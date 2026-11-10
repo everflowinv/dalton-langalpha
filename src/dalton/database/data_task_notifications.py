@@ -8,7 +8,7 @@ as the single authoritative platform-send ledger without manufacturing conversat
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 import logging
@@ -1526,6 +1526,232 @@ async def _resolve_reconcile_recipient_identity(
     return canonical_target_address, ledger_recipient, computed_keys
 
 
+async def reconcile_single_data_task_delivery_row(
+    row: Mapping[str, Any],
+    *,
+    uncertain_codes: Sequence[str] | None = None,
+    mark_delivery_fn: Callable[..., Awaitable[Any]] | None = None,
+    conn: Any = None,
+    allow_retry_candidate_statuses: bool = False,
+) -> bool:
+    """Reconcile a single outer `dalton_notify_deliveries` row against `dalton_channel_deliveries`.
+
+    Read-only unless all expected items for the original persisted recipient identity are
+    durably `sent` in `dalton_channel_deliveries`, in which case it atomically transitions
+    the outer row to `status = 'sent', error_code = NULL` and converges the run's
+    `notify_status` to `'dispatched'`.
+    """
+    raw_exec_id = str(row.get("execution_id") or "").strip()
+    owner_user_id = str(row.get("user_id") or "").strip()
+    channel = str(row.get("channel") or "").strip().lower()
+    target = str(row.get("target") or "").strip()
+    raw_row_status = str(row.get("status") or "").strip().lower()
+    payload = (
+        row.get("payload_json")
+        if isinstance(row.get("payload_json"), Mapping)
+        else None
+    )
+    if not (raw_exec_id and owner_user_id and channel and target):
+        return False
+
+    try:
+        norm_run_id = normalize_run_uuid(raw_exec_id)
+    except DataTaskArtifactError:
+        return False
+
+    parsed_target = _parse_requested_notify_target(target)
+    if parsed_target is None:
+        return False
+    platform, target_kind, raw_ident = parsed_target
+    if platform != channel:
+        return False
+
+    expected_count = _derive_expected_item_count_from_persisted_payload(payload)
+    if expected_count is None or expected_count <= 0:
+        return False
+
+    eff_uncertain_codes = (
+        list(uncertain_codes)
+        if uncertain_codes is not None
+        else sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
+    )
+
+    try:
+        async with get_db_connection(conn) as row_conn:
+            async with row_conn.cursor(row_factory=dict_row) as cur:
+                resolved_ident = await _resolve_reconcile_recipient_identity(
+                    cur,
+                    norm_run_id=norm_run_id,
+                    owner_user_id=owner_user_id,
+                    platform=platform,
+                    target_kind=target_kind,
+                    raw_ident=raw_ident,
+                    expected_count=expected_count,
+                    payload=payload,
+                )
+                if resolved_ident is None:
+                    return False
+                canonical_target_address, _recipient_id, expected_keys = resolved_ident
+
+                await cur.execute(
+                    """
+                    SELECT delivery_key, status
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = ANY(%s)
+                      AND kind = 'data_task'
+                      AND run_id = %s
+                      AND user_id = %s
+                      AND platform = %s
+                      AND target_address = %s
+                    """,
+                    (
+                        expected_keys,
+                        norm_run_id,
+                        owner_user_id,
+                        platform,
+                        canonical_target_address,
+                    ),
+                )
+                item_rows = await cur.fetchall()
+
+            status_by_key = {
+                str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()
+                for ir in (item_rows or [])
+            }
+            if len(status_by_key) != expected_count or not all(
+                status_by_key.get(k) == "sent" for k in expected_keys
+            ):
+                return False
+
+            updated_outer = False
+            async with row_conn.transaction():
+                async with row_conn.cursor(row_factory=dict_row) as tx_cur:
+                    await tx_cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_reconcile:{norm_run_id}:{channel}:{target}",),
+                    )
+                    await tx_cur.execute(
+                        """
+                        SELECT delivery_key, status
+                        FROM dalton_channel_deliveries
+                        WHERE delivery_key = ANY(%s)
+                          AND kind = 'data_task'
+                          AND run_id = %s
+                          AND user_id = %s
+                          AND platform = %s
+                          AND target_address = %s
+                        """,
+                        (
+                            expected_keys,
+                            norm_run_id,
+                            owner_user_id,
+                            platform,
+                            canonical_target_address,
+                        ),
+                    )
+                    tx_items = await tx_cur.fetchall()
+                    tx_status_by_key = {
+                        str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()
+                        for ir in (tx_items or [])
+                    }
+                    if len(tx_status_by_key) != expected_count or not all(
+                        tx_status_by_key.get(k) == "sent" for k in expected_keys
+                    ):
+                        return False
+
+                    if allow_retry_candidate_statuses:
+                        await tx_cur.execute(
+                            """
+                            UPDATE dalton_notify_deliveries
+                            SET status = 'sent',
+                                error_code = NULL,
+                                updated_at = NOW()
+                            WHERE execution_id = %s
+                              AND channel = %s
+                              AND target = %s
+                              AND status IN ('pending', 'failed')
+                            """,
+                            (raw_exec_id, channel, target),
+                        )
+                    else:
+                        await tx_cur.execute(
+                            """
+                            UPDATE dalton_notify_deliveries
+                            SET status = 'sent',
+                                error_code = NULL,
+                                updated_at = NOW()
+                            WHERE execution_id = %s
+                              AND channel = %s
+                              AND target = %s
+                              AND (
+                                  (
+                                      status = 'pending'
+                                      AND (
+                                          error_code IS NULL
+                                          OR COALESCE(error_code, '') = ''
+                                          OR COALESCE(error_code, '') = ANY(%s)
+                                      )
+                                  )
+                                  OR (
+                                      status = 'failed'
+                                      AND COALESCE(error_code, '') = 'attempts_exhausted'
+                                  )
+                              )
+                            """,
+                            (raw_exec_id, channel, target, eff_uncertain_codes),
+                        )
+                    if isinstance(tx_cur.rowcount, int) and tx_cur.rowcount > 0:
+                        updated_outer = True
+                        await tx_cur.execute(
+                            """
+                            UPDATE dalton_data_task_runs r
+                            SET notify_status = 'dispatched',
+                                updated_at = NOW()
+                            WHERE r.run_id = %s::uuid
+                              AND r.notify_status = 'pending_dispatch'
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM dalton_notify_deliveries d
+                                  WHERE d.execution_id = %s
+                                    AND d.status = 'sent'
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM dalton_notify_deliveries d
+                                  WHERE d.execution_id = %s
+                                    AND d.status NOT IN ('sent', 'skipped')
+                              )
+                            """,
+                            (norm_run_id, raw_exec_id, raw_exec_id),
+                        )
+
+            if updated_outer:
+                if mark_delivery_fn is not None:
+                    expected_st: str | tuple[str, ...] = (
+                        raw_row_status
+                        if raw_row_status in ("pending", "failed")
+                        else ("pending", "failed")
+                    )
+                    await mark_delivery_fn(
+                        raw_exec_id,
+                        channel,
+                        target,
+                        status="sent",
+                        error_code=None,
+                        expected_status=expected_st,
+                    )
+                return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as row_exc:
+        logger.warning(
+            "Data-task uncertain delivery reconciliation skipped row execution_id=%s: error_type=%s",
+            raw_exec_id,
+            type(row_exc).__name__,
+        )
+    return False
+
+
 async def reconcile_uncertain_data_task_deliveries(
     *,
     limit: int = 5,
@@ -1534,12 +1760,14 @@ async def reconcile_uncertain_data_task_deliveries(
     mark_delivery_fn: Callable[..., Awaitable[Any]] | None = None,
     conn: Any = None,
 ) -> int:
-    """Read-only reconciliation of uncertain `dalton_notify_deliveries` rows against `dalton_channel_deliveries`.
+    """Read-only reconciliation of `dalton_notify_deliveries` rows against `dalton_channel_deliveries`.
 
-    Remains active even after `attempt_count >= max_attempts`. Never authorizes a claim,
-    never invokes platform/gateway sends, never resets unknown items, and never increments
-    `attempt_count`. Marks the outer row `sent` iff all expected items for the exact original
-    `(run_id, owner_user_id, platform, canonical_target_address, recipient_id)` are durably `sent`.
+    Remains active even after `attempt_count >= max_attempts` (including `pending` rows with
+    `error_code IS NULL` or an uncertain code, and `failed` rows with `error_code = 'attempts_exhausted'`).
+    Never authorizes a claim, never invokes platform/gateway sends, never resets unknown items,
+    and never increments `attempt_count`. Marks the outer row `sent` iff all expected items for
+    the exact original `(run_id, owner_user_id, platform, canonical_target_address, recipient_id)`
+    are durably `sent`.
     """
     eff_limit = max(1, int(limit or 5))
     t0 = started_at if started_at is not None else time.monotonic()
@@ -1556,8 +1784,20 @@ async def reconcile_uncertain_data_task_deliveries(
                            d.channel, d.target, d.status, d.attempt_count,
                            d.error_code, d.payload_json
                     FROM dalton_notify_deliveries d
-                    WHERE d.status = 'pending'
-                      AND COALESCE(d.error_code, '') = ANY(%s)
+                    WHERE (
+                        (
+                            d.status = 'pending'
+                            AND (
+                                d.error_code IS NULL
+                                OR COALESCE(d.error_code, '') = ''
+                                OR COALESCE(d.error_code, '') = ANY(%s)
+                            )
+                        )
+                        OR (
+                            d.status = 'failed'
+                            AND COALESCE(d.error_code, '') = 'attempts_exhausted'
+                        )
+                    )
                       AND (
                           d.automation_id LIKE 'data:%%'
                           OR (d.payload_json ->> 'route_key') LIKE 'data:%%'
@@ -1598,175 +1838,14 @@ async def reconcile_uncertain_data_task_deliveries(
             if time.monotonic() - t0 >= max_duration_s:
                 break
 
-            raw_exec_id = str(row.get("execution_id") or "").strip()
-            owner_user_id = str(row.get("user_id") or "").strip()
-            channel = str(row.get("channel") or "").strip().lower()
-            target = str(row.get("target") or "").strip()
-            payload = (
-                row.get("payload_json")
-                if isinstance(row.get("payload_json"), Mapping)
-                else None
-            )
-            if not (raw_exec_id and owner_user_id and channel and target):
-                continue
-
-            try:
-                norm_run_id = normalize_run_uuid(raw_exec_id)
-            except DataTaskArtifactError:
-                continue
-
-            parsed_target = _parse_requested_notify_target(target)
-            if parsed_target is None:
-                continue
-            platform, target_kind, raw_ident = parsed_target
-            if platform != channel:
-                continue
-
-            expected_count = _derive_expected_item_count_from_persisted_payload(payload)
-            if expected_count is None or expected_count <= 0:
-                continue
-
-            try:
-                async with get_db_connection(conn) as row_conn:
-                    async with row_conn.cursor(row_factory=dict_row) as cur:
-                        resolved_ident = await _resolve_reconcile_recipient_identity(
-                            cur,
-                            norm_run_id=norm_run_id,
-                            owner_user_id=owner_user_id,
-                            platform=platform,
-                            target_kind=target_kind,
-                            raw_ident=raw_ident,
-                            expected_count=expected_count,
-                            payload=payload,
-                        )
-                        if resolved_ident is None:
-                            continue
-                        canonical_target_address, _recipient_id, expected_keys = resolved_ident
-
-                        await cur.execute(
-                            """
-                            SELECT delivery_key, status
-                            FROM dalton_channel_deliveries
-                            WHERE delivery_key = ANY(%s)
-                              AND kind = 'data_task'
-                              AND run_id = %s
-                              AND user_id = %s
-                              AND platform = %s
-                              AND target_address = %s
-                            """,
-                            (
-                                expected_keys,
-                                norm_run_id,
-                                owner_user_id,
-                                platform,
-                                canonical_target_address,
-                            ),
-                        )
-                        item_rows = await cur.fetchall()
-
-                    status_by_key = {
-                        str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()
-                        for ir in (item_rows or [])
-                    }
-                    if len(status_by_key) != expected_count or not all(
-                        status_by_key.get(k) == "sent" for k in expected_keys
-                    ):
-                        continue
-
-                    updated_outer = False
-                    async with row_conn.transaction():
-                        async with row_conn.cursor(row_factory=dict_row) as tx_cur:
-                            await tx_cur.execute(
-                                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                                (f"dalton_reconcile:{norm_run_id}:{channel}:{target}",),
-                            )
-                            await tx_cur.execute(
-                                """
-                                SELECT delivery_key, status
-                                FROM dalton_channel_deliveries
-                                WHERE delivery_key = ANY(%s)
-                                  AND kind = 'data_task'
-                                  AND run_id = %s
-                                  AND user_id = %s
-                                  AND platform = %s
-                                  AND target_address = %s
-                                """,
-                                (
-                                    expected_keys,
-                                    norm_run_id,
-                                    owner_user_id,
-                                    platform,
-                                    canonical_target_address,
-                                ),
-                            )
-                            tx_items = await tx_cur.fetchall()
-                            tx_status_by_key = {
-                                str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()
-                                for ir in (tx_items or [])
-                            }
-                            if len(tx_status_by_key) != expected_count or not all(
-                                tx_status_by_key.get(k) == "sent" for k in expected_keys
-                            ):
-                                continue
-
-                            await tx_cur.execute(
-                                """
-                                UPDATE dalton_notify_deliveries
-                                SET status = 'sent',
-                                    error_code = NULL,
-                                    updated_at = NOW()
-                                WHERE execution_id = %s
-                                  AND channel = %s
-                                  AND target = %s
-                                  AND status = 'pending'
-                                  AND COALESCE(error_code, '') = ANY(%s)
-                                """,
-                                (raw_exec_id, channel, target, uncertain_codes),
-                            )
-                            if isinstance(tx_cur.rowcount, int) and tx_cur.rowcount > 0:
-                                updated_outer = True
-                                await tx_cur.execute(
-                                    """
-                                    UPDATE dalton_data_task_runs r
-                                    SET notify_status = 'dispatched',
-                                        updated_at = NOW()
-                                    WHERE r.run_id = %s::uuid
-                                      AND r.notify_status = 'pending_dispatch'
-                                      AND EXISTS (
-                                          SELECT 1
-                                          FROM dalton_notify_deliveries d
-                                          WHERE d.execution_id = %s
-                                            AND d.status = 'sent'
-                                      )
-                                      AND NOT EXISTS (
-                                          SELECT 1
-                                          FROM dalton_notify_deliveries d
-                                          WHERE d.execution_id = %s
-                                            AND d.status NOT IN ('sent', 'skipped')
-                                      )
-                                    """,
-                                    (norm_run_id, raw_exec_id, raw_exec_id),
-                                )
-
-                    if updated_outer:
-                        reconciled_count += 1
-                        if mark_delivery_fn is not None:
-                            await mark_delivery_fn(
-                                raw_exec_id,
-                                channel,
-                                target,
-                                status="sent",
-                                error_code=None,
-                                expected_status="pending",
-                            )
-            except asyncio.CancelledError:
-                raise
-            except Exception as row_exc:
-                logger.warning(
-                    "Data-task uncertain delivery reconciliation skipped row execution_id=%s: error_type=%s",
-                    raw_exec_id,
-                    type(row_exc).__name__,
-                )
+            if await reconcile_single_data_task_delivery_row(
+                row,
+                uncertain_codes=uncertain_codes,
+                mark_delivery_fn=mark_delivery_fn,
+                conn=conn,
+                allow_retry_candidate_statuses=False,
+            ):
+                reconciled_count += 1
     except asyncio.CancelledError:
         raise
     except Exception as scan_exc:

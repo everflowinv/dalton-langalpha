@@ -957,6 +957,7 @@ async def test_concurrent_claim_multi_item_resume_and_uncertain_ledger_protectio
         await admin_conn.close()
 
 
+
 @pytest.mark.asyncio
 async def test_unbound_admin_group_delivery_workspace_gate_and_real_vault_startup_db(
     migrated_dsn: str,
@@ -2620,6 +2621,7 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
         await admin_conn.close()
 
 
+
 @pytest.mark.asyncio
 async def test_outer_delivery_identity_freeze_conflict_rejection_and_late_reconciliation_db(
     migrated_dsn: str,
@@ -3200,6 +3202,7 @@ async def test_outer_delivery_identity_freeze_conflict_rejection_and_late_reconc
                 (pm_uid,),
             )
         await admin_conn.close()
+
 
 
 @pytest.mark.asyncio
@@ -4470,3 +4473,906 @@ async def test_in_flight_native_cancellation_and_stale_scanner_race_preserve_unc
             )
         await sched_conn.close()
         await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_completed_items_without_uncertainty_marker_and_after_attempts_exhausted_db(
+    migrated_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PostgreSQL verification for Part A (recover outer completion from persisted original-identity `sent` items):
+    1. When outer row is `pending / error_code=NULL / attempt_count=3` and all expected items for the original
+       recipient are durably `sent` in `dalton_channel_deliveries`, both `reconcile_uncertain_data_task_deliveries`
+       and `retry_failed_notify_deliveries` (including its pre-exhaustion / pre-revocation check) recover the
+       outer row to `status='sent', error_code=NULL, attempt_count=3` and the run to `notify_status='dispatched'`
+       with 0 send calls.
+    2. When items are incomplete (`in_flight`), reconciliation does not recover (even if another recipient has
+       `sent` rows), and `retry_failed_notify_deliveries` transitions stale `pending/NULL/attempt_count=3` to
+       `status='failed', error_code='attempts_exhausted'`; when the original recipient's items subsequently
+       become `sent`, reconciliation recovers the `failed/attempts_exhausted` row to `sent` (`error_code=NULL`,
+       `attempt_count=3`) and the run to `dispatched` with 0 send calls.
+    """
+    dsn = migrated_dsn
+    pm_uid = f"pm-rec-a-{uuid4().hex[:8]}"
+    orig_open_id = f"ou_rec_orig_{uuid4().hex[:6]}"
+    other_open_id = f"ou_rec_other_{uuid4().hex[:6]}"
+    target = "feishu:@me"
+
+    run_ready_reconcile = str(uuid4())
+    run_ready_retry = str(uuid4())
+    run_ready_per_row = str(uuid4())
+    run_late_exhausted = str(uuid4())
+    all_runs = [
+        run_ready_reconcile,
+        run_ready_retry,
+        run_ready_per_row,
+        run_late_exhausted,
+    ]
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "reca_h_var",
+        backend_var_dir=tmp_path / "reca_b_var",
+    )
+    outbox_doc = {
+        "text": "Part A recovery report",
+        "items": [
+            {"index": 0, "text": "Item 0"},
+            {"index": 1, "text": "Item 1"},
+        ],
+    }
+    for rid in all_runs:
+        rdir = path_map.backend_run_artifacts_dir(rid)
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "outbox.json").write_text(json.dumps(outbox_doc), encoding="utf-8")
+
+    @asynccontextmanager
+    async def _real_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        c = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            yield c
+        finally:
+            await c.close()
+
+    async def _real_get_prefs(user_id: str) -> dict[str, Any] | None:
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                    (user_id,),
+                )
+                return await cur.fetchone()
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    for mod in (dtn_db, cg_db, notify_dispatch_mod):
+        monkeypatch.setattr(
+            mod,
+            "get_db_connection",
+            create_autospec(mod.get_db_connection, side_effect=_real_db_conn),
+        )
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, side_effect=_real_get_prefs),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+
+    def _keys_for(rid: str, recipient: str) -> list[str]:
+        return [
+            dtn_db.build_data_task_item_delivery_key(
+                run_id=rid,
+                platform="feishu",
+                recipient_id=recipient,
+                item_index=0,
+            ),
+            dtn_db.build_data_task_item_delivery_key(
+                run_id=rid,
+                platform="feishu",
+                recipient_id=recipient,
+                item_index=1,
+            ),
+        ]
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        manifest = load_data_task_manifest()
+        slot_base = datetime(2026, 11, 10, 14, 0, tzinfo=timezone.utc)
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET enabled = TRUE, notify_enabled = TRUE
+                    WHERE job_key = 'softbank-nav-monitor'
+                    """
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_uid, f"{pm_uid}@synth.local", pm_uid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                    VALUES (%s, 'feishu', %s)
+                    """,
+                    (pm_uid, orig_open_id),
+                )
+
+                for idx, rid in enumerate(all_runs):
+                    s_utc = slot_base + timedelta(minutes=idx * 5)
+                    keys_orig = _keys_for(rid, orig_open_id)
+                    meta = dtn_db.build_reconcile_identity_metadata(
+                        platform="feishu",
+                        recipient_id=orig_open_id,
+                        canonical_target_address=target,
+                        delivery_keys=keys_orig,
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_data_task_runs (
+                            run_id, job_key, generation, trigger_source,
+                            scheduled_slot_utc, deadline_utc, status,
+                            outbox_payload, notify_status
+                        )
+                        VALUES (%s::uuid, 'softbank-nav-monitor', 1, 'cron', %s, %s, 'succeeded', %s, 'pending_dispatch')
+                        """,
+                        (rid, s_utc, s_utc + timedelta(minutes=10), Jsonb(outbox_doc)),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_notify_deliveries (
+                            delivery_id, execution_id, automation_id, user_id,
+                            channel, target, status, attempt_count, error_code,
+                            payload_json, created_at, updated_at
+                        )
+                        VALUES (
+                            %s, %s, 'data:softbank-nav-monitor', %s,
+                            'feishu', %s, 'pending', 3, NULL,
+                            %s, NOW() - INTERVAL '25 minutes', NOW() - INTERVAL '25 minutes'
+                        )
+                        """,
+                        (
+                            str(uuid4()),
+                            rid,
+                            pm_uid,
+                            target,
+                            Jsonb({"route_key": "data:softbank-nav-monitor", "text": "Part A", **meta}),
+                        ),
+                    )
+
+                # Seed `sent` items for `run_ready_reconcile`, `run_ready_retry`, and `run_ready_per_row`
+                for rid in (run_ready_reconcile, run_ready_retry, run_ready_per_row):
+                    for k in _keys_for(rid, orig_open_id):
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_deliveries (
+                                delivery_key, kind, user_id, run_id, execution_id,
+                                is_current, has_non_empty_text, platform, target_address,
+                                status, total_chunks, sent_chunks, created_at, updated_at
+                            )
+                            VALUES (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', %s, 'sent', 1, 1, NOW(), NOW())
+                            """,
+                            (k, pm_uid, rid, rid, target),
+                        )
+
+                # Seed incomplete items for `run_late_exhausted` (item 0 `sent`, item 1 `in_flight`),
+                # plus `sent` items for a wrong recipient (`other_open_id`)
+                late_orig_keys = _keys_for(run_late_exhausted, orig_open_id)
+                late_other_keys = _keys_for(run_late_exhausted, other_open_id)
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_deliveries (
+                        delivery_key, kind, user_id, run_id, execution_id,
+                        is_current, has_non_empty_text, platform, target_address,
+                        status, total_chunks, sent_chunks, created_at, updated_at
+                    )
+                    VALUES
+                    (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', %s, 'sent', 1, 1, NOW(), NOW()),
+                    (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', %s, 'in_flight', 1, 0, NOW(), NOW()),
+                    (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', %s, 'sent', 1, 1, NOW(), NOW()),
+                    (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', %s, 'sent', 1, 1, NOW(), NOW())
+                    """,
+                    (
+                        late_orig_keys[0], pm_uid, run_late_exhausted, run_late_exhausted, target,
+                        late_orig_keys[1], pm_uid, run_late_exhausted, run_late_exhausted, target,
+                        late_other_keys[0], pm_uid, run_late_exhausted, run_late_exhausted, target,
+                        late_other_keys[1], pm_uid, run_late_exhausted, run_late_exhausted, target,
+                    ),
+                )
+
+        await upsert_user_preferences(
+            user_id=pm_uid,
+            model_preference={
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [target],
+                "dalton_notify_routes": {"data:softbank-nav-monitor": [target]},
+            },
+            conn=admin_conn,
+        )
+
+        send_spy = create_autospec(ct_mod.post_data_task_gateway_notify)
+
+        # 1. `reconcile_uncertain_data_task_deliveries` recovers `run_ready_reconcile` (`pending/NULL/3`)
+        #    directly when all original-recipient items are `sent`
+        #    Temporarily hide `run_ready_retry` and `run_ready_per_row` as `sent` so we test each path cleanly
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE dalton_notify_deliveries SET status = 'sent' WHERE execution_id IN (%s, %s)",
+                (run_ready_retry, run_ready_per_row),
+            )
+
+        assert await dtn_db.reconcile_uncertain_data_task_deliveries(limit=10) == 1
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_ready_reconcile,),
+            )
+            assert await cur.fetchone() == {
+                "status": "sent",
+                "attempt_count": 3,
+                "error_code": None,
+            }
+            await cur.execute(
+                "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_ready_reconcile,),
+            )
+            assert (await cur.fetchone())["notify_status"] == "dispatched"
+            # `run_late_exhausted` (item 1 still `in_flight`) was NOT recovered
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_late_exhausted,),
+            )
+            assert await cur.fetchone() == {
+                "status": "pending",
+                "attempt_count": 3,
+                "error_code": None,
+            }
+
+        # 2. `retry_failed_notify_deliveries` recovers `run_ready_retry` (`pending/NULL/3`, items `sent`)
+        #    to `sent` + `dispatched` with 0 send calls, while transitioning incomplete `run_late_exhausted`
+        #    (`pending/NULL/3`, item 1 `in_flight`) to `failed/attempts_exhausted`
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE dalton_notify_deliveries SET status = 'pending', error_code = NULL WHERE execution_id = %s",
+                (run_ready_retry,),
+            )
+
+        retry_rec_count = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            limit=10,
+            max_attempts=3,
+            stale_pending_minutes=10,
+            data_task_notify_fn=send_spy,
+        )
+        assert retry_rec_count == 1
+        assert send_spy.call_count == 0
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_ready_retry,),
+            )
+            assert await cur.fetchone() == {
+                "status": "sent",
+                "attempt_count": 3,
+                "error_code": None,
+            }
+            await cur.execute(
+                "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_ready_retry,),
+            )
+            assert (await cur.fetchone())["notify_status"] == "dispatched"
+
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_late_exhausted,),
+            )
+            assert await cur.fetchone() == {
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "attempts_exhausted",
+            }
+            await cur.execute(
+                "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_late_exhausted,),
+            )
+            assert (await cur.fetchone())["notify_status"] == "pending_dispatch"
+
+        # 3. Per-row pre-exhaustion / pre-revocation check in `retry_failed_notify_deliveries`
+        #    recovers `run_ready_per_row` (`pending/NULL/3`) even when task is disabled and routes removed
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE dalton_notify_deliveries SET status = 'pending', error_code = NULL WHERE execution_id = %s",
+                (run_ready_per_row,),
+            )
+            await cur.execute(
+                "UPDATE dalton_data_task_defs SET enabled = FALSE, notify_enabled = FALSE WHERE job_key = 'softbank-nav-monitor'"
+            )
+
+        async def _noop_top_reconcile(**_kw: Any) -> int:
+            return 0
+
+        per_row_count = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            limit=10,
+            max_attempts=3,
+            stale_pending_minutes=10,
+            reconcile_data_tasks_fn=_noop_top_reconcile,
+            data_task_notify_fn=send_spy,
+        )
+        assert per_row_count == 1
+        assert send_spy.call_count == 0
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_ready_per_row,),
+            )
+            assert await cur.fetchone() == {
+                "status": "sent",
+                "attempt_count": 3,
+                "error_code": None,
+            }
+            await cur.execute(
+                "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_ready_per_row,),
+            )
+            assert (await cur.fetchone())["notify_status"] == "dispatched"
+
+        # 4. Late completion of `run_late_exhausted`'s second item (`late_orig_keys[1] -> 'sent'`)
+        #    recovers the `failed/attempts_exhausted` outer row to `sent` (`error_code=None`, `attempt_count=3`)
+        #    and the run to `notify_status='dispatched'` with 0 send calls!
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE dalton_channel_deliveries SET status = 'sent', sent_chunks = 1 WHERE delivery_key = %s",
+                (late_orig_keys[1],),
+            )
+
+        assert await dtn_db.reconcile_uncertain_data_task_deliveries(limit=10) == 1
+        assert send_spy.call_count == 0
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_late_exhausted,),
+            )
+            assert await cur.fetchone() == {
+                "status": "sent",
+                "attempt_count": 3,
+                "error_code": None,
+            }
+            await cur.execute(
+                "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_late_exhausted,),
+            )
+            assert (await cur.fetchone())["notify_status"] == "dispatched"
+    finally:
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_deliveries WHERE run_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_runs WHERE run_id = ANY(%s::uuid[])",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key = 'softbank-nav-monitor'"
+            )
+            await cur.execute(
+                "DELETE FROM user_preferences WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM users WHERE user_id = %s",
+                (pm_uid,),
+            )
+        await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_with_concurrent_retry_attempt_protection_db(
+    migrated_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PostgreSQL concurrency test for Stage B:
+    1. `claim_target_delivery_with_attempt` atomically returns `(True, 1)` on initial claim,
+       `(False, None)` on competing claim while `pending`, and `(True, 2)` on re-claim after `failed`.
+    2. Using two real PostgreSQL connections and event coordination (`scheduler_cancel_with_new_retry`):
+       - Scheduler claims `attempt_count=2`, writes `failed` (`error_code='synthetic_retryable'`, `expected_attempt_count=2`),
+         and pauses before `_shielded_mark_failed` returns;
+       - Caller cancels `scheduler_task`, and `retry_failed_notify_deliveries` claims `attempt_count=3, status='pending'`;
+       - Releasing the old scheduler's failure write propagates `CancelledError` without overwriting `attempt_count=3`;
+       - Releasing the retry completes the item (`sent`), updates outer delivery to `status='sent', attempt_count=3, error_code=None`,
+         and updates `dalton_data_task_runs.notify_status` to `'dispatched'`.
+    """
+    from src.dalton.data_jobs import scheduler as sched_mod
+
+    dsn = migrated_dsn
+    pm_uid = f"pm-sched-b-{uuid4().hex[:8]}"
+    open_id = f"ou_sched_b_{uuid4().hex[:8]}"
+    target = f"feishu:user:{open_id}"
+    canonical_target = "feishu:@me"
+    claim_check_run = str(uuid4())
+    race_run = str(uuid4())
+    all_runs = [claim_check_run, race_run]
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "recb_h_var",
+        backend_var_dir=tmp_path / "recb_b_var",
+    )
+    outbox_doc = {
+        "text": "Part B concurrency report",
+        "items": [{"index": 0, "text": "Part B item 0"}],
+    }
+    for rid in all_runs:
+        rdir = path_map.backend_run_artifacts_dir(rid)
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "outbox.json").write_text(json.dumps(outbox_doc), encoding="utf-8")
+
+    @asynccontextmanager
+    async def _real_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        c = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            yield c
+        finally:
+            await c.close()
+
+    async def _real_get_prefs(user_id: str) -> dict[str, Any] | None:
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                    (user_id,),
+                )
+                return await cur.fetchone()
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    for mod in (dtn_db, cg_db, notify_dispatch_mod):
+        monkeypatch.setattr(
+            mod,
+            "get_db_connection",
+            create_autospec(mod.get_db_connection, side_effect=_real_db_conn),
+        )
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, side_effect=_real_get_prefs),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    first_failed_written = asyncio.Event()
+    release_failed_write = asyncio.Event()
+    retry_entered = asyncio.Event()
+    release_retry = asyncio.Event()
+    owned_tasks: list[asyncio.Task[Any]] = []
+    try:
+        manifest = load_data_task_manifest()
+        slot_base = datetime(2026, 11, 10, 15, 0, tzinfo=timezone.utc)
+        race_item_key = dtn_db.build_data_task_item_delivery_key(
+            run_id=race_run,
+            platform="feishu",
+            recipient_id=open_id,
+            item_index=0,
+        )
+        race_meta = dtn_db.build_reconcile_identity_metadata(
+            platform="feishu",
+            recipient_id=open_id,
+            canonical_target_address=canonical_target,
+            delivery_keys=[race_item_key],
+        )
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET enabled = TRUE, notify_enabled = TRUE
+                    WHERE job_key = 'softbank-nav-monitor'
+                    """
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_uid, f"{pm_uid}@synth.local", pm_uid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                    VALUES (%s, 'feishu', %s)
+                    """,
+                    (pm_uid, open_id),
+                )
+                for idx, rid in enumerate(all_runs):
+                    s_utc = slot_base + timedelta(minutes=idx * 5)
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_data_task_runs (
+                            run_id, job_key, generation, trigger_source,
+                            scheduled_slot_utc, deadline_utc, status,
+                            outbox_payload, notify_status
+                        )
+                        VALUES (%s::uuid, 'softbank-nav-monitor', 1, 'cron', %s, %s, 'succeeded', %s, 'pending_dispatch')
+                        """,
+                        (rid, s_utc, s_utc + timedelta(minutes=10), Jsonb(outbox_doc)),
+                    )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_notify_deliveries (
+                        delivery_id, execution_id, automation_id, user_id,
+                        channel, target, status, attempt_count, error_code,
+                        payload_json, created_at, updated_at
+                    )
+                    VALUES (
+                        %s, %s, 'data:softbank-nav-monitor', %s,
+                        'feishu', %s, 'failed', 1, 'synthetic_retryable',
+                        %s, NOW() - INTERVAL '25 minutes', NOW() - INTERVAL '25 minutes'
+                    )
+                    """,
+                    (
+                        str(uuid4()),
+                        race_run,
+                        pm_uid,
+                        target,
+                        Jsonb({"route_key": "data:softbank-nav-monitor", "text": "Part B", **race_meta}),
+                    ),
+                )
+
+        await upsert_user_preferences(
+            user_id=pm_uid,
+            model_preference={
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [target],
+                "dalton_notify_routes": {"data:softbank-nav-monitor": [target]},
+            },
+            conn=admin_conn,
+        )
+
+        # 1. Verify atomic claim attempt_count against real PostgreSQL
+        assert (
+            await notify_dispatch_mod.claim_target_delivery_with_attempt(
+                claim_check_run,
+                "feishu",
+                target,
+                user_id=pm_uid,
+                automation_id="data:softbank-nav-monitor",
+                payload={"route_key": "data:softbank-nav-monitor"},
+            )
+            == (True, 1)
+        )
+        assert (
+            await notify_dispatch_mod.claim_target_delivery_with_attempt(
+                claim_check_run,
+                "feishu",
+                target,
+                user_id=pm_uid,
+                automation_id="data:softbank-nav-monitor",
+                payload={"route_key": "data:softbank-nav-monitor"},
+            )
+            == (False, None)
+        )
+        assert (
+            await notify_dispatch_mod.claim_target_delivery(
+                claim_check_run,
+                "feishu",
+                target,
+                user_id=pm_uid,
+                automation_id="data:softbank-nav-monitor",
+                payload={"route_key": "data:softbank-nav-monitor"},
+            )
+            is False
+        )
+        assert (
+            await notify_dispatch_mod.mark_target_delivery(
+                claim_check_run,
+                "feishu",
+                target,
+                status="failed",
+                error_code="ReadTimeout",
+                expected_status="pending",
+                expected_attempt_count=1,
+            )
+            is True
+        )
+        assert (
+            await notify_dispatch_mod.claim_target_delivery_with_attempt(
+                claim_check_run,
+                "feishu",
+                target,
+                user_id=pm_uid,
+                automation_id="data:softbank-nav-monitor",
+                payload={"route_key": "data:softbank-nav-monitor"},
+            )
+            == (True, 2)
+        )
+        assert (
+            await notify_dispatch_mod.mark_target_delivery(
+                claim_check_run,
+                "feishu",
+                target,
+                status="sent",
+                error_code=None,
+                expected_status="pending",
+                expected_attempt_count=2,
+            )
+            is True
+        )
+
+        # 2. Event-controlled concurrency race (`scheduler_cancel_with_new_retry`)
+        real_mark = notify_dispatch_mod.mark_target_delivery
+        real_claim = notify_dispatch_mod.claim_target_delivery
+        mark_calls: list[dict[str, Any]] = []
+
+        async def _read_race_state() -> dict[str, Any]:
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT attempt_count, status, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                    (race_run,),
+                )
+                outer = await cur.fetchone()
+                await cur.execute(
+                    "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                    (race_run,),
+                )
+                run_row = await cur.fetchone()
+                return {
+                    "outer": dict(outer) if outer else None,
+                    "run_notify_status": run_row["notify_status"] if run_row else None,
+                }
+
+        async def _coordinated_mark(*args: Any, **kwargs: Any) -> bool:
+            res = await real_mark(*args, **kwargs)
+            mark_calls.append(
+                {
+                    "status": kwargs.get("status"),
+                    "error_code": kwargs.get("error_code"),
+                    "expected_attempt_count": kwargs.get("expected_attempt_count"),
+                    "updated": res,
+                }
+            )
+            if kwargs.get("status") == "failed" and not first_failed_written.is_set():
+                first_failed_written.set()
+                await release_failed_write.wait()
+            return res
+
+        async def _claim_through_real(*args: Any, **kwargs: Any) -> Any:
+            return await real_claim(*args, **kwargs)
+
+        async def _synthetic_failure(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "status": "failed",
+                "results": [
+                    {
+                        "target": target,
+                        "ok": False,
+                        "status": "failed",
+                        "error_code": "synthetic_retryable",
+                    }
+                ],
+            }
+
+        async def _synthetic_retry(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            retry_entered.set()
+            await release_retry.wait()
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_deliveries (
+                        delivery_key, kind, user_id, run_id, execution_id,
+                        is_current, has_non_empty_text, platform, target_address,
+                        status, total_chunks, sent_chunks, created_at, updated_at
+                    )
+                    VALUES (%s, 'data_task', %s, %s, %s::uuid, TRUE, TRUE, 'feishu', %s, 'sent', 1, 1, NOW(), NOW())
+                    ON CONFLICT (delivery_key) DO UPDATE
+                    SET status = 'sent', sent_chunks = 1, updated_at = NOW()
+                    """,
+                    (race_item_key, pm_uid, race_run, race_run, canonical_target),
+                )
+            return {
+                "ok": True,
+                "results": [{"target": target, "ok": True, "status": "sent"}],
+            }
+
+        sched_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        lock_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            assert await sched_mod.try_scheduler_lock(lock_conn) is True
+            scheduler_task = asyncio.create_task(
+                sched_mod.dispatch_data_task_run_notification(
+                    sched_conn,
+                    lock_conn=lock_conn,
+                    run_id=race_run,
+                    job_key="softbank-nav-monitor",
+                    db_outbox_payload=outbox_doc,
+                    path_map=path_map,
+                    evaluate_eligibility_fn=create_autospec(
+                        notify_dispatch_mod.evaluate_user_notify_eligibility,
+                        return_value=(True, None, [target]),
+                    ),
+                    claim_target_fn=create_autospec(
+                        real_claim, side_effect=_claim_through_real
+                    ),
+                    post_notify_fn=create_autospec(
+                        ct_mod.post_data_task_gateway_notify,
+                        side_effect=_synthetic_failure,
+                    ),
+                    mark_target_fn=create_autospec(
+                        real_mark, side_effect=_coordinated_mark
+                    ),
+                    fetch_deliveries_fn=create_autospec(
+                        notify_dispatch_mod.fetch_execution_deliveries,
+                        side_effect=notify_dispatch_mod.fetch_execution_deliveries,
+                    ),
+                )
+            )
+            owned_tasks.append(scheduler_task)
+            await asyncio.wait_for(first_failed_written.wait(), timeout=5.0)
+            assert await _read_race_state() == {
+                "outer": {
+                    "attempt_count": 2,
+                    "status": "failed",
+                    "error_code": "synthetic_retryable",
+                },
+                "run_notify_status": "pending_dispatch",
+            }
+
+            scheduler_task.cancel()
+            await asyncio.sleep(0)
+
+            retry_task = asyncio.create_task(
+                notify_dispatch_mod.retry_failed_notify_deliveries(
+                    limit=10,
+                    max_attempts=3,
+                    stale_pending_minutes=10,
+                    data_task_notify_fn=create_autospec(
+                        ct_mod.post_data_task_gateway_notify,
+                        side_effect=_synthetic_retry,
+                    ),
+                )
+            )
+            owned_tasks.append(retry_task)
+            retry_started = asyncio.create_task(retry_entered.wait())
+            owned_tasks.append(retry_started)
+            await asyncio.wait(
+                [retry_task, retry_started], timeout=5.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if retry_task.done():
+                await retry_task
+            assert retry_entered.is_set(), await _read_race_state()
+            assert await _read_race_state() == {
+                "outer": {
+                    "attempt_count": 3,
+                    "status": "pending",
+                    "error_code": None,
+                },
+                "run_notify_status": "pending_dispatch",
+            }
+
+            release_failed_write.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(scheduler_task, timeout=5.0)
+
+            # After old scheduler cancellation cleanup, the new retry's attempt_count=3 is untouched!
+            assert await _read_race_state() == {
+                "outer": {
+                    "attempt_count": 3,
+                    "status": "pending",
+                    "error_code": None,
+                },
+                "run_notify_status": "pending_dispatch",
+            }
+            assert mark_calls == [
+                {
+                    "status": "failed",
+                    "error_code": "synthetic_retryable",
+                    "expected_attempt_count": 2,
+                    "updated": True,
+                }
+            ]
+
+            release_retry.set()
+            retry_sent_count = await asyncio.wait_for(retry_task, timeout=5.0)
+            assert retry_sent_count == 1
+            status = await sched_mod.dispatch_data_task_run_notification(
+                sched_conn,
+                lock_conn=lock_conn,
+                run_id=race_run,
+                job_key="softbank-nav-monitor",
+                db_outbox_payload=outbox_doc,
+                path_map=path_map,
+                evaluate_eligibility_fn=create_autospec(
+                    notify_dispatch_mod.evaluate_user_notify_eligibility,
+                    return_value=(True, None, [target]),
+                ),
+            )
+            assert status == "dispatched"
+            assert await _read_race_state() == {
+                "outer": {
+                    "attempt_count": 3,
+                    "status": "sent",
+                    "error_code": None,
+                },
+                "run_notify_status": "dispatched",
+            }
+            await sched_mod.release_scheduler_lock(lock_conn, close_conn=False)
+        finally:
+            await sched_conn.close()
+            await lock_conn.close()
+    finally:
+        release_failed_write.set()
+        release_retry.set()
+        for t in owned_tasks:
+            if not t.done():
+                t.cancel()
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_deliveries WHERE run_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_runs WHERE run_id = ANY(%s::uuid[])",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key = 'softbank-nav-monitor'"
+            )
+            await cur.execute(
+                "DELETE FROM user_preferences WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM users WHERE user_id = %s",
+                (pm_uid,),
+            )
+        await admin_conn.close()
+
+

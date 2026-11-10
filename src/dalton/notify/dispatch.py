@@ -1144,7 +1144,7 @@ async def evaluate_user_notify_eligibility(
     return (True, None, effective_targets)
 
 
-async def claim_target_delivery(
+async def claim_target_delivery_with_attempt(
     execution_id: str,
     channel: str,
     target: str,
@@ -1153,18 +1153,18 @@ async def claim_target_delivery(
     automation_id: str | None = None,
     payload: Mapping[str, Any] | None = None,
     stale_pending_minutes: int = 10,
-) -> bool:
-    """Atomically claim or retry a ``(execution_id, channel, target)`` row in ``dalton_notify_deliveries``.
+) -> tuple[bool, int | None]:
+    """Atomically claim or retry a ``(execution_id, channel, target)`` row and return ``(claimed, attempt_count)``.
 
-    Returns ``True`` when the row is newly inserted as ``pending`` or transitioned from
-    ``failed`` (or stale ``pending`` older than ``stale_pending_minutes``) with
-    ``attempt_count < 3`` to ``pending``.
+    Uses a single ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING delivery_id, attempt_count``
+    statement so the caller receives the exact ``attempt_count`` of the claimed attempt without
+    a separate unlocked ``SELECT``.
     """
     exec_id = (execution_id or "").strip()
     ch = (channel or "").strip().lower()
     tgt = (target or "").strip()
     if not (exec_id and ch and tgt):
-        return False
+        return False, None
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -1230,7 +1230,7 @@ async def claim_target_delivery(
                     )
                 )
                   AND dalton_notify_deliveries.attempt_count < 3
-                RETURNING delivery_id
+                RETURNING delivery_id, attempt_count
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1245,7 +1245,58 @@ async def claim_target_delivery(
                 ),
             )
             row = await cur.fetchone()
-            return row is not None
+            if row is None:
+                return False, None
+            if isinstance(row, Mapping):
+                raw_attempt = row.get("attempt_count")
+                try:
+                    attempt_count = (
+                        int(raw_attempt) if raw_attempt is not None else 1
+                    )
+                except (TypeError, ValueError):
+                    attempt_count = 1
+                return True, attempt_count
+            if isinstance(row, (tuple, list)):
+                if len(row) >= 2 and row[1] is not None:
+                    try:
+                        return True, int(row[1])
+                    except (TypeError, ValueError):
+                        return True, 1
+                if len(row) == 1 and isinstance(row[0], int):
+                    return True, int(row[0])
+            return True, 1
+
+
+async def claim_target_delivery(
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    user_id: str = "",
+    automation_id: str | None = None,
+    payload: Mapping[str, Any] | None = None,
+    stale_pending_minutes: int = 10,
+    return_attempt_count: bool = False,
+) -> bool | tuple[bool, int | None]:
+    """Atomically claim or retry a ``(execution_id, channel, target)`` row in ``dalton_notify_deliveries``.
+
+    Returns ``True`` when the row is newly inserted as ``pending`` or transitioned from
+    ``failed`` (or stale ``pending`` older than ``stale_pending_minutes``) with
+    ``attempt_count < 3`` to ``pending``. When ``return_attempt_count=True``, returns
+    ``(claimed_ok, attempt_count)`` from the same ``RETURNING`` clause.
+    """
+    claimed_ok, attempt_count = await claim_target_delivery_with_attempt(
+        execution_id,
+        channel,
+        target,
+        user_id=user_id,
+        automation_id=automation_id,
+        payload=payload,
+        stale_pending_minutes=stale_pending_minutes,
+    )
+    if return_attempt_count:
+        return claimed_ok, attempt_count
+    return claimed_ok
 
 
 async def mark_target_delivery(
@@ -1469,36 +1520,22 @@ async def _invoke_mark_delivery(
         "status": status,
         "error_code": effective_code,
     }
-    side_effect = getattr(mark_fn, "side_effect", None)
-    eff_fn = side_effect if callable(side_effect) else mark_fn
-    if (
-        reason is not None
-        and _callable_accepts_kwarg(mark_fn, "reason")
-        and _callable_accepts_kwarg(eff_fn, "reason")
-    ):
+    if reason is not None and _callable_accepts_kwarg(mark_fn, "reason"):
         kwargs["reason"] = reason
-    if (
-        expected_status is not None
-        and _callable_accepts_kwarg(mark_fn, "expected_status")
-        and _callable_accepts_kwarg(eff_fn, "expected_status")
+    if expected_status is not None and _callable_accepts_kwarg(
+        mark_fn, "expected_status"
     ):
         kwargs["expected_status"] = expected_status
-    if (
-        expected_attempt_count is not None
-        and _callable_accepts_kwarg(mark_fn, "expected_attempt_count")
-        and _callable_accepts_kwarg(eff_fn, "expected_attempt_count")
+    if expected_attempt_count is not None and _callable_accepts_kwarg(
+        mark_fn, "expected_attempt_count"
     ):
         kwargs["expected_attempt_count"] = expected_attempt_count
-    if (
-        expected_updated_at is not None
-        and _callable_accepts_kwarg(mark_fn, "expected_updated_at")
-        and _callable_accepts_kwarg(eff_fn, "expected_updated_at")
+    if expected_updated_at is not None and _callable_accepts_kwarg(
+        mark_fn, "expected_updated_at"
     ):
         kwargs["expected_updated_at"] = expected_updated_at
-    if (
-        exclude_uncertain_data_task
-        and _callable_accepts_kwarg(mark_fn, "exclude_uncertain_data_task")
-        and _callable_accepts_kwarg(eff_fn, "exclude_uncertain_data_task")
+    if exclude_uncertain_data_task and _callable_accepts_kwarg(
+        mark_fn, "exclude_uncertain_data_task"
     ):
         kwargs["exclude_uncertain_data_task"] = True
     res = await mark_fn(
@@ -1560,10 +1597,11 @@ async def _shielded_mark_failed(
     expected_status: str | Sequence[str] | None = "pending",
     expected_attempt_count: int | None = None,
     timeout_s: float = 3.0,
+    on_settled: Callable[[], None] | None = None,
 ) -> None:
     """Mark a claimed row ``failed`` under ``asyncio.shield`` with a ``timeout_s`` deadline."""
-    await _run_shielded_mark(
-        _invoke_mark_delivery(
+    async def _do_mark() -> None:
+        await _invoke_mark_delivery(
             mark_fn,
             execution_id,
             channel,
@@ -1573,7 +1611,12 @@ async def _shielded_mark_failed(
             reason=reason,
             expected_status=expected_status,
             expected_attempt_count=expected_attempt_count,
-        ),
+        )
+        if on_settled is not None:
+            on_settled()
+
+    await _run_shielded_mark(
+        _do_mark(),
         timeout_s=timeout_s,
     )
 
@@ -1588,10 +1631,11 @@ async def _shielded_mark_uncertain(
     expected_status: str | Sequence[str] | None = "pending",
     expected_attempt_count: int | None = None,
     timeout_s: float = 3.0,
+    on_settled: Callable[[], None] | None = None,
 ) -> None:
     """Persist ``status='pending'`` with an uncertain ``error_code`` under ``asyncio.shield``."""
-    await _run_shielded_mark(
-        _invoke_mark_delivery(
+    async def _do_mark() -> None:
+        await _invoke_mark_delivery(
             mark_fn,
             execution_id,
             channel,
@@ -1600,7 +1644,12 @@ async def _shielded_mark_uncertain(
             error_code=error_code,
             expected_status=expected_status,
             expected_attempt_count=expected_attempt_count,
-        ),
+        )
+        if on_settled is not None:
+            on_settled()
+
+    await _run_shielded_mark(
+        _do_mark(),
         timeout_s=timeout_s,
     )
 
@@ -1611,7 +1660,7 @@ async def claim_execution_notify(
     target: str = "all",
 ) -> bool:
     """Claim delivery for ``(execution_id, channel, target)`` in ``dalton_notify_deliveries``."""
-    return await claim_target_delivery(execution_id, channel, target)
+    return bool(await claim_target_delivery(execution_id, channel, target))
 
 
 async def post_bridge_notify(
@@ -1831,18 +1880,14 @@ async def _invoke_post_notify(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     extra_kwargs: dict[str, Any] = {}
-    side_effect = getattr(post_notify_fn, "side_effect", None)
-    eff_fn = side_effect if callable(side_effect) else post_notify_fn
-    if images is not None and _callable_accepts_kwarg(post_notify_fn, "images") and _callable_accepts_kwarg(eff_fn, "images"):
+    if images is not None and _callable_accepts_kwarg(post_notify_fn, "images"):
         extra_kwargs["images"] = images
-    if run_id is not None and _callable_accepts_kwarg(post_notify_fn, "run_id") and _callable_accepts_kwarg(eff_fn, "run_id"):
+    if run_id is not None and _callable_accepts_kwarg(post_notify_fn, "run_id"):
         extra_kwargs["run_id"] = run_id
 
-    if _callable_accepts_kwarg(post_notify_fn, "card") and _callable_accepts_kwarg(eff_fn, "card"):
-        return await post_notify_fn(targets, text, card=card, **extra_kwargs)
     if _callable_accepts_kwarg(post_notify_fn, "card"):
         try:
-            return await post_notify_fn(targets, text, card=card)
+            return await post_notify_fn(targets, text, card=card, **extra_kwargs)
         except TypeError:
             pass
     return await post_notify_fn(targets, text)
@@ -2068,6 +2113,10 @@ async def retry_failed_notify_deliveries(
     sent_count = 0
     started_at = time.monotonic()
     uncertain_codes_list = sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
+    custom_mark = (
+        mark_delivery_fn if mark_delivery_fn is not mark_target_delivery else None
+    )
+    reconciler_used = False
     try:
         if reconcile_data_tasks_fn is not None or post_notify_fn is post_bridge_notify:
             reconciler = reconcile_data_tasks_fn
@@ -2077,9 +2126,7 @@ async def retry_failed_notify_deliveries(
                 )
 
                 reconciler = reconcile_uncertain_data_task_deliveries
-            custom_mark = (
-                mark_delivery_fn if mark_delivery_fn is not mark_target_delivery else None
-            )
+            reconciler_used = True
             sent_count += await reconciler(
                 limit=limit,
                 max_duration_s=max_duration_s,
@@ -2193,6 +2240,19 @@ async def retry_failed_notify_deliveries(
             try:
                 if is_data_task_row and is_uncertain_notify_error_code(row_error_code):
                     continue
+                if is_data_task_row and reconciler_used:
+                    from src.dalton.database.data_task_notifications import (
+                        reconcile_single_data_task_delivery_row,
+                    )
+
+                    if await reconcile_single_data_task_delivery_row(
+                        row,
+                        uncertain_codes=uncertain_codes_list,
+                        mark_delivery_fn=custom_mark,
+                        allow_retry_candidate_statuses=True,
+                    ):
+                        sent_count += 1
+                        continue
                 if attempt_count >= max_attempts:
                     async with get_db_connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:

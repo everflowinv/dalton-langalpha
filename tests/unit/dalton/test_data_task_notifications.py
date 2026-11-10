@@ -789,7 +789,11 @@ async def test_gateway_transport_and_wrapping_layers_preserve_uncertain_state_an
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
+        _ = (expected_updated_at, exclude_uncertain_data_task)
         marked_calls.append(
             {
                 "execution_id": execution_id,
@@ -799,6 +803,7 @@ async def test_gateway_transport_and_wrapping_layers_preserve_uncertain_state_an
                 "error_code": error_code,
                 "reason": reason,
                 "expected_status": expected_status,
+                "expected_attempt_count": expected_attempt_count,
             }
         )
         return True
@@ -2902,6 +2907,11 @@ async def test_native_send_cancellation_and_stale_scanner_version_guards(
         "reconcile_uncertain_data_task_deliveries",
         create_autospec(dtn_db.reconcile_uncertain_data_task_deliveries, return_value=0),
     )
+    monkeypatch.setattr(
+        dtn_db,
+        "reconcile_single_data_task_delivery_row",
+        create_autospec(dtn_db.reconcile_single_data_task_delivery_row, return_value=False),
+    )
 
     recorded_marks: list[dict[str, Any]] = []
 
@@ -3198,6 +3208,11 @@ async def test_outer_mark_operational_error_and_shielded_cleanup_cancellation_pr
         "reconcile_uncertain_data_task_deliveries",
         create_autospec(dtn_db.reconcile_uncertain_data_task_deliveries, return_value=0),
     )
+    monkeypatch.setattr(
+        dtn_db,
+        "reconcile_single_data_task_delivery_row",
+        create_autospec(dtn_db.reconcile_single_data_task_delivery_row, return_value=False),
+    )
 
     # -------------------------------------------------------------------------
     # 1. `retry_failed_notify_deliveries`: transient `psycopg.OperationalError` on first mark
@@ -3437,8 +3452,12 @@ async def test_outer_mark_operational_error_and_shielded_cleanup_cancellation_pr
             error_code: str | None = None,
             reason: str | None = None,
             expected_status: Any = None,
+            expected_attempt_count: int | None = None,
+            expected_updated_at: Any = None,
+            exclude_uncertain_data_task: bool = False,
             _calls: list[dict[str, Any]] = sched_marks,
         ) -> bool:
+            _ = (expected_updated_at, exclude_uncertain_data_task)
             _calls.append(
                 {
                     "execution_id": execution_id,
@@ -3448,6 +3467,7 @@ async def test_outer_mark_operational_error_and_shielded_cleanup_cancellation_pr
                     "error_code": error_code,
                     "reason": reason,
                     "expected_status": expected_status,
+                    "expected_attempt_count": expected_attempt_count,
                 }
             )
             if len(_calls) == 1:
@@ -3515,7 +3535,11 @@ async def test_outer_mark_operational_error_and_shielded_cleanup_cancellation_pr
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
+        _ = (expected_updated_at, exclude_uncertain_data_task)
         write_entered.set()
         await release_write.wait()
         cleanup_completed.append(
@@ -3527,6 +3551,7 @@ async def test_outer_mark_operational_error_and_shielded_cleanup_cancellation_pr
                 "error_code": error_code,
                 "reason": reason,
                 "expected_status": expected_status,
+                "expected_attempt_count": expected_attempt_count,
             }
         )
         return True
@@ -3629,3 +3654,749 @@ async def test_notification_mark_deadline_bounds_async_cancellation_cleanup(
                 task.exception()
         await asyncio.sleep(0)
     assert all(task not in notify_dispatch_mod._pending_mark_cleanup for task in writes)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_and_retry_recover_completed_items_with_null_error_code_or_attempts_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. `pending / error_code=None / attempt_count=3` with all original-identity items `sent` recovers
+       outer `sent` (`error_code=None`, `attempt_count=3`) and run `dispatched` via both
+       `reconcile_uncertain_data_task_deliveries` and `retry_failed_notify_deliveries` (including its
+       pre-exhaustion / pre-revocation check) with 0 send calls.
+    2. Incomplete items (`in_flight`) do not recover and transition to `failed / attempts_exhausted`
+       on stale retry; when those original-identity items subsequently become `sent`, reconciliation
+       recovers outer `sent` (`error_code=None`, `attempt_count=3`) and run `dispatched`.
+    3. Wrong recipient identity or partial item completion never recovers `sent`.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+
+    from src.dalton.llm.model_prefs import (
+        resolve_dalton_notify_enabled,
+        resolve_dalton_notify_overrides,
+        resolve_dalton_notify_routes,
+        resolve_dalton_notify_targets,
+    )
+
+    run_ready = str(uuid4())
+    run_late = str(uuid4())
+    owner_uid = "pm-rec-a"
+    orig_recipient = "ou_orig_rec_a"
+    wrong_recipient = "ou_wrong_rec_b"
+    target = "feishu:@me"
+    observed_ts = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+
+    def _make_keys(rid: str, rec: str) -> list[str]:
+        return [
+            dtn_db.build_data_task_item_delivery_key(
+                run_id=rid,
+                platform="feishu",
+                recipient_id=rec,
+                item_index=0,
+            ),
+            dtn_db.build_data_task_item_delivery_key(
+                run_id=rid,
+                platform="feishu",
+                recipient_id=rec,
+                item_index=1,
+            ),
+        ]
+
+    ready_keys = _make_keys(run_ready, orig_recipient)
+    late_keys = _make_keys(run_late, orig_recipient)
+    wrong_late_keys = _make_keys(run_late, wrong_recipient)
+
+    ready_meta = dtn_db.build_reconcile_identity_metadata(
+        platform="feishu",
+        recipient_id=orig_recipient,
+        canonical_target_address=target,
+        delivery_keys=ready_keys,
+    )
+    late_meta = dtn_db.build_reconcile_identity_metadata(
+        platform="feishu",
+        recipient_id=orig_recipient,
+        canonical_target_address=target,
+        delivery_keys=late_keys,
+    )
+
+    outer_rows: dict[str, dict[str, Any]] = {
+        run_ready: {
+            "execution_id": run_ready,
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": owner_uid,
+            "channel": "feishu",
+            "target": target,
+            "status": "pending",
+            "attempt_count": 3,
+            "error_code": None,
+            "updated_at": observed_ts,
+            "payload_json": {
+                "route_key": "data:softbank-nav-monitor",
+                "text": "Ready report",
+                **ready_meta,
+            },
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": False,
+            "data_task_notify_enabled": False,
+        },
+        run_late: {
+            "execution_id": run_late,
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": owner_uid,
+            "channel": "feishu",
+            "target": target,
+            "status": "pending",
+            "attempt_count": 3,
+            "error_code": None,
+            "updated_at": observed_ts,
+            "payload_json": {
+                "route_key": "data:softbank-nav-monitor",
+                "text": "Late report",
+                **late_meta,
+            },
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": True,
+            "data_task_notify_enabled": True,
+        },
+    }
+    run_notify_status: dict[str, str] = {
+        run_ready: "pending_dispatch",
+        run_late: "pending_dispatch",
+    }
+    channel_items: dict[str, dict[str, Any]] = {
+        ready_keys[0]: {
+            "delivery_key": ready_keys[0],
+            "run_id": run_ready,
+            "user_id": owner_uid,
+            "platform": "feishu",
+            "target_address": target,
+            "status": "sent",
+        },
+        ready_keys[1]: {
+            "delivery_key": ready_keys[1],
+            "run_id": run_ready,
+            "user_id": owner_uid,
+            "platform": "feishu",
+            "target_address": target,
+            "status": "sent",
+        },
+        late_keys[0]: {
+            "delivery_key": late_keys[0],
+            "run_id": run_late,
+            "user_id": owner_uid,
+            "platform": "feishu",
+            "target_address": target,
+            "status": "sent",
+        },
+        late_keys[1]: {
+            "delivery_key": late_keys[1],
+            "run_id": run_late,
+            "user_id": owner_uid,
+            "platform": "feishu",
+            "target_address": target,
+            "status": "in_flight",
+        },
+        wrong_late_keys[0]: {
+            "delivery_key": wrong_late_keys[0],
+            "run_id": run_late,
+            "user_id": owner_uid,
+            "platform": "feishu",
+            "target_address": target,
+            "status": "sent",
+        },
+        wrong_late_keys[1]: {
+            "delivery_key": wrong_late_keys[1],
+            "run_id": run_late,
+            "user_id": owner_uid,
+            "platform": "feishu",
+            "target_address": target,
+            "status": "sent",
+        },
+    }
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self.rowcount = 0
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self) -> _FakeCursor:
+            return self
+
+        async def __aexit__(self, *_a: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.split())
+            self.rowcount = 0
+            self._rows = []
+            if "FROM dalton_notify_deliveries d" in norm and "ORDER BY" in norm:
+                if "LEFT JOIN automations a" in norm:
+                    # `retry_failed_notify_deliveries` candidate scan
+                    self._rows = [
+                        dict(r)
+                        for r in outer_rows.values()
+                        if r["status"] in ("pending", "failed")
+                    ]
+                else:
+                    # `reconcile_uncertain_data_task_deliveries` candidate scan
+                    assert "d.error_code IS NULL" in norm
+                    assert "attempts_exhausted" in norm
+                    uncertain_set = set(params[0]) if params else set()
+                    for r in outer_rows.values():
+                        st = r["status"]
+                        ec = r["error_code"] or ""
+                        if (
+                            st == "pending"
+                            and (r["error_code"] is None or ec == "" or ec in uncertain_set)
+                        ) or (st == "failed" and ec == "attempts_exhausted"):
+                            self._rows.append(dict(r))
+            elif "FROM dalton_channel_deliveries" in norm and "WHERE delivery_key = ANY" in norm:
+                keys_req, r_id, u_id, plat, tgt_addr = params
+                self._rows = [
+                    {"delivery_key": k, "status": channel_items[k]["status"]}
+                    for k in keys_req
+                    if k in channel_items
+                    and channel_items[k]["run_id"] == r_id
+                    and channel_items[k]["user_id"] == u_id
+                    and channel_items[k]["platform"] == plat
+                    and channel_items[k]["target_address"] == tgt_addr
+                ]
+            elif norm.startswith("UPDATE dalton_notify_deliveries SET status = 'sent'"):
+                exec_id = params[0]
+                row = outer_rows.get(exec_id)
+                if row is not None:
+                    if "status IN ('pending', 'failed')" in norm:
+                        can_update = row["status"] in ("pending", "failed")
+                    else:
+                        assert "error_code IS NULL" in norm
+                        assert "attempts_exhausted" in norm
+                        uncertain_set = set(params[3])
+                        ec = row["error_code"] or ""
+                        can_update = (
+                            row["status"] == "pending"
+                            and (row["error_code"] is None or ec == "" or ec in uncertain_set)
+                        ) or (row["status"] == "failed" and ec == "attempts_exhausted")
+                    if can_update:
+                        row["status"] = "sent"
+                        row["error_code"] = None
+                        self.rowcount = 1
+            elif norm.startswith("UPDATE dalton_data_task_runs r SET notify_status = 'dispatched'"):
+                r_id = params[0]
+                if (
+                    run_notify_status.get(r_id) == "pending_dispatch"
+                    and outer_rows[r_id]["status"] == "sent"
+                ):
+                    run_notify_status[r_id] = "dispatched"
+                    self.rowcount = 1
+            elif norm.startswith("UPDATE dalton_notify_deliveries SET status = 'failed', error_code = 'attempts_exhausted'"):
+                exec_id = params[0]
+                row = outer_rows.get(exec_id)
+                if row is not None and row["status"] == "pending" and row["attempt_count"] >= 3:
+                    row["status"] = "failed"
+                    row["error_code"] = "attempts_exhausted"
+                    self.rowcount = 1
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _FakeConn:
+        def cursor(self, **_kw: Any) -> _FakeCursor:
+            return _FakeCursor()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_db_conn(_c: Any = None):
+        yield _FakeConn()
+
+    for mod in (dtn_db, notify_dispatch_mod):
+        monkeypatch.setattr(
+            mod,
+            "get_db_connection",
+            create_autospec(mod.get_db_connection, side_effect=_fake_db_conn),
+        )
+
+    send_spy = create_autospec(ct_mod.post_data_task_gateway_notify)
+
+    async def _is_admin(_uid: str | None) -> bool:
+        return True
+
+    # 1. `retry_failed_notify_deliveries` recovers `run_ready` (`pending/None/3`, items `sent`) to `sent` + `dispatched`
+    #    with 0 send calls, while transitioning incomplete `run_late` (`pending/None/3`, item 1 `in_flight`) to `failed/attempts_exhausted`
+    reconciled_via_retry = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=send_spy,
+        resolve_enabled_fn=create_autospec(resolve_dalton_notify_enabled, return_value=True),
+        resolve_overrides_fn=create_autospec(resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(resolve_dalton_notify_targets, return_value=[]),
+        resolve_routes_fn=create_autospec(resolve_dalton_notify_routes, return_value={}),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+    )
+    assert reconciled_via_retry == 1
+    assert send_spy.call_count == 0
+    assert outer_rows[run_ready]["status"] == "sent"
+    assert outer_rows[run_ready]["error_code"] is None
+    assert outer_rows[run_ready]["attempt_count"] == 3
+    assert run_notify_status[run_ready] == "dispatched"
+
+    # Incomplete `run_late` was NOT falsely recovered by `wrong_recipient`'s `sent` rows, and is now `failed/attempts_exhausted`
+    assert outer_rows[run_late]["status"] == "failed"
+    assert outer_rows[run_late]["error_code"] == "attempts_exhausted"
+    assert outer_rows[run_late]["attempt_count"] == 3
+    assert run_notify_status[run_late] == "pending_dispatch"
+
+    # 2. Also verify per-row pre-exhaustion/pre-revocation recovery inside `retry_failed_notify_deliveries`
+    #    when top-of-function `reconcile_data_tasks_fn` returns 0 (simulating completion right before candidate check)
+    outer_rows[run_ready]["status"] = "pending"
+    outer_rows[run_ready]["error_code"] = None
+    run_notify_status[run_ready] = "pending_dispatch"
+
+    async def _noop_top_reconcile(**_kw: Any) -> int:
+        return 0
+
+    per_row_recovered = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        reconcile_data_tasks_fn=_noop_top_reconcile,
+        data_task_notify_fn=send_spy,
+        resolve_enabled_fn=create_autospec(resolve_dalton_notify_enabled, return_value=False),
+        resolve_overrides_fn=create_autospec(resolve_dalton_notify_overrides, return_value={}),
+        resolve_targets_fn=create_autospec(resolve_dalton_notify_targets, return_value=[]),
+        resolve_routes_fn=create_autospec(resolve_dalton_notify_routes, return_value={}),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+    )
+    assert per_row_recovered == 1
+    assert send_spy.call_count == 0
+    assert outer_rows[run_ready]["status"] == "sent"
+    assert outer_rows[run_ready]["error_code"] is None
+    assert run_notify_status[run_ready] == "dispatched"
+
+    # 3. Late completion of `run_late`'s second item (`late_keys[1] -> 'sent'`) recovers `failed/attempts_exhausted`
+    #    to `sent` (`error_code=None`, `attempt_count=3`) and run `dispatched` with 0 send calls!
+    channel_items[late_keys[1]]["status"] = "sent"
+    late_reconciled = await dtn_db.reconcile_uncertain_data_task_deliveries(limit=10)
+    assert late_reconciled == 1
+    assert send_spy.call_count == 0
+    assert outer_rows[run_late]["status"] == "sent"
+    assert outer_rows[run_late]["error_code"] is None
+    assert outer_rows[run_late]["attempt_count"] == 3
+    assert run_notify_status[run_late] == "dispatched"
+
+
+@pytest.mark.asyncio
+async def test_claim_target_delivery_with_attempt_and_scheduler_expected_attempt_count_protection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. `claim_target_delivery_with_attempt` and `claim_target_delivery` share the single atomic
+       `INSERT ... ON CONFLICT ... RETURNING delivery_id, attempt_count` query (no unlocked SELECT),
+       returning `(True, 1)` on initial claim, `(True, 2)` on failed re-claim, `(False, None)` on
+       competing claim failure, and `bool` for legacy callers.
+    2. `dispatch_data_task_run_notification` passes each target's atomically claimed `expected_attempt_count`
+       across `not allowed`, `recipient_identity_conflict`, `skipped`, `pending/uncertain`, `sent`, `failed`,
+       `except Exception`, and `except asyncio.CancelledError`.
+    3. When `dispatch_data_task_run_notification` is cancelled while `_shielded_mark_failed` is awaiting its
+       already-committed failure write (`expected_attempt_count=2`) and a new retry claims `attempt_count=3`,
+       the old scheduler does NOT perform a duplicate `CancelledError` write and cannot overwrite `attempt_count=3`.
+    """
+    from contextlib import asynccontextmanager
+
+    from src.dalton.data_jobs import scheduler as sched_mod
+
+    # -------------------------------------------------------------------------
+    # 1. `claim_target_delivery_with_attempt` & `claim_target_delivery` SQL and return shapes
+    # -------------------------------------------------------------------------
+    executed_claim_sql: list[str] = []
+    returning_queue: list[tuple[Any, ...] | None] = [
+        ("deliv-1", 1),
+        ("deliv-1", 2),
+        None,
+        ("deliv-2", 1),
+        None,
+        ("deliv-3", 2),
+    ]
+
+    class _ClaimCur:
+        async def __aenter__(self) -> _ClaimCur:
+            return self
+
+        async def __aexit__(self, *_a: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, _params: Any = None) -> None:
+            executed_claim_sql.append(" ".join(sql.split()))
+
+        async def fetchone(self) -> tuple[Any, ...] | None:
+            return returning_queue.pop(0) if returning_queue else None
+
+    class _ClaimConn:
+        def cursor(self, **_kw: Any) -> _ClaimCur:
+            return _ClaimCur()
+
+    @asynccontextmanager
+    async def _claim_conn_cm(_c: Any = None):
+        yield _ClaimConn()
+
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "get_db_connection",
+        create_autospec(notify_dispatch_mod.get_db_connection, side_effect=_claim_conn_cm),
+    )
+
+    assert (
+        await notify_dispatch_mod.claim_target_delivery_with_attempt(
+            "exec-c1", "feishu", "feishu:@me", user_id="u-1", automation_id="data:sb"
+        )
+        == (True, 1)
+    )
+    assert (
+        await notify_dispatch_mod.claim_target_delivery_with_attempt(
+            "exec-c1", "feishu", "feishu:@me", user_id="u-1", automation_id="data:sb"
+        )
+        == (True, 2)
+    )
+    assert (
+        await notify_dispatch_mod.claim_target_delivery_with_attempt(
+            "exec-c1", "feishu", "feishu:@me", user_id="u-1", automation_id="data:sb"
+        )
+        == (False, None)
+    )
+    assert (
+        await notify_dispatch_mod.claim_target_delivery(
+            "exec-c2", "feishu", "feishu:@me", user_id="u-1", automation_id="data:sb"
+        )
+        is True
+    )
+    assert (
+        await notify_dispatch_mod.claim_target_delivery(
+            "exec-c2", "feishu", "feishu:@me", user_id="u-1", automation_id="data:sb"
+        )
+        is False
+    )
+    assert (
+        await notify_dispatch_mod.claim_target_delivery(
+            "exec-c3",
+            "feishu",
+            "feishu:@me",
+            user_id="u-1",
+            automation_id="data:sb",
+            return_attempt_count=True,
+        )
+        == (True, 2)
+    )
+    assert len(executed_claim_sql) == 6
+    for q in executed_claim_sql:
+        assert "RETURNING delivery_id, attempt_count" in q
+        assert not q.upper().startswith("SELECT ")
+
+    # -------------------------------------------------------------------------
+    # 2. `dispatch_data_task_run_notification` passes per-target `expected_attempt_count`
+    # -------------------------------------------------------------------------
+    path_map = build_path_map(host_var_dir=tmp_path / "hb", backend_var_dir=tmp_path / "bb")
+    monkeypatch.setattr(
+        sched_mod,
+        "get_configured_pm_user_ids",
+        create_autospec(sched_mod.get_configured_pm_user_ids, return_value=["pm-b-1"]),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "check_scheduler_lock",
+        create_autospec(sched_mod.check_scheduler_lock, return_value=None),
+    )
+
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+    cursor.fetchone.return_value = (1,)
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.closed = False
+
+    @asynccontextmanager
+    async def _cur_cm(*_a: Any, **_kw: Any):
+        yield cursor
+
+    @asynccontextmanager
+    async def _tx_cm(*_a: Any, **_kw: Any):
+        yield
+
+    conn.cursor.side_effect = _cur_cm
+    conn.transaction.side_effect = _tx_cm
+
+    run_multi = str(uuid4())
+    rdir_multi = path_map.backend_run_artifacts_dir(run_multi)
+    rdir_multi.mkdir(parents=True, exist_ok=True)
+    (rdir_multi / "outbox.json").write_text(
+        json.dumps({"feishu_message": "Multi-target attempt count check"}),
+        encoding="utf-8",
+    )
+
+    tgt_a = "feishu:chat:oc_target_a"
+    tgt_b = "feishu:chat:oc_target_b"
+    tgt_c = "feishu:chat:oc_target_c"
+    attempt_map = {tgt_a: 1, tgt_b: 2, tgt_c: 3}
+    recorded_marks: list[dict[str, Any]] = []
+
+    async def _claim_by_target(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        user_id: str = "",
+        automation_id: str | None = None,
+        payload: dict | None = None,
+        stale_pending_minutes: int = 10,
+        return_attempt_count: bool = False,
+    ) -> bool | tuple[bool, int | None]:
+        _ = (execution_id, channel, user_id, automation_id, payload, stale_pending_minutes)
+        att = attempt_map[target]
+        return (True, att) if return_attempt_count else True
+
+    async def _record_mark(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        reason: str | None = None,
+        expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
+    ) -> bool:
+        _ = (expected_updated_at, exclude_uncertain_data_task)
+        recorded_marks.append(
+            {
+                "execution_id": execution_id,
+                "channel": channel,
+                "target": target,
+                "status": status,
+                "error_code": error_code,
+                "reason": reason,
+                "expected_status": expected_status,
+                "expected_attempt_count": expected_attempt_count,
+            }
+        )
+        return True
+
+    async def _multi_post(
+        targets: Any,
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> dict[str, Any]:
+        _ = (text, card, images, run_id, gateway_url, service_token, timeout_s, http_client)
+        tgt = targets[0]
+        if tgt == tgt_a:
+            return {
+                "ok": True,
+                "status": "sent",
+                "results": [{"target": tgt_a, "ok": True, "status": "sent"}],
+            }
+        if tgt == tgt_b:
+            return {
+                "ok": False,
+                "status": "failed",
+                "results": [
+                    {
+                        "target": tgt_b,
+                        "ok": False,
+                        "status": "failed",
+                        "error_code": "synthetic_retryable",
+                    }
+                ],
+            }
+        return {
+            "ok": True,
+            "status": "skipped",
+            "results": [
+                {
+                    "target": tgt_c,
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "no_changes",
+                }
+            ],
+        }
+
+    await sched_mod.dispatch_data_task_run_notification(
+        conn,
+        lock_conn=conn,
+        run_id=run_multi,
+        job_key="softbank-nav-monitor",
+        path_map=path_map,
+        evaluate_eligibility_fn=create_autospec(
+            notify_dispatch_mod.evaluate_user_notify_eligibility,
+            return_value=(True, None, [tgt_a, tgt_b, tgt_c]),
+        ),
+        claim_target_fn=create_autospec(
+            notify_dispatch_mod.claim_target_delivery,
+            side_effect=_claim_by_target,
+        ),
+        post_notify_fn=create_autospec(
+            ct_mod.post_data_task_gateway_notify,
+            side_effect=_multi_post,
+        ),
+        mark_target_fn=create_autospec(
+            notify_dispatch_mod.mark_target_delivery,
+            side_effect=_record_mark,
+        ),
+        fetch_deliveries_fn=create_autospec(
+            notify_dispatch_mod.fetch_execution_deliveries,
+            return_value=[],
+        ),
+    )
+
+    assert [
+        (m["target"], m["status"], m["error_code"], m["expected_attempt_count"])
+        for m in recorded_marks
+    ] == [
+        (tgt_a, "sent", None, 1),
+        (tgt_b, "failed", "synthetic_retryable", 2),
+        (tgt_c, "skipped", "no_changes", 3),
+    ]
+
+    # Also verify `not allowed` branch passes `expected_attempt_count`
+    recorded_marks.clear()
+    await sched_mod.dispatch_data_task_run_notification(
+        conn,
+        lock_conn=conn,
+        run_id=run_multi,
+        job_key="softbank-nav-monitor",
+        path_map=path_map,
+        evaluate_eligibility_fn=create_autospec(
+            notify_dispatch_mod.evaluate_user_notify_eligibility,
+            return_value=(False, "toggle_off", [tgt_b]),
+        ),
+        claim_target_fn=create_autospec(
+            notify_dispatch_mod.claim_target_delivery,
+            side_effect=_claim_by_target,
+        ),
+        post_notify_fn=create_autospec(ct_mod.post_data_task_gateway_notify),
+        mark_target_fn=create_autospec(
+            notify_dispatch_mod.mark_target_delivery,
+            side_effect=_record_mark,
+        ),
+        fetch_deliveries_fn=create_autospec(
+            notify_dispatch_mod.fetch_execution_deliveries,
+            return_value=[],
+        ),
+    )
+    assert [
+        (m["target"], m["status"], m["error_code"], m["expected_attempt_count"])
+        for m in recorded_marks
+    ] == [(tgt_b, "skipped", "toggle_off", 2)]
+
+    # -------------------------------------------------------------------------
+    # 3. `scheduler_cancel_with_new_retry` race:
+    #    Scheduler commits `failed` (`expected_attempt_count=2`), gets cancelled while
+    #    `_shielded_mark_failed` is still awaiting return, and retry advances row to `attempt_count=3, status='pending'`.
+    #    Old scheduler does NOT perform a duplicate `CancelledError` write and leaves `attempt_count=3` intact.
+    # -------------------------------------------------------------------------
+    race_state = {"attempt_count": 2, "status": "pending", "error_code": None}
+    race_marks: list[dict[str, Any]] = []
+    first_failed_written = asyncio.Event()
+    release_failed_write = asyncio.Event()
+
+    async def _coordinated_race_mark(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        reason: str | None = None,
+        expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
+    ) -> bool:
+        _ = (execution_id, channel, target, reason, expected_updated_at, exclude_uncertain_data_task)
+        updated = (
+            (expected_status is None or race_state["status"] == expected_status)
+            and (
+                expected_attempt_count is None
+                or race_state["attempt_count"] == expected_attempt_count
+            )
+        )
+        if updated:
+            race_state["status"] = status
+            race_state["error_code"] = error_code
+        race_marks.append(
+            {
+                "status": status,
+                "error_code": error_code,
+                "expected_attempt_count": expected_attempt_count,
+                "updated": updated,
+            }
+        )
+        if status == "failed" and not first_failed_written.is_set():
+            first_failed_written.set()
+            await release_failed_write.wait()
+        return updated
+
+    race_task = asyncio.create_task(
+        sched_mod.dispatch_data_task_run_notification(
+            conn,
+            lock_conn=conn,
+            run_id=run_multi,
+            job_key="softbank-nav-monitor",
+            path_map=path_map,
+            evaluate_eligibility_fn=create_autospec(
+                notify_dispatch_mod.evaluate_user_notify_eligibility,
+                return_value=(True, None, [tgt_b]),
+            ),
+            claim_target_fn=create_autospec(
+                notify_dispatch_mod.claim_target_delivery,
+                side_effect=_claim_by_target,
+            ),
+            post_notify_fn=create_autospec(
+                ct_mod.post_data_task_gateway_notify,
+                side_effect=_multi_post,
+            ),
+            mark_target_fn=create_autospec(
+                notify_dispatch_mod.mark_target_delivery,
+                side_effect=_coordinated_race_mark,
+            ),
+            fetch_deliveries_fn=create_autospec(
+                notify_dispatch_mod.fetch_execution_deliveries,
+                return_value=[],
+            ),
+        )
+    )
+    await first_failed_written.wait()
+    assert race_state == {
+        "attempt_count": 2,
+        "status": "failed",
+        "error_code": "synthetic_retryable",
+    }
+    # Cancel scheduler while `_shielded_mark_failed` is still awaiting return, and simulate retry claiming attempt 3
+    race_task.cancel()
+    await asyncio.sleep(0)
+    race_state.update({"attempt_count": 3, "status": "pending", "error_code": None})
+    release_failed_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await race_task
+
+    assert race_marks == [
+        {
+            "status": "failed",
+            "error_code": "synthetic_retryable",
+            "expected_attempt_count": 2,
+            "updated": True,
+        }
+    ]
+    assert race_state == {
+        "attempt_count": 3,
+        "status": "pending",
+        "error_code": None,
+    }
+

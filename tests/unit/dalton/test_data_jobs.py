@@ -4340,12 +4340,13 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         automation_id: str | None = None,
         payload: Any = None,
         stale_pending_minutes: int = 10,
-    ) -> bool:
+        return_attempt_count: bool = False,
+    ) -> bool | tuple[bool, int]:
         _ = (user_id, automation_id, payload, stale_pending_minutes)
         delivery_ledger.setdefault((execution_id, channel, target), []).append(
             ("pending", None)
         )
-        return True
+        return (True, 1) if return_attempt_count else True
 
     async def _fake_mark(
         execution_id: str,
@@ -4356,6 +4357,9 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
         _ = expected_status
         delivery_ledger.setdefault((execution_id, channel, target), []).append(
@@ -4666,10 +4670,11 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         automation_id: str | None = None,
         payload: Any = None,
         stale_pending_minutes: int = 10,
-    ) -> bool:
+        return_attempt_count: bool = False,
+    ) -> bool | tuple[bool, int]:
         _ = (execution_id, user_id, automation_id, payload, stale_pending_minutes)
         persisted_rows_7[(channel, target)] = "pending"
-        return True
+        return (True, 1) if return_attempt_count else True
 
     async def _mark_and_update_7b(
         execution_id: str,
@@ -4680,6 +4685,9 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
         _ = (execution_id, error_code, reason, expected_status)
         persisted_rows_7[(channel, target)] = status
