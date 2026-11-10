@@ -837,11 +837,30 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         which takes the user's write lock. A fold of a former Home takes that
         lock before the automation rows it moves, so it is taken first here
         too, or the two wait on each other."""
+        # DALTON-HOOK(company-automations): lock user_preferences before locking the automation row
+        if plan.create or plan.update:
+            from src.dalton.database.company_automations import (
+                lock_and_fetch_user_preferences_for_snapshot,
+            )
+        if plan.create:
+            plan.prelocked_pref_row = await lock_and_fetch_user_preferences_for_snapshot(  # type: ignore[attr-defined]
+                user_id,
+                conn=conn,
+                notify_storage_mode="legacy",
+            )
+            return None
         if not (plan.update or plan.delete):
             return None
         if plan.update and plan.update.fields:
             async with conn.cursor() as cur:
                 await lock_user_writes(cur, user_id)
+        if plan.update:
+            notify_mode = str((row or {}).get("notify_storage_mode") or "legacy")
+            plan.prelocked_pref_row = await lock_and_fetch_user_preferences_for_snapshot(  # type: ignore[attr-defined]
+                user_id,
+                conn=conn,
+                notify_storage_mode=notify_mode,
+            )
         locked = await auto_db.get_automation_file(user_id, self.file_name, conn=conn, lock=True)
         return _version(locked) if locked else ""
 
@@ -901,6 +920,8 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             coalesce_file_update_with_action,
         )
 
+        prelocked_pref = getattr(plan, "prelocked_pref_row", None)
+
         if delete := plan.delete:
             await auto_db.delete_automation(delete.automation_id, user_id, conn=conn)
             report = f'Deleted "{delete.name}" ({self.file_name}), with its run history'
@@ -910,6 +931,7 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             with coalesce_file_update_with_action(
                 has_fields=bool(update.fields),
                 has_action=bool(update.action),
+                prelocked_pref_row=prelocked_pref,
             ):
                 if update.fields:
                     row = await step(
@@ -952,7 +974,11 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 warning = lifecycle.delivery_warning((update.fields.get("delivery_config") or {}).get("methods"))
 
         if create := plan.create:
-            with coalesce_file_create_pause(pause=bool(create.pause)):
+            # DALTON-HOOK(company-automations): coalesce create+pause into single v1 history entry
+            with coalesce_file_create_pause(
+                pause=bool(create.pause),
+                prelocked_pref_row=prelocked_pref,
+            ):
                 row = await step(
                     lifecycle.create_automation,
                     user_id,

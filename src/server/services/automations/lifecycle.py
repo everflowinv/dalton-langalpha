@@ -475,7 +475,7 @@ async def update_automation(
     model_pref: dict[str, Any] | None = None,
     current: Dict[str, Any] | None = None,
     delivery_checked: bool = False,
-    expected_config_version: Any = None,
+    expected_config_version: Any = None,  # DALTON-HOOK(company-automations)
 ) -> Optional[Dict[str, Any]]:
     """Update an automation with validation and next_run_at recalculation.
 
@@ -529,6 +529,7 @@ async def update_automation(
     update = AutomationUpdate.model_validate(
         fields, context={"trigger_type": current["trigger_type"]}
     )
+    # DALTON-HOOK(company-automations): strip expected_config_version from database update kwargs
     update_kwargs = update.model_dump(
         exclude_unset=True, exclude={"trigger_type", "expected_config_version"}
     )
@@ -875,6 +876,7 @@ async def pause_automation(
             field="status",
         )
 
+    # DALTON-HOOK(company-automations): reconcile locked pause state and record pause history
     async def _reconcile_locked_pause(
         locked_row: Any,
         effective_kwargs: Dict[str, Any],
@@ -900,6 +902,7 @@ async def pause_automation(
         if outer_ctx is not None and outer_ctx.has_explicit_actor
         else user_id
     )
+    # DALTON-HOOK(company-automations): bind pause history context for database update
     with automation_history_context(
         actor_user_id=eff_actor_for_ctx,
         action="pause",
@@ -988,6 +991,7 @@ async def resume_automation(
             )
     # A price trigger has no next_run_at: it is only re-activated.
 
+    # DALTON-HOOK(company-automations): reconcile locked resume state and record resume history
     async def _reconcile_locked_resume(
         locked_row: Any,
         effective_kwargs: Dict[str, Any],
@@ -1028,6 +1032,7 @@ async def resume_automation(
         if outer_ctx is not None and outer_ctx.has_explicit_actor
         else user_id
     )
+    # DALTON-HOOK(company-automations): bind resume history context for database update
     with automation_history_context(
         actor_user_id=eff_actor_for_ctx,
         action="resume",

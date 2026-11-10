@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import inspect
 from pathlib import Path
@@ -2235,3 +2235,238 @@ async def test_au1_resolve_effective_once_run_at_precedence_and_legacy_fallback(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_au1_notify_snapshot_parity_with_model_prefs_and_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.llm import model_prefs
+    from src.dalton.notify import dispatch
+
+    row = {
+        "automation_id": AUTO_TRACKING_ID,
+        "user_id": INTERNAL_UID,
+        "name": "dalton-earnings-calendar",
+        "metadata": {},
+        "scope": "research_tracking",
+        "notify_storage_mode": "legacy",
+    }
+
+    cases: list[tuple[str, dict[str, Any], bool, tuple[bool, list[str]]]] = [
+        ("missing_master_and_missing_targets", {}, True, (False, [])),
+        (
+            "explicit_master_false_with_targets",
+            {
+                "dalton_notify_enabled": False,
+                "dalton_notify_targets": [
+                    "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                ],
+            },
+            True,
+            (False, ["feishu:user:ou_0123456789abcdef0123456789abcdef"]),
+        ),
+        (
+            "explicit_master_true_personal_targets",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [
+                    "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                ],
+            },
+            True,
+            (True, ["feishu:user:ou_0123456789abcdef0123456789abcdef"]),
+        ),
+        (
+            "routes_have_personal_but_targets_missing",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            True,
+            (True, []),
+        ),
+        (
+            "routes_have_personal_but_targets_empty",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [],
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            True,
+            (True, []),
+        ),
+        (
+            "routes_have_group_only_internal_user",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            True,
+            (True, ["feishu:chat:oc_0123456789abcdef0123456789abcdef"]),
+        ),
+        (
+            "routes_have_group_only_external_user",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            False,
+            (True, []),
+        ),
+    ]
+
+    for label, model_pref, allow_groups, expected in cases:
+        pref_row = {"model_preference": model_pref, "other_preference": {}}
+
+        async def _fake_get_prefs(_uid: str, _pr: dict[str, Any] = pref_row) -> dict[str, Any]:
+            return _pr
+
+        async def _fake_is_admin(_uid: str | None = None, _ag: bool = allow_groups) -> bool:
+            return _ag
+
+        monkeypatch.setattr(model_prefs, "get_user_preferences", _fake_get_prefs)
+        monkeypatch.setattr(access_tiers, "is_internal_or_admin", _fake_is_admin)
+
+        snap_enabled, snap_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            row, pref_row=pref_row
+        )
+        assert (snap_enabled, snap_routes) == expected, label
+
+        master = await model_prefs.resolve_dalton_notify_enabled(INTERNAL_UID)
+        personal_targets = await model_prefs.resolve_dalton_notify_targets(INTERNAL_UID)
+        overrides = await model_prefs.resolve_dalton_notify_overrides(INTERNAL_UID)
+        routes = await model_prefs.resolve_dalton_notify_routes(INTERNAL_UID)
+        classification = dispatch.classify_automation_for_notify(row)
+        _cat, task_eff, _src = dispatch.resolve_automation_notify_state(
+            row, overrides, routes
+        )
+        routed = dispatch.resolve_notify_route_targets(
+            row, routes, personal_targets, include_chat_targets=allow_groups
+        )
+        prod_routes = (
+            routed
+            if routed is not None
+            else (list(personal_targets) if classification is not None else [])
+        )
+        prod_enabled = bool(master and task_eff)
+        assert (snap_enabled, snap_routes) == (prod_enabled, prod_routes), label
+
+    # task_row mode reads directly from row without consulting user_preferences
+    task_row_probe = {
+        **row,
+        "scope": "company",
+        "notify_storage_mode": "task_row",
+        "notify_enabled": True,
+        "notify_routes": ["feishu:chat:oc_company_1"],
+    }
+    tr_enabled, tr_routes = await company_auto_db.resolve_snapshot_notify_fields(
+        task_row_probe
+    )
+    assert tr_enabled is True
+    assert tr_routes == ["feishu:chat:oc_company_1"]
+
+
+@pytest.mark.asyncio
+async def test_au1_once_coalesced_update_pause_and_timezone_offset_normalization() -> None:
+    from datetime import timezone
+
+    t_old = datetime(2035, 6, 15, 10, 0, tzinfo=UTC)
+    t_new = datetime(2035, 6, 16, 11, 0, tzinfo=UTC)
+
+    # 1. Equivalent instant with +08:00 vs +00:00 normalizes to canonical UTC ISO and produces no false diff
+    tz_plus8 = timezone(timedelta(hours=8))
+    dt_plus8 = datetime(2035, 6, 15, 18, 0, tzinfo=tz_plus8)
+    assert company_auto_db._to_iso_str(dt_plus8) == "2035-06-15T10:00:00+00:00"
+    assert (
+        company_auto_db._to_iso_str("2035-06-15T18:00:00+08:00")
+        == "2035-06-15T10:00:00+00:00"
+    )
+    assert (
+        company_auto_db._to_iso_str("2035-06-15T10:00:00Z")
+        == "2035-06-15T10:00:00+00:00"
+    )
+
+    v1_cols = await company_auto_db.build_create_history_columns(
+        {
+            **_sample_automation_row(),
+            "trigger_type": "once",
+            "cron_expression": None,
+            "next_run_at": dt_plus8,
+        },
+        actor_user_id=INTERNAL_UID,
+        desired_status="active",
+        pref_row={},
+        changed_at_iso="2026-11-10T00:00:00+00:00",
+    )
+    v1_snap = v1_cols["audit_history"][0]["snapshot"]
+    assert v1_snap["once_run_at"] == "2035-06-15T10:00:00+00:00"
+
+    # Legacy snapshot with +08:00 compared against +00:00 equivalent instant produces no false diff
+    legacy_snap_plus8 = {**v1_snap, "once_run_at": "2035-06-15T18:00:00+08:00"}
+    assert company_auto_svc.compute_snapshot_changes(legacy_snap_plus8, v1_snap) == {}
+    assert legacy_snap_plus8["once_run_at"] == "2035-06-15T18:00:00+08:00"
+
+    # 2. Coalesced AutomationFile save: Step 1 updates next_run_at (t_old -> t_new), Step 2 pauses (status='paused')
+    base_pre_row = {
+        **_sample_automation_row(
+            config_version=1,
+            active_version=1,
+        ),
+        "trigger_type": "once",
+        "cron_expression": None,
+        "audit_history": [
+            {
+                "version": 1,
+                "prev_version": None,
+                "restored_from_version": None,
+                "actor_user_id": INTERNAL_UID,
+                "changed_at": "2026-11-10T00:00:00+00:00",
+                "action": "create",
+                "changes": {},
+                "snapshot": {**v1_snap, "once_run_at": t_old.isoformat()},
+            }
+        ],
+        "status": "active",
+        "next_run_at": t_old,
+        "metadata": {"once_schedule_at": t_old.isoformat()},
+    }
+    locked_row_step2 = {
+        **base_pre_row,
+        "next_run_at": t_new,
+        "metadata": {"once_schedule_at": t_new.isoformat()},
+    }
+    hist_cols_v2, is_noop = await company_auto_db.prepare_update_history_columns(
+        locked_row_step2,
+        {"status": "paused"},
+        actor_user_id=INTERNAL_UID,
+        action="update",
+        pref_row={},
+        base_pre_row=base_pre_row,
+        changed_at_iso="2026-11-10T01:00:00+00:00",
+    )
+    assert is_noop is False
+    assert hist_cols_v2["config_version"] == 2
+    v2_entry = hist_cols_v2["audit_history"][-1]
+    assert v2_entry["snapshot"]["desired_status"] == "paused"
+    assert v2_entry["snapshot"]["once_run_at"] == t_new.isoformat()
+    assert v2_entry["changes"] == {
+        "desired_status": {"old": "active", "new": "paused"},
+        "once_run_at": {"old": t_old.isoformat(), "new": t_new.isoformat()},
+    }

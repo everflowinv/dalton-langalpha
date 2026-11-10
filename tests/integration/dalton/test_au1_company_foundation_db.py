@@ -3274,6 +3274,85 @@ async def test_au1_batch_a_once_schedule_preservation_and_automation_file_coales
                 },
             }
 
+    # 5b. AutomationFile simultaneous once next_run_at edit + status="paused" -> single v1 -> v2 with once_run_at & desired_status in changes
+    res_once_file_create = await _livefs_save(
+        "file-once-coalesce.json",
+        {
+            "name": "File Once Coalesce",
+            "description": "Initial once file",
+            "trigger_type": "once",
+            "next_run_at": "2035-06-15T10:00:00Z",
+            "timezone": "UTC",
+            "status": "active",
+            "instruction": "Run once initial",
+        },
+    )
+    assert "created" in res_once_file_create["message"].lower()
+
+    res_once_file_upd_pause = await _livefs_save(
+        "file-once-coalesce.json",
+        {
+            "name": "File Once Coalesce",
+            "description": "Initial once file",
+            "trigger_type": "once",
+            "next_run_at": "2035-06-16T11:00:00Z",
+            "timezone": "UTC",
+            "status": "paused",
+            "instruction": "Run once initial",
+        },
+    )
+    assert "paused" in res_once_file_upd_pause["message"].lower()
+
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM automations WHERE user_id = %s AND file_name = 'file-once-coalesce.json'",
+                (uid,),
+            )
+            once_coal_row = await cur.fetchone()
+            assert once_coal_row is not None
+            assert once_coal_row["status"] == "paused"
+            assert once_coal_row["config_version"] == 2
+            assert once_coal_row["active_version"] == 2
+            assert (
+                once_coal_row["metadata"]["once_schedule_at"]
+                == "2035-06-16T11:00:00+00:00"
+            )
+            assert len(once_coal_row["audit_history"]) == 2
+            v2_once_coal = once_coal_row["audit_history"][1]
+            assert v2_once_coal["version"] == 2
+            assert v2_once_coal["prev_version"] == 1
+            assert v2_once_coal["action"] == "update"
+            assert v2_once_coal["snapshot"]["desired_status"] == "paused"
+            assert (
+                v2_once_coal["snapshot"]["once_run_at"]
+                == "2035-06-16T11:00:00+00:00"
+            )
+            assert v2_once_coal["changes"] == {
+                "desired_status": {"old": "active", "new": "paused"},
+                "once_run_at": {
+                    "old": "2035-06-15T10:00:00+00:00",
+                    "new": "2035-06-16T11:00:00+00:00",
+                },
+            }
+
+    # Resuming the coalesced once task (v2 -> v3) only changes desired_status, no delayed once_run_at diff!
+    resumed_once_coal = await lifecycle_mod.resume_automation(
+        str(once_coal_row["automation_id"]), uid
+    )
+    assert resumed_once_coal is not None
+    assert resumed_once_coal["config_version"] == 3
+    once_coal_hist_v3 = await _hist_row(str(once_coal_row["automation_id"]))
+    assert len(once_coal_hist_v3["audit_history"]) == 3
+    v3_once_coal = once_coal_hist_v3["audit_history"][2]
+    assert v3_once_coal["action"] == "resume"
+    assert (
+        v3_once_coal["snapshot"]["once_run_at"] == "2035-06-16T11:00:00+00:00"
+    )
+    assert v3_once_coal["changes"] == {
+        "desired_status": {"old": "paused", "new": "active"},
+    }
+
     # 6. AutomationFile simultaneous field edit + Step 2 failure in commit():
     #    Step 2 raises 409, and outer transaction rolls back Step 1's field edit + history completely!
     paused_future_once = await auto_db.create_automation(
@@ -3462,6 +3541,83 @@ async def test_au1_batch_a_dalton_schedule_system_jobs_tracking_and_runtime_isol
         "resume",
     ]
 
+    # 1b. schedule_dalton_automation_helper once task with +08:00 timestamp:
+    #     repeat with identical +08:00 or equivalent +00:00 stays v1; genuinely different time bumps to v2
+    once_sched_create = await schedule_dalton_automation_helper(
+        name="dalton-nvda-once-offset",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Once offset check",
+            "instruction": "Run once with offset",
+            "next_run_at": "2035-06-15T18:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert once_sched_create["ok"] is True
+    assert once_sched_create["action"] == "created"
+    once_offset_id = once_sched_create["automation_id"]
+    once_offset_hist1 = await _hist_row(once_offset_id)
+    assert once_offset_hist1["config_version"] == 1
+    assert (
+        once_offset_hist1["audit_history"][0]["snapshot"]["once_run_at"]
+        == "2035-06-15T10:00:00+00:00"
+    )
+
+    # Repeat with identical +08:00 string -> no version bump!
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-once-offset",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Once offset check",
+            "instruction": "Run once with offset",
+            "next_run_at": "2035-06-15T18:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert (await _hist_row(once_offset_id))["config_version"] == 1
+
+    # Repeat with equivalent UTC +00:00 string -> no version bump!
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-once-offset",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Once offset check",
+            "instruction": "Run once with offset",
+            "next_run_at": "2035-06-15T10:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert (await _hist_row(once_offset_id))["config_version"] == 1
+
+    # Genuinely different instant -> bumps to v2 and records changes.once_run_at
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-once-offset",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Once offset check",
+            "instruction": "Run once with offset",
+            "next_run_at": "2035-06-16T18:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    once_offset_hist2 = await _hist_row(once_offset_id)
+    assert once_offset_hist2["config_version"] == 2
+    assert len(once_offset_hist2["audit_history"]) == 2
+    assert once_offset_hist2["audit_history"][1]["changes"] == {
+        "once_run_at": {
+            "old": "2035-06-15T10:00:00+00:00",
+            "new": "2035-06-16T10:00:00+00:00",
+        }
+    }
+
     # 2. toggle_system_job on Home job (`dalton-earnings-calendar`) + idempotent repeat calls
     await sys_jobs_mod.toggle_system_job(
         uid, "dalton-earnings-calendar", enabled=True, actor_user_id=pm_actor
@@ -3601,3 +3757,217 @@ async def test_au1_batch_a_dalton_schedule_system_jobs_tracking_and_runtime_isol
     assert after_runtime["config_version"] == before_runtime["config_version"]
     assert after_runtime["active_version"] == before_runtime["active_version"]
     assert after_runtime["audit_history"] == before_runtime["audit_history"]
+
+
+@pytest.mark.asyncio
+async def test_au1_batch_a_notify_snapshot_parity_and_transactional_preference_lock_real_db(
+    au1_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from ptc_agent.agent.backends.automations import AutomationsBackend
+    from ptc_agent.core.sandbox.livefs_mount import CallContext
+    from src.server.database import user as user_db
+    from src.server.database.user_lock import lock_user_profile
+
+    uid = "u-hist-notify-lock"
+    ws_id = str(uuid.uuid4())
+    thread_id = str(uuid.uuid4())
+
+    async with au1_live_pool.connection() as conn:
+        await _insert_user(conn, uid, "notify-lock@dalton.test")
+        await _insert_workspace(conn, ws_id, uid, "Notify-Lock-WS")
+
+    monkeypatch.setattr(access_tiers, "is_internal_or_admin", lambda _u: _coro(True))
+
+    # 1. User initially has NO user_preferences row.
+    #    Open a preference transaction on conn_pref holding lock_user_profile(cur, uid),
+    #    start create_automation concurrently, verify create_automation blocks until conn_pref commits,
+    #    and verify v1 snapshot records the newly committed preferences!
+    pref_locked_evt = asyncio.Event()
+    release_pref_tx_evt = asyncio.Event()
+    create_done_evt = asyncio.Event()
+
+    async def _pref_writer_initial() -> None:
+        async with au1_live_pool.connection() as conn_pref, conn_pref.transaction():
+            async with conn_pref.cursor(row_factory=dict_row) as cur:
+                await lock_user_profile(cur, uid)
+                await cur.execute(
+                    """
+                    INSERT INTO user_preferences (user_id, model_preference)
+                    VALUES (%s, %s::jsonb)
+                    ON CONFLICT (user_id) DO UPDATE SET model_preference = EXCLUDED.model_preference
+                    """,
+                    (
+                        uid,
+                        json.dumps(
+                            {
+                                "dalton_notify_enabled": True,
+                                "dalton_notify_targets": [
+                                    "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                                ],
+                            }
+                        ),
+                    ),
+                )
+                pref_locked_evt.set()
+                await release_pref_tx_evt.wait()
+
+    async def _concurrent_create() -> dict[str, Any]:
+        await pref_locked_evt.wait()
+        res = await auto_db.create_automation(
+            user_id=uid,
+            name="dalton-earnings-calendar",
+            file_name="earnings-cal-lock.json",
+            trigger_type="cron",
+            cron_expression="0 8 * * 1-5",
+            timezone="Asia/Shanghai",
+            instruction="Check earnings calendar",
+            workspace_id=ws_id,
+        )
+        create_done_evt.set()
+        return res
+
+    pref_task = asyncio.create_task(_pref_writer_initial())
+    create_task = asyncio.create_task(_concurrent_create())
+    await asyncio.wait_for(pref_locked_evt.wait(), timeout=5)
+    await asyncio.sleep(0.05)
+    # create_automation must still be waiting on lock_user_profile!
+    assert not create_done_evt.is_set()
+    release_pref_tx_evt.set()
+    created_row, _ = await asyncio.wait_for(
+        asyncio.gather(create_task, pref_task), timeout=10
+    )
+    auto_id = str(created_row["automation_id"])
+    hist_v1 = await company_auto_db.get_automation_history_row(auto_id)
+    assert hist_v1 is not None
+    snap_v1 = hist_v1["audit_history"][0]["snapshot"]
+    assert snap_v1["notify_enabled"] is True
+    assert snap_v1["notify_routes"] == [
+        "feishu:user:ou_0123456789abcdef0123456789abcdef"
+    ]
+
+    # 2. Routes contain personal target while dalton_notify_targets is omitted -> notify_routes is [] (not fabricated)
+    async with au1_live_pool.connection() as conn:
+        await conn.execute(
+            """
+            UPDATE user_preferences
+            SET model_preference = %s::jsonb
+            WHERE user_id = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "dalton_notify_enabled": True,
+                        "dalton_notify_routes": {
+                            "dalton-earnings-calendar": [
+                                "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                            ]
+                        },
+                    }
+                ),
+                uid,
+            ),
+        )
+    await lifecycle_mod.update_automation(
+        auto_id, uid, {"description": "Personal route without targets"}
+    )
+    hist_v2 = await company_auto_db.get_automation_history_row(auto_id)
+    assert hist_v2 is not None
+    snap_v2 = hist_v2["audit_history"][-1]["snapshot"]
+    assert snap_v2["notify_enabled"] is True
+    assert snap_v2["notify_routes"] == []
+
+    # 3. Concurrent preference update vs AutomationFile save:
+    #    Preference transaction holds lock_user_preferences and sets group route + master False;
+    #    AutomationFile.hold waits on lock_user_preferences BEFORE locking automations row,
+    #    and commits v3 snapshot with the committed preference state!
+    root_prefix = "/home/workspace/.agents/user/automations"
+    backend = AutomationsBackend(
+        user_id=uid,
+        call=CallContext(
+            workspace_id=ws_id, thread_id=thread_id, timezone="Asia/Shanghai"
+        ),
+        sandbox_backend=MagicMock(),
+        root_prefix=root_prefix,
+    )
+    file_path = f"{root_prefix}/earnings-cal-lock.json"
+    await backend.aread_range(file_path, 0, 2000)
+
+    pref2_locked_evt = asyncio.Event()
+    release_pref2_evt = asyncio.Event()
+    file_save_done_evt = asyncio.Event()
+
+    async def _pref_writer_second() -> None:
+        async with au1_live_pool.connection() as conn_pref2, conn_pref2.transaction():
+            await user_db.lock_user_preferences(uid, conn=conn_pref2)
+            await conn_pref2.execute(
+                """
+                UPDATE user_preferences
+                SET model_preference = %s::jsonb
+                WHERE user_id = %s
+                """,
+                (
+                    json.dumps(
+                        {
+                            "dalton_notify_enabled": False,
+                            "dalton_notify_routes": {
+                                "dalton-earnings-calendar": [
+                                    "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+                                ]
+                            },
+                        }
+                    ),
+                    uid,
+                ),
+            )
+            pref2_locked_evt.set()
+            await release_pref2_evt.wait()
+
+    async def _concurrent_file_save() -> dict[str, Any]:
+        await pref2_locked_evt.wait()
+        res = await backend.awrite_text(
+            file_path,
+            json.dumps(
+                {
+                    "name": "dalton-earnings-calendar",
+                    "description": "Updated via AutomationFile after pref lock",
+                    "trigger_type": "cron",
+                    "cron_expression": "0 8 * * 1-5",
+                    "timezone": "Asia/Shanghai",
+                    "status": "active",
+                    "instruction": "Check earnings calendar v3",
+                }
+            ),
+        )
+        file_save_done_evt.set()
+        return res
+
+    pref2_task = asyncio.create_task(_pref_writer_second())
+    file_task = asyncio.create_task(_concurrent_file_save())
+    await asyncio.wait_for(pref2_locked_evt.wait(), timeout=5)
+    await asyncio.sleep(0.05)
+    assert not file_save_done_evt.is_set()
+    release_pref2_evt.set()
+    await asyncio.wait_for(asyncio.gather(file_task, pref2_task), timeout=10)
+
+    hist_v3 = await company_auto_db.get_automation_history_row(auto_id)
+    assert hist_v3 is not None
+    assert hist_v3["config_version"] == 3
+    snap_v3 = hist_v3["audit_history"][-1]["snapshot"]
+    assert snap_v3["description"] == "Updated via AutomationFile after pref lock"
+    assert snap_v3["notify_enabled"] is False
+    assert snap_v3["notify_routes"] == [
+        "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+    ]
+    changes_v3 = hist_v3["audit_history"][-1]["changes"]
+    assert set(changes_v3) == {"description", "instruction"}
+    assert changes_v3["description"] == {
+        "old": snap_v2["description"],
+        "new": snap_v3["description"],
+    }
+    assert changes_v3["instruction"] == {
+        "old": snap_v2["instruction"],
+        "new": snap_v3["instruction"],
+    }

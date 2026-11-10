@@ -173,12 +173,15 @@ async def create_automation(
     its own, and a clash on it raises ``UniqueViolation``.
     """
     # DALTON-HOOK(company-automations): enforce non-company ownership, canonical scope, and v1 audit_history on create
+    import contextlib
     from datetime import timezone as _dt_tz
     from unittest.mock import NonCallableMock
     from src.dalton.company_identity import is_company_system_user
     from src.dalton.database.company_automations import (
+        _is_real_db_conn,
         _to_iso_str,
         build_create_history_columns,
+        lock_and_fetch_user_preferences_for_snapshot,
         resolve_automation_scope_for_write,
     )
     from src.dalton.services.company_automations import (
@@ -216,109 +219,127 @@ async def create_automation(
 
     clashes = 0
     async with get_db_connection(conn) as conn:
-        effective_scope = (
-            scope
-            if scope in ("personal", "research_tracking")
-            else await resolve_automation_scope_for_write(
-                user_id,
-                name=name,
-                workspace_id=workspace_id,
-                metadata=effective_metadata,
-                conn=conn,
+        is_real_conn = _is_real_db_conn(conn)
+        outer_tx = conn.transaction() if is_real_conn else contextlib.nullcontext()
+        # DALTON-HOOK(company-automations): lock user_preferences, build v1 snapshot, and insert in one transaction
+        async with outer_tx:
+            if (
+                coalesce_state is not None
+                and coalesce_state.prelocked_pref_row is not None
+            ):
+                pref_row = coalesce_state.prelocked_pref_row
+            elif hist_ctx is not None and hist_ctx.prelocked_pref_row is not None:
+                pref_row = hist_ctx.prelocked_pref_row
+            else:
+                pref_row = await lock_and_fetch_user_preferences_for_snapshot(
+                    user_id,
+                    conn=conn,
+                    notify_storage_mode="legacy",
+                )
+            effective_scope = (
+                scope
+                if scope in ("personal", "research_tracking")
+                else await resolve_automation_scope_for_write(
+                    user_id,
+                    name=name,
+                    workspace_id=workspace_id,
+                    metadata=effective_metadata,
+                    conn=conn,
+                )
             )
-        )
-        # DALTON-HOOK(company-automations): build initial v1 configuration snapshot and history
-        hist_cols = await build_create_history_columns(
-            {
-                "automation_id": automation_id,
-                "user_id": user_id,
-                "name": name,
-                "description": description,
-                "status": eff_status,
-                "trigger_type": trigger_type,
-                "cron_expression": cron_expression,
-                "next_run_at": next_run_at,
-                "trigger_config": trigger_config or {},
-                "timezone": timezone,
-                "instruction": instruction,
-                "workspace_id": workspace_id,
-                "llm_model": llm_model,
-                "additional_context": additional_context,
-                "thread_strategy": thread_strategy,
-                "conversation_thread_id": conversation_thread_id,
-                "max_failures": max_failures,
-                "delivery_config": delivery_config or {},
-                "metadata": effective_metadata,
-                "scope": effective_scope,
-                "notify_storage_mode": "legacy",
-            },
-            actor_user_id=effective_created_by,
-            desired_status=initial_desired_status,
-            changed_at_iso=now_iso,
-            conn=conn if not isinstance(conn, NonCallableMock) else None,
-        )
-        while True:
-            chosen = file_name or await _free_file_name(user_id, name, conn)
-            try:
-                # A savepoint inside a caller's transaction, so a clash
-                # leaves it usable for the next attempt.
-                async with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(f"""
-                        INSERT INTO automations (
-                            automation_id, user_id, name, file_name, description,
-                            trigger_type, cron_expression, timezone, trigger_config,
+            # DALTON-HOOK(company-automations): build initial v1 configuration snapshot and history
+            hist_cols = await build_create_history_columns(
+                {
+                    "automation_id": automation_id,
+                    "user_id": user_id,
+                    "name": name,
+                    "description": description,
+                    "status": eff_status,
+                    "trigger_type": trigger_type,
+                    "cron_expression": cron_expression,
+                    "next_run_at": next_run_at,
+                    "trigger_config": trigger_config or {},
+                    "timezone": timezone,
+                    "instruction": instruction,
+                    "workspace_id": workspace_id,
+                    "llm_model": llm_model,
+                    "additional_context": additional_context,
+                    "thread_strategy": thread_strategy,
+                    "conversation_thread_id": conversation_thread_id,
+                    "max_failures": max_failures,
+                    "delivery_config": delivery_config or {},
+                    "metadata": effective_metadata,
+                    "scope": effective_scope,
+                    "notify_storage_mode": "legacy",
+                },
+                actor_user_id=effective_created_by,
+                desired_status=initial_desired_status,
+                pref_row=pref_row,
+                changed_at_iso=now_iso,
+                conn=conn if not isinstance(conn, NonCallableMock) else None,
+            )
+            while True:
+                chosen = file_name or await _free_file_name(user_id, name, conn)
+                try:
+                    # A savepoint inside a caller's transaction, so a clash
+                    # leaves it usable for the next attempt.
+                    async with conn.transaction(), conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(f"""
+                            INSERT INTO automations (
+                                automation_id, user_id, name, file_name, description,
+                                trigger_type, cron_expression, timezone, trigger_config,
+                                next_run_at,
+                                instruction, workspace_id, llm_model, additional_context,
+                                thread_strategy, conversation_thread_id,
+                                status, max_failures, failure_count,
+                                delivery_config, metadata,
+                                scope, created_by, updated_by,
+                                config_version, active_version, audit_history,
+                                created_at, updated_at
+                            )
+                            VALUES (
+                                %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s,
+                                %s,
+                                %s, %s, %s, %s,
+                                %s, %s,
+                                %s, %s, 0,
+                                %s, %s,
+                                %s, %s, %s,
+                                %s, %s, %s,
+                                NOW(), NOW()
+                            )
+                            RETURNING {AUTOMATION_COLUMNS}
+                        """, (
+                            automation_id, user_id, name, chosen, description,
+                            trigger_type, cron_expression, timezone,
+                            Json(trigger_config or {}),
                             next_run_at,
-                            instruction, workspace_id, llm_model, additional_context,
+                            instruction, workspace_id, llm_model,
+                            Json(additional_context) if additional_context else None,
                             thread_strategy, conversation_thread_id,
-                            status, max_failures, failure_count,
-                            delivery_config, metadata,
-                            scope, created_by, updated_by,
-                            config_version, active_version, audit_history,
-                            created_at, updated_at
-                        )
-                        VALUES (
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s,
-                            %s, %s, %s, %s,
-                            %s, %s,
-                            %s, %s, 0,
-                            %s, %s,
-                            %s, %s, %s,
-                            %s, %s, %s,
-                            NOW(), NOW()
-                        )
-                        RETURNING {AUTOMATION_COLUMNS}
-                    """, (
-                        automation_id, user_id, name, chosen, description,
-                        trigger_type, cron_expression, timezone,
-                        Json(trigger_config or {}),
-                        next_run_at,
-                        instruction, workspace_id, llm_model,
-                        Json(additional_context) if additional_context else None,
-                        thread_strategy, conversation_thread_id,
-                        eff_status,  # DALTON-HOOK(coverage-tracking)
-                        max_failures,
-                        Json(delivery_config or {}),
-                        Json(effective_metadata),
-                        effective_scope,  # DALTON-HOOK(company-automations)
-                        effective_created_by,
-                        hist_cols["updated_by"],
-                        hist_cols["config_version"],
-                        hist_cols["active_version"],
-                        Json(hist_cols["audit_history"]),
-                    ))
-                    result = await cur.fetchone()
-            except UniqueViolation:
-                clashes += 1
-                if file_name is not None or clashes == _FILE_NAME_ATTEMPTS:
-                    raise
-                continue
-            logger.info(
-                f"[automation_db] create_automation automation_id={automation_id} "
-                f"user_id={user_id} trigger_type={trigger_type}"
-            )
-            return dict(result)
+                            eff_status,  # DALTON-HOOK(coverage-tracking)
+                            max_failures,
+                            Json(delivery_config or {}),
+                            Json(effective_metadata),
+                            effective_scope,  # DALTON-HOOK(company-automations)
+                            effective_created_by,
+                            hist_cols["updated_by"],
+                            hist_cols["config_version"],
+                            hist_cols["active_version"],
+                            Json(hist_cols["audit_history"]),
+                        ))
+                        result = await cur.fetchone()
+                except UniqueViolation:
+                    clashes += 1
+                    if file_name is not None or clashes == _FILE_NAME_ATTEMPTS:
+                        raise
+                    continue
+                logger.info(
+                    f"[automation_db] create_automation automation_id={automation_id} "
+                    f"user_id={user_id} trigger_type={trigger_type}"
+                )
+                return dict(result)
 
 
 # Whether the pinned thread is one a run of this automation created, which is
@@ -525,7 +546,7 @@ async def update_automation(
     from unittest.mock import NonCallableMock
     from src.dalton.database.company_automations import (
         _to_iso_str,
-        fetch_user_preferences_unlocked,
+        lock_and_fetch_user_preferences_for_snapshot,
         prepare_update_history_columns,
     )
     from src.dalton.services.company_automations import (
@@ -676,10 +697,31 @@ async def update_automation(
     async with get_db_connection(conn) as conn:
         is_mock_conn = isinstance(conn, NonCallableMock)
         if not is_mock_conn and (should_record or expected_cv is not None):
-            # DALTON-HOOK(company-automations): read user_preferences before locking automations row
-            pref_row = await fetch_user_preferences_unlocked(user_id, conn=conn)
             now_iso = datetime.now(_dt_tz.utc).isoformat()
             async with conn.transaction():
+                # DALTON-HOOK(company-automations): lock user_preferences inside transaction before locking automations row
+                coalesce = get_current_file_coalesce_state()
+                if should_record and not (
+                    coalesce is not None and coalesce.mode == "create_pause"
+                ):
+                    if (
+                        coalesce is not None
+                        and coalesce.prelocked_pref_row is not None
+                    ):
+                        pref_row = coalesce.prelocked_pref_row
+                    elif (
+                        hist_ctx is not None
+                        and hist_ctx.prelocked_pref_row is not None
+                    ):
+                        pref_row = hist_ctx.prelocked_pref_row
+                    else:
+                        pref_row = await lock_and_fetch_user_preferences_for_snapshot(
+                            user_id,
+                            conn=conn,
+                            notify_storage_mode="legacy",
+                        )
+                else:
+                    pref_row = {}
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         f"""
@@ -694,7 +736,6 @@ async def update_automation(
                     if not locked_row:
                         return None
 
-                    coalesce = get_current_file_coalesce_state()
                     if not (coalesce is not None and coalesce.mode == "create_pause"):
                         validate_existing_history_state(locked_row)
                         if (
@@ -911,19 +952,13 @@ async def claim_due_automations(
                 if not rows:
                     return []
 
+                from src.dalton.database.company_automations import _to_iso_str  # DALTON-HOOK(company-automations)
+
                 claimed = []
                 for row in rows:
                     automation_id = str(row["automation_id"])
                     execution_id = str(uuid4())
-                    once_iso = (
-                        row["next_run_at"].isoformat()
-                        if hasattr(row.get("next_run_at"), "isoformat")
-                        else (
-                            str(row["next_run_at"])
-                            if row.get("next_run_at") is not None
-                            else None
-                        )
-                    )
+                    once_iso = _to_iso_str(row.get("next_run_at"))
 
                     # DALTON-HOOK(company-automations): preserve once_schedule_at in metadata before clearing next_run_at
                     # Advance next_run_at to NULL (scheduler will recalculate)
@@ -954,6 +989,7 @@ async def claim_due_automations(
                     """, (execution_id, automation_id, row["next_run_at"], server_id))
 
                     entry = dict(row)
+                    # DALTON-HOOK(company-automations): reflect once_schedule_at on returned claimed entry
                     if str(row.get("trigger_type") or "") == "once" and once_iso:
                         merged_meta = dict(entry.get("metadata") or {})
                         merged_meta["once_schedule_at"] = once_iso

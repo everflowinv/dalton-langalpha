@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import NonCallableMock
+import uuid
 
 from psycopg.rows import dict_row
 
@@ -251,13 +252,53 @@ async def get_automation_history_row(
 def _to_iso_str(val: Any) -> str | None:
     if val is None:
         return None
+    if isinstance(val, datetime):
+        if val.tzinfo is not None and val.utcoffset() is not None:
+            return val.astimezone(UTC).isoformat()
+        return val.isoformat()
     if hasattr(val, "isoformat"):
         return val.isoformat()
     if isinstance(val, str):
         cleaned = val.strip()
-        return cleaned if cleaned else None
+        if not cleaned:
+            return None
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return parsed.astimezone(UTC).isoformat()
+        except ValueError:
+            pass
+        return cleaned
     cleaned = str(val).strip()
     return cleaned if cleaned else None
+
+
+def _is_real_db_conn(conn: Any) -> bool:
+    if conn is None or isinstance(conn, NonCallableMock):
+        return False
+    return hasattr(conn, "info") or hasattr(conn, "pgconn")
+
+
+async def lock_and_fetch_user_preferences_for_snapshot(
+    user_id: str,
+    *,
+    conn: Any,
+    notify_storage_mode: str | None = "legacy",
+) -> dict[str, Any]:
+    """Acquire the user's profile advisory lock in ``conn``'s transaction and read ``user_preferences``.
+
+    Skipped when ``notify_storage_mode == 'task_row'`` or ``conn`` is an in-memory unit-test double.
+    """
+    mode = str(notify_storage_mode or "legacy").strip() or "legacy"
+    if mode == "task_row":
+        return {}
+    clean_uid = normalize_scope_text(user_id)
+    if not clean_uid or not _is_real_db_conn(conn):
+        return {}
+    from src.server.database.user import lock_user_preferences
+
+    locked = await lock_user_preferences(clean_uid, conn=conn)
+    return dict(locked) if isinstance(locked, Mapping) else {}
 
 
 async def _resolve_effective_once_run_at(
@@ -396,8 +437,8 @@ async def resolve_snapshot_notify_fields(
 
     Uses ``row['notify_storage_mode']`` as the sole selector:
     - ``'task_row'``: read ``notify_enabled`` and ``notify_routes`` from ``row``.
-    - ``'legacy'``: resolve from owner's ``user_preferences`` without calling
-      ``lock_user_preferences``.
+    - ``'legacy'``: resolve from owner's ``user_preferences`` using the exact
+      same defaults and route intersection rules as ``model_prefs`` and ``dispatch``.
     """
     storage_mode = str(row.get("notify_storage_mode") or "legacy").strip() or "legacy"
     if storage_mode == "task_row":
@@ -440,7 +481,6 @@ async def resolve_snapshot_notify_fields(
         else await fetch_user_preferences_unlocked(owner_id, conn=conn)
     )
 
-    has_master = False
     master_enabled = False
     for bag_key in ("model_preference", "other_preference"):
         bag = effective_pref_row.get(bag_key)
@@ -448,22 +488,17 @@ async def resolve_snapshot_notify_fields(
             norm_en = _normalize_stored_value(
                 DALTON_NOTIFY_ENABLED_KEY, bag.get(DALTON_NOTIFY_ENABLED_KEY)
             )
-            if isinstance(norm_en, bool):
-                has_master = True
-                master_enabled = norm_en
-                break
+            master_enabled = bool(norm_en) if isinstance(norm_en, bool) else False
+            break
 
-    has_targets_key = False
     targets: list[str] = []
     for bag_key in ("model_preference", "other_preference"):
         bag = effective_pref_row.get(bag_key)
         if isinstance(bag, Mapping) and DALTON_NOTIFY_TARGETS_KEY in bag:
-            has_targets_key = True
             norm_tgts = _normalize_stored_value(
                 DALTON_NOTIFY_TARGETS_KEY, bag.get(DALTON_NOTIFY_TARGETS_KEY)
             )
-            if isinstance(norm_tgts, list):
-                targets = list(norm_tgts)
+            targets = list(norm_tgts) if isinstance(norm_tgts, list) else []
             break
 
     overrides: dict[str, bool] = {}
@@ -473,8 +508,7 @@ async def resolve_snapshot_notify_fields(
             norm_ov = _normalize_stored_value(
                 DALTON_NOTIFY_OVERRIDES_KEY, bag.get(DALTON_NOTIFY_OVERRIDES_KEY)
             )
-            if isinstance(norm_ov, Mapping):
-                overrides = dict(norm_ov)
+            overrides = dict(norm_ov) if isinstance(norm_ov, Mapping) else {}
             break
 
     routes_map: dict[str, list[str]] = {}
@@ -483,11 +517,10 @@ async def resolve_snapshot_notify_fields(
         norm_rt = _normalize_stored_value(
             DALTON_NOTIFY_ROUTES_KEY, mp_bag.get(DALTON_NOTIFY_ROUTES_KEY)
         )
-        if isinstance(norm_rt, Mapping):
-            routes_map = dict(norm_rt)
+        routes_map = dict(norm_rt) if isinstance(norm_rt, Mapping) else {}
 
     classification = classify_automation_for_notify(row)
-    cat, per_task_eff, _ = resolve_automation_notify_state(
+    _cat, per_task_eff, _ = resolve_automation_notify_state(
         row, overrides, routes_map
     )
 
@@ -496,20 +529,10 @@ async def resolve_snapshot_notify_fields(
     except Exception:
         include_chats = False
 
-    effective_configured_targets = targets
-    if not has_targets_key and routes_map:
-        fallback_personal: list[str] = []
-        for rt_list in routes_map.values():
-            if isinstance(rt_list, list):
-                for item in rt_list:
-                    if isinstance(item, str) and item.strip() and item.strip() not in fallback_personal:
-                        fallback_personal.append(item.strip())
-        effective_configured_targets = fallback_personal
-
     routed = resolve_notify_route_targets(
         row,
         routes_map,
-        effective_configured_targets,
+        targets,
         include_chat_targets=include_chats,
     )
     if routed is not None:
@@ -519,16 +542,7 @@ async def resolve_snapshot_notify_fields(
     else:
         effective_routes = []
 
-    if cat is None and classification is None:
-        custom_key = f"automation:{str(row.get('automation_id') or '').strip()}"
-        if custom_key in overrides and isinstance(overrides[custom_key], bool):
-            per_task_eff = overrides[custom_key]
-
-    if has_master and not master_enabled:
-        effective_enabled = False
-    else:
-        effective_enabled = bool(per_task_eff)
-
+    effective_enabled = bool(master_enabled and per_task_eff)
     return effective_enabled, effective_routes
 
 
@@ -537,6 +551,7 @@ async def build_create_history_columns(
     *,
     actor_user_id: str | None,
     desired_status: str = "active",
+    pref_row: Mapping[str, Any] | None = None,
     changed_at_iso: str,
     conn: Any = None,
 ) -> dict[str, Any]:
@@ -551,7 +566,7 @@ async def build_create_history_columns(
         else None
     )
     notify_enabled, notify_routes = await resolve_snapshot_notify_fields(
-        row_data, conn=conn
+        row_data, pref_row=pref_row, conn=conn
     )
     snapshot = build_automation_config_snapshot(
         row_data,
@@ -648,6 +663,10 @@ async def prepare_update_history_columns(
         and update_fields.get("next_run_at") is not None
     ):
         post_once_run_at = _to_iso_str(update_fields.get("next_run_at"))
+    elif base_pre_row is not None:
+        post_once_run_at = await _resolve_effective_once_run_at(
+            locked_row, conn=conn
+        )
     else:
         post_once_run_at = pre_once_run_at
 

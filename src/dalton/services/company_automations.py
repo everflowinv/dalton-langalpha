@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -47,6 +48,7 @@ class AutomationHistoryContext:
     locked_row_reconciler: (
         Callable[[Mapping[str, Any], dict[str, Any], Any], Awaitable[None]] | None
     ) = None
+    prelocked_pref_row: dict[str, Any] | None = None
 
     @property
     def has_explicit_actor(self) -> bool:
@@ -63,10 +65,11 @@ class AutomationHistoryContext:
 class FileCoalesceState:
     """State for coalescing two-step ``AutomationFile.commit`` operations into one version."""
 
-    mode: str  # "create_pause" or "update_action"
+    mode: str  # "create_pause", "update_action", or "single_file_op"
     has_action_step: bool = False
     step1_pre_row: dict[str, Any] | None = None
     step1_pref_row: dict[str, Any] | None = None
+    prelocked_pref_row: dict[str, Any] | None = None
 
 
 _HISTORY_CTX_VAR: ContextVar[AutomationHistoryContext | None] = ContextVar(
@@ -98,6 +101,7 @@ def automation_history_context(
     locked_row_reconciler: (
         Callable[[Mapping[str, Any], dict[str, Any], Any], Awaitable[None]] | None
     ) = None,
+    prelocked_pref_row: dict[str, Any] | None = None,
 ) -> Iterator[AutomationHistoryContext]:
     """Bind history recording parameters for the enclosed automation write call."""
     parent = _HISTORY_CTX_VAR.get()
@@ -121,6 +125,11 @@ def automation_history_context(
         if skip_if_unchanged is not None
         else (parent.skip_if_unchanged if parent is not None else False)
     )
+    eff_prelocked_pref = (
+        prelocked_pref_row
+        if prelocked_pref_row is not None
+        else (parent.prelocked_pref_row if parent is not None else None)
+    )
     ctx = AutomationHistoryContext(
         record_history=record_history,
         actor_user_id=eff_actor,
@@ -128,6 +137,7 @@ def automation_history_context(
         expected_config_version=eff_expected,
         skip_if_unchanged=eff_skip_unchanged,
         locked_row_reconciler=locked_row_reconciler,
+        prelocked_pref_row=eff_prelocked_pref,
     )
     token = _HISTORY_CTX_VAR.set(ctx)
     try:
@@ -137,12 +147,20 @@ def automation_history_context(
 
 
 @contextmanager
-def coalesce_file_create_pause(*, pause: bool) -> Iterator[FileCoalesceState | None]:
+def coalesce_file_create_pause(
+    *,
+    pause: bool,
+    prelocked_pref_row: dict[str, Any] | None = None,
+) -> Iterator[FileCoalesceState | None]:
     """Coalesce ``AutomationFile`` create + immediate pause into a single ``v1`` history entry."""
-    if not pause:
+    if not pause and prelocked_pref_row is None:
         yield None
         return
-    state = FileCoalesceState(mode="create_pause", has_action_step=True)
+    state = FileCoalesceState(
+        mode="create_pause" if pause else "single_file_op",
+        has_action_step=bool(pause),
+        prelocked_pref_row=prelocked_pref_row,
+    )
     token = _FILE_COALESCE_VAR.set(state)
     try:
         yield state
@@ -152,13 +170,21 @@ def coalesce_file_create_pause(*, pause: bool) -> Iterator[FileCoalesceState | N
 
 @contextmanager
 def coalesce_file_update_with_action(
-    *, has_fields: bool, has_action: bool
+    *,
+    has_fields: bool,
+    has_action: bool,
+    prelocked_pref_row: dict[str, Any] | None = None,
 ) -> Iterator[FileCoalesceState | None]:
     """Coalesce ``AutomationFile`` field update + pause/resume into one version increment."""
-    if not (has_fields and has_action):
+    both = bool(has_fields and has_action)
+    if not both and prelocked_pref_row is None:
         yield None
         return
-    state = FileCoalesceState(mode="update_action", has_action_step=True)
+    state = FileCoalesceState(
+        mode="update_action" if both else "single_file_op",
+        has_action_step=both,
+        prelocked_pref_row=prelocked_pref_row,
+    )
     token = _FILE_COALESCE_VAR.set(state)
     try:
         yield state
@@ -484,6 +510,24 @@ def build_automation_config_snapshot(
     return sanitize_automation_snapshot(raw_snapshot)
 
 
+def _same_instant_iso(old_val: Any, new_val: Any) -> bool:
+    if not isinstance(old_val, str) or not isinstance(new_val, str):
+        return False
+    try:
+        dt_old = datetime.fromisoformat(old_val.strip())
+        dt_new = datetime.fromisoformat(new_val.strip())
+    except ValueError:
+        return False
+    if (
+        dt_old.tzinfo is not None
+        and dt_old.utcoffset() is not None
+        and dt_new.tzinfo is not None
+        and dt_new.utcoffset() is not None
+    ):
+        return dt_old.astimezone(UTC) == dt_new.astimezone(UTC)
+    return False
+
+
 def compute_snapshot_changes(
     pre_snapshot: Mapping[str, Any],
     post_snapshot: Mapping[str, Any],
@@ -494,6 +538,8 @@ def compute_snapshot_changes(
         old_val = pre_snapshot.get(field_name)
         new_val = post_snapshot.get(field_name)
         if old_val != new_val:
+            if field_name == "once_run_at" and _same_instant_iso(old_val, new_val):
+                continue
             changes[field_name] = {"old": old_val, "new": new_val}
     return changes
 
