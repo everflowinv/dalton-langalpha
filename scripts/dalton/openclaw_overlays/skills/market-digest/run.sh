@@ -6,12 +6,81 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+_resolve_cli_in_dir() {
+    local dir="$1"
+    if [[ -f "${dir}/scripts/market_digest_cli.py" ]]; then
+        printf '%s\n' "${dir}/scripts/market_digest_cli.py"
+        return 0
+    fi
+    if [[ -f "${dir}/scripts/digest_cli.py" ]]; then
+        printf '%s\n' "${dir}/scripts/digest_cli.py"
+        return 0
+    fi
+    return 1
+}
+
+SKILL_DIR=""
+if [[ -n "${DALTON_MARKET_DIGEST_SKILL_DIR:-}" ]]; then
+    if ! _resolve_cli_in_dir "${DALTON_MARKET_DIGEST_SKILL_DIR}" >/dev/null; then
+        echo "[market-digest] ERROR: unsupported DALTON_MARKET_DIGEST_SKILL_DIR=${DALTON_MARKET_DIGEST_SKILL_DIR} (missing scripts/market_digest_cli.py)" >&2
+        exit 1
+    fi
+    SKILL_DIR="${DALTON_MARKET_DIGEST_SKILL_DIR}"
+elif [[ -n "${DALTON_SKILL_DIR:-}" ]]; then
+    if ! _resolve_cli_in_dir "${DALTON_SKILL_DIR}" >/dev/null; then
+        echo "[market-digest] ERROR: unsupported DALTON_SKILL_DIR=${DALTON_SKILL_DIR} (missing scripts/market_digest_cli.py)" >&2
+        exit 1
+    fi
+    SKILL_DIR="${DALTON_SKILL_DIR}"
+elif [[ -n "${DALTON_OCW_ROOT:-}" ]] && _resolve_cli_in_dir "${DALTON_OCW_ROOT}/skills/market-digest" >/dev/null; then
+    SKILL_DIR="${DALTON_OCW_ROOT}/skills/market-digest"
+elif _resolve_cli_in_dir "${SCRIPT_DIR}" >/dev/null; then
+    SKILL_DIR="${SCRIPT_DIR}"
+elif _resolve_cli_in_dir "${PWD}/skills/market-digest" >/dev/null; then
+    SKILL_DIR="${PWD}/skills/market-digest"
+else
+    echo "[market-digest] ERROR: unable to locate market_digest_cli.py in supported skill directories" >&2
+    exit 1
+fi
+
+_PRESERVED_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+if [[ -n "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH:-}" && -f "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH}" && "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH}" != "${SCRIPT_DIR}/run.sh" ]]; then
+    set -a
+    while IFS= read -r _cfg_line || [[ -n "${_cfg_line}" ]]; do
+        case "${_cfg_line}" in
+            *market_digest_cli.py*|*digest_cli.py*|*bridge_subprocess_env.py*|*"exec "*|*"python"*)
+                continue
+                ;;
+            [[:space:]]*\#*|\#*|"")
+                continue
+                ;;
+            *export\ *|[A-Za-z_]*=*|*source\ *|.\ *|*[[:space:]].\ *)
+                eval "${_cfg_line}" 2>/dev/null || true
+                ;;
+        esac
+    done < "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH}"
+    set +a
+fi
+unset DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH _cfg_line
+
 if [[ -n "${DALTON_SKILL_SHELL_RC:-}" && -f "${DALTON_SKILL_SHELL_RC}" ]]; then
     # shellcheck disable=SC1090
     source "${DALTON_SKILL_SHELL_RC}"
 fi
+for _env_cand in "${DALTON_OCW_ROOT:-}/.env" "$(dirname "$(dirname "${SKILL_DIR}")")/.env" "${SKILL_DIR}/.env"; do
+    if [[ -n "${_env_cand}" && -f "${_env_cand}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${_env_cand}"
+        set +a
+    fi
+done
+if [[ -n "${_PRESERVED_GEMINI_API_KEY}" ]]; then
+    export GEMINI_API_KEY="${_PRESERVED_GEMINI_API_KEY}"
+fi
+unset _PRESERVED_GEMINI_API_KEY _env_cand
 
-unset BASH_ENV ENV
+unset BASH_ENV ENV ZDOTDIR PROMPT_COMMAND PYTHONSTARTUP PYTHONINSPECT PYTHONPATH PYTHONHOME PYTHONUSERBASE PYTHONEXECUTABLE CDPATH GLOBIGNORE
 unset SEED_ASR_APP_ID SEED_ASR_ACCESS_KEY VOLC_TOS_AK VOLC_TOS_SK VOLC_TOS_BUCKET VOLC_TOS_REGION VOLC_TOS_ENDPOINT
 unset DALTON_ASR_STORAGE_ENDPOINT_URL DALTON_ASR_STORAGE_BUCKET_NAME DALTON_ASR_STORAGE_ACCESS_KEY_ID DALTON_ASR_STORAGE_SECRET_ACCESS_KEY DALTON_ASR_STORAGE_REGION DALTON_ASR_STORAGE_ADDRESSING_STYLE DALTON_ASR_STORAGE_KEY_PREFIX
 unset FEISHU_APP_ID FEISHU_APP_SECRET FEISHU_DEFAULT_GRANT_CHAT_ID
@@ -22,22 +91,13 @@ unset DALTON_BRIDGE_ADMIN_TOKEN DALTON_BRIDGE_TOKEN
 
 while IFS='=' read -r _env_name _; do
     case "${_env_name}" in
-        SEED_ASR_*|VOLC_TOS_*|DALTON_ASR_STORAGE_*|FEISHU_*|LARK_*|OPENCLAW_FEISHU_*|DALTON_FEISHU_*)
+        SEED_ASR_*|VOLC_TOS_*|DALTON_ASR_STORAGE_*|FEISHU_*|LARK_*|OPENCLAW_FEISHU_*|DALTON_FEISHU_*|BASH_FUNC_*)
             unset "${_env_name}" 2>/dev/null || true
             ;;
     esac
 done < <(env)
 
-SKILL_DIR="${SCRIPT_DIR}"
-if [[ ! -f "${SKILL_DIR}/scripts/market_digest_cli.py" ]]; then
-    if [[ -n "${DALTON_OCW_ROOT:-}" && -f "${DALTON_OCW_ROOT}/skills/market-digest/scripts/market_digest_cli.py" ]]; then
-        SKILL_DIR="${DALTON_OCW_ROOT}/skills/market-digest"
-    elif [[ -f "${PWD}/skills/market-digest/scripts/market_digest_cli.py" ]]; then
-        SKILL_DIR="${PWD}/skills/market-digest"
-    fi
-fi
-
-CLI_SCRIPT="${SKILL_DIR}/scripts/market_digest_cli.py"
+CLI_SCRIPT="$(_resolve_cli_in_dir "${SKILL_DIR}")"
 if [[ -n "${DALTON_SKILL_PYTHON:-}" && -x "${DALTON_SKILL_PYTHON}" ]]; then
     PYTHON_BIN="${DALTON_SKILL_PYTHON}"
 elif [[ -x "${SKILL_DIR}/venv/bin/python" ]]; then
@@ -57,6 +117,6 @@ fi
 unset DALTON_BRIDGE_ENV_FILTER_PY
 
 if [[ -n "${FILTER_PY}" && -f "${FILTER_PY}" ]]; then
-    exec "${PYTHON_BIN}" "${FILTER_PY}" exec-nonarchive -- "${PYTHON_BIN}" "${CLI_SCRIPT}" "$@"
+    exec "${PYTHON_BIN}" "${FILTER_PY}" exec-nonarchive --allow-env GEMINI_API_KEY -- "${PYTHON_BIN}" "${CLI_SCRIPT}" "$@"
 fi
 exec "${PYTHON_BIN}" "${CLI_SCRIPT}" "$@"

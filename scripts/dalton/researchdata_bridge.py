@@ -6141,6 +6141,10 @@ def _is_empty_community_output(route: str, operation: str, parsed: Any) -> bool:
     return False
 
 
+class UnsupportedSkillLauncherError(ValueError):
+    """Raised when an explicit skill `run.sh` path is not a verified launcher for the target skill."""
+
+
 class ResearchDataBridge:
     """HTTP-to-stdio MCP bridge for OpenClaw `researchdata`.
 
@@ -10339,10 +10343,10 @@ class ResearchDataBridge:
         subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
             os.environ,
             extra_env={
-                **env_file_vars,
                 "GEMINI_API_KEY": gemini_api_key,
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
+            allow_keys=("GEMINI_API_KEY",),
         )
 
         proc = await asyncio.create_subprocess_exec(
@@ -11685,27 +11689,69 @@ class ResearchDataBridge:
         all_ok = bool(results) and all(bool(item.get("ok")) for item in results)
         return 200, {"ok": all_ok, "results": results}
 
+    @staticmethod
+    def _is_verified_skill_launcher_file(
+        explicit: Path,
+        cli_names: tuple[str, ...],
+        overlay: Path,
+    ) -> bool:
+        """Accept an installed copy of the maintained launcher in a supported skill directory."""
+        exp = explicit.expanduser()
+        if not exp.is_file():
+            return False
+        skill_dir = exp.parent
+        if not any((skill_dir / "scripts" / name).is_file() for name in cli_names):
+            return False
+        try:
+            return exp.read_bytes() == overlay.read_bytes()
+        except OSError:
+            return False
+
+    @classmethod
+    def _should_use_overlay_for_skill_run_sh(
+        cls,
+        explicit: Path,
+        overlay: Path,
+        cli_names: tuple[str, ...],
+    ) -> bool:
+        """Return True when `explicit` targets a supported skill directory that should execute through `overlay`."""
+        if not overlay.is_file():
+            return False
+        exp = explicit.expanduser()
+        try:
+            if exp.resolve() == overlay.resolve():
+                return True
+        except OSError:
+            pass
+        if cls._is_verified_skill_launcher_file(exp, cli_names, overlay):
+            return False
+        skill_dir = exp.parent
+        if any((skill_dir / "scripts" / name).is_file() for name in cli_names):
+            return True
+        return False
+
     def _resolve_wiki_run_sh(self) -> Path:
-        """Locate the company-wiki `run.sh` entrypoint, preferring the workspace file and falling back to the repo overlay when the skill CLI exists."""
-        explicit = getattr(self.cfg, "wiki_run_sh", None)
-        if isinstance(explicit, Path):
-            return explicit
-        candidate = self.cfg.ocw_root / "skills" / "company-wiki" / "run.sh"
-        if candidate.is_file():
-            return candidate
-        cli_script = (
-            self.cfg.ocw_root
-            / "skills"
-            / "company-wiki"
-            / "scripts"
-            / "company_wiki_cli.py"
-        )
+        """Locate the company-wiki `run.sh` entrypoint, using the maintained repo overlay launcher for supported skill directories and refusing unsupported explicit launchers."""
         overlay = (
             _SCRIPT_DIR / "openclaw_overlays" / "skills" / "company-wiki" / "run.sh"
         )
-        if cli_script.is_file() and overlay.is_file():
+        cli_names = ("company_wiki_cli.py", "wiki_cli.py")
+        explicit = getattr(self.cfg, "wiki_run_sh", None)
+        if isinstance(explicit, Path):
+            if self._should_use_overlay_for_skill_run_sh(
+                explicit,
+                overlay,
+                cli_names,
+            ):
+                return overlay
+            if self._is_verified_skill_launcher_file(explicit, cli_names, overlay):
+                return explicit.expanduser()
+            raise UnsupportedSkillLauncherError(
+                f"Unsupported company-wiki launcher {explicit}: target skill directory must contain scripts/company_wiki_cli.py or scripts/wiki_cli.py"
+            )
+        if overlay.is_file():
             return overlay
-        return candidate
+        return self.cfg.ocw_root / "skills" / "company-wiki" / "run.sh"
 
     def _load_company_wiki_config(self) -> dict[str, Any]:
         """Read `skills/company-wiki/config.json` in read-only mode."""
@@ -12552,11 +12598,23 @@ class ResearchDataBridge:
         )
 
     def _build_wiki_subprocess_env(self) -> dict[str, str]:
-        """Construct minimal environment for `company-wiki/run.sh` and `market-digest/run.sh` without leaking bridge, Feishu, gateway, or ASR credentials."""
+        """Construct minimal environment for `company-wiki/run.sh` and `market-digest/run.sh` without leaking bridge, Feishu, gateway, ASR, or unrelated provider credentials."""
         env_file_vars = _read_env_file_dict(self.cfg.env_path)
         gemini_api_key = (
-            env_file_vars.get("GEMINI_API_KEY", "").strip()
-            or os.environ.get("GEMINI_API_KEY", "").strip()
+            os.environ.get("GEMINI_API_KEY", "").strip()
+            or env_file_vars.get("GEMINI_API_KEY", "").strip()
+        )
+        explicit_wiki_run_sh = getattr(self.cfg, "wiki_run_sh", None)
+        wiki_skill_dir = (
+            explicit_wiki_run_sh.expanduser().parent
+            if isinstance(explicit_wiki_run_sh, Path)
+            else self.cfg.ocw_root / "skills" / "company-wiki"
+        )
+        explicit_md_run_sh = getattr(self.cfg, "market_digest_run_sh", None)
+        md_skill_dir = (
+            explicit_md_run_sh.expanduser().parent
+            if isinstance(explicit_md_run_sh, Path)
+            else self.cfg.ocw_root / "skills" / "market-digest"
         )
         base_env: dict[str, str] = {
             "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
@@ -12566,14 +12624,35 @@ class ResearchDataBridge:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
             "SKILL_WARNINGS": "ignore",
+            "DALTON_OCW_ROOT": str(self.cfg.ocw_root),
+            "DALTON_WIKI_SKILL_DIR": str(wiki_skill_dir),
+            "DALTON_MARKET_DIGEST_SKILL_DIR": str(md_skill_dir),
             "DALTON_BRIDGE_ENV_FILTER_PY": str(_SCRIPT_DIR / "bridge_subprocess_env.py"),
         }
+        if isinstance(explicit_wiki_run_sh, Path) and explicit_wiki_run_sh.expanduser().is_file():
+            base_env["DALTON_WIKI_EXPLICIT_RUN_SH"] = str(explicit_wiki_run_sh.expanduser())
+        if isinstance(explicit_md_run_sh, Path) and explicit_md_run_sh.expanduser().is_file():
+            base_env["DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH"] = str(explicit_md_run_sh.expanduser())
+        for opt_key in ("DALTON_SKILL_PYTHON", "DALTON_SKILL_SHELL_RC"):
+            opt_val = os.environ.get(opt_key, "").strip()
+            if opt_val:
+                base_env[opt_key] = opt_val
         if gemini_api_key:
             base_env["GEMINI_API_KEY"] = gemini_api_key
         if self.cfg.subprocess_proxy:
             base_env["HTTP_PROXY"] = self.cfg.subprocess_proxy
             base_env["HTTPS_PROXY"] = self.cfg.subprocess_proxy
-        return bridge_subprocess_env.build_nonarchive_subprocess_env(base_env)
+        return bridge_subprocess_env.build_nonarchive_subprocess_env(
+            base_env,
+            allow_keys=("GEMINI_API_KEY",),
+        )
+
+    @staticmethod
+    def _build_skill_exec_argv(cmd: list[str]) -> list[str]:
+        """Normalize skill launcher argv so mode-0644 overlay `.sh` scripts execute via `/bin/bash`."""
+        if cmd and str(cmd[0]).endswith(".sh") and not os.access(str(cmd[0]), os.X_OK):
+            return ["/bin/bash", *[str(x) for x in cmd]]
+        return [str(x) for x in cmd]
 
     async def _run_company_wiki_ingest_cli(
         self,
@@ -12582,9 +12661,10 @@ class ResearchDataBridge:
         env: dict[str, str],
         timeout_s: float,
     ) -> dict[str, Any]:
-        """Run `company-wiki/run.sh --json add|add-file` as an argv list without a shell."""
+        """Run `company-wiki/run.sh --json add|add-file` as an argv list without an interactive shell."""
+        exec_cmd = self._build_skill_exec_argv(cmd)
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *exec_cmd,
             cwd=str(self.cfg.ocw_root),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
@@ -13208,7 +13288,15 @@ class ResearchDataBridge:
 
         # Built before any lock is taken: these touch the filesystem and can
         # raise, and only the try/finally below releases the claim locks.
-        run_sh = self._resolve_wiki_run_sh()
+        try:
+            run_sh = self._resolve_wiki_run_sh()
+        except UnsupportedSkillLauncherError as exc:
+            return 400, {
+                "ok": False,
+                "status": "unsupported_launcher",
+                "error_code": "unsupported_launcher",
+                "error": str(exc),
+            }
         subproc_env = self._build_wiki_subprocess_env()
 
         # Kernel file locks (`fcntl.flock`) across duplicate check + CLI write + idempotency/audit persistence
@@ -13602,25 +13690,27 @@ class ResearchDataBridge:
         return raw_doc_key, document_id
 
     def _resolve_market_digest_run_sh(self) -> Path:
-        explicit = getattr(self.cfg, "market_digest_run_sh", None)
-        if isinstance(explicit, Path):
-            return explicit
-        candidate = self.cfg.ocw_root / "skills" / "market-digest" / "run.sh"
-        if candidate.is_file():
-            return candidate
-        cli_script = (
-            self.cfg.ocw_root
-            / "skills"
-            / "market-digest"
-            / "scripts"
-            / "market_digest_cli.py"
-        )
+        """Locate the market-digest `run.sh` entrypoint, using the maintained repo overlay launcher for supported skill directories and refusing unsupported explicit launchers."""
         overlay = (
             _SCRIPT_DIR / "openclaw_overlays" / "skills" / "market-digest" / "run.sh"
         )
-        if cli_script.is_file() and overlay.is_file():
+        cli_names = ("market_digest_cli.py", "digest_cli.py")
+        explicit = getattr(self.cfg, "market_digest_run_sh", None)
+        if isinstance(explicit, Path):
+            if self._should_use_overlay_for_skill_run_sh(
+                explicit,
+                overlay,
+                cli_names,
+            ):
+                return overlay
+            if self._is_verified_skill_launcher_file(explicit, cli_names, overlay):
+                return explicit.expanduser()
+            raise UnsupportedSkillLauncherError(
+                f"Unsupported market-digest launcher {explicit}: target skill directory must contain scripts/market_digest_cli.py or scripts/digest_cli.py"
+            )
+        if overlay.is_file():
             return overlay
-        return candidate
+        return self.cfg.ocw_root / "skills" / "market-digest" / "run.sh"
 
     def _sales_notes_audit_path(self) -> Path:
         return self.cfg.ocw_root / self._SALES_NOTES_AUDIT_REL
@@ -13872,7 +13962,15 @@ class ResearchDataBridge:
                     prior_out["document_id"] = replay_doc_id
                 return 200, prior_out
 
-        run_sh = self._resolve_market_digest_run_sh()
+        try:
+            run_sh = self._resolve_market_digest_run_sh()
+        except UnsupportedSkillLauncherError as exc:
+            return 400, {
+                "ok": False,
+                "status": "unsupported_launcher",
+                "error_code": "unsupported_launcher",
+                "error": str(exc),
+            }
         env = self._build_wiki_subprocess_env()
 
         cmd: list[str] = [str(run_sh), "--json", "add-note"]
@@ -13916,8 +14014,9 @@ class ResearchDataBridge:
                     os.close(fd)
                 cmd.extend(["--content", f"@{tmp_payload}"])
 
+            exec_cmd = self._build_skill_exec_argv(cmd)
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *exec_cmd,
                 cwd=str(self.cfg.ocw_root),
                 env=env,
                 stdin=asyncio.subprocess.DEVNULL,

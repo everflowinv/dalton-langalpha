@@ -1150,8 +1150,7 @@ async def test_bridge_feishu_dedicated_config_never_falls_back_to_openclaw_or_ga
     assert code_503 == 503
     assert body_503 == {
         "ok": False,
-        "error_code": "feishu_not_configured",
-        "message": "FEISHU_APP_ID / FEISHU_APP_SECRET not configured on host",
+        "error": "feishu_not_configured",
     }
 
     # 2. Partial credentials (only FEISHU_APP_ID set) -> still unconfigured

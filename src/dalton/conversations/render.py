@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shlex
 from datetime import date
 from pathlib import Path
@@ -144,6 +145,21 @@ def render_conversation_digest_md(
     return "\n".join(lines).rstrip() + "\n"
 
 
+_WORKSPACE_RENDER_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "SANDBOX_PROVIDER",
+        "DOCKER_SANDBOX_IMAGE",
+        "DOCKER_SANDBOX_DEV_MODE",
+        "DOCKER_SANDBOX_HOST_DIR",
+        "DOCKER_SANDBOX_VOLUMES",
+        "DAYTONA_API_KEY",
+        "DAYTONA_SERVER_URL",
+        "E2B_API_KEY",
+        "PTC_CONFIG_FILE",
+    }
+)
+
+
 async def _resolve_workspace_backend(
     workspace_id: str,
     *,
@@ -151,7 +167,8 @@ async def _resolve_workspace_backend(
 ) -> Any:
     """Resolve a pinned `SandboxBackend` for `workspace_id` via `WorkspaceManager`.
 
-    Lazily initializes `WorkspaceManager` with SDK config when invoked from standalone CLI.
+    Lazily initializes `WorkspaceManager` with SDK config when invoked from standalone CLI,
+    preserving the caller's filtered environment across late config loads.
     """
     from ptc_agent.agent.backends.sandbox import SandboxBackend
     from ptc_agent.core.paths import SandboxLayout
@@ -162,8 +179,17 @@ async def _resolve_workspace_backend(
         workspace_manager = WorkspaceManager.get_instance()
     except ValueError:
         from ptc_agent.config import ConfigContext, load_from_files
+        from scripts.dalton import bridge_subprocess_env
 
-        agent_config = await load_from_files(context=ConfigContext.SDK)
+        pre_load_env = dict(os.environ)
+        try:
+            agent_config = await load_from_files(context=ConfigContext.SDK)
+        finally:
+            bridge_subprocess_env.scrub_post_dotenv_import_env(
+                os.environ,
+                pre_load_env,
+                extra_preserve_keys=_WORKSPACE_RENDER_ENV_KEYS,
+            )
         workspace_manager = WorkspaceManager.get_instance(config=agent_config)
 
     session = await workspace_manager.get_session_for_workspace(

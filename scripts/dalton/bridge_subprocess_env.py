@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import sys
 import tempfile
 from typing import Any
@@ -89,6 +90,65 @@ BRIDGE_TOKEN_ENV_KEYS: frozenset[str] = frozenset(
     }
 )
 
+SHELL_INJECTION_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        "PROMPT_COMMAND",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "CDPATH",
+        "GLOBIGNORE",
+    }
+)
+
+SHELL_INJECTION_ENV_PREFIXES: tuple[str, ...] = ("BASH_FUNC_",)
+
+NONARCHIVE_STRIPPED_PROVIDER_AND_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "XAI_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "ZAI_API_KEY",
+        "MOONSHOT_API_KEY",
+        "MINIMAX_API_KEY",
+        "KIMI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "CEREBRAS_API_KEY",
+        "GROQ_API_KEY",
+        "MISTRAL_API_KEY",
+        "COHERE_API_KEY",
+        "TOGETHER_API_KEY",
+        "FIREWORKS_API_KEY",
+        "PERPLEXITY_API_KEY",
+        "DALTON_XAI_OAUTH_CLIENT_ID",
+        "DALTON_XAI_GROK_CLIENT_VERSION",
+        "TAVILY_API_KEY",
+        "BRAVE_API_KEY",
+        "EXA_API_KEY",
+        "SERPER_API_KEY",
+        "FMP_API_KEY",
+        "FINNHUB_API_KEY",
+        "POLYGON_API_KEY",
+        "TIINGO_API_KEY",
+        "ALPHA_VANTAGE_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "BYOK_ENCRYPTION_KEY",
+        "DB_PASSWORD",
+        "DALTON_REEXTRACT_DSN",
+        "DATABASE_URL",
+        "DAYTONA_API_KEY",
+        "E2B_API_KEY",
+    }
+)
+
 CARD_SEND_EXPLICIT_FEISHU_KEYS: tuple[str, ...] = (
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
@@ -96,6 +156,22 @@ CARD_SEND_EXPLICIT_FEISHU_KEYS: tuple[str, ...] = (
 )
 
 ARCHIVE_BASE_REQUIRED_KEYS: tuple[str, ...] = ("PATH", "HOME", "LANG", "TZ")
+
+ARCHIVE_WORKSPACE_RUNTIME_KEYS: frozenset[str] = frozenset(
+    {
+        "SANDBOX_PROVIDER",
+        "DOCKER_SANDBOX_IMAGE",
+        "DOCKER_SANDBOX_DEV_MODE",
+        "DOCKER_SANDBOX_HOST_DIR",
+        "DOCKER_SANDBOX_VOLUMES",
+        "DAYTONA_API_KEY",
+        "DAYTONA_SERVER_URL",
+        "E2B_API_KEY",
+        "PTC_CONFIG_FILE",
+        "DALTON_DOTENV_PATH",
+        "DALTON_REPO_ENV_FILE",
+    }
+)
 
 ARCHIVE_BASE_OPTIONAL_PROCESS_KEYS: frozenset[str] = frozenset(
     {
@@ -117,6 +193,7 @@ ARCHIVE_BASE_OPTIONAL_PROCESS_KEYS: frozenset[str] = frozenset(
         "DALTON_ARCHIVE_MEM_TRACE",
         "DALTON_ARCHIVE_PID_FILE",
         "DALTON_ARCHIVE_STATE_FILE",
+        *ARCHIVE_WORKSPACE_RUNTIME_KEYS,
     }
 )
 
@@ -188,6 +265,15 @@ class EnvFileValidationError(ValueError):
         super().__init__(msg)
 
 
+def _is_shell_injection_key(key: str) -> bool:
+    upper = key.upper()
+    return (
+        key in SHELL_INJECTION_ENV_KEYS
+        or upper in SHELL_INJECTION_ENV_KEYS
+        or any(upper.startswith(prefix) for prefix in SHELL_INJECTION_ENV_PREFIXES)
+    )
+
+
 def _is_stripped_credential_key(key: str) -> bool:
     upper = key.upper()
     return (
@@ -208,9 +294,18 @@ def has_asr_credentials_in_env(env: Mapping[str, str] | None = None) -> bool:
 def strip_asr_credentials_from_env(
     env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Return a copy of `env` with ASR/TOS, Feishu, OpenClaw gateway, and broker keys removed."""
+    """Return a copy of `env` with ASR/TOS, Feishu, OpenClaw gateway, broker, and shell injection keys removed."""
     src = env if env is not None else os.environ
-    return {k: str(v) for k, v in src.items() if not _is_stripped_credential_key(k)}
+    return {
+        k: str(v)
+        for k, v in src.items()
+        if not _is_stripped_credential_key(k) and not _is_shell_injection_key(k)
+    }
+
+
+def _nonarchive_stripped_provider_keys(repo_root: Path | None = None) -> frozenset[str]:
+    _, _, catalog_provider_keys = _load_catalog_maps(repo_root)
+    return frozenset(NONARCHIVE_STRIPPED_PROVIDER_AND_SECRET_KEYS | catalog_provider_keys)
 
 
 def build_nonarchive_subprocess_env(
@@ -218,11 +313,16 @@ def build_nonarchive_subprocess_env(
     *,
     extra_env: Mapping[str, str] | None = None,
     drop_keys: Iterable[str] = (),
+    allow_keys: Iterable[str] = (),
+    repo_root: Path | None = None,
 ) -> dict[str, str]:
     """Build filtered environment for the 8 non-archive Bridge subprocess entrypoints and skills.
 
     Strips all ASR/TOS, Feishu (`FEISHU_*`, `LARK_*`, `OPENCLAW_FEISHU_*`, `DALTON_FEISHU_*`),
-    gateway/broker tokens, and both `DALTON_BRIDGE_ADMIN_TOKEN` and `DALTON_BRIDGE_TOKEN`.
+    gateway/broker tokens, shell startup injection variables (`BASH_ENV`, `ENV`, `ZDOTDIR`,
+    `PROMPT_COMMAND`, `PYTHONSTARTUP`, etc.), both `DALTON_BRIDGE_ADMIN_TOKEN` and
+    `DALTON_BRIDGE_TOKEN`, and all unrelated LLM/search/market/DB/encryption secrets unless
+    explicitly listed in `allow_keys`.
     """
     merged: dict[str, str] = {}
     src = base_env if base_env is not None else os.environ
@@ -237,6 +337,12 @@ def build_nonarchive_subprocess_env(
     cleaned = strip_asr_credentials_from_env(merged)
     for token_key in BRIDGE_TOKEN_ENV_KEYS:
         cleaned.pop(token_key, None)
+
+    explicitly_allowed = {str(k).strip() for k in allow_keys if str(k).strip()}
+    for secret_key in _nonarchive_stripped_provider_keys(repo_root):
+        if secret_key not in explicitly_allowed:
+            cleaned.pop(secret_key, None)
+
     for key in drop_keys:
         cleaned.pop(str(key), None)
     if not cleaned.get("PATH", "").strip():
@@ -610,31 +716,215 @@ def resolve_provider_env_keys_for_models(
     return frozenset(allowed), frozenset(required), frozenset(all_provider_keys)
 
 
+def _extract_preference_model_from_mapping(
+    user_preferences: Mapping[str, Any] | None,
+) -> str | None:
+    if not isinstance(user_preferences, Mapping):
+        return None
+    mp = user_preferences.get("model_preference")
+    if isinstance(mp, Mapping):
+        cand = mp.get("model")
+        if isinstance(cand, str) and cand.strip():
+            return cand.strip()
+    elif isinstance(mp, str) and mp.strip():
+        return mp.strip()
+    direct = user_preferences.get("model")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    return None
+
+
+def _extract_models_from_plan_file(
+    plan_path: Path | str | None,
+) -> tuple[str | None, str | None]:
+    if plan_path is None:
+        return None, None
+    p = Path(plan_path).expanduser()
+    if not p.is_file():
+        return None, None
+    doc = _read_json_dict(p)
+    raw_model = doc.get("model")
+    raw_fb = doc.get("fallback_model")
+    p_model = str(raw_model).strip() if isinstance(raw_model, str) and raw_model.strip() else None
+    p_fb = str(raw_fb).strip() if isinstance(raw_fb, str) else None
+    return p_model, p_fb
+
+
+def _read_and_close_candidates_fd(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Read and close one-shot `_DALTON_ARCHIVE_CANDIDATES_FD` pipe if present."""
+    raw_fd = ""
+    if isinstance(env, MutableMapping):
+        raw_fd = str(env.pop("_DALTON_ARCHIVE_CANDIDATES_FD", "") or "").strip()
+    elif env is not None:
+        raw_fd = str(env.get("_DALTON_ARCHIVE_CANDIDATES_FD") or "").strip()
+    env_fd = str(os.environ.pop("_DALTON_ARCHIVE_CANDIDATES_FD", "") or "").strip()
+    if not raw_fd:
+        raw_fd = env_fd
+    if not raw_fd:
+        return {}
+    try:
+        fd_num = int(raw_fd)
+    except ValueError:
+        return {}
+    if fd_num < 0:
+        return {}
+    chunks: list[bytes] = []
+    try:
+        while True:
+            buf = os.read(fd_num, 65536)
+            if not buf:
+                break
+            chunks.append(buf)
+    except OSError:
+        return {}
+    finally:
+        try:
+            os.close(fd_num)
+        except OSError:
+            pass
+    try:
+        parsed = json.loads(b"".join(chunks).decode("utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in parsed.items():
+        if isinstance(k, str) and isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    return out
+
+
+def capture_archive_provider_candidates(
+    env: Mapping[str, str] | None = None,
+    *,
+    repo_root: Path | None = None,
+    repo_env_path: Path | None = None,
+    hydrate_from_dotenv: bool = True,
+) -> dict[str, str]:
+    """Capture allowlisted candidate values (`environment > dotenv`) locally for one invocation."""
+    root = repo_root or _repo_root_default()
+    src = env if env is not None else os.environ
+    pipe_candidates = _read_and_close_candidates_fd(src)
+    dotenv_vars = _resolve_dotenv_vars(
+        src,
+        repo_root=root,
+        repo_env_path=repo_env_path,
+        hydrate_from_dotenv=hydrate_from_dotenv,
+    )
+    _, _, all_provider_keys = _load_catalog_maps(root)
+    candidate_keys = (
+        set(all_provider_keys)
+        | set(XAI_OAUTH_ALLOWED_ENV_KEYS)
+        | {"DALTON_ASSIST_FALLBACK_MODEL"}
+        | set(ARCHIVE_BASE_REQUIRED_KEYS)
+        | set(ARCHIVE_BASE_OPTIONAL_PROCESS_KEYS)
+        | set(ARCHIVE_DB_REQUIRED_KEYS)
+        | set(ARCHIVE_DB_OPTIONAL_KEYS)
+        | {"BYOK_ENCRYPTION_KEY"}
+        | set(ARCHIVE_OWNER_REQUIRED_KEYS)
+        | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
+        | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
+        | {
+            "DALTON_BRIDGE_ADMIN_TOKEN",
+            "DALTON_BRIDGE_EMBED_URL",
+            "no_proxy",
+            "DALTON_OCW_AGENTS_ROOT",
+            "DALTON_REEXTRACT_DSN",
+        }
+    )
+    captured: dict[str, str] = {}
+    for key in sorted(candidate_keys):
+        if (
+            _is_stripped_credential_key(key)
+            or _is_shell_injection_key(key)
+            or key == "DALTON_BRIDGE_TOKEN"
+        ):
+            continue
+        pipe_val = str(pipe_candidates.get(key) or "").strip()
+        if pipe_val:
+            if key == "DALTON_BRIDGE_EMBED_URL" and "host.docker.internal" in pipe_val:
+                captured[key] = DEFAULT_HOST_EMBED_URL
+            else:
+                captured[key] = pipe_val
+            continue
+        env_val = str(src.get(key) or "").strip()
+        if env_val:
+            if key == "DALTON_BRIDGE_EMBED_URL" and "host.docker.internal" in env_val:
+                captured[key] = DEFAULT_HOST_EMBED_URL
+            else:
+                captured[key] = env_val
+            continue
+        file_val = str(dotenv_vars.get(key) or "").strip()
+        if file_val:
+            if key == "DALTON_BRIDGE_EMBED_URL" and "host.docker.internal" in file_val:
+                captured[key] = DEFAULT_HOST_EMBED_URL
+            else:
+                captured[key] = file_val
+    return captured
+
+
 def resolve_selected_archive_models(
     *,
     explicit_model: str | None = None,
     explicit_fallback_model: str | None = None,
+    plan_model: str | None = None,
+    plan_fallback_model: str | None = None,
+    plan_path: Path | str | None = None,
+    preference_model: str | None = None,
+    user_preferences: Mapping[str, Any] | None = None,
     assist_fallback_raw: str | None = None,
     repo_root: Path | None = None,
+    include_primary: bool = True,
 ) -> list[str]:
     """Return deduplicated `[primary, fallback, *assist_fallbacks]` model IDs for archive/extract."""
     defaults = read_dalton_yaml_archive_defaults(repo_root)
-    primary = (
-        str(explicit_model).strip()
-        if explicit_model and str(explicit_model).strip()
-        else str(defaults["extractor_model"])
+    file_plan_model, file_plan_fb = _extract_models_from_plan_file(plan_path)
+    eff_plan_model = (
+        str(plan_model).strip()
+        if plan_model and str(plan_model).strip()
+        else file_plan_model
     )
-    if explicit_fallback_model is None:
-        fallback = str(defaults["extractor_fallback_model"] or "").strip()
+    eff_pref_model = (
+        str(preference_model).strip()
+        if preference_model and str(preference_model).strip()
+        else _extract_preference_model_from_mapping(user_preferences)
+    )
+    has_non_yaml_primary = bool(
+        (explicit_model and str(explicit_model).strip())
+        or eff_plan_model
+        or eff_pref_model
+    )
+    if not include_primary:
+        primary = ""
+    elif explicit_model and str(explicit_model).strip():
+        primary = str(explicit_model).strip()
+    elif eff_plan_model:
+        primary = eff_plan_model
+    elif eff_pref_model:
+        primary = eff_pref_model
     else:
+        primary = str(defaults["extractor_model"])
+
+    if explicit_fallback_model is not None:
         fallback = str(explicit_fallback_model or "").strip()
+    elif plan_fallback_model is not None:
+        fallback = str(plan_fallback_model or "").strip()
+    elif file_plan_fb is not None:
+        fallback = str(file_plan_fb or "").strip()
+    else:
+        fallback = str(defaults["extractor_fallback_model"] or "").strip()
 
     if assist_fallback_raw is not None and str(assist_fallback_raw).strip():
         assist_models = [
             item.strip() for item in str(assist_fallback_raw).split(",") if item.strip()
         ]
-    else:
+    elif include_primary and not has_non_yaml_primary:
         assist_models = list(defaults.get("assist_fallback_models") or [])
+    else:
+        assist_models = []
 
     ordered: list[str] = []
     for candidate in [primary, fallback, *assist_models]:
@@ -693,6 +983,54 @@ def archive_allowed_env_keys(
     return frozenset(allowed), provider_required
 
 
+def _resolve_dotenv_vars(
+    env: Mapping[str, str] | None = None,
+    *,
+    repo_root: Path | None = None,
+    repo_env_path: Path | None = None,
+    hydrate_from_dotenv: bool = False,
+) -> dict[str, str]:
+    """Load key-value pairs from an explicit dotenv file or `<repo>/.env` when requested."""
+    src = env if env is not None else os.environ
+    if repo_env_path is not None:
+        return parse_env_file_dict(Path(repo_env_path).expanduser())
+    explicit = (
+        str(src.get("DALTON_DOTENV_PATH") or "").strip()
+        or str(src.get("DALTON_REPO_ENV_FILE") or "").strip()
+    )
+    if explicit:
+        return parse_env_file_dict(Path(explicit).expanduser())
+    if hydrate_from_dotenv:
+        root = repo_root or _repo_root_default()
+        return parse_env_file_dict(root / ".env")
+    return {}
+
+
+def resolve_reextract_dsn(
+    *,
+    explicit_dsn: str | None = None,
+    env: Mapping[str, str] | None = None,
+    repo_root: Path | None = None,
+    repo_env_path: Path | None = None,
+    hydrate_from_dotenv: bool = True,
+) -> str | None:
+    """Resolve `DALTON_REEXTRACT_DSN` from CLI `--dsn`, process environment, or `.env` before filtering."""
+    if explicit_dsn and str(explicit_dsn).strip():
+        return str(explicit_dsn).strip()
+    src = env if env is not None else os.environ
+    env_dsn = str(src.get("DALTON_REEXTRACT_DSN") or "").strip()
+    if env_dsn:
+        return env_dsn
+    dotenv_vars = _resolve_dotenv_vars(
+        src,
+        repo_root=repo_root,
+        repo_env_path=repo_env_path,
+        hydrate_from_dotenv=hydrate_from_dotenv,
+    )
+    file_dsn = str(dotenv_vars.get("DALTON_REEXTRACT_DSN") or "").strip()
+    return file_dsn or None
+
+
 def build_archive_subprocess_env(
     *,
     repo_env_path: Path | None = None,
@@ -700,23 +1038,37 @@ def build_archive_subprocess_env(
     base_env: Mapping[str, str] | None = None,
     explicit_model: str | None = None,
     explicit_fallback_model: str | None = None,
+    plan_model: str | None = None,
+    plan_fallback_model: str | None = None,
+    plan_path: Path | str | None = None,
+    preference_model: str | None = None,
+    user_preferences: Mapping[str, Any] | None = None,
     host_embed_url: str = DEFAULT_HOST_EMBED_URL,
     ocw_agents_root: str | None = None,
     repo_root: Path | None = None,
     validate_required: bool = False,
+    defer_primary_model_validation: bool = False,
 ) -> dict[str, str]:
     """Construct the archive subprocess environment strictly following §2.6.1.4 Steps 1–4.
 
     Step 1: Initialize controlled base process vars (`PATH`, `HOME`, `LANG`, `TZ`, safe runtime paths).
-    Step 2: Extract allowlisted DB, `BYOK_ENCRYPTION_KEY`, owner/auth mode, and selected-model
-            provider keys from `<repo>/.env` (falling back to `base_env` only for allowlisted keys).
+    Step 2: Extract allowlisted DB, `BYOK_ENCRYPTION_KEY`, owner/auth mode, workspace runtime,
+            and selected-model provider keys with `environment > dotenv` priority.
     Step 3: Extract ONLY `DALTON_BRIDGE_ADMIN_TOKEN` from `researchdata-bridge.env`.
     Step 4: Force host `DALTON_BRIDGE_EMBED_URL` + `no_proxy` and optional `DALTON_OCW_AGENTS_ROOT`,
-            then strip all forbidden credentials.
+            then strip all forbidden credentials and shell injection variables.
     """
     root = repo_root or _repo_root_default()
     parent = base_env if base_env is not None else os.environ
-    repo_vars = parse_env_file_dict(repo_env_path) if repo_env_path is not None else {}
+    eff_repo_env = repo_env_path
+    if eff_repo_env is None:
+        explicit_env_file = (
+            str(parent.get("DALTON_DOTENV_PATH") or "").strip()
+            or str(parent.get("DALTON_REPO_ENV_FILE") or "").strip()
+        )
+        if explicit_env_file:
+            eff_repo_env = Path(explicit_env_file).expanduser()
+    repo_vars = parse_env_file_dict(eff_repo_env) if eff_repo_env is not None else {}
     bridge_vars = parse_env_file_dict(bridge_env_path) if bridge_env_path is not None else {}
 
     # Step 1: Base process environment
@@ -730,24 +1082,36 @@ def build_archive_subprocess_env(
         val = parent.get(opt_key)
         if isinstance(val, str) and val.strip():
             out[opt_key] = val
+        elif opt_key in ARCHIVE_WORKSPACE_RUNTIME_KEYS and opt_key in repo_vars:
+            rval = str(repo_vars.get(opt_key) or "").strip()
+            if rval:
+                out[opt_key] = rval
+    if eff_repo_env is not None and "DALTON_DOTENV_PATH" not in out:
+        out["DALTON_DOTENV_PATH"] = str(eff_repo_env)
 
     # Resolve selected models to determine exact provider key allowlist
     assist_raw = (
-        repo_vars.get("DALTON_ASSIST_FALLBACK_MODEL")
-        if "DALTON_ASSIST_FALLBACK_MODEL" in repo_vars
-        else parent.get("DALTON_ASSIST_FALLBACK_MODEL")
+        str(parent.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+        or str(repo_vars.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+        or None
     )
     selected_models = resolve_selected_archive_models(
         explicit_model=explicit_model,
         explicit_fallback_model=explicit_fallback_model,
+        plan_model=plan_model,
+        plan_fallback_model=plan_fallback_model,
+        plan_path=plan_path,
+        preference_model=preference_model,
+        user_preferences=user_preferences,
         assist_fallback_raw=assist_raw,
         repo_root=root,
+        include_primary=not defer_primary_model_validation,
     )
     provider_allowed, provider_required, _ = resolve_provider_env_keys_for_models(
         selected_models, repo_root=root
     )
 
-    # Step 2: Allowlisted keys from `<repo>/.env` (with allowlisted fallback from `parent`)
+    # Step 2: Allowlisted keys with `parent` (environment) taking priority over `<repo>/.env`
     step2_keys = (
         list(ARCHIVE_DB_REQUIRED_KEYS)
         + list(ARCHIVE_DB_OPTIONAL_KEYS)
@@ -758,10 +1122,10 @@ def build_archive_subprocess_env(
         + sorted(provider_allowed)
     )
     for key in step2_keys:
-        if key in repo_vars and str(repo_vars[key]).strip():
-            out[key] = str(repo_vars[key]).strip()
-        elif key in parent and str(parent[key]).strip():
+        if key in parent and str(parent[key]).strip():
             out[key] = str(parent[key]).strip()
+        elif key in repo_vars and str(repo_vars[key]).strip():
+            out[key] = str(repo_vars[key]).strip()
 
     # Step 3: Extract ONLY `DALTON_BRIDGE_ADMIN_TOKEN` from `researchdata-bridge.env`
     admin_tok = str(bridge_vars.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip()
@@ -788,9 +1152,10 @@ def build_archive_subprocess_env(
     if eff_agents_root:
         out["DALTON_OCW_AGENTS_ROOT"] = eff_agents_root
 
-    # Final defensive scrub of any stripped credential keys and non-admin bridge token
+    # Final defensive scrub of any stripped credential keys, shell injection vars, and non-admin bridge token
     out = strip_asr_credentials_from_env(out)
     out.pop("DALTON_BRIDGE_TOKEN", None)
+    out.pop("_DALTON_ARCHIVE_CANDIDATES_FD", None)
 
     if validate_required:
         validate_archive_required_env(
@@ -877,45 +1242,85 @@ def validate_archive_required_env(
 
 def scrub_post_dotenv_import_env(
     target_env: MutableMapping[str, str],
+    pre_import_env: Mapping[str, str] | None = None,
     *,
-    pre_import_env: Mapping[str, str],
+    explicit_model: str | None = None,
+    explicit_fallback_model: str | None = None,
+    extra_preserve_keys: Iterable[str] = (),
     repo_root: Path | None = None,
     include_reextract_dsn: bool = False,
 ) -> None:
-    """Re-filter `os.environ` immediately after importing `src.*` (which runs `load_dotenv()`).
+    """Re-filter `target_env` after late config/dotenv loads (`load_from_files` / `load_dotenv_async`).
 
-    Removes all stripped Feishu/gateway/ASR/broker credentials, drops any non-allowlisted
-    keys newly injected from `.env`, and restores the host `DALTON_BRIDGE_EMBED_URL` and
-    `no_proxy` values.
+    Removes all stripped Feishu/gateway/ASR/broker credentials and shell injection vars,
+    drops any non-allowlisted keys newly injected from `.env`, and preserves the caller's
+    pre-load environment plus selected model/workspace keys.
     """
     root = repo_root or _repo_root_default()
-    assist_raw = target_env.get("DALTON_ASSIST_FALLBACK_MODEL")
-    selected_models = resolve_selected_archive_models(
-        assist_fallback_raw=assist_raw,
-        repo_root=root,
-    )
-    allowed_keys, _ = archive_allowed_env_keys(models=selected_models, repo_root=root)
-    if include_reextract_dsn:
+    pre_env = pre_import_env if pre_import_env is not None else {}
+
+    if explicit_model is not None or explicit_fallback_model is not None:
+        assist_raw = target_env.get("DALTON_ASSIST_FALLBACK_MODEL") or pre_env.get(
+            "DALTON_ASSIST_FALLBACK_MODEL"
+        )
+        selected_models = resolve_selected_archive_models(
+            explicit_model=explicit_model,
+            explicit_fallback_model=explicit_fallback_model,
+            assist_fallback_raw=assist_raw,
+            repo_root=root,
+        )
+        allowed_keys, _ = archive_allowed_env_keys(models=selected_models, repo_root=root)
+    else:
+        allowed_keys = frozenset(
+            set(ARCHIVE_BASE_REQUIRED_KEYS)
+            | set(ARCHIVE_BASE_OPTIONAL_PROCESS_KEYS)
+            | set(ARCHIVE_DB_REQUIRED_KEYS)
+            | set(ARCHIVE_DB_OPTIONAL_KEYS)
+            | set(ARCHIVE_OWNER_REQUIRED_KEYS)
+            | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
+            | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
+            | {"DALTON_BRIDGE_ADMIN_TOKEN", "DALTON_BRIDGE_EMBED_URL", "no_proxy", "DALTON_OCW_AGENTS_ROOT"}
+        )
+
+    if extra_preserve_keys:
+        allowed_keys = frozenset(set(allowed_keys) | {str(k) for k in extra_preserve_keys if k})
+    if include_reextract_dsn or "DALTON_REEXTRACT_DSN" in pre_env:
         allowed_keys = frozenset(set(allowed_keys) | {"DALTON_REEXTRACT_DSN"})
 
     for key in list(target_env.keys()):
-        if _is_stripped_credential_key(key) or key == "DALTON_BRIDGE_TOKEN":
+        if (
+            _is_stripped_credential_key(key)
+            or _is_shell_injection_key(key)
+            or key == "DALTON_BRIDGE_TOKEN"
+        ):
             target_env.pop(key, None)
             continue
-        if key not in pre_import_env and key not in allowed_keys:
+        if key not in pre_env and key not in allowed_keys:
             target_env.pop(key, None)
 
-    pre_embed = str(pre_import_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
+    for key, pre_raw in pre_env.items():
+        if (
+            _is_stripped_credential_key(key)
+            or _is_shell_injection_key(key)
+            or key == "DALTON_BRIDGE_TOKEN"
+        ):
+            continue
+        pre_val = str(pre_raw or "").strip()
+        if pre_val:
+            target_env[key] = pre_val
+
+    pre_embed = str(pre_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
     if pre_embed and _validate_host_embed_url(pre_embed) is None:
         target_env["DALTON_BRIDGE_EMBED_URL"] = pre_embed
-    else:
+    elif "DALTON_BRIDGE_EMBED_URL" in target_env:
         cur_embed = str(target_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
         if not cur_embed or "host.docker.internal" in cur_embed:
             target_env["DALTON_BRIDGE_EMBED_URL"] = DEFAULT_HOST_EMBED_URL
 
-    target_env["no_proxy"] = _merge_no_proxy(
-        pre_import_env.get("no_proxy") or target_env.get("no_proxy")
-    )
+    if "no_proxy" in pre_env or "no_proxy" in target_env:
+        target_env["no_proxy"] = _merge_no_proxy(
+            pre_env.get("no_proxy") or target_env.get("no_proxy")
+        )
 
 
 def enforce_archive_process_env_in_place(
@@ -923,24 +1328,89 @@ def enforce_archive_process_env_in_place(
     *,
     explicit_model: str | None = None,
     explicit_fallback_model: str | None = None,
+    plan_model: str | None = None,
+    plan_fallback_model: str | None = None,
+    plan_path: Path | str | None = None,
+    preference_model: str | None = None,
+    user_preferences: Mapping[str, Any] | None = None,
+    provider_candidates: Mapping[str, str] | None = None,
     repo_root: Path | None = None,
+    repo_env_path: Path | None = None,
+    hydrate_from_dotenv: bool = False,
     preserve_pytest: bool = False,
     validate_required: bool = False,
+    defer_primary_model_validation: bool = False,
 ) -> frozenset[str]:
     """Filter `target_env` in place to the exact archive allowlist for the selected models."""
     root = repo_root or _repo_root_default()
+    dotenv_vars = _resolve_dotenv_vars(
+        target_env,
+        repo_root=root,
+        repo_env_path=repo_env_path,
+        hydrate_from_dotenv=hydrate_from_dotenv,
+    )
+    cand_vars: dict[str, str] = {}
+    _, _, all_provider_keys = _load_catalog_maps(root)
+    for p_key in set(all_provider_keys) | set(XAI_OAUTH_ALLOWED_ENV_KEYS) | {"DALTON_ASSIST_FALLBACK_MODEL"}:
+        cur_p_val = str(target_env.get(p_key) or "").strip()
+        if cur_p_val:
+            cand_vars[p_key] = cur_p_val
+    if isinstance(provider_candidates, Mapping):
+        for p_key, p_val in provider_candidates.items():
+            if str(p_val or "").strip():
+                cand_vars[str(p_key)] = str(p_val).strip()
+    assist_raw = (
+        str(cand_vars.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+        or str(target_env.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+        or str(dotenv_vars.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+        or None
+    )
+    has_resolved_primary = bool(
+        (explicit_model and str(explicit_model).strip())
+        or (plan_model and str(plan_model).strip())
+        or (preference_model and str(preference_model).strip())
+        or user_preferences is not None
+        or plan_path is not None
+    )
+    include_primary = not (defer_primary_model_validation and not has_resolved_primary)
     selected_models = resolve_selected_archive_models(
         explicit_model=explicit_model,
         explicit_fallback_model=explicit_fallback_model,
-        assist_fallback_raw=target_env.get("DALTON_ASSIST_FALLBACK_MODEL"),
+        plan_model=plan_model,
+        plan_fallback_model=plan_fallback_model,
+        plan_path=plan_path,
+        preference_model=preference_model,
+        user_preferences=user_preferences,
+        assist_fallback_raw=assist_raw,
         repo_root=root,
+        include_primary=include_primary,
     )
     allowed_keys, provider_required = archive_allowed_env_keys(
         models=selected_models, repo_root=root
     )
 
+    for key in allowed_keys:
+        if (
+            isinstance(provider_candidates, Mapping)
+            and key in provider_candidates
+            and str(provider_candidates[key] or "").strip()
+        ):
+            target_env[key] = str(provider_candidates[key]).strip()
+            continue
+        if str(target_env.get(key) or "").strip():
+            continue
+        if key in cand_vars and str(cand_vars[key]).strip():
+            target_env[key] = str(cand_vars[key]).strip()
+            continue
+        if dotenv_vars and key in dotenv_vars and str(dotenv_vars[key]).strip():
+            target_env[key] = str(dotenv_vars[key]).strip()
+
     for key in list(target_env.keys()):
-        if _is_stripped_credential_key(key) or key == "DALTON_BRIDGE_TOKEN":
+        if (
+            _is_stripped_credential_key(key)
+            or _is_shell_injection_key(key)
+            or key == "DALTON_BRIDGE_TOKEN"
+        ):
             target_env.pop(key, None)
             continue
         if preserve_pytest and key.startswith("PYTEST_"):
@@ -1019,28 +1489,90 @@ def enforce_reextract_process_env_in_place(
     *,
     explicit_model: str | None = None,
     explicit_fallback_model: str | None = None,
+    plan_model: str | None = None,
+    plan_fallback_model: str | None = None,
+    plan_path: Path | str | None = None,
+    preference_model: str | None = None,
+    user_preferences: Mapping[str, Any] | None = None,
+    provider_candidates: Mapping[str, str] | None = None,
     explicit_dsn: str | None = None,
     repo_root: Path | None = None,
+    repo_env_path: Path | None = None,
+    hydrate_from_dotenv: bool = False,
     preserve_pytest: bool = False,
     validate_required: bool = False,
 ) -> frozenset[str]:
     """Filter `target_env` in place to the exact least-privilege set for `reextract_conversations.py <subcommand>`."""
     root = repo_root or _repo_root_default()
     cmd = str(subcommand or "").strip()
+    dotenv_vars = _resolve_dotenv_vars(
+        target_env,
+        repo_root=root,
+        repo_env_path=repo_env_path,
+        hydrate_from_dotenv=hydrate_from_dotenv,
+    )
+    cand_vars: dict[str, str] = {}
+    _, _, all_provider_keys = _load_catalog_maps(root)
+    for p_key in set(all_provider_keys) | set(XAI_OAUTH_ALLOWED_ENV_KEYS) | {"DALTON_ASSIST_FALLBACK_MODEL"}:
+        cur_p_val = str(target_env.get(p_key) or "").strip()
+        if cur_p_val:
+            cand_vars[p_key] = cur_p_val
+    if isinstance(provider_candidates, Mapping):
+        for p_key, p_val in provider_candidates.items():
+            if str(p_val or "").strip():
+                cand_vars[str(p_key)] = str(p_val).strip()
     selected_models: list[str] = []
     if cmd == "extract":
+        assist_raw = (
+            str(cand_vars.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+            or str(target_env.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+            or str(dotenv_vars.get("DALTON_ASSIST_FALLBACK_MODEL") or "").strip()
+            or None
+        )
         selected_models = resolve_selected_archive_models(
             explicit_model=explicit_model,
             explicit_fallback_model=explicit_fallback_model,
-            assist_fallback_raw=target_env.get("DALTON_ASSIST_FALLBACK_MODEL"),
+            plan_model=plan_model,
+            plan_fallback_model=plan_fallback_model,
+            plan_path=plan_path,
+            preference_model=preference_model,
+            user_preferences=user_preferences,
+            assist_fallback_raw=assist_raw,
             repo_root=root,
         )
     allowed_keys, cond_required = reextract_allowed_env_keys(
         cmd, models=selected_models, repo_root=root
     )
 
+    for key in allowed_keys:
+        if (
+            isinstance(provider_candidates, Mapping)
+            and key in provider_candidates
+            and str(provider_candidates[key] or "").strip()
+        ):
+            target_env[key] = str(provider_candidates[key]).strip()
+            continue
+        if str(target_env.get(key) or "").strip():
+            continue
+        if key in cand_vars and str(cand_vars[key]).strip():
+            target_env[key] = str(cand_vars[key]).strip()
+            continue
+        if dotenv_vars and key in dotenv_vars and str(dotenv_vars[key]).strip():
+            target_env[key] = str(dotenv_vars[key]).strip()
+
+    if (
+        cmd in ("plan", "apply", "render", "rollback")
+        and explicit_dsn
+        and str(explicit_dsn).strip()
+    ):
+        target_env["DALTON_REEXTRACT_DSN"] = str(explicit_dsn).strip()
+
     for key in list(target_env.keys()):
-        if _is_stripped_credential_key(key) or key == "DALTON_BRIDGE_TOKEN":
+        if (
+            _is_stripped_credential_key(key)
+            or _is_shell_injection_key(key)
+            or key == "DALTON_BRIDGE_TOKEN"
+        ):
             target_env.pop(key, None)
             continue
         if preserve_pytest and key.startswith("PYTEST_"):
@@ -1073,6 +1605,16 @@ def enforce_reextract_process_env_in_place(
     return cond_required
 
 
+def _is_valid_postgres_dsn(dsn: str) -> bool:
+    s = str(dsn or "").strip()
+    if not s:
+        return False
+    if s.startswith(("postgresql://", "postgres://")):
+        parsed = urlparse(s)
+        return bool(parsed.hostname or parsed.path.strip("/"))
+    return "dbname=" in s or "host=" in s
+
+
 def validate_reextract_required_env(
     env: Mapping[str, str],
     subcommand: str,
@@ -1088,13 +1630,16 @@ def validate_reextract_required_env(
         if not str(env.get(key) or "").strip():
             issues.append(f"missing required key {key}")
 
-    has_dsn = bool(
-        cmd in ("plan", "apply", "render", "rollback")
-        and (
-            (explicit_dsn and str(explicit_dsn).strip())
-            or str(env.get("DALTON_REEXTRACT_DSN") or "").strip()
-        )
+    dsn_val = (
+        str(explicit_dsn).strip()
+        if explicit_dsn and str(explicit_dsn).strip()
+        else str(env.get("DALTON_REEXTRACT_DSN") or "").strip()
     )
+    has_dsn = bool(cmd in ("plan", "apply", "render", "rollback") and dsn_val)
+    if has_dsn and not _is_valid_postgres_dsn(dsn_val):
+        issues.append(
+            "invalid key DALTON_REEXTRACT_DSN (must be a postgresql:// URI or libpq conninfo)"
+        )
     if not has_dsn or (cmd == "render"):
         # Note: `render --yes` also opens the app pool for workspace resolution; dry-run with
         # explicit `--dsn` can skip DB_* only when `DALTON_REEXTRACT_DSN` / `--dsn` is given
@@ -1161,6 +1706,64 @@ def inspect_env_key_presence(
 # ---------------------------------------------------------------------------
 
 
+_MACOS_SYSTEM_ROOT_SYMLINKS: frozenset[str] = frozenset({"/var", "/tmp", "/etc"})
+
+
+def _validate_safe_parent_chain(target_path: Path, *, report_path: Path) -> None:
+    """Reject any symlinked or non-directory ancestor in `target_path` (excluding OS root links)."""
+    abs_parent = Path(os.path.abspath(str(target_path)))
+    for candidate in (abs_parent, *abs_parent.parents):
+        cand_str = str(candidate)
+        if cand_str in _MACOS_SYSTEM_ROOT_SYMLINKS:
+            continue
+        if candidate.is_symlink():
+            raise EnvFileValidationError(
+                path=report_path,
+                reason=f"unsafe symlink parent directory ({candidate})",
+            )
+        try:
+            st = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise EnvFileValidationError(
+                path=report_path,
+                reason=f"parent path is not a directory ({candidate})",
+            )
+
+
+def validate_safe_directory_target(dir_path: Path) -> None:
+    """Validate that `dir_path` and its ancestors are safe real directories (never symlinks)."""
+    _validate_safe_parent_chain(dir_path, report_path=dir_path)
+
+
+def validate_safe_regular_file_target(
+    path: Path,
+    *,
+    allow_missing: bool = True,
+) -> None:
+    """Validate that `path` has safe real parent directories and is a regular file (never a symlink)."""
+    _validate_safe_parent_chain(path.parent, report_path=path)
+    if path.is_symlink():
+        raise EnvFileValidationError(
+            path=path,
+            reason="target path must not be a symlink",
+        )
+    try:
+        st = path.lstat()
+    except FileNotFoundError as exc:
+        if not allow_missing:
+            raise EnvFileValidationError(
+                path=path,
+                reason="required file does not exist",
+            ) from exc
+        return
+    if stat.S_ISDIR(st.st_mode):
+        raise EnvFileValidationError(path=path, reason="target path is a directory")
+    if not stat.S_ISREG(st.st_mode):
+        raise EnvFileValidationError(path=path, reason="target path is not a regular file")
+
+
 def _fsync_directory(dir_path: Path) -> None:
     try:
         fd = os.open(str(dir_path), os.O_RDONLY)
@@ -1182,15 +1785,12 @@ def atomic_write_text(
     parent_mode: int | None = None,
 ) -> None:
     """Atomically write `content` to `path` with exact `mode` permissions via temp file + `os.replace`."""
+    validate_safe_regular_file_target(path, allow_missing=True)
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        if parent_mode is not None:
-            os.chmod(path.parent, parent_mode)
-    elif parent_mode is not None:
-        try:
-            os.chmod(path.parent, parent_mode)
-        except OSError:
-            pass
+    validate_safe_directory_target(path.parent)
+    if parent_mode is not None:
+        os.chmod(path.parent, parent_mode)
 
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -1210,6 +1810,7 @@ def atomic_write_text(
         os.close(fd)
         closed = True
         os.chmod(tmp_path, mode)
+        validate_safe_regular_file_target(path, allow_missing=True)
         os.replace(tmp_path, path)
         _fsync_directory(path.parent)
     except BaseException:
@@ -1228,16 +1829,15 @@ def atomic_write_text(
 def parse_env_file_strict(
     path: Path,
 ) -> tuple[list[tuple[str, str | None, str]], dict[str, str]]:
-    """Strictly parse an env file, rejecting malformed `KEY=VALUE` lines and duplicate keys.
+    """Strictly parse an env file, rejecting symlinks, malformed `KEY=VALUE` lines, and duplicate keys.
 
     Returns `(entries, unquoted_values)` where each entry is `(kind, key_or_none, raw_line)`
     and `unquoted_values` applies `v.strip().strip("'").strip('"')` matching `_read_env_file_dict`.
     Never includes raw values in raised error messages.
     """
+    validate_safe_regular_file_target(path, allow_missing=True)
     if not path.exists():
         return [], {}
-    if path.is_dir():
-        raise EnvFileValidationError(path=path, reason="target path is a directory")
 
     raw_text = path.read_text(encoding="utf-8")
     entries: list[tuple[str, str | None, str]] = []
@@ -1517,17 +2117,18 @@ def render_plist_atomic(
     logs_dir: Path | None = None,
 ) -> int:
     """Render launchd plist atomically (`0644`) using non-secret paths from `bridge_env_path`."""
+    validate_safe_regular_file_target(bridge_env_path, allow_missing=False)
+    validate_safe_regular_file_target(template_path, allow_missing=False)
+    validate_safe_regular_file_target(dest_path, allow_missing=True)
     _, bridge_vals = parse_env_file_strict(bridge_env_path)
     port_int = int(str(bridge_vals.get("DALTON_BRIDGE_PORT") or "8960").strip())
     ocw_root = str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip()
     python_bin = str(bridge_vals.get("DALTON_OCW_PYTHON") or "").strip()
-    if not template_path.is_file():
-        raise EnvFileValidationError(
-            path=template_path, reason="plist template does not exist"
-        )
     tpl = template_path.read_text(encoding="utf-8")
     eff_logs = logs_dir if logs_dir is not None else (home_dir / "Library" / "Logs")
+    validate_safe_directory_target(eff_logs)
     eff_logs.mkdir(parents=True, exist_ok=True)
+    validate_safe_directory_target(eff_logs)
     rendered = (
         tpl.replace("__HOME__/.config/dalton/researchdata-bridge.env", str(bridge_env_path))
         .replace("__HOME__/Library/Logs", str(eff_logs))
@@ -1554,7 +2155,16 @@ def _cmd_exec_nonarchive(args: argparse.Namespace) -> int:
         return 2
     env = build_nonarchive_subprocess_env(
         os.environ,
-        drop_keys=("DALTON_BRIDGE_ENV_FILTER_PY",),
+        drop_keys=(
+            "DALTON_BRIDGE_ENV_FILTER_PY",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONUSERBASE",
+            "PYTHONSTARTUP",
+            "PYTHONINSPECT",
+            "PYTHONEXECUTABLE",
+        ),
+        allow_keys=getattr(args, "allow_env", None) or (),
     )
     os.execvpe(cmd[0], cmd, env)
     return 127
@@ -1576,6 +2186,13 @@ def _cmd_exec_archive(args: argparse.Namespace) -> int:
         else Path(os.path.expanduser("~/.config/dalton/researchdata-bridge.env"))
     )
     explicit_model = args.model or _extract_model_arg_from_argv(cmd)
+    defer_primary = not bool(explicit_model)
+    caller_candidates = capture_archive_provider_candidates(
+        os.environ,
+        repo_root=repo_root,
+        repo_env_path=repo_env,
+        hydrate_from_dotenv=True,
+    )
     try:
         env = build_archive_subprocess_env(
             repo_env_path=repo_env,
@@ -1585,10 +2202,21 @@ def _cmd_exec_archive(args: argparse.Namespace) -> int:
             host_embed_url=args.embed_url or DEFAULT_HOST_EMBED_URL,
             repo_root=repo_root,
             validate_required=True,
+            defer_primary_model_validation=defer_primary,
         )
     except ArchiveEnvValidationError as exc:
         print(f"[archive_env] ERROR: {exc}", file=sys.stderr)
         return 1
+
+    if caller_candidates:
+        payload_bytes = json.dumps(caller_candidates, ensure_ascii=False).encode("utf-8")
+        rfd, wfd = os.pipe()
+        try:
+            os.write(wfd, payload_bytes)
+        finally:
+            os.close(wfd)
+        os.set_inheritable(rfd, True)
+        env["_DALTON_ARCHIVE_CANDIDATES_FD"] = str(rfd)
 
     os.execvpe(cmd[0], cmd, env)
     return 127
@@ -1655,6 +2283,13 @@ def build_cli_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
     p_na = sub.add_parser("exec-nonarchive", help="Scrub credentials and exec command")
+    p_na.add_argument(
+        "--allow-env",
+        action="append",
+        default=[],
+        dest="allow_env",
+        help="Explicitly allow a specific credential variable (repeatable)",
+    )
     p_na.add_argument("command", nargs=argparse.REMAINDER)
 
     p_ar = sub.add_parser("exec-archive", help="Build archive allowlist env, validate, and exec")

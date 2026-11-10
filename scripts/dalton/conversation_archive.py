@@ -45,8 +45,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-_PRE_IMPORT_ENV: dict[str, str] = dict(os.environ)
-
 from scripts.dalton import bridge_subprocess_env  # noqa: E402
 from scripts.dalton.conversations.export_openclaw import (  # noqa: E402
     DEFAULT_AGENTS,
@@ -87,14 +85,6 @@ from src.dalton.llm.model_prefs import resolve_dalton_extract_model  # noqa: E40
 from src.dalton.settings import get_dalton_settings  # noqa: E402
 from src.server.database import pool as _db_pool_mod  # noqa: E402
 from src.server.database.pool import get_or_create_pool, open_session_connection  # noqa: E402
-
-# Re-filter `os.environ` immediately after `src.*` imports (which trigger `load_dotenv()`)
-# and restore the host `DALTON_BRIDGE_EMBED_URL` and `no_proxy` (§2.6.1.4).
-bridge_subprocess_env.scrub_post_dotenv_import_env(
-    os.environ,
-    pre_import_env=_PRE_IMPORT_ENV,
-    repo_root=REPO_ROOT,
-)
 
 _orig_open_session_connection = open_session_connection
 
@@ -2849,6 +2839,8 @@ async def run_archive_pipeline(
     agents: list[str] | tuple[str, ...] = DEFAULT_AGENTS,
     extractor_model: str | None = None,
     extractor_fallback_model: str | None = None,
+    provider_candidates: dict[str, str] | None = None,
+    validate_env: bool = False,
     segment_deadline_s: float | None = None,
     hourly_token_budget: int | None = None,
     extract_concurrency: int | None = None,
@@ -2871,17 +2863,34 @@ async def run_archive_pipeline(
     today_et = datetime.now(ET_TZ).date()
     eff_since = since_date or (today_et - timedelta(days=int(cfg.default_backfill_days or 14)))
     eff_until = until_date or today_et
+    eff_Provider_cands = (
+        dict(provider_candidates)
+        if isinstance(provider_candidates, dict)
+        else bridge_subprocess_env.capture_archive_provider_candidates(
+            os.environ,
+            repo_root=REPO_ROOT,
+            hydrate_from_dotenv=True,
+        )
+    )
     eff_model = (extractor_model or "").strip()
     if not eff_model:
         eff_model = (await resolve_dalton_extract_model(archive_billing_user_id())).strip()
-    bridge_subprocess_env.enforce_archive_process_env_in_place(
+    eff_fallback = str(
+        extractor_fallback_model
+        if extractor_fallback_model is not None
+        else (cfg.extractor_fallback_model or DEFAULT_FALLBACK_MODEL)
+    ).strip()
+    cond_required = bridge_subprocess_env.enforce_archive_process_env_in_place(
         os.environ,
         explicit_model=eff_model,
-        explicit_fallback_model=str(cfg.extractor_fallback_model or DEFAULT_FALLBACK_MODEL),
+        explicit_fallback_model=eff_fallback,
+        provider_candidates=eff_Provider_cands,
         repo_root=REPO_ROOT,
-        preserve_pytest=True,
-        validate_required=False,
+        hydrate_from_dotenv=True,
+        preserve_pytest=(not validate_env),
+        validate_required=validate_env,
     )
+    _ = cond_required
     eff_budget = int(hourly_token_budget or cfg.hourly_token_budget)
     eff_concurrency = max(
         1,
@@ -2976,7 +2985,19 @@ async def run_archive_pipeline(
                 from ptc_agent.config import load_from_files
                 from src.server.services.llm.service import LLMService
 
-                agent_cfg = await load_from_files()
+                try:
+                    agent_cfg = await load_from_files()
+                finally:
+                    bridge_subprocess_env.enforce_archive_process_env_in_place(
+                        os.environ,
+                        explicit_model=eff_model,
+                        explicit_fallback_model=eff_fallback,
+                        provider_candidates=eff_Provider_cands,
+                        repo_root=REPO_ROOT,
+                        hydrate_from_dotenv=False,
+                        preserve_pytest=True,
+                        validate_required=False,
+                    )
                 if getattr(agent_cfg, "llm", None) is not None and hasattr(agent_cfg.llm, "fallback"):
                     agent_cfg.llm.fallback = []
                 shared_llm_service = LLMService(agent_config=agent_cfg, logger=logger)
@@ -3281,6 +3302,8 @@ async def _async_main(
     args: argparse.Namespace,
     *,
     on_finally: Callable[[], Any] | None = None,
+    provider_candidates: dict[str, str] | None = None,
+    validate_env: bool = False,
 ) -> dict[str, Any]:
     mode = args.subcommand or "run"
     today_et = datetime.now(ET_TZ).date()
@@ -3313,6 +3336,8 @@ async def _async_main(
             "ocw_agents_root": args.ocw_agents_root,
             "agents": agents,
             "extractor_model": args.model,
+            "provider_candidates": provider_candidates,
+            "validate_env": validate_env,
             "hourly_token_budget": args.hourly_token_budget,
             "skip_host_export": bool(args.skip_host_export),
         }
@@ -3360,18 +3385,31 @@ def main(
     configure_archive_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    should_hydrate = (
+        validate_env is True
+        or bool(os.environ.get("DALTON_DOTENV_PATH"))
+        or bool(os.environ.get("DALTON_REPO_ENV_FILE"))
+    )
+    provider_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+        os.environ,
+        repo_root=REPO_ROOT,
+        hydrate_from_dotenv=should_hydrate,
+    )
     cond_required = bridge_subprocess_env.enforce_archive_process_env_in_place(
         os.environ,
         explicit_model=args.model,
+        provider_candidates=provider_candidates,
         repo_root=REPO_ROOT,
+        hydrate_from_dotenv=should_hydrate,
         preserve_pytest=(validate_env is not True),
         validate_required=False,
+        defer_primary_model_validation=not bool(args.model),
     )
     if validate_env is True:
         try:
             bridge_subprocess_env.validate_archive_required_env(
                 os.environ,
-                conditional_required_keys=cond_required,
+                conditional_required_keys=(cond_required if args.model else set()),
             )
         except bridge_subprocess_env.ArchiveEnvValidationError as exc:
             print(f"[conversation_archive] ERROR: {exc}", file=sys.stderr)
@@ -3383,7 +3421,12 @@ def main(
     has_live_abandoned = False
     interrupted = False
     main_task: asyncio.Task[dict[str, Any]] = loop.create_task(
-        _async_main(args, on_finally=on_finally)
+        _async_main(
+            args,
+            on_finally=on_finally,
+            provider_candidates=provider_candidates,
+            validate_env=(validate_env is True),
+        )
     )
     prev_sigint_handler: Any = None
     sigint_installed = False
@@ -3419,6 +3462,9 @@ def main(
             summary = loop.run_until_complete(main_task)
         except ArchiveAlreadyRunningError as exc:
             exit_code = int(exc.code if isinstance(exc.code, int) else EXIT_CODE_LOCK_HELD)
+        except bridge_subprocess_env.ArchiveEnvValidationError as exc:
+            print(f"[conversation_archive] ERROR: {exc}", file=sys.stderr)
+            exit_code = EXIT_CODE_FATAL
         except KeyboardInterrupt:
             interrupted = True
             exit_code = EXIT_CODE_FATAL

@@ -48,8 +48,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-_PRE_IMPORT_ENV: dict[str, str] = dict(os.environ)
-
 from psycopg.rows import dict_row  # noqa: E402
 from psycopg.types.json import Jsonb  # noqa: E402
 
@@ -70,7 +68,6 @@ from scripts.dalton.conversation_archive import (  # noqa: E402
 )
 from scripts.dalton.conversations.export_openclaw import (  # noqa: E402
     DEFAULT_AGENTS,
-    DEFAULT_OCW_AGENTS_ROOT,
     is_operational_or_chitchat,
     resolve_default_ocw_agents_root,
     run_export,
@@ -91,15 +88,6 @@ from src.dalton.conversations.render import (  # noqa: E402
 )
 from src.dalton.database import conversations as db_conv  # noqa: E402
 from src.dalton.settings import get_dalton_settings  # noqa: E402
-
-# Re-filter `os.environ` immediately after `src.*` imports (which trigger `load_dotenv()`)
-# and restore the host `DALTON_BRIDGE_EMBED_URL` and `no_proxy` (§2.6.1.4).
-bridge_subprocess_env.scrub_post_dotenv_import_env(
-    os.environ,
-    pre_import_env=_PRE_IMPORT_ENV,
-    repo_root=REPO_ROOT,
-    include_reextract_dsn=True,
-)
 
 logger = logging.getLogger("dalton.reextract_conversations")
 
@@ -834,7 +822,19 @@ def _dsn_dbname(dsn: str) -> str:
 
 
 def resolve_dsn(args: argparse.Namespace) -> str | None:
-    dsn = getattr(args, "dsn", None) or os.environ.get(DSN_ENV) or None
+    dsn = (
+        getattr(args, "dsn", None)
+        or os.environ.get(DSN_ENV)
+        or bridge_subprocess_env.resolve_reextract_dsn(
+            explicit_dsn=getattr(args, "dsn", None),
+            env=os.environ,
+            repo_root=REPO_ROOT,
+            hydrate_from_dotenv=bool(
+                os.environ.get("DALTON_DOTENV_PATH") or os.environ.get("DALTON_REPO_ENV_FILE")
+            ),
+        )
+        or None
+    )
     if dsn:
         # Only the database name: the DSN may carry a password.
         logger.warning("Targeting database %r from --dsn/%s, not the app pool", _dsn_dbname(dsn), DSN_ENV)
@@ -1052,13 +1052,40 @@ def _outcome_record(
     return rec
 
 
-async def _build_shared_llm_service() -> Any:
+async def _build_shared_llm_service(
+    *,
+    model: str | None = None,
+    fallback_model: str | None = None,
+    provider_candidates: dict[str, str] | None = None,
+) -> Any:
     """Same shared service the archive builds: one client, provider fallback chain disabled."""
     try:
         from ptc_agent.config import load_from_files
         from src.server.services.llm.service import LLMService
 
-        agent_cfg = await load_from_files()
+        pre_load_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+            os.environ,
+            repo_root=REPO_ROOT,
+            hydrate_from_dotenv=False,
+        )
+        if isinstance(provider_candidates, dict):
+            for k, v in provider_candidates.items():
+                if str(v or "").strip():
+                    pre_load_candidates[str(k)] = str(v).strip()
+        try:
+            agent_cfg = await load_from_files()
+        finally:
+            bridge_subprocess_env.enforce_reextract_process_env_in_place(
+                os.environ,
+                "extract",
+                explicit_model=model,
+                explicit_fallback_model=fallback_model,
+                provider_candidates=pre_load_candidates,
+                repo_root=REPO_ROOT,
+                hydrate_from_dotenv=False,
+                preserve_pytest=True,
+                validate_required=False,
+            )
         if getattr(agent_cfg, "llm", None) is not None and hasattr(agent_cfg.llm, "fallback"):
             agent_cfg.llm.fallback = []
         return LLMService(agent_config=agent_cfg, logger=logger)
@@ -2289,12 +2316,15 @@ async def _cmd_extract(args: argparse.Namespace) -> int:
         raise RunStateError(
             f"--fallback-model {fallback!r} does not match the plan's {plan.get('fallback_model')!r}"
         )
+    provider_candidates = getattr(args, "_provider_candidates", None)
     bridge_subprocess_env.enforce_reextract_process_env_in_place(
         os.environ,
         "extract",
         explicit_model=str(model),
         explicit_fallback_model=str(fallback or ""),
+        provider_candidates=provider_candidates,
         repo_root=REPO_ROOT,
+        hydrate_from_dotenv=True,
         preserve_pytest=True,
         validate_required=False,
     )
@@ -2340,7 +2370,11 @@ async def _cmd_extract(args: argparse.Namespace) -> int:
     pool = get_or_create_pool()
     await pool.open(wait=True)
     try:
-        llm_service = await _build_shared_llm_service()
+        llm_service = await _build_shared_llm_service(
+            model=str(model),
+            fallback_model=str(fallback or ""),
+            provider_candidates=provider_candidates,
+        )
         summary = await run_extraction(
             segments,
             StagingLedger(run_dir / STAGED_FILE),
@@ -2543,13 +2577,32 @@ def main(
         except Exception:
             pass
 
+    should_hydrate = (
+        validate_env is True
+        or bool(os.environ.get("DALTON_DOTENV_PATH"))
+        or bool(os.environ.get("DALTON_REPO_ENV_FILE"))
+    )
+    provider_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+        os.environ,
+        repo_root=REPO_ROOT,
+        hydrate_from_dotenv=should_hydrate,
+    )
+    args._provider_candidates = provider_candidates
+    eff_dsn = bridge_subprocess_env.resolve_reextract_dsn(
+        explicit_dsn=getattr(args, "dsn", None),
+        env=os.environ,
+        repo_root=REPO_ROOT,
+        hydrate_from_dotenv=should_hydrate,
+    )
     cond_required = bridge_subprocess_env.enforce_reextract_process_env_in_place(
         os.environ,
         args.subcommand,
         explicit_model=eff_model,
         explicit_fallback_model=eff_fallback,
-        explicit_dsn=getattr(args, "dsn", None),
+        provider_candidates=provider_candidates,
+        explicit_dsn=eff_dsn,
         repo_root=REPO_ROOT,
+        hydrate_from_dotenv=should_hydrate,
         preserve_pytest=(validate_env is not True),
         validate_required=False,
     )
@@ -2563,7 +2616,7 @@ def main(
                 os.environ,
                 args.subcommand,
                 conditional_required_keys=cond_required,
-                explicit_dsn=getattr(args, "dsn", None),
+                explicit_dsn=eff_dsn,
             )
         return asyncio.run(COMMANDS[args.subcommand](args))
     except bridge_subprocess_env.ArchiveEnvValidationError as exc:
