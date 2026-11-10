@@ -1,3 +1,5 @@
+import type { SessionCommandTargetKind } from "./commands.js";
+
 export type ChannelPlatform = "feishu" | "discord" | "weixin";
 
 export const SUPPORTED_PLATFORMS: readonly ChannelPlatform[] = [
@@ -233,6 +235,91 @@ export interface InboundChannelEvent {
   /** Arbitrary platform payload saved in `raw_payload`. */
   rawPayload?: Record<string, unknown>;
 }
+
+export type NativeInteractionAckOutcome = "acknowledged" | "failed" | "unknown";
+export type NativeInteractionReplyOutcome = "sent" | "failed" | "expired" | "unknown";
+
+export interface NativeAutocompleteChoice {
+  name: string;
+  value: string;
+}
+
+export interface NativeCommandResponder {
+  readonly ackResult: {
+    outcome: NativeInteractionAckOutcome;
+    status?: number;
+    discordCode?: number;
+    retryAfterMs?: number;
+    reason?: string;
+  };
+  readonly receivedAtMs: number;
+  readonly expiresAtMs: number;
+  isExpired(): boolean;
+  sendPrivateReply(text: string): Promise<{
+    outcome: NativeInteractionReplyOutcome;
+    status?: number;
+    discordCode?: number;
+    retryAfterMs?: number;
+    reason?: string;
+  }>;
+}
+
+export interface NativeAutocompleteResponder {
+  readonly receivedAtMs: number;
+  respondChoices(choices: readonly NativeAutocompleteChoice[]): Promise<{
+    outcome: NativeInteractionAckOutcome;
+    status?: number;
+    discordCode?: number;
+    retryAfterMs?: number;
+    reason?: string;
+  }>;
+}
+
+export interface NativeCommandInteractionEvent {
+  kind: "command";
+  platform: "discord";
+  interactionId: string;
+  requestKey: string;
+  applicationId: string;
+  commandName: "main" | "workspace" | "new" | "stop";
+  cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+  targetKind?: SessionCommandTargetKind;
+  workspaceId?: string;
+  workspaceQuery?: string;
+  platformUserId: string;
+  platformUsername?: string;
+  chatType: "dm" | "group";
+  chatAddress: string;
+  chatId: string;
+  chatName?: string;
+  threadScopeKey: string;
+  rawPayload: Record<string, unknown>;
+  responder: NativeCommandResponder;
+}
+
+export interface NativeAutocompleteInteractionEvent {
+  kind: "autocomplete";
+  platform: "discord";
+  interactionId: string;
+  applicationId: string;
+  commandName: "workspace";
+  focusedOptionName: "workspace";
+  query: string;
+  platformUserId: string;
+  platformUsername?: string;
+  chatType: "dm" | "group";
+  chatAddress: string;
+  chatId: string;
+  chatName?: string;
+  threadScopeKey: string;
+  rawPayload: Record<string, unknown>;
+  deadlineMs?: number;
+  responder: NativeAutocompleteResponder;
+}
+
+export type NativeInteractionEvent =
+  | NativeCommandInteractionEvent
+  | NativeAutocompleteInteractionEvent;
 
 // ---------------------------------------------------------------------------
 // `/agent/*` Request & Response Shapes (§1.2.1 ~ §1.2.7)

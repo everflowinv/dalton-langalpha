@@ -182,6 +182,9 @@ class SessionCommandRequest(BaseModel):
     weixin_context_source: str | None = None
     weixin_context_seq: int | None = None
     is_internal_query: bool = False
+    native_interaction: bool = False
+    native_ack_status: str | None = None
+    native_reply_status: str | None = None
 
 
 class ChannelSettingsPutRequest(BaseModel):
@@ -532,6 +535,9 @@ async def internal_session_command_endpoint(
         weixin_context_source=body.weixin_context_source,
         weixin_context_seq=body.weixin_context_seq,
         is_internal_query=body.is_internal_query,
+        native_interaction=body.native_interaction,
+        native_ack_status=body.native_ack_status,
+        native_reply_status=body.native_reply_status,
     )
 
 

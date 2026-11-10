@@ -36,6 +36,11 @@ import {
   MAX_ATTACHMENT_COUNT,
   MAX_INLINE_IMAGE_BYTES,
   MAX_TOTAL_ATTACHMENT_BYTES,
+  type NativeAutocompleteChoice,
+  type NativeAutocompleteInteractionEvent,
+  type NativeCommandInteractionEvent,
+  type NativeCommandResponder,
+  type NativeInteractionEvent,
   type PendingInterruptState,
   PUBLIC_LIVE_STATUSES,
   PUBLIC_REPLAY_NEEDED_STATUSES,
@@ -187,6 +192,9 @@ export class ChannelGatewayOrchestrator {
     for (const adapter of this.adapters.values()) {
       adapter.onInboundEvent(async (event) => {
         await this.handleInboundEvent(event);
+      });
+      adapter.onNativeInteraction?.(async (event) => {
+        await this.handleNativeInteraction(event);
       });
     }
   }
@@ -984,14 +992,313 @@ export class ChannelGatewayOrchestrator {
     return true;
   }
 
+  // =========================================================================
+  // Discord Native Interactions (`INTERACTION_CREATE`)
+  // =========================================================================
+
+  async handleNativeInteraction(event: NativeInteractionEvent): Promise<void> {
+    if (event.kind === "autocomplete") {
+      await this.handleNativeAutocompleteInteraction(event);
+      return;
+    }
+    await this.handleNativeCommandInteraction(event);
+  }
+
+  private async handleNativeAutocompleteInteraction(
+    event: NativeAutocompleteInteractionEvent,
+  ): Promise<void> {
+    const deadlineMs = event.deadlineMs ?? event.responder.receivedAtMs + 1_800;
+    const remainingMs = deadlineMs - this.nowFn();
+    if (remainingMs <= 0) {
+      await event.responder.respondChoices([]);
+      return;
+    }
+    const budgetMs = Math.min(1_800, remainingMs);
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const queryPromise = this.backend.sessionCommand({
+        cmd: "workspace_list",
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        chat_id: event.chatId,
+        chat_name: event.chatName ?? null,
+        scope_key: event.threadScopeKey,
+        is_internal_query: true,
+      });
+      const timeoutPromise = new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), budgetMs);
+        (timeoutHandle as { unref?: () => void }).unref?.();
+      });
+      const res = await Promise.race([queryPromise, timeoutPromise]);
+      if (
+        !res ||
+        !res.ok ||
+        res.allowed === false ||
+        res.linked === false ||
+        !Array.isArray(res.workspaces)
+      ) {
+        await event.responder.respondChoices([]);
+        return;
+      }
+
+      const rawQuery = (event.query ?? "").trim().toLowerCase();
+      const prefixMatches: NativeAutocompleteChoice[] = [];
+      const substringMatches: NativeAutocompleteChoice[] = [];
+      for (const ws of res.workspaces) {
+        const wsId = typeof ws.workspace_id === "string" ? ws.workspace_id.trim() : "";
+        const wsName = typeof ws.name === "string" ? ws.name.trim() : "";
+        if (!wsId || !wsName) continue;
+        if (!rawQuery) {
+          prefixMatches.push({ name: wsName, value: wsId });
+          continue;
+        }
+        const lowerName = wsName.toLowerCase();
+        const lowerId = wsId.toLowerCase();
+        if (lowerName.startsWith(rawQuery) || lowerId.startsWith(rawQuery)) {
+          prefixMatches.push({ name: wsName, value: wsId });
+        } else if (lowerName.includes(rawQuery) || lowerId.includes(rawQuery)) {
+          substringMatches.push({ name: wsName, value: wsId });
+        }
+      }
+      const choices = [...prefixMatches, ...substringMatches].slice(0, 25);
+      await event.responder.respondChoices(choices);
+    } catch {
+      await event.responder.respondChoices([]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+
+  private async handleNativeCommandInteraction(
+    event: NativeCommandInteractionEvent,
+  ): Promise<void> {
+    const ackOutcome = event.responder.ackResult.outcome;
+    const rawPayload: Record<string, unknown> = {
+      ...event.rawPayload,
+      platform_user_id: event.platformUserId,
+      ...(event.platformUsername
+        ? { platform_username: event.platformUsername }
+        : {}),
+      chat_id: event.chatId,
+      ...(event.chatName ? { chat_name: event.chatName } : {}),
+      command: `/${event.commandName}`,
+      cmd: event.cmd,
+      native_interaction: true,
+      native_ack_status: ackOutcome,
+      native_reply_status:
+        ackOutcome === "acknowledged" ? "pending" : "not_applicable",
+    };
+
+    if (ackOutcome !== "acknowledged") {
+      // Initial callback failed or had an unknown outcome: record the unexecuted
+      // interaction in the ledger without executing the command or touching session state.
+      await this.backend.sessionCommand({
+        cmd: event.cmd,
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        chat_id: event.chatId,
+        chat_name: event.chatName ?? null,
+        scope_key: event.threadScopeKey,
+        message_id: event.interactionId,
+        request_key: event.requestKey,
+        raw_payload: rawPayload,
+        target_kind: event.targetKind ?? null,
+        workspace_id: event.workspaceId ?? null,
+        workspace_query: event.workspaceQuery ?? null,
+        native_interaction: true,
+        native_ack_status: ackOutcome,
+        native_reply_status: "not_applicable",
+      });
+      return;
+    }
+
+    const cmdRes = await this.backend.sessionCommand({
+      cmd: event.cmd,
+      platform: event.platform,
+      platform_user_id: event.platformUserId,
+      chat_type: event.chatType,
+      chat_address: event.chatAddress,
+      chat_id: event.chatId,
+      chat_name: event.chatName ?? null,
+      scope_key: event.threadScopeKey,
+      message_id: event.interactionId,
+      request_key: event.requestKey,
+      raw_payload: rawPayload,
+      target_kind: event.targetKind ?? null,
+      workspace_id: event.workspaceId ?? null,
+      workspace_query: event.workspaceQuery ?? null,
+      native_interaction: true,
+      native_ack_status: "acknowledged",
+      native_reply_status: "pending",
+    });
+
+    if (cmdRes.not_executed === true) {
+      return;
+    }
+
+    const syntheticEvent: InboundChannelEvent = {
+      platform: event.platform,
+      platformUserId: event.platformUserId,
+      ...(event.platformUsername
+        ? { platformUsername: event.platformUsername }
+        : {}),
+      chatType: event.chatType,
+      chatAddress: event.chatAddress,
+      chatId: event.chatId,
+      ...(event.chatName ? { chatName: event.chatName } : {}),
+      threadScopeKey: event.threadScopeKey,
+      messageId: event.interactionId,
+      text: "",
+      rawPayload,
+    };
+
+    await this.completeSessionCommandExecution({
+      event: syntheticEvent,
+      cmd: event.cmd,
+      targetKind: event.targetKind ?? null,
+      workspaceQuery: event.workspaceQuery ?? null,
+      cmdRes,
+      nativeResponder: event.responder,
+    });
+  }
+
+  private isNativeInteractionEvent(
+    rawPayload?: Record<string, unknown> | null,
+    cmdRes?: I3SessionCommandResponse | null,
+  ): boolean {
+    if (cmdRes?.native_interaction === true) return true;
+    if (!rawPayload || typeof rawPayload !== "object") return false;
+    return (
+      rawPayload.native_interaction === true ||
+      Boolean(
+        rawPayload.discord_interaction &&
+          typeof rawPayload.discord_interaction === "object" &&
+          !Array.isArray(rawPayload.discord_interaction),
+      )
+    );
+  }
+
+  private async deliverNativeCommandReply(params: {
+    event: InboundChannelEvent;
+    cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+    cmdRes: I3SessionCommandResponse;
+    replyText: string;
+    nativeResponder?: NativeCommandResponder;
+  }): Promise<void> {
+    const { event, cmd, cmdRes, replyText, nativeResponder } = params;
+    const terminalStatus = cmdRes.ok ? "completed" : "failed";
+    const effectDonePatch =
+      cmd === "stop" && cmdRes.ok ? { command_effect_status: "done" } : {};
+
+    if (!nativeResponder) {
+      // Process restarted and the short-lived interaction token is no longer available:
+      // preserve the command result, close out the reply attempt, and never fall back to public channel send.
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "abandoned_on_restart",
+        },
+      });
+      return;
+    }
+
+    if (nativeResponder.isExpired()) {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "expired",
+        },
+      });
+      return;
+    }
+
+    const editOutcome = await nativeResponder.sendPrivateReply(replyText);
+    if (editOutcome.outcome === "sent") {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "sent",
+        },
+      });
+      return;
+    }
+
+    if (editOutcome.outcome === "expired" || editOutcome.outcome === "failed") {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status:
+            editOutcome.outcome === "expired" ? "expired" : "failed",
+        },
+      });
+      return;
+    }
+
+    // Transient / unknown webhook PATCH outcome within the 15-minute token window:
+    // keep `command_reply_pending: true` so a retry with the valid token can still update `@original`
+    // without re-executing the command.
+    await this.backend.updateInboundProgress({
+      platform: event.platform,
+      message_id: event.messageId,
+      ...effectDonePatch,
+      raw_payload_patch: {
+        native_interaction: true,
+        native_reply_status: "failed",
+      },
+    });
+  }
+
   private async completeSessionCommandExecution(params: {
     event: InboundChannelEvent;
     cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
     targetKind?: SessionCommandTargetKind | null;
     workspaceQuery?: string | null;
     cmdRes: I3SessionCommandResponse;
+    nativeResponder?: NativeCommandResponder;
   }): Promise<void> {
-    const { event, cmd, targetKind, workspaceQuery, cmdRes } = params;
+    const {
+      event,
+      cmd,
+      targetKind,
+      workspaceQuery,
+      cmdRes,
+      nativeResponder,
+    } = params;
+    const isNative =
+      Boolean(nativeResponder) ||
+      this.isNativeInteractionEvent(event.rawPayload, cmdRes);
+
+    if (cmdRes.not_executed === true) {
+      return;
+    }
 
     if (
       cmdRes.command_reply_pending === false &&
@@ -1004,14 +1311,27 @@ export class ChannelGatewayOrchestrator {
       !cmdRes.ok &&
       (cmdRes.linked === false || cmdRes.deny_reason === "not_linked")
     ) {
+      const denyText = this.formatDenyNotice(
+        event.platform,
+        cmdRes.deny_reason ?? "not_linked",
+      );
+      if (isNative) {
+        if (cmdRes.command_reply_pending !== false) {
+          await this.deliverNativeCommandReply({
+            event,
+            cmd,
+            cmdRes,
+            replyText: denyText,
+            nativeResponder,
+          });
+        }
+        return;
+      }
       const delivered = await this.sendInboundNotice(
         event,
         null,
         `notice:${event.platform}:${event.messageId}:deny_not_linked`,
-        this.formatDenyNotice(
-          event.platform,
-          cmdRes.deny_reason ?? "not_linked",
-        ),
+        denyText,
       );
       if (delivered) {
         await this.backend.updateInboundProgress({
@@ -1026,7 +1346,11 @@ export class ChannelGatewayOrchestrator {
     const userId = cmdRes.dalton_user_id ?? null;
 
     if (cmd === "stop" && this.isStopCancelDenied(cmdRes)) {
-      await this.deliverPersistedStopCancelDenial({ event, cmdRes });
+      await this.deliverPersistedStopCancelDenial({
+        event,
+        cmdRes,
+        nativeResponder,
+      });
       return;
     }
 
@@ -1101,6 +1425,7 @@ export class ChannelGatewayOrchestrator {
                   ...failureResult,
                   dalton_user_id: userId ?? failureResult.dalton_user_id ?? null,
                 },
+                nativeResponder,
               });
             }
             return;
@@ -1123,6 +1448,17 @@ export class ChannelGatewayOrchestrator {
       workspaceQuery: workspaceQuery ?? null,
       cmdRes,
     });
+
+    if (isNative) {
+      await this.deliverNativeCommandReply({
+        event,
+        cmd,
+        cmdRes,
+        replyText,
+        nativeResponder,
+      });
+      return;
+    }
 
     if (userId) {
       const delivered = await this.sendNoticeDelivery({
@@ -1204,8 +1540,9 @@ export class ChannelGatewayOrchestrator {
   private async deliverPersistedStopCancelDenial(params: {
     event: InboundChannelEvent;
     cmdRes: I3SessionCommandResponse;
+    nativeResponder?: NativeCommandResponder;
   }): Promise<void> {
-    const { event, cmdRes } = params;
+    const { event, cmdRes, nativeResponder } = params;
     if (cmdRes.command_reply_pending === false) {
       return;
     }
@@ -1214,6 +1551,19 @@ export class ChannelGatewayOrchestrator {
         ? cmdRes.stop_cancel_status
         : null;
     const failText = `Failed to stop the current run (status ${cancelStatus}).`;
+    const isNative =
+      Boolean(nativeResponder) ||
+      this.isNativeInteractionEvent(event.rawPayload, cmdRes);
+    if (isNative) {
+      await this.deliverNativeCommandReply({
+        event,
+        cmd: "stop",
+        cmdRes,
+        replyText: failText,
+        nativeResponder,
+      });
+      return;
+    }
     const userId = cmdRes.dalton_user_id ?? null;
     let delivered = false;
     if (userId) {
@@ -1301,6 +1651,9 @@ export class ChannelGatewayOrchestrator {
       if (!cmdRes.ok) {
         if (cmdRes.deny_reason === "workspace_ambiguous") {
           const candidates = cmdRes.candidates ?? [];
+          if (candidates.length === 0) {
+            return this.formatDenyNotice(platform, "workspace_write_denied");
+          }
           const candidateLines = candidates.map(
             (c) => `- \`${c.name}\` (\`${c.workspace_id}\`)`,
           );
@@ -7693,7 +8046,7 @@ export class ChannelGatewayOrchestrator {
         rawCmd === "stop"
           ? rawCmd
           : "workspace_list";
-      const targetKind =
+      const targetKind: SessionCommandTargetKind | null =
         cmdReq.target_kind === "home" ||
         cmdReq.target_kind === "workspace_id" ||
         cmdReq.target_kind === "exact_name" ||
@@ -7706,6 +8059,26 @@ export class ChannelGatewayOrchestrator {
         typeof cmdReq.workspace_query === "string"
           ? cmdReq.workspace_query
           : null;
+      const isNativeCmd =
+        this.isNativeInteractionEvent(row.raw_payload) ||
+        cmdReq.native_interaction === true ||
+        cmdResRaw.native_interaction === true;
+      const nativeAckStatus:
+        | "acknowledged"
+        | "unknown"
+        | "failed"
+        | undefined =
+        cmdReq.native_ack_status === "acknowledged" ||
+        cmdReq.native_ack_status === "unknown" ||
+        cmdReq.native_ack_status === "failed"
+          ? cmdReq.native_ack_status
+          : row.raw_payload?.native_ack_status === "acknowledged" ||
+              row.raw_payload?.native_ack_status === "unknown" ||
+              row.raw_payload?.native_ack_status === "failed"
+            ? row.raw_payload.native_ack_status
+            : isNativeCmd
+              ? "acknowledged"
+              : undefined;
       const reauthorizedRes = await this.backend.sessionCommand({
         cmd,
         platform: row.platform,
@@ -7729,6 +8102,12 @@ export class ChannelGatewayOrchestrator {
         target_kind: targetKind,
         workspace_id: workspaceId,
         workspace_query: workspaceQuery,
+        ...(isNativeCmd
+          ? {
+              native_interaction: true,
+              ...(nativeAckStatus ? { native_ack_status: nativeAckStatus } : {}),
+            }
+          : {}),
       });
       const persistedStopRunId =
         typeof row.run_id === "string" && row.run_id.length > 0
@@ -7816,6 +8195,7 @@ export class ChannelGatewayOrchestrator {
               : (reauthorizedRes.command_reply_pending ??
                 row.command_reply_pending ??
                 true),
+        ...(isNativeCmd ? { native_interaction: true } : {}),
         ...(stopCancelDenied
           ? {
               ok: false,
@@ -7864,13 +8244,25 @@ export class ChannelGatewayOrchestrator {
 
     const userId = row.dalton_user_id;
     if (!userId) {
+      const isNative = this.isNativeInteractionEvent(row.raw_payload);
       await this.backend.updateInboundProgress({
         platform: row.platform,
         message_id: row.message_id,
         status: "failed",
         fallback_pending: false,
+        ...(isNative
+          ? {
+              command_reply_pending: false,
+              command_effect_status: "done",
+              raw_payload_patch: {
+                native_interaction: true,
+                native_reply_status: "abandoned_on_restart",
+              },
+            }
+          : {}),
       });
       if (
+        !isNative &&
         row.chat_type === "dm" &&
         row.raw_payload?.invalid_inbound_event !== true &&
         row.raw_payload?.rejected_reason !== "weixin_group_unsupported"

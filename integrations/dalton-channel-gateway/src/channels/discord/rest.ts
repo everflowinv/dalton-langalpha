@@ -138,7 +138,7 @@ export function parseRetryAfterSeconds(body: unknown, headers: Headers, fallback
 export function createRouteKey(method: string, path: string): string {
   const pathname = path.split("?")[0] ?? path;
   const segments = pathname.replace(/^\/+/, "").split("/");
-  if (segments[0] === "webhooks" && segments[2]) {
+  if ((segments[0] === "webhooks" || segments[0] === "interactions") && segments[2]) {
     segments[2] = "[redacted]";
   }
   return `${method.toUpperCase()} /${segments.join("/")}`;
