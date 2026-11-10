@@ -3473,14 +3473,13 @@ async def _execute_session_command_once(
                             if stored_inbound is not None
                             else None
                         )
+                        # Replay saved denials without changing token order or
+                        # reply state. Newly linked senders use the identity path.
                         if (
                             stored_inbound is not None
                             and isinstance(stored_res, dict)
                             and stored_res.get("ok") is False
                             and stored_res.get("deny_reason") == "not_linked"
-                            and bool(
-                                stored_inbound.get("command_reply_pending", False)
-                            )
                         ):
                             return {
                                 **dict(stored_res),

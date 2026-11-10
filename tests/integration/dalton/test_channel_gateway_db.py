@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import contextvars
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -5856,6 +5857,450 @@ async def test_weixin_context_order_source_and_invalid_inbound_real_pg(
     assert fresh["seq"] == 1
     assert fresh["protocol_seq_high"] == 1
     assert fresh["context_token"] == "D1"
+
+
+@pytest.mark.asyncio
+async def test_weixin_completed_unbound_replay_keeps_newer_context_real_pg(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished no-order unbound command must not replace a newer token.
+
+    The first private command still stores encrypted context and stays in
+    startup recovery while its reply is pending. After that reply is finished,
+    a newer command keeps its own pending context. Replaying the finished
+    command, then the newer one, leaves the newer token, both pending flags,
+    and the account sequence unchanged, and does not create a session or
+    another outbound row.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    monkeypatch.setenv("DALTON_PM_USER_IDS", user_a)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", f"{user_a}@example.com")
+    enc_key = os.environ["BYOK_ENCRYPTION_KEY"]
+    bot = f"{prefix}_wx_replay_bot@im.wechat"
+    sender = f"{prefix}_wx_replay_sender"
+    scope = f"dm:{sender}"
+    mid_a = f"{prefix}_unbound_cmd_a"
+    mid_b = f"{prefix}_unbound_cmd_b"
+    token_a = f"ctx-a-{uuid4().hex}"
+    token_b = f"ctx-b-{uuid4().hex}"
+    bot_secret = f"bot-{uuid4().hex}"
+    hash_a = hashlib.sha256(token_a.encode()).hexdigest()
+    hash_b = hashlib.sha256(token_b.encode()).hexdigest()
+
+    def _digest_text(value: Any) -> str:
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, (bytes, bytearray)):
+            value = bytes(value).decode("utf-8")
+        if not isinstance(value, str) or not value:
+            return ""
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def _digest_cipher(value: Any) -> str:
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if not isinstance(value, (bytes, bytearray)):
+            raise AssertionError(type(value).__name__)
+        return hashlib.sha256(bytes(value)).hexdigest()
+
+    def _response_hides_secrets(body: dict[str, Any]) -> bool:
+        dumped = json.dumps(body, default=str)
+        return (
+            token_a not in dumped
+            and token_b not in dumped
+            and bot_secret not in dumped
+        )
+
+    async def command(
+        message_id: str,
+        cmd: str,
+        token: str,
+        *,
+        seq: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {}
+        if seq is not None:
+            payload["seq"] = seq
+            kwargs["weixin_context_source"] = "protocol"
+            kwargs["weixin_context_seq"] = seq
+        return await cg_db.execute_session_command(
+            cmd=cmd,
+            platform="weixin",
+            platform_user_id=sender,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            scope_key=scope,
+            message_id=message_id,
+            weixin_context_token=token,
+            weixin_bot_id=bot,
+            weixin_bot_generation=generation,
+            raw_payload=payload,
+            **kwargs,
+        )
+
+    async def token_row() -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT encode(
+                               sha256(convert_to(
+                                   pgp_sym_decrypt(encrypted_context_token, %s),
+                                   'UTF8'
+                               )),
+                               'hex'
+                           ) AS token_hash,
+                           seq, seq_source, protocol_seq_high, platform_time_high,
+                           bot_generation, encrypted_context_token AS cipher,
+                           updated_at
+                    FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s
+                      AND bot_generation = %s
+                      AND platform_user_id = %s
+                    """,
+                    (enc_key, bot, generation, sender),
+                )
+                row = await cur.fetchone()
+        if row is None:
+            raise AssertionError("missing token row")
+        return {
+            "token_hash": row["token_hash"],
+            "seq": int(row["seq"]),
+            "seq_source": row["seq_source"],
+            "protocol_seq_high": int(row["protocol_seq_high"]),
+            "platform_time_high": int(row["platform_time_high"]),
+            "bot_generation": int(row["bot_generation"]),
+            "cipher_hash": _digest_cipher(row["cipher"]),
+            "updated_at": row["updated_at"],
+        }
+
+    async def inbound_row(message_id: str) -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT encode(
+                               sha256(convert_to(
+                                   pgp_sym_decrypt(encrypted_weixin_context_token, %s),
+                                   'UTF8'
+                               )),
+                               'hex'
+                           ) AS token_hash,
+                           weixin_context_seq,
+                           weixin_context_bot_id,
+                           weixin_context_bot_generation,
+                           command_reply_pending,
+                           command_effect_status,
+                           status,
+                           event_kind,
+                           command_result->>'deny_reason' AS deny_reason,
+                           (command_result->>'ok')::boolean AS result_ok,
+                           dalton_user_id IS NULL AS no_user,
+                           thread_id IS NULL AS no_thread,
+                           run_id IS NULL AS no_run,
+                           session_generation IS NULL AS no_generation,
+                           encrypted_weixin_context_token AS cipher,
+                           updated_at,
+                           jsonb_exists(raw_payload, 'seq') AS has_seq,
+                           jsonb_exists(raw_payload, 'create_time_ms') AS has_time,
+                           jsonb_exists(raw_payload, 'weixin_context_token') AS has_token_field
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'weixin' AND message_id = %s
+                    """,
+                    (enc_key, message_id),
+                )
+                row = await cur.fetchone()
+        if row is None:
+            raise AssertionError("missing inbound row")
+        return {
+            "token_hash": row["token_hash"],
+            "seq": int(row["weixin_context_seq"]),
+            "bot_id": row["weixin_context_bot_id"],
+            "bot_generation": int(row["weixin_context_bot_generation"]),
+            "pending": row["command_reply_pending"],
+            "effect": row["command_effect_status"],
+            "status": row["status"],
+            "event_kind": row["event_kind"],
+            "deny_reason": row["deny_reason"],
+            "result_ok": row["result_ok"],
+            "no_user": row["no_user"],
+            "no_thread": row["no_thread"],
+            "no_run": row["no_run"],
+            "no_generation": row["no_generation"],
+            "cipher_hash": _digest_cipher(row["cipher"]),
+            "updated_at": row["updated_at"],
+            "has_seq": row["has_seq"],
+            "has_time": row["has_time"],
+            "has_token_field": row["has_token_field"],
+        }
+
+    async def effect_counts() -> dict[str, int]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT
+                        (
+                            SELECT COUNT(*)
+                            FROM dalton_channel_identities
+                            WHERE platform_user_id = %s
+                        ) AS identities,
+                        (
+                            SELECT COUNT(*)
+                            FROM dalton_channel_session_generations
+                            WHERE scope_key = %s
+                        ) AS sessions,
+                        (
+                            SELECT COUNT(*)
+                            FROM dalton_channel_deliveries
+                            WHERE user_id = %s
+                               OR strpos(delivery_key, %s) > 0
+                               OR strpos(delivery_key, %s) > 0
+                        ) AS deliveries,
+                        (
+                            SELECT COUNT(*)
+                            FROM dalton_channel_inbound_events
+                            WHERE platform = 'weixin' AND message_id = ANY(%s)
+                        ) AS inbounds,
+                        (
+                            SELECT COUNT(*)
+                            FROM dalton_channel_weixin_context_tokens
+                            WHERE ilink_bot_id = %s AND platform_user_id = %s
+                        ) AS token_rows
+                    """,
+                    (
+                        sender,
+                        scope,
+                        f"unlinked:weixin:{sender}",
+                        mid_a,
+                        mid_b,
+                        [mid_a, mid_b],
+                        bot,
+                        sender,
+                    ),
+                )
+                row = await cur.fetchone()
+        return {key: int(row[key]) for key in row}
+
+    async def latest_hash(message_id: str) -> str:
+        state = await cg_db.get_weixin_state(
+            include_token=False,
+            recipient_platform_user_id=sender,
+            inbound_message_id=message_id,
+        )
+        return _digest_text(state.get("weixin_context_token"))
+
+    async def startup_pending() -> dict[str, dict[str, Any]]:
+        recovered = await cg_db.recover_channel_state(mode="startup")
+        found: dict[str, dict[str, Any]] = {}
+        for row in recovered["inbound_events"]:
+            message_id = row.get("message_id")
+            if message_id in (mid_a, mid_b):
+                found[str(message_id)] = {
+                    "event_kind": row.get("event_kind"),
+                    "command_reply_pending": row.get("command_reply_pending"),
+                }
+        return found
+
+    started = await cg_db.upsert_weixin_state(
+        login_session_action="start",
+        login_session_key=f"{prefix}-replay-sess",
+        login_owner_user_id=user_a,
+        login_status="wait",
+        login_qrcode=f"{prefix}-replay-qr",
+        login_qrcode_img_content="data:image/png;base64,AAAA",
+        login_expires_in_seconds=300,
+    )
+    assert started["updated"] is True
+    confirmed = await cg_db.upsert_weixin_state(
+        login_session_action="confirm",
+        login_session_key=f"{prefix}-replay-sess",
+        login_owner_user_id=user_a,
+        expected_login_version=int(started["login_version"]),
+        expected_bot_generation=int(started["expected_bot_generation"]),
+        ilink_bot_id=bot,
+        owner_user_id=user_a,
+        bot_token=bot_secret,
+        base_url="https://ilinkai.weixin.qq.com",
+        status="active",
+        ilink_user_id=f"{prefix}_wx_replay_admin",
+        ilink_username="Replay Admin",
+    )
+    assert confirmed["updated"] is True
+    generation = int(confirmed["bot_generation"])
+    account = await cg_db.get_weixin_state(include_token=False)
+    assert int(account["bot_generation"]) == generation
+    assert account.get("weixin_context_token") is None
+
+    first_a = await command(mid_a, "new", token_a)
+    first_a_hides_secrets = _response_hides_secrets(first_a)
+    assert first_a_hides_secrets is True
+    assert first_a["ok"] is False
+    assert first_a["linked"] is False
+    assert first_a["allowed"] is False
+    assert first_a["deny_reason"] == "not_linked"
+    assert first_a.get("duplicate", False) is False
+    assert first_a["command_reply_pending"] is True
+    assert "workspaces" not in first_a
+    stored_a = await token_row()
+    assert stored_a["token_hash"] == hash_a
+    assert stored_a["seq_source"] == "receive"
+    assert stored_a["seq"] == 1
+    assert stored_a["protocol_seq_high"] == 0
+    assert stored_a["platform_time_high"] == 0
+    assert stored_a["bot_generation"] == generation
+    inbound_a = await inbound_row(mid_a)
+    assert inbound_a["token_hash"] == hash_a
+    assert inbound_a["seq"] == 1
+    assert inbound_a["bot_id"] == bot
+    assert inbound_a["bot_generation"] == generation
+    assert inbound_a["pending"] is True
+    assert inbound_a["effect"] == "done"
+    assert inbound_a["status"] == "ignored"
+    assert inbound_a["event_kind"] == "command"
+    assert inbound_a["deny_reason"] == "not_linked"
+    assert inbound_a["result_ok"] is False
+    assert inbound_a["no_user"] is True
+    assert inbound_a["no_thread"] is True
+    assert inbound_a["no_run"] is True
+    assert inbound_a["no_generation"] is True
+    assert inbound_a["has_seq"] is False
+    assert inbound_a["has_time"] is False
+    assert inbound_a["has_token_field"] is False
+    assert await latest_hash(mid_a) == hash_a
+    pending = await startup_pending()
+    assert set(pending) == {mid_a}
+    assert pending[mid_a]["event_kind"] == "command"
+    assert pending[mid_a]["command_reply_pending"] is True
+    quiet = await effect_counts()
+    assert quiet == {
+        "identities": 0,
+        "sessions": 0,
+        "deliveries": 0,
+        "inbounds": 1,
+        "token_rows": 1,
+    }
+
+    await cg_db.update_inbound_progress(
+        platform="weixin",
+        message_id=mid_a,
+        command_reply_pending=False,
+    )
+    settled_a = await inbound_row(mid_a)
+    assert settled_a["pending"] is False
+    assert settled_a["token_hash"] == hash_a
+    assert settled_a["cipher_hash"] == inbound_a["cipher_hash"]
+    assert settled_a["effect"] == "done"
+    assert await startup_pending() == {}
+
+    first_b = await command(mid_b, "stop", token_b, seq=4)
+    first_b_hides_secrets = _response_hides_secrets(first_b)
+    assert first_b_hides_secrets is True
+    assert first_b["ok"] is False
+    assert first_b["deny_reason"] == "not_linked"
+    assert first_b.get("duplicate", False) is False
+    assert first_b["command_reply_pending"] is True
+    stored_b = await token_row()
+    assert stored_b["token_hash"] == hash_b
+    assert stored_b["token_hash"] != hash_a
+    assert stored_b["seq_source"] == "protocol"
+    assert stored_b["seq"] == 4
+    assert stored_b["protocol_seq_high"] == 4
+    assert stored_b["platform_time_high"] == 0
+    assert stored_b["bot_generation"] == generation
+    assert stored_b["cipher_hash"] != stored_a["cipher_hash"]
+    inbound_b = await inbound_row(mid_b)
+    assert inbound_b["token_hash"] == hash_b
+    assert inbound_b["seq"] == 4
+    assert inbound_b["pending"] is True
+    assert inbound_b["effect"] == "done"
+    assert inbound_b["status"] == "ignored"
+    assert inbound_b["no_user"] is True
+    assert inbound_b["no_thread"] is True
+    assert inbound_b["no_run"] is True
+    assert inbound_b["no_generation"] is True
+    kept_a = await inbound_row(mid_a)
+    assert kept_a["pending"] is False
+    assert kept_a["token_hash"] == hash_a
+    assert kept_a["cipher_hash"] == inbound_a["cipher_hash"]
+    assert kept_a["updated_at"] == settled_a["updated_at"]
+    assert await latest_hash(mid_b) == hash_b
+    assert await latest_hash(mid_a) == hash_b
+    pending = await startup_pending()
+    assert set(pending) == {mid_b}
+    assert pending[mid_b]["event_kind"] == "command"
+    assert pending[mid_b]["command_reply_pending"] is True
+    before_replay = await effect_counts()
+    assert before_replay == {
+        "identities": 0,
+        "sessions": 0,
+        "deliveries": 0,
+        "inbounds": 2,
+        "token_rows": 1,
+    }
+    account_before = int((await cg_db.get_weixin_state(include_token=False))["bot_generation"])
+    assert account_before == generation
+
+    replay_a = await command(mid_a, "new", token_a)
+    replay_a_hides_secrets = _response_hides_secrets(replay_a)
+    assert replay_a_hides_secrets is True
+    assert replay_a["duplicate"] is True
+    assert replay_a["deny_reason"] == "not_linked"
+    assert replay_a["ok"] is False
+    assert "command_reply_pending" in replay_a
+    assert replay_a["command_reply_pending"] is False
+    assert replay_a["command_effect_status"] == "done"
+    assert replay_a["existing_status"] == "ignored"
+    replay_b = await command(mid_b, "stop", token_b, seq=4)
+    replay_b_hides_secrets = _response_hides_secrets(replay_b)
+    assert replay_b_hides_secrets is True
+    assert replay_b["duplicate"] is True
+    assert replay_b["deny_reason"] == "not_linked"
+    assert replay_b["command_reply_pending"] is True
+    assert replay_b["command_effect_status"] == "done"
+    assert replay_b["existing_status"] == "ignored"
+
+    latest = await token_row()
+    assert latest["token_hash"] == hash_b
+    assert latest["seq_source"] == stored_b["seq_source"]
+    assert latest["seq"] == stored_b["seq"]
+    assert latest["protocol_seq_high"] == stored_b["protocol_seq_high"]
+    assert latest["platform_time_high"] == stored_b["platform_time_high"]
+    assert latest["bot_generation"] == stored_b["bot_generation"]
+    assert latest["cipher_hash"] == stored_b["cipher_hash"]
+    assert latest["updated_at"] == stored_b["updated_at"]
+    final_a = await inbound_row(mid_a)
+    final_b = await inbound_row(mid_b)
+    assert final_a["pending"] is False
+    assert final_b["pending"] is True
+    assert final_a["token_hash"] == hash_a
+    assert final_b["token_hash"] == hash_b
+    assert final_a["cipher_hash"] == inbound_a["cipher_hash"]
+    assert final_b["cipher_hash"] == inbound_b["cipher_hash"]
+    assert final_a["updated_at"] == kept_a["updated_at"]
+    assert final_b["updated_at"] == inbound_b["updated_at"]
+    assert final_a["effect"] == "done"
+    assert final_b["effect"] == "done"
+    assert final_a["no_user"] is True
+    assert final_b["no_user"] is True
+    assert final_a["no_thread"] is True
+    assert final_b["no_thread"] is True
+    assert final_a["no_run"] is True
+    assert final_b["no_run"] is True
+    assert final_a["seq"] == 1
+    assert final_b["seq"] == 4
+    assert await latest_hash(mid_a) == hash_b
+    assert await latest_hash(mid_b) == hash_b
+    assert await latest_hash(mid_a) != hash_a
+    pending = await startup_pending()
+    assert set(pending) == {mid_b}
+    assert pending[mid_b]["command_reply_pending"] is True
+    assert await effect_counts() == before_replay
+    account_after = int((await cg_db.get_weixin_state(include_token=False))["bot_generation"])
+    assert account_after == account_before
 
 
 @pytest.mark.asyncio
