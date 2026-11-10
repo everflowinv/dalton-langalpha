@@ -37,6 +37,9 @@ import {
   ChannelDeliveryError,
   type CheckTargetLiveResult,
   type DownloadedAttachment,
+  type SendCardImageInput,
+  type SendCardOptions,
+  type SendCardResult,
   type SendFileOptions,
   type SendFileResult,
   type SendTextChunkOptions,
@@ -56,6 +59,7 @@ import {
   listFeishuDirectoryGroupsDetailed,
 } from "./directory.js";
 import {
+  assertFeishuCardWithinEnvelope,
   chunkFeishuOutboundText,
   shouldUseFeishuCard,
 } from "./format.js";
@@ -64,10 +68,15 @@ import {
   parseFeishuInboundEvent,
   resolveFeishuMessageDedupeKey,
 } from "./inbound-parse.js";
-import { downloadMessageResourceFeishu, sendMediaFeishu } from "./media.js";
+import {
+  downloadMessageResourceFeishu,
+  sendMediaFeishu,
+  uploadImageFeishu,
+} from "./media.js";
 import { probeFeishu } from "./probe.js";
 import {
   getMessageFeishu,
+  sendCardFeishu,
   sendMessageFeishu,
   sendStructuredCardFeishu,
 } from "./send.js";
@@ -327,6 +336,7 @@ export interface FeishuChannelAdapterOptions {
   encryptKey?: string;
   verificationToken?: string;
   botOpenId?: string;
+  outgoingOnly?: boolean;
   maxChunkChars?: number;
   client?: Lark.Client;
   wsClientFactory?: (creds: FeishuWSClientOptions) => FeishuWSClientLike;
@@ -338,6 +348,73 @@ export interface FeishuChannelAdapterOptions {
   logger?: SubsystemLogger;
 }
 
+function collectFeishuCardPlaceholderPaths(node: unknown, out: string[]): void {
+  if (!node || typeof node !== "object") {
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectFeishuCardPlaceholderPaths(item, out);
+    }
+    return;
+  }
+  const rec = node as Record<string, unknown>;
+  if (rec.tag === "__img__") {
+    out.push(typeof rec.path === "string" ? rec.path.trim() : "");
+    return;
+  }
+  for (const val of Object.values(rec)) {
+    collectFeishuCardPlaceholderPaths(val, out);
+  }
+}
+
+function replaceFeishuCardPlaceholdersInPlace(
+  node: unknown,
+  uploadedKeys: ReadonlyMap<string, string>,
+): unknown {
+  if (!node || typeof node !== "object") {
+    return node;
+  }
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i += 1) {
+      node[i] = replaceFeishuCardPlaceholdersInPlace(node[i], uploadedKeys);
+    }
+    return node;
+  }
+  const rec = node as Record<string, unknown>;
+  if (rec.tag === "__img__") {
+    const ph = typeof rec.path === "string" ? rec.path.trim() : "";
+    const imageKey = uploadedKeys.get(ph);
+    if (!ph || !imageKey) {
+      throw new ChannelDeliveryError(
+        `Unresolved __img__ placeholder in Feishu Card 2.0: "${ph}"`,
+        { outcome: "failed", code: "not_allowed" },
+      );
+    }
+    const rawAlt = rec.alt;
+    const altObj =
+      rawAlt && typeof rawAlt === "object" && !Array.isArray(rawAlt)
+        ? structuredClone(rawAlt as Record<string, unknown>)
+        : {
+            tag: "plain_text",
+            content: typeof rawAlt === "string" ? rawAlt : "",
+          };
+    return {
+      tag: "img",
+      img_key: imageKey,
+      alt: altObj,
+      mode: "fit_horizontal",
+      preview: true,
+    };
+  }
+  for (const [k, v] of Object.entries(rec)) {
+    if (v && typeof v === "object") {
+      rec[k] = replaceFeishuCardPlaceholdersInPlace(v, uploadedKeys);
+    }
+  }
+  return rec;
+}
+
 export class FeishuChannelAdapter implements ChannelAdapter {
   readonly platform = "feishu" as const;
   readonly maxChunkChars: number;
@@ -347,6 +424,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   private readonly domain?: FeishuDomain;
   private readonly encryptKey?: string;
   private readonly verificationToken?: string;
+  private readonly outgoingOnly: boolean;
   private botOpenId?: string;
   private clientInstance?: Lark.Client;
   private readonly wsClientFactory?: (
@@ -369,6 +447,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     this.domain = options.domain;
     this.encryptKey = options.encryptKey;
     this.verificationToken = options.verificationToken;
+    this.outgoingOnly = options.outgoingOnly ?? false;
     this.botOpenId = options.botOpenId?.trim() || undefined;
     this.maxChunkChars = options.maxChunkChars ?? 4000;
     this.clientInstance = options.client;
@@ -390,6 +469,13 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       return false;
     }
     return this.monitorHandle.isConnected();
+  }
+
+  isReadyForOutbound(): boolean {
+    if (!this.isConfigured()) {
+      return false;
+    }
+    return this.outgoingOnly ? true : this.isConnected();
   }
 
   getBotOpenId(): string | undefined {
@@ -450,7 +536,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   }
 
   async start(): Promise<void> {
-    if (!this.isConfigured()) {
+    if (!this.isConfigured() || this.outgoingOnly) {
       return;
     }
     if (this.connected) {
@@ -653,6 +739,95 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       messageId: res.messageId,
       status: "sent",
       reason: null,
+    };
+  }
+
+  async sendCard(options: SendCardOptions): Promise<SendCardResult> {
+    const client = this.getClient();
+    const target = resolveDaltonOutboundTarget({
+      targetAddress: options.targetAddress,
+      recipientPlatformUserId: options.recipientPlatformUserId,
+    });
+    if (!target) {
+      throw new ChannelDeliveryError(
+        `Unable to resolve Feishu target for address "${options.targetAddress}"`,
+        {
+          outcome: "failed",
+          code: "target_not_found",
+        },
+      );
+    }
+
+    const resolvedCard = structuredClone(options.card);
+    const imagesByPlaceholder = new Map<string, SendCardImageInput>();
+    for (const img of options.images ?? []) {
+      const ph = img.placeholder.trim();
+      if (!ph) {
+        throw new ChannelDeliveryError(
+          "Feishu card image input cannot have an empty placeholder",
+          { outcome: "failed", code: "not_allowed" },
+        );
+      }
+      imagesByPlaceholder.set(ph, img);
+    }
+
+    const foundPlaceholders: string[] = [];
+    collectFeishuCardPlaceholderPaths(resolvedCard, foundPlaceholders);
+    const uniquePlaceholders = new Set<string>();
+    for (const ph of foundPlaceholders) {
+      if (!ph || !imagesByPlaceholder.has(ph)) {
+        throw new ChannelDeliveryError(
+          `Unresolved __img__ placeholder in Feishu Card 2.0: "${ph}"`,
+          { outcome: "failed", code: "not_allowed" },
+        );
+      }
+      uniquePlaceholders.add(ph);
+    }
+    if (uniquePlaceholders.size !== imagesByPlaceholder.size) {
+      throw new ChannelDeliveryError(
+        "Feishu Card 2.0 image inputs contain unreferenced placeholders",
+        { outcome: "failed", code: "not_allowed" },
+      );
+    }
+
+    const uploadedKeys = new Map<string, string>();
+    for (const ph of uniquePlaceholders) {
+      const imgInput = imagesByPlaceholder.get(ph)!;
+      const uploaded = await uploadImageFeishu(client, {
+        image: imgInput.content,
+        imageType: "message",
+      });
+      uploadedKeys.set(ph, uploaded.imageKey);
+    }
+
+    replaceFeishuCardPlaceholdersInPlace(resolvedCard, uploadedKeys);
+
+    const remainingPlaceholders: string[] = [];
+    collectFeishuCardPlaceholderPaths(resolvedCard, remainingPlaceholders);
+    if (remainingPlaceholders.length > 0) {
+      throw new ChannelDeliveryError(
+        "Unresolved __img__ placeholder remained after image upload",
+        { outcome: "failed", code: "not_allowed" },
+      );
+    }
+
+    try {
+      assertFeishuCardWithinEnvelope(resolvedCard, "Feishu outbound card");
+    } catch (err) {
+      throw new ChannelDeliveryError(
+        err instanceof Error ? err.message : String(err),
+        { outcome: "failed", code: "not_allowed" },
+      );
+    }
+
+    const res = await sendCardFeishu(client, {
+      to: target,
+      card: resolvedCard,
+      replyToMessageId: options.replyToMessageId,
+    });
+    return {
+      messageId: res.messageId,
+      resolvedAddress: options.targetAddress,
     };
   }
 

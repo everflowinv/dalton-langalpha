@@ -151,25 +151,31 @@ export async function* makeAbortableOpenWatchSse(
   });
 }
 
-export type MockBackend = BackendClient & {
-  readonly progressUpdates: I7InboundProgressRequest[];
-  readonly deliveryClaims: I6AuthorizeAndClaimRequest[];
-  readonly deliveryUpdates: I7DeliveriesProgressRequest[];
-  readonly appendCalls: Array<{
-    userId: string;
-    threadId: string;
-    payload: ThreadMessageDispatchPayload;
-  }>;
-  readonly createCalls: Array<{
-    userId: string;
-    payload: ThreadMessageDispatchPayload;
-  }>;
-  readonly retryCalls: Array<{
-    userId: string;
-    threadId: string;
-    payload: ThreadRetryPayload;
-  }>;
-};
+export type MockBackend = BackendClient &
+  Required<
+    Pick<
+      BackendClient,
+      "authorizeDataTaskNotificationPlan" | "downloadDataTaskRunArtifact"
+    >
+  > & {
+    readonly progressUpdates: I7InboundProgressRequest[];
+    readonly deliveryClaims: I6AuthorizeAndClaimRequest[];
+    readonly deliveryUpdates: I7DeliveriesProgressRequest[];
+    readonly appendCalls: Array<{
+      userId: string;
+      threadId: string;
+      payload: ThreadMessageDispatchPayload;
+    }>;
+    readonly createCalls: Array<{
+      userId: string;
+      payload: ThreadMessageDispatchPayload;
+    }>;
+    readonly retryCalls: Array<{
+      userId: string;
+      threadId: string;
+      payload: ThreadRetryPayload;
+    }>;
+  };
 
 export function createMockBackend(): MockBackend {
   const defaultState = loadFixtureKey<I4StateResponse>(
@@ -703,6 +709,20 @@ export function createMockBackend(): MockBackend {
     downloadWorkspaceFile: vi.fn(async () => ({
       content: Buffer.from("PDF_REPORT_CONTENT", "utf8"),
       mimeType: "application/pdf",
+    })),
+
+    authorizeDataTaskNotificationPlan: vi.fn(async () => ({
+      authorized: false,
+      status: "failed" as const,
+      code: "run_not_found",
+      message: "Run not configured in mock backend",
+    })),
+
+    downloadDataTaskRunArtifact: vi.fn(async () => ({
+      content: Buffer.from("\x89PNG\r\n\x1a\n", "binary"),
+      mimeType: "image/png",
+      filename: "chart.png",
+      sha256Header: null,
     })),
   };
 

@@ -7,8 +7,11 @@ import type {
 import {
   type AvailableChatsResult,
   type ChannelAdapter,
+  ChannelDeliveryError,
   type CheckTargetLiveResult,
   type DownloadedAttachment,
+  type SendCardOptions,
+  type SendCardResult,
   type SendFileOptions,
   type SendFileResult,
   type SendTextChunkOptions,
@@ -27,6 +30,10 @@ export interface FakeSentFileRecord extends SendFileOptions {
   status: "sent" | "linked";
 }
 
+export interface FakeSentCardRecord extends SendCardOptions {
+  messageId: string;
+}
+
 /**
  * Deterministic in-memory `ChannelAdapter` for Phase 2 end-to-end testing.
  * Supports scripted chunk failures, attachment downloads, live group chat listings,
@@ -38,10 +45,12 @@ export class FakeChannelAdapter implements ChannelAdapter {
 
   configured = true;
   connected = true;
+  outboundReady: boolean | null = null;
   started = false;
 
   readonly sentTexts: FakeSentTextRecord[] = [];
   readonly sentFiles: FakeSentFileRecord[] = [];
+  readonly sentCards: FakeSentCardRecord[] = [];
 
   private inboundHandler: ((event: InboundChannelEvent) => Promise<void>) | null = null;
   private msgCounter = 0;
@@ -57,6 +66,10 @@ export class FakeChannelAdapter implements ChannelAdapter {
 
   private sendFileBehavior:
     | ((options: SendFileOptions) => Promise<SendFileResult> | SendFileResult)
+    | null = null;
+
+  private sendCardBehavior:
+    | ((options: SendCardOptions) => Promise<SendCardResult> | SendCardResult)
     | null = null;
 
   private checkTargetBehavior:
@@ -95,6 +108,13 @@ export class FakeChannelAdapter implements ChannelAdapter {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  isReadyForOutbound(): boolean {
+    if (!this.configured) {
+      return false;
+    }
+    return this.outboundReady !== null ? this.outboundReady : this.connected;
   }
 
   async start(): Promise<void> {
@@ -142,6 +162,12 @@ export class FakeChannelAdapter implements ChannelAdapter {
     fn: ((options: SendFileOptions) => Promise<SendFileResult> | SendFileResult) | null,
   ): void {
     this.sendFileBehavior = fn;
+  }
+
+  setSendCardBehavior(
+    fn: ((options: SendCardOptions) => Promise<SendCardResult> | SendCardResult) | null,
+  ): void {
+    this.sendCardBehavior = fn;
   }
 
   setCheckTargetBehavior(
@@ -201,6 +227,24 @@ export class FakeChannelAdapter implements ChannelAdapter {
     const messageId = `${this.platform}_file_${this.msgCounter}`;
     this.sentFiles.push({ ...options, messageId, status: "sent" });
     return { messageId, status: "sent", reason: null };
+  }
+
+  async sendCard(options: SendCardOptions): Promise<SendCardResult> {
+    if (this.platform !== "feishu" && !this.sendCardBehavior) {
+      throw new ChannelDeliveryError(
+        `Structured card delivery is not supported on ${this.platform}`,
+        { outcome: "failed", code: "not_allowed" },
+      );
+    }
+    if (this.sendCardBehavior) {
+      const res = await this.sendCardBehavior(options);
+      this.sentCards.push({ ...options, messageId: res.messageId });
+      return res;
+    }
+    this.msgCounter += 1;
+    const messageId = `${this.platform}_card_${this.msgCounter}`;
+    this.sentCards.push({ ...options, messageId });
+    return { messageId, resolvedAddress: options.targetAddress };
   }
 
   private downloadAttachmentDelegate:

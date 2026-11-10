@@ -7,6 +7,8 @@ export * from "./channels/adapter.js";
 export * from "./channels/fake-adapter.js";
 export * from "./channels/feishu/index.js";
 export * from "./delivery-service.js";
+export * from "./data-task-notification-types.js";
+export * from "./data-task-notifications.js";
 export * from "./agent-routes.js";
 export * from "./orchestrator.js";
 export * from "./server.js";

@@ -1,4 +1,9 @@
 import type {
+  DataTaskAuthorizePlanResponse,
+  DataTaskDownloadedArtifact,
+  DataTaskNotificationRequest,
+} from "./data-task-notification-types.js";
+import type {
   AutomationRunTargetRecord,
   ChannelPlatform,
   ChatContentItem,
@@ -280,7 +285,13 @@ export interface I5SettingsPutResult {
 
 export interface I6AuthorizeAndClaimRequest {
   delivery_key: string;
-  kind: "agent_send" | "fallback" | "interrupt" | "automation" | "notice";
+  kind:
+    | "agent_send"
+    | "fallback"
+    | "interrupt"
+    | "automation"
+    | "notice"
+    | "data_task";
   user_id?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
@@ -306,6 +317,7 @@ export interface I6AuthorizeAndClaimResponse {
     | "no_current_conversation"
     | "unknown_delivery_blocks_fallback"
     | "in_flight"
+    | string
     | null;
   message?: string;
   first_response_json?: Record<string, unknown> | null;
@@ -834,6 +846,16 @@ export interface BackendClient {
     workspaceId: string,
     workspacePath: string,
   ): Promise<{ content: Buffer; mimeType: string }>;
+
+  authorizeDataTaskNotificationPlan?(
+    req: DataTaskNotificationRequest,
+  ): Promise<DataTaskAuthorizePlanResponse>;
+
+  downloadDataTaskRunArtifact?(
+    runId: string,
+    artifactId: string,
+    maxBytes?: number,
+  ): Promise<DataTaskDownloadedArtifact>;
 }
 
 export class BackendHttpError extends Error {
@@ -1499,6 +1521,107 @@ export class HttpBackendClient implements BackendClient {
     return {
       content: Buffer.from(arrayBuffer),
       mimeType,
+    };
+  }
+
+  async authorizeDataTaskNotificationPlan(
+    req: DataTaskNotificationRequest,
+  ): Promise<DataTaskAuthorizePlanResponse> {
+    const { status, data } = await this.requestJson<DataTaskAuthorizePlanResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/data-task-notifications/plan",
+      {
+        body: {
+          run_id: req.run_id,
+          target: req.target,
+        },
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `authorizeDataTaskNotificationPlan failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async downloadDataTaskRunArtifact(
+    runId: string,
+    artifactId: string,
+    maxBytes = 20 * 1024 * 1024,
+  ): Promise<DataTaskDownloadedArtifact> {
+    const url = new URL(
+      `${this.baseUrl}/api/v1/dalton/channels/internal/data-task-notifications/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
+    );
+    const resp = await this.fetchImpl(url, {
+      method: "GET",
+      headers: this.headers(),
+    });
+    if (!resp.ok) {
+      let body: unknown = null;
+      try {
+        body = await resp.json();
+      } catch {
+        body = null;
+      }
+      throw new BackendHttpError(
+        `downloadDataTaskRunArtifact failed (${resp.status})`,
+        resp.status,
+        body,
+      );
+    }
+
+    const declaredLengthRaw = resp.headers.get("content-length");
+    if (declaredLengthRaw) {
+      const declaredLength = Number.parseInt(declaredLengthRaw, 10);
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        throw new Error(
+          `Artifact exceeds maximum byte limit (${declaredLength} > ${maxBytes})`,
+        );
+      }
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    if (resp.body) {
+      for await (const rawChunk of resp.body as AsyncIterable<Uint8Array>) {
+        const buf = Buffer.from(rawChunk);
+        total += buf.byteLength;
+        if (total > maxBytes) {
+          throw new Error(
+            `Artifact stream exceeded maximum byte limit (${maxBytes})`,
+          );
+        }
+        chunks.push(buf);
+      }
+    } else {
+      const ab = await resp.arrayBuffer();
+      if (ab.byteLength > maxBytes) {
+        throw new Error(
+          `Artifact body exceeded maximum byte limit (${maxBytes})`,
+        );
+      }
+      chunks.push(Buffer.from(ab));
+    }
+
+    const content = Buffer.concat(chunks);
+    const mimeType = (
+      resp.headers.get("content-type") ?? "application/octet-stream"
+    )
+      .split(";")[0]!
+      .trim()
+      .toLowerCase();
+    const filename =
+      resp.headers.get("x-artifact-filename")?.trim() || artifactId;
+    const sha256Header = resp.headers.get("x-artifact-sha256")?.trim() ?? null;
+
+    return {
+      content,
+      mimeType,
+      filename,
+      sha256Header,
     };
   }
 }

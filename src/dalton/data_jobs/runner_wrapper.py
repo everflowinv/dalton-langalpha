@@ -307,6 +307,7 @@ def persist_redacted_outbox(
     job_key: str = "",
     stdout_text: str = "",
     explicit_payload: Any = None,
+    workspace_dir: Path | str | None = None,
 ) -> dict[str, Any] | None:
     """Redact in memory and atomically write the outbox payload to ``outbox_path`` (§4.4.3, §5.1.3).
 
@@ -358,6 +359,25 @@ def persist_redacted_outbox(
 
     if raw_payload is None:
         return None
+
+    if str(job_key) == "asia-leverage-crossview-daily" and workspace_dir is not None:
+        from src.dalton.data_jobs.notification_payloads import (
+            is_t27_outbox_prepared,
+            prepare_t27_run_outbox,
+        )
+
+        if isinstance(raw_payload, dict) and not is_t27_outbox_prepared(raw_payload):
+            md_source = str(
+                raw_payload.get("text")
+                or raw_payload.get("feishu_message")
+                or stripped_stdout
+            )
+            raw_payload = prepare_t27_run_outbox(
+                md_source,
+                workspace_dir=Path(workspace_dir),
+                run_artifacts_dir=outbox_path.parent,
+                redactor=redactor,
+            )
 
     redacted = redactor.redact_value(raw_payload)
     if not isinstance(redacted, dict):
@@ -571,13 +591,28 @@ async def run_wrapped_command(
         redacted_stdout = "".join(stdout_chunks)
         redacted_stderr = "".join(stderr_chunks)
 
-        outbox_payload = persist_redacted_outbox(
-            outbox_path=outbox_path,
-            staging_outbox_path=staging_outbox_path,
-            job_key=job_key,
-            redactor=redactor,
-            stdout_text=redacted_stdout,
-        )
+        from src.dalton.data_jobs.notification_payloads import DataTaskNotificationPrepError
+
+        try:
+            outbox_payload = persist_redacted_outbox(
+                outbox_path=outbox_path,
+                staging_outbox_path=staging_outbox_path,
+                job_key=job_key,
+                redactor=redactor,
+                stdout_text=redacted_stdout,
+                workspace_dir=workspace_dir if exit_code == 0 else None,
+            )
+        except DataTaskNotificationPrepError as prep_exc:
+            redacted_err = redactor.redact_text(
+                f"runner_wrapper: report preparation failed: {prep_exc}\n"
+            )
+            err_stream.write(redacted_err)
+            err_stream.flush()
+            redacted_stderr = f"{redacted_stderr}{redacted_err}"
+            outbox_payload = None
+            outbox_path.unlink(missing_ok=True)
+            if exit_code == 0:
+                exit_code = 1
     finally:
         try:
             staging_outbox_path.unlink(missing_ok=True)

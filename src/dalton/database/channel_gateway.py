@@ -2434,6 +2434,19 @@ async def authorize_and_claim_delivery(
     if not cleaned_key:
         raise HTTPException(status_code=400, detail="delivery_key is required")
     cleaned_kind = str(kind or "agent_send").strip().lower()
+    if cleaned_kind == "data_task":
+        from src.dalton.database.data_task_notifications import (
+            authorize_and_claim_data_task_delivery,
+        )
+
+        return await authorize_and_claim_data_task_delivery(
+            delivery_key=cleaned_key,
+            run_id=run_id,
+            target=target,
+            has_non_empty_text=has_non_empty_text,
+            total_chunks=total_chunks,
+            conn=conn,
+        )
     cleaned_uid = str(user_id or "").strip() or None
     cleaned_platform = str(platform or "").strip().lower() or None
     cleaned_target = str(target).strip() if target is not None and str(target).strip() else None

@@ -49,11 +49,22 @@ from src.dalton.data_jobs.manifest import (
     load_data_task_manifest,
     sync_manifest_to_db,
 )
+from src.dalton.data_jobs.notification_payloads import (
+    DataTaskNotificationPrepError,
+    T27_JOB_KEY,
+    is_t27_outbox_prepared,
+    prepare_t27_run_outbox,
+)
 from src.dalton.data_jobs.runner_wrapper import (
     EXIT_CODE_NO_OUTPUT_TIMEOUT,
     EXIT_CODE_TOTAL_TIMEOUT,
+    atomic_write_json,
     extract_last_json_object,
     resolve_task_payload_source,
+)
+from src.dalton.notify.channel_transport import (
+    extract_target_uncertain_code,
+    post_data_task_gateway_notify,
 )
 from src.dalton.notify.dispatch import (
     _evaluate_target_results,
@@ -66,7 +77,6 @@ from src.dalton.notify.dispatch import (
     extract_feishu_cards_from_payload,
     fetch_execution_deliveries,
     mark_target_delivery,
-    post_bridge_notify,
 )
 from src.dalton.settings import (
     get_configured_pm_user_ids,
@@ -1832,6 +1842,39 @@ async def execute_claimed_container_run(
             reference_date=reference_date,
         )
     )
+    if (
+        claimed.job_key == T27_JOB_KEY
+        and evaluation.ok
+        and evaluation.status == "succeeded"
+        and not is_t27_outbox_prepared(outbox_payload)
+    ):
+        md_source = ""
+        if isinstance(outbox_payload, Mapping):
+            md_source = str(
+                outbox_payload.get("text")
+                or outbox_payload.get("feishu_message")
+                or ""
+            )
+        if not md_source.strip():
+            md_source = str(outcome.log_tail or "")
+        run_art_dir = paths.backend_run_artifacts_dir(claimed.run_id)
+        try:
+            prepared_t27 = prepare_t27_run_outbox(
+                md_source,
+                workspace_dir=paths.backend_data_root,
+                run_artifacts_dir=run_art_dir,
+            )
+            atomic_write_json(run_art_dir / "outbox.json", prepared_t27)
+            outbox_payload = prepared_t27
+        except DataTaskNotificationPrepError as prep_exc:
+            outbox_payload = None
+            evaluation = TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"report_preparation_failed: {prep_exc}",
+                warnings=list(evaluation.warnings),
+                details={**evaluation.details, "report_prep_code": prep_exc.code},
+            )
     return await finalize_task_run(
         conn,
         lock_conn=lock_conn,
@@ -2313,6 +2356,13 @@ def _resolve_run_notify_payload(
         if not text:
             text = f"数据任务：{job_key}"
 
+    if not text and isinstance(raw_payload.get("items"), list) and raw_payload["items"]:
+        first_item = raw_payload["items"][0]
+        if isinstance(first_item, Mapping) and isinstance(first_item.get("text"), str):
+            text = first_item["text"].strip()
+        if not text:
+            text = f"数据任务：{cleaned_key}"
+
     if not text and raw_payload and not feishu_cards:
         text = json.dumps(raw_payload, ensure_ascii=False)
 
@@ -2405,7 +2455,7 @@ async def dispatch_data_task_run_notification(
     path_map: DataTaskPathMap | None = None,
     evaluate_eligibility_fn: Callable[..., Awaitable[tuple[bool, str | None, list[str]]]] = evaluate_user_notify_eligibility,
     claim_target_fn: Callable[..., Awaitable[bool]] = claim_target_delivery,
-    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_data_task_gateway_notify,
     mark_target_fn: Callable[..., Awaitable[bool]] = mark_target_delivery,
     fetch_deliveries_fn: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]] = fetch_execution_deliveries,
 ) -> str:
@@ -2561,16 +2611,22 @@ async def dispatch_data_task_run_notification(
 
             await check_scheduler_lock(lock_conn)
             try:
-                bridge_res = await dispatch_target_with_payload(
-                    post_notify_fn,
-                    [cleaned_tgt],
-                    text,
-                    card,
-                    target_payload,
-                    run_id=str(run_id),
-                    channel=ch,
-                    check_lock_fn=lambda: check_scheduler_lock(lock_conn),
-                )
+                if post_notify_fn is post_data_task_gateway_notify:
+                    bridge_res = await post_notify_fn(
+                        [cleaned_tgt],
+                        run_id=str(run_id),
+                    )
+                else:
+                    bridge_res = await dispatch_target_with_payload(
+                        post_notify_fn,
+                        [cleaned_tgt],
+                        text,
+                        card,
+                        target_payload,
+                        run_id=str(run_id),
+                        channel=ch,
+                        check_lock_fn=lambda: check_scheduler_lock(lock_conn),
+                    )
             except asyncio.CancelledError:
                 for rem_ch, rem_tgt in list(pending_targets):
                     await _shielded_mark_failed(
@@ -2621,6 +2677,22 @@ async def dispatch_data_task_run_notification(
                     expected_status="pending",
                 )
                 local_by_target[(ch, cleaned_tgt)] = "skipped"
+                if (ch, cleaned_tgt) in pending_targets:
+                    pending_targets.remove((ch, cleaned_tgt))
+                continue
+
+            uncertain_code = extract_target_uncertain_code(cleaned_tgt, bridge_res)
+            if uncertain_code is not None:
+                await _invoke_mark_delivery(
+                    mark_target_fn,
+                    str(run_id),
+                    ch,
+                    cleaned_tgt,
+                    status="pending",
+                    error_code=uncertain_code,
+                    expected_status="pending",
+                )
+                local_by_target[(ch, cleaned_tgt)] = "pending"
                 if (ch, cleaned_tgt) in pending_targets:
                     pending_targets.remove((ch, cleaned_tgt))
                 continue
@@ -2721,7 +2793,7 @@ async def dispatch_pending_data_task_notifications(
     path_map: DataTaskPathMap | None = None,
     evaluate_eligibility_fn: Callable[..., Awaitable[tuple[bool, str | None, list[str]]]] = evaluate_user_notify_eligibility,
     claim_target_fn: Callable[..., Awaitable[bool]] = claim_target_delivery,
-    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_data_task_gateway_notify,
     mark_target_fn: Callable[..., Awaitable[bool]] = mark_target_delivery,
     fetch_deliveries_fn: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]] = fetch_execution_deliveries,
 ) -> list[tuple[str, str]]:

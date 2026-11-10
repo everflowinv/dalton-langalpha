@@ -10,6 +10,7 @@ import { extractUserIdHeader, verifyServiceToken } from "./auth.js";
 import type { BackendClient } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
 import type { GatewayConfig } from "./config.js";
+import { DataTaskNotificationService } from "./data-task-notifications.js";
 import { DeliveryService } from "./delivery-service.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
 import type {
@@ -27,6 +28,7 @@ export interface GatewayApp {
   readonly backend: BackendClient;
   readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   readonly deliveryService: DeliveryService;
+  readonly dataTaskNotifications: DataTaskNotificationService;
   readonly agentRoutes: AgentRoutesHandler;
   readonly orchestrator: ChannelGatewayOrchestrator;
   start(): Promise<{ host: string; port: number }>;
@@ -74,6 +76,11 @@ export function createGatewayApp(options: {
   }
 
   const deliveryService = new DeliveryService({ backend, adapters });
+  const dataTaskNotifications = new DataTaskNotificationService({
+    backend,
+    adapters,
+    mode: config.mode,
+  });
   const agentRoutes = new AgentRoutesHandler({
     backend,
     adapters,
@@ -106,6 +113,31 @@ export function createGatewayApp(options: {
 
       if (method === "GET" && pathname === "/health") {
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/internal/data-task-notifications") {
+        let body: unknown;
+        try {
+          body = await readJsonBody<unknown>(req);
+        } catch {
+          sendJson(res, 400, {
+            ok: false,
+            status: "failed",
+            code: "invalid_json",
+            message: "Malformed JSON request body.",
+            run_id: "",
+            target: "",
+            platform: null,
+            items_total: 0,
+            items_sent: 0,
+            items: [],
+          });
+          return;
+        }
+        const result =
+          await dataTaskNotifications.handleDataTaskNotification(body);
+        sendJson(res, result.status, result.data);
         return;
       }
 
@@ -322,13 +354,16 @@ export function createGatewayApp(options: {
     backend,
     adapters,
     deliveryService,
+    dataTaskNotifications,
     agentRoutes,
     orchestrator,
     async start(): Promise<{ host: string; port: number }> {
-      await orchestrator.syncWeixinStateCache();
-      for (const adapter of adapters.values()) {
-        if (adapter.isConfigured()) {
-          await adapter.start();
+      if (config.mode !== "outgoing") {
+        await orchestrator.syncWeixinStateCache();
+        for (const adapter of adapters.values()) {
+          if (adapter.isConfigured()) {
+            await adapter.start();
+          }
         }
       }
       await new Promise<void>((resolveListen, rejectListen) => {
@@ -338,15 +373,19 @@ export function createGatewayApp(options: {
           resolveListen();
         });
       });
-      // Kick off startup recovery in background without blocking HTTP listen or adapters
-      orchestrator.startStartupRecoveryInBackground();
+      if (config.mode !== "outgoing") {
+        // Kick off startup recovery in background without blocking HTTP listen or adapters
+        orchestrator.startStartupRecoveryInBackground();
+      }
       const addr = server.address() as AddressInfo;
       return { host: addr.address, port: addr.port };
     },
     async stop(): Promise<void> {
-      await orchestrator.stopAllWatches();
-      for (const adapter of adapters.values()) {
-        await adapter.stop();
+      if (config.mode !== "outgoing") {
+        await orchestrator.stopAllWatches();
+        for (const adapter of adapters.values()) {
+          await adapter.stop();
+        }
       }
       if (server.listening) {
         await new Promise<void>((resolveClose) => {

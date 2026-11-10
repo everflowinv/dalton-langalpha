@@ -64,6 +64,26 @@ export interface SendFileResult {
   reason?: string | null;
 }
 
+export interface SendCardImageInput {
+  placeholder: string;
+  content: Buffer;
+  mimeType: string;
+  filename: string;
+}
+
+export interface SendCardOptions {
+  targetAddress: string;
+  recipientPlatformUserId?: string | null;
+  card: Record<string, unknown>;
+  images?: SendCardImageInput[];
+  replyToMessageId?: string | null;
+}
+
+export interface SendCardResult {
+  messageId: string;
+  resolvedAddress?: string;
+}
+
 export interface DownloadedAttachment {
   content: Buffer;
   filename: string;
@@ -123,6 +143,12 @@ export interface ChannelAdapter {
   /** Whether the channel runtime/connection is currently healthy. */
   isConnected(): boolean;
 
+  /**
+   * Optional outbound-send readiness check separating credential readiness
+   * from an inbound WebSocket listener's health in outgoing-notification mode.
+   */
+  isReadyForOutbound?(): boolean;
+
   /** Start listening to the platform (no-op for unconfigured or test adapters). */
   start(): Promise<void>;
 
@@ -140,6 +166,9 @@ export interface ChannelAdapter {
 
   /** Send a single file attachment to the platform. */
   sendFile(options: SendFileOptions): Promise<SendFileResult>;
+
+  /** Optional structured card send (e.g. Feishu Card Schema 2.0 with uploaded images). */
+  sendCard?(options: SendCardOptions): Promise<SendCardResult>;
 
   /** Download an inbound attachment from the platform. */
   downloadAttachment(

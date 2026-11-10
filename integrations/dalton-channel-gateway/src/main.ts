@@ -26,6 +26,7 @@ export function buildConfiguredAdapters(
       new FeishuChannelAdapter({
         appId: config.channels.feishu.appId,
         appSecret: config.channels.feishu.appSecret,
+        outgoingOnly: config.mode === "outgoing",
         ...overrides?.feishu,
       }),
     );
@@ -34,8 +35,39 @@ export function buildConfiguredAdapters(
   return adapters;
 }
 
-export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const config = loadConfig(env);
+function resolveCliModeOverride(argv: readonly string[]): "incoming" | "outgoing" | undefined {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === "--outgoing-only") {
+      return "outgoing";
+    }
+    if (arg.startsWith("--mode=")) {
+      const val = arg.slice("--mode=".length).trim().toLowerCase();
+      if (val === "incoming" || val === "outgoing") {
+        return val;
+      }
+      throw new Error(`Invalid --mode="${val}". Expected "incoming" or "outgoing".`);
+    }
+    if (arg === "--mode" && i + 1 < argv.length) {
+      const val = argv[i + 1]!.trim().toLowerCase();
+      if (val === "incoming" || val === "outgoing") {
+        return val;
+      }
+      throw new Error(`Invalid --mode "${val}". Expected "incoming" or "outgoing".`);
+    }
+  }
+  return undefined;
+}
+
+export async function main(
+  env: NodeJS.ProcessEnv = process.env,
+  argv: readonly string[] = process.argv.slice(2),
+): Promise<void> {
+  const cliMode = resolveCliModeOverride(argv);
+  const effectiveEnv = cliMode
+    ? { ...env, DALTON_GATEWAY_MODE: cliMode }
+    : env;
+  const config = loadConfig(effectiveEnv);
   if (!config.serviceToken || config.serviceToken.length < 32) {
     throw new Error(
       "INTERNAL_SERVICE_TOKEN must be set and at least 32 characters long.",

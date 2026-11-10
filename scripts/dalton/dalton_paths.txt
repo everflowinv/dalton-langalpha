@@ -202,3 +202,13 @@ tests/unit/dalton/test_t26_task_preview.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_sections.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
 tests/unit/dalton/test_sentiment_observation_dates.py
+# Dalton data-task report delivery via dedicated channel gateway:
+src/dalton/data_jobs/notification_payloads.py
+src/dalton/notify/channel_transport.py
+src/dalton/database/data_task_notifications.py
+src/dalton/app/data_task_notifications_router.py
+integrations/dalton-channel-gateway/src/data-task-notification-types.ts
+integrations/dalton-channel-gateway/src/data-task-notifications.ts
+integrations/dalton-channel-gateway/test/data-task-notifications.test.ts
+tests/unit/dalton/test_data_task_notifications.py
+tests/integration/dalton/test_data_task_notifications_db.py

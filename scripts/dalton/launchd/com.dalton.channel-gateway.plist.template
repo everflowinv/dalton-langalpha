@@ -29,6 +29,9 @@
     <string>127.0.0.1</string>
     <key>GATEWAY_PORT</key>
     <string>8962</string>
+    <!-- Startup mode: "incoming" (default, full inbound + outbound) or "outgoing" (notification-only, no WS listeners/Weixin/startup recovery). -->
+    <key>DALTON_GATEWAY_MODE</key>
+    <string>incoming</string>
     <key>DALTON_BACKEND_URL</key>
     <string>http://127.0.0.1:8000</string>
     <key>WEB_BASE_URL</key>

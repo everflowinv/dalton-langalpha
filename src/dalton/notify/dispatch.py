@@ -26,6 +26,12 @@ from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_routes,
     resolve_dalton_notify_targets,
 )
+from src.dalton.notify.channel_transport import (
+    UNCERTAIN_NOTIFY_ERROR_CODES,
+    extract_target_uncertain_code,
+    is_uncertain_notify_error_code,
+    post_data_task_gateway_notify,
+)
 from src.dalton.settings import (
     get_dalton_bridge_base_url,
     get_dalton_bridge_admin_token,
@@ -1848,6 +1854,7 @@ async def _fetch_data_task_def_notify_state(job_key: str) -> dict[str, Any] | No
 async def retry_failed_notify_deliveries(
     *,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
+    data_task_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_data_task_gateway_notify,
     mark_delivery_fn: Callable[..., Awaitable[Any]] = mark_target_delivery,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
@@ -1869,6 +1876,7 @@ async def retry_failed_notify_deliveries(
     """
     sent_count = 0
     started_at = time.monotonic()
+    uncertain_codes_list = sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
     try:
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -1876,6 +1884,7 @@ async def retry_failed_notify_deliveries(
                     """
                     SELECT d.execution_id, d.automation_id, d.user_id,
                            d.channel, d.target, d.status, d.attempt_count,
+                           d.error_code,
                            d.payload_json,
                            a.name AS automation_name,
                            a.metadata AS automation_metadata,
@@ -1914,6 +1923,7 @@ async def retry_failed_notify_deliveries(
             ch = str(row.get("channel") or "").strip().lower()
             tgt = str(row.get("target") or "").strip()
             user_id = str(row.get("user_id") or "").strip()
+            row_error_code = str(row.get("error_code") or "").strip()
             try:
                 attempt_count = int(row.get("attempt_count") or 0)
             except (TypeError, ValueError):
@@ -1929,6 +1939,8 @@ async def retry_failed_notify_deliveries(
             row_claimed = False
             try:
                 if attempt_count >= max_attempts:
+                    if is_uncertain_notify_error_code(row_error_code):
+                        continue
                     async with get_db_connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute(
@@ -1941,6 +1953,7 @@ async def retry_failed_notify_deliveries(
                                   AND channel = %s
                                   AND target = %s
                                   AND status = 'pending'
+                                  AND COALESCE(error_code, '') <> ALL(%s)
                                   AND attempt_count >= %s
                                   AND updated_at <= NOW() - make_interval(mins => %s)
                                 """,
@@ -1948,6 +1961,7 @@ async def retry_failed_notify_deliveries(
                                     exec_id,
                                     ch,
                                     tgt,
+                                    uncertain_codes_list,
                                     max_attempts,
                                     stale_pending_minutes,
                                 ),
@@ -2096,18 +2110,62 @@ async def retry_failed_notify_deliveries(
                     else None
                 )
                 remaining_s = max(0.1, max_duration_s - (time.monotonic() - started_at))
-                bridge_res = await asyncio.wait_for(
-                    dispatch_target_with_payload(
-                        post_notify_fn,
-                        [tgt],
-                        text,
-                        card,
-                        payload,
-                        run_id=exec_id,
-                        channel=ch,
-                    ),
-                    timeout=remaining_s,
+                use_gateway_transport = (
+                    is_data_task_row and post_notify_fn is post_bridge_notify
                 )
+                if use_gateway_transport:
+                    bridge_res = await asyncio.wait_for(
+                        data_task_notify_fn([tgt], run_id=exec_id),
+                        timeout=remaining_s,
+                    )
+                else:
+                    bridge_res = await asyncio.wait_for(
+                        dispatch_target_with_payload(
+                            post_notify_fn,
+                            [tgt],
+                            text,
+                            card,
+                            payload,
+                            run_id=exec_id,
+                            channel=ch,
+                        ),
+                        timeout=remaining_s,
+                    )
+                uncertain_code = extract_target_uncertain_code(tgt, bridge_res)
+                if uncertain_code is not None:
+                    await _invoke_mark_delivery(
+                        mark_delivery_fn,
+                        exec_id,
+                        ch,
+                        tgt,
+                        status="pending",
+                        error_code=uncertain_code,
+                        expected_status="pending",
+                    )
+                    row_claimed = False
+                    continue
+
+                if isinstance(bridge_res, Mapping) and str(
+                    bridge_res.get("status") or ""
+                ).strip().lower() == "skipped":
+                    skip_code = str(
+                        bridge_res.get("error_code")
+                        or bridge_res.get("code")
+                        or "skipped"
+                    ).strip() or "skipped"
+                    await _invoke_mark_delivery(
+                        mark_delivery_fn,
+                        exec_id,
+                        ch,
+                        tgt,
+                        status="skipped",
+                        reason=skip_code,
+                        error_code=skip_code,
+                        expected_status="pending",
+                    )
+                    row_claimed = False
+                    continue
+
                 outcomes, batch_err = _evaluate_target_results([tgt], bridge_res)
                 if outcomes.get(tgt) is True:
                     await _invoke_mark_delivery(
@@ -2133,25 +2191,53 @@ async def retry_failed_notify_deliveries(
                 row_claimed = False
             except asyncio.CancelledError:
                 if row_claimed:
-                    await _shielded_mark_failed(
-                        mark_delivery_fn,
-                        exec_id,
-                        ch,
-                        tgt,
-                        error_code="CancelledError",
-                        expected_status="pending",
-                    )
+                    if is_data_task_row and is_uncertain_notify_error_code(row_error_code):
+                        await _invoke_mark_delivery(
+                            mark_delivery_fn,
+                            exec_id,
+                            ch,
+                            tgt,
+                            status="pending",
+                            error_code=row_error_code,
+                            expected_status="pending",
+                        )
+                    else:
+                        await _shielded_mark_failed(
+                            mark_delivery_fn,
+                            exec_id,
+                            ch,
+                            tgt,
+                            error_code="CancelledError",
+                            expected_status="pending",
+                        )
                     row_claimed = False
                 raise
             except Exception as retry_exc:
+                is_timeout_exc = isinstance(
+                    retry_exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)
+                ) and not isinstance(retry_exc, httpx.ConnectTimeout)
+                preserve_uncertain = is_uncertain_notify_error_code(row_error_code) or (
+                    is_data_task_row
+                    and post_notify_fn is post_bridge_notify
+                    and is_timeout_exc
+                )
                 status_code = getattr(
                     getattr(retry_exc, "response", None), "status_code", None
                 )
                 err_code = (
-                    f"http_{status_code}"
-                    if status_code
-                    else type(retry_exc).__name__
+                    row_error_code
+                    if is_uncertain_notify_error_code(row_error_code)
+                    else (
+                        "delivery_uncertain"
+                        if preserve_uncertain
+                        else (
+                            f"http_{status_code}"
+                            if status_code
+                            else type(retry_exc).__name__
+                        )
+                    )
                 )
+                target_status = "pending" if preserve_uncertain else "failed"
                 if row_claimed:
                     try:
                         await _invoke_mark_delivery(
@@ -2159,19 +2245,20 @@ async def retry_failed_notify_deliveries(
                             exec_id,
                             ch,
                             tgt,
-                            status="failed",
+                            status=target_status,
                             error_code=err_code,
                             expected_status="pending",
                         )
                     except asyncio.CancelledError:
-                        await _shielded_mark_failed(
-                            mark_delivery_fn,
-                            exec_id,
-                            ch,
-                            tgt,
-                            error_code=err_code,
-                            expected_status="pending",
-                        )
+                        if not preserve_uncertain:
+                            await _shielded_mark_failed(
+                                mark_delivery_fn,
+                                exec_id,
+                                ch,
+                                tgt,
+                                error_code=err_code,
+                                expected_status="pending",
+                            )
                         row_claimed = False
                         raise
                     except Exception:

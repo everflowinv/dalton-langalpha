@@ -1,11 +1,15 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
+export type GatewayStartupMode = "incoming" | "outgoing";
+
 export interface GatewayConfig {
   /** Strictly `127.0.0.1` (§0.2, §5.1). */
   host: "127.0.0.1";
   /** Default `8962` (§0.2, §5.1). */
   port: number;
+  /** Startup mode: `"incoming"` (default) or `"outgoing"` (notification-only, no inbound listeners/Weixin/startup recovery). */
+  mode?: GatewayStartupMode;
   /** Shared `INTERNAL_SERVICE_TOKEN` (length >= 32, §1.1). */
   serviceToken: string;
   /** Backend base URL, e.g. `http://127.0.0.1:8000`. */
@@ -40,7 +44,9 @@ function parseBool(value: string | undefined, defaultValue = false): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): GatewayConfig & { mode: GatewayStartupMode } {
   const requestedHost = (env.GATEWAY_HOST ?? "127.0.0.1").trim();
   if (requestedHost !== "127.0.0.1") {
     throw new Error(
@@ -59,9 +65,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     env.DALTON_WEIXIN_CACHE_DIR ?? resolve(homedir(), ".dalton", "channel-gateway", "weixin")
   ).trim();
 
+  const rawMode = (env.DALTON_GATEWAY_MODE ?? env.GATEWAY_MODE ?? "incoming")
+    .trim()
+    .toLowerCase();
+  if (rawMode !== "incoming" && rawMode !== "outgoing") {
+    throw new Error(
+      `Invalid gateway mode "${rawMode}". Expected "incoming" or "outgoing".`,
+    );
+  }
+  const mode: GatewayStartupMode = rawMode;
+
+  const feishuAppId = (env.DALTON_FEISHU_APP_ID ?? "").trim();
+  const feishuAppSecret = (env.DALTON_FEISHU_APP_SECRET ?? "").trim();
+  const discordBotToken = (env.DALTON_DISCORD_BOT_TOKEN ?? "").trim();
+
+  const feishuEnabled =
+    mode === "outgoing" && env.DALTON_FEISHU_ENABLED === undefined
+      ? Boolean(feishuAppId && feishuAppSecret)
+      : parseBool(env.DALTON_FEISHU_ENABLED, false);
+  const discordEnabled =
+    mode === "outgoing" && env.DALTON_DISCORD_ENABLED === undefined
+      ? Boolean(discordBotToken)
+      : parseBool(env.DALTON_DISCORD_ENABLED, false);
+
   return {
     host: "127.0.0.1",
     port,
+    mode,
     serviceToken,
     backendUrl,
     webBaseUrl,
@@ -69,16 +99,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     colleagueDispatchEnabled: parseBool(env.DALTON_COLLEAGUE_DISPATCH_ENABLED, true),
     channels: {
       feishu: {
-        enabled: parseBool(env.DALTON_FEISHU_ENABLED, false),
-        appId: (env.DALTON_FEISHU_APP_ID ?? "").trim(),
-        appSecret: (env.DALTON_FEISHU_APP_SECRET ?? "").trim(),
+        enabled: feishuEnabled,
+        appId: feishuAppId,
+        appSecret: feishuAppSecret,
       },
       discord: {
-        enabled: parseBool(env.DALTON_DISCORD_ENABLED, false),
-        botToken: (env.DALTON_DISCORD_BOT_TOKEN ?? "").trim(),
+        enabled: discordEnabled,
+        botToken: discordBotToken,
       },
       weixin: {
-        enabled: parseBool(env.DALTON_WEIXIN_ENABLED, false),
+        enabled: mode === "outgoing" ? false : parseBool(env.DALTON_WEIXIN_ENABLED, false),
         apiBaseUrl: (env.DALTON_WEIXIN_API_BASE_URL ?? "https://ilinkai.weixin.qq.com")
           .trim()
           .replace(/\/+$/, ""),
