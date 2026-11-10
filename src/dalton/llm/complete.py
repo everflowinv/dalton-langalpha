@@ -19,7 +19,6 @@ from src.dalton.budget.port import (
 )
 from src.dalton.budget.service import (
     _is_subscription_model,
-    _notional_price_index,
     _resolve_provider_for_model,
     reconcile_and_summarize_day,
     resolve_user_budget_config,
@@ -199,13 +198,42 @@ def compute_call_costs(
     billing_type: str,
     token_usage: dict[str, Any] | None,
 ) -> tuple[Decimal, Decimal]:
-    """Compute `(cash_usd, notional_usd)` for a single LLM invocation."""
+    """Compute `(cash_usd, notional_usd)` for a single LLM invocation (or its per-attempt calls)."""
+    from src.dalton.llm.notional_pricing import (
+        build_notional_price_index,
+        calculate_notional_cost,
+        is_subscription_model,
+        resolve_notional_card,
+    )
+
     usage = token_usage if isinstance(token_usage, dict) else {}
-    in_tok = int(usage.get("input_tokens") or 0)
-    out_tok = int(usage.get("output_tokens") or 0)
-    cached_tok = int(usage.get("cached_tokens") or 0)
+    raw_calls = usage.get("per_call_usages")
+    call_usages: list[dict[str, int]] = []
+    if isinstance(raw_calls, list) and raw_calls:
+        for item in raw_calls:
+            if isinstance(item, dict):
+                call_usages.append(
+                    {
+                        "input_tokens": int(item.get("input_tokens") or 0),
+                        "output_tokens": int(item.get("output_tokens") or 0),
+                        "cached_tokens": int(item.get("cached_tokens") or 0),
+                        "cache_5m_tokens": int(item.get("cache_5m_tokens") or 0),
+                        "cache_1h_tokens": int(item.get("cache_1h_tokens") or 0),
+                    }
+                )
+    if not call_usages:
+        call_usages = [
+            {
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "cached_tokens": int(usage.get("cached_tokens") or 0),
+                "cache_5m_tokens": int(usage.get("cache_5m_tokens") or 0),
+                "cache_1h_tokens": int(usage.get("cache_1h_tokens") or 0),
+            }
+        ]
 
     calc_cost = Decimal("0")
+    calc_notional: Decimal | None = None
     try:
         from src.utils.tracking.core import calculate_cost_from_per_call_records
 
@@ -213,32 +241,49 @@ def compute_call_costs(
             [
                 {
                     "model_name": model_key,
-                    "usage": {
-                        "input_tokens": in_tok,
-                        "output_tokens": out_tok,
-                        "cached_tokens": cached_tok,
-                    },
+                    "usage": dict(cu),
                     "billing_type": billing_type,
                 }
+                for cu in call_usages
             ]
         )
         calc_cost = Decimal(str(res.get("total_cost") or "0")).quantize(Decimal("0.000001"))
+        per_call = res.get("per_call_costs") or []
+        if per_call and all(
+            isinstance(c, dict) and c.get("notional_cost") is not None for c in per_call
+        ):
+            calc_notional = sum(
+                (Decimal(str(c["notional_cost"])) for c in per_call),
+                Decimal("0"),
+            ).quantize(Decimal("0.000001"))
     except Exception as exc:
         logger.debug("[DaltonComplete] calculate_cost_from_per_call_records failed: %s", exc)
 
-    if billing_type == "oauth" or _is_subscription_model(model_key, billing_type):
+    is_sub = (
+        billing_type == "oauth"
+        or _is_subscription_model(model_key, billing_type)
+        or is_subscription_model(model_key, billing_type, overlay_loader=load_overlay_data)
+    )
+    if is_sub:
+        idx = build_notional_price_index(overlay_loader=load_overlay_data)
+        card = resolve_notional_card(model_key, index=idx)
+        if card is not None:
+            total_notional = Decimal("0")
+            for cu in call_usages:
+                usd, _ = calculate_notional_cost(
+                    card,
+                    input_tokens=cu["input_tokens"],
+                    output_tokens=cu["output_tokens"],
+                    cached_tokens=cu["cached_tokens"],
+                    cache_5m_tokens=cu["cache_5m_tokens"],
+                    cache_1h_tokens=cu["cache_1h_tokens"],
+                )
+                total_notional += Decimal(str(usd))
+            return Decimal("0"), total_notional.quantize(Decimal("0.000001"))
+        if calc_notional is not None and calc_notional > Decimal("0"):
+            return Decimal("0"), calc_notional
         if calc_cost > Decimal("0"):
             return Decimal("0"), calc_cost
-        idx = _notional_price_index()
-        card = idx.get(model_key)
-        if card is not None:
-            uncached_in = max(0, in_tok - cached_tok)
-            usd = (
-                uncached_in * card["input"]
-                + cached_tok * card["cached_input"]
-                + out_tok * card["output"]
-            ) / 1_000_000.0
-            return Decimal("0"), Decimal(f"{usd:.6f}")
         return Decimal("0"), Decimal("0")
 
     return calc_cost, Decimal("0")
