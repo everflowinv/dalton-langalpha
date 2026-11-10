@@ -79,6 +79,81 @@
         "write": "parameters.thinking_level"
       }
     },
+    "gemini-4-carbon-low-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-carbon-low",
+      "provider": "antigravity-oauth",
+      "display_name": "Gemini 4 Carbon (Low)",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 262144
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-carbon-medium-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-carbon-medium",
+      "provider": "antigravity-oauth",
+      "display_name": "Gemini 4 Carbon (Medium)",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 262144
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-carbon-high-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-carbon-high",
+      "provider": "antigravity-oauth",
+      "display_name": "Gemini 4 Carbon (High)",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 262144
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
     "gemini-3.8-flash-low-oauth": {
       "prompt_guidance": "lean",
       "model_id": "gemini-3.8-flash-low",
@@ -861,6 +936,48 @@
       "billing": "subscription",
       "notional_ref": "gemini-4-argon",
       "tool_calling": true
+    },
+    "gemini-4-carbon-low-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 10.0,
+        "cached_input": 0.1,
+        "estimated": false,
+        "source": "https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/",
+        "verified_at": "2026-11-10"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Current nominal rates are $2 input / $10 output / $0.1 cached input per million tokens, verified 2026-11-10. Introductory period, then $4 / $20; end date not specified. Source published 2026-10-28: https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/"
+    },
+    "gemini-4-carbon-medium-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 10.0,
+        "cached_input": 0.1,
+        "estimated": false,
+        "source": "https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/",
+        "verified_at": "2026-11-10"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Current nominal rates are $2 input / $10 output / $0.1 cached input per million tokens, verified 2026-11-10. Introductory period, then $4 / $20; end date not specified. Source published 2026-10-28: https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/"
+    },
+    "gemini-4-carbon-high-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 2.0,
+        "output": 10.0,
+        "cached_input": 0.1,
+        "estimated": false,
+        "source": "https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/",
+        "verified_at": "2026-11-10"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Current nominal rates are $2 input / $10 output / $0.1 cached input per million tokens, verified 2026-11-10. Introductory period, then $4 / $20; end date not specified. Source published 2026-10-28: https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/"
     },
     "gemini-3.8-flash-low-oauth": {
       "family": "google-gemini",
