@@ -139,6 +139,7 @@ async def au1_live_pool(
         budget as dalton_budget_db,
         channel_gateway as dalton_channel_gw_db,
         company_automations as company_auto_db,
+        company_data_tasks as company_data_db,
         coverage as dalton_coverage_db,
         coverage_units as dalton_coverage_units_db,
         members as dalton_members_db,
@@ -194,6 +195,7 @@ async def au1_live_pool(
         dalton_budget_db,
         dalton_channel_gw_db,
         company_auto_db,
+        company_data_db,
         dalton_coverage_db,
         dalton_coverage_units_db,
         dalton_members_db,
@@ -1290,10 +1292,10 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
     app.dependency_overrides[principal_mod.get_principal] = lambda: caller_holder["principal"]
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        # 1. Empty company list before company rows are preset -> 200, total=0
+        # 1. Company list before the manifest definitions exist is a read error.
         r_empty_comp = await client.get("/api/v1/automations?scope=company")
-        assert r_empty_comp.status_code == 200, r_empty_comp.text
-        assert r_empty_comp.json() == {"automations": [], "total": 0}
+        assert r_empty_comp.status_code == 503, r_empty_comp.text
+        assert "incomplete" in r_empty_comp.json()["detail"]
 
         # 2. Omitted scope returns all 4 tasks of internal_uid (never defaults to personal)
         r_all = await client.get("/api/v1/automations")
@@ -1392,12 +1394,30 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
                     same_created,
                 ),
             )
+            from src.dalton.data_jobs.manifest import (
+                load_manifest_entries,
+                sync_manifest_to_db,
+            )
 
-        # Internal member reads scope=company: gets row's task_row notify state, NOT caller prefs!
+            await sync_manifest_to_db(db_conn)
+            manifest_ids = {f"data:{entry.job_key}" for entry in load_manifest_entries()}
+
+        # Internal member reads scope=company: the real company agent plus the
+        # manifest scripts. Notify state still comes from the agent row.
         r_comp = await client.get("/api/v1/automations?scope=company")
         assert r_comp.status_code == 200, r_comp.text
-        assert r_comp.json()["total"] == 1
-        [comp_item] = r_comp.json()["automations"]
+        assert r_comp.json()["total"] == 1 + len(manifest_ids)
+        comp_item = next(
+            item
+            for item in r_comp.json()["automations"]
+            if item["automation_id"] == comp_preset_id
+        )
+        script_items = [
+            item for item in r_comp.json()["automations"] if item["engine_kind"] == "script"
+        ]
+        assert {item["automation_id"] for item in script_items} == manifest_ids
+        assert all(item["scope"] == "company" for item in script_items)
+        assert all("command_argv" not in item for item in script_items)
         assert comp_item["automation_id"] == comp_preset_id
         assert comp_item["scope"] == "company"
         assert comp_item["engine_kind"] == "agent"

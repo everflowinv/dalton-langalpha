@@ -287,11 +287,19 @@ async def test_get_automation(client):
 
 @pytest.mark.asyncio
 async def test_get_automation_not_found(client):
+    # DALTON-HOOK(company-automations): check both owner and shared company lookups
     fake_id = str(uuid.uuid4())
-    with patch(
-        f"{AUTO_DB}.get_automation",
-        new_callable=AsyncMock,
-        return_value=None,
+    with (
+        patch(
+            f"{AUTO_DB}.get_automation",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "src.dalton.database.company_data_tasks.get_company_agent_detail",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
     ):
         resp = await client.get(f"/api/v1/automations/{fake_id}")
 
@@ -655,10 +663,18 @@ def _run(**overrides):
 
 @pytest.mark.asyncio
 async def test_list_executions(client):
-    with patch(
-        f"{EXEC_DB}.list_executions",
-        new_callable=AsyncMock,
-        return_value=([_run()], True),
+    # DALTON-HOOK(company-automations): resolve task ownership before reading executions
+    with (
+        patch(
+            f"{EXEC_DB}.list_executions",
+            new_callable=AsyncMock,
+            return_value=([_run()], True),
+        ),
+        patch(
+            "src.dalton.database.company_data_tasks.get_automation_owner_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
     ):
         resp = await client.get(
             f"/api/v1/automations/{AUTO_ID}/executions"
@@ -674,11 +690,19 @@ async def test_list_executions(client):
 
 @pytest.mark.asyncio
 async def test_list_executions_with_pagination(client):
-    with patch(
-        f"{EXEC_DB}.list_executions",
-        new_callable=AsyncMock,
-        return_value=([], False),
-    ) as mock_list:
+    # DALTON-HOOK(company-automations): preserve owner-scoped execution pagination
+    with (
+        patch(
+            f"{EXEC_DB}.list_executions",
+            new_callable=AsyncMock,
+            return_value=([], False),
+        ) as mock_list,
+        patch(
+            "src.dalton.database.company_data_tasks.get_automation_owner_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
         resp = await client.get(
             f"/api/v1/automations/{AUTO_ID}/executions?limit=5&offset=10"
         )
