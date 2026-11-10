@@ -555,20 +555,27 @@ async def test_queued_slot_wait_vs_low_memory_separation_and_superseded() -> Non
     assert "WHERE run_id = %(run_id)s::uuid" in low_sql
     assert low_params == {"run_id": "run-low-mem", "now_utc": now}
 
-    # Case C: expire_low_memory_runs transitions only expired low_mem_since_utc IS NOT NULL runs
-    # to skipped_low_memory and increments consecutive_failures
+    # Case C: expire_low_memory_runs locks the definition, then skips one still-queued
+    # run and increments consecutive_failures once.
     conn_exp, state_exp = _make_autospec_db(
         [
             {"fetchall": [{"run_id": "run-low-mem", "job_key": T5_JOB_KEY}]},
-            {"rowcount": 1},  # UPDATE status = 'skipped_low_memory'
-            {"rowcount": 1},  # UPDATE consecutive_failures = consecutive_failures + 1
+            {"fetchone": {"enabled": True}},  # SELECT def FOR UPDATE
+            {"rowcount": 1, "fetchone": {"trigger_source": "cron"}},  # one queued run
+            {"rowcount": 1},  # UPDATE consecutive_failures once
         ]
     )
     expired_ids = await expire_low_memory_runs(conn_exp, now_utc=now + timedelta(minutes=6))
     assert expired_ids == ["run-low-mem"]
-    assert "status = 'skipped_low_memory'" in state_exp["executed"][1][0]
-    assert "WHERE run_id = %(run_id)s::uuid" in state_exp["executed"][1][0]
-    assert "consecutive_failures = consecutive_failures + 1" in state_exp["executed"][2][0]
+    lock_sql = state_exp["executed"][1][0]
+    assert "dalton_data_task_defs" in lock_sql
+    assert "FOR UPDATE" in lock_sql
+    skip_sql = state_exp["executed"][2][0]
+    assert "status = 'skipped_low_memory'" in skip_sql
+    assert "WHERE run_id = %(run_id)s::uuid" in skip_sql
+    assert "status = 'queued'" in skip_sql
+    assert "consecutive_failures = consecutive_failures + 1" in state_exp["executed"][3][0]
+    assert not any("FOR SHARE" in sql for sql, _ in state_exp["executed"])
 
     # Case D: enqueue_due_cron_tasks marks old queued run as skipped_superseded (no failure bump)
     conn_sup, state_sup = _make_autospec_db(
@@ -587,9 +594,20 @@ async def test_queued_slot_wait_vs_low_memory_separation_and_superseded() -> Non
                     }
                 ]
             },
-            # 2. UPDATE old queued run SET status = 'skipped_superseded'
+            # 2. Lock the definition and confirm it is still due
+            {
+                "fetchone": {
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "cron_expr": "*/5 9-16 * * 1-5",
+                    "timezone": "America/New_York",
+                    "timeout_seconds": 240,
+                    "runner": "container",
+                }
+            },
+            # 3. UPDATE old queued run SET status = 'skipped_superseded'
             {"rowcount": 1},
-            # 3. INSERT new queued run
+            # 4. INSERT new queued run
             {"rowcount": 1, "fetchone": {"run_id": "run-new-slot"}},
         ]
     )
@@ -597,11 +615,185 @@ async def test_queued_slot_wait_vs_low_memory_separation_and_superseded() -> Non
     tick_utc = datetime(2026, 11, 6, 15, 5, 10, tzinfo=timezone.utc)
     enqueued = await enqueue_due_cron_tasks(conn_sup, now_utc=tick_utc)
     assert enqueued == ["run-new-slot"]
-    sup_sql, _ = state_sup["executed"][1]
+    lock_sql, _ = state_sup["executed"][1]
+    assert "FOR UPDATE" in lock_sql
+    assert "dalton_data_task_defs" in lock_sql
+    sup_sql, _ = state_sup["executed"][2]
     assert "status = 'skipped_superseded'" in sup_sql
     assert "trigger_source = 'cron'" in sup_sql
-    assert "%(run_id)s::uuid" in state_sup["executed"][2][0]
+    assert "%(run_id)s::uuid" in state_sup["executed"][3][0]
     assert not any("consecutive_failures" in sql for sql, _ in state_sup["executed"])
+
+
+def _low_memory_candidate(
+    *,
+    run_id: str,
+    job_key: str,
+    now: datetime,
+    trigger_source: str = "cron",
+    enabled: bool = True,
+) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "job_key": job_key,
+        "trigger_source": trigger_source,
+        "scheduled_slot_utc": now - timedelta(minutes=5),
+        "deadline_utc": now,
+        "low_mem_since_utc": None,
+        "enabled": enabled,
+        "paused_by_user": False,
+        "runner": "container",
+        "command_argv": ["bash", "-lc", "echo low-mem"],
+        "workdir": "/Users/everflow/.openclaw/workspace",
+        "timeout_seconds": 300,
+        "no_output_timeout_seconds": 120,
+        "required_secrets": [],
+        "cos_mode": "skip",
+        "notify_enabled": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_low_memory_expiry_locks_definition_before_one_queued_run() -> None:
+    """Both expiry paths lock the definition before changing the queued run."""
+    now = datetime(2026, 11, 7, 14, 0, tzinfo=timezone.utc)
+
+    missed, missed_state = _make_autospec_db(
+        [
+            {"fetchall": [{"run_id": "run-gone", "job_key": T5_JOB_KEY}]},
+            {"fetchone": {"enabled": True}},
+            {"rowcount": 0, "fetchone": None},
+        ]
+    )
+    assert await expire_low_memory_runs(missed, now_utc=now) == []
+    assert "FOR UPDATE" in missed_state["executed"][1][0]
+    assert "skipped_low_memory" in missed_state["executed"][2][0]
+    assert not any("consecutive_failures" in sql for sql, _ in missed_state["executed"])
+
+    claim, claim_state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 4,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    _low_memory_candidate(
+                        run_id="run-claim-deadline",
+                        job_key=T5_JOB_KEY,
+                        now=now,
+                    )
+                ]
+            },
+            {"fetchone": {"enabled": True}},
+            {"rowcount": 1, "fetchone": {"trigger_source": "cron"}},
+            {"rowcount": 1},
+        ]
+    )
+    claimed = await claim_next_queued_run(
+        claim,
+        now_utc=now,
+        available_memory_mb=100,
+        min_free_mem_mb=1280,
+    )
+    assert claimed is None
+    assert "FOR UPDATE" in claim_state["executed"][3][0]
+    assert "dalton_data_task_defs" in claim_state["executed"][3][0]
+    skip_sql = claim_state["executed"][4][0]
+    assert "skipped_low_memory" in skip_sql
+    assert "low_mem_since_utc = COALESCE" in skip_sql
+    assert "status = 'queued'" in skip_sql
+    assert "consecutive_failures = consecutive_failures + 1" in claim_state["executed"][5][0]
+    assert not any(
+        sql.lstrip().upper().startswith("UPDATE") and "dalton_data_task_slot" in sql
+        for sql, _ in claim_state["executed"]
+    )
+    assert claim_state["tx_commits"] == 1
+
+    trial, trial_state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 4,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    _low_memory_candidate(
+                        run_id="run-claim-trial",
+                        job_key=T18_JOB_KEY,
+                        now=now,
+                        trigger_source="manual",
+                        enabled=False,
+                    )
+                ]
+            },
+            {"fetchone": {"enabled": False}},
+            {"rowcount": 1, "fetchone": {"trigger_source": "manual"}},
+        ]
+    )
+    assert (
+        await claim_next_queued_run(
+            trial,
+            now_utc=now,
+            available_memory_mb=100,
+            min_free_mem_mb=1280,
+        )
+        is None
+    )
+    assert "FOR UPDATE" in trial_state["executed"][3][0]
+    assert "skipped_low_memory" in trial_state["executed"][4][0]
+    assert not any("consecutive_failures" in sql for sql, _ in trial_state["executed"])
+
+    cancelled, cancelled_state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 4,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    _low_memory_candidate(
+                        run_id="run-already-cancelled",
+                        job_key=T5_JOB_KEY,
+                        now=now,
+                    )
+                ]
+            },
+            {"fetchone": {"enabled": False}},
+            {"rowcount": 0, "fetchone": None},
+        ]
+    )
+    assert (
+        await claim_next_queued_run(
+            cancelled,
+            now_utc=now,
+            available_memory_mb=100,
+            min_free_mem_mb=1280,
+        )
+        is None
+    )
+    assert "FOR UPDATE" in cancelled_state["executed"][3][0]
+    assert not any(
+        "consecutive_failures" in sql for sql, _ in cancelled_state["executed"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1408,6 +1600,16 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
                     }
                 ]
             },
+            {
+                "fetchone": {
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "cron_expr": "0 10 * * 1-5",
+                    "timezone": "America/New_York",
+                    "timeout_seconds": 900,
+                    "runner": "host",
+                }
+            },
             {"rowcount": 0},  # UPDATE old queued SET skipped_superseded
             {"rowcount": 1, "fetchone": {"run_id": "run-host-enq-1"}},  # INSERT new queued run
         ]
@@ -1456,6 +1658,41 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
     assert claimed.host_mode == "run"
     assert claimed.generation == 2
     assert state_claim["tx_commits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_due_cron_skips_when_locked_def_is_paused_or_rescheduled() -> None:
+    """A stale candidate must not enqueue after the locked row is paused or moved."""
+    tick = datetime(2026, 11, 6, 15, 5, tzinfo=timezone.utc)
+    candidate = {
+        "job_key": T18_JOB_KEY,
+        "cron_expr": "*/5 9-16 * * 1-5",
+        "timezone": "America/New_York",
+        "timeout_seconds": 240,
+        "enabled": True,
+        "paused_by_user": False,
+        "runner": "container",
+    }
+    paused, paused_state = _make_autospec_db(
+        [
+            {"fetchall": [candidate]},
+            {"fetchone": {**candidate, "paused_by_user": True, "enabled": True}},
+        ]
+    )
+    assert await enqueue_due_cron_tasks(paused, now_utc=tick) == []
+    assert "FOR UPDATE" in paused_state["executed"][1][0]
+    assert not any("INSERT INTO dalton_data_task_runs" in sql for sql, _ in paused_state["executed"])
+    assert not any("skipped_superseded" in sql for sql, _ in paused_state["executed"])
+
+    moved, moved_state = _make_autospec_db(
+        [
+            {"fetchall": [candidate]},
+            {"fetchone": {**candidate, "cron_expr": "0 0 1 1 *"}},
+        ]
+    )
+    assert await enqueue_due_cron_tasks(moved, now_utc=tick) == []
+    assert "FOR UPDATE" in moved_state["executed"][1][0]
+    assert not any("INSERT INTO dalton_data_task_runs" in sql for sql, _ in moved_state["executed"])
 
 
 @pytest.mark.asyncio
@@ -5611,6 +5848,16 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
                     }
                 ]
             },
+            {
+                "fetchone": {
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "cron_expr": "*/5 9-16 * * 1-5",
+                    "timezone": "America/New_York",
+                    "timeout_seconds": 240,
+                    "runner": "container",
+                }
+            },
             {"rowcount": 1},  # UPDATE prior queued cron run -> skipped_superseded
             {"rowcount": 1, "fetchone": {"run_id": "cron-slot-run-1"}},
         ]
@@ -5618,7 +5865,8 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     tick_utc = datetime(2026, 11, 6, 15, 5, 10, tzinfo=timezone.utc)
     enqueued_cron = await enqueue_due_cron_tasks(conn_cron_sup, now_utc=tick_utc)
     assert enqueued_cron == ["cron-slot-run-1"]
-    sup_sql, _ = state_cron_sup["executed"][1]
+    assert "FOR UPDATE" in state_cron_sup["executed"][1][0]
+    sup_sql, _ = state_cron_sup["executed"][2]
     assert "status = 'skipped_superseded'" in sup_sql
     assert "trigger_source = 'cron'" in sup_sql
     assert "trigger_source = 'manual'" not in sup_sql
@@ -6079,7 +6327,8 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     assert fin_imm_params["notify_status"] == "pending_dispatch"
     assert any("consecutive_failures = 0" in sql for sql, _ in state_fin_imm["executed"])
 
-    # Trial low-memory expiry (`enabled = False`) and takeover (`enabled = False`) do NOT increment consecutive_failures
+    # Trial low-memory expiry (`enabled = False` on the locked definition) and takeover
+    # (`enabled = False`) do NOT increment consecutive_failures.
     conn_exp_man, state_exp_man = _make_autospec_db(
         [
             {
@@ -6092,11 +6341,14 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
                     }
                 ]
             },
-            {"rowcount": 1},  # UPDATE status = 'skipped_low_memory'
+            {"fetchone": {"enabled": False}},  # locked definition says this is a trial
+            {"rowcount": 1, "fetchone": {"trigger_source": "manual"}},
         ]
     )
     expired_man = await expire_low_memory_runs(conn_exp_man, now_utc=now + timedelta(minutes=10))
     assert expired_man == ["manual-low-mem-1"]
+    assert "FOR UPDATE" in state_exp_man["executed"][1][0]
+    assert "skipped_low_memory" in state_exp_man["executed"][2][0]
     assert not any("consecutive_failures" in sql for sql, _ in state_exp_man["executed"])
 
     lock_takeover, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(5)])
