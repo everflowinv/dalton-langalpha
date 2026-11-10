@@ -9,8 +9,9 @@ import { isTaskAgentId } from '../../utils/agentId';
 import { opensTurn } from '../../components/messageList/messagePredicates';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import { reportRow, senderProvenance, type SenderMetadata } from '../provenance';
-import { deliveredEntryRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
-import type { ReportSource } from '@/types/api';
+// DALTON-HOOK(chat-large-upload): reuse failedSteerRow for replayed undelivered steers
+import { deliveredEntryRow, failedSteerRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
+import type { ArtifactCommentsShown, ReportSource } from '@/types/api';
 import { isDeliveredNotice, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
 import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
@@ -18,6 +19,8 @@ import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { wakeTurnOpener } from '../wakeupEvents';
 import { openerMatchText, readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
+// DALTON-HOOK(chat-large-upload): normalize persisted attachment metadata on replayed turns
+import { normalizeAttachments } from '../../hooks/utils/messageHelpers';
 
 
 /** Shape of an SSE history event. */
@@ -79,11 +82,13 @@ function dropLiveCopy(
   pairIndex: number,
   insertIndex: number,
 ): { rest: MessageRecord[]; removedAbove: number } {
+  // DALTON-HOOK(chat-large-upload): skip unadmitted attachment sends when matching live copies of empty/file-only turns
   let opener = -1;
   for (let i = prev.length - 1; i >= 0; i--) {
     const m = prev[i];
     if (
       m.role === 'user' && !m.isHistory && !m.queued && opensTurn(m)
+      && !(m.unadmitted && Array.isArray(m.attachments) && m.attachments.length > 0)
       && m.turnIndex === pairIndex && String(m.content ?? '').trim() === content
     ) {
       opener = i;
@@ -143,7 +148,12 @@ function refusedBefore(m: MessageRecord, turn: number): boolean {
  * price alert or a wakeup that woke the agent is written for the model too,
  * and heads its turn as its row, which still draws when it names nothing.
  */
-function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): MessageRecord | null {
+function turnOpenerRow(
+  event: HistoryEvent,
+  pairIndex: number,
+  text: string,
+  opensHidden = false,
+): MessageRecord | null {
   // Deterministic id keyed only on pairIndex (the server-side turn_index,
   // unique per turn). Earlier code suffixed `Date.now()` here as
   // speculative collision defense, but that made the same logical bubble
@@ -162,10 +172,14 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
       ...(event.report_run_id ? { runId: event.report_run_id } : {}),
     }) : null;
   }
-  if (!text) return null;
+  // DALTON-HOOK(chat-large-upload): keep explicit onboarding kickoffs hidden while rendering file-only user turns
+  if (opensHidden) return null;
+  const attachments = normalizeAttachments(event.metadata?.attachments);
+  if (!text && !attachments) return null;
   const row: MessageRecord = {
     id, role: 'user', content: event.content, contentType: 'text', timestamp,
     isStreaming: false, isHistory: true, turnIndex: pairIndex,
+    ...(attachments ? { attachments } : {}),
   };
   const provenance = senderProvenance(event.metadata);
   if (provenance) row.provenance = provenance;
@@ -278,12 +292,13 @@ export function handleHistoryUserMessage({
       steeringBatches: 0,
     });
 
-    const userMessage = turnOpenerRow(event, pairIndex, messageContent);
+    // DALTON-HOOK(chat-large-upload): pass opensHidden and normalize persisted attachments
+    const userMessage = turnOpenerRow(event, pairIndex, messageContent, opensHidden);
     if (userMessage) {
       // Restore attachment metadata from persisted query metadata
-      const attachments = event.metadata?.attachments as unknown[] | undefined;
-      if (attachments && attachments.length > 0) {
-        userMessage.attachments = event.metadata!.attachments;
+      const normalized = normalizeAttachments(event.metadata?.attachments);
+      if (normalized) {
+        userMessage.attachments = normalized;
       }
 
       // Restore widget snapshot metadata so the chip deck re-renders below
@@ -830,6 +845,64 @@ export function handleHistorySteeringDelivered({
     newMessagesStartIndexRef.current = idx + 1;
     return next;
   });
+}
+
+// DALTON-HOOK(chat-large-upload): replay permanently failed main-thread steers idempotently
+export function handleHistorySteeringReturned({
+  event,
+  pairIndex,
+  refs,
+  setMessages,
+  onCopySettled,
+}: {
+  event: HistoryEvent;
+  pairIndex: number;
+  refs: HistorySteeringRefs;
+  setMessages: SetMessages;
+  onCopySettled?: (requestKey: string | null, comments?: ArtifactCommentsShown) => void;
+}): void {
+  const { newMessagesStartIndexRef } = refs;
+  const reqKey = typeof event.request_key === 'string' && event.request_key
+    ? event.request_key
+    : null;
+  const jobKey = typeof event.job_id === 'string' && event.job_id
+    ? event.job_id
+    : String(event.timestamp ?? pairIndex);
+  const rowId = `history-steering-failed-${pairIndex}-${reqKey || jobKey}`;
+  const row = failedSteerRow(event, rowId, pairIndex);
+  if (!row) return;
+  const userMessage: MessageRecord = { ...row, isHistory: true };
+
+  setMessages((prev: MessageRecord[]) => {
+    const rawJobId = typeof event.job_id === 'string' && event.job_id ? event.job_id : null;
+    const lost = prev.flatMap((m, i) => {
+      const id = typeof m.id === 'string' ? m.id : '';
+      if (id === rowId) return [i];
+      if (
+        reqKey &&
+        ((m.role === 'user' && (m as { requestKey?: string }).requestKey === reqKey) ||
+          id === `failed-steer-${reqKey}` ||
+          id === `pending-steer-${reqKey}` ||
+          (id.startsWith('history-steering-failed-') && id.endsWith(`-${reqKey}`)))
+      ) {
+        return [i];
+      }
+      if (
+        rawJobId &&
+        (id === `failed-steer-${rawJobId}` ||
+          (id.startsWith('history-steering-failed-') && id.endsWith(`-${rawJobId}`)))
+      ) {
+        return [i];
+      }
+      return [];
+    });
+    const rest = lost.length === 0 ? prev : prev.filter((_, i) => !lost.includes(i));
+    const idx = newMessagesStartIndexRef.current - lost.filter((i) => i < newMessagesStartIndexRef.current).length;
+    const next = [...rest.slice(0, idx), userMessage, ...rest.slice(idx)];
+    newMessagesStartIndexRef.current = idx + 1;
+    return next;
+  });
+  onCopySettled?.(reqKey, row.artifactComments);
 }
 
 /** Task-artifact statuses the backend stamps onto replayed events. */

@@ -12,6 +12,10 @@ import {
 import { deliveredNoticeRow } from '../wakeupEvents';
 import { reportRow, senderProvenance } from '../provenance';
 import { readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
+import { opensTurn } from '../../components/messageList/messagePredicates';
+import { projectTurns } from '../../components/messageList/turnProjection';
+// DALTON-HOOK(chat-large-upload): normalize attachment metadata on delivered steers
+import { mergeAcceptedAttachments, normalizeAttachments } from '../../hooks/utils/messageHelpers';
 
 /** A delivery's entries, typed once where the loose event shapes are read. A
  *  steer's file comments are read here too, and dropped when unreadable. A
@@ -69,7 +73,9 @@ export function deliveredEntryRow(
     });
   }
   // A comment send's note may be empty: its comments are the message.
-  if (!entry.content && !entry.artifact_comments) return null;
+  // DALTON-HOOK(chat-large-upload): render file-only steers and normalize verified attachment metadata
+  const attachments = normalizeAttachments(entry.attachments);
+  if (!entry.content && !entry.artifact_comments && !attachments) return null;
   const provenance = senderProvenance({ origin: entry.origin, platform: entry.platform });
   return {
     id: rowId('user'),
@@ -83,6 +89,7 @@ export function deliveredEntryRow(
     ...(provenance ? { provenance } : {}),
     ...(entry.request_key ? { requestKey: entry.request_key } : {}),
     ...(entry.artifact_comments ? { artifactComments: entry.artifact_comments } : {}),
+    ...(attachments ? { attachments } : {}),
   };
 }
 
@@ -119,6 +126,14 @@ function claimDeliveredSteers(
     if (entry.artifact_comments) {
       claimed.content = entry.content;
       claimed.artifactComments = entry.artifact_comments;
+    }
+    // DALTON-HOOK(chat-large-upload): preserve original user text, normalized server metadata, and caller-owned blob fields
+    const mergedAttachments = Array.isArray(entry.attachments) && entry.attachments.length > 0
+      ? mergeAcceptedAttachments(claimed.attachments, entry.attachments)
+      : undefined;
+    if (mergedAttachments) {
+      claimed.content = entry.content;
+      claimed.attachments = mergedAttachments;
     }
     if (joinTurn && turn !== undefined) claimed.turnIndex = turn;
     if (next === messages) next = [...messages];
@@ -238,4 +253,198 @@ export function foldSteeringDelivery(
     clearedErrors,
     settledKeys,
   };
+}
+
+// DALTON-HOOK(chat-large-upload): build and idempotently fold permanently failed steer attachment notices
+export function failedSteerRow(
+  event: Record<string, unknown>,
+  id: string,
+  turnIndex: number | undefined,
+): UserMessage | null {
+  const errorText = typeof event.error === 'string' && event.error.trim()
+    ? event.error.trim()
+    : 'Attachment could not be delivered.';
+  const shownComments = event.artifact_comments !== undefined
+    ? readArtifactCommentsShown(event.artifact_comments)
+    : undefined;
+  const content = shownComments ? shownComments.note : String(event.content ?? '');
+  const attachments = normalizeAttachments(event.attachments);
+  if (!content && !shownComments && !attachments) return null;
+  const rawTs = event.timestamp;
+  const timestamp = typeof rawTs === 'number'
+    ? new Date(rawTs * 1000)
+    : typeof rawTs === 'string' && rawTs
+      ? new Date(rawTs)
+      : new Date();
+  const requestKey = typeof event.request_key === 'string' && event.request_key
+    ? event.request_key
+    : undefined;
+  return {
+    id,
+    role: 'user',
+    content,
+    contentType: 'text',
+    timestamp,
+    isStreaming: false,
+    steering: false,
+    steeringDelivered: false,
+    queueRefused: true,
+    queueError: errorText,
+    ...(turnIndex !== undefined ? { turnIndex } : {}),
+    ...(requestKey ? { requestKey } : {}),
+    ...(shownComments ? { artifactComments: shownComments } : {}),
+    ...(attachments ? { attachments } : {}),
+  };
+}
+
+export interface FoldFailedSteerOptions {
+  /** Oldest turn index currently loaded in the paged transcript window, if known. */
+  minLoadedTurn?: number | null;
+  /** Mark newly inserted durable rows as history bubbles so reloads/pagination reconcile cleanly. */
+  isHistory?: boolean;
+  /** Keep the history/live boundary ref aligned when inserting a history bubble before it. */
+  newMessagesStartIndexRef?: { current: number };
+}
+
+function matchesFailedSteerBubble(
+  m: ChatMessage,
+  requestKey: string | undefined,
+  jobId: string | undefined,
+  fallbackId: string,
+): boolean {
+  const id = typeof m.id === 'string' ? m.id : '';
+  if (id === fallbackId) return true;
+  if (requestKey) {
+    if (m.role === 'user' && (m as { requestKey?: string }).requestKey === requestKey) {
+      return true;
+    }
+    if (
+      id === `pending-steer-${requestKey}` ||
+      id === `failed-steer-${requestKey}` ||
+      (id.startsWith('history-steering-failed-') && id.endsWith(`-${requestKey}`))
+    ) {
+      return true;
+    }
+  }
+  if (jobId) {
+    if (
+      id === `failed-steer-${jobId}` ||
+      (id.startsWith('history-steering-failed-') && id.endsWith(`-${jobId}`))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function foldFailedSteer(
+  prev: ChatMessage[],
+  event: Record<string, unknown>,
+  turnIndex: number | undefined,
+  options?: FoldFailedSteerOptions,
+): ChatMessage[] {
+  const requestKey = typeof event.request_key === 'string' && event.request_key
+    ? event.request_key
+    : undefined;
+  const jobId = typeof event.job_id === 'string' && event.job_id
+    ? event.job_id
+    : undefined;
+  const keyOrJob = requestKey || jobId || String(event.timestamp ?? turnIndex ?? 0);
+  const fallbackId = options?.isHistory && turnIndex !== undefined
+    ? `history-steering-failed-${turnIndex}-${keyOrJob}`
+    : `failed-steer-${requestKey || jobId || String(turnIndex ?? 0)}`;
+  const baseRow = failedSteerRow(event, fallbackId, turnIndex);
+  if (!baseRow) return prev;
+  const row: UserMessage = options?.isHistory ? { ...baseRow, isHistory: true } : baseRow;
+
+  const matched: number[] = [];
+  prev.forEach((m, i) => {
+    if (matchesFailedSteerBubble(m, requestKey, jobId, fallbackId)) {
+      matched.push(i);
+    }
+  });
+
+  if (matched.length > 0) {
+    const keep = matched[0];
+    if (matched.length === 1) {
+      const existing = prev[keep] as UserMessage;
+      const nextTurn = turnIndex !== undefined ? turnIndex : existing.turnIndex;
+      if (
+        existing.queueRefused === true &&
+        existing.queueError === row.queueError &&
+        !existing.steering &&
+        !existing.steeringDelivered &&
+        existing.turnIndex === nextTurn &&
+        existing.content === (row.content || existing.content)
+      ) {
+        return prev;
+      }
+    }
+    const drop = new Set(matched.slice(1));
+    return prev.flatMap((m, i) => {
+      if (drop.has(i)) return [];
+      if (i !== keep) return [m];
+      const existing = m as UserMessage;
+      const mergedAtts = row.attachments
+        ? mergeAcceptedAttachments(existing.attachments, row.attachments)
+        : existing.attachments;
+      const updated: UserMessage = {
+        ...existing,
+        content: row.content || existing.content,
+        steering: false,
+        steeringDelivered: false,
+        queueRefused: true,
+        queueError: row.queueError,
+        ...(turnIndex !== undefined ? { turnIndex } : {}),
+        ...(requestKey && !existing.requestKey ? { requestKey } : {}),
+        ...(row.artifactComments ? { artifactComments: row.artifactComments } : {}),
+        ...(mergedAtts ? { attachments: mergedAtts } : {}),
+      };
+      return [updated];
+    });
+  }
+
+  const projected = projectTurns(prev);
+  let minProjectedTurn: number | null = null;
+  for (const p of projected) {
+    if (p.turnIndex !== null && (opensTurn(p.message) || p.message.role === 'assistant')) {
+      minProjectedTurn = minProjectedTurn === null ? p.turnIndex : Math.min(minProjectedTurn, p.turnIndex);
+    }
+  }
+  const effectiveMinTurn = typeof options?.minLoadedTurn === 'number'
+    ? options.minLoadedTurn
+    : minProjectedTurn;
+
+  if (turnIndex !== undefined && effectiveMinTurn !== null && turnIndex < effectiveMinTurn) {
+    return prev;
+  }
+
+  let insertAt = prev.length;
+  if (turnIndex !== undefined && projected.length > 0) {
+    let lastInTurn = -1;
+    let firstAfterTurn = -1;
+    for (const p of projected) {
+      if (p.turnIndex === null) continue;
+      if (p.turnIndex === turnIndex) {
+        lastInTurn = p.rawIndex;
+      } else if (p.turnIndex > turnIndex && firstAfterTurn === -1) {
+        firstAfterTurn = p.rawIndex;
+      }
+    }
+    if (lastInTurn !== -1) {
+      insertAt = lastInTurn + 1;
+    } else if (firstAfterTurn !== -1) {
+      insertAt = firstAfterTurn;
+    }
+  }
+
+  if (
+    options?.isHistory &&
+    options?.newMessagesStartIndexRef &&
+    insertAt <= options.newMessagesStartIndexRef.current
+  ) {
+    options.newMessagesStartIndexRef.current += 1;
+  }
+
+  return [...prev.slice(0, insertAt), row, ...prev.slice(insertAt)];
 }

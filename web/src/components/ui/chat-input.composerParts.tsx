@@ -150,17 +150,20 @@ export function DraftTokenLayer({
  * Chart image + file preview cards, in a row that stays mounted for the same
  * reason as the pills'.
  */
+// DALTON-HOOK(chat-large-upload): pass onRetryFile through to FilePreviewCard
 export function ComposerAttachments({
   chartImage,
   onRemoveChartImage,
   files,
   onRemoveFile,
+  onRetryFile,
   isMobile,
 }: {
   chartImage: string | null;
   onRemoveChartImage?: (() => void) | null;
   files: FileAttachment[];
   onRemoveFile: (id: string) => void;
+  onRetryFile?: (id: string) => void;
   isMobile: boolean;
 }) {
   const { t } = useTranslation();
@@ -184,11 +187,13 @@ export function ComposerAttachments({
             </button>
           </motion.div>
         )}
+        {/* DALTON-HOOK(chat-large-upload): wire per-card retry action for failed uploads */}
         {files.map((file) => (
           <FilePreviewCard
             key={file.id}
             file={file}
             onRemove={onRemoveFile}
+            onRetry={onRetryFile}
           />
         ))}
       </AnimatePresence>

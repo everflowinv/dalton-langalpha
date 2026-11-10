@@ -46,6 +46,10 @@ async def attach_request_files(
     config: Any,
     *,
     project: ProjectContext | None = None,
+    # DALTON-HOOK(chat-large-upload): caller and workspace identity for verified chat_upload materialization
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    is_existing_colleague_thread: bool = False,
 ) -> list[dict]:
     """Upload the turn's attachments and describe them to the PTC agent.
 
@@ -54,8 +58,32 @@ async def attach_request_files(
     blocks; a PDF it accepts goes in as a note with its page count once it is
     saved, and inline only when it is not.
     """
+    if request.hitl_response:
+        return messages
     multimodal_contexts = parse_multimodal_contexts(request.additional_context)
-    if not multimodal_contexts or request.hitl_response:
+    # DALTON-HOOK(chat-large-upload): extract server-stored chat_upload references alongside inline contexts
+    from src.dalton.services.chat_uploads import (
+        extract_chat_upload_contexts,
+        materialize_chat_uploads,
+    )
+
+    chat_upload_contexts = extract_chat_upload_contexts(request.additional_context)
+    if not multimodal_contexts and not chat_upload_contexts:
+        return messages
+    if not multimodal_contexts:
+        resolved_ws = workspace_id or (
+            str(project.workspace_id) if project and project.workspace_id else None
+        )
+        upload_notes = await materialize_chat_uploads(
+            chat_upload_contexts,
+            sandbox=session.sandbox if session else None,
+            user_id=user_id,
+            workspace_id=resolved_ws,
+            project=project,
+            is_existing_colleague_thread=is_existing_colleague_thread,
+        )
+        if upload_notes:
+            _append_to_last_user_message(messages, build_file_reminder(upload_notes))
         return messages
 
     # 1. Upload ALL files to sandbox
@@ -195,6 +223,22 @@ async def attach_request_files(
             f"[PTC_CHAT] {len(file_only)} file-only attachment(s) "
             f"uploaded to sandbox for {effective_model}"
         )
+
+    # DALTON-HOOK(chat-large-upload): materialize server-stored chat_upload items when sent alongside inline attachments
+    if chat_upload_contexts:
+        resolved_ws = workspace_id or (
+            str(project.workspace_id) if project and project.workspace_id else None
+        )
+        upload_notes = await materialize_chat_uploads(
+            chat_upload_contexts,
+            sandbox=session.sandbox if session else None,
+            user_id=user_id,
+            workspace_id=resolved_ws,
+            project=project,
+            is_existing_colleague_thread=is_existing_colleague_thread,
+        )
+        if upload_notes:
+            _append_to_last_user_message(messages, build_file_reminder(upload_notes))
 
     return messages
 

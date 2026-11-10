@@ -23,6 +23,8 @@ async def stub_lines(
     queries_by_turn: dict[Any, list[dict[str, Any]]],
     responses_by_turn: dict[Any, dict[str, Any]],
     open_runs: dict[Any, str] | None = None,
+    # DALTON-HOOK(chat-large-upload): replay permanently failed steers on stub/in-progress turns
+    failed_steers_by_turn: dict[Any, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[Any, list[Line]], list[Any]]:
     """Each turn as its user message, the stream its row archived when it
     kept one, and the terminal error or stop close the row records; and the
@@ -37,6 +39,8 @@ async def stub_lines(
     failed turn's stream sent.
     """
     open_runs = open_runs or {}
+    # DALTON-HOOK(chat-large-upload): pass failed_steers_by_turn into _stub_items
+    failed_by_turn = failed_steers_by_turn or {}
     responses_by_turn = await with_replay_facts(responses_by_turn, turn_indexes)
     lines = {
         ti: [
@@ -47,6 +51,7 @@ async def stub_lines(
                 queries_by_turn.get(ti, []),
                 responses_by_turn.get(ti),
                 open_runs.get(ti),
+                failed_by_turn.get(ti, []),
             )
         ]
         for ti in turn_indexes
@@ -75,21 +80,26 @@ def unavailable_item(thread_id: str) -> dict[str, Any]:
     }
 
 
+# DALTON-HOOK(chat-large-upload): include permanently failed steers in stub turn items
 def _stub_items(
     thread_id: str,
     turn_index: Any,
     queries: list[dict[str, Any]],
     response: dict[str, Any] | None,
     open_run: str | None,
+    failed_steers: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     response_id = str(response.get("conversation_response_id")) if response else None
     # A turn still going shows what its run streams; an archive on its row is
     # an earlier attempt's.
     archived = [] if open_run else archived_stream(response) or []
+    failed_items = [
+        items._failed_steer_item(thread_id, f) for f in (failed_steers or ())
+    ]
     closing = items.terminal_items(thread_id, response, archived)
     if not closing and _lost(response, open_run):
         closing.append(unavailable_item(thread_id))
-    turn_items = archived + closing
+    turn_items = archived + failed_items + closing
     for item in turn_items:
         items._enrich(item, thread_id, turn_index, response_id)
     return [

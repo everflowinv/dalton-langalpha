@@ -356,6 +356,9 @@ ALLOWED_HOOKS=(
   "ui-model-pick"
   # Forked replies keep a unique bubble identifier throughout checkpoint loading.
   "fork-message-identifiers"
+  # Chat composer large-file multipart uploads (<=200 MiB) stored under chat-uploads/
+  # and materialized into sandbox work/uploads/ without inline base64 payloads.
+  "chat-large-upload"
   # AU1 Batch 1: company system identity external auth refusal, automation scope
   # classification/backfill, scoped read-only listing, and modification history.
   "company-automations"

@@ -322,6 +322,17 @@ def serialize_context_metadata(
                 serialized_ctx.append({"type": "skills", "name": ctx.name})
             elif ctx_type == "directive":
                 serialized_ctx.append({"type": "directive", "content": ctx.content})
+            # DALTON-HOOK(chat-large-upload): persist lightweight upload_id reference (never file bytes)
+            elif ctx_type == "chat_upload":
+                serialized_ctx.append(
+                    {
+                        "type": "chat_upload",
+                        "upload_id": ctx.upload_id,
+                        "name": ctx.name,
+                        "mime_type": ctx.mime_type,
+                        "size": ctx.size,
+                    }
+                )
         if serialized_ctx:
             query_metadata["additional_context"] = serialized_ctx
 
