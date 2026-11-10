@@ -1177,6 +1177,7 @@ async def claim_target_delivery(
                 VALUES (%s, %s, %s, %s, %s, %s, 'pending', 1, %s)
                 ON CONFLICT (execution_id, channel, target) DO UPDATE
                 SET status = 'pending',
+                    error_code = NULL,
                     attempt_count = dalton_notify_deliveries.attempt_count + 1,
                     payload_json = (
                         CASE
@@ -1256,13 +1257,18 @@ async def mark_target_delivery(
     error_code: str | None = None,
     reason: str | None = None,
     expected_status: str | Sequence[str] | None = None,
+    expected_attempt_count: int | None = None,
+    expected_updated_at: Any = None,
+    exclude_uncertain_data_task: bool = False,
 ) -> bool:
     """Update delivery status (``pending``, ``sent``, ``failed``, or ``skipped``) in ``dalton_notify_deliveries``.
 
     When ``expected_status`` is provided as a single status (e.g. ``'pending'``) or a
     sequence of statuses (e.g. ``('failed', 'pending')``), the ``UPDATE`` includes
     ``AND status = %s`` or ``AND status IN (...)`` so a completed ``sent`` row is never
-    overwritten. Returns ``True`` iff a row was updated.
+    overwritten. Optional ``expected_attempt_count``, ``expected_updated_at``, and
+    ``exclude_uncertain_data_task`` guards prevent stale retry scanners from overwriting
+    concurrently claimed or uncertain rows. Returns ``True`` iff a row was updated.
     """
     exec_id = (execution_id or "").strip()
     ch = (channel or "").strip().lower()
@@ -1288,47 +1294,97 @@ async def mark_target_delivery(
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            if len(exp_statuses) == 1:
-                await cur.execute(
-                    """
-                    UPDATE dalton_notify_deliveries
-                    SET status = %s,
-                        error_code = %s,
-                        updated_at = NOW()
-                    WHERE execution_id = %s
-                      AND channel = %s
-                      AND target = %s
-                      AND status = %s
-                    """,
-                    (status, effective_code, exec_id, ch, tgt, exp_statuses[0]),
-                )
-            elif len(exp_statuses) > 1:
-                placeholders = ", ".join(["%s"] * len(exp_statuses))
+            if (
+                expected_attempt_count is None
+                and expected_updated_at is None
+                and not exclude_uncertain_data_task
+            ):
+                if len(exp_statuses) == 1:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_notify_deliveries
+                        SET status = %s,
+                            error_code = %s,
+                            updated_at = NOW()
+                        WHERE execution_id = %s
+                          AND channel = %s
+                          AND target = %s
+                          AND status = %s
+                        """,
+                        (status, effective_code, exec_id, ch, tgt, exp_statuses[0]),
+                    )
+                elif len(exp_statuses) > 1:
+                    placeholders = ", ".join(["%s"] * len(exp_statuses))
+                    await cur.execute(
+                        f"""
+                        UPDATE dalton_notify_deliveries
+                        SET status = %s,
+                            error_code = %s,
+                            updated_at = NOW()
+                        WHERE execution_id = %s
+                          AND channel = %s
+                          AND target = %s
+                          AND status IN ({placeholders})
+                        """,
+                        (status, effective_code, exec_id, ch, tgt, *exp_statuses),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_notify_deliveries
+                        SET status = %s,
+                            error_code = %s,
+                            updated_at = NOW()
+                        WHERE execution_id = %s
+                          AND channel = %s
+                          AND target = %s
+                        """,
+                        (status, effective_code, exec_id, ch, tgt),
+                    )
+            else:
+                clauses: list[str] = [
+                    "execution_id = %s",
+                    "channel = %s",
+                    "target = %s",
+                ]
+                params_list: list[Any] = [status, effective_code, exec_id, ch, tgt]
+                if len(exp_statuses) == 1:
+                    clauses.append("status = %s")
+                    params_list.append(exp_statuses[0])
+                elif len(exp_statuses) > 1:
+                    placeholders = ", ".join(["%s"] * len(exp_statuses))
+                    clauses.append(f"status IN ({placeholders})")
+                    params_list.extend(exp_statuses)
+                elif status != "sent":
+                    clauses.append("status <> 'sent'")
+                if expected_attempt_count is not None:
+                    clauses.append("attempt_count = %s")
+                    params_list.append(int(expected_attempt_count))
+                if expected_updated_at is not None:
+                    clauses.append("updated_at = %s")
+                    params_list.append(expected_updated_at)
+                if exclude_uncertain_data_task:
+                    clauses.append(
+                        """NOT (
+                            status = 'pending'
+                            AND (
+                                COALESCE(automation_id, '') LIKE 'data:%%'
+                                OR COALESCE(payload_json ->> 'route_key', '') LIKE 'data:%%'
+                            )
+                            AND COALESCE(error_code, '') = ANY(%s)
+                        )"""
+                    )
+                    params_list.append(sorted(UNCERTAIN_NOTIFY_ERROR_CODES))
+                where_sql = "\n                      AND ".join(clauses)
                 await cur.execute(
                     f"""
                     UPDATE dalton_notify_deliveries
                     SET status = %s,
                         error_code = %s,
                         updated_at = NOW()
-                    WHERE execution_id = %s
-                      AND channel = %s
-                      AND target = %s
-                      AND status IN ({placeholders})
+                    WHERE {where_sql}
                     """,
-                    (status, effective_code, exec_id, ch, tgt, *exp_statuses),
-                )
-            else:
-                await cur.execute(
-                    """
-                    UPDATE dalton_notify_deliveries
-                    SET status = %s,
-                        error_code = %s,
-                        updated_at = NOW()
-                    WHERE execution_id = %s
-                      AND channel = %s
-                      AND target = %s
-                    """,
-                    (status, effective_code, exec_id, ch, tgt),
+                    tuple(params_list),
                 )
             updated_rows = (
                 cur.rowcount if isinstance(cur.rowcount, int) else 0
@@ -1404,26 +1460,47 @@ async def _invoke_mark_delivery(
     error_code: str | None = None,
     reason: str | None = None,
     expected_status: str | Sequence[str] | None = None,
+    expected_attempt_count: int | None = None,
+    expected_updated_at: Any = None,
+    exclude_uncertain_data_task: bool = False,
 ) -> bool:
     effective_code = reason if reason is not None else error_code
     kwargs: dict[str, Any] = {
         "status": status,
         "error_code": effective_code,
     }
-    try:
-        sig = inspect.signature(mark_fn)
-        has_var_kw = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in sig.parameters.values()
-        )
-        if reason is not None and ("reason" in sig.parameters or has_var_kw):
-            kwargs["reason"] = reason
-        if expected_status is not None and (
-            "expected_status" in sig.parameters or has_var_kw
-        ):
-            kwargs["expected_status"] = expected_status
-    except (ValueError, TypeError):
-        pass
+    side_effect = getattr(mark_fn, "side_effect", None)
+    eff_fn = side_effect if callable(side_effect) else mark_fn
+    if (
+        reason is not None
+        and _callable_accepts_kwarg(mark_fn, "reason")
+        and _callable_accepts_kwarg(eff_fn, "reason")
+    ):
+        kwargs["reason"] = reason
+    if (
+        expected_status is not None
+        and _callable_accepts_kwarg(mark_fn, "expected_status")
+        and _callable_accepts_kwarg(eff_fn, "expected_status")
+    ):
+        kwargs["expected_status"] = expected_status
+    if (
+        expected_attempt_count is not None
+        and _callable_accepts_kwarg(mark_fn, "expected_attempt_count")
+        and _callable_accepts_kwarg(eff_fn, "expected_attempt_count")
+    ):
+        kwargs["expected_attempt_count"] = expected_attempt_count
+    if (
+        expected_updated_at is not None
+        and _callable_accepts_kwarg(mark_fn, "expected_updated_at")
+        and _callable_accepts_kwarg(eff_fn, "expected_updated_at")
+    ):
+        kwargs["expected_updated_at"] = expected_updated_at
+    if (
+        exclude_uncertain_data_task
+        and _callable_accepts_kwarg(mark_fn, "exclude_uncertain_data_task")
+        and _callable_accepts_kwarg(eff_fn, "exclude_uncertain_data_task")
+    ):
+        kwargs["exclude_uncertain_data_task"] = True
     res = await mark_fn(
         execution_id,
         channel,
@@ -1431,6 +1508,45 @@ async def _invoke_mark_delivery(
         **kwargs,
     )
     return res if isinstance(res, bool) else True
+
+
+_pending_mark_cleanup: set[asyncio.Future[Any]] = set()
+
+
+def _finish_mark_cleanup(task: asyncio.Future[Any]) -> None:
+    _pending_mark_cleanup.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _run_shielded_mark(
+    coro: Awaitable[Any],
+    *,
+    timeout_s: float = 3.0,
+) -> None:
+    """Allow a write to finish within its deadline, preserving caller cancellation."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(timeout_s))
+    task = asyncio.ensure_future(coro)
+    cancelled_exc: asyncio.CancelledError | None = None
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError as exc:
+            if cancelled_exc is None:
+                cancelled_exc = exc
+    if task.done():
+        _finish_mark_cleanup(task)
+    else:
+        # Keep cancellation cleanup alive without extending the caller's deadline.
+        _pending_mark_cleanup.add(task)
+        task.add_done_callback(_finish_mark_cleanup)
+        task.cancel()
+    if cancelled_exc is not None:
+        raise cancelled_exc
 
 
 async def _shielded_mark_failed(
@@ -1442,27 +1558,51 @@ async def _shielded_mark_failed(
     error_code: str = "CancelledError",
     reason: str | None = None,
     expected_status: str | Sequence[str] | None = "pending",
+    expected_attempt_count: int | None = None,
     timeout_s: float = 3.0,
 ) -> None:
     """Mark a claimed row ``failed`` under ``asyncio.shield`` with a ``timeout_s`` deadline."""
-    try:
-        await asyncio.wait_for(
-            asyncio.shield(
-                _invoke_mark_delivery(
-                    mark_fn,
-                    execution_id,
-                    channel,
-                    target,
-                    status="failed",
-                    error_code=error_code,
-                    reason=reason,
-                    expected_status=expected_status,
-                )
-            ),
-            timeout=timeout_s,
-        )
-    except (Exception, asyncio.CancelledError):
-        pass
+    await _run_shielded_mark(
+        _invoke_mark_delivery(
+            mark_fn,
+            execution_id,
+            channel,
+            target,
+            status="failed",
+            error_code=error_code,
+            reason=reason,
+            expected_status=expected_status,
+            expected_attempt_count=expected_attempt_count,
+        ),
+        timeout_s=timeout_s,
+    )
+
+
+async def _shielded_mark_uncertain(
+    mark_fn: Callable[..., Awaitable[Any]],
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    error_code: str = "delivery_uncertain",
+    expected_status: str | Sequence[str] | None = "pending",
+    expected_attempt_count: int | None = None,
+    timeout_s: float = 3.0,
+) -> None:
+    """Persist ``status='pending'`` with an uncertain ``error_code`` under ``asyncio.shield``."""
+    await _run_shielded_mark(
+        _invoke_mark_delivery(
+            mark_fn,
+            execution_id,
+            channel,
+            target,
+            status="pending",
+            error_code=error_code,
+            expected_status=expected_status,
+            expected_attempt_count=expected_attempt_count,
+        ),
+        timeout_s=timeout_s,
+    )
 
 
 async def claim_execution_notify(
@@ -1956,6 +2096,7 @@ async def retry_failed_notify_deliveries(
                     SELECT d.execution_id, d.automation_id, d.user_id,
                            d.channel, d.target, d.status, d.attempt_count,
                            d.error_code,
+                           d.updated_at,
                            d.payload_json,
                            a.name AS automation_name,
                            a.metadata AS automation_metadata,
@@ -2008,6 +2149,16 @@ async def retry_failed_notify_deliveries(
             tgt = str(row.get("target") or "").strip()
             user_id = str(row.get("user_id") or "").strip()
             row_error_code = str(row.get("error_code") or "").strip()
+            row_updated_at = row.get("updated_at")
+            raw_row_status = str(row.get("status") or "").strip().lower()
+            skip_expected_status: str | tuple[str, ...] = (
+                raw_row_status
+                if (
+                    mark_delivery_fn is mark_target_delivery
+                    and raw_row_status in ("failed", "pending")
+                )
+                else ("failed", "pending")
+            )
             try:
                 attempt_count = int(row.get("attempt_count") or 0)
             except (TypeError, ValueError):
@@ -2034,14 +2185,18 @@ async def retry_failed_notify_deliveries(
             ) or raw_route_key.lower().startswith("data:")
 
             row_claimed = False
+            claimed_attempt_count: int | None = None
+            use_gateway_transport = False
+            native_send_started = False
+            transport_outcome_uncertain_or_sent = False
+            uncertain_error_code = "delivery_uncertain"
             try:
                 if is_data_task_row and is_uncertain_notify_error_code(row_error_code):
                     continue
                 if attempt_count >= max_attempts:
                     async with get_db_connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
-                            await cur.execute(
-                                """
+                            exhausted_sql = """
                                 UPDATE dalton_notify_deliveries
                                 SET status = 'failed',
                                     error_code = 'attempts_exhausted',
@@ -2057,17 +2212,25 @@ async def retry_failed_notify_deliveries(
                                       )
                                       OR COALESCE(error_code, '') <> ALL(%s)
                                   )
+                                  AND attempt_count = %s
                                   AND attempt_count >= %s
                                   AND updated_at <= NOW() - make_interval(mins => %s)
-                                """,
-                                (
-                                    exec_id,
-                                    ch,
-                                    tgt,
-                                    uncertain_codes_list,
-                                    max_attempts,
-                                    stale_pending_minutes,
-                                ),
+                            """
+                            exhausted_params: list[Any] = [
+                                exec_id,
+                                ch,
+                                tgt,
+                                uncertain_codes_list,
+                                attempt_count,
+                                max_attempts,
+                                stale_pending_minutes,
+                            ]
+                            if row_updated_at is not None:
+                                exhausted_sql += "\n                                  AND updated_at = %s"
+                                exhausted_params.append(row_updated_at)
+                            await cur.execute(
+                                exhausted_sql,
+                                tuple(exhausted_params),
                             )
                             updated_rows = (
                                 cur.rowcount
@@ -2087,6 +2250,9 @@ async def retry_failed_notify_deliveries(
                             reason="attempts_exhausted",
                             error_code="attempts_exhausted",
                             expected_status="pending",
+                            expected_attempt_count=attempt_count,
+                            expected_updated_at=row_updated_at,
+                            exclude_uncertain_data_task=True,
                         )
                     continue
 
@@ -2120,7 +2286,10 @@ async def retry_failed_notify_deliveries(
                             status="skipped",
                             reason="task_disabled",
                             error_code="task_disabled",
-                            expected_status=("failed", "pending"),
+                            expected_status=skip_expected_status,
+                            expected_attempt_count=attempt_count,
+                            expected_updated_at=row_updated_at,
+                            exclude_uncertain_data_task=True,
                         )
                         if skipped_updated:
                             logger.info(
@@ -2148,7 +2317,10 @@ async def retry_failed_notify_deliveries(
                         status="skipped",
                         reason=skip_reason or "toggle_off",
                         error_code=skip_reason or "toggle_off",
-                        expected_status=("failed", "pending"),
+                        expected_status=skip_expected_status,
+                        expected_attempt_count=attempt_count,
+                        expected_updated_at=row_updated_at,
+                        exclude_uncertain_data_task=True,
                     )
                     if skipped_updated:
                         logger.info(
@@ -2160,10 +2332,10 @@ async def retry_failed_notify_deliveries(
 
                 async with get_db_connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
+                        claim_sql = """
                             UPDATE dalton_notify_deliveries
                             SET status = 'pending',
+                                error_code = NULL,
                                 attempt_count = attempt_count + 1,
                                 updated_at = NOW()
                             WHERE execution_id = %s
@@ -2183,28 +2355,44 @@ async def retry_failed_notify_deliveries(
                                       AND updated_at <= NOW() - make_interval(mins => %s)
                                   )
                               )
+                              AND attempt_count = %s
                               AND attempt_count < %s
-                            RETURNING attempt_count, payload_json
-                            """,
-                            (
-                                exec_id,
-                                ch,
-                                tgt,
-                                uncertain_codes_list,
-                                stale_pending_minutes,
-                                max_attempts,
-                            ),
+                        """
+                        claim_params: list[Any] = [
+                            exec_id,
+                            ch,
+                            tgt,
+                            uncertain_codes_list,
+                            stale_pending_minutes,
+                            attempt_count,
+                            max_attempts,
+                        ]
+                        if row_updated_at is not None:
+                            claim_sql += "      AND updated_at = %s\n                        "
+                            claim_params.append(row_updated_at)
+                        claim_sql += "    RETURNING attempt_count, payload_json"
+                        await cur.execute(
+                            claim_sql,
+                            tuple(claim_params),
                         )
                         claimed_row = await cur.fetchone()
                         if claimed_row is not None:
                             row_claimed = True
-                            if isinstance(claimed_row, Mapping) and isinstance(
-                                claimed_row.get("payload_json"), Mapping
-                            ):
-                                if isinstance(payload, MutableMapping):
-                                    payload.update(claimed_row["payload_json"])
-                                else:
-                                    payload = dict(claimed_row["payload_json"])
+                            if isinstance(claimed_row, Mapping):
+                                try:
+                                    claimed_attempt_count = int(
+                                        claimed_row.get("attempt_count")
+                                        or (attempt_count + 1)
+                                    )
+                                except (TypeError, ValueError):
+                                    claimed_attempt_count = attempt_count + 1
+                                if isinstance(claimed_row.get("payload_json"), Mapping):
+                                    if isinstance(payload, MutableMapping):
+                                        payload.update(claimed_row["payload_json"])
+                                    else:
+                                        payload = dict(claimed_row["payload_json"])
+                            else:
+                                claimed_attempt_count = attempt_count + 1
                 if not row_claimed:
                     continue
 
@@ -2219,6 +2407,7 @@ async def retry_failed_notify_deliveries(
                     is_data_task_row and post_notify_fn is post_bridge_notify
                 )
                 if use_gateway_transport:
+                    native_send_started = True
                     bridge_res = await asyncio.wait_for(
                         data_task_notify_fn([tgt], run_id=exec_id),
                         timeout=remaining_s,
@@ -2238,6 +2427,8 @@ async def retry_failed_notify_deliveries(
                     )
                 uncertain_code = extract_target_uncertain_code(tgt, bridge_res)
                 if uncertain_code is not None:
+                    uncertain_error_code = uncertain_code
+                    transport_outcome_uncertain_or_sent = True
                     await _invoke_mark_delivery(
                         mark_delivery_fn,
                         exec_id,
@@ -2246,6 +2437,7 @@ async def retry_failed_notify_deliveries(
                         status="pending",
                         error_code=uncertain_code,
                         expected_status="pending",
+                        expected_attempt_count=claimed_attempt_count,
                     )
                     row_claimed = False
                     continue
@@ -2253,6 +2445,8 @@ async def retry_failed_notify_deliveries(
                 if isinstance(bridge_res, Mapping) and str(
                     bridge_res.get("status") or ""
                 ).strip().lower() == "skipped":
+                    native_send_started = False
+                    transport_outcome_uncertain_or_sent = False
                     skip_code = str(
                         bridge_res.get("error_code")
                         or bridge_res.get("code")
@@ -2267,12 +2461,15 @@ async def retry_failed_notify_deliveries(
                         reason=skip_code,
                         error_code=skip_code,
                         expected_status="pending",
+                        expected_attempt_count=claimed_attempt_count,
                     )
                     row_claimed = False
                     continue
 
                 outcomes, batch_err = _evaluate_target_results([tgt], bridge_res)
                 if outcomes.get(tgt) is True:
+                    uncertain_error_code = "delivery_uncertain"
+                    transport_outcome_uncertain_or_sent = True
                     await _invoke_mark_delivery(
                         mark_delivery_fn,
                         exec_id,
@@ -2281,9 +2478,12 @@ async def retry_failed_notify_deliveries(
                         status="sent",
                         error_code=None,
                         expected_status="pending",
+                        expected_attempt_count=claimed_attempt_count,
                     )
                     sent_count += 1
                 else:
+                    native_send_started = False
+                    transport_outcome_uncertain_or_sent = False
                     await _invoke_mark_delivery(
                         mark_delivery_fn,
                         exec_id,
@@ -2292,48 +2492,65 @@ async def retry_failed_notify_deliveries(
                         status="failed",
                         error_code=batch_err or "target_failed",
                         expected_status="pending",
+                        expected_attempt_count=claimed_attempt_count,
                     )
                 row_claimed = False
             except asyncio.CancelledError:
                 if row_claimed:
-                    if is_data_task_row and is_uncertain_notify_error_code(row_error_code):
-                        await _invoke_mark_delivery(
-                            mark_delivery_fn,
-                            exec_id,
-                            ch,
-                            tgt,
-                            status="pending",
-                            error_code=row_error_code,
-                            expected_status="pending",
-                        )
-                    else:
-                        await _shielded_mark_failed(
-                            mark_delivery_fn,
-                            exec_id,
-                            ch,
-                            tgt,
-                            error_code="CancelledError",
-                            expected_status="pending",
-                        )
-                    row_claimed = False
+                    try:
+                        if use_gateway_transport and native_send_started:
+                            await _shielded_mark_uncertain(
+                                mark_delivery_fn,
+                                exec_id,
+                                ch,
+                                tgt,
+                                error_code=uncertain_error_code,
+                                expected_status="pending",
+                                expected_attempt_count=claimed_attempt_count,
+                            )
+                        else:
+                            await _shielded_mark_failed(
+                                mark_delivery_fn,
+                                exec_id,
+                                ch,
+                                tgt,
+                                error_code="CancelledError",
+                                expected_status="pending",
+                                expected_attempt_count=claimed_attempt_count,
+                            )
+                    finally:
+                        row_claimed = False
                 raise
             except Exception as retry_exc:
                 is_timeout_exc = isinstance(
-                    retry_exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)
-                ) and not isinstance(retry_exc, httpx.ConnectTimeout)
-                preserve_uncertain = is_uncertain_notify_error_code(row_error_code) or (
-                    is_data_task_row
-                    and post_notify_fn is post_bridge_notify
-                    and is_timeout_exc
+                    retry_exc,
+                    (
+                        asyncio.TimeoutError,
+                        TimeoutError,
+                        httpx.TimeoutException,
+                        httpx.TransportError,
+                    ),
+                ) and not isinstance(
+                    retry_exc, (httpx.ConnectTimeout, httpx.ConnectError)
+                )
+                exc_code = getattr(retry_exc, "code", None)
+                preserve_uncertain = bool(
+                    use_gateway_transport
+                    and native_send_started
+                    and (
+                        transport_outcome_uncertain_or_sent
+                        or is_timeout_exc
+                        or is_uncertain_notify_error_code(exc_code)
+                    )
                 )
                 status_code = getattr(
                     getattr(retry_exc, "response", None), "status_code", None
                 )
                 err_code = (
-                    row_error_code
-                    if is_uncertain_notify_error_code(row_error_code)
+                    str(exc_code)
+                    if is_uncertain_notify_error_code(exc_code)
                     else (
-                        "delivery_uncertain"
+                        uncertain_error_code
                         if preserve_uncertain
                         else (
                             f"http_{status_code}"
@@ -2345,30 +2562,43 @@ async def retry_failed_notify_deliveries(
                 target_status = "pending" if preserve_uncertain else "failed"
                 if row_claimed:
                     try:
-                        await _invoke_mark_delivery(
-                            mark_delivery_fn,
-                            exec_id,
-                            ch,
-                            tgt,
-                            status=target_status,
-                            error_code=err_code,
-                            expected_status="pending",
-                        )
-                    except asyncio.CancelledError:
-                        if not preserve_uncertain:
-                            await _shielded_mark_failed(
+                        if preserve_uncertain:
+                            await _shielded_mark_uncertain(
                                 mark_delivery_fn,
                                 exec_id,
                                 ch,
                                 tgt,
                                 error_code=err_code,
                                 expected_status="pending",
+                                expected_attempt_count=claimed_attempt_count,
                             )
+                        else:
+                            try:
+                                await _invoke_mark_delivery(
+                                    mark_delivery_fn,
+                                    exec_id,
+                                    ch,
+                                    tgt,
+                                    status=target_status,
+                                    error_code=err_code,
+                                    expected_status="pending",
+                                    expected_attempt_count=claimed_attempt_count,
+                                )
+                            except asyncio.CancelledError:
+                                await _shielded_mark_failed(
+                                    mark_delivery_fn,
+                                    exec_id,
+                                    ch,
+                                    tgt,
+                                    error_code=err_code,
+                                    expected_status="pending",
+                                    expected_attempt_count=claimed_attempt_count,
+                                )
+                                raise
+                            except Exception:
+                                pass
+                    finally:
                         row_claimed = False
-                        raise
-                    except Exception:
-                        pass
-                    row_claimed = False
                 logger.warning(
                     "[DALTON_NOTIFY] Retry row failed for execution_id=%s: error_type=%s",
                     exec_id,

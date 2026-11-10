@@ -16,6 +16,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+import httpx
 import psycopg
 from psycopg.rows import dict_row
 
@@ -68,12 +69,15 @@ from src.dalton.data_jobs.runner_wrapper import (
 from src.dalton.data_jobs.safe_fs import SafeFsError
 from src.dalton.notify.channel_transport import (
     extract_target_uncertain_code,
+    is_uncertain_notify_error_code,
     post_data_task_gateway_notify,
 )
 from src.dalton.notify.dispatch import (
+    _callable_accepts_kwarg,
     _evaluate_target_results,
     _invoke_mark_delivery,
     _shielded_mark_failed,
+    _shielded_mark_uncertain,
     _split_target_channel,
     claim_target_delivery,
     dispatch_target_with_payload,
@@ -2766,42 +2770,50 @@ async def dispatch_data_task_run_notification(
                 continue
             local_by_target[(ch, cleaned_tgt)] = "pending"
             pending_targets.append((ch, cleaned_tgt))
+            active_native_target: tuple[str, str] | None = None
+            active_uncertain_code = "delivery_uncertain"
+            transport_outcome_uncertain_or_sent = False
 
-            if claim_target_fn is claim_target_delivery:
-                from src.dalton.database.data_task_notifications import (
-                    ensure_outer_reconcile_identity_persisted,
-                )
-
-                persisted_rec = await ensure_outer_reconcile_identity_persisted(
-                    run_id=str(run_id),
-                    channel=ch,
-                    target=cleaned_tgt,
-                    owner_user_id=pm_user_id,
-                    payload=target_payload,
-                )
-                if isinstance(persisted_rec, Mapping):
-                    if persisted_rec.get("conflict") is True:
-                        conflict_code = str(
-                            persisted_rec.get("code") or "recipient_identity_conflict"
-                        )
-                        await _invoke_mark_delivery(
-                            mark_target_fn,
-                            str(run_id),
-                            ch,
-                            cleaned_tgt,
-                            status="failed",
-                            error_code=conflict_code,
-                            expected_status="pending",
-                        )
-                        local_by_target[(ch, cleaned_tgt)] = "failed"
-                        if (ch, cleaned_tgt) in pending_targets:
-                            pending_targets.remove((ch, cleaned_tgt))
-                        continue
-                    target_payload.update(persisted_rec)
-
-            await check_scheduler_lock(lock_conn)
             try:
-                if post_notify_fn is post_data_task_gateway_notify:
+                if claim_target_fn is claim_target_delivery:
+                    from src.dalton.database.data_task_notifications import (
+                        ensure_outer_reconcile_identity_persisted,
+                    )
+
+                    persisted_rec = await ensure_outer_reconcile_identity_persisted(
+                        run_id=str(run_id),
+                        channel=ch,
+                        target=cleaned_tgt,
+                        owner_user_id=pm_user_id,
+                        payload=target_payload,
+                    )
+                    if isinstance(persisted_rec, Mapping):
+                        if persisted_rec.get("conflict") is True:
+                            conflict_code = str(
+                                persisted_rec.get("code")
+                                or "recipient_identity_conflict"
+                            )
+                            await _invoke_mark_delivery(
+                                mark_target_fn,
+                                str(run_id),
+                                ch,
+                                cleaned_tgt,
+                                status="failed",
+                                error_code=conflict_code,
+                                expected_status="pending",
+                            )
+                            local_by_target[(ch, cleaned_tgt)] = "failed"
+                            if (ch, cleaned_tgt) in pending_targets:
+                                pending_targets.remove((ch, cleaned_tgt))
+                            continue
+                        target_payload.update(persisted_rec)
+
+                await check_scheduler_lock(lock_conn)
+                if (
+                    post_notify_fn is post_data_task_gateway_notify
+                    or _callable_accepts_kwarg(post_notify_fn, "gateway_url")
+                ):
+                    active_native_target = (ch, cleaned_tgt)
                     bridge_res = await post_notify_fn(
                         [cleaned_tgt],
                         run_id=str(run_id),
@@ -2817,101 +2829,172 @@ async def dispatch_data_task_run_notification(
                         channel=ch,
                         check_lock_fn=lambda: check_scheduler_lock(lock_conn),
                     )
-            except asyncio.CancelledError:
-                for rem_ch, rem_tgt in list(pending_targets):
+
+                target_skip_reason = _extract_target_skip_reason(
+                    cleaned_tgt, bridge_res
+                )
+                if target_skip_reason is not None:
+                    active_native_target = None
+                    transport_outcome_uncertain_or_sent = False
+                    await _invoke_mark_delivery(
+                        mark_target_fn,
+                        str(run_id),
+                        ch,
+                        cleaned_tgt,
+                        status="skipped",
+                        reason=target_skip_reason,
+                        error_code=target_skip_reason,
+                        expected_status="pending",
+                    )
+                    local_by_target[(ch, cleaned_tgt)] = "skipped"
+                    if (ch, cleaned_tgt) in pending_targets:
+                        pending_targets.remove((ch, cleaned_tgt))
+                    continue
+
+                uncertain_code = extract_target_uncertain_code(
+                    cleaned_tgt, bridge_res
+                )
+                if uncertain_code is not None:
+                    active_native_target = (ch, cleaned_tgt)
+                    active_uncertain_code = uncertain_code
+                    transport_outcome_uncertain_or_sent = True
+                    await _invoke_mark_delivery(
+                        mark_target_fn,
+                        str(run_id),
+                        ch,
+                        cleaned_tgt,
+                        status="pending",
+                        error_code=uncertain_code,
+                        expected_status="pending",
+                    )
+                    local_by_target[(ch, cleaned_tgt)] = "pending"
+                    if (ch, cleaned_tgt) in pending_targets:
+                        pending_targets.remove((ch, cleaned_tgt))
+                    continue
+
+                outcomes, batch_err = _evaluate_target_results(
+                    [cleaned_tgt], bridge_res
+                )
+                if outcomes.get(cleaned_tgt) is True:
+                    active_native_target = (ch, cleaned_tgt)
+                    active_uncertain_code = "delivery_uncertain"
+                    transport_outcome_uncertain_or_sent = True
+                    await _invoke_mark_delivery(
+                        mark_target_fn,
+                        str(run_id),
+                        ch,
+                        cleaned_tgt,
+                        status="sent",
+                        error_code=None,
+                        expected_status="pending",
+                    )
+                    local_by_target[(ch, cleaned_tgt)] = "sent"
+                else:
+                    active_native_target = None
+                    transport_outcome_uncertain_or_sent = False
+                    err_code = _extract_target_error_code(
+                        cleaned_tgt, bridge_res, batch_err
+                    )
                     await _shielded_mark_failed(
                         mark_target_fn,
                         str(run_id),
-                        rem_ch,
-                        rem_tgt,
-                        error_code="CancelledError",
+                        ch,
+                        cleaned_tgt,
+                        error_code=err_code,
                         expected_status="pending",
                     )
-                    local_by_target[(rem_ch, rem_tgt)] = "failed"
+                    local_by_target[(ch, cleaned_tgt)] = "failed"
+                if (ch, cleaned_tgt) in pending_targets:
+                    pending_targets.remove((ch, cleaned_tgt))
+            except asyncio.CancelledError:
+                for rem_ch, rem_tgt in list(pending_targets):
+                    try:
+                        if (rem_ch, rem_tgt) == active_native_target:
+                            await _shielded_mark_uncertain(
+                                mark_target_fn,
+                                str(run_id),
+                                rem_ch,
+                                rem_tgt,
+                                error_code=active_uncertain_code,
+                                expected_status="pending",
+                            )
+                            local_by_target[(rem_ch, rem_tgt)] = "pending"
+                        else:
+                            await _shielded_mark_failed(
+                                mark_target_fn,
+                                str(run_id),
+                                rem_ch,
+                                rem_tgt,
+                                error_code="CancelledError",
+                                expected_status="pending",
+                            )
+                            local_by_target[(rem_ch, rem_tgt)] = "failed"
+                    except asyncio.CancelledError:
+                        pass
                 pending_targets.clear()
                 raise
             except SchedulerLockLostError:
                 raise
             except Exception as post_exc:
-                status_code = getattr(
-                    getattr(post_exc, "response", None), "status_code", None
+                is_timeout_exc = isinstance(
+                    post_exc,
+                    (
+                        asyncio.TimeoutError,
+                        TimeoutError,
+                        httpx.TimeoutException,
+                        httpx.TransportError,
+                    ),
+                ) and not isinstance(
+                    post_exc, (httpx.ConnectTimeout, httpx.ConnectError)
                 )
-                err_code = (
-                    f"http_{status_code}"
-                    if status_code
-                    else type(post_exc).__name__
+                exc_code = getattr(post_exc, "code", None)
+                preserve_uncertain = bool(
+                    active_native_target == (ch, cleaned_tgt)
+                    and (
+                        transport_outcome_uncertain_or_sent
+                        or is_timeout_exc
+                        or is_uncertain_notify_error_code(exc_code)
+                    )
                 )
-                await _shielded_mark_failed(
-                    mark_target_fn,
-                    str(run_id),
-                    ch,
-                    cleaned_tgt,
-                    error_code=err_code,
-                    expected_status="pending",
-                )
-                local_by_target[(ch, cleaned_tgt)] = "failed"
-                if (ch, cleaned_tgt) in pending_targets:
-                    pending_targets.remove((ch, cleaned_tgt))
+                try:
+                    if preserve_uncertain:
+                        uncertain_err = (
+                            str(exc_code)
+                            if is_uncertain_notify_error_code(exc_code)
+                            else active_uncertain_code
+                        )
+                        local_by_target[(ch, cleaned_tgt)] = "pending"
+                        await _shielded_mark_uncertain(
+                            mark_target_fn,
+                            str(run_id),
+                            ch,
+                            cleaned_tgt,
+                            error_code=uncertain_err,
+                            expected_status="pending",
+                        )
+                    else:
+                        active_native_target = None
+                        status_code = getattr(
+                            getattr(post_exc, "response", None), "status_code", None
+                        )
+                        err_code = (
+                            f"http_{status_code}"
+                            if status_code
+                            else type(post_exc).__name__
+                        )
+                        local_by_target[(ch, cleaned_tgt)] = "failed"
+                        await _shielded_mark_failed(
+                            mark_target_fn,
+                            str(run_id),
+                            ch,
+                            cleaned_tgt,
+                            error_code=err_code,
+                            expected_status="pending",
+                        )
+                finally:
+                    if (ch, cleaned_tgt) in pending_targets:
+                        pending_targets.remove((ch, cleaned_tgt))
                 continue
-
-            target_skip_reason = _extract_target_skip_reason(cleaned_tgt, bridge_res)
-            if target_skip_reason is not None:
-                await _invoke_mark_delivery(
-                    mark_target_fn,
-                    str(run_id),
-                    ch,
-                    cleaned_tgt,
-                    status="skipped",
-                    reason=target_skip_reason,
-                    error_code=target_skip_reason,
-                    expected_status="pending",
-                )
-                local_by_target[(ch, cleaned_tgt)] = "skipped"
-                if (ch, cleaned_tgt) in pending_targets:
-                    pending_targets.remove((ch, cleaned_tgt))
-                continue
-
-            uncertain_code = extract_target_uncertain_code(cleaned_tgt, bridge_res)
-            if uncertain_code is not None:
-                await _invoke_mark_delivery(
-                    mark_target_fn,
-                    str(run_id),
-                    ch,
-                    cleaned_tgt,
-                    status="pending",
-                    error_code=uncertain_code,
-                    expected_status="pending",
-                )
-                local_by_target[(ch, cleaned_tgt)] = "pending"
-                if (ch, cleaned_tgt) in pending_targets:
-                    pending_targets.remove((ch, cleaned_tgt))
-                continue
-
-            outcomes, batch_err = _evaluate_target_results([cleaned_tgt], bridge_res)
-            if outcomes.get(cleaned_tgt) is True:
-                await _invoke_mark_delivery(
-                    mark_target_fn,
-                    str(run_id),
-                    ch,
-                    cleaned_tgt,
-                    status="sent",
-                    error_code=None,
-                    expected_status="pending",
-                )
-                local_by_target[(ch, cleaned_tgt)] = "sent"
-            else:
-                err_code = _extract_target_error_code(cleaned_tgt, bridge_res, batch_err)
-                await _shielded_mark_failed(
-                    mark_target_fn,
-                    str(run_id),
-                    ch,
-                    cleaned_tgt,
-                    error_code=err_code,
-                    expected_status="pending",
-                )
-                local_by_target[(ch, cleaned_tgt)] = "failed"
-            if (ch, cleaned_tgt) in pending_targets:
-                pending_targets.remove((ch, cleaned_tgt))
 
     persisted_by_target: dict[tuple[str, str], str] = dict(existing_by_target)
     if (

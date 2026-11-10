@@ -5,6 +5,7 @@ Uses synthetic fixtures only and constructs all test doubles with ``unittest.moc
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import inspect
@@ -22,6 +23,7 @@ import zlib
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import httpx
+import psycopg
 import pytest
 
 from src.dalton.app.router import router as dalton_router
@@ -2814,3 +2816,816 @@ async def test_outer_reconcile_identity_inspection_and_enforcement_rejects_confl
     assert outcome.ok is False
     assert outcome.code == "recipient_identity_conflict"
     assert not any(q.startswith("UPDATE dalton_notify_deliveries") for q in executed_queries)
+
+
+@pytest.mark.asyncio
+async def test_native_send_cancellation_and_stale_scanner_version_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-flight native gateway cancellation persists `pending/delivery_uncertain`; pre-send/Bridge cancellation persists `failed/CancelledError`; stale scanner skip enforces row version and uncertain exclusion."""
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    import psycopg
+
+    from src.dalton.data_jobs import scheduler as sched_mod
+    from src.dalton.llm.model_prefs import (
+        resolve_dalton_notify_enabled,
+        resolve_dalton_notify_overrides,
+        resolve_dalton_notify_routes,
+        resolve_dalton_notify_targets,
+    )
+
+    # -------------------------------------------------------------------------
+    # 1. `retry_failed_notify_deliveries`: cancellation AFTER `data_task_notify_fn` starts
+    #    persists `status='pending', error_code='delivery_uncertain'` (never `failed/CancelledError`)
+    # -------------------------------------------------------------------------
+    run_retry_cancel = str(uuid4())
+    target_group = "feishu:chat:oc_cancel_group"
+    observed_ts = datetime(2026, 4, 15, 10, 0, tzinfo=timezone.utc)
+    candidate_rows: list[dict[str, Any]] = [
+        {
+            "execution_id": run_retry_cancel,
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": "pm-cancel-1",
+            "channel": "feishu",
+            "target": target_group,
+            "status": "failed",
+            "attempt_count": 2,
+            "error_code": "ReadTimeout",
+            "updated_at": observed_ts,
+            "payload_json": {
+                "route_key": "data:softbank-nav-monitor",
+                "text": "SoftBank NAV",
+            },
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": True,
+            "data_task_notify_enabled": True,
+        }
+    ]
+    executed_sql: list[tuple[str, Any]] = []
+
+    class _FakeRetryCursor:
+        rowcount = 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            executed_sql.append((" ".join(sql.split()), params))
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(candidate_rows)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return {"attempt_count": 3, "payload_json": candidate_rows[0]["payload_json"]}
+
+    class _FakeRetryConn:
+        def cursor(self, **_kw):
+            return _FakeRetryCursor()
+
+    @asynccontextmanager
+    async def _fake_retry_db_conn(_c: Any = None):
+        yield _FakeRetryConn()
+
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "get_db_connection",
+        create_autospec(notify_dispatch_mod.get_db_connection, side_effect=_fake_retry_db_conn),
+    )
+    monkeypatch.setattr(
+        dtn_db,
+        "reconcile_uncertain_data_task_deliveries",
+        create_autospec(dtn_db.reconcile_uncertain_data_task_deliveries, return_value=0),
+    )
+
+    recorded_marks: list[dict[str, Any]] = []
+
+    async def _record_mark(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        reason: str | None = None,
+        expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
+    ) -> bool:
+        recorded_marks.append(
+            {
+                "execution_id": execution_id,
+                "channel": channel,
+                "target": target,
+                "status": status,
+                "error_code": error_code,
+                "reason": reason,
+                "expected_status": expected_status,
+                "expected_attempt_count": expected_attempt_count,
+                "expected_updated_at": expected_updated_at,
+                "exclude_uncertain_data_task": exclude_uncertain_data_task,
+            }
+        )
+        return True
+
+    mark_spy = create_autospec(
+        notify_dispatch_mod.mark_target_delivery,
+        side_effect=_record_mark,
+    )
+
+    native_started = asyncio.Event()
+    never_finish: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+
+    async def _blocking_native_notify(
+        targets: Any,
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> dict[str, Any]:
+        _ = (targets, text, card, images, run_id, gateway_url, service_token, timeout_s, http_client)
+        native_started.set()
+        return await never_finish
+
+    async def _is_admin(_uid: str | None) -> bool:
+        return True
+
+    retry_task = asyncio.create_task(
+        notify_dispatch_mod.retry_failed_notify_deliveries(
+            data_task_notify_fn=create_autospec(
+                ct_mod.post_data_task_gateway_notify,
+                side_effect=_blocking_native_notify,
+            ),
+            mark_delivery_fn=mark_spy,
+            resolve_enabled_fn=create_autospec(resolve_dalton_notify_enabled, return_value=True),
+            resolve_overrides_fn=create_autospec(resolve_dalton_notify_overrides, return_value={}),
+            resolve_targets_fn=create_autospec(resolve_dalton_notify_targets, return_value=[]),
+            resolve_routes_fn=create_autospec(
+                resolve_dalton_notify_routes,
+                return_value={"data:softbank-nav-monitor": [target_group]},
+            ),
+            is_admin_fn=create_autospec(_is_admin, return_value=True),
+        )
+    )
+    await native_started.wait()
+    retry_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await retry_task
+
+    assert len(recorded_marks) == 1
+    assert recorded_marks[0]["execution_id"] == run_retry_cancel
+    assert recorded_marks[0]["status"] == "pending"
+    assert recorded_marks[0]["error_code"] == "delivery_uncertain"
+    assert recorded_marks[0]["expected_status"] == "pending"
+    assert recorded_marks[0]["expected_attempt_count"] == 3
+
+    # -------------------------------------------------------------------------
+    # 2. `dispatch_data_task_run_notification`:
+    #    (a) Cancellation AFTER `post_data_task_gateway_notify` starts -> `pending/delivery_uncertain`
+    #    (b) Cancellation BEFORE `post_data_task_gateway_notify` starts -> `failed/CancelledError`
+    # -------------------------------------------------------------------------
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    run_sched_cancel = str(uuid4())
+    rdir = path_map.backend_run_artifacts_dir(run_sched_cancel)
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "outbox.json").write_text(
+        json.dumps({"feishu_message": "Scheduler cancel check"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        sched_mod,
+        "get_configured_pm_user_ids",
+        create_autospec(sched_mod.get_configured_pm_user_ids, return_value=["pm-cancel-1"]),
+    )
+
+    sched_started = asyncio.Event()
+    sched_never_finish: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+
+    async def _blocking_sched_gateway(
+        targets: Any,
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> dict[str, Any]:
+        _ = (targets, text, card, images, run_id, gateway_url, service_token, timeout_s, http_client)
+        sched_started.set()
+        return await sched_never_finish
+
+    monkeypatch.setattr(
+        sched_mod,
+        "post_data_task_gateway_notify",
+        create_autospec(ct_mod.post_data_task_gateway_notify, side_effect=_blocking_sched_gateway),
+    )
+
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+    cursor.fetchone.return_value = (1,)
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.closed = False
+
+    @asynccontextmanager
+    async def _cur_cm(*_a: Any, **_kw: Any):
+        yield cursor
+
+    @asynccontextmanager
+    async def _tx_cm(*_a: Any, **_kw: Any):
+        yield
+
+    conn.cursor.side_effect = _cur_cm
+    conn.transaction.side_effect = _tx_cm
+
+    recorded_marks.clear()
+    sched_task = asyncio.create_task(
+        sched_mod.dispatch_data_task_run_notification(
+            conn,
+            lock_conn=conn,
+            run_id=run_sched_cancel,
+            job_key="softbank-nav-monitor",
+            path_map=path_map,
+            evaluate_eligibility_fn=create_autospec(
+                notify_dispatch_mod.evaluate_user_notify_eligibility,
+                return_value=(True, None, [target_group]),
+            ),
+            claim_target_fn=create_autospec(
+                notify_dispatch_mod.claim_target_delivery,
+                return_value=True,
+            ),
+            post_notify_fn=sched_mod.post_data_task_gateway_notify,
+            mark_target_fn=mark_spy,
+            fetch_deliveries_fn=create_autospec(
+                notify_dispatch_mod.fetch_execution_deliveries,
+                return_value=[],
+            ),
+        )
+    )
+    await sched_started.wait()
+    sched_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sched_task
+
+    assert len(recorded_marks) == 1
+    assert recorded_marks[0]["execution_id"] == run_sched_cancel
+    assert recorded_marks[0]["status"] == "pending"
+    assert recorded_marks[0]["error_code"] == "delivery_uncertain"
+    assert recorded_marks[0]["expected_status"] == "pending"
+
+    # (b) Cancellation BEFORE `post_data_task_gateway_notify` starts (during post-claim lock check)
+    recorded_marks.clear()
+    lock_calls = {"count": 0}
+    pre_send_lock_entered = asyncio.Event()
+    pre_send_never_finish: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def _cancel_before_send_lock(_lock_conn: Any) -> None:
+        lock_calls["count"] += 1
+        if lock_calls["count"] >= 3:
+            pre_send_lock_entered.set()
+            await pre_send_never_finish
+
+    monkeypatch.setattr(
+        sched_mod,
+        "check_scheduler_lock",
+        create_autospec(sched_mod.check_scheduler_lock, side_effect=_cancel_before_send_lock),
+    )
+
+    pre_send_task = asyncio.create_task(
+        sched_mod.dispatch_data_task_run_notification(
+            conn,
+            lock_conn=conn,
+            run_id=run_sched_cancel,
+            job_key="softbank-nav-monitor",
+            path_map=path_map,
+            evaluate_eligibility_fn=create_autospec(
+                notify_dispatch_mod.evaluate_user_notify_eligibility,
+                return_value=(True, None, [target_group]),
+            ),
+            claim_target_fn=create_autospec(
+                notify_dispatch_mod.claim_target_delivery,
+                return_value=True,
+            ),
+            post_notify_fn=sched_mod.post_data_task_gateway_notify,
+            mark_target_fn=mark_spy,
+            fetch_deliveries_fn=create_autospec(
+                notify_dispatch_mod.fetch_execution_deliveries,
+                return_value=[],
+            ),
+        )
+    )
+    await pre_send_lock_entered.wait()
+    pre_send_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pre_send_task
+
+    assert len(recorded_marks) == 1
+    assert recorded_marks[0]["status"] == "failed"
+    assert recorded_marks[0]["error_code"] == "CancelledError"
+
+    # -------------------------------------------------------------------------
+    # 3. Stale scanner skip `UPDATE` enforces observed `attempt_count`, `updated_at`,
+    #    and uncertain data-task exclusion at the SQL boundary
+    # -------------------------------------------------------------------------
+    executed_sql.clear()
+    updated_stale = await notify_dispatch_mod.mark_target_delivery(
+        run_retry_cancel,
+        "feishu",
+        target_group,
+        status="skipped",
+        reason="target_removed",
+        error_code="target_removed",
+        expected_status="failed",
+        expected_attempt_count=2,
+        expected_updated_at=observed_ts,
+        exclude_uncertain_data_task=True,
+    )
+    assert updated_stale is True
+    assert len(executed_sql) == 1
+    stale_sql_str, stale_params = executed_sql[0]
+    assert "status = %s" in stale_sql_str
+    assert "attempt_count = %s" in stale_sql_str
+    assert "updated_at = %s" in stale_sql_str
+    assert "COALESCE(error_code, '') = ANY(%s)" in stale_sql_str
+    assert stale_params[0] == "skipped"
+    assert stale_params[1] == "target_removed"
+    assert 2 in stale_params
+    assert observed_ts in stale_params
+
+
+@pytest.mark.asyncio
+async def test_outer_mark_operational_error_and_shielded_cleanup_cancellation_propagation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify:
+    1. Transient `psycopg.OperationalError` on the first outer `mark_target_delivery` call after native `sent` or `unknown`
+       in both `retry_failed_notify_deliveries` and `dispatch_data_task_run_notification` falls back to persisting
+       `status='pending', error_code='delivery_uncertain'` (never `status='failed', error_code='OperationalError'`).
+    2. Task cancellation arriving while `_shielded_mark_uncertain` (directly or inside `dispatch_data_task_run_notification`
+       after `httpx.ReadTimeout`) is awaiting a held write waits for the shielded write to finish and then propagates `CancelledError`.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+
+    from src.dalton.data_jobs import scheduler as sched_mod
+    from src.dalton.llm.model_prefs import (
+        resolve_dalton_notify_enabled,
+        resolve_dalton_notify_overrides,
+        resolve_dalton_notify_routes,
+        resolve_dalton_notify_targets,
+    )
+
+    original_get_db_connection = notify_dispatch_mod.get_db_connection
+    target_group = "feishu:chat:oc_r8_unit_group"
+    observed_ts = datetime(2026, 4, 15, 11, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(
+        dtn_db,
+        "reconcile_uncertain_data_task_deliveries",
+        create_autospec(dtn_db.reconcile_uncertain_data_task_deliveries, return_value=0),
+    )
+
+    # -------------------------------------------------------------------------
+    # 1. `retry_failed_notify_deliveries`: transient `psycopg.OperationalError` on first mark
+    #    after native `sent` and after native `unknown` -> fallback writes `pending/delivery_uncertain`
+    # -------------------------------------------------------------------------
+    for mode, native_res in [
+        (
+            "sent",
+            {
+                "ok": True,
+                "status_code": 200,
+                "status": "sent",
+                "results": [{"target": target_group, "ok": True, "status": "sent"}],
+            },
+        ),
+        (
+            "unknown",
+            {
+                "ok": False,
+                "status_code": 200,
+                "status": "unknown",
+                "uncertain": True,
+                "error_code": "delivery_uncertain",
+                "results": [
+                    {
+                        "target": target_group,
+                        "ok": False,
+                        "status": "unknown",
+                        "uncertain": True,
+                        "error": "delivery_uncertain",
+                    }
+                ],
+            },
+        ),
+    ]:
+        exec_id = f"run-retry-operr-{mode}"
+        candidate_row = {
+            "execution_id": exec_id,
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": "pm-r8-1",
+            "channel": "feishu",
+            "target": target_group,
+            "status": "failed",
+            "attempt_count": 2,
+            "error_code": "ReadTimeout",
+            "updated_at": observed_ts,
+            "payload_json": {
+                "route_key": "data:softbank-nav-monitor",
+                "text": "SoftBank NAV",
+            },
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": True,
+            "data_task_notify_enabled": True,
+        }
+
+        class _FakeCur:
+            def __init__(self) -> None:
+                self._last_sql = ""
+
+            async def __aenter__(self) -> _FakeCur:
+                return self
+
+            async def __aexit__(self, *_a: Any) -> None:
+                return None
+
+            async def execute(self, sql: str, _params: Any = None) -> None:
+                self._last_sql = sql
+
+            async def fetchall(self) -> list[dict[str, Any]]:
+                if "FROM dalton_notify_deliveries d" in self._last_sql:
+                    return [dict(candidate_row)]
+                return []
+
+            async def fetchone(self) -> dict[str, Any] | None:
+                if "RETURNING attempt_count, payload_json" in self._last_sql:
+                    return {
+                        "attempt_count": 3,
+                        "payload_json": dict(candidate_row["payload_json"]),
+                    }
+                return None
+
+        class _FakeConn:
+            def cursor(self, **_kw: Any) -> _FakeCur:
+                return _FakeCur()
+
+        @asynccontextmanager
+        async def _fake_conn_cm(_c: Any = None):
+            yield _FakeConn()
+
+        monkeypatch.setattr(
+            notify_dispatch_mod,
+            "get_db_connection",
+            create_autospec(original_get_db_connection, side_effect=_fake_conn_cm),
+        )
+
+        mark_calls: list[dict[str, Any]] = []
+
+        async def _flaky_mark(
+            execution_id: str,
+            channel: str,
+            target: str,
+            *,
+            status: str,
+            error_code: str | None = None,
+            reason: str | None = None,
+            expected_status: Any = None,
+            expected_attempt_count: int | None = None,
+            expected_updated_at: Any = None,
+            exclude_uncertain_data_task: bool = False,
+            _calls: list[dict[str, Any]] = mark_calls,
+        ) -> bool:
+            _calls.append(
+                {
+                    "execution_id": execution_id,
+                    "channel": channel,
+                    "target": target,
+                    "status": status,
+                    "error_code": error_code,
+                    "reason": reason,
+                    "expected_status": expected_status,
+                    "expected_attempt_count": expected_attempt_count,
+                    "expected_updated_at": expected_updated_at,
+                    "exclude_uncertain_data_task": exclude_uncertain_data_task,
+                }
+            )
+            if len(_calls) == 1:
+                raise psycopg.OperationalError("simulated transient outer mark failure")
+            return True
+
+        async def _is_admin(_uid: str | None) -> bool:
+            return True
+
+        sent_cnt = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            data_task_notify_fn=create_autospec(
+                ct_mod.post_data_task_gateway_notify,
+                return_value=native_res,
+            ),
+            mark_delivery_fn=create_autospec(
+                notify_dispatch_mod.mark_target_delivery,
+                side_effect=_flaky_mark,
+            ),
+            resolve_enabled_fn=create_autospec(resolve_dalton_notify_enabled, return_value=True),
+            resolve_overrides_fn=create_autospec(resolve_dalton_notify_overrides, return_value={}),
+            resolve_targets_fn=create_autospec(resolve_dalton_notify_targets, return_value=[]),
+            resolve_routes_fn=create_autospec(
+                resolve_dalton_notify_routes,
+                return_value={"data:softbank-nav-monitor": [target_group]},
+            ),
+            is_admin_fn=create_autospec(_is_admin, return_value=True),
+        )
+        assert sent_cnt == 0
+        assert len(mark_calls) == 2
+        assert mark_calls[1]["execution_id"] == exec_id
+        assert mark_calls[1]["status"] == "pending"
+        assert mark_calls[1]["error_code"] == "delivery_uncertain"
+        assert mark_calls[1]["expected_status"] == "pending"
+        assert mark_calls[1]["expected_attempt_count"] == 3
+
+    # -------------------------------------------------------------------------
+    # 2. `dispatch_data_task_run_notification`: transient `psycopg.OperationalError` on first mark
+    #    after native `sent` and after native `unknown` -> fallback writes `pending/delivery_uncertain`
+    # -------------------------------------------------------------------------
+    path_map = build_path_map(host_var_dir=tmp_path / "h8", backend_var_dir=tmp_path / "b8")
+    monkeypatch.setattr(
+        sched_mod,
+        "get_configured_pm_user_ids",
+        create_autospec(sched_mod.get_configured_pm_user_ids, return_value=["pm-r8-1"]),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "check_scheduler_lock",
+        create_autospec(sched_mod.check_scheduler_lock, return_value=None),
+    )
+
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+    cursor.fetchone.return_value = (1,)
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.closed = False
+
+    @asynccontextmanager
+    async def _cur_cm(*_a: Any, **_kw: Any):
+        yield cursor
+
+    @asynccontextmanager
+    async def _tx_cm(*_a: Any, **_kw: Any):
+        yield
+
+    conn.cursor.side_effect = _cur_cm
+    conn.transaction.side_effect = _tx_cm
+
+    for mode, native_res in [
+        (
+            "sent",
+            {
+                "ok": True,
+                "status_code": 200,
+                "status": "sent",
+                "results": [{"target": target_group, "ok": True, "status": "sent"}],
+            },
+        ),
+        (
+            "unknown",
+            {
+                "ok": False,
+                "status_code": 200,
+                "status": "unknown",
+                "uncertain": True,
+                "error_code": "delivery_uncertain",
+                "results": [
+                    {
+                        "target": target_group,
+                        "ok": False,
+                        "status": "unknown",
+                        "uncertain": True,
+                        "error": "delivery_uncertain",
+                    }
+                ],
+            },
+        ),
+    ]:
+        sched_run_id = str(uuid4())
+        rdir = path_map.backend_run_artifacts_dir(sched_run_id)
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "outbox.json").write_text(
+            json.dumps({"feishu_message": "Scheduler transient mark error check"}),
+            encoding="utf-8",
+        )
+        sched_marks: list[dict[str, Any]] = []
+
+        async def _flaky_sched_mark(
+            execution_id: str,
+            channel: str,
+            target: str,
+            *,
+            status: str,
+            error_code: str | None = None,
+            reason: str | None = None,
+            expected_status: Any = None,
+            _calls: list[dict[str, Any]] = sched_marks,
+        ) -> bool:
+            _calls.append(
+                {
+                    "execution_id": execution_id,
+                    "channel": channel,
+                    "target": target,
+                    "status": status,
+                    "error_code": error_code,
+                    "reason": reason,
+                    "expected_status": expected_status,
+                }
+            )
+            if len(_calls) == 1:
+                raise psycopg.OperationalError("simulated transient scheduler mark failure")
+            return True
+
+        res_status = await sched_mod.dispatch_data_task_run_notification(
+            conn,
+            lock_conn=conn,
+            run_id=sched_run_id,
+            job_key="softbank-nav-monitor",
+            path_map=path_map,
+            evaluate_eligibility_fn=create_autospec(
+                notify_dispatch_mod.evaluate_user_notify_eligibility,
+                return_value=(True, None, [target_group]),
+            ),
+            claim_target_fn=create_autospec(
+                notify_dispatch_mod.claim_target_delivery,
+                return_value=True,
+            ),
+            post_notify_fn=create_autospec(
+                ct_mod.post_data_task_gateway_notify,
+                return_value=native_res,
+            ),
+            mark_target_fn=create_autospec(
+                notify_dispatch_mod.mark_target_delivery,
+                side_effect=_flaky_sched_mark,
+            ),
+            fetch_deliveries_fn=create_autospec(
+                notify_dispatch_mod.fetch_execution_deliveries,
+                return_value=[],
+            ),
+        )
+        assert res_status == "pending_dispatch"
+        assert len(sched_marks) == 2
+        assert sched_marks[1]["execution_id"] == sched_run_id
+        assert sched_marks[1]["status"] == "pending"
+        assert sched_marks[1]["error_code"] == "delivery_uncertain"
+        assert sched_marks[1]["expected_status"] == "pending"
+
+    # -------------------------------------------------------------------------
+    # 3. `dispatch_data_task_run_notification`: native sender raises `httpx.ReadTimeout`,
+    #    uncertain-state write is held by an event, caller task is cancelled while awaiting
+    #    `_shielded_mark_uncertain`, then write is released -> write completes AND
+    #    `asyncio.CancelledError` is propagated to caller!
+    # -------------------------------------------------------------------------
+    timeout_cancel_run = str(uuid4())
+    tc_dir = path_map.backend_run_artifacts_dir(timeout_cancel_run)
+    tc_dir.mkdir(parents=True, exist_ok=True)
+    (tc_dir / "outbox.json").write_text(
+        json.dumps({"feishu_message": "ReadTimeout then cancel during cleanup"}),
+        encoding="utf-8",
+    )
+
+    write_entered = asyncio.Event()
+    release_write = asyncio.Event()
+    cleanup_completed: list[dict[str, Any]] = []
+
+    async def _held_uncertain_mark(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        reason: str | None = None,
+        expected_status: Any = None,
+    ) -> bool:
+        write_entered.set()
+        await release_write.wait()
+        cleanup_completed.append(
+            {
+                "execution_id": execution_id,
+                "channel": channel,
+                "target": target,
+                "status": status,
+                "error_code": error_code,
+                "reason": reason,
+                "expected_status": expected_status,
+            }
+        )
+        return True
+
+    tc_task = asyncio.create_task(
+        sched_mod.dispatch_data_task_run_notification(
+            conn,
+            lock_conn=conn,
+            run_id=timeout_cancel_run,
+            job_key="softbank-nav-monitor",
+            path_map=path_map,
+            evaluate_eligibility_fn=create_autospec(
+                notify_dispatch_mod.evaluate_user_notify_eligibility,
+                return_value=(True, None, [target_group]),
+            ),
+            claim_target_fn=create_autospec(
+                notify_dispatch_mod.claim_target_delivery,
+                return_value=True,
+            ),
+            post_notify_fn=create_autospec(
+                ct_mod.post_data_task_gateway_notify,
+                side_effect=httpx.ReadTimeout("gateway read timed out"),
+            ),
+            mark_target_fn=create_autospec(
+                notify_dispatch_mod.mark_target_delivery,
+                side_effect=_held_uncertain_mark,
+            ),
+            fetch_deliveries_fn=create_autospec(
+                notify_dispatch_mod.fetch_execution_deliveries,
+                return_value=[],
+            ),
+        )
+    )
+    await write_entered.wait()
+    tc_task.cancel()
+    await asyncio.sleep(0)
+    # Write is still shielded and waiting for `release_write`
+    assert cleanup_completed == []
+    release_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await tc_task
+
+    assert len(cleanup_completed) == 1
+    assert cleanup_completed[0]["execution_id"] == timeout_cancel_run
+    assert cleanup_completed[0]["status"] == "pending"
+    assert cleanup_completed[0]["error_code"] == "delivery_uncertain"
+    assert cleanup_completed[0]["expected_status"] == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [0, 1, 2])
+async def test_notification_mark_deadline_bounds_async_cancellation_cleanup(
+    cancel_count: int,
+) -> None:
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    writes: list[asyncio.Task[Any]] = []
+
+    async def write_with_async_cleanup() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        writes.append(task)
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            raise RuntimeError("Synthetic cleanup failure")
+
+    caller = asyncio.create_task(
+        notify_dispatch_mod._run_shielded_mark(
+            write_with_async_cleanup(), timeout_s=0.1
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        for _ in range(cancel_count):
+            caller.cancel()
+            await asyncio.sleep(0)
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        completed, _ = await asyncio.wait({caller}, timeout=0.2)
+        assert caller in completed
+        if cancel_count:
+            with pytest.raises(asyncio.CancelledError):
+                caller.result()
+        else:
+            assert caller.result() is None
+        assert not writes[0].done()
+        assert writes[0] in notify_dispatch_mod._pending_mark_cleanup
+    finally:
+        release_cleanup.set()
+        if not caller.done():
+            caller.cancel()
+        completed, pending = await asyncio.wait({caller, *writes}, timeout=1)
+        assert not pending
+        for task in completed:
+            if not task.cancelled():
+                task.exception()
+        await asyncio.sleep(0)
+    assert all(task not in notify_dispatch_mod._pending_mark_cleanup for task in writes)

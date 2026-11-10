@@ -4931,6 +4931,7 @@ async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_nul
         status="sent",
         error_code=None,
         expected_status="pending",
+        expected_attempt_count=2,
     )
 
     # 4. Item 2: When data task is disabled (enabled=False or notify_enabled=False), retry marks delivery 'skipped' (error_code='task_disabled') and does NOT re-send
@@ -4989,6 +4990,8 @@ async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_nul
         error_code="task_disabled",
         reason="task_disabled",
         expected_status=("failed", "pending"),
+        expected_attempt_count=1,
+        exclude_uncertain_data_task=True,
     )
 
 
