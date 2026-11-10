@@ -115,6 +115,7 @@ class SessionCommandRequest(BaseModel):
     cmd: str
     platform: str
     dalton_user_id: str | None = None
+    platform_user_id: str | None = None
     chat_type: str = "dm"
     chat_address: str | None = None
     chat_id: str | None = None
@@ -122,7 +123,13 @@ class SessionCommandRequest(BaseModel):
     scope_key: str
     workspace_id: str | None = None
     workspace_query: str | None = None
+    target_kind: str | None = None
     external_thread_id: str | None = None
+    message_id: str | None = None
+    request_key: str | None = None
+    raw_payload: dict[str, Any] | None = None
+    weixin_context_token: str | None = None
+    is_internal_query: bool = False
 
 
 class ChannelSettingsPutRequest(BaseModel):
@@ -152,6 +159,9 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     inbound_message_id: str | None = None
     has_non_empty_text: bool = True
     total_chunks: int = 0
+    source_scope_key: str | None = None
+    source_generation: int | None = None
+    activity_origin: str | None = "none"
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -182,6 +192,9 @@ class InboundProgressRequest(BaseModel):
     resubmitted_request_key: str | None = None
     steered_into_run_id: str | None = None
     fallback_pending: bool | None = None
+    command_effect_status: str | None = None
+    command_reply_pending: bool | None = None
+    command_result: dict[str, Any] | None = None
     uploaded_attachments: list[Any] | None = None
     raw_payload: dict[str, Any] | None = None
     raw_payload_patch: dict[str, Any] | None = None
@@ -298,12 +311,22 @@ async def internal_session_command_endpoint(
     body: SessionCommandRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """I-3: Execute `/workspace`, `/new`, or `/stop` session command."""
-    eff_uid = _resolve_internal_user_id(request, body.dalton_user_id)
+    """I-3: Execute `/workspace`, `/main`, `/<workspace>`, `/new`, or `/stop` session command."""
+    eff_uid = (
+        str(body.dalton_user_id or "").strip()
+        or str(request.headers.get("X-User-Id") or "").strip()
+        or None
+    )
+    if not eff_uid and not str(body.platform_user_id or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="dalton_user_id, X-User-Id, or platform_user_id is required",
+        )
     return await execute_session_command(
         cmd=body.cmd,
         platform=body.platform,
         dalton_user_id=eff_uid,
+        platform_user_id=body.platform_user_id,
         chat_type=body.chat_type,
         chat_address=body.chat_address,
         chat_id=body.chat_id,
@@ -311,7 +334,13 @@ async def internal_session_command_endpoint(
         scope_key=body.scope_key,
         workspace_id=body.workspace_id,
         workspace_query=body.workspace_query,
+        target_kind=body.target_kind,
         external_thread_id=body.external_thread_id,
+        message_id=body.message_id,
+        request_key=body.request_key,
+        raw_payload=body.raw_payload,
+        weixin_context_token=body.weixin_context_token,
+        is_internal_query=body.is_internal_query,
     )
 
 
@@ -396,6 +425,9 @@ async def internal_deliveries_authorize_and_claim_endpoint(
         inbound_message_id=body.inbound_message_id,
         has_non_empty_text=body.has_non_empty_text,
         total_chunks=body.total_chunks,
+        source_scope_key=body.source_scope_key,
+        source_generation=body.source_generation,
+        activity_origin=body.activity_origin,
     )
 
 
@@ -440,6 +472,9 @@ async def internal_inbound_progress_endpoint(
         resubmitted_request_key=body.resubmitted_request_key,
         steered_into_run_id=body.steered_into_run_id,
         fallback_pending=body.fallback_pending,
+        command_effect_status=body.command_effect_status,
+        command_reply_pending=body.command_reply_pending,
+        command_result=body.command_result,
         uploaded_attachments=body.uploaded_attachments,
         raw_payload=body.raw_payload,
         raw_payload_patch=body.raw_payload_patch,
