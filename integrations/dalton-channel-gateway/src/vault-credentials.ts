@@ -30,7 +30,7 @@ export type VaultBootstrapErrorCode =
 /**
  * Redacted startup/credential error containing at most classification codes
  * and whitelisted credential key names (`DALTON_FEISHU_APP_ID`, `DALTON_FEISHU_APP_SECRET`).
- * Never includes secret values or raw response bodies.
+ * Never includes secret values, response bodies, or raw error causes.
  */
 export class VaultBootstrapError extends Error {
   readonly code: VaultBootstrapErrorCode;
@@ -68,14 +68,57 @@ function filterAllowedKeyNames(rawList: unknown): DedicatedFeishuVaultKey[] {
   return result;
 }
 
+function isAbortOrTimeoutError(
+  err: unknown,
+  timedOut: boolean,
+  signal: AbortSignal,
+): boolean {
+  if (timedOut || signal.aborted) {
+    return true;
+  }
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") {
+      return true;
+    }
+  }
+  if (typeof err === "object" && err !== null && "name" in err) {
+    const errName = (err as { name?: unknown }).name;
+    if (errName === "AbortError" || errName === "TimeoutError") {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function cancelResponseBodySafe(
+  resp: Response | undefined,
+): Promise<void> {
+  if (!resp?.body) {
+    return;
+  }
+  try {
+    if (!resp.bodyUsed) {
+      await resp.body.cancel();
+    }
+  } catch {
+    // Ignore stream cancellation errors on already-closed or aborted sockets.
+  }
+}
+
 async function readBoundedUtf8Response(
   resp: Response,
   maxBytes: number,
+  deadlineCtx: {
+    timeoutMs: number;
+    isTimedOut: () => boolean;
+    signal: AbortSignal;
+  },
 ): Promise<string> {
   const declaredLenRaw = resp.headers.get("content-length");
   if (declaredLenRaw) {
     const declaredLen = Number.parseInt(declaredLenRaw, 10);
     if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+      await cancelResponseBodySafe(resp);
       throw new VaultBootstrapError(
         "vault_malformed_response",
         "Dalton Vault credential response exceeded maximum permitted byte size.",
@@ -85,28 +128,111 @@ async function readBoundedUtf8Response(
 
   const chunks: Buffer[] = [];
   let total = 0;
+
   if (resp.body) {
-    for await (const rawChunk of resp.body as AsyncIterable<Uint8Array>) {
-      const buf = Buffer.from(rawChunk);
-      total += buf.byteLength;
-      if (total > maxBytes) {
+    const reader = resp.body.getReader();
+    const onAbort = () => {
+      void reader.cancel().catch(() => undefined);
+    };
+    if (deadlineCtx.signal.aborted) {
+      onAbort();
+    } else {
+      deadlineCtx.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      while (true) {
+        if (deadlineCtx.isTimedOut() || deadlineCtx.signal.aborted) {
+          throw new VaultBootstrapError(
+            "vault_timeout",
+            `Timed out after ${deadlineCtx.timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
+          );
+        }
+        const { done, value } = await reader.read();
+        if (deadlineCtx.isTimedOut() || deadlineCtx.signal.aborted) {
+          throw new VaultBootstrapError(
+            "vault_timeout",
+            `Timed out after ${deadlineCtx.timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
+          );
+        }
+        if (done) {
+          break;
+        }
+        if (!value) {
+          continue;
+        }
+        const buf = Buffer.from(value);
+        total += buf.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw new VaultBootstrapError(
+            "vault_malformed_response",
+            "Dalton Vault credential response exceeded maximum permitted byte size.",
+          );
+        }
+        chunks.push(buf);
+      }
+    } catch (err) {
+      await reader.cancel().catch(() => undefined);
+      if (err instanceof VaultBootstrapError) {
+        throw err;
+      }
+      if (
+        isAbortOrTimeoutError(
+          err,
+          deadlineCtx.isTimedOut(),
+          deadlineCtx.signal,
+        )
+      ) {
+        throw new VaultBootstrapError(
+          "vault_timeout",
+          `Timed out after ${deadlineCtx.timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
+        );
+      }
+      throw new VaultBootstrapError(
+        "vault_unavailable",
+        "Failed to read response body from Dalton Vault credential endpoint.",
+      );
+    } finally {
+      deadlineCtx.signal.removeEventListener("abort", onAbort);
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore if lock was already released.
+      }
+    }
+  } else {
+    try {
+      const ab = await resp.arrayBuffer();
+      if (ab.byteLength > maxBytes) {
         throw new VaultBootstrapError(
           "vault_malformed_response",
           "Dalton Vault credential response exceeded maximum permitted byte size.",
         );
       }
-      chunks.push(buf);
-    }
-  } else {
-    const ab = await resp.arrayBuffer();
-    if (ab.byteLength > maxBytes) {
+      chunks.push(Buffer.from(ab));
+    } catch (err) {
+      if (err instanceof VaultBootstrapError) {
+        throw err;
+      }
+      if (
+        isAbortOrTimeoutError(
+          err,
+          deadlineCtx.isTimedOut(),
+          deadlineCtx.signal,
+        )
+      ) {
+        throw new VaultBootstrapError(
+          "vault_timeout",
+          `Timed out after ${deadlineCtx.timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
+        );
+      }
       throw new VaultBootstrapError(
-        "vault_malformed_response",
-        "Dalton Vault credential response exceeded maximum permitted byte size.",
+        "vault_unavailable",
+        "Failed to read response body from Dalton Vault credential endpoint.",
       );
     }
-    chunks.push(Buffer.from(ab));
   }
+
   return Buffer.concat(chunks).toString("utf8");
 }
 
@@ -226,6 +352,8 @@ export interface LoadedFeishuVaultCredentials {
 /**
  * Fetch `DALTON_FEISHU_APP_ID` and `DALTON_FEISHU_APP_SECRET` from the Dalton backend's
  * service-authenticated Vault endpoint into process memory before reporting service readiness.
+ * Enforces a single end-to-end deadline across connection, headers, response-body consumption,
+ * and validation without resetting the timeout after headers.
  */
 export async function loadFeishuCredentialsFromVault(
   options: LoadFeishuCredentialsFromVaultOptions,
@@ -264,169 +392,218 @@ export async function loadFeishuCredentialsFromVault(
 
   const controller = new AbortController();
   let timedOut = false;
+  let activeResponse: Response | undefined;
+  let rejectOnDeadline!: (err: VaultBootstrapError) => void;
+
+  const deadlinePromise = new Promise<never>((_resolve, reject) => {
+    rejectOnDeadline = reject;
+  });
+  // Guard against unhandled rejection if request finishes synchronously alongside timer fire.
+  deadlinePromise.catch(() => undefined);
+
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
+    void cancelResponseBodySafe(activeResponse);
+    rejectOnDeadline(
+      new VaultBootstrapError(
+        "vault_timeout",
+        `Timed out after ${timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
+      ),
+    );
   }, timeoutMs);
 
-  let resp: Response;
+  const executeWithinSingleDeadline =
+    async (): Promise<LoadedFeishuVaultCredentials> => {
+      let resp: Response;
+      try {
+        resp = await fetchImpl(endpointUrl, {
+          method: "POST",
+          headers: {
+            "X-Service-Token": options.serviceToken.trim(),
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            "Cache-Control": "no-store",
+          },
+          body: "{}",
+          redirect: "error",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        activeResponse = resp;
+      } catch (err) {
+        if (isAbortOrTimeoutError(err, timedOut, controller.signal)) {
+          throw new VaultBootstrapError(
+            "vault_timeout",
+            `Timed out after ${timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
+          );
+        }
+        const errMsgLower = (
+          err instanceof Error
+            ? `${err.message} ${err.cause instanceof Error ? err.cause.message : ""}`
+            : String(err)
+        ).toLowerCase();
+        if (errMsgLower.includes("redirect")) {
+          throw new VaultBootstrapError(
+            "vault_redirect_rejected",
+            "Refused HTTP redirect while loading dedicated Feishu credentials from Vault.",
+          );
+        }
+        throw new VaultBootstrapError(
+          "vault_unavailable",
+          "Failed to connect to Dalton backend Vault credential endpoint.",
+        );
+      }
+
+      if (resp.redirected || (resp.status >= 300 && resp.status < 400)) {
+        await cancelResponseBodySafe(resp);
+        throw new VaultBootstrapError(
+          "vault_redirect_rejected",
+          `Refused HTTP redirect (${resp.status}) while loading dedicated Feishu credentials from Vault.`,
+        );
+      }
+
+      if (resp.status === 401 || resp.status === 403) {
+        await cancelResponseBodySafe(resp);
+        throw new VaultBootstrapError(
+          "vault_auth_failed",
+          `Service authentication failed (${resp.status}) while loading dedicated Feishu credentials from Vault.`,
+        );
+      }
+
+      const rawText = await readBoundedUtf8Response(
+        resp,
+        MAX_VAULT_RESPONSE_BYTES,
+        {
+          timeoutMs,
+          isTimedOut: () => timedOut,
+          signal: controller.signal,
+        },
+      );
+
+      if (!resp.ok) {
+        let remoteCode = "";
+        let missingKeys: DedicatedFeishuVaultKey[] = [];
+        if (rawText) {
+          try {
+            const errParsed = JSON.parse(rawText) as unknown;
+            if (isPlainRecord(errParsed)) {
+              remoteCode =
+                typeof errParsed.code === "string" ? errParsed.code.trim() : "";
+              missingKeys = filterAllowedKeyNames(errParsed.missing);
+            }
+          } catch {
+            // Ignore unparseable error body; never echo raw response text.
+          }
+        }
+        if (remoteCode === "vault_credentials_missing") {
+          const suffix =
+            missingKeys.length > 0 ? `: ${missingKeys.join(", ")}` : "";
+          throw new VaultBootstrapError(
+            "vault_credentials_missing",
+            `Dedicated Feishu credentials missing in primary administrator Vault${suffix}`,
+            missingKeys,
+          );
+        }
+        if (remoteCode === "vault_credentials_invalid") {
+          const suffix =
+            missingKeys.length > 0 ? `: ${missingKeys.join(", ")}` : "";
+          throw new VaultBootstrapError(
+            "vault_credentials_invalid",
+            `Dedicated Feishu credentials in primary administrator Vault have invalid format${suffix}`,
+            missingKeys,
+          );
+        }
+        throw new VaultBootstrapError(
+          "vault_unavailable",
+          `Dalton Vault credential endpoint returned HTTP ${resp.status}.`,
+        );
+      }
+
+      let parsedBody: unknown;
+      try {
+        parsedBody = JSON.parse(rawText);
+      } catch {
+        throw new VaultBootstrapError(
+          "vault_malformed_response",
+          "Received malformed JSON from Dalton Vault credential endpoint.",
+        );
+      }
+
+      if (!isPlainRecord(parsedBody) || !isPlainRecord(parsedBody.credentials)) {
+        throw new VaultBootstrapError(
+          "vault_malformed_response",
+          "Dalton Vault credential response is missing the expected credentials object.",
+        );
+      }
+
+      const credsRecord = parsedBody.credentials;
+      const rawAppId = credsRecord.DALTON_FEISHU_APP_ID;
+      const rawAppSecret = credsRecord.DALTON_FEISHU_APP_SECRET;
+
+      const appId = typeof rawAppId === "string" ? rawAppId.trim() : "";
+      const appSecret =
+        typeof rawAppSecret === "string" ? rawAppSecret.trim() : "";
+
+      const missing: DedicatedFeishuVaultKey[] = [];
+      if (!appId) {
+        missing.push("DALTON_FEISHU_APP_ID");
+      }
+      if (!appSecret) {
+        missing.push("DALTON_FEISHU_APP_SECRET");
+      }
+      if (missing.length > 0) {
+        throw new VaultBootstrapError(
+          "vault_credentials_missing",
+          `Dedicated Feishu credentials missing or empty in Vault response: ${missing.join(", ")}`,
+          missing,
+        );
+      }
+
+      const invalid: DedicatedFeishuVaultKey[] = [];
+      if (/\s|\0/.test(appId)) {
+        invalid.push("DALTON_FEISHU_APP_ID");
+      }
+      if (/\s|\0/.test(appSecret)) {
+        invalid.push("DALTON_FEISHU_APP_SECRET");
+      }
+      if (invalid.length > 0) {
+        throw new VaultBootstrapError(
+          "vault_credentials_invalid",
+          `Dedicated Feishu credentials contain invalid whitespace or control characters: ${invalid.join(", ")}`,
+          invalid,
+        );
+      }
+
+      options.logger?.info(
+        "Loaded dedicated Feishu credentials from Dalton Vault",
+        {
+          source: "vault",
+          keys: [...DEDICATED_FEISHU_VAULT_KEYS],
+        },
+      );
+
+      return { appId, appSecret };
+    };
+
   try {
-    resp = await fetchImpl(endpointUrl, {
-      method: "POST",
-      headers: {
-        "X-Service-Token": options.serviceToken.trim(),
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "Cache-Control": "no-store",
-      },
-      body: "{}",
-      redirect: "error",
-      cache: "no-store",
-      signal: controller.signal,
-    });
+    return await Promise.race([executeWithinSingleDeadline(), deadlinePromise]);
   } catch (err) {
-    if (
-      timedOut ||
-      (err instanceof Error &&
-        (err.name === "AbortError" || err.name === "TimeoutError"))
-    ) {
+    await cancelResponseBodySafe(activeResponse);
+    if (err instanceof VaultBootstrapError) {
+      throw err;
+    }
+    if (isAbortOrTimeoutError(err, timedOut, controller.signal)) {
       throw new VaultBootstrapError(
         "vault_timeout",
         `Timed out after ${timeoutMs}ms while loading dedicated Feishu credentials from Vault.`,
       );
     }
-    const errMsgLower = (
-      err instanceof Error
-        ? `${err.message} ${err.cause instanceof Error ? err.cause.message : ""}`
-        : String(err)
-    ).toLowerCase();
-    if (errMsgLower.includes("redirect")) {
-      throw new VaultBootstrapError(
-        "vault_redirect_rejected",
-        "Refused HTTP redirect while loading dedicated Feishu credentials from Vault.",
-      );
-    }
     throw new VaultBootstrapError(
       "vault_unavailable",
-      "Failed to connect to Dalton backend Vault credential endpoint.",
+      "Failed to load dedicated Feishu credentials from Dalton Vault.",
     );
   } finally {
     clearTimeout(timer);
   }
-
-  if (resp.redirected || (resp.status >= 300 && resp.status < 400)) {
-    throw new VaultBootstrapError(
-      "vault_redirect_rejected",
-      `Refused HTTP redirect (${resp.status}) while loading dedicated Feishu credentials from Vault.`,
-    );
-  }
-
-  if (resp.status === 401 || resp.status === 403) {
-    throw new VaultBootstrapError(
-      "vault_auth_failed",
-      `Service authentication failed (${resp.status}) while loading dedicated Feishu credentials from Vault.`,
-    );
-  }
-
-  const rawText = await readBoundedUtf8Response(resp, MAX_VAULT_RESPONSE_BYTES);
-
-  if (!resp.ok) {
-    let remoteCode = "";
-    let missingKeys: DedicatedFeishuVaultKey[] = [];
-    if (rawText) {
-      try {
-        const errParsed = JSON.parse(rawText) as unknown;
-        if (isPlainRecord(errParsed)) {
-          remoteCode =
-            typeof errParsed.code === "string" ? errParsed.code.trim() : "";
-          missingKeys = filterAllowedKeyNames(errParsed.missing);
-        }
-      } catch {
-        // Ignore unparseable error body; never echo raw response text.
-      }
-    }
-    if (remoteCode === "vault_credentials_missing") {
-      const suffix =
-        missingKeys.length > 0 ? `: ${missingKeys.join(", ")}` : "";
-      throw new VaultBootstrapError(
-        "vault_credentials_missing",
-        `Dedicated Feishu credentials missing in primary administrator Vault${suffix}`,
-        missingKeys,
-      );
-    }
-    if (remoteCode === "vault_credentials_invalid") {
-      const suffix =
-        missingKeys.length > 0 ? `: ${missingKeys.join(", ")}` : "";
-      throw new VaultBootstrapError(
-        "vault_credentials_invalid",
-        `Dedicated Feishu credentials in primary administrator Vault have invalid format${suffix}`,
-        missingKeys,
-      );
-    }
-    throw new VaultBootstrapError(
-      "vault_unavailable",
-      `Dalton Vault credential endpoint returned HTTP ${resp.status}.`,
-    );
-  }
-
-  let parsedBody: unknown;
-  try {
-    parsedBody = JSON.parse(rawText);
-  } catch {
-    throw new VaultBootstrapError(
-      "vault_malformed_response",
-      "Received malformed JSON from Dalton Vault credential endpoint.",
-    );
-  }
-
-  if (!isPlainRecord(parsedBody) || !isPlainRecord(parsedBody.credentials)) {
-    throw new VaultBootstrapError(
-      "vault_malformed_response",
-      "Dalton Vault credential response is missing the expected credentials object.",
-    );
-  }
-
-  const credsRecord = parsedBody.credentials;
-  const rawAppId = credsRecord.DALTON_FEISHU_APP_ID;
-  const rawAppSecret = credsRecord.DALTON_FEISHU_APP_SECRET;
-
-  const appId = typeof rawAppId === "string" ? rawAppId.trim() : "";
-  const appSecret = typeof rawAppSecret === "string" ? rawAppSecret.trim() : "";
-
-  const missing: DedicatedFeishuVaultKey[] = [];
-  if (!appId) {
-    missing.push("DALTON_FEISHU_APP_ID");
-  }
-  if (!appSecret) {
-    missing.push("DALTON_FEISHU_APP_SECRET");
-  }
-  if (missing.length > 0) {
-    throw new VaultBootstrapError(
-      "vault_credentials_missing",
-      `Dedicated Feishu credentials missing or empty in Vault response: ${missing.join(", ")}`,
-      missing,
-    );
-  }
-
-  const invalid: DedicatedFeishuVaultKey[] = [];
-  if (/\s|\0/.test(appId)) {
-    invalid.push("DALTON_FEISHU_APP_ID");
-  }
-  if (/\s|\0/.test(appSecret)) {
-    invalid.push("DALTON_FEISHU_APP_SECRET");
-  }
-  if (invalid.length > 0) {
-    throw new VaultBootstrapError(
-      "vault_credentials_invalid",
-      `Dedicated Feishu credentials contain invalid whitespace or control characters: ${invalid.join(", ")}`,
-      invalid,
-    );
-  }
-
-  options.logger?.info("Loaded dedicated Feishu credentials from Dalton Vault", {
-    source: "vault",
-    keys: [...DEDICATED_FEISHU_VAULT_KEYS],
-  });
-
-  return { appId, appSecret };
 }

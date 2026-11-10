@@ -10,6 +10,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { HttpBackendClient } from "../src/backend-client.js";
@@ -31,6 +32,7 @@ import type { ChannelPlatform } from "../src/types.js";
 import {
   loadFeishuCredentialsFromVault,
   VaultBootstrapError,
+  type VaultBootstrapErrorCode,
 } from "../src/vault-credentials.js";
 import { createMockBackend, TEST_SERVICE_TOKEN } from "./helpers.js";
 
@@ -1582,7 +1584,7 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       enableDebug: true,
     });
 
-    let serverBehavior:
+    type VaultTestServerBehavior =
       | "valid_v1"
       | "valid_v2"
       | "missing_secret"
@@ -1590,7 +1592,10 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       | "auth_401"
       | "redirect_302"
       | "timeout"
-      | "malformed_json" = "valid_v1";
+      | "malformed_json";
+
+    let serverBehavior: VaultTestServerBehavior = "valid_v1";
+    const pendingTimers = new Set<NodeJS.Timeout>();
 
     const vaultHttpServer = createServer((req, res) => {
       if (
@@ -1625,11 +1630,13 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       }
       if (serverBehavior === "timeout") {
         // Hold connection past client timeout
-        setTimeout(() => {
+        const t = setTimeout(() => {
+          pendingTimers.delete(t);
           if (!res.writableEnded) {
             res.writeHead(504).end();
           }
         }, 300);
+        pendingTimers.add(t);
         return;
       }
       if (serverBehavior === "malformed_json") {
@@ -1804,8 +1811,8 @@ describe("Dalton data-task report delivery via channel gateway", () => {
 
       // 3. Error cases: missing values, empty 200, 401 auth failure, 302 redirect, timeout, malformed JSON -> fail closed with zero env fallback!
       const failureCases: Array<{
-        behavior: typeof serverBehavior;
-        expectedCode: string;
+        behavior: VaultTestServerBehavior;
+        expectedCode: VaultBootstrapErrorCode;
       }> = [
         { behavior: "missing_secret", expectedCode: "vault_credentials_missing" },
         { behavior: "empty_200", expectedCode: "vault_credentials_missing" },
@@ -1905,8 +1912,344 @@ describe("Dalton data-task report delivery via channel gateway", () => {
         expect(combinedLogs).not.toContain(secretCandidate);
       }
     } finally {
+      for (const t of pendingTimers) {
+        clearTimeout(t);
+      }
+      pendingTimers.clear();
+      vaultHttpServer.closeAllConnections();
       await closeHttpServer(vaultHttpServer);
       rmSync(envDir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces one Vault deadline across immediate 200 headers + delayed or stalled body, succeeds on within-deadline chunked body, and redacts mid-body stream errors", async () => {
+    const SYNTH_STREAM_APP_ID = "cli_synth_stream_deadline_app";
+    const SYNTH_STREAM_SECRET = "sec_synth_stream_deadline_secret_900";
+    const STALLED_BODY_SECRET = "sec_synth_stalled_body_fragment_901";
+    const DESTROYED_BODY_SECRET = "sec_synth_destroyed_body_fragment_902";
+    const OVERSIZED_BODY_SECRET = "sec_synth_oversized_body_fragment_903";
+
+    const logLines: string[] = [];
+    const sink: LoggerSink = {
+      debug: (line) => logLines.push(line),
+      info: (line) => logLines.push(line),
+      warn: (line) => logLines.push(line),
+      error: (line) => logLines.push(line),
+    };
+    const logger = createSubsystemLogger("test-vault-body-deadline", {
+      sink,
+      enableDebug: true,
+    });
+
+    type BodyDeadlineScenario =
+      | "headers_flushed_delayed_body"
+      | "partial_body_stalled_indefinitely"
+      | "within_deadline_chunked_ok"
+      | "mid_body_socket_destroy"
+      | "oversized_streaming_body";
+
+    let scenario: BodyDeadlineScenario = "headers_flushed_delayed_body";
+    const pendingTimers = new Set<NodeJS.Timeout>();
+
+    const scheduleTimer = (fn: () => void, ms: number): void => {
+      const handle = setTimeout(() => {
+        pendingTimers.delete(handle);
+        fn();
+      }, ms);
+      pendingTimers.add(handle);
+    };
+
+    const bodyServer = createServer((req, res) => {
+      if (
+        req.method !== "POST" ||
+        req.url !==
+          "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+      ) {
+        res.writeHead(404).end();
+        return;
+      }
+      if (req.headers["x-service-token"] !== TEST_SERVICE_TOKEN) {
+        res.writeHead(401, { "Cache-Control": "no-store" }).end();
+        return;
+      }
+
+      if (scenario === "headers_flushed_delayed_body") {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.flushHeaders();
+        scheduleTimer(() => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.end(
+              JSON.stringify({
+                credentials: {
+                  DALTON_FEISHU_APP_ID: SYNTH_STREAM_APP_ID,
+                  DALTON_FEISHU_APP_SECRET: SYNTH_STREAM_SECRET,
+                },
+              }),
+            );
+          }
+        }, 260);
+        return;
+      }
+
+      if (scenario === "partial_body_stalled_indefinitely") {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.flushHeaders();
+        res.write(
+          `{"credentials":{"DALTON_FEISHU_APP_SECRET":"${STALLED_BODY_SECRET}`,
+        );
+        // Intentionally never end `res`: client deadline must abort and clean up stream.
+        return;
+      }
+
+      if (scenario === "within_deadline_chunked_ok") {
+        const fullJson = JSON.stringify({
+          credentials: {
+            DALTON_FEISHU_APP_ID: SYNTH_STREAM_APP_ID,
+            DALTON_FEISHU_APP_SECRET: SYNTH_STREAM_SECRET,
+          },
+        });
+        const midpoint = Math.floor(fullJson.length / 2);
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.flushHeaders();
+        scheduleTimer(() => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(fullJson.slice(0, midpoint));
+          }
+        }, 10);
+        scheduleTimer(() => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.end(fullJson.slice(midpoint));
+          }
+        }, 25);
+        return;
+      }
+
+      if (scenario === "mid_body_socket_destroy") {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.flushHeaders();
+        res.write(
+          `{"credentials":{"DALTON_FEISHU_APP_SECRET":"${DESTROYED_BODY_SECRET}`,
+        );
+        scheduleTimer(() => {
+          req.socket.destroy();
+        }, 10);
+        return;
+      }
+
+      // `oversized_streaming_body`: exceed 16 KiB without Content-Length header
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.flushHeaders();
+      const pad = "x".repeat(18 * 1024);
+      res.end(
+        `{"credentials":{"DALTON_FEISHU_APP_ID":"${SYNTH_STREAM_APP_ID}","DALTON_FEISHU_APP_SECRET":"${OVERSIZED_BODY_SECRET}","pad":"${pad}"}}`,
+      );
+    });
+
+    const port = await listenEphemeralLoopback(bodyServer);
+    const backendUrl = `http://127.0.0.1:${port}`;
+
+    const withHardTestGuard = async <T>(
+      promise: Promise<T>,
+      guardMs = 1500,
+    ): Promise<T> => {
+      let guardTimer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_resolve, reject) => {
+            guardTimer = setTimeout(
+              () => reject(new Error(`Hard test guard (${guardMs}ms) exceeded`)),
+              guardMs,
+            );
+          }),
+        ]);
+      } finally {
+        if (guardTimer !== undefined) {
+          clearTimeout(guardTimer);
+        }
+      }
+    };
+
+    try {
+      // 1. Immediate 200 headers + body delayed past deadline -> `vault_timeout`, zero credentials returned
+      scenario = "headers_flushed_delayed_body";
+      const t0 = performance.now();
+      let delayedErr: unknown;
+      try {
+        await withHardTestGuard(
+          prepareGatewayRuntime({
+            env: {
+              GATEWAY_HOST: "127.0.0.1",
+              GATEWAY_PORT: "0",
+              DALTON_GATEWAY_MODE: "outgoing",
+              DALTON_BACKEND_URL: backendUrl,
+              INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+              DALTON_FEISHU_ENABLED: "true",
+              DALTON_FEISHU_CREDENTIAL_SOURCE: "vault",
+              DALTON_FEISHU_APP_ID: "cli_env_fallback_forbidden",
+              DALTON_FEISHU_APP_SECRET: "sec_env_fallback_forbidden",
+            },
+            vaultTimeoutMs: 35,
+            logger,
+          }),
+        );
+      } catch (err) {
+        delayedErr = err;
+      }
+      const delayedElapsedMs = performance.now() - t0;
+      expect(delayedErr).toBeInstanceOf(VaultBootstrapError);
+      expect((delayedErr as VaultBootstrapError).code).toBe("vault_timeout");
+      expect((delayedErr as Error).cause).toBeUndefined();
+      expect(delayedElapsedMs).toBeLessThan(220);
+
+      // 2. Partial body begins streaming then stalls indefinitely -> `vault_timeout` without leaking partial chunk
+      scenario = "partial_body_stalled_indefinitely";
+      let stalledErr: unknown;
+      try {
+        await withHardTestGuard(
+          prepareGatewayRuntime({
+            env: {
+              GATEWAY_HOST: "127.0.0.1",
+              GATEWAY_PORT: "0",
+              DALTON_GATEWAY_MODE: "outgoing",
+              DALTON_BACKEND_URL: backendUrl,
+              INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+              DALTON_FEISHU_ENABLED: "true",
+              DALTON_FEISHU_CREDENTIAL_SOURCE: "vault",
+            },
+            vaultTimeoutMs: 40,
+            logger,
+          }),
+        );
+      } catch (err) {
+        stalledErr = err;
+      }
+      expect(stalledErr).toBeInstanceOf(VaultBootstrapError);
+      expect((stalledErr as VaultBootstrapError).code).toBe("vault_timeout");
+      expect((stalledErr as Error).cause).toBeUndefined();
+      expect((stalledErr as Error).message).not.toContain(STALLED_BODY_SECRET);
+
+      // 3. Within-deadline chunked body -> succeeds cleanly and passes credentials in memory only
+      scenario = "within_deadline_chunked_ok";
+      const observedCreds: Array<{ appId: string; appSecret: string }> = [];
+      const { client: fakeLark } = createFakeOutboundLarkClient();
+      const okRuntime = await withHardTestGuard(
+        prepareGatewayRuntime({
+          env: {
+            GATEWAY_HOST: "127.0.0.1",
+            GATEWAY_PORT: "0",
+            DALTON_GATEWAY_MODE: "outgoing",
+            DALTON_BACKEND_URL: backendUrl,
+            INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+            DALTON_FEISHU_ENABLED: "true",
+            DALTON_FEISHU_CREDENTIAL_SOURCE: "vault",
+          },
+          vaultTimeoutMs: 500,
+          logger,
+          adapterOverrides: {
+            feishu: {
+              clientFactory: (creds) => {
+                observedCreds.push({
+                  appId: creds.appId,
+                  appSecret: creds.appSecret,
+                });
+                return fakeLark;
+              },
+            },
+          },
+        }),
+      );
+      const okAdapter = okRuntime.adapters.get("feishu") as FeishuChannelAdapter;
+      await okAdapter.sendTextChunk({
+        targetAddress: "feishu:oc_synth_stream_ok",
+        text: "stream-ok",
+        chunkIndex: 0,
+        totalChunks: 1,
+      });
+      expect(observedCreds).toEqual([
+        { appId: SYNTH_STREAM_APP_ID, appSecret: SYNTH_STREAM_SECRET },
+      ]);
+      await okRuntime.app.stop();
+
+      // 4. Failure during response-body consumption (mid-stream socket reset) -> safe `vault_unavailable`, no cause/secret leak
+      scenario = "mid_body_socket_destroy";
+      let destroyErr: unknown;
+      try {
+        await withHardTestGuard(
+          loadFeishuCredentialsFromVault({
+            backendUrl,
+            serviceToken: TEST_SERVICE_TOKEN,
+            timeoutMs: 500,
+            logger,
+          }),
+        );
+      } catch (err) {
+        destroyErr = err;
+      }
+      expect(destroyErr).toBeInstanceOf(VaultBootstrapError);
+      expect((destroyErr as VaultBootstrapError).code).toBe("vault_unavailable");
+      expect((destroyErr as Error).cause).toBeUndefined();
+      expect((destroyErr as Error).message).not.toContain(DESTROYED_BODY_SECRET);
+      expect((destroyErr as Error).message).not.toContain(TEST_SERVICE_TOKEN);
+
+      // 5. Oversized streaming body (> 16 KiB) -> rejected as `vault_malformed_response` without leaking secret
+      scenario = "oversized_streaming_body";
+      let oversizedErr: unknown;
+      try {
+        await withHardTestGuard(
+          loadFeishuCredentialsFromVault({
+            backendUrl,
+            serviceToken: TEST_SERVICE_TOKEN,
+            timeoutMs: 500,
+            logger,
+          }),
+        );
+      } catch (err) {
+        oversizedErr = err;
+      }
+      expect(oversizedErr).toBeInstanceOf(VaultBootstrapError);
+      expect((oversizedErr as VaultBootstrapError).code).toBe(
+        "vault_malformed_response",
+      );
+      expect((oversizedErr as Error).cause).toBeUndefined();
+      expect((oversizedErr as Error).message).not.toContain(
+        OVERSIZED_BODY_SECRET,
+      );
+
+      // 6. Verify zero credentials or service tokens ever appeared in captured logs
+      const allLogs = logLines.join("\n");
+      for (const secretCandidate of [
+        SYNTH_STREAM_APP_ID,
+        SYNTH_STREAM_SECRET,
+        STALLED_BODY_SECRET,
+        DESTROYED_BODY_SECRET,
+        OVERSIZED_BODY_SECRET,
+        TEST_SERVICE_TOKEN,
+      ]) {
+        expect(allLogs).not.toContain(secretCandidate);
+      }
+    } finally {
+      for (const t of pendingTimers) {
+        clearTimeout(t);
+      }
+      pendingTimers.clear();
+      bodyServer.closeAllConnections();
+      await closeHttpServer(bodyServer);
     }
   });
 });

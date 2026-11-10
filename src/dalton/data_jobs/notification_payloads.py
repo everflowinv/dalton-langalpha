@@ -530,7 +530,11 @@ def _safe_read_contained_regular_file(
     max_bytes: int = MAX_NOTIFICATION_ARTIFACT_BYTES,
     reject_base_symlink: bool = True,
 ) -> bytes:
-    """Open and read ``relative_path`` under ``base_dir`` without following symlinks on any segment."""
+    """Open and read ``relative_path`` under ``base_dir`` without following symlinks on any segment.
+
+    Opens the leaf with ``O_NONBLOCK`` so FIFOs or special nodes cannot block ``open(2)``
+    before ``fstat`` rejects non-regular descriptors.
+    """
     parts = _normalize_strict_relative_parts(relative_path)
     base_str = os.fspath(base_dir)
     try:
@@ -543,12 +547,24 @@ def _safe_read_contained_regular_file(
     if reject_base_symlink and stat.S_ISLNK(base_lstat.st_mode):
         raise DataTaskArtifactError("Artifact base directory cannot be a symlink", code="symlink_rejected")
 
-    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    cloexec_flag = getattr(os, "O_CLOEXEC", 0)
+    nonblock_flag = getattr(os, "O_NONBLOCK", 0)
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | cloexec_flag
     if reject_base_symlink:
         dir_flags |= getattr(os, "O_NOFOLLOW", 0)
 
-    nofollow_dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    nofollow_file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    nofollow_dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | cloexec_flag
+    )
+    nofollow_file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | nonblock_flag
+        | cloexec_flag
+    )
 
     current_fd: int | None = None
     try:
@@ -574,8 +590,9 @@ def _safe_read_contained_regular_file(
                         code="symlink_rejected",
                     ) from exc
                 raise DataTaskArtifactError("Failed to traverse artifact directory") from exc
-            os.close(current_fd)
+            prev_fd = current_fd
             current_fd = next_fd
+            os.close(prev_fd)
 
         leaf_name = parts[-1]
         try:
@@ -588,12 +605,24 @@ def _safe_read_contained_regular_file(
                     "Symlink or directory target is forbidden for artifact file",
                     code="symlink_rejected",
                 ) from exc
+            if exc.errno in (
+                errno.ENXIO,
+                getattr(errno, "EOPNOTSUPP", errno.ENXIO),
+                getattr(errno, "ENOTSUP", errno.ENXIO),
+            ):
+                raise DataTaskArtifactError(
+                    "Artifact target is not a regular file",
+                    code="unsupported_media_type",
+                ) from exc
             raise DataTaskArtifactError("Failed to open artifact file") from exc
 
         try:
             file_stat = os.fstat(file_fd)
             if not stat.S_ISREG(file_stat.st_mode):
-                raise DataTaskArtifactError("Artifact target is not a regular file", code="unsupported_media_type")
+                raise DataTaskArtifactError(
+                    "Artifact target is not a regular file",
+                    code="unsupported_media_type",
+                )
             if file_stat.st_size <= 0:
                 raise DataTaskArtifactError("Artifact file is empty", code="artifact_empty")
             if file_stat.st_size > max_bytes:
@@ -601,6 +630,9 @@ def _safe_read_contained_regular_file(
                     f"Artifact exceeds maximum size ({file_stat.st_size} > {max_bytes} bytes)",
                     code="artifact_too_large",
                 )
+
+            if nonblock_flag and hasattr(os, "set_blocking"):
+                os.set_blocking(file_fd, True)
 
             chunks: list[bytes] = []
             total = 0

@@ -31,6 +31,7 @@ from src.dalton.data_jobs.notification_payloads import (
     DataTaskNotificationPrepError,
     T26_JOB_KEY,
     T27_JOB_KEY,
+    _safe_read_contained_regular_file,
     build_data_task_delivery_plan,
     prepare_t27_run_outbox,
     read_validated_run_artifact,
@@ -550,7 +551,7 @@ def test_artifact_security_containment_symlinks_urls_oversized_and_router_auth(
             )
         assert bad_exc.value.code == expected_code
 
-    # 4. Unsupported format (HTML disguised as .png) & cross-run read rejection
+    # 4. Unsupported format (HTML disguised as .png), directory target, missing file, oversized file, & cross-run read rejection
     disguised = run_dir / "images" / "fake.png"
     disguised.write_bytes(b"<!doctype html><html>not an image</html>")
     with pytest.raises(DataTaskArtifactError) as mime_exc:
@@ -568,6 +569,22 @@ def test_artifact_security_containment_symlinks_urls_oversized_and_router_auth(
             run_artifacts_dir=run_dir,
         )
     assert mime_exc.value.code == "unsupported_media_type"
+
+    dir_target = run_dir / "images" / "subdir.png"
+    dir_target.mkdir()
+    with pytest.raises(DataTaskArtifactError) as dir_target_exc:
+        _safe_read_contained_regular_file(run_dir, "images/subdir.png")
+    assert dir_target_exc.value.code in ("unsupported_media_type", "symlink_rejected")
+
+    with pytest.raises(DataTaskArtifactError) as missing_exc:
+        _safe_read_contained_regular_file(run_dir, "images/does_not_exist.png")
+    assert missing_exc.value.code == "artifact_missing"
+
+    oversized_img = run_dir / "images" / "oversized.png"
+    oversized_img.write_bytes(_make_synthetic_png(b"BIG" * 64))
+    with pytest.raises(DataTaskArtifactError) as over_exc:
+        _safe_read_contained_regular_file(run_dir, "images/oversized.png", max_bytes=32)
+    assert over_exc.value.code == "artifact_too_large"
 
     valid_img = _make_synthetic_png(b"VALID-IMG")
     (run_dir / "images" / "ok.png").write_bytes(valid_img)
@@ -799,19 +816,30 @@ async def test_gateway_transport_and_wrapping_layers_preserve_uncertain_state_an
     assert marked_calls[0]["status"] == "pending"
     assert marked_calls[0]["error_code"] == "in_flight"
 
-    # 4. Non-data notification (`on_automation_settled`) still uses `post_bridge_notify`
+    # 4. Non-data notification (`on_automation_settled`) still uses `post_bridge_notify` and never uses data-task transport
+    data_task_gw_spy = create_autospec(notify_dispatch_mod.post_data_task_gateway_notify)
+    monkeypatch.setattr(notify_dispatch_mod, "post_data_task_gateway_notify", data_task_gw_spy)
+
     bridge_double = create_autospec(
         notify_dispatch_mod.post_bridge_notify,
         return_value={"ok": True, "status_code": 200, "results": [{"target": target, "ok": True}]},
     )
     settled_ok = await notify_dispatch_mod.on_automation_settled(
-        automation={"automation_id": str(uuid4()), "name": "dalton-nvda-earn-2026q3-t0"},
+        automation={
+            "automation_id": str(uuid4()),
+            "user_id": "pm-synth-1",
+            "name": "dalton-nvda-earn-2026q3-t0",
+        },
         execution_id=str(uuid4()),
         final_text="## 结论\n合成财报点评",
         resolve_enabled_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
         resolve_overrides_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
-        resolve_targets_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_targets, return_value=[target]),
-        resolve_routes_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_routes, return_value={}),
+        resolve_targets_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_targets, return_value=[]),
+        resolve_routes_fn=create_autospec(
+            notify_dispatch_mod.resolve_dalton_notify_routes,
+            return_value={"earnings_t0": [target]},
+        ),
+        is_admin_fn=create_autospec(notify_dispatch_mod._default_notify_admin, return_value=True),
         get_verdict_fn=create_autospec(notify_dispatch_mod.get_verdict_for_execution, return_value=None),
         claim_target_fn=create_autospec(notify_dispatch_mod.claim_target_delivery, return_value=True),
         mark_target_fn=create_autospec(notify_dispatch_mod.mark_target_delivery, return_value=True),
@@ -820,6 +848,8 @@ async def test_gateway_transport_and_wrapping_layers_preserve_uncertain_state_an
     )
     assert settled_ok is True
     bridge_double.assert_awaited_once()
+    assert bridge_double.await_args.args[0] == [target]
+    data_task_gw_spy.assert_not_awaited()
 
 
 def test_channel_gateway_url_container_to_host_loopback_rewrite(
@@ -1124,3 +1154,83 @@ def test_launchd_template_contains_no_plaintext_feishu_or_service_secrets() -> N
         "INTERNAL_SERVICE_TOKEN",
     ):
         assert forbidden_key not in env_vars
+
+
+def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess() -> None:
+    """R3 §1: Writerless FIFO artifact leaf is rejected immediately via nonblocking open + fstat without stalling."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    project_root = Path(__file__).resolve().parents[3]
+    tmp_dir = Path(tempfile.mkdtemp(prefix="dalton-fifo-reg-")).resolve()
+    proc: subprocess.Popen[str] | None = None
+    try:
+        images_dir = tmp_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        fifo_path = images_dir / "chart.png"
+        os.mkfifo(fifo_path)
+
+        child_script = "\n".join(
+            [
+                "import json",
+                "from pathlib import Path",
+                "from uuid import uuid4",
+                "from src.dalton.data_jobs.notification_payloads import (",
+                "    DataTaskArtifactError,",
+                "    _safe_read_contained_regular_file,",
+                "    build_data_task_delivery_plan,",
+                ")",
+                f"root = Path({str(tmp_dir)!r})",
+                "direct_code = None",
+                "try:",
+                "    _safe_read_contained_regular_file(root, 'images/chart.png')",
+                "except DataTaskArtifactError as exc:",
+                "    direct_code = exc.code",
+                "plan_code = None",
+                "try:",
+                "    build_data_task_delivery_plan(",
+                "        run_id=str(uuid4()),",
+                "        job_key='softbank-nav-monitor',",
+                "        raw_outbox={",
+                "            'feishu_cards': [{",
+                "                'card': {'schema': '2.0', 'body': {'elements': [{'tag': '__img__', 'path': 'p0'}]}},",
+                "                'images': [{'placeholder': 'p0', 'path': 'images/chart.png'}],",
+                "            }]",
+                "        },",
+                "        run_artifacts_dir=root,",
+                "    )",
+                "except DataTaskArtifactError as exc:",
+                "    plan_code = exc.code",
+                "print(json.dumps({'direct_code': direct_code, 'plan_code': plan_code}), flush=True)",
+            ]
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            cwd=project_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout_text, stderr_text = proc.communicate(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5.0)
+            pytest.fail(
+                "FIFO artifact open blocked in isolated child subprocess beyond 3.0s hard timeout"
+            )
+
+        assert proc.returncode == 0, f"Child subprocess failed: {stderr_text}"
+        result = json.loads(stdout_text.strip().splitlines()[-1])
+        assert result == {
+            "direct_code": "unsupported_media_type",
+            "plan_code": "unsupported_media_type",
+        }
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    assert not tmp_dir.exists()
