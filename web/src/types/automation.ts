@@ -187,3 +187,157 @@ export interface AutomationRun extends AutomationExecution {
   trigger_type: TriggerType;
   workspace_id: string | null;
 }
+
+/** A list or feed filter. Omitted on the request, the list stays the caller's
+ *  own personal and research tasks and does not ask for company tasks. */
+export type AutomationScope = 'personal' | 'research_tracking' | 'company';
+
+/** Normalized list key. `null` is the omitted filter, not a fourth scope and
+ *  not an empty string. */
+export interface AutomationReadListQuery {
+  scope: AutomationScope | null;
+  status: string | null;
+  limit: number;
+  offset: number;
+}
+
+/** Normalized feed key. `thread_id` null means the request left it off. */
+export interface AutomationRunReadQuery {
+  scope: AutomationScope | null;
+  status: string | null;
+  thread_id: string | null;
+  limit: number;
+  offset: number;
+}
+
+/** Normalized page key for one task's runs or its modification history. */
+export interface AutomationReadPageQuery {
+  limit: number;
+  offset: number;
+}
+
+// DALTON-HOOK(company-automations): agent and script read models. Write payloads stay agent-only.
+
+/** An agent task as the read API returns it. `last_execution` is the execution
+ *  row from the list: it has no `engine_kind`. */
+export interface AgentAutomationRead extends Automation {
+  engine_kind: 'agent';
+  scope: AutomationScope;
+  notify_storage_mode: string;
+  config_version: number;
+  active_version: number;
+  created_by: string | null;
+  updated_by: string | null;
+  additional_context: Record<string, unknown>[] | null;
+}
+
+/** One script run nested on a script task. Status stays the stored word
+ *  (`succeeded`, `timed_out`, …). There is no conversation to open. */
+export interface ScriptExecutionRead {
+  automation_execution_id: string;
+  automation_id: string;
+  status: string;
+  scheduled_at: string;
+  created_at: string;
+  engine_kind: 'script';
+  conversation_thread_id: null;
+  started_at: string | null;
+  completed_at: string | null;
+  exit_code: number | null;
+  failure_reason: string | null;
+  notify_status: string | null;
+  triggered_by_user_id: string | null;
+  log_tail: string | null;
+  trigger_source: string | null;
+}
+
+/** A company manifest script. Agent fields (instruction, trigger, user,
+ *  workspace, model) are absent. `description` is always null. */
+export interface ScriptAutomationRead {
+  automation_id: string;
+  name: string;
+  status: string;
+  enabled: boolean;
+  paused_by_user: boolean;
+  cron_expression: string;
+  timezone: string;
+  config_version: number;
+  active_version: number;
+  updated_at: string;
+  notify_storage_mode: string;
+  engine_kind: 'script';
+  scope: 'company';
+  description: null;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  updated_by: string | null;
+  dalton_notify_category: string | null;
+  dalton_notify_effective: boolean | null;
+  dalton_notify_source: string | null;
+  dalton_notify_route_targets: string[] | null;
+  last_execution: ScriptExecutionRead | null;
+}
+
+/** One task from the scoped list or the detail route. */
+export type AutomationRead = AgentAutomationRead | ScriptAutomationRead;
+
+/** An agent run in the feed or in one task's run page. */
+export interface AgentAutomationRunRead extends AutomationRun {
+  engine_kind: 'agent';
+}
+
+/** A script run in the feed or in one task's run page. `trigger_type` is
+ *  absent. `workspace_id` and `excerpt` are null. */
+export interface ScriptAutomationRunRead extends ScriptExecutionRead {
+  automation_name: string;
+  workspace_id: null;
+  excerpt: null;
+}
+
+/** One row of the shared run page. */
+export type AutomationRunRead = AgentAutomationRunRead | ScriptAutomationRunRead;
+
+/** `{automations, total}` from `GET /api/v1/automations`. */
+export interface AutomationReadList {
+  automations: AutomationRead[];
+  /** Server total for the filter, not `automations.length`. */
+  total: number;
+}
+
+/** `{executions, has_more}` from the feed and from one task's run page. */
+export interface AutomationRunReadList {
+  executions: AutomationRunRead[];
+  /** Server flag. A short page can still have more, and a full page can be the last. */
+  has_more: boolean;
+}
+
+/** One field's before and after on a modification-history entry. */
+export interface AutomationFieldChange {
+  old: unknown;
+  new: unknown;
+}
+
+/** One stored version. Nullable columns stay nullable. */
+export interface AutomationHistoryEntry {
+  version: number;
+  prev_version: number | null;
+  restored_from_version: number | null;
+  actor_user_id: string | null;
+  changed_at: string | null;
+  action: string;
+  changes: Record<string, AutomationFieldChange>;
+  snapshot: Record<string, unknown>;
+}
+
+/** `GET /api/v1/automations/{id}/history`. */
+export interface AutomationHistory {
+  automation_id: string;
+  scope: string;
+  engine_kind: 'agent' | 'script';
+  config_version: number;
+  active_version: number;
+  entries: AutomationHistoryEntry[];
+  total: number;
+  limit: number;
+  offset: number;
+}
