@@ -95,6 +95,20 @@ class SteeredReportInbox:
         steers = await _take_steers(thread_id, run_id) if "steer" in kinds else []
         return reports + steers
 
+    # DALTON-HOOK(chat-large-upload): claim once-only live stream notices for permanently failed steers
+    async def take_failed(self, thread_id: str, run_id: str) -> list[dict[str, Any]]:
+        """Claim unannounced permanent steer attachment failures for ``run_id``."""
+        from src.server.database.runs import outbox as outbox_db
+
+        try:
+            return await outbox_db.claim_unannounced_failed_steers(thread_id, run_id)
+        except Exception:
+            logger.warning(
+                f"[REPORT_STEER] Claiming failed steers for {thread_id} run {run_id} failed",
+                exc_info=True,
+            )
+            return []
+
     def render_group(self, kind: str, contents: list[str]) -> str:
         """The one block the reports of ``kind`` one model call takes in read as."""
         return _GROUP_BLOCKS[kind](contents)

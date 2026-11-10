@@ -10,9 +10,11 @@ responses (never persisted, never mark_failed).
 
 from __future__ import annotations
 
+# DALTON-HOOK(chat-large-upload): async cleanup shield and typing for staged steer attachments
+import asyncio
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -196,8 +198,11 @@ async def wait_or_steer(
     steer_job_id: str | None = None,
     agent: AgentSteer | None = None,
     artifact_comments: ShownSend | None = None,
-    # DALTON-HOOK(chat-large-upload): carry validated chat_upload descriptors on steers
+    # DALTON-HOOK(chat-large-upload): carry ordered object-backed attachment descriptors on steers
     chat_uploads: list[dict] | None = None,
+    additional_context: list[Any] | None = None,
+    is_existing_colleague_thread: bool = False,
+    upload_claim_key: str | None = None,
 ) -> tuple[bool, str | HandOffSteered | None]:
     """Admit a new turn, steer the running one, or 409.
 
@@ -246,112 +251,165 @@ async def wait_or_steer(
     from src.server.database.runs import outbox as outbox_db
     from src.server.handlers.chat.steering import steer_payload
 
-    # DALTON-HOOK(chat-large-upload): build verified attachment metadata once for steered chat_uploads
+    # DALTON-HOOK(chat-large-upload): stage mixed/inline + chat_upload attachments for steers and clean up on non-acceptance
+    resolved_chat_uploads: list[dict] | None = chat_uploads
     steer_attachments: list[dict] | None = None
-    if chat_uploads:
+    staged_inline_ids: list[str] = []
+    staged_once = False
+    accepted_ok = False
+
+    if resolved_chat_uploads and additional_context is None:
         from src.dalton.services.chat_uploads import build_chat_upload_history_metadata
 
         steer_attachments = (
             await build_chat_upload_history_metadata(
-                chat_uploads,
+                resolved_chat_uploads,
                 user_id=user_id,
                 workspace_id=workspace_id,
             )
             or None
         )
 
-    for _lap in range(_STEER_ADMISSION_LAPS):
-        state, active_row = await manager.wait_for_admission(thread_id)
-        # A START that committed before that read, or a steer admitted
-        # before it, is visible from here on, whatever worker made it.
-        await dedup_retransmit_or_raise(
-            thread_id, request_key, except_job_id=steer_job_id
-        )
-        if state == "fresh":
-            if steer_only:
-                raise HTTPException(
-                    status_code=409, detail=admission_conflict_detail("not_running")
-                )
-            return True, None
-
-        # Only a genuinely-running turn on a steerable path can be steered;
-        # every other non-fresh state, and every request ``steer_allowed``
-        # refuses, is a conflict. Steering mid-stopping would start a second
-        # checkpoint writer; mid-compaction would corrupt the context rewrite.
-        if state != "running" or not can_steer or active_row is None:
-            raise HTTPException(
-                status_code=409, detail=admission_conflict_detail(state)
+    try:
+        for _lap in range(_STEER_ADMISSION_LAPS):
+            state, active_row = await manager.wait_for_admission(thread_id)
+            # A START that committed before that read, or a steer admitted
+            # before it, is visible from here on, whatever worker made it.
+            await dedup_retransmit_or_raise(
+                thread_id, request_key, except_job_id=steer_job_id
             )
+            if state == "fresh":
+                if steer_only:
+                    raise HTTPException(
+                        status_code=409, detail=admission_conflict_detail("not_running")
+                    )
+                return True, None
 
-        active_run_id = str(active_row["conversation_response_id"])
-        # DALTON-HOOK(chat-large-upload): persist chat_upload descriptors and verified attachments in steer outbox payload
-        payload = steer_payload(
-            user_input,
-            user_id,
-            sender=agent.sender if agent else "user",
-            workspace_id=workspace_id,
-            platform=platform,
-            request_key=request_key,
-            origin=agent.origin if agent else None,
-            artifact_comments=artifact_comments,
-            chat_uploads=chat_uploads,
-            attachments=steer_attachments,
-        )
-        if agent is not None:
-            idempotency_key = agent.idempotency_key
-        elif request_key:
-            idempotency_key = steer_idempotency_key(request_key)
-        else:
-            idempotency_key = f"steer:{uuid4()}"
-        result = await outbox_db.admit_steer(
-            thread_id=thread_id,
-            run_id=active_run_id,
-            payload=payload,
-            idempotency_key=idempotency_key,
-            origin_stamp=agent.origin_stamp if agent else None,
-        )
-        if result["state"] == "accepted" and agent is not None:
-            from src.server.handlers.chat.request_prep import HandOffSteered
-
-            return False, HandOffSteered(active_run_id, result["job_id"])
-        if result["state"] == "accepted":
-            accepted = {
-                "thread_id": thread_id,
-                "content": payload["content"],
-                "position": result["position"],
-            }
-            if artifact_comments is not None:
-                accepted["artifact_comments"] = artifact_comments.model_dump(
-                    mode="json"
+            # Only a genuinely-running turn on a steerable path can be steered;
+            # every other non-fresh state, and every request ``steer_allowed``
+            # refuses, is a conflict. Steering mid-stopping would start a second
+            # checkpoint writer; mid-compaction would corrupt the context rewrite.
+            if state != "running" or not can_steer or active_row is None:
+                raise HTTPException(
+                    status_code=409, detail=admission_conflict_detail(state)
                 )
-            if steer_attachments:
-                accepted["attachments"] = steer_attachments
-            event_data = json.dumps(accepted)
-            return False, f"event: steering_accepted\ndata: {event_data}\n\n"
-        if result["state"] == "duplicate":
-            # Another copy of this send steered between the recheck and here.
-            job = result["job"]
-            run_id, steered = steer_job_run_id(job)
-            run = await tl_db.get_run(run_id) if run_id else None
-            if run is None:
+
+            # DALTON-HOOK(chat-large-upload): persist ordered inline + chat_upload batch before durable steer acceptance
+            if not staged_once and additional_context is not None:
+                from src.dalton.services.chat_uploads import (
+                    build_chat_upload_history_metadata,
+                    stage_request_attachments_for_steer,
+                )
+
+                staged_descriptors, staged_inline_ids = (
+                    await stage_request_attachments_for_steer(
+                        additional_context,
+                        user_id=user_id,
+                        workspace_id=str(workspace_id or ""),
+                        is_existing_colleague_thread=is_existing_colleague_thread,
+                        claim_key=upload_claim_key,
+                    )
+                )
+                resolved_chat_uploads = staged_descriptors or None
+                steer_attachments = (
+                    await build_chat_upload_history_metadata(
+                        resolved_chat_uploads,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                    )
+                    or None
+                    if resolved_chat_uploads
+                    else None
+                )
+                staged_once = True
+
+            active_run_id = str(active_row["conversation_response_id"])
+            # DALTON-HOOK(chat-large-upload): persist chat_upload descriptors and verified attachments in steer outbox payload
+            payload = steer_payload(
+                user_input,
+                user_id,
+                sender=agent.sender if agent else "user",
+                workspace_id=workspace_id,
+                platform=platform,
+                request_key=request_key,
+                origin=agent.origin if agent else None,
+                artifact_comments=artifact_comments,
+                chat_uploads=resolved_chat_uploads,
+                attachments=steer_attachments,
+            )
+            if agent is not None:
+                idempotency_key = agent.idempotency_key
+            elif request_key:
+                idempotency_key = steer_idempotency_key(request_key)
+            else:
+                idempotency_key = f"steer:{uuid4()}"
+            result = await outbox_db.admit_steer(
+                thread_id=thread_id,
+                run_id=active_run_id,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                origin_stamp=agent.origin_stamp if agent else None,
+                upload_claim_key=upload_claim_key,
+            )
+            if result["state"] == "accepted" and agent is not None:
+                accepted_ok = True
+                from src.server.handlers.chat.request_prep import HandOffSteered
+
+                return False, HandOffSteered(active_run_id, result["job_id"])
+            if result["state"] == "accepted":
+                accepted_ok = True
+                accepted = {
+                    "thread_id": thread_id,
+                    "content": payload["content"],
+                    "position": result["position"],
+                }
+                if artifact_comments is not None:
+                    accepted["artifact_comments"] = artifact_comments.model_dump(
+                        mode="json"
+                    )
+                # DALTON-HOOK(chat-large-upload): include verified attachment metadata in steering_accepted
+                if steer_attachments:
+                    accepted["attachments"] = steer_attachments
+                event_data = json.dumps(accepted)
+                return False, f"event: steering_accepted\ndata: {event_data}\n\n"
+            if result["state"] == "duplicate":
+                # Another copy of this send steered between the recheck and here.
+                job = result["job"]
+                run_id, steered = steer_job_run_id(job)
+                run = await tl_db.get_run(run_id) if run_id else None
+                if run is None:
+                    raise HTTPException(
+                        status_code=409, detail=admission_conflict_detail("running")
+                    )
+                if steered and agent is not None:
+                    # The primer answers it as it answered the copy that steered.
+                    from src.server.handlers.chat.request_prep import HandOffSteered
+
+                    return False, HandOffSteered(
+                        str(run["conversation_response_id"]), str(job["id"])
+                    )
+                raise tl_db.DuplicateRequestError(run, steered=steered)
+            if result["state"] != "not_running":
+                # ``owned_elsewhere``: the run reports back to another Home
+                # thread, so this one's hand-off cannot ride it.
                 raise HTTPException(
                     status_code=409, detail=admission_conflict_detail("running")
                 )
-            if steered and agent is not None:
-                # The primer answers it as it answered the copy that steered.
-                from src.server.handlers.chat.request_prep import HandOffSteered
+            # The run ended or was stopped between the admission read and the
+            # insert: nothing was written, so read admission again.
 
-                return False, HandOffSteered(
-                    str(run["conversation_response_id"]), str(job["id"])
-                )
-            raise tl_db.DuplicateRequestError(run, steered=steered)
-        if result["state"] != "not_running":
-            # ``owned_elsewhere``: the run reports back to another Home
-            # thread, so this one's hand-off cannot ride it.
-            raise HTTPException(
-                status_code=409, detail=admission_conflict_detail("running")
+        raise HTTPException(status_code=409, detail=admission_conflict_detail("running"))
+    finally:
+        # DALTON-HOOK(chat-large-upload): delete server-staged inline blobs if steer was not accepted
+        if staged_inline_ids and not accepted_ok:
+            from src.dalton.services.chat_uploads import (
+                cleanup_unaccepted_staged_uploads,
             )
-        # The run ended or was stopped between the admission read and the
-        # insert: nothing was written, so read admission again.
 
-    raise HTTPException(status_code=409, detail=admission_conflict_detail("running"))
+            await asyncio.shield(
+                cleanup_unaccepted_staged_uploads(
+                    staged_inline_ids,
+                    user_id=user_id,
+                    claim_key=upload_claim_key,
+                )
+            )

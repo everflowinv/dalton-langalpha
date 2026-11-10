@@ -625,6 +625,30 @@ class RunSSEProducer:
                             })
                             continue
 
+                        # DALTON-HOOK(chat-large-upload): surface permanently failed steer attachments live
+                        if event_type == "steering_returned":
+                            returned_payload: Dict[str, Any] = {
+                                "thread_id": self.thread_id,
+                                "turn_index": self.turn_index,
+                            }
+                            for key in (
+                                "reason",
+                                "error",
+                                "error_code",
+                                "request_key",
+                                "content",
+                                "attachments",
+                                "artifact_comments",
+                                "timestamp",
+                                "job_id",
+                            ):
+                                if event_data.get(key) is not None:
+                                    returned_payload[key] = event_data[key]
+                            yield self._build_sse_event(
+                                "steering_returned", returned_payload
+                            )
+                            continue
+
                         # ``model_fallback`` arrives as a langgraph ui record
                         # (push_ui_message dual-writes the custom stream + the
                         # checkpointed ui channel); unwrap to the legacy wire

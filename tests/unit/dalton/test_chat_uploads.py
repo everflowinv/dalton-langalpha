@@ -488,6 +488,7 @@ class InMemoryChatUploadLedger:
         upload_ids: Sequence[str] | None = None,
         now: datetime | None = None,
     ) -> int:
+        del request_key
         key = str(claim_key or "").strip()
         if not key:
             return 0
@@ -499,7 +500,6 @@ class InMemoryChatUploadLedger:
         if wanted is not None and not wanted:
             return 0
         eff_now = now or datetime.now(timezone.utc)
-        clean_req = str(request_key or "").strip()
         async with self._lock:
             matched = [
                 row
@@ -509,16 +509,6 @@ class InMemoryChatUploadLedger:
                 and key in (row.get("pending_claims") or {})
             ]
             if not matched:
-                return 0
-            if clean_req and clean_req in self.accepted_request_keys:
-                for row in matched:
-                    if row["state"] == "ready" and row["cleaned_at"] is None:
-                        row["used_at"] = row["used_at"] or eff_now
-                        row["expires_at"] = None
-                        row["pending_claims"] = self._pruned_claims(
-                            row, eff_now, drop_key=key
-                        )
-                        row["updated_at"] = eff_now
                 return 0
             for row in matched:
                 row["pending_claims"] = self._pruned_claims(
@@ -878,9 +868,11 @@ def upload_env(monkeypatch: pytest.MonkeyPatch):
         if workspace_id == home_id and workspace_id not in workspaces:
             return None
         ws = workspaces.get(workspace_id)
-        if ws is None:
+        if ws is None or ws.get("status") == "deleted":
             raise HTTPException(status_code=404, detail="Workspace not found")
         if str(ws["user_id"]) != str(user_id):
+            if ws.get("web_access") == "rw" and user_id in (ws.get("colleagues") or ()):
+                return ws
             raise HTTPException(status_code=403, detail="Forbidden")
         return ws
 
@@ -1535,19 +1527,35 @@ class _FakeSandbox:
         return True
 
     async def _runtime_call(self, fn: Any, *args: Any, **kwargs: Any) -> _FakeExecResult:
+        import shlex as _shlex
+
         cmd = str(args[0]) if args else ""
         if "for p in " in cmd:
             # Missing-path probe from _probe_missing_sandbox_paths
-            import shlex as _shlex
-
             prefix = cmd.split("for p in ", 1)[1].split("; do ", 1)[0]
             missing = [p for p in _shlex.split(prefix) if p not in self.files]
             return _FakeExecResult(
                 stdout="\n".join(missing) + ("\n" if missing else ""),
                 exit_code=0,
             )
-        # Simulate plenty of free disk space (20 GiB free in 1K-blocks df output)
-        df_out = "Filesystem 1024-blocks Used Available Capacity Mounted on\noverlay 52428800 1048576 20971520 5% /home/workspace\n"
+        if "p, exp_sz, exp_sha = sys.argv[1]" in cmd:
+            parts = _shlex.split(cmd)
+            if len(parts) >= 3:
+                target_p, exp_sz_str, exp_sha = parts[-3], parts[-2], parts[-1]
+                buf = self.files.get(target_p)
+                if (
+                    buf is not None
+                    and len(buf) == int(exp_sz_str)
+                    and hashlib.sha256(buf).hexdigest() == exp_sha.lower()
+                ):
+                    return _FakeExecResult(stdout="", exit_code=0)
+            return _FakeExecResult(stdout="", exit_code=1)
+        # Simulate free disk space (defaults to 20 GiB free in 1K-blocks df output)
+        avail_kb = getattr(self, "free_bytes", 20 * 1024 * 1024 * 1024) // 1024
+        df_out = (
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+            f"overlay 52428800 1048576 {avail_kb} 5% /home/workspace\n"
+        )
         return _FakeExecResult(stdout=df_out, exit_code=0)
 
 
@@ -2750,3 +2758,557 @@ async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_
         user_id=user_id, workspace_id=ws_id, filename="after_accept.bin", size_bytes=512
     )
     assert after_accept["state"] == "uploading"
+
+
+# ---------------------------------------------------------------------------
+# 8. Round 9 regressions: mixed steer staging, provisional release isolation,
+#    live part permission rechecks, durable steer failure, and disk budget
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_r9_mixed_attachments_in_steers_ordered_staging_and_partial_failure_rollback(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stage_request_attachments_for_steer persists mixed 200 MiB + inline PNG/PDF batches
+    in exact order, supports inline-only and file-only batches, and rolls back newly staged
+    inline blobs if any item or admission fails."""
+    user_id = "user-r9-mixed"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+
+    # Pre-upload a ready file
+    file_bytes = b"large-model-data-" * 512
+    created = await svc.initiate_chat_upload(
+        user_id=user_id,
+        workspace_id=ws_id,
+        filename="dataset_200m.parquet",
+        size_bytes=len(file_bytes),
+        mime_type="application/octet-stream",
+    )
+    uid_file = created["upload_id"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_file,
+        part_number=1,
+        user_id=user_id,
+        stream=_bytes_stream(file_bytes),
+    )
+    await svc.complete_chat_upload(upload_id=uid_file, user_id=user_id)
+
+    png_raw = b"\x89PNG\r\n\x1a\n" + b"png-pixels-" * 32
+    pdf_raw = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF"
+    png_url = f"data:image/png;base64,{base64.b64encode(png_raw).decode()}"
+    pdf_url = f"data:application/pdf;base64,{base64.b64encode(pdf_raw).decode()}"
+
+    mixed_batch = [
+        ChatUploadContext(
+            upload_id=uid_file,
+            name="dataset_200m.parquet",
+            mime_type="application/octet-stream",
+            size=len(file_bytes),
+        ),
+        MultimodalContext(type="image", data=png_url, description="chart_q4.png"),
+        MultimodalContext(type="pdf", data=pdf_url, description="summary_memo.pdf"),
+    ]
+
+    # 1. Partial staging failure on second inline item aborts & deletes first staged inline item
+    real_upload_part = upload_env["store"].upload_part_bytes
+    calls = 0
+
+    def _fail_on_second_inline(
+        object_key: str,
+        store_upload_id: str,
+        *,
+        part_number: int,
+        data: bytes,
+    ) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return None
+        return real_upload_part(
+            object_key,
+            store_upload_id,
+            part_number=part_number,
+            data=data,
+        )
+
+    with patch.object(
+        chat_upload_storage,
+        "upload_part_bytes",
+        create_autospec(chat_upload_storage.upload_part_bytes, side_effect=_fail_on_second_inline),
+    ):
+        with pytest.raises(HTTPException) as stage_fail_exc:
+            await svc.stage_request_attachments_for_steer(
+                mixed_batch,
+                user_id=user_id,
+                workspace_id=ws_id,
+                claim_key="req:r9-stage-fail",
+            )
+        assert stage_fail_exc.value.status_code == 503
+
+    # Caller's pre-existing upload stays ready; zero newly staged inline blobs remain in storage
+    assert upload_env["ledger"].rows[uid_file]["state"] == "ready"
+    assert len(upload_env["store"].objects) == 1
+
+    # 2. Full mixed staging succeeds in exact order [dataset_200m.parquet, chart_q4.png, summary_memo.pdf]
+    claim_mixed = svc.chat_upload_claim_key(
+        request_key=str(uuid.uuid4()), run_id=str(uuid.uuid4())
+    )
+    descriptors, staged_ids = await svc.stage_request_attachments_for_steer(
+        mixed_batch,
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=claim_mixed,
+    )
+    assert len(descriptors) == 3
+    assert len(staged_ids) == 2
+    assert [d["name"] for d in descriptors] == [
+        "dataset_200m.parquet",
+        "chart_q4.png",
+        "summary_memo.pdf",
+    ]
+    assert [d["source_kind"] for d in descriptors] == ["chat_upload", "image", "pdf"]
+
+    hist_meta = await svc.build_chat_upload_history_metadata(
+        descriptors, user_id=user_id, workspace_id=ws_id
+    )
+    assert [m["type"] for m in hist_meta] == ["file", "image", "pdf"]
+    assert [m["name"] for m in hist_meta] == [
+        "dataset_200m.parquet",
+        "chart_q4.png",
+        "summary_memo.pdf",
+    ]
+
+    # Confirm all 3 atomically (as admit_steer does)
+    confirmed = await svc.confirm_request_chat_uploads(
+        descriptors,
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=claim_mixed,
+    )
+    assert len(confirmed) == 3
+    assert all(r["used_at"] is not None and r["expires_at"] is None for r in confirmed)
+
+    # 3. Non-accepted staged inline steer cleans up its staged blob immediately
+    desc_unaccepted, staged_unaccepted = await svc.stage_request_attachments_for_steer(
+        [MultimodalContext(type="image", data=png_url, description="temp_shot")],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key="req:unaccepted-steer",
+    )
+    assert len(staged_unaccepted) == 1
+    unaccepted_uid = staged_unaccepted[0]
+    unaccepted_key = upload_env["ledger"].rows[unaccepted_uid]["object_key"]
+    assert unaccepted_key in upload_env["store"].objects
+
+    await svc.cleanup_unaccepted_staged_uploads(
+        staged_unaccepted,
+        user_id=user_id,
+        claim_key="req:unaccepted-steer",
+    )
+    assert upload_env["ledger"].rows[unaccepted_uid]["state"] == "aborted"
+    assert upload_env["ledger"].rows[unaccepted_uid]["cleaned_at"] is not None
+    assert unaccepted_key not in upload_env["store"].objects
+
+
+@pytest.mark.asyncio
+async def test_r9_provisional_release_never_confirms_unrelated_uploads_on_same_request_key(
+    upload_env,
+) -> None:
+    """Duplicate/concurrent requests sharing request_key with different uploads must never
+    confirm the rejected upload set on release_provisional_claims."""
+    user_id = "user-r9-dup-claim"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+
+    async def _make_ready(name: str) -> str:
+        data = f"payload-{name}".encode() * 64
+        up = await svc.initiate_chat_upload(
+            user_id=user_id, workspace_id=ws_id, filename=name, size_bytes=len(data)
+        )
+        uid = up["upload_id"]
+        await svc.receive_chat_upload_part(
+            upload_id=uid, part_number=1, user_id=user_id, stream=_bytes_stream(data)
+        )
+        await svc.complete_chat_upload(upload_id=uid, user_id=user_id)
+        return uid
+
+    uid_accepted = await _make_ready("accepted.bin")
+    uid_rejected = await _make_ready("rejected.bin")
+
+    shared_rk = str(uuid.uuid4())
+    upload_env["ledger"].accepted_request_keys.add(shared_rk)
+
+    claim_a = svc.chat_upload_claim_key(request_key=shared_rk, run_id=str(uuid.uuid4()))
+    claim_b = svc.chat_upload_claim_key(request_key=shared_rk, run_id=str(uuid.uuid4()))
+    assert claim_a != claim_b
+
+    await svc.validate_and_claim_request_attachments(
+        [ChatUploadContext(upload_id=uid_accepted, name="accepted.bin", size=512)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=claim_a,
+    )
+    await svc.validate_and_claim_request_attachments(
+        [ChatUploadContext(upload_id=uid_rejected, name="rejected.bin", size=512)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=claim_b,
+    )
+
+    # Confirm only Copy A's upload
+    await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=uid_accepted, name="accepted.bin", size=512)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=claim_a,
+    )
+
+    # Release Copy B's rejected claim under the same request_key
+    await svc.release_request_chat_uploads(
+        user_id=user_id,
+        claim_key=claim_b,
+        request_key=shared_rk,
+        additional_context=[
+            ChatUploadContext(upload_id=uid_rejected, name="rejected.bin", size=512)
+        ],
+    )
+
+    row_acc = upload_env["ledger"].rows[uid_accepted]
+    row_rej = upload_env["ledger"].rows[uid_rejected]
+    assert row_acc["used_at"] is not None
+    assert row_acc["expires_at"] is None
+
+    # Rejected upload MUST remain unused, keep its expiry, and be cancellable!
+    assert row_rej["used_at"] is None
+    assert row_rej["expires_at"] is not None
+    assert row_rej["pending_claims"] == {}
+    cancelled = await svc.cancel_chat_upload(upload_id=uid_rejected, user_id=user_id)
+    assert cancelled["state"] == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_r9_part_upload_rechecks_live_workspace_write_permission_before_slot_and_mid_stream(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """receive_chat_upload_part rejects workspace write revocation before reading, after
+    waiting on _PART_UPLOAD_SEMAPHORE, and mid-stream before MinIO upload_part_bytes."""
+    owner_id = "user-r9-ws-owner"
+    colleague_id = "user-r9-ws-colleague"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner_id,
+        "status": "running",
+        "web_access": "rw",
+        "colleagues": {colleague_id},
+    }
+
+    payload = b"part-permission-check-" * 128
+    part_sha = hashlib.sha256(payload).hexdigest()
+
+    up_pre = await svc.initiate_chat_upload(
+        user_id=colleague_id, workspace_id=ws_id, filename="pre.bin", size_bytes=len(payload)
+    )
+    up_slot = await svc.initiate_chat_upload(
+        user_id=colleague_id, workspace_id=ws_id, filename="slot.bin", size_bytes=len(payload)
+    )
+    up_mid = await svc.initiate_chat_upload(
+        user_id=colleague_id, workspace_id=ws_id, filename="mid.bin", size_bytes=len(payload)
+    )
+
+    upload_part_spy = getattr(chat_upload_storage, "upload_part_bytes")
+    upload_part_spy.reset_mock()
+
+    # 1. Revoke write access BEFORE part call -> 403, zero MinIO calls
+    upload_env["workspaces"][ws_id]["web_access"] = "ro"
+    with pytest.raises(HTTPException) as pre_exc:
+        await svc.receive_chat_upload_part(
+            upload_id=up_pre["upload_id"],
+            part_number=1,
+            user_id=colleague_id,
+            stream=_bytes_stream(payload),
+            expected_part_sha256=part_sha,
+        )
+    assert pre_exc.value.status_code == 403
+    assert upload_part_spy.call_count == 0
+
+    # 2. Restore rw, block on semaphore, revoke WHILE waiting for slot -> 403, zero MinIO calls
+    upload_env["workspaces"][ws_id]["web_access"] = "rw"
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(svc, "_PART_UPLOAD_SEMAPHORE", sem)
+    await sem.acquire()
+    slot_task = asyncio.create_task(
+        svc.receive_chat_upload_part(
+            upload_id=up_slot["upload_id"],
+            part_number=1,
+            user_id=colleague_id,
+            stream=_bytes_stream(payload),
+            expected_part_sha256=part_sha,
+        )
+    )
+    await asyncio.sleep(0.02)
+    upload_env["workspaces"][ws_id]["web_access"] = "ro"
+    sem.release()
+    with pytest.raises(HTTPException) as slot_exc:
+        await slot_task
+    assert slot_exc.value.status_code == 403
+    assert upload_part_spy.call_count == 0
+
+    # 3. Restore rw, revoke MID-STREAM while reading slow body -> 403, zero MinIO calls, slot freed
+    upload_env["workspaces"][ws_id]["web_access"] = "rw"
+    chunk1_read = asyncio.Event()
+    proceed_chunk2 = asyncio.Event()
+
+    async def _mid_revoke_stream():
+        half = len(payload) // 2
+        yield payload[:half]
+        chunk1_read.set()
+        await proceed_chunk2.wait()
+        yield payload[half:]
+
+    mid_task = asyncio.create_task(
+        svc.receive_chat_upload_part(
+            upload_id=up_mid["upload_id"],
+            part_number=1,
+            user_id=colleague_id,
+            stream=_mid_revoke_stream(),
+            expected_part_sha256=part_sha,
+        )
+    )
+    await asyncio.wait_for(chunk1_read.wait(), timeout=2.0)
+    upload_env["workspaces"][ws_id]["web_access"] = "ro"
+    proceed_chunk2.set()
+    with pytest.raises(HTTPException) as mid_exc:
+        await mid_task
+    assert mid_exc.value.status_code == 403
+    assert upload_part_spy.call_count == 0
+    assert sem._value == 1
+
+
+@pytest.mark.asyncio
+async def test_r9_materialize_charges_disk_only_for_missing_or_corrupt_files(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """materialize_chat_uploads skips disk charges and MinIO pulls when the exact SHA-verified
+    file is already on disk, but charges disk and rejects when the file is missing or corrupt."""
+    from src.server.services.computer_disk import CRITICAL_FREE_BYTES
+
+    user_id = "user-r9-disk"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+
+    exact_200m = svc.MAX_CHAT_UPLOAD_BYTES
+    uid = str(uuid.uuid4())
+    sample_bytes = b"verified-content-digest"
+    sha_hex = hashlib.sha256(sample_bytes).hexdigest()
+    obj_key = chat_upload_storage.build_chat_upload_key(ws_id, uid, "big.bin")
+    upload_env["store"].objects[obj_key] = sample_bytes
+    now = datetime.now(timezone.utc)
+    row = {
+        "upload_id": uid,
+        "user_id": user_id,
+        "workspace_id": ws_id,
+        "filename": "big.bin",
+        "safe_filename": "big.bin",
+        "mime_type": "application/octet-stream",
+        "size_bytes": len(sample_bytes),
+        "part_size": svc.CHAT_UPLOAD_PART_SIZE,
+        "part_count": 1,
+        "object_key": obj_key,
+        "store_upload_id": "mp-disk-1",
+        "expected_sha256": sha_hex,
+        "actual_sha256": sha_hex,
+        "uploaded_parts": {},
+        "pending_claims": {},
+        "state": "ready",
+        "error": None,
+        "claim_token": None,
+        "lease_until": None,
+        "expires_at": None,
+        "used_at": now,
+        "cleaned_at": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    upload_env["ledger"].rows[uid] = row
+
+    project = ProjectContext(workspace_id=ws_id, dir_name="DISK_WS")
+    sandbox = _FakeSandbox()
+    rel_path = svc.build_sandbox_upload_rel_path(row)
+    abs_path = sandbox.normalize_path(rel_path, project=project)
+
+    # Place valid file on disk and set free_bytes BELOW len(sample_bytes) above CRITICAL_FREE_BYTES
+    sandbox.files[abs_path] = sample_bytes
+    sandbox.free_bytes = CRITICAL_FREE_BYTES + 4
+
+    pull_calls = 0
+
+    async def _spy_pull_direct(
+        sbx: Any, entries: list[dict[str, Any]], *, layout: WorkspaceLayout
+    ) -> dict[str, dict[str, Any]]:
+        nonlocal pull_calls
+        pull_calls += 1
+        sandbox.files[abs_path] = sample_bytes
+        return {entries[0]["path"]: {"status": "ok"}}
+
+    monkeypatch.setattr(
+        svc,
+        "pull_direct",
+        create_autospec(_REAL_PULL_DIRECT, side_effect=_spy_pull_direct),
+    )
+
+    ctx = [ChatUploadContext(upload_id=uid, name="big.bin", size=len(sample_bytes))]
+
+    # 1. Already present with matching size + SHA-256 -> succeeds with 0 pulls despite tight disk!
+    notes = await svc.materialize_chat_uploads(
+        ctx, sandbox=sandbox, user_id=user_id, workspace_id=ws_id, project=project
+    )
+    assert len(notes) == 1 and rel_path in notes[0]
+    assert pull_calls == 0
+
+    # 2. Same-size corrupt file on disk -> SHA mismatch detected, charges disk, fails under tight free space
+    sandbox.files[abs_path] = b"X" * len(sample_bytes)
+    with pytest.raises(RuntimeError, match="Not enough free disk space"):
+        await svc.materialize_chat_uploads(
+            ctx, sandbox=sandbox, user_id=user_id, workspace_id=ws_id, project=project
+        )
+    assert pull_calls == 0
+
+    # 3. With enough free space for 1 copy (not 2!), duplicate descriptors [ctx, ctx] deduplicate
+    #    target path, charge once, pull once, and return 2 ordered notes!
+    sandbox.free_bytes = CRITICAL_FREE_BYTES + len(sample_bytes) + 2
+    notes_dup = await svc.materialize_chat_uploads(
+        ctx + ctx, sandbox=sandbox, user_id=user_id, workspace_id=ws_id, project=project
+    )
+    assert len(notes_dup) == 2
+    assert pull_calls == 1
+    assert sandbox.files[abs_path] == sample_bytes
+    del exact_200m
+
+
+@pytest.mark.asyncio
+async def test_r9_replay_projects_table_sourced_steering_returned_for_failed_steers() -> None:
+    """project_turn and stub_lines emit table-sourced steering_returned items for permanently
+    failed main-thread steers and invalidate lines_key when failed_steers change."""
+    from src.server.database.conversation.replay_rows import ThreadRows
+    from src.server.services.history.reader import TurnAnchor
+    from src.server.services.history.replay import run_lane
+    from src.server.services.history.replay.facts import RunFacts
+    from src.server.services.history.replay.keys import lines_key
+    from src.server.services.history.replay.stubs import _stub_items
+    from src.server.services.history.replay.turn import Inputs, project_turn
+    from src.server.services.history.slices import TurnSlice
+
+    tid = str(uuid.uuid4())
+    rid = str(uuid.uuid4())
+    rk = str(uuid.uuid4())
+    query_row = {
+        "conversation_query_id": str(uuid.uuid4()),
+        "turn_index": 0,
+        "content": "Initial question",
+        "type": "user",
+        "created_at": datetime.now(timezone.utc),
+        "metadata": {},
+        "xmin": 1,
+    }
+    resp_row = {
+        "conversation_response_id": rid,
+        "turn_index": 0,
+        "status": "completed",
+        "created_at": datetime.now(timezone.utc),
+        "metadata": {},
+        "xmin": 2,
+    }
+    failed_entry = {
+        "turn_index": 0,
+        "reason": "attachment_failed",
+        "error": "Attachment has expired or was removed",
+        "error_code": "http_410",
+        "request_key": rk,
+        "content": "Steer with retired file",
+        "attachments": [
+            {
+                "name": "retired.csv",
+                "type": "file",
+                "size": 4096,
+                "status": "uploaded",
+                "upload_id": str(uuid.uuid4()),
+            }
+        ],
+        "timestamp": 1700000200.0,
+        "job_id": str(uuid.uuid4()),
+    }
+
+    rows_without = ThreadRows(
+        thread_id=tid,
+        owner_id="u-1",
+        thread={"latest_checkpoint_id": "cp-1"},
+        queries=[query_row],
+        responses_by_turn={0: resp_row},
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+        failed_steers=[],
+    )
+    rows_with = ThreadRows(
+        thread_id=tid,
+        owner_id="u-1",
+        thread={"latest_checkpoint_id": "cp-1"},
+        queries=[query_row],
+        responses_by_turn={0: resp_row},
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+        failed_steers=[failed_entry],
+    )
+
+    inputs_without = Inputs.of(rows_without)
+    inputs_with = Inputs.of(rows_with)
+    anchor = TurnAnchor(
+        turn_index=0,
+        input_checkpoint_id="cp-0",
+        tail_checkpoint_id="cp-1",
+        ending_interrupts=[],
+    )
+    assert lines_key(inputs_without, 0, anchor, resp_row) != lines_key(
+        inputs_with, 0, anchor, resp_row
+    )
+
+    turn_slice = TurnSlice(
+        anchor=anchor,
+        messages=[],
+        new_ui_records=[],
+        offload_events=[],
+        summarize_events=[],
+    )
+    lane = run_lane.RunLane(None, tid, RunFacts.of([]))
+    projected_items, _ = project_turn(inputs_with, 0, turn_slice, resp_row, lane)
+    returned_proj = [
+        it for it in projected_items if it["event"] == "steering_returned"
+    ]
+    assert len(returned_proj) == 1
+    assert returned_proj[0]["data"]["request_key"] == rk
+    assert returned_proj[0]["data"]["reason"] == "attachment_failed"
+    assert returned_proj[0]["data"]["error"] == "Attachment has expired or was removed"
+    assert returned_proj[0]["data"]["turn_index"] == 0
+
+    stub_out = _stub_items(tid, 0, [query_row], resp_row, None, [failed_entry])
+    returned_stub = [it for it in stub_out if it["event"] == "steering_returned"]
+    assert len(returned_stub) == 1
+    assert returned_stub[0]["data"]["request_key"] == rk

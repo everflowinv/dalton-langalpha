@@ -14,11 +14,13 @@ import { MAX_FILE_SIZE, MAX_TOTAL_ATTACHMENTS_BYTES } from '../chat-input.helper
 import ChatInput, { type ChatInputHandle, type ChatInputProps } from '../chat-input';
 import { attachmentsToContexts } from '@/pages/ChatAgent/utils/fileUpload';
 import {
+  foldFailedSteer,
   foldSteeringDelivery,
   steeringDeliveredEntries,
 } from '@/pages/ChatAgent/session/stream/steeringDelivery';
 import {
   handleHistorySteeringDelivered,
+  handleHistorySteeringReturned,
   handleHistoryUserMessage,
 } from '@/pages/ChatAgent/session/history/historyHandlers';
 import type { ChatMessage, UserMessage } from '@/types/chat';
@@ -834,5 +836,143 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       isHistory: true,
       attachments: [fileOnlyChip],
     });
+  });
+
+  it('preserves mixed [200 MiB + PNG + PDF] steer attachment order and surfaces permanent steer attachment failures live and on reload without duplication', () => {
+    const mixedAttachments = [
+      {
+        name: 'dataset_200m.parquet',
+        type: 'file',
+        mime_type: 'application/octet-stream',
+        size: 200 * 1024 * 1024,
+        status: 'uploaded',
+        upload_id: 'up-mixed-200m',
+      },
+      {
+        name: 'margin_chart.png',
+        type: 'image',
+        mime_type: 'image/png',
+        size: 16384,
+        status: 'uploaded',
+        upload_id: 'up-mixed-png',
+      },
+      {
+        name: 'board_memo.pdf',
+        type: 'pdf',
+        mime_type: 'application/pdf',
+        size: 32768,
+        status: 'uploaded',
+        upload_id: 'up-mixed-pdf',
+      },
+    ];
+
+    // 1. Mixed 200 MiB + inline PNG + inline PDF preserves exact order on live delivery & replay
+    const mixedDelivery = {
+      messages: [
+        {
+          content: 'Cross-check all three files',
+          request_key: 'req-mixed-1',
+          timestamp: 1700000100,
+          attachments: mixedAttachments,
+        },
+      ],
+    };
+    const mixedFold = foldSteeringDelivery(
+      [],
+      steeringDeliveredEntries(mixedDelivery),
+      0,
+      (kind) => `live-mixed-${kind}`,
+    );
+    expect(mixedFold.messages).toHaveLength(1);
+    expect((mixedFold.messages[0] as UserMessage).attachments?.map((a) => a.name)).toEqual([
+      'dataset_200m.parquet',
+      'margin_chart.png',
+      'board_memo.pdf',
+    ]);
+    expect((mixedFold.messages[0] as UserMessage).attachments?.map((a) => a.type)).toEqual([
+      'file',
+      'image',
+      'pdf',
+    ]);
+
+    // 2. Permanent steer attachment failure surfaces live on the optimistic bubble idempotently
+    const optimisticSteer: UserMessage = {
+      id: 'user-optimistic-failed-steer',
+      role: 'user',
+      content: 'Use retired attachment',
+      contentType: 'text',
+      timestamp: new Date(1700000200000),
+      isStreaming: false,
+      steering: true,
+      requestKey: 'req-failed-steer-1',
+      turnIndex: 0,
+    };
+    const failedEvent = {
+      reason: 'attachment_failed',
+      error: 'Attachment has expired or was removed',
+      error_code: 'http_410',
+      request_key: 'req-failed-steer-1',
+      content: 'Use retired attachment',
+      attachments: [mixedAttachments[0]],
+      timestamp: 1700000205,
+      job_id: 'job-failed-1',
+    };
+
+    const afterLiveFail1 = foldFailedSteer([optimisticSteer], failedEvent, 0);
+    expect(afterLiveFail1).toHaveLength(1);
+    expect(afterLiveFail1[0]).toMatchObject({
+      id: 'user-optimistic-failed-steer',
+      role: 'user',
+      content: 'Use retired attachment',
+      steering: false,
+      steeringDelivered: false,
+      queueRefused: true,
+      queueError: 'Attachment has expired or was removed',
+      requestKey: 'req-failed-steer-1',
+      attachments: [mixedAttachments[0]],
+    });
+
+    // Repeated live failure handling does not duplicate the bubble
+    const afterLiveFail2 = foldFailedSteer(afterLiveFail1, failedEvent, 0);
+    expect(afterLiveFail2).toHaveLength(1);
+
+    // 3. History reload replaces the live bubble and stays idempotent across repeated reloads
+    let historyMessages: MessageRecord[] = [...(afterLiveFail2 as unknown as MessageRecord[])];
+    const setMessages: SetMessages = (updater) => {
+      historyMessages = typeof updater === 'function' ? updater(historyMessages) : updater;
+    };
+    const newMessagesStartIndexRef = { current: historyMessages.length };
+    const settledKeys: Array<string | null> = [];
+
+    handleHistorySteeringReturned({
+      event: failedEvent,
+      pairIndex: 0,
+      refs: { newMessagesStartIndexRef },
+      setMessages,
+      onCopySettled: (key) => settledKeys.push(key),
+    });
+
+    expect(settledKeys).toEqual(['req-failed-steer-1']);
+    expect(historyMessages).toHaveLength(1);
+    expect(historyMessages[0]).toMatchObject({
+      id: 'history-steering-failed-0-req-failed-steer-1',
+      role: 'user',
+      isHistory: true,
+      steering: false,
+      steeringDelivered: false,
+      queueRefused: true,
+      queueError: 'Attachment has expired or was removed',
+      requestKey: 'req-failed-steer-1',
+      attachments: [mixedAttachments[0]],
+    });
+
+    // Second reload with the same replayed event never duplicates the failed bubble
+    handleHistorySteeringReturned({
+      event: failedEvent,
+      pairIndex: 0,
+      refs: { newMessagesStartIndexRef },
+      setMessages,
+    });
+    expect(historyMessages).toHaveLength(1);
   });
 });

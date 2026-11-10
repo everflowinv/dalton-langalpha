@@ -149,6 +149,10 @@ class ChatUploadContext(AdditionalContextBase):
     name: Optional[str] = Field(None, max_length=512, description="Display filename")
     mime_type: Optional[str] = Field(None, max_length=256, description="Declared MIME type")
     size: Optional[int] = Field(None, ge=0, description="File size in bytes")
+    source_kind: Optional[Literal["image", "pdf", "file", "chat_upload"]] = Field(
+        None,
+        description="Original attachment kind when staged from inline attachments",
+    )
 
 
 AdditionalContext = Annotated[

@@ -6,7 +6,8 @@ digested into the lines epoch (``keys.projection_sources``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+# DALTON-HOOK(chat-large-upload): default_factory for failed_steers_by_turn on Inputs
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -43,24 +44,47 @@ class Inputs:
     run_facts: replay_facts.RunFacts
     # The run of each turn still going (``ThreadRows.open_runs``).
     open_runs: dict[Any, str]
+    # DALTON-HOOK(chat-large-upload): failed steers grouped by turn_index for replay
+    failed_steers_by_turn: dict[Any, list[dict[str, Any]]] = field(default_factory=dict)
 
     @classmethod
     def of(cls, rows: ThreadRows) -> Inputs:
         queries_by_turn = group_queries(rows.queries)
+        turn_indexes = sorted(ti for ti in queries_by_turn if ti is not None)
+        failed_by_turn = group_failed_steers(rows.failed_steers, turn_indexes)
         return cls(
             thread_id=rows.thread_id,
-            turn_indexes=sorted(ti for ti in queries_by_turn if ti is not None),
+            turn_indexes=turn_indexes,
             queries_by_turn=queries_by_turn,
             responses_by_turn=rows.responses_by_turn,
             usage_by_response=items._usage_rows_by_response(rows.usages),
             provenance_by_response=items._rows_by_response(rows.provenance, many=True),
             run_facts=replay_facts.RunFacts.of(rows.run_facts),
             open_runs=rows.open_runs,
+            failed_steers_by_turn=failed_by_turn,
         )
 
     def response_id(self, turn_index: Any) -> str | None:
         response = self.responses_by_turn.get(turn_index)
         return str(response["conversation_response_id"]) if response else None
+
+
+# DALTON-HOOK(chat-large-upload): group permanently failed steers onto their owning turn
+def group_failed_steers(
+    failed_steers: list[dict[str, Any]] | None,
+    turn_indexes: list[Any],
+) -> dict[Any, list[dict[str, Any]]]:
+    out: dict[Any, list[dict[str, Any]]] = {}
+    fallback_turn = turn_indexes[-1] if turn_indexes else None
+    for entry in failed_steers or ():
+        if not isinstance(entry, dict):
+            continue
+        ti = entry.get("turn_index")
+        if ti is None:
+            ti = fallback_turn
+        if ti is not None:
+            out.setdefault(ti, []).append(entry)
+    return out
 
 
 def group_queries(queries: list[Any]) -> dict[Any, list[dict[str, Any]]]:
@@ -147,6 +171,11 @@ def project_turn(
     turn_items.extend(projector.manual_context_window_items(thread_id, turn))
 
     _fill_token_thresholds(turn_items)
+    # DALTON-HOOK(chat-large-upload): replay permanently failed main-thread steers on their turn
+    turn_items.extend(
+        items._failed_steer_item(thread_id, failed)
+        for failed in inputs.failed_steers_by_turn.get(turn_index, ())
+    )
     # The row's terminal error and a user stop's close, after the legacy
     # facts so each can defer to the copy they placed: an archived error
     # frame takes the row's kind instead of gaining a twin.

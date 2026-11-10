@@ -368,9 +368,7 @@ async def astream_ptc_workflow(
                 )
                 # Admit a fresh turn, steer the running one, or 409 — see
                 # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
-                # DALTON-HOOK(chat-large-upload): carry validated chat_upload descriptors on steers
-                from src.dalton.services.chat_uploads import extract_chat_upload_contexts
-
+                # DALTON-HOOK(chat-large-upload): carry full ordered attachments and claim key on steers
                 admit = partial(
                     wait_or_steer,
                     manager,
@@ -389,8 +387,11 @@ async def astream_ptc_workflow(
                         request, dispatched=dispatched, steerable=steerable
                     ),
                     artifact_comments=request.artifact_comments,
-                    chat_uploads=extract_chat_upload_contexts(request.additional_context)
-                    or None,
+                    additional_context=(
+                        None if request.hitl_response else request.additional_context
+                    ),
+                    is_existing_colleague_thread=(workspace_owner_id != str(user_id)),
+                    upload_claim_key=upload_claims.claim_key,
                 )
                 if held_by is None:
                     ready, steering_event = await admit()
@@ -511,9 +512,9 @@ async def astream_ptc_workflow(
                 )
                 if request.additional_context and not request.hitl_response:
                     multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
-                    # DALTON-HOOK(chat-large-upload): record history attachment metadata for server-stored chat_upload items
+                    # DALTON-HOOK(chat-large-upload): record ordered history attachment metadata for inline + chat_upload items
                     from src.dalton.services.chat_uploads import (
-                        build_chat_upload_history_metadata,
+                        build_ordered_turn_attachment_metadata,
                         extract_chat_upload_contexts,
                     )
 
@@ -523,19 +524,17 @@ async def astream_ptc_workflow(
                     # A retry writes no query row, so a second upload would be
                     # stored for nothing.
                     if (multimodal_ctxs or chat_upload_ctxs) and not request.retry_of_run_id:
-                        att_meta: list[dict] = []
-                        if multimodal_ctxs:
-                            att_meta.extend(
-                                await build_attachment_metadata(multimodal_ctxs, thread_id)
-                            )
-                        if chat_upload_ctxs:
-                            att_meta.extend(
-                                await build_chat_upload_history_metadata(
-                                    request.additional_context,
-                                    user_id=user_id,
-                                    workspace_id=workspace_id,
-                                )
-                            )
+                        inline_meta = (
+                            await build_attachment_metadata(multimodal_ctxs, thread_id)
+                            if multimodal_ctxs
+                            else []
+                        )
+                        att_meta = await build_ordered_turn_attachment_metadata(
+                            request.additional_context,
+                            inline_metadata=inline_meta,
+                            user_id=user_id,
+                            workspace_id=workspace_id,
+                        )
                         if att_meta:
                             query_metadata["attachments"] = att_meta
                     if widget_ctxs:

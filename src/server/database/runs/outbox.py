@@ -1879,6 +1879,8 @@ async def admit_steer(
     payload: Dict[str, Any],
     idempotency_key: str,
     origin_stamp: Optional[Dict[str, Any]] = None,
+    # DALTON-HOOK(chat-large-upload): per-invocation claim key for provisional attachment confirmation
+    upload_claim_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Accept a steer into ``run_id``, the thread's live run, in one
     transaction.
@@ -1984,7 +1986,11 @@ async def admit_steer(
                         if isinstance(item, dict) and item.get("upload_id")
                     ]
                     req_key = str(payload.get("request_key") or "").strip()
-                    claim_key = f"req:{req_key}" if req_key else None
+                    claim_key = (
+                        str(upload_claim_key).strip()
+                        if upload_claim_key
+                        else (f"req:{req_key}" if req_key else None)
+                    )
                     confirmed = await confirm_provisional_claims(
                         upload_ids,
                         user_id=str(payload.get("user_id") or ""),
@@ -2485,20 +2491,49 @@ async def is_job_held_by(job_id: str, *, owner: Tuple[str, str]) -> bool:
             return bool(row and row[0])
 
 
+def _failed_steer_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+    """User-visible failure record for a steer whose attachment could not be delivered."""
+    base = _returned_entry(row)
+    payload = row.get("payload") or {}
+    delivery_err = payload.get("delivery_error") or {}
+    code = str(delivery_err.get("code") or "attachment_failed")
+    msg = str(
+        delivery_err.get("message")
+        or "Attachment could not be delivered."
+    )
+    created_at = row.get("created_at")
+    entry: Dict[str, Any] = {
+        **base,
+        "reason": "attachment_failed",
+        "error": msg,
+        "error_code": code,
+        "failed_run_id": payload.get("failed_run_id"),
+        "job_id": str(row.get("hook_outbox_id") or row.get("id") or ""),
+    }
+    if created_at is not None:
+        entry["created_at"] = (
+            created_at.isoformat()
+            if hasattr(created_at, "isoformat")
+            else str(created_at)
+        )
+    return entry
+
+
 async def fail_held_steer_job(
     job_id: str,
     *,
     owner: Tuple[str, str],
     error_code: str,
     error_message: str,
-) -> bool:
+) -> Optional[Dict[str, Any]]:
     """Close a held steer job permanently when its attachment is revoked, deleted, or forbidden."""
     _, owner_id = owner
     patch = {
+        "failed_run_id": str(owner_id),
         "delivery_error": {
             "code": str(error_code or "attachment_failed")[:100],
             "message": str(error_message or "Attachment could not be delivered")[:500],
-        }
+        },
     }
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
@@ -2511,13 +2546,13 @@ async def fail_held_steer_job(
                         next_retry_at = NULL,
                         lease_expires_at = NULL,
                         payload = (o.payload - 'steered_run_id')
-                            || jsonb_build_object('outcome', 'dropped')
+                            || jsonb_build_object('outcome', 'failed')
                             || %(patch)s::jsonb
                     WHERE o.hook_outbox_id = %(job_id)s::uuid
                       AND o.status = 'pending'
                       AND o.payload->>'steered_run_id' = %(owner)s::text
                       AND {_steer_sql(_LIVE_STEER_SQL)}
-                    RETURNING o.payload
+                    RETURNING o.hook_outbox_id, o.payload, o.created_at
                     """,
                     {
                         "job_id": job_id,
@@ -2528,7 +2563,36 @@ async def fail_held_steer_job(
                 closed = [dict(r) for r in await cur.fetchall()]
                 if closed:
                     await _give_back_comments(conn, closed)
-                return bool(closed)
+                    return _failed_steer_entry(closed[0])
+                return None
+
+
+# DALTON-HOOK(chat-large-upload): claim once-only live stream notices for permanently failed steers
+async def claim_unannounced_failed_steers(
+    thread_id: str, run_id: str
+) -> List[Dict[str, Any]]:
+    """Atomically claim unannounced ``outcome='failed'`` steers for ``run_id`` once across workers."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE hook_outbox o
+                SET payload = o.payload
+                    || jsonb_build_object('failure_announced_at', NOW())
+                WHERE o.conversation_thread_id = %(thread_id)s::uuid
+                  AND o.hook_type = 'steer'
+                  AND o.status = 'done'
+                  AND o.payload->>'outcome' = 'failed'
+                  AND o.payload->>'failed_run_id' = %(run_id)s::text
+                  AND NOT (o.payload ? 'failure_announced_at')
+                  AND NOT ({_IS_PLATFORM_SQL})
+                RETURNING o.hook_outbox_id, o.payload, o.created_at
+                """,
+                {"thread_id": thread_id, "run_id": run_id},
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+    rows.sort(key=lambda r: (r["created_at"], str(r["hook_outbox_id"])))
+    return [_failed_steer_entry(r) for r in rows]
 
 
 _CONFIRMED_OUTCOME_SQL = (

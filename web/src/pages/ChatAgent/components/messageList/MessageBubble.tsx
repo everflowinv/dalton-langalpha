@@ -405,7 +405,8 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         original steering text in the agent's context. */}
     {/* Nor does a send of file comments: an edit sends text, and the
         comments it carried are no longer queued to go again. */}
-    {isUser && onEditMessage && !isSteering && !artifactComments && (
+    {/* DALTON-HOOK(chat-large-upload): hide edit pencil on failed/unadmitted sends and steers */}
+    {isUser && onEditMessage && !isSteering && !artifactComments && !message.queueError && !message.unadmitted && (
       <button
         onClick={handleStartEdit}
         className={ACTION_BUTTON}
@@ -791,6 +792,20 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
             on the chart and attached to this send. Read-only summary. */}
         {hasChartSelections && (
           <InlineSelectionCards selections={chartSelections!} />
+        )}
+
+        {/* DALTON-HOOK(chat-large-upload): show undelivered steer/attachment failure reason live and after reload */}
+        {isUser && !!message.queueError && (
+          <div
+            role="alert"
+            data-testid="steer-delivery-error"
+            className="text-xs leading-snug text-right"
+            style={{ color: 'var(--color-loss)' }}
+          >
+            {typeof message.queueError === 'string'
+              ? message.queueError
+              : (message.queueError as StructuredError).message}
+          </div>
         )}
         </>
         )}

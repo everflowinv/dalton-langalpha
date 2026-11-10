@@ -10,7 +10,9 @@ a bounded 4 MiB chunked fallback when direct pull is unavailable).
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator, Sequence
+from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -312,6 +314,27 @@ async def _require_owned_upload(upload_id: str, user_id: str) -> dict[str, Any]:
     return row
 
 
+async def _verify_upload_row_write_scope(row: dict[str, Any], user_id: str) -> str:
+    """Verify owner identity, live workspace/Home write permission, and object-key scope."""
+    if str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    target_ws = str(row["workspace_id"])
+    resolved_ws = await resolve_and_verify_upload_workspace(user_id, target_ws)
+    if str(resolved_ws) != target_ws:
+        raise HTTPException(
+            status_code=403,
+            detail="Attachment belongs to a different workspace",
+        )
+    if not storage.is_chat_upload_key_for_workspace(
+        str(row.get("object_key") or ""), resolved_ws
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Attachment storage key does not match workspace",
+        )
+    return resolved_ws
+
+
 def _as_utc(ts: Any) -> datetime | None:
     if not isinstance(ts, datetime):
         return None
@@ -346,17 +369,21 @@ def _check_part_accepting_row(
     part_number: int,
     *,
     now_utc: datetime,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     """Return an idempotent response dict if already ``ready``, or raise if not accepting parts."""
     state = str(row["state"])
     if state == "ready" and row.get("cleaned_at") is None:
         uploaded = (row.get("uploaded_parts") or {}).get(str(int(part_number)))
         if uploaded:
+            recorded_sha = str(uploaded["sha256"])
+            if expected_sha256 and not hmac.compare_digest(recorded_sha, expected_sha256):
+                raise HTTPException(status_code=400, detail="Part checksum mismatch")
             return {
                 "upload_id": str(row["upload_id"]),
                 "part_number": int(part_number),
                 "size_bytes": int(uploaded["size"]),
-                "sha256": str(uploaded["sha256"]),
+                "sha256": recorded_sha,
                 "state": "ready",
             }
         raise HTTPException(status_code=409, detail="Upload is already completed")
@@ -385,18 +412,22 @@ async def receive_chat_upload_part(
 ) -> dict[str, Any]:
     """Stream one bounded part from client to MinIO under idle and total deadlines."""
     _ensure_feature_ready()
+    normalized_part_sha = _normalize_sha256(
+        expected_part_sha256, field_name="X-Part-Sha256"
+    )
     row = await _require_owned_upload(upload_id, user_id)
+    await _verify_upload_row_write_scope(row, user_id)
 
     early_ready = _check_part_accepting_row(
-        row, int(part_number), now_utc=datetime.now(timezone.utc)
+        row,
+        int(part_number),
+        now_utc=datetime.now(timezone.utc),
+        expected_sha256=normalized_part_sha,
     )
     if early_ready is not None:
         return early_ready
 
     expected_len = expected_part_size(row, int(part_number))
-    normalized_part_sha = _normalize_sha256(
-        expected_part_sha256, field_name="X-Part-Sha256"
-    )
 
     if content_length_header is not None and str(content_length_header).strip():
         try:
@@ -435,10 +466,14 @@ async def receive_chat_upload_part(
     etag: str | None = None
     part_sha = ""
     try:
-        # Re-verify durable state and expiry after acquiring the semaphore slot.
+        # Re-verify live workspace write scope, durable state, and expiry after acquiring the slot.
         row = await _require_owned_upload(upload_id, user_id)
+        await _verify_upload_row_write_scope(row, user_id)
         slot_ready = _check_part_accepting_row(
-            row, int(part_number), now_utc=datetime.now(timezone.utc)
+            row,
+            int(part_number),
+            now_utc=datetime.now(timezone.utc),
+            expected_sha256=normalized_part_sha,
         )
         if slot_ready is not None:
             return slot_ready
@@ -487,16 +522,33 @@ async def receive_chat_upload_part(
                 detail="Part checksum mismatch",
             )
 
-        # Re-check upload state and expiry right before writing to object storage so an
-        # upload cancelled or expired mid-stream never sends late parts to MinIO.
-        fresh = await db.get_upload(str(row["upload_id"]))
-        if not fresh:
-            raise HTTPException(status_code=404, detail="Upload not found")
+        # Re-check live workspace write permission, upload state, and expiry right before
+        # mutating object storage so a mid-stream revocation/cancel/expiry never writes to MinIO.
+        fresh = await _require_owned_upload(str(row["upload_id"]), user_id)
+        await _verify_upload_row_write_scope(fresh, user_id)
         post_read_ready = _check_part_accepting_row(
-            fresh, int(part_number), now_utc=datetime.now(timezone.utc)
+            fresh,
+            int(part_number),
+            now_utc=datetime.now(timezone.utc),
+            expected_sha256=part_sha,
         )
         if post_read_ready is not None:
             return post_read_ready
+
+        existing_part = (fresh.get("uploaded_parts") or {}).get(str(int(part_number)))
+        if (
+            isinstance(existing_part, dict)
+            and existing_part.get("etag")
+            and int(existing_part.get("size") or 0) == expected_len
+            and hmac.compare_digest(str(existing_part.get("sha256") or ""), part_sha)
+        ):
+            return {
+                "upload_id": str(fresh["upload_id"]),
+                "part_number": int(part_number),
+                "size_bytes": expected_len,
+                "sha256": part_sha,
+                "state": str(fresh["state"]),
+            }
 
         payload = bytes(buf)
         buf.clear()
@@ -609,6 +661,7 @@ async def complete_chat_upload(
     _ensure_feature_ready()
     normalized_sha = _normalize_sha256(expected_sha256, field_name="sha256")
     row = await _require_owned_upload(upload_id, user_id)
+    await _verify_upload_row_write_scope(row, user_id)
     uid = str(row["upload_id"])
 
     if row["state"] == "ready" and row.get("cleaned_at") is None:
@@ -630,9 +683,6 @@ async def complete_chat_upload(
         and not hmac.compare_digest(str(row["expected_sha256"]), normalized_sha)
     ):
         raise HTTPException(status_code=400, detail="File checksum mismatch")
-
-    # Re-verify workspace write permission before finalizing.
-    await resolve_and_verify_upload_workspace(user_id, str(row["workspace_id"]))
 
     claimed = await db.claim_complete(
         uid,
@@ -946,6 +996,20 @@ async def cancel_chat_upload(*, upload_id: str, user_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_INLINE_MIME_EXT: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+    "application/json": ".json",
+}
+
+
 def extract_chat_upload_contexts(
     additional_context: Sequence[Any] | None,
 ) -> list[dict[str, Any]]:
@@ -963,6 +1027,7 @@ def extract_chat_upload_contexts(
                         "name": item.get("name"),
                         "mime_type": item.get("mime_type"),
                         "size": item.get("size"),
+                        "source_kind": item.get("source_kind"),
                     }
                 )
         elif getattr(item, "type", None) == "chat_upload":
@@ -973,9 +1038,54 @@ def extract_chat_upload_contexts(
                     "name": getattr(item, "name", None),
                     "mime_type": getattr(item, "mime_type", None),
                     "size": getattr(item, "size", None),
+                    "source_kind": getattr(item, "source_kind", None),
                 }
             )
     return extracted
+
+
+def has_any_attachment_contexts(additional_context: Sequence[Any] | None) -> bool:
+    """True when ``additional_context`` carries any inline or ``chat_upload`` attachment."""
+    if not additional_context:
+        return False
+    for item in additional_context:
+        item_type = (
+            item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        )
+        if item_type in ("image", "pdf", "file", "chat_upload"):
+            return True
+    return False
+
+
+def _decode_inline_data_url(data_url: str, *, fallback_type: str) -> tuple[bytes, str]:
+    """Validate and decode an inline base64 data URL into ``(raw_bytes, mime_type)``."""
+    raw_url = str(data_url or "").strip()
+    header, sep, b64_payload = raw_url.partition(",")
+    if not sep or not header.startswith("data:") or ";base64" not in header:
+        raise HTTPException(status_code=400, detail="Malformed attachment data URL")
+    mime_part = header[len("data:") :].split(";", 1)[0].strip().lower()
+    if not mime_part:
+        mime_part = (
+            "application/pdf"
+            if fallback_type == "pdf"
+            else "image/png"
+            if fallback_type == "image"
+            else "application/octet-stream"
+        )
+    try:
+        decoded = base64.b64decode(b64_payload.strip(), validate=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail="Invalid base64 attachment payload"
+        ) from exc
+    if len(decoded) <= 0:
+        raise HTTPException(status_code=400, detail="Empty attachment is not allowed")
+    if len(decoded) > MAX_INLINE_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Inline attachment exceeds the 30 MB inline limit",
+        )
+    return decoded, mime_part[:120]
 
 
 class SteerAttachmentTransientError(RuntimeError):
@@ -994,11 +1104,13 @@ class SteerAttachmentPermanentError(Exception):
 def chat_upload_claim_key(
     *, request_key: str | None = None, run_id: str | None = None
 ) -> str:
-    """Deterministic provisional claim token scoped to one logical send or run."""
+    """Provisional claim token scoped to a single send invocation."""
     clean_req = str(request_key or "").strip()
+    clean_run = str(run_id or "").strip()
+    if clean_req and clean_run:
+        return f"req:{clean_req}:{clean_run}"
     if clean_req:
         return f"req:{clean_req}"
-    clean_run = str(run_id or "").strip()
     if clean_run:
         return f"run:{clean_run}"
     return f"ephemeral:{uuid.uuid4()}"
@@ -1064,6 +1176,7 @@ async def _validate_attachment_batch(
                     status_code=413,
                     detail="Inline attachment exceeds the 30 MB inline limit",
                 )
+            _decode_inline_data_url(str(data_url), fallback_type=str(item_type))
             inline_bytes += decoded
             if inline_bytes > MAX_INLINE_TOTAL_BYTES:
                 raise HTTPException(
@@ -1153,6 +1266,347 @@ async def _validate_attachment_batch(
     return canonical_ws, upload_ids, verified_rows
 
 
+async def _stage_single_inline_attachment(
+    *,
+    data_url: str,
+    description: str | None,
+    fallback_type: str,
+    user_id: str,
+    canonical_ws: str,
+) -> dict[str, Any]:
+    """Persist one validated inline attachment into ``chat-uploads/`` + ``ready`` ledger row."""
+    raw_bytes, mime_type = _decode_inline_data_url(
+        data_url, fallback_type=fallback_type
+    )
+    raw_name = str(description or "").strip() or fallback_type
+    if "." not in posixpath.basename(raw_name.replace("\\", "/")):
+        raw_name = f"{raw_name}{_INLINE_MIME_EXT.get(mime_type, '')}"
+    display_name, safe_name = sanitize_chat_upload_filename(raw_name)
+
+    size_bytes = len(raw_bytes)
+    expected_sha = hashlib.sha256(raw_bytes).hexdigest()
+    upload_id = str(uuid.uuid4())
+    part_size = CHAT_UPLOAD_PART_SIZE
+    part_count = max(1, math.ceil(size_bytes / part_size))
+    object_key = storage.build_chat_upload_key(canonical_ws, upload_id, safe_name)
+
+    store_upload_id = await asyncio.to_thread(
+        storage.open_multipart_upload,
+        object_key,
+        content_type=mime_type,
+    )
+    if not store_upload_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not stage inline attachment. Please try again.",
+        )
+
+    row_created = False
+    claim_token: str | None = None
+    try:
+        row = await db.create_upload_guarded(
+            upload_id=upload_id,
+            user_id=user_id,
+            workspace_id=canonical_ws,
+            filename=display_name,
+            safe_filename=safe_name,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            part_size=part_size,
+            part_count=part_count,
+            object_key=object_key,
+            store_upload_id=store_upload_id,
+            expected_sha256=expected_sha,
+            ttl=UPLOADING_TTL,
+            max_active_uploads=MAX_ACTIVE_USER_UPLOADS + MAX_MESSAGE_ATTACHMENTS,
+            max_active_bytes=MAX_ACTIVE_USER_UPLOAD_BYTES + MAX_INLINE_TOTAL_BYTES,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many uploads in progress. Wait for current uploads to finish or remove one.",
+            )
+        row_created = True
+
+        ordered_parts: list[dict[str, Any]] = []
+        for idx in range(part_count):
+            part_num = idx + 1
+            chunk = raw_bytes[idx * part_size : (idx + 1) * part_size]
+            part_sha = hashlib.sha256(chunk).hexdigest()
+            etag = await asyncio.to_thread(
+                storage.upload_part_bytes,
+                object_key,
+                store_upload_id,
+                part_number=part_num,
+                data=chunk,
+            )
+            if not etag:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Failed to stage inline attachment part. Please retry.",
+                )
+            updated = await db.record_uploaded_part(
+                upload_id,
+                part_number=part_num,
+                etag=etag,
+                size_bytes=len(chunk),
+                sha256=part_sha,
+            )
+            if updated is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Failed to record staged inline attachment part.",
+                )
+            ordered_parts.append({"part_number": part_num, "etag": etag})
+
+        claimed = await db.claim_complete(
+            upload_id,
+            lease=COMPLETE_LEASE,
+            expected_sha256=expected_sha,
+        )
+        if claimed is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to finalize staged inline attachment.",
+            )
+        claim_token = str(claimed.get("claim_token") or "")
+
+        completed = await asyncio.to_thread(
+            storage.complete_multipart_upload,
+            object_key,
+            store_upload_id,
+            ordered_parts,
+        )
+        if not completed:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to assemble staged inline attachment.",
+            )
+
+        digest = await asyncio.to_thread(
+            storage.compute_stored_object_digest,
+            object_key,
+        )
+        if digest is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to verify staged inline attachment.",
+            )
+        actual_size, actual_sha = digest
+        if actual_size != size_bytes or not hmac.compare_digest(
+            actual_sha, expected_sha
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="Staged inline attachment verification mismatch.",
+            )
+
+        ready_row = await db.mark_ready(
+            upload_id,
+            actual_sha256=actual_sha,
+            ready_ttl=READY_UNUSED_TTL,
+            claim_token=claim_token,
+        )
+        if ready_row is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to mark staged inline attachment ready.",
+            )
+        return ready_row
+    except BaseException:
+        try:
+            if row_created:
+                if claim_token:
+                    failed_row = await db.mark_failed(
+                        upload_id,
+                        error_code="stage_failed",
+                        error_detail="Inline attachment staging failed",
+                        claim_token=claim_token,
+                    )
+                    if failed_row is not None:
+                        await _cleanup_storage_objects(
+                            failed_row, mark_cleaned_on_success=True
+                        )
+                else:
+                    aborted = await db.abort_upload(upload_id, user_id=user_id)
+                    if aborted is not None:
+                        await _cleanup_storage_objects(
+                            aborted, mark_cleaned_on_success=True
+                        )
+            else:
+                await asyncio.to_thread(
+                    storage.abort_multipart_upload, object_key, store_upload_id
+                )
+                await asyncio.to_thread(storage.delete_stored_object, object_key)
+        except Exception:
+            logger.warning(
+                "Cleanup after failed inline steer staging failed for %s",
+                upload_id,
+                exc_info=True,
+            )
+        raise
+
+
+async def cleanup_unaccepted_staged_uploads(
+    staged_upload_ids: Sequence[str] | None,
+    *,
+    user_id: str,
+    claim_key: str | None = None,
+) -> None:
+    """Release claims and immediately delete server-staged inline blobs when steer admission does not accept."""
+    unique_ids = [str(uid).strip() for uid in dict.fromkeys(staged_upload_ids or ()) if uid]
+    if not unique_ids or not user_id:
+        return
+    clean_key = str(claim_key or "").strip()
+    if clean_key:
+        try:
+            await db.release_provisional_claims(
+                user_id=user_id,
+                claim_key=clean_key,
+                upload_ids=unique_ids,
+            )
+        except Exception:
+            logger.warning(
+                "Releasing provisional claim %s on unaccepted staged uploads failed",
+                clean_key,
+                exc_info=True,
+            )
+    for uid in unique_ids:
+        try:
+            await cancel_chat_upload(upload_id=uid, user_id=user_id)
+        except Exception:
+            logger.warning(
+                "Cleaning unaccepted staged inline upload %s failed",
+                uid,
+                exc_info=True,
+            )
+
+
+async def stage_request_attachments_for_steer(
+    additional_context: Sequence[Any] | None,
+    *,
+    user_id: str,
+    workspace_id: str,
+    is_existing_colleague_thread: bool = False,
+    claim_key: str | None = None,
+    ttl: timedelta = PROVISIONAL_CLAIM_TTL,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate and stage all ordered steer attachments as object-backed ``chat_upload`` descriptors.
+
+    Returns ``(ordered_chat_upload_contexts, newly_staged_inline_upload_ids)``.
+    Any pre-acceptance failure aborts and deletes all newly staged inline objects while
+    leaving caller-owned ``chat_upload`` rows intact.
+    """
+    if not has_any_attachment_contexts(additional_context):
+        return [], []
+
+    _ensure_feature_ready()
+    canonical_ws = await resolve_and_verify_upload_workspace(
+        user_id,
+        workspace_id,
+        is_existing_colleague_thread=is_existing_colleague_thread,
+    )
+    _, _, verified_existing_rows = await _validate_attachment_batch(
+        additional_context,
+        user_id=user_id,
+        workspace_id=canonical_ws,
+        is_existing_colleague_thread=is_existing_colleague_thread,
+    )
+    existing_by_id = {str(r["upload_id"]): r for r in verified_existing_rows}
+
+    eff_key = str(claim_key or "").strip() or chat_upload_claim_key()
+    ordered_descriptors: list[dict[str, Any]] = []
+    staged_inline_ids: list[str] = []
+
+    try:
+        for item in additional_context or ():
+            item_type = (
+                item.get("type")
+                if isinstance(item, dict)
+                else getattr(item, "type", None)
+            )
+            if item_type == "chat_upload":
+                raw_uid = (
+                    item.get("upload_id")
+                    if isinstance(item, dict)
+                    else getattr(item, "upload_id", "")
+                )
+                uid = _validate_uuid(str(raw_uid or ""), field_name="upload_id")
+                row = existing_by_id[uid]
+                src_kind = (
+                    item.get("source_kind")
+                    if isinstance(item, dict)
+                    else getattr(item, "source_kind", None)
+                ) or "chat_upload"
+                ordered_descriptors.append(
+                    {
+                        "type": "chat_upload",
+                        "upload_id": uid,
+                        "name": str(row["filename"]),
+                        "mime_type": str(row["mime_type"]),
+                        "size": int(row["size_bytes"]),
+                        "source_kind": src_kind,
+                    }
+                )
+            elif item_type in ("image", "pdf", "file"):
+                data_url = (
+                    item.get("data", "")
+                    if isinstance(item, dict)
+                    else getattr(item, "data", "")
+                ) or ""
+                desc = (
+                    item.get("description")
+                    if isinstance(item, dict)
+                    else getattr(item, "description", None)
+                )
+                staged_row = await _stage_single_inline_attachment(
+                    data_url=str(data_url),
+                    description=desc,
+                    fallback_type=str(item_type),
+                    user_id=user_id,
+                    canonical_ws=canonical_ws,
+                )
+                staged_uid = str(staged_row["upload_id"])
+                staged_inline_ids.append(staged_uid)
+                ordered_descriptors.append(
+                    {
+                        "type": "chat_upload",
+                        "upload_id": staged_uid,
+                        "name": str(staged_row["filename"]),
+                        "mime_type": str(staged_row["mime_type"]),
+                        "size": int(staged_row["size_bytes"]),
+                        "source_kind": str(item_type),
+                    }
+                )
+
+        all_ids = [d["upload_id"] for d in ordered_descriptors]
+        if all_ids:
+            claimed_by_id = await db.claim_provisional_batch(
+                all_ids,
+                user_id=user_id,
+                workspace_id=canonical_ws,
+                claim_key=eff_key,
+                ttl=ttl,
+            )
+            if claimed_by_id is None:
+                raise HTTPException(
+                    status_code=410,
+                    detail="Attachment has expired or was removed",
+                )
+    except BaseException:
+        if staged_inline_ids:
+            await asyncio.shield(
+                cleanup_unaccepted_staged_uploads(
+                    staged_inline_ids,
+                    user_id=user_id,
+                    claim_key=eff_key,
+                )
+            )
+        raise
+
+    return ordered_descriptors, staged_inline_ids
+
+
 async def validate_and_claim_request_attachments(
     additional_context: Sequence[Any] | None,
     *,
@@ -1230,7 +1684,7 @@ async def release_request_chat_uploads(
     request_key: str | None = None,
     additional_context: Sequence[Any] | None = None,
 ) -> int:
-    """Release a provisional claim on rejection while protecting any accepted request."""
+    """Release a provisional claim on rejection without altering durable retention."""
     upload_ids: list[str] | None = None
     if additional_context is not None:
         upload_items = extract_chat_upload_contexts(additional_context)
@@ -1264,6 +1718,7 @@ class ChatUploadSendScope:
         workspace_id: str,
         request_key: str | None = None,
         run_id: str | None = None,
+        claim_key: str | None = None,
         is_existing_colleague_thread: bool = False,
         preclaimed: bool = False,
     ) -> None:
@@ -1271,7 +1726,9 @@ class ChatUploadSendScope:
         self.user_id = str(user_id or "")
         self.workspace_id = str(workspace_id or "")
         self.request_key = request_key
-        self.claim_key = chat_upload_claim_key(request_key=request_key, run_id=run_id)
+        self.claim_key = str(claim_key or "").strip() or chat_upload_claim_key(
+            request_key=request_key, run_id=run_id
+        )
         self.is_existing_colleague_thread = is_existing_colleague_thread
         self._has_uploads = bool(extract_chat_upload_contexts(additional_context))
         self._claimed = bool(preclaimed and self._has_uploads)
@@ -1354,16 +1811,63 @@ async def build_chat_upload_history_metadata(
         ):
             out.append(_row_to_history_attachment(row))
         else:
-            out.append(
-                {
-                    "name": str(item.get("name") or "file")[:200],
-                    "type": "file",
-                    "size": int(item.get("size") or 0),
-                    "status": "uploaded",
-                    "upload_id": raw_id,
-                }
+            mime_hint = str(item.get("mime_type") or "").strip()
+            src_kind = str(item.get("source_kind") or "").strip()
+            att_type = (
+                src_kind
+                if src_kind in ("image", "pdf")
+                else "pdf"
+                if mime_hint == "application/pdf"
+                else "image"
+                if mime_hint.startswith("image/")
+                else "file"
             )
+            entry: dict[str, Any] = {
+                "name": str(item.get("name") or "file")[:200],
+                "type": att_type,
+                "size": int(item.get("size") or 0),
+                "status": "uploaded",
+                "upload_id": raw_id,
+            }
+            if mime_hint:
+                entry["mime_type"] = mime_hint
+            out.append(entry)
     return out
+
+
+async def build_ordered_turn_attachment_metadata(
+    additional_context: Sequence[Any] | None,
+    *,
+    inline_metadata: Sequence[dict[str, Any]] | None = None,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Combine inline and ``chat_upload`` metadata in exact ``additional_context`` order."""
+    if not additional_context:
+        return list(inline_metadata or [])
+    upload_meta = await build_chat_upload_history_metadata(
+        additional_context,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    inline_iter = iter(inline_metadata or ())
+    upload_iter = iter(upload_meta)
+    combined: list[dict[str, Any]] = []
+    for item in additional_context:
+        item_type = (
+            item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        )
+        if item_type in ("image", "pdf", "file"):
+            nxt = next(inline_iter, None)
+            if nxt is not None:
+                combined.append(nxt)
+        elif item_type == "chat_upload":
+            nxt = next(upload_iter, None)
+            if nxt is not None:
+                combined.append(nxt)
+    combined.extend(inline_iter)
+    combined.extend(upload_iter)
+    return combined
 
 
 async def _free_disk_bytes(sandbox: Any, work_dir: str) -> int | None:
@@ -1376,6 +1880,46 @@ async def _free_disk_bytes(sandbox: Any, work_dir: str) -> int | None:
         return None
     reading = parse_df(getattr(result, "stdout", "") or "")
     return reading.free_bytes if reading else None
+
+
+async def _probe_sandbox_file_matches(
+    sandbox: Any,
+    abs_target_path: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> bool:
+    """Return True iff ``abs_target_path`` is a regular file with exact ``expected_size`` and SHA-256."""
+    clean_sha = str(expected_sha256 or "").strip().lower()
+    if not clean_sha or int(expected_size) <= 0:
+        return False
+    verify_existing_cmd = (
+        "python3 -c '"
+        "import hashlib, os, sys; "
+        "p, exp_sz, exp_sha = sys.argv[1], int(sys.argv[2]), sys.argv[3]; "
+        "sys.exit(1) if (not os.path.isfile(p) or os.path.islink(p) or os.path.getsize(p) != exp_sz) else None; "
+        "h = hashlib.sha256();\n"
+        "with open(p, \"rb\") as f:\n"
+        "    while True:\n"
+        "        b = f.read(1048576)\n"
+        "        if not b: break\n"
+        "        h.update(b)\n"
+        "sys.exit(0 if h.hexdigest() == exp_sha else 1)"
+        "' "
+        f"{shlex.quote(abs_target_path)} {int(expected_size)} {shlex.quote(clean_sha)}"
+    )
+    probe_timeout = max(20, transfer_timeout_s(int(expected_size)))
+    try:
+        probe = await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            verify_existing_cmd,
+            timeout=probe_timeout,
+            total_timeout=max(120.0, float(probe_timeout) + 30.0),
+            retry_policy=RetryPolicy.SAFE,
+        )
+    except Exception:
+        return False
+    return getattr(probe, "exit_code", 1) == 0
 
 
 async def _materialize_via_chunked_stream(
@@ -1394,32 +1938,13 @@ async def _materialize_via_chunked_stream(
     part_path = f"{parent_dir}/.wsfiles-part-{uid_hex}"
 
     # Fast-path idempotency check if target already holds the exact bytes.
-    verify_existing_cmd = (
-        "python3 -c '"
-        "import hashlib, os, sys; "
-        "p, exp_sz, exp_sha = sys.argv[1], int(sys.argv[2]), sys.argv[3]; "
-        "sys.exit(1) if (not os.path.isfile(p) or os.path.islink(p) or os.path.getsize(p) != exp_sz) else None; "
-        "h = hashlib.sha256();\n"
-        "with open(p, \"rb\") as f:\n"
-        "    while True:\n"
-        "        b = f.read(1048576)\n"
-        "        if not b: break\n"
-        "        h.update(b)\n"
-        "sys.exit(0 if h.hexdigest() == exp_sha else 1)"
-        "' "
-        f"{shlex.quote(abs_target_path)} {int(expected_size)} {shlex.quote(expected_sha256)}"
-    )
-    if expected_sha256:
-        probe_timeout = max(20, transfer_timeout_s(expected_size))
-        probe = await sandbox._runtime_call(
-            sandbox.runtime.exec,
-            verify_existing_cmd,
-            timeout=probe_timeout,
-            total_timeout=max(120.0, float(probe_timeout) + 30.0),
-            retry_policy=RetryPolicy.SAFE,
-        )
-        if getattr(probe, "exit_code", 1) == 0:
-            return
+    if await _probe_sandbox_file_matches(
+        sandbox,
+        abs_target_path,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+    ):
+        return
 
     prep = await sandbox._runtime_call(
         sandbox.runtime.exec,
@@ -1614,65 +2139,101 @@ async def materialize_chat_uploads(
         return notes
 
     layout = _sandbox_layout(sandbox, eff_project)
-
-    total_needed = sum(int(r["size_bytes"]) for r in verified_rows)
-    free_bytes = await _free_disk_bytes(sandbox, layout.workspace)
-    if free_bytes is not None and free_bytes - CRITICAL_FREE_BYTES < total_needed:
-        raise RuntimeError(
-            f"Not enough free disk space in workspace ({max(free_bytes, 0) // _MIB} MB free)"
-        )
-
     can_direct = bool(
         getattr(getattr(sandbox, "provider", None), "direct_blob_transfer", True)
     )
 
+    ordered_targets: list[tuple[dict[str, Any], str, str, int]] = []
+    unique_by_abs: dict[str, tuple[dict[str, Any], str, str, int]] = {}
     for row in verified_rows:
         rel_path = build_sandbox_upload_rel_path(row)
         if not sandbox.validate_path(rel_path, eff_project):
             raise PermissionError(f"Invalid sandbox upload target: {rel_path!r}")
         abs_path = sandbox.normalize_path(rel_path, project=eff_project)
         size_bytes = int(row["size_bytes"])
+        entry = (row, rel_path, abs_path, size_bytes)
+        ordered_targets.append(entry)
+        unique_by_abs.setdefault(abs_path, entry)
 
-        async with sandbox.path_write_lock(abs_path):
-            # Re-verify workspace write access right before placing on disk.
-            await resolve_and_verify_upload_workspace(
-                user_id,
-                workspace_id,
-                is_existing_colleague_thread=is_existing_colleague_thread,
+    async with AsyncExitStack() as lock_stack:
+        for abs_path in sorted(unique_by_abs):
+            await lock_stack.enter_async_context(sandbox.path_write_lock(abs_path))
+
+        # Re-verify workspace write access right before probing/placing on disk.
+        await resolve_and_verify_upload_workspace(
+            user_id,
+            workspace_id,
+            is_existing_colleague_thread=is_existing_colleague_thread,
+        )
+
+        missing_or_mismatched: list[tuple[dict[str, Any], str, str, int]] = []
+        for abs_path in sorted(unique_by_abs):
+            t_row, t_rel, t_abs, t_size = unique_by_abs[abs_path]
+            exp_sha = str(
+                t_row.get("actual_sha256") or t_row.get("expected_sha256") or ""
             )
-            await _place_row_in_sandbox(
+            if not await _probe_sandbox_file_matches(
                 sandbox,
-                row,
-                layout=layout,
-                abs_path=abs_path,
-                rel_path=rel_path,
-                can_direct=can_direct,
-            )
+                t_abs,
+                expected_size=t_size,
+                expected_sha256=exp_sha,
+            ):
+                missing_or_mismatched.append((t_row, t_rel, t_abs, t_size))
 
+        if missing_or_mismatched:
+            total_needed = sum(t_size for _, _, _, t_size in missing_or_mismatched)
+            free_bytes = await _free_disk_bytes(sandbox, layout.workspace)
+            if (
+                free_bytes is not None
+                and free_bytes - CRITICAL_FREE_BYTES < total_needed
+            ):
+                raise RuntimeError(
+                    f"Not enough free disk space in workspace ({max(free_bytes, 0) // _MIB} MB free)"
+                )
+
+            for t_row, t_rel, t_abs, _ in missing_or_mismatched:
+                await resolve_and_verify_upload_workspace(
+                    user_id,
+                    workspace_id,
+                    is_existing_colleague_thread=is_existing_colleague_thread,
+                )
+                await _place_row_in_sandbox(
+                    sandbox,
+                    t_row,
+                    layout=layout,
+                    abs_path=t_abs,
+                    rel_path=t_rel,
+                    can_direct=can_direct,
+                )
+
+    for row, rel_path, _, size_bytes in ordered_targets:
+        mime = str(row.get("mime_type") or "")
+        hint = (
+            "Read it directly or use Python to inspect it."
+            if mime == "application/pdf" or mime.startswith("image/")
+            else "Use Python to process it."
+        )
         notes.append(
-            f"The user attached a file ({row['filename']}, {row['mime_type']}, "
+            f"The user attached a file ({row['filename']}, {mime}, "
             f"{_format_human_bytes(size_bytes)}). It has been saved to {rel_path}. "
-            "Use Python to process it."
+            f"{hint}"
         )
 
     return notes
 
 
-async def materialize_steered_chat_uploads(
+async def verify_steered_chat_uploads(
     payload: dict[str, Any],
-    *,
-    project: ProjectContext | None = None,
-    session: Any | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Materialize ``chat_uploads`` on a held steer job into the verified workspace folder.
+) -> tuple[str, str, bool, list[dict[str, Any]]]:
+    """Verify workspace write access and attachment state for a steered payload.
 
-    Returns ``(model_file_reminder, verified_attachment_metadata)``.
-    Raises :class:`SteerAttachmentPermanentError` on authorization/reference failures
-    and :class:`SteerAttachmentTransientError` on temporary sandbox/storage errors.
+    Returns ``(normalized_workspace_id, workspace_owner_id, is_colleague, verified_rows)``.
+    Raises :class:`SteerAttachmentPermanentError` on permanent failures and
+    :class:`SteerAttachmentTransientError` on transient infrastructure errors.
     """
     chat_uploads = payload.get("chat_uploads")
     if not chat_uploads:
-        return "", []
+        return "", "", False, []
     user_id = str(payload.get("user_id") or "").strip()
     workspace_id = str(payload.get("workspace_id") or "").strip()
     if not user_id or not workspace_id:
@@ -1683,13 +2244,6 @@ async def materialize_steered_chat_uploads(
 
     from src.dalton.sharing import ColleagueAccessRevokedError
     from src.server.database.workspace import get_workspace
-    from src.server.services.workspace_layout import (
-        WorkspaceFolderMoving,
-        WorkspaceLayoutUnavailable,
-        resolve_project_context,
-    )
-    from src.server.services.workspace_manager import WorkspaceManager
-    from src.server.utils.multimodal_context import build_file_reminder
 
     try:
         normalized_ws = _validate_uuid(workspace_id, field_name="workspace_id")
@@ -1699,7 +2253,10 @@ async def materialize_steered_chat_uploads(
             str(exc.detail),
         ) from exc
 
-    ws_row = await get_workspace(normalized_ws)
+    try:
+        ws_row = await get_workspace(normalized_ws)
+    except Exception as exc:
+        raise SteerAttachmentTransientError(str(exc)) from exc
     if ws_row is None and not is_home_id(user_id, normalized_ws):
         raise SteerAttachmentPermanentError(
             "workspace_not_found",
@@ -1731,13 +2288,52 @@ async def materialize_steered_chat_uploads(
         raise SteerAttachmentPermanentError("forbidden", str(exc)) from exc
     except HTTPException as exc:
         if exc.status_code in (400, 401, 403, 404, 410, 413):
+            detail = exc.detail
+            msg = (
+                str(detail.get("message") or detail)
+                if isinstance(detail, dict)
+                else str(detail)
+            )
             raise SteerAttachmentPermanentError(
                 f"http_{exc.status_code}",
-                str(exc.detail),
+                msg,
             ) from exc
         raise SteerAttachmentTransientError(str(exc.detail)) from exc
     except Exception as exc:
         raise SteerAttachmentTransientError(str(exc)) from exc
+
+    return normalized_ws, ws_owner, is_colleague, verified_rows
+
+
+async def materialize_steered_chat_uploads(
+    payload: dict[str, Any],
+    *,
+    project: ProjectContext | None = None,
+    session: Any | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Materialize ``chat_uploads`` on a held steer job into the verified workspace folder.
+
+    Returns ``(model_file_reminder, verified_attachment_metadata)``.
+    Raises :class:`SteerAttachmentPermanentError` on authorization/reference failures
+    and :class:`SteerAttachmentTransientError` on temporary sandbox/storage errors.
+    """
+    chat_uploads = payload.get("chat_uploads")
+    if not chat_uploads:
+        return "", []
+    user_id = str(payload.get("user_id") or "").strip()
+
+    from src.dalton.sharing import ColleagueAccessRevokedError
+    from src.server.services.workspace_layout import (
+        WorkspaceFolderMoving,
+        WorkspaceLayoutUnavailable,
+        resolve_project_context,
+    )
+    from src.server.services.workspace_manager import WorkspaceManager
+    from src.server.utils.multimodal_context import build_file_reminder
+
+    normalized_ws, ws_owner, is_colleague, verified_rows = (
+        await verify_steered_chat_uploads(payload)
+    )
 
     if session is None:
         try:
@@ -2003,9 +2599,16 @@ async def rematerialize_workspace_chat_uploads(
     )
     restored = 0
     errors = 0
-    for row, rel_path, abs_path in missing_entries:
+    for row, rel_path, abs_path in sorted(missing_entries, key=lambda e: e[2]):
         try:
             async with sandbox.path_write_lock(abs_path):
+                if await _probe_sandbox_file_matches(
+                    sandbox,
+                    abs_path,
+                    expected_size=int(row["size_bytes"]),
+                    expected_sha256=str(row.get("actual_sha256") or ""),
+                ):
+                    continue
                 await _place_row_in_sandbox(
                     sandbox,
                     row,

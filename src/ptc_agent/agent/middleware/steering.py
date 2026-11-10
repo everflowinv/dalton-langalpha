@@ -225,6 +225,9 @@ class SteeringMiddleware(AgentMiddleware):
         ):
             announce(runtime.stream_writer, thread_id, delivered)
         taken = await self._take(thread_id, run_id)
+        # DALTON-HOOK(chat-large-upload): announce permanently failed steer attachments live without model injection
+        for failed in await self._take_failed(thread_id, run_id):
+            announce_returned(runtime.stream_writer, thread_id, failed)
         resumes = await self._take_resumes(thread_id, run_id)
         if not taken and not resumes:
             return None
@@ -344,6 +347,21 @@ class SteeringMiddleware(AgentMiddleware):
                 )
         except Exception as e:
             logger.warning(f"[Steering] Settling resume of {held['task_id']} failed: {e}")
+
+    # DALTON-HOOK(chat-large-upload): claim once-only failure notices for permanently failed steer attachments
+    async def _take_failed(
+        self, thread_id: str, run_id: str | None
+    ) -> list[dict[str, Any]]:
+        if "steer" not in self.kinds or self.report_inbox is None or not run_id:
+            return []
+        take_failed = getattr(self.report_inbox, "take_failed", None)
+        if take_failed is None:
+            return []
+        try:
+            return await take_failed(thread_id, run_id)
+        except Exception as e:
+            logger.warning(f"[Steering] Taking failed steers failed: {e}")
+            return []
 
     async def _take_resumes(
         self, thread_id: str, run_id: str | None
@@ -485,6 +503,17 @@ def announce(
     """Tell the stream a steering message was delivered."""
     try:
         writer({"type": "steering_delivered", "thread_id": thread_id, **delivered})
+    except Exception:
+        logger.debug("[Steering] stream_writer unavailable, skipping SSE event")
+
+
+# DALTON-HOOK(chat-large-upload): emit live steering_returned notice when a steer attachment fails permanently
+def announce_returned(
+    writer: Callable[[Any], None], thread_id: str, returned: dict[str, Any]
+) -> None:
+    """Tell the stream a steering message could not be delivered."""
+    try:
+        writer({"type": "steering_returned", "thread_id": thread_id, **returned})
     except Exception:
         logger.debug("[Steering] stream_writer unavailable, skipping SSE event")
 

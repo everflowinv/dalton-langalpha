@@ -24,7 +24,9 @@ import {
   ZERO_USAGE, extractTokenUsageDelta, accumulateTokenUsage,
 } from '../../utils/tokenUsage';
 import { computeSteeringBoundary, keepSegmentsThrough, shouldSkipSteeringRollback } from './steeringRollback';
-import { foldSteeringDelivery, steeringDeliveredEntries, withContinuation } from './steeringDelivery';
+// DALTON-HOOK(chat-large-upload): fold live undelivered steer attachment failure events
+import { foldFailedSteer, foldSteeringDelivery, steeringDeliveredEntries, withContinuation } from './steeringDelivery';
+import { readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
 import {
   buildModelFallbackSegment, appendNotificationSegmentOnce,
   isWorkspaceChangingToolSuccess, mapToolCallIdToAgentId,
@@ -508,9 +510,32 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
 
     // A main-thread steering_returned hands a chat app's missed steers back
     // to the gateway that resubmits them; a steer this view sent stays on the
-    // server and its next turn reads it. Task-lane steering_returned is
-    // handled in the isSubagent block (it must not mutate main-chat state).
-    if (eventType === 'steering_returned' && !isSubagent) return;
+    // server and its next turn reads it, except when an attachment permanently
+    // failed verification/materialization (reason="attachment_failed").
+    // DALTON-HOOK(chat-large-upload): surface permanently failed steer attachments live
+    if (eventType === 'steering_returned' && !isSubagent) {
+      if (event.reason === 'attachment_failed') {
+        const turn = event.turn_index ?? turnOf(rt.messagesRef.current, assistantMessageId);
+        const errMsg = typeof event.error === 'string' && event.error.trim()
+          ? event.error.trim()
+          : 'Attachment could not be delivered.';
+        const reqKey = typeof event.request_key === 'string' && event.request_key
+          ? event.request_key
+          : null;
+        if (reqKey) {
+          rt.requestKeyRef.current.spend(reqKey);
+        }
+        const shownComments = event.artifact_comments !== undefined
+          ? readArtifactCommentsShown(event.artifact_comments)
+          : undefined;
+        if (shownComments) {
+          rt.requestKeyRef.current.returned(shownComments);
+        }
+        rt.setMessages((prev) => foldFailedSteer(prev, event as Record<string, unknown>, turn));
+        rt.setMessageError(errMsg);
+      }
+      return;
+    }
 
     // Handle unified context_window events (token_usage, summarize, offload)
     if (eventType === 'context_window') {

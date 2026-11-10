@@ -564,6 +564,8 @@ export type UserMessage = {
    * server took it.
    */
   queueRefused?: boolean;
+  // DALTON-HOOK(chat-large-upload): failure reason shown on undelivered steer/attachment bubbles
+  queueError?: StructuredError | string;
   /**
    * Set while this message is parked during an in-progress compaction (the
    * backend 409s a POST mid-compaction). Rendered as a shimmer bubble like a

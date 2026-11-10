@@ -130,7 +130,40 @@ async def execute_steer(job: dict) -> None:
         return
 
     if sender == "user":
-        # DALTON-HOOK(chat-large-upload): preserve server-stored chat_upload references when a parked steer becomes a turn
+        # DALTON-HOOK(chat-large-upload): verify server-stored chat_upload references on parked steers and settle permanent failures durably
+        if payload.get("chat_uploads"):
+            from src.dalton.services.chat_uploads import (
+                SteerAttachmentPermanentError,
+                SteerAttachmentTransientError,
+                verify_steered_chat_uploads,
+            )
+
+            try:
+                await verify_steered_chat_uploads(payload)
+            except SteerAttachmentPermanentError as exc:
+                await finish(
+                    "failed",
+                    {
+                        "failed_run_id": str(row.get("run_id") or ""),
+                        "delivery_error": {
+                            "code": exc.code[:100],
+                            "message": exc.message[:500],
+                        },
+                    },
+                )
+                if payload.get("artifact_comments") and payload.get("request_key"):
+                    from src.server.services.artifacts.comments import give_back_unread
+
+                    await give_back_unread(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        request_key=payload["request_key"],
+                    )
+                return
+            except SteerAttachmentTransientError:
+                await repark()
+                return
+
         body = {
             "messages": [{"role": "user", "content": payload.get("content") or ""}],
             "workspace_id": workspace_id,

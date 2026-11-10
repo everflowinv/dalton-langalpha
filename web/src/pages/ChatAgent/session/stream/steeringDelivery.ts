@@ -252,3 +252,97 @@ export function foldSteeringDelivery(
     settledKeys,
   };
 }
+
+// DALTON-HOOK(chat-large-upload): build and idempotently fold permanently failed steer attachment notices
+export function failedSteerRow(
+  event: Record<string, unknown>,
+  id: string,
+  turnIndex: number | undefined,
+): UserMessage | null {
+  const errorText = typeof event.error === 'string' && event.error.trim()
+    ? event.error.trim()
+    : 'Attachment could not be delivered.';
+  const shownComments = event.artifact_comments !== undefined
+    ? readArtifactCommentsShown(event.artifact_comments)
+    : undefined;
+  const content = shownComments ? shownComments.note : String(event.content ?? '');
+  const attachments = normalizeAttachments(event.attachments);
+  if (!content && !shownComments && !attachments) return null;
+  const rawTs = event.timestamp;
+  const timestamp = typeof rawTs === 'number'
+    ? new Date(rawTs * 1000)
+    : typeof rawTs === 'string' && rawTs
+      ? new Date(rawTs)
+      : new Date();
+  const requestKey = typeof event.request_key === 'string' && event.request_key
+    ? event.request_key
+    : undefined;
+  return {
+    id,
+    role: 'user',
+    content,
+    contentType: 'text',
+    timestamp,
+    isStreaming: false,
+    steering: false,
+    steeringDelivered: false,
+    queueRefused: true,
+    queueError: errorText,
+    ...(turnIndex !== undefined ? { turnIndex } : {}),
+    ...(requestKey ? { requestKey } : {}),
+    ...(shownComments ? { artifactComments: shownComments } : {}),
+    ...(attachments ? { attachments } : {}),
+  };
+}
+
+export function foldFailedSteer(
+  prev: ChatMessage[],
+  event: Record<string, unknown>,
+  turnIndex: number | undefined,
+): ChatMessage[] {
+  const requestKey = typeof event.request_key === 'string' && event.request_key
+    ? event.request_key
+    : undefined;
+  const jobId = typeof event.job_id === 'string' && event.job_id
+    ? event.job_id
+    : undefined;
+  const fallbackId = `failed-steer-${requestKey || jobId || String(turnIndex ?? 0)}`;
+  const row = failedSteerRow(event, fallbackId, turnIndex);
+  if (!row) return prev;
+
+  const matched: number[] = [];
+  prev.forEach((m, i) => {
+    if (m.id === fallbackId) {
+      matched.push(i);
+    } else if (requestKey && m.role === 'user' && m.requestKey === requestKey) {
+      matched.push(i);
+    }
+  });
+
+  if (matched.length > 0) {
+    const keep = matched[0];
+    const drop = new Set(matched.slice(1));
+    return prev.flatMap((m, i) => {
+      if (drop.has(i)) return [];
+      if (i !== keep) return [m];
+      const existing = m as UserMessage;
+      const mergedAtts = row.attachments
+        ? mergeAcceptedAttachments(existing.attachments, row.attachments)
+        : existing.attachments;
+      const updated: UserMessage = {
+        ...existing,
+        content: row.content || existing.content,
+        steering: false,
+        steeringDelivered: false,
+        queueRefused: true,
+        queueError: row.queueError,
+        ...(turnIndex !== undefined ? { turnIndex } : {}),
+        ...(row.artifactComments ? { artifactComments: row.artifactComments } : {}),
+        ...(mergedAtts ? { attachments: mergedAtts } : {}),
+      };
+      return [updated];
+    });
+  }
+
+  return [...prev, row];
+}

@@ -650,13 +650,11 @@ async def release_provisional_claims(
     upload_ids: Sequence[str] | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Release ``claim_key`` on rejection unless another copy with ``request_key`` was durably accepted."""
+    """Drop ``claim_key`` from ``pending_claims`` without altering durable ``used_at`` retention."""
+    del request_key
     key = str(claim_key or "").strip()
     if not key:
         return 0
-    from src.server.database.runs.lifecycle import request_key_has_run
-    from src.server.database.runs.outbox import steer_key_taken
-
     unique_ids = (
         [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
         if upload_ids is not None
@@ -687,30 +685,6 @@ async def release_provisional_claims(
                 )
                 locked_ids = [str(r["upload_id"]) for r in await cur.fetchall()]
                 if not locked_ids:
-                    return 0
-
-                clean_req_key = str(request_key).strip() if request_key else ""
-                if clean_req_key and (
-                    await request_key_has_run(conn, clean_req_key)
-                    or await steer_key_taken(conn, clean_req_key)
-                ):
-                    await cur.execute(
-                        f"""
-                        UPDATE dalton_chat_file_uploads AS u
-                        SET used_at = COALESCE(u.used_at, {now_expr}),
-                            expires_at = NULL,
-                            pending_claims = {_pruned_claims_sql("u", now_expr=now_expr, drop_key_param="%(claim_key)s")},
-                            updated_at = {now_expr}
-                        WHERE u.upload_id = ANY(%(locked_ids)s)
-                          AND u.state = 'ready'
-                          AND u.cleaned_at IS NULL
-                        """,
-                        {
-                            "locked_ids": locked_ids,
-                            "claim_key": key,
-                            "now": now,
-                        },
-                    )
                     return 0
 
                 await cur.execute(

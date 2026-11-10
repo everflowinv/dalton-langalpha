@@ -9,8 +9,9 @@ import { isTaskAgentId } from '../../utils/agentId';
 import { opensTurn } from '../../components/messageList/messagePredicates';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import { reportRow, senderProvenance, type SenderMetadata } from '../provenance';
-import { deliveredEntryRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
-import type { ReportSource } from '@/types/api';
+// DALTON-HOOK(chat-large-upload): reuse failedSteerRow for replayed undelivered steers
+import { deliveredEntryRow, failedSteerRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
+import type { ArtifactCommentsShown, ReportSource } from '@/types/api';
 import { isDeliveredNotice, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
 import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
@@ -843,6 +844,49 @@ export function handleHistorySteeringDelivered({
     newMessagesStartIndexRef.current = idx + 1;
     return next;
   });
+}
+
+// DALTON-HOOK(chat-large-upload): replay permanently failed main-thread steers idempotently
+export function handleHistorySteeringReturned({
+  event,
+  pairIndex,
+  refs,
+  setMessages,
+  onCopySettled,
+}: {
+  event: HistoryEvent;
+  pairIndex: number;
+  refs: HistorySteeringRefs;
+  setMessages: SetMessages;
+  onCopySettled?: (requestKey: string | null, comments?: ArtifactCommentsShown) => void;
+}): void {
+  const { newMessagesStartIndexRef } = refs;
+  const reqKey = typeof event.request_key === 'string' && event.request_key
+    ? event.request_key
+    : null;
+  const jobKey = typeof event.job_id === 'string' && event.job_id
+    ? event.job_id
+    : String(event.timestamp ?? pairIndex);
+  const rowId = `history-steering-failed-${pairIndex}-${reqKey || jobKey}`;
+  const row = failedSteerRow(event, rowId, pairIndex);
+  if (!row) return;
+  const userMessage: MessageRecord = { ...row, isHistory: true };
+
+  setMessages((prev: MessageRecord[]) => {
+    const lost = prev.flatMap((m, i) => {
+      if (m.id === rowId) return [i];
+      if (reqKey && m.role === 'user' && (m as { requestKey?: string }).requestKey === reqKey) {
+        return [i];
+      }
+      return [];
+    });
+    const rest = lost.length === 0 ? prev : prev.filter((_, i) => !lost.includes(i));
+    const idx = newMessagesStartIndexRef.current - lost.filter((i) => i < newMessagesStartIndexRef.current).length;
+    const next = [...rest.slice(0, idx), userMessage, ...rest.slice(idx)];
+    newMessagesStartIndexRef.current = idx + 1;
+    return next;
+  });
+  onCopySettled?.(reqKey, row.artifactComments);
 }
 
 /** Task-artifact statuses the backend stamps onto replayed events. */

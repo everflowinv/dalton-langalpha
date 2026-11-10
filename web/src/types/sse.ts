@@ -338,6 +338,20 @@ export interface SteeringDeliveredEvent extends BaseSSEEvent {
   messages: SteeringDeliveredEntry[];
 }
 
+// DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
+export interface SteeringReturnedEvent extends BaseSSEEvent {
+  event: 'steering_returned';
+  reason?: string;
+  error?: string;
+  error_code?: string;
+  request_key?: string;
+  content?: string;
+  attachments?: Attachment[];
+  artifact_comments?: ArtifactCommentsShown;
+  timestamp?: number;
+  job_id?: string;
+}
+
 export interface TaskSteeringAcceptedEvent extends BaseSSEEvent {
   event: 'task_steering_accepted';
   task_id: string;
