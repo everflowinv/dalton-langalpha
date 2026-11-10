@@ -1260,9 +1260,11 @@ async def test_terminal_cleanup_on_success_failure_and_cancel_and_cleanup_error_
     tos_client_cancel.delete_object.return_value = True
 
     asr_client_cancel = create_autospec(sac.SeedAsrClient, instance=True)
+    transcription_started = asyncio.Event()
 
     async def _slow_transcribe(**kwargs: Any) -> sac.QueryOutcome:
         await kwargs["persist_request_id_fn"]("req-clean-cancel")
+        transcription_started.set()
         await asyncio.sleep(10.0)
         raise AssertionError("Should have been cancelled")
 
@@ -1287,11 +1289,7 @@ async def test_terminal_cleanup_on_success_failure_and_cancel_and_cleanup_error_
             "idempotency_key": "idemp-cancel-01",
         }
     )
-    for _ in range(40):
-        _, st_c = await mgr_cancel.get_job("job_clean_cancel")
-        if st_c["job"]["segments"] and st_c["job"]["segments"][0].get("tos_object_key"):
-            break
-        await asyncio.sleep(0.01)
+    await asyncio.wait_for(transcription_started.wait(), timeout=5.0)
 
     code_c, body_c = await mgr_cancel.cancel_job("job_clean_cancel")
     assert code_c == 200
