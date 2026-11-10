@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 from urllib.parse import urlsplit
@@ -29,6 +30,9 @@ import pytest_asyncio
 from src.dalton import access_tiers
 from src.dalton.database import automation_reports as reports
 from src.dalton.database import channel_gateway as cg_db
+from src.dalton.database import data_task_notifications as dtn
+from src.dalton.notify import dispatch as notify_dispatch
+from src.dalton.notify.channel_transport import post_data_task_gateway_notify
 from src.server.database import automation_executions as execution_db
 from src.server.database import pool as db_pool
 from src.server.database import user as user_db
@@ -340,6 +344,27 @@ async def _cleanup(pool: AsyncConnectionPool, world: World) -> None:
                 WHERE user_id = ANY(%s) OR execution_id = ANY(%s)
                 """,
                 (users, world.execution_ids),
+            )
+            await cur.execute(
+                """
+                DELETE FROM dalton_channel_deliveries
+                WHERE user_id = ANY(%s)
+                   OR execution_id = ANY(%s::uuid[])
+                   OR run_id = ANY(%s)
+                """,
+                (users, world.execution_ids, world.execution_ids),
+            )
+            await cur.execute(
+                """
+                DELETE FROM dalton_data_task_runs
+                WHERE run_id = ANY(%s::uuid[])
+                   OR job_key LIKE %s
+                """,
+                (world.execution_ids, f"rptnative_{world.prefix}%"),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key LIKE %s",
+                (f"rptnative_{world.prefix}%",),
             )
             await cur.execute(
                 """
@@ -1248,3 +1273,628 @@ async def test_default_authorization_reuses_the_held_connection(
     finally:
         await _cleanup(pool, built)
         await pool.close()
+
+
+def _plan_kwargs(world: World) -> dict[str, Any]:
+    return {
+        "resolve_enabled_fn": world.resolve_enabled,
+        "resolve_overrides_fn": world.resolve_overrides,
+        "resolve_targets_fn": world.resolve_targets,
+        "resolve_routes_fn": world.resolve_routes,
+        "is_admin_fn": world.is_admin,
+    }
+
+
+def _patch_native_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route plan, claim, and dispatch through the fixture pool. Notifications stay enabled."""
+    monkeypatch.setattr(dtn, "get_db_connection", reports.get_db_connection)
+    monkeypatch.setattr(notify_dispatch, "get_db_connection", reports.get_db_connection)
+    monkeypatch.setattr(
+        dtn,
+        "get_dalton_settings",
+        create_autospec(
+            dtn.get_dalton_settings,
+            return_value=SimpleNamespace(enabled=True),
+        ),
+    )
+
+
+async def _insert_data_run(
+    world: World,
+    run_id: str,
+    *,
+    status: str,
+    outbox: dict[str, Any] | None = None,
+) -> str:
+    job_key = f"rptnative_{world.prefix}_{run_id.replace('-', '')[:12]}"
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_data_task_defs (
+                    job_key, task_code, title, batch_no, runner, cron_expr,
+                    timezone, command_argv, workdir
+                )
+                VALUES (%s, 'rptnative', 'native plan stage', 1, 'container',
+                        '0 0 * * *', 'UTC', %s::jsonb, '/tmp')
+                """,
+                (job_key, json.dumps(["true"])),
+            )
+            await cur.execute(
+                """
+                INSERT INTO dalton_data_task_runs (
+                    run_id, job_key, trigger_source, scheduled_slot_utc,
+                    deadline_utc, status, notify_status, outbox_payload
+                )
+                VALUES (
+                    %s::uuid, %s, 'manual', NOW(), NOW() + INTERVAL '1 hour',
+                    %s, 'pending_dispatch', %s::jsonb
+                )
+                """,
+                (run_id, job_key, status, json.dumps(outbox or {})),
+            )
+    return job_key
+
+
+async def _notify_status(world: World, run_id: str) -> str | None:
+    async with world.pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_id,),
+            )
+            row = await cur.fetchone()
+    if not isinstance(row, dict):
+        return None
+    return str(row.get("notify_status") or "")
+
+
+async def _channel_rows(world: World, execution_id: str) -> list[dict[str, Any]]:
+    async with world.pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT delivery_key, kind, run_id, execution_id::text AS execution_id,
+                       platform, target_address, status, user_id
+                FROM dalton_channel_deliveries
+                WHERE run_id = %s OR execution_id = %s::uuid
+                ORDER BY delivery_key ASC
+                """,
+                (execution_id, execution_id),
+            )
+            fetched = await cur.fetchall()
+    return [dict(row) for row in fetched or []]
+
+
+@pytest.mark.asyncio
+async def test_saved_report_plan_and_claim_keep_original_cards(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    first = _card("First [10-K](https://example.com/msft/10k)")
+    second = _card("Second [10-Q](https://example.com/msft/10q)")
+    saved = await _submit(world, cards=[first, second])
+    assert saved["ok"] is True
+    digest = saved["payload"]["content_sha256"]
+    chat_id = world.chat_a.rsplit(":", 1)[-1]
+
+    plan = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert plan["authorized"] is True
+    assert plan["status"] == "authorized"
+    assert plan["run_id"] == world.execution_id
+    assert plan["job_key"] == world.automation_id
+    assert plan["recipient_id"] == chat_id
+    assert plan["canonical_target_address"] == world.address_a
+    assert plan["requested_target"] == world.chat_a
+    assert plan["target_kind"] == "group"
+    assert [item["kind"] for item in plan["items"]] == ["feishu_card", "feishu_card"]
+    assert [item["item_index"] for item in plan["items"]] == [0, 1]
+    assert [item["card"]["body"]["elements"][0]["content"] for item in plan["items"]] == [
+        first["body"]["elements"][0]["content"],
+        second["body"]["elements"][0]["content"],
+    ]
+    assert all(item["images"] == [] and "artifact" not in item for item in plan["items"])
+
+    rows = await _rows(world)
+    stamped = next(row for row in rows if row["target"] == world.chat_a)
+    assert stamped["payload_json"]["source"] == "automation_report"
+    assert stamped["payload_json"]["content_sha256"] == digest
+    assert stamped["payload_json"]["cards"] == saved["payload"]["cards"]
+    assert stamped["payload_json"]["target_snapshot"] == saved["targets"]
+    assert stamped["payload_json"]["reconcile_recipient_id"] == chat_id
+    assert stamped["automation_id"] == world.automation_id
+    assert not str(stamped["automation_id"]).startswith("data:")
+
+    delivery_key = plan["items"][0]["delivery_key"]
+    claimed = await dtn.authorize_and_claim_data_task_delivery(
+        delivery_key=delivery_key,
+        run_id=world.execution_id,
+        target=world.chat_a,
+        has_non_empty_text=True,
+        total_chunks=0,
+        **_plan_kwargs(world),
+    )
+    assert claimed["claim_status"] == "claimed"
+    assert claimed["recipient_id"] == chat_id
+    assert claimed["target_address"] == world.address_a
+    ledger = await _channel_rows(world, world.execution_id)
+    assert len(ledger) == 1
+    assert ledger[0]["kind"] == "data_task"
+    assert ledger[0]["execution_id"] == world.execution_id
+    assert ledger[0]["run_id"] == world.execution_id
+    assert ledger[0]["status"] == "in_flight"
+
+    again = await dtn.authorize_and_claim_data_task_delivery(
+        delivery_key=delivery_key,
+        run_id=world.execution_id,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert again["claim_status"] == "in_flight_or_unknown"
+    assert len(await _channel_rows(world, world.execution_id)) == 1
+    still = next(row for row in await _rows(world) if row["target"] == world.chat_a)
+    assert still["payload_json"]["content_sha256"] == digest
+    assert still["payload_json"]["cards"] == saved["payload"]["cards"]
+
+
+@pytest.mark.asyncio
+async def test_saved_report_plan_denies_wrong_body_identity_and_removed_target(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world)
+    assert saved["ok"] is True
+    missing = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target="feishu:chat:oc_not_in_this_batch",
+        **_plan_kwargs(world),
+    )
+    assert missing["authorized"] is False
+    assert missing["code"] == "target_not_routed"
+    assert missing["status"] == "skipped"
+
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET payload_json = jsonb_set(payload_json, '{expected_item_count}', '5'::jsonb)
+                WHERE execution_id = %s AND target = %s
+                """,
+                (world.execution_id, world.chat_a),
+            )
+    invalid = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert invalid["authorized"] is False
+    assert invalid["code"] == "payload_invalid"
+
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET payload_json = payload_json
+                    || jsonb_build_object(
+                        'expected_item_count', 1,
+                        'reconcile_recipient_id', 'oc_wrong_recipient',
+                        'reconcile_platform', 'feishu',
+                        'reconcile_canonical_target', 'feishu:oc_wrong_recipient'
+                    )
+                WHERE execution_id = %s AND target = %s
+                """,
+                (world.execution_id, world.chat_b),
+            )
+    conflict = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_b,
+        **_plan_kwargs(world),
+    )
+    assert conflict["authorized"] is False
+    assert conflict["code"] == "recipient_identity_conflict"
+
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET payload_json = jsonb_set(payload_json, '{expected_item_count}', '1'::jsonb)
+                WHERE execution_id = %s AND target = %s
+                """,
+                (world.execution_id, world.chat_a),
+            )
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            report_targets=[world.chat_a],
+        ),
+    )
+    removed = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_b,
+        **_plan_kwargs(world),
+    )
+    assert removed["authorized"] is False
+    assert removed["code"] == "target_removed"
+    kept = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert kept["authorized"] is True
+    assert kept["items"][0]["kind"] == "feishu_card"
+    assert kept["recipient_id"] == world.chat_a.rsplit(":", 1)[-1]
+
+
+@pytest.mark.asyncio
+async def test_report_plan_does_not_use_a_colliding_data_run_and_data_path_remains(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("Original body")])
+    assert saved["ok"] is True
+    data_job = await _insert_data_run(
+        world,
+        world.execution_id,
+        status="succeeded",
+        outbox={"text": "decoy-not-a-card"},
+    )
+    plan = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert plan["authorized"] is True
+    assert plan["job_key"] == world.automation_id
+    assert plan["job_key"] != data_job
+    assert plan["items"][0]["kind"] == "feishu_card"
+    assert "decoy-not-a-card" not in json.dumps(plan["items"])
+    assert await _notify_status(world, world.execution_id) == "pending_dispatch"
+
+    other_run = str(uuid4())
+    world.execution_ids.append(other_run)
+    await _insert_data_run(world, other_run, status="queued", outbox={"text": "queued"})
+    queued = await dtn.authorize_data_task_notification_plan(
+        run_id=other_run,
+        target="feishu:@me",
+        **_plan_kwargs(world),
+    )
+    assert queued["authorized"] is False
+    assert queued["code"] == "run_not_succeeded"
+
+    absent = str(uuid4())
+    world.execution_ids.append(absent)
+    missing = await dtn.authorize_data_task_notification_plan(
+        run_id=absent,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert missing["authorized"] is False
+    assert missing["code"] == "run_not_found"
+    assert await _channel_rows(world, absent) == []
+
+
+@pytest.mark.asyncio
+async def test_failure_text_plan_claims_the_saved_discord_recipient(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    execution_id, thread_id, run_id = await _add_execution(world)
+    text = "The digest failed closed."
+    saved = await _submit(
+        world,
+        execution_id=execution_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        report_run_id="fail-2026-11-10",
+        cards=None,
+        failure_text=text,
+    )
+    assert saved["ok"] is True
+    assert saved["targets"] == [world.discord_target]
+    plan = await dtn.authorize_data_task_notification_plan(
+        run_id=execution_id,
+        target=world.discord_target,
+        **_plan_kwargs(world),
+    )
+    assert plan["authorized"] is True
+    assert plan["run_id"] == execution_id
+    assert plan["job_key"] == world.automation_id
+    assert plan["platform"] == "discord"
+    assert plan["target_kind"] == "dm"
+    assert plan["canonical_target_address"] == "discord:@me"
+    assert plan["recipient_id"] == world.discord_id
+    assert plan["owner_platform_user_id"] == world.discord_id
+    assert len(plan["items"]) == 1
+    assert plan["items"][0]["kind"] == "text"
+    assert plan["items"][0]["text"] == text
+    assert "artifact" not in plan["items"][0]
+    claimed = await dtn.authorize_and_claim_data_task_delivery(
+        delivery_key=plan["items"][0]["delivery_key"],
+        run_id=execution_id,
+        target=world.discord_target,
+        has_non_empty_text=True,
+        total_chunks=0,
+        **_plan_kwargs(world),
+    )
+    assert claimed["claim_status"] == "claimed"
+    assert claimed["recipient_id"] == world.discord_id
+    ledger = await _channel_rows(world, execution_id)
+    assert ledger[0]["kind"] == "data_task"
+    assert ledger[0]["target_address"] == "discord:@me"
+
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_channel_identities
+                SET platform_user_id = '999999999999999999'
+                WHERE user_id = %s AND platform = 'discord'
+                """,
+                (world.owner,),
+            )
+    rebound = await dtn.authorize_data_task_notification_plan(
+        run_id=execution_id,
+        target=world.discord_target,
+        **_plan_kwargs(world),
+    )
+    assert rebound["authorized"] is False
+    assert rebound["code"] == "target_revoked"
+    stored = next(row for row in await _rows(world) if row["execution_id"] == execution_id)
+    assert stored["payload_json"]["failure_text"] == text
+    assert stored["payload_json"]["reconcile_recipient_id"] == world.discord_id
+
+
+def _dispatch(world: World, notify: Any, execution_id: str | None = None):
+    return notify_dispatch.dispatch_automation_report(
+        execution_id or world.execution_id,
+        notify_fn=notify,
+        **_plan_kwargs(world),
+    )
+
+
+async def _write_sent_ledger(
+    world: World,
+    execution_id: str,
+    target: str,
+    *,
+    item_limit: int | None = None,
+) -> list[str]:
+    rows = await reports.load_execution_report_rows(execution_id)
+    row = next(item for item in rows if item["target"] == target)
+    payload = row["payload_json"]
+    keys = [str(key) for key in payload["reconcile_delivery_keys"]]
+    if item_limit is not None:
+        keys = keys[:item_limit]
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for key in keys:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_deliveries (
+                        delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                        is_current, has_non_empty_text, platform, target_address,
+                        status, total_chunks, sent_chunks, platform_message_ids,
+                        files_status, created_at, updated_at
+                    )
+                    VALUES (
+                        %s, 'data_task', %s, NULL, %s, %s::uuid,
+                        FALSE, TRUE, %s, %s,
+                        'sent', 0, 0, '[]'::jsonb,
+                        '[]'::jsonb, NOW(), NOW()
+                    )
+                    ON CONFLICT (delivery_key) DO UPDATE
+                    SET status = 'sent', updated_at = NOW()
+                    """,
+                    (
+                        key,
+                        row["user_id"],
+                        row["execution_id"],
+                        row["execution_id"],
+                        payload["reconcile_platform"],
+                        payload["reconcile_canonical_target"],
+                    ),
+                )
+    return keys
+
+
+def _gateway(world: World, calls: list[dict[str, Any]], *, item_limit: int | None = None):
+    async def _notify(
+        targets: list[str],
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: Any = None,
+    ) -> dict[str, Any]:
+        assert text == ""
+        assert card is None
+        assert images is None
+        assert gateway_url is None
+        assert service_token is None
+        assert http_client is None
+        assert len(targets) == 1
+        assert timeout_s is not None and timeout_s > 0
+        calls.append({"target": targets[0], "run_id": run_id, "timeout_s": timeout_s})
+        await asyncio.sleep(0.05)
+        await _write_sent_ledger(
+            world,
+            str(run_id),
+            targets[0],
+            item_limit=item_limit,
+        )
+        return {
+            "ok": True,
+            "status": "sent",
+            "results": [{"target": targets[0], "ok": True, "status": "sent"}],
+        }
+
+    return create_autospec(post_data_task_gateway_notify, side_effect=_notify)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_confirms_every_saved_card_once(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    first = _card("First [10-K](https://example.com/msft/10k)")
+    second = _card("Second [10-Q](https://example.com/msft/10q)")
+    saved = await _submit(world, cards=[first, second])
+    assert saved["ok"] is True
+    original_cards = saved["payload"]["cards"]
+    digest = saved["payload"]["content_sha256"]
+    await _insert_data_run(world, world.execution_id, status="succeeded")
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls)
+    sent = await _dispatch(world, notify)
+    assert sent["ok"] is True
+    assert sent["delivery_confirmed"] is True
+    assert sent["status"] == "sent"
+    assert sent["execution_id"] == world.execution_id
+    assert sent["payload"]["cards"] == original_cards
+    assert sent["payload"]["content_sha256"] == digest
+    assert {call["target"] for call in calls} == {world.chat_a, world.chat_b}
+    assert {call["run_id"] for call in calls} == {world.execution_id}
+    assert len(calls) == 2
+    rows = await _rows(world)
+    assert len(rows) == 2
+    assert all(row["status"] == "sent" and row["attempt_count"] == 1 for row in rows)
+    assert all(row["payload_json"]["cards"] == original_cards for row in rows)
+    assert all(row["payload_json"]["content_sha256"] == digest for row in rows)
+    assert all(row["error_code"] in (None, "") for row in rows)
+    ledger = await _channel_rows(world, world.execution_id)
+    assert len(ledger) == 4
+    assert all(row["kind"] == "data_task" and row["status"] == "sent" for row in ledger)
+    assert await _notify_status(world, world.execution_id) == "pending_dispatch"
+
+    again = await _dispatch(world, notify)
+    assert again["delivery_confirmed"] is True
+    assert len(calls) == 2
+    assert all(row["attempt_count"] == 1 for row in await _rows(world))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_keeps_an_incomplete_ledger_unconfirmed_and_does_not_resend(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("First"), _card("Second")])
+    assert saved["ok"] is True
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls, item_limit=1)
+    incomplete = await _dispatch(world, notify)
+    assert incomplete["delivery_confirmed"] is False
+    assert incomplete["status"] == "unknown"
+    assert len(calls) == 2
+    rows = await _rows(world)
+    assert all(row["status"] == "pending" for row in rows)
+    assert all(row["error_code"] == "delivery_uncertain" for row in rows)
+    assert all(row["attempt_count"] == 1 for row in rows)
+    again = await _dispatch(world, notify)
+    assert again["delivery_confirmed"] is False
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_quiet_and_missing_report_dispatch_does_not_send(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    quiet = await _submit(world, material="no", cards=None)
+    assert quiet["quiet"] is True
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls)
+    missing_id = str(uuid4())
+    world.execution_ids.append(missing_id)
+    missing = await _dispatch(world, notify, missing_id)
+    assert missing["ok"] is False
+    assert missing["code"] == "not_found"
+    assert missing["delivery_confirmed"] is False
+    quiet_view = await _dispatch(world, notify)
+    assert quiet_view["ok"] is False
+    assert quiet_view["delivery_confirmed"] is False
+    assert calls == []
+    assert await notify_dispatch.claim_saved_report_delivery(
+        world.execution_id,
+        "feishu",
+        "feishu:chat:oc_not_saved",
+    ) == (False, None)
+    assert await _rows(world) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_claims_each_saved_target_once(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("First"), _card("Second")])
+    assert saved["ok"] is True
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls)
+    await asyncio.gather(_dispatch(world, notify), _dispatch(world, notify))
+    assert len(calls) == 2
+    assert {call["target"] for call in calls} == {world.chat_a, world.chat_b}
+    rows = await _rows(world)
+    assert {row["attempt_count"] for row in rows} == {1}
+    assert {row["status"] for row in rows} == {"sent"}
+    assert await reports.read_execution_report_confirmed(world.execution_id) is True
+
+
+@pytest.mark.asyncio
+async def test_report_profile_settlement_does_not_send_generic_text(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("First"), _card("Second")])
+    assert saved["delivery_confirmed"] is False
+    post = create_autospec(
+        notify_dispatch.post_bridge_notify,
+        side_effect=AssertionError("generic notification"),
+    )
+    automation = {
+        "automation_id": world.automation_id,
+        "user_id": world.owner,
+        "name": "AM digest",
+        "metadata": _profile(world.chat_a, world.chat_b, world.discord_target),
+    }
+    assert await notify_dispatch.on_automation_settled(
+        automation=automation,
+        execution_id=world.execution_id,
+        final_text="Generic completion text must not be sent.",
+        post_notify_fn=post,
+        **_plan_kwargs(world),
+    ) is False
+    calls: list[dict[str, Any]] = []
+    sent = await _dispatch(world, _gateway(world, calls))
+    assert sent["delivery_confirmed"] is True
+    assert await notify_dispatch.on_automation_settled(
+        automation=automation,
+        execution_id=world.execution_id,
+        final_text="Generic completion text must not be sent.",
+        post_notify_fn=post,
+        **_plan_kwargs(world),
+    ) is True
+    post.assert_not_called()
+    assert len(calls) == 2
