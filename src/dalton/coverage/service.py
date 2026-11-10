@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import logging
 import os
 from collections.abc import Mapping, Sequence
@@ -13,7 +14,10 @@ from typing import Any
 
 import yaml
 
+from src.dalton.access_tiers import get_user_tier as get_identity_tier
+from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage.models import (
+    DEDICATED_COMPANY_KEYS,
     build_coverage_doc,
     company_to_row,
     dump_coverage_yaml,
@@ -182,6 +186,143 @@ async def get_user_coverage(
     return build_coverage_doc(companies, as_of=as_of, generated_at=latest_ts)
 
 
+def _coverage_updated_iso(row: Mapping[str, Any], *, timespec: str = "auto") -> str:
+    """UTC updated_at. Ranking keeps full precision; document stamps pass seconds."""
+    updated_at = row.get("updated_at")
+    if isinstance(updated_at, datetime):
+        return updated_at.astimezone(timezone.utc).isoformat(timespec=timespec)
+    if isinstance(updated_at, str) and updated_at:
+        return updated_at
+    return ""
+
+
+def _latest_coverage_timestamp(rows: Sequence[Mapping[str, Any]]) -> str | None:
+    latest: str | None = None
+    for row in rows:
+        iso = _coverage_updated_iso(row, timespec="seconds")
+        if iso and (latest is None or iso > latest):
+            latest = iso
+    return latest
+
+
+def _roster_rank_beats(
+    challenger: tuple[str, str, str],
+    incumbent: tuple[str, str, str],
+) -> bool:
+    c_tier, c_updated, c_uid = challenger
+    i_tier, i_updated, i_uid = incumbent
+    c_core = c_tier == "core"
+    i_core = i_tier == "core"
+    if c_core != i_core:
+        return c_core
+    if c_updated != i_updated:
+        return c_updated > i_updated
+    return c_uid < i_uid
+
+
+def _company_roster_company(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    ticker = str(row.get("ticker") or "").strip().upper()
+    if not ticker:
+        return None
+    company = row_to_company(row)
+    raw_market = company.get("market")
+    market = str(raw_market).strip().upper() if raw_market is not None else ""
+    if not market:
+        market = infer_market(ticker)
+    # Dedicated roster columns only. Member workspace, group ids, user ids,
+    # and other extra fields stay on the member row.
+    values: dict[str, Any] = {
+        "ticker": ticker,
+        "name": company.get("name") if company.get("name") is not None else ticker,
+        "tier": company.get("tier"),
+        "market": market,
+        "peer_group": company.get("peer_group") if company.get("peer_group") is not None else "",
+        "peers": copy.deepcopy(list(company.get("peers") or [])),
+        "aliases": copy.deepcopy(dict(company.get("aliases") or {})),
+        "earnings": copy.deepcopy(dict(company.get("earnings") or {})),
+    }
+    return {key: values[key] for key in DEDICATED_COMPANY_KEYS}
+
+
+async def get_company_coverage(*, conn: Any = None) -> dict[str, Any]:
+    """Union of admin and internal rosters for company execution.
+
+    Takes no caller id. Company, external, blank, unknown, and failed
+    identity lookups are omitted. One output row per (ticker, market).
+    """
+    if not _can_reach_coverage_db(conn):
+        return build_coverage_doc([])
+    try:
+        rows = await coverage_db.list_all_coverage_rows(conn=conn)
+    except Exception as exc:
+        if _is_pool_not_open_error(exc):
+            logger.debug(
+                "[DALTON_COVERAGE] DB pool not open in get_company_coverage: %s",
+                exc,
+            )
+            return build_coverage_doc([])
+        raise
+
+    # Request-local only. The next company run looks members up again.
+    identity_tiers: dict[str, str | None] = {}
+    included_rows: list[Mapping[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        uid = str(row.get("user_id") or "").strip()
+        if not uid:
+            continue
+        if uid not in identity_tiers:
+            try:
+                raw_tier = await get_identity_tier(uid)
+            except Exception as exc:
+                logger.warning(
+                    "[DALTON_COVERAGE] company coverage identity lookup failed for user_id=%s (%s)",
+                    uid,
+                    type(exc).__name__,
+                )
+                identity_tiers[uid] = None
+            else:
+                identity_tiers[uid] = str(raw_tier or "").strip().lower()
+        tier = identity_tiers[uid]
+        if is_company_system_user(uid) or tier not in ("admin", "internal"):
+            continue
+        included_rows.append(row)
+
+    chosen: dict[tuple[str, str], dict[str, Any]] = {}
+    ranks: dict[tuple[str, str], tuple[str, str, str]] = {}
+    stamped: list[Mapping[str, Any]] = []
+    for row in included_rows:
+        roster = _company_roster_company(row)
+        if roster is None:
+            continue
+        stamped.append(row)
+        pair = (str(roster["ticker"]), str(roster["market"]))
+        rank = (
+            str(roster.get("tier") or ""),
+            # "auto" keeps microseconds and still formats an exact instant
+            # the same way, so only a real tie reaches user_id.
+            _coverage_updated_iso(row, timespec="auto"),
+            str(row.get("user_id") or "").strip(),
+        )
+        previous = ranks.get(pair)
+        # One (ticker, market): core before watch, then later updated_at
+        # at full UTC precision, then the smaller user_id. Input order
+        # does not matter.
+        if previous is None or _roster_rank_beats(rank, previous):
+            chosen[pair] = roster
+            ranks[pair] = rank
+
+    if not chosen:
+        return build_coverage_doc([])
+
+    companies = [chosen[pair] for pair in sorted(chosen)]
+    # Included member rows only. Excluded members cannot move as_of.
+    latest_ts = _latest_coverage_timestamp(stamped)
+    as_of = latest_ts[:10] if latest_ts and len(latest_ts) >= 10 else date.today().isoformat()
+    return build_coverage_doc(companies, as_of=as_of, generated_at=latest_ts)
+
+
 async def get_user_tier(
     user_id: str | None,
     ticker: str,
@@ -338,6 +479,12 @@ def get_user_aliases_sync(
 async def render_coverage_yaml(user_id: str, *, conn: Any = None) -> str:
     """Render `coverage.yaml` YAML string for `user_id` from `dalton_coverage`."""
     doc = await get_user_coverage(user_id, conn=conn)
+    return dump_coverage_yaml(doc)
+
+
+async def render_company_coverage_yaml(*, conn: Any = None) -> str:
+    """Render the company-execution coverage union as YAML."""
+    doc = await get_company_coverage(conn=conn)
     return dump_coverage_yaml(doc)
 
 

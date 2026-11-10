@@ -1,4 +1,4 @@
-"""Per-user coverage roster, rule groups, Home YAML rendering, and earnings calendar mirror."""
+"""Per-user coverage roster, company execution union, rule groups, Home YAML rendering, and earnings calendar mirror."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from src.dalton.coverage.service import (
     add_coverage_group,
     add_user_coverage_tickers,
     ensure_user_earnings_calendar_automation,
+    get_company_coverage,
     get_user_aliases,
     get_user_aliases_sync,
     get_user_coverage,
@@ -41,6 +42,7 @@ from src.dalton.coverage.service import (
     refresh_due_coverage_groups_for_preflight,
     remove_coverage_group,
     remove_user_coverage_tickers,
+    render_company_coverage_yaml,
     render_coverage_yaml,
     resolve_coverage_group,
     seed_user_coverage_from_yaml,
@@ -67,6 +69,7 @@ __all__ = [
     "ensure_user_earnings_calendar_automation",
     "extract_row_group_ids",
     "extract_row_stale_group_ids",
+    "get_company_coverage",
     "get_user_aliases",
     "get_user_aliases_sync",
     "get_user_coverage",
@@ -85,6 +88,7 @@ __all__ = [
     "refresh_due_coverage_groups_for_preflight",
     "remove_coverage_group",
     "remove_user_coverage_tickers",
+    "render_company_coverage_yaml",
     "render_coverage_yaml",
     "resolve_coverage_group",
     "row_to_company",
