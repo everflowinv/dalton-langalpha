@@ -1,3 +1,4 @@
+import type { BackendClient } from "../backend-client.js";
 import type {
   AvailableChatItem,
   ChannelPlatform,
@@ -16,18 +17,21 @@ export type ChannelErrorCode =
 export class ChannelDeliveryError extends Error {
   readonly outcome: ChannelErrorOutcome;
   readonly code: ChannelErrorCode;
+  readonly retryAfterMs?: number;
 
   constructor(
     message: string,
     options: {
       outcome: ChannelErrorOutcome;
       code: ChannelErrorCode;
+      retryAfterMs?: number;
     },
   ) {
     super(message);
     this.name = "ChannelDeliveryError";
     this.outcome = options.outcome;
     this.code = options.code;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -56,6 +60,7 @@ export interface SendTextChunkOptions {
    */
   onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   weixinContextToken?: string | null;
+  inboundMessageId?: string | null;
 }
 
 export interface SendTextChunkResult {
@@ -72,6 +77,7 @@ export interface SendFileOptions {
   mimeType: string;
   threadScopeKey?: string | null;
   weixinContextToken?: string | null;
+  inboundMessageId?: string | null;
 }
 
 export interface SendFileResult {
@@ -163,20 +169,27 @@ export interface WeixinQrStartResult {
   qrcode_img_content?: string;
   session_key: string;
   status?: string;
+  expires_at?: string;
+  message?: string;
 }
 
 export interface WeixinQrWaitResult {
+  session_key?: string;
   status:
     | "wait"
     | "scaned"
     | "confirmed"
     | "expired"
+    | "verify_code"
     | "need_verify"
     | "need_verifycode"
     | "error";
+  connected?: boolean;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;
+  bot_generation?: number | null;
+  expires_at?: string | null;
   bot_token?: string | null;
   base_url?: string | null;
   message?: string | null;
@@ -252,6 +265,7 @@ export interface ChannelAdapter {
   }): Promise<CheckTargetLiveResult>;
 
   /** Optional Weixin iLink QR login methods (§1.5 #4, §4.4). */
+  setBackendClient?(client: BackendClient): void;
   startQrLogin?(options: { userId: string }): Promise<WeixinQrStartResult>;
   waitQrLogin?(options: {
     userId: string;

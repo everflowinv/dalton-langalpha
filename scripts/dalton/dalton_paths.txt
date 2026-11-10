@@ -205,6 +205,15 @@ tests/integration/dalton/test_discord_thread_persistence_db.py
 integrations/dalton-channel-gateway/README.md
 integrations/dalton-channel-gateway/src/native-commands/
 integrations/dalton-channel-gateway/test/native-commands.test.ts
+# CH-1 Personal Weixin iLink: d032 state migration, Weixin channel adapter, web QR settings card, and tests.
+src/dalton/migrations/versions/d032_weixin_state.py
+integrations/dalton-channel-gateway/src/channels/weixin/
+integrations/dalton-channel-gateway/test/weixin.test.ts
+integrations/dalton-channel-gateway/test/weixin-real-backend.integration.test.ts
+tests/integration/dalton/weixin_live_backend_harness.py
+tests/integration/dalton/test_weixin_full_stack.py
+web/src/pages/Settings/panels/dalton/DaltonWeixinChannelCard.tsx
+web/src/pages/Settings/panels/dalton/__tests__/DaltonWeixinChannelCard.test.tsx
 
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
 scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py

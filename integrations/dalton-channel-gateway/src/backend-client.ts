@@ -1,15 +1,20 @@
+import {
+  readStreamWithLimit,
+  SafeFetchError,
+} from "./shared/safe-fetch.js";
 import type { SessionCommandTargetKind } from "./commands.js";
 import type {
   DataTaskAuthorizePlanResponse,
   DataTaskDownloadedArtifact,
   DataTaskNotificationRequest,
 } from "./data-task-notification-types.js";
-import type {
-  AutomationRunTargetRecord,
-  ChannelPlatform,
-  ChatContentItem,
-  PendingInterruptState,
-  UploadedAttachmentRecord,
+import {
+  type AutomationRunTargetRecord,
+  type ChannelPlatform,
+  type ChatContentItem,
+  MAX_ATTACHMENT_BYTES,
+  type PendingInterruptState,
+  type UploadedAttachmentRecord,
 } from "./types.js";
 
 export type { SessionCommandTargetKind };
@@ -121,6 +126,9 @@ export interface I1RegisterAndResolveRequest {
   request_key: string;
   raw_payload?: Record<string, unknown>;
   weixin_context_token?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
+  weixin_context_seq?: number | null;
 }
 
 export interface I1RegisterAndResolveResponse {
@@ -145,6 +153,9 @@ export interface I1RegisterAndResolveResponse {
     | "workspace_write_denied"
     | "colleague_dispatch_disabled"
     | "workspace_not_found"
+    | "weixin_group_unsupported"
+    | "invalid_inbound_event"
+    | string
     | null;
   dalton_user_id: string | null;
   user_tier?: string | null;
@@ -165,6 +176,13 @@ export interface I1RegisterAndResolveResponse {
   uploaded_attachments: UploadedAttachmentRecord[];
   raw_payload: Record<string, unknown>;
   pending_interrupt: PendingInterruptState | null;
+  consumed_bind_result?: Record<string, unknown> | null;
+  /** Present when this message already has a stored bind or session command. */
+  command_request?: Record<string, unknown> | null;
+  /** Stored bind/unbind or session result. Old bind rows have `ok` and no `delivery_key`. */
+  command_result?: Record<string, unknown> | null;
+  /** False means the confirmation was already accepted and must not be sent again. */
+  command_reply_pending?: boolean;
 }
 
 export interface I2BindCodeConsumeRequest {
@@ -174,6 +192,10 @@ export interface I2BindCodeConsumeRequest {
   platform_username?: string | null;
   platform_tenant_key?: string | null;
   weixin_context_token?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
+  weixin_context_seq?: number | null;
+  inbound_message_id?: string | null;
   code?: string | null;
   is_group: boolean;
   user_id?: string | null;
@@ -186,6 +208,7 @@ export interface I2BindCodeConsumeRequest {
 
 export interface I2BindCodeConsumeResponse {
   ok: boolean;
+  idempotent?: boolean;
   reason?:
     | "revoked_in_group"
     | "invalid_or_expired"
@@ -198,6 +221,8 @@ export interface I2BindCodeConsumeResponse {
   platform_user_id?: string;
   generation?: number;
   generations?: Record<string, number>;
+  action?: "bind" | "unbind" | string;
+  delivery_key?: string;
   duplicate?: boolean;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
@@ -221,6 +246,10 @@ export interface I3SessionCommandRequest {
   request_key?: string | null;
   raw_payload?: Record<string, unknown> | null;
   weixin_context_token?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
+  weixin_context_source?: "protocol" | "platform_time" | "receive" | string | null;
+  weixin_context_seq?: number | null;
   is_internal_query?: boolean;
   native_interaction?: boolean;
   native_ack_status?: "acknowledged" | "failed" | "unknown" | null;
@@ -599,6 +628,7 @@ export interface RecoverInboundEventRow {
     | null;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
+  consumed_bind_result?: Record<string, unknown> | null;
   pending_interrupt_snapshot?: PendingInterruptState | null;
   status: InboundEventStatus;
   fallback_pending: boolean;
@@ -700,15 +730,37 @@ export interface I8AutomationRunFinishResponse {
   targets: AutomationRunTargetRecord[];
 }
 
+export interface I9WeixinStateGetOptions {
+  include_token?: boolean;
+  recipient_platform_user_id?: string | null;
+  inbound_message_id?: string | null;
+}
+
 export interface I9WeixinStateGetResponse {
   configured: boolean;
   ilink_bot_id: string | null;
   owner_user_id: string | null;
+  ilink_user_id?: string | null;
+  ilink_username?: string | null;
   bot_token?: string | null;
   base_url: string;
+  cdn_base_url?: string | null;
   get_updates_buf: string;
   status: "active" | "expired" | "unconfigured" | string;
+  bot_generation?: number;
   updated_at: string | null;
+  login_session_key?: string | null;
+  login_owner_user_id?: string | null;
+  login_version?: number | null;
+  login_expected_bot_generation?: number | null;
+  login_status?: string | null;
+  login_qrcode?: string | null;
+  login_qrcode_img_content?: string | null;
+  login_redirect_base_url?: string | null;
+  login_expires_at?: string | null;
+  login_confirmed_result?: Record<string, unknown> | null;
+  login_updated_at?: string | null;
+  weixin_context_token?: string | null;
 }
 
 export interface I9WeixinStatePutRequest {
@@ -716,16 +768,40 @@ export interface I9WeixinStatePutRequest {
   owner_user_id?: string | null;
   bot_token?: string | null;
   base_url?: string | null;
+  cdn_base_url?: string | null;
   get_updates_buf?: string | null;
   status?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;
+  expected_bot_generation?: number | null;
+  expected_ilink_bot_id?: string | null;
+  expected_get_updates_buf?: string | null;
+  login_session_action?: "start" | "update" | "confirm" | null;
+  login_session_key?: string | null;
+  login_owner_user_id?: string | null;
+  login_version?: number | null;
+  login_status?: string | null;
+  login_qrcode?: string | null;
+  login_qrcode_img_content?: string | null;
+  login_redirect_base_url?: string | null;
+  login_expires_at?: string | null;
 }
 
 export interface I9WeixinStatePutResponse {
   ok: boolean;
-  ilink_bot_id: string;
-  owner_user_id: string;
+  updated?: boolean;
+  idempotent?: boolean;
+  stale_session?: boolean;
+  stale_generation?: boolean;
+  cas_mismatch?: boolean;
+  reason?: string | null;
+  session_key?: string | null;
+  login_version?: number | null;
+  expected_bot_generation?: number | null;
+  bot_generation?: number;
+  confirmed_result?: Record<string, unknown> | null;
+  ilink_bot_id: string | null;
+  owner_user_id: string | null;
   base_url: string;
   get_updates_buf: string;
   status: string;
@@ -911,7 +987,9 @@ export interface BackendClient {
     userId?: string,
   ): Promise<{ status: number; data: I8AutomationRunFinishResponse | null }>;
 
-  getWeixinState(includeToken?: boolean): Promise<I9WeixinStateGetResponse>;
+  getWeixinState(
+    includeTokenOrOptions?: boolean | I9WeixinStateGetOptions,
+  ): Promise<I9WeixinStateGetResponse>;
 
   putWeixinState(req: I9WeixinStatePutRequest): Promise<I9WeixinStatePutResponse>;
 
@@ -1450,11 +1528,24 @@ export class HttpBackendClient implements BackendClient {
   }
 
   // --- I-9 (GET) ---
-  async getWeixinState(includeToken = true): Promise<I9WeixinStateGetResponse> {
+  async getWeixinState(
+    includeTokenOrOptions: boolean | I9WeixinStateGetOptions = true,
+  ): Promise<I9WeixinStateGetResponse> {
+    const opts: I9WeixinStateGetOptions =
+      typeof includeTokenOrOptions === "boolean"
+        ? { include_token: includeTokenOrOptions }
+        : includeTokenOrOptions;
+    const includeToken = opts.include_token !== false;
     const { status, data } = await this.jsonRequest<I9WeixinStateGetResponse>(
       "GET",
       "/api/v1/dalton/channels/internal/weixin-state",
-      { query: { include_token: includeToken ? "true" : "false" } },
+      {
+        query: {
+          include_token: includeToken ? "true" : "false",
+          recipient_platform_user_id: opts.recipient_platform_user_id ?? undefined,
+          inbound_message_id: opts.inbound_message_id ?? undefined,
+        },
+      },
     );
     if (status >= 400) {
       throw new Error(`I-9 getWeixinState failed (${status}): ${JSON.stringify(data)}`);
@@ -1771,10 +1862,29 @@ export class HttpBackendClient implements BackendClient {
       const errText = await resp.text();
       throw new Error(`downloadWorkspaceFile failed (${resp.status}): ${errText}`);
     }
-    const arrayBuffer = await resp.arrayBuffer();
+    const contentLengthHeader = resp.headers.get("content-length");
+    if (contentLengthHeader) {
+      const parsedLen = Number.parseInt(contentLengthHeader, 10);
+      if (Number.isFinite(parsedLen) && parsedLen > MAX_ATTACHMENT_BYTES) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SafeFetchError(
+          "size_exceeded",
+          `Workspace file exceeds 20 MB limit (${parsedLen} bytes)`,
+        );
+      }
+    }
+    const content = resp.body
+      ? await readStreamWithLimit(resp.body, { maxBytes: MAX_ATTACHMENT_BYTES })
+      : Buffer.from(await resp.arrayBuffer());
+    if (content.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new SafeFetchError(
+        "size_exceeded",
+        `Workspace file exceeds 20 MB limit (${content.byteLength} bytes)`,
+      );
+    }
     const mimeType = resp.headers.get("content-type") ?? "application/octet-stream";
     return {
-      content: Buffer.from(arrayBuffer),
+      content,
       mimeType,
     };
   }

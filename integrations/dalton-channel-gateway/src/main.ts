@@ -9,6 +9,10 @@ import {
   type FeishuChannelAdapterOptions,
 } from "./channels/feishu/index.js";
 import {
+  WeixinChannelAdapter,
+  type WeixinChannelAdapterOptions,
+} from "./channels/weixin/index.js";
+import {
   type FeishuCredentialSource,
   type GatewayConfig,
   type GatewayStartupMode,
@@ -29,6 +33,7 @@ export function buildConfiguredAdapters(
   config: GatewayConfig,
   overrides?: {
     feishu?: Partial<FeishuChannelAdapterOptions>;
+    weixin?: Partial<WeixinChannelAdapterOptions>;
     discord?: Partial<DiscordChannelAdapterOptions>;
   },
 ): Map<ChannelPlatform, ChannelAdapter> {
@@ -54,6 +59,17 @@ export function buildConfiguredAdapters(
         appSecret: effectiveFeishuAppSecret,
         outgoingOnly:
           overrides?.feishu?.outgoingOnly ?? config.mode === "outgoing",
+      }),
+    );
+  }
+
+  if (config.channels.weixin.enabled) {
+    adapters.set(
+      "weixin",
+      new WeixinChannelAdapter({
+        baseUrl: config.channels.weixin.apiBaseUrl,
+        cdnBaseUrl: config.channels.weixin.cdnBaseUrl,
+        ...overrides?.weixin,
       }),
     );
   }
