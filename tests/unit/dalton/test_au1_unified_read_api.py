@@ -722,3 +722,58 @@ async def test_single_execution_history_passes_computer_id(
     assert raised.value.status_code == 403
     assert raised.value.detail == "Forbidden"
     listed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_detail_passes_computer_id_into_last_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detail keeps the owner lookup and adds computer reach only for a computer token."""
+    row = {
+        "automation_id": AGENT_ID,
+        "user_id": INTERNAL,
+        "name": "Owned Task",
+        "description": "desc",
+        "trigger_type": "cron",
+        "cron_expression": "0 9 * * *",
+        "timezone": "Asia/Shanghai",
+        "trigger_config": {},
+        "next_run_at": None,
+        "last_run_at": None,
+        "instruction": "Run",
+        "workspace_id": None,
+        "llm_model": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "status": "active",
+        "max_failures": 3,
+        "failure_count": 0,
+        "delivery_config": {"methods": []},
+        "metadata": {},
+        "created_at": TIE,
+        "updated_at": TIE,
+        "last_execution": None,
+        "scope": "personal",
+        "notify_storage_mode": "legacy",
+        "config_version": 1,
+        "active_version": 1,
+        "created_by": INTERNAL,
+    }
+    fetched = create_autospec(auto_db.get_automation, return_value=row)
+    monkeypatch.setattr(automations_app.auto_db, "get_automation", fetched)
+
+    async def _noop(_user_id: str, _items: list[Any]) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "src.dalton.notify.dispatch.populate_automation_notify_state",
+        _noop,
+    )
+
+    await automations_app.get_automation(AGENT_ID, _session(INTERNAL))
+    fetched.assert_awaited_once_with(AGENT_ID, INTERNAL)
+
+    fetched.reset_mock()
+    await automations_app.get_automation(AGENT_ID, _computer(INTERNAL))
+    fetched.assert_awaited_once_with(AGENT_ID, INTERNAL, computer_id=COMPUTER)

@@ -225,15 +225,16 @@ async def _insert_execution(
     thread_id: str | None = None,
     excerpt: str | None = None,
     error_message: str | None = None,
+    delivery_result: list[dict[str, Any]] | None = None,
 ) -> None:
     await conn.execute(
         """
         INSERT INTO automation_executions (
             automation_execution_id, automation_id, status,
             conversation_thread_id, scheduled_at, created_at,
-            result_excerpt, error_message
+            result_excerpt, error_message, delivery_result
         )
-        VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s, %s, %s)
+        VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s, %s, %s, %s::jsonb)
         """,
         (
             execution_id,
@@ -244,6 +245,7 @@ async def _insert_execution(
             created_at,
             excerpt,
             error_message,
+            json.dumps(delivery_result) if delivery_result is not None else None,
         ),
     )
 
@@ -1298,7 +1300,7 @@ async def _execution_rows(pool: AsyncConnectionPool) -> list[dict[str, Any]]:
                 SELECT automation_execution_id::text AS automation_execution_id,
                        automation_id::text AS automation_id,
                        conversation_thread_id::text AS conversation_thread_id,
-                       result_excerpt, error_message, status, created_at
+                       result_excerpt, error_message, delivery_result, status, created_at
                 FROM automation_executions
                 ORDER BY created_at DESC, automation_execution_id DESC
                 """
@@ -1317,6 +1319,38 @@ async def _thread_places(pool: AsyncConnectionPool) -> list[tuple[str, str]]:
                 """
             )
             return [(row[0], row[1]) for row in await cur.fetchall()]
+
+
+def _tasks(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {item["automation_id"]: item for item in body["automations"]}
+
+
+def _assert_last(
+    task: dict[str, Any],
+    *,
+    execution_id: str | None,
+    excerpt: str | None = None,
+    error_message: str | None = None,
+    thread_id: str | None = None,
+    status: str | None = None,
+    delivery_note: str | None = None,
+) -> None:
+    last = task["last_execution"]
+    if execution_id is None:
+        assert last is None
+        return
+    assert last["automation_execution_id"] == execution_id
+    assert last["excerpt"] == excerpt
+    assert last["error_message"] == error_message
+    assert last["conversation_thread_id"] == thread_id
+    assert last["status"] == status
+    assert last["delivery_result"] == [{"note": delivery_note}]
+
+
+def _assert_secrets_absent(payload: object, secrets: tuple[str, ...]) -> None:
+    rendered = str(payload)
+    for secret in secrets:
+        assert secret not in rendered
 
 
 async def _automation_version(
@@ -1351,6 +1385,10 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
     ws_b = "b4444444-4444-4444-8444-444444444444"
     personal_id = "c5555555-5555-4555-8555-555555555555"
     research_id = "d6666666-6666-4666-8666-666666666666"
+    foreign_only_id = "a9999999-9999-4999-8999-999999999999"
+    other_id = "ab000000-0000-4000-8000-0000000000c2"
+    company_id = "ab000000-0000-4000-8000-0000000000c1"
+    other_user = "u-move-other"
     thread_a = "e7777777-7777-4777-8777-777777777771"
     thread_home = "e7777777-7777-4777-8777-777777777772"
     thread_a_mid = "e7777777-7777-4777-8777-777777777773"
@@ -1367,23 +1405,73 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
     run_a_mid = "f1000000-0000-4000-8000-000000000007"
     run_b_second = "f1000000-0000-4000-8000-000000000008"
     run_none = "f1000000-0000-4000-8000-000000000009"
+    run_research_inflight = "f1000000-0000-4000-8000-000000000011"
+    run_personal_inflight = "f1000000-0000-4000-8000-000000000012"
+    run_foreign_done = "f1000000-0000-4000-8000-000000000013"
+    run_foreign_live = "f1000000-0000-4000-8000-000000000014"
     old_a = "OLD-A-EXCERPT"
     old_a_error = "OLD-A-ERROR"
+    old_a_delivery = "OLD-A-DELIVERY"
     old_home = "OLD-HOME-EXCERPT"
     old_home_error = "OLD-HOME-ERROR"
+    old_home_delivery = "OLD-HOME-DELIVERY"
     old_mid = "OLD-A-MID-EXCERPT"
     old_mid_error = "OLD-A-MID-ERROR"
+    old_mid_delivery = "OLD-A-MID-DELIVERY"
     old_research = "OLD-A-RESEARCH-EXCERPT"
     old_research_error = "OLD-A-RESEARCH-ERROR"
+    old_research_delivery = "OLD-A-RESEARCH-DELIVERY"
+    old_research_live = "OLD-RESEARCH-INFLIGHT"
+    old_research_live_error = "OLD-RESEARCH-INFLIGHT-ERROR"
+    old_research_live_delivery = "OLD-RESEARCH-INFLIGHT-DELIVERY"
+    old_personal_live = "OLD-A-INFLIGHT"
+    old_personal_live_error = "OLD-A-INFLIGHT-ERROR"
+    old_personal_live_delivery = "OLD-A-INFLIGHT-DELIVERY"
+    foreign_done = "FOREIGN-ONLY-DONE"
+    foreign_done_error = "FOREIGN-ONLY-DONE-ERROR"
+    foreign_done_delivery = "FOREIGN-ONLY-DONE-DELIVERY"
+    foreign_live = "FOREIGN-ONLY-LIVE"
+    foreign_live_error = "FOREIGN-ONLY-LIVE-ERROR"
+    foreign_live_delivery = "FOREIGN-ONLY-LIVE-DELIVERY"
+    other_excerpt = "OTHER-OWNER-EXCERPT"
+    other_error = "OTHER-OWNER-ERROR"
+    other_delivery = "OTHER-OWNER-DELIVERY"
+    company_excerpt = "COMPANY-TASK-EXCERPT"
+    company_error = "COMPANY-TASK-ERROR"
+    company_delivery = "COMPANY-TASK-DELIVERY"
+    b_first_delivery = "B-FIRST-DELIVERY"
+    b_research_delivery = "B-RESEARCH-NOTHREAD-DELIVERY"
     banned = (
         old_a,
         old_a_error,
+        old_a_delivery,
         old_home,
         old_home_error,
+        old_home_delivery,
         old_mid,
         old_mid_error,
+        old_mid_delivery,
         old_research,
         old_research_error,
+        old_research_delivery,
+        old_research_live,
+        old_research_live_error,
+        old_research_live_delivery,
+        old_personal_live,
+        old_personal_live_error,
+        old_personal_live_delivery,
+        foreign_done,
+        foreign_done_error,
+        foreign_done_delivery,
+        foreign_live,
+        foreign_live_error,
+        foreign_live_delivery,
+        other_excerpt,
+        other_error,
+        other_delivery,
+        company_excerpt,
+        company_error,
+        company_delivery,
         thread_a,
         thread_home,
         thread_a_mid,
@@ -1396,6 +1484,12 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
     research_feed = f"{feed}?scope=research_tracking"
     personal_history = f"/api/v1/automations/{personal_id}/executions"
     research_history = f"/api/v1/automations/{research_id}/executions"
+    personal_detail = f"/api/v1/automations/{personal_id}"
+    research_detail = f"/api/v1/automations/{research_id}"
+    foreign_detail = f"/api/v1/automations/{foreign_only_id}"
+    task_list = "/api/v1/automations?limit=100"
+    personal_list = "/api/v1/automations?scope=personal&limit=100"
+    research_list = "/api/v1/automations?scope=research_tracking&limit=100"
     visible = [
         run_research_b,
         run_research_none,
@@ -1405,16 +1499,21 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
     ]
     personal_visible = [run_b_first, run_b_second, run_none]
     research_visible = [run_research_b, run_research_none]
+    owner_task_ids = [research_id, personal_id, foreign_only_id]
     session_order = [
         run_research_a,
+        run_research_inflight,
         run_a_top,
         run_research_b,
         run_home,
         run_research_none,
+        run_personal_inflight,
         run_b_first,
         run_a_mid,
         run_b_second,
         run_none,
+        run_foreign_done,
+        run_foreign_live,
     ]
 
     async with au1_live_pool.connection() as conn:
@@ -1453,6 +1552,40 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             notify_storage_mode="legacy",
             description="research-before-move",
         )
+        await _insert_automation(
+            conn,
+            automation_id=foreign_only_id,
+            user_id=owner,
+            name="Foreign Only Task",
+            workspace_id=ws_a,
+            scope="personal",
+            created_by=owner,
+            created_at=day,
+            notify_storage_mode="legacy",
+        )
+        await _insert_user(conn, other_user, "other-move@dalton.test")
+        await _insert_automation(
+            conn,
+            automation_id=other_id,
+            user_id=other_user,
+            name="Unrelated Owner Task",
+            workspace_id=ws_b,
+            scope="personal",
+            created_by=other_user,
+            created_at=day,
+            notify_storage_mode="legacy",
+        )
+        await _insert_automation(
+            conn,
+            automation_id=company_id,
+            user_id=COMPANY_SYSTEM_USER_ID,
+            name="Unrelated Company Task",
+            workspace_id=ws_b,
+            scope="company",
+            created_by=COMPANY_SYSTEM_USER_ID,
+            created_at=day,
+            notify_storage_mode="task_row",
+        )
         await _insert_thread(conn, thread_id=thread_a, workspace_id=ws_a, thread_index=1)
         await _insert_thread(
             conn, thread_id=thread_a_mid, workspace_id=ws_a, thread_index=2
@@ -1472,6 +1605,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             thread_id=thread_research_a,
             excerpt=old_research,
             error_message=old_research_error,
+            delivery_result=[{"note": old_research_delivery}],
         )
         await _insert_execution(
             conn,
@@ -1482,6 +1616,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             thread_id=thread_a,
             excerpt=old_a,
             error_message=old_a_error,
+            delivery_result=[{"note": old_a_delivery}],
         )
         await _insert_execution(
             conn,
@@ -1492,6 +1627,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             thread_id=thread_home,
             excerpt=old_home,
             error_message=old_home_error,
+            delivery_result=[{"note": old_home_delivery}],
         )
         await _insert_execution(
             conn,
@@ -1502,6 +1638,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             thread_id=thread_a_mid,
             excerpt=old_mid,
             error_message=old_mid_error,
+            delivery_result=[{"note": old_mid_delivery}],
         )
     before_move = await _execution_rows(au1_live_pool)
     places_before = await _thread_places(au1_live_pool)
@@ -1514,6 +1651,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         for automation_id, scope in (
             (personal_id, "personal"),
             (research_id, "research_tracking"),
+            (foreign_only_id, "personal"),
         ):
             moved = await _expect(
                 await client.patch(
@@ -1539,6 +1677,17 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             )
             await _insert_execution(
                 conn,
+                execution_id=run_research_inflight,
+                automation_id=research_id,
+                status="running",
+                created_at=day.replace(hour=18, minute=45),
+                thread_id=thread_research_a,
+                excerpt=old_research_live,
+                error_message=old_research_live_error,
+                delivery_result=[{"note": old_research_live_delivery}],
+            )
+            await _insert_execution(
+                conn,
                 execution_id=run_research_b,
                 automation_id=research_id,
                 status="completed",
@@ -1550,9 +1699,21 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
                 conn,
                 execution_id=run_research_none,
                 automation_id=research_id,
-                status="completed",
+                status="running",
                 created_at=day.replace(hour=17),
                 excerpt="B-RESEARCH-NOTHREAD",
+                delivery_result=[{"note": b_research_delivery}],
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_personal_inflight,
+                automation_id=personal_id,
+                status="running",
+                created_at=day.replace(hour=16, minute=30),
+                thread_id=thread_a,
+                excerpt=old_personal_live,
+                error_message=old_personal_live_error,
+                delivery_result=[{"note": old_personal_live_delivery}],
             )
             await _insert_execution(
                 conn,
@@ -1562,6 +1723,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
                 created_at=day.replace(hour=16),
                 thread_id=thread_b_first,
                 excerpt="B-FIRST-EXCERPT",
+                delivery_result=[{"note": b_first_delivery}],
             )
             await _insert_execution(
                 conn,
@@ -1580,12 +1742,58 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
                 created_at=day.replace(hour=13),
                 excerpt="B-NOTHREAD-EXCERPT",
             )
+            await _insert_execution(
+                conn,
+                execution_id=run_foreign_done,
+                automation_id=foreign_only_id,
+                status="completed",
+                created_at=day.replace(hour=12),
+                thread_id=thread_a,
+                excerpt=foreign_done,
+                error_message=foreign_done_error,
+                delivery_result=[{"note": foreign_done_delivery}],
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_foreign_live,
+                automation_id=foreign_only_id,
+                status="running",
+                created_at=day.replace(hour=11),
+                thread_id=thread_a,
+                excerpt=foreign_live,
+                error_message=foreign_live_error,
+                delivery_result=[{"note": foreign_live_delivery}],
+            )
+            await _insert_execution(
+                conn,
+                execution_id="f1000000-0000-4000-8000-000000000015",
+                automation_id=other_id,
+                status="running",
+                created_at=day.replace(hour=9),
+                thread_id=None,
+                excerpt=other_excerpt,
+                error_message=other_error,
+                delivery_result=[{"note": other_delivery}],
+            )
+            await _insert_execution(
+                conn,
+                execution_id="f1000000-0000-4000-8000-000000000016",
+                automation_id=company_id,
+                status="completed",
+                created_at=day.replace(hour=8),
+                thread_id=None,
+                excerpt=company_excerpt,
+                error_message=company_error,
+                delivery_result=[{"note": company_delivery}],
+            )
         stored_runs = await _execution_rows(au1_live_pool)
         stored_threads = await _thread_places(au1_live_pool)
         personal_version = await _automation_version(au1_live_pool, personal_id)
         research_version = await _automation_version(au1_live_pool, research_id)
+        foreign_version = await _automation_version(au1_live_pool, foreign_only_id)
         assert personal_version["workspace_id"] == ws_b
         assert research_version["workspace_id"] == ws_b
+        assert foreign_version["workspace_id"] == ws_b
 
         holder["principal"] = _computer(comp_b, owner)
         await _assert_execution_pages(client, feed, visible, banned)
@@ -1620,11 +1828,101 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
             assert secret not in off_computer.text
             assert secret not in home_thread.text
 
+        b_default = await _expect(await client.get(task_list), 200)
+        assert _ids(b_default) == owner_task_ids
+        assert b_default["total"] == len(owner_task_ids)
+        _assert_secrets_absent(b_default, banned)
+        b_tasks = _tasks(b_default)
+        _assert_last(
+            b_tasks[personal_id],
+            execution_id=run_b_first,
+            excerpt="B-FIRST-EXCERPT",
+            thread_id=thread_b_first,
+            status="completed",
+            delivery_note=b_first_delivery,
+        )
+        _assert_last(
+            b_tasks[research_id],
+            execution_id=run_research_none,
+            excerpt="B-RESEARCH-NOTHREAD",
+            status="running",
+            delivery_note=b_research_delivery,
+        )
+        _assert_last(b_tasks[foreign_only_id], execution_id=None)
+        b_personal = await _expect(await client.get(personal_list), 200)
+        assert _ids(b_personal) == [personal_id, foreign_only_id]
+        _assert_secrets_absent(b_personal, banned)
+        _assert_last(
+            _tasks(b_personal)[personal_id],
+            execution_id=run_b_first,
+            excerpt="B-FIRST-EXCERPT",
+            thread_id=thread_b_first,
+            status="completed",
+            delivery_note=b_first_delivery,
+        )
+        _assert_last(_tasks(b_personal)[foreign_only_id], execution_id=None)
+        b_research = await _expect(await client.get(research_list), 200)
+        assert _ids(b_research) == [research_id]
+        _assert_secrets_absent(b_research, banned)
+        _assert_last(
+            _tasks(b_research)[research_id],
+            execution_id=run_research_none,
+            excerpt="B-RESEARCH-NOTHREAD",
+            status="running",
+            delivery_note=b_research_delivery,
+        )
+        personal_body = await _expect(await client.get(personal_detail), 200)
+        research_body = await _expect(await client.get(research_detail), 200)
+        foreign_body = await _expect(await client.get(foreign_detail), 200)
+        _assert_secrets_absent(personal_body, banned)
+        _assert_secrets_absent(research_body, banned)
+        _assert_secrets_absent(foreign_body, banned)
+        _assert_last(
+            personal_body,
+            execution_id=run_b_first,
+            excerpt="B-FIRST-EXCERPT",
+            thread_id=thread_b_first,
+            status="completed",
+            delivery_note=b_first_delivery,
+        )
+        _assert_last(
+            research_body,
+            execution_id=run_research_none,
+            excerpt="B-RESEARCH-NOTHREAD",
+            status="running",
+            delivery_note=b_research_delivery,
+        )
+        _assert_last(foreign_body, execution_id=None)
+        await _assert_execution_pages(
+            client,
+            f"/api/v1/automations/{foreign_only_id}/executions",
+            [],
+            banned,
+        )
+        unrelated = await client.get(f"/api/v1/automations/{other_id}")
+        assert unrelated.status_code == 404, unrelated.text
+        _assert_secrets_absent(unrelated.text, banned)
+        company_hidden = await client.get(f"/api/v1/automations/{company_id}")
+        assert company_hidden.status_code == 403, company_hidden.text
+        assert company_hidden.json()["detail"] == "Forbidden"
+        _assert_secrets_absent(company_hidden.text, banned)
+
         holder["principal"] = _computer(comp_a, owner)
         for url in (feed, personal_feed, research_feed):
             hidden = await _expect(await client.get(_paged(url, limit=20, offset=0)), 200)
             assert hidden == {"executions": [], "has_more": False}
-        for url in (personal_history, research_history):
+        for url in (task_list, personal_list, research_list):
+            hidden_tasks = await _expect(await client.get(url), 200)
+            assert hidden_tasks["automations"] == []
+            assert hidden_tasks["total"] == 0
+            _assert_secrets_absent(hidden_tasks, banned)
+        for url in (
+            personal_history,
+            research_history,
+            personal_detail,
+            research_detail,
+            foreign_detail,
+        ):
             denied = await client.get(url)
             assert denied.status_code == 403, denied.text
             assert denied.json()["detail"]["message"] == (
@@ -1637,8 +1935,11 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         own = await _expect(await client.get(_paged(feed, limit=20, offset=0)), 200)
         assert _run_ids(own) == session_order
         assert old_a in str(own)
+        assert old_a_delivery in str(own)
         assert old_home in str(own)
         assert old_research in str(own)
+        assert other_excerpt not in str(own)
+        assert company_excerpt not in str(own)
         personal_own = await _expect(
             await client.get(_paged(personal_history, limit=20, offset=0)),
             200,
@@ -1646,6 +1947,7 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         assert _run_ids(personal_own) == [
             run_a_top,
             run_home,
+            run_personal_inflight,
             run_b_first,
             run_a_mid,
             run_b_second,
@@ -1657,11 +1959,97 @@ async def test_moved_task_execution_reads_stay_on_the_token_computer(
         )
         assert _run_ids(research_own) == [
             run_research_a,
+            run_research_inflight,
             run_research_b,
             run_research_none,
         ]
+        session_default = await _expect(await client.get(task_list), 200)
+        assert _ids(session_default) == owner_task_ids
+        assert other_id not in _ids(session_default)
+        assert company_id not in _ids(session_default)
+        session_tasks = _tasks(session_default)
+        _assert_last(
+            session_tasks[personal_id],
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
+        )
+        _assert_last(
+            session_tasks[research_id],
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
+            status="running",
+            delivery_note=old_research_live_delivery,
+        )
+        _assert_last(
+            session_tasks[foreign_only_id],
+            execution_id=run_foreign_live,
+            excerpt=foreign_live,
+            error_message=foreign_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=foreign_live_delivery,
+        )
+        session_personal = await _expect(await client.get(personal_list), 200)
+        assert _ids(session_personal) == [personal_id, foreign_only_id]
+        session_research = await _expect(await client.get(research_list), 200)
+        assert _ids(session_research) == [research_id]
+        _assert_last(
+            _tasks(session_personal)[personal_id],
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
+        )
+        _assert_last(
+            _tasks(session_research)[research_id],
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
+            status="running",
+            delivery_note=old_research_live_delivery,
+        )
+        session_personal_detail = await _expect(await client.get(personal_detail), 200)
+        session_research_detail = await _expect(await client.get(research_detail), 200)
+        session_foreign_detail = await _expect(await client.get(foreign_detail), 200)
+        _assert_last(
+            session_personal_detail,
+            execution_id=run_personal_inflight,
+            excerpt=old_personal_live,
+            error_message=old_personal_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=old_personal_live_delivery,
+        )
+        _assert_last(
+            session_research_detail,
+            execution_id=run_research_inflight,
+            excerpt=old_research_live,
+            error_message=old_research_live_error,
+            thread_id=thread_research_a,
+            status="running",
+            delivery_note=old_research_live_delivery,
+        )
+        _assert_last(
+            session_foreign_detail,
+            execution_id=run_foreign_live,
+            excerpt=foreign_live,
+            error_message=foreign_live_error,
+            thread_id=thread_a,
+            status="running",
+            delivery_note=foreign_live_delivery,
+        )
 
     assert await _execution_rows(au1_live_pool) == stored_runs
     assert await _thread_places(au1_live_pool) == stored_threads
     assert await _automation_version(au1_live_pool, personal_id) == personal_version
     assert await _automation_version(au1_live_pool, research_id) == research_version
+    assert await _automation_version(au1_live_pool, foreign_only_id) == foreign_version
