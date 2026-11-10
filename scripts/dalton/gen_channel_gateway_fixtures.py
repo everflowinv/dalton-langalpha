@@ -230,13 +230,25 @@ def build_i2_fixtures() -> dict[str, Any]:
 
 
 def build_i3_fixtures() -> dict[str, Any]:
-    """Return structures from `execute_session_command` (`src/dalton/database/channel_gateway.py:1418-1426, 1499-1505, 1593-1597, 1669-1674`)."""
+    """Return structures from `execute_session_command` (`src/dalton/database/channel_gateway.py`)."""
+    ext_gen_1 = format_external_thread_id("feishu", "dm:ou_alice", USER_ID, 1, "dm")
     ext_gen_2 = format_external_thread_id("feishu", "dm:ou_alice", USER_ID, 2, "dm")
     return {
         "workspace_list": {
             "ok": True,
+            "linked": True,
+            "allowed": True,
+            "dalton_user_id": USER_ID,
+            "user_tier": "internal",
             "current_workspace_id": WORKSPACE_ID,
+            "current_workspace_name": "Quant Workspace",
+            "is_home": False,
             "home_workspace_id": HOME_WS_ID,
+            "generation": 1,
+            "external_thread_id": ext_gen_1,
+            "duplicate": False,
+            "command_effect_status": "done",
+            "command_reply_pending": True,
             "workspaces": [
                 {"workspace_id": HOME_WS_ID, "name": "Home"},
                 {"workspace_id": WORKSPACE_ID, "name": "Quant Workspace"},
@@ -244,23 +256,53 @@ def build_i3_fixtures() -> dict[str, Any]:
         },
         "workspace_switch_dm": {
             "ok": True,
+            "linked": True,
+            "allowed": True,
+            "dalton_user_id": USER_ID,
+            "user_tier": "internal",
             "workspace_id": WORKSPACE_ID,
+            "workspace_name": "Quant Workspace",
+            "is_home": False,
             "override_workspace_id": WORKSPACE_ID,
+            "home_workspace_id": HOME_WS_ID,
             "generation": 2,
             "external_thread_id": ext_gen_2,
+            "duplicate": False,
+            "command_effect_status": "done",
+            "command_reply_pending": True,
         },
         "new_session": {
             "ok": True,
+            "linked": True,
+            "allowed": True,
+            "dalton_user_id": USER_ID,
+            "user_tier": "internal",
+            "workspace_id": HOME_WS_ID,
+            "workspace_name": "Chief of Staff",
+            "is_home": True,
+            "override_workspace_id": None,
+            "home_workspace_id": HOME_WS_ID,
             "generation": 2,
             "external_thread_id": ext_gen_2,
+            "duplicate": False,
+            "command_effect_status": "done",
+            "command_reply_pending": True,
         },
         "stop_session": {
             "ok": True,
+            "linked": True,
+            "allowed": True,
+            "dalton_user_id": USER_ID,
+            "user_tier": "internal",
+            "workspace_id": WORKSPACE_ID,
+            "is_home": False,
             "thread_id": THREAD_ID,
             "run_id": RUN_ID,
-            "external_thread_id": format_external_thread_id(
-                "feishu", "dm:ou_alice", USER_ID, 1, "dm"
-            ),
+            "generation": 1,
+            "external_thread_id": ext_gen_1,
+            "duplicate": False,
+            "command_effect_status": "pending_cancel",
+            "command_reply_pending": True,
         },
     }
 
