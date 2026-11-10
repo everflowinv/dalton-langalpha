@@ -270,3 +270,8 @@ tests/unit/server/database/test_last_execution_reach.py
 src/dalton/services/company_script_writes.py
 tests/unit/dalton/test_company_script_writes.py
 tests/integration/dalton/test_company_script_writes_db.py
+
+# Unified task read hooks: agent and script list, detail, runs, and history.
+web/src/pages/Automations/hooks/useAutomationReads.ts
+web/src/pages/Automations/hooks/__tests__/useAutomationReads.test.tsx
+web/src/pages/Automations/utils/__tests__/api.reads.test.ts
