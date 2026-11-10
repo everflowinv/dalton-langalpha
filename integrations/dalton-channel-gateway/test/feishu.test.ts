@@ -72,6 +72,7 @@ import {
   RUN_ID,
   THREAD_ID,
   USER_ID,
+  WORKSPACE_ID,
 } from "./helpers.js";
 
 // --- Realistic Lark.Client Test Double (Strict Method Signatures) ---
@@ -1193,11 +1194,134 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       expect(h.backend.sessionCommand).toHaveBeenCalledWith(
         expect.objectContaining({
           platform: "feishu",
-          dalton_user_id: "user_alice_123",
+          platform_user_id: "ou_alice",
+          message_id: "om_dm_new_no_mention",
           scope_key: "dm:ou_alice",
           cmd: "new",
         }),
       );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("requires structured @bot mention for group slash commands and ignores unmentioned, plain-text @bot, broadcast @_all, or undefined-trigger group events", async () => {
+    // 1. Unmentioned group slash commands must have `isGroupTrigger === false`
+    for (const cmd of [
+      "/bind 123456",
+      "/workspace",
+      "/workspace list",
+      "/main",
+      "/量化研究 A组",
+      "/new",
+      "/stop",
+      "/unbind",
+      "@DaltonBot /main",
+    ]) {
+      const ev = parseFeishuInboundEvent(
+        {
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            message_id: `om_grp_unmentioned_${cmd}`,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: cmd }),
+          },
+        },
+        { botOpenId: BOT_OPEN_ID },
+      );
+      expect(ev?.isGroupTrigger).toBe(false);
+    }
+
+    // 2. Broadcast `@_all` with slash command is NOT a structured bot mention
+    const broadcastSlashEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_grp_broadcast_slash_1",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_all /main" }),
+          mentions: [
+            {
+              key: "@_all",
+              id: { open_id: "all" },
+              name: "All",
+            },
+          ],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(broadcastSlashEvent?.isGroupTrigger).toBe(false);
+
+    // 3. Structured @bot mention with `/bind 123456` sets `isGroupTrigger === true`
+    const mentionedGroupBindEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_grp_bind_1",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_user_1 /bind 123456" }),
+          mentions: [
+            {
+              key: "@_user_1",
+              id: { open_id: BOT_OPEN_ID },
+              name: "DaltonBot",
+            },
+          ],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(mentionedGroupBindEvent?.isGroupTrigger).toBe(true);
+    expect(mentionedGroupBindEvent?.text).toBe("/bind 123456");
+
+    const h = createTestHarness();
+    try {
+      // Unmentioned group command and `isGroupTrigger: undefined` must produce zero backend calls
+      const unmentionedGroupMain = parseFeishuInboundEvent(
+        {
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            message_id: "om_grp_unmentioned_main",
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: "/main" }),
+          },
+        },
+        { botOpenId: BOT_OPEN_ID },
+      )!;
+      await h.feishuAdapter.emitInbound(unmentionedGroupMain);
+      await h.feishuAdapter.emitInbound({
+        ...unmentionedGroupMain,
+        messageId: "om_grp_undefined_trigger",
+        isGroupTrigger: undefined,
+      });
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
+      expect(h.backend.consumeBindCode).not.toHaveBeenCalled();
+
+      // Mentioned `/bind 123456` in group triggers and revokes leaked group bind code
+      vi.mocked(h.backend.consumeBindCode).mockResolvedValueOnce({
+        ok: false,
+        reason: "revoked_in_group",
+      });
+      await h.feishuAdapter.emitInbound(mentionedGroupBindEvent!);
+      expect(h.backend.consumeBindCode).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "bind",
+          platform: "feishu",
+          code: "123456",
+          is_group: true,
+        }),
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("revoked");
     } finally {
       await h.cleanup();
     }
@@ -1402,6 +1526,9 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
 
       const origRegister = h.backend.registerAndResolveInbound;
       const defaultImpl = vi.mocked(origRegister).getMockImplementation()!;
+      const defaultSessionCmd = vi
+        .mocked(h.backend.sessionCommand)
+        .getMockImplementation()!;
       const registrationOrder: string[] = [];
       vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
         async (req) => {
@@ -1411,6 +1538,12 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
           return defaultImpl(req);
         },
       );
+      vi.mocked(h.backend.sessionCommand).mockImplementation(async (req) => {
+        if (req.message_id) {
+          registrationOrder.push(req.message_id);
+        }
+        return defaultSessionCmd(req);
+      });
 
       let finishSseStream!: () => void;
       const sseHold = new Promise<void>((resolve) => {
@@ -5162,5 +5295,860 @@ describe("main.ts adapter registration & shared helpers", () => {
     expect(dedupe.check("k1")).toBe(true);
     now = 1600;
     expect(dedupe.check("k1")).toBe(false);
+  });
+
+  it("handles /main, /<workspace_name> (Chinese and internal spaces), /workspace <name|id|home>, duplicate candidates, and unknown slash commands from real Feishu inbound entry", async () => {
+    const BOT_OPEN_ID = "ou_bot_dalton";
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      // 1. DM `/main` switches to Chief of Staff (Home) via atomic I-3 without calling I-1
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_main_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/main" }),
+        },
+      });
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          cmd: "workspace_switch",
+          target_kind: "home",
+          workspace_query: "home",
+          message_id: "om_cmd_main_1",
+          platform_user_id: "ou_alice",
+          raw_payload: expect.objectContaining({
+            command: "/main",
+            cmd: "workspace_switch",
+          }),
+        }),
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "Chief of Staff",
+      );
+
+      // 2. DM `/量化研究 A组` (Chinese + internal space) switches by exact outer-trimmed name
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_cn_ws_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "  /量化研究 A组  " }),
+        },
+      });
+      expect(h.backend.sessionCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          cmd: "workspace_switch",
+          target_kind: "shortcut_name",
+          workspace_query: "量化研究 A组",
+          message_id: "om_cmd_cn_ws_1",
+          raw_payload: expect.objectContaining({
+            command: "/量化研究 A组",
+            cmd: "workspace_switch",
+          }),
+        }),
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("量化研究 A组");
+
+      // 2b. Group chat command with structured @bot mention strips only the bot mention and preserves workspace characters
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_grp_mention_1",
+          chat_id: "oc_grp_cmd_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_user_1 /@Alpha #1 研究组" }),
+          mentions: [
+            {
+              key: "@_user_1",
+              name: "DaltonBot",
+              id: { open_id: BOT_OPEN_ID },
+            },
+          ],
+        },
+      });
+      expect(h.backend.sessionCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          cmd: "workspace_switch",
+          chat_type: "group",
+          target_kind: "shortcut_name",
+          workspace_query: "@Alpha #1 研究组",
+          message_id: "om_cmd_grp_mention_1",
+          raw_payload: expect.objectContaining({
+            command: "/@Alpha #1 研究组",
+          }),
+        }),
+      );
+
+      // 2c. Group chat plain-text `@DaltonBot /main` WITHOUT structured bot mention is ignored completely
+      const callsBeforeUnmentioned = vi.mocked(h.backend.sessionCommand).mock
+        .calls.length;
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_grp_plain_text_mention",
+          chat_id: "oc_grp_cmd_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@DaltonBot /main" }),
+        },
+      });
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.length).toBe(
+        callsBeforeUnmentioned,
+      );
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+
+      // 3. Reserved word conflict (`main`) resolved via `/workspace <UUID>` or `/workspace <name>`
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_explicit_ws_uuid",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({
+            text: `/workspace ${WORKSPACE_ID}`,
+          }),
+        },
+      });
+      expect(h.backend.sessionCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          cmd: "workspace_switch",
+          target_kind: "workspace_id",
+          workspace_id: WORKSPACE_ID,
+          message_id: "om_cmd_explicit_ws_uuid",
+          raw_payload: expect.objectContaining({
+            command: `/workspace ${WORKSPACE_ID}`,
+          }),
+        }),
+      );
+
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_explicit_ws_name",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({
+            text: "/workspace main",
+          }),
+        },
+      });
+      expect(h.backend.sessionCommand).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          cmd: "workspace_switch",
+          target_kind: "exact_name",
+          workspace_query: "main",
+          message_id: "om_cmd_explicit_ws_name",
+          raw_payload: expect.objectContaining({
+            command: "/workspace main",
+          }),
+        }),
+      );
+
+      // 4. Duplicate workspace name (`workspace_ambiguous`) lists candidates with UUIDs and keeps current session
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: false,
+        linked: true,
+        dalton_user_id: USER_ID,
+        deny_reason: "workspace_ambiguous",
+        candidates: [
+          {
+            workspace_id: "11111111-1111-4111-8111-111111111111",
+            name: "Alpha Research",
+          },
+          {
+            workspace_id: "22222222-2222-4222-8222-222222222222",
+            name: "Alpha Research",
+          },
+        ],
+        command_reply_pending: true,
+      });
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_dup_ws_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/Alpha Research" }),
+        },
+      });
+      const dupReply = h.feishuAdapter.sentTexts.at(-1)?.text ?? "";
+      expect(dupReply).toContain("Multiple workspaces match");
+      expect(dupReply).toContain("11111111-1111-4111-8111-111111111111");
+      expect(dupReply).toContain("22222222-2222-4222-8222-222222222222");
+      expect(dupReply).toContain("Current session was not changed");
+
+      // 5. Unknown slash `/nonexistent_ws` returns clear prompt and NEVER starts a model turn
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: false,
+        linked: true,
+        dalton_user_id: USER_ID,
+        deny_reason: "workspace_not_found",
+        command_reply_pending: true,
+      });
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_unknown_slash_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/nonexistent_ws" }),
+        },
+      });
+      const unknownReply = h.feishuAdapter.sentTexts.at(-1)?.text ?? "";
+      expect(unknownReply).toContain("Unknown command or workspace");
+      expect(unknownReply).toContain("/workspace");
+      expect(unknownReply).toContain("/main");
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(h.backend.appendCalls).toHaveLength(0);
+
+      // 6. Invalid command syntax `/main extra` returns usage prompt and never calls backend
+      const cmdCallsBefore = vi.mocked(h.backend.sessionCommand).mock.calls
+        .length;
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_cmd_bad_main_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/main extra" }),
+        },
+      });
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.length).toBe(
+        cmdCallsBefore,
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("Usage: `/main`");
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(h.backend.appendCalls).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("recovers command inbound rows at startup without dispatching /main or /new as LLM turns, and formats stale-session HITL interrupts with a thread link", async () => {
+    const h = createTestHarness();
+    try {
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [
+          {
+            platform: "feishu",
+            message_id: "om_rec_cmd_main_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm",
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: "rk_rec_main_1",
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: null,
+            run_id: null,
+            turn_index: null,
+            workspace_id: null,
+            external_thread_id: `feishu:dm:ou_alice:u:${USER_ID}:g:2`,
+            generation: 2,
+            event_kind: "command",
+            command_request: {
+              cmd: "workspace_switch",
+              target_kind: "home",
+              workspace_query: "home",
+            },
+            command_result: {
+              ok: true,
+              is_home: true,
+              workspace_id: null,
+              workspace_name: "Chief of Staff",
+              generation: 2,
+              external_thread_id: `feishu:dm:ou_alice:u:${USER_ID}:g:2`,
+            },
+            command_effect_status: "done",
+            command_reply_pending: true,
+            status: "received",
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: { text: "/main", platform_user_id: "ou_alice" },
+            pending_interrupt: null,
+          },
+          {
+            platform: "feishu",
+            message_id: "om_rec_cmd_stop_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm",
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: "rk_rec_stop_1",
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: null,
+            workspace_id: WORKSPACE_ID,
+            external_thread_id: `feishu:dm:ou_alice:u:${USER_ID}:g:1`,
+            generation: 1,
+            event_kind: "command",
+            command_request: {
+              cmd: "stop",
+            },
+            command_result: {
+              ok: true,
+              thread_id: THREAD_ID,
+              run_id: RUN_ID,
+              generation: 1,
+            },
+            command_effect_status: "pending_cancel",
+            command_reply_pending: true,
+            status: "received",
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: { text: "/stop", platform_user_id: "ou_alice" },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+
+      await h.app.orchestrator.runStartupRecovery();
+
+      // Must NOT dispatch `/main` or `/stop` to the LLM
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(h.backend.appendCalls).toHaveLength(0);
+
+      // `/stop` executed `cancelThreadTurn` and marked `command_effect_status: "done"`
+      expect(h.backend.cancelThreadTurn).toHaveBeenCalledWith(
+        USER_ID,
+        THREAD_ID,
+        RUN_ID,
+      );
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_rec_cmd_main_1" &&
+            u.status === "completed" &&
+            u.command_reply_pending === false,
+        ),
+      ).toBe(true);
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_rec_cmd_stop_1" &&
+            u.status === "completed" &&
+            u.command_reply_pending === false &&
+            u.command_effect_status === "done",
+        ),
+      ).toBe(true);
+
+      // Verify stale-session HITL interrupt includes web link to original thread
+      vi.mocked(h.backend.updateInboundProgress).mockResolvedValueOnce({
+        ok: true,
+        run_id: RUN_ID,
+        has_in_flight_current_text: false,
+        has_unknown_current_text: false,
+        has_in_flight_or_unknown_current_text: false,
+        sent_to_current_count: 0,
+        session_is_current_for_interrupt: false,
+      });
+      vi.mocked(h.backend.appendThreadMessages).mockImplementationOnce(
+        async () => ({
+          status: 200,
+          isSse: true,
+          events: makeSseEventsFromFixture([
+            {
+              event: "interrupt",
+              data: {
+                thread_id: THREAD_ID,
+                run_id: RUN_ID,
+                interrupt_id: "int_stale_1",
+                action_requests: [
+                  {
+                    type: "ask_user_question",
+                    question: "Which benchmark index should we use?",
+                    options: ["CSI 300", "S&P 500"],
+                  },
+                ],
+              },
+            },
+          ]),
+        }),
+      );
+
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stale_int_trigger_1",
+        text: "Run benchmark comparison",
+      });
+      await new Promise((r) => setTimeout(r, 25));
+
+      const lastSent = h.feishuAdapter.sentTexts.at(-1)?.text ?? "";
+      expect(lastSent).toContain("Which benchmark index should we use?");
+      expect(lastSent).toContain("earlier conversation thread");
+      expect(lastSent).toContain(`/chat/t/${THREAD_ID}`);
+      const staleInterruptClaim = h.backend.deliveryClaims.at(-1);
+      expect(staleInterruptClaim?.activity_origin).toBe("replay");
+      expect(staleInterruptClaim?.source_scope_key).toBe("dm:ou_alice");
+      expect(staleInterruptClaim?.source_generation).toBe(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("enforces /stop HTTP status handling (503 retry, 403 refusal, null run_id guard), command recovery re-auth, same-workspace reply, per-attachment incremental I-7 progress, and background run watch generation fidelity", async () => {
+    const h = createTestHarness();
+    try {
+      // 1. `/stop` with 503 transient failure keeps `pending_cancel` and does NOT send premature success reply
+      vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({
+        status: 503,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stop_503_1",
+        text: "/stop",
+      });
+      expect(h.backend.cancelThreadTurn).toHaveBeenCalledWith(
+        USER_ID,
+        THREAD_ID,
+        RUN_ID,
+      );
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_stop_503_1" &&
+            u.command_effect_status === "done",
+        ),
+      ).toBe(false);
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("Stopped the current run."),
+        ),
+      ).toBe(false);
+
+      // Startup recovery retries the `pending_cancel` row when `cancelThreadTurn` returns 200
+      vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({
+        status: 200,
+      });
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [
+          {
+            platform: "feishu",
+            message_id: "om_stop_503_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm",
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: "rk_stop_503_1",
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: null,
+            workspace_id: WORKSPACE_ID,
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            session_generation: 1,
+            event_kind: "command",
+            command_request: { cmd: "stop" },
+            command_result: {
+              ok: true,
+              linked: true,
+              thread_id: THREAD_ID,
+              run_id: RUN_ID,
+              generation: 1,
+            },
+            command_effect_status: "pending_cancel",
+            command_reply_pending: true,
+            status: "received",
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: { text: "/stop", platform_user_id: "ou_alice" },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+      await h.app.orchestrator.runStartupRecovery();
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_stop_503_1" &&
+            u.status === "completed" &&
+            u.command_effect_status === "done" &&
+            u.command_reply_pending === false,
+        ),
+      ).toBe(true);
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "Stopped the current run.",
+      );
+
+      // 2. `/stop` with 403 permanent refusal marks `status: "failed"`, `command_effect_status: "done"` and sends explicit refusal notice
+      vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({
+        status: 403,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stop_403_1",
+        text: "/stop",
+      });
+      const stop403FailureIdx = h.backend.progressUpdates.findIndex(
+        (u) =>
+          u.message_id === "om_stop_403_1" &&
+          u.status === "failed" &&
+          u.command_effect_status === "done" &&
+          u.command_reply_pending === true &&
+          u.command_result?.ok === false &&
+          u.command_result?.allowed === false &&
+          u.command_result?.deny_reason === "stop_cancel_denied" &&
+          u.command_result?.stop_cancel_status === 403,
+      );
+      const stop403ClearIdx = h.backend.progressUpdates.findIndex(
+        (u, idx) =>
+          idx > stop403FailureIdx &&
+          u.message_id === "om_stop_403_1" &&
+          u.command_reply_pending === false,
+      );
+      expect(stop403FailureIdx).toBeGreaterThanOrEqual(0);
+      expect(stop403ClearIdx).toBeGreaterThan(stop403FailureIdx);
+      expect(
+        h.backend.deliveryClaims.find(
+          (claim) =>
+            claim.delivery_key === "notice:feishu:om_stop_403_1:command_err",
+        ),
+      ).toMatchObject({
+        kind: "notice",
+        activity_origin: "none",
+      });
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "Failed to stop the current run (status 403).",
+      );
+
+      // 3. `/stop` when no active `run_id` exists (`run_id: null`): marks `done` and NEVER calls `cancelThreadTurn`
+      const cancelCallsBeforeNullRun = vi.mocked(h.backend.cancelThreadTurn)
+        .mock.calls.length;
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: true,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: WORKSPACE_ID,
+        is_home: false,
+        thread_id: THREAD_ID,
+        run_id: null,
+        generation: 1,
+        command_effect_status: "done",
+        command_reply_pending: true,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stop_no_run_1",
+        text: "/stop",
+      });
+      expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls.length).toBe(
+        cancelCallsBeforeNullRun,
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "No active run to stop in the current session.",
+      );
+
+      // 4. Command recovery re-authorization via `sessionCommand` when user unlinked or lost workspace access
+      const sentBeforeDeniedRecovery = h.feishuAdapter.sentTexts.length;
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: false,
+        linked: false,
+        deny_reason: "not_linked",
+        command_effect_status: "done",
+        command_reply_pending: false,
+      });
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [
+          {
+            platform: "feishu",
+            message_id: "om_rec_unlinked_stop_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm",
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: "rk_rec_unlinked_stop_1",
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: null,
+            workspace_id: WORKSPACE_ID,
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            event_kind: "command",
+            command_request: { cmd: "stop" },
+            command_result: {
+              ok: true,
+              thread_id: THREAD_ID,
+              run_id: RUN_ID,
+              generation: 1,
+            },
+            command_effect_status: "pending_cancel",
+            command_reply_pending: true,
+            status: "received",
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: { text: "/stop", platform_user_id: "ou_alice" },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+      await h.app.orchestrator.runStartupRecovery();
+      expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls.length).toBe(
+        cancelCallsBeforeNullRun,
+      );
+      expect(h.feishuAdapter.sentTexts.length).toBe(sentBeforeDeniedRecovery);
+
+      // 5. Same-workspace switch (`switched: false`, generation 2) keeps this conversation
+      // and does not start a model turn. The reply names the workspace and its id.
+      const createCallsBeforeSameWs = h.backend.createCalls.length;
+      const appendCallsBeforeSameWs = h.backend.appendCalls.length;
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: true,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: WORKSPACE_ID,
+        workspace_name: "Quant Workspace",
+        is_home: false,
+        switched: false,
+        generation: 2,
+        command_effect_status: "done",
+        command_reply_pending: true,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_sw_same_1",
+        text: "/Quant Workspace",
+      });
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toBe(
+        `Already in workspace \`Quant Workspace\` (\`${WORKSPACE_ID}\`). Keeping current conversation.`,
+      );
+      expect(h.backend.createCalls).toHaveLength(createCallsBeforeSameWs);
+      expect(h.backend.appendCalls).toHaveLength(appendCallsBeforeSameWs);
+      expect(
+        h.backend.deliveryClaims.find(
+          (claim) => claim.delivery_key === "notice:feishu:om_sw_same_1:command",
+        ),
+      ).toMatchObject({
+        kind: "notice",
+        thread_id: null,
+        run_id: null,
+        source_generation: 2,
+        activity_origin: "command",
+      });
+
+      // 6. Per-attachment incremental `updateDeliveryProgress` in `DeliveryService`.
+      // File bytes come from `downloadWorkspaceFile`. Each successful `sendFile`
+      // persists `files_status` before the next file is attempted.
+      vi.mocked(h.backend.downloadWorkspaceFile).mockImplementation(
+        async (_userId, _workspaceId, workspacePath) => ({
+          content: Buffer.from(
+            workspacePath.endsWith("first.pdf") ? "PDF_1" : "PDF_2",
+            "utf8",
+          ),
+          mimeType: "application/pdf",
+        }),
+      );
+      let attachmentCallIdx = 0;
+      h.feishuAdapter.setSendFileBehavior(async (params) => {
+        attachmentCallIdx += 1;
+        if (attachmentCallIdx === 1) {
+          expect(params.path).toBe("reports/first.pdf");
+          expect(params.content.equals(Buffer.from("PDF_1", "utf8"))).toBe(
+            true,
+          );
+          return {
+            messageId: "feishu_file_first",
+            status: "sent",
+            reason: null,
+          };
+        }
+        const incrementalUpdate = h.backend.deliveryUpdates.find(
+          (u) =>
+            u.delivery_key === "tool:run_inc_att:1" &&
+            u.files_status?.some(
+              (f) => f.path === "reports/first.pdf" && f.status === "sent",
+            ) &&
+            !u.files_status?.some((f) => f.path === "reports/second.pdf"),
+        );
+        expect(incrementalUpdate).toBeDefined();
+        throw new ChannelDeliveryError(
+          "second attachment failed across boundary",
+          { outcome: "failed", code: "unavailable" },
+        );
+      });
+
+      const attRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "tool:run_inc_att:1",
+        kind: "agent_send",
+        userId: USER_ID,
+        threadId: THREAD_ID,
+        runId: RUN_ID,
+        platform: "feishu",
+        target: "feishu:@me",
+        text: "",
+        files: [
+          { path: "reports/first.pdf", workspace_id: WORKSPACE_ID },
+          { path: "reports/second.pdf", workspace_id: WORKSPACE_ID },
+        ],
+        sourceScopeKey: "dm:ou_alice",
+        sourceGeneration: 2,
+        activityOrigin: "conversation",
+      });
+      expect(attRes.status).toBe("partial");
+      expect(attRes.files).toEqual([
+        expect.objectContaining({
+          path: "reports/first.pdf",
+          status: "sent",
+        }),
+        expect.objectContaining({
+          path: "reports/second.pdf",
+          status: "failed",
+        }),
+      ]);
+      expect(h.backend.downloadWorkspaceFile).toHaveBeenCalledWith(
+        USER_ID,
+        WORKSPACE_ID,
+        "reports/first.pdf",
+      );
+      expect(h.backend.downloadWorkspaceFile).toHaveBeenCalledWith(
+        USER_ID,
+        WORKSPACE_ID,
+        "reports/second.pdf",
+      );
+      const attUpdates = h.backend.deliveryUpdates.filter(
+        (u) => u.delivery_key === "tool:run_inc_att:1",
+      );
+      expect(
+        attUpdates.some(
+          (u) =>
+            u.files_status?.some(
+              (f) => f.path === "reports/first.pdf" && f.status === "sent",
+            ) && !u.files_status?.some((f) => f.path === "reports/second.pdf"),
+        ),
+      ).toBe(true);
+      expect(attUpdates.at(-1)?.files_status).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "reports/first.pdf",
+            status: "sent",
+          }),
+        ]),
+      );
+      h.feishuAdapter.setSendFileBehavior(null);
+
+      // 7. `recoverSingleBackgroundRun` preserves `scope_key` and `generation` from recovered watch/background row
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [],
+        background_runs: [
+          {
+            run_id: "bg_run_gen5",
+            thread_id: THREAD_ID,
+            dalton_user_id: USER_ID,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            scope_key: "dm:ou_alice",
+            generation: 5,
+            turn_index: 2,
+            status: "completed",
+            fallback_pending: true,
+            sent_to_current_count: 0,
+          },
+        ],
+        thread_watches: [
+          {
+            thread_id: THREAD_ID,
+            dalton_user_id: USER_ID,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            scope_key: "dm:ou_alice",
+            generation: 5,
+            last_seen_turn_index: 2,
+            watch_active: true,
+            pending_interrupt: null,
+          },
+        ],
+        automation_runs: [],
+      });
+      await h.app.orchestrator.runStartupRecovery();
+      const bgWatchUpdates = h.backend.progressUpdates.filter(
+        (u) => u.thread_watch?.thread_id === THREAD_ID,
+      );
+      expect(bgWatchUpdates.at(-1)?.thread_watch?.generation).toBe(5);
+      expect(bgWatchUpdates.at(-1)?.thread_watch?.scope_key).toBe(
+        "dm:ou_alice",
+      );
+    } finally {
+      await h.cleanup();
+    }
   });
 });

@@ -1,11 +1,13 @@
 """Database persistence and transaction logic for CH-1 Channel Gateway (`I-1` ~ `I-9` & §1.5).
 
-All SQL for the 11 `dalton_channel_*` tables (migration `d030`) lives here.
+All SQL for the 11 `dalton_channel_*` tables (migrations `d030`, `d031`) lives here.
 
 Global lock order across transactions:
-1. Personal settings rows (`dalton_channel_user_settings`, `FOR UPDATE`; sorted by `user_id` when locking multiple users)
+0. Per-message / per-delivery advisory locks (`dalton_inbound:<platform>:<message_id>`, `dalton_delivery:<delivery_key>`)
+1. Personal settings advisory + row locks (`dalton_user_settings:<user_id>`, `dalton_channel_user_settings` `FOR UPDATE`; sorted by `user_id` when locking multiple users)
 2. Group chat advisory locks (`_acquire_group_chat_lock`; sorted by `platform`, `chat_address`)
-3. Chat binding rows (`dalton_channel_chat_bindings`) / identity rows (`dalton_channel_identities`) / session generation rows (`dalton_channel_session_generations`)
+3. Chat binding rows (`dalton_channel_chat_bindings`) / identity rows (`dalton_channel_identities`) / session generation rows (`dalton_channel_session_generations` `FOR UPDATE`)
+4. Inbound event / thread watch / background run / delivery rows (`dalton_channel_inbound_events`, `dalton_channel_thread_watches`, `dalton_channel_background_runs`, `dalton_channel_deliveries` `FOR UPDATE`)
 """
 
 from __future__ import annotations
@@ -55,10 +57,97 @@ SUPPORTED_PLATFORMS: tuple[str, ...] = ("feishu", "discord", "weixin")
 GROUP_PLATFORMS: tuple[str, ...] = ("feishu", "discord")
 BIND_CODE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 BIND_CODE_TTL_SECONDS = 600
+SESSION_INACTIVITY_TIMEOUT = timedelta(hours=6)
+CHIEF_OF_STAFF_DISPLAY_NAME = "Chief of Staff"
 USER_SETTINGS_PKEY_CONSTRAINT = "dalton_channel_user_settings_pkey"
 _TX_RETRY_MAX_ATTEMPTS = 3
 _TX_RETRY_BACKOFF_MIN_SECONDS = 0.02
 _TX_RETRY_BACKOFF_MAX_SECONDS = 0.10
+
+
+def _coerce_utc_datetime(val: Any) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, str):
+        raw = val.strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return (
+                parsed
+                if parsed.tzinfo is not None
+                else parsed.replace(tzinfo=timezone.utc)
+            )
+        except ValueError:
+            return None
+    return None
+
+
+def _is_session_expired(last_activity_at: Any, db_now: datetime) -> bool:
+    dt = _coerce_utc_datetime(last_activity_at)
+    if dt is None:
+        return False
+    return db_now >= dt + SESSION_INACTIVITY_TIMEOUT
+
+
+async def _fetch_db_now(cur: Any) -> datetime:
+    """Read database current timestamp (`clock_timestamp()`) after row locks are held."""
+    await cur.execute("SELECT clock_timestamp() AS db_now")
+    row = await cur.fetchone()
+    if row and isinstance(row, dict):
+        dt = _coerce_utc_datetime(row.get("db_now"))
+        if dt is not None:
+            return dt
+    return datetime.now(timezone.utc)
+
+
+async def _lock_or_create_session_row(
+    cur: Any,
+    *,
+    platform: str,
+    scope_key: str,
+    dalton_user_id: str,
+) -> tuple[dict[str, Any], bool, datetime]:
+    """Ensure `(platform, scope_key, dalton_user_id)` exists, lock it `FOR UPDATE`, and return `(row, inserted_new, db_now)`."""
+    await cur.execute(
+        """
+        INSERT INTO dalton_channel_session_generations (
+            platform, scope_key, dalton_user_id, generation
+        )
+        VALUES (%s, %s, %s, 1)
+        ON CONFLICT (platform, scope_key, dalton_user_id) DO NOTHING
+        RETURNING platform
+        """,
+        (platform, scope_key, dalton_user_id),
+    )
+    inserted_new = (await cur.fetchone()) is not None
+    await cur.execute(
+        """
+        SELECT generation, override_workspace_id, pending_interrupt,
+               last_conversation_activity_at, selection_initialized_at
+        FROM dalton_channel_session_generations
+        WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+        FOR UPDATE
+        """,
+        (platform, scope_key, dalton_user_id),
+    )
+    fetched = await cur.fetchone()
+    row = (
+        dict(fetched)
+        if fetched
+        else {
+            "generation": 1,
+            "override_workspace_id": None,
+            "pending_interrupt": None,
+            "last_conversation_activity_at": None,
+            "selection_initialized_at": None,
+        }
+    )
+    db_now = await _fetch_db_now(cur)
+    return row, inserted_new, db_now
 
 
 def _is_retryable_tx_error(exc: BaseException) -> bool:
@@ -391,6 +480,7 @@ def _serialize_inbound_row(
         "deny_reason": deny_reason,
         "dalton_user_id": row.get("dalton_user_id"),
         "user_tier": user_tier,
+        "event_kind": row.get("event_kind") or "message",
         "request_key": str(row["request_key"]) if row.get("request_key") else None,
         "retry_request_key": (
             str(row["retry_request_key"]) if row.get("retry_request_key") else None
@@ -414,6 +504,10 @@ def _serialize_inbound_row(
         "uploaded_attachments": row.get("uploaded_attachments"),
         "raw_payload": row.get("raw_payload") or {},
         "pending_interrupt": pending_interrupt,
+        "command_request": row.get("command_request"),
+        "command_result": row.get("command_result"),
+        "command_effect_status": row.get("command_effect_status"),
+        "command_reply_pending": bool(row.get("command_reply_pending", False)),
     }
 
 
@@ -496,9 +590,9 @@ async def _register_and_resolve_inbound_once(
                     INSERT INTO dalton_channel_inbound_events (
                         platform, message_id, request_key, chat_type,
                         chat_address, thread_scope_key, status,
-                        fallback_pending, raw_payload
+                        fallback_pending, raw_payload, event_kind
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, 'pending', FALSE, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending', FALSE, %s, 'message')
                     ON CONFLICT (platform, message_id) DO NOTHING
                     RETURNING *
                     """,
@@ -522,18 +616,16 @@ async def _register_and_resolve_inbound_once(
                         (cleaned_platform, cleaned_msg_id),
                     )
                     existing = dict(await cur.fetchone())
-                    ex_uid = existing.get("dalton_user_id")
-                    ex_ws_id = existing.get("workspace_id")
-                    ws_status = None
-                    ws_owner_id = ex_uid
-                    if ex_ws_id:
-                        ws_row = await _fetch_workspace_row(cur, str(ex_ws_id))
-                        if ws_row:
-                            ws_status = ws_row.get("status")
-                            ws_owner_id = str(ws_row.get("user_id") or ex_uid or "")
-                    gen_val = None
                     existing_payload = existing.get("raw_payload")
-                    if (
+                    eff_puid = cleaned_puid or (
+                        str(existing_payload.get("platform_user_id") or "").strip()
+                        if isinstance(existing_payload, dict)
+                        else ""
+                    )
+                    gen_val = existing.get("session_generation")
+                    if gen_val is not None:
+                        gen_val = int(gen_val)
+                    elif (
                         isinstance(existing_payload, dict)
                         and existing_payload.get("generation") is not None
                     ):
@@ -544,20 +636,106 @@ async def _register_and_resolve_inbound_once(
                             gen_part = ext_tid.rsplit(":gen:", 1)[-1]
                             if gen_part.isdigit():
                                 gen_val = int(gen_part)
-                    pending_int = None
-                    if ex_uid:
+
+                    # Re-verify identity on replay
+                    ex_uid = existing.get("dalton_user_id")
+                    if eff_puid:
                         await cur.execute(
                             """
-                            SELECT pending_interrupt
-                            FROM dalton_channel_session_generations
-                            WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                            SELECT * FROM dalton_channel_identities
+                            WHERE platform = %s AND platform_user_id = %s
                             """,
-                            (cleaned_platform, existing["thread_scope_key"], ex_uid),
+                            (cleaned_platform, eff_puid),
                         )
-                        gen_row = await cur.fetchone()
-                        if gen_row:
+                        id_replay = await cur.fetchone()
+                        if not id_replay or (
+                            ex_uid and str(id_replay["user_id"]) != str(ex_uid)
+                        ):
+                            return _serialize_inbound_row(
+                                existing,
+                                existing_status=existing["status"],
+                                linked=False,
+                                allowed=False,
+                                deny_reason="not_linked",
+                                generation=gen_val,
+                            )
+                        ex_uid = str(id_replay["user_id"])
+
+                    if not ex_uid:
+                        return _serialize_inbound_row(
+                            existing,
+                            existing_status=existing["status"],
+                            linked=False,
+                            allowed=False,
+                            deny_reason="not_linked",
+                            generation=gen_val,
+                        )
+
+                    ex_tier = await get_user_tier(ex_uid)
+                    ex_chat_type = str(
+                        existing.get("chat_type") or cleaned_chat_type
+                    ).strip().lower()
+                    if ex_chat_type == "group" and (
+                        ex_tier == "external" or cleaned_platform == "weixin"
+                    ):
+                        return _serialize_inbound_row(
+                            existing,
+                            existing_status=existing["status"],
+                            linked=True,
+                            allowed=False,
+                            deny_reason="external_member_group_forbidden",
+                            user_tier=ex_tier,
+                            generation=gen_val,
+                        )
+
+                    # Re-verify write permission on the original target workspace (never re-route replay to Home)
+                    ex_ws_id = existing.get("workspace_id")
+                    ws_status = None
+                    ws_owner_id = ex_uid
+                    home_ws_id = get_home_workspace_id(ex_uid)
+                    if ex_ws_id:
+                        if normalize_uuid(ex_ws_id) != normalize_uuid(home_ws_id):
+                            ok, deny_reason, ws_row = (
+                                await _verify_workspace_write_permission(
+                                    cur, str(ex_ws_id), ex_uid, conn=owned_conn
+                                )
+                            )
+                            if not ok or ws_row is None:
+                                return _serialize_inbound_row(
+                                    existing,
+                                    existing_status=existing["status"],
+                                    linked=True,
+                                    allowed=False,
+                                    deny_reason=deny_reason
+                                    or "workspace_write_denied",
+                                    user_tier=ex_tier,
+                                    generation=gen_val,
+                                )
+                            ws_status = ws_row.get("status")
+                            ws_owner_id = str(ws_row.get("user_id") or ex_uid or "")
+                        else:
+                            ws_row = await _fetch_workspace_row(cur, str(ex_ws_id))
+                            if ws_row:
+                                ws_status = ws_row.get("status")
+                                ws_owner_id = str(
+                                    ws_row.get("user_id") or ex_uid or ""
+                                )
+
+                    pending_int = existing.get("pending_interrupt_snapshot")
+                    await cur.execute(
+                        """
+                        SELECT generation, pending_interrupt
+                        FROM dalton_channel_session_generations
+                        WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                        """,
+                        (cleaned_platform, existing["thread_scope_key"], ex_uid),
+                    )
+                    gen_row = await cur.fetchone()
+                    if gen_row:
+                        cur_gen = int(gen_row.get("generation") or 1)
+                        if gen_val is None or cur_gen == gen_val:
                             pending_int = gen_row.get("pending_interrupt")
-                    ex_tier = await get_user_tier(ex_uid) if ex_uid else None
+
                     return _serialize_inbound_row(
                         existing,
                         existing_status=existing["status"],
@@ -639,26 +817,13 @@ async def _register_and_resolve_inbound_once(
                 if cleaned_chat_type == "group":
                     await _acquire_group_chat_lock(cur, cleaned_platform, cleaned_address)
 
-                # Ensure session generation row exists
-                await cur.execute(
-                    """
-                    INSERT INTO dalton_channel_session_generations (
-                        platform, scope_key, dalton_user_id, generation
-                    )
-                    VALUES (%s, %s, %s, 1)
-                    ON CONFLICT (platform, scope_key, dalton_user_id) DO NOTHING
-                    """,
-                    (cleaned_platform, cleaned_scope, dalton_user_id),
+                # Lock personal session generation row and evaluate 6-hour inactivity / legacy initialization
+                gen_row, inserted_new, db_now = await _lock_or_create_session_row(
+                    cur,
+                    platform=cleaned_platform,
+                    scope_key=cleaned_scope,
+                    dalton_user_id=dalton_user_id,
                 )
-                await cur.execute(
-                    """
-                    SELECT generation, override_workspace_id, pending_interrupt
-                    FROM dalton_channel_session_generations
-                    WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
-                    """,
-                    (cleaned_platform, cleaned_scope, dalton_user_id),
-                )
-                gen_row = dict(await cur.fetchone())
                 generation = int(gen_row["generation"])
                 override_ws_id = (
                     str(gen_row["override_workspace_id"])
@@ -666,83 +831,62 @@ async def _register_and_resolve_inbound_once(
                     else None
                 )
                 pending_interrupt = gen_row.get("pending_interrupt")
+                selection_init_at = gen_row.get("selection_initialized_at")
+                last_activity_at = gen_row.get("last_conversation_activity_at")
 
-                # 4. Resolve target workspace & write permission
+                if selection_init_at is None:
+                    if not inserted_new and (
+                        override_ws_id is not None or cleaned_chat_type == "group"
+                    ):
+                        generation += 1
+                        pending_interrupt = None
+                    override_ws_id = None
+                elif _is_session_expired(last_activity_at, db_now):
+                    if override_ws_id is not None:
+                        override_ws_id = None
+                        generation += 1
+                        pending_interrupt = None
+
+                if (
+                    isinstance(pending_interrupt, dict)
+                    and pending_interrupt.get("generation") is not None
+                    and int(pending_interrupt["generation"]) != generation
+                ):
+                    pending_interrupt = None
+
+                # 4. Resolve target workspace & write permission (personal selection for both DM and Group)
                 target_ws_id: str | None = None
                 workspace_status: str | None = None
                 workspace_owner_id: str | None = None
 
-                if cleaned_chat_type == "group":
-                    await cur.execute(
-                        """
-                        SELECT workspace_id FROM dalton_channel_chat_bindings
-                        WHERE platform = %s AND chat_address = %s
-                        """,
-                        (cleaned_platform, cleaned_address),
-                    )
-                    chat_binding = await cur.fetchone()
-                    bound_ws_id = (
-                        str(chat_binding["workspace_id"])
-                        if chat_binding and chat_binding.get("workspace_id")
-                        else None
-                    )
-                    if bound_ws_id:
-                        ok, deny_reason, ws_row = (
-                            await _verify_workspace_write_permission(
-                                cur, bound_ws_id, dalton_user_id, conn=owned_conn
-                            )
+                if override_ws_id:
+                    ok, deny_reason, ws_row = (
+                        await _verify_workspace_write_permission(
+                            cur, override_ws_id, dalton_user_id, conn=owned_conn
                         )
-                        if not ok or ws_row is None:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_channel_inbound_events
-                                SET dalton_user_id = %s, status = 'ignored', updated_at = NOW()
-                                WHERE platform = %s AND message_id = %s
-                                RETURNING *
-                                """,
-                                (dalton_user_id, cleaned_platform, cleaned_msg_id),
-                            )
-                            inbound_row = dict(await cur.fetchone())
-                            return _serialize_inbound_row(
-                                inbound_row,
-                                existing_status=None,
-                                linked=True,
-                                allowed=False,
-                                deny_reason=deny_reason or "workspace_write_denied",
-                                user_tier=user_tier,
-                            )
-                        target_ws_id = str(ws_row["workspace_id"])
-                        workspace_status = ws_row.get("status")
-                        workspace_owner_id = str(ws_row["user_id"])
-                else:
-                    if override_ws_id:
-                        ok, deny_reason, ws_row = (
-                            await _verify_workspace_write_permission(
-                                cur, override_ws_id, dalton_user_id, conn=owned_conn
-                            )
+                    )
+                    if not ok or ws_row is None:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET dalton_user_id = %s, status = 'ignored', updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            RETURNING *
+                            """,
+                            (dalton_user_id, cleaned_platform, cleaned_msg_id),
                         )
-                        if not ok or ws_row is None:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_channel_inbound_events
-                                SET dalton_user_id = %s, status = 'ignored', updated_at = NOW()
-                                WHERE platform = %s AND message_id = %s
-                                RETURNING *
-                                """,
-                                (dalton_user_id, cleaned_platform, cleaned_msg_id),
-                            )
-                            inbound_row = dict(await cur.fetchone())
-                            return _serialize_inbound_row(
-                                inbound_row,
-                                existing_status=None,
-                                linked=True,
-                                allowed=False,
-                                deny_reason=deny_reason or "workspace_write_denied",
-                                user_tier=user_tier,
-                            )
-                        target_ws_id = str(ws_row["workspace_id"])
-                        workspace_status = ws_row.get("status")
-                        workspace_owner_id = str(ws_row["user_id"])
+                        inbound_row = dict(await cur.fetchone())
+                        return _serialize_inbound_row(
+                            inbound_row,
+                            existing_status=None,
+                            linked=True,
+                            allowed=False,
+                            deny_reason=deny_reason or "workspace_write_denied",
+                            user_tier=user_tier,
+                        )
+                    target_ws_id = str(ws_row["workspace_id"])
+                    workspace_status = ws_row.get("status")
+                    workspace_owner_id = str(ws_row["user_id"])
 
                 if target_ws_id is None:
                     home_ws_id = get_home_workspace_id(dalton_user_id)
@@ -752,6 +896,33 @@ async def _register_and_resolve_inbound_once(
                     workspace_owner_id = (
                         str(home_row["user_id"]) if home_row else dalton_user_id
                     )
+
+                # Update session row with initialized selection and activity timestamp
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_session_generations
+                    SET generation = %s,
+                        override_workspace_id = %s,
+                        pending_interrupt = %s,
+                        selection_initialized_at = COALESCE(selection_initialized_at, %s),
+                        last_conversation_activity_at = %s,
+                        updated_at = %s
+                    WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (
+                        generation,
+                        override_ws_id,
+                        Jsonb(pending_interrupt)
+                        if pending_interrupt is not None
+                        else None,
+                        db_now,
+                        db_now,
+                        db_now,
+                        cleaned_platform,
+                        cleaned_scope,
+                        dalton_user_id,
+                    ),
+                )
 
                 # 5. Compute external_thread_id and update inbound row
                 external_thread_id = format_external_thread_id(
@@ -768,6 +939,8 @@ async def _register_and_resolve_inbound_once(
                     SET dalton_user_id = %s,
                         workspace_id = %s,
                         external_thread_id = %s,
+                        session_generation = %s,
+                        pending_interrupt_snapshot = %s,
                         raw_payload = %s,
                         updated_at = NOW()
                     WHERE platform = %s AND message_id = %s
@@ -777,6 +950,10 @@ async def _register_and_resolve_inbound_once(
                         dalton_user_id,
                         target_ws_id,
                         external_thread_id,
+                        generation,
+                        Jsonb(pending_interrupt)
+                        if pending_interrupt is not None
+                        else None,
                         Jsonb(payload_dict),
                         cleaned_platform,
                         cleaned_msg_id,
@@ -899,7 +1076,7 @@ async def _bind_identity_in_tx(
     weixin_context_token: str | None = None,
 ) -> int:
     """Bind `(user_id, platform)` to `platform_user_id`, advance existing generations, and initialize settings."""
-    # Lock order (same as update_user_channel_settings): personal settings rows
+    # Lock order (same as update_user_channel_settings): personal settings locks
     # first, then session generation rows. Lock the binder's row and every
     # displaced user's row, sorted, before touching any generation row; otherwise
     # a concurrent settings save (settings row -> group lock -> generation rows)
@@ -913,6 +1090,10 @@ async def _bind_identity_in_tx(
     )
     lock_uids = sorted({user_id, *(str(r["user_id"]) for r in await cur.fetchall())})
     for lock_uid in lock_uids:
+        await cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (f"dalton_user_settings:{lock_uid}",),
+        )
         await cur.execute(
             """
             SELECT 1 FROM dalton_channel_user_settings
@@ -934,10 +1115,21 @@ async def _bind_identity_in_tx(
         old_uid = str(d_row["user_id"])
         await cur.execute(
             """
+            SELECT scope_key FROM dalton_channel_session_generations
+            WHERE platform = %s AND dalton_user_id = %s
+            ORDER BY scope_key
+            FOR UPDATE
+            """,
+            (platform, old_uid),
+        )
+        await cur.execute(
+            """
             UPDATE dalton_channel_session_generations
             SET generation = generation + 1,
                 override_workspace_id = NULL,
                 pending_interrupt = NULL,
+                selection_initialized_at = NOW(),
+                last_conversation_activity_at = NULL,
                 updated_at = NOW()
             WHERE platform = %s AND dalton_user_id = %s
             """,
@@ -971,10 +1163,21 @@ async def _bind_identity_in_tx(
     # Advance any existing session_generations rows for (platform, user_id)
     await cur.execute(
         """
+        SELECT scope_key FROM dalton_channel_session_generations
+        WHERE platform = %s AND dalton_user_id = %s
+        ORDER BY scope_key
+        FOR UPDATE
+        """,
+        (platform, user_id),
+    )
+    await cur.execute(
+        """
         UPDATE dalton_channel_session_generations
         SET generation = generation + 1,
             override_workspace_id = NULL,
             pending_interrupt = NULL,
+            selection_initialized_at = NOW(),
+            last_conversation_activity_at = NOW(),
             updated_at = NOW()
         WHERE platform = %s AND dalton_user_id = %s
         """,
@@ -985,9 +1188,10 @@ async def _bind_identity_in_tx(
     await cur.execute(
         """
         INSERT INTO dalton_channel_session_generations (
-            platform, scope_key, dalton_user_id, generation, override_workspace_id, pending_interrupt
+            platform, scope_key, dalton_user_id, generation, override_workspace_id,
+            pending_interrupt, selection_initialized_at, last_conversation_activity_at
         )
-        VALUES (%s, %s, %s, 1, NULL, NULL)
+        VALUES (%s, %s, %s, 1, NULL, NULL, NOW(), NOW())
         ON CONFLICT (platform, scope_key, dalton_user_id) DO NOTHING
         """,
         (platform, dm_scope, user_id),
@@ -1153,6 +1357,10 @@ async def _consume_bind_code_or_unbind_once(
                     # Lock personal settings row FIRST (matching bind & update_user_channel_settings lock order)
                     # before deleting identity row or touching session generation rows.
                     await cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_user_settings:{target_uid}",),
+                    )
+                    await cur.execute(
                         """
                         SELECT version, apps FROM dalton_channel_user_settings
                         WHERE user_id = %s FOR UPDATE
@@ -1213,23 +1421,25 @@ async def _consume_bind_code_or_unbind_once(
                                 ),
                             )
 
-                    # Deactivate active thread watches on this platform
+                    # Lock and update dalton_channel_session_generations BEFORE dalton_channel_thread_watches
+                    # (matching global lock order: settings -> identities -> session_generations -> thread_watches).
                     await cur.execute(
                         """
-                        UPDATE dalton_channel_thread_watches
-                        SET watch_active = FALSE, updated_at = NOW()
-                        WHERE dalton_user_id = %s AND platform = %s AND watch_active = TRUE
+                        SELECT scope_key FROM dalton_channel_session_generations
+                        WHERE platform = %s AND dalton_user_id = %s
+                        ORDER BY scope_key
+                        FOR UPDATE
                         """,
-                        (target_uid, cleaned_platform),
+                        (cleaned_platform, target_uid),
                     )
-
-                    # Never delete dalton_channel_session_generations rows; increment generation + 1
                     await cur.execute(
                         """
                         UPDATE dalton_channel_session_generations
                         SET generation = generation + 1,
                             override_workspace_id = NULL,
                             pending_interrupt = NULL,
+                            selection_initialized_at = NOW(),
+                            last_conversation_activity_at = NULL,
                             updated_at = NOW()
                         WHERE platform = %s AND dalton_user_id = %s
                         RETURNING scope_key, generation
@@ -1240,6 +1450,25 @@ async def _consume_bind_code_or_unbind_once(
                         str(r["scope_key"]): int(r["generation"])
                         for r in await cur.fetchall()
                     }
+
+                    # Deactivate active thread watches on this platform AFTER locking session_generations
+                    await cur.execute(
+                        """
+                        SELECT thread_id FROM dalton_channel_thread_watches
+                        WHERE dalton_user_id = %s AND platform = %s AND watch_active = TRUE
+                        ORDER BY thread_id
+                        FOR UPDATE
+                        """,
+                        (target_uid, cleaned_platform),
+                    )
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_thread_watches
+                        SET watch_active = FALSE, updated_at = NOW()
+                        WHERE dalton_user_id = %s AND platform = %s AND watch_active = TRUE
+                        """,
+                        (target_uid, cleaned_platform),
+                    )
                     return {
                         "ok": True,
                         "user_id": target_uid,
@@ -1253,7 +1482,7 @@ async def _consume_bind_code_or_unbind_once(
 
 
 # ---------------------------------------------------------------------------
-# I-3: Session Commands (/workspace, /new, /stop)
+# I-3: Session Commands (/workspace, /main, /<workspace_name>, /new, /stop)
 # ---------------------------------------------------------------------------
 
 
@@ -1309,51 +1538,129 @@ async def execute_session_command(
     *,
     cmd: str,
     platform: str,
-    dalton_user_id: str,
+    dalton_user_id: str | None = None,
+    platform_user_id: str | None = None,
     chat_type: str = "dm",
     chat_address: str | None = None,
     chat_id: str | None = None,
     chat_name: str | None = None,
     scope_key: str,
+    message_id: str | None = None,
+    request_key: str | None = None,
+    raw_payload: dict[str, Any] | None = None,
+    weixin_context_token: str | None = None,
     workspace_id: str | None = None,
     workspace_query: str | None = None,
+    target_kind: str | None = None,
     external_thread_id: str | None = None,
+    is_internal_query: bool = False,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """I-3: Handle `workspace_list`, `workspace_switch`, `new`, and `stop`."""
+    """I-3: Atomically execute `workspace_list`, `workspace_switch`, `new`, and `stop` with inbound idempotency."""
     cleaned_cmd = str(cmd or "").strip().lower()
-    if cleaned_cmd in ("workspace_switch", "new"):
-        return await _run_tx_with_retry(
-            f"execute_session_command:{cleaned_cmd}",
-            conn,
-            lambda attempt_conn: _execute_session_command_once(
-                cmd=cmd,
-                platform=platform,
-                dalton_user_id=dalton_user_id,
-                chat_type=chat_type,
-                chat_address=chat_address,
-                chat_id=chat_id,
-                chat_name=chat_name,
-                scope_key=scope_key,
-                workspace_id=workspace_id,
-                workspace_query=workspace_query,
-                external_thread_id=external_thread_id,
-                conn=attempt_conn,
-            ),
+    return await _run_tx_with_retry(
+        f"execute_session_command:{cleaned_cmd}",
+        conn,
+        lambda attempt_conn: _execute_session_command_once(
+            cmd=cmd,
+            platform=platform,
+            dalton_user_id=dalton_user_id,
+            platform_user_id=platform_user_id,
+            chat_type=chat_type,
+            chat_address=chat_address,
+            chat_id=chat_id,
+            chat_name=chat_name,
+            scope_key=scope_key,
+            message_id=message_id,
+            request_key=request_key,
+            raw_payload=raw_payload,
+            weixin_context_token=weixin_context_token,
+            workspace_id=workspace_id,
+            workspace_query=workspace_query,
+            target_kind=target_kind,
+            external_thread_id=external_thread_id,
+            is_internal_query=is_internal_query,
+            conn=attempt_conn,
+        ),
+    )
+
+
+async def _upsert_command_inbound_row(
+    cur: Any,
+    *,
+    platform: str,
+    message_id: str,
+    request_key: str,
+    chat_type: str,
+    chat_address: str,
+    scope_key: str,
+    dalton_user_id: str | None,
+    workspace_id: str | None,
+    external_thread_id: str | None,
+    session_generation: int | None,
+    thread_id: str | None,
+    run_id: str | None,
+    status: str,
+    command_request: dict[str, Any],
+    command_result: dict[str, Any],
+    command_effect_status: str,
+    command_reply_pending: bool,
+    raw_payload: dict[str, Any],
+) -> None:
+    await cur.execute(
+        """
+        INSERT INTO dalton_channel_inbound_events (
+            platform, message_id, request_key, chat_type,
+            chat_address, thread_scope_key, dalton_user_id,
+            workspace_id, external_thread_id, session_generation,
+            thread_id, run_id, status, fallback_pending,
+            raw_payload, event_kind, command_request, command_result,
+            command_effect_status, command_reply_pending, updated_at
         )
-    return await _execute_session_command_once(
-        cmd=cmd,
-        platform=platform,
-        dalton_user_id=dalton_user_id,
-        chat_type=chat_type,
-        chat_address=chat_address,
-        chat_id=chat_id,
-        chat_name=chat_name,
-        scope_key=scope_key,
-        workspace_id=workspace_id,
-        workspace_query=workspace_query,
-        external_thread_id=external_thread_id,
-        conn=conn,
+        VALUES (
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, FALSE,
+            %s, 'command', %s, %s,
+            %s, %s, NOW()
+        )
+        ON CONFLICT (platform, message_id) DO UPDATE SET
+            dalton_user_id = COALESCE(EXCLUDED.dalton_user_id, dalton_channel_inbound_events.dalton_user_id),
+            workspace_id = COALESCE(EXCLUDED.workspace_id, dalton_channel_inbound_events.workspace_id),
+            external_thread_id = COALESCE(EXCLUDED.external_thread_id, dalton_channel_inbound_events.external_thread_id),
+            session_generation = COALESCE(EXCLUDED.session_generation, dalton_channel_inbound_events.session_generation),
+            thread_id = COALESCE(EXCLUDED.thread_id, dalton_channel_inbound_events.thread_id),
+            run_id = COALESCE(EXCLUDED.run_id, dalton_channel_inbound_events.run_id),
+            status = EXCLUDED.status,
+            raw_payload = EXCLUDED.raw_payload,
+            event_kind = 'command',
+            command_request = EXCLUDED.command_request,
+            command_result = EXCLUDED.command_result,
+            command_effect_status = EXCLUDED.command_effect_status,
+            command_reply_pending = EXCLUDED.command_reply_pending,
+            updated_at = NOW()
+        """,
+        (
+            platform,
+            message_id,
+            request_key,
+            chat_type,
+            chat_address,
+            scope_key,
+            dalton_user_id,
+            normalize_uuid(workspace_id) if workspace_id else None,
+            external_thread_id,
+            session_generation,
+            normalize_uuid(thread_id) if thread_id else None,
+            run_id,
+            status,
+            Jsonb(raw_payload),
+            Jsonb(command_request),
+            Jsonb(command_result),
+            command_effect_status,
+            command_reply_pending,
+        ),
     )
 
 
@@ -1361,150 +1668,431 @@ async def _execute_session_command_once(
     *,
     cmd: str,
     platform: str,
-    dalton_user_id: str,
+    dalton_user_id: str | None = None,
+    platform_user_id: str | None = None,
     chat_type: str = "dm",
     chat_address: str | None = None,
     chat_id: str | None = None,
     chat_name: str | None = None,
     scope_key: str,
+    message_id: str | None = None,
+    request_key: str | None = None,
+    raw_payload: dict[str, Any] | None = None,
+    weixin_context_token: str | None = None,
     workspace_id: str | None = None,
     workspace_query: str | None = None,
+    target_kind: str | None = None,
     external_thread_id: str | None = None,
+    is_internal_query: bool = False,
     conn: Any = None,
 ) -> dict[str, Any]:
     cleaned_cmd = str(cmd or "").strip().lower()
+    if cleaned_cmd not in ("workspace_list", "workspace_switch", "new", "stop"):
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported session command: {cmd!r}"
+        )
+
     cleaned_platform = str(platform or "").strip().lower()
     cleaned_uid = str(dalton_user_id or "").strip()
+    cleaned_puid = str(platform_user_id or "").strip()
     cleaned_chat_type = str(chat_type or "dm").strip().lower()
     cleaned_scope = str(scope_key or "").strip()
     cleaned_address = str(chat_address or f"{cleaned_platform}:@me").strip()
+    cleaned_msg_id = str(message_id or "").strip() or None
+    cleaned_target_kind = str(target_kind or "").strip().lower() or None
 
-    user_tier = await get_user_tier(cleaned_uid)
-    if cleaned_chat_type == "group" and (
-        user_tier == "external" or cleaned_platform == "weixin"
-    ):
-        return {"ok": False, "deny_reason": "external_member_group_forbidden"}
+    req_uuid = (
+        normalize_uuid(request_key)
+        or (
+            str(uuid5(DALTON_CHANNEL_NAMESPACE, f"{cleaned_platform}:{cleaned_msg_id}"))
+            if cleaned_msg_id
+            else str(uuid5(DALTON_CHANNEL_NAMESPACE, f"{cleaned_platform}:{cleaned_scope}:{cleaned_cmd}"))
+        )
+    )
+    payload_dict = dict(raw_payload or {})
+    if cleaned_puid:
+        payload_dict["platform_user_id"] = cleaned_puid
+    if weixin_context_token and "weixin_context_token" not in payload_dict:
+        payload_dict["weixin_context_token"] = weixin_context_token
 
-    home_ws_id = get_home_workspace_id(cleaned_uid)
+    cmd_req_dict: dict[str, Any] = {
+        "cmd": cleaned_cmd,
+        "workspace_id": workspace_id,
+        "workspace_query": workspace_query,
+        "target_kind": cleaned_target_kind,
+        "external_thread_id": external_thread_id,
+    }
 
-    if cleaned_cmd == "workspace_list":
-        writable_names = await _get_writable_workspace_names(cleaned_uid)
-        async with get_db_connection(conn) as owned_conn:
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                current_ws_id = home_ws_id
-                if cleaned_chat_type == "group":
+                existing_inbound: dict[str, Any] | None = None
+                orig_uid = ""
+                orig_puid = ""
+                if cleaned_msg_id:
                     await cur.execute(
-                        """
-                        SELECT workspace_id FROM dalton_channel_chat_bindings
-                        WHERE platform = %s AND chat_address = %s
-                        """,
-                        (cleaned_platform, cleaned_address),
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_inbound:{cleaned_platform}:{cleaned_msg_id}",),
                     )
-                    b_row = await cur.fetchone()
-                    if b_row and b_row.get("workspace_id"):
-                        current_ws_id = str(b_row["workspace_id"])
-                else:
                     await cur.execute(
                         """
-                        SELECT override_workspace_id FROM dalton_channel_session_generations
+                        SELECT * FROM dalton_channel_inbound_events
+                        WHERE platform = %s AND message_id = %s
+                        """,
+                        (cleaned_platform, cleaned_msg_id),
+                    )
+                    ex_row = await cur.fetchone()
+                    if ex_row:
+                        existing_inbound = dict(ex_row)
+                        orig_uid = str(
+                            existing_inbound.get("dalton_user_id") or ""
+                        ).strip()
+                        if isinstance(existing_inbound.get("raw_payload"), dict):
+                            orig_puid = str(
+                                existing_inbound["raw_payload"].get("platform_user_id")
+                                or ""
+                            ).strip()
+                            if not cleaned_puid and orig_puid:
+                                cleaned_puid = orig_puid
+                                payload_dict["platform_user_id"] = cleaned_puid
+
+                async def _deny_and_ignore_command(
+                    res_payload: dict[str, Any], *, uid_val: str | None
+                ) -> dict[str, Any]:
+                    if cleaned_msg_id:
+                        await _upsert_command_inbound_row(
+                            cur,
+                            platform=cleaned_platform,
+                            message_id=cleaned_msg_id,
+                            request_key=req_uuid,
+                            chat_type=cleaned_chat_type,
+                            chat_address=cleaned_address,
+                            scope_key=cleaned_scope,
+                            dalton_user_id=uid_val,
+                            workspace_id=None,
+                            external_thread_id=None,
+                            session_generation=None,
+                            thread_id=None,
+                            run_id=None,
+                            status="ignored",
+                            command_request=cmd_req_dict,
+                            command_result=res_payload,
+                            command_effect_status="done",
+                            command_reply_pending=False,
+                            raw_payload=payload_dict,
+                        )
+                    return res_payload
+
+                # 1. Identity verification (including re-authorization on redelivery / startup recovery)
+                if orig_puid and cleaned_puid and orig_puid != cleaned_puid:
+                    return await _deny_and_ignore_command(
+                        {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "not_linked",
+                        },
+                        uid_val=None,
+                    )
+
+                if cleaned_puid:
+                    await cur.execute(
+                        """
+                        SELECT * FROM dalton_channel_identities
+                        WHERE platform = %s AND platform_user_id = %s
+                        """,
+                        (cleaned_platform, cleaned_puid),
+                    )
+                    identity = await cur.fetchone()
+                    if not identity:
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            },
+                            uid_val=None,
+                        )
+                    resolved_identity_uid = str(identity["user_id"])
+                    if (orig_uid and orig_uid != resolved_identity_uid) or (
+                        cleaned_uid and cleaned_uid != resolved_identity_uid
+                    ):
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            },
+                            uid_val=None,
+                        )
+                    cleaned_uid = resolved_identity_uid
+                    if weixin_context_token:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_identities
+                            SET weixin_context_token = %s, updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (weixin_context_token, identity["id"]),
+                        )
+                elif cleaned_msg_id or existing_inbound is not None:
+                    check_uid = cleaned_uid or orig_uid
+                    if not check_uid or (
+                        orig_uid and cleaned_uid and orig_uid != cleaned_uid
+                    ):
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            },
+                            uid_val=None,
+                        )
+                    await cur.execute(
+                        """
+                        SELECT * FROM dalton_channel_identities
+                        WHERE user_id = %s AND platform = %s
+                        """,
+                        (check_uid, cleaned_platform),
+                    )
+                    identity = await cur.fetchone()
+                    if not identity:
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            },
+                            uid_val=None,
+                        )
+                    if (
+                        orig_puid
+                        and str(identity.get("platform_user_id") or "").strip()
+                        != orig_puid
+                    ):
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            },
+                            uid_val=None,
+                        )
+                    cleaned_uid = check_uid
+
+                if not cleaned_uid:
+                    return {
+                        "ok": False,
+                        "linked": False,
+                        "allowed": False,
+                        "deny_reason": "not_linked",
+                    }
+
+                # 2. Tier & group chat check
+                user_tier = await get_user_tier(cleaned_uid)
+                if cleaned_chat_type == "group" and (
+                    user_tier == "external" or cleaned_platform == "weixin"
+                ):
+                    return await _deny_and_ignore_command(
+                        {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "deny_reason": "external_member_group_forbidden",
+                        },
+                        uid_val=cleaned_uid,
+                    )
+
+                home_ws_id = get_home_workspace_id(cleaned_uid)
+
+                # 3. Idempotent return for a command that already has a result for this message_id.
+                # Success re-checks live write permission. Any other stored result is final.
+                if existing_inbound is not None and isinstance(
+                    existing_inbound.get("command_result"), dict
+                ):
+                    stored_res = dict(existing_inbound["command_result"])
+                    if stored_res.get("ok") is True:
+                        if cleaned_cmd == "workspace_list":
+                            writable_names = await _get_writable_workspace_names(
+                                cleaned_uid
+                            )
+                            stored_res["workspaces"] = [
+                                {"workspace_id": wid, "name": name}
+                                for wid, name in writable_names.items()
+                            ]
+                            cur_wid = str(
+                                stored_res.get("current_workspace_id") or ""
+                            ).strip()
+                            if (
+                                not stored_res.get("is_home")
+                                and cur_wid
+                                and normalize_uuid(cur_wid)
+                                != normalize_uuid(home_ws_id)
+                            ):
+                                if cur_wid in writable_names:
+                                    stored_res["current_workspace_name"] = (
+                                        writable_names[cur_wid]
+                                    )
+                                else:
+                                    ok, _, ws_row = (
+                                        await _verify_workspace_write_permission(
+                                            cur,
+                                            cur_wid,
+                                            cleaned_uid,
+                                            conn=owned_conn,
+                                        )
+                                    )
+                                    if not ok or ws_row is None:
+                                        stored_res["current_workspace_id"] = (
+                                            home_ws_id
+                                        )
+                                        stored_res["current_workspace_name"] = (
+                                            CHIEF_OF_STAFF_DISPLAY_NAME
+                                        )
+                                        stored_res["is_home"] = True
+                        else:
+                            target_ws_id = stored_res.get("override_workspace_id") or (
+                                None
+                                if stored_res.get("is_home")
+                                else stored_res.get("workspace_id")
+                            )
+                            if target_ws_id and normalize_uuid(
+                                target_ws_id
+                            ) != normalize_uuid(home_ws_id):
+                                ok, perm_deny, _ = (
+                                    await _verify_workspace_write_permission(
+                                        cur,
+                                        str(target_ws_id),
+                                        cleaned_uid,
+                                        conn=owned_conn,
+                                    )
+                                )
+                                if not ok:
+                                    denied_dup = await _deny_and_ignore_command(
+                                        {
+                                            "ok": False,
+                                            "linked": True,
+                                            "allowed": False,
+                                            "dalton_user_id": cleaned_uid,
+                                            "user_tier": user_tier,
+                                            "deny_reason": perm_deny
+                                            or "workspace_write_denied",
+                                        },
+                                        uid_val=cleaned_uid,
+                                    )
+                                    return {
+                                        **denied_dup,
+                                        "duplicate": True,
+                                        "command_effect_status": "done",
+                                        "command_reply_pending": False,
+                                        "existing_status": "ignored",
+                                    }
+
+                        eff_stored_status = (
+                            existing_inbound.get("command_effect_status") or "done"
+                        )
+                        if eff_stored_status == "pending_cancel" and not (
+                            stored_res.get("thread_id") and stored_res.get("run_id")
+                        ):
+                            eff_stored_status = "done"
+                            if cleaned_msg_id:
+                                await cur.execute(
+                                    """
+                                    UPDATE dalton_channel_inbound_events
+                                    SET command_effect_status = 'done',
+                                        updated_at = NOW()
+                                    WHERE platform = %s AND message_id = %s
+                                    """,
+                                    (cleaned_platform, cleaned_msg_id),
+                                )
+                        return {
+                            **stored_res,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "duplicate": True,
+                            "command_effect_status": eff_stored_status,
+                            "command_reply_pending": bool(
+                                existing_inbound.get("command_reply_pending", False)
+                            ),
+                            "existing_status": existing_inbound.get("status"),
+                        }
+
+                    # A stored denial or other non-success is final for this message_id.
+                    # Resending it restores an unsent reply and does not run the command again,
+                    # so a later rename or workspace switch cannot turn the old event into a new selection.
+                    return {
+                        **stored_res,
+                        "dalton_user_id": cleaned_uid,
+                        "user_tier": user_tier,
+                        "duplicate": True,
+                        "command_effect_status": existing_inbound.get(
+                            "command_effect_status"
+                        )
+                        or "done",
+                        "command_reply_pending": bool(
+                            existing_inbound.get("command_reply_pending", False)
+                        ),
+                        "existing_status": existing_inbound.get("status"),
+                    }
+
+                # Read-only internal query path (e.g. GET /agent/session when message_id is omitted)
+                if cleaned_cmd == "workspace_list" and is_internal_query and not cleaned_msg_id:
+                    writable_names = await _get_writable_workspace_names(cleaned_uid)
+                    await cur.execute(
+                        """
+                        SELECT generation, override_workspace_id,
+                               last_conversation_activity_at, selection_initialized_at
+                        FROM dalton_channel_session_generations
                         WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
                         """,
                         (cleaned_platform, cleaned_scope, cleaned_uid),
                     )
                     g_row = await cur.fetchone()
-                    if g_row and g_row.get("override_workspace_id"):
-                        current_ws_id = str(g_row["override_workspace_id"])
-
-        return {
-            "ok": True,
-            "current_workspace_id": current_ws_id,
-            "home_workspace_id": home_ws_id,
-            "workspaces": [
-                {"workspace_id": wid, "name": name}
-                for wid, name in writable_names.items()
-            ],
-        }
-
-    if cleaned_cmd == "workspace_switch":
-        raw_target = str(workspace_id or workspace_query or "").strip()
-        is_home_target = raw_target.lower() in ("", "home", "none", "null") or (
-            normalize_uuid(raw_target) == home_ws_id
-        )
-        resolved_ws_id: str | None = None
-        if not is_home_target:
-            candidate_uuid = normalize_uuid(raw_target)
-            if candidate_uuid:
-                resolved_ws_id = candidate_uuid
-            else:
-                writable_names = await _get_writable_workspace_names(cleaned_uid)
-                items = list(writable_names.items())
-                if raw_target.isdigit():
-                    idx = int(raw_target) - 1
-                    if 0 <= idx < len(items):
-                        resolved_ws_id = items[idx][0]
-                if resolved_ws_id is None:
-                    for wid, wname in items:
-                        if wname.strip().lower() == raw_target.lower():
-                            resolved_ws_id = wid
-                            break
-                if resolved_ws_id is None:
-                    return {"ok": False, "deny_reason": "workspace_not_found"}
-
-        async with get_db_connection(conn) as owned_conn:
-            async with owned_conn.transaction():
-                async with owned_conn.cursor(row_factory=dict_row) as cur:
-                    if resolved_ws_id is not None:
-                        ok, deny_reason, ws_row = (
-                            await _verify_workspace_write_permission(
-                                cur, resolved_ws_id, cleaned_uid, conn=owned_conn
-                            )
+                    db_now = await _fetch_db_now(cur)
+                    eff_override_ws: str | None = None
+                    gen_val = 1
+                    if g_row:
+                        gen_val = int(g_row.get("generation") or 1)
+                        raw_ov = (
+                            str(g_row["override_workspace_id"])
+                            if g_row.get("override_workspace_id")
+                            else None
                         )
-                        if not ok or ws_row is None:
-                            return {
-                                "ok": False,
-                                "deny_reason": deny_reason or "workspace_write_denied",
-                            }
-                        resolved_ws_id = str(ws_row["workspace_id"])
+                        init_at = g_row.get("selection_initialized_at")
+                        act_at = g_row.get("last_conversation_activity_at")
+                        if init_at is not None and not _is_session_expired(act_at, db_now):
+                            eff_override_ws = raw_ov
+                    current_ws_id = eff_override_ws or home_ws_id
+                    current_ws_name = (
+                        CHIEF_OF_STAFF_DISPLAY_NAME
+                        if eff_override_ws is None
+                        else (writable_names.get(eff_override_ws) or eff_override_ws)
+                    )
+                    return {
+                        "ok": True,
+                        "linked": True,
+                        "allowed": True,
+                        "dalton_user_id": cleaned_uid,
+                        "user_tier": user_tier,
+                        "current_workspace_id": current_ws_id,
+                        "current_workspace_name": current_ws_name,
+                        "is_home": eff_override_ws is None,
+                        "home_workspace_id": home_ws_id,
+                        "generation": gen_val,
+                        "workspaces": [
+                            {"workspace_id": wid, "name": name}
+                            for wid, name in writable_names.items()
+                        ],
+                    }
 
-                    if cleaned_chat_type == "dm":
-                        await cur.execute(
-                            """
-                            INSERT INTO dalton_channel_session_generations (
-                                platform, scope_key, dalton_user_id, generation,
-                                override_workspace_id, pending_interrupt, updated_at
-                            )
-                            VALUES (%s, %s, %s, 2, %s, NULL, NOW())
-                            ON CONFLICT (platform, scope_key, dalton_user_id) DO UPDATE SET
-                                generation = dalton_channel_session_generations.generation + 1,
-                                override_workspace_id = EXCLUDED.override_workspace_id,
-                                pending_interrupt = NULL,
-                                updated_at = NOW()
-                            RETURNING generation
-                            """,
-                            (
-                                cleaned_platform,
-                                cleaned_scope,
-                                cleaned_uid,
-                                resolved_ws_id,
-                            ),
-                        )
-                        new_gen = int((await cur.fetchone())["generation"])
-                        ext_id = format_external_thread_id(
-                            cleaned_platform,
-                            cleaned_scope,
-                            cleaned_uid,
-                            new_gen,
-                            "dm",
-                        )
-                        return {
-                            "ok": True,
-                            "workspace_id": resolved_ws_id or home_ws_id,
-                            "override_workspace_id": resolved_ws_id,
-                            "generation": new_gen,
-                            "external_thread_id": ext_id,
-                        }
-
-                    # Group chat workspace switch
+                if cleaned_chat_type == "group":
                     eff_chat_id = extract_chat_id(
                         cleaned_platform,
                         chat_id=chat_id,
@@ -1516,164 +2104,578 @@ async def _execute_session_command_once(
                         if cleaned_address and not cleaned_address.endswith(":@me")
                         else f"{cleaned_platform}:{eff_chat_id}"
                     )
-                    await _acquire_group_chat_lock(
-                        cur, cleaned_platform, eff_address
-                    )
+                    await _acquire_group_chat_lock(cur, cleaned_platform, eff_address)
+
+                gen_row, inserted_new, db_now = await _lock_or_create_session_row(
+                    cur,
+                    platform=cleaned_platform,
+                    scope_key=cleaned_scope,
+                    dalton_user_id=cleaned_uid,
+                )
+                generation = int(gen_row["generation"])
+                override_ws_id = (
+                    str(gen_row["override_workspace_id"])
+                    if gen_row.get("override_workspace_id")
+                    else None
+                )
+                pending_interrupt = gen_row.get("pending_interrupt")
+                selection_init_at = gen_row.get("selection_initialized_at")
+                last_activity_at = gen_row.get("last_conversation_activity_at")
+                is_uninitialized = selection_init_at is None
+                is_expired = _is_session_expired(last_activity_at, db_now)
+
+                cmd_result: dict[str, Any]
+                effect_status = "done"
+
+                if cleaned_cmd == "workspace_list":
+                    writable_names = await _get_writable_workspace_names(cleaned_uid)
+                    if is_uninitialized:
+                        if not inserted_new and (
+                            override_ws_id is not None or cleaned_chat_type == "group"
+                        ):
+                            generation += 1
+                            pending_interrupt = None
+                        override_ws_id = None
+                    elif is_expired:
+                        if override_ws_id is not None:
+                            override_ws_id = None
+                            generation += 1
+                            pending_interrupt = None
+
                     await cur.execute(
                         """
-                        INSERT INTO dalton_channel_chat_bindings (
-                            platform, chat_address, chat_name, workspace_id,
-                            bound_by_user_id, updated_at
-                        )
-                        VALUES (%s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (platform, chat_address) DO UPDATE SET
-                            workspace_id = EXCLUDED.workspace_id,
-                            chat_name = COALESCE(EXCLUDED.chat_name, dalton_channel_chat_bindings.chat_name),
-                            bound_by_user_id = EXCLUDED.bound_by_user_id,
-                            updated_at = NOW()
+                        UPDATE dalton_channel_session_generations
+                        SET generation = %s,
+                            override_workspace_id = %s,
+                            pending_interrupt = %s,
+                            selection_initialized_at = COALESCE(selection_initialized_at, %s),
+                            last_conversation_activity_at = %s,
+                            updated_at = %s
+                        WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
                         """,
                         (
+                            generation,
+                            override_ws_id,
+                            Jsonb(pending_interrupt)
+                            if pending_interrupt is not None
+                            else None,
+                            db_now,
+                            db_now,
+                            db_now,
                             cleaned_platform,
-                            eff_address,
-                            chat_name,
-                            resolved_ws_id,
+                            cleaned_scope,
                             cleaned_uid,
                         ),
                     )
-                    new_gen = await _advance_group_chat_generations_in_tx(
-                        cur,
-                        platform=cleaned_platform,
-                        chat_id=eff_chat_id,
-                        operator_scope_key=cleaned_scope,
-                        operator_user_id=cleaned_uid,
-                    )
-                    eff_gen = new_gen or 2
-                    ext_id = format_external_thread_id(
-                        cleaned_platform,
-                        cleaned_scope,
-                        cleaned_uid,
-                        eff_gen,
-                        "group",
-                    )
-                    return {
-                        "ok": True,
-                        "workspace_id": resolved_ws_id or home_ws_id,
-                        "bound_workspace_id": resolved_ws_id,
-                        "generation": eff_gen,
-                        "external_thread_id": ext_id,
-                    }
-
-    if cleaned_cmd == "new":
-        async with get_db_connection(conn) as owned_conn:
-            async with owned_conn.transaction():
-                async with owned_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        INSERT INTO dalton_channel_session_generations (
-                            platform, scope_key, dalton_user_id, generation,
-                            pending_interrupt, updated_at
-                        )
-                        VALUES (%s, %s, %s, 2, NULL, NOW())
-                        ON CONFLICT (platform, scope_key, dalton_user_id) DO UPDATE SET
-                            generation = dalton_channel_session_generations.generation + 1,
-                            pending_interrupt = NULL,
-                            updated_at = NOW()
-                        RETURNING generation
-                        """,
-                        (cleaned_platform, cleaned_scope, cleaned_uid),
-                    )
-                    new_gen = int((await cur.fetchone())["generation"])
-                    ext_id = format_external_thread_id(
-                        cleaned_platform,
-                        cleaned_scope,
-                        cleaned_uid,
-                        new_gen,
-                        cleaned_chat_type,
-                    )
-                    return {
-                        "ok": True,
-                        "generation": new_gen,
-                        "external_thread_id": ext_id,
-                    }
-
-    if cleaned_cmd == "stop":
-        async with get_db_connection(conn) as owned_conn:
-            async with owned_conn.cursor(row_factory=dict_row) as cur:
-                ext_id = (external_thread_id or "").strip() or None
-                if not ext_id:
-                    await cur.execute(
-                        """
-                        SELECT generation FROM dalton_channel_session_generations
-                        WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
-                        """,
-                        (cleaned_platform, cleaned_scope, cleaned_uid),
-                    )
-                    g_row = await cur.fetchone()
-                    gen_val = int(g_row["generation"]) if g_row else 1
-                    ext_id = format_external_thread_id(
-                        cleaned_platform,
-                        cleaned_scope,
-                        cleaned_uid,
-                        gen_val,
-                        cleaned_chat_type,
-                    )
-
-                thread_id = await lookup_thread_by_external_id(
-                    cleaned_platform, ext_id, cleaned_uid
-                )
-                if not thread_id:
-                    await cur.execute(
-                        """
-                        SELECT thread_id FROM dalton_channel_inbound_events
-                        WHERE platform = %s AND dalton_user_id = %s
-                          AND external_thread_id = %s AND thread_id IS NOT NULL
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """,
-                        (cleaned_platform, cleaned_uid, ext_id),
-                    )
-                    in_row = await cur.fetchone()
-                    if in_row and in_row.get("thread_id"):
-                        thread_id = str(in_row["thread_id"])
-
-                active_run_id: str | None = None
-                if thread_id:
-                    await cur.execute(
-                        """
-                        SELECT conversation_response_id
-                        FROM conversation_responses
-                        WHERE conversation_thread_id = %s AND status = 'in_progress'
-                        ORDER BY run_seq DESC
-                        LIMIT 1
-                        """,
-                        (thread_id,),
-                    )
-                    r_row = await cur.fetchone()
-                    if r_row and r_row.get("conversation_response_id"):
-                        active_run_id = str(r_row["conversation_response_id"])
+                    current_ws_id = override_ws_id or home_ws_id
+                    if override_ws_id is None:
+                        current_ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
                     else:
+                        current_ws_name = writable_names.get(override_ws_id)
+                        if not current_ws_name:
+                            w_row = await _fetch_workspace_row(cur, override_ws_id)
+                            current_ws_name = (
+                                str(w_row["name"])
+                                if w_row and w_row.get("name")
+                                else override_ws_id
+                            )
+                    ext_id = format_external_thread_id(
+                        cleaned_platform,
+                        cleaned_scope,
+                        cleaned_uid,
+                        generation,
+                        cleaned_chat_type,
+                    )
+                    cmd_result = {
+                        "ok": True,
+                        "linked": True,
+                        "allowed": True,
+                        "dalton_user_id": cleaned_uid,
+                        "user_tier": user_tier,
+                        "current_workspace_id": current_ws_id,
+                        "current_workspace_name": current_ws_name,
+                        "is_home": override_ws_id is None,
+                        "home_workspace_id": home_ws_id,
+                        "generation": generation,
+                        "external_thread_id": ext_id,
+                        "workspaces": [
+                            {"workspace_id": wid, "name": name}
+                            for wid, name in writable_names.items()
+                        ],
+                    }
+
+                elif cleaned_cmd == "workspace_switch":
+                    raw_id = str(workspace_id or "").strip()
+                    raw_query = str(workspace_query or "").strip()
+                    raw_target = raw_id or raw_query
+                    is_home_target = (
+                        cleaned_target_kind == "home"
+                        or (
+                            cleaned_target_kind not in ("shortcut_name", "exact_name")
+                            and (
+                                raw_target.lower()
+                                in ("", "home", "main", "chief of staff", "none", "null")
+                                or normalize_uuid(raw_target) == home_ws_id
+                            )
+                        )
+                    )
+                    resolved_ws_id: str | None = None
+                    resolved_ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
+                    deny_reason: str | None = None
+                    candidates: list[dict[str, str]] | None = None
+
+                    if not is_home_target:
+                        candidate_uuid = (
+                            normalize_uuid(raw_id or raw_target)
+                            if cleaned_target_kind not in ("shortcut_name", "exact_name")
+                            else None
+                        )
+                        if candidate_uuid:
+                            if candidate_uuid == home_ws_id:
+                                is_home_target = True
+                            else:
+                                ok, perm_deny, ws_row = (
+                                    await _verify_workspace_write_permission(
+                                        cur,
+                                        candidate_uuid,
+                                        cleaned_uid,
+                                        conn=owned_conn,
+                                    )
+                                )
+                                if not ok or ws_row is None:
+                                    deny_reason = (
+                                        perm_deny or "workspace_write_denied"
+                                    )
+                                else:
+                                    resolved_ws_id = str(ws_row["workspace_id"])
+                                    resolved_ws_name = str(
+                                        ws_row.get("name") or resolved_ws_id
+                                    )
+                        else:
+                            writable_names = await _get_writable_workspace_names(
+                                cleaned_uid
+                            )
+                            q_exact = raw_target.strip()
+                            q_norm = q_exact.lower()
+                            exact_matches = [
+                                (wid, wname)
+                                for wid, wname in writable_names.items()
+                                if wname.strip() == q_exact
+                            ]
+                            matches = (
+                                exact_matches
+                                if exact_matches
+                                else [
+                                    (wid, wname)
+                                    for wid, wname in writable_names.items()
+                                    if wname.strip().lower() == q_norm
+                                ]
+                            )
+                            if len(matches) > 1:
+                                deny_reason = "workspace_ambiguous"
+                                candidates = [
+                                    {"workspace_id": wid, "name": wname}
+                                    for wid, wname in matches
+                                ]
+                            elif len(matches) == 1:
+                                matched_wid, matched_name = matches[0]
+                                ok, perm_deny, ws_row = (
+                                    await _verify_workspace_write_permission(
+                                        cur,
+                                        matched_wid,
+                                        cleaned_uid,
+                                        conn=owned_conn,
+                                    )
+                                )
+                                if not ok or ws_row is None:
+                                    deny_reason = (
+                                        perm_deny or "workspace_write_denied"
+                                    )
+                                else:
+                                    resolved_ws_id = str(ws_row["workspace_id"])
+                                    resolved_ws_name = str(
+                                        ws_row.get("name")
+                                        or matched_name
+                                        or resolved_ws_id
+                                    )
+                            else:
+                                deny_reason = "workspace_not_found"
+
+                    if deny_reason is not None:
+                        cmd_result = {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "deny_reason": deny_reason,
+                            "workspace_query": raw_target,
+                        }
+                        if candidates is not None:
+                            cmd_result["candidates"] = candidates
+                    else:
+                        if is_uninitialized:
+                            if resolved_ws_id is not None:
+                                switched = True
+                            elif not inserted_new and (
+                                override_ws_id is not None
+                                or cleaned_chat_type == "group"
+                            ):
+                                switched = True
+                            else:
+                                switched = False
+                        elif is_expired:
+                            if override_ws_id is not None or resolved_ws_id is not None:
+                                switched = True
+                            else:
+                                switched = False
+                        else:
+                            switched = normalize_uuid(
+                                override_ws_id
+                            ) != normalize_uuid(resolved_ws_id)
+
+                        if switched:
+                            new_gen = 2 if inserted_new else generation + 1
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_session_generations
+                                SET generation = %s,
+                                    override_workspace_id = %s,
+                                    pending_interrupt = NULL,
+                                    selection_initialized_at = COALESCE(selection_initialized_at, %s),
+                                    last_conversation_activity_at = %s,
+                                    updated_at = %s
+                                WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                                """,
+                                (
+                                    new_gen,
+                                    resolved_ws_id,
+                                    db_now,
+                                    db_now,
+                                    db_now,
+                                    cleaned_platform,
+                                    cleaned_scope,
+                                    cleaned_uid,
+                                ),
+                            )
+                        else:
+                            new_gen = generation
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_session_generations
+                                SET generation = %s,
+                                    override_workspace_id = %s,
+                                    pending_interrupt = %s,
+                                    selection_initialized_at = COALESCE(selection_initialized_at, %s),
+                                    last_conversation_activity_at = %s,
+                                    updated_at = %s
+                                WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                                """,
+                                (
+                                    new_gen,
+                                    resolved_ws_id,
+                                    Jsonb(pending_interrupt)
+                                    if pending_interrupt is not None
+                                    else None,
+                                    db_now,
+                                    db_now,
+                                    db_now,
+                                    cleaned_platform,
+                                    cleaned_scope,
+                                    cleaned_uid,
+                                ),
+                            )
+                        ext_id = format_external_thread_id(
+                            cleaned_platform,
+                            cleaned_scope,
+                            cleaned_uid,
+                            new_gen,
+                            cleaned_chat_type,
+                        )
+                        cmd_result = {
+                            "ok": True,
+                            "linked": True,
+                            "allowed": True,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "workspace_id": resolved_ws_id or home_ws_id,
+                            "workspace_name": resolved_ws_name,
+                            "is_home": resolved_ws_id is None,
+                            "override_workspace_id": resolved_ws_id,
+                            "home_workspace_id": home_ws_id,
+                            "generation": new_gen,
+                            "external_thread_id": ext_id,
+                            "switched": switched,
+                        }
+
+                elif cleaned_cmd == "new":
+                    eff_override_ws = (
+                        None if (is_uninitialized or is_expired) else override_ws_id
+                    )
+                    deny_reason = None
+                    ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
+                    if eff_override_ws is not None:
+                        ok, perm_deny, ws_row = (
+                            await _verify_workspace_write_permission(
+                                cur, eff_override_ws, cleaned_uid, conn=owned_conn
+                            )
+                        )
+                        if not ok or ws_row is None:
+                            deny_reason = perm_deny or "workspace_write_denied"
+                        else:
+                            eff_override_ws = str(ws_row["workspace_id"])
+                            ws_name = str(ws_row.get("name") or eff_override_ws)
+
+                    if deny_reason is not None:
+                        cmd_result = {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "deny_reason": deny_reason,
+                        }
+                    else:
+                        new_gen = 2 if inserted_new else generation + 1
                         await cur.execute(
                             """
-                            SELECT run_id FROM dalton_channel_inbound_events
-                            WHERE thread_id = %s AND status IN ('accepted', 'streaming')
-                              AND run_id IS NOT NULL
-                            ORDER BY created_at DESC
-                            LIMIT 1
+                            UPDATE dalton_channel_session_generations
+                            SET generation = %s,
+                                override_workspace_id = %s,
+                                pending_interrupt = NULL,
+                                selection_initialized_at = COALESCE(selection_initialized_at, %s),
+                                last_conversation_activity_at = %s,
+                                updated_at = %s
+                            WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
                             """,
-                            (thread_id,),
+                            (
+                                new_gen,
+                                eff_override_ws,
+                                db_now,
+                                db_now,
+                                db_now,
+                                cleaned_platform,
+                                cleaned_scope,
+                                cleaned_uid,
+                            ),
                         )
-                        in_run = await cur.fetchone()
-                        if in_run and in_run.get("run_id"):
-                            active_run_id = str(in_run["run_id"])
+                        ext_id = format_external_thread_id(
+                            cleaned_platform,
+                            cleaned_scope,
+                            cleaned_uid,
+                            new_gen,
+                            cleaned_chat_type,
+                        )
+                        cmd_result = {
+                            "ok": True,
+                            "linked": True,
+                            "allowed": True,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "workspace_id": eff_override_ws or home_ws_id,
+                            "workspace_name": ws_name,
+                            "is_home": eff_override_ws is None,
+                            "override_workspace_id": eff_override_ws,
+                            "home_workspace_id": home_ws_id,
+                            "generation": new_gen,
+                            "external_thread_id": ext_id,
+                        }
+
+                else:  # cleaned_cmd == "stop"
+                    expired_switched_to_home = False
+                    if is_uninitialized:
+                        if not inserted_new and (
+                            override_ws_id is not None or cleaned_chat_type == "group"
+                        ):
+                            generation += 1
+                            pending_interrupt = None
+                            expired_switched_to_home = True
+                        override_ws_id = None
+                    elif is_expired:
+                        if override_ws_id is not None:
+                            override_ws_id = None
+                            generation += 1
+                            pending_interrupt = None
+                            expired_switched_to_home = True
+
+                    deny_reason = None
+                    if override_ws_id is not None:
+                        ok, perm_deny, ws_row = (
+                            await _verify_workspace_write_permission(
+                                cur, override_ws_id, cleaned_uid, conn=owned_conn
+                            )
+                        )
+                        if not ok or ws_row is None:
+                            deny_reason = perm_deny or "workspace_write_denied"
+
+                    if deny_reason is not None:
+                        cmd_result = {
+                            "ok": False,
+                            "linked": True,
+                            "allowed": False,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "deny_reason": deny_reason,
+                        }
+                    else:
+                        if expired_switched_to_home:
+                            ext_id = format_external_thread_id(
+                                cleaned_platform,
+                                cleaned_scope,
+                                cleaned_uid,
+                                generation,
+                                cleaned_chat_type,
+                            )
+                        else:
+                            ext_id = (external_thread_id or "").strip() or format_external_thread_id(
+                                cleaned_platform,
+                                cleaned_scope,
+                                cleaned_uid,
+                                generation,
+                                cleaned_chat_type,
+                            )
+
+                        thread_id: str | None = None
+                        active_run_id: str | None = None
+                        if not expired_switched_to_home:
+                            thread_id = await lookup_thread_by_external_id(
+                                cleaned_platform, ext_id, cleaned_uid
+                            )
+                            if not thread_id:
+                                await cur.execute(
+                                    """
+                                    SELECT thread_id FROM dalton_channel_inbound_events
+                                    WHERE platform = %s AND dalton_user_id = %s
+                                      AND external_thread_id = %s AND thread_id IS NOT NULL
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                    """,
+                                    (cleaned_platform, cleaned_uid, ext_id),
+                                )
+                                in_row = await cur.fetchone()
+                                if in_row and in_row.get("thread_id"):
+                                    thread_id = str(in_row["thread_id"])
+
+                            if thread_id:
+                                await cur.execute(
+                                    """
+                                    SELECT conversation_response_id
+                                    FROM conversation_responses
+                                    WHERE conversation_thread_id = %s AND status = 'in_progress'
+                                    ORDER BY run_seq DESC
+                                    LIMIT 1
+                                    """,
+                                    (thread_id,),
+                                )
+                                r_row = await cur.fetchone()
+                                if r_row and r_row.get("conversation_response_id"):
+                                    active_run_id = str(
+                                        r_row["conversation_response_id"]
+                                    )
+                                else:
+                                    await cur.execute(
+                                        """
+                                        SELECT run_id FROM dalton_channel_inbound_events
+                                        WHERE thread_id = %s AND status IN ('accepted', 'streaming', 'dispatched')
+                                          AND run_id IS NOT NULL
+                                        ORDER BY created_at DESC
+                                        LIMIT 1
+                                        """,
+                                        (thread_id,),
+                                    )
+                                    in_run = await cur.fetchone()
+                                    if in_run and in_run.get("run_id"):
+                                        active_run_id = str(in_run["run_id"])
+                                    else:
+                                        await cur.execute(
+                                            """
+                                            SELECT run_id FROM dalton_channel_background_runs
+                                            WHERE thread_id = %s AND status IN ('running', 'streaming')
+                                              AND run_id IS NOT NULL
+                                            ORDER BY created_at DESC
+                                            LIMIT 1
+                                            """,
+                                            (thread_id,),
+                                        )
+                                        bg_run = await cur.fetchone()
+                                        if bg_run and bg_run.get("run_id"):
+                                            active_run_id = str(bg_run["run_id"])
+
+                        effect_status = (
+                            "pending_cancel"
+                            if (thread_id and active_run_id and cleaned_msg_id)
+                            else "done"
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_session_generations
+                            SET generation = %s,
+                                override_workspace_id = %s,
+                                pending_interrupt = %s,
+                                selection_initialized_at = COALESCE(selection_initialized_at, %s),
+                                last_conversation_activity_at = %s,
+                                updated_at = %s
+                            WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                            """,
+                            (
+                                generation,
+                                override_ws_id,
+                                Jsonb(pending_interrupt)
+                                if pending_interrupt is not None
+                                else None,
+                                db_now,
+                                db_now,
+                                db_now,
+                                cleaned_platform,
+                                cleaned_scope,
+                                cleaned_uid,
+                            ),
+                        )
+                        cmd_result = {
+                            "ok": True,
+                            "linked": True,
+                            "allowed": True,
+                            "dalton_user_id": cleaned_uid,
+                            "user_tier": user_tier,
+                            "workspace_id": override_ws_id or home_ws_id,
+                            "is_home": override_ws_id is None,
+                            "generation": generation,
+                            "thread_id": thread_id,
+                            "run_id": active_run_id,
+                            "external_thread_id": ext_id,
+                        }
+
+                if cleaned_msg_id:
+                    await _upsert_command_inbound_row(
+                        cur,
+                        platform=cleaned_platform,
+                        message_id=cleaned_msg_id,
+                        request_key=req_uuid,
+                        chat_type=cleaned_chat_type,
+                        chat_address=cleaned_address,
+                        scope_key=cleaned_scope,
+                        dalton_user_id=cleaned_uid,
+                        workspace_id=cmd_result.get("workspace_id")
+                        or cmd_result.get("current_workspace_id")
+                        or home_ws_id,
+                        external_thread_id=cmd_result.get("external_thread_id"),
+                        session_generation=cmd_result.get("generation") or generation,
+                        thread_id=cmd_result.get("thread_id"),
+                        run_id=cmd_result.get("run_id"),
+                        status="accepted",
+                        command_request=cmd_req_dict,
+                        command_result=cmd_result,
+                        command_effect_status=effect_status,
+                        command_reply_pending=True,
+                        raw_payload=payload_dict,
+                    )
 
                 return {
-                    "ok": True,
-                    "thread_id": thread_id,
-                    "run_id": active_run_id,
-                    "external_thread_id": ext_id,
+                    **cmd_result,
+                    "duplicate": False,
+                    "command_effect_status": effect_status,
+                    "command_reply_pending": bool(cleaned_msg_id),
                 }
-
-    raise HTTPException(status_code=400, detail=f"Unsupported session command: {cmd!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1943,6 +2945,10 @@ async def _update_user_channel_settings_once(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"dalton_user_settings:{cleaned_uid}",),
+                )
                 await cur.execute(
                     """
                     SELECT version, apps FROM dalton_channel_user_settings
@@ -2242,7 +3248,7 @@ async def _update_user_channel_settings_once(
                     )
                     return {"workspace_id": ws_val}
 
-                # Sync dalton_channel_chat_bindings and advance group generation only for groups changed in this submission
+                # Sync dalton_channel_chat_bindings for group notification settings (independent of personal session generations)
                 for app_key in GROUP_PLATFORMS:
                     old_app_cfg = (
                         current_apps.get(app_key)
@@ -2329,13 +3335,6 @@ async def _update_user_channel_settings_once(
                                     """,
                                     (app_key, chat_addr),
                                 )
-                                cid = extract_chat_id(app_key, chat_address=chat_addr)
-                                await _advance_group_chat_generations_in_tx(
-                                    cur,
-                                    platform=app_key,
-                                    chat_id=cid,
-                                    operator_user_id=cleaned_uid,
-                                )
                         else:
                             binding_cfg = new_raw_chats[chat_addr]
                             new_ws_id = new_routing[chat_addr].get("workspace_id")
@@ -2362,13 +3361,6 @@ async def _update_user_channel_settings_once(
                                     new_ws_id,
                                     cleaned_uid,
                                 ),
-                            )
-                            cid = extract_chat_id(app_key, chat_address=chat_addr)
-                            await _advance_group_chat_generations_in_tx(
-                                cur,
-                                platform=app_key,
-                                chat_id=cid,
-                                operator_user_id=cleaned_uid,
                             )
 
                 if row:
@@ -2427,6 +3419,9 @@ async def authorize_and_claim_delivery(
     inbound_message_id: str | None = None,
     has_non_empty_text: bool = True,
     total_chunks: int = 0,
+    source_scope_key: str | None = None,
+    source_generation: int | None = None,
+    activity_origin: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-6: Atomically check idempotency, authorize outbound target across Scenarios A1/A2/B/C, and claim `in_flight`."""
@@ -2454,6 +3449,17 @@ async def authorize_and_claim_delivery(
     eff_exec_id = normalize_uuid(automation_execution_id or execution_id)
     norm_tid = normalize_uuid(thread_id)
     cleaned_rid = str(run_id or "").strip() or None
+    eff_source_scope = str(source_scope_key or "").strip() or None
+    eff_source_gen = int(source_generation) if source_generation is not None else None
+    eff_activity_origin = str(activity_origin or "none").strip().lower()
+    if eff_activity_origin not in (
+        "conversation",
+        "replay",
+        "notification",
+        "command",
+        "none",
+    ):
+        eff_activity_origin = "none"
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -2473,8 +3479,84 @@ async def authorize_and_claim_delivery(
                     (cleaned_key,),
                 )
                 existing = await cur.fetchone()
+                # True only when this claim may persist activity_origin conversation -> replay.
+                replay_recovery = False
                 if existing:
+                    ex_scope = (
+                        str(existing.get("source_scope_key") or "").strip() or None
+                    )
+                    ex_gen = (
+                        int(existing["source_generation"])
+                        if existing.get("source_generation") is not None
+                        else None
+                    )
+                    ex_origin = (
+                        str(existing.get("activity_origin") or "none")
+                        .strip()
+                        .lower()
+                    )
                     ex_status = str(existing["status"])
+                    scope_mismatch = (
+                        eff_source_scope is not None and ex_scope != eff_source_scope
+                    )
+                    gen_mismatch = (
+                        eff_source_gen is not None and ex_gen != eff_source_gen
+                    )
+                    origin_differs = (
+                        activity_origin is not None
+                        and ex_origin != eff_activity_origin
+                    )
+                    # Absent scope or generation matches only another absent value.
+                    # conversation -> replay is allowed only for this same scope and generation.
+                    # A failed row may be claimed again and stored as replay. A sent or partial
+                    # row is already delivered: return it unchanged and do not send the body again.
+                    same_scope_and_generation = (
+                        ex_scope == eff_source_scope and ex_gen == eff_source_gen
+                    )
+                    conversation_to_replay = (
+                        ex_origin == "conversation"
+                        and eff_activity_origin == "replay"
+                        and same_scope_and_generation
+                    )
+                    replay_recovery = ex_status == "failed" and conversation_to_replay
+                    if (
+                        ex_status in ("sent", "partial")
+                        and conversation_to_replay
+                    ):
+                        ex_user = str(existing.get("user_id") or "").strip()
+                        ex_plat = str(existing.get("platform") or "").strip().lower()
+                        ex_target = str(existing.get("target_address") or "").strip()
+                        got_user = str(cleaned_uid or "").strip()
+                        got_plat = str(cleaned_platform or "").strip().lower()
+                        got_target = str(cleaned_target or "").strip()
+                        if (
+                            ex_user != got_user
+                            or ex_plat != got_plat
+                            or ex_target != got_target
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "Delivery identity or destination does not match the existing record.",
+                            }
+                        return {
+                            "claim_status": "already_completed",
+                            "status": ex_status,
+                            "first_response_json": existing.get("first_response_json"),
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "is_current": bool(existing.get("is_current", False)),
+                        }
+                    if scope_mismatch or gen_mismatch or (
+                        origin_differs and not replay_recovery
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "Delivery source metadata is immutable and does not match existing record.",
+                        }
                     if ex_status in ("sent", "partial"):
                         return {
                             "claim_status": "already_completed",
@@ -2549,6 +3631,46 @@ async def authorize_and_claim_delivery(
                             "code": "no_current_conversation",
                             "message": "Inbound event not found.",
                         }
+                    persisted_scope = (
+                        str(in_row.get("thread_scope_key") or "").strip() or None
+                    )
+                    persisted_gen = (
+                        int(in_row["session_generation"])
+                        if in_row.get("session_generation") is not None
+                        else None
+                    )
+                    if (
+                        eff_source_scope is not None
+                        and persisted_scope is not None
+                        and eff_source_scope != persisted_scope
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "source_scope_key does not match inbound event.",
+                        }
+                    if (
+                        eff_source_gen is not None
+                        and persisted_gen is not None
+                        and eff_source_gen != persisted_gen
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "source_generation does not match inbound event.",
+                        }
+                    if eff_activity_origin == "conversation":
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "Direct notice cannot claim conversation activity origin.",
+                        }
+                    eff_source_scope = persisted_scope
+                    eff_source_gen = persisted_gen
+
                     resolved_platform = str(in_row["platform"])
                     resolved_target_address = str(in_row["chat_address"])
                     raw_p = in_row.get("raw_payload") or {}
@@ -2558,30 +3680,50 @@ async def authorize_and_claim_delivery(
                         if in_row.get("dalton_user_id")
                         else f"unlinked:{resolved_platform}:{puid}"
                     )
-                    if _is_dm_address(resolved_platform, resolved_target_address):
-                        resolved_recipient_id = puid
-                    else:
-                        resolved_recipient_id = extract_chat_id(
-                            resolved_platform, chat_address=resolved_target_address
-                        )
                     weixin_ctx_token = raw_p.get("weixin_context_token")
-                    if not weixin_ctx_token and in_row.get("dalton_user_id"):
+                    if in_row.get("dalton_user_id") and (
+                        not puid or not weixin_ctx_token
+                    ):
                         await cur.execute(
                             """
-                            SELECT weixin_context_token FROM dalton_channel_identities
+                            SELECT platform_user_id, weixin_context_token
+                            FROM dalton_channel_identities
                             WHERE user_id = %s AND platform = %s
                             """,
                             (in_row["dalton_user_id"], resolved_platform),
                         )
                         id_row = await cur.fetchone()
                         if id_row:
-                            weixin_ctx_token = id_row.get("weixin_context_token")
+                            if not puid:
+                                puid = str(id_row.get("platform_user_id") or "")
+                            if not weixin_ctx_token:
+                                weixin_ctx_token = id_row.get("weixin_context_token")
+                    if _is_dm_address(resolved_platform, resolved_target_address):
+                        resolved_recipient_id = puid
+                    else:
+                        resolved_recipient_id = extract_chat_id(
+                            resolved_platform, chat_address=resolved_target_address
+                        )
 
                 # Scenario B: Automation delivery
                 elif eff_exec_id and (
                     cleaned_kind == "automation"
                     or (cleaned_kind == "agent_send" and eff_exec_id is not None)
                 ):
+                    if (
+                        eff_source_scope is not None
+                        or eff_source_gen is not None
+                        or eff_activity_origin == "conversation"
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "Automation deliveries cannot claim conversation session source.",
+                        }
+                    eff_source_scope = None
+                    eff_source_gen = None
+
                     await cur.execute(
                         """
                         SELECT * FROM dalton_channel_automation_runs
@@ -2696,7 +3838,8 @@ async def authorize_and_claim_delivery(
                             await cur.execute(
                                 f"""
                                 SELECT dalton_user_id, platform, chat_address AS target_address,
-                                       thread_id, run_id
+                                       thread_scope_key, workspace_id, session_generation,
+                                       external_thread_id, raw_payload, thread_id, run_id
                                 FROM dalton_channel_inbound_events
                                 WHERE {" AND ".join(in_clauses)}
                                 ORDER BY created_at DESC
@@ -2725,7 +3868,8 @@ async def authorize_and_claim_delivery(
                         if source_row is None and norm_tid:
                             await cur.execute(
                                 """
-                                SELECT dalton_user_id, platform, target_address, thread_id
+                                SELECT dalton_user_id, platform, target_address,
+                                       scope_key, generation, thread_id
                                 FROM dalton_channel_thread_watches
                                 WHERE thread_id = %s
                                 """,
@@ -2761,6 +3905,102 @@ async def authorize_and_claim_delivery(
                     resolved_target_address = str(source_row["target_address"])
                     is_current = True
 
+                    persisted_scope: str | None = None
+                    persisted_gen: int | None = None
+                    raw_sc = source_row.get("thread_scope_key") or source_row.get(
+                        "scope_key"
+                    )
+                    if raw_sc:
+                        persisted_scope = str(raw_sc).strip() or None
+                    if source_row.get("session_generation") is not None:
+                        persisted_gen = int(source_row["session_generation"])
+                    elif source_row.get("generation") is not None:
+                        persisted_gen = int(source_row["generation"])
+                    elif (
+                        isinstance(source_row.get("raw_payload"), dict)
+                        and source_row["raw_payload"].get("generation") is not None
+                    ):
+                        persisted_gen = int(
+                            source_row["raw_payload"]["generation"]
+                        )
+                    elif source_row.get("external_thread_id") and ":gen:" in str(
+                        source_row["external_thread_id"]
+                    ):
+                        gen_p = (
+                            str(source_row["external_thread_id"])
+                            .rsplit(":gen:", 1)[-1]
+                            .strip()
+                        )
+                        if gen_p.isdigit():
+                            persisted_gen = int(gen_p)
+
+                    lookup_tid = normalize_uuid(source_row.get("thread_id")) or norm_tid
+                    if (persisted_scope is None or persisted_gen is None) and lookup_tid:
+                        await cur.execute(
+                            """
+                            SELECT dalton_user_id, platform, target_address,
+                                   scope_key, generation, thread_id
+                            FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s
+                            """,
+                            (lookup_tid,),
+                        )
+                        w_extra = await cur.fetchone()
+                        if w_extra and str(w_extra.get("dalton_user_id") or "") == resolved_user_id:
+                            if persisted_scope is None and w_extra.get("scope_key"):
+                                persisted_scope = str(w_extra["scope_key"]).strip() or None
+                            if persisted_gen is None and w_extra.get("generation") is not None:
+                                persisted_gen = int(w_extra["generation"])
+                    if (persisted_scope is None or persisted_gen is None) and lookup_tid:
+                        await cur.execute(
+                            """
+                            SELECT dalton_user_id, platform, chat_address AS target_address,
+                                   thread_scope_key, workspace_id, session_generation,
+                                   external_thread_id, raw_payload, thread_id, run_id
+                            FROM dalton_channel_inbound_events
+                            WHERE dalton_user_id = %s AND thread_id = %s
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            (resolved_user_id, lookup_tid),
+                        )
+                        in_extra = await cur.fetchone()
+                        if in_extra:
+                            if persisted_scope is None and in_extra.get("thread_scope_key"):
+                                persisted_scope = str(in_extra["thread_scope_key"]).strip() or None
+                            if persisted_gen is None and in_extra.get("session_generation") is not None:
+                                persisted_gen = int(in_extra["session_generation"])
+
+                    if eff_source_scope is not None and (
+                        persisted_scope is None or eff_source_scope != persisted_scope
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "source_scope_key does not match persisted conversation source.",
+                        }
+                    if eff_source_gen is not None and (
+                        persisted_gen is None or eff_source_gen != persisted_gen
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "source_generation does not match persisted conversation source.",
+                        }
+                    if eff_activity_origin == "conversation" and (
+                        persisted_scope is None or persisted_gen is None
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "Conversation activity origin requires a persisted conversation source.",
+                        }
+                    eff_source_scope = persisted_scope
+                    eff_source_gen = persisted_gen
+
                     await cur.execute(
                         """
                         SELECT * FROM dalton_channel_identities
@@ -2789,33 +4029,43 @@ async def authorize_and_claim_delivery(
                                 "code": "not_allowed",
                                 "message": "Group chat delivery is not allowed.",
                             }
-                        await cur.execute(
-                            """
-                            SELECT workspace_id FROM dalton_channel_chat_bindings
-                            WHERE platform = %s AND chat_address = %s
-                            """,
-                            (resolved_platform, resolved_target_address),
-                        )
-                        cb_row = await cur.fetchone()
-                        if cb_row and cb_row.get("workspace_id"):
-                            ok, _, _ = await _verify_workspace_write_permission(
-                                cur,
-                                str(cb_row["workspace_id"]),
-                                resolved_user_id,
-                                conn=owned_conn,
-                            )
-                            if not ok:
-                                return {
-                                    "claim_status": "denied",
-                                    "status": "failed",
-                                    "code": "not_allowed",
-                                    "message": "Workspace write access revoked.",
-                                }
                         resolved_recipient_id = extract_chat_id(
                             resolved_platform, chat_address=resolved_target_address
                         )
                     else:
                         resolved_recipient_id = str(id_row["platform_user_id"])
+
+                    # Verify write permission on the source thread's actual workspace (not group notification bindings)
+                    source_ws_id = source_row.get("workspace_id")
+                    eff_tid = normalize_uuid(source_row.get("thread_id")) or norm_tid
+                    if source_ws_id is None and eff_tid:
+                        await cur.execute(
+                            """
+                            SELECT workspace_id FROM conversation_threads
+                            WHERE conversation_thread_id = %s
+                            """,
+                            (eff_tid,),
+                        )
+                        th_row = await cur.fetchone()
+                        if th_row and th_row.get("workspace_id"):
+                            source_ws_id = th_row["workspace_id"]
+                    home_ws_for_user = get_home_workspace_id(resolved_user_id)
+                    if source_ws_id and normalize_uuid(source_ws_id) != normalize_uuid(
+                        home_ws_for_user
+                    ):
+                        ok, _, _ = await _verify_workspace_write_permission(
+                            cur,
+                            str(source_ws_id),
+                            resolved_user_id,
+                            conn=owned_conn,
+                        )
+                        if not ok:
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "Workspace write access revoked.",
+                            }
 
                 # Scenario C: Explicit target proactive send (kind == "agent_send" && target != null)
                 else:
@@ -2938,10 +4188,13 @@ async def authorize_and_claim_delivery(
                         resolved_recipient_id = str(id_row["platform_user_id"])
 
                     # Check whether explicit target happens to match the turn's current conversation
+                    persisted_c_scope: str | None = None
+                    persisted_c_gen: int | None = None
                     if cleaned_rid or norm_tid:
                         await cur.execute(
                             """
-                            SELECT chat_address FROM dalton_channel_inbound_events
+                            SELECT chat_address, thread_scope_key, session_generation
+                            FROM dalton_channel_inbound_events
                             WHERE dalton_user_id = %s
                               AND (%s::text IS NULL OR run_id = %s)
                               AND (%s::uuid IS NULL OR thread_id = %s)
@@ -2959,22 +4212,110 @@ async def authorize_and_claim_delivery(
                         cur_in = await cur.fetchone()
                         if cur_in and str(cur_in["chat_address"]) == resolved_target_address:
                             is_current = True
+                            if cur_in.get("thread_scope_key"):
+                                persisted_c_scope = str(cur_in["thread_scope_key"]).strip() or None
+                            if cur_in.get("session_generation") is not None:
+                                persisted_c_gen = int(cur_in["session_generation"])
 
-                # 3. Atomic claim in dalton_channel_deliveries
+                    if is_current:
+                        if eff_source_scope is not None and (
+                            persisted_c_scope is None
+                            or eff_source_scope != persisted_c_scope
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "source_scope_key does not match current conversation source.",
+                            }
+                        if eff_source_gen is not None and (
+                            persisted_c_gen is None
+                            or eff_source_gen != persisted_c_gen
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "source_generation does not match current conversation source.",
+                            }
+                        if eff_activity_origin == "conversation" and (
+                            persisted_c_scope is None or persisted_c_gen is None
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "Conversation activity origin requires a persisted conversation source.",
+                            }
+                        eff_source_scope = persisted_c_scope
+                        eff_source_gen = persisted_c_gen
+                    else:
+                        if (
+                            eff_source_scope is not None
+                            or eff_source_gen is not None
+                            or eff_activity_origin == "conversation"
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "Non-current proactive target cannot claim conversation session source.",
+                            }
+                        eff_source_scope = None
+                        eff_source_gen = None
+
+                # Reclaim keeps the delivery key. A different user, platform, or destination
+                # is rejected and does not retarget the stored row.
+                if existing is not None:
+                    ex_user = str(existing.get("user_id") or "").strip()
+                    ex_plat = str(existing.get("platform") or "").strip().lower()
+                    ex_target = str(existing.get("target_address") or "").strip()
+                    got_user = str(resolved_user_id or "").strip()
+                    got_plat = str(resolved_platform or "").strip().lower()
+                    got_target = str(resolved_target_address or "").strip()
+                    if (
+                        ex_user != got_user
+                        or ex_plat != got_plat
+                        or ex_target != got_target
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "Delivery identity or destination does not match the existing record.",
+                        }
+
+                # 3. Atomic claim. Scope and generation stay as first stored.
+                # A failed conversation delivery reclaimed as replay persists activity_origin='replay'
+                # so a later progress update does not extend last_conversation_activity_at.
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_deliveries (
                         delivery_key, kind, user_id, thread_id, run_id, execution_id,
                         is_current, has_non_empty_text, platform, target_address,
                         status, total_chunks, sent_chunks, platform_message_ids,
-                        files_status, created_at, updated_at
+                        files_status, source_scope_key, source_generation, activity_origin,
+                        created_at, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, NOW(), NOW())
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        'in_flight', %s, 0, '[]'::jsonb,
+                        '[]'::jsonb, %s, %s, %s,
+                        NOW(), NOW()
+                    )
                     ON CONFLICT (delivery_key) DO UPDATE SET
                         status = 'in_flight',
                         total_chunks = EXCLUDED.total_chunks,
                         error_code = NULL,
                         error_message = NULL,
+                        activity_origin = CASE
+                            WHEN %s
+                             AND dalton_channel_deliveries.status = 'failed'
+                             AND dalton_channel_deliveries.activity_origin = 'conversation'
+                            THEN 'replay'
+                            ELSE dalton_channel_deliveries.activity_origin
+                        END,
                         updated_at = NOW()
                     """,
                     (
@@ -2989,6 +4330,10 @@ async def authorize_and_claim_delivery(
                         resolved_platform,
                         resolved_target_address,
                         int(total_chunks or 0),
+                        eff_source_scope,
+                        eff_source_gen,
+                        eff_activity_origin,
+                        replay_recovery,
                     ),
                 )
 
@@ -3014,6 +4359,17 @@ async def authorize_and_claim_delivery(
 # ---------------------------------------------------------------------------
 
 
+def _count_delivered_files(items: Any) -> int:
+    if not isinstance(items, list):
+        return 0
+    return sum(
+        1
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() in ("sent", "linked")
+    )
+
+
 async def update_delivery_progress(
     *,
     delivery_key: str,
@@ -3027,7 +4383,38 @@ async def update_delivery_progress(
     error_message: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """I-7 (1): Update `dalton_channel_deliveries` and increment `sent_to_current_count` when appropriate."""
+    """I-7 (1): Update `dalton_channel_deliveries`, increment `sent_to_current_count`, and update conversation activity timestamp."""
+    return await _run_tx_with_retry(
+        "update_delivery_progress",
+        conn,
+        lambda c: _update_delivery_progress_once(
+            delivery_key=delivery_key,
+            sent_chunks=sent_chunks,
+            total_chunks=total_chunks,
+            platform_message_ids=platform_message_ids,
+            files_status=files_status,
+            first_response_json=first_response_json,
+            status=status,
+            error_code=error_code,
+            error_message=error_message,
+            conn=c,
+        ),
+    )
+
+
+async def _update_delivery_progress_once(
+    *,
+    delivery_key: str,
+    sent_chunks: int | None = None,
+    total_chunks: int | None = None,
+    platform_message_ids: list[Any] | None = None,
+    files_status: list[Any] | None = None,
+    first_response_json: dict[str, Any] | None = None,
+    status: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    conn: Any = None,
+) -> dict[str, Any]:
     cleaned_key = str(delivery_key or "").strip()
     if not cleaned_key:
         raise HTTPException(status_code=400, detail="delivery_key is required")
@@ -3035,6 +4422,57 @@ async def update_delivery_progress(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                # 0. Serialize with authorize_and_claim_delivery on the same delivery_key
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"dalton_delivery:{cleaned_key}",),
+                )
+                # 1. Pre-read immutable origin metadata to lock session generation row BEFORE delivery row
+                await cur.execute(
+                    """
+                    SELECT user_id, platform, source_scope_key, source_generation, activity_origin
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = %s
+                    """,
+                    (cleaned_key,),
+                )
+                pre_row = await cur.fetchone()
+                if not pre_row:
+                    raise HTTPException(
+                        status_code=404, detail="Delivery record not found"
+                    )
+
+                locked_session_row: dict[str, Any] | None = None
+                db_now: datetime | None = None
+                src_uid = str(pre_row.get("user_id") or "").strip()
+                src_plat = str(pre_row.get("platform") or "").strip().lower()
+                src_scope = str(pre_row.get("source_scope_key") or "").strip()
+                src_gen = pre_row.get("source_generation")
+                act_origin = str(pre_row.get("activity_origin") or "none").strip().lower()
+
+                if (
+                    act_origin == "conversation"
+                    and src_uid
+                    and src_plat
+                    and src_scope
+                    and src_gen is not None
+                ):
+                    await cur.execute(
+                        """
+                        SELECT generation, override_workspace_id,
+                               last_conversation_activity_at, selection_initialized_at
+                        FROM dalton_channel_session_generations
+                        WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                        FOR UPDATE
+                        """,
+                        (src_plat, src_scope, src_uid),
+                    )
+                    s_row = await cur.fetchone()
+                    if s_row:
+                        locked_session_row = dict(s_row)
+                    db_now = await _fetch_db_now(cur)
+
+                # 2. Lock delivery row FOR UPDATE
                 await cur.execute(
                     """
                     SELECT * FROM dalton_channel_deliveries
@@ -3049,13 +4487,23 @@ async def update_delivery_progress(
                         status_code=404, detail="Delivery record not found"
                     )
 
+                locked_uid = str(row.get("user_id") or "").strip()
+                locked_plat = str(row.get("platform") or "").strip().lower()
+                locked_scope = str(row.get("source_scope_key") or "").strip()
+                locked_gen = row.get("source_generation")
+                locked_origin = (
+                    str(row.get("activity_origin") or "none").strip().lower()
+                )
+
                 prev_status = str(row["status"])
                 new_status = str(status or prev_status)
-                new_sent_chunks = (
+                prev_sent_chunks = int(row.get("sent_chunks") or 0)
+                req_sent_chunks = (
                     int(sent_chunks)
                     if sent_chunks is not None
-                    else int(row.get("sent_chunks") or 0)
+                    else prev_sent_chunks
                 )
+                new_sent_chunks = max(prev_sent_chunks, req_sent_chunks)
                 new_total_chunks = (
                     int(total_chunks)
                     if total_chunks is not None
@@ -3066,11 +4514,19 @@ async def update_delivery_progress(
                     if platform_message_ids is not None
                     else (row.get("platform_message_ids") or [])
                 )
-                new_files_status = (
-                    files_status
-                    if files_status is not None
-                    else (row.get("files_status") or [])
-                )
+                prev_files = row.get("files_status") or []
+                prev_delivered_files = _count_delivered_files(prev_files)
+                if files_status is not None:
+                    cand_delivered_files = _count_delivered_files(files_status)
+                    new_files_status = (
+                        files_status
+                        if cand_delivered_files >= prev_delivered_files
+                        else prev_files
+                    )
+                else:
+                    cand_delivered_files = prev_delivered_files
+                    new_files_status = prev_files
+
                 new_first_resp = (
                     first_response_json
                     if first_response_json is not None
@@ -3103,6 +4559,52 @@ async def update_delivery_progress(
                         cleaned_key,
                     ),
                 )
+
+                # 3. Conditionally advance last_conversation_activity_at when new conversation output was delivered
+                made_new_output_progress = (
+                    new_sent_chunks > prev_sent_chunks
+                    or cand_delivered_files > prev_delivered_files
+                )
+                if (
+                    made_new_output_progress
+                    and locked_session_row is not None
+                    and db_now is not None
+                    and locked_origin == "conversation"
+                    and locked_uid == src_uid
+                    and locked_plat == src_plat
+                    and locked_scope == src_scope
+                    and locked_gen is not None
+                    and src_gen is not None
+                    and int(locked_gen) == int(src_gen)
+                ):
+                    cur_s_gen = int(locked_session_row.get("generation") or 0)
+                    init_at = locked_session_row.get("selection_initialized_at")
+                    last_act = locked_session_row.get("last_conversation_activity_at")
+                    if (
+                        cur_s_gen == int(locked_gen)
+                        and init_at is not None
+                        and not _is_session_expired(last_act, db_now)
+                    ):
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_session_generations
+                            SET last_conversation_activity_at = %s,
+                                updated_at = %s
+                            WHERE platform = %s
+                              AND scope_key = %s
+                              AND dalton_user_id = %s
+                              AND generation = %s
+                              AND selection_initialized_at IS NOT NULL
+                            """,
+                            (
+                                db_now,
+                                db_now,
+                                locked_plat,
+                                locked_scope,
+                                locked_uid,
+                                int(locked_gen),
+                            ),
+                        )
 
                 updated_count = 0
                 run_id_val = row.get("run_id")
@@ -3164,20 +4666,403 @@ async def update_inbound_progress(
     uploaded_attachments: list[Any] | None = None,
     raw_payload: dict[str, Any] | None = None,
     raw_payload_patch: dict[str, Any] | None = None,
+    command_effect_status: str | None = None,
+    command_reply_pending: bool | None = None,
+    command_result: dict[str, Any] | None = None,
     session_interrupt_update: dict[str, Any] | None = None,
     background_run: dict[str, Any] | None = None,
     thread_watch: dict[str, Any] | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
-    """I-7 (2): Update inbound event, session pending_interrupt, background_runs, and thread_watches."""
+    """I-7 (2): Update inbound event, session pending_interrupt, thread_watches, and background_runs."""
+    return await _run_tx_with_retry(
+        "update_inbound_progress",
+        conn,
+        lambda c: _update_inbound_progress_once(
+            platform=platform,
+            message_id=message_id,
+            status=status,
+            thread_id=thread_id,
+            run_id=run_id,
+            turn_index=turn_index,
+            request_key=request_key,
+            retry_request_key=retry_request_key,
+            resubmitted_request_key=resubmitted_request_key,
+            steered_into_run_id=steered_into_run_id,
+            fallback_pending=fallback_pending,
+            uploaded_attachments=uploaded_attachments,
+            raw_payload=raw_payload,
+            raw_payload_patch=raw_payload_patch,
+            command_effect_status=command_effect_status,
+            command_reply_pending=command_reply_pending,
+            command_result=command_result,
+            session_interrupt_update=session_interrupt_update,
+            background_run=background_run,
+            thread_watch=thread_watch,
+            conn=c,
+        ),
+    )
+
+
+async def _update_inbound_progress_once(
+    *,
+    platform: str | None = None,
+    message_id: str | None = None,
+    status: str | None = None,
+    thread_id: str | None = None,
+    run_id: str | None = None,
+    turn_index: int | None = None,
+    request_key: str | None = None,
+    retry_request_key: str | None = None,
+    resubmitted_request_key: str | None = None,
+    steered_into_run_id: str | None = None,
+    fallback_pending: bool | None = None,
+    uploaded_attachments: list[Any] | None = None,
+    raw_payload: dict[str, Any] | None = None,
+    raw_payload_patch: dict[str, Any] | None = None,
+    command_effect_status: str | None = None,
+    command_reply_pending: bool | None = None,
+    command_result: dict[str, Any] | None = None,
+    session_interrupt_update: dict[str, Any] | None = None,
+    background_run: dict[str, Any] | None = None,
+    thread_watch: dict[str, Any] | None = None,
+    conn: Any = None,
+) -> dict[str, Any]:
     effective_run_id = str(run_id).strip() if run_id else None
+    cleaned_p = platform.strip().lower() if platform and platform.strip() else None
+    cleaned_mid = message_id.strip() if message_id and message_id.strip() else None
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                if platform and message_id:
-                    cleaned_p = platform.strip().lower()
-                    cleaned_mid = message_id.strip()
+                # 0. Acquire per-inbound advisory lock first (matches I-1 and I-3 lock ordering)
+                if cleaned_p and cleaned_mid:
+                    await cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"dalton_inbound:{cleaned_p}:{cleaned_mid}",),
+                    )
+
+                # 1. Lock & update dalton_channel_session_generations FIRST (before inbound_events / watches / background_runs)
+                watch_interrupt_patch: tuple[str, Any] | None = None
+                session_is_current_for_interrupt: bool | None = None
+                if session_interrupt_update:
+                    si_plat = str(session_interrupt_update["platform"]).strip().lower()
+                    si_scope = str(session_interrupt_update["scope_key"]).strip()
+                    si_uid = str(session_interrupt_update["dalton_user_id"]).strip()
+                    si_val = session_interrupt_update.get("pending_interrupt")
+                    si_expected_gen = session_interrupt_update.get("generation")
+                    if (
+                        si_expected_gen is None
+                        and isinstance(si_val, dict)
+                        and si_val.get("generation") is not None
+                    ):
+                        si_expected_gen = int(si_val["generation"])
+                    si_expected_tid = normalize_uuid(
+                        session_interrupt_update.get("thread_id")
+                        or (
+                            si_val.get("thread_id")
+                            if isinstance(si_val, dict)
+                            else None
+                        )
+                        or thread_id
+                        or (
+                            thread_watch.get("thread_id")
+                            if isinstance(thread_watch, dict)
+                            else None
+                        )
+                    )
+                    si_expected_rid = (
+                        session_interrupt_update.get("run_id")
+                        or (si_val.get("run_id") if isinstance(si_val, dict) else None)
+                        or effective_run_id
+                        or (
+                            background_run.get("run_id")
+                            if isinstance(background_run, dict)
+                            else None
+                        )
+                    )
+                    si_expected_iid = session_interrupt_update.get("interrupt_id") or (
+                        si_val.get("interrupt_id")
+                        if isinstance(si_val, dict)
+                        else None
+                    )
+
+                    # Pre-read persisted source (without FOR UPDATE) to validate generation and scope before locking session
+                    persisted_src: dict[str, Any] | None = None
+                    if cleaned_p and cleaned_mid:
+                        await cur.execute(
+                            """
+                            SELECT * FROM dalton_channel_inbound_events
+                            WHERE platform = %s AND message_id = %s
+                            """,
+                            (cleaned_p, cleaned_mid),
+                        )
+                        in_src = await cur.fetchone()
+                        if in_src:
+                            persisted_src = dict(in_src)
+                    if persisted_src is None and (si_expected_rid or si_expected_tid):
+                        src_clauses: list[str] = ["dalton_user_id = %s"]
+                        src_params: list[Any] = [si_uid]
+                        if si_expected_rid:
+                            src_clauses.append("run_id = %s")
+                            src_params.append(str(si_expected_rid))
+                        if si_expected_tid:
+                            src_clauses.append("thread_id = %s")
+                            src_params.append(si_expected_tid)
+                        await cur.execute(
+                            f"""
+                            SELECT dalton_user_id, platform, chat_address AS target_address,
+                                   thread_scope_key, workspace_id, session_generation,
+                                   external_thread_id, raw_payload, thread_id, run_id
+                            FROM dalton_channel_inbound_events
+                            WHERE {" AND ".join(src_clauses)}
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            tuple(src_params),
+                        )
+                        in_by_rt = await cur.fetchone()
+                        if in_by_rt:
+                            persisted_src = dict(in_by_rt)
+                    if (
+                        (
+                            persisted_src is None
+                            or persisted_src.get("session_generation") is None
+                        )
+                        and si_expected_tid
+                    ):
+                        await cur.execute(
+                            """
+                            SELECT dalton_user_id, platform, target_address,
+                                   scope_key, generation, thread_id
+                            FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s
+                            """,
+                            (si_expected_tid,),
+                        )
+                        w_src = await cur.fetchone()
+                        if w_src:
+                            persisted_src = dict(w_src)
+
+                    src_plat_ok = True
+                    src_uid_ok = True
+                    src_scope_ok = True
+                    persisted_gen_val: int | None = None
+                    if persisted_src is not None:
+                        p_plat = str(persisted_src.get("platform") or "").strip().lower()
+                        p_uid = str(persisted_src.get("dalton_user_id") or "").strip()
+                        p_scope = str(
+                            persisted_src.get("thread_scope_key")
+                            or persisted_src.get("scope_key")
+                            or ""
+                        ).strip()
+                        src_plat_ok = not p_plat or p_plat == si_plat
+                        src_uid_ok = not p_uid or p_uid == si_uid
+                        src_scope_ok = not p_scope or p_scope == si_scope
+                        if persisted_src.get("session_generation") is not None:
+                            persisted_gen_val = int(persisted_src["session_generation"])
+                        elif persisted_src.get("generation") is not None:
+                            persisted_gen_val = int(persisted_src["generation"])
+                        elif (
+                            isinstance(persisted_src.get("raw_payload"), dict)
+                            and persisted_src["raw_payload"].get("generation")
+                            is not None
+                        ):
+                            persisted_gen_val = int(
+                                persisted_src["raw_payload"]["generation"]
+                            )
+                        elif persisted_src.get("external_thread_id") and ":gen:" in str(
+                            persisted_src["external_thread_id"]
+                        ):
+                            gen_s = (
+                                str(persisted_src["external_thread_id"])
+                                .rsplit(":gen:", 1)[-1]
+                                .strip()
+                            )
+                            if gen_s.isdigit():
+                                persisted_gen_val = int(gen_s)
+
+                    s_row, _, s_db_now = await _lock_or_create_session_row(
+                        cur,
+                        platform=si_plat,
+                        scope_key=si_scope,
+                        dalton_user_id=si_uid,
+                    )
+                    cur_s_gen = int(s_row.get("generation") or 1)
+                    cur_s_int = s_row.get("pending_interrupt")
+                    is_s_expired = (
+                        _is_session_expired(
+                            s_row.get("last_conversation_activity_at"), s_db_now
+                        )
+                        and s_row.get("override_workspace_id") is not None
+                    )
+
+                    # Resolve authoritative generation for interrupt check (never allow None to match by default)
+                    eff_expected_gen: int | None = None
+                    gen_conflict = False
+                    if (
+                        si_expected_gen is not None
+                        and persisted_gen_val is not None
+                        and int(si_expected_gen) != persisted_gen_val
+                    ):
+                        gen_conflict = True
+                    elif persisted_gen_val is not None and persisted_gen_val > 0:
+                        eff_expected_gen = persisted_gen_val
+                    elif (
+                        si_expected_gen is not None
+                        and int(si_expected_gen) > 0
+                        and (
+                            persisted_src is not None
+                            or (
+                                isinstance(thread_watch, dict)
+                                and normalize_uuid(thread_watch.get("thread_id"))
+                                == si_expected_tid
+                                and str(thread_watch.get("dalton_user_id") or "").strip()
+                                == si_uid
+                                and str(thread_watch.get("platform") or "")
+                                .strip()
+                                .lower()
+                                == si_plat
+                                and str(thread_watch.get("scope_key") or "").strip()
+                                == si_scope
+                                and int(thread_watch.get("generation") or 0)
+                                == int(si_expected_gen)
+                            )
+                            or (
+                                si_val is None
+                                and isinstance(cur_s_int, dict)
+                                and (
+                                    si_expected_iid is not None
+                                    or si_expected_rid is not None
+                                    or si_expected_tid is not None
+                                )
+                            )
+                        )
+                    ):
+                        eff_expected_gen = int(si_expected_gen)
+
+                    gen_matches_current = (
+                        not is_s_expired
+                        and not gen_conflict
+                        and src_plat_ok
+                        and src_uid_ok
+                        and src_scope_ok
+                        and eff_expected_gen is not None
+                        and eff_expected_gen == cur_s_gen
+                    )
+                    session_is_current_for_interrupt = gen_matches_current
+
+                    should_update_session_int = False
+                    if si_val is not None:
+                        if gen_matches_current:
+                            should_update_session_int = True
+                    else:
+                        if (
+                            gen_matches_current
+                            and isinstance(cur_s_int, dict)
+                            and (
+                                si_expected_iid is not None
+                                or si_expected_rid is not None
+                                or si_expected_tid is not None
+                            )
+                        ):
+                            should_update_session_int = True
+                            if (
+                                cur_s_int.get("generation") is not None
+                                and int(cur_s_int["generation"]) != cur_s_gen
+                            ):
+                                should_update_session_int = False
+                            elif (
+                                si_expected_iid
+                                and cur_s_int.get("interrupt_id")
+                                and str(cur_s_int["interrupt_id"])
+                                != str(si_expected_iid)
+                            ):
+                                should_update_session_int = False
+                            elif (
+                                si_expected_rid
+                                and cur_s_int.get("run_id")
+                                and str(cur_s_int["run_id"])
+                                != str(si_expected_rid)
+                            ):
+                                should_update_session_int = False
+                            elif (
+                                si_expected_tid
+                                and cur_s_int.get("thread_id")
+                                and normalize_uuid(cur_s_int["thread_id"])
+                                != si_expected_tid
+                            ):
+                                should_update_session_int = False
+
+                    if should_update_session_int:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_session_generations
+                            SET pending_interrupt = %s,
+                                updated_at = NOW()
+                            WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                            """,
+                            (
+                                Jsonb(si_val) if si_val is not None else None,
+                                si_plat,
+                                si_scope,
+                                si_uid,
+                            ),
+                        )
+                    if si_expected_tid:
+                        watch_interrupt_patch = (si_expected_tid, si_val)
+
+                # If command_effect_status == 'done' is being reported for a pending_cancel command row,
+                # lock session row first and update activity ONLY on the first valid transition pending_cancel -> done
+                if (
+                    cleaned_p
+                    and cleaned_mid
+                    and command_effect_status == "done"
+                    and status != "failed"
+                    and not session_interrupt_update
+                ):
+                    await cur.execute(
+                        """
+                        SELECT * FROM dalton_channel_inbound_events
+                        WHERE platform = %s AND message_id = %s
+                        """,
+                        (cleaned_p, cleaned_mid),
+                    )
+                    cmd_pre = await cur.fetchone()
+                    if (
+                        cmd_pre
+                        and cmd_pre.get("event_kind") == "command"
+                        and cmd_pre.get("command_effect_status") == "pending_cancel"
+                        and cmd_pre.get("dalton_user_id")
+                        and cmd_pre.get("thread_scope_key")
+                        and cmd_pre.get("session_generation") is not None
+                    ):
+                        c_uid = str(cmd_pre["dalton_user_id"])
+                        c_scope = str(cmd_pre["thread_scope_key"])
+                        c_gen = int(cmd_pre["session_generation"])
+                        s_row, _, db_now = await _lock_or_create_session_row(
+                            cur,
+                            platform=cleaned_p,
+                            scope_key=c_scope,
+                            dalton_user_id=c_uid,
+                        )
+                        if int(
+                            s_row.get("generation") or 0
+                        ) == c_gen and not _is_session_expired(
+                            s_row.get("last_conversation_activity_at"), db_now
+                        ):
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_session_generations
+                                SET last_conversation_activity_at = %s,
+                                    updated_at = %s
+                                WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s AND generation = %s
+                                """,
+                                (db_now, db_now, cleaned_p, c_scope, c_uid, c_gen),
+                            )
+
+                # 2. Update dalton_channel_inbound_events
+                if cleaned_p and cleaned_mid:
                     sets: list[str] = ["updated_at = NOW()"]
                     params: list[Any] = []
                     if status is not None:
@@ -3210,6 +5095,20 @@ async def update_inbound_progress(
                     if uploaded_attachments is not None:
                         sets.append("uploaded_attachments = %s")
                         params.append(Jsonb(uploaded_attachments))
+                    if command_effect_status is not None:
+                        sets.append("command_effect_status = %s")
+                        params.append(str(command_effect_status))
+                    if command_reply_pending is not None:
+                        sets.append("command_reply_pending = %s")
+                        params.append(bool(command_reply_pending))
+                    if command_result is not None:
+                        if not isinstance(command_result, dict):
+                            raise HTTPException(
+                                status_code=400,
+                                detail="command_result must be an object",
+                            )
+                        sets.append("command_result = %s")
+                        params.append(Jsonb(command_result))
                     if raw_payload is not None:
                         sets.append("raw_payload = %s")
                         params.append(Jsonb(raw_payload))
@@ -3233,29 +5132,132 @@ async def update_inbound_progress(
                     if in_row and in_row.get("run_id") and not effective_run_id:
                         effective_run_id = str(in_row["run_id"])
 
-                if session_interrupt_update:
-                    si_plat = str(session_interrupt_update["platform"]).strip().lower()
-                    si_scope = str(session_interrupt_update["scope_key"]).strip()
-                    si_uid = str(session_interrupt_update["dalton_user_id"]).strip()
-                    si_val = session_interrupt_update.get("pending_interrupt")
+                # 3. Update dalton_channel_thread_watches BEFORE dalton_channel_background_runs
+                if thread_watch:
+                    tw_tid = normalize_uuid(thread_watch["thread_id"])
+                    tw_uid = str(thread_watch["dalton_user_id"]).strip()
+                    tw_plat = str(thread_watch["platform"]).strip().lower()
+                    tw_addr = str(thread_watch["target_address"]).strip()
+                    tw_scope = str(thread_watch.get("scope_key") or "").strip()
+                    raw_tw_gen = thread_watch.get("generation")
+                    tw_gen = (
+                        int(raw_tw_gen)
+                        if raw_tw_gen is not None and int(raw_tw_gen) > 0
+                        else 0
+                    )
+                    if not tw_scope or tw_scope == tw_addr or tw_gen <= 0:
+                        await cur.execute(
+                            """
+                            SELECT dalton_user_id, platform, target_address,
+                                   scope_key, generation, thread_id
+                            FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s
+                            """,
+                            (tw_tid,),
+                        )
+                        ex_tw = await cur.fetchone()
+                        if ex_tw:
+                            if (not tw_scope or tw_scope == tw_addr) and ex_tw.get(
+                                "scope_key"
+                            ):
+                                tw_scope = str(ex_tw["scope_key"]).strip()
+                            if tw_gen <= 0 and ex_tw.get("generation"):
+                                tw_gen = int(ex_tw["generation"])
+                    if not tw_scope:
+                        tw_scope = tw_addr
+                    if tw_gen <= 0:
+                        tw_gen = 1
+
+                    tw_last_turn = int(thread_watch.get("last_seen_turn_index") or 0)
+                    tw_active = bool(thread_watch.get("watch_active", True))
+                    has_tw_int = "pending_interrupt" in thread_watch
+                    tw_int = thread_watch.get("pending_interrupt")
+                    if not has_tw_int and watch_interrupt_patch and watch_interrupt_patch[0] == tw_tid:
+                        has_tw_int = True
+                        tw_int = watch_interrupt_patch[1]
+                        watch_interrupt_patch = None
+
+                    if has_tw_int:
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_thread_watches (
+                                thread_id, dalton_user_id, platform, target_address,
+                                scope_key, generation, last_seen_turn_index, watch_active,
+                                pending_interrupt, created_at, updated_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                            ON CONFLICT (thread_id) DO UPDATE SET
+                                target_address = EXCLUDED.target_address,
+                                scope_key = EXCLUDED.scope_key,
+                                generation = EXCLUDED.generation,
+                                last_seen_turn_index = GREATEST(
+                                    dalton_channel_thread_watches.last_seen_turn_index,
+                                    EXCLUDED.last_seen_turn_index
+                                ),
+                                watch_active = EXCLUDED.watch_active,
+                                pending_interrupt = EXCLUDED.pending_interrupt,
+                                updated_at = NOW()
+                            """,
+                            (
+                                tw_tid,
+                                tw_uid,
+                                tw_plat,
+                                tw_addr,
+                                tw_scope,
+                                tw_gen,
+                                tw_last_turn,
+                                tw_active,
+                                Jsonb(tw_int) if tw_int is not None else None,
+                            ),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_thread_watches (
+                                thread_id, dalton_user_id, platform, target_address,
+                                scope_key, generation, last_seen_turn_index, watch_active,
+                                created_at, updated_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                            ON CONFLICT (thread_id) DO UPDATE SET
+                                target_address = EXCLUDED.target_address,
+                                scope_key = EXCLUDED.scope_key,
+                                generation = EXCLUDED.generation,
+                                last_seen_turn_index = GREATEST(
+                                    dalton_channel_thread_watches.last_seen_turn_index,
+                                    EXCLUDED.last_seen_turn_index
+                                ),
+                                watch_active = EXCLUDED.watch_active,
+                                updated_at = NOW()
+                            """,
+                            (
+                                tw_tid,
+                                tw_uid,
+                                tw_plat,
+                                tw_addr,
+                                tw_scope,
+                                tw_gen,
+                                tw_last_turn,
+                                tw_active,
+                            ),
+                        )
+
+                if watch_interrupt_patch is not None:
+                    patch_tid, patch_int = watch_interrupt_patch
                     await cur.execute(
                         """
-                        INSERT INTO dalton_channel_session_generations (
-                            platform, scope_key, dalton_user_id, generation, pending_interrupt, updated_at
-                        )
-                        VALUES (%s, %s, %s, 1, %s, NOW())
-                        ON CONFLICT (platform, scope_key, dalton_user_id) DO UPDATE SET
-                            pending_interrupt = EXCLUDED.pending_interrupt,
+                        UPDATE dalton_channel_thread_watches
+                        SET pending_interrupt = %s,
                             updated_at = NOW()
+                        WHERE thread_id = %s
                         """,
                         (
-                            si_plat,
-                            si_scope,
-                            si_uid,
-                            Jsonb(si_val) if si_val is not None else None,
+                            Jsonb(patch_int) if patch_int is not None else None,
+                            patch_tid,
                         ),
                     )
 
+                # 4. Update dalton_channel_background_runs
                 if background_run:
                     bg_rid = str(background_run["run_id"]).strip()
                     bg_tid = normalize_uuid(background_run["thread_id"])
@@ -3291,46 +5293,6 @@ async def update_inbound_progress(
                     )
                     if not effective_run_id:
                         effective_run_id = bg_rid
-
-                if thread_watch:
-                    tw_tid = normalize_uuid(thread_watch["thread_id"])
-                    tw_uid = str(thread_watch["dalton_user_id"]).strip()
-                    tw_plat = str(thread_watch["platform"]).strip().lower()
-                    tw_addr = str(thread_watch["target_address"]).strip()
-                    tw_scope = str(thread_watch["scope_key"]).strip()
-                    tw_gen = int(thread_watch.get("generation") or 1)
-                    tw_last_turn = int(thread_watch.get("last_seen_turn_index") or 0)
-                    tw_active = bool(thread_watch.get("watch_active", True))
-                    await cur.execute(
-                        """
-                        INSERT INTO dalton_channel_thread_watches (
-                            thread_id, dalton_user_id, platform, target_address,
-                            scope_key, generation, last_seen_turn_index, watch_active,
-                            created_at, updated_at
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-                        ON CONFLICT (thread_id) DO UPDATE SET
-                            target_address = EXCLUDED.target_address,
-                            scope_key = EXCLUDED.scope_key,
-                            generation = EXCLUDED.generation,
-                            last_seen_turn_index = GREATEST(
-                                dalton_channel_thread_watches.last_seen_turn_index,
-                                EXCLUDED.last_seen_turn_index
-                            ),
-                            watch_active = EXCLUDED.watch_active,
-                            updated_at = NOW()
-                        """,
-                        (
-                            tw_tid,
-                            tw_uid,
-                            tw_plat,
-                            tw_addr,
-                            tw_scope,
-                            tw_gen,
-                            tw_last_turn,
-                            tw_active,
-                        ),
-                    )
 
                 has_in_flight = False
                 has_unknown = False
@@ -3382,6 +5344,7 @@ async def update_inbound_progress(
                     "has_unknown_current_text": has_unknown,
                     "has_in_flight_or_unknown_current_text": has_in_flight or has_unknown,
                     "sent_to_current_count": sent_count,
+                    "session_is_current_for_interrupt": session_is_current_for_interrupt,
                 }
 
 
@@ -3393,12 +5356,35 @@ async def reconcile_steer(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-7 (3): Reconcile `hook_outbox` steer outcome with `conversation_responses.status` (§1.3.2 & §1.3.1 #3)."""
+    return await _run_tx_with_retry(
+        "reconcile_steer",
+        conn,
+        lambda c: _reconcile_steer_once(
+            platform=platform,
+            message_id=message_id,
+            run_id=run_id,
+            conn=c,
+        ),
+    )
+
+
+async def _reconcile_steer_once(
+    *,
+    platform: str,
+    message_id: str,
+    run_id: str | None = None,
+    conn: Any = None,
+) -> dict[str, Any]:
     cleaned_platform = str(platform or "").strip().lower()
     cleaned_mid = str(message_id or "").strip()
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"dalton_inbound:{cleaned_platform}:{cleaned_mid}",),
+                )
                 await cur.execute(
                     """
                     SELECT * FROM dalton_channel_inbound_events
@@ -3710,6 +5696,18 @@ async def recover_channel_state(
                         (norm_tid, norm_tid),
                     )
                     updated_watches = [dict(r) for r in await cur.fetchall()]
+                    watch_by_tid = {
+                        str(w["thread_id"]): w
+                        for w in updated_watches
+                        if w.get("thread_id")
+                    }
+                    for bgr in bg_runs:
+                        w_match = watch_by_tid.get(str(bgr.get("thread_id") or ""))
+                        if w_match:
+                            if not bgr.get("scope_key") and w_match.get("scope_key"):
+                                bgr["scope_key"] = w_match["scope_key"]
+                            if bgr.get("generation") is None and w_match.get("generation") is not None:
+                                bgr["generation"] = w_match["generation"]
                     return {
                         "mode": "watch_reconnect",
                         "background_runs": _json_safe_rows(bg_runs),
@@ -3739,16 +5737,50 @@ async def recover_channel_state(
                 active_watches = [dict(r) for r in await cur.fetchall()]
                 await _backfill_watch_notification_runs_in_tx(cur, active_watches)
 
+                # Heal any historical pending_cancel command rows that lack a pinned target run_id
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_inbound_events
+                    SET command_effect_status = 'done',
+                        updated_at = NOW()
+                    WHERE command_effect_status = 'pending_cancel'
+                      AND (thread_id IS NULL OR run_id IS NULL OR btrim(run_id) = '')
+                    """
+                )
+
                 # ③ Fetch all 4 recovery sets
                 await cur.execute(
                     """
                     SELECT * FROM dalton_channel_inbound_events
                     WHERE status IN ('pending', 'accepted', 'streaming', 'steered', 'pending_resubmit')
                        OR fallback_pending = TRUE
+                       OR command_reply_pending = TRUE
+                       OR command_effect_status = 'pending_cancel'
                     ORDER BY created_at ASC
                     """
                 )
                 inbound_events = [dict(r) for r in await cur.fetchall()]
+                cleaned_inbound_events: list[dict[str, Any]] = []
+                for r in inbound_events:
+                    if r.get("command_effect_status") == "pending_cancel" and not (
+                        r.get("thread_id") and str(r.get("run_id") or "").strip()
+                    ):
+                        r["command_effect_status"] = "done"
+                        if (
+                            r.get("status")
+                            not in (
+                                "pending",
+                                "accepted",
+                                "streaming",
+                                "steered",
+                                "pending_resubmit",
+                            )
+                            and not r.get("fallback_pending")
+                            and not r.get("command_reply_pending")
+                        ):
+                            continue
+                    cleaned_inbound_events.append(r)
+                inbound_events = cleaned_inbound_events
 
                 await cur.execute(
                     """
@@ -3767,6 +5799,18 @@ async def recover_channel_state(
                     """
                 )
                 thread_watches = [dict(r) for r in await cur.fetchall()]
+                watch_by_tid = {
+                    str(w["thread_id"]): w
+                    for w in thread_watches
+                    if w.get("thread_id")
+                }
+                for bgr in background_runs:
+                    w_match = watch_by_tid.get(str(bgr.get("thread_id") or ""))
+                    if w_match:
+                        if not bgr.get("scope_key") and w_match.get("scope_key"):
+                            bgr["scope_key"] = w_match["scope_key"]
+                        if bgr.get("generation") is None and w_match.get("generation") is not None:
+                            bgr["generation"] = w_match["generation"]
 
                 await cur.execute(
                     """
@@ -3797,6 +5841,8 @@ def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 item[k] = v.isoformat()
             else:
                 item[k] = v
+        if "session_generation" in item and "generation" not in item:
+            item["generation"] = item["session_generation"]
         out.append(item)
     return out
 

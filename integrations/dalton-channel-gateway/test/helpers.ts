@@ -317,6 +317,7 @@ export function createMockBackend(): MockBackend {
       if (
         lastUpdate?.status === "sent" &&
         (req.delivery_key.startsWith("notice:partial:") ||
+          req.delivery_key.endsWith(":command") ||
           (req.delivery_key.startsWith("fallback:") &&
             prevClaimForKey &&
             (req.inbound_message_id ?? null) ===
@@ -544,7 +545,36 @@ export function createMockBackend(): MockBackend {
           return structuredClone(defaultI3WsList);
         }
         if (req.cmd === "workspace_switch") {
-          return structuredClone(defaultI3WsSwitch);
+          const isExplicitName =
+            req.target_kind === "shortcut_name" ||
+            req.target_kind === "exact_name";
+          if (
+            req.target_kind === "home" ||
+            (!isExplicitName &&
+              (req.workspace_query?.toLowerCase() === "home" ||
+                req.workspace_query?.toLowerCase() === "main"))
+          ) {
+            return {
+              ...structuredClone(defaultI3WsSwitch),
+              workspace_id: HOME_WS_ID,
+              home_workspace_id: HOME_WS_ID,
+              is_home: true,
+              workspace_name: "Chief of Staff",
+              override_workspace_id: null,
+            };
+          }
+          return {
+            ...structuredClone(defaultI3WsSwitch),
+            is_home: false,
+            home_workspace_id: HOME_WS_ID,
+            ...(req.workspace_id ? { workspace_id: req.workspace_id } : {}),
+            ...(req.workspace_query
+              ? { workspace_name: req.workspace_query }
+              : {}),
+          };
+        }
+        if (req.cmd === "new") {
+          return structuredClone(defaultI3NewSession);
         }
         return {
           ...structuredClone(defaultI3WsList),
