@@ -52,6 +52,8 @@ from src.server.models.automation import (
     AutomationRunsListResponse,
     AutomationsListResponse,
     AutomationUpdate,
+    CompanyScriptUpdate,
+    CompanyScriptVersionRequest,
     DeliveryDefaultUpdate,
 )
 from src.server.dependencies.principal import (
@@ -86,6 +88,36 @@ def _company_write_response(row: dict[str, Any]):
     from src.dalton.services.company_agent_writes import company_agent_write_response
 
     return company_agent_write_response(row)
+
+
+def _body_is_missing(body: Any) -> bool:
+    return body is None or type(body).__name__ in ("Body", "FieldInfo")
+
+
+def _body_validation_error(exc: ValidationError) -> HTTPException:
+    """422 in the same shape FastAPI uses for a rejected JSON body."""
+    detail = []
+    for item in exc.errors(include_url=False, include_context=False, include_input=False):
+        loc = tuple(item.get("loc") or ())
+        if not loc or loc[0] != "body":
+            item = {**item, "loc": ("body", *loc)}
+        detail.append(item)
+    return HTTPException(status_code=422, detail=detail)
+
+
+def _validate_model(model: Any, body: Any) -> Any:
+    # DALTON-HOOK(company-automations): choose the model after the id is classified
+    if _body_is_missing(body):
+        raise HTTPException(status_code=422, detail="Request body is required")
+    try:
+        return model.model_validate(body)
+    except ValidationError as exc:
+        raise _body_validation_error(exc) from None
+
+
+def _script_expected_version(body: Any) -> int:
+    parsed = _validate_model(CompanyScriptVersionRequest, body)
+    return int(parsed.expected_config_version)
 
 
 # =============================================================================
@@ -365,15 +397,28 @@ async def get_automation(
     return company_resp
 
 
-@router.patch("/automations/{automation_id}", response_model=AutomationResponse)
+# DALTON-HOOK(company-automations): UUID keeps the agent write; data:<job_key> updates the script
+@router.patch("/automations/{automation_id}", response_model=AutomationReadResponse)
 @handle_api_exceptions("update automation", logger, conflict_on_value_error=True)
 async def update_automation(
-    automation_id: UUID,
-    request: AutomationUpdate,
+    automation_id: str,
     principal: WorkspaceSendPrincipal,
     http_request: Request,
+    body: Any = Body(...),
 ):
     """Partial update of an automation."""
+    # DALTON-HOOK(company-automations): classify the id before choosing the agent or script body
+    parsed = _parse_read_id(automation_id)
+    if parsed.kind == "script":
+        script_request = _validate_model(CompanyScriptUpdate, body)
+        from src.dalton.services.company_script_writes import update_company_script
+
+        return await update_company_script(
+            principal, str(parsed.job_key), script_request
+        )
+    # Former UUID path parameter normalized the text. Keep that canonical form.
+    agent_id = str(parsed.agent_id)
+    request = _validate_model(AutomationUpdate, body)
     user_id = principal.user_id
     # DALTON-HOOK(company-automations): company system identity cannot write through this route
     _refuse_company_service_actor(user_id)
@@ -396,7 +441,7 @@ async def update_automation(
             expected_config_version=expected_cv,
         ):
             automation = await handler.update_automation(
-                automation_id=str(automation_id),
+                automation_id=agent_id,
                 user_id=user_id,
                 fields=fields,
             )
@@ -421,7 +466,7 @@ async def update_automation(
 
     company_row = await update_company_agent(
         principal,
-        str(automation_id),
+        agent_id,
         fields,
         request=request,
         expected_config_version=expected_cv,
@@ -460,14 +505,27 @@ async def trigger_automation(
     return result
 
 
-@router.post("/automations/{automation_id}/pause", response_model=AutomationResponse)
+# DALTON-HOOK(company-automations): data pause requires a version; agent pause stays optional
+@router.post("/automations/{automation_id}/pause", response_model=AutomationReadResponse)
 @handle_api_exceptions("pause automation", logger, conflict_on_value_error=True)
 async def pause_automation(
-    automation_id: UUID,
+    automation_id: str,
     principal: WorkspaceWritePrincipal,
     body: Any = Body(default=None),
 ):
     """Pause an active automation."""
+    # DALTON-HOOK(company-automations): classify the id before reading the pause body
+    parsed = _parse_read_id(automation_id)
+    if parsed.kind == "script":
+        version = _script_expected_version(body)
+        from src.dalton.services.company_script_writes import pause_company_script
+
+        return await pause_company_script(
+            principal,
+            str(parsed.job_key),
+            expected_config_version=version,
+        )
+    agent_id = str(parsed.agent_id)
     user_id = principal.user_id
     # DALTON-HOOK(company-automations): company system identity cannot pause through this route
     _refuse_company_service_actor(user_id)
@@ -478,7 +536,7 @@ async def pause_automation(
         action="pause",
         expected_config_version=expected_cv,
     ):
-        automation = await handler.pause_automation(str(automation_id), user_id)
+        automation = await handler.pause_automation(agent_id, user_id)
     if automation:
         resp = AutomationResponse.model_validate(automation)
         # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
@@ -491,7 +549,7 @@ async def pause_automation(
 
     company_row = await pause_company_agent(
         principal,
-        str(automation_id),
+        agent_id,
         expected_config_version=expected_cv,
     )
     if not company_row:
@@ -499,15 +557,28 @@ async def pause_automation(
     return _company_write_response(company_row)
 
 
-@router.post("/automations/{automation_id}/resume", response_model=AutomationResponse)
+# DALTON-HOOK(company-automations): data resume requires a version; agent resume stays optional
+@router.post("/automations/{automation_id}/resume", response_model=AutomationReadResponse)
 @handle_api_exceptions("resume automation", logger, conflict_on_value_error=True)
 async def resume_automation(
-    automation_id: UUID,
+    automation_id: str,
     # Re-arms runs into the automation's thread, so not the call's own.
     principal: WorkspaceSendPrincipal,
     body: Any = Body(default=None),
 ):
     """Resume a paused or disabled automation."""
+    # DALTON-HOOK(company-automations): classify the id before reading the resume body
+    parsed = _parse_read_id(automation_id)
+    if parsed.kind == "script":
+        version = _script_expected_version(body)
+        from src.dalton.services.company_script_writes import resume_company_script
+
+        return await resume_company_script(
+            principal,
+            str(parsed.job_key),
+            expected_config_version=version,
+        )
+    agent_id = str(parsed.agent_id)
     user_id = principal.user_id
     # DALTON-HOOK(company-automations): company system identity cannot resume through this route
     _refuse_company_service_actor(user_id)
@@ -518,7 +589,7 @@ async def resume_automation(
         action="resume",
         expected_config_version=expected_cv,
     ):
-        automation = await handler.resume_automation(str(automation_id), user_id)
+        automation = await handler.resume_automation(agent_id, user_id)
     if automation:
         resp = AutomationResponse.model_validate(automation)
         # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
@@ -531,7 +602,7 @@ async def resume_automation(
 
     company_row = await resume_company_agent(
         principal,
-        str(automation_id),
+        agent_id,
         expected_config_version=expected_cv,
     )
     if not company_row:

@@ -1,8 +1,9 @@
-"""Read-only SQL for the unified company task API.
+"""SQL for the unified company task API.
 
 Company agent rows must match both ``scope = 'company'`` and the fixed company
-user. Script rows are limited to caller-supplied manifest job keys. This module
-does not insert, update, or delete.
+user. Script rows are limited to caller-supplied manifest job keys. Reads do
+not insert or seed. Script schedule writes update an existing definition row
+and may cancel queued runs; they do not insert a definition.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from typing import Any
 import uuid
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
 from src.server.database.pool import get_db_connection
@@ -407,3 +409,118 @@ async def read_user_model_preferences(
             )
             rows = await cur.fetchall()
     return {str(row["user_id"]): row.get("model_preference") for row in rows}
+
+
+_DEF_LOCK_COLUMNS = _DEF_READ_COLUMNS + ",\n    audit_history"
+
+
+def _require_write_conn(conn: Any) -> None:
+    """Definition writes must stay on the caller's open transaction."""
+    if conn is None:
+        raise RuntimeError("script definition writes require the caller's transaction")
+
+
+async def lock_script_def_for_update(
+    job_key: str,
+    *,
+    conn: Any,
+) -> dict[str, Any] | None:
+    """Lock one existing definition row. Does not insert a missing row."""
+    _require_write_conn(conn)
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_DEF_LOCK_COLUMNS}
+                FROM dalton_data_task_defs
+                WHERE job_key = %s
+                FOR UPDATE
+                """,
+                (job_key,),
+            )
+            row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def update_locked_script_def(
+    job_key: str,
+    *,
+    enabled: bool,
+    paused_by_user: bool,
+    cron_expr: str,
+    timezone: str,
+    config_version: int,
+    active_version: int,
+    updated_by: str,
+    audit_history: list[Any],
+    expected_config_version: int,
+    conn: Any,
+) -> bool:
+    """Update schedule and version columns of the row locked by the caller.
+
+    Notification, cos, command, migration, and deletion columns are not written.
+    ``False`` means the locked version no longer matches ``expected_config_version``.
+    """
+    _require_write_conn(conn)
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_data_task_defs
+                SET
+                    enabled = %s,
+                    paused_by_user = %s,
+                    cron_expr = %s,
+                    timezone = %s,
+                    config_version = %s,
+                    active_version = %s,
+                    updated_by = %s,
+                    audit_history = %s,
+                    updated_at = NOW()
+                WHERE job_key = %s
+                  AND config_version = %s
+                """,
+                (
+                    enabled,
+                    paused_by_user,
+                    cron_expr,
+                    timezone,
+                    config_version,
+                    active_version,
+                    updated_by,
+                    Jsonb(audit_history),
+                    job_key,
+                    expected_config_version,
+                ),
+            )
+            return cur.rowcount == 1
+
+
+async def cancel_queued_script_runs(
+    job_key: str,
+    *,
+    failure_reason: str,
+    trigger_source: str | None = None,
+    conn: Any,
+) -> int:
+    """Cancel queued runs that have not started. Leave starting and running rows."""
+    _require_write_conn(conn)
+    sql = """
+        UPDATE dalton_data_task_runs
+        SET
+            status = 'cancelled',
+            failure_reason = %s,
+            notify_status = 'skipped',
+            completed_at = NOW(),
+            updated_at = NOW()
+        WHERE job_key = %s
+          AND status = 'queued'
+    """
+    params: list[Any] = [failure_reason, job_key]
+    if trigger_source is not None:
+        sql += " AND trigger_source = %s"
+        params.append(trigger_source)
+    async with get_db_connection(conn) as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(sql, tuple(params))
+            return int(cur.rowcount or 0)
