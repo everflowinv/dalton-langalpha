@@ -4,13 +4,15 @@
   "private": true,
   "type": "module",
   "bin": {
-    "dalton-channel-gateway": "./dist/index.mjs"
+    "dalton-channel-gateway": "./dist/index.mjs",
+    "dalton-native-commands": "./dist/native-commands.mjs"
   },
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
     "build": "node build.mjs",
+    "native-commands": "node ./dist/native-commands.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
