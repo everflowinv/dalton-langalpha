@@ -250,12 +250,24 @@ async def test_sales_notes_ingest_dry_run_returns_preview():
         )
     assert code == 200 and payload["status"] == "dry_run"
     assert payload["dry_run"] is True
-    # The argv rides the add-note subcommand with --dry-run, institution and
-    # a temp-file --content, never the text on the command line.
+    # The argv launches run.sh via /bin/bash and rides the add-note subcommand
+    # with --dry-run, institution, title, and a temp-file --content, never the
+    # text on the command line.
     cmd = captured["cmd"]
-    assert cmd[1:4] == ["--json", "add-note", "--institution"]
-    assert "--dry-run" in cmd
-    assert any(a == "--content" and b.startswith("@") for a, b in zip(cmd, cmd[1:]))
+    assert cmd[:9] == [
+        "/bin/bash",
+        "/nonexistent/run.sh",
+        "--json",
+        "add-note",
+        "--institution",
+        "MS",
+        "--title",
+        "T",
+        "--dry-run",
+    ]
+    assert len(cmd) == 11
+    assert cmd[9] == "--content"
+    assert cmd[10].startswith("@")
 
 
 class TestIngestRouter:

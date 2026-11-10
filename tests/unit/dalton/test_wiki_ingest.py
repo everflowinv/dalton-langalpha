@@ -48,9 +48,12 @@ def _make_test_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     """Create an isolated `ResearchDataBridge` rooted under `tmp_path` without touching `~/.openclaw`."""
     ocw_root = tmp_path / "openclaw_workspace"
     skill_dir = ocw_root / "skills" / "company-wiki"
-    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    cli_py = skill_dir / "scripts" / "company_wiki_cli.py"
+    cli_py.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    overlay_run_sh = BRIDGE_DIR / "openclaw_overlays" / "skills" / "company-wiki" / "run.sh"
     run_sh = skill_dir / "run.sh"
-    run_sh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    run_sh.write_text(overlay_run_sh.read_text(encoding="utf-8"), encoding="utf-8")
     run_sh.chmod(0o755)
 
     config_json = skill_dir / "config.json"
@@ -87,6 +90,35 @@ def _make_test_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     cfg.wiki_ingest_temp_dir = tmp_path / "var" / "dalton" / "tmp" / "wiki_ingest"
     cfg.wiki_ingest_timeout_s = 30.0
     return rb.ResearchDataBridge(cfg)
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "cli_name", "config_name", "resolver_name"),
+    [
+        ("company-wiki", "company_wiki_cli.py", "wiki_run_sh", "_resolve_wiki_run_sh"),
+        ("market-digest", "market_digest_cli.py", "market_digest_run_sh", "_resolve_market_digest_run_sh"),
+    ],
+)
+def test_supported_skill_launcher_uses_maintained_content(
+    tmp_path: Path, skill_name: str, cli_name: str, config_name: str, resolver_name: str,
+) -> None:
+    bridge = _make_test_bridge(tmp_path)
+    skill_dir = tmp_path / skill_name
+    (skill_dir / "scripts").mkdir(parents=True)
+    (skill_dir / "scripts" / cli_name).write_text("", encoding="utf-8")
+    launcher = skill_dir / "run.sh"
+    overlay = BRIDGE_DIR / "openclaw_overlays" / "skills" / skill_name / "run.sh"
+    setattr(bridge.cfg, config_name, launcher)
+    resolve = getattr(bridge, resolver_name)
+
+    launcher.write_bytes(overlay.read_bytes())
+    assert resolve() == launcher
+
+    launcher.write_text(
+        f"#!/bin/sh\n# exec-nonarchive {cli_name}\nexec python3 scripts/{cli_name}\n",
+        encoding="utf-8",
+    )
+    assert resolve() == overlay
 
 
 async def _send_raw_http_request(
@@ -911,10 +943,10 @@ async def test_bridge_wiki_ingest_cancellation_kills_reaps_cleans_temp_and_logs_
             }
         )
     )
-    await started_event.wait()
+    await asyncio.wait_for(started_event.wait(), timeout=5.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=5.0)
 
     fake_proc.kill.assert_called_once()
     fake_proc.wait.assert_called_once()
