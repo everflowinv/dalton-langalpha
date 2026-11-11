@@ -14,7 +14,9 @@ import type {
   AutomationRunReadQuery,
   AutomationScope,
   AutomationUpdatePayload,
+  CompanyScriptUpdatePayload,
   DeliveryOptions,
+  ScriptAutomationRead,
 } from '@/types/automation';
 
 export interface AutomationList {
@@ -38,20 +40,37 @@ export const listAutomations = (params: QueryParams): Promise<ApiResponse<Automa
 export const createAutomation = (data: AutomationPayload): Promise<ApiResponse<Automation>> =>
   api.post('/api/v1/automations', data);
 
-export const updateAutomation = (id: string, data: AutomationUpdatePayload): Promise<ApiResponse<Automation>> =>
-  api.patch(`/api/v1/automations/${id}`, data);
+export const updateAutomation = (
+  id: string,
+  data: AutomationUpdatePayload & { expected_config_version?: number },
+): Promise<ApiResponse<Automation>> => api.patch(automationItemPath(id), data);
 
-export const deleteAutomation = (id: string): Promise<ApiResponse> =>
-  api.delete(`/api/v1/automations/${id}`);
+// DALTON-HOOK(company-automations): script schedule patch. The body is only cron, timezone, and version.
+export function updateCompanyScript(
+  id: string,
+  data: CompanyScriptUpdatePayload,
+): Promise<ApiResponse<ScriptAutomationRead>> {
+  const body: CompanyScriptUpdatePayload = { expected_config_version: data.expected_config_version };
+  if (typeof data.cron_expression === 'string') body.cron_expression = data.cron_expression;
+  if (typeof data.timezone === 'string') body.timezone = data.timezone;
+  return api.patch(automationItemPath(id), body);
+}
 
-export const pauseAutomation = (id: string): Promise<ApiResponse> =>
-  api.post(`/api/v1/automations/${id}/pause`);
+export const deleteAutomation = (id: string): Promise<ApiResponse> => api.delete(automationItemPath(id));
 
-export const resumeAutomation = (id: string): Promise<ApiResponse> =>
-  api.post(`/api/v1/automations/${id}/resume`);
+/** Personal and research callers omit the version and send no body. Company sends the version. */
+export const pauseAutomation = (id: string, expectedConfigVersion?: number): Promise<ApiResponse> =>
+  postVersion(automationItemPath(id, '/pause'), expectedConfigVersion);
 
-export const triggerAutomation = (id: string): Promise<ApiResponse> =>
-  api.post(`/api/v1/automations/${id}/trigger`);
+export const resumeAutomation = (id: string, expectedConfigVersion?: number): Promise<ApiResponse> =>
+  postVersion(automationItemPath(id, '/resume'), expectedConfigVersion);
+
+export const triggerAutomation = (id: string): Promise<ApiResponse> => api.post(automationItemPath(id, '/trigger'));
+
+function postVersion(url: string, expectedConfigVersion?: number): Promise<ApiResponse> {
+  if (expectedConfigVersion == null) return api.post(url);
+  return api.post(url, { expected_config_version: expectedConfigVersion });
+}
 
 export const listExecutions = (id: string, params: QueryParams): Promise<ApiResponse<ExecutionList>> =>
   api.get(`/api/v1/automations/${id}/executions`, { params });
@@ -171,7 +190,7 @@ function readParams(
 }
 
 /** A UUID or a full `data:<job_key>`. The path is encoded, not checked. */
-function automationReadPath(id: string, suffix = ''): string {
+function automationItemPath(id: string, suffix = ''): string {
   if (!id) throw new Error('Missing automation id');
   return `/api/v1/automations/${encodeURIComponent(id)}${suffix}`;
 }
@@ -194,7 +213,7 @@ export function listAutomationRunReads(
 
 /** One agent UUID or one full `data:<job_key>`. The route takes no scope. */
 export function getAutomationRead(id: string): Promise<ApiResponse<AutomationRead>> {
-  return api.get(automationReadPath(id));
+  return api.get(automationItemPath(id));
 }
 
 /** One task's run page. The route takes no scope, status, or thread. */
@@ -203,7 +222,7 @@ export function listAutomationExecutionReads(
   params: AutomationReadPageParams = {},
 ): Promise<ApiResponse<AutomationRunReadList>> {
   const query = automationExecutionReadQuery(params);
-  return api.get(automationReadPath(id, '/executions'), { params: readParams(query) });
+  return api.get(automationItemPath(id, '/executions'), { params: readParams(query) });
 }
 
 /** One task's modification history. The route takes no scope. */
@@ -212,5 +231,5 @@ export function listAutomationHistory(
   params: AutomationReadPageParams = {},
 ): Promise<ApiResponse<AutomationHistory>> {
   const query = automationHistoryQuery(params);
-  return api.get(automationReadPath(id, '/history'), { params: readParams(query) });
+  return api.get(automationItemPath(id, '/history'), { params: readParams(query) });
 }

@@ -180,6 +180,14 @@ export interface AutomationPayload {
  *  trigger for life, so there is no `trigger_type`. */
 export type AutomationUpdatePayload = Partial<Omit<AutomationPayload, 'trigger_type'>>;
 
+/** Schedule change for one company script. Unknown fields are refused.
+ *  `expected_config_version` is the detail's current `config_version`. */
+export interface CompanyScriptUpdatePayload {
+  cron_expression?: string;
+  timezone?: string;
+  expected_config_version: number;
+}
+
 /** One entry of the cross-automation run feed: a run and the identity of
  *  the automation it belongs to. */
 export interface AutomationRun extends AutomationExecution {

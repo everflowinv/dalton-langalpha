@@ -1237,7 +1237,7 @@ def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess
 
         child_script = "\n".join(
             [
-                "import json",
+                "import json, signal",
                 "from pathlib import Path",
                 "from uuid import uuid4",
                 "from src.dalton.data_jobs.notification_payloads import (",
@@ -1245,6 +1245,7 @@ def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess
                 "    _safe_read_contained_regular_file,",
                 "    build_data_task_delivery_plan,",
                 ")",
+                "signal.alarm(3)",
                 f"root = Path({str(tmp_dir)!r})",
                 "direct_code = None",
                 "try:",
@@ -1266,6 +1267,7 @@ def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess
                 "    )",
                 "except DataTaskArtifactError as exc:",
                 "    plan_code = exc.code",
+                "signal.alarm(0)",
                 "print(json.dumps({'direct_code': direct_code, 'plan_code': plan_code}), flush=True)",
             ]
         )
@@ -1278,12 +1280,12 @@ def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess
             text=True,
         )
         try:
-            stdout_text, stderr_text = proc.communicate(timeout=3.0)
+            stdout_text, stderr_text = proc.communicate(timeout=15.0)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate(timeout=5.0)
             pytest.fail(
-                "FIFO artifact open blocked in isolated child subprocess beyond 3.0s hard timeout"
+                "FIFO child did not finish within the 15s process timeout"
             )
 
         assert proc.returncode == 0, f"Child subprocess failed: {stderr_text}"
@@ -2053,12 +2055,13 @@ async def test_bounded_run_metadata_and_database_precedence_across_scheduler_and
         project_root = Path(__file__).resolve().parents[3]
         child_code = "\n".join(
             [
-                "import json, os, uuid",
+                "import json, os, signal, uuid",
                 "from pathlib import Path",
                 "from src.dalton.data_jobs.container_runner import build_path_map, read_run_artifacts",
                 "from src.dalton.data_jobs.notification_payloads import DataTaskArtifactError",
                 "from src.dalton.data_jobs import scheduler as sched_mod",
                 "from src.dalton.database import data_task_notifications as dtn_db",
+                "signal.alarm(3)",
                 f"base = Path({str(fifo_tmp)!r})",
                 "pm = build_path_map(host_var_dir=base / 'h', backend_var_dir=base / 'b')",
                 # Run A: valid `outbox.json`, writerless FIFO at `frozen_manifest.json` -> notification must NOT open manifest; strict completion rejects FIFO promptly
@@ -2086,6 +2089,7 @@ async def test_bounded_run_metadata_and_database_precedence_across_scheduler_and
                 "except DataTaskArtifactError as exc:",
                 "    outbox_fifo_api = exc.code",
                 "_, _, outbox_fifo_sched = sched_mod._resolve_run_notify_payload(rid_b, 'us-topbottom-dm-v23', db_outbox_payload=None, log_tail=None, path_map=pm)",
+                "signal.alarm(0)",
                 "print(json.dumps({",
                 "    'a_api_ok': a_api == {'items': [{'text': 'ok'}]},",
                 "    'a_sched_count': a_sched.get('expected_item_count'),",
@@ -2104,12 +2108,12 @@ async def test_bounded_run_metadata_and_database_precedence_across_scheduler_and
             text=True,
         )
         try:
-            stdout_text, stderr_text = proc.communicate(timeout=3.0)
+            stdout_text, stderr_text = proc.communicate(timeout=15.0)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate(timeout=5.0)
             pytest.fail(
-                "Metadata FIFO open blocked in isolated child subprocess beyond 3.0s hard timeout"
+                "Metadata FIFO child did not finish within the 15s process timeout"
             )
         assert proc.returncode == 0, f"Child subprocess failed: {stderr_text}"
         parsed_res = json.loads(stdout_text.strip().splitlines()[-1])
