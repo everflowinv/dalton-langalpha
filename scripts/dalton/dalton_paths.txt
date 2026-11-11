@@ -290,3 +290,6 @@ web/src/pages/Automations/__tests__/Automations.groups.test.tsx
 web/src/pages/Automations/__tests__/readBridge.ts
 web/src/pages/Automations/utils/__tests__/api.writes.test.ts
 tests/unit/dalton/test_sec_call_observability.py
+
+# Claude Fable 5.2 native API and OAuth routes (overlay only; manifests stay upstream).
+tests/unit/dalton/test_fable52.py
