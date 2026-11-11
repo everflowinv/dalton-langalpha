@@ -353,3 +353,113 @@ def test_public_functions_take_server_identity_and_no_recipient() -> None:
     assert "cards" in submit_names
     assert "failure_text" in submit_names
     assert "cards" not in status_names
+
+
+def test_cards_keep_a_failure_snapshot_and_only_certain_failures_qualify() -> None:
+    prepared, err = prepare_automation_report_content(
+        profile="msft-tracker",
+        cards=[_card()],
+        failure_text=None,
+    )
+    assert err is None and prepared is not None
+    parsed, profile_err = parse_report_profile(_profile())
+    assert profile_err is None and parsed is not None
+    execution_id = "11111111-1111-1111-1111-111111111111"
+    payload = reports._build_payload(
+        profile=parsed,
+        prepared=prepared,
+        report_run_id="digest-1",
+        execution_id=execution_id,
+        owner_user_id="owner",
+        automation_id="22222222-2222-2222-2222-222222222222",
+        targets=list(parsed["report_targets"]),
+    )
+    assert payload["failure_target_snapshot"] == list(parsed["failure_targets"])
+    assert payload["target_snapshot"] == list(parsed["report_targets"])
+    assert payload["cards"] == prepared["cards"]
+    assert payload["content_sha256"] == prepared["content_sha256"]
+    assert payload["content_sha256"] == automation_report_content_sha256(
+        profile="msft-tracker",
+        content_kind="cards",
+        cards=prepared["cards"],
+        failure_text=None,
+    )
+    assert "failure_text" not in payload
+
+    text_prepared, text_err = prepare_automation_report_content(
+        profile="msft-tracker",
+        cards=None,
+        failure_text="The digest failed closed.",
+    )
+    assert text_err is None and text_prepared is not None
+    text_payload = reports._build_payload(
+        profile=parsed,
+        prepared=text_prepared,
+        report_run_id="fail-1",
+        execution_id=execution_id,
+        owner_user_id="owner",
+        automation_id="22222222-2222-2222-2222-222222222222",
+        targets=list(parsed["failure_targets"]),
+    )
+    assert "failure_target_snapshot" not in text_payload
+
+    assert reports.failure_target_snapshot_of({}) is None
+    assert reports.failure_target_snapshot_of({"failure_target_snapshot": []}) == []
+    assert reports.failure_target_snapshot_of(
+        {"failure_target_snapshot": [" discord:user:424242424242424242 "]}
+    ) == ["discord:user:424242424242424242"]
+    assert reports.failure_target_snapshot_of({"failure_target_snapshot": [""]}) is None
+
+    certain = {"status": "failed", "error_code": "http_500", "attempt_count": 3}
+    assert reports.card_delivery_is_terminal(certain) is True
+    assert reports.card_delivery_is_terminal({**certain, "attempt_count": 1}) is False
+    assert reports.card_delivery_is_terminal(
+        {"status": "failed", "error_code": "attempts_exhausted", "attempt_count": 1}
+    ) is True
+    for code in (
+        "unknown",
+        "in_flight",
+        "partial",
+        "gateway_restarted",
+        "delivery_uncertain",
+        "toggle_off",
+        "target_removed",
+        "not_started",
+    ):
+        assert reports.card_delivery_is_terminal({**certain, "error_code": code}) is False
+    assert reports.card_delivery_is_terminal({**certain, "status": "pending"}) is False
+    assert reports.card_delivery_is_terminal({**certain, "status": "skipped"}) is False
+
+    terminal_rows = [
+        {"target": "feishu:chat:oc_b", "error_code": "http_500", "attempt_count": 3},
+        {"target": "feishu:chat:oc_a", "error_code": "http_502", "attempt_count": 3},
+    ]
+    notice = reports.build_failure_alert_payload(
+        report_payload=payload,
+        execution_id=execution_id,
+        terminal_rows=terminal_rows,
+        failure_targets=payload["failure_target_snapshot"],
+    )
+    assert notice["source"] == reports.FAILURE_ALERT_SOURCE
+    assert notice["content_kind"] == "failure_text"
+    assert notice["expected_item_count"] == 1
+    assert notice["original_execution_id"] == execution_id
+    assert notice["original_content_sha256"] == payload["content_sha256"]
+    assert "cards" not in notice
+    assert notice["failure_text"].splitlines()[3:] == [
+        "- feishu:chat:oc_a: http_502 attempt 3",
+        "- feishu:chat:oc_b: http_500 attempt 3",
+    ]
+    assert notice["content_sha256"] == automation_report_content_sha256(
+        profile=notice["profile"],
+        content_kind="failure_text",
+        cards=None,
+        failure_text=notice["failure_text"],
+    )
+    items, item_err = reports.native_items_from_failure_alert_payload(notice)
+    assert item_err is None
+    assert items == [{"item_index": 0, "kind": "text", "text": notice["failure_text"]}]
+    assert reports.native_items_from_report_payload(notice) == (None, "payload_invalid")
+    assert reports.is_failure_alert_payload(notice) is True
+    assert reports.is_automation_report_payload(notice) is False
+    assert reports.is_failure_alert_payload(payload) is False

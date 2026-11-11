@@ -1898,3 +1898,434 @@ async def test_report_profile_settlement_does_not_send_generic_text(
     ) is True
     post.assert_not_called()
     assert len(calls) == 2
+
+
+async def _set_delivery(
+    world: World,
+    execution_id: str,
+    target: str,
+    *,
+    status: str,
+    attempt: int,
+    error_code: str | None,
+) -> None:
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET status = %s,
+                    attempt_count = %s,
+                    error_code = %s,
+                    updated_at = NOW()
+                WHERE execution_id = %s
+                  AND target = %s
+                """,
+                (status, attempt, error_code, execution_id, target),
+            )
+            assert cur.rowcount == 1
+
+
+def _sourced(rows: list[dict[str, Any]], execution_id: str, source: str) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if row["execution_id"] == execution_id and row["payload_json"].get("source") == source
+    ]
+
+
+async def _mark_cards_failed(world: World, execution_id: str, *, attempt: int, error_code: str) -> None:
+    for target in (world.chat_a, world.chat_b):
+        await _set_delivery(
+            world,
+            execution_id,
+            target,
+            status="failed",
+            attempt=attempt,
+            error_code=error_code,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cards_save_a_failure_snapshot_without_changing_the_body(world: World) -> None:
+    saved = await _submit(world)
+    payload = saved["payload"]
+    digest = reports.automation_report_content_sha256(
+        profile=payload["profile"],
+        content_kind="cards",
+        cards=payload["cards"],
+        failure_text=None,
+    )
+    assert payload["content_sha256"] == digest
+    assert payload["failure_target_snapshot"] == [world.discord_target]
+    assert payload["target_snapshot"] == [world.chat_a, world.chat_b]
+    stored = _sourced(await _rows(world), world.execution_id, "automation_report")
+    assert len(stored) == 2
+    assert all(row["payload_json"]["cards"] == payload["cards"] for row in stored)
+    assert all(row["payload_json"]["content_sha256"] == digest for row in stored)
+
+    execution_id, thread_id, run_id = await _add_execution(world)
+    text = await _submit(
+        world,
+        execution_id=execution_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        report_run_id="fail-no-snapshot",
+        cards=None,
+        failure_text="The digest failed closed.",
+    )
+    assert text["ok"] is True
+    assert text["targets"] == [world.discord_target]
+    assert "failure_target_snapshot" not in text["payload"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_card_failure_creates_one_discord_failure_alert(world: World) -> None:
+    saved = await _submit(world)
+    digest = saved["payload"]["content_sha256"]
+    cards = saved["payload"]["cards"]
+    early = await reports.ensure_report_failure_alert(world.execution_id)
+    assert early == {
+        "ok": True,
+        "code": "not_terminal",
+        "created": False,
+        "targets": [world.discord_target],
+    }
+    await _mark_cards_failed(world, world.execution_id, attempt=1, error_code="http_500")
+    retryable = await reports.ensure_report_failure_alert(world.execution_id)
+    assert retryable["code"] == "not_terminal"
+    assert _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE) == []
+
+    for code in ("unknown", "in_flight", "partial"):
+        for target in (world.chat_a, world.chat_b):
+            await _set_delivery(
+                world,
+                world.execution_id,
+                target,
+                status="pending",
+                attempt=3,
+                error_code=code,
+            )
+        uncertain = await reports.ensure_report_failure_alert(world.execution_id)
+        assert uncertain["code"] == "not_terminal"
+    assert _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE) == []
+
+    await _mark_cards_failed(world, world.execution_id, attempt=3, error_code="http_500")
+    created, repeated = await asyncio.gather(
+        reports.ensure_report_failure_alert(world.execution_id),
+        reports.ensure_report_failure_alert(world.execution_id),
+    )
+    assert sorted([created["code"], repeated["code"]]) == ["created", "exists"]
+    assert sorted([created["created"], repeated["created"]]) == [False, True]
+    alerts = _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(alerts) == 1
+    assert alerts[0]["channel"] == "discord"
+    assert alerts[0]["target"] == world.discord_target
+    assert alerts[0]["status"] == "pending"
+    assert alerts[0]["attempt_count"] == 0
+    notice = alerts[0]["payload_json"]
+    assert notice["original_execution_id"] == world.execution_id
+    assert notice["original_content_sha256"] == digest
+    assert notice["content_kind"] == "failure_text"
+    assert notice["expected_item_count"] == 1
+    assert "cards" not in notice
+    assert world.chat_a in notice["failure_text"]
+    assert world.chat_b in notice["failure_text"]
+    original = _sourced(await _rows(world), world.execution_id, "automation_report")
+    assert len(original) == 2
+    assert all(row["payload_json"]["cards"] == cards for row in original)
+    assert all(row["payload_json"]["content_sha256"] == digest for row in original)
+    assert all(
+        row["payload_json"]["failure_target_snapshot"] == [world.discord_target]
+        for row in original
+    )
+    status = await _status(world)
+    assert status["targets"] == [world.chat_a, world.chat_b]
+    assert status["delivery_confirmed"] is False
+    assert await reports.read_execution_report_confirmed(world.execution_id) is False
+    loaded = await reports.load_execution_report_rows(world.execution_id)
+    assert {row["target"] for row in loaded} == {world.chat_a, world.chat_b}
+
+    again = await reports.ensure_report_failure_alert(world.execution_id)
+    assert again["code"] == "exists"
+    assert again["created"] is False
+    assert len(_sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE)) == 1
+
+    missing_id, missing_thread, missing_run = await _add_execution(world)
+    missing_saved = await _submit(
+        world,
+        execution_id=missing_id,
+        thread_id=missing_thread,
+        run_id=missing_run,
+        report_run_id="missing-snapshot",
+        cards=[_card("Other [10-Q](https://example.com/msft/10q)")],
+    )
+    assert missing_saved["created"] is True
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET payload_json = payload_json - 'failure_target_snapshot'
+                WHERE execution_id = %s
+                  AND COALESCE(payload_json->>'source', '') = 'automation_report'
+                """,
+                (missing_id,),
+            )
+            assert cur.rowcount == 2
+    await _mark_cards_failed(world, missing_id, attempt=3, error_code="http_500")
+    missing = await reports.ensure_report_failure_alert(missing_id)
+    assert missing["code"] == "failure_snapshot_missing"
+    assert missing["created"] is False
+    assert _sourced(await _rows(world), missing_id, reports.FAILURE_ALERT_SOURCE) == []
+
+    text_id, text_thread, text_run = await _add_execution(world)
+    text_saved = await _submit(
+        world,
+        execution_id=text_id,
+        thread_id=text_thread,
+        run_id=text_run,
+        report_run_id="original-failure-text",
+        cards=None,
+        failure_text="The digest failed closed.",
+    )
+    assert text_saved["targets"] == [world.discord_target]
+    await _set_delivery(
+        world,
+        text_id,
+        world.discord_target,
+        status="failed",
+        attempt=3,
+        error_code="http_500",
+    )
+    derived = await reports.ensure_report_failure_alert(text_id)
+    assert derived["code"] == "not_cards"
+    assert _sourced(await _rows(world), text_id, reports.FAILURE_ALERT_SOURCE) == []
+    assert len(_sourced(await _rows(world), text_id, "automation_report")) == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_alert_skips_recovered_cards_and_catchup_sends_once(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    await _submit(world)
+    denied = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.discord_target,
+        **_plan_kwargs(world),
+    )
+    assert denied["authorized"] is False
+    assert denied["code"] == "target_not_routed"
+
+    await _mark_cards_failed(world, world.execution_id, attempt=3, error_code="http_500")
+    created = await reports.ensure_report_failure_alert(world.execution_id)
+    assert created["created"] is True
+    plan = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.discord_target,
+        **_plan_kwargs(world),
+    )
+    assert plan["authorized"] is True
+    assert plan["recipient_id"] == world.discord_id
+    assert plan["platform"] == "discord"
+    notice_text = _sourced(
+        await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE
+    )[0]["payload_json"]["failure_text"]
+    assert len(plan["items"]) == 1
+    alert_item = plan["items"][0]
+    assert alert_item["item_index"] == 0
+    assert alert_item["kind"] == "text"
+    assert alert_item["text"] == notice_text
+    assert "card" not in alert_item
+    assert "artifact" not in alert_item
+    assert alert_item["delivery_key"] == (
+        f"data_task:{world.execution_id}:discord:{world.discord_id}:item:0"
+    )
+    card_plan = await dtn.authorize_data_task_notification_plan(
+        run_id=world.execution_id,
+        target=world.chat_a,
+        **_plan_kwargs(world),
+    )
+    assert card_plan["authorized"] is True
+    assert card_plan["items"][0]["delivery_key"] != plan["items"][0]["delivery_key"]
+
+    for target in (world.chat_a, world.chat_b):
+        await _set_delivery(
+            world,
+            world.execution_id,
+            target,
+            status="sent",
+            attempt=3,
+            error_code=None,
+        )
+    calls: list[dict[str, Any]] = []
+
+    async def _notify(
+        targets: list[str],
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: Any = None,
+    ) -> dict[str, Any]:
+        _ = (text, card, images, gateway_url, service_token, timeout_s, http_client)
+        calls.append({"target": targets[0], "run_id": run_id})
+        return {
+            "ok": False,
+            "status": "failed",
+            "results": [{"target": targets[0], "ok": False, "status": "failed"}],
+        }
+
+    notify = create_autospec(post_data_task_gateway_notify, side_effect=_notify)
+    skipped = await notify_dispatch.dispatch_report_failure_alert(
+        world.execution_id,
+        notify_fn=notify,
+        **_plan_kwargs(world),
+    )
+    assert calls == []
+    assert skipped["code"] == "report_recovered"
+    recovered = _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(recovered) == 1
+    assert recovered[0]["status"] == "skipped"
+    assert recovered[0]["error_code"] == "report_recovered"
+
+    recur_id, recur_thread, recur_run = await _add_execution(world)
+    recur_saved = await _submit(
+        world,
+        execution_id=recur_id,
+        thread_id=recur_thread,
+        run_id=recur_run,
+        report_run_id="recur-alert",
+        cards=[_card("Recur [10-K](https://example.com/msft/10k)")],
+    )
+    assert recur_saved["created"] is True
+    await _mark_cards_failed(world, recur_id, attempt=3, error_code="http_500")
+    assert (await reports.ensure_report_failure_alert(recur_id))["created"] is True
+    await _set_delivery(
+        world,
+        recur_id,
+        world.discord_target,
+        status="failed",
+        attempt=3,
+        error_code="http_500",
+    )
+    repeat = await reports.ensure_report_failure_alert(recur_id)
+    assert repeat["code"] == "exists"
+    exhausted = await notify_dispatch.dispatch_report_failure_alert(
+        recur_id,
+        notify_fn=notify,
+        **_plan_kwargs(world),
+    )
+    assert exhausted["ok"] is True
+    assert calls == []
+    assert len(_sourced(await _rows(world), recur_id, reports.FAILURE_ALERT_SOURCE)) == 1
+
+    catch_id, catch_thread, catch_run = await _add_execution(world)
+    catch_saved = await _submit(
+        world,
+        execution_id=catch_id,
+        thread_id=catch_thread,
+        run_id=catch_run,
+        report_run_id="catchup-alert",
+        cards=[_card("Catch-up [10-K](https://example.com/msft/10k)")],
+    )
+    assert catch_saved["created"] is True
+    await _mark_cards_failed(world, catch_id, attempt=3, error_code="http_500")
+
+    async def _skip_reconcile(**_kwargs: Any) -> int:
+        return 0
+
+    async def _send(
+        targets: list[str],
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: Any = None,
+    ) -> dict[str, Any]:
+        _ = (text, card, images, gateway_url, service_token, timeout_s, http_client)
+        calls.append({"target": targets[0], "run_id": run_id})
+        if run_id == catch_id and targets == [world.discord_target]:
+            rows = await reports.load_execution_failure_alert_rows(catch_id)
+            payload = rows[0]["payload_json"]
+            async with world.pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    for key in payload["reconcile_delivery_keys"]:
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_deliveries (
+                                delivery_key, kind, user_id, thread_id, run_id,
+                                execution_id, is_current, has_non_empty_text,
+                                platform, target_address, status, total_chunks,
+                                sent_chunks, platform_message_ids, files_status,
+                                created_at, updated_at
+                            )
+                            VALUES (
+                                %s, 'data_task', %s, NULL, %s,
+                                %s::uuid, FALSE, TRUE,
+                                %s, %s, 'sent', 0,
+                                0, '[]'::jsonb, '[]'::jsonb,
+                                NOW(), NOW()
+                            )
+                            ON CONFLICT (delivery_key) DO UPDATE
+                            SET status = 'sent', updated_at = NOW()
+                            """,
+                            (
+                                key,
+                                rows[0]["user_id"],
+                                catch_id,
+                                catch_id,
+                                payload["reconcile_platform"],
+                                payload["reconcile_canonical_target"],
+                            ),
+                        )
+            return {
+                "ok": True,
+                "status": "sent",
+                "results": [{"target": targets[0], "ok": True, "status": "sent"}],
+            }
+        return {
+            "ok": False,
+            "status": "failed",
+            "results": [{"target": targets[0], "ok": False, "status": "failed"}],
+        }
+
+    sender = create_autospec(post_data_task_gateway_notify, side_effect=_send)
+    bridge = create_autospec(notify_dispatch.post_bridge_notify)
+    await notify_dispatch.retry_failed_notify_deliveries(
+        post_notify_fn=bridge,
+        data_task_notify_fn=sender,
+        reconcile_data_tasks_fn=_skip_reconcile,
+        max_attempts=3,
+        limit=20,
+        **_plan_kwargs(world),
+    )
+    assert all(call["run_id"] != catch_id for call in calls)
+    caught = _sourced(await _rows(world), catch_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(caught) == 1
+    assert caught[0]["status"] == "pending"
+    assert caught[0]["attempt_count"] == 0
+    calls.clear()
+    await notify_dispatch.retry_failed_notify_deliveries(
+        post_notify_fn=bridge,
+        data_task_notify_fn=sender,
+        reconcile_data_tasks_fn=_skip_reconcile,
+        max_attempts=3,
+        limit=20,
+        **_plan_kwargs(world),
+    )
+    assert {"target": world.discord_target, "run_id": catch_id} in calls
+    sent_alert = _sourced(await _rows(world), catch_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(sent_alert) == 1
+    assert sent_alert[0]["status"] == "sent"
+    assert len(_sourced(await _rows(world), catch_id, "automation_report")) == 2

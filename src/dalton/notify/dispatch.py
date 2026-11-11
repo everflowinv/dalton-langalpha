@@ -2191,6 +2191,105 @@ async def _release_unstarted_retry_claim(
     return released
 
 
+async def _catch_up_terminal_report_failure_alerts(
+    *,
+    max_attempts: int,
+    lookback_hours: int,
+    limit: int,
+    uncertain_codes: Sequence[str],
+) -> None:
+    """Create failure notices for card rows the send page can no longer claim.
+
+    The send scan excludes ``attempt_count >= max_attempts``. This query uses
+    the same lookback and limit, then calls the same terminal insert. It does
+    not send the notice; the next scan claims the new pending row.
+    """
+    from src.dalton.database.automation_reports import (
+        card_delivery_is_terminal,
+        ensure_report_failure_alert,
+    )
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT d.execution_id,
+                       d.status,
+                       d.error_code,
+                       d.attempt_count,
+                       d.payload_json
+                FROM dalton_notify_deliveries d
+                WHERE COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
+                  AND COALESCE(d.payload_json ->> 'content_kind', '') = 'cards'
+                  AND d.status = 'failed'
+                  AND (
+                      d.attempt_count >= %s
+                      OR COALESCE(d.error_code, '') = 'attempts_exhausted'
+                  )
+                  AND COALESCE(d.error_code, '') <> ''
+                  AND COALESCE(d.error_code, '') NOT IN (
+                      'toggle_off',
+                      'target_removed',
+                      'target_revoked',
+                      'target_not_routed',
+                      'no_authorized_target',
+                      'profile_invalid',
+                      'task_disabled',
+                      'dalton_disabled',
+                      'report_recovered',
+                      'not_started'
+                  )
+                  AND COALESCE(d.error_code, '') <> ALL(%s)
+                  AND d.created_at >= NOW() - make_interval(hours => %s)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM dalton_notify_deliveries alert
+                      WHERE lower(alert.execution_id) = lower(d.execution_id)
+                        AND COALESCE(alert.payload_json ->> 'source', '')
+                            = 'automation_report_failure_alert'
+                  )
+                ORDER BY d.updated_at ASC, d.created_at ASC
+                LIMIT %s
+                """,
+                (
+                    max(1, int(max_attempts)),
+                    list(uncertain_codes),
+                    int(lookback_hours),
+                    max(1, int(limit)),
+                ),
+            )
+            found = await cur.fetchall()
+    seen: set[str] = set()
+    for row in found or []:
+        if not isinstance(row, Mapping):
+            continue
+        exec_id = str(row.get("execution_id") or "").strip()
+        payload = row.get("payload_json")
+        if isinstance(payload, Mapping):
+            if str(payload.get("source") or "") != "automation_report":
+                continue
+            if str(payload.get("content_kind") or "") != "cards":
+                continue
+            if not card_delivery_is_terminal(row, max_attempts=max_attempts):
+                continue
+        if not exec_id or exec_id in seen:
+            continue
+        seen.add(exec_id)
+        try:
+            await ensure_report_failure_alert(
+                exec_id,
+                max_attempts=max_attempts,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[DALTON_NOTIFY] Failure alert catch-up failed for execution_id=%s",
+                exec_id,
+                exc_info=True,
+            )
+
+
 async def retry_failed_notify_deliveries(
     *,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
@@ -2218,7 +2317,9 @@ async def retry_failed_notify_deliveries(
     rows never starve retryable work. A saved automation report, including one still
     pending on attempt 0, is sent with ``dispatch_automation_report``; an uncertain
     report row stays on the reconciliation scan. Processes bounded batches within
-    ``max_duration_s`` seconds. 会传播 ``CancelledError``，其他异常不抛出。
+    ``max_duration_s`` seconds. A card row already at the attempt cap is not on
+    that send page; the same scan inserts its failure notice when the saved
+    card delivery is a certain terminal failure. 会传播 ``CancelledError``，其他异常不抛出。
     """
     sent_count = 0
     started_at = time.monotonic()
@@ -2274,7 +2375,10 @@ async def retry_failed_notify_deliveries(
                         OR (
                             d.status = 'pending'
                             AND d.attempt_count = 0
-                            AND COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
+                            AND COALESCE(d.payload_json ->> 'source', '') IN (
+                                'automation_report',
+                                'automation_report_failure_alert'
+                            )
                             AND (d.error_code IS NULL OR COALESCE(d.error_code, '') = '')
                         )
                         OR (
@@ -2283,7 +2387,10 @@ async def retry_failed_notify_deliveries(
                                 NOT (
                                     COALESCE(d.automation_id, '') LIKE 'data:%%'
                                     OR COALESCE(d.payload_json ->> 'route_key', '') LIKE 'data:%%'
-                                    OR COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
+                                    OR COALESCE(d.payload_json ->> 'source', '') IN (
+                                        'automation_report',
+                                        'automation_report_failure_alert'
+                                    )
                                 )
                                 OR COALESCE(d.error_code, '') <> ALL(%s)
                             )
@@ -2292,7 +2399,10 @@ async def retry_failed_notify_deliveries(
                     )
                       AND d.created_at >= NOW() - make_interval(hours => %s)
                       AND (
-                          COALESCE(d.payload_json ->> 'source', '') <> 'automation_report'
+                          COALESCE(d.payload_json ->> 'source', '') NOT IN (
+                              'automation_report',
+                              'automation_report_failure_alert'
+                          )
                           OR d.attempt_count < %s
                       )
                     ORDER BY d.updated_at ASC, d.created_at ASC
@@ -2309,7 +2419,7 @@ async def retry_failed_notify_deliveries(
                 )
                 candidates = await cur.fetchall()
 
-        report_executions_seen: set[str] = set()
+        report_executions_seen: set[tuple[str, str]] = set()
         for row in candidates or []:
             if time.monotonic() - started_at >= max_duration_s:
                 break
@@ -2361,10 +2471,15 @@ async def retry_failed_notify_deliveries(
             transport_outcome_uncertain_or_sent = False
             uncertain_error_code = "delivery_uncertain"
             try:
-                if str(payload.get("source") or "") == "automation_report":
+                row_source = str(payload.get("source") or "")
+                if row_source in {
+                    "automation_report",
+                    "automation_report_failure_alert",
+                }:
                     if is_uncertain_notify_error_code(row_error_code):
                         continue
-                    if exec_id in report_executions_seen:
+                    seen_key = (row_source, exec_id)
+                    if seen_key in report_executions_seen:
                         continue
                     if (
                         _remaining_retry_request_budget_s(
@@ -2373,7 +2488,7 @@ async def retry_failed_notify_deliveries(
                         < RETRY_MIN_REQUEST_TIMEOUT_S
                     ):
                         break
-                    report_executions_seen.add(exec_id)
+                    report_executions_seen.add(seen_key)
                     pending_targets: list[str] = []
                     for cand in candidates or []:
                         if str(cand.get("execution_id") or "").strip() != exec_id:
@@ -2383,14 +2498,19 @@ async def retry_failed_notify_deliveries(
                             if isinstance(cand.get("payload_json"), Mapping)
                             else {}
                         )
-                        if str(cand_payload.get("source") or "") != "automation_report":
+                        if str(cand_payload.get("source") or "") != row_source:
                             continue
                         if str(cand.get("status") or "").strip().lower() == "sent":
                             continue
                         cand_target = str(cand.get("target") or "").strip()
                         if cand_target:
                             pending_targets.append(cand_target)
-                    report_result = await dispatch_automation_report(
+                    report_sender = (
+                        dispatch_report_failure_alert
+                        if row_source == "automation_report_failure_alert"
+                        else dispatch_automation_report
+                    )
+                    report_result = await report_sender(
                         exec_id,
                         notify_fn=data_task_notify_fn,
                         mark_fn=mark_delivery_fn,
@@ -2894,6 +3014,12 @@ async def retry_failed_notify_deliveries(
                     exec_id,
                     type(retry_exc).__name__,
                 )
+        await _catch_up_terminal_report_failure_alerts(
+            max_attempts=max_attempts,
+            lookback_hours=lookback_hours,
+            limit=limit,
+            uncertain_codes=uncertain_codes_list,
+        )
     except Exception as scan_exc:
         logger.warning(
             "[DALTON_NOTIFY] Retry scan failed: error_type=%s",
@@ -3062,32 +3188,35 @@ async def _load_saved_report_rows(
     return [dict(row) for row in loaded if isinstance(row, Mapping)]
 
 
-async def claim_saved_report_delivery(
+_CLAIMABLE_DELIVERY_SOURCES = {
+    "automation_report": "automation_report",
+    "automation_report_failure_alert": "automation_report_failure_alert",
+}
+
+
+async def _claim_saved_delivery_source(
     execution_id: str,
     channel: str,
     target: str,
     *,
+    source: str,
     max_attempts: int = 3,
     stale_pending_minutes: int = 10,
     conn: Any = None,
 ) -> tuple[bool, int | None]:
-    """Claim one saved report row. Does not insert a row and does not rewrite the payload.
-
-    Pending ``attempt_count = 0`` is claimable. Failed rows and stale pending rows
-    are claimable while ``attempt_count`` is below ``max_attempts``. Uncertain
-    native errors stay excluded. A missing report row is left missing.
-    """
+    """Claim one saved row of ``source``. Does not insert or rewrite the payload."""
+    literal = _CLAIMABLE_DELIVERY_SOURCES.get(source)
     exec_id = (execution_id or "").strip()
     ch = (channel or "").strip().lower()
     tgt = (target or "").strip()
-    if not (exec_id and ch and tgt):
+    if literal is None or not (exec_id and ch and tgt):
         return False, None
     bounded_attempts = max(1, int(max_attempts))
     connection_cm = get_db_connection(conn) if conn is not None else get_db_connection()
     async with connection_cm as held:
         async with held.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 UPDATE dalton_notify_deliveries
                 SET status = 'pending',
                     error_code = NULL,
@@ -3096,7 +3225,7 @@ async def claim_saved_report_delivery(
                 WHERE lower(execution_id) = lower(%s)
                   AND channel = %s
                   AND target = %s
-                  AND COALESCE(payload_json ->> 'source', '') = 'automation_report'
+                  AND COALESCE(payload_json ->> 'source', '') = '{literal}'
                   AND attempt_count < %s
                   AND (
                       (
@@ -3144,6 +3273,53 @@ async def claim_saved_report_delivery(
         except (TypeError, ValueError):
             return True, 1
     return True, 1
+
+
+async def claim_saved_report_delivery(
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    max_attempts: int = 3,
+    stale_pending_minutes: int = 10,
+    conn: Any = None,
+) -> tuple[bool, int | None]:
+    """Claim one saved report row. Does not insert a row and does not rewrite the payload.
+
+    Pending ``attempt_count = 0`` is claimable. Failed rows and stale pending rows
+    are claimable while ``attempt_count`` is below ``max_attempts``. Uncertain
+    native errors stay excluded. A missing report row is left missing.
+    """
+    return await _claim_saved_delivery_source(
+        execution_id,
+        channel,
+        target,
+        source="automation_report",
+        max_attempts=max_attempts,
+        stale_pending_minutes=stale_pending_minutes,
+        conn=conn,
+    )
+
+
+async def claim_saved_failure_alert(
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    max_attempts: int = 3,
+    stale_pending_minutes: int = 10,
+    conn: Any = None,
+) -> tuple[bool, int | None]:
+    """Claim one saved failure notice. Does not insert a row or rewrite its payload."""
+    return await _claim_saved_delivery_source(
+        execution_id,
+        channel,
+        target,
+        source="automation_report_failure_alert",
+        max_attempts=max_attempts,
+        stale_pending_minutes=stale_pending_minutes,
+        conn=conn,
+    )
 
 
 async def _mark_saved_report_row(
@@ -3442,6 +3618,7 @@ async def dispatch_automation_report(
     mark_fn: Callable[..., Awaitable[Any]] | None = None,
     authorize_fn: Callable[..., Awaitable[Any]] | None = None,
     load_rows_fn: Callable[..., Awaitable[Any]] | None = None,
+    create_failure_alert: bool = True,
     max_attempts: int = 3,
     stale_pending_minutes: int = 10,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
@@ -3461,7 +3638,9 @@ async def dispatch_automation_report(
     ``unknown``, ``partial``, or ``gateway_restarted`` is not claimed or
     posted; the outer row stays pending with that uncertain code and the same
     attempt. Durable confirmation is the saved status view after every
-    intended target's native items are ``sent``.
+    intended target's native items are ``sent``. When this function loads the
+    saved card rows itself, a certain terminal card failure inserts one
+    failure notice. Injected loaders and failure-notice sends do not.
     """
     from src.dalton.database import automation_reports as automation_reports
     from src.dalton.database.data_task_notifications import (
@@ -3537,6 +3716,22 @@ async def dispatch_automation_report(
             continue
         if stop:
             break
+    if create_failure_alert and load_rows_fn is None:
+        try:
+            await automation_reports.ensure_report_failure_alert(
+                exec_id,
+                max_attempts=bounded_attempts,
+                conn=conn,
+                reconcile_row_fn=reconcile_row_fn,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[DALTON_NOTIFY] Report failure alert was not saved for execution_id=%s",
+                exec_id,
+                exc_info=True,
+            )
     try:
         return await _saved_view()
     except asyncio.CancelledError:
@@ -3555,6 +3750,73 @@ async def dispatch_automation_report(
             "targets": [],
             "results": [],
         }
+
+
+async def dispatch_report_failure_alert(
+    execution_id: str,
+    *,
+    conn: Any = None,
+    notify_fn: Callable[..., Awaitable[Any]] | None = None,
+    reconcile_row_fn: Callable[..., Awaitable[Any]] | None = None,
+    claim_fn: Callable[..., Awaitable[Any]] | None = None,
+    mark_fn: Callable[..., Awaitable[Any]] | None = None,
+    authorize_fn: Callable[..., Awaitable[Any]] | None = None,
+    max_attempts: int = 3,
+    stale_pending_minutes: int = 10,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[Mapping[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[Sequence[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[Mapping[str, Sequence[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    started_at: float | None = None,
+    max_duration_s: float | None = None,
+) -> dict[str, Any]:
+    """Send one saved failure notice, or skip it when the cards recovered.
+
+    The notice is claimed and posted through the same native plan path as a
+    saved report. Its own failure retries only this row. It does not create
+    another notice.
+    """
+    from src.dalton.database.automation_reports import (
+        failure_alert_still_required,
+        load_execution_failure_alert_rows,
+        report_status_view,
+    )
+
+    still_required = await failure_alert_still_required(
+        execution_id,
+        max_attempts=max_attempts,
+        conn=conn,
+        reconcile_row_fn=reconcile_row_fn,
+        mark_fn=mark_fn,
+    )
+    if not still_required:
+        view = report_status_view(
+            await load_execution_failure_alert_rows(execution_id, conn=conn)
+        )
+        if view.get("ok"):
+            view["code"] = "report_recovered"
+        return view
+    return await dispatch_automation_report(
+        execution_id,
+        conn=conn,
+        notify_fn=notify_fn,
+        reconcile_row_fn=reconcile_row_fn,
+        claim_fn=claim_fn or claim_saved_failure_alert,
+        mark_fn=mark_fn,
+        authorize_fn=authorize_fn,
+        load_rows_fn=load_execution_failure_alert_rows,
+        create_failure_alert=False,
+        max_attempts=max_attempts,
+        stale_pending_minutes=stale_pending_minutes,
+        resolve_enabled_fn=resolve_enabled_fn,
+        resolve_overrides_fn=resolve_overrides_fn,
+        resolve_targets_fn=resolve_targets_fn,
+        resolve_routes_fn=resolve_routes_fn,
+        is_admin_fn=is_admin_fn,
+        started_at=started_at,
+        max_duration_s=max_duration_s,
+    )
 
 
 async def on_automation_settled(
@@ -3600,12 +3862,24 @@ async def on_automation_settled(
 
         from src.dalton.database.automation_reports import (
             automation_has_validated_report_profile,
+            ensure_report_failure_alert,
             read_execution_report_confirmed,
         )
 
         if automation_has_validated_report_profile(automation):
             reader = report_status_fn or read_execution_report_confirmed
-            return bool(await reader(execution_id))
+            confirmed = bool(await reader(execution_id))
+            try:
+                await ensure_report_failure_alert(execution_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[DALTON_NOTIFY] Settlement did not save a report failure alert for execution_id=%s",
+                    execution_id,
+                    exc_info=True,
+                )
+            return confirmed
 
         classification = classify_automation_for_notify(automation)
 
