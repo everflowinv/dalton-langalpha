@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import os
+import signal
 import struct
 import subprocess
 import sys
@@ -805,6 +806,338 @@ def test_real_compare_snapshot_ingest_recovery_and_embedding_retry(tmp_path: Pat
     assert not (root / "locks" / "github-observation.lock").exists()
 
 
+def test_public_ingest_retries_its_own_embedding_errors(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    _write_prepared(root, DATE, OWNER)
+    python = Path(sys.executable)
+    env = _env(tmp_path)
+    decisions, dispositions, records = _bundle()
+    saved = _run(root, signals.parse_signal_request(_body(
+        "save",
+        github_decisions=decisions,
+        earnings_dispositions=dispositions,
+        signal_records=records,
+    )), python=python, env=env)
+    assert saved["ok"] is True
+    compared = _run(root, signals.parse_signal_request(_body("compare")), python=python, env=env)
+    assert compared["ok"] is True and compared["reused"] is False
+    generation = _generation(root, DATE)
+    compare_bytes = (generation / "compare_result.json").read_bytes()
+    bundle_bytes = {
+        name: (generation / name).read_bytes()
+        for name in ("github_decisions.json", "earnings_dispositions.json", "signal_records.json")
+    }
+
+    failed = _run(root, signals.parse_signal_request(_body("ingest")), python=python, env=env)
+    assert failed["ok"] is True and failed["reused"] is False
+    assert failed["status"] == "ingested"
+    assert failed["signals"] == 2 and failed["embedded_signals"] == 0
+    assert failed["embedding_errors"]
+    outcome = generation / "outcome.json"
+    failed_outcome = outcome.read_bytes()
+    commit = _commit(root, DATE)
+    assert commit["status"] == "ingested"
+    assert commit["outcome_sha256"] == hashlib.sha256(failed_outcome).hexdigest()
+    assert commit["bundle_hash"] == saved["bundle_hash"]
+    db_path = root / "ai_signal_memory.sqlite"
+    conn = connect_db(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM signals WHERE embedding IS NULL").fetchone()[0] == 2
+    hashes = {
+        row["record_key"]: row["content_hash"]
+        for row in conn.execute("SELECT record_key, content_hash FROM signals")
+    }
+    conn.close()
+    frozen = {
+        "bundle_hash": commit["bundle_hash"],
+        "generation": commit["generation"],
+        "compare_sha256": commit["compare_sha256"],
+    }
+
+    seen: list[list[str]] = []
+    blob = struct.pack("<768f", *([0.25] * 768))
+
+    def fill(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        seen.append(list(argv))
+        action = argv[4]
+        db = Path(argv[3])
+        if action == "ingest":
+            conn = connect_db(db)
+            try:
+                rows = conn.execute(
+                    "SELECT record_key, content_hash FROM signals WHERE embedding IS NULL"
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        """UPDATE signals
+                           SET embedding = ?, embedding_dim = 768, embedding_model = ?
+                           WHERE record_key = ? AND content_hash = ?""",
+                        (blob, "gemini-embedding-2", row["record_key"], row["content_hash"]),
+                    )
+            finally:
+                conn.close()
+            return _child(stdout=json.dumps({"inserted": 0, "updated": 2, "embedding_errors": []}))
+        if action == "stats":
+            conn = connect_db(db)
+            try:
+                payload = stats(conn)
+            finally:
+                conn.close()
+            return _child(stdout=json.dumps(payload))
+        return _child(returncode=1)
+
+    filled = _run(root, signals.parse_signal_request(_body("ingest")), python=python, env=env, command=fill)
+    assert [item[4] for item in seen] == ["ingest", "stats"]
+    assert "--no-embeddings" not in seen[0]
+    assert seen[0][3] == str(db_path)
+    assert seen[0][seen[0].index("--input") + 1] == str(generation / "signal_records.json")
+    assert filled["ok"] is True and filled["reused"] is False
+    assert filled["embedding_errors"] == []
+    assert filled["embedded_signals"] == 2
+    assert filled["embedding_status"] == "complete"
+    assert filled["status"] == "ingested"
+    assert filled["bundle_hash"] == frozen["bundle_hash"]
+    assert outcome.is_file()
+    assert outcome.read_bytes() != failed_outcome
+    stored = json.loads(outcome.read_text(encoding="utf-8"))
+    assert stored["ingest"]["embedding_errors"] == []
+    assert stored["bundle_hash"] == frozen["bundle_hash"]
+    updated_commit = _commit(root, DATE)
+    assert updated_commit["status"] == "ingested"
+    assert updated_commit["generation"] == frozen["generation"]
+    assert updated_commit["bundle_hash"] == frozen["bundle_hash"]
+    assert updated_commit["compare_sha256"] == frozen["compare_sha256"]
+    assert updated_commit["outcome_sha256"] == hashlib.sha256(outcome.read_bytes()).hexdigest()
+    assert (generation / "compare_result.json").read_bytes() == compare_bytes
+    for name, raw in bundle_bytes.items():
+        assert (generation / name).read_bytes() == raw
+    conn = connect_db(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 2
+    for record_key, digest in hashes.items():
+        row = conn.execute(
+            "SELECT content_hash, embedding FROM signals WHERE record_key = ?",
+            (record_key,),
+        ).fetchone()
+        assert row["content_hash"] == digest
+        assert bytes(row["embedding"]) == blob
+    counted = stats(conn)
+    conn.close()
+    assert counted["embedded_signals"] == 2
+    assert counted["embedding_status"] == "complete"
+    outcome_after = outcome.read_bytes()
+    commit_after = (root / "signals" / DATE / "commit.json").read_bytes()
+
+    again: list[str] = []
+
+    def boom(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        again.append(argv[4])
+        return _child(returncode=1)
+
+    repeated = _run(root, signals.parse_signal_request(_body("ingest")), python=python, env=env, command=boom)
+    assert again == []
+    assert repeated["reused"] is True
+    assert repeated["embedding_errors"] == []
+    assert repeated["embedded_signals"] == 2
+    assert outcome.read_bytes() == outcome_after
+    assert (root / "signals" / DATE / "commit.json").read_bytes() == commit_after
+    assert (generation / "compare_result.json").read_bytes() == compare_bytes
+
+
+def test_retry_adopts_outcome_written_before_the_final_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    _write_prepared(root, DATE, OWNER)
+    python = Path(sys.executable)
+    env = _env(tmp_path)
+    decisions, dispositions, records = _bundle()
+    saved = _run(root, signals.parse_signal_request(_body(
+        "save",
+        github_decisions=decisions,
+        earnings_dispositions=dispositions,
+        signal_records=records,
+    )), python=python, env=env)
+    assert saved["ok"] is True
+    compared = _run(root, signals.parse_signal_request(_body("compare")), python=python, env=env)
+    assert compared["ok"] is True
+    generation = _generation(root, DATE)
+    compare_bytes = (generation / "compare_result.json").read_bytes()
+    bundle_bytes = {
+        name: (generation / name).read_bytes()
+        for name in ("github_decisions.json", "earnings_dispositions.json", "signal_records.json")
+    }
+    failed = _run(root, signals.parse_signal_request(_body("ingest")), python=python, env=env)
+    assert failed["ok"] is True and failed["embedding_errors"] and failed["embedded_signals"] == 0
+    outcome = generation / "outcome.json"
+    commit = _commit(root, DATE)
+    frozen = {
+        "bundle_hash": commit["bundle_hash"],
+        "generation": commit["generation"],
+        "compare_sha256": commit["compare_sha256"],
+    }
+    db_path = root / "ai_signal_memory.sqlite"
+    conn = connect_db(db_path)
+    before = {
+        row["record_key"]: row["content_hash"]
+        for row in conn.execute("SELECT record_key, content_hash FROM signals")
+    }
+    conn.close()
+    assert len(before) == 2
+
+    seen: list[str] = []
+    blob = struct.pack("<768f", *([0.5] * 768))
+
+    def fill(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        action = argv[4]
+        seen.append(action)
+        db = Path(argv[3])
+        if action == "ingest":
+            conn = connect_db(db)
+            try:
+                rows = conn.execute(
+                    "SELECT record_key, content_hash FROM signals"
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        """UPDATE signals
+                           SET embedding = ?, embedding_dim = 768, embedding_model = ?
+                           WHERE record_key = ? AND content_hash = ?""",
+                        (blob, "gemini-embedding-2", row["record_key"], row["content_hash"]),
+                    )
+            finally:
+                conn.close()
+            return _child(stdout=json.dumps({"inserted": 0, "updated": 2, "embedding_errors": []}))
+        if action == "stats":
+            conn = connect_db(db)
+            try:
+                payload = stats(conn)
+            finally:
+                conn.close()
+            return _child(stdout=json.dumps(payload))
+        return _child(returncode=1)
+
+    real_replace = signals._replace_commit
+
+    def fail_final(root_path: Path, current: dict[str, Any], updated: dict[str, Any]) -> bool:
+        if updated.get("status") == "ingested":
+            return False
+        return real_replace(root_path, current, updated)
+
+    monkeypatch.setattr(signals, "_replace_commit", fail_final)
+    interrupted = _run(
+        root, signals.parse_signal_request(_body("ingest")), python=python, env=env, command=fill,
+    )
+    monkeypatch.setattr(signals, "_replace_commit", real_replace)
+    assert interrupted["code"] == "commit_inconsistent"
+    assert seen == ["ingest", "stats"]
+    mid = _commit(root, DATE)
+    assert mid["status"] == "ingesting"
+    assert mid["outcome_sha256"] is None
+    assert mid["bundle_hash"] == frozen["bundle_hash"]
+    assert mid["generation"] == frozen["generation"]
+    assert mid["compare_sha256"] == frozen["compare_sha256"]
+    written = json.loads(outcome.read_text(encoding="utf-8"))
+    assert written["ingest"]["embedding_errors"] == []
+    assert written["bundle_hash"] == frozen["bundle_hash"]
+    assert (generation / "compare_result.json").read_bytes() == compare_bytes
+    for name, raw in bundle_bytes.items():
+        assert (generation / name).read_bytes() == raw
+    outcome_bytes = outcome.read_bytes()
+    conn = connect_db(db_path)
+    filled_rows = {
+        row["record_key"]: (row["content_hash"], bytes(row["embedding"]))
+        for row in conn.execute("SELECT record_key, content_hash, embedding FROM signals")
+    }
+    conn.close()
+    assert set(filled_rows) == set(before)
+    for record_key, digest in before.items():
+        assert filled_rows[record_key] == (digest, blob)
+
+    calls: list[str] = []
+
+    def boom(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        calls.append(argv[4])
+        return _child(returncode=1)
+
+    recovered = _run(
+        root, signals.parse_signal_request(_body("ingest")), python=python, env=env, command=boom,
+    )
+    assert calls == []
+    assert recovered["ok"] is True and recovered["reused"] is True
+    assert recovered["status"] == "ingested"
+    assert recovered["embedding_errors"] == []
+    assert recovered["embedded_signals"] == 2
+    assert recovered["signals"] == 2
+    finished = _commit(root, DATE)
+    assert finished["status"] == "ingested"
+    assert finished["outcome_sha256"] == hashlib.sha256(outcome_bytes).hexdigest()
+    assert finished["bundle_hash"] == frozen["bundle_hash"]
+    assert finished["generation"] == frozen["generation"]
+    assert finished["compare_sha256"] == frozen["compare_sha256"]
+    assert outcome.read_bytes() == outcome_bytes
+    assert (generation / "compare_result.json").read_bytes() == compare_bytes
+    conn = connect_db(db_path)
+    recovered_rows = {
+        row["record_key"]: (row["content_hash"], bytes(row["embedding"]))
+        for row in conn.execute("SELECT record_key, content_hash, embedding FROM signals")
+    }
+    assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 2
+    conn.close()
+    assert recovered_rows == filled_rows
+    commit_bytes = (root / "signals" / DATE / "commit.json").read_bytes()
+
+    repeated = _run(
+        root, signals.parse_signal_request(_body("ingest")), python=python, env=env, command=boom,
+    )
+    assert calls == []
+    assert repeated["reused"] is True
+    assert repeated["embedding_errors"] == []
+    assert outcome.read_bytes() == outcome_bytes
+    assert (root / "signals" / DATE / "commit.json").read_bytes() == commit_bytes
+    assert (generation / "compare_result.json").read_bytes() == compare_bytes
+
+
 def test_child_argv_keeps_the_interpreter_and_strips_secrets(tmp_path: Path) -> None:
     root = tmp_path / "state"
     _write_prepared(root, DATE, OWNER)
@@ -1492,7 +1825,7 @@ async def test_route_timeout_and_cancel_stop_one_child(
     assert cancelled_seen.wait(2)
     assert calls["count"] == 1
 
-    pids: list[int] = []
+    children: list[subprocess.Popen[bytes]] = []
 
     def blocking(parsed: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         del parsed
@@ -1502,29 +1835,45 @@ async def test_route_timeout_and_cancel_stop_one_child(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        pids.append(proc.pid)
-        kwargs["on_spawn"](proc.pid)
-        kwargs["cancelled"].wait(5)
-        return {"ok": True, "action": "compare", "code": "ok"}
+        try:
+            children.append(proc)
+            kwargs["on_spawn"](proc.pid)
+            kwargs["cancelled"].wait(5)
+            return {"ok": True, "action": "compare", "code": "ok"}
+        finally:
+            deadline = time.monotonic() + 2
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if proc.poll() is not None:
+                proc.wait(timeout=1)
 
     monkeypatch.setattr(module, "execute_signal", blocking)
     monkeypatch.setattr(module, "operation_timeout_seconds", lambda action: 30)
     task = asyncio.create_task(bridge.handle_ai_finance_signals(_body("compare")))
-    for _ in range(50):
-        if pids:
-            break
-        await asyncio.sleep(0.05)
-    assert pids
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pids[0], 0)
-        except OSError:
-            break
-        await asyncio.sleep(0.05)
-    else:
-        signals.kill_owned_group(pids[0])
-        raise AssertionError("child process group was still running")
+    owned: subprocess.Popen[bytes] | None = None
+    try:
+        for _ in range(50):
+            if children:
+                break
+            await asyncio.sleep(0.05)
+        assert len(children) == 1
+        owned = children[0]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        deadline = time.monotonic() + 2
+        while owned.poll() is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        returncode = owned.poll()
+        assert returncode in {-signal.SIGTERM, -signal.SIGKILL}
+        assert owned.wait(timeout=1) == returncode
+        with pytest.raises(ProcessLookupError):
+            os.kill(owned.pid, 0)
+    finally:
+        if owned is not None and owned.poll() is None:
+            signals.kill_owned_group(owned.pid)
+            try:
+                owned.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                owned.kill()
+                owned.wait(timeout=2)

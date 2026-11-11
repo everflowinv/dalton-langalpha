@@ -509,9 +509,17 @@ def _ingest(
         return _error("compare_required", batch_id=parsed["batch_id"], status=current["status"])
     compare_bytes = _compare_bytes(root, current)
     saved = _load_outcome(root, current)
-    if current["status"] == "ingested" and saved is not None:
+    if (
+        current["status"] == "ingested"
+        and saved is not None
+        and not _outcome_has_embedding_errors(saved)
+    ):
         return _ingest_summary(parsed, current, saved, reused=True)
-    if current["status"] == "ingesting" and saved is not None:
+    if (
+        current["status"] == "ingesting"
+        and saved is not None
+        and _adopt_written_outcome(current, saved)
+    ):
         if _compare_bytes(root, current) != compare_bytes:
             return _error("compare_unavailable", batch_id=parsed["batch_id"])
         updated = dict(current)
@@ -520,7 +528,30 @@ def _ingest(
         if not _replace_commit(root, current, updated):
             return _error("commit_inconsistent", batch_id=parsed["batch_id"])
         return _ingest_summary(parsed, updated, saved, reused=True)
-    if current["status"] == "open":
+    if (
+        current["status"] == "ingested"
+        and saved is not None
+        and _outcome_has_embedding_errors(saved)
+    ):
+        if _cancelled(cancelled):
+            return _error("signal_timeout")
+        cleared = dict(current)
+        cleared["status"] = "ingesting"
+        cleared["outcome_sha256"] = None
+        if not _replace_commit(root, current, cleared):
+            return _error("commit_inconsistent", batch_id=parsed["batch_id"])
+        reread = _read_commit(root, str(parsed["batch_id"]))
+        if (
+            not isinstance(reread, dict)
+            or reread.get("status") != "ingesting"
+            or reread.get("outcome_sha256") is not None
+            or reread.get("bundle_hash") != current["bundle_hash"]
+            or reread.get("compare_sha256") != current["compare_sha256"]
+            or reread.get("generation") != current["generation"]
+        ):
+            return _error("commit_inconsistent", batch_id=parsed["batch_id"])
+        current = reread
+    elif current["status"] == "open":
         frozen = dict(current)
         frozen["status"] = "ingesting"
         if _cancelled(cancelled):
@@ -1050,6 +1081,30 @@ def _files_match(root: Path, current: Mapping[str, Any]) -> bool:
     if github is None or earnings is None or signals is None:
         return False
     return _bundle_hash(github, earnings, signals) == current["bundle_hash"]
+
+
+def _outcome_has_embedding_errors(outcome: Mapping[str, Any]) -> bool:
+    """Whether this saved outcome still lists its own embedding failures.
+
+    Live database coverage is not an input. An empty list is a finished ingest.
+    """
+    ingest = outcome.get("ingest")
+    if not isinstance(ingest, dict):
+        return False
+    errors = ingest.get("embedding_errors")
+    return isinstance(errors, list) and bool(errors)
+
+
+def _adopt_written_outcome(current: Mapping[str, Any], outcome: Mapping[str, Any]) -> bool:
+    """Whether an ingesting commit should keep the outcome file already on disk.
+
+    A hash that still names this file finishes the first ingest, including a
+    file that lists embedding errors. After a retry clears that hash, only a
+    file with an empty error list is adopted. An error list continues the retry.
+    """
+    if current.get("outcome_sha256") == outcome.get("file_sha256"):
+        return True
+    return not _outcome_has_embedding_errors(outcome)
 
 
 def _load_outcome(root: Path, current: Mapping[str, Any]) -> dict[str, Any] | None:

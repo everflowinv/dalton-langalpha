@@ -291,6 +291,8 @@ tests/unit/dalton/test_ai_finance_earnings.py
 tests/unit/dalton/test_ai_finance_signal_memory.py
 tests/unit/dalton/test_ai_finance_validate.py
 tests/unit/dalton/test_ai_finance_prepare.py
+scripts/dalton/ai_finance/batch_retrieval.py
+tests/unit/dalton/test_ai_finance_retrieval.py
 
 # T11 AI finance inputs: execution identity, operator prepare, and paged read.
 src/dalton/database/ai_finance.py
