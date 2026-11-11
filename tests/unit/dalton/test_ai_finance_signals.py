@@ -96,7 +96,7 @@ def _child(**overrides: Any) -> ChildResult:
 def _earnings(summary: str = "AI revenue grew 中文") -> dict[str, Any]:
     doc_id = "doc-signal"
     return {
-        "record_key": f"earnings:{doc_id}:{EVENT[:10]}",
+        "record_key": f"earnings:{doc_id}",
         "source_type": "earnings",
         "external_id": doc_id,
         "event_time": EVENT,

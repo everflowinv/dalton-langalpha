@@ -308,3 +308,4 @@ scripts/dalton/researchdata_bridge.py
 src/dalton/tools/ai_finance_signals_tools.py
 src/dalton/tools/__init__.py
 tests/unit/dalton/test_ai_finance_signals.py
+tests/unit/dalton/test_ai_finance_signal_schema.py
