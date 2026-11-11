@@ -198,6 +198,151 @@ def test_failed_earnings_retries_only_that_stage(tmp_path: Path) -> None:
     assert list(tmp_path.rglob("*.sqlite")) == []
 
 
+def test_completion_metadata_failure_does_not_recollect_earnings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = tmp_path / "github_seen.json"
+    seen.write_bytes(b'{"repos": {}}\n')
+    seen_bytes = seen.read_bytes()
+    calls: list[str] = []
+
+    def github(request: dict[str, Any]) -> dict[str, Any]:
+        calls.append("github")
+        assert request["now"] == FIXED
+        return {"version": 3, "candidates": []}
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls.append("earnings")
+        assert request["now"] == FIXED
+        body = "first-body" if calls.count("earnings") == 1 else "recollected-body"
+        return _earnings(request, body=body)
+
+    real_write = prepare_mod._atomic_write
+    armed = {"once": True}
+
+    def flaky_write(path: Path, payload: bytes) -> None:
+        if armed["once"] and path.name == "metadata.json":
+            parsed = json.loads(payload)
+            if parsed["stages"]["earnings"].get("status") == "complete":
+                armed["once"] = False
+                raise OSError("completion metadata")
+        real_write(path, payload)
+
+    monkeypatch.setattr(prepare_mod, "_atomic_write", flaky_write)
+    first = prepare_batch(
+        state_root=tmp_path,
+        batch_id=BATCH,
+        started_at=FIXED,
+        github_collector=github,
+        earnings_collector=earnings,
+    )
+    batch = tmp_path / "batches" / BATCH
+    artifact = batch / "earnings_scan.json"
+    candidate = batch / "candidates" / "doc1.txt"
+    saved_artifact = artifact.read_bytes()
+    artifact_inode = artifact.stat().st_ino
+    saved_candidate = candidate.read_bytes()
+    stored = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
+    assert first["ok"] is False
+    assert first["inconsistent"] is False
+    assert first["errors"] == ["earnings_failed:OSError"]
+    assert first["stages"]["github"] == "complete"
+    assert first["stages"]["earnings"] == "failed"
+    assert first["reused"] == []
+    assert calls == ["github", "earnings"]
+    assert not (batch / "manifest.json").exists()
+    assert isinstance(stored["stages"]["earnings"]["sha256"], str)
+    assert stored["stages"]["earnings"]["candidate_files"]["candidates/doc1.txt"]
+    assert candidate.read_text(encoding="utf-8") == "first-body"
+
+    second = prepare_batch(
+        state_root=tmp_path,
+        batch_id=BATCH,
+        started_at=FIXED,
+        github_collector=github,
+        earnings_collector=earnings,
+    )
+    published = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
+    assert second["ok"] is True
+    assert second["inconsistent"] is False
+    assert second["reused"] == ["github", "earnings"]
+    assert second["stages"]["earnings"] == "complete"
+    assert calls == ["github", "earnings"]
+    assert artifact.read_bytes() == saved_artifact
+    assert artifact.stat().st_ino == artifact_inode
+    assert candidate.read_bytes() == saved_candidate
+    assert candidate.read_text(encoding="utf-8") == "first-body"
+    assert published["stages"]["earnings"]["sha256"] == hashlib.sha256(saved_artifact).hexdigest()
+    assert published["stages"]["earnings"]["sha256"] == stored["stages"]["earnings"]["sha256"]
+    assert seen.read_bytes() == seen_bytes
+    assert list(tmp_path.rglob("*.sqlite")) == []
+
+
+def test_pending_artifact_without_completion_record_is_not_recollected(tmp_path: Path) -> None:
+    seen = tmp_path / "github_seen.json"
+    seen.write_bytes(b'{"repos": {}}\n')
+    seen_bytes = seen.read_bytes()
+    calls: list[str] = []
+
+    def github(request: dict[str, Any]) -> dict[str, Any]:
+        calls.append("github")
+        assert request["now"] == FIXED
+        return {"version": 3, "candidates": []}
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls.append("earnings")
+        assert request["now"] == FIXED
+        body = "first-body" if calls.count("earnings") == 1 else "recollected-body"
+        return _earnings(request, body=body)
+
+    prepare_batch(
+        state_root=tmp_path,
+        batch_id=BATCH,
+        started_at=FIXED,
+        github_collector=github,
+        earnings_collector=earnings,
+    )
+    batch = tmp_path / "batches" / BATCH
+    artifact = batch / "earnings_scan.json"
+    candidate = batch / "candidates" / "doc1.txt"
+    saved_artifact = artifact.read_bytes()
+    artifact_inode = artifact.stat().st_ino
+    saved_candidate = candidate.read_bytes()
+    metadata_path = batch / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["stages"]["earnings"]["status"] = "pending"
+    metadata["stages"]["earnings"]["sha256"] = None
+    metadata["stages"]["earnings"]["candidate_files"] = {}
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    pending_metadata = metadata_path.read_bytes()
+    manifest = (batch / "manifest.json").read_bytes()
+    before = list(calls)
+
+    result = prepare_batch(
+        state_root=tmp_path,
+        batch_id=BATCH,
+        started_at=FIXED,
+        github_collector=github,
+        earnings_collector=earnings,
+    )
+    assert result["ok"] is False
+    assert result["inconsistent"] is True
+    assert result["errors"] == ["earnings_uncommitted"]
+    assert result["stages"]["github"] == "complete"
+    assert result["stages"]["earnings"] == "pending"
+    assert result["reused"] == ["github"]
+    assert result["manifest"] is None
+    assert calls == before
+    assert artifact.read_bytes() == saved_artifact
+    assert artifact.stat().st_ino == artifact_inode
+    assert candidate.read_bytes() == saved_candidate
+    assert candidate.read_text(encoding="utf-8") == "first-body"
+    assert metadata_path.read_bytes() == pending_metadata
+    assert (batch / "manifest.json").read_bytes() == manifest
+    assert seen.read_bytes() == seen_bytes
+    assert list(tmp_path.rglob("*.sqlite")) == []
+
+
 def test_corrupt_artifact_is_not_rewritten_or_refetched(tmp_path: Path) -> None:
     calls: list[str] = []
 

@@ -70,9 +70,11 @@ def prepare_batch(
 ) -> dict[str, Any]:
     """Collect one batch under state_root/batches/{batch_id}.
 
-    A repeated call reuses stages whose artifact hashes still match. A failed
-    stage is the only stage retried. Hash mismatches stay on disk and come
-    back as inconsistent.
+    A later call reuses a stage whose completion record still matches its
+    artifact, candidate texts, and frozen window. A failed stage is collected
+    again only when that stage has not written its artifact. An artifact
+    without a matching completion record is left on disk and reported
+    inconsistent.
     """
     _validate_request(batch_id, started_at, hours)
     root = _require_state_root(state_root)
@@ -308,6 +310,19 @@ def _handle_stage(
         return "reused", None
     if status not in {"pending", "failed"}:
         return "inconsistent", f"{name}_inconsistent"
+    artifact_path = batch_dir / _STAGE_FILES[name]
+    if _entry_exists(artifact_path):
+        # Hashes stored for this batch are the completion record. The artifact's
+        # presence is not. Reuse a record that still matches the files and the
+        # frozen window; otherwise leave the artifact and candidate files alone.
+        problem = _completion_problem(batch_dir, name, stage, metadata)
+        if problem:
+            return "inconsistent", problem
+        stage["status"] = "complete"
+        stage.pop("error", None)
+        _atomic_write(meta_path, _canonical_bytes(metadata))
+        return "reused", None
+    wrote_artifact = False
     try:
         payload = collector(request)
         if not isinstance(payload, dict):
@@ -318,18 +333,24 @@ def _handle_stage(
         else:
             files = {}
         body = _canonical_bytes(payload)
-        _atomic_write(batch_dir / _STAGE_FILES[name], body)
-        stage["status"] = "complete"
-        stage["sha256"] = hashlib.sha256(body).hexdigest()
+        digest = hashlib.sha256(body).hexdigest()
+        _atomic_write(artifact_path, body)
+        wrote_artifact = True
+        stage["sha256"] = digest
         stage["candidate_files"] = files
         stage.pop("error", None)
+        stage["status"] = "complete"
         _atomic_write(meta_path, _canonical_bytes(metadata))
         return "ran", None
     except Exception as exc:
         stage["status"] = "failed"
         stage["error"] = type(exc).__name__
-        stage["sha256"] = None
-        stage["candidate_files"] = {}
+        # Hashes taken from an artifact already on disk stay as its completion
+        # record. Only a stage that has not written its artifact is cleared so
+        # a later call can collect it.
+        if not wrote_artifact:
+            stage["sha256"] = None
+            stage["candidate_files"] = {}
         _atomic_write(meta_path, _canonical_bytes(metadata))
         return "failed", type(exc).__name__
 
@@ -355,6 +376,55 @@ def _stage_problem(batch_dir: Path, name: str, stage: dict[str, Any]) -> str | N
             return f"{name}_inconsistent"
         if actual_file != digest:
             return f"{name}_inconsistent"
+    return None
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _completion_problem(
+    batch_dir: Path,
+    name: str,
+    stage: dict[str, Any],
+    metadata: dict[str, Any],
+) -> str | None:
+    """Return an error when this batch has no usable completion record.
+
+    The record is the artifact hash and candidate-file hashes in this batch's
+    metadata. Those hashes must match the files on disk. An earnings artifact
+    must also repeat the batch's frozen window. A file with the stage's name
+    is not a record.
+    """
+    recorded_hash = stage.get("sha256")
+    recorded_files = stage.get("candidate_files")
+    if not isinstance(recorded_hash, str) or not isinstance(recorded_files, dict):
+        return f"{name}_uncommitted"
+    problem = _stage_problem(batch_dir, name, stage)
+    if problem:
+        return problem
+    if name != "earnings":
+        return None
+    try:
+        payload = json.loads(_read_regular(batch_dir / _STAGE_FILES[name]))
+    except (OSError, PrepareError, json.JSONDecodeError, UnicodeError):
+        return f"{name}_inconsistent"
+    if not isinstance(payload, dict):
+        return f"{name}_inconsistent"
+    window = metadata.get("window")
+    if not isinstance(window, dict):
+        return f"{name}_inconsistent"
+    try:
+        _require_earnings_window(payload, window)
+        files = _candidate_files(payload, batch_dir)
+    except PrepareError:
+        return f"{name}_inconsistent"
+    if files != recorded_files:
+        return f"{name}_inconsistent"
     return None
 
 
