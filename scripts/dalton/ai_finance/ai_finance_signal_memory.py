@@ -492,6 +492,7 @@ def serialize_match(row: sqlite3.Row, similarity: float | None, shared_tags: set
         "industry": row["industry"],
         "summary": row["summary"],
         "evidence": row["evidence"],
+        "evidence_status": row["evidence_status"],
         "signal_types": json.loads(row["signal_types_json"] or "[]"),
         "signal_direction": row["signal_direction"],
         "qa_concern": row["qa_concern"],

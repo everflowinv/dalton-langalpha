@@ -110,12 +110,13 @@ def test_empty_history_is_not_fts_and_compare_does_not_insert(tmp_path: Path, mo
         raise RuntimeError("GEMINI_API_KEY not available")
 
     fake_embed.side_effect = refuse
-    memory.ingest_records(conn, [_record("one", "zebraquota automation")], True)
+    memory.ingest_records(conn, [_record("one", "zebraquota automation") | {"evidence_status": "actual"}], True)
     assert calls["n"] == 0
     before = memory.stats(conn)["signals"]
     compared = memory.compare_records(conn, [_record("two", "zebraquota staffing")], 5)
     assert compared["search_modes"] == ["fts"]
     assert compared["comparisons"][0]["matches"]
+    assert compared["comparisons"][0]["matches"][0]["evidence_status"] == "actual"
     assert calls["n"] == 1
     assert memory.stats(conn)["signals"] == before
     conn.close()
