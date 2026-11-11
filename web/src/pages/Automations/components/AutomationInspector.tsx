@@ -46,6 +46,14 @@ interface AutomationInspectorProps {
   onOpenRun: (runId: string) => void;
   onEdit: (a: Automation) => void;
   onDelete: (a: Automation) => void;
+  /** Company tasks hide run, delete, dismiss, and skip. Defaults keep personal rows unchanged. */
+  allowRun?: boolean;
+  allowDelete?: boolean;
+  allowDismiss?: boolean;
+  allowSkip?: boolean;
+  /** When set, pause and resume send this `config_version` and stay off until it is known. */
+  requireVersion?: boolean;
+  expectedConfigVersion?: number | null;
 }
 
 /**
@@ -60,6 +68,12 @@ export default function AutomationInspector({
   onOpenRun,
   onEdit,
   onDelete,
+  allowRun = true,
+  allowDelete = true,
+  allowDismiss = true,
+  allowSkip = true,
+  requireVersion = false,
+  expectedConfigVersion = null,
 }: AutomationInspectorProps) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -85,6 +99,11 @@ export default function AutomationInspector({
 
   const ui = automationStatusUi(a);
   const { canPause, canResume, canRun, runBusy, canDismiss } = automationActions(a);
+  const versionReady = !requireVersion || expectedConfigVersion != null;
+  const pauseTarget = () =>
+    requireVersion && expectedConfigVersion != null
+      ? { id: a.automation_id, expectedConfigVersion }
+      : a.automation_id;
   const last = a.last_execution;
   // The opened run is looked for on the list row and in the history this
   // pane loads. There is no reading one run by its id, so one older than
@@ -128,28 +147,30 @@ export default function AutomationInspector({
       )}
 
       <div className="automation-inspector-actions">
-        <HeaderButton
-          variant="secondary"
-          icon={Zap}
-          disabled={busy || runBusy || !canRun}
-          onClick={() => trigger.mutate(a.automation_id)}
-        >
-          {t('automation.runNow')}
-        </HeaderButton>
+        {allowRun && (
+          <HeaderButton
+            variant="secondary"
+            icon={Zap}
+            disabled={busy || runBusy || !canRun}
+            onClick={() => trigger.mutate(a.automation_id)}
+          >
+            {t('automation.runNow')}
+          </HeaderButton>
+        )}
         {canPause && (
-          <HeaderButton variant="secondary" icon={Pause} disabled={busy} onClick={() => pause.mutate(a.automation_id)}>
+          <HeaderButton variant="secondary" icon={Pause} disabled={busy || !versionReady} onClick={() => pause.mutate(pauseTarget())}>
             {t('automation.pause')}
           </HeaderButton>
         )}
         {canResume && (
-          <HeaderButton variant="secondary" icon={Play} disabled={busy} onClick={() => resume.mutate(a.automation_id)}>
+          <HeaderButton variant="secondary" icon={Play} disabled={busy || !versionReady} onClick={() => resume.mutate(pauseTarget())}>
             {t('automation.resume')}
           </HeaderButton>
         )}
         {/* Only while the newest run, the one dismissed, is the one shown:
             an opened older run, or one still being placed, would leave a
             failure dismissed unseen. */}
-        {canDismiss && isLatest && !placing && last && (
+        {allowDismiss && canDismiss && isLatest && !placing && last && (
           <HeaderButton
             variant="secondary"
             icon={EyeOff}
@@ -160,12 +181,14 @@ export default function AutomationInspector({
             {t('automation.dismiss')}
           </HeaderButton>
         )}
-        <HeaderButton variant="secondary" icon={Pencil} onClick={() => onEdit(a)}>
+        <HeaderButton variant="secondary" icon={Pencil} disabled={!versionReady} onClick={() => onEdit(a)}>
           {t('automation.edit')}
         </HeaderButton>
-        <HeaderButton variant="ghost" icon={Trash2} className="ml-auto hover:text-(color:--color-icon-danger)" onClick={() => onDelete(a)}>
-          {t('common.delete')}
-        </HeaderButton>
+        {allowDelete && (
+          <HeaderButton variant="ghost" icon={Trash2} className="ml-auto hover:text-(color:--color-icon-danger)" onClick={() => onDelete(a)}>
+            {t('common.delete')}
+          </HeaderButton>
+        )}
       </div>
 
       <section ref={reportRef} className="automation-inspector-section">
@@ -181,7 +204,11 @@ export default function AutomationInspector({
             links={isLatest ? attentionLinks(a) : []}
             busy={busy}
             onOpen={() => openThread(shownRun.conversation_thread_id)}
-            onSkip={() => skip.mutate({ automationId: a.automation_id, executionId: shownRun.automation_execution_id })}
+            onSkip={
+              allowSkip
+                ? () => skip.mutate({ automationId: a.automation_id, executionId: shownRun.automation_execution_id })
+                : undefined
+            }
           />
         ) : (
           <p className="automations-quiet-note">{t('automation.noRunsForThis')}</p>
@@ -267,7 +294,7 @@ function RunCard({
   links: ErrorLinkSpec[];
   busy: boolean;
   onOpen: () => void;
-  onSkip: () => void;
+  onSkip?: () => void;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();

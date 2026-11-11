@@ -27,15 +27,28 @@ function holdHome(): () => Promise<void> {
   return () => act(async () => answer());
 }
 
-vi.mock('../utils/api', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../utils/api')>()),
-  listAutomations: vi.fn(),
-  listExecutions: vi.fn(),
-  listRecentRuns: vi.fn(),
-  getDeliveryOptions: vi.fn(),
-  createAutomation: vi.fn(),
-  updateAutomation: vi.fn(),
-}));
+vi.mock('@/contexts/AuthContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/contexts/AuthContext')>();
+  return { ...actual, useAuth: () => ({ userId: 'user-1', isLoggedIn: true, isInitialized: true }) };
+});
+
+vi.mock('../utils/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/api')>();
+  const { personalReadMocks } = await import('./readBridge');
+  const listAutomations = vi.fn(async (_params: { limit?: number; offset?: number }) => ({
+    data: { automations: new Array<Automation>() },
+  }));
+  return {
+    ...actual,
+    listAutomations,
+    listExecutions: vi.fn(),
+    listRecentRuns: vi.fn(),
+    getDeliveryOptions: vi.fn(),
+    createAutomation: vi.fn(),
+    updateAutomation: vi.fn(),
+    ...personalReadMocks(listAutomations),
+  };
+});
 
 beforeEach(() => {
   home.getHomeWorkspace.mockResolvedValue(HOME_ROW);

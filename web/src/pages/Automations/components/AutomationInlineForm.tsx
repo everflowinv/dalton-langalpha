@@ -46,6 +46,12 @@ export interface AutomationInlineFormProps {
   /** Told whether the form now differs from what it opened with. */
   onDirtyChange?: (dirty: boolean) => void;
   loading: boolean;
+  /** Shown above the fields. Does not replace what the reader typed. */
+  notice?: React.ReactNode;
+  submitLabel?: string;
+  submitDisabled?: boolean;
+  /** Company edits do not offer personal delivery. */
+  omitDelivery?: boolean;
 }
 
 export default function AutomationInlineForm({
@@ -55,6 +61,10 @@ export default function AutomationInlineForm({
   onCancel,
   onDirtyChange,
   loading,
+  notice,
+  submitLabel,
+  submitDisabled = false,
+  omitDelivery = false,
 }: AutomationInlineFormProps) {
   const { t } = useTranslation();
   // What the form opened with. The props follow the list as it refreshes,
@@ -88,6 +98,7 @@ export default function AutomationInlineForm({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitDisabled) return;
     const problem = validateForm(form, Date.now(), isEdit ? opened.values : undefined);
     if (problem) {
       // A field folded away cannot be fixed, so its section opens.
@@ -136,6 +147,7 @@ export default function AutomationInlineForm({
   return (
     <motion.div {...PANE_ENTER} exit={{ opacity: 0, transition: TWEEN.exit }}>
       <form onSubmit={handleSubmit} className="automation-form">
+        {notice}
         <div className="automation-form-rows">
           <FormRow label={t('common.name')} htmlFor={ids.name}>
             <Input
@@ -175,17 +187,18 @@ export default function AutomationInlineForm({
             deliveryProblems={refused}
             // DALTON-HOOK(automation-model): pass server model error to MoreOptions
             modelError={modelError}
+            omitDelivery={omitDelivery}
           />
         </div>
 
         <div className="automation-form-actions">
           <Button
             type="submit"
-            disabled={loading || placing}
+            disabled={loading || placing || submitDisabled}
             className="hover:opacity-90"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
           >
-            {loading || placing ? t('common.saving') : isEdit ? t('automation.saveChanges') : t('common.create')}
+            {loading || placing ? t('common.saving') : submitLabel ? submitLabel : isEdit ? t('automation.saveChanges') : t('common.create')}
           </Button>
           <Button type="button" variant="ghost" onClick={onCancel}>
             {t('common.cancel')}

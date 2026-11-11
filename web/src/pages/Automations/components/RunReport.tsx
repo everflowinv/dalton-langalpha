@@ -23,7 +23,7 @@ interface RunReportProps {
   meta: string[];
   layout: keyof typeof LAYOUT;
   busy: boolean;
-  onSkip: () => void;
+  onSkip?: () => void;
   onOpenThread: () => void;
   /** Passed only where the caller allows the failed run another go. */
   onRetry?: () => void;
@@ -50,7 +50,7 @@ export function RunReport({ run, view, meta, layout, busy, onSkip, onOpenThread,
       {view.noteKey && <p className="automation-run-note">{t(view.noteKey)}</p>}
       {(view.waiting || onRetry || onResume || links.length > 0 || hasThread) && (
         <div className="automation-run-actions">
-          {view.waiting && (
+          {view.waiting && onSkip && (
             <HeaderButton variant="secondary" disabled={busy} onClick={onSkip}>
               {t('automation.skipRun')}
             </HeaderButton>

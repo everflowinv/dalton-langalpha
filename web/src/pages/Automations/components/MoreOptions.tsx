@@ -53,6 +53,8 @@ interface MoreOptionsProps {
   deliveryProblems?: DeliveryProblem[];
   // DALTON-HOOK(automation-model): server refusal message when saving an unavailable model
   modelError?: string | null;
+  /** Company tasks cannot store a personal delivery choice. */
+  omitDelivery?: boolean;
 }
 
 const NO_PROBLEMS: DeliveryProblem[] = [];
@@ -67,6 +69,7 @@ export default function MoreOptions({
   deliveryAttempts,
   deliveryProblems = NO_PROBLEMS,
   modelError = null,
+  omitDelivery = false,
 }: MoreOptionsProps) {
   const { t } = useTranslation();
   const uid = useId();
@@ -127,9 +130,13 @@ export default function MoreOptions({
     allWorkspaces ? t('agents.chiefOfStaff') : placeLabel({ workspace_id: form.place }, workspaceName),
     ...(form.llm_model ? [formatModel(form.llm_model)] : []),
     t(form.thread_strategy === 'continue' ? 'automation.continueExisting' : 'automation.newThreadEachRun'),
-    form.delivery_methods.length
-      ? t('automation.deliversTo', { method: form.delivery_methods.map(entryName).join(', ') })
-      : t('automation.noDelivery'),
+    ...(omitDelivery
+      ? []
+      : [
+          form.delivery_methods.length
+            ? t('automation.deliversTo', { method: form.delivery_methods.map(entryName).join(', ') })
+            : t('automation.noDelivery'),
+        ]),
     t('automation.stopsAfter', { count: form.max_failures }),
   ].join(' · ');
 
@@ -222,7 +229,7 @@ export default function MoreOptions({
           />
         </FormRow>
 
-        <FormRow label={t('automation.delivery')} labelId={ids.delivery}>
+        {!omitDelivery && <FormRow label={t('automation.delivery')} labelId={ids.delivery}>
           {picker ? (
             <DeliveryPicker
               methods={form.delivery_methods}
@@ -264,7 +271,7 @@ export default function MoreOptions({
               <DeliveryProblems problems={deliveryProblems} nameOf={entryName} />
             </>
           )}
-        </FormRow>
+        </FormRow>}
 
         {form.trigger_type === 'price' && (
           <FormRow label={t('automation.priceRetrigger')} labelId={ids.retrigger}>
