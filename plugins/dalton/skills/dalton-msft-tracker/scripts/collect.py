@@ -1087,7 +1087,7 @@ def _legacy_ae_map(last_run: dict[str, Any], queries: list[str]) -> dict[str, di
                 "complete": False,
                 "ok": True,
                 "cursor": None,
-                "covered_until": covered,
+                "covered_until": covered if covered and covered < end else None,
                 "window": {"start": start, "end": end},
             }
         elif covered:
@@ -1947,7 +1947,17 @@ def _commit_ids(packet: dict[str, Any]) -> set[str]:
     return ids
 
 
-def _validate_ae_state(state: dict[str, Any]) -> None:
+def _committed_ae_covered(last_run: dict[str, Any]) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for query, row in _ae_prev_map(last_run).items():
+        day = _coerce_day(row.get("covered_until"))
+        if day:
+            found[query] = day
+    return found
+
+
+def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = None) -> None:
+    retained = _committed_ae_covered(last_run or {})
     queries = state.get("queries")
     if not isinstance(queries, list):
         raise CollectError("bad_ae_state", "msft_ae_state.queries 必须是列表")
@@ -1965,7 +1975,9 @@ def _validate_ae_state(state: dict[str, Any]) -> None:
                 raise CollectError("ae_covered_until_mismatch", "完成的 AE 查询只能把 covered_until 记到本窗口终点")
         elif covered not in (None, ""):
             covered_day = parse_day(str(covered), "ae.covered_until")
-            if covered_day >= end:
+            # 同一天重新采集未完成时，保留已经提交的覆盖日期。
+            # 从更早的覆盖日抬到本窗口终点，或超过终点，仍然拒绝。
+            if covered_day > end or (covered_day == end and retained.get(row["query"]) != end):
                 raise CollectError("ae_incomplete_advanced", "未完成的 AE 查询不能把覆盖日期推进到窗口终点")
         if start > end:
             raise CollectError("bad_ae_state", "AE 窗口起点晚于终点")
@@ -2007,9 +2019,9 @@ def cmd_commit(args: argparse.Namespace) -> int:
         ae_state = packet.get("msft_ae_state")
         if not isinstance(ae_state, dict):
             return fail("bad_ae_state", "packet 缺少 msft_ae_state")
-        _validate_ae_state(ae_state)
         seen = _read_state_list(paths["seen"])
         last_run = _read_state_object(paths["last_run"])
+        _validate_ae_state(ae_state, last_run)
         log_text = paths["log"].read_text(encoding="utf-8") if paths["log"].exists() else ""
         new_ids = _commit_ids(packet)
         merged_set = set(seen) | new_ids

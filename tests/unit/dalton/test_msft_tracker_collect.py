@@ -760,6 +760,169 @@ def test_legacy_ae_resume_then_new_state(
     assert _ae["status"]
 
 
+def test_retained_ae_coverage_commits_and_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    mode = {"kind": "has_more"}
+    calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls.append(arguments)
+        kind = mode["kind"]
+        if kind == "error":
+            return {"ok": False, "error": "upstream down", "data": {}}
+        if kind == "partial":
+            return {
+                "ok": True,
+                "status": "partial",
+                "data": {"ok": True, "status": "partial", "results": [], "warnings": [WIKI_WARNING]},
+            }
+        if kind == "resume":
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        token = "cursor-kept" if arguments["query"] == first else "cursor-kept-2"
+        return {"ok": True, "data": {"results": [], "has_more": True, "cursor": token}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    seed_last = {
+        "ticker": "MSFT",
+        "run_id": "20261110-0900",
+        "committed_at": "2026-11-10T09:00:00-05:00",
+        "since": "2026-11-09",
+        "until": "2026-11-10",
+        "snapshot_file": "data/consensus/snap.json",
+        "material": "no",
+        "summary": "covered",
+        "msft_ae_state": {"queries": [
+            {
+                "query": query,
+                "complete": True,
+                "ok": True,
+                "cursor": None,
+                "covered_until": "2026-11-10",
+                "window": {"start": "2026-11-06", "end": "2026-11-10"},
+            }
+            for query in (first, second)
+        ]},
+    }
+    states: dict[str, dict[str, Any]] = {}
+    for kind in ("has_more", "error", "partial"):
+        mode["kind"] = kind
+        calls.clear()
+        _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), seed_last)
+        rows = state["queries"]
+        assert [row["query"] for row in rows] == [first, second]
+        assert all(row["complete"] is False and row["covered_until"] == "2026-11-10" for row in rows)
+        assert all(row["window"] == {"start": "2026-11-06", "end": "2026-11-10"} for row in rows)
+        assert all("cursor" not in args.get("params", {}) for args in calls)
+        assert _ae["status"]
+        states[kind] = state
+    assert [row["cursor"] for row in states["has_more"]["queries"]] == ["cursor-kept", "cursor-kept-2"]
+    assert all(row["ok"] is True for row in states["has_more"]["queries"])
+    assert all(
+        row["ok"] is False and row["cursor"] is None and row["error"] == "upstream down"
+        for row in states["error"]["queries"]
+    )
+    assert all(
+        row["ok"] is True and row["cursor"] is None and WIKI_WARNING in row["error"]
+        for row in states["partial"]["queries"]
+    )
+
+    def commit_kind(kind: str) -> tuple[Path, dict[str, Any]]:
+        ws = _workspace(tmp_path / kind)
+        (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+        (ws / "research" / "tracker" / "last_run.json").write_text(json.dumps(seed_last), encoding="utf-8")
+        _write_packet(
+            ws, "20261110-2200", "2026-11-10",
+            ae=states[kind], collected_at="2026-11-10T22:00:00-05:00",
+        )
+        code, payload = _run(
+            capsys,
+            ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2200", "--material", "no", "--summary", kind],
+        )
+        assert code == 0 and payload["ok"] is True
+        last = _read_json(ws / "research" / "tracker" / "last_run.json")
+        saved = {row["query"]: row for row in last["msft_ae_state"]["queries"]}
+        for row in states[kind]["queries"]:
+            kept = saved[row["query"]]
+            assert kept["complete"] is False
+            assert kept["covered_until"] == "2026-11-10"
+            assert kept["cursor"] == row["cursor"]
+            assert kept["ok"] is row["ok"]
+            assert kept["window"] == {"start": "2026-11-06", "end": "2026-11-10"}
+        return ws, last
+
+    kept_ws, kept_last = commit_kind("has_more")
+    commit_kind("error")
+    commit_kind("partial")
+
+    mode["kind"] = "resume"
+    calls.clear()
+    collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-12", set(), kept_last)
+    replayed = {args["query"]: args for args in calls}
+    assert set(replayed) == {first, second}
+    assert replayed[first]["start"] == "2026-11-06" and replayed[first]["end"] == "2026-11-10"
+    assert replayed[first]["params"]["cursor"] == "cursor-kept"
+    assert replayed[second]["start"] == "2026-11-06" and replayed[second]["end"] == "2026-11-10"
+    assert replayed[second]["params"]["cursor"] == "cursor-kept-2"
+
+    blocked = _workspace(tmp_path / "earlier")
+    (blocked / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    earlier = json.loads(json.dumps(seed_last))
+    for row in earlier["msft_ae_state"]["queries"]:
+        row["covered_until"] = "2026-11-09"
+        row["window"]["end"] = "2026-11-09"
+    earlier_path = blocked / "research" / "tracker" / "last_run.json"
+    earlier_path.write_text(json.dumps(earlier), encoding="utf-8")
+    _write_packet(
+        blocked, "20261110-2200", "2026-11-10",
+        ae=states["has_more"], collected_at="2026-11-10T22:00:00-05:00",
+    )
+    before = earlier_path.read_bytes()
+    code, payload = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(blocked), "--run-id", "20261110-2200", "--material", "no", "--summary", "advance"],
+    )
+    assert code == 2 and payload["status"] == "ae_incomplete_advanced"
+    assert earlier_path.read_bytes() == before
+
+    kept_path = kept_ws / "research" / "tracker" / "last_run.json"
+    past = json.loads(json.dumps(states["has_more"]))
+    for row in past["queries"]:
+        row["complete"] = False
+        row["covered_until"] = "2026-11-11"
+    _write_packet(
+        kept_ws, "20261110-2300", "2026-11-10",
+        ae=past, collected_at="2026-11-10T23:00:00-05:00",
+    )
+    before = kept_path.read_bytes()
+    code, payload = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(kept_ws), "--run-id", "20261110-2300", "--material", "no", "--summary", "past-end"],
+    )
+    assert code == 2 and payload["status"] == "ae_incomplete_advanced"
+    assert kept_path.read_bytes() == before
+
+    moved = json.loads(json.dumps(states["has_more"]))
+    for row in moved["queries"]:
+        row["complete"] = False
+        row["covered_until"] = "2026-11-11"
+        row["window"]["end"] = "2026-11-11"
+    _write_packet(
+        kept_ws, "20261110-2310", "2026-11-11",
+        ae=moved, collected_at="2026-11-10T23:10:00-05:00",
+    )
+    code, payload = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(kept_ws), "--run-id", "20261110-2310", "--material", "no", "--summary", "new-end"],
+    )
+    assert code == 2 and payload["status"] == "ae_incomplete_advanced"
+    assert kept_path.read_bytes() == before
+    assert _read_json(kept_path)["msft_ae_state"]["queries"][0]["cursor"] == "cursor-kept"
+
+
 def test_offline_collect_leaves_seen_and_recovers_packet(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1263,3 +1426,32 @@ def test_partial_wiki_consensus_and_sec(
     assert WIKI_WARNING in sources["sec"]
     assert "partial" in sources["estimates"] and "field_status" in sources["estimates"]
     assert "price" in sources["estimates"]
+
+
+@pytest.mark.parametrize("mode", ["has_more", "partial", "error"])
+def test_legacy_incomplete_window_can_commit_and_resume(monkeypatch, tmp_path, capsys, mode):
+    cfg = collect_mod.load_research_config()
+    calls = []
+    def bridge(tool_name, arguments, timeout=120):
+        calls.append(arguments)
+        if mode == "error":
+            return {"ok": False, "error": "unavailable", "data": {}}
+        if mode == "partial":
+            return {"ok": True, "status": "partial", "data": {"results": [], "status": "partial", "warnings": [WIKI_WARNING]}}
+        return {"ok": True, "data": {"results": [], "has_more": True, "cursor": "new-query-cursor"}}
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    imported = {"ae_covered_until": "2026-10-28", "ae_resume": {"window": {"since": "2026-10-25", "until": "2026-10-28"}, "cursor": "legacy-cursor"}}
+    _, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), imported)
+    assert all(not row["complete"] and row["covered_until"] is None for row in state["queries"])
+    ws = _workspace(tmp_path)
+    (ws / "data/consensus/snap.json").write_text("{}", encoding="utf-8")
+    _write_packet(ws, "20261110-1000", "2026-11-10", since="2026-11-09", ae=state)
+    code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-1000", "--material", "no", "--summary", "resume legacy window"])
+    assert code == 0
+    last = _read_json(ws / "research/tracker/last_run.json")
+    calls.clear()
+    collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-11", set(), last)
+    assert len(calls) == 2
+    assert all(row["start"] == "2026-10-25" and row["end"] == "2026-10-28" for row in calls)
+    assert all(row["params"].get("cursor") == ("new-query-cursor" if mode == "has_more" else None) for row in calls)
