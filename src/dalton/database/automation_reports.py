@@ -10,7 +10,10 @@ below to re-read these rows; they do not accept a replacement body.
 A saved card batch may also store the failure recipients from that same
 profile. After a card delivery is a certain terminal failure, one Discord
 failure notice can be inserted for those frozen recipients. That notice is a
-separate row and is not part of the original card aggregate.
+separate row and is not part of the original card aggregate. Plan and claim
+read the native item ledger before authorizing that notice. A sent card item
+clears a stale outer failure and skips an unsent notice. An unresolved native
+item does not authorize the notice.
 
 Identity arguments are server-sourced. The caller does not name an owner,
 task, execution, thread, run, or recipient inside the report body.
@@ -60,6 +63,12 @@ _NON_TERMINAL_CARD_CODES = frozenset(
         "not_started",
     }
 )
+# Native item statuses that are still open. They are not a recovered card and
+# they are not a certain card failure.
+_UNRESOLVED_NATIVE_ITEM_STATUSES = frozenset(
+    {"in_flight", "unknown", "partial", "gateway_restarted"}
+)
+_RECONCILE_LOCK_ATTEMPTS = 4
 REPORT_PROFILES = frozenset(
     {"msft-tracker", "market-digest-am", "market-digest-pm"}
 )
@@ -1555,33 +1564,148 @@ def _failure_alert_payload_matches(
     )
 
 
+class _ReconcileLockSetChanged(Exception):
+    """The delivery rows changed while their reconcile locks were being taken."""
+
+
+def _delivery_dicts(fetched: Any) -> list[dict[str, Any]]:
+    if not isinstance(fetched, list):
+        return []
+    return [dict(row) for row in fetched if isinstance(row, Mapping)]
+
+
+def _reconcile_lock_name(execution_id: str, channel: str, target: str) -> str | None:
+    """Return the reconciler's advisory name, or None when the execution is not a UUID.
+
+    This is the same name ``reconcile_single_data_task_delivery_row`` takes before
+    it updates the outer row: ``dalton_reconcile:{normalized execution}:{channel}:{target}``.
+    """
+    from src.dalton.data_jobs.notification_payloads import (
+        DataTaskArtifactError,
+        normalize_run_uuid,
+    )
+
+    try:
+        normalized = normalize_run_uuid(execution_id)
+    except DataTaskArtifactError:
+        return None
+    cleaned_channel = str(channel or "").strip().lower()
+    cleaned_target = str(target or "").strip()
+    if not cleaned_channel or not cleaned_target:
+        return None
+    return f"dalton_reconcile:{normalized}:{cleaned_channel}:{cleaned_target}"
+
+
+def _reconcile_lock_names(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    names: set[str] = set()
+    for row in rows:
+        name = _reconcile_lock_name(
+            str(row.get("execution_id") or ""),
+            str(row.get("channel") or ""),
+            str(row.get("target") or ""),
+        )
+        if name:
+            names.add(name)
+    return tuple(sorted(names))
+
+
+def _reconcile_lock_names_including_failure_targets(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Row locks plus the frozen failure recipients those rows may insert."""
+    names = set(_reconcile_lock_names(rows))
+    for row in rows:
+        snapshot = failure_target_snapshot_of(_payload_dict(row.get("payload_json")))
+        if not snapshot:
+            continue
+        execution_id = str(row.get("execution_id") or "")
+        for target in snapshot:
+            name = _reconcile_lock_name(
+                execution_id,
+                target.split(":", 1)[0],
+                target,
+            )
+            if name:
+                names.add(name)
+    return tuple(sorted(names))
+
+
+async def _acquire_reconcile_locks(cur: Any, names: Sequence[str]) -> None:
+    for name in names:
+        await cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (name,),
+        )
+
+
+async def _lock_after_reconcile_advisories(
+    cur: Any,
+    *,
+    preview_sql: str,
+    locked_sql: str,
+    params: tuple[Any, ...],
+    lock_names_fn: Callable[[Sequence[Mapping[str, Any]]], tuple[str, ...]] | None = None,
+) -> list[dict[str, Any]]:
+    """Take reconcile advisories in sorted order, then lock the outer rows.
+
+    The reconciler takes ``dalton_reconcile:...`` and only then updates
+    ``dalton_notify_deliveries``. Callers that already hold the outer row and
+    then enter the reconciler deadlock with it. A savepoint releases both locks
+    when the row set changes so the retry takes the expanded set first.
+    """
+    derive = lock_names_fn or _reconcile_lock_names
+    for _attempt in range(_RECONCILE_LOCK_ATTEMPTS):
+        await cur.execute("SAVEPOINT dalton_reconcile_order")
+        try:
+            await cur.execute(preview_sql, params)
+            preview = _delivery_dicts(await cur.fetchall())
+            row_names = _reconcile_lock_names(preview)
+            await _acquire_reconcile_locks(
+                cur,
+                tuple(sorted(set(row_names) | set(derive(preview)))),
+            )
+            await cur.execute(locked_sql, params)
+            locked = _delivery_dicts(await cur.fetchall())
+            if _reconcile_lock_names(locked) != row_names:
+                raise _ReconcileLockSetChanged()
+        except _ReconcileLockSetChanged:
+            await cur.execute("ROLLBACK TO SAVEPOINT dalton_reconcile_order")
+            await cur.execute("RELEASE SAVEPOINT dalton_reconcile_order")
+            continue
+        else:
+            await cur.execute("RELEASE SAVEPOINT dalton_reconcile_order")
+            return locked
+    raise _ReconcileLockSetChanged()
+
+
+_EXECUTION_DELIVERY_SQL = """
+SELECT delivery_id::text AS delivery_id,
+       execution_id,
+       automation_id,
+       user_id,
+       channel,
+       target,
+       status,
+       error_code,
+       attempt_count,
+       payload_json
+FROM dalton_notify_deliveries
+WHERE lower(execution_id) = lower(%s)
+ORDER BY target ASC, delivery_id ASC
+"""
+
+
 async def _lock_execution_delivery_rows(
     cur: Any,
     execution_id: str,
 ) -> list[dict[str, Any]]:
-    await cur.execute(
-        """
-        SELECT delivery_id::text AS delivery_id,
-               execution_id,
-               automation_id,
-               user_id,
-               channel,
-               target,
-               status,
-               error_code,
-               attempt_count,
-               payload_json
-        FROM dalton_notify_deliveries
-        WHERE lower(execution_id) = lower(%s)
-        ORDER BY target ASC, delivery_id ASC
-        FOR UPDATE
-        """,
-        (execution_id,),
+    return await _lock_after_reconcile_advisories(
+        cur,
+        preview_sql=_EXECUTION_DELIVERY_SQL,
+        locked_sql=_EXECUTION_DELIVERY_SQL + " FOR UPDATE",
+        params=(execution_id,),
+        lock_names_fn=_reconcile_lock_names_including_failure_targets,
     )
-    fetched = await cur.fetchall()
-    if not isinstance(fetched, list):
-        return []
-    return [dict(row) for row in fetched if isinstance(row, Mapping)]
 
 
 def _report_rows_of(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1745,10 +1869,11 @@ async def ensure_report_failure_alert(
 ) -> dict[str, Any]:
     """Insert one failure notice after a saved card batch is terminally failed.
 
-    Locks the task, then the execution, then the delivery rows. Re-reads the
-    card rows after reconciliation and inserts only the frozen failure
-    recipients. A different saved body on the same recipient rolls the insert
-    back. Uncertain card rows and permission skips do not qualify.
+    Locks the task, then the execution, then the reconcile advisories for the
+    saved rows and frozen failure recipients, and only then the delivery rows.
+    Re-reads the card rows after reconciliation and inserts only the frozen
+    failure recipients. A different saved body on the same recipient rolls the
+    insert back. Uncertain card rows and permission skips do not qualify.
     """
     exec_id = str(execution_id or "").strip()
     if not exec_id:
@@ -1764,7 +1889,7 @@ async def ensure_report_failure_alert(
                         max_attempts=max(1, int(max_attempts)),
                         reconcile_row_fn=reconcile_row_fn,
                     )
-    except _FailureAlertConflict:
+    except (_FailureAlertConflict, _ReconcileLockSetChanged):
         logger.warning(
             "Report failure alert conflict for execution_id=%s",
             exec_id,
@@ -1933,6 +2058,147 @@ def _resolver_kwargs(
     if is_admin_fn is not None:
         kwargs["is_admin_fn"] = is_admin_fn
     return kwargs
+
+
+async def _native_card_ledger_state(cur: Any, row: Mapping[str, Any]) -> str:
+    """Return ``sent``, ``unresolved``, or ``open`` from the native item ledger.
+
+    ``open`` means the ledger neither confirms every item sent nor shows an
+    unresolved item. The caller then keeps the outer row's own terminal state.
+    Identity resolution is the reconciler's, so a stale outer failure cannot
+    hide a native ``sent`` row.
+    """
+    from src.dalton.data_jobs.notification_payloads import (
+        DataTaskArtifactError,
+        normalize_run_uuid,
+    )
+    from src.dalton.database.data_task_notifications import (
+        _derive_expected_item_count_from_persisted_payload,
+        _parse_requested_notify_target,
+        _resolve_reconcile_recipient_identity,
+    )
+
+    payload = _payload_dict(row.get("payload_json"))
+    execution_id = str(row.get("execution_id") or "").strip()
+    owner_user_id = str(row.get("user_id") or "").strip()
+    channel = str(row.get("channel") or "").strip().lower()
+    target = str(row.get("target") or "").strip()
+    if not (execution_id and owner_user_id and channel and target):
+        return "open"
+    try:
+        norm_run_id = normalize_run_uuid(execution_id)
+    except DataTaskArtifactError:
+        return "open"
+    parsed = _parse_requested_notify_target(target)
+    if parsed is None:
+        return "open"
+    platform, target_kind, raw_ident = parsed
+    if platform != channel:
+        return "open"
+    expected_count = _derive_expected_item_count_from_persisted_payload(payload)
+    if expected_count is None or expected_count <= 0:
+        return "open"
+    resolved = await _resolve_reconcile_recipient_identity(
+        cur,
+        norm_run_id=norm_run_id,
+        owner_user_id=owner_user_id,
+        platform=platform,
+        target_kind=target_kind,
+        raw_ident=raw_ident,
+        expected_count=expected_count,
+        payload=payload,
+    )
+    if resolved is None:
+        return "open"
+    canonical_target_address, _recipient_id, expected_keys = resolved
+    await cur.execute(
+        """
+        SELECT delivery_key, status, error_code
+        FROM dalton_channel_deliveries
+        WHERE delivery_key = ANY(%s)
+          AND kind = 'data_task'
+          AND run_id = %s
+          AND user_id = %s
+          AND platform = %s
+          AND target_address = %s
+        """,
+        (
+            expected_keys,
+            norm_run_id,
+            owner_user_id,
+            platform,
+            canonical_target_address,
+        ),
+    )
+    fetched = await cur.fetchall()
+    by_key = {
+        str(item.get("delivery_key") or ""): item
+        for item in fetched
+        if isinstance(item, Mapping)
+    }
+    saw_unresolved = False
+    for key in expected_keys:
+        item = by_key.get(key)
+        if not isinstance(item, Mapping):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        code = str(item.get("error_code") or "").strip().lower()
+        if status in _UNRESOLVED_NATIVE_ITEM_STATUSES or (
+            status != "sent" and code in UNCERTAIN_NOTIFY_ERROR_CODES
+        ):
+            saw_unresolved = True
+    if saw_unresolved:
+        return "unresolved"
+    if len(by_key) == expected_count and all(
+        str((by_key.get(key) or {}).get("status") or "").strip().lower() == "sent"
+        for key in expected_keys
+    ):
+        return "sent"
+    return "open"
+
+
+async def _failure_alert_parent_gate(
+    cur: Any,
+    report_rows: Sequence[Mapping[str, Any]],
+    *,
+    max_attempts: int,
+) -> str:
+    """Return ``send``, ``recovered``, or ``unresolved`` for a failure notice.
+
+    A native ``sent`` item clears that card target even when its outer row is
+    still a stale failure. Any unresolved native item blocks the notice. The
+    outer row is the terminal source only when the ledger is silent.
+    """
+    saw_terminal = False
+    for row in report_rows:
+        payload = _payload_dict(row.get("payload_json"))
+        if str(payload.get("content_kind") or "") != "cards":
+            return "unresolved"
+        ledger = await _native_card_ledger_state(cur, row)
+        if ledger == "unresolved":
+            return "unresolved"
+        if ledger == "sent":
+            continue
+        if card_delivery_is_terminal(row, max_attempts=max_attempts):
+            saw_terminal = True
+    if saw_terminal:
+        return "send"
+    return "recovered"
+
+
+async def _skip_unsent_failure_alerts(cur: Any, execution_id: str) -> None:
+    await cur.execute(
+        """
+        UPDATE dalton_notify_deliveries
+        SET status = 'skipped',
+            error_code = 'report_recovered',
+            updated_at = NOW()
+        WHERE lower(execution_id) = lower(%s)
+          AND COALESCE(payload_json->>'source', '') = 'automation_report_failure_alert'
+          AND status IN ('pending', 'failed')
+        """,
+        (execution_id,),
+    )
 
 
 async def _authorize_failure_alert_row(
@@ -2142,6 +2408,26 @@ async def _authorize_failure_alert_row(
             code="target_revoked",
             message="The failure recipient is no longer bound to the owner.",
         )
+    # Plan and claim do not receive the worker attempt cap. 3 is the same
+    # default ``card_delivery_is_terminal`` and the sender use.
+    parent_gate = await _failure_alert_parent_gate(
+        cur,
+        report_rows,
+        max_attempts=3,
+    )
+    if parent_gate == "unresolved":
+        return _deny_report(
+            status="pending",
+            code="parent_unresolved",
+            message="A saved card item is still unresolved in the native ledger.",
+        )
+    if parent_gate == "recovered":
+        await _skip_unsent_failure_alerts(cur, row_execution)
+        return _deny_report(
+            status="skipped",
+            code="report_recovered",
+            message="The saved card batch is no longer a certain terminal failure.",
+        )
     return {
         "scope": "report",
         "allowed": True,
@@ -2183,8 +2469,7 @@ async def authorize_saved_report_target(
 
     exec_id = str(execution_id or "").strip()
     cleaned_target = str(target or "").strip()
-    await cur.execute(
-        """
+    saved_rows_sql = """
         SELECT delivery_id::text AS delivery_id,
                execution_id,
                automation_id,
@@ -2202,12 +2487,20 @@ async def authorize_saved_report_target(
               'automation_report_failure_alert'
           )
         ORDER BY target ASC, delivery_id ASC
-        FOR UPDATE
-        """,
-        (exec_id,),
-    )
-    fetched = await cur.fetchall()
-    rows = [dict(row) for row in fetched if isinstance(row, Mapping)] if isinstance(fetched, list) else []
+    """
+    try:
+        rows = await _lock_after_reconcile_advisories(
+            cur,
+            preview_sql=saved_rows_sql,
+            locked_sql=saved_rows_sql + " FOR UPDATE",
+            params=(exec_id,),
+        )
+    except _ReconcileLockSetChanged:
+        return _deny_report(
+            status="failed",
+            code="payload_invalid",
+            message="Saved report rows changed while locking.",
+        )
     if not rows:
         return {"scope": "none"}
     report_rows = _report_rows_of(rows)

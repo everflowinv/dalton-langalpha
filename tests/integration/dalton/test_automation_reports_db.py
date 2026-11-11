@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
 from dataclasses import dataclass, field
 import json
 import os
@@ -2329,3 +2330,432 @@ async def test_failure_alert_skips_recovered_cards_and_catchup_sends_once(
     assert len(sent_alert) == 1
     assert sent_alert[0]["status"] == "sent"
     assert len(_sourced(await _rows(world), catch_id, "automation_report")) == 2
+
+
+async def _submit_distinct_cards(
+    world: World,
+    report_run_id: str,
+    content: str,
+) -> tuple[str, dict[str, Any]]:
+    execution_id, thread_id, run_id = await _add_execution(world)
+    saved = await _submit(
+        world,
+        execution_id=execution_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        report_run_id=report_run_id,
+        cards=[_card(content)],
+    )
+    assert saved["ok"] is True
+    assert saved["created"] is True
+    return execution_id, saved
+
+
+async def _native_card_progress(
+    world: World,
+    execution_id: str,
+    target: str,
+    *,
+    sent: bool,
+) -> str:
+    plan = await dtn.authorize_data_task_notification_plan(
+        run_id=execution_id,
+        target=target,
+        **_plan_kwargs(world),
+    )
+    assert plan["authorized"] is True
+    delivery_key = plan["items"][0]["delivery_key"]
+    claim = await dtn.authorize_and_claim_data_task_delivery(
+        delivery_key=delivery_key,
+        run_id=execution_id,
+        target=target,
+        total_chunks=1,
+        **_plan_kwargs(world),
+    )
+    assert claim["claim_status"] == "claimed"
+    if sent:
+        await cg_db.update_delivery_progress(
+            delivery_key=delivery_key,
+            status="sent",
+            sent_chunks=1,
+            total_chunks=1,
+            platform_message_ids=["123456789012345678"],
+            first_response_json={"message_id": "123456789012345678"},
+        )
+    return delivery_key
+
+
+async def _quarantine_other_deliveries(
+    world: World,
+    execution_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Move other recent rows outside the catch-up lookback, and return the old times."""
+    async with world.pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT delivery_id::text AS delivery_id, created_at, updated_at
+                FROM dalton_notify_deliveries
+                WHERE NOT (execution_id = ANY(%s))
+                  AND created_at >= NOW() - INTERVAL '24 hours'
+                """,
+                (execution_ids,),
+            )
+            saved = [dict(row) for row in await cur.fetchall()]
+            if not saved:
+                return []
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET created_at = NOW() - INTERVAL '30 days',
+                    updated_at = NOW() - INTERVAL '30 days'
+                WHERE delivery_id::text = ANY(%s)
+                """,
+                ([row["delivery_id"] for row in saved],),
+            )
+    return saved
+
+
+async def _restore_delivery_times(world: World, saved: list[dict[str, Any]]) -> None:
+    if not saved:
+        return
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for row in saved:
+                await cur.execute(
+                    """
+                    UPDATE dalton_notify_deliveries
+                    SET created_at = %s, updated_at = %s
+                    WHERE delivery_id = %s::uuid
+                    """,
+                    (row["created_at"], row["updated_at"], row["delivery_id"]),
+                )
+
+
+@pytest.mark.asyncio
+async def test_alert_plan_refuses_a_recovered_or_unresolved_card_ledger(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    recovered_id, recovered_saved = await _submit_distinct_cards(
+        world,
+        "ledger-recovered",
+        "Recovered [10-K](https://example.com/msft/recovered)",
+    )
+    digest = recovered_saved["payload"]["content_sha256"]
+    cards = recovered_saved["payload"]["cards"]
+    await _mark_cards_failed(world, recovered_id, attempt=3, error_code="http_500")
+    assert (await reports.ensure_report_failure_alert(recovered_id))["created"] is True
+    for target in (world.chat_a, world.chat_b):
+        await _native_card_progress(world, recovered_id, target, sent=True)
+    alert_plan = await dtn.authorize_data_task_notification_plan(
+        run_id=recovered_id,
+        target=world.discord_target,
+        **_plan_kwargs(world),
+    )
+    assert alert_plan["authorized"] is False
+    assert alert_plan["code"] == "report_recovered"
+    alert_key = dtn.build_data_task_item_delivery_key(
+        run_id=recovered_id,
+        platform="discord",
+        recipient_id=world.discord_id,
+        item_index=0,
+    )
+    alert_claim = await dtn.authorize_and_claim_data_task_delivery(
+        delivery_key=alert_key,
+        run_id=recovered_id,
+        target=world.discord_target,
+        total_chunks=1,
+        **_plan_kwargs(world),
+    )
+    assert alert_claim["claim_status"] == "denied"
+    recovered_alert = _sourced(
+        await _rows(world), recovered_id, reports.FAILURE_ALERT_SOURCE
+    )
+    assert len(recovered_alert) == 1
+    assert recovered_alert[0]["status"] == "skipped"
+    assert recovered_alert[0]["error_code"] == "report_recovered"
+    original = _sourced(await _rows(world), recovered_id, "automation_report")
+    assert len(original) == 2
+    assert all(row["payload_json"]["cards"] == cards for row in original)
+    assert all(row["payload_json"]["content_sha256"] == digest for row in original)
+    assert await reports.read_execution_report_confirmed(recovered_id) is False
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM dalton_channel_deliveries WHERE delivery_key = %s",
+                (alert_key,),
+            )
+            assert await cur.fetchone() is None
+
+    active_id, _active_saved = await _submit_distinct_cards(
+        world,
+        "ledger-inflight",
+        "In flight [10-Q](https://example.com/msft/inflight)",
+    )
+    await _mark_cards_failed(world, active_id, attempt=3, error_code="http_500")
+    assert (await reports.ensure_report_failure_alert(active_id))["created"] is True
+    await _native_card_progress(world, active_id, world.chat_a, sent=False)
+    held = await dtn.authorize_data_task_notification_plan(
+        run_id=active_id,
+        target=world.discord_target,
+        **_plan_kwargs(world),
+    )
+    assert held["authorized"] is False
+    assert held["code"] == "parent_unresolved"
+    active_key = dtn.build_data_task_item_delivery_key(
+        run_id=active_id,
+        platform="discord",
+        recipient_id=world.discord_id,
+        item_index=0,
+    )
+    active_claim = await dtn.authorize_and_claim_data_task_delivery(
+        delivery_key=active_key,
+        run_id=active_id,
+        target=world.discord_target,
+        total_chunks=1,
+        **_plan_kwargs(world),
+    )
+    assert active_claim["claim_status"] == "denied"
+    active_alert = _sourced(await _rows(world), active_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(active_alert) == 1
+    assert active_alert[0]["status"] == "pending"
+    assert active_alert[0]["attempt_count"] == 0
+    assert active_alert[0]["error_code"] in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_catchup_skips_unusable_snapshots_before_the_page_limit(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    invalid_ids: list[str] = []
+    mutations = (
+        "payload_json - 'failure_target_snapshot'",
+        "jsonb_set(payload_json, '{failure_target_snapshot}', '[]'::jsonb)",
+        "jsonb_set(payload_json, '{failure_target_snapshot}', '\"not-an-array\"'::jsonb)",
+    )
+    for index, expression in enumerate(mutations):
+        execution_id, _saved = await _submit_distinct_cards(
+            world,
+            f"unusable-snapshot-{index}",
+            f"Old snapshot {index} [10-K](https://example.com/msft/old-{index})",
+        )
+        invalid_ids.append(execution_id)
+        await _mark_cards_failed(world, execution_id, attempt=3, error_code="http_500")
+        async with world.pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_notify_deliveries
+                    SET payload_json = {expression},
+                        created_at = NOW() - INTERVAL '3 hours',
+                        updated_at = NOW() - INTERVAL '3 hours'
+                    WHERE execution_id = %s
+                      AND COALESCE(payload_json->>'source', '') = 'automation_report'
+                    """,
+                    (execution_id,),
+                )
+                assert cur.rowcount == 2
+    valid_id, valid_saved = await _submit_distinct_cards(
+        world,
+        "usable-snapshot",
+        "Fresh snapshot [10-K](https://example.com/msft/fresh)",
+    )
+    valid_digest = valid_saved["payload"]["content_sha256"]
+    await _mark_cards_failed(world, valid_id, attempt=3, error_code="http_500")
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET created_at = NOW() - INTERVAL '1 hour',
+                    updated_at = NOW() - INTERVAL '1 hour'
+                WHERE execution_id = %s
+                """,
+                (valid_id,),
+            )
+            assert cur.rowcount == 2
+    quarantined = await _quarantine_other_deliveries(
+        world, [*invalid_ids, valid_id]
+    )
+    try:
+        from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
+
+        args = {
+            "max_attempts": 3,
+            "lookback_hours": 24,
+            "limit": 2,
+            "uncertain_codes": sorted(UNCERTAIN_NOTIFY_ERROR_CODES),
+        }
+        await notify_dispatch._catch_up_terminal_report_failure_alerts(**args)
+        created = _sourced(await _rows(world), valid_id, reports.FAILURE_ALERT_SOURCE)
+        assert len(created) == 1
+        assert created[0]["target"] == world.discord_target
+        assert created[0]["status"] == "pending"
+        assert created[0]["payload_json"]["original_content_sha256"] == valid_digest
+        assert "cards" not in created[0]["payload_json"]
+        for execution_id in invalid_ids:
+            assert _sourced(
+                await _rows(world), execution_id, reports.FAILURE_ALERT_SOURCE
+            ) == []
+        await notify_dispatch._catch_up_terminal_report_failure_alerts(**args)
+        assert len(
+            _sourced(await _rows(world), valid_id, reports.FAILURE_ALERT_SOURCE)
+        ) == 1
+    finally:
+        await _restore_delivery_times(world, quarantined)
+
+
+@pytest.mark.asyncio
+async def test_ensure_reconcile_lock_order_does_not_deadlock(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    execution_id, _saved = await _submit_distinct_cards(
+        world,
+        "lock-order",
+        "Lock order [10-K](https://example.com/msft/locks)",
+    )
+    await _native_card_progress(world, execution_id, world.chat_a, sent=True)
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET status = 'pending', attempt_count = 1, error_code = NULL
+                WHERE execution_id = %s
+                  AND COALESCE(payload_json->>'source', '') = 'automation_report'
+                """,
+                (execution_id,),
+            )
+            assert cur.rowcount == 2
+            await cur.execute(
+                """
+                SELECT delivery_id::text AS delivery_id,
+                       execution_id, automation_id, user_id, channel, target,
+                       status, error_code, attempt_count, payload_json
+                FROM dalton_notify_deliveries
+                WHERE execution_id = %s AND target = %s
+                """,
+                (execution_id, world.chat_a),
+            )
+            outer = dict(await cur.fetchone())
+    errors: list[str] = []
+
+    class _ReconcileErrors(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            error_type = ""
+            if isinstance(record.args, tuple) and record.args:
+                error_type = str(record.args[-1])
+            if error_type in {
+                "DeadlockDetected",
+                "InFailedSqlTransaction",
+                "QueryCanceled",
+            }:
+                errors.append(error_type)
+
+    handler = _ReconcileErrors()
+    reconcile_logger = logging.getLogger(dtn.__name__)
+    reconcile_logger.addHandler(handler)
+    held = asyncio.Event()
+    proceed = asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = []
+
+    async def gated(row: dict[str, Any], **kwargs: Any) -> bool:
+        held.set()
+        await asyncio.wait_for(proceed.wait(), timeout=5)
+        return await dtn.reconcile_single_data_task_delivery_row(row, **kwargs)
+
+    async def run_ensure(conn: Any) -> Any:
+        try:
+            result = await reports.ensure_report_failure_alert(
+                execution_id,
+                conn=conn,
+                reconcile_row_fn=gated,
+            )
+            return ("completed", result.get("code"), result.get("created"))
+        except Exception as exc:
+            return type(exc).__name__
+
+    async def run_reconcile(conn: Any) -> Any:
+        try:
+            await dtn.reconcile_single_data_task_delivery_row(
+                outer,
+                conn=conn,
+                allow_retry_candidate_statuses=True,
+            )
+            return "completed"
+        except Exception as exc:
+            return type(exc).__name__
+
+    ensure_outcome: Any = None
+    reconcile_outcome: Any = None
+    try:
+        async with world.pool.connection() as first, world.pool.connection() as second:
+            try:
+                await first.execute("SET deadlock_timeout = '100ms'")
+                await second.execute("SET deadlock_timeout = '100ms'")
+                await first.execute("SET statement_timeout = '5000ms'")
+                await second.execute("SET statement_timeout = '5000ms'")
+                first_pid = first.info.backend_pid
+                second_pid = second.info.backend_pid
+                ensure_task = asyncio.create_task(run_ensure(first))
+                tasks.append(ensure_task)
+                await asyncio.wait_for(held.wait(), timeout=5)
+                reconcile_task = asyncio.create_task(run_reconcile(second))
+                tasks.append(reconcile_task)
+                deadline = asyncio.get_running_loop().time() + 3
+                blocked = False
+                while asyncio.get_running_loop().time() < deadline:
+                    async with world.pool.connection() as observer:
+                        async with observer.cursor(row_factory=dict_row) as cur:
+                            await cur.execute(
+                                """
+                                SELECT pg_blocking_pids(pid) AS blockers
+                                FROM pg_stat_activity
+                                WHERE datname = current_database()
+                                  AND pid = %s
+                                """,
+                                (second_pid,),
+                            )
+                            activity = await cur.fetchone()
+                    blockers = list((activity or {}).get("blockers") or [])
+                    if first_pid in blockers:
+                        blocked = True
+                        break
+                    await asyncio.sleep(0.02)
+                proceed.set()
+                ensure_outcome, reconcile_outcome = await asyncio.wait_for(
+                    asyncio.gather(ensure_task, reconcile_task),
+                    timeout=8,
+                )
+                assert blocked
+            finally:
+                proceed.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                for held_conn in (first, second):
+                    try:
+                        await held_conn.rollback()
+                    except Exception:
+                        pass
+                    await held_conn.execute("RESET deadlock_timeout")
+                    await held_conn.execute("RESET statement_timeout")
+    finally:
+        reconcile_logger.removeHandler(handler)
+
+    assert errors == []
+    assert ensure_outcome == ("completed", "not_terminal", False)
+    assert reconcile_outcome == "completed"
+    refreshed = _sourced(await _rows(world), execution_id, "automation_report")
+    chat_a = next(row for row in refreshed if row["target"] == world.chat_a)
+    assert chat_a["status"] == "sent"
+    assert chat_a["error_code"] in (None, "")
+    assert _sourced(await _rows(world), execution_id, reports.FAILURE_ALERT_SOURCE) == []

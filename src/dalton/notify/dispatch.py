@@ -2207,6 +2207,7 @@ async def _catch_up_terminal_report_failure_alerts(
     from src.dalton.database.automation_reports import (
         card_delivery_is_terminal,
         ensure_report_failure_alert,
+        failure_target_snapshot_of,
     )
 
     async with get_db_connection() as conn:
@@ -2248,6 +2249,31 @@ async def _catch_up_terminal_report_failure_alerts(
                         AND COALESCE(alert.payload_json ->> 'source', '')
                             = 'automation_report_failure_alert'
                   )
+                  -- jsonb_array_elements rejects scalars and objects. The CASE
+                  -- keeps a missing or malformed snapshot from aborting the scan.
+                  AND jsonb_typeof(d.payload_json -> 'failure_target_snapshot') = 'array'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(
+                          CASE
+                              WHEN jsonb_typeof(d.payload_json -> 'failure_target_snapshot') = 'array'
+                              THEN d.payload_json -> 'failure_target_snapshot'
+                              ELSE '[]'::jsonb
+                          END
+                      ) AS snapshot_item(value)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(
+                          CASE
+                              WHEN jsonb_typeof(d.payload_json -> 'failure_target_snapshot') = 'array'
+                              THEN d.payload_json -> 'failure_target_snapshot'
+                              ELSE '[]'::jsonb
+                          END
+                      ) AS snapshot_item(value)
+                      WHERE jsonb_typeof(snapshot_item.value) <> 'string'
+                         OR btrim(snapshot_item.value #>> '{}') = ''
+                  )
                 ORDER BY d.updated_at ASC, d.created_at ASC
                 LIMIT %s
                 """,
@@ -2265,13 +2291,16 @@ async def _catch_up_terminal_report_failure_alerts(
             continue
         exec_id = str(row.get("execution_id") or "").strip()
         payload = row.get("payload_json")
-        if isinstance(payload, Mapping):
-            if str(payload.get("source") or "") != "automation_report":
-                continue
-            if str(payload.get("content_kind") or "") != "cards":
-                continue
-            if not card_delivery_is_terminal(row, max_attempts=max_attempts):
-                continue
+        if not isinstance(payload, Mapping):
+            continue
+        if str(payload.get("source") or "") != "automation_report":
+            continue
+        if str(payload.get("content_kind") or "") != "cards":
+            continue
+        if not failure_target_snapshot_of(payload):
+            continue
+        if not card_delivery_is_terminal(row, max_attempts=max_attempts):
+            continue
         if not exec_id or exec_id in seen:
             continue
         seen.add(exec_id)
@@ -3038,8 +3067,12 @@ _REPORT_AUTH_SKIP_CODES = frozenset(
         "profile_invalid",
         "task_disabled",
         "dalton_disabled",
+        "report_recovered",
     }
 )
+# The parent card is still unresolved. Leaving the notice pending lets a later
+# scan send it or skip it; marking it failed would consume the notice.
+_REPORT_AUTH_HOLD_CODES = frozenset({"parent_unresolved"})
 _ACCEPTED_TRANSPORT_WORDS = frozenset({"accepted", "started", "queued"})
 _UNRESOLVED_ITEM_STATUSES = frozenset(
     {"in_flight", "unknown", "partial", "gateway_restarted"}
@@ -3424,6 +3457,8 @@ async def _dispatch_one_saved_report_target(
             code = "not_allowed"
             if isinstance(auth, Mapping):
                 code = str(auth.get("code") or code).strip() or code
+            if code in _REPORT_AUTH_HOLD_CODES:
+                return False
             await _mark_saved_report_row(
                 marker,
                 execution_id,
