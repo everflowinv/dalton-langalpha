@@ -1,0 +1,81 @@
+{
+  "schema": "2.0",
+  "config": {
+    "wide_screen_mode": true,
+    "update_multi": true
+  },
+  "header": {
+    "title": {
+      "tag": "plain_text",
+      "content": "📈 MSFT 跟踪｜11-09 22:50 ET"
+    },
+    "template": "indigo",
+    "subtitle": {
+      "tag": "plain_text",
+      "content": "Microsoft · 多空观点、盈利预测修正与催化剂"
+    },
+    "text_tag_list": [
+      {
+        "tag": "text_tag",
+        "text": {
+          "tag": "plain_text",
+          "content": "MSFT"
+        },
+        "color": "indigo"
+      }
+    ]
+  },
+  "body": {
+    "direction": "vertical",
+    "vertical_spacing": "8px",
+    "elements": [
+      {
+        "tag": "markdown",
+        "content": "**判断**\n\n测试资料。详见 https://example.com/D1-skip 。D1（Azure 增速能不能再超指引、产能跟不跟得上）本轮判断不变，之后再写 D1 只保留编号。目标价区间 1至2 美元。"
+      },
+      {
+        "tag": "hr"
+      },
+      {
+        "tag": "markdown",
+        "content": "**新信息**\n\n- 测试券商（测试资料）2026-11-09：FY27 EPS 19.78。详见 [测试新闻](https://example.com/msft-test-note)。"
+      },
+      {
+        "tag": "hr"
+      },
+      {
+        "tag": "markdown",
+        "content": "**盈利预测修正**\n\n测试资料。收入、成本、投资收益三层都未改。一致预期未动。"
+      },
+      {
+        "tag": "hr"
+      },
+      {
+        "tag": "markdown",
+        "content": "**X 上的专业观点**\n\n- @test_analyst（测试身份）：测试资料，Azure 仍是主分歧，赞 12，[原帖](https://example.com/msft-test-post)\n- @test_pm（测试基金经理）：测试资料，capex 节奏未改，赞 8，[原帖](https://example.com/msft-test-post-2)\n- @test_research（测试研究员）：测试资料，Copilot 席位无新调查，赞 5，[原帖](https://example.com/msft-test-post-3)"
+      },
+      {
+        "tag": "hr"
+      },
+      {
+        "tag": "markdown",
+        "content": "**催化剂**\n\n测试资料。2026-11-20 测试催化剂，日期未改。"
+      },
+      {
+        "tag": "hr"
+      },
+      {
+        "tag": "markdown",
+        "content": "**改判条件**\n\n测试资料。Azure 增速落到指引下沿时，倾向改为看空。"
+      },
+      {
+        "tag": "hr"
+      },
+      {
+        "tag": "markdown",
+        "text_size": "notation",
+        "content": "<font color='grey'>**来源**</font>\n<font color='grey'>- [测试新闻](https://example.com/msft-test-note)</font>\n<font color='grey'>- AlphaEngine 测试券商 11/09 doc test-doc-001</font>\n<font color='grey'>- 数据备注：以上数字均为测试资料。</font>"
+      }
+    ]
+  }
+}
