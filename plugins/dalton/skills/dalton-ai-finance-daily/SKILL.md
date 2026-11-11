@@ -73,8 +73,7 @@ ai_finance_signals("stats", batch_id)
 恢复时看已保存 bundle 的 `status`：
 
 - `ingesting`：用同一份三件对象 `save`，然后 `ingest`。
-- `ingested` 且 `embedding_errors` 非空：再 `ingest` 一次，然后 `stats`。披露仍在的错误和实际覆盖。
-- `ingested` 且没有这些错误：直接 `stats`。
+- `ingested`：对同一批调用幂等 `ingest`，根据这次返回的 `embedding_errors` 执行上一段的补齐与披露步骤，然后 `stats`。
 - `open`：按本节的 save、compare、read、ingest。
 
 `upstream_primitive_adoption` 在 save 之前按 `github.md` 定下。三份对象不在本轮上下文里时，停在该步骤并写明。

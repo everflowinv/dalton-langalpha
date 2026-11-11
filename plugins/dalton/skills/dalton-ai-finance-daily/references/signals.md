@@ -29,9 +29,9 @@
 
 `summary`、`tam_mapping`、`investment_implication` 和 `external_id` 都要有内容。不使用 `full_text`、`transcript`、`content`、`body`、`text`、`document`、`raw_text`、`path`、`file`、`db`、`api_key` 这些键。
 
-GitHub 的 `record_key` 是 `github:<owner/repo>:<YYYY-MM-DD>`。日期是该条 `event_time` 的前 10 个字符。`external_id` 是 `owner/repo`。`event_time` 用这条信号材料里已经给出的带时区时间。`metrics` 保留官方 `complete_through`、`daily_gain`、`gain_7d`、`daily_velocity_3d` 和 `velocity_change_pct`，供以后检索；这些数字不进入 GitHub 栏目。材料只有日期、没有带时区时间时，来源说明写明该条缺事件时间，这条不写入 `signal_records`，也不补时钟。同一仓库出现新的事件日期时使用新的 `record_key`。`url` 是该仓库的 https 地址。`tags` 含一条 `upstream:` 加 `github.md` 里的小写标识。没有相关 Q&A 时，三个 Q&A 字段都是空字符串。
+GitHub 的 `record_key` 是 `github:<owner/repo>:<YYYY-MM-DD>`。日期是该条 `event_time` 的前 10 个字符。`external_id` 是 `owner/repo`。`event_time` 使用本批 GitHub 输出的 `generated_at`，表示本次采集观察时间。`metrics` 保留官方 `complete_through`、`daily_gain`、`gain_7d`、`daily_velocity_3d` 和 `velocity_change_pct`，供以后检索；这些数字不进入 GitHub 栏目。官方星数期间仍由 `complete_through` 表示。同一仓库出现新的事件日期时使用新的 `record_key`。`url` 是该仓库的 https 地址。`tags` 含一条 `upstream:` 加 `github.md` 里的小写标识。没有相关 Q&A 时，三个 Q&A 字段都是空字符串。
 
-业绩会的 `record_key` 是 `earnings:<doc_id>`，`external_id` 是该 `doc_id`。`event_time` 用候选或服务器输出里已经带时区的时间。`rank_date` 或 `publish_time` 只有公历日时，来源说明写明该条缺事件时间，这条不写入 `signal_records`，也不补时钟。具备该时间且 `disposition` 为 `signal` 的候选恰好一条，`watchlist` 和 `reject` 不出现。
+业绩会的 `record_key` 是 `earnings:<doc_id>`，`external_id` 是该 `doc_id`。`event_time` 沿用采集器的日期解析规则：优先 `rank_date`，缺失或无法解析时使用 `publish_time`；有时区则换算为香港时间，无时区则按香港时间解释。只有公历日期时，采用该日 `00:00:00+08:00` 的解析值，并在 `metrics` 中注明 `source_time_precision=date`。每个 `disposition` 为 `signal` 的候选恰好一条，`watchlist` 和 `reject` 不出现。
 
 `management_response_status` 为空时，`qa_concern` 和 `management_response` 都为空。`direct` 和 `partial` 两边都有内容。`evasive_or_unanswered` 至少写明分析师的问题，回答文本可以为空。
 
