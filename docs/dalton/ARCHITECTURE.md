@@ -232,6 +232,8 @@ Docker（colima，数据盘在 EveSSD）
 
 模型目录由四部分合并而成：上游 manifest、`src/dalton/llm/native_overlay.json`、运行时同步覆盖层 `var/dalton/catalog/native_sync_overlay.json`、`src/dalton/llm/openclaw_overlay.json`（`src/dalton/llm/overlay.py`、`src/dalton/llm/native_catalog.py`，钩子 `llm-overlay`）。`dalton_meta` 字段标明每个模型的家族和计费方式。各个角色默认用哪个模型，由 `agent_config.dalton.yaml`、`src/dalton/dalton.yaml` 和代理定义决定。
 
+Claude Fable 5.2 通过 `native_overlay.json` 登记：`claude-fable-5-2` 使用 Anthropic API，`claude-fable-5-2-oauth` 使用 Claude 订阅登录，两者的上游模型 ID 均为 `claude-fable-5-2`。上下文为 1,000,000 token，最大输出为 128,000 token。自适应思考始终启用，默认强度为 high，支持 low、medium、high、xhigh、max。请求使用 `drop_block` 和 `thinking-binding-controls-2026-08-01` 处理历史消息前缀变化。API 每百万 token 价格为输入 8 美元、输出 40 美元、缓存读取 0.20 美元、5 分钟缓存写入 10 美元、1 小时缓存写入 16 美元。订阅调用的现金花费记为 0，并通过 `notional_ref` 计算名义成本。价格核对日期为 2026-11-11，参见[官方规格](https://platform.claude.com/docs/en/models/fable-5-2/overview)和[迁移说明](https://platform.claude.com/docs/en/models/fable-5-2/migration-guide)。
+
 | 接入方式 | 供应商 | 说明 |
 |---|---|---|
 | 订阅 OAuth（上游） | `codex-oauth`、`claude-oauth` | |
