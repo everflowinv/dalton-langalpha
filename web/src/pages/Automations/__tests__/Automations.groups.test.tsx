@@ -783,6 +783,151 @@ describe('cached reads and independent pages', () => {
     expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
   });
 
+  it('retries a script with the later detail version and the same draft', async () => {
+    const taskId = 'data:prices';
+    const draft = '7 7 * * 7';
+    const retryName = label('automation.retryWithCurrent');
+    const listed = script({ automation_id: taskId, name: 'Close prices', config_version: 3, cron_expression: '0 9 * * 1-5' });
+    const other = script({ automation_id: 'data:other', name: 'Other book', config_version: 11 });
+    let detailMode: 'open' | 'fail' | 'other' | 'fresh' = 'open';
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      return { data: { automations: [listed, other], total: 2 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockImplementation(async (id: string) => {
+      if (detailMode === 'fail') throw httpError(503, 'unavailable');
+      if (detailMode === 'other') return { data: other } as never;
+      if (id !== taskId) throw httpError(404, 'missing');
+      const version = detailMode === 'fresh' ? 8 : 3;
+      return { data: { ...listed, config_version: version } } as never;
+    });
+    vi.mocked(api.updateCompanyScript).mockImplementation(async () => {
+      detailMode = 'fail';
+      throw httpError(409, 'Someone else saved this task.');
+    });
+    const { queryClient } = renderAt('/automations?view=manage');
+    const cron = () => screen.getByLabelText(label('automation.scriptCron'));
+    const retry = () => screen.getByRole('button', { name: retryName });
+
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
+    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: draft } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+
+    await waitFor(() => {
+      expect(retry()).toBeDisabled();
+      expect(queryClient.isFetching({ queryKey: queryKeys.automations.all })).toBe(0);
+    });
+    expect(cron()).toHaveValue(draft);
+    expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api.updateCompanyScript).mock.calls[0]).toEqual([
+      taskId,
+      { expected_config_version: 3, cron_expression: draft },
+    ]);
+
+    await act(async () => {
+      detailMode = 'other';
+      await queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+    });
+    await waitFor(() => expect(queryClient.isFetching({ queryKey: queryKeys.automations.all })).toBe(0));
+    expect(retry()).toBeDisabled();
+    expect(cron()).toHaveValue(draft);
+    expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(label('automation.currentVersion', { version: 11 }))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+
+    await act(async () => {
+      detailMode = 'fresh';
+      await queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+    });
+    await waitFor(() => expect(retry()).toBeEnabled());
+    expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
+    expect(cron()).toHaveValue(draft);
+    expect(screen.getByText(label('automation.currentVersion', { version: 8 }))).toBeInTheDocument();
+
+    fireEvent.click(retry());
+    await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.updateCompanyScript).mock.calls[1]).toEqual([
+      taskId,
+      { expected_config_version: 8, cron_expression: draft },
+    ]);
+  });
+
+  it('retries a company agent with the later detail version and the same draft', async () => {
+    const taskId = 'co-1';
+    const draft = 'Desk hours';
+    const retryName = label('automation.retryWithCurrent');
+    const listed = agent({ automation_id: taskId, name: 'Desk', scope: 'company', config_version: 2 });
+    const other = agent({ automation_id: 'co-2', name: 'Other desk', scope: 'company', config_version: 11 });
+    let detailMode: 'open' | 'fail' | 'other' | 'fresh' = 'open';
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      return { data: { automations: [listed, other], total: 2 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockImplementation(async (id: string) => {
+      if (detailMode === 'fail') throw httpError(503, 'unavailable');
+      if (detailMode === 'other') return { data: other } as never;
+      if (id !== taskId) throw httpError(404, 'missing');
+      const version = detailMode === 'fresh' ? 9 : 7;
+      return { data: { ...listed, config_version: version } } as never;
+    });
+    vi.mocked(api.updateAutomation).mockImplementation(async () => {
+      detailMode = 'fail';
+      throw httpError(409, 'Someone else saved this task.');
+    });
+    const { queryClient } = renderAt('/automations?view=manage');
+    const name = () => screen.getByLabelText(label('common.name'));
+    const retry = () => screen.getByRole('button', { name: retryName });
+
+    await waitFor(() => expect(inspector('Desk').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    fireEvent.click(inspector('Desk').getByRole('button', { name: label('automation.edit') }));
+    fireEvent.change(await screen.findByLabelText(label('common.name')), { target: { value: draft } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+
+    await waitFor(() => {
+      expect(retry()).toBeDisabled();
+      expect(queryClient.isFetching({ queryKey: queryKeys.automations.all })).toBe(0);
+    });
+    expect(name()).toHaveValue(draft);
+    expect(api.updateAutomation).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api.updateAutomation).mock.calls[0][0]).toBe(taskId);
+    expect(vi.mocked(api.updateAutomation).mock.calls[0][1]).toMatchObject({
+      name: draft,
+      expected_config_version: 7,
+    });
+    expect(vi.mocked(api.updateAutomation).mock.calls[0][1]).not.toHaveProperty('delivery_config');
+
+    await act(async () => {
+      detailMode = 'other';
+      await queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+    });
+    await waitFor(() => expect(queryClient.isFetching({ queryKey: queryKeys.automations.all })).toBe(0));
+    expect(retry()).toBeDisabled();
+    expect(name()).toHaveValue(draft);
+    expect(api.updateAutomation).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(label('automation.currentVersion', { version: 11 }))).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+
+    await act(async () => {
+      detailMode = 'fresh';
+      await queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+    });
+    await waitFor(() => expect(retry()).toBeEnabled());
+    expect(api.updateAutomation).toHaveBeenCalledTimes(1);
+    expect(name()).toHaveValue(draft);
+    expect(screen.getByText(label('automation.currentVersion', { version: 9 }))).toBeInTheDocument();
+
+    fireEvent.click(retry());
+    await waitFor(() => expect(api.updateAutomation).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(api.updateAutomation).mock.calls[1][0]).toBe(taskId);
+    expect(vi.mocked(api.updateAutomation).mock.calls[1][1]).toMatchObject({
+      name: draft,
+      expected_config_version: 9,
+    });
+    expect(vi.mocked(api.updateAutomation).mock.calls[1][1]).not.toHaveProperty('delivery_config');
+    expect(vi.mocked(api.updateAutomation).mock.calls[1][1]).not.toHaveProperty('config_version');
+  });
+
   it('keeps previous-page navigation after the next page fails', async () => {
     vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
       if (params?.scope !== 'research_tracking') return emptyPage();

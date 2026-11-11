@@ -65,7 +65,15 @@ type FormMode = { kind: 'create'; template: TemplateId; nonce: number } | { kind
 
 type ScopeName = 'company' | 'personal' | 'research_tracking';
 
-type ConfigConflict = { id: string; message: string; current: number | null };
+type ConfigConflict = {
+  id: string;
+  message: string;
+  current: number | null;
+  /** `dataUpdatedAt` of this task's detail when the conflict was recorded. */
+  seenUpdatedAt: number;
+  /** Detail cached at that moment. A failed refetch keeps this same page. */
+  seenData: unknown;
+};
 
 function lastFilledOffset(total: number): number {
   if (!Number.isFinite(total) || total <= 0) return 0;
@@ -148,6 +156,21 @@ function RememberedScroll({ memoryKey, children }: { memoryKey: string; children
       {children}
     </div>
   );
+}
+
+// DALTON-HOOK(company-automations): explicit retry reads a newer successful detail for the same task, not a list row or the detail cached when the refetch failed.
+function laterConflictVersion(
+  conflict: ConfigConflict | null,
+  paneId: string | null,
+  detail: { isSuccess: boolean; data?: { automation_id?: string; config_version?: unknown } | undefined },
+  updatedAt: number,
+): number | null {
+  if (!conflict || conflict.current != null || paneId !== conflict.id || !detail.isSuccess) return null;
+  const data = detail.data;
+  if (!data || data.automation_id !== conflict.id) return null;
+  const newer =
+    updatedAt > conflict.seenUpdatedAt || (updatedAt === conflict.seenUpdatedAt && data !== conflict.seenData);
+  return newer ? configVersionOf(data) : null;
 }
 
 /**
@@ -299,6 +322,16 @@ export default function Automations() {
     (companyForbidden && !!openDetail && isCompanyTask(openDetail));
   const detailTask = !detailForbidden ? openDetail : null;
   const pageRow = paneId ? pool.find((task) => task.automation_id === paneId) : undefined;
+  // DALTON-HOOK(company-automations): a later successful detail for this same conflict fills the version explicit retry sends.
+  const recoveredVersion = laterConflictVersion(
+    conflict,
+    paneId,
+    detail,
+    conflict && paneId === conflict.id
+      ? queryClient.getQueryState(queryKeys.automations.readDetail(userId, conflict.id))?.dataUpdatedAt ?? 0
+      : 0,
+  );
+  if (conflict && recoveredVersion != null) setConflict({ ...conflict, current: recoveredVersion });
 
   useEffect(() => {
     if (form?.kind !== 'edit') return;
@@ -407,15 +440,22 @@ export default function Automations() {
   const rememberConflict = useCallback(
     async (id: string, err: unknown) => {
       const message = mutationErrorMessage(err, '');
-      setConflict({ id, message, current: null });
+      const remembered = queryClient.getQueryState(queryKeys.automations.readDetail(userId, id));
+      // DALTON-HOOK(company-automations): a failed conflict refetch leaves retry off until a later successful detail for this same task.
+      setConflict({
+        id,
+        message,
+        current: null,
+        seenUpdatedAt: remembered?.dataUpdatedAt ?? 0,
+        seenData: remembered?.data,
+      });
       const read = await detail.refetch();
-      // A failed refetch has no new version, so retry stays off and the typed draft stays mounted.
       setConflict((current) => {
-        if (!current || current.id !== id) return current;
-        return { ...current, current: read.isSuccess ? configVersionOf(read.data) : null };
+        if (!current || current.id !== id || !read.isSuccess || read.data?.automation_id !== id) return current;
+        return { ...current, current: configVersionOf(read.data) };
       });
     },
-    [detail],
+    [detail, queryClient, userId],
   );
 
   const startEdit = useCallback(
