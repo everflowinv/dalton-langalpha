@@ -1767,7 +1767,8 @@ def _summary(workspace: Path, packet: dict[str, Any], recovered: bool) -> dict[s
     tracker = workspace / "research" / "tracker" / run_id
     internal = packet.get("internal") or {}
     return {
-        "ok": not packet.get("failed_sources"),
+        # 完成的数据包保留来源告警，供后续研究披露。
+        "ok": True,
         "recovered": recovered,
         "ticker": TICKER,
         "run_id": run_id,

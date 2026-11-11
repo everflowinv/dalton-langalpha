@@ -1410,7 +1410,8 @@ def test_partial_wiki_consensus_and_sec(
     seen_path.write_text('["keep-me"]\n', encoding="utf-8")
     before = seen_path.read_bytes()
     code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "partial-1", "--since", "2026-11-08"])
-    assert code == 0 and payload["ok"] is False
+    assert code == 0 and payload["ok"] is True
+    assert payload["failed_sources"]
     assert seen_path.read_bytes() == before
     packet = _read_json(tracker / "partial-1" / "packet.json")
     assert packet["consensus"]["status"] == "partial"
@@ -1426,6 +1427,114 @@ def test_partial_wiki_consensus_and_sec(
     assert WIKI_WARNING in sources["sec"]
     assert "partial" in sources["estimates"] and "field_status" in sources["estimates"]
     assert "price" in sources["estimates"]
+
+
+def test_incomplete_ae_page_keeps_packet_ok_and_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    calls = {"n": 0, "closed": False}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if calls["closed"]:
+            raise AssertionError("recovered collect called the bridge")
+        calls["n"] += 1
+        if arguments.get("route") == "alphaengine":
+            assert arguments["limit"] == 20
+            token = "a" if arguments["query"] == first else "b"
+            items = [
+                {
+                    "doc_id": f"alphaengine:{token}-{i}",
+                    "title": "Azure note",
+                    "companies": ["Microsoft"],
+                    "publish_time": "2026-11-10",
+                }
+                for i in range(20)
+            ]
+            return {"ok": True, "data": {"results": items, "has_more": True, "cursor": f"cursor-{token}"}}
+        if arguments.get("route") == "x-timeline":
+            assert "params" not in arguments
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        if arguments.get("route") == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+    ws = _workspace(tmp_path)
+    tracker = ws / "research" / "tracker"
+    last_run = {
+        "ticker": "MSFT",
+        "run_id": "20261109-1800",
+        "until": "2026-11-09",
+        "msft_ae_state": {"queries": [
+            {
+                "query": query,
+                "complete": True,
+                "ok": True,
+                "cursor": None,
+                "covered_until": "2026-11-09",
+                "window": {"start": "2026-11-06", "end": "2026-11-09"},
+            }
+            for query in (first, second)
+        ]},
+    }
+    last_path = tracker / "last_run.json"
+    last_path.write_text(json.dumps(last_run), encoding="utf-8")
+    before_last = last_path.read_bytes()
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "ae-page", "--since", "2026-11-09"])
+    assert code == 0 and payload["ok"] is True and payload["recovered"] is False
+    assert payload["short_circuit_eligible"] is False
+    assert payload["counts"]["alphaengine"] == 40
+    errors = [item["error"] for item in payload["failed_sources"] if item["source"] == "alphaengine"]
+    assert errors == [f"{query}: 未完成，覆盖日期不推进" for query in (first, second)]
+    packet_path = tracker / "ae-page" / "packet.json"
+    packet_bytes = packet_path.read_bytes()
+    packet = json.loads(packet_bytes)
+    assert packet["collection_complete"] is True
+    assert packet["failed_sources"] == payload["failed_sources"]
+    by_query = {row["query"]: row for row in packet["msft_ae_state"]["queries"]}
+    for query, token in ((first, "a"), (second, "b")):
+        row = by_query[query]
+        assert row["ok"] is True and row["returned"] == 20 and row["has_more"] is True
+        assert row["complete"] is False and row["cursor"] == f"cursor-{token}"
+        assert row["covered_until"] == "2026-11-09"
+        assert row["window"]["end"] == "2026-11-10"
+    assert last_path.read_bytes() == before_last
+    taken = calls["n"]
+    calls["closed"] = True
+
+    def _boom(ticker: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        raise AssertionError("recovered collect fetched consensus")
+
+    _patch_consensus(monkeypatch, _boom)
+    code, again = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "ae-page", "--since", "2026-11-09"])
+    assert code == 0 and again["ok"] is True and again["recovered"] is True
+    assert again["failed_sources"] == payload["failed_sources"]
+    assert again["counts"] == payload["counts"]
+    assert calls["n"] == taken
+    assert packet_path.read_bytes() == packet_bytes
+    assert last_path.read_bytes() == before_last
+
+    bad = tracker / "bad-packet" / "packet.json"
+    bad.parent.mkdir()
+    bad.write_text("{", encoding="utf-8")
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "bad-packet"])
+    assert code == 2 and payload["ok"] is False and payload["status"] == "packet_unreadable"
+    assert calls["n"] == taken
+    half = tracker / "half-packet" / "packet.json"
+    half.parent.mkdir()
+    half.write_text(
+        json.dumps({"ticker": "MSFT", "run_id": "half-packet", "collection_complete": False}),
+        encoding="utf-8",
+    )
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "half-packet"])
+    assert code == 2 and payload["ok"] is False and payload["status"] == "packet_exists_not_complete"
+    assert calls["n"] == taken
+    assert packet_path.read_bytes() == packet_bytes
 
 
 @pytest.mark.parametrize("mode", ["has_more", "partial", "error"])
