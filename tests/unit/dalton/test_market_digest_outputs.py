@@ -601,3 +601,60 @@ def test_cached_retry_after_sqlite_failure(tmp_path: Path) -> None:
     assert "## AM\n" in archive
     assert body in archive
     assert "KEEP-PM" in {row[5] for row in after}
+
+
+def _insert_before_source(body: str, block: str) -> str:
+    needle = f"\n{SOURCE_HEADING}\n"
+    assert needle in body
+    return body.replace(needle, f"\n{block}\n{SOURCE_HEADING}\n", 1)
+
+
+def test_period_marker_lines_are_rejected_and_archive_stays(tmp_path: Path) -> None:
+    world = _World(tmp_path, seed=False)
+    am_execution, am_prepared = world.execution("AM")
+    pm_execution, _pm_prepared = world.execution("PM")
+    date = am_prepared["authoritative_date"]
+    archive_path = world.memory / f"{date}.md"
+    original = "Existing preamble\n\n## PM\n\nkeep PM archive\n".encode("utf-8")
+    archive_path.write_bytes(original)
+    am = _body("AM", date, "MARK-AM")
+    pm = _body("PM", date, "MARK-PM")
+    refused = [
+        ("AM", am_execution, _insert_before_source(am, "## PM")),
+        ("AM", am_execution, _insert_before_source(am, "## PM").replace("\n", "\r\n")),
+        ("AM", am_execution, _insert_before_source(am, "## PM\r")),
+        ("AM", am_execution, _insert_before_source(am, "```text\n## PM\nAM tail inside fence\n```")),
+        ("AM", am_execution, _insert_before_source(am, "```text\r\n## PM\r\n```")),
+        ("PM", pm_execution, _insert_before_source(pm, "## AM")),
+        ("PM", pm_execution, _insert_before_source(pm, "## AM").replace("\n", "\r\n")),
+        ("PM", pm_execution, _insert_before_source(pm, "## AM\r")),
+        ("PM", pm_execution, _insert_before_source(pm, "~~~\n## AM\nPM tail inside fence\n~~~")),
+        ("PM", pm_execution, _insert_before_source(pm, "~~~\r\n## AM\r\n~~~")),
+    ]
+    for period, execution, body in refused:
+        assert mod.save_output(world.config, execution, period, body) == {
+            "ok": False,
+            "code": "body_invalid",
+        }
+        with pytest.raises(mod._Rejected) as caught:
+            mod._archive_body(world.config, date, period, body)
+        assert caught.value.code == "body_invalid"
+        assert archive_path.read_bytes() == original
+    assert not (world.body / "AM").exists()
+    assert not (world.body / "PM").exists()
+
+    safe_am = _insert_before_source(am, "```text\n## PM notes\n## am\nAM-TAIL-TOKEN\n```")
+    safe_pm = _insert_before_source(pm, "```text\r\n## AM notes\r\n## pm\r\nPM-TAIL-TOKEN\r\n```")
+    assert mod.save_output(world.config, am_execution, "AM", safe_am)["ok"] is True
+    assert mod.save_output(world.config, pm_execution, "PM", safe_pm)["ok"] is True
+    assert mod._archive_body(world.config, date, "AM", safe_am) == "written"
+    assert mod._archive_body(world.config, date, "PM", safe_pm) == "written"
+    archived = archive_path.read_bytes().decode("utf-8")
+    assert "Existing preamble" in archived
+    assert safe_am in archived
+    assert safe_pm in archived
+    assert sum(line == "## AM" for line in archived.splitlines()) == 1
+    assert sum(line == "## PM" for line in archived.splitlines()) == 1
+    am_section = archived.split("\n## PM\n", 1)[0]
+    assert "AM-TAIL-TOKEN" in am_section
+    assert "PM-TAIL-TOKEN" in archived.split("\n## PM\n", 1)[1]

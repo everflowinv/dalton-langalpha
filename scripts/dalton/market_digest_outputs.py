@@ -664,6 +664,23 @@ def _input_hash(value: object) -> str | None:
     return None
 
 
+_PERIOD_MARKER_LINES = frozenset({"## AM", "## PM"})
+
+
+def _contains_period_marker(text: str) -> bool:
+    """True when a line is exactly ``## AM`` or ``## PM`` after CR/LF removal.
+
+    The archive parser treats those lines as period boundaries. A digest body
+    must not contain them, including inside a fence, or the other period's
+    archive write would treat the tail as its own section.
+    """
+
+    for line in text.splitlines(keepends=True):
+        if line.rstrip("\r\n") in _PERIOD_MARKER_LINES:
+            return True
+    return False
+
+
 def _validate_markdown(markdown: object, period: str, date_value: str) -> dict[str, Any]:
     if not isinstance(markdown, str) or markdown == "":
         raise _Rejected("body_invalid")
@@ -675,6 +692,8 @@ def _validate_markdown(markdown: object, period: str, date_value: str) -> dict[s
         raise _Rejected("body_invalid") from None
     if not payload or len(payload) > MAX_BODY_BYTES:
         raise _Rejected("body_too_large" if payload else "body_invalid")
+    if _contains_period_marker(markdown):
+        raise _Rejected("body_invalid")
     skip = f"SKIP: no new emails for {date_value} {period}"
     lines = markdown.splitlines()
     if lines == [skip]:
@@ -1000,6 +1019,8 @@ def _upsert_period(blocks: list[tuple[str, str]], period: str, payload: str) -> 
 def _archive_body(config: OutputConfig, date_value: str, period: str, markdown: str) -> str:
     """Replace only the exact period section. Return written or reused."""
 
+    if _contains_period_marker(markdown):
+        raise _Rejected("body_invalid")
     _mkdir(config.market_memory_dir)
     path = _child(config.market_memory_dir, f"{date_value}.md")
     canonical = markdown if markdown.endswith("\n") else markdown + "\n"
@@ -1328,7 +1349,7 @@ def _finalize_locked(
     try:
         archive_result = _archive_body(config, bound["date"], bound["period"], markdown)
     except _Rejected as exc:
-        code = exc.code if exc.code in {"archive_too_large", "state_rejected"} else "archive_failed"
+        code = exc.code if exc.code in {"archive_too_large", "state_rejected", "body_invalid"} else "archive_failed"
         _set_status(directory, metadata, archive_status="failed")
         return _finalize_result(
             metadata,

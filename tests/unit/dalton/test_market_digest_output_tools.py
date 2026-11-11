@@ -375,3 +375,24 @@ async def test_different_body_is_not_saved(monkeypatch: pytest.MonkeyPatch) -> N
     assert payload["byte_count"] == len(stored_md.encode())
     assert "stored-line" not in raw
     assert "caller-line" not in raw
+
+
+@pytest.mark.parametrize("marker", ["## AM", "## PM"])
+async def test_period_marker_line_is_not_sent(
+    monkeypatch: pytest.MonkeyPatch, marker: str
+) -> None:
+    source = "## \U0001f4dd \u6765\u6e90\n"
+    markdown = _markdown().replace(source, f"{marker}\r\n{source}", 1)
+    record = _stored(markdown)
+    record["section_count"] = sum(
+        line.startswith("## ") for line in markdown.splitlines()
+    )
+    world = _install(monkeypatch)
+    world.steps.append(record)
+    _raw, payload = await _run("submit")
+    assert world.trace == [("http", "get")]
+    assert world.factory.call_count == 0
+    assert world.calls == []
+    assert payload["code"] == "body_invalid"
+    assert payload["stage"] == "body_invalid"
+    assert payload["finalized"] is False

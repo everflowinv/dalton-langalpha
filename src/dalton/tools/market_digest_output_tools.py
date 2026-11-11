@@ -361,6 +361,9 @@ def _validate_saved(payload: Mapping[str, Any], period: str) -> _Saved | str:
         return "body_invalid"
     if _nonneg(payload.get("source_line_count")) != sources:
         return "body_invalid"
+    # splitlines drops CR/LF. Exact "## AM" / "## PM" lines are period boundaries.
+    if any(line in {"## AM", "## PM"} for line in lines):
+        return "body_invalid"
     archive_status = _token(payload.get("archive_status"))
     embedding_status = _token(payload.get("embedding_status"))
     index_status = _token(payload.get("index_status"))
