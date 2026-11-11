@@ -283,3 +283,11 @@ web/src/pages/Automations/hooks/useAutomationReads.ts
 web/src/pages/Automations/hooks/__tests__/useAutomationReads.test.tsx
 web/src/pages/Automations/utils/__tests__/api.reads.test.ts
 tests/unit/dalton/test_sec_call_observability.py
+
+# T11 AI finance core: batch collection, signal memory, and brief checks.
+scripts/dalton/ai_finance/
+tests/unit/dalton/test_ai_finance_github.py
+tests/unit/dalton/test_ai_finance_earnings.py
+tests/unit/dalton/test_ai_finance_signal_memory.py
+tests/unit/dalton/test_ai_finance_validate.py
+tests/unit/dalton/test_ai_finance_prepare.py
