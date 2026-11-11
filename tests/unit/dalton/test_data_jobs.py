@@ -7389,8 +7389,10 @@ async def test_pr12_dispatch_and_retry_feishu_cards_raw_order_and_fallback(
         [
             {"fetchall": candidate_rows},
             {"fetchone": {"attempt_count": 2}},
+            {"fetchall": []},
             {"fetchall": candidate_rows},
             {"fetchone": {"attempt_count": 3}},
+            {"fetchall": []},
         ]
     )
 
