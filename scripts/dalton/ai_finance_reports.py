@@ -1047,10 +1047,77 @@ def _invalid(batch_id: str, violations: list[str]) -> dict[str, Any]:
     return _error("report_invalid", batch_id=batch_id, violation_count=len(violations), violations=safe)
 
 
+_VIOLATION_CREDENTIAL = re.compile(
+    r"(?i)(?<![\w.-])(?:"
+    r"bearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|sk-[A-Za-z0-9-]{16,}"
+    r"|(?:api[_-]?key|secret|token|password|passwd|authorization)(?![\w.-])\s*[:=]\s*[^\s,，。;]+"
+    r")"
+)
+_VIOLATION_URL = re.compile(r"(?i)\b(?:https?|file)://[^\s,，。;]+")
+_VIOLATION_DRIVE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[/\\][^\s,，。;]*")
+_VIOLATION_UNC = re.compile(r"\\\\[^\s,，。;]*")
+_VIOLATION_TILDE = re.compile(r"~[/\\][^\s,，。;]*")
+_VIOLATION_ABSOLUTE = re.compile(r"(?<![\w.-])/(?:[^\s,，。;\\])+")
+_VIOLATION_SLASH_RUN = re.compile(r"[^\s,，。;]*[/\\][^\s,，。;]*")
+_VIOLATION_EDGE = "([{\"'.,:;)]}"
+
+
+def _violation_repo(token: str) -> bool:
+    """True for one bounded owner/repo, not a path or a longer slash chain."""
+    if len(token) > 201 or token.count("/") != 1 or "\\" in token:
+        return False
+    owner, repo = token.split("/", 1)
+    if owner in {".", ".."} or repo in {".", ".."}:
+        return False
+    if not re.fullmatch(r"[\w.-]{1,100}", owner) or not re.fullmatch(r"[\w.-]{1,100}", repo):
+        return False
+    return bool(re.search(r"[A-Za-z0-9]", owner) and re.search(r"[A-Za-z0-9]", repo))
+
+
+def _keep_violation_repo(match: re.Match[str]) -> str:
+    token = match.group(0).strip(_VIOLATION_EDGE)
+    if _violation_repo(token):
+        return token
+    return " "
+
+
+def _clip_violation(text: str) -> str:
+    if len(text) <= 180:
+        return text
+    clipped = text[:180]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.strip()
+
+
+def _violation_residue_unsafe(text: str) -> bool:
+    if "~/" in text or "~\\" in text or _VIOLATION_CREDENTIAL.search(text):
+        return True
+    residue = _VIOLATION_SLASH_RUN.sub(
+        lambda match: " " if _violation_repo(match.group(0).strip(_VIOLATION_EDGE)) else match.group(0),
+        text,
+    )
+    return "/" in residue or "\\" in residue
+
+
 def _safe_violation(text: str) -> str:
-    cleaned = re.sub(r"(?:~|/|[A-Za-z]:\\)[^\s，。;]*", "", text)
-    cleaned = cleaned.replace("\\", " ").strip()
-    return re.sub(r"\s+", " ", cleaned)[:180]
+    """Keep validator owner/repo names. Drop filesystem paths and credential material."""
+    cleaned = _VIOLATION_CREDENTIAL.sub(" ", text)
+    cleaned = _VIOLATION_URL.sub(" ", cleaned)
+    cleaned = _VIOLATION_DRIVE.sub(" ", cleaned)
+    cleaned = _VIOLATION_UNC.sub(" ", cleaned)
+    cleaned = _VIOLATION_TILDE.sub(" ", cleaned)
+    cleaned = _VIOLATION_ABSOLUTE.sub(" ", cleaned)
+    cleaned = _VIOLATION_SLASH_RUN.sub(_keep_violation_repo, cleaned)
+    cleaned = _clip_violation(re.sub(r"\s+", " ", cleaned).strip())
+    cleaned = _VIOLATION_SLASH_RUN.sub(_keep_violation_repo, cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 180:
+        cleaned = _clip_violation(cleaned)
+    if not cleaned or _violation_residue_unsafe(cleaned):
+        return ""
+    return cleaned[:180]
 
 
 def _error(code: str, **extra: Any) -> dict[str, Any]:

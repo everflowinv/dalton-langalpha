@@ -546,6 +546,77 @@ def _report_invalid_feedback(payload: object) -> tuple[list[str], int | None]:
     return _bounded_violations(payload.get("violations")), count
 
 
+_VIOLATION_CREDENTIAL = re.compile(
+    r"(?i)(?<![\w.-])(?:"
+    r"bearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|sk-[A-Za-z0-9-]{16,}"
+    r"|(?:api[_-]?key|secret|token|password|passwd|authorization)(?![\w.-])\s*[:=]\s*[^\s,，。;]+"
+    r")"
+)
+_VIOLATION_URL = re.compile(r"(?i)\b(?:https?|file)://[^\s,，。;]+")
+_VIOLATION_DRIVE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[/\\][^\s,，。;]*")
+_VIOLATION_UNC = re.compile(r"\\\\[^\s,，。;]*")
+_VIOLATION_TILDE = re.compile(r"~[/\\][^\s,，。;]*")
+_VIOLATION_ABSOLUTE = re.compile(r"(?<![\w.-])/(?:[^\s,，。;\\])+")
+_VIOLATION_SLASH_RUN = re.compile(r"[^\s,，。;]*[/\\][^\s,，。;]*")
+_VIOLATION_EDGE = "([{\"'.,:;)]}"
+
+
+def _violation_repo(token: str) -> bool:
+    if len(token) > 201 or token.count("/") != 1 or "\\" in token:
+        return False
+    owner, repo = token.split("/", 1)
+    if owner in {".", ".."} or repo in {".", ".."}:
+        return False
+    if not re.fullmatch(r"[\w.-]{1,100}", owner) or not re.fullmatch(r"[\w.-]{1,100}", repo):
+        return False
+    return bool(re.search(r"[A-Za-z0-9]", owner) and re.search(r"[A-Za-z0-9]", repo))
+
+
+def _keep_violation_repo(match: re.Match[str]) -> str:
+    token = match.group(0).strip(_VIOLATION_EDGE)
+    if _violation_repo(token):
+        return token
+    return " "
+
+
+def _clip_violation(text: str) -> str:
+    if len(text) <= 180:
+        return text
+    clipped = text[:180]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.strip()
+
+
+def _violation_residue_unsafe(text: str) -> bool:
+    if "~/" in text or "~\\" in text or _VIOLATION_CREDENTIAL.search(text):
+        return True
+    residue = _VIOLATION_SLASH_RUN.sub(
+        lambda match: " " if _violation_repo(match.group(0).strip(_VIOLATION_EDGE)) else match.group(0),
+        text,
+    )
+    return "/" in residue or "\\" in residue
+
+
+def _public_violation(text: str) -> str:
+    cleaned = _VIOLATION_CREDENTIAL.sub(" ", text)
+    cleaned = _VIOLATION_URL.sub(" ", cleaned)
+    cleaned = _VIOLATION_DRIVE.sub(" ", cleaned)
+    cleaned = _VIOLATION_UNC.sub(" ", cleaned)
+    cleaned = _VIOLATION_TILDE.sub(" ", cleaned)
+    cleaned = _VIOLATION_ABSOLUTE.sub(" ", cleaned)
+    cleaned = _VIOLATION_SLASH_RUN.sub(_keep_violation_repo, cleaned)
+    cleaned = _clip_violation(re.sub(r"\s+", " ", cleaned).strip())
+    cleaned = _VIOLATION_SLASH_RUN.sub(_keep_violation_repo, cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 180:
+        cleaned = _clip_violation(cleaned)
+    if not cleaned or _violation_residue_unsafe(cleaned):
+        return ""
+    return cleaned[:180]
+
+
 def _bounded_violations(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
@@ -553,14 +624,9 @@ def _bounded_violations(raw: object) -> list[str]:
     for item in raw[:8]:
         if not isinstance(item, str):
             continue
-        cleaned = re.sub(r"(?:~|/|[A-Za-z]:\\)[^\s，。;]*", "", item)
-        cleaned = re.sub(r"\s+", " ", cleaned.replace("\\", " ")).strip()[:180]
-        if not cleaned or "/" in cleaned or "\\" in cleaned:
-            continue
-        folded = cleaned.lower()
-        if "secret" in folded or "token" in folded or "api_key" in folded:
-            continue
-        safe.append(cleaned)
+        cleaned = _public_violation(item)
+        if cleaned:
+            safe.append(cleaned)
     return safe
 
 

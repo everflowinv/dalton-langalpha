@@ -16510,6 +16510,77 @@ def _ai_finance_report_response(payload: object, *, failed_code: str) -> tuple[i
     return status, public
 
 
+_AI_FINANCE_VIOLATION_CREDENTIAL = re.compile(
+    r"(?i)(?<![\w.-])(?:"
+    r"bearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|sk-[A-Za-z0-9-]{16,}"
+    r"|(?:api[_-]?key|secret|token|password|passwd|authorization)(?![\w.-])\s*[:=]\s*[^\s,，。;]+"
+    r")"
+)
+_AI_FINANCE_VIOLATION_URL = re.compile(r"(?i)\b(?:https?|file)://[^\s,，。;]+")
+_AI_FINANCE_VIOLATION_DRIVE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[/\\][^\s,，。;]*")
+_AI_FINANCE_VIOLATION_UNC = re.compile(r"\\\\[^\s,，。;]*")
+_AI_FINANCE_VIOLATION_TILDE = re.compile(r"~[/\\][^\s,，。;]*")
+_AI_FINANCE_VIOLATION_ABSOLUTE = re.compile(r"(?<![\w.-])/(?:[^\s,，。;\\])+")
+_AI_FINANCE_VIOLATION_SLASH_RUN = re.compile(r"[^\s,，。;]*[/\\][^\s,，。;]*")
+_AI_FINANCE_VIOLATION_EDGE = "([{\"'.,:;)]}"
+
+
+def _ai_finance_violation_repo(token: str) -> bool:
+    if len(token) > 201 or token.count("/") != 1 or "\\" in token:
+        return False
+    owner, repo = token.split("/", 1)
+    if owner in {".", ".."} or repo in {".", ".."}:
+        return False
+    if not re.fullmatch(r"[\w.-]{1,100}", owner) or not re.fullmatch(r"[\w.-]{1,100}", repo):
+        return False
+    return bool(re.search(r"[A-Za-z0-9]", owner) and re.search(r"[A-Za-z0-9]", repo))
+
+
+def _ai_finance_keep_violation_repo(match: re.Match[str]) -> str:
+    token = match.group(0).strip(_AI_FINANCE_VIOLATION_EDGE)
+    if _ai_finance_violation_repo(token):
+        return token
+    return " "
+
+
+def _ai_finance_clip_violation(text: str) -> str:
+    if len(text) <= 180:
+        return text
+    clipped = text[:180]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped.strip()
+
+
+def _ai_finance_violation_residue_unsafe(text: str) -> bool:
+    if "~/" in text or "~\\" in text or _AI_FINANCE_VIOLATION_CREDENTIAL.search(text):
+        return True
+    residue = _AI_FINANCE_VIOLATION_SLASH_RUN.sub(
+        lambda match: " " if _ai_finance_violation_repo(match.group(0).strip(_AI_FINANCE_VIOLATION_EDGE)) else match.group(0),
+        text,
+    )
+    return "/" in residue or "\\" in residue
+
+
+def _ai_finance_report_violation(text: str) -> str:
+    cleaned = _AI_FINANCE_VIOLATION_CREDENTIAL.sub(" ", text)
+    cleaned = _AI_FINANCE_VIOLATION_URL.sub(" ", cleaned)
+    cleaned = _AI_FINANCE_VIOLATION_DRIVE.sub(" ", cleaned)
+    cleaned = _AI_FINANCE_VIOLATION_UNC.sub(" ", cleaned)
+    cleaned = _AI_FINANCE_VIOLATION_TILDE.sub(" ", cleaned)
+    cleaned = _AI_FINANCE_VIOLATION_ABSOLUTE.sub(" ", cleaned)
+    cleaned = _AI_FINANCE_VIOLATION_SLASH_RUN.sub(_ai_finance_keep_violation_repo, cleaned)
+    cleaned = _ai_finance_clip_violation(re.sub(r"\s+", " ", cleaned).strip())
+    cleaned = _AI_FINANCE_VIOLATION_SLASH_RUN.sub(_ai_finance_keep_violation_repo, cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 180:
+        cleaned = _ai_finance_clip_violation(cleaned)
+    if not cleaned or _ai_finance_violation_residue_unsafe(cleaned):
+        return ""
+    return cleaned[:180]
+
+
 def _ai_finance_report_violations(payload: Mapping[str, Any]) -> list[str]:
     raw = payload.get("violations")
     if not isinstance(raw, list):
@@ -16518,14 +16589,9 @@ def _ai_finance_report_violations(payload: Mapping[str, Any]) -> list[str]:
     for item in raw[:8]:
         if not isinstance(item, str):
             continue
-        cleaned = re.sub(r"(?:~|/|[A-Za-z]:\\)[^\s，。;]*", "", item)
-        cleaned = re.sub(r"\s+", " ", cleaned.replace("\\", " ")).strip()[:180]
-        if not cleaned or "/" in cleaned or "\\" in cleaned:
-            continue
-        folded = cleaned.lower()
-        if "secret" in folded or "token" in folded or "api_key" in folded:
-            continue
-        safe.append(cleaned)
+        cleaned = _ai_finance_report_violation(item)
+        if cleaned:
+            safe.append(cleaned)
     return safe
 
 

@@ -122,9 +122,9 @@ def _broadcast_at() -> float:
     return _started().timestamp()
 
 
-def _candidate() -> dict[str, Any]:
+def _candidate(full_name: str = "acme/alpha") -> dict[str, Any]:
     return {
-        "full_name": "acme/alpha",
+        "full_name": full_name,
         "history_verified": True,
         "report_eligible": True,
         "github": {"stars": 2590},
@@ -139,23 +139,29 @@ def _candidate() -> dict[str, Any]:
     }
 
 
-def _decisions() -> dict[str, Any]:
+def _decisions(repos: list[str] | None = None) -> dict[str, Any]:
+    names = ["acme/alpha"] if repos is None else repos
     return {
         "records": [{
-            "repo": "acme/alpha",
+            "repo": name,
             "decision": "include",
             "reason": "eligible and material",
-            "readme_url": "https://github.com/acme/alpha",
+            "readme_url": f"https://github.com/{name}",
             "displayed": True,
-        }]
+        } for name in names]
     }
 
 
-def _write_prepared(root: Path) -> None:
+def _write_prepared(root: Path, candidates: list[dict[str, Any]] | None = None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     batch = root / "batches" / DATE
     batch.mkdir(parents=True)
-    github_doc = {"version": 3, "complete_through": THROUGH, "continuing_hotspots": [], "candidates": [_candidate()]}
+    github_doc = {
+        "version": 3,
+        "complete_through": THROUGH,
+        "continuing_hotspots": [],
+        "candidates": [_candidate()] if candidates is None else candidates,
+    }
     scan = {"coverage": {"ai_candidates": 0}, "candidates": []}
     github_bytes = _canon(github_doc)
     earnings_bytes = _canon(scan)
@@ -199,7 +205,7 @@ def _write_prepared(root: Path) -> None:
     (clocks / f"{DATE}.json").write_text(json.dumps(clock), encoding="utf-8")
 
 
-def _save_bundle(root: Path) -> dict[str, Any]:
+def _save_bundle(root: Path, decisions: dict[str, Any] | None = None) -> dict[str, Any]:
     parsed = signals.parse_signal_request({
         "action": "save",
         "batch_id": DATE,
@@ -209,7 +215,7 @@ def _save_bundle(root: Path) -> dict[str, Any]:
         "workspace_id": WORKSPACE,
         "thread_id": THREAD,
         "profile": "ai-finance-daily",
-        "github_decisions": _decisions(),
+        "github_decisions": _decisions() if decisions is None else decisions,
         "earnings_dispositions": {"records": []},
         "signal_records": {"records": []},
     })
@@ -264,10 +270,14 @@ def _freeze(root: Path) -> None:
     path.write_bytes(_canon(commit))
 
 
-def _ingested(tmp_path: Path) -> Path:
+def _ingested(
+    tmp_path: Path,
+    candidates: list[dict[str, Any]] | None = None,
+    decisions: dict[str, Any] | None = None,
+) -> Path:
     root = tmp_path / "state"
-    _write_prepared(root)
-    _save_bundle(root)
+    _write_prepared(root, candidates)
+    _save_bundle(root, decisions)
     _freeze(root)
     (root / "github_trending_history.json").write_bytes(b"pool-sentinel")
     return root
@@ -395,6 +405,7 @@ def test_save_validates_the_daily_and_reuses_the_same_bytes(tmp_path: Path) -> N
     bad = _save_daily(root, markdown=MARKDOWN.replace("+1,053", "+1"))
     assert bad["code"] == "report_invalid"
     assert bad["violation_count"] >= 1
+    assert "GitHub displayed stars disagree with verified data: acme/alpha" in bad["violations"]
     dumped = json.dumps(bad)
     assert str(root) not in dumped
     assert "card" not in bad
@@ -702,7 +713,7 @@ class _Delivery:
         return str(item)
 
 
-def _install(monkeypatch: pytest.MonkeyPatch, root: Path) -> SimpleNamespace:
+def _install(monkeypatch: pytest.MonkeyPatch, root: Path, *, through_bridge: bool = False) -> SimpleNamespace:
     clock = {"scheduled_at": _started().replace(minute=0), "started_at": _started()}
     pool = _Pool(clock)
     http_calls: list[dict[str, Any]] = []
@@ -734,6 +745,9 @@ def _install(monkeypatch: pytest.MonkeyPatch, root: Path) -> SimpleNamespace:
             assert "state_root" not in body
             parsed = reports.parse_report_request(body)
             result = reports.execute_report(parsed, state_root=root)
+            if through_bridge:
+                status, public = rb._ai_finance_report_response(result, failed_code="report_failed")
+                return httpx.Response(status, json=public)
             status = 200 if result.get("ok") is True else 409
             if isinstance(result.get("code"), str) and (result["code"] == "unknown_field" or result["code"].startswith("invalid")):
                 status = 400
@@ -1030,3 +1044,147 @@ async def test_initial_submit_returns_validation_details_without_sending(monkeyp
     assert installed.delivery.calls == []
     assert not (root / "reports" / DATE / "report.json").exists()
     assert not (root / "seen.json").exists()
+
+
+_FEEDBACK_REPOS = (
+    "acme/alpha",
+    "acme/beta",
+    "tokenizers/foo",
+    "secretflow/secretflow",
+    "org/api_key_tool",
+)
+
+
+def _public_violation_layers(text: str) -> tuple[str, str, str]:
+    host = reports._safe_violation(text)
+    bridge = rb._ai_finance_report_violations({"violations": [text]})
+    tool = report_tools._bounded_violations([text])
+    return host, bridge[0] if bridge else "", tool[0] if tool else ""
+
+
+def _mismatch_daily(repos: tuple[str, ...] | list[str]) -> str:
+    items: list[str] = []
+    for index, repo in enumerate(repos, 1):
+        items.extend([
+            f"{index}. **[{repo}](https://github.com/{repo})**（总 stars 2,590；日增 +1）",
+            "项目直接对应开发者工具的采用。",
+            "相关公开说明见仓库 README。",
+            "",
+        ])
+    return "\n".join([
+        "## 📊 AI + 金融投资日报",
+        "",
+        "### 今日要闻",
+        "1. **标题** — 摘要。（[来源](https://example.com/a)）",
+        "",
+        "### GitHub AI 项目动量",
+        *items,
+        "### Earnings Calls：AI 的直接业务影响",
+        "本轮没有达到入库标准的电话会。",
+        "#### 跨日共性与新趋势",
+        "与上一交易日相比没有新的跨日主题。",
+        "",
+        "### 来源说明",
+        "新闻来自公开链接，GitHub 数字来自官方完成日桶。",
+        "",
+    ])
+
+
+def test_public_violations_keep_repo_names_and_drop_paths() -> None:
+    listed = (
+        "GitHub candidates missing relevance review: "
+        "acme/alpha, acme/beta, tokenizers/foo, secretflow/secretflow, org/api_key_tool"
+    )
+    assert _public_violation_layers(listed) == (listed, listed, listed)
+    for repo in _FEEDBACK_REPOS:
+        text = f"GitHub displayed stars disagree with verified data: {repo}"
+        assert _public_violation_layers(text) == (text, text, text)
+    hostile = (
+        "GitHub displayed stars disagree with verified data: org/api_key_tool "
+        "missing file: /Users/everflow/secret/report.md "
+        "also ~/private/token.txt "
+        "and /tmp/ai-finance/daily.md "
+        r"and C:\Users\everflow\secret\a.json "
+        r"and D:/tmp/secret/a "
+        r"and \\server\share\secret\x "
+        "api_key=sk-live-0123456789abcdef token=supersecretvalue "
+        "Bearer deadbeefdeadbeef"
+    )
+    for layer in _public_violation_layers(hostile):
+        assert "org/api_key_tool" in layer
+        assert len(layer) <= 180
+        assert "\\" not in layer
+        for needle in (
+            "/Users",
+            "/tmp",
+            "~/",
+            "C:",
+            "D:",
+            "server",
+            "sk-live",
+            "api_key=",
+            "supersecretvalue",
+            "deadbeef",
+            "token.txt",
+            "secret/report",
+        ):
+            assert needle not in layer, needle
+    slashy = "see foo/bar/baz and ./secret and ../token before acme/alpha"
+    assert _public_violation_layers(slashy) == (
+        "see and and before acme/alpha",
+        "see and and before acme/alpha",
+        "see and and before acme/alpha",
+    )
+    assert _public_violation_layers("https://github.com/tokenizers/foo") == ("", "", "")
+    long = "GitHub displayed stars disagree with verified data: acme/alpha " + ("pad " * 80)
+    for layer in _public_violation_layers(long):
+        assert layer.startswith("GitHub displayed stars disagree with verified data: acme/alpha")
+        assert "acme/alpha" in layer
+        assert len(layer) <= 180
+    items = [f"GitHub displayed stars disagree with verified data: acme/repo{index}" for index in range(9)]
+    host_list = reports._invalid(DATE, items)
+    bridge_list = rb._ai_finance_report_violations({"violations": items})
+    tool_list = report_tools._bounded_violations(items)
+    assert host_list["violation_count"] == 9
+    assert len(host_list["violations"]) == 8
+    assert bridge_list == tool_list == host_list["violations"]
+    assert host_list["violations"][0] == items[0]
+    assert all("acme/repo8" not in item for item in host_list["violations"])
+    assert all(len(item) <= 180 for item in host_list["violations"])
+
+
+@pytest.mark.asyncio
+async def test_star_mismatch_submit_keeps_repo_identity_without_sending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repos = list(_FEEDBACK_REPOS)
+    root = _ingested(tmp_path, [_candidate(name) for name in repos], _decisions(repos))
+    installed = _install(monkeypatch, root, through_bridge=True)
+    result = json.loads(await installed.tool.ainvoke(
+        {
+            "action": "submit",
+            "batch_id": DATE,
+            "markdown": _mismatch_daily(repos),
+            "news_events": _news(),
+        },
+        config=_config(),
+    ))
+    assert result["ok"] is False
+    assert result["code"] == "report_invalid"
+    assert result["delivery_confirmed"] is False
+    assert "card" not in result
+    for repo in repos:
+        assert f"GitHub displayed stars disagree with verified data: {repo}" in result["violations"]
+    assert len(result["violations"]) <= 8
+    assert result["violation_count"] >= len(repos)
+    assert all(len(item) <= 180 for item in result["violations"])
+    assert installed.delivery.calls == []
+    assert not (root / "reports" / DATE / "report.json").exists()
+    assert not (root / "reports" / DATE / "body.md").exists()
+    assert not (root / "seen.json").exists()
+    assert not (root / "github_seen.json").exists()
+    dumped = json.dumps(result)
+    assert str(root) not in dumped
+    assert "/Users" not in dumped
+    assert "~/" not in dumped
