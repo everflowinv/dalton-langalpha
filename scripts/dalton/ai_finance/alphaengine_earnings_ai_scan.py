@@ -11,7 +11,7 @@ import re
 import sys
 import threading
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -21,8 +21,10 @@ from zoneinfo import ZoneInfo
 
 try:
     from .ai_finance_signal_memory import now_iso, resolve_explicit_path
+    from .batch_retrieval import RetrievalCacheCorrupt, UnresolvedRetrieval, open_batch_retrieval
 except ImportError:
     from ai_finance_signal_memory import now_iso, resolve_explicit_path
+    from batch_retrieval import RetrievalCacheCorrupt, UnresolvedRetrieval, open_batch_retrieval
 
 
 class TransportUnconfigured(RuntimeError):
@@ -237,6 +239,8 @@ def search_transcripts(
                 call_args["cursor"] = cursor
             try:
                 page = rpc("search_library", call_args)
+            except (UnresolvedRetrieval, RetrievalCacheCorrupt):
+                raise
             except Exception as exc:
                 errors.append({
                     "query": query,
@@ -360,6 +364,57 @@ def context_windows(text: str, matches: list[dict[str, Any]], max_chars: int = 7
     return "\n\n--- AI MATCH CONTEXT ---\n\n".join(chunk for _, _, chunk in selected)
 
 
+def _fetch_documents(
+    selected: list[dict[str, Any]],
+    rpc: Callable[..., dict[str, Any]],
+    workers: int,
+) -> dict[str, dict[str, Any] | Exception]:
+    """Fetch the selected documents.
+
+    At most `workers` calls run at once. An interrupt cancels documents that
+    have not started, so a crash does not send the next full-document request.
+    An unresolved full-document call aborts the scan instead of being stored
+    as an ordinary fetch error.
+    """
+    fetched: dict[str, dict[str, Any] | Exception] = {}
+    if not selected:
+        return fetched
+    # The next document is submitted only after an earlier one has finished.
+    # A crash then cannot queue the rest of the batch behind the workers.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    pending = list(selected)
+    in_flight: dict[Any, dict[str, Any]] = {}
+
+    def fill() -> None:
+        while pending and len(in_flight) < workers:
+            item = pending.pop(0)
+            future = pool.submit(fetch_full_document, str(item.get("doc_id")), rpc)
+            in_flight[future] = item
+
+    try:
+        fill()
+        while in_flight:
+            done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+            for future in done:
+                item = in_flight.pop(future)
+                doc_id = str(item.get("doc_id"))
+                try:
+                    fetched[doc_id] = future.result()
+                except (UnresolvedRetrieval, RetrievalCacheCorrupt):
+                    raise
+                except Exception as exc:
+                    fetched[doc_id] = exc
+            fill()
+    except BaseException:
+        for future in in_flight:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+    return fetched
+
+
 def scan(args: argparse.Namespace) -> dict[str, Any]:
     rpc = rpc_from_transport(getattr(args, "transport", None))
     auth = rpc("auth_status", {})
@@ -369,8 +424,19 @@ def scan(args: argparse.Namespace) -> dict[str, Any]:
     if now_hkt.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     now_hkt = now_hkt.astimezone(HKT)
+    queries = list(args.query or DEFAULT_SEARCH_QUERIES)
+    retrieval_root = getattr(args, "retrieval_root", None)
+    if retrieval_root is not None:
+        journal = open_batch_retrieval(
+            retrieval_root,
+            batch_id=str(getattr(args, "batch_id", None) or Path(retrieval_root).name),
+            started_at=now_hkt,
+            hours=args.hours,
+            max_documents=args.max_documents,
+            queries=queries,
+        )
+        rpc = journal.wrap(rpc)
     cutoff = now_hkt - timedelta(hours=args.hours)
-    queries = args.query or DEFAULT_SEARCH_QUERIES
     raw, search_errors, query_stats = search_transcripts(
         queries, cutoff.date().isoformat(), now_hkt.date().isoformat(), rpc
     )
@@ -397,18 +463,7 @@ def scan(args: argparse.Namespace) -> dict[str, Any]:
 
     candidates: list[dict[str, Any]] = []
     documents: list[dict[str, Any]] = []
-    fetched_map: dict[str, dict[str, Any] | Exception] = {}
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {
-            pool.submit(fetch_full_document, str(item.get("doc_id")), rpc): item for item in selected
-        }
-        for future in as_completed(futures):
-            item = futures[future]
-            doc_id = str(item.get("doc_id"))
-            try:
-                fetched_map[doc_id] = future.result()
-            except Exception as exc:
-                fetched_map[doc_id] = exc
+    fetched_map = _fetch_documents(selected, rpc, args.workers)
 
     candidate_dir = resolve_explicit_path(args.candidate_dir)
     relative_root = getattr(args, "relative_root", None)

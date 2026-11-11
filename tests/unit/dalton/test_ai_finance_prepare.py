@@ -531,6 +531,8 @@ def test_default_collectors_receive_the_frozen_batch(tmp_path: Path, monkeypatch
     assert seen["scan"].query is None
     assert seen["scan"].transport == {"url": "http://127.0.0.1/rpc"}
     assert seen["scan"].relative_root == tmp_path / "batches" / BATCH
+    assert seen["scan"].retrieval_root == tmp_path / "batches" / BATCH
+    assert seen["scan"].batch_id == BATCH
     assert not (tmp_path / "github_seen.json").exists()
     assert list(tmp_path.rglob("*.sqlite")) == []
 

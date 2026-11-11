@@ -74,7 +74,8 @@ def prepare_batch(
     artifact, candidate texts, and frozen window. A failed stage is collected
     again only when that stage has not written its artifact. An artifact
     without a matching completion record is left on disk and reported
-    inconsistent.
+    inconsistent. Earnings full-document pages for this batch stay in its
+    retrieval journal and are replayed before another upstream call.
     """
     _validate_request(batch_id, started_at, hours)
     root = _require_state_root(state_root)
@@ -623,16 +624,19 @@ def _default_github(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _default_earnings(request: dict[str, Any]) -> dict[str, Any]:
+    batch_dir = request["relative_root"]
     return scan(
         SimpleNamespace(
             transport=request["transport"],
             now=request["now"],
-            relative_root=request["relative_root"],
+            relative_root=batch_dir,
             candidate_dir=request["candidate_dir"],
             hours=request["hours"],
             workers=request["workers"],
             max_documents=request["max_documents"],
             query=request["queries"],
+            retrieval_root=batch_dir,
+            batch_id=batch_dir.name,
         )
     )
 
