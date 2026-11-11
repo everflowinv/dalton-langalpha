@@ -796,6 +796,25 @@ def get_dalton_bridge_admin_token() -> str:
     return os.getenv("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
 
 
+def get_market_digest_owner_user_id() -> str | None:
+    """Return the operator user allowed to read prepared market-digest batches.
+
+    ``DALTON_MARKET_DIGEST_OWNER_ID`` must be one hyphenated UUID. Blank,
+    malformed, and non-canonical values return None. There is no default user.
+    """
+    raw = os.getenv("DALTON_MARKET_DIGEST_OWNER_ID", "").strip()
+    if len(raw) != 36:
+        return None
+    try:
+        parsed = uuid.UUID(raw)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    canonical = str(parsed)
+    if canonical != raw.lower():
+        return None
+    return canonical
+
+
 def get_internal_service_token() -> str:
     """Return ``INTERNAL_SERVICE_TOKEN`` from environment (empty string if unset)."""
     return os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()

@@ -75,6 +75,7 @@ _current_corr_id: ContextVar[str | None] = ContextVar(
 )
 
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
+_MARKET_DIGEST_OUTPUT_SAVE_REQUEST_BYTES = 1024 * 1024  # save route only
 MAX_EMBED_REQUEST_BYTES = 128 * 1024  # 128 KiB dedicated limit for /embed
 MAX_WIKI_INGEST_REQUEST_BYTES = 30 * 1024 * 1024  # 30 MiB HTTP envelope limit for /wiki/ingest (20 MB file b64)
 WIKI_INGEST_MAX_TEXT_CHARS = 200_000
@@ -1381,6 +1382,33 @@ class BridgeConfig:
         self.market_digest_run_sh: Path | None = (
             Path(os.environ["DALTON_MARKET_DIGEST_RUN_SH"]).expanduser()
             if os.environ.get("DALTON_MARKET_DIGEST_RUN_SH", "").strip()
+            else None
+        )
+        # Prepared-batch directory. Explicit operator path only; no default root.
+        raw_market_digest_state_root = os.environ.get(
+            "DALTON_MARKET_DIGEST_STATE_ROOT", ""
+        ).strip()
+        self.market_digest_state_root: Path | None = (
+            Path(raw_market_digest_state_root).expanduser()
+            if raw_market_digest_state_root
+            else None
+        )
+        # Operator JSON for prepare. Explicit path only; no default file.
+        raw_market_digest_prepare_config = os.environ.get(
+            "DALTON_MARKET_DIGEST_PREPARE_CONFIG", ""
+        ).strip()
+        self.market_digest_prepare_config: Path | None = (
+            Path(raw_market_digest_prepare_config).expanduser()
+            if raw_market_digest_prepare_config
+            else None
+        )
+        # Operator JSON for saved digest output. Explicit path only; no default file.
+        raw_market_digest_output_config = os.environ.get(
+            "DALTON_MARKET_DIGEST_OUTPUT_CONFIG", ""
+        ).strip()
+        self.market_digest_output_config: Path | None = (
+            Path(raw_market_digest_output_config).expanduser()
+            if raw_market_digest_output_config
             else None
         )
         default_wiki_audit = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "wiki_ingest_audit.jsonl"
@@ -15212,6 +15240,211 @@ class ResearchDataBridge:
                 **({} if confirmed else {"error": "process_group_still_alive"}),
             }
 
+    async def handle_market_digest_prepare(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/market-digest/prepare`.
+
+        The admin token gate already ran. Config and state-root checks finish
+        before a prepare thread starts. Cancelling this request leaves that
+        thread running; it is not replaced and it does not kill the child.
+        """
+        if set(body) != _PREPARE_REQUEST_KEYS:
+            if set(body) - _PREPARE_REQUEST_KEYS:
+                status, payload = _market_digest_reject(
+                    400, "unknown_field", "Request keys are not allowed."
+                )
+            else:
+                status, payload = _market_digest_reject(
+                    400,
+                    "invalid_request",
+                    "period and automation_execution_id are required.",
+                )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        period = body.get("period")
+        if period not in {"AM", "PM"}:
+            status, payload = _market_digest_reject(
+                400, "invalid_period", "period must be AM or PM."
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        execution_id = _canonical_automation_execution_id(body.get("automation_execution_id"))
+        if execution_id is None:
+            status, payload = _market_digest_reject(
+                400,
+                "invalid_automation_execution",
+                "automation_execution_id must be a canonical UUID.",
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        root = getattr(self.cfg, "market_digest_state_root", None)
+        config_path = getattr(self.cfg, "market_digest_prepare_config", None)
+        if root is None or config_path is None:
+            status, payload = _market_digest_unavailable(
+                "not_configured",
+                "Market-digest prepare is not configured.",
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        try:
+            loaded = await asyncio.to_thread(_load_market_digest_prepare_config, Path(config_path))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("market-digest prepare config failed: %s", type(exc).__name__)
+            status, payload = _market_digest_unavailable(
+                "config_invalid",
+                "Market-digest prepare config is invalid.",
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        try:
+            same_root = Path(loaded.state_root).resolve() == Path(root).expanduser().resolve()
+        except Exception as exc:
+            logger.warning("market-digest prepare root check failed: %s", type(exc).__name__)
+            status, payload = _market_digest_unavailable(
+                "config_invalid",
+                "Market-digest prepare config is invalid.",
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        if not same_root:
+            status, payload = _market_digest_unavailable(
+                "config_invalid",
+                "Market-digest prepare config does not match the read state root.",
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        try:
+            result = await asyncio.to_thread(
+                _call_prepare_execution_inputs,
+                loaded,
+                period,
+                execution_id,
+            )
+        except asyncio.CancelledError:
+            # The worker keeps the saved attempt. Do not start a second prepare.
+            raise
+        except Exception as exc:
+            logger.warning("market-digest prepare failed: %s", type(exc).__name__)
+            status, payload = _market_digest_unavailable(
+                "prepare_failed",
+                "The market-digest batch could not be prepared.",
+            )
+            _log_market_digest_prepare(status, payload)
+            return status, payload
+        status, payload = _market_digest_prepare_response(result)
+        _log_market_digest_prepare(status, payload)
+        return status, payload
+
+    async def handle_market_digest_read(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/market-digest/read`.
+
+        The admin token gate already ran. An unset state root returns
+        ``not_configured`` and does not read a batch. A request without
+        ``automation_execution_id`` keeps the direct date read. This method
+        does not prepare, submit, or archive.
+        """
+        root = getattr(self.cfg, "market_digest_state_root", None)
+        if root is None:
+            status, payload = _market_digest_unavailable(
+                "not_configured",
+                "DALTON_MARKET_DIGEST_STATE_ROOT is not configured",
+            )
+            _log_market_digest_read(status, payload)
+            return status, payload
+        page_body = body
+        expected_hash: str | None = None
+        if "automation_execution_id" in body:
+            bound, rejection = _bound_read_target(body)
+            if rejection is not None:
+                _log_market_digest_read(rejection[0], rejection[1])
+                return rejection
+            assert bound is not None
+            try:
+                binding = await asyncio.to_thread(
+                    _load_market_digest_binding,
+                    Path(root),
+                    bound["execution_id"],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("market-digest binding read failed: %s", type(exc).__name__)
+                status, payload = _market_digest_unavailable(
+                    "read_failed",
+                    "The prepared batch could not be read.",
+                )
+                _log_market_digest_read(status, payload)
+                return status, payload
+            page_body, expected_hash, rejection = _page_body_for_binding(binding, bound)
+            if rejection is not None:
+                _log_market_digest_read(rejection[0], rejection[1])
+                return rejection
+            assert page_body is not None
+        try:
+            result = await asyncio.to_thread(
+                _read_market_digest_page,
+                Path(root),
+                page_body,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("market-digest read failed: %s", type(exc).__name__)
+            status, payload = _market_digest_unavailable(
+                "read_failed",
+                "The prepared batch could not be read.",
+            )
+            _log_market_digest_read(status, payload)
+            return status, payload
+        status, payload = _market_digest_read_response(result)
+        if expected_hash is not None and payload.get("ok") is True:
+            if _page_input_hash(payload) != expected_hash:
+                status, payload = _market_digest_reject(
+                    409,
+                    "hash_mismatch",
+                    "The prepared batch hash does not match this execution.",
+                )
+        _log_market_digest_read(status, payload)
+        return status, payload
+
+    async def handle_market_digest_output(
+        self,
+        action: str,
+        body: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
+        """Handle one admin market-digest output route.
+
+        The backend client budget is 30 seconds for get and save, and 360
+        seconds for finalize. This method does not add another wait. Cancelling
+        the request leaves the one worker thread running.
+        """
+
+        rejection = _validate_output_request(action, body)
+        if rejection is not None:
+            _log_market_digest_output(action, rejection[0], rejection[1])
+            return rejection
+        try:
+            result = await asyncio.to_thread(
+                _run_market_digest_output,
+                self.cfg,
+                action,
+                body,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("market-digest output failed: %s", type(exc).__name__)
+            status, payload = _market_digest_unavailable(
+                "output_failed",
+                "The market-digest output could not be completed.",
+            )
+            _log_market_digest_output(action, status, payload)
+            return status, payload
+        status, payload = _market_digest_output_response(action, result)
+        _log_market_digest_output(action, status, payload)
+        return status, payload
+
     async def handle_data_task_host_run(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Handle `POST /internal/data-tasks/host-run` (§2.3 item 3).
 
@@ -18598,6 +18831,761 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
     return int(child.wait())
 
 
+_PREPARE_DROP = object()
+_PREPARE_REQUEST_KEYS = frozenset({"period", "automation_execution_id"})
+_BOUND_READ_KEYS = frozenset({
+    "period",
+    "date",
+    "offset",
+    "max_chars",
+    "automation_execution_id",
+})
+_PREPARE_PUBLIC_KEYS = (
+    "schema",
+    "ok",
+    "usable",
+    "preparation_status",
+    "reason",
+    "period",
+    "started_hkt_date",
+    "authoritative_date",
+    "execution_id",
+    "digest_outcome",
+    "digest_invoked",
+    "tmtb_invoked",
+    "reused",
+    "emails_count",
+    "priority_senders",
+    "funda",
+    "image_backlog",
+    "tmtb",
+    "hashes",
+    "batch_id",
+    "automation_execution_id",
+)
+_MARKET_DIGEST_DOCUMENT_KEYS = (
+    "text",
+    "emails",
+    "tmtb_docs",
+    "pending_snippets",
+    "body",
+    "content",
+)
+_MARKET_DIGEST_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_MARKET_DIGEST_BAD_REQUEST = frozenset({
+    "invalid_request",
+    "unknown_field",
+    "invalid_period",
+    "invalid_date",
+    "invalid_offset",
+    "invalid_max_chars",
+    "invalid_automation_execution",
+})
+_MARKET_DIGEST_UNAVAILABLE = frozenset({
+    "not_configured",
+    "config_invalid",
+    "read_failed",
+    "prepare_failed",
+})
+
+
+def _market_digest_code(value: object) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return ""
+    if all(ch.isascii() and (ch.isalnum() or ch == "_") for ch in value):
+        return value
+    return ""
+
+
+def _market_digest_unavailable(code: str, error: str) -> tuple[int, dict[str, Any]]:
+    return 503, {"ok": False, "code": code, "error": error}
+
+
+def _market_digest_http_status(result: Mapping[str, Any]) -> int:
+    if result.get("ok") is True:
+        return 200
+    code = result.get("code")
+    if code in _MARKET_DIGEST_BAD_REQUEST:
+        return 400
+    if code in _MARKET_DIGEST_UNAVAILABLE:
+        return 503
+    return 409
+
+
+def _log_market_digest_read(status: int, payload: Mapping[str, Any]) -> None:
+    logger.info(
+        "market-digest read status=%s code=%s",
+        status,
+        _market_digest_code(payload.get("code")) or "-",
+    )
+
+
+def _log_market_digest_prepare(status: int, payload: Mapping[str, Any]) -> None:
+    code = _market_digest_code(payload.get("code")) or _market_digest_code(
+        payload.get("preparation_status")
+    )
+    logger.info("market-digest prepare status=%s code=%s", status, code or "-")
+
+
+def _market_digest_reject(status: int, code: str, error: str) -> tuple[int, dict[str, Any]]:
+    return status, {"ok": False, "code": code, "error": error}
+
+
+def _canonical_automation_execution_id(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if str(parsed) != value:
+        return None
+    return value
+
+
+def _market_digest_iso_date(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) != 10:
+        return None
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    if parsed.strftime("%Y-%m-%d") != text:
+        return None
+    return text
+
+
+def _market_digest_pathlike(value: str) -> bool:
+    folded = value.lower()
+    if value.startswith(("/", "~", "\\")) or "\\" in value or "file:" in folded:
+        return True
+    return any(
+        needle in folded
+        for needle in ("/users/", "/home/", "/var/", "/tmp/", "/private/", "/opt/")
+    )
+
+
+def _clean_prepare_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        if len(value) > 200 or _market_digest_pathlike(value):
+            return _PREPARE_DROP
+        return value
+    if isinstance(value, list):
+        cleaned_items = []
+        for item in value:
+            cleaned = _clean_prepare_value(item)
+            if cleaned is _PREPARE_DROP:
+                return _PREPARE_DROP
+            cleaned_items.append(cleaned)
+        return cleaned_items
+    if isinstance(value, dict):
+        cleaned_map: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or len(key) > 80
+                or _market_digest_pathlike(key)
+            ):
+                continue
+            cleaned = _clean_prepare_value(item)
+            if cleaned is _PREPARE_DROP:
+                continue
+            cleaned_map[key] = cleaned
+        return cleaned_map
+    return _PREPARE_DROP
+
+
+def _sanitize_prepare_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    for key in _PREPARE_PUBLIC_KEYS:
+        if key not in result:
+            continue
+        value = _clean_prepare_value(result[key])
+        if value is _PREPARE_DROP:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def _market_digest_prepare_response(result: object) -> tuple[int, dict[str, Any]]:
+    if not isinstance(result, dict):
+        return _market_digest_unavailable(
+            "prepare_failed",
+            "The market-digest batch could not be prepared.",
+        )
+    payload = _sanitize_prepare_result(result)
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return _market_digest_unavailable(
+            "prepare_failed",
+            "The market-digest batch could not be prepared.",
+        )
+    if len(encoded) > 128 * 1024:
+        return _market_digest_reject(
+            409,
+            "response_exceeds_bound",
+            "The prepare result does not fit in the response bound.",
+        )
+    return 200, payload
+
+
+def _load_market_digest_prepare_config(config_path: Path) -> Any:
+    try:
+        from scripts.dalton.market_digest_inputs import load_prepare_config
+    except ImportError:
+        from market_digest_inputs import load_prepare_config
+    return load_prepare_config(config_path=config_path)
+
+
+def _call_prepare_execution_inputs(config: Any, period: str, execution_id: str) -> dict[str, Any]:
+    try:
+        from scripts.dalton.market_digest_inputs import prepare_execution_inputs
+    except ImportError:
+        from market_digest_inputs import prepare_execution_inputs
+    return prepare_execution_inputs(config, period, execution_id)
+
+
+def _load_market_digest_binding(state_root: Path, execution_id: str) -> dict[str, Any]:
+    try:
+        from scripts.dalton.market_digest_inputs import get_execution_binding
+    except ImportError:
+        from market_digest_inputs import get_execution_binding
+    return get_execution_binding(state_root, execution_id)
+
+
+def _read_market_digest_page(state_root: Path, body: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        from scripts.dalton import market_digest_access as helper
+    except ImportError:
+        import market_digest_access as helper
+    return helper.read_market_digest_page(state_root, body)
+
+
+def _bound_read_target(
+    body: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, tuple[int, dict[str, Any]] | None]:
+    if set(body) - _BOUND_READ_KEYS:
+        return None, _market_digest_reject(400, "unknown_field", "Request keys are not allowed.")
+    execution_id = _canonical_automation_execution_id(body.get("automation_execution_id"))
+    if execution_id is None:
+        return None, _market_digest_reject(
+            400,
+            "invalid_automation_execution",
+            "automation_execution_id must be a canonical UUID.",
+        )
+    if "period" not in body:
+        return None, _market_digest_reject(
+            400,
+            "invalid_request",
+            "period and automation_execution_id are required.",
+        )
+    period = body.get("period")
+    if period not in {"AM", "PM"}:
+        return None, _market_digest_reject(400, "invalid_period", "period must be AM or PM.")
+    supplied_date = None
+    if "date" in body:
+        supplied_date = _market_digest_iso_date(body.get("date"))
+        if supplied_date is None:
+            return None, _market_digest_reject(
+                400, "invalid_date", "date must be a real YYYY-MM-DD."
+            )
+    target = {
+        "execution_id": execution_id,
+        "period": period,
+        "date": supplied_date,
+        "offset": body.get("offset") if "offset" in body else None,
+        "max_chars": body.get("max_chars") if "max_chars" in body else None,
+        "has_offset": "offset" in body,
+        "has_max_chars": "max_chars" in body,
+    }
+    return target, None
+
+
+def _page_body_for_binding(
+    binding: object,
+    target: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, tuple[int, dict[str, Any]] | None]:
+    if not isinstance(binding, Mapping) or binding.get("ok") is not True:
+        code = "binding_corrupt"
+        if isinstance(binding, Mapping):
+            code = _market_digest_code(binding.get("code")) or code
+        if code in _MARKET_DIGEST_BAD_REQUEST:
+            status = 400
+        elif code in _MARKET_DIGEST_UNAVAILABLE:
+            status = 503
+        else:
+            status = 409
+        return None, None, _market_digest_reject(
+            status, code, "The execution binding could not be read."
+        )
+    period = target["period"]
+    if binding.get("period") != period:
+        return None, None, _market_digest_reject(
+            409,
+            "period_mismatch",
+            "The requested period does not match this execution.",
+        )
+    authoritative = binding.get("authoritative_date")
+    batch_id = binding.get("batch_id")
+    hashes = binding.get("hashes")
+    input_hash = hashes.get("input_sha256") if isinstance(hashes, Mapping) else None
+    ready = (
+        isinstance(authoritative, str)
+        and _market_digest_iso_date(authoritative) == authoritative
+        and batch_id == f"{period}/{authoritative}"
+        and isinstance(input_hash, str)
+        and _MARKET_DIGEST_HEX64.fullmatch(input_hash) is not None
+    )
+    if not ready:
+        return None, None, _market_digest_reject(
+            409, "not_ready", "The prepared batch is not ready to read."
+        )
+    supplied = target.get("date")
+    if supplied is not None and supplied != authoritative:
+        return None, None, _market_digest_reject(
+            409,
+            "date_mismatch",
+            "The requested date does not match this execution.",
+        )
+    page_body: dict[str, Any] = {"period": period, "date": authoritative}
+    if target.get("has_offset") is True:
+        page_body["offset"] = target.get("offset")
+    if target.get("has_max_chars") is True:
+        page_body["max_chars"] = target.get("max_chars")
+    return page_body, str(input_hash), None
+
+
+def _page_input_hash(payload: Mapping[str, Any]) -> str | None:
+    hashes = payload.get("hashes")
+    if not isinstance(hashes, Mapping):
+        return None
+    value = hashes.get("input_sha256")
+    if isinstance(value, str) and _MARKET_DIGEST_HEX64.fullmatch(value):
+        return value
+    return None
+
+
+def _market_digest_read_response(result: object) -> tuple[int, dict[str, Any]]:
+    if not isinstance(result, dict):
+        return _market_digest_unavailable(
+            "read_failed",
+            "The prepared batch could not be read.",
+        )
+    status = _market_digest_http_status(result)
+    if result.get("ok") is not True:
+        for key in _MARKET_DIGEST_DOCUMENT_KEYS:
+            result.pop(key, None)
+    try:
+        encoded = json.dumps(result, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return _market_digest_unavailable(
+            "read_failed",
+            "The prepared batch could not be read.",
+        )
+    if len(encoded) > 128 * 1024:
+        return _market_digest_reject(
+            409,
+            "response_exceeds_bound",
+            "The page does not fit in the response bound.",
+        )
+    return status, result
+
+
+_OUTPUT_RESPONSE_BYTES = 1024 * 1024
+_OUTPUT_FINALIZE_RESPONSE_BYTES = 128 * 1024
+_OUTPUT_BODY_BYTES = 128 * 1024
+_EMBED_CHILD_TIMEOUT_S = 75.0
+_EMBED_DEADLINE_S = 300.0
+_EMBED_BATCH_SIZE = 100
+_EMBED_CHUNK_CHARS = 3000
+_EMBED_STDOUT_BYTES = 8 * 1024 * 1024
+_EMBED_STDERR_BYTES = 0
+_OUTPUT_BRIDGE = "_bridge_http"
+_OUTPUT_GET_KEYS = frozenset({"period", "automation_execution_id"})
+_OUTPUT_SAVE_KEYS = frozenset({"period", "automation_execution_id", "markdown"})
+_OUTPUT_FINALIZE_KEYS = frozenset({"period", "automation_execution_id", "body_sha256"})
+_OUTPUT_PUBLIC_KEYS = (
+    "ok",
+    "code",
+    "reused",
+    "report_run_id",
+    "period",
+    "date",
+    "automation_execution_id",
+    "prepared_execution_id",
+    "body_sha256",
+    "input_sha256",
+    "byte_count",
+    "section_count",
+    "source_line_count",
+    "archive_status",
+    "embedding_status",
+    "index_status",
+    "chunk_count",
+    "archive",
+    "embedding",
+    "index",
+)
+_OUTPUT_ACTIONS = {
+    "/internal/market-digest/output/get": "get",
+    "/internal/market-digest/output/save": "save",
+    "/internal/market-digest/output/finalize": "finalize",
+}
+_OUTPUT_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$")
+_OUTPUT_NOT_CONFIGURED = "Market-digest output is not configured."
+_OUTPUT_CONFIG_INVALID = "Market-digest output config is invalid."
+_OUTPUT_ROOT_MISMATCH = "Market-digest output config does not match the read state root."
+_OUTPUT_EMBED_MISSING = "Market-digest embedding is not configured."
+_OUTPUT_FAILED = "The market-digest output could not be completed."
+
+
+class _EmbedError(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+
+
+def _output_bridge_error(status: int, code: str, error: str) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error, _OUTPUT_BRIDGE: status}
+
+
+def _log_market_digest_output(action: str, status: int, payload: Mapping[str, Any]) -> None:
+    label = action if action in {"get", "save", "finalize"} else "-"
+    logger.info(
+        "market-digest output action=%s status=%s code=%s",
+        label,
+        status,
+        _market_digest_code(payload.get("code")) or "-",
+    )
+
+
+def _validate_output_request(
+    action: str,
+    body: Mapping[str, Any],
+) -> tuple[int, dict[str, Any]] | None:
+    allowed = {
+        "get": _OUTPUT_GET_KEYS,
+        "save": _OUTPUT_SAVE_KEYS,
+        "finalize": _OUTPUT_FINALIZE_KEYS,
+    }.get(action)
+    if allowed is None:
+        return _market_digest_reject(400, "invalid_request", "Required output fields are missing.")
+    if set(body) - allowed:
+        return _market_digest_reject(400, "unknown_field", "Request keys are not allowed.")
+    if set(body) != allowed:
+        return _market_digest_reject(400, "invalid_request", "Required output fields are missing.")
+    if body.get("period") not in {"AM", "PM"}:
+        return _market_digest_reject(400, "invalid_period", "period must be AM or PM.")
+    if _canonical_automation_execution_id(body.get("automation_execution_id")) is None:
+        return _market_digest_reject(
+            400,
+            "invalid_automation_execution",
+            "automation_execution_id must be a canonical UUID.",
+        )
+    if action == "save" and not isinstance(body.get("markdown"), str):
+        return _market_digest_reject(400, "invalid_request", "markdown must be a string.")
+    if action == "finalize":
+        digest = body.get("body_sha256")
+        if not isinstance(digest, str) or _MARKET_DIGEST_HEX64.fullmatch(digest) is None:
+            return _market_digest_reject(
+                400,
+                "hash_mismatch",
+                "body_sha256 must be 64 lowercase hex characters.",
+            )
+    return None
+
+
+def _load_market_digest_output_config(config_path: Path) -> Any:
+    try:
+        from scripts.dalton.market_digest_outputs import load_output_config
+    except ImportError:
+        from market_digest_outputs import load_output_config
+    return load_output_config(config_path)
+
+
+def _call_save_output(config: Any, execution_id: str, period: str, markdown: str) -> dict[str, Any]:
+    try:
+        from scripts.dalton.market_digest_outputs import save_output
+    except ImportError:
+        from market_digest_outputs import save_output
+    return save_output(config, execution_id, period, markdown)
+
+
+def _call_get_output(config: Any, execution_id: str, period: str) -> dict[str, Any]:
+    try:
+        from scripts.dalton.market_digest_outputs import get_output
+    except ImportError:
+        from market_digest_outputs import get_output
+    return get_output(config, execution_id, period, include_body=True)
+
+
+def _call_finalize_output(
+    config: Any,
+    execution_id: str,
+    period: str,
+    body_sha256: str,
+    embedder: Any,
+) -> dict[str, Any]:
+    try:
+        from scripts.dalton.market_digest_outputs import finalize_output
+    except ImportError:
+        from market_digest_outputs import finalize_output
+    return finalize_output(config, execution_id, period, body_sha256, embedder=embedder)
+
+
+def _load_run_json_command() -> Any:
+    try:
+        from scripts.dalton.market_digest_inputs import run_json_command
+    except ImportError:
+        from market_digest_inputs import run_json_command
+    return run_json_command
+
+
+def _reject_nonfinite(_name: str) -> None:
+    raise ValueError("nonfinite")
+
+
+def _parse_embed_stdout(stdout: str, expected: int) -> list[list[Any]]:
+    try:
+        loaded = json.loads(stdout, parse_constant=_reject_nonfinite)
+    except (json.JSONDecodeError, ValueError, UnicodeError):
+        raise _EmbedError("embed_failed") from None
+    if not isinstance(loaded, dict) or loaded.get("ok") is not True:
+        raise _EmbedError("embed_failed")
+    embeddings = loaded.get("embeddings")
+    if not isinstance(embeddings, list) or len(embeddings) != expected:
+        raise _EmbedError("embed_failed")
+    rows: list[list[Any]] = []
+    for item in embeddings:
+        if isinstance(item, (str, bytes)) or not isinstance(item, list):
+            raise _EmbedError("embed_failed")
+        rows.append(item)
+    return rows
+
+
+def _embed_texts(
+    texts: list[str],
+    model: str,
+    *,
+    python_executable: Path,
+    script_path: Path,
+    env: Mapping[str, str],
+    runner: Any = None,
+    now: Any = None,
+    deadline_seconds: float = _EMBED_DEADLINE_S,
+    child_timeout_seconds: float = _EMBED_CHILD_TIMEOUT_S,
+) -> list[list[Any]]:
+    """Embed ``texts`` in ordered batches. Failures raise and return nothing."""
+
+    if not isinstance(texts, list) or not texts:
+        raise _EmbedError("embed_failed")
+    if not isinstance(model, str) or _OUTPUT_MODEL_RE.fullmatch(model) is None or ".." in model:
+        raise _EmbedError("embed_failed")
+    for text in texts:
+        if not isinstance(text, str) or len(text) > _EMBED_CHUNK_CHARS or "\x00" in text:
+            raise _EmbedError("embed_failed")
+    clock = time.monotonic if now is None else now
+    started = clock()
+    command = _load_run_json_command() if runner is None else runner
+    rows: list[list[Any]] = []
+    argv = [str(python_executable), str(script_path)]
+    for offset in range(0, len(texts), _EMBED_BATCH_SIZE):
+        batch = texts[offset : offset + _EMBED_BATCH_SIZE]
+        remaining = deadline_seconds - (clock() - started)
+        if remaining <= 0:
+            raise _EmbedError("embed_failed")
+        payload = json.dumps(
+            {"texts": batch, "model": model},
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(payload) > 2 * 1024 * 1024:
+            raise _EmbedError("embed_failed")
+        child = command(
+            argv,
+            env=env,
+            timeout_seconds=min(child_timeout_seconds, remaining),
+            stdout_limit_bytes=_EMBED_STDOUT_BYTES,
+            stderr_limit_bytes=_EMBED_STDERR_BYTES,
+            input_bytes=payload,
+        )
+        if (
+            child.returncode != 0
+            or child.timed_out
+            or child.still_running
+            or child.stdout_truncated
+        ):
+            raise _EmbedError("embed_failed")
+        rows.extend(_parse_embed_stdout(child.stdout, len(batch)))
+    if len(rows) != len(texts):
+        raise _EmbedError("embed_failed")
+    return rows
+
+
+def _market_digest_embed_base_env(cfg: Any) -> dict[str, str]:
+    base = {
+        "PATH": os.environ.get("PATH", "").strip() or "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", "").strip() or str(Path.home()),
+        "LANG": os.environ.get("LANG", "").strip() or "en_US.UTF-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    proxy = str(getattr(cfg, "subprocess_proxy", "") or "").strip()
+    if proxy:
+        base["HTTP_PROXY"] = proxy
+        base["HTTPS_PROXY"] = proxy
+    return base
+
+
+def _market_digest_embed_env(cfg: Any, repo_root: Path) -> dict[str, str] | None:
+    env_path = getattr(cfg, "env_path", None)
+    if not isinstance(env_path, Path):
+        return None
+    key = _read_env_file_dict(env_path).get("GEMINI_API_KEY", "").strip()
+    if not key:
+        return None
+    return bridge_subprocess_env.build_nonarchive_subprocess_env(
+        _market_digest_embed_base_env(cfg),
+        extra_env={"GEMINI_API_KEY": key},
+        allow_keys=("GEMINI_API_KEY",),
+        repo_root=repo_root,
+    )
+
+
+def _market_digest_embed_script() -> Path:
+    return Path(__file__).resolve().with_name("market_digest_embed.py")
+
+
+def _make_market_digest_embedder(cfg: Any, prepare_cfg: Any) -> Any:
+    script = _market_digest_embed_script()
+    if not script.is_file():
+        return _output_bridge_error(503, "output_failed", _OUTPUT_FAILED)
+    try:
+        env = _market_digest_embed_env(cfg, Path(prepare_cfg.repo_root))
+    except Exception as exc:
+        logger.warning("market-digest embedding env failed: %s", type(exc).__name__)
+        return _output_bridge_error(503, "output_failed", _OUTPUT_FAILED)
+    if env is None:
+        return _output_bridge_error(503, "embedding_not_configured", _OUTPUT_EMBED_MISSING)
+    python_executable = Path(prepare_cfg.python_executable)
+
+    def embedder(texts: list[str], model: str) -> list[list[Any]]:
+        return _embed_texts(
+            texts,
+            model,
+            python_executable=python_executable,
+            script_path=script,
+            env=env,
+        )
+
+    return embedder
+
+
+def _run_market_digest_output(cfg: Any, action: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    root = getattr(cfg, "market_digest_state_root", None)
+    prepare_path = getattr(cfg, "market_digest_prepare_config", None)
+    output_path = getattr(cfg, "market_digest_output_config", None)
+    if root is None or prepare_path is None or output_path is None:
+        return _output_bridge_error(503, "not_configured", _OUTPUT_NOT_CONFIGURED)
+    try:
+        prepare_cfg = _load_market_digest_prepare_config(Path(prepare_path))
+        output_cfg = _load_market_digest_output_config(Path(output_path))
+    except Exception as exc:
+        logger.warning("market-digest output config failed: %s", type(exc).__name__)
+        return _output_bridge_error(503, "config_invalid", _OUTPUT_CONFIG_INVALID)
+    try:
+        read_root = Path(root).expanduser().resolve()
+        prepare_root = Path(prepare_cfg.state_root).resolve()
+        output_root = Path(output_cfg.input_state_root).resolve()
+    except Exception as exc:
+        logger.warning("market-digest output root check failed: %s", type(exc).__name__)
+        return _output_bridge_error(503, "config_invalid", _OUTPUT_CONFIG_INVALID)
+    if not (read_root == prepare_root == output_root):
+        return _output_bridge_error(503, "config_invalid", _OUTPUT_ROOT_MISMATCH)
+    execution_id = str(body["automation_execution_id"])
+    period = str(body["period"])
+    try:
+        if action == "get":
+            return _call_get_output(output_cfg, execution_id, period)
+        if action == "save":
+            return _call_save_output(output_cfg, execution_id, period, str(body["markdown"]))
+        embedder = _make_market_digest_embedder(cfg, prepare_cfg)
+        if isinstance(embedder, dict):
+            return embedder
+        return _call_finalize_output(
+            output_cfg,
+            execution_id,
+            period,
+            str(body["body_sha256"]),
+            embedder,
+        )
+    except Exception as exc:
+        logger.warning("market-digest output failed: %s", type(exc).__name__)
+        return _output_bridge_error(503, "output_failed", _OUTPUT_FAILED)
+
+
+def _market_digest_output_response(action: str, result: object) -> tuple[int, dict[str, Any]]:
+    if not isinstance(result, dict):
+        return _market_digest_unavailable("output_failed", _OUTPUT_FAILED)
+    if _OUTPUT_BRIDGE in result:
+        code = _market_digest_code(result.get("code")) or "output_failed"
+        error = result.get("error")
+        if (
+            not isinstance(error, str)
+            or len(error) > 200
+            or "\n" in error
+            or _market_digest_pathlike(error)
+        ):
+            error = _OUTPUT_FAILED
+        status = result.get(_OUTPUT_BRIDGE)
+        if status not in {400, 409, 503}:
+            status = 503
+        return int(status), {"ok": False, "code": code, "error": error}
+    cleaned: dict[str, Any] = {}
+    for key in _OUTPUT_PUBLIC_KEYS:
+        if key not in result:
+            continue
+        value = _clean_prepare_value(result[key])
+        if value is _PREPARE_DROP:
+            continue
+        cleaned[key] = value
+    if action in {"get", "save"} and "markdown" in result:
+        markdown = result.get("markdown")
+        if not isinstance(markdown, str) or "\x00" in markdown:
+            return _market_digest_reject(409, "body_invalid", "The saved markdown is not usable.")
+        try:
+            size = len(markdown.encode("utf-8"))
+        except UnicodeError:
+            return _market_digest_reject(409, "body_invalid", "The saved markdown is not usable.")
+        if size > _OUTPUT_BODY_BYTES:
+            return _market_digest_reject(
+                409,
+                "response_exceeds_bound",
+                "The output result does not fit in the response bound.",
+            )
+        cleaned["markdown"] = markdown
+    try:
+        encoded = json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return _market_digest_unavailable("output_failed", _OUTPUT_FAILED)
+    limit = _OUTPUT_FINALIZE_RESPONSE_BYTES if action == "finalize" else _OUTPUT_RESPONSE_BYTES
+    if len(encoded) > limit:
+        return _market_digest_reject(
+            409,
+            "response_exceeds_bound",
+            "The output result does not fit in the response bound.",
+        )
+    return 200, cleaned
+
+
 async def _send_http(
     writer: asyncio.StreamWriter,
     status_code: int,
@@ -18758,6 +19746,10 @@ async def _handle_client(
         elif path in ("/feishu/doc/create", "/feishu/doc/append"):
             # C2: these bodies carry inline image bytes beside the markdown.
             max_bytes = MAX_FEISHU_DOC_REQUEST_BYTES
+        elif path == "/internal/market-digest/output/save":
+            # 128KiB of UTF-8 markdown expands when JSON-encoded. This route
+            # alone accepts 1MiB. get and finalize stay on MAX_REQUEST_BYTES.
+            max_bytes = _MARKET_DIGEST_OUTPUT_SAVE_REQUEST_BYTES
         else:
             max_bytes = MAX_REQUEST_BYTES
         if content_length > max_bytes:
@@ -19228,6 +20220,104 @@ async def _handle_client(
                 return
 
             await _send_http(writer, 404, "Not Found", {"ok": False, "error": "Not Found"})
+            return
+
+        # POST /internal/market-digest/prepare. Admin token only; the gate above
+        # rejects an MCP token before this route runs.
+        if path == "/internal/market-digest/prepare":
+            if method != "POST":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            try:
+                prepare_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(prepare_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(
+                    writer, 400, "Bad Request", {"ok": False, "error": "Parse error"}
+                )
+                return
+            code, payload = await bridge.handle_market_digest_prepare(prepare_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # POST /internal/market-digest/read. Admin token only; the gate above
+        # rejects an MCP token before this route runs. Unknown JSON fields are
+        # rejected by the helper. automation_execution_id is removed before that
+        # helper when the tool sends it.
+        if path == "/internal/market-digest/read":
+            if method != "POST":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            try:
+                digest_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(digest_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(
+                    writer, 400, "Bad Request", {"ok": False, "error": "Parse error"}
+                )
+                return
+            code, payload = await bridge.handle_market_digest_read(digest_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # POST /internal/market-digest/output/{get,save,finalize}. Admin token
+        # only; the gate above rejects an MCP token before this route runs.
+        if path in _OUTPUT_ACTIONS:
+            if method != "POST":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            try:
+                output_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(output_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(
+                    writer, 400, "Bad Request", {"ok": False, "error": "Parse error"}
+                )
+                return
+            code, payload = await bridge.handle_market_digest_output(
+                _OUTPUT_ACTIONS[path],
+                output_body,
+            )
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
             return
 
         # Route 9: POST /internal/data-tasks/host-run and POST /internal/data-tasks/host-kill

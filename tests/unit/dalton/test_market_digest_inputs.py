@@ -2104,3 +2104,21 @@ def test_unrestorable_tmtb_record_is_not_replaced(tmp_path: Path) -> None:
     assert empty.tmtb_path().read_bytes() == original_tmtb
     assert reused["reused"] is True
     assert _kinds(empty_runner) == ["digest", "tmtb"]
+
+
+def test_virtualenv_python_invocation_path_is_preserved(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    executable = tmp_path / "venv" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.symlink_to(layout.python.resolve())
+    validated = mod.validate_config(layout.config(python_executable=executable))
+    assert validated.python_executable == executable
+    assert validated.python_executable != executable.resolve()
+    config_path = tmp_path / "prepare.json"
+    config_path.write_text(json.dumps({
+        "state_root": str(layout.state), "skill_dir": str(layout.skill),
+        "tmtb_script": str(layout.tmtb_script), "python": str(executable),
+        "repo_root": str(layout.repo),
+    }), encoding="utf-8")
+    loaded = mod.load_prepare_config(config_path=config_path)
+    assert loaded.python_executable == executable
