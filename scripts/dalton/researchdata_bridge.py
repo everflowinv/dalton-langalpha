@@ -77,6 +77,7 @@ _current_corr_id: ContextVar[str | None] = ContextVar(
 MAX_REQUEST_BYTES = 256 * 1024  # 256 KiB
 _MARKET_DIGEST_OUTPUT_SAVE_REQUEST_BYTES = 1024 * 1024  # save route only
 _AI_FINANCE_SIGNALS_REQUEST_BYTES = 1024 * 1024  # three research objects
+_AI_FINANCE_REPORT_REQUEST_BYTES = 1024 * 1024  # daily markdown plus news keys
 MAX_EMBED_REQUEST_BYTES = 128 * 1024  # 128 KiB dedicated limit for /embed
 MAX_WIKI_INGEST_REQUEST_BYTES = 30 * 1024 * 1024  # 30 MiB HTTP envelope limit for /wiki/ingest (20 MB file b64)
 WIKI_INGEST_MAX_TEXT_CHARS = 200_000
@@ -15434,6 +15435,59 @@ class ResearchDataBridge:
             return _ai_finance_signals_unavailable("signal_failed")
         return _ai_finance_signals_response(result, failed_code="signal_failed")
 
+    async def handle_ai_finance_report(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/ai-finance/report`.
+
+        The admin token gate already ran. Save, get, and commit_seen share
+        one worker thread. This route does not prepare a batch, compare,
+        ingest, or send a card.
+        """
+        reports = _ai_finance_reports()
+        access = _ai_finance_access()
+        parsed = reports.parse_report_request(body)
+        if parsed.get("ok") is not True:
+            return _ai_finance_report_response(parsed, failed_code="invalid_request")
+        configured = access.configured_owner_user_id()
+        if configured is None:
+            return _ai_finance_report_unavailable("not_configured")
+        if parsed["owner_user_id"] != configured or parsed["user_id"] != configured:
+            return _ai_finance_report_response(
+                {
+                    "ok": False,
+                    "code": "owner_mismatch",
+                    "error": "This batch belongs to another owner.",
+                },
+                failed_code="owner_mismatch",
+            )
+        config_path = getattr(self.cfg, "ai_finance_config", None)
+        if not isinstance(config_path, Path):
+            return _ai_finance_report_unavailable("not_configured")
+        try:
+            loaded = await asyncio.to_thread(access.load_operator_config, config_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ai-finance report config failed: %s", type(exc).__name__)
+            return _ai_finance_report_unavailable("config_invalid")
+        action = str(parsed["action"])
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    reports.execute_report,
+                    parsed,
+                    state_root=loaded.state_root,
+                ),
+                timeout=reports.operation_timeout_seconds(action),
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return _ai_finance_report_unavailable("report_timeout")
+        except Exception as exc:
+            logger.warning("ai-finance report failed: %s", type(exc).__name__)
+            return _ai_finance_report_unavailable("report_failed")
+        return _ai_finance_report_response(result, failed_code="report_failed")
+
     async def handle_market_digest_prepare(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Handle `POST /internal/market-digest/prepare`.
 
@@ -15947,6 +16001,14 @@ def _ai_finance_signals() -> Any:
     return signals
 
 
+def _ai_finance_reports() -> Any:
+    try:
+        from scripts.dalton import ai_finance_reports as reports
+    except ImportError:
+        import ai_finance_reports as reports
+    return reports
+
+
 def _ai_finance_signal_child_env(cfg: Any, loaded: Any) -> dict[str, str]:
     """Child environment for the signal CLI.
 
@@ -16288,6 +16350,192 @@ def _ai_finance_signals_safe_error(payload: Mapping[str, Any], code: str) -> str
         if "secret" not in folded and "token" not in folded and "api_key" not in folded and "file:" not in folded:
             return error
     return _ai_finance_signals_sentence(code)
+
+
+_AI_FINANCE_REPORT_RESPONSE_BYTES = 384 * 1024
+_AI_FINANCE_REPORT_503 = frozenset({
+    "not_configured",
+    "config_invalid",
+    "report_failed",
+    "report_timeout",
+})
+_AI_FINANCE_REPORT_ERROR_KEYS = (
+    "action",
+    "batch_id",
+    "profile",
+    "status",
+    "reason",
+    "bundle_hash",
+    "reused",
+    "seen_status",
+    "violation_count",
+)
+_AI_FINANCE_REPORT_SUCCESS_KEYS = frozenset({
+    "ok",
+    "action",
+    "code",
+    "batch_id",
+    "profile",
+    "owner_user_id",
+    "report_run_id",
+    "bundle_hash",
+    "generation",
+    "manifest_sha256",
+    "body_sha256",
+    "content_sha256",
+    "seen_status",
+    "reused",
+    "news_count",
+    "github_count",
+    "card",
+    "offset",
+    "max_chars",
+    "total_chars",
+    "next_offset",
+    "complete",
+    "text",
+})
+
+
+def _ai_finance_report_sentence(code: str) -> str:
+    sentences = {
+        "not_configured": "AI-finance reports are not configured.",
+        "config_invalid": "AI-finance config is invalid.",
+        "invalid_request": "The request is not valid.",
+        "unknown_field": "Request keys are not allowed.",
+        "report_failed": "The report operation did not finish.",
+        "report_timeout": "The report operation did not finish before the timeout.",
+        "report_missing": "Save the daily before this action.",
+        "report_invalid": "The daily did not pass the report check.",
+        "report_too_large": "The card does not fit in the report limit.",
+        "report_date_closed": "This business date is outside the allowed report window.",
+        "content_conflict": "This batch already has a different daily.",
+        "not_ready": "The ingested signal bundle is not ready for a report.",
+        "bundle_missing": "Save a signal bundle before this report.",
+        "compare_unavailable": "The saved comparison cannot be read.",
+        "commit_inconsistent": "The saved report could not be read.",
+        "owner_mismatch": "This batch belongs to another owner.",
+        "hash_mismatch": "The saved report failed the hash check.",
+        "news_mismatch": "The news keys do not match the daily.",
+        "seen_incomplete": "The broadcast state was only partly updated. Retry the same commit.",
+        "clock_inconsistent": "The saved batch clock could not be read.",
+        "not_found": "The prepared batch is not available.",
+        "batch_not_ready": "The prepared batch is not complete.",
+        "offset_past_end": "offset is past the end of the daily.",
+        "response_exceeds_bound": "The page does not fit in the response bound.",
+        "path_escape": "The report path is not inside this state root.",
+        "profile_mismatch": "This batch profile is not ai-finance-daily.",
+    }
+    if code in sentences:
+        return sentences[code]
+    if isinstance(code, str) and code.startswith("invalid"):
+        return "The request is not valid."
+    return "The report operation did not finish."
+
+
+def _ai_finance_report_status(payload: Mapping[str, Any]) -> int:
+    if payload.get("ok") is True:
+        return 200
+    code = payload.get("code")
+    if not isinstance(code, str):
+        return 409
+    if code == "unknown_field" or code.startswith("invalid"):
+        return 400
+    if code in _AI_FINANCE_REPORT_503:
+        return 503
+    return 409
+
+
+def _ai_finance_report_unavailable(code: str) -> tuple[int, dict[str, Any]]:
+    return _ai_finance_report_response(
+        {"ok": False, "code": code, "error": _ai_finance_report_sentence(code)},
+        failed_code=code,
+    )
+
+
+def _ai_finance_report_response(payload: object, *, failed_code: str) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        public: dict[str, Any] = {
+            "ok": False,
+            "code": failed_code,
+            "error": _ai_finance_report_sentence(failed_code),
+        }
+    elif payload.get("ok") is True:
+        action = payload.get("action")
+        if action not in {"save", "get", "commit_seen"}:
+            public = {
+                "ok": False,
+                "code": failed_code,
+                "error": _ai_finance_report_sentence(failed_code),
+            }
+        else:
+            public = {key: payload[key] for key in _AI_FINANCE_REPORT_SUCCESS_KEYS if key in payload}
+            public["ok"] = True
+            public["action"] = action
+    else:
+        code = payload.get("code")
+        if not isinstance(code, str) or not code or len(code) > 80:
+            code = failed_code
+        public = {"ok": False, "code": code, "error": _ai_finance_report_safe_error(payload, code)}
+        for key in _AI_FINANCE_REPORT_ERROR_KEYS:
+            if key not in payload:
+                continue
+            if key == "violation_count":
+                count = payload[key]
+                if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 100:
+                    public[key] = count
+                continue
+            public[key] = payload[key]
+        if code == "report_invalid":
+            violations = _ai_finance_report_violations(payload)
+            if violations:
+                public["violations"] = violations
+    try:
+        encoded = json.dumps(public, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        public = {
+            "ok": False,
+            "code": failed_code,
+            "error": _ai_finance_report_sentence(failed_code),
+        }
+        encoded = json.dumps(public).encode("utf-8")
+    if len(encoded) > _AI_FINANCE_REPORT_RESPONSE_BYTES:
+        public = {
+            "ok": False,
+            "code": "response_exceeds_bound",
+            "error": _ai_finance_report_sentence("response_exceeds_bound"),
+        }
+    status = _ai_finance_report_status(public)
+    logger.info("ai-finance report status=%s code=%s", status, public.get("code"))
+    return status, public
+
+
+def _ai_finance_report_violations(payload: Mapping[str, Any]) -> list[str]:
+    raw = payload.get("violations")
+    if not isinstance(raw, list):
+        return []
+    safe: list[str] = []
+    for item in raw[:8]:
+        if not isinstance(item, str):
+            continue
+        cleaned = re.sub(r"(?:~|/|[A-Za-z]:\\)[^\s，。;]*", "", item)
+        cleaned = re.sub(r"\s+", " ", cleaned.replace("\\", " ")).strip()[:180]
+        if not cleaned or "/" in cleaned or "\\" in cleaned:
+            continue
+        folded = cleaned.lower()
+        if "secret" in folded or "token" in folded or "api_key" in folded:
+            continue
+        safe.append(cleaned)
+    return safe
+
+
+def _ai_finance_report_safe_error(payload: Mapping[str, Any], code: str) -> str:
+    error = payload.get("error")
+    if isinstance(error, str) and error and len(error) <= 200 and "/" not in error and "\\" not in error:
+        folded = error.lower()
+        if "secret" not in folded and "token" not in folded and "api_key" not in folded and "file:" not in folded:
+            return error
+    return _ai_finance_report_sentence(code)
 
 
 def _normalize_content_type_key(raw: str) -> str:
@@ -20307,6 +20555,9 @@ async def _handle_client(
             # Three research objects do not fit the 256KiB default. This route
             # alone accepts 1MiB. Prepare and read stay on MAX_REQUEST_BYTES.
             max_bytes = _AI_FINANCE_SIGNALS_REQUEST_BYTES
+        elif path == "/internal/ai-finance/report":
+            # The daily and its news keys do not fit the 256KiB default.
+            max_bytes = _AI_FINANCE_REPORT_REQUEST_BYTES
         else:
             max_bytes = MAX_REQUEST_BYTES
         if content_length > max_bytes:
@@ -20926,6 +21177,37 @@ async def _handle_client(
                 )
                 return
             code, payload = await bridge.handle_ai_finance_signals(ai_signals_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # POST /internal/ai-finance/report. Admin token only; the gate above
+        # rejects a missing token and an MCP token before this route runs.
+        if path == "/internal/ai-finance/report":
+            if method != "POST":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            try:
+                ai_report_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(ai_report_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(
+                    writer, 400, "Bad Request", {"ok": False, "error": "Parse error"}
+                )
+                return
+            code, payload = await bridge.handle_ai_finance_report(ai_report_body)
             status_label = {
                 200: "OK",
                 400: "Bad Request",

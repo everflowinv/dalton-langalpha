@@ -195,6 +195,7 @@ _MESSAGES = {
     "invalid_max_chars": "max_chars must be an integer from 1 to 32000.",
     "response_exceeds_bound": "The page does not fit in the response bound.",
     "path_escape": "The signal path is not inside this state root.",
+    "not_ready": "The ingested signal bundle is not ready for a report.",
 }
 
 
@@ -1899,5 +1900,140 @@ def _batch_lock(root: Path, batch_id: str) -> Iterator[None]:
 def _db_lock(root: Path) -> Iterator[None]:
     with _flock(root / "locks" / "ai-signal-memory.lock", _DB_THREAD):
         yield
+
+
+def _report_started_at(root: Path, batch_id: str) -> datetime | None:
+    clock = _read_clock(root / "batch_clocks" / f"{batch_id}.json", batch_id)
+    if clock.get("ok") is not True:
+        return None
+    raw = _read_file(root / "batch_clocks" / f"{batch_id}.json", max_bytes=64 * 1024)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _parse_instant(data.get("started_at"))
+
+
+def _report_github_document(root: Path, batch_id: str) -> bytes | dict[str, Any]:
+    batch_dir = root / "batches" / batch_id
+    metadata = _read_json(batch_dir / "metadata.json")
+    manifest_raw = _read_named(batch_dir, "manifest.json")
+    if metadata is None or manifest_raw is None:
+        return _error("hash_mismatch", batch_id=batch_id)
+    try:
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return _error("hash_mismatch", batch_id=batch_id)
+    stages = metadata.get("stages")
+    artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+    if not isinstance(stages, dict) or not isinstance(artifacts, dict):
+        return _error("hash_mismatch", batch_id=batch_id)
+    return _hashed_artifact(
+        batch_dir,
+        stages.get("github"),
+        artifacts.get("github_candidates"),
+        "github_candidates.json",
+    )
+
+
+def _report_object(directory: Path, name: str) -> dict[str, Any] | None:
+    raw = _read_file(directory / name, max_bytes=_OBJECT_MAX_BYTES)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def read_report_bundle(*, state_root: Path, batch_id: str, owner_user_id: str) -> dict[str, Any]:
+    """Return one frozen ingested bundle for the report host.
+
+    The commit and research files stay unchanged. A batch that has not
+    finished ingest returns ``not_ready`` instead of a partial bundle.
+    """
+    root = _require_root(state_root)
+    if isinstance(root, dict):
+        return root
+    if _iso_date(batch_id) is None:
+        return _error("invalid_batch")
+    owner = _canonical_uuid(owner_user_id)
+    if owner is None:
+        return _error("invalid_owner")
+    with _batch_lock(root, batch_id):
+        return _read_report_bundle_locked(root, batch_id, owner)
+
+
+def _read_report_bundle_locked(root: Path, batch_id: str, owner: str) -> dict[str, Any]:
+    prepared = _load_prepared(root, batch_id, owner)
+    if prepared.get("ok") is not True:
+        return prepared
+    current = _require_bundle(
+        root,
+        {"batch_id": batch_id, "owner_user_id": owner},
+        prepared,
+    )
+    if current.get("ok") is False:
+        return current
+    if current.get("status") != "ingested":
+        return _error("not_ready", batch_id=batch_id, status=current.get("status"))
+    if not isinstance(current.get("compare_sha256"), str) or not isinstance(current.get("outcome_sha256"), str):
+        return _error("not_ready", batch_id=batch_id, status="ingested")
+    if not _files_match(root, current):
+        return _error("commit_inconsistent", batch_id=batch_id)
+    compare = _load_compare(root, current)
+    outcome = _load_outcome(root, current)
+    if compare is None or outcome is None or outcome.get("file_sha256") != current["outcome_sha256"]:
+        return _error("commit_inconsistent", batch_id=batch_id)
+    directory = _existing_generation(root, current)
+    if isinstance(directory, dict):
+        return directory
+    decisions = _report_object(directory, "github_decisions.json")
+    dispositions = _report_object(directory, "earnings_dispositions.json")
+    records = _report_object(directory, "signal_records.json")
+    if decisions is None or dispositions is None or records is None:
+        return _error("commit_inconsistent", batch_id=batch_id)
+    github_raw = _report_github_document(root, batch_id)
+    if isinstance(github_raw, dict):
+        return github_raw
+    try:
+        github = json.loads(github_raw.decode("utf-8"))
+        earnings = json.loads(prepared["earnings_bytes"].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, AttributeError):
+        return _error("hash_mismatch", batch_id=batch_id)
+    if not isinstance(github, dict) or github.get("version") != 3 or github.get("candidates") != prepared["github_candidates"]:
+        return _error("hash_mismatch", batch_id=batch_id)
+    if not isinstance(earnings, dict):
+        return _error("hash_mismatch", batch_id=batch_id)
+    started = _report_started_at(root, batch_id)
+    if started is None:
+        return _error("clock_inconsistent", batch_id=batch_id)
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "profile": PROFILE,
+        "owner_user_id": owner,
+        "manifest_sha256": current["manifest_sha256"],
+        "bundle_hash": current["bundle_hash"],
+        "generation": current["generation"],
+        "compare_sha256": current["compare_sha256"],
+        "outcome_sha256": current["outcome_sha256"],
+        "github_candidates": github,
+        "earnings_scan": earnings,
+        "github_decisions": decisions,
+        "earnings_dispositions": dispositions,
+        "signal_records": records,
+        "compare": compare,
+        "ingest": outcome["ingest"],
+        "stats": outcome["stats"],
+        "started_at": started.isoformat(),
+    }
 
 

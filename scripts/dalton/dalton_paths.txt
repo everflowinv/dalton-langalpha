@@ -319,3 +319,11 @@ tests/unit/dalton/test_ai_finance_signal_schema.py
 
 # Claude Fable 5.2 native API and OAuth routes (overlay only; manifests stay upstream).
 tests/unit/dalton/test_fable52.py
+
+# T11 AI finance report: saved daily, original card, and post-send seen state.
+scripts/dalton/ai_finance_reports.py
+scripts/dalton/ai_finance_signals.py
+scripts/dalton/researchdata_bridge.py
+src/dalton/tools/ai_finance_report_tools.py
+src/dalton/tools/__init__.py
+tests/unit/dalton/test_ai_finance_reports.py
