@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import inspect
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 from unittest.mock import create_autospec
 from uuid import uuid4
 
@@ -207,6 +207,34 @@ def test_report_candidate_matches_only_the_saved_target() -> None:
             canonical_target_address="feishu:@me",
         )
         is True
+    )
+    assert (
+        dtn._is_candidate_outer_delivery_row(
+            {
+                "target": "discord:user:424242424242424242",
+                "payload_json": {"source": "automation_report_failure_alert"},
+            },
+            platform="discord",
+            target_kind="dm",
+            raw_ident="999999999999999999",
+            requested_target="discord:user:424242424242424242",
+            canonical_target_address="discord:@me",
+        )
+        is True
+    )
+    assert (
+        dtn._is_candidate_outer_delivery_row(
+            {
+                "target": "discord:user:424242424242424242",
+                "payload_json": {"source": "automation_report_failure_alert"},
+            },
+            platform="discord",
+            target_kind="dm",
+            raw_ident="424242424242424242",
+            requested_target="discord:user:111111111111111111",
+            canonical_target_address="discord:@me",
+        )
+        is False
     )
     assert (
         dtn._is_candidate_outer_delivery_row(
@@ -887,3 +915,232 @@ async def test_ordinary_settlement_still_sends_generic_notification(
     )
     assert pushed is True
     post.assert_called_once()
+
+
+def test_reconcile_scan_selects_the_failure_alert_source() -> None:
+    scanner = inspect.getsource(dtn.reconcile_uncertain_data_task_deliveries)
+    single = inspect.getsource(dtn.reconcile_single_data_task_delivery_row)
+    assert "automation_report_failure_alert" in scanner
+    assert "is_failure_alert_payload" in single
+
+
+@pytest.mark.asyncio
+async def test_failure_alert_claim_updates_only_that_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executed: list[str] = []
+
+    class _Cursor:
+        async def __aenter__(self) -> _Cursor:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def execute(self, sql: str, _params: Any = None) -> None:
+            executed.append(" ".join(sql.split()))
+
+        async def fetchone(self) -> dict[str, int]:
+            return {"delivery_id": "1", "attempt_count": 1}
+
+    class _Connection:
+        def cursor(self, **_kwargs: Any) -> _Cursor:
+            return _Cursor()
+
+    @asynccontextmanager
+    async def _connection(_conn: Any = None) -> Any:
+        yield _Connection()
+
+    monkeypatch.setattr(
+        notify_dispatch,
+        "get_db_connection",
+        create_autospec(notify_dispatch.get_db_connection, side_effect=_connection),
+    )
+    claimed, attempt = await notify_dispatch.claim_saved_failure_alert(
+        "exec-alert",
+        "discord",
+        "discord:user:424242424242424242",
+    )
+    assert (claimed, attempt) == (True, 1)
+    statement = executed[0]
+    assert statement.upper().startswith("UPDATE ")
+    assert "INSERT" not in statement.upper()
+    assert "= 'automation_report_failure_alert'" in statement
+    assert "= 'automation_report'" not in statement
+    assert "payload_json =" not in statement
+
+
+@pytest.mark.asyncio
+async def test_retry_scan_includes_failure_alerts_and_a_separate_catchup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
+
+    executed: list[tuple[str, Any]] = []
+
+    class _Cursor:
+        async def __aenter__(self) -> _Cursor:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            executed.append((" ".join(str(sql).split()), params))
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+        async def fetchone(self) -> None:
+            return None
+
+    class _Connection:
+        def cursor(self, **_kwargs: Any) -> _Cursor:
+            return _Cursor()
+
+    @asynccontextmanager
+    async def _connection(_conn: Any = None) -> Any:
+        yield _Connection()
+
+    monkeypatch.setattr(
+        notify_dispatch,
+        "get_db_connection",
+        create_autospec(notify_dispatch.get_db_connection, side_effect=_connection),
+    )
+    notify = create_autospec(post_data_task_gateway_notify)
+    sent = await notify_dispatch.retry_failed_notify_deliveries(
+        post_notify_fn=notify,
+        max_attempts=4,
+        lookback_hours=24,
+        stale_pending_minutes=10,
+        limit=5,
+    )
+    assert sent == 0
+    notify.assert_not_called()
+    assert len(executed) == 2
+    send_sql, send_params = executed[0]
+    catch_sql, catch_params = executed[1]
+    both = "IN ( 'automation_report', 'automation_report_failure_alert' )"
+    assert both in send_sql
+    assert "NOT IN ( 'automation_report', 'automation_report_failure_alert' )" in send_sql
+    assert send_sql.count("%s") == 6
+    uncertain = sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
+    assert send_params == (4, uncertain, 10, 24, 4, 5)
+    assert "content_kind" in catch_sql
+    assert "NOT EXISTS" in catch_sql
+    assert "automation_report_failure_alert" in catch_sql
+    assert "error_code = 'attempts_exhausted'" not in catch_sql
+    assert catch_params == (4, uncertain, 24, 5)
+
+
+@pytest.mark.asyncio
+async def test_injected_report_dispatch_does_not_create_a_failure_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def explode(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("failure alert")
+
+    monkeypatch.setattr(reports, "ensure_report_failure_alert", explode)
+
+    async def load(execution_id: str, conn: Any = None) -> list[dict[str, Any]]:
+        _ = (execution_id, conn)
+        return []
+
+    notify = create_autospec(post_data_task_gateway_notify)
+    view = await notify_dispatch.dispatch_automation_report(
+        "exec-missing",
+        load_rows_fn=create_autospec(reports.load_execution_report_rows, side_effect=load),
+        notify_fn=notify,
+    )
+    assert view["code"] == "not_found"
+    notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_saved_card_dispatch_requests_one_failure_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_id = str(uuid4())
+    row = _saved_row(
+        "feishu:chat:oc_alpha",
+        execution_id=execution_id,
+        status="failed",
+        error_code="http_500",
+        attempt_count=3,
+    )
+    seen: list[str] = []
+
+    async def load(execution_id_arg: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        assert execution_id_arg == execution_id
+        assert conn is None
+        return [row]
+
+    async def ensure(
+        execution_id_arg: str,
+        *,
+        max_attempts: int = 3,
+        conn: Any = None,
+        reconcile_row_fn: Any = None,
+    ) -> dict[str, Any]:
+        assert execution_id_arg == execution_id
+        assert max_attempts == 3
+        assert conn is None
+        assert reconcile_row_fn is not None
+        seen.append(execution_id_arg)
+        return {"ok": True, "code": "not_terminal", "created": False, "targets": []}
+
+    async def reconcile(row_arg: Mapping[str, Any], **_kwargs: Any) -> bool:
+        assert row_arg["target"] == "feishu:chat:oc_alpha"
+        return False
+
+    monkeypatch.setattr(reports, "load_execution_report_rows", load)
+    monkeypatch.setattr(reports, "ensure_report_failure_alert", ensure)
+    notify = create_autospec(post_data_task_gateway_notify)
+    view = await notify_dispatch.dispatch_automation_report(
+        execution_id,
+        notify_fn=notify,
+        reconcile_row_fn=reconcile,
+    )
+    assert seen == [execution_id]
+    assert view["ok"] is True
+    assert view["delivery_confirmed"] is False
+    notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failure_alert_dispatch_does_not_create_another_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def explode(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("recursive failure alert")
+
+    async def still_required(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    async def load(execution_id: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        _ = conn
+        return [
+            _saved_row(
+                "discord:user:424242424242424242",
+                execution_id=execution_id,
+                channel="discord",
+                status="failed",
+                error_code="http_500",
+                attempt_count=3,
+            )
+        ]
+
+    async def reconcile(_row: Mapping[str, Any], **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(reports, "ensure_report_failure_alert", explode)
+    monkeypatch.setattr(reports, "failure_alert_still_required", still_required)
+    monkeypatch.setattr(reports, "load_execution_failure_alert_rows", load)
+    notify = create_autospec(post_data_task_gateway_notify)
+    view = await notify_dispatch.dispatch_report_failure_alert(
+        "exec-alert",
+        notify_fn=notify,
+        reconcile_row_fn=reconcile,
+    )
+    assert view["ok"] is True
+    notify.assert_not_called()

@@ -785,10 +785,10 @@ def _is_candidate_outer_delivery_row(
         except ValueError:
             parsed_payload = None
         row_payload = parsed_payload
-    if (
-        isinstance(row_payload, Mapping)
-        and str(row_payload.get("source") or "") == "automation_report"
-    ):
+    if isinstance(row_payload, Mapping) and str(row_payload.get("source") or "") in {
+        "automation_report",
+        "automation_report_failure_alert",
+    }:
         return row_target == requested_target.strip()
     if row_target in (requested_target.strip(), canonical_target_address.strip()):
         return True
@@ -1931,9 +1931,13 @@ async def reconcile_single_data_task_delivery_row(
                         updated_outer = True
                         from src.dalton.database.automation_reports import (
                             is_automation_report_payload,
+                            is_failure_alert_payload,
                         )
 
-                        if not is_automation_report_payload(payload):
+                        if not (
+                            is_automation_report_payload(payload)
+                            or is_failure_alert_payload(payload)
+                        ):
                             await tx_cur.execute(
                                 """
                                 UPDATE dalton_data_task_runs r
@@ -2035,6 +2039,7 @@ async def reconcile_uncertain_data_task_deliveries(
                           d.automation_id LIKE 'data:%%'
                           OR (d.payload_json ->> 'route_key') LIKE 'data:%%'
                           OR COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
+                          OR COALESCE(d.payload_json ->> 'source', '') = 'automation_report_failure_alert'
                       )
                     ORDER BY
                         (
