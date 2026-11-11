@@ -450,6 +450,393 @@ def test_operator_json_rejects_unknown_keys_and_links(tmp_path: Path) -> None:
     assert linked.value.code == "config_invalid"
 
 
+def test_news_seen_keeps_seven_day_keys_and_the_frozen_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    keep, fractional, future, boundary, expired = (character * 64 for character in "abcde")
+    started = FIRST.timestamp()
+    cutoff = started - access._NEWS_SEEN_WINDOW_SECONDS
+    inside = int(started) - 3600
+    fraction = started - 10.5
+    later = started + 3600
+    source = {
+        keep: inside,
+        fractional: fraction,
+        future: later,
+        boundary: cutoff,
+        expired: cutoff - 1,
+    }
+    seen = tmp_path / "seen.json"
+    seen.write_text(json.dumps(source), encoding="utf-8")
+    original = seen.read_bytes()
+    calls = {"n": 0}
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls["n"] += 1
+        return _earnings(request, body="AI body")
+
+    prepared = _prepare(tmp_path, FIRST, EXECUTION, earnings)
+    assert prepared["ok"] is True
+    assert prepared["resources"] == ["manifest", "github", "earnings", "candidate", "news_seen"]
+    assert calls["n"] == 1
+    assert seen.read_bytes() == original
+    batch = tmp_path / "batches" / DATE
+    raw = (batch / "news_seen.json").read_bytes()
+    loaded = json.loads(raw)
+    assert set(loaded) == {keep, fractional, future, boundary}
+    assert type(loaded[keep]) is int and loaded[keep] == inside
+    assert type(loaded[fractional]) is float and loaded[fractional] == fraction
+    assert loaded[future] == later
+    assert loaded[boundary] == cutoff
+    record = json.loads((batch / "news_seen_record.json").read_text(encoding="utf-8"))
+    assert set(record) == {"schema", "batch_id", "owner_user_id", "started_at", "sha256"}
+    assert record["schema"] == 1
+    assert record["batch_id"] == DATE
+    assert record["owner_user_id"] == OWNER
+    assert datetime.fromisoformat(record["started_at"]).astimezone(timezone.utc) == FIRST.astimezone(timezone.utc)
+    assert record["sha256"] == hashlib.sha256(raw).hexdigest()
+    manifest = (batch / "manifest.json").read_bytes()
+    seen.write_text(json.dumps({expired: cutoff - 1}), encoding="utf-8")
+    again = _prepare(tmp_path, LATER, EXECUTION_2, earnings)
+    assert again["ok"] is True
+    assert again["recovered"] is True
+    assert again["reused"] == ["github", "earnings"]
+    assert calls["n"] == 1
+    assert (batch / "news_seen.json").read_bytes() == raw
+    assert (batch / "manifest.json").read_bytes() == manifest
+    pages: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(30):
+        page = access.read_ai_finance_page(tmp_path, _read_fields("news_seen", offset=offset, max_chars=48))
+        assert page["ok"] is True
+        assert page["resource"] == "news_seen"
+        assert page["content_sha256"] == record["sha256"]
+        assert str(tmp_path) not in json.dumps(page)
+        pages.append(page)
+        if page["next_offset"] is None:
+            assert page["complete"] is True
+            break
+        assert page["complete"] is False
+        offset = page["next_offset"]
+    else:
+        raise AssertionError("news_seen page did not complete")
+    assert len(pages) > 1
+    assert "".join(page["text"] for page in pages) == raw.decode("utf-8")
+    manifest_text, manifest_hash = _read_all(tmp_path, "manifest")
+    assert manifest_text.encode("utf-8") == manifest
+    assert manifest_hash == hashlib.sha256(manifest).hexdigest()
+    candidate, candidate_hash = _read_all(tmp_path, "candidate", doc_id="doc1")
+    assert candidate == "AI body"
+    assert candidate_hash == hashlib.sha256(b"AI body").hexdigest()
+
+
+def test_missing_and_empty_news_seen_are_explicit_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    first = _prepare(missing, FIRST, EXECUTION, lambda request: _earnings(request))
+    assert first["ok"] is True
+    assert not (missing / "seen.json").exists()
+    snapshot = missing / "batches" / DATE / "news_seen.json"
+    assert json.loads(snapshot.read_text(encoding="utf-8")) == {}
+    record = json.loads((missing / "batches" / DATE / "news_seen_record.json").read_text(encoding="utf-8"))
+    assert record["sha256"] == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    seen = empty / "seen.json"
+    seen.write_bytes(b"{}")
+    before = seen.read_bytes()
+    second = _prepare(empty, FIRST, EXECUTION, lambda request: _earnings(request))
+    assert second["ok"] is True
+    assert seen.read_bytes() == before
+    assert json.loads((empty / "batches" / DATE / "news_seen.json").read_text(encoding="utf-8")) == {}
+
+
+def test_corrupt_news_source_does_not_become_empty_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    key = "ab" * 32
+    payloads = {
+        "json": b"{",
+        "blank": b"",
+        "list": b"[]",
+        "hex": json.dumps({"zz": 1}).encode("utf-8"),
+        "upper": json.dumps({"AB" * 32: 1}).encode("utf-8"),
+        "bool": json.dumps({key: True}).encode("utf-8"),
+        "text": json.dumps({key: "1"}).encode("utf-8"),
+        "nan": ('{"' + key + '": NaN}').encode("utf-8"),
+        "infinity": ('{"' + key + '": Infinity}').encode("utf-8"),
+    }
+    for name, payload in payloads.items():
+        root = tmp_path / name
+        root.mkdir()
+        (root / "seen.json").write_bytes(payload)
+        result = _prepare_without_collection(root)
+        assert result["code"] == "news_seen_invalid", name
+        assert str(root) not in json.dumps(result)
+        assert not (root / "batches").exists()
+        assert not (root / "batch_clocks" / f"{DATE}.json").exists()
+    linked = tmp_path / "link"
+    linked.mkdir()
+    secret = linked / "secret.json"
+    secret.write_text(SECRET, encoding="utf-8")
+    (linked / "seen.json").symlink_to(secret)
+    link_result = _prepare_without_collection(linked)
+    assert link_result["code"] == "not_regular"
+    assert SECRET not in json.dumps(link_result)
+    assert not (linked / "batches").exists()
+    over = tmp_path / "over"
+    over.mkdir()
+    (over / "seen.json").write_bytes(b"{" + b" " * 64)
+    monkeypatch.setattr(access, "SOURCE_READ_MAX_BYTES", 32)
+    oversized = _prepare_without_collection(over)
+    assert oversized["code"] == "source_oversize"
+    assert not (over / "batches").exists()
+    assert not (over / "batch_clocks" / f"{DATE}.json").exists()
+
+
+def test_news_snapshot_mismatch_symlink_and_oversize_are_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    calls = {"n": 0}
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls["n"] += 1
+        return _earnings(request)
+
+    root = tmp_path / "batch"
+    root.mkdir()
+    prepared = _prepare(root, FIRST, EXECUTION, earnings)
+    assert prepared["ok"] is True
+    assert calls["n"] == 1
+    batch = root / "batches" / DATE
+    manifest = (batch / "manifest.json").read_bytes()
+    snapshot = batch / "news_seen.json"
+    record_path = batch / "news_seen_record.json"
+    snapshot.write_bytes(b"not-json")
+    mismatched = _prepare(root, FIRST, EXECUTION, earnings)
+    assert mismatched["code"] == "hash_mismatch"
+    assert calls["n"] == 1
+    assert (batch / "manifest.json").read_bytes() == manifest
+    read_mismatch = access.read_ai_finance_page(root, _read_fields("news_seen"))
+    assert read_mismatch["code"] == "hash_mismatch"
+    assert "text" not in read_mismatch
+    assert str(root) not in json.dumps(read_mismatch)
+    body = b'{"zz": 1}\n'
+    snapshot.write_bytes(body)
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["sha256"] = hashlib.sha256(body).hexdigest()
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    invalid = access.read_ai_finance_page(root, _read_fields("news_seen"))
+    assert invalid["code"] == "news_seen_invalid"
+    assert str(root) not in json.dumps(invalid)
+    refused = _prepare(root, FIRST, EXECUTION, earnings)
+    assert refused["code"] == "news_seen_invalid"
+    assert calls["n"] == 1
+    assert (batch / "manifest.json").read_bytes() == manifest
+
+    linked_root = tmp_path / "linked"
+    linked_root.mkdir()
+    linked_prepare = _prepare(linked_root, FIRST, EXECUTION, lambda request: _earnings(request))
+    assert linked_prepare["ok"] is True
+    outside = linked_root / "outside.json"
+    outside.write_text(SECRET, encoding="utf-8")
+    linked_snapshot = linked_root / "batches" / DATE / "news_seen.json"
+    linked_snapshot.unlink()
+    linked_snapshot.symlink_to(outside)
+    linked_read = access.read_ai_finance_page(linked_root, _read_fields("news_seen"))
+    assert linked_read["code"] == "not_regular"
+    assert SECRET not in json.dumps(linked_read)
+    linked_again = _prepare_without_collection(linked_root)
+    assert linked_again["code"] == "not_regular"
+
+    wide = tmp_path / "wide"
+    wide.mkdir()
+    assert _prepare(wide, FIRST, EXECUTION, lambda request: _earnings(request))["ok"] is True
+    wide_snapshot = wide / "batches" / DATE / "news_seen.json"
+    wide_snapshot.write_bytes(b"x" * (2 * 1024 * 1024))
+    monkeypatch.setattr(access, "SOURCE_READ_MAX_BYTES", 1024 * 1024)
+    wide_read = access.read_ai_finance_page(wide, _read_fields("news_seen"))
+    assert wide_read["code"] == "source_oversize"
+    assert str(wide) not in json.dumps(wide_read)
+
+
+def test_news_record_interrupt_is_not_completed_or_recollected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    key = "a" * 64
+    seen = tmp_path / "seen.json"
+    seen.write_text(json.dumps({key: int(FIRST.timestamp())}), encoding="utf-8")
+    real_write = access._atomic_write
+
+    def fail_record(path: Path, payload: bytes) -> None:
+        if path.name == "news_seen_record.json":
+            raise OSError("record")
+        real_write(path, payload)
+
+    monkeypatch.setattr(access, "_atomic_write", fail_record)
+    with pytest.raises(OSError, match="record"):
+        _prepare(tmp_path, FIRST, EXECUTION, lambda request: _earnings(request))
+    snapshot = tmp_path / "batches" / DATE / "news_seen.json"
+    saved = snapshot.read_bytes()
+    assert json.loads(saved) == {key: int(FIRST.timestamp())}
+    assert not (tmp_path / "batches" / DATE / "news_seen_record.json").exists()
+    assert not (tmp_path / "batch_clocks" / f"{DATE}.json").exists()
+    monkeypatch.setattr(access, "_atomic_write", real_write)
+    seen.write_bytes(b"{")
+    calls = {"n": 0}
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls["n"] += 1
+        return _earnings(request)
+
+    second = _prepare(tmp_path, FIRST, EXECUTION, earnings)
+    assert second["code"] == "news_seen_uncommitted"
+    assert calls["n"] == 0
+    assert snapshot.read_bytes() == saved
+    assert not (tmp_path / "batch_clocks" / f"{DATE}.json").exists()
+    assert str(tmp_path) not in json.dumps(second)
+
+
+def test_old_batch_without_news_snapshot_does_not_read_current_seen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    calls = {"n": 0}
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls["n"] += 1
+        return _earnings(request)
+
+    seen = tmp_path / "seen.json"
+    seen.write_bytes(b"{}")
+    first = _prepare(tmp_path, FIRST, EXECUTION, earnings)
+    assert first["ok"] is True
+    assert calls["n"] == 1
+    batch = tmp_path / "batches" / DATE
+    manifest = (batch / "manifest.json").read_bytes()
+    (batch / "news_seen.json").unlink()
+    (batch / "news_seen_record.json").unlink()
+    seen.write_bytes(b"{")
+    second = _prepare(tmp_path, LATER, EXECUTION_2, earnings)
+    assert second["ok"] is True
+    assert second["reused"] == ["github", "earnings"]
+    assert calls["n"] == 1
+    assert not (batch / "news_seen.json").exists()
+    assert not (batch / "news_seen_record.json").exists()
+    assert (batch / "manifest.json").read_bytes() == manifest
+    refused = access.read_ai_finance_page(tmp_path, _read_fields("news_seen"))
+    assert refused["code"] == "news_seen_uncommitted"
+    assert str(tmp_path) not in json.dumps(refused)
+    assert not (batch / "news_seen.json").exists()
+
+
+def test_concurrent_prepares_save_one_news_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    key = "c" * 64
+    seen = tmp_path / "seen.json"
+    seen.write_text(json.dumps({key: int(FIRST.timestamp())}), encoding="utf-8")
+    original = seen.read_bytes()
+    calls = {"n": 0}
+    real_project = access._project_news_seen
+
+    def counting(root: Path, started_at: datetime) -> dict[str, int | float]:
+        calls["n"] += 1
+        return real_project(root, started_at)
+
+    monkeypatch.setattr(access, "_project_news_seen", counting)
+    errors: list[BaseException] = []
+    results: list[dict[str, Any]] = []
+
+    def run(execution_id: str) -> None:
+        try:
+            results.append(_prepare(
+                tmp_path,
+                FIRST,
+                execution_id,
+                lambda request: _earnings(request, body="AI body"),
+            ))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(EXECUTION,)),
+        threading.Thread(target=run, args=(EXECUTION_2,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert errors == []
+    assert [item["ok"] for item in results] == [True, True]
+    assert calls["n"] == 1
+    assert seen.read_bytes() == original
+    snapshot = tmp_path / "batches" / DATE / "news_seen.json"
+    assert json.loads(snapshot.read_text(encoding="utf-8")) == {key: int(FIRST.timestamp())}
+    record = json.loads((tmp_path / "batches" / DATE / "news_seen_record.json").read_text(encoding="utf-8"))
+    assert record["sha256"] == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+
+
+def test_news_seen_read_uses_existing_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _owner(monkeypatch)
+    prepared = _prepare(tmp_path, FIRST, EXECUTION, lambda request: _earnings(request, body="AI body"))
+    assert prepared["ok"] is True
+    with_doc = access.read_ai_finance_page(tmp_path, _read_fields("news_seen", doc_id="doc1"))
+    assert with_doc["code"] == "invalid_doc_id"
+    assert str(tmp_path) not in json.dumps(with_doc)
+    past = access.read_ai_finance_page(tmp_path, _read_fields("news_seen", offset=10**7))
+    assert past["code"] == "offset_past_end"
+    assert "text" not in past
+    assert str(tmp_path) not in json.dumps(past)
+    escaped = dict(_read_fields("news_seen"))
+    escaped["batch_id"] = "../secret"
+    assert access.read_ai_finance_page(tmp_path, escaped)["code"] == "invalid_batch"
+    bad_execution = dict(_read_fields("news_seen"))
+    bad_execution["automation_execution_id"] = "not-a-uuid"
+    assert access.read_ai_finance_page(tmp_path, bad_execution)["code"] == "invalid_automation_execution"
+    wrong_profile = dict(_read_fields("news_seen"))
+    wrong_profile["profile"] = "market-digest-am"
+    assert access.read_ai_finance_page(tmp_path, wrong_profile)["code"] == "profile_mismatch"
+    missing = dict(_read_fields("news_seen"))
+    missing["batch_id"] = "2026-11-10"
+    assert access.read_ai_finance_page(tmp_path, missing)["code"] == "not_found"
+    other = dict(_read_fields("news_seen"))
+    other["owner_user_id"] = OTHER
+    refused = access.read_ai_finance_page(tmp_path, other)
+    assert refused["code"] == "not_allowed"
+    assert str(tmp_path) not in json.dumps(refused)
+
+
+def _prepare_without_collection(root: Path) -> dict[str, Any]:
+    calls: list[str] = []
+
+    def earnings(request: dict[str, Any]) -> dict[str, Any]:
+        calls.append("earnings")
+        return _earnings(request)
+
+    result = _prepare(root, FIRST, EXECUTION, earnings)
+    assert calls == []
+    return result
+
+
 def _owner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DALTON_AI_FINANCE_OWNER_USER_ID", OWNER)
 

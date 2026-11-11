@@ -263,7 +263,7 @@ def _host_prepare() -> dict[str, Any]:
         "recovered": False,
         "manifest_ready": True,
         "candidate_doc_ids": ["doc1"],
-        "resources": ["manifest", "github", "earnings", "candidate"],
+        "resources": ["manifest", "github", "earnings", "candidate", "news_seen"],
     }
 
 
@@ -343,6 +343,16 @@ def test_tool_signatures_have_no_path_or_clock() -> None:
     assert "period" not in inspect.signature(ai_finance_db.authorize_ai_finance_execution).parameters
     assert "state_root" not in (prepare_tool.description or "")
     assert "ai_finance_read" in (prepare_tool.description or "")
+    assert "news_seen" in (prepare_tool.description or "")
+    assert "news_seen" in (read_tool.description or "")
+    assert tools.ResourceName.__args__ == access._RESOURCE_ORDER
+    assert tools._RESOURCE_ORDER == access._RESOURCE_ORDER
+    assert tools._RESOURCES == access._RESOURCES
+    parsed, refused = tools._parse_read(DATE, "news_seen", None, 0, 16)
+    assert refused is None
+    assert parsed is not None and parsed["resource"] == "news_seen"
+    doc_refusal = json.loads(tools._parse_read(DATE, "news_seen", "doc1", 0, 16)[1] or "")
+    assert doc_refusal["code"] == "invalid_doc_id"
     assert tools._PREPARE_HTTP_TIMEOUT_S == 7260.0
     assert tools._HTTP_TIMEOUT_S == 30.0
     assert tools._MAX_HOST_RESPONSE_BYTES == 128 * 1024

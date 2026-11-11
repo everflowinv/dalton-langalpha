@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -27,11 +28,13 @@ from zoneinfo import ZoneInfo
 try:
     from scripts.dalton.ai_finance.ai_finance_github_momentum import resolve_explicit_path
     from scripts.dalton.ai_finance.ai_finance_github_trending import collect_trending
+    from scripts.dalton.ai_finance.batch_retrieval import ConfirmedRetrievalFailure
     from scripts.dalton.ai_finance.prepare import PrepareError, prepare_batch
 except ImportError:
     # The script directory is sys.path[0]. Collectors live in the ai_finance package.
     from ai_finance.ai_finance_github_momentum import resolve_explicit_path
     from ai_finance.ai_finance_github_trending import collect_trending
+    from ai_finance.batch_retrieval import ConfirmedRetrievalFailure
     from ai_finance.prepare import PrepareError, prepare_batch
 
 PROFILE = "ai-finance-daily"
@@ -43,7 +46,12 @@ MAX_RESPONSE_BYTES = 128 * 1024
 _CONFIG_MAX_BYTES = 64 * 1024
 _CLOCK_MAX_BYTES = 64 * 1024
 _ALLOWED_OPERATIONS = frozenset({"auth_status", "search_library", "get_document"})
-_RESOURCES = frozenset({"manifest", "github", "earnings", "candidate"})
+_RESOURCE_ORDER = ("manifest", "github", "earnings", "candidate", "news_seen")
+_RESOURCES = frozenset(_RESOURCE_ORDER)
+_NEWS_SEEN_FILE = "news_seen.json"
+_NEWS_SEEN_RECORD = "news_seen_record.json"
+_NEWS_RECORD_KEYS = frozenset({"schema", "batch_id", "owner_user_id", "started_at", "sha256"})
+_NEWS_SEEN_WINDOW_SECONDS = 7 * 24 * 60 * 60
 _STAGE_STATUS = frozenset({"pending", "failed", "complete"})
 _PREPARE_KEYS = frozenset({
     "automation_execution_id",
@@ -98,7 +106,9 @@ _MESSAGES = {
     "not_regular": "The prepared file is not a regular file.",
     "source_oversize": "The prepared batch exceeds the read bound.",
     "invalid_batch": "batch_id must be a real YYYY-MM-DD business date.",
-    "invalid_resource": "resource must be manifest, github, earnings, or candidate.",
+    "invalid_resource": "resource must be manifest, github, earnings, candidate, or news_seen.",
+    "news_seen_uncommitted": "This batch has no frozen news history.",
+    "news_seen_invalid": "The news history is not a valid hash map.",
     "invalid_doc_id": "doc_id is only accepted for a manifest candidate.",
     "invalid_offset": "offset must be a nonnegative integer.",
     "invalid_max_chars": "max_chars must be an integer from 1 to 32000.",
@@ -343,7 +353,12 @@ def run_research_call(
     arguments: Mapping[str, Any],
     timeout: float,
 ) -> dict[str, Any]:
-    """Submit one call and wait once. A timeout does not submit ``get_document`` again."""
+    """Submit one call and wait once.
+
+    A completed ``research_failed`` envelope becomes
+    ``ConfirmedRetrievalFailure``. A timeout stays ``AeCallError`` and does
+    not submit ``get_document`` again.
+    """
     params = research_params(tool, arguments)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise AeCallError("invalid_arguments")
@@ -356,8 +371,13 @@ def run_research_call(
             cancel()
         raise AeCallError("alphaengine_timeout") from None
     if not isinstance(envelope, Mapping):
-        raise AeCallError("research_failed")
-    return unwrap_research_envelope(tool, envelope)
+        raise ConfirmedRetrievalFailure("research_failed")
+    try:
+        return unwrap_research_envelope(tool, envelope)
+    except AeCallError as exc:
+        if exc.code == "research_failed":
+            raise ConfirmedRetrievalFailure("research_failed") from None
+        raise
 
 
 def _business_payload(result: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -573,7 +593,7 @@ def _public_prepare(root: Path, result: object, *, recovered: bool) -> dict[str,
         "recovered": recovered,
         "manifest_ready": False,
         "candidate_doc_ids": [],
-        "resources": ["manifest", "github", "earnings", "candidate"],
+        "resources": list(_RESOURCE_ORDER),
     }
     if batch_id is not None:
         payload["batch_id"] = batch_id
@@ -688,23 +708,177 @@ def _freeze_clock(
         existing, problem = _read_clock(path, batch_id)
         if problem:
             return None, False, problem
-        if existing is None:
-            document = {
-                "schema": 1,
-                "batch_id": batch_id,
-                "started_at": started_at.isoformat(),
-                "scheduled_at": scheduled_at.isoformat(),
-                "first_execution_id": execution_id,
-                "owner_user_id": owner_user_id,
-                "profile": PROFILE,
-            }
-            _atomic_write(path, _canonical_bytes(document))
-            return started_at, False, None
-        if existing["owner_user_id"] != owner_user_id:
-            return None, True, "owner_mismatch"
-        if existing["profile"] != PROFILE:
-            return None, True, "profile_mismatch"
-        return existing["started_at"], True, None
+        if existing is not None:
+            if existing["owner_user_id"] != owner_user_id:
+                return None, True, "owner_mismatch"
+            if existing["profile"] != PROFILE:
+                return None, True, "profile_mismatch"
+            try:
+                _freeze_news_seen(
+                    root,
+                    batch_id=batch_id,
+                    owner_user_id=owner_user_id,
+                    started_at=existing["started_at"],
+                    clock_exists=True,
+                )
+            except AccessError as exc:
+                return None, True, exc.code
+            return existing["started_at"], True, None
+        try:
+            _freeze_news_seen(
+                root,
+                batch_id=batch_id,
+                owner_user_id=owner_user_id,
+                started_at=started_at,
+                clock_exists=False,
+            )
+        except AccessError as exc:
+            return None, False, exc.code
+        document = {
+            "schema": 1,
+            "batch_id": batch_id,
+            "started_at": started_at.isoformat(),
+            "scheduled_at": scheduled_at.isoformat(),
+            "first_execution_id": execution_id,
+            "owner_user_id": owner_user_id,
+            "profile": PROFILE,
+        }
+        _atomic_write(path, _canonical_bytes(document))
+        return started_at, False, None
+
+
+def _freeze_news_seen(
+    root: Path,
+    *,
+    batch_id: str,
+    owner_user_id: str,
+    started_at: datetime,
+    clock_exists: bool,
+) -> None:
+    """Freeze ``seen.json`` once, before the clock file is published.
+
+    The caller holds the clock lock. A snapshot that is already on disk is
+    checked and kept. This does not take the report lock and does not import
+    the report module. ``seen.json`` is read only while this batch has no
+    snapshot file yet.
+    """
+    batch_dir = root / "batches" / batch_id
+    snapshot = batch_dir / _NEWS_SEEN_FILE
+    record = batch_dir / _NEWS_SEEN_RECORD
+    if _path_exists(snapshot) or _path_exists(record):
+        _require_real_dir(root / "batches")
+        _require_real_dir(batch_dir)
+        _durable_news_seen(batch_dir, batch_id, owner_user_id, started_at)
+        return
+    if clock_exists:
+        return
+    projected = _project_news_seen(root, started_at)
+    raw = _canonical_bytes(projected)
+    if len(raw) > SOURCE_READ_MAX_BYTES:
+        raise AccessError("source_oversize")
+    batch_dir = _ensure_batch_dir(root, batch_id)
+    _atomic_write(batch_dir / _NEWS_SEEN_FILE, raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    _atomic_write(batch_dir / _NEWS_SEEN_RECORD, _canonical_bytes({
+        "schema": 1,
+        "batch_id": batch_id,
+        "owner_user_id": owner_user_id,
+        "started_at": started_at.isoformat(),
+        "sha256": digest,
+    }))
+
+
+def _project_news_seen(root: Path, started_at: datetime) -> dict[str, int | float]:
+    path = root / "seen.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        raise AccessError("read_failed") from None
+    raw = _read_no_follow(path, max_bytes=SOURCE_READ_MAX_BYTES)
+    return _news_map(raw, started_at=started_at)
+
+
+def _durable_news_seen(
+    batch_dir: Path,
+    batch_id: str,
+    owner_user_id: str,
+    started_at: datetime,
+) -> bytes:
+    """Return the frozen snapshot bytes when the completion record matches."""
+    snapshot = batch_dir / _NEWS_SEEN_FILE
+    record_path = batch_dir / _NEWS_SEEN_RECORD
+    if not _path_exists(snapshot) or not _path_exists(record_path):
+        raise AccessError("news_seen_uncommitted")
+    record_raw = _read_no_follow(record_path, max_bytes=SOURCE_READ_MAX_BYTES)
+    try:
+        record = json.loads(record_raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise AccessError("news_seen_invalid") from None
+    if type(record) is not dict or set(record) != _NEWS_RECORD_KEYS:
+        raise AccessError("news_seen_invalid")
+    if type(record.get("schema")) is not int or record.get("schema") != 1:
+        raise AccessError("news_seen_invalid")
+    if record.get("batch_id") != batch_id or record.get("owner_user_id") != owner_user_id:
+        raise AccessError("news_seen_invalid")
+    frozen = _parse_instant(record.get("started_at"))
+    if frozen is None or frozen.astimezone(timezone.utc) != started_at.astimezone(timezone.utc):
+        raise AccessError("news_seen_invalid")
+    digest = record.get("sha256")
+    if not isinstance(digest, str) or _HEX64.fullmatch(digest) is None:
+        raise AccessError("news_seen_invalid")
+    raw = _read_no_follow(snapshot, max_bytes=SOURCE_READ_MAX_BYTES)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise AccessError("hash_mismatch")
+    _news_map(raw)
+    return raw
+
+
+def _news_map(raw: bytes, *, started_at: datetime | None = None) -> dict[str, int | float]:
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise AccessError("news_seen_invalid") from None
+    if type(parsed) is not dict:
+        raise AccessError("news_seen_invalid")
+    cutoff = None if started_at is None else started_at.timestamp() - _NEWS_SEEN_WINDOW_SECONDS
+    kept: dict[str, int | float] = {}
+    for key, value in parsed.items():
+        if type(key) is not str or _HEX64.fullmatch(key) is None:
+            raise AccessError("news_seen_invalid")
+        if type(value) is bool or type(value) not in {int, float} or not math.isfinite(value):
+            raise AccessError("news_seen_invalid")
+        if cutoff is not None and value < cutoff:
+            continue
+        kept[key] = value
+    return kept
+
+
+def _ensure_batch_dir(root: Path, batch_id: str) -> Path:
+    batches = root / "batches"
+    if _path_exists(batches):
+        _require_real_dir(batches)
+    else:
+        batches.mkdir()
+    batch_dir = batches / batch_id
+    if batch_dir.parent != batches or batch_dir.name != batch_id:
+        raise AccessError("path_escape")
+    if _path_exists(batch_dir):
+        _require_real_dir(batch_dir)
+    else:
+        batch_dir.mkdir()
+    return batch_dir
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise AccessError("read_failed") from None
+    return True
 
 
 def _load_clock_for_read(root: Path, batch_id: str, owner_user_id: str) -> dict[str, Any]:
@@ -780,6 +954,9 @@ def _resource_bytes(
 ) -> tuple[bytes, str]:
     batch_id = str(clock["batch_id"])
     metadata, manifest, batch_dir = _load_verified_batch(root, batch_id, clock["started_at"])
+    if resource == "news_seen":
+        raw = _durable_news_seen(batch_dir, batch_id, str(clock["owner_user_id"]), clock["started_at"])
+        return raw, hashlib.sha256(raw).hexdigest()
     if resource == "manifest":
         raw = _read_named(batch_dir, "manifest.json")
         digest = hashlib.sha256(raw).hexdigest()

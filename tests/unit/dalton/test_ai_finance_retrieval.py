@@ -16,6 +16,7 @@ import pytest
 
 import scripts.dalton.ai_finance.batch_retrieval as retrieval_mod
 import scripts.dalton.ai_finance.prepare as prepare_mod
+from scripts.dalton import ai_finance_access as access
 from scripts.dalton.ai_finance.alphaengine_earnings_ai_scan import scan
 from scripts.dalton.ai_finance.batch_retrieval import UnresolvedRetrieval, open_batch_retrieval
 from scripts.dalton.ai_finance.prepare import prepare_batch
@@ -417,6 +418,153 @@ def test_provider_error_is_replayed_and_not_treated_as_unresolved(tmp_path: Path
     assert first["errors"][0]["error"] == "RuntimeError: unavailable"
     assert second["errors"][0]["error"] == "RuntimeError: unavailable"
     assert "UnresolvedRetrieval" not in second["errors"][0]["error"]
+
+
+class _Ready:
+    def __init__(self, value: Any = None, error: BaseException | None = None) -> None:
+        self._value = value
+        self._error = error
+
+    def result(self, timeout: float | None = None) -> Any:
+        del timeout
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+    def cancel(self) -> bool:
+        return True
+
+
+def _completed(structured: dict[str, Any]) -> dict[str, Any]:
+    business = {
+        "ok": True,
+        "status": "ok",
+        "executed": True,
+        "data": {"isError": False, "structuredContent": structured},
+    }
+    return {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(business)}],
+            "isError": False,
+        },
+    }
+
+
+def _adapter_transport(
+    submit_result: Any,
+    submits: list[str],
+) -> Any:
+    def transport(tool: str, arguments: dict[str, Any], timeout: int = 150) -> dict[str, Any]:
+        def submit(params: dict[str, Any]) -> _Ready:
+            operation = params["arguments"]["operation"]
+            submits.append(operation)
+            produced = submit_result(operation, params["arguments"]["params"])
+            if isinstance(produced, BaseException):
+                return _Ready(error=produced)
+            return _Ready(produced)
+
+        return access.run_research_call(
+            submit=submit,
+            tool=tool,
+            arguments=arguments,
+            timeout=float(timeout),
+        )
+
+    return transport
+
+
+def test_completed_research_failure_is_fetch_error_and_is_not_sent_again(tmp_path: Path) -> None:
+    secret = "SECRET-RESEARCH-BODY"
+    submits: list[str] = []
+
+    def answer(operation: str, params: dict[str, Any]) -> Any:
+        if operation == "auth_status":
+            return _completed({"authenticated": True, "status": "ready"})
+        if operation == "search_library":
+            return _completed({
+                "results": [
+                    _hit("doc-ok", "2026-10-11T09:00:00+08:00"),
+                    _hit("doc-bad", "2026-10-11T09:00:00+08:00"),
+                ],
+                "has_more": False,
+            })
+        assert operation == "get_document"
+        if params["doc_id"] == "doc-bad":
+            return {"result": {"isError": True, "content": [{"type": "text", "text": secret}]}}
+        text = "AI revenue grew."
+        return _completed({
+            "text": text,
+            "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "content_chars": len(text),
+            "next_offset": None,
+            "metadata": {},
+        })
+
+    batch = tmp_path / "batches" / BATCH
+    batch.mkdir(parents=True)
+    transport = _adapter_transport(answer, submits)
+    args = _scan_args(batch, transport)
+    args.workers = 1
+    first = scan(args)
+    second = scan(args)
+    assert submits.count("get_document") == 2
+    assert submits.count("search_library") == 1
+    assert submits.count("auth_status") == 2
+    assert {item["doc_id"] for item in first["candidates"]} == {"doc-ok"}
+    assert len(first["errors"]) == 1
+    assert first["errors"][0]["doc_id"] == "doc-bad"
+    assert first["errors"][0]["status"] == "fetch_error"
+    assert first["errors"][0]["error"] == "ConfirmedRetrievalFailure: research_failed"
+    assert secret not in first["errors"][0]["error"]
+    assert second["errors"] == first["errors"]
+    assert {item["doc_id"] for item in second["candidates"]} == {"doc-ok"}
+    saved = {
+        json.loads(path.read_text(encoding="utf-8"))["args"]["doc_id"]: json.loads(path.read_text(encoding="utf-8"))
+        for path in (batch / ".retrieval" / "calls").glob("get_document-*.json")
+    }
+    assert saved["doc-bad"]["state"] == "confirmed"
+    assert saved["doc-bad"]["outcome"] == "error"
+    assert saved["doc-bad"]["error_type"] == "ConfirmedRetrievalFailure"
+    assert saved["doc-bad"]["message"] == "research_failed"
+    assert secret not in json.dumps(saved["doc-bad"])
+    assert saved["doc-ok"]["outcome"] == "value"
+
+
+def test_research_timeout_stays_unresolved_and_is_not_sent_again(tmp_path: Path) -> None:
+    submits: list[str] = []
+
+    def answer(operation: str, params: dict[str, Any]) -> Any:
+        del params
+        if operation == "auth_status":
+            return _completed({"authenticated": True, "status": "ready"})
+        if operation == "search_library":
+            return _completed({
+                "results": [_hit("doc-1", "2026-10-11T09:00:00+08:00")],
+                "has_more": False,
+            })
+        assert operation == "get_document"
+        return TimeoutError()
+
+    batch = tmp_path / "batches" / BATCH
+    batch.mkdir(parents=True)
+    transport = _adapter_transport(answer, submits)
+    args = _scan_args(batch, transport)
+    args.workers = 1
+    with pytest.raises(UnresolvedRetrieval, match="no durable confirmed response"):
+        scan(args)
+    with pytest.raises(UnresolvedRetrieval, match="no confirmed response"):
+        scan(args)
+    assert submits.count("get_document") == 1
+    assert submits.count("search_library") == 1
+    assert submits.count("auth_status") == 2
+    records = list((batch / ".retrieval" / "calls").glob("get_document-*.json"))
+    assert len(records) == 1
+    saved = json.loads(records[0].read_text(encoding="utf-8"))
+    assert saved["state"] == "inflight"
+    assert "outcome" not in saved
+    assert "error_type" not in saved
 
 
 def _scan_args(batch: Path, transport: Any) -> Any:

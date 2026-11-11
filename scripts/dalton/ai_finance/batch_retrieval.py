@@ -32,7 +32,21 @@ class UnresolvedRetrieval(RuntimeError):
     """A full-document call has no durable confirmed response."""
 
 
+class ConfirmedRetrievalFailure(Exception):
+    """A finished full-document response that is not a usable page.
+
+    The journal stores this and replays it. The scan keeps it on that
+    document. It is not an unresolved call and it is not sent again.
+    """
+
+
 _TOOLS = {"search_library", "get_document"}
+# Closed set written by this process. A record's error_type is one of these
+# tokens, not an arbitrary class name.
+_CONFIRMED_FAILURES = {
+    "RuntimeError": RuntimeError,
+    "ConfirmedRetrievalFailure": ConfirmedRetrievalFailure,
+}
 _CALL_NAME = re.compile(r"^(?:search_library|get_document)-[0-9a-f]{64}\.json$")
 _MAX_RECORD_BYTES = 4 * 1024 * 1024
 _BLOCKED_PARTS = {".openclaw", ".feishu-daily-ai-finance"}
@@ -133,15 +147,16 @@ class BatchRetrieval:
                 except Exception as exc:
                     if tool != "get_document":
                         raise
-                    # Only an exact RuntimeError is a finished transport outcome.
-                    # Timeouts and other failures stay in flight: the call may have
-                    # been sent, and this transport does not say it was not charged.
-                    if type(exc) is not RuntimeError:
+                    # A finished RuntimeError or ConfirmedRetrievalFailure is stored
+                    # and replayed. A timeout or any other failure stays in flight:
+                    # the call may have been sent, and it is not sent again.
+                    failure = _confirmed_failure_name(exc)
+                    if failure is None:
                         raise UnresolvedRetrieval(
                             "full-document failure has no durable confirmed response"
                         ) from exc
                     try:
-                        _write_error(path, tool, frozen_args, exc)
+                        _write_error(path, tool, frozen_args, failure, str(exc))
                     except Exception as persist_exc:
                         raise UnresolvedRetrieval("full-document result was not durable") from persist_exc
                     raise
@@ -152,7 +167,8 @@ class BatchRetrieval:
                                 path,
                                 tool,
                                 frozen_args,
-                                RuntimeError("retrieval payload must be an object"),
+                                "RuntimeError",
+                                "retrieval payload must be an object",
                             )
                         except Exception as persist_exc:
                             raise UnresolvedRetrieval("full-document result was not durable") from persist_exc
@@ -295,10 +311,11 @@ def _check_record(record: dict[str, Any], tool: str, arguments: dict[str, Any]) 
             raise RetrievalCacheCorrupt("retrieval value hash does not match")
         return
     if outcome == "error":
+        failure = record.get("error_type")
         message = record.get("message")
-        if record.get("error_type") != "RuntimeError" or not isinstance(message, str):
+        if failure not in _CONFIRMED_FAILURES or not isinstance(message, str):
             raise RetrievalCacheCorrupt("retrieval error record is not usable")
-        if _error_sha(message) != record.get("sha256"):
+        if _error_sha(failure, message) != record.get("sha256"):
             raise RetrievalCacheCorrupt("retrieval error hash does not match")
         return
     raise RetrievalCacheCorrupt("retrieval outcome is not usable")
@@ -309,7 +326,7 @@ def _replay(record: dict[str, Any], tool: str, arguments: dict[str, Any]) -> dic
     if record.get("state") == "inflight":
         raise UnresolvedRetrieval("full-document call has no confirmed response")
     if record.get("outcome") == "error":
-        raise RuntimeError(record["message"])
+        raise _CONFIRMED_FAILURES[record["error_type"]](record["message"])
     return json.loads(_canonical(record["value"]))
 
 
@@ -325,17 +342,32 @@ def _write_value(path: Path, tool: str, arguments: dict[str, Any], value: dict[s
     })
 
 
-def _write_error(path: Path, tool: str, arguments: dict[str, Any], exc: BaseException) -> None:
-    message = str(exc)
+def _confirmed_failure_name(exc: BaseException) -> str | None:
+    if type(exc) is RuntimeError:
+        return "RuntimeError"
+    if type(exc) is ConfirmedRetrievalFailure:
+        return "ConfirmedRetrievalFailure"
+    return None
+
+
+def _write_error(
+    path: Path,
+    tool: str,
+    arguments: dict[str, Any],
+    failure: str,
+    message: str,
+) -> None:
+    if failure not in _CONFIRMED_FAILURES:
+        raise RetrievalCacheCorrupt("retrieval error record is not usable")
     _write_record(path, {
         "schema": 1,
         "state": "confirmed",
         "tool": tool,
         "args": arguments,
         "outcome": "error",
-        "error_type": "RuntimeError",
+        "error_type": failure,
         "message": message,
-        "sha256": _error_sha(message),
+        "sha256": _error_sha(failure, message),
     })
 
 
@@ -343,8 +375,8 @@ def _value_sha(value: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _error_sha(message: str) -> str:
-    return hashlib.sha256(_canonical({"error_type": "RuntimeError", "message": message})).hexdigest()
+def _error_sha(failure: str, message: str) -> str:
+    return hashlib.sha256(_canonical({"error_type": failure, "message": message})).hexdigest()
 
 
 def _read_record(path: Path) -> dict[str, Any]:

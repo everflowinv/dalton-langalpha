@@ -30,7 +30,8 @@ from src.dalton.tools.automation_report_tools import _server_identity
 
 logger = logging.getLogger(__name__)
 
-ResourceName = Literal["manifest", "github", "earnings", "candidate"]
+_RESOURCE_ORDER = ("manifest", "github", "earnings", "candidate", "news_seen")
+ResourceName = Literal["manifest", "github", "earnings", "candidate", "news_seen"]
 _MAX_OFFSET = 32 * 1024 * 1024
 _MAX_CHARS = 32000
 _DEFAULT_MAX_CHARS = 16000
@@ -42,7 +43,7 @@ _PREPARE_PATH = "/internal/ai-finance/prepare"
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _DOC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
-_RESOURCES = frozenset({"manifest", "github", "earnings", "candidate"})
+_RESOURCES = frozenset(_RESOURCE_ORDER)
 _STAGE_STATUS = frozenset({"pending", "failed", "complete"})
 _DOCUMENT_KEYS = ("text", "content", "body", "candidates", "github", "earnings")
 
@@ -59,7 +60,7 @@ def create_ai_finance_inputs_tools() -> list[BaseTool]:
         Returns:
             JSON with batch_id, window, stages, and candidate doc_ids. No host path and no full text.
 
-        Pass batch_id to ai_finance_read. For a candidate, also pass its doc_id. Follow next_offset until it is null.
+        Pass batch_id to ai_finance_read. For a candidate, also pass its doc_id. news_seen is the frozen news history and does not take doc_id. Follow next_offset until it is null.
         """
         identity, refused = await _gate(config)
         if refused is not None:
@@ -116,8 +117,8 @@ def create_ai_finance_inputs_tools() -> list[BaseTool]:
 
         Args:
             batch_id: batch_id from prepare. A real YYYY-MM-DD business date.
-            resource: manifest, github, earnings, or candidate.
-            doc_id: Required only when resource is candidate. Use a doc_id from prepare.
+            resource: manifest, github, earnings, candidate, or news_seen.
+            doc_id: Required only when resource is candidate. Use a doc_id from prepare. news_seen does not take doc_id.
             offset: Character offset. 0 is the start.
             max_chars: Characters to return, from 1 to 32000.
 
@@ -271,7 +272,10 @@ def _parse_read(
     if _iso_date(batch_id) is None:
         return None, _refuse("invalid_batch", "batch_id must be a real YYYY-MM-DD business date.")
     if resource not in _RESOURCES:
-        return None, _refuse("invalid_resource", "resource must be manifest, github, earnings, or candidate.")
+        return None, _refuse(
+            "invalid_resource",
+            "resource must be manifest, github, earnings, candidate, or news_seen.",
+        )
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > _MAX_OFFSET:
         return None, _refuse("invalid_offset", "offset must be a nonnegative integer.")
     if isinstance(max_chars, bool) or not isinstance(max_chars, int) or not 1 <= max_chars <= _MAX_CHARS:
@@ -384,7 +388,7 @@ def _accept_prepare(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     if not isinstance(errors, list) or any(not isinstance(item, str) or _TOKEN.fullmatch(item) is None for item in errors):
         return None
     resources = payload.get("resources")
-    if resources != ["manifest", "github", "earnings", "candidate"]:
+    if resources != list(_RESOURCE_ORDER):
         return None
     started_at = _parse_instant(payload.get("started_at"))
     if started_at is None or _pathlike(started_at.isoformat()):
@@ -402,7 +406,7 @@ def _accept_prepare(payload: Mapping[str, Any]) -> dict[str, Any] | None:
         "recovered": payload.get("recovered") is True,
         "manifest_ready": payload.get("manifest_ready") is True,
         "candidate_doc_ids": [str(item) for item in doc_ids],
-        "resources": ["manifest", "github", "earnings", "candidate"],
+        "resources": list(_RESOURCE_ORDER),
     }
 
 
