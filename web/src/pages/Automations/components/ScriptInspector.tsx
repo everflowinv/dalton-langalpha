@@ -1,5 +1,5 @@
 // DALTON-HOOK(company-automations): a company script has schedule controls and no agent actions.
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Pause, Pencil, Play } from 'lucide-react';
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
@@ -8,7 +8,7 @@ import type { ScriptAutomationRead } from '@/types/automation';
 import { useAutomationExecutionReads } from '../hooks/useAutomationReads';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { formatDateTimeShort } from '../utils/time';
-import { runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
+import { isCompanyTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
 import './AutomationInspector.css';
 
 interface ScriptInspectorProps {
@@ -17,13 +17,19 @@ interface ScriptInspectorProps {
   /** Detail `config_version`. Pause, resume, and save stay off until it is known. */
   configVersion: number | null;
   onEdit: (script: ScriptAutomationRead) => void;
+  /** Company run list returned 403. The page clears that task's cached reads. */
+  onRunsForbidden: (automationId: string) => void;
 }
 
-export default function ScriptInspector({ script, runId, configVersion, onEdit }: ScriptInspectorProps) {
+export default function ScriptInspector({ script, runId, configVersion, onEdit, onRunsForbidden }: ScriptInspectorProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const { pause, resume, busy } = useAutomationMutations();
   const runs = useAutomationExecutionReads(script.automation_id, { limit: 20, offset: 0 });
+  const runsForbidden = isCompanyTask(script) && isForbiddenError(runs.error);
+  useEffect(() => {
+    if (runsForbidden) onRunsForbidden(script.automation_id);
+  }, [runsForbidden, onRunsForbidden, script.automation_id]);
   const statusKey = scriptStatusLabelKey(script);
   const versionReady = configVersion != null;
   const canPause = script.enabled && !script.paused_by_user;
@@ -31,6 +37,14 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit }
   const target = () => (configVersion == null ? null : { id: script.automation_id, expectedConfigVersion: configVersion });
   const executions = runs.data?.executions ?? [];
   const opened = runId ? executions.find((run) => run.automation_execution_id === runId) ?? null : null;
+
+  if (runsForbidden) {
+    return (
+      <article className="automation-inspector">
+        <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
+      </article>
+    );
+  }
 
   return (
     <article className="automation-inspector">

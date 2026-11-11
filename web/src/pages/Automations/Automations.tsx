@@ -1,13 +1,15 @@
+// DALTON-HOOK(company-automations): manage reads three scopes and keeps an open company draft across independent paging.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { SwapCell } from '@/components/ui/crossfade';
 import { apiErrorStatus } from '@/api/errors';
 import { useAuth } from '@/contexts/AuthContext';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { ListError, ListSkeleton } from '@/components/mcp/McpPrimitives';
+import { queryKeys } from '@/lib/queryKeys';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import type { Automation, AutomationUpdatePayload, CompanyScriptUpdatePayload } from '@/types/automation';
@@ -28,6 +30,7 @@ import { recentRunsQuery } from './hooks/useRecentRuns';
 import { useWatchedReadings } from './hooks/useWatchedReadings';
 import { mutationErrorMessage } from './utils/errors';
 import { automationToFormState } from './utils/form';
+// DALTON-HOOK(company-automations): company tasks are recognized by scope, and writes use the detail config_version.
 import {
   asAutomations,
   configVersionOf,
@@ -64,6 +67,45 @@ type ScopeName = 'company' | 'personal' | 'research_tracking';
 
 type ConfigConflict = { id: string; message: string; current: number | null };
 
+function lastFilledOffset(total: number): number {
+  if (!Number.isFinite(total) || total <= 0) return 0;
+  return Math.floor((total - 1) / MANAGE_PAGE_SIZE) * MANAGE_PAGE_SIZE;
+}
+
+/** The offset to store when a successful page is past the last filled one, or null when it already fits. */
+function clampedScopeOffset(offset: number, total: number | null): number | null {
+  if (total == null) return null;
+  const last = lastFilledOffset(total);
+  return offset > last ? last : null;
+}
+
+// DALTON-HOOK(company-automations): a refused company run list drops that user's company lists and that task's cached reads.
+function forbidCompanyTaskReads(queryClient: QueryClient, userId: string | null, automationId: string) {
+  if (!userId) return;
+  const error = Object.assign(new Error('Company task access was refused'), { response: { status: 403 } });
+  for (const query of queryClient.getQueryCache().findAll({ queryKey: [...queryKeys.automations.all, 'read'] })) {
+    const key = query.queryKey;
+    if (key[3] !== userId) continue;
+    const kind = key[2];
+    let matches = false;
+    if (kind === 'list') {
+      const params = key[4];
+      matches = !!params && typeof params === 'object' && (params as { scope?: unknown }).scope === 'company';
+    } else if (kind === 'detail' || kind === 'executions' || kind === 'history') {
+      matches = key[4] === automationId;
+    }
+    if (!matches) continue;
+    query.setState({
+      data: undefined,
+      dataUpdatedAt: 0,
+      status: 'error',
+      error,
+      fetchStatus: 'idle',
+    });
+  }
+}
+
+// DALTON-HOOK(company-automations): company agent saves send the detail version and omit personal delivery.
 function companyAgentPatch(
   payload: AutomationUpdatePayload,
   version: number,
@@ -119,6 +161,7 @@ function RememberedScroll({ memoryKey, children }: { memoryKey: string; children
  * lands on it. Without a `view` the last one used wins, which is a
  * per-browser convenience and so lives in local storage.
  */
+// DALTON-HOOK(company-automations): manage keeps three independent pages and the open company draft in this view.
 export default function Automations() {
   const { t } = useTranslation();
   const { userId } = useAuth();
@@ -150,6 +193,7 @@ export default function Automations() {
     notifyOnChangeProps: ['isPending'],
   });
 
+  // DALTON-HOOK(company-automations): each scope has its own offset. A company draft records the detail version it opened with.
   const [form, setForm] = useState<FormMode | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Automation | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
@@ -159,6 +203,8 @@ export default function Automations() {
   const [scopeUser, setScopeUser] = useState(userId);
   const [editVersion, setEditVersion] = useState<number | null>(null);
   const [conflict, setConflict] = useState<ConfigConflict | null>(null);
+  // True once manage has shown settled groups, so one group's next page does not replace the whole view.
+  const manageSettled = useRef(false);
 
   if (userId !== scopeUser) {
     setScopeUser(userId);
@@ -167,6 +213,7 @@ export default function Automations() {
     setEditVersion(null);
     setConflict(null);
     setForm(null);
+    manageSettled.current = false;
   }
 
   const manageOn = view === 'manage';
@@ -190,14 +237,33 @@ export default function Automations() {
   });
 
   const companyForbidden = isForbiddenError(companyQuery.error);
-  const companyTasks =
-    companyQuery.isSuccess && !companyForbidden && companyQuery.data ? companyQuery.data.automations : [];
-  const personalTasks = personalQuery.isSuccess && personalQuery.data ? personalQuery.data.automations : [];
-  const researchTasks = researchQuery.isSuccess && researchQuery.data ? researchQuery.data.automations : [];
+  const personalForbidden = isForbiddenError(personalQuery.error);
+  const researchForbidden = isForbiddenError(researchQuery.error);
+  // DALTON-HOOK(company-automations): a 503 keeps the last authorized rows. A 403 still drops that scope.
+  const companyTasks = !companyForbidden && companyQuery.data ? companyQuery.data.automations : [];
+  const personalTasks = !personalForbidden && personalQuery.data ? personalQuery.data.automations : [];
+  const researchTasks = !researchForbidden && researchQuery.data ? researchQuery.data.automations : [];
   const listsReady =
     (companyQuery.isSuccess || companyQuery.isError) &&
     (personalQuery.isSuccess || personalQuery.isError) &&
     (researchQuery.isSuccess || researchQuery.isError);
+  if (!manageOn) manageSettled.current = false;
+  else if (listsReady) manageSettled.current = true;
+  const settledTotal = (
+    query: { isSuccess: boolean; data?: { total: number } | undefined },
+    forbidden: boolean,
+  ): number | null => (query.isSuccess && !forbidden && query.data ? query.data.total : null);
+  const companyNext = clampedScopeOffset(offsets.company, settledTotal(companyQuery, companyForbidden));
+  const personalNext = clampedScopeOffset(offsets.personal, settledTotal(personalQuery, personalForbidden));
+  const researchNext = clampedScopeOffset(offsets.research_tracking, settledTotal(researchQuery, researchForbidden));
+  const pastEnd = companyNext != null || personalNext != null || researchNext != null;
+  if (pastEnd) {
+    setOffsets({
+      company: companyNext ?? offsets.company,
+      personal: personalNext ?? offsets.personal,
+      research_tracking: researchNext ?? offsets.research_tracking,
+    });
+  }
   const personalGroups = useOrderedGroups(asAutomations(personalTasks));
   const researchGroups = useOrderedGroups(asAutomations(researchTasks));
   const pool = useMemo(
@@ -205,11 +271,16 @@ export default function Automations() {
     [companyTasks, personalTasks, researchTasks],
   );
   const fallback = companyTasks[0] ?? personalGroups[0]?.items[0] ?? researchGroups[0]?.items[0];
-  const showStandIn = manageOn && listsReady && !selectedId && !runId;
+  // DALTON-HOOK(company-automations): paging one group keeps the task already standing in for the pane.
+  const showStandIn = manageOn && !selectedId && !runId && (listsReady || standInId != null);
   const remembered = standInId ? pool.find((task) => task.automation_id === standInId) : undefined;
-  const standIn = showStandIn ? remembered ?? fallback : undefined;
+  const standIn = showStandIn ? remembered ?? (listsReady ? fallback : undefined) : undefined;
   const nextStandIn = standIn?.automation_id ?? null;
-  if ((showStandIn || !manageOn) && nextStandIn !== standInId) setStandInId(nextStandIn);
+  if (!manageOn) {
+    if (standInId !== null) setStandInId(null);
+  } else if (listsReady && showStandIn && nextStandIn !== standInId) {
+    setStandInId(nextStandIn);
+  }
 
   const runOwner =
     !selectedId && runId
@@ -218,7 +289,9 @@ export default function Automations() {
       : undefined;
   const paneId = selectedId ?? runOwner?.automation_id ?? (runId ? null : standIn?.automation_id ?? null);
   const detail = useAutomationRead(paneId, { enabled: manageOn && !!paneId });
-  const openDetail = detail.isSuccess && detail.data?.automation_id === paneId ? detail.data : null;
+  // DALTON-HOOK(company-automations): a failed refetch keeps the last authorized detail. A 403 does not.
+  const openDetail =
+    paneId && !isForbiddenError(detail.error) && detail.data?.automation_id === paneId ? detail.data : null;
   // The company list and this detail are separate queries. Once the list is
   // refused, the cached company detail and its draft are hidden as well.
   const detailForbidden =
@@ -229,6 +302,7 @@ export default function Automations() {
 
   useEffect(() => {
     if (form?.kind !== 'edit') return;
+    // DALTON-HOOK(company-automations): a company refusal closes that draft. A personal draft has no version here.
     // `editVersion` is set only when this draft belongs to a company task.
     // A company-list refusal drops that draft even if the stand-in pane has
     // already moved off it. A personal or research draft leaves it null.
@@ -248,6 +322,14 @@ export default function Automations() {
     [form, draftDirty],
   );
 
+  const onRunsForbidden = useCallback(
+    (automationId: string) => {
+      forbidCompanyTaskReads(queryClient, userId, automationId);
+    },
+    [queryClient, userId],
+  );
+
+  // DALTON-HOOK(company-automations): leaving an open draft asks first. The view, task, and run stay in the URL.
   const navigateTo = useCallback(
     (next: AutomationsView, id: string | null, run: string | null = null) => {
       const params = new URLSearchParams(searchParams);
@@ -273,6 +355,7 @@ export default function Automations() {
     [leaveForm, navigateTo],
   );
 
+  // DALTON-HOOK(company-automations): opening a selected company run clears the config conflict before navigation.
   const openRun = useCallback(
     (id: string, run: string | null) =>
       leaveForm(() => {
@@ -303,6 +386,7 @@ export default function Automations() {
     [leaveForm, navigateTo, selectedId, view],
   );
 
+  // DALTON-HOOK(company-automations): company writes use this detail version, never the list row's version.
   const writeVersion = detailTask && isCompanyTask(detailTask) ? configVersionOf(detailTask) : null;
   const taskById = useCallback(
     (id: string): ManageTask | null => {
@@ -325,9 +409,11 @@ export default function Automations() {
       const message = mutationErrorMessage(err, '');
       setConflict({ id, message, current: null });
       const read = await detail.refetch();
-      setConflict((current) =>
-        current && current.id === id ? { ...current, current: configVersionOf(read.data) } : current,
-      );
+      // A failed refetch has no new version, so retry stays off and the typed draft stays mounted.
+      setConflict((current) => {
+        if (!current || current.id !== id) return current;
+        return { ...current, current: read.isSuccess ? configVersionOf(read.data) : null };
+      });
     },
     [detail],
   );
@@ -352,6 +438,7 @@ export default function Automations() {
         if (company) {
           const version = versionFor(id);
           if (version == null) return;
+          // DALTON-HOOK(company-automations): company agent updates carry the detail version and no delivery config.
           data = companyAgentPatch(submission.payload, version);
         }
         try {
@@ -377,6 +464,7 @@ export default function Automations() {
     async (id: string, patch: ScriptSchedulePatch) => {
       const version = versionFor(id);
       if (version == null) return;
+      // DALTON-HOOK(company-automations): a script patch sends the detail version and only a changed cron or timezone.
       const data: CompanyScriptUpdatePayload = { expected_config_version: version };
       if (patch.cron_expression) data.cron_expression = patch.cron_expression;
       if (patch.timezone) data.timezone = patch.timezone;
@@ -417,6 +505,7 @@ export default function Automations() {
           kind: 'script',
           key: `script:${editing.automation_id}`,
           props: {
+            // DALTON-HOOK(company-automations): the script form keeps its typed cron until this task changes.
             cronExpression: editing.cron_expression,
             timezone: editing.timezone,
             loading: busy,
@@ -452,6 +541,7 @@ export default function Automations() {
           loading: busy,
           submitDisabled: !!held && held.current == null,
           submitLabel: held ? t('automation.retryWithCurrent') : undefined,
+          // DALTON-HOOK(company-automations): a company agent edit does not offer personal delivery.
           omitDelivery: isCompanyTask(editing),
           notice: held ? <ConfigConflictNotice message={held.message} version={held.current} /> : undefined,
           initialValues: automationToFormState(editing, homeZone, homeRow?.workspace_id),
@@ -473,54 +563,83 @@ export default function Automations() {
     };
   }, [form, formBlocked, editing, held, busy, submitScript, handleSubmit, homePending, homeZone, homeRow, t]);
 
+  // DALTON-HOOK(company-automations): a ready detail stays up while another group is still loading its page.
   const selection = useMemo((): ManageSelection => {
     const linked = !!(selectedId || runId);
     if (paneId && detailForbidden) return { kind: 'forbidden' };
     const task = detailTask ?? (!detailForbidden ? pageRow : undefined);
     if (task) return linked ? { kind: 'chosen', task, runId } : { kind: 'first', task };
-    if (paneId && (detail.isLoading || detail.isFetching || !listsReady)) return { kind: 'loading' };
+    if (paneId && (detail.isLoading || detail.isFetching)) return { kind: 'loading' };
     if (selectedId || runId) return { kind: 'missing', runId };
-    if (!listsReady) return { kind: 'loading' };
+    if (!listsReady && !manageSettled.current) return { kind: 'loading' };
     return { kind: 'none' };
   }, [paneId, detailForbidden, detailTask, pageRow, detail.isLoading, detail.isFetching, listsReady, selectedId, runId]);
+
+  const taskScope = (id: string): ScopeName | null => {
+    if (companyTasks.some((task) => task.automation_id === id)) return 'company';
+    if (personalTasks.some((task) => task.automation_id === id)) return 'personal';
+    if (researchTasks.some((task) => task.automation_id === id)) return 'research_tracking';
+    if (openDetail?.automation_id === id) {
+      const scope = openDetail.scope;
+      if (scope === 'company' || scope === 'personal' || scope === 'research_tracking') return scope;
+    }
+    return null;
+  };
 
   const scopePage = (
     scope: ScopeName,
     titleKey: string,
     tasks: ScopePage['tasks'],
-    total: number,
-    query: { isLoading: boolean; isFetching: boolean; isSuccess: boolean; isError: boolean },
+    query: {
+      data?: { total: number } | undefined;
+      isLoading: boolean;
+      isFetching: boolean;
+      isSuccess: boolean;
+      isError: boolean;
+    },
     forbidden: boolean,
-  ): ScopePage => ({
-    scope,
-    titleKey,
-    tasks: forbidden ? [] : tasks,
-    total: forbidden ? 0 : total,
-    offset: offsets[scope],
-    isLoading: !forbidden && (query.isLoading || (query.isFetching && !query.isSuccess)),
-    isForbidden: forbidden,
-    isError: query.isError,
-    onOffset: (offset) => setOffsets((current) => ({ ...current, [scope]: offset })),
-  });
+  ): ScopePage => {
+    const pageData = forbidden ? undefined : query.data;
+    const retained = pageData != null;
+    return {
+      scope,
+      titleKey,
+      tasks: retained ? tasks : [],
+      total: retained ? pageData.total : 0,
+      offset: offsets[scope],
+      isLoading: !forbidden && !retained && (query.isLoading || (query.isFetching && !query.isSuccess)),
+      isForbidden: forbidden,
+      isError: !forbidden && query.isError && !retained,
+      onOffset: (offset) => {
+        const apply = () => setOffsets((current) => (current[scope] === offset ? current : { ...current, [scope]: offset }));
+        const editingId = form?.kind === 'edit' ? form.automationId : null;
+        // Paging the open stand-in's own group changes which task is on screen.
+        if (editingId && !selectedId && !runId && taskScope(editingId) === scope) {
+          leaveForm(() => {
+            setForm(null);
+            setConflict(null);
+            setDraftDirty(false);
+            setEditVersion(null);
+            apply();
+          });
+          return;
+        }
+        apply();
+      },
+    };
+  };
 
   const pages: ScopePage[] = [
-    scopePage('company', 'automation.groupCompany', companyTasks, companyQuery.data?.total ?? 0, companyQuery, companyForbidden),
-    scopePage('personal', 'automation.groupMine', personalTasks, personalQuery.data?.total ?? 0, personalQuery, isForbiddenError(personalQuery.error)),
-    scopePage(
-      'research_tracking',
-      'automation.groupResearch',
-      researchTasks,
-      researchQuery.data?.total ?? 0,
-      researchQuery,
-      isForbiddenError(researchQuery.error),
-    ),
+    scopePage('company', 'automation.groupCompany', companyTasks, companyQuery, companyForbidden),
+    scopePage('personal', 'automation.groupMine', personalTasks, personalQuery, personalForbidden),
+    scopePage('research_tracking', 'automation.groupResearch', researchTasks, researchQuery, researchForbidden),
   ];
 
   const visibleCount = companyTasks.length + personalTasks.length + researchTasks.length;
-  // Starters only when every group loaded and is empty. A 403 or a failed
-  // read keeps the three groups, each with its own refusal or error.
+  // DALTON-HOOK(company-automations): starters only when every group loaded empty on its real page.
+  // A 403, a failed read, or an offset past the last filled page keeps the three groups.
   const successfulEmpty =
-    companyQuery.isSuccess && personalQuery.isSuccess && researchQuery.isSuccess && visibleCount === 0;
+    companyQuery.isSuccess && personalQuery.isSuccess && researchQuery.isSuccess && visibleCount === 0 && !pastEnd;
   let body: React.ReactNode;
   if (view === 'feed') {
     if (error && automations.length === 0) {
@@ -556,7 +675,8 @@ export default function Automations() {
         </RememberedScroll>
       );
     }
-  } else if (!selectedId && !runId && !listsReady) {
+  } else if (!selectedId && !runId && !listsReady && !manageSettled.current) {
+    // DALTON-HOOK(company-automations): the first manage load uses a page skeleton. A later page of one group does not.
     body = (
       <div className="automations-scroll">
         <div className="automations-frame">
@@ -580,6 +700,7 @@ export default function Automations() {
       </div>
     );
   } else {
+    // DALTON-HOOK(company-automations): scope-paged manage receives the detail version and the company refusal callback.
     body = (
       <div className="automations-frame automations-frame-fill">
         <ManageView
@@ -592,6 +713,7 @@ export default function Automations() {
           form={formHost}
           onEdit={startEdit}
           onDelete={setDeleteTarget}
+          onRunsForbidden={onRunsForbidden}
         />
       </div>
     );

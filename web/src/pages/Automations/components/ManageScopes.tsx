@@ -97,9 +97,7 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
               <CompanyRows tasks={page.tasks.filter(isScriptTask)} selectedId={selectedId} onSelect={onSelect} />
             </>
           )}
-          {!page.isForbidden && !page.isLoading && page.total > MANAGE_PAGE_SIZE && (
-            <ScopePager page={page} />
-          )}
+          {(showFullPager(page) || showReturnPager(page)) && <ScopePager page={page} showCount={showFullPager(page)} />}
         </section>
       ))}
     </div>
@@ -166,7 +164,16 @@ function CompanyRows({
   );
 }
 
-function ScopePager({ page }: { page: ScopePage }) {
+function showFullPager(page: ScopePage): boolean {
+  return !page.isForbidden && !page.isLoading && !page.isError && page.total > MANAGE_PAGE_SIZE;
+}
+
+/** Previous stays available when a later page is loading or failed and its total is not known yet. */
+function showReturnPager(page: ScopePage): boolean {
+  return !page.isForbidden && page.offset > 0 && (page.isLoading || page.isError);
+}
+
+function ScopePager({ page, showCount }: { page: ScopePage; showCount: boolean }) {
   const { t } = useTranslation();
   const pages = Math.max(1, Math.ceil(page.total / MANAGE_PAGE_SIZE));
   const current = Math.floor(page.offset / MANAGE_PAGE_SIZE) + 1;
@@ -182,11 +189,13 @@ function ScopePager({ page }: { page: ScopePage }) {
       >
         {t('automation.prevPage')}
       </button>
-      <span className="automation-mono automations-scope-page">{t('automation.pageOf', { page: current, pages })}</span>
+      {showCount && (
+        <span className="automation-mono automations-scope-page">{t('automation.pageOf', { page: current, pages })}</span>
+      )}
       <button
         type="button"
         className="automation-link"
-        disabled={page.offset + MANAGE_PAGE_SIZE >= page.total}
+        disabled={!showCount || page.offset + MANAGE_PAGE_SIZE >= page.total}
         aria-label={`${t('automation.nextPage')} ${group}`}
         onClick={() => page.onOffset(page.offset + MANAGE_PAGE_SIZE)}
       >

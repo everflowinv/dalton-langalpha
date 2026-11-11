@@ -27,6 +27,7 @@ function holdHome(): () => Promise<void> {
   return () => act(async () => answer());
 }
 
+// DALTON-HOOK(company-automations): manage tests sign in as user-1 and read personal tasks through the same list mock.
 vi.mock('@/contexts/AuthContext', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/contexts/AuthContext')>();
   return { ...actual, useAuth: () => ({ userId: 'user-1', isLoggedIn: true, isInitialized: true }) };

@@ -47,6 +47,7 @@ export interface AutomationInlineFormProps {
   onDirtyChange?: (dirty: boolean) => void;
   loading: boolean;
   /** Shown above the fields. Does not replace what the reader typed. */
+  // DALTON-HOOK(company-automations): a company edit can show a conflict notice, a retry label, and no delivery fields.
   notice?: React.ReactNode;
   submitLabel?: string;
   submitDisabled?: boolean;

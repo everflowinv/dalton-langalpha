@@ -1,3 +1,4 @@
+// DALTON-HOOK(company-automations): manage shows three scope groups and one task, or the form that edits it.
 import React, { useLayoutEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence, motion } from '@/lib/framer';
@@ -18,6 +19,7 @@ import ScriptInspector from './ScriptInspector';
 import ScriptScheduleForm, { type ScriptScheduleFormProps } from './ScriptScheduleForm';
 import './ManageView.css';
 
+// DALTON-HOOK(company-automations): the form key is the task id, so a version refresh does not reset the draft.
 /** The open form: the props it mounts with, and the key that remounts it
  *  for another task or a fresh start. The key is the task id, not its version. */
 export type FormHost =
@@ -38,6 +40,7 @@ export type ManageSelection =
   | { kind: 'loading' }
   | { kind: 'none' };
 
+// DALTON-HOOK(company-automations): scope groups, the current detail version, and permission callbacks for the open task.
 interface ManageViewProps {
   pages: ScopePage[];
   readings: Map<string, WatchedReading>;
@@ -49,6 +52,8 @@ interface ManageViewProps {
   form: FormHost | null;
   onEdit: (task: ManageTask) => void;
   onDelete: (task: Automation) => void;
+  /** A company run list returned 403. The page drops that task's cached reads. */
+  onRunsForbidden: (automationId: string) => void;
 }
 
 /**
@@ -66,6 +71,7 @@ export default function ManageView({
   form,
   onEdit,
   onDelete,
+  onRunsForbidden,
 }: ManageViewProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -75,6 +81,7 @@ export default function ManageView({
   const company = shown ? isCompanyTask(shown) : false;
   const runId = selection.kind === 'chosen' ? selection.runId : null;
 
+  // DALTON-HOOK(company-automations): the open form stays mounted while another group's page is loading.
   const formPane = form && (
     <div className="automation-form-pane">
       <h2 className="title-font automation-form-title">
@@ -100,6 +107,7 @@ export default function ManageView({
         runId={runId}
         configVersion={writeVersion}
         onEdit={onEdit}
+        onRunsForbidden={onRunsForbidden}
       />
     ) : (
       <AutomationInspector
@@ -110,12 +118,14 @@ export default function ManageView({
         onOpenRun={(run) => onOpenRun(shown.automation_id, run)}
         onEdit={onEdit}
         onDelete={onDelete}
+        // DALTON-HOOK(company-automations): company agents can edit and pause. Run, delete, dismiss, and skip stay off.
         allowRun={!company}
         allowDelete={!company}
         allowDismiss={!company}
         allowSkip={!company}
         requireVersion={company}
         expectedConfigVersion={writeVersion}
+        onRunsForbidden={onRunsForbidden}
       />
     )
   ) : selection.kind === 'forbidden' ? (
@@ -155,6 +165,7 @@ export default function ManageView({
     />
   );
 
+  // DALTON-HOOK(company-automations): a phone opens the chosen task in a sheet. The stand-in stays on the list.
   if (isMobile) {
     const sheetOpen = !form && (selection.kind === 'chosen' || selection.kind === 'missing' || selection.kind === 'forbidden');
     return (
@@ -179,6 +190,7 @@ export default function ManageView({
         {list}
       </motion.div>
       <div ref={paneRef} className="automations-manage-pane automations-scroller" onScroll={revealPaneScroll}>
+        {/* DALTON-HOOK(company-automations): the form and the inspector crossfade, so the previous heading stays until its exit ends. */}
         <AnimatePresence initial={false} mode="popLayout">
           {formPane ? (
             <motion.div key="form" {...PANE_CROSSFADE}>

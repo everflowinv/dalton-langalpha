@@ -33,6 +33,7 @@ interface RunReportProps {
   links?: ErrorLinkSpec[];
 }
 
+// DALTON-HOOK(company-automations): skip is optional, so a company run report has no skip action.
 /** What one run left behind: the answer's start, the error, a note on why it
  *  waits or was skipped, and what can be done about it. */
 export function RunReport({ run, view, meta, layout, busy, onSkip, onOpenThread, onRetry, onResume, links = [] }: RunReportProps) {

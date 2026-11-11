@@ -41,6 +41,7 @@
   margin-bottom: 20px;
 }
 
+/* DALTON-HOOK(company-automations): each scope group pages on its own, under its heading. */
 .automations-scope-pager {
   display: flex;
   align-items: center;

@@ -10,6 +10,7 @@ import Automations from '../Automations';
 vi.mock('@/hooks/useHomeTimezone', () => ({ useHomeTimezone: () => 'America/New_York' }));
 vi.mock('@/hooks/useWorkspaces', () => ({ useWorkspaces: () => ({ data: { workspaces: [] } }) }));
 
+// DALTON-HOOK(company-automations): this page signs in as user-1 and reads personal tasks through the same list mock.
 vi.mock('@/contexts/AuthContext', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/contexts/AuthContext')>();
   return { ...actual, useAuth: () => ({ userId: 'user-1', isLoggedIn: true, isInitialized: true }) };

@@ -27,6 +27,7 @@ import {
 import { distanceLabel } from '../utils/price';
 import { scheduleSentence } from '../utils/schedule';
 import { attentionLinks, automationActions, automationStatusUi, describeRun } from '../utils/status';
+import { isForbiddenError } from '../utils/taskKind';
 import { formatDateTimeShort, formatDuration } from '../utils/time';
 import { PriceMeter } from './PriceMeter';
 import { RunReport } from './RunReport';
@@ -38,6 +39,7 @@ import './AutomationInspector.css';
 const INSTRUCTION_FOLD_CHARS = 480;
 const INSTRUCTION_FOLD_LINES = 10;
 
+// DALTON-HOOK(company-automations): company agents hide run, delete, dismiss, and skip, and pause with the detail version.
 interface AutomationInspectorProps {
   automation: Automation;
   reading: WatchedReading | undefined;
@@ -54,6 +56,8 @@ interface AutomationInspectorProps {
   /** When set, pause and resume send this `config_version` and stay off until it is known. */
   requireVersion?: boolean;
   expectedConfigVersion?: number | null;
+  /** Company run list returned 403. Personal inspectors leave this unset. */
+  onRunsForbidden?: (automationId: string) => void;
 }
 
 /**
@@ -74,6 +78,7 @@ export default function AutomationInspector({
   allowSkip = true,
   requireVersion = false,
   expectedConfigVersion = null,
+  onRunsForbidden,
 }: AutomationInspectorProps) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -82,7 +87,8 @@ export default function AutomationInspector({
   const openThread = useOpenThread();
   const { pause, resume, trigger, skip, dismiss, busy } = useAutomationMutations();
   const deliveryMethods = a.delivery_config?.methods ?? [];
-  const { executions, loading } = useExecutions(a.automation_id, deliveryMethods.length > 0);
+  const { executions, loading, error: runsError } = useExecutions(a.automation_id, deliveryMethods.length > 0);
+  const runsForbidden = requireVersion && isForbiddenError(runsError);
   const place = useAutomationPlace();
   const workspaceId = a.workspace_id;
   const workspaceName = workspaceNameOf(useWorkspaceOptions(), workspaceId);
@@ -97,6 +103,7 @@ export default function AutomationInspector({
     [delivery.options, a.last_execution, executions],
   );
 
+  // DALTON-HOOK(company-automations): a company pause sends the open detail's config_version and stays off until it is known.
   const ui = automationStatusUi(a);
   const { canPause, canResume, canRun, runBusy, canDismiss } = automationActions(a);
   const versionReady = !requireVersion || expectedConfigVersion != null;
@@ -126,6 +133,17 @@ export default function AutomationInspector({
     openedOnMount.current = runId;
     reportRef.current?.scrollIntoView?.({ block: 'nearest', behavior: scrollMotion() });
   }, [runId]);
+  useEffect(() => {
+    if (runsForbidden) onRunsForbidden?.(a.automation_id);
+  }, [runsForbidden, onRunsForbidden, a.automation_id]);
+
+  if (runsForbidden) {
+    return (
+      <article className="automation-inspector">
+        <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
+      </article>
+    );
+  }
 
   const kicker = [t(ui.labelKey), place.label(a, workspaceName)];
 
@@ -146,6 +164,7 @@ export default function AutomationInspector({
         </div>
       )}
 
+      {/* DALTON-HOOK(company-automations): run now, dismiss, and delete render only for a personal or research task. */}
       <div className="automation-inspector-actions">
         {allowRun && (
           <HeaderButton
@@ -181,6 +200,7 @@ export default function AutomationInspector({
             {t('automation.dismiss')}
           </HeaderButton>
         )}
+        {/* DALTON-HOOK(company-automations): company tasks keep pause, resume, and edit, and hide run, delete, dismiss, and skip. */}
         <HeaderButton variant="secondary" icon={Pencil} disabled={!versionReady} onClick={() => onEdit(a)}>
           {t('automation.edit')}
         </HeaderButton>
@@ -283,6 +303,7 @@ function Instruction({ text }: { text: string }) {
   );
 }
 
+// DALTON-HOOK(company-automations): skip is omitted when the open task is a company agent.
 function RunCard({
   execution: e,
   links,

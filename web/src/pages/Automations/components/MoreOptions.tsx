@@ -229,6 +229,7 @@ export default function MoreOptions({
           />
         </FormRow>
 
+        {/* DALTON-HOOK(company-automations): company edits do not offer personal delivery. */}
         {!omitDelivery && <FormRow label={t('automation.delivery')} labelId={ids.delivery}>
           {picker ? (
             <DeliveryPicker
@@ -271,6 +272,7 @@ export default function MoreOptions({
               <DeliveryProblems problems={deliveryProblems} nameOf={entryName} />
             </>
           )}
+        {/* DALTON-HOOK(company-automations): company edits stop before this delivery choice. */}
         </FormRow>}
 
         {form.trigger_type === 'price' && (

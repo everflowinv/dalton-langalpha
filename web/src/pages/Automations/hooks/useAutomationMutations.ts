@@ -1,3 +1,4 @@
+// DALTON-HOOK(company-automations): company writes send the detail config_version and refresh only that company access on 403.
 import { useIsMutating, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
@@ -76,6 +77,7 @@ export function useAutomationMutations() {
         return queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
       }
       toast({ variant: 'destructive', description: mutationErrorMessage(err, t('automation.actionFailed')) });
+      // DALTON-HOOK(company-automations): a company 403 re-reads that company list and that task. A 409 re-reads the family.
       const companyId = apiErrorStatus(err) === 403 ? companyWriteId(variables) : null;
       if (companyId) return refreshCompanyAccess(queryClient, companyId);
     },
@@ -101,6 +103,7 @@ export function useAutomationMutations() {
       (await automationApi.updateCompanyScript(id, data)).data,
   });
   const remove = useMutation({ ...shared, mutationFn: (id: string) => automationApi.deleteAutomation(id) });
+  // DALTON-HOOK(company-automations): company pause and resume send the detail version. Personal calls stay one argument.
   const pause = useMutation({
     ...shared,
     mutationFn: (target: AutomationWriteTarget) => {
@@ -147,6 +150,7 @@ export function useAutomationMutations() {
       automationApi.dismissRun(automationId, executionId),
   });
 
+  // DALTON-HOOK(company-automations): every company and personal write shares this pending flag.
   const busy = useIsMutating({ mutationKey: WRITE_KEY }) > 0;
   return { create, update, updateScript, remove, pause, resume, trigger, skip, dismiss, busy };
 }

@@ -1,7 +1,8 @@
 // DALTON-HOOK(company-automations): manage groups, company writes, and deep links.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import i18n from '@/i18n';
+import { queryKeys } from '@/lib/queryKeys';
 import { renderWithProviders } from '@/test/utils';
 import type { AgentAutomationRead, AutomationRun, ScriptAutomationRead, ScriptExecutionRead } from '@/types/automation';
 import * as api from '../utils/api';
@@ -195,7 +196,7 @@ describe('three manage groups', () => {
     expect((await screen.findAllByText('company 50')).length).toBeGreaterThan(0);
     fireEvent.click(companyNext());
     expect((await screen.findAllByText('company 100')).length).toBeGreaterThan(0);
-    expect(screen.queryAllByText('company 0')).toHaveLength(0);
+    await waitFor(() => expect(screen.queryAllByText('company 0')).toHaveLength(0));
     expect(screen.getAllByText('personal 0').length).toBeGreaterThan(0);
     expect(companyNext()).toBeDisabled();
     expect(api.listAutomationReads).toHaveBeenCalledWith({ scope: 'company', limit: 50, offset: 100 });
@@ -575,6 +576,228 @@ describe('a company script save', () => {
     expect(await screen.findByText(label('automation.companyUnavailable'))).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+  });
+});
+
+describe('cached reads and independent pages', () => {
+  async function pastPaneExit() {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+  }
+
+  it('clears a cached company script when its run list is forbidden', async () => {
+    let rejectRuns!: (error: Error) => void;
+    const task = script({ automation_id: 'data:prices', name: 'Close prices' });
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      return { data: { automations: [task], total: 1 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockResolvedValue({ data: task } as never);
+    vi.mocked(api.listAutomationExecutionReads).mockImplementation(
+      () => new Promise((_resolve, reject) => {
+        rejectRuns = reject;
+      }),
+    );
+    renderAt('/automations?view=manage&id=data%3Aprices');
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    await act(async () => {
+      rejectRuns(httpError(403, 'restricted'));
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { level: 2, name: 'Close prices' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Close prices/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    expect(screen.queryByText('restricted')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation.groupResearch') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+  });
+
+  it('keeps a company script when its run list fails', async () => {
+    const task = script({ automation_id: 'data:prices', name: 'Close prices' });
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      return { data: { automations: [task], total: 1 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockResolvedValue({ data: task } as never);
+    vi.mocked(api.listAutomationExecutionReads).mockRejectedValue(httpError(503, 'unavailable'));
+    renderAt('/automations?view=manage&id=data%3Aprices');
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    expect(screen.getByRole('heading', { level: 2, name: 'Close prices' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Close prices/ })).toBeInTheDocument();
+  });
+
+  it('clears a cached company agent when its run list is forbidden', async () => {
+    let revoked = false;
+    const task = agent({ automation_id: 'co-agent', name: 'Desk brief', scope: 'company', config_version: 4 });
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      return { data: { automations: [task], total: 1 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockResolvedValue({ data: task } as never);
+    vi.mocked(api.listExecutions).mockImplementation(async () => {
+      if (revoked) throw httpError(403, 'restricted');
+      return { data: { executions: [], has_more: false } } as never;
+    });
+    const { queryClient } = renderAt('/automations?view=manage&id=co-agent');
+    await waitFor(() => expect(inspector('Desk brief').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    await act(async () => {
+      revoked = true;
+      await queryClient.invalidateQueries({ queryKey: queryKeys.automations.executions(task.automation_id) });
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { level: 2, name: 'Desk brief' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Desk brief/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
+  });
+
+  it('keeps a company draft while a different group changes pages', async () => {
+    const task = script({ automation_id: 'data:prices', name: 'Close prices' });
+    let finishPage!: (value: never) => void;
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope === 'company') return { data: { automations: [task], total: 1 } } as never;
+      if (params?.scope === 'research_tracking') {
+        if (params.offset === 50) return new Promise<never>((resolve) => {
+          finishPage = resolve;
+        });
+        return { data: { automations: [agent({ automation_id: 'research-0', name: 'Research first', scope: 'research_tracking' })], total: 51 } } as never;
+      }
+      return emptyPage();
+    });
+    vi.mocked(api.getAutomationRead).mockResolvedValue({ data: task } as never);
+    renderAt('/automations?view=manage');
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
+    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    fireEvent.click(screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` }));
+    await waitFor(() => expect(finishPage).toBeDefined());
+    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    await act(async () => {
+      finishPage({ data: { automations: [agent({ automation_id: 'research-50', name: 'Research second', scope: 'research_tracking' })], total: 51 } } as never);
+    });
+    expect(await screen.findByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(screen.getByRole('button', { name: /Research second/ })).toBeInTheDocument();
+  });
+
+  it('asks before paging away from the open company draft', async () => {
+    const task = script({ automation_id: 'data:prices', name: 'Close prices' });
+    const second = script({ automation_id: 'data:next', name: 'Second company' });
+    let pageTwo = false;
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      if (params.offset === 50) {
+        pageTwo = true;
+        return { data: { automations: [second], total: 51 } } as never;
+      }
+      return { data: { automations: [task], total: 51 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockImplementation(async (id) => ({ data: id === second.automation_id ? second : task }) as never);
+    renderAt('/automations?view=manage');
+    const nextName = `${label('automation.nextPage')} ${label('automation.groupCompany')}`;
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
+    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    fireEvent.click(screen.getByRole('button', { name: nextName }));
+    const dialog = await screen.findByRole('dialog');
+    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(pageTwo).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: label('common.cancel') }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(pageTwo).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: nextName }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.discardDraft') }));
+    expect(await screen.findByRole('button', { name: /Second company/ })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByDisplayValue('7 7 * * 7')).not.toBeInTheDocument());
+  });
+
+  it('returns to an existing page when the final page becomes empty', async () => {
+    let reduced = false;
+    const remaining = agent({ automation_id: 'personal-0', name: 'Remaining personal', scope: 'personal' });
+    const last = agent({ automation_id: 'personal-50', name: 'Last personal', scope: 'personal' });
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'personal') return emptyPage();
+      return { data: { automations: params.offset === 50 ? (reduced ? [] : [last]) : [remaining], total: reduced ? 50 : 51 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockImplementation(async (id) => ({ data: id === last.automation_id ? last : remaining }) as never);
+    const { queryClient } = renderAt('/automations?view=manage');
+    fireEvent.click(await screen.findByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupMine')}` }));
+    await screen.findByRole('button', { name: /Last personal/ });
+    await act(async () => {
+      reduced = true;
+      await queryClient.invalidateQueries();
+    });
+    expect(await screen.findByRole('button', { name: /Remaining personal/ })).toBeInTheDocument();
+    expect(screen.queryByText(label('automation.startFrom'))).not.toBeInTheDocument();
+  });
+
+  it('keeps an off-page draft when a detail refetch fails', async () => {
+    let failed = false;
+    const task = script({ automation_id: 'data:offpage', name: 'Off page script' });
+    vi.mocked(api.getAutomationRead).mockImplementation(async () => {
+      if (failed) throw httpError(503, 'unavailable');
+      return { data: task } as never;
+    });
+    const { queryClient } = renderAt('/automations?view=manage&id=data%3Aoffpage');
+    await waitFor(() => expect(inspector('Off page script').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    fireEvent.click(inspector('Off page script').getByRole('button', { name: label('automation.edit') }));
+    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    await act(async () => {
+      failed = true;
+      await queryClient.invalidateQueries();
+    });
+    await pastPaneExit();
+    expect(screen.getByDisplayValue('7 7 * * 7')).toBeInTheDocument();
+    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+  });
+
+  it('keeps the draft when a conflict refetch fails and leaves retry off', async () => {
+    const current = script({ automation_id: 'data:prices', name: 'Close prices', config_version: 3 });
+    const draft = '7 7 * * 7';
+    let detailFails = false;
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'company') return emptyPage();
+      return { data: { automations: [current], total: 1 } } as never;
+    });
+    vi.mocked(api.getAutomationRead).mockImplementation(async () => {
+      if (detailFails) throw httpError(503, 'unavailable');
+      return { data: current } as never;
+    });
+    vi.mocked(api.updateCompanyScript).mockImplementation(async () => {
+      detailFails = true;
+      throw httpError(409, 'Someone else saved this task.');
+    });
+    renderAt('/automations?view=manage');
+    await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
+    fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
+    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: draft } });
+    fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
+    await waitFor(() => expect(vi.mocked(api.getAutomationRead).mock.calls.length).toBeGreaterThan(1));
+    await pastPaneExit();
+    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue(draft);
+    expect(screen.getByRole('button', { name: label('automation.retryWithCurrent') })).toBeDisabled();
+    expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
+  });
+
+  it('keeps previous-page navigation after the next page fails', async () => {
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
+      if (params?.scope !== 'research_tracking') return emptyPage();
+      if (params.offset === 50) throw httpError(503, 'unavailable');
+      return { data: { automations: [agent({ automation_id: 'research-first', name: 'Research first', scope: 'research_tracking' })], total: 76 } } as never;
+    });
+    renderAt('/automations?view=manage');
+    const research = () => screen.getByRole('region', { name: label('automation.groupResearch') });
+    fireEvent.click(await screen.findByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` }));
+    await waitFor(() => expect(within(research()).getByText(label('automation.scopeLoadFailed'))).toBeInTheDocument());
+    expect(within(research()).getByRole('button', { name: `${label('automation.prevPage')} ${label('automation.groupResearch')}` })).toBeEnabled();
+    expect(within(research()).getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` })).toBeDisabled();
+    expect(within(research()).queryByText(/Page /)).not.toBeInTheDocument();
+    fireEvent.click(within(research()).getByRole('button', { name: `${label('automation.prevPage')} ${label('automation.groupResearch')}` }));
+    expect(await within(research()).findByRole('button', { name: /Research first/ })).toBeInTheDocument();
   });
 });
 
