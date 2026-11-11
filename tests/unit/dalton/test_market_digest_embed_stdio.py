@@ -38,6 +38,16 @@ class HttpOptions:
     def __init__(self, timeout, retry_options):
         self.timeout = timeout
         self.retry_options = retry_options
+
+
+class Part:
+    def __init__(self, text):
+        self.text = text
+
+
+class Content:
+    def __init__(self, parts):
+        self.parts = list(parts)
 """
 
 _FAKE_GENAI = """
@@ -76,22 +86,51 @@ class _Emb:
         self.values = values
 
 
+def _described_contents(contents):
+    described = []
+    for item in list(contents):
+        parts = getattr(item, "parts", None)
+        if parts is None and isinstance(item, str):
+            described.append({"kind": "str", "parts": [item]})
+            continue
+        described.append({
+            "kind": type(item).__name__,
+            "parts": [getattr(part, "text", None) for part in (parts or [])],
+        })
+    return described
+
+
+def _separate_texts(contents):
+    texts = []
+    for item in list(contents):
+        parts = getattr(item, "parts", None)
+        if type(item).__name__ != "Content" or not isinstance(parts, list) or len(parts) != 1:
+            return None
+        text = getattr(parts[0], "text", None)
+        if not isinstance(text, str):
+            return None
+        texts.append(text)
+    return texts
+
+
 class _Models:
     def embed_content(self, *, model, contents, config):
         payload = _load()
+        described = _described_contents(contents)
         payload.setdefault("calls", []).append({
             "model": model,
-            "contents": list(contents),
+            "contents": described,
             "config": config,
         })
         _store(payload)
         mode = os.environ.get("EMBED_MODE", "")
+        separate = _separate_texts(contents)
         if mode == "nan":
             embeddings = [_Emb([float("nan")])]
-        elif mode == "short":
-            embeddings = []
+        elif mode == "short" or mode == "mismatch" or separate is None:
+            embeddings = [] if mode == "short" else [_Emb([1.0, 1.0])]
         else:
-            embeddings = [_Emb([1.0, float(len(text))]) for text in contents]
+            embeddings = [_Emb([1.0, float(len(text))]) for text in separate]
         return type("Response", (), {"embeddings": embeddings})()
 
 
@@ -491,7 +530,7 @@ def test_embed_child_uses_one_sdk_attempt(
     env = _child_env(fake, capture, GEMINI_API_KEY="test-gemini-key")
     assert "SECRET_PARENT" not in env
     payload = json.dumps(
-        {"texts": ["甲", "乙"], "model": "gemini-embedding-001"},
+        {"texts": ["甲", "乙乙"], "model": "gemini-embedding-001"},
         ensure_ascii=False,
     ).encode("utf-8")
     completed = _embed(payload, env)
@@ -500,7 +539,7 @@ def test_embed_child_uses_one_sdk_attempt(
     assert b"test-gemini-key" not in completed.stdout
     assert b"inherited-process-key" not in completed.stdout
     body = json.loads(completed.stdout.decode("utf-8"))
-    assert body == {"ok": True, "embeddings": [[1.0, 1.0], [1.0, 1.0]]}
+    assert body == {"ok": True, "embeddings": [[1.0, 1.0], [1.0, 2.0]]}
     recorded = json.loads(capture.read_text(encoding="utf-8"))
     assert recorded["api_key"] == "test-gemini-key"
     assert recorded["timeout"] == 60000
@@ -509,7 +548,10 @@ def test_embed_child_uses_one_sdk_attempt(
     assert recorded["calls"] == [
         {
             "model": "gemini-embedding-001",
-            "contents": ["甲", "乙"],
+            "contents": [
+                {"kind": "Content", "parts": ["甲"]},
+                {"kind": "Content", "parts": ["乙乙"]},
+            ],
             "config": {"task_type": "RETRIEVAL_DOCUMENT"},
         }
     ]
@@ -558,3 +600,21 @@ def test_embed_child_hides_nonfinite_and_short_vectors(tmp_path: Path) -> None:
         assert b"nan" not in completed.stdout.lower()
         recorded = json.loads(capture.read_text(encoding="utf-8"))
         assert len(recorded["calls"]) == 1
+    two = json.dumps(
+        {"texts": ["alpha", "beta"], "model": "gemini-embedding-001"},
+    ).encode("utf-8")
+    capture.unlink(missing_ok=True)
+    mismatched = _embed(
+        two,
+        _child_env(fake, capture, GEMINI_API_KEY="test-gemini-key", EMBED_MODE="mismatch"),
+    )
+    assert mismatched.returncode != 0
+    assert mismatched.stderr == b""
+    assert _code(mismatched) == "embed_failed"
+    assert b"alpha" not in mismatched.stdout
+    assert b"beta" not in mismatched.stdout
+    recorded = json.loads(capture.read_text(encoding="utf-8"))
+    assert recorded["calls"][0]["contents"] == [
+        {"kind": "Content", "parts": ["alpha"]},
+        {"kind": "Content", "parts": ["beta"]},
+    ]

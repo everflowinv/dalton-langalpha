@@ -85,9 +85,13 @@ def _embed(texts: list[str], model: str, api_key: str) -> list[list[float]]:
             retry_options=types.HttpRetryOptions(attempts=1),
         ),
     )
+    # Each Content produces one vector in input order.
     response = client.models.embed_content(
         model=model,
-        contents=texts,
+        contents=[
+            types.Content(parts=[types.Part(text=text)])
+            for text in texts
+        ],
         config={"task_type": "RETRIEVAL_DOCUMENT"},
     )
     embeddings = getattr(response, "embeddings", None)
