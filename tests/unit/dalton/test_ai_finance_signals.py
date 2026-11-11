@@ -1877,3 +1877,305 @@ async def test_route_timeout_and_cancel_stop_one_child(
             except subprocess.TimeoutExpired:
                 owned.kill()
                 owned.wait(timeout=2)
+
+
+_LEGAL_EMBEDDING_ERRORS = (
+    "github:acme/token-agent:2026-11-11: RuntimeError",
+    "github:acme/api-key:2026-11-11: HTTPError",
+    "github:acme/secret-scan:2026-11-11: URLError",
+    "earnings:key-risk: TimeoutError",
+    "earnings:token-note: JSONDecodeError",
+)
+_SECRET_EMBEDDING_ERROR = (
+    "github:acme/token-agent:2026-11-11: RuntimeError GEMINI_API_KEY=sk-live-secret-value"
+)
+
+
+def _ingest_tool_payload(errors: list[str]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "action": "ingest",
+        "code": "ok",
+        "batch_id": DATE,
+        "profile": signal_tools.PROFILE,
+        "bundle_hash": "a" * 64,
+        "manifest_sha256": "b" * 64,
+        "status": "ingested",
+        "embedding_model": "gemini-embedding-2",
+        "embedding_dim": 768,
+        "reused": False,
+        "inserted": 1,
+        "updated": 0,
+        "embedding_errors": errors,
+        "signals": 1,
+        "embedded_signals": 0,
+        "embedding_status": "none",
+        "embedding_coverage_pct": 0.0,
+        "configured_embedding_model": "gemini-embedding-2",
+        "configured_embedding_dim": 768,
+    }
+
+
+def _prepare_open_bundle(root: Path, command: Any) -> None:
+    _write_prepared(root, DATE, OWNER)
+    python = Path(sys.executable)
+    decisions, dispositions, records = _bundle()
+    saved = _run(root, signals.parse_signal_request(_body(
+        "save",
+        github_decisions=decisions,
+        earnings_dispositions=dispositions,
+        signal_records=records,
+    )), python=python)
+    assert saved["ok"] is True
+    compared = _run(
+        root,
+        signals.parse_signal_request(_body("compare")),
+        python=python,
+        env=_env(root),
+        command=command,
+    )
+    assert compared["ok"] is True
+
+
+def test_public_ingest_keeps_legal_embedding_identifiers(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+
+    def command(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        action = argv[4]
+        if action == "compare":
+            _compare_bytes_of(argv, "token-agent")
+            return _child()
+        if action == "ingest":
+            return _child(stdout=json.dumps({
+                "inserted": 2,
+                "updated": 0,
+                "embedding_errors": list(_LEGAL_EMBEDDING_ERRORS),
+            }))
+        if action == "stats":
+            return _child(stdout=_stats_stdout())
+        return _child(returncode=1)
+
+    _prepare_open_bundle(root, command)
+    ingested = _run(
+        root,
+        signals.parse_signal_request(_body("ingest")),
+        python=Path(sys.executable),
+        env=_env(root),
+        command=command,
+    )
+    assert ingested["ok"] is True
+    assert ingested["embedding_errors"] == list(_LEGAL_EMBEDDING_ERRORS)
+    assert "token-agent" in ingested["embedding_errors"][0]
+    assert "api-key" in ingested["embedding_errors"][1]
+    assert "secret-scan" in ingested["embedding_errors"][2]
+    parsed = {"action": "ingest", "batch_id": DATE}
+    accepted = signal_tools._accept_success(
+        _ingest_tool_payload(list(_LEGAL_EMBEDDING_ERRORS)),
+        parsed,
+    )
+    assert accepted is not None
+    assert accepted["embedding_errors"] == list(_LEGAL_EMBEDDING_ERRORS)
+
+    secret_root = tmp_path / "secret-state"
+    marker = "sk-live-secret-value"
+
+    def reject(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        action = argv[4]
+        if action == "compare":
+            _compare_bytes_of(argv, "secret")
+            return _child()
+        if action == "ingest":
+            return _child(stdout=json.dumps({
+                "inserted": 0,
+                "updated": 2,
+                "embedding_errors": [_SECRET_EMBEDDING_ERROR],
+            }))
+        return _child(returncode=1)
+
+    _prepare_open_bundle(secret_root, reject)
+    rejected = _run(
+        secret_root,
+        signals.parse_signal_request(_body("ingest")),
+        python=Path(sys.executable),
+        env=_env(secret_root),
+        command=reject,
+    )
+    assert rejected["code"] == "signal_failed"
+    rendered = json.dumps(rejected)
+    assert marker not in rendered
+    assert "GEMINI_API_KEY" not in rendered
+    generation = _generation(secret_root, DATE)
+    assert not (generation / "outcome.json").exists()
+    malformed = (
+        _SECRET_EMBEDDING_ERROR,
+        "/Users/everflow/.ssh/id_secret: RuntimeError",
+        "github:acme/token-agent:2026-11-11: token sk-live-secret-value",
+        "earnings:../../secret: RuntimeError",
+        "github:acme/token-agent:2026-13-40: RuntimeError",
+    )
+    for item in malformed:
+        assert signal_tools._accept_success(_ingest_tool_payload([item]), parsed) is None
+        assert signals._safe_embedding_error(item) is False
+
+
+def _compare_over_two_mib() -> bytes:
+    body = {
+        "search_modes": ["fts"],
+        "history_signals_before_ingest": 80,
+        "history_embedded_signals_before_ingest": 0,
+        "history_embedding_status_before_ingest": "none",
+        "comparisons": [
+            {
+                "current": {"record_key": f"earnings:current-{index}", "evidence": "current"},
+                "matches": [
+                    {
+                        "record_key": f"earnings:history-{hit}",
+                        "summary": "historical",
+                        "evidence": "中" + "e" * 3999,
+                    }
+                    for hit in range(8)
+                ],
+            }
+            for index in range(80)
+        ],
+    }
+    return (json.dumps(body, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def test_compare_above_two_mib_is_readable_and_reused(tmp_path: Path) -> None:
+    raw = _compare_over_two_mib()
+    assert len(raw) > 2 * 1024 * 1024
+    assert len(raw) <= signals._COMPARE_FILE_MAX
+    root = tmp_path / "state"
+    calls: list[str] = []
+
+    def command(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        action = argv[4]
+        calls.append(action)
+        if action == "compare":
+            Path(argv[argv.index("--output") + 1]).write_bytes(raw)
+            return _child()
+        return _child(returncode=1)
+
+    _prepare_open_bundle(root, command)
+    generation = _generation(root, DATE)
+    stored = (generation / "compare_result.json").read_bytes()
+    assert stored == raw
+    assert calls == ["compare"]
+    calls.clear()
+    compared = _run(
+        root,
+        signals.parse_signal_request(_body("compare")),
+        python=Path(sys.executable),
+        env=_env(root),
+        command=command,
+    )
+    assert calls == []
+    assert compared["ok"] is True
+    assert compared["reused"] is True
+    assert compared["content_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert compared["total_chars"] == len(raw.decode("utf-8"))
+
+    page = _run(
+        root,
+        signals.parse_signal_request(_body("read", offset=0, max_chars=16000)),
+        python=Path(sys.executable),
+    )
+    assert page["ok"] is True
+    assert page["next_offset"] is not None
+    assert page["complete"] is False
+    assert page["content_sha256"] == compared["content_sha256"]
+    assert page["total_chars"] == compared["total_chars"]
+    assert page["text"] == raw.decode("utf-8")[: len(page["text"])]
+    assert len(json.dumps(page, ensure_ascii=False).encode()) <= signals.MAX_RESPONSE_BYTES
+    assert signals.MAX_RESPONSE_BYTES == 128 * 1024
+    assert signal_tools._MAX_HOST_RESPONSE_BYTES == 128 * 1024
+    follow = _run(
+        root,
+        signals.parse_signal_request(_body("read", offset=page["next_offset"], max_chars=16000)),
+        python=Path(sys.executable),
+    )
+    assert follow["ok"] is True
+    assert follow["offset"] == page["next_offset"]
+    assert follow["text"]
+    assert follow["content_sha256"] == page["content_sha256"]
+    assert (generation / "compare_result.json").read_bytes() == raw
+
+
+def test_compare_refuses_file_over_the_stored_cap(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+
+    def command(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        if argv[4] != "compare":
+            return _child(returncode=1)
+        path = Path(argv[argv.index("--output") + 1])
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.ftruncate(fd, signals._COMPARE_FILE_MAX + 1)
+        finally:
+            os.close(fd)
+        return _child()
+
+    _write_prepared(root, DATE, OWNER)
+    python = Path(sys.executable)
+    decisions, dispositions, records = _bundle()
+    saved = _run(root, signals.parse_signal_request(_body(
+        "save",
+        github_decisions=decisions,
+        earnings_dispositions=dispositions,
+        signal_records=records,
+    )), python=python)
+    assert saved["ok"] is True
+    refused = _run(
+        root,
+        signals.parse_signal_request(_body("compare")),
+        python=python,
+        env=_env(root),
+        command=command,
+    )
+    assert refused["code"] == "signal_failed"
+    generation = _generation(root, DATE)
+    assert not (generation / "compare_result.json").exists()
+    assert list(generation.glob(".compare-out-*")) == []
+    assert _commit(root, DATE)["status"] == "open"
+    assert _commit(root, DATE)["compare_sha256"] is None

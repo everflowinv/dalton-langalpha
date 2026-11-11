@@ -60,7 +60,27 @@ _MAX_DEPTH = 8
 _SOURCE_MAX_BYTES = 32 * 1024 * 1024
 _STDOUT_LIMIT = 256 * 1024
 _STDERR_LIMIT = 64 * 1024
-_COMPARE_FILE_MAX = 2 * 1024 * 1024
+# CLI compare output is indent-2 UTF-8 JSON: one current record plus up to
+# COMPARE_LIMIT historical hits, for at most _MAX_RECORDS currents. Each side
+# repeats the long text fields at _MAX_STRING characters, and non-ASCII text
+# is up to 4 bytes per character. HTTP pages stay at MAX_RESPONSE_BYTES.
+_COMPARE_TEXT_FIELDS = 9
+_COMPARE_UTF8_BYTES_PER_CHAR = 4
+_COMPARE_RECORD_BYTES = (
+    _COMPARE_TEXT_FIELDS * _MAX_STRING * _COMPARE_UTF8_BYTES_PER_CHAR
+    + 8192
+)
+_COMPARE_FILE_MAX = (
+    _MAX_RECORDS * (1 + COMPARE_LIMIT) * _COMPARE_RECORD_BYTES
+    + 65_536
+)
+_EMBEDDING_EXCEPTIONS = frozenset({
+    "RuntimeError",
+    "HTTPError",
+    "URLError",
+    "TimeoutError",
+    "JSONDecodeError",
+})
 _ACTIONS = frozenset({"save", "compare", "ingest", "stats", "read"})
 _COMMON_KEYS = frozenset({
     "action",
@@ -1380,16 +1400,42 @@ def _count_map(value: object) -> dict[str, int] | None:
     return cleaned
 
 
-def _safe_embedding_error(value: object) -> bool:
-    if not isinstance(value, str) or len(value) > 200 or "\n" in value or "\\" in value:
+def _embedding_record_key(record: str) -> bool:
+    """Business id the signal CLI prefixes onto an exception class.
+
+    GitHub keys are ``github:{owner}/{repo}:{YYYY-MM-DD}``. Earnings keys are
+    ``earnings:{external_id}``. Repo names may contain token, key, or secret.
+    """
+    if len(record) > 4000 or "\x00" in record or "\\" in record or "\n" in record or "\r" in record:
         return False
-    folded = value.lower()
-    if "key" in folded or "secret" in folded or "token" in folded or "gemini_api" in folded:
+    if record.startswith("github:"):
+        owner_repo, separator, day = record[len("github:"):].rpartition(":")
+        return (
+            separator == ":"
+            and _REPO.fullmatch(owner_repo) is not None
+            and _iso_date(day) is not None
+        )
+    if record.startswith("earnings:"):
+        external_id = record[len("earnings:"):]
+        return (
+            bool(external_id)
+            and external_id == external_id.strip()
+            and len(external_id) <= 128
+            and ".." not in external_id
+            and "/" not in external_id
+            and "\\" not in external_id
+        )
+    return False
+
+
+def _safe_embedding_error(value: object) -> bool:
+    """Accept only ``{record_key}: {ExceptionClass}`` from the signal CLI."""
+    if not isinstance(value, str) or "\n" in value or "\r" in value or "\\" in value or "\x00" in value:
         return False
     record, separator, kind = value.rpartition(": ")
-    if not separator or not record or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", kind):
+    if separator != ": " or kind not in _EMBEDDING_EXCEPTIONS:
         return False
-    return ".." not in record
+    return _embedding_record_key(record)
 
 
 def _save_summary(

@@ -45,6 +45,14 @@ _HTTP_TIMEOUT_COMPARE_S = 960.0
 _MAX_HOST_RESPONSE_BYTES = 128 * 1024
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_REPO = re.compile(r"^[\w.-]+/[\w.-]+$")
+_EMBEDDING_EXCEPTIONS = frozenset({
+    "RuntimeError",
+    "HTTPError",
+    "URLError",
+    "TimeoutError",
+    "JSONDecodeError",
+})
 _BUNDLE_STATUS = frozenset({"open", "ingesting", "ingested"})
 _SEARCH_MODES = frozenset({"empty_history", "embedding", "fts", "none"})
 _HISTORY_STATUS = frozenset({"empty", "complete", "partial", "none"})
@@ -535,16 +543,38 @@ def _count_map(value: object) -> dict[str, int] | None:
     return cleaned
 
 
-def _safe_embedding_error(value: object) -> bool:
-    if not isinstance(value, str) or len(value) > 200 or "\n" in value or "\\" in value:
+def _embedding_record_key(record: str) -> bool:
+    """Same business ids as the signal host. Words inside a repo name stay."""
+    if len(record) > 4000 or "\x00" in record or "\\" in record or "\n" in record or "\r" in record:
         return False
-    folded = value.lower()
-    if any(needle in folded for needle in ("key", "secret", "token", "gemini_api")):
+    if record.startswith("github:"):
+        owner_repo, separator, day = record[len("github:"):].rpartition(":")
+        return (
+            separator == ":"
+            and _REPO.fullmatch(owner_repo) is not None
+            and _iso_date(day) is not None
+        )
+    if record.startswith("earnings:"):
+        external_id = record[len("earnings:"):]
+        return (
+            bool(external_id)
+            and external_id == external_id.strip()
+            and len(external_id) <= 128
+            and ".." not in external_id
+            and "/" not in external_id
+            and "\\" not in external_id
+        )
+    return False
+
+
+def _safe_embedding_error(value: object) -> bool:
+    """Accept only ``{record_key}: {ExceptionClass}`` from the signal CLI."""
+    if not isinstance(value, str) or "\n" in value or "\r" in value or "\\" in value or "\x00" in value:
         return False
     record, separator, kind = value.rpartition(": ")
-    if not separator or not record or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", kind):
+    if separator != ": " or kind not in _EMBEDDING_EXCEPTIONS:
         return False
-    return ".." not in record
+    return _embedding_record_key(record)
 
 
 def _host_failure(payload: Mapping[str, Any] | None) -> str:
