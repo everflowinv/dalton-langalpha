@@ -325,7 +325,7 @@ def unwrap_research_envelope(operation: str, envelope: Mapping[str, Any]) -> dic
     if not isinstance(business, dict) or business.get("ok") is not True:
         raise AeCallError("research_failed")
     data = business.get("data")
-    if not isinstance(data, dict) or data.get("isError") is not False:
+    if not isinstance(data, dict) or data.get("isError", False) is not False:
         raise AeCallError("research_failed")
     structured = data.get("structuredContent")
     if not isinstance(structured, dict):

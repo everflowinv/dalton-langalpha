@@ -90,6 +90,21 @@ def test_prepare_request_canonicalizes_and_rejects_unknown_fields() -> None:
     assert SECRET not in json.dumps(rejected)
 
 
+@pytest.mark.parametrize("operation", ["auth_status", "search_library", "get_document"])
+@pytest.mark.parametrize("error_flag", [None, False, True, "false"])
+def test_optional_inner_error_flag(operation: str, error_flag: object) -> None:
+    structured = {"authenticated": True, "status": "ready", "text": "page"}
+    data: dict[str, Any] = {"structuredContent": structured}
+    if error_flag is not None:
+        data["isError"] = error_flag
+    envelope = _envelope({"ok": True, "data": data})
+    if error_flag is None or error_flag is False:
+        assert access.unwrap_research_envelope(operation, envelope) == structured
+    else:
+        with pytest.raises(access.AeCallError, match="research_failed"):
+            access.unwrap_research_envelope(operation, envelope)
+
+
 def test_research_envelope_and_single_submit() -> None:
     auth = access.unwrap_research_envelope("auth_status", _envelope(_business({
         "authenticated": True,
