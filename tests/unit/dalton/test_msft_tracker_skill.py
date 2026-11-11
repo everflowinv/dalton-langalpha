@@ -80,6 +80,8 @@ def test_skill_matches_report_tool_and_keeps_targets_out() -> None:
     assert ".agents/skills/dalton-msft-tracker/scripts/" in skill
     assert "plugins/dalton/skills/" not in skill
     assert "尚未整合" not in skill
+    assert "research_pending" in skill
+    assert "--content-kind failure_text" in skill
     assert "research/tracker/thesis.md" in skill
     assert "同一内容不在底稿和卡片里各写一遍" not in skill
     assert "同一内容不在底稿和卡片里各写一遍" not in rules
@@ -612,3 +614,173 @@ def test_pool_cap_repeat_remove_and_review(tmp_path: Path) -> None:
     payload = json.loads(buf.getvalue())
     assert payload["counted"] is False
     assert payload["added_count"] == 3
+
+
+def _complete_packet(root: Path, run_id: str, **extra: object) -> None:
+    run = root / "research" / "tracker" / run_id
+    run.mkdir(parents=True, exist_ok=True)
+    body = {"ticker": "MSFT", "run_id": run_id, "collection_complete": True}
+    body.update(extra)
+    (run / "packet.json").write_text(json.dumps(body), encoding="utf-8")
+
+
+def test_unreviewed_packet_resume_and_failure_record(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    tracker = root / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "thesis.md").write_text(THESIS, encoding="utf-8")
+    older = "20261109-2250"
+    newer = "20261110-2250"
+    _complete_packet(root, older)
+    _complete_packet(root, newer)
+    broken = tracker / "20261108-0100"
+    broken.mkdir()
+    (broken / "packet.json").write_text("{}\n", encoding="utf-8")
+    mismatch = tracker / "20261108-0200"
+    mismatch.mkdir()
+    (mismatch / "packet.json").write_text(
+        json.dumps({"ticker": "MSFT", "run_id": "other", "collection_complete": True}),
+        encoding="utf-8",
+    )
+    other_ticker = tracker / "20261108-0300"
+    other_ticker.mkdir()
+    (other_ticker / "packet.json").write_text(
+        json.dumps({"ticker": "AAPL", "run_id": "20261108-0300", "collection_complete": True}),
+        encoding="utf-8",
+    )
+    unfinished = tracker / "20261108-0400"
+    unfinished.mkdir()
+    (unfinished / "packet.json").write_text(
+        json.dumps({"ticker": "MSFT", "run_id": "20261108-0400", "collection_complete": False}),
+        encoding="utf-8",
+    )
+    linked = tracker / "20261108-0500"
+    linked.mkdir()
+    (linked / "packet.json").symlink_to(tracker / newer / "packet.json")
+
+    open_runs = STATE.unfinished_runs(root)
+    assert [item["run_id"] for item in open_runs] == [newer, older]
+    assert open_runs[0]["research_pending"] is True
+    assert open_runs[0]["packet_json"] == f"research/tracker/{newer}/packet.json"
+    assert "material" not in open_runs[0]
+    assert "report_run_id" not in open_runs[0]
+    assert "content_kind" not in open_runs[0]
+    resume = STATE.next_step(open_runs[0], None, committed=False)
+    assert resume["action"] == "continue_research"
+    assert resume["commit_material"] is None
+    assert resume["report_action"] is None
+    assert resume["seen_unchanged"] is True
+    assert resume["blocks_new_collect"] is True
+
+    (tracker / "updates.log").write_text(
+        f"2026-11-10 22:50 | {newer} | material=no | 已提交\n",
+        encoding="utf-8",
+    )
+    assert [item["run_id"] for item in STATE.unfinished_runs(root)] == [older]
+
+    reviewed = STATE.save_review(
+        root,
+        older,
+        material="yes",
+        summary="已有判断",
+        report_run_id=older,
+        send_status="pending",
+        card_json=f"research/tracker/{older}/card.json",
+        content_kind="cards",
+    )
+    stored = json.loads((root / reviewed["path"]).read_text(encoding="utf-8"))
+    again = STATE.unfinished_runs(root)
+    assert [item["run_id"] for item in again] == [older]
+    assert again[0]["report_run_id"] == older
+    assert again[0]["content_kind"] == "cards"
+    assert again[0]["card_json"] == stored["card_json"]
+    assert "research_pending" not in again[0]
+
+    failure_id = "msft-collect-20261110"
+    saved = STATE.save_review(
+        root,
+        failure_id,
+        material="yes",
+        summary="Collection failed",
+        report_run_id=failure_id,
+        send_status="pending",
+        content_kind="failure_text",
+    )
+    fail_dir = tracker / failure_id
+    assert saved["ok"] is True
+    assert not (fail_dir / "packet.json").exists()
+    assert not (tracker / "seen.json").exists()
+    assert failure_id not in (tracker / "updates.log").read_text(encoding="utf-8")
+    failure = json.loads((fail_dir / "review.json").read_text(encoding="utf-8"))
+    assert failure["run_id"] == failure_id
+    assert failure["report_run_id"] == failure_id
+    assert failure["content_kind"] == "failure_text"
+    assert failure["card_json"] is None
+    listed = STATE.unfinished_runs(root)
+    assert listed[0]["run_id"] == failure_id
+    assert [item["run_id"] for item in listed] == [failure_id, older]
+
+    try:
+        STATE.save_review(
+            root,
+            "msft-collect-20261111",
+            material="yes",
+            summary="不该没有数据包",
+            report_run_id="msft-collect-20261111",
+            send_status="pending",
+            content_kind="cards",
+        )
+    except STATE.StateError as exc:
+        assert exc.status == "packet_missing"
+    else:
+        raise AssertionError("card review without a packet was accepted")
+    assert not (tracker / "msft-collect-20261111").exists()
+
+    try:
+        STATE.save_review(
+            root,
+            failure_id,
+            material="yes",
+            summary="失败记录不能改挂卡片",
+            report_run_id=failure_id,
+            send_status="sent",
+            card_json=f"research/tracker/{failure_id}/card.json",
+            content_kind="failure_text",
+        )
+    except STATE.StateError as exc:
+        assert exc.status == "packet_missing"
+    else:
+        raise AssertionError("failure review accepted a card without a packet")
+    assert json.loads((fail_dir / "review.json").read_text(encoding="utf-8"))["send_status"] == "pending"
+
+    updated = STATE.save_review(
+        root,
+        failure_id,
+        material="yes",
+        summary="Collection failed",
+        report_run_id=failure_id,
+        send_status="sent",
+        content_kind="failure_text",
+    )
+    assert updated["review"]["send_status"] == "sent"
+    assert updated["review"]["report_run_id"] == failure_id
+    assert updated["review"]["content_kind"] == "failure_text"
+    assert not (fail_dir / "packet.json").exists()
+
+    try:
+        STATE.save_review(
+            root,
+            failure_id,
+            material="yes",
+            summary="换成另一份失败报告",
+            report_run_id="msft-collect-20261111",
+            send_status="sent",
+            content_kind="failure_text",
+        )
+    except STATE.StateError as exc:
+        assert exc.status == "review_identity_conflict"
+    else:
+        raise AssertionError("failure review changed report id")
+    kept = json.loads((fail_dir / "review.json").read_text(encoding="utf-8"))
+    assert kept["report_run_id"] == failure_id
+    assert kept["send_status"] == "sent"

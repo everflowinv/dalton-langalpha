@@ -383,7 +383,6 @@ def save_review(
     content_kind: str | None = None,
 ) -> dict[str, Any]:
     root = open_workspace(workspace)
-    run_id = _require_packet(root, run_id)
     report_run_id = validate_run_id(report_run_id)
     if material not in {"yes", "no"}:
         raise StateError("bad_material", "material 只能是 yes 或 no")
@@ -391,6 +390,13 @@ def save_review(
         raise StateError("bad_send_status", "send_status 不在允许的状态里")
     if content_kind is not None and content_kind not in CONTENT_KINDS:
         raise StateError("bad_content_kind", "content_kind 只能是 cards 或 failure_text")
+    # Early transport failure has no packet. Cards and any review that names a card still do.
+    failure_only = content_kind == "failure_text" and not card_json
+    if failure_only:
+        run_id = validate_run_id(run_id)
+        ensure_relative(root, f"research/tracker/{run_id}/review.json")
+    else:
+        run_id = _require_packet(root, run_id)
     text = _one_line(summary, "bad_summary", "summary 需要一行非空文字")
     thesis = ensure_relative(root, thesis_path)
     if thesis.is_symlink() or not thesis.is_file():
@@ -477,6 +483,32 @@ def _committed_ids(workspace: Path) -> set[str]:
     return found
 
 
+def _safe_complete_packet(packet_path: Path) -> str | None:
+    """Run id for a finished MSFT packet stored in its own run directory."""
+    if packet_path.is_symlink() or not packet_path.is_file():
+        return None
+    run_dir = packet_path.parent
+    if run_dir.is_symlink():
+        return None
+    run_id = run_dir.name
+    try:
+        validate_run_id(run_id)
+    except StateError:
+        return None
+    try:
+        data = json.loads(packet_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("collection_complete") is not True:
+        return None
+    if data.get("run_id") != run_id:
+        return None
+    ticker = data.get("ticker")
+    if not isinstance(ticker, str) or ticker.upper() != "MSFT":
+        return None
+    return run_id
+
+
 def unfinished_runs(workspace: Path | str) -> list[dict[str, Any]]:
     root = open_workspace(workspace)
     tracker = root / "research" / "tracker"
@@ -496,6 +528,19 @@ def unfinished_runs(workspace: Path | str) -> list[dict[str, Any]]:
             continue
         if isinstance(review, dict):
             found.append(review)
+    for packet_path in tracker.glob("*/packet.json"):
+        run_id = packet_path.parent.name
+        if run_id in committed or (packet_path.parent / "review.json").exists():
+            continue
+        if _safe_complete_packet(packet_path) is None:
+            continue
+        found.append(
+            {
+                "run_id": run_id,
+                "research_pending": True,
+                "packet_json": f"research/tracker/{run_id}/packet.json",
+            }
+        )
     found.sort(key=lambda item: str(item.get("run_id") or ""), reverse=True)
     return found
 
@@ -541,6 +586,9 @@ def next_step(
     }
     if committed:
         decision.update(action="done", seen_unchanged=False, blocks_new_collect=False)
+        return decision
+    if review.get("research_pending") is True and review.get("material") not in {"yes", "no"}:
+        decision.update(action="continue_research")
         return decision
     material = review.get("material")
     if material == "no":

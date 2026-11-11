@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -577,11 +578,11 @@ def test_x_same_day_until_dedupe_and_null_cache(monkeypatch: pytest.MonkeyPatch,
     searches = [args for args in calls if args.get("operation") == "search"]
     timelines = [args for args in calls if args.get("operation") == "tweets"]
     assert len(searches) == len(cfg["x_queries"])
-    assert {args["until"] for args in searches} == {"2026-11-11"}
+    assert {args["until"] for args in searches} == {"2026-11-12"}
     assert {args["since"] for args in searches} == {"2026-11-09"}
     assert {args["count"] for args in searches} == {40}
     assert {args["handle"] for args in timelines} == {"keeper", "allhands"}
-    assert {args["until"] for args in timelines} == {"2026-11-10"}
+    assert {args["until"] for args in timelines} == {"2026-11-11"}
     assert {args["count"] for args in timelines} == {20}
     assert pool_path.read_bytes() == pool_bytes and author_path.read_bytes() == author_bytes
 
@@ -605,6 +606,158 @@ def test_x_same_day_until_dedupe_and_null_cache(monkeypatch: pytest.MonkeyPatch,
     failures = collect_mod.failed_sources({"status": {}}, {"status": []}, {"status": []}, overflow_data, {"ok": True, "status": "ok"})
     assert failures == []
     assert author_path.read_bytes() == author_bytes
+
+
+def _normalize_x_timeline():
+    scripts = REPO_ROOT / "scripts" / "dalton"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import researchdata_bridge as bridge
+
+    return bridge._normalize_x_timeline_output
+
+
+def _xreach(post_id: str, created_at: str, text: str) -> dict[str, Any]:
+    return {
+        "id": post_id,
+        "createdAt": created_at,
+        "text": text,
+        "user": {"screenName": "keeper", "name": "Keeper"},
+        "likeCount": 4,
+        "retweetCount": 0,
+        "replyCount": 0,
+        "viewCount": 1,
+    }
+
+
+def test_x_upstream_window_keeps_et_evening(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    winter_timeline, winter_search = collect_mod._x_upstream_until("2026-11-10")
+    summer_timeline, summer_search = collect_mod._x_upstream_until("2026-07-15")
+    same_timeline, same_search = collect_mod._x_upstream_until("2026-11-10")
+    assert (winter_timeline, winter_search) == ("2026-11-11", "2026-11-12")
+    assert (summer_timeline, summer_search) == ("2026-07-16", "2026-07-17")
+    assert (same_timeline, same_search) == (winter_timeline, winter_search)
+
+    normalize = _normalize_x_timeline()
+    evening = _xreach("evening", "2026-11-11T02:30:00Z", "Azure EPS late")
+    nxt = _xreach("nextday", "2026-11-11T12:00:00Z", "Azure EPS next")
+    dropped = normalize({"items": [evening, nxt]}, operation="tweets", count=20, since="2026-11-10", until="2026-11-10")
+    assert dropped["items"] == []
+    kept = normalize({"items": [evening, nxt]}, operation="tweets", count=20, since="2026-11-10", until=winter_timeline)
+    assert {item["id"] for item in kept["items"]} == {"evening", "nextday"}
+    summer_evening = _xreach("summer", "2026-07-16T02:30:00Z", "Azure EPS summer")
+    summer_old = normalize(
+        {"items": [summer_evening]}, operation="tweets", count=20, since="2026-07-15", until="2026-07-15"
+    )
+    summer_new = normalize(
+        {"items": [summer_evening]}, operation="tweets", count=20, since="2026-07-15", until=summer_timeline
+    )
+    assert summer_old["items"] == []
+    assert [item["id"] for item in summer_new["items"]] == ["summer"]
+
+    cfg = collect_mod.load_research_config()
+    ws = _workspace(tmp_path)
+    (ws / "research" / "tracker" / "x_pool.json").write_text(
+        json.dumps({"keeper": {"active": True, "tickers": ["MSFT"]}}), encoding="utf-8"
+    )
+    calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        assert tool_name == "community" and "params" not in arguments
+        calls.append(arguments)
+        if arguments.get("operation") == "search":
+            items = []
+            for item in (evening, nxt):
+                stamp = datetime.fromisoformat(item["createdAt"].replace("Z", "+00:00")).astimezone(ZoneInfo("UTC"))
+                if stamp.date().isoformat() < arguments["until"]:
+                    items.append(item)
+            return {"ok": True, "data": {"data": {"items": items, "has_more": False}}}
+        raw = {"items": [evening, nxt]}
+        normalized = normalize(
+            raw,
+            operation="tweets",
+            count=int(arguments["count"]),
+            since=str(arguments.get("since") or ""),
+            until=str(arguments.get("until") or ""),
+        )
+        return {"ok": True, "data": {"data": {"items": normalized["items"], "has_more": False}}}
+
+    _patch_bridge(monkeypatch, bridge)
+    data = collect_mod.collect_x(cfg, "2026-11-10", "2026-11-10", set(), ws)
+    assert {args["until"] for args in calls if args.get("operation") == "search"} == {"2026-11-12"}
+    assert {args["until"] for args in calls if args.get("operation") == "tweets"} == {"2026-11-11"}
+    assert "x:evening" in data["new"]
+    assert data["new"]["x:evening"]["created_at"].startswith("2026-11-11T02:30:00")
+    assert "x:nextday" not in data["new"] and "x:nextday" not in data["noise_ids"]
+
+
+def test_legacy_ae_resume_then_new_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    calls: list[dict[str, Any]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    covered_only = {"ae_covered_until": "2026-10-28"}
+    collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), covered_only)
+    assert [args["query"] for args in calls] == [first, second]
+    assert {args["start"] for args in calls} == {"2026-10-25"}
+    assert {args["end"] for args in calls} == {"2026-11-10"}
+    assert all("cursor" not in args["params"] for args in calls)
+
+    calls.clear()
+    imported = {
+        "ticker": "MSFT",
+        "run_id": "20261028-1800",
+        "committed_at": "2026-10-28T18:00:00-04:00",
+        "since": "2026-10-25",
+        "until": "2026-10-28",
+        "snapshot_file": "data/consensus/old.json",
+        "material": "no",
+        "summary": "imported",
+        "ae_covered_until": "2026-10-28",
+        "ae_resume": {
+            "window": {"since": "2026-10-25", "until": "2026-10-28"},
+            "cursor": "legacy-cursor-token",
+            "query": "Microsoft",
+        },
+    }
+    _ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), imported)
+    assert [args["query"] for args in calls] == [first, second]
+    assert {args["start"] for args in calls} == {"2026-10-25"}
+    assert {args["end"] for args in calls} == {"2026-10-28"}
+    assert all("cursor" not in args["params"] for args in calls)
+    assert all("legacy-cursor-token" not in json.dumps(args) for args in calls)
+    assert {row["complete"] for row in state["queries"]} == {True}
+    assert {row["covered_until"] for row in state["queries"]} == {"2026-10-28"}
+
+    ws = _workspace(tmp_path)
+    (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    _write_packet(ws, "20261110-1000", "2026-11-10", since="2026-11-09", ae=state)
+    code, _payload = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-1000", "--material", "no", "--summary", "legacy"],
+    )
+    assert code == 0
+    last = _read_json(ws / "research" / "tracker" / "last_run.json")
+    assert last["run_id"] == "20261110-1000"
+    assert "ae_resume" not in last and "ae_covered_until" not in last
+    assert "legacy-cursor-token" not in json.dumps(last)
+    assert {row["window"]["end"] for row in last["msft_ae_state"]["queries"]} == {"2026-10-28"}
+
+    calls.clear()
+    collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-10", set(), last)
+    assert [args["query"] for args in calls] == [first, second]
+    assert {args["start"] for args in calls} == {"2026-10-25"}
+    assert {args["end"] for args in calls} == {"2026-11-10"}
+    assert all("cursor" not in args["params"] for args in calls)
+    assert _ae["status"]
 
 
 def test_offline_collect_leaves_seen_and_recovers_packet(

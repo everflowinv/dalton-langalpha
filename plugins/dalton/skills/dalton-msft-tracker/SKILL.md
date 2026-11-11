@@ -22,7 +22,11 @@ python3 .agents/skills/dalton-msft-tracker/scripts/state.py open-runs \
   --workspace-dir <workspace>
 ```
 
-有未完成运行时，取最新一条，沿用原来的 `run_id` 和 `report_run_id`。本轮不再采集第二个包。
+返回按 `run_id` 从新到旧排列，已写入 `updates.log` 的运行不在其中。选择时跳过已经确认发出的 `failure_text`。其余取最新一条，本轮不再采集第二个包。
+
+选中的一条 `research_pending` 为 true 时，采集已经完成，研究还没有 review。沿用该条的 `run_id` 和 `packet_json`，从第 3 节继续读这个包并做研究。不要编造 `material`，不要调用报告工具，也不要把它当成已经确认发送。
+
+已有 review 时，沿用原来的 `run_id` 和 `report_run_id`。
 
 `review.json` 可以先记下 `card_json`，再构造卡片。恢复时先看这个相对路径是不是工作区内的普通文件。文件还不存在，或该路径是符号链接时，继续这一轮的研究和卡片构造，沿用同一个 `run_id` 和 `report_run_id`。不要读取这张还不存在的卡片，也不要提交报告。
 
@@ -32,10 +36,10 @@ python3 .agents/skills/dalton-msft-tracker/scripts/state.py open-runs \
 - 卡片文件已在，但这一份报告的 `delivery_confirmed` 还不是 `true`，或 `status` 为 `pending`、`unknown`、`failed`：保留数据包、底稿和原卡片字节。用同一个 `report_run_id` 和完全相同的 `cards` 再提交一次，并用 `status` 核查。
 - 接受卡片确认前，返回里的 `report_run_id` 必须与 review 的 `report_run_id` 完全一致，并且 `content_kind` 明确为 `cards`。同时 `ok` 为 `true`、`delivery_confirmed` 为 `true`、`status` 为 `sent` 时，卡片保持原字节，只 `commit --material yes`。缺 `report_run_id`、标识不一致，或 `content_kind` 不是 `cards` 时，保持原状，不 commit，`seen.json` 不变。
 - 本地把发送记成 `sent`，但还没有上述同一份报告的结果时，只调用 `status`，先不要 commit。
-- review 的 `content_kind` 为 `failure_text` 时，不要 `commit --material yes`。失败文本的确认同样要求返回里的 `report_run_id` 与 review 完全一致，并且 `content_kind` 明确为 `failure_text`，同时 `ok`、`delivery_confirmed` 和 `status` 为 `sent`。对上之后，`seen.json` 仍保持原状，这条记录不挡住新的采集。同一份报告还没确认时，用同一个 `report_run_id` 再提交一次失败文本。标识不一致或缺字段时保持原状，不把失败文本当成已结束。
+- review 的 `content_kind` 为 `failure_text` 时，不要 `commit --material yes`。这条记录可以没有 `packet.json`；没有数据包时不要补造。失败文本的确认同样要求返回里的 `report_run_id` 与 review 完全一致，并且 `content_kind` 明确为 `failure_text`，同时 `ok`、`delivery_confirmed` 和 `status` 为 `sent`。对上之后，`seen.json` 仍保持原状，这条记录不挡住新的采集，也不表示研究包已经处理。同一份报告还没确认时，用同一个 `report_run_id` 再提交一次失败文本。标识不一致或缺字段时保持原状，不把失败文本当成已结束。
 - 工具返回的 `code` 为 `not_automation_run`：这不是自动化运行。不要 commit，不要另找发送办法。最终回复说明本次不是自动化运行，不附卡片正文。
 
-最新一条如果是已确认的 `failure_text`，不要把它恢复成待发送卡片，直接进入采集。其他未完成运行先恢复。没有未完成运行时，进入采集。
+已确认的 `failure_text` 不恢复成卡片，也不 commit。跳过它之后若还有未完成运行，恢复其中最新的一条。一条都没有时，进入采集。
 
 ## 2. 采集
 
@@ -147,7 +151,20 @@ python3 .agents/skills/dalton-msft-tracker/scripts/collect.py commit \
 
 ## 7. 采集失败
 
-两次采集都失败时，不要 commit。若本轮还没有保存过卡片，发送失败报告，`cards` 省略：
+两次采集都失败，或采集还没有写出 `packet.json` 时，不要 commit，不要补造 `packet.json`。若本轮还没有保存过卡片，先写下失败恢复记录，再发送失败报告。`cards` 省略：
+
+```bash
+python3 .agents/skills/dalton-msft-tracker/scripts/state.py save-review \
+  --workspace-dir <workspace> \
+  --run-id <RUN_ID> \
+  --material yes \
+  --summary "<一句话>" \
+  --report-run-id <RUN_ID> \
+  --send-status pending \
+  --content-kind failure_text
+```
+
+这里的 `--material yes` 只标记失败报告，不授权 `commit --material yes`。
 
 ```python
 automation_report(
@@ -158,4 +175,4 @@ automation_report(
 )
 ```
 
-`RUN_ID` 用已经产生的 `run_id`；采集还没有 `run_id` 时，用当天美东日期组成稳定标识 `msft-collect-YYYYMMDD`。失败文本的确认要求返回里的 `report_run_id` 与这次提交的标识完全一致，并且 `content_kind` 明确为 `failure_text`。对上之后，review 也记为 `failure_text`。这不构成研究包成功处理，不要因此 `commit --material yes`。标识不一致或缺字段时保持原状，`seen.json` 不变。失败文本已确认发出后，最终回复只写 `NO_REPLY`。失败文本未能保存时，最终回复只留这一行失败说明，不附卡片正文。工具返回的 `code` 为 `not_automation_run` 时，按第 1 节处理，不要把 `status` 字段当成这个结果。
+`RUN_ID` 用已经产生的 `run_id`；采集还没有 `run_id` 时，用当天美东日期组成稳定标识 `msft-collect-YYYYMMDD`。失败文本的确认要求返回里的 `report_run_id` 与这条记录完全一致，并且 `content_kind` 明确为 `failure_text`。对上之后，用同一个 `run_id`、`report_run_id` 和 `--content-kind failure_text` 把 `send_status` 写成 `sent`。这不构成研究包成功处理，不要因此 `commit --material yes`，`seen.json` 保持原状。标识不一致或缺字段时保持原状。失败文本已确认发出后，最终回复只写 `NO_REPLY`。失败文本未能保存时，最终回复只留这一行失败说明，不附卡片正文。工具返回的 `code` 为 `not_automation_run` 时，按第 1 节处理，不要把 `status` 字段当成这个结果。

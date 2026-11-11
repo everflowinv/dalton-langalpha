@@ -25,6 +25,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
+UTC = ZoneInfo("UTC")
 SKILL_DIR = Path(__file__).resolve().parent.parent
 RESEARCH_CONFIG_PATH = SKILL_DIR / "config" / "research.json"
 GENERIC_COLLECT_PATH = SKILL_DIR.parent / "dalton-thesis-delta" / "scripts" / "collect.py"
@@ -1049,8 +1050,13 @@ def collect_internal(
     }
 
 
+def _has_msft_ae_state(last_run: dict[str, Any]) -> bool:
+    state = last_run.get("msft_ae_state") if isinstance(last_run, dict) else None
+    return isinstance(state, dict) and isinstance(state.get("queries"), list)
+
+
 def _ae_prev_map(last_run: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    state = last_run.get("msft_ae_state")
+    state = last_run.get("msft_ae_state") if isinstance(last_run, dict) else None
     queries = state.get("queries") if isinstance(state, dict) else None
     if not isinstance(queries, list):
         return {}
@@ -1059,6 +1065,40 @@ def _ae_prev_map(last_run: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for item in queries
         if isinstance(item, dict) and isinstance(item.get("query"), str)
     }
+
+
+def _legacy_ae_map(last_run: dict[str, Any], queries: list[str]) -> dict[str, dict[str, Any]]:
+    """没有 msft_ae_state 时，用导入的覆盖日和未完成窗口初始化每一条查询。
+
+    旧 cursor 只对当时那一次筛选有效，这里从窗口起点重放，不带 cursor。
+    """
+    if not isinstance(last_run, dict) or _has_msft_ae_state(last_run):
+        return {}
+    covered = _coerce_day(last_run.get("ae_covered_until"))
+    resume = last_run.get("ae_resume") if isinstance(last_run.get("ae_resume"), dict) else None
+    window = resume.get("window") if isinstance(resume, dict) and isinstance(resume.get("window"), dict) else {}
+    start = _coerce_day(window.get("start") or window.get("since"))
+    end = _coerce_day(window.get("end") or window.get("until"))
+    found: dict[str, dict[str, Any]] = {}
+    for query in queries:
+        if start and end and start <= end:
+            found[query] = {
+                "query": query,
+                "complete": False,
+                "ok": True,
+                "cursor": None,
+                "covered_until": covered,
+                "window": {"start": start, "end": end},
+            }
+        elif covered:
+            found[query] = {
+                "query": query,
+                "complete": True,
+                "ok": True,
+                "cursor": None,
+                "covered_until": covered,
+            }
+    return found
 
 
 def collect_alphaengine(
@@ -1071,8 +1111,8 @@ def collect_alphaengine(
     """每条查询一轮只搜一次。未完成的查询下一轮重放原窗口和 cursor，不改用新的 until。"""
     pat = re.compile(str(cfg["aliases_regex"]))
     names = {str(name) for name in cfg.get("ae_company_names") or []}
-    prev_map = _ae_prev_map(last_run)
     queries = [str(q) for q in (cfg.get("ae_queries") or [])][: int(cfg.get("ae_max_searches") or 2)]
+    prev_map = _ae_prev_map(last_run) or _legacy_ae_map(last_run, queries)
     found: dict[str, Any] = {}
     statuses: list[dict[str, Any]] = []
     state_queries: list[dict[str, Any]] = []
@@ -1269,6 +1309,30 @@ def _in_window(parsed: datetime | None, since: str, until: str) -> bool:
     return since <= day <= until
 
 
+def _coerce_day(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _x_upstream_until(until: str) -> tuple[str, str]:
+    """把美东自然日扩成上游仍能覆盖到当天结束的 UTC 日期。
+
+    时间线按推文的 UTC 日历日做含当日过滤。搜索的 until: 排除该 UTC 日的零点。
+    返回 (时间线 until, 搜索 until)。调用方仍用美东日期做最终过滤。
+    """
+    end = datetime.combine(date.fromisoformat(until) + timedelta(days=1), datetime.min.time(), tzinfo=ET)
+    timeline = (end - timedelta(microseconds=1)).astimezone(UTC).date().isoformat()
+    end_utc = end.astimezone(UTC)
+    boundary = end_utc.date()
+    if end_utc > datetime.combine(boundary, datetime.min.time(), tzinfo=UTC):
+        boundary += timedelta(days=1)
+    return timeline, boundary.isoformat()
+
+
 def _metric(metrics: Any, key: str) -> int | None:
     if not isinstance(metrics, dict) or key not in metrics:
         return None
@@ -1318,7 +1382,7 @@ def collect_x(
     seen: set[str],
     workspace: Path,
 ) -> dict[str, Any]:
-    search_until = (date.fromisoformat(until) + timedelta(days=1)).isoformat()
+    timeline_until, search_until = _x_upstream_until(until)
     raw: dict[str, dict[str, Any]] = {}
     statuses: list[dict[str, Any]] = []
     failures: list[str] = []
@@ -1364,7 +1428,7 @@ def collect_x(
             "operation": "tweets",
             "handle": handle,
             "since": since,
-            "until": until,
+            "until": timeline_until,
             "count": X_TIMELINE_COUNT,
         }
         res = call_bridge_jsonrpc("community", arguments)
