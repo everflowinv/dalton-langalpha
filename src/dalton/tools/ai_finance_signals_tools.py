@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 _ACTIONS = frozenset({"save", "compare", "ingest", "stats", "read"})
 _SAVE_OBJECTS = ("github_decisions", "earnings_dispositions", "signal_records")
 _HOST_PATH = "/internal/ai-finance/signals"
-_MAX_OFFSET = 32 * 1024 * 1024
+# Character offset. One character is at least one byte, so this matches the
+# stored comparison byte cap in ai_finance_signals._COMPARE_FILE_MAX.
+_MAX_OFFSET = 256 * (1 + 8) * (9 * 4000 * 4 + 8192) + 65_536
 _MAX_CHARS = 32000
 _DEFAULT_MAX_CHARS = 16000
 _HTTP_TIMEOUT_SAVE_S = 60.0
@@ -457,7 +459,7 @@ def _accept_page(
     total = payload.get("total_chars")
     text = payload.get("text")
     digest = payload.get("content_sha256")
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0 or total > _MAX_OFFSET:
         return None
     if not isinstance(text, str) or len(text) > parsed["max_chars"]:
         return None
@@ -474,6 +476,7 @@ def _accept_page(
         or not isinstance(nxt, int)
         or nxt != end
         or nxt <= parsed["offset"]
+        or nxt > _MAX_OFFSET
         or nxt > total
         or complete is not False
     ):

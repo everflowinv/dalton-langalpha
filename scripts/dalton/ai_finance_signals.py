@@ -74,6 +74,10 @@ _COMPARE_FILE_MAX = (
     _MAX_RECORDS * (1 + COMPARE_LIMIT) * _COMPARE_RECORD_BYTES
     + 65_536
 )
+# Read offset is a character index. One character is at least one byte, so the
+# stored comparison byte cap is a safe upper bound. Source reads stay at
+# _SOURCE_MAX_BYTES.
+_READ_OFFSET_MAX = _COMPARE_FILE_MAX
 _EMBEDDING_EXCEPTIONS = frozenset({
     "RuntimeError",
     "HTTPError",
@@ -330,7 +334,7 @@ def parse_signal_request(body: object) -> dict[str, Any]:
     if action == "read":
         offset = body.get("offset", 0)
         max_chars = body.get("max_chars", DEFAULT_MAX_CHARS)
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > _SOURCE_MAX_BYTES:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > _READ_OFFSET_MAX:
             return _error("invalid_offset")
         if isinstance(max_chars, bool) or not isinstance(max_chars, int) or not 1 <= max_chars <= MAX_CHARS:
             return _error("invalid_max_chars")

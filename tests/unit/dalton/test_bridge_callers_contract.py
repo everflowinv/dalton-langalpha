@@ -45,6 +45,11 @@ COVERED_BRIDGE_CALLER_FILES: set[str] = {
 }
 
 DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
+    "scripts/dalton/ai_finance/alphaengine_earnings_ai_scan.py": (
+        "Optional explicit-URL transport calls native AlphaEngine MCP tools "
+        "auth_status/search_library/get_document, without bridge route arguments. "
+        "The scheduled automation injects the authenticated ResearchDataBridge adapter."
+    ),
     "scripts/dalton/researchdata_bridge.py": (
         "Bridge server internal stdio transport forwarding (_call_alphaengine_stdio_direct, "
         "_call_guidepoint_stdio_direct, _forward_stdio_rpc) to upstream MCP subprocesses, "

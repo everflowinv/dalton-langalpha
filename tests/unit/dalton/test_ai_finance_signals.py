@@ -2179,3 +2179,212 @@ def test_compare_refuses_file_over_the_stored_cap(tmp_path: Path) -> None:
     assert list(generation.glob(".compare-out-*")) == []
     assert _commit(root, DATE)["status"] == "open"
     assert _commit(root, DATE)["compare_sha256"] is None
+
+
+def _compare_past_source_offset() -> bytes:
+    """Indent-2 compare JSON past 32MiB, with each text field at the 4000-character limit.
+
+    Quote characters expand to backslash-quote in the stored JSON. The saved
+    bundle stays the compact accepted current; only historical matches repeat.
+    """
+    quoted = '"' * signals._MAX_STRING
+    comparisons = []
+    for index in range(64):
+        matches = []
+        for hit in range(signals.COMPARE_LIMIT):
+            matches.append({
+                "record_key": f"earnings:history-{index}-{hit}",
+                "source_type": "earnings",
+                "external_id": f"history-{index}-{hit}",
+                "event_time": "2026-11-10T00:00:00+00:00",
+                "title": quoted,
+                "entity": quoted,
+                "industry": quoted,
+                "summary": quoted,
+                "evidence": quoted,
+                "qa_concern": quoted,
+                "management_response": quoted,
+                "tam_mapping": quoted,
+                "investment_implication": quoted,
+                "evidence_status": "supported",
+                "signal_types": ["cost_productivity"],
+                "signal_direction": "positive",
+                "management_response_status": "direct",
+                "url": "https://example.com/history",
+                "embedding_similarity": None,
+                "shared_tags": ["ai"],
+            })
+        comparisons.append({"current": _earnings("AI revenue grew"), "matches": matches})
+    body = {
+        "search_modes": ["fts"],
+        "history_signals_before_ingest": 64 * signals.COMPARE_LIMIT,
+        "history_embedded_signals_before_ingest": 0,
+        "history_embedding_status_before_ingest": "none",
+        "comparisons": comparisons,
+    }
+    return (json.dumps(body, ensure_ascii=False, indent=2) + "\n").encode()
+
+
+def test_public_read_past_source_offset_reaches_compare_file(tmp_path: Path) -> None:
+    raw = _compare_past_source_offset()
+    full = raw.decode("utf-8")
+    old_cap = 32 * 1024 * 1024
+    bound = signals._READ_OFFSET_MAX
+    assert old_cap == signals._SOURCE_MAX_BYTES
+    assert bound == signals._COMPARE_FILE_MAX == signal_tools._MAX_OFFSET
+    assert old_cap < len(full) <= bound
+    assert len(raw) <= signals._COMPARE_FILE_MAX
+    assert signals.MAX_CHARS == 32000
+    assert signals.MAX_RESPONSE_BYTES == 128 * 1024
+    assert signals._OBJECT_MAX_BYTES == 256 * 1024
+    assert signal_tools._MAX_CHARS == 32000
+    assert signal_tools._MAX_HOST_RESPONSE_BYTES == 128 * 1024
+    loaded = json.loads(raw)
+    sample = loaded["comparisons"][0]["matches"][0]
+    long_fields = (
+        "title",
+        "entity",
+        "industry",
+        "summary",
+        "evidence",
+        "qa_concern",
+        "management_response",
+        "tam_mapping",
+        "investment_implication",
+    )
+    assert len(loaded["comparisons"]) <= signals._MAX_RECORDS
+    assert len(loaded["comparisons"][0]["matches"]) == signals.COMPARE_LIMIT
+    assert len(loaded["comparisons"][0]["current"]["summary"]) < signals._MAX_STRING
+    for key in long_fields:
+        assert len(sample[key]) == signals._MAX_STRING
+        assert '"' in sample[key]
+    assert "\\\"" in full
+
+    root = tmp_path / "state"
+
+    def command(
+        argv: list[str],
+        *,
+        env: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit_bytes: int,
+        stderr_limit_bytes: int,
+        on_spawn: Any,
+        input_bytes: bytes | None,
+    ) -> ChildResult:
+        del env, timeout_seconds, stdout_limit_bytes, stderr_limit_bytes, on_spawn, input_bytes
+        if argv[4] != "compare":
+            return _child(returncode=1)
+        Path(argv[argv.index("--output") + 1]).write_bytes(raw)
+        return _child()
+
+    _prepare_open_bundle(root, command)
+    generation = _generation(root, DATE)
+    assert (generation / "compare_result.json").read_bytes() == raw
+    assert len((generation / "signal_records.json").read_bytes()) <= signals._OBJECT_MAX_BYTES
+    assert _commit(root, DATE)["status"] == "open"
+
+    offset = old_cap + 1
+    page = _run(
+        root,
+        signals.parse_signal_request(_body("read", offset=offset, max_chars=signals.MAX_CHARS)),
+        python=Path(sys.executable),
+    )
+    assert page["ok"] is True
+    assert page["offset"] == offset
+    assert page["max_chars"] == signals.MAX_CHARS
+    assert 0 < len(page["text"]) <= signals.MAX_CHARS
+    assert len(page["text"]) < page["total_chars"]
+    assert page["text"] == full[offset:offset + len(page["text"])]
+    assert page["text"] != full
+    assert "\\" in page["text"]
+    assert page["complete"] is False
+    assert page["next_offset"] == offset + len(page["text"])
+    assert old_cap < page["next_offset"] <= bound
+    assert page["total_chars"] == len(full)
+    assert page["content_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert len(json.dumps(page, ensure_ascii=False).encode()) <= signals.MAX_RESPONSE_BYTES
+    accepted = signal_tools._accept_success(
+        page,
+        {"action": "read", "batch_id": DATE, "offset": offset, "max_chars": signals.MAX_CHARS},
+    )
+    assert accepted is not None
+    assert accepted["next_offset"] == page["next_offset"]
+    assert len(accepted["text"]) <= signals.MAX_CHARS
+
+    follow = _run(
+        root,
+        signals.parse_signal_request(_body("read", offset=page["next_offset"], max_chars=signals.MAX_CHARS)),
+        python=Path(sys.executable),
+    )
+    assert follow["ok"] is True
+    assert follow["offset"] == page["next_offset"]
+    assert 0 < len(follow["text"]) <= signals.MAX_CHARS
+    assert follow["text"] == full[follow["offset"]:follow["offset"] + len(follow["text"])]
+    assert follow["content_sha256"] == page["content_sha256"]
+    assert len(json.dumps(follow, ensure_ascii=False).encode()) <= signals.MAX_RESPONSE_BYTES
+    parsed_follow, refused_follow = signal_tools._parse_call(
+        "read", DATE, None, None, None, page["next_offset"], signals.MAX_CHARS,
+    )
+    assert refused_follow is None
+    assert parsed_follow is not None and parsed_follow["offset"] == page["next_offset"]
+
+    at_bound = signals.parse_signal_request(_body("read", offset=bound, max_chars=signals.MAX_CHARS))
+    assert at_bound["ok"] is True
+    assert at_bound["offset"] == bound
+    past_file = _run(root, at_bound, python=Path(sys.executable))
+    assert past_file["code"] == "offset_past_end"
+    assert "text" not in past_file
+    assert past_file["total_chars"] == len(full)
+    edge_parsed = {"action": "read", "batch_id": DATE, "offset": bound - 1, "max_chars": signals.MAX_CHARS}
+    edge = signal_tools._accept_success(
+        {
+            "ok": True,
+            "action": "read",
+            "code": "ok",
+            "batch_id": DATE,
+            "profile": signal_tools.PROFILE,
+            "bundle_hash": page["bundle_hash"],
+            "offset": bound - 1,
+            "max_chars": signals.MAX_CHARS,
+            "total_chars": bound,
+            "content_sha256": page["content_sha256"],
+            "text": "x",
+            "next_offset": bound,
+            "complete": False,
+        },
+        edge_parsed,
+    )
+    assert edge is not None
+    assert edge["next_offset"] == bound
+
+    above = signals.parse_signal_request(_body("read", offset=bound + 1, max_chars=signals.MAX_CHARS))
+    assert above["code"] == "invalid_offset"
+    assert "text" not in above
+    above_parsed, above_refused = signal_tools._parse_call(
+        "read", DATE, None, None, None, bound + 1, signals.MAX_CHARS,
+    )
+    assert above_parsed is None
+    assert above_refused is not None
+    assert json.loads(above_refused)["code"] == "invalid_offset"
+    assert signal_tools._accept_success(
+        {
+            "ok": True,
+            "action": "read",
+            "code": "ok",
+            "batch_id": DATE,
+            "profile": signal_tools.PROFILE,
+            "bundle_hash": page["bundle_hash"],
+            "offset": bound - 1,
+            "max_chars": signals.MAX_CHARS,
+            "total_chars": bound + 1,
+            "content_sha256": page["content_sha256"],
+            "text": "xy",
+            "next_offset": bound + 1,
+            "complete": False,
+        },
+        edge_parsed,
+    ) is None
+    assert (generation / "compare_result.json").read_bytes() == raw
+    assert _commit(root, DATE)["status"] == "open"
+    assert _commit(root, DATE)["compare_sha256"] == hashlib.sha256(raw).hexdigest()
