@@ -1,0 +1,76 @@
+{
+  "ticker": "MSFT",
+  "name": "Microsoft",
+  "aliases_regex": "\\bMSFT\\b|\\$MSFT|Microsoft|\\bAzure\\b|Copilot|Nadella|Amy Hood|\\bM365\\b|Microsoft 365|Fairwater|\\bMaia\\b|Xbox|XBOX|MAI-\\d|Mustafa Suleyman",
+  "alias_terms": [
+    "Microsoft",
+    "MSFT",
+    "Azure",
+    "Copilot",
+    "Nadella",
+    "M365",
+    "Fairwater",
+    "Maia",
+    "Xbox"
+  ],
+  "internal_routes": [
+    "tmtb",
+    "sales-notes",
+    "funda-ai",
+    "company-wiki"
+  ],
+  "internal_limit": 60,
+  "internal_read_cap_per_route": 12,
+  "excluded_documents": [],
+  "wiki_min_alias_hits": 2,
+  "ae_queries": [
+    "Microsoft Azure Copilot",
+    "微软 Azure 云 Copilot"
+  ],
+  "ae_max_searches": 2,
+  "ae_company_names": [
+    "Microsoft Corporation",
+    "Microsoft Corp.",
+    "Microsoft Corp",
+    "Microsoft"
+  ],
+  "sec_forms": [
+    "8-K",
+    "10-Q",
+    "10-K",
+    "S-3ASR",
+    "424B2",
+    "424B5",
+    "FWP"
+  ],
+  "news_queries": [
+    "Microsoft analyst estimates price target downgrade upgrade Azure",
+    "Microsoft OpenAI Copilot capex datacenter Anthropic news"
+  ],
+  "x_queries": [
+    "$MSFT min_faves:150 -filter:replies",
+    "$MSFT (Azure OR capex OR Copilot OR EPS OR estimates OR margin OR RPO OR multiple OR valuation OR OpenAI) min_faves:40 -filter:replies",
+    "(Microsoft OR Azure OR Nadella) (capex OR \"gross margin\" OR RPO OR backlog OR Copilot OR seats) (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies"
+  ],
+  "x_pool_max": 25,
+  "x_keep_max": 30,
+  "x_enrich_max": 20,
+  "model": {
+    "diluted_shares_bn": 7.45,
+    "tax_rate": 0.2,
+    "other_income_bn": {
+      "0y": -0.4,
+      "+1y": -0.4
+    },
+    "source": "FY26 Q4 8-K 附件 99.1（accession 0001193125-26-323632）：non-GAAP 净利润 353 亿/EPS 4.74 ≈ 74.5 亿股；FY27 Q1 指引税率约 20%、其他收入约 -1 亿/季（不含 OpenAI）。Yahoo 0y=FY27（2027-06 止），+1y=FY28；一致 EPS 为 non-GAAP（剔除 OpenAI 损益）"
+  },
+  "thresholds": {
+    "fy1_eps_vs_last_run_pct": 1.0,
+    "fy1_eps_vs_7d_pct": 2.0,
+    "fy1_rev_vs_last_run_pct": 0.7,
+    "pt_mean_vs_last_run_pct": 2.0,
+    "fy1_down_revisions_7d": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0
+  }
+}
