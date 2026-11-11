@@ -37,6 +37,22 @@
   padding-bottom: 40px;
 }
 
+.automations-scope {
+  margin-bottom: 20px;
+}
+
+/* DALTON-HOOK(company-automations): each scope group pages on its own, under its heading. */
+.automations-scope-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.automations-scope-page {
+  color: var(--color-text-tertiary);
+}
+
 /* On a phone the automation opens in the bottom sheet, which is card-filled,
    so the price meter knocks out of the card rather than the page. */
 .automations-manage-mobile .automation-inspector {

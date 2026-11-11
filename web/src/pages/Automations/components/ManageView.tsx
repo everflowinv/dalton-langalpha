@@ -1,119 +1,153 @@
+// DALTON-HOOK(company-automations): manage shows three scope groups and one task, or the form that edits it.
 import React, { useLayoutEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence, motion } from '@/lib/framer';
 import { SwapCell } from '@/components/ui/crossfade';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
+import { ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import type { Automation } from '@/types/automation';
-import type { OrderedGroup } from '../hooks/useOrderedGroups';
 import { useScrollReveal } from '../hooks/useScrollReveal';
 import type { WatchedReading } from '../hooks/useWatchedReadings';
 import { PANE_CROSSFADE } from '../utils/motion';
+import { isCompanyTask, isScriptTask, type ManageTask } from '../utils/taskKind';
 import AutomationInlineForm, { type AutomationInlineFormProps } from './AutomationInlineForm';
 import AutomationInspector from './AutomationInspector';
-import { AutomationList } from './AutomationList';
+import { ManageScopes, type ScopePage } from './ManageScopes';
+import ScriptInspector from './ScriptInspector';
+import ScriptScheduleForm, { type ScriptScheduleFormProps } from './ScriptScheduleForm';
 import './ManageView.css';
 
+// DALTON-HOOK(company-automations): the form key is the task id, so a version refresh does not reset the draft.
 /** The open form: the props it mounts with, and the key that remounts it
- *  for another automation or a fresh start. */
-export interface FormHost {
-  key: string;
-  props: AutomationInlineFormProps;
-}
+ *  for another task or a fresh start. The key is the task id, not its version. */
+export type FormHost =
+  | { kind: 'agent'; key: string; props: AutomationInlineFormProps }
+  | { kind: 'script'; key: string; props: ScriptScheduleFormProps };
 
 /**
- * What the list marks and the pane shows. A choice the list does not hold
- * (deleted, or past the first page it loads) is `missing`, and the pane says
- * so rather than show another automation in its place. With no choice a row
- * stands in, the first one the pane opened on for as long as the list holds
- * it, so the pane is never an empty frame; only a choice,
- * `chosen` or `missing`, opens the phone sheet. `runId` is the run a link
- * opened, which only a choice carries.
+ * What the list marks and the pane shows. A choice the lists do not hold is
+ * `missing` until its own read returns. A forbidden read shows no task and no
+ * actions. With no choice a row stands in. Only a choice, `chosen` or
+ * `missing` or `forbidden`, opens the phone sheet.
  */
 export type ManageSelection =
-  | { kind: 'chosen'; automation: Automation; runId: string | null }
-  | { kind: 'first'; automation: Automation }
+  | { kind: 'chosen'; task: ManageTask; runId: string | null }
+  | { kind: 'first'; task: ManageTask }
   | { kind: 'missing'; runId: string | null }
+  | { kind: 'forbidden' }
+  | { kind: 'loading' }
   | { kind: 'none' };
 
+// DALTON-HOOK(company-automations): scope groups, the current detail version, and permission callbacks for the open task.
 interface ManageViewProps {
-  groups: OrderedGroup[];
+  pages: ScopePage[];
   readings: Map<string, WatchedReading>;
   selection: ManageSelection;
+  /** Company writes use the open detail's version, never a list row's. */
+  writeVersion: number | null;
   onSelect: (id: string | null) => void;
   onOpenRun: (automationId: string, runId: string | null) => void;
   form: FormHost | null;
-  onEdit: (a: Automation) => void;
-  onDelete: (a: Automation) => void;
+  onEdit: (task: ManageTask) => void;
+  onDelete: (task: Automation) => void;
+  /** A company run list returned 403. The page drops that task's cached reads. */
+  onRunsForbidden: (automationId: string) => void;
 }
 
 /**
- * The list and the thing it lists, side by side: the whole set on the left,
- * one automation (or the form that makes or changes one) on the right. On a
- * phone the list is the page and the automation opens as a sheet over it.
+ * The list and the thing it lists, side by side: three scope groups on the
+ * left, one task (or the form that makes or changes one) on the right. On a
+ * phone the list is the page and the task opens as a sheet over it.
  */
 export default function ManageView({
-  groups,
+  pages,
   readings,
   selection,
+  writeVersion,
   onSelect,
   onOpenRun,
   form,
   onEdit,
   onDelete,
+  onRunsForbidden,
 }: ManageViewProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
   const revealListScroll = useScrollReveal();
   const revealPaneScroll = useScrollReveal();
-  const shown = selection.kind === 'chosen' || selection.kind === 'first' ? selection.automation : null;
-  const missing = selection.kind === 'missing';
+  const shown = selection.kind === 'chosen' || selection.kind === 'first' ? selection.task : null;
+  const company = shown ? isCompanyTask(shown) : false;
+  const runId = selection.kind === 'chosen' ? selection.runId : null;
 
+  // DALTON-HOOK(company-automations): the open form stays mounted while another group's page is loading.
   const formPane = form && (
     <div className="automation-form-pane">
       <h2 className="title-font automation-form-title">
-        {t(form.props.original ? 'automation.editAutomation' : 'automation.newAutomation')}
+        {t(
+          form.kind === 'script'
+            ? 'automation.editAutomation'
+            : form.props.original
+              ? 'automation.editAutomation'
+              : 'automation.newAutomation',
+        )}
       </h2>
-      {/* Another automation's form dissolves over this one in a single grid
-          cell, so the pane is never an empty frame between the two. */}
       <SwapCell as="div" className="items-start" swapKey={String(form.key)}>
-        <AutomationInlineForm {...form.props} />
+        {form.kind === 'script' ? <ScriptScheduleForm {...form.props} /> : <AutomationInlineForm {...form.props} />}
       </SwapCell>
     </div>
   );
 
   const inspector = shown ? (
-    <AutomationInspector
-      key={shown.automation_id}
-      automation={shown}
-      reading={readings.get(shown.automation_id)}
-      runId={selection.kind === 'chosen' ? selection.runId : null}
-      onOpenRun={(run) => onOpenRun(shown.automation_id, run)}
-      onEdit={onEdit}
-      onDelete={onDelete}
-    />
+    isScriptTask(shown) ? (
+      <ScriptInspector
+        key={shown.automation_id}
+        script={shown}
+        runId={runId}
+        configVersion={writeVersion}
+        onEdit={onEdit}
+        onRunsForbidden={onRunsForbidden}
+      />
+    ) : (
+      <AutomationInspector
+        key={shown.automation_id}
+        automation={shown}
+        reading={readings.get(shown.automation_id)}
+        runId={runId}
+        onOpenRun={(run) => onOpenRun(shown.automation_id, run)}
+        onEdit={onEdit}
+        onDelete={onDelete}
+        // DALTON-HOOK(company-automations): company agents can edit and pause. Run, delete, dismiss, and skip stay off.
+        allowRun={!company}
+        allowDelete={!company}
+        allowDismiss={!company}
+        allowSkip={!company}
+        requireVersion={company}
+        expectedConfigVersion={writeVersion}
+        onRunsForbidden={onRunsForbidden}
+      />
+    )
+  ) : selection.kind === 'forbidden' ? (
+    <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
   ) : selection.kind === 'missing' ? (
     <p className="automations-quiet-note">{t(selection.runId ? 'automation.runLinkNotFound' : 'automation.notFound')}</p>
+  ) : selection.kind === 'loading' ? (
+    <ListSkeleton rows={4} />
   ) : null;
 
-  // What the pane holds. On a phone the list's scroller is the pane and only
-  // a form opens there, above the list; a row opens a sheet instead.
-  const paneKey = form ? `form:${form.key}` : isMobile ? undefined : shown?.automation_id ?? (missing ? 'missing' : undefined);
+  const paneKey = form
+    ? `form:${form.key}`
+    : isMobile
+      ? undefined
+      : shown?.automation_id ?? (selection.kind === 'missing' || selection.kind === 'forbidden' ? selection.kind : undefined);
 
-  // Leaving the page and coming back finds both columns where they were. The
-  // keys name the layout, so the phone's single scroller and the two desktop
-  // ones never restore each other's depth, and the pane's names what it
-  // held, so a link to another automation does not land at this one's depth.
   const listRef = useRef<HTMLDivElement>(null);
   const paneRef = useRef<HTMLDivElement>(null);
   const layout = isMobile ? 'mobile' : 'desktop';
   useScrollMemory(listRef, `page:automations:manage:${layout}:list`);
   useScrollMemory(paneRef, `page:automations:manage:${layout}:pane:${paneKey ?? 'list'}`);
 
-  // Within a visit, a different automation (or a form) opens at its top, not
-  // at the depth it was last read to. The phone's list, back from a form, is
-  // the memory's to place, and so is the first render.
   const placedKey = useRef(paneKey);
   useLayoutEffect(() => {
     if (placedKey.current === paneKey) return;
@@ -121,17 +155,24 @@ export default function ManageView({
     if (paneKey !== undefined && paneRef.current) paneRef.current.scrollTop = 0;
   }, [paneKey]);
 
+  const list = (
+    <ManageScopes
+      pages={pages}
+      readings={readings}
+      selectedId={form ? null : selection.kind === 'chosen' || (!isMobile && selection.kind === 'first') ? selection.task.automation_id : null}
+      onSelect={(id) => onSelect(id)}
+      keyboardNav={!isMobile && !form}
+    />
+  );
+
+  // DALTON-HOOK(company-automations): a phone opens the chosen task in a sheet. The stand-in stays on the list.
   if (isMobile) {
+    const sheetOpen = !form && (selection.kind === 'chosen' || selection.kind === 'missing' || selection.kind === 'forbidden');
     return (
       <div ref={paneRef} className="automations-manage-mobile">
         {formPane}
-        <AutomationList
-          groups={groups}
-          readings={readings}
-          selectedId={selection.kind === 'chosen' ? selection.automation.automation_id : null}
-          onSelect={onSelect}
-        />
-        <MobileBottomSheet open={!form && (selection.kind === 'chosen' || missing)} onClose={() => onSelect(null)} height="88vh">
+        {list}
+        <MobileBottomSheet open={sheetOpen} onClose={() => onSelect(null)} height="88vh">
           <div className="px-1 pb-6">{inspector}</div>
         </MobileBottomSheet>
       </div>
@@ -146,17 +187,10 @@ export default function ManageView({
         className="automations-manage-list automations-scroller"
         onScroll={revealListScroll}
       >
-        <AutomationList
-          groups={groups}
-          readings={readings}
-          selectedId={form ? null : shown?.automation_id ?? null}
-          onSelect={onSelect}
-          keyboardNav
-        />
+        {list}
       </motion.div>
       <div ref={paneRef} className="automations-manage-pane automations-scroller" onScroll={revealPaneScroll}>
-        {/* The outgoing pane is lifted out of flow and dissolves over the
-            incoming one, so a switch never passes through an empty frame. */}
+        {/* DALTON-HOOK(company-automations): the form and the inspector crossfade, so the previous heading stays until its exit ends. */}
         <AnimatePresence initial={false} mode="popLayout">
           {formPane ? (
             <motion.div key="form" {...PANE_CROSSFADE}>
@@ -164,7 +198,7 @@ export default function ManageView({
             </motion.div>
           ) : (
             inspector && (
-              <motion.div key={shown?.automation_id ?? 'missing'} {...PANE_CROSSFADE}>
+              <motion.div key={shown?.automation_id ?? selection.kind} {...PANE_CROSSFADE}>
                 {inspector}
               </motion.div>
             )

@@ -6,9 +6,11 @@ import { isRunLive } from '../utils/status';
 import { isDeliverySettling, pollMs } from '../utils/polling';
 import { listExecutions } from '../utils/api';
 
+// DALTON-HOOK(company-automations): company inspectors read `error` so a refused run list can drop that task.
 interface UseExecutionsResult {
   executions: AutomationExecution[];
   loading: boolean;
+  error: Error | null;
 }
 
 const EMPTY: AutomationExecution[] = [];
@@ -24,14 +26,15 @@ const executionsQuery = (automationId: string) =>
  *  still change. `delivers`: the automation has delivery entries, so a run
  *  that ended with no record yet is waiting for one. */
 export function useExecutions(automationId: string, delivers = false): UseExecutionsResult {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error } = useQuery({
     ...executionsQuery(automationId),
     refetchInterval: (query) =>
       pollMs(!!query.state.data?.executions.some((e) => isRunLive(e.status) || isDeliverySettling(e, delivers))),
     refetchIntervalInBackground: false,
   });
 
-  return { executions: data?.executions ?? EMPTY, loading: isLoading };
+  // DALTON-HOOK(company-automations): the company inspector reads this error when the run list is refused.
+  return { executions: data?.executions ?? EMPTY, loading: isLoading, error: error ?? null };
 }
 
 /** Warms an automation's runs before it is opened, so its pane renders whole

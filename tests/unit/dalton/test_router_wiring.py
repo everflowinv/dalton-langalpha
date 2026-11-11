@@ -68,6 +68,7 @@ class _StubLLMClient:
 
 @pytest.fixture()
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "local-dev-user")
     # Patch DB pool at the lowest layer so real service + database functions execute
     # their imports and parameter bindings without needing a live Postgres server.
     # Every test double uses create_autospec (L33) so wrong parameter names fail immediately.

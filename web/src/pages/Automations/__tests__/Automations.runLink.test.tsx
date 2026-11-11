@@ -10,13 +10,27 @@ import Automations from '../Automations';
 vi.mock('@/hooks/useHomeTimezone', () => ({ useHomeTimezone: () => 'America/New_York' }));
 vi.mock('@/hooks/useWorkspaces', () => ({ useWorkspaces: () => ({ data: { workspaces: [] } }) }));
 
-vi.mock('../utils/api', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../utils/api')>()),
-  listAutomations: vi.fn(),
-  listExecutions: vi.fn(),
-  listRecentRuns: vi.fn(),
-  dismissRun: vi.fn(),
-}));
+// DALTON-HOOK(company-automations): this page signs in as user-1 and reads personal tasks through the same list mock.
+vi.mock('@/contexts/AuthContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/contexts/AuthContext')>();
+  return { ...actual, useAuth: () => ({ userId: 'user-1', isLoggedIn: true, isInitialized: true }) };
+});
+
+vi.mock('../utils/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/api')>();
+  const { personalReadMocks } = await import('./readBridge');
+  const listAutomations = vi.fn(async (_params: { limit?: number; offset?: number }) => ({
+    data: { automations: new Array<Automation>() },
+  }));
+  return {
+    ...actual,
+    listAutomations,
+    listExecutions: vi.fn(),
+    listRecentRuns: vi.fn(),
+    dismissRun: vi.fn(),
+    ...personalReadMocks(listAutomations),
+  };
+});
 
 afterEach(() => {
   vi.clearAllMocks();
