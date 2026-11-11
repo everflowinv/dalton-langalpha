@@ -291,5 +291,42 @@ web/src/pages/Automations/__tests__/readBridge.ts
 web/src/pages/Automations/utils/__tests__/api.writes.test.ts
 tests/unit/dalton/test_sec_call_observability.py
 
+# T11 AI finance core: batch collection, signal memory, and brief checks.
+scripts/dalton/ai_finance/
+tests/unit/dalton/test_ai_finance_github.py
+tests/unit/dalton/test_ai_finance_earnings.py
+tests/unit/dalton/test_ai_finance_signal_memory.py
+tests/unit/dalton/test_ai_finance_validate.py
+tests/unit/dalton/test_ai_finance_prepare.py
+scripts/dalton/ai_finance/batch_retrieval.py
+tests/unit/dalton/test_ai_finance_retrieval.py
+
+# T11 AI finance inputs: execution identity, operator prepare, and paged read.
+src/dalton/database/ai_finance.py
+src/dalton/tools/ai_finance_inputs_tools.py
+scripts/dalton/ai_finance_access.py
+tests/unit/dalton/test_ai_finance_access.py
+tests/unit/dalton/test_ai_finance_inputs.py
+
+# T11 AI finance signals: reviewed bundles, compare, ingest, and stats.
+scripts/dalton/ai_finance_signals.py
+scripts/dalton/ai_finance_access.py
+scripts/dalton/researchdata_bridge.py
+src/dalton/tools/ai_finance_signals_tools.py
+src/dalton/tools/__init__.py
+tests/unit/dalton/test_ai_finance_signals.py
+tests/unit/dalton/test_ai_finance_signal_schema.py
+
 # Claude Fable 5.2 native API and OAuth routes (overlay only; manifests stay upstream).
 tests/unit/dalton/test_fable52.py
+
+# T11 AI finance report: saved daily, original card, and post-send seen state.
+scripts/dalton/ai_finance_reports.py
+scripts/dalton/ai_finance_signals.py
+scripts/dalton/researchdata_bridge.py
+src/dalton/tools/ai_finance_report_tools.py
+src/dalton/tools/__init__.py
+tests/unit/dalton/test_ai_finance_reports.py
+# T11 AI finance daily execution skill.
+plugins/dalton/skills/dalton-ai-finance-daily/
+tests/unit/dalton/test_ai_finance_daily_skill.py

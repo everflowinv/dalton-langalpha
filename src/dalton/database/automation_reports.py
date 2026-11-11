@@ -70,7 +70,12 @@ _UNRESOLVED_NATIVE_ITEM_STATUSES = frozenset(
 )
 _RECONCILE_LOCK_ATTEMPTS = 4
 REPORT_PROFILES = frozenset(
-    {"msft-tracker", "market-digest-am", "market-digest-pm"}
+    {
+        "msft-tracker",
+        "market-digest-am",
+        "market-digest-pm",
+        "ai-finance-daily",
+    }
 )
 MAX_CARDS = 20
 MAX_CARD_JSON_BYTES = 262144
@@ -212,7 +217,7 @@ def parse_report_profile(
     """Return ``(profile, None)`` for a strict report profile.
 
     ``(None, None)`` means ``report_profile`` is absent. ``(None,
-    "profile_invalid")`` means the key is present but not one of the three
+    "profile_invalid")`` means the key is present but not one of the
     configured profiles, or a list, target, or extra key is illegal.
     """
     if not isinstance(metadata, Mapping) or "report_profile" not in metadata:

@@ -27,8 +27,12 @@ _MODEL_LITERAL_RE = re.compile(
 
 # Explicit allowlist of (relative_path_under_src_dalton, unquoted_literal) -> reason.
 # Every entry here is a provider ID, a family/broker prefix pattern (ending with '-' or '-oauth'),
-# or an OAuth CLI User-Agent string — never a concrete model name.
+# an OAuth CLI User-Agent, a nominal price fallback, or a persisted embedding format identifier.
 HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("tools/ai_finance_signals_tools.py", "gemini-embedding-2"): (
+        "Validates the migrated signal store's fixed 768-dimensional embedding format; "
+        "does not select the conversation model."
+    ),
     ("llm/notional_pricing.py", "-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{candidate}-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{identity}-oauth"): "Nominal pricing model reference normalization",

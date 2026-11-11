@@ -65,8 +65,13 @@ def _profile(
     }
 
 
-def test_profile_accepts_only_the_three_named_profiles() -> None:
-    for profile_id in ("msft-tracker", "market-digest-am", "market-digest-pm"):
+def test_profile_accepts_only_named_profiles() -> None:
+    for profile_id in (
+        "msft-tracker",
+        "market-digest-am",
+        "market-digest-pm",
+        "ai-finance-daily",
+    ):
         parsed, err = parse_report_profile(_profile(profile_id))
         assert err is None
         assert parsed is not None
@@ -77,6 +82,7 @@ def test_profile_accepts_only_the_three_named_profiles() -> None:
         "msft-tracker",
         "market-digest-am",
         "market-digest-pm",
+        "ai-finance-daily",
     }
 
 
