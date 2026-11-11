@@ -129,9 +129,17 @@ class AeCallError(Exception):
 
 @dataclass(frozen=True)
 class OperatorConfig:
-    """The operator JSON. Only ``state_root`` is accepted."""
+    """Operator JSON. ``state_root`` is required.
+
+    ``python_executable`` is optional and is kept as given, not resolved, so a
+    virtualenv interpreter still sees its own prefix. ``embedding_model`` and
+    ``embedding_dim`` are optional and may only be gemini-embedding-2 and 768.
+    """
 
     state_root: Path
+    python_executable: Path | None = None
+    embedding_model: str = "gemini-embedding-2"
+    embedding_dim: int = 768
 
 
 def configured_owner_user_id() -> str | None:
@@ -207,6 +215,28 @@ def _iso_date(value: object) -> str | None:
     return value
 
 
+def _python_executable(value: object) -> Path:
+    """Return the configured interpreter path without resolving it.
+
+    A virtualenv ``python`` is often a symlink. Resolving it would drop the
+    prefix Python uses to find ``pyvenv.cfg``. The path itself must still be
+    absolute and name a file.
+    """
+    if not isinstance(value, str) or not value or len(value) > 1024 or "\x00" in value:
+        raise AccessError("config_invalid")
+    path = Path(value)
+    if not path.is_absolute():
+        raise AccessError("config_invalid")
+    if any(part in {".openclaw", ".feishu-daily-ai-finance"} for part in path.parts):
+        raise AccessError("config_invalid")
+    try:
+        if not path.is_file():
+            raise AccessError("config_invalid")
+    except OSError:
+        raise AccessError("config_invalid") from None
+    return path
+
+
 def _require_root(state_root: Path) -> Path:
     if not isinstance(state_root, Path) or not state_root.is_absolute():
         raise AccessError("config_invalid")
@@ -228,7 +258,7 @@ def _require_root(state_root: Path) -> Path:
 
 
 def load_operator_config(config_path: Path) -> OperatorConfig:
-    """Load the one operator JSON. Unknown keys and symlink roots are refused."""
+    """Load the operator JSON. Unknown keys and symlink roots are refused."""
     if not isinstance(config_path, Path) or not config_path.is_absolute() or config_path.is_symlink():
         raise AccessError("config_invalid")
     try:
@@ -242,9 +272,24 @@ def load_operator_config(config_path: Path) -> OperatorConfig:
         data = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, AccessError):
         raise AccessError("config_invalid") from None
-    if not isinstance(data, dict) or set(data) != {"state_root"} or not isinstance(data.get("state_root"), str):
+    allowed = {"state_root", "python_executable", "embedding_model", "embedding_dim"}
+    if not isinstance(data, dict) or "state_root" not in data or set(data) - allowed:
         raise AccessError("config_invalid")
-    return OperatorConfig(state_root=_require_root(Path(data["state_root"])))
+    if not isinstance(data.get("state_root"), str):
+        raise AccessError("config_invalid")
+    python_executable = None
+    if "python_executable" in data:
+        python_executable = _python_executable(data.get("python_executable"))
+    model = data.get("embedding_model", "gemini-embedding-2")
+    dim = data.get("embedding_dim", 768)
+    if model != "gemini-embedding-2" or type(dim) is not int or dim != 768:
+        raise AccessError("config_invalid")
+    return OperatorConfig(
+        state_root=_require_root(Path(data["state_root"])),
+        python_executable=python_executable,
+        embedding_model=model,
+        embedding_dim=dim,
+    )
 
 
 def research_params(tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
