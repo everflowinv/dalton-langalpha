@@ -252,7 +252,7 @@ def test_skill_states_the_final_procedure() -> None:
     assert "run.sh" not in text and "feishu_send_card.py" not in text
     assert "# 📊 市场晨报 — <authoritative_date>" in rules
     assert "## 📝 来源" in rules
-    assert "本轮此栏无新材料" in rules
+    assert "只保留该节标题和原来的栏目顺序" in rules
 
 
 def test_wrappers_call_the_integrated_host(monkeypatch: pytest.MonkeyPatch) -> None:
