@@ -815,6 +815,25 @@ def get_market_digest_owner_user_id() -> str | None:
     return canonical
 
 
+def get_ai_finance_owner_user_id() -> str | None:
+    """Return the operator user allowed to prepare AI-finance batches.
+
+    ``DALTON_AI_FINANCE_OWNER_USER_ID`` must be one hyphenated UUID. Blank,
+    malformed, and non-canonical values return None. There is no default user.
+    """
+    raw = os.getenv("DALTON_AI_FINANCE_OWNER_USER_ID", "").strip()
+    if len(raw) != 36:
+        return None
+    try:
+        parsed = uuid.UUID(raw)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    canonical = str(parsed)
+    if canonical != raw.lower():
+        return None
+    return canonical
+
+
 def get_internal_service_token() -> str:
     """Return ``INTERNAL_SERVICE_TOKEN`` from environment (empty string if unset)."""
     return os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()

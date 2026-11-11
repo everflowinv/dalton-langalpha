@@ -1411,6 +1411,13 @@ class BridgeConfig:
             if raw_market_digest_output_config
             else None
         )
+        # T11 operator JSON. Explicit path only; the request cannot choose it.
+        raw_ai_finance_config = os.environ.get("DALTON_AI_FINANCE_CONFIG", "").strip()
+        self.ai_finance_config: Path | None = (
+            Path(raw_ai_finance_config).expanduser()
+            if raw_ai_finance_config
+            else None
+        )
         default_wiki_audit = _SCRIPT_DIR.parents[1] / "var" / "dalton" / "wiki_ingest_audit.jsonl"
         self.wiki_ingest_audit_file: Path = Path(
             os.environ.get("DALTON_WIKI_INGEST_AUDIT_FILE", str(default_wiki_audit))
@@ -15240,6 +15247,108 @@ class ResearchDataBridge:
                 **({} if confirmed else {"error": "process_group_still_alive"}),
             }
 
+    async def handle_ai_finance_prepare(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/ai-finance/prepare`.
+
+        The admin token gate already ran. The operator path is
+        ``DALTON_AI_FINANCE_CONFIG``. The core runs on a worker thread and
+        calls this bridge's ``handle_tools_call`` on the current loop. A
+        timeout does not start a second prepare.
+        """
+        access = _ai_finance_access()
+        parsed = access.parse_prepare_request(body)
+        if parsed.get("ok") is not True:
+            return _ai_finance_response(parsed, failed_code="invalid_request")
+        configured = access.configured_owner_user_id()
+        if configured is None:
+            return _ai_finance_unavailable("not_configured")
+        if parsed["owner_user_id"] != configured or parsed["user_id"] != configured:
+            return _ai_finance_response(
+                {
+                    "ok": False,
+                    "code": "owner_mismatch",
+                    "error": "This batch belongs to another owner.",
+                },
+                failed_code="owner_mismatch",
+            )
+        config_path = getattr(self.cfg, "ai_finance_config", None)
+        if not isinstance(config_path, Path):
+            return _ai_finance_unavailable("not_configured")
+        try:
+            loaded = await asyncio.to_thread(access.load_operator_config, config_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ai-finance prepare config failed: %s", type(exc).__name__)
+            return _ai_finance_unavailable("config_invalid")
+        loop = asyncio.get_running_loop()
+        caller = {
+            "user": parsed["user_id"],
+            "workspace": parsed["workspace_id"],
+            "thread": parsed["thread_id"],
+        }
+        try:
+            result = await asyncio.to_thread(
+                access.prepare_ai_finance_batch,
+                state_root=loaded.state_root,
+                scheduled_at=parsed["scheduled_at"],
+                started_at=parsed["started_at"],
+                execution_id=parsed["execution_id"],
+                owner_user_id=parsed["owner_user_id"],
+                transport=_ai_finance_transport(self, loop, caller),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ai-finance prepare failed: %s", type(exc).__name__)
+            return _ai_finance_unavailable("prepare_failed")
+        return _ai_finance_response(result, failed_code="prepare_failed")
+
+    async def handle_ai_finance_read(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/ai-finance/read`.
+
+        The admin token gate already ran. Reads stay inside the requested
+        batch. This method does not prepare or submit a report.
+        """
+        access = _ai_finance_access()
+        parsed = access.parse_read_request(body)
+        if parsed.get("ok") is not True:
+            return _ai_finance_response(parsed, failed_code="invalid_request")
+        configured = access.configured_owner_user_id()
+        if configured is None:
+            return _ai_finance_unavailable("not_configured")
+        if parsed["owner_user_id"] != configured:
+            return _ai_finance_response(
+                {
+                    "ok": False,
+                    "code": "not_allowed",
+                    "error": "This account cannot read the prepared batch.",
+                },
+                failed_code="not_allowed",
+            )
+        config_path = getattr(self.cfg, "ai_finance_config", None)
+        if not isinstance(config_path, Path):
+            return _ai_finance_unavailable("not_configured")
+        try:
+            loaded = await asyncio.to_thread(access.load_operator_config, config_path)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ai-finance read config failed: %s", type(exc).__name__)
+            return _ai_finance_unavailable("config_invalid")
+        try:
+            result = await asyncio.to_thread(
+                access.read_ai_finance_page,
+                loaded.state_root,
+                body,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ai-finance read failed: %s", type(exc).__name__)
+            return _ai_finance_unavailable("read_failed")
+        return _ai_finance_response(result, failed_code="read_failed")
+
     async def handle_market_digest_prepare(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Handle `POST /internal/market-digest/prepare`.
 
@@ -15735,6 +15844,177 @@ class ResearchDataBridge:
         }
 
 
+
+
+def _ai_finance_access() -> Any:
+    try:
+        from scripts.dalton import ai_finance_access as access
+    except ImportError:
+        import ai_finance_access as access
+    return access
+
+
+def _ai_finance_transport(
+    bridge: ResearchDataBridge,
+    loop: asyncio.AbstractEventLoop,
+    caller: Mapping[str, str],
+) -> Any:
+    """Sync scanner callback. One submit, then the current bridge call."""
+    access = _ai_finance_access()
+    identity = {
+        "user": caller["user"],
+        "workspace": caller["workspace"],
+        "thread": caller["thread"],
+    }
+
+    def transport(tool: str, arguments: dict[str, Any], timeout: float = 150) -> dict[str, Any]:
+        def submit(params: dict[str, Any]) -> Any:
+            return asyncio.run_coroutine_threadsafe(
+                bridge.handle_tools_call(
+                    uuid.uuid4().hex,
+                    params,
+                    caller_identity=dict(identity),
+                ),
+                loop,
+            )
+
+        return access.run_research_call(
+            submit=submit,
+            tool=tool,
+            arguments=arguments,
+            timeout=float(timeout),
+        )
+
+    return transport
+
+
+_AI_FINANCE_RESPONSE_BYTES = 128 * 1024
+_AI_FINANCE_ERROR_KEYS = (
+    "ok",
+    "code",
+    "error",
+    "batch_id",
+    "resource",
+    "doc_id",
+    "offset",
+    "max_chars",
+    "total_chars",
+    "content_sha256",
+    "profile",
+    "window",
+    "stages",
+    "reused",
+    "errors",
+    "inconsistent",
+    "recovered",
+    "manifest_ready",
+    "candidate_doc_ids",
+)
+_AI_FINANCE_503 = frozenset({
+    "not_configured",
+    "config_invalid",
+    "prepare_failed",
+    "read_failed",
+})
+
+
+def _ai_finance_sentence(code: str) -> str:
+    sentences = {
+        "not_configured": "AI-finance prepare is not configured.",
+        "config_invalid": "AI-finance config is invalid.",
+        "invalid_request": "The request is not valid.",
+        "unknown_field": "Request keys are not allowed.",
+        "clock_disagreement": "The execution clocks do not share one Hong Kong business date.",
+        "owner_mismatch": "This batch belongs to another owner.",
+        "not_allowed": "This account cannot read the prepared batch.",
+        "prepare_failed": "The AI-finance batch could not be prepared.",
+        "prepare_rejected": "The AI-finance batch could not be prepared.",
+        "read_failed": "The prepared batch could not be read.",
+        "hash_mismatch": "The prepared batch failed the hash check.",
+        "offset_past_end": "offset is past the end of the prepared text.",
+        "path_escape": "The candidate reference is not inside this batch.",
+        "not_regular": "The prepared file is not a regular file.",
+        "response_exceeds_bound": "The page does not fit in the response bound.",
+        "profile_mismatch": "This batch profile is not ai-finance-daily.",
+        "not_found": "The prepared batch is not available.",
+        "clock_inconsistent": "The saved batch clock could not be read.",
+    }
+    if code in sentences:
+        return sentences[code]
+    if isinstance(code, str) and (code.startswith("invalid") or "_failed:" in code):
+        return "The AI-finance batch was not prepared."
+    return "The prepared batch could not be read."
+
+
+def _ai_finance_status(payload: Mapping[str, Any]) -> int:
+    if payload.get("ok") is True:
+        return 200
+    code = payload.get("code")
+    if not isinstance(code, str):
+        return 409
+    if code == "clock_disagreement" or code == "unknown_field" or code.startswith("invalid"):
+        return 400
+    if code in _AI_FINANCE_503:
+        return 503
+    return 409
+
+
+def _ai_finance_safe_error(payload: Mapping[str, Any], code: str) -> str:
+    error = payload.get("error")
+    if isinstance(error, str) and error and len(error) <= 200 and "/" not in error and "\\" not in error:
+        folded = error.lower()
+        if "secret" not in folded and "token" not in folded and "file:" not in folded:
+            return error
+    return _ai_finance_sentence(code)
+
+
+def _ai_finance_unavailable(code: str) -> tuple[int, dict[str, Any]]:
+    return _ai_finance_response(
+        {"ok": False, "code": code, "error": _ai_finance_sentence(code)},
+        failed_code=code,
+    )
+
+
+def _ai_finance_response(payload: object, *, failed_code: str) -> tuple[int, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        public: dict[str, Any] = {
+            "ok": False,
+            "code": failed_code,
+            "error": _ai_finance_sentence(failed_code),
+        }
+    elif payload.get("ok") is True:
+        public = dict(payload)
+        public.pop("path", None)
+        public.pop("state_root", None)
+    else:
+        code = payload.get("code")
+        if not isinstance(code, str) or not code or len(code) > 80:
+            code = failed_code
+        public = {"ok": False, "code": code}
+        for key in _AI_FINANCE_ERROR_KEYS:
+            if key in {"ok", "code", "error", "text", "content", "body", "path", "state_root"}:
+                continue
+            if key in payload:
+                public[key] = payload[key]
+        public["error"] = _ai_finance_safe_error(payload, code)
+    try:
+        encoded = json.dumps(public, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        public = {
+            "ok": False,
+            "code": failed_code,
+            "error": _ai_finance_sentence(failed_code),
+        }
+        encoded = json.dumps(public).encode("utf-8")
+    if len(encoded) > _AI_FINANCE_RESPONSE_BYTES:
+        public = {
+            "ok": False,
+            "code": "response_exceeds_bound",
+            "error": _ai_finance_sentence("response_exceeds_bound"),
+        }
+    status = _ai_finance_status(public)
+    logger.info("ai-finance status=%s code=%s", status, public.get("code"))
+    return status, public
 
 
 def _normalize_content_type_key(raw: str) -> str:
@@ -20276,6 +20556,68 @@ async def _handle_client(
                 )
                 return
             code, payload = await bridge.handle_market_digest_read(digest_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # POST /internal/ai-finance/prepare. Admin token only; the gate above
+        # rejects a missing token and an MCP token before this route runs.
+        if path == "/internal/ai-finance/prepare":
+            if method != "POST":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            try:
+                ai_prepare_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(ai_prepare_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(
+                    writer, 400, "Bad Request", {"ok": False, "error": "Parse error"}
+                )
+                return
+            code, payload = await bridge.handle_ai_finance_prepare(ai_prepare_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
+        # POST /internal/ai-finance/read. Admin token only; the gate above
+        # rejects a missing token and an MCP token before this route runs.
+        if path == "/internal/ai-finance/read":
+            if method != "POST":
+                await _send_http(
+                    writer,
+                    405,
+                    "Method Not Allowed",
+                    {"ok": False, "error": "Method Not Allowed"},
+                )
+                return
+            try:
+                ai_read_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(ai_read_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(
+                    writer, 400, "Bad Request", {"ok": False, "error": "Parse error"}
+                )
+                return
+            code, payload = await bridge.handle_ai_finance_read(ai_read_body)
             status_label = {
                 200: "OK",
                 400: "Bad Request",
