@@ -86,6 +86,7 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-earnings-deep", "dalton-earnings-deep", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-stock-move", "dalton-stock-move", ("dalton-conventions", "research-conventions")),
     ("dalton-thesis-delta", "dalton-thesis-delta", ("dalton-conventions", "research-conventions")),
+    ("dalton-msft-tracker", None, ("dalton-thesis-delta",)),
     ("dalton-sector-delta", None, ("dalton-conventions", "research-conventions", "dalton-knowledge", "dalton-agenda")),
     ("dalton-filing-review", "dalton-filing-review", ("dalton-conventions", "research-conventions")),
     ("dalton-weekly-review", "weekly-review", ("dalton-conventions", "research-conventions", _RW)),
