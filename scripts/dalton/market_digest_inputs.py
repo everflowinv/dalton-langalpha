@@ -11,6 +11,9 @@ path is rejected and is not opened.
 The child process group is reaped when the leader exits or the timeout expires.
 Descendants that still hold the pipes are included. Each pipe reader owns a
 duplicate descriptor and exits before the stream that owns the original is closed.
+Optional ``input_bytes`` is written on a side thread while those readers drain,
+and that writer is joined on exit and on timeout. The default leaves stdin as
+``DEVNULL``.
 
 Credentials stay in the child environment built by
 ``build_nonarchive_subprocess_env``. This module does not read shell profiles,
@@ -66,6 +69,7 @@ DEFAULT_STDOUT_LIMIT_BYTES = 1024 * 1024
 MAX_STDOUT_LIMIT_BYTES = 2 * 1024 * 1024
 DEFAULT_STDERR_LIMIT_BYTES = 0
 MAX_STDERR_LIMIT_BYTES = 64 * 1024
+MAX_STDIN_BYTES = 2 * 1024 * 1024
 MAX_JSON_BYTES = 32 * 1024 * 1024
 DEFAULT_READ_MAX_BYTES = 32 * 1024 * 1024
 HARD_READ_MAX_BYTES = 64 * 1024 * 1024
@@ -142,6 +146,7 @@ class JsonCommandRunner(Protocol):
         stdout_limit_bytes: int,
         stderr_limit_bytes: int,
         on_spawn: Callable[[int], None] | None = None,
+        input_bytes: bytes | None = None,
     ) -> ChildResult: ...
 
 
@@ -563,6 +568,43 @@ def _finish_pipe(
             pass
 
 
+def _write_stdin(stream: Any, payload: bytes) -> None:
+    """Write ``payload`` from a side thread, then close stdin so the child sees EOF."""
+
+    try:
+        if stream is None:
+            return
+        view = memoryview(payload)
+        offset = 0
+        fd = stream.fileno()
+        while offset < len(view):
+            written = os.write(fd, view[offset:])
+            if written <= 0:
+                break
+            offset += written
+    except Exception:
+        return
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _finish_writer(thread: threading.Thread | None, stream: Any) -> None:
+    """Join the stdin writer. Close a pipe the writer never took."""
+
+    if thread is None:
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        return
+    thread.join(timeout=_PIPE_JOIN_SECONDS)
+
+
 def run_json_command(
     argv: list[str],
     *,
@@ -571,6 +613,7 @@ def run_json_command(
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
     on_spawn: Callable[[int], None] | None = None,
+    input_bytes: bytes | None = None,
 ) -> ChildResult:
     """Run ``argv`` with ``shell=False``, a bounded timeout, and bounded stdout.
 
@@ -578,7 +621,10 @@ def run_json_command(
     can persist the pid before a crash. The owned process group is reaped when
     the leader exits or the timeout expires, including descendants that still
     hold the pipes. Pipe readers are joined before their streams are closed.
-    This function does not start another process.
+    ``input_bytes=None`` keeps stdin on ``DEVNULL``. Any other value is bytes
+    of at most 2MiB, written on a side thread that starts with the stdout and
+    stderr drains and is joined after the process group is reaped. This function
+    does not start another process.
     """
 
     if (
@@ -589,38 +635,53 @@ def run_json_command(
         raise PrepareConfigError("argv must be a non-empty list of strings")
     if timeout_seconds <= 0:
         raise PrepareConfigError("timeout_seconds must be positive")
+    if input_bytes is not None:
+        if not isinstance(input_bytes, bytes) or len(input_bytes) > MAX_STDIN_BYTES:
+            raise PrepareConfigError("input_bytes must be at most 2MiB of bytes")
     child_env = {str(key): str(value) for key, value in env.items() if value is not None}
     cwd: str | None = None
     if len(argv) >= 2 and argv[1].startswith(os.sep):
         parent = Path(argv[1]).resolve().parent
         if parent.is_dir():
             cwd = str(parent)
-    proc = subprocess.Popen(
-        argv,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        env=child_env,
-        cwd=cwd,
-        shell=False,
-        start_new_session=True,
-    )
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": subprocess.DEVNULL if input_bytes is None else subprocess.PIPE,
+        "env": child_env,
+        "cwd": cwd,
+        "shell": False,
+        "start_new_session": True,
+    }
+    if input_bytes is not None:
+        popen_kwargs["bufsize"] = 0
+    proc = subprocess.Popen(argv, **popen_kwargs)
     out_box: dict[str, tuple[bytes, int, bool]] = {}
     err_box: dict[str, tuple[bytes, int, bool]] = {}
     out_reader: tuple[threading.Thread, threading.Event] | None = None
     err_reader: tuple[threading.Thread, threading.Event] | None = None
+    writer: threading.Thread | None = None
     timed_out = False
     try:
         if on_spawn is not None:
             on_spawn(proc.pid)
         out_reader = _start_pipe_reader(proc.stdout, stdout_limit_bytes, out_box)
         err_reader = _start_pipe_reader(proc.stderr, stderr_limit_bytes, err_box)
+        if input_bytes is not None:
+            writer = threading.Thread(
+                target=_write_stdin,
+                args=(proc.stdin, input_bytes),
+                name="market-digest-stdin",
+                daemon=True,
+            )
+            writer.start()
         try:
             proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
     finally:
         _reap_group(proc)
+        _finish_writer(writer, None if input_bytes is None else proc.stdin)
         _finish_pipe(out_reader, proc.stdout)
         _finish_pipe(err_reader, proc.stderr)
     stdout_raw, _, stdout_truncated = out_box.get("value", (b"", 0, False))
@@ -696,10 +757,8 @@ def validate_config(config: PrepareConfig) -> PrepareConfig:
     state_root = _as_dir(_as_absolute(config.state_root, "state_root"), "state_root", must_exist=False)
     skill_dir = _as_dir(_as_absolute(config.skill_dir, "skill_dir"), "skill_dir", must_exist=True)
     tmtb_script = _as_file(_as_absolute(config.tmtb_script, "tmtb_script"), "tmtb_script")
-    python_executable = _as_file(
-        _as_absolute(config.python_executable, "python"),
-        "python",
-    )
+    python_executable = _as_absolute(config.python_executable, "python")
+    _as_file(python_executable, "python")
     if not os.access(python_executable, os.X_OK):
         raise PrepareConfigError("python must be executable")
     repo_root = _as_dir(

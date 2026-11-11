@@ -93,6 +93,7 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-call", "dalton-call", ("dalton-conventions", "research-conventions")),
     ("dalton-pm-qa", "pm-qa", ("dalton-conventions", "research-conventions")),
     ("dalton-transcript-polish", "transcribe", ("dalton-conventions", "research-conventions")),
+    ("dalton-market-digest", None, ()),
     ("dalton-language", None, ()),
     ("dalton-onboarding", None, ()),
 )
