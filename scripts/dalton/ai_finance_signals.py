@@ -50,7 +50,11 @@ MAX_RESPONSE_BYTES = 128 * 1024
 DEFAULT_MAX_CHARS = 16000
 MAX_CHARS = 32000
 _OBJECT_MAX_BYTES = 256 * 1024
-_MAX_RECORDS = 80
+# A prepared earnings scan still holds at most 80 transcripts. Signal rows may
+# add GitHub records on top of those 80, so the bundle ceiling is 256. The
+# original validator still matches each row to the scan and the candidate review.
+_EARNINGS_SCAN_MAX = 80
+_MAX_RECORDS = 256
 _MAX_STRING = 4000
 _MAX_DEPTH = 8
 _SOURCE_MAX_BYTES = 32 * 1024 * 1024
@@ -100,8 +104,25 @@ _SIGNAL_KEYS = frozenset({
     "investment_implication",
     "tags",
 })
-_DECISION_KEYS = frozenset({"repo", "decision", "reason", "readme_url", "displayed"})
-_DISPOSITION_KEYS = frozenset({"doc_id", "disposition", "reason"})
+_DECISION_KEYS = frozenset({
+    "repo",
+    "decision",
+    "reason",
+    "readme_url",
+    "displayed",
+    "upstream",
+    "upstream_evidence",
+})
+_DISPOSITION_KEYS = frozenset({
+    "doc_id",
+    "entity",
+    "disposition",
+    "signal_direction",
+    "evidence_status",
+    "reason",
+    "key_evidence",
+    "qa_checked",
+})
 _FORBIDDEN_KEYS = frozenset({
     "full_text",
     "transcript",
@@ -731,8 +752,12 @@ def _check_bundle(
 
 
 def _check_dispositions(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Dispositions carry doc_id, disposition, and an optional reason. Nothing else."""
+    """Validate one disposition and its structured metadata per scanned transcript."""
+    if len(records) > _EARNINGS_SCAN_MAX:
+        return _error("bundle_invalid", reason="bundle_oversize")
     for record in records:
+        if _contains_forbidden_key(record):
+            return _error("bundle_invalid", reason="transcript_rejected")
         if set(record) - _DISPOSITION_KEYS or not {"doc_id", "disposition"} <= set(record):
             return _error("bundle_invalid", reason="bundle_invalid")
         doc_id = record.get("doc_id")
@@ -749,8 +774,16 @@ def _check_dispositions(records: list[dict[str, Any]]) -> dict[str, Any] | None:
             return _error("bundle_invalid", reason="bundle_invalid")
         if record.get("disposition") not in {"signal", "watchlist", "reject"}:
             return _error("bundle_invalid", reason="bundle_invalid")
-        if "reason" in record and (not isinstance(record.get("reason"), str) or not record["reason"].strip()):
+        if "signal_direction" in record and record.get("signal_direction") not in _DIRECTIONS:
             return _error("bundle_invalid", reason="bundle_invalid")
+        if "qa_checked" in record and type(record.get("qa_checked")) is not bool:
+            return _error("bundle_invalid", reason="bundle_invalid")
+        for key in ("entity", "evidence_status", "reason", "key_evidence"):
+            if key not in record:
+                continue
+            value = record.get(key)
+            if not isinstance(value, str) or not value.strip() or len(value) > _MAX_STRING or "\x00" in value:
+                return _error("bundle_invalid", reason="bundle_invalid")
     return None
 
 
@@ -768,8 +801,11 @@ def _check_decisions(
             return _error("bundle_invalid", reason="github_duplicate_candidate")
         by_name[key] = item
     seen: set[str] = set()
+    required = {"repo", "decision", "reason", "readme_url"}
     for record in records:
-        if set(record) - _DECISION_KEYS or not _DECISION_KEYS <= (set(record) | {"displayed"}):
+        if _contains_forbidden_key(record):
+            return _error("bundle_invalid", reason="transcript_rejected")
+        if set(record) - _DECISION_KEYS or not required <= set(record):
             return _error("bundle_invalid", reason="github_decision_invalid")
         repo = record.get("repo")
         if not isinstance(repo, str) or _REPO.fullmatch(repo) is None:
@@ -789,6 +825,12 @@ def _check_decisions(
             return _error("bundle_invalid", reason="github_decision_invalid")
         if "displayed" in record and type(record.get("displayed")) is not bool:
             return _error("bundle_invalid", reason="github_decision_invalid")
+        for field in ("upstream", "upstream_evidence"):
+            if field not in record:
+                continue
+            value = record.get(field)
+            if not isinstance(value, str) or not value.strip() or len(value) > _MAX_STRING or "\x00" in value:
+                return _error("bundle_invalid", reason="github_decision_invalid")
         if record["decision"] == "include" and not _eligible(candidate):
             return _error("bundle_invalid", reason="github_not_eligible")
     if seen != set(by_name):
@@ -811,8 +853,15 @@ def _check_signal_fields(
         for item in candidates
         if _eligible(item)
     }
+    if len(records) > _MAX_RECORDS:
+        return _error("bundle_invalid", reason="bundle_oversize")
+    earnings_count = sum(1 for record in records if record.get("source_type") == "earnings")
+    if earnings_count > _EARNINGS_SCAN_MAX:
+        return _error("bundle_invalid", reason="bundle_oversize")
     for record in records:
-        if set(record) - _SIGNAL_KEYS or _FORBIDDEN_KEYS & set(record):
+        if _contains_forbidden_key(record):
+            return _error("bundle_invalid", reason="transcript_rejected")
+        if set(record) - _SIGNAL_KEYS:
             return _error("bundle_invalid", reason="signal_fields_invalid")
         if record.get("source_type") not in {"github", "earnings"}:
             return _error("bundle_invalid", reason="signal_fields_invalid")
@@ -832,14 +881,25 @@ def _check_signal_fields(
         if "url" in record and record["url"] not in ("", None) and not _https_url(record.get("url")):
             return _error("bundle_invalid", reason="signal_fields_invalid")
         if record["source_type"] == "earnings":
-            if not isinstance(record.get("qa_concern"), str) or not record["qa_concern"].strip():
+            concern = record.get("qa_concern")
+            response = record.get("management_response")
+            status = record.get("management_response_status")
+            if not isinstance(concern, str) or not isinstance(response, str) or not isinstance(status, str):
                 return _error("bundle_invalid", reason="signal_fields_invalid")
-            if record.get("management_response_status") not in _RESPONSE_STATUS:
+            if (
+                len(concern) > _MAX_STRING
+                or len(response) > _MAX_STRING
+                or "\x00" in concern
+                or "\x00" in response
+            ):
                 return _error("bundle_invalid", reason="signal_fields_invalid")
-            if record["management_response_status"] != "evasive_or_unanswered":
-                response = record.get("management_response")
-                if not isinstance(response, str) or not response.strip():
+            if status == "":
+                if concern != "" or response != "":
                     return _error("bundle_invalid", reason="signal_fields_invalid")
+            elif status not in _RESPONSE_STATUS or not concern.strip():
+                return _error("bundle_invalid", reason="signal_fields_invalid")
+            elif status != "evasive_or_unanswered" and not response.strip():
+                return _error("bundle_invalid", reason="signal_fields_invalid")
         if record["source_type"] == "github":
             key = record["external_id"].lower()
             if key not in included or key not in eligible:
@@ -848,7 +908,27 @@ def _check_signal_fields(
             canonical = canonical_record(dict(record))
         except (TypeError, ValueError):
             return _error("bundle_invalid", reason="signal_fields_invalid")
-        expected = f"{canonical['source_type']}:{canonical['external_id']}:{canonical['event_time'][:10]}"
+        external_id = record.get("external_id")
+        if record["source_type"] == "earnings":
+            if (
+                not isinstance(external_id, str)
+                or not external_id
+                or external_id != external_id.strip()
+                or len(external_id) > 128
+                or ".." in external_id
+                or "/" in external_id
+                or "\\" in external_id
+                or "\x00" in external_id
+            ):
+                return _error("bundle_invalid", reason="signal_fields_invalid")
+            expected = f"earnings:{external_id}"
+        else:
+            if not isinstance(external_id, str) or _REPO.fullmatch(external_id) is None:
+                return _error("bundle_invalid", reason="signal_fields_invalid")
+            day = _iso_date(str(record.get("event_time"))[:10])
+            if day is None:
+                return _error("bundle_invalid", reason="signal_fields_invalid")
+            expected = f"github:{external_id}:{day}"
         if record.get("record_key") != expected or canonical["record_key"] != expected:
             return _error("bundle_invalid", reason="record_key_invalid")
         if canonical["signal_direction"] not in _DIRECTIONS:
