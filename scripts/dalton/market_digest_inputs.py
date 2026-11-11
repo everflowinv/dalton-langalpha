@@ -18,6 +18,10 @@ Credentials stay in the child environment built by
 
 ``status`` prints metadata and hashes. ``read`` returns the saved batch for the
 research step and does not accept a filesystem path.
+
+``prepare_execution_inputs`` binds one canonical automation execution id to one
+prepared attempt. A later call keeps that attempt, including after midnight,
+and does not start another digest command.
 """
 
 from __future__ import annotations
@@ -2421,11 +2425,15 @@ def _begin(
     now: datetime,
     runner: JsonCommandRunner,
     env_builder: NonarchiveEnvBuilder,
+    *,
+    on_persisted: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     child_env = _child_env(config, env_builder)
     attempt = _new_attempt(config, period, hong_kong_date(now), now)
     _attach_state(attempt, state_root)
     _persist(state_root, attempt)
+    if on_persisted is not None:
+        on_persisted(attempt)
     try:
         child = _invoke(
             config,
@@ -2482,6 +2490,558 @@ def prepare_inputs(
         if existing is None:
             return _begin(checked, checked.state_root, selected, current, command_runner, builder)
         return _resume(checked, checked.state_root, existing, command_runner, builder)
+
+
+_BINDING_KEYS = frozenset(
+    {
+        "schema",
+        "automation_execution_id",
+        "period",
+        "prepared_execution_id",
+        "started_hkt_date",
+        "authoritative_date",
+        "batch_id",
+        "hashes",
+    }
+)
+_HASH_FIELD_KEYS = (
+    "input_sha256",
+    "emails_sha256",
+    "tmtb_sha256",
+    "digest_source_sha256",
+    "tmtb_source_sha256",
+)
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _canonical_automation_id(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) != 36:
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if str(parsed) != value:
+        return None
+    return value
+
+
+def _hex32(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 32
+        and all(char in _HEX_CHARS for char in value)
+    )
+
+
+def _hex64(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in _HEX_CHARS for char in value)
+    )
+
+
+def _copy_hashes(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) != set(_HASH_FIELD_KEYS):
+        return None
+    copied: dict[str, Any] = {}
+    for key in _HASH_FIELD_KEYS:
+        item = value.get(key)
+        if key in {"digest_source_sha256", "tmtb_source_sha256"} and item is None:
+            copied[key] = None
+            continue
+        if not _hex64(item):
+            return None
+        copied[key] = item
+    return copied
+
+
+def _attempt_identity_ok(attempt: Mapping[str, Any], period: str) -> bool:
+    schema = attempt.get("schema")
+    if schema != SCHEMA or isinstance(schema, bool):
+        return False
+    if attempt.get("period") != period:
+        return False
+    if _valid_date(attempt.get("started_hkt_date")) is None:
+        return False
+    if not _hex32(attempt.get("execution_id")):
+        return False
+    if not isinstance(attempt.get("digest"), dict):
+        return False
+    if not isinstance(attempt.get("tmtb"), dict):
+        return False
+    return True
+
+
+def _contained(path: Path, parent: Path) -> bool:
+    if parent.is_symlink() or path.is_symlink():
+        return False
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _read_state_mapping(
+    path: Path,
+    parent: Path,
+    max_bytes: int,
+) -> tuple[dict[str, Any] | None, str]:
+    """Return ``(document, "ok"|"missing"|"corrupt")`` without following a link."""
+
+    try:
+        if not _contained(path, parent):
+            return None, "corrupt"
+        if not path.exists():
+            return None, "missing"
+        raw = _read_regular_bytes(path, max_bytes)
+    except _OutputRejected:
+        return None, "corrupt"
+    except OSError:
+        return None, "corrupt"
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None, "corrupt"
+    if not isinstance(value, dict):
+        return None, "corrupt"
+    return value, "ok"
+
+
+def _binding_file(state_root: Path, canonical_id: str) -> Path:
+    directory = state_root / "executions"
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise PrepareConfigError("state record must be a regular file")
+    path = directory / f"{canonical_id}.json"
+    if not _contained(path, directory):
+        raise PrepareConfigError("state record must be a regular file")
+    return path
+
+
+@contextmanager
+def _execution_lock(state_root: Path, canonical_id: str):
+    """Same thread lock plus flock as a period lock, named only by a UUID."""
+
+    if _canonical_automation_id(canonical_id) != canonical_id:
+        raise PrepareConfigError("automation_execution_id must be a canonical UUID")
+    lock_dir = state_root / "locks"
+    if lock_dir.is_symlink():
+        raise PrepareConfigError("state record must be a regular file")
+    _mkdir(lock_dir)
+    lock_path = lock_dir / f"execution_{canonical_id}.lock"
+    if lock_path.is_symlink() or not _contained(lock_path, lock_dir):
+        raise PrepareConfigError("state record must be a regular file")
+    thread_lock = _thread_lock_for(lock_path.resolve())
+    with thread_lock:
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _execution_refusal(
+    code: str,
+    *,
+    period: str | None,
+    automation_execution_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "ok": False,
+        "usable": False,
+        "preparation_status": code,
+        "reason": code,
+        "period": period,
+        "started_hkt_date": None,
+        "authoritative_date": None,
+        "execution_id": None,
+        "automation_execution_id": automation_execution_id,
+        "digest_outcome": None,
+        "digest_invoked": False,
+        "tmtb_invoked": False,
+        "reused": False,
+        "emails_count": None,
+        "priority_senders": None,
+        "funda": None,
+        "image_backlog": None,
+        "tmtb": None,
+        "hashes": None,
+        "batch_id": None,
+    }
+
+
+def _binding_refusal(code: str, automation_execution_id: str | None) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "code": code,
+        "automation_execution_id": automation_execution_id,
+    }
+
+
+def _validated_binding(
+    document: Mapping[str, Any],
+    canonical_id: str,
+) -> dict[str, Any] | None:
+    if set(document) != _BINDING_KEYS:
+        return None
+    schema = document.get("schema")
+    if schema != SCHEMA or isinstance(schema, bool):
+        return None
+    if document.get("automation_execution_id") != canonical_id:
+        return None
+    period = document.get("period")
+    if period not in {"AM", "PM"}:
+        return None
+    if not _hex32(document.get("prepared_execution_id")):
+        return None
+    started = _valid_date(document.get("started_hkt_date"))
+    if started is None:
+        return None
+    raw_date = document.get("authoritative_date")
+    if raw_date is None:
+        authoritative = None
+    else:
+        authoritative = _valid_date(raw_date)
+        if authoritative is None:
+            return None
+    raw_batch = document.get("batch_id")
+    if raw_batch is None:
+        batch_id = None
+    elif (
+        authoritative is not None
+        and isinstance(raw_batch, str)
+        and raw_batch == f"{period}/{authoritative}"
+    ):
+        batch_id = raw_batch
+    else:
+        return None
+    raw_hashes = document.get("hashes")
+    if raw_hashes is None:
+        hashes = None
+    else:
+        hashes = _copy_hashes(raw_hashes)
+        if hashes is None:
+            return None
+    return {
+        "schema": SCHEMA,
+        "automation_execution_id": canonical_id,
+        "period": period,
+        "prepared_execution_id": document["prepared_execution_id"],
+        "started_hkt_date": started,
+        "authoritative_date": authoritative,
+        "batch_id": batch_id,
+        "hashes": hashes,
+    }
+
+
+def _load_binding(
+    state_root: Path,
+    canonical_id: str,
+) -> tuple[dict[str, Any] | None, str]:
+    try:
+        path = _binding_file(state_root, canonical_id)
+    except PrepareConfigError:
+        return None, "corrupt"
+    document, status = _read_state_mapping(
+        path,
+        state_root / "executions",
+        MAX_ATTEMPT_BYTES,
+    )
+    if status != "ok" or document is None:
+        return None, status
+    binding = _validated_binding(document, canonical_id)
+    if binding is None:
+        return None, "corrupt"
+    return binding, "ok"
+
+
+def _write_binding(state_root: Path, binding: Mapping[str, Any]) -> None:
+    canonical = str(binding["automation_execution_id"])
+    path = _binding_file(state_root, canonical)
+    _atomic_json(path, binding)
+
+
+def _binding_from_attempt(
+    automation_execution_id: str,
+    attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    period = str(attempt["period"])
+    result = attempt.get("result") if isinstance(attempt.get("result"), Mapping) else {}
+    authoritative = _valid_date(attempt.get("authoritative_date"))
+    if authoritative is None:
+        authoritative = _valid_date(result.get("authoritative_date"))
+    batch_id = None
+    if authoritative is not None and result.get("batch_id") == f"{period}/{authoritative}":
+        batch_id = f"{period}/{authoritative}"
+    return {
+        "schema": SCHEMA,
+        "automation_execution_id": automation_execution_id,
+        "period": period,
+        "prepared_execution_id": attempt["execution_id"],
+        "started_hkt_date": attempt["started_hkt_date"],
+        "authoritative_date": authoritative,
+        "batch_id": batch_id,
+        "hashes": _copy_hashes(result.get("hashes")),
+    }
+
+
+def _merge_binding_metadata(
+    binding: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    updated = dict(binding)
+    if result.get("execution_id") != binding["prepared_execution_id"]:
+        return updated
+    if result.get("period") != binding["period"]:
+        return updated
+    if result.get("started_hkt_date") != binding["started_hkt_date"]:
+        return updated
+    authoritative = _valid_date(result.get("authoritative_date"))
+    if authoritative is not None:
+        updated["authoritative_date"] = authoritative
+        expected = f"{binding['period']}/{authoritative}"
+        if result.get("batch_id") == expected:
+            updated["batch_id"] = expected
+    hashes = _copy_hashes(result.get("hashes"))
+    if hashes is not None:
+        updated["hashes"] = hashes
+    return updated
+
+
+def _remember_binding(
+    state_root: Path,
+    canonical_id: str,
+    result: Mapping[str, Any],
+) -> None:
+    binding, status = _load_binding(state_root, canonical_id)
+    if binding is None or status != "ok":
+        return
+    updated = _merge_binding_metadata(binding, result)
+    if updated != binding:
+        _write_binding(state_root, updated)
+
+
+def _with_execution(result: Mapping[str, Any], automation_execution_id: str) -> dict[str, Any]:
+    payload = dict(result)
+    payload["automation_execution_id"] = automation_execution_id
+    return payload
+
+
+def _load_bound_attempt(
+    state_root: Path,
+    binding: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    period = str(binding["period"])
+    started = str(binding["started_hkt_date"])
+    parent = state_root / "attempts" / period
+    document, status = _read_state_mapping(
+        _attempt_path(state_root, period, started),
+        parent,
+        MAX_ATTEMPT_BYTES,
+    )
+    if status == "missing":
+        return None, "attempt_missing"
+    if status != "ok" or document is None:
+        return None, "attempt_corrupt"
+    if (
+        document.get("execution_id") != binding["prepared_execution_id"]
+        or document.get("period") != period
+        or document.get("started_hkt_date") != started
+    ):
+        return None, "attempt_mismatch"
+    if not _attempt_identity_ok(document, period):
+        return None, "attempt_corrupt"
+    return document, None
+
+
+def _bind_attempt(
+    state_root: Path,
+    canonical_id: str,
+    period: str,
+    attempt: Mapping[str, Any],
+) -> None:
+    if not _attempt_identity_ok(attempt, period):
+        raise PrepareConfigError("state record must be a regular file")
+    if attempt.get("started_hkt_date") != _valid_date(attempt.get("started_hkt_date")):
+        raise PrepareConfigError("state record must be a regular file")
+    _write_binding(state_root, _binding_from_attempt(canonical_id, attempt))
+
+
+def _bind_blocked_attempt(
+    state_root: Path,
+    canonical_id: str,
+    period: str,
+    blocked: Mapping[str, Any],
+) -> None:
+    started = _valid_date(blocked.get("started_hkt_date"))
+    prepared = blocked.get("execution_id")
+    if started is None or not _hex32(prepared) or blocked.get("period") != period:
+        return
+    parent = state_root / "attempts" / period
+    document, status = _read_state_mapping(
+        _attempt_path(state_root, period, started),
+        parent,
+        MAX_ATTEMPT_BYTES,
+    )
+    if status != "ok" or document is None:
+        return
+    if document.get("execution_id") != prepared or document.get("started_hkt_date") != started:
+        return
+    if not _attempt_identity_ok(document, period):
+        return
+    _bind_attempt(state_root, canonical_id, period, document)
+
+
+def prepare_execution_inputs(
+    config: PrepareConfig,
+    period: str,
+    automation_execution_id: str,
+    *,
+    now: datetime | None = None,
+    runner: JsonCommandRunner | None = None,
+    env_builder: NonarchiveEnvBuilder | None = None,
+) -> dict[str, Any]:
+    """Bind one automation execution to one prepared attempt, then prepare it.
+
+    The binding is written before mail is consumed. A second call for the same
+    execution reuses that attempt and never selects another date. The same
+    execution with the other period returns ``period_mismatch`` and does not
+    collect. ``execution_id`` in the result remains the prepared attempt id.
+    """
+
+    checked = validate_config(config)
+    selected = _normalize_period(period)
+    current = now if now is not None else datetime.now(HKT)
+    if current.tzinfo is None:
+        raise PrepareConfigError("now must be timezone-aware")
+    canonical = _canonical_automation_id(automation_execution_id)
+    if canonical is None:
+        return _execution_refusal(
+            "invalid_automation_execution",
+            period=selected,
+            automation_execution_id=None,
+        )
+    command_runner = runner or run_json_command
+    builder = env_builder or build_nonarchive_subprocess_env
+    try:
+        _mkdir(checked.state_root)
+        with _execution_lock(checked.state_root, canonical):
+            with _period_lock(checked.state_root, selected):
+                return _prepare_bound_execution(
+                    checked,
+                    selected,
+                    canonical,
+                    current,
+                    command_runner,
+                    builder,
+                )
+    except (OSError, PrepareConfigError):
+        return _execution_refusal(
+            "state_unreadable",
+            period=selected,
+            automation_execution_id=canonical,
+        )
+
+
+def _prepare_bound_execution(
+    config: PrepareConfig,
+    period: str,
+    canonical_id: str,
+    now: datetime,
+    runner: JsonCommandRunner,
+    env_builder: NonarchiveEnvBuilder,
+) -> dict[str, Any]:
+    state_root = config.state_root
+    binding, status = _load_binding(state_root, canonical_id)
+    if status == "corrupt":
+        return _execution_refusal(
+            "binding_corrupt",
+            period=period,
+            automation_execution_id=canonical_id,
+        )
+    if binding is not None:
+        if binding["period"] != period:
+            return _execution_refusal(
+                "period_mismatch",
+                period=period,
+                automation_execution_id=canonical_id,
+            )
+        attempt, error = _load_bound_attempt(state_root, binding)
+        if error is not None or attempt is None:
+            return _execution_refusal(
+                error or "attempt_corrupt",
+                period=period,
+                automation_execution_id=canonical_id,
+            )
+        result = _resume(config, state_root, attempt, runner, env_builder)
+        _remember_binding(state_root, canonical_id, result)
+        return _with_execution(result, canonical_id)
+
+    blocked = _reconcile_running_digests(state_root, period)
+    if blocked is not None:
+        _bind_blocked_attempt(state_root, canonical_id, period, blocked)
+        return _with_execution(blocked, canonical_id)
+    existing = _covering_attempt(state_root, period, hong_kong_date(now))
+    if existing is not None:
+        if not _attempt_identity_ok(existing, period):
+            return _execution_refusal(
+                "attempt_corrupt",
+                period=period,
+                automation_execution_id=canonical_id,
+            )
+        _bind_attempt(state_root, canonical_id, period, existing)
+        result = _resume(config, state_root, existing, runner, env_builder)
+        _remember_binding(state_root, canonical_id, result)
+        return _with_execution(result, canonical_id)
+
+    def on_persisted(attempt: dict[str, Any]) -> None:
+        _bind_attempt(state_root, canonical_id, period, attempt)
+
+    result = _begin(
+        config,
+        state_root,
+        period,
+        now,
+        runner,
+        env_builder,
+        on_persisted=on_persisted,
+    )
+    _remember_binding(state_root, canonical_id, result)
+    return _with_execution(result, canonical_id)
+
+
+def get_execution_binding(state_root: Path, automation_execution_id: str) -> dict[str, Any]:
+    """Return one execution binding. Missing and corrupt records do not collect."""
+
+    root = _as_dir(_as_absolute(state_root, "state_root"), "state_root", must_exist=True)
+    canonical = _canonical_automation_id(automation_execution_id)
+    if canonical is None:
+        return _binding_refusal("invalid_automation_execution", None)
+    try:
+        binding, status = _load_binding(root, canonical)
+    except OSError:
+        return _binding_refusal("binding_corrupt", canonical)
+    if binding is None:
+        code = "binding_missing" if status == "missing" else "binding_corrupt"
+        return _binding_refusal(code, canonical)
+    payload = dict(binding)
+    payload["ok"] = True
+    payload["code"] = "ok"
+    return payload
 
 
 def _lookup_attempt(state_root: Path, period: str, date_value: str) -> dict[str, Any] | None:
