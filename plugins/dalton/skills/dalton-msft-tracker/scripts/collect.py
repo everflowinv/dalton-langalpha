@@ -1977,7 +1977,7 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
             covered_day = parse_day(str(covered), "ae.covered_until")
             # 同一天重新采集未完成时，保留已经提交的覆盖日期。
             # 从更早的覆盖日抬到本窗口终点，或超过终点，仍然拒绝。
-            if covered_day > end or (covered_day == end and retained.get(row["query"]) != end):
+            if covered_day > end or (covered_day == end and retained.get(row["query"], "") < covered_day):
                 raise CollectError("ae_incomplete_advanced", "未完成的 AE 查询不能把覆盖日期推进到窗口终点")
         if start > end:
             raise CollectError("bad_ae_state", "AE 窗口起点晚于终点")

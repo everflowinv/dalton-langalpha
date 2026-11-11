@@ -1455,3 +1455,23 @@ def test_legacy_incomplete_window_can_commit_and_resume(monkeypatch, tmp_path, c
     assert len(calls) == 2
     assert all(row["start"] == "2026-10-25" and row["end"] == "2026-10-28" for row in calls)
     assert all(row["params"].get("cursor") == ("new-query-cursor" if mode == "has_more" else None) for row in calls)
+
+
+def test_old_incomplete_packet_commits_after_newer_coverage(monkeypatch, tmp_path, capsys):
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    ws = _workspace(tmp_path)
+    (ws / "data/consensus/snap.json").write_text("{}", encoding="utf-8")
+    old_state = _ae_state("2026-11-10", "query")
+    old_state["queries"][0]["complete"] = False
+    old_state["queries"][0]["cursor"] = "old-cursor"
+    _write_packet(ws, "20261110-2200", "2026-11-10", new_ids=["old-doc"], ae=old_state)
+    _write_packet(ws, "20261111-2200", "2026-11-11", new_ids=["new-doc"], ae=_ae_state("2026-11-11", "query"))
+    def commit(run):
+        return _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", run, "--material", "no", "--summary", run])
+    assert commit("20261111-2200")[0] == 0
+    latest = (ws / "research/tracker/last_run.json").read_bytes()
+    assert commit("20261110-2200")[0] == 0
+    assert commit("20261110-2200")[0] == 0
+    assert (ws / "research/tracker/last_run.json").read_bytes() == latest
+    assert _log_count((ws / "research/tracker/updates.log").read_text(), "20261110-2200") == 1
+    assert {"old-doc", "new-doc"} <= set(_read_json(ws / "research/tracker/seen.json"))
