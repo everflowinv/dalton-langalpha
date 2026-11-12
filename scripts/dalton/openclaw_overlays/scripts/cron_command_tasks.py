@@ -67,7 +67,7 @@ US_TOPBOTTOM_COLLECTORS: tuple[tuple[str, str], ...] = (
     ('us-top-monitor', 'skills/us-top-monitor/scripts/us_top_monitor_cli.py'),
 )
 US_TOPBOTTOM_SKILLS = tuple(skill for skill, _ in US_TOPBOTTOM_COLLECTORS)
-ALLOWED_CHART_SUFFIXES = frozenset({'.png', '.jpg', '.jpeg', '.webp', '.gif', '.md'})
+ALLOWED_CHART_SUFFIXES = frozenset({'.png', '.jpg', '.jpeg', '.webp', '.gif', '.md', '.txt'})
 DEFAULT_CONTAINER_PYTHON_BIN = '/app/.venv/bin/python'
 DEFAULT_TMPFS_OUTBOX_DIR = Path('/run/dalton-outbox')
 DEFAULT_CONTAINER_SECRETS_DIR = Path('/run/dalton-secrets')
@@ -583,6 +583,12 @@ ETF_DRY_RUN_BANNER = '--- 飞书卡片 JSON (Dry Run) ---'
 AI_CHAIN_TASK = 'ai-chain-daily'
 ETF_TASK = 'us-etf-monthly-flows'
 VOL_SURFACE_TASK = 'vol-surface-daily-snapshot'
+E_WATCH_DAILY_TASK = 'e-watch-daily'
+E_WATCH_ATTACHMENT_TEXT = '📎 e-watch 全文（含未触发清单与口径）'
+PT_WATCHLIST_TASKS = ('pt-watchlist-asia', 'pt-watchlist-us')
+CHINA_2C_TASKS = ('china-2c-hk-monitor', 'china-2c-us-monitor')
+PT_TASK_CODES = {'pt-watchlist-asia': 'T41', 'pt-watchlist-us': 'T23'}
+CHINA_TASK_CODES = {'china-2c-hk-monitor': 'T43', 'china-2c-us-monitor': 'T24'}
 
 
 def ai_chain_delivery_spec(obj):
@@ -658,10 +664,14 @@ def etf_dry_run_outbox(stdout):
 
 
 def _run_workspace_argv(argv, ws_root, accepted=(0,), timeout=540):
+    """Run one workspace command.
+
+    ``TimeoutExpired`` is not wrapped. The original ``Runner.run`` lets that
+    exception surface, and the task line is ``{task} 执行失败：`` plus
+    ``str(TimeoutExpired)`` (``Command '…' timed out after N seconds``).
+    """
     try:
         result = subprocess.run(argv, cwd=ws_root, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f'{argv[0]} 超时（timeout {timeout}s）') from exc
     except OSError as exc:
         raise RuntimeError(f'{argv[0]} 启动失败：{exc}') from exc
     raw = result.stdout or ''
@@ -1068,6 +1078,299 @@ def run_dalton_us_topbottom_preview() -> int:
         return 1 if error else 0
 
 
+def _items_from_spec(spec):
+    """Turn a delivery spec into ``message()`` items. ``plan()`` and tests share this."""
+    items = []
+    for entry in spec:
+        text = entry.get('text')
+        if not isinstance(text, str):
+            raise ValueError('投递文本必须是字符串')
+        media = entry.get('media')
+        if media:
+            items.append(message(entry['channel'], entry['target'], text, media))
+        else:
+            items.append(message(entry['channel'], entry['target'], text))
+    return items
+
+
+def e_watch_daily_delivery_spec(obj):
+    """Discord DMs OpenClaw would send for one e-watch daily JSON object.
+
+    Each ``messages`` entry is its own message. The full-text file is one more
+    message after those, even when ``messages`` is empty.
+    """
+    spec = [
+        {'channel': 'discord', 'target': V_DM, 'text': text, 'media': None}
+        for text in obj['messages']
+    ]
+    spec.append({
+        'channel': 'discord',
+        'target': V_DM,
+        'text': E_WATCH_ATTACHMENT_TEXT,
+        'media': obj['report_file'],
+    })
+    return spec
+
+
+def e_watch_daily_failure_text(exc):
+    return f'{E_WATCH_DAILY_TASK} 执行失败：{exc}'
+
+
+def pt_watchlist_delivery_spec(obj):
+    """One Feishu message, plus a second only when ``jepq_message`` is truthy."""
+    if obj['feishu_target'] != ASIA:
+        raise ValueError('投递目标与原任务不一致，请检查脚本配置')
+    spec = [{'channel': 'feishu', 'target': ASIA, 'text': obj['main_message'], 'media': None}]
+    if obj.get('jepq_message'):
+        spec.append({'channel': 'feishu', 'target': ASIA, 'text': obj['jepq_message'], 'media': None})
+    return spec
+
+
+def china_2c_delivery_spec(raw):
+    """One Feishu message: the monitor's stdout, including its trailing newline."""
+    if not raw.strip():
+        raise ValueError('消费监控输出为空')
+    return [{'channel': 'feishu', 'target': ASIA, 'text': raw, 'media': None}]
+
+
+def _monitor_obj(raw, context='采集输出'):
+    value = json_result(raw, context)
+    if value.get('ok') is False or value.get('status') == 'error':
+        raise RuntimeError(str(value.get('error') or value.get('hint') or value))
+    return value
+
+
+def stage_delivery_items(spec, ws_root, raw_ws, run_dir):
+    """Copy spec media into the run directory and return ordered outbox items."""
+    run_rel = tuple(run_dir.relative_to(ws_root).parts)
+    outbox_items = []
+    for pos, entry in enumerate(spec):
+        text = entry.get('text')
+        if not isinstance(text, str):
+            raise ValueError('投递文本必须是字符串')
+        item = {
+            'index': pos,
+            'channel': entry['channel'],
+            'target': entry['target'],
+            'text': text,
+            'preserve_exact_text': True,
+        }
+        media = entry.get('media')
+        if media:
+            src = _validate_workspace_chart(media, ws_root, raw_ws)
+            original_name = Path(src.name).name
+            retained = _ensure_safe_workspace_subpath(
+                ws_root, (*run_rel, 'attachments', str(pos), original_name),
+            )
+            retained.parent.mkdir(parents=True, exist_ok=True)
+            chart_bytes, chart_sha = _atomic_copy_chart(src, retained)
+            item['media'] = f'attachments/{pos}/{original_name}'
+            item['filename'] = original_name
+            item['chart_bytes'] = chart_bytes
+            item['chart_sha256'] = chart_sha
+        outbox_items.append(item)
+    return outbox_items
+
+
+def _route_target(channel, target):
+    """Map OpenClaw channel + target to a Dalton route string.
+
+    Kept in this file on purpose. The wrapper child has only ``child_site`` on
+    ``PYTHONPATH`` and cannot import ``src.dalton``.
+    """
+    platform = str(channel or '').strip().lower()
+    text = str(target or '').strip()
+    if platform == 'discord' and (text.startswith('user:') or text.startswith('channel:')):
+        return f'discord:{text}'
+    if platform == 'feishu' and (text.startswith('user:') or text.startswith('chat:')):
+        return f'feishu:{text}'
+    if platform == 'feishu' and text.startswith('oc_'):
+        return f'feishu:chat:{text}'
+    raise ValueError(f'无法转换成通知路由目标：{platform} {text}')
+
+
+def _write_staged_monitor_outbox(staging, *, task_code, job_key, channel, target, run_id, items, notify_on_failure=False):
+    payload = {
+        'schema_version': 1,
+        'task_code': task_code,
+        'job_key': job_key,
+        'run_id': run_id,
+        'channel': channel,
+        'target': target,
+        'route_target': _route_target(channel, target),
+        'text': '\n\n'.join(item['text'] for item in items if item.get('text')),
+        'items': items,
+        'preserve_exact_text': True,
+    }
+    if notify_on_failure:
+        payload['notify_on_failure'] = True
+    _atomic_write_json(staging, payload)
+
+
+def _write_e_watch_failure_outbox(exc):
+    """Stage the failure DM. Any error here is ignored so the caller can still print it."""
+    text = e_watch_daily_failure_text(exc)
+    try:
+        ws_root, raw_ws = _resolve_dalton_workspace()
+        run_id = _resolve_dalton_run_id()
+        run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+        staging = _resolve_staging_outbox_path(run_dir, run_id)
+        _write_staged_monitor_outbox(
+            staging,
+            task_code='T35',
+            job_key=E_WATCH_DAILY_TASK,
+            channel='discord',
+            target=V_DM,
+            run_id=run_id,
+            items=[{
+                'index': 0,
+                'channel': 'discord',
+                'target': V_DM,
+                'text': text,
+                'preserve_exact_text': True,
+            }],
+            notify_on_failure=True,
+        )
+    except Exception:
+        return
+
+
+def run_dalton_e_watch_daily_preview():
+    """Run e-watch daily and stage its Discord DMs. Dalton sends them after confirm."""
+    try:
+        return _run_dalton_e_watch_daily_preview_body()
+    except BlockingIOError:
+        print('NO_REPLY')
+        return 0
+    except Exception as exc:
+        _write_e_watch_failure_outbox(exc)
+        print(e_watch_daily_failure_text(exc))
+        return 1
+
+
+def _run_dalton_e_watch_daily_preview_body():
+    ws_root, raw_ws = _resolve_dalton_workspace()
+    run_id = _resolve_dalton_run_id()
+    run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+    staging = _resolve_staging_outbox_path(run_dir, run_id)
+    lock_fd = None
+    try:
+        lock_fd = _acquire_preview_lock(ws_root, E_WATCH_DAILY_TASK)
+        python_bin = _resolve_dalton_python_bin()
+        result = _run_workspace_argv(
+            [python_bin, 'scripts/e_watch_monitor.py'],
+            ws_root,
+            accepted=(0,),
+        )
+        obj = _monitor_obj(result.stdout or '')
+        spec = e_watch_daily_delivery_spec(obj)
+        items = stage_delivery_items(spec, ws_root, raw_ws, run_dir)
+        _write_staged_monitor_outbox(
+            staging,
+            task_code='T35',
+            job_key=E_WATCH_DAILY_TASK,
+            channel='discord',
+            target=V_DM,
+            run_id=run_id,
+            items=items,
+        )
+        print('NO_REPLY')
+        return 0
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def run_dalton_pt_watchlist_preview(task):
+    """Run the shared PT watchlist script. A failure is logged, not sent."""
+    try:
+        return _run_dalton_pt_watchlist_preview_body(task)
+    except BlockingIOError:
+        print('NO_REPLY')
+        return 0
+    except Exception as exc:
+        print(f'{task} 执行失败：{exc}')
+        return 1
+
+
+def _run_dalton_pt_watchlist_preview_body(task):
+    ws_root, raw_ws = _resolve_dalton_workspace()
+    run_id = _resolve_dalton_run_id()
+    run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+    staging = _resolve_staging_outbox_path(run_dir, run_id)
+    lock_fd = None
+    try:
+        lock_fd = _acquire_preview_lock(ws_root, task)
+        python_bin = _resolve_dalton_python_bin()
+        result = _run_workspace_argv(
+            [python_bin, 'scripts/pt_watchlist_monitor.py'],
+            ws_root,
+            accepted=(0,),
+        )
+        obj = _monitor_obj(result.stdout or '')
+        spec = pt_watchlist_delivery_spec(obj)
+        items = stage_delivery_items(spec, ws_root, raw_ws, run_dir)
+        _write_staged_monitor_outbox(
+            staging,
+            task_code=PT_TASK_CODES[task],
+            job_key=task,
+            channel='feishu',
+            target=ASIA,
+            run_id=run_id,
+            items=items,
+        )
+        print('NO_REPLY')
+        return 0
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def run_dalton_china_2c_preview(task):
+    """Run china-2c for one market. Exit 1 still produced a report. Failures are not sent."""
+    try:
+        return _run_dalton_china_2c_preview_body(task)
+    except BlockingIOError:
+        print('NO_REPLY')
+        return 0
+    except Exception as exc:
+        print(f'{task} 执行失败：{exc}')
+        return 1
+
+
+def _run_dalton_china_2c_preview_body(task):
+    market = 'hk' if '-hk-' in task else 'us'
+    ws_root, raw_ws = _resolve_dalton_workspace()
+    run_id = _resolve_dalton_run_id()
+    run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+    staging = _resolve_staging_outbox_path(run_dir, run_id)
+    lock_fd = None
+    try:
+        lock_fd = _acquire_preview_lock(ws_root, task)
+        python_bin = _resolve_dalton_python_bin()
+        result = _run_workspace_argv(
+            [python_bin, 'scripts/china_2c_monitor.py', '--market', market],
+            ws_root,
+            accepted=(0, 1),
+        )
+        spec = china_2c_delivery_spec(result.stdout or '')
+        items = stage_delivery_items(spec, ws_root, raw_ws, run_dir)
+        _write_staged_monitor_outbox(
+            staging,
+            task_code=CHINA_TASK_CODES[task],
+            job_key=task,
+            channel='feishu',
+            target=ASIA,
+            run_id=run_id,
+            items=items,
+        )
+        print('NO_REPLY')
+        return 0
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
 class Runner:
     def __init__(self, name, root=None):
         self.name = name
@@ -1132,21 +1435,14 @@ class Runner:
                 text = '已生成报告并推送至 Eve tracking 群。'
         elif name.startswith('pt-watchlist-'):
             obj = self.obj(['python3', 'scripts/pt_watchlist_monitor.py'])
-            if obj['feishu_target'] != ASIA:
-                raise ValueError('投递目标与原任务不一致，请检查脚本配置')
-            items = [message('feishu', ASIA, obj['main_message'])]
-            if obj.get('jepq_message'):
-                items.append(message('feishu', ASIA, obj['jepq_message']))
+            items = _items_from_spec(pt_watchlist_delivery_spec(obj))
         elif name.startswith('china-2c-'):
             market = 'hk' if '-hk-' in name else 'us'
             raw = self.run(['python3', 'scripts/china_2c_monitor.py', '--market', market], accepted=(0, 1))
-            if not raw.strip():
-                raise ValueError('消费监控输出为空')
-            items = [message('feishu', ASIA, raw)]
+            items = _items_from_spec(china_2c_delivery_spec(raw))
         elif name == 'e-watch-daily':
             obj = self.obj(['python3', 'scripts/e_watch_monitor.py'])
-            items = [message('discord', V_DM, m) for m in obj['messages']]
-            items.append(message('discord', V_DM, '📎 e-watch 全文（含未触发清单与口径）', obj['report_file']))
+            items = _items_from_spec(e_watch_daily_delivery_spec(obj))
         elif name == 'ai-chain-daily':
             self.run(['bash', 'skills/ai-chain/run.sh', '--json', 'daily-run'])
             path = WS / 'skills/ai-chain/state/daily_push.json'
@@ -1260,6 +1556,12 @@ def main():
         return run_dalton_etf_preview()
     if is_dalton_mode() and args.task == VOL_SURFACE_TASK:
         return run_dalton_vol_surface_preview()
+    if is_dalton_mode() and args.task == E_WATCH_DAILY_TASK:
+        return run_dalton_e_watch_daily_preview()
+    if is_dalton_mode() and args.task in PT_WATCHLIST_TASKS:
+        return run_dalton_pt_watchlist_preview(args.task)
+    if is_dalton_mode() and args.task in CHINA_2C_TASKS:
+        return run_dalton_china_2c_preview(args.task)
     runner = Runner(args.task)
     runner.directory.mkdir(parents=True, exist_ok=True)
     with (runner.directory / 'run.lock').open('w') as lock:

@@ -238,7 +238,7 @@ def _parse_task_baseline_markdown() -> dict[str, dict[str, object]]:
 
 def test_manifest_matches_baseline_and_approved_changes() -> None:
     manifest = load_data_task_manifest()
-    assert len(manifest.tasks) == 28
+    assert len(manifest.tasks) == 35
 
     baseline_rows = _parse_task_baseline_markdown()
     assert len(baseline_rows) == 19
@@ -255,8 +255,9 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
         "T76",
         "T83",
     }
+    batch4_codes = {"T2", "T23", "T24", "T35", "T38", "T41", "T43"}
     assert set(baseline_rows).issubset(by_code)
-    assert set(by_code) - set(baseline_rows) == batch3_codes
+    assert set(by_code) - set(baseline_rows) == batch3_codes | batch4_codes
 
     for code, base in baseline_rows.items():
         entry = by_code[code]
@@ -320,8 +321,8 @@ async def test_sync_manifest_to_db_restores_t25_redacted_python() -> None:
 
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
-    assert count == 28
-    assert len(state["executed"]) == 28
+    assert count == 35
+    assert len(state["executed"]) == 35
 
     # T28 syncs active baseline cron/timezone ("40 9 * * 1-5" / "America/New_York"), not cutover values
     t28_params = next(p for _, p in state["executed"] if p["job_key"] == "tw-leverage-daily")
@@ -5273,8 +5274,9 @@ async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_termina
     from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
 
     # 1. Baseline tasks other than T5 and T18 keep empty freeze_paths.
-    # Batch-3 exact lists live in test_data_jobs_batch3. T76 and T83 are empty
-    # because a successful exit does not always write a file.
+    # Batch-3 exact lists live in test_data_jobs_batch3. Batch-4 lists live in
+    # test_data_jobs_batch4. T76, T83, T2, and T38 are empty because a successful
+    # exit does not always write a file.
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
     assert by_code["T5"].freeze_paths == [
@@ -5287,8 +5289,9 @@ async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_termina
         "temp/megacap-relative-signal-monitor/latest.json",
     ]
     batch3_codes = {"T9", "T16", "T20", "T36", "T42", "T58", "T73", "T76", "T83"}
+    batch4_codes = {"T2", "T23", "T24", "T35", "T38", "T41", "T43"}
     for code, entry in by_code.items():
-        if code in ("T5", "T18") or code in batch3_codes:
+        if code in ("T5", "T18") or code in batch3_codes or code in batch4_codes:
             continue
         assert entry.freeze_paths == [], f"Expected empty freeze_paths for {code}"
 
@@ -6698,8 +6701,8 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
 ) -> None:
     """Verify `scripts/dalton/seed_openclaw_data.sh` with temporary directories:
     - Default (`--dry-run`) prints total size and does not write to target;
-    - `--apply` syncs ONLY paths listed in Design §6.2 table (14 scripts, 9 skills, listed data paths,
-      and `state/cron-command/{us-topbottom-dm-v23,softbank-nav-monitor,tsmc-adr-premium}/last-run.json`);
+    - `--apply` syncs ONLY paths listed in the seed allowlist (phase 1 plus batch 3 and batch 4
+      scripts, skills, config, and state);
     - Does NOT sync unlisted directories/files (`memory/`, `media/`, `wiki/`, `backups/`, `markx/`,
       unlisted scripts, or unlisted skills);
     - Excludes `venv/`, `.venv/`, `cos-venv/`, `pending.json`, `*inflight*`, `.git/`, and `.dalton-freeze/`,
@@ -6755,7 +6758,8 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
         d = src_dir / unlisted_dir
         d.mkdir(parents=True)
         (d / "secret.txt").write_text("do_not_sync", encoding="utf-8")
-    (src_dir / "scripts" / "e_watch_monitor.py").write_text("unlisted_script", encoding="utf-8")
+    (src_dir / "scripts" / "e_watch_monitor.py").write_text("listed_batch4\n", encoding="utf-8")
+    (src_dir / "scripts" / "not_seeded.py").write_text("unlisted_script", encoding="utf-8")
     (src_dir / "skills" / "quantum-ew-bottom-monitor").mkdir(parents=True)
     (src_dir / "skills" / "quantum-ew-bottom-monitor" / "unused.txt").write_text(
         "unlisted_skill", encoding="utf-8"
@@ -6816,7 +6820,8 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     ).exists()
     for unlisted_name in ("memory", "media", "wiki", "backups", "markx"):
         assert not (dst_dir / unlisted_name).exists()
-    assert not (dst_dir / "scripts" / "e_watch_monitor.py").exists()
+    assert (dst_dir / "scripts" / "e_watch_monitor.py").read_text(encoding="utf-8") == "listed_batch4\n"
+    assert not (dst_dir / "scripts" / "not_seeded.py").exists()
     assert not (dst_dir / "skills" / "quantum-ew-bottom-monitor").exists()
 
     launcher_path = (
@@ -7678,7 +7683,7 @@ async def test_pr12_round2_overlay_redaction_and_manifest_sync_preserves_schedul
     manifest = load_data_task_manifest()
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
-    assert count == 28
+    assert count == 35
     sql_executed, params_executed = state["executed"][0]
     insert_clause, conflict_clause = sql_executed.split(
         "ON CONFLICT (job_key) DO UPDATE SET", 1

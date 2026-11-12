@@ -1459,17 +1459,62 @@ export class DataTaskNotificationService {
 
       const messageIds: string[] = [];
       let sentChunks = 0;
+      const filesStatus: Array<{
+        path: string;
+        status: "sent" | "linked" | "failed";
+        reason: string | null;
+      }> = [];
+      const sendTextWithFile = readyAdapter.sendTextWithFile?.bind(readyAdapter);
+      // One platform message for a caption plus its file. Longer text still
+      // chunks, and the file rides on the last chunk instead of a second post.
+      // Adapters without sendTextWithFile keep text-then-file.
+      const attachFileToLastTextChunk =
+        item.kind === "text_and_file" &&
+        verifiedAttachment !== null &&
+        typeof sendTextWithFile === "function" &&
+        textChunks.length > 0;
+      let fileAttachedToText = false;
 
       for (let i = 0; i < textChunks.length; i += 1) {
         let chunkRes: { messageId: string };
+        const attachFile =
+          attachFileToLastTextChunk && i === textChunks.length - 1;
         try {
-          chunkRes = await readyAdapter.sendTextChunk({
-            targetAddress,
-            recipientPlatformUserId,
-            text: textChunks[i]!,
-            chunkIndex: i,
-            totalChunks: textChunks.length,
-          });
+          if (attachFile && verifiedAttachment && sendTextWithFile) {
+            const combined = await sendTextWithFile({
+              targetAddress,
+              recipientPlatformUserId,
+              path: verifiedAttachment.filename,
+              filename: verifiedAttachment.filename,
+              content: verifiedAttachment.content,
+              mimeType: verifiedAttachment.mimeType,
+              text: textChunks[i]!,
+              chunkIndex: i,
+              totalChunks: textChunks.length,
+            });
+            if (combined.status !== "sent") {
+              throw new ChannelDeliveryError(
+                combined.reason ??
+                  "Chart file must be uploaded directly; text-only link substitution is not permitted.",
+                { outcome: "failed", code: "not_allowed" },
+              );
+            }
+            chunkRes = { messageId: combined.messageId };
+            fileAttachedToText = true;
+            filesStatus.push({
+              path: verifiedAttachment.filename,
+              status: "sent",
+              reason: null,
+            });
+          } else {
+            chunkRes = await readyAdapter.sendTextChunk({
+              targetAddress,
+              recipientPlatformUserId,
+              text: textChunks[i]!,
+              chunkIndex: i,
+              totalChunks: textChunks.length,
+            });
+          }
         } catch (chunkErr) {
           const classified = classifyAdapterError(chunkErr);
           const anySent = sentChunks > 0;
@@ -1582,13 +1627,7 @@ export class DataTaskNotificationService {
         }
       }
 
-      const filesStatus: Array<{
-        path: string;
-        status: "sent" | "linked" | "failed";
-        reason: string | null;
-      }> = [];
-
-      if (item.kind === "text_and_file" && verifiedAttachment) {
+      if (item.kind === "text_and_file" && verifiedAttachment && !fileAttachedToText) {
         try {
           const fileRes = await readyAdapter.sendFile({
             targetAddress,

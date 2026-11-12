@@ -1,4 +1,4 @@
-# OC-1 deterministic data tasks manifest (28 tasks: phase 1 plus nine batch-3 script tasks).
+# OC-1 deterministic data tasks manifest (35 tasks: phase 1, nine batch-3 script tasks, seven batch-4 watchlist scans).
 # Fields match DESIGN_data_task_layer.FINAL_20261107.md §1.1 (TASK_BASELINE.md + approved changes for T28 & T44).
 # All tasks default to enabled: false in PR 0-1 so merging does not alter production behavior.
 tasks:
@@ -697,6 +697,174 @@ tasks:
       - "python3"
       - "scripts/semi_bottom_checklist.py"
       - "run"
+    secret_names: []
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  # OC-1 batch 4. Schedules match the OpenClaw cron export. Scripts run unchanged.
+  # enabled and notify_enabled stay false until a later cutover.
+  - task_code: "T35"
+    job_key: "e-watch-daily"
+    title: "e-watch-daily"
+    batch_no: 1
+    runner: "container"
+    cron: "0 8 * * 1-6"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 1800
+    no_output_timeout_seconds: 1800
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py e-watch-daily"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "e-watch-daily"
+    secret_names: []
+    freeze_paths:
+      - "temp/e_watch_latest.txt"
+      - "state/e_watch_signal_state.json"
+      - "state/e_watch_daily_history.json"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T2"
+    job_key: "e-watch-intraday"
+    title: "e-watch-intraday"
+    batch_no: 1
+    runner: "container"
+    cron: "5,35 * * * *"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 300
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "sh -lc python3 scripts/e_watch_monitor.py --mode intraday"
+    command_argv:
+      - "python3"
+      - "scripts/e_watch_monitor.py"
+      - "--mode"
+      - "intraday"
+    secret_names: []
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T41"
+    job_key: "pt-watchlist-asia"
+    title: "pt-watchlist-asia"
+    batch_no: 1
+    runner: "container"
+    cron: "8 10 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py pt-watchlist-asia"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "pt-watchlist-asia"
+    secret_names: []
+    freeze_paths:
+      - "temp/pt_watchlist_latest.txt"
+      - "state/pt_watchlist_signal_state.json"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T23"
+    job_key: "pt-watchlist-us"
+    title: "pt-watchlist-us"
+    batch_no: 1
+    runner: "container"
+    cron: "12 22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py pt-watchlist-us"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "pt-watchlist-us"
+    secret_names: []
+    freeze_paths:
+      - "temp/pt_watchlist_latest.txt"
+      - "state/pt_watchlist_signal_state.json"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T43"
+    job_key: "china-2c-hk-monitor"
+    title: "china-2c-hk-monitor"
+    batch_no: 1
+    runner: "container"
+    cron: "10 10 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py china-2c-hk-monitor"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "china-2c-hk-monitor"
+    secret_names: []
+    freeze_paths:
+      - "state/china_2c_monitor_state.json"
+      - "temp/china_2c_monitor_latest.txt"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T24"
+    job_key: "china-2c-us-monitor"
+    title: "china-2c-us-monitor"
+    batch_no: 1
+    runner: "container"
+    cron: "15 22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py china-2c-us-monitor"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "china-2c-us-monitor"
+    secret_names: []
+    freeze_paths:
+      - "state/china_2c_monitor_state.json"
+      - "temp/china_2c_monitor_latest.txt"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T38"
+    job_key: "a-share-bottom-volume-watch"
+    title: "a-share-bottom-volume-watch"
+    batch_no: 1
+    runner: "container"
+    cron: "*/2 9-11,13-15 * * 1-5"
+    timezone: "Asia/Shanghai"
+    timeout_seconds: 120
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "sh -lc 'mkdir -p state/a-share-volume-watch && python3 scripts/a_share_volume_watch.py 2>>state/a-share-volume-watch/stderr.log'"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "mkdir -p state/a-share-volume-watch && python3 scripts/a_share_volume_watch.py 2>>state/a-share-volume-watch/stderr.log"
     secret_names: []
     freeze_paths: []
     cos_mode: "skip"

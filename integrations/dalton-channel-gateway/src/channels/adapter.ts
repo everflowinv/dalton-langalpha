@@ -86,6 +86,13 @@ export interface SendFileResult {
   reason?: string | null;
 }
 
+/** One platform message that carries both text and a file. Used only for `text_and_file`. */
+export interface SendTextWithFileOptions extends SendFileOptions {
+  text: string;
+  chunkIndex: number;
+  totalChunks: number;
+}
+
 export interface SendCardImageInput {
   placeholder: string;
   content: Buffer;
@@ -237,6 +244,13 @@ export interface ChannelAdapter {
 
   /** Send a single file attachment to the platform. */
   sendFile(options: SendFileOptions): Promise<SendFileResult>;
+
+  /**
+   * Optional: one platform request that includes both `text` and the file.
+   * Data-task `text_and_file` uses this when present. Adapters that omit it
+   * keep the separate text-then-file sends.
+   */
+  sendTextWithFile?(options: SendTextWithFileOptions): Promise<SendFileResult>;
 
   /** Optional structured card send (e.g. Feishu Card Schema 2.0 with uploaded images). */
   sendCard?(options: SendCardOptions): Promise<SendCardResult>;

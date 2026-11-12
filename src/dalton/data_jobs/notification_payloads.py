@@ -53,6 +53,7 @@ ALLOWED_IMAGE_EXTENSIONS: dict[str, str] = {
     ".webp": "image/webp",
 }
 MARKDOWN_ARTIFACT_MIME = "text/markdown"
+PLAIN_TEXT_ARTIFACT_MIME = "text/plain"
 
 CARD_MARKDOWN_MAX_CHARS = 2000
 IMG_LINE_RE = re.compile(r"^IMG:(\S+)\s*$")
@@ -528,9 +529,9 @@ def _detect_validated_image_mime(data: bytes, filename: str, *, max_bytes: int =
 
 
 def _detect_validated_artifact_mime(data: bytes, filename: str, *, max_bytes: int = MAX_NOTIFICATION_ARTIFACT_BYTES) -> str:
-    """Accept a Markdown file attachment as ``text/markdown``. Images stay byte-checked."""
+    """Accept Markdown as ``text/markdown`` and ``.txt`` as ``text/plain``. Images stay byte-checked."""
     ext = Path(filename).suffix.lower()
-    if ext == ".md":
+    if ext in {".md", ".txt"}:
         if not data:
             raise DataTaskArtifactError("Artifact file is empty", code="artifact_empty")
         if len(data) > max_bytes:
@@ -538,6 +539,8 @@ def _detect_validated_artifact_mime(data: bytes, filename: str, *, max_bytes: in
                 f"Artifact exceeds maximum size ({len(data)} > {max_bytes} bytes)",
                 code="artifact_too_large",
             )
+        if ext == ".txt":
+            return PLAIN_TEXT_ARTIFACT_MIME
         return MARKDOWN_ARTIFACT_MIME
     return _detect_validated_image_mime(data, filename, max_bytes=max_bytes)
 

@@ -15,6 +15,7 @@ import type * as Lark from "@larksuiteoapi/node-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { HttpBackendClient } from "../src/backend-client.js";
 import type { ChannelAdapter } from "../src/channels/adapter.js";
+import { DiscordChannelAdapter, RequestClient } from "../src/channels/discord/index.js";
 import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
 import { loadConfig } from "../src/config.js";
@@ -703,6 +704,186 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       );
     } finally {
       await appWithDiscord.stop();
+    }
+  });
+
+  it("sends an e-watch text_and_file caption and attachment as one Discord message", async () => {
+    const caption = "📎 e-watch 全文（含未触发清单与口径）";
+    const firstText = "早盘一条，末尾换行要留着\n";
+    const secondText = "第二条没有换行";
+    const fileBody = Buffer.from("全文第一行\n未触发：ABC\n", "utf8");
+    const runId = "88888888-8888-4888-8888-888888888888";
+    const recipient = "1134818575211839498";
+
+    const plan: DataTaskAuthorizePlanResponse = {
+      authorized: true,
+      status: "authorized",
+      run_id: runId,
+      job_key: "e-watch-daily",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: recipient,
+      platform: "discord",
+      target_kind: "dm",
+      requested_target: `discord:user:${recipient}`,
+      canonical_target_address: "discord:@me",
+      recipient_id: recipient,
+      items: [
+        {
+          item_index: 0,
+          delivery_key: `data_task:${runId}:discord:${recipient}:item:0`,
+          kind: "text",
+          text: firstText,
+        },
+        {
+          item_index: 1,
+          delivery_key: `data_task:${runId}:discord:${recipient}:item:1`,
+          kind: "text",
+          text: secondText,
+        },
+        {
+          item_index: 2,
+          delivery_key: `data_task:${runId}:discord:${recipient}:item:2`,
+          kind: "text_and_file",
+          text: caption,
+          artifact: {
+            artifact_id: "item2-media0",
+            filename: "e_watch_latest.txt",
+            mime_type: "text/plain",
+            size_bytes: fileBody.byteLength,
+            sha256: sha256Hex(fileBody),
+          },
+        },
+      ],
+    };
+
+    const backend = createMockBackend();
+    vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
+      structuredClone(plan),
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue({
+      claim_status: "claimed",
+      platform: "discord",
+      target_address: "discord:@me",
+      recipient_id: recipient,
+      is_current: false,
+      home_workspace_id: "00000000-0000-0000-0000-000000000001",
+      weixin_context_token: null,
+    });
+    vi.mocked(backend.downloadDataTaskRunArtifact).mockResolvedValue({
+      content: fileBody,
+      mimeType: "text/plain",
+      filename: "e_watch_latest.txt",
+      sha256Header: sha256Hex(fileBody),
+    });
+
+    const messagePosts: Array<{
+      content: string;
+      filename: string | null;
+      bytes: Buffer | null;
+    }> = [];
+    let messageSeq = 0;
+    const rest = new RequestClient("test-bot-token", {
+      fetchImpl: async (url, init) => {
+        const path = new URL(url).pathname.replace(/^\/api\/v10/, "");
+        if (path === "/users/@me/channels") {
+          return new Response(JSON.stringify({ id: "dm-e-watch" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (path !== "/channels/dm-e-watch/messages") {
+          return new Response(JSON.stringify({ message: `unexpected ${path}` }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        messageSeq += 1;
+        const body = init.body;
+        if (body instanceof FormData) {
+          const payload = JSON.parse(String(body.get("payload_json") ?? "{}")) as {
+            content?: string;
+            attachments?: Array<{ filename?: string }>;
+          };
+          const file = body.get("files[0]");
+          const bytes =
+            file instanceof Blob ? Buffer.from(await file.arrayBuffer()) : null;
+          messagePosts.push({
+            content: payload.content ?? "",
+            filename: payload.attachments?.[0]?.filename ?? null,
+            bytes,
+          });
+        } else {
+          const payload = JSON.parse(String(body ?? "{}")) as { content?: string };
+          messagePosts.push({
+            content: payload.content ?? "",
+            filename: null,
+            bytes: null,
+          });
+        }
+        return new Response(JSON.stringify({ id: `msg-${messageSeq}` }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const discord = new DiscordChannelAdapter({
+      botToken: "test-bot-token",
+      botUserId: "999",
+      rest,
+    });
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        DALTON_GATEWAY_MODE: "outgoing",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+      }),
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", discord]]),
+    });
+    const listen = await app.start();
+    try {
+      const response = await fetch(
+        `http://${listen.host}:${listen.port}/internal/data-task-notifications`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+          },
+          body: JSON.stringify({
+            run_id: runId,
+            target: `discord:user:${recipient}`,
+          }),
+        },
+      );
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as DataTaskNotificationResponse;
+      expect(body.ok).toBe(true);
+      expect(body.status).toBe("sent");
+      expect(body.items_sent).toBe(3);
+      expect(messagePosts).toHaveLength(3);
+      expect(messagePosts[0]).toEqual({
+        content: firstText,
+        filename: null,
+        bytes: null,
+      });
+      expect(messagePosts[1]).toEqual({
+        content: secondText,
+        filename: null,
+        bytes: null,
+      });
+      expect(messagePosts[2]?.content).toBe(caption);
+      expect(messagePosts[2]?.filename).toBe("e_watch_latest.txt");
+      expect(messagePosts[2]?.bytes?.equals(fileBody)).toBe(true);
+      expect(body.items.map((item) => item.platform_message_ids)).toEqual([
+        ["msg-1"],
+        ["msg-2"],
+        ["msg-3"],
+      ]);
+    } finally {
+      await app.stop();
     }
   });
 

@@ -91,6 +91,13 @@ TASK_NOTIFY_PAYLOAD_SOURCES: dict[str, str] = {
     "semi-rescue-alert-am": "stdout_json",  # T36
     "semi-rescue-alert-pm": "stdout_json",  # T16
     "semi-bottom-checklist-1030et": "stdout_text",  # T83
+    "e-watch-daily": "outbox_file",  # T35
+    "e-watch-intraday": "stdout_text",  # T2
+    "pt-watchlist-asia": "outbox_file",  # T41
+    "pt-watchlist-us": "outbox_file",  # T23
+    "china-2c-hk-monitor": "outbox_file",  # T43
+    "china-2c-us-monitor": "outbox_file",  # T24
+    "a-share-bottom-volume-watch": "stdout_text",  # T38
 }
 
 _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
@@ -114,6 +121,13 @@ _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
     "T36": "stdout_json",
     "T16": "stdout_json",
     "T83": "stdout_text",
+    "T35": "outbox_file",
+    "T2": "stdout_text",
+    "T41": "outbox_file",
+    "T23": "outbox_file",
+    "T43": "outbox_file",
+    "T24": "outbox_file",
+    "T38": "stdout_text",
 }
 
 

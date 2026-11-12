@@ -181,14 +181,14 @@ async def test_real_postgres_data_jobs_end_to_end(
         manifest = load_data_task_manifest()
         async with conn.transaction():
             synced = await sync_manifest_to_db(conn, manifest)
-        assert synced == 28
+        assert synced == 35
 
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 "SELECT job_key, cron_expr, timezone, runner, enabled, required_secrets FROM dalton_data_task_defs ORDER BY job_key"
             )
             defs = await cur.fetchall()
-        assert len(defs) == 28
+        assert len(defs) == 35
         by_key = {row["job_key"]: row for row in defs}
         assert by_key["tw-leverage-daily"]["cron_expr"] == "40 9 * * 1-5"
         assert by_key["tw-leverage-daily"]["timezone"] == "America/New_York"
