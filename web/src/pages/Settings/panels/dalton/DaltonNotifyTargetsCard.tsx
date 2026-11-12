@@ -58,12 +58,12 @@ export function DaltonNotifyTargetsCard(): React.ReactElement {
       await updatePreferences.mutateAsync(
         splitPreferenceWrite({ dalton_notify_enabled: next }),
       );
-      setSaveMessage(next ? '已开启飞书提醒' : '已关闭飞书提醒');
+      setSaveMessage(next ? '已开启推送总开关' : '已关闭推送总开关');
     } catch (err: unknown) {
       const msg =
         err instanceof Error && err.message
           ? err.message
-          : '保存飞书提醒开关失败';
+          : '保存推送总开关失败';
       setError(msg);
     }
   };
@@ -177,17 +177,17 @@ export function DaltonNotifyTargetsCard(): React.ReactElement {
             className="text-sm font-semibold"
             style={{ color: 'var(--color-text-primary)' }}
           >
-            飞书提醒
+            推送总开关
           </span>
           <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            开启后，财报快讯、深度复盘、财报前瞻、重大股价异动、每周复盘会私信给你。
+            控制全部自动任务推送（飞书、Discord、群）。
           </p>
         </div>
         <ToggleSwitch
           checked={enabled}
           onChange={() => void handleToggleEnabled()}
           disabled={!prefsReady}
-          ariaLabel="飞书提醒"
+          ariaLabel="推送总开关"
           className="mt-0.5"
         />
       </div>

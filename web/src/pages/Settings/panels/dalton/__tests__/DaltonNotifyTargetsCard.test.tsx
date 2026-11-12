@@ -82,7 +82,7 @@ describe('DaltonNotifyTargetsCard', () => {
 
     render(<DaltonNotifyTargetsCard />);
 
-    const masterSwitch = screen.getByRole('switch', { name: '飞书提醒' });
+    const masterSwitch = screen.getByRole('switch', { name: '推送总开关' });
     const input = screen.getByLabelText('推送到');
     const addButton = screen.getByRole('button', { name: /添加/ });
     const deleteButton = screen.getByRole('button', { name: '删除 feishu:user:ou_existing_01' });
@@ -227,14 +227,14 @@ describe('DaltonNotifyTargetsCard', () => {
     expect(alert).toHaveTextContent('发送失败（exit_code=1）');
   });
 
-  it('defaults master switch 飞书提醒 to off, toggles on/off, and reads back saved value', async () => {
+  it('defaults master switch 推送总开关 to off, toggles on/off, and reads back saved value', async () => {
     const { unmount } = render(<DaltonNotifyTargetsCard />);
 
     expect(
-      screen.getByText('开启后，财报快讯、深度复盘、财报前瞻、重大股价异动、每周复盘会私信给你。'),
+      screen.getByText('控制全部自动任务推送（飞书、Discord、群）。'),
     ).toBeInTheDocument();
 
-    const masterSwitch = screen.getByRole('switch', { name: '飞书提醒' });
+    const masterSwitch = screen.getByRole('switch', { name: '推送总开关' });
     expect(masterSwitch).toHaveAttribute('aria-checked', 'false');
 
     await act(async () => {
@@ -248,10 +248,11 @@ describe('DaltonNotifyTargetsCard', () => {
       });
     });
     expect(masterSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByText('已开启推送总开关')).toBeInTheDocument();
 
     unmount();
     render(<DaltonNotifyTargetsCard />);
-    const remountedSwitch = screen.getByRole('switch', { name: '飞书提醒' });
+    const remountedSwitch = screen.getByRole('switch', { name: '推送总开关' });
     expect(remountedSwitch).toHaveAttribute('aria-checked', 'true');
 
     await act(async () => {
@@ -265,5 +266,6 @@ describe('DaltonNotifyTargetsCard', () => {
       });
     });
     expect(remountedSwitch).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText('已关闭推送总开关')).toBeInTheDocument();
   });
 });

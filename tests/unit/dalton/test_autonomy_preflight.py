@@ -880,6 +880,229 @@ async def test_preflight_check_skips_when_no_signals_and_wakes_once(monkeypatch)
     assert res_dup.reason == "no_new_signals"
 
 
+def _schedule_day() -> str:
+    """The calendar day preflight stamps onto a schedule wake signal."""
+    from src.dalton.settings import get_dalton_settings
+
+    try:
+        tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz).date().isoformat()
+
+
+def _mock_preflight_workspace(monkeypatch: pytest.MonkeyPatch, *, user_id: str, workspace_id: str) -> None:
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": workspace_id, "user_id": user_id},
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_schedule_wake_dedup_key_includes_automation_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same user, same parsed ticker, same day: each custom_dalton task wakes once.
+
+    The shared watch-state dedup key is ``{kind}:{automation_id}:{date}``.
+    An old ``{kind}:{date}`` entry already in that state does not count as seen.
+    A second run of the same automation on the same day still skips.
+    weekly_delta and earnings_window use the same key shape.
+    """
+    user_id = "local-dev-user"
+    workspace_id = "22222222-2222-2222-2222-222222222222"
+    _mock_preflight_workspace(monkeypatch, user_id=user_id, workspace_id=workspace_id)
+    day = _schedule_day()
+    am_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+    pm_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"
+    delta_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa3"
+    earn_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa4"
+    state: dict[str, Any] = {
+        "_woken_signal_keys": [["schedule", f"custom_dalton:{day}"]],
+    }
+
+    def _auto(automation_id: str, name: str) -> dict[str, Any]:
+        return {
+            "automation_id": automation_id,
+            "name": name,
+            "trigger_type": "cron",
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+        }
+
+    async def _run(automation_id: str, name: str, execution_id: str):
+        return await preflight_check(
+            _auto(automation_id, name),
+            execution_id,
+            watch_state_override=state,
+            persist=False,
+        )
+
+    am = await _run(am_id, "dalton-ta-screen-am", "exec-am")
+    assert am.should_wake is True, am
+    assert am.decision == "wake"
+    assert am.signals[0]["probe"] == "schedule"
+    assert am.signals[0]["signal_key"] == f"custom_dalton:{am_id}:{day}"
+    assert am.signals[0]["payload"]["kind"] == "custom_dalton"
+    assert 'ticker="TA"' in (am.wake_context or "")
+
+    pm = await _run(pm_id, "dalton-ta-screen-pm", "exec-pm")
+    assert pm.should_wake is True, pm
+    assert pm.reason != "no_new_signals"
+    assert pm.signals[0]["signal_key"] == f"custom_dalton:{pm_id}:{day}"
+
+    am_again = await _run(am_id, "dalton-ta-screen-am", "exec-am-2")
+    assert am_again.should_wake is False
+    assert am_again.reason == "no_new_signals"
+
+    delta = await _run(delta_id, "dalton-ta-delta", "exec-delta")
+    assert delta.should_wake is True, delta
+    assert delta.signals[0]["signal_key"] == f"weekly_delta:{delta_id}:{day}"
+    assert delta.signals[0]["payload"]["kind"] == "weekly_delta"
+
+    earn = await _run(earn_id, "dalton-ta-earn-2026q3-t0", "exec-earn")
+    assert earn.should_wake is True, earn
+    assert earn.signals[0]["signal_key"] == f"earnings_window:{earn_id}:{day}"
+    assert earn.signals[0]["payload"]["kind"] == "earnings_window"
+
+    seen = {tuple(item) for item in state.get("_woken_signal_keys") or []}
+    assert ("schedule", f"custom_dalton:{day}") in seen
+    assert ("schedule", f"custom_dalton:{am_id}:{day}") in seen
+    assert ("schedule", f"custom_dalton:{pm_id}:{day}") in seen
+    assert ("schedule", f"weekly_delta:{delta_id}:{day}") in seen
+    assert ("schedule", f"earnings_window:{earn_id}:{day}") in seen
+
+
+@pytest.mark.asyncio
+async def test_persisted_schedule_signal_dedup_is_per_automation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production dedup is the signal row unique on (workspace, probe, signal_key).
+
+    A woken ``custom_dalton:{date}`` row must not skip a different automation
+    whose key now includes its id. The same automation the same day still skips.
+    """
+    import uuid
+
+    import src.dalton.autonomy.preflight as preflight_mod
+
+    user_id = "local-dev-user"
+    workspace_id = "22222222-2222-2222-2222-222222222222"
+    _mock_preflight_workspace(monkeypatch, user_id=user_id, workspace_id=workspace_id)
+    monkeypatch.setattr(
+        preflight_mod,
+        "_check_budget_available",
+        create_autospec(preflight_mod._check_budget_available, return_value=(True, None)),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "expire_old_signals",
+        create_autospec(watch_db.expire_old_signals, return_value=[]),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "get_watch_state",
+        create_autospec(watch_db.get_watch_state, return_value={}),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "upsert_watch_state",
+        create_autospec(watch_db.upsert_watch_state, return_value={}),
+    )
+    monkeypatch.setattr(
+        watch_db,
+        "insert_preflight_log",
+        create_autospec(watch_db.insert_preflight_log, return_value={}),
+    )
+
+    day = _schedule_day()
+    rows: dict[tuple[str, str], dict[str, Any]] = {
+        ("schedule", f"custom_dalton:{day}"): {
+            "signal_id": str(uuid.uuid4()),
+            "signal_key": f"custom_dalton:{day}",
+            "woken_execution_id": "already-woken",
+            "resolved_at": None,
+            "expired_at": None,
+        }
+    }
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        pair = (str(kwargs.get("probe") or ""), str(kwargs.get("signal_key") or ""))
+        existing = rows.get(pair)
+        if existing is not None:
+            should_wake = (
+                existing.get("woken_execution_id") is None
+                and existing.get("resolved_at") is None
+                and existing.get("expired_at") is None
+            )
+            return dict(existing), should_wake
+        row = {
+            "signal_id": str(uuid.uuid4()),
+            "signal_key": pair[1],
+            "woken_execution_id": None,
+            "resolved_at": None,
+            "expired_at": None,
+            "status": "pending",
+        }
+        rows[pair] = row
+        return dict(row), True
+
+    async def _claim(signal_ids: Any, execution_id: Any, **_kwargs: Any) -> list[dict[str, str]]:
+        wanted = {str(item) for item in signal_ids}
+        claimed: list[dict[str, str]] = []
+        for row in rows.values():
+            if str(row["signal_id"]) in wanted and row.get("woken_execution_id") is None:
+                row["woken_execution_id"] = execution_id
+                claimed.append({"signal_id": str(row["signal_id"])})
+        return claimed
+
+    monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(watch_db.upsert_signal, side_effect=_upsert))
+    monkeypatch.setattr(
+        watch_db,
+        "claim_signals_woken",
+        create_autospec(watch_db.claim_signals_woken, side_effect=_claim),
+    )
+
+    am_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+    pm_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"
+
+    def _auto(automation_id: str, name: str) -> dict[str, Any]:
+        return {
+            "automation_id": automation_id,
+            "name": name,
+            "trigger_type": "cron",
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+        }
+
+    am = await preflight_check(
+        _auto(am_id, "dalton-ta-screen-am"),
+        "exec-am-persist",
+        persist=True,
+    )
+    assert am.should_wake is True, am
+    assert am.signals[0]["signal_key"] == f"custom_dalton:{am_id}:{day}"
+
+    pm = await preflight_check(
+        _auto(pm_id, "dalton-ta-screen-pm"),
+        "exec-pm-persist",
+        persist=True,
+    )
+    assert pm.should_wake is True, pm
+    assert pm.reason != "no_new_signals"
+    assert pm.signals[0]["signal_key"] == f"custom_dalton:{pm_id}:{day}"
+
+    am_again = await preflight_check(
+        _auto(am_id, "dalton-ta-screen-am"),
+        "exec-am-persist-2",
+        persist=True,
+    )
+    assert am_again.should_wake is False
+    assert am_again.reason == "no_new_signals"
+
+
 def _stale_harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Persist-mode preflight doubles keyed by signal_key, so a test can tell
     the stale sweep-up and the real wake signal apart."""

@@ -873,10 +873,13 @@ async def _preflight_check_inner(
         )
         emitted.extend(sigs)
     elif kind in ("weekly_delta", "earnings_window", "custom_dalton"):
+        # 同一用户、同一代码、同一天可以有多个计划任务（早班/晚班、多个
+        # dalton-dash-…）。跟踪状态和信号表按工作区共享，键带上自动化 ID，
+        # 每个任务当天各自有一条计划唤醒信号。
         emitted.append(
             ProbeSignal(
                 probe="schedule",
-                signal_key=f"{kind}:{datetime.now(tz).date().isoformat()}",
+                signal_key=f"{kind}:{automation_id}:{datetime.now(tz).date().isoformat()}",
                 priority="P1",
                 summary=f"{ticker or name} 计划任务唤醒（{kind}）",
                 payload={"kind": kind},
@@ -885,6 +888,8 @@ async def _preflight_check_inner(
     elif kind == "sector_delta":
         # 行业资料增量是计划唤醒：采集在唤醒后的沙箱里按
         # dalton-sector-delta 技能执行，预检不跑任何证券探针。
+        # 每个行业工作区只有一个 sector_delta 自动化，去重按工作区隔离，
+        # 键保持 sector_delta:日期。
         emitted.append(
             ProbeSignal(
                 probe="schedule",
