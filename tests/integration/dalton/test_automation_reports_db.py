@@ -2759,3 +2759,22 @@ async def test_ensure_reconcile_lock_order_does_not_deadlock(
     assert chat_a["status"] == "sent"
     assert chat_a["error_code"] in (None, "")
     assert _sourced(await _rows(world), execution_id, reports.FAILURE_ALERT_SOURCE) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile_id", ["meta-tracker", "amzn-tracker", "googl-tracker"])
+async def test_quiet_submit_accepts_company_tracker_profiles(world: World, profile_id: str) -> None:
+    await _set_metadata(
+        world,
+        _profile(world.chat_a, world.chat_b, world.discord_target, profile=profile_id),
+    )
+    quiet = await _submit(
+        world,
+        material="no",
+        cards=None,
+        report_run_id=f"{profile_id}-quiet",
+    )
+    assert quiet["ok"] is True
+    assert quiet["quiet"] is True
+    assert quiet.get("code") != "profile_invalid"
+    assert await _rows(world) == []

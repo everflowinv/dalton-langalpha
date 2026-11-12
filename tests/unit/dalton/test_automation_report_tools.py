@@ -787,3 +787,19 @@ async def test_status_cancellation_propagates(storage: SimpleNamespace) -> None:
         await _invoke({"action": "status", "report_run_id": _REPORT})
     storage.submit.assert_not_awaited()
     storage.sender.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile_id", ["meta-tracker", "amzn-tracker", "googl-tracker"])
+async def test_saved_company_tracker_profile_is_echoed(
+    storage: SimpleNamespace, profile_id: str
+) -> None:
+    saved = dict(_PENDING)
+    saved["profile"] = profile_id
+    storage.submit.return_value = saved
+    payload = await _invoke(_submit_args())
+    assert payload["profile"] == profile_id
+    assert payload["content_kind"] == "cards"
+    assert payload["status"] == "pending"
+    assert payload["delivery_confirmed"] is False
+    assert payload["report_run_id"] == _REPORT

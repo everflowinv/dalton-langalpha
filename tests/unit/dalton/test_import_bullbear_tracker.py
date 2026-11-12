@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.dalton.import_msft_tracker import import_msft_tracker
+from scripts.dalton.import_bullbear_tracker import import_bullbear_tracker
 
 SNAP = "2026-11-09_2250.json"
 COMMITTED_AT = "2026-11-09T22:50:00-05:00"
@@ -72,7 +72,7 @@ def test_dry_run_apply_repeat_preserves_newer_target(tmp_path: Path) -> None:
     source_before = _tree(source)
     workspace_before = _tree(workspace)
 
-    dry = import_msft_tracker(source, workspace, apply=False)
+    dry = import_bullbear_tracker(source, workspace, apply=False)
     assert dry["ok"] is True
     assert dry["dry_run"] is True
     assert dry["paths"]["written"] == []
@@ -81,7 +81,7 @@ def test_dry_run_apply_repeat_preserves_newer_target(tmp_path: Path) -> None:
     assert _tree(source) == source_before
     assert _tree(workspace) == workspace_before
 
-    applied = import_msft_tracker(source, workspace, apply=True)
+    applied = import_bullbear_tracker(source, workspace, apply=True)
     assert applied["ok"] is True
     assert applied["paths"]["written"]
     seen = json.loads((workspace / "research/tracker/seen.json").read_text())
@@ -105,7 +105,7 @@ def test_dry_run_apply_repeat_preserves_newer_target(tmp_path: Path) -> None:
     assert _tree(source) == source_before
 
     after = _tree(workspace)
-    repeat = import_msft_tracker(source, workspace, apply=True)
+    repeat = import_bullbear_tracker(source, workspace, apply=True)
     assert repeat["ok"] is True
     assert repeat["paths"]["written"] == []
     assert _tree(workspace) == after
@@ -116,7 +116,7 @@ def test_overlapping_roots_write_nothing(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _snapshot(source)
     before = _tree(source)
-    same = import_msft_tracker(source, source, apply=True)
+    same = import_bullbear_tracker(source, source, apply=True)
     assert same["ok"] is False
     assert same["paths"]["written"] == []
     assert any(item["reason"] == "overlapping_roots" for item in same["conflicts"])
@@ -125,7 +125,7 @@ def test_overlapping_roots_write_nothing(tmp_path: Path) -> None:
     nested = source / "ws"
     nested.mkdir()
     nested_before = _tree(source)
-    inside = import_msft_tracker(source, nested, apply=True)
+    inside = import_bullbear_tracker(source, nested, apply=True)
     assert inside["ok"] is False
     assert _tree(source) == nested_before
 
@@ -133,7 +133,7 @@ def test_overlapping_roots_write_nothing(tmp_path: Path) -> None:
     inner = workspace / "snap"
     _snapshot(inner)
     outer_before = _tree(workspace)
-    outside = import_msft_tracker(inner, workspace, apply=True)
+    outside = import_bullbear_tracker(inner, workspace, apply=True)
     assert outside["ok"] is False
     assert _tree(workspace) == outer_before
 
@@ -144,11 +144,11 @@ def test_overlapping_roots_write_nothing(tmp_path: Path) -> None:
     _write(stock / "x_authors.json", "{}\n")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    allowed = import_msft_tracker(msft, elsewhere, stock, apply=False)
+    allowed = import_bullbear_tracker(msft, elsewhere, stock, apply=False)
     assert allowed["ok"] is True
     assert not (elsewhere / "research").exists()
     stock_before = _tree(stock)
-    shared_workspace = import_msft_tracker(msft, stock, stock, apply=True)
+    shared_workspace = import_bullbear_tracker(msft, stock, stock, apply=True)
     assert shared_workspace["ok"] is False
     assert shared_workspace["paths"]["written"] == []
     assert _tree(stock) == stock_before
@@ -206,7 +206,7 @@ def test_target_custom_metadata_retained(tmp_path: Path) -> None:
         json.dumps({"Ada": {"handle": "Ada", "name": "Ada", "token_supply_estimate": 42}}),
     )
 
-    result = import_msft_tracker(source, workspace, shared, apply=True)
+    result = import_bullbear_tracker(source, workspace, shared, apply=True)
     assert result["ok"] is True
     pool = json.loads((workspace / "research/tracker/x_pool.json").read_text())
     authors = json.loads((workspace / "research/tracker/x_authors.json").read_text())
@@ -228,7 +228,7 @@ def test_consensus_conflict_blocks_all_writes(tmp_path: Path) -> None:
     _write(workspace / "research/tracker/seen.json", '["keep-me"]\n')
     source_before = _tree(source)
     before = _tree(workspace)
-    result = import_msft_tracker(source, workspace, apply=True)
+    result = import_bullbear_tracker(source, workspace, apply=True)
     assert result["ok"] is False
     assert result["paths"]["written"] == []
     assert any(item["reason"] == "consensus_conflict" for item in result["conflicts"])
@@ -241,7 +241,7 @@ def test_invalid_seen_and_timestamp(tmp_path: Path) -> None:
     bad_seen_ws = tmp_path / "bad-seen-ws"
     _snapshot(bad_seen_source, seen="[1]\n")
     bad_seen_ws.mkdir()
-    seen_result = import_msft_tracker(bad_seen_source, bad_seen_ws, apply=True)
+    seen_result = import_bullbear_tracker(bad_seen_source, bad_seen_ws, apply=True)
     assert seen_result["ok"] is False
     assert any(item["reason"] == "invalid_seen" for item in seen_result["conflicts"])
     assert _tree(bad_seen_ws) == {}
@@ -253,7 +253,7 @@ def test_invalid_seen_and_timestamp(tmp_path: Path) -> None:
     last_run["committed_at"] = "2026-11-09T22:50:00"
     _write(bad_time_source / "last_run.json", json.dumps(last_run) + "\n")
     bad_time_ws.mkdir()
-    time_result = import_msft_tracker(bad_time_source, bad_time_ws, apply=True)
+    time_result = import_bullbear_tracker(bad_time_source, bad_time_ws, apply=True)
     assert time_result["ok"] is False
     assert any(item["reason"] == "invalid_timestamp" for item in time_result["conflicts"])
     assert _tree(bad_time_ws) == {}
@@ -269,7 +269,7 @@ def test_escaping_target_symlink_writes_nothing(tmp_path: Path) -> None:
     workspace.mkdir()
     (workspace / "research").symlink_to(outside, target_is_directory=True)
     source_before = _tree(source)
-    result = import_msft_tracker(source, workspace, apply=True)
+    result = import_bullbear_tracker(source, workspace, apply=True)
     assert result["ok"] is False
     assert result["paths"]["written"] == []
     assert any(item["reason"] == "symlink_escape" for item in result["conflicts"])
@@ -287,7 +287,7 @@ def test_working_thesis_copies_once_and_keeps_edits(tmp_path: Path) -> None:
     before = _tree(workspace)
     source_before = _tree(source)
 
-    dry = import_msft_tracker(source, workspace, apply=False)
+    dry = import_bullbear_tracker(source, workspace, apply=False)
     assert dry["ok"] is True
     assert dry["dry_run"] is True
     assert dry["paths"]["written"] == []
@@ -299,7 +299,7 @@ def test_working_thesis_copies_once_and_keeps_edits(tmp_path: Path) -> None:
     assert _tree(workspace) == before
     assert _tree(source) == source_before
 
-    applied = import_msft_tracker(source, workspace, apply=True)
+    applied = import_bullbear_tracker(source, workspace, apply=True)
     assert applied["ok"] is True
     assert applied["working_thesis"]["action"] == "created"
     working = workspace / "research/tracker/thesis.md"
@@ -313,13 +313,13 @@ def test_working_thesis_copies_once_and_keeps_edits(tmp_path: Path) -> None:
     working.write_text("edited working thesis\n", encoding="utf-8")
     edited = working.read_bytes()
     source_after_edit = _tree(source)
-    repeat_dry = import_msft_tracker(source, workspace, apply=False)
+    repeat_dry = import_bullbear_tracker(source, workspace, apply=False)
     assert repeat_dry["ok"] is True
     assert repeat_dry["working_thesis"]["action"] == "reused"
     assert repeat_dry["paths"]["written"] == []
     assert working.read_bytes() == edited
 
-    repeat = import_msft_tracker(source, workspace, apply=True)
+    repeat = import_bullbear_tracker(source, workspace, apply=True)
     assert repeat["ok"] is True
     assert repeat["working_thesis"] == {
         "path": "research/tracker/thesis.md",
@@ -331,3 +331,66 @@ def test_working_thesis_copies_once_and_keeps_edits(tmp_path: Path) -> None:
     assert (workspace / "thesis.md").read_text() == "rendered thesis\n"
     assert (workspace / "data/thesis.json").read_text() == '{"version":1}\n'
     assert _tree(source) == source_after_edit
+
+
+def test_shared_pool_keeps_only_the_company_or_all(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    shared = tmp_path / "shared"
+    workspace.mkdir()
+    _snapshot(source)
+    _write(
+        shared / "x_pool.json",
+        json.dumps(
+            {
+                "MetaOnly": {"name": "MetaOnly", "active": True, "tickers": ["META"]},
+                "AllDesk": {"name": "AllDesk", "active": True, "tickers": ["ALL"]},
+                "MsftOnly": {"name": "MsftOnly", "active": True, "tickers": ["MSFT"]},
+                "Idle": {"name": "Idle", "active": False, "tickers": ["META", "ALL"]},
+            }
+        ),
+    )
+    _write(
+        shared / "x_authors.json",
+        json.dumps(
+            {
+                "metaonly": {"handle": "MetaOnly", "name": "MetaOnly"},
+                "alldesk": {"handle": "AllDesk", "name": "AllDesk"},
+                "msftonly": {"handle": "MsftOnly", "name": "MsftOnly"},
+                "idle": {"handle": "Idle", "name": "Idle"},
+            }
+        ),
+    )
+    result = import_bullbear_tracker(source, workspace, shared, apply=True, ticker="META")
+    assert result["ok"] is True
+    assert result["conflicts"] == []
+    assert result["counts"]["x_accounts"] == 2
+    pool = json.loads((workspace / "research/tracker/x_pool.json").read_text(encoding="utf-8"))
+    authors = json.loads((workspace / "research/tracker/x_authors.json").read_text(encoding="utf-8"))
+    assert set(pool) == {"metaonly", "alldesk"}
+    assert pool["metaonly"]["tickers"] == ["META"]
+    assert pool["alldesk"]["tickers"] == ["ALL"]
+    assert set(authors) == {"metaonly", "alldesk"}
+    assert (workspace / "research/tracker/imported-meta/thesis.md").is_file()
+
+
+def test_legacy_msft_manifest_imports_again_without_rewriting(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _snapshot(source)
+    first = import_bullbear_tracker(source, workspace, apply=True)
+    assert first["ok"] is True
+    manifest_path = workspace / "research/tracker/imported-msft/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "bullbear-tracker-import/1"
+    assert manifest["ticker"] == "MSFT"
+    manifest["schema"] = "msft-tracker-import/1"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    frozen = manifest_path.read_bytes()
+    repeat = import_bullbear_tracker(source, workspace, apply=True)
+    assert repeat["ok"] is True
+    assert repeat["conflicts"] == []
+    assert repeat["paths"]["written"] == []
+    assert manifest_path.read_bytes() == frozen
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["schema"] == "msft-tracker-import/1"

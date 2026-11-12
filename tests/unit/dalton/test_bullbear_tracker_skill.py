@@ -11,8 +11,10 @@ from io import StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
-SKILL = ROOT / "plugins/dalton/skills/dalton-msft-tracker"
+SKILL = ROOT / "plugins/dalton/skills/dalton-bullbear-tracker"
 FIXTURE_MD = Path(__file__).resolve().parent / "fixtures/msft_tracker_card.md"
 FIXTURE_JSON = Path(__file__).resolve().parent / "fixtures/msft_tracker_card.json"
 RUN_ID = "20261109-2250"
@@ -33,18 +35,18 @@ def _load(name: str, relative: str):
 
 RENDER = _load(
     "msft_render_card",
-    "plugins/dalton/skills/dalton-msft-tracker/scripts/render_card.py",
+    "plugins/dalton/skills/dalton-bullbear-tracker/scripts/render_card.py",
 )
 STATE = _load(
     "msft_tracker_state",
-    "plugins/dalton/skills/dalton-msft-tracker/scripts/state.py",
+    "plugins/dalton/skills/dalton-bullbear-tracker/scripts/state.py",
 )
 
 
 def _run(root: Path, run_id: str = RUN_ID) -> Path:
     run = root / "research" / "tracker" / run_id
     run.mkdir(parents=True)
-    (run / "packet.json").write_text("{}\n", encoding="utf-8")
+    (run / "packet.json").write_text('{"ticker": "MSFT"}\n', encoding="utf-8")
     (root / "research" / "tracker" / "thesis.md").write_text(THESIS, encoding="utf-8")
     return run
 
@@ -67,17 +69,22 @@ def _review(card: str = CARD_REL, **extra: object) -> dict:
 
 def test_skill_matches_report_tool_and_keeps_targets_out() -> None:
     skill = (SKILL / "SKILL.md").read_text(encoding="utf-8")
-    rules = (SKILL / "references/research-rules.md").read_text(encoding="utf-8")
-    assert "references/research-rules.md" in skill
+    rules = (
+        (SKILL / "references/common-rules.md").read_text(encoding="utf-8")
+        + "\n"
+        + (SKILL / "references/msft-rules.md").read_text(encoding="utf-8")
+    )
+    assert "references/common-rules.md" in skill
+    assert "references/<ticker小写>-rules.md" in skill
     assert "automation_report(action=\"submit\", report_run_id=RUN_ID,\n                  material=\"yes\", cards=[CARD])" in skill
     assert "automation_report(action=\"status\", report_run_id=RUN_ID)" in skill
-    assert 'failure_text="MSFT 跟踪本轮采集失败：原因，下一轮自动重试"' in skill
+    assert 'failure_text="<TICKER> 跟踪本轮采集失败：原因，下一轮自动重试"' in skill
     assert "delivery_confirmed" in skill
     assert "content_kind` 明确为 `cards`" in skill
     assert "--material no" in skill
     assert "NO_REPLY" in skill
     assert "code` 为 `not_automation_run`" in skill
-    assert ".agents/skills/dalton-msft-tracker/scripts/" in skill
+    assert ".agents/skills/dalton-bullbear-tracker/scripts/" in skill
     assert "plugins/dalton/skills/" not in skill
     assert "尚未整合" not in skill
     assert "research_pending" in skill
@@ -85,7 +92,7 @@ def test_skill_matches_report_tool_and_keeps_targets_out() -> None:
     assert "research/tracker/thesis.md" in skill
     assert "同一内容不在底稿和卡片里各写一遍" not in skill
     assert "同一内容不在底稿和卡片里各写一遍" not in rules
-    assert "卡片读者看不到底稿" in rules
+    assert "卡片读者看不到工作底稿" in rules
     assert "无论本轮是否重要，都用编辑工具改有变化的章节" in rules
     for banned in (
         "oc_91724960011ac1576702a372a01ddc1f",
@@ -598,6 +605,8 @@ def test_pool_cap_repeat_remove_and_review(tmp_path: Path) -> None:
             [
                 "x-pool",
                 "add",
+                "--ticker",
+                "MSFT",
                 "--workspace-dir",
                 str(root),
                 "--run-id",
@@ -784,3 +793,311 @@ def test_unreviewed_packet_resume_and_failure_record(tmp_path: Path) -> None:
     kept = json.loads((fail_dir / "review.json").read_text(encoding="utf-8"))
     assert kept["report_run_id"] == failure_id
     assert kept["send_status"] == "sent"
+
+
+def test_msft_card_matches_saved_fixture_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    run = _run(root)
+    (run / "card.md").write_bytes(FIXTURE_MD.read_bytes())
+    RENDER.render_card(root, RUN_ID, f"research/tracker/{RUN_ID}/card.md", CARD_REL, "MSFT")
+    rendered = (root / CARD_REL).read_text(encoding="utf-8")
+    expected = RENDER.dump_card(json.loads(FIXTURE_JSON.read_text(encoding="utf-8")))
+    assert rendered == expected
+    assert rendered == FIXTURE_JSON.read_text(encoding="utf-8")
+    style = RENDER.load_card_style("MSFT")
+    assert style == {
+        "title_prefix": "📈 MSFT 跟踪｜",
+        "subtitle": "Microsoft · 多空观点、盈利预测修正与催化剂",
+        "tag": "MSFT",
+        "header_template": "indigo",
+        "tag_color": "indigo",
+    }
+
+
+@pytest.mark.parametrize(
+    ("ticker", "template", "subtitle"),
+    [
+        ("META", "blue", "Meta Platforms · 多空观点、盈利预测修正与催化剂"),
+        ("AMZN", "orange", "Amazon · 多空观点、盈利预测修正与催化剂"),
+        ("GOOGL", "green", "Alphabet · 多空观点、盈利预测修正与催化剂"),
+    ],
+)
+def test_card_header_follows_company_config(
+    tmp_path: Path, ticker: str, template: str, subtitle: str
+) -> None:
+    root = tmp_path / ticker
+    run = _run(root)
+    (run / "card.md").write_text("## 判断\n测试资料。\n", encoding="utf-8")
+    output = f"research/tracker/{RUN_ID}/card.json"
+    RENDER.render_card(root, RUN_ID, f"research/tracker/{RUN_ID}/card.md", output, ticker)
+    card = json.loads((root / output).read_text(encoding="utf-8"))
+    assert card["header"]["template"] == template
+    assert card["header"]["text_tag_list"][0]["color"] == template
+    assert card["header"]["text_tag_list"][0]["text"]["content"] == ticker
+    assert card["header"]["title"]["content"] == f"📈 {ticker} 跟踪｜11-09 22:50 ET"
+    assert card["header"]["subtitle"]["content"] == subtitle
+    assert card["header"]["title"]["content"] != "📈 MSFT 跟踪｜11-09 22:50 ET"
+
+
+def test_configs_share_research_fields_and_omit_recipients() -> None:
+    loaded: dict[str, dict] = {}
+    for ticker in ("MSFT", "META", "AMZN", "GOOGL"):
+        path = SKILL / "config" / f"{ticker}.json"
+        text = path.read_text(encoding="utf-8")
+        lowered = text.lower()
+        for banned in ("feishu", "chat", "token", "secret", "discord"):
+            assert banned not in lowered, path.name
+        loaded[ticker] = json.loads(text)
+        assert loaded[ticker]["ticker"] == ticker
+        assert set(loaded[ticker]["card"]) == {
+            "title_prefix",
+            "subtitle",
+            "tag",
+            "header_template",
+            "tag_color",
+        }
+    shared = set(loaded["MSFT"]) - {"extra_consensus_flags"}
+    for ticker in ("META", "AMZN", "GOOGL"):
+        assert set(loaded[ticker]) == shared
+        assert "extra_consensus_flags" not in loaded[ticker]
+
+
+def test_rules_keep_company_material_out_of_the_shared_file() -> None:
+    common = (SKILL / "references/common-rules.md").read_text(encoding="utf-8")
+    for token in ("Microsoft", "MSFT", "Azure", "FY27"):
+        assert token not in common
+    for name in ("meta-rules.md", "amzn-rules.md", "googl-rules.md"):
+        text = (SKILL / "references" / name).read_text(encoding="utf-8")
+        assert "Microsoft" not in text
+        assert "FY27" not in text
+        assert "剔除 OpenAI" not in text
+        assert "不含 OpenAI" not in text
+    for path in (SKILL / "references").glob("*.md"):
+        text = path.read_text(encoding="utf-8")
+        for banned in ("/Users/", ".openclaw", "stock_tracker.py", "feishu_send_card"):
+            assert banned not in text, path.name
+
+
+def test_open_runs_and_pool_follow_the_company_ticker(tmp_path: Path) -> None:
+    root = tmp_path / "meta"
+    tracker = root / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "thesis.md").write_text(THESIS, encoding="utf-8")
+    run_id = "20261109-2250"
+    (tracker / run_id).mkdir()
+    (tracker / run_id / "packet.json").write_text(
+        json.dumps({"ticker": "META", "run_id": run_id, "collection_complete": True}),
+        encoding="utf-8",
+    )
+    msft_run = "20261110-2250"
+    (tracker / msft_run).mkdir()
+    (tracker / msft_run / "packet.json").write_text(
+        json.dumps({"ticker": "MSFT", "run_id": msft_run, "collection_complete": True}),
+        encoding="utf-8",
+    )
+    listed = STATE.unfinished_runs(root, "META")
+    assert [item["run_id"] for item in listed] == [run_id]
+    added = STATE.add_author(
+        root, run_id, "@shared", "ALL", "基金经理，连续给出数字", ticker="META"
+    )
+    assert added["ok"] is True
+    try:
+        STATE.add_author(
+            root, run_id, "@msftonly", "MSFT", "基金经理，连续给出数字", ticker="META"
+        )
+    except STATE.StateError as exc:
+        assert exc.status == "ticker_scope"
+    else:
+        raise AssertionError("MSFT-only author was accepted into the META pool")
+    assert (tracker / ".meta-collect.lock").is_file()
+    try:
+        STATE.resolve_ticker("NVDA")
+    except STATE.StateError as exc:
+        assert exc.status == "unsupported_ticker"
+    else:
+        raise AssertionError("NVDA was accepted")
+
+
+def test_state_rejects_other_company_and_blank_ticker_and_keeps_legacy_msft(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    run_id = "20261109-2250"
+    run = root / "research" / "tracker" / run_id
+    run.mkdir(parents=True)
+    packet = run / "packet.json"
+    packet.write_text(
+        json.dumps({"ticker": "MSFT", "run_id": run_id, "collection_complete": True}),
+        encoding="utf-8",
+    )
+    before = packet.read_bytes()
+
+    try:
+        STATE.save_review(
+            root,
+            run_id,
+            material="yes",
+            summary="不该写入",
+            report_run_id=run_id,
+            send_status="pending",
+            content_kind="cards",
+            ticker="META",
+        )
+    except STATE.StateError as exc:
+        assert exc.status == "company_mismatch"
+    else:
+        raise AssertionError("META save-review wrote an MSFT run")
+    assert packet.read_bytes() == before
+    assert not (run / "review.json").exists()
+    assert not (root / "research" / "tracker" / ".meta-collect.lock").exists()
+
+    try:
+        STATE.add_author(root, run_id, "@meta", "META", "基金经理，连续给出数字", ticker="META")
+    except STATE.StateError as exc:
+        assert exc.status == "company_mismatch"
+    else:
+        raise AssertionError("META x-pool add wrote an MSFT run")
+    try:
+        STATE.remove_author(root, run_id, "@meta", "不再覆盖", ticker="META")
+    except STATE.StateError as exc:
+        assert exc.status == "company_mismatch"
+    else:
+        raise AssertionError("META x-pool remove wrote an MSFT run")
+    assert packet.read_bytes() == before
+    assert not (root / "research" / "tracker" / "x_pool.json").exists()
+    assert not (root / "research" / "tracker" / ".meta-collect.lock").exists()
+
+    for raw in ("", "   "):
+        try:
+            STATE.resolve_ticker(raw)
+        except STATE.StateError as exc:
+            assert exc.status == "unsupported_ticker"
+        else:
+            raise AssertionError(f"blank ticker {raw!r} was accepted")
+        buf = StringIO()
+        with redirect_stdout(buf):
+            code = STATE.main(["open-runs", "--ticker", raw, "--workspace-dir", str(root)])
+        assert code == 2
+        assert json.loads(buf.getvalue())["status"] == "unsupported_ticker"
+
+    legacy_id = "msft-collect-20261101"
+    legacy = root / "research" / "tracker" / legacy_id
+    legacy.mkdir()
+    (legacy / "review.json").write_text(
+        json.dumps(
+            {
+                "run_id": legacy_id,
+                "material": "yes",
+                "summary": "旧失败记录",
+                "thesis_path": "research/tracker/thesis.md",
+                "thesis_sha256": "abc",
+                "report_run_id": legacy_id,
+                "card_json": None,
+                "send_status": "pending",
+                "content_kind": "failure_text",
+            }
+        ),
+        encoding="utf-8",
+    )
+    msft_runs = [item["run_id"] for item in STATE.unfinished_runs(root, "MSFT")]
+    meta_runs = [item["run_id"] for item in STATE.unfinished_runs(root, "META")]
+    assert legacy_id in msft_runs
+    assert legacy_id not in meta_runs
+    assert "ticker" not in json.loads((legacy / "review.json").read_text(encoding="utf-8"))
+
+
+def test_failure_review_without_packet_rejects_other_company(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    tracker = root / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "thesis.md").write_text(THESIS, encoding="utf-8")
+    bodies = {
+        "msft-collect-20261111": {
+            "run_id": "msft-collect-20261111",
+            "ticker": "MSFT",
+            "material": "yes",
+            "summary": "采集失败",
+            "thesis_path": "research/tracker/thesis.md",
+            "thesis_sha256": "abc",
+            "report_run_id": "msft-collect-20261111",
+            "card_json": None,
+            "send_status": "pending",
+            "content_kind": "failure_text",
+        },
+        "msft-collect-20261101": {
+            "run_id": "msft-collect-20261101",
+            "material": "yes",
+            "summary": "旧失败记录",
+            "thesis_path": "research/tracker/thesis.md",
+            "thesis_sha256": "abc",
+            "report_run_id": "msft-collect-20261101",
+            "card_json": None,
+            "send_status": "pending",
+            "content_kind": "failure_text",
+        },
+    }
+    before: dict[str, bytes] = {}
+    for run_id, body in bodies.items():
+        review = tracker / run_id / "review.json"
+        review.parent.mkdir()
+        review.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        before[run_id] = review.read_bytes()
+        buf = StringIO()
+        with redirect_stdout(buf):
+            code = STATE.main(
+                [
+                    "save-review",
+                    "--ticker",
+                    "META",
+                    "--workspace-dir",
+                    str(root),
+                    "--run-id",
+                    run_id,
+                    "--material",
+                    "yes",
+                    "--summary",
+                    "不该改写",
+                    "--report-run-id",
+                    run_id,
+                    "--send-status",
+                    "sent",
+                    "--content-kind",
+                    "failure_text",
+                ]
+            )
+        assert code == 2
+        assert json.loads(buf.getvalue())["status"] == "company_mismatch"
+        assert review.read_bytes() == before[run_id]
+        assert not (review.parent / "packet.json").exists()
+    assert not (tracker / ".meta-collect.lock").exists()
+
+
+def test_corrupt_packet_keeps_review_visible_by_review_ticker(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    tracker = root / "research" / "tracker"
+
+    def write_run(run_id: str, packet: str, review: dict[str, object]) -> None:
+        folder = tracker / run_id
+        folder.mkdir(parents=True)
+        (folder / "packet.json").write_text(packet, encoding="utf-8")
+        (folder / "review.json").write_text(json.dumps(review), encoding="utf-8")
+
+    meta_id = "meta-collect-20261102"
+    write_run(meta_id, "not json", {"run_id": meta_id, "ticker": "META", "content_kind": "failure_text"})
+    legacy_id = "msft-collect-20261103"
+    write_run(legacy_id, "[]\n", {"run_id": legacy_id, "content_kind": "failure_text"})
+    foreign_id = "20261104-1200"
+    write_run(
+        foreign_id,
+        json.dumps({"ticker": "MSFT", "run_id": foreign_id}),
+        {"run_id": foreign_id, "ticker": "META", "content_kind": "failure_text"},
+    )
+
+    bad_bytes_id = "meta-collect-20261105"
+    write_run(bad_bytes_id, "", {"run_id": bad_bytes_id, "ticker": "META", "content_kind": "failure_text"})
+    (tracker / bad_bytes_id / "packet.json").write_bytes(b"\xff\xfe{")
+
+    meta_runs = [item["run_id"] for item in STATE.unfinished_runs(root, "META")]
+    msft_runs = [item["run_id"] for item in STATE.unfinished_runs(root, "MSFT")]
+    assert bad_bytes_id in meta_runs and bad_bytes_id not in msft_runs
+    assert meta_id in meta_runs and meta_id not in msft_runs
+    assert legacy_id in msft_runs and legacy_id not in meta_runs
+    assert foreign_id in msft_runs and foreign_id not in meta_runs

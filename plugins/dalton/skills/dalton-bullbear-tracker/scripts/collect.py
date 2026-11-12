@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""MSFT 跟踪采集与提交。
+"""公司多空日跟踪的采集与提交。
 
-只服务 MSFT。通用逻辑来自同级技能 dalton-thesis-delta 的 collect.py
+只服务 MSFT、META、AMZN、GOOGL。通用逻辑来自同级技能 dalton-thesis-delta 的 collect.py
 （仓库里是 plugins/dalton/skills，沙箱里是 .agents/skills，都按同级目录加载）。
 本脚本不读不写旧 OpenClaw 根目录，也不调用 gateway、xreach 或子进程。
 
@@ -27,9 +27,10 @@ from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 SKILL_DIR = Path(__file__).resolve().parent.parent
-RESEARCH_CONFIG_PATH = SKILL_DIR / "config" / "research.json"
 GENERIC_COLLECT_PATH = SKILL_DIR.parent / "dalton-thesis-delta" / "scripts" / "collect.py"
 
+SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
+# 直接调用采集函数时默认 MSFT，线上状态键和锁名由此推出。
 TICKER = "MSFT"
 EXCERPT_MAX = 6000
 PARA_MAX = 1800
@@ -81,7 +82,7 @@ def _load_generic():
             "generic_collect_missing",
             f"找不到同级通用采集模块 {GENERIC_COLLECT_PATH}",
         )
-    name = "dalton_thesis_delta_collect_for_msft"
+    name = "dalton_thesis_delta_collect_for_bullbear_tracker"
     spec = importlib.util.spec_from_file_location(name, GENERIC_COLLECT_PATH)
     if spec is None or spec.loader is None:
         raise CollectError("generic_collect_missing", f"无法加载 {GENERIC_COLLECT_PATH}")
@@ -113,6 +114,20 @@ def now_et() -> datetime:
 def emit(payload: dict[str, Any], code: int = 0) -> int:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return code
+
+
+def ae_state_key(ticker: str | None = None) -> str:
+    """续采状态键。MSFT 线上键名是 msft_ae_state，由 ticker 小写推出。"""
+    return f"{(ticker or TICKER).lower()}_ae_state"
+
+
+def collect_lock_name(ticker: str | None = None) -> str:
+    # 线上 MSFT 锁文件名是 .msft-collect.lock，由 ticker 小写推出，不要改成别的文件名。
+    return f".{(ticker or TICKER).lower()}-collect.lock"
+
+
+def research_config_path(ticker: str | None = None) -> Path:
+    return SKILL_DIR / "config" / f"{(ticker or TICKER).upper()}.json"
 
 
 def fail(status: str, message: str, **extra: Any) -> int:
@@ -220,7 +235,7 @@ def atomic_write_json(workspace: Path, path: Path, obj: Any) -> None:
 @contextmanager
 def workspace_lock(workspace: Path, tracker: Path) -> Iterator[None]:
     tracker.mkdir(parents=True, exist_ok=True)
-    lock_path = tracker / ".msft-collect.lock"
+    lock_path = tracker / collect_lock_name()
     if not _inside(workspace, lock_path):
         raise CollectError("path_escape", "锁文件越出工作区")
     handle = lock_path.open("a+")
@@ -234,11 +249,11 @@ def workspace_lock(workspace: Path, tracker: Path) -> Iterator[None]:
 
 def load_research_config() -> dict[str, Any]:
     try:
-        data = json.loads(RESEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(research_config_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CollectError("research_config_unreadable", str(exc)[:200]) from exc
     if not isinstance(data, dict) or str(data.get("ticker") or "").upper() != TICKER:
-        raise CollectError("company_not_msft", "研究配置不是 MSFT")
+        raise CollectError("company_mismatch", f"研究配置不是 {TICKER}")
     return data
 
 
@@ -255,7 +270,7 @@ def load_company(workspace: Path) -> dict[str, Any]:
         raise CollectError("company_json_unreadable", "data/company.json 不是对象")
     ticker = str(data.get("ticker") or TICKER).upper()
     if ticker != TICKER:
-        raise CollectError("company_not_msft", f"工作区公司是 {ticker}，本采集器只处理 MSFT")
+        raise CollectError("company_mismatch", f"工作区公司是 {ticker}，本采集器只处理 {TICKER}")
     return data
 
 
@@ -296,15 +311,30 @@ def consensus_deltas(
     prev: dict[str, Any] | None,
     thr: dict[str, Any],
     sec_new_count: int = 0,
+    extra_flags: Any = None,
 ) -> tuple[dict[str, Any], list[str]]:
     deltas, flags = _g.compute_consensus_deltas(cur, prev, thr, sec_new_count=sec_new_count)
     flags = list(flags)
-    _append_msft_flags(deltas, flags, thr)
+    specs = _configured_extra_flags() if extra_flags is None else extra_flags
+    _append_extra_flags(deltas, flags, thr, specs)
     return deltas, flags
 
 
-def _append_msft_flags(deltas: dict[str, Any], flags: list[str], thr: dict[str, Any]) -> None:
+def _configured_extra_flags() -> list[Any]:
+    try:
+        cfg = load_research_config()
+    except CollectError:
+        return []
+    specs = cfg.get("extra_consensus_flags")
+    return specs if isinstance(specs, list) else []
+
+
+def _append_extra_flags(deltas: dict[str, Any], flags: list[str], thr: dict[str, Any], specs: Any) -> None:
     # 通用函数已用 eps_fy1_vs_last_pct 报过「本财年(0y) EPS 较上次运行」，这里不重复。
+    # MSFT 的两条额外触发在 config/MSFT.json 的 extra_consensus_flags，标签和阈值键保持原样。
+    if not isinstance(specs, list):
+        return
+
     def add(key: str, limit: Any, label: str) -> None:
         val = deltas.get(key)
         if val is None:
@@ -312,8 +342,15 @@ def _append_msft_flags(deltas: dict[str, Any], flags: list[str], thr: dict[str, 
         if abs(float(val)) >= float(limit):
             flags.append(f"{label} {float(val):+.2f}%（阈值 ±{float(limit)}%）")
 
-    add("eps_0y_vs_7d_pct", thr.get("eps_fy1_vs_7d_pct", 2.0), "本财年(0y) EPS 较 7 天前")
-    add("rev_0y_vs_last_pct", thr.get("rev_fy1_or_q1_vs_last_pct", 0.7), "本财年(0y) 收入较上次运行")
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        delta = spec.get("delta")
+        threshold = spec.get("threshold")
+        label = spec.get("label")
+        if not isinstance(delta, str) or not isinstance(threshold, str) or not isinstance(label, str):
+            continue
+        add(delta, thr.get(threshold, spec.get("default", 0)), label)
 
 
 def _fy_label(raw: str) -> str:
@@ -323,13 +360,72 @@ def _fy_label(raw: str) -> str:
     return f"FY{year}"
 
 
+def _fiscal_end_month(model: dict[str, Any]) -> int | None:
+    raw = model.get("fiscal_year_end_month")
+    if type(raw) is not int or not 1 <= raw <= 12:
+        return None
+    return raw
+
+
+def _basis_year(model: dict[str, Any]) -> int | None:
+    raw = model.get("basis_fiscal_year")
+    if type(raw) is not int or raw < 1900:
+        return None
+    return raw
+
+
+def other_income_for_fiscal_year(model: dict[str, Any], fiscal_year: int) -> Any:
+    """配置里的 0y 属于 basis_fiscal_year，+1y 属于下一年。没有对应键时返回未知。"""
+    other = model.get("other_income_bn") if isinstance(model.get("other_income_bn"), dict) else {}
+    basis = _basis_year(model)
+    if basis is None:
+        return None
+    offset = fiscal_year - basis
+    if offset == 0:
+        key = "0y"
+    elif offset > 0:
+        key = f"+{offset}y"
+    else:
+        key = f"{offset}y"
+    if key not in other:
+        return None
+    return other[key]
+
+
+def _years_from_fiscal_month(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """当前日期决定 0y 和 +1y 是哪两个财年。其他收入按基准财年换算，不跟着日历年滚动。"""
+    month = _fiscal_end_month(model)
+    if month is None:
+        return []
+    today = now_et().date()
+    end_year = today.year if today.month <= month else today.year + 1
+    years: list[dict[str, Any]] = []
+    for offset, key in ((0, "0y"), (1, "+1y")):
+        year = end_year + offset
+        income = other_income_for_fiscal_year(model, year)
+        item: dict[str, Any] = {
+            "key": key,
+            "fiscal_year": f"FY{year}",
+            "period_end_prefix": f"{year}-{month:02d}",
+            "other_income_bn": income,
+        }
+        if income is None:
+            item["other_income_reason"] = f"FY{year} 没有其他收入假设，未计算隐含费用"
+        years.append(item)
+    return years
+
+
 def applicable_years(model: dict[str, Any]) -> list[dict[str, Any]]:
-    """从来源原文解析 0y/+1y 各自对应的财年末，不把相对键永久当成某一个财年。"""
+    """从来源原文解析 0y/+1y 各自对应的财年末。
+
+    来源里能解析出截止月时，其他收入仍取配置里的 0y 和 +1y。
+    解析不到时用 fiscal_year_end_month 和当前日期得到实际财年，再减去 basis_fiscal_year 回到配置里的相对键。
+    """
     source = str(model.get("source") or "")
     other = model.get("other_income_bn") if isinstance(model.get("other_income_bn"), dict) else {}
     match = _OY_RE.search(source)
     if not match:
-        return []
+        return _years_from_fiscal_month(model)
     month = match.group(3)
     years = [{
         "key": "0y",
@@ -1050,13 +1146,13 @@ def collect_internal(
     }
 
 
-def _has_msft_ae_state(last_run: dict[str, Any]) -> bool:
-    state = last_run.get("msft_ae_state") if isinstance(last_run, dict) else None
+def _has_ae_state(last_run: dict[str, Any]) -> bool:
+    state = last_run.get(ae_state_key()) if isinstance(last_run, dict) else None
     return isinstance(state, dict) and isinstance(state.get("queries"), list)
 
 
 def _ae_prev_map(last_run: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    state = last_run.get("msft_ae_state") if isinstance(last_run, dict) else None
+    state = last_run.get(ae_state_key()) if isinstance(last_run, dict) else None
     queries = state.get("queries") if isinstance(state, dict) else None
     if not isinstance(queries, list):
         return {}
@@ -1068,11 +1164,11 @@ def _ae_prev_map(last_run: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _legacy_ae_map(last_run: dict[str, Any], queries: list[str]) -> dict[str, dict[str, Any]]:
-    """没有 msft_ae_state 时，用导入的覆盖日和未完成窗口初始化每一条查询。
+    """没有本 ticker 的续采状态时，用导入的覆盖日和未完成窗口初始化每一条查询。
 
-    旧 cursor 只对当时那一次筛选有效，这里从窗口起点重放，不带 cursor。
+    MSFT 的键名是 msft_ae_state。旧 cursor 只对当时那一次筛选有效，这里从窗口起点重放，不带 cursor。
     """
-    if not isinstance(last_run, dict) or _has_msft_ae_state(last_run):
+    if not isinstance(last_run, dict) or _has_ae_state(last_run):
         return {}
     covered = _coerce_day(last_run.get("ae_covered_until"))
     resume = last_run.get("ae_resume") if isinstance(last_run.get("ae_resume"), dict) else None
@@ -1351,7 +1447,7 @@ def _load_pool(workspace: Path, cfg: dict[str, Any]) -> tuple[list[str], dict[st
         if not isinstance(info, dict) or info.get("active", True) is False:
             continue
         tickers = {str(item).upper() for item in (info.get("tickers") or [])}
-        if tickers & {TICKER, "ALL"}:
+        if tickers & {TICKER, "ALL"}:  # 本公司 ticker 或 ALL
             eligible.append(str(handle))
     return eligible[: int(cfg.get("x_pool_max") or 25)], raw
 
@@ -1647,9 +1743,17 @@ def render_packet_md(pk: dict[str, Any]) -> str:
     if assumptions.get("source"):
         lines.append(f"- 来源：{assumptions['source']}")
     for item in assumptions.get("applicable_years") or []:
-        lines.append(
-            f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {item.get('other_income_bn')}"
-        )
+        income = item.get("other_income_bn")
+        reason = item.get("other_income_reason")
+        if reason:
+            shown = "未知" if income is None else income
+            lines.append(
+                f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {shown}（{reason}）"
+            )
+        else:
+            lines.append(
+                f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {income}"
+            )
     for key in ("0y", "+1y"):
         row = (model.get("periods") or {}).get(key) or {}
         if row.get("status") == "ok":
@@ -1690,7 +1794,7 @@ def render_packet_md(pk: dict[str, Any]) -> str:
     ae = pk.get("alphaengine") or {}
     lines.extend(["", "## AlphaEngine"])
     lines.append("固定查询：")
-    for row in (pk.get("msft_ae_state") or {}).get("queries") or []:
+    for row in (pk.get(ae_state_key(str(pk.get("ticker") or TICKER))) or {}).get("queries") or []:
         window = row.get("window") or {}
         lines.append(
             f"- {row.get('query')} | 窗口 {window.get('start')} 至 {window.get('end')} | "
@@ -1851,7 +1955,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
         sec = collect_sec(cfg, since, seen)
         xdata = collect_x(cfg, since, until, seen, workspace)
         thr = map_thresholds(cfg.get("thresholds"))
-        deltas, flags = consensus_deltas(consensus, previous, thr, sec_new_count=len(sec["new"]))
+        raw_extra = cfg.get("extra_consensus_flags")
+        extra_flags = raw_extra if isinstance(raw_extra, list) else []
+        deltas, flags = consensus_deltas(
+            consensus, previous, thr, sec_new_count=len(sec["new"]), extra_flags=extra_flags
+        )
         model = build_implied_model(consensus, cfg.get("model") or {})
         failures = failed_sources(internal, ae, sec, xdata, consensus)
         packet = {
@@ -1881,7 +1989,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
             "collected_at": collected_at,
             "internal_since": internal_since,
             "internal_retry_since": internal_since if _internal_needs_retry(internal) else None,
-            "msft_ae_state": ae_state,
+            ae_state_key(): ae_state,
             "limits": {
                 "internal_limit": cfg.get("internal_limit"),
                 "internal_read_cap_per_route": cfg.get("internal_read_cap_per_route"),
@@ -1961,7 +2069,7 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
     retained = _committed_ae_covered(last_run or {})
     queries = state.get("queries")
     if not isinstance(queries, list):
-        raise CollectError("bad_ae_state", "msft_ae_state.queries 必须是列表")
+        raise CollectError("bad_ae_state", f"{ae_state_key()}.queries 必须是列表")
     for row in queries:
         if not isinstance(row, dict) or not isinstance(row.get("query"), str):
             raise CollectError("bad_ae_state", "AE 查询状态缺少 query")
@@ -2017,9 +2125,10 @@ def cmd_commit(args: argparse.Namespace) -> int:
         if packet.get("run_id") != run_id:
             return fail("packet_run_mismatch", "packet 的 run_id 与参数不一致")
         snapshot = _snapshot_for_commit(workspace, packet)
-        ae_state = packet.get("msft_ae_state")
+        ae_key = ae_state_key()
+        ae_state = packet.get(ae_key)
         if not isinstance(ae_state, dict):
-            return fail("bad_ae_state", "packet 缺少 msft_ae_state")
+            return fail("bad_ae_state", f"packet 缺少 {ae_key}")
         seen = _read_state_list(paths["seen"])
         last_run = _read_state_object(paths["last_run"])
         _validate_ae_state(ae_state, last_run)
@@ -2044,7 +2153,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
                 "snapshot_file": snapshot,
                 "material": args.material,
                 "summary": summary,
-                "msft_ae_state": ae_state,
+                ae_key: ae_state,
             }
             if "internal_retry_since" in packet:
                 last_body["internal_retry_since"] = _coerce_retry_since(packet.get("internal_retry_since"))
@@ -2081,25 +2190,43 @@ def cmd_commit(args: argparse.Namespace) -> int:
         return emit(body)
 
 
+def _use_ticker(raw: str) -> str:
+    chosen = str(raw or "").strip().upper()
+    if chosen not in SUPPORTED_TICKERS:
+        raise CollectError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
+    return chosen
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="MSFT 跟踪采集与提交")
+    global TICKER
+    parser = argparse.ArgumentParser(description="多空日跟踪采集与提交")
     sub = parser.add_subparsers(dest="cmd", required=True)
     collect = sub.add_parser("collect")
+    collect.add_argument("--ticker", required=True)
     collect.add_argument("--workspace-dir", required=True)
     collect.add_argument("--since")
     collect.add_argument("--run-id")
     commit = sub.add_parser("commit")
+    commit.add_argument("--ticker", required=True)
     commit.add_argument("--workspace-dir", required=True)
     commit.add_argument("--run-id", required=True)
     commit.add_argument("--material", required=True)
     commit.add_argument("--summary", required=True)
     args = parser.parse_args(argv)
+    previous = TICKER
+    try:
+        chosen = _use_ticker(args.ticker)
+    except CollectError as exc:
+        return fail(exc.status, exc.message, ticker=str(args.ticker or "").strip().upper())
+    TICKER = chosen
     try:
         if args.cmd == "collect":
             return cmd_collect(args)
         return cmd_commit(args)
     except CollectError as exc:
         return fail(exc.status, exc.message)
+    finally:
+        TICKER = previous
 
 
 if __name__ == "__main__":

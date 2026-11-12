@@ -62,6 +62,7 @@
       "0y": -0.4,
       "+1y": -0.4
     },
+    "fiscal_year_end_month": 6,
     "source": "FY26 Q4 8-K 附件 99.1（accession 0001193125-26-323632）：non-GAAP 净利润 353 亿/EPS 4.74 ≈ 74.5 亿股；FY27 Q1 指引税率约 20%、其他收入约 -1 亿/季（不含 OpenAI）。Yahoo 0y=FY27（2027-06 止），+1y=FY28；一致 EPS 为 non-GAAP（剔除 OpenAI 损益）"
   },
   "thresholds": {
@@ -72,5 +73,26 @@
     "fy1_down_revisions_7d": 5,
     "price_1d_pct": 4.0,
     "price_5d_pct": 8.0
-  }
+  },
+  "card": {
+    "title_prefix": "📈 MSFT 跟踪｜",
+    "subtitle": "Microsoft · 多空观点、盈利预测修正与催化剂",
+    "tag": "MSFT",
+    "header_template": "indigo",
+    "tag_color": "indigo"
+  },
+  "extra_consensus_flags": [
+    {
+      "delta": "eps_0y_vs_7d_pct",
+      "threshold": "eps_fy1_vs_7d_pct",
+      "default": 2.0,
+      "label": "本财年(0y) EPS 较 7 天前"
+    },
+    {
+      "delta": "rev_0y_vs_last_pct",
+      "threshold": "rev_fy1_or_q1_vs_last_pct",
+      "default": 0.7,
+      "label": "本财年(0y) 收入较上次运行"
+    }
+  ]
 }

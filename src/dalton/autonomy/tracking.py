@@ -260,6 +260,20 @@ def _filter_company_automations(
     return matched
 
 
+def _replaced_by_tracker(row: dict[str, Any] | None) -> str | None:
+    """Non-empty tracker UUID on a row. Blank, missing, or non-string values are unmarked."""
+    if not isinstance(row, dict):
+        return None
+    meta = row.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("replaced_by_tracker")
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    return text or None
+
+
 def _derive_status_and_details(
     *,
     workspace_id: str,
@@ -275,6 +289,7 @@ def _derive_status_and_details(
     )
     expected_names = [str(s["name"]) for s in specs]
     tz = str(specs[0].get("timezone") or "America/New_York") if specs else "America/New_York"
+    delta_name = f"dalton-{str(ticker).strip().lower()}-delta"
 
     by_name: dict[str, dict[str, Any]] = {}
     for r in company_rows:
@@ -282,20 +297,32 @@ def _derive_status_and_details(
         if r_name and r_name not in by_name:
             by_name[r_name] = r
 
-    existing_standard = [by_name[n] for n in expected_names if n in by_name]
-    missing_tasks = [n for n in expected_names if n not in by_name]
+    # Any same-name delta row can carry the marker. The first row alone is not enough.
+    replaced_marker = None
+    for r in company_rows:
+        if str(r.get("name") or "").strip() != delta_name:
+            continue
+        replaced_marker = _replaced_by_tracker(r)
+        if replaced_marker:
+            break
+    # A delta already replaced by the company tracker is not a missing or paused standard task.
+    countable_names = [
+        n for n in expected_names if not (n == delta_name and replaced_marker)
+    ]
+    existing_standard = [by_name[n] for n in countable_names if n in by_name]
+    missing_tasks = [n for n in countable_names if n not in by_name]
     active_tasks = [
         n
-        for n in expected_names
+        for n in countable_names
         if n in by_name and str(by_name[n].get("status") or "").lower() == "active"
     ]
     paused_tasks = [
         n
-        for n in expected_names
+        for n in countable_names
         if n in by_name and str(by_name[n].get("status") or "").lower() == "paused"
     ]
 
-    total_expected = len(expected_names)
+    total_expected = len(countable_names)
     if len(existing_standard) == total_expected and len(active_tasks) == total_expected:
         status = "enabled"
         label = LABEL_ENABLED_ZH
@@ -312,7 +339,9 @@ def _derive_status_and_details(
         isinstance(r.get("metadata"), dict) and bool(r["metadata"].get("paused_by_user"))
         for r in existing_standard
     ) or any(
-        isinstance(r.get("metadata"), dict) and bool(r["metadata"].get("paused_by_user"))
+        isinstance(r.get("metadata"), dict)
+        and bool(r["metadata"].get("paused_by_user"))
+        and not (replaced_marker and str(r.get("name") or "").strip() == delta_name)
         for r in company_rows
     )
 
@@ -370,7 +399,7 @@ def _derive_status_and_details(
             }
         )
 
-    return {
+    details = {
         "ok": True,
         "workspace_id": str(workspace_id),
         "ticker": ticker,
@@ -386,6 +415,9 @@ def _derive_status_and_details(
         "tasks": tasks_list,
         "automations": tasks_list,
     }
+    if replaced_marker:
+        details["delta_replaced_by_tracker"] = replaced_marker
+    return details
 
 
 async def _load_company_automations(
@@ -1100,19 +1132,30 @@ async def enable_tracking(
             for r in company_rows
             if isinstance(r, dict) and r.get("name")
         }
+        delta_name = f"dalton-{str(ticker).strip().lower()}-delta"
+        # One marked row is enough. A later unmarked duplicate must not be upserted.
+        delta_replaced = any(
+            isinstance(r, dict)
+            and str(r.get("name") or "").strip() == delta_name
+            and _replaced_by_tracker(r)
+            for r in company_rows
+        )
 
         for spec in specs:
+            s_name = str(spec.get("name") or "")
+            existing_c = by_name_company.get(s_name)
+            if s_name == delta_name and delta_replaced:
+                continue
             spec_copy = dict(spec)
             spec_meta = dict(spec_copy.get("metadata") or {})
             spec_meta["paused_by_user"] = None
             spec_meta["tier"] = resolved_tier
-            if str(spec_copy.get("name") or "").endswith("-delta"):
+            if str(spec_copy.get("name") or "") == delta_name:
                 spec_copy["cron_expression"] = delta_cron
                 spec_copy["timezone"] = delta_tz
             spec_copy["metadata"] = spec_meta
             spec_copy["status"] = "active"
             s_name = str(spec_copy["name"])
-            existing_c = by_name_company.get(s_name)
             was_paused = bool(
                 existing_c and str(existing_c.get("status") or "").strip().lower() == "paused"
             )
@@ -1142,6 +1185,8 @@ async def enable_tracking(
             for r in company_rows:
                 r_name = str(r.get("name") or "").strip()
                 if r_name in expected_names:
+                    continue
+                if _replaced_by_tracker(r):
                     continue
                 if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
                     cleaned_meta = dict(r.get("metadata") or {})
@@ -1327,6 +1372,17 @@ async def resync_delta_schedule(
                 "tier": resolved_tier,
                 "name": delta_name,
             }
+        open_rows = [row for row in delta_rows if not _replaced_by_tracker(row)]
+        if not open_rows:
+            return {
+                "ok": True,
+                "updated": False,
+                "reason": "replaced_by_tracker",
+                "user_id": uid,
+                "ticker": t_upper,
+                "tier": resolved_tier,
+                "name": delta_name,
+            }
 
         from src.server.services.automation_scheduler import AutomationScheduler
 
@@ -1348,7 +1404,7 @@ async def resync_delta_schedule(
             action="update",
             skip_if_unchanged=True,
         ):
-            for row in delta_rows:
+            for row in open_rows:
                 auto_id = str(row["automation_id"])
                 old_cron = row.get("cron_expression")
                 old_tz = row.get("timezone")

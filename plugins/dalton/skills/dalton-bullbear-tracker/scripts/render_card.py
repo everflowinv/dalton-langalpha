@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one MSFT tracker card file. Stdlib only. No network and no credentials."""
+"""Build one bull/bear tracker card file. Stdlib only. No network and no credentials."""
 
 from __future__ import annotations
 
@@ -15,10 +15,8 @@ from typing import Any, Optional, Tuple
 
 CARD_MARKDOWN_MAX_CHARS = 2000
 CARD_BODY_MAX_CHARS = 3000
-TICKER = "MSFT"
-SUBTITLE = "Microsoft · 多空观点、盈利预测修正与催化剂"
-HEADER_TEMPLATE = "indigo"
-TAG_COLOR = "indigo"
+SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
+SKILL_DIR = Path(__file__).resolve().parent.parent
 
 _TABLE_LINE_RE = re.compile(r"^\s*\|.*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
@@ -404,6 +402,29 @@ def _forbidden_payload(obj: Any) -> bool:
     return False
 
 
+def load_card_style(ticker: str = "MSFT") -> dict[str, str]:
+    chosen = str(ticker or "").strip().upper()
+    if chosen not in SUPPORTED_TICKERS:
+        raise RenderError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
+    path = SKILL_DIR / "config" / f"{chosen}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RenderError("research_config_unreadable", str(exc)[:200]) from exc
+    if not isinstance(data, dict) or str(data.get("ticker") or "").upper() != chosen:
+        raise RenderError("company_mismatch", f"研究配置不是 {chosen}")
+    card = data.get("card")
+    if not isinstance(card, dict):
+        raise RenderError("card_config_missing", "配置缺少 card")
+    style: dict[str, str] = {}
+    for key in ("title_prefix", "subtitle", "tag", "header_template", "tag_color"):
+        value = card.get(key)
+        if not isinstance(value, str) or not value:
+            raise RenderError("card_config_missing", f"card.{key} 缺失")
+        style[key] = value
+    return style
+
+
 def dump_card(card: dict[str, Any]) -> str:
     return json.dumps(card, ensure_ascii=False, indent=2) + "\n"
 
@@ -423,8 +444,15 @@ def prepare_body(markdown: str, thesis: Path) -> tuple[str, list[str]]:
     return prepared, [str(item) for item in glossed]
 
 
-def render_card(workspace: Path | str, run_id: str, file_rel: str, output_rel: str) -> dict[str, Any]:
+def render_card(
+    workspace: Path | str,
+    run_id: str,
+    file_rel: str,
+    output_rel: str,
+    ticker: str = "MSFT",
+) -> dict[str, Any]:
     root = open_workspace(str(workspace))
+    style = load_card_style(ticker)
     stamp = parse_run_stamp(run_id)
     source = ensure_relative(root, file_rel)
     output = ensure_relative(root, output_rel)
@@ -434,14 +462,14 @@ def render_card(workspace: Path | str, run_id: str, file_rel: str, output_rel: s
     if source.is_symlink() or not source.is_file():
         raise RenderError("card_missing", "找不到卡片正文")
     prepared, glossed = prepare_body(source.read_text(encoding="utf-8"), root / "research" / "tracker" / "thesis.md")
-    title = f"📈 {TICKER} 跟踪｜{stamp:%m-%d %H:%M} ET"
+    title = f"{style['title_prefix']}{stamp:%m-%d %H:%M} ET"
     card = markdown_to_card_elements(
         prepared,
         title=title,
-        subtitle=SUBTITLE,
-        header_template=HEADER_TEMPLATE,
-        tag=TICKER,
-        tag_color=TAG_COLOR,
+        subtitle=style["subtitle"],
+        header_template=style["header_template"],
+        tag=style["tag"],
+        tag_color=style["tag_color"],
     )
     if _forbidden_payload(card):
         raise RenderError("unsupported_content", "卡片不接受图片或表格")
@@ -480,14 +508,15 @@ def _atomic_write(workspace: Path, path: Path, text: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="构造一张 MSFT 跟踪卡片")
+    parser = argparse.ArgumentParser(description="构造一张多空日跟踪卡片")
+    parser.add_argument("--ticker", required=True)
     parser.add_argument("--workspace-dir", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--file", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
-        result = render_card(args.workspace_dir, args.run_id, args.file, args.output)
+        result = render_card(args.workspace_dir, args.run_id, args.file, args.output, args.ticker)
     except RenderError as exc:
         payload: dict[str, Any] = {"ok": False, "status": exc.status, "error": exc.message}
         payload.update(exc.extra)
