@@ -29,11 +29,17 @@ import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
 
+# DALTON-HOOK(chat-large-upload): fence doubles follow the real function signatures.
+from src.dalton.services.chat_uploads import (
+    abort_delete_workspace_chat_uploads,
+    begin_delete_workspace_chat_uploads,
+    retire_deleted_workspace_chat_uploads,
+)
 from src.server.app.share_files import (
     download_shared_file,
     list_shared_files,
@@ -597,12 +603,33 @@ async def test_delete_unlinks_a_symlink_instead_of_its_target(computer) -> None:
     target = Path(computer.work_dir, "work", "report.html")
     link = Path(computer.work_dir, "work", "report-link.html")
     link.symlink_to("report.html")
+    # DALTON-HOOK(chat-large-upload): delete reads the folder layout, then fences
+    # retained chat uploads before rm. This row names its computer root, and the
+    # fence is stubbed so the assertion stays on the symlink.
+    row = _workspace() | {"computer_root_dir": computer.root}
+    # begin returns the fenced upload ids; abort and retire return counts.
+    begin = create_autospec(begin_delete_workspace_chat_uploads, return_value=[])
+    abort = create_autospec(abort_delete_workspace_chat_uploads, return_value=0)
+    retire = create_autospec(retire_deleted_workspace_chat_uploads, return_value=0)
+
     with (
-        patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_CRUD_DBWS, AsyncMock(return_value=row)),
+        patch(_FILES_DBWS, AsyncMock(return_value=row)),
         patch(_CRUD_OWNER, MagicMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
-        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, row)),
+        patch(
+            "src.dalton.services.chat_uploads.begin_delete_workspace_chat_uploads",
+            begin,
+        ),
+        patch(
+            "src.dalton.services.chat_uploads.abort_delete_workspace_chat_uploads",
+            abort,
+        ),
+        patch(
+            "src.dalton.services.chat_uploads.retire_deleted_workspace_chat_uploads",
+            retire,
+        ),
     ):
         result = await delete_workspace_files(
             WS_A, OWNER, body=DeleteFilesRequest(paths=["work/report-link.html"])
