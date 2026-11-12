@@ -26,6 +26,13 @@ export interface FakeSentTextRecord extends SendTextChunkOptions {
   messageId: string;
 }
 
+export interface FakeSentPlainTextRecord {
+  targetAddress: string;
+  text: string;
+  recipientPlatformUserId?: string | null;
+  messageId: string;
+}
+
 export interface FakeSentFileRecord extends SendFileOptions {
   messageId: string;
   status: "sent" | "linked";
@@ -50,6 +57,8 @@ export class FakeChannelAdapter implements ChannelAdapter {
   started = false;
 
   readonly sentTexts: FakeSentTextRecord[] = [];
+  readonly sentPlainTexts: FakeSentPlainTextRecord[] = [];
+  readonly sentTextMessages: FakeSentPlainTextRecord[] = [];
   readonly sentFiles: FakeSentFileRecord[] = [];
   persistedWeixinState: {
     configured: boolean;
@@ -229,6 +238,36 @@ export class FakeChannelAdapter implements ChannelAdapter {
 
   splitTextChunks(text: string): string[] {
     return splitTextByLimit(text, this.maxChunkChars);
+  }
+
+  splitPlainTextChunks(text: string): string[] {
+    return splitTextByLimit(text, this.maxChunkChars);
+  }
+
+  splitTextMessageChunks(text: string): string[] {
+    return splitTextByLimit(text, this.maxChunkChars);
+  }
+
+  async sendPlainText(options: {
+    targetAddress: string;
+    text: string;
+    recipientPlatformUserId?: string | null;
+  }): Promise<{ messageId: string }> {
+    this.msgCounter += 1;
+    const messageId = `${this.platform}_plain_${this.msgCounter}`;
+    this.sentPlainTexts.push({ ...options, messageId });
+    return { messageId };
+  }
+
+  async sendTextMessage(options: {
+    targetAddress: string;
+    text: string;
+    recipientPlatformUserId?: string | null;
+  }): Promise<{ messageId: string }> {
+    this.msgCounter += 1;
+    const messageId = `${this.platform}_text_${this.msgCounter}`;
+    this.sentTextMessages.push({ ...options, messageId });
+    return { messageId };
   }
 
   async sendTextChunk(options: SendTextChunkOptions): Promise<SendTextChunkResult> {

@@ -12,6 +12,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from src.dalton.data_jobs.notification_payloads import DataTaskDeliveryItem
 from src.dalton.database import automation_reports as reports
 from src.dalton.database import data_task_notifications as dtn
 from src.dalton.database.data_task_notifications import AuthorizedDataTaskTarget
@@ -142,7 +143,8 @@ def test_report_items_become_an_in_memory_plan_without_artifacts() -> None:
     assert all(item.images == () and item.artifact is None for item in plan.items)
     wired = [item.to_wire_dict(delivery_key=f"key-{item.item_index}") for item in plan.items]
     assert [item["images"] for item in wired] == [[], []]
-    assert all("artifact" not in item for item in wired)
+    assert all("artifact" not in item and "plain" not in item for item in wired)
+    assert all(item.plain is False for item in plan.items)
 
     decision = dtn._authorized_target_from_report(
         {
@@ -1144,3 +1146,53 @@ async def test_failure_alert_dispatch_does_not_create_another_notice(
     )
     assert view["ok"] is True
     notify.assert_not_called()
+
+
+def test_text_report_plan_item_stays_plain_text() -> None:
+    body = "| Ticker | P/E |\n| --- | --- |\n| AAPL | 28 |"
+    items, err = reports.native_items_from_report_payload(
+        {
+            "source": "automation_report",
+            "content_sha256": "abc123",
+            "expected_item_count": 1,
+            "content_kind": "text",
+            "text": body,
+        }
+    )
+    assert err is None
+    assert items == [{"item_index": 0, "kind": "text", "text": body}]
+    plan = dtn._resolved_plan_from_report_items(
+        run_id="run-text",
+        job_key="job-text",
+        items=items or [],
+    )
+    assert plan is not None
+    assert plan.items[0].plain is True
+    wire = plan.items[0].to_wire_dict(delivery_key="key-0")
+    assert wire["kind"] == "text"
+    assert wire["text"] == body
+    assert wire["plain"] is True
+
+    failure_items, failure_err = reports.native_items_from_report_payload(
+        {
+            "source": "automation_report",
+            "content_sha256": "abc123",
+            "expected_item_count": 1,
+            "content_kind": "failure_text",
+            "failure_text": "boom",
+        }
+    )
+    assert failure_err is None
+    failure_plan = dtn._resolved_plan_from_report_items(
+        run_id="run-fail",
+        job_key="job-fail",
+        items=failure_items or [],
+    )
+    assert failure_plan is not None
+    assert failure_plan.items[0].plain is True
+
+    data_wire = DataTaskDeliveryItem(item_index=0, kind="text", text="data").to_wire_dict(
+        delivery_key="data-key"
+    )
+    assert data_wire["kind"] == "text"
+    assert "plain" not in data_wire

@@ -203,6 +203,9 @@ def _card(content: str = "See [10-K](https://example.com/msft/10k)") -> dict[str
     }
 
 
+_UNSET_TEXT_TARGETS = object()
+
+
 def _profile(
     chat_a: str,
     chat_b: str,
@@ -210,16 +213,17 @@ def _profile(
     *,
     report_targets: list[str] | None = None,
     failure_targets: list[str] | None = None,
+    text_targets: Any = _UNSET_TEXT_TARGETS,
     profile: str = "market-digest-am",
 ) -> dict[str, Any]:
-    return {
-        "ticker": "MSFT",
-        "report_profile": {
-            "profile": profile,
-            "report_targets": [chat_a, chat_b] if report_targets is None else report_targets,
-            "failure_targets": [discord_target] if failure_targets is None else failure_targets,
-        },
+    body: dict[str, Any] = {
+        "profile": profile,
+        "report_targets": [chat_a, chat_b] if report_targets is None else report_targets,
+        "failure_targets": [discord_target] if failure_targets is None else failure_targets,
     }
+    if text_targets is not _UNSET_TEXT_TARGETS:
+        body["text_targets"] = text_targets
+    return {"ticker": "MSFT", "report_profile": body}
 
 
 def _bind_auth(state: AuthState, automation_id: str) -> dict[str, Any]:
@@ -806,7 +810,23 @@ async def test_quiet_held_and_failure_text_follow_the_profile_route(world: World
         ),
     )
     cards_on_failure_only = await _submit(world)
-    assert cards_on_failure_only["code"] == "no_authorized_target"
+    assert cards_on_failure_only["code"] == "profile_invalid"
+    failure_without_report_route = await _submit(
+        world,
+        cards=None,
+        failure_text="Tracker failed. Source https://example.com/msft",
+    )
+    assert failure_without_report_route["code"] == "profile_invalid"
+    assert await _rows(world) == []
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            profile="msft-tracker",
+        ),
+    )
     async with world.pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -2778,3 +2798,272 @@ async def test_quiet_submit_accepts_company_tracker_profiles(world: World, profi
     assert quiet["quiet"] is True
     assert quiet.get("code") != "profile_invalid"
     assert await _rows(world) == []
+
+
+def _report_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if (row.get("payload_json") or {}).get("source") == "automation_report"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_text_submit_stores_text_targets_and_replays(world: World) -> None:
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            text_targets=[world.discord_target],
+        ),
+    )
+    body = "# Discord\n\n| Ticker | P/E |\n| --- | --- |\n| AAPL | 28 |"
+    saved = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text=body,
+        report_run_id="text-discord",
+    )
+    assert saved["ok"] is True
+    assert saved["created"] is True
+    assert saved["content_kind"] == "text"
+    assert saved["targets"] == [world.discord_target]
+    assert saved["payload"]["text"] == body
+    assert saved["payload"]["expected_item_count"] == 1
+    assert "cards" not in saved["payload"]
+    assert "failure_text" not in saved["payload"]
+    assert "failure_target_snapshot" not in saved["payload"]
+    rows = _report_rows(await _rows(world))
+    assert len(rows) == 1
+    assert rows[0]["channel"] == "discord"
+    assert rows[0]["target"] == world.discord_target
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["payload_json"]["content_sha256"] == saved["content_sha256"]
+    assert rows[0]["payload_json"]["text"] == body
+
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE automation_executions
+                SET status = 'completed', completed_at = NOW()
+                WHERE automation_execution_id = %s::uuid
+                """,
+                (world.execution_id,),
+            )
+    later_id, later_thread, later_run = await _add_execution(world)
+    replay = await _submit(
+        world,
+        execution_id=later_id,
+        thread_id=later_thread,
+        run_id=later_run,
+        cards=None,
+        failure_text=None,
+        text=body,
+        report_run_id="text-discord",
+    )
+    assert replay["ok"] is True
+    assert replay["created"] is False
+    assert replay["content_sha256"] == saved["content_sha256"]
+    assert len(_report_rows(await _rows(world))) == 1
+
+    padded = await _submit(
+        world,
+        execution_id=later_id,
+        thread_id=later_thread,
+        run_id=later_run,
+        cards=None,
+        failure_text=None,
+        text=f"  {body}  ",
+        report_run_id="text-discord",
+    )
+    assert padded["ok"] is False
+    assert padded["code"] == "content_conflict"
+    assert len(_report_rows(await _rows(world))) == 1
+
+    conflict = await _submit(
+        world,
+        execution_id=later_id,
+        thread_id=later_thread,
+        run_id=later_run,
+        cards=None,
+        failure_text=None,
+        text="a different markdown body",
+        report_run_id="text-discord",
+    )
+    assert conflict["ok"] is False
+    assert conflict["code"] == "content_conflict"
+    assert len(_report_rows(await _rows(world))) == 1
+
+    card_id, card_thread, card_run = await _add_execution(world)
+    cards = await _submit(
+        world,
+        execution_id=card_id,
+        thread_id=card_thread,
+        run_id=card_run,
+        cards=[_card()],
+        failure_text=None,
+        text=None,
+        report_run_id="cards-still-feishu",
+    )
+    assert cards["ok"] is True
+    assert cards["created"] is True
+    assert cards["targets"] == [world.chat_a, world.chat_b]
+    card_rows = [
+        row
+        for row in _report_rows(await _rows(world))
+        if row["payload_json"]["content_kind"] == "cards"
+    ]
+    assert {row["target"] for row in card_rows} == {world.chat_a, world.chat_b}
+    assert all(row["channel"] == "feishu" for row in card_rows)
+
+
+@pytest.mark.asyncio
+async def test_text_target_outside_routes_stores_nothing(world: World) -> None:
+    foreign = "discord:user:999999999999999999"
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            text_targets=[foreign],
+        ),
+    )
+    refused = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text="not authorized",
+        report_run_id="text-unauthorized",
+    )
+    assert refused["ok"] is False
+    assert refused["code"] == "no_authorized_target"
+    assert await _rows(world) == []
+
+
+@pytest.mark.asyncio
+async def test_empty_report_targets_can_send_text_only(world: World) -> None:
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            report_targets=[],
+            failure_targets=[],
+            text_targets=[world.chat_a],
+        ),
+    )
+    saved = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text="feishu group text",
+        report_run_id="text-only",
+    )
+    assert saved["ok"] is True
+    assert saved["created"] is True
+    assert saved["targets"] == [world.chat_a]
+    rows = _report_rows(await _rows(world))
+    assert len(rows) == 1
+    assert rows[0]["channel"] == "feishu"
+    assert rows[0]["target"] == world.chat_a
+
+    later_id, later_thread, later_run = await _add_execution(world)
+    cards = await _submit(
+        world,
+        execution_id=later_id,
+        thread_id=later_thread,
+        run_id=later_run,
+        cards=[_card()],
+        report_run_id="cards-without-report-targets",
+    )
+    assert cards["ok"] is False
+    assert cards["code"] == "no_authorized_target"
+    assert len(_report_rows(await _rows(world))) == 1
+
+
+@pytest.mark.asyncio
+async def test_unset_text_targets_use_report_targets(world: World) -> None:
+    saved = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text="fallback markdown",
+        report_run_id="text-fallback",
+    )
+    assert saved["ok"] is True
+    assert saved["targets"] == [world.chat_a, world.chat_b]
+    rows = _report_rows(await _rows(world))
+    assert {row["target"] for row in rows} == {world.chat_a, world.chat_b}
+    assert all(row["payload_json"]["content_kind"] == "text" for row in rows)
+    assert all("cards" not in row["payload_json"] for row in rows)
+
+    quiet = await _submit(
+        world,
+        material="no",
+        cards=None,
+        failure_text=None,
+        text="should not store",
+        report_run_id="text-quiet",
+    )
+    assert quiet["ok"] is False
+    assert quiet["code"] == "quiet_with_content"
+    assert len(_report_rows(await _rows(world))) == 2
+
+
+@pytest.mark.asyncio
+async def test_discord_channel_text_target_is_authorized(world: World) -> None:
+    channel_id = str(uuid4().int % 10**18).zfill(18)
+    channel_target = f"discord:channel:{channel_id}"
+    address = f"discord:{channel_id}"
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_chat_bindings
+                    (platform, chat_address, chat_name, workspace_id, bound_by_user_id)
+                VALUES ('discord', %s, 'Channel', NULL, %s)
+                """,
+                (address, world.owner),
+            )
+            await cur.execute(
+                """
+                UPDATE dalton_channel_user_settings
+                SET apps = apps || %s::jsonb
+                WHERE user_id = %s
+                """,
+                (
+                    json.dumps({"discord": {"chats": {address: {"name": "Channel"}}}}),
+                    world.owner,
+                ),
+            )
+    world.auth.routes.append(channel_target)
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            text_targets=[channel_target],
+        ),
+    )
+    saved = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text="channel markdown",
+        report_run_id="text-channel",
+    )
+    assert saved["ok"] is True
+    assert saved["created"] is True
+    assert saved["targets"] == [channel_target]
+    rows = _report_rows(await _rows(world))
+    assert len(rows) == 1
+    assert rows[0]["channel"] == "discord"
+    assert rows[0]["target"] == channel_target
+    assert rows[0]["payload_json"]["expected_item_count"] == 1

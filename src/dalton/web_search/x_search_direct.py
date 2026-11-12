@@ -35,6 +35,7 @@ from src.dalton.web_search.x_search import (
     X_RATE_LIMITED_MESSAGE,
     X_UNTRUSTED_NOTICE,
     _normalize_handles_param,
+    _optional_x_bool,
     _x_answer_with_sources,
     map_x_search_response,
 )
@@ -153,7 +154,15 @@ def _request_body(
     from_date: Optional[str],
     to_date: Optional[str],
     handles: Optional[List[str]],
+    enable_image_understanding: Optional[bool] = None,
+    enable_video_understanding: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    image_flag = _optional_x_bool(
+        "enable_image_understanding", enable_image_understanding
+    )
+    video_flag = _optional_x_bool(
+        "enable_video_understanding", enable_video_understanding
+    )
     tool_def: Dict[str, Any] = {"type": "x_search"}
     if handles:
         tool_def["allowed_x_handles"] = handles
@@ -161,6 +170,10 @@ def _request_body(
         tool_def["from_date"] = from_date
     if to_date is not None:
         tool_def["to_date"] = to_date
+    if image_flag is not None:
+        tool_def["enable_image_understanding"] = image_flag
+    if video_flag is not None:
+        tool_def["enable_video_understanding"] = video_flag
     return {
         "model": X_SEARCH_MODEL,
         "input": query,
@@ -358,6 +371,9 @@ class DirectXSearchClient:
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         handles: Optional[List[str]] = None,
+        *,
+        enable_image_understanding: Optional[bool] = None,
+        enable_video_understanding: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """POST one x_search turn and return a broker-shaped payload."""
         started = time.monotonic()
@@ -369,7 +385,12 @@ class DirectXSearchClient:
             base_url = self._base_url or xai_oauth_base_url()
             url, headers = oauth_request(token, base_url=base_url)
             body = _request_body(
-                query, from_date=from_date, to_date=to_date, handles=handles
+                query,
+                from_date=from_date,
+                to_date=to_date,
+                handles=handles,
+                enable_image_understanding=enable_image_understanding,
+                enable_video_understanding=enable_video_understanding,
             )
             # Wall clock for the whole POST and body read. A drip of SSE
             # chunks resets httpx's per-read timer, so it cannot extend this.
@@ -421,8 +442,11 @@ def build_direct_x_search_tool(
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         handles: Optional[List[str]] = None,
+        enable_image_understanding: Optional[bool] = None,
+        enable_video_understanding: Optional[bool] = None,
     ) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
         """Search X (Twitter) posts for social sentiment, management or KOL remarks, first-hand reactions to breaking events, and original posts.
+        Set `enable_image_understanding` or `enable_video_understanding` only when this call must read images or video; omit both to leave the xAI request unchanged.
 
         Args:
             query: Natural-language topic, ticker, or event to search on X. Put date bounds in `from_date`/`to_date` and account filters in `handles` rather than inside `query`.
@@ -441,6 +465,12 @@ def build_direct_x_search_tool(
             if from_date and to_date and from_date > to_date:
                 raise ValueError("from_date must not be later than to_date")
             normalized_handles = _normalize_handles_param(handles)
+            image_flag = _optional_x_bool(
+                "enable_image_understanding", enable_image_understanding
+            )
+            video_flag = _optional_x_bool(
+                "enable_video_understanding", enable_video_understanding
+            )
             sent_query = query.strip()
 
             api = _client()
@@ -453,6 +483,8 @@ def build_direct_x_search_tool(
                     "to_date": to_date,
                     "handles": normalized_handles,
                     "include_favicon": include_favicon,
+                    "enable_image_understanding": image_flag,
+                    "enable_video_understanding": video_flag,
                 },
             )
             cached = await get_cached_search(cache_key)
@@ -470,6 +502,8 @@ def build_direct_x_search_tool(
                 from_date=from_date,
                 to_date=to_date,
                 handles=normalized_handles,
+                enable_image_understanding=image_flag,
+                enable_video_understanding=video_flag,
             )
             elapsed = time.monotonic() - started
             cleaned, artifact = map_x_search_response(

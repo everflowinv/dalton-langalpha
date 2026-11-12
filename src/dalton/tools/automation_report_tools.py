@@ -49,11 +49,13 @@ def create_automation_report_tools() -> list[BaseTool]:
         material: str | None = None,
         cards: list[dict[str, Any]] | None = None,
         failure_text: str | None = None,
+        text: str | None = None,
         *,
         config: RunnableConfig,
     ) -> str:
         """Submit Schema 2.0 cards or a failure text for this server-started automation, or read that report's delivery progress.
         Only that run can call it. An external member cannot. Reuse one report_run_id for the same report. no, no_change, and no-change store nothing.
+        A `text` body is Markdown up to 40000 characters, mutually exclusive with `cards` and `failure_text`, and is delivered as plain text rather than a card.
 
         Args:
             action: "submit" or "status".
@@ -128,6 +130,7 @@ def create_automation_report_tools() -> list[BaseTool]:
                 material=material,
                 cards=cards,
                 failure_text=failure_text,
+                text=text,
             )
         except asyncio.CancelledError:
             raise

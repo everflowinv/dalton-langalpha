@@ -6152,3 +6152,18 @@ describe("main.ts adapter registration & shared helpers", () => {
     }
   });
 });
+
+describe("Feishu text message chunking", () => {
+  it("never splits a surrogate pair at a hard cut", async () => {
+    const { chunkFeishuTextMessage } = await import("../src/channels/feishu/format.js");
+    const text = "a".repeat(29999) + "😀bb";
+    const chunks = chunkFeishuTextMessage(text, 30000);
+    expect(chunks.join("")).toBe(text);
+    for (const chunk of chunks) {
+      const last = chunk.charCodeAt(chunk.length - 1);
+      expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+      const first = chunk.charCodeAt(0);
+      expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
+    }
+  });
+});

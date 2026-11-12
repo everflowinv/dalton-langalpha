@@ -239,16 +239,39 @@ export interface ChannelAdapter {
   /** Split markdown/text into platform-sized chunks. */
   splitTextChunks(text: string): string[];
 
+  /**
+   * Split text for a Feishu post send. Adapters that omit this cannot
+   * deliver ops-alert post text.
+   */
+  splitPlainTextChunks?(text: string): string[];
+
+  /**
+   * Split a literal platform text message. Feishu uses a character cap.
+   * Adapters that omit this cannot deliver an automation-report `plain` item.
+   */
+  splitTextMessageChunks?(text: string): string[];
+
   /** Send a single text chunk to the platform. */
   sendTextChunk(options: SendTextChunkOptions): Promise<SendTextChunkResult>;
 
   /**
-   * Send plain text without the table/code-block card upgrade used by sendTextChunk.
-   * Ops alerts use this so a `|` in the fixed sentence stays a text message.
+   * Send a Feishu post without the table/code-block card upgrade.
+   * Ops alerts use this so a `|` in the fixed sentence stays a post.
    */
   sendPlainText?(options: {
     targetAddress: string;
     text: string;
+    recipientPlatformUserId?: string | null;
+  }): Promise<{ messageId: string }>;
+
+  /**
+   * Send `msg_type: "text"` with content `{"text": ...}`.
+   * Automation report `plain` items use this and may pass a DM recipient.
+   */
+  sendTextMessage?(options: {
+    targetAddress: string;
+    text: string;
+    recipientPlatformUserId?: string | null;
   }): Promise<{ messageId: string }>;
 
   /** Send a single file attachment to the platform. */
@@ -317,6 +340,11 @@ export function splitTextByLimit(text: string, maxChunkChars: number): string[] 
     }
     if (splitIdx <= 0 || splitIdx < Math.floor(maxChunkChars * 0.4)) {
       splitIdx = maxChunkChars;
+      // A hard cut must not split a surrogate pair (emoji etc.).
+      const before = remaining.charCodeAt(splitIdx - 1);
+      if (before >= 0xd800 && before <= 0xdbff && splitIdx > 1) {
+        splitIdx -= 1;
+      }
     }
     chunks.push(remaining.slice(0, splitIdx));
     remaining = remaining.slice(splitIdx).replace(/^\n/, "");

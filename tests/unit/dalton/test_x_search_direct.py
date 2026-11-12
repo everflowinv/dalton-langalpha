@@ -624,3 +624,41 @@ async def test_dripping_sse_hits_the_wall_clock_timeout(
     assert content == "X 搜索暂不可用"
     assert "code" not in artifact
     assert cache.sets == []
+
+
+@pytest.mark.asyncio
+async def test_media_flags_are_forwarded_only_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=_sample())
+
+    cache = _Cache()
+    cache.install(monkeypatch)
+    client = DirectXSearchClient(token=TOKEN, transport=httpx.MockTransport(handler))
+    tool = build_direct_x_search_tool(client=client)
+    await tool.coroutine(query="NVDA")
+    assert "enable_image_understanding" not in seen[0]["tools"][0]
+    assert "enable_video_understanding" not in seen[0]["tools"][0]
+
+    await tool.coroutine(
+        query="NVDA images",
+        enable_image_understanding=True,
+        enable_video_understanding=False,
+    )
+    flags = seen[1]["tools"][0]
+    assert flags["type"] == "x_search"
+    assert flags["enable_image_understanding"] is True
+    assert flags["enable_video_understanding"] is False
+
+    refused, artifact = await tool.coroutine(query="NVDA", enable_image_understanding=1)
+    assert "参数错误" in refused
+    assert "code" not in artifact
+    assert len(seen) == 2
+
+    await tool.coroutine(query="NVDA", enable_video_understanding=False)
+    assert len(seen) == 3
+    assert cache.sets[0][0] != cache.sets[2][0]

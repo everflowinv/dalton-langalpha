@@ -1,7 +1,8 @@
 """Immutable storage for configured automation report batches.
 
-A report batch is one original-card payload, or one failure text, for one
-``report_run_id`` of one automation. Rows land in ``dalton_notify_deliveries``
+A report batch is one original-card payload, one Markdown text body, or one
+failure text, for one ``report_run_id`` of one automation. Rows land in
+``dalton_notify_deliveries``
 only after the running execution matches the server-supplied identity and
 every configured recipient for that outcome is still authorized. This module
 does not send or open a gateway call. Native plan and claim call the helpers
@@ -86,10 +87,12 @@ REPORT_PROFILES = frozenset(
 MAX_CARDS = 20
 MAX_CARD_JSON_BYTES = 262144
 MAX_FAILURE_TEXT_CHARS = 2000
+MAX_TEXT_CHARS = 40000
 MAX_PROFILE_TARGETS = 5
 QUIET_MATERIALS = frozenset({"no", "no_change", "no-change"})
 
-_PROFILE_KEYS = frozenset({"profile", "report_targets", "failure_targets"})
+_PROFILE_REQUIRED_KEYS = frozenset({"profile", "report_targets", "failure_targets"})
+_PROFILE_OPTIONAL_KEYS = frozenset({"text_targets"})
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.IGNORECASE,
@@ -98,6 +101,7 @@ _REPORT_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FEISHU_CHAT_TARGET_RE = re.compile(r"^feishu:chat:oc_[A-Za-z0-9_-]{3,128}$")
 _FEISHU_USER_TARGET_RE = re.compile(r"^feishu:user:ou_[A-Za-z0-9_-]{3,128}$")
 _DISCORD_USER_TARGET_RE = re.compile(r"^discord:user:[0-9]{5,32}$")
+_DISCORD_CHANNEL_TARGET_RE = re.compile(r"^discord:channel:[0-9]{5,32}$")
 _FORBIDDEN_KEYS = frozenset(
     {
         "chat_id",
@@ -231,7 +235,9 @@ def parse_report_profile(
     raw = metadata.get("report_profile")
     if not isinstance(raw, Mapping):
         return None, "profile_invalid"
-    if set(raw) != _PROFILE_KEYS:
+    keys = set(raw)
+    allowed_keys = _PROFILE_REQUIRED_KEYS | _PROFILE_OPTIONAL_KEYS
+    if not _PROFILE_REQUIRED_KEYS <= keys or not keys <= allowed_keys:
         return None, "profile_invalid"
     profile_id = raw.get("profile")
     if not isinstance(profile_id, str) or profile_id not in REPORT_PROFILES:
@@ -242,12 +248,24 @@ def parse_report_profile(
     )
     if report_targets is None or failure_targets is None:
         return None, "profile_invalid"
-    if not report_targets and not failure_targets:
+    if "text_targets" in raw:
+        text_targets = _clean_target_list(raw.get("text_targets"), outcome="text")
+        if text_targets is None:
+            return None, "profile_invalid"
+    else:
+        text_targets = None
+    # A report needs somewhere to send. failure_targets alone is not enough.
+    # text_targets counts only when that key is present.
+    if text_targets is None:
+        if not report_targets:
+            return None, "profile_invalid"
+    elif not report_targets and not text_targets:
         return None, "profile_invalid"
     return {
         "profile": profile_id,
         "report_targets": report_targets,
         "failure_targets": failure_targets,
+        "text_targets": text_targets,
     }, None
 
 
@@ -411,24 +429,36 @@ def automation_report_content_sha256(
     content_kind: str,
     cards: list[dict[str, Any]] | None,
     failure_text: str | None,
+    text: Any = None,
 ) -> str:
     """SHA-256 of the canonical report body.
 
     Key order does not change the digest. List order and string text do.
-    The unused body is null: cards for a failure text, and the reverse.
+    Card and failure digests omit ``text`` so a resubmit of a saved batch
+    still matches. A text body stores ``text`` and nulls the other two.
     """
-    if content_kind == "cards":
-        body_cards: Any = cards
-        body_text: Any = None
+    if content_kind == "text":
+        canonical: dict[str, Any] = {
+            "profile": profile,
+            "content_kind": content_kind,
+            "cards": None,
+            "failure_text": None,
+            "text": text,
+        }
+    elif content_kind == "cards":
+        canonical = {
+            "profile": profile,
+            "content_kind": content_kind,
+            "cards": cards,
+            "failure_text": None,
+        }
     else:
-        body_cards = None
-        body_text = failure_text
-    canonical = {
-        "profile": profile,
-        "content_kind": content_kind,
-        "cards": body_cards,
-        "failure_text": body_text,
-    }
+        canonical = {
+            "profile": profile,
+            "content_kind": content_kind,
+            "cards": None,
+            "failure_text": failure_text,
+        }
     raw = json.dumps(
         canonical,
         sort_keys=True,
@@ -443,18 +473,26 @@ def prepare_automation_report_content(
     profile: str,
     cards: Any,
     failure_text: Any,
+    text: Any = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Validate cards xor failure text and return the stored body plus digest.
+    """Validate exactly one of cards, text, or failure text.
 
     Ordinary https and http markdown links are kept. Attachment keys, local
-    paths, and recipient keys are refused. Returns ``(None, code)`` on refusal.
+    paths, and ``IMG:`` markers are refused on cards, text, and failure text.
+    ``strip()`` decides whether a text body is empty. The saved text, its
+    length, and its digest keep the original characters. Returns ``(None,
+    code)`` on refusal.
     """
     if profile not in REPORT_PROFILES:
         return None, "profile_invalid"
     if failure_text is not None and not isinstance(failure_text, str):
         return None, "invalid_failure_text"
-    text = failure_text.strip() if isinstance(failure_text, str) else ""
-    has_text = bool(text)
+    if text is not None and not isinstance(text, str):
+        return None, "invalid_text"
+    failure = failure_text.strip() if isinstance(failure_text, str) else ""
+    raw_text = text if isinstance(text, str) else ""
+    has_failure = bool(failure)
+    has_body = bool(raw_text.strip())
     if cards is None:
         card_list: list[Any] | None = None
     elif not isinstance(cards, list):
@@ -462,27 +500,48 @@ def prepare_automation_report_content(
     else:
         card_list = cards
     has_cards = bool(card_list)
-    if has_cards and has_text:
+    supplied = sum(1 for flag in (has_cards, has_failure, has_body) if flag)
+    if supplied > 1:
         return None, "mixed_outcome"
-    if card_list is not None and not has_cards and not has_text:
+    if card_list is not None and not has_cards and not has_failure and not has_body:
         return None, "invalid_card"
-    if not has_cards and not has_text:
+    if supplied == 0:
         return None, "missing_content"
-    if has_text:
-        if len(text) > MAX_FAILURE_TEXT_CHARS:
+    if has_body:
+        if len(raw_text) > MAX_TEXT_CHARS:
             return None, "content_too_large"
-        if _scan_string(text, url_key=False):
+        if _scan_string(raw_text, url_key=False):
+            return None, "invalid_text"
+        digest = automation_report_content_sha256(
+            profile=profile,
+            content_kind="text",
+            cards=None,
+            failure_text=None,
+            text=raw_text,
+        )
+        return {
+            "content_kind": "text",
+            "cards": None,
+            "failure_text": None,
+            "text": raw_text,
+            "content_sha256": digest,
+            "expected_item_count": 1,
+        }, None
+    if has_failure:
+        if len(failure) > MAX_FAILURE_TEXT_CHARS:
+            return None, "content_too_large"
+        if _scan_string(failure, url_key=False):
             return None, "invalid_failure_text"
         digest = automation_report_content_sha256(
             profile=profile,
             content_kind="failure_text",
             cards=None,
-            failure_text=text,
+            failure_text=failure,
         )
         return {
             "content_kind": "failure_text",
             "cards": None,
-            "failure_text": text,
+            "failure_text": failure,
             "content_sha256": digest,
             "expected_item_count": 1,
         }, None
@@ -572,6 +631,7 @@ async def submit_automation_report(
     material: str,
     cards: list[dict[str, Any]] | None = None,
     failure_text: str | None = None,
+    text: str | None = None,
     conn: Any = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
@@ -607,7 +667,7 @@ async def submit_automation_report(
         quiet = True
     else:
         return _error(action, "invalid_material", "material must be yes, no, no_change, or no-change.")
-    content_supplied = _content_supplied(cards, failure_text)
+    content_supplied = _content_supplied(cards, failure_text, text)
     try:
         async with get_db_connection(conn) as owned:
             async with owned.transaction():
@@ -631,7 +691,7 @@ async def submit_automation_report(
                             return _error(
                                 action,
                                 "quiet_with_content",
-                                "A no-change report cannot include cards or failure text.",
+                                "A no-change report cannot include cards, text, or failure text.",
                             )
                         return {
                             "ok": True,
@@ -645,12 +705,13 @@ async def submit_automation_report(
                         profile=str(parsed["profile"]),
                         cards=cards,
                         failure_text=failure_text,
+                        text=text,
                     )
                     if content_err or prepared is None:
                         return _error(
                             action,
                             content_err or "invalid_card",
-                            "Report content is not a bounded original card batch or failure text.",
+                            "Report content is not a bounded original card batch, text body, or failure text.",
                         )
                     existing = await _load_report_rows(
                         cur,
@@ -822,7 +883,35 @@ def _target_allowed(target: str, *, outcome: str) -> bool:
             _FEISHU_CHAT_TARGET_RE.fullmatch(target)
             or _FEISHU_USER_TARGET_RE.fullmatch(target)
         )
+    if outcome == "text":
+        return bool(
+            _FEISHU_CHAT_TARGET_RE.fullmatch(target)
+            or _FEISHU_USER_TARGET_RE.fullmatch(target)
+            or _DISCORD_USER_TARGET_RE.fullmatch(target)
+            or _DISCORD_CHANNEL_TARGET_RE.fullmatch(target)
+        )
     return bool(_DISCORD_USER_TARGET_RE.fullmatch(target))
+
+
+def _outcome_targets(profile: Mapping[str, Any], content_kind: str) -> list[str] | None:
+    """Recipients for one saved outcome.
+
+    Text uses ``text_targets`` when that key is a list, including an empty
+    list. ``None`` means the key was omitted, so text falls back to
+    ``report_targets``. Cards stay on ``report_targets``.
+    """
+    if content_kind == "cards":
+        raw = profile.get("report_targets")
+    elif content_kind == "failure_text":
+        raw = profile.get("failure_targets")
+    elif content_kind == "text":
+        chosen = profile.get("text_targets")
+        raw = profile.get("report_targets") if chosen is None else chosen
+    else:
+        return None
+    if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+        return None
+    return list(raw)
 
 
 def _validate_card(card: Mapping[str, Any]) -> str | None:
@@ -874,9 +963,12 @@ def _scan_string(value: str, *, url_key: bool) -> str | None:
     return None
 
 
-def _content_supplied(cards: Any, failure_text: Any) -> bool:
+def _content_supplied(cards: Any, failure_text: Any, text: Any = None) -> bool:
     if cards is not None:
         return True
+    if text is not None:
+        if not isinstance(text, str) or text.strip():
+            return True
     if failure_text is None:
         return False
     if isinstance(failure_text, str):
@@ -1035,6 +1127,8 @@ def _build_payload(
     if prepared["content_kind"] == "cards":
         payload["cards"] = prepared["cards"]
         payload["failure_target_snapshot"] = list(profile["failure_targets"])
+    elif prepared["content_kind"] == "text":
+        payload["text"] = prepared["text"]
     else:
         payload["failure_text"] = prepared["failure_text"]
     return payload
@@ -1230,11 +1324,7 @@ async def _authorize_all_targets(
     from src.dalton.database.data_task_notifications import _parse_requested_notify_target
     from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
 
-    intended = (
-        list(profile["report_targets"])
-        if content_kind == "cards"
-        else list(profile["failure_targets"])
-    )
+    intended = _outcome_targets(profile, content_kind)
     if not intended:
         return None, "no_authorized_target"
     from src.dalton.database import channel_gateway as channel_gateway_db
@@ -1307,8 +1397,9 @@ def native_items_from_report_payload(
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Return ordered native items copied from a saved report payload.
 
-    Cards stay in stored order and carry no images and no artifact. Failure
-    text is one text item. The digest is not rebuilt from jsonb.
+    Cards stay in stored order and carry no images and no artifact. A text
+    report and a failure text are each one text item. The digest is not
+    rebuilt from jsonb.
     """
     if not is_automation_report_payload(payload):
         return None, "payload_invalid"
@@ -1340,6 +1431,11 @@ def native_items_from_report_payload(
         if not isinstance(text, str) or not text or expected != 1:
             return None, "payload_invalid"
         return [{"item_index": 0, "kind": "text", "text": text}], None
+    if kind == "text":
+        body = payload.get("text")
+        if not isinstance(body, str) or not body or expected != 1:
+            return None, "payload_invalid"
+        return [{"item_index": 0, "kind": "text", "text": body}], None
     return None, "payload_invalid"
 
 
@@ -1398,14 +1494,8 @@ def saved_report_target_still_configured(
     if not isinstance(snapshot, list) or cleaned not in snapshot:
         return False, "target_removed"
     kind = str(payload.get("content_kind") or "")
-    intended = (
-        parsed.get("report_targets")
-        if kind == "cards"
-        else parsed.get("failure_targets")
-        if kind == "failure_text"
-        else None
-    )
-    if not isinstance(intended, list) or cleaned not in intended:
+    intended = _outcome_targets(parsed, kind)
+    if intended is None or cleaned not in intended:
         return False, "target_removed"
     return True, ""
 
@@ -2592,7 +2682,7 @@ async def authorize_saved_report_target(
         return _deny_report(
             status="failed",
             code=item_err or "payload_invalid",
-            message="Saved report body is not a native card batch or failure text.",
+            message="Saved report body is not a native card batch, text body, or failure text.",
         )
     await cur.execute(
         """

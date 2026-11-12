@@ -14,9 +14,16 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
 import { gfmTable } from "micromark-extension-gfm-table";
 import { chunkMarkdownTextWithMode, type ChunkMode } from "../../shared/text.js";
+import { splitTextByLimit } from "../adapter.js";
 
 export const FEISHU_POST_MAX_BYTES = 30_720;
 export const FEISHU_CARD_MAX_BYTES = 30_720;
+/**
+ * One Feishu `msg_type: "text"` body, in characters.
+ * `@larksuiteoapi/node-sdk` 1.74.0 types `im.message.create` `content` as
+ * `string` and states no length. `FEISHU_POST_MAX_BYTES` is the post envelope.
+ */
+export const FEISHU_TEXT_MESSAGE_MAX_CHARS = 30_000;
 export const FEISHU_CARD_MAX_ELEMENTS = 200;
 export const FEISHU_CARD_TABLE_LIMIT = 5;
 
@@ -523,6 +530,13 @@ export function chunkFeishuMarkdownByEnvelope(
   };
 
   return splitOversizedSegment(text);
+}
+
+export function chunkFeishuTextMessage(
+  text: string,
+  maxChars: number = FEISHU_TEXT_MESSAGE_MAX_CHARS,
+): string[] {
+  return splitTextByLimit(text, maxChars);
 }
 
 export function chunkFeishuPostMarkdown(

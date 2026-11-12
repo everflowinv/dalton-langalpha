@@ -43,6 +43,8 @@ export interface DataTaskTextPlanItem {
   delivery_key: string;
   kind: "text";
   text: string;
+  /** Feishu sends this item as post text and does not upgrade tables or code to a card. */
+  plain?: boolean;
   existing_status?: string | null;
 }
 

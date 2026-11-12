@@ -352,6 +352,7 @@ def _resolved_plan_from_report_items(
                     item_index=index,
                     kind="text",
                     text=text,
+                    plain=True,
                 )
             )
         else:
@@ -386,7 +387,7 @@ def _authorized_target_from_report(decision: Mapping[str, Any]) -> AuthorizedDat
             allowed=False,
             deny_status="failed",
             deny_code="payload_invalid",
-            deny_message="Saved report body is not a native card batch or failure text.",
+            deny_message="Saved report body is not a native card batch, text body, or failure text.",
             create_outer_row=False,
         )
     owner_platform_user_id = decision.get("owner_platform_user_id")

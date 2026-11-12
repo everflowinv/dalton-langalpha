@@ -62,6 +62,8 @@ import {
 import {
   assertFeishuCardWithinEnvelope,
   chunkFeishuOutboundText,
+  chunkFeishuPostMarkdown,
+  chunkFeishuTextMessage,
   shouldUseFeishuCard,
 } from "./format.js";
 import {
@@ -80,6 +82,7 @@ import {
   sendCardFeishu,
   sendMessageFeishu,
   sendStructuredCardFeishu,
+  sendTextMessageFeishu,
 } from "./send.js";
 import {
   buildDaltonFeishuThreadScopeKey,
@@ -678,6 +681,20 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     return chunkFeishuOutboundText(text);
   }
 
+  splitPlainTextChunks(text: string): string[] {
+    if (!text) {
+      return [];
+    }
+    return chunkFeishuPostMarkdown(text);
+  }
+
+  splitTextMessageChunks(text: string): string[] {
+    if (!text) {
+      return [];
+    }
+    return chunkFeishuTextMessage(text);
+  }
+
   async sendTextChunk(
     options: SendTextChunkOptions,
   ): Promise<SendTextChunkResult> {
@@ -722,10 +739,12 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   async sendPlainText(options: {
     targetAddress: string;
     text: string;
+    recipientPlatformUserId?: string | null;
   }): Promise<{ messageId: string }> {
     const client = this.getClient();
     const target = resolveDaltonOutboundTarget({
       targetAddress: options.targetAddress,
+      recipientPlatformUserId: options.recipientPlatformUserId,
     });
     if (!target) {
       throw new ChannelDeliveryError(
@@ -737,6 +756,32 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       );
     }
     const res = await sendMessageFeishu(client, {
+      to: target,
+      text: options.text,
+    });
+    return { messageId: res.messageId };
+  }
+
+  async sendTextMessage(options: {
+    targetAddress: string;
+    text: string;
+    recipientPlatformUserId?: string | null;
+  }): Promise<{ messageId: string }> {
+    const client = this.getClient();
+    const target = resolveDaltonOutboundTarget({
+      targetAddress: options.targetAddress,
+      recipientPlatformUserId: options.recipientPlatformUserId,
+    });
+    if (!target) {
+      throw new ChannelDeliveryError(
+        `Unable to resolve Feishu target for address "${options.targetAddress}"`,
+        {
+          outcome: "failed",
+          code: "target_not_found",
+        },
+      );
+    }
+    const res = await sendTextMessageFeishu(client, {
       to: target,
       text: options.text,
     });
