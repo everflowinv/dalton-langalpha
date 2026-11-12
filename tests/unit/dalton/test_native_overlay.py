@@ -43,7 +43,7 @@ def test_native_overlay_does_not_collide_with_upstream():
 
     native_models = native.get("models") or {}
     # DALTON-HOOK(llm-overlay): claude-fable-5-2 and claude-fable-5-2-oauth are overlay-only.
-    assert len(native_models) == 32
+    assert len(native_models) == 36
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -1570,11 +1570,8 @@ _CARBON_SOURCE = (
     "https://blog.google/innovation-and-ai/models-and-research/"
     "gemini-models/introducing-gemini-4-carbon/"
 )
-_CARBON_BY_EFFORT = {
-    "low": "Gemini 4 Carbon (Low)",
-    "medium": "Gemini 4 Carbon (Medium)",
-    "high": "Gemini 4 Carbon (High)",
-}
+# Carbon carries no display_name: like Argon and Flash, the picker shows the key.
+_CARBON_BY_EFFORT = {"low": None, "medium": None, "high": None}
 # 2M prompt with 1M cached, plus 1M output: fresh input $2, cache $0.10, output $10.
 _CARBON_USAGE = {
     "input_tokens": 2_000_000,
@@ -1646,7 +1643,7 @@ def test_gemini_4_carbon_client_request_and_introductory_notional_price(monkeypa
         assert mc.get_reasoning_efforts(key) == [effort]
         assert mc.get_reasoning_effort_default(key) == effort
         surfaced = catalog[key]
-        assert surfaced["display_name"] == display_name
+        assert surfaced.get("display_name") == display_name
         assert surfaced["context"] == 1_048_576
         assert "speed" not in surfaced
         assert "intelligence" not in surfaced
@@ -1747,3 +1744,99 @@ def test_gemini_4_carbon_client_request_and_introductory_notional_price(monkeypa
     assert declarations[0]["name"] == "ping_tool"
     assert tool_payload["model"] == "gemini-4-carbon-high"
     assert tool_payload["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH"
+
+
+# Gemini 4 Hydrogen: four Antigravity identities, including xhigh. Nominal card
+# chosen 2026-11-12 ($0.75 / $3.75 / $0.0375 per million tokens), estimated.
+_HYDROGEN_EFFORTS = ("low", "medium", "high", "xhigh")
+_HYDROGEN_SOURCE = (
+    "https://huggingnews.com/ai/"
+    "googles-gemini-4-hydrogen-ai-model-appears-in-cloud-billing-catalogue-e905b78c"
+)
+
+
+def test_gemini_4_hydrogen_catalog_xhigh_request_and_estimated_notional_price(monkeypatch):
+    """Hydrogen is listed like Argon (no display_name) and xhigh reaches the
+    request as thinkingLevel XHIGH; the nominal card is an estimate."""
+    from src.dalton.llm.notional_pricing import resolve_notional_card
+    from src.dalton.llm.role_policy import family_of, is_text_only
+    from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    meta = load_dalton_meta()
+    listed = dict(mc.listed_models())
+    catalog = mc.get_model_metadata()
+
+    for effort in _HYDROGEN_EFFORTS:
+        key = f"gemini-4-hydrogen-{effort}-oauth"
+        model_id = f"gemini-4-hydrogen-{effort}"
+        assert key in listed
+        entry = mc.get_model_config(key)
+        assert entry["provider"] == "antigravity-oauth"
+        assert entry["model_id"] == model_id
+        assert entry["context"] == 1_048_576
+        assert entry["parameters"]["max_output_tokens"] == 65536
+        assert entry["reasoning"] == {
+            "efforts": [effort],
+            "default": effort,
+            "write": "parameters.thinking_level",
+        }
+        assert mc.get_input_modalities(key) == ["text", "image", "pdf", "video"]
+        surfaced = catalog[key]
+        assert surfaced.get("display_name") is None
+        assert family_of(key) == "google-gemini"
+        assert is_text_only(key) is False
+
+        stored = meta[key]["notional_pricing"]
+        assert meta[key]["billing"] == "subscription"
+        assert meta[key]["tool_calling"] is True
+        assert stored["estimated"] is True
+        assert stored["source"] == _HYDROGEN_SOURCE
+        assert resolve_notional_card(key) == {
+            "input": 0.75,
+            "output": 3.75,
+            "cached_input": 0.0375,
+        }
+
+        client = LLM(key, api_key="fake-ag-token").get_llm()
+        assert isinstance(client, ChatAntigravity)
+        assert client.model == model_id
+        assert client.thinking_level == effort
+        payload = client._build_payload([HumanMessage(content="ping")])
+        assert payload["model"] == model_id
+        assert payload["request"]["generationConfig"]["thinkingConfig"] == {
+            "includeThoughts": True,
+            "thinkingLevel": effort.upper(),
+        }
+
+        billed = calculate_cost_from_per_call_records(
+            [
+                {
+                    "model_name": key,
+                    "pricing_model_id": client.metadata["pricing_model_id"],
+                    "pricing_provider": client.metadata["pricing_provider"],
+                    "billing_type": client.metadata["billing_type"],
+                    "usage": {
+                        "input_tokens": 2_000_000,
+                        "output_tokens": 1_000_000,
+                        "cached_tokens": 1_000_000,
+                    },
+                }
+            ]
+        )
+        assert billed["total_cost"] == 0.0
+        # 1M fresh input $0.75 + 1M cached $0.0375 + 1M output $3.75.
+        assert billed["notional_cost"] == pytest.approx(4.5375)
+
+
+def test_antigravity_xhigh_is_a_thinking_level_and_derives_from_the_model_id():
+    from src.dalton.llm.providers.antigravity.client import (
+        _derive_thinking_level,
+        _normalize_thinking_level,
+    )
+
+    assert _normalize_thinking_level("xhigh") == "XHIGH"
+    assert _derive_thinking_level("gemini-4-hydrogen-xhigh") == "XHIGH"
+    assert _derive_thinking_level("gemini-4-argon-high") == "HIGH"
+    assert _normalize_thinking_level("max") is None
