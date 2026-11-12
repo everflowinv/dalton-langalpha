@@ -49,7 +49,9 @@ ALLOWED_HOOKS=(
   "provenance-declared"
   "provenance-type"
   "web-search-openclaw"
+  "web-search-gemini"
   "x-search-openclaw"
+  "x-search-direct"
   # PK knowledge, publish & autonomy hooks
   "knowledge-reconcile"
   "knowledge-reconcile-mw"

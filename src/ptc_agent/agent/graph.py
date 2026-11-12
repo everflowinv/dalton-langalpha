@@ -205,8 +205,10 @@ async def build_ptc_graph(
     )
 
     # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    # DALTON-HOOK(x-search-direct): the x_search line follows x_search.enabled.
     await warm_turn_data_map(
         search_api=getattr(config, "search_api", None),
+        x_search_enabled=bool(getattr(config, "x_search_enabled", False)),
         team_memory_enabled=team_memory_enabled,
     )
 
@@ -374,8 +376,10 @@ async def build_ptc_graph_with_session(
     )
 
     # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    # DALTON-HOOK(x-search-direct): the x_search line follows x_search.enabled.
     await warm_turn_data_map(
         search_api=getattr(config, "search_api", None),
+        x_search_enabled=bool(getattr(config, "x_search_enabled", False)),
         team_memory_enabled=team_memory_enabled,
     )
 

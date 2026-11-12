@@ -62,14 +62,28 @@ def estimate_data_map_tokens(markdown: str) -> int:
         return max(1, len(markdown) // 2)
 
 
-def _is_x_search_enabled(search_api: str | None) -> bool:
-    """Return True iff `search_api` binds `x_search` (matches `PTCAgent.create_agent` in `agent.py`)."""
+def _is_x_search_enabled(
+    search_api: str | None,
+    x_search_enabled: bool | None = None,
+) -> bool:
+    """Whether this turn mounts ``x_search``.
+
+    An explicit ``x_search_enabled`` matches ``PTCAgent.create_agent``. When
+    the caller omits it, the previous rule stays: only
+    ``search_api == "openclaw"`` includes the line.
+    """
+    if x_search_enabled is not None:
+        return bool(x_search_enabled)
     return str(search_api or "").strip().lower() == "openclaw"
 
 
-def _apply_search_api_filter(markdown: str, search_api: str | None) -> str:
-    """Filter `- \\`x_search\\`...` from `markdown` when `search_api != 'openclaw'`."""
-    if _is_x_search_enabled(search_api):
+def _apply_search_api_filter(
+    markdown: str,
+    search_api: str | None,
+    x_search_enabled: bool | None = None,
+) -> str:
+    """Drop the ``x_search`` line when that tool is not mounted for the turn."""
+    if _is_x_search_enabled(search_api, x_search_enabled):
         return markdown
     return "\n".join(
         line
@@ -355,6 +369,7 @@ def render_data_map_markdown(
     spec: Mapping[str, Any] | None = None,
     as_of_date: date | str | None = None,
     search_api: str | None = "openclaw",
+    x_search_enabled: bool | None = None,
     max_tokens: int = MAX_DATA_MAP_TOKENS,
 ) -> str:
     """Render the compact Dalton Data Map Markdown block (<= `max_tokens`).
@@ -366,7 +381,7 @@ def render_data_map_markdown(
     _ = as_of_date  # Title is date-free to keep the static prompt prefix stable.
     loaded_spec = dict(spec) if isinstance(spec, Mapping) else load_sources_spec()
     health_lookup = dict(health_map) if isinstance(health_map, Mapping) else {}
-    include_x = _is_x_search_enabled(search_api)
+    include_x = _is_x_search_enabled(search_api, x_search_enabled)
 
     routes = merge_catalog_routes(
         catalog_routes=catalog_routes,
@@ -459,6 +474,7 @@ def render_static_data_map_markdown(
     *,
     spec: Mapping[str, Any] | None = None,
     search_api: str | None = "openclaw",
+    x_search_enabled: bool | None = None,
     team_memory_enabled: bool = False,
 ) -> str:
     """Render the static fallback data map with all sources marked `未体检` (never touches DB or network)."""
@@ -469,6 +485,7 @@ def render_static_data_map_markdown(
         conversation_stats=None,
         spec=spec,
         search_api=search_api,
+        x_search_enabled=x_search_enabled,
     )
     return _apply_team_memory_filter(md, team_memory_enabled)
 
@@ -530,6 +547,7 @@ async def get_or_build_data_map_markdown(
     cache_date: date | None = None,
     conn: Any = None,
     search_api: str | None = "openclaw",
+    x_search_enabled: bool | None = None,
     timeout_s: float = CACHE_READ_TIMEOUT_S,
     team_memory_enabled: bool = False,
 ) -> str:
@@ -546,10 +564,13 @@ async def get_or_build_data_map_markdown(
             timeout=timeout_s,
         )
         if cached and cached.get("rendered_markdown"):
-            md = _apply_search_api_filter(str(cached["rendered_markdown"]), search_api)
+            md = _apply_search_api_filter(
+                str(cached["rendered_markdown"]), search_api, x_search_enabled
+            )
             return _apply_team_memory_filter(md, team_memory_enabled)
         return render_static_data_map_markdown(
             search_api=search_api,
+            x_search_enabled=x_search_enabled,
             team_memory_enabled=team_memory_enabled,
         )
     except asyncio.CancelledError:
@@ -561,6 +582,7 @@ async def get_or_build_data_map_markdown(
         )
         return render_static_data_map_markdown(
             search_api=search_api,
+            x_search_enabled=x_search_enabled,
             team_memory_enabled=team_memory_enabled,
         )
 
@@ -573,6 +595,7 @@ def set_turn_data_map(markdown: str | None) -> None:
 async def warm_turn_data_map(
     *,
     search_api: str | None = "openclaw",
+    x_search_enabled: bool | None = None,
     cache_date: date | None = None,
     conn: Any = None,
     team_memory_enabled: bool = False,
@@ -582,19 +605,34 @@ async def warm_turn_data_map(
         cache_date=cache_date,
         conn=conn,
         search_api=search_api,
+        x_search_enabled=x_search_enabled,
         team_memory_enabled=team_memory_enabled,
     )
     set_turn_data_map(md)
     return md
 
 
+def _configured_x_search_enabled() -> bool:
+    """Deployment ``x_search.enabled``. Only a real boolean turns the line on."""
+    from src.config.tool_settings import _get_tool_config
+
+    value = _get_tool_config("x_search.enabled", False)
+    return value if isinstance(value, bool) else False
+
+
 def resolve_prompt_data_map(*, team_memory_enabled: bool | None = None) -> str:
-    """Return the current turn's pre-warmed data map, or the static `未体检` fallback if unset."""
+    """Return the current turn's pre-warmed data map, or the static `未体检` fallback if unset.
+
+    The static fallback's ``x_search`` line follows ``x_search.enabled``.
+    It does not follow ``search_api``.
+    """
     current = _TURN_DATA_MAP_VAR.get()
     if current and current.strip():
         if team_memory_enabled is not None:
             return _apply_team_memory_filter(current, team_memory_enabled)
         return current
     return render_static_data_map_markdown(
+        search_api=None,
+        x_search_enabled=_configured_x_search_enabled(),
         team_memory_enabled=bool(team_memory_enabled),
     )

@@ -63,6 +63,7 @@ X_NO_EVIDENCE_TAG = "no_evidence"
 X_NO_EVIDENCE_NOTICE = "以下为未经来源支持的摘要，不得作为事实或引语使用"
 X_SUMMARY_TRUNCATED_NOTE = "摘要输出异常，已截断"
 MAX_X_HANDLES = 20
+_X_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 # 生成摘要里的模型控制标记（<|eos|>、<｜eos｜>、<|im_end|>、…）。
 _CONTROL_TOKEN_RE = re.compile(r"<[|｜][A-Za-z0-9_]+[|｜]>")
@@ -232,7 +233,11 @@ def _strip_quoted_spans(answer: str) -> str:
 
 
 def _x_answer_with_sources(
-    answer: str, results: List[Dict[str, Any]]
+    answer: str,
+    results: List[Dict[str, Any]],
+    *,
+    only_heading: str = X_ANSWER_ONLY_HEADING,
+    with_sources_heading: str = X_ANSWER_WITH_SOURCES_HEADING,
 ) -> Union[str, List[Dict[str, Any]]]:
     """Place the xAI synthesized summary (with untrusted external content notice) as the leading `answer_box` item.
 
@@ -241,14 +246,14 @@ def _x_answer_with_sources(
     layer that does it), so nothing here re-processes the text."""
     if not results:
         return (
-            f"{X_ANSWER_ONLY_HEADING} [{X_NO_EVIDENCE_TAG}]\n"
+            f"{only_heading} [{X_NO_EVIDENCE_TAG}]\n"
             f"{X_NO_EVIDENCE_NOTICE}\n{answer}"
         )
     prefixed_answer = f"{X_UNTRUSTED_NOTICE}\n{answer}" if answer else X_UNTRUSTED_NOTICE
     return [
         {
             "type": "answer_box",
-            "title": X_ANSWER_WITH_SOURCES_HEADING,
+            "title": with_sources_heading,
             "content": prefixed_answer,
             "evidence": "posts_below",
         },
@@ -437,6 +442,8 @@ def _normalize_handles_param(handles: Optional[List[str]]) -> Optional[List[str]
         h = item.strip().lstrip("@").strip()
         if not h:
             raise ValueError("handles entries must not be empty")
+        if _X_USERNAME_RE.fullmatch(h) is None:
+            raise ValueError("handles entries must be X usernames")
         cleaned.append(h)
     if len(cleaned) > MAX_X_HANDLES:
         raise ValueError(f"handles cannot exceed {MAX_X_HANDLES} accounts")
