@@ -115,6 +115,9 @@ async def test_a_blocked_discovery_hop_is_unprocessable_and_keeps_the_query_out(
     # A server whose /mcp redirects to /mcp/ trips the no-redirect rule on the
     # very first hop. That used to reach the route as a bare 500, logged at
     # ERROR quoting the row's URL, credential and all.
+    # DALTON-HOOK(httpx2-log-level): pin httpx2 at WARNING as the logging config does; another
+    # test in the same worker can leave the root logger at INFO.
+    caplog.set_level(logging.WARNING, logger="httpx2")
     url = "https://mcp.vendor.test/mcp?api_key=sk-live-123"
 
     async def _pin(target, *, require_https=True, allow_non_global=False):
