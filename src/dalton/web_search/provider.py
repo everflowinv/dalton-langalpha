@@ -129,7 +129,13 @@ class OpenClawSearchEmptyGenerationError(RuntimeError):
         super().__init__(EMPTY_GENERATION_MESSAGE if not cleaned else cleaned)
 
 
-def _answer_with_sources(answer: str, results: List[Dict[str, Any]]) -> Union[str, List[Dict[str, Any]]]:
+def _answer_with_sources(
+    answer: str,
+    results: List[Dict[str, Any]],
+    *,
+    only_heading: str = ANSWER_ONLY_HEADING,
+    with_sources_heading: str = ANSWER_WITH_SOURCES_HEADING,
+) -> Union[str, List[Dict[str, Any]]]:
     """The model-visible content when the broker returns a synthesized answer.
 
     Grounded providers (Gemini) return the answer plus citation links that carry no
@@ -138,8 +144,8 @@ def _answer_with_sources(answer: str, results: List[Dict[str, Any]]) -> Union[st
     citation hovers keep reading the same JSON list and skip non page/news items.
     """
     if not results:
-        return f"{ANSWER_ONLY_HEADING}\n{answer}"
-    return [{"type": "answer_box", "title": ANSWER_WITH_SOURCES_HEADING, "content": answer}, *results]
+        return f"{only_heading}\n{answer}"
+    return [{"type": "answer_box", "title": with_sources_heading, "content": answer}, *results]
 
 
 def unwrap_untrusted_text(value: Any) -> str:
@@ -167,6 +173,7 @@ def _resolve_date_window(
     default_time_range: Optional[str],
     start_date: Optional[str],
     end_date: Optional[str],
+    provider: str = "OpenClaw",
 ) -> tuple[Optional[str], Optional[str]]:
     """Resolve tool time filters into the broker's ``(dateAfter, dateBefore)`` pair.
 
@@ -185,13 +192,13 @@ def _resolve_date_window(
         return date_after, date_before
 
     effective_range = normalize_time_range(
-        time_range, default_time_range, provider="OpenClaw"
+        time_range, default_time_range, provider=provider
     )
     if not effective_range:
         return None, None
 
     computed_after = time_range_to_start_date(
-        effective_range, fmt="%Y-%m-%d", provider="OpenClaw"
+        effective_range, fmt="%Y-%m-%d", provider=provider
     )
     if not computed_after:
         return None, None

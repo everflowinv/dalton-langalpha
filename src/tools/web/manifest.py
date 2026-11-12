@@ -173,11 +173,19 @@ def get_web_providers() -> Mapping[str, WebProviderSpec]:
     """
     from src.config.tool_settings import get_search_api  # DALTON-HOOK(web-search-openclaw)
 
-    if get_search_api() != "openclaw":  # DALTON-HOOK(web-search-openclaw)
-        return _load_base_web_providers()
-    from src.dalton.web_search_spec import register_openclaw_web_provider  # DALTON-HOOK(web-search-openclaw)
+    search_api = get_search_api()
+    base = _load_base_web_providers()
+    if search_api == "openclaw":  # DALTON-HOOK(web-search-openclaw)
+        from src.dalton.web_search_spec import register_openclaw_web_provider  # DALTON-HOOK(web-search-openclaw)
 
-    return register_openclaw_web_provider(_load_base_web_providers())  # DALTON-HOOK(web-search-openclaw)
+        return register_openclaw_web_provider(base)  # DALTON-HOOK(web-search-openclaw)
+    if search_api == "gemini_grounding":  # DALTON-HOOK(web-search-gemini)
+        from src.dalton.web_search_spec import (  # DALTON-HOOK(web-search-gemini)
+            register_gemini_grounding_web_provider,
+        )
+
+        return register_gemini_grounding_web_provider(base)  # DALTON-HOOK(web-search-gemini)
+    return base
 
 
 get_web_providers.cache_clear = _load_base_web_providers.cache_clear  # type: ignore[attr-defined]  # DALTON-HOOK(web-search-openclaw)

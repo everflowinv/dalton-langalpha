@@ -576,12 +576,12 @@ class PTCAgent:
         )
         shared_tools.append(web_search_tool)
         shared_tools.append(web_fetch_tool)
-        # DALTON-HOOK(x-search-openclaw)
+        # DALTON-HOOK(x-search-direct): mounted from x_search.enabled, not search_api.
         x_search_tools: list[Any] = []
-        if str(self.config.search_api or "").strip().lower() == "openclaw":
-            from src.dalton.web_search.x_search import build_x_search_tool
+        if bool(getattr(self.config, "x_search_enabled", False)):
+            from src.dalton.web_search.x_search_direct import build_direct_x_search_tool
 
-            x_search_tool = build_x_search_tool()
+            x_search_tool = build_direct_x_search_tool()
             shared_tools.append(x_search_tool)
             x_search_tools.append(x_search_tool)
 
@@ -769,7 +769,7 @@ class PTCAgent:
                 execute_code=sub_code_tool,
                 bash=sub_bash_tool,
                 filesystem=subagent_filesystem_tools,
-                web=[web_search_tool, web_fetch_tool, *x_search_tools],  # DALTON-HOOK(x-search-openclaw)
+                web=[web_search_tool, web_fetch_tool, *x_search_tools],  # DALTON-HOOK(x-search-direct)
                 finance=finance_tools,
                 todo=todo_tools,
                 search_tool=search_tool,

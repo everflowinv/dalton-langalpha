@@ -501,3 +501,21 @@ class TestGenerateConfigTemplate:
         assert "mcp" in data
         assert "logging" in data
         assert "filesystem" in data
+
+
+class TestXSearchEnabled:
+    # DALTON-HOOK(x-search-direct): the loader accepts only a real boolean.
+    def test_absent_section_leaves_x_search_off(self):
+        config = load_from_dict(_full_config_dict())
+        assert config.x_search_enabled is False
+
+    def test_bool_enabled(self):
+        on = load_from_dict(_full_config_dict(x_search={"enabled": True}))
+        off = load_from_dict(_full_config_dict(x_search={"enabled": False}))
+        assert on.x_search_enabled is True
+        assert off.x_search_enabled is False
+
+    def test_string_enabled_does_not_count(self):
+        """``bool("false")`` is True, so only a real YAML boolean is accepted."""
+        config = load_from_dict(_full_config_dict(x_search={"enabled": "false"}))
+        assert config.x_search_enabled is False

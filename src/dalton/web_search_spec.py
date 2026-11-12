@@ -95,3 +95,76 @@ def register_openclaw_search_builder(
 ) -> Mapping[str, Callable[..., Any]]:
     """Wrap ``_PROVIDER_BUILDERS`` so ``openclaw`` is registered iff ``get_web_providers()`` includes it."""
     return _OpenClawBuilderRegistry(builders)
+
+
+def register_gemini_grounding_web_provider(
+    providers: Mapping[str, WebProviderSpec],
+) -> Mapping[str, WebProviderSpec]:
+    """Return ``providers`` with ``gemini_grounding`` when ``search_api`` selects it."""
+    if _current_search_api() != "gemini_grounding" or "gemini_grounding" in providers:
+        return providers
+    extended = dict(providers)
+    extended["gemini_grounding"] = WebProviderSpec(
+        name="gemini_grounding",
+        display_name="Gemini Grounding",
+        env_key="GEMINI_API_KEY",
+        capabilities=MappingProxyType(
+            {
+                CAPABILITY_SEARCH: CapabilitySpec(
+                    verb=CAPABILITY_SEARCH,
+                    tracking_name="GeminiGroundingSearchTool",
+                    min_tier=None,
+                    default_level="standard",
+                    levels=(
+                        LevelSpec(
+                            name="standard",
+                            display_name="Standard",
+                            native_params={},
+                            min_tier=None,
+                            credits=0.0,
+                        ),
+                    ),
+                    max_batch_size=1,
+                )
+            }
+        ),
+    )
+    return MappingProxyType(extended)
+
+
+def _gemini_grounding_builder(**kwargs: Any) -> Any:
+    from src.dalton.web_search.gemini_grounding import build_web_search_tool
+
+    return build_web_search_tool(**kwargs)
+
+
+class _GeminiGroundingBuilderRegistry(Mapping[str, Callable[..., Any]]):
+    """Expose ``gemini_grounding`` iff ``search_api == "gemini_grounding"``."""
+
+    def __init__(self, base: Mapping[str, Callable[..., Any]]) -> None:
+        self._base = base
+
+    def _active(self) -> dict[str, Callable[..., Any]]:
+        active = dict(self._base)
+        if _current_search_api() == "gemini_grounding":
+            active["gemini_grounding"] = _gemini_grounding_builder
+        return active
+
+    def __getitem__(self, key: str) -> Callable[..., Any]:
+        return self._active()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._active())
+
+    def __len__(self) -> int:
+        return len(self._active())
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._active()
+
+
+def register_gemini_grounding_search_builder(
+    builders: Mapping[str, Callable[..., Any]],
+) -> Mapping[str, Callable[..., Any]]:
+    """Wrap builders so ``gemini_grounding`` is registered iff ``search_api`` selects it."""
+    return _GeminiGroundingBuilderRegistry(builders)

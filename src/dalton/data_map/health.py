@@ -437,17 +437,29 @@ def build_route_probe_spec(
 
 
 async def default_web_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -> dict[str, Any]:
-    """Minimal real probe for `web_search`, validating non-empty results via `map_broker_response`."""
+    """Minimal real probe for `web_search`, validating non-empty results via `map_broker_response`.
+
+    ``gemini_grounding`` uses the Gemini client. ``openclaw`` (and any other
+    deployment default) keeps the original bridge client.
+    """
+    from src.config.tool_settings import get_search_api
     from src.dalton.web_search.provider import (
         OpenClawSearchEmptyResultError,
         OpenClawSearchWrapper,
         map_broker_response,
     )
 
-    wrapper = OpenClawSearchWrapper(timeout_seconds=clamp_timeout_s(timeout_s))
-    raw = await wrapper.raw_results(query="NVDA stock", max_results=1)
+    query = "NVDA stock"
+    if str(get_search_api() or "").strip().lower() == "gemini_grounding":
+        from src.dalton.web_search.gemini_grounding import GeminiGroundingClient
+
+        client = GeminiGroundingClient(timeout_seconds=clamp_timeout_s(timeout_s))
+        raw = await client.raw_results(query=query, max_results=1)
+    else:
+        wrapper = OpenClawSearchWrapper(timeout_seconds=clamp_timeout_s(timeout_s))
+        raw = await wrapper.raw_results(query=query, max_results=1)
     try:
-        cleaned, _artifact = map_broker_response(raw, query="NVDA stock", include_favicon=False)
+        cleaned, _artifact = map_broker_response(raw, query=query, include_favicon=False)
     except OpenClawSearchEmptyResultError as exc:
         raise OpenClawSearchEmptyResultError("空结果") from exc
     latest = extract_latest_date(cleaned)
@@ -456,13 +468,14 @@ async def default_web_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S)
 
 async def default_x_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -> dict[str, Any]:
     """Minimal real probe for `x_search`."""
-    from src.dalton.web_search.x_search import OpenClawXSearchWrapper, map_x_search_response
+    from src.dalton.web_search.x_search import map_x_search_response
+    from src.dalton.web_search.x_search_direct import DirectXSearchClient
 
     today = _probe_today()
     from_d = (today - timedelta(days=7)).isoformat()
     to_d = today.isoformat()
-    wrapper = OpenClawXSearchWrapper(timeout_seconds=clamp_timeout_s(timeout_s))
-    raw = await wrapper.raw_results(query="NVDA", from_date=from_d, to_date=to_d)
+    client = DirectXSearchClient(timeout_seconds=clamp_timeout_s(timeout_s))
+    raw = await client.raw_results(query="NVDA", from_date=from_d, to_date=to_d)
     cleaned, _artifact = map_x_search_response(raw, query="NVDA", include_favicon=False)
     latest = extract_latest_date(cleaned) or extract_latest_date(raw)
     return {"latest_date": latest, "count": len(cleaned)}

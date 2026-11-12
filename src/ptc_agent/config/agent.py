@@ -390,6 +390,12 @@ class AgentConfig(BaseModel):
     # If False (default), return immediately and show status of running tasks
     background_auto_wait: bool = False
 
+    # DALTON-HOOK(x-search-direct): mount x_search from this switch, not from
+    # search_api. False when the key is absent, so a deployment that never
+    # set it does not mount a tool that needs the admin xAI OAuth token.
+    # agent_config.dalton.yaml sets it true.
+    x_search_enabled: bool = False
+
     # Note: deep-agent automatically enables middlewares (TodoList, Compaction, etc.)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

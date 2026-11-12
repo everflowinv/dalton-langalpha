@@ -17,6 +17,7 @@ from src.dalton.data_map import builder as map_builder
 from src.dalton.data_map import health as health_mod
 from src.dalton.database import data_map as db_data_map
 from src.dalton.tools import build_dalton_tools
+from src.dalton.web_search import gemini_grounding as grounding_mod
 from src.dalton.web_search import provider as web_provider
 from src.ptc_agent.agent.prompts.loader import PromptLoader
 import src.tools.market_data.implementations as market_impl
@@ -197,6 +198,52 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
         search_api="tavily",
     )
     assert "- `x_search`" not in md_no_x
+
+    # The mount switch wins over search_api when the caller passes it.
+    md_switch_on = map_builder.render_data_map_markdown(
+        catalog_routes=_sample_catalog_routes(),
+        handoff_routes=FIXED_HANDOFF_ROUTES,
+        health_map=_sample_health_map(),
+        conversation_stats=_sample_conversation_stats(),
+        search_api="gemini_grounding",
+        x_search_enabled=True,
+    )
+    assert "- `x_search`" in md_switch_on
+    md_switch_off = map_builder.render_data_map_markdown(
+        catalog_routes=_sample_catalog_routes(),
+        handoff_routes=FIXED_HANDOFF_ROUTES,
+        health_map=_sample_health_map(),
+        conversation_stats=_sample_conversation_stats(),
+        search_api="openclaw",
+        x_search_enabled=False,
+    )
+    assert "- `x_search`" not in md_switch_off
+
+
+def test_static_prompt_fallback_follows_x_search_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unwarmed prompt map follows ``x_search.enabled``, not ``search_api``."""
+    token = map_builder._TURN_DATA_MAP_VAR.set(None)
+
+    def _config(enabled: object):
+        def _get(key_path: str, default: object = None) -> object:
+            if key_path == "x_search.enabled":
+                return enabled
+            return default
+
+        return _get
+
+    try:
+        monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda default="tavily": "openclaw")
+        monkeypatch.setattr("src.config.tool_settings._get_tool_config", _config(False))
+        assert "- `x_search`" not in map_builder.resolve_prompt_data_map()
+
+        monkeypatch.setattr("src.config.tool_settings._get_tool_config", _config(True))
+        assert "- `x_search`" in map_builder.resolve_prompt_data_map()
+
+        monkeypatch.setattr("src.config.tool_settings._get_tool_config", _config("true"))
+        assert "- `x_search`" not in map_builder.resolve_prompt_data_map()
+    finally:
+        map_builder._TURN_DATA_MAP_VAR.reset(token)
 
 
 def test_render_data_map_token_limit_trimming() -> None:
@@ -494,13 +541,17 @@ async def test_bridge_inner_proxy_error_and_web_search_empty_result(
     assert "Guidepoint session expired" in str(by_id["guidepoint"]["detail"]["reason"])
 
     # 2) Web search empty result via `map_broker_response` -> unavailable with reason `空结果`
-    mock_wrapper_instance = create_autospec(web_provider.OpenClawSearchWrapper, instance=True)
+    monkeypatch.setattr(
+        "src.config.tool_settings.get_search_api",
+        lambda: "gemini_grounding",
+    )
+    mock_wrapper_instance = create_autospec(grounding_mod.GeminiGroundingClient, instance=True)
     mock_wrapper_instance.raw_results.return_value = {"ok": True, "result": {"results": []}}
     mock_wrapper_cls = create_autospec(
-        web_provider.OpenClawSearchWrapper,
+        grounding_mod.GeminiGroundingClient,
         return_value=mock_wrapper_instance,
     )
-    monkeypatch.setattr(web_provider, "OpenClawSearchWrapper", mock_wrapper_cls)
+    monkeypatch.setattr(grounding_mod, "GeminiGroundingClient", mock_wrapper_cls)
 
     with pytest.raises(web_provider.OpenClawSearchEmptyResultError, match="空结果"):
         await health_mod.default_web_search_probe(timeout_s=5.0)
@@ -536,6 +587,56 @@ async def test_bridge_inner_proxy_error_and_web_search_empty_result(
     ok_web = await health_mod.default_web_search_probe(timeout_s=5.0)
     assert ok_web["latest_date"] == "2026-10-20"
     assert ok_web["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_web_search_probe_follows_the_configured_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``gemini_grounding`` uses the Gemini client. ``openclaw`` uses the bridge."""
+    payload = {
+        "ok": True,
+        "result": {
+            "results": [
+                {
+                    "title": "NVDA earnings",
+                    "url": "https://example.com/nvda",
+                    "content": "Q3 update",
+                    "published_date": "2026-10-20",
+                }
+            ]
+        },
+    }
+    gemini_instance = create_autospec(grounding_mod.GeminiGroundingClient, instance=True)
+    gemini_instance.raw_results.return_value = payload
+    gemini_cls = create_autospec(
+        grounding_mod.GeminiGroundingClient,
+        return_value=gemini_instance,
+    )
+    monkeypatch.setattr(grounding_mod, "GeminiGroundingClient", gemini_cls)
+
+    bridge_instance = create_autospec(web_provider.OpenClawSearchWrapper, instance=True)
+    bridge_instance.raw_results.return_value = payload
+    bridge_cls = create_autospec(
+        web_provider.OpenClawSearchWrapper,
+        return_value=bridge_instance,
+    )
+    monkeypatch.setattr(web_provider, "OpenClawSearchWrapper", bridge_cls)
+
+    monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda: "gemini_grounding")
+    gemini_probe = await health_mod.default_web_search_probe(timeout_s=5.0)
+    assert gemini_probe["latest_date"] == "2026-10-20"
+    assert gemini_probe["count"] == 1
+    gemini_cls.assert_called_once()
+    bridge_cls.assert_not_called()
+
+    gemini_cls.reset_mock()
+    monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda: "openclaw")
+    bridge_probe = await health_mod.default_web_search_probe(timeout_s=5.0)
+    assert bridge_probe["latest_date"] == "2026-10-20"
+    assert bridge_probe["count"] == 1
+    bridge_cls.assert_called_once()
+    gemini_cls.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -352,6 +352,12 @@ def load_from_dict(
     # Search API provider + default depth level
     search_api = config_data.get("search_api", "tavily")
     search_depth = config_data.get("search_depth", "standard")
+    # DALTON-HOOK(x-search-direct): only a real boolean counts. A missing
+    # section leaves the tool off; the Dalton overlay sets enabled: true.
+    x_search_section = config_data.get("x_search")
+    x_search_enabled = False
+    if isinstance(x_search_section, dict) and isinstance(x_search_section.get("enabled"), bool):
+        x_search_enabled = x_search_section["enabled"]
 
     # Create config object
     config = AgentConfig(
@@ -367,6 +373,7 @@ def load_from_dict(
         search_api=search_api,
         search_depth=search_depth,
         background_auto_wait=background_auto_wait,
+        x_search_enabled=x_search_enabled,
     )
 
     return config

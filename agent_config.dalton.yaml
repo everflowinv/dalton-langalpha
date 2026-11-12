@@ -50,7 +50,16 @@ subagents:
     general-purpose:
       model: "grok-4.7-oauth"
 
+# Switch to "gemini_grounding" once GEMINI_API_KEY is configured for the backend (OC-5).
 search_api: "openclaw"
+
+# Gemini API + Google Search grounding. Model matches the retired OpenClaw setting.
+web_search:
+  model: gemini-2.5-flash
+
+# Direct xAI Responses x_search. Independent of search_api. Absent means off.
+x_search:
+  enabled: true
 
 # Crawler: the backend container is 4 GB (docker-compose.dalton.yml mem_limit)
 # and the server process itself takes ~0.7–0.8 GB plus whatever a running turn
