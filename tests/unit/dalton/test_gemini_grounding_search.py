@@ -357,15 +357,15 @@ async def test_missing_key_does_not_call_http(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_dalton_yaml_selects_gemini_grounding(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The overlay stays on OpenClaw until a key exists. The selector still
-    returns the Gemini tool when ``search_api`` is ``gemini_grounding``.
+    """The overlay selects Gemini Grounding, and the selector returns the
+    Gemini tool when ``search_api`` is ``gemini_grounding``.
     """
     import yaml
 
     from src.tools.web.search import get_web_search_tool
 
     data = yaml.safe_load((REPO_ROOT / "agent_config.dalton.yaml").read_text(encoding="utf-8"))
-    assert data["search_api"] == "openclaw"
+    assert data["search_api"] == "gemini_grounding"
     assert data["x_search"]["enabled"] is True
     assert data["web_search"]["model"] == "gemini-2.5-flash"
 
