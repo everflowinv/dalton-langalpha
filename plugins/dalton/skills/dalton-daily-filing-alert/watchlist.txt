@@ -1,0 +1,54 @@
+# Company Filings Alert - SEC Watchlist
+# Updated: 2026-03-16
+
+# Fintech
+AFRM
+
+# Media/Telecom
+SATS
+
+# China ADR
+BABA
+ATAT
+PDD
+EDU
+TCOM
+HTHT
+FUTU
+TAL
+
+# US Tech - Mega Cap
+GOOGL
+MSFT
+META
+AMZN
+
+# AI / Semiconductor
+NVDA
+AVGO
+TSM
+AMD
+INTC
+ASML
+ACMR
+MU
+NBIS
+
+# Optical / Networking
+LITE
+COHR
+NOK
+
+# Hardware / Storage
+DELL
+SNDK
+
+# US Tech - Growth
+DASH
+NFLX
+SPOT
+APP
+RBLX
+
+# Insurance
+PGR
