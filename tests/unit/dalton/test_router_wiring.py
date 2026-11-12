@@ -197,40 +197,6 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
                 create_autospec(o_mod.get_oauth_tokens, return_value=None),
             )
 
-    monkeypatch.setattr(
-        oc_admin,
-        "get_dalton_broker_token",
-        create_autospec(oc_admin.get_dalton_broker_token, return_value=""),
-    )
-    monkeypatch.setattr(
-        oc_admin,
-        "try_acquire_sync_lock",
-        create_autospec(oc_admin.try_acquire_sync_lock, return_value=True),
-    )
-    monkeypatch.setattr(
-        oc_admin,
-        "release_sync_lock",
-        create_autospec(oc_admin.release_sync_lock, return_value=None),
-    )
-    monkeypatch.setattr(
-        oc_admin,
-        "create_sync_run",
-        create_autospec(
-            oc_admin.create_sync_run,
-            return_value="00000000-0000-0000-0000-000000000088",
-        ),
-    )
-    monkeypatch.setattr(
-        oc_admin,
-        "finish_sync_run",
-        create_autospec(oc_admin.finish_sync_run, return_value=None),
-    )
-    monkeypatch.setattr(
-        oc_admin,
-        "find_user_referenced_models",
-        create_autospec(oc_admin.find_user_referenced_models, return_value=set()),
-    )
-
     # Wire resolve_model_client with create_autospec so probe_provider executes end-to-end
     monkeypatch.setattr(
         llm_clients_mod,
@@ -275,9 +241,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 @pytest.mark.parametrize(
     ("method", "path", "json_body"),
     [
-        ("GET", "/api/v1/dalton/openclaw/models/status", None),
         ("GET", "/api/v1/dalton/openclaw/health", None),
-        ("POST", "/api/v1/dalton/openclaw/models/sync", {"dry_run": True, "force": False}),
         ("GET", "/api/v1/dalton/providers/status", None),
         ("POST", "/api/v1/dalton/providers/xai/probe", {"model_key": "grok-4.7"}),
         ("GET", "/api/v1/dalton/providers/available-models", None),
@@ -499,7 +463,7 @@ def test_gatekeeper_catches_broken_service_symbol(
 def test_workspace_ownership_and_pm_guards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify non-owner gets 403 on workspace knowledge routes and non-PM gets 403 on sync/import."""
+    """Verify non-owner gets 403 on workspace knowledge routes and non-PM gets 403 on PM diagnostics."""
     import src.server.database.workspace as ws_db
 
     real_get_workspace = ws_db.get_workspace
@@ -527,11 +491,8 @@ def test_workspace_ownership_and_pm_guards(
     )
     assert r_vers.status_code == 403
 
-    r_sync = intruder_client.post(
-        "/api/v1/dalton/openclaw/models/sync",
-        json={"dry_run": True, "force": False},
-    )
-    assert r_sync.status_code == 403
+    r_pm = intruder_client.get("/api/v1/dalton/diagnostics/browser-memory")
+    assert r_pm.status_code == 403
 
     # P0J §8.1 #14: fail-closed when workspace is not found -> 404 (never silently allow)
     monkeypatch.setattr(

@@ -781,7 +781,7 @@ async def test_g32_reviewer_falls_back_to_next_cross_family_candidate(
         "gpt-6.1-sol-oauth",
         "claude-sonnet-5-5-oauth",
         "gemini-4-argon-high-oauth",
-        "ocb-xai-grok-4.7",
+        "grok-4.7",
     ]
     called_models: list[str] = []
 
@@ -855,7 +855,7 @@ async def test_g32_reviewer_falls_back_to_next_cross_family_candidate(
         return_value=DaltonCompleteResult(
             ok=False,
             status="failed",
-            model="ocb-xai-grok-4.7",
+            model="grok-4.7",
             error="upstream_timeout",
         ),
     )

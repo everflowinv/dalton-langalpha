@@ -1,10 +1,12 @@
-# P0N 模型主路径切到 LangAlpha 原生供应商（broker v2 保留为并行路径）
+# P0N 模型主路径切到 LangAlpha 原生供应商（broker 对话模型已在 OC-5 移除）
 
 版本 1.0，2026-10-18。写给接手开发的工程师。验收由 lead 负责。
 
+> **OC-5（2026-11-12）已取代本文的 broker 模型决定。** `ocb-*` 对话模型、`openclaw_overlay.json`、模型同步按钮和 `models.broker.enabled` 已从代码移除。OpenClaw 网关仍用于 x_search、researchdata 和飞书。下面正文是当时的实施记录，其中“broker 不退役、`ocb-*` 继续出现在目录里”不再执行。
+
 本分册的代码现状基于 `dalton/main` 的 HEAD `7670a03f`。上游基线是 `8e0dce94`（`feat(auth): verify outside apps' OAuth access tokens…`，即合入 Dalton 之前最后一个上游提交）。
 
-**和其他分册的关系：** 本分册修订 P0 的 P0.4–P0.8 的**默认值**，不推翻它们的设计。broker v2（P0.2–P0.3）、模型同步与同步按钮（P0.7）继续保留、继续可用，只是不再是默认模型路径。冲突时以本分册和 README §6 新增的决定为准（见 §0.3）。
+**和其他分册的关系：** 本分册当时修订 P0 的 P0.4–P0.8 的**默认值**。OC-5 进一步移除了 `ocb-*` 对话模型。下文里“broker 继续可用、不要删除”的句子不再执行。冲突时以 `docs/dalton/ARCHITECTURE.md` 和 OC-5 为准。
 
 ---
 
@@ -13,7 +15,7 @@
 ### 0.1 owner 已确认的方向（含 2026-10-18 的更新）
 
 1. **默认模型路径改为 LangAlpha 原生供应商**：claude-oauth、codex-oauth（上游原生），antigravity-oauth、muse-oauth（owner 新加的订阅登录），xai（owner 新加，API key 现金计费），以及 providers.json 里已有的 API key 供应商（deepseek、gemini、z-ai、minimax、openrouter……）。
-2. **broker v2 不退役。** 它继续安装在 OpenClaw 网关里，`ocb-*` 模型继续出现在模型目录里、可以被选为任何角色的模型；健康检查继续跑；OpenClaw "重新同步模型" 按钮继续可用，放进新的"模型供应商状态"卡片里，作为其中一节。现在**不做**任何卸载、删除动作。退役的前提条件见 §6，届时另行决定。
+2. **broker 对话模型已在 OC-5 移除。** 写本文时的决定是保留 `ocb-*` 和同步按钮，不做卸载。该决定已作废：目录里不再有 `ocb-*`，设置页不再有 broker 同步。OpenClaw 网关本身仍在，用于 x_search、researchdata 和飞书。下文 §6 的退役条件不再适用。
 3. 模型目录的唯一来源 = **LangAlpha 上游 manifest + Dalton overlay**。owner 直接改上游 `models.json` / `providers.json` 的做法要改为 overlay，上游文件回到 `8e0dce94` 的原样。
 4. 订阅登录（claude-oauth、codex-oauth、antigravity-oauth、muse-oauth）冒用官方 CLI 的身份，条款和封号风险比 OpenClaw 的 CLI 网关更高。owner 已知情并接受，缓解措施见 P0N.8 和 §5。
 

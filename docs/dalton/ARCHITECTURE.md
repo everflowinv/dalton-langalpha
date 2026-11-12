@@ -12,7 +12,7 @@ Dalton 是构建在开源项目 LangAlpha 之上的基金研究分析师。LangA
 - 正式发布治理：数字核验、两轮语言审查（只标不改）、异族模型独立审稿、PM 审批，以及发布时由智能体渲染 HTML；
 - 自主研究：预检与探针唤醒、股价异动按交易日单向触发、研究总监排期，以及自动化结果经飞书卡片 2.0 / Discord 私信推送；
 - 数据接入：researchdata 桥接（MCP 令牌与管理令牌分离）、公司 Wiki 入库与飞书文档读写、SEC XBRL、`yfinance` 优先与 FMP 共享额度熔断、盘前盘后行情标注、网页、X、团队对话归档；
-- 模型接入与计费：订阅制 OAuth、原生 GLM、原生订阅模型巡检/同步/退役、OpenClaw broker，以及每日现金额度；
+- 模型接入与计费：订阅制 OAuth、原生 GLM、原生订阅模型巡检/同步/退役，以及每日现金额度（`ocb-*` 对话模型已在 OC-5 移除）；
 - 团队模式与安全边界：邮箱白名单与 PM 单次邀请链接注册（用户名 + 密码）、三层身份（`admin` / `internal` / `external`）与外部成员完全隔离、共享模型凭据、按通道（Web UI 与 Chief of Staff）配置的工作区共享权限；个人工作区内的全局搜索（⌘K）、输入框草稿持久化、文件与 Memo 面板批量上传、后台子代理并发上限与排队；隐藏交易与券商连接功能（保留仪表盘「持仓」视图），后端拒绝券商开关与交易权限变更且不向智能体绑定任何下单工具。
 
 **代码归属。** Dalton 自有代码只放在 `scripts/dalton/dalton_paths.txt` 列出的路径下，主要有：
@@ -28,7 +28,7 @@ Dalton 是构建在开源项目 LangAlpha 之上的基金研究分析师。LangA
 
 ```
 宿主机（macOS）
-  ├─ OpenClaw：模型 broker（ocb-*）、researchdata MCP、xreach、web_search / x_search 网关、飞书与 Discord 发送通道
+  ├─ OpenClaw：researchdata MCP、xreach、web_search / x_search 网关、飞书与 Discord 发送通道（ocb-* 对话模型已在 OC-5 移除）
   ├─ researchdata 桥接  127.0.0.1:8960   scripts/dalton/researchdata_bridge.py（launchd: com.dalton.researchdata-bridge）
   │    ├─ MCP 接口：POST /mcp（_is_valid_mcp_token：校验 DALTON_BRIDGE_TOKEN 或 DALTON_BRIDGE_ADMIN_TOKEN）
   │    └─ 管理接口：POST /embed、POST /wiki/ingest、POST /feishu/*、GET|POST /jobs/conversation-archive*、GET /jobs/ops、POST /notify（_require_admin_token：仅校验 DALTON_BRIDGE_ADMIN_TOKEN）
@@ -230,7 +230,7 @@ Docker（colima，数据盘在 EveSSD）
 
 ## 8. 模型接入
 
-模型目录由四部分合并而成：上游 manifest、`src/dalton/llm/native_overlay.json`、运行时同步覆盖层 `var/dalton/catalog/native_sync_overlay.json`、`src/dalton/llm/openclaw_overlay.json`（`src/dalton/llm/overlay.py`、`src/dalton/llm/native_catalog.py`，钩子 `llm-overlay`）。`dalton_meta` 字段标明每个模型的家族和计费方式。各个角色默认用哪个模型，由 `agent_config.dalton.yaml`、`src/dalton/dalton.yaml` 和代理定义决定。
+模型目录由三部分合并而成：上游 manifest、`src/dalton/llm/native_overlay.json`、运行时同步覆盖层 `var/dalton/catalog/native_sync_overlay.json`（`src/dalton/llm/overlay.py`、`src/dalton/llm/native_catalog.py`，钩子 `llm-overlay`）。`dalton_meta` 字段标明每个模型的家族和计费方式。各个角色默认用哪个模型，由 `agent_config.dalton.yaml`、`src/dalton/dalton.yaml` 和代理定义决定。OC-5 已移除 `ocb-*` 目录（原先的 `openclaw_overlay.json`）。
 
 Claude Fable 5.2 通过 `native_overlay.json` 登记：`claude-fable-5-2` 使用 Anthropic API，`claude-fable-5-2-oauth` 使用 Claude 订阅登录，两者的上游模型 ID 均为 `claude-fable-5-2`。上下文为 1,000,000 token，最大输出为 128,000 token。自适应思考始终启用，默认强度为 high，支持 low、medium、high、xhigh、max。请求使用 `drop_block` 和 `thinking-binding-controls-2026-08-01` 处理历史消息前缀变化。API 每百万 token 价格为输入 8 美元、输出 40 美元、缓存读取 0.20 美元、5 分钟缓存写入 10 美元、1 小时缓存写入 16 美元。订阅调用的现金花费记为 0，并通过 `notional_ref` 计算名义成本。价格核对日期为 2026-11-11，参见[官方规格](https://platform.claude.com/docs/en/models/fable-5-2/overview)和[迁移说明](https://platform.claude.com/docs/en/models/fable-5-2/migration-guide)。
 
@@ -241,8 +241,9 @@ Claude Fable 5.2 通过 `native_overlay.json` 登记：`claude-fable-5-2` 使用
 | 订阅 OAuth（Dalton） | `muse-oauth` | 登录后向 `/muse-code/key` 换发模型 API key；会话头和 Muse Code CLI 1.4.12 一致 |
 | 订阅 OAuth（Dalton） | `xai-oauth` | SuperGrok：`auth.x.ai` 设备码登录，带 Redis 锁的刷新，经 `cli-chat-proxy.grok.com` 调用。`x-grok-client-version` 由 `DALTON_XAI_GROK_CLIENT_VERSION` 指定（默认 `1.0.67`），过旧会收到 426 |
 | 订阅 API key | `z-ai-cn-coding` | 智谱 GLM Coding Plan，Anthropic 协议；模型 `glm-5.3-plan`、`glm-5.3-flash-plan`，默认思考强度 low。只认自己名下的 key，不会回落到按量计费的父供应商。频率限制较严，批量调用时要低并发并退避 |
-| OpenClaw broker | `openclaw-broker` | `ocb-*`，`http://{HOST_IP}:18789/dalton-broker/v1`，用 `scripts/dalton/sync_openclaw_models.py` 同步 |
 | 现金 | `deepseek`、`xai`（API key）等 | |
+
+OC-5 已移除 `ocb-*` 对话模型和 `openclaw-broker` 供应商。OpenClaw 网关仍用于 x_search、researchdata 和飞书，不再提供对话模型。
 
 **角色策略**（`src/dalton/llm/role_policy.py`）：
 

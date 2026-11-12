@@ -16,7 +16,6 @@ from unittest.mock import create_autospec
 
 from langchain_anthropic import ChatAnthropic
 
-from src.dalton.llm.openclaw_catalog import build_overlay
 from src.dalton.llm.providers.antigravity import ChatAntigravity
 from src.dalton.llm.providers.muse.client import ChatMuseOpenAI
 from src.dalton.llm.providers.xai_grok.client import ChatGrokOpenAI
@@ -41,17 +40,6 @@ def test_anthropic_compatible_host_never_carries_claude_only_fields():
     assert isinstance(compat, ChatAnthropic)
     assert carries_tool_changes(compat) is False
     assert carries_turn_scoped(compat) is False
-
-
-def test_broker_overlay_builds_an_openai_sdk_line():
-    overlay = build_overlay(
-        catalog={"data": [{"id": "gpt-x", "displayName": "GPT X"}]},
-        v1_rate_cards={},
-        price_cards={},
-        current_overlay={},
-    )
-    broker = overlay["providers"]["provider_config"]["openclaw-broker"]
-    assert broker["sdk"] == "openai" and broker["use_response_api"] is False
 
 
 def test_the_gates_ask_the_client_not_its_name():

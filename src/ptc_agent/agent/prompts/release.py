@@ -25,8 +25,8 @@ _AGENT = _PROMPTS.parent
 # DALTON-HOOK(prompt-release-sources): the Dalton data map renders into
 # system.md.j2 and components/tool_guide.md.j2 as the ``dalton_data_map``
 # variable (injected by loader.py's DALTON-HOOK(data-map)), so its render
-# inputs are deploy state of the static prompt. ``src/dalton/llm/openclaw_overlay.json``
-# is deliberately absent: runtime-regenerated, never a prompt source.
+# inputs are deploy state of the static prompt. The OpenClaw broker overlay
+# was removed (OC-5) and is not a prompt source.
 _DALTON_DATA_MAP = _AGENT.parents[2] / "src" / "dalton" / "data_map"
 
 

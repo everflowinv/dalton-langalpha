@@ -26,7 +26,7 @@ from src.dalton.llm.role_policy import (
     check_roles,
     explain_model_availability,
 )
-from src.dalton.settings import get_disabled_providers, is_broker_models_enabled
+from src.dalton.settings import get_disabled_providers
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
     roles_by_provider: dict[str, list[dict[str, str]]] = {}
     for item in role_assignments:
         prov = model_to_provider.get(item["model"], "")
-        if prov and prov != "openclaw-broker":
+        if prov:
             roles_by_provider.setdefault(prov, []).append(item)
 
     # Check user BYOK keys (get_user_api_keys returns {"byok_enabled", "keys": {prov: key}, "base_urls"})
@@ -244,7 +244,7 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         "deepseek",
     ]
     for p in list(roles_by_provider.keys()) + list(byok_providers):
-        if p and p != "openclaw-broker" and p not in candidate_providers and p in flat_providers:
+        if p and p not in candidate_providers and p in flat_providers:
             candidate_providers.append(p)
 
     usage_stats = await _fetch_usage_stats_24h(model_to_provider, user_id=user_id)
@@ -503,16 +503,6 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
             row_payload.update(muse_row_extras)
         providers_out.append(row_payload)
 
-    broker_enabled = is_broker_models_enabled()
-    broker_health: dict[str, Any] | None = None
-    if broker_enabled:
-        try:
-            from src.dalton.services.openclaw_admin import probe_health
-
-            broker_health = await probe_health()
-        except Exception as e:
-            broker_health = {"status": "error", "error": sanitize_error_text(str(e))}
-
     avail_map = await explain_model_availability(user_id=user_id)
     avail_set = {k for k, v in avail_map.items() if v.get("available")}
     from src.dalton.llm.model_prefs import (
@@ -535,10 +525,6 @@ async def get_providers_status(*, user_id: str) -> dict[str, Any]:
         "generated_at": now.isoformat(),
         "providers": providers_out,
         "role_warnings": role_warnings,
-        "broker": {
-            "enabled": broker_enabled,
-            "health": broker_health,
-        },
     }
 
 

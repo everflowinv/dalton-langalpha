@@ -6,7 +6,7 @@ Checks in order:
    - `INTERNAL_SERVICE_TOKEN` is set in environment / `.env`.
    - `GET /api/v1/dalton/openclaw/health` with `X-User-Id: realrun-pm-a` returns `user_id == "realrun-pm-a"`, `is_pm == True`.
    - `GET /api/v1/dalton/openclaw/health` with `X-User-Id: realrun-user-b` returns `user_id == "realrun-user-b"`, `is_pm == False`.
-   - PM-only `POST /api/v1/dalton/openclaw/models/sync` (`{"dry_run": true}`) returns 200 for `realrun-pm-a` and 403 for `realrun-user-b`.
+   - PM-only `GET /api/v1/dalton/diagnostics/browser-memory` returns 200 for `realrun-pm-a` and 403 for `realrun-user-b`.
 2. `version`:
    - Local working tree is clean (`git_dirty == False`).
    - Backend `git_sha` equals local `HEAD` (`git_sha`), and `backend_git_dirty == False`.
@@ -15,13 +15,11 @@ Checks in order:
      verifying HTTP 200 (covering the Redis wake listener pool) and a `conversation_usages` row recorded under `user_id == "realrun-pm-a"` with `cash_usd == 0.0`.
 4. `bridge`:
    - `http://127.0.0.1:8960/healthz` returns 200 and one real MCP `tools/call` read succeeds.
-5. `broker`:
-   - OpenClaw broker `/health` returns 200 (`ok: true`) and `/models` returns a non-empty model list.
-6. `deployment`:
+5. `deployment`:
    - Reports whether the backend is running in `docker` or `host` mode.
-7. `static_script_scan`:
+6. `static_script_scan`:
    - Scans `scripts/dalton/realrun/g*.py` for forbidden `from src` imports, direct `INSERT INTO` SQL statements, `_for_check_env_probe`, and `*_fn=` preflight override arguments.
-8. `oauth_token_provenance`:
+7. `oauth_token_provenance`:
    - Verifies that test user (`realrun-pm-a`) OAuth token in `user_oauth_tokens` has a prior `oauth_login_start` event in `dalton_provider_events` (`e.created_at <= t.created_at`), and that no `realrun-%` row in `user_oauth_tokens` lacks a prior `oauth_login_start` event (L39, P0J §1.5).
 """
 
@@ -167,12 +165,8 @@ def check_identity_and_version(base_url: str) -> tuple[dict[str, Any], dict[str,
         st_pm_h, body_pm_h = pm_client.get("/api/v1/dalton/openclaw/health")
         st_b_h, body_b_h = user_b_client.get("/api/v1/dalton/openclaw/health")
 
-        st_pm_sync, body_pm_sync = pm_client.post(
-            "/api/v1/dalton/openclaw/models/sync", json_body={"dry_run": True}
-        )
-        st_b_sync, body_b_sync = user_b_client.post(
-            "/api/v1/dalton/openclaw/models/sync", json_body={"dry_run": True}
-        )
+        st_pm_sync, _body_pm_gate = pm_client.get("/api/v1/dalton/diagnostics/browser-memory")
+        st_b_sync, _body_b_gate = user_b_client.get("/api/v1/dalton/diagnostics/browser-memory")
 
     pm_uid = body_pm_h.get("user_id") if isinstance(body_pm_h, dict) else None
     pm_is_pm = body_pm_h.get("is_pm") if isinstance(body_pm_h, dict) else None
@@ -876,53 +870,10 @@ def check_bridge(bridge_url: str = "http://127.0.0.1:8960") -> dict[str, Any]:
         }
 
 
-def check_broker(broker_url: str | None = None) -> dict[str, Any]:
-    """Run check #5: OpenClaw broker `/health` and `/models?detail=1`."""
-    url = (
-        broker_url
-        or os.getenv("DALTON_BROKER_URL")
-        or "http://127.0.0.1:18789/dalton-broker/v1"
-    ).rstrip("/")
-    token = os.getenv("DALTON_BROKER_TOKEN", "").strip()
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    try:
-        with httpx.Client(timeout=25.0, trust_env=False) as c:
-            h_resp = c.get(f"{url}/health", headers=headers)
-            m_resp = c.get(f"{url}/models?detail=1", headers=headers)
-        h_body = h_resp.json() if h_resp.status_code == 200 else {}
-        m_body = m_resp.json() if m_resp.status_code == 200 else {}
-        models_list = (
-            (m_body.get("data") or m_body.get("models"))
-            if isinstance(m_body, dict)
-            else []
-        )
-        ok = (
-            h_resp.status_code == 200
-            and bool(h_body.get("ok"))
-            and m_resp.status_code == 200
-            and isinstance(models_list, list)
-            and len(models_list) > 0
-        )
-        return {
-            "status": "PASS" if ok else "FAIL",
-            "broker_url": url,
-            "health_status": h_resp.status_code,
-            "models_status": m_resp.status_code,
-            "models_count": len(models_list) if isinstance(models_list, list) else 0,
-        }
-    except Exception as exc:
-        return {
-            "status": "FAIL",
-            "broker_url": url,
-            "error": _safe_exc_summary(exc, "broker health or models request failed"),
-        }
-
-
 def run_all_checks(
     *,
     backend_url: str = "http://127.0.0.1:8000",
     bridge_url: str = "http://127.0.0.1:8960",
-    broker_url: str | None = None,
     transport_model: str = "gemini-3.8-flash-low-oauth",
     strict_static_scan: bool = False,
     skip_oauth_and_transport: bool = False,
@@ -934,7 +885,6 @@ def run_all_checks(
             "Refusing to run check_env without service-token authentication."
         )
 
-    broker_res = check_broker(broker_url)
     identity_res, version_res, deployment_res = check_identity_and_version(backend_url)
     migrated_ws_res = check_migrated_workspace_ownership()
     realrun_ws_res = check_realrun_workspace_provenance()
@@ -947,7 +897,6 @@ def run_all_checks(
         "migrated_workspace_ownership": migrated_ws_res,
         "realrun_workspace_provenance": realrun_ws_res,
         "bridge": bridge_res,
-        "broker": broker_res,
         "deployment": deployment_res,
         "static_script_scan": static_res,
     }
@@ -984,7 +933,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Verify Dalton real-run environment (P0J §1.4).")
     parser.add_argument("--backend", default="http://127.0.0.1:8000", help="Backend base URL")
     parser.add_argument("--bridge", default="http://127.0.0.1:8960", help="ResearchData bridge base URL")
-    parser.add_argument("--broker", default=None, help="OpenClaw broker base URL")
     parser.add_argument(
         "--model",
         default="gemini-3.8-flash-low-oauth",
@@ -997,7 +945,6 @@ def main() -> int:
         summary = run_all_checks(
             backend_url=args.backend,
             bridge_url=args.bridge,
-            broker_url=args.broker,
             transport_model=args.model,
             strict_static_scan=args.strict_static_scan,
         )

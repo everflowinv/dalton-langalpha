@@ -33,7 +33,6 @@ def test_the_official_lines_stay_on_and_the_relays_off() -> None:
         "muse-wonder-1.0-oauth",
         "grok-4.7-oauth",
         "glm-5.3-plan",
-        "ocb-claude-cli-gateway-claude-opus-5-5",
     ):
         assert name not in on
 
@@ -58,7 +57,6 @@ def test_client_side_gate_reads_the_provider_stamp() -> None:
     # the point is the relay short-circuit happens before them.
     assert native_kind(official) is None
     assert native_compaction_disabled("claude-oauth")
-    assert native_compaction_disabled("openclaw-broker")
     assert not native_compaction_disabled("anthropic")
     assert not native_compaction_disabled("openai")
     assert not native_compaction_disabled("codex-oauth")
@@ -93,7 +91,6 @@ def test_handoff_on_switch_across_official_and_dalton_routes() -> None:
     antigravity = create_llm("gemini-4-argon-high-oauth", api_key="dummy")
     muse_oauth = create_llm("muse-wonder-1.0-oauth", api_key="dummy")
     xai = create_llm("grok-4.7-oauth", api_key="dummy")
-    broker = create_llm("ocb-claude-cli-gateway-claude-opus-5-5", api_key="dummy")
 
     anthropic_summary = HumanMessage(
         content="signed-summary-text",
@@ -140,7 +137,6 @@ def test_handoff_on_switch_across_official_and_dalton_routes() -> None:
         (antigravity, "antigravity"),
         (muse_oauth, "muse-oauth"),
         (xai, "xai"),
-        (broker, "openclaw-broker"),
     ):
         assert adopt([anthropic_summary], relay_client, relay_route) is None
         assert replays(anthropic_summary, relay_client) is False
@@ -158,8 +154,6 @@ def test_handoff_on_switch_across_official_and_dalton_routes() -> None:
         "antigravity",
         "muse-oauth",
         "xai",
-        "openclaw-broker",
-        "openclaw-broker|https://relay.example/v1",
     ):
         relay_origin_summary = HumanMessage(
             content="from-relay",

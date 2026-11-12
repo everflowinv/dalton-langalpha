@@ -11,8 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from src.dalton.llm.native_catalog import NATIVE_SYNC_OVERLAY_PATH
-from src.dalton.llm.openclaw_catalog import OVERLAY_PATH
-from src.dalton.settings import is_broker_models_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +26,11 @@ NATIVE_OVERLAY_PATH = Path(__file__).resolve().parent / "native_overlay.json"
 PINNED_OVERLAY_MODEL_KEYS = frozenset({"grok-4.7-oauth", "grok-4.3-oauth"})
 
 # Merge order: checked-in native overlay → runtime native-sync overlay
-# (var/dalton/catalog, written by the settings-page card) → OpenClaw overlay.
+# (var/dalton/catalog, written by the settings-page card).
+# The OpenClaw broker overlay (`ocb-*`) was removed in OC-5.
 OVERLAY_SOURCES: list[tuple[str, Path]] = [
     ("native", NATIVE_OVERLAY_PATH),
     ("native_sync", NATIVE_SYNC_OVERLAY_PATH),
-    ("openclaw", OVERLAY_PATH),
 ]
 
 _LAST_STAT_AT: float = 0.0
@@ -52,7 +50,7 @@ def _stat_part(path: Path) -> str:
 
 
 def current_overlay_stamp(path: Path | None = None, *, force: bool = False) -> str | None:
-    """Return combined stamp `'native:<mtime>:<size>|native_sync:<…>|openclaw:<…>'` (throttled to 1 stat / 2s)."""
+    """Return combined stamp `'native:<mtime>:<size>|native_sync:<…>'` (throttled to 1 stat / 2s)."""
     global _LAST_STAT_AT, _LAST_STAMP
     if path is not None:
         part = _stat_part(path)
@@ -66,13 +64,7 @@ def current_overlay_stamp(path: Path | None = None, *, force: bool = False) -> s
         return _LAST_STAMP
     _LAST_STAT_AT = now
 
-    broker_on = is_broker_models_enabled()
-    parts: list[str] = []
-    for name, src_path in OVERLAY_SOURCES:
-        if name == "openclaw" and not broker_on:
-            parts.append(f"{name}:disabled")
-        else:
-            parts.append(f"{name}:{_stat_part(src_path)}")
+    parts = [f"{name}:{_stat_part(src_path)}" for name, src_path in OVERLAY_SOURCES]
     _LAST_STAMP = "|".join(parts)
     return _LAST_STAMP
 
@@ -83,8 +75,8 @@ def overlay_changed(previous_stamp: str | None, path: Path | None = None) -> boo
 
 
 def load_overlay_data(path: Path | None = None) -> dict[str, Any] | None:
-    """Load an overlay JSON file from disk (defaults to `openclaw_overlay.json`), returning None if absent/invalid."""
-    target = path or OVERLAY_PATH
+    """Load an overlay JSON file from disk (defaults to `native_overlay.json`), returning None if absent/invalid."""
+    target = path or NATIVE_OVERLAY_PATH
     if not target.exists():
         return None
     try:
@@ -222,11 +214,10 @@ def _drop_retired_models(
     rows from the manifest's per-provider model lists.
 
     Runs after every overlay source is merged, so it covers models defined in
-    the upstream manifest, `native_overlay.json`, the native-sync runtime
-    overlay, and `openclaw_overlay.json` alike — an upstream re-merge can never
-    bring a retired key back. A pricing row survives when a key that is not
-    retired still serves the same `model_id`, since the row prices that
-    survivor too.
+    the upstream manifest, `native_overlay.json`, and the native-sync runtime
+    overlay alike — an upstream re-merge can never bring a retired key back.
+    A pricing row survives when a key that is not retired still serves the
+    same `model_id`, since the row prices that survivor too.
     """
     manifest_models = manifest.get("models")
     dropped_pairs: list[tuple[str, str]] = []
@@ -292,7 +283,7 @@ def apply_model_overlay(
     manifest: dict[str, Any],
     path: Path | None = None,
 ) -> str | None:
-    """Merge Dalton overlays (`native_overlay.json` → native-sync runtime overlay → `openclaw_overlay.json`) into `llm_config` and `manifest`.
+    """Merge Dalton overlays (`native_overlay.json` → native-sync runtime overlay) into `llm_config` and `manifest`.
 
     Never overwrites existing upstream model keys or provider_config groups; logs an error and skips on collision.
     Afterwards the native overlays' retired keys are dropped (see
@@ -311,20 +302,16 @@ def apply_model_overlay(
             _merge_single_overlay(overlay, path.name, llm_config, manifest)
         return stamp
 
-    broker_on = is_broker_models_enabled()
     retired_records: list[dict[str, Any]] = []
     for name, src_path in OVERLAY_SOURCES:
-        if name == "openclaw" and not broker_on:
-            continue
         overlay = load_overlay_data(src_path)
         if overlay:
             _merge_single_overlay(overlay, name, llm_config, manifest)
-            if name in ("native", "native_sync"):
-                retired_records.extend(
-                    item
-                    for item in overlay.get("retired") or []
-                    if isinstance(item, dict)
-                )
+            retired_records.extend(
+                item
+                for item in overlay.get("retired") or []
+                if isinstance(item, dict)
+            )
     if retired_records:
         _drop_retired_models(retired_records, llm_config, manifest)
     _enforce_pinned_overlay_routes(llm_config)
@@ -332,7 +319,7 @@ def apply_model_overlay(
 
 
 def load_dalton_meta() -> dict[str, dict[str, Any]]:
-    """Return merged `dalton_meta` across `native_overlay.json`, the native-sync runtime overlay, and `openclaw_overlay.json` (P0N.1)."""
+    """Return merged `dalton_meta` across `native_overlay.json` and the native-sync runtime overlay (P0N.1)."""
     meta: dict[str, dict[str, Any]] = {}
 
     def _merge_meta_block(source: dict[str, Any] | None) -> None:
@@ -346,13 +333,4 @@ def load_dalton_meta() -> dict[str, dict[str, Any]]:
 
     _merge_meta_block(load_overlay_data(NATIVE_OVERLAY_PATH))
     _merge_meta_block(load_overlay_data(NATIVE_SYNC_OVERLAY_PATH))
-
-    if is_broker_models_enabled():
-        oc = load_overlay_data(OVERLAY_PATH)
-        if isinstance(oc, dict):
-            oc_models = oc.get("models") or {}
-            if isinstance(oc_models, dict):
-                for k, entry in oc_models.items():
-                    if isinstance(entry, dict) and isinstance(entry.get("dalton"), dict):
-                        meta.setdefault(str(k), copy.deepcopy(entry["dalton"]))
     return meta

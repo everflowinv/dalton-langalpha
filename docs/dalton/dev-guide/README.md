@@ -8,11 +8,11 @@
 |---|---|---|
 | `../blueprint.md` | 目标、设计原则、总体架构。**所有人先读** | 全体 |
 | `README.md`（本文） | 阶段、依赖、工作包、约定、决定记录、验收方式 | 全体 |
-| `P0-platform.md` | 本地环境、broker v2 模型接入、模型同步与同步按钮、本地日预算、原生界面验证 | 平台工程师、broker 工程师 |
+| `P0-platform.md` | 本地环境、broker v2 模型接入（`ocb-*` 对话模型已在 OC-5 移除，本文是历史搭建记录）、本地日预算、原生界面验证 | 平台工程师 |
 | `P0D-P1-data-and-onboarding.md` | researchdata 桥接、SEC 数据、来源记录；基金方法论 skill、覆盖名单、公司工作区初始化、旧认知迁移 | 数据工程师、内容工程师 |
 | `PK-knowledge-governance-autonomy.md` | 公司知识层、发布治理、自主研究议程、界面小改 | 后端工程师 |
 | `PS-analyst-skills-and-workflows.md` | 分析师的 skill、workflow、自动任务，以及验收样例 | 内容工程师 |
-| `P0N-native-models.md` | 模型改为以 LangAlpha 原生接入为默认路径；broker v2 保留为并行可选路径。**包含一个严重问题的修复：主模型用订阅登录时日预算被整个跳过（P0N.6）** | 平台工程师 |
+| `P0N-native-models.md` | 模型改为以 LangAlpha 原生接入为默认路径。文内“broker 不退役”已作废：`ocb-*` 目录在 OC-5 移除。**包含一个严重问题的修复：主模型用订阅登录时日预算被整个跳过（P0N.6）** | 平台工程师 |
 | `P0H-round2-fixes.md` | 第二轮代码审查后的修正指南：发布核验职责重新划分（代码不能独立判"有矛盾"）、修通自主议程、环境启动与真实运行证据门槛、开发流程硬性要求 | 全体，**当前这一轮先做这份** |
 | `P0G-review-fixes.md` | 第一轮代码审查（R1–R7）后的修正指南：按 8 个族派活，并规定这一轮的修法原则（语义判断交给便宜的 LLM，代码只管钱、凭据和算术） | 全体（已完成，原则继续有效） |
 | `P0F-acceptance-fixes.md` | 第一轮代码验收发现的 6 个问题和修正步骤 | 全体，**先做** |
@@ -48,7 +48,7 @@ OpenClaw（宿主机）
 
 LangAlpha（Docker / colima）
   ├─ 后端：主智能体、子智能体、workflow、自动任务、记忆
-  │    ├─ 模型：openclaw-broker 供应商（ocb-*）+ 原生 Claude 订阅登录（主模型可切换）
+  │    ├─ 模型：原生订阅与现金 API（ocb-* / openclaw-broker 已在 OC-5 移除）
   │    ├─ 本地日预算 LocalBudgetPort（P0.8）
   │    ├─ 知识层工具 knowledge_update / knowledge_append_verdict（PK.4）
   │    ├─ 发布工具 publish_report：数字核验 → 独立审稿 → PM 审批（PK.8–PK.13）
@@ -160,6 +160,7 @@ workflows/<name>/          initial-coverage、full-coverage、bullbear-doc、ear
 | O12 | 代码交给其他工程师写，lead 负责验收 |
 | O13 | 模型默认改为 LangAlpha 原生接入（Claude 订阅、ChatGPT 订阅、Antigravity、Muse、xAI，以及上游的 API key 供应商）。broker v2 **暂不退役**，作为并行可选的路径保留 |
 | O14 | owner 知晓并接受：原生的订阅接入是冒充官方命令行调用后台接口，违反条款、被限制的风险高于 OpenClaw 经 CLI 网关的用法 |
+| OC-5 | 2026-11-12：移除全部 `ocb-*` 对话模型，以及 overlay、同步按钮和 `models.broker.enabled`。OpenClaw 网关保留，用于 x_search、researchdata 和飞书。本表 O3、O13、L1、L2 里关于 broker 对话模型的句子由本行取代 |
 
 ### 6.2 lead 做出的技术决定
 

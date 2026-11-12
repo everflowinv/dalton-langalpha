@@ -12,7 +12,7 @@
 - 事件五词 JSON 统一为 `NO_CHANGE`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`、`NEW_THESIS`；md 和界面显示无变化、强化、削弱、证伪、新论点。
 - `publish_report` 新增 kind `bullbear`，`bullbear-doc` 用它发布。
 - PK 简化：直接修改知识文件不再被拦截或还原，改为本轮结束后检测并记成 `direct_edit` 版本，不合 schema 时给分析师加警告；草稿永不被阻止，核验只在发布时卡一次。各步相应措辞已改。
-- 模型键统一为 `ocb-<provider>-<model>`；CLI gateway 类模型只做纯文本角色（compaction、后台摘要、审稿人），不给用工具的子智能体；审稿家族由 `role_policy.family_of()` 判定。
+- 模型键用目录里的原生键（订阅 OAuth 或现金 API）。`ocb-*` 对话模型已在 OC-5 移除。审稿家族由 `role_policy.family_of()` 判定。
 - workflow 放仓库根 `workflows/<name>/workflow.js`，P0.1 的 compose overlay 已挂载 `./workflows`，改完重启后端即可，不必重建镜像。
 - 代码位置按 P0：Dalton 后端代码在 `src/dalton/`；工作区名就是 ticker（`META`），兄弟路径 `../META/`。
 - 本阶段只做美股；港股、A 股的深度支持移到 P6，相关步骤标“P6”。SPCX 留在 Core；美团代码 `3690.HK`；价格默认 yfinance（FMP 以后可选）。
@@ -64,7 +64,7 @@
   - `tools` 用的是“工具词”：`web`、`market_data`、`code`、`shell`（`src/ptc_agent/agent/subagents/merge.py: TOOL_WORDS`），也接受 Claude Code 工具名（`Bash` 对应 `code`+`shell`，`WebSearch`/`WebFetch` 对应 `web`）。**文件读写工具每个子智能体都有，不能用 `tools` 去掉。** 不写 `tools` 时绑定 Analyst 预设（`DEFAULT_CUSTOM_TOOLS`：web、market_data、code、shell）。
   - 子智能体没有只读开关：绑了 `filesystem` 工具组就可写（PK D5 已核实 `subagents/compiler.py`）。所以 PK 把**权威审稿放在服务端**：`publish_report` 内部用 `LLMService.complete` 调另一家族的模型，结论写数据库；`plugins/dalton/agents/dalton-reviewer.md`（PK.10 交付）只用于草稿期的自愿审阅，两处共用同一份 prompt。本文的 workflow 在草稿期派它做审阅，它的意见只用于修订，不能替代发布时的服务端审稿。
   - `knowledge_update` / `knowledge_append_verdict` / `publish_report` 只挂在主智能体上（`src/dalton/tools/`），**子智能体不能经工具写知识层、不能发布**（PK.4 (7)）。所以本文所有 workflow 的子智能体只写 `research/`、`drafts/`、`model/` 下的自由文件，并把知识层修改写成“修订草案”文件；由启动 skill 的主智能体在 workflow 结束后读草案、调用 `knowledge_update` 落库。子智能体如果直接改了 `data/*.json`，不会被拦截，PK.5 在本轮结束后检测并记一个 `direct_edit` 版本（不合 schema 时给分析师加警告），但这不是正规路径，提示词里要写明不要这样做。
-  - 子智能体的 `model`：用工具的子智能体（`dalton-evidence` 等）不写 `model`，跟随线程模型；绝不配 CLI gateway 类的 text-only 模型（`ocb-claude-cli-gateway-*`、antigravity、muse），那类模型只用于 compaction、后台摘要和审稿人（P0.6）。需要写死时只用 manifest 键（`ocb-<provider>-<model>` 或原生键）。
+  - 子智能体的 `model`：用工具的子智能体（`dalton-evidence` 等）不写 `model`，跟随线程模型。需要写死时只用目录里的原生模型键。`ocb-*` 对话模型已在 OC-5 移除。
 - 内置子智能体（`src/ptc_agent/agent/subagents/builtins.py`）：`research` 只有 `web_search` 和文件工具，**没有 `execute_code`，调不了 PTC 的 MCP 数据函数**；`general-purpose` 和 `equity-analyst` 有全套工具。凡是要调内部研究库、wiki、SEC、行情的取证支线，`agentType` 必须用 `general-purpose`、`equity-analyst` 或 Dalton 自己的取证子智能体，不能用 `research`。
 - Chief of Staff 角色（Home）不带 `equity-analyst` 子智能体，新研究交给工作区分析师（`delegate_to_analyst`）。
 
@@ -212,7 +212,7 @@ frontmatter 只写 `name` 和 `description`（随包 skill 不解析其他键）
 |---|---|---|
 | 渲染与投递 | 飞书分块写入、`feishu_grant_perm.sh`、Discord 不用表格、禁止 `$` 和 `~`（飞书 LaTeX/删除线）、`<url>` 包裹 | 删除。LangAlpha 渲染 Markdown；投递走自动任务 `delivery` 或 PK 定义的通知 |
 | 时间与批次上限 | 25 分钟硬杀、10/12/8 分钟检索上限、900 秒批次、每节落盘标记 `<!-- 已落盘 -->` | 删除。改用 workflow 的 `child_timeout` 和本地预算 |
-| 写死的模型 | `claude-cli-gateway/claude-opus-5-5`、`openai/gpt-6.1-sol`、`google/gemini-4-argon` 等 | 删除。lead 和子智能体模型由 P0.6 的角色配置决定（可切换）；草稿期审稿人模型写在 `plugins/dalton/agents/dalton-reviewer.md` 一处（manifest 键，如 `ocb-openai-gpt-6.1-sol`），发布时审稿人由 PK 的 `reviewer_models` 按 `role_policy.family_of()` 选 |
+| 写死的模型 | `claude-cli-gateway/claude-opus-5-5`、`openai/gpt-6.1-sol`、`google/gemini-4-argon` 等 | 删除。lead 和子智能体模型由 P0.6 的角色配置决定（可切换）；草稿期审稿人模型写在 `plugins/dalton/agents/dalton-reviewer.md` 一处（目录里的原生模型键，如 `gpt-6.1-sol-oauth`），发布时审稿人由 PK 的 `reviewer_models` 按 `role_policy.family_of()` 选。`ocb-*` 已在 OC-5 移除 |
 | 人名与账号 | Richard、Mark、Lumos、Eve、PM 的个人邮箱、飞书 folder token | 改成工作区配置（覆盖名单文件、PM 称呼），不写进 skill |
 | OpenClaw 运行时调用 | `sessions_spawn`、`sessions_yield`、`researchdata__*` 工具名、`data_gateway.py`、`NO_REPLY` | 换成 workflow `agent()` 和 P0D 的 MCP 函数 |
 | 本机特殊情况 | roic.ai 403、东财被封、Reddit 无路由、AlphaEngine 每日约 190 次额度 | 不写进方法；额度类约束由数据接口返回错误时处理 |
@@ -1962,7 +1962,7 @@ PM 随时提问（在公司工作区问分析师，或在 Home 问研究总监�
 **规则**
 1. 草稿期审稿人的回复文本是唯一采信的产物；审稿前后对成稿做 `sha256` 比对，不一致判审稿无效（子智能体没有只读开关，PK D5）。
 2. 草稿期审稿的 P0 必须在发布前处理完；`publish_report` 的服务端审稿给 `revise` 时，按其 `must_fix` 修改后重新调用（新的调用会建新请求，PK.11）。
-3. 草稿期审稿人模型在 PK.10 的 agent 文件里写成 manifest 键（如 `ocb-openai-gpt-6.1-sol`；lead 切换到其他家族时按 P0.6 换成不同家族的键，`role_policy.py` 会对同家族告警）；发布时的服务端审稿人由 PK 的 `reviewer_models` 列表按 `role_policy.family_of()` 选第一个与作者不同家族、且可用的模型。审稿是纯文本调用，可以用 text-only 的 CLI gateway 模型。本文所有 workflow 不覆盖它。
+3. 草稿期审稿人模型在 PK.10 的 agent 文件里写成目录里的原生模型键（如 `gpt-6.1-sol-oauth`；lead 切换到其他家族时换成不同家族的键，`role_policy.py` 会对同家族告警）；发布时的服务端审稿人由 PK 的 `reviewer_models` 列表按 `role_policy.family_of()` 选第一个与作者不同家族、且可用的模型。`ocb-*` 对话模型已在 OC-5 移除。本文所有 workflow 不覆盖审稿人选择。
 
 **验证方式** 在 PS.6 的流程里观察：草稿期审稿意见存在且被处理；服务端审稿 `review_unavailable` 时（例如临时停用审稿模型）草稿仍在 `drafts/` 可读、发布被拒。
 

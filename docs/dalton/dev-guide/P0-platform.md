@@ -2,6 +2,8 @@
 
 版本 0.3，2026-10-18。基座 LangAlpha main `8e0dce94`，分支 `dalton/main`。对应蓝图 §4.3（模型接入）、§4.9（本地预算）、§5 P0。
 
+> **OC-5（2026-11-12）：** 本文里的 broker 对话模型步骤不再执行。已删除 `ocb-*` 目录、`openclaw_catalog.py`、`openclaw_overlay.json`、`openclaw_overrides.yaml`、`broker_http.py`、`sync_openclaw_models.py`、`openclaw_smoke.py`、设置页同步按钮和 `llm-broker-client` 钩子。OpenClaw 网关仍用于 x_search、researchdata 和飞书。下文保留为当时的搭建记录。
+
 **修订记录 v0.3（2026-10-18，按 owner 与 lead 的决定统一修订）：**
 - 本地运行时改为 **colima**（4 CPU、5 GiB 内存，VM 磁盘和数据放 `/Volumes/EveSSD`），不再写 Docker Desktop；所有公司工作区共用一台 computer（一个沙箱，内存 3 GiB，空闲自动停）。Daytona 不用。可达性测试以 colima 为准（P0.1）。
 - compose overlay 增加挂载 `workflows/`（改 workflow 不用重建镜像）和 `config/dalton/`；backend 内存上限按 5 GiB VM 下调（P0.1）。

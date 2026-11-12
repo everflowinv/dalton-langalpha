@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--exclude-prefix",
         default="",
-        help="Optional model key prefix to exclude (e.g. 'ocb-').",
+        help="Optional model key prefix to exclude (e.g. 'grok-').",
     )
     args = parser.parse_args(argv)
 
@@ -32,16 +32,8 @@ def main(argv: list[str] | None = None) -> int:
         for k, v in sorted(cfg.llm_config.items())
         if not (prefix and k.startswith(prefix))
     }
-    flat_providers = {
-        k: v
-        for k, v in sorted(cfg._flat_providers.items())
-        if not (prefix and k == "openclaw-broker")
-    }
-    pricing_models = {
-        k: v
-        for k, v in sorted((cfg.manifest.get("models") or {}).items())
-        if not (prefix and k == "openclaw-broker")
-    }
+    flat_providers = dict(sorted(cfg._flat_providers.items()))
+    pricing_models = dict(sorted((cfg.manifest.get("models") or {}).items()))
 
     payload = {
         "llm_config": llm_config,

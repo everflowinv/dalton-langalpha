@@ -37,9 +37,9 @@ def test_the_data_map_render_inputs_are_registered_sources() -> None:
 
 
 def test_the_runtime_regenerated_overlay_is_not_a_prompt_source() -> None:
-    """``src/dalton/llm/openclaw_overlay.json`` is regenerated at runtime
-    (plan B5/D16① excludes it); hashing it would flip the digest on every
-    deploy's runtime state, not on a source change."""
+    """The OpenClaw broker overlay was removed in OC-5 and is not a prompt
+    source. Hashing a runtime catalog file would flip the digest on deploy
+    state rather than on a source change."""
     assert all("openclaw_overlay.json" not in p.parts for p in release._sources())
 
 

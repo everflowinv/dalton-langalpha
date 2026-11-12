@@ -27,11 +27,7 @@ from src.dalton.services.native_admin import (
     run_native_restore,
     run_native_sync,
 )
-from src.dalton.services.openclaw_admin import (
-    get_openclaw_status,
-    probe_health,
-    run_sync,
-)
+from src.dalton.services.openclaw_admin import probe_health
 from src.dalton.services.provider_status import (
     get_available_models_report,
     get_providers_status,
@@ -43,11 +39,6 @@ from src.server.utils.api import CurrentUserId, handle_api_exceptions
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/dalton", tags=["Dalton"])
-
-
-class OpenClawSyncRequest(BaseModel):
-    dry_run: bool = False
-    force: bool = False
 
 
 class NativeModelSyncRequest(BaseModel):
@@ -182,27 +173,10 @@ async def _verify_workspace_access(workspace_id: str, user_id: str) -> dict[str,
 
 
 # ---------------------------------------------------------------------------
-# P0.7: OpenClaw Broker v2 Model Sync, Status & Health
+# Deployment identity. The path stays `/openclaw/health` because real-run
+# preflight reads git_sha / is_pm / deployment from it. Broker model sync
+# was removed with the ocb-* catalog (OC-5).
 # ---------------------------------------------------------------------------
-
-
-@router.post("/openclaw/models/sync")
-@handle_api_exceptions("sync openclaw models", logger)
-async def sync_openclaw_models_endpoint(
-    body: OpenClawSyncRequest,
-    user_id: CurrentUserId,
-) -> dict[str, Any]:
-    _require_pm_user(user_id)
-    return await run_sync(user_id=user_id, dry_run=body.dry_run, force=body.force)
-
-
-@router.get("/openclaw/models/status")
-@handle_api_exceptions("get openclaw models status", logger)
-async def get_openclaw_models_status_endpoint(
-    user_id: CurrentUserId,
-) -> dict[str, Any]:
-    _require_dalton_enabled()
-    return await get_openclaw_status()
 
 
 @router.get("/openclaw/health")

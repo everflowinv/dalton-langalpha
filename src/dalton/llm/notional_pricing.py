@@ -121,29 +121,6 @@ def build_notional_price_index(
     loader = overlay_loader or _overlay_mod.load_overlay_data
     out: dict[str, dict[str, Any]] = {}
 
-    overlay = loader() or {}
-    models_map = overlay.get("models") or {}
-    prov_models = ((overlay.get("providers") or {}).get("models") or {}).get(
-        "openclaw-broker", []
-    )
-    by_ref: dict[str, dict[str, Any]] = {}
-    for pm in prov_models:
-        if isinstance(pm, dict) and pm.get("id"):
-            by_ref[str(pm["id"])] = pm
-
-    for key, mcfg in models_map.items():
-        if not isinstance(mcfg, dict):
-            continue
-        ref = str(mcfg.get("model_id") or "")
-        pm = by_ref.get(ref) or {}
-        np = pm.get("notional_pricing")
-        if isinstance(np, dict):
-            card = normalize_notional_card(np)
-            if card is not None:
-                out[str(key)] = card
-                if ref:
-                    out[ref] = card
-
     try:
         from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
 
@@ -190,7 +167,6 @@ def is_subscription_model(
     *,
     pricing_model_id: str | None = None,
     pricing_provider: str | None = None,
-    overlay_loader: Callable[..., dict[str, Any]] | None = None,
 ) -> bool:
     """Return True when the model or route uses subscription/OAuth billing."""
     if billing_type == "oauth" or model_name.endswith("-oauth"):
@@ -216,25 +192,6 @@ def is_subscription_model(
         oauth_meta = dalton_meta.get(f"{candidate}-oauth")
         if isinstance(oauth_meta, dict) and str(oauth_meta.get("billing") or "") == "subscription":
             return True
-
-    if model_name.startswith("ocb-"):
-        try:
-            loader = overlay_loader or _overlay_mod.load_overlay_data
-            overlay = loader() or {}
-            mcfg = (overlay.get("models") or {}).get(model_name)
-            if isinstance(mcfg, dict):
-                ref = str(mcfg.get("model_id") or "")
-                prov_models = ((overlay.get("providers") or {}).get("models") or {}).get(
-                    "openclaw-broker", []
-                )
-                for pm in prov_models:
-                    if isinstance(pm, dict) and str(pm.get("id")) == ref:
-                        if (pm.get("pricing") or {}).get("pricing_type") == "subscription" or (
-                            pm.get("dalton") or {}
-                        ).get("billing") == "subscription":
-                            return True
-        except Exception:
-            pass
 
     return False
 

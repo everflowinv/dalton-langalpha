@@ -36,11 +36,21 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/notional_pricing.py", "-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{candidate}-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{identity}-oauth"): "Nominal pricing model reference normalization",
-    ("llm/notional_pricing.py", "ocb-"): "Nominal pricing model reference normalization",
     # The two Grok keys Dalton pins to its own xai-oauth line
     # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entries on grok-oauth).
     ("llm/overlay.py", "grok-4.7-oauth"): "Pinned overlay route key",
     ("llm/overlay.py", "grok-4.3-oauth"): "Pinned overlay route key",
+    # Vendor-family prefixes moved out of the removed broker catalog (OC-5).
+    ("llm/model_family.py", "-oauth"): "Strip -oauth before the family prefix match",
+    ("llm/model_family.py", "claude-"): "Claude family prefix",
+    ("llm/model_family.py", "deepseek"): "DeepSeek family name",
+    ("llm/model_family.py", "deepseek-"): "DeepSeek family prefix",
+    ("llm/model_family.py", "gemini-"): "Gemini family prefix",
+    ("llm/model_family.py", "glm-"): "GLM family prefix",
+    ("llm/model_family.py", "gpt-"): "GPT family prefix",
+    ("llm/model_family.py", "gpt-oss-"): "GPT-OSS family prefix, matched before gpt-",
+    ("llm/model_family.py", "grok-"): "Grok family prefix",
+    ("llm/model_family.py", "muse-"): "Muse family prefix",
     # OC-5 search tools: the upstream search models mirror OpenClaw's own settings
     # (tools.web.search via Gemini API, xSearch.model); they are tool backends,
     # not conversation model selection. web_search.model in agent_config overrides.
@@ -71,9 +81,6 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/native_compaction_lines.py", "grok-oauth"): "OAuth provider ID in native compaction route table",
     ("llm/native_compaction_lines.py", "muse-oauth"): "OAuth provider ID in native compaction route table",
     ("llm/native_compaction_lines.py", "xai-oauth"): "OAuth provider ID in native compaction route table",
-    ("llm/openclaw_catalog.py", "claude-cli-gateway"): "OpenClaw gateway provider identifier",
-    ("llm/openclaw_catalog.py", "deepseek"): "Model family name in openclaw_catalog family table",
-    ("llm/openclaw_catalog.py", "muse-cli-gateway"): "OpenClaw gateway provider identifier",
     ("llm/overlay.py", "antigravity-oauth"): "Native OAuth provider ID in catalog overlay merge",
     ("llm/overlay.py", "claude-oauth"): "Native OAuth provider ID in catalog overlay merge",
     ("llm/overlay.py", "codex-oauth"): "Native OAuth provider ID in catalog overlay merge",
@@ -92,11 +99,9 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/providers/xai_grok/client.py", "xai-oauth"): "Provider key for error tagging",
     ("llm/providers/xai_grok/oauth.py", "xai-oauth"): "OAuth token storage provider key",
     ("llm/role_policy.py", "antigravity-oauth"): "Provider ID in availability/family checks",
-    ("llm/role_policy.py", "claude-cli-gateway"): "OpenClaw gateway provider identifier",
     ("llm/role_policy.py", "claude-oauth"): "Provider ID in availability/family checks",
     ("llm/role_policy.py", "codex-oauth"): "Provider ID in availability/family checks",
     ("llm/role_policy.py", "deepseek"): "Model family name and provider ID in family_of()",
-    ("llm/role_policy.py", "muse-cli-gateway"): "OpenClaw gateway provider identifier",
     ("llm/role_policy.py", "muse-oauth"): "Provider ID in availability/family checks",
     ("llm/role_policy.py", "xai-oauth"): "Provider ID in availability/family checks",
     ("publish/review.py", "deepseek"): "Model family name in review.py family_of()",
@@ -115,19 +120,7 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("budget/service.py", "gpt-"): "Model family prefix check (.startswith('gpt-'))",
     ("budget/service.py", "grok-"): "Model family prefix check (.startswith('grok-'))",
     ("budget/service.py", "muse-"): "Model family prefix check (.startswith('muse-'))",
-    ("budget/service.py", "ocb-"): "Broker model prefix check (.startswith('ocb-'))",
     ("llm/complete.py", "-oauth"): "OAuth model suffix check (.endswith('-oauth'))",
-    ("llm/complete.py", "ocb-"): "Broker model prefix check (.startswith('ocb-'))",
-    ("llm/openclaw_catalog.py", "-oauth"): "OAuth model suffix check in catalog builder",
-    ("llm/openclaw_catalog.py", "claude-"): "Claude family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "deepseek-"): "DeepSeek family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "gemini-"): "Gemini family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "glm-"): "GLM family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "gpt-"): "GPT family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "gpt-oss-"): "GPT-OSS family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "grok-"): "Grok family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "muse-"): "Muse family prefix in catalog family table",
-    ("llm/openclaw_catalog.py", "ocb-"): "Broker catalog prefix construction",
     ("llm/providers/antigravity/client.py", "-oauth"): "Strip -oauth suffix to derive upstream model_id",
     ("llm/providers/antigravity/client.py", "claude-"): "Detect Antigravity-hosted Claude family prefix",
     ("llm/providers/antigravity/client.py", "gemini-3-"): "Detect Gemini 3 thinking parameter prefix",
@@ -150,7 +143,6 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/role_policy.py", "gpt-"): "OpenAI GPT family prefix in _FAMILY_PREFIX_RULES",
     ("llm/role_policy.py", "grok-"): "xAI Grok family prefix in _FAMILY_PREFIX_RULES",
     ("llm/role_policy.py", "muse-"): "Meta Muse family prefix in _FAMILY_PREFIX_RULES",
-    ("llm/role_policy.py", "ocb-"): "OpenClaw broker prefix in family_of() / select_independent_reviewer()",
     ("publish/review.py", "-oauth"): "OAuth suffix strip in review.py family_of()",
     ("publish/review.py", "claude-"): "Claude family prefix in review.py family_of()",
     ("publish/review.py", "deepseek-"): "DeepSeek family prefix in review.py family_of()",
@@ -159,9 +151,7 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("publish/review.py", "gpt-"): "GPT family prefix in review.py family_of()",
     ("publish/review.py", "grok-"): "Grok family prefix in review.py family_of()",
     ("publish/review.py", "muse-"): "Muse family prefix in review.py family_of()",
-    ("publish/review.py", "ocb-"): "Broker prefix strip in review.py family_of()",
     ("services/provider_status.py", "-oauth"): "OAuth suffix check in provider_status",
-    ("services/provider_status.py", "ocb-"): "Broker prefix check in provider_status",
     # OAuth protocol User-Agent headers & Redis cache key prefixes (not model names)
     ("database/muse_tokens.py", "muse-api-key:invalid"): "Redis invalidation flag key for Muse API key",
     ("llm/providers/claude_oauth/oauth.py", "claude-cli/2.1.63 (external, cli)"): "Required Claude CLI OAuth User-Agent header",
@@ -658,11 +648,6 @@ async def test_provider_status_uses_dalton_model_pref_for_assist_and_reviewer_ro
     )
     monkeypatch.setattr(
         ps_mod,
-        "is_broker_models_enabled",
-        create_autospec(ps_mod.is_broker_models_enabled, return_value=False),
-    )
-    monkeypatch.setattr(
-        ps_mod,
         "explain_model_availability",
         create_autospec(
             ps_mod.explain_model_availability,
@@ -672,7 +657,6 @@ async def test_provider_status_uses_dalton_model_pref_for_assist_and_reviewer_ro
                 "grok-4.7-oauth": {"available": True},
                 "deepseek-flash": {"available": True},
                 "gpt-6.1-sol-oauth": {"available": True},
-                "ocb-xai-grok-4.7": {"available": True},
             },
         ),
     )
@@ -1134,4 +1118,72 @@ async def test_dalton_language_model_resolves_user_pref_then_fallback(
         await mp_mod.resolve_dalton_language_model("user-member")
         == settings_mod.get_dalton_settings().publish.audit_model
     )
+
+
+@pytest.mark.asyncio
+async def test_catalog_missing_model_pref_resolves_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A saved name that is not in the catalog, such as leftover ``ocb-xxx``, is unset.
+
+    The user's value is skipped, then the PM holder's, then ``dalton.yaml``.
+    A timeout stored beside the stale model is left alone. ``publish/language.py``
+    passes the resolved name into ``assist_json``; that call skips its fallback
+    list when the caller supplies a model, so the name must already be the default.
+    """
+    prefs_by_user: dict[str, dict[str, Any]] = {
+        "user-member": {
+            "model_preference": {
+                "dalton_language_model": "ocb-xxx",
+                "dalton_audit_timeout_s": 240,
+            }
+        },
+        "user-pm-holder": {
+            "model_preference": {
+                "dalton_language_model": "ocb-xxx",
+                "dalton_audit_model": "ocb-xxx",
+                "dalton_audit_fallback_models": ["ocb-xxx"],
+            }
+        },
+    }
+
+    async def _fake_get_prefs(uid: str) -> dict[str, Any] | None:
+        return prefs_by_user.get(uid)
+
+    monkeypatch.setattr(
+        mp_mod,
+        "get_user_preferences",
+        create_autospec(mp_mod.get_user_preferences, side_effect=_fake_get_prefs),
+    )
+    monkeypatch.setattr(
+        mp_mod,
+        "get_team_credential_holder_id",
+        create_autospec(mp_mod.get_team_credential_holder_id, return_value="user-pm-holder"),
+    )
+
+    assert (
+        await mp_mod.resolve_dalton_language_model("user-member")
+        == mp_mod.dalton_model_default("dalton_language_model")
+    )
+    assert (
+        await mp_mod.resolve_dalton_audit_model("user-member")
+        == mp_mod.dalton_model_default("dalton_audit_model")
+    )
+    assert await mp_mod.resolve_dalton_audit_fallback_models("user-member") == list(
+        mp_mod.dalton_model_default("dalton_audit_fallback_models") or []
+    )
+    assert await mp_mod.dalton_model_pref("user-member", "dalton_audit_timeout_s") == 240
+
+    prefs_by_user["user-pm-holder"]["model_preference"]["dalton_language_model"] = (
+        "grok-4.7-oauth"
+    )
+    assert await mp_mod.resolve_dalton_language_model("user-member") == "grok-4.7-oauth"
+
+    prefs_by_user["user-member"]["model_preference"]["dalton_audit_fallback_models"] = [
+        "ocb-xxx",
+        "grok-4.7-oauth",
+    ]
+    assert await mp_mod.resolve_dalton_audit_fallback_models("user-member") == [
+        "grok-4.7-oauth"
+    ]
 

@@ -2,6 +2,8 @@
 
 最后更新：2026-10-21
 
+OC-5（2026-11-12）：`ocb-*` 对话模型目录、overlay 和设置页同步已从代码移除。下表各行是当时的进度记录，不改状态。
+
 本文件按 `docs/dalton/dev-guide/README.md`、`P0J-round4-fixes.md`、`P0I-round3-fixes.md`、`P0H-round2-fixes.md`、`P0G-review-fixes.md`、`P0N-native-models.md`、`P0F-acceptance-fixes.md` 的工作包与步骤实时记录开发进展、分支与提交 SHA、【待验证】项的实测结论、以及已落地的上游 `DALTON-HOOK` 挂钩。
 
 状态三级标记（按 `P0F.5` 与 `L37`、`L38`、`L39`–`L43` 规范）：

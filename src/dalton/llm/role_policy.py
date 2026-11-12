@@ -7,9 +7,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-from src.dalton.llm.openclaw_catalog import FAMILY_PREFIX_TABLE, infer_family_from_model_id
-from src.dalton.llm.overlay import load_dalton_meta, load_overlay_data
-from src.dalton.settings import get_disabled_providers, is_broker_models_enabled
+from src.dalton.llm.model_family import infer_family_from_model_id
+from src.dalton.llm.overlay import load_dalton_meta
+from src.dalton.settings import get_disabled_providers
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LATEST_NATIVE_SMOKE_PATH = REPO_ROOT / "var" / "dalton" / "smoke" / "latest_native.json"
@@ -21,27 +21,6 @@ _OAUTH_PROVIDER_TOKEN_KEYS: dict[str, str] = {
     "muse-oauth": "muse-oauth",
     "xai-oauth": "xai-oauth",
 }
-
-
-def _overlay_provider_index() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Return `(by_key, by_ref)` of provider model entries from `openclaw_overlay.json`."""
-    overlay = load_overlay_data() or {}
-    models_map = overlay.get("models") or {}
-    prov_models = ((overlay.get("providers") or {}).get("models") or {}).get(
-        "openclaw-broker", []
-    )
-    by_ref: dict[str, dict[str, Any]] = {}
-    for pm in prov_models:
-        if isinstance(pm, dict) and pm.get("id"):
-            by_ref[str(pm["id"])] = pm
-
-    by_key: dict[str, dict[str, Any]] = {}
-    for key, mcfg in models_map.items():
-        if isinstance(mcfg, dict):
-            ref = str(mcfg.get("model_id") or "")
-            if ref in by_ref:
-                by_key[str(key)] = by_ref[ref]
-    return by_key, by_ref
 
 
 def _merged_model_entry(model_key: str) -> dict[str, Any] | None:
@@ -61,9 +40,9 @@ def family_of(model_key: str | None) -> str:
     """Return canonical underlying vendor family for `model_key` (P0N.5 L20).
 
     Lookup order:
-    1. `load_dalton_meta()[key]["family"]` (includes both native_overlay and openclaw_overlay)
+    1. `load_dalton_meta()[key]["family"]` (native overlay and native-sync overlay)
     2. Merged `ModelConfig.get_model_config(key)["model_id"]` via `infer_family_from_model_id`
-    3. `key` itself via `infer_family_from_model_id` (including `ocb-` prefix handling)
+    3. `key` itself via `infer_family_from_model_id`
     4. `'unknown'`
     """
     if not model_key:
@@ -79,16 +58,6 @@ def family_of(model_key: str | None) -> str:
         if fam and str(fam) != "unknown":
             return str(fam)
 
-    by_key, by_ref = _overlay_provider_index()
-    if key in by_key:
-        fam = (by_key[key].get("dalton") or {}).get("family")
-        if fam and str(fam) != "unknown":
-            return str(fam)
-    if key in by_ref:
-        fam = (by_ref[key].get("dalton") or {}).get("family")
-        if fam and str(fam) != "unknown":
-            return str(fam)
-
     # 2. Merged ModelConfig model_id
     mcfg = _merged_model_entry(key)
     if isinstance(mcfg, dict):
@@ -98,14 +67,7 @@ def family_of(model_key: str | None) -> str:
             if inferred != "unknown":
                 return inferred
 
-    # 3. Key itself (including ocb-<provider>-<model>)
-    if key.startswith("ocb-"):
-        rest = key[4:].lower()
-        for prefix, _fam in FAMILY_PREFIX_TABLE:
-            idx = rest.find(prefix)
-            if idx != -1:
-                return infer_family_from_model_id(rest[idx:])
-
+    # 3. Key itself
     return infer_family_from_model_id(key)
 
 
@@ -132,13 +94,6 @@ def is_text_only(model_key: str | None) -> bool:
         if "tool_calling" in meta_map[key] and not bool(meta_map[key]["tool_calling"]):
             return True
 
-    by_key, by_ref = _overlay_provider_index()
-    entry = by_key.get(key) or by_ref.get(key)
-    if entry is not None:
-        dalton_meta = entry.get("dalton") or {}
-        if "tool_calling" in dalton_meta:
-            return not bool(dalton_meta["tool_calling"])
-
     # Check latest_native.json smoke results (N3 == "fail" -> text-only)
     native_smoke = _load_latest_native_smoke()
     smoke_entry = native_smoke.get(key)
@@ -147,10 +102,6 @@ def is_text_only(model_key: str | None) -> bool:
         if isinstance(checks, dict) and checks.get("N3") == "fail":
             return True
 
-    lower = key.lower()
-    for text_only_gw in ("claude-cli-gateway", "antigravity-cli-gateway", "muse-cli-gateway"):
-        if text_only_gw in lower:
-            return True
     return False
 
 
@@ -183,7 +134,6 @@ async def explain_model_availability(
     llm_cfg = mc.llm_config or {}
     flat_providers = mc.flat_providers or {}
     disabled = get_disabled_providers()
-    broker_enabled = is_broker_models_enabled()
     meta_map = load_dalton_meta()
 
     # Query OAuth connection states for the subscription providers. Availability
@@ -254,25 +204,21 @@ async def explain_model_availability(
             reasons.append("hidden")
         if provider in disabled or (parent_provider and parent_provider in disabled):
             reasons.append("provider_disabled")
-        if provider == "openclaw-broker" or key.startswith("ocb-"):
-            if not broker_enabled:
-                reasons.append("broker_disabled")
+        access_type = str(prov_info.get("access_type") or "")
+        if access_type == "oauth" or provider in _OAUTH_PROVIDER_TOKEN_KEYS:
+            if not oauth_connected.get(provider, False):
+                reasons.append("oauth_not_connected")
         else:
-            access_type = str(prov_info.get("access_type") or "")
-            if access_type == "oauth" or provider in _OAUTH_PROVIDER_TOKEN_KEYS:
-                if not oauth_connected.get(provider, False):
-                    reasons.append("oauth_not_connected")
+            env_key = str(prov_info.get("env_key") or "")
+            has_env = bool(env_key and os.environ.get(env_key, "").strip())
+            if access_type == "coding_plan" or provider == "z-ai-cn-coding":
+                has_byok = provider in byok_providers
             else:
-                env_key = str(prov_info.get("env_key") or "")
-                has_env = bool(env_key and os.environ.get(env_key, "").strip())
-                if access_type == "coding_plan" or provider == "z-ai-cn-coding":
-                    has_byok = provider in byok_providers
-                else:
-                    has_byok = provider in byok_providers or (
-                        parent_provider and parent_provider in byok_providers
-                    )
-                if env_key and not (has_env or has_byok):
-                    reasons.append("api_key_missing")
+                has_byok = provider in byok_providers or (
+                    parent_provider and parent_provider in byok_providers
+                )
+            if env_key and not (has_env or has_byok):
+                reasons.append("api_key_missing")
 
         if require_tool_calling and is_text_only(key):
             reasons.append("text_only")
@@ -313,7 +259,6 @@ def _select_independent_reviewer_from_candidates(
         return None
 
     disabled_providers = get_disabled_providers()
-    by_key, _ = _overlay_provider_index()
 
     for cand in candidates:
         if is_forbidden_for_roles(cand):
@@ -332,11 +277,6 @@ def _select_independent_reviewer_from_candidates(
                 continue
         if available_models is not None and cand not in available_models:
             continue
-        if cand.startswith("ocb-"):
-            if not is_broker_models_enabled():
-                continue
-            if by_key and cand not in by_key:
-                continue
         return cand
     return None
 

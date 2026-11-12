@@ -62,7 +62,7 @@ def test_journal_dump_normalize_rows_and_strip_body_fields() -> None:
             "scope_ref": "user:realrun-g1-user",
             "purpose": "audit.judge",
             "model_key": "gpt-6-astra",
-            "provider": "openclaw-broker",
+            "provider": "deepseek",
             "billing_type": "subscription",
             "state": "done",
             "attempt": 1,
@@ -86,8 +86,8 @@ def test_journal_dump_normalize_rows_and_strip_body_fields() -> None:
             "user_id": "realrun-g1-user",
             "scope_ref": "user:realrun-g1-user",
             "purpose": "audit.label_figures",
-            "model_key": "ocb-deepseek-deepseek-flash",
-            "provider": "openclaw-broker",
+            "model_key": "deepseek-flash",
+            "provider": "deepseek",
             "billing_type": "cash",
             "state": "done",
             "attempt": 1,
@@ -1357,7 +1357,10 @@ def test_j5a_realrun_script_fixes_g5_callback_ordering_and_g2_schema(
     repo_root = Path(__file__).resolve().parents[3]
     g2_src = (repo_root / "scripts" / "dalton" / "realrun" / "g2_providers.py").read_text(encoding="utf-8")
     assert "/api/v1/dalton/budget/task-caps/workspace/{sample_ws_id}" in g2_src
-    assert 'json_body={"dry_run": True}' in g2_src
+    assert '"/api/v1/dalton/diagnostics/browser-memory"' in g2_src
+    assert "Expected diagnostics/browser-memory to return 200 for PM" in g2_src
+    assert "st_b_gate == 403" in g2_src
+    assert "Expected diagnostics/browser-memory to return 403 for non-PM" in g2_src
     assert "claude-sonnet-5-5-low-oauth" in g2_src
     sample_thesis = {
         "schema_version": 1,

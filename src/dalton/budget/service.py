@@ -89,7 +89,6 @@ def _is_subscription_model(
         billing_type,
         pricing_model_id=pricing_model_id,
         pricing_provider=pricing_provider,
-        overlay_loader=load_overlay_data,
     )
     if is_sub and billing_type != "oauth":
         if (
@@ -226,7 +225,6 @@ def _resolve_provider_for_model(
         if resolved != "unknown" and (
             billing_type != "oauth"
             or resolved == "z-ai-cn-coding"
-            or resolved == "openclaw-broker"
             or resolved.endswith("-oauth")
         ):
             return resolved
@@ -240,8 +238,6 @@ def _resolve_provider_for_model(
             return str(prov)
     except Exception:
         pass
-    if model_name.startswith("ocb-"):
-        return "openclaw-broker"
     if model_name.endswith("-oauth"):
         if model_name.startswith("claude-"):
             return "claude-oauth"

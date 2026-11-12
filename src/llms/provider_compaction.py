@@ -79,11 +79,11 @@ def native_compaction_kind(
     """
     if not entry or not provider:
         return None
-    # DALTON-HOOK(native-compaction-lines): Dalton's OAuth/subscription and
-    # broker relays stay off the offer, whatever the SDK family says.
+    # DALTON-HOOK(native-compaction-lines): Dalton's OAuth/subscription
+    # relays stay off the offer, whatever the SDK family says.
     from src.dalton.llm.native_compaction_lines import native_compaction_disabled
 
-    if native_compaction_disabled(entry.get("provider")) or provider.get("dalton_broker"):
+    if native_compaction_disabled(entry.get("provider")):
         return None
     sdk = provider.get("sdk")
     access = provider.get("access_type")

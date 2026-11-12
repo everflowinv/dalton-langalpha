@@ -23,7 +23,6 @@ from src.dalton.llm.complete import (
     JournalIndeterminate,
     dalton_complete,
 )
-from src.dalton.llm.openclaw_catalog import build_overlay
 from src.dalton.llm.role_policy import check_roles, family_of
 from src.server.services.llm.service import LLMService
 
@@ -597,218 +596,14 @@ def test_build_local_run_gate():
 
 
 def test_family_of_and_role_policy():
-    assert family_of("ocb-openai-gpt-5.4") == "openai-gpt"
-    assert family_of("ocb-openai-codex-gpt-5.4-codex") == "openai-gpt"
-    assert family_of("ocb-claude-cli-gateway-claude-opus-5-5") == "anthropic-claude"
-    assert family_of("ocb-google-gemini-3.8-pro") == "google-gemini"
-    assert family_of("ocb-xai-grok-4.7") == "xai-grok"
+    assert family_of("gpt-5.4") == "openai-gpt"
+    assert family_of("gpt-5.4-codex") == "openai-gpt"
+    assert family_of("claude-opus-5-5") == "anthropic-claude"
+    assert family_of("gemini-3.8-pro") == "google-gemini"
+    assert family_of("grok-4.7") == "xai-grok"
 
     res = check_roles()
     assert isinstance(res, list)
-
-
-def test_openclaw_catalog_tiered_pricing_and_discrepancy():
-    catalog = {
-        "meta": {"brokerVersion": "2.0.0", "openclawVersion": "2026.10.4"},
-        "data": [
-            {
-                "ref": "google/gemini-3.8-flash",
-                "provider": "google",
-                "name": "Gemini 3.8 Flash",
-                "api": "google-generative-ai",
-                "contextWindow": 1000000,
-                "maxTokens": 65536,
-                "reasoning": True,
-                "input": ["text", "image"],
-                "toolCalling": True,
-                "billing": "cash",
-                "cost": {
-                    "input": 0.75,
-                    "output": 3.75,
-                    "cacheRead": 0.075,
-                },
-            },
-            {
-                "ref": "openai/gpt-5.4",
-                "provider": "openai",
-                "name": "GPT 5.4",
-                "api": "openai-responses",
-                "contextWindow": 1050000,
-                "maxTokens": 128000,
-                "reasoning": True,
-                "input": ["text", "image"],
-                "toolCalling": True,
-                "billing": "cash",
-                "cost": {
-                    "input": 2.5,
-                    "output": 15.0,
-                    "cacheRead": 0.25,
-                    "tieredPricing": [
-                        {
-                            "range": [0, 272001],
-                            "input": 2.5,
-                            "output": 15.0,
-                            "cacheRead": 0.25,
-                        },
-                        {
-                            "range": [272001, -1],
-                            "input": 5.0,
-                            "output": 22.5,
-                            "cacheRead": 0.5,
-                        },
-                    ],
-                },
-            },
-        ],
-    }
-    v1_rate_cards = {
-        "google/gemini-3.8-flash": {
-            "rateCard": {
-                "input": 1.5,
-                "output": 7.5,
-            }
-        },
-        "openai/gpt-5.4": {
-            "rateCard": {
-                "input": 2.5,
-                "output": 15.0,
-            }
-        },
-    }
-    overlay = build_overlay(
-        catalog=catalog,
-        overrides={},
-        v1_rate_cards=v1_rate_cards,
-    )
-    prov_models = {
-        m["id"]: m for m in overlay["providers"]["models"]["openclaw-broker"]
-    }
-    flash = prov_models["google/gemini-3.8-flash"]
-    # Conservative max between 0.75 and 1.5 is 1.5
-    assert flash["pricing"]["input"] == 1.5
-    assert flash["pricing"]["output"] == 7.5
-    assert len(overlay["meta"]["price_discrepancies"]) >= 1
-
-    gpt = prov_models["openai/gpt-5.4"]
-    in_tiers = gpt["pricing"]["input_tiers"]
-    assert len(in_tiers) == 2
-    assert in_tiers[0]["max_tokens"] == 272000
-    assert in_tiers[1]["rate"] == 5.0
-
-
-@pytest.mark.asyncio
-async def test_openclaw_grok_subscription_overrides_and_non_cash_cost():
-    from src.dalton.llm.complete import (
-        compute_call_costs,
-        resolve_model_billing_and_provider,
-    )
-    from src.dalton.llm.openclaw_catalog import OVERLAY_PATH, load_overrides
-    from src.dalton.llm.overlay import load_overlay_data as _orig_load_overlay_data
-    from src.dalton.services.openclaw_admin import get_openclaw_status
-    from src.llms.llm import LLM
-
-    priced_refs = (
-        "xai/grok-4.7",
-        "xai/grok-4.3",
-        "xai/grok-build-0.1",
-    )
-    grok_refs = (*priced_refs, "xai/grok-4.7-build-fast")
-    catalog = {
-        "meta": {"brokerVersion": "0.2.0", "openclawVersion": "2026.10.21"},
-        "data": [
-            *[
-                {
-                    "ref": ref,
-                    "provider": "xai",
-                    "name": ref,
-                    "api": "openai-responses",
-                    "contextWindow": 500000,
-                    "maxTokens": 128000,
-                    "reasoning": True,
-                    "input": ["text"],
-                    "toolCalling": True,
-                    "cost": {"input": 2.0, "output": 6.0, "cacheRead": 0.5},
-                }
-                for ref in priced_refs
-            ],
-            {
-                "ref": "xai/grok-4.7-build-fast",
-                "provider": "xai",
-                "name": "Grok 4.7 Build Fast",
-                "api": "openai-responses",
-                "contextWindow": 256000,
-                "maxTokens": 64000,
-                "reasoning": True,
-                "input": ["text"],
-                "toolCalling": True,
-                "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
-            },
-        ],
-    }
-    overlay = build_overlay(catalog=catalog, overrides=load_overrides())
-    prov_models = {
-        m["id"]: m for m in overlay["providers"]["models"]["openclaw-broker"]
-    }
-    for ref in grok_refs:
-        pm = prov_models[ref]
-        assert pm["dalton"]["billing"] == "subscription"
-        assert pm["pricing"]["pricing_type"] == "subscription"
-
-    for ref in priced_refs:
-        assert prov_models[ref]["notional_pricing"]["input"] == 2.0
-
-    assert prov_models["xai/grok-4.7-build-fast"]["notional_pricing"] is None
-    assert overlay["models"]["ocb-xai-grok-4.7-build-fast"]["visible"] is True
-
-    def _fake_load_overlay(path=None):
-        if path is None or path == OVERLAY_PATH:
-            return overlay
-        return _orig_load_overlay_data(path)
-
-    with (
-        patch("src.dalton.services.openclaw_admin.load_overlay_data", side_effect=_fake_load_overlay),
-        patch("src.dalton.llm.complete.load_overlay_data", side_effect=_fake_load_overlay),
-        patch("src.dalton.budget.service.load_overlay_data", side_effect=_fake_load_overlay),
-        patch("src.dalton.llm.overlay.load_overlay_data", side_effect=_fake_load_overlay),
-    ):
-        LLM._model_config = None
-        try:
-            status = await get_openclaw_status()
-            by_key = {m["key"]: m for m in status["models"]}
-            for key in (
-                "ocb-xai-grok-4.7",
-                "ocb-xai-grok-4.3",
-                "ocb-xai-grok-build-0.1",
-                "ocb-xai-grok-4.7-build-fast",
-            ):
-                assert by_key[key]["subscription"] is True
-
-            billing_type, provider = resolve_model_billing_and_provider("ocb-xai-grok-4.7")
-            assert billing_type == "oauth"
-            assert provider == "openclaw-broker"
-            cash_usd, notional_usd = compute_call_costs(
-                "ocb-xai-grok-4.7",
-                billing_type,
-                {"input_tokens": 1000, "output_tokens": 500, "cached_tokens": 0},
-            )
-            assert cash_usd == Decimal("0")
-            assert notional_usd == Decimal("0.005000")
-
-            fast_billing, fast_provider = resolve_model_billing_and_provider(
-                "ocb-xai-grok-4.7-build-fast"
-            )
-            assert fast_billing == "oauth"
-            assert fast_provider == "openclaw-broker"
-            fast_cash, fast_notional = compute_call_costs(
-                "ocb-xai-grok-4.7-build-fast",
-                fast_billing,
-                {"input_tokens": 1000, "output_tokens": 500, "cached_tokens": 0},
-            )
-            assert fast_cash == Decimal("0")
-            assert fast_notional == Decimal("0")
-        finally:
-            LLM._model_config = None
-
 
 
 @pytest.mark.asyncio
@@ -1405,11 +1200,6 @@ async def test_glm_coding_subscription_budget_and_provider_status(
         ps_mod,
         "explain_model_availability",
         create_autospec(ps_mod.explain_model_availability, return_value={}),
-    )
-    monkeypatch.setattr(
-        ps_mod,
-        "is_broker_models_enabled",
-        create_autospec(ps_mod.is_broker_models_enabled, return_value=False),
     )
 
     # Case 1: unconfigured (no ZAI_CN_CODING_API_KEY)
