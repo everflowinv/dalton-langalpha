@@ -78,6 +78,8 @@ def test_profile_accepts_only_named_profiles() -> None:
         "us-weekly-movers",
         "x-accounts-daily",
         "humanoid-robot-weekly",
+        "weekly-trend-impact-scan",
+        "ct-semi-sentiment",
     ):
         parsed, err = parse_report_profile(_profile(profile_id))
         assert err is None
@@ -96,6 +98,8 @@ def test_profile_accepts_only_named_profiles() -> None:
         "us-weekly-movers",
         "x-accounts-daily",
         "humanoid-robot-weekly",
+        "weekly-trend-impact-scan",
+        "ct-semi-sentiment",
     }
 
 

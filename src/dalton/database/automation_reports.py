@@ -82,6 +82,8 @@ REPORT_PROFILES = frozenset(
         "us-weekly-movers",
         "x-accounts-daily",
         "humanoid-robot-weekly",
+        "weekly-trend-impact-scan",
+        "ct-semi-sentiment",
     }
 )
 MAX_CARDS = 20

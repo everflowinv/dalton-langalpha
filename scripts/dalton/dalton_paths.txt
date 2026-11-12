@@ -355,3 +355,8 @@ src/ptc_agent/agent/middleware/skills/dalton_registry.py
 tests/unit/dalton/test_agentturn_family1.py
 tests/unit/dalton/test_automation_reports.py
 tests/unit/dalton/test_declared_sources.py
+
+# OC-1 agent-turn family 2a: weekly trend impact scan, CT semiconductor sentiment.
+plugins/dalton/skills/dalton-weekly-trend-impact-scan/
+plugins/dalton/skills/dalton-ct-semi-sentiment/
+tests/unit/dalton/test_agentturn_family2a.py
