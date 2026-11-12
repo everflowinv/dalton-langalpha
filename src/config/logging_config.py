@@ -61,6 +61,7 @@ THIRD_PARTY_LIBRARIES = [
     'openai',
     'anthropic',
     'httpx',
+    'httpx2',  # DALTON-HOOK(httpx2-log-level): its INFO request line prints full URLs (query credentials)
     'httpcore',
     'urllib3',
     'requests',

@@ -115,6 +115,7 @@ ALLOWED_HOOKS=(
   "wiki-ingest"
   "handoff-keep-on-resumable"
   "fallback-reason-log"
+  "httpx2-log-level"
   "sandbox-pip-system"
   "subagent-workspace-root"
   "workspace-sharing-settings"
