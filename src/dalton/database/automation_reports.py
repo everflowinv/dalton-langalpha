@@ -88,6 +88,7 @@ REPORT_PROFILES = frozenset(
         "global-consumer-weekly",
         "daily-filing-alert",
         "tob-industry-weekly",
+        "vip-news-alert",
     }
 )
 MAX_CARDS = 20
