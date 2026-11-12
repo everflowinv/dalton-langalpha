@@ -284,6 +284,8 @@ def _locked_def_matches_slot(locked: Any, slot_utc: datetime) -> bool:
     runner = str(_extract_field(locked, "runner", 5) or "")
     if runner not in ("container", "host"):
         return False
+    if _extract_field(locked, "deleted_at", 6) is not None:
+        return False
     cron_expr = str(_extract_field(locked, "cron_expr", 2) or "")
     tz_name = str(_extract_field(locked, "timezone", 3) or "")
     try:
@@ -314,6 +316,7 @@ async def enqueue_due_cron_tasks(
             FROM dalton_data_task_defs
             WHERE enabled = TRUE
               AND paused_by_user = FALSE
+              AND deleted_at IS NULL
               AND runner IN ('container', 'host')
             ORDER BY job_key ASC
             """
@@ -348,7 +351,7 @@ async def enqueue_due_cron_tasks(
                 await cur.execute(
                     """
                     SELECT enabled, paused_by_user, cron_expr, timezone,
-                           timeout_seconds, runner
+                           timeout_seconds, runner, deleted_at
                     FROM dalton_data_task_defs
                     WHERE job_key = %(job_key)s
                     FOR UPDATE
@@ -459,7 +462,7 @@ async def enqueue_manual_task_run(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT job_key, timeout_seconds, runner, enabled
+                SELECT job_key, timeout_seconds, runner, enabled, deleted_at
                 FROM dalton_data_task_defs
                 WHERE job_key = %(job_key)s
                 FOR UPDATE
@@ -469,6 +472,10 @@ async def enqueue_manual_task_run(
             def_row = await cur.fetchone()
             if def_row is None:
                 raise ValueError(f"Unknown data task job_key: {resolved_job_key}")
+            if _extract_field(def_row, "deleted_at", 4) is not None:
+                raise ManualTaskRunConflictError(
+                    f"任务已删除，不能手动运行 (job_key={resolved_job_key})"
+                )
 
             enabled_raw = _extract_field(def_row, "enabled", 3)
             if bool(enabled_raw):
@@ -749,7 +756,8 @@ async def claim_next_queued_run(
                 d.required_secrets,
                 d.cos_mode,
                 d.notify_enabled,
-                d.timezone
+                d.timezone,
+                d.deleted_at
             FROM dalton_data_task_runs r
             LEFT JOIN dalton_data_task_defs d ON d.job_key = r.job_key
             WHERE r.status = 'queued'
@@ -771,6 +779,23 @@ async def claim_next_queued_run(
             continue
         job_key = str(cand["job_key"])
         trigger_source = str(cand.get("trigger_source") or "cron")
+        if cand.get("deleted_at") is not None:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_data_task_runs
+                        SET status = 'cancelled',
+                            failure_reason = 'task_deleted',
+                            notify_status = 'skipped',
+                            completed_at = NOW(),
+                            updated_at = NOW()
+                        WHERE run_id = %(run_id)s::uuid
+                          AND status = 'queued'
+                        """,
+                        {"run_id": run_id},
+                    )
+            continue
         enabled = bool(cand.get("enabled"))
         paused = bool(cand.get("paused_by_user"))
         is_trial = trigger_source == "manual" and not enabled
@@ -871,7 +896,7 @@ async def claim_next_queued_run(
 
                     await cur.execute(
                         """
-                        SELECT enabled, paused_by_user
+                        SELECT enabled, paused_by_user, deleted_at
                         FROM dalton_data_task_defs
                         WHERE job_key = %(job_key)s
                         FOR SHARE
@@ -882,6 +907,11 @@ async def claim_next_queued_run(
                     if locked_def is None:
                         raise _ClaimRollback(
                             "run_not_claimable",
+                            unclaimable_run_id=run_id,
+                        )
+                    if _extract_field(locked_def, "deleted_at", 2) is not None:
+                        raise _ClaimRollback(
+                            "task_deleted",
                             unclaimable_run_id=run_id,
                         )
                     locked_enabled = bool(_extract_field(locked_def, "enabled", 0))
@@ -898,6 +928,7 @@ async def claim_next_queued_run(
                         WHERE r.run_id = %(run_id)s::uuid
                           AND r.status = 'queued'
                           AND d.job_key = r.job_key
+                          AND d.deleted_at IS NULL
                           AND d.enabled = %(expected_enabled)s
                           AND d.paused_by_user = %(expected_paused)s
                           AND (
@@ -928,14 +959,21 @@ async def claim_next_queued_run(
                             """
                             UPDATE dalton_data_task_runs
                             SET status = 'cancelled',
-                                failure_reason = 'task_disabled_before_claim',
+                                failure_reason = %(failure_reason)s,
                                 notify_status = 'skipped',
                                 completed_at = NOW(),
                                 updated_at = NOW()
                             WHERE run_id = %(run_id)s::uuid
                               AND status = 'queued'
                             """,
-                            {"run_id": rb.unclaimable_run_id},
+                            {
+                                "run_id": rb.unclaimable_run_id,
+                                "failure_reason": (
+                                    "task_deleted"
+                                    if rb.reason == "task_deleted"
+                                    else "task_disabled_before_claim"
+                                ),
+                            },
                         )
             continue
 

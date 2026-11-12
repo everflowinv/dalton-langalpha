@@ -362,6 +362,8 @@ class FilePlan:
     notes: list[str] = field(default_factory=list)
     # What the lifecycle checks a named model against; None reads it there.
     model_pref: dict[str, Any] | None = None
+    # Preferences locked before the automation row. Delete sets this in hold.
+    prelocked_pref_row: dict[str, Any] | None = None
 
     def __bool__(self) -> bool:
         return bool(self.create or self.update or self.delete)
@@ -838,12 +840,12 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         lock before the automation rows it moves, so it is taken first here
         too, or the two wait on each other."""
         # DALTON-HOOK(company-automations): lock user_preferences before locking the automation row
-        if plan.create or plan.update:
+        if plan.create or plan.update or plan.delete:
             from src.dalton.database.company_automations import (
                 lock_and_fetch_user_preferences_for_snapshot,
             )
         if plan.create:
-            plan.prelocked_pref_row = await lock_and_fetch_user_preferences_for_snapshot(  # type: ignore[attr-defined]
+            plan.prelocked_pref_row = await lock_and_fetch_user_preferences_for_snapshot(
                 user_id,
                 conn=conn,
                 notify_storage_mode="legacy",
@@ -856,11 +858,19 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 await lock_user_writes(cur, user_id)
         if plan.update:
             notify_mode = str((row or {}).get("notify_storage_mode") or "legacy")
-            plan.prelocked_pref_row = await lock_and_fetch_user_preferences_for_snapshot(  # type: ignore[attr-defined]
+            plan.prelocked_pref_row = await lock_and_fetch_user_preferences_for_snapshot(
                 user_id,
                 conn=conn,
                 notify_storage_mode=notify_mode,
             )
+        if plan.delete:
+            notify_mode = str((row or {}).get("notify_storage_mode") or "legacy")
+            locked_prefs = await lock_and_fetch_user_preferences_for_snapshot(
+                user_id,
+                conn=conn,
+                notify_storage_mode=notify_mode,
+            )
+            plan.prelocked_pref_row = locked_prefs if isinstance(locked_prefs, dict) else {}
         locked = await auto_db.get_automation_file(user_id, self.file_name, conn=conn, lock=True)
         return _version(locked) if locked else ""
 
@@ -923,8 +933,19 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         prelocked_pref = getattr(plan, "prelocked_pref_row", None)
 
         if delete := plan.delete:
-            await auto_db.delete_automation(delete.automation_id, user_id, conn=conn)
-            report = f'Deleted "{delete.name}" ({self.file_name}), with its run history'
+            # DALTON-HOOK(company-automations): file removal is a recycle-bin soft delete
+            await auto_db.delete_automation(
+                delete.automation_id,
+                user_id,
+                conn=conn,
+                actor_user_id=user_id,
+                expected_config_version=None,
+                prelocked_pref_row=plan.prelocked_pref_row,
+            )
+            report = (
+                f'Deleted "{delete.name}" ({self.file_name}); '
+                "it is in the recycle bin and its run history is kept"
+            )
 
         if update := plan.update:
             row = update.row

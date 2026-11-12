@@ -711,6 +711,24 @@ class CompanyScriptVersionRequest(BaseModel):
         return _strict_positive_config_version(value)
 
 
+# DALTON-HOOK(company-automations): recycle writes require a version; a bad type is 400 in the route
+class RecycleVersionRequest(BaseModel):
+    """Body for soft delete and restore. An empty object is validated in the route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_config_version: Any = None
+
+
+class AutomationRollbackRequest(BaseModel):
+    """Body for a one-step rollback. Both versions are validated in the route."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_config_version: Any = None
+    target_version: Any = None
+
+
 # =============================================================================
 # Response Models
 # =============================================================================
@@ -804,6 +822,8 @@ class AutomationResponse(BaseModel):
     active_version: int = 1
     created_by: Optional[str] = None
     updated_by: Optional[str] = None
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
     # DALTON-HOOK(dalton-notify): expose pushable category, effective toggle state, source, and custom route targets
     dalton_notify_category: Optional[str] = None
     dalton_notify_effective: Optional[bool] = None
@@ -881,6 +901,8 @@ class ScriptAutomationResponse(BaseModel):
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     updated_by: Optional[str] = None
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
     dalton_notify_category: Optional[str] = None
     dalton_notify_effective: Optional[bool] = None
     dalton_notify_source: Optional[str] = None

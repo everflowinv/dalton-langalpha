@@ -1194,20 +1194,14 @@ async def trigger_automation(
     Returns:
         Dict with execution_id and status.
     """
-    current = await auto_db.get_automation(automation_id, user_id)
-    if not current:
-        raise ValueError("Automation not found")
-
-    if current["status"] not in ("active", "paused", "completed"):
-        raise ValueError(
-            f"Cannot trigger automation in '{current['status']}' status"
-        )
-
+    # Lock the parent and insert in one transaction, so a delete cannot leave
+    # a pending execution behind.
     scheduler = AutomationScheduler.get_instance()
-    execution_id = await exec_db.create_execution(
-        automation_id=automation_id,
-        scheduled_at=datetime.now(timezone.utc),
-        server_id=scheduler.server_id,
+    execution_id, current = await exec_db.create_execution_for_live_parent(
+        automation_id,
+        user_id,
+        datetime.now(timezone.utc),
+        scheduler.server_id,
     )
 
     scheduler.dispatch(current, execution_id, name=f"manual_exec_{automation_id[:8]}")

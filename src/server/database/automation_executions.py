@@ -9,6 +9,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.server.database.automation import (
+    AUTOMATION_COLUMNS,
     EXECUTION_COLUMNS,
     UNSETTLED_STATUSES,
     not_a_server_skip,
@@ -28,14 +29,19 @@ async def _count_strike(cur, automation_id: str, *, fuse: bool = False) -> int:
     'max_failures'), so the user is told which of the two switched it off.
     It keeps a one-time automation's time, as a pause does: a manual run that
     fused it leaves the scheduled one for a resume to restore. Only a live
-    automation is disabled: a pause, a finish or an earlier disable, and its
-    reason, stand.
+    automation is switched to ``disabled``. A paused one keeps its status and
+    still stores the reason. A finish or an earlier disable, and its reason,
+    stand. A later strike does not replace ``provider_auth`` with
+    ``max_failures``. A later success does not clear the reason; only resume
+    or enable does.
     """
     # DALTON-HOOK(no-strike): P0F.3 dalton-* automations never auto-disable on consecutive failures
-    disables = (
+    strike_limit = (
         "(%(fuse)s OR (failure_count + 1 >= max_failures AND name NOT LIKE 'dalton-%%'))"
-        " AND status IN ('active', 'executing')"
     )
+    disables = f"{strike_limit} AND status IN ('active', 'executing')"
+    # A paused parent is not flipped to disabled, but the reason is kept.
+    records_reason = f"{strike_limit} AND status IN ('active', 'executing', 'paused')"
     dalton_backoff = (
         "GREATEST(COALESCE(next_run_at, NOW()), NOW() + make_interval("
         "secs => LEAST(604800, 3600 * (1 << LEAST(failure_count, 8)))))"
@@ -49,8 +55,10 @@ async def _count_strike(cur, automation_id: str, *, fuse: bool = False) -> int:
                                WHEN name LIKE 'dalton-%%' AND trigger_type <> 'price'
                                THEN {dalton_backoff}
                                ELSE next_run_at END,
-            disable_reason = CASE WHEN {disables} THEN %(reason)s
-                                  ELSE disable_reason END
+            disable_reason = CASE
+                WHEN disable_reason = 'provider_auth' THEN 'provider_auth'
+                WHEN {records_reason} THEN %(reason)s
+                ELSE disable_reason END
         FROM (SELECT status AS was FROM automations
               WHERE automation_id = %(automation_id)s) before_strike
         WHERE automation_id = %(automation_id)s
@@ -113,6 +121,35 @@ async def transition_execution(
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(query, params)
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def begin_execution_if_not_deleted(
+    execution_id: str,
+    *,
+    started_at: datetime,
+) -> Optional[Dict[str, Any]]:
+    """Move a pending execution to running only while its automation is live.
+
+    DALTON-HOOK(company-automations): a soft-deleted automation does not start.
+    The shared ``transition_execution`` helper is left unchanged.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE automation_executions e
+                SET status = 'running', started_at = %s
+                FROM automations a
+                WHERE e.automation_execution_id = %s
+                  AND e.status = 'pending'
+                  AND a.automation_id = e.automation_id
+                  AND a.deleted_at IS NULL
+                RETURNING e.conversation_thread_id, e.conversation_response_id
+                """,
+                (started_at, execution_id),
+            )
             row = await cur.fetchone()
             return dict(row) if row else None
 
@@ -227,15 +264,14 @@ async def settle_execution(
                 if strike in ("count", "fuse"):
                     await _count_strike(cur, automation_id, fuse=strike == "fuse")
                 elif strike == "reset":
-                    # A disabled automation keeps its count and reason until it
-                    # is resumed: a firing that was already running when
-                    # another one disabled it does not explain the disable away.
+                    # A success keeps disable_reason. Only an explicit resume
+                    # or enable clears it. A disabled automation also keeps its
+                    # count: a firing already running when another one disabled
+                    # it does not explain the disable away.
                     await cur.execute("""
                         UPDATE automations
                         SET failure_count = CASE WHEN status = 'disabled'
-                                                 THEN failure_count ELSE 0 END,
-                            disable_reason = CASE WHEN status = 'disabled'
-                                                  THEN disable_reason END
+                                                 THEN failure_count ELSE 0 END
                         WHERE automation_id = %s
                     """, (automation_id,))
                 # After the strike, which may have disabled the automation.
@@ -557,6 +593,69 @@ async def get_settling_run(run_id: str) -> Optional[Dict[str, Any]]:
             """, (run_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def skip_unstarted_executions_of_deleted_parents() -> int:
+    """Skip pending and waiting firings whose parent is still soft-deleted.
+
+    The sweep calls this once. The recycle module reads ``deleted_at`` in
+    that same UPDATE.
+    """
+    from src.dalton.database.automation_recycle import (
+        skip_unstarted_executions_of_deleted_parents as skip_deleted,
+    )
+
+    return await skip_deleted()
+
+
+_TRIGGERABLE_STATUSES = ("active", "paused", "completed")
+
+
+async def create_execution_for_live_parent(
+    automation_id: str,
+    user_id: str,
+    scheduled_at: datetime,
+    server_id: str,
+) -> tuple[str, Dict[str, Any]]:
+    """Lock the parent, refuse a deleted or non-triggerable row, then insert.
+
+    The lock and the insert share one transaction, so a delete that commits
+    first leaves no pending execution. Raises ``ValueError`` with the same
+    texts ``trigger_automation`` used when the read and the insert were separate.
+    """
+    execution_id = str(uuid4())
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    SELECT {AUTOMATION_COLUMNS}
+                    FROM automations
+                    WHERE automation_id = %s AND user_id = %s
+                    FOR UPDATE
+                    """,
+                    (automation_id, user_id),
+                )
+                parent = await cur.fetchone()
+                if parent is None or parent.get("deleted_at") is not None:
+                    raise ValueError("Automation not found")
+                parent_row = dict(parent)
+                if parent_row.get("status") not in _TRIGGERABLE_STATUSES:
+                    raise ValueError(
+                        f"Cannot trigger automation in '{parent_row.get('status')}' status"
+                    )
+                await cur.execute(
+                    """
+                    INSERT INTO automation_executions (
+                        automation_execution_id, automation_id,
+                        status, scheduled_at, server_id, created_at,
+                        heartbeat_at
+                    )
+                    VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW())
+                    """,
+                    (execution_id, automation_id, scheduled_at, server_id),
+                )
+    return execution_id, parent_row
 
 
 async def create_execution(

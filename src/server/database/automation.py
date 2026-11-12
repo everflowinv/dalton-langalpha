@@ -39,7 +39,7 @@ AUTOMATION_COLUMNS = """
     status, max_failures, failure_count, disable_reason,
     delivery_config, metadata,
     scope, notify_enabled, notify_routes, notify_storage_mode,
-    config_version, active_version, created_by, updated_by, deleted_at,
+    config_version, active_version, created_by, updated_by, deleted_at, deleted_by,
     created_at, updated_at
 """
 
@@ -450,6 +450,34 @@ async def get_automation(
             return dict(result) if result else None
 
 
+async def get_automation_including_deleted(
+    automation_id: str,
+    user_id: str,
+    *,
+    computer_id: Optional[str] = None,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Same row as ``get_automation``, including one already in the recycle bin.
+
+    Settlement and the abandoned-firing sweep use this so a running execution
+    of a deleted task still finishes. ``get_automation`` stays the user-facing
+    read and still hides deleted rows. None means the row is physically gone.
+    """
+    reach_params: tuple[str, ...] = ()
+    if computer_id is not None:
+        reach_params = _last_execution_computer_params(user_id, computer_id)
+    async with get_db_connection(conn) as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(f"""
+                SELECT {AUTOMATION_COLUMNS}, le.last_execution, {_OWNS_THREAD}
+                FROM automations
+                {_last_execution_join("automations", computer_id=computer_id)}
+                WHERE automation_id = %s AND user_id = %s
+            """, (*reach_params, automation_id, user_id))
+            result = await cur.fetchone()
+            return dict(result) if result else None
+
+
 async def list_automations(
     user_id: str,
     *,
@@ -457,6 +485,7 @@ async def list_automations(
     limit: int = 50,
     offset: int = 0,
     computer_id: Optional[str] = None,
+    include_deleted: bool = False,
 ) -> tuple[List[Dict[str, Any]], int]:
     """List automations for a user with optional status filter.
 
@@ -468,8 +497,9 @@ async def list_automations(
     Returns:
         Tuple of (list of automation dicts, total count).
     """
-    # DALTON-HOOK(company-automations): exclude soft-deleted rows and stabilize tie-break order
-    where_parts = ["user_id = %s", "deleted_at IS NULL"]
+    # DALTON-HOOK(company-automations): live rows stay deleted_at IS NULL; the recycle bin flips that predicate only
+    deleted_sql = "deleted_at IS NOT NULL" if include_deleted else "deleted_at IS NULL"
+    where_parts = ["user_id = %s", deleted_sql]
     params: list = [user_id]
 
     if status:
@@ -968,20 +998,33 @@ async def update_automation(
 
 
 async def delete_automation(
-    automation_id: str, user_id: str, *, conn=None
+    automation_id: str,
+    user_id: str,
+    *,
+    conn=None,
+    actor_user_id: str | None = None,
+    expected_config_version: int | None = None,
+    prelocked_pref_row=None,
 ) -> bool:
-    """Delete an automation (executions cascade deleted)."""
-    async with get_db_connection(conn) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("""
-                DELETE FROM automations
-                WHERE automation_id = %s AND user_id = %s
-            """, (automation_id, user_id))
+    """Soft-delete an automation. Physical removal waits for the 30-day purge.
 
-            deleted = cur.rowcount > 0
-            if deleted:
-                logger.info(f"[automation_db] delete_automation automation_id={automation_id}")
-            return deleted
+    DALTON-HOOK(company-automations): recycle-bin soft delete. The row stays,
+    pending and waiting runs are skipped, and executions are not cascaded.
+    ``expected_config_version is None`` uses the locked row's own version.
+    """
+    from src.dalton.services.automation_recycle import soft_delete_owned_automation
+
+    deleted = await soft_delete_owned_automation(
+        automation_id,
+        user_id,
+        actor_user_id=actor_user_id,
+        expected_config_version=expected_config_version,
+        prelocked_pref_row=prelocked_pref_row,
+        conn=conn,
+    )
+    if deleted:
+        logger.info(f"[automation_db] delete_automation automation_id={automation_id}")
+    return deleted
 
 
 # =============================================================================
@@ -1019,6 +1062,7 @@ async def claim_due_automations(
                     SELECT {AUTOMATION_COLUMNS}
                     FROM automations
                     WHERE status = 'active'
+                      AND deleted_at IS NULL
                       AND next_run_at IS NOT NULL
                       AND next_run_at <= %s
                     ORDER BY next_run_at ASC
@@ -1048,12 +1092,14 @@ async def claim_due_automations(
                                 next_run_at = NULL,
                                 last_run_at = NOW()
                             WHERE automation_id = %s
+                              AND deleted_at IS NULL
                         """, (once_iso, automation_id))
                     else:
                         await cur.execute("""
                             UPDATE automations
                             SET next_run_at = NULL, last_run_at = NOW()
                             WHERE automation_id = %s
+                              AND deleted_at IS NULL
                         """, (automation_id,))
 
                     # Insert pending execution
@@ -1101,6 +1147,7 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
                     UPDATE automations
                     SET status = 'executing', next_run_at = NULL, last_run_at = NOW()
                     WHERE automation_id = %s AND status = 'active'
+                      AND deleted_at IS NULL
                 """, (automation_id,))
                 if cur.rowcount == 0:
                     return None
@@ -1116,24 +1163,39 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
 
 
 async def update_automation_next_run(
-    automation_id: str, next_run_at: Optional[datetime]
-) -> None:
+    automation_id: str,
+    next_run_at: Optional[datetime],
+    *,
+    config_version: int | None = None,
+) -> bool:
     """Schedule a claimed cron's next run, unless the row moved on meanwhile.
 
     The claim left ``next_run_at`` NULL. An edit to the schedule or zone made
     since has already set it from the new expression, and a pause cleared
     the status; either way the time computed from the claimed row is stale,
-    so it is written only over a NULL on a row still active.
+    so it is written only over a NULL on a row still active. A soft-deleted
+    row is never rescheduled. ``config_version`` keeps a stale claim from
+    writing over a newer edit.
+
+    DALTON-HOOK(company-automations): recycle bin refuses a deleted row here.
     """
+    version_sql = ""
+    params: list = [next_run_at, automation_id]
+    if config_version is not None:
+        version_sql = " AND config_version = %s"
+        params.append(config_version)
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("""
+            await cur.execute(f"""
                 UPDATE automations
                 SET next_run_at = %s
                 WHERE automation_id = %s
                   AND next_run_at IS NULL
                   AND status = 'active'
-            """, (next_run_at, automation_id))
+                  AND deleted_at IS NULL
+                  {version_sql}
+            """, tuple(params))
+            return cur.rowcount > 0
 
 
 async def get_active_price_automations() -> List[Dict[str, Any]]:
@@ -1145,6 +1207,7 @@ async def get_active_price_automations() -> List[Dict[str, Any]]:
                 FROM automations
                 WHERE trigger_type = 'price'
                   AND status = 'active'
+                  AND deleted_at IS NULL
             """)
             results = await cur.fetchall()
             return [dict(row) for row in results]

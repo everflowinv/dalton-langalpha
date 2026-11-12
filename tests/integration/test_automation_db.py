@@ -205,6 +205,7 @@ class TestDeleteAutomation:
     async def test_delete_automation(
         self, seed_user, patched_get_db_connection
     ):
+        from src.server.database import automation as automation_db
         from src.server.database.automation import (
             create_automation,
             delete_automation,
@@ -227,6 +228,28 @@ class TestDeleteAutomation:
             str(auto["automation_id"]), seed_user["user_id"]
         )
         assert result is None
+
+        async with automation_db.get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT deleted_at, status
+                    FROM automations
+                    WHERE automation_id = %s
+                    """,
+                    (str(auto["automation_id"]),),
+                )
+                stored = await cur.fetchone()
+        assert stored is not None
+        deleted_at = stored["deleted_at"] if isinstance(stored, dict) else stored[0]
+        status = stored["status"] if isinstance(stored, dict) else stored[1]
+        assert deleted_at is not None
+        assert status == "paused"
+
+        again = await delete_automation(
+            str(auto["automation_id"]), seed_user["user_id"]
+        )
+        assert again is False
 
     async def test_delete_nonexistent(
         self, seed_user, patched_get_db_connection

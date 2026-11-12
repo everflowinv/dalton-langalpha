@@ -575,6 +575,16 @@ class AutomationExecutor:
         before anything else runs (``_keep_delivery``), each start's
         replacing the last's.
         """
+        # DALTON-HOOK(company-automations): do not start delivery after a soft delete
+        from src.dalton.database.automation_recycle import automation_is_soft_deleted
+
+        automation_id = str(firing.automation.get("automation_id") or "")
+        if automation_id and await automation_is_soft_deleted(automation_id):
+            logger.info(
+                f"[AUTOMATION_EXEC] Not delivering a deleted automation: "
+                f"execution_id={execution_id}"
+            )
+            return
         entries = automation_delivery.entries_of(firing.automation)
         if firing.delivery_starts and entries == firing.delivery_entries:
             return
@@ -863,6 +873,17 @@ class AutomationExecutor:
             name=f"automation_heartbeat_{execution_id[:8]}",
         )
         try:
+            # DALTON-HOOK(company-automations): pending→running only while the parent is not deleted
+            if not await exec_db.begin_execution_if_not_deleted(
+                execution_id,
+                started_at=datetime.now(timezone.utc),
+            ):
+                logger.warning(
+                    f"[AUTOMATION_EXEC] Not starting: execution_id={execution_id} "
+                    f"was settled or its automation was deleted"
+                )
+                keep_alive.cancel()
+                return
             from src.dalton.autonomy import preflight as dalton_preflight
 
             decision = await dalton_preflight.decide(automation, execution_id)
@@ -877,18 +898,56 @@ class AutomationExecutor:
                 )
                 keep_alive.cancel()
                 return
-            if not await exec_db.transition_execution(
-                execution_id,
-                from_statuses=("pending",),
-                to="running",
-                started_at=datetime.now(timezone.utc),
-            ):
-                logger.warning(
-                    f"[AUTOMATION_EXEC] Not starting: execution_id={execution_id} "
-                    f"was settled before it began"
+        except asyncio.CancelledError:
+            # A cancel during preflight never started the turn. Record it as
+            # interrupted, then keep propagating the cancel. The heartbeat
+            # stops on this path too.
+            try:
+                await settle(
+                    automation,
+                    execution_id,
+                    Outcome.INTERRUPTED,
+                    workspace_id=str(automation.get("workspace_id") or "") or None,
                 )
+            except Exception as settle_error:
+                logger.error(
+                    f"[AUTOMATION_EXEC] Settling an interrupted preflight failed: "
+                    f"execution_id={execution_id} error={settle_error}"
+                )
+            finally:
                 keep_alive.cancel()
-                return
+            raise
+        except Exception as e:
+            limit_message = _limit_message(e)
+            if limit_message is not None:
+                outcome, error_msg = Outcome.LIMITED, limit_message
+                logger.warning(
+                    f"[AUTOMATION_EXEC] A usage limit refused the preflight, no "
+                    f"strike: execution_id={execution_id} error={error_msg}"
+                )
+            else:
+                ours = _our_failure(e)
+                outcome = Outcome.FAILED_OURS if ours else Outcome.FAILED
+                error_msg = f"{type(e).__name__}: {clean_error_text(str(e))}"
+                logger.error(
+                    f"[AUTOMATION_EXEC] Preflight failed: "
+                    f"execution_id={execution_id} error={error_msg}"
+                )
+            try:
+                await settle(
+                    automation,
+                    execution_id,
+                    outcome,
+                    workspace_id=str(automation.get("workspace_id") or "") or None,
+                    error=error_msg,
+                )
+            except Exception as settle_error:
+                logger.error(
+                    f"[AUTOMATION_EXEC] Settling a failed preflight failed: "
+                    f"execution_id={execution_id} error={settle_error}"
+                )
+            keep_alive.cancel()
+            return
         except BaseException:
             keep_alive.cancel()
             raise

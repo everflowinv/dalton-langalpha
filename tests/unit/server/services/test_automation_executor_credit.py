@@ -14,11 +14,13 @@ Covers:
 """
 
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
 
+from src.dalton.database.automation_recycle import automation_is_soft_deleted
+from src.server.database.automation_executions import begin_execution_if_not_deleted
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.services.automation_executor import AutomationExecutor
 
@@ -99,8 +101,28 @@ def _route_reads():
 
 @contextmanager
 def _bind_db(module, db):
-    """Point both DB modules a service imports at one mock."""
-    with patch(f"{module}.auto_db", new=db), patch(f"{module}.exec_db", new=db):
+    """Point both DB modules a service imports at one mock.
+
+    ``begin_execution_if_not_deleted`` has to be awaitable and truthy: a
+    child MagicMock cannot be awaited, and a falsy row returns before the
+    turn these tests measure. The soft-delete read is imported inside the
+    executor and the settlement tail, so it is patched on its own module.
+    """
+    db.begin_execution_if_not_deleted = create_autospec(
+        begin_execution_if_not_deleted,
+        return_value={
+            "conversation_thread_id": None,
+            "conversation_response_id": None,
+        },
+    )
+    with (
+        patch(f"{module}.auto_db", new=db),
+        patch(f"{module}.exec_db", new=db),
+        patch(
+            "src.dalton.database.automation_recycle.automation_is_soft_deleted",
+            new=create_autospec(automation_is_soft_deleted, return_value=False),
+        ),
+    ):
         yield db
 
 
@@ -444,6 +466,13 @@ def _assert_execution_marked_failed(mock_adb):
 
 def _setup_auto_db(mock_adb):
     """Wire up common auto_db mock return values."""
+    mock_adb.begin_execution_if_not_deleted = create_autospec(
+        begin_execution_if_not_deleted,
+        return_value={
+            "conversation_thread_id": None,
+            "conversation_response_id": None,
+        },
+    )
     mock_adb.transition_execution = AsyncMock(
         return_value={"conversation_thread_id": None}
     )

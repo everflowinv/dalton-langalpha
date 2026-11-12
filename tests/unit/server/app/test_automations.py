@@ -8,7 +8,7 @@ delivery through the messaging service.
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import httpx
 import pytest
@@ -262,7 +262,12 @@ async def test_list_automations_with_filters(client):
 
     assert resp.status_code == 200
     mock_list.assert_awaited_once_with(
-        "test-user-123", status="active", limit=10, offset=5, computer_id=None
+        "test-user-123",
+        status="active",
+        limit=10,
+        offset=5,
+        computer_id=None,
+        include_deleted=False,
     )
 
 
@@ -537,27 +542,78 @@ async def test_update_to_an_unknown_model_is_409(client, unknown_models):
 
 @pytest.mark.asyncio
 async def test_delete_automation(client):
-    with patch(
-        f"{AUTO_DB}.delete_automation",
-        new_callable=AsyncMock,
-        return_value=True,
-    ):
-        resp = await client.delete(f"/api/v1/automations/{AUTO_ID}")
+    from src.server.models.automation import AutomationResponse
 
-    assert resp.status_code == 204
+    from src.dalton.services.automation_recycle import delete_task
+
+    body = _automation(
+        status="paused",
+        config_version=2,
+        deleted_by="test-user-123",
+        deleted_at=NOW,
+    )
+    with patch(
+        "src.dalton.services.automation_recycle.delete_task",
+        new=create_autospec(
+            delete_task,
+            return_value=AutomationResponse.model_validate(body),
+        ),
+    ):
+        resp = await client.request(
+            "DELETE",
+            f"/api/v1/automations/{AUTO_ID}",
+            json={"expected_config_version": 1},
+        )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["deleted_at"] is not None
+    assert payload["deleted_by"] == "test-user-123"
+    assert payload["config_version"] == 2
+    assert payload["status"] == "paused"
 
 
 @pytest.mark.asyncio
 async def test_delete_automation_not_found(client):
+    from fastapi import HTTPException
+
+    from src.dalton.services.automation_recycle import delete_task
+
     fake_id = str(uuid.uuid4())
     with patch(
-        f"{AUTO_DB}.delete_automation",
-        new_callable=AsyncMock,
-        return_value=False,
+        "src.dalton.services.automation_recycle.delete_task",
+        new=create_autospec(
+            delete_task,
+            side_effect=HTTPException(status_code=404, detail="Automation not found"),
+        ),
     ):
-        resp = await client.delete(f"/api/v1/automations/{fake_id}")
+        resp = await client.request(
+            "DELETE",
+            f"/api/v1/automations/{fake_id}",
+            json={"expected_config_version": 1},
+        )
 
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_extra_field_is_422(client):
+    resp = await client.request(
+        "DELETE",
+        f"/api/v1/automations/{AUTO_ID}",
+        json={"name": "nope"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_empty_body_is_400(client):
+    resp = await client.request(
+        "DELETE",
+        f"/api/v1/automations/{AUTO_ID}",
+        json={},
+    )
+    assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------

@@ -2328,6 +2328,51 @@ async def _catch_up_terminal_report_failure_alerts(
             )
 
 
+def _notify_id_is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+async def _retry_parent_is_deleted(row: Mapping[str, Any]) -> bool:
+    """Fresh read of the parent ``deleted_at`` before a retry send.
+
+    A ``data:`` id is a job key, not an automation uuid. A missing data-task
+    row is not treated as deleted. A missing automation row is deleted, which
+    is what ``automation_is_soft_deleted`` already returns.
+    """
+    raw_auto_id = str(row.get("automation_id") or "").strip()
+    payload = row.get("payload_json") if isinstance(row.get("payload_json"), Mapping) else {}
+    route_key = str(payload.get("route_key") or "").strip() if isinstance(payload, Mapping) else ""
+    is_data = raw_auto_id.lower().startswith("data:") or route_key.lower().startswith("data:")
+    if is_data:
+        source = raw_auto_id if raw_auto_id.lower().startswith("data:") else route_key
+        job_key = source[5:].strip()
+        if not job_key:
+            return False
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT deleted_at
+                    FROM dalton_data_task_defs
+                    WHERE job_key = %s
+                    """,
+                    (job_key,),
+                )
+                found = await cur.fetchone()
+        if not isinstance(found, Mapping):
+            return False
+        return found.get("deleted_at") is not None
+    if not _notify_id_is_uuid(raw_auto_id):
+        return False
+    from src.dalton.database.automation_recycle import automation_is_soft_deleted
+
+    return await automation_is_soft_deleted(raw_auto_id)
+
+
 async def retry_failed_notify_deliveries(
     *,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
@@ -2509,6 +2554,21 @@ async def retry_failed_notify_deliveries(
             transport_outcome_uncertain_or_sent = False
             uncertain_error_code = "delivery_uncertain"
             try:
+                if await _retry_parent_is_deleted(row):
+                    await _invoke_mark_delivery(
+                        mark_delivery_fn,
+                        exec_id,
+                        ch,
+                        tgt,
+                        status="skipped",
+                        reason="task_deleted",
+                        error_code="task_deleted",
+                        expected_status=skip_expected_status,
+                        expected_attempt_count=attempt_count,
+                        expected_updated_at=row_updated_at,
+                        exclude_uncertain_data_task=True,
+                    )
+                    continue
                 row_source = str(payload.get("source") or "")
                 if row_source in {
                     "automation_report",
@@ -2770,6 +2830,79 @@ async def retry_failed_notify_deliveries(
                               )
                               AND attempt_count = %s
                               AND attempt_count < %s
+                              -- A missing data-task row is not deleted.
+                              -- Only deleted_at on that row blocks the claim.
+                              -- A non-uuid id that is not a data task still claims.
+                              AND (
+                                  CASE
+                                      WHEN lower(btrim(COALESCE(
+                                          automation_id, ''
+                                      ))) LIKE 'data:%%'
+                                          OR lower(btrim(COALESCE(
+                                              payload_json ->> 'route_key', ''
+                                          ))) LIKE 'data:%%'
+                                      THEN (
+                                          EXISTS (
+                                              SELECT 1
+                                              FROM dalton_data_task_defs AS d
+                                              WHERE d.job_key = (
+                                                  CASE
+                                                      WHEN lower(btrim(COALESCE(
+                                                          automation_id, ''
+                                                      ))) LIKE 'data:%%'
+                                                      THEN btrim(substring(
+                                                          btrim(automation_id)
+                                                          FROM 6
+                                                      ))
+                                                      ELSE btrim(substring(
+                                                          btrim(
+                                                              payload_json
+                                                              ->> 'route_key'
+                                                          )
+                                                          FROM 6
+                                                      ))
+                                                  END
+                                              )
+                                                AND d.deleted_at IS NULL
+                                          )
+                                          OR NOT EXISTS (
+                                              SELECT 1
+                                              FROM dalton_data_task_defs AS d
+                                              WHERE d.job_key = (
+                                                  CASE
+                                                      WHEN lower(btrim(COALESCE(
+                                                          automation_id, ''
+                                                      ))) LIKE 'data:%%'
+                                                      THEN btrim(substring(
+                                                          btrim(automation_id)
+                                                          FROM 6
+                                                      ))
+                                                      ELSE btrim(substring(
+                                                          btrim(
+                                                              payload_json
+                                                              ->> 'route_key'
+                                                          )
+                                                          FROM 6
+                                                      ))
+                                                  END
+                                              )
+                                          )
+                                      )
+                                      WHEN btrim(COALESCE(automation_id, '')) ~* (
+                                          '^[0-9a-f]{8}-[0-9a-f]{4}-'
+                                          || '[0-9a-f]{4}-[0-9a-f]{4}-'
+                                          || '[0-9a-f]{12}$'
+                                      )
+                                      THEN EXISTS (
+                                          SELECT 1
+                                          FROM automations AS a
+                                          WHERE a.automation_id::text
+                                              = dalton_notify_deliveries.automation_id
+                                            AND a.deleted_at IS NULL
+                                      )
+                                      ELSE TRUE
+                                  END
+                              )
                         """
                         claim_params: list[Any] = [
                             exec_id,
@@ -3269,6 +3402,20 @@ async def _claim_saved_delivery_source(
                   AND target = %s
                   AND COALESCE(payload_json ->> 'source', '') = '{literal}'
                   AND attempt_count < %s
+                  -- DALTON-HOOK(company-automations): a report of a deleted automation is never claimed
+                  AND (
+                      btrim(COALESCE(automation_id, '')) !~* (
+                          '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-'
+                          || '[0-9a-f]{{4}}-[0-9a-f]{{4}}-'
+                          || '[0-9a-f]{{12}}$'
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM automations AS a
+                          WHERE a.automation_id::text = dalton_notify_deliveries.automation_id
+                            AND a.deleted_at IS NULL
+                      )
+                  )
                   AND (
                       (
                           status = 'pending'

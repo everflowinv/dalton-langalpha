@@ -769,7 +769,8 @@ class TestWhyAFiringFailed:
             strike="reset",
         )
         auto = await get_automation(aid, uid)
-        assert (auto["failure_count"], auto["disable_reason"]) == (0, None)
+        # A success keeps the reason. Only the resume below clears it.
+        assert (auto["failure_count"], auto["disable_reason"]) == (0, "max_failures")
 
         # A run that ends after the automation switched off leaves the reason
         # standing: the automation is still off for it.
@@ -851,7 +852,13 @@ class TestWhyAFiringFailed:
 
         auto = await get_automation(aid, uid)
         assert (auto["status"], auto["failure_count"]) == (status, 1)
-        assert (auto["disable_reason"], auto["metadata"]) == (None, {"source": "chat"})
+        # A paused parent keeps the fuse reason. completed and disabled do not
+        # gain one; this row had none stored.
+        expected_reason = "provider_auth" if status == "paused" else None
+        assert (auto["disable_reason"], auto["metadata"]) == (
+            expected_reason,
+            {"source": "chat"},
+        )
 
     async def test_the_last_execution_passes_over_a_skip_the_server_made(
         self, seed_user, patched_get_db_connection

@@ -755,6 +755,7 @@ async def list_automations_for_scope(
     status: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    include_deleted: bool = False,
 ):
     """Read-only scoped automation listing enforcing company/computer boundaries."""
     from src.dalton.notify.dispatch import populate_automation_notify_state
@@ -772,6 +773,7 @@ async def list_automations_for_scope(
             status=status,
             limit=limit,
             offset=offset,
+            include_deleted=include_deleted,
         )
 
     rows, total = await company_auto_db.list_automations_for_scope_db(
@@ -781,6 +783,7 @@ async def list_automations_for_scope(
         limit=limit,
         offset=offset,
         computer_id=principal.computer_id,
+        include_deleted=include_deleted,
     )
     items = [AutomationResponse.model_validate(r) for r in rows]
     await populate_automation_notify_state(principal.user_id, items)

@@ -14,10 +14,15 @@ import asyncio
 import json
 from contextlib import asynccontextmanager, contextmanager, suppress
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, create_autospec, patch
 
 import pytest
 
+from src.dalton.database.automation_recycle import automation_is_soft_deleted
+from src.server.database.automation import (
+    get_automation,
+    get_automation_including_deleted,
+)
 from src.server.services import automation_delivery
 from src.server.services import automation_settlement as settlement_mod
 from src.server.services.automation_delivery import Delivery, Finish, Target
@@ -75,8 +80,8 @@ EXPECTED = {
     Outcome.STOPPED: ("skipped", ("running",), None, CLOSES, "automation.failed", "user", None, "stopped"),
     Outcome.SKIPPED: ("skipped", ("waiting",), None, CLOSES, None, None, None, "skipped"),
     # DALTON-HOOK(precheck-outcome): zero-token preflight skip settles from
-    # pending, no strike, no webhook, and counts as the schedule's run.
-    Outcome.PRECHECK_SKIPPED: ("skipped", ("pending",), None, CLOSES, None, None, None, "precheck_skipped"),
+    # pending or running, no strike, no webhook, and counts as the schedule's run.
+    Outcome.PRECHECK_SKIPPED: ("skipped", ("pending", "running"), None, CLOSES, None, None, None, "precheck_skipped"),
 }
 
 
@@ -154,6 +159,13 @@ def _settlement(row):
         patch(f"{_MOD}.exec_db", new=fx.db),
         patch(f"{_MOD}.outbox_db", new=fx.outbox),
         patch(f"{_MOD}.get_db_connection", new=connection),
+        # The tail imports this helper itself and would check out the real pool.
+        # False keeps these rows live. A finish for a missing automation is
+        # still ``get_automation`` returning None, which asks nothing.
+        patch(
+            "src.dalton.database.automation_recycle.automation_is_soft_deleted",
+            new=create_autospec(automation_is_soft_deleted, return_value=False),
+        ),
         patch(f"{_MOD}.WebhookClient", return_value=MagicMock(fire_event=fx.fire)),
         patch(f"{_MOD}.automation_delivery.finish_run", new=fx.finish),
         patch(f"{_MOD}.publish_automation_wait", new=fx.announce),
@@ -1114,7 +1126,16 @@ def _finalize_job():
 @contextmanager
 def _finished(run, automation=None):
     with _settlement(_row()) as fx:
-        fx.db.get_automation = AsyncMock(return_value=automation)
+        # Settle reads the parent even after a soft delete. Finish still uses
+        # the live read, so a deleted parent asks the messaging service nothing.
+        if automation is None or automation.get("deleted_at") is not None:
+            live = None
+        else:
+            live = automation
+        fx.db.get_automation_including_deleted = create_autospec(
+            get_automation_including_deleted, return_value=automation,
+        )
+        fx.db.get_automation = create_autospec(get_automation, return_value=live)
         fx.db.get_settling_run = AsyncMock(return_value=run)
         fx.excerpt = AsyncMock(return_value=RunAnswer("Markets rose"))
         with patch(f"{_MOD}.read_run_answer", new=fx.excerpt):
@@ -1307,8 +1328,23 @@ async def test_a_deleted_automation_owes_nothing():
     with _finished(_ended("completed")) as fx:
         await _settle_finished_run(_finalize_job())
 
-    fx.db.get_automation.assert_awaited_once_with(_AID, "user-1")
+    fx.db.get_automation_including_deleted.assert_awaited_once_with(_AID, "user-1")
     fx.db.settle_execution.assert_not_awaited()
+    fx.fire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_parent_still_settles_and_does_not_notify():
+    """A running firing of a soft-deleted parent settles. It does not notify."""
+    deleted = {**_automation("cron"), "deleted_at": "2026-11-01T00:00:00+00:00"}
+    with _finished(_ended("completed"), deleted) as fx:
+        with patch(
+            "src.dalton.database.automation_recycle.automation_is_soft_deleted",
+            new=create_autospec(automation_is_soft_deleted, return_value=True),
+        ):
+            await _settle_finished_run(_finalize_job())
+
+    fx.db.settle_execution.assert_awaited()
     fx.fire.assert_not_awaited()
 
 

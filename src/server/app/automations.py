@@ -12,7 +12,9 @@ Endpoints (/api/v1/automations):
 - PUT    /automations/delivery-default             - Set a workspace's default chat
 - GET    /automations/{automation_id}              - Get automation
 - PATCH  /automations/{automation_id}              - Update automation
-- DELETE /automations/{automation_id}              - Delete automation
+- DELETE /automations/{automation_id}              - Soft-delete into the recycle bin
+- POST   /automations/{automation_id}/restore      - Restore from the recycle bin
+- POST   /automations/{automation_id}/rollback     - Roll back one configuration version
 - POST   /automations/{automation_id}/trigger      - Manual trigger
 - POST   /automations/{automation_id}/pause        - Pause
 - POST   /automations/{automation_id}/resume       - Resume
@@ -28,7 +30,7 @@ from typing import Any, Literal, Optional  # DALTON-HOOK(company-automations)
 from uuid import UUID
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from src.dalton.company_identity import is_company_system_user  # DALTON-HOOK(company-automations)
@@ -36,6 +38,7 @@ from src.dalton.services.company_automations import (  # DALTON-HOOK(company-aut
     AutomationHistoryResponse,
     automation_history_context,
     extract_expected_config_version,
+    validate_expected_config_version,
 )
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
@@ -48,6 +51,7 @@ from src.server.models.automation import (
     AutomationCreate,
     AutomationReadResponse,
     AutomationResponse,
+    AutomationRollbackRequest,
     AutomationRunResponse,
     AutomationRunsListResponse,
     AutomationsListResponse,
@@ -55,6 +59,7 @@ from src.server.models.automation import (
     CompanyScriptUpdate,
     CompanyScriptVersionRequest,
     DeliveryDefaultUpdate,
+    RecycleVersionRequest,
 )
 from src.server.dependencies.principal import (
     ReadPrincipal,
@@ -172,6 +177,10 @@ async def list_automations(
     ),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    include_deleted: bool = Query(
+        False,
+        description="When true, return only this group's soft-deleted rows",
+    ),
 ):
     """List automations for the current user, each with its newest execution."""
     # DALTON-HOOK(company-automations): delegate explicit scope queries to AU1 read-only service
@@ -184,6 +193,7 @@ async def list_automations(
             status=status,
             limit=limit,
             offset=offset,
+            include_deleted=include_deleted,
         )
     user_id = principal.user_id
     automations, total = await auto_db.list_automations(
@@ -192,6 +202,7 @@ async def list_automations(
         limit=limit,
         offset=offset,
         computer_id=principal.computer_id,
+        include_deleted=include_deleted,
     )
     items = [AutomationResponse.model_validate(a) for a in automations]
     # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
@@ -476,17 +487,75 @@ async def update_automation(
     return _company_write_response(company_row)
 
 
-@router.delete("/automations/{automation_id}", status_code=204)
-@handle_api_exceptions("delete automation", logger)
+def _positive_recycle_version(value: Any, field_name: str) -> int:
+    """400 for a missing or non-positive version. Not a ValueError, so it stays 400."""
+    if field_name == "expected_config_version":
+        # provided=True never returns None; a bad value is already HTTP 400.
+        return validate_expected_config_version(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be a positive integer",
+        )
+    return value
+
+
+# DALTON-HOOK(company-automations): soft delete, restore, and one-step rollback
+@router.delete("/automations/{automation_id}", response_model=AutomationReadResponse)
+@handle_api_exceptions("delete automation", logger, conflict_on_value_error=True)
 async def delete_automation(
-    automation_id: UUID,
-    user_id: WorkspaceWriteUserId,
+    automation_id: str,
+    principal: WorkspaceWritePrincipal,
+    body: RecycleVersionRequest,
 ):
-    """Delete an automation (cascade deletes executions)."""
-    deleted = await auto_db.delete_automation(str(automation_id), user_id)
-    if not deleted:
-        raise_not_found("Automation")
-    return Response(status_code=204)
+    """Soft-delete an automation or a ``data:<job_key>`` into the recycle bin."""
+    version = _positive_recycle_version(
+        body.expected_config_version,
+        "expected_config_version",
+    )
+    from src.dalton.services.automation_recycle import delete_task
+
+    return await delete_task(principal, automation_id, version)
+
+
+@router.post("/automations/{automation_id}/restore", response_model=AutomationReadResponse)
+@handle_api_exceptions("restore automation", logger, conflict_on_value_error=True)
+async def restore_automation(
+    automation_id: str,
+    principal: WorkspaceWritePrincipal,
+    body: RecycleVersionRequest,
+):
+    """Restore a soft-deleted automation or data task."""
+    version = _positive_recycle_version(
+        body.expected_config_version,
+        "expected_config_version",
+    )
+    from src.dalton.services.automation_recycle import restore_task
+
+    return await restore_task(principal, automation_id, version)
+
+
+@router.post("/automations/{automation_id}/rollback", response_model=AutomationReadResponse)
+@handle_api_exceptions("rollback automation", logger, conflict_on_value_error=True)
+async def rollback_automation(
+    automation_id: str,
+    principal: WorkspaceWritePrincipal,
+    body: AutomationRollbackRequest,
+):
+    """Roll an automation or data task back one configuration version."""
+    version = _positive_recycle_version(
+        body.expected_config_version,
+        "expected_config_version",
+    )
+    target = _positive_recycle_version(body.target_version, "target_version")
+    from src.dalton.services.automation_recycle import rollback_task
+
+    return await rollback_task(
+        principal,
+        automation_id,
+        expected_config_version=version,
+        target_version=target,
+    )
 
 
 # =============================================================================

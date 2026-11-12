@@ -194,7 +194,7 @@ _POLICIES: Dict[Outcome, _Policy] = {
     # DALTON-HOOK(precheck-outcome): zero-token preflight skip from pending
     Outcome.PRECHECK_SKIPPED: _Policy(
         status="skipped",
-        from_statuses=("pending",),
+        from_statuses=("pending", "running"),
         metric="precheck_skipped",
         schedule="close",
     ),
@@ -463,7 +463,16 @@ async def _after_settling(
     it. Any other held run is finished from here.
     """
     policy = _POLICIES[outcome]
-    if policy.webhook and not _repeats_a_refusal(policy.failure_reason, run_id, row):
+    # DALTON-HOOK(company-automations): a soft-deleted automation does not notify
+    from src.dalton.database.automation_recycle import automation_is_soft_deleted
+
+    parent_id = str(automation.get("automation_id") or "")
+    deleted = bool(parent_id) and await automation_is_soft_deleted(parent_id)
+    if (
+        not deleted
+        and policy.webhook
+        and not _repeats_a_refusal(policy.failure_reason, run_id, row)
+    ):
         if delivery is not None and delivery.held and policy.finish is not None:
             if finish_left:
                 _nudge_drainer()
@@ -483,7 +492,7 @@ async def _after_settling(
             if delivery_result is not None:
                 await _record_delivery(execution_id, delivery_result)
     # DALTON-HOOK(dalton-notify): push completed Dalton automation results to analyst via OpenClaw
-    if outcome is Outcome.COMPLETED:
+    if not deleted and outcome is Outcome.COMPLETED:
         from src.dalton.notify.dispatch import on_automation_settled
 
         await on_automation_settled(
@@ -866,11 +875,12 @@ async def _settle_finished_run(job: Dict[str, Any]) -> None:
     from src.server.services.hook_outbox import MAX_ATTEMPTS
 
     payload = job.get("payload") or {}
-    automation = await auto_db.get_automation(
+    # A soft-deleted parent still settles. Notification is skipped afterwards.
+    # None means the row is physically gone.
+    automation = await auto_db.get_automation_including_deleted(
         payload["automation_id"], payload.get("user_id")
     )
     if automation is None:
-        # Deleted, and its firings with it.
         return
     run_id = str(job["run_id"])
     await settle_by_run(

@@ -1225,20 +1225,58 @@ async def _has_recent_health_check_within_24h(*, conn: Any = None) -> bool:
 
 
 async def _is_data_health_paused_by_user(*, conn: Any = None) -> bool:
-    """Return True if the Home ``dalton-data-health`` automation is paused or marked ``paused_by_user``."""
-    from src.dalton.autonomy.schedule import list_all_user_automations
+    """Return True when startup health should stay quiet.
+
+    A company-owned ``dalton-data-health`` row decides by itself, including
+    when it is soft-deleted. Otherwise any matching PM row does. Deleted
+    rows count. An empty PM list still falls back to ``local-dev-user``.
+    """
+    from psycopg.rows import dict_row
+
+    from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
     from src.dalton.credentials import get_configured_pm_user_ids
+    from src.server.database.pool import get_db_connection
 
     pm_ids = list(get_configured_pm_user_ids() or ["local-dev-user"])
-    for uid in pm_ids:
-        rows = await list_all_user_automations(uid, name_prefix="dalton-data-health", conn=conn)
-        for r in rows:
-            if not isinstance(r, Mapping) or str(r.get("name") or "").strip() != "dalton-data-health":
-                continue
-            st = str(r.get("status") or "").strip().lower()
-            meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
-            if st == "paused" or bool(meta.get("paused_by_user")):
-                return True
+    async with get_db_connection(conn) as db:
+        async with db.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT user_id, scope, status, deleted_at, metadata
+                FROM automations
+                WHERE name = 'dalton-data-health'
+                  AND (
+                        scope = 'company'
+                        OR user_id = %s
+                        OR user_id = ANY(%s)
+                  )
+                """,
+                (COMPANY_SYSTEM_USER_ID, pm_ids),
+            )
+            rows = list(await cur.fetchall() or [])
+    company_rows = [
+        row
+        for row in rows
+        if str(row.get("scope") or "") == "company"
+        or str(row.get("user_id") or "") == COMPANY_SYSTEM_USER_ID
+    ]
+    chosen = company_rows or [
+        row for row in rows if str(row.get("user_id") or "") in set(pm_ids)
+    ]
+    freeze_stages = {"frozen", "switching", "rollback_frozen"}
+    for row in chosen:
+        if row.get("deleted_at") is not None:
+            return True
+        status = str(row.get("status") or "").strip().lower()
+        if status not in ("active", "executing"):
+            return True
+        meta = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+        if bool(meta.get("paused_by_user")):
+            return True
+        migration = meta.get("company_migration") if isinstance(meta, Mapping) else None
+        stage = migration.get("stage") if isinstance(migration, Mapping) else None
+        if stage in freeze_stages:
+            return True
     return False
 
 

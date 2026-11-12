@@ -14,6 +14,7 @@ import copy
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
+from datetime import UTC, datetime
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
@@ -108,13 +109,25 @@ class FakeAutomationsDb:
             stored = {"user_id": self.user_id, "owns_thread": False, **copy.deepcopy(row)}
             self.rows[str(stored["automation_id"])] = stored
 
+    def _is_live(self, row: dict[str, Any]) -> bool:
+        return row.get("deleted_at") is None
+
     def list(self) -> list[dict[str, Any]]:
-        mine = [r for r in self.rows.values() if r["user_id"] == self.user_id]
+        mine = [
+            r for r in self.rows.values()
+            if r["user_id"] == self.user_id and self._is_live(r)
+        ]
         return [copy.deepcopy(r) for r in sorted(mine, key=lambda r: r["file_name"])]
 
     def _filed(self, user_id: str, file_name: str) -> dict[str, Any] | None:
         return next(
-            (r for r in self.rows.values() if r["user_id"] == user_id and r["file_name"] == file_name), None
+            (
+                r for r in self.rows.values()
+                if r["user_id"] == user_id
+                and r["file_name"] == file_name
+                and self._is_live(r)
+            ),
+            None,
         )
 
     def _taken(self, user_id: str, file_name: str) -> UniqueViolation:
@@ -163,7 +176,9 @@ class FakeAutomationsDb:
 
     async def get_automation(self, automation_id: str, user_id: str, *, conn: Any = None) -> dict[str, Any] | None:
         row = self._owned(automation_id, user_id)
-        return copy.deepcopy(row) if row else None
+        if row is None or not self._is_live(row):
+            return None
+        return copy.deepcopy(row)
 
     async def create_automation(
         self,
@@ -249,9 +264,23 @@ class FakeAutomationsDb:
                 row[key] = _uuid(value) if key in _UUID_COLUMNS else value
         return copy.deepcopy(row)
 
-    async def delete_automation(self, automation_id: str, user_id: str, *, conn: Any = None) -> bool:
+    async def delete_automation(
+        self,
+        automation_id: str,
+        user_id: str,
+        *,
+        conn: Any = None,
+        actor_user_id: str | None = None,
+        expected_config_version: int | None = None,
+        prelocked_pref_row: Any = None,
+    ) -> bool:
         self._journal("delete", automation_id, conn)
-        if self._owned(automation_id, user_id) is None:
+        row = self._owned(automation_id, user_id)
+        if row is None or row.get("deleted_at") is not None:
             return False
-        del self.rows[str(automation_id)]
+        prior = str(row.get("status") or "")
+        row["pre_delete_desired_status"] = "active" if prior in ("active", "executing") else "paused"
+        row["status"] = "paused"
+        row["deleted_at"] = datetime.now(UTC)
+        row["deleted_by"] = actor_user_id or user_id
         return True

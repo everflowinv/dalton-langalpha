@@ -12,11 +12,13 @@ here ends.
 import asyncio
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
 
+from src.dalton.database.automation_recycle import automation_is_soft_deleted
+from src.server.database.automation_executions import begin_execution_if_not_deleted
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.runs.lifecycle import RunSlotBusyError
 from src.server.handlers.chat.admission_gate import (
@@ -88,6 +90,15 @@ def _firing(turns, *, runs=None, busy=(), fresh=None, is_byok=(False,)):
     """
     runs = runs or {}
     db = MagicMock()
+    # Truthy, and awaitable: a child MagicMock raises at the new pending→running
+    # call, and the tests that poll for the turn would then wait forever.
+    db.begin_execution_if_not_deleted = create_autospec(
+        begin_execution_if_not_deleted,
+        return_value={
+            "conversation_thread_id": None,
+            "conversation_response_id": None,
+        },
+    )
     db.transition_execution = AsyncMock(return_value={"conversation_thread_id": None})
     db.settle_execution = AsyncMock(
         return_value={
@@ -131,6 +142,10 @@ def _firing(turns, *, runs=None, busy=(), fresh=None, is_byok=(False,)):
         patch(f"{_MOD}.exec_db", new=db),
         patch("src.server.services.automation_settlement.auto_db", new=db),
         patch("src.server.services.automation_settlement.exec_db", new=db),
+        patch(
+            "src.dalton.database.automation_recycle.automation_is_soft_deleted",
+            new=create_autospec(automation_is_soft_deleted, return_value=False),
+        ),
         patch(f"{_MOD}.is_byok_active", new=fx.byok),
         patch(f"{_MOD}.has_any_oauth_token", new=AsyncMock(return_value=False)),
         patch(f"{_MOD}.enforce_credit_limit", new=fx.credit),
@@ -354,6 +369,47 @@ async def test_a_stop_before_admission_interrupts_the_firing():
     assert _settled(fx)["to"] == "failed"
     assert _settled(fx)["error_message"] == INTERRUPTED_ERROR
     assert _settled(fx)["conversation_response_id"] is None
+
+
+def _heartbeat_names() -> list[str]:
+    return [
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if not task.done() and task.get_name().startswith("automation_heartbeat_")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_preflight_cancel_settles_interrupted_and_stops_the_heartbeat():
+    with _firing([]) as fx:
+        with patch(
+            "src.dalton.autonomy.preflight.decide",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await AutomationExecutor().execute(_automation(), _EXEC)
+    assert _settled(fx)["to"] == "failed"
+    assert _settled(fx)["failure_reason"] == "interrupted"
+    assert _settled(fx)["from_statuses"] == ("pending", "running")
+    fx.astream.assert_not_called()
+    await asyncio.sleep(0)
+    assert _heartbeat_names() == []
+
+
+@pytest.mark.asyncio
+async def test_a_preflight_error_settles_by_whose_failure_it_was():
+    with _firing([]) as fx:
+        with patch(
+            "src.dalton.autonomy.preflight.decide",
+            new=AsyncMock(side_effect=RuntimeError("preflight blew up")),
+        ):
+            await AutomationExecutor().execute(_automation(), _EXEC)
+    assert _settled(fx)["to"] == "failed"
+    assert _settled(fx)["strike"] == "count"
+    assert "RuntimeError: preflight blew up" in _settled(fx)["error_message"]
+    fx.astream.assert_not_called()
+    await asyncio.sleep(0)
+    assert _heartbeat_names() == []
 
 
 # ─── Delivery through the messaging service ──────────────────────────
@@ -599,10 +655,10 @@ async def test_a_refusal_with_nowhere_to_deliver_fires_the_webhook():
 @pytest.mark.asyncio
 async def test_a_firing_settled_before_its_turn_hands_nothing_over():
     with _firing([_streams]) as fx, _delivery(_HELD) as dx:
-        fx.db.transition_execution.side_effect = [
-            {"conversation_thread_id": None},  # pending -> running
-            None,  # the thread could not be recorded: settled elsewhere
-        ]
+        # pending→running is begin_execution_if_not_deleted. The one
+        # transition_execution call records the thread, and None means that
+        # write lost because the firing was settled elsewhere.
+        fx.db.transition_execution.return_value = None
         await AutomationExecutor().execute(_automation(**_DELIVERING), _EXEC)
 
     dx.start.assert_not_awaited()

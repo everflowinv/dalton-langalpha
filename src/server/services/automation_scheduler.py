@@ -71,6 +71,18 @@ class AutomationScheduler:
         self._shutdown_event.clear()
         self._context = contextvars.copy_context()
         self._executor.resume_waiting()
+        # DALTON-HOOK(company-automations): one 30-day recycle purge on startup
+        try:
+            from src.dalton.services.automation_recycle import (
+                purge_expired_automations_if_due,
+            )
+
+            await purge_expired_automations_if_due(
+                datetime.now(timezone.utc),
+                force=True,
+            )
+        except Exception:
+            logger.exception("[SCHEDULER] recycle purge failed")
         self._poll_task = asyncio.create_task(
             self._poll_loop(), name="automation_scheduler_poll"
         )
@@ -140,22 +152,36 @@ class AutomationScheduler:
         """
         try:
             closed = await exec_db.settle_legacy_executions(INTERRUPTED_ERROR)
-            if closed:
-                logger.warning(
-                    f"[SCHEDULER] Closed {closed} firings left unsettled "
-                    f"by an earlier build"
-                )
+            skipped = await exec_db.skip_unstarted_executions_of_deleted_parents()
             rows = await exec_db.list_abandoned_executions(ABANDONED_AFTER_SECONDS)
         except Exception as e:
             logger.error(f"[SCHEDULER] Abandoned-firing sweep failed: {e}")
             return
+        if closed:
+            logger.warning(
+                f"[SCHEDULER] Closed {closed} firings left unsettled "
+                f"by an earlier build"
+            )
+        if skipped:
+            logger.warning(
+                "[SCHEDULER] Skipped %s unstarted firing(s) of deleted automations",
+                skipped,
+            )
         for row in rows:
             execution_id = str(row["automation_execution_id"])
             try:
-                automation = await auto_db.get_automation(
+                automation = await auto_db.get_automation_including_deleted(
                     str(row["automation_id"]), row["user_id"]
                 )
                 if automation is None:
+                    continue
+                if (
+                    automation.get("deleted_at") is not None
+                    and row["status"] in ("pending", "waiting")
+                ):
+                    # Already covered by the one UPDATE when the parent was
+                    # still deleted. An id update here would also skip a run
+                    # created after a restore.
                     continue
                 outcome = await settle_abandoned(
                     automation, row, ABANDONED_AFTER_SECONDS
@@ -220,7 +246,22 @@ class AutomationScheduler:
                         automation["cron_expression"],
                         automation.get("timezone", "UTC"),
                     )
-                    await auto_db.update_automation_next_run(automation_id, next_run)
+                    wrote = await auto_db.update_automation_next_run(
+                        automation_id,
+                        next_run,
+                        config_version=(
+                            int(automation["config_version"])
+                            if automation.get("config_version") is not None
+                            else None
+                        ),
+                    )
+                    # DALTON-HOOK(company-automations): one retry when the claim's version moved
+                    if not wrote:
+                        from src.dalton.services.automation_recycle import (
+                            retry_claimed_cron_next_run,
+                        )
+
+                        await retry_claimed_cron_next_run(automation_id)
                 except Exception as e:
                     logger.error(
                         f"[SCHEDULER] Scheduling the next run failed, so it has "
@@ -237,6 +278,15 @@ class AutomationScheduler:
             self._sweep_task = asyncio.create_task(
                 self._sweep_abandoned_firings(), name="automation_sweep"
             )
+        # DALTON-HOOK(company-automations): daily recycle purge, one worker via advisory lock
+        try:
+            from src.dalton.services.automation_recycle import (
+                purge_expired_automations_if_due,
+            )
+
+            await purge_expired_automations_if_due(now)
+        except Exception:
+            logger.exception("[SCHEDULER] recycle purge failed")
 
     async def _run_execution(
         self,

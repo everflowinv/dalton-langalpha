@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 import httpx
+from fastapi import HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -57,6 +58,7 @@ from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.home_workspace import is_home_id, is_home_row
 from src.server.database.pool import get_db_connection
+from src.server.utils.api import raise_not_found
 from src.server.database.user import (
     get_user_preferences,
     invalidate_user_prefs_cache,
@@ -892,6 +894,7 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
     defs_by_key: dict[str, dict[str, Any]] = {}
     runs_by_key: dict[str, dict[str, Any]] = {}
     pm_routes_by_key: dict[str, list[str]] = {}
+    deleted_job_keys: set[str] = set()
 
     try:
         async with get_db_connection() as conn:
@@ -903,8 +906,10 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
                         cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
                         cos_mode, notify_enabled, enabled, paused_by_user,
                         consecutive_failures, config_version, active_version,
-                        updated_by, audit_history, updated_at
+                        updated_by, audit_history, updated_at,
+                        notify_storage_mode, notify_routes
                     FROM dalton_data_task_defs
+                    WHERE deleted_at IS NULL
                     ORDER BY batch_no ASC, task_code ASC, job_key ASC
                     """
                 )
@@ -912,6 +917,17 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
                 for d_row in def_rows or []:
                     if isinstance(d_row, Mapping) and d_row.get("job_key"):
                         defs_by_key[str(d_row["job_key"])] = dict(d_row)
+
+                await cur.execute(
+                    """
+                    SELECT job_key
+                    FROM dalton_data_task_defs
+                    WHERE deleted_at IS NOT NULL
+                    """
+                )
+                for gone in await cur.fetchall() or []:
+                    if isinstance(gone, Mapping) and gone.get("job_key"):
+                        deleted_job_keys.add(str(gone["job_key"]))
 
                 await cur.execute(
                     """
@@ -935,15 +951,39 @@ async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for entry in manifest_entries:
         jk = entry.job_key
+        if jk in deleted_job_keys:
+            continue
+        def_row = defs_by_key.get(jk)
+        routes = _data_task_routes_for_read(def_row, pm_routes_by_key.get(jk))
         out.append(
             _build_data_job_entry(
                 entry,
-                defs_by_key.get(jk),
+                def_row,
                 runs_by_key.get(jk),
-                pm_routes_by_key.get(jk),
+                routes,
             )
         )
     return out
+
+
+def _data_task_routes_for_read(
+    def_row: Mapping[str, Any] | None,
+    legacy_routes: list[str] | None,
+) -> list[str] | None:
+    """Routes from the row when storage is ``task_row``; otherwise the preference list."""
+    if (
+        isinstance(def_row, Mapping)
+        and str(def_row.get("notify_storage_mode") or "legacy").strip() == "task_row"
+    ):
+        raw = def_row.get("notify_routes") or []
+        if isinstance(raw, list):
+            return [
+                str(item).strip()
+                for item in raw
+                if isinstance(item, str) and str(item).strip()
+            ]
+        return []
+    return legacy_routes
 
 
 async def _fetch_single_data_system_job(
@@ -971,7 +1011,8 @@ async def _fetch_single_data_system_job(
                     cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
                     cos_mode, notify_enabled, enabled, paused_by_user,
                     consecutive_failures, config_version, active_version,
-                    updated_by, audit_history, updated_at
+                    updated_by, audit_history, updated_at,
+                    notify_storage_mode, notify_routes, deleted_at
                 FROM dalton_data_task_defs
                 WHERE job_key = %s
                 """,
@@ -998,8 +1039,16 @@ async def _fetch_single_data_system_job(
                 latest_run = dict(fetched_run)
 
         if pm_routes is None:
-            routes_map = await _read_pm_data_notify_routes_map(conn=c)
-            pm_routes = routes_map.get(job_key)
+            row_routes = _data_task_routes_for_read(def_row, None)
+            if (
+                isinstance(def_row, Mapping)
+                and str(def_row.get("notify_storage_mode") or "legacy").strip()
+                == "task_row"
+            ):
+                pm_routes = row_routes or []
+            else:
+                routes_map = await _read_pm_data_notify_routes_map(conn=c)
+                pm_routes = routes_map.get(job_key)
 
     try:
         if conn is not None:
@@ -1007,6 +1056,8 @@ async def _fetch_single_data_system_job(
         else:
             async with get_db_connection() as db_conn:
                 await _query_on_conn(db_conn)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.debug(
             "[DALTON_SYSTEM_JOBS] single data task query fallback for %s: %s",
@@ -1016,6 +1067,11 @@ async def _fetch_single_data_system_job(
         if pm_routes is None:
             routes_map = await _read_pm_data_notify_routes_map()
             pm_routes = routes_map.get(job_key)
+
+    # A database error leaves def_row empty and still falls back to the manifest.
+    # A deleted row is hidden here, the same way the list omits it.
+    if isinstance(def_row, Mapping) and def_row.get("deleted_at") is not None:
+        raise_not_found("Automation")
 
     return _build_data_job_entry(manifest_entry, def_row, latest_run, pm_routes)
 
@@ -1032,7 +1088,8 @@ async def _ensure_and_lock_data_task_def_row(
             cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
             cos_mode, notify_enabled, enabled, paused_by_user,
             consecutive_failures, config_version, active_version,
-            updated_by, audit_history, updated_at
+            updated_by, audit_history, updated_at, deleted_at,
+            notify_storage_mode, notify_routes
         FROM dalton_data_task_defs
         WHERE job_key = %s
         FOR UPDATE
@@ -1094,7 +1151,8 @@ async def _ensure_and_lock_data_task_def_row(
             cron_expr, timezone, timeout_seconds, no_output_timeout_seconds,
             cos_mode, notify_enabled, enabled, paused_by_user,
             consecutive_failures, config_version, active_version,
-            updated_by, audit_history, updated_at
+            updated_by, audit_history, updated_at, deleted_at,
+            notify_storage_mode, notify_routes
         FROM dalton_data_task_defs
         WHERE job_key = %s
         FOR UPDATE
@@ -1258,6 +1316,9 @@ async def record_auto_pruned_data_task_routes(
 async def rollback_data_task_config(
     actor_user_id: str,
     job_key: str,
+    *,
+    expected_config_version: int | None = None,
+    target_version: int | None = None,
 ) -> dict[str, Any]:
     """Step backward along the ``prev_version`` chain for ``data:<job_key>`` and record a rollback snapshot."""
     actor_uid = str(actor_user_id or "").strip()
@@ -1285,7 +1346,26 @@ async def rollback_data_task_config(
         locked_prefs = await lock_user_preferences(pm_user_id, conn=conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             def_row = await _ensure_and_lock_data_task_def_row(cur, manifest_entry)
+            if def_row.get("deleted_at") is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Restore the data task before rolling it back",
+                )
+            storage_mode = (
+                str(def_row.get("notify_storage_mode") or "legacy").strip() or "legacy"
+            )
             old_ver = int(def_row.get("config_version") or 1)
+            if (
+                expected_config_version is not None
+                and int(expected_config_version) != old_ver
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "config_version conflict: "
+                        f"expected {expected_config_version}, found {old_ver}"
+                    ),
+                )
             active_ver = int(def_row.get("active_version") or 1)
             old_enabled = bool(def_row.get("enabled", False))
             old_cron = str(def_row.get("cron_expr") or manifest_entry.cron_expr).strip()
@@ -1299,10 +1379,18 @@ async def rollback_data_task_config(
                 )
 
             active_entry = _find_audit_entry(history, active_ver)
-            if active_entry is None or active_entry.get("prev_version") is None:
+            previous = None if active_entry is None else active_entry.get("prev_version")
+            if isinstance(previous, bool) or not isinstance(previous, int):
+                previous = None
+            if target_version is not None:
+                if previous is None or int(target_version) != previous:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="target_version must be the previous active version",
+                    )
+            elif active_entry is None or previous is None:
                 raise ValueError("已处于最早配置版本，无法继续回退")
-
-            target_ver = int(active_entry["prev_version"])
+            target_ver = int(previous) if previous is not None else 0
             target_entry = _find_audit_entry(history, target_ver)
             if target_entry is None or not isinstance(target_entry.get("snapshot"), Mapping):
                 raise ValueError("已处于最早配置版本，无法继续回退")
@@ -1320,6 +1408,10 @@ async def rollback_data_task_config(
                 for x in (target_snapshot.get("notify_routes") or [])
                 if isinstance(x, str) and str(x).strip()
             ]
+            if "notify_enabled" in target_snapshot:
+                restored_notify_enabled = bool(target_snapshot.get("notify_enabled"))
+            else:
+                restored_notify_enabled = bool(def_row.get("notify_enabled"))
             # A snapshot without a schedule (the seed, or one taken before the
             # schedule became editable) leaves the current schedule in place:
             # the manifest no longer owns these columns once the row exists.
@@ -1332,7 +1424,14 @@ async def rollback_data_task_config(
                 else None
             )
             active_snap = active_entry.get("snapshot")
-            if target in stored_routes_map:
+            if storage_mode == "task_row":
+                raw_row_routes = def_row.get("notify_routes") or []
+                old_routes = [
+                    str(x).strip()
+                    for x in raw_row_routes
+                    if isinstance(x, str) and str(x).strip()
+                ] if isinstance(raw_row_routes, list) else []
+            elif target in stored_routes_map:
                 old_routes = stored_routes_map[target]
             elif isinstance(active_snap, Mapping) and isinstance(
                 active_snap.get("notify_routes"), list
@@ -1360,7 +1459,24 @@ async def rollback_data_task_config(
                     "new": restored_tz,
                 }
 
+            if storage_mode == "task_row" and (
+                bool(def_row.get("notify_enabled")) != restored_notify_enabled
+                or "notify_enabled" in target_snapshot
+            ):
+                rollback_changes["notify_enabled"] = {
+                    "old": bool(def_row.get("notify_enabled")),
+                    "new": restored_notify_enabled,
+                }
+
             new_ver = old_ver + 1
+            rollback_snapshot: dict[str, Any] = {
+                "enabled": restored_enabled,
+                "notify_routes": restored_routes,
+                "cron_expr": restored_cron,
+                "timezone": restored_tz,
+            }
+            if storage_mode == "task_row":
+                rollback_snapshot["notify_enabled"] = restored_notify_enabled
             rollback_entry = {
                 "version": new_ver,
                 "prev_version": target_entry.get("prev_version"),
@@ -1369,12 +1485,7 @@ async def rollback_data_task_config(
                 "changed_at": now_iso,
                 "action": "rollback",
                 "changes": rollback_changes,
-                "snapshot": {
-                    "enabled": restored_enabled,
-                    "notify_routes": restored_routes,
-                    "cron_expr": restored_cron,
-                    "timezone": restored_tz,
-                },
+                "snapshot": rollback_snapshot,
             }
             updated_history = history + [rollback_entry]
 
@@ -1416,16 +1527,29 @@ async def rollback_data_task_config(
                     (target,),
                 )
 
-        await _write_pm_data_task_notify_route_in_tx(
-            conn,
-            pm_user_id=pm_user_id,
-            job_key=target,
-            notify_routes=restored_routes,
-        )
+            if storage_mode == "task_row":
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET notify_enabled = %s,
+                        notify_routes = %s,
+                        updated_at = NOW()
+                    WHERE job_key = %s
+                    """,
+                    (restored_notify_enabled, Jsonb(restored_routes), target),
+                )
+
+        if storage_mode != "task_row":
+            await _write_pm_data_task_notify_route_in_tx(
+                conn,
+                pm_user_id=pm_user_id,
+                job_key=target,
+                notify_routes=restored_routes,
+            )
         job_entry = await _fetch_single_data_system_job(
             target,
             conn=conn,
-            pm_routes_override=restored_routes,
+            pm_routes_override=None if storage_mode == "task_row" else restored_routes,
         )
 
     await invalidate_user_prefs_cache(pm_user_id)
@@ -1937,6 +2061,8 @@ async def toggle_system_job(
                     def_row = await _ensure_and_lock_data_task_def_row(
                         cur, manifest_entry
                     )
+                    if def_row.get("deleted_at") is not None:
+                        raise_not_found("Automation")
                     old_ver = int(def_row.get("config_version") or 1)
                     active_ver = int(def_row.get("active_version") or 1)
                     old_enabled = bool(def_row.get("enabled", False))
@@ -2245,6 +2371,11 @@ async def toggle_system_job(
 async def _trigger_automation_row_async(user_id: str, automation_row: dict[str, Any]) -> dict[str, Any]:
     """Trigger an automation row immediately via ``AutomationScheduler`` without altering its schedule."""
     auto_id = str(automation_row["automation_id"])
+    # DALTON-HOOK(company-automations): a soft-deleted row is not triggered, including the not-found fallback
+    from src.dalton.database.automation_recycle import automation_is_soft_deleted
+
+    if automation_row.get("deleted_at") is not None or await automation_is_soft_deleted(auto_id):
+        raise ValueError("Automation not found")
     try:
         res = await auto_lifecycle.trigger_automation(auto_id, user_id)
         return {
@@ -2257,12 +2388,13 @@ async def _trigger_automation_row_async(user_id: str, automation_row: dict[str, 
             raise
         logger.warning("[DALTON_SYSTEM_JOBS] trigger_automation fallback for %s: %s", auto_id, exc)
         scheduler = AutomationScheduler.get_instance()
-        execution_id = await exec_db.create_execution(
-            automation_id=auto_id,
-            scheduled_at=datetime.now(UTC),
-            server_id=scheduler.server_id,
+        execution_id, parent = await exec_db.create_execution_for_live_parent(
+            auto_id,
+            user_id,
+            datetime.now(UTC),
+            scheduler.server_id,
         )
-        scheduler.dispatch(automation_row, execution_id, name=f"manual_exec_{auto_id[:8]}")
+        scheduler.dispatch(parent, execution_id, name=f"manual_exec_{auto_id[:8]}")
         return {
             "execution_id": execution_id,
             "automation_id": auto_id,
@@ -2299,7 +2431,7 @@ async def run_system_job_now(
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     """
-                    SELECT job_key, title, enabled, timeout_seconds
+                    SELECT job_key, title, enabled, timeout_seconds, deleted_at
                     FROM dalton_data_task_defs
                     WHERE job_key = %s
                     FOR UPDATE
@@ -2307,6 +2439,8 @@ async def run_system_job_now(
                     (target,),
                 )
                 def_row = await cur.fetchone()
+                if isinstance(def_row, Mapping) and def_row.get("deleted_at") is not None:
+                    raise_not_found("Automation")
                 if not isinstance(def_row, Mapping) or not bool(def_row.get("enabled", False)):
                     raise ValueError("任务已关闭，请先开启后再手动运行")
 
