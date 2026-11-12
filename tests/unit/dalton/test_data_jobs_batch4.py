@@ -349,7 +349,9 @@ def test_e_watch_txt_attachment_is_staged_as_plain_text(tmp_path: Path) -> None:
     )
     run_dir = workspace / ".dalton-runs" / RUN_ID
     run_dir.mkdir(parents=True)
-    items = mod.stage_delivery_items(spec, workspace, workspace, run_dir)
+    items = mod.stage_delivery_items(
+        spec, workspace, workspace, run_dir, allowed_suffixes=mod.E_WATCH_REPORT_SUFFIXES,
+    )
     assert [item["text"] for item in items] == [first, ATTACHMENT_TEXT]
     assert items[0].get("media") is None
     assert items[1]["filename"] == "e_watch_latest.txt"
@@ -393,7 +395,11 @@ def test_e_watch_txt_attachment_is_staged_as_plain_text(tmp_path: Path) -> None:
     assert loaded.filename == "e_watch_latest.txt"
     assert loaded.mime_type == "text/plain"
     assert loaded.content == body.encode("utf-8")
-    assert _detect_validated_artifact_mime(b"# card\n", "card.md") == MARKDOWN_ARTIFACT_MIME
+    assert _detect_validated_artifact_mime(
+        b"# card\n", "card.md", text_suffixes={".md"},
+    ) == MARKDOWN_ARTIFACT_MIME
+    with pytest.raises(Exception, match="Unsupported artifact file extension"):
+        _detect_validated_artifact_mime(b"not an image", "chart.txt")
 
 
 def test_china_stdout_keeps_the_trailing_newline(tmp_path: Path) -> None:

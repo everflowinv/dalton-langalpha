@@ -67,7 +67,11 @@ US_TOPBOTTOM_COLLECTORS: tuple[tuple[str, str], ...] = (
     ('us-top-monitor', 'skills/us-top-monitor/scripts/us_top_monitor_cli.py'),
 )
 US_TOPBOTTOM_SKILLS = tuple(skill for skill, _ in US_TOPBOTTOM_COLLECTORS)
-ALLOWED_CHART_SUFFIXES = frozenset({'.png', '.jpg', '.jpeg', '.webp', '.gif', '.md', '.txt'})
+# Charts are images. ``.md`` is only an ai-chain high-severity card, and ``.txt``
+# is only the e-watch full report. Other tasks, including T26, stay on images.
+ALLOWED_CHART_SUFFIXES = frozenset({'.png', '.jpg', '.jpeg', '.webp', '.gif'})
+AI_CHAIN_CARD_SUFFIXES = ALLOWED_CHART_SUFFIXES | {'.md'}
+E_WATCH_REPORT_SUFFIXES = ALLOWED_CHART_SUFFIXES | {'.txt'}
 DEFAULT_CONTAINER_PYTHON_BIN = '/app/.venv/bin/python'
 DEFAULT_TMPFS_OUTBOX_DIR = Path('/run/dalton-outbox')
 DEFAULT_CONTAINER_SECRETS_DIR = Path('/run/dalton-secrets')
@@ -437,7 +441,8 @@ def _assert_no_symlinks_under_base(base: Path, rel_parts: tuple[str, ...]) -> No
             raise ValueError(f'附件路径包含软链接：{cur}')
 
 
-def _validate_workspace_chart(chart_raw: Any, ws_root: Path, raw_ws: Path) -> Path:
+def _validate_workspace_chart(chart_raw: Any, ws_root: Path, raw_ws: Path, allowed_suffixes=None) -> Path:
+    """Check one workspace attachment. The default suffix set is images only."""
     if not isinstance(chart_raw, str) or not chart_raw.strip() or '\x00' in chart_raw:
         raise ValueError('采集输出缺少有效 chart')
     stripped = chart_raw.strip()
@@ -478,7 +483,8 @@ def _validate_workspace_chart(chart_raw: Any, ws_root: Path, raw_ws: Path) -> Pa
     _assert_no_symlinks_under_base(ws_root, tuple(resolved.relative_to(ws_root).parts))
 
     suffix = resolved.suffix.lower()
-    if suffix not in ALLOWED_CHART_SUFFIXES:
+    allowed = ALLOWED_CHART_SUFFIXES if allowed_suffixes is None else frozenset(allowed_suffixes)
+    if suffix not in allowed:
         raise ValueError(f'附件格式不支持：{resolved}')
 
     open_flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
@@ -772,7 +778,9 @@ def _run_dalton_ai_chain_preview_body():
             }
             media = entry.get('media')
             if media:
-                src = _validate_workspace_chart(media, ws_root, raw_ws)
+                src = _validate_workspace_chart(
+                    media, ws_root, raw_ws, allowed_suffixes=AI_CHAIN_CARD_SUFFIXES,
+                )
                 original_name = Path(src.name).name
                 retained = _ensure_safe_workspace_subpath(
                     ws_root, (*run_rel, 'attachments', str(pos), original_name),
@@ -1140,8 +1148,12 @@ def _monitor_obj(raw, context='采集输出'):
     return value
 
 
-def stage_delivery_items(spec, ws_root, raw_ws, run_dir):
-    """Copy spec media into the run directory and return ordered outbox items."""
+def stage_delivery_items(spec, ws_root, raw_ws, run_dir, *, allowed_suffixes=None):
+    """Copy spec media into the run directory and return ordered outbox items.
+
+    ``allowed_suffixes`` defaults to images. e-watch passes ``E_WATCH_REPORT_SUFFIXES``
+    so the full-text ``.txt`` is accepted and other tasks are not.
+    """
     run_rel = tuple(run_dir.relative_to(ws_root).parts)
     outbox_items = []
     for pos, entry in enumerate(spec):
@@ -1157,7 +1169,9 @@ def stage_delivery_items(spec, ws_root, raw_ws, run_dir):
         }
         media = entry.get('media')
         if media:
-            src = _validate_workspace_chart(media, ws_root, raw_ws)
+            src = _validate_workspace_chart(
+                media, ws_root, raw_ws, allowed_suffixes=allowed_suffixes,
+            )
             original_name = Path(src.name).name
             retained = _ensure_safe_workspace_subpath(
                 ws_root, (*run_rel, 'attachments', str(pos), original_name),
@@ -1264,7 +1278,9 @@ def _run_dalton_e_watch_daily_preview_body():
         )
         obj = _monitor_obj(result.stdout or '')
         spec = e_watch_daily_delivery_spec(obj)
-        items = stage_delivery_items(spec, ws_root, raw_ws, run_dir)
+        items = stage_delivery_items(
+            spec, ws_root, raw_ws, run_dir, allowed_suffixes=E_WATCH_REPORT_SUFFIXES,
+        )
         _write_staged_monitor_outbox(
             staging,
             task_code='T35',
