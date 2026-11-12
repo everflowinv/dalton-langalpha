@@ -937,6 +937,35 @@ def _summary_date(events: dict[str, Any]) -> str:
     return value
 
 
+# Same link shape as feishu_doc_url in scripts/dalton/researchdata_bridge.py.
+FEISHU_DOC_BASE = "https://feishu.cn"
+_FEISHU_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
+
+
+def doc_record_rel(summary_date: str) -> str:
+    return f"temp/vip-news-alert/{summary_date}/doc.json"
+
+
+def _transcript_doc_url(workspace: Path, summary_date: str) -> str | None:
+    """Link to the Feishu doc feishu_create_doc made today, read from doc.json."""
+    path = _card_io().workspace_file(workspace, doc_record_rel(summary_date))
+    if not path.is_file():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("ok") is not True:
+        return None
+    node = record.get("node_token")
+    if isinstance(node, str) and _FEISHU_TOKEN_RE.fullmatch(node):
+        return f"{FEISHU_DOC_BASE}/wiki/{node}"
+    document_id = record.get("document_id")
+    if isinstance(document_id, str) and _FEISHU_TOKEN_RE.fullmatch(document_id):
+        return f"{FEISHU_DOC_BASE}/docx/{document_id}"
+    return None
+
+
 def _require_http(value: Any) -> str:
     if not isinstance(value, str):
         raise RuntimeError("url must be http")
@@ -1104,7 +1133,11 @@ def build_markdown(events: dict[str, Any], workspace: Path, *, as_of: str | None
         for block in transcript_blocks:
             lines.extend(block)
             lines.append("")
-        lines.append(f"完整记录已存工作区 {transcript_rel(summary_date)}")
+        doc_url = _transcript_doc_url(workspace, summary_date)
+        if doc_url:
+            lines.append(f"📝 完整采访记录：{doc_url}")
+        else:
+            lines.append(f"完整记录已存工作区 {transcript_rel(summary_date)}")
         lines.append("")
     if notes:
         lines.append("## 来源")

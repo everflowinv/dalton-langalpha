@@ -30,7 +30,9 @@ PROFILE = "vip-news-alert"
 RUN_ID = "vip-news-alert-2026-11-12"
 BANNED = (
     "discord",
-    "feishu",
+    # The skill may call feishu_create_doc for the transcript doc; a delivery
+    # target ("feishu:chat:...", "feishu:user:...") must still never appear.
+    "feishu:",
     "feishu_send_card",
     ".openclaw",
     "openclaw_workspace",
@@ -1139,3 +1141,44 @@ def test_a_youtube_link_from_web_search_beats_a_same_title_article() -> None:
     trump = _person(result, "Trump")
     assert [video["url"] for video in trump["videos"]] == ["https://www.youtube.com/watch?v=interview01"]
     assert trump["web_articles"] == []
+
+
+def test_the_card_links_the_feishu_transcript_doc_when_one_was_made(tmp_path: Path) -> None:
+    cli = _load("vip_news_doc_link", CLI_PATH)
+    interview = {
+        "summary": "采访摘要",
+        "url": "https://www.youtube.com/watch?v=abcdefghijk",
+        "title": "Trump interview",
+        "points": ["要点一", "要点二", "要点三"],
+    }
+    workspace_line = "完整记录已存工作区 research-outputs/vip-news-alert/2026-11-12-transcripts.md"
+    cases = (
+        # The bridge's success shape: document_id, no url (feishu_doc_url builds the link).
+        ({"ok": True, "document_id": "DoxAbCdEf123456", "title": "VIP 采访记录 — 2026-11-12"},
+         "📝 完整采访记录：https://feishu.cn/docx/DoxAbCdEf123456"),
+        ({"ok": True, "document_id": "DoxAbCdEf123456", "space_id": "7000", "node_token": "WikNode1234567",
+          "warning": "share failed"},
+         "📝 完整采访记录：https://feishu.cn/wiki/WikNode1234567"),
+        ({"ok": False, "error": "content_insert_failed", "document_id": "DoxAbCdEf123456"}, workspace_line),
+        ({"ok": True, "document_id": "../../etc"}, workspace_line),
+        (None, workspace_line),
+    )
+    for index, (record, expected) in enumerate(cases):
+        workspace = tmp_path / f"ws-{index}"
+        transcript = workspace / "research-outputs" / "vip-news-alert" / "2026-11-12-transcripts.md"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("# VIP 采访记录 — 2026-11-12\n\n### 核心要点\n- 要点\n", encoding="utf-8")
+        if record is not None:
+            _write_json(workspace, "temp/vip-news-alert/2026-11-12/doc.json", record)
+        events = {"summary_date": "2026-11-12", "people": [{"key": "Trump", "interviews": [interview]}]}
+        _write_json(workspace, "events.json", events)
+        code, payload = _run(cli, [
+            "--json", "render", "--workspace-dir", str(workspace),
+            "--events", "events.json", "--markdown", "temp/vip-news-alert/2026-11-12/card.md",
+            "--output", "temp/vip-news-alert/2026-11-12/card.json", "--as-of", AS_OF,
+        ])
+        assert code == 0, payload
+        markdown = (workspace / payload["markdown"]).read_text(encoding="utf-8")
+        assert expected in markdown, (record, markdown)
+        if expected != workspace_line:
+            assert workspace_line not in markdown
