@@ -44,6 +44,7 @@ vi.mock('../utils/api', async (importOriginal) => {
     updateCompanyScript: vi.fn(),
     pauseAutomation: vi.fn(),
     createAutomation: vi.fn(),
+    listAutomationHistory: vi.fn(),
   };
 });
 
@@ -165,6 +166,19 @@ beforeEach(() => {
   vi.mocked(api.updateCompanyScript).mockResolvedValue({ data: {} } as never);
   vi.mocked(api.pauseAutomation).mockResolvedValue({ data: {} } as never);
   vi.mocked(api.createAutomation).mockResolvedValue({ data: {} } as never);
+  vi.mocked(api.listAutomationHistory).mockResolvedValue({
+    data: {
+      automation_id: 'none',
+      scope: 'company',
+      engine_kind: 'agent',
+      config_version: 1,
+      active_version: 1,
+      entries: [],
+      total: 0,
+      limit: 50,
+      offset: 0,
+    },
+  } as never);
 });
 
 afterEach(() => {
@@ -214,7 +228,7 @@ describe('three manage groups', () => {
     expect(api.listAutomationReads).toHaveBeenCalledWith({ scope: 'personal', limit: 50, offset: 100 });
   });
 
-  it('keeps a company refusal inside the company group', async () => {
+  it('hides the company group when that list is refused', async () => {
     const secret = 'Quarterly ledger alpha';
     vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
       if (params?.scope === 'company') throw httpError(403, secret);
@@ -228,9 +242,10 @@ describe('three manage groups', () => {
     });
     renderAt('/automations?view=manage');
 
-    expect(await screen.findByText(label('automation.companyUnavailable'))).toBeInTheDocument();
-    const personal = screen.getByRole('region', { name: label('automation.groupMine') });
+    const personal = await screen.findByRole('region', { name: label('automation.groupMine') });
     const research = screen.getByRole('region', { name: label('automation.groupResearch') });
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     expect(within(personal).getByRole('button', { name: /My morning note/ })).toBeInTheDocument();
     expect(within(research).getByRole('button', { name: /Filing watch/ })).toBeInTheDocument();
     expect(screen.queryByText(secret)).not.toBeInTheDocument();
@@ -307,6 +322,7 @@ describe('company script and agent details', () => {
     await waitFor(() => expect(scriptPane.getByRole('button', { name: label('automation.pause') })).toBeEnabled());
     expect(scriptPane.getByRole('button', { name: label('automation.edit') })).toBeEnabled();
     expect(scriptPane.queryByRole('button', { name: label('automation.runNow') })).not.toBeInTheDocument();
+    expect(scriptPane.getByRole('button', { name: label('automation.moveToRecycle') })).toBeInTheDocument();
     expect(scriptPane.queryByRole('button', { name: label('common.delete') })).not.toBeInTheDocument();
     expect(scriptPane.queryByRole('button', { name: label('automation.openThread') })).not.toBeInTheDocument();
     const scriptRun = await scriptPane.findByRole('listitem');
@@ -322,6 +338,7 @@ describe('company script and agent details', () => {
     await waitFor(() => expect(agentPane.getByRole('button', { name: label('automation.pause') })).toBeEnabled());
     expect(agentPane.getByRole('button', { name: label('automation.edit') })).toBeEnabled();
     expect(agentPane.queryByRole('button', { name: label('automation.runNow') })).not.toBeInTheDocument();
+    expect(agentPane.getByRole('button', { name: label('automation.moveToRecycle') })).toBeInTheDocument();
     expect(agentPane.queryByRole('button', { name: label('common.delete') })).not.toBeInTheDocument();
   });
 
@@ -504,7 +521,8 @@ describe('a company script save', () => {
     fireEvent.click(screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupCompany')}` }));
 
     expect(await screen.findByText(label('automation.detailForbidden'))).toBeInTheDocument();
-    expect(await screen.findByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     await waitFor(() => expect(screen.queryByDisplayValue(draft)).not.toBeInTheDocument());
     expect(screen.queryByText(draft)).not.toBeInTheDocument();
     expect(screen.queryByText('Close prices')).not.toBeInTheDocument();
@@ -543,7 +561,8 @@ describe('a company script save', () => {
 
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.queryByDisplayValue('7 7 * * 7')).not.toBeInTheDocument());
-    expect(await screen.findByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByText('Close prices')).not.toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
   });
@@ -573,7 +592,8 @@ describe('a company script save', () => {
 
     await waitFor(() => expect(api.pauseAutomation).toHaveBeenCalledWith(taskId, 3));
     await waitFor(() => expect(screen.queryByRole('heading', { level: 2, name: 'Close prices' })).not.toBeInTheDocument());
-    expect(await screen.findByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
+    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
   });
@@ -608,7 +628,8 @@ describe('cached reads and independent pages', () => {
       expect(screen.queryByRole('heading', { level: 2, name: 'Close prices' })).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Close prices/ })).not.toBeInTheDocument();
     });
-    expect(screen.getByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByText('restricted')).not.toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: label('automation.groupResearch') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
@@ -650,7 +671,8 @@ describe('cached reads and independent pages', () => {
       expect(screen.queryByRole('heading', { level: 2, name: 'Desk brief' })).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Desk brief/ })).not.toBeInTheDocument();
     });
-    expect(screen.getByText(label('automation.companyUnavailable'))).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: label('automation.groupMine') })).getByText(label('automation.scopeEmpty'))).toBeInTheDocument();
   });
 

@@ -13,8 +13,8 @@ type ListAutomations = (params: { limit?: number; offset?: number }) => Promise<
  * Company and research stay empty. A missing detail is a 404.
  */
 export function personalReadMocks(listAutomations: ListAutomations) {
-  const listAutomationReads = vi.fn(async (params?: { scope?: string; limit?: number; offset?: number }) => {
-    if (params?.scope !== 'personal') {
+  const listAutomationReads = vi.fn(async (params?: { scope?: string; limit?: number; offset?: number; includeDeleted?: boolean }) => {
+    if (params?.scope !== 'personal' || params.includeDeleted) {
       return { data: { automations: [] as Automation[], total: 0 }, status: 200, statusText: 'OK', headers: {} };
     }
     return listAutomations({ limit: params.limit ?? 100, offset: params.offset ?? 0 });
@@ -46,5 +46,22 @@ export function personalReadMocks(listAutomations: ListAutomations) {
     };
   });
 
-  return { listAutomationReads, getAutomationRead };
+  const listAutomationHistory = vi.fn(async (id: string) => ({
+    data: {
+      automation_id: id,
+      scope: 'personal',
+      engine_kind: 'agent' as const,
+      config_version: 1,
+      active_version: 1,
+      entries: [],
+      total: 0,
+      limit: 50,
+      offset: 0,
+    },
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+  }));
+
+  return { listAutomationReads, getAutomationRead, listAutomationHistory };
 }

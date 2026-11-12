@@ -253,6 +253,33 @@ describe('automation read requests', () => {
     expect(sentParams()).not.toHaveProperty('status');
     expect(automationReadListQuery()).toEqual({ scope: null, status: null, limit: 50, offset: 0 });
     expect(automationReadListQuery({ limit: 50, offset: 0 })).toEqual(automationReadListQuery());
+    expect(sentParams()).not.toHaveProperty('include_deleted');
+  });
+
+  it('asks only for deleted rows when includeDeleted is set, and leaves it off otherwise', async () => {
+    await listAutomationReads({ scope: 'company', includeDeleted: true });
+    expect(get).toHaveBeenCalledWith('/api/v1/automations', {
+      params: { scope: 'company', limit: 50, offset: 0, include_deleted: true },
+    });
+    expect(automationReadListQuery({ scope: 'company', includeDeleted: true })).toEqual({
+      scope: 'company',
+      status: null,
+      limit: 50,
+      offset: 0,
+      includeDeleted: true,
+    });
+    expect(automationReadListQuery({ includeDeleted: false })).toEqual({
+      scope: null,
+      status: null,
+      limit: 50,
+      offset: 0,
+    });
+    get.mockClear();
+    await listAutomationReads({ scope: 'personal', includeDeleted: false });
+    expect(get).toHaveBeenCalledWith('/api/v1/automations', {
+      params: { scope: 'personal', limit: 50, offset: 0 },
+    });
+    expect(sentParams()).not.toHaveProperty('include_deleted');
   });
 
   it('sends personal, research_tracking, and company scopes unchanged', async () => {

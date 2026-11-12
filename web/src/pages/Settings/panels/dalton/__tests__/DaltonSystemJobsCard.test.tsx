@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
-import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { fireEvent, screen } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
 import { DaltonSystemJobsCard } from '../DaltonSystemJobsCard';
 import {
@@ -43,65 +43,34 @@ describe('DaltonSystemJobsCard', () => {
     });
   });
 
-  it('shows Chinese error banner and never shows success when toggle fails with HTTP 500 or ok:false', async () => {
-    mockToggleJob.mockRejectedValueOnce({
-      response: {
-        status: 500,
-        data: { detail: '切换团队对话归档状态失败: 写入宿主机归档开关状态文件失败' },
-      },
-    });
-
+  it('renders job status without a switch or run-now and links to company tasks', async () => {
     renderWithProviders(<DaltonSystemJobsCard />);
 
-    const toggleBtn = await screen.findByLabelText('切换 团队对话归档');
-    fireEvent.click(toggleBtn);
-
-    await waitFor(() => {
-      expect(
-        screen.getByText('切换团队对话归档状态失败: 写入宿主机归档开关状态文件失败'),
-      ).toBeInTheDocument();
-    });
+    expect(await screen.findByTestId('system-job-row-conversation-archive')).toBeInTheDocument();
+    expect(screen.queryByLabelText('切换 团队对话归档')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('system-job-run-conversation-archive')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('system-job-pause-all-conversation-archive')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('system-job-repair-conversation-archive')).not.toBeInTheDocument();
+    expect(screen.queryByText('全部暂停')).not.toBeInTheDocument();
+    expect(screen.queryByText('修复')).not.toBeInTheDocument();
+    expect(screen.queryByText('立即运行')).not.toBeInTheDocument();
+    expect(mockToggleJob).not.toHaveBeenCalled();
+    expect(mockRunNow).not.toHaveBeenCalled();
     expect(screen.queryByText(/已关闭|已开启/)).not.toBeInTheDocument();
-
-    // Also when response resolves with ok: false -> shows error, not success
-    mockToggleJob.mockResolvedValueOnce({
-      ok: false,
-      error: '切换团队对话归档状态失败: 宿主机桥接异常',
-    });
-    fireEvent.click(toggleBtn);
-
-    await waitFor(() => {
-      expect(screen.getByText('切换团队对话归档状态失败: 宿主机桥接异常')).toBeInTheDocument();
-    });
-    expect(screen.queryByText(/已关闭|已开启/)).not.toBeInTheDocument();
-
-    // Only when ok === true does it show "已关闭"
-    mockToggleJob.mockResolvedValueOnce({ ok: true });
-    fireEvent.click(toggleBtn);
-
-    await waitFor(() => {
-      expect(screen.getByText('团队对话归档 已关闭')).toBeInTheDocument();
-    });
+    const link = screen.getByRole('link', { name: '前往 自动化 → 公司公共任务' });
+    expect(link).toHaveAttribute('href', '/automations?scope=company');
   });
 
-  it('shows error banner when runNow fails with HTTP 500 or ok:false', async () => {
-    mockRunNow.mockRejectedValueOnce({
-      response: {
-        status: 500,
-        data: { detail: '启动团队对话归档失败: 写入团队对话归档 PID 文件失败' },
-      },
-    });
-
+  it('does not offer run-now on the read-only card', async () => {
     renderWithProviders(<DaltonSystemJobsCard />);
 
-    const runBtn = await screen.findByTestId('system-job-run-conversation-archive');
-    fireEvent.click(runBtn);
-
-    await waitFor(() => {
-      expect(
-        screen.getByText('启动团队对话归档失败: 写入团队对话归档 PID 文件失败'),
-      ).toBeInTheDocument();
-    });
+    expect(await screen.findByTestId('system-job-row-conversation-archive')).toBeInTheDocument();
+    expect(screen.queryByTestId('system-job-run-conversation-archive')).not.toBeInTheDocument();
+    expect(screen.queryByText('立即运行')).not.toBeInTheDocument();
+    expect(mockRunNow).not.toHaveBeenCalled();
+    const link = screen.getByTestId('system-jobs-open-company');
+    expect(link).toHaveAttribute('href', '/automations?scope=company');
+    expect(link).toHaveTextContent('前往 自动化 → 公司公共任务');
   });
 
   it('filters rendered scope groups and subtitle according to the scopes prop', async () => {
@@ -112,7 +81,7 @@ describe('DaltonSystemJobsCard', () => {
     expect(screen.queryByTestId('system-jobs-group-host')).not.toBeInTheDocument();
     expect(screen.queryByTestId('system-jobs-group-ops')).not.toBeInTheDocument();
     expect(
-      screen.getByText('统一查看、开关与立即触发系统内所有自动运行任务（公司跟踪、Home 全局）'),
+      screen.getByText('只读查看系统底层定时任务的运行状态（公司跟踪、Home 全局）'),
     ).toBeInTheDocument();
   });
 
@@ -273,16 +242,21 @@ describe('DaltonSystemJobsCard', () => {
       screen.getByTestId('system-job-row-sector:ai-infrastructure'),
     ).toBeInTheDocument();
     expect(screen.getByText('AI Infrastructure 行业自动跟踪')).toBeInTheDocument();
-    // 与公司 scope 同一套暂停/开关控件
-    expect(screen.getByLabelText('切换 AI Infrastructure 行业自动跟踪')).toBeInTheDocument();
-    expect(screen.getByTestId('system-job-run-sector:ai-infrastructure')).toBeInTheDocument();
+    expect(screen.queryByLabelText('切换 AI Infrastructure 行业自动跟踪')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('system-job-run-sector:ai-infrastructure')).not.toBeInTheDocument();
+    expect(screen.queryByText('全部暂停')).not.toBeInTheDocument();
+    expect(screen.queryByText('修复')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '前往 自动化 → 公司公共任务' })).toHaveAttribute(
+      'href',
+      '/automations?scope=company',
+    );
     expect(screen.queryByTestId('system-jobs-group-host')).not.toBeInTheDocument();
     // 摘要行包含行业跟踪（sector 摘要名走 i18n；jsdom 下组件测试以 en-US
     // 渲染，原有四个 scope 的摘要名是组件内写死的中文，所以这里按 en-US
     // 目录里的 sector 摘要名 'Sector tracking' 断言）
     expect(
       screen.getByText(
-        '统一查看、开关与立即触发系统内所有自动运行任务（公司跟踪、Sector tracking、Home 全局）',
+        '只读查看系统底层定时任务的运行状态（公司跟踪、Sector tracking、Home 全局）',
       ),
     ).toBeInTheDocument();
   });

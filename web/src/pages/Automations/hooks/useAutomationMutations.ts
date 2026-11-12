@@ -102,7 +102,39 @@ export function useAutomationMutations() {
     mutationFn: async ({ id, data }: { id: string; data: CompanyScriptUpdatePayload }) =>
       (await automationApi.updateCompanyScript(id, data)).data,
   });
-  const remove = useMutation({ ...shared, mutationFn: (id: string) => automationApi.deleteAutomation(id) });
+  // Delete, restore, and rollback say the row changed under the reader. Other writes keep the shared 409 copy.
+  const versionConflict = (err: unknown, variables: unknown) => {
+    if (apiErrorStatus(err) === 409) {
+      toast({ description: t('automation.versionConflict') });
+      return queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+    }
+    return shared.onError(err, variables);
+  };
+  const remove = useMutation({
+    ...shared,
+    mutationFn: ({ id, expectedConfigVersion }: { id: string; expectedConfigVersion: number }) =>
+      automationApi.deleteAutomation(id, expectedConfigVersion),
+    onError: versionConflict,
+  });
+  const restore = useMutation({
+    ...shared,
+    mutationFn: ({ id, expectedConfigVersion }: { id: string; expectedConfigVersion: number }) =>
+      automationApi.restoreAutomation(id, expectedConfigVersion),
+    onError: versionConflict,
+  });
+  const rollback = useMutation({
+    ...shared,
+    mutationFn: ({
+      id,
+      targetVersion,
+      expectedConfigVersion,
+    }: {
+      id: string;
+      targetVersion: number;
+      expectedConfigVersion: number;
+    }) => automationApi.rollbackAutomation(id, targetVersion, expectedConfigVersion),
+    onError: versionConflict,
+  });
   // DALTON-HOOK(company-automations): company pause and resume send the detail version. Personal calls stay one argument.
   const pause = useMutation({
     ...shared,
@@ -152,7 +184,7 @@ export function useAutomationMutations() {
 
   // DALTON-HOOK(company-automations): every company and personal write shares this pending flag.
   const busy = useIsMutating({ mutationKey: WRITE_KEY }) > 0;
-  return { create, update, updateScript, remove, pause, resume, trigger, skip, dismiss, busy };
+  return { create, update, updateScript, remove, restore, rollback, pause, resume, trigger, skip, dismiss, busy };
 }
 
 export type AutomationMutations = ReturnType<typeof useAutomationMutations>;

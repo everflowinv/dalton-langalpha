@@ -7,12 +7,13 @@ import { SwapCell } from '@/components/ui/crossfade';
 import { apiErrorStatus } from '@/api/errors';
 import { useAuth } from '@/contexts/AuthContext';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { ListError, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { queryKeys } from '@/lib/queryKeys';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
-import type { Automation, AutomationUpdatePayload, CompanyScriptUpdatePayload } from '@/types/automation';
+import type { AutomationUpdatePayload, CompanyScriptUpdatePayload } from '@/types/automation';
 import AutomationsHeader, { type AutomationsView } from './components/AutomationsHeader';
 import AutomationInlineForm, { type FormSubmission } from './components/AutomationInlineForm';
 import ConfirmDeleteDialog from './components/ConfirmDeleteDialog';
@@ -64,6 +65,10 @@ function storeView(view: AutomationsView): void {
 type FormMode = { kind: 'create'; template: TemplateId; nonce: number } | { kind: 'edit'; automationId: string };
 
 type ScopeName = 'company' | 'personal' | 'research_tracking';
+
+function parseScope(value: string | null): ScopeName | null {
+  return value === 'personal' || value === 'research_tracking' || value === 'company' ? value : null;
+}
 
 type ConfigConflict = {
   id: string;
@@ -188,6 +193,7 @@ function laterConflictVersion(
 export default function Automations() {
   const { t } = useTranslation();
   const { userId } = useAuth();
+  const { callerTier, callerTierPending, callerTierError } = useTeamCredentials();
   const { automations, loading, loaded, error } = useAutomations();
   const lastCount = useLastShape('automations.count', loaded ? automations.length : null);
   const {
@@ -208,8 +214,14 @@ export default function Automations() {
   const runId = searchParams.get('run');
   const listLoading = loading && (lastCount !== 0 || !!selectedId || !!runId);
   const urlView = searchParams.get('view');
+  const requestedScope = parseScope(searchParams.get('scope'));
+  // A settings link carries `scope` and no `view`. That opens manage even when the last view was the feed.
   const view: AutomationsView =
-    urlView === 'feed' || urlView === 'manage' ? urlView : selectedId || runId ? 'manage' : storedView ?? 'feed';
+    urlView === 'feed' || urlView === 'manage'
+      ? urlView
+      : requestedScope || selectedId || runId
+        ? 'manage'
+        : storedView ?? 'feed';
   const { isPending: runsPending } = useInfiniteQuery({
     ...recentRunsQuery(),
     enabled: view === 'feed',
@@ -218,10 +230,20 @@ export default function Automations() {
 
   // DALTON-HOOK(company-automations): each scope has its own offset. A company draft records the detail version it opened with.
   const [form, setForm] = useState<FormMode | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<Automation | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ManageTask | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [pendingLeave, setPendingLeave] = useState<(() => void) | null>(null);
   const [offsets, setOffsets] = useState<Record<ScopeName, number>>({ company: 0, personal: 0, research_tracking: 0 });
+  const [deletedOffsets, setDeletedOffsets] = useState<Record<ScopeName, number>>({
+    company: 0,
+    personal: 0,
+    research_tracking: 0,
+  });
+  const [recycleOpen, setRecycleOpen] = useState<Record<ScopeName, boolean>>({
+    company: false,
+    personal: false,
+    research_tracking: false,
+  });
   const [standInId, setStandInId] = useState<string | null>(null);
   const [scopeUser, setScopeUser] = useState(userId);
   const [editVersion, setEditVersion] = useState<number | null>(null);
@@ -232,6 +254,8 @@ export default function Automations() {
   if (userId !== scopeUser) {
     setScopeUser(userId);
     setOffsets({ company: 0, personal: 0, research_tracking: 0 });
+    setDeletedOffsets({ company: 0, personal: 0, research_tracking: 0 });
+    setRecycleOpen({ company: false, personal: false, research_tracking: false });
     setStandInId(null);
     setEditVersion(null);
     setConflict(null);
@@ -240,11 +264,17 @@ export default function Automations() {
   }
 
   const manageOn = view === 'manage';
+  // External members never see the company group. Wait for the tier before asking, so that
+  // request is not sent and then hidden. A failed credentials read is the same: hide the group
+  // and skip both company requests until a later read says internal or admin. An unset tier
+  // with no error is OSS mode, which still asks.
+  const companyHiddenByTier = callerTier === 'external' || Boolean(callerTierError);
+  const companyReadsOn = manageOn && !callerTierPending && !companyHiddenByTier;
   const companyQuery = useAutomationReadList({
     scope: 'company',
     limit: MANAGE_PAGE_SIZE,
     offset: offsets.company,
-    enabled: manageOn,
+    enabled: companyReadsOn,
   });
   const personalQuery = useAutomationReadList({
     scope: 'personal',
@@ -258,16 +288,45 @@ export default function Automations() {
     offset: offsets.research_tracking,
     enabled: manageOn,
   });
+  // Recycle counts for groups this caller can see are requested with the live lists, before a bin is opened.
+  // An external member, and a failed credentials read, do not request the company list or its bin.
+  const companyDeleted = useAutomationReadList({
+    scope: 'company',
+    limit: MANAGE_PAGE_SIZE,
+    offset: deletedOffsets.company,
+    includeDeleted: true,
+    enabled: companyReadsOn && !isForbiddenError(companyQuery.error),
+  });
+  const personalDeleted = useAutomationReadList({
+    scope: 'personal',
+    limit: MANAGE_PAGE_SIZE,
+    offset: deletedOffsets.personal,
+    includeDeleted: true,
+    enabled: manageOn && !isForbiddenError(personalQuery.error),
+  });
+  const researchDeleted = useAutomationReadList({
+    scope: 'research_tracking',
+    limit: MANAGE_PAGE_SIZE,
+    offset: deletedOffsets.research_tracking,
+    includeDeleted: true,
+    enabled: manageOn && !isForbiddenError(researchQuery.error),
+  });
 
   const companyForbidden = isForbiddenError(companyQuery.error);
   const personalForbidden = isForbiddenError(personalQuery.error);
   const researchForbidden = isForbiddenError(researchQuery.error);
-  // DALTON-HOOK(company-automations): a 503 keeps the last authorized rows. A 403 still drops that scope.
-  const companyTasks = !companyForbidden && companyQuery.data ? companyQuery.data.automations : [];
+  // A refused company list, an external member, and a failed credentials read omit the whole company group.
+  const hideCompany = companyHiddenByTier || companyForbidden;
+  // DALTON-HOOK(company-automations): a 503 keeps the last authorized rows. A 403 drops that scope.
+  const companyTasks = !hideCompany && companyQuery.data ? companyQuery.data.automations : [];
   const personalTasks = !personalForbidden && personalQuery.data ? personalQuery.data.automations : [];
   const researchTasks = !researchForbidden && researchQuery.data ? researchQuery.data.automations : [];
+  // While the tier is loading, company is not settled, so the page stays on its skeleton.
+  const companyListSettled = callerTierPending
+    ? false
+    : companyHiddenByTier || companyQuery.isSuccess || companyQuery.isError;
   const listsReady =
-    (companyQuery.isSuccess || companyQuery.isError) &&
+    companyListSettled &&
     (personalQuery.isSuccess || personalQuery.isError) &&
     (researchQuery.isSuccess || researchQuery.isError);
   if (!manageOn) manageSettled.current = false;
@@ -287,11 +346,48 @@ export default function Automations() {
       research_tracking: researchNext ?? offsets.research_tracking,
     });
   }
+  const deletedCompanyNext = recycleOpen.company
+    ? clampedScopeOffset(deletedOffsets.company, settledTotal(companyDeleted, companyForbidden))
+    : null;
+  const deletedPersonalNext = recycleOpen.personal
+    ? clampedScopeOffset(deletedOffsets.personal, settledTotal(personalDeleted, personalForbidden))
+    : null;
+  const deletedResearchNext = recycleOpen.research_tracking
+    ? clampedScopeOffset(deletedOffsets.research_tracking, settledTotal(researchDeleted, researchForbidden))
+    : null;
+  if (deletedCompanyNext != null || deletedPersonalNext != null || deletedResearchNext != null) {
+    setDeletedOffsets({
+      company: deletedCompanyNext ?? deletedOffsets.company,
+      personal: deletedPersonalNext ?? deletedOffsets.personal,
+      research_tracking: deletedResearchNext ?? deletedOffsets.research_tracking,
+    });
+  }
   const personalGroups = useOrderedGroups(asAutomations(personalTasks));
   const researchGroups = useOrderedGroups(asAutomations(researchTasks));
   const pool = useMemo(
-    () => [...companyTasks, ...personalTasks, ...researchTasks],
-    [companyTasks, personalTasks, researchTasks],
+    () => {
+      const deletedRows = (open: boolean, rows: ManageTask[] | undefined) => (open && rows ? rows : []);
+      return [
+      ...companyTasks,
+      ...personalTasks,
+      ...researchTasks,
+      ...deletedRows(recycleOpen.company && !hideCompany, companyDeleted.data?.automations),
+      ...deletedRows(recycleOpen.personal && !personalForbidden, personalDeleted.data?.automations),
+      ...deletedRows(recycleOpen.research_tracking && !researchForbidden, researchDeleted.data?.automations),
+      ];
+    },
+    [
+      companyTasks,
+      personalTasks,
+      researchTasks,
+      recycleOpen,
+      hideCompany,
+      personalForbidden,
+      researchForbidden,
+      companyDeleted.data,
+      personalDeleted.data,
+      researchDeleted.data,
+    ],
   );
   const fallback = companyTasks[0] ?? personalGroups[0]?.items[0] ?? researchGroups[0]?.items[0];
   // DALTON-HOOK(company-automations): paging one group keeps the task already standing in for the pane.
@@ -305,13 +401,39 @@ export default function Automations() {
     setStandInId(nextStandIn);
   }
 
+  const deletedRow = useCallback(
+    (id: string): ManageTask | undefined => {
+      const from = (open: boolean, hidden: boolean, rows: readonly ManageTask[] | undefined) => {
+        if (!open || hidden || !rows) return undefined;
+        return rows.find((task) => task.automation_id === id);
+      };
+      return (
+        from(recycleOpen.company, hideCompany, companyDeleted.data?.automations) ??
+        from(recycleOpen.personal, personalForbidden, personalDeleted.data?.automations) ??
+        from(recycleOpen.research_tracking, researchForbidden, researchDeleted.data?.automations)
+      );
+    },
+    [
+      recycleOpen,
+      hideCompany,
+      companyDeleted.data,
+      personalDeleted.data,
+      researchDeleted.data,
+      personalForbidden,
+      researchForbidden,
+    ],
+  );
+
   const runOwner =
     !selectedId && runId
       ? pool.find((task) => !isScriptTask(task) && task.last_execution?.automation_execution_id === runId) ??
         automations.find((task) => task.last_execution?.automation_execution_id === runId)
       : undefined;
   const paneId = selectedId ?? runOwner?.automation_id ?? (runId ? null : standIn?.automation_id ?? null);
-  const detail = useAutomationRead(paneId, { enabled: manageOn && !!paneId });
+  // An open recycle bin owns its selected row. The detail cache can still hold the pre-delete task:
+  // a deleted task's detail is 404, and that read keeps the last success.
+  const selectedDeleted = paneId ? deletedRow(paneId) : undefined;
+  const detail = useAutomationRead(paneId, { enabled: manageOn && !!paneId && selectedDeleted == null });
   // DALTON-HOOK(company-automations): a failed refetch keeps the last authorized detail. A 403 does not.
   const openDetail =
     paneId && !isForbiddenError(detail.error) && detail.data?.automation_id === paneId ? detail.data : null;
@@ -354,6 +476,16 @@ export default function Automations() {
     },
     [form, draftDirty],
   );
+
+  const scopeDenied = requestedScope === 'company' && !callerTierPending && (companyHiddenByTier || companyForbidden);
+  const activeScope: ScopeName | null = scopeDenied ? 'personal' : requestedScope;
+  useEffect(() => {
+    if (view !== 'manage' || requestedScope !== 'company' || !scopeDenied) return;
+    const params = new URLSearchParams(searchParams);
+    params.set('scope', 'personal');
+    if (params.get('view') !== 'feed' && params.get('view') !== 'manage') params.set('view', 'manage');
+    setSearchParams(params, { replace: true });
+  }, [view, requestedScope, scopeDenied, searchParams, setSearchParams]);
 
   const onRunsForbidden = useCallback(
     (automationId: string) => {
@@ -423,10 +555,12 @@ export default function Automations() {
   const writeVersion = detailTask && isCompanyTask(detailTask) ? configVersionOf(detailTask) : null;
   const taskById = useCallback(
     (id: string): ManageTask | null => {
+      const deleted = deletedRow(id);
+      if (deleted) return deleted;
       if (detailTask?.automation_id === id) return detailTask;
       return pool.find((task) => task.automation_id === id) ?? null;
     },
-    [detailTask, pool],
+    [deletedRow, detailTask, pool],
   );
 
   const versionFor = useCallback(
@@ -523,14 +657,20 @@ export default function Automations() {
 
   const handleConfirmDelete = useCallback(async () => {
     if (!deleteTarget) return;
+    const version = configVersionOf(deleteTarget);
+    if (version == null) return;
+    const id = deleteTarget.automation_id;
     try {
-      await removeAutomation(deleteTarget.automation_id);
-      if (deleteTarget.automation_id === selectedId) navigateTo('manage', null);
+      await removeAutomation({ id, expectedConfigVersion: version });
+      // The detail read of a deleted task is 404 and would keep this success. Drop it for both UUID and data: ids.
+      queryClient.removeQueries({ queryKey: queryKeys.automations.readDetail(userId, id), exact: true });
+      if (id === selectedId) navigateTo('manage', null);
       setDeleteTarget(null);
-    } catch {
-      // Reported by the mutation hook.
+    } catch (err) {
+      // Reported by the mutation hook. A conflict closes the confirm so the refreshed row can be read.
+      if (apiErrorStatus(err) === 409) setDeleteTarget(null);
     }
-  }, [deleteTarget, removeAutomation, navigateTo, selectedId]);
+  }, [deleteTarget, removeAutomation, navigateTo, selectedId, queryClient, userId]);
 
   const editing = form?.kind === 'edit' ? taskById(form.automationId) : null;
   const held = conflict && editing && conflict.id === editing.automation_id ? conflict : null;
@@ -606,39 +746,61 @@ export default function Automations() {
   // DALTON-HOOK(company-automations): a ready detail stays up while another group is still loading its page.
   const selection = useMemo((): ManageSelection => {
     const linked = !!(selectedId || runId);
-    if (paneId && detailForbidden) return { kind: 'forbidden' };
-    const task = detailTask ?? (!detailForbidden ? pageRow : undefined);
+    if (paneId && detailForbidden && !selectedDeleted) return { kind: 'forbidden' };
+    // The open bin's row wins over a detail cached before the delete.
+    const task = selectedDeleted ?? detailTask ?? (!detailForbidden ? pageRow : undefined);
     if (task) return linked ? { kind: 'chosen', task, runId } : { kind: 'first', task };
-    if (paneId && (detail.isLoading || detail.isFetching)) return { kind: 'loading' };
+    if (paneId && !selectedDeleted && (detail.isLoading || detail.isFetching)) return { kind: 'loading' };
     if (selectedId || runId) return { kind: 'missing', runId };
     if (!listsReady && !manageSettled.current) return { kind: 'loading' };
     return { kind: 'none' };
-  }, [paneId, detailForbidden, detailTask, pageRow, detail.isLoading, detail.isFetching, listsReady, selectedId, runId]);
+  }, [paneId, detailForbidden, selectedDeleted, detailTask, pageRow, detail.isLoading, detail.isFetching, listsReady, selectedId, runId]);
 
-  const taskScope = (id: string): ScopeName | null => {
-    if (companyTasks.some((task) => task.automation_id === id)) return 'company';
-    if (personalTasks.some((task) => task.automation_id === id)) return 'personal';
-    if (researchTasks.some((task) => task.automation_id === id)) return 'research_tracking';
+  const taskScope = useCallback((id: string): ScopeName | null => {
+    const has = (tasks: readonly { automation_id: string }[] | undefined) =>
+      !!tasks?.some((task) => task.automation_id === id);
+    if (!hideCompany && (has(companyTasks) || has(companyDeleted.data?.automations))) return 'company';
+    if (has(personalTasks) || has(personalDeleted.data?.automations)) return 'personal';
+    if (has(researchTasks) || has(researchDeleted.data?.automations)) return 'research_tracking';
     if (openDetail?.automation_id === id) {
       const scope = openDetail.scope;
       if (scope === 'company' || scope === 'personal' || scope === 'research_tracking') return scope;
     }
     return null;
-  };
+  }, [hideCompany, companyTasks, personalTasks, researchTasks, companyDeleted.data, personalDeleted.data, researchDeleted.data, openDetail]);
+
+  const handleRestored = useCallback(
+    (id: string) => {
+      const scope = taskScope(id);
+      if (!scope) return;
+      setRecycleOpen((current) => ({ ...current, [scope]: false }));
+    },
+    [taskScope],
+  );
 
   const scopePage = (
     scope: ScopeName,
     titleKey: string,
-    tasks: ScopePage['tasks'],
-    query: {
-      data?: { total: number } | undefined;
+    liveTasks: ScopePage['tasks'],
+    liveQuery: {
+      data?: { total: number; automations?: ScopePage['tasks'] } | undefined;
       isLoading: boolean;
       isFetching: boolean;
       isSuccess: boolean;
       isError: boolean;
     },
     forbidden: boolean,
+    deletedQuery: {
+      data?: { total: number; automations: ScopePage['tasks'] } | undefined;
+      isLoading: boolean;
+      isFetching: boolean;
+      isSuccess: boolean;
+      isError: boolean;
+    },
   ): ScopePage => {
+    const open = recycleOpen[scope] && !forbidden;
+    const query = open ? deletedQuery : liveQuery;
+    const tasks = open ? deletedQuery.data?.automations ?? [] : liveTasks;
     const pageData = forbidden ? undefined : query.data;
     const retained = pageData != null;
     return {
@@ -646,11 +808,20 @@ export default function Automations() {
       titleKey,
       tasks: retained ? tasks : [],
       total: retained ? pageData.total : 0,
-      offset: offsets[scope],
+      offset: open ? deletedOffsets[scope] : offsets[scope],
       isLoading: !forbidden && !retained && (query.isLoading || (query.isFetching && !query.isSuccess)),
       isForbidden: forbidden,
       isError: !forbidden && query.isError && !retained,
+      recycleCount: !forbidden && deletedQuery.isSuccess && deletedQuery.data ? deletedQuery.data.total : 0,
+      recycleReady: !forbidden && deletedQuery.isSuccess,
+      recycleOpen: open,
+      showingDeleted: open,
+      onToggleRecycle: () => setRecycleOpen((current) => ({ ...current, [scope]: !current[scope] })),
       onOffset: (offset) => {
+        if (open) {
+          setDeletedOffsets((current) => (current[scope] === offset ? current : { ...current, [scope]: offset }));
+          return;
+        }
         const apply = () => setOffsets((current) => (current[scope] === offset ? current : { ...current, [scope]: offset }));
         const editingId = form?.kind === 'edit' ? form.automationId : null;
         // Paging the open stand-in's own group changes which task is on screen.
@@ -670,16 +841,32 @@ export default function Automations() {
   };
 
   const pages: ScopePage[] = [
-    scopePage('company', 'automation.groupCompany', companyTasks, companyQuery, companyForbidden),
-    scopePage('personal', 'automation.groupMine', personalTasks, personalQuery, personalForbidden),
-    scopePage('research_tracking', 'automation.groupResearch', researchTasks, researchQuery, researchForbidden),
-  ];
+    scopePage('company', 'automation.groupCompany', companyTasks, companyQuery, companyForbidden, companyDeleted),
+    scopePage('personal', 'automation.groupMine', personalTasks, personalQuery, personalForbidden, personalDeleted),
+    scopePage('research_tracking', 'automation.groupResearch', researchTasks, researchQuery, researchForbidden, researchDeleted),
+  ].filter((page) => page.scope !== 'company' || !hideCompany);
 
   const visibleCount = companyTasks.length + personalTasks.length + researchTasks.length;
-  // DALTON-HOOK(company-automations): starters only when every group loaded empty on its real page.
-  // A 403, a failed read, or an offset past the last filled page keeps the three groups.
-  const successfulEmpty =
-    companyQuery.isSuccess && personalQuery.isSuccess && researchQuery.isSuccess && visibleCount === 0 && !pastEnd;
+  const deletedCount =
+    (companyHiddenByTier || companyForbidden ? 0 : companyDeleted.data?.total ?? 0) +
+    (personalForbidden ? 0 : personalDeleted.data?.total ?? 0) +
+    (researchForbidden ? 0 : researchDeleted.data?.total ?? 0);
+  const binsSettled =
+    (companyHiddenByTier || companyForbidden || companyDeleted.isSuccess || companyDeleted.isError) &&
+    (personalForbidden || personalDeleted.isSuccess || personalDeleted.isError) &&
+    (researchForbidden || researchDeleted.isSuccess || researchDeleted.isError);
+  // DALTON-HOOK(company-automations): starters only when every visible group loaded empty on its real page.
+  // A refused company list hides that group. Another failed read, or an offset past the last filled page, keeps its group.
+  // A recycle bin with rows keeps the groups too, so those rows can be restored.
+  const liveEmptySuccess =
+    !callerTierPending &&
+    (companyHiddenByTier || companyQuery.isSuccess) &&
+    personalQuery.isSuccess &&
+    researchQuery.isSuccess &&
+    visibleCount === 0 &&
+    !pastEnd;
+  const waitingForBins = manageOn && !selectedId && !runId && liveEmptySuccess && !binsSettled;
+  const successfulEmpty = liveEmptySuccess && binsSettled && deletedCount === 0;
   let body: React.ReactNode;
   if (view === 'feed') {
     if (error && automations.length === 0) {
@@ -715,7 +902,7 @@ export default function Automations() {
         </RememberedScroll>
       );
     }
-  } else if (!selectedId && !runId && !listsReady && !manageSettled.current) {
+  } else if (!selectedId && !runId && ((!listsReady && !manageSettled.current) || waitingForBins)) {
     // DALTON-HOOK(company-automations): the first manage load uses a page skeleton. A later page of one group does not.
     body = (
       <div className="automations-scroll">
@@ -754,6 +941,8 @@ export default function Automations() {
           onEdit={startEdit}
           onDelete={setDeleteTarget}
           onRunsForbidden={onRunsForbidden}
+          onRestored={handleRestored}
+          activeScope={activeScope}
         />
       </div>
     );
