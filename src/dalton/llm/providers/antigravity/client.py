@@ -166,12 +166,14 @@ def _normalize_thinking_level(value: Any) -> Optional[str]:
     upper = str(value).strip().upper().replace("-", "_")
     if upper == "EXTRA_LOW":
         return "LOW"
-    return upper if upper in {"LOW", "MEDIUM", "HIGH"} else None
+    # XHIGH is offered by Gemini 4 Hydrogen; verified live 2026-11-12 (more
+    # reasoning tokens than HIGH on the same prompt).
+    return upper if upper in {"LOW", "MEDIUM", "HIGH", "XHIGH"} else None
 
 
 def _derive_thinking_level(model: str) -> Optional[str]:
-    """Thinking level from the catalog's suffixed model id (gemini-4-argon-high)."""
-    match = re.search(r"-(extra-low|low|medium|high)$", model)
+    """Thinking level from the catalog's suffixed model id (gemini-4-argon-high, gemini-4-hydrogen-xhigh)."""
+    match = re.search(r"-(extra-low|low|medium|xhigh|high)$", model)
     if not match:
         return None
     return _normalize_thinking_level(match.group(1))

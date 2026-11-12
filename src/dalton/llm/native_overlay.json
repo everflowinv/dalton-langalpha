@@ -83,7 +83,6 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-4-carbon-low",
       "provider": "antigravity-oauth",
-      "display_name": "Gemini 4 Carbon (Low)",
       "visible": true,
       "context": 1048576,
       "input_modalities": [
@@ -108,7 +107,6 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-4-carbon-medium",
       "provider": "antigravity-oauth",
-      "display_name": "Gemini 4 Carbon (Medium)",
       "visible": true,
       "context": 1048576,
       "input_modalities": [
@@ -133,7 +131,6 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-4-carbon-high",
       "provider": "antigravity-oauth",
-      "display_name": "Gemini 4 Carbon (High)",
       "visible": true,
       "context": 1048576,
       "input_modalities": [
@@ -151,6 +148,102 @@
           "high"
         ],
         "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-hydrogen-low-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-hydrogen-low",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-hydrogen-medium-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-hydrogen-medium",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-hydrogen-high-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-hydrogen-high",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-hydrogen-xhigh-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-hydrogen-xhigh",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "xhigh"
+        ],
+        "default": "xhigh",
         "write": "parameters.thinking_level"
       }
     },
@@ -1080,6 +1173,62 @@
       },
       "tool_calling": true,
       "comment": "Subscription cash cost is 0. Current nominal rates are $2 input / $10 output / $0.1 cached input per million tokens, verified 2026-11-10. Introductory period, then $4 / $20; end date not specified. Source published 2026-10-28: https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/"
+    },
+    "gemini-4-hydrogen-low-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 0.75,
+        "output": 3.75,
+        "cached_input": 0.0375,
+        "estimated": true,
+        "source": "https://huggingnews.com/ai/googles-gemini-4-hydrogen-ai-model-appears-in-cloud-billing-catalogue-e905b78c",
+        "verified_at": "2026-11-12"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Hydrogen is not officially announced; nominal rates $0.75 input / $3.75 output / $0.0375 cached input per million tokens, chosen by the user 2026-11-12 from a Google Cloud billing catalogue report (another report gives $1.50 / $7.50). Context and output limits are unpublished; Flash-tier values are used until Google publishes them."
+    },
+    "gemini-4-hydrogen-medium-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 0.75,
+        "output": 3.75,
+        "cached_input": 0.0375,
+        "estimated": true,
+        "source": "https://huggingnews.com/ai/googles-gemini-4-hydrogen-ai-model-appears-in-cloud-billing-catalogue-e905b78c",
+        "verified_at": "2026-11-12"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Hydrogen is not officially announced; nominal rates $0.75 input / $3.75 output / $0.0375 cached input per million tokens, chosen by the user 2026-11-12 from a Google Cloud billing catalogue report (another report gives $1.50 / $7.50). Context and output limits are unpublished; Flash-tier values are used until Google publishes them."
+    },
+    "gemini-4-hydrogen-high-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 0.75,
+        "output": 3.75,
+        "cached_input": 0.0375,
+        "estimated": true,
+        "source": "https://huggingnews.com/ai/googles-gemini-4-hydrogen-ai-model-appears-in-cloud-billing-catalogue-e905b78c",
+        "verified_at": "2026-11-12"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Hydrogen is not officially announced; nominal rates $0.75 input / $3.75 output / $0.0375 cached input per million tokens, chosen by the user 2026-11-12 from a Google Cloud billing catalogue report (another report gives $1.50 / $7.50). Context and output limits are unpublished; Flash-tier values are used until Google publishes them."
+    },
+    "gemini-4-hydrogen-xhigh-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 0.75,
+        "output": 3.75,
+        "cached_input": 0.0375,
+        "estimated": true,
+        "source": "https://huggingnews.com/ai/googles-gemini-4-hydrogen-ai-model-appears-in-cloud-billing-catalogue-e905b78c",
+        "verified_at": "2026-11-12"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Hydrogen is not officially announced; nominal rates $0.75 input / $3.75 output / $0.0375 cached input per million tokens, chosen by the user 2026-11-12 from a Google Cloud billing catalogue report (another report gives $1.50 / $7.50). Context and output limits are unpublished; Flash-tier values are used until Google publishes them."
     },
     "gemini-3.8-flash-low-oauth": {
       "family": "google-gemini",
