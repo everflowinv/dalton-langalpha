@@ -273,10 +273,9 @@ def test_skill_text_locks_research_and_delivery() -> None:
     assert "暂无" in weekly_text
     assert "不明确" in weekly_text
     assert "行情缺失" in weekly_text
-    assert "yf_price.get_stock_history" in weekly_text
+    assert "get_stock_history" in weekly_text
     assert "get_dividends_and_splits" in weekly_text
-    assert "adjusted=False" in weekly_text
-    assert "adjusted=True" in weekly_text
+    assert "`adjusted` 分别为 false 和 true" in weekly_text
     assert "0700.HK" in weekly_text
     assert "趋势影响周扫第 N 步失败" in weekly_text
     web_blocks = [block for block in _python_blocks(weekly_text) if "web_search" in block]

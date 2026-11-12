@@ -46,11 +46,7 @@ web_search(query=QUERY, start_date=START_DATE, end_date=END_DATE)
 
 相关股票用 `yf_price` 核对近期表现。港股用数字加 `.HK`（如 `0700.HK`），A 股用 `.SH` 或 `.SZ`，美股用不带交易所后缀的代码。两地上市分开写，不把两地涨跌幅合成一个数。
 
-```python
-yf_price.get_stock_history(ticker=TICKER, period="1mo", interval="1d", adjusted=False)
-yf_price.get_stock_history(ticker=TICKER, period="1mo", interval="1d", adjusted=True)
-yf_price.get_dividends_and_splits(ticker=TICKER)
-```
+每只股票取三份数据：`yf_price` 的 `get_stock_history` 各取一次未复权和复权日线（参数 `ticker`、`period="1mo"`、`interval="1d"`，`adjusted` 分别为 false 和 true），以及 `get_dividends_and_splits`（参数 `ticker`）。
 
 多只股票的日线可以改用一次 `yf_price.get_multiple_stocks_history`，未复权和复权各一次。分红和拆股仍逐只调用。行情口径写在「近期股价」里：上市地常规交易时段的收盘价、起止日期、币种，以及未复权价和复权价是否一致。复权、拆股或交易日缺失有疑问时，不下「是否已经反映」的结论，写明疑问。工具报错或没有该股票的记录时，写「行情缺失」，不用新闻页面上的价格顶上。
 
