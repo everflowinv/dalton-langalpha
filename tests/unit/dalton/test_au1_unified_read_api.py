@@ -433,8 +433,15 @@ async def test_list_company_automations_sorts_the_merged_catalog_once(
         "find_present_job_keys",
         create_autospec(db.find_present_job_keys, return_value=set(keys)),
     )
-    def _agents(*, status: str | None = None, conn: Any = None) -> list[dict[str, Any]]:
+    def _agents(
+        *,
+        status: str | None = None,
+        include_deleted: bool = False,
+        conn: Any = None,
+    ) -> list[dict[str, Any]]:
         del conn
+        if include_deleted:
+            return []
         row = _agent_row(updated_at=TIE, status="active")
         if status and row["status"] != status:
             return []
@@ -661,6 +668,7 @@ async def test_feed_accepts_raw_script_status_and_default_list_stays_owner_scope
             limit=50,
             offset=0,
             computer_id=None,
+            include_deleted=False,
         )
         company_list.assert_not_awaited()
 

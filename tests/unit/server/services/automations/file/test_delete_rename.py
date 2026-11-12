@@ -20,7 +20,10 @@ from tests.unit.server.services.automations.file._support import (
     _write,
 )
 
-DELETED = 'Deleted "Morning brief" (morning-brief.json), with its run history'
+DELETED = (
+    'Deleted "Morning brief" (morning-brief.json); '
+    "it is in the recycle bin and its run history is kept"
+)
 
 
 class TestDeleteByStatus:
@@ -33,6 +36,9 @@ class TestDeleteByStatus:
 
         assert report == DELETED
         assert [r["file_name"] for r in db.list()] == [OTHER_FILE_NAME]
+        # DALTON-HOOK(company-automations): status deleted pauses and keeps history
+        assert db.rows[BRIEF]["deleted_at"] is not None
+        assert db.rows[BRIEF]["status"] == "paused"
         assert [(w.op, w.automation_id, w.depth) for w in db.writes] == [("delete", BRIEF, 1)]
 
     @pytest.mark.asyncio
@@ -68,6 +74,9 @@ class TestRemove:
 
         assert stored.report == DELETED
         assert [r["file_name"] for r in db.list()] == [OTHER_FILE_NAME]
+        # DALTON-HOOK(company-automations): removing the file pauses and keeps history
+        assert db.rows[BRIEF]["deleted_at"] is not None
+        assert db.rows[BRIEF]["status"] == "paused"
         assert [(w.op, w.automation_id, w.joined) for w in db.writes] == [("delete", BRIEF, True)]
 
     @pytest.mark.asyncio

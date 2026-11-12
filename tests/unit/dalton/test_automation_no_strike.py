@@ -68,3 +68,26 @@ async def test_fuse_immediately_disables_dalton_automation_with_provider_auth():
     assert "(%(fuse)s OR (failure_count + 1 >= max_failures AND name NOT LIKE 'dalton-%%'))" in sql
     assert params["fuse"] is True
     assert params["reason"] == "provider_auth"
+
+
+@pytest.mark.asyncio
+async def test_a_paused_failure_records_the_reason_without_flipping_status():
+    """A paused parent stores the fuse reason. The status flip still excludes paused."""
+    cur = AsyncMock()
+    cur.fetchone.return_value = {"failure_count": 1, "disabled": False}
+    await _count_strike(cur, "user-custom-auto-id", fuse=True)
+    sql = cur.execute.call_args[0][0]
+    assert "AND status IN ('active', 'executing') THEN 'disabled'" in sql
+    assert "AND status IN ('active', 'executing', 'paused') THEN %(reason)s" in sql
+
+
+@pytest.mark.asyncio
+async def test_provider_auth_stays_when_a_later_strike_would_record_max_failures():
+    """An existing provider_auth reason stays. A later strike does not replace it."""
+    cur = AsyncMock()
+    cur.fetchone.return_value = {"failure_count": 2, "disabled": False}
+    await _count_strike(cur, "user-custom-auto-id", fuse=False)
+    sql = cur.execute.call_args[0][0]
+    sticky = "WHEN disable_reason = 'provider_auth' THEN 'provider_auth'"
+    assert sticky in sql
+    assert sql.index(sticky) < sql.index("THEN %(reason)s")

@@ -1098,8 +1098,12 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
         limit: int = 50,
         offset: int = 0,
         computer_id: str | None = None,
+        include_deleted: bool = False,
         conn: Any = None,
     ) -> tuple[list[dict[str, Any]], int]:
+        del conn
+        if include_deleted:
+            return [], 0
         if scope == "personal":
             return [personal_row], 1
         if scope == "research_tracking":
@@ -1118,7 +1122,11 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
         mock_scoped_db,
     )
 
-    async def _fake_company_list(principal, *, status=None, limit=50, offset=0):
+    async def _fake_company_list(
+        principal, *, status=None, limit=50, offset=0, include_deleted: bool = False
+    ):
+        if include_deleted:
+            return AutomationsListResponse(automations=[], total=0)
         resp = AutomationResponse.model_validate(company_task_row)
         company_auto_svc.apply_company_notify_representation(resp, company_task_row)
         return AutomationsListResponse(automations=[resp], total=1)
@@ -1153,6 +1161,7 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
             limit=50,
             offset=0,
             computer_id=None,
+            include_deleted=False,
         )
 
         # 2. Invalid scope -> 422

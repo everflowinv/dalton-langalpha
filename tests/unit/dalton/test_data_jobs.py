@@ -5126,6 +5126,8 @@ async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_nul
     shared_db_conn, _ = _make_autospec_db(
         [
             {"fetchall": candidate_rows},
+            # Retry re-reads dalton_data_task_defs.deleted_at before the claim.
+            {"fetchone": {"deleted_at": None}},
             {"fetchone": {"attempt_count": 2}},
         ]
     )
@@ -5212,7 +5214,13 @@ async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_nul
             "data_task_notify_enabled": True,
         }
     ]
-    disabled_db_conn, _ = _make_autospec_db([{"fetchall": disabled_candidates}])
+    disabled_db_conn, _ = _make_autospec_db(
+        [
+            {"fetchall": disabled_candidates},
+            # Same deleted_at read. This parent is disabled, not deleted.
+            {"fetchone": {"deleted_at": None}},
+        ]
+    )
 
     @asynccontextmanager
     async def _fake_get_disabled_db_conn(conn: Any = None):
@@ -7404,9 +7412,12 @@ async def test_pr12_dispatch_and_retry_feishu_cards_raw_order_and_fallback(
     retry_db_conn, _ = _make_autospec_db(
         [
             {"fetchall": candidate_rows},
+            # Retry re-reads dalton_data_task_defs.deleted_at before the claim.
+            {"fetchone": {"deleted_at": None}},
             {"fetchone": {"attempt_count": 2}},
             {"fetchall": []},
             {"fetchall": candidate_rows},
+            {"fetchone": {"deleted_at": None}},
             {"fetchone": {"attempt_count": 3}},
             {"fetchall": []},
         ]

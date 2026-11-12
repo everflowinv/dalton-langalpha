@@ -85,12 +85,16 @@ class _InMemoryAutomationsStore:
         status: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        computer_id: str | None = None,
+        include_deleted: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
+        del computer_id
         filtered = [
             dict(r)
             for r in self.rows
             if r.get("user_id", user_id) == user_id
             and (status is None or r.get("status") == status)
+            and ((r.get("deleted_at") is not None) == include_deleted)
         ]
         return filtered[offset : offset + limit], len(filtered)
 
@@ -1109,6 +1113,15 @@ async def test_non_pm_strips_log_tail_and_company_run_now_requires_enabled_and_a
     )
     mock_create_exec = create_autospec(system_jobs_mod.exec_db.create_execution)
     monkeypatch.setattr(system_jobs_mod.exec_db, "create_execution", mock_create_exec)
+    # The row is not in the database. Without this, the soft-delete read runs
+    # before trigger_automation and the not-found fallback never stays unreached.
+    import src.dalton.database.automation_recycle as recycle_mod
+
+    monkeypatch.setattr(
+        recycle_mod,
+        "automation_is_soft_deleted",
+        create_autospec(recycle_mod.automation_is_soft_deleted, return_value=False),
+    )
 
     with pytest.raises(RuntimeError, match="enqueue failed"):
         await system_jobs_mod._trigger_automation_row_async(
@@ -1188,6 +1201,19 @@ async def test_preflight_400s_heartbeat_keeps_execution_alive_beyond_300s_stale_
         exec_mod.exec_db,
         "touch_execution",
         create_autospec(exec_mod.exec_db.touch_execution, side_effect=_fake_touch_execution),
+    )
+    # Heartbeat sleep waits for a tick that only preflight sets. The new
+    # pending→running call runs first, so it has to return a live row here.
+    monkeypatch.setattr(
+        exec_mod.exec_db,
+        "begin_execution_if_not_deleted",
+        create_autospec(
+            exec_mod.exec_db.begin_execution_if_not_deleted,
+            return_value={
+                "conversation_thread_id": None,
+                "conversation_response_id": None,
+            },
+        ),
     )
 
     real_sleep = asyncio.sleep
@@ -2608,6 +2634,7 @@ class _InMemoryDataTaskStore:
 
         self.defs: dict[str, dict[str, Any]] = {}
         self.runs: list[dict[str, Any]] = []
+        self.job_key_queries: list[str] = []
         self.user_model_prefs: dict[str, dict[str, Any]] = {
             USER_ID: {
                 "dalton_notify_targets": [
@@ -2642,13 +2669,22 @@ class _InMemoryDataTaskStore:
                 last_all["val"] = []
 
                 if "FROM dalton_data_task_defs WHERE job_key =" in q:
+                    self.job_key_queries.append(q)
                     jk = str(p[0])
                     row = self.defs.get(jk)
                     last_one["val"] = dict(row) if row is not None else None
                     return
 
-                if "FROM dalton_data_task_defs ORDER BY" in q:
-                    last_all["val"] = [dict(r) for r in self.defs.values()]
+                if "FROM dalton_data_task_defs" in q and "deleted_at IS NOT NULL" in q:
+                    last_all["val"] = [
+                        dict(r) for r in self.defs.values() if r.get("deleted_at") is not None
+                    ]
+                    return
+
+                if "FROM dalton_data_task_defs" in q and "ORDER BY" in q:
+                    last_all["val"] = [
+                        dict(r) for r in self.defs.values() if r.get("deleted_at") is None
+                    ]
                     return
 
                 if "INSERT INTO dalton_data_task_defs" in q:
@@ -2722,6 +2758,21 @@ class _InMemoryDataTaskStore:
                                 "audit_history": [dict(x) for x in hist_val],
                             }
                         )
+                    return
+
+                if (
+                    "UPDATE dalton_data_task_defs" in q
+                    and "notify_routes =" in q
+                    and "paused_by_user =" not in q
+                    and "config_version =" not in q
+                ):
+                    jk = str(p[2])
+                    self.defs[jk].update(
+                        {
+                            "notify_enabled": bool(p[0]),
+                            "notify_routes": getattr(p[1], "obj", p[1]),
+                        }
+                    )
                     return
 
                 if "UPDATE dalton_data_task_defs" in q and "paused_by_user =" not in q:
@@ -3880,6 +3931,179 @@ async def test_pr12_data_jobs_schedule_routes_rollback_and_cos_conversation_tool
     assert rb_to_v1["job"]["schedule"] == orig_cron
     assert rb_to_v1["job"]["timezone"] == orig_tz
     assert rb_to_v1["job"]["notify_routes"] == []
+
+
+def _data_snapshot(enabled: bool, routes: list[str], notify_enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "notify_routes": list(routes),
+        "notify_enabled": notify_enabled,
+        "cron_expr": "0 8 * * *",
+        "timezone": "Asia/Shanghai",
+    }
+
+
+def _seed_data_def(
+    store: _InMemoryDataTaskStore,
+    job_key: str,
+    *,
+    mode: str,
+    deleted_at: str | None = None,
+    row_routes: list[str] | None = None,
+) -> None:
+    store.defs[job_key] = {
+        "job_key": job_key,
+        "enabled": True,
+        "paused_by_user": False,
+        "notify_enabled": True,
+        "notify_routes": list(row_routes or ["feishu:user:ou_row_only"]),
+        "notify_storage_mode": mode,
+        "config_version": 2,
+        "active_version": 2,
+        "cron_expr": "15 4 * * *",
+        "timezone": "Asia/Shanghai",
+        "deleted_at": deleted_at,
+        "consecutive_failures": 0,
+        "updated_by": "internal-a",
+        "updated_at": "2026-11-08T00:00:00+00:00",
+        "audit_history": [
+            {
+                "version": 1,
+                "prev_version": None,
+                "action": "seed",
+                "snapshot": _data_snapshot(False, ["feishu:user:ou_admin1"], False),
+            },
+            {
+                "version": 2,
+                "prev_version": 1,
+                "action": "update",
+                "snapshot": _data_snapshot(True, ["feishu:user:ou_admin2"], True),
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_old_data_task_exits_refuse_and_hide_a_deleted_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted data task is absent from the list, and the old exits 404."""
+    from fastapi import HTTPException
+
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    data_store.wire(monkeypatch, {USER_ID: "admin"})
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_call_host_bridge",
+        create_autospec(
+            system_jobs_mod._call_host_bridge,
+            return_value=(200, {"ok": True, "jobs": []}),
+        ),
+    )
+    job_key = next(iter(system_jobs_mod._get_data_tasks_manifest_map()))
+    _seed_data_def(
+        data_store,
+        job_key,
+        mode="legacy",
+        deleted_at="2026-11-01T00:00:00+00:00",
+    )
+
+    listed = await system_jobs_mod.list_system_jobs(USER_ID)
+    data_keys = [job["job_key"] for job in listed["jobs"] if job["scope"] == "data"]
+    assert job_key not in data_keys
+    assert len(data_keys) == len(system_jobs_mod._get_data_tasks_manifest_map()) - 1
+
+    with pytest.raises(HTTPException) as toggled:
+        await system_jobs_mod.toggle_system_job(
+            USER_ID,
+            f"data:{job_key}",
+            enabled=False,
+            actor_user_id=USER_ID,
+        )
+    assert toggled.value.status_code == 404
+    assert toggled.value.detail == "Automation not found"
+    with pytest.raises(HTTPException) as rescheduled:
+        await system_jobs_mod.toggle_system_job(
+            USER_ID,
+            f"data:{job_key}",
+            cron_expr="0 9 * * *",
+            actor_user_id=USER_ID,
+        )
+    assert rescheduled.value.status_code == 404
+    assert data_store.defs[job_key]["enabled"] is True
+    assert data_store.defs[job_key]["cron_expr"] == "15 4 * * *"
+
+    with pytest.raises(HTTPException) as ran:
+        await system_jobs_mod.run_system_job_now(USER_ID, f"data:{job_key}")
+    assert ran.value.status_code == 404
+    assert ran.value.detail == "Automation not found"
+    assert data_store.runs == []
+
+    before = len(data_store.job_key_queries)
+    with pytest.raises(HTTPException) as status:
+        await system_jobs_mod.get_system_job_status(USER_ID, f"data:{job_key}")
+    assert status.value.status_code == 404
+    assert status.value.detail == "Automation not found"
+    status_sql = " ".join(data_store.job_key_queries[before:])
+    assert "deleted_at" in status_sql
+
+
+@pytest.mark.asyncio
+async def test_data_task_rollback_follows_notify_storage_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """legacy writes the preference item; task_row writes the task row and leaves prefs."""
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    data_store.wire(monkeypatch, {USER_ID: "admin", "internal-a": "internal"})
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_call_host_bridge",
+        create_autospec(
+            system_jobs_mod._call_host_bridge,
+            return_value=(200, {"ok": True, "jobs": []}),
+        ),
+    )
+    legacy_key, task_row_key = list(system_jobs_mod._get_data_tasks_manifest_map())[:2]
+    _seed_data_def(data_store, legacy_key, mode="legacy")
+    _seed_data_def(data_store, task_row_key, mode="task_row")
+    data_store.user_model_prefs[USER_ID]["dalton_notify_routes"] = {
+        f"data:{legacy_key}": ["feishu:user:ou_admin2"],
+        f"data:{task_row_key}": ["feishu:user:ou_kept"],
+    }
+
+    legacy = await system_jobs_mod.rollback_data_task_config("internal-a", legacy_key)
+    assert legacy["job"]["notify_routes"] == ["feishu:user:ou_admin1"]
+    assert legacy["job"]["enabled"] is False
+    assert (
+        data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][f"data:{legacy_key}"]
+        == ["feishu:user:ou_admin1"]
+    )
+    assert data_store.defs[legacy_key]["notify_routes"] == ["feishu:user:ou_row_only"]
+    assert "notify_enabled" not in legacy["job"]["audit_history"][-1]["snapshot"]
+
+    task_row = await system_jobs_mod.rollback_data_task_config("internal-a", task_row_key)
+    assert task_row["job"]["notify_routes"] == ["feishu:user:ou_admin1"]
+    assert task_row["job"]["notify_enabled"] is False
+    assert data_store.defs[task_row_key]["notify_routes"] == ["feishu:user:ou_admin1"]
+    assert data_store.defs[task_row_key]["notify_enabled"] is False
+    assert (
+        data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][f"data:{task_row_key}"]
+        == ["feishu:user:ou_kept"]
+    )
+    snap = task_row["job"]["audit_history"][-1]["snapshot"]
+    assert snap["notify_enabled"] is False
+    assert snap["notify_routes"] == ["feishu:user:ou_admin1"]
+    assert task_row["job"]["audit_history"][-1]["changes"]["notify_routes"]["old"] == [
+        "feishu:user:ou_row_only"
+    ]
+
+    listed = await system_jobs_mod.list_system_jobs(USER_ID)
+    listed_row = next(job for job in listed["jobs"] if job.get("job_key") == task_row_key)
+    assert listed_row["notify_routes"] == ["feishu:user:ou_admin1"]
 
 
 

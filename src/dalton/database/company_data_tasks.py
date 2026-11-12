@@ -50,6 +50,7 @@ async def find_present_job_keys(
 async def list_company_agent_rows(
     *,
     status: str | None = None,
+    include_deleted: bool = False,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
     """Return every non-deleted company agent, optionally filtered by ``automations.status``.
@@ -58,8 +59,13 @@ async def list_company_agent_rows(
     """
     from src.server.database.automation import AUTOMATION_COLUMNS, _last_execution_join
 
+    deleted_sql = (
+        "automations.deleted_at IS NOT NULL"
+        if include_deleted
+        else "automations.deleted_at IS NULL"
+    )
     where_parts = [
-        "automations.deleted_at IS NULL",
+        deleted_sql,
         "automations.scope = 'company'",
         "automations.user_id = %s",
     ]
@@ -160,25 +166,32 @@ _DEF_READ_COLUMNS = """
     updated_by,
     updated_at,
     migration_state,
-    deleted_at
+    deleted_at,
+    deleted_by
 """
 
 
 async def list_active_manifest_def_rows(
     job_keys: list[str],
     *,
+    include_deleted: bool = False,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Return non-deleted definition rows whose keys are in ``job_keys``."""
+    """Return definition rows whose keys are in ``job_keys``.
+
+    ``include_deleted`` selects only soft-deleted rows. The default stays
+    ``deleted_at IS NULL``.
+    """
     if not job_keys:
         return []
+    deleted_sql = "deleted_at IS NOT NULL" if include_deleted else "deleted_at IS NULL"
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 SELECT {_DEF_READ_COLUMNS}
                 FROM dalton_data_task_defs
-                WHERE deleted_at IS NULL
+                WHERE {deleted_sql}
                   AND job_key = ANY(%s)
                 """,
                 (list(job_keys),),

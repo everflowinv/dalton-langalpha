@@ -286,6 +286,10 @@ def _adapt_data_task_to_automation_response(
         dalton_notify_source=source,
         dalton_notify_route_targets=routes,
         last_execution=_script_execution(job_key, latest_run),
+        deleted_at=def_row.get("deleted_at"),
+        deleted_by=(
+            str(def_row["deleted_by"]) if def_row.get("deleted_by") is not None else None
+        ),
     )
 
 
@@ -295,12 +299,19 @@ async def list_company_automations(
     status: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    include_deleted: bool = False,
 ) -> AutomationsListResponse:
     """Merge company agents and manifest scripts, then sort and page once."""
     await require_company_scope_read_access(principal)
     keys = await _require_complete_manifest()
-    agent_rows = await company_data_db.list_company_agent_rows(status=status)
-    def_rows = await company_data_db.list_active_manifest_def_rows(keys)
+    agent_rows = await company_data_db.list_company_agent_rows(
+        status=status,
+        include_deleted=include_deleted,
+    )
+    def_rows = await company_data_db.list_active_manifest_def_rows(
+        keys,
+        include_deleted=include_deleted,
+    )
     runs = await company_data_db.list_latest_script_runs(
         [str(row["job_key"]) for row in def_rows]
     )
@@ -336,6 +347,8 @@ async def list_company_automations(
 async def get_script_automation(
     principal: Principal,
     job_key: str,
+    *,
+    allow_deleted: bool = False,
 ) -> ScriptAutomationResponse:
     """Read one manifest script. Unknown keys are 404; a missing row is 503."""
     await require_company_scope_read_access(principal)
@@ -345,7 +358,7 @@ async def get_script_automation(
         raise CompanyDataTaskReadError(
             f"Company data task definition is missing: {job_key}"
         )
-    if def_row.get("deleted_at") is not None:
+    if def_row.get("deleted_at") is not None and not allow_deleted:
         raise HTTPException(status_code=404, detail="Automation not found")
     runs = await company_data_db.list_latest_script_runs([job_key])
     route_map = await _legacy_routes_by_job([def_row])

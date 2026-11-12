@@ -168,6 +168,7 @@ async def list_automations_for_scope_db(
     limit: int = 50,
     offset: int = 0,
     computer_id: str | None = None,
+    include_deleted: bool = False,
     conn: Any = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Read paginated automations and matching total count for an explicit ``scope``."""
@@ -177,7 +178,12 @@ async def list_automations_for_scope_db(
         _last_execution_join,
     )
 
-    where_parts: list[str] = ["automations.deleted_at IS NULL"]
+    deleted_sql = (
+        "automations.deleted_at IS NOT NULL"
+        if include_deleted
+        else "automations.deleted_at IS NULL"
+    )
+    where_parts: list[str] = [deleted_sql]
     params: list[Any] = []
 
     if scope == "company":

@@ -49,6 +49,10 @@ def _quiet_sweep(mock_exec_db):
     """Nothing left unsettled, so a poll's sweep is a no-op."""
     mock_exec_db.settle_legacy_executions = AsyncMock(return_value=0)
     mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[])
+    # DALTON-HOOK(company-automations): the sweep skips deleted parents once
+    mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+        return_value=0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +274,9 @@ class TestPollOnce:
             side_effect=lambda *_: calls.append("sweep") or 0
         )
         mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[])
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=0
+        )
 
         scheduler = AutomationScheduler()
         await scheduler._poll_once()
@@ -284,6 +291,7 @@ class TestPollOnce:
     async def test_a_slow_sweep_does_not_hold_up_the_next_claim(
         self, mock_executor_cls, mock_auto_db, mock_exec_db
     ):
+        # DALTON-HOOK(company-automations): polls call the one-shot parent skip
         mock_executor_cls.get_instance.return_value = AsyncMock()
         release = asyncio.Event()
         sweeps = []
@@ -296,6 +304,9 @@ class TestPollOnce:
         mock_auto_db.claim_due_automations = AsyncMock(return_value=[])
         mock_exec_db.settle_legacy_executions = AsyncMock(side_effect=slow_sweep)
         mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[])
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=0
+        )
         scheduler = AutomationScheduler()
 
         await scheduler._poll_once()
@@ -344,7 +355,11 @@ class TestSweep:
         automation = _make_automation(automation_id="auto-kept")
         mock_exec_db.settle_legacy_executions = AsyncMock(return_value=2)
         mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[kept, gone])
-        mock_auto_db.get_automation = AsyncMock(
+        # DALTON-HOOK(company-automations): sweep skips deleted parents once
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=0
+        )
+        mock_auto_db.get_automation_including_deleted = AsyncMock(
             side_effect=lambda aid, uid: automation if aid == "auto-kept" else None
         )
         mock_settle.side_effect = AsyncMock(return_value=Outcome.INTERRUPTED)
@@ -369,7 +384,12 @@ class TestSweep:
         rows = [_abandoned_row("auto-1"), _abandoned_row("auto-1")]
         mock_exec_db.settle_legacy_executions = AsyncMock(return_value=0)
         mock_exec_db.list_abandoned_executions = AsyncMock(return_value=rows)
-        mock_auto_db.get_automation = AsyncMock(return_value=_make_automation())
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=0
+        )
+        mock_auto_db.get_automation_including_deleted = AsyncMock(
+            return_value=_make_automation()
+        )
         mock_settle.side_effect = [RuntimeError("db blip"), None]
 
         await AutomationScheduler()._sweep_abandoned_firings()
@@ -389,10 +409,51 @@ class TestSweep:
         mock_exec_db.list_abandoned_executions = AsyncMock(
             side_effect=RuntimeError("db down")
         )
+        # DALTON-HOOK(company-automations): a failed sweep still calls the skip
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=0
+        )
 
         await AutomationScheduler()._sweep_abandoned_firings()
 
         mock_settle.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_MOD}.settle_abandoned")
+    @patch(f"{_MOD}.exec_db")
+    @patch(f"{_MOD}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_deleted_parents_pending_firing_is_skipped(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db, mock_settle
+    ):
+        """The sweep skips unstarted rows in one call. A running row still settles."""
+        mock_executor_cls.get_instance.return_value = MagicMock()
+        aid = "auto-deleted"
+        pending = _abandoned_row(aid)
+        pending["status"] = "pending"
+        running = _abandoned_row(aid)
+        running["status"] = "running"
+        deleted = _make_automation(
+            automation_id=aid,
+            deleted_at="2026-11-01T00:00:00+00:00",
+        )
+        mock_exec_db.settle_legacy_executions = AsyncMock(return_value=0)
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=1
+        )
+        mock_exec_db.list_abandoned_executions = AsyncMock(
+            return_value=[pending, running]
+        )
+        mock_auto_db.get_automation_including_deleted = AsyncMock(return_value=deleted)
+        mock_settle.side_effect = AsyncMock(return_value=Outcome.INTERRUPTED)
+
+        await AutomationScheduler()._sweep_abandoned_firings()
+
+        skipped = mock_exec_db.skip_unstarted_executions_of_deleted_parents
+        skipped.assert_awaited_once_with()
+        mock_exec_db.list_deleted_parent_ids_with_unstarted.assert_not_called()
+        mock_settle.assert_awaited_once()
+        assert mock_settle.await_args.args[1]["status"] == "running"
 
     @pytest.mark.asyncio
     @patch(f"{_MOD}.AutomationExecutor")

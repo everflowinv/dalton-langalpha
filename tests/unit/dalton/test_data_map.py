@@ -780,13 +780,36 @@ async def test_health_check_isolation_separate_backends_and_dedicated_lock(
     mock_rel_lock.assert_awaited_once_with(conn=mock_lock_conn)
     mock_lock_conn.close.assert_awaited_once()
 
-    # Startup check skips immediately when today's cache already exists
-    from src.server.database import automation as auto_db
+    # Startup check skips when today's cache exists. Pause is a direct read of
+    # the dalton-data-health row, including a deleted one, not the task list.
+    from contextlib import asynccontextmanager
+
+    from psycopg import AsyncCursor
+
+    pause_cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _pause_fetchall() -> list[dict[str, Any]]:
+        return []
+
+    pause_cur.fetchall.side_effect = _pause_fetchall
+
+    @asynccontextmanager
+    async def _pause_cursor(*_args: Any, **_kwargs: Any):
+        yield pause_cur
+
+    pause_conn = create_autospec(AsyncConnection, instance=True)
+    pause_conn.cursor.side_effect = _pause_cursor
+
+    @asynccontextmanager
+    async def _pause_db(*_args: Any, **_kwargs: Any):
+        yield pause_conn
 
     monkeypatch.setattr(
-        auto_db,
-        "list_all_automations",
-        create_autospec(auto_db.list_all_automations, return_value=[]),
+        health_mod.db_pool,
+        "get_db_connection",
+        create_autospec(
+            health_mod.db_pool.get_db_connection, side_effect=_pause_db
+        ),
     )
     mock_open_lock.reset_mock()
     mock_get_cached.return_value = {"cache_date": "2026-10-22", "rendered_markdown": "## Dalton 数据地图"}
@@ -807,7 +830,9 @@ async def test_startup_health_check_loop_cross_day_exception_and_cancel(
     3) Skips when a health check record exists within the last 24 hours;
     4) Runs once when neither condition holds, without entering a periodic sleep loop.
     """
-    from src.server.database import automation as auto_db
+    from contextlib import asynccontextmanager
+
+    from psycopg import AsyncCursor
 
     monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-admin")
     current_day = [date(2026, 10, 22)]
@@ -832,24 +857,45 @@ async def test_startup_health_check_loop_cross_day_exception_and_cancel(
     }
     automation_rows: list[dict[str, Any]] = [
         {
-            "automation_id": "auto-dh-1",
             "user_id": "pm-admin",
-            "name": "dalton-data-health",
+            "scope": "personal",
             "status": "paused",
-            "metadata": {"dalton_managed": True, "dalton_kind": "data_health", "paused_by_user": True},
+            "deleted_at": None,
+            "metadata": {
+                "dalton_managed": True,
+                "dalton_kind": "data_health",
+                "paused_by_user": True,
+            },
         }
     ]
     raise_db_error = [False]
 
-    async def _fake_list_all_automations(user_id: str, *, conn: Any = None) -> list[dict[str, Any]]:
+    pause_cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _pause_execute(*_args: Any, **_kwargs: Any) -> None:
         if raise_db_error[0]:
             raise RuntimeError("db query failure")
-        return [dict(r) for r in automation_rows if r.get("user_id") == user_id]
+
+    async def _pause_fetchall() -> list[dict[str, Any]]:
+        return [dict(row) for row in automation_rows]
+
+    pause_cur.execute.side_effect = _pause_execute
+    pause_cur.fetchall.side_effect = _pause_fetchall
+
+    @asynccontextmanager
+    async def _pause_cursor(*_args: Any, **_kwargs: Any):
+        yield pause_cur
+
+    pause_conn = create_autospec(AsyncConnection, instance=True)
+    pause_conn.cursor.side_effect = _pause_cursor
+
+    @asynccontextmanager
+    async def _pause_db(*_args: Any, **_kwargs: Any):
+        yield pause_conn
 
     async def _fake_get_cached(cache_date: date, *, conn: Any = None) -> dict[str, Any] | None:
         return cached_by_date.get(cache_date)
 
-    mock_list_all = create_autospec(auto_db.list_all_automations, side_effect=_fake_list_all_automations)
     mock_get_cached = create_autospec(db_data_map.get_cached_data_map, side_effect=_fake_get_cached)
     mock_fetch_health = create_autospec(db_data_map.fetch_all_source_health, return_value={})
     mock_lock_conn = create_autospec(AsyncConnection, instance=True)
@@ -882,7 +928,13 @@ async def test_startup_health_check_loop_cross_day_exception_and_cancel(
         return_value=([{"source_id": "tmtb", "status": "available"}], [], set(FIXED_HANDOFF_ROUTES)),
     )
 
-    monkeypatch.setattr(auto_db, "list_all_automations", mock_list_all)
+    monkeypatch.setattr(
+        health_mod.db_pool,
+        "get_db_connection",
+        create_autospec(
+            health_mod.db_pool.get_db_connection, side_effect=_pause_db
+        ),
+    )
     monkeypatch.setattr(db_data_map, "get_cached_data_map", mock_get_cached)
     monkeypatch.setattr(db_data_map, "fetch_all_source_health", mock_fetch_health)
     monkeypatch.setattr(db_data_map, "try_acquire_health_run_lock", mock_try_lock)

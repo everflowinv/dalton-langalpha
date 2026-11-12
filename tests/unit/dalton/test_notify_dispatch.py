@@ -1218,6 +1218,327 @@ def test_format_notify_message_and_frontend_url_resolution(
     assert not any("/chat/t/" in ln for ln in lines_without_link)
 
 
+@pytest.mark.asyncio
+async def test_retry_skips_a_deleted_parent_and_does_not_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry re-reads deleted_at and marks the row skipped. It does not send."""
+    import src.dalton.database.automation_recycle as recycle_mod
+
+    class _State:
+        mode = ""
+        deleted_at: Any = None
+        missing = False
+
+    state = _State()
+    queries: list[str] = []
+    candidates: list[dict[str, Any]] = []
+
+    fake_cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _execute(sql: Any, params: Any = None, **_kwargs: object) -> None:
+        text = " ".join(str(sql).split())
+        queries.append(text)
+        if "FROM dalton_notify_deliveries" in text and "SELECT" in text:
+            state.mode = "scan"
+        elif "FROM dalton_data_task_defs" in text:
+            state.mode = "defs"
+        else:
+            state.mode = "other"
+
+    async def _fetchall() -> list[dict[str, Any]]:
+        if state.mode == "scan":
+            return list(candidates)
+        return []
+
+    async def _fetchone() -> dict[str, Any] | None:
+        if state.mode != "defs" or state.missing:
+            return None
+        return {"deleted_at": state.deleted_at}
+
+    async def _enter() -> Any:
+        return fake_cursor
+
+    async def _exit(*_args: object) -> None:
+        return None
+
+    fake_cursor.execute.side_effect = _execute
+    fake_cursor.fetchall.side_effect = _fetchall
+    fake_cursor.fetchone.side_effect = _fetchone
+    fake_cursor.__aenter__.side_effect = _enter
+    fake_cursor.__aexit__.side_effect = _exit
+    fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    fake_conn.cursor.return_value = fake_cursor
+
+    @asynccontextmanager
+    async def _db(_conn: Any = None):
+        yield fake_conn
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "get_db_connection",
+        create_autospec(pool_mod.get_db_connection, side_effect=_db),
+    )
+
+    assert await dispatch_mod._retry_parent_is_deleted(
+        {"automation_id": "auto-1", "payload_json": {}}
+    ) is False
+    assert not any("dalton_data_task_defs" in query for query in queries)
+
+    state.missing = True
+    assert await dispatch_mod._retry_parent_is_deleted(
+        {"automation_id": "data:cn-leverage-daily", "payload_json": {}}
+    ) is False
+    state.missing = False
+    state.deleted_at = datetime(2026, 11, 1, tzinfo=UTC)
+    assert await dispatch_mod._retry_parent_is_deleted(
+        {"automation_id": "data:cn-leverage-daily", "payload_json": {}}
+    ) is True
+
+    auto_id = str(uuid4())
+    monkeypatch.setattr(
+        recycle_mod,
+        "automation_is_soft_deleted",
+        create_autospec(recycle_mod.automation_is_soft_deleted, return_value=True),
+    )
+    candidates.extend(
+        [
+            {
+                "execution_id": "exec-deleted-auto",
+                "automation_id": auto_id,
+                "user_id": "u-1",
+                "channel": "feishu",
+                "target": "feishu:user:ou_keep",
+                "status": "failed",
+                "attempt_count": 1,
+                "payload_json": {"text": "report"},
+            },
+            {
+                "execution_id": "exec-deleted-data",
+                "automation_id": "data:cn-leverage-daily",
+                "user_id": "u-1",
+                "channel": "feishu",
+                "target": "feishu:user:ou_keep",
+                "status": "pending",
+                "attempt_count": 1,
+                "payload_json": {"route_key": "data:cn-leverage-daily", "text": "report"},
+            },
+        ]
+    )
+    marks: list[tuple[Any, ...]] = []
+
+    async def _mark(execution_id, channel, target, **kwargs):
+        marks.append((execution_id, kwargs.get("status"), kwargs.get("reason")))
+        return True
+
+    mark = create_autospec(mark_target_delivery, side_effect=_mark)
+    post = create_autospec(
+        post_bridge_notify,
+        return_value={"ok": True, "results": []},
+    )
+    sent = await retry_failed_notify_deliveries(
+        post_notify_fn=post,
+        mark_delivery_fn=mark,
+        limit=5,
+    )
+    assert sent == 0
+    post.assert_not_called()
+    assert marks == [
+        ("exec-deleted-auto", "skipped", "task_deleted"),
+        ("exec-deleted-data", "skipped", "task_deleted"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_claim_fails_when_the_parent_is_deleted_after_the_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delete after the early check fails the claim, so the row is not sent."""
+    import src.dalton.database.automation_recycle as recycle_mod
+
+    auto_id = str(uuid4())
+    job_key = "cn-leverage-daily"
+    auto_target = "feishu:user:ou_auto"
+    data_target = "feishu:user:ou_data"
+    queries: list[str] = []
+    claim_sqls: list[str] = []
+
+    class _State:
+        mode = ""
+        sql = ""
+        params: Any = None
+
+    state = _State()
+    candidates = [
+        {
+            "execution_id": "exec-raced-auto",
+            "automation_id": auto_id,
+            "user_id": "u-claim",
+            "channel": "feishu",
+            "target": auto_target,
+            "status": "failed",
+            "attempt_count": 1,
+            "payload_json": {"text": "still due"},
+            "automation_name": "Morning",
+            "automation_metadata": {},
+        },
+        {
+            "execution_id": "exec-live-data",
+            "automation_id": f"data:{job_key}",
+            "user_id": "u-claim",
+            "channel": "feishu",
+            "target": data_target,
+            "status": "failed",
+            "attempt_count": 1,
+            "payload_json": {"route_key": f"data:{job_key}", "text": "still due"},
+            "data_task_enabled": True,
+            "data_task_notify_enabled": True,
+        },
+    ]
+
+    fake_cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+
+    async def _execute(sql: Any, params: Any = None, **_kwargs: object) -> None:
+        text = " ".join(str(sql).split())
+        queries.append(text)
+        state.sql = text
+        state.params = params
+        if "RETURNING attempt_count" in text and "UPDATE" in text:
+            state.mode = "claim"
+            claim_sqls.append(text)
+        elif "data_task_enabled" in text and "dalton_notify_deliveries" in text:
+            state.mode = "scan"
+        elif (
+            "SELECT" in text
+            and "deleted_at" in text
+            and "dalton_data_task_defs" in text
+            and "UPDATE" not in text
+        ):
+            state.mode = "defs"
+        else:
+            state.mode = "other"
+
+    async def _fetchall() -> list[dict[str, Any]]:
+        if state.mode == "scan":
+            return list(candidates)
+        return []
+
+    async def _fetchone() -> dict[str, Any] | None:
+        if state.mode == "defs":
+            return {"deleted_at": None}
+        if state.mode != "claim":
+            return None
+        exec_id = str(state.params[0]) if state.params else ""
+        guards_parent = (
+            "deleted_at IS NULL" in state.sql
+            and "automations" in state.sql
+            and "dalton_data_task_defs" in state.sql
+        )
+        if not guards_parent:
+            return {"attempt_count": 2, "payload_json": {"text": "still due"}}
+        if exec_id == "exec-raced-auto":
+            return None
+        if exec_id == "exec-live-data":
+            return {
+                "attempt_count": 2,
+                "payload_json": {
+                    "route_key": f"data:{job_key}",
+                    "text": "still due",
+                },
+            }
+        return None
+
+    async def _enter() -> Any:
+        return fake_cursor
+
+    async def _exit(*_args: object) -> None:
+        return None
+
+    fake_cursor.execute.side_effect = _execute
+    fake_cursor.fetchall.side_effect = _fetchall
+    fake_cursor.fetchone.side_effect = _fetchone
+    fake_cursor.__aenter__.side_effect = _enter
+    fake_cursor.__aexit__.side_effect = _exit
+    fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    fake_conn.cursor.return_value = fake_cursor
+
+    @asynccontextmanager
+    async def _db(_conn: Any = None):
+        yield fake_conn
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "get_db_connection",
+        create_autospec(pool_mod.get_db_connection, side_effect=_db),
+    )
+    parent_deleted = create_autospec(
+        recycle_mod.automation_is_soft_deleted,
+        return_value=False,
+    )
+    monkeypatch.setattr(
+        recycle_mod,
+        "automation_is_soft_deleted",
+        parent_deleted,
+    )
+
+    async def _post(targets, text, card=None, **_kwargs):
+        return {
+            "ok": True,
+            "results": [{"target": target, "ok": True} for target in targets],
+        }
+
+    async def _mark(*_args, **_kwargs):
+        return True
+
+    async def _admin(_user_id: str | None = None) -> bool:
+        return True
+
+    post = create_autospec(post_bridge_notify, side_effect=_post)
+    mark = create_autospec(mark_target_delivery, side_effect=_mark)
+    sent = await retry_failed_notify_deliveries(
+        post_notify_fn=post,
+        mark_delivery_fn=mark,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled,
+            return_value=True,
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides,
+            return_value={},
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets,
+            return_value=[auto_target, data_target],
+        ),
+        resolve_routes_fn=create_autospec(
+            model_prefs_mod.resolve_dalton_notify_routes,
+            return_value={
+                f"automation:{auto_id}": [auto_target],
+                f"data:{job_key}": [data_target],
+            },
+        ),
+        is_admin_fn=create_autospec(_admin, return_value=True),
+        limit=5,
+    )
+
+    assert parent_deleted.await_count == 1
+    assert parent_deleted.await_args.args[0] == auto_id
+    assert any(
+        "UPDATE" not in query
+        and "dalton_data_task_defs" in query
+        and "deleted_at" in query
+        for query in queries
+    )
+    assert claim_sqls
+    for claim_sql in claim_sqls:
+        assert "deleted_at IS NULL" in claim_sql
+        assert "automations" in claim_sql
+        assert "dalton_data_task_defs" in claim_sql
+    assert sent == 1
+    assert post.await_count == 1
+    assert post.await_args.args[0] == [data_target]
+
+
 def test_feishu_card_schema_2_0_real_sentences_truncation_and_behaviors_button() -> None:
     """Verify:
     - Verdict template color mapping.
@@ -2357,3 +2678,43 @@ async def test_resolve_and_populate_automation_notify_state_custom_routed_and_bu
         [],
     )
 
+
+
+# DALTON-HOOK(company-automations): a saved report of a deleted automation is never claimed.
+@pytest.mark.parametrize("source", ["automation_report", "automation_report_failure_alert"])
+def test_saved_report_claim_requires_live_parent(monkeypatch, source):
+    import contextlib
+
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    executed: list[str] = []
+
+    class _Cursor:
+        async def execute(self, sql, params=None):
+            executed.append(sql)
+
+        async def fetchone(self):
+            return None
+
+    class _Conn:
+        def cursor(self, row_factory=None):
+            @contextlib.asynccontextmanager
+            async def _cm():
+                yield _Cursor()
+
+            return _cm()
+
+    @contextlib.asynccontextmanager
+    async def _fake_connection(conn=None):
+        yield _Conn()
+
+    monkeypatch.setattr(dispatch_mod, "get_db_connection", _fake_connection)
+    claimed, attempts = asyncio.run(
+        dispatch_mod._claim_saved_delivery_source(
+            "exec-1", "feishu", "chat:oc_x", source=source
+        )
+    )
+    assert (claimed, attempts) == (False, None)
+    sql = executed[0]
+    assert "FROM automations AS a" in sql and "a.deleted_at IS NULL" in sql
+    assert "[0-9a-f]{8}-[0-9a-f]{4}-" in sql
