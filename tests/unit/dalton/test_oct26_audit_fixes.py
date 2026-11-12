@@ -533,7 +533,11 @@ def test_model_fallback_emits_warning_log_with_reason_and_scrubs_secrets(
 ) -> None:
     """_emit_fallback logs a WARNING with from_model, to_model, status_code, error_type, and sanitized error, and includes error_type in UI props."""
     import ptc_agent.agent.middleware.model_resilience as mr_mod
+    import structlog
 
+    # Patch a fresh proxy, not the module's own: reading .warning on the real
+    # proxy binds and caches it, and later capture_logs tests see nothing.
+    monkeypatch.setattr(mr_mod, "logger", structlog.get_logger(mr_mod.__name__))
     warning_spy = create_autospec(mr_mod.logger.warning)
     monkeypatch.setattr(mr_mod.logger, "warning", warning_spy)
 
