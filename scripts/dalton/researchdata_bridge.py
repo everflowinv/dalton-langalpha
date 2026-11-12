@@ -16913,14 +16913,32 @@ def _cwd_under_ocw(cwd: Any, ocw_root: Path) -> Path:
 
 
 def _load_host_job_manifest():
-    """Load the data-task manifest from this checkout. Fail closed for non-BBG jobs."""
-    repo_root = Path(__file__).resolve().parents[2]
-    root_text = str(repo_root)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    from src.dalton.data_jobs.manifest import load_data_task_manifest
+    """Load the data-task manifest from this checkout. Fail closed for non-BBG jobs.
 
-    return load_data_task_manifest()
+    The bridge runs under the host interpreter, which lacks the backend's
+    dependencies. Importing ``src.dalton`` runs its package ``__init__`` and the
+    backend settings, so load ``manifest.py`` by path; it needs only yaml and
+    pydantic.
+    """
+    import importlib.util
+
+    module_path = (
+        Path(__file__).resolve().parents[2] / "src" / "dalton" / "data_jobs" / "manifest.py"
+    )
+    name = "_dalton_bridge_data_task_manifest"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module.load_data_task_manifest()
 
 
 def resolve_host_run_command_spec(
