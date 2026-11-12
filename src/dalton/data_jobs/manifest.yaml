@@ -1,4 +1,4 @@
-# OC-1 deterministic data tasks manifest (35 tasks: phase 1, nine batch-3 script tasks, seven batch-4 watchlist scans).
+# OC-1 deterministic data tasks manifest (36 tasks: phase 1, nine batch-3 script tasks, seven batch-4 watchlist scans, one batch-5 host task).
 # Fields match DESIGN_data_task_layer.FINAL_20261107.md §1.1 (TASK_BASELINE.md + approved changes for T28 & T44).
 # All tasks default to enabled: false in PR 0-1 so merging does not alter production behavior.
 tasks:
@@ -867,6 +867,32 @@ tasks:
       - "mkdir -p state/a-share-volume-watch && python3 scripts/a_share_volume_watch.py 2>>state/a-share-volume-watch/stderr.log"
     secret_names: []
     freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  # OC-1 batch 5. Only T34. Podcast jobs stay on OpenClaw until a Gemini API key is configured.
+  - task_code: "T34"
+    job_key: "richard-relative-dashboard-refresh"
+    title: "richard-relative-dashboard-refresh"
+    batch_no: 1
+    runner: "host"
+    host_mode: "run"
+    cron: "20 18 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "var/dalton/openclaw-data"
+    command: "bash skills/kweb-dashboard/scripts/run.sh deploy --json"
+    command_argv:
+      - "bash"
+      - "skills/kweb-dashboard/scripts/run.sh"
+      - "deploy"
+      - "--json"
+    secret_names: []
+    freeze_paths:
+      - "research-outputs/kweb-dashboard/index.html"
     cos_mode: "skip"
     notify_enabled: false
     enabled: false

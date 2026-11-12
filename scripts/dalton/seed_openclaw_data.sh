@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Bootstrap seed sync for OC-1 data tasks (Design §6.2).
-# Syncs ONLY the allowlisted scripts (25), skills (12), config, and data paths
-# (Design §6.2, plus the batch 3 and batch 4 files those tasks read) from ~/.openclaw/workspace/ to
+# Syncs ONLY the allowlisted scripts (25), skills (13), config, and data paths
+# (Design §6.2, plus the batch 3, batch 4, and batch 5 files those tasks read) from ~/.openclaw/workspace/ to
 # <repo>/var/dalton/openclaw-data/, excluding venv/, .venv/, cos-venv/,
-# pending.json, *inflight*, .git/, and .dalton-freeze/, and creates the
+# pending.json, *inflight*, .git/, .dalton-freeze/, and credential names
+# (.env, *.env, .env.*, *secret*, *credential*, *.pem, *.key, *.p12,
+# id_rsa*, *token*.json), and creates the
 # state/sentiment-dashboard/cos-venv/bin/python launcher for /app/.venv/bin/python.
 #
 # Code (scripts, skill code, config) is updated on every --apply.
@@ -115,9 +117,10 @@ SEED_CONFIGS=(
   "config/a_share_volume_watch.json"
 )
 
-# Phase 1 skills, plus batch 3 skills. Skill code (including config/ and
-# references/) is updated on every --apply. Directories named state, data,
-# temp, events, or model_cards inside a skill are state: copied only when the target file is missing.
+# Phase 1 skills, plus batch 3 skills and the batch 5 kweb-dashboard skill.
+# Skill code (including config/ and references/) is updated on every --apply.
+# Directories named state, data, temp, events, or model_cards inside a skill
+# are state: copied only when the target file is missing.
 # venv/, .venv/, and cos-venv/ stay excluded below.
 SEED_SKILLS=(
   "skills/ah-premium-monitor"
@@ -132,6 +135,7 @@ SEED_SKILLS=(
   "skills/ai-chain"
   "skills/fde-hiring-tracker"
   "skills/hedging-analysis"
+  "skills/kweb-dashboard"
 )
 
 # State and generated data. A later --apply fills gaps and does not replace
@@ -202,6 +206,12 @@ SEED_STATE_PATHS=(
   # T38 redirects stderr here. The directory must exist before Python starts.
   # Files already in the target (stderr.log, runtime json) are not replaced.
   "state/a-share-volume-watch"
+  # T34 portfolio files. Copied only when the target file is missing.
+  # Generated index.html is not seeded. Keychain credentials are not files.
+  "state/kweb-dashboard/portfolio_state.json"
+  "state/kweb-dashboard/portfolio_ledger.jsonl"
+  "state/kweb-dashboard/etf_aum.json"
+  "research-outputs/kweb-dashboard/portfolio/*.md"
 )
 
 SOURCE_DIR="${SOURCE_DIR%/}"
@@ -252,6 +262,71 @@ trap 'rm -f "${CODE_FILES_TMP}" "${STATE_FILES_TMP}" "${RSYNC_OUT_TMP}"; [[ -z "
   done
 ) | LC_ALL=C sort -u > "${STATE_FILES_TMP}"
 
+# One list for every copy channel. rsync --exclude covers files found by
+# recursing a listed directory. A path named explicitly in --files-from is
+# removed here, because rsync still transfers that path when it matches an
+# exclude. Overlay copies use the same component check.
+CREDENTIAL_NAME_PATTERNS=(
+  ".env"
+  "*.env"
+  ".env.*"
+  "*secret*"
+  "*credential*"
+  "*.pem"
+  "*.key"
+  "*.p12"
+  "id_rsa*"
+  "*token*.json"
+)
+
+is_credential_component() {
+  local name="$1"
+  local pattern
+  for pattern in "${CREDENTIAL_NAME_PATTERNS[@]}"; do
+    # The pattern is a filename glob, so it must stay unquoted.
+    # shellcheck disable=SC2254
+    case "${name}" in
+      ${pattern})
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+is_credential_relpath() {
+  local rest="$1"
+  local part
+  while [[ -n "${rest}" ]]; do
+    part="${rest%%/*}"
+    if is_credential_component "${part}"; then
+      return 0
+    fi
+    if [[ "${rest}" == */* ]]; then
+      rest="${rest#*/}"
+    else
+      break
+    fi
+  done
+  return 1
+}
+
+filter_credential_list() {
+  local list_file="$1"
+  local filtered
+  filtered="$(mktemp "${TMPDIR:-/tmp}/dalton_seed_nocred.XXXXXX")"
+  while IFS= read -r rel || [[ -n "${rel}" ]]; do
+    if [[ -z "${rel}" ]] || is_credential_relpath "${rel}"; then
+      continue
+    fi
+    printf '%s\n' "${rel}"
+  done < "${list_file}" > "${filtered}"
+  mv -f "${filtered}" "${list_file}"
+}
+
+filter_credential_list "${CODE_FILES_TMP}"
+filter_credential_list "${STATE_FILES_TMP}"
+
 # $1 is the files-from list. Extra arguments are rsync options for that class.
 seed_rsync() {
   local files_from="$1"
@@ -271,6 +346,10 @@ seed_rsync() {
     "--exclude=.git/"
     "--exclude=.dalton-freeze/"
   )
+  local pattern
+  for pattern in "${CREDENTIAL_NAME_PATTERNS[@]}"; do
+    args+=("--exclude=${pattern}")
+  done
   if [[ "${MODE}" == "dry-run" ]]; then
     args+=(--dry-run --itemize-changes)
   fi
@@ -307,6 +386,9 @@ if [[ "${MODE}" == "dry-run" ]]; then
     TOTAL_SIZE_LINE="Total file size: 0 B"
   fi
   for rel_overlay in "${OVERLAY_FILES[@]}"; do
+    if is_credential_relpath "${rel_overlay}"; then
+      continue
+    fi
     echo "[seed_openclaw_data] DRY-RUN overlay: ${OVERLAY_DIR}/${rel_overlay} -> ${TARGET_DIR}/${rel_overlay}"
   done
   echo "[seed_openclaw_data] DRY-RUN ensure dir: ${TARGET_DIR}/state/a-share-volume-watch"
@@ -324,6 +406,9 @@ seed_rsync "${STATE_FILES_TMP}" --ignore-existing
 mkdir -p "${TARGET_DIR}/state/a-share-volume-watch"
 
 for rel_overlay in "${OVERLAY_FILES[@]}"; do
+  if is_credential_relpath "${rel_overlay}"; then
+    continue
+  fi
   mkdir -p "$(dirname "${TARGET_DIR}/${rel_overlay}")"
   cp -p "${OVERLAY_DIR}/${rel_overlay}" "${TARGET_DIR}/${rel_overlay}"
   echo "[seed_openclaw_data] Applied overlay: ${OVERLAY_DIR}/${rel_overlay} -> ${TARGET_DIR}/${rel_overlay}"

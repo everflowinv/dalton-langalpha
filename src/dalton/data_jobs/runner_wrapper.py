@@ -98,6 +98,7 @@ TASK_NOTIFY_PAYLOAD_SOURCES: dict[str, str] = {
     "china-2c-hk-monitor": "outbox_file",  # T43
     "china-2c-us-monitor": "outbox_file",  # T24
     "a-share-bottom-volume-watch": "stdout_text",  # T38
+    "richard-relative-dashboard-refresh": "none",  # T34
 }
 
 _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
@@ -128,6 +129,7 @@ _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
     "T43": "outbox_file",
     "T24": "outbox_file",
     "T38": "stdout_text",
+    "T34": "none",
 }
 
 
@@ -387,7 +389,10 @@ def persist_redacted_outbox(
 
     payload_source = resolve_task_payload_source(job_key)
     stripped_stdout = stdout_text.strip()
-    if raw_payload is None and stripped_stdout:
+    # Silent refresh: stdout is not a notification, even when the JSON has
+    # feishu_message, feishu_target, report_text, report, or card. A staging
+    # outbox file read above is kept; phase-1 T5 persists that file.
+    if payload_source != "none" and raw_payload is None and stripped_stdout:
         parsed = extract_last_json_object(stdout_text)
         if isinstance(parsed, dict) and (
             payload_source == "stdout_json"
