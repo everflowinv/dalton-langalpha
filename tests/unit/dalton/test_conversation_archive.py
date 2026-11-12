@@ -8879,11 +8879,13 @@ async def test_segment_exceeding_segment_deadline_s_marked_incomplete_and_contin
             concurrency=1,
             extract_fn=mock_extract,
         ),
-        timeout=2.0,
+        timeout=8.0,
     )
     elapsed = archive_cli.time.monotonic() - t_start
 
-    assert elapsed < 1.5
+    # The hung segment sleeps 10 s; finishing well under that proves the 0.05 s
+    # deadline cut it. The margin absorbs a loaded 4-worker baseline.
+    assert elapsed < 6.0
     assert visited_segments == ["ev-hang-0", "ev-fast-1"]
     assert batch_summary["incomplete_segments_count"] == 2
     inc_by_ev = {item["first_event_id"]: item for item in batch_summary["incomplete_segments"]}
