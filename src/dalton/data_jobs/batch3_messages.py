@@ -105,15 +105,37 @@ def _md_us_day(value: Any) -> str:
     return f"{day.month}/{day.day}"
 
 
-def _load_markdown_to_card_elements():
-    script = (
-        Path(__file__).resolve().parents[3]
-        / "scripts"
-        / "dalton"
-        / "openclaw_overlays"
-        / "scripts"
-        / "feishu_send_card.py"
-    )
+# Seeded by scripts/dalton/seed_openclaw_data.sh from the overlay into the data copy.
+# The data-task container mounts that copy and /app/src, not /app/scripts.
+_DATA_COPY_CARD_SCRIPT = Path("scripts") / "feishu_send_card.py"
+_REPO_OVERLAY_FEISHU_SEND_CARD = (
+    Path(__file__).resolve().parents[3]
+    / "scripts"
+    / "dalton"
+    / "openclaw_overlays"
+    / "scripts"
+    / "feishu_send_card.py"
+)
+
+
+def _load_markdown_to_card_elements(workspace: Path):
+    """Load ``markdown_to_card_elements`` from the data copy, then the repo overlay.
+
+    ``workspace`` is the data-copy root this module already uses: the container data
+    root inside a task, or ``backend_data_root`` when the backend process calls in.
+    The repo overlay is the fallback a backend process can read.
+    """
+    data_copy = Path(workspace) / _DATA_COPY_CARD_SCRIPT
+    overlay = _REPO_OVERLAY_FEISHU_SEND_CARD
+    if data_copy.is_file():
+        script = data_copy
+    elif overlay.is_file():
+        script = overlay
+    else:
+        raise DataTaskNotificationPrepError(
+            "飞书卡片脚本不存在："
+            f"数据副本 {data_copy} 与仓库 overlay {overlay} 都没有 feishu_send_card.py"
+        )
     spec = importlib.util.spec_from_file_location("dalton_overlay_feishu_send_card", script)
     if spec is None or spec.loader is None:
         raise DataTaskNotificationPrepError(f"飞书卡片脚本无法加载：{script}")
@@ -439,7 +461,7 @@ def _adjust_semi_rescue(
     title = f"{cfg['title']}{slot_cn}｜{verdict['emoji']} {verdict['text']}"
     subtitle = _semi_rescue_subtitle(cfg, snap, layout)
     markdown = card_md_path.read_text(encoding="utf-8")
-    to_card = _load_markdown_to_card_elements()
+    to_card = _load_markdown_to_card_elements(workspace)
     card = to_card(
         markdown,
         title,
