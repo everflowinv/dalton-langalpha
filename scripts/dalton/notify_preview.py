@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preview a Dalton Feishu Card Schema 2.0 notification in ``--dry-run`` mode without sending.
+"""Preview a Dalton Feishu Card Schema 2.0 notification by printing the card JSON.
 
 Usage:
     .venv/bin/python scripts/dalton/notify_preview.py --automation dalton-googl-earn-2026q1-t0 --execution exec-123
@@ -13,9 +13,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
-import tempfile
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -26,10 +24,7 @@ from src.dalton.notify.dispatch import (  # noqa: E402
     build_feishu_notify_card,
     classify_automation_for_notify,
 )
-from src.dalton.settings import (  # noqa: E402
-    FEISHU_SEND_CARD_TIMEOUT_S,
-    get_dalton_frontend_url,
-)
+from src.dalton.settings import get_dalton_frontend_url  # noqa: E402
 from src.server.app import setup  # noqa: E402
 import src.server.services.automation_excerpt as _excerpt_mod  # noqa: E402
 from src.server.services.automation_excerpt import read_run_answer  # noqa: E402
@@ -43,10 +38,6 @@ from src.server.utils.checkpointer import (  # noqa: E402
 _ORIG_READ_RUN_ANSWER = read_run_answer
 _last_load_used_excerpt: bool = False
 TRUNCATED_EXCERPT_WARNING = "使用的是截断摘要，正文可能不完整"
-
-DEFAULT_FEISHU_SCRIPT = Path(
-    os.path.expanduser("~/.openclaw/workspace/scripts/feishu_send_card.py")
-)
 
 DEFAULT_SAMPLE_TEXT = (
     "## 结论\n"
@@ -186,10 +177,8 @@ def run_preview(
     thread_id: str | None = None,
     frontend_url: str | None = None,
     sample: bool = False,
-    script_path: Path = DEFAULT_FEISHU_SCRIPT,
-    timeout_s: float = FEISHU_SEND_CARD_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Generate Feishu Card 2.0 JSON and validate/render it via ``feishu_send_card.py --dry-run``."""
+    """Build the Feishu Card 2.0 JSON the backend would store. This does not send."""
     classification = classify_automation_for_notify({"name": automation_name})
     if classification is None:
         raise ValueError(
@@ -233,60 +222,14 @@ def run_preview(
         frontend_base_url=eff_frontend_url,
         is_excerpt=used_excerpt,
     )
-
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".json",
-            prefix="dalton_notify_preview_",
-            encoding="utf-8",
-            delete=False,
-        ) as fh:
-            json.dump(card, fh, ensure_ascii=False, indent=2)
-            tmp_path = Path(fh.name)
-
-        cmd = [
-            "python3",
-            str(script_path),
-            "--chat-id",
-            "ou_preview_dry_run",
-            "--receive-id-type",
-            "open_id",
-            "--card-json-file",
-            str(tmp_path),
-            "--dry-run",
-            "--json",
-        ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"feishu_send_card.py --dry-run exited with code {proc.returncode}"
-            )
-        if proc.stdout and proc.stdout.strip():
-            rendered = json.loads(proc.stdout)
-        else:
-            rendered = dict(card)
-        if used_excerpt and isinstance(rendered, dict):
-            rendered = {"warning": TRUNCATED_EXCERPT_WARNING, **rendered}
-        return rendered
-    finally:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+    if used_excerpt:
+        return {"warning": TRUNCATED_EXCERPT_WARNING, **card}
+    return card
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate and dry-run preview a Dalton Feishu Card 2.0 notification."
+        description="Print the Dalton Feishu Card 2.0 JSON for one automation notification."
     )
     parser.add_argument(
         "--automation",
@@ -325,10 +268,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--script",
-        default=str(DEFAULT_FEISHU_SCRIPT),
-        help="Path to OpenClaw feishu_send_card.py",
+        default="",
+        help="Accepted and ignored. Preview prints the backend card JSON.",
     )
     args = parser.parse_args(argv)
+    _ = args.script
 
     try:
         rendered = run_preview(
@@ -339,7 +283,6 @@ def main(argv: list[str] | None = None) -> int:
             thread_id=args.thread_id,
             frontend_url=args.frontend_url,
             sample=bool(args.sample),
-            script_path=Path(args.script).expanduser(),
         )
     except Exception as exc:
         print(f"notify_preview error: {exc}", file=sys.stderr)

@@ -252,6 +252,13 @@ integrations/dalton-channel-gateway/src/vault-credentials.ts
 integrations/dalton-channel-gateway/test/data-task-notifications.test.ts
 tests/unit/dalton/test_data_task_notifications.py
 tests/integration/dalton/test_data_task_notifications_db.py
+# OC-5 PR-1 batch 2: generic automation notifications and loopback ops alerts.
+src/dalton/database/automation_notifications.py
+src/dalton/app/automation_notifications_router.py
+integrations/dalton-channel-gateway/src/automation-notifications.ts
+integrations/dalton-channel-gateway/src/ops-alerts.ts
+integrations/dalton-channel-gateway/test/automation-notifications.test.ts
+tests/unit/dalton/test_automation_notify_gateway.py
 # AU1 Batch 1: company automation schema (d035), system identity & budget seed,
 # unified scope classification, read-only scoped listing & modification history, and tests.
 src/dalton/migrations/versions/d035_company_automations.py

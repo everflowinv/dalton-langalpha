@@ -719,6 +719,30 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     };
   }
 
+  async sendPlainText(options: {
+    targetAddress: string;
+    text: string;
+  }): Promise<{ messageId: string }> {
+    const client = this.getClient();
+    const target = resolveDaltonOutboundTarget({
+      targetAddress: options.targetAddress,
+    });
+    if (!target) {
+      throw new ChannelDeliveryError(
+        `Unable to resolve Feishu target for address "${options.targetAddress}"`,
+        {
+          outcome: "failed",
+          code: "target_not_found",
+        },
+      );
+    }
+    const res = await sendMessageFeishu(client, {
+      to: target,
+      text: options.text,
+    });
+    return { messageId: res.messageId };
+  }
+
   async sendFile(options: SendFileOptions): Promise<SendFileResult> {
     const client = this.getClient();
     const target = resolveDaltonOutboundTarget({

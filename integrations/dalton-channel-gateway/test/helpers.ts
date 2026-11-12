@@ -155,7 +155,9 @@ export type MockBackend = BackendClient &
   Required<
     Pick<
       BackendClient,
-      "authorizeDataTaskNotificationPlan" | "downloadDataTaskRunArtifact"
+      | "authorizeDataTaskNotificationPlan"
+      | "authorizeAutomationNotificationPlan"
+      | "downloadDataTaskRunArtifact"
     >
   > & {
     readonly progressUpdates: I7InboundProgressRequest[];
@@ -952,6 +954,13 @@ export function createMockBackend(): MockBackend {
       status: "failed" as const,
       code: "run_not_found",
       message: "Run not configured in mock backend",
+    })),
+
+    authorizeAutomationNotificationPlan: vi.fn(async () => ({
+      authorized: false,
+      status: "failed" as const,
+      code: "delivery_not_found",
+      message: "Delivery not configured in mock backend",
     })),
 
     downloadDataTaskRunArtifact: vi.fn(async () => ({

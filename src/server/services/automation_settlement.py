@@ -491,7 +491,7 @@ async def _after_settling(
                 delivery_result = automation_delivery.unsent(delivery) or None
             if delivery_result is not None:
                 await _record_delivery(execution_id, delivery_result)
-    # DALTON-HOOK(dalton-notify): push completed Dalton automation results to analyst via OpenClaw
+    # DALTON-HOOK(dalton-notify): push completed Dalton automation results to the analyst via the channel gateway
     if not deleted and outcome is Outcome.COMPLETED:
         from src.dalton.notify.dispatch import on_automation_settled
 

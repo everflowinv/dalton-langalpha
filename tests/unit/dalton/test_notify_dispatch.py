@@ -1770,28 +1770,8 @@ def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(
     - Opens and closes the backend pool via ``get_or_create_pool()`` + ``await pool.open()`` / ``await pool.close()``.
     - Queries ``result_excerpt`` (not ``excerpt``).
     - Exits non-zero (1) and prints the reason when the execution is missing and ``--sample`` is not passed.
-    - Uses fixed sample only when ``--sample`` is explicitly passed, and always invokes ``feishu_send_card.py --dry-run``.
+    - Uses fixed sample only when ``--sample`` is explicitly passed, and prints the backend card JSON.
     """
-    recorded_cmd: list[str] = []
-
-    def _fake_run(
-        cmd: list[str],
-        *,
-        capture_output: bool = True,
-        text: bool = True,
-        timeout: float = 15.0,
-        check: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
-        _ = (capture_output, text, timeout, check)
-        recorded_cmd.clear()
-        recorded_cmd.extend(cmd)
-        idx = cmd.index("--card-json-file")
-        raw = Path(cmd[idx + 1]).read_text(encoding="utf-8")
-        return subprocess.CompletedProcess(cmd, returncode=0, stdout=raw, stderr="")
-
-    run_spy = create_autospec(subprocess.run, side_effect=_fake_run)
-    monkeypatch.setattr(notify_preview.subprocess, "run", run_spy)
-
     fake_pool = create_autospec(AsyncConnectionPool, instance=True)
     executed_sql: list[str] = []
     db_row: dict[str, Any] | None = {
@@ -1875,8 +1855,8 @@ def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(
     fake_pool.open.assert_awaited_once()
     fake_pool.close.assert_awaited_once()
     assert any("result_excerpt" in s for s in executed_sql)
-    assert "--dry-run" in recorded_cmd
     out_ok = capsys.readouterr().out
+    assert '"schema": "2.0"' in out_ok
     assert "真实数据库行里的研报摘要。" in out_ok
 
     # 2. Missing execution record without --sample -> returns non-zero (1) and prints reason to stderr
@@ -1893,7 +1873,7 @@ def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(
     err_missing = capsys.readouterr().err
     assert "exec-missing-999" in err_missing
 
-    # 3. Explicit --sample -> uses sample text without querying DB and invokes --dry-run
+    # 3. Explicit --sample -> uses sample text without querying DB and prints the card JSON
     rc_sample = notify_preview.main(
         [
             "--automation",
@@ -1904,8 +1884,8 @@ def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(
         ]
     )
     assert rc_sample == 0
-    assert "--dry-run" in recorded_cmd
-    capsys.readouterr()
+    sample_out = capsys.readouterr().out
+    assert '"schema": "2.0"' in sample_out
 
     # 4. Initializes checkpointer via get_checkpointer + open_checkpointer_pool, prefers full run answer
     #    via read_run_answer, closes checkpointer via close_checkpointer_pool, and on fallback prints

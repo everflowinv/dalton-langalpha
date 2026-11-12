@@ -6139,6 +6139,20 @@ async def authorize_and_claim_delivery(
             total_chunks=total_chunks,
             conn=conn,
         )
+    # DALTON-HOOK(dalton-notify): claim generic automation notifications before conversation auth
+    if cleaned_kind == "automation_notify":
+        from src.dalton.database.automation_notifications import (
+            authorize_and_claim_automation_notify_delivery,
+        )
+
+        return await authorize_and_claim_automation_notify_delivery(
+            delivery_key=cleaned_key,
+            run_id=run_id,
+            target=target,
+            has_non_empty_text=has_non_empty_text,
+            total_chunks=total_chunks,
+            conn=conn,
+        )
     cleaned_uid = str(user_id or "").strip() or None
     cleaned_platform = str(platform or "").strip().lower() or None
     cleaned_target = str(target).strip() if target is not None and str(target).strip() else None

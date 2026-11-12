@@ -242,6 +242,15 @@ export interface ChannelAdapter {
   /** Send a single text chunk to the platform. */
   sendTextChunk(options: SendTextChunkOptions): Promise<SendTextChunkResult>;
 
+  /**
+   * Send plain text without the table/code-block card upgrade used by sendTextChunk.
+   * Ops alerts use this so a `|` in the fixed sentence stays a text message.
+   */
+  sendPlainText?(options: {
+    targetAddress: string;
+    text: string;
+  }): Promise<{ messageId: string }>;
+
   /** Send a single file attachment to the platform. */
   sendFile(options: SendFileOptions): Promise<SendFileResult>;
 

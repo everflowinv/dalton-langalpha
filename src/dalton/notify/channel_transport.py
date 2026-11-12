@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 import http.cookiejar
 import logging
 from typing import Any
+from uuid import UUID
 
 import httpx
 
@@ -24,6 +25,7 @@ from src.dalton.settings import (
 logger = logging.getLogger(__name__)
 
 DATA_TASK_GATEWAY_PATH = "/internal/data-task-notifications"
+AUTOMATION_GATEWAY_PATH = "/internal/automation-notifications"
 
 UNCERTAIN_NOTIFY_ERROR_CODES: frozenset[str] = frozenset(
     {
@@ -378,3 +380,196 @@ async def post_data_task_gateway_notify(
         out["error_code"] = first_error_code
         out["error"] = first_error_code
     return out
+
+
+def _automation_transport_failure(
+    *,
+    target: str,
+    error_code: str,
+    status_code: int,
+    uncertain: bool = False,
+) -> dict[str, Any]:
+    status = "unknown" if uncertain else "failed"
+    item: dict[str, Any] = {
+        "target": target,
+        "ok": False,
+        "status": status,
+        "error": error_code,
+        "error_code": error_code,
+    }
+    if uncertain:
+        item["uncertain"] = True
+    return {
+        "ok": False,
+        "status": status,
+        "uncertain": uncertain,
+        "status_code": status_code,
+        "error_code": error_code,
+        "results": [item],
+    }
+
+
+async def post_automation_gateway_notify(
+    delivery_id: str,
+    *,
+    target: str,
+    gateway_url: str | None = None,
+    service_token: str | None = None,
+    timeout_s: float | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """POST only ``{"delivery_id": ...}`` to ``/internal/automation-notifications``.
+
+    ``target`` is the caller's notify target. It is placed on ``results[].target``
+    so settlement can match the row. It is not sent on the wire.
+    A connect failure before the request leaves is a certain ``failed``. A timeout
+    after the request starts is ``delivery_uncertain``.
+    """
+    cleaned_target = str(target or "").strip()
+    try:
+        cleaned_id = str(UUID(str(delivery_id or "").strip()))
+    except (ValueError, AttributeError, TypeError):
+        cleaned_id = ""
+    if not cleaned_id or not cleaned_target:
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="invalid_request",
+            status_code=400,
+        )
+
+    eff_token = (
+        service_token if service_token is not None else get_internal_service_token()
+    ).strip()
+    if not eff_token:
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="service_token_unconfigured",
+            status_code=503,
+        )
+
+    eff_base = (
+        gateway_url if gateway_url is not None else get_dalton_channel_gateway_url()
+    ).strip().rstrip("/")
+    if not eff_base:
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="gateway_url_unconfigured",
+            status_code=503,
+        )
+
+    eff_timeout_s = (
+        max(1.0, float(timeout_s))
+        if timeout_s is not None
+        else max(45.0, get_notify_http_timeout_s() * 2.5)
+    )
+    req_timeout = httpx.Timeout(eff_timeout_s, connect=min(5.0, eff_timeout_s))
+    endpoint = f"{eff_base}{AUTOMATION_GATEWAY_PATH}"
+    headers = {
+        "X-Service-Token": eff_token,
+        "Content-Type": "application/json",
+    }
+    body = {"delivery_id": cleaned_id}
+
+    owns_client = http_client is None
+    client = http_client if http_client is not None else _build_ephemeral_client()
+    try:
+        resp = await client.post(
+            endpoint,
+            headers=headers,
+            json=body,
+            timeout=req_timeout,
+        )
+    except (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.UnsupportedProtocol,
+        httpx.InvalidURL,
+    ) as conn_exc:
+        code = type(conn_exc).__name__
+        logger.warning(
+            "Automation gateway unreachable before send: delivery_id=%s error_type=%s",
+            cleaned_id,
+            code,
+        )
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code=code,
+            status_code=0,
+        )
+    except (httpx.TimeoutException, httpx.TransportError):
+        logger.warning(
+            "Automation gateway response lost after request start (uncertain): delivery_id=%s",
+            cleaned_id,
+        )
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code="delivery_uncertain",
+            status_code=0,
+            uncertain=True,
+        )
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    try:
+        parsed = resp.json()
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, Mapping):
+        parsed = {}
+
+    gw_status = str(parsed.get("status") or "").strip().lower()
+    raw_code = str(parsed.get("code") or parsed.get("error_code") or "").strip()
+    safe_code = redact_managed_tokens(raw_code)[:96] if raw_code else ""
+
+    if resp.status_code == 200 and gw_status == "sent":
+        return {
+            "ok": True,
+            "status": "sent",
+            "uncertain": False,
+            "status_code": resp.status_code,
+            "results": [
+                {
+                    "target": cleaned_target,
+                    "ok": True,
+                    "status": "sent",
+                    "items_sent": parsed.get("items_sent"),
+                    "items_total": parsed.get("items_total"),
+                }
+            ],
+        }
+
+    if gw_status == "skipped":
+        skip_code = safe_code or "skipped"
+        return {
+            "ok": True,
+            "status": "skipped",
+            "uncertain": False,
+            "status_code": resp.status_code,
+            "results": [
+                {
+                    "target": cleaned_target,
+                    "ok": False,
+                    "skipped": True,
+                    "status": "skipped",
+                    "reason": skip_code,
+                    "error_code": skip_code,
+                }
+            ],
+        }
+
+    if gw_status in ("unknown", "partial", "in_flight") or is_uncertain_notify_error_code(safe_code):
+        uncertain_code = safe_code if is_uncertain_notify_error_code(safe_code) else "delivery_uncertain"
+        return _automation_transport_failure(
+            target=cleaned_target,
+            error_code=uncertain_code,
+            status_code=resp.status_code,
+            uncertain=True,
+        )
+
+    fail_code = safe_code or f"http_{resp.status_code}"
+    return _automation_transport_failure(
+        target=cleaned_target,
+        error_code=fail_code,
+        status_code=resp.status_code,
+    )
