@@ -86,6 +86,7 @@ REPORT_PROFILES = frozenset(
         "ct-semi-sentiment",
         "china-consumer-weekly",
         "global-consumer-weekly",
+        "daily-filing-alert",
     }
 )
 MAX_CARDS = 20

@@ -363,3 +363,6 @@ tests/unit/dalton/test_declared_sources.py
 plugins/dalton/skills/dalton-weekly-trend-impact-scan/
 plugins/dalton/skills/dalton-ct-semi-sentiment/
 tests/unit/dalton/test_agentturn_family2a.py
+# OC-1 daily filing alert.
+plugins/dalton/skills/dalton-daily-filing-alert/
+tests/unit/dalton/test_agentturn_daily_filing.py
