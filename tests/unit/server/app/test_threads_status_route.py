@@ -8,7 +8,10 @@ Pins the optimizations layered onto this endpoint:
 """
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch
+
+# DALTON-HOOK(chat-large-upload): owner status reads durable failed steers.
+from src.server.database.runs.outbox import list_failed_steers_for_status
 
 STATUS_MOD = "src.server.services.report_back.handoff.status"
 
@@ -56,6 +59,9 @@ async def test_status_full_path_threads_is_shared(threads_client):
     meta = AsyncMock(return_value={"user_id": CALLER, "is_shared": True})
     full = AsyncMock(return_value={"thread_id": TID, "is_shared": True})
     pending = AsyncMock(return_value=[])
+    # DALTON-HOOK(chat-large-upload): the owner status also reads durable failed steers.
+    # A fresh conversation pool is created closed, so the real query cannot run here.
+    failed = create_autospec(list_failed_steers_for_status, return_value=[])
     with (
         patch("src.server.database.conversation.get_thread_auth_meta", meta),
         patch("src.server.services.thread_status.read_thread_runtime_status", full),
@@ -63,6 +69,10 @@ async def test_status_full_path_threads_is_shared(threads_client):
             "src.server.database.runs.outbox.list_pending_steers",
             pending,
             create=True,
+        ),
+        patch(
+            "src.server.database.runs.outbox.list_failed_steers_for_status",
+            failed,
         ),
     ):
         resp = await threads_client.get(f"/api/v1/threads/{TID}/status")

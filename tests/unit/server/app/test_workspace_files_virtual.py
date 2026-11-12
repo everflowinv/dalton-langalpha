@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec
 
 import pytest
 from fastapi import HTTPException
@@ -20,6 +20,12 @@ from fastapi import HTTPException
 from ptc_agent.agent.backends.automations import AutomationsBackend
 from ptc_agent.agent.backends.user_data import UserDataBackend
 from ptc_agent.agent.filesystem_routes import route_for
+# DALTON-HOOK(chat-large-upload): fence doubles follow the real function signatures.
+from src.dalton.services.chat_uploads import (
+    abort_delete_workspace_chat_uploads,
+    begin_delete_workspace_chat_uploads,
+    retire_deleted_workspace_chat_uploads,
+)
 from src.server.app.workspace_files import crud
 from src.server.app.workspace_files._shared import (
     _present_virtual_file,
@@ -369,6 +375,22 @@ async def test_a_server_held_file_is_refused_as_such_when_the_mount_is_down(work
 
 @pytest.mark.asyncio
 async def test_a_server_held_file_is_not_probed_and_the_files_after_it_keep_their_slot(workspace, monkeypatch):
+    # DALTON-HOOK(chat-large-upload): delete fences retained uploads before rm.
+    # No upload rows here; a live fence hits the database and clears deleted.
+    # begin returns fenced ids; abort and retire return counts.
+    fences = {
+        "begin_delete_workspace_chat_uploads": create_autospec(
+            begin_delete_workspace_chat_uploads, return_value=[]
+        ),
+        "abort_delete_workspace_chat_uploads": create_autospec(
+            abort_delete_workspace_chat_uploads, return_value=0
+        ),
+        "retire_deleted_workspace_chat_uploads": create_autospec(
+            retire_deleted_workspace_chat_uploads, return_value=0
+        ),
+    }
+    for name, double in fences.items():
+        monkeypatch.setattr(f"src.dalton.services.chat_uploads.{name}", double)
     probe = AsyncMock(side_effect=lambda _sb, paths, work_dir: list(paths))
     sandbox = _sandbox_to_change(monkeypatch, probe)
 

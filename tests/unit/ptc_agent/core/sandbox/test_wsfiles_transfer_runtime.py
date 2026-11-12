@@ -681,7 +681,7 @@ def test_pull_mismatch_leaves_no_file(tmp_path, bucket):
     out = rt.pull({"root": str(tmp_path), "items": [item]})
     assert out["results"]["a.bin"]["status"] == "mismatch"
     assert not (tmp_path / "a.bin").exists()
-    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
 
 
 @pytest.mark.enable_socket
@@ -701,7 +701,7 @@ def test_pull_retries_a_body_the_store_cut_short(tmp_path, bucket, cuts, status,
         assert (tmp_path / "a.bin").read_bytes() == data
     else:
         assert not (tmp_path / "a.bin").exists()
-    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
 
 
 @pytest.mark.enable_socket
@@ -974,7 +974,7 @@ def test_pull_file_places_a_staged_relay_upload(tmp_path):
     assert out["results"]["gone.txt"]["status"] == "failed"
     assert out["results"]["n.txt"] == {"status": "failed", "http": None, "error": "missing url", "ms": out["results"]["n.txt"]["ms"]}
     assert not (tmp_path / "s.txt").exists() and not (tmp_path / "w.txt").exists()
-    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
 
 
 def _staged(root, rel: str, data: bytes, **over):
@@ -1001,7 +1001,7 @@ def test_pull_keep_existing_never_replaces_a_file_written_after_the_look(tmp_pat
     assert {p: r["status"] for p, r in out["results"].items()} == {"note.md": "ok", "plain.md": "ok"}
     assert (tmp_path / "note.md").read_bytes() == b"turn"
     assert (tmp_path / "plain.md").read_bytes() == b"backup"
-    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
 
 
 def test_pull_stamps_the_bytes_before_they_are_placed(tmp_path, monkeypatch):
@@ -1042,7 +1042,7 @@ def test_pull_keep_existing_places_a_missing_file_and_keeps_a_present_one(tmp_pa
         assert (tmp_path / "there.md").read_bytes() == b"turn"
         assert (tmp_path / "missing.md").read_bytes() == b"backup"
         assert stat.S_IMODE(os.stat(tmp_path / "missing.md").st_mode) == 0o600
-        assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+        assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
 
 
 def test_pull_pack_keep_existing_member_leaves_a_present_file(tmp_path):
@@ -1171,7 +1171,7 @@ def test_a_body_read_that_fails_mid_stream_drops_the_pooled_connection(tmp_path,
         rt._download_to_temp(item["url"], str(tmp_path), 10)
     assert stamped == [key]
     assert key not in rt._local.conns
-    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
 
     # The control: a body read that runs to the end keeps its connection.
     name, _, _, _ = rt._download_to_temp(item["url"], str(tmp_path), 10)
@@ -1452,8 +1452,8 @@ def test_pull_pack_extracts_every_member_with_one_get(tmp_path, bucket):
     st = os.stat(tmp_path / "two.txt")
     assert stat.S_IMODE(st.st_mode) == 0o640 and st.st_mtime_ns == 1_700_000_000_000_000_000
     assert bucket.hits[item["url"][len(bucket.base):]] == 1
-    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-")]
-    assert os.listdir(tmp_path / "_internal/packs") == []
+    assert not [p for p in os.listdir(tmp_path) if p.startswith(".wsfiles-") and p != rt._SWEEP_LOCK_NAME]  # DALTON-HOOK(chat-large-upload): the sweep lock is a persistent flock, not a staging leftover
+    assert [p for p in os.listdir(tmp_path / "_internal/packs") if p != rt._SWEEP_LOCK_NAME] == []  # DALTON-HOOK(chat-large-upload): the pack download holds the same persistent flock under _internal/packs
 
 
 @pytest.mark.enable_socket

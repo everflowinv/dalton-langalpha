@@ -12,15 +12,30 @@ changes the system prompt, which fails every earlier block.
 from __future__ import annotations
 
 import pytest
+import structlog
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from structlog.testing import capture_logs
 
+import ptc_agent.agent.middleware.model_resilience as model_resilience
 from ptc_agent.agent.middleware.model_resilience import ModelResilienceMiddleware
 from tests.unit.ptc_agent.agent.prefix_stability import Wire, anthropic_model, drops, listed, reply
 
 THREAD = "c3d4e5f6-0000-4000-8000-000000000000"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_model_resilience_logger(monkeypatch):
+    # DALTON-HOOK(fallback-reason-log): an earlier configure_structlog caches
+    # this module logger's first bind. capture_logs then edits a newer
+    # processor list, so the drop line never arrives. reset_defaults() does
+    # not drop that cached bind; a fresh proxy binds inside the capture.
+    saved = structlog.get_config()
+    structlog.configure(cache_logger_on_first_use=False)
+    monkeypatch.setattr(model_resilience, "logger", structlog.get_logger(model_resilience.__name__))
+    yield
+    structlog.configure(**saved)
 
 
 def _agent(saver: InMemorySaver, system: str):

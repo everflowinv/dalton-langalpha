@@ -50,8 +50,9 @@ def user_mock_db(mock_connection):
     """Patch get_db_connection in the user module (its import location)."""
 
     @asynccontextmanager
-    async def _fake():
-        yield mock_connection
+    async def _fake(conn=None):
+        # DALTON-HOOK(data-jobs): delete_user_preferences passes the caller's connection.
+        yield conn if conn is not None else mock_connection
 
     with patch(
         "src.server.database.user.get_db_connection",

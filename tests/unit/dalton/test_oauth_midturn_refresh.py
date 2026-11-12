@@ -368,7 +368,11 @@ async def test_429_falls_back_with_sanitized_warning_on_main_and_subagent(
 ):
     """P0-5: 429 falls back immediately without OAuth refresh; fallback log and UI event sanitize secrets and carry error_type on both main agent and subagent."""
     import ptc_agent.agent.middleware.model_resilience as mr_mod
+    import structlog
 
+    # Patch a fresh proxy, not the module's own: reading .warning on the real
+    # proxy binds and caches it, and later capture_logs tests see nothing.
+    monkeypatch.setattr(mr_mod, "logger", structlog.get_logger(mr_mod.__name__))
     warn_calls: list[tuple[tuple, dict]] = []
 
     def _capture_warn(*args, **kwargs):

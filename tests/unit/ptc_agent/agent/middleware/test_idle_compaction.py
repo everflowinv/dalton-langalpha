@@ -10,9 +10,12 @@ from __future__ import annotations
 import dataclasses
 import json
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from langchain.agents import create_agent
+# DALTON-HOOK(native-compaction-lines): the hour client subclasses ChatAnthropic.
+from langchain_anthropic import ChatAnthropic
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage
@@ -35,6 +38,8 @@ from ptc_agent.agent.middleware.tool_surface import ToolSurfaceMiddleware
 from ptc_agent.agent.prompts import release
 from ptc_agent.config.agent import CompactionConfig
 from src.config import features
+# DALTON-HOOK(native-compaction-lines): with_ttl is what writes the hour onto the request.
+from src.llms.cache_markers import with_ttl
 from src.server.services.idle_compaction import plan_firing
 from tests.unit.ptc_agent.agent.prefix_stability import (
     Wire,
@@ -203,6 +208,74 @@ def clock(monkeypatch) -> _Clock:
     return clock
 
 
+_MARKER_PATHS = frozenset({"system", "tools", "messages", "content", "source"})
+
+
+class _HourAnthropic(ChatAnthropic):
+    """Official-host client that writes an hour on every cache marker.
+
+    DALTON-HOOK(native-compaction-lines): claude-opus-5-5-oauth is stamped
+    pricing_provider=claude-oauth, and native_kind refuses that relay, so
+    the clock cannot arm on ChatAnthropicOAuth. That class is still the only
+    production client whose _get_request_payload calls with_ttl
+    (anthropic_oauth.py). An official ChatAnthropic leaves the middleware's
+    five-minute marker as it was. This subclass stays a ChatAnthropic on the
+    official host, so the gate still says anthropic, and the request carries
+    the same hour.
+    """
+
+    cache_ttl: ClassVar[str] = "1h"
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        return with_ttl(
+            super()._get_request_payload(input_, stop=stop, **kwargs), self.cache_ttl
+        )
+
+
+def _hour_model():
+    """The catalog client for claude-opus-5-5, sending an hour's cache."""
+    base = anthropic_model("claude-opus-5-5")
+    values = {name: getattr(base, name) for name in type(base).model_fields}
+    return _HourAnthropic.model_construct(
+        _fields_set=set(base.__pydantic_fields_set__),
+        **values,
+    )
+
+
+def _marker_ttls(payload: dict) -> list[str | None]:
+    """TTLs on the cache markers ``payload`` sent, not names inside schemas."""
+    found: list[str | None] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        marker = value.get("cache_control")
+        if isinstance(marker, dict) and "type" in marker:
+            found.append(marker.get("ttl"))
+        for key, item in value.items():
+            if key in _MARKER_PATHS:
+                walk(item)
+
+    top = payload.get("cache_control")
+    if isinstance(top, dict) and "type" in top:
+        found.append(top.get("ttl"))
+    for key in ("system", "tools", "messages"):
+        walk(payload.get(key))
+    return found
+
+
+def _assert_sent_ttl(payloads: list[dict], ttl: str) -> None:
+    assert payloads
+    for payload in payloads:
+        found = _marker_ttls(payload)
+        assert found
+        assert set(found) == {ttl}
+
+
 def _agent(
     saver,
     system: str,
@@ -226,7 +299,8 @@ def _agent(
             )
         )
     return create_agent(
-        model=model or anthropic_model("claude-opus-5-5-oauth"),
+        # DALTON-HOOK(native-compaction-lines): see _hour_model.
+        model=model or _hour_model(),
         tools=list(tools),
         system_prompt=system,
         middleware=[
@@ -287,7 +361,7 @@ def _system(payload: dict) -> str:
 
 @pytest.mark.asyncio
 async def test_a_final_claude_answer_leaves_the_idle_clock_from_its_requests_start(monkeypatch, clock):
-    Wire(_turn(clock, 6_000)).install(monkeypatch)
+    wire = Wire(_turn(clock, 6_000)).install(monkeypatch)
     started = clock.now
     agent = _agent(InMemorySaver(), "Prompt A.")
     await agent.ainvoke({"messages": [HumanMessage("Get a.")]}, CFG)
@@ -299,6 +373,8 @@ async def test_a_final_claude_answer_leaves_the_idle_clock_from_its_requests_sta
     assert (idle["requested_at"], idle["tail_requested_at"]) == (started + 10, None)
     assert idle["digest"]
     assert values["_last_answer"]["threshold"] == THRESHOLD
+    # DALTON-HOOK(native-compaction-lines): the recorded request asks for an hour.
+    _assert_sent_ttl(wire.payloads, "1h")
 
 
 @pytest.mark.asyncio
@@ -331,11 +407,13 @@ async def test_the_arm_reads_the_idle_threshold_the_turn_resolved(monkeypatch, c
 @pytest.mark.asyncio
 async def test_a_five_minute_route_leaves_no_clock(monkeypatch, clock):
     """Its slot would come minutes after the answer, a pause to read it."""
-    Wire(_turn(clock, 6_000)).install(monkeypatch)
+    wire = Wire(_turn(clock, 6_000)).install(monkeypatch)
     agent = _agent(InMemorySaver(), "Prompt A.", model=anthropic_model())
     await agent.ainvoke({"messages": [HumanMessage("Get a.")]}, CFG)
 
     assert "_idle_clock" not in await _state(agent)
+    # DALTON-HOOK(native-compaction-lines): the official client still sends five minutes.
+    _assert_sent_ttl(wire.payloads, "5m")
 
 
 @pytest.mark.asyncio
@@ -408,6 +486,8 @@ async def test_a_deploy_after_a_turn_sent_with_skip_still_rebuilds_idle(monkeypa
     compaction = await _idle_ask(_agent(saver, "Prompt B.", cold=COLD))
 
     assert _instructions(wire.payloads[2]) == NO_TAIL
+    # DALTON-HOOK(native-compaction-lines): the recorded request asks for an hour.
+    _assert_sent_ttl(wire.payloads, "1h")
     assert compaction.preserved == []
     assert "idle=fire kind=I1" in caplog.text
 
@@ -450,6 +530,8 @@ async def test_a_deployed_thread_is_rebuilt_from_its_warm_cache_keeping_no_turns
     assert is_compaction_request(summary)
     assert _instructions(summary) == NO_TAIL
     assert "Prompt A." in _system(summary)
+    # DALTON-HOOK(native-compaction-lines): the recorded request asks for an hour.
+    _assert_sent_ttl(wire.payloads, "1h")
     assert compaction.preserved == []
     assert "idle=fire kind=I1" in caplog.text and "rebuild=yes reason=idle" in caplog.text
 
@@ -465,6 +547,8 @@ async def test_a_large_thread_that_is_not_due_keeps_its_tail(monkeypatch, clock,
     compaction = await _idle_ask(agent)
 
     assert _instructions(wire.payloads[3]) == KEEPS_TAIL
+    # DALTON-HOOK(native-compaction-lines): the recorded request asks for an hour.
+    _assert_sent_ttl(wire.payloads, "1h")
     assert compaction.preserved
     assert "idle=fire kind=I2" in caplog.text
 

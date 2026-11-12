@@ -508,7 +508,6 @@ class TestAutomationModelUpdate:
         from unittest.mock import create_autospec
         from src.dalton.notify import dispatch as notify_dispatch
         from src.server.app import automations as automations_app
-        from src.server.models.automation import AutomationUpdate
 
         now = datetime.now(timezone.utc)
         full_row = _current_row(
@@ -546,13 +545,13 @@ class TestAutomationModelUpdate:
             notify_dispatch, "populate_automation_notify_state", notify_mock
         )
 
-        req = AutomationUpdate.model_validate({"llm_model": None})
+        # DALTON-HOOK(company-automations): the route body is the raw payload.
         # DALTON-HOOK(automation-model): #656 made the route take a principal
         # (WorkspaceSendPrincipal) instead of a bare user_id; a session
         # principal carries the same owner.
         resp = await automations_app.update_automation(
             automation_id=uuid.UUID(AUTOMATION_ID),
-            request=req,
+            body={"llm_model": None},
             principal=Principal(user_id=OWNER, auth="session"),
             http_request=_stub_request(),
         )
@@ -569,7 +568,6 @@ class TestAutomationModelUpdate:
         from unittest.mock import create_autospec
         from src.dalton.notify import dispatch as notify_dispatch
         from src.server.app import automations as automations_app
-        from src.server.models.automation import AutomationUpdate
 
         now = datetime.now(timezone.utc)
         full_row = _current_row(
@@ -607,11 +605,11 @@ class TestAutomationModelUpdate:
             notify_dispatch, "populate_automation_notify_state", notify_mock
         )
 
-        req = AutomationUpdate.model_validate({"name": "renamed"})
+        # DALTON-HOOK(company-automations): the route body is the raw payload.
         # DALTON-HOOK(automation-model): same principal-shaped call as above.
         resp = await automations_app.update_automation(
             automation_id=uuid.UUID(AUTOMATION_ID),
-            request=req,
+            body={"name": "renamed"},
             principal=Principal(user_id=OWNER, auth="session"),
             http_request=_stub_request(),
         )
