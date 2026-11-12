@@ -191,7 +191,9 @@ run_and_record \
 # 沙箱内改名脚本），同文件其余用例照常运行：test_tree_runtime.py 21 条、
 # test_folder_move_script.py 17 条、test_livefs_daemon.py 16 条。
 # 引号写进字符串里：run_and_record 用 bash -c 执行，参数化 id 的 [...] 否则会被当成通配。
-unit_cmd="uv run --with pytest-xdist pytest tests/unit -q -n ${DALTON_BASELINE_WORKERS:-4} --dist loadgroup --durations=25"
+# 单测不出网。本机 shell 的小写 http(s)_proxy 会盖过测试给 Claude CLI 设的 HTTPS_PROXY，
+# 让 claude_code 的假 API 测试连到真 api.anthropic.com 并报 401。uv 取包仍走代理，只在 pytest 这一层清掉。
+unit_cmd="uv run --with pytest-xdist env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY pytest tests/unit -q -n ${DALTON_BASELINE_WORKERS:-4} --dist loadgroup --durations=25"
 if [[ "$(uname -s)" == "Darwin" ]]; then
   unit_cmd+=" --deselect 'tests/unit/ptc_agent/core/sandbox/test_tree_runtime.py::test_a_copy_the_deadline_cuts_short_resumes_where_it_stopped'"
   unit_cmd+=" --deselect 'tests/unit/ptc_agent/core/sandbox/test_tree_runtime.py::test_a_copy_made_again_writes_only_what_changed_since'"
