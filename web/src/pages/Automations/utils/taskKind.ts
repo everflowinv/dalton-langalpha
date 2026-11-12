@@ -24,6 +24,11 @@ export function configVersionOf(task: { config_version?: unknown } | null | unde
   return typeof value === 'number' && Number.isInteger(value) && value >= 1 ? value : null;
 }
 
+/** True when the row is in the recycle bin. A missing or blank timestamp is a live row. */
+export function isDeletedTask(task: { deleted_at?: unknown } | null | undefined): boolean {
+  return typeof task?.deleted_at === 'string' && task.deleted_at.length > 0;
+}
+
 /** Agent rows, including a list row that has no `engine_kind`. Scripts are left out. */
 export function asAutomations(tasks: readonly ManageTask[]): Automation[] {
   const agents: Automation[] = [];

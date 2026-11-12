@@ -1,17 +1,18 @@
 // @vitest-environment node
 // DALTON-HOOK(company-automations): company write bodies stay numeric and encoded.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { pauseAutomation, resumeAutomation, updateAutomation, updateCompanyScript } from '../api';
+import { deleteAutomation, pauseAutomation, restoreAutomation, resumeAutomation, rollbackAutomation, updateAutomation, updateCompanyScript } from '../api';
 
 const post = vi.hoisted(() => vi.fn());
 const patch = vi.hoisted(() => vi.fn());
+const remove = vi.hoisted(() => vi.fn());
 
 vi.mock('@/api/client', () => ({
   api: {
     get: vi.fn(),
     post,
     patch,
-    delete: vi.fn(),
+    delete: remove,
     put: vi.fn(),
   },
 }));
@@ -19,8 +20,10 @@ vi.mock('@/api/client', () => ({
 beforeEach(() => {
   post.mockReset();
   patch.mockReset();
+  remove.mockReset();
   post.mockResolvedValue({ data: {} });
   patch.mockResolvedValue({ data: {} });
+  remove.mockResolvedValue({ data: {} });
 });
 
 describe('automation writes', () => {
@@ -53,6 +56,27 @@ describe('automation writes', () => {
     expect(patch.mock.calls[0]).toEqual([
       `/api/v1/automations/${encodeURIComponent('data:job/key')}`,
       { expected_config_version: 3, cron_expression: '0 10 * * 1-5' },
+    ]);
+  });
+
+  it('deletes into the recycle bin with the version in the body', async () => {
+    await deleteAutomation('data:prices', 4);
+    expect(remove.mock.calls[0]).toEqual([
+      '/api/v1/automations/data%3Aprices',
+      { data: { expected_config_version: 4 } },
+    ]);
+  });
+
+  it('restores a deleted task with the version in the body', async () => {
+    await restoreAutomation('auto-1', 8);
+    expect(post.mock.calls[0]).toEqual(['/api/v1/automations/auto-1/restore', { expected_config_version: 8 }]);
+  });
+
+  it('rolls back to the previous version with both versions in the body', async () => {
+    await rollbackAutomation('data:prices', 3, 9);
+    expect(post.mock.calls[0]).toEqual([
+      '/api/v1/automations/data%3Aprices/rollback',
+      { target_version: 3, expected_config_version: 9 },
     ]);
   });
 

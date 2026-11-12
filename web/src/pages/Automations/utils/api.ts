@@ -56,7 +56,27 @@ export function updateCompanyScript(
   return api.patch(automationItemPath(id), body);
 }
 
-export const deleteAutomation = (id: string): Promise<ApiResponse> => api.delete(automationItemPath(id));
+/** Soft-delete into the recycle bin. The body is the caller's current `config_version`. */
+export function deleteAutomation(id: string, expectedConfigVersion: number): Promise<ApiResponse> {
+  return api.delete(automationItemPath(id), { data: { expected_config_version: expectedConfigVersion } });
+}
+
+/** Put a recycle-bin row back. The body is the deleted row's `config_version`. */
+export function restoreAutomation(id: string, expectedConfigVersion: number): Promise<ApiResponse> {
+  return api.post(automationItemPath(id, '/restore'), { expected_config_version: expectedConfigVersion });
+}
+
+/** Roll the live task back to the previous stored version. */
+export function rollbackAutomation(
+  id: string,
+  targetVersion: number,
+  expectedConfigVersion: number,
+): Promise<ApiResponse> {
+  return api.post(automationItemPath(id, '/rollback'), {
+    target_version: targetVersion,
+    expected_config_version: expectedConfigVersion,
+  });
+}
 
 /** Personal and research callers omit the version and send no body. Company sends the version. */
 export const pauseAutomation = (id: string, expectedConfigVersion?: number): Promise<ApiResponse> =>
@@ -123,6 +143,8 @@ export interface AutomationReadListParams {
   status?: string;
   limit?: number;
   offset?: number;
+  /** When true, the list is only that scope's recycle-bin rows. */
+  includeDeleted?: boolean;
 }
 
 /** Filters `GET /api/v1/automations/executions` actually accepts. */
@@ -140,14 +162,17 @@ export interface AutomationReadPageParams {
   offset?: number;
 }
 
-/** List key. An omitted scope or status is null here and left off the request. */
+/** List key. An omitted scope or status is null here and left off the request.
+ *  `includeDeleted` is on the key only for the recycle bin, so live keys stay unchanged. */
 export function automationReadListQuery(params: AutomationReadListParams = {}): AutomationReadListQuery {
-  return {
+  const query: AutomationReadListQuery = {
     scope: params.scope ?? null,
     status: params.status ?? null,
     limit: params.limit ?? READ_LIST_LIMIT,
     offset: params.offset ?? READ_LIST_OFFSET,
   };
+  if (params.includeDeleted === true) query.includeDeleted = true;
+  return query;
 }
 
 /** Feed key. Defaults match `listAutomationRunReads`. */
@@ -181,11 +206,13 @@ export function automationHistoryQuery(params: AutomationReadPageParams = {}): A
 function readParams(
   page: AutomationReadPageQuery,
   filters: { scope?: AutomationScope | null; status?: string | null; thread_id?: string | null } = {},
+  includeDeleted = false,
 ): QueryParams {
-  const params: QueryParams = { limit: page.limit, offset: page.offset };
+  const params: Record<string, string | number | boolean | null | undefined> = { limit: page.limit, offset: page.offset };
   if (filters.scope != null) params.scope = filters.scope;
   if (filters.status != null) params.status = filters.status;
   if (filters.thread_id != null) params.thread_id = filters.thread_id;
+  if (includeDeleted) params.include_deleted = true;
   return params;
 }
 
@@ -200,7 +227,7 @@ export function listAutomationReads(
   params: AutomationReadListParams = {},
 ): Promise<ApiResponse<AutomationReadList>> {
   const query = automationReadListQuery(params);
-  return api.get('/api/v1/automations', { params: readParams(query, query) });
+  return api.get('/api/v1/automations', { params: readParams(query, query, query.includeDeleted === true) });
 }
 
 /** Scoped run feed. Script statuses such as `succeeded` are sent unchanged. */

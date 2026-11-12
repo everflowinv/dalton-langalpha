@@ -1,6 +1,6 @@
 import React, { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertCircle, ArrowUpRight, EyeOff, Pause, Pencil, Play, Trash2, Zap } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, EyeOff, Pause, Pencil, Play, RotateCcw, Trash2, Undo2, Zap } from 'lucide-react';
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
 import { useModelName } from '@/hooks/useModelName';
@@ -9,6 +9,7 @@ import { scrollMotion } from '@/lib/reducedMotion';
 import { cn } from '@/lib/utils';
 import type { Automation, AutomationExecution, DeliveryAttempt } from '@/types/automation';
 import type { ErrorLinkSpec } from '@/utils/rateLimitError';
+import { useModificationHistory } from '../hooks/useModificationHistory';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { useAutomationPlace } from '../hooks/useAutomationPlace';
 import { useDeliveryOptions } from '../hooks/useDeliveryOptions';
@@ -27,7 +28,8 @@ import {
 import { distanceLabel } from '../utils/price';
 import { scheduleSentence } from '../utils/schedule';
 import { attentionLinks, automationActions, automationStatusUi, describeRun } from '../utils/status';
-import { isForbiddenError } from '../utils/taskKind';
+import { isDeletedTask, isForbiddenError } from '../utils/taskKind';
+import { DeletedMeta, ModificationHistory, RecordTabs, RollbackDialog } from './ModificationHistory';
 import { formatDateTimeShort, formatDuration } from '../utils/time';
 import { PriceMeter } from './PriceMeter';
 import { RunReport } from './RunReport';
@@ -39,7 +41,7 @@ import './AutomationInspector.css';
 const INSTRUCTION_FOLD_CHARS = 480;
 const INSTRUCTION_FOLD_LINES = 10;
 
-// DALTON-HOOK(company-automations): company agents hide run, delete, dismiss, and skip, and pause with the detail version.
+// DALTON-HOOK(company-automations): company agents hide run, dismiss, and skip. Pause uses the detail version. Delete moves the task to the recycle bin.
 interface AutomationInspectorProps {
   automation: Automation;
   reading: WatchedReading | undefined;
@@ -48,7 +50,7 @@ interface AutomationInspectorProps {
   onOpenRun: (runId: string) => void;
   onEdit: (a: Automation) => void;
   onDelete: (a: Automation) => void;
-  /** Company tasks hide run, delete, dismiss, and skip. Defaults keep personal rows unchanged. */
+  /** Company tasks hide run, dismiss, and skip. Defaults keep personal rows unchanged. */
   allowRun?: boolean;
   allowDelete?: boolean;
   allowDismiss?: boolean;
@@ -58,6 +60,8 @@ interface AutomationInspectorProps {
   expectedConfigVersion?: number | null;
   /** Company run list returned 403. Personal inspectors leave this unset. */
   onRunsForbidden?: (automationId: string) => void;
+  /** After a recycle-bin restore succeeds. The page closes that group's bin. */
+  onRestored?: () => void;
 }
 
 /**
@@ -79,6 +83,7 @@ export default function AutomationInspector({
   requireVersion = false,
   expectedConfigVersion = null,
   onRunsForbidden,
+  onRestored,
 }: AutomationInspectorProps) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -86,8 +91,10 @@ export default function AutomationInspector({
   const now = useNow();
   const openThread = useOpenThread();
   const { pause, resume, trigger, skip, dismiss, busy } = useAutomationMutations();
+  const deleted = isDeletedTask(a);
+  const history = useModificationHistory(a, requireVersion, onRunsForbidden, onRestored);
   const deliveryMethods = a.delivery_config?.methods ?? [];
-  const { executions, loading, error: runsError } = useExecutions(a.automation_id, deliveryMethods.length > 0);
+  const { executions, loading, error: runsError } = useExecutions(a.automation_id, deliveryMethods.length > 0, !deleted);
   const runsForbidden = requireVersion && isForbiddenError(runsError);
   const place = useAutomationPlace();
   const workspaceId = a.workspace_id;
@@ -137,7 +144,7 @@ export default function AutomationInspector({
     if (runsForbidden) onRunsForbidden?.(a.automation_id);
   }, [runsForbidden, onRunsForbidden, a.automation_id]);
 
-  if (runsForbidden) {
+  if (runsForbidden || history.historyForbidden) {
     return (
       <article className="automation-inspector">
         <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
@@ -154,6 +161,7 @@ export default function AutomationInspector({
         <span className="truncate">{kicker.join(' · ')}</span>
       </div>
       <h2 className="title-font automation-inspector-title">{a.name}</h2>
+      {deleted && <DeletedMeta deletedAt={a.deleted_at} deletedBy={a.deleted_by} />}
       {a.description && <p className="automation-inspector-desc">{a.description}</p>}
       <p className="automation-inspector-schedule">{scheduleSentence(a, t, locale, now)}</p>
 
@@ -164,7 +172,19 @@ export default function AutomationInspector({
         </div>
       )}
 
-      {/* DALTON-HOOK(company-automations): run now, dismiss, and delete render only for a personal or research task. */}
+      {deleted ? (
+        <div className="automation-inspector-actions">
+          <HeaderButton
+            variant="primary"
+            icon={RotateCcw}
+            disabled={busy || history.version == null}
+            onClick={() => void history.restoreTask()}
+          >
+            {busy ? t('automation.restoring') : t('automation.restoreTask')}
+          </HeaderButton>
+        </div>
+      ) : (
+      /* DALTON-HOOK(company-automations): run now and dismiss stay off for a company task. Delete moves the task to the recycle bin. */
       <div className="automation-inspector-actions">
         {allowRun && (
           <HeaderButton
@@ -200,16 +220,33 @@ export default function AutomationInspector({
             {t('automation.dismiss')}
           </HeaderButton>
         )}
-        {/* DALTON-HOOK(company-automations): company tasks keep pause, resume, and edit, and hide run, delete, dismiss, and skip. */}
+        {/* DALTON-HOOK(company-automations): company tasks keep pause, resume, edit, and recycle. Run, dismiss, and skip stay off. */}
         <HeaderButton variant="secondary" icon={Pencil} disabled={!versionReady} onClick={() => onEdit(a)}>
           {t('automation.edit')}
         </HeaderButton>
+        {history.prevVersion != null && (
+          <HeaderButton
+            variant="secondary"
+            icon={Undo2}
+            disabled={busy || history.version == null}
+            onClick={() => history.setRollbackOpen(true)}
+          >
+            {t('automation.rollbackButton', { version: history.prevVersion })}
+          </HeaderButton>
+        )}
         {allowDelete && (
-          <HeaderButton variant="ghost" icon={Trash2} className="ml-auto hover:text-(color:--color-icon-danger)" onClick={() => onDelete(a)}>
-            {t('common.delete')}
+          <HeaderButton
+            variant="ghost"
+            icon={Trash2}
+            className="ml-auto hover:text-(color:--color-icon-danger)"
+            disabled={busy || history.version == null}
+            onClick={() => onDelete(a)}
+          >
+            {t('automation.moveToRecycle')}
           </HeaderButton>
         )}
       </div>
+      )}
 
       <section ref={reportRef} className="automation-inspector-section">
         <h3 className="automations-kicker">{t(isLatest ? 'automation.latestRun' : 'automation.selectedRun')}</h3>
@@ -237,12 +274,20 @@ export default function AutomationInspector({
 
       <section className="automation-inspector-section">
         <h3 className="automations-kicker">{t('automation.instruction')}</h3>
-        <Instruction text={a.instruction} />
+        <Instruction text={a.instruction ?? ''} />
       </section>
 
       <section className="automation-inspector-section">
-        <h3 className="automations-kicker">{t('automation.runHistory')}</h3>
-        {loading ? (
+        <RecordTabs value={history.recordTab} onChange={history.setRecordTab} />
+        {history.recordTab === 'history' ? (
+          <ModificationHistory
+            history={history.history}
+            loading={history.historyLoading}
+            failed={history.historyFailed}
+            prevVersion={history.prevVersion}
+            onRollback={history.version == null ? null : () => history.setRollbackOpen(true)}
+          />
+        ) : loading ? (
           <ListSkeleton rows={2} />
         ) : executions.length === 0 ? (
           <p className="automations-quiet-note">{t('automation.noRunsForThis')}</p>
@@ -256,6 +301,17 @@ export default function AutomationInspector({
           />
         )}
       </section>
+
+      <RollbackDialog
+        open={history.rollbackOpen}
+        version={history.prevVersion}
+        snapshot={history.targetSnapshot}
+        ready={history.snapshotReady}
+        pending={history.snapshotPending}
+        loading={busy}
+        onOpenChange={history.setRollbackOpen}
+        onConfirm={() => void history.confirmRollback()}
+      />
 
       <section className="automation-inspector-section">
         <h3 className="automations-kicker">{t('automation.details')}</h3>

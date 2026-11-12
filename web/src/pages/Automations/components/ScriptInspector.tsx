@@ -1,14 +1,16 @@
 // DALTON-HOOK(company-automations): a company script has schedule controls and no agent actions.
 import React, { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Pause, Pencil, Play } from 'lucide-react';
+import { Pause, Pencil, Play, RotateCcw, Trash2, Undo2 } from 'lucide-react';
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
 import type { ScriptAutomationRead } from '@/types/automation';
+import { useModificationHistory } from '../hooks/useModificationHistory';
 import { useAutomationExecutionReads } from '../hooks/useAutomationReads';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { formatDateTimeShort } from '../utils/time';
-import { isCompanyTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
+import { isCompanyTask, isDeletedTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
+import { DeletedMeta, ModificationHistory, RecordTabs, RollbackDialog } from './ModificationHistory';
 import './AutomationInspector.css';
 
 interface ScriptInspectorProps {
@@ -17,15 +19,20 @@ interface ScriptInspectorProps {
   /** Detail `config_version`. Pause, resume, and save stay off until it is known. */
   configVersion: number | null;
   onEdit: (script: ScriptAutomationRead) => void;
+  onDelete: (script: ScriptAutomationRead) => void;
   /** Company run list returned 403. The page clears that task's cached reads. */
   onRunsForbidden: (automationId: string) => void;
+  /** After a recycle-bin restore succeeds. The page closes that group's bin. */
+  onRestored?: () => void;
 }
 
-export default function ScriptInspector({ script, runId, configVersion, onEdit, onRunsForbidden }: ScriptInspectorProps) {
+export default function ScriptInspector({ script, runId, configVersion, onEdit, onDelete, onRunsForbidden, onRestored }: ScriptInspectorProps) {
   const { t } = useTranslation();
   const locale = useLocale();
   const { pause, resume, busy } = useAutomationMutations();
-  const runs = useAutomationExecutionReads(script.automation_id, { limit: 20, offset: 0 });
+  const deleted = isDeletedTask(script);
+  const history = useModificationHistory(script, isCompanyTask(script), onRunsForbidden, onRestored);
+  const runs = useAutomationExecutionReads(script.automation_id, { limit: 20, offset: 0, enabled: !deleted });
   const runsForbidden = isCompanyTask(script) && isForbiddenError(runs.error);
   useEffect(() => {
     if (runsForbidden) onRunsForbidden(script.automation_id);
@@ -38,7 +45,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
   const executions = runs.data?.executions ?? [];
   const opened = runId ? executions.find((run) => run.automation_execution_id === runId) ?? null : null;
 
-  if (runsForbidden) {
+  if (runsForbidden || history.historyForbidden) {
     return (
       <article className="automation-inspector">
         <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
@@ -53,6 +60,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
         {statusKey ? ` · ${t(statusKey)}` : script.status ? ` · ${script.status}` : ''}
       </div>
       <h2 className="title-font automation-inspector-title">{script.name}</h2>
+      {deleted && <DeletedMeta deletedAt={script.deleted_at} deletedBy={script.deleted_by} />}
       <dl className="automation-details">
         <dt>{t('automation.scriptStatus')}</dt>
         <dd>{statusKey ? t(statusKey) : script.status}</dd>
@@ -80,6 +88,18 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
         )}
       </dl>
 
+      {deleted ? (
+        <div className="automation-inspector-actions">
+          <HeaderButton
+            variant="primary"
+            icon={RotateCcw}
+            disabled={busy || history.version == null}
+            onClick={() => void history.restoreTask()}
+          >
+            {busy ? t('automation.restoring') : t('automation.restoreTask')}
+          </HeaderButton>
+        </div>
+      ) : (
       <div className="automation-inspector-actions">
         {canPause && (
           <HeaderButton
@@ -110,10 +130,40 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
         <HeaderButton variant="secondary" icon={Pencil} disabled={!versionReady} onClick={() => onEdit(script)}>
           {t('automation.edit')}
         </HeaderButton>
+        {history.prevVersion != null && (
+          <HeaderButton
+            variant="secondary"
+            icon={Undo2}
+            disabled={busy || history.version == null}
+            onClick={() => history.setRollbackOpen(true)}
+          >
+            {t('automation.rollbackButton', { version: history.prevVersion })}
+          </HeaderButton>
+        )}
+        <HeaderButton
+          variant="ghost"
+          icon={Trash2}
+          className="ml-auto hover:text-(color:--color-icon-danger)"
+          disabled={busy || history.version == null}
+          onClick={() => onDelete(script)}
+        >
+          {t('automation.moveToRecycle')}
+        </HeaderButton>
       </div>
+      )}
 
       <section className="automation-inspector-section">
-        <h3 className="automations-kicker">{t('automation.runHistory')}</h3>
+        <RecordTabs value={history.recordTab} onChange={history.setRecordTab} />
+        {history.recordTab === 'history' ? (
+          <ModificationHistory
+            history={history.history}
+            loading={history.historyLoading}
+            failed={history.historyFailed}
+            prevVersion={history.prevVersion}
+            onRollback={history.version == null ? null : () => history.setRollbackOpen(true)}
+          />
+        ) : (
+        <>
         {runId && !opened && !runs.isLoading && <p className="automations-quiet-note">{t('automation.runNotFound')}</p>}
         {runs.isLoading ? (
           <ListSkeleton rows={2} />
@@ -130,7 +180,20 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
             ))}
           </ul>
         )}
+        </>
+        )}
       </section>
+
+      <RollbackDialog
+        open={history.rollbackOpen}
+        version={history.prevVersion}
+        snapshot={history.targetSnapshot}
+        ready={history.snapshotReady}
+        pending={history.snapshotPending}
+        loading={busy}
+        onOpenChange={history.setRollbackOpen}
+        onConfirm={() => void history.confirmRollback()}
+      />
     </article>
   );
 }

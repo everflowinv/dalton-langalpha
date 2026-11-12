@@ -24,12 +24,15 @@ const executionsQuery = (automationId: string) =>
 
 /** An automation's runs, polled fast while one is live or its delivery may
  *  still change. `delivers`: the automation has delivery entries, so a run
- *  that ended with no record yet is waiting for one. */
-export function useExecutions(automationId: string, delivers = false): UseExecutionsResult {
+ *  that ended with no record yet is waiting for one. `enabled` is false for a
+ *  deleted task, which does not load runs. */
+export function useExecutions(automationId: string, delivers = false, enabled = true): UseExecutionsResult {
   const { data, isLoading, error } = useQuery({
     ...executionsQuery(automationId),
-    refetchInterval: (query) =>
-      pollMs(!!query.state.data?.executions.some((e) => isRunLive(e.status) || isDeliverySettling(e, delivers))),
+    enabled,
+    refetchInterval: enabled
+      ? (query) => pollMs(!!query.state.data?.executions.some((e) => isRunLive(e.status) || isDeliverySettling(e, delivers)))
+      : false,
     refetchIntervalInBackground: false,
   });
 

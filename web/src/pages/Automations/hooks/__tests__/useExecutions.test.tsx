@@ -99,6 +99,14 @@ describe('useExecutions: polling while a delivery settles', () => {
     expect(calls()).toBe(4);
   });
 
+  it('does not fetch runs when disabled', async () => {
+    vi.mocked(api.listExecutions).mockResolvedValue(page(ended(5_000, null)));
+    renderHookWithProviders(() => useExecutions('auto-1', true, false));
+    await tick(0);
+    await tick(LIVE_POLL_MS);
+    expect(calls()).toBe(0);
+  });
+
   it('waits at the live pace for a first record only when the automation delivers', async () => {
     vi.mocked(api.listExecutions).mockResolvedValue(page(ended(5_000, null)));
     const delivering = renderHookWithProviders(() => useExecutions('auto-1', true));

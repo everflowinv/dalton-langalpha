@@ -146,6 +146,11 @@ export interface Automation {
   metadata?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
+  /** Set while the task is in the recycle bin. Absent on a live row. */
+  deleted_at?: string | null;
+  /** Server config version; required by soft delete, restore and rollback. */
+  config_version?: number;
+  deleted_by?: string | null;
 
   last_execution: AutomationExecution | null;
   // DALTON-HOOK(dalton-notify): pushable category, effective value, source, and custom route targets returned by backend
@@ -207,6 +212,8 @@ export interface AutomationReadListQuery {
   status: string | null;
   limit: number;
   offset: number;
+  /** Present only on a recycle-bin key. Live list keys omit it. */
+  includeDeleted?: true;
 }
 
 /** Normalized feed key. `thread_id` null means the request left it off. */
@@ -279,6 +286,9 @@ export interface ScriptAutomationRead {
   next_run_at: string | null;
   last_run_at: string | null;
   updated_by: string | null;
+  /** Set while the script is in the recycle bin. Absent on a live row. */
+  deleted_at?: string | null;
+  deleted_by?: string | null;
   dalton_notify_category: string | null;
   dalton_notify_effective: boolean | null;
   dalton_notify_source: string | null;

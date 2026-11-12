@@ -9,6 +9,7 @@ import type { WatchedReading } from '../hooks/useWatchedReadings';
 import { useOrderedGroups } from '../hooks/useOrderedGroups';
 import { scheduleLine } from '../utils/schedule';
 import { asAutomations, isScriptTask, scriptStatusLabelKey } from '../utils/taskKind';
+import { formatDateTimeShort } from '../utils/time';
 import { AutomationList } from './AutomationList';
 
 export const MANAGE_PAGE_SIZE = 50;
@@ -23,6 +24,13 @@ export interface ScopePage {
   isForbidden: boolean;
   isError: boolean;
   onOffset: (offset: number) => void;
+  /** Deleted rows in this group. Zero until the recycle query settles. */
+  recycleCount: number;
+  /** False while the recycle count is still loading. */
+  recycleReady: boolean;
+  recycleOpen: boolean;
+  showingDeleted: boolean;
+  onToggleRecycle: () => void;
 }
 
 interface ManageScopesProps {
@@ -31,9 +39,11 @@ interface ManageScopesProps {
   selectedId: string | null;
   onSelect: (id: string) => void;
   keyboardNav?: boolean;
+  /** The group named by `?scope=`. Null when the URL does not name one. */
+  activeScope?: ScopePage['scope'] | null;
 }
 
-export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNav = false }: ManageScopesProps) {
+export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNav = false, activeScope = null }: ManageScopesProps) {
   const { t } = useTranslation();
   const navRef = useRef<HTMLDivElement>(null);
   const personal = pages.find((page) => page.scope === 'personal');
@@ -64,10 +74,22 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
     return () => window.removeEventListener('keydown', onKey);
   }, [keyboardNav, onSelect, selectedId]);
 
+  useEffect(() => {
+    if (!activeScope) return;
+    const node = navRef.current?.querySelector<HTMLElement>(`[data-scope="${activeScope}"]`);
+    if (node && typeof node.scrollIntoView === 'function') node.scrollIntoView({ block: 'nearest' });
+  }, [activeScope]);
+
   return (
     <div ref={navRef} className="automations-scopes" aria-label={t('automation.automations')}>
       {pages.map((page) => (
-        <section key={page.scope} className="automations-scope" aria-label={t(page.titleKey)}>
+        <section
+          key={page.scope}
+          className="automations-scope"
+          data-scope={page.scope}
+          aria-label={t(page.titleKey)}
+          aria-current={page.scope === activeScope ? 'true' : undefined}
+        >
           <h2 className="automations-kicker automations-list-heading">
             {t(page.titleKey)}
             {!page.isForbidden && !page.isLoading && page.total > 0 && (
@@ -83,7 +105,11 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
           ) : page.isError ? (
             <p className="automations-quiet-note">{t('automation.scopeLoadFailed')}</p>
           ) : page.tasks.length === 0 ? (
-            <p className="automations-quiet-note">{t('automation.scopeEmpty')}</p>
+            <p className="automations-quiet-note">
+              {t(page.showingDeleted ? 'automation.recycleEmpty' : 'automation.scopeEmpty')}
+            </p>
+          ) : page.showingDeleted ? (
+            <DeletedRows tasks={page.tasks} selectedId={selectedId} onSelect={onSelect} />
           ) : page.scope === 'company' ? (
             <CompanyRows tasks={page.tasks} selectedId={selectedId} onSelect={onSelect} />
           ) : (
@@ -98,9 +124,58 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
             </>
           )}
           {(showFullPager(page) || showReturnPager(page)) && <ScopePager page={page} showCount={showFullPager(page)} />}
+          {!page.isForbidden && (
+            <button
+              type="button"
+              className="automation-link automations-recycle-toggle"
+              aria-pressed={page.recycleOpen}
+              onClick={page.onToggleRecycle}
+            >
+              {page.recycleReady
+                ? t('automation.recycleBin', { total: page.recycleCount })
+                : t('automation.recycleBinPending')}
+            </button>
+          )}
         </section>
       ))}
     </div>
+  );
+}
+
+function DeletedRows({
+  tasks,
+  selectedId,
+  onSelect,
+}: {
+  tasks: AutomationRead[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  return (
+    <>
+      {tasks.map((task) => {
+        const selected = task.automation_id === selectedId;
+        const actor = task.deleted_by || t('automation.unknownActor');
+        const time = task.deleted_at ? formatDateTimeShort(task.deleted_at, locale) : '—';
+        return (
+          <button
+            key={task.automation_id}
+            type="button"
+            className="automations-list-row"
+            data-id={task.automation_id}
+            aria-current={selected ? 'true' : undefined}
+            onClick={() => onSelect(task.automation_id)}
+          >
+            <span className="min-w-0 flex-1">
+              <span className="automations-list-name">{task.name}</span>
+              <span className="automation-mono automations-list-sub">{t('automation.deletedMeta', { actor, time })}</span>
+            </span>
+          </button>
+        );
+      })}
+    </>
   );
 }
 

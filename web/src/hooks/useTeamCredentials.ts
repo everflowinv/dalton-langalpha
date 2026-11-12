@@ -29,10 +29,17 @@ export function useTeamCredentials(): {
   isPm: boolean;
   canInvite: boolean;
   callerTier?: string | null;
+  /** True while Dalton auth is still reading `caller_tier`. OSS mode is never pending. */
+  callerTierPending: boolean;
+  /**
+   * True when Dalton auth failed to read `caller_tier`. OSS mode is not a failed read:
+   * the tier is simply unset, and callers keep the non-Dalton behavior.
+   */
+  callerTierError: boolean;
 } {
   const { userId } = useAuth();
 
-  const { data, isError } = useQuery<TeamCredentialsStatus>({
+  const { data, isError, isLoading } = useQuery<TeamCredentialsStatus>({
     queryKey: queryKeys.dalton.credentialsStatus(userId),
     queryFn: async () => {
       const { api } = await import('@/api/client');
@@ -54,11 +61,14 @@ export function useTeamCredentials(): {
       isPm: true,
       canInvite: false,
       callerTier: null,
+      callerTierPending: false,
+      callerTierError: false,
     };
   }
   const isShared = Boolean(data?.enabled);
   const isPm = !isError && Boolean(data?.is_pm);
-  const callerTier = !isError ? (data?.caller_tier ?? null) : null;
+  const callerTierError = isError;
+  const callerTier = !callerTierError ? (data?.caller_tier ?? null) : null;
   return {
     isShared,
     canDisconnect: !isError && Boolean(data?.can_disconnect),
@@ -72,5 +82,7 @@ export function useTeamCredentials(): {
       callerTier === 'admin' ||
       callerTier === 'internal',
     callerTier,
+    callerTierPending: Boolean(userId) && isLoading,
+    callerTierError,
   };
 }

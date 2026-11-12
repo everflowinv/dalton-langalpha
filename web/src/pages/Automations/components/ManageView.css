@@ -41,6 +41,14 @@
   margin-bottom: 20px;
 }
 
+.automations-scope[aria-current='true'] {
+  box-shadow: inset 2px 0 0 var(--color-text-primary);
+}
+
+.automations-recycle-toggle {
+  margin-top: 10px;
+}
+
 /* DALTON-HOOK(company-automations): each scope group pages on its own, under its heading. */
 .automations-scope-pager {
   display: flex;

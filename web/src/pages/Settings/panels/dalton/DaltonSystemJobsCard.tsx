@@ -1,4 +1,5 @@
-import React, { useCallback, useState } from 'react';
+import React, { useState } from 'react';
+import { Link } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
@@ -6,18 +7,10 @@ import {
   Clock,
   HelpCircle,
   Loader2,
-  PauseCircle,
-  Play,
   RefreshCw,
-  Wrench,
   XCircle,
 } from 'lucide-react';
-import { ToggleSwitch } from '@/components/ui/switch';
-import {
-  useDaltonSystemJobs,
-  useRunDaltonSystemJobNow,
-  useToggleDaltonSystemJob,
-} from '../../hooks/useOpenClaw';
+import { useDaltonSystemJobs } from '../../hooks/useOpenClaw';
 import {
   type DaltonSystemJobItem,
   type DaltonSystemJobScope,
@@ -144,97 +137,18 @@ export function DaltonSystemJobsCard({
   scopes?: DaltonSystemJobScope[];
 } = {}): React.ReactElement {
   const { t } = useTranslation();
-  const [busyKey, setBusyKey] = useState<string | null>(null);
-  const [banner, setBanner] = useState<{ type: 'info' | 'error'; text: string } | null>(null);
   const [expandedLogKeys, setExpandedLogKeys] = useState<Record<string, boolean>>({});
 
   const { data, isLoading, isFetching, refetch, error: queryError } = useDaltonSystemJobs();
-  const toggleMutation = useToggleDaltonSystemJob();
-  const runNowMutation = useRunDaltonSystemJobNow();
 
   const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
   const loading = isLoading || isFetching;
-
-  const handleToggle = useCallback(
-    async (job: DaltonSystemJobItem, nextEnabled: boolean) => {
-      if (!job.can_toggle || busyKey) return;
-      setBusyKey(job.key);
-      setBanner(null);
-      try {
-        const res = await toggleMutation.mutateAsync({ key: job.key, enabled: nextEnabled });
-        if (res?.ok === true) {
-          setBanner({
-            type: 'info',
-            text: `${job.title || job.key} 已${nextEnabled ? '开启' : '关闭'}`,
-          });
-        } else {
-          setBanner({
-            type: 'error',
-            text: res?.error || res?.message || '切换任务状态失败',
-          });
-        }
-      } catch (err: unknown) {
-        const respData = (
-          err as { response?: { data?: { detail?: string; error?: string; message?: string } } }
-        )?.response?.data;
-        const msg =
-          respData?.detail ||
-          respData?.error ||
-          respData?.message ||
-          (err instanceof Error ? err.message : '切换任务状态失败');
-        setBanner({ type: 'error', text: msg });
-      } finally {
-        setBusyKey(null);
+  const effectiveBanner = queryError
+    ? {
+        type: 'error' as const,
+        text: queryError instanceof Error ? queryError.message : '加载系统自动任务失败',
       }
-    },
-    [busyKey, toggleMutation],
-  );
-
-  const handleRunNow = useCallback(
-    async (job: DaltonSystemJobItem) => {
-      if (!job.can_run_now || busyKey) return;
-      setBusyKey(job.key);
-      setBanner(null);
-      try {
-        const res = await runNowMutation.mutateAsync(job.key);
-        if (res?.ok === true) {
-          setBanner({
-            type: 'info',
-            text:
-              res.message ||
-              `已异步触发「${job.title || job.key}」，请稍后在 ${res.where_to_check || '当前面板'} 查看结果`,
-          });
-        } else {
-          setBanner({
-            type: 'error',
-            text: res?.error || res?.message || '触发立即运行失败',
-          });
-        }
-      } catch (err: unknown) {
-        const respData = (
-          err as { response?: { data?: { detail?: string; error?: string; message?: string } } }
-        )?.response?.data;
-        const msg =
-          respData?.detail ||
-          respData?.error ||
-          respData?.message ||
-          (err instanceof Error ? err.message : '触发立即运行失败');
-        setBanner({ type: 'error', text: msg });
-      } finally {
-        setBusyKey(null);
-      }
-    },
-    [busyKey, runNowMutation],
-  );
-
-  const effectiveBanner =
-    banner ||
-    (queryError
-      ? {
-          type: 'error' as const,
-          text: queryError instanceof Error ? queryError.message : '加载系统自动任务失败',
-        }
-      : null);
+    : null;
 
   return (
     <div
@@ -245,14 +159,24 @@ export function DaltonSystemJobsCard({
       }}
       data-testid="dalton-system-jobs-card"
     >
+      <Link
+        to="/automations?scope=company"
+        data-testid="system-jobs-open-company"
+        className="mb-3 flex w-full items-center justify-center rounded-md px-3 py-2 text-sm font-semibold"
+        style={{
+          backgroundColor: 'var(--color-btn-primary-bg)',
+          color: 'var(--color-btn-primary-text)',
+        }}
+      >
+        前往 自动化 → 公司公共任务
+      </Link>
       <div className="flex items-center justify-between gap-2 pb-3">
         <div>
           <h4 className="text-sm font-semibold" style={{ color: 'var(--color-text-primary)' }}>
             自动任务
           </h4>
           <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            统一查看、开关与立即触发系统内所有自动运行任务（
-            {scopes.map((s) => scopeSummaryName(s, t)).join('、')}）
+            {`只读查看系统底层定时任务的运行状态（${scopes.map((s) => scopeSummaryName(s, t)).join('、')}）`}
           </p>
         </div>
         <button
@@ -307,8 +231,6 @@ export function DaltonSystemJobsCard({
                 ) : (
                   <div className="divide-y divide-border/40">
                     {groupJobs.map((job) => {
-                      const isBusy = busyKey === job.key;
-                      const isChecked = job.status === 'on';
                       const displaySchedule =
                         job.schedule ||
                         (job.key === 'conversation-archive' || job.kind === 'conversation_archive'
@@ -385,61 +307,6 @@ export function DaltonSystemJobsCard({
                                   </pre>
                                 )}
                               </div>
-                            )}
-                          </div>
-
-                          <div className="flex shrink-0 items-center gap-2 pt-1 sm:pt-0">
-                            {job.scope !== 'ops' && job.status === 'partial' && job.can_toggle && (
-                              <>
-                                <button
-                                  type="button"
-                                  disabled={isBusy}
-                                  onClick={() => void handleToggle(job, false)}
-                                  data-testid={`system-job-pause-all-${job.key}`}
-                                  className="inline-flex items-center gap-1 rounded bg-zinc-500/15 px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-500/25 disabled:opacity-50 dark:text-zinc-300"
-                                >
-                                  <PauseCircle className="h-3 w-3" />
-                                  全部暂停
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={isBusy}
-                                  onClick={() => void handleToggle(job, true)}
-                                  data-testid={`system-job-repair-${job.key}`}
-                                  className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/25 disabled:opacity-50 dark:text-amber-300"
-                                >
-                                  <Wrench className="h-3 w-3" />
-                                  修复
-                                </button>
-                              </>
-                            )}
-
-                            {job.scope !== 'ops' && job.can_run_now && (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => void handleRunNow(job)}
-                                className="inline-flex items-center gap-1 rounded border border-border/60 bg-background px-2 py-1 text-[11px] font-medium text-foreground hover:bg-muted/60 disabled:opacity-50"
-                                data-testid={`system-job-run-${job.key}`}
-                              >
-                                {isBusy ? (
-                                  <Loader2 className="h-3 w-3 animate-spin" />
-                                ) : (
-                                  <Play className="h-3 w-3" />
-                                )}
-                                立即运行
-                              </button>
-                            )}
-
-                            {job.scope !== 'ops' && job.can_toggle ? (
-                              <ToggleSwitch
-                                checked={isChecked}
-                                disabled={isBusy}
-                                onChange={() => void handleToggle(job, !isChecked)}
-                                ariaLabel={`切换 ${job.title || job.key}`}
-                              />
-                            ) : (
-                              <span className="text-[11px] text-muted-foreground">只读</span>
                             )}
                           </div>
                         </div>

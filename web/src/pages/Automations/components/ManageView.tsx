@@ -7,11 +7,10 @@ import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useScrollMemory } from '@/lib/scrollMemory';
-import type { Automation } from '@/types/automation';
 import { useScrollReveal } from '../hooks/useScrollReveal';
 import type { WatchedReading } from '../hooks/useWatchedReadings';
 import { PANE_CROSSFADE } from '../utils/motion';
-import { isCompanyTask, isScriptTask, type ManageTask } from '../utils/taskKind';
+import { configVersionOf, isCompanyTask, isDeletedTask, isScriptTask, type ManageTask } from '../utils/taskKind';
 import AutomationInlineForm, { type AutomationInlineFormProps } from './AutomationInlineForm';
 import AutomationInspector from './AutomationInspector';
 import { ManageScopes, type ScopePage } from './ManageScopes';
@@ -51,9 +50,13 @@ interface ManageViewProps {
   onOpenRun: (automationId: string, runId: string | null) => void;
   form: FormHost | null;
   onEdit: (task: ManageTask) => void;
-  onDelete: (task: Automation) => void;
+  onDelete: (task: ManageTask) => void;
   /** A company run list returned 403. The page drops that task's cached reads. */
   onRunsForbidden: (automationId: string) => void;
+  /** Closes the recycle bin of the restored task's group. */
+  onRestored: (automationId: string) => void;
+  /** The group named by `?scope=`, after an unauthorized company link falls back. */
+  activeScope?: ScopePage['scope'] | null;
 }
 
 /**
@@ -72,6 +75,8 @@ export default function ManageView({
   onEdit,
   onDelete,
   onRunsForbidden,
+  onRestored,
+  activeScope = null,
 }: ManageViewProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -79,6 +84,8 @@ export default function ManageView({
   const revealPaneScroll = useScrollReveal();
   const shown = selection.kind === 'chosen' || selection.kind === 'first' ? selection.task : null;
   const company = shown ? isCompanyTask(shown) : false;
+  const deleted = shown ? isDeletedTask(shown) : false;
+  const shownVersion = configVersionOf(shown);
   const runId = selection.kind === 'chosen' ? selection.runId : null;
 
   // DALTON-HOOK(company-automations): the open form stays mounted while another group's page is loading.
@@ -107,7 +114,9 @@ export default function ManageView({
         runId={runId}
         configVersion={writeVersion}
         onEdit={onEdit}
+        onDelete={onDelete}
         onRunsForbidden={onRunsForbidden}
+        onRestored={() => onRestored(shown.automation_id)}
       />
     ) : (
       <AutomationInspector
@@ -118,14 +127,15 @@ export default function ManageView({
         onOpenRun={(run) => onOpenRun(shown.automation_id, run)}
         onEdit={onEdit}
         onDelete={onDelete}
-        // DALTON-HOOK(company-automations): company agents can edit and pause. Run, delete, dismiss, and skip stay off.
-        allowRun={!company}
-        allowDelete={!company}
-        allowDismiss={!company}
-        allowSkip={!company}
+        // DALTON-HOOK(company-automations): company agents can edit, pause, and move to the recycle bin. Run, dismiss, and skip stay off.
+        allowRun={!company && !deleted}
+        allowDelete={!deleted}
+        allowDismiss={!company && !deleted}
+        allowSkip={!company && !deleted}
         requireVersion={company}
-        expectedConfigVersion={writeVersion}
+        expectedConfigVersion={deleted ? shownVersion : writeVersion}
         onRunsForbidden={onRunsForbidden}
+        onRestored={() => onRestored(shown.automation_id)}
       />
     )
   ) : selection.kind === 'forbidden' ? (
@@ -162,6 +172,7 @@ export default function ManageView({
       selectedId={form ? null : selection.kind === 'chosen' || (!isMobile && selection.kind === 'first') ? selection.task.automation_id : null}
       onSelect={(id) => onSelect(id)}
       keyboardNav={!isMobile && !form}
+      activeScope={activeScope}
     />
   );
 
