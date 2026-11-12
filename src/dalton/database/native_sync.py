@@ -106,7 +106,7 @@ def _normalize_run_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     out = dict(row)
     out["run_id"] = str(out["run_id"])
-    # Same 5-minute staleness rule as OpenClaw runs (openclaw_sync._normalize_sync_row).
+    # A `running` row older than 5 minutes reads as `interrupted`.
     if out.get("status") == "running" and out.get("is_stale_running"):
         out["status"] = "interrupted"
     out.pop("is_stale_running", None)

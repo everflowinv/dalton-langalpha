@@ -327,12 +327,38 @@ async def _read_user_model_pref_key(
     return _filter_shadowed_by_custom_models(key, value, custom_set)
 
 
+def _without_models_missing_from_catalog(key: str, value: Any) -> Any:
+    """Drop saved model names that are not in the current system catalog.
+
+    ``model_resolves`` (availability) is the existing check. An empty preference
+    map asks only whether the name is a merged-manifest key, so a leftover
+    broker model is unset and resolution continues. When the manifest failed
+    to load, that function keeps every name. Non-model keys are unchanged.
+    """
+    if value is None or key not in (*DALTON_SINGLE_MODEL_KEYS, *DALTON_MODEL_LIST_KEYS):
+        return value
+    from src.server.services.llm.availability import model_resolves
+
+    if key in DALTON_SINGLE_MODEL_KEYS:
+        if isinstance(value, str) and model_resolves({}, value):
+            return value
+        logger.warning("Ignoring %s=%r: not in the system model catalog", key, value)
+        return None
+    if isinstance(value, list):
+        kept = [m for m in value if isinstance(m, str) and model_resolves({}, m)]
+        if len(kept) != len(value):
+            logger.warning("Ignoring catalog-missing entries in %s", key)
+        return kept or None
+    return None
+
+
 async def dalton_model_pref(user_id: str | None, key: str) -> Any:
     """Resolve a Dalton model preference with precedence: user -> first PM holder -> dalton.yaml.
 
     Every candidate (from user, PM holder, or yaml) is checked against the actual
     caller's (`user_id`) `custom_models` so a caller's custom model never shadows
-    a system model in `LLMService`.
+    a system model in `LLMService`. A user or PM model name that is not in the
+    current catalog is treated as unset, and resolution continues.
     """
     if key == DALTON_NOTIFY_ENABLED_KEY:
         return await resolve_dalton_notify_enabled(user_id)
@@ -350,20 +376,26 @@ async def dalton_model_pref(user_id: str | None, key: str) -> Any:
         own_mp = await _read_user_model_preference_map(uid)
         if own_mp is not None:
             caller_custom_set = _extract_custom_model_set(own_mp)
-            own_val = _filter_shadowed_by_custom_models(
+            own_val = _without_models_missing_from_catalog(
                 key,
-                _normalize_stored_value(key, own_mp.get(key)),
-                caller_custom_set,
+                _filter_shadowed_by_custom_models(
+                    key,
+                    _normalize_stored_value(key, own_mp.get(key)),
+                    caller_custom_set,
+                ),
             )
             if own_val is not None:
                 return own_val
 
     holder_id = (get_team_credential_holder_id() or "").strip()
     if holder_id and holder_id != uid:
-        holder_val = await _read_user_model_pref_key(
-            holder_id,
+        holder_val = _without_models_missing_from_catalog(
             key,
-            caller_custom_set=caller_custom_set if uid else None,
+            await _read_user_model_pref_key(
+                holder_id,
+                key,
+                caller_custom_set=caller_custom_set if uid else None,
+            ),
         )
         if holder_val is not None:
             return holder_val

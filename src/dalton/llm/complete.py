@@ -127,26 +127,6 @@ def resolve_model_billing_and_provider(model_key: str) -> tuple[str, str]:
     except Exception:
         pass
 
-    try:
-        overlay = load_overlay_data() or {}
-        models_map = overlay.get("models") or {}
-        mcfg = models_map.get(key)
-        if isinstance(mcfg, dict):
-            if (mcfg.get("dalton") or {}).get("billing") == "subscription":
-                return "oauth", "openclaw-broker"
-            ref = str(mcfg.get("model_id") or "")
-            prov_models = ((overlay.get("providers") or {}).get("models") or {}).get(
-                "openclaw-broker", []
-            )
-            for pm in prov_models:
-                if isinstance(pm, dict) and str(pm.get("id")) == ref:
-                    if (pm.get("pricing") or {}).get("pricing_type") == "subscription" or (
-                        pm.get("dalton") or {}
-                    ).get("billing") == "subscription":
-                        return "oauth", "openclaw-broker"
-    except Exception:
-        pass
-
     return "platform", _resolve_provider_for_model(key, "platform")
 
 
@@ -262,7 +242,7 @@ def compute_call_costs(
     is_sub = (
         billing_type == "oauth"
         or _is_subscription_model(model_key, billing_type)
-        or is_subscription_model(model_key, billing_type, overlay_loader=load_overlay_data)
+        or is_subscription_model(model_key, billing_type)
     )
     if is_sub:
         idx = build_notional_price_index(overlay_loader=load_overlay_data)

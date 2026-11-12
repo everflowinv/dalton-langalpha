@@ -75,7 +75,6 @@ _UNTOUCHED = (
     "src/llms/manifest/models.json",
     "src/llms/manifest/providers.json",
     "src/llms/manifest/task_costs.json",
-    "src/dalton/llm/openclaw_overlay.json",
     "tests/unit/llms/request_lock.json",
     "agent_config.yaml",
     "agent_config.dalton.yaml",

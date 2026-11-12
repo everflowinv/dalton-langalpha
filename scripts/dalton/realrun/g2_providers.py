@@ -458,15 +458,24 @@ def main() -> int:
                 f"/api/v1/dalton/knowledge/{sample_ws_id}/thesis/diff",
                 params={"from": 1, "to": 2},
             )
-            _, oc_health = _invoke_and_record("GET", "/api/v1/dalton/openclaw/health", "/api/v1/dalton/openclaw/health")
-            _invoke_and_record("GET", "/api/v1/dalton/openclaw/models/status", "/api/v1/dalton/openclaw/models/status")
-            st_sync, body_sync = _invoke_and_record(
-                "POST",
-                "/api/v1/dalton/openclaw/models/sync",
-                "/api/v1/dalton/openclaw/models/sync",
-                json_body={"dry_run": True},
+            _invoke_and_record("GET", "/api/v1/dalton/openclaw/health", "/api/v1/dalton/openclaw/health")
+            st_pm_gate, body_pm_gate = _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/diagnostics/browser-memory",
+                "/api/v1/dalton/diagnostics/browser-memory",
             )
-            assert st_sync == 200, f"Expected openclaw/models/sync dry_run to return 200, got {st_sync}: {body_sync}"
+            assert st_pm_gate == 200, (
+                f"Expected diagnostics/browser-memory to return 200 for PM, got {st_pm_gate}: {body_pm_gate}"
+            )
+            st_b_gate, body_b_gate = _invoke_and_record(
+                "GET",
+                "/api/v1/dalton/diagnostics/browser-memory",
+                "/api/v1/dalton/diagnostics/browser-memory",
+                as_user_b=True,
+            )
+            assert st_b_gate == 403, (
+                f"Expected diagnostics/browser-memory to return 403 for non-PM, got {st_b_gate}: {body_b_gate}"
+            )
             _invoke_and_record("GET", "/api/v1/dalton/providers/available-models", "/api/v1/dalton/providers/available-models")
             _, prov_status_body = _invoke_and_record(
                 "GET", "/api/v1/dalton/providers/status", "/api/v1/dalton/providers/status"

@@ -55,8 +55,6 @@ network:
     - "https://dns.google/resolve"
 
 models:
-  broker:
-    enabled: true            # OpenClaw broker v2 parallel path; false hides ocb-* from catalog
   disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
   # Single source of truth for Dalton auxiliary task (assist) model defaults
   # (agent_config.dalton.yaml no longer defines llm.assist).

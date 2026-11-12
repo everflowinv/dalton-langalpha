@@ -3,6 +3,9 @@
 版本 0.3，2026-10-18。基座：LangAlpha main `8e0dce94`，分支 `dalton/main`。对应蓝图 §3、§4.6、§4.7、§4.8、§4.10。
 
 **修订记录 v0.3（2026-10-18）**
+
+> **OC-5（2026-11-12）：** 修订记录里的 `ocb-<provider>-<model>` 模型键已移除。现行模型键是目录里的原生键；审稿家族仍由 `role_policy.family_of()` 判定。
+
 - **按 owner 原则做减法**：核验只在发布时卡一次，草稿永不被阻止。删除拦截写入的 `DaltonKnowledgeGuardMiddleware` 和 DRIFT 自动还原；FilePanel、Write、Bash 的直接修改一律放行，本轮结束后检测并记为 `direct_edit` 版本，不合 schema 时只给分析师警告（PK.5）。硬性不变量只留三条：证据台账只追加；`official`（正式 house view）只能由 `publish_report` 写；目标价必须指向模型单元格。其余改为警告或删除（PK.4）。总工时由约 44 人日降到约 31 人日。
 - **代码位置**统一到 `src/dalton/`（P0 的仓库卫生规则）：`src/dalton/{knowledge,publish,autonomy,database,tools,app}`；行为配置从 `config.yaml dalton:` 改到 `src/dalton/dalton.yaml`，经 `src/dalton/settings.py` 读取。路由并入 P0 的 `src/dalton/app/router.py`。
 - **迁移**改用 P0 定下的独立 Dalton 链（`alembic_version_dalton`）：074/075/076 改为 `d003_knowledge`、`d005_publications`、`d006_autonomy`；`d004_provenance_locator` 由 P0D-P1 §P0-D.3b 提供。Dalton 表不建指向上游表的外键，去掉级联删除和 `dalton.allow_cascade` 开关。

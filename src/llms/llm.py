@@ -1117,12 +1117,6 @@ class LLM:
             existing_mk = params.get("model_kwargs") or {}
             params["model_kwargs"] = {**existing_mk, "prompt_cache_key": cache_key}
 
-        # DALTON-HOOK(llm-broker-client): stable invocation ids for the Dalton broker's idempotency journal
-        if self.provider_info.get("dalton_broker"):
-            from src.dalton.llm.broker_http import broker_http_clients
-            params.setdefault("http_async_client", broker_http_clients().async_client)
-            params.setdefault("http_client", broker_http_clients().sync_client)
-
         self._hold_params_to_egress(params, "openai")
         return params
 

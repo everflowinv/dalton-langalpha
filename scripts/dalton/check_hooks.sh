@@ -25,7 +25,6 @@ done
 ALLOWED_HOOKS=(
   # P0 & P0N platform hooks
   "llm-overlay"
-  "llm-broker-client"
   "llm-sdk-dispatch"
   "oauth-dispatch"
   "provider-kill-switch"
@@ -317,7 +316,7 @@ ALLOWED_HOOKS=(
   # 发布指纹（部署变化 → 旧线程下一轮 due/rebuild）。Dalton 的 data_map 经
   # loader.py 的 data-map 钩子渲染进 system.md.j2 / tool_guide.md.j2，其渲染
   # 输入（data_map 的 __init__/builder/health/sources.yaml）由此 hook 登记进
-  # _sources()；运行时重新生成的 src/dalton/llm/openclaw_overlay.json 明确排除。
+  # _sources()。ocb-* broker overlay 已在 OC-5 删除，不再是提示词来源。
   "prompt-release-sources"
   # sync3 B9（上游 #656 电脑 CLI token）的部署级开关
   # dalton.computer_cli_tokens.enabled（默认 false）的三道拦截：cli_tokens.keep()
@@ -374,7 +373,6 @@ ALLOWED_HOOKS=(
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
 P0_REQUIRED_HOOKS=(
   "llm-overlay"
-  "llm-broker-client"
   "catalog-cache"
   "router"
   "budget-gate"

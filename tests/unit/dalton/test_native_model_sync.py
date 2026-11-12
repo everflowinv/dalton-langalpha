@@ -60,11 +60,11 @@ def _isolated_native_sync_overlay(tmp_path, monkeypatch):
     return path
 
 
-def test_overlay_sources_merge_order_places_native_sync_between_native_and_openclaw():
+def test_overlay_sources_merge_order_is_native_then_native_sync():
     from src.dalton.llm.overlay import OVERLAY_SOURCES
 
     names = [name for name, _path in OVERLAY_SOURCES]
-    assert names == ["native", "native_sync", "openclaw"]
+    assert names == ["native", "native_sync"]
 
 
 def test_native_sync_overlay_merges_models_and_dalton_meta(tmp_path, monkeypatch):
@@ -2157,19 +2157,6 @@ async def test_native_model_status_keeps_succeeded_diff_after_failed_check(monke
     assert [d["key"] for d in status["diff"]["deprecated"]] == ["grok-4.3-oauth"]
     assert status["providers"][0]["status"] == "ok"
     assert status["providers"][0]["provider"] == "xai-oauth"
-
-
-def test_openclaw_sync_run_queries_filter_by_source():
-    """OpenClaw status must not surface native runs (d012 `source` column)."""
-    import inspect
-
-    import src.dalton.database.native_sync as native_sync_db
-    import src.dalton.database.openclaw_sync as oc_sync_db
-
-    src = inspect.getsource(oc_sync_db.fetch_recent_sync_runs)
-    assert "source = 'openclaw'" in src
-    src_native = inspect.getsource(native_sync_db.fetch_recent_native_runs)
-    assert "source = 'native'" in src_native
 
 
 def test_native_run_queries_carry_and_exclude_kinds():

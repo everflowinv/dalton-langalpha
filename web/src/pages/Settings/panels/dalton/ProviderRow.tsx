@@ -161,7 +161,7 @@ export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
                 backgroundColor: 'var(--color-warning-soft)',
                 color: 'var(--color-warning)',
               }}
-              title="订阅直连模仿官方 CLI 请求头，存在被限流或封号风险；可随时切换至现金模型或 OpenClaw broker。"
+              title="订阅直连模仿官方 CLI 请求头，存在被限流或封号风险；可随时切换至现金模型。"
             >
               条款风险
             </span>

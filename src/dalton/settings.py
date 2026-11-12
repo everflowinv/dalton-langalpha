@@ -28,16 +28,9 @@ DALTON_YAML_PATH = Path(__file__).resolve().parent / "dalton.yaml"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class DaltonBrokerModelsConfig(BaseModel):
-    """OpenClaw broker v2 parallel model path configuration (P0N.1)."""
-
-    enabled: bool = True
-
-
 class DaltonModelsConfig(BaseModel):
     """Model provider switches and assist role defaults (P0N.1, P0N.8, L27)."""
 
-    broker: DaltonBrokerModelsConfig = Field(default_factory=DaltonBrokerModelsConfig)
     disabled_providers: list[str] = Field(default_factory=list)
     assist_model: str = ""
     assist_fallback_model: str | list[str] = Field(default_factory=list)
@@ -608,14 +601,6 @@ def is_dalton_supabase_auth_enabled() -> bool:
     return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "supabase"
 
 
-def is_broker_models_enabled() -> bool:
-    """Whether OpenClaw broker v2 (`ocb-*`) models are enabled in the catalog (P0N.1)."""
-    env_flag = os.getenv("DALTON_BROKER_ENABLED")
-    if env_flag is not None:
-        return env_flag.strip().lower() in ("1", "true", "yes")
-    return get_dalton_config().models.broker.enabled
-
-
 def get_disabled_providers() -> set[str]:
     """Return disabled provider IDs from `DALTON_DISABLED_PROVIDERS` or `dalton.yaml` (L17, P0N.8)."""
     env_raw = os.getenv("DALTON_DISABLED_PROVIDERS")
@@ -673,7 +658,12 @@ def log_dalton_startup_warnings() -> None:
 
 
 def get_dalton_broker_token() -> str:
-    """Return ``DALTON_BROKER_TOKEN`` from environment (empty string if unset)."""
+    """Return ``DALTON_BROKER_TOKEN`` from the environment (empty string if unset).
+
+    ``provider_events.sanitize_error_text`` uses this helper to redact the token.
+    The x_search bridge reads ``DALTON_BROKER_TOKEN`` and ``DALTON_BROKER_URL``
+    from the environment itself and does not call a settings helper.
+    """
     return os.getenv("DALTON_BROKER_TOKEN", "").strip()
 
 
@@ -697,15 +687,6 @@ def get_xai_grok_client_version() -> str:
     """Return the Grok CLI version sent as ``x-grok-client-version``."""
     raw = os.getenv("DALTON_XAI_GROK_CLIENT_VERSION", "").strip()
     return raw or DEFAULT_XAI_GROK_CLIENT_VERSION
-
-
-def get_dalton_broker_url(host: str | None = None) -> str:
-    """Return the resolved OpenClaw broker v2 base URL."""
-    resolved_host = host or HOST_IP
-    explicit = os.getenv("DALTON_BROKER_URL", "").strip()
-    if explicit:
-        return explicit.replace("{HOST_IP}", resolved_host).rstrip("/")
-    return f"http://{resolved_host}:18789/dalton-broker/v1"
 
 
 def get_dalton_researchdata_url() -> str:

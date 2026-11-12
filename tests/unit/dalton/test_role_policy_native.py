@@ -12,8 +12,8 @@ from src.dalton.llm.role_policy import (
 )
 
 
-def test_family_of_native_and_broker_models():
-    """P0N.5 L20: family_of resolves underlying model family regardless of hosting provider."""
+def test_family_of_native_models():
+    """P0N.5 L20: family_of resolves the underlying vendor family from the model id."""
     assert family_of("claude-opus-5-5-oauth") == "anthropic-claude"
     assert family_of("claude-opus-5-5-high-oauth") == "anthropic-claude"
     assert family_of("claude-sonnet-5-5-thinking-low-oauth") == "anthropic-claude"
@@ -30,8 +30,6 @@ def test_family_of_native_and_broker_models():
     assert family_of("kimi-k2-thinking") == "moonshot-kimi"
     assert family_of("qwen3-max") == "alibaba-qwen"
     assert family_of("minimax-m2") == "minimax"
-    assert family_of("ocb-xai-grok-4.7") == "xai-grok"
-    assert family_of("ocb-openai-gpt-6.1-sol") == "openai-gpt"
 
 
 @pytest.mark.asyncio
@@ -173,9 +171,9 @@ def test_default_role_config_has_zero_warnings():
         },
         "subagents": {
             "definitions": {
-                "research": {"model": "ocb-xai-grok-4.7"},
-                "data-prep": {"model": "ocb-xai-grok-4.7"},
-                "general-purpose": {"model": "ocb-xai-grok-4.7"},
+                "research": {"model": "grok-4.7"},
+                "data-prep": {"model": "grok-4.7"},
+                "general-purpose": {"model": "grok-4.7"},
             }
         },
     }
@@ -215,7 +213,6 @@ def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
                 "gemini-4-argon-medium-oauth",  # publish.audit_model
                 "gpt-6.1-sol-oauth",
                 "deepseek-flash",
-                "ocb-deepseek-deepseek-flash",
                 model_key,
             },
         ) == []

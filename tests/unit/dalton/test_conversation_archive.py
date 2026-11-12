@@ -904,7 +904,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
             "state": "done",
             "response": latest_resp,
             "model_key": "gemini-4-argon-medium-oauth",
-            "provider": "openclaw-broker",
+            "provider": "antigravity-oauth",
             "billing_type": "oauth",
             "usage": {"input_tokens": 120, "output_tokens": 60},
             "notional_usd": "0.001",

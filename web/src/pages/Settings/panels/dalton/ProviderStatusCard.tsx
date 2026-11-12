@@ -8,20 +8,16 @@ import {
 } from 'lucide-react';
 import { useProviderStatus } from '../../hooks/useProviderStatus';
 import { ProviderRow } from './ProviderRow';
-import { OpenClawCard } from './OpenClawCard';
 import { NativeModelsCard } from './NativeModelsCard';
 
 export function ProviderStatusCard() {
   const { t } = useTranslation();
   const statusQuery = useProviderStatus(true);
-  const [brokerExpanded, setBrokerExpanded] = useState(false);
   const [nativeModelsExpanded, setNativeModelsExpanded] = useState(false);
 
   const data = statusQuery.data;
   const providers = data?.providers ?? [];
   const roleWarnings = data?.role_warnings ?? [];
-  const brokerEnabled = data?.broker?.enabled ?? true;
-  const brokerHealth = data?.broker?.health;
 
   // Summarize active role models from used_by_roles
   const roleSummary: string[] = [];
@@ -32,13 +28,6 @@ export function ProviderStatusCard() {
       }
     }
   }
-
-  const brokerDotColor =
-    brokerHealth?.status === 'ok'
-      ? 'var(--color-profit)'
-      : brokerHealth?.status === 'degraded'
-        ? 'var(--color-warning)'
-        : 'var(--color-loss)';
 
   return (
     <div
@@ -114,40 +103,6 @@ export function ProviderStatusCard() {
           <ProviderRow key={item.provider} item={item} />
         ))}
       </div>
-
-      {/* Collapsible OpenClaw broker parallel path section */}
-      {brokerEnabled && (
-        <div
-          className="pt-2.5 mt-1"
-          style={{ borderTop: '1px solid var(--color-border-muted)' }}
-        >
-          <button
-            type="button"
-            onClick={() => setBrokerExpanded((v) => !v)}
-            className="flex items-center gap-2 text-xs font-medium w-full text-left"
-            style={{ color: 'var(--color-text-secondary)' }}
-            data-testid="dalton-broker-section-toggle"
-          >
-            {brokerExpanded ? (
-              <ChevronDown className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
-            <span
-              className="inline-block h-2 w-2 rounded-full"
-              style={{ backgroundColor: brokerDotColor }}
-            />
-            <span>
-              {t('dalton.providers.brokerSectionTitle', 'OpenClaw broker（并行路径）')}
-            </span>
-          </button>
-          {brokerExpanded && (
-            <div className="mt-2.5">
-              <OpenClawCard embedded />
-            </div>
-          )}
-        </div>
-      )}
 
       {/* Native-subscription model sync card (check → confirm → add-only runtime overlay) */}
       <div

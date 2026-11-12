@@ -3,7 +3,7 @@
 Product decision 6 (roadmap §6): only the official Claude / OpenAI API lines
 keep upstream's default (native compaction on). Every line Dalton operates or
 relays itself — the Claude-Code OAuth subscription route, Antigravity, Muse,
-xAI/Grok OAuth, the GLM coding-plan route, and the broker that fronts them —
+xAI/Grok OAuth, and the GLM coding-plan route —
 is off until its real capability is proven, exactly because the gate upstream
 reads (SDK family + official host + beta) says nothing about whether *our*
 credential's endpoint serves the signed-summary protocol this build relies on.
@@ -40,8 +40,6 @@ NATIVE_COMPACTION_OFF_PROVIDERS = frozenset(
         # variant matches no sdk branch and api.x.ai is not an official host;
         # an upstream relaxation of either would turn it on silently.
         "grok-oauth",
-        # OpenClaw broker gateway.
-        "openclaw-broker",
         # GLM coding-plan subscription routes (Anthropic-compatible wire).
         "z-ai-coding",
         "z-ai-cn-coding",

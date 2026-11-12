@@ -391,11 +391,9 @@ export const queryKeys = {
     // Today's market-wide brief, as markdown for the agent.
     marketBrief: () => [...queryKeys.insights.all, 'market-brief'],
   },
-  // DALTON-HOOK(query-keys): Dalton OpenClaw sync, native-model sync, budget, and coverage board query keys
+  // DALTON-HOOK(query-keys): Dalton native-model sync, budget, and coverage board query keys
   dalton: {
     all:             ['dalton'],
-    openclawStatus:  () => [...queryKeys.dalton.all, 'openclaw', 'status'],
-    openclawHealth:  () => [...queryKeys.dalton.all, 'openclaw', 'health'],
     nativeModelsStatus: () => [...queryKeys.dalton.all, 'native-models', 'status'],
     providersStatus: () => [...queryKeys.dalton.all, 'providers', 'status'],
     modelsAvailable: () => [...queryKeys.dalton.all, 'models', 'available'],

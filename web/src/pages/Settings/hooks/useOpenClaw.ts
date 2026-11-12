@@ -6,50 +6,15 @@ import {
   fetchDaltonBudget,
   fetchDaltonBudgetToday,
   fetchNativeModelsStatus,
-  fetchOpenClawHealth,
-  fetchOpenClawStatus,
   restoreNativeModels,
   retireNativeModels,
   syncNativeModels,
   fetchDaltonSystemJobs,
   runDaltonSystemJobNow,
-  syncOpenClawModels,
   toggleDaltonSystemJob,
   updateDaltonBudget,
   upsertDaltonTaskCap,
 } from '../utils/daltonApi';
-
-export function useOpenClawStatus(enabled = true) {
-  return useQuery({
-    queryKey: queryKeys.dalton.openclawStatus(),
-    queryFn: fetchOpenClawStatus,
-    enabled,
-    staleTime: 30_000,
-  });
-}
-
-export function useOpenClawHealth(enabled = true) {
-  return useQuery({
-    queryKey: queryKeys.dalton.openclawHealth(),
-    queryFn: fetchOpenClawHealth,
-    enabled,
-    refetchInterval: enabled ? 60_000 : false,
-    staleTime: 15_000,
-  });
-}
-
-export function useOpenClawSync() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (params: { dry_run: boolean; force?: boolean }) => syncOpenClawModels(params),
-    onSuccess: (res) => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.all });
-      if (res.applied) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
-      }
-    },
-  });
-}
 
 // Native-subscription model sync: status is a plain read of the last stored
 // check — opening the settings page never triggers a provider fetch.

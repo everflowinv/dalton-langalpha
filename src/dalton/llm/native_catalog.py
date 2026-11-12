@@ -27,17 +27,78 @@ from typing import Any
 import httpx
 
 from src.dalton.database.provider_events import sanitize_error_text
-from src.dalton.llm.openclaw_catalog import (
-    _REASONING_LEVEL_MAP,
-    _normalize_reasoning_efforts,
-    REPO_ROOT,
-    assert_no_credentials,
-    infer_family_from_model_id,
-)
+from src.dalton.llm.model_family import infer_family_from_model_id
 
 logger = logging.getLogger(__name__)
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 NATIVE_SYNC_OVERLAY_PATH = REPO_ROOT / "var" / "dalton" / "catalog" / "native_sync_overlay.json"
+
+_FORBIDDEN_CREDENTIAL_KEYS = frozenset(
+    {
+        "apiKey",
+        "api_key",
+        "headers",
+        "auth",
+        "token",
+        "secret",
+        "password",
+        "credentials",
+        "bearer",
+    }
+)
+
+# Upstream reasoning-level spellings → catalog effort names.
+_REASONING_LEVEL_MAP: dict[str, str] = {
+    "off": "none",
+    "none": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+
+def _normalize_reasoning_efforts(levels: list[str] | None) -> list[str]:
+    if not levels:
+        return ["low", "medium", "high"]
+    seen: list[str] = []
+    for lv in levels:
+        mapped = _REASONING_LEVEL_MAP.get(str(lv).lower())
+        if mapped and mapped not in seen:
+            seen.append(mapped)
+    return seen or ["low", "medium", "high"]
+
+
+def assert_no_credentials(obj: Any, path: str = "root") -> None:
+    """Raise ValueError if any forbidden credential key appears anywhere in obj."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k) in _FORBIDDEN_CREDENTIAL_KEYS:
+                raise ValueError(f"Forbidden credential field {k!r} at {path}")
+            assert_no_credentials(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            assert_no_credentials(item, f"{path}[{i}]")
+
+
+def load_upstream_bare_pricing() -> dict[str, dict[str, Any]]:
+    """Load fallback pricing by bare model id from upstream providers.json."""
+    providers_path = REPO_ROOT / "src" / "llms" / "manifest" / "providers.json"
+    if not providers_path.exists():
+        return {}
+    data = json.loads(providers_path.read_text(encoding="utf-8"))
+    models_by_provider = data.get("models") or {}
+    out: dict[str, dict[str, Any]] = {}
+    for _prov, items in models_by_provider.items():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict) and item.get("id") and isinstance(item.get("pricing"), dict):
+                out.setdefault(str(item["id"]), copy.deepcopy(item["pricing"]))
+    return out
 NATIVE_SYNC_OVERLAY_SCHEMA = "dalton-native-sync-overlay/1"
 
 FETCH_TIMEOUT_S = 15.0
@@ -607,7 +668,6 @@ class _ProviderProfile:
 def _known_cash_model_ids() -> frozenset[str]:
     """Bare model ids that carry a cash price card (providers.json + native overlay)."""
     from src.dalton.llm.overlay import NATIVE_OVERLAY_PATH, load_overlay_data
-    from src.dalton.llm.openclaw_catalog import load_upstream_bare_pricing
 
     ids = set(load_upstream_bare_pricing())
     native = load_overlay_data(NATIVE_OVERLAY_PATH) or {}

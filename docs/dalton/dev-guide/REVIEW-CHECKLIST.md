@@ -54,9 +54,11 @@ git diff --name-only 8e0dce94 HEAD --diff-filter=M | grep -v '^docs/'   # 被改
 
 ## 2. 分模块检查
 
-### R1 broker v2 与模型清单（优先级：高）
+### R1 broker v2 与模型清单（OC-5 已移除，不再作为现行检查）
 
-**范围：**
+> **OC-5（2026-11-12）：** `ocb-*` 对话模型已从目录删除，随之一起删除的有 `broker_http.py`、`openclaw_catalog.py`、`openclaw_overlay.json`、`openclaw_overrides.yaml`、`sync_openclaw_models.py`、`openclaw_smoke.py`。下面关于 broker 对话模型、overlay 合并和模型同步脚本的检查项不再执行。`role_policy.family_of` 仍用于目录里的原生模型。OpenClaw 网关插件保留，用于 x_search，不在这里审查。
+
+**范围（历史，对照当时的代码）：**
 - `integrations/openclaw/dalton-langalpha-broker/**`
 - `scripts/dalton/install_broker_v2.sh`、`scripts/dalton/broker_spike_client.py`
 - `src/dalton/llm/{broker_http.py, openclaw_catalog.py, overlay.py, openclaw_overlay.json, openclaw_overrides.yaml, role_policy.py}`
@@ -342,7 +344,7 @@ lead 汇总 7 份结果，把需要修的问题转成修正任务，放进 `P0F-
 1. **R2 预算**：钱
 2. **R4 知识层与发布**：正式成果的可信度
 3. **R6 原生供应商**：账号安全
-4. **R1 broker**
+4. **R1 broker 对话模型** — OC-5 已移除，跳过
 5. **R3 数据**
 6. **R7 skill 和 workflow**
 7. **R5 自主议程**

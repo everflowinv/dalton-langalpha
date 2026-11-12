@@ -140,6 +140,8 @@ Dalton 服务层（新建，在 LangAlpha 后端内）
 
 ### 4.3 模型接入：复用 OpenClaw 的模型列表
 
+> **OC-5（2026-11-12）：** 这一节规划的 OpenClaw 对话模型路径（含 `scripts/sync_openclaw_models.py`）已移除。现行对话模型是 LangAlpha 原生订阅和现金 API。OpenClaw 仍提供 researchdata、x_search 和飞书通道。
+
 **现状：**
 - 旧 Dalton 通过一个专属 broker（Unix socket，HMAC 认证）调用 OpenClaw 模型。它带调用日志、只读重放和"不重复付费"，但只支持单条 prompt 进、整段文本出，不支持流式，也不支持工具调用。
 - LangAlpha 的智能体必须用原生工具调用和流式输出，所以 broker 不能作为主路径。

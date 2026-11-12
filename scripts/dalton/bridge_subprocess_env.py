@@ -621,7 +621,6 @@ def _load_catalog_maps(
     for overlay_rel in (
         Path("src/dalton/llm/native_overlay.json"),
         Path("var/dalton/catalog/native_sync_overlay.json"),
-        Path("src/dalton/llm/openclaw_overlay.json"),
     ):
         ov = _read_json_dict(root / overlay_rel)
         ov_providers = ov.get("providers")
@@ -641,8 +640,6 @@ def _infer_provider_from_model_name(model: str) -> str | None:
     if not m:
         return None
     lower = m.lower()
-    if lower.startswith("ocb-"):
-        return "openclaw-broker"
     if lower == "grok-oauth" or (lower.startswith("grok-") and lower.endswith("-oauth")):
         return "xai-oauth"
     if lower.endswith("-oauth"):
@@ -709,7 +706,7 @@ def resolve_provider_env_keys_for_models(
             allowed.update(XAI_OAUTH_ALLOWED_ENV_KEYS)
             required.update(XAI_OAUTH_REQUIRED_ENV_KEYS)
             continue
-        if provider == "openclaw-broker" or provider.endswith("-oauth") or provider == "oauth":
+        if provider.endswith("-oauth") or provider == "oauth":
             continue
         p_meta = provider_info.get(provider) or {}
         env_key = p_meta.get("env_key")
