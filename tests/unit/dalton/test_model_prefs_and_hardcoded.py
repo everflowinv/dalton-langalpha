@@ -41,6 +41,12 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entries on grok-oauth).
     ("llm/overlay.py", "grok-4.7-oauth"): "Pinned overlay route key",
     ("llm/overlay.py", "grok-4.3-oauth"): "Pinned overlay route key",
+    # OC-5 search tools: the upstream search models mirror OpenClaw's own settings
+    # (tools.web.search via Gemini API, xSearch.model); they are tool backends,
+    # not conversation model selection. web_search.model in agent_config overrides.
+    ("web_search/gemini_grounding.py", "gemini-2.5-flash"): "Default Gemini grounding search model (OpenClaw parity)",
+    ("web_search/x_search_direct.py", "grok-4.3"): "x_search backend model (OpenClaw xSearch.model parity)",
+    ("web_search/x_search_direct.py", "xai-oauth"): "OAuth provider ID for the admin x_search token",
     # Provider IDs (OAuth and API providers)
     ("app/oauth.py", "antigravity-oauth"): "OAuth provider identifier in router table",
     ("app/oauth.py", "claude-oauth"): "OAuth provider identifier in router table",
