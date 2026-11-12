@@ -1,0 +1,2017 @@
+{
+ "meta": {
+  "version": "1.0",
+  "built_at": "2026-08-16",
+  "scope": "US + Japan listed consumer companies; auto manufacturers excluded",
+  "price_source": "Yahoo Finance via yfinance (auto_adjust=False)",
+  "name_source": "yfinance longName/shortName at build time",
+  "benchmarks": {
+   "US": "^GSPC",
+   "JP": "^N225"
+  },
+  "count": 209,
+  "market_counts": {
+   "US": 133,
+   "JP": 76
+  },
+  "subsector_counts": {
+   "apparel_footwear": 16,
+   "beauty_personal": 9,
+   "beer_spirits": 9,
+   "coffee_tea": 3,
+   "dairy": 5,
+   "drugstore_conv": 9,
+   "ecommerce": 9,
+   "home_durables": 10,
+   "household_products": 11,
+   "leisure_gaming": 11,
+   "mass_retail": 11,
+   "packaged_food": 18,
+   "pet": 3,
+   "restaurants_casual": 11,
+   "restaurants_qsr": 14,
+   "snacks_confection": 7,
+   "soft_drinks": 8,
+   "specialty_retail": 9,
+   "sportswear": 11,
+   "tobacco": 4,
+   "toys_ip": 7,
+   "travel_lodging": 14
+  },
+  "dropped_at_build": [
+   "3141.T",
+   "3593.T",
+   "4921.T",
+   "8028.T",
+   "8114.T",
+   "FL",
+   "KLG",
+   "SKX",
+   "VSCO"
+  ],
+  "dropped_reason": "no daily price data returned at build time; not re-listed under a verified alternate ticker",
+  "name_zh_source": "人工建表：仅填中文财经媒体与卖方研报固定使用的译名，其余为 null，检索时回退英文名",
+  "name_ja_source": "JPX 上場銘柄一覧 data_j.xls（2026-07-31 版）銘柄名，NFKC 归一",
+  "name_zh_count": 125,
+  "name_ja_count": 76
+ },
+ "companies": [
+  {
+   "ticker": "7453.T",
+   "market": "JP",
+   "name": "Ryohin Keikaku Co., Ltd.",
+   "subsector": "apparel_footwear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 15.11,
+   "name_zh": "良品计画",
+   "name_ja": "良品計画"
+  },
+  {
+   "ticker": "8227.T",
+   "market": "JP",
+   "name": "SHIMAMURA Co., Ltd.",
+   "subsector": "apparel_footwear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 4.53,
+   "name_zh": "岛村",
+   "name_ja": "しまむら"
+  },
+  {
+   "ticker": "9983.T",
+   "market": "JP",
+   "name": "Fast Retailing Co., Ltd.",
+   "subsector": "apparel_footwear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 151.23,
+   "name_zh": "迅销",
+   "name_ja": "ファーストリテイリング"
+  },
+  {
+   "ticker": "AEO",
+   "market": "US",
+   "name": "American Eagle Outfitters, Inc.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": null
+  },
+  {
+   "ticker": "ANF",
+   "market": "US",
+   "name": "Abercrombie & Fitch Co.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 4.8,
+   "name_zh": null
+  },
+  {
+   "ticker": "BIRK",
+   "market": "US",
+   "name": "Birkenstock Holding plc",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 7.0,
+   "name_zh": "勃肯"
+  },
+  {
+   "ticker": "BURL",
+   "market": "US",
+   "name": "Burlington Stores, Inc.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 21.88,
+   "name_zh": null
+  },
+  {
+   "ticker": "CPRI",
+   "market": "US",
+   "name": "Capri Holdings Limited",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.76,
+   "name_zh": "卡普里控股"
+  },
+  {
+   "ticker": "GAP",
+   "market": "US",
+   "name": "Gap, Inc. (The)",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "盖璞"
+  },
+  {
+   "ticker": "LEVI",
+   "market": "US",
+   "name": "Levi Strauss & Co.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 8.68,
+   "name_zh": "李维斯"
+  },
+  {
+   "ticker": "PVH",
+   "market": "US",
+   "name": "PVH Corp.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": null
+  },
+  {
+   "ticker": "RL",
+   "market": "US",
+   "name": "Ralph Lauren Corporation",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 23.17,
+   "name_zh": "拉夫劳伦"
+  },
+  {
+   "ticker": "ROST",
+   "market": "US",
+   "name": "Ross Stores, Inc.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 78.71,
+   "name_zh": null
+  },
+  {
+   "ticker": "TJX",
+   "market": "US",
+   "name": "The TJX Companies, Inc.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 168.04,
+   "name_zh": null
+  },
+  {
+   "ticker": "TPR",
+   "market": "US",
+   "name": "Tapestry, Inc.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 26.06,
+   "name_zh": "泰佩思琦"
+  },
+  {
+   "ticker": "URBN",
+   "market": "US",
+   "name": "Urban Outfitters, Inc.",
+   "subsector": "apparel_footwear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 6.66,
+   "name_zh": null
+  },
+  {
+   "ticker": "4452.T",
+   "market": "JP",
+   "name": "Kao Corporation",
+   "subsector": "beauty_personal",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 20.48,
+   "name_zh": "花王",
+   "name_ja": "花王"
+  },
+  {
+   "ticker": "4911.T",
+   "market": "JP",
+   "name": "Shiseido Company, Limited",
+   "subsector": "beauty_personal",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 9.1,
+   "name_zh": "资生堂",
+   "name_ja": "資生堂"
+  },
+  {
+   "ticker": "4922.T",
+   "market": "JP",
+   "name": "KOSE Holdings Corporation",
+   "subsector": "beauty_personal",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.11,
+   "name_zh": "高丝",
+   "name_ja": "コーセーホールディングス"
+  },
+  {
+   "ticker": "4927.T",
+   "market": "JP",
+   "name": "Pola Orbis Holdings Inc.",
+   "subsector": "beauty_personal",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.99,
+   "name_zh": "宝丽奥蜜思",
+   "name_ja": "ポーラ・オルビスホールディングス"
+  },
+  {
+   "ticker": "4928.T",
+   "market": "JP",
+   "name": "Noevir Holdings Co., Ltd.",
+   "subsector": "beauty_personal",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.05,
+   "name_zh": null,
+   "name_ja": "ノエビアホールディングス"
+  },
+  {
+   "ticker": "COTY",
+   "market": "US",
+   "name": "Coty Inc.",
+   "subsector": "beauty_personal",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.51,
+   "name_zh": "科蒂"
+  },
+  {
+   "ticker": "EL",
+   "market": "US",
+   "name": "Estee Lauder Companies, Inc. (T",
+   "subsector": "beauty_personal",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "雅诗兰黛"
+  },
+  {
+   "ticker": "ELF",
+   "market": "US",
+   "name": "e.l.f. Beauty, Inc.",
+   "subsector": "beauty_personal",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 5.4,
+   "name_zh": null
+  },
+  {
+   "ticker": "IPAR",
+   "market": "US",
+   "name": "Interparfums, Inc.",
+   "subsector": "beauty_personal",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.67,
+   "name_zh": null
+  },
+  {
+   "ticker": "2501.T",
+   "market": "JP",
+   "name": "Sapporo Breweries Limited",
+   "subsector": "beer_spirits",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 5.1,
+   "name_zh": "札幌啤酒",
+   "name_ja": "サッポロビール"
+  },
+  {
+   "ticker": "2502.T",
+   "market": "JP",
+   "name": "Asahi Group Holdings, Ltd.",
+   "subsector": "beer_spirits",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 15.97,
+   "name_zh": "朝日集团",
+   "name_ja": "アサヒグループホールディングス"
+  },
+  {
+   "ticker": "2503.T",
+   "market": "JP",
+   "name": "Kirin Holdings Company, Limited",
+   "subsector": "beer_spirits",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 15.66,
+   "name_zh": "麒麟控股",
+   "name_ja": "キリンホールディングス"
+  },
+  {
+   "ticker": "2531.T",
+   "market": "JP",
+   "name": "Takara Holdings Inc.",
+   "subsector": "beer_spirits",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.61,
+   "name_zh": null,
+   "name_ja": "宝ホールディングス"
+  },
+  {
+   "ticker": "2587.T",
+   "market": "JP",
+   "name": "Suntory Beverage & Food Limited",
+   "subsector": "beer_spirits",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 9.15,
+   "name_zh": "三得利饮料食品",
+   "name_ja": "サントリービバレッジ&フード"
+  },
+  {
+   "ticker": "BF-B",
+   "market": "US",
+   "name": "Brown-Forman Corporation",
+   "subsector": "beer_spirits",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 13.04,
+   "name_zh": "百富门"
+  },
+  {
+   "ticker": "SAM",
+   "market": "US",
+   "name": "The Boston Beer Company, Inc.",
+   "subsector": "beer_spirits",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.91,
+   "name_zh": "波士顿啤酒"
+  },
+  {
+   "ticker": "STZ",
+   "market": "US",
+   "name": "Constellation Brands, Inc.",
+   "subsector": "beer_spirits",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 23.77,
+   "name_zh": "星座品牌"
+  },
+  {
+   "ticker": "TAP",
+   "market": "US",
+   "name": "Molson Coors Beverage Company",
+   "subsector": "beer_spirits",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 7.97,
+   "name_zh": "莫尔森康胜"
+  },
+  {
+   "ticker": "3087.T",
+   "market": "JP",
+   "name": "DOUTOR NICHIRES Holdings Co., Ltd.",
+   "subsector": "coffee_tea",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 0.86,
+   "name_zh": null,
+   "name_ja": "ドトール・日レスホールディングス"
+  },
+  {
+   "ticker": "DNUT",
+   "market": "US",
+   "name": "Krispy Kreme, Inc.",
+   "subsector": "coffee_tea",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.58,
+   "name_zh": null
+  },
+  {
+   "ticker": "SBUX",
+   "market": "US",
+   "name": "Starbucks Corporation",
+   "subsector": "coffee_tea",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 122.77,
+   "name_zh": "星巴克"
+  },
+  {
+   "ticker": "2264.T",
+   "market": "JP",
+   "name": "Morinaga Milk Industry Co., Ltd.",
+   "subsector": "dairy",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.46,
+   "name_zh": "森永乳业",
+   "name_ja": "森永乳業"
+  },
+  {
+   "ticker": "2266.T",
+   "market": "JP",
+   "name": "Rokko Butter Co., Ltd.",
+   "subsector": "dairy",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 0.13,
+   "name_zh": null,
+   "name_ja": "六甲バター"
+  },
+  {
+   "ticker": "2269.T",
+   "market": "JP",
+   "name": "Meiji Holdings Co., Ltd.",
+   "subsector": "dairy",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 7.38,
+   "name_zh": "明治控股",
+   "name_ja": "明治ホールディングス"
+  },
+  {
+   "ticker": "2270.T",
+   "market": "JP",
+   "name": "MEGMILK SNOW BRAND Co.,Ltd.",
+   "subsector": "dairy",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.43,
+   "name_zh": "雪印梅高乳业",
+   "name_ja": "雪印メグミルク"
+  },
+  {
+   "ticker": "LWAY",
+   "market": "US",
+   "name": "Lifeway Foods, Inc.",
+   "subsector": "dairy",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.39,
+   "name_zh": null
+  },
+  {
+   "ticker": "3088.T",
+   "market": "JP",
+   "name": "MatsukiyoCocokara & Co.",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 6.29,
+   "name_zh": "松本清",
+   "name_ja": "マツキヨココカラ&カンパニー"
+  },
+  {
+   "ticker": "3148.T",
+   "market": "JP",
+   "name": "Create SD Holdings Co., Ltd.",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.39,
+   "name_zh": null,
+   "name_ja": "クリエイトSDホールディングス"
+  },
+  {
+   "ticker": "3349.T",
+   "market": "JP",
+   "name": "COSMOS Pharmaceutical Corporation",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.31,
+   "name_zh": null,
+   "name_ja": "コスモス薬品"
+  },
+  {
+   "ticker": "3391.T",
+   "market": "JP",
+   "name": "Tsuruha Holdings Inc.",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 6.98,
+   "name_zh": "鹤羽控股",
+   "name_ja": "ツルハホールディングス"
+  },
+  {
+   "ticker": "3549.T",
+   "market": "JP",
+   "name": "Kusuri No Aoki Holdings Co., Ltd.",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.46,
+   "name_zh": null,
+   "name_ja": "クスリのアオキホールディングス"
+  },
+  {
+   "ticker": "7649.T",
+   "market": "JP",
+   "name": "Sugi Holdings Co.,Ltd.",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.35,
+   "name_zh": null,
+   "name_ja": "スギホールディングス"
+  },
+  {
+   "ticker": "9989.T",
+   "market": "JP",
+   "name": "Sundrug Co.,Ltd.",
+   "subsector": "drugstore_conv",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.78,
+   "name_zh": null,
+   "name_ja": "サンドラッグ"
+  },
+  {
+   "ticker": "CASY",
+   "market": "US",
+   "name": "Casey's General Stores, Inc.",
+   "subsector": "drugstore_conv",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 31.32,
+   "name_zh": null
+  },
+  {
+   "ticker": "MUSA",
+   "market": "US",
+   "name": "Murphy USA Inc.",
+   "subsector": "drugstore_conv",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 10.46,
+   "name_zh": null
+  },
+  {
+   "ticker": "3092.T",
+   "market": "JP",
+   "name": "ZOZO, Inc.",
+   "subsector": "ecommerce",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 6.38,
+   "name_zh": null,
+   "name_ja": "ZOZO"
+  },
+  {
+   "ticker": "4385.T",
+   "market": "JP",
+   "name": "Mercari, Inc.",
+   "subsector": "ecommerce",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 5.17,
+   "name_zh": null,
+   "name_ja": "メルカリ"
+  },
+  {
+   "ticker": "4755.T",
+   "market": "JP",
+   "name": "Rakuten Group, Inc.",
+   "subsector": "ecommerce",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 10.91,
+   "name_zh": "乐天集团",
+   "name_ja": "楽天グループ"
+  },
+  {
+   "ticker": "AMZN",
+   "market": "US",
+   "name": "Amazon.com, Inc.",
+   "subsector": "ecommerce",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2833.03,
+   "name_zh": "亚马逊"
+  },
+  {
+   "ticker": "CHWY",
+   "market": "US",
+   "name": "Chewy, Inc.",
+   "subsector": "ecommerce",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 9.18,
+   "name_zh": null
+  },
+  {
+   "ticker": "DASH",
+   "market": "US",
+   "name": "DoorDash, Inc.",
+   "subsector": "ecommerce",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 94.56,
+   "name_zh": null
+  },
+  {
+   "ticker": "EBAY",
+   "market": "US",
+   "name": "eBay Inc.",
+   "subsector": "ecommerce",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 45.9,
+   "name_zh": null
+  },
+  {
+   "ticker": "ETSY",
+   "market": "US",
+   "name": "Etsy, Inc.",
+   "subsector": "ecommerce",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 7.33,
+   "name_zh": null
+  },
+  {
+   "ticker": "W",
+   "market": "US",
+   "name": "Wayfair Inc.",
+   "subsector": "ecommerce",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 13.92,
+   "name_zh": null
+  },
+  {
+   "ticker": "5947.T",
+   "market": "JP",
+   "name": "Rinnai Corporation",
+   "subsector": "home_durables",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.23,
+   "name_zh": "林内",
+   "name_ja": "リンナイ"
+  },
+  {
+   "ticker": "7965.T",
+   "market": "JP",
+   "name": "Zojirushi Corporation",
+   "subsector": "home_durables",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 0.6,
+   "name_zh": "象印",
+   "name_ja": "象印マホービン"
+  },
+  {
+   "ticker": "9843.T",
+   "market": "JP",
+   "name": "Nitori Holdings Co., Ltd.",
+   "subsector": "home_durables",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 10.78,
+   "name_zh": "宜得利",
+   "name_ja": "ニトリホールディングス"
+  },
+  {
+   "ticker": "ARHS",
+   "market": "US",
+   "name": "Arhaus, Inc.",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.39,
+   "name_zh": null
+  },
+  {
+   "ticker": "HELE",
+   "market": "US",
+   "name": "Helen of Troy Limited",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.7,
+   "name_zh": null
+  },
+  {
+   "ticker": "LZB",
+   "market": "US",
+   "name": "La-Z-Boy Incorporated",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.67,
+   "name_zh": null
+  },
+  {
+   "ticker": "RH",
+   "market": "US",
+   "name": "RH",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.44,
+   "name_zh": null
+  },
+  {
+   "ticker": "SGI",
+   "market": "US",
+   "name": "Somnigroup International Inc.",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 13.9,
+   "name_zh": null
+  },
+  {
+   "ticker": "WHR",
+   "market": "US",
+   "name": "Whirlpool Corporation",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.7,
+   "name_zh": "惠而浦"
+  },
+  {
+   "ticker": "WSM",
+   "market": "US",
+   "name": "Williams-Sonoma, Inc.",
+   "subsector": "home_durables",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 28.45,
+   "name_zh": null
+  },
+  {
+   "ticker": "4912.T",
+   "market": "JP",
+   "name": "Lion Corporation",
+   "subsector": "household_products",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.39,
+   "name_zh": "狮王",
+   "name_ja": "ライオン"
+  },
+  {
+   "ticker": "4967.T",
+   "market": "JP",
+   "name": "Kobayashi Pharmaceutical Co., Ltd.",
+   "subsector": "household_products",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.64,
+   "name_zh": "小林制药",
+   "name_ja": "小林製薬"
+  },
+  {
+   "ticker": "7956.T",
+   "market": "JP",
+   "name": "Pigeon Corporation",
+   "subsector": "household_products",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.65,
+   "name_zh": "贝亲",
+   "name_ja": "ピジョン"
+  },
+  {
+   "ticker": "8113.T",
+   "market": "JP",
+   "name": "Unicharm Corporation",
+   "subsector": "household_products",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 10.87,
+   "name_zh": "尤妮佳",
+   "name_ja": "ユニ・チャーム"
+  },
+  {
+   "ticker": "CHD",
+   "market": "US",
+   "name": "Church & Dwight Company, Inc.",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 24.03,
+   "name_zh": null
+  },
+  {
+   "ticker": "CL",
+   "market": "US",
+   "name": "Colgate-Palmolive Company",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 73.3,
+   "name_zh": "高露洁棕榈"
+  },
+  {
+   "ticker": "CLX",
+   "market": "US",
+   "name": "Clorox Company (The)",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 12.78,
+   "name_zh": "高乐氏"
+  },
+  {
+   "ticker": "ENR",
+   "market": "US",
+   "name": "Energizer Holdings, Inc.",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.56,
+   "name_zh": "劲量"
+  },
+  {
+   "ticker": "KMB",
+   "market": "US",
+   "name": "Kimberly-Clark Corporation",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 36.71,
+   "name_zh": "金佰利"
+  },
+  {
+   "ticker": "PG",
+   "market": "US",
+   "name": "Procter & Gamble Company (The)",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 336.0,
+   "name_zh": "宝洁"
+  },
+  {
+   "ticker": "REYN",
+   "market": "US",
+   "name": "Reynolds Consumer Products Inc.",
+   "subsector": "household_products",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 5.53,
+   "name_zh": null
+  },
+  {
+   "ticker": "4680.T",
+   "market": "JP",
+   "name": "Round One Corporation",
+   "subsector": "leisure_gaming",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.22,
+   "name_zh": null,
+   "name_ja": "ラウンドワン"
+  },
+  {
+   "ticker": "6460.T",
+   "market": "JP",
+   "name": "Sega Sammy Holdings Inc.",
+   "subsector": "leisure_gaming",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.55,
+   "name_zh": "世嘉飒美",
+   "name_ja": "セガサミーホールディングス"
+  },
+  {
+   "ticker": "9766.T",
+   "market": "JP",
+   "name": "Konami Group Corporation",
+   "subsector": "leisure_gaming",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 19.07,
+   "name_zh": "科乐美",
+   "name_ja": "コナミグループ"
+  },
+  {
+   "ticker": "CZR",
+   "market": "US",
+   "name": "Caesars Entertainment, Inc.",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 6.06,
+   "name_zh": "凯撒娱乐"
+  },
+  {
+   "ticker": "DKNG",
+   "market": "US",
+   "name": "DraftKings Inc.",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 12.98,
+   "name_zh": null
+  },
+  {
+   "ticker": "LVS",
+   "market": "US",
+   "name": "Las Vegas Sands Corp.",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 29.94,
+   "name_zh": "拉斯维加斯金沙"
+  },
+  {
+   "ticker": "MGM",
+   "market": "US",
+   "name": "MGM Resorts International",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 11.28,
+   "name_zh": "美高梅"
+  },
+  {
+   "ticker": "PENN",
+   "market": "US",
+   "name": "PENN Entertainment, Inc.",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.52,
+   "name_zh": null
+  },
+  {
+   "ticker": "PLNT",
+   "market": "US",
+   "name": "Planet Fitness, Inc.",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.82,
+   "name_zh": null
+  },
+  {
+   "ticker": "PTON",
+   "market": "US",
+   "name": "Peloton Interactive, Inc.",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.47,
+   "name_zh": null
+  },
+  {
+   "ticker": "WYNN",
+   "market": "US",
+   "name": "Wynn Resorts, Limited",
+   "subsector": "leisure_gaming",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 10.56,
+   "name_zh": "永利度假村"
+  },
+  {
+   "ticker": "3382.T",
+   "market": "JP",
+   "name": "Seven & i Holdings Co., Ltd.",
+   "subsector": "mass_retail",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 30.69,
+   "name_zh": "7&i控股",
+   "name_ja": "セブン&アイ・ホールディングス"
+  },
+  {
+   "ticker": "7532.T",
+   "market": "JP",
+   "name": "Pan Pacific International Holdings Corporation",
+   "subsector": "mass_retail",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 17.67,
+   "name_zh": "泛太平洋国际控股",
+   "name_ja": "パン・パシフィック・インターナショナルホールディングス"
+  },
+  {
+   "ticker": "8267.T",
+   "market": "JP",
+   "name": "Aeon Co., Ltd.",
+   "subsector": "mass_retail",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 24.4,
+   "name_zh": "永旺",
+   "name_ja": "イオン"
+  },
+  {
+   "ticker": "ACI",
+   "market": "US",
+   "name": "Albertsons Companies, Inc.",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 6.03,
+   "name_zh": null
+  },
+  {
+   "ticker": "BJ",
+   "market": "US",
+   "name": "BJ's Wholesale Club Holdings, Inc.",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 11.93,
+   "name_zh": null
+  },
+  {
+   "ticker": "COST",
+   "market": "US",
+   "name": "Costco Wholesale Corporation",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 426.23,
+   "name_zh": "好市多"
+  },
+  {
+   "ticker": "DG",
+   "market": "US",
+   "name": "Dollar General Corporation",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 27.19,
+   "name_zh": null
+  },
+  {
+   "ticker": "DLTR",
+   "market": "US",
+   "name": "Dollar Tree, Inc.",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 24.87,
+   "name_zh": "美元树"
+  },
+  {
+   "ticker": "KR",
+   "market": "US",
+   "name": "Kroger Company (The)",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "克罗格"
+  },
+  {
+   "ticker": "TGT",
+   "market": "US",
+   "name": "Target Corporation",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "塔吉特"
+  },
+  {
+   "ticker": "WMT",
+   "market": "US",
+   "name": "Walmart Inc.",
+   "subsector": "mass_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 917.33,
+   "name_zh": "沃尔玛"
+  },
+  {
+   "ticker": "2212.T",
+   "market": "JP",
+   "name": "Yamazaki Baking Co., Ltd.",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 4.43,
+   "name_zh": "山崎面包",
+   "name_ja": "山崎製パン"
+  },
+  {
+   "ticker": "2801.T",
+   "market": "JP",
+   "name": "Kikkoman Corporation",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 10.65,
+   "name_zh": "龟甲万",
+   "name_ja": "キッコーマン"
+  },
+  {
+   "ticker": "2802.T",
+   "market": "JP",
+   "name": "Ajinomoto Co., Inc.",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 34.56,
+   "name_zh": "味之素",
+   "name_ja": "味の素"
+  },
+  {
+   "ticker": "2809.T",
+   "market": "JP",
+   "name": "Kewpie Corporation",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 4.02,
+   "name_zh": "丘比",
+   "name_ja": "キユーピー"
+  },
+  {
+   "ticker": "2871.T",
+   "market": "JP",
+   "name": "Nichirei Corporation",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.49,
+   "name_zh": "日冷",
+   "name_ja": "ニチレイ"
+  },
+  {
+   "ticker": "2875.T",
+   "market": "JP",
+   "name": "Toyo Suisan Kaisha, Ltd.",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 6.55,
+   "name_zh": "东洋水产",
+   "name_ja": "東洋水産"
+  },
+  {
+   "ticker": "2897.T",
+   "market": "JP",
+   "name": "Nissin Foods Holdings Co.,Ltd.",
+   "subsector": "packaged_food",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 5.44,
+   "name_zh": "日清食品",
+   "name_ja": "日清食品ホールディングス"
+  },
+  {
+   "ticker": "BRBR",
+   "market": "US",
+   "name": "BellRing Brands, Inc.",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.25,
+   "name_zh": null
+  },
+  {
+   "ticker": "CAG",
+   "market": "US",
+   "name": "ConAgra Brands, Inc.",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 7.48,
+   "name_zh": "康尼格拉"
+  },
+  {
+   "ticker": "CPB",
+   "market": "US",
+   "name": "The Campbell's Company",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "金宝汤"
+  },
+  {
+   "ticker": "GIS",
+   "market": "US",
+   "name": "General Mills, Inc.",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 20.96,
+   "name_zh": "通用磨坊"
+  },
+  {
+   "ticker": "HRL",
+   "market": "US",
+   "name": "Hormel Foods Corporation",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "荷美尔"
+  },
+  {
+   "ticker": "KHC",
+   "market": "US",
+   "name": "The Kraft Heinz Company",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 30.25,
+   "name_zh": "卡夫亨氏"
+  },
+  {
+   "ticker": "LW",
+   "market": "US",
+   "name": "Lamb Weston Holdings, Inc.",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 7.3,
+   "name_zh": null
+  },
+  {
+   "ticker": "MKC",
+   "market": "US",
+   "name": "McCormick & Company, Incorporated",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 14.7,
+   "name_zh": "味好美"
+  },
+  {
+   "ticker": "POST",
+   "market": "US",
+   "name": "Post Holdings, Inc.",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.67,
+   "name_zh": null
+  },
+  {
+   "ticker": "SJM",
+   "market": "US",
+   "name": "The J. M. Smucker Company",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 12.97,
+   "name_zh": null
+  },
+  {
+   "ticker": "TSN",
+   "market": "US",
+   "name": "Tyson Foods, Inc.",
+   "subsector": "packaged_food",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 20.46,
+   "name_zh": "泰森食品"
+  },
+  {
+   "ticker": "CENT",
+   "market": "US",
+   "name": "Central Garden & Pet Company",
+   "subsector": "pet",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.74,
+   "name_zh": null
+  },
+  {
+   "ticker": "FRPT",
+   "market": "US",
+   "name": "Freshpet, Inc.",
+   "subsector": "pet",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.5,
+   "name_zh": null
+  },
+  {
+   "ticker": "WOOF",
+   "market": "US",
+   "name": "Petco Health and Wellness Company, Inc.",
+   "subsector": "pet",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.81,
+   "name_zh": null
+  },
+  {
+   "ticker": "3053.T",
+   "market": "JP",
+   "name": "Pepper Food Service Co., Ltd.",
+   "subsector": "restaurants_casual",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 0.09,
+   "name_zh": null,
+   "name_ja": "ペッパーフードサービス"
+  },
+  {
+   "ticker": "3197.T",
+   "market": "JP",
+   "name": "Skylark Holdings Co., Ltd.",
+   "subsector": "restaurants_casual",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 4.77,
+   "name_zh": null,
+   "name_ja": "すかいらーくホールディングス"
+  },
+  {
+   "ticker": "3397.T",
+   "market": "JP",
+   "name": "TORIDOLL Holdings Corporation",
+   "subsector": "restaurants_casual",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.38,
+   "name_zh": null,
+   "name_ja": "トリドールホールディングス"
+  },
+  {
+   "ticker": "7581.T",
+   "market": "JP",
+   "name": "Saizeriya Co.,Ltd.",
+   "subsector": "restaurants_casual",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.36,
+   "name_zh": "萨莉亚",
+   "name_ja": "サイゼリヤ"
+  },
+  {
+   "ticker": "BLMN",
+   "market": "US",
+   "name": "Bloomin' Brands, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.9,
+   "name_zh": null
+  },
+  {
+   "ticker": "CAVA",
+   "market": "US",
+   "name": "CAVA Group, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 8.69,
+   "name_zh": null
+  },
+  {
+   "ticker": "CBRL",
+   "market": "US",
+   "name": "Cracker Barrel Old Country Store, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.29,
+   "name_zh": null
+  },
+  {
+   "ticker": "CMG",
+   "market": "US",
+   "name": "Chipotle Mexican Grill, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 42.39,
+   "name_zh": null
+  },
+  {
+   "ticker": "DRI",
+   "market": "US",
+   "name": "Darden Restaurants, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 25.58,
+   "name_zh": "达登餐饮"
+  },
+  {
+   "ticker": "EAT",
+   "market": "US",
+   "name": "Brinker International, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 10.17,
+   "name_zh": null
+  },
+  {
+   "ticker": "TXRH",
+   "market": "US",
+   "name": "Texas Roadhouse, Inc.",
+   "subsector": "restaurants_casual",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 13.59,
+   "name_zh": null
+  },
+  {
+   "ticker": "2695.T",
+   "market": "JP",
+   "name": "Kura Sushi, Inc.",
+   "subsector": "restaurants_qsr",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 0.86,
+   "name_zh": "藏寿司",
+   "name_ja": "くら寿司"
+  },
+  {
+   "ticker": "2702.T",
+   "market": "JP",
+   "name": "McDonald's Holdings Company (Japan), Ltd.",
+   "subsector": "restaurants_qsr",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 6.68,
+   "name_zh": "日本麦当劳",
+   "name_ja": "日本マクドナルドホールディングス"
+  },
+  {
+   "ticker": "7550.T",
+   "market": "JP",
+   "name": "Zensho Holdings Co., Ltd.",
+   "subsector": "restaurants_qsr",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 11.34,
+   "name_zh": null,
+   "name_ja": "ゼンショーホールディングス"
+  },
+  {
+   "ticker": "9861.T",
+   "market": "JP",
+   "name": "Yoshinoya Holdings Co., Ltd.",
+   "subsector": "restaurants_qsr",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.57,
+   "name_zh": "吉野家",
+   "name_ja": "吉野家ホールディングス"
+  },
+  {
+   "ticker": "9936.T",
+   "market": "JP",
+   "name": "Ohsho Food Service Corp.",
+   "subsector": "restaurants_qsr",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 0.96,
+   "name_zh": null,
+   "name_ja": "王将フードサービス"
+  },
+  {
+   "ticker": "DPZ",
+   "market": "US",
+   "name": "Domino's Pizza Inc",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 11.46,
+   "name_zh": "达美乐"
+  },
+  {
+   "ticker": "JACK",
+   "market": "US",
+   "name": "Jack in the Box Inc.",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.33,
+   "name_zh": null
+  },
+  {
+   "ticker": "MCD",
+   "market": "US",
+   "name": "McDonald's Corporation",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 193.07,
+   "name_zh": "麦当劳"
+  },
+  {
+   "ticker": "PZZA",
+   "market": "US",
+   "name": "Papa John's International, Inc.",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.8,
+   "name_zh": "棒约翰"
+  },
+  {
+   "ticker": "QSR",
+   "market": "US",
+   "name": "Restaurant Brands International",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 35.57,
+   "name_zh": "餐饮品牌国际"
+  },
+  {
+   "ticker": "SHAK",
+   "market": "US",
+   "name": "Shake Shack Inc.",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.2,
+   "name_zh": null
+  },
+  {
+   "ticker": "WEN",
+   "market": "US",
+   "name": "Wendy's Company (The)",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.65,
+   "name_zh": "温迪"
+  },
+  {
+   "ticker": "WING",
+   "market": "US",
+   "name": "Wingstop Inc.",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.44,
+   "name_zh": null
+  },
+  {
+   "ticker": "YUM",
+   "market": "US",
+   "name": "Yum! Brands, Inc.",
+   "subsector": "restaurants_qsr",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 40.42,
+   "name_zh": "百胜餐饮"
+  },
+  {
+   "ticker": "2201.T",
+   "market": "JP",
+   "name": "Morinaga&Co., Ltd.",
+   "subsector": "snacks_confection",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.38,
+   "name_zh": "森永制果",
+   "name_ja": "森永製菓"
+  },
+  {
+   "ticker": "2206.T",
+   "market": "JP",
+   "name": "Ezaki Glico Co., Ltd.",
+   "subsector": "snacks_confection",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.03,
+   "name_zh": "江崎格力高",
+   "name_ja": "江崎グリコ"
+  },
+  {
+   "ticker": "2229.T",
+   "market": "JP",
+   "name": "Calbee, Inc.",
+   "subsector": "snacks_confection",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.37,
+   "name_zh": "卡乐比",
+   "name_ja": "カルビー"
+  },
+  {
+   "ticker": "HSY",
+   "market": "US",
+   "name": "The Hershey Company",
+   "subsector": "snacks_confection",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 37.01,
+   "name_zh": "好时"
+  },
+  {
+   "ticker": "JJSF",
+   "market": "US",
+   "name": "J&J Snack Foods Corp.",
+   "subsector": "snacks_confection",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.67,
+   "name_zh": null
+  },
+  {
+   "ticker": "MDLZ",
+   "market": "US",
+   "name": "Mondelez International, Inc.",
+   "subsector": "snacks_confection",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 81.19,
+   "name_zh": "亿滋国际"
+  },
+  {
+   "ticker": "UTZ",
+   "market": "US",
+   "name": "Utz Brands, Inc.",
+   "subsector": "snacks_confection",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.04,
+   "name_zh": null
+  },
+  {
+   "ticker": "2267.T",
+   "market": "JP",
+   "name": "Yakult Honsha Co.,Ltd.",
+   "subsector": "soft_drinks",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 5.3,
+   "name_zh": "养乐多",
+   "name_ja": "ヤクルト本社"
+  },
+  {
+   "ticker": "2579.T",
+   "market": "JP",
+   "name": "Coca-Cola Bottlers Japan Holdings Inc.",
+   "subsector": "soft_drinks",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 4.12,
+   "name_zh": "日本可口可乐瓶装",
+   "name_ja": "コカ・コーラ ボトラーズジャパンホールディングス"
+  },
+  {
+   "ticker": "2593.T",
+   "market": "JP",
+   "name": "Ito En, Ltd.",
+   "subsector": "soft_drinks",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.22,
+   "name_zh": "伊藤园",
+   "name_ja": "伊藤園"
+  },
+  {
+   "ticker": "CELH",
+   "market": "US",
+   "name": "Celsius Holdings, Inc.",
+   "subsector": "soft_drinks",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 7.36,
+   "name_zh": null
+  },
+  {
+   "ticker": "KDP",
+   "market": "US",
+   "name": "Keurig Dr Pepper Inc.",
+   "subsector": "soft_drinks",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 42.78,
+   "name_zh": null
+  },
+  {
+   "ticker": "KO",
+   "market": "US",
+   "name": "Coca-Cola Company (The)",
+   "subsector": "soft_drinks",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 377.38,
+   "name_zh": "可口可乐"
+  },
+  {
+   "ticker": "MNST",
+   "market": "US",
+   "name": "Monster Beverage Corporation",
+   "subsector": "soft_drinks",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 91.72,
+   "name_zh": "怪物饮料"
+  },
+  {
+   "ticker": "PEP",
+   "market": "US",
+   "name": "PepsiCo, Inc.",
+   "subsector": "soft_drinks",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 192.32,
+   "name_zh": "百事"
+  },
+  {
+   "ticker": "3050.T",
+   "market": "JP",
+   "name": "DCM Holdings Co., Ltd.",
+   "subsector": "specialty_retail",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.38,
+   "name_zh": null,
+   "name_ja": "DCMホールディングス"
+  },
+  {
+   "ticker": "ASO",
+   "market": "US",
+   "name": "Academy Sports and Outdoors, Inc.",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.98,
+   "name_zh": null
+  },
+  {
+   "ticker": "BBWI",
+   "market": "US",
+   "name": "Bath & Body Works, Inc.",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 3.91,
+   "name_zh": null
+  },
+  {
+   "ticker": "BBY",
+   "market": "US",
+   "name": "Best Buy Co., Inc.",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "百思买"
+  },
+  {
+   "ticker": "DKS",
+   "market": "US",
+   "name": "DICK'S Sporting Goods, Inc.",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 18.08,
+   "name_zh": null
+  },
+  {
+   "ticker": "HD",
+   "market": "US",
+   "name": "Home Depot, Inc. (The)",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "家得宝"
+  },
+  {
+   "ticker": "LOW",
+   "market": "US",
+   "name": "Lowe's Companies, Inc.",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": null,
+   "name_zh": "劳氏"
+  },
+  {
+   "ticker": "TSCO",
+   "market": "US",
+   "name": "Tractor Supply Company",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 18.67,
+   "name_zh": null
+  },
+  {
+   "ticker": "ULTA",
+   "market": "US",
+   "name": "Ulta Beauty, Inc.",
+   "subsector": "specialty_retail",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 21.96,
+   "name_zh": null
+  },
+  {
+   "ticker": "7309.T",
+   "market": "JP",
+   "name": "Shimano Inc.",
+   "subsector": "sportswear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 10.88,
+   "name_zh": "禧玛诺",
+   "name_ja": "シマノ"
+  },
+  {
+   "ticker": "7936.T",
+   "market": "JP",
+   "name": "ASICS Corporation",
+   "subsector": "sportswear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 23.88,
+   "name_zh": "亚瑟士",
+   "name_ja": "アシックス"
+  },
+  {
+   "ticker": "8022.T",
+   "market": "JP",
+   "name": "Mizuno Corporation",
+   "subsector": "sportswear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.02,
+   "name_zh": "美津浓",
+   "name_ja": "美津濃"
+  },
+  {
+   "ticker": "8111.T",
+   "market": "JP",
+   "name": "Goldwin Inc.",
+   "subsector": "sportswear",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.87,
+   "name_zh": null,
+   "name_ja": "ゴールドウイン"
+  },
+  {
+   "ticker": "CROX",
+   "market": "US",
+   "name": "Crocs, Inc.",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 6.32,
+   "name_zh": "卡骆驰"
+  },
+  {
+   "ticker": "DECK",
+   "market": "US",
+   "name": "Deckers Outdoor Corporation",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 12.68,
+   "name_zh": "德克斯户外"
+  },
+  {
+   "ticker": "LULU",
+   "market": "US",
+   "name": "lululemon athletica inc.",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 13.58,
+   "name_zh": "露露乐檬"
+  },
+  {
+   "ticker": "NKE",
+   "market": "US",
+   "name": "NIKE, Inc.",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 60.42,
+   "name_zh": "耐克"
+  },
+  {
+   "ticker": "ONON",
+   "market": "US",
+   "name": "On Holding AG",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 10.77,
+   "name_zh": "昂跑"
+  },
+  {
+   "ticker": "UAA",
+   "market": "US",
+   "name": "Under Armour, Inc.",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 2.3,
+   "name_zh": "安德玛"
+  },
+  {
+   "ticker": "VFC",
+   "market": "US",
+   "name": "V.F. Corporation",
+   "subsector": "sportswear",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 5.85,
+   "name_zh": "威富集团"
+  },
+  {
+   "ticker": "2914.T",
+   "market": "JP",
+   "name": "Japan Tobacco Inc.",
+   "subsector": "tobacco",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 81.01,
+   "name_zh": "日本烟草",
+   "name_ja": "日本たばこ産業"
+  },
+  {
+   "ticker": "MO",
+   "market": "US",
+   "name": "Altria Group, Inc.",
+   "subsector": "tobacco",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 109.7,
+   "name_zh": "奥驰亚"
+  },
+  {
+   "ticker": "PM",
+   "market": "US",
+   "name": "Philip Morris International Inc",
+   "subsector": "tobacco",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 296.74,
+   "name_zh": "菲莫国际"
+  },
+  {
+   "ticker": "TPB",
+   "market": "US",
+   "name": "Turning Point Brands, Inc.",
+   "subsector": "tobacco",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 1.75,
+   "name_zh": null
+  },
+  {
+   "ticker": "4816.T",
+   "market": "JP",
+   "name": "Toei Animation Co.,Ltd.",
+   "subsector": "toys_ip",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 3.76,
+   "name_zh": "东映动画",
+   "name_ja": "東映アニメーション"
+  },
+  {
+   "ticker": "7832.T",
+   "market": "JP",
+   "name": "BANDAI NAMCO Holdings Inc.",
+   "subsector": "toys_ip",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 22.26,
+   "name_zh": "万代南梦宫",
+   "name_ja": "バンダイナムコホールディングス"
+  },
+  {
+   "ticker": "7974.T",
+   "market": "JP",
+   "name": "Nintendo Co., Ltd.",
+   "subsector": "toys_ip",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 66.18,
+   "name_zh": "任天堂",
+   "name_ja": "任天堂"
+  },
+  {
+   "ticker": "8136.T",
+   "market": "JP",
+   "name": "Sanrio Company, Ltd.",
+   "subsector": "toys_ip",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 9.67,
+   "name_zh": "三丽鸥",
+   "name_ja": "サンリオ"
+  },
+  {
+   "ticker": "FNKO",
+   "market": "US",
+   "name": "Funko, Inc.",
+   "subsector": "toys_ip",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 0.34,
+   "name_zh": null
+  },
+  {
+   "ticker": "HAS",
+   "market": "US",
+   "name": "Hasbro, Inc.",
+   "subsector": "toys_ip",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 13.64,
+   "name_zh": "孩之宝"
+  },
+  {
+   "ticker": "MAT",
+   "market": "US",
+   "name": "Mattel, Inc.",
+   "subsector": "toys_ip",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 4.29,
+   "name_zh": "美泰"
+  },
+  {
+   "ticker": "4661.T",
+   "market": "JP",
+   "name": "Oriental Land Co., Ltd.",
+   "subsector": "travel_lodging",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 30.94,
+   "name_zh": "东方乐园",
+   "name_ja": "オリエンタルランド"
+  },
+  {
+   "ticker": "4681.T",
+   "market": "JP",
+   "name": "Resorttrust, Inc.",
+   "subsector": "travel_lodging",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 2.52,
+   "name_zh": null,
+   "name_ja": "リゾートトラスト"
+  },
+  {
+   "ticker": "9616.T",
+   "market": "JP",
+   "name": "Kyoritsu Maintenance Co., Ltd.",
+   "subsector": "travel_lodging",
+   "currency": "JPY",
+   "mktcap_usd_bn_at_build": 1.89,
+   "name_zh": null,
+   "name_ja": "共立メンテナンス"
+  },
+  {
+   "ticker": "ABNB",
+   "market": "US",
+   "name": "Airbnb, Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 110.21,
+   "name_zh": "爱彼迎"
+  },
+  {
+   "ticker": "BKNG",
+   "market": "US",
+   "name": "Booking Holdings Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 159.34,
+   "name_zh": null
+  },
+  {
+   "ticker": "CCL",
+   "market": "US",
+   "name": "Carnival Corporation Ltd.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 38.51,
+   "name_zh": "嘉年华邮轮"
+  },
+  {
+   "ticker": "CHH",
+   "market": "US",
+   "name": "Choice Hotels International, Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 4.75,
+   "name_zh": null
+  },
+  {
+   "ticker": "EXPE",
+   "market": "US",
+   "name": "Expedia Group, Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 39.93,
+   "name_zh": null
+  },
+  {
+   "ticker": "H",
+   "market": "US",
+   "name": "Hyatt Hotels Corporation",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 17.05,
+   "name_zh": "凯悦酒店"
+  },
+  {
+   "ticker": "HLT",
+   "market": "US",
+   "name": "Hilton Worldwide Holdings Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 73.64,
+   "name_zh": "希尔顿"
+  },
+  {
+   "ticker": "MAR",
+   "market": "US",
+   "name": "Marriott International, Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 93.02,
+   "name_zh": "万豪国际"
+  },
+  {
+   "ticker": "NCLH",
+   "market": "US",
+   "name": "Norwegian Cruise Line Holdings Ltd.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 8.73,
+   "name_zh": "挪威邮轮"
+  },
+  {
+   "ticker": "RCL",
+   "market": "US",
+   "name": "Royal Caribbean Cruises Ltd.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 81.57,
+   "name_zh": "皇家加勒比"
+  },
+  {
+   "ticker": "WH",
+   "market": "US",
+   "name": "Wyndham Hotels & Resorts, Inc.",
+   "subsector": "travel_lodging",
+   "currency": "USD",
+   "mktcap_usd_bn_at_build": 5.46,
+   "name_zh": "温德姆酒店"
+  }
+ ]
+}

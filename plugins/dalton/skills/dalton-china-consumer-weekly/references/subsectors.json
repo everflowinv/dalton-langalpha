@@ -1,0 +1,582 @@
+{
+ "meta": {
+  "version": "1.0",
+  "count": 26,
+  "note": "细分口径以本文件为准；universe.json 的 subsector 必须是这里的 key"
+ },
+ "subsectors": [
+  {
+   "key": "baijiu",
+   "name_cn": "白酒",
+   "drivers": [
+    "批价与库存",
+    "宴席与商务场景",
+    "次高端降级",
+    "渠道回款",
+    "控盘分利"
+   ],
+   "alphaengine_queries": [
+    "白酒 批价 库存 渠道调研",
+    "白酒 次高端 动销 纪要"
+   ],
+   "guidepoint_queries": [
+    "China baijiu channel inventory destocking",
+    "premium baijiu wholesale price trend"
+   ],
+   "web_queries": [
+    "白酒 批价 动销 库存",
+    "茅台 批价"
+   ]
+  },
+  {
+   "key": "beer_other_alcohol",
+   "name_cn": "啤酒与其他酒类",
+   "drivers": [
+    "吨价与高端化",
+    "现饮渠道恢复",
+    "原料成本",
+    "夜场与餐饮客流"
+   ],
+   "alphaengine_queries": [
+    "啤酒 吨价 高端化 纪要",
+    "啤酒 现饮 渠道"
+   ],
+   "guidepoint_queries": [
+    "China beer premiumization on-trade channel",
+    "China beer volume price mix"
+   ],
+   "web_queries": [
+    "啤酒 高端化 吨价",
+    "啤酒 销量 现饮"
+   ]
+  },
+  {
+   "key": "soft_drinks",
+   "name_cn": "软饮料与包装水",
+   "drivers": [
+    "单价战与价格战",
+    "无糖茶与能量饮料结构",
+    "冰柜与终端网点",
+    "原料与包材成本"
+   ],
+   "alphaengine_queries": [
+    "包装水 价格战 纪要",
+    "无糖茶 能量饮料 动销"
+   ],
+   "guidepoint_queries": [
+    "China bottled water price war share shift",
+    "China sugar-free tea category growth"
+   ],
+   "web_queries": [
+    "包装水 价格战 份额",
+    "无糖茶 增速",
+    "东鹏 能量饮料"
+   ]
+  },
+  {
+   "key": "dairy",
+   "name_cn": "乳制品",
+   "drivers": [
+    "原奶周期与喷粉",
+    "常温白奶需求",
+    "婴配粉出生率与新国标",
+    "买赠与费用率"
+   ],
+   "alphaengine_queries": [
+    "原奶 价格 周期 纪要",
+    "乳制品 需求 库存"
+   ],
+   "guidepoint_queries": [
+    "China raw milk price cycle oversupply",
+    "China infant formula market share"
+   ],
+   "web_queries": [
+    "原奶 价格",
+    "婴配粉 出生率 需求"
+   ]
+  },
+  {
+   "key": "snacks",
+   "name_cn": "休闲零食与烘焙",
+   "drivers": [
+    "量贩零食渠道扩张",
+    "白牌竞争",
+    "单品爆款",
+    "山姆与会员店供货"
+   ],
+   "alphaengine_queries": [
+    "量贩零食 渠道 纪要",
+    "零食 白牌 竞争"
+   ],
+   "guidepoint_queries": [
+    "China discount snack store expansion",
+    "China snack channel shift membership store"
+   ],
+   "web_queries": [
+    "量贩零食 门店",
+    "零食 山姆 供应商"
+   ]
+  },
+  {
+   "key": "condiments",
+   "name_cn": "调味品与食品配料",
+   "drivers": [
+    "餐饮需求与B端复苏",
+    "成本下行",
+    "复合调味渗透",
+    "渠道库存"
+   ],
+   "alphaengine_queries": [
+    "调味品 餐饮 需求 纪要",
+    "复合调味 渗透"
+   ],
+   "guidepoint_queries": [
+    "China condiment foodservice demand recovery",
+    "China compound seasoning penetration"
+   ],
+   "web_queries": [
+    "调味品 餐饮 需求",
+    "海天 动销"
+   ]
+  },
+  {
+   "key": "frozen_prepared",
+   "name_cn": "速冻与预制食品",
+   "drivers": [
+    "B端餐饮供应链",
+    "小B与团餐",
+    "冷链成本",
+    "大单品放量"
+   ],
+   "alphaengine_queries": [
+    "速冻 预制菜 渠道 纪要",
+    "餐饮供应链 需求"
+   ],
+   "guidepoint_queries": [
+    "China prepared food B2B foodservice demand",
+    "China frozen food channel"
+   ],
+   "web_queries": [
+    "预制菜 需求",
+    "速冻 B端 餐饮"
+   ]
+  },
+  {
+   "key": "restaurants",
+   "name_cn": "餐饮连锁",
+   "drivers": [
+    "同店与翻台率",
+    "客单价",
+    "开店节奏与加盟",
+    "外卖占比与补贴"
+   ],
+   "alphaengine_queries": [
+    "餐饮 同店 翻台 纪要",
+    "连锁餐饮 开店 加盟"
+   ],
+   "guidepoint_queries": [
+    "China restaurant same store sales traffic",
+    "China chain restaurant franchise expansion"
+   ],
+   "web_queries": [
+    "餐饮 同店 客单价",
+    "海底捞 翻台"
+   ]
+  },
+  {
+   "key": "tea_coffee",
+   "name_cn": "茶饮与咖啡",
+   "drivers": [
+    "门店净增与闭店率",
+    "单店日均杯量",
+    "加盟商回报周期",
+    "下沉与出海"
+   ],
+   "alphaengine_queries": [
+    "现制茶饮 单店 杯量 纪要",
+    "加盟 回报 周期 奶茶"
+   ],
+   "guidepoint_queries": [
+    "China bubble tea store expansion unit economics",
+    "China coffee chain cup volume"
+   ],
+   "web_queries": [
+    "奶茶 门店 净增",
+    "蜜雪 古茗 加盟"
+   ]
+  },
+  {
+   "key": "hotel_travel",
+   "name_cn": "酒店与旅游景区",
+   "drivers": [
+    "RevPAR与OCC/ADR拆分",
+    "开店与储备",
+    "出游人次",
+    "景区客流"
+   ],
+   "alphaengine_queries": [
+    "酒店 RevPAR 纪要",
+    "景区 客流 出游"
+   ],
+   "guidepoint_queries": [
+    "China hotel RevPAR ADR occupancy trend",
+    "China domestic travel volume"
+   ],
+   "web_queries": [
+    "酒店 RevPAR",
+    "景区 客流 暑期"
+   ]
+  },
+  {
+   "key": "ota_platform",
+   "name_cn": "在线旅游与出行平台",
+   "drivers": [
+    "间夜量与佣金率",
+    "出境恢复度",
+    "补贴投放",
+    "国际业务占比"
+   ],
+   "alphaengine_queries": [
+    "OTA 间夜 佣金 纪要",
+    "出境游 恢复"
+   ],
+   "guidepoint_queries": [
+    "China OTA room nights take rate",
+    "China outbound travel recovery"
+   ],
+   "web_queries": [
+    "携程 间夜",
+    "出境游 恢复 数据"
+   ]
+  },
+  {
+   "key": "duty_free_retail",
+   "name_cn": "免税与线下零售",
+   "drivers": [
+    "客流与转化率",
+    "离岛免税销售额",
+    "同店与关店",
+    "会员与自有品牌"
+   ],
+   "alphaengine_queries": [
+    "免税 离岛 销售额 纪要",
+    "商超 同店 客流"
+   ],
+   "guidepoint_queries": [
+    "Hainan duty free sales trend",
+    "China supermarket same store sales"
+   ],
+   "web_queries": [
+    "离岛免税 销售额",
+    "商超 同店 客流"
+   ]
+  },
+  {
+   "key": "sportswear",
+   "name_cn": "运动服饰",
+   "drivers": [
+    "流水增速与折扣率",
+    "库销比",
+    "DTC占比",
+    "新品与专业品类"
+   ],
+   "alphaengine_queries": [
+    "运动服饰 流水 折扣 纪要",
+    "库销比 渠道"
+   ],
+   "guidepoint_queries": [
+    "China sportswear retail sales discount inventory",
+    "China athletic footwear channel check"
+   ],
+   "web_queries": [
+    "安踏 李宁 流水",
+    "运动服饰 折扣 库存"
+   ]
+  },
+  {
+   "key": "apparel",
+   "name_cn": "大众服饰与鞋履",
+   "drivers": [
+    "终端零售与天气",
+    "加盟商补库",
+    "电商占比",
+    "品牌调性升级"
+   ],
+   "alphaengine_queries": [
+    "服饰 零售 库存 纪要",
+    "羽绒服 动销"
+   ],
+   "guidepoint_queries": [
+    "China apparel retail sales channel inventory",
+    "China down jacket season demand"
+   ],
+   "web_queries": [
+    "服饰 零售 动销",
+    "波司登 羽绒服 销售"
+   ]
+  },
+  {
+   "key": "gold_jewelry",
+   "name_cn": "黄金珠宝",
+   "drivers": [
+    "金价与克重/一口价结构",
+    "同店与加盟拓店",
+    "婚庆需求",
+    "毛利率结构"
+   ],
+   "alphaengine_queries": [
+    "黄金珠宝 同店 金价 纪要",
+    "一口价 产品 结构"
+   ],
+   "guidepoint_queries": [
+    "China gold jewelry same store sales gold price",
+    "China jewelry franchise store openings"
+   ],
+   "web_queries": [
+    "黄金 珠宝 同店",
+    "金价 需求 克重"
+   ]
+  },
+  {
+   "key": "cosmetics",
+   "name_cn": "化妆品与个护",
+   "drivers": [
+    "线上大促与GMV",
+    "抖音渠道效率",
+    "新品与成分",
+    "国货份额"
+   ],
+   "alphaengine_queries": [
+    "化妆品 抖音 GMV 纪要",
+    "国货 美妆 份额"
+   ],
+   "guidepoint_queries": [
+    "China beauty e-commerce GMV Douyin channel",
+    "China domestic cosmetics brand share"
+   ],
+   "web_queries": [
+    "美妆 抖音 GMV",
+    "国货 化妆品 份额"
+   ]
+  },
+  {
+   "key": "medical_aesthetics",
+   "name_cn": "医美与消费医疗",
+   "drivers": [
+    "终端客流与获客成本",
+    "新品获证",
+    "水光与再生材料",
+    "合规监管"
+   ],
+   "alphaengine_queries": [
+    "医美 终端 客流 纪要",
+    "再生 材料 获证"
+   ],
+   "guidepoint_queries": [
+    "China medical aesthetics clinic traffic",
+    "China injectable filler approval"
+   ],
+   "web_queries": [
+    "医美 客流 价格",
+    "水光针 监管"
+   ]
+  },
+  {
+   "key": "home_appliance",
+   "name_cn": "白电与厨电",
+   "drivers": [
+    "以旧换新补贴",
+    "内销排产与外销订单",
+    "原材料成本",
+    "房地产后周期"
+   ],
+   "alphaengine_queries": [
+    "家电 排产 内销 纪要",
+    "以旧换新 补贴 效果"
+   ],
+   "guidepoint_queries": [
+    "China home appliance trade-in subsidy sales",
+    "China air conditioner production schedule"
+   ],
+   "web_queries": [
+    "家电 以旧换新 销量",
+    "空调 排产"
+   ]
+  },
+  {
+   "key": "small_appliance",
+   "name_cn": "小家电与清洁电器",
+   "drivers": [
+    "新品类渗透",
+    "海外自主品牌",
+    "扫地机均价",
+    "线上份额"
+   ],
+   "alphaengine_queries": [
+    "扫地机 均价 份额 纪要",
+    "小家电 出海"
+   ],
+   "guidepoint_queries": [
+    "China robot vacuum ASP share",
+    "China small appliance overseas brand"
+   ],
+   "web_queries": [
+    "扫地机 份额 均价",
+    "小家电 出海 增速"
+   ]
+  },
+  {
+   "key": "furniture_home",
+   "name_cn": "家居与家具",
+   "drivers": [
+    "二手房与翻新需求",
+    "整装与大宗渠道",
+    "客单价",
+    "地产竣工"
+   ],
+   "alphaengine_queries": [
+    "家居 零售 订单 纪要",
+    "整装 渠道 占比"
+   ],
+   "guidepoint_queries": [
+    "China furniture retail orders renovation demand",
+    "China home improvement channel"
+   ],
+   "web_queries": [
+    "家居 订单 二手房",
+    "定制家居 客单价"
+   ]
+  },
+  {
+   "key": "pet",
+   "name_cn": "宠物食品与用品",
+   "drivers": [
+    "主粮国产替代",
+    "单品牌复购",
+    "代工出口订单",
+    "原料成本"
+   ],
+   "alphaengine_queries": [
+    "宠物食品 国产 份额 纪要",
+    "宠物 代工 出口"
+   ],
+   "guidepoint_queries": [
+    "China pet food domestic brand share",
+    "China pet food OEM export orders"
+   ],
+   "web_queries": [
+    "宠物食品 国产 份额",
+    "宠物 主粮 复购"
+   ]
+  },
+  {
+   "key": "toys_ip",
+   "name_cn": "潮玩与IP消费",
+   "drivers": [
+    "单IP生命周期与新IP",
+    "海外开店与坪效",
+    "二级市场价格",
+    "联名节奏"
+   ],
+   "alphaengine_queries": [
+    "潮玩 IP 海外 纪要",
+    "IP 授权 收入"
+   ],
+   "guidepoint_queries": [
+    "China pop toy overseas store productivity",
+    "China IP licensing consumer demand"
+   ],
+   "web_queries": [
+    "泡泡玛特 海外 门店",
+    "潮玩 二级市场 价格"
+   ]
+  },
+  {
+   "key": "maternal_baby",
+   "name_cn": "母婴与家庭消费",
+   "drivers": [
+    "出生率与政策补贴",
+    "奶粉与营养品结构",
+    "门店转型服务"
+   ],
+   "alphaengine_queries": [
+    "母婴 门店 客流 纪要",
+    "出生率 政策 补贴"
+   ],
+   "guidepoint_queries": [
+    "China birth rate subsidy consumption impact",
+    "China maternal baby retail channel"
+   ],
+   "web_queries": [
+    "生育 补贴 政策",
+    "母婴 门店 客流"
+   ]
+  },
+  {
+   "key": "education",
+   "name_cn": "教育与培训",
+   "drivers": [
+    "非学科培训需求",
+    "暑秋招生与留存",
+    "师资与产能扩张",
+    "监管口径"
+   ],
+   "alphaengine_queries": [
+    "教育 培训 招生 纪要",
+    "非学科 需求"
+   ],
+   "guidepoint_queries": [
+    "China tutoring enrollment capacity expansion",
+    "China non-academic training demand"
+   ],
+   "web_queries": [
+    "非学科 培训 招生",
+    "教育 产能 扩张"
+   ]
+  },
+  {
+   "key": "ecommerce_local",
+   "name_cn": "电商与本地生活",
+   "drivers": [
+    "GMV与货币化率",
+    "即时零售补贴强度",
+    "竞争格局",
+    "外卖单量与UE"
+   ],
+   "alphaengine_queries": [
+    "即时零售 补贴 单量 纪要",
+    "电商 货币化 率"
+   ],
+   "guidepoint_queries": [
+    "China instant retail subsidy order volume",
+    "China e-commerce take rate competition"
+   ],
+   "web_queries": [
+    "即时零售 补贴 单量",
+    "外卖 补贴 竞争"
+   ]
+  },
+  {
+   "key": "consumer_supply_chain",
+   "name_cn": "消费供应链",
+   "drivers": [
+    "代工订单与产能利用",
+    "包材与纸浆成本",
+    "客户结构",
+    "出海产能"
+   ],
+   "alphaengine_queries": [
+    "代工 订单 产能 纪要",
+    "包材 成本 纸浆"
+   ],
+   "guidepoint_queries": [
+    "China consumer OEM order visibility capacity",
+    "China packaging cost pulp price"
+   ],
+   "web_queries": [
+    "代工 订单 产能",
+    "纸浆 包材 成本"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,1758 @@
+{
+ "meta": {
+  "version": "1.0",
+  "built_at": "2026-08-16",
+  "price_source": "tencent qt.gtimg.cn / web.ifzq.gtimg.cn (qfq)",
+  "name_source": "vendor quote name at build time",
+  "count": 214,
+  "subsector_counts": {
+   "apparel": 11,
+   "baijiu": 15,
+   "beer_other_alcohol": 10,
+   "condiments": 9,
+   "consumer_supply_chain": 10,
+   "cosmetics": 11,
+   "dairy": 10,
+   "duty_free_retail": 10,
+   "ecommerce_local": 8,
+   "education": 6,
+   "frozen_prepared": 5,
+   "furniture_home": 8,
+   "gold_jewelry": 9,
+   "home_appliance": 9,
+   "hotel_travel": 9,
+   "maternal_baby": 5,
+   "medical_aesthetics": 6,
+   "ota_platform": 4,
+   "pet": 5,
+   "restaurants": 9,
+   "small_appliance": 8,
+   "snacks": 13,
+   "soft_drinks": 9,
+   "sportswear": 5,
+   "tea_coffee": 5,
+   "toys_ip": 5
+  }
+ },
+ "companies": [
+  {
+   "symbol": "sh600519",
+   "ticker": "600519.SH",
+   "market": "A",
+   "name": "贵州茅台",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 16775.97
+  },
+  {
+   "symbol": "sz000858",
+   "ticker": "000858.SZ",
+   "market": "A",
+   "name": "五粮液",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 2862.69
+  },
+  {
+   "symbol": "sz000568",
+   "ticker": "000568.SZ",
+   "market": "A",
+   "name": "泸州老窖",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 1316.17
+  },
+  {
+   "symbol": "sh600809",
+   "ticker": "600809.SH",
+   "market": "A",
+   "name": "山西汾酒",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 1506.9
+  },
+  {
+   "symbol": "sz002304",
+   "ticker": "002304.SZ",
+   "market": "A",
+   "name": "洋河股份",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 611.32
+  },
+  {
+   "symbol": "sz000596",
+   "ticker": "000596.SZ",
+   "market": "A",
+   "name": "古井贡酒",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 525.22
+  },
+  {
+   "symbol": "sh603369",
+   "ticker": "603369.SH",
+   "market": "A",
+   "name": "今世缘",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 371.05
+  },
+  {
+   "symbol": "sh600779",
+   "ticker": "600779.SH",
+   "market": "A",
+   "name": "水井坊",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 138.79
+  },
+  {
+   "symbol": "sh603198",
+   "ticker": "603198.SH",
+   "market": "A",
+   "name": "迎驾贡酒",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 330.16
+  },
+  {
+   "symbol": "sh600559",
+   "ticker": "600559.SH",
+   "market": "A",
+   "name": "老白干酒",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 109.77
+  },
+  {
+   "symbol": "sh603589",
+   "ticker": "603589.SH",
+   "market": "A",
+   "name": "口子窖",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 118.91
+  },
+  {
+   "symbol": "sz000799",
+   "ticker": "000799.SZ",
+   "market": "A",
+   "name": "酒鬼酒",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 133.03
+  },
+  {
+   "symbol": "sh600702",
+   "ticker": "600702.SH",
+   "market": "A",
+   "name": "舍得酒业",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 123.31
+  },
+  {
+   "symbol": "sh603919",
+   "ticker": "603919.SH",
+   "market": "A",
+   "name": "金徽酒",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 84.71
+  },
+  {
+   "symbol": "hk06979",
+   "ticker": "6979.HK",
+   "market": "HK",
+   "name": "珍酒李渡",
+   "subsector": "baijiu",
+   "mktcap_yi_at_build": 278.8837
+  },
+  {
+   "symbol": "sh600600",
+   "ticker": "600600.SH",
+   "market": "A",
+   "name": "青岛啤酒",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 716.88,
+   "dual_listed_with": "0168.HK"
+  },
+  {
+   "symbol": "hk00168",
+   "ticker": "0168.HK",
+   "market": "HK",
+   "name": "青岛啤酒股份",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 601.61,
+   "dual_listed_with": "600600.SH"
+  },
+  {
+   "symbol": "hk00291",
+   "ticker": "0291.HK",
+   "market": "HK",
+   "name": "华润啤酒",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 722.8026
+  },
+  {
+   "symbol": "hk01876",
+   "ticker": "1876.HK",
+   "market": "HK",
+   "name": "百威亚太",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 850.2261
+  },
+  {
+   "symbol": "sh600132",
+   "ticker": "600132.SH",
+   "market": "A",
+   "name": "重庆啤酒",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 207.33
+  },
+  {
+   "symbol": "sz002461",
+   "ticker": "002461.SZ",
+   "market": "A",
+   "name": "珠江啤酒",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 189.46
+  },
+  {
+   "symbol": "sz000729",
+   "ticker": "000729.SZ",
+   "market": "A",
+   "name": "燕京啤酒",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 357.67
+  },
+  {
+   "symbol": "sh600059",
+   "ticker": "600059.SH",
+   "market": "A",
+   "name": "古越龙山",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 74.75
+  },
+  {
+   "symbol": "sz002568",
+   "ticker": "002568.SZ",
+   "market": "A",
+   "name": "百润股份",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 197.8
+  },
+  {
+   "symbol": "sh600197",
+   "ticker": "600197.SH",
+   "market": "A",
+   "name": "伊力特",
+   "subsector": "beer_other_alcohol",
+   "mktcap_yi_at_build": 49.49
+  },
+  {
+   "symbol": "hk09633",
+   "ticker": "9633.HK",
+   "market": "HK",
+   "name": "农夫山泉",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 4802.2412
+  },
+  {
+   "symbol": "hk02460",
+   "ticker": "2460.HK",
+   "market": "HK",
+   "name": "华润饮料",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 183.8218
+  },
+  {
+   "symbol": "hk00322",
+   "ticker": "0322.HK",
+   "market": "HK",
+   "name": "康师傅控股",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 752.5911
+  },
+  {
+   "symbol": "hk00220",
+   "ticker": "0220.HK",
+   "market": "HK",
+   "name": "统一企业中国",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 337.9879
+  },
+  {
+   "symbol": "hk00345",
+   "ticker": "0345.HK",
+   "market": "HK",
+   "name": "维他奶国际",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 65.1744
+  },
+  {
+   "symbol": "sh605499",
+   "ticker": "605499.SH",
+   "market": "A",
+   "name": "东鹏饮料",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 902.55
+  },
+  {
+   "symbol": "sh603711",
+   "ticker": "603711.SH",
+   "market": "A",
+   "name": "香飘飘",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 48.39
+  },
+  {
+   "symbol": "sh605337",
+   "ticker": "605337.SH",
+   "market": "A",
+   "name": "李子园",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 37.68
+  },
+  {
+   "symbol": "hk00506",
+   "ticker": "0506.HK",
+   "market": "HK",
+   "name": "中国食品",
+   "subsector": "soft_drinks",
+   "mktcap_yi_at_build": 92.728
+  },
+  {
+   "symbol": "sh600887",
+   "ticker": "600887.SH",
+   "market": "A",
+   "name": "伊利股份",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 1613.6
+  },
+  {
+   "symbol": "hk02319",
+   "ticker": "2319.HK",
+   "market": "HK",
+   "name": "蒙牛乳业",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 703.7828
+  },
+  {
+   "symbol": "sz002946",
+   "ticker": "002946.SZ",
+   "market": "A",
+   "name": "新乳业",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 136.07
+  },
+  {
+   "symbol": "sh600597",
+   "ticker": "600597.SH",
+   "market": "A",
+   "name": "光明乳业",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 91.94
+  },
+  {
+   "symbol": "hk06186",
+   "ticker": "6186.HK",
+   "market": "HK",
+   "name": "中国飞鹤",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 287.5703
+  },
+  {
+   "symbol": "hk01717",
+   "ticker": "1717.HK",
+   "market": "HK",
+   "name": "澳优",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 21.8712
+  },
+  {
+   "symbol": "hk01112",
+   "ticker": "1112.HK",
+   "market": "HK",
+   "name": "H&H国际控股",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 101.6114
+  },
+  {
+   "symbol": "hk01117",
+   "ticker": "1117.HK",
+   "market": "HK",
+   "name": "现代牧业",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 117.5476
+  },
+  {
+   "symbol": "sh600429",
+   "ticker": "600429.SH",
+   "market": "A",
+   "name": "三元股份",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 68.65
+  },
+  {
+   "symbol": "sz002732",
+   "ticker": "002732.SZ",
+   "market": "A",
+   "name": "燕塘乳业",
+   "subsector": "dairy",
+   "mktcap_yi_at_build": 21.54
+  },
+  {
+   "symbol": "sz002847",
+   "ticker": "002847.SZ",
+   "market": "A",
+   "name": "盐津铺子",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 128.8
+  },
+  {
+   "symbol": "sz002557",
+   "ticker": "002557.SZ",
+   "market": "A",
+   "name": "洽洽食品",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 95.96
+  },
+  {
+   "symbol": "sz300783",
+   "ticker": "300783.SZ",
+   "market": "A",
+   "name": "三只松鼠",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 70.78
+  },
+  {
+   "symbol": "sh603719",
+   "ticker": "603719.SH",
+   "market": "A",
+   "name": "良品铺子",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 39.2
+  },
+  {
+   "symbol": "sz002991",
+   "ticker": "002991.SZ",
+   "market": "A",
+   "name": "甘源食品",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 39.94
+  },
+  {
+   "symbol": "sz003000",
+   "ticker": "003000.SZ",
+   "market": "A",
+   "name": "劲仔食品",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 46.85
+  },
+  {
+   "symbol": "sh603866",
+   "ticker": "603866.SH",
+   "market": "A",
+   "name": "桃李面包",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 67.03
+  },
+  {
+   "symbol": "sh603886",
+   "ticker": "603886.SH",
+   "market": "A",
+   "name": "元祖股份",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 25.3
+  },
+  {
+   "symbol": "hk09985",
+   "ticker": "9985.HK",
+   "market": "HK",
+   "name": "卫龙美味",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 211.5609
+  },
+  {
+   "symbol": "hk00151",
+   "ticker": "0151.HK",
+   "market": "HK",
+   "name": "中国旺旺",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 391.2936
+  },
+  {
+   "symbol": "sh603517",
+   "ticker": "603517.SH",
+   "market": "A",
+   "name": "ST绝味",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 66.18
+  },
+  {
+   "symbol": "hk01458",
+   "ticker": "1458.HK",
+   "market": "HK",
+   "name": "周黑鸭",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 26.2214
+  },
+  {
+   "symbol": "sz002695",
+   "ticker": "002695.SZ",
+   "market": "A",
+   "name": "煌上煌",
+   "subsector": "snacks",
+   "mktcap_yi_at_build": 61.95
+  },
+  {
+   "symbol": "sh603288",
+   "ticker": "603288.SH",
+   "market": "A",
+   "name": "海天味业",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 2095.84
+  },
+  {
+   "symbol": "sh600872",
+   "ticker": "600872.SH",
+   "market": "A",
+   "name": "中炬高新",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 145.33
+  },
+  {
+   "symbol": "sh603027",
+   "ticker": "603027.SH",
+   "market": "A",
+   "name": "千禾味业",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 97.28
+  },
+  {
+   "symbol": "sz002507",
+   "ticker": "002507.SZ",
+   "market": "A",
+   "name": "涪陵榨菜",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 130.51
+  },
+  {
+   "symbol": "sh603317",
+   "ticker": "603317.SH",
+   "market": "A",
+   "name": "天味食品",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 151.66
+  },
+  {
+   "symbol": "sz300999",
+   "ticker": "300999.SZ",
+   "market": "A",
+   "name": "金龙鱼",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 1349.98
+  },
+  {
+   "symbol": "sh605089",
+   "ticker": "605089.SH",
+   "market": "A",
+   "name": "味知香",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 27.97
+  },
+  {
+   "symbol": "sh603755",
+   "ticker": "603755.SH",
+   "market": "A",
+   "name": "日辰股份",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 22.88
+  },
+  {
+   "symbol": "sh600298",
+   "ticker": "600298.SH",
+   "market": "A",
+   "name": "安琪酵母",
+   "subsector": "condiments",
+   "mktcap_yi_at_build": 377.5
+  },
+  {
+   "symbol": "sh603345",
+   "ticker": "603345.SH",
+   "market": "A",
+   "name": "安井食品",
+   "subsector": "frozen_prepared",
+   "mktcap_yi_at_build": 280.63
+  },
+  {
+   "symbol": "sz002216",
+   "ticker": "002216.SZ",
+   "market": "A",
+   "name": "三全食品",
+   "subsector": "frozen_prepared",
+   "mktcap_yi_at_build": 114.65
+  },
+  {
+   "symbol": "sz001215",
+   "ticker": "001215.SZ",
+   "market": "A",
+   "name": "千味央厨",
+   "subsector": "frozen_prepared",
+   "mktcap_yi_at_build": 31.35
+  },
+  {
+   "symbol": "hk02517",
+   "ticker": "2517.HK",
+   "market": "HK",
+   "name": "锅圈",
+   "subsector": "frozen_prepared",
+   "mktcap_yi_at_build": 50.9109
+  },
+  {
+   "symbol": "hk00288",
+   "ticker": "0288.HK",
+   "market": "HK",
+   "name": "万洲国际",
+   "subsector": "frozen_prepared",
+   "mktcap_yi_at_build": 1011.6628
+  },
+  {
+   "symbol": "hk06862",
+   "ticker": "6862.HK",
+   "market": "HK",
+   "name": "海底捞",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 636.5508
+  },
+  {
+   "symbol": "hk09658",
+   "ticker": "9658.HK",
+   "market": "HK",
+   "name": "特海国际",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 71.4028
+  },
+  {
+   "symbol": "hk09922",
+   "ticker": "9922.HK",
+   "market": "HK",
+   "name": "九毛九",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 16.1179
+  },
+  {
+   "symbol": "hk00520",
+   "ticker": "0520.HK",
+   "market": "HK",
+   "name": "呷哺呷哺",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 3.0413
+  },
+  {
+   "symbol": "hk09987",
+   "ticker": "9987.HK",
+   "market": "HK",
+   "name": "百胜中国",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 1268.3373
+  },
+  {
+   "symbol": "hk01405",
+   "ticker": "1405.HK",
+   "market": "HK",
+   "name": "达势股份",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 48.4885
+  },
+  {
+   "symbol": "sh603043",
+   "ticker": "603043.SH",
+   "market": "A",
+   "name": "广州酒家",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 77.38
+  },
+  {
+   "symbol": "sh605108",
+   "ticker": "605108.SH",
+   "market": "A",
+   "name": "同庆楼",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 33.1
+  },
+  {
+   "symbol": "sz002186",
+   "ticker": "002186.SZ",
+   "market": "A",
+   "name": "全聚德",
+   "subsector": "restaurants",
+   "mktcap_yi_at_build": 28.94
+  },
+  {
+   "symbol": "hk02097",
+   "ticker": "2097.HK",
+   "market": "HK",
+   "name": "蜜雪集团",
+   "subsector": "tea_coffee",
+   "mktcap_yi_at_build": 860.2162
+  },
+  {
+   "symbol": "hk01364",
+   "ticker": "1364.HK",
+   "market": "HK",
+   "name": "古茗",
+   "subsector": "tea_coffee",
+   "mktcap_yi_at_build": 561.2519
+  },
+  {
+   "symbol": "hk02555",
+   "ticker": "2555.HK",
+   "market": "HK",
+   "name": "茶百道",
+   "subsector": "tea_coffee",
+   "mktcap_yi_at_build": 69.4488
+  },
+  {
+   "symbol": "hk02150",
+   "ticker": "2150.HK",
+   "market": "HK",
+   "name": "奈雪的茶",
+   "subsector": "tea_coffee",
+   "mktcap_yi_at_build": 12.464
+  },
+  {
+   "symbol": "hk02589",
+   "ticker": "2589.HK",
+   "market": "HK",
+   "name": "沪上阿姨",
+   "subsector": "tea_coffee",
+   "mktcap_yi_at_build": 90.4746
+  },
+  {
+   "symbol": "sh600754",
+   "ticker": "600754.SH",
+   "market": "A",
+   "name": "锦江酒店",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 204.09
+  },
+  {
+   "symbol": "hk01179",
+   "ticker": "1179.HK",
+   "market": "HK",
+   "name": "华住集团-S",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 990.2267
+  },
+  {
+   "symbol": "sh600258",
+   "ticker": "600258.SH",
+   "market": "A",
+   "name": "首旅酒店",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 134.22
+  },
+  {
+   "symbol": "sz000888",
+   "ticker": "000888.SZ",
+   "market": "A",
+   "name": "峨眉山Ａ",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 51.43
+  },
+  {
+   "symbol": "sh603136",
+   "ticker": "603136.SH",
+   "market": "A",
+   "name": "天目湖",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 24.26
+  },
+  {
+   "symbol": "sz002033",
+   "ticker": "002033.SZ",
+   "market": "A",
+   "name": "丽江股份",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 49.23
+  },
+  {
+   "symbol": "sh600138",
+   "ticker": "600138.SH",
+   "market": "A",
+   "name": "中青旅",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 51.03
+  },
+  {
+   "symbol": "sz300859",
+   "ticker": "300859.SZ",
+   "market": "A",
+   "name": "西域旅游",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 42.66
+  },
+  {
+   "symbol": "sz000430",
+   "ticker": "000430.SZ",
+   "market": "A",
+   "name": "张家界",
+   "subsector": "hotel_travel",
+   "mktcap_yi_at_build": 54.08
+  },
+  {
+   "symbol": "hk09961",
+   "ticker": "9961.HK",
+   "market": "HK",
+   "name": "携程集团-S",
+   "subsector": "ota_platform",
+   "mktcap_yi_at_build": 2198.9306
+  },
+  {
+   "symbol": "hk00780",
+   "ticker": "0780.HK",
+   "market": "HK",
+   "name": "同程旅行",
+   "subsector": "ota_platform",
+   "mktcap_yi_at_build": 314.772
+  },
+  {
+   "symbol": "hk06699",
+   "ticker": "6699.HK",
+   "market": "HK",
+   "name": "时代天使",
+   "subsector": "medical_aesthetics",
+   "mktcap_yi_at_build": 162.0627
+  },
+  {
+   "symbol": "sh601888",
+   "ticker": "601888.SH",
+   "market": "A",
+   "name": "中国中免",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 1123.26,
+   "dual_listed_with": "1880.HK"
+  },
+  {
+   "symbol": "hk01880",
+   "ticker": "1880.HK",
+   "market": "HK",
+   "name": "中国中免",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 1032.6649,
+   "dual_listed_with": "601888.SH"
+  },
+  {
+   "symbol": "hk09896",
+   "ticker": "9896.HK",
+   "market": "HK",
+   "name": "名创优品",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 282.6752
+  },
+  {
+   "symbol": "hk06808",
+   "ticker": "6808.HK",
+   "market": "HK",
+   "name": "高鑫零售",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 103.0375
+  },
+  {
+   "symbol": "sh601933",
+   "ticker": "601933.SH",
+   "market": "A",
+   "name": "永辉超市",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 284.71
+  },
+  {
+   "symbol": "sh600859",
+   "ticker": "600859.SH",
+   "market": "A",
+   "name": "王府井",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 110.71
+  },
+  {
+   "symbol": "sh603708",
+   "ticker": "603708.SH",
+   "market": "A",
+   "name": "家家悦",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 59.24
+  },
+  {
+   "symbol": "sz002419",
+   "ticker": "002419.SZ",
+   "market": "A",
+   "name": "天虹股份",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 52.27
+  },
+  {
+   "symbol": "sh600729",
+   "ticker": "600729.SH",
+   "market": "A",
+   "name": "重百集团",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 83.77
+  },
+  {
+   "symbol": "sh600827",
+   "ticker": "600827.SH",
+   "market": "A",
+   "name": "百联股份",
+   "subsector": "duty_free_retail",
+   "mktcap_yi_at_build": 135.6
+  },
+  {
+   "symbol": "hk02020",
+   "ticker": "2020.HK",
+   "market": "HK",
+   "name": "安踏体育",
+   "subsector": "sportswear",
+   "mktcap_yi_at_build": 2012.192
+  },
+  {
+   "symbol": "hk02331",
+   "ticker": "2331.HK",
+   "market": "HK",
+   "name": "李宁",
+   "subsector": "sportswear",
+   "mktcap_yi_at_build": 372.9886
+  },
+  {
+   "symbol": "hk01368",
+   "ticker": "1368.HK",
+   "market": "HK",
+   "name": "特步国际",
+   "subsector": "sportswear",
+   "mktcap_yi_at_build": 100.0767
+  },
+  {
+   "symbol": "hk01361",
+   "ticker": "1361.HK",
+   "market": "HK",
+   "name": "361度",
+   "subsector": "sportswear",
+   "mktcap_yi_at_build": 101.6643
+  },
+  {
+   "symbol": "hk06110",
+   "ticker": "6110.HK",
+   "market": "HK",
+   "name": "滔搏",
+   "subsector": "sportswear",
+   "mktcap_yi_at_build": 76.275
+  },
+  {
+   "symbol": "hk03998",
+   "ticker": "3998.HK",
+   "market": "HK",
+   "name": "波司登",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 549.2363
+  },
+  {
+   "symbol": "sh600398",
+   "ticker": "600398.SH",
+   "market": "A",
+   "name": "海澜之家",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 283.84
+  },
+  {
+   "symbol": "sz002563",
+   "ticker": "002563.SZ",
+   "market": "A",
+   "name": "森马服饰",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 155.18
+  },
+  {
+   "symbol": "sz002832",
+   "ticker": "002832.SZ",
+   "market": "A",
+   "name": "比音勒芬",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 148.84
+  },
+  {
+   "symbol": "sh603877",
+   "ticker": "603877.SH",
+   "market": "A",
+   "name": "太平鸟",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 59.49
+  },
+  {
+   "symbol": "sz002154",
+   "ticker": "002154.SZ",
+   "market": "A",
+   "name": "报喜鸟",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 61.44
+  },
+  {
+   "symbol": "sh601566",
+   "ticker": "601566.SH",
+   "market": "A",
+   "name": "九牧王",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 48.33
+  },
+  {
+   "symbol": "hk03306",
+   "ticker": "3306.HK",
+   "market": "HK",
+   "name": "江南布衣",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 107.4036
+  },
+  {
+   "symbol": "hk01234",
+   "ticker": "1234.HK",
+   "market": "HK",
+   "name": "中国利郎",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 40.5947
+  },
+  {
+   "symbol": "sh603808",
+   "ticker": "603808.SH",
+   "market": "A",
+   "name": "歌力思",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 30.84
+  },
+  {
+   "symbol": "hk01910",
+   "ticker": "1910.HK",
+   "market": "HK",
+   "name": "新秀丽",
+   "subsector": "apparel",
+   "mktcap_yi_at_build": 180.2938
+  },
+  {
+   "symbol": "hk01929",
+   "ticker": "1929.HK",
+   "market": "HK",
+   "name": "周大福",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 1223.4251
+  },
+  {
+   "symbol": "hk06181",
+   "ticker": "6181.HK",
+   "market": "HK",
+   "name": "老铺黄金",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 589.6197
+  },
+  {
+   "symbol": "sh600612",
+   "ticker": "600612.SH",
+   "market": "A",
+   "name": "老凤祥",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 176.97
+  },
+  {
+   "symbol": "sz002867",
+   "ticker": "002867.SZ",
+   "market": "A",
+   "name": "周大生",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 133.84
+  },
+  {
+   "symbol": "sz002345",
+   "ticker": "002345.SZ",
+   "market": "A",
+   "name": "潮宏基",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 91.07
+  },
+  {
+   "symbol": "sh600916",
+   "ticker": "600916.SH",
+   "market": "A",
+   "name": "中国黄金",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 126.5
+  },
+  {
+   "symbol": "hk00116",
+   "ticker": "0116.HK",
+   "market": "HK",
+   "name": "周生生",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 79.0605
+  },
+  {
+   "symbol": "hk00590",
+   "ticker": "0590.HK",
+   "market": "HK",
+   "name": "六福集团",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 142.6672
+  },
+  {
+   "symbol": "sh605599",
+   "ticker": "605599.SH",
+   "market": "A",
+   "name": "菜百股份",
+   "subsector": "gold_jewelry",
+   "mktcap_yi_at_build": 120.63
+  },
+  {
+   "symbol": "sh603605",
+   "ticker": "603605.SH",
+   "market": "A",
+   "name": "珀莱雅",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 226.42
+  },
+  {
+   "symbol": "sh600315",
+   "ticker": "600315.SH",
+   "market": "A",
+   "name": "上海家化",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 116.7
+  },
+  {
+   "symbol": "sz300957",
+   "ticker": "300957.SZ",
+   "market": "A",
+   "name": "贝泰妮",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 138.73
+  },
+  {
+   "symbol": "sz300740",
+   "ticker": "300740.SZ",
+   "market": "A",
+   "name": "水羊股份",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 94.05
+  },
+  {
+   "symbol": "sh603983",
+   "ticker": "603983.SH",
+   "market": "A",
+   "name": "丸美生物",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 112.92
+  },
+  {
+   "symbol": "hk02367",
+   "ticker": "2367.HK",
+   "market": "HK",
+   "name": "巨子生物",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 311.0793
+  },
+  {
+   "symbol": "hk01318",
+   "ticker": "1318.HK",
+   "market": "HK",
+   "name": "毛戈平",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 253.6717
+  },
+  {
+   "symbol": "hk02145",
+   "ticker": "2145.HK",
+   "market": "HK",
+   "name": "上美股份",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 117.4917
+  },
+  {
+   "symbol": "sz003010",
+   "ticker": "003010.SZ",
+   "market": "A",
+   "name": "若羽臣",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 87.07
+  },
+  {
+   "symbol": "sz001328",
+   "ticker": "001328.SZ",
+   "market": "A",
+   "name": "登康口腔",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 51.48
+  },
+  {
+   "symbol": "sh600249",
+   "ticker": "600249.SH",
+   "market": "A",
+   "name": "两面针",
+   "subsector": "cosmetics",
+   "mktcap_yi_at_build": 28.98
+  },
+  {
+   "symbol": "sz300896",
+   "ticker": "300896.SZ",
+   "market": "A",
+   "name": "爱美客",
+   "subsector": "medical_aesthetics",
+   "mktcap_yi_at_build": 305.07
+  },
+  {
+   "symbol": "sh688363",
+   "ticker": "688363.SH",
+   "market": "A",
+   "name": "华熙生物",
+   "subsector": "medical_aesthetics",
+   "mktcap_yi_at_build": 180.39
+  },
+  {
+   "symbol": "sz002612",
+   "ticker": "002612.SZ",
+   "market": "A",
+   "name": "朗姿股份",
+   "subsector": "medical_aesthetics",
+   "mktcap_yi_at_build": 71.1
+  },
+  {
+   "symbol": "sz300888",
+   "ticker": "300888.SZ",
+   "market": "A",
+   "name": "稳健医疗",
+   "subsector": "medical_aesthetics",
+   "mktcap_yi_at_build": 169.47
+  },
+  {
+   "symbol": "sz000963",
+   "ticker": "000963.SZ",
+   "market": "A",
+   "name": "华东医药",
+   "subsector": "medical_aesthetics",
+   "mktcap_yi_at_build": 521.21
+  },
+  {
+   "symbol": "sz000333",
+   "ticker": "000333.SZ",
+   "market": "A",
+   "name": "美的集团",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 6334.02
+  },
+  {
+   "symbol": "sz000651",
+   "ticker": "000651.SZ",
+   "market": "A",
+   "name": "格力电器",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 2234.96
+  },
+  {
+   "symbol": "sh600690",
+   "ticker": "600690.SH",
+   "market": "A",
+   "name": "海尔智家",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 2040.57,
+   "dual_listed_with": "6690.HK"
+  },
+  {
+   "symbol": "hk06690",
+   "ticker": "6690.HK",
+   "market": "HK",
+   "name": "海尔智家",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 1976.8043,
+   "dual_listed_with": "600690.SH"
+  },
+  {
+   "symbol": "sz000921",
+   "ticker": "000921.SZ",
+   "market": "A",
+   "name": "海信家电",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 355.77
+  },
+  {
+   "symbol": "sz002508",
+   "ticker": "002508.SZ",
+   "market": "A",
+   "name": "老板电器",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 149.39
+  },
+  {
+   "symbol": "sz002035",
+   "ticker": "002035.SZ",
+   "market": "A",
+   "name": "华帝股份",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 41.11
+  },
+  {
+   "symbol": "sh600060",
+   "ticker": "600060.SH",
+   "market": "A",
+   "name": "海信视像",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 332.51
+  },
+  {
+   "symbol": "hk01070",
+   "ticker": "1070.HK",
+   "market": "HK",
+   "name": "TCL电子",
+   "subsector": "home_appliance",
+   "mktcap_yi_at_build": 405.6185
+  },
+  {
+   "symbol": "sz002959",
+   "ticker": "002959.SZ",
+   "market": "A",
+   "name": "小熊电器",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 52.17
+  },
+  {
+   "symbol": "sh603486",
+   "ticker": "603486.SH",
+   "market": "A",
+   "name": "科沃斯",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 323.44
+  },
+  {
+   "symbol": "sh688169",
+   "ticker": "688169.SH",
+   "market": "A",
+   "name": "石头科技",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 276.76
+  },
+  {
+   "symbol": "sz002032",
+   "ticker": "002032.SZ",
+   "market": "A",
+   "name": "苏泊尔",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 326.98
+  },
+  {
+   "symbol": "sz002242",
+   "ticker": "002242.SZ",
+   "market": "A",
+   "name": "九阳股份",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 69.28
+  },
+  {
+   "symbol": "sh605555",
+   "ticker": "605555.SH",
+   "market": "A",
+   "name": "德昌股份",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 57.51
+  },
+  {
+   "symbol": "sh603579",
+   "ticker": "603579.SH",
+   "market": "A",
+   "name": "荣泰健康",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 37.4
+  },
+  {
+   "symbol": "hk00669",
+   "ticker": "0669.HK",
+   "market": "HK",
+   "name": "创科实业",
+   "subsector": "small_appliance",
+   "mktcap_yi_at_build": 2602.3763
+  },
+  {
+   "symbol": "sh603833",
+   "ticker": "603833.SH",
+   "market": "A",
+   "name": "欧派家居",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 192.43
+  },
+  {
+   "symbol": "sz002572",
+   "ticker": "002572.SZ",
+   "market": "A",
+   "name": "索菲亚",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 78.78
+  },
+  {
+   "symbol": "sh603816",
+   "ticker": "603816.SH",
+   "market": "A",
+   "name": "顾家家居",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 215.05
+  },
+  {
+   "symbol": "sh603801",
+   "ticker": "603801.SH",
+   "market": "A",
+   "name": "志邦家居",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 25.76
+  },
+  {
+   "symbol": "sz001323",
+   "ticker": "001323.SZ",
+   "market": "A",
+   "name": "慕思股份",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 81.23
+  },
+  {
+   "symbol": "sh603008",
+   "ticker": "603008.SH",
+   "market": "A",
+   "name": "ST喜临门",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 28.36
+  },
+  {
+   "symbol": "sz000910",
+   "ticker": "000910.SZ",
+   "market": "A",
+   "name": "大亚圣象",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 29.18
+  },
+  {
+   "symbol": "sh603208",
+   "ticker": "603208.SH",
+   "market": "A",
+   "name": "江山欧派",
+   "subsector": "furniture_home",
+   "mktcap_yi_at_build": 19.96
+  },
+  {
+   "symbol": "sz301498",
+   "ticker": "301498.SZ",
+   "market": "A",
+   "name": "乖宝宠物",
+   "subsector": "pet",
+   "mktcap_yi_at_build": 164.51
+  },
+  {
+   "symbol": "sz002891",
+   "ticker": "002891.SZ",
+   "market": "A",
+   "name": "中宠股份",
+   "subsector": "pet",
+   "mktcap_yi_at_build": 96.57
+  },
+  {
+   "symbol": "sz300673",
+   "ticker": "300673.SZ",
+   "market": "A",
+   "name": "佩蒂股份",
+   "subsector": "pet",
+   "mktcap_yi_at_build": 32.74
+  },
+  {
+   "symbol": "sz301335",
+   "ticker": "301335.SZ",
+   "market": "A",
+   "name": "天元宠物",
+   "subsector": "pet",
+   "mktcap_yi_at_build": 28.28
+  },
+  {
+   "symbol": "sz001206",
+   "ticker": "001206.SZ",
+   "market": "A",
+   "name": "依依股份",
+   "subsector": "pet",
+   "mktcap_yi_at_build": 31.14
+  },
+  {
+   "symbol": "hk09992",
+   "ticker": "9992.HK",
+   "market": "HK",
+   "name": "泡泡玛特",
+   "subsector": "toys_ip",
+   "mktcap_yi_at_build": 2052.2718
+  },
+  {
+   "symbol": "hk00325",
+   "ticker": "0325.HK",
+   "market": "HK",
+   "name": "布鲁可",
+   "subsector": "toys_ip",
+   "mktcap_yi_at_build": 182.1263
+  },
+  {
+   "symbol": "sz002292",
+   "ticker": "002292.SZ",
+   "market": "A",
+   "name": "奥飞娱乐",
+   "subsector": "toys_ip",
+   "mktcap_yi_at_build": 121.99
+  },
+  {
+   "symbol": "sh603899",
+   "ticker": "603899.SH",
+   "market": "A",
+   "name": "晨光股份",
+   "subsector": "toys_ip",
+   "mktcap_yi_at_build": 203.76
+  },
+  {
+   "symbol": "sz002862",
+   "ticker": "002862.SZ",
+   "market": "A",
+   "name": "实丰文化",
+   "subsector": "toys_ip",
+   "mktcap_yi_at_build": 23.54
+  },
+  {
+   "symbol": "sh603214",
+   "ticker": "603214.SH",
+   "market": "A",
+   "name": "爱婴室",
+   "subsector": "maternal_baby",
+   "mktcap_yi_at_build": 18.92
+  },
+  {
+   "symbol": "sz301078",
+   "ticker": "301078.SZ",
+   "market": "A",
+   "name": "孩子王",
+   "subsector": "maternal_baby",
+   "mktcap_yi_at_build": 90.92
+  },
+  {
+   "symbol": "hk01086",
+   "ticker": "1086.HK",
+   "market": "HK",
+   "name": "好孩子国际",
+   "subsector": "maternal_baby",
+   "mktcap_yi_at_build": 15.2273
+  },
+  {
+   "symbol": "hk01797",
+   "ticker": "1797.HK",
+   "market": "HK",
+   "name": "东方甄选",
+   "subsector": "education",
+   "mktcap_yi_at_build": 222.8667
+  },
+  {
+   "symbol": "hk09901",
+   "ticker": "9901.HK",
+   "market": "HK",
+   "name": "新东方-S",
+   "subsector": "education",
+   "mktcap_yi_at_build": 647.4049
+  },
+  {
+   "symbol": "hk00839",
+   "ticker": "0839.HK",
+   "market": "HK",
+   "name": "中教控股",
+   "subsector": "education",
+   "mktcap_yi_at_build": 50.1256
+  },
+  {
+   "symbol": "hk01769",
+   "ticker": "1769.HK",
+   "market": "HK",
+   "name": "思考乐教育",
+   "subsector": "education",
+   "mktcap_yi_at_build": 5.9293
+  },
+  {
+   "symbol": "sh605098",
+   "ticker": "605098.SH",
+   "market": "A",
+   "name": "行动教育",
+   "subsector": "education",
+   "mktcap_yi_at_build": 64.56
+  },
+  {
+   "symbol": "sz000526",
+   "ticker": "000526.SZ",
+   "market": "A",
+   "name": "学大教育",
+   "subsector": "education",
+   "mktcap_yi_at_build": 40.26
+  },
+  {
+   "symbol": "hk09988",
+   "ticker": "9988.HK",
+   "market": "HK",
+   "name": "阿里巴巴-W",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 22990.8117
+  },
+  {
+   "symbol": "hk03690",
+   "ticker": "3690.HK",
+   "market": "HK",
+   "name": "美团-W",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 5385.0147
+  },
+  {
+   "symbol": "hk09618",
+   "ticker": "9618.HK",
+   "market": "HK",
+   "name": "京东集团-SW",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 2962.176
+  },
+  {
+   "symbol": "hk01024",
+   "ticker": "1024.HK",
+   "market": "HK",
+   "name": "快手-W",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 1733.2766
+  },
+  {
+   "symbol": "hk00241",
+   "ticker": "0241.HK",
+   "market": "HK",
+   "name": "阿里健康",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 524.8885
+  },
+  {
+   "symbol": "hk06618",
+   "ticker": "6618.HK",
+   "market": "HK",
+   "name": "京东健康",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 1259.8647
+  },
+  {
+   "symbol": "hk09699",
+   "ticker": "9699.HK",
+   "market": "HK",
+   "name": "顺丰同城",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 73.1404
+  },
+  {
+   "symbol": "sz300785",
+   "ticker": "300785.SZ",
+   "market": "A",
+   "name": "值得买",
+   "subsector": "ecommerce_local",
+   "mktcap_yi_at_build": 77.57
+  },
+  {
+   "symbol": "hk02313",
+   "ticker": "2313.HK",
+   "market": "HK",
+   "name": "申洲国际",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 623.3764
+  },
+  {
+   "symbol": "sz300979",
+   "ticker": "300979.SZ",
+   "market": "A",
+   "name": "华利集团",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 402.15
+  },
+  {
+   "symbol": "hk00551",
+   "ticker": "0551.HK",
+   "market": "HK",
+   "name": "裕元集团",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 220.1451
+  },
+  {
+   "symbol": "hk01044",
+   "ticker": "1044.HK",
+   "market": "HK",
+   "name": "恒安国际",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 284.6711
+  },
+  {
+   "symbol": "sz002511",
+   "ticker": "002511.SZ",
+   "market": "A",
+   "name": "中顺洁柔",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 90.06
+  },
+  {
+   "symbol": "sz002831",
+   "ticker": "002831.SZ",
+   "market": "A",
+   "name": "裕同科技",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 348.36
+  },
+  {
+   "symbol": "sz002701",
+   "ticker": "002701.SZ",
+   "market": "A",
+   "name": "奥瑞金",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 122.1
+  },
+  {
+   "symbol": "sz301004",
+   "ticker": "301004.SZ",
+   "market": "A",
+   "name": "嘉益股份",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 49.92
+  },
+  {
+   "symbol": "hk06969",
+   "ticker": "6969.HK",
+   "market": "HK",
+   "name": "思摩尔国际",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 531.2775
+  },
+  {
+   "symbol": "hk06055",
+   "ticker": "6055.HK",
+   "market": "HK",
+   "name": "中烟香港",
+   "subsector": "consumer_supply_chain",
+   "mktcap_yi_at_build": 153.138
+  },
+  {
+   "symbol": "sz002570",
+   "ticker": "002570.SZ",
+   "market": "A",
+   "name": "贝因美",
+   "subsector": "maternal_baby",
+   "mktcap_yi_at_build": 49.36
+  },
+  {
+   "symbol": "sz002762",
+   "ticker": "002762.SZ",
+   "market": "A",
+   "name": "金发拉比",
+   "subsector": "maternal_baby",
+   "mktcap_yi_at_build": 36.04
+  },
+  {
+   "symbol": "sz002707",
+   "ticker": "002707.SZ",
+   "market": "A",
+   "name": "众信旅游",
+   "subsector": "ota_platform",
+   "mktcap_yi_at_build": 50.32
+  },
+  {
+   "symbol": "sz000524",
+   "ticker": "000524.SZ",
+   "market": "A",
+   "name": "岭南控股",
+   "subsector": "ota_platform",
+   "mktcap_yi_at_build": 62.6
+  }
+ ]
+}
+

@@ -2126,6 +2126,226 @@ async def test_terminal_card_failure_creates_one_discord_failure_alert(world: Wo
 
 
 @pytest.mark.asyncio
+async def test_terminal_text_failure_alerts_once_and_sent_text_does_not(world: World) -> None:
+    body = "# 中国消费周报\n\n本周无结构性变化\n"
+    saved = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text=body,
+        report_run_id="china-consumer-weekly-2026-11-13",
+    )
+    assert saved["ok"] is True
+    assert saved["content_kind"] == "text"
+    assert saved["payload"]["text"] == body
+    assert saved["payload"]["failure_target_snapshot"] == [world.discord_target]
+    early = await reports.ensure_report_failure_alert(world.execution_id)
+    assert early["code"] == "not_terminal"
+    assert early["targets"] == [world.discord_target]
+    await _mark_cards_failed(world, world.execution_id, attempt=1, error_code="http_500")
+    assert (await reports.ensure_report_failure_alert(world.execution_id))["code"] == "not_terminal"
+    for code in ("unknown", "in_flight", "partial"):
+        await _mark_cards_failed(world, world.execution_id, attempt=3, error_code=code)
+        uncertain = await reports.ensure_report_failure_alert(world.execution_id)
+        assert uncertain["code"] == "not_terminal"
+    assert _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE) == []
+
+    await _mark_cards_failed(world, world.execution_id, attempt=3, error_code="http_500")
+    created = await reports.ensure_report_failure_alert(world.execution_id)
+    again = await reports.ensure_report_failure_alert(world.execution_id)
+    assert created["code"] == "created"
+    assert created["created"] is True
+    assert created["targets"] == [world.discord_target]
+    assert again["code"] == "exists"
+    assert again["created"] is False
+    alerts = _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(alerts) == 1
+    assert alerts[0]["channel"] == "discord"
+    assert alerts[0]["target"] == world.discord_target
+    assert alerts[0]["status"] == "pending"
+    original = _sourced(await _rows(world), world.execution_id, "automation_report")
+    assert len(original) == 2
+    assert all(row["payload_json"]["content_kind"] == "text" for row in original)
+    assert all(row["payload_json"]["text"] == body for row in original)
+    assert all(
+        row["payload_json"]["failure_target_snapshot"] == [world.discord_target]
+        for row in original
+    )
+
+    sent_id, sent_thread, sent_run = await _add_execution(world)
+    sent = await _submit(
+        world,
+        execution_id=sent_id,
+        thread_id=sent_thread,
+        run_id=sent_run,
+        cards=None,
+        failure_text=None,
+        text=body + "已发送\n",
+        report_run_id="china-consumer-weekly-sent",
+    )
+    assert sent["created"] is True
+    for target in (world.chat_a, world.chat_b):
+        await _set_delivery(
+            world,
+            sent_id,
+            target,
+            status="sent",
+            attempt=1,
+            error_code=None,
+        )
+    quiet = await reports.ensure_report_failure_alert(sent_id)
+    assert quiet["code"] == "not_terminal"
+    assert _sourced(await _rows(world), sent_id, reports.FAILURE_ALERT_SOURCE) == []
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_skips_body_targets_and_sends_other_targets_once(
+    world: World,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failure recipient that already holds the body is not inserted again."""
+    caplog.set_level(logging.WARNING, logger=reports.logger.name)
+    body = "# 中国消费周报\n\n本周无结构性变化\n"
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            text_targets=[world.discord_target],
+            failure_targets=[world.discord_target],
+        ),
+    )
+    saved = await _submit(
+        world,
+        cards=None,
+        failure_text=None,
+        text=body,
+        report_run_id="overlap-text",
+    )
+    assert saved["ok"] is True
+    assert saved["targets"] == [world.discord_target]
+    early = await reports.ensure_report_failure_alert(world.execution_id)
+    assert early["code"] == "not_terminal"
+    assert "failure_target_is_delivery_target" not in caplog.text
+    await _set_delivery(
+        world,
+        world.execution_id,
+        world.discord_target,
+        status="failed",
+        attempt=3,
+        error_code="http_500",
+    )
+    skipped = await reports.ensure_report_failure_alert(world.execution_id)
+    assert skipped == {
+        "ok": True,
+        "code": "failure_target_is_delivery_target",
+        "created": False,
+        "targets": [world.discord_target],
+    }
+    repeated = await reports.ensure_report_failure_alert(world.execution_id)
+    assert repeated["ok"] is True
+    assert repeated["code"] == "failure_target_is_delivery_target"
+    assert repeated["created"] is False
+    assert _sourced(await _rows(world), world.execution_id, reports.FAILURE_ALERT_SOURCE) == []
+    assert "failure_target_is_delivery_target" in caplog.text
+
+    extra = "discord:user:123456789012345678"
+    partial_id, partial_thread, partial_run = await _add_execution(world)
+    await _set_metadata(
+        world,
+        _profile(
+            world.chat_a,
+            world.chat_b,
+            world.discord_target,
+            text_targets=[world.discord_target],
+            failure_targets=[world.discord_target, extra],
+        ),
+    )
+    partial_saved = await _submit(
+        world,
+        execution_id=partial_id,
+        thread_id=partial_thread,
+        run_id=partial_run,
+        cards=None,
+        failure_text=None,
+        text=body + "部分重叠\n",
+        report_run_id="partial-overlap-text",
+    )
+    assert partial_saved["ok"] is True
+    assert partial_saved["targets"] == [world.discord_target]
+    await _set_delivery(
+        world,
+        partial_id,
+        world.discord_target,
+        status="failed",
+        attempt=3,
+        error_code="http_500",
+    )
+    partial = await reports.ensure_report_failure_alert(partial_id)
+    partial_again = await reports.ensure_report_failure_alert(partial_id)
+    assert partial["ok"] is True
+    assert partial["code"] == "created"
+    assert partial["created"] is True
+    assert partial["targets"] == [extra]
+    assert partial_again["code"] == "exists"
+    assert partial_again["created"] is False
+    partial_alerts = _sourced(await _rows(world), partial_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(partial_alerts) == 1
+    assert partial_alerts[0]["target"] == extra
+    assert partial_alerts[0]["status"] == "pending"
+
+    caplog.clear()
+    await _set_metadata(
+        world,
+        _profile(world.chat_a, world.chat_b, world.discord_target),
+    )
+    distinct_id, distinct_thread, distinct_run = await _add_execution(world)
+    distinct = await _submit(
+        world,
+        execution_id=distinct_id,
+        thread_id=distinct_thread,
+        run_id=distinct_run,
+        cards=None,
+        failure_text=None,
+        text=body + "另一目标\n",
+        report_run_id="distinct-text",
+    )
+    assert distinct["ok"] is True
+    assert distinct["targets"] == [world.chat_a, world.chat_b]
+    await _mark_cards_failed(world, distinct_id, attempt=3, error_code="http_500")
+    created = await reports.ensure_report_failure_alert(distinct_id)
+    again = await reports.ensure_report_failure_alert(distinct_id)
+    assert created["ok"] is True
+    assert created["code"] == "created"
+    assert created["created"] is True
+    assert created["targets"] == [world.discord_target]
+    assert again["code"] == "exists"
+    distinct_alerts = _sourced(await _rows(world), distinct_id, reports.FAILURE_ALERT_SOURCE)
+    assert len(distinct_alerts) == 1
+    assert distinct_alerts[0]["target"] == world.discord_target
+
+    card_id, card_thread, card_run = await _add_execution(world)
+    cards = await _submit(
+        world,
+        execution_id=card_id,
+        thread_id=card_thread,
+        run_id=card_run,
+        report_run_id="distinct-cards",
+    )
+    assert cards["ok"] is True
+    assert cards["content_kind"] == "cards"
+    assert cards["targets"] == [world.chat_a, world.chat_b]
+    await _mark_cards_failed(world, card_id, attempt=3, error_code="http_500")
+    card_alert = await reports.ensure_report_failure_alert(card_id)
+    assert card_alert["ok"] is True
+    assert card_alert["code"] == "created"
+    assert card_alert["targets"] == [world.discord_target]
+    assert len(_sourced(await _rows(world), card_id, reports.FAILURE_ALERT_SOURCE)) == 1
+    assert "failure_target_is_delivery_target" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_failure_alert_skips_recovered_cards_and_catchup_sends_once(
     world: World,
     monkeypatch: pytest.MonkeyPatch,
@@ -2835,7 +3055,7 @@ async def test_text_submit_stores_text_targets_and_replays(world: World) -> None
     assert saved["payload"]["expected_item_count"] == 1
     assert "cards" not in saved["payload"]
     assert "failure_text" not in saved["payload"]
-    assert "failure_target_snapshot" not in saved["payload"]
+    assert saved["payload"]["failure_target_snapshot"] == [world.discord_target]
     rows = _report_rows(await _rows(world))
     assert len(rows) == 1
     assert rows[0]["channel"] == "discord"

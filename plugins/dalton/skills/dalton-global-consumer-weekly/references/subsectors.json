@@ -1,0 +1,140 @@
+{
+ "meta": {
+  "version": "1.0",
+  "count": 22,
+  "note": "细分口径以本文件为准；universe.json 的 subsector 必须是这里的 key。cross_market=false 的细分某一侧成分不足 2 家，不参与跨市场背离计算，只出单市场指数。"
+ },
+ "subsectors": [
+  {"key": "sportswear", "name_cn": "运动服饰与户外", "cross_market": true,
+   "drivers": ["批发订单与渠道库存", "DTC 占比与折扣率", "跑鞋新品周期", "棉花与运费成本", "中国区需求"],
+   "alphaengine_queries": ["运动服饰 库存 折扣 渠道", "Nike Adidas 订单 纪要"],
+   "guidepoint_queries": ["US athletic footwear wholesale inventory discounting", "running shoe brand share shift Hoka On"],
+   "web_queries": ["athletic footwear inventory discount", "running shoe market share"]},
+
+  {"key": "apparel_footwear", "name_cn": "大众服饰与鞋履", "cross_market": true,
+   "drivers": ["同店销售与客流", "折扣率与售罄率", "关税与到岸成本", "折扣店分流", "换季天气"],
+   "alphaengine_queries": ["美国服饰零售 同店 折扣", "日本服饰 优衣库 同店"],
+   "guidepoint_queries": ["US apparel retail comp sales promotion cadence", "off-price retail inventory availability"],
+   "web_queries": ["apparel retailer comparable sales", "off-price apparel inventory"]},
+
+  {"key": "beer_spirits", "name_cn": "啤酒与烈酒", "cross_market": true,
+   "drivers": ["销量与吨价", "现饮与非现饮渠道", "铝与麦芽成本", "无酒精与低度化", "GLP-1 对饮酒量的影响"],
+   "alphaengine_queries": ["啤酒 销量 吨价 高端化", "烈酒 库存 去化"],
+   "guidepoint_queries": ["US beer depletions off-premise scan data", "spirits distributor inventory destocking"],
+   "web_queries": ["beer depletions scan data", "spirits inventory destocking"]},
+
+  {"key": "soft_drinks", "name_cn": "软饮与能量饮料", "cross_market": true,
+   "drivers": ["销量与定价拆分", "能量饮料份额", "铝罐与糖成本", "便利渠道客流", "新品铺货"],
+   "alphaengine_queries": ["软饮 提价 销量 拆分", "能量饮料 份额"],
+   "guidepoint_queries": ["energy drink convenience channel share Celsius Monster", "carbonated soft drink price mix"],
+   "web_queries": ["energy drink market share scan", "beverage price mix volume"]},
+
+  {"key": "packaged_food", "name_cn": "包装食品", "cross_market": true,
+   "drivers": ["销量与提价拆分", "自有品牌替代", "谷物与油脂成本", "GLP-1 对食量的影响", "货架份额"],
+   "alphaengine_queries": ["包装食品 销量 提价 自有品牌", "日本食品 提价 转嫁"],
+   "guidepoint_queries": ["US packaged food private label trade down", "GLP-1 impact packaged food volume"],
+   "web_queries": ["packaged food private label share", "food volume price mix"]},
+
+  {"key": "snacks_confection", "name_cn": "零食与糖果", "cross_market": true,
+   "drivers": ["可可与糖成本", "提价接受度与弹性", "冲动消费与便利渠道", "节庆备货"],
+   "alphaengine_queries": ["零食 糖果 可可 成本 提价", "日本零食 提价"],
+   "guidepoint_queries": ["chocolate cocoa cost pass through elasticity", "salty snack category volume trend"],
+   "web_queries": ["cocoa cost chocolate pricing", "salty snacks volume decline"]},
+
+  {"key": "dairy", "name_cn": "乳制品", "cross_market": false,
+   "drivers": ["原奶收购价", "高附加值品类", "功能性乳饮", "冷链与渠道"],
+   "alphaengine_queries": ["乳制品 原奶 成本 高附加值"],
+   "guidepoint_queries": ["Japan dairy pricing raw milk cost pass through"],
+   "web_queries": ["raw milk price dairy margin"]},
+
+  {"key": "restaurants_qsr", "name_cn": "快餐连锁", "cross_market": true,
+   "drivers": ["同店销售拆分客流与客单", "价值菜单与促销", "牛肉与人工成本", "外卖占比", "新开店节奏"],
+   "alphaengine_queries": ["快餐 同店 客流 客单 促销", "日本外食 同店"],
+   "guidepoint_queries": ["QSR traffic value menu franchisee margin", "restaurant beef cost labor pressure"],
+   "web_queries": ["QSR same store sales traffic", "fast food value menu war"]},
+
+  {"key": "restaurants_casual", "name_cn": "休闲正餐", "cross_market": true,
+   "drivers": ["同店与客流", "客单价与菜单提价", "食材与人工成本", "单店模型与开店回报"],
+   "alphaengine_queries": ["正餐 同店 客单 开店回报"],
+   "guidepoint_queries": ["casual dining traffic check average unit economics", "fast casual new unit returns"],
+   "web_queries": ["casual dining traffic trend", "fast casual unit economics"]},
+
+  {"key": "coffee_tea", "name_cn": "咖啡与茶饮", "cross_market": false,
+   "drivers": ["咖啡豆成本", "同店与客流", "会员与数字化订单", "定价与杯量"],
+   "alphaengine_queries": ["咖啡 连锁 同店 成本"],
+   "guidepoint_queries": ["coffee chain traffic mobile order throughput", "arabica cost pass through cafe pricing"],
+   "web_queries": ["coffee chain same store sales", "arabica price cafe cost"]},
+
+  {"key": "beauty_personal", "name_cn": "美妆与个护", "cross_market": true,
+   "drivers": ["中国与旅游零售需求", "线上份额与新锐品牌", "渠道库存", "日元与入境消费"],
+   "alphaengine_queries": ["美妆 中国需求 旅游零售 库存", "日本化妆品 入境 需求"],
+   "guidepoint_queries": ["prestige beauty China travel retail destocking", "mass beauty share shift indie brands"],
+   "web_queries": ["prestige beauty China demand", "beauty market share indie brand"]},
+
+  {"key": "household_products", "name_cn": "家清与个人护理用品", "cross_market": true,
+   "drivers": ["销量与提价拆分", "自有品牌替代", "树脂与浆价成本", "货架份额与促销"],
+   "alphaengine_queries": ["家清 日化 销量 提价 自有品牌"],
+   "guidepoint_queries": ["household products private label trade down volume", "diaper category share Japan China"],
+   "web_queries": ["household products volume price", "private label household share"]},
+
+  {"key": "mass_retail", "name_cn": "大众零售与商超", "cross_market": true,
+   "drivers": ["同店与客流客单", "食品与非食品结构", "会员制与自有品牌", "低收入客群消费降级", "库存周转"],
+   "alphaengine_queries": ["商超 同店 客流 自有品牌", "日本零售 同店 客流"],
+   "guidepoint_queries": ["US mass retail comp traffic ticket trade down", "warehouse club membership renewal"],
+   "web_queries": ["mass retailer comp sales traffic", "consumer trade down grocery"]},
+
+  {"key": "drugstore_conv", "name_cn": "药妆与便利店", "cross_market": true,
+   "drivers": ["入境客与免税销售", "处方与非处方结构", "客流与客单", "燃油与便利渠道联动"],
+   "alphaengine_queries": ["日本 药妆 入境 免税 销售", "便利店 客流"],
+   "guidepoint_queries": ["Japan drugstore inbound tax free sales trend", "convenience store traffic fuel margin"],
+   "web_queries": ["Japan drugstore inbound sales", "convenience store same store sales"]},
+
+  {"key": "ecommerce", "name_cn": "电商与本地生活平台", "cross_market": true,
+   "drivers": ["GMV 与订单量", "履约成本与配送效率", "广告变现率", "补贴与竞争强度", "第三方卖家结构"],
+   "alphaengine_queries": ["电商 GMV 订单 变现率", "日本电商 乐天 GMV"],
+   "guidepoint_queries": ["US ecommerce GMV order growth take rate", "food delivery incentive competition margin"],
+   "web_queries": ["ecommerce GMV order growth", "food delivery competition subsidy"]},
+
+  {"key": "specialty_retail", "name_cn": "专业零售", "cross_market": false,
+   "drivers": ["大件可选消费需求", "房地产与装修周期", "同店与客单", "自有品牌与专供"],
+   "alphaengine_queries": ["专业零售 同店 大件消费"],
+   "guidepoint_queries": ["home improvement big ticket demand pro customer", "specialty retail comp traffic"],
+   "web_queries": ["home improvement big ticket demand", "specialty retail comparable sales"]},
+
+  {"key": "home_durables", "name_cn": "家居与家电", "cross_market": true,
+   "drivers": ["房屋成交与搬家周期", "利率敏感度", "大件延迟购买", "关税与到岸成本", "促销强度"],
+   "alphaengine_queries": ["家居 家电 需求 利率 大件"],
+   "guidepoint_queries": ["furniture demand housing turnover deferral", "appliance replacement cycle promotion"],
+   "web_queries": ["furniture demand housing turnover", "appliance demand replacement cycle"]},
+
+  {"key": "pet", "name_cn": "宠物", "cross_market": false,
+   "drivers": ["养宠数量与新增", "高端化与鲜食渗透", "谷物与蛋白成本", "线上份额", "兽医服务价格"],
+   "alphaengine_queries": ["宠物 食品 高端化 渗透"],
+   "guidepoint_queries": ["US pet food premiumization fresh adoption", "pet category household penetration trend"],
+   "web_queries": ["pet food premium fresh growth", "pet ownership trend US"]},
+
+  {"key": "toys_ip", "name_cn": "玩具与IP消费", "cross_market": true,
+   "drivers": ["IP 新品周期与授权", "主机与软件销量", "收藏与潮玩渠道", "节庆备货与补库"],
+   "alphaengine_queries": ["玩具 IP 授权 新品", "任天堂 主机 软件 销量"],
+   "guidepoint_queries": ["toy retail sell through licensing cycle", "console software attach rate"],
+   "web_queries": ["toy industry sell through", "console hardware software sales"]},
+
+  {"key": "travel_lodging", "name_cn": "酒店旅游与邮轮", "cross_market": true,
+   "drivers": ["RevPAR 与入住率", "邮轮订舱与票价", "航空客运量", "入境与出境客流", "商旅与休闲结构"],
+   "alphaengine_queries": ["酒店 RevPAR 入住率", "邮轮 订舱 票价", "日本 入境 旅游"],
+   "guidepoint_queries": ["US hotel RevPAR group business transient mix", "cruise booking curve pricing"],
+   "web_queries": ["hotel RevPAR trend", "cruise booking pricing 2026"]},
+
+  {"key": "leisure_gaming", "name_cn": "博彩与休闲娱乐", "cross_market": true,
+   "drivers": ["澳门与拉斯维加斯博彩收入", "线上博彩 handle 与 hold", "会员与到店客流", "促销与返还率"],
+   "alphaengine_queries": ["博彩 收入 澳门 拉斯维加斯", "线上博彩 handle"],
+   "guidepoint_queries": ["Macau GGR mass segment recovery", "US online sports betting handle hold rate"],
+   "web_queries": ["Macau GGR monthly", "sports betting handle hold"]},
+
+  {"key": "tobacco", "name_cn": "烟草与新型烟草", "cross_market": false,
+   "drivers": ["卷烟销量与提价", "加热不燃烧渗透", "尼古丁袋增长", "监管与税收", "非法电子烟挤压"],
+   "alphaengine_queries": ["烟草 销量 提价 新型烟草"],
+   "guidepoint_queries": ["heated tobacco IQOS penetration Japan", "nicotine pouch category growth US"],
+   "web_queries": ["heated tobacco penetration", "nicotine pouch growth"]}
+ ]
+}
