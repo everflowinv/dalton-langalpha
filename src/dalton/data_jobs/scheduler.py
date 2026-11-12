@@ -1328,14 +1328,24 @@ def resolve_notify_status(
     notify_enabled: bool,
     has_outbox_payload: bool,
     is_trial: bool = False,
+    notify_on_failure: bool = False,
 ) -> str:
     """Compute ``notify_status`` for a completed run (§3.4.1).
 
     Trial runs (`is_trial == True`, i.e. manual runs claimed while task `enabled == False`)
-    never dispatch live notifications: when `terminal_status == 'succeeded'`,
+    never dispatch live notifications: when the run produced a payload,
     `notify_status` is always `'preview_only'` regardless of `notify_enabled`.
+
+    ``notify_on_failure`` keeps an outbox that OpenClaw itself would send on
+    failure (ai-chain DEV text, FDE weekly failure text). Other failed runs
+    stay ``skipped``. Live dispatch still requires ``notify_enabled``.
     """
-    if terminal_status != "succeeded":
+    failure_notify = (
+        notify_on_failure
+        and terminal_status == "failed"
+        and has_outbox_payload
+    )
+    if terminal_status != "succeeded" and not failure_notify:
         return "skipped"
     if is_trial:
         return "preview_only"
@@ -1423,12 +1433,52 @@ async def finalize_task_run(
 
     terminal_status = evaluation.status
     has_outbox = outbox_payload is not None
+    notify_on_failure = (
+        isinstance(outbox_payload, Mapping) and outbox_payload.get("notify_on_failure") is True
+    )
     notify_status = resolve_notify_status(
         terminal_status=terminal_status,
         notify_enabled=claimed.notify_enabled,
         has_outbox_payload=has_outbox,
         is_trial=claimed.is_trial,
+        notify_on_failure=notify_on_failure,
     )
+    if (
+        notify_status == "pending_dispatch"
+        and isinstance(outbox_payload, dict)
+        and isinstance(outbox_payload.get("delivery_writeback"), Mapping)
+    ):
+        try:
+            from src.dalton.data_jobs.batch3_messages import capture_delivery_writeback_snapshot
+
+            started_at = await _load_run_started_at(conn, claimed.run_id)
+            writeback = outbox_payload.get("delivery_writeback")
+            if isinstance(writeback, dict):
+                if started_at:
+                    writeback["run_started_at"] = started_at
+                writeback["run_id"] = str(claimed.run_id)
+            outbox_payload = capture_delivery_writeback_snapshot(
+                outbox_payload,
+                workspace=paths.backend_data_root,
+                run_dir=paths.backend_run_artifacts_dir(claimed.run_id),
+            )
+        except (DataTaskNotificationPrepError, OSError, ValueError) as cap_exc:
+            outbox_payload = None
+            evaluation = TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"report_preparation_failed: {cap_exc}",
+                warnings=list(evaluation.warnings),
+                details={**evaluation.details, "report_prep_code": "writeback_snapshot_failed"},
+            )
+            terminal_status = evaluation.status
+            notify_status = resolve_notify_status(
+                terminal_status=terminal_status,
+                notify_enabled=claimed.notify_enabled,
+                has_outbox_payload=False,
+                is_trial=claimed.is_trial,
+                notify_on_failure=False,
+            )
     serialized_outbox = (
         json.dumps(outbox_payload, ensure_ascii=False) if outbox_payload is not None else None
     )
@@ -2082,6 +2132,20 @@ async def execute_claimed_container_run(
     )
 
 
+_BBG_HOST_JOB_KEYS = frozenset({"bbg-data-pull-asia", "bbg-data-pull-us"})
+
+
+def _manifest_host_command(job_key: str) -> tuple[list[str], str] | None:
+    """Return the manifest host argv and cwd, so a stale DB row cannot drift."""
+    try:
+        entry = load_data_task_manifest().by_job_key().get(job_key)
+    except Exception:
+        return None
+    if entry is None or entry.runner != "host":
+        return None
+    return list(entry.command_argv), str(entry.cwd)
+
+
 async def execute_claimed_host_run(
     conn: Any,
     *,
@@ -2132,6 +2196,15 @@ async def execute_claimed_host_run(
 
     async def _run_once_with_heartbeats(gen: int) -> tuple[HostRunOutcome | None, bool]:
         await check_scheduler_lock(lock_conn)
+        host_command_kwargs: dict[str, Any] = {}
+        if claimed.job_key not in _BBG_HOST_JOB_KEYS:
+            manifest_command = _manifest_host_command(claimed.job_key)
+            if manifest_command is not None:
+                host_command_kwargs["command_argv"] = manifest_command[0]
+                host_command_kwargs["cwd"] = manifest_command[1]
+            elif claimed.command_argv:
+                host_command_kwargs["command_argv"] = list(claimed.command_argv)
+                host_command_kwargs["cwd"] = claimed.workdir
         run_coro = host_client.run_host_task(
             generation=gen,
             run_id=claimed.run_id,
@@ -2140,6 +2213,7 @@ async def execute_claimed_host_run(
             scheduled_slot_utc=scheduled_slot_iso,
             timeout=claimed.timeout_seconds,
             no_output_timeout=claimed.no_output_timeout_seconds,
+            **host_command_kwargs,
         )
         run_task: asyncio.Task[HostRunOutcome] = asyncio.create_task(run_coro)
         timed_out_local = False
@@ -2717,6 +2791,249 @@ async def _invoke_claim_target(
     return (claimed_ok, 1 if claimed_ok else None)
 
 
+def _coerce_outbox_payload(payload: Any) -> Mapping[str, Any] | None:
+    if isinstance(payload, str) and payload.strip():
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(payload, Mapping):
+        return payload
+    return None
+
+
+def _outbox_has_delivery_writeback(payload: Any) -> bool:
+    mapped = _coerce_outbox_payload(payload)
+    return isinstance(mapped, Mapping) and isinstance(mapped.get("delivery_writeback"), Mapping)
+
+
+# Same bound as notify delivery ``max_attempts`` (default 3 in
+# ``src.dalton.notify.dispatch``). A failed writeback is not retried forever.
+WRITEBACK_FAILURE_ATTEMPT_LIMIT = 3
+
+
+def _writeback_abandon_reason(attempts: int) -> str:
+    return (
+        f"writeback failed {attempts} times; "
+        "stopped retrying and did not resend the notification"
+    )
+
+
+def _writeback_attempt_count(payload: Any) -> int:
+    mapped = _coerce_outbox_payload(payload)
+    if not isinstance(mapped, Mapping):
+        return 0
+    raw = mapped.get("writeback_attempts")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
+async def _load_run_started_at(conn: Any, run_id: str) -> str | None:
+    """Read ``dalton_data_task_runs.started_at`` for writeback ordering.
+
+    UUID ``run_id`` is not time-ordered. A datetime is returned as UTC ISO text.
+    A scripted row that is not a timestamp returns ``None``.
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT started_at
+            FROM dalton_data_task_runs
+            WHERE run_id = %(run_id)s::uuid
+            """,
+            {"run_id": str(run_id)},
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    value = _extract_field(row, "started_at", 0)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+async def _persist_writeback_status(
+    conn: Any,
+    run_id: str,
+    status: str,
+    *,
+    attempts: int | None = None,
+    reason: str | None = None,
+) -> None:
+    """Store writeback status on the existing ``outbox_payload`` JSON object.
+
+    ``attempts`` and ``reason`` are omitted when null, so a ``done`` update does
+    not erase a previous attempt count. ``abandoned`` drops out of the retry
+    scan, which only selects ``pending`` and ``failed``.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE dalton_data_task_runs
+            SET outbox_payload = outbox_payload || jsonb_strip_nulls(jsonb_build_object(
+                    'writeback_status', %(status)s::text,
+                    'writeback_attempts', %(attempts)s::int,
+                    'writeback_abandon_reason', %(reason)s::text
+                )),
+                updated_at = NOW()
+            WHERE run_id = %(run_id)s::uuid
+              AND jsonb_typeof(outbox_payload) = 'object'
+              AND outbox_payload ? 'delivery_writeback'
+            """,
+            {
+                "run_id": str(run_id),
+                "status": status,
+                "attempts": attempts,
+                "reason": reason,
+            },
+        )
+
+
+async def _store_writeback_outcome(
+    conn: Any,
+    run_id: str,
+    status: str,
+    payload: Any,
+) -> str:
+    """Persist one writeback result. Only ``failed`` consumes an attempt.
+
+    The attempt that reaches the cap is stored as ``abandoned`` with a reason.
+    ``done`` (including an older-run skip or a hash mismatch) does not count
+    and does not send the notification again.
+    """
+    attempts: int | None = None
+    reason: str | None = None
+    if status == "failed":
+        attempts = _writeback_attempt_count(payload) + 1
+        if attempts >= WRITEBACK_FAILURE_ATTEMPT_LIMIT:
+            status = "abandoned"
+            reason = _writeback_abandon_reason(attempts)
+    await _persist_writeback_status(
+        conn,
+        run_id,
+        status,
+        attempts=attempts,
+        reason=reason,
+    )
+    return status
+
+
+async def _complete_confirmed_delivery_writeback(
+    conn: Any,
+    *,
+    run_id: str,
+    job_key: str,
+    db_outbox_payload: Any,
+    path_map: DataTaskPathMap | None,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_data_task_gateway_notify,
+) -> str:
+    """Write this run's snapshotted state. Never sends the original notification.
+
+    An ETF Discord mirror is a separate gateway send to the snapshotted targets.
+    File failures and mirror failures return ``failed`` so the scan can retry.
+    A superseded ai-chain file is ``done`` inside ``apply`` and is not retried.
+    """
+    from src.dalton.data_jobs.batch3_messages import apply_confirmed_delivery_writeback
+
+    paths = path_map or build_path_map()
+    mapped = _coerce_outbox_payload(db_outbox_payload)
+    try:
+        mirror_targets = apply_confirmed_delivery_writeback(
+            mapped,
+            paths.backend_data_root,
+            "dispatched",
+            run_artifacts_dir=paths.backend_run_artifacts_dir(str(run_id)),
+        )
+        if mirror_targets:
+            posted = await post_notify_fn(list(mirror_targets), run_id=str(run_id))
+            if (
+                not isinstance(posted, Mapping)
+                or posted.get("ok") is not True
+                or str(posted.get("status") or "") != "sent"
+            ):
+                detail = posted.get("error") if isinstance(posted, Mapping) else posted
+                raise RuntimeError(f"etf discord mirror failed: {detail}")
+        return "done"
+    except Exception as writeback_exc:
+        logger.warning(
+            "Confirmed delivery for run_id=%s job_key=%s was not written back: %s",
+            run_id,
+            job_key,
+            writeback_exc,
+        )
+        return "failed"
+
+
+async def retry_unfinished_delivery_writebacks(
+    conn: Any,
+    *,
+    lock_conn: Any,
+    path_map: DataTaskPathMap | None = None,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_data_task_gateway_notify,
+) -> list[tuple[str, str]]:
+    """Retry file writeback for dispatched runs. Does not send the original message.
+
+    Called beside ``dispatch_pending_data_task_notifications``. An empty scan
+    does not take the scheduler lock, so existing lock-step tests stay put.
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT r.run_id::text AS run_id,
+                   r.job_key,
+                   r.outbox_payload
+            FROM dalton_data_task_runs r
+            WHERE r.notify_status = 'dispatched'
+              AND jsonb_typeof(r.outbox_payload) = 'object'
+              AND r.outbox_payload ? 'delivery_writeback'
+              AND COALESCE(r.outbox_payload->>'writeback_status', '') IN ('pending', 'failed')
+            ORDER BY r.completed_at ASC NULLS LAST, r.created_at ASC
+            """
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        return []
+
+    results: list[tuple[str, str]] = []
+    for row in rows:
+        await check_scheduler_lock(lock_conn)
+        run_id = str(_extract_field(row, "run_id", 0))
+        job_key = str(_extract_field(row, "job_key", 1))
+        payload = _extract_field(row, "outbox_payload", 2)
+        mapped = _coerce_outbox_payload(payload)
+        attempts_so_far = _writeback_attempt_count(mapped)
+        if (
+            isinstance(mapped, Mapping)
+            and str(mapped.get("writeback_status") or "") == "failed"
+            and attempts_so_far >= WRITEBACK_FAILURE_ATTEMPT_LIMIT
+        ):
+            await _persist_writeback_status(
+                conn,
+                run_id,
+                "abandoned",
+                attempts=attempts_so_far,
+                reason=_writeback_abandon_reason(attempts_so_far),
+            )
+            results.append((run_id, "abandoned"))
+            continue
+        status = await _complete_confirmed_delivery_writeback(
+            conn,
+            run_id=run_id,
+            job_key=job_key,
+            db_outbox_payload=payload,
+            path_map=path_map,
+            post_notify_fn=post_notify_fn,
+        )
+        status = await _store_writeback_outcome(conn, run_id, status, payload)
+        results.append((run_id, status))
+    return results
+
+
 async def dispatch_data_task_run_notification(
     conn: Any,
     *,
@@ -3225,6 +3542,7 @@ async def dispatch_data_task_run_notification(
             terminal_notify_status = "skipped"
 
     await check_scheduler_lock(lock_conn)
+    notify_rowcount = 0
     async with conn.transaction():
         async with conn.cursor() as cur:
             await cur.execute(
@@ -3240,6 +3558,26 @@ async def dispatch_data_task_run_notification(
                     "notify_status": terminal_notify_status,
                 },
             )
+            notify_rowcount = int(cur.rowcount or 0)
+    if (
+        terminal_notify_status == "dispatched"
+        and notify_rowcount == 1
+        and _outbox_has_delivery_writeback(db_outbox_payload)
+    ):
+        writeback_status = await _complete_confirmed_delivery_writeback(
+            conn,
+            run_id=str(run_id),
+            job_key=job_key,
+            db_outbox_payload=db_outbox_payload,
+            path_map=path_map,
+            post_notify_fn=post_notify_fn,
+        )
+        await _store_writeback_outcome(
+            conn,
+            str(run_id),
+            writeback_status,
+            db_outbox_payload,
+        )
     return terminal_notify_status
 
 
@@ -3444,6 +3782,10 @@ async def run_data_task_scheduler_loop(
                         )
 
                 await dispatch_pending_data_task_notifications(
+                    work_conn,
+                    lock_conn=lock_conn,
+                )
+                await retry_unfinished_delivery_writebacks(
                     work_conn,
                     lock_conn=lock_conn,
                 )

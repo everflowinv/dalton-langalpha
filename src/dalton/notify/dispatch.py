@@ -1046,9 +1046,18 @@ def resolve_notify_route_targets(
 
 
 def _is_chat_target(target: str) -> bool:
-    from src.dalton.llm.model_prefs import is_dalton_chat_target
+    """A route entry that is delivered with the group side, not the personal list.
 
-    return is_dalton_chat_target(target)
+    Feishu groups stay on ``is_dalton_chat_target`` so Discord channels do not
+    trigger Feishu group discovery. Both still ride along when the owner is
+    allowed to use non-personal route entries.
+    """
+    from src.dalton.llm.model_prefs import (
+        is_dalton_chat_target,
+        is_dalton_discord_channel_target,
+    )
+
+    return is_dalton_chat_target(target) or is_dalton_discord_channel_target(target)
 
 
 async def _default_notify_admin(user_id: str | None) -> bool:

@@ -61,10 +61,11 @@ DALTON_NOTIFY_LABEL_MAX_CHARS = 40
 _FEISHU_NOTIFY_TARGET_RE = re.compile(r"^feishu:user:ou_[A-Za-z0-9_-]+$")
 _FEISHU_CHAT_NOTIFY_TARGET_RE = re.compile(r"^feishu:chat:oc_[A-Za-z0-9_-]+$")
 _DISCORD_NOTIFY_TARGET_RE = re.compile(r"^discord:user:[0-9]+$")
+_DISCORD_CHANNEL_NOTIFY_TARGET_RE = re.compile(r"^discord:channel:[0-9]{5,32}$")
 
 
 def is_valid_dalton_notify_target(target: str) -> bool:
-    """Return True when ``target`` matches ``feishu:user:ou_<id>``, ``feishu:chat:oc_<id>`` or ``discord:user:<digits>``."""
+    """Return True for a Feishu user, Feishu group, Discord user, or Discord channel target."""
     if not isinstance(target, str):
         return False
     cleaned = target.strip()
@@ -72,23 +73,43 @@ def is_valid_dalton_notify_target(target: str) -> bool:
         _FEISHU_NOTIFY_TARGET_RE.match(cleaned)
         or _FEISHU_CHAT_NOTIFY_TARGET_RE.match(cleaned)
         or _DISCORD_NOTIFY_TARGET_RE.match(cleaned)
+        or _DISCORD_CHANNEL_NOTIFY_TARGET_RE.match(cleaned)
     )
 
 
 def is_dalton_chat_target(target: str) -> bool:
-    """True when ``target`` is a Feishu group target (``feishu:chat:oc_<id>``)."""
+    """True when ``target`` is a Feishu group target (``feishu:chat:oc_<id>``).
+
+    Discord channels are valid route targets, but they are not Feishu groups:
+    naming one must not start Feishu group discovery.
+    """
     if not isinstance(target, str):
         return False
     return bool(_FEISHU_CHAT_NOTIFY_TARGET_RE.match(target.strip()))
 
 
+def is_dalton_discord_channel_target(target: str) -> bool:
+    """True for ``discord:channel:<5-32 digits>`` (an OpenClaw Discord channel id)."""
+    if not isinstance(target, str):
+        return False
+    return bool(_DISCORD_CHANNEL_NOTIFY_TARGET_RE.match(target.strip()))
+
+
+def _route_target_skips_personal_list(target: str) -> bool:
+    """Feishu groups and Discord channels ride on a route, not the personal DM list."""
+    return is_dalton_chat_target(target) or is_dalton_discord_channel_target(target)
+
+
 def is_valid_dalton_personal_target(target: str) -> bool:
     """A target a user may keep in their own list: a personal DM only (``feishu:user:``/``discord:user:``).
 
-    Group targets (``feishu:chat:``) never enter ``dalton_notify_targets``; they
-    only ever appear inside an admin's route entries.
+    Group targets (``feishu:chat:``) and Discord channels never enter
+    ``dalton_notify_targets``; they only appear inside an admin's route entries.
     """
-    return is_valid_dalton_notify_target(target) and not is_dalton_chat_target(target)
+    return (
+        is_valid_dalton_notify_target(target)
+        and not _route_target_skips_personal_list(target)
+    )
 
 
 def normalize_dalton_notify_label(raw: Any) -> str:
@@ -758,7 +779,7 @@ def validate_dalton_model_preferences(
                     if not isinstance(item, str) or not is_valid_dalton_notify_target(item):
                         raise TuningError(
                             DALTON_NOTIFY_ROUTES_KEY,
-                            f"{DALTON_NOTIFY_ROUTES_KEY}: 目标格式无效 {item!r}，仅支持 feishu:user:<open_id>、feishu:chat:<chat_id> 或 discord:user:<数字id>",
+                            f"{DALTON_NOTIFY_ROUTES_KEY}: 目标格式无效 {item!r}，仅支持 feishu:user:<open_id>、feishu:chat:<chat_id>、discord:user:<数字id> 或 discord:channel:<数字id>",
                         )
                     cleaned_route_target = item.strip()
                     if cleaned_route_target not in seen_route_targets:
@@ -843,7 +864,7 @@ def _validate_and_prune_notify_target_refs(
                 cleaned_item = item.strip() if isinstance(item, str) else ""
                 if (
                     cleaned_item
-                    and not is_dalton_chat_target(cleaned_item)
+                    and not _route_target_skips_personal_list(cleaned_item)
                     and cleaned_item not in target_set
                 ):
                     raise TuningError(
@@ -869,7 +890,7 @@ def _validate_and_prune_notify_target_refs(
             kept = [
                 t
                 for t in original
-                if is_dalton_chat_target(t) or t in target_set
+                if _route_target_skips_personal_list(t) or t in target_set
             ]
             if kept != original:
                 # An emptied route is `[]` (deliver nowhere), never null.
@@ -885,7 +906,7 @@ def _validate_and_prune_notify_target_refs(
             cleaned_key = label_target.strip() if isinstance(label_target, str) else ""
             if (
                 cleaned_key
-                and not is_dalton_chat_target(cleaned_key)
+                and not _route_target_skips_personal_list(cleaned_key)
                 and cleaned_key not in target_set
             ):
                 label_cleanup[cleaned_key] = None

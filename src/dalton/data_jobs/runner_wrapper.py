@@ -82,6 +82,15 @@ TASK_NOTIFY_PAYLOAD_SOURCES: dict[str, str] = {
     "ah-premium-pm": "stdout_json",  # T44
     "softbank-nav-monitor": "outbox_file",  # T52
     "tsmc-adr-premium": "outbox_file",  # T54
+    "ai-chain-daily": "outbox_file",  # T20
+    "us-etf-monthly-flows": "outbox_file",  # T76
+    "vol-surface-daily-snapshot": "none",  # T42
+    "gs-pb-weekly-rundown": "none",  # T58
+    "fde-hiring-snapshot-daily": "none",  # T9
+    "fde-hiring-weekly-report": "stdout_text",  # T73
+    "semi-rescue-alert-am": "stdout_json",  # T36
+    "semi-rescue-alert-pm": "stdout_json",  # T16
+    "semi-bottom-checklist-1030et": "stdout_text",  # T83
 }
 
 _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
@@ -96,6 +105,15 @@ _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
     "T26": "outbox_file",
     "T52": "outbox_file",
     "T54": "outbox_file",
+    "T20": "outbox_file",
+    "T76": "outbox_file",
+    "T42": "none",
+    "T58": "none",
+    "T9": "none",
+    "T73": "stdout_text",
+    "T36": "stdout_json",
+    "T16": "stdout_json",
+    "T83": "stdout_text",
 }
 
 
@@ -395,6 +413,25 @@ def persist_redacted_outbox(
                 run_artifacts_dir=outbox_path.parent,
                 redactor=redactor,
             )
+
+    from src.dalton.data_jobs.batch3_messages import SUPPRESS_OUTBOX, adjust_batch3_payload
+
+    adjusted = adjust_batch3_payload(
+        job_key=str(job_key),
+        payload=raw_payload if isinstance(raw_payload, dict) else None,
+        stdout_text=stdout_text,
+        workspace_dir=Path(workspace_dir) if workspace_dir is not None else None,
+        run_artifacts_dir=outbox_path.parent,
+    )
+    if adjusted is SUPPRESS_OUTBOX:
+        if outbox_path.is_file() and not outbox_path.is_symlink():
+            outbox_path.unlink(missing_ok=True)
+        return None
+    if isinstance(adjusted, dict):
+        raw_payload = adjusted
+
+    if raw_payload is None:
+        return None
 
     redacted = redactor.redact_value(raw_payload)
     if not isinstance(redacted, dict):

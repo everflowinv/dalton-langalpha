@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 import copy
 from dataclasses import dataclass, field
 import hashlib
+import json
 from pathlib import Path, PurePosixPath
 import re
 from typing import Any
@@ -51,6 +52,7 @@ ALLOWED_IMAGE_EXTENSIONS: dict[str, str] = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
+MARKDOWN_ARTIFACT_MIME = "text/markdown"
 
 CARD_MARKDOWN_MAX_CHARS = 2000
 IMG_LINE_RE = re.compile(r"^IMG:(\S+)\s*$")
@@ -525,6 +527,21 @@ def _detect_validated_image_mime(data: bytes, filename: str, *, max_bytes: int =
     return actual_mime
 
 
+def _detect_validated_artifact_mime(data: bytes, filename: str, *, max_bytes: int = MAX_NOTIFICATION_ARTIFACT_BYTES) -> str:
+    """Accept a Markdown file attachment as ``text/markdown``. Images stay byte-checked."""
+    ext = Path(filename).suffix.lower()
+    if ext == ".md":
+        if not data:
+            raise DataTaskArtifactError("Artifact file is empty", code="artifact_empty")
+        if len(data) > max_bytes:
+            raise DataTaskArtifactError(
+                f"Artifact exceeds maximum size ({len(data)} > {max_bytes} bytes)",
+                code="artifact_too_large",
+            )
+        return MARKDOWN_ARTIFACT_MIME
+    return _detect_validated_image_mime(data, filename, max_bytes=max_bytes)
+
+
 def _safe_read_contained_regular_file(
     base_dir: Path,
     relative_path: str,
@@ -973,8 +990,10 @@ def prepare_run_outbox_image_metadata(
             try:
                 norm_rel = "/".join(_normalize_strict_relative_parts(str(raw_media).strip()))
                 data = _safe_read_contained_regular_file(run_artifacts_dir, norm_rel)
-                fname = sanitize_artifact_filename(PurePosixPath(norm_rel).name)
-                _detect_validated_image_mime(data, fname)
+                preferred = item_obj.get("filename")
+                raw_name = preferred if isinstance(preferred, str) and preferred.strip() else PurePosixPath(norm_rel).name
+                fname = sanitize_artifact_filename(str(raw_name))
+                _detect_validated_artifact_mime(data, fname)
             except DataTaskNotificationError as exc:
                 raise DataTaskNotificationPrepError(str(exc), code=exc.code) from exc
 
@@ -1047,7 +1066,7 @@ def _validate_and_register_run_artifact(
     norm_rel = "/".join(_normalize_strict_relative_parts(rel_path))
     data = _safe_read_contained_regular_file(run_artifacts_dir, norm_rel)
     filename = sanitize_artifact_filename(preferred_filename or PurePosixPath(norm_rel).name)
-    mime_type = _detect_validated_image_mime(data, filename)
+    mime_type = _detect_validated_artifact_mime(data, filename)
     actual_size = len(data)
     actual_sha256 = hashlib.sha256(data).hexdigest()
 
@@ -1120,12 +1139,137 @@ def _validate_and_register_run_artifact(
     return descriptor, internal_ref
 
 
+def _etf_mirror_route(
+    raw_outbox: Mapping[str, Any],
+    run_artifacts_dir: Path,
+) -> tuple[bool, list[str]]:
+    """Return whether the ETF Discord mirror is usable, and its targets.
+
+    A snapshot with ``skipped`` true is not usable. File targets replace the
+    spec targets when the file lists any. A missing or unreadable snapshot
+    leaves the spec targets in place so a real mirror target still fails closed
+    inside the mirror plan.
+    """
+    spec = raw_outbox.get("delivery_writeback")
+    skipped = False
+    targets: list[str] = []
+    if isinstance(spec, Mapping) and spec.get("kind") == "etf_discord_mirror":
+        skipped = spec.get("mirror_skipped") is True
+        raw_targets = spec.get("targets")
+        if isinstance(raw_targets, list):
+            targets = [str(item).strip() for item in raw_targets if str(item or "").strip()]
+    try:
+        data = _safe_read_contained_regular_file(run_artifacts_dir, "writeback/etf_mirror.json")
+        raw = json.loads(data.decode("utf-8"))
+    except (OSError, DataTaskNotificationError, ValueError):
+        raw = None
+    if isinstance(raw, dict):
+        if raw.get("skipped") is True:
+            skipped = True
+        file_targets = raw.get("targets")
+        if isinstance(file_targets, list):
+            cleaned = [str(item).strip() for item in file_targets if str(item or "").strip()]
+            if cleaned:
+                targets = cleaned
+    return (not skipped) and bool(targets), targets
+
+
+def etf_discord_mirror_plan_target(
+    raw_outbox: Mapping[str, Any] | None,
+    run_artifacts_dir: Path,
+) -> str | None:
+    """First snapshotted Discord target, or ``None`` when the mirror was skipped."""
+    if not isinstance(raw_outbox, Mapping):
+        return None
+    usable, targets = _etf_mirror_route(raw_outbox, run_artifacts_dir)
+    if not usable:
+        return None
+    return targets[0]
+
+
+def _etf_discord_mirror_applies(
+    raw_outbox: Mapping[str, Any],
+    run_artifacts_dir: Path,
+    delivery_target: str | None,
+) -> bool:
+    """True only when this delivery target is one recorded by the mirror snapshot."""
+    target = str(delivery_target or "").strip()
+    if not target:
+        return False
+    usable, targets = _etf_mirror_route(raw_outbox, run_artifacts_dir)
+    return usable and target in targets
+
+
+def _build_etf_discord_mirror_plan(
+    *,
+    run_id: str,
+    job_key: str,
+    run_artifacts_dir: Path,
+) -> ResolvedDataTaskPlan:
+    """Discord copy of an ETF card, using only the snapshotted messages."""
+    data = _safe_read_contained_regular_file(run_artifacts_dir, "writeback/etf_mirror.json")
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except ValueError as exc:
+        raise DataTaskNotificationError("ETF Discord mirror snapshot is not JSON") from exc
+    if not isinstance(raw, dict):
+        raise DataTaskNotificationError("ETF Discord mirror snapshot is not an object")
+    if raw.get("skipped") is True:
+        raise DataTaskNotificationError(
+            "ETF Discord mirror was skipped for this run",
+            code="mirror_skipped",
+        )
+    messages = raw.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise DataTaskNotificationError("ETF Discord mirror has no snapshotted messages")
+    artifacts_by_id: dict[str, InternalArtifactRef] = {}
+    plan_items: list[DataTaskDeliveryItem] = []
+    for index, text in enumerate(messages):
+        if not isinstance(text, str) or not text:
+            raise DataTaskNotificationError(f"ETF Discord mirror message {index} is empty")
+        plan_items.append(DataTaskDeliveryItem(item_index=index, kind="text", text=text))
+    images = raw.get("images") or []
+    if not isinstance(images, list):
+        raise DataTaskNotificationError("ETF Discord mirror images must be a list")
+    next_index = len(plan_items)
+    for image in images:
+        if not isinstance(image, Mapping):
+            raise DataTaskNotificationError("ETF Discord mirror image entry is invalid")
+        artifact_id = f"item{next_index}-media0"
+        desc, iref = _validate_and_register_run_artifact(
+            artifact_id=artifact_id,
+            rel_path=str(image.get("rel") or ""),
+            run_artifacts_dir=run_artifacts_dir,
+            expected_size_bytes=image.get("size_bytes"),
+            expected_sha256=image.get("sha256"),
+            preferred_filename=str(image.get("filename") or "") or None,
+        )
+        artifacts_by_id[artifact_id] = iref
+        plan_items.append(
+            DataTaskDeliveryItem(
+                item_index=next_index,
+                kind="text_and_file",
+                text="",
+                artifact=desc,
+            )
+        )
+        next_index += 1
+    return ResolvedDataTaskPlan(
+        run_id=run_id,
+        job_key=job_key,
+        items=tuple(plan_items),
+        artifacts_by_id=artifacts_by_id,
+    )
+
+
 def build_data_task_delivery_plan(
     *,
     run_id: str,
     job_key: str,
     raw_outbox: Mapping[str, Any] | None,
     run_artifacts_dir: Path,
+    delivery_platform: str | None = None,
+    delivery_target: str | None = None,
 ) -> ResolvedDataTaskPlan:
     """Validate persisted report payload and artifacts for ``run_id`` into an immutable plan."""
     norm_run_id = normalize_run_uuid(run_id)
@@ -1134,6 +1278,17 @@ def build_data_task_delivery_plan(
         raise DataTaskNotificationError("job_key is required")
     if not isinstance(raw_outbox, Mapping) or not raw_outbox:
         raise DataTaskNotificationError("Run has no persisted notification outbox payload", code="empty_payload")
+
+    if (
+        cleaned_job_key == "us-etf-monthly-flows"
+        and str(delivery_platform or "").strip().lower() == "discord"
+        and _etf_discord_mirror_applies(raw_outbox, run_artifacts_dir, delivery_target)
+    ):
+        return _build_etf_discord_mirror_plan(
+            run_id=norm_run_id,
+            job_key=cleaned_job_key,
+            run_artifacts_dir=run_artifacts_dir,
+        )
 
     if cleaned_job_key == T27_JOB_KEY and not is_t27_outbox_prepared(raw_outbox):
         raise DataTaskNotificationPrepError(
@@ -1270,8 +1425,15 @@ def build_data_task_delivery_plan(
             raw_media = item_obj.get("media")
             has_media = isinstance(raw_media, str) and bool(raw_media.strip())
 
+            keep_exact_text = (
+                item_obj.get("preserve_exact_text") is True
+                or raw_outbox.get("preserve_exact_text") is True
+            )
+            if keep_exact_text:
+                item_text = str(item_obj.get("text") or "")
+
             if cleaned_job_key == T26_JOB_KEY:
-                if not item_text:
+                if not item_text.strip():
                     raise DataTaskNotificationError(f"T26 item {ordered_idx} has empty text")
                 if not has_media:
                     raise DataTaskArtifactError(f"T26 item {ordered_idx} is missing required chart media")
@@ -1285,12 +1447,14 @@ def build_data_task_delivery_plan(
 
             if has_media:
                 artifact_id = f"item{ordered_idx}-media0"
+                preferred_name = item_obj.get("filename")
                 desc, iref = _validate_and_register_run_artifact(
                     artifact_id=artifact_id,
                     rel_path=str(raw_media).strip(),
                     run_artifacts_dir=run_artifacts_dir,
                     expected_size_bytes=item_obj.get("chart_bytes"),
                     expected_sha256=item_obj.get("chart_sha256"),
+                    preferred_filename=preferred_name if isinstance(preferred_name, str) and preferred_name.strip() else None,
                 )
                 artifacts_by_id[artifact_id] = iref
                 plan_items.append(
@@ -1302,7 +1466,7 @@ def build_data_task_delivery_plan(
                     )
                 )
             else:
-                if not item_text:
+                if not item_text.strip():
                     raise DataTaskNotificationError(f"Item {ordered_idx} has neither text nor media")
                 plan_items.append(
                     DataTaskDeliveryItem(
@@ -1322,11 +1486,15 @@ def build_data_task_delivery_plan(
     # Format 3: Single card or plain/markdown text outbox
     raw_single_card = raw_outbox.get("card")
     text_val = ""
-    for text_key in ("feishu_message", "message", "text", "summary"):
-        candidate = raw_outbox.get(text_key)
-        if isinstance(candidate, str) and candidate.strip():
-            text_val = candidate.strip()
-            break
+    exact_text = raw_outbox.get("text") if raw_outbox.get("preserve_exact_text") is True else None
+    if isinstance(exact_text, str) and exact_text.strip():
+        text_val = exact_text
+    else:
+        for text_key in ("feishu_message", "message", "text", "summary"):
+            candidate = raw_outbox.get(text_key)
+            if isinstance(candidate, str) and candidate.strip():
+                text_val = candidate.strip()
+                break
 
     if isinstance(raw_single_card, Mapping):
         card_copy = _upgrade_card_envelope_if_needed(raw_single_card)
@@ -1397,7 +1565,7 @@ def read_validated_run_artifact(
         raise DataTaskArtifactNotFoundError(f"Artifact {cleaned_id!r} is not part of run {norm_run_id}")
 
     data = _safe_read_contained_regular_file(run_artifacts_dir, ref.rel_path)
-    mime_type = _detect_validated_image_mime(data, ref.filename)
+    mime_type = _detect_validated_artifact_mime(data, ref.filename)
     actual_size = len(data)
     actual_sha256 = hashlib.sha256(data).hexdigest()
 
