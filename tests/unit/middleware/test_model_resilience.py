@@ -12,6 +12,23 @@ from ptc_agent.agent.middleware.model_resilience import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_model_resilience_logger(monkeypatch):
+    # DALTON-HOOK(fallback-reason-log): under xdist an earlier test in the same
+    # worker may run configure_structlog, which caches this module logger's
+    # first bind (cache_logger_on_first_use). capture_logs then cannot see its
+    # lines. A fresh proxy with caching off binds inside each capture.
+    import structlog
+
+    from ptc_agent.agent.middleware import model_resilience
+
+    saved = structlog.get_config()
+    structlog.configure(cache_logger_on_first_use=False)
+    monkeypatch.setattr(model_resilience, "logger", structlog.get_logger(model_resilience.__name__))
+    yield
+    structlog.configure(**saved)
+
+
 class _FakeModel:
     def __init__(self, name, thinking=None):
         self.model = name
