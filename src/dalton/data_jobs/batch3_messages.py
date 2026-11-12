@@ -23,10 +23,22 @@ from src.dalton.data_jobs.notification_payloads import DataTaskNotificationPrepE
 
 logger = logging.getLogger(__name__)
 
-# OpenClaw cron ``delivery.to`` for the two announce tasks. ai-chain and ETF
-# keep using the overlay constants DEV and TRACKING.
+# OpenClaw cron ``delivery.to`` for announce tasks. ai-chain and ETF keep using
+# the overlay constants DEV and TRACKING. Batch 4 personal targets stay in the
+# OpenClaw ``user:`` / ``ou_`` form here; ``canonical_route_target`` is what the
+# notification route and the binding check consume.
 FDE_WEEKLY_DISCORD_TARGET = "channel:1481256083589697566"
 SEMI_BOTTOM_DISCORD_TARGET = "channel:1480405100672581875"
+E_WATCH_DISCORD_DM = "user:1134818575211839498"
+A_SHARE_FEISHU_DM = "user:ou_75b483fb76c31370c715e3a3df1e0a61"
+E_WATCH_INTRADAY_JOB_KEY = "e-watch-intraday"
+A_SHARE_VOLUME_JOB_KEY = "a-share-bottom-volume-watch"
+_ANNOUNCE_STDOUT_TARGETS: dict[str, tuple[str, str]] = {
+    E_WATCH_INTRADAY_JOB_KEY: ("discord", E_WATCH_DISCORD_DM),
+    "T2": ("discord", E_WATCH_DISCORD_DM),
+    A_SHARE_VOLUME_JOB_KEY: ("feishu", A_SHARE_FEISHU_DM),
+    "T38": ("feishu", A_SHARE_FEISHU_DM),
+}
 FDE_WEEKLY_FAILURE_PREFIX = "⚠️ FDE 周报生成失败（"
 
 SEMI_RESCUE_JOB_KEYS = frozenset({"semi-rescue-alert-am", "semi-rescue-alert-pm"})
@@ -171,6 +183,31 @@ def _read_json_file(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def canonical_route_target(channel: str, openclaw_target: str) -> str:
+    """Map an OpenClaw ``channel`` + ``target`` to a Dalton notify route string.
+
+    Discord ``user:`` / ``channel:`` and Feishu ``user:`` / ``chat:`` keep their
+    prefix. A bare Feishu chat id ``oc_…`` becomes ``feishu:chat:oc_…``.
+    """
+    platform = str(channel or "").strip().lower()
+    target = str(openclaw_target or "").strip()
+    if platform == "discord" and (target.startswith("user:") or target.startswith("channel:")):
+        return f"discord:{target}"
+    if platform == "feishu" and (target.startswith("user:") or target.startswith("chat:")):
+        return f"feishu:{target}"
+    if platform == "feishu" and target.startswith("oc_"):
+        return f"feishu:chat:{target}"
+    raise ValueError(f"无法转换成通知路由目标：{platform} {target}")
+
+
+def _canonical_announce_job_key(job_key: str) -> str:
+    if job_key in {E_WATCH_INTRADAY_JOB_KEY, "T2"}:
+        return E_WATCH_INTRADAY_JOB_KEY
+    if job_key in {A_SHARE_VOLUME_JOB_KEY, "T38"}:
+        return A_SHARE_VOLUME_JOB_KEY
+    return job_key
+
+
 def adjust_batch3_payload(
     *,
     job_key: str,
@@ -198,6 +235,15 @@ def adjust_batch3_payload(
         )
     if key == "fde-hiring-weekly-report":
         return _adjust_fde_weekly(payload, stdout_text)
+    if key in _ANNOUNCE_STDOUT_TARGETS:
+        channel, target = _ANNOUNCE_STDOUT_TARGETS[key]
+        return _adjust_announce_stdout(
+            payload,
+            stdout_text,
+            job_key=key,
+            channel=channel,
+            target=target,
+        )
     return None
 
 
@@ -208,6 +254,7 @@ def _adjust_plain_discord(
     job_key: str,
     target: str,
     suppress_no_reply: bool,
+    channel: str = "discord",
 ) -> dict[str, Any] | _SuppressOutbox | None:
     text = stdout_text if stdout_text else str((payload or {}).get("text") or "")
     if not text.strip():
@@ -218,13 +265,42 @@ def _adjust_plain_discord(
     out = dict(payload or {})
     out["job_key"] = job_key
     out["format"] = "text"
-    out["channel"] = "discord"
+    out["channel"] = channel
     out["target"] = target
     out["text"] = text
     out["feishu_message"] = text
     out["preserve_exact_text"] = True
     out.pop("notify_on_failure", None)
     return out
+
+
+def _adjust_announce_stdout(
+    payload: dict[str, Any] | None,
+    stdout_text: str,
+    *,
+    job_key: str,
+    channel: str,
+    target: str,
+) -> dict[str, Any] | _SuppressOutbox | None:
+    """Send the same stdout OpenClaw announce would, including a failure sentence.
+
+    Empty text and a first line of ``NO_REPLY`` are dropped. A kept message is
+    marked ``notify_on_failure`` so a non-zero exit that still printed the
+    sentence (a-share's eight-failure line) is not skipped.
+    """
+    adjusted = _adjust_plain_discord(
+        payload,
+        stdout_text,
+        job_key=_canonical_announce_job_key(job_key),
+        target=target,
+        suppress_no_reply=True,
+        channel=channel,
+    )
+    if adjusted is SUPPRESS_OUTBOX or not isinstance(adjusted, dict):
+        return adjusted
+    adjusted["route_target"] = canonical_route_target(channel, target)
+    adjusted["notify_on_failure"] = True
+    return adjusted
 
 
 def _adjust_fde_weekly(

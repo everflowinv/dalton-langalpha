@@ -53,6 +53,15 @@ ALLOWED_IMAGE_EXTENSIONS: dict[str, str] = {
     ".webp": "image/webp",
 }
 MARKDOWN_ARTIFACT_MIME = "text/markdown"
+PLAIN_TEXT_ARTIFACT_MIME = "text/plain"
+
+# Only these jobs may attach a non-image file. T26 and every other chart stay images.
+_TEXT_ARTIFACT_SUFFIXES_BY_JOB: dict[str, frozenset[str]] = {
+    "ai-chain-daily": frozenset({".md"}),
+    "T20": frozenset({".md"}),
+    "e-watch-daily": frozenset({".txt"}),
+    "T35": frozenset({".txt"}),
+}
 
 CARD_MARKDOWN_MAX_CHARS = 2000
 IMG_LINE_RE = re.compile(r"^IMG:(\S+)\s*$")
@@ -527,10 +536,22 @@ def _detect_validated_image_mime(data: bytes, filename: str, *, max_bytes: int =
     return actual_mime
 
 
-def _detect_validated_artifact_mime(data: bytes, filename: str, *, max_bytes: int = MAX_NOTIFICATION_ARTIFACT_BYTES) -> str:
-    """Accept a Markdown file attachment as ``text/markdown``. Images stay byte-checked."""
+def _text_artifact_suffixes(job_key: str) -> frozenset[str]:
+    """Return the non-image suffixes one job may attach. Unknown jobs get none."""
+    return _TEXT_ARTIFACT_SUFFIXES_BY_JOB.get(str(job_key or "").strip(), frozenset())
+
+
+def _detect_validated_artifact_mime(
+    data: bytes,
+    filename: str,
+    *,
+    max_bytes: int = MAX_NOTIFICATION_ARTIFACT_BYTES,
+    text_suffixes: frozenset[str] | set[str] | None = None,
+) -> str:
+    """Byte-check images. ``.md`` / ``.txt`` are accepted only when ``text_suffixes`` names them."""
     ext = Path(filename).suffix.lower()
-    if ext == ".md":
+    allowed_text = frozenset(text_suffixes or ())
+    if ext in allowed_text and ext in {".md", ".txt"}:
         if not data:
             raise DataTaskArtifactError("Artifact file is empty", code="artifact_empty")
         if len(data) > max_bytes:
@@ -538,6 +559,8 @@ def _detect_validated_artifact_mime(data: bytes, filename: str, *, max_bytes: in
                 f"Artifact exceeds maximum size ({len(data)} > {max_bytes} bytes)",
                 code="artifact_too_large",
             )
+        if ext == ".txt":
+            return PLAIN_TEXT_ARTIFACT_MIME
         return MARKDOWN_ARTIFACT_MIME
     return _detect_validated_image_mime(data, filename, max_bytes=max_bytes)
 
@@ -863,7 +886,7 @@ def prepare_run_outbox_image_metadata(
     Validates any already-supplied byte counts or digests against the actual staged image bytes and
     rejects malformed or mismatched supplied metadata rather than overwriting it.
     """
-    _ = job_key
+    text_suffixes = _text_artifact_suffixes(job_key)
     if raw_outbox is None:
         return None
     if not isinstance(raw_outbox, Mapping):
@@ -993,7 +1016,7 @@ def prepare_run_outbox_image_metadata(
                 preferred = item_obj.get("filename")
                 raw_name = preferred if isinstance(preferred, str) and preferred.strip() else PurePosixPath(norm_rel).name
                 fname = sanitize_artifact_filename(str(raw_name))
-                _detect_validated_artifact_mime(data, fname)
+                _detect_validated_artifact_mime(data, fname, text_suffixes=text_suffixes)
             except DataTaskNotificationError as exc:
                 raise DataTaskNotificationPrepError(str(exc), code=exc.code) from exc
 
@@ -1059,6 +1082,7 @@ def _validate_and_register_run_artifact(
     expected_sha256: str | None = None,
     preferred_filename: str | None = None,
     placeholder: str | None = None,
+    text_suffixes: frozenset[str] | set[str] | None = None,
 ) -> tuple[PlanArtifactDescriptor, InternalArtifactRef]:
     if not ARTIFACT_ID_RE.match(artifact_id):
         raise DataTaskArtifactError(f"Invalid artifact_id: {artifact_id!r}")
@@ -1066,7 +1090,7 @@ def _validate_and_register_run_artifact(
     norm_rel = "/".join(_normalize_strict_relative_parts(rel_path))
     data = _safe_read_contained_regular_file(run_artifacts_dir, norm_rel)
     filename = sanitize_artifact_filename(preferred_filename or PurePosixPath(norm_rel).name)
-    mime_type = _detect_validated_artifact_mime(data, filename)
+    mime_type = _detect_validated_artifact_mime(data, filename, text_suffixes=text_suffixes)
     actual_size = len(data)
     actual_sha256 = hashlib.sha256(data).hexdigest()
 
@@ -1455,6 +1479,7 @@ def build_data_task_delivery_plan(
                     expected_size_bytes=item_obj.get("chart_bytes"),
                     expected_sha256=item_obj.get("chart_sha256"),
                     preferred_filename=preferred_name if isinstance(preferred_name, str) and preferred_name.strip() else None,
+                    text_suffixes=_text_artifact_suffixes(cleaned_job_key),
                 )
                 artifacts_by_id[artifact_id] = iref
                 plan_items.append(
@@ -1565,7 +1590,9 @@ def read_validated_run_artifact(
         raise DataTaskArtifactNotFoundError(f"Artifact {cleaned_id!r} is not part of run {norm_run_id}")
 
     data = _safe_read_contained_regular_file(run_artifacts_dir, ref.rel_path)
-    mime_type = _detect_validated_artifact_mime(data, ref.filename)
+    mime_type = _detect_validated_artifact_mime(
+        data, ref.filename, text_suffixes=_text_artifact_suffixes(plan.job_key),
+    )
     actual_size = len(data)
     actual_sha256 = hashlib.sha256(data).hexdigest()
 

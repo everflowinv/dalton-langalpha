@@ -282,6 +282,8 @@ export async function sendFileDiscord(
     filename: string;
     content: Buffer;
     mimeType: string;
+    /** When set, this is the message content on the same Discord post as the file. */
+    text?: string;
     threadScopeKey?: string | null;
     resolveDmChannelId?: (recipientUserId: string) => Promise<string>;
   },
@@ -317,7 +319,7 @@ export async function sendFileDiscord(
   let response: unknown;
   try {
     response = await rest.post(`/channels/${encodeURIComponent(channelId)}/messages`, {
-      content: "",
+      content: params.text ?? "",
       nonce: createDiscordMessageNonce(),
       files: [file],
     });

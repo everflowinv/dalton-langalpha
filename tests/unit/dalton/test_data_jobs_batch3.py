@@ -1555,7 +1555,9 @@ def test_ai_chain_markdown_high_cards_are_discord_file_attachments(tmp_path: Pat
         }
         media = entry.get("media")
         if media:
-            src = overlay._validate_workspace_chart(media, workspace, workspace)
+            src = overlay._validate_workspace_chart(
+                media, workspace, workspace, allowed_suffixes=overlay.AI_CHAIN_CARD_SUFFIXES,
+            )
             original_name = Path(src.name).name
             retained = overlay._ensure_safe_workspace_subpath(
                 workspace, (*run_rel, "attachments", str(pos), original_name)

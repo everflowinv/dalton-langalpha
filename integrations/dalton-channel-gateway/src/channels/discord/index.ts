@@ -20,6 +20,7 @@ import {
   type AvailableChatsResult, type ChannelAdapter, ChannelDeliveryError,
   type CheckTargetLiveResult, type DownloadedAttachment, type ListAvailableChatsOptions,
   type SendFileOptions, type SendFileResult, type SendTextChunkOptions, type SendTextChunkResult,
+  type SendTextWithFileOptions,
 } from "../adapter.js";
 import { chunkDiscordText, DISCORD_MAX_CHARS } from "./chunk.js";
 import {
@@ -845,6 +846,20 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       filename: options.filename,
       content: options.content,
       mimeType: options.mimeType,
+      threadScopeKey: options.threadScopeKey,
+      resolveDmChannelId: (id) => this.resolveDmChannelId(id),
+    });
+    return { messageId: res.messageId, status: "sent", reason: null };
+  }
+
+  async sendTextWithFile(options: SendTextWithFileOptions): Promise<SendFileResult> {
+    const res = await sendFileDiscord(this.getRest(), {
+      targetAddress: options.targetAddress,
+      recipientPlatformUserId: options.recipientPlatformUserId,
+      filename: options.filename,
+      content: options.content,
+      mimeType: options.mimeType,
+      text: options.text,
       threadScopeKey: options.threadScopeKey,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
     });
