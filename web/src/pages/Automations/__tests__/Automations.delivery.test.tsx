@@ -353,7 +353,7 @@ describe('per-task Feishu/Discord notify switches on Automations page', () => {
     });
     expect(earnSwitch).toHaveAttribute('aria-checked', 'true');
     expect(earnSwitch).toBeDisabled();
-    expect(screen.getByText('在设置里打开飞书提醒')).toBeInTheDocument();
+    expect(screen.getByText('在设置里打开推送总开关')).toBeInTheDocument();
 
     // Non-pushable watch task does not render a switch
     expect(
@@ -365,7 +365,7 @@ describe('per-task Feishu/Discord notify switches on Automations page', () => {
   });
 
   // DALTON-HOOK(dalton-notify): verify toggling per-task switch submits only changed key and reads back override
-  it('saves only the single changed task key and reads back per-task override when master switch 飞书提醒 is enabled', async () => {
+  it('saves only the single changed task key and reads back per-task override when master switch 推送总开关 is enabled', async () => {
     prefMocks.preferences = {
       model_preference: {
         dalton_notify_enabled: true,
@@ -382,7 +382,7 @@ describe('per-task Feishu/Discord notify switches on Automations page', () => {
     });
     expect(earnSwitch).not.toBeDisabled();
     expect(earnSwitch).toHaveAttribute('aria-checked', 'true');
-    expect(screen.queryByText('在设置里打开飞书提醒')).not.toBeInTheDocument();
+    expect(screen.queryByText('在设置里打开推送总开关')).not.toBeInTheDocument();
 
     fireEvent.click(earnSwitch);
     await waitFor(() => {

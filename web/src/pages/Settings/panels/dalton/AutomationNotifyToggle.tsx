@@ -63,7 +63,7 @@ export function AutomationNotifyToggle({
     <div
       className="flex shrink-0 items-center gap-1.5"
       data-testid={`dalton-notify-toggle-${automation.name}`}
-      title={!masterEnabled ? '在设置里打开飞书提醒' : undefined}
+      title={!masterEnabled ? '在设置里打开推送总开关' : undefined}
     >
       <span
         className="text-xs"
@@ -87,7 +87,7 @@ export function AutomationNotifyToggle({
           className="text-[11px]"
           style={{ color: 'var(--color-text-tertiary)' }}
         >
-          在设置里打开飞书提醒
+          在设置里打开推送总开关
         </span>
       )}
     </div>

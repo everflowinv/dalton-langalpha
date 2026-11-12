@@ -433,8 +433,11 @@ describe("Settings: the user's instructions", () => {
 
     fireEvent.change(nonAdminSearch, { target: { value: '飞书' } });
     expect(screen.queryByText('Feishu read scopes')).not.toBeInTheDocument();
-    // Notification targets is every member's own card, so it still answers "飞书".
-    expect(await screen.findByText('Notification targets')).toBeInTheDocument();
+    // The master push switch is every member's own card, so it still answers "飞书".
+    expect(await screen.findByText('Master push switch')).toBeInTheDocument();
+    // DALTON-HOOK(settings-section): 推送总开关 is a search term for that card
+    fireEvent.change(nonAdminSearch, { target: { value: '总开关' } });
+    expect(await screen.findByText('Master push switch')).toBeInTheDocument();
     unmount();
 
     h.canInvite = true;

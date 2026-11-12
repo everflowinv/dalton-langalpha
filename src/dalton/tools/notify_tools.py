@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 NotifyActionLiteral = Literal["list", "set_route", "add_personal_target", "test"]
 
-MASTER_SWITCH_OFF_NOTE = "你的推送总开关目前是关的，在设置里打开后才会推送"
+MASTER_SWITCH_OFF_NOTE = "你的推送总开关目前是关的：请在 设置 → 模型 页底部「推送到」卡片里打开「推送总开关」后才会推送"
 NOTIFY_CONFIRM_CHANGED_ERROR = (
     "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。"
 )

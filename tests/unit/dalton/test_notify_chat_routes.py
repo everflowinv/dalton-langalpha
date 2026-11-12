@@ -1973,7 +1973,7 @@ async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_valida
     assert confirm_payload["args"] == {
         "任务": "dalton-nvda-earn-2026q1-t0",
         "推送到": ["我本人（个人，feishu:user:ou_me_1）", "半导体投研群（群，oc_g1）"],
-        "提示": "你的推送总开关目前是关的，在设置里打开后才会推送",
+        "提示": "你的推送总开关目前是关的：请在 设置 → 模型 页底部「推送到」卡片里打开「推送总开关」后才会推送",
     }
     assert "dalton-nvda-earn-2026q1-t0 →" in confirm_payload["summary"]
     assert "我本人" in confirm_payload["summary"]
@@ -1998,8 +1998,8 @@ async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_valida
     assert res_approved["success"] is True
     assert res_approved["targets"] == ["feishu:user:ou_me_1", "feishu:chat:oc_g1"]
     assert res_approved["notify_enabled"] is False
-    assert "你的推送总开关目前是关的，在设置里打开后才会推送" in res_approved["note"]
-    assert "你的推送总开关目前是关的，在设置里打开后才会推送" in res_approved["summary"]
+    assert "你的推送总开关目前是关的：请在 设置 → 模型 页底部「推送到」卡片里打开「推送总开关」后才会推送" in res_approved["note"]
+    assert "你的推送总开关目前是关的：请在 设置 → 模型 页底部「推送到」卡片里打开「推送总开关」后才会推送" in res_approved["summary"]
     assert validate_sync_spy.call_count == 1
     assert validate_user_spy.await_count == 1
     assert len(upserted_patches) == 1

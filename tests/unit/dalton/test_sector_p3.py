@@ -582,6 +582,9 @@ async def test_sector_delta_preflight_is_pure_schedule_wake(monkeypatch: pytest.
     assert res.decision == "wake"
     assert res.signals and res.signals[0]["probe"] == "schedule"
     assert res.signals[0]["payload"]["kind"] == "sector_delta"
+    # 每个行业工作区只有一个 delta 自动化，键按工作区隔离，不带自动化 ID。
+    assert res.signals[0]["signal_key"].startswith("sector_delta:")
+    assert "a-2" not in res.signals[0]["signal_key"]
     # 计划唤醒不跑议程探针；persist=False 不写跟踪状态
     assert mock_agenda.await_count == 0
     assert mock_upsert_ws.await_count == 0

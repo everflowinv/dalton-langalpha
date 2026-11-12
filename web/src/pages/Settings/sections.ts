@@ -162,7 +162,8 @@ export const SETTINGS = {
   daltonFeishuScopes: { section: 'model', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', visibleWhen: canShowDaltonFeishuScopesCard },
   daltonProviders: { section: 'model', anchor: 'dalton-providers', labelKey: 'settings.dalton.providersLabel', descKey: 'settings.dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 team credentials provider status' },
   daltonBudget: { section: 'model', anchor: 'dalton-budget', labelKey: 'settings.dalton.budgetLabel', descKey: 'settings.dalton.budgetDesc', keywords: '预算 每日预算 团队模型限额 USD 额度 调额 daily budget spending limit' },
-  daltonNotifyTargets: { section: 'model', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 主动推送 消息提醒 notify targets feishu discord proactive alerts' },
+  // DALTON-HOOK(settings-section): master push switch lives on this card; search must find 推送总开关
+  daltonNotifyTargets: { section: 'model', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 主动推送 消息提醒 notify targets feishu discord proactive alerts 推送总开关 总开关 飞书提醒 推送开关' },
   // DALTON-HOOK(settings-section): personal Feishu and Discord bind codes on Models, in platform and self-hosted
   daltonChannelBindings: { section: 'model', anchor: 'dalton-channel-bindings', labelKey: 'settings.dalton.channelBindingsLabel', descKey: 'settings.dalton.channelBindingsDesc', keywords: '飞书 Discord 账号绑定 绑定码 私聊 机器人 bind code feishu discord account' },
   daltonSystemJobs: { section: 'model', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', advanced: true, keywords: '自动任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron' },
