@@ -370,3 +370,7 @@ tests/unit/dalton/test_agentturn_daily_filing.py
 # OC-1 agent-turn ToB industry weekly (collect + text report).
 plugins/dalton/skills/dalton-tob-industry-weekly/
 tests/unit/dalton/test_agentturn_tob.py
+
+# OC-1 VIP news alert.
+plugins/dalton/skills/dalton-vip-news-alert/
+tests/unit/dalton/test_agentturn_vip_news.py
