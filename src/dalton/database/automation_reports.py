@@ -78,6 +78,9 @@ REPORT_PROFILES = frozenset(
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
+        "us-weekly-movers",
+        "x-accounts-daily",
+        "humanoid-robot-weekly",
     }
 )
 MAX_CARDS = 20

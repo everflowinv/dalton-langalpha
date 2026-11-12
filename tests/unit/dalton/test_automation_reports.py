@@ -73,6 +73,9 @@ def test_profile_accepts_only_named_profiles() -> None:
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
+        "us-weekly-movers",
+        "x-accounts-daily",
+        "humanoid-robot-weekly",
     ):
         parsed, err = parse_report_profile(_profile(profile_id))
         assert err is None
@@ -88,6 +91,9 @@ def test_profile_accepts_only_named_profiles() -> None:
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
+        "us-weekly-movers",
+        "x-accounts-daily",
+        "humanoid-robot-weekly",
     }
 
 

@@ -1,0 +1,63 @@
+model_sources:
+  papers:
+    - arXiv cs.RO
+    - OpenReview
+    - CoRL
+    - ICRA
+    - IROS
+    - RSS
+  official_labs:
+    - Google DeepMind Robotics
+    - NVIDIA Isaac / Robotics
+    - Physical Intelligence
+    - Skild AI
+    - Toyota Research Institute
+  repositories:
+    - GitHub releases
+    - Hugging Face models
+    - Hugging Face datasets
+
+industry_media:
+  - The Robot Report
+  - IEEE Spectrum Robotics
+  - Robotics 24/7
+  - Automation World
+  - Assembly Magazine
+  - Control Engineering
+  - Modern Materials Handling
+  - IFR
+  - A3
+  - Interact Analysis
+
+reddit:
+  - robotics
+  - HumanoidRobotics
+  - ROS
+  - ReinforcementLearning
+  - controltheory
+
+x_official:
+  - physical_int
+  - SkildAI
+  - Figure_robot
+  - AgilityRobotics
+  - Apptronik
+  - SanctuaryAI
+  - 1x_tech
+  - BostonDynamics
+  - GoogleDeepMind
+
+x_researchers:
+  - DrJimFan
+  - svlevine
+  - hausman_k
+  - LerrelPinto
+  - yukez
+  - pathak2206
+
+deployment_languages:
+  - en
+  - zh
+  - ja
+  - ko
+  - de

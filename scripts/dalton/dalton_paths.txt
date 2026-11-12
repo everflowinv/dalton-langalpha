@@ -337,3 +337,14 @@ tests/unit/dalton/test_ai_finance_reports.py
 # T11 AI finance daily execution skill.
 plugins/dalton/skills/dalton-ai-finance-daily/
 tests/unit/dalton/test_ai_finance_daily_skill.py
+
+# OC-1 agent-turn family 1: US weekly movers, X account daily, humanoid weekly.
+plugins/dalton/skills/dalton-us-weekly-movers/
+plugins/dalton/skills/dalton-x-accounts-daily/
+plugins/dalton/skills/dalton-humanoid-robot-weekly/
+scripts/dalton/import_openclaw_skill_state.py
+src/dalton/database/automation_reports.py
+src/ptc_agent/agent/middleware/skills/dalton_registry.py
+tests/unit/dalton/test_agentturn_family1.py
+tests/unit/dalton/test_automation_reports.py
+tests/unit/dalton/test_declared_sources.py

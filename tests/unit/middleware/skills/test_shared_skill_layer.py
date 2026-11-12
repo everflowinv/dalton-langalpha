@@ -56,8 +56,12 @@ def test_layer_survives_its_own_disable():
 
 def test_layer_goes_when_every_dependent_is_off():
     disabled = {LAYER, *_dependents()}
-    assert resolve_disabled_skills(disabled) == frozenset(disabled)
-    assert LAYER not in build_effective_skill_registry(disabled_skills=disabled)
+    # The three report skills require dalton-bullbear-tracker and not this layer,
+    # so the tracker stays enabled while the layer itself still goes.
+    assert resolve_disabled_skills(disabled) == frozenset(disabled - {"dalton-bullbear-tracker"})
+    registry = build_effective_skill_registry(disabled_skills=disabled)
+    assert LAYER not in registry
+    assert "dalton-bullbear-tracker" in registry
 
 
 def test_disabling_a_dependent_keeps_the_layer():
@@ -137,6 +141,10 @@ def test_dalton_layer_survives_its_own_disable():
 
 def test_dalton_layer_goes_when_every_dependent_is_off():
     disabled = {DALTON_LAYER, *_dalton_dependents()}
-    assert resolve_disabled_skills(disabled) == frozenset(disabled)
-    assert DALTON_LAYER not in build_effective_skill_registry(disabled_skills=disabled)
+    # The three report skills require dalton-bullbear-tracker and not this layer,
+    # so the tracker stays enabled while the layer itself still goes.
+    assert resolve_disabled_skills(disabled) == frozenset(disabled - {"dalton-bullbear-tracker"})
+    registry = build_effective_skill_registry(disabled_skills=disabled)
+    assert DALTON_LAYER not in registry
+    assert "dalton-bullbear-tracker" in registry
 
