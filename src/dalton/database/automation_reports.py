@@ -87,6 +87,7 @@ REPORT_PROFILES = frozenset(
         "china-consumer-weekly",
         "global-consumer-weekly",
         "daily-filing-alert",
+        "tob-industry-weekly",
     }
 )
 MAX_CARDS = 20

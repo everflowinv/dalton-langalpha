@@ -1,0 +1,26 @@
+# 两条自动化都在 Asia/Hong_Kong 的周五。
+# 采集 14:00 只入库。成稿 16:00 提交纯文本。
+# 接收方在 metadata.report_profile，配置名 tob-industry-weekly。
+# 文件名、卡片标题、归档名和 snapshot 用当周周五。
+
+jobs:
+  - name: tob-tracker-collect
+    description: 周五下午采集财报日历、公告、纪要、卖方点评与预测修正，只入库不成稿
+    schedule:
+      kind: cron
+      expr: "0 14 * * 5"
+      tz: Asia/Hong_Kong
+    sessionTarget: isolated
+    delivery:
+      mode: none
+    timeoutSeconds: 5400
+  - name: tob-tracker-report
+    description: 周五 16:00 按当周业绩窗口成稿、校验，用 automation_report 提交卡片全文
+    schedule:
+      kind: cron
+      expr: "0 16 * * 5"
+      tz: Asia/Hong_Kong
+    sessionTarget: isolated
+    delivery:
+      mode: none
+    timeoutSeconds: 3600

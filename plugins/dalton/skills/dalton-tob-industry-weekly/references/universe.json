@@ -1,0 +1,995 @@
+{
+  "meta": {
+    "version": "1.0",
+    "built_at": "2026-08-19",
+    "count": 120,
+    "market_counts": {
+      "A": 56,
+      "HK": 16,
+      "US": 48
+    },
+    "subsector_counts": {
+      "erp": 7,
+      "oa": 2,
+      "office": 2,
+      "fintech_it": 19,
+      "construction_it": 4,
+      "healthcare_it": 5,
+      "gov_it": 7,
+      "industrial_sw": 6,
+      "security": 16,
+      "cloud": 3,
+      "ai": 6,
+      "vertical_saas": 7,
+      "it_services": 12,
+      "hcm": 4,
+      "platform_sw": 7,
+      "crm": 2,
+      "collab": 5,
+      "data_infra": 6
+    },
+    "note": "核心覆盖池。池外公司本周发业绩且属于软件/信息服务的，按 off_pool 收录。"
+  },
+  "companies": [
+    {
+      "ticker": "600588.SH",
+      "name": "用友网络",
+      "name_en": "Yonyou",
+      "market": "A",
+      "subsector": "erp",
+      "ae_query": "用友"
+    },
+    {
+      "ticker": "300378.SZ",
+      "name": "鼎捷数智",
+      "name_en": "Digiwin",
+      "market": "A",
+      "subsector": "erp",
+      "ae_query": "鼎捷"
+    },
+    {
+      "ticker": "300687.SZ",
+      "name": "赛意信息",
+      "name_en": "Sieyuan Info",
+      "market": "A",
+      "subsector": "erp",
+      "ae_query": "赛意信息"
+    },
+    {
+      "ticker": "300170.SZ",
+      "name": "汉得信息",
+      "name_en": "Hand Enterprise",
+      "market": "A",
+      "subsector": "erp",
+      "ae_query": "汉得信息"
+    },
+    {
+      "ticker": "002063.SZ",
+      "name": "远光软件",
+      "name_en": "YGSoft",
+      "market": "A",
+      "subsector": "erp",
+      "ae_query": "远光软件"
+    },
+    {
+      "ticker": "300996.SZ",
+      "name": "普联软件",
+      "name_en": "Pulink",
+      "market": "A",
+      "subsector": "erp",
+      "ae_query": "普联软件"
+    },
+    {
+      "ticker": "603039.SH",
+      "name": "泛微网络",
+      "name_en": "Weaver",
+      "market": "A",
+      "subsector": "oa",
+      "ae_query": "泛微"
+    },
+    {
+      "ticker": "688369.SH",
+      "name": "致远互联",
+      "name_en": "Seeyon",
+      "market": "A",
+      "subsector": "oa",
+      "ae_query": "致远互联"
+    },
+    {
+      "ticker": "688111.SH",
+      "name": "金山办公",
+      "name_en": "Kingsoft Office",
+      "market": "A",
+      "subsector": "office",
+      "ae_query": "金山办公"
+    },
+    {
+      "ticker": "600570.SH",
+      "name": "恒生电子",
+      "name_en": "Hundsun",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "恒生电子"
+    },
+    {
+      "ticker": "600446.SH",
+      "name": "金证股份",
+      "name_en": "Kingdom",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "金证股份"
+    },
+    {
+      "ticker": "603383.SH",
+      "name": "顶点软件",
+      "name_en": "Apex Software",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "顶点软件"
+    },
+    {
+      "ticker": "300674.SZ",
+      "name": "宇信科技",
+      "name_en": "Yusys",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "宇信科技"
+    },
+    {
+      "ticker": "300348.SZ",
+      "name": "长亮科技",
+      "name_en": "Sunline",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "长亮科技"
+    },
+    {
+      "ticker": "688590.SH",
+      "name": "新致软件",
+      "name_en": "Newtouch",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "新致软件"
+    },
+    {
+      "ticker": "300872.SZ",
+      "name": "天阳科技",
+      "name_en": "Tansun",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "天阳科技"
+    },
+    {
+      "ticker": "002987.SZ",
+      "name": "京北方",
+      "name_en": "Northking",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "京北方"
+    },
+    {
+      "ticker": "300465.SZ",
+      "name": "高伟达",
+      "name_en": "Gowin",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "高伟达"
+    },
+    {
+      "ticker": "300541.SZ",
+      "name": "先进数通",
+      "name_en": "Advanced Digital",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "先进数通"
+    },
+    {
+      "ticker": "300663.SZ",
+      "name": "科蓝软件",
+      "name_en": "Colasoft Software",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "科蓝软件"
+    },
+    {
+      "ticker": "300468.SZ",
+      "name": "四方精创",
+      "name_en": "Sifang Jinchuang",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "四方精创"
+    },
+    {
+      "ticker": "600571.SH",
+      "name": "信雅达",
+      "name_en": "Sunyard",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "信雅达"
+    },
+    {
+      "ticker": "688588.SH",
+      "name": "凌志软件",
+      "name_en": "Linkage Software",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "凌志软件"
+    },
+    {
+      "ticker": "603171.SH",
+      "name": "税友股份",
+      "name_en": "Servyou",
+      "market": "A",
+      "subsector": "fintech_it",
+      "ae_query": "税友"
+    },
+    {
+      "ticker": "002410.SZ",
+      "name": "广联达",
+      "name_en": "Glodon",
+      "market": "A",
+      "subsector": "construction_it",
+      "ae_query": "广联达"
+    },
+    {
+      "ticker": "688109.SH",
+      "name": "品茗科技",
+      "name_en": "Pinming",
+      "market": "A",
+      "subsector": "construction_it",
+      "ae_query": "品茗"
+    },
+    {
+      "ticker": "300253.SZ",
+      "name": "卫宁健康",
+      "name_en": "Winning Health",
+      "market": "A",
+      "subsector": "healthcare_it",
+      "ae_query": "卫宁健康"
+    },
+    {
+      "ticker": "300451.SZ",
+      "name": "创业慧康",
+      "name_en": "B-Soft",
+      "market": "A",
+      "subsector": "healthcare_it",
+      "ae_query": "创业慧康"
+    },
+    {
+      "ticker": "002777.SZ",
+      "name": "久远银海",
+      "name_en": "Yinhai",
+      "market": "A",
+      "subsector": "healthcare_it",
+      "ae_query": "久远银海"
+    },
+    {
+      "ticker": "688579.SH",
+      "name": "山大地纬",
+      "name_en": "Dareway",
+      "market": "A",
+      "subsector": "healthcare_it",
+      "ae_query": "山大地纬"
+    },
+    {
+      "ticker": "002368.SZ",
+      "name": "太极股份",
+      "name_en": "Taiji",
+      "market": "A",
+      "subsector": "gov_it",
+      "ae_query": "太极股份"
+    },
+    {
+      "ticker": "000555.SZ",
+      "name": "神州信息",
+      "name_en": "Digital China Info",
+      "market": "A",
+      "subsector": "gov_it",
+      "ae_query": "神州信息"
+    },
+    {
+      "ticker": "603927.SH",
+      "name": "中科软",
+      "name_en": "Sinosoft",
+      "market": "A",
+      "subsector": "gov_it",
+      "ae_query": "中科软"
+    },
+    {
+      "ticker": "300525.SZ",
+      "name": "博思软件",
+      "name_en": "Boss Software",
+      "market": "A",
+      "subsector": "gov_it",
+      "ae_query": "博思软件"
+    },
+    {
+      "ticker": "300075.SZ",
+      "name": "数字政通",
+      "name_en": "e-Gov",
+      "market": "A",
+      "subsector": "gov_it",
+      "ae_query": "数字政通"
+    },
+    {
+      "ticker": "688232.SH",
+      "name": "新点软件",
+      "name_en": "Newpoint",
+      "market": "A",
+      "subsector": "gov_it",
+      "ae_query": "新点软件"
+    },
+    {
+      "ticker": "600845.SH",
+      "name": "宝信软件",
+      "name_en": "Baosight",
+      "market": "A",
+      "subsector": "industrial_sw",
+      "ae_query": "宝信软件"
+    },
+    {
+      "ticker": "688083.SH",
+      "name": "中望软件",
+      "name_en": "ZWCAD",
+      "market": "A",
+      "subsector": "industrial_sw",
+      "ae_query": "中望软件"
+    },
+    {
+      "ticker": "688777.SH",
+      "name": "中控技术",
+      "name_en": "Supcon",
+      "market": "A",
+      "subsector": "industrial_sw",
+      "ae_query": "中控技术"
+    },
+    {
+      "ticker": "688188.SH",
+      "name": "柏楚电子",
+      "name_en": "Friendess",
+      "market": "A",
+      "subsector": "industrial_sw",
+      "ae_query": "柏楚电子"
+    },
+    {
+      "ticker": "603859.SH",
+      "name": "能科科技",
+      "name_en": "Nancal",
+      "market": "A",
+      "subsector": "industrial_sw",
+      "ae_query": "能科科技"
+    },
+    {
+      "ticker": "688507.SH",
+      "name": "索辰科技",
+      "name_en": "S2C",
+      "market": "A",
+      "subsector": "industrial_sw",
+      "ae_query": "索辰科技"
+    },
+    {
+      "ticker": "300454.SZ",
+      "name": "深信服",
+      "name_en": "Sangfor",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "深信服"
+    },
+    {
+      "ticker": "688561.SH",
+      "name": "奇安信",
+      "name_en": "Qi-Anxin",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "奇安信"
+    },
+    {
+      "ticker": "002439.SZ",
+      "name": "启明星辰",
+      "name_en": "Venustech",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "启明星辰"
+    },
+    {
+      "ticker": "688023.SH",
+      "name": "安恒信息",
+      "name_en": "DBAPPSecurity",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "安恒信息"
+    },
+    {
+      "ticker": "002212.SZ",
+      "name": "天融信",
+      "name_en": "Topsec",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "天融信"
+    },
+    {
+      "ticker": "300369.SZ",
+      "name": "绿盟科技",
+      "name_en": "NSFOCUS",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "绿盟科技"
+    },
+    {
+      "ticker": "002268.SZ",
+      "name": "电科网安",
+      "name_en": "CETC Cyber",
+      "market": "A",
+      "subsector": "security",
+      "ae_query": "电科网安"
+    },
+    {
+      "ticker": "000938.SZ",
+      "name": "紫光股份",
+      "name_en": "Unisplendour",
+      "market": "A",
+      "subsector": "cloud",
+      "ae_query": "紫光股份"
+    },
+    {
+      "ticker": "688158.SH",
+      "name": "优刻得",
+      "name_en": "UCloud",
+      "market": "A",
+      "subsector": "cloud",
+      "ae_query": "优刻得"
+    },
+    {
+      "ticker": "002230.SZ",
+      "name": "科大讯飞",
+      "name_en": "iFlytek",
+      "market": "A",
+      "subsector": "ai",
+      "ae_query": "科大讯飞"
+    },
+    {
+      "ticker": "300229.SZ",
+      "name": "拓尔思",
+      "name_en": "TRS",
+      "market": "A",
+      "subsector": "ai",
+      "ae_query": "拓尔思"
+    },
+    {
+      "ticker": "002153.SZ",
+      "name": "石基信息",
+      "name_en": "Shiji",
+      "market": "A",
+      "subsector": "vertical_saas",
+      "ae_query": "石基信息"
+    },
+    {
+      "ticker": "002065.SZ",
+      "name": "东华软件",
+      "name_en": "DCITS",
+      "market": "A",
+      "subsector": "it_services",
+      "ae_query": "东华软件"
+    },
+    {
+      "ticker": "600718.SH",
+      "name": "东软集团",
+      "name_en": "Neusoft",
+      "market": "A",
+      "subsector": "it_services",
+      "ae_query": "东软集团"
+    },
+    {
+      "ticker": "0268.HK",
+      "name": "金蝶国际",
+      "name_en": "Kingdee",
+      "market": "HK",
+      "subsector": "erp",
+      "ae_query": "金蝶"
+    },
+    {
+      "ticker": "0354.HK",
+      "name": "中国软件国际",
+      "name_en": "Chinasoft",
+      "market": "HK",
+      "subsector": "it_services",
+      "ae_query": "中软国际"
+    },
+    {
+      "ticker": "0909.HK",
+      "name": "明源云",
+      "name_en": "Mingyuan Cloud",
+      "market": "HK",
+      "subsector": "construction_it",
+      "ae_query": "明源云"
+    },
+    {
+      "ticker": "2013.HK",
+      "name": "微盟集团",
+      "name_en": "Weimob",
+      "market": "HK",
+      "subsector": "vertical_saas",
+      "ae_query": "微盟"
+    },
+    {
+      "ticker": "6051.HK",
+      "name": "有赞",
+      "name_en": "Youzan",
+      "market": "HK",
+      "subsector": "vertical_saas",
+      "ae_query": "有赞"
+    },
+    {
+      "ticker": "2392.HK",
+      "name": "玄武云",
+      "name_en": "Xuanwu Cloud",
+      "market": "HK",
+      "subsector": "vertical_saas",
+      "ae_query": "玄武云"
+    },
+    {
+      "ticker": "2158.HK",
+      "name": "医渡科技",
+      "name_en": "Yidu Tech",
+      "market": "HK",
+      "subsector": "healthcare_it",
+      "ae_query": "医渡科技"
+    },
+    {
+      "ticker": "1675.HK",
+      "name": "亚信科技",
+      "name_en": "AsiaInfo",
+      "market": "HK",
+      "subsector": "gov_it",
+      "ae_query": "亚信科技"
+    },
+    {
+      "ticker": "3888.HK",
+      "name": "金山软件",
+      "name_en": "Kingsoft",
+      "market": "HK",
+      "subsector": "office",
+      "ae_query": "金山软件"
+    },
+    {
+      "ticker": "0020.HK",
+      "name": "商汤",
+      "name_en": "SenseTime",
+      "market": "HK",
+      "subsector": "ai",
+      "ae_query": "商汤"
+    },
+    {
+      "ticker": "6682.HK",
+      "name": "第四范式",
+      "name_en": "4Paradigm",
+      "market": "HK",
+      "subsector": "ai",
+      "ae_query": "第四范式"
+    },
+    {
+      "ticker": "2121.HK",
+      "name": "创新奇智",
+      "name_en": "AInnovation",
+      "market": "HK",
+      "subsector": "ai",
+      "ae_query": "创新奇智"
+    },
+    {
+      "ticker": "6608.HK",
+      "name": "百融云",
+      "name_en": "Bairong",
+      "market": "HK",
+      "subsector": "fintech_it",
+      "ae_query": "百融云"
+    },
+    {
+      "ticker": "9669.HK",
+      "name": "北森控股",
+      "name_en": "Beisen",
+      "market": "HK",
+      "subsector": "hcm",
+      "ae_query": "北森"
+    },
+    {
+      "ticker": "2586.HK",
+      "name": "多点数智",
+      "name_en": "DPC Dash",
+      "market": "HK",
+      "subsector": "vertical_saas",
+      "ae_query": "多点数智"
+    },
+    {
+      "ticker": "3896.HK",
+      "name": "金山云",
+      "name_en": "Kingsoft Cloud",
+      "market": "HK",
+      "subsector": "cloud",
+      "ae_query": "金山云"
+    },
+    {
+      "ticker": "MSFT",
+      "name": "微软",
+      "name_en": "Microsoft",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "Microsoft"
+    },
+    {
+      "ticker": "ORCL",
+      "name": "甲骨文",
+      "name_en": "Oracle",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "Oracle"
+    },
+    {
+      "ticker": "SAP",
+      "name": "SAP",
+      "name_en": "SAP",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "SAP"
+    },
+    {
+      "ticker": "ADBE",
+      "name": "Adobe",
+      "name_en": "Adobe",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "Adobe"
+    },
+    {
+      "ticker": "IBM",
+      "name": "IBM",
+      "name_en": "IBM",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "IBM"
+    },
+    {
+      "ticker": "CRM",
+      "name": "Salesforce",
+      "name_en": "Salesforce",
+      "market": "US",
+      "subsector": "crm",
+      "ae_query": "Salesforce"
+    },
+    {
+      "ticker": "NOW",
+      "name": "ServiceNow",
+      "name_en": "ServiceNow",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "ServiceNow"
+    },
+    {
+      "ticker": "INTU",
+      "name": "Intuit",
+      "name_en": "Intuit",
+      "market": "US",
+      "subsector": "fintech_it",
+      "ae_query": "Intuit"
+    },
+    {
+      "ticker": "ROP",
+      "name": "Roper",
+      "name_en": "Roper Technologies",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "Roper"
+    },
+    {
+      "ticker": "ADP",
+      "name": "ADP",
+      "name_en": "ADP",
+      "market": "US",
+      "subsector": "hcm",
+      "ae_query": "ADP"
+    },
+    {
+      "ticker": "PAYX",
+      "name": "Paychex",
+      "name_en": "Paychex",
+      "market": "US",
+      "subsector": "hcm",
+      "ae_query": "Paychex"
+    },
+    {
+      "ticker": "WDAY",
+      "name": "Workday",
+      "name_en": "Workday",
+      "market": "US",
+      "subsector": "hcm",
+      "ae_query": "Workday"
+    },
+    {
+      "ticker": "TEAM",
+      "name": "Atlassian",
+      "name_en": "Atlassian",
+      "market": "US",
+      "subsector": "collab",
+      "ae_query": "Atlassian"
+    },
+    {
+      "ticker": "HUBS",
+      "name": "HubSpot",
+      "name_en": "HubSpot",
+      "market": "US",
+      "subsector": "crm",
+      "ae_query": "HubSpot"
+    },
+    {
+      "ticker": "ZM",
+      "name": "Zoom",
+      "name_en": "Zoom",
+      "market": "US",
+      "subsector": "collab",
+      "ae_query": "Zoom"
+    },
+    {
+      "ticker": "DOCU",
+      "name": "DocuSign",
+      "name_en": "DocuSign",
+      "market": "US",
+      "subsector": "vertical_saas",
+      "ae_query": "DocuSign"
+    },
+    {
+      "ticker": "OKTA",
+      "name": "Okta",
+      "name_en": "Okta",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Okta"
+    },
+    {
+      "ticker": "BILL",
+      "name": "BILL",
+      "name_en": "BILL Holdings",
+      "market": "US",
+      "subsector": "fintech_it",
+      "ae_query": "BILL"
+    },
+    {
+      "ticker": "MNDY",
+      "name": "monday.com",
+      "name_en": "monday.com",
+      "market": "US",
+      "subsector": "collab",
+      "ae_query": "monday.com"
+    },
+    {
+      "ticker": "ASAN",
+      "name": "Asana",
+      "name_en": "Asana",
+      "market": "US",
+      "subsector": "collab",
+      "ae_query": "Asana"
+    },
+    {
+      "ticker": "GTLB",
+      "name": "GitLab",
+      "name_en": "GitLab",
+      "market": "US",
+      "subsector": "collab",
+      "ae_query": "GitLab"
+    },
+    {
+      "ticker": "PCOR",
+      "name": "Procore",
+      "name_en": "Procore",
+      "market": "US",
+      "subsector": "construction_it",
+      "ae_query": "Procore"
+    },
+    {
+      "ticker": "QTWO",
+      "name": "Q2",
+      "name_en": "Q2 Holdings",
+      "market": "US",
+      "subsector": "fintech_it",
+      "ae_query": "Q2"
+    },
+    {
+      "ticker": "SHOP",
+      "name": "Shopify",
+      "name_en": "Shopify",
+      "market": "US",
+      "subsector": "vertical_saas",
+      "ae_query": "Shopify"
+    },
+    {
+      "ticker": "SNOW",
+      "name": "Snowflake",
+      "name_en": "Snowflake",
+      "market": "US",
+      "subsector": "data_infra",
+      "ae_query": "Snowflake"
+    },
+    {
+      "ticker": "DDOG",
+      "name": "Datadog",
+      "name_en": "Datadog",
+      "market": "US",
+      "subsector": "data_infra",
+      "ae_query": "Datadog"
+    },
+    {
+      "ticker": "MDB",
+      "name": "MongoDB",
+      "name_en": "MongoDB",
+      "market": "US",
+      "subsector": "data_infra",
+      "ae_query": "MongoDB"
+    },
+    {
+      "ticker": "CFLT",
+      "name": "Confluent",
+      "name_en": "Confluent",
+      "market": "US",
+      "subsector": "data_infra",
+      "ae_query": "Confluent"
+    },
+    {
+      "ticker": "ESTC",
+      "name": "Elastic",
+      "name_en": "Elastic",
+      "market": "US",
+      "subsector": "data_infra",
+      "ae_query": "Elastic"
+    },
+    {
+      "ticker": "NET",
+      "name": "Cloudflare",
+      "name_en": "Cloudflare",
+      "market": "US",
+      "subsector": "data_infra",
+      "ae_query": "Cloudflare"
+    },
+    {
+      "ticker": "CRWD",
+      "name": "CrowdStrike",
+      "name_en": "CrowdStrike",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "CrowdStrike"
+    },
+    {
+      "ticker": "FTNT",
+      "name": "Fortinet",
+      "name_en": "Fortinet",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Fortinet"
+    },
+    {
+      "ticker": "PANW",
+      "name": "Palo Alto",
+      "name_en": "Palo Alto Networks",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Palo Alto"
+    },
+    {
+      "ticker": "ZS",
+      "name": "Zscaler",
+      "name_en": "Zscaler",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Zscaler"
+    },
+    {
+      "ticker": "S",
+      "name": "SentinelOne",
+      "name_en": "SentinelOne",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "SentinelOne"
+    },
+    {
+      "ticker": "TENB",
+      "name": "Tenable",
+      "name_en": "Tenable",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Tenable"
+    },
+    {
+      "ticker": "QLYS",
+      "name": "Qualys",
+      "name_en": "Qualys",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Qualys"
+    },
+    {
+      "ticker": "RBRK",
+      "name": "Rubrik",
+      "name_en": "Rubrik",
+      "market": "US",
+      "subsector": "security",
+      "ae_query": "Rubrik"
+    },
+    {
+      "ticker": "PLTR",
+      "name": "Palantir",
+      "name_en": "Palantir",
+      "market": "US",
+      "subsector": "ai",
+      "ae_query": "Palantir"
+    },
+    {
+      "ticker": "PATH",
+      "name": "UiPath",
+      "name_en": "UiPath",
+      "market": "US",
+      "subsector": "platform_sw",
+      "ae_query": "UiPath"
+    },
+    {
+      "ticker": "ACN",
+      "name": "埃森哲",
+      "name_en": "Accenture",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "Accenture"
+    },
+    {
+      "ticker": "CTSH",
+      "name": "高知特",
+      "name_en": "Cognizant",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "Cognizant"
+    },
+    {
+      "ticker": "EPAM",
+      "name": "EPAM",
+      "name_en": "EPAM",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "EPAM"
+    },
+    {
+      "ticker": "GLOB",
+      "name": "Globant",
+      "name_en": "Globant",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "Globant"
+    },
+    {
+      "ticker": "IT",
+      "name": "Gartner",
+      "name_en": "Gartner",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "Gartner"
+    },
+    {
+      "ticker": "INFY",
+      "name": "Infosys",
+      "name_en": "Infosys",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "Infosys"
+    },
+    {
+      "ticker": "WIT",
+      "name": "Wipro",
+      "name_en": "Wipro",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "Wipro"
+    },
+    {
+      "ticker": "LTIM",
+      "name": "LTIMindtree",
+      "name_en": "LTIMindtree",
+      "market": "US",
+      "subsector": "it_services",
+      "ae_query": "LTIMindtree"
+    }
+  ]
+}

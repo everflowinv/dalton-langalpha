@@ -129,6 +129,16 @@ def build_tool_signature_registry() -> dict[str, set[str]]:
         fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
         registry[t.name] = fields
 
+    # 4b. Direct market tools (`get_market_overview` etc. in src/tools/market_data/tool.py)
+    from langchain_core.tools import BaseTool
+
+    import src.tools.market_data.tool as market_tools
+
+    for t in vars(market_tools).values():
+        if isinstance(t, BaseTool):
+            fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
+            registry[t.name] = fields - {"config"}
+
     # 5. Workflow tool (`RunWorkflow`)
     registry["RunWorkflow"] = {
         "script",
