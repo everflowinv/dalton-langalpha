@@ -1,4 +1,4 @@
-// Modification history for an open task, plus rollback and restore.
+// DALTON-HOOK(company-automations): modification history for an open task, plus rollback and restore.
 import { useCallback, useEffect, useState } from 'react';
 import { apiErrorStatus } from '@/api/errors';
 import type { AutomationHistory, AutomationHistoryEntry } from '@/types/automation';

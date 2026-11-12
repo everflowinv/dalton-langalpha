@@ -50,6 +50,7 @@
   margin-bottom: 10px;
 }
 
+/* DALTON-HOOK(company-automations): history tabs and modification rows. */
 .automation-record-tabs {
   display: flex;
   gap: 16px;

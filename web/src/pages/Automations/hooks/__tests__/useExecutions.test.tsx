@@ -99,6 +99,7 @@ describe('useExecutions: polling while a delivery settles', () => {
     expect(calls()).toBe(4);
   });
 
+  // DALTON-HOOK(company-automations): a deleted agent does not request its runs.
   it('does not fetch runs when disabled', async () => {
     vi.mocked(api.listExecutions).mockResolvedValue(page(ended(5_000, null)));
     renderHookWithProviders(() => useExecutions('auto-1', true, false));

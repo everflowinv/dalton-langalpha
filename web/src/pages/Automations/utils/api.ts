@@ -78,6 +78,7 @@ export function rollbackAutomation(
   });
 }
 
+// DALTON-HOOK(company-automations): personal pause and resume omit the version. Company sends it.
 /** Personal and research callers omit the version and send no body. Company sends the version. */
 export const pauseAutomation = (id: string, expectedConfigVersion?: number): Promise<ApiResponse> =>
   postVersion(automationItemPath(id, '/pause'), expectedConfigVersion);

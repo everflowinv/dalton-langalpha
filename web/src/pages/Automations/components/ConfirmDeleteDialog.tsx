@@ -27,6 +27,7 @@ export default function ConfirmDeleteDialog({ open, onOpenChange, onConfirm, aut
         style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)' }}
       >
         <DialogHeader>
+          {/* DALTON-HOOK(company-automations): delete confirms a move into the recycle bin. */}
           <DialogTitle style={{ color: 'var(--color-text-primary)' }}>{t('automation.recycleTitle')}</DialogTitle>
           <DialogDescription style={{ color: 'var(--color-text-secondary)' }}>
             {t('automation.recycleConfirm', { name: automationName })}

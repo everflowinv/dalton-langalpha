@@ -1,4 +1,4 @@
-// The run / modification tabs, the history list, and the rollback confirm.
+// DALTON-HOOK(company-automations): the run / modification tabs, the history list, and the rollback confirm.
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Undo2 } from 'lucide-react';

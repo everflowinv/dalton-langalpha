@@ -289,6 +289,13 @@ web/src/pages/Automations/utils/taskKind.ts
 web/src/pages/Automations/__tests__/Automations.groups.test.tsx
 web/src/pages/Automations/__tests__/readBridge.ts
 web/src/pages/Automations/utils/__tests__/api.writes.test.ts
+# History, rollback, and recycle stay beside the automations page. A file-header
+# DALTON-HOOK does not exempt a new upstream path; ownership is this list.
+web/src/pages/Automations/components/ModificationHistory.tsx
+web/src/pages/Automations/hooks/useModificationHistory.ts
+web/src/pages/Automations/utils/historyView.ts
+web/src/pages/Automations/__tests__/Automations.recycle.test.tsx
+web/src/pages/Automations/__tests__/Automations.companyTier.test.tsx
 tests/unit/dalton/test_sec_call_observability.py
 
 # T11 AI finance core: batch collection, signal memory, and brief checks.

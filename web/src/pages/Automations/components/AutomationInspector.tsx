@@ -1,3 +1,4 @@
+// DALTON-HOOK(company-automations): company inspector adds rollback, history, and recycle actions.
 import React, { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle, ArrowUpRight, EyeOff, Pause, Pencil, Play, RotateCcw, Trash2, Undo2, Zap } from 'lucide-react';
@@ -76,6 +77,7 @@ export default function AutomationInspector({
   onOpenRun,
   onEdit,
   onDelete,
+  // DALTON-HOOK(company-automations): company tasks hide run, dismiss, and skip. Pause waits for a version.
   allowRun = true,
   allowDelete = true,
   allowDismiss = true,
@@ -140,6 +142,7 @@ export default function AutomationInspector({
     openedOnMount.current = runId;
     reportRef.current?.scrollIntoView?.({ block: 'nearest', behavior: scrollMotion() });
   }, [runId]);
+  // DALTON-HOOK(company-automations): a company 403 on runs or history replaces this inspector.
   useEffect(() => {
     if (runsForbidden) onRunsForbidden?.(a.automation_id);
   }, [runsForbidden, onRunsForbidden, a.automation_id]);
@@ -261,6 +264,7 @@ export default function AutomationInspector({
             links={isLatest ? attentionLinks(a) : []}
             busy={busy}
             onOpen={() => openThread(shownRun.conversation_thread_id)}
+            // DALTON-HOOK(company-automations): a company task leaves skip off.
             onSkip={
               allowSkip
                 ? () => skip.mutate({ automationId: a.automation_id, executionId: shownRun.automation_execution_id })
@@ -302,6 +306,7 @@ export default function AutomationInspector({
         )}
       </section>
 
+      {/* DALTON-HOOK(company-automations): rollback stays disabled until the target snapshot is loaded. */}
       <RollbackDialog
         open={history.rollbackOpen}
         version={history.prevVersion}

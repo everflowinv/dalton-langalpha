@@ -1,4 +1,4 @@
-// How a modification-history entry is shown: newest first, with a short change line.
+// DALTON-HOOK(company-automations): how a modification-history entry is shown: newest first, with a short change line.
 import type { AutomationFieldChange, AutomationHistoryEntry } from '@/types/automation';
 
 const FIELD_KEYS: Record<string, string> = {

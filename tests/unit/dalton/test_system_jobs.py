@@ -1606,12 +1606,19 @@ async def test_bridge_state_write_oserror_returns_500_and_ok_false_and_cookie_ov
         bridge._archive_proc = None
         bridge._remove_archive_pid_file(expected_pid=live_winner_pid)
 
-    # --- R4 Item 1 & Item 6: Frontend DaltonSystemJobsCard checks `res?.ok === true` and WorkspaceTrackingToggle imports hooks from the Dalton-local `./useWorkspaceTracking` ---
+    # The settings card is read-only. It no longer handles a switch result or
+    # calls the toggle and run-now endpoints. WorkspaceTrackingToggle still
+    # imports its hooks from the Dalton-local `./useWorkspaceTracking`.
     repo_root = Path(__file__).resolve().parents[3]
     card_src = (
         repo_root / "web/src/pages/Settings/panels/dalton/DaltonSystemJobsCard.tsx"
     ).read_text(encoding="utf-8")
-    assert "res?.ok === true" in card_src
+    assert "res?.ok === true" not in card_src
+    assert "toggleDaltonSystemJob" not in card_src
+    assert "runDaltonSystemJobNow" not in card_src
+    assert "立即运行" not in card_src
+    assert "只读查看系统底层定时任务的运行状态" in card_src
+    assert 'data-testid="system-jobs-open-company"' in card_src
 
     toggle_src = (
         repo_root / "web/src/pages/ChatAgent/components/dalton/WorkspaceTrackingToggle.tsx"
