@@ -1,0 +1,110 @@
+# 中国消费周报的具名信源清单。改信源改这个文件，不要临场决定去哪儿查。
+# 每季度复核一次：失效的链接、改名的账号、停更的数据源直接删，不留占位。
+# last_reviewed 到期未复核时，报告的「信源与数据口径」一节要写明这一点。
+
+last_reviewed: 2026-08-16
+review_cycle: quarterly
+
+# ---------------------------------------------------------------- 第一层 公司与官方
+company_disclosure:
+  a_share:
+    - 巨潮资讯网 cninfo.com.cn（定期报告、业绩预告、业绩快报）
+    - 上交所 e互动 / 深交所互动易（投资者关系问答）
+    - 公司月度或季度经营数据公告（餐饮、零售、酒店按月披露的较多）
+  hk:
+    - 港交所披露易 hkexnews.hk（业绩、正面盈利预告、股权变动）
+    - 公司官网 IR 页的业绩演示稿与业绩会 webcast
+  tooling:
+    - A 股与港股走 finance(route="cn-hk", operation="filings" 或 "ask", ticker=..., start=..., end=...)
+    - 中概若要看美国申报，走 finance(route="sec", operation="list-filings", ticker=..., form="20-F" 或 "6-K")
+  official_stats:
+    - 国家统计局：社会消费品零售总额、居民人均消费支出（月度）
+    - 商务部：重点零售企业销售、餐饮收入
+    - 海关总署：相关品类进出口（化妆品、宠物食品、纺服）
+    - 文旅部与民航局：客流、票房、出行数据（酒店景区与出行相关细分）
+
+# ---------------------------------------------------------------- 第二层 卖方与买方研究
+alphaengine:
+  call_convention:
+    sort: relevance              # 必须。带 query 时 sort 只能是 relevance
+    filters: industry_names      # 放在 params.industry_names
+    time_filter: 用 research 的 start / end，再在结果里核对 publish_date
+    time_window: 最近 2 周内发布；更旧的只作背景并标发布日期
+    flow: search_library → get_document
+  call: >
+    research(route="alphaengine", operation="search_library", query=..., start=YYYY-MM-DD,
+    end=YYYY-MM-DD, limit=20, params={"sort": "relevance", "industry_names": [...]})
+  priority:
+    - 路演纪要与调研纪要（带管理层原话，优先级高于点评）
+    - 深度报告里的假设表（重点看哪个假设从多少改到多少）
+    - 首次覆盖与评级变动（只作观点，不作事实）
+  note: 记录机构、日期、口径；卖方观点不得写成事实
+
+# ---------------------------------------------------------------- 第三层 专家访谈
+guidepoint:
+  flow: search_library，返回的是问答摘录，不是整篇全文
+  query_language: en
+  time_window:
+    primary: 本周新发布
+    fallback: 最近 2 周内，须标访谈日期并降级为「背景，非本周增量」
+    beyond: 超过 2 周写「本周无相关新增访谈」，不拿更旧的稿凑
+  call: >
+    research(route="guidepoint", operation="search_library", query=..., start=..., end=...,
+    limit=30, params={"keywords": ["..."], "recency_bias": 50})
+  constraints:
+    - 逐字引用不超过 20 个英文词，必须紧跟 source_attribution 原文
+    - 不写专家姓名，不用于 KYC 或合规筛查
+    - recency_bias 只是排序权重，不代替 start / end
+
+# ---------------------------------------------------------------- 第四层 渠道与第三方数据
+channel_data:
+  baijiu:
+    - 今日酒价 / 酒说（飞天茅台、普五、国窖批价与渠道库存天数）
+    - 中国酒业协会行业运行数据
+  food_beverage:
+    - 上游报价已接自动源：commodities（新浪期货连续合约日线，A 级）
+    - 生鲜乳收购价：无期货合约，退回农业农村部畜牧兽医局周度数据，人工标日期，C 级
+    - 瓦楞纸现货：无免费源，用纸浆期货 SP0 作方向代理并标明是代理
+  retail_ecommerce:
+    - 星图数据、魔镜洞察（大促与品类线上份额，第三方估算，C 级）
+    - 平台官方战报（只作口径参考，注明是平台口径）
+  catering_hotel:
+    - 窄门餐眼（开关店净增，第三方估算，C 级）
+    - 各连锁品牌自身披露的门店数（A 级，优先）
+  apparel_sportswear:
+    - Nike / Adidas / lululemon 财报里的库存与订单表述（代工与品牌的下游印证）
+  gold_jewelry:
+    - 上海黄金交易所 Au9999 价格与成交量
+  note: 第三方估算一律 C 级，写「估算」；平台口径与公司口径分开写
+
+# ---------------------------------------------------------------- 第五层 实时检索与社区
+web_search:
+  provider: web_search
+  rules:
+    - 一周窗口用 time_range="week"，或用 start_date / end_date（YYYY-MM-DD）
+    - topic 可传 news 或 finance，当前实现会忽略 topic，结果还要再核对发布日期
+    - 域名约束写进 query
+  named_media:
+    - 界面新闻、第一财经、财新（付费墙内容不强行绕过）
+    - 36氪与晚点（新消费与平台侧）
+    - 中国食品报、中国经营报（渠道与行业协会口径）
+    - Reuters / Bloomberg / Nikkei Asia 的中国消费报道（外资视角）
+community:
+  xueqiu: community(route="xueqiu", operation="search", query=...)
+  last30days: >
+    community(route="last30days", operation="search", query=..., days=7, plan={"subqueries":
+    [{"search_query": "...", "ranking_query": "..."}]})。Reddit 不是必选来源，也不要换路径去绕。
+    社区证据最高 C 级。
+  rules:
+    - 只作发现与争议来源，不作销量、价格、份额的一手依据
+    - 百度百科一律不采纳；微博谨慎参考
+
+# ---------------------------------------------------------------- 每周固定看的量化输入
+weekly_quant_checklist:
+  status: 大宗已接自动源；渠道类仍需人工查证并标注日期与来源
+  items:
+    - 大宗成本（自动）：commodities，12 个品种，含 PTA/乙二醇、白糖、棕榈油、豆油、棉花、黄金、豆粕、玉米、鸡蛋、生猪、纸浆
+    - 大宗成本（人工）：生鲜乳收购价、瓦楞纸现货
+    - 白酒批价与渠道库存天数
+    - 连锁餐饮与茶饮的开关店净增
+    - 主要品类的线上份额与均价

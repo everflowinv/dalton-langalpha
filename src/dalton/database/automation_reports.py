@@ -84,6 +84,8 @@ REPORT_PROFILES = frozenset(
         "humanoid-robot-weekly",
         "weekly-trend-impact-scan",
         "ct-semi-sentiment",
+        "china-consumer-weekly",
+        "global-consumer-weekly",
     }
 )
 MAX_CARDS = 20
@@ -1131,6 +1133,7 @@ def _build_payload(
         payload["failure_target_snapshot"] = list(profile["failure_targets"])
     elif prepared["content_kind"] == "text":
         payload["text"] = prepared["text"]
+        payload["failure_target_snapshot"] = list(profile["failure_targets"])
     else:
         payload["failure_text"] = prepared["failure_text"]
     return payload
@@ -1838,7 +1841,9 @@ async def _ensure_report_failure_alert_locked(
         str(_payload_dict(row.get("payload_json")).get("content_kind") or "")
         for row in report_rows
     }
-    if kinds != {"cards"}:
+    # Text bodies use the same once-only definite-failure notice as cards.
+    # failure_text and mixed batches stay on not_cards.
+    if kinds not in ({"cards"}, {"text"}):
         return _alert_result("not_cards", ok=True)
     report_payload = _payload_dict(report_rows[0].get("payload_json"))
     snapshot = failure_target_snapshot_of(report_payload)
@@ -1897,14 +1902,31 @@ async def _ensure_report_failure_alert_locked(
         != str(locked.get("automation_id") or "").lower()
     ):
         raise _FailureAlertConflict()
+    # A failure recipient that already holds this report body cannot take a
+    # second delivery row. Skip it and keep every other failure recipient.
+    body_targets = {str(row.get("target") or "").strip() for row in report_rows}
+    skipped = [target for target in snapshot if target in body_targets]
+    alert_targets = [target for target in snapshot if target not in body_targets]
+    if skipped:
+        logger.warning(
+            "failure_target_is_delivery_target execution_id=%s targets=%s",
+            stored_execution,
+            skipped,
+        )
+    if not alert_targets:
+        return _alert_result(
+            "failure_target_is_delivery_target",
+            ok=True,
+            targets=skipped,
+        )
     expected = build_failure_alert_payload(
         report_payload=report_payload,
         execution_id=stored_execution,
         terminal_rows=terminal,
-        failure_targets=snapshot,
+        failure_targets=alert_targets,
     )
     by_target = {str(row.get("target") or "").strip(): row for row in rows}
-    for target in snapshot:
+    for target in alert_targets:
         existing = by_target.get(target)
         if existing is None:
             continue
@@ -1917,7 +1939,7 @@ async def _ensure_report_failure_alert_locked(
     created = False
     owner_user_id = str(report_rows[0].get("user_id") or "")
     automation_id = str(report_rows[0].get("automation_id") or "")
-    for target in snapshot:
+    for target in alert_targets:
         if target in by_target:
             continue
         channel = target.split(":", 1)[0].strip().lower()
@@ -1944,7 +1966,7 @@ async def _ensure_report_failure_alert_locked(
         if await cur.fetchone() is not None:
             created = True
     refreshed = await _lock_execution_delivery_rows(cur, execution_id)
-    for target in snapshot:
+    for target in alert_targets:
         matched = [
             row
             for row in refreshed
@@ -1959,7 +1981,7 @@ async def _ensure_report_failure_alert_locked(
         "created" if created else "exists",
         ok=True,
         created=created,
-        targets=snapshot,
+        targets=alert_targets,
     )
 
 
@@ -1970,13 +1992,17 @@ async def ensure_report_failure_alert(
     conn: Any = None,
     reconcile_row_fn: Callable[..., Awaitable[Any]] | None = None,
 ) -> dict[str, Any]:
-    """Insert one failure notice after a saved card batch is terminally failed.
+    """Insert one failure notice after a saved card batch or text body fails.
 
     Locks the task, then the execution, then the reconcile advisories for the
     saved rows and frozen failure recipients, and only then the delivery rows.
-    Re-reads the card rows after reconciliation and inserts only the frozen
+    Re-reads the saved rows after reconciliation and inserts only the frozen
     failure recipients. A different saved body on the same recipient rolls the
-    insert back. Uncertain card rows and permission skips do not qualify.
+    insert back. Uncertain rows and permission skips do not qualify. A text
+    body follows the same definite-failure, once-only rule as cards. A failure
+    recipient that already holds this report body is skipped and logged as
+    ``failure_target_is_delivery_target``; the other recipients are still sent
+    once. Cards use the same rule.
     """
     exec_id = str(execution_id or "").strip()
     if not exec_id:
@@ -2008,12 +2034,12 @@ async def failure_alert_still_required(
     reconcile_row_fn: Callable[..., Awaitable[Any]] | None = None,
     mark_fn: Callable[..., Awaitable[Any]] | None = None,
 ) -> bool:
-    """Reconcile the original cards and decide whether the notice may be sent.
+    """Reconcile the original cards or text and decide whether the notice may be sent.
 
-    A late native confirmation that leaves no terminal card target marks an
+    A late native confirmation that leaves no terminal target marks an
     unsent notice ``skipped`` / ``report_recovered``. A notice that already
     left pending or failed keeps its real status. Some remaining terminal
-    targets still allow the frozen text to send.
+    targets still allow the frozen text to send. Already-sent rows do not.
     """
     exec_id = str(execution_id or "").strip()
     if not exec_id:
@@ -2038,7 +2064,7 @@ async def failure_alert_still_required(
         row
         for row in rows
         if str(_payload_dict(row.get("payload_json")).get("content_kind") or "")
-        == "cards"
+        in {"cards", "text"}
         and card_delivery_is_terminal(row, max_attempts=bounded)
     ]
     if terminal:
@@ -2268,15 +2294,19 @@ async def _failure_alert_parent_gate(
 ) -> str:
     """Return ``send``, ``recovered``, or ``unresolved`` for a failure notice.
 
-    A native ``sent`` item clears that card target even when its outer row is
+    A native ``sent`` item clears that target even when its outer row is
     still a stale failure. Any unresolved native item blocks the notice. The
-    outer row is the terminal source only when the ledger is silent.
+    outer row is the terminal source only when the ledger is silent. A saved
+    text body uses the same gate as a card batch. Mixed kinds stay unresolved.
     """
+    kinds = {
+        str(_payload_dict(row.get("payload_json")).get("content_kind") or "")
+        for row in report_rows
+    }
+    if kinds not in ({"cards"}, {"text"}):
+        return "unresolved"
     saw_terminal = False
     for row in report_rows:
-        payload = _payload_dict(row.get("payload_json"))
-        if str(payload.get("content_kind") or "") != "cards":
-            return "unresolved"
         ledger = await _native_card_ledger_state(cur, row)
         if ledger == "unresolved":
             return "unresolved"
@@ -2339,12 +2369,14 @@ async def _authorize_failure_alert_row(
     parent = _payload_dict(report_rows[0].get("payload_json"))
     parent_hash = str(parent.get("content_sha256") or "")
     parent_run = str(parent.get("report_run_id") or "")
+    parent_kind = str(parent.get("content_kind") or "")
     if (
-        str(parent.get("content_kind") or "") != "cards"
+        parent_kind not in {"cards", "text"}
         or not parent_hash
         or not parent_run
         or any(
-            str(_payload_dict(item.get("payload_json")).get("content_kind") or "") != "cards"
+            str(_payload_dict(item.get("payload_json")).get("content_kind") or "")
+            != parent_kind
             or str(_payload_dict(item.get("payload_json")).get("content_sha256") or "")
             != parent_hash
             or str(_payload_dict(item.get("payload_json")).get("report_run_id") or "")

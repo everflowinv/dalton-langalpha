@@ -2432,11 +2432,12 @@ async def _catch_up_terminal_report_failure_alerts(
     limit: int,
     uncertain_codes: Sequence[str],
 ) -> None:
-    """Create failure notices for card rows the send page can no longer claim.
+    """Create failure notices for card or text rows the send page can no longer claim.
 
     The send scan excludes ``attempt_count >= max_attempts``. This query uses
     the same lookback and limit, then calls the same terminal insert. It does
-    not send the notice; the next scan claims the new pending row.
+    not send the notice; the next scan claims the new pending row. Text uses
+    the same definite-failure rule as cards.
     """
     from src.dalton.database.automation_reports import (
         card_delivery_is_terminal,
@@ -2455,7 +2456,7 @@ async def _catch_up_terminal_report_failure_alerts(
                        d.payload_json
                 FROM dalton_notify_deliveries d
                 WHERE COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
-                  AND COALESCE(d.payload_json ->> 'content_kind', '') = 'cards'
+                  AND COALESCE(d.payload_json ->> 'content_kind', '') IN ('cards', 'text')
                   AND d.status = 'failed'
                   AND (
                       d.attempt_count >= %s
@@ -2529,7 +2530,7 @@ async def _catch_up_terminal_report_failure_alerts(
             continue
         if str(payload.get("source") or "") != "automation_report":
             continue
-        if str(payload.get("content_kind") or "") != "cards":
+        if str(payload.get("content_kind") or "") not in {"cards", "text"}:
             continue
         if not failure_target_snapshot_of(payload):
             continue

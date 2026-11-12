@@ -122,8 +122,10 @@ def build_tool_signature_registry() -> dict[str, set[str]]:
         fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
         registry.setdefault(t.name, set()).update(fields)
 
-    # 4. Direct search tools (`web_search`, `x_search`)
-    for t in (build_web_search_tool(), build_x_search_tool()):
+    # 4. Direct web tools (`web_search`, `x_search`, `WebFetch`)
+    from src.tools.web.fetch import web_fetch_tool
+
+    for t in (build_web_search_tool(), build_x_search_tool(), web_fetch_tool):
         fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
         registry[t.name] = fields
 

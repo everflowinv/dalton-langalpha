@@ -349,7 +349,10 @@ tests/unit/dalton/test_ai_finance_daily_skill.py
 plugins/dalton/skills/dalton-us-weekly-movers/
 plugins/dalton/skills/dalton-x-accounts-daily/
 plugins/dalton/skills/dalton-humanoid-robot-weekly/
+plugins/dalton/skills/dalton-china-consumer-weekly/
+plugins/dalton/skills/dalton-global-consumer-weekly/
 scripts/dalton/import_openclaw_skill_state.py
+tests/unit/dalton/test_agentturn_family2b.py
 src/dalton/database/automation_reports.py
 src/ptc_agent/agent/middleware/skills/dalton_registry.py
 tests/unit/dalton/test_agentturn_family1.py

@@ -80,6 +80,8 @@ def test_profile_accepts_only_named_profiles() -> None:
         "humanoid-robot-weekly",
         "weekly-trend-impact-scan",
         "ct-semi-sentiment",
+        "china-consumer-weekly",
+        "global-consumer-weekly",
     ):
         parsed, err = parse_report_profile(_profile(profile_id))
         assert err is None
@@ -100,6 +102,8 @@ def test_profile_accepts_only_named_profiles() -> None:
         "humanoid-robot-weekly",
         "weekly-trend-impact-scan",
         "ct-semi-sentiment",
+        "china-consumer-weekly",
+        "global-consumer-weekly",
     }
 
 
@@ -715,7 +719,7 @@ def test_text_body_is_exclusive_bounded_and_keeps_card_hashes() -> None:
     assert payload["content_sha256"] == prepared["content_sha256"]
     assert "cards" not in payload
     assert "failure_text" not in payload
-    assert "failure_target_snapshot" not in payload
+    assert payload["failure_target_snapshot"] == list(parsed["failure_targets"])
     items, item_err = reports.native_items_from_report_payload(payload)
     assert item_err is None
     assert items == [{"item_index": 0, "kind": "text", "text": prepared["text"]}]
