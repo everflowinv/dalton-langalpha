@@ -1,0 +1,23 @@
+{
+  "version": "1.0",
+  "subsectors": {
+    "erp": { "name_zh": "管理软件与ERP", "ae_queries": ["用友", "金蝶", "鼎捷", "赛意", "汉得"] },
+    "oa": { "name_zh": "协同与OA", "ae_queries": ["泛微", "致远互联"] },
+    "office": { "name_zh": "办公软件", "ae_queries": ["金山办公", "金山软件"] },
+    "fintech_it": { "name_zh": "金融IT", "ae_queries": ["恒生电子", "宇信科技", "长亮科技", "税友"] },
+    "construction_it": { "name_zh": "建筑与工程IT", "ae_queries": ["广联达", "品茗", "明源云"] },
+    "healthcare_it": { "name_zh": "医疗IT", "ae_queries": ["卫宁健康", "创业慧康", "医渡科技"] },
+    "gov_it": { "name_zh": "政务与信创", "ae_queries": ["太极股份", "神州信息", "中科软", "博思软件"] },
+    "industrial_sw": { "name_zh": "工业软件", "ae_queries": ["宝信软件", "中望软件", "中控技术", "柏楚电子"] },
+    "security": { "name_zh": "网络安全", "ae_queries": ["深信服", "奇安信", "启明星辰", "安恒信息", "CrowdStrike", "Palo Alto"] },
+    "cloud": { "name_zh": "云计算", "ae_queries": ["优刻得", "金山云", "紫光股份"] },
+    "ai": { "name_zh": "AI软件", "ae_queries": ["科大讯飞", "商汤", "第四范式", "Palantir"] },
+    "vertical_saas": { "name_zh": "垂直SaaS", "ae_queries": ["石基信息", "微盟", "有赞", "北森"] },
+    "platform_sw": { "name_zh": "平台软件", "ae_queries": ["Microsoft", "Oracle", "SAP", "Adobe", "Salesforce", "ServiceNow"] },
+    "data_infra": { "name_zh": "数据与基础设施", "ae_queries": ["Snowflake", "Datadog", "MongoDB", "Cloudflare"] },
+    "collab": { "name_zh": "协作与开发工具", "ae_queries": ["Atlassian", "Zoom", "GitLab", "Monday"] },
+    "hcm": { "name_zh": "人力资源与薪酬", "ae_queries": ["Workday", "ADP", "Paychex"] },
+    "crm": { "name_zh": "CRM与营销云", "ae_queries": ["Salesforce", "HubSpot"] },
+    "it_services": { "name_zh": "信息服务与IT咨询", "ae_queries": ["Accenture", "Cognizant", "EPAM", "Infosys", "IBM", "东软", "中软国际"] }
+  }
+}

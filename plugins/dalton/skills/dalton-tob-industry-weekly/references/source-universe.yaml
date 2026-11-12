@@ -1,0 +1,43 @@
+# 信源去哪查。改信源改这个文件，不要临场另起一套。
+# 接收方在任务的 metadata.report_profile，这里不写接收方。
+layers:
+  company_disclosure:
+    US:
+      - finance(route="sec", operation="list-filings", form="8-K" 或 "10-Q" 或 "6-K")
+      - 数字回 filing。新闻稿只作交叉。
+    A:
+      - finance(route="cn-hk", operation="filings") 按 6 位代码逐票取公告
+      - scripts/cninfo_a_scan.py 只筛标题和日期，不打开网络连接
+      - a-filings.json 只有 companies：键是 6 位代码，值是 filings 返回的列表；顶满 limit 的那次原始调用不放入
+      - 不用全市场分类查询。单票返回条数达到 limit 时，按更小日期段再查并合并；任一段仍顶满则在本期缺口注明可能截断
+    HK:
+      - finance(route="cn-hk", operation="filings") 按 5 位代码逐票取披露易业绩公告
+  earnings_call:
+    - research(route="alphaengine", operation="search_library")
+    - query 用公司中文名加「业绩发布会 管理层发言」；美股可用英文名加 earnings call
+    - params.document_categories 用 meeting_minutes 与 sell_side_comment，params.sort 用 relevance
+    - 带 query 时 sort 只用 relevance
+    - 只取最近 2 周；更旧的标「背景，非本周增量」
+    - 纪要只走 AlphaEngine。回退到 roic.ai 禁止
+    - institution_meetings 或 personal_meetings 与卖方分类同一次调用会得到 E_SCOPE_CONFLICT，这两类单独查
+  sellside:
+    - research(route="alphaengine", operation="search_library")
+    - params.document_categories 用 sell_side_comment 或 sell_side_report
+    - 查具体公司只传中文名或英文正式名，不传 industry_names，不传 markets
+    - 重点是口径和假设变了什么，以及上修或下修，不写评级本身
+    - 预测修正是文本口径，必须写机构名和日期
+  web:
+    - web_search(query, start_date, end_date, time_range="week")
+    - 不传 country、language、domain_filter
+    - 用来补财报日历、目标价调整新闻、池外亮点
+  community:
+    - 默认不跑。只有用户点名某家口碑时才查社区
+    - community(route="last30days", operation="search", query, days=7)
+sessions:
+  - get_market_overview(region="cn" 或 "hk" 或 "us", date=当周周五)，只采用返回里的 date
+  - record-sessions 带 --as-of 当周周五，写入 sessions.json 里该周五的 weeks 条目；本周没记录的市场就是缺失，不读上一周
+  - finance(route="cn-hk", operation="quote") 只是现货备用，不接受历史日期，不拿它填交易日
+delivery:
+  kind: automation_report_text
+  profile: tob-industry-weekly
+  archive: research-outputs/tob-industry-tracker/
