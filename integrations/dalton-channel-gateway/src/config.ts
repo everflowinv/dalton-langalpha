@@ -22,6 +22,11 @@ export interface GatewayConfig {
   webBaseUrl: string;
   /** Local Weixin cache directory (`~/.dalton/channel-gateway/weixin`, mode 0700). */
   weixinCacheDir: string;
+  /**
+   * Host file for loopback ops alerts (`DALTON_OPS_ALERTS_FILE`).
+   * Read from the merged process and env-file configuration. Empty when unset.
+   */
+  opsAlertsFile?: string;
   /** Whether colleague workspace dispatch is enabled (`DALTON_COLLEAGUE_DISPATCH_ENABLED`). */
   colleagueDispatchEnabled: boolean;
   /** Enabled channel platforms. */
@@ -188,6 +193,7 @@ export function loadConfig(
     backendUrl,
     webBaseUrl,
     weixinCacheDir,
+    opsAlertsFile: (mergedEnv.DALTON_OPS_ALERTS_FILE ?? "").trim(),
     colleagueDispatchEnabled: parseBool(
       mergedEnv.DALTON_COLLEAGUE_DISPATCH_ENABLED,
       true,

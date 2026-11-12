@@ -30,6 +30,7 @@ from src.dalton.notify.channel_transport import (
     UNCERTAIN_NOTIFY_ERROR_CODES,
     extract_target_uncertain_code,
     is_uncertain_notify_error_code,
+    post_automation_gateway_notify,
     post_data_task_gateway_notify,
 )
 from src.dalton.settings import (
@@ -37,6 +38,7 @@ from src.dalton.settings import (
     get_dalton_bridge_admin_token,
     get_dalton_frontend_url,
     get_notify_http_timeout_s,
+    notify_via_gateway_enabled,
 )
 from src.server.database.pool import get_db_connection
 
@@ -124,6 +126,17 @@ def is_excluded_automation_for_notify(
     else:
         return False
     return bool(name and _EXCLUDED_AUTO_RE.match(name.lower()))
+
+
+def dalton_kind_for_stored_category(category: str) -> str:
+    """Map a category stored on a notify row back to ``metadata.dalton_kind``.
+
+    Settlement stores ``earnings_calendar``. The classifier reads ``calendar``.
+    """
+    cleaned = str(category or "").strip()
+    if cleaned == "earnings_calendar":
+        return "calendar"
+    return cleaned
 
 
 def classify_automation_for_notify(
@@ -1153,6 +1166,35 @@ async def evaluate_user_notify_eligibility(
     return (True, None, effective_targets)
 
 
+class ClaimAttempt(tuple):
+    """``(claimed, attempt_count)`` plus the claimed row's ``delivery_id``.
+
+    Equality, length, and unpacking stay a two-item pair. ``delivery_id`` is an
+    attribute so existing callers that compare against ``(True, 1)`` keep working.
+    """
+
+    delivery_id: str | None
+
+    def __new__(
+        cls,
+        claimed: bool,
+        attempt_count: int | None,
+        delivery_id: str | None = None,
+    ) -> ClaimAttempt:
+        result = tuple.__new__(cls, (claimed, attempt_count))
+        result.delivery_id = delivery_id
+        return result
+
+
+def _as_claim_attempt(
+    claimed: bool,
+    attempt_count: int | None,
+    delivery_id: Any = None,
+) -> ClaimAttempt:
+    text = str(delivery_id).strip() if delivery_id is not None else ""
+    return ClaimAttempt(claimed, attempt_count, text or None)
+
+
 async def claim_target_delivery_with_attempt(
     execution_id: str,
     channel: str,
@@ -1162,18 +1204,20 @@ async def claim_target_delivery_with_attempt(
     automation_id: str | None = None,
     payload: Mapping[str, Any] | None = None,
     stale_pending_minutes: int = 10,
-) -> tuple[bool, int | None]:
-    """Atomically claim or retry a ``(execution_id, channel, target)`` row and return ``(claimed, attempt_count)``.
+) -> ClaimAttempt:
+    """Atomically claim or retry a ``(execution_id, channel, target)`` row.
 
-    Uses a single ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING delivery_id, attempt_count``
-    statement so the caller receives the exact ``attempt_count`` of the claimed attempt without
-    a separate unlocked ``SELECT``.
+    Returns ``(claimed, attempt_count)`` and sets ``delivery_id`` on that pair.
+    Uses one ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` statement.
+    Data-task rows keep their existing stale-pending rule. A pending
+    ``transport=gateway`` automation row whose ``error_code`` is uncertain
+    is not reclaimed. A row that already has ``transport`` keeps that value.
     """
     exec_id = (execution_id or "").strip()
     ch = (channel or "").strip().lower()
     tgt = (target or "").strip()
     if not (exec_id and ch and tgt):
-        return False, None
+        return _as_claim_attempt(False, None)
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -1217,6 +1261,18 @@ async def claim_target_delivery_with_attempt(
                             )
                             ELSE '{}'::jsonb
                         END
+                    ) || (
+                        CASE
+                            WHEN COALESCE(
+                                dalton_notify_deliveries.payload_json ->> 'transport',
+                                ''
+                            ) <> ''
+                            THEN jsonb_build_object(
+                                'transport',
+                                dalton_notify_deliveries.payload_json -> 'transport'
+                            )
+                            ELSE '{}'::jsonb
+                        END
                     ),
                     updated_at = NOW()
                 WHERE (
@@ -1231,6 +1287,7 @@ async def claim_target_delivery_with_attempt(
                             NOT (
                                 COALESCE(dalton_notify_deliveries.automation_id, '') LIKE 'data:%%'
                                 OR COALESCE(dalton_notify_deliveries.payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                OR COALESCE(dalton_notify_deliveries.payload_json ->> 'transport', '') = 'gateway'
                             )
                             OR COALESCE(dalton_notify_deliveries.error_code, '') <> ALL(%s)
                         )
@@ -1255,8 +1312,11 @@ async def claim_target_delivery_with_attempt(
             )
             row = await cur.fetchone()
             if row is None:
-                return False, None
+                return _as_claim_attempt(False, None)
+            delivery_id: Any = None
+            attempt_count = 1
             if isinstance(row, Mapping):
+                delivery_id = row.get("delivery_id")
                 raw_attempt = row.get("attempt_count")
                 try:
                     attempt_count = (
@@ -1264,16 +1324,17 @@ async def claim_target_delivery_with_attempt(
                     )
                 except (TypeError, ValueError):
                     attempt_count = 1
-                return True, attempt_count
-            if isinstance(row, (tuple, list)):
-                if len(row) >= 2 and row[1] is not None:
-                    try:
-                        return True, int(row[1])
-                    except (TypeError, ValueError):
-                        return True, 1
-                if len(row) == 1 and isinstance(row[0], int):
-                    return True, int(row[0])
-            return True, 1
+            elif isinstance(row, (tuple, list)):
+                if len(row) >= 2:
+                    delivery_id = row[0]
+                    if row[1] is not None:
+                        try:
+                            attempt_count = int(row[1])
+                        except (TypeError, ValueError):
+                            attempt_count = 1
+                elif len(row) == 1 and isinstance(row[0], int):
+                    attempt_count = int(row[0])
+            return _as_claim_attempt(True, attempt_count, delivery_id)
 
 
 async def claim_target_delivery(
@@ -1430,6 +1491,7 @@ async def mark_target_delivery(
                             AND (
                                 COALESCE(automation_id, '') LIKE 'data:%%'
                                 OR COALESCE(payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                OR COALESCE(payload_json ->> 'transport', '') = 'gateway'
                             )
                             AND COALESCE(error_code, '') = ANY(%s)
                         )"""
@@ -1735,6 +1797,18 @@ async def post_bridge_notify(
         return data
 
 
+setattr(post_bridge_notify, "__dalton_bridge_notify__", True)
+
+
+def _post_notify_is_bridge(fn: Callable[..., Any]) -> bool:
+    """Return whether ``fn`` is the Bridge ``/notify`` sender.
+
+    The marker lives on the function object. Replacing the module global with a
+    test double does not copy it, so an injected sender stays on the Bridge path.
+    """
+    return bool(getattr(fn, "__dalton_bridge_notify__", False))
+
+
 async def send_dalton_notify_test(
     user_id: str | None,
     target: str,
@@ -1799,6 +1873,14 @@ async def send_dalton_notify_test(
     }
     text_msg = f"Dalton 推送测试\n这是一条测试推送，用于确认该目标可用。目标：{display}"
 
+    if notify_via_gateway_enabled():
+        return await _send_claimed_notify_test(
+            user_id=user_id,
+            target=cleaned,
+            text=text_msg,
+            card=card,
+        )
+
     res = await post_bridge_notify([cleaned], text_msg, card)
     results = res.get("results") if isinstance(res, dict) else None
     item = (
@@ -1835,6 +1917,117 @@ async def send_dalton_notify_test(
     if log_id:
         detail = f"{detail}（log_id: {log_id}）"
     return {"ok": False, "detail": detail, "error_code": error_code}
+
+
+async def _send_claimed_notify_test(
+    *,
+    user_id: str | None,
+    target: str,
+    text: str,
+    card: dict[str, Any],
+) -> dict[str, Any]:
+    """Insert a ``source=notify_test`` row, then send that ``delivery_id`` through the gateway.
+
+    The row is outside ``retry_failed_notify_deliveries``. An uncertain result stays
+    pending with that error code and is not sent again.
+    """
+    execution_id = f"test:{uuid.uuid4()}"
+    channel, cleaned = _split_target_channel(target)
+    claim = await claim_target_delivery_with_attempt(
+        execution_id,
+        channel,
+        cleaned,
+        user_id=str(user_id or ""),
+        automation_id=None,
+        payload={
+            "text": text,
+            "card": card,
+            "source": "notify_test",
+            "transport": "gateway",
+            "automation_name": "",
+            "category": "custom",
+        },
+    )
+    delivery_id = claim.delivery_id
+    if not claim[0] or not delivery_id:
+        return {
+            "ok": False,
+            "detail": "发送失败（claim_failed）",
+            "error_code": "claim_failed",
+        }
+
+    res = await post_automation_gateway_notify(delivery_id, target=cleaned)
+    skip_code = _notify_result_skip_code(cleaned, res)
+    if skip_code is not None:
+        await mark_target_delivery(
+            execution_id,
+            channel,
+            cleaned,
+            status="skipped",
+            error_code=skip_code,
+            expected_status="pending",
+        )
+        return {
+            "ok": False,
+            "detail": f"发送失败（{skip_code}）",
+            "error_code": skip_code,
+        }
+
+    uncertain_code = extract_target_uncertain_code(cleaned, res)
+    if uncertain_code is not None:
+        await _shielded_mark_uncertain(
+            mark_target_delivery,
+            execution_id,
+            channel,
+            cleaned,
+            error_code=uncertain_code,
+            expected_status="pending",
+        )
+        return {"ok": False, "detail": "结果未知", "error_code": uncertain_code}
+
+    results = res.get("results") if isinstance(res, Mapping) else None
+    item = (
+        next(
+            (
+                entry
+                for entry in results
+                if isinstance(entry, Mapping)
+                and str(entry.get("target") or "") == cleaned
+            ),
+            None,
+        )
+        if isinstance(results, list)
+        else None
+    )
+    if isinstance(item, Mapping) and item.get("ok") is True:
+        await mark_target_delivery(
+            execution_id,
+            channel,
+            cleaned,
+            status="sent",
+            error_code=None,
+            expected_status="pending",
+        )
+        return {"ok": True, "detail": None, "error_code": None}
+
+    error_code = "send_failed"
+    if isinstance(item, Mapping):
+        error_code = str(item.get("error") or item.get("error_code") or error_code)
+    elif isinstance(res, Mapping):
+        error_code = str(res.get("error_code") or error_code)
+    await mark_target_delivery(
+        execution_id,
+        channel,
+        cleaned,
+        status="failed",
+        error_code=error_code,
+        expected_status="pending",
+    )
+    return {
+        "ok": False,
+        "detail": f"发送失败（{error_code}）",
+        "error_code": error_code,
+    }
 
 
 def extract_feishu_cards_from_payload(
@@ -1994,6 +2187,34 @@ async def dispatch_target_with_payload(
     return last_res
 
 
+def _notify_result_skip_code(target: str, transport_res: Any) -> str | None:
+    """Return the skip code for ``target`` when the gateway declined to send."""
+    if not isinstance(transport_res, Mapping):
+        return None
+    cleaned = str(target or "").strip()
+    results = transport_res.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("target") or "").strip() != cleaned:
+                continue
+            skipped = item.get("skipped") is True or str(
+                item.get("status") or ""
+            ).strip().lower() == "skipped"
+            if skipped:
+                code = str(
+                    item.get("error_code") or item.get("reason") or "skipped"
+                ).strip()
+                return code or "skipped"
+    if str(transport_res.get("status") or "").strip().lower() == "skipped":
+        code = str(
+            transport_res.get("error_code") or transport_res.get("code") or "skipped"
+        ).strip()
+        return code or "skipped"
+    return None
+
+
 def _evaluate_target_results(
     claimed_targets: Sequence[str],
     bridge_res: Any,
@@ -2061,7 +2282,11 @@ def _reconstruct_automation_from_delivery_row(
     raw_meta = row.get("automation_metadata")
     meta: dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
     if not meta and payload.get("category") and payload.get("category") != "custom":
-        meta = {"dalton_kind": str(payload.get("category"))}
+        meta = {
+            "dalton_kind": dalton_kind_for_stored_category(
+                str(payload.get("category"))
+            )
+        }
     if auto_id or auto_name or meta:
         reconstructed: dict[str, Any] = {"name": auto_name, "metadata": meta}
         if auto_id:
@@ -2397,7 +2622,9 @@ async def retry_failed_notify_deliveries(
     ``reason`` = ``toggle_off`` or ``target_removed``. Uncertain data-task rows are
     reconciled read-only against ``dalton_channel_deliveries`` (independent of
     ``attempt_count``) and excluded from send-retry selection so unresolved uncertain
-    rows never starve retryable work. A saved automation report, including one still
+    rows never starve retryable work. Uncertain gateway completions and test pushes
+    are reconciled the same way: a platform ``sent`` or ``failed`` updates the outer
+    row, and ``in_flight``, ``unknown``, or a missing platform row is not resent. A saved automation report, including one still
     pending on attempt 0, is sent with ``dispatch_automation_report``; an uncertain
     report row stays on the reconciliation scan. Processes bounded batches within
     ``max_duration_s`` seconds. A card row already at the attempt cap is not on
@@ -2429,6 +2656,19 @@ async def retry_failed_notify_deliveries(
             )
             if time.monotonic() - started_at >= max_duration_s:
                 return sent_count
+            from src.dalton.database.automation_notifications import (
+                reconcile_uncertain_automation_notify_deliveries,
+            )
+
+            sent_count += await reconcile_uncertain_automation_notify_deliveries(
+                limit=limit,
+                max_duration_s=max_duration_s,
+                started_at=started_at,
+                mark_delivery_fn=custom_mark,
+                get_connection=get_db_connection,
+            )
+            if time.monotonic() - started_at >= max_duration_s:
+                return sent_count
 
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -2437,6 +2677,7 @@ async def retry_failed_notify_deliveries(
                     SELECT d.execution_id, d.automation_id, d.user_id,
                            d.channel, d.target, d.status, d.attempt_count,
                            d.error_code,
+                           d.delivery_id,
                            d.updated_at,
                            d.payload_json,
                            a.name AS automation_name,
@@ -2474,12 +2715,14 @@ async def retry_failed_notify_deliveries(
                                         'automation_report',
                                         'automation_report_failure_alert'
                                     )
+                                    OR COALESCE(d.payload_json ->> 'transport', '') = 'gateway'
                                 )
                                 OR COALESCE(d.error_code, '') <> ALL(%s)
                             )
                             AND d.updated_at <= NOW() - make_interval(mins => %s)
                         )
                     )
+                      AND COALESCE(d.payload_json ->> 'source', '') <> 'notify_test'
                       AND d.created_at >= NOW() - make_interval(hours => %s)
                       AND (
                           COALESCE(d.payload_json ->> 'source', '') NOT IN (
@@ -2570,6 +2813,21 @@ async def retry_failed_notify_deliveries(
                     )
                     continue
                 row_source = str(payload.get("source") or "")
+                if row_source == "notify_test":
+                    continue
+                row_transport = str(payload.get("transport") or "").strip().lower()
+                if (
+                    row_transport == "gateway"
+                    and not is_data_task_row
+                    and row_source
+                    not in {
+                        "automation_report",
+                        "automation_report_failure_alert",
+                    }
+                    and raw_row_status == "pending"
+                    and is_uncertain_notify_error_code(row_error_code)
+                ):
+                    continue
                 if row_source in {
                     "automation_report",
                     "automation_report_failure_alert",
@@ -2666,6 +2924,7 @@ async def retry_failed_notify_deliveries(
                                       NOT (
                                           COALESCE(automation_id, '') LIKE 'data:%%'
                                           OR COALESCE(payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                          OR COALESCE(payload_json ->> 'transport', '') = 'gateway'
                                       )
                                       OR COALESCE(error_code, '') <> ALL(%s)
                                   )
@@ -2793,8 +3052,20 @@ async def retry_failed_notify_deliveries(
                 if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
                     break
 
+                row_transport = str(payload.get("transport") or "").strip().lower()
+                automation_gateway = (
+                    row_transport == "gateway"
+                    and not is_data_task_row
+                    and row_source
+                    not in {
+                        "automation_report",
+                        "automation_report_failure_alert",
+                        "notify_test",
+                    }
+                )
                 use_gateway_transport = (
-                    is_data_task_row and post_notify_fn is post_bridge_notify
+                    (is_data_task_row and post_notify_fn is post_bridge_notify)
+                    or automation_gateway
                 )
                 async with get_db_connection() as conn:
                     if (
@@ -2822,6 +3093,7 @@ async def retry_failed_notify_deliveries(
                                           NOT (
                                               COALESCE(automation_id, '') LIKE 'data:%%'
                                               OR COALESCE(payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                              OR COALESCE(payload_json ->> 'transport', '') = 'gateway'
                                           )
                                           OR COALESCE(error_code, '') <> ALL(%s)
                                       )
@@ -2976,7 +3248,32 @@ async def retry_failed_notify_deliveries(
                 wait_for_timeout_s = (
                     request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
                 )
-                if use_gateway_transport:
+                if use_gateway_transport and automation_gateway:
+                    raw_delivery_id = str(row.get("delivery_id") or "").strip()
+                    if not raw_delivery_id:
+                        native_send_started = False
+                        await _invoke_mark_delivery(
+                            mark_delivery_fn,
+                            exec_id,
+                            ch,
+                            tgt,
+                            status="failed",
+                            error_code="missing_delivery_id",
+                            expected_status="pending",
+                            expected_attempt_count=claimed_attempt_count,
+                        )
+                        row_claimed = False
+                        continue
+                    native_send_started = True
+                    bridge_res = await asyncio.wait_for(
+                        post_automation_gateway_notify(
+                            raw_delivery_id,
+                            target=tgt,
+                            timeout_s=request_timeout_s,
+                        ),
+                        timeout=wait_for_timeout_s,
+                    )
+                elif use_gateway_transport:
                     native_send_started = True
                     gateway_kwargs: dict[str, Any] = {"run_id": exec_id}
                     if _callable_accepts_kwarg(
@@ -4154,21 +4451,55 @@ async def on_automation_settled(
             frontend_base_url=resolved_frontend_url,
             title_override=payoff_title_override,
         )
+        via_gateway = (
+            notify_via_gateway_enabled()
+            and _post_notify_is_bridge(post_notify_fn)
+            and claim_execution_fn is None
+        )
         payload_record = {
             "text": message_text,
             "card": card_dict,
             "automation_name": str(automation.get("name") or "").strip(),
             "category": classification.category,
+            "source": "automation_completion",
+            "transport": "gateway" if via_gateway else "bridge",
         }
         automation_id_str = (
             str(automation.get("automation_id") or "").strip() or None
         )
 
-        claimed_targets: list[tuple[str, str]] = []
+        claimed_targets: list[tuple[str, str, str | None]] = []
         if claim_execution_fn is not None:
             if await claim_execution_fn(execution_id):
                 for tgt in targets:
-                    claimed_targets.append(_split_target_channel(tgt))
+                    ch, cleaned_tgt = _split_target_channel(tgt)
+                    claimed_targets.append((ch, cleaned_tgt, None))
+        elif via_gateway:
+            for tgt in targets:
+                ch, cleaned_tgt = _split_target_channel(tgt)
+                claim_res = await claim_target_delivery_with_attempt(
+                    execution_id,
+                    ch,
+                    cleaned_tgt,
+                    user_id=user_id,
+                    automation_id=automation_id_str,
+                    payload=payload_record,
+                )
+                if not claim_res[0]:
+                    continue
+                if not claim_res.delivery_id:
+                    await _invoke_mark_delivery(
+                        mark_target_fn,
+                        execution_id,
+                        ch,
+                        cleaned_tgt,
+                        status="failed",
+                        error_code="missing_delivery_id",
+                        expected_status="pending",
+                    )
+                    continue
+                claimed_targets.append((ch, cleaned_tgt, claim_res.delivery_id))
+                pending_targets.append((ch, cleaned_tgt))
         else:
             for tgt in targets:
                 ch, cleaned_tgt = _split_target_channel(tgt)
@@ -4180,7 +4511,7 @@ async def on_automation_settled(
                     automation_id=automation_id_str,
                     payload=payload_record,
                 ):
-                    claimed_targets.append((ch, cleaned_tgt))
+                    claimed_targets.append((ch, cleaned_tgt, None))
                     pending_targets.append((ch, cleaned_tgt))
 
         if not claimed_targets:
@@ -4191,14 +4522,33 @@ async def on_automation_settled(
             return False
 
         any_sent = False
-        for ch, cleaned_tgt in claimed_targets:
+        for ch, cleaned_tgt, delivery_id in claimed_targets:
             try:
-                bridge_res = await _invoke_post_notify(
-                    post_notify_fn,
-                    [cleaned_tgt],
-                    message_text,
-                    card_dict,
-                )
+                if via_gateway:
+                    bridge_res = await post_automation_gateway_notify(
+                        str(delivery_id),
+                        target=cleaned_tgt,
+                    )
+                else:
+                    bridge_res = await _invoke_post_notify(
+                        post_notify_fn,
+                        [cleaned_tgt],
+                        message_text,
+                        card_dict,
+                    )
+            except asyncio.CancelledError:
+                if via_gateway:
+                    await _shielded_mark_uncertain(
+                        mark_target_fn,
+                        execution_id,
+                        ch,
+                        cleaned_tgt,
+                        error_code="delivery_uncertain",
+                        expected_status="pending",
+                    )
+                    if (ch, cleaned_tgt) in pending_targets:
+                        pending_targets.remove((ch, cleaned_tgt))
+                raise
             except Exception as post_exc:
                 status_code = getattr(
                     getattr(post_exc, "response", None), "status_code", None
@@ -4243,6 +4593,52 @@ async def on_automation_settled(
                 )
                 continue
 
+            if via_gateway:
+                skip_code = _notify_result_skip_code(cleaned_tgt, bridge_res)
+                if skip_code is not None:
+                    try:
+                        await _invoke_mark_delivery(
+                            mark_target_fn,
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            status="skipped",
+                            reason=skip_code,
+                            error_code=skip_code,
+                            expected_status="pending",
+                        )
+                    except Exception as mark_exc:
+                        logger.warning(
+                            "[DALTON_NOTIFY] Failed marking delivery status for execution_id=%s: error_type=%s",
+                            execution_id,
+                            type(mark_exc).__name__,
+                        )
+                    if (ch, cleaned_tgt) in pending_targets:
+                        pending_targets.remove((ch, cleaned_tgt))
+                    continue
+                uncertain_code = extract_target_uncertain_code(
+                    cleaned_tgt, bridge_res
+                )
+                if uncertain_code is not None:
+                    try:
+                        await _shielded_mark_uncertain(
+                            mark_target_fn,
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            error_code=uncertain_code,
+                            expected_status="pending",
+                        )
+                    except Exception as mark_exc:
+                        logger.warning(
+                            "[DALTON_NOTIFY] Failed marking delivery status for execution_id=%s: error_type=%s",
+                            execution_id,
+                            type(mark_exc).__name__,
+                        )
+                    if (ch, cleaned_tgt) in pending_targets:
+                        pending_targets.remove((ch, cleaned_tgt))
+                    continue
+
             outcomes, batch_err = _evaluate_target_results(
                 [cleaned_tgt], bridge_res
             )
@@ -4250,6 +4646,15 @@ async def on_automation_settled(
             if ok:
                 any_sent = True
             if claim_execution_fn is None:
+                if via_gateway and not ok:
+                    recorded_error = _extract_retry_target_error_code(
+                        cleaned_tgt,
+                        bridge_res,
+                        batch_err,
+                        use_gateway_transport=True,
+                    )
+                else:
+                    recorded_error = None if ok else (batch_err or "target_failed")
                 try:
                     await _invoke_mark_delivery(
                         mark_target_fn,
@@ -4257,7 +4662,7 @@ async def on_automation_settled(
                         ch,
                         cleaned_tgt,
                         status="sent" if ok else "failed",
-                        error_code=None if ok else (batch_err or "target_failed"),
+                        error_code=recorded_error,
                     )
                 except Exception as mark_exc:
                     logger.warning(

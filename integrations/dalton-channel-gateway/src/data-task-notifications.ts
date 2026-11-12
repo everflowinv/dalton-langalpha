@@ -44,6 +44,10 @@ const SKIP_CODES = new Set([
   "override_off",
   "target_not_routed",
   "no_targets",
+  "target_removed",
+  "eve_tracking_mirror_pending",
+  "task_deleted",
+  "already_sent",
 ]);
 
 class DataTaskBackendAckError extends Error {
@@ -360,12 +364,19 @@ export interface DataTaskNotificationServiceOptions {
   queueTaskTimeoutMs?: number;
 }
 
-interface ExecutionStateTracker {
+export interface ExecutionStateTracker {
   claimedAnyItem: boolean;
   resolvedPlatform: ChannelPlatform | null;
   itemsTotal: number;
   itemsSent: number;
   outcomes: DataTaskItemDeliveryOutcome[];
+}
+
+export interface AuthorizedPlanDeliveryOptions {
+  /** When present, the shared loop uses this plan and does not fetch a data-task plan. */
+  rawPlan?: unknown;
+  claimKind?: "data_task" | "automation_notify";
+  liveCheckPurpose?: string;
 }
 
 export class DataTaskNotificationService {
@@ -663,20 +674,42 @@ export class DataTaskNotificationService {
     }
   }
 
+  async deliverAuthorizedPlan(
+    runId: string,
+    target: string,
+    tracker: ExecutionStateTracker,
+    options?: AuthorizedPlanDeliveryOptions,
+  ): Promise<{ status: number; data: DataTaskNotificationResponse }> {
+    return this.executeAuthorizedPlan(runId, target, tracker, options);
+  }
+
   private async executeAuthorizedPlan(
     runId: string,
     target: string,
     tracker: ExecutionStateTracker,
+    options?: AuthorizedPlanDeliveryOptions,
   ): Promise<{ status: number; data: DataTaskNotificationResponse }> {
-    if (typeof this.backend.authorizeDataTaskNotificationPlan !== "function") {
-      throw new DataTaskBackendAckError(
-        "BackendClient does not implement authorizeDataTaskNotificationPlan",
-      );
+    const claimKind = options?.claimKind ?? "data_task";
+    const liveCheckPurpose =
+      options?.liveCheckPurpose ?? "data_task_notification";
+    const suppliedPlan = Object.prototype.hasOwnProperty.call(
+      options ?? {},
+      "rawPlan",
+    );
+    let rawPlan: unknown;
+    if (suppliedPlan) {
+      rawPlan = options?.rawPlan;
+    } else {
+      if (typeof this.backend.authorizeDataTaskNotificationPlan !== "function") {
+        throw new DataTaskBackendAckError(
+          "BackendClient does not implement authorizeDataTaskNotificationPlan",
+        );
+      }
+      rawPlan = await this.backend.authorizeDataTaskNotificationPlan({
+        run_id: runId,
+        target,
+      });
     }
-    const rawPlan: unknown = await this.backend.authorizeDataTaskNotificationPlan({
-      run_id: runId,
-      target,
-    });
 
     if (!isPlainRecord(rawPlan) || typeof rawPlan.authorized !== "boolean") {
       return {
@@ -853,7 +886,7 @@ export class DataTaskNotificationService {
         const preClaimLiveCheck = await readyAdapter.checkTargetLive!({
           userId: plan.owner_user_id ?? "",
           address: canonicalPlanTargetAddress,
-          purpose: "data_task_notification",
+          purpose: liveCheckPurpose,
         });
         if (!preClaimLiveCheck.ok) {
           const failCode = preClaimLiveCheck.code ?? "not_allowed";
@@ -895,7 +928,7 @@ export class DataTaskNotificationService {
       try {
         rawClaim = await this.backend.authorizeAndClaimDelivery({
           delivery_key: item.delivery_key,
-          kind: "data_task",
+          kind: claimKind,
           run_id: plan.run_id ?? runId,
           target: plan.requested_target ?? target,
           platform,
@@ -1080,7 +1113,7 @@ export class DataTaskNotificationService {
         const liveCheck = await readyAdapter.checkTargetLive!({
           userId: plan.owner_user_id ?? "",
           address: targetAddress,
-          purpose: "data_task_notification",
+          purpose: liveCheckPurpose,
         });
         if (!liveCheck.ok) {
           const failCode = liveCheck.code ?? "not_allowed";

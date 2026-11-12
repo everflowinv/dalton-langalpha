@@ -2295,12 +2295,16 @@ async def global_search_endpoint(
 
 
 from src.dalton.app.channels_router import channels_router  # noqa: E402
+from src.dalton.app.automation_notifications_router import (  # noqa: E402
+    automation_notifications_router,
+)
 from src.dalton.app.data_task_notifications_router import (  # noqa: E402
     data_task_notifications_router,
 )
 
 router.include_router(channels_router)
 router.include_router(data_task_notifications_router)
+router.include_router(automation_notifications_router)
 
 
 

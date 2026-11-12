@@ -1083,6 +1083,29 @@ def get_dalton_channel_gateway_url(host: str | None = None) -> str:
     return f"http://{default_host}:{port}"
 
 
+def notify_via_gateway_enabled() -> bool:
+    """Return whether generic automation notifications use the channel gateway.
+
+    ``DALTON_NOTIFY_VIA_GATEWAY`` defaults to off. Off keeps ``post_bridge_notify``.
+    On sends newly claimed completion and test rows through the gateway.
+    """
+    raw = os.getenv("DALTON_NOTIFY_VIA_GATEWAY", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def get_eve_tracking_chat_id() -> str:
+    """Return ``DALTON_EVE_TRACKING_CHAT_ID`` (a Feishu ``oc_`` chat id).
+
+    Empty means completion plans do not intercept any chat. A value may be the
+    bare chat id or ``feishu:chat:<id>``; the returned string is the bare id.
+    The id is never hardcoded.
+    """
+    raw = os.getenv("DALTON_EVE_TRACKING_CHAT_ID", "").strip()
+    if raw.lower().startswith("feishu:chat:"):
+        raw = raw.split(":", 2)[-1].strip()
+    return raw
+
+
 FEISHU_SEND_CARD_TIMEOUT_S: float = 15.0
 
 

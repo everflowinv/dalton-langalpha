@@ -401,7 +401,8 @@ export interface I6AuthorizeAndClaimRequest {
     | "interrupt"
     | "automation"
     | "notice"
-    | "data_task";
+    | "data_task"
+    | "automation_notify";
   user_id?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
@@ -1079,6 +1080,10 @@ export interface BackendClient {
     req: DataTaskNotificationRequest,
   ): Promise<DataTaskAuthorizePlanResponse>;
 
+  authorizeAutomationNotificationPlan?(req: {
+    delivery_id: string;
+  }): Promise<DataTaskAuthorizePlanResponse>;
+
   downloadDataTaskRunArtifact?(
     runId: string,
     artifactId: string,
@@ -1381,7 +1386,7 @@ export class HttpBackendClient implements BackendClient {
   async authorizeAndClaimDelivery(
     req: I6AuthorizeAndClaimRequest,
   ): Promise<I6AuthorizeAndClaimResponse> {
-    if (req.kind === "data_task") {
+    if (req.kind === "data_task" || req.kind === "automation_notify") {
       const { data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
         "POST",
         "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
@@ -1414,7 +1419,8 @@ export class HttpBackendClient implements BackendClient {
   ): Promise<I7DeliveriesProgressResponse> {
     if (
       typeof req.delivery_key === "string" &&
-      req.delivery_key.startsWith("data_task:")
+      (req.delivery_key.startsWith("data_task:") ||
+        req.delivery_key.startsWith("automation_notify:"))
     ) {
       const { data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
         "POST",
@@ -1905,6 +1911,26 @@ export class HttpBackendClient implements BackendClient {
         cache: "no-store",
         strictJson: true,
         operationLabel: "authorizeDataTaskNotificationPlan",
+      },
+    );
+    return data;
+  }
+
+  async authorizeAutomationNotificationPlan(req: {
+    delivery_id: string;
+  }): Promise<DataTaskAuthorizePlanResponse> {
+    const { data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/automation-notifications/plan",
+      {
+        body: {
+          delivery_id: req.delivery_id,
+        },
+        timeoutMs: 15_000,
+        redirect: "error",
+        cache: "no-store",
+        strictJson: true,
+        operationLabel: "authorizeAutomationNotificationPlan",
       },
     );
     return data;

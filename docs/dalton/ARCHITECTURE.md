@@ -213,7 +213,7 @@ Docker（colima，数据盘在 EveSSD）
 - **推送稿语言审查与卡片组装**（`build_feishu_notify_card`、`format_notify_message`、`scripts/dalton/notify_preview.py`）：
   - 6 种推送任务在收尾前必须把推送正文写入 `research/push/<slug>.md`，完成两轮 `check_language` 并通过 `dalton_check_done` 的 `closing.push_draft` 校验。
   - 飞书使用 Card Schema 2.0：按五词结论映射表头配色（`VERDICT_TEMPLATE_MAP`）和业务标签（`CATEGORY_BUSINESS_TAG_MAP`），提取「结论 / 要点 / 下一步验证 / 来源」四个区块（`extract_card_sections`），按块截断（`_truncate_section_body`：单块上限 320 字、全卡正文上限 3000 字，整块保留 Markdown 表格与列表或在句末标点截断，并通过 `_strip_non_http_markdown_links` 剥离沙箱内部路径链接），底部附「在 Dalton 中打开」按钮（链接为 `{DALTON_FRONTEND_URL}/chat/t/{thread_id}`）。Discord 发送纯文本私信。
-  - 预览工具 `scripts/dalton/notify_preview.py` 优先经 `CheckpointHistoryReader`（`read_run_answer`）从 LangGraph checkpointer 读取完整回复，仅在不可用时回退到 `automation_executions.result_excerpt`（打印截断告警并通过 `_keep_excerpt_last_line` 丢弃未闭合尾行），再调 `feishu_send_card.py --dry-run` 校验卡片结构。
+  - 预览工具 `scripts/dalton/notify_preview.py` 优先经 `CheckpointHistoryReader`（`read_run_answer`）从 LangGraph checkpointer 读取完整回复，仅在不可用时回退到 `automation_executions.result_excerpt`（打印截断告警并通过 `_keep_excerpt_last_line` 丢弃未闭合尾行），然后直接打印后端卡片 JSON。
 - **投递账本与重试**：`dalton_notify_deliveries` 表以 `(execution_id, channel, target)` 唯一键做幂等认领（`claim_target_delivery`、`mark_target_delivery`），后端通过宿主机桥接层 `POST /notify`（携带 `DALTON_BRIDGE_ADMIN_TOKEN`）发送。`preflight.decide()` 期间顺带调用 `retry_failed_notify_deliveries`，对 24 小时内失败或 `pending` 超 10 分钟的记录最多重试 3 次（重试前重新核对用户当前开关和目标）。
 
 ## 7. 预算与计费

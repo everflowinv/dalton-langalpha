@@ -11,7 +11,9 @@ import type { BackendClient } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
 import { WeixinQrLoginError } from "./channels/weixin/index.js";
 import type { GatewayConfig } from "./config.js";
+import { AutomationNotificationService } from "./automation-notifications.js";
 import { DataTaskNotificationService } from "./data-task-notifications.js";
+import { handleOpsAlert } from "./ops-alerts.js";
 import { DeliveryService } from "./delivery-service.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
 import type {
@@ -179,6 +181,16 @@ export function createGatewayApp(options: {
     adapters,
     mode: config.mode,
   });
+  const automationNotifications = new AutomationNotificationService(
+    backend,
+    dataTaskNotifications,
+  );
+  const feishuAdapter = adapters.get("feishu");
+  const sendOpsPlainText =
+    typeof feishuAdapter?.sendPlainText === "function"
+      ? (targetAddress: string, text: string) =>
+          feishuAdapter.sendPlainText!({ targetAddress, text })
+      : undefined;
   const agentRoutes = new AgentRoutesHandler({
     backend,
     adapters,
@@ -235,6 +247,52 @@ export function createGatewayApp(options: {
         }
         const result =
           await dataTaskNotifications.handleDataTaskNotification(body);
+        sendJson(res, result.status, result.data);
+        return;
+      }
+
+      if (method === "POST" && pathname === "/internal/automation-notifications") {
+        let body: unknown;
+        try {
+          body = await readJsonBody<unknown>(req);
+        } catch {
+          sendJson(res, 400, {
+            ok: false,
+            status: "failed",
+            code: "invalid_json",
+            message: "Malformed JSON request body.",
+            run_id: "",
+            target: "",
+            platform: null,
+            items_total: 0,
+            items_sent: 0,
+            items: [],
+          });
+          return;
+        }
+        const result = await automationNotifications.handle(body);
+        sendJson(res, result.status, result.data);
+        return;
+      }
+
+      if (method === "POST" && pathname === "/internal/ops-alerts") {
+        let body: unknown;
+        try {
+          body = await readJsonBody<unknown>(req);
+        } catch {
+          sendJson(res, 400, {
+            ok: false,
+            code: "invalid_json",
+            message: "Malformed JSON request body.",
+          });
+          return;
+        }
+        const result = await handleOpsAlert({
+          body,
+          remoteAddress: req.socket.remoteAddress,
+          configPath: config.opsAlertsFile,
+          sendPlainText: sendOpsPlainText,
+        });
         sendJson(res, result.status, result.data);
         return;
       }
