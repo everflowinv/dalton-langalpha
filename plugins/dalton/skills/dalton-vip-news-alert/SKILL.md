@@ -25,7 +25,7 @@ description: "无人值守的 VIP 动态速递：汇总七位人物过去 24 小
 - `render` 生成卡片。你提交 `automation_report`。
 - 只有卡片确认发出之后，才运行 `commit-seen`。
 
-草稿在 `temp/vip-news-alert/<summary_date>/`：`raw.json`、`filtered.json`、`events.json`、`card.md`、`card.json`、`manifest.json`、`confirm.json`。采访全文在 `research-outputs/vip-news-alert/<summary_date>-transcripts.md`。去重状态在 `state/vip-news-alert/seen.json`。路径都相对工作区。不要写绝对路径，不要用上级目录。
+草稿在 `temp/vip-news-alert/<summary_date>/`：`raw.json`、`filtered.json`、`events.json`、`card.md`、`card.json`、`manifest.json`、`confirm.json`、`doc.json`。采访全文在 `research-outputs/vip-news-alert/<summary_date>-transcripts.md`。去重状态在 `state/vip-news-alert/seen.json`。路径都相对工作区。不要写绝对路径，不要用上级目录。
 
 ## 1. 窗口、自检、名单、计划
 
@@ -198,7 +198,7 @@ WebFetch(url=VIDEO_URL, prompt=FETCH_PROMPT)
 - 每条写一两句中文摘要。先给判断，再写事实、数字和原话里的关键信息。
 - `unmatched_x` 里只有作者、URL、时间都核验过、并且能判断是本人或机构原帖的，才归入对应人物。第三方评论丢掉。同一事件只写一次。
 
-有任何 transcript 时，把完整采访记录写到 `research-outputs/vip-news-alert/<summary_date>-transcripts.md`。不要创建外部文档。文件放在工作区内，内容非空，不要把这个路径做成符号链接。每位有字幕的采访按下面的结构写，核心要点写 5 到 8 条。修正字幕里明显的错词。主持人和嘉宾的问答分开。
+有任何 transcript 时，把完整采访记录写到 `research-outputs/vip-news-alert/<summary_date>-transcripts.md`。文件放在工作区内，内容非空，不要把这个路径做成符号链接。每位有字幕的采访按下面的结构写，核心要点写 5 到 8 条。修正字幕里明显的错词。主持人和嘉宾的问答分开。
 
 ```markdown
 # VIP 采访记录 — YYYY-MM-DD
@@ -213,6 +213,14 @@ WebFetch(url=VIDEO_URL, prompt=FETCH_PROMPT)
 **主持人**: 问题
 **Donald Trump**: 回答
 ```
+
+写好文件后，把文件全文建成一篇飞书文档（这是本任务要求的交付物，原任务每天都建这篇文档）。每天最多建一篇：先看 `temp/vip-news-alert/<summary_date>/doc.json`，文件已存在就直接复用，不再调用。文件不存在时调用一次：
+
+```python
+feishu_create_doc(title="VIP 采访记录 — <summary_date>", markdown=TRANSCRIPT_MARKDOWN)
+```
+
+`TRANSCRIPT_MARKDOWN` 是刚写好的文件全文。拿到返回后立刻把返回的 JSON 原样写进 `temp/vip-news-alert/<summary_date>/doc.json`，成功和失败都写，然后再做下一步。调用本身报错、没有拿到 JSON 时，写 `{"ok": false, "error": "call_failed"}`。`render` 从这个文件读 `document_id`（建在知识库里时读 `node_token`）生成文档链接，卡片显示 `📝 完整采访记录：<链接>`。返回带 `warning` 时文档已经建好，把 warning 写进来源备注。返回 `ok` 为 false 或调用失败时，卡片改为显示工作区文件路径，失败原因写进来源备注；不要重试，不要因此让整轮失败。
 
 然后写 `temp/vip-news-alert/<summary_date>/events.json`。`title` 照抄筛选结果里的 `title`，中文写在 `summary`。去重和 seen 用的是 `title`，不要用摘要替换它。`url` 用筛选结果里的 URL。`source` 用筛选结果里的 `source`。有字幕的采访才填 `points`，而且必须是恰好 3 条非空中文要点，从全文那 5 到 8 条里选。没有字幕就省略 `points`。`source_notes` 抄筛选 `notes`；没有备注就省略或用空数组。人物键只用 Trump、Bessent、Warsh、Demis、Elon、Sam、Dario。没有内容的人物省略。同一键不要写两次。
 
@@ -275,7 +283,7 @@ python3 .agents/skills/dalton-vip-news-alert/scripts/vip_news_alert.py \
 1. 标题 `📡 VIP 动态速递 — <summary_date>`，破折号是长破折号。
 2. 人物按名单顺序。每位一个二级标题 `## ◎ Donald Trump（3条动态）`，括号是全角，条数是采访、新闻和动态的合计。没有内容的人物省略。
 3. 人物内部按这个顺序，空栏目省略：`**🎥 采访/演讲:**`，摘要下一行是视频链接；`**📰 新闻报道:**`，摘要下一行是报道链接；`**📰 动态:**`，一行是 `中文摘要 [source: *DeItaone]`。来源名里的 `*DeItaone` 保持原样。
-4. 有采访要点时，最后之前是 `## 完整采访记录`。每条是 `**Donald Trump：标题**`、恰好 3 条要点、视频链接。全部采访共用一句 `完整记录已存工作区 research-outputs/vip-news-alert/<summary_date>-transcripts.md`。
+4. 有采访要点时，最后之前是 `## 完整采访记录`。每条是 `**Donald Trump：标题**`、恰好 3 条要点、视频链接。全部采访共用一行：`doc.json` 记录建档成功时是 `📝 完整采访记录：<飞书文档链接>`，否则是 `完整记录已存工作区 research-outputs/vip-news-alert/<summary_date>-transcripts.md`。
 5. `source_notes` 非空时，`## 来源` 放在整张卡片的最后。
 
 `ok` 为 true 且 `empty` 为 false 时，读 `card.json` 的对象作为 `CARD`。`card_conflict` 表示磁盘上的卡片和这次渲染不同：保留原文件，不要改 events 后再渲第二张，也不要换第二个 `report_run_id`。
