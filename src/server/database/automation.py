@@ -1147,6 +1147,7 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
                     UPDATE automations
                     SET status = 'executing', next_run_at = NULL, last_run_at = NOW()
                     WHERE automation_id = %s AND status = 'active'
+                      -- DALTON-HOOK(company-automations): skip a deleted price claim
                       AND deleted_at IS NULL
                 """, (automation_id,))
                 if cur.rowcount == 0:
@@ -1207,6 +1208,7 @@ async def get_active_price_automations() -> List[Dict[str, Any]]:
                 FROM automations
                 WHERE trigger_type = 'price'
                   AND status = 'active'
+                  -- DALTON-HOOK(company-automations): skip a deleted price row
                   AND deleted_at IS NULL
             """)
             results = await cur.fetchall()

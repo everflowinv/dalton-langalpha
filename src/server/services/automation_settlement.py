@@ -875,7 +875,7 @@ async def _settle_finished_run(job: Dict[str, Any]) -> None:
     from src.server.services.hook_outbox import MAX_ATTEMPTS
 
     payload = job.get("payload") or {}
-    # A soft-deleted parent still settles. Notification is skipped afterwards.
+    # DALTON-HOOK(company-automations): a deleted parent still settles.
     # None means the row is physically gone.
     automation = await auto_db.get_automation_including_deleted(
         payload["automation_id"], payload.get("user_id")

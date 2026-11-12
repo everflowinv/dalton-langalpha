@@ -224,6 +224,7 @@ class TestDeleteAutomation:
         )
         assert deleted is True
 
+        # DALTON-HOOK(company-automations): delete pauses and sets deleted_at
         result = await get_automation(
             str(auto["automation_id"]), seed_user["user_id"]
         )

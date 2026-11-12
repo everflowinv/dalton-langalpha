@@ -49,6 +49,7 @@ def _quiet_sweep(mock_exec_db):
     """Nothing left unsettled, so a poll's sweep is a no-op."""
     mock_exec_db.settle_legacy_executions = AsyncMock(return_value=0)
     mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[])
+    # DALTON-HOOK(company-automations): the sweep skips deleted parents once
     mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
         return_value=0
     )
@@ -290,6 +291,7 @@ class TestPollOnce:
     async def test_a_slow_sweep_does_not_hold_up_the_next_claim(
         self, mock_executor_cls, mock_auto_db, mock_exec_db
     ):
+        # DALTON-HOOK(company-automations): polls call the one-shot parent skip
         mock_executor_cls.get_instance.return_value = AsyncMock()
         release = asyncio.Event()
         sweeps = []
@@ -353,6 +355,7 @@ class TestSweep:
         automation = _make_automation(automation_id="auto-kept")
         mock_exec_db.settle_legacy_executions = AsyncMock(return_value=2)
         mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[kept, gone])
+        # DALTON-HOOK(company-automations): sweep skips deleted parents once
         mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
             return_value=0
         )
@@ -406,6 +409,7 @@ class TestSweep:
         mock_exec_db.list_abandoned_executions = AsyncMock(
             side_effect=RuntimeError("db down")
         )
+        # DALTON-HOOK(company-automations): a failed sweep still calls the skip
         mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
             return_value=0
         )

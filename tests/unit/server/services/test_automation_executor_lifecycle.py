@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 import pytest
 from fastapi import HTTPException
 
+# DALTON-HOOK(company-automations): lifecycle tests stub the soft-delete read
 from src.dalton.database.automation_recycle import automation_is_soft_deleted
 from src.server.database.automation_executions import begin_execution_if_not_deleted
 from src.server.database.home_workspace import get_home_workspace_id
@@ -121,6 +122,7 @@ def _firing(turns, *, runs=None, busy=(), fresh=None, is_byok=(False,)):
 
     async def get_run(run_id):
         index = run_ids.index(run_id)
+        # DALTON-HOOK(company-automations): the live claim is what admits the turn
         run = runs.get(index, "in_progress")
         if run is None or isinstance(run, dict):
             return run
@@ -372,6 +374,7 @@ async def test_a_stop_before_admission_interrupts_the_firing():
 
 
 def _heartbeat_names() -> list[str]:
+    # DALTON-HOOK(company-automations): preflight cancel settles interrupted
     return [
         task.get_name()
         for task in asyncio.all_tasks()
@@ -655,6 +658,7 @@ async def test_a_refusal_with_nowhere_to_deliver_fires_the_webhook():
 @pytest.mark.asyncio
 async def test_a_firing_settled_before_its_turn_hands_nothing_over():
     with _firing([_streams]) as fx, _delivery(_HELD) as dx:
+        # DALTON-HOOK(company-automations): a settled firing does not start delivery
         # pending→running is begin_execution_if_not_deleted. The one
         # transition_execution call records the thread, and None means that
         # write lost because the firing was settled elsewhere.

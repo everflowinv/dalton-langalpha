@@ -110,6 +110,7 @@ class FakeAutomationsDb:
             self.rows[str(stored["automation_id"])] = stored
 
     def _is_live(self, row: dict[str, Any]) -> bool:
+        # DALTON-HOOK(company-automations): a list hides a soft-deleted row
         return row.get("deleted_at") is None
 
     def list(self) -> list[dict[str, Any]]:
@@ -274,6 +275,7 @@ class FakeAutomationsDb:
         expected_config_version: int | None = None,
         prelocked_pref_row: Any = None,
     ) -> bool:
+        # DALTON-HOOK(company-automations): delete pauses and stamps deleted_at
         self._journal("delete", automation_id, conn)
         row = self._owned(automation_id, user_id)
         if row is None or row.get("deleted_at") is not None:

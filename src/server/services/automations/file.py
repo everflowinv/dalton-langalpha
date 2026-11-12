@@ -362,7 +362,7 @@ class FilePlan:
     notes: list[str] = field(default_factory=list)
     # What the lifecycle checks a named model against; None reads it there.
     model_pref: dict[str, Any] | None = None
-    # Preferences locked before the automation row. Delete sets this in hold.
+    # DALTON-HOOK(company-automations): delete locks prefs before the row.
     prelocked_pref_row: dict[str, Any] | None = None
 
     def __bool__(self) -> bool:

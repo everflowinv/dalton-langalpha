@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, call, create_autospec, patch
 
 import pytest
 
+# DALTON-HOOK(company-automations): settlement tests stub the soft-delete read
 from src.dalton.database.automation_recycle import automation_is_soft_deleted
 from src.server.database.automation import (
     get_automation,
@@ -159,6 +160,7 @@ def _settlement(row):
         patch(f"{_MOD}.exec_db", new=fx.db),
         patch(f"{_MOD}.outbox_db", new=fx.outbox),
         patch(f"{_MOD}.get_db_connection", new=connection),
+        # DALTON-HOOK(company-automations): these rows stay live
         # The tail imports this helper itself and would check out the real pool.
         # False keeps these rows live. A finish for a missing automation is
         # still ``get_automation`` returning None, which asks nothing.
@@ -1126,8 +1128,8 @@ def _finalize_job():
 @contextmanager
 def _finished(run, automation=None):
     with _settlement(_row()) as fx:
-        # Settle reads the parent even after a soft delete. Finish still uses
-        # the live read, so a deleted parent asks the messaging service nothing.
+        # DALTON-HOOK(company-automations): finish reads a deleted parent.
+        # The live read still hides it, so delivery is not asked.
         if automation is None or automation.get("deleted_at") is not None:
             live = None
         else:
@@ -1328,6 +1330,7 @@ async def test_a_deleted_automation_owes_nothing():
     with _finished(_ended("completed")) as fx:
         await _settle_finished_run(_finalize_job())
 
+    # DALTON-HOOK(company-automations): a missing parent does not settle or notify
     fx.db.get_automation_including_deleted.assert_awaited_once_with(_AID, "user-1")
     fx.db.settle_execution.assert_not_awaited()
     fx.fire.assert_not_awaited()

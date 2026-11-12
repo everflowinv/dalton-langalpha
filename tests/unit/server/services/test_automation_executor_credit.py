@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 import pytest
 from fastapi import HTTPException
 
+# DALTON-HOOK(company-automations): credit tests stub the soft-delete read
 from src.dalton.database.automation_recycle import automation_is_soft_deleted
 from src.server.database.automation_executions import begin_execution_if_not_deleted
 from src.server.database.home_workspace import get_home_workspace_id
@@ -103,6 +104,7 @@ def _route_reads():
 def _bind_db(module, db):
     """Point both DB modules a service imports at one mock.
 
+    DALTON-HOOK(company-automations): pending to running is the live claim.
     ``begin_execution_if_not_deleted`` has to be awaitable and truthy: a
     child MagicMock cannot be awaited, and a falsy row returns before the
     turn these tests measure. The soft-delete read is imported inside the
@@ -466,6 +468,7 @@ def _assert_execution_marked_failed(mock_adb):
 
 def _setup_auto_db(mock_adb):
     """Wire up common auto_db mock return values."""
+    # DALTON-HOOK(company-automations): pending to running is the live claim
     mock_adb.begin_execution_if_not_deleted = create_autospec(
         begin_execution_if_not_deleted,
         return_value={

@@ -3841,6 +3841,10 @@ async def test_reconcile_and_retry_recover_completed_items_with_null_error_code_
             norm = " ".join(sql.split())
             self.rowcount = 0
             self._rows = []
+            if "SELECT deleted_at" in norm and "FROM dalton_data_task_defs" in norm:
+                # The data task exists and is not deleted, so retry continues.
+                self._rows = [{"deleted_at": None}]
+                return
             if "FROM dalton_notify_deliveries d" in norm and "ORDER BY" in norm:
                 if "LEFT JOIN automations a" in norm:
                     # `retry_failed_notify_deliveries` candidate scan
@@ -3910,6 +3914,9 @@ async def test_reconcile_and_retry_recover_completed_items_with_null_error_code_
                     row["status"] = "failed"
                     row["error_code"] = "attempts_exhausted"
                     self.rowcount = 1
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._rows[0] if self._rows else None
 
         async def fetchall(self) -> list[dict[str, Any]]:
             return list(self._rows)

@@ -8,6 +8,7 @@ from uuid import uuid4
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+# DALTON-HOOK(company-automations): the locked parent read uses these columns
 from src.server.database.automation import (
     AUTOMATION_COLUMNS,
     EXECUTION_COLUMNS,
@@ -264,6 +265,7 @@ async def settle_execution(
                 if strike in ("count", "fuse"):
                     await _count_strike(cur, automation_id, fuse=strike == "fuse")
                 elif strike == "reset":
+                    # DALTON-HOOK(company-automations): success keeps disable_reason
                     # A success keeps disable_reason. Only an explicit resume
                     # or enable clears it. A disabled automation also keeps its
                     # count: a firing already running when another one disabled
@@ -598,6 +600,7 @@ async def get_settling_run(run_id: str) -> Optional[Dict[str, Any]]:
 async def skip_unstarted_executions_of_deleted_parents() -> int:
     """Skip pending and waiting firings whose parent is still soft-deleted.
 
+    DALTON-HOOK(company-automations): one sweep UPDATE skips those firings.
     The sweep calls this once. The recycle module reads ``deleted_at`` in
     that same UPDATE.
     """

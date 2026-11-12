@@ -769,6 +769,7 @@ class TestWhyAFiringFailed:
             strike="reset",
         )
         auto = await get_automation(aid, uid)
+        # DALTON-HOOK(company-automations): a success keeps disable_reason.
         # A success keeps the reason. Only the resume below clears it.
         assert (auto["failure_count"], auto["disable_reason"]) == (0, "max_failures")
 
@@ -852,6 +853,7 @@ class TestWhyAFiringFailed:
 
         auto = await get_automation(aid, uid)
         assert (auto["status"], auto["failure_count"]) == (status, 1)
+        # DALTON-HOOK(company-automations): a paused strike keeps the fuse reason
         # A paused parent keeps the fuse reason. completed and disabled do not
         # gain one; this row had none stored.
         expected_reason = "provider_auth" if status == "paused" else None

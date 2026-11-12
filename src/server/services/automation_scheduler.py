@@ -163,6 +163,7 @@ class AutomationScheduler:
                 f"by an earlier build"
             )
         if skipped:
+            # DALTON-HOOK(company-automations): one skip for deleted parents
             logger.warning(
                 "[SCHEDULER] Skipped %s unstarted firing(s) of deleted automations",
                 skipped,

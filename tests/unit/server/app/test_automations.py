@@ -8,6 +8,8 @@ delivery through the messaging service.
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+
+# DALTON-HOOK(company-automations): delete tests spec the recycle helper
 from unittest.mock import AsyncMock, create_autospec, patch
 
 import httpx
@@ -565,7 +567,7 @@ async def test_delete_automation(client):
             json={"expected_config_version": 1},
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 200  # DALTON-HOOK(company-automations): soft delete
     payload = resp.json()
     assert payload["deleted_at"] is not None
     assert payload["deleted_by"] == "test-user-123"
@@ -596,6 +598,7 @@ async def test_delete_automation_not_found(client):
     assert resp.status_code == 404
 
 
+# DALTON-HOOK(company-automations): delete requires the config version
 @pytest.mark.asyncio
 async def test_delete_extra_field_is_422(client):
     resp = await client.request(

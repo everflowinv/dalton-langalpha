@@ -36,6 +36,7 @@ class TestDeleteByStatus:
 
         assert report == DELETED
         assert [r["file_name"] for r in db.list()] == [OTHER_FILE_NAME]
+        # DALTON-HOOK(company-automations): status deleted pauses and keeps history
         assert db.rows[BRIEF]["deleted_at"] is not None
         assert db.rows[BRIEF]["status"] == "paused"
         assert [(w.op, w.automation_id, w.depth) for w in db.writes] == [("delete", BRIEF, 1)]
@@ -73,6 +74,7 @@ class TestRemove:
 
         assert stored.report == DELETED
         assert [r["file_name"] for r in db.list()] == [OTHER_FILE_NAME]
+        # DALTON-HOOK(company-automations): removing the file pauses and keeps history
         assert db.rows[BRIEF]["deleted_at"] is not None
         assert db.rows[BRIEF]["status"] == "paused"
         assert [(w.op, w.automation_id, w.joined) for w in db.writes] == [("delete", BRIEF, True)]
