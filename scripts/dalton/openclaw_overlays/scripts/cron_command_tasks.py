@@ -67,7 +67,7 @@ US_TOPBOTTOM_COLLECTORS: tuple[tuple[str, str], ...] = (
     ('us-top-monitor', 'skills/us-top-monitor/scripts/us_top_monitor_cli.py'),
 )
 US_TOPBOTTOM_SKILLS = tuple(skill for skill, _ in US_TOPBOTTOM_COLLECTORS)
-ALLOWED_CHART_SUFFIXES = frozenset({'.png', '.jpg', '.jpeg', '.webp', '.gif'})
+ALLOWED_CHART_SUFFIXES = frozenset({'.png', '.jpg', '.jpeg', '.webp', '.gif', '.md'})
 DEFAULT_CONTAINER_PYTHON_BIN = '/app/.venv/bin/python'
 DEFAULT_TMPFS_OUTBOX_DIR = Path('/run/dalton-outbox')
 DEFAULT_CONTAINER_SECRETS_DIR = Path('/run/dalton-secrets')
@@ -579,6 +579,298 @@ def _resolve_dalton_python_bin() -> str:
     return sys.executable or 'python3'
 
 
+ETF_DRY_RUN_BANNER = '--- 飞书卡片 JSON (Dry Run) ---'
+AI_CHAIN_TASK = 'ai-chain-daily'
+ETF_TASK = 'us-etf-monthly-flows'
+VOL_SURFACE_TASK = 'vol-surface-daily-snapshot'
+
+
+def ai_chain_delivery_spec(obj):
+    """OpenClaw plan items for one ``daily_push.json`` object, before media path checks.
+
+    ``plan()`` and the Dalton preview both use this so the Discord text, order,
+    and target stay the same string the cron adapter would build.
+    """
+    if not obj.get('sent') and (not obj.get('quiet') or '🟡' in obj.get('summary', '')):
+        if obj['target'] != DEV:
+            raise ValueError('ai-chain 投递目标与原任务不一致')
+        spec = [{'channel': 'discord', 'target': DEV, 'text': obj['summary'], 'media': None}]
+        spec += [
+            {'channel': 'discord', 'target': DEV, 'text': '', 'media': p}
+            for p in obj['high_cards']
+        ]
+        return spec
+    return []
+
+
+def ai_chain_failure_text(exc):
+    return f'{AI_CHAIN_TASK} 执行失败：{exc}'
+
+
+def format_vol_surface_gap(row):
+    return f"{row['ticker']}：{row.get('error', '采集失败')}"
+
+
+def format_vol_surface_row(row):
+    iv = row.get('atm_iv', {})
+    return (
+        f"{row['ticker']}：数据截止 {row.get('timestamp', row.get('date', '未取得'))}；"
+        f"spot {row.get('spot', '未取得')}；期权数 {row.get('total_options', '未取得')}；ATM IV "
+        + ' / '.join(
+            f"{d} {str(iv[d]) + '%' if iv.get(d) is not None else '未取得'}"
+            for d in ('7D', '30D', '60D', '90D')
+        )
+        + f"；30D skew {str(row['skew_30d_pp']) + 'pp' if row.get('skew_30d_pp') is not None else '未取得'}"
+    )
+
+
+def format_vol_surface_text(rows, error=''):
+    return '\n'.join(['每日波动率曲面快照', *rows, '数据缺口：' + (error or '无')])
+
+
+def parse_etf_dry_run_card(stdout):
+    """Return the card object printed after the tracker's dry-run banner."""
+    marker_at = stdout.rfind(ETF_DRY_RUN_BANNER)
+    if marker_at < 0:
+        raise ValueError('ETF dry-run 输出缺少飞书卡片分隔')
+    card = json.loads(stdout[marker_at + len(ETF_DRY_RUN_BANNER):])
+    if not isinstance(card, dict):
+        raise ValueError('ETF dry-run 卡片不是对象')
+    return card
+
+
+def etf_dry_run_outbox(stdout):
+    card = parse_etf_dry_run_card(stdout)
+    return {
+        'schema_version': 1,
+        'task_code': 'T76',
+        'job_key': ETF_TASK,
+        'channel': 'feishu',
+        'chat_id': TRACKING,
+        'feishu_cards': [{'card': card, 'images': [], 'chat_id': TRACKING}],
+        'delivery_writeback': {
+            'kind': 'etf_discord_mirror',
+            'chat_id': TRACKING,
+            'receive_id_type': 'chat_id',
+            'label': 'ETF 月度资金流',
+        },
+    }
+
+
+def _run_workspace_argv(argv, ws_root, accepted=(0,), timeout=540):
+    try:
+        result = subprocess.run(argv, cwd=ws_root, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f'{argv[0]} 超时（timeout {timeout}s）') from exc
+    except OSError as exc:
+        raise RuntimeError(f'{argv[0]} 启动失败：{exc}') from exc
+    raw = result.stdout or ''
+    err = result.stderr or ''
+    label = argv[1] if len(argv) > 1 else argv[0]
+    if result.returncode not in accepted or 'feishu card send returned' in err:
+        raise RuntimeError(f'{label} 失败（exit {result.returncode}）：\n' + (raw + '\n' + err)[-2400:])
+    return result
+
+
+def _write_ai_chain_failure_outbox(exc):
+    text = ai_chain_failure_text(exc)
+    try:
+        ws_root, raw_ws = _resolve_dalton_workspace()
+        run_id = _resolve_dalton_run_id()
+        run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+        staging = _resolve_staging_outbox_path(run_dir, run_id)
+    except Exception:
+        return
+    _atomic_write_json(staging, {
+        'schema_version': 1,
+        'task_code': 'T20',
+        'job_key': AI_CHAIN_TASK,
+        'channel': 'discord',
+        'target': DEV,
+        'text': text,
+        'notify_on_failure': True,
+        'items': [{
+            'index': 0,
+            'channel': 'discord',
+            'target': DEV,
+            'text': text,
+            'preserve_exact_text': True,
+        }],
+        'preserve_exact_text': True,
+    })
+
+
+def run_dalton_ai_chain_preview():
+    """Produce ai-chain Discord items. ``sent`` is set only after Dalton confirms delivery."""
+    try:
+        return _run_dalton_ai_chain_preview_body()
+    except BlockingIOError:
+        print('NO_REPLY')
+        return 0
+    except Exception as exc:
+        _write_ai_chain_failure_outbox(exc)
+        print(ai_chain_failure_text(exc))
+        return 1
+
+
+def _acquire_preview_lock(ws_root, task_name):
+    state_dir = _ensure_safe_workspace_subpath(
+        ws_root, ('state', 'cron-command', task_name), create_parents=True,
+    )
+    if state_dir.is_symlink() or (state_dir.exists() and not state_dir.is_dir()):
+        raise ValueError(f'状态目录非法：{state_dir}')
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = _ensure_safe_workspace_subpath(ws_root, ('state', 'cron-command', task_name, 'dalton-preview.lock'))
+    if lock_path.is_symlink():
+        raise ValueError(f'锁文件不能为软链接：{lock_path}')
+    lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(lock_path, lock_flags, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _run_dalton_ai_chain_preview_body():
+    ws_root, raw_ws = _resolve_dalton_workspace()
+    run_id = _resolve_dalton_run_id()
+    run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+    staging = _resolve_staging_outbox_path(run_dir, run_id)
+    lock_fd = None
+    try:
+        lock_fd = _acquire_preview_lock(ws_root, AI_CHAIN_TASK)
+        _run_workspace_argv(['bash', 'skills/ai-chain/run.sh', '--json', 'daily-run'], ws_root)
+        push_path = _ensure_safe_workspace_subpath(
+            ws_root, ('skills', 'ai-chain', 'state', 'daily_push.json'),
+        )
+        obj = json.loads(push_path.read_text(encoding='utf-8'))
+        spec = ai_chain_delivery_spec(obj)
+        if not spec:
+            print('NO_REPLY')
+            return 0
+        run_rel = tuple(run_dir.relative_to(ws_root).parts)
+        outbox_items = []
+        for pos, entry in enumerate(spec):
+            item = {
+                'index': pos,
+                'channel': entry['channel'],
+                'target': entry['target'],
+                'text': entry['text'],
+                'preserve_exact_text': True,
+            }
+            media = entry.get('media')
+            if media:
+                src = _validate_workspace_chart(media, ws_root, raw_ws)
+                original_name = Path(src.name).name
+                retained = _ensure_safe_workspace_subpath(
+                    ws_root, (*run_rel, 'attachments', str(pos), original_name),
+                )
+                retained.parent.mkdir(parents=True, exist_ok=True)
+                chart_bytes, chart_sha = _atomic_copy_chart(src, retained)
+                item['media'] = f'attachments/{pos}/{original_name}'
+                item['filename'] = original_name
+                item['chart_bytes'] = chart_bytes
+                item['chart_sha256'] = chart_sha
+            outbox_items.append(item)
+        _atomic_write_json(staging, {
+            'schema_version': 1,
+            'task_code': 'T20',
+            'job_key': AI_CHAIN_TASK,
+            'run_id': run_id,
+            'channel': 'discord',
+            'target': DEV,
+            'text': '\n\n'.join(item['text'] for item in outbox_items if item.get('text')),
+            'items': outbox_items,
+            'delivery_writeback': {
+                'kind': 'ai_chain_daily_push',
+                'path': 'skills/ai-chain/state/daily_push.json',
+            },
+        })
+        print('NO_REPLY')
+        return 0
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def run_dalton_etf_preview():
+    """Run the ETF tracker with ``--dry-run`` and stage the card. Dalton sends it."""
+    try:
+        ws_root, raw_ws = _resolve_dalton_workspace()
+        run_id = _resolve_dalton_run_id()
+        run_dir = _resolve_dalton_run_dir(ws_root, run_id, raw_ws=raw_ws)
+        staging = _resolve_staging_outbox_path(run_dir, run_id)
+        lock_fd = None
+        try:
+            lock_fd = _acquire_preview_lock(ws_root, ETF_TASK)
+            python_bin = _resolve_dalton_python_bin()
+            result = _run_workspace_argv(
+                [python_bin, 'scripts/etf_monthly_flows_tracker.py', '--dry-run', '--to', TRACKING],
+                ws_root,
+            )
+            _atomic_write_json(staging, etf_dry_run_outbox(result.stdout or ''))
+            print('NO_REPLY')
+            return 0
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+    except BlockingIOError:
+        print('NO_REPLY')
+        return 0
+    except Exception as exc:
+        print(f'{ETF_TASK} 执行失败：{exc}')
+        return 1
+
+
+def run_dalton_vol_surface_preview():
+    """Print the same Chinese snapshot ``plan()`` builds. This task does not notify."""
+    try:
+        ws_root, _raw_ws = _resolve_dalton_workspace()
+        lock_fd = None
+        try:
+            lock_fd = _acquire_preview_lock(ws_root, VOL_SURFACE_TASK)
+            results, gaps = [], []
+            try:
+                result = _run_workspace_argv(
+                    ['bash', 'skills/hedging-analysis/run.sh', 'timemachine', '--json', 'snapshot', '--tickers', '^SPX,QQQ'],
+                    ws_root,
+                    accepted=(0, 1),
+                )
+                obj = json_result(result.stdout or '')
+                for row in obj['results']:
+                    if not row.get('ok'):
+                        gaps.append(format_vol_surface_gap(row))
+                        continue
+                    results.append(format_vol_surface_row(row))
+            except (RuntimeError, ValueError) as exc:
+                gaps.append(str(exc))
+            try:
+                result = _run_workspace_argv(
+                    ['bash', 'skills/hedging-analysis/run.sh', 'timemachine', '--json', 'backfill-vix'],
+                    ws_root,
+                )
+                obj = json_result(result.stdout or '')
+                if obj.get('ok') is False or obj.get('status') == 'error':
+                    raise RuntimeError(str(obj.get('error') or obj.get('hint') or obj))
+                results.append('VIX 历史库已更新，数据截止 ' + str(obj['regime_range'][-1]))
+            except (RuntimeError, ValueError) as exc:
+                gaps.append(str(exc))
+            error = '\n'.join(gaps)
+            print(format_vol_surface_text(results, error))
+            return 1 if error else 0
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+    except BlockingIOError:
+        print('NO_REPLY')
+        return 0
+    except Exception as exc:
+        print(f'{VOL_SURFACE_TASK} 执行失败：{exc}')
+        return 1
+
+
 def _collect_dalton_skill_output(
     cli_rel_path: str,
     ws_root: Path,
@@ -859,11 +1151,13 @@ class Runner:
             self.run(['bash', 'skills/ai-chain/run.sh', '--json', 'daily-run'])
             path = WS / 'skills/ai-chain/state/daily_push.json'
             obj = json.loads(path.read_text())
-            if not obj.get('sent') and (not obj.get('quiet') or '🟡' in obj.get('summary', '')):
-                if obj['target'] != DEV:
-                    raise ValueError('ai-chain 投递目标与原任务不一致')
-                items = [message('discord', DEV, obj['summary'])]
-                items += [message('discord', DEV, media=p) for p in obj['high_cards']]
+            spec = ai_chain_delivery_spec(obj)
+            items = [
+                message('discord', DEV, entry['text'], entry['media']) if entry.get('media')
+                else message('discord', DEV, entry['text'])
+                for entry in spec
+            ]
+            if items:
                 after = {'path': str(path), 'value': {**obj, 'sent': True}}
         elif name == 'hk-momentum-weekly':
             obj = self.obj(['python3', 'scripts/hk_momentum_index/render_chart.py'])
@@ -893,10 +1187,9 @@ class Runner:
                 obj = json_result(self.run(['bash', 'skills/hedging-analysis/run.sh', 'timemachine', '--json', 'snapshot', '--tickers', '^SPX,QQQ'], accepted=(0, 1)))
                 for row in obj['results']:
                     if not row.get('ok'):
-                        gaps.append(f"{row['ticker']}：{row.get('error', '采集失败')}")
+                        gaps.append(format_vol_surface_gap(row))
                         continue
-                    iv = row.get('atm_iv', {})
-                    results.append(f"{row['ticker']}：数据截止 {row.get('timestamp', row.get('date', '未取得'))}；spot {row.get('spot', '未取得')}；期权数 {row.get('total_options', '未取得')}；ATM IV " + ' / '.join(f"{d} {str(iv[d]) + '%' if iv.get(d) is not None else '未取得'}" for d in ('7D', '30D', '60D', '90D')) + f"；30D skew {str(row['skew_30d_pp']) + 'pp' if row.get('skew_30d_pp') is not None else '未取得'}")
+                    results.append(format_vol_surface_row(row))
             except (RuntimeError, ValueError) as exc:
                 gaps.append(str(exc))
             try:
@@ -905,7 +1198,7 @@ class Runner:
             except (RuntimeError, ValueError) as exc:
                 gaps.append(str(exc))
             error = '\n'.join(gaps)
-            text = '\n'.join(['每日波动率曲面快照', *results, '数据缺口：' + (error or '无')])
+            text = format_vol_surface_text(results, error)
         return {'items': items, 'text': text, 'error': error, 'after': after}
 
     def execute(self):
@@ -955,12 +1248,18 @@ def main():
         return 0
     if not args.task:
         parser.error('task is required')
-    if args.task == US_TOPBOTTOM_TASK and is_dalton_mode():
+    if is_dalton_mode() and args.task == US_TOPBOTTOM_TASK:
         try:
             return run_dalton_us_topbottom_preview()
         except Exception as exc:
             print(f'{args.task} 执行失败：{exc}', file=sys.stderr)
             return 1
+    if is_dalton_mode() and args.task == AI_CHAIN_TASK:
+        return run_dalton_ai_chain_preview()
+    if is_dalton_mode() and args.task == ETF_TASK:
+        return run_dalton_etf_preview()
+    if is_dalton_mode() and args.task == VOL_SURFACE_TASK:
+        return run_dalton_vol_surface_preview()
     runner = Runner(args.task)
     runner.directory.mkdir(parents=True, exist_ok=True)
     with (runner.directory / 'run.lock').open('w') as lock:

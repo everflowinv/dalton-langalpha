@@ -887,7 +887,7 @@ async def _read_pm_data_notify_routes_map(
 
 
 async def _fetch_data_system_jobs() -> list[dict[str, Any]]:
-    """Fetch all 19 ``data`` scope system jobs for internal/admin callers."""
+    """Fetch every registered ``data`` scope system job for internal/admin callers."""
     manifest_entries = load_data_task_manifest().tasks
     defs_by_key: dict[str, dict[str, Any]] = {}
     runs_by_key: dict[str, dict[str, Any]] = {}

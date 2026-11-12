@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Literal
@@ -32,6 +33,7 @@ from src.dalton.data_jobs.notification_payloads import (
     ResolvedDataTaskPlan,
     ValidatedArtifactBytes,
     build_data_task_delivery_plan,
+    etf_discord_mirror_plan_target,
     normalize_run_uuid,
     read_validated_run_artifact,
 )
@@ -90,6 +92,79 @@ def build_data_task_item_delivery_key(
     cleaned_platform = str(platform or "").strip().lower()
     cleaned_recipient = str(recipient_id or "").strip()
     return f"data_task:{norm_run_id}:{cleaned_platform}:{cleaned_recipient}:item:{int(item_index)}"
+
+
+def discord_channel_is_guild_text(channel: Mapping[str, Any] | None) -> bool:
+    """True only for a guild text channel (type 0) or announcement channel (type 5).
+
+    DM (type 1), group DM (type 3), threads, and a missing ``guild_id`` are rejected.
+    """
+    if not isinstance(channel, Mapping):
+        return False
+    raw_type = channel.get("type")
+    if isinstance(raw_type, bool) or not isinstance(raw_type, int):
+        return False
+    guild_id = str(channel.get("guild_id") or "").strip()
+    return raw_type in (0, 5) and bool(guild_id)
+
+
+def _fetch_discord_channel_sync(channel_id: str, token: str) -> dict[str, Any]:
+    import urllib.request
+
+    url = f"https://discord.com/api/v10/channels/{channel_id}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "DaltonDataTasks",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("discord channel payload is not an object")
+    return payload
+
+
+async def verify_discord_channel_is_guild_text(channel_id: str) -> tuple[bool, str | None]:
+    """Check a ``discord:channel:`` id when this process has the bot token.
+
+    The gateway holds ``DALTON_DISCORD_BOT_TOKEN`` and checks the same rule in
+    ``checkTargetLive`` before every send. When the backend has no token, this
+    returns success so authorization is not failed closed ahead of that check.
+    """
+    token = os.environ.get("DALTON_DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        return True, None
+    if not DISCORD_SNOWFLAKE_RE.match(str(channel_id or "").strip()):
+        return False, "Discord channel id is not a snowflake."
+    try:
+        payload = await asyncio.to_thread(_fetch_discord_channel_sync, channel_id, token)
+    except Exception as exc:
+        logger.warning("Discord channel lookup failed for %s: %s", channel_id, exc)
+        return False, "Discord channel lookup failed."
+    if discord_channel_is_guild_text(payload):
+        return True, None
+    return False, "Discord channel target must be a guild text channel."
+
+
+def _requested_target_is_snapshotted_etf_mirror(run_row: Mapping[str, Any], cleaned_target: str) -> bool:
+    """True when ``cleaned_target`` is this run's snapshotted ETF Discord copy."""
+    outbox = run_row.get("outbox_payload")
+    if isinstance(outbox, str) and outbox.strip():
+        try:
+            outbox = json.loads(outbox)
+        except ValueError:
+            return False
+    if not isinstance(outbox, Mapping):
+        return False
+    spec = outbox.get("delivery_writeback")
+    if not isinstance(spec, Mapping) or spec.get("kind") != "etf_discord_mirror":
+        return False
+    if spec.get("mirror_skipped") is True:
+        return False
+    targets = spec.get("targets")
+    return isinstance(targets, list) and cleaned_target in targets
 
 
 def _parse_requested_notify_target(raw_target: str) -> tuple[str, str, str] | None:
@@ -467,7 +542,20 @@ async def _authorize_run_and_target_in_tx(
 
     job_key = str(run_row["job_key"]).strip()
     run_status = str(run_row.get("status") or "").strip().lower()
-    if run_status != "succeeded":
+    failure_notify = False
+    if run_status == "failed":
+        raw_failure_outbox = run_row.get("outbox_payload")
+        if isinstance(raw_failure_outbox, str) and raw_failure_outbox.strip():
+            try:
+                raw_failure_outbox = json.loads(raw_failure_outbox)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_failure_outbox = None
+        if (
+            isinstance(raw_failure_outbox, Mapping)
+            and raw_failure_outbox.get("notify_on_failure") is True
+        ):
+            failure_notify = True
+    if run_status != "succeeded" and not failure_notify:
         return AuthorizedDataTaskTarget(
             allowed=False,
             deny_status="failed",
@@ -529,7 +617,7 @@ async def _authorize_run_and_target_in_tx(
         target_kind=target_kind,
         raw_ident=raw_ident,
         effective_targets=list(effective_targets or []),
-    ):
+    ) and not _requested_target_is_snapshotted_etf_mirror(run_row, cleaned_target):
         return AuthorizedDataTaskTarget(
             allowed=False,
             deny_status="skipped",
@@ -606,20 +694,32 @@ async def _authorize_run_and_target_in_tx(
             recipient_id = bound_platform_uid
     else:
         canonical_target_address = f"{platform}:{raw_ident}"
-        ok_group, group_err, _ = await _verify_group_target_deliverable(
-            cur,
-            user_id=owner_user_id,
-            platform=platform,
-            chat_address=canonical_target_address,
-            conn=conn,
-        )
-        if not ok_group:
-            return AuthorizedDataTaskTarget(
-                allowed=False,
-                deny_status="failed",
-                deny_code="not_allowed",
-                deny_message=group_err or "Group chat is not bound or accessible in Dalton channel settings.",
+        # Discord channel targets are guild text channels, not Feishu group bindings.
+        # Personal Discord targets stay on the DM branch above.
+        if platform == "discord":
+            ok_channel, channel_err = await verify_discord_channel_is_guild_text(raw_ident)
+            if not ok_channel:
+                return AuthorizedDataTaskTarget(
+                    allowed=False,
+                    deny_status="failed",
+                    deny_code="not_allowed",
+                    deny_message=channel_err or "Discord channel target must be a guild text channel.",
+                )
+        else:
+            ok_group, group_err, _ = await _verify_group_target_deliverable(
+                cur,
+                user_id=owner_user_id,
+                platform=platform,
+                chat_address=canonical_target_address,
+                conn=conn,
             )
+            if not ok_group:
+                return AuthorizedDataTaskTarget(
+                    allowed=False,
+                    deny_status="failed",
+                    deny_code="not_allowed",
+                    deny_message=group_err or "Group chat is not bound or accessible in Dalton channel settings.",
+                )
         recipient_id = raw_ident
 
     resolved_plan: ResolvedDataTaskPlan | None = None
@@ -638,6 +738,8 @@ async def _authorize_run_and_target_in_tx(
                 job_key=job_key,
                 raw_outbox=raw_outbox,
                 run_artifacts_dir=paths.backend_run_artifacts_dir(norm_run_id),
+                delivery_platform=platform,
+                delivery_target=cleaned_target,
             )
         except DataTaskNotificationError as exc:
             return AuthorizedDataTaskTarget(
@@ -1431,12 +1533,33 @@ async def load_authorized_data_task_artifact(
         raw_outbox=raw_outbox,
         run_artifacts_dir=run_art_dir,
     )
-    return read_validated_run_artifact(
-        run_id=norm_run_id,
-        artifact_id=artifact_id,
-        plan=plan,
-        run_artifacts_dir=run_art_dir,
-    )
+    try:
+        return read_validated_run_artifact(
+            run_id=norm_run_id,
+            artifact_id=artifact_id,
+            plan=plan,
+            run_artifacts_dir=run_art_dir,
+        )
+    except DataTaskArtifactNotFoundError:
+        if job_key != "us-etf-monthly-flows":
+            raise
+        mirror_target = etf_discord_mirror_plan_target(raw_outbox, run_art_dir)
+        if mirror_target is None:
+            raise
+        mirror_plan = build_data_task_delivery_plan(
+            run_id=norm_run_id,
+            job_key=job_key,
+            raw_outbox=raw_outbox,
+            run_artifacts_dir=run_art_dir,
+            delivery_platform="discord",
+            delivery_target=mirror_target,
+        )
+        return read_validated_run_artifact(
+            run_id=norm_run_id,
+            artifact_id=artifact_id,
+            plan=mirror_plan,
+            run_artifacts_dir=run_art_dir,
+        )
 
 
 def _derive_expected_item_count_from_persisted_payload(
@@ -1942,6 +2065,18 @@ async def reconcile_single_data_task_delivery_row(
                                 """
                                 UPDATE dalton_data_task_runs r
                                 SET notify_status = 'dispatched',
+                                    outbox_payload = CASE
+                                        WHEN jsonb_typeof(r.outbox_payload) = 'object'
+                                         AND r.outbox_payload ? 'delivery_writeback'
+                                         AND COALESCE(r.outbox_payload->>'writeback_status', '') IS DISTINCT FROM 'done'
+                                        THEN jsonb_set(
+                                            r.outbox_payload,
+                                            '{writeback_status}',
+                                            '"pending"'::jsonb,
+                                            true
+                                        )
+                                        ELSE r.outbox_payload
+                                    END,
                                     updated_at = NOW()
                                 WHERE r.run_id = %s::uuid
                                   AND r.notify_status = 'pending_dispatch'

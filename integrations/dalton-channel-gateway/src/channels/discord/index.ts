@@ -931,9 +931,25 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       if (parsed.guildId && channel.guild_id && channel.guild_id !== parsed.guildId) {
         return { ok: false, address: null, message: "Discord channel does not belong to the expected guild." };
       }
+      if (!parsed.threadId) {
+        const guildId = typeof channel.guild_id === "string" ? channel.guild_id.trim() : "";
+        if ((channel.type !== 0 && channel.type !== 5) || !guildId) {
+          return { ok: false, address: null, message: "Discord channel target must be a guild text channel." };
+        }
+      }
       if (parsed.threadId) {
-        if (parsed.parentChannelId && channel.parent_id && channel.parent_id !== parsed.parentChannelId) {
+        const guildId = typeof channel.guild_id === "string" ? channel.guild_id.trim() : "";
+        const parentId = typeof channel.parent_id === "string" ? channel.parent_id.trim() : "";
+        const expectedParent = parsed.parentChannelId?.trim() ?? "";
+        const expectedGuild = parsed.guildId?.trim() ?? "";
+        if (!isDiscordThreadChannelType(channel.type) || !guildId) {
+          return { ok: false, address: null, message: "Discord thread target must be a guild thread." };
+        }
+        if (!parentId || !expectedParent || parentId !== expectedParent) {
           return { ok: false, address: null, message: "Discord thread does not belong to the expected parent channel." };
+        }
+        if (expectedGuild !== "" && guildId !== expectedGuild) {
+          return { ok: false, address: null, message: "Discord channel does not belong to the expected guild." };
         }
         await ensureThreadUnarchived(this.getRest(), channel);
       }

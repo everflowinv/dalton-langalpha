@@ -3893,6 +3893,9 @@ async def test_reconcile_and_retry_recover_completed_items_with_null_error_code_
                         row["error_code"] = None
                         self.rowcount = 1
             elif norm.startswith("UPDATE dalton_data_task_runs r SET notify_status = 'dispatched'"):
+                assert "{writeback_status}" in norm
+                assert '"pending"' in norm
+                assert "IS DISTINCT FROM 'done'" in norm
                 r_id = params[0]
                 if (
                     run_notify_status.get(r_id) == "pending_dispatch"

@@ -4590,6 +4590,176 @@ describe("Discord outbound", () => {
     expect(parseDiscordTarget(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:${THREAD_ID}`)?.threadId).toBe(THREAD_ID);
   });
 
+  it("checkTargetLive accepts a guild text or announcement channel and rejects DM and group DM", async () => {
+    const channelAddress = `discord:channel:${CHANNEL_ID}`;
+    const cases: Array<{ type: number; guild_id?: string; ok: boolean }> = [
+      { type: 0, guild_id: GUILD_ID, ok: true },
+      { type: 5, guild_id: GUILD_ID, ok: true },
+      { type: 1, ok: false },
+      { type: 3, ok: false },
+      { type: 0, ok: false },
+    ];
+    for (const item of cases) {
+      const { rest } = makeRest(async () => jsonResponse({
+        id: CHANNEL_ID,
+        type: item.type,
+        ...(item.guild_id ? { guild_id: item.guild_id } : {}),
+        name: "checked",
+      }));
+      const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+      const result = await adapter.checkTargetLive({
+        userId: "dalton-u",
+        address: channelAddress,
+        purpose: "automation",
+      });
+      expect(result.ok).toBe(item.ok);
+      if (item.ok) {
+        expect(result.address).toBe(channelAddress);
+      } else {
+        expect(result.message).toBe("Discord channel target must be a guild text channel.");
+      }
+    }
+  });
+
+  it("checkTargetLive still accepts a personal Discord DM", async () => {
+    const { rest, calls } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      if (route === "/users/@me/channels" && call.init.method === "POST") {
+        return jsonResponse({ id: "dm-1" });
+      }
+      throw new Error(`unexpected ${call.init.method} ${route}`);
+    });
+    const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+    const result = await adapter.checkTargetLive({
+      userId: "dalton-u",
+      platformUserId: USER_ID,
+      address: "discord:@me",
+      purpose: "automation",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.address).toBe("discord:@me");
+    expect(calls.map((call) => routeOf(call.url))).toEqual(["/users/@me/channels"]);
+  });
+
+  it("checkTargetLive requires a guild thread whose parent and guild match the address", async () => {
+    const shortAddress = `discord:${CHANNEL_ID}:thread:${THREAD_ID}`;
+    const slashAddress = `discord:${GUILD_ID}/${CHANNEL_ID}:thread:${THREAD_ID}`;
+    expect(parseDiscordTarget(shortAddress)).toMatchObject({
+      kind: "thread",
+      channelId: THREAD_ID,
+      parentChannelId: CHANNEL_ID,
+      threadId: THREAD_ID,
+    });
+    expect(parseDiscordTarget(slashAddress)?.parentChannelId).toBe(CHANNEL_ID);
+    expect(parseDiscordTarget(slashAddress)?.guildId).toBe(GUILD_ID);
+
+    for (const address of [shortAddress, slashAddress]) {
+      for (const threadType of [10, 11, 12]) {
+        const { rest, calls } = makeRest(async () => jsonResponse({
+          id: THREAD_ID,
+          type: threadType,
+          guild_id: GUILD_ID,
+          parent_id: CHANNEL_ID,
+          name: "thread",
+        }));
+        const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+        const result = await adapter.checkTargetLive({
+          userId: "dalton-u",
+          address,
+          purpose: "automation",
+        });
+        expect(result.ok).toBe(true);
+        expect(result.address).toBe(address);
+        expect(calls.some((call) => call.init.method === "PATCH")).toBe(false);
+      }
+    }
+
+    for (const channelType of [1, 0, 5, 3]) {
+      const { rest, calls } = makeRest(async () => jsonResponse({
+        id: THREAD_ID,
+        type: channelType,
+        guild_id: GUILD_ID,
+        parent_id: CHANNEL_ID,
+        thread_metadata: { archived: true },
+      }));
+      const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+      const result = await adapter.checkTargetLive({
+        userId: "dalton-u",
+        address: shortAddress,
+        purpose: "automation",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.message).toBe("Discord thread target must be a guild thread.");
+      expect(calls.some((call) => call.init.method === "PATCH")).toBe(false);
+    }
+
+    const parentMismatch = makeRest(async () => jsonResponse({
+      id: THREAD_ID,
+      type: 11,
+      guild_id: GUILD_ID,
+      parent_id: "700000099",
+    }));
+    const parentResult = await new DiscordChannelAdapter({
+      botToken: "t", botUserId: BOT_ID, rest: parentMismatch.rest,
+    }).checkTargetLive({
+      userId: "dalton-u",
+      address: shortAddress,
+      purpose: "automation",
+    });
+    expect(parentResult.ok).toBe(false);
+    expect(parentResult.message).toBe("Discord thread does not belong to the expected parent channel.");
+
+    for (const guildId of [undefined, "   "]) {
+      const { rest } = makeRest(async () => jsonResponse({
+        id: THREAD_ID,
+        type: 11,
+        ...(guildId === undefined ? {} : { guild_id: guildId }),
+        parent_id: CHANNEL_ID,
+      }));
+      const result = await new DiscordChannelAdapter({
+        botToken: "t", botUserId: BOT_ID, rest,
+      }).checkTargetLive({
+        userId: "dalton-u",
+        address: shortAddress,
+        purpose: "automation",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.message).toBe("Discord thread target must be a guild thread.");
+    }
+
+    const wrongGuild = makeRest(async () => jsonResponse({
+      id: THREAD_ID,
+      type: 11,
+      guild_id: "other-guild",
+      parent_id: CHANNEL_ID,
+    }));
+    const guildResult = await new DiscordChannelAdapter({
+      botToken: "t", botUserId: BOT_ID, rest: wrongGuild.rest,
+    }).checkTargetLive({
+      userId: "dalton-u",
+      address: slashAddress,
+      purpose: "automation",
+    });
+    expect(guildResult.ok).toBe(false);
+    expect(guildResult.message).toBe("Discord channel does not belong to the expected guild.");
+
+    const missingParent = makeRest(async () => jsonResponse({
+      id: THREAD_ID,
+      type: 11,
+      guild_id: GUILD_ID,
+      parent_id: null,
+    }));
+    const missingResult = await new DiscordChannelAdapter({
+      botToken: "t", botUserId: BOT_ID, rest: missingParent.rest,
+    }).checkTargetLive({
+      userId: "dalton-u",
+      address: shortAddress,
+      purpose: "automation",
+    });
+    expect(missingResult.ok).toBe(false);
+    expect(missingResult.message).toBe("Discord thread does not belong to the expected parent channel.");
+  });
+
   it("registers Discord only when enabled with a token, coexisting with Feishu", () => {
     const env = {
       INTERNAL_SERVICE_TOKEN: "x".repeat(32),

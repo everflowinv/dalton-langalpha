@@ -15806,6 +15806,16 @@ class ResearchDataBridge:
 
             self._host_max_seen_generation = max(self._host_max_seen_generation, generation)
 
+            # ``host_mode`` defaults to mirror. Only the two Bloomberg jobs may
+            # use it. Every other job is rejected before a process is started.
+            if host_mode == "mirror" and job_key not in BBG_HOST_JOB_KEYS:
+                return 400, {
+                    "ok": False,
+                    "rejected": True,
+                    "error": "host_command_rejected",
+                }
+
+            host_workspace_env = str(data_root)
             if self._host_task_command_override is not None:
                 gate_spec = {
                     "mode": "command",
@@ -15822,11 +15832,25 @@ class ResearchDataBridge:
                     "poll_interval_s": float(self.cfg.host_task_mirror_poll_interval_s),
                 }
             else:
-                bbg_script = data_root / "scripts" / "bbg_remote_refresh.sh"
+                try:
+                    run_spec = resolve_host_run_command_spec(
+                        job_key=job_key,
+                        command_argv=body.get("command_argv"),
+                        cwd=body.get("cwd"),
+                        data_root=data_root,
+                        ocw_root=ocw_root,
+                    )
+                except HostCommandRejected:
+                    return 400, {
+                        "ok": False,
+                        "rejected": True,
+                        "error": "host_command_rejected",
+                    }
+                host_workspace_env = str(run_spec["workspace_env"])
                 gate_spec = {
                     "mode": "command",
-                    "command_argv": ["bash", str(bbg_script)],
-                    "cwd": str(data_root),
+                    "command_argv": list(run_spec["command_argv"]),
+                    "cwd": str(run_spec["cwd"]),
                 }
 
             child_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
@@ -15838,7 +15862,7 @@ class ResearchDataBridge:
             child_env["DALTON_RUN_DIR"] = str(run_outbox_file.parent)
             child_env["DALTON_OUTBOX_FILE"] = str(run_outbox_file)
             if host_mode == "run":
-                child_env["OPENCLAW_WORKSPACE"] = str(data_root)
+                child_env["OPENCLAW_WORKSPACE"] = host_workspace_env
                 child_env["DALTON_PYTHON_BIN"] = str(os.environ.get("DALTON_PYTHON_BIN") or py_bin)
                 child_env["TZ"] = "America/New_York"
                 child_env["DALTON_NO_DIRECT_SEND"] = "1"
@@ -16850,10 +16874,111 @@ def build_wiki_ingest_cmd(
 _FEISHU_TARGET_RE = re.compile(r"^feishu:(user:ou_[A-Za-z0-9_-]+)$")
 _FEISHU_CHAT_TARGET_RE = re.compile(r"^feishu:(chat:oc_[A-Za-z0-9_-]+)$")
 _DISCORD_TARGET_RE = re.compile(r"^discord:(user:[0-9]+)$")
+_DISCORD_CHANNEL_TARGET_RE = re.compile(r"^discord:channel:([0-9]{5,32})$")
+
+BBG_HOST_JOB_KEYS = frozenset({"bbg-data-pull-asia", "bbg-data-pull-us"})
+# Manifest cwd token. After an exact match the bridge runs in data_root, the
+# host path of Dalton's openclaw-data copy.
+HOST_DATA_COPY_CWD = "var/dalton/openclaw-data"
+
+
+class HostCommandRejected(ValueError):
+    """A non-Bloomberg host command is not that job's manifest host entry."""
+
+
+def _host_argv_is_usable(command_argv: Any) -> bool:
+    if not isinstance(command_argv, list) or not command_argv:
+        return False
+    for item in command_argv:
+        if not isinstance(item, str) or item == "" or "\x00" in item:
+            return False
+    return True
+
+
+def _cwd_under_ocw(cwd: Any, ocw_root: Path) -> Path:
+    """Keep ``cwd`` only when it is ``ocw_root`` or a child. Anything else stays at the root."""
+    root = Path(ocw_root).resolve()
+    if not isinstance(cwd, str) or not cwd.strip() or "\x00" in cwd:
+        return root
+    candidate = Path(cwd)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return root
+    if resolved == root or root in resolved.parents:
+        return resolved
+    return root
+
+
+def _load_host_job_manifest():
+    """Load the data-task manifest from this checkout. Fail closed for non-BBG jobs."""
+    repo_root = Path(__file__).resolve().parents[2]
+    root_text = str(repo_root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    from src.dalton.data_jobs.manifest import load_data_task_manifest
+
+    return load_data_task_manifest()
+
+
+def resolve_host_run_command_spec(
+    *,
+    job_key: str,
+    command_argv: Any,
+    cwd: Any,
+    data_root: Path,
+    ocw_root: Path,
+) -> dict[str, str | list[str]]:
+    """Choose the host-run command.
+
+    Bloomberg pulls always run ``scripts/bbg_remote_refresh.sh`` under
+    ``data_root``. Every other job is accepted only when ``job_key`` is a
+    ``runner: host`` manifest entry and both ``command_argv`` and ``cwd``
+    equal that entry. Unknown jobs and drifted arguments raise
+    ``HostCommandRejected`` and do not fall back to the Bloomberg script.
+    The manifest cwd token ``var/dalton/openclaw-data`` then becomes
+    ``data_root`` for the process cwd and ``OPENCLAW_WORKSPACE``.
+    """
+    _ = ocw_root
+    root = Path(data_root)
+    bbg_argv = ["bash", str(root / "scripts" / "bbg_remote_refresh.sh")]
+    key = str(job_key or "").strip()
+    if key in BBG_HOST_JOB_KEYS:
+        return {
+            "command_argv": bbg_argv,
+            "cwd": str(root),
+            "workspace_env": str(root),
+        }
+    try:
+        manifest = _load_host_job_manifest()
+        entry = manifest.by_job_key().get(key)
+    except Exception as exc:
+        raise HostCommandRejected("host manifest unavailable") from exc
+    if entry is None or entry.runner != "host":
+        raise HostCommandRejected(f"unknown host job: {key}")
+    expected_argv = [str(item) for item in entry.command_argv]
+    if not _host_argv_is_usable(command_argv) or list(command_argv) != expected_argv:
+        raise HostCommandRejected("host command_argv does not match the manifest")
+    expected_cwd = str(entry.cwd)
+    if not isinstance(cwd, str) or cwd != expected_cwd:
+        raise HostCommandRejected("host cwd does not match the manifest")
+    resolved = root if expected_cwd == HOST_DATA_COPY_CWD else Path(expected_cwd)
+    return {
+        "command_argv": expected_argv,
+        "cwd": str(resolved),
+        "workspace_env": str(resolved),
+    }
 
 
 def parse_notify_target(raw: str) -> tuple[str, str]:
-    """Split ``feishu:user:<id>`` / ``feishu:chat:<id>`` / ``discord:user:<id>`` into ``(channel, '<kind>:<id>')``."""
+    """Split a notify target into ``(channel, '<kind>:<id>')``.
+
+    Accepts ``feishu:user:`` / ``feishu:chat:`` / ``discord:user:`` and
+    ``discord:channel:<5-32 digits>``. The Discord channel form is what the
+    OpenClaw message tool expects (``channel:<id>``).
+    """
     if not isinstance(raw, str):
         raise ValueError("Target must be a string")
     cleaned = raw.strip()
@@ -16866,6 +16991,9 @@ def parse_notify_target(raw: str) -> tuple[str, str]:
     m_discord = _DISCORD_TARGET_RE.match(cleaned)
     if m_discord:
         return "discord", m_discord.group(1)
+    m_channel = _DISCORD_CHANNEL_TARGET_RE.match(cleaned)
+    if m_channel:
+        return "discord", f"channel:{m_channel.group(1)}"
     raise ValueError(f"Unsupported notify target format: {cleaned!r}")
 
 

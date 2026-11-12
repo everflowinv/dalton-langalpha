@@ -1,4 +1,4 @@
-# OC-1 Phase 1 deterministic data tasks manifest (19 tasks).
+# OC-1 deterministic data tasks manifest (28 tasks: phase 1 plus nine batch-3 script tasks).
 # Fields match DESIGN_data_task_layer.FINAL_20261107.md §1.1 (TASK_BASELINE.md + approved changes for T28 & T44).
 # All tasks default to enabled: false in PR 0-1 so merging does not alter production behavior.
 tasks:
@@ -470,6 +470,234 @@ tasks:
     secret_names:
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  # OC-1 batch 3. Schedules match the OpenClaw cron export. All stay disabled
+  # until a side-by-side preview is accepted. batch_no stays in 1..4.
+  - task_code: "T20"
+    job_key: "ai-chain-daily"
+    title: "ai-chain-daily"
+    batch_no: 1
+    runner: "container"
+    cron: "50 8 * * *"
+    timezone: "America/New_York"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 900
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py ai-chain-daily"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "ai-chain-daily"
+    secret_names: []
+    freeze_paths:
+      - "skills/ai-chain/state/daily_push.json"
+      - "skills/ai-chain/state/ingest_health.json"
+      - "skills/ai-chain/events/bus.jsonl"
+      - "research-outputs/*-ai-chain-daily.md"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T76"
+    job_key: "us-etf-monthly-flows"
+    title: "us-etf-monthly-flows"
+    batch_no: 1
+    runner: "container"
+    cron: "0 10 3 * *"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py us-etf-monthly-flows"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "us-etf-monthly-flows"
+    secret_names: []
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T42"
+    job_key: "vol-surface-daily-snapshot"
+    title: "vol-surface-daily-snapshot"
+    batch_no: 1
+    runner: "container"
+    cron: "10 21 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py vol-surface-daily-snapshot"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "vol-surface-daily-snapshot"
+    secret_names: []
+    freeze_paths:
+      - "skills/hedging-analysis/data/index.json"
+      - "skills/hedging-analysis/data/snapshots/**/*.parquet"
+      - "skills/hedging-analysis/data/regimes/*.parquet"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T58"
+    job_key: "gs-pb-weekly-rundown"
+    title: "gs-pb-weekly-rundown"
+    batch_no: 1
+    runner: "host"
+    host_mode: "run"
+    cron: "0 9 * * 6"
+    timezone: "America/New_York"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 300
+    output_max_bytes: 50000
+    cwd: "var/dalton/openclaw-data"
+    command: "/Users/everflow/.openclaw/workspace/skills/company-wiki/venv/bin/python -I scripts/gs_pb_weekly.py run --json"
+    command_argv:
+      - "/Users/everflow/.openclaw/workspace/skills/company-wiki/venv/bin/python"
+      - "-I"
+      - "scripts/gs_pb_weekly.py"
+      - "run"
+      - "--json"
+    secret_names: []
+    freeze_paths:
+      - "state/gs-pb-weekly/state.json"
+      - "state/gs-pb-weekly/last-run.json"
+      - "research-outputs/gs-pb-weekly/gs_pb_charts_daily_latest.csv"
+      - "research-outputs/gs-pb-weekly/gs_pb_core_weekly_latest.csv"
+      - "research-outputs/gs-pb-weekly/issues/*.json"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T9"
+    job_key: "fde-hiring-snapshot-daily"
+    title: "fde-hiring-snapshot-daily"
+    batch_no: 1
+    runner: "container"
+    cron: "20 6 * * *"
+    timezone: "America/New_York"
+    timeout_seconds: 2400
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "sh -lc bash skills/fde-hiring-tracker/scripts/run.sh --quiet --json snapshot --concurrency 8"
+    command_argv:
+      - "bash"
+      - "skills/fde-hiring-tracker/scripts/run.sh"
+      - "--quiet"
+      - "--json"
+      - "snapshot"
+      - "--concurrency"
+      - "8"
+    secret_names: []
+    freeze_paths:
+      - "skills/fde-hiring-tracker/state/snapshots/*.json"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T73"
+    job_key: "fde-hiring-weekly-report"
+    title: "fde-hiring-weekly-report"
+    batch_no: 1
+    runner: "container"
+    cron: "10 7 * * 1"
+    timezone: "America/New_York"
+    timeout_seconds: 900
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "sh -lc bash scripts/fde_hiring_weekly_report.sh"
+    command_argv:
+      - "bash"
+      - "scripts/fde_hiring_weekly_report.sh"
+    secret_names: []
+    freeze_paths:
+      - "temp/fde_hiring_weekly.err"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T36"
+    job_key: "semi-rescue-alert-am"
+    title: "semi-rescue-alert-am"
+    batch_no: 1
+    runner: "container"
+    cron: "0 8 * * 2-6"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 560
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "/opt/homebrew/bin/python3 -I scripts/semi_rescue_alert.py run --slot am --send --json"
+    command_argv:
+      - "python3"
+      - "scripts/semi_rescue_alert.py"
+      - "run"
+      - "--slot"
+      - "am"
+      - "--json"
+    secret_names: []
+    freeze_paths:
+      - "research-outputs/semi-rescue-alert/**/*"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T16"
+    job_key: "semi-rescue-alert-pm"
+    title: "semi-rescue-alert-pm"
+    batch_no: 1
+    runner: "container"
+    cron: "0 21 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 560
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "/opt/homebrew/bin/python3 -I scripts/semi_rescue_alert.py run --slot pm --send --json"
+    command_argv:
+      - "python3"
+      - "scripts/semi_rescue_alert.py"
+      - "run"
+      - "--slot"
+      - "pm"
+      - "--json"
+    secret_names: []
+    freeze_paths:
+      - "research-outputs/semi-rescue-alert/**/*"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T83"
+    job_key: "semi-bottom-checklist-1030et"
+    title: "semi-bottom-checklist-1030et"
+    batch_no: 1
+    runner: "container"
+    cron: "30 10 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 300
+    no_output_timeout_seconds: 240
+    output_max_bytes: 20000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "/opt/homebrew/bin/python3 -I scripts/semi_bottom_checklist.py run"
+    command_argv:
+      - "python3"
+      - "scripts/semi_bottom_checklist.py"
+      - "run"
+    secret_names: []
     freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false

@@ -238,13 +238,25 @@ def _parse_task_baseline_markdown() -> dict[str, dict[str, object]]:
 
 def test_manifest_matches_baseline_and_approved_changes() -> None:
     manifest = load_data_task_manifest()
-    assert len(manifest.tasks) == 19
+    assert len(manifest.tasks) == 28
 
     baseline_rows = _parse_task_baseline_markdown()
     assert len(baseline_rows) == 19
 
     by_code = manifest.by_task_code()
-    assert set(by_code.keys()) == set(baseline_rows.keys())
+    batch3_codes = {
+        "T9",
+        "T16",
+        "T20",
+        "T36",
+        "T42",
+        "T58",
+        "T73",
+        "T76",
+        "T83",
+    }
+    assert set(baseline_rows).issubset(by_code)
+    assert set(by_code) - set(baseline_rows) == batch3_codes
 
     for code, base in baseline_rows.items():
         entry = by_code[code]
@@ -308,8 +320,8 @@ async def test_sync_manifest_to_db_restores_t25_redacted_python() -> None:
 
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
-    assert count == 19
-    assert len(state["executed"]) == 19
+    assert count == 28
+    assert len(state["executed"]) == 28
 
     # T28 syncs active baseline cron/timezone ("40 9 * * 1-5" / "America/New_York"), not cutover values
     t28_params = next(p for _, p in state["executed"] if p["job_key"] == "tw-leverage-daily")
@@ -5252,7 +5264,9 @@ async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_termina
     from src.dalton.data_jobs.evaluators import TaskEvaluationResult
     from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
 
-    # 1. Verify manifest freeze_paths populated for T5 and T18, and empty for the other 17 tasks
+    # 1. Baseline tasks other than T5 and T18 keep empty freeze_paths.
+    # Batch-3 exact lists live in test_data_jobs_batch3. T76 and T83 are empty
+    # because a successful exit does not always write a file.
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
     assert by_code["T5"].freeze_paths == [
@@ -5264,9 +5278,11 @@ async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_termina
     assert by_code["T18"].freeze_paths == [
         "temp/megacap-relative-signal-monitor/latest.json",
     ]
+    batch3_codes = {"T9", "T16", "T20", "T36", "T42", "T58", "T73", "T76", "T83"}
     for code, entry in by_code.items():
-        if code not in ("T5", "T18"):
-            assert entry.freeze_paths == [], f"Expected empty freeze_paths for {code}"
+        if code in ("T5", "T18") or code in batch3_codes:
+            continue
+        assert entry.freeze_paths == [], f"Expected empty freeze_paths for {code}"
 
     # 2. Prepare T5 artifacts and verify atomic done.json write (temp file -> os.replace)
     data_root = tmp_path / "openclaw-data"
@@ -7651,7 +7667,7 @@ async def test_pr12_round2_overlay_redaction_and_manifest_sync_preserves_schedul
     manifest = load_data_task_manifest()
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
-    assert count == 19
+    assert count == 28
     sql_executed, params_executed = state["executed"][0]
     insert_clause, conflict_clause = sql_executed.split(
         "ON CONFLICT (job_key) DO UPDATE SET", 1

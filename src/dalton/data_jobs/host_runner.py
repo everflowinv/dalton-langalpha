@@ -177,6 +177,8 @@ async def post_bridge_host_run(
     scheduled_slot_utc: datetime | str,
     timeout: int,
     no_output_timeout: int | None = None,
+    command_argv: list[str] | None = None,
+    cwd: str | None = None,
 ) -> HostRunOutcome:
     """Send `POST /internal/data-tasks/host-run` and wait synchronously for the outcome."""
     body: dict[str, Any] = {
@@ -188,6 +190,10 @@ async def post_bridge_host_run(
         "timeout": int(timeout),
         "no_output_timeout": (int(no_output_timeout) if no_output_timeout is not None else None),
     }
+    if command_argv is not None:
+        body["command_argv"] = list(command_argv)
+    if cwd is not None:
+        body["cwd"] = str(cwd)
     http_timeout = max(30.0, float(timeout) + HOST_RUN_HTTP_OVERHEAD_S)
     try:
         payload = await _post_bridge_data_tasks(
@@ -368,6 +374,8 @@ class DataTaskHostBridgeClient:
         scheduled_slot_utc: datetime | str,
         timeout: int,
         no_output_timeout: int | None = None,
+        command_argv: list[str] | None = None,
+        cwd: str | None = None,
     ) -> HostRunOutcome:
         """Execute a host data task via `POST /internal/data-tasks/host-run` and return a structured outcome."""
         return await post_bridge_host_run(
@@ -378,6 +386,8 @@ class DataTaskHostBridgeClient:
             scheduled_slot_utc=scheduled_slot_utc,
             timeout=timeout,
             no_output_timeout=no_output_timeout,
+            command_argv=command_argv,
+            cwd=cwd,
         )
 
     async def kill_host_tasks(

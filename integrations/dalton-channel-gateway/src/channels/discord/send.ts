@@ -43,9 +43,12 @@ export function parseDiscordTarget(address: string): ParsedDiscordTarget | null 
   const parts = raw.split("/").filter(Boolean);
   if (parts.length === 0) return null;
   if (threadId) {
-    return parts.length >= 2
-      ? { kind: "thread", guildId: parts[0], channelId: threadId, parentChannelId: parts[1], threadId }
-      : { kind: "thread", channelId: threadId, threadId };
+    if (parts.length >= 2) {
+      return { kind: "thread", guildId: parts[0], channelId: threadId, parentChannelId: parts[1], threadId };
+    }
+    const parentChannelId = parts[0]?.trim() ?? "";
+    if (!parentChannelId) return null;
+    return { kind: "thread", channelId: threadId, parentChannelId, threadId };
   }
   if (parts.length >= 2) return { kind: "channel", guildId: parts[0], channelId: parts[1]! };
   return { kind: "channel", channelId: parts[0]! };

@@ -341,7 +341,7 @@ async def _history_bytes(
 async def _seed_identity(pool: AsyncConnectionPool) -> Seed:
     entries = load_manifest_entries()
     keys = [entry.job_key for entry in entries]
-    assert len(keys) == 19
+    assert len(keys) == 28
     for required in (BBG, AH_AM, AH_PM, CN, JP, TSMC):
         assert required in keys
     comp_a = "11111111-1111-4111-8111-111111111111"
