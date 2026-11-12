@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-COLLECT_PATH = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-msft-tracker" / "scripts" / "collect.py"
+COLLECT_PATH = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-bullbear-tracker" / "scripts" / "collect.py"
 ET = ZoneInfo("America/New_York")
 FROZEN = datetime(2026, 11, 10, 22, 50, tzinfo=ET)
 WIKI_WARNING = "列表有更多文档，请缩小筛选或提高 limit"
@@ -35,7 +35,13 @@ _ORIG_TRANSPORT = collect_mod.resolve_researchdata_transport
 _ORIG_CONSENSUS = collect_mod.fetch_consensus_snapshot
 
 
-def _run(capsys: pytest.CaptureFixture[str], argv: list[str]) -> tuple[int, dict[str, Any]]:
+def _run(
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    ticker: str | None = "MSFT",
+) -> tuple[int, dict[str, Any]]:
+    if ticker is not None and "--ticker" not in argv:
+        argv = [argv[0], "--ticker", ticker, *argv[1:]]
     code = collect_mod.main(argv)
     payload = json.loads(capsys.readouterr().out)
     return code, payload
@@ -989,7 +995,7 @@ def test_offline_collect_leaves_seen_and_recovers_packet(
 def test_collect_rejects_non_msft_and_bad_run_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     ws = _workspace(tmp_path / "bad-company", ticker="AAPL")
     code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "ok-id"])
-    assert code == 2 and payload["status"] == "company_not_msft"
+    assert code == 2 and payload["status"] == "company_mismatch"
     assert not (ws / "research" / "tracker" / "ok-id").exists()
 
     ws = _workspace(tmp_path / "bad-run")
@@ -1584,3 +1590,182 @@ def test_old_incomplete_packet_commits_after_newer_coverage(monkeypatch, tmp_pat
     assert (ws / "research/tracker/last_run.json").read_bytes() == latest
     assert _log_count((ws / "research/tracker/updates.log").read_text(), "20261110-2200") == 1
     assert {"old-doc", "new-doc"} <= set(_read_json(ws / "research/tracker/seen.json"))
+
+
+@pytest.mark.parametrize("raw", ["NVDA", "msftt", ""])
+def test_collect_rejects_unknown_ticker(capsys: pytest.CaptureFixture[str], raw: str) -> None:
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", "/tmp/unused", "--run-id", "ok-id"],
+        ticker=raw,
+    )
+    assert code == 2
+    assert payload["status"] == "unsupported_ticker"
+    assert payload["ticker"] == raw.strip().upper()
+    assert collect_mod.TICKER == "MSFT"
+
+
+@pytest.mark.parametrize(
+    ("ticker", "lock_name", "state_key"),
+    [
+        ("MSFT", ".msft-collect.lock", "msft_ae_state"),
+        ("META", ".meta-collect.lock", "meta_ae_state"),
+        ("AMZN", ".amzn-collect.lock", "amzn_ae_state"),
+        ("GOOGL", ".googl-collect.lock", "googl_ae_state"),
+    ],
+)
+def test_lock_and_ae_state_key_follow_ticker(tmp_path: Path, ticker: str, lock_name: str, state_key: str) -> None:
+    assert collect_mod.ae_state_key(ticker) == state_key
+    assert collect_mod.collect_lock_name(ticker) == lock_name
+    assert ".msft-collect.lock" in COLLECT_PATH.read_text(encoding="utf-8")
+    workspace = tmp_path / ticker
+    tracker = workspace / "research" / "tracker"
+    previous = collect_mod.TICKER
+    collect_mod.TICKER = ticker
+    try:
+        with collect_mod.workspace_lock(workspace, tracker):
+            assert (tracker / lock_name).is_file()
+    finally:
+        collect_mod.TICKER = previous
+
+
+@pytest.mark.parametrize("ticker", ["MSFT", "META", "AMZN", "GOOGL"])
+def test_x_pool_scope_is_company_or_all(tmp_path: Path, ticker: str) -> None:
+    workspace = tmp_path / ticker
+    tracker = workspace / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "x_pool.json").write_text(
+        json.dumps(
+            {
+                "meta_only": {"active": True, "tickers": ["META"]},
+                "shared": {"active": True, "tickers": ["ALL"]},
+                "msft_only": {"active": True, "tickers": ["MSFT"]},
+                "amzn_only": {"active": True, "tickers": ["AMZN"]},
+                "googl_only": {"active": True, "tickers": ["GOOGL"]},
+                "idle": {"active": False, "tickers": [ticker, "ALL"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    previous = collect_mod.TICKER
+    collect_mod.TICKER = ticker
+    try:
+        handles, _pool = collect_mod._load_pool(workspace, {"x_pool_max": 25})
+    finally:
+        collect_mod.TICKER = previous
+    expected = {
+        "MSFT": ["shared", "msft_only"],
+        "META": ["meta_only", "shared"],
+        "AMZN": ["shared", "amzn_only"],
+        "GOOGL": ["shared", "googl_only"],
+    }
+    assert handles == expected[ticker]
+
+
+def test_applicable_years_follow_fiscal_month_when_source_has_no_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(collect_mod, "now_et", lambda: datetime(2026, 11, 11, tzinfo=ET))
+    for ticker in ("META", "AMZN", "GOOGL"):
+        model = json.loads(collect_mod.research_config_path(ticker).read_text(encoding="utf-8"))["model"]
+        assert model["fiscal_year_end_month"] == 12
+        years = collect_mod.applicable_years(model)
+        assert [item["key"] for item in years] == ["0y", "+1y"]
+        assert years[0]["fiscal_year"] == "FY2026"
+        assert years[0]["period_end_prefix"] == "2026-12"
+        assert years[1]["fiscal_year"] == "FY2027"
+        assert years[1]["period_end_prefix"] == "2027-12"
+        assert years[0]["other_income_bn"] == model["other_income_bn"]["0y"]
+        assert years[1]["other_income_bn"] == model["other_income_bn"]["+1y"]
+        built = collect_mod.build_implied_model(
+            {
+                "earnings_estimate": {
+                    "0y": {"avg": 10, "period_end": "2026-12-31", "currency": "USD"},
+                },
+                "revenue_estimate": {
+                    "0y": {"avg": 100e9, "period_end": "2026-12-31", "currency": "USD"},
+                },
+            },
+            model,
+        )
+        assert built["periods"]["0y"]["status"] == "ok"
+        assert built["periods"]["0y"]["fiscal_year"] == "FY2026"
+        assert built["periods"]["+1y"]["status"] == "missing_period"
+
+    monkeypatch.setattr(collect_mod, "now_et", lambda: datetime(2026, 3, 1, tzinfo=ET))
+    msft = json.loads(collect_mod.research_config_path("MSFT").read_text(encoding="utf-8"))["model"]
+    assert msft["fiscal_year_end_month"] == 6
+    assert "0001193125-26-323632" in msft["source"]
+    assert "0y=FY27（2027-06 止）" in msft["source"]
+    parsed = collect_mod.applicable_years(msft)
+    assert parsed[0]["fiscal_year"] == "FY27"
+    assert parsed[0]["period_end_prefix"] == "2027-06"
+    assert parsed[0]["other_income_bn"] == -0.4
+    assert parsed[1]["fiscal_year"] == "FY28"
+    assert parsed[1]["period_end_prefix"] == "2028-06"
+    assert parsed[1]["other_income_bn"] == -0.4
+
+
+@pytest.mark.parametrize(
+    "today",
+    [datetime(2026, 12, 15, tzinfo=ET), datetime(2027, 1, 15, tzinfo=ET)],
+)
+def test_other_income_stays_on_basis_fiscal_year(monkeypatch: pytest.MonkeyPatch, today: datetime) -> None:
+    monkeypatch.setattr(collect_mod, "now_et", lambda: today)
+    for ticker in ("META", "AMZN", "GOOGL"):
+        configured = json.loads(collect_mod.research_config_path(ticker).read_text(encoding="utf-8"))["model"]
+        assert configured["basis_fiscal_year"] == 2026
+
+    model = json.loads(collect_mod.research_config_path("AMZN").read_text(encoding="utf-8"))["model"]
+    assert collect_mod.other_income_for_fiscal_year(model, 2026) == 69.1
+    assert collect_mod.other_income_for_fiscal_year(model, 2027) == 0
+    assert collect_mod.other_income_for_fiscal_year(model, 2028) is None
+
+    years = collect_mod.applicable_years(model)
+    assert [item["key"] for item in years] == ["0y", "+1y"]
+    if today.year == 2026:
+        expected = (("FY2026", "2026-12", 69.1), ("FY2027", "2027-12", 0))
+        periods = (("0y", "2026-12-31", "ok"), ("+1y", "2027-12-31", "ok"))
+    else:
+        expected = (("FY2027", "2027-12", 0), ("FY2028", "2028-12", None))
+        periods = (("0y", "2027-12-31", "ok"), ("+1y", "2028-12-31", "other_income_missing"))
+    for item, (fiscal_year, prefix, income) in zip(years, expected, strict=True):
+        assert item["fiscal_year"] == fiscal_year
+        assert item["period_end_prefix"] == prefix
+        assert item["other_income_bn"] == income
+        if income is None:
+            assert item["other_income_reason"] == f"{fiscal_year} 没有其他收入假设，未计算隐含费用"
+        else:
+            assert "other_income_reason" not in item
+
+    built = collect_mod.build_implied_model(
+        {
+            "earnings_estimate": {
+                key: {"avg": 10, "period_end": end, "currency": "USD"} for key, end, _status in periods
+            },
+            "revenue_estimate": {
+                key: {"avg": 100e9, "period_end": end, "currency": "USD"} for key, end, _status in periods
+            },
+        },
+        model,
+    )
+    for key, _end, status in periods:
+        entry = built["periods"][key]
+        assert entry["status"] == status
+        if status == "ok":
+            assert entry["other_income_bn"] == next(item["other_income_bn"] for item in years if item["key"] == key)
+            assert "implied_total_expenses_bn" in entry
+        else:
+            assert entry["fiscal_year"] == "FY2028"
+            assert entry["reason"] == "FY2028 没有其他收入假设，未计算隐含费用"
+            assert "implied_total_expenses_bn" not in entry
+
+    msft = json.loads(collect_mod.research_config_path("MSFT").read_text(encoding="utf-8"))["model"]
+    assert "basis_fiscal_year" not in msft
+    parsed = collect_mod.applicable_years(msft)
+    assert parsed[0]["fiscal_year"] == "FY27"
+    assert parsed[0]["period_end_prefix"] == "2027-06"
+    assert parsed[0]["other_income_bn"] == -0.4
+    assert parsed[1]["fiscal_year"] == "FY28"
+    assert parsed[1]["period_end_prefix"] == "2028-06"
+    assert parsed[1]["other_income_bn"] == -0.4
+    assert "other_income_reason" not in parsed[0]
+    assert "other_income_reason" not in parsed[1]

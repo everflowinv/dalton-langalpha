@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import an MSFT tracker snapshot into a Dalton workspace.
+"""Import a bull/bear tracker snapshot into a Dalton workspace.
 
 Offline and deterministic. Source and workspace paths are explicit arguments.
 The default is a dry run; ``--apply`` writes. A conflict writes nothing.
@@ -18,13 +18,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-TICKER = "MSFT"
-ARCHIVE = "research/tracker/imported-msft"
+SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
+MANIFEST_SCHEMA = "bullbear-tracker-import/1"
+LEGACY_MANIFEST_SCHEMA = "msft-tracker-import/1"
 SEEN_REL = "research/tracker/seen.json"
 LAST_RUN_REL = "research/tracker/last_run.json"
 LOG_REL = "research/tracker/updates.log"
 WORKING_THESIS_REL = "research/tracker/thesis.md"
-MANIFEST_REL = f"{ARCHIVE}/manifest.json"
 X_POOL_REL = "research/tracker/x_pool.json"
 X_AUTHORS_REL = "research/tracker/x_authors.json"
 FORBIDDEN_TARGETS = frozenset({"thesis.md", "data/thesis.json", "research/thesis.md"})
@@ -56,13 +56,14 @@ SOURCE_FILES = ("seen.json", "last_run.json", "updates.log", "thesis.md", "deliv
 _UNSAFE = object()
 
 
-def import_msft_tracker(
+def import_bullbear_tracker(
     source_dir: Path | str,
     workspace_dir: Path | str,
     shared_state_dir: Path | str | None = None,
     apply: bool = False,
+    ticker: str = "MSFT",
 ) -> dict[str, Any]:
-    """Plan, and optionally write, one MSFT tracker import.
+    """Plan, and optionally write, one company tracker import.
 
     Returns counts, workspace-relative paths, source hashes, and conflicts.
     File bodies are not included. ``apply`` false leaves both trees unchanged.
@@ -80,6 +81,12 @@ def import_msft_tracker(
         "last_run_action": None,
         "working_thesis_action": None,
     }
+    chosen = str(ticker or "").strip().upper()
+    if chosen not in SUPPORTED_TICKERS:
+        _conflict(plan, "ticker", "unsupported_ticker")
+        return _result(plan, apply, written=[])
+    plan["ticker"] = chosen
+    plan["archive"] = f"research/tracker/imported-{chosen.lower()}"
 
     if not _real_dir(source):
         _conflict(plan, "source", "symlink_escape" if source.is_symlink() else "missing_source")
@@ -343,10 +350,11 @@ def _plan_consensus(plan: dict[str, Any], workspace: Path, consensus: dict[str, 
 
 
 def _plan_archives(plan: dict[str, Any], workspace: Path, files: dict[str, bytes]) -> None:
+    archive = str(plan["archive"])
     mapping = {
-        "thesis.md": f"{ARCHIVE}/thesis.md",
-        "updates.log": f"{ARCHIVE}/updates.log",
-        "deliveries.json": f"{ARCHIVE}/deliveries.json",
+        "thesis.md": f"{archive}/thesis.md",
+        "updates.log": f"{archive}/updates.log",
+        "deliveries.json": f"{archive}/deliveries.json",
     }
     keys = {
         "thesis.md": "archive_thesis",
@@ -546,8 +554,8 @@ def _plan_last_run(
     ):
         _conflict(plan, "last_run.json", "invalid_timestamp" if committed is None else "invalid_last_run")
         return
-    ticker = source.get("ticker", TICKER)
-    if not isinstance(ticker, str) or ticker.upper() != TICKER:
+    ticker = source.get("ticker", plan["ticker"])
+    if not isinstance(ticker, str) or ticker.upper() != plan["ticker"]:
         _conflict(plan, "last_run.json", "invalid_last_run")
         return
     summary = _summary_text(source.get("summary")) if "summary" in source else None
@@ -573,7 +581,7 @@ def _plan_last_run(
         return
 
     imported: dict[str, Any] = {
-        "ticker": TICKER,
+        "ticker": plan["ticker"],
         "run_id": run_id,
         "committed_at": source["committed_at"],
         "since": since,
@@ -646,7 +654,7 @@ def _norm_handle(handle: str) -> str | None:
     return text.lower()
 
 
-def _relevance(entry: object) -> str:
+def _relevance(entry: object, ticker: str) -> str:
     if not isinstance(entry, dict):
         return "bad"
     active = entry.get("active", True)
@@ -657,7 +665,7 @@ def _relevance(entry: object) -> str:
     tickers = entry.get("tickers")
     if not isinstance(tickers, list) or any(not isinstance(item, str) for item in tickers):
         return "bad"
-    if any(item.upper() in {TICKER, "ALL"} for item in tickers):
+    if any(item.upper() in {ticker, "ALL"} for item in tickers):
         return "yes"
     return "no"
 
@@ -749,7 +757,7 @@ def _load_object(raw: bytes) -> dict[str, Any] | None:
 def _select_pool(plan: dict[str, Any], pool: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
     selected: dict[str, dict[str, Any]] = {}
     for handle, entry in pool.items():
-        state = _relevance(entry)
+        state = _relevance(entry, str(plan["ticker"]))
         if state == "no":
             continue
         if state == "bad" or not isinstance(handle, str) or not isinstance(entry, dict):
@@ -871,7 +879,22 @@ def _target_object(plan: dict[str, Any], workspace: Path, rel: str) -> dict[str,
     return obj
 
 
+def _same_manifest(existing: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    """Treat a legacy MSFT manifest as the same import when the payload matches."""
+    schema = existing.get("schema")
+    allowed = {MANIFEST_SCHEMA}
+    if manifest.get("ticker") == "MSFT":
+        allowed.add(LEGACY_MANIFEST_SCHEMA)
+    if schema not in allowed:
+        return False
+    for key in ("ticker", "source_committed_at", "source_hashes", "targets"):
+        if existing.get(key) != manifest.get(key):
+            return False
+    return set(existing) <= {"schema", "ticker", "source_committed_at", "source_hashes", "targets"}
+
+
 def _plan_manifest(plan: dict[str, Any], workspace: Path, last_run_raw: bytes) -> None:
+    manifest_rel = f"{plan['archive']}/manifest.json"
     try:
         source = json.loads(last_run_raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -879,21 +902,29 @@ def _plan_manifest(plan: dict[str, Any], workspace: Path, last_run_raw: bytes) -
         return
     source_committed_at = source.get("committed_at") if isinstance(source, dict) else None
     if not isinstance(source_committed_at, str):
-        _conflict(plan, MANIFEST_REL, "invalid_last_run")
+        _conflict(plan, manifest_rel, "invalid_last_run")
         return
     # The source record's committed_at, not the clock, so a repeat import matches.
     manifest = {
-        "schema": "msft-tracker-import/1",
-        "ticker": TICKER,
+        "schema": MANIFEST_SCHEMA,
+        "ticker": plan["ticker"],
         "source_committed_at": source_committed_at,
         "source_hashes": dict(sorted(plan["hashes"].items())),
         "targets": plan["targets"],
     }
-    plan["targets"]["manifest"] = MANIFEST_REL
-    existing = _target_bytes(workspace, MANIFEST_REL, plan)
+    plan["targets"]["manifest"] = manifest_rel
+    existing = _target_bytes(workspace, manifest_rel, plan)
     if existing is _UNSAFE:
         return
-    _queue(plan, MANIFEST_REL, _json_bytes(manifest), existing)
+    if isinstance(existing, bytes):
+        try:
+            previous = json.loads(existing.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            previous = None
+        if isinstance(previous, dict) and _same_manifest(previous, manifest):
+            plan["reused"].append(manifest_rel)
+            return
+    _queue(plan, manifest_rel, _json_bytes(manifest), existing)
 
 
 def _atomic_write(workspace: Path, rel: str, data: bytes) -> None:
@@ -962,17 +993,19 @@ def _result(plan: dict[str, Any], apply: bool, written: list[str]) -> dict[str, 
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Import an MSFT tracker snapshot into a Dalton workspace.")
+    parser = argparse.ArgumentParser(description="Import a bull/bear tracker snapshot into a Dalton workspace.")
+    parser.add_argument("--ticker", required=True)
     parser.add_argument("--source-dir", required=True, type=Path)
     parser.add_argument("--workspace-dir", required=True, type=Path)
     parser.add_argument("--shared-state-dir", type=Path)
     parser.add_argument("--apply", action="store_true", help="Write the planned files. Omit for a dry run.")
     args = parser.parse_args(argv)
-    result = import_msft_tracker(
+    result = import_bullbear_tracker(
         args.source_dir,
         args.workspace_dir,
         shared_state_dir=args.shared_state_dir,
         apply=args.apply,
+        ticker=args.ticker,
     )
     json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
     sys.stdout.write("\n")

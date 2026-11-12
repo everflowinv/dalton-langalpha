@@ -72,6 +72,9 @@ _RECONCILE_LOCK_ATTEMPTS = 4
 REPORT_PROFILES = frozenset(
     {
         "msft-tracker",
+        "meta-tracker",
+        "amzn-tracker",
+        "googl-tracker",
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",

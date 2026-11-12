@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from src.dalton.database import automation_reports as reports
 from src.dalton.database.automation_reports import (
     REPORT_PROFILES,
@@ -80,6 +82,9 @@ def test_profile_accepts_only_named_profiles() -> None:
         assert parsed["failure_targets"] == ["discord:user:424242424242424242"]
     assert REPORT_PROFILES == {
         "msft-tracker",
+        "meta-tracker",
+        "amzn-tracker",
+        "googl-tracker",
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
@@ -469,3 +474,27 @@ def test_cards_keep_a_failure_snapshot_and_only_certain_failures_qualify() -> No
     assert reports.is_failure_alert_payload(notice) is True
     assert reports.is_automation_report_payload(notice) is False
     assert reports.is_failure_alert_payload(payload) is False
+
+
+@pytest.mark.parametrize("profile_id", ["meta-tracker", "amzn-tracker", "googl-tracker"])
+def test_company_tracker_profiles_follow_the_msft_route(profile_id: str) -> None:
+    parsed, err = parse_report_profile(_profile(profile_id))
+    assert err is None and parsed is not None
+    assert parsed["profile"] == profile_id
+    assert parsed["report_targets"] == ["feishu:chat:oc_msftboard"]
+    assert parsed["failure_targets"] == ["discord:user:424242424242424242"]
+    prepared, prep_err = prepare_automation_report_content(
+        profile=profile_id,
+        cards=[_card()],
+        failure_text=None,
+    )
+    assert prep_err is None and prepared is not None
+    assert prepared["content_kind"] == "cards"
+    text, text_err = prepare_automation_report_content(
+        profile=profile_id,
+        cards=None,
+        failure_text="Tracker failed. Source https://example.com/status",
+    )
+    assert text_err is None and text is not None
+    assert text["content_kind"] == "failure_text"
+    assert text["failure_text"] == "Tracker failed. Source https://example.com/status"

@@ -1,0 +1,86 @@
+{
+  "ticker": "AMZN",
+  "name": "Amazon",
+  "aliases_regex": "\\bAMZN\\b|\\$AMZN|Amazon|\\bAWS\\b|Jassy|Olsavsky|Garman|Trainium|\\bTrn[23]\\b|Bedrock|Kuiper|Amazon Leo|Project Rainier|\\bRufus\\b|Alexa\\+?|\\bZoox\\b|Prime Video",
+  "alias_terms": [
+    "Amazon",
+    "AMZN",
+    "AWS",
+    "Jassy",
+    "Trainium",
+    "Bedrock",
+    "Kuiper",
+    "Garman",
+    "Rufus"
+  ],
+  "internal_routes": [
+    "tmtb",
+    "sales-notes",
+    "funda-ai",
+    "company-wiki"
+  ],
+  "internal_limit": 60,
+  "internal_read_cap_per_route": 12,
+  "excluded_documents": [],
+  "wiki_min_alias_hits": 2,
+  "ae_queries": [
+    "Amazon AWS Trainium capex retail margin",
+    "亚马逊 AWS 云 资本开支 零售利润率"
+  ],
+  "ae_max_searches": 2,
+  "ae_company_names": [
+    "Amazon.com, Inc.",
+    "Amazon.com Inc.",
+    "Amazon.com Inc",
+    "Amazon.com",
+    "Amazon"
+  ],
+  "sec_forms": [
+    "8-K",
+    "10-Q",
+    "10-K",
+    "S-3ASR",
+    "424B2",
+    "424B5",
+    "FWP"
+  ],
+  "news_queries": [
+    "Amazon analyst estimates price target downgrade upgrade AWS",
+    "Amazon AWS Trainium Anthropic capex Kuiper retail news"
+  ],
+  "x_queries": [
+    "$AMZN min_faves:150 -filter:replies",
+    "$AMZN (AWS OR capex OR Trainium OR EPS OR estimates OR margin OR backlog OR retail OR advertising OR Anthropic) min_faves:40 -filter:replies",
+    "(Amazon OR AWS OR Jassy) (capex OR backlog OR Trainium OR \"operating margin\" OR \"free cash flow\") (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies"
+  ],
+  "x_pool_max": 25,
+  "x_keep_max": 30,
+  "x_enrich_max": 20,
+  "model": {
+    "diluted_shares_bn": 10.95,
+    "tax_rate": 0.2,
+    "other_income_bn": {
+      "0y": 69.1,
+      "+1y": 0
+    },
+    "fiscal_year_end_month": 12,
+    "basis_fiscal_year": 2026,
+    "source": "2Q26 10-Q（accession 0001018724-26-000026）：Q2 稀释股数 109.0 亿，上半年其他收入 690.6 亿（Anthropic 优先股重估 628 亿等）；FY2025 10-K 有效税率 19.6%。Yahoo 0y=FY2026（含上半年 Anthropic 重估收益）、+1y=FY2027；一致 EPS 为 GAAP，H2 与 FY27 基本不含投资收益"
+  },
+  "thresholds": {
+    "fy1_eps_vs_last_run_pct": 1.0,
+    "fy1_eps_vs_7d_pct": 2.0,
+    "fy1_rev_vs_last_run_pct": 0.7,
+    "pt_mean_vs_last_run_pct": 2.0,
+    "fy1_down_revisions_7d": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0
+  },
+  "card": {
+    "title_prefix": "📈 AMZN 跟踪｜",
+    "subtitle": "Amazon · 多空观点、盈利预测修正与催化剂",
+    "tag": "AMZN",
+    "header_template": "orange",
+    "tag_color": "orange"
+  }
+}

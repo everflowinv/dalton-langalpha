@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local MSFT tracker review records and X-pool edits. Stdlib only."""
+"""Local bull/bear tracker review records and X-pool edits. Stdlib only."""
 
 from __future__ import annotations
 
@@ -85,6 +85,19 @@ def ensure_relative(workspace: Path, raw: str) -> Path:
     return current
 
 
+SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
+
+
+def resolve_ticker(raw: str | None = None) -> str:
+    # 省略参数时仍默认 MSFT，兼容只传工作区的旧调用。显式空白不能再落成 MSFT。
+    if raw is None:
+        return "MSFT"
+    chosen = str(raw).strip().upper()
+    if chosen not in SUPPORTED_TICKERS:
+        raise StateError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
+    return chosen
+
+
 def normalize_handle(handle: str) -> str:
     text = handle.strip().lstrip("@").strip()
     if not text or "/" in text or "\\" in text or ".." in text or any(char.isspace() for char in text):
@@ -93,10 +106,12 @@ def normalize_handle(handle: str) -> str:
 
 
 @contextmanager
-def workspace_lock(workspace: Path) -> Iterator[None]:
+def workspace_lock(workspace: Path, ticker: str = "MSFT") -> Iterator[None]:
+    chosen = resolve_ticker(ticker)
     tracker = workspace / "research" / "tracker"
     tracker.mkdir(parents=True, exist_ok=True)
-    lock_path = tracker / ".msft-collect.lock"
+    # 线上 MSFT 锁文件名是 .msft-collect.lock，由 ticker 小写推出，不要改成别的文件名。
+    lock_path = tracker / f".{chosen.lower()}-collect.lock"
     if not _inside(workspace, lock_path):
         raise StateError("path_escape", "锁文件越出工作区")
     handle = lock_path.open("a+")
@@ -137,19 +152,56 @@ def _load_object(path: Path) -> dict[str, Any]:
         raise StateError("symlink_escape", f"拒绝透过符号链接读取：{path.name}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StateError("state_unreadable", f"{path.name} 无法读取") from exc
     if not isinstance(data, dict):
         raise StateError("state_unreadable", f"{path.name} 必须是对象")
     return data
 
 
-def _require_packet(workspace: Path, run_id: str) -> str:
+def _packet_path(workspace: Path, run_id: str) -> Path:
     run_id = validate_run_id(run_id)
-    packet = ensure_relative(workspace, f"research/tracker/{run_id}/packet.json")
+    return ensure_relative(workspace, f"research/tracker/{run_id}/packet.json")
+
+
+def _require_packet(workspace: Path, run_id: str, ticker: str) -> str:
+    """Packet must exist and name the same company as ``ticker``. Does not create files."""
+    chosen = resolve_ticker(ticker)
+    packet = _packet_path(workspace, run_id)
     if packet.is_symlink() or not packet.is_file():
         raise StateError("packet_missing", "运行目录没有 packet.json")
-    return run_id
+    raw = _load_object(packet).get("ticker")
+    found = raw.strip().upper() if isinstance(raw, str) else ""
+    if found != chosen:
+        raise StateError("company_mismatch", f"数据包公司是 {found or '空'}，本命令只处理 {chosen}")
+    return packet.parent.name
+
+
+def _reject_foreign_packet(workspace: Path, run_id: str, ticker: str) -> str:
+    """Failure reviews may omit packet.json. A packet that exists must match ``ticker``."""
+    run_id = validate_run_id(run_id)
+    packet = _packet_path(workspace, run_id)
+    if packet.is_symlink():
+        raise StateError("symlink_escape", "拒绝透过符号链接读取：packet.json")
+    if not packet.is_file():
+        return run_id
+    return _require_packet(workspace, run_id, ticker)
+
+
+def _recorded_company(record: dict[str, Any]) -> str:
+    """A review with no ticker is a legacy MSFT record. Any other value must match exactly."""
+    recorded = record.get("ticker")
+    if recorded is None:
+        return "MSFT"
+    if isinstance(recorded, str) and recorded.strip():
+        return recorded.strip().upper()
+    return ""
+
+
+def _reject_review_company(existing: dict[str, Any], chosen: str) -> None:
+    company = _recorded_company(existing)
+    if company != chosen:
+        raise StateError("company_mismatch", f"恢复记录公司是 {company or '空'}，本命令只处理 {chosen}")
 
 
 def _moment(now: datetime | None) -> datetime:
@@ -244,7 +296,7 @@ def _apply_profile(entry: dict[str, Any], authors: dict[str, Any], norm: str) ->
         entry["profile_status"] = "present"
 
 
-def _merge_tickers(entry: dict[str, Any], incoming: list[str]) -> None:
+def _merge_tickers(entry: dict[str, Any], incoming: list[str], ticker: str = "MSFT") -> None:
     current = entry.get("tickers", [])
     if current is None:
         current = []
@@ -256,8 +308,9 @@ def _merge_tickers(entry: dict[str, Any], incoming: list[str]) -> None:
         if item.upper() not in seen:
             merged.append(item)
             seen.add(item.upper())
-    if not any(item.upper() in {"MSFT", "ALL"} for item in merged):
-        raise StateError("ticker_scope", "账号池只维护 MSFT 或 ALL")
+    allowed = {ticker.upper(), "ALL"}
+    if not any(item.upper() in allowed for item in merged):
+        raise StateError("ticker_scope", f"账号池只维护 {ticker.upper()} 或 ALL")
     entry["tickers"] = merged
 
 
@@ -296,13 +349,15 @@ def add_author(
     tickers: str,
     reason: str,
     now: datetime | None = None,
+    ticker: str = "MSFT",
 ) -> dict[str, Any]:
     root = open_workspace(workspace)
-    run_id = _require_packet(root, run_id)
+    chosen = resolve_ticker(ticker)
+    run_id = _require_packet(root, run_id, chosen)
     norm = normalize_handle(handle)
     incoming = _parse_tickers(tickers)
     basis = _one_line(reason, "bad_reason", "研究依据需要一行非空文字")
-    with workspace_lock(root):
+    with workspace_lock(root, chosen):
         pool = _load_object(root / POOL_REL)
         authors = _load_object(root / AUTHORS_REL)
         changes = _load_changes(root, run_id)
@@ -320,7 +375,7 @@ def add_author(
             entry["added_at"] = _moment(now).date().isoformat()
         entry["active"] = True
         entry["reason"] = basis
-        _merge_tickers(entry, incoming)
+        _merge_tickers(entry, incoming, chosen)
         _apply_profile(entry, authors, norm)
         updated = dict(pool)
         if old_key is not None and old_key != norm:
@@ -343,12 +398,14 @@ def remove_author(
     handle: str,
     reason: str,
     now: datetime | None = None,
+    ticker: str = "MSFT",
 ) -> dict[str, Any]:
     root = open_workspace(workspace)
-    run_id = _require_packet(root, run_id)
+    chosen = resolve_ticker(ticker)
+    run_id = _require_packet(root, run_id, chosen)
     norm = normalize_handle(handle)
     basis = _one_line(reason, "bad_reason", "移出原因需要一行非空文字")
-    with workspace_lock(root):
+    with workspace_lock(root, chosen):
         pool = _load_object(root / POOL_REL)
         changes = _load_changes(root, run_id)
         old_key, entry = _pool_entry(pool, norm)
@@ -381,8 +438,10 @@ def save_review(
     thesis_path: str = THESIS_REL,
     thesis_sha256: str | None = None,
     content_kind: str | None = None,
+    ticker: str = "MSFT",
 ) -> dict[str, Any]:
     root = open_workspace(workspace)
+    chosen = resolve_ticker(ticker)
     report_run_id = validate_run_id(report_run_id)
     if material not in {"yes", "no"}:
         raise StateError("bad_material", "material 只能是 yes 或 no")
@@ -391,12 +450,18 @@ def save_review(
     if content_kind is not None and content_kind not in CONTENT_KINDS:
         raise StateError("bad_content_kind", "content_kind 只能是 cards 或 failure_text")
     # Early transport failure has no packet. Cards and any review that names a card still do.
+    # A packet that does exist must name this company, and the check happens before any write.
     failure_only = content_kind == "failure_text" and not card_json
     if failure_only:
-        run_id = validate_run_id(run_id)
+        run_id = _reject_foreign_packet(root, run_id, chosen)
         ensure_relative(root, f"research/tracker/{run_id}/review.json")
     else:
-        run_id = _require_packet(root, run_id)
+        run_id = _require_packet(root, run_id, chosen)
+    rel = f"research/tracker/{run_id}/review.json"
+    target = root / rel
+    # An existing review can outlive its packet. Compare companies before the thesis read and the lock.
+    if target.is_file() and not target.is_symlink():
+        _reject_review_company(_load_object(target), chosen)
     text = _one_line(summary, "bad_summary", "summary 需要一行非空文字")
     thesis = ensure_relative(root, thesis_path)
     if thesis.is_symlink() or not thesis.is_file():
@@ -408,9 +473,7 @@ def save_review(
     if card_json:
         ensure_relative(root, card_json)
         card_rel = card_json
-    rel = f"research/tracker/{run_id}/review.json"
-    target = root / rel
-    with workspace_lock(root):
+    with workspace_lock(root, chosen):
         if target.is_symlink():
             raise StateError("symlink_escape", "拒绝透过符号链接写入恢复记录")
         if target.exists():
@@ -424,6 +487,7 @@ def save_review(
                 content_kind=content_kind,
                 material=material,
                 thesis_path=thesis_path,
+                ticker=chosen,
             )
         record = {
             "run_id": run_id,
@@ -435,6 +499,7 @@ def save_review(
             "card_json": card_rel,
             "send_status": send_status,
             "content_kind": content_kind,
+            "ticker": chosen,
         }
         atomic_write_text(root, target, _dump(record))
     return {"ok": True, "path": rel, "review": record}
@@ -449,8 +514,10 @@ def _merge_review_identity(
     content_kind: str | None,
     material: str,
     thesis_path: str,
+    ticker: str,
 ) -> tuple[str | None, str | None, str]:
-    """Keep the first run, report, and card identity. send_status may change."""
+    """Keep the first run, report, card, and company. send_status may change."""
+    _reject_review_company(existing, ticker)
     if existing.get("run_id") != run_id or existing.get("report_run_id") != report_run_id:
         raise StateError("review_identity_conflict", "已有恢复记录的运行和报告标识保持不变")
     if existing.get("material") not in (None, material):
@@ -483,8 +550,8 @@ def _committed_ids(workspace: Path) -> set[str]:
     return found
 
 
-def _safe_complete_packet(packet_path: Path) -> str | None:
-    """Run id for a finished MSFT packet stored in its own run directory."""
+def _safe_complete_packet(packet_path: Path, company: str = "MSFT") -> str | None:
+    """Run id for a finished company packet stored in its own run directory."""
     if packet_path.is_symlink() or not packet_path.is_file():
         return None
     run_dir = packet_path.parent
@@ -497,19 +564,37 @@ def _safe_complete_packet(packet_path: Path) -> str | None:
         return None
     try:
         data = json.loads(packet_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict) or data.get("collection_complete") is not True:
         return None
     if data.get("run_id") != run_id:
         return None
-    ticker = data.get("ticker")
-    if not isinstance(ticker, str) or ticker.upper() != "MSFT":
+    packet_ticker = data.get("ticker")
+    if not isinstance(packet_ticker, str) or packet_ticker.upper() != resolve_ticker(company):
         return None
     return run_id
 
 
-def unfinished_runs(workspace: Path | str) -> list[dict[str, Any]]:
+def _review_matches_company(root: Path, run_id: str, review: dict[str, Any], company: str) -> bool:
+    """A readable packet object wins. Unreadable or non-object packets fall back to the review ticker."""
+    packet = root / "research" / "tracker" / run_id / "packet.json"
+    if packet.is_symlink():
+        return False
+    if packet.is_file():
+        try:
+            data = json.loads(packet.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        else:
+            if isinstance(data, dict):
+                raw = data.get("ticker")
+                return isinstance(raw, str) and raw.strip().upper() == company
+    return _recorded_company(review) == company
+
+
+def unfinished_runs(workspace: Path | str, ticker: str = "MSFT") -> list[dict[str, Any]]:
+    ticker = resolve_ticker(ticker)
     root = open_workspace(workspace)
     tracker = root / "research" / "tracker"
     if not tracker.is_dir():
@@ -524,15 +609,15 @@ def unfinished_runs(workspace: Path | str) -> list[dict[str, Any]]:
             continue
         try:
             review = json.loads(review_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if isinstance(review, dict):
+        if isinstance(review, dict) and _review_matches_company(root, run_id, review, ticker):
             found.append(review)
     for packet_path in tracker.glob("*/packet.json"):
         run_id = packet_path.parent.name
         if run_id in committed or (packet_path.parent / "review.json").exists():
             continue
-        if _safe_complete_packet(packet_path) is None:
+        if _safe_complete_packet(packet_path, ticker) is None:
             continue
         found.append(
             {
@@ -670,10 +755,11 @@ def _emit(payload: dict[str, Any], code: int) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="MSFT 跟踪的本地研究状态")
+    parser = argparse.ArgumentParser(description="多空日跟踪的本地研究状态")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     review = sub.add_parser("save-review")
+    review.add_argument("--ticker", required=True)
     review.add_argument("--workspace-dir", required=True)
     review.add_argument("--run-id", required=True)
     review.add_argument("--material", required=True)
@@ -686,6 +772,7 @@ def main(argv: list[str] | None = None) -> int:
     review.add_argument("--content-kind")
 
     opened = sub.add_parser("open-runs")
+    opened.add_argument("--ticker", required=True)
     opened.add_argument("--workspace-dir", required=True)
 
     pool = sub.add_parser("x-pool")
@@ -693,6 +780,7 @@ def main(argv: list[str] | None = None) -> int:
     add = pool_cmd.add_parser("add")
     remove = pool_cmd.add_parser("remove")
     for command in (add, remove):
+        command.add_argument("--ticker", required=True)
         command.add_argument("--workspace-dir", required=True)
         command.add_argument("--run-id", required=True)
         command.add_argument("--handle", required=True)
@@ -713,9 +801,10 @@ def main(argv: list[str] | None = None) -> int:
                 thesis_path=args.thesis_path,
                 thesis_sha256=args.thesis_sha256,
                 content_kind=args.content_kind,
+                ticker=args.ticker,
             )
         elif args.cmd == "open-runs":
-            result = {"ok": True, "runs": unfinished_runs(args.workspace_dir)}
+            result = {"ok": True, "runs": unfinished_runs(args.workspace_dir, args.ticker)}
         elif args.pool_cmd == "add":
             result = add_author(
                 args.workspace_dir,
@@ -723,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.handle,
                 args.tickers,
                 args.reason,
+                ticker=args.ticker,
             )
         else:
             result = remove_author(
@@ -730,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.run_id,
                 args.handle,
                 args.reason,
+                ticker=args.ticker,
             )
     except StateError as exc:
         return _emit({"ok": False, "status": exc.status, "error": exc.message}, 2)

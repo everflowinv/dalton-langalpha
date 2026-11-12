@@ -1,0 +1,83 @@
+{
+  "ticker": "META",
+  "name": "Meta Platforms",
+  "aliases_regex": "\\bMETA\\b|\\bMeta\\b|\\$META|Muse|Zuckerberg|\\bZuck\\b|Instagram|WhatsApp|Threads|Reality Labs|Hyperion|Prometheus|Wonder Full|Muse Charm|Meta AI",
+  "alias_terms": [
+    "Meta",
+    "META",
+    "Zuckerberg",
+    "Muse",
+    "Instagram",
+    "WhatsApp",
+    "Hyperion",
+    "Prometheus"
+  ],
+  "internal_routes": [
+    "tmtb",
+    "sales-notes",
+    "funda-ai",
+    "company-wiki"
+  ],
+  "internal_limit": 60,
+  "internal_read_cap_per_route": 12,
+  "excluded_documents": [],
+  "wiki_min_alias_hits": 2,
+  "ae_queries": [
+    "Meta Platforms",
+    "Meta 脸书 Muse"
+  ],
+  "ae_max_searches": 2,
+  "ae_company_names": [
+    "Meta Platforms, Inc.",
+    "Meta Platforms Inc",
+    "Meta Platforms"
+  ],
+  "sec_forms": [
+    "8-K",
+    "10-Q",
+    "10-K",
+    "S-3ASR",
+    "424B2",
+    "424B5",
+    "FWP"
+  ],
+  "news_queries": [
+    "Meta Platforms analyst estimates price target downgrade upgrade",
+    "Meta Platforms Muse capex financing regulation news"
+  ],
+  "x_queries": [
+    "$META min_faves:150 -filter:replies",
+    "$META (capex OR opex OR EPS OR estimates OR guidance OR margin OR FCF OR multiple OR valuation OR Muse) min_faves:40 -filter:replies",
+    "(Meta OR Zuckerberg) (capex OR opex OR \"free cash flow\" OR depreciation OR Muse) (estimates OR EPS OR margin OR ROI OR revenue) min_faves:60 -filter:replies"
+  ],
+  "x_pool_max": 25,
+  "x_keep_max": 30,
+  "x_enrich_max": 20,
+  "model": {
+    "diluted_shares_bn": 2.56,
+    "tax_rate": 0.16,
+    "other_income_bn": {
+      "0y": 0,
+      "+1y": 0
+    },
+    "fiscal_year_end_month": 12,
+    "basis_fiscal_year": 2026,
+    "source": "2Q26 8-K 附件 99.1：净利润 158.48 亿美元 / 稀释 EPS 6.18 美元 ≈ 25.6 亿股；有效税率 16%；经营利润 187.75 亿与税前 187.56 亿几乎相等，其他收入按 0"
+  },
+  "thresholds": {
+    "fy1_eps_vs_last_run_pct": 1.0,
+    "fy1_eps_vs_7d_pct": 2.0,
+    "fy1_rev_vs_last_run_pct": 0.7,
+    "pt_mean_vs_last_run_pct": 2.0,
+    "fy1_down_revisions_7d": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0
+  },
+  "card": {
+    "title_prefix": "📈 META 跟踪｜",
+    "subtitle": "Meta Platforms · 多空观点、盈利预测修正与催化剂",
+    "tag": "META",
+    "header_template": "blue",
+    "tag_color": "blue"
+  }
+}
