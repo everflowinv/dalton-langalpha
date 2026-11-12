@@ -159,6 +159,8 @@ class DataTaskDeliveryItem:
     card: dict[str, Any] | None = None
     images: tuple[PlanArtifactDescriptor, ...] = ()
     artifact: PlanArtifactDescriptor | None = None
+    # Automation report text asks Feishu to skip the table/code card upgrade.
+    plain: bool = False
 
     def to_wire_dict(self, *, delivery_key: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -178,6 +180,8 @@ class DataTaskDeliveryItem:
             payload["artifact"] = self.artifact.to_wire_dict()
         else:
             payload["text"] = self.text
+            if self.plain:
+                payload["plain"] = True
         return payload
 
 

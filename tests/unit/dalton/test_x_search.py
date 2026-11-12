@@ -876,3 +876,76 @@ def test_short_quoted_terms_pair_correctly_and_stay_quoted() -> None:
     assert "“AI”" in zh_out
     assert "“管理层在电话会上" not in zh_out
     assert "管理层在电话会上表示未来三个季度的资本开支将明显高于市场预期" in zh_out
+
+
+@pytest.mark.asyncio
+async def test_x_search_forwards_media_flags_only_when_set() -> None:
+    mock_wrapper = create_autospec(OpenClawXSearchWrapper, instance=True)
+    mock_wrapper.raw_results.return_value = {
+        "ok": True,
+        "provider": "xai",
+        "result": {
+            "details": {
+                "query": "NVDA",
+                "provider": "xai",
+                "content": "No posts.",
+                "citations": [],
+            }
+        },
+    }
+    tool_fn = build_x_search_tool(wrapper=mock_wrapper)
+    await tool_fn.coroutine(
+        query="NVDA",
+        enable_image_understanding=True,
+        enable_video_understanding=False,
+    )
+    mock_wrapper.raw_results.assert_awaited_once_with(
+        query="NVDA",
+        from_date=None,
+        to_date=None,
+        handles=None,
+        enable_image_understanding=True,
+        enable_video_understanding=False,
+    )
+
+    mock_wrapper.raw_results.reset_mock()
+    refused, artifact = await tool_fn.coroutine(
+        query="NVDA", enable_video_understanding=0
+    )
+    assert "参数错误" in refused
+    assert "code" not in artifact
+    mock_wrapper.raw_results.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_openclaw_wrapper_puts_media_flags_on_the_bridge_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.tools.web.providers._shared import request_json
+
+    seen: list[dict] = []
+
+    async def record_body(*_args: object, **kwargs: object) -> dict:
+        body = kwargs["json_body"]
+        assert isinstance(body, dict)
+        seen.append(dict(body))
+        return {"ok": True, "provider": "xai", "result": {"details": {}}}
+
+    monkeypatch.setattr(
+        "src.dalton.web_search.x_search.request_json",
+        create_autospec(request_json, side_effect=record_body),
+    )
+    wrapper = OpenClawXSearchWrapper(
+        bridge_url="http://bridge.example",
+        bridge_token="tok",
+    )
+    await wrapper.raw_results("NVDA")
+    assert "enable_image_understanding" not in seen[0]
+    assert "enable_video_understanding" not in seen[0]
+    await wrapper.raw_results(
+        "NVDA",
+        enable_image_understanding=True,
+        enable_video_understanding=False,
+    )
+    assert seen[1]["enable_image_understanding"] is True
+    assert seen[1]["enable_video_understanding"] is False

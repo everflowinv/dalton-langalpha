@@ -852,6 +852,31 @@ export class DataTaskNotificationService {
       };
     }
 
+    const needsPlainFeishu =
+      platform === "feishu" &&
+      planItems.some((it) => it.kind === "text" && it.plain === true);
+    if (
+      needsPlainFeishu &&
+      (typeof readyAdapter.sendTextMessage !== "function" ||
+        typeof readyAdapter.splitTextMessageChunks !== "function")
+    ) {
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: "failed",
+          code: "unsupported_item_kind",
+          message: `Adapter ${platform} does not support plain text delivery.`,
+          run_id: runId,
+          target,
+          platform,
+          items_total: planItems.length,
+          items_sent: 0,
+          items: [],
+        },
+      };
+    }
+
     if (
       plan.target_kind === "group" &&
       typeof readyAdapter.checkTargetLive !== "function"
@@ -912,11 +937,15 @@ export class DataTaskNotificationService {
         groupLiveVerified = true;
       }
 
+      const usePlainFeishu =
+        item.kind === "text" && item.plain === true && platform === "feishu";
       const textChunks =
         item.kind === "feishu_card"
           ? []
           : item.text
-            ? readyAdapter.splitTextChunks(item.text)
+            ? usePlainFeishu
+              ? readyAdapter.splitTextMessageChunks!(item.text)
+              : readyAdapter.splitTextChunks(item.text)
             : [];
       const totalChunks = item.kind === "feishu_card" ? 1 : textChunks.length;
       const hasNonEmptyText =
@@ -1538,6 +1567,12 @@ export class DataTaskNotificationService {
               path: verifiedAttachment.filename,
               status: "sent",
               reason: null,
+            });
+          } else if (usePlainFeishu) {
+            chunkRes = await readyAdapter.sendTextMessage!({
+              targetAddress,
+              recipientPlatformUserId,
+              text: textChunks[i]!,
             });
           } else {
             chunkRes = await readyAdapter.sendTextChunk({

@@ -453,6 +453,34 @@ export async function sendMessageFeishu(
   return toFeishuMessageSendResult(response, target);
 }
 
+export async function sendTextMessageFeishu(
+  client: Lark.Client,
+  params: {
+    to: string;
+    text: string;
+    replyToMessageId?: string | null;
+    replyInThread?: boolean;
+  },
+): Promise<FeishuMessageSendResult> {
+  const { target, receiveIdType, replyToMessageId, replyInThread } =
+    resolveFeishuSendTarget({
+      to: params.to,
+      replyToMessageId: params.replyToMessageId,
+      replyInThread: params.replyInThread,
+    });
+
+  const response = await sendReplyOrFallbackDirect(client, {
+    replyToMessageId,
+    replyInThread,
+    content: JSON.stringify({ text: params.text }),
+    msgType: "text",
+    target,
+    receiveIdType,
+  });
+
+  return toFeishuMessageSendResult(response, target);
+}
+
 export async function sendCardFeishu(
   client: Lark.Client,
   params: {

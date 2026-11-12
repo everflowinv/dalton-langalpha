@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 
 import pytest
 
@@ -106,10 +108,6 @@ def test_profile_absent_is_not_invalid_and_malformed_is() -> None:
         _profile(report_targets=["feishu:chat:oc_msftboard"], failure_targets=[])
     )
     assert err is None and parsed is not None
-    parsed, err = parse_report_profile(
-        _profile(report_targets=[], failure_targets=["discord:user:424242424242424242"])
-    )
-    assert err is None and parsed is not None
 
     for metadata in (
         _profile("other-task"),
@@ -121,6 +119,7 @@ def test_profile_absent_is_not_invalid_and_malformed_is() -> None:
             }
         },
         _profile(report_targets=[], failure_targets=[]),
+        _profile(report_targets=[], failure_targets=["discord:user:424242424242424242"]),
         _profile(report_targets=["discord:user:424242424242424242"]),
         _profile(failure_targets=["feishu:chat:oc_msftboard"]),
         _profile(report_targets=["feishu:chat:oc_msftboard"] * 2),
@@ -369,6 +368,7 @@ def test_public_functions_take_server_identity_and_no_recipient() -> None:
         assert name not in status_names
     assert "cards" in submit_names
     assert "failure_text" in submit_names
+    assert "text" in submit_names
     assert "cards" not in status_names
 
 
@@ -504,3 +504,341 @@ def test_company_tracker_profiles_follow_the_msft_route(profile_id: str) -> None
     assert text_err is None and text is not None
     assert text["content_kind"] == "failure_text"
     assert text["failure_text"] == "Tracker failed. Source https://example.com/status"
+
+
+def _canonical_digest(body: dict) -> str:
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def test_text_body_is_exclusive_bounded_and_keeps_card_hashes() -> None:
+    markdown = "    # Digest\n\n| Ticker | P/E |\n| --- | --- |\n| AAPL | 28 |\n"
+    prepared, err = prepare_automation_report_content(
+        profile="msft-tracker",
+        cards=None,
+        failure_text=None,
+        text=markdown,
+    )
+    assert err is None and prepared is not None
+    assert prepared["content_kind"] == "text"
+    assert prepared["text"] == markdown
+    assert prepared["text"].startswith("    ")
+    assert prepared["cards"] is None
+    assert prepared["failure_text"] is None
+    assert prepared["expected_item_count"] == 1
+    assert prepared["content_sha256"] == _canonical_digest(
+        {
+            "profile": "msft-tracker",
+            "content_kind": "text",
+            "cards": None,
+            "failure_text": None,
+            "text": prepared["text"],
+        }
+    )
+
+    at_limit, limit_err = prepare_automation_report_content(
+        profile="msft-tracker",
+        cards=None,
+        failure_text=None,
+        text="x" * 40000,
+    )
+    assert limit_err is None and at_limit is not None
+    assert len(at_limit["text"]) == 40000
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker",
+            cards=None,
+            failure_text=None,
+            text="x" * 40001,
+        )[1]
+        == "content_too_large"
+    )
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker", cards=None, failure_text=None, text="   "
+        )[1]
+        == "missing_content"
+    )
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker",
+            cards=None,
+            failure_text=None,
+            text=" " + ("x" * 40000),
+        )[1]
+        == "content_too_large"
+    )
+    indented, indent_err = prepare_automation_report_content(
+        profile="msft-tracker",
+        cards=None,
+        failure_text=None,
+        text="    code",
+    )
+    assert indent_err is None and indented is not None
+    assert indented["text"] == "    code"
+    bare, bare_err = prepare_automation_report_content(
+        profile="msft-tracker", cards=None, failure_text=None, text="body"
+    )
+    padded, padded_err = prepare_automation_report_content(
+        profile="msft-tracker", cards=None, failure_text=None, text=" body "
+    )
+    assert bare_err is None and bare is not None
+    assert padded_err is None and padded is not None
+    assert bare["text"] == "body"
+    assert padded["text"] == " body "
+    assert bare["content_sha256"] != padded["content_sha256"]
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker",
+            cards=None,
+            failure_text=None,
+            text="See /tmp/local.md",
+        )[1]
+        == "invalid_text"
+    )
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker",
+            cards=None,
+            failure_text=None,
+            text="IMG: secret",
+        )[1]
+        == "invalid_text"
+    )
+    linked, link_err = prepare_automation_report_content(
+        profile="msft-tracker",
+        cards=None,
+        failure_text=None,
+        text="See https://example.com/status",
+    )
+    assert link_err is None and linked is not None
+    assert linked["text"] == "See https://example.com/status"
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker", cards=None, failure_text=None, text=1
+        )[1]
+        == "invalid_text"
+    )
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker", cards=[_card()], failure_text=None, text="hi"
+        )[1]
+        == "mixed_outcome"
+    )
+    assert (
+        prepare_automation_report_content(
+            profile="msft-tracker", cards=None, failure_text="hi", text="hi"
+        )[1]
+        == "mixed_outcome"
+    )
+    empty_cards_text, empty_err = prepare_automation_report_content(
+        profile="msft-tracker", cards=[], failure_text=None, text="hi"
+    )
+    assert empty_err is None and empty_cards_text is not None
+    assert empty_cards_text["content_kind"] == "text"
+    empty_cards_failure, failure_err = prepare_automation_report_content(
+        profile="msft-tracker", cards=[], failure_text="boom", text=None
+    )
+    assert failure_err is None and empty_cards_failure is not None
+    assert empty_cards_failure["content_kind"] == "failure_text"
+
+    stored_cards, card_err = prepare_automation_report_content(
+        profile="msft-tracker", cards=[_card()], failure_text=None
+    )
+    assert card_err is None and stored_cards is not None
+    card_digest = _canonical_digest(
+        {
+            "profile": "msft-tracker",
+            "content_kind": "cards",
+            "cards": stored_cards["cards"],
+            "failure_text": None,
+        }
+    )
+    assert stored_cards["content_sha256"] == card_digest
+    assert (
+        automation_report_content_sha256(
+            profile="msft-tracker",
+            content_kind="cards",
+            cards=stored_cards["cards"],
+            failure_text=None,
+            text="ignored",
+        )
+        == card_digest
+    )
+    same_words = "same words"
+    failure_digest = _canonical_digest(
+        {
+            "profile": "msft-tracker",
+            "content_kind": "failure_text",
+            "cards": None,
+            "failure_text": same_words,
+        }
+    )
+    assert (
+        automation_report_content_sha256(
+            profile="msft-tracker",
+            content_kind="failure_text",
+            cards=None,
+            failure_text=same_words,
+        )
+        == failure_digest
+    )
+    assert (
+        automation_report_content_sha256(
+            profile="msft-tracker",
+            content_kind="text",
+            cards=None,
+            failure_text=None,
+            text=same_words,
+        )
+        != failure_digest
+    )
+
+    parsed, profile_err = parse_report_profile(_profile())
+    assert profile_err is None and parsed is not None
+    payload = reports._build_payload(
+        profile=parsed,
+        prepared=prepared,
+        report_run_id="text-1",
+        execution_id="11111111-1111-1111-1111-111111111111",
+        owner_user_id="owner",
+        automation_id="22222222-2222-2222-2222-222222222222",
+        targets=["feishu:chat:oc_msftboard"],
+    )
+    assert payload["text"] == prepared["text"]
+    assert payload["content_kind"] == "text"
+    assert payload["expected_item_count"] == 1
+    assert payload["content_sha256"] == prepared["content_sha256"]
+    assert "cards" not in payload
+    assert "failure_text" not in payload
+    assert "failure_target_snapshot" not in payload
+    items, item_err = reports.native_items_from_report_payload(payload)
+    assert item_err is None
+    assert items == [{"item_index": 0, "kind": "text", "text": prepared["text"]}]
+    assert reports._same_saved_body(
+        [{"payload_json": payload}], prepared["content_sha256"]
+    )
+    assert (
+        reports._same_saved_body([{"payload_json": payload}], "0" * 64) is False
+    )
+    assert reports._content_supplied(None, None, "body") is True
+    assert reports._content_supplied(None, None, "   ") is False
+    assert reports._content_supplied(None, None, 1) is True
+
+
+def test_text_targets_parse_and_select_the_text_route() -> None:
+    chat = "feishu:chat:oc_msftboard"
+    discord_user = "discord:user:424242424242424242"
+    channel = "discord:channel:424242424242424242"
+    feishu_user = "feishu:user:ou_analyst"
+    base = {
+        "profile": "msft-tracker",
+        "report_targets": [chat],
+        "failure_targets": [discord_user],
+    }
+    parsed, err = parse_report_profile(
+        {
+            "report_profile": {
+                **base,
+                "text_targets": [discord_user, channel, feishu_user, chat],
+            }
+        }
+    )
+    assert err is None and parsed is not None
+    assert parsed["text_targets"] == [discord_user, channel, feishu_user, chat]
+
+    absent, absent_err = parse_report_profile(_profile())
+    assert absent_err is None and absent is not None
+    assert absent["text_targets"] is None
+    failure_only, failure_only_err = parse_report_profile(
+        _profile(report_targets=[], failure_targets=[discord_user])
+    )
+    assert failure_only is None and failure_only_err == "profile_invalid"
+
+    only_text, only_err = parse_report_profile(
+        {
+            "report_profile": {
+                "profile": "msft-tracker",
+                "report_targets": [],
+                "failure_targets": [],
+                "text_targets": [chat],
+            }
+        }
+    )
+    assert only_err is None and only_text is not None
+    assert only_text["report_targets"] == []
+    assert only_text["text_targets"] == [chat]
+
+    for metadata in (
+        {"report_profile": {**base, "text_targets": ["discord:guild:424242424242424242"]}},
+        {"report_profile": {**base, "text_targets": ["slack:channel:C123"]}},
+        {
+            "report_profile": {
+                **base,
+                "text_targets": [f"discord:user:{str(i).zfill(8)}" for i in range(6)],
+            }
+        },
+        {"report_profile": {**base, "text_targets": [discord_user, discord_user]}},
+        {
+            "report_profile": {
+                "profile": "msft-tracker",
+                "report_targets": [],
+                "failure_targets": [discord_user],
+                "text_targets": [],
+            }
+        },
+    ):
+        assert parse_report_profile(metadata)[1] == "profile_invalid"
+
+    explicit_empty, empty_err = parse_report_profile(
+        {"report_profile": {**base, "text_targets": []}}
+    )
+    assert empty_err is None and explicit_empty is not None
+    assert explicit_empty["text_targets"] == []
+    assert reports._outcome_targets(explicit_empty, "text") == []
+    assert reports._outcome_targets(absent, "text") == [chat]
+    assert reports._outcome_targets(parsed, "text") == [
+        discord_user,
+        channel,
+        feishu_user,
+        chat,
+    ]
+    assert reports._outcome_targets(parsed, "cards") == [chat]
+    assert reports._outcome_targets(parsed, "failure_text") == [discord_user]
+
+    text_payload = {
+        "source": "automation_report",
+        "content_kind": "text",
+        "profile": "msft-tracker",
+        "target_snapshot": [channel],
+    }
+    ok, code = reports.saved_report_target_still_configured(
+        {"metadata": {"report_profile": {**base, "text_targets": [channel]}}},
+        text_payload,
+        channel,
+    )
+    assert ok is True and code == ""
+    removed, removed_code = reports.saved_report_target_still_configured(
+        {"metadata": {"report_profile": {**base, "text_targets": [channel]}}},
+        {**text_payload, "target_snapshot": [chat]},
+        chat,
+    )
+    assert removed is False and removed_code == "target_removed"
+    card_payload = {
+        "source": "automation_report",
+        "content_kind": "cards",
+        "profile": "msft-tracker",
+        "target_snapshot": [chat],
+    }
+    cards_ok, cards_code = reports.saved_report_target_still_configured(
+        {"metadata": {"report_profile": {**base, "text_targets": [channel]}}},
+        card_payload,
+        chat,
+    )
+    assert cards_ok is True and cards_code == ""
+    fallback_ok, fallback_code = reports.saved_report_target_still_configured(
+        {"metadata": _profile()},
+        {**text_payload, "target_snapshot": [chat]},
+        chat,
+    )
+    assert fallback_ok is True and fallback_code == ""

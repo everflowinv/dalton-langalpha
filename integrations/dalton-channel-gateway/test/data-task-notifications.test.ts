@@ -18,6 +18,7 @@ import type { ChannelAdapter } from "../src/channels/adapter.js";
 import { DiscordChannelAdapter, RequestClient } from "../src/channels/discord/index.js";
 import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
+import { FEISHU_TEXT_MESSAGE_MAX_CHARS } from "../src/channels/feishu/format.js";
 import { loadConfig } from "../src/config.js";
 import type {
   DataTaskAuthorizePlanResponse,
@@ -3092,5 +3093,242 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       ackBackendServer.closeAllConnections();
       await closeHttpServer(ackBackendServer);
     }
+  });
+});
+
+const PLAIN_TABLE = "| Ticker | P/E |\n| --- | --- |\n| AAPL | 28.4x |";
+const PLAIN_FEISHU_RECIPIENT = "ou_synth_pm";
+const PLAIN_DISCORD_RECIPIENT = "100000000000000001";
+
+function plainTextPlan(options: {
+  platform: "feishu" | "discord";
+  text: string;
+  plain?: boolean;
+  runId: string;
+}): DataTaskAuthorizePlanResponse {
+  const feishu = options.platform === "feishu";
+  const recipient = feishu ? PLAIN_FEISHU_RECIPIENT : PLAIN_DISCORD_RECIPIENT;
+  return {
+    authorized: true,
+    status: "authorized",
+    run_id: options.runId,
+    job_key: "report-text",
+    owner_user_id: SYNTH_USER_ID,
+    owner_platform_user_id: recipient,
+    platform: options.platform,
+    target_kind: "dm",
+    requested_target: feishu
+      ? "feishu:@me"
+      : `discord:user:${recipient}`,
+    canonical_target_address: feishu ? "feishu:@me" : "discord:@me",
+    recipient_id: recipient,
+    items: [
+      {
+        item_index: 0,
+        delivery_key: `data_task:${options.runId}:${options.platform}:${recipient}:item:0`,
+        kind: "text",
+        text: options.text,
+        ...(options.plain ? { plain: true } : {}),
+      },
+    ],
+  };
+}
+
+function claimedDelivery(
+  platform: "feishu" | "discord",
+  recipient: string,
+): {
+  claim_status: "claimed";
+  platform: "feishu" | "discord";
+  target_address: string;
+  recipient_id: string;
+  is_current: false;
+  home_workspace_id: string;
+  weixin_context_token: null;
+} {
+  return {
+    claim_status: "claimed",
+    platform,
+    target_address: platform === "feishu" ? "feishu:@me" : "discord:@me",
+    recipient_id: recipient,
+    is_current: false,
+    home_workspace_id: "00000000-0000-0000-0000-000000000001",
+    weixin_context_token: null,
+  };
+}
+
+describe("automation report plain text", () => {
+  async function postPlan(
+    adapters: Map<ChannelPlatform, ChannelAdapter>,
+    plan: DataTaskAuthorizePlanResponse,
+    target: string,
+  ): Promise<{
+    status: number;
+    body: DataTaskNotificationResponse;
+    backend: ReturnType<typeof createMockBackend>;
+  }> {
+    const backend = createMockBackend();
+    vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
+      structuredClone(plan),
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue(
+      claimedDelivery(
+        plan.platform === "discord" ? "discord" : "feishu",
+        plan.recipient_id ?? PLAIN_FEISHU_RECIPIENT,
+      ),
+    );
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        DALTON_GATEWAY_MODE: "outgoing",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+      }),
+      backend,
+      adapters,
+    });
+    const listen = await app.start();
+    try {
+      const response = await fetch(
+        `http://${listen.host}:${listen.port}/internal/data-task-notifications`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+          },
+          body: JSON.stringify({ run_id: plan.run_id, target }),
+        },
+      );
+      const body = (await response.json()) as DataTaskNotificationResponse;
+      return { status: response.status, body, backend };
+    } finally {
+      await app.stop();
+    }
+  }
+
+  it("sends a Feishu table as post text when plain is set, and as a card otherwise", async () => {
+    const plainClient = createFakeOutboundLarkClient();
+    const plainAdapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client: plainClient.client,
+    });
+    const plain = await postPlan(
+      new Map<ChannelPlatform, ChannelAdapter>([["feishu", plainAdapter]]),
+      plainTextPlan({
+        platform: "feishu",
+        text: PLAIN_TABLE,
+        plain: true,
+        runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      }),
+      "feishu:@me",
+    );
+    expect(plain.status).toBe(200);
+    expect(plain.body.ok).toBe(true);
+    expect(plain.body.status).toBe("sent");
+    expect(plainClient.sentMessages).toHaveLength(1);
+    expect(plainClient.sentMessages[0]?.msg_type).toBe("text");
+    expect(plainClient.sentMessages[0]?.receive_id).toBe(PLAIN_FEISHU_RECIPIENT);
+    expect(JSON.parse(plainClient.sentMessages[0]?.content ?? "{}")).toEqual({
+      text: PLAIN_TABLE,
+    });
+
+    const cardClient = createFakeOutboundLarkClient();
+    const cardAdapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client: cardClient.client,
+    });
+    const upgraded = await postPlan(
+      new Map<ChannelPlatform, ChannelAdapter>([["feishu", cardAdapter]]),
+      plainTextPlan({
+        platform: "feishu",
+        text: PLAIN_TABLE,
+        runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      }),
+      "feishu:@me",
+    );
+    expect(upgraded.status).toBe(200);
+    expect(upgraded.body.ok).toBe(true);
+    expect(cardClient.sentMessages).toHaveLength(1);
+    expect(cardClient.sentMessages[0]?.msg_type).toBe("interactive");
+  });
+
+  it("chunks a long plain Feishu body as posts and does not build a card", async () => {
+    const { client, sentMessages } = createFakeOutboundLarkClient();
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_synth",
+      appSecret: "sec_synth",
+      outgoingOnly: true,
+      client,
+    });
+    const result = await postPlan(
+      new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapter]]),
+      plainTextPlan({
+        platform: "feishu",
+        text: "a".repeat(FEISHU_TEXT_MESSAGE_MAX_CHARS + 2_000),
+        plain: true,
+        runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+      }),
+      "feishu:@me",
+    );
+    expect(result.body.ok).toBe(true);
+    const texts = sentMessages.map((message) => {
+      expect(message.msg_type).toBe("text");
+      return (JSON.parse(message.content) as { text: string }).text;
+    });
+    expect(texts.map((item) => item.length)).toEqual([
+      FEISHU_TEXT_MESSAGE_MAX_CHARS,
+      2_000,
+    ]);
+    expect(sentMessages.some((message) => message.msg_type === "interactive")).toBe(
+      false,
+    );
+  });
+
+  it("keeps Discord plain text on the 2000-character chunk path", async () => {
+    const adapter = new FakeChannelAdapter("discord", 2000);
+    const result = await postPlan(
+      new Map<ChannelPlatform, ChannelAdapter>([["discord", adapter]]),
+      plainTextPlan({
+        platform: "discord",
+        text: "x".repeat(4001),
+        plain: true,
+        runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4",
+      }),
+      `discord:user:${PLAIN_DISCORD_RECIPIENT}`,
+    );
+    expect(result.body.ok).toBe(true);
+    expect(result.body.status).toBe("sent");
+    expect(adapter.sentTexts.map((item) => item.text.length)).toEqual([
+      2000, 2000, 1,
+    ]);
+    expect(adapter.sentPlainTexts).toEqual([]);
+    expect(adapter.sentTextMessages).toEqual([]);
+    expect(adapter.sentCards).toEqual([]);
+  });
+
+  it("fails a plain Feishu item before claim when the adapter cannot send plain text", async () => {
+    const adapter = new FakeChannelAdapter("feishu");
+    Object.defineProperty(adapter, "sendTextMessage", { value: undefined });
+    const result = await postPlan(
+      new Map<ChannelPlatform, ChannelAdapter>([["feishu", adapter]]),
+      plainTextPlan({
+        platform: "feishu",
+        text: PLAIN_TABLE,
+        plain: true,
+        runId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
+      }),
+      "feishu:@me",
+    );
+    expect(result.status).toBe(200);
+    expect(result.body.ok).toBe(false);
+    expect(result.body.code).toBe("unsupported_item_kind");
+    expect(result.backend.authorizeAndClaimDelivery).not.toHaveBeenCalled();
+    expect(adapter.sentTexts).toEqual([]);
+    expect(adapter.sentCards).toEqual([]);
   });
 });

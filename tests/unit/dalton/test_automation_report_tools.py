@@ -36,7 +36,7 @@ _AUTOMATION = "22222222-2222-4222-8222-222222222222"
 _EXECUTION = "11111111-1111-4111-8111-111111111111"
 _EXECUTION_B = "33333333-3333-4333-8333-333333333333"
 _REPORT = "msft-2026-11-10"
-_CALLER_ARGS = {"action", "report_run_id", "material", "cards", "failure_text"}
+_CALLER_ARGS = {"action", "report_run_id", "material", "cards", "failure_text", "text"}
 _ROLES = ("analyst", "chief_of_staff")
 
 _CARDS = [
@@ -192,6 +192,7 @@ def test_schema_takes_only_the_report_arguments() -> None:
         "material",
         "cards",
         "failure_text",
+        "text",
         "config",
     ]
     for name, field in tool.args_schema.model_fields.items():
@@ -239,6 +240,7 @@ async def test_submit_forwards_config_identity_and_returns_pending_saved_batch(
         "material": "yes",
         "cards": _CARDS,
         "failure_text": None,
+        "text": None,
     }
     _assert_sender_received_only(storage, _EXECUTION)
     status_kwargs = storage.status.await_args.kwargs
@@ -803,3 +805,18 @@ async def test_saved_company_tracker_profile_is_echoed(
     assert payload["status"] == "pending"
     assert payload["delivery_confirmed"] is False
     assert payload["report_run_id"] == _REPORT
+
+
+@pytest.mark.asyncio
+async def test_text_submit_forwards_the_markdown_body(storage: SimpleNamespace) -> None:
+    saved = dict(_PENDING)
+    saved["content_kind"] = "text"
+    saved["payload"] = {"source": "automation_report", "text": "# Hi"}
+    storage.submit.return_value = saved
+    payload = await _invoke(_submit_args(cards=None, failure_text=None, text="# Hi"))
+    assert storage.submit.await_args.kwargs["cards"] is None
+    assert storage.submit.await_args.kwargs["failure_text"] is None
+    assert storage.submit.await_args.kwargs["text"] == "# Hi"
+    _assert_sender_received_only(storage, _EXECUTION)
+    assert payload["content_kind"] == "text"
+    assert payload["payload"]["text"] == "# Hi"

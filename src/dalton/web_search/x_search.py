@@ -65,6 +65,18 @@ X_SUMMARY_TRUNCATED_NOTE = "摘要输出异常，已截断"
 MAX_X_HANDLES = 20
 _X_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
+
+def _optional_x_bool(name: str, value: Any) -> bool | None:
+    """Return a media-understanding flag, or None when the caller omitted it.
+
+    Integers are refused. ``True`` and ``False`` are both forwarded.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be a boolean")
+
 # 生成摘要里的模型控制标记（<|eos|>、<｜eos｜>、<|im_end|>、…）。
 _CONTROL_TOKEN_RE = re.compile(r"<[|｜][A-Za-z0-9_]+[|｜]>")
 # 引号对（直双引号、弯双引号、中文直角双引号）。无来源摘要按"逐对识别"处理：
@@ -634,8 +646,17 @@ class OpenClawXSearchWrapper:
         to_date: Optional[str] = None,
         handles: Optional[List[str]] = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        *,
+        enable_image_understanding: Optional[bool] = None,
+        enable_video_understanding: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Send one X search request to the host-side bridge and return the broker response."""
+        image_flag = _optional_x_bool(
+            "enable_image_understanding", enable_image_understanding
+        )
+        video_flag = _optional_x_bool(
+            "enable_video_understanding", enable_video_understanding
+        )
         payload: Dict[str, Any] = {
             "query": query,
             "timeoutMs": int(timeout_ms),
@@ -646,6 +667,10 @@ class OpenClawXSearchWrapper:
             payload["from_date"] = from_date
         if to_date is not None:
             payload["to_date"] = to_date
+        if image_flag is not None:
+            payload["enable_image_understanding"] = image_flag
+        if video_flag is not None:
+            payload["enable_video_understanding"] = video_flag
 
         endpoint = (
             self._bridge_url
@@ -728,8 +753,11 @@ def build_x_search_tool(
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         handles: Optional[List[str]] = None,
+        enable_image_understanding: Optional[bool] = None,
+        enable_video_understanding: Optional[bool] = None,
     ) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
         """Search X (Twitter) posts for social sentiment, management or KOL remarks, first-hand reactions to breaking events, and original posts.
+        Set `enable_image_understanding` or `enable_video_understanding` only when this call must read images or video; omit both to leave the xAI request unchanged.
 
         Args:
             query: Natural-language topic, ticker, or event to search on X. Put date bounds in `from_date`/`to_date` and account filters in `handles` rather than inside `query`.
@@ -748,6 +776,17 @@ def build_x_search_tool(
             if from_date and to_date and from_date > to_date:
                 raise ValueError("from_date must not be later than to_date")
             normalized_handles = _normalize_handles_param(handles)
+            image_flag = _optional_x_bool(
+                "enable_image_understanding", enable_image_understanding
+            )
+            video_flag = _optional_x_bool(
+                "enable_video_understanding", enable_video_understanding
+            )
+            media_kwargs: Dict[str, Any] = {}
+            if image_flag is not None:
+                media_kwargs["enable_image_understanding"] = image_flag
+            if video_flag is not None:
+                media_kwargs["enable_video_understanding"] = video_flag
 
             api = _get_api_wrapper()
             start_t = time.monotonic()
@@ -756,6 +795,7 @@ def build_x_search_tool(
                 from_date=from_date,
                 to_date=to_date,
                 handles=normalized_handles,
+                **media_kwargs,
             )
             elapsed = time.monotonic() - start_t
             cleaned_results, artifact = map_x_search_response(
