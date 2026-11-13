@@ -395,6 +395,7 @@ class BackgroundSubagentOrchestrator:
             + (" (stopped)" if t.terminal_status == "cancelled" else "")
             for t in sorted_tasks
         )
+        # DALTON-HOOK(user-visible-text): multi-task notice asks to fetch and check, keeps the user's language
         return (
             f"Your background subagent tasks' runs have ended: {task_list}.\n\n"
             f"Call `TaskOutput(task_id=\"...\")` for each finished task's result, "

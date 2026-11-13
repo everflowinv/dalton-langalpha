@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 
 import pytest
 
+# DALTON-HOOK(user-visible-text): builtins imported for the rule-reaches-subagents tests
 from ptc_agent.agent.subagents.builtins import BUILTIN_SUBAGENTS
 from ptc_agent.agent.subagents.compiler import SubagentCompiler
 from ptc_agent.agent.subagents.definition import SubagentDefinition

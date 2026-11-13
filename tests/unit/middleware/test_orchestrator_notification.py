@@ -59,6 +59,7 @@ class TestCheckAndGetNotification:
         assert notification is not None
         assert "Task-abc123" in notification
         assert 'TaskOutput(task_id="abc123")' in notification
+        # DALTON-HOOK(user-visible-text): notice wording pinned below
         assert "has completed" not in notification
         assert (
             "check the result and any files it wrote before telling the user "
