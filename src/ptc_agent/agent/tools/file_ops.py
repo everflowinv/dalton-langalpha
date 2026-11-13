@@ -162,8 +162,10 @@ def create_filesystem_tools(
             requested pages, with a marker giving the offset of the next ones.
 
         Strip the line-number prefix before passing text to Edit.
-        For a long PDF, extract or search its text with code first, then Read only the pages you need.
+        Images do not support cropping through offset or limit. For a dense image, save cropped images from the original with Python when code execution is available, then Read those files; otherwise hand unreadable dense regions to an agent that can run code.
+        For a long PDF, search its extractable text with Python first, then Read the pages that matter. Inspect the rendered page (via Read or a rendered page image) for scanned pages, tables, or any place the extracted text looks wrong.
         """
+        # DALTON-HOOK(dense-image-reading): image offset/limit and the PDF image check above.
         try:
             # Middleware injects the actual content; this return is just a sentinel.
             if file_path.startswith(("http://", "https://")):

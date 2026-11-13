@@ -124,7 +124,10 @@ class TestPerImageBytes:
         assert "scan.png" in note["text"]
         assert "was not sent" in note["text"]
         assert "work/uploads/scan.png" in note["text"]
-        assert "PIL" in note["text"]
+        # DALTON-HOOK(dense-image-reading): the note asks for crops, without repeating that the image was not sent.
+        assert "裁剪块" in note["text"]
+        assert "原图未发送" not in note["text"]
+        assert "当前不能执行代码时，请交给具备代码执行能力的代理生成裁剪块" in note["text"]
         # No image block rides the request.
         assert not any(block.get("type") == "image_url" for block in result[0].content)
         # History keeps what could not be sent.

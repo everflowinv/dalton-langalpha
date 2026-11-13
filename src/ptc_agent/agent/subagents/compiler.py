@@ -321,6 +321,14 @@ class SubagentCompiler:
         if rule not in body:
             body = f"{body.rstrip()}\n\n{rule}" if body.strip() else rule
 
+        # DALTON-HOOK(dense-image-reading): custom_prompt and custom_prompt_template
+        # skip subagent_base. output_guidelines includes this component when that
+        # section is on, and the base includes it otherwise. Append the rendered
+        # component once only when that full text is absent.
+        image_rule = loader.get_component("dense_image_reading").strip()
+        if image_rule not in body:
+            body = f"{body.rstrip()}\n\n{image_rule}" if body.strip() else image_rule
+
         # DALTON-HOOK(subagent-workspace-root): inject workspace absolute root
         # and skills path prefix at the shared exit of all three prompt paths
         # (custom_prompt, custom_prompt_template, and default base template).

@@ -113,7 +113,18 @@ def usable_image(content: bytes, accepted: frozenset[str]) -> bool:
     )
 
 
-_SANDBOX_TAIL = " For fine detail, crop the original in the sandbox."
+# DALTON-HOOK(dense-image-reading): a downscaled view is not the source for dense text.
+# Crop only when this call can run code. With no tool list, one sentence states both.
+def _sandbox_tail(capability: str | None) -> str:
+    """The note after a shrunk image that was still sent, when the original is saved."""
+    if capability == "code":
+        return " 读取密集文字或表格时，从保存的原图裁剪相关区域后查看，并核对转录结果。"
+    if capability is None:
+        return (
+            " 读取密集文字或表格时，若当前可以执行代码，从保存的原图裁剪相关区域后查看并核对转录结果；"
+            "否则把读不清的密集区域交给具备代码执行能力的代理裁剪。"
+        )
+    return " 读不清的密集区域交给具备代码执行能力的代理裁剪。"
 
 # The label an upload saved to the sandbox carries (``inject_multimodal_context``
 # writes it just before the image), the one place its sandbox copy is stated.
@@ -645,9 +656,9 @@ def _fit_under_bytes(
     return None
 
 
-def _note(fitted: _Fitted, in_sandbox: bool) -> dict[str, str]:
+def _note(fitted: _Fitted, in_sandbox: bool, capability: str | None = None) -> dict[str, str]:
     (ow, oh), (w, h) = fitted.original, fitted.size
-    tail = _SANDBOX_TAIL if in_sandbox else ""
+    tail = _sandbox_tail(capability) if in_sandbox else ""
     return {
         "type": "text",
         "text": (
@@ -664,14 +675,16 @@ def _mb(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-def _byte_note(original_data: str, fitted: _Fitted, in_sandbox: bool) -> dict[str, str]:
+def _byte_note(
+    original_data: str, fitted: _Fitted, in_sandbox: bool, capability: str | None = None
+) -> dict[str, str]:
     """The note after a byte-ladder re-encode: what shrank, and by how much."""
     action = (
         "re-encoded to JPEG"
         if fitted.size == fitted.original
         else f"resized to {fitted.size[0]}x{fitted.size[1]} pixels and re-encoded to JPEG"
     )
-    tail = _SANDBOX_TAIL if in_sandbox else ""
+    tail = _sandbox_tail(capability) if in_sandbox else ""
     return {
         "type": "text",
         "text": (
@@ -685,12 +698,14 @@ def _byte_note(original_data: str, fitted: _Fitted, in_sandbox: bool) -> dict[st
 def _too_large_note(name: str, path: str | None, size_bytes: int) -> dict[str, str]:
     """The note an image no ladder step could bring under the ceiling leaves."""
     if path:
+        # DALTON-HOOK(dense-image-reading): crop the saved original; a call that cannot run code hands that crop to an agent that can.
         return {
             "type": "text",
             "text": (
                 f"[Image {name} is too large for this model ({_mb(size_bytes)} even "
-                f"after scaling and re-encoding), so it was not sent. Shrink the copy "
-                f"at {path} with Python (PIL) and view it with Read.]"
+                f"after scaling and re-encoding), so it was not sent. "
+                f"请从保存的原图 {path} 生成裁剪块，逐块查看。"
+                f"当前不能执行代码时，请交给具备代码执行能力的代理生成裁剪块。]"
             ),
         }
     return {
@@ -786,6 +801,8 @@ async def fit_images(
     messages: list,
     accepted: frozenset[str],
     max_side: Callable[[int], int | None],
+    *,
+    capability: str | None = None,
 ) -> tuple[list, frozenset[tuple[int, int]], frozenset[str]]:
     """Fit every image block in ``messages`` to the target's types and side limit.
 
@@ -794,7 +811,9 @@ async def fit_images(
     set from its bytes. ``max_side`` maps the request's image count to the
     limit. A downscaled image is followed by a text block saying so, which
     points at the original when the sandbox holds one: an upload saved there,
-    or a Read by path.
+    or a Read by path. ``capability`` is this call's tool list (``code``,
+    ``image``, ``none``, or None when the list is absent): the crop sentence
+    follows it. None states both the crop and the handoff in one sentence.
 
     DALTON-HOOK(attachment-native-cap): every image is also held to a byte
     ceiling (``_MAX_IMAGE_BYTES``) and the request's images together to a
@@ -976,9 +995,9 @@ async def fit_images(
                 # DALTON-HOOK(attachment-native-cap): a byte-ladder re-encode
                 # says what it did; the pixel note only when that is all.
                 if (i, j) in byte_fit_keys:
-                    blocks.append(_byte_note(payloads[(i, j)][0], fit, in_sandbox))
+                    blocks.append(_byte_note(payloads[(i, j)][0], fit, in_sandbox, capability))
                 elif fit.size != fit.original:
-                    blocks.append(_note(fit, in_sandbox))
+                    blocks.append(_note(fit, in_sandbox, capability))
             elif (mime := relabels.get((i, j))) is not None:
                 data, rebuild = payloads[(i, j)]
                 blocks.append(rebuild(data, mime))

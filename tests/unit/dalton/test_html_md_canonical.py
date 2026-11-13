@@ -92,6 +92,22 @@ def test_user_visible_text_rule_reaches_every_role_and_mode(role, guidance):
     assert "这些内容为英文时" not in text
 
 
+_DENSE_IMAGE = "不得修改转录值来消除差额"
+
+
+@pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
+@pytest.mark.parametrize("guidance", ["lean", "detailed"])
+def test_dense_image_reading_reaches_every_role_and_mode(role, guidance):
+    """DALTON-HOOK(dense-image-reading): the component sits in output guidelines,
+    outside role and guidance fences, so each combination sees it once."""
+    text = get_loader().get_system_prompt(**_SYSTEM, role=role, guidance=guidance)
+    assert text.count(_DENSE_IMAGE) == 1
+    assert text.count("## 密集图片与表格") == 1
+    assert "已复读一致" in text
+    assert "尚未复核" in text
+    assert "无法辨认" in text
+
+
 def test_user_visible_text_rule_when_user_profile_is_empty():
     """An empty profile omits the profile block; the system prompt still has the rule."""
     block = BaselineContextMiddleware(

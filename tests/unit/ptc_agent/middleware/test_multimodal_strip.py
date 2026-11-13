@@ -202,16 +202,15 @@ class TestStripUnsupportedContentBlocks:
         )
         texts = [m.content[1]["text"] for m in result if isinstance(m, ToolMessage)]
 
+        # DALTON-HOOK(dense-image-reading): a URL is not in the workspace. This
+        # call passes no tool list, so the note stays on the generic reading.
         assert texts[0].endswith(f" {PLACEHOLDER_GUIDANCE}]")
         assert texts[1] == (
             "[PDF attached in a prior turn, not visible to the current model. "
-            f"The file is at {url}: download it in the sandbox and extract it yourself "
-            "with Python (a PDF's text or page renders, OCR or image analysis) before "
-            "giving up. If that cannot answer the question, tell the user: an unsupported "
-            "input type means switching to a model that accepts it, a page-limit rejection "
-            "means splitting the document or a longer-context model. Answer in best effort "
-            "otherwise.]"
+            f"文件在 {url}，不在工作区。{PLACEHOLDER_GUIDANCE}]"
         )
+        assert "文件仍在工作区" not in texts[1]
+        assert "先用 Python 提取" not in texts[1]
         # Each guidance is said once, on the first block it applies to.
         assert texts[2] == "[PDF attached in a prior turn, not visible to the current model.]"
 
@@ -463,11 +462,13 @@ class _ModelCallRequest:
     tests' recorded removals.
     """
 
-    def __init__(self, manifest_model, messages, system_message=None, state=None):
+    def __init__(self, manifest_model, messages, system_message=None, state=None, tools=None):
         self.model = types.SimpleNamespace(metadata={"manifest_model": manifest_model})
         self.messages = messages
         self.system_message = system_message
         self.state = state
+        # DALTON-HOOK(dense-image-reading): None means the tool list is absent.
+        self.tools = tools
 
     def override(self, **kwargs):
         clone = _ModelCallRequest.__new__(_ModelCallRequest)
@@ -475,6 +476,7 @@ class _ModelCallRequest:
         clone.messages = kwargs.get("messages", self.messages)
         clone.system_message = kwargs.get("system_message", self.system_message)
         clone.state = kwargs.get("state", self.state)
+        clone.tools = kwargs.get("tools", self.tools)
         return clone
 
 
@@ -592,8 +594,171 @@ class TestTheGuidanceRidesInThePlaceholder:
         placeholder = seen["request"].messages[0].content[1]["text"]
         assert placeholder.startswith("[Image attached in a prior turn, not visible to the current model.")
         assert PLACEHOLDER_GUIDANCE in placeholder
-        assert "extract it yourself" in placeholder
+        # DALTON-HOOK(dense-image-reading): this request exposes no tool list,
+        # so the note does not order a Python extract. The English placeholder
+        # already says the block is not visible.
+        assert "先使用实际可用的文本提取或 OCR（光学字符识别）工具" in placeholder
+        assert "当前模型尚未看到这项内容" not in placeholder
+        assert "先用 Python 提取" not in placeholder
         assert _system_text(seen["request"]) == "prefix"
+
+
+class TestGuidanceFollowsToolCapability:
+    """DALTON-HOOK(dense-image-reading): the note follows the block, vision, and tools.
+
+    An image a text model cannot see is handed off even when the call has
+    Read. A vision model with only Read is told to read the original, not to
+    crop. Code may crop. A PDF the model cannot accept is handed off; only a
+    PDF over the page ceiling is read by page. An unsaved image asks for a
+    new upload.
+    """
+
+    @staticmethod
+    async def _note(tools, *, model="glm-5.2", content=None):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        if content is None:
+            content = [
+                {"type": "text", "text": "Look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]
+        history = [HumanMessage(content=content)]
+        await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest(model, history, tools=tools), handler
+        )
+        blocks = seen["request"].messages[0].content
+        return " ".join(
+            block["text"]
+            for block in blocks
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+
+    @pytest.mark.asyncio
+    async def test_code_tools_may_extract_with_python(self):
+        """Text model, image block, code tools: extract, and cropping may be named."""
+        text = await self._note([{"name": "ExecuteCode"}, {"name": "Read"}])
+        assert "先用 Python 提取" in text
+        assert "裁剪" in text
+        assert "尚未复核" in text
+        assert "具备看图能力的代理" in text
+
+    @pytest.mark.asyncio
+    async def test_a_text_model_with_only_read_hands_an_image_off(self):
+        """Text model, image block, only Read: hand off. Do not tell it to crop or view."""
+        text = await self._note([{"name": "Read"}])
+        assert "具备看图能力的代理" in text
+        assert "当前模型不能查看图片" in text
+        assert "裁剪" not in text
+        assert "先用 Python 提取" not in text
+        assert "Python" not in text
+        assert "图片读取工具" not in text
+        assert "直接读取原图" not in text
+
+    @pytest.mark.asyncio
+    async def test_a_vision_model_with_only_read_is_not_told_to_crop(self):
+        """Vision model, only Read: read the original. The note must not require a crop."""
+        raw = base64.b64encode(b"not an image").decode()
+        text = await self._note(
+            [{"name": "Read"}],
+            model="claude-sonnet-5-5",
+            content=[{
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{raw}"},
+            }],
+        )
+        assert "not visible" in text
+        assert "直接读取原图" in text
+        assert "裁剪" not in text
+        assert "先用 Python 提取" not in text
+        assert "Python" not in text
+        assert "不能查看图片" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_unsupported_pdf_with_only_read_is_handed_off(self):
+        """glm-5.2 cannot accept a PDF. Read must not be told to page through it."""
+        text = await self._note(
+            [{"name": "Read"}],
+            content=[{
+                "type": "file",
+                "base64": "abc",
+                "mime_type": "application/pdf",
+                "filename": "doc.pdf",
+            }],
+        )
+        assert "具备 PDF 读取能力的代理" in text
+        assert "当前模型不支持 PDF" in text
+        assert "按页" not in text
+        assert "分页" not in text
+        assert "裁剪" not in text
+        assert "先用 Python 提取" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_unsupported_pdf_with_code_extracts_then_hands_off(self):
+        text = await self._note(
+            [{"name": "ExecuteCode"}],
+            content=[{
+                "type": "file",
+                "base64": "abc",
+                "mime_type": "application/pdf",
+                "filename": "doc.pdf",
+            }],
+        )
+        assert "具备 PDF 读取能力的代理" in text
+        assert "先用 Python 提取" in text
+        assert "尚未复核" in text
+        assert "按页" not in text
+        assert "分页" not in text
+        assert "裁剪" not in text
+
+    @pytest.mark.asyncio
+    async def test_an_unsaved_image_on_a_text_model_asks_for_a_new_upload(self):
+        """A model switch strips the image. The label names no saved copy."""
+        text = await self._note(
+            [{"name": "ExecuteCode"}, {"name": "Read"}],
+            content=[
+                {"type": "text", "text": "[Attached image: chart.png]"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ],
+        )
+        assert "请用户重新上传" in text
+        assert "先用 Python 提取" not in text
+        assert "裁剪" not in text
+        assert "文件仍在工作区" not in text
+
+    @pytest.mark.asyncio
+    async def test_neither_tool_asks_a_capable_agent(self):
+        text = await self._note([{"name": "web_search"}])
+        assert "请交由具备看图能力的代理读取" in text
+        assert "Python" not in text
+        assert "图片读取工具" not in text
+        assert "裁剪" not in text
+
+    def test_a_url_with_code_is_not_described_as_already_in_the_workspace(self):
+        text = placeholder_guidance("https://example.test/a.png", "code")
+        assert "https://example.test/a.png" in text
+        assert "不在工作区" in text
+        assert "文件仍在工作区" not in text
+        assert "并用 Python 提取" in text
+        assert "当前模型尚未看到这项内容" not in text
+
+    def test_vision_read_only_guidance_does_not_require_a_crop(self):
+        text = placeholder_guidance(
+            "work/shot.png", "image", kind="image", model_sees_images=True
+        )
+        assert "直接读取原图" in text
+        assert "裁剪" not in text
+
+    def test_code_on_an_image_may_name_a_crop(self):
+        text = placeholder_guidance(
+            "work/shot.png", "code", kind="image", model_sees_images=False
+        )
+        assert "裁剪" in text
+        assert "先用 Python 提取" in text
+        assert "尚未复核" in text
 
 
 def _batch(*after_ai):
@@ -787,6 +952,26 @@ class TestPDFPageCeilingIsPerTarget:
             },
         )
         return "_route_200k"
+
+    # DALTON-HOOK(dense-image-reading): over-page PDFs page; unsupported PDFs go to a capable agent
+    @pytest.mark.asyncio
+    async def test_an_over_page_pdf_with_read_is_read_by_page(self, route_200k):
+        """The model accepts PDFs. This file is over the page ceiling, so page it."""
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest(route_200k, [_pdf_block(300)], tools=[{"name": "Read"}]),
+            handler,
+        )
+        text = seen["request"].messages[0].content[1]["text"]
+        assert "分页读取" in text
+        assert "超过当前模型的页数上限" in text
+        assert "具备 PDF 读取能力" not in text
+        assert "先用 Python 提取" not in text
 
     @pytest.mark.asyncio
     async def test_the_same_pdf_is_stripped_for_a_200k_route(self, route_200k):
