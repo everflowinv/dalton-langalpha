@@ -450,6 +450,17 @@ def build_route_probe_spec(
                 "limit": 1,
             },
         )
+    if rid == "discord-history":
+        # Valid short read for contract checks. The health loop does not call it.
+        return (
+            "research",
+            {
+                "route": "discord-history",
+                "operation": "list_messages",
+                "channel_id": "0",
+                "limit": 1,
+            },
+        )
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
@@ -834,6 +845,23 @@ async def _execute_probes(
                 }
 
             tasks.append(asyncio.create_task(_unprobed_gcal()))
+            continue
+
+        if rid == "discord-history":
+            async def _unprobed_discord_history(
+                r_id: str = rid, r_cat: str = cat
+            ) -> dict[str, Any]:
+                return {
+                    "source_id": r_id,
+                    "category": r_cat,
+                    "status": "unprobed",
+                    "latency_ms": 0,
+                    "latest_date": None,
+                    "error_type": "Discord 历史不探测",
+                    "detail": {"reason": "Discord 历史不探测"},
+                }
+
+            tasks.append(asyncio.create_task(_unprobed_discord_history()))
             continue
 
         if rid == "all":

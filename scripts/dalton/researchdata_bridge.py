@@ -10,7 +10,7 @@ Endpoints:
   - `POST /notify`, `POST /feishu/*` (admin-token routes: notification fanout
     and the host-side Feishu OpenAPI proxy)
 
-Pure Python 3.11+ standard library only.
+Pure Python 3.11+ standard library, plus httpx for the discord-history route.
 """
 
 from __future__ import annotations
@@ -170,6 +170,7 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "x-timeline": (60, 60),
     "tmeet": (120, 180),
     "gcal": (90, 120),
+    "discord-history": (30, 60),
 }
 
 BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
@@ -3124,6 +3125,31 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             'research(route="gcal", operation="delete_event", event_id="evt-example-1")',
         ],
     },
+    "discord-history": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["list_messages"],
+        "default_operation": "list_messages",
+        "operation_aliases": {},
+        "accepted_params": ["channel_id", "after", "limit"],
+        "accepted_nested_params": [],
+        "required_params": {"list_messages": ["channel_id"]},
+        "optional_params": ["after", "limit"],
+        "param_formats": {
+            "channel_id": "1-32 位数字的频道雪花 ID，且必须在 DALTON_DISCORD_HISTORY_CHANNELS 白名单",
+            "after": "可选，1-32 位数字的消息雪花 ID 字符串",
+            "limit": "1-100 的整数，默认 100",
+        },
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\", \"data\": {\"messages\": [...], \"has_more\": false, "
+            "\"message_count\": 0}, \"_sources\": [...]}. "
+            "messages 按 id 升序，含 id、timestamp、author_id、author_is_bot、content、attachments、embeds。"
+            "雪花 ID 是字符串。has_more 在 Discord 原始条数等于 limit 时为 true。"
+        ),
+        "examples": [
+            'research(route="discord-history", operation="list_messages", channel_id="0", after="100", limit=100)',
+        ],
+    },
 }
 
 TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
@@ -3141,6 +3167,7 @@ TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
         "funda-ai",
         "tmeet",
         "gcal",
+        "discord-history",
     ),
     "community": ("xueqiu", "employee", "last30days", "x-timeline"),
 }
@@ -3827,7 +3854,7 @@ def _normalize_and_validate_call_args(
             else:
                 normalized["query"] = folded_query
 
-    if not is_comm and route not in {"tmeet", "gcal"}:
+    if not is_comm and route not in {"tmeet", "gcal", "discord-history"}:
         for date_k in _DATE_PARAM_FIELDS:
             raw_date = normalized.get(date_k)
             if raw_date is None:
@@ -4629,6 +4656,7 @@ _FAILURE_STATUSES: frozenset[str] = frozenset(
         "failed",
         "forbidden",
         "unauthorized",
+        "not_authorized",
         "rate_limited",
         "timeout",
         "quota_exceeded",
@@ -5234,6 +5262,7 @@ def _classify_error_category_and_hint(
             "handoff_filtered",
             "auth_expired",
             "unauthorized",
+            "not_authorized",
             "forbidden",
             "quota_exceeded",
             "rate_limited",
@@ -5243,6 +5272,7 @@ def _classify_error_category_and_hint(
             "paid_source_not_allowed",
             "handoff_filtered",
             "unauthorized",
+            "not_authorized",
             "forbidden",
             "auth_expired",
         )
@@ -6400,6 +6430,242 @@ GCAL_CATALOG_ENTRY: dict[str, Any] = {
 }
 
 
+_DISCORD_API = "https://discord.com/api/v10"
+_DISCORD_USER_AGENT = "DaltonResearchDataBridge/1.0"
+_DISCORD_DEFAULT_LIMIT = 100
+_DISCORD_MAX_LIMIT = 100
+_DISCORD_RETRY_CAP_S = 60.0
+_DISCORD_SNOWFLAKE_RE = re.compile(r"^[0-9]{1,32}$")
+_DISCORD_HINT_TOKEN = "桥接进程没有 DALTON_DISCORD_BOT_TOKEN。"
+_DISCORD_HINT_AUTH = "Discord 拒绝了这次读取。"
+_DISCORD_HINT_RATE = "退避一次后仍然被限流。"
+_DISCORD_HINT_UPSTREAM = "Discord 历史读取失败。"
+_DISCORD_HINT_TIMEOUT = "Discord 历史读取超时。"
+_DISCORD_HINT_WHITELIST = "频道不在 DALTON_DISCORD_HISTORY_CHANNELS 白名单。"
+_DISCORD_HINT_CHANNEL = "channel_id 需要是 1 到 32 位数字。"
+_DISCORD_HINT_AFTER = "after 需要是数字雪花 ID 字符串。"
+_DISCORD_HINT_LIMIT = "limit 需要是 1 到 100 的整数。"
+_DISCORD_HINT_OPERATION = "discord-history 只提供 list_messages。"
+
+DISCORD_HISTORY_CATALOG_ENTRY: dict[str, Any] = {
+    "id": "discord-history",
+    "tool": "research",
+    "category": "research",
+    "kind": "bridge_readonly",
+    "name": "Discord channel history",
+    "description": "只读拉取白名单 Discord 频道里、指定雪花 ID 之后的消息。不写消息，不加表情。",
+    "operations": ["list_messages"],
+    "rules": [
+        "不并入 all。",
+        "channel_id 必须在 DALTON_DISCORD_HISTORY_CHANNELS 白名单。",
+        "只读 list_messages。",
+        "凭证不回显。",
+    ],
+}
+
+
+def _discord_proxy(cfg: Any) -> str | None:
+    """Proxy for the Discord REST call. Never log the returned URL."""
+    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    configured = str(getattr(cfg, "subprocess_proxy", "") or "").strip()
+    return configured or None
+
+
+def _discord_whitelist() -> set[str]:
+    raw = os.environ.get("DALTON_DISCORD_HISTORY_CHANNELS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _discord_snowflake(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    if _DISCORD_SNOWFLAKE_RE.fullmatch(text) is None:
+        return None
+    return text
+
+
+def _discord_failure(status: str, error_code: str, hint: str, category: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": status,
+        "error_code": error_code,
+        "error_category": category,
+        "error": hint,
+        "hint": hint,
+        "_discord_hint": hint,
+        "data": None,
+    }
+
+
+def _discord_param_error(hint: str) -> dict[str, Any]:
+    return _discord_failure("invalid_arguments", "invalid_arguments", hint, "参数错误")
+
+
+def _discord_limit(value: Any) -> int:
+    if value is None:
+        return _DISCORD_DEFAULT_LIMIT
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("bad limit")
+    if value < 1 or value > _DISCORD_MAX_LIMIT:
+        raise ValueError("bad limit")
+    return value
+
+
+def _discord_retry_delay(response: Any) -> float:
+    """Seconds to wait after one 429. Header first, then JSON retry_after. The body is not returned."""
+    delay: float | None = None
+    headers = getattr(response, "headers", None)
+    header = ""
+    if headers is not None:
+        try:
+            header = str(headers.get("Retry-After") or "").strip()
+        except Exception:
+            header = ""
+    if header:
+        try:
+            delay = float(header)
+        except ValueError:
+            delay = None
+    if delay is None:
+        payload: Any = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            raw = payload.get("retry_after")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                delay = float(raw)
+    if delay is None:
+        delay = 1.0
+    elif delay < 0:
+        delay = 0.0
+    if delay > _DISCORD_RETRY_CAP_S:
+        delay = _DISCORD_RETRY_CAP_S
+    return delay
+
+
+def _discord_normalize_message(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    message_id = _discord_snowflake(raw.get("id"))
+    if message_id is None:
+        return None
+    author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
+    author_id = _discord_snowflake(author.get("id")) or ""
+    attachments: list[dict[str, Any]] = []
+    raw_attachments = raw.get("attachments")
+    if isinstance(raw_attachments, list):
+        for item in raw_attachments:
+            if not isinstance(item, dict):
+                continue
+            size = item.get("size")
+            attachments.append(
+                {
+                    "id": _discord_snowflake(item.get("id")) or "",
+                    "filename": item.get("filename") if isinstance(item.get("filename"), str) else "",
+                    "content_type": item.get("content_type") if isinstance(item.get("content_type"), str) else "",
+                    "size": size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else 0,
+                    "url": item.get("url") if isinstance(item.get("url"), str) else "",
+                }
+            )
+    embeds: list[dict[str, str]] = []
+    raw_embeds = raw.get("embeds")
+    if isinstance(raw_embeds, list):
+        for item in raw_embeds:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url") if isinstance(item.get("url"), str) else ""
+            title = item.get("title") if isinstance(item.get("title"), str) else ""
+            if not url and not title:
+                continue
+            entry: dict[str, str] = {}
+            if url:
+                entry["url"] = url
+            if title:
+                entry["title"] = title
+            embeds.append(entry)
+    return {
+        "id": message_id,
+        "timestamp": raw.get("timestamp") if isinstance(raw.get("timestamp"), str) else "",
+        "author_id": author_id,
+        "author_is_bot": author.get("bot") is True,
+        "content": raw.get("content") if isinstance(raw.get("content"), str) else "",
+        "attachments": attachments,
+        "embeds": embeds,
+    }
+
+
+def _discord_interpret(response: Any, limit: int, channel_id: str) -> dict[str, Any]:
+    code = getattr(response, "status_code", None)
+    if not isinstance(code, int):
+        logger.warning("discord-history read failed channel=%s error_type=bad_response", channel_id)
+        return _discord_failure("upstream_error", "upstream_error", _DISCORD_HINT_UPSTREAM, "上游不可用")
+    if code == 200:
+        try:
+            raw = response.json()
+        except Exception:
+            logger.warning("discord-history read failed channel=%s http_status=%s", channel_id, code)
+            return _discord_failure("upstream_error", "upstream_error", _DISCORD_HINT_UPSTREAM, "上游不可用")
+        if not isinstance(raw, list):
+            logger.warning("discord-history read failed channel=%s http_status=%s", channel_id, code)
+            return _discord_failure("upstream_error", "upstream_error", _DISCORD_HINT_UPSTREAM, "上游不可用")
+        messages: list[dict[str, Any]] = []
+        for item in raw:
+            normalized = _discord_normalize_message(item)
+            if normalized is not None:
+                messages.append(normalized)
+        messages.sort(key=lambda item: int(item["id"]))
+        return {
+            "ok": True,
+            "status": "ok",
+            "data": {
+                "messages": messages,
+                "has_more": len(raw) == limit,
+                "message_count": len(messages),
+            },
+        }
+    logger.warning("discord-history read failed channel=%s http_status=%s", channel_id, code)
+    if code in (401, 403):
+        return _discord_failure("not_authorized", "not_authorized", _DISCORD_HINT_AUTH, "权限或额度")
+    if code == 429:
+        return _discord_failure("rate_limited", "rate_limited", _DISCORD_HINT_RATE, "权限或额度")
+    return _discord_failure(
+        "upstream_error",
+        "upstream_error",
+        f"Discord 历史读取失败，HTTP 状态 {code}。",
+        "上游不可用",
+    )
+
+
+def _discord_redact(value: Any, token: str) -> Any:
+    if not token:
+        return value
+    if isinstance(value, str):
+        return value.replace(token, "[redacted]")
+    if isinstance(value, list):
+        return [_discord_redact(item, token) for item in value]
+    if isinstance(value, dict):
+        return {key: _discord_redact(item, token) for key, item in value.items()}
+    return value
+
+
+def _discord_messages_url(channel_id: str, *, after: str | None, limit: int) -> str:
+    query: dict[str, str] = {"limit": str(limit)}
+    if after:
+        query["after"] = after
+    return f"{_DISCORD_API}/channels/{channel_id}/messages?{urllib.parse.urlencode(query)}"
+
+
 def _gcal_failure(
     status: str,
     error_code: str,
@@ -6986,6 +7252,8 @@ class ResearchDataBridge:
         self._host_ps_list_fn: Any = None
         self._host_task_command_override: list[str] | None = None
         self._host_abort_before_gate_release: bool = False
+        self._discord_http: Any = None
+        self._discord_sleep: Any = asyncio.sleep
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
@@ -7181,6 +7449,8 @@ class ResearchDataBridge:
                         route_prop["enum"].append("tmeet")
                     if "gcal" not in route_prop["enum"]:
                         route_prop["enum"].append("gcal")
+                    if "discord-history" not in route_prop["enum"]:
+                        route_prop["enum"].append("discord-history")
                 if isinstance(props, dict):
                     props.setdefault(
                         "record_file_id",
@@ -7222,6 +7492,20 @@ class ResearchDataBridge:
                     props.setdefault(
                         "description",
                         {"type": "string", "description": "gcal insert_event description."},
+                    )
+                    props.setdefault(
+                        "channel_id",
+                        {
+                            "type": "string",
+                            "description": "discord-history list_messages: whitelist channel snowflake.",
+                        },
+                    )
+                    props.setdefault(
+                        "after",
+                        {
+                            "type": "string",
+                            "description": "discord-history list_messages: snowflake; return messages newer than this id.",
+                        },
                     )
                     for bound_name in ("start", "end"):
                         bound = props.get(bound_name)
@@ -9389,6 +9673,158 @@ class ResearchDataBridge:
         finished = self._gcal_finish(operation, arguments, payload, calendar_id)
         return self._make_tool_result_response(req_id, finished, is_error=finished.get("ok") is False)
 
+    async def _discord_http_get(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout_s: float,
+    ) -> Any:
+        client = self._discord_http
+        if client is not None:
+            return await client.get(url, headers=headers, timeout=timeout_s)
+        # Imported here so a bridge interpreter without httpx still starts;
+        # only this route then reports an upstream error.
+        import httpx
+
+        proxy = _discord_proxy(self.cfg)
+        async with httpx.AsyncClient(proxy=proxy, trust_env=False, timeout=timeout_s) as owned:
+            return await owned.get(url, headers=headers, timeout=timeout_s)
+
+    def _discord_finish(
+        self,
+        operation: str,
+        arguments: dict[str, Any],
+        payload: dict[str, Any],
+        token: str,
+    ) -> dict[str, Any]:
+        hint = payload.pop("_discord_hint", None)
+        norm = _build_normalized_params_view(arguments)
+        _apply_error_and_empty_contract("research", "discord-history", operation, payload, norm)
+        if isinstance(hint, str) and hint:
+            payload["hint"] = hint
+        declared = source_identity.declare(
+            "research",
+            {
+                "route": "discord-history",
+                "operation": operation,
+                **{
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in {"timeout", "route", "operation"}
+                },
+            },
+            payload,
+        )
+        payload["_declared_sources"] = declared
+        payload["_sources"] = declared
+        redacted = _discord_redact(payload, token)
+        return redacted if isinstance(redacted, dict) else payload
+
+    async def _discord_read(
+        self,
+        channel_id: str,
+        after: str | None,
+        limit: int,
+        timeout_s: float,
+        token: str,
+    ) -> dict[str, Any]:
+        url = _discord_messages_url(channel_id, after=after, limit=limit)
+        headers = {
+            "Authorization": f"Bot {token}",
+            "User-Agent": _DISCORD_USER_AGENT,
+        }
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("discord-history unavailable: httpx is not installed for the bridge interpreter")
+            return _discord_failure("upstream_error", "upstream_error", _DISCORD_HINT_UPSTREAM, "上游不可用")
+        try:
+            response = await self._discord_http_get(url, headers, timeout_s)
+            if getattr(response, "status_code", None) == 429:
+                await self._discord_sleep(_discord_retry_delay(response))
+                response = await self._discord_http_get(url, headers, timeout_s)
+        except httpx.TimeoutException:
+            logger.warning(
+                "discord-history read failed channel=%s error_type=TimeoutException",
+                channel_id,
+            )
+            return _discord_failure("timeout", "timeout", _DISCORD_HINT_TIMEOUT, "上游不可用")
+        except httpx.HTTPError:
+            logger.warning(
+                "discord-history read failed channel=%s error_type=HTTPError",
+                channel_id,
+            )
+            return _discord_failure("upstream_error", "upstream_error", _DISCORD_HINT_UPSTREAM, "上游不可用")
+        return _discord_interpret(response, limit, channel_id)
+
+    async def _handle_discord_history_call(
+        self,
+        req_id: Any,
+        arguments: dict[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        operation = str(arguments.get("operation") or "list_messages").strip() or "list_messages"
+        token = os.environ.get("DALTON_DISCORD_BOT_TOKEN", "").strip()
+        if operation != "list_messages":
+            payload = _discord_param_error(_DISCORD_HINT_OPERATION)
+        else:
+            channel_raw = arguments.get("channel_id")
+            channel_id = channel_raw.strip() if isinstance(channel_raw, str) else ""
+            if _DISCORD_SNOWFLAKE_RE.fullmatch(channel_id) is None:
+                payload = _discord_param_error(_DISCORD_HINT_CHANNEL)
+            elif channel_id not in _discord_whitelist():
+                payload = _discord_param_error(_DISCORD_HINT_WHITELIST)
+            else:
+                after_raw = arguments.get("after")
+                if after_raw is None or (isinstance(after_raw, str) and not after_raw.strip()):
+                    after = None
+                    after_ok = True
+                elif isinstance(after_raw, str) and _DISCORD_SNOWFLAKE_RE.fullmatch(after_raw.strip()) is not None:
+                    after = after_raw.strip()
+                    after_ok = True
+                else:
+                    after = None
+                    after_ok = False
+                if not after_ok:
+                    payload = _discord_param_error(_DISCORD_HINT_AFTER)
+                else:
+                    try:
+                        limit: int | None = _discord_limit(arguments.get("limit"))
+                    except ValueError:
+                        limit = None
+                    if limit is None:
+                        payload = _discord_param_error(_DISCORD_HINT_LIMIT)
+                    elif not token:
+                        payload = _discord_failure(
+                            "source_missing",
+                            "source_missing",
+                            _DISCORD_HINT_TOKEN,
+                            "上游不可用",
+                        )
+                    else:
+                        try:
+                            payload = await self._discord_read(
+                                channel_id,
+                                after,
+                                limit,
+                                float(eff_timeout),
+                                token,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - keep the token out of the envelope
+                            logger.warning(
+                                "discord-history read failed channel=%s error_type=%s",
+                                channel_id,
+                                type(exc).__name__,
+                            )
+                            payload = _discord_failure(
+                                "upstream_error",
+                                "upstream_error",
+                                _DISCORD_HINT_UPSTREAM,
+                                "上游不可用",
+                            )
+        finished = self._discord_finish(operation, arguments, payload, token)
+        return self._make_tool_result_response(req_id, finished, is_error=finished.get("ok") is False)
+
     def _validate_and_build_community_cmd(
         self,
         route: str,
@@ -10922,6 +11358,8 @@ class ResearchDataBridge:
             return await self._handle_tmeet_call(req_id, arguments, eff_timeout)
         if tool_name == "research" and route == "gcal":
             return await self._handle_gcal_call(req_id, arguments, eff_timeout)
+        if tool_name == "research" and route == "discord-history":
+            return await self._handle_discord_history_call(req_id, arguments, eff_timeout)
         call_args = dict(arguments)
         if tool_name == "catalog":
             call_args.pop("route", None)
@@ -11480,6 +11918,8 @@ class ResearchDataBridge:
                                 kept_routes.append(dict(TMEET_CATALOG_ENTRY))
                             if "gcal" not in research_ids:
                                 kept_routes.append(dict(GCAL_CATALOG_ENTRY))
+                            if "discord-history" not in research_ids:
+                                kept_routes.append(dict(DISCORD_HISTORY_CATALOG_ENTRY))
                         if include_community:
                             for comm_id in ("xueqiu", "employee", "last30days", "x-timeline"):
                                 if comm_id not in seen_comm and comm_id not in handoff:

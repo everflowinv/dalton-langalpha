@@ -1143,6 +1143,51 @@ def _declare_gcal(
     return out[:MAX_SOURCES_PER_CALL]
 
 
+def _declare_discord_history(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    channel = str(arguments.get("channel_id") or "").strip() or "channel"
+    raw_data = payload.get("data")
+    rows: Any = None
+    if isinstance(raw_data, dict) and isinstance(raw_data.get("messages"), list):
+        rows = raw_data.get("messages")
+    elif isinstance(inner, dict) and isinstance(inner.get("messages"), list):
+        rows = inner.get("messages")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        message_id = str(item.get("id") or "").strip()
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        content = str(item.get("content") or "").strip()
+        timestamp = str(item.get("timestamp") or "").strip()
+        as_of = timestamp[:10] if len(timestamp) >= 10 and timestamp[:4].isdigit() else fallback_as_of
+        out.append(
+            _make_entry(
+                document_id=f"discord-history:{channel}:{message_id}",
+                route="discord-history",
+                identity="internal_note",
+                publisher="Discord",
+                title=content or f"Discord {message_id}",
+                as_of=as_of or fallback_as_of,
+                as_of_basis="publish_time",
+                source_type="community_post",
+                private=True,
+            )
+        )
+        if len(out) >= MAX_SOURCES_PER_CALL:
+            break
+    return out[:MAX_SOURCES_PER_CALL]
+
+
 def _declare_x_timeline(
     arguments: dict[str, Any],
     payload: dict[str, Any],
@@ -1326,5 +1371,7 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
         return _declare_tmeet(args, payload, inner, fallback_as_of)
     if route == "gcal":
         return _declare_gcal(args, payload, inner, fallback_as_of)
+    if route == "discord-history":
+        return _declare_discord_history(args, payload, inner, fallback_as_of)
 
     return []

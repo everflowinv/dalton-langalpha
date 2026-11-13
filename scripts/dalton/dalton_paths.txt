@@ -396,3 +396,8 @@ tests/unit/dalton/test_agentturn_ai_app.py
 plugins/dalton/skills/dalton-richard-earnings/
 tests/unit/dalton/test_agentturn_richard_earnings.py
 tests/unit/dalton/test_researchdata_bridge_gcal.py
+
+# OC-1 Discord wiki auto-ingest (host discord-history route).
+plugins/dalton/skills/dalton-wiki-auto-ingest/
+tests/unit/dalton/test_agentturn_wiki_ingest.py
+tests/unit/dalton/test_researchdata_bridge_discord_history.py
