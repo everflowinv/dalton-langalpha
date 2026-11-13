@@ -1578,8 +1578,8 @@ async def test_fix1_item1_xreach_version_strips_credentials_and_all_bridge_subpr
                 f"{mod_name}:{node.lineno} ({call_name}) must explicitly pass `env=` keyword argument"
             )
 
-    # DALTON-HOOK(data-jobs): 12 sites in researchdata_bridge.py + 2 sites in asr_jobs.py = 14 sites total
-    assert len(found_sites) == 14
+    # DALTON-HOOK(data-jobs): 13 sites in researchdata_bridge.py + 2 sites in asr_jobs.py = 15 sites total
+    assert len(found_sites) == 15
 
     # 2. Verify `probe_xreach_version` (`/healthz` xreach --version) strips all 7 ASR/TOS credentials
     creds = _test_credentials()

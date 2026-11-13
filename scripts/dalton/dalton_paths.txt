@@ -378,3 +378,7 @@ tests/unit/dalton/test_agentturn_vip_news.py
 # OC-1 Mark new-energy and China-ADR weekly (original + restyle).
 plugins/dalton/skills/dalton-mark-weekly-newenergy/
 tests/unit/dalton/test_agentturn_mark_weekly.py
+
+# OC-1 Tencent Meeting weekly minutes (host tmeet route).
+plugins/dalton/skills/dalton-tmeet-weekly-minutes/
+tests/unit/dalton/test_agentturn_tmeet.py
