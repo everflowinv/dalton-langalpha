@@ -8510,3 +8510,36 @@ async def test_runner_wrapper_safe_atomic_writes_preserve_json_format_and_reject
     assert wrap_res.exit_code == 1
     assert outside_file.exists()
     assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'
+
+
+def test_prune_old_freeze_slots_keeps_newest_and_current(tmp_path: Path) -> None:
+    from src.dalton.data_jobs.freeze import prune_old_freeze_slots
+
+    job_dir = tmp_path / ".dalton-freeze" / "job"
+    names = [
+        "2026-11-10T09:32:00Z",
+        "2026-11-11T09:32:00.425835Z",
+        "2026-11-12T09:32:00Z",
+        "2026-11-13T02:10:00Z",
+    ]
+    for name in names:
+        (job_dir / name).mkdir(parents=True)
+        (job_dir / name / "done.json").write_text("{}", encoding="utf-8")
+    (job_dir / "notes").mkdir()
+    outside = tmp_path / "outside-slot"
+    outside.mkdir()
+    (job_dir / "2026-11-01T00:00:00Z").symlink_to(outside, target_is_directory=True)
+
+    removed = prune_old_freeze_slots(job_dir, keep=2, current_slot="2026-11-13T02:10:00Z")
+
+    assert removed == ["2026-11-11T09:32:00.425835Z", "2026-11-10T09:32:00Z"]
+    assert sorted(p.name for p in job_dir.iterdir()) == [
+        "2026-11-01T00:00:00Z",
+        "2026-11-12T09:32:00Z",
+        "2026-11-13T02:10:00Z",
+        "notes",
+    ]
+    assert outside.is_dir()
+    # The slot just written survives even when it is not among the newest.
+    removed_again = prune_old_freeze_slots(job_dir, keep=1, current_slot="2026-11-12T09:32:00Z")
+    assert removed_again == []
