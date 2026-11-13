@@ -5,6 +5,8 @@ description: "无人值守的 Discord wiki（知识库）资料入库：按频�
 
 # Discord wiki 资料自动入库
 
+Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
+
 无人值守。不提问，不创建子任务。不对 Discord 消息加表情。本轮只处理自动化指令里写明的那一个频道。
 
 两条自动化共用本技能。频道 ID 和发送者策略由自动化指令写明，作为参数传给下面的脚本；`report_run_id` 里的香港日期由脚本 `summary` 自动生成。接收方在自动化配置的 `metadata.report_profile`（`wiki-auto-ingest`）里定义。技能正文和 `automation_report` 参数都不写接收方。
