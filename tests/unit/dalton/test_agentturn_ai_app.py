@@ -137,7 +137,7 @@ def test_frontmatter_registry_and_profile() -> None:
     assert description == read_skill_description(SKILL_NAME)
     assert len(description) <= 120
     assert (SKILL_NAME, None, ()) in _DALTON_SKILL_SPECS
-    assert len(_DALTON_SKILL_SPECS) == 44
+    assert len(_DALTON_SKILL_SPECS) == 45
     assert PROFILE in REPORT_PROFILES
 
 

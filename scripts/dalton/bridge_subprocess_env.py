@@ -58,6 +58,7 @@ ASR_CREDENTIAL_ENV_KEYS: frozenset[str] = frozenset(
         "DALTON_BROKER_TOKEN",
         "DALTON_BROKER_TOKEN_PATH",
         "DALTON_WEB_SEARCH_BRIDGE_TOKEN",
+        "DALTON_DISCORD_BOT_TOKEN",
     }
 )
 

@@ -93,6 +93,7 @@ REPORT_PROFILES = frozenset(
         "tmeet-weekly-minutes",
         "ai-app-weekly",
         "richard-earnings",
+        "wiki-auto-ingest",
     }
 )
 MAX_CARDS = 20
