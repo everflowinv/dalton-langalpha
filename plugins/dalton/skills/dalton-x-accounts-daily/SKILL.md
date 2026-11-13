@@ -156,6 +156,6 @@ automation_report(action="status", report_run_id=RUN_ID)
 
 窗口内没有新帖也提交这张卡片，栏目里写「过去 24 小时内没有新推文」。不要改成静默。
 
-返回里的 `report_run_id` 一致、`content_kind` 为 `cards`、`ok` 为 true、`delivery_confirmed` 为 true、`status` 为 `sent` 时，最终回复只写 `NO_REPLY`。未确认就用同一标识和同一份 `cards` 再提交。同一 `report_run_id` 已保存不同正文时返回 `content_conflict`，不要改卡片，也不要换第二个标识。`not_automation_run` 时停止，最终回复说明本次不是自动化运行，不附日报正文。
+渲染（`render`）返回 `card_conflict`（卡片文件冲突）时，禁止删除或覆盖已有卡片文件（不要调用 `unlink` 删除文件，也不要换路径重写）：先读已保存的正文（`summary.md`）、卡片（`card.json`）和 `automation_report(action="status", report_run_id=RUN_ID)` 的发送状态；若状态已是已发送（`status="sent"` 且 `delivery_confirmed=true`），最终回复直接写 `NO_REPLY`；若尚未确认发送，保持原采集窗口（`start_iso` / `end_iso`），直接用已保存的 `card.json` 和同一 `report_run_id`（`x-accounts-daily-<summary_date>`）调用 `automation_report(action="submit", ...)`。提交返回里的 `report_run_id` 一致、`content_kind` 为 `cards`、`ok` 为 true、`delivery_confirmed` 为 true、`status` 为 `sent` 时，最终回复只写 `NO_REPLY`；未确认就用同一标识和同一份 `cards` 再提交。同一 `report_run_id` 已保存不同正文时返回 `content_conflict`（正文冲突），不要改卡片，也不要换第二个标识。`not_automation_run`（非自动化运行）时停止，最终回复说明本次不是自动化运行，不附日报正文。
 
 提交失败时保留临时文件。再提交一行 `failure_text`。这行也保存失败时，最终回复只写这行错误。不要发第二份正文。

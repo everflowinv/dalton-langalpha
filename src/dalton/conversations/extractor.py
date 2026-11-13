@@ -412,6 +412,138 @@ def normalize_tickers_and_entities(
     return tickers, entities
 
 
+_SPEAKER_LINE_RE = re.compile(
+    r"(?m)^[ \t]*(?:[-*][ \t]+)?(?P<label>[^:：\n]{1,40})[:：][ \t]*\S"
+)
+_GENERIC_LABELS = frozenset({
+    "结论", "摘要", "备注", "说明", "更新", "原因", "风险", "目标", "观点",
+    "要点", "计划", "收入", "利润", "背景", "建议", "总结", "影响", "进展",
+    "现状", "标题", "概述", "重点", "下一步", "问题", "机会", "展望", "评论",
+    "分析", "对策", "措施", "公司", "产品", "行业", "市场", "业务", "价格",
+    "需求", "供给", "竞争", "估值", "数据", "时间", "日期", "地点", "来源",
+    "链接", "主题", "会议", "客户", "订单", "毛利", "指引", "催化剂", "结果",
+    "转写", "转发", "纪要", "说话人", "引文", "原文",
+    "note", "notes", "summary", "update", "reason", "risk", "target", "view",
+    "plan", "conclusion", "revenue", "profit", "outlook", "http", "https",
+    "company", "product", "market", "price", "demand", "supply", "data",
+    "date", "time", "source", "link", "topic", "guidance", "margin",
+    "transcript", "forwarded", "quote",
+})
+_MATERIAL_MARKER_RE = re.compile(
+    r"转写|转发|说话人|纪要|WEBVTT|transcript|forwarded",
+    re.IGNORECASE,
+)
+
+
+def _plain_label(label: str) -> str:
+    """Drop Markdown emphasis so ``**观点**`` is classified as a heading."""
+    return label.replace("*", "").replace("_", "").strip()
+
+
+def _label_is_speaker(label: str) -> bool:
+    text = _plain_label(label)
+    if not text or len(text) > 40:
+        return False
+    lowered = text.casefold()
+    if lowered in _GENERIC_LABELS or lowered.startswith("http") or "/" in text:
+        return False
+    return True
+
+
+def _speaker_spans(text: str) -> list[tuple[int, int, str]]:
+    body = text or ""
+    marks = [
+        (match.start(), _plain_label(match.group("label")))
+        for match in _SPEAKER_LINE_RE.finditer(body)
+        if _label_is_speaker(match.group("label"))
+    ]
+    spans: list[tuple[int, int, str]] = []
+    for index, (start, label) in enumerate(marks):
+        end = marks[index + 1][0] if index + 1 < len(marks) else len(body)
+        spans.append((start, end, label))
+    return spans
+
+
+def _body_is_multi_speaker_transcript(text: str) -> bool:
+    """True only when the body is explicitly a transcript and has two speakers.
+
+    A marker alone (「看了下专家纪要」) or two heading-like labels alone
+    (「收入 / 利润」) does not reassign the author. Attachments are not a marker.
+    """
+    if not _MATERIAL_MARKER_RE.search(text or ""):
+        return False
+    # Two distinct speakers: one label repeated is a list, not a conversation.
+    return len({label for _, _, label in _speaker_spans(text)}) >= 2
+
+
+def _viewpoint_author(text: str, quote: str | None) -> str:
+    spans = _speaker_spans(text)
+    if not spans:
+        return "未识别"
+    quote_s = str(quote or "").strip()
+    if not quote_s:
+        return spans[0][2] if len(spans) == 1 else "未识别"
+    body = text or ""
+    positions = [m.start() for m in re.finditer(re.escape(quote_s), body)]
+    norm_quote = normalize_whitespace(quote_s)
+    # Every occurrence counts, exact or whitespace-equivalent (as verify_verbatim_quote
+    # treats them): a quote said by two speakers has no single author.
+    owners = [
+        label
+        for start, end, label in spans
+        if norm_quote and norm_quote in normalize_whitespace(body[start:end])
+    ]
+    owners += [
+        label
+        for pos in positions
+        for start, end, label in spans
+        if not (end <= pos or start >= pos + len(quote_s))
+    ]
+    unique: list[str] = []
+    for label in owners:
+        if label not in unique:
+            unique.append(label)
+    if len(unique) == 1:
+        return unique[0]
+    return "未识别"
+
+
+def _split_uploaded_material(
+    speaker: dict[str, Any],
+    source_event: dict[str, Any],
+    quote: str | None,
+) -> dict[str, Any]:
+    """Keep the message sender off the viewpoint when the text is someone else's.
+
+    ``speaker.role`` stays ``participant``: ``dalton_conversation_cards.speaker_role``
+    only allows owner, participant, and agent. ``uploaded_by`` is the sender.
+    """
+    if speaker.get("role") == "agent":
+        return speaker
+    text = str(source_event.get("text") or "")
+    has_upload = bool(source_event.get("attachments") or source_event.get("files"))
+    reattribute = _body_is_multi_speaker_transcript(text)
+    if not reattribute and not has_upload:
+        return speaker
+    uploaded_by = {
+        "name": speaker.get("name"),
+        "role": speaker.get("role"),
+        "is_owner": bool(speaker.get("is_owner")),
+        "sender_id_hash": speaker.get("sender_id_hash"),
+    }
+    if not reattribute:
+        # A file alone has no speaker structure: the author stays the sender.
+        return {**speaker, "uploaded_by": uploaded_by}
+    return {
+        "sender_id_hash": speaker.get("sender_id_hash") or "unknown",
+        "name": _viewpoint_author(text, quote),
+        "is_owner": False,
+        "role": "participant",
+        "material": True,
+        "uploaded_by": uploaded_by,
+    }
+
+
 def enforce_speaker_and_agent_citation(
     card_type: str,
     cited_sources: list[Any] | None,
@@ -469,6 +601,7 @@ def enforce_speaker_and_agent_citation(
             if not all_verified:
                 eff_type = "opinion"
 
+    speaker = _split_uploaded_material(speaker, source_event, quote)
     return speaker, eff_type, cleaned_sources
 
 
@@ -4694,6 +4827,11 @@ async def extract_segment_cards(
             "date_et": ev_date_et,
             "speaker": speaker,
             "speaker_role": speaker["role"],
+            **(
+                {"uploaded_by": speaker["uploaded_by"]}
+                if isinstance(speaker.get("uploaded_by"), dict)
+                else {}
+            ),
             "tickers": tickers,
             "entities": entities,
             "sectors": sectors,

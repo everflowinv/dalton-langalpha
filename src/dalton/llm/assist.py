@@ -133,6 +133,27 @@ async def resolve_assist_fallback_model(
     return models[0] if models else None
 
 
+def _sum_usage(left: Any, right: Any) -> dict[str, Any]:
+    """Add numeric usage counters from two calls. Booleans stay with the later call."""
+    first = dict(left or {}) if isinstance(left, dict) else {}
+    second = dict(right or {}) if isinstance(right, dict) else {}
+    merged: dict[str, Any] = {}
+    for key in set(first) | set(second):
+        av = first.get(key)
+        bv = second.get(key)
+        if isinstance(av, bool) or isinstance(bv, bool):
+            merged[key] = bv if bv is not None else av
+        elif isinstance(av, (int, float)) and isinstance(bv, (int, float)):
+            merged[key] = av + bv
+        elif isinstance(av, (int, float)):
+            merged[key] = av
+        elif isinstance(bv, (int, float)):
+            merged[key] = bv
+        else:
+            merged[key] = bv if bv is not None else av
+    return merged
+
+
 def _has_stream_output_started(comp: Any) -> bool:
     """Return True if the call already started streaming or produced output before failing."""
     if getattr(comp, "stream_started", False):
@@ -196,6 +217,20 @@ def _extract_json_dict(raw_data: Any, raw_text: str | None) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError(f"Expected JSON object, got {type(parsed).__name__}")
     return parsed
+
+
+def _parse_assist_payload(comp: Any, schema: dict[str, Any] | None) -> dict[str, Any]:
+    """Parse and schema-check one completion. Raises only structured-output errors."""
+    parsed = _extract_json_dict(comp.data, comp.text)
+    if isinstance(schema, dict) and schema:
+        parsed = _normalize_schema_enums(parsed, schema)
+        jsonschema.validate(instance=parsed, schema=schema)
+    return parsed
+
+
+# JSONDecodeError is a ValueError; both are structured-output failures, as is a
+# schema ValidationError. Other exceptions (timeouts, IO) are not retried.
+_STRUCTURED_OUTPUT_ERRORS = (json.JSONDecodeError, jsonschema.ValidationError, ValueError)
 
 
 def _normalize_schema_enums(instance: Any, schema: Any) -> Any:
@@ -270,6 +305,8 @@ async def assist_json(
     comp: Any = None
 
     try:
+        carried_cost = 0.0
+        carried_usage: dict[str, Any] = {}
         resolved_or_coro = resolve_assist_model(
             role=role, explicit_model=model, user_id=user_id
         )
@@ -443,6 +480,9 @@ async def assist_json(
         used_model = comp.model or resolved_model
         is_cached = bool(getattr(comp, "cached", False) or getattr(comp, "replayed", False))
         is_replayed = bool(getattr(comp, "replayed", False) or getattr(comp, "cached", False))
+        # Kept across a successful repair so the first call is not dropped when `comp` is replaced.
+        carried_cost = 0.0
+        carried_usage: dict[str, Any] = {}
 
         if not comp.ok:
             logger.warning(
@@ -467,17 +507,101 @@ async def assist_json(
                 error_kind=getattr(comp, "error_kind", None),
             )
 
-        parsed = _extract_json_dict(comp.data, comp.text)
-        if isinstance(schema, dict) and schema:
-            parsed = _normalize_schema_enums(parsed, schema)
-            jsonschema.validate(instance=parsed, schema=schema)
+        try:
+            parsed = _parse_assist_payload(comp, schema)
+        except _STRUCTURED_OUTPUT_ERRORS as parse_exc:
+            # One repair send. A different system prompt and scope_ref make a new
+            # journal invocation, so the cached bad JSON is not replayed. Past the
+            # deadline nothing new may be sent. An upstream failure of the repair
+            # call keeps the original parse error_kind.
+            if _past_deadline():
+                raise
+            repair_system = (
+                f"{system_prompt}\n\n"
+                "上一次输出无法解析为符合 Schema 的 JSON。"
+                "请只修正 JSON 结构，不要改写被审查或被处理的原文，"
+                "不要输出 Markdown 代码块或额外解释。\n"
+                f"解析错误：{type(parse_exc).__name__}: "
+                f"{sanitize_error_text(parse_exc, max_len=300)}"
+            )
+            logger.info(
+                "[DaltonAssist] task=%s model=%s structured output unparseable (%s); one repair retry",
+                task,
+                used_model,
+                type(parse_exc).__name__,
+            )
+            try:
+                comp_repair = await dalton_complete(
+                    llm_service=llm_service,
+                    user_id=user_id,
+                    system_prompt=repair_system,
+                    user_prompt=payload_json,
+                    scope_ref=f"{eff_scope}:parse_repair",
+                    purpose=f"assist.{task}",
+                    request_model=resolved_model,
+                    response_schema=schema,
+                    slot="background",
+                    timeout_s=timeout_s,
+                    deadline=deadline,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    resend_indeterminate=False,
+                    resend_max_attempts=None,
+                    raise_on_error=False,
+                    persist_raw=persist_raw,
+                    skip_journal=skip_journal,
+                )
+            except Exception as repair_call_exc:
+                logger.warning(
+                    "[DaltonAssist] task=%s model=%s parse-repair call failed (%s); keeping %s",
+                    task,
+                    used_model,
+                    type(repair_call_exc).__name__,
+                    type(parse_exc).__name__,
+                )
+                raise parse_exc from repair_call_exc
+            # A cached or replayed first response was billed when it was first made;
+            # only a live first call adds to this invocation's cost and usage.
+            first_live = not (getattr(comp, "cached", False) or getattr(comp, "replayed", False))
+            first_cost = float(comp.cash_usd or 0.0) if first_live else 0.0
+            first_usage = dict(getattr(comp, "usage", None) or {}) if first_live else {}
+            if not comp_repair.ok:
+                safe_parse = sanitize_error_text(parse_exc, max_len=200)
+                repair_cost = float(getattr(comp_repair, "cash_usd", 0.0) or 0.0)
+                return AssistResult(
+                    ok=False,
+                    data=None,
+                    error=safe_parse,
+                    model=getattr(comp_repair, "model", None) or used_model,
+                    cost_usd=first_cost + repair_cost,
+                    cached=bool(
+                        getattr(comp_repair, "cached", False)
+                        or getattr(comp_repair, "replayed", False)
+                    ),
+                    replayed=bool(
+                        getattr(comp_repair, "replayed", False)
+                        or getattr(comp_repair, "cached", False)
+                    ),
+                    status=getattr(comp_repair, "status", None) or "error",
+                    usage=_sum_usage(first_usage, getattr(comp_repair, "usage", None)),
+                    error_kind=type(parse_exc).__name__,
+                )
+            carried_cost = first_cost
+            carried_usage = first_usage
+            comp = comp_repair
+            used_model = comp.model or resolved_model
+            is_cached = bool(getattr(comp, "cached", False) or getattr(comp, "replayed", False))
+            is_replayed = bool(getattr(comp, "replayed", False) or getattr(comp, "cached", False))
+            parsed = _parse_assist_payload(comp, schema)
 
+        billed_cost = carried_cost + float(comp.cash_usd or 0.0)
+        billed_usage = _sum_usage(carried_usage, getattr(comp, "usage", None))
         logger.info(
             "[DaltonAssist] task=%s model=%s elapsed_ms=%d cost_usd=%.6f cached=%s status=ok",
             task,
             used_model,
             elapsed_ms,
-            comp.cash_usd,
+            billed_cost,
             is_cached,
         )
         return AssistResult(
@@ -485,11 +609,11 @@ async def assist_json(
             data=parsed,
             error=None,
             model=used_model,
-            cost_usd=comp.cash_usd,
+            cost_usd=billed_cost,
             cached=is_cached,
             replayed=is_replayed,
             status="ok",
-            usage=dict(getattr(comp, "usage", None) or {}),
+            usage=billed_usage,
             error_kind=getattr(comp, "error_kind", None),
         )
     except Exception as exc:
@@ -509,8 +633,13 @@ async def assist_json(
             if comp is not None
             else False
         )
-        err_usage = dict(getattr(comp, "usage", None) or {}) if comp is not None else {}
-        err_cost = float(getattr(comp, "cash_usd", 0.0) or 0.0) if comp is not None else 0.0
+        err_usage = _sum_usage(
+            carried_usage,
+            getattr(comp, "usage", None) if comp is not None else {},
+        )
+        err_cost = carried_cost + (
+            float(getattr(comp, "cash_usd", 0.0) or 0.0) if comp is not None else 0.0
+        )
         logger.warning(
             "[DaltonAssist] task=%s model=%s elapsed_ms=%d status=error error=%s",
             task,

@@ -102,7 +102,16 @@ def render_conversation_digest_md(
         lines.append(f"## {idx}. [{c_type}] {claim}{header_suffix}")
         lines.append("")
         lines.append(f"- **卡片 ID**：`{cid}` · **来源类型**：`conversation` · **置信度**：`{conf:.2f}`")
-        lines.append(f"- **说话人**：{sp_name}（`{sp_role}`）· **时间**：`{ts_str}`")
+        uploaded = speaker.get("uploaded_by") if isinstance(speaker.get("uploaded_by"), dict) else None
+        if not isinstance(uploaded, dict) and isinstance(card.get("uploaded_by"), dict):
+            uploaded = card.get("uploaded_by")
+        if isinstance(uploaded, dict) and uploaded.get("name"):
+            up_role = str(uploaded.get("role") or "participant")
+            lines.append(
+                f"- **观点作者**：{sp_name}（`{sp_role}`）· **上传者**：{uploaded.get('name')}（`{up_role}`）· **时间**：`{ts_str}`"
+            )
+        else:
+            lines.append(f"- **说话人**：{sp_name}（`{sp_role}`）· **时间**：`{ts_str}`")
 
         tickers = [str(t).upper() for t in (card.get("tickers") or []) if str(t).strip()]
         entities = [str(e) for e in (card.get("entities") or []) if str(e).strip()]

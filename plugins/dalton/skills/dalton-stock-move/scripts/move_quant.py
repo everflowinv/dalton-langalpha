@@ -17,6 +17,8 @@ move_quant.py — 股价异动统一量化脚本（PS.10）
    window_z = 窗口超额 / (σ * sqrt(窗口交易日数))。
    （无真实同业时日超额、σ 与 z 值同样按上述 benchmark 口径，不与同业口径混用。）
 5. 量比 (volume_vs_adtv) = 当日成交量 / 前 20 日均量（不含当日）。
+   盘中（session_complete 为 false）该字段是截至当前的累计成交量占日均量比例，
+   并附已开盘分钟数 / 全天分钟数；不能单独据此判断缩量或放量。
 6. 判定 (assessment)：
    - sector_beta：当且仅当 |窗口超额| < 3.0pp 且 |窗口 z| < 1.5
    - stock_specific：当 |窗口超额| >= 5.0pp 或 |窗口 z| >= 2.0
@@ -31,7 +33,7 @@ import json
 import math
 import re
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -465,6 +467,122 @@ def _annotate_cn_daily_issues(
     return price_sources, notes, verdicts
 
 
+def _market_session_windows(symbol: str) -> tuple[ZoneInfo, list[tuple[time, time]], int]:
+    """Regular-session clock for a ticker. Unknown suffixes use the US session."""
+    sym = (symbol or "").upper()
+    if sym.endswith(".HK"):
+        return (
+            ZoneInfo("Asia/Hong_Kong"),
+            [(time(9, 30), time(12, 0)), (time(13, 0), time(16, 0))],
+            330,
+        )
+    if sym.endswith((".SS", ".SH", ".SZ")):
+        return (
+            ZoneInfo("Asia/Shanghai"),
+            [(time(9, 30), time(11, 30)), (time(13, 0), time(15, 0))],
+            240,
+        )
+    return ZoneInfo("America/New_York"), [(time(9, 30), time(16, 0))], 390
+
+
+_US_REGULAR_OPEN_MINUTES = 9 * 60 + 30
+_HALF_DAY_UNRECOGNIZED_NOTE = "未识别半日市，提前收市日的折算值偏高"
+
+
+def _clock_from_minutes(minutes: int) -> time:
+    bounded = min(max(int(minutes), 0), 23 * 60 + 59)
+    return time(bounded // 60, bounded % 60)
+
+
+def _session_clock(
+    symbol: str, session_date: date
+) -> tuple[ZoneInfo, list[tuple[time, time]], int, str | None]:
+    """Windows and length for one calendar day.
+
+    US length uses that day's actual regular close from
+    ``_resolve_regular_close_minutes`` (an early close is shorter than 390).
+    HK and A-shares have no exchange calendar here, so the length stays the
+    regular full day and ``session_calendar`` is ``regular_only``; so is a US
+    day when no exchange calendar library is available.
+    """
+    market_tz, windows, length = _market_session_windows(symbol)
+    sym = (symbol or "").upper()
+    if sym.endswith(".HK") or sym.endswith((".SS", ".SH", ".SZ")):
+        return market_tz, windows, length, "regular_only"
+    close_minutes, checked = _resolve_regular_close_minutes(session_date, market_tz)
+    if close_minutes <= _US_REGULAR_OPEN_MINUTES:
+        close_minutes = 16 * 60
+    length = close_minutes - _US_REGULAR_OPEN_MINUTES
+    windows = [(time(9, 30), _clock_from_minutes(close_minutes))]
+    # Without an exchange calendar an early close is not detected either.
+    return market_tz, windows, length, (None if checked else "regular_only")
+
+
+def _session_elapsed_minutes(local_t: time, windows: list[tuple[time, time]]) -> tuple[int, bool]:
+    """Return (minutes since the open, whether the regular session has closed).
+
+    Before the open, elapsed is 0 and the session is not complete. A lunch
+    break keeps the minutes already traded and does not mark the session closed.
+    """
+    now_m = local_t.hour * 60 + local_t.minute
+    elapsed = 0
+    opened = False
+    for start, end in windows:
+        start_m = start.hour * 60 + start.minute
+        end_m = end.hour * 60 + end.minute
+        if now_m < start_m:
+            return elapsed, False
+        opened = True
+        if now_m >= end_m:
+            elapsed += end_m - start_m
+            continue
+        return elapsed + (now_m - start_m), False
+    return elapsed, opened
+
+
+def _same_clock_volume_ratio(
+    symbol: str,
+    volume_df,
+    session_date: date,
+    as_of_local: datetime,
+    lookback: int = ADTV_LOOKBACK_DAYS,
+) -> float | None:
+    """Mean of prior days' cumulative volume up to the same clock, if the frame has clocks.
+
+    Daily bars are stamped at midnight and cannot support this. Returns None then.
+    """
+    if volume_df is None or symbol not in getattr(volume_df, "columns", []):
+        return None
+    series = volume_df[symbol].dropna()
+    if series.empty:
+        return None
+    import pandas as pd
+
+    has_clock = False
+    by_day: dict[date, float] = {}
+    clock_m = as_of_local.hour * 60 + as_of_local.minute
+    for ts, val in series.items():
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is not None:
+            stamp = stamp.tz_convert(as_of_local.tzinfo)
+        if stamp.hour or stamp.minute or stamp.second:
+            has_clock = True
+        if (stamp.hour * 60 + stamp.minute) > clock_m:
+            continue
+        day = stamp.date()
+        by_day[day] = by_day.get(day, 0.0) + float(val)
+    if not has_clock:
+        return None
+    today_cum = by_day.get(session_date)
+    prior_days = sorted(day for day in by_day if day < session_date)[-lookback:]
+    if today_cum is None or not prior_days:
+        return None
+    avg = sum(by_day[day] for day in prior_days) / len(prior_days)
+    if avg <= 0:
+        return None
+    return today_cum / avg
+
+
 def compute_quant_from_frames(
     target: str,
     peers: list[str],
@@ -479,6 +597,7 @@ def compute_quant_from_frames(
     price_sources: dict[str, str] | None = None,
     source_notes: list[str] | None = None,
     today_quote: dict[str, Any] | None = None,
+    as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """
     核心计算函数（可对真实 yfinance DataFrame 或测试 DataFrame 执行）。
@@ -757,6 +876,82 @@ def compute_quant_from_frames(
 
     assessment = classify_move(benchmark_excess, window_z)
 
+    if as_of is None:
+        as_of = datetime.now(timezone.utc)
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    market_tz = _market_session_windows(target)[0]
+    as_of_local = as_of.astimezone(market_tz)
+    end_bar = pd.Timestamp(end_idx)
+    if end_bar.tzinfo is not None:
+        bar_date = end_bar.tz_convert(market_tz).date()
+    else:
+        bar_date = end_bar.date()
+    market_tz, session_windows, session_length, session_calendar = _session_clock(target, bar_date)
+    session_fields: dict[str, Any] = {}
+    if bar_date == as_of_local.date():
+        elapsed, closed = _session_elapsed_minutes(as_of_local.time(), session_windows)
+        if not closed:
+            progress = (elapsed / session_length) if session_length else None
+            same_clock = _same_clock_volume_ratio(
+                target, volume_df, bar_date, as_of_local
+            )
+            if same_clock is not None:
+                comparison = {
+                    "basis": "same_time",
+                    "note": "与历史同一时刻的累计成交量比较。",
+                    "scaled_vs_adtv": round(same_clock, 2),
+                    "session_progress": round(progress, 4) if progress is not None else None,
+                }
+            else:
+                scaled = (
+                    (vol_vs_adtv / progress)
+                    if (vol_vs_adtv is not None and progress)
+                    else None
+                )
+                comparison = {
+                    "basis": "session_progress_scaled",
+                    "note": (
+                        "折算：拿截至当前的累计成交量占日均量比例除以时段进度，"
+                        "只能和同一时段进度对比，不能单独判断缩量或放量。"
+                    ),
+                    "scaled_vs_adtv": round(scaled, 2) if scaled is not None else None,
+                    "session_progress": round(progress, 4) if progress is not None else None,
+                }
+            if session_calendar == "regular_only" and comparison.get("basis") == "session_progress_scaled":
+                comparison["note"] = f"{comparison['note']}{_HALF_DAY_UNRECOGNIZED_NOTE}"
+            session_fields = {
+                "session_complete": False,
+                "session_elapsed_minutes": elapsed,
+                "session_length_minutes": session_length,
+                "session_progress": round(progress, 4) if progress is not None else None,
+                "volume_vs_adtv_label": "截至当前的累计成交量占日均量比例",
+                "volume_comparison": comparison,
+            }
+            if session_calendar:
+                session_fields["session_calendar"] = session_calendar
+            if session_calendar == "regular_only" and comparison.get("basis") == "session_progress_scaled":
+                warnings_list.append(_HALF_DAY_UNRECOGNIZED_NOTE)
+            warnings_list.append(
+                "盘中 volume_vs_adtv 是截至当前的累计成交量占日均量比例，"
+                "不能单独据此判断缩量或放量；只和同一时段进度对比。"
+                + (
+                    "本次比较用的是历史同一时刻累计量。"
+                    if comparison["basis"] == "same_time"
+                    else "历史同一时刻累计量取不到，比较值是按时段进度折算的。"
+                )
+            )
+            if daily_breakdown:
+                daily_breakdown[-1]["session_complete"] = False
+        else:
+            session_fields = {"session_complete": True}
+            if session_calendar:
+                session_fields["session_calendar"] = session_calendar
+    else:
+        session_fields = {"session_complete": True}
+        if session_calendar:
+            session_fields["session_calendar"] = session_calendar
+
     return {
         "ok": True,
         "session": "regular",
@@ -771,6 +966,7 @@ def compute_quant_from_frames(
         "last_day_volume": last_vol,
         "adtv_20d": round(adtv_20d, 0) if adtv_20d is not None else None,
         "volume_vs_adtv": round(vol_vs_adtv, 2) if vol_vs_adtv is not None else None,
+        **session_fields,
         "daily": daily_breakdown,
         "peers": peer_rows,
         "peers_used": valid_peer_syms,

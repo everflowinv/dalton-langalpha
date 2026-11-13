@@ -38,6 +38,48 @@ logger = logging.getLogger(__name__)
 
 LANGUAGE_TASK = "language.review"
 
+# Structured-output failures from assist_json. ValueError covers an empty body
+# or a non-object; JSONDecodeError is itself a ValueError and is listed so the
+# kind string is obvious. Anything else from the model call is upstream.
+_PARSE_ERROR_KINDS = frozenset({"JSONDecodeError", "ValidationError", "ValueError"})
+
+
+class LanguageReviewCallError(RuntimeError):
+    """Model call failed. ``error_kind`` is the underlying assist error, not the wrapper."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_kind: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.status = status
+
+
+def _classify_review_call(exc: BaseException) -> tuple[str, bool]:
+    """Map a review-call failure to (error_type, retryable).
+
+    error_type is ``parse_failure`` (structured output), ``upstream_unavailable``
+    (timeout, indeterminate, model or IO), or left to the tool for input problems.
+    """
+    kind = str(getattr(exc, "error_kind", None) or "")
+    short = kind.rsplit(".", 1)[-1]
+    status = str(getattr(exc, "status", None) or "")
+    if short in _PARSE_ERROR_KINDS:
+        return "parse_failure", True
+    if (
+        status == "indeterminate"
+        or short in {"indeterminate", "TimeoutError", "CancelledError", "ConnectError"}
+        or "timeout" in kind.lower()
+        or "timeout" in str(exc).lower()
+        or "暂时不可用" in str(exc)
+    ):
+        return "upstream_unavailable", True
+    return "upstream_unavailable", True
+
 # The rules ARE the review, so they are read from the shipped skill rather than
 # duplicated here; a missing file is a loud error, never a silent no-rules pass.
 SKILL_RULES_PATH = (
@@ -511,8 +553,16 @@ async def _run_check_language_locked(
                 # call also ended uncertain. Name the condition instead of the
                 # journal's "可能已经计费" wording, which reads like a dead end —
                 # the next check_language call re-sends rather than being locked.
-                raise RuntimeError("语言审查服务暂时不可用，可稍后重试或跳过")
-            raise RuntimeError(f"第 {round} 轮语言审查调用失败（{res.error or res.status}）")
+                raise LanguageReviewCallError(
+                    "语言审查服务暂时不可用，可稍后重试或跳过",
+                    error_kind=res.error_kind or "indeterminate",
+                    status="indeterminate",
+                )
+            raise LanguageReviewCallError(
+                str(res.error or res.status or "调用失败"),
+                error_kind=res.error_kind,
+                status=res.status,
+            )
         chunk_issues, chunk_dropped = _collect_issues(res, section)
         dropped_issue_types[0] += chunk_dropped
         return chunk_issues
@@ -522,12 +572,26 @@ async def _run_check_language_locked(
             _review_chunk(section, chunk) for section, chunk in chunks
         ))
     except Exception as e:
+        error_type, retryable = _classify_review_call(e)
+        detail = str(e)
+        record = "未写附属审查记录文件（.language.json / .language.md）"
+        if error_type == "parse_failure":
+            # The mandated sentence is added once by the check_language tool.
+            # This layer only names the round and the parser error.
+            message = f"ERROR: 语言审查第 {round} 轮未完成（{detail}）。{record}。"
+        elif "可稍后重试或跳过" in detail:
+            message = f"ERROR: {detail}。{record}。"
+        else:
+            message = (
+                f"ERROR: 语言审查第 {round} 轮未完成（{detail}）。{record}，不算通过；"
+                "请稍后重试或检查语言审查模型配置。"
+            )
         return {
             "ok": False,
-            "message": (
-                f"ERROR: 语言审查第 {round} 轮未完成（{e}）。未写侧车，不算通过；"
-                "请稍后重试或检查语言审查模型配置。"
-            ),
+            "error_type": error_type,
+            "retryable": retryable,
+            "error_kind": getattr(e, "error_kind", None) or type(e).__name__,
+            "message": message,
         }
 
     # Re-read the draft before touching the sidecar: if the draft changed while

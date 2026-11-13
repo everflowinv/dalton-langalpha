@@ -565,7 +565,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
           trigger：{"kind": filing|earnings|price_move|consensus_change|indicator|due_validation|pm_question|internal_material|agenda|director|manual, "ref": 唤醒信号 id / accession / V- 编号, "automation_execution_id": 仅自动任务}；
           next_validation：{"what": 下一项看什么, "due": "YYYY-MM-DD"（不能是 null）, "validation_id": 可选 V-xxx}——不是 text/when。
         - 可选：affected（{pillars:[], debates:[], drivers:[]}）；evidence_ids（["E-…"]——不是 evidence/evidence_refs/basis/summary）；question_ids（["Q-…"]）；house_view_changed；
-          `payoff_assessment`（`dalton-stock-move` 与 `dalton-thesis-delta` 每条 `verdict` **必填**，缺了在能识别调用来源时直接拒存；其他技能可选）：评估当前价格下的赔率是否发生实质变化。赔率没变填 `{"changed": false, "reason": "none"}`；赔率变了填 `{"changed": true, "reason": "<枚举值>"}`（`changed=false` 时 `reason` 只能填 `"none"`，`changed=true` 时不得填 `"none"`），`reason` 五选一：`"price_crossed_band"`（三情景假设未改，单纯股价越过三情景或买点价带）| `"scenario_revised"`（重算并调整了三情景 EPS 或估值倍数假设）| `"expectations_migrated"`（三情景假设未改，但 Street consensus 或买方 bogey 明显移动）| `"catalyst_expired"`（支撑催化剂已兑现、落空或过期）| `"protection_failed"`（生存、价值或路径任一下行保护条件失效）。
+          `payoff_assessment`（`dalton-stock-move` 与 `dalton-thesis-delta` 每条 `verdict` **必填**，缺了在能识别调用来源时直接拒存；其他技能可选）：评估当前价格下的赔率是否发生实质变化。比较依据缺失时填 `{"comparable": false, "changed": false, "reason": "none"}`，正文写「尚未评估」，不要漏传 `"comparable": false`。比过之后赔率没变填 `{"changed": false, "reason": "none"}`；预期收益或所需概率有变化时用 `expected_return_delta`、`required_probability_delta` 写明差额。若仅因股价在原价带内波动产生差额、未触发下列五种情形之一，则 `changed` 仍填 `false`、`reason` 仍填 `"none"`。赔率变了填 `{"changed": true, "reason": "<枚举值>"}`。`reason` 五选一：`"price_crossed_band"`（三情景假设未改，单纯股价越过三情景或买点价带）| `"scenario_revised"`（重算并调整了三情景 EPS（每股收益）或估值倍数假设）| `"expectations_migrated"`（三情景假设未改，但 Street consensus（卖方一致预期）或买方 bogey（买方预期门槛）明显移动）| `"catalyst_expired"`（支撑催化剂已兑现、落空或过期）| `"protection_failed"`（生存、价值或路径任一下行保护条件失效）。
         最小示例：{"verdict":"NO_CHANGE","event":"…","rationale":"…","progress":"none","trigger":{"kind":"internal_material","ref":"<信号id>"},"next_validation":{"what":"…","due":"2026-11-05"}}；被拒时返回只列未知字段与缺少的字段，照改后原样重试。
 
         Writing requires the caller to own the workspace or hold rw on it; external members are fully isolated — colleagues' workspaces are not visible to them at all (a 404 is an identity limit — report it, don't retry).
@@ -614,13 +614,15 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                     + why
                     + "），本条未保存（NOT SAVED）。"
                     "股价异动归因与每日增量跟踪的每条 `verdict` 都要评估当前价格下的赔率；"
-                    "补上该字段后原样重试：赔率没变传 "
+                    "补上该字段后原样重试：比较依据缺失、尚未评估传 "
+                    '`{"comparable": false, "changed": false, "reason": "none"}`；'
+                    "比过之后赔率没变传 "
                     '`{"changed": false, "reason": "none"}`；'
                     "赔率变了传 "
                     '`{"changed": true, "reason": "<枚举值>"}`'
                     "（`price_crossed_band` 单纯股价越过三情景或买点价带 | "
-                    "`scenario_revised` 重算了三情景 EPS 或估值倍数假设 | "
-                    "`expectations_migrated` Street consensus 或买方 bogey 明显移动 | "
+                    "`scenario_revised` 重算了三情景 EPS（每股收益）或估值倍数假设 | "
+                    "`expectations_migrated` Street consensus（卖方一致预期）或买方 bogey（买方预期门槛）明显移动 | "
                     "`catalyst_expired` 催化剂已兑现或过期 | "
                     "`protection_failed` 下行保护失效）。"
                 )

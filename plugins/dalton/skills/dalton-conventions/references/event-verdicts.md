@@ -36,7 +36,7 @@ verdict（上文五词结论）描述的是论点本身的变化，动作要看 
 1. **事件描述与发生日期（Event & Date）**：具体发生了什么客观事件或披露。
 2. **映射的目标节点（Target Pillar / Debate / Driver）**：明确指向知识层中的哪个 Thesis 支柱、哪条核心争议或哪个业务驱动因子（JSON 参数 `affected` 填编号如 `P1`、`D2`、`K1`；报告正文和推送正文用一句话直接写出该支柱、分歧或驱动变量的具体内容，不写编号）。
 3. **五词结论（Verdict）**：JSON 填上述 5 个正式枚举值之一，报告正文和推送正文写中文短标签（无变化 / 强化 / 削弱 / 证伪 / 新论点）。
-4. **量化证据与来源（Evidence & Source Attribution）**：实际数字 vs 预期数字（写明公司指引、卖方一致预期或买方 bogey 的各自口径与出处）。
+4. **量化证据与来源（Evidence & Source Attribution）**：实际数字 vs 预期数字（写明公司指引、卖方一致预期或买方 bogey（买方预期门槛）的各自口径与出处）。
 5. **下一项待验证事项与日期（Next Verification & Date）**：为了确认该趋势延续或反转，下一步要看什么具体指标、在什么时间点验证（同步更新至 `agenda.md`）。
 
 ---
@@ -65,7 +65,7 @@ verdict（上文五词结论）描述的是论点本身的变化，动作要看 
 
 - **拒绝噪音与刷存在感**：每日/每周例行扫描时，如果某家公司只有例行公关稿、无新意的卖方重复研报或正常市场随波波动（结论为 `NO_CHANGE` 且无新增高质量证据），**在静默日志中记账即可，不向 PM 推送废话日报**。
 - **推送门槛**：只有当出现改变 Debate 天平的新证据、关键 KPI 触及预警阈值、重要专家/管理层新口径或显著个股 Alpha 异动时，才生成正式简报。
-- **无论是否推送，报告正文必须单独回答“赔率变了没有”**：对照上一版三情景（`Bear` / `Base` / `Bull`）价带与所需胜率，写明这次事件之后当前价格下的赔率是变好、变差还是没变，以及原因。`dalton-stock-move` 与 `dalton-thesis-delta` 的每条 `verdict` 必须把这一判断写进 `payoff_assessment` 字段：赔率没变填 `{"changed": false, "reason": "none"}`；变了填 `{"changed": true, "reason": "<枚举值>"}`，`reason` 从 `"price_crossed_band"`（我们的三情景假设未改，单纯股价越过上一版三情景或买点价带）、`"scenario_revised"`（我们重算并调整了三情景的 EPS 或估值倍数假设）、`"expectations_migrated"`（我们的三情景假设未改，但 Street consensus 或买方 bogey 明显移动）、`"catalyst_expired"`（支撑催化剂已兑现、落空或过期）、`"protection_failed"`（生存、价值或路径任一下行保护条件失效）中按主因选一个；其他技能暂只在正文回答，不写该字段。
+- **无论是否推送，报告正文必须单独回答“赔率变了没有”**：写明这次事件之后当前价格下的赔率是变好、变差、没变还是尚未评估（缺历史比较基准时），以及原因。正文对照上一版三情景（`Bear`（悲观）/ `Base`（基准）/ `Bull`（乐观））价带与所需胜率。比较依据缺失时，正文写「尚未评估」，不要写成赔率没变。`dalton-stock-move` 与 `dalton-thesis-delta` 的每条 `verdict` 必须把这一判断写进 `payoff_assessment`：比较依据缺失时填 `{"comparable": false, "changed": false, "reason": "none"}`；比过之后赔率没变填 `{"changed": false, "reason": "none"}`，预期收益或所需概率有变化时用 `expected_return_delta`、`required_probability_delta` 写明差额。若仅因股价在原价带内波动产生差额、未触发下列五种情形之一，则 `changed` 仍填 `false`、`reason` 仍填 `"none"`。变了填 `{"changed": true, "reason": "<枚举值>"}`，`reason` 从 `"price_crossed_band"`（我们的三情景假设未改，单纯股价越过上一版三情景或买点价带）、`"scenario_revised"`（我们重算并调整了三情景的 EPS（每股收益）或估值倍数假设）、`"expectations_migrated"`（我们的三情景假设未改，但 Street consensus（卖方一致预期）或买方 bogey（买方预期门槛）明显移动）、`"catalyst_expired"`（支撑催化剂已兑现、落空或过期）、`"protection_failed"`（生存、价值或路径任一下行保护条件失效）中按主因选一个；其他技能暂只在正文回答，不写该字段。
 - **`NO_CHANGE` 但赔率变了，仍要推送（`dalton-stock-move`）**：价格触发异动归因中，若股价越过三情景或买点价带，或三情景假设、市场预期、催化剂、下行保护的变化改变了当前价格下的赔率，即使论点没变（`verdict` 为 `"NO_CHANGE"`、且 `payoff_assessment.changed` 为 `true`），仍必须向 PM 推送：按 `dalton-stock-move` 第 7 步写入推送稿并完成两轮 `check_language`，推送稿 `## 结论` 首句写明“论点未变、赔率变了：<一句话写清具体原因>”（通知卡片标题由系统按同一格式自动生成）。
 - **禁止为了触发推送而改写五词结论**：`verdict` 只按论点本身的实际变化填写（见 §1 的动作表），赔率变化只写进 `payoff_assessment`。把 `"NO_CHANGE"` 改写成 `"THESIS_STRENGTHENED"` 等论点变化枚举来换取推送，属于造假，一律禁止。
 
