@@ -636,7 +636,7 @@ class TestWorkflowsAndHelperScripts:
                 "## 五、Catalyst & KPI\n- 催化剂\n"
                 "## 六、财务体检\n- **结论**：资产负债表没有触发提示项\n"
                 "## 七、Variant perception\n- 预期差\n"
-                "## 八、一句话\nThe stock works if A (debate 1 短名1).\n"
+                "## 八、一句话\n成立的条件：A（debate 1 短名1）。\n"
                 "## 九、股东回报附录\n- 附录 [回报引用1]\n"
                 "## 引用\n"
                 "[引用1]: evidence:E-20261023-01 （行情）\n"

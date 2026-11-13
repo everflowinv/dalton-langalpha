@@ -116,7 +116,7 @@ EV（企业价值）/ 当前核心估值倍数（如 NTM P/E）/ 30 日均成交
 - **催化剂日历**：未来 3 / 6 / 12 个月的事件与观察指标
 - **下一次要看什么**：下一份财报 / 数据发布时盯什么
 - 节末用标准一句话收尾（见 `.agents/skills/dalton-conventions/references/writing.md` §6）：
-  "The stock works if [X]; it breaks if [Y]; the key debate is [Z]."
+  成立的条件：[X]；失效的条件：[Y]；最关键的分歧：[Z]。
 
 ## 附录
 正文只写结论与关键数字，以下内容放这里（或 research/ 工作文件）：
