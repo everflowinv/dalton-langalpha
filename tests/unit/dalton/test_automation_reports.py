@@ -87,6 +87,7 @@ def test_profile_accepts_only_named_profiles() -> None:
         "vip-news-alert",
         "mark-weekly-newenergy",
         "tmeet-weekly-minutes",
+        "ai-app-weekly",
     ):
         parsed, err = parse_report_profile(_profile(profile_id))
         assert err is None
@@ -114,6 +115,7 @@ def test_profile_accepts_only_named_profiles() -> None:
         "vip-news-alert",
         "mark-weekly-newenergy",
         "tmeet-weekly-minutes",
+        "ai-app-weekly",
     }
 
 

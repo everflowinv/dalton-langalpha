@@ -1,0 +1,38 @@
+# Dalton 两条自动化。接收方写在报告配置里，本文件不写接收方。
+automations:
+  - name: ai-app-db-refresh
+    schedule: "0 16 * * 2"
+    tz: Asia/Hong_Kong
+    model: gpt-6.1-sol-oauth
+    report_profile: ai-app-weekly
+    report_run_id: ai-app-db-refresh-<tuesday>
+    success: NO_REPLY
+    on_self_test_failure: failure_text
+    on_interrupt: failure_text
+    steps:
+      - 读 SKILL.md 的补库步骤，跑 self-test，再按窗口入库。
+      - self-test 失败或流程中断时，调用 automation_report(failure_text=...)，report_run_id 为 ai-app-db-refresh-<tuesday>（由自动化绑定的报告配置 ai-app-weekly 投递）。
+      - 成功路径不提交 automation_report，最终回复 NO_REPLY。
+  - name: ai-app-weekly
+    schedule: "0 15 * * 5"
+    tz: Asia/Hong_Kong
+    model: gpt-6-astra-oauth
+    report_profile: ai-app-weekly
+    report_run_id: ai-app-weekly-<friday>
+    success: NO_REPLY
+    steps:
+      - 读 SKILL.md 的周报步骤。
+      - 跑 self-test，再 plan。
+      - 按信源顺序扫描，不派子任务。
+      - 新披露的数字先 add-metric，再 screen。管理层原话 add-quote，Guidepoint 命中 add-expert。
+      - 先 diff，周报开头写本周变化，含表述强度迁移、首次量化和方向翻转。
+      - screen --with-price、ai-monetization、headline-monetization（分档和绝对增速榜都写）、usage。四表分开。
+      - reconcile 清零前不发报告。
+      - 按 templates/weekly-report.md 写稿，validate 通过后才建飞书文档。
+      - 摘要用 automation_report 提交。全文文档正文未完成时摘要标明，不放该链接，不归档，不写快照。正文已完成且确认提交成功后才 archive-report，再 snapshot --write。无变化、不建文档、且该期既没有 doc.json 也没有 doc.failed.json 时，确认短消息提交成功后 snapshot --write --no-doc。已有未完成正文、损坏记录或失败记录时该命令仍拒绝。
+      - 成功最终回复 NO_REPLY。
+
+notes:
+  - 周报窗口为上周五 15:00 HKT 至本周五 15:00 HKT。周四美股盘后（等于周五 04:00 HKT）的财报在窗口内；周五美股盘前与盘后的财报滚入下一周。
+  - 补库窗口为上周五 15:00 HKT 至本周二运行时刻。
+  - 财报密集期（2 月、5 月、8 月、11 月）可加一条周二只刷新筛选榜的补充跑，需明确要求后才建。

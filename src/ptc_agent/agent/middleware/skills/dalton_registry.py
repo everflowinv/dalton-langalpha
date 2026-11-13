@@ -108,6 +108,7 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-vip-news-alert", None, ("dalton-bullbear-tracker",)),
     ("dalton-mark-weekly-newenergy", None, ()),
     ("dalton-tmeet-weekly-minutes", None, ()),
+    ("dalton-ai-app-weekly-monitor", None, ()),
     ("dalton-language", None, ()),
     ("dalton-onboarding", None, ()),
 )

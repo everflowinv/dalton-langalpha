@@ -382,3 +382,6 @@ tests/unit/dalton/test_agentturn_mark_weekly.py
 # OC-1 Tencent Meeting weekly minutes (host tmeet route).
 plugins/dalton/skills/dalton-tmeet-weekly-minutes/
 tests/unit/dalton/test_agentturn_tmeet.py
+# OC-1 AI application weekly monitor (db refresh + change report).
+plugins/dalton/skills/dalton-ai-app-weekly-monitor/
+tests/unit/dalton/test_agentturn_ai_app.py

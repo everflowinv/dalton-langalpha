@@ -91,6 +91,7 @@ REPORT_PROFILES = frozenset(
         "vip-news-alert",
         "mark-weekly-newenergy",
         "tmeet-weekly-minutes",
+        "ai-app-weekly",
     }
 )
 MAX_CARDS = 20
