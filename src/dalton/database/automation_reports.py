@@ -89,6 +89,7 @@ REPORT_PROFILES = frozenset(
         "daily-filing-alert",
         "tob-industry-weekly",
         "vip-news-alert",
+        "mark-weekly-newenergy",
     }
 )
 MAX_CARDS = 20

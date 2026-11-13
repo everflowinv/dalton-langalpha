@@ -374,3 +374,7 @@ tests/unit/dalton/test_agentturn_tob.py
 # OC-1 VIP news alert.
 plugins/dalton/skills/dalton-vip-news-alert/
 tests/unit/dalton/test_agentturn_vip_news.py
+
+# OC-1 Mark new-energy and China-ADR weekly (original + restyle).
+plugins/dalton/skills/dalton-mark-weekly-newenergy/
+tests/unit/dalton/test_agentturn_mark_weekly.py
