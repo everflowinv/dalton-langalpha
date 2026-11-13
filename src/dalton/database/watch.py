@@ -15,6 +15,94 @@ from src.server.database.pool import get_db_connection
 
 HOME_WORKSPACE_SENTINEL = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
+# Per-automation consecutive preflight-timeout counts live in this JSON object
+# inside ``dalton_watch_state.state``. Full-document replaces must keep the key
+# from the stored row; only the atomic helpers below may change it.
+PREFLIGHT_TIMEOUT_STREAKS_KEY = "preflight_timeout_streaks"
+
+_COMPANY_WATCH_STATE_UPSERT_SQL = (
+    "INSERT INTO dalton_watch_state (workspace_id, ticker, state, updated_at) "
+    "VALUES (%s, %s, %s, NOW()) "
+    "ON CONFLICT (workspace_id) DO UPDATE "
+    "SET ticker = EXCLUDED.ticker, "
+    "state = (EXCLUDED.state - 'preflight_timeout_streaks') || "
+    "jsonb_build_object('preflight_timeout_streaks', "
+    "COALESCE(dalton_watch_state.state->'preflight_timeout_streaks', '{}'::jsonb)), "
+    "updated_at = NOW() "
+    "RETURNING workspace_id, ticker, state, updated_at"
+)
+
+# One statement owns the count, the cycle start, and the reminded flag.
+# A cycle starts when the count goes from 0 to 1. The same statement also
+# fills cycle_started_at when the stored entry is a legacy bare integer or an
+# object whose cycle_started_at is null or blank. That backfill writes NOW(),
+# clears reminded, and keeps the incremented count. A later bump keeps a
+# cycle that is already set, and keeps reminded.
+_BUMP_PREFLIGHT_TIMEOUT_STREAK_SQL = (
+    "INSERT INTO dalton_watch_state (workspace_id, ticker, state, updated_at) "
+    "VALUES (%s, %s, jsonb_build_object('preflight_timeout_streaks', "
+    "jsonb_build_object(%s::text, jsonb_build_object("
+    "'streak', 1, 'cycle_started_at', to_jsonb(NOW()), 'reminded', false))), NOW()) "
+    "ON CONFLICT (workspace_id) DO UPDATE "
+    "SET state = jsonb_set("
+    "COALESCE(dalton_watch_state.state, '{}'::jsonb), "
+    "'{preflight_timeout_streaks}', "
+    "COALESCE(dalton_watch_state.state->'preflight_timeout_streaks', '{}'::jsonb) "
+    "|| jsonb_build_object(%s::text, jsonb_build_object("
+    "'streak', (CASE "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'object' "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->%s->>'streak')::int, 0) "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'number' "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->>%s)::int, 0) "
+    "ELSE 0 END) + 1, "
+    "'cycle_started_at', CASE "
+    "WHEN (CASE "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'object' "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->%s->>'streak')::int, 0) "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'number' "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->>%s)::int, 0) "
+    "ELSE 0 END) = 0 THEN to_jsonb(NOW()) "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'object' "
+    "AND NULLIF(btrim(dalton_watch_state.state->'preflight_timeout_streaks'->%s->>'cycle_started_at'), '') IS NOT NULL "
+    "THEN dalton_watch_state.state->'preflight_timeout_streaks'->%s->'cycle_started_at' "
+    "ELSE to_jsonb(NOW()) END, "
+    "'reminded', CASE "
+    "WHEN (CASE "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'object' "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->%s->>'streak')::int, 0) "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'number' "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->>%s)::int, 0) "
+    "ELSE 0 END) = 0 THEN false "
+    "WHEN jsonb_typeof(COALESCE(dalton_watch_state.state->'preflight_timeout_streaks'->%s, 'null'::jsonb)) = 'object' "
+    "AND NULLIF(btrim(dalton_watch_state.state->'preflight_timeout_streaks'->%s->>'cycle_started_at'), '') IS NOT NULL "
+    "THEN COALESCE((dalton_watch_state.state->'preflight_timeout_streaks'->%s->>'reminded')::boolean, false) "
+    "ELSE false END)), true), "
+    "updated_at = NOW() "
+    "RETURNING (state->'preflight_timeout_streaks'->%s->>'streak')::int AS streak"
+)
+
+_RESET_PREFLIGHT_TIMEOUT_STREAK_SQL = (
+    "UPDATE dalton_watch_state "
+    "SET state = jsonb_set("
+    "COALESCE(state, '{}'::jsonb), "
+    "'{preflight_timeout_streaks}', "
+    "COALESCE(state->'preflight_timeout_streaks', '{}'::jsonb) - %s::text, "
+    "true), "
+    "updated_at = NOW() "
+    "WHERE workspace_id = %s"
+)
+
+_MARK_PREFLIGHT_TIMEOUT_REMINDED_SQL = (
+    "UPDATE dalton_watch_state "
+    "SET state = jsonb_set("
+    "COALESCE(state, '{}'::jsonb), "
+    "ARRAY['preflight_timeout_streaks', %s, 'reminded'], "
+    "'true'::jsonb, true), "
+    "updated_at = NOW() "
+    "WHERE workspace_id = %s "
+    "AND (state->'preflight_timeout_streaks'->%s->>'cycle_started_at') = %s"
+)
+
 
 def _resolve_ws_uuid(workspace_id: Optional[str]) -> uuid.UUID:
     """Resolve workspace_id to UUID, using HOME_WORKSPACE_SENTINEL when empty/None/home (A10)."""
@@ -57,9 +145,10 @@ async def upsert_watch_state(
 
     A sector coverage unit (d027, sector layer P3) passes ``ticker=None`` with
     ``subject_kind="sector"`` and its ``unit_id`` — the row's subject identity
-    is the unit, never a made-up ticker. The company INSERT is unchanged for
-    company callers: the sector columns only enter the statement on the sector
-    branch, so no company write touches the new columns.
+    is the unit, never a made-up ticker. Company writes do not touch those
+    sector columns. The company conflict update keeps
+    ``preflight_timeout_streaks`` from the stored row, so a full-document
+    replace cannot wipe the timeout count.
     """
     ws_uuid = _resolve_ws_uuid(workspace_id)
     kind = str(subject_kind or "company").strip().lower() or "company"
@@ -90,19 +179,120 @@ async def upsert_watch_state(
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                INSERT INTO dalton_watch_state (workspace_id, ticker, state, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (workspace_id) DO UPDATE
-                SET ticker = EXCLUDED.ticker,
-                    state = EXCLUDED.state,
-                    updated_at = NOW()
-                RETURNING workspace_id, ticker, state, updated_at
-                """,
+                _COMPANY_WATCH_STATE_UPSERT_SQL,
                 (ws_uuid, (ticker or "HOME").upper(), Jsonb(state)),
             )
             row = await cur.fetchone()
             return dict(row) if row else {}
+
+
+def _timeout_streak_key(automation_id: str) -> str:
+    cleaned = str(automation_id or "").strip()
+    return cleaned or "_"
+
+
+async def bump_preflight_timeout_streak(
+    workspace_id: Optional[str],
+    automation_id: str,
+    ticker: Optional[str],
+) -> int:
+    """Add 1 to this task's timeout streak and return the new count.
+
+    One ``INSERT ... ON CONFLICT DO UPDATE``. The count goes from 0 to 1 in
+    that same statement, which also writes ``cycle_started_at`` and clears
+    ``reminded``. A legacy bare integer, or an object with an empty
+    ``cycle_started_at``, gets ``NOW()`` in that same statement. The
+    incremented count is kept, and ``reminded`` is cleared because the cycle
+    id is new. Later bumps keep a cycle that is already set, and keep the
+    reminded flag. The count is not read into Python first. A failure raises
+    and does not replace the watch-state document.
+    """
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    auto_key = _timeout_streak_key(automation_id)
+    ticker_norm = (ticker or "HOME").upper()
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                _BUMP_PREFLIGHT_TIMEOUT_STREAK_SQL,
+                (ws_uuid, ticker_norm, *([auto_key] * 21)),
+            )
+            row = await cur.fetchone()
+    if not row or row.get("streak") is None:
+        raise RuntimeError("preflight timeout streak bump did not return a count")
+    return int(row["streak"])
+
+
+async def reset_preflight_timeout_streak(
+    workspace_id: Optional[str],
+    automation_id: str,
+) -> None:
+    """Drop this task's timeout entry: count, cycle start, and reminded flag.
+
+    No row is inserted when the workspace has no watch state. A failure raises
+    and does not write a replacement document.
+    """
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    auto_key = _timeout_streak_key(automation_id)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                _RESET_PREFLIGHT_TIMEOUT_STREAK_SQL,
+                (auto_key, ws_uuid),
+            )
+
+
+async def mark_preflight_timeout_reminded(
+    workspace_id: Optional[str],
+    automation_id: str,
+    cycle_started_at: str,
+) -> None:
+    """Record that this timeout cycle's reminder was claimed.
+
+    The update matches ``cycle_started_at``, so a newer cycle is left alone.
+    A failure raises and does not write a replacement document.
+    """
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    auto_key = _timeout_streak_key(automation_id)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                _MARK_PREFLIGHT_TIMEOUT_REMINDED_SQL,
+                (auto_key, ws_uuid, auto_key, str(cycle_started_at)),
+            )
+
+
+async def list_unwoken_signals(
+    workspace_id: Optional[str],
+    ticker: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return unresolved signals that no execution has claimed yet."""
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    clauses = [
+        "workspace_id = %s",
+        "woken_execution_id IS NULL",
+        "resolved_at IS NULL",
+        "expired_at IS NULL",
+    ]
+    params: list[Any] = [ws_uuid]
+    if ticker:
+        clauses.append("ticker = %s")
+        params.append(ticker.upper())
+    where_sql = " AND ".join(clauses)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
+                       summary, payload, detected_at, woken_execution_id, woken_at,
+                       resolved_at, expired_at
+                FROM dalton_signals
+                WHERE {where_sql}
+                ORDER BY detected_at ASC
+                """,
+                tuple(params),
+            )
+            rows = await cur.fetchall()
+            return [_with_signal_status(dict(r)) for r in (rows or [])]
 
 
 def _with_signal_status(row: dict[str, Any]) -> dict[str, Any]:

@@ -279,6 +279,8 @@ class PreflightResult:
     reason: Optional[str] = None
     signals: list[dict[str, Any]] = field(default_factory=list)
     wake_context: Optional[str] = None
+    # Probe names still unfinished when a company-watch preflight times out.
+    incomplete_probes: list[str] = field(default_factory=list)
 
     @property
     def skip(self) -> bool:
@@ -676,6 +678,765 @@ async def _sync_home_coverage_for_preflight(
     return group_refresh_summary
 
 
+# Company-watch probe order: local due checks first, then network filings.
+# A network hang must not skip an earnings date or a due agenda item.
+_COMPANY_LOCAL_PROBES: tuple[str, ...] = ("agenda", "earnings")
+_COMPANY_NETWORK_PROBES: tuple[str, ...] = ("sec", "cnhk")
+_COMPANY_PROBE_ORDER: tuple[str, ...] = _COMPANY_LOCAL_PROBES + _COMPANY_NETWORK_PROBES
+_PREFLIGHT_DECISIONS = frozenset({"wake", "skip", "passthrough"})
+# Filing watermarks. A later full-document write must not keep a probe's new
+# values when that probe's signals failed to save.
+_SEEN_WATERMARK_KEYS: tuple[str, ...] = (
+    "seen_accessions",
+    "last_sec_accession",
+    "seen_cnhk_filings",
+    "last_cnhk_check_date",
+)
+
+
+def _mark_probe_done(progress: Optional[dict[str, Any]], probe_name: str) -> None:
+    if not isinstance(progress, dict):
+        return
+    pending = progress.get("pending")
+    if isinstance(pending, list):
+        progress["pending"] = [name for name in pending if name != probe_name]
+
+
+def _note_probe_not_succeeded(progress: Optional[dict[str, Any]]) -> None:
+    """A backed-off or failed probe did not finish a real request."""
+    if isinstance(progress, dict):
+        progress["probes_all_succeeded"] = False
+
+
+def _restore_seen_watermarks(state: dict[str, Any], prior: dict[str, Any]) -> dict[str, Any]:
+    """Drop a probe's new filing watermarks so a later write cannot mark them read."""
+    restored = dict(state)
+    for key in _SEEN_WATERMARK_KEYS:
+        if key in prior:
+            restored[key] = prior[key]
+        else:
+            restored.pop(key, None)
+    return restored
+
+
+async def _upsert_company_watch_state(
+    *,
+    persist: bool,
+    state_read_ok: bool,
+    workspace_id: Optional[str],
+    ticker: Optional[str],
+    state: dict[str, Any],
+) -> None:
+    """Write company watch state only after a successful read.
+
+    A failed read must not replace the stored document with an empty one.
+    The SQL keeps ``preflight_timeout_streaks`` from the stored row.
+    """
+    if not persist or not workspace_id or not ticker:
+        return
+    if not state_read_ok:
+        logger.warning("[DALTON_PREFLIGHT] 跟踪状态读取失败，跳过写回以免覆盖已有记录")
+        return
+    try:
+        await watch_db.upsert_watch_state(workspace_id, ticker, state)
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] upsert_watch_state failed: %s", e)
+
+
+async def _commit_network_probe_signals(
+    *,
+    signals: list[ProbeSignal],
+    state: dict[str, Any],
+    persist: bool,
+    state_read_ok: bool,
+    workspace_id: Optional[str],
+    ticker: Optional[str],
+    saved_out: Optional[list[dict[str, Any]]] = None,
+) -> bool:
+    """Save one network probe's signals. The seen watermark stays in ``state``.
+
+    The run writes watch state once, at the end. A ``False`` return tells the
+    caller to roll ``state``'s filing watermarks back first, so that write
+    cannot mark a filing read while its signal is missing. ``state`` and
+    ``state_read_ok`` are kept for that caller; this function does not write them.
+    """
+    del state, state_read_ok
+    if not persist:
+        return True
+    saved_rows: list[dict[str, Any]] = []
+    saved_all = True
+    for sig in signals:
+        try:
+            row, _should_wake = await watch_db.upsert_signal(
+                workspace_id=workspace_id,
+                ticker=ticker,
+                probe=sig.probe,
+                signal_key=sig.signal_key,
+                priority=sig.priority,
+                summary=sig.summary,
+                payload=sig.payload,
+            )
+            saved_rows.append(
+                {
+                    "signal_id": str((row or {}).get("signal_id") or ""),
+                    "probe": sig.probe,
+                    "signal_key": sig.signal_key,
+                    "priority": sig.priority,
+                    "summary": sig.summary,
+                    "payload": sig.payload,
+                }
+            )
+        except Exception as e:
+            saved_all = False
+            logger.warning("[DALTON_PREFLIGHT] upsert_signal failed: %s", e)
+    if not saved_all:
+        logger.warning("[DALTON_PREFLIGHT] 网络探针信号未全部保存，不更新已读记录")
+        return False
+    if saved_out is not None:
+        saved_out.extend(saved_rows)
+    return True
+
+
+def _merge_wake_results(
+    first: Optional[PreflightResult],
+    second: Optional[PreflightResult],
+    *,
+    name: str,
+    ticker: Optional[str],
+) -> Optional[PreflightResult]:
+    """Combine two wake decisions. A skip does not erase an earlier wake."""
+    wakes = [item for item in (first, second) if item is not None and item.should_wake]
+    if not wakes:
+        return second if second is not None else first
+    if len(wakes) == 1:
+        return wakes[0]
+    signals: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    incomplete: list[str] = []
+    for item in wakes:
+        for probe_name in item.incomplete_probes:
+            if probe_name not in incomplete:
+                incomplete.append(probe_name)
+        for sig in item.signals:
+            pair = (str(sig.get("probe") or ""), str(sig.get("signal_key") or ""))
+            if not pair[1] or pair in seen:
+                continue
+            seen.add(pair)
+            signals.append(sig)
+    return PreflightResult(
+        should_wake=True,
+        decision="wake",
+        reason=f"{len(signals)}_signals",
+        signals=signals,
+        wake_context=format_wake_directive(
+            automation_name=name,
+            ticker=ticker,
+            signals=signals,
+        ),
+        incomplete_probes=incomplete,
+    )
+
+
+def _remember_wake(
+    progress: Optional[dict[str, Any]],
+    result: PreflightResult,
+    *,
+    name: str,
+    ticker: Optional[str],
+) -> None:
+    """Store a claimed wake where cancellation of a later await cannot drop it."""
+    if not isinstance(progress, dict) or not result.should_wake:
+        return
+    existing = progress.get("committed_wake")
+    if isinstance(existing, PreflightResult) and existing.should_wake:
+        merged = _merge_wake_results(existing, result, name=name, ticker=ticker)
+        result = merged if merged is not None else result
+    progress["committed_wake"] = result
+    progress["wake_log_pending"] = True
+
+
+def _wake_already_committed(progress: Optional[dict[str, Any]]) -> bool:
+    """True when an earlier pass already claimed a wake that must be delivered."""
+    if not isinstance(progress, dict):
+        return False
+    existing = progress.get("committed_wake")
+    return isinstance(existing, PreflightResult) and existing.should_wake
+
+
+def _timeout_streak_entry(
+    state: dict[str, Any],
+    automation_id: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """This task's timeout entry, or None when it is missing or still a bare int."""
+    raw = state.get("preflight_timeout_streaks")
+    if not isinstance(raw, dict):
+        return None
+    key = str(automation_id or "").strip() or "_"
+    entry = raw.get(key)
+    if isinstance(entry, dict):
+        return entry
+    return None
+
+
+def _pending_timeout_reminder(
+    state: dict[str, Any],
+    automation_id: Optional[str],
+    threshold: int,
+) -> Optional[ProbeSignal]:
+    """A reminder for this cycle, read at the start of a run.
+
+    The sentence uses the streak stored with the cycle. A bare integer or a
+    blank cycle start is filled by the timeout bump; this read waits until
+    that cycle id exists. ``reminded`` stops a second reminder for the same
+    cycle. The caller claims this signal in the one conclude step. A timeout
+    before that conclude leaves the cycle unreminded, and the next run tries
+    again.
+    """
+    entry = _timeout_streak_entry(state, automation_id)
+    if entry is None:
+        return None
+    try:
+        streak = int(entry.get("streak") or 0)
+    except (TypeError, ValueError):
+        return None
+    step = threshold if threshold >= 1 else 1
+    if streak < step or entry.get("reminded") is True:
+        return None
+    cycle = entry.get("cycle_started_at")
+    if cycle is None:
+        return None
+    cycle_s = str(cycle).strip()
+    if not cycle_s or cycle_s.lower() == "null":
+        return None
+    return ProbeSignal(
+        probe="preflight",
+        signal_key=f"preflight_timeout_streak:{automation_id or '_'}:{cycle_s}",
+        priority="P1",
+        summary=f"预检连续 {streak} 次超时，需要检查数据源",
+        payload={
+            "kind": "preflight_timeout_streak",
+            "streak": streak,
+            "cycle_started_at": cycle_s,
+        },
+    )
+
+
+def _reminder_cycle(sig: ProbeSignal) -> str:
+    payload = sig.payload if isinstance(sig.payload, dict) else {}
+    if payload.get("kind") != "preflight_timeout_streak":
+        return ""
+    return str(payload.get("cycle_started_at") or "").strip()
+
+
+def _note_timeout_reminder_settled(
+    probe_progress: Optional[dict[str, Any]],
+    cycle_started_at: str,
+    *,
+    persist: bool,
+) -> None:
+    """Remember a cycle whose reminder was claimed or was already woken."""
+    if not persist or not cycle_started_at or not isinstance(probe_progress, dict):
+        return
+    probe_progress["timeout_reminder_settled"] = cycle_started_at
+
+
+_TIMEOUT_REMINDER_RETRY_LIMIT = 5
+
+
+def _signal_was_claimed(row: Any) -> bool:
+    """True when an execution has already claimed this signal row."""
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().lower() == "woken":
+        return True
+    if row.get("woken_execution_id") not in (None, ""):
+        return True
+    return row.get("woken_at") is not None
+
+
+def _signal_closed_unclaimed(row: Any) -> bool:
+    """True when the row expired and nobody claimed it.
+
+    A row someone resolved was seen and dismissed, so it settles the cycle
+    rather than starting a retry.
+    """
+    if not isinstance(row, dict) or _signal_was_claimed(row):
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    if status == "expired":
+        return True
+    if row.get("expired_at") is not None and row.get("resolved_at") is None:
+        return True
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return payload.get("status") == "expired"
+
+
+def _signal_resolved(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    return status == "resolved" or row.get("resolved_at") is not None
+
+
+async def _save_timeout_reminder_retry(
+    sig: ProbeSignal,
+    *,
+    cycle: str,
+    persist: bool,
+    workspace_id: Optional[str],
+    ticker: Optional[str],
+    probe_progress: Optional[dict[str, Any]],
+    pending_reminder_cycles: dict[str, str],
+    candidate_signals: list[dict[str, Any]],
+) -> None:
+    """Save a fresh reminder row after the previous one closed unclaimed.
+
+    The new key keeps the cycle id and adds ``:retry:N``. A row that comes
+    back already claimed settles the cycle. A still-pending row is claimed
+    with the rest of this run. Each closed slot tries the next suffix, up to
+    a fixed limit. Failing to save, or finding no claimable row, leaves the
+    cycle unreminded so the next finished run tries again.
+    """
+    # The fixed suffixes keep keys stable across runs. Once all of them have
+    # closed unclaimed, each later run adds one key of its own (UTC second), so
+    # a cycle is never stuck without a claimable reminder; still one attempt
+    # per run.
+    run_key = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    attempts = [str(n) for n in range(1, _TIMEOUT_REMINDER_RETRY_LIMIT + 1)] + [run_key]
+    for attempt in attempts:
+        retry_key = f"{sig.signal_key}:retry:{attempt}"
+        try:
+            retry_row, retry_unwoken = await watch_db.upsert_signal(
+                workspace_id=workspace_id,
+                ticker=ticker,
+                probe=sig.probe,
+                signal_key=retry_key,
+                priority=sig.priority,
+                summary=sig.summary,
+                payload=sig.payload,
+            )
+        except Exception as retry_err:
+            logger.warning("[DALTON_PREFLIGHT] 连续超时提醒重试保存失败: %s", retry_err)
+            return
+        if retry_unwoken:
+            signal_id = str((retry_row or {}).get("signal_id") or "").strip()
+            if not signal_id:
+                logger.warning("[DALTON_PREFLIGHT] 连续超时提醒重试没有信号编号，本周期下次再试")
+                return
+            pending_reminder_cycles[signal_id] = cycle
+            candidate_signals.append(
+                {
+                    "signal_id": signal_id,
+                    "probe": sig.probe,
+                    "signal_key": retry_key,
+                    "priority": sig.priority,
+                    "summary": sig.summary,
+                    "payload": sig.payload,
+                }
+            )
+            return
+        if _signal_was_claimed(retry_row) or _signal_resolved(retry_row):
+            _note_timeout_reminder_settled(probe_progress, cycle, persist=persist)
+            return
+        if not _signal_closed_unclaimed(retry_row):
+            return
+    logger.warning("[DALTON_PREFLIGHT] 连续超时提醒仍未领取，本周期下次再试")
+
+
+async def _conclude_preflight(
+    *,
+    emitted: list[ProbeSignal],
+    state: dict[str, Any],
+    persist: bool,
+    workspace_id: Optional[str],
+    ticker: Optional[str],
+    automation_id: Optional[str],
+    execution_id: str,
+    name: str,
+    user_id: Optional[str],
+    agenda_doc_override: Optional[dict[str, Any]],
+    watch_state_override: Optional[dict[str, Any]],
+    group_refresh_summary: Optional[str],
+    load_saved_signals: bool,
+    probe_progress: Optional[dict[str, Any]] = None,
+    triage_timeout_s: Optional[float] = None,
+) -> PreflightResult:
+    """Upsert, triage, and claim ``emitted``. This is the only claim in a preflight.
+
+    The caller runs it after the probe-phase timeout, so that timeout cannot
+    cancel a claim that has already started.
+
+    Once ``claim_signals_woken`` returns, the wake is stored on
+    ``probe_progress`` before any later await. The caller writes the wake log
+    after this function returns, so a log failure cannot drop a claimed wake.
+    """
+    candidate_signals: list[dict[str, Any]] = []
+    pending_reminder_cycles: dict[str, str] = {}
+
+    if persist:
+        for sig in emitted:
+            try:
+                row, is_unwoken = await watch_db.upsert_signal(
+                    workspace_id=workspace_id,
+                    ticker=ticker,
+                    probe=sig.probe,
+                    signal_key=sig.signal_key,
+                    priority=sig.priority,
+                    summary=sig.summary,
+                    payload=sig.payload,
+                )
+                cycle = _reminder_cycle(sig)
+                if cycle and is_unwoken:
+                    pending_reminder_cycles[str(row.get("signal_id") or "")] = cycle
+                elif cycle:
+                    # should_wake is false for a claimed row and also for an
+                    # expired or resolved row. A claimed row, or one a person
+                    # resolved, counts as reminded. An expired row that was
+                    # never claimed is saved again under a new key; this run's
+                    # claim marks the cycle.
+                    if _signal_was_claimed(row) or _signal_resolved(row):
+                        _note_timeout_reminder_settled(
+                            probe_progress,
+                            cycle,
+                            persist=persist,
+                        )
+                    elif _signal_closed_unclaimed(row):
+                        await _save_timeout_reminder_retry(
+                            sig,
+                            cycle=cycle,
+                            persist=persist,
+                            workspace_id=workspace_id,
+                            ticker=ticker,
+                            probe_progress=probe_progress,
+                            pending_reminder_cycles=pending_reminder_cycles,
+                            candidate_signals=candidate_signals,
+                        )
+                if is_unwoken:
+                    candidate_signals.append(
+                        {
+                            "signal_id": str(row.get("signal_id") or ""),
+                            "probe": sig.probe,
+                            "signal_key": sig.signal_key,
+                            "priority": sig.priority,
+                            "summary": sig.summary,
+                            "payload": sig.payload,
+                        }
+                    )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] upsert_signal failed: %s", e)
+                # A reminder that did not save stays unreminded and is retried
+                # on the next finished run. Other signals keep the old fallback.
+                if not _reminder_cycle(sig):
+                    candidate_signals.append(sig.to_dict())
+    else:
+        seen_keys: set[tuple[str, str]] = set(
+            tuple(x) for x in (state.get("_woken_signal_keys") or []) if isinstance(x, (list, tuple)) and len(x) == 2
+        )
+        for sig in emitted:
+            pair = (sig.probe, sig.signal_key)
+            if pair not in seen_keys:
+                candidate_signals.append(sig.to_dict())
+                # The stale-todo sweep-up is only recorded once it actually
+                # rides along a wake (below); recording it here would let a
+                # lone, non-waking stale hint consume the week's dedup key.
+                if (sig.payload or {}).get("kind") != "stale_todos":
+                    seen_keys.add(pair)
+        state["_woken_signal_keys"] = [list(x) for x in sorted(seen_keys)]
+        if watch_state_override is not None:
+            watch_state_override.clear()
+            watch_state_override.update(state)
+
+    if persist and load_saved_signals and workspace_id:
+        try:
+            saved_rows = await watch_db.list_unwoken_signals(workspace_id, ticker)
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] list unwoken signals failed: %s", e)
+            saved_rows = []
+        have = {
+            (str(item.get("probe") or ""), str(item.get("signal_key") or ""))
+            for item in candidate_signals
+        }
+        for row in saved_rows:
+            pair = (str(row.get("probe") or ""), str(row.get("signal_key") or ""))
+            if not pair[0] or not pair[1] or pair in have:
+                continue
+            have.add(pair)
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            candidate_signals.append(
+                {
+                    "signal_id": str(row.get("signal_id") or ""),
+                    "probe": pair[0],
+                    "signal_key": pair[1],
+                    "priority": row.get("priority") or "P1",
+                    "summary": row.get("summary") or "",
+                    "payload": payload,
+                }
+            )
+
+    # The stale-todo sweep-up never stands in the wake decision (round 4 #3):
+    # it is kept out of the direct-wake split, the LLM triage and thereby the
+    # triage fallback, so a lone stale signal reads as "no new signals" and
+    # stays unhandled for the next run (its ISO-week signal_key still dedups
+    # the hint to once a week). It only rides along — and only then is marked
+    # notified — when another signal actually wakes this round.
+    stale_signals: list[dict[str, Any]] = []
+    effective_candidates: list[dict[str, Any]] = []
+    for cand in candidate_signals:
+        payload = cand.get("payload") if isinstance(cand.get("payload"), dict) else {}
+        if payload.get("kind") == "stale_todos":
+            stale_signals.append(cand)
+        else:
+            effective_candidates.append(cand)
+    candidate_signals = effective_candidates
+
+    if not candidate_signals:
+        if persist and not _wake_already_committed(probe_progress):
+            try:
+                await watch_db.insert_preflight_log(
+                    automation_id=automation_id,
+                    automation_execution_id=execution_id,
+                    workspace_id=workspace_id,
+                    decision="skip",
+                    reason="no_new_signals",
+                    signals=[],
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason="no_new_signals",
+            signals=[],
+            wake_context=None,
+        )
+
+    # Split into direct-wake signals and LLM-triage signals (G4.3)
+    direct_signals: list[dict[str, Any]] = []
+    triage_candidates: list[dict[str, Any]] = []
+    for cand in candidate_signals:
+        if is_direct_wake_signal(cand):
+            direct_signals.append(cand)
+        else:
+            triage_candidates.append(cand)
+
+    triage_kept: list[dict[str, Any]] = []
+    triage_skipped: list[dict[str, Any]] = []
+    triage_reason = "no_triage"
+    if triage_candidates:
+        try:
+            triage_call = _triage_signals_with_llm(
+                ticker=ticker,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                signals=triage_candidates,
+                agenda_doc=agenda_doc_override,
+                watch_state=state,
+                persist=persist,
+            )
+            if triage_timeout_s is not None:
+                triage_kept, triage_skipped, triage_reason = await asyncio.wait_for(
+                    triage_call,
+                    timeout=triage_timeout_s,
+                )
+            else:
+                triage_kept, triage_skipped, triage_reason = await triage_call
+        except asyncio.TimeoutError:
+            logger.warning("[DALTON_PREFLIGHT] 历史披露分诊超时，本轮领取直接信号")
+            triage_kept = []
+            triage_skipped = []
+            triage_reason = "triage_timeout"
+        if persist and triage_skipped:
+            skipped_ids = [str(s["signal_id"]) for s in triage_skipped if s.get("signal_id")]
+            if skipped_ids:
+                try:
+                    await watch_db.resolve_signals(
+                        skipped_ids,
+                        workspace_id=workspace_id,
+                        ticker=ticker,
+                        resolved_by="preflight.triage:skip",
+                    )
+                except Exception as e:
+                    logger.warning("[DALTON_PREFLIGHT] resolve triage-skipped signals failed: %s", e)
+
+    woke_signals = direct_signals + triage_kept
+
+    if not woke_signals:
+        skip_reason = triage_reason if triage_candidates else "no_new_signals"
+        if persist and not _wake_already_committed(probe_progress):
+            try:
+                await watch_db.insert_preflight_log(
+                    automation_id=automation_id,
+                    automation_execution_id=execution_id,
+                    workspace_id=workspace_id,
+                    decision="skip",
+                    reason=skip_reason,
+                    signals=triage_skipped,
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason=skip_reason,
+            signals=[],
+            wake_context=None,
+        )
+
+    # Atomically claim unwoken signals (A10): filter out any signal already claimed by a concurrent execution
+    signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
+    if persist and signal_ids_to_mark:
+        try:
+            claimed_raw = await watch_db.claim_signals_woken(
+                signal_ids_to_mark,
+                execution_id,
+                workspace_id=workspace_id,
+            )
+            claimed_ids = {
+                str(r.get("signal_id") if isinstance(r, dict) else r)
+                for r in (claimed_raw or [])
+                if (r.get("signal_id") if isinstance(r, dict) else r)
+            }
+            for signal_id, cycle in pending_reminder_cycles.items():
+                if signal_id and signal_id in claimed_ids:
+                    _note_timeout_reminder_settled(
+                        probe_progress,
+                        cycle,
+                        persist=persist,
+                    )
+            woke_signals = [
+                s
+                for s in woke_signals
+                if not s.get("signal_id") or str(s["signal_id"]) in claimed_ids
+            ]
+            if not woke_signals:
+                if persist and not _wake_already_committed(probe_progress):
+                    try:
+                        await watch_db.insert_preflight_log(
+                            automation_id=automation_id,
+                            automation_execution_id=execution_id,
+                            workspace_id=workspace_id,
+                            decision="skip",
+                            reason="already_claimed_by_concurrent_run",
+                            signals=[],
+                        )
+                    except Exception as e:
+                        logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+                return PreflightResult(
+                    should_wake=False,
+                    decision="skip",
+                    reason="already_claimed_by_concurrent_run",
+                    signals=[],
+                    wake_context=None,
+                )
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] claim_signals_woken failed: %s", e)
+            if persist and not _wake_already_committed(probe_progress):
+                try:
+                    await watch_db.insert_preflight_log(
+                        automation_id=automation_id,
+                        automation_execution_id=execution_id,
+                        workspace_id=workspace_id,
+                        decision="skip",
+                        reason="claim_failed",
+                        signals=[],
+                    )
+                except Exception as log_err:
+                    logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", log_err)
+            return PreflightResult(
+                should_wake=False,
+                decision="skip",
+                reason="claim_failed",
+                signals=[],
+                wake_context=None,
+            )
+
+    # A real wake happened: the stale-todo sweep-up rides along, and only then
+    # is it marked notified (round 4 #3). Record that decision before the
+    # resolve await. Cancellation of the resolve cannot drop the claim.
+    if stale_signals:
+        if not persist:
+            keys = {
+                tuple(x)
+                for x in (state.get("_woken_signal_keys") or [])
+                if isinstance(x, (list, tuple)) and len(x) == 2
+            }
+            keys.update(
+                (str(s.get("probe")), str(s.get("signal_key"))) for s in stale_signals
+            )
+            state["_woken_signal_keys"] = [list(x) for x in sorted(keys)]
+            if watch_state_override is not None:
+                watch_state_override.clear()
+                watch_state_override.update(state)
+        woke_signals = woke_signals + stale_signals
+
+    wake_ctx = format_wake_directive(
+        automation_name=name,
+        ticker=ticker,
+        signals=woke_signals,
+    )
+    if group_refresh_summary:
+        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
+        wake_ctx = f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
+    result = PreflightResult(
+        should_wake=True,
+        decision="wake",
+        reason=f"{len(woke_signals)}_signals",
+        signals=woke_signals,
+        wake_context=wake_ctx,
+    )
+    _remember_wake(probe_progress, result, name=name, ticker=ticker)
+    if persist and stale_signals:
+        stale_ids = [str(s["signal_id"]) for s in stale_signals if s.get("signal_id")]
+        if stale_ids:
+            try:
+                await watch_db.resolve_signals(
+                    stale_ids,
+                    workspace_id=workspace_id,
+                    ticker=ticker,
+                    resolved_by="preflight.stale_todos:notified",
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] resolve stale_todos signals failed: %s", e)
+    return result
+
+
+def _conclude_kwargs(
+    *,
+    emitted: list[ProbeSignal],
+    state: dict[str, Any],
+    persist: bool,
+    workspace_id: Optional[str],
+    ticker: Optional[str],
+    automation_id: Optional[str],
+    execution_id: str,
+    name: str,
+    user_id: Optional[str],
+    agenda_doc_override: Optional[dict[str, Any]],
+    watch_state_override: Optional[dict[str, Any]],
+    group_refresh_summary: Optional[str],
+    load_saved_signals: bool,
+    probe_progress: Optional[dict[str, Any]] = None,
+    triage_timeout_s: Optional[float] = None,
+) -> dict[str, Any]:
+    return {
+        "emitted": emitted,
+        "state": state,
+        "persist": persist,
+        "workspace_id": workspace_id,
+        "ticker": ticker,
+        "automation_id": automation_id,
+        "execution_id": execution_id,
+        "name": name,
+        "user_id": user_id,
+        "agenda_doc_override": agenda_doc_override,
+        "watch_state_override": watch_state_override,
+        "group_refresh_summary": group_refresh_summary,
+        "load_saved_signals": load_saved_signals,
+        "probe_progress": probe_progress,
+        "triage_timeout_s": triage_timeout_s,
+    }
+
+
 async def _preflight_check_inner(
     automation: dict[str, Any],
     execution_id: str,
@@ -686,6 +1447,7 @@ async def _preflight_check_inner(
     persist: bool = True,
     home_synced_in_outer: bool = False,
     precomputed_group_refresh_summary: Optional[str] = None,
+    probe_progress: Optional[dict[str, Any]] = None,
 ) -> PreflightResult:
     """Inner implementation of `preflight_check` wrapped by `asyncio.wait_for` (A3)."""
     if not is_dalton_automation(automation):
@@ -832,15 +1594,20 @@ async def _preflight_check_inner(
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] expire_old_signals failed: %s", e)
 
-    # Load watch state
+    # Load watch state. A failed read must not be written back later.
     state: dict[str, Any] = {}
+    state_read_ok = True
     if watch_state_override is not None:
         state = dict(watch_state_override)
     elif persist and workspace_id:
         try:
             state = await watch_db.get_watch_state(workspace_id)
         except Exception as e:
+            state_read_ok = False
             logger.warning("[DALTON_PREFLIGHT] get_watch_state failed: %s", e)
+    if isinstance(probe_progress, dict):
+        # A failed read must not clear the timeout streak on the way out.
+        probe_progress["state_read_ok"] = state_read_ok
 
     emitted: list[ProbeSignal] = []
 
@@ -952,11 +1719,25 @@ async def _preflight_check_inner(
                 )
                 state = record_probe_backoff(state, "agenda", str(err))
     else:
-        # Standard company_watch: run the 4 company probes (agenda, sec, cnhk, earnings) with time-based backoff
+        # Company watch: due items and the earnings date first, then SEC / CN-HK.
+        # Network probes still run after a due item. The one claim is the
+        # conclude step after this probe phase. A timeout here does not claim
+        # or wake; the next finished run claims what was saved.
+        threshold = int(getattr(settings.autonomy, "preflight_timeout_streak", 3) or 3)
+        if state_read_ok:
+            reminder = _pending_timeout_reminder(state, automation_id, threshold)
+            if reminder is not None:
+                emitted.append(reminder)
+                if isinstance(probe_progress, dict):
+                    probe_progress["timeout_reminder_cycle"] = str(
+                        (reminder.payload or {}).get("cycle_started_at") or ""
+                    ).strip()
         t_sym = ticker or "UNKNOWN"
         eff_ws_id = workspace_id if persist else None
         sec_supports_user_id = "user_id" in inspect.signature(probe_sec).parameters
-        probe_runners = [
+        if isinstance(probe_progress, dict):
+            probe_progress["pending"] = list(_COMPANY_PROBE_ORDER)
+        local_runners = [
             (
                 "agenda",
                 lambda st: probe_agenda(
@@ -966,6 +1747,17 @@ async def _preflight_check_inner(
                     agenda_doc=agenda_doc_override,
                 ),
             ),
+            (
+                "earnings",
+                lambda st: probe_earnings(
+                    ticker=t_sym,
+                    watch_state=st,
+                    workspace_id=eff_ws_id,
+                    agenda_doc=agenda_doc_override,
+                ),
+            ),
+        ]
+        network_runners = [
             (
                 "sec",
                 lambda st: (
@@ -994,17 +1786,10 @@ async def _preflight_check_inner(
                     allow_network=persist,
                 ),
             ),
-            (
-                "earnings",
-                lambda st: probe_earnings(
-                    ticker=t_sym,
-                    watch_state=st,
-                    workspace_id=eff_ws_id,
-                    agenda_doc=agenda_doc_override,
-                ),
-            ),
         ]
-        for probe_name, runner in probe_runners:
+
+        async def _run_company_probe(probe_name: str, runner: Any, *, commit_seen: bool) -> None:
+            nonlocal state
             in_bo, nb_iso = is_in_backoff(state, probe_name)
             if in_bo:
                 logger.info(
@@ -1013,14 +1798,36 @@ async def _preflight_check_inner(
                     t_sym,
                     nb_iso,
                 )
-                continue
+                _note_probe_not_succeeded(probe_progress)
+                _mark_probe_done(probe_progress, probe_name)
+                return
+            prior_state = dict(state)
             try:
                 sigs, state = await runner(state)
                 if probe_name == "cnhk" and state.get("cnhk_probe_degraded"):
                     state = record_probe_backoff(state, probe_name, "cnhk_probe_degraded")
+                    _note_probe_not_succeeded(probe_progress)
                 else:
                     state = clear_probe_backoff(state, probe_name)
+                # Only the probe that just returned. A flag this run cleared
+                # stays false and does not block the streak reset.
+                if probe_name == "sec" and state.get("sec_probe_degraded") is True:
+                    _note_probe_not_succeeded(probe_progress)
+                if probe_name == "cnhk" and state.get("cnhk_probe_partial") is True:
+                    _note_probe_not_succeeded(probe_progress)
                 emitted.extend(sigs)
+                if commit_seen:
+                    committed = await _commit_network_probe_signals(
+                        signals=sigs,
+                        state=state,
+                        persist=persist,
+                        state_read_ok=state_read_ok,
+                        workspace_id=workspace_id,
+                        ticker=ticker,
+                    )
+                    if not committed:
+                        state = _restore_seen_watermarks(state, prior_state)
+                _mark_probe_done(probe_progress, probe_name)
             except Exception as err:
                 logger.warning(
                     "[DALTON_PREFLIGHT] probe=%s ticker=%s transient error: %s",
@@ -1029,14 +1836,56 @@ async def _preflight_check_inner(
                     err,
                 )
                 state = record_probe_backoff(state, probe_name, str(err))
+                _note_probe_not_succeeded(probe_progress)
+                _mark_probe_done(probe_progress, probe_name)
 
-    # Persist updated watch state (including any auto-resolved CIK or watermarks)
-    if persist and workspace_id and ticker:
+        for probe_name, runner in local_runners:
+            await _run_company_probe(probe_name, runner, commit_seen=False)
+        # Due agenda and earnings signals are saved before any network probe.
+        # A timeout still does not claim them. The next finished run claims
+        # the saved rows even when the local probe no longer emits them.
+        # These probes do not advance filing watermarks, so a failed save
+        # does not roll state back; the conclude step retries if it runs.
+        local_signals = [sig for sig in emitted if sig.probe in _COMPANY_LOCAL_PROBES]
+        if local_signals:
+            await _commit_network_probe_signals(
+                signals=local_signals,
+                state=state,
+                persist=persist,
+                state_read_ok=state_read_ok,
+                workspace_id=workspace_id,
+                ticker=ticker,
+            )
+        await _upsert_company_watch_state(
+            persist=persist,
+            state_read_ok=state_read_ok,
+            workspace_id=workspace_id,
+            ticker=ticker,
+            state=state,
+        )
+        for probe_name, runner in network_runners:
+            await _run_company_probe(probe_name, runner, commit_seen=True)
+        if isinstance(probe_progress, dict):
+            pending_after = probe_progress.get("pending")
+            # Backoff, a degraded or partial result, and probe errors set
+            # probes_all_succeeded to false. Those runs leave the streak as it is.
+            if (
+                isinstance(pending_after, list)
+                and not pending_after
+                and probe_progress.get("probes_all_succeeded", True) is True
+            ):
+                probe_progress["probes_completed"] = True
+
+    # Persist updated watch state (including any auto-resolved CIK or watermarks).
+    # Skip the write when the read failed so an empty document cannot replace the row.
+    if persist and workspace_id and not state_read_ok and (ticker or str(kind).startswith("sector_")):
+        logger.warning("[DALTON_PREFLIGHT] 跟踪状态读取失败，跳过写回以免覆盖已有记录")
+    elif persist and workspace_id and ticker:
         try:
             await watch_db.upsert_watch_state(workspace_id, ticker, state)
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] upsert_watch_state failed: %s", e)
-    elif persist and workspace_id and kind.startswith("sector_"):
+    elif persist and workspace_id and kind.startswith("sector_") and state_read_ok:
         # 行业主体的跟踪状态（d027）：ticker 为 NULL，身份由 unit_id +
         # subject_kind 承载；元数据缺 unit_id 时放弃写入而不是回退成公司行。
         sector_meta = automation.get("metadata") if isinstance(automation.get("metadata"), dict) else {}
@@ -1058,82 +1907,35 @@ async def _preflight_check_inner(
                 name,
             )
 
-    # Deduplicate against dalton_signals (idempotent by workspace_id, probe, signal_key; A10)
-    candidate_signals: list[dict[str, Any]] = []
-
-    if persist:
-        for sig in emitted:
-            try:
-                row, is_unwoken = await watch_db.upsert_signal(
-                    workspace_id=workspace_id,
-                    ticker=ticker,
-                    probe=sig.probe,
-                    signal_key=sig.signal_key,
-                    priority=sig.priority,
-                    summary=sig.summary,
-                    payload=sig.payload,
-                )
-                if is_unwoken:
-                    candidate_signals.append(
-                        {
-                            "signal_id": str(row.get("signal_id") or ""),
-                            "probe": sig.probe,
-                            "signal_key": sig.signal_key,
-                            "priority": sig.priority,
-                            "summary": sig.summary,
-                            "payload": sig.payload,
-                        }
-                    )
-            except Exception as e:
-                logger.warning("[DALTON_PREFLIGHT] upsert_signal failed: %s", e)
-                candidate_signals.append(sig.to_dict())
-    else:
-        seen_keys: set[tuple[str, str]] = set(
-            tuple(x) for x in (state.get("_woken_signal_keys") or []) if isinstance(x, (list, tuple)) and len(x) == 2
+    # The claim runs in preflight_check after the probe-phase timeout returns.
+    # Company-watch also picks up signals a previous timed-out run already saved.
+    conclude_args = _conclude_kwargs(
+        emitted=emitted,
+        state=state,
+        persist=persist,
+        workspace_id=workspace_id,
+        ticker=ticker,
+        automation_id=automation_id,
+        execution_id=execution_id,
+        name=name,
+        user_id=user_id,
+        agenda_doc_override=agenda_doc_override,
+        watch_state_override=watch_state_override,
+        group_refresh_summary=group_refresh_summary,
+        load_saved_signals=(kind == "company_watch"),
+        probe_progress=probe_progress,
+    )
+    if isinstance(probe_progress, dict):
+        probe_progress["conclude_kwargs"] = conclude_args
+        return PreflightResult(
+            should_wake=False,
+            decision="skip",
+            reason="await_conclude",
+            signals=[],
+            wake_context=None,
         )
-        for sig in emitted:
-            pair = (sig.probe, sig.signal_key)
-            if pair not in seen_keys:
-                candidate_signals.append(sig.to_dict())
-                # The stale-todo sweep-up is only recorded once it actually
-                # rides along a wake (below); recording it here would let a
-                # lone, non-waking stale hint consume the week's dedup key.
-                if (sig.payload or {}).get("kind") != "stale_todos":
-                    seen_keys.add(pair)
-        state["_woken_signal_keys"] = [list(x) for x in sorted(seen_keys)]
-        if watch_state_override is not None:
-            watch_state_override.clear()
-            watch_state_override.update(state)
-
-    # The stale-todo sweep-up never stands in the wake decision (round 4 #3):
-    # it is kept out of the direct-wake split, the LLM triage and thereby the
-    # triage fallback, so a lone stale signal reads as "no new signals" and
-    # stays unhandled for the next run (its ISO-week signal_key still dedups
-    # the hint to once a week). It only rides along — and only then is marked
-    # notified — when another signal actually wakes this round.
-    stale_signals: list[dict[str, Any]] = []
-    effective_candidates: list[dict[str, Any]] = []
-    for cand in candidate_signals:
-        payload = cand.get("payload") if isinstance(cand.get("payload"), dict) else {}
-        if payload.get("kind") == "stale_todos":
-            stale_signals.append(cand)
-        else:
-            effective_candidates.append(cand)
-    candidate_signals = effective_candidates
-
-    if not candidate_signals:
-        if persist:
-            try:
-                await watch_db.insert_preflight_log(
-                    automation_id=automation_id,
-                    automation_execution_id=execution_id,
-                    workspace_id=workspace_id,
-                    decision="skip",
-                    reason="no_new_signals",
-                    signals=[],
-                )
-            except Exception as e:
-                logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+    settled = await _conclude_preflight(**conclude_args)
+    if settled is None:
         return PreflightResult(
             should_wake=False,
             decision="skip",
@@ -1141,184 +1943,112 @@ async def _preflight_check_inner(
             signals=[],
             wake_context=None,
         )
+    return settled
 
-    # Split into direct-wake signals and LLM-triage signals (G4.3)
-    direct_signals: list[dict[str, Any]] = []
-    triage_candidates: list[dict[str, Any]] = []
-    for cand in candidate_signals:
-        if is_direct_wake_signal(cand):
-            direct_signals.append(cand)
-        else:
-            triage_candidates.append(cand)
 
-    triage_kept: list[dict[str, Any]] = []
-    triage_skipped: list[dict[str, Any]] = []
-    triage_reason = "no_triage"
-    if triage_candidates:
-        triage_kept, triage_skipped, triage_reason = await _triage_signals_with_llm(
-            ticker=ticker,
+def _allowed_decision(decision: str) -> str:
+    """d006 allows only wake, skip, and passthrough. Never persist another value."""
+    if decision not in _PREFLIGHT_DECISIONS:
+        logger.error("[DALTON_PREFLIGHT] refused decision %r; logging skip", decision)
+        return "skip"
+    return decision
+
+
+async def _log_wake_result(
+    *,
+    automation_id: Optional[str],
+    execution_id: str,
+    workspace_id: Optional[str],
+    result: PreflightResult,
+) -> None:
+    """Write the wake log. A failure only warns; the wake itself still stands."""
+    try:
+        await watch_db.insert_preflight_log(
+            automation_id=automation_id,
+            automation_execution_id=execution_id,
             workspace_id=workspace_id,
-            user_id=user_id,
-            signals=triage_candidates,
-            agenda_doc=agenda_doc_override,
-            watch_state=state,
-            persist=persist,
+            decision=_allowed_decision(result.decision),
+            reason=str(result.reason or ""),
+            signals=list(result.signals),
         )
-        if persist and triage_skipped:
-            skipped_ids = [str(s["signal_id"]) for s in triage_skipped if s.get("signal_id")]
-            if skipped_ids:
-                try:
-                    await watch_db.resolve_signals(
-                        skipped_ids,
-                        workspace_id=workspace_id,
-                        ticker=ticker,
-                        resolved_by="preflight.triage:skip",
-                    )
-                except Exception as e:
-                    logger.warning("[DALTON_PREFLIGHT] resolve triage-skipped signals failed: %s", e)
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] 唤醒已领取，日志写入失败: %s", e)
 
-    woke_signals = direct_signals + triage_kept
 
-    if not woke_signals:
-        skip_reason = triage_reason if triage_candidates else "no_new_signals"
-        if persist:
-            try:
-                await watch_db.insert_preflight_log(
-                    automation_id=automation_id,
-                    automation_execution_id=execution_id,
-                    workspace_id=workspace_id,
-                    decision="skip",
-                    reason=skip_reason,
-                    signals=triage_skipped,
-                )
-            except Exception as e:
-                logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
-        return PreflightResult(
-            should_wake=False,
-            decision="skip",
-            reason=skip_reason,
-            signals=[],
-            wake_context=None,
-        )
+async def _reset_company_timeout_streak(
+    *,
+    kind: str,
+    persist: bool,
+    workspace_id: Optional[str],
+    automation_id: Optional[str],
+) -> None:
+    """Clear the streak after every company-watch probe has requested and succeeded.
 
-    # Atomically claim unwoken signals (A10): filter out any signal already claimed by a concurrent execution
-    signal_ids_to_mark = [str(s["signal_id"]) for s in woke_signals if s.get("signal_id")]
-    if persist and signal_ids_to_mark:
+    The caller skips this when the watch-state read failed, when any probe is
+    still unfinished, when a probe was in backoff, or when a probe came back
+    degraded or partial. Those runs leave the stored count in place.
+    """
+    if kind != "company_watch" or not persist or not workspace_id:
+        return
+    try:
+        await watch_db.reset_preflight_timeout_streak(workspace_id, automation_id or "")
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] 预检已完成，但超时计数清零失败: %s", e)
+
+
+async def _company_preflight_timeout(
+    *,
+    automation: dict[str, Any],
+    execution_id: str,
+    workspace_id: str,
+    ticker: Optional[str],
+    name: str,
+    persist: bool,
+    timeout_s: float,
+    probe_progress: dict[str, Any],
+) -> PreflightResult:
+    """Company-watch probe phase timed out.
+
+    Signals from probes that already finished stay saved, including due
+    agenda and earnings signals written before the network probes. This path
+    does not claim or wake. The next run that finishes its probes claims
+    those saved signals.
+    """
+    pending = probe_progress.get("pending") if isinstance(probe_progress, dict) else None
+    incomplete = [str(item) for item in pending if item] if isinstance(pending, list) else []
+    logger.warning(
+        "[DALTON_PREFLIGHT] 预检超时（>%.1fs），%s；未完成探针：%s",
+        timeout_s,
+        name,
+        "、".join(incomplete) or "无",
+    )
+    if persist and workspace_id:
         try:
-            claimed_raw = await watch_db.claim_signals_woken(
-                signal_ids_to_mark,
-                execution_id,
-                workspace_id=workspace_id,
+            await watch_db.bump_preflight_timeout_streak(
+                workspace_id,
+                str(automation.get("automation_id") or ""),
+                ticker,
             )
-            claimed_ids = {
-                str(r.get("signal_id") if isinstance(r, dict) else r)
-                for r in (claimed_raw or [])
-                if (r.get("signal_id") if isinstance(r, dict) else r)
-            }
-            woke_signals = [
-                s
-                for s in woke_signals
-                if not s.get("signal_id") or str(s["signal_id"]) in claimed_ids
-            ]
-            if not woke_signals:
-                if persist:
-                    try:
-                        await watch_db.insert_preflight_log(
-                            automation_id=automation_id,
-                            automation_execution_id=execution_id,
-                            workspace_id=workspace_id,
-                            decision="skip",
-                            reason="already_claimed_by_concurrent_run",
-                            signals=[],
-                        )
-                    except Exception as e:
-                        logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
-                return PreflightResult(
-                    should_wake=False,
-                    decision="skip",
-                    reason="already_claimed_by_concurrent_run",
-                    signals=[],
-                    wake_context=None,
-                )
         except Exception as e:
-            logger.warning("[DALTON_PREFLIGHT] claim_signals_woken failed: %s", e)
-            if persist:
-                try:
-                    await watch_db.insert_preflight_log(
-                        automation_id=automation_id,
-                        automation_execution_id=execution_id,
-                        workspace_id=workspace_id,
-                        decision="skip",
-                        reason="claim_failed",
-                        signals=[],
-                    )
-                except Exception as log_err:
-                    logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", log_err)
-            return PreflightResult(
-                should_wake=False,
-                decision="skip",
-                reason="claim_failed",
-                signals=[],
-                wake_context=None,
-            )
-
-    # A real wake happened: now the stale-todo sweep-up rides along, and only
-    # now is it marked notified (round 4 #3) — resolving it here means the
-    # weekly hint was delivered; without a wake it stays unhandled above.
-    if stale_signals:
-        stale_ids = [str(s["signal_id"]) for s in stale_signals if s.get("signal_id")]
-        if persist and stale_ids:
-            try:
-                await watch_db.resolve_signals(
-                    stale_ids,
-                    workspace_id=workspace_id,
-                    ticker=ticker,
-                    resolved_by="preflight.stale_todos:notified",
-                )
-            except Exception as e:
-                logger.warning("[DALTON_PREFLIGHT] resolve stale_todos signals failed: %s", e)
-        if not persist:
-            keys = {
-                tuple(x)
-                for x in (state.get("_woken_signal_keys") or [])
-                if isinstance(x, (list, tuple)) and len(x) == 2
-            }
-            keys.update(
-                (str(s.get("probe")), str(s.get("signal_key"))) for s in stale_signals
-            )
-            state["_woken_signal_keys"] = [list(x) for x in sorted(keys)]
-            if watch_state_override is not None:
-                watch_state_override.clear()
-                watch_state_override.update(state)
-        woke_signals = woke_signals + stale_signals
-
-    if persist:
+            logger.warning("[DALTON_PREFLIGHT] 超时计数写入失败，不覆盖跟踪状态: %s", e)
         try:
             await watch_db.insert_preflight_log(
-                automation_id=automation_id,
+                automation_id=str(automation.get("automation_id") or "") or None,
                 automation_execution_id=execution_id,
                 workspace_id=workspace_id,
-                decision="wake",
-                reason=f"{len(woke_signals)}_signals",
-                signals=woke_signals,
+                decision=_allowed_decision("skip"),
+                reason="preflight_timeout",
+                signals=[{"incomplete_probes": incomplete}],
             )
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
-
-    wake_ctx = format_wake_directive(
-        automation_name=name,
-        ticker=ticker,
-        signals=woke_signals,
-    )
-    if group_refresh_summary:
-        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
-        wake_ctx = f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
     return PreflightResult(
-        should_wake=True,
-        decision="wake",
-        reason=f"{len(woke_signals)}_signals",
-        signals=woke_signals,
-        wake_context=wake_ctx,
+        should_wake=False,
+        decision="skip",
+        reason="preflight_timeout",
+        signals=[],
+        wake_context=None,
+        incomplete_probes=incomplete,
     )
 
 
@@ -1331,7 +2061,7 @@ async def preflight_check(
     persist: bool = True,
     timeout_s: Optional[float] = None,
 ) -> PreflightResult:
-    """Run zero-token preflight + optional LLM triage bounded by `preflight_timeout_s` (45s default, A3)."""
+    """Run zero-token preflight. ``preflight_timeout_s`` bounds the probe phase; the claim runs after it."""
     if not is_dalton_automation(automation):
         return PreflightResult(should_wake=True, decision="passthrough", reason="non_dalton")
 
@@ -1407,10 +2137,14 @@ async def preflight_check(
                 )
             if gated is not None:
                 return gated
+        # Disabled mode does not run probes, so the timeout streak stays as it is.
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
+    probe_progress: dict[str, Any] = {
+        "pending": list(_COMPANY_PROBE_ORDER) if kind == "company_watch" else [],
+    }
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _preflight_check_inner(
                 automation,
                 execution_id,
@@ -1420,6 +2154,7 @@ async def preflight_check(
                 persist=persist,
                 home_synced_in_outer=home_synced_in_outer,
                 precomputed_group_refresh_summary=precomputed_group_refresh_summary,
+                probe_progress=probe_progress,
             ),
             timeout=eff_timeout,
         )
@@ -1452,10 +2187,8 @@ async def preflight_check(
                 wake_context=None,
             )
         if str(kind).startswith("sector_"):
-            # 行业任务超时不保守唤醒（r3 lead 决定）：卡住的可能正是绑定
-            # 校验，唤醒一个绑定已失配的旧工作区任务会把行业回合写进错误
-            # 的工作区；超时按跳过处理，下一次调度自然重试。公司任务的
-            # 保守唤醒逐字不变。
+            # 行业任务超时不唤醒：卡住的可能正是绑定校验，唤醒一个绑定已失配的
+            # 旧工作区任务会把行业回合写进错误的工作区。超时按跳过处理。
             timeout_reason = "preflight_timeout_sector"
             logger.warning(
                 "[DALTON_PREFLIGHT] sector preflight timed out after %.1fs for %s; skipping without wake",
@@ -1470,6 +2203,18 @@ async def preflight_check(
                 reason=timeout_reason,
                 persist=persist,
             )
+        if kind == "company_watch":
+            return await _company_preflight_timeout(
+                automation=automation,
+                execution_id=execution_id,
+                workspace_id=verified_ownership.workspace_id,
+                ticker=_extract_ticker(automation),
+                name=name,
+                persist=persist,
+                timeout_s=eff_timeout,
+                probe_progress=probe_progress,
+            )
+        # Calendar, director, and schedule tasks keep the previous conservative wake.
         ticker = _extract_ticker(automation)
         logger.warning(
             "[DALTON_PREFLIGHT] preflight_check timed out after %.1fs for %s; waking conservatively",
@@ -1493,6 +2238,65 @@ async def preflight_check(
                 signals=[timeout_sig],
             ),
         )
+    conclude_args = probe_progress.pop("conclude_kwargs", None)
+    if isinstance(conclude_args, dict):
+        conclude_args["triage_timeout_s"] = eff_timeout
+        settled = await _conclude_preflight(**conclude_args)
+        if settled is None:
+            result = PreflightResult(
+                should_wake=False,
+                decision="skip",
+                reason="no_new_signals",
+                signals=[],
+                wake_context=None,
+            )
+        else:
+            result = settled
+    probes_completed = probe_progress.get("probes_completed") is True
+    state_read_ok = probe_progress.get("state_read_ok", True) is not False
+    # A reminder that was due and not claimed has to survive until the next
+    # finished run. Clearing the cycle here would drop that retry.
+    pending_cycle = probe_progress.get("timeout_reminder_cycle")
+    reminder_unsettled = (
+        isinstance(pending_cycle, str)
+        and bool(pending_cycle.strip())
+        and probe_progress.get("timeout_reminder_settled") != pending_cycle
+    )
+    if kind == "company_watch" and probes_completed and state_read_ok and not reminder_unsettled:
+        await _reset_company_timeout_streak(
+            kind=kind,
+            persist=persist,
+            workspace_id=verified_ownership.workspace_id,
+            automation_id=str(automation.get("automation_id") or "") or None,
+        )
+    settled_cycle = probe_progress.get("timeout_reminder_settled")
+    if (
+        kind == "company_watch"
+        and persist
+        and state_read_ok
+        and isinstance(settled_cycle, str)
+        and settled_cycle.strip()
+    ):
+        try:
+            await watch_db.mark_preflight_timeout_reminded(
+                verified_ownership.workspace_id,
+                str(automation.get("automation_id") or ""),
+                settled_cycle.strip(),
+            )
+        except Exception as e:
+            logger.warning(
+                "[DALTON_PREFLIGHT] 连续超时提醒已领取，但已提醒标记写入失败: %s",
+                e,
+            )
+    if persist and result.should_wake and probe_progress.get("wake_log_pending"):
+        await _log_wake_result(
+            automation_id=str(automation.get("automation_id") or "") or None,
+            execution_id=execution_id,
+            workspace_id=verified_ownership.workspace_id,
+            result=result,
+        )
+        probe_progress["wake_log_pending"] = False
+    return result
 
 
 PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 30.0
