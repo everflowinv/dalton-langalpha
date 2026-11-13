@@ -22,9 +22,7 @@ export const queryKeys = {
     me:          () => [...queryKeys.user.all, 'me'],
     preferences: () => [...queryKeys.user.all, 'preferences'],
     apiKeys:     () => [...queryKeys.user.all, 'api-keys'],
-    // Under the keys: it says whether an Anthropic key is saved, so a key
-    // saved or removed reads it again.
-    claudeCodeCustody: () => [...queryKeys.user.apiKeys(), 'claude-code-custody'],
+    claudeCodeCustody: () => [...queryKeys.user.all, 'claude-code-custody'],
     // Its own entry, not part of preferences: the server keeps it apart so the
     // agent, which can write preferences, cannot raise it.
     tradingPermission: () => [...queryKeys.user.all, 'trading-permission'],
@@ -42,6 +40,8 @@ export const queryKeys = {
     claudeCodeStatus: () => [...queryKeys.features.claudeCode(), 'status'],
     claudeCodeComputers: () => [...queryKeys.features.claudeCode(), 'computers'],
     claudeCodeSetup: () => [...queryKeys.features.claudeCode(), 'setup'],
+    // Check now's mutations, each carrying its credential as variables.
+    claudeCodePlanCheck: () => [...queryKeys.features.claudeCode(), 'plan-check'],
   },
   platform: {
     all:    ['platform'],

@@ -9,7 +9,7 @@ import time  # DALTON-HOOK(market-data-fallback): epoch for the quota-reset head
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -259,6 +259,14 @@ def _limit_reached(data: Any) -> bool:
     return isinstance(data, dict) and "Limit Reach" in str(
         data.get("Error Message") or ""
     )
+
+
+class CallDate(NamedTuple):
+    """One FMP earnings-call listing: the fiscal label and the day it was held."""
+
+    quarter: int
+    fiscal_year: int
+    date: date
 
 
 class FMPClient:
@@ -725,28 +733,27 @@ class FMPClient:
             params={"symbol": symbol, "year": year, "quarter": quarter},
         )
 
-    async def get_earnings_call_dates(self, symbol: str) -> List[List]:
-        """All earnings-call transcript dates for ``symbol``.
+    async def get_earnings_call_dates(self, symbol: str) -> List[CallDate]:
+        """All earnings-call transcript dates for ``symbol``, one per FMP label.
 
-        Stable returns ``[{quarter, fiscalYear, date}, ...]``; callers
-        historically iterate as ``[quarter, fiscal_year, date]`` triples
-        (see :func:`src.tools.sec.earnings_call.fetch_matching_earnings_call`),
-        so we reshape to that form.
+        Rows missing a label or a parseable date are dropped.
         """
         data = await self._make_request(
             "earning-call-transcript-dates", params={"symbol": symbol}
         )
-        result: List[List] = []
-        for row in (data or []):
-            if not isinstance(row, dict):
+        if isinstance(data, dict):
+            raise FMPRequestError("FMP API returned an error")
+        calls: List[CallDate] = []
+        for row in data or []:
+            try:
+                calls.append(CallDate(
+                    int(row["quarter"]),
+                    int(row.get("fiscalYear") or row["year"]),
+                    datetime.strptime(row["date"][:10], "%Y-%m-%d").date(),
+                ))
+            except (KeyError, TypeError, ValueError):
                 continue
-            quarter = row.get("quarter")
-            fiscal_year = row.get("fiscalYear") or row.get("year")
-            call_date = row.get("date")
-            if quarter is None or fiscal_year is None or call_date is None:
-                continue
-            result.append([quarter, fiscal_year, call_date])
-        return result
+        return calls
 
     async def get_historical_earnings_calendar(
         self, symbol: str, limit: int = 20

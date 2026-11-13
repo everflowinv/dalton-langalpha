@@ -236,11 +236,15 @@
   },
   "settings": {
     "fontSize": "字体大小",
-    "cardStyle": "卡片样式",
-    "cardStyleDesc": "对话和看板中数据卡片及其详情面板的外观。",
+    "cardStyle": "样式",
+    "cardStyleDesc": "主题的外观：卡片、控件和页面的绘制方式。",
     "cardStyleTerminal": "终端",
+    "cardStyleSoft": "柔和",
+    "cardStyleSoftDesc": "开放边框、胶囊与细线",
     "cardStyleBalanced": "均衡",
-    "cardStyleQuiet": "简洁",
+    "cardStyleBalancedDesc": "填充卡片，最接近经典外观",
+    "cardStyleTerminalDesc": "等宽字体、括号与虚线",
+    "themeMode": "模式",
     "experiments": "实验功能",
     "experimentsIntro": "仍在开发中的抢先体验功能。开启后即可为你的账户启用，随时都能关闭。",
     "experimentsEmpty": "暂无可用的实验功能。",
@@ -278,7 +282,7 @@
       },
       "claude_code_runtime": {
         "label": "Claude Code 运行时（预览版）",
-        "description": "通过 Claude Code 运行你的 Claude 对话，用量计入你自己的 Claude 套餐。它用 setup token 登录，这是专为 LangAlpha 生成的独立凭据，不会影响你自己的 Claude Code 登录。Claude Code 在你自己的电脑上运行；如果此服务器提供该选项，也可以在云端计算机上运行，使用你的 setup token 或 Anthropic API 密钥。请在设置的“模型接入”中选择运行位置。"
+        "description": "通过 Claude Code 运行你的 Claude 对话，用量计入你自己的 Claude 套餐。它用 setup token 登录，这是专为 LangAlpha 生成的独立凭据，不会影响你自己的 Claude Code 登录。Claude Code 在你自己的电脑上运行；如果此服务器提供该选项，也可以在云端计算机上运行，使用你的 setup token。请在设置的“模型接入”中选择运行位置。"
       },
       "a_share_pack": {
         "label": "A 股市场包",
@@ -634,7 +638,7 @@
       "preferences": "你告诉 Agent 的投资方式，让它的研究更贴合你。",
       "plan": "你的套餐、积分和账单，在 {{brand}} 账户中管理。",
       "general": "语言、时区和应用内引导。",
-      "appearance": "主题、字号和数据卡片的样式。",
+      "appearance": "主题（样式与浅色或深色）和字号。",
       "chat": "回复如何呈现，以及 Agent 工作时对话里显示什么。",
       "artifacts": "评论 Agent 生成的文件时的默认设置。",
       "agent": "Agent 如何作答、哪些操作无需询问，以及如何搜索网页。",
@@ -664,9 +668,8 @@
     "desktopGroup": "桌面应用",
     "helpGroup": "帮助",
     "displayGroup": "显示",
-    "themeDesc": "自动模式跟随系统设置。",
+    "themeDesc": "浅色或深色。自动则跟随系统设置。",
     "fontSizeDesc": "在此设备上缩放整个应用的文字。",
-    "chartsGroup": "数据卡片",
     "repliesGroup": "Agent 回复时",
     "composerGroup": "输入框",
     "artifacts": {
@@ -2640,6 +2643,8 @@
       "stateLapses": "等待中 · {{when}}失效",
       "stateHeld": "已触发 · 本轮结束后送达",
       "stateHeldUsage": "已触发 · 已达用量上限，将在你发送下一条消息时送达",
+      "stateHeldPlan": "等待 Claude 套餐在 {{time}} 重置",
+      "stateHeldPlanUnknown": "等待 Claude 套餐重置",
       "stateFired": "已触发 · {{time}}",
       "stateFinished": "已结束",
       "stateLapsed": "已失效",
@@ -2798,9 +2803,6 @@
       "claudeCodeNeedsOwnComputer": "仅可在你自己电脑上的工作区中使用",
       "claudeCodePolicyBlocked": "你所在组织的 Claude Code 策略不允许它在这台电脑上运行",
       "claudeCodeHostedOff": "请在设置中选择它在云端计算机上的运行方式",
-      "claudeCodeNeedsApiKey": "在设置中添加你的 Anthropic API 密钥后，即可在云端计算机上使用",
-      "claudeCodeApiKeyEndpoint": "请在设置中清空 Anthropic API 密钥的 Base URL，才能在云端计算机上使用",
-      "claudeCodePaused": "此服务器已暂停在云端计算机上运行",
       "claudeCodeNeedsBiggerComputer": "需要中型及以上规格的云端计算机，或你自己的电脑",
       "claudeCodeNeedsBiggerComputerPlan": "需要中型及以上规格的云端计算机：可更改规格或升级 LangAlpha 套餐，或使用你自己的电脑"
     },
@@ -2946,13 +2948,9 @@
         "account": "你的账户未开启 Claude Code。请在设置的“模型接入”中开启，或选择其他模型。",
         "token_refused": "Claude 拒绝了你的 setup token，它可能已过期或被撤销。请在设置的“模型接入”中添加新的 token 后使用此模型。",
         "hosted_off": "你的账户设置为只在你自己的电脑上运行 Claude Code，所以云端计算机上的工作区无法使用 Claude Code 模型。请在设置的“模型接入”中选择运行位置，或把此工作区移到你自己的电脑上。",
-        "needs_api_key": "在云端计算机上，Claude Code 直接在这台计算机上用你的 Anthropic API 密钥运行，但你还没有保存密钥。请在设置的“模型接入”中添加，或把此工作区移到你自己的电脑上。",
-        "api_key_endpoint": "云端计算机上的 Claude Code 只会把你的 Anthropic API 密钥发送给 Anthropic，而你的密钥设置了自定义 Base URL。请在设置的“模型接入”中清空 Base URL，或把此工作区移到你自己的电脑上。",
-        "api_key_refused": "Anthropic 拒绝了你的 API 密钥，或该账户已无余额。请在设置的“模型接入”中检查此密钥。",
         "too_many_turns": "你在云端计算机上同时运行的 Claude Code 对话已达上限（{{n}} 个），请等其中一个结束后再试。",
-        "hosted_paused": "此服务器已暂停在云端计算机上运行 Claude Code，在你自己的电脑上仍可运行。请选择其他模型，或把此工作区移到你自己的电脑上。",
         "stored_blocked": "你的账户无法保存 setup token，因此 Claude Code 只能在你自己的电脑上运行。请选择其他模型，或把此工作区移到你自己的电脑上。",
-        "stored_unattended": "自动化、唤醒以及其他 Agent 发来的对话不会使用 LangAlpha 为你保存的 setup token 运行。请在设置的“模型接入”中改用你的 Anthropic API 密钥，或在你自己的、有独立 token 的电脑上运行此工作区。",
+        "stored_unattended": "自动化、唤醒以及其他 Agent 自行发起的工作不会使用 LangAlpha 为你保存的 setup token 运行。如需用 Claude Code 运行它们，请在设置的“模型接入”中改为在你自己的电脑上运行。",
         "choice_changed": "本轮开始时，云端计算机上 Claude Code 的运行方式发生了变化。请重新发送你的消息。",
         "needs_bigger_computer": "Claude Code 可在中型及以上规格的云端计算机上运行，而此工作区所在的计算机规格较小。你可以更改这台计算机的规格，或把此工作区移到你自己的电脑上。",
         "needs_bigger_computer_plan": "Claude Code 可在中型及以上规格的云端计算机上运行，而此工作区所在的计算机规格较小。你可以更改这台计算机的规格或升级 LangAlpha 套餐，或把此工作区移到你自己的电脑上。"
@@ -3690,6 +3688,7 @@
     "stateLastRunFailed": "上次运行失败",
     "stateKeyRejected": "API 密钥被拒",
     "stateUsageLimit": "已达用量上限",
+    "stateClaudePlan": "Claude 套餐已达限额",
     "statePaused": "已暂停",
     "stateFinished": "已结束",
     "stateWatching": "监控中",
@@ -7068,10 +7067,6 @@
         "heading": "Claude Code 在哪里运行",
         "local": "仅在你自己的电脑上",
         "localDetail": "Claude Code 在你自己的电脑上运行，每台电脑各用自己的 setup token，LangAlpha 不保留副本。云端计算机上的工作区无法使用 Claude Code 模型。",
-        "apiKey": "也用于云端计算机，使用你的 Anthropic API 密钥",
-        "apiKeyDetail": "在中型及以上规格的云端计算机上，工作区的 Claude Code 直接在这台计算机上运行，每轮对话由 LangAlpha 把你的 API 密钥发给它。用量计入你的 Anthropic Console 账户，Max、Ultra 和 Team 套餐每月含 API 额度，不占用你 Claude 套餐的用量限额。",
-        "apiKeyEndpoint": "你的 Anthropic API 密钥设置了自定义 Base URL，云端计算机上的 Claude Code 无法使用它。清空该密钥的 Base URL 后即可使用。",
-        "needsApiKey": "云端计算机上的 Claude Code 没有可用的 Anthropic API 密钥。请在“模型接入”中添加，或重新保存已有的密钥。",
         "stored": "也用于云端计算机，使用由 LangAlpha 保存的 setup token",
         "storedDetail": "在中型及以上规格的云端计算机上，工作区的 Claude Code 直接在这台计算机上运行；没有独立 token 的你自己的电脑也在本机运行 Claude Code。每轮对话由 LangAlpha 把加密保存的 setup token 发给运行它的计算机。用量计入你的 Claude 套餐。",
         "paused": "此服务器已暂停在云端计算机上运行 Claude Code。你的选择会保留，Claude Code 在你自己的电脑上照常运行。",
@@ -7698,6 +7693,39 @@
       "creditsDetail": "如果你的 Claude 账户开启了额外用量，Claude Code 会继续用它运行。",
       "note": "{{names}} 上的 Claude 账户开启了额外用量。超出限额的第一次请求会在 LangAlpha 停止之前计入额外用量。如果永远不想使用，请在 claude.ai 中关闭。",
       "noteLink": "打开 claude.ai 用量设置"
+    },
+    "short": {
+      "five_hour": "5 小时",
+      "seven_day": "7 天",
+      "seven_day_opus": "7 天 Opus",
+      "seven_day_sonnet": "7 天 Sonnet",
+      "seven_day_overage_included": "7 天 Fable"
+    },
+    "near": "{{window}}已用 {{percent}}%，将于 {{time}} 重置。",
+    "limitDetail": "{{short}}限额已用完，{{time}} 重置",
+    "limitReached": "已达限额",
+    "pending": "下一轮 Claude Code 运行后显示套餐用量",
+    "asOf": "截至{{ago}}，来自这个 token 最近一次 Claude Code 请求。在 claude.ai 和你自己的 Claude Code 中的使用也计入。",
+    "table": {
+      "computer": "电脑",
+      "token": "Token",
+      "account": "账户",
+      "resets": "重置"
+    },
+    "meter": {
+      "title": "{{name}} 上的 Claude 套餐",
+      "tip": "截至{{ago}}。5 小时将于 {{time5}} 重置，7 天将于 {{time7}} 重置。",
+      "empty": "首轮运行后显示用量",
+      "resets": "5 小时将于 {{time5}} 重置，7 天将于 {{time7}} 重置。"
+    },
+    "check": {
+      "now": "立即检查",
+      "running": "检查中…",
+      "tip": "用你的 Claude 套餐发送一次很小的请求来读取用量。",
+      "held": "{{time}} 后可再次检查。",
+      "failed": "无法连接 Claude 检查用量，请稍后再试。",
+      "computerUnreached": "无法连接这台电脑查看用量，请稍后再试。",
+      "unsaved": "Claude 已响应，但用量未能更新，请稍后再试。"
     }
   }
 }

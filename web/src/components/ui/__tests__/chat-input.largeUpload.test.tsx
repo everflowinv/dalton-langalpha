@@ -1026,6 +1026,7 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       armReportBack: vi.fn(),
       refreshWorkspaces: vi.fn(),
       refreshClaudeCode: vi.fn(),
+      refreshClaudeCodePlan: vi.fn(), // DALTON-HOOK(chat-large-upload): upstream #740 dep
     };
 
     const processorRefs: StreamProcessorRefs = {

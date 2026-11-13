@@ -28,6 +28,7 @@ import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
 // DALTON-HOOK(colleague-dispatch): read cached user and team workspace permissions for sidebar row gating
 import { queryKeys } from '@/lib/queryKeys';
+import { cn } from '@/lib/utils';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../components/ui/hover-card';
 import { mediumDate, relativeTime } from '@/lib/format';
 import { Loader } from '@/components/ui/loader';
@@ -141,7 +142,7 @@ function ThreadRowTitle({ tid, title, active, onActivate }: {
         e.preventDefault();
         onActivate();
       }}
-      className={`text-sm truncate${fading ? ' animate-fade-in' : ''}`}
+      className={cn('text-sm truncate', fading && 'animate-fade-in', active && 'rail-prompt')}
       style={{ color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}
     >
       {title}

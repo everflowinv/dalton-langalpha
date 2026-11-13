@@ -32,7 +32,10 @@ def _lazy_builder(provider: str):
 # provider module with build_web_search_tool, one manifest entry.
 _PROVIDER_BUILDERS = register_gemini_grounding_search_builder(  # DALTON-HOOK(web-search-gemini)
     register_openclaw_search_builder(  # DALTON-HOOK(web-search-openclaw)
-        {name: _lazy_builder(name) for name in ("tavily", "serper", "bocha", "exa", "parallel")},
+        {
+            name: _lazy_builder(name)
+            for name in ("tavily", "serper", "bocha", "exa", "parallel", "deepseek")
+        },
     )
 )
 

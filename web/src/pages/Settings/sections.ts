@@ -96,8 +96,9 @@ export interface SettingEntry {
   desktopOnly?: boolean;
   /** Drawn only in the Models section's advanced view, which opening it turns on. */
   advanced?: boolean;
-  /** Names of rows drawn only some of the time beside this one, which a
-   *  search finds here so it never opens on a row that is not there. */
+  /** Other names the search finds this row by, though the row does not show
+   *  them: rows drawn only some of the time beside it, so a search never opens
+   *  on a row that is not there, or the name of the group the row sits in. */
   alsoKeys?: readonly string[];
   // DALTON-HOOK(settings-section): bilingual search terms and card-level visibility predicate
   keywords?: string;
@@ -118,7 +119,8 @@ export const SETTINGS = {
   timezone: { section: 'general', anchor: 'timezone', labelKey: 'settings.timezone', descKey: 'settings.timezoneDesc' },
   linkTarget: { section: 'general', anchor: 'link-target', labelKey: 'settings.shareLinkOpen', descKey: 'settings.shareLinkOpenDesc', desktopOnly: true },
   guides: { section: 'general', anchor: 'guides', labelKey: 'onboarding.settings.sectionTitle', descKey: 'onboarding.settings.description' },
-  theme: { section: 'appearance', anchor: 'theme', labelKey: 'settings.theme', descKey: 'settings.themeDesc' },
+  // Drawn as Mode under the Theme heading, and still looked for as the theme.
+  theme: { section: 'appearance', anchor: 'theme', labelKey: 'settings.themeMode', descKey: 'settings.themeDesc', alsoKeys: ['settings.theme'] },
   fontSize: { section: 'appearance', anchor: 'font-size', labelKey: 'settings.fontSize', descKey: 'settings.fontSizeDesc' },
   cardStyle: { section: 'appearance', anchor: 'card-style', labelKey: 'settings.cardStyle', descKey: 'settings.cardStyleDesc', keywords: '卡片样式 card style' },
   turnDisplay: { section: 'chat', anchor: 'stream-reasoning', labelKey: 'settings.turnDisplay', descKey: 'settings.turnDisplayDesc' },

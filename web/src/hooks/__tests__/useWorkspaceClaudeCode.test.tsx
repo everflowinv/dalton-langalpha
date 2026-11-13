@@ -44,6 +44,8 @@ function run(
   if (computerId) queryClient.setQueryData(queryKeys.workspaces.detail('ws-1'), desk(computerId));
   return renderHookWithProviders(() => useWorkspaceClaudeCode('ws-1'), { queryClient });
 }
+/** The picker's meter on a token that works, which turns run on through the saved one. */
+const savedMeter = (name: string) => ({ name, plan: undefined, credential: { kind: 'saved' }, checkAfter: null });
 const desk = (computerId: string | null) => ({ workspace_id: 'ws-1', name: 'Desk', is_home: false, computer_id: computerId });
 const failed = (code: number) => Object.assign(new Error(`Request failed with status code ${code}`), { response: { status: code, data: {} } });
 
@@ -58,17 +60,37 @@ describe('useWorkspaceClaudeCode', () => {
     await waitFor(() => expect(result.current).toEqual({ state: 'rejected', computerId: null, known: true }));
   });
 
-  it("reads the plan of the token the turn runs on: the computer's own, the saved one, or none on the API key", async () => {
+  it("reads the plan of the token the turn runs on: the computer's own, or the saved one", async () => {
     const plan = (credits: 'on' | 'off') => ({ five_hour: null, seven_day: null, limits: [], credits, observed_at: '2026-11-06T19:00:00Z' });
     const own = run('cmp-mac', { ...RUNS_HERE, plan: plan('off') }, () => Promise.resolve({ computers: [{ ...MAC, plan: plan('on') }] }));
     await waitFor(() => expect(own.result.current.plan).toEqual(plan('on')));
     const saved = run('cmp-daytona', { ...RUNS_HERE, plan: plan('off') });
     await waitFor(() => expect(saved.result.current.plan).toEqual(plan('off')));
-    const apiKey = run('cmp-daytona', { ...OWN_ONLY, plan: plan('off') }, undefined, () => Promise.resolve({
-      mode: 'api_key', api_key_saved: true, offered: ['api_key'], blocked: false, runs_on: 'api_key', refusal: null, disclosure: null,
-    }));
-    await waitFor(() => expect(apiKey.result.current.state).toBe('api_key'));
-    expect(apiKey.result.current.plan).toBeUndefined();
+  });
+
+  it("holds Check now as long as the server says, counted from when its read arrived, never from a time on the server's clock", async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const arrived = Date.parse('2026-11-07T15:00:00Z');
+    vi.setSystemTime(arrived);
+    // The server's clock runs an hour ahead of this browser's.
+    const plan = { five_hour: null, seven_day: null, limits: [], credits: null, observed_at: '2026-11-07T16:00:00Z' };
+    try {
+      const own = run('cmp-mac', OWN_ONLY, () => Promise.resolve({ computers: [{ ...MAC, state: 'signed_in', source: 'machine', plan, check_in: 60 }] }));
+      await waitFor(() => expect(own.result.current.meter?.checkAfter).toBe(arrived + 60_000));
+      const saved = run('cmp-daytona', { ...RUNS_HERE, state: 'signed_in', plan, check_in: 120 });
+      await waitFor(() => expect(saved.result.current.meter?.checkAfter).toBe(arrived + 120_000));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('offers no Check now in the meter where a check would be billed to usage credits', async () => {
+    const plan = { five_hour: null, seven_day: null, limits: [], credits: null, observed_at: '2026-11-07T16:00:00Z' };
+    const own = run('cmp-mac', OWN_ONLY, () => Promise.resolve({ computers: [{ ...MAC, state: 'signed_in', source: 'machine', plan, check_bills: true }] }));
+    await waitFor(() => expect(own.result.current.meter).toMatchObject({ name: 'Studio Mac', credential: null }));
+    const saved = run('cmp-daytona', { ...RUNS_HERE, state: 'signed_in', plan, check_bills: true });
+    await waitFor(() => expect(saved.result.current.meter).toBeDefined());
+    expect(saved.result.current.meter?.credential).toBeNull();
   });
 
   it("needs one of the user's own computers on a hosted computer where no saved token runs", async () => {
@@ -134,19 +156,13 @@ describe('useWorkspaceClaudeCode', () => {
   });
 
   it.each<[WorkspaceClaudeCode['state'], Partial<ClaudeCodeCustody>]>([
-    ['hosted_off', { mode: 'local', api_key_saved: true, refusal: 'hosted_off' }],
-    ['needs_api_key', { mode: 'api_key', api_key_saved: false, refusal: 'needs_api_key' }],
-    ['api_key_endpoint', { mode: 'api_key', api_key_saved: true, refusal: 'api_key_endpoint' }],
-    ['api_key', { mode: 'api_key', api_key_saved: true, runs_on: 'api_key' }],
-    ['hosted_paused', { mode: 'api_key', api_key_saved: true, offered: ['stored'], refusal: 'hosted_paused' }],
-    ['hosted_paused', { mode: 'stored', offered: ['api_key'], refusal: 'hosted_paused' }],
+    ['hosted_off', { mode: 'local', refusal: 'hosted_off' }],
     ['needs_own_computer', { blocked: true, offered: [], refusal: 'stored_blocked' }],
-    ['needs_own_computer', { mode: 'api_key', api_key_saved: true, refusal: 'needs_own_computer' }],
-    ['hosted_off', { blocked: true, offered: ['api_key'], refusal: 'hosted_off' }],
+    ['needs_own_computer', { mode: 'stored', refusal: 'needs_own_computer' }],
     ['checking', { mode: 'stored', offered: ['stored'], runs_on: 'stored_token' }],
   ])('on a hosted computer reads %s off the verdict for the choice for cloud computers', async (state, choice) => {
     const custody: ClaudeCodeCustody = {
-      mode: 'local', api_key_saved: false, offered: ['api_key', 'stored'], blocked: false, runs_on: null, refusal: null, disclosure: null, ...choice,
+      mode: 'local', offered: ['stored'], blocked: false, runs_on: null, refusal: null, disclosure: null, ...choice,
     };
     const { result } = run('cmp-daytona', OWN_ONLY, undefined, () => Promise.resolve(custody));
     await waitFor(() => expect(result.current).toEqual({ state, computerId: null, known: true }));
@@ -154,16 +170,12 @@ describe('useWorkspaceClaudeCode', () => {
 
   const SMALL = () => Promise.resolve({ computers: [MAC], cloud_refusals: { 'cmp-daytona': 'needs_bigger_computer' } });
 
-  it.each<[WorkspaceClaudeCode['state'], Partial<ClaudeCodeCustody>]>([
-    ['needs_bigger_computer', { mode: 'api_key', api_key_saved: true, runs_on: 'api_key' }],
-    ['needs_api_key', { mode: 'api_key', api_key_saved: false, refusal: 'needs_api_key' }],
-    ['hosted_off', { mode: 'local', refusal: 'hosted_off' }],
-  ])('on a cloud computer the server names too small reads %s, the credential first', async (state, choice) => {
+  it('on a cloud computer the server names too small reads the refusal, the credential first', async () => {
     const custody: ClaudeCodeCustody = {
-      mode: 'local', api_key_saved: false, offered: ['api_key'], blocked: false, runs_on: null, refusal: null, disclosure: null, ...choice,
+      mode: 'local', offered: ['stored'], blocked: false, runs_on: null, refusal: 'hosted_off', disclosure: null,
     };
     const { result } = run('cmp-daytona', OWN_ONLY, SMALL, () => Promise.resolve(custody));
-    await waitFor(() => expect(result.current).toEqual({ state, computerId: null, known: true }));
+    await waitFor(() => expect(result.current).toEqual({ state: 'hosted_off', computerId: null, known: true }));
   });
 
   // A self-hosted server offers no choice, and names the computer on the same list.
@@ -176,12 +188,12 @@ describe('useWorkspaceClaudeCode', () => {
 
   it('runs on a cloud computer the server does not name', async () => {
     const { result } = run('cmp-other', { ...RUNS_HERE, state: 'signed_in' }, SMALL);
-    await waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: null, known: true }));
+    await waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: null, known: true, meter: savedMeter('your setup token') }));
   });
 
   // The status says what the stored token is doing once it reads the choice.
   it('waits as on a check while the token is stored but the status does not run it yet', async () => {
-    const { result } = run('cmp-daytona', OWN_ONLY, undefined, () => Promise.resolve({ mode: 'stored', api_key_saved: false, offered: ['stored'], blocked: false, runs_on: 'stored_token', refusal: null, disclosure: null }));
+    const { result } = run('cmp-daytona', OWN_ONLY, undefined, () => Promise.resolve({ mode: 'stored', offered: ['stored'], blocked: false, runs_on: 'stored_token', refusal: null, disclosure: null }));
     await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 50));
     expect(result.current).toEqual({ state: 'checking', computerId: null, known: true });
@@ -200,19 +212,19 @@ describe('useWorkspaceClaudeCode', () => {
 
   // A stored token is one this server runs turns on, as a self-hosted one's is.
   it('follows the saved token where this server runs turns on it, whatever the choice reads', async () => {
-    const { result } = run('cmp-daytona', RUNS_HERE, undefined, () => Promise.resolve({ mode: 'stored', api_key_saved: false, offered: ['stored'], blocked: false, runs_on: 'stored_token', refusal: null, disclosure: null }));
+    const { result } = run('cmp-daytona', RUNS_HERE, undefined, () => Promise.resolve({ mode: 'stored', offered: ['stored'], blocked: false, runs_on: 'stored_token', refusal: null, disclosure: null }));
     await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
     await waitFor(() => expect(result.current).toEqual({ state: 'rejected', computerId: null, known: true }));
   });
 
   it('needs one of the user\'s own computers where no cloud computer runs it, whatever the stored token reads', async () => {
-    const { result } = run('cmp-daytona', { ...RUNS_HERE, state: 'signed_in' }, undefined, () => Promise.resolve({ mode: 'stored', api_key_saved: false, offered: ['stored'], blocked: false, runs_on: null, refusal: 'needs_own_computer', disclosure: null }));
+    const { result } = run('cmp-daytona', { ...RUNS_HERE, state: 'signed_in' }, undefined, () => Promise.resolve({ mode: 'stored', offered: ['stored'], blocked: false, runs_on: null, refusal: 'needs_own_computer', disclosure: null }));
     await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
     await waitFor(() => expect(result.current).toEqual({ state: 'needs_own_computer', computerId: null, known: true }));
   });
 
   it("follows an own computer's entry whatever the choice for cloud computers", async () => {
-    const { result } = run('cmp-mac', OWN_ONLY, undefined, () => Promise.resolve({ mode: 'local', api_key_saved: false, offered: ['api_key'], blocked: false, runs_on: null, refusal: 'hosted_off', disclosure: null }));
+    const { result } = run('cmp-mac', OWN_ONLY, undefined, () => Promise.resolve({ mode: 'local', offered: ['stored'], blocked: false, runs_on: null, refusal: 'hosted_off', disclosure: null }));
     await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
     await waitFor(() => expect(result.current).toEqual({ state: 'no_token', computerId: 'cmp-mac', known: true }));
   });
@@ -225,14 +237,14 @@ describe('useWorkspaceClaudeCode', () => {
     const RELAYING: ClaudeCodeComputer = { ...MAC, state: 'signed_in', source: 'saved' };
 
     it.each([
-      ['a hosted computer', 'cmp-daytona', null],
-      ['a computer relaying it', 'cmp-mac', 'cmp-mac'],
-    ])('reads %s as refused', async (_, computerId, expected) => {
+      ['a hosted computer', 'cmp-daytona', null, 'your setup token'],
+      ['a computer relaying it', 'cmp-mac', 'cmp-mac', 'Studio Mac'],
+    ])('reads %s as refused', async (_, computerId, expected, name) => {
       vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
       vi.setSystemTime(NOW);
       try {
         const { result } = run(computerId, SIGNED_IN, () => Promise.resolve({ computers: [RELAYING] }));
-        await act(() => vi.waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: expected, known: true })));
+        await act(() => vi.waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: expected, known: true, meter: savedMeter(name) })));
         (getClaudeCodeStatus as Mock).mockResolvedValue({ ...SIGNED_IN, state: 'rejected' });
         (getClaudeCodeComputers as Mock).mockImplementation(() => Promise.resolve({ computers: [{ ...RELAYING, state: 'rejected' }] }));
         await act(() => vi.advanceTimersByTimeAsync(31_000));
@@ -249,7 +261,7 @@ describe('useWorkspaceClaudeCode', () => {
       queryClient.setQueryData(queryKeys.features.list(), [{ key: 'claude_code_runtime', enabled: true }]);
       queryClient.setQueryData(queryKeys.workspaces.detail('ws-1'), desk('cmp-mac'));
       const { result } = renderHookWithProviders(() => useWorkspaceClaudeCode('ws-1'), { queryClient });
-      await waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: 'cmp-mac', known: true }));
+      await waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: 'cmp-mac', known: true, meter: savedMeter('Studio Mac') }));
       (getClaudeCodeStatus as Mock).mockResolvedValue({ ...SIGNED_IN, state: 'rejected' });
       (getClaudeCodeComputers as Mock).mockResolvedValue({ computers: [{ ...RELAYING, state: 'rejected' }] });
       await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeStatus() }));

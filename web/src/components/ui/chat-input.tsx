@@ -34,11 +34,10 @@ import {
 } from './chat-input.composerParts';
 import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
 import type { ModelRowStatus } from './chat-input.modelPicker';
-import { ANTHROPIC_KEY_URL, CLAUDE_CODE_CHOICE_URL, biggerComputer, claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
-import type { Payer } from '@/lib/modelPayer';
+import { CLAUDE_CODE_CHOICE_URL, biggerComputer, claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
 import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
 import { usePlanReader } from '@/hooks/useClaudeCodePlan';
-import { pickerPlanHold, planOutOf } from '@/lib/claudeCodePlan';
+import { creditsRefused, pickerPlanHold, planOutOf } from '@/lib/claudeCodePlan';
 import { deriveRecentModels } from './chat-input.models';
 import { modelGroups } from '@/lib/modelGroups';
 import { useEffortToolbarItem, useToolbarItems } from './chat-input.toolbar';
@@ -1042,19 +1041,15 @@ function ChatInput({
   // A Claude Code model runs a turn while the token where the workspace's
   // computer runs it works or could not be checked, as admission lets it;
   // otherwise its row says why, and where the user can fix it: that
-  // computer's token, or the saved one. On a cloud computer it may run on
-  // the user's Anthropic API key, which then pays for it. One whose Claude
-  // plan is used up for it waits for the reset, unless usage credits carry it,
-  // told by the picker's own minute clock (`now`), so the composer does not
-  // turn with the minute.
+  // computer's token, or the saved one. One whose Claude plan is used up for
+  // it waits for the reset, unless usage credits carry it, told by the
+  // picker's own minute clock (`now`), so the composer does not turn with the
+  // minute.
   const claudeCode = useWorkspaceClaudeCode(selectedWorkspaceId);
   const planReader = usePlanReader();
-  const pickerPayers = useMemo((): Record<string, Payer> => (claudeCode.state === 'api_key'
-    ? Object.fromEntries(Object.entries(payers).map(([m, payer]) => [m, isClaudeCodeModel(modelMetadata[m]) ? 'own_key' : payer]))
-    : payers), [claudeCode.state, payers, modelMetadata]);
   const modelGroupList = useMemo(() => modelGroups({
     models: turn.models,
-    payers: pickerPayers,
+    payers,
     brandOf: (group) => {
       const entry = entryFor(group);
       if (!entry?.group || entry.group === group) return undefined;
@@ -1063,7 +1058,7 @@ function ChatInput({
         label: visibleModels[entry.group]?.display_name ?? entry.group_display_name ?? entry.display_name,
       };
     },
-  }), [turn.models, visibleModels, pickerPayers, entryFor]);
+  }), [turn.models, visibleModels, payers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
     .filter((m) => !favorites.models.includes(m) && turn.offers(m));
   const tokenUrl = claudeCodeTokenUrl(selectedWorkspaceId);
@@ -1074,10 +1069,7 @@ function ChatInput({
         case 'no_token': return { unavailable: t('chat.modelSelector.claudeCodeSignedOut'), fix: () => navigate(tokenUrl) };
         case 'rejected': return { unavailable: t('chat.modelSelector.claudeCodeRejected'), fix: () => navigate(tokenUrl) };
         case 'needs_own_computer': return { unavailable: t('chat.modelSelector.claudeCodeNeedsOwnComputer') };
-        case 'hosted_paused': return { unavailable: t('chat.modelSelector.claudeCodePaused') };
         case 'hosted_off': return { unavailable: t('chat.modelSelector.claudeCodeHostedOff'), fix: () => navigate(CLAUDE_CODE_CHOICE_URL) };
-        case 'needs_api_key': return { unavailable: t('chat.modelSelector.claudeCodeNeedsApiKey'), fix: () => navigate(ANTHROPIC_KEY_URL) };
-        case 'api_key_endpoint': return { unavailable: t('chat.modelSelector.claudeCodeApiKeyEndpoint'), fix: () => navigate(ANTHROPIC_KEY_URL) };
         case 'needs_bigger_computer': {
           const { rowKey, link } = biggerComputer();
           return { unavailable: t(rowKey), fix: link ? () => window.open(link.url, '_blank', 'noopener,noreferrer') : undefined };
@@ -1086,9 +1078,12 @@ function ChatInput({
         case 'needs_perl': return { unavailable: t('modelAccess.claudeCode.fail.needs_perl') };
         case 'computer_unsupported': return { unavailable: t('modelAccess.claudeCode.fail.computer_unsupported') };
       }
-      const planHold = pickerPlanHold(
-        t, claudeCode.plan, planOutOf(preferences?.other_preference), m, { ...planReader, now },
-      );
+      const planOut = planOutOf(preferences?.other_preference);
+      const planHold = pickerPlanHold(t, claudeCode.plan, planOut, m, { ...planReader, now });
+      const credential = claudeCode.meter?.credential;
+      if (planHold && credential && creditsRefused(claudeCode.plan, planOut, m, now)) {
+        return { unavailable: planHold, check: { credential, checkAfter: claudeCode.meter?.checkAfter ?? null } };
+      }
       if (planHold) return { unavailable: planHold };
     }
     return { tag: lapsedSignIn(m) ? t('modelAccess.status.needsReauth') : undefined };
@@ -1102,12 +1097,15 @@ function ChatInput({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {/* Main Container. 22px is concentric with the 12px send button 10px in
-          from the bottom edge (DESIGN.md, Radius); the drag and recording
-          overlays repeat it. */}
+      {/* Main Container. 16px, concentric with the 8px send button set 8px
+          into the corner (DESIGN.md, Radius). Terminal and Soft state
+          their own corners for the composer, its send button and the rows
+          stacked on it (--cs-composer-*, styles/cardStyle.css); the drag and
+          recording overlays repeat the corner, and the open styles draw the
+          edge in theirs. */}
       <div
         ref={attachChatContainer}
-        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
+        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[var(--cs-composer-radius,16px)] cursor-text border border-[color:var(--color-shell-edge,var(--color-border-input))] bg-(--color-bg-card)', isListening && 'recording')}
         onClick={(event) => {
           // A press on a control in the box is that control's, and the deck
           // above the text is its own surface: focusing the text there would
@@ -1376,13 +1374,14 @@ function ChatInput({
               <ChatInputModelMenu
                 selectedModel={pillModel}
                 metadata={modelMetadata}
-                payers={pickerPayers}
+                payers={payers}
                 groups={modelGroupList}
                 favorites={favorites.models.filter(turn.offers)}
                 recent={recentModels}
                 onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
                 onSelectModel={handlePickModel}
                 rowStatus={modelRowStatus}
+                planMeter={claudeCode.meter}
                 dropdownDirection={dropdownDirection}
                 container={chatContainer}
                 draftRef={textareaRef}

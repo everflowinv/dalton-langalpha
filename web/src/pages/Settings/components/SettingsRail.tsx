@@ -102,12 +102,13 @@ export function SettingsRail({ section }: { section: Section }) {
   }, [section, searching]);
 
   return (
-    <div className={cn('settings-rail', (searchOpen || searching) && 'is-searching')}>
-      <div className="settings-search">
+    <div className={cn('page-rail settings-rail', (searchOpen || searching) && 'is-searching')}>
+      <div className="page-search settings-search">
         <Search className="settings-search-icon" aria-hidden />
         <input
           ref={inputRef}
           type="search"
+          className="page-search-input"
           role="combobox"
           aria-expanded={searching}
           aria-controls={listId}
@@ -173,7 +174,7 @@ export function SettingsRail({ section }: { section: Section }) {
                   onMouseEnter={() => setActive(index)}
                   onClick={() => open(entry, false)}
                 >
-                  <Icon className="settings-rail-icon" aria-hidden />
+                  <Icon className="page-rail-icon" aria-hidden />
                   <span className="min-w-0">
                     <span className="settings-result-name">{t(entry.labelKey)}</span>
                     <span className="settings-result-section">{t(SECTIONS[entry.section].labelKey)}</span>
@@ -199,7 +200,7 @@ export function SettingsRail({ section }: { section: Section }) {
             if (visible.length === 0) return null;
             return (
             <div key={group.labelKey} className="settings-rail-group">
-              <div className="settings-rail-label">{t(group.labelKey)}</div>
+              <div className="page-rail-label open-style:label-voice">{t(group.labelKey)}</div>
               {visible.map((s) => {
                 const Icon = SECTIONS[s].icon;
                 const current = s === section;
@@ -207,11 +208,11 @@ export function SettingsRail({ section }: { section: Section }) {
                   <Link
                     key={s}
                     to={`?tab=${s}`}
-                    className={cn('settings-rail-link', current && 'is-active')}
+                    className={cn('page-rail-link', current && 'is-active')}
                     aria-current={current ? 'page' : undefined}
                   >
-                    <Icon className="settings-rail-icon" aria-hidden />
-                    <span className="settings-rail-name">{t(SECTIONS[s].labelKey)}</span>
+                    <Icon className="page-rail-icon" aria-hidden />
+                    <span className={cn('page-rail-name', current && 'rail-prompt')}>{t(SECTIONS[s].labelKey)}</span>
                   </Link>
                 );
               })}
