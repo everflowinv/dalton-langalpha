@@ -376,7 +376,7 @@ class _Reader:
         from src.server.services.cancel_dispatch import _cancel_subagent_task
 
         try:
-            outcome = await _cancel_subagent_task(self.thread_id, task_id)
+            outcome = await _cancel_subagent_task(self.thread_id, task_id, None)
         except HTTPException as e:
             logger.warning("[ThreadStatus] stop of %s failed", shown, exc_info=True)
             detail = e.detail if isinstance(e.detail, str) else "Failed to cancel task."

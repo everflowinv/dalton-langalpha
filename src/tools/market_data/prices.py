@@ -24,7 +24,7 @@ from src.data_client import get_market_data_provider
 from src.data_client.fallbacks import unrecorded
 from src.data_client.freshness import Freshness, FreshnessLabel, measure_bars, measure_daily
 from src.data_client.market_data_provider import symbol_market  # DALTON-HOOK(stock-move-upgrade)
-from src.data_client.normalize import series_in_progress, series_lineage
+from src.data_client.normalize import listing_currency, series_in_progress, series_lineage
 from src.data_client.ginlix_data.directory import display_names
 from src.utils.market_hours import interval_seconds  # DALTON-HOOK(stock-move-upgrade)
 from market_protocol import AssetClass, PriceTreatment, market_of  # DALTON-HOOK(stock-move-upgrade)
@@ -678,6 +678,7 @@ No price data available for the specified period."""
         # always read STALE.
         venue_now = venue_local_time(ref) or datetime.now()
         open_ended = _window_is_open(end_date, venue_now)
+        price_currency = listing_currency(ref)
 
         artifact = {
             "type": "stock_prices",
@@ -685,7 +686,7 @@ No price data available for the specified period."""
             **({"name": cn_name} if cn_name else {}),
             # The chart renders the axis and tooltips off this — without it the
             # client falls back to a suffix guess and a CNY series reads as USD.
-            **({"price_currency": ref.price_currency} if ref is not None else {}),
+            **({"price_currency": price_currency} if price_currency else {}),
             # A CN fund prints a tenth of a fen finer than a stock (3 places).
             **({"asset_class": ref.asset_class.value} if ref is not None else {}),
             "ohlcv": ohlcv,

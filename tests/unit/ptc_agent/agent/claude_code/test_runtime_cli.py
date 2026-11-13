@@ -14,6 +14,8 @@ import base64
 import json
 import os
 import shlex
+import time
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import pytest
@@ -25,6 +27,7 @@ from langgraph.prebuilt import ToolNode
 from ptc_agent.agent.claude_code.cli import COMPACT_INSTRUCTIONS
 from ptc_agent.agent.claude_code.compaction import CompactionRules
 from ptc_agent.agent.claude_code.launcher import Credential, LocalLauncher
+from ptc_agent.agent.claude_code.plan import PlanWatch
 from ptc_agent.agent.claude_code.runtime import (
     TURN_KEY,
     TURN_QUERIES,
@@ -33,13 +36,14 @@ from ptc_agent.agent.claude_code.runtime import (
     build_claude_code_graph,
     token_works,
 )
-from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport, SteeringMiddleware, steers_ahead_message
+from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport, SteeringMiddleware, TaskResume, steers_ahead_message
 from ptc_agent.agent.middleware.runtime_context.durable import DurableUpdate, build_update_message, render_update_row
 from ptc_agent.agent.middleware.runtime_context.envelope import frame_reminder
+from src.llms.claude_code import PLAN_NOTICE_KEY, PlanLimit, PlanStopped
 from src.utils.tracking.per_call_token_tracker import PerCallTokenTracker
 
 from .conftest import TEST_KEY
-from .fake_api import TOKEN, FakeMessagesAPI
+from .fake_api import TOKEN, FakeMessagesAPI, unified
 from .harness import bash, new_graph, run_turn, spec
 
 pytestmark = [pytest.mark.enable_socket, pytest.mark.asyncio]
@@ -571,7 +575,9 @@ async def test_a_compaction_whose_summary_is_refused_fails_in_its_own_words_and_
         api.refused = frozenset({TOKEN})
         saved = _SavedToken(TOKEN)
         with pytest.raises(ClaudeTurnFailed) as failed:
-            await compact(SPEC, session["pinned"], LocalLauncher(env=env, saved=saved), thread_key="t-compact-refused",
+            refusing = LocalLauncher(env=env, saved=saved)
+            await compact(SPEC, session["pinned"], refusing, plan=PlanWatch(refusing, SPEC.model, stop_at_limit=False),
+                          thread_key="t-compact-refused",
                           identity="test-user", records=session)
     assert failed.value.kind == "auth_failed" and "401" in str(failed.value)
     assert saved.refusals == [TOKEN]
@@ -637,6 +643,101 @@ async def test_a_refused_request_fails_the_turn_and_commits_no_reply():
     assert failed.value.kind == "auth_failed"
     values = (await graph.aget_state({"configurable": {"thread_id": "t-refused"}})).values
     assert not any(isinstance(m, AIMessage) for m in values.get("messages", []))
+
+
+def _billed_at_the_limit() -> dict[str, str]:
+    """A response the plan ran out on, billed to usage credits."""
+    resets = {"five_hour": int(time.time()) + 3600, "seven_day": int(time.time()) + 86400}
+    return unified("rejected", five_hour=1.0, seven_day=0.6, resets=resets, claim="five_hour", overage="allowed",
+                   overage_in_use=True)
+
+
+async def test_a_reply_billed_to_usage_credits_under_stop_is_committed_with_the_notice():
+    async with FakeMessagesAPI(first_party=True, limits=[_billed_at_the_limit()]) as api:
+        values = await turn(api, new_graph(), "t-billed", [HumanMessage("hello")])
+    notice = values["messages"][-1].response_metadata[PLAN_NOTICE_KEY]
+    assert (notice["reason"], notice["window"]) == ("billed_credits", "five_hour")
+
+
+async def test_under_stop_the_cli_is_stopped_at_the_batch_end_after_a_response_billed_to_usage_credits():
+    async with FakeMessagesAPI(first_party=True, limits=[_billed_at_the_limit()]) as api:
+        with pytest.raises(PlanStopped) as stopped:
+            await turn(api, new_graph(), "t-gate", [HumanMessage("RUN_TOOL please")])
+        assert len(api.model_requests) == 1, "nothing more is asked of Claude past the limit"
+    assert (stopped.value.window, stopped.value.credits_billed) == ("five_hour", True)
+
+
+async def test_under_stop_a_reply_cut_at_the_output_limit_is_stopped_at_its_continuation():
+    """The CLI asks for the continuation as the cut reply ends, before the
+    response's report reaches the run, so that one request can go out; the
+    CLI is interrupted then, and the turn ends at the limit."""
+    graph = new_graph()
+    async with FakeMessagesAPI(first_party=True, limits=[_billed_at_the_limit()]) as api:
+        with pytest.raises(PlanStopped) as stopped:
+            await turn(api, graph, "t-maxtok-billed", [HumanMessage("MAX_TOKENS please")])
+        asked = len(api.model_requests)
+    values = (await graph.aget_state({"configurable": {"thread_id": "t-maxtok-billed"}})).values
+    assert [m.text for m in values["messages"] if isinstance(m, AIMessage)][0] == "part one"
+    assert (stopped.value.window, stopped.value.credits_billed) == ("five_hour", True)
+    assert asked <= 2, "no continuation is asked for past the one under way"
+
+
+class _HeldRow:
+    """A credential's row another run kept the plan's limit on."""
+
+    def __init__(self, limit: PlanLimit, *, read_s: float = 0) -> None:
+        self.held, self.read_s = limit, read_s
+        self.reads: list[tuple[str, str]] = []
+
+    async def open(self):
+        pass
+
+    async def out(self):
+        return "stop"
+
+    def record(self, signed_in, reading):
+        pass
+
+    async def limit(self, signed_in, model):
+        self.reads.append((signed_in, model))
+        await asyncio.sleep(self.read_s)
+        return self.held
+
+    async def written(self):
+        pass
+
+
+async def test_under_stop_a_limit_the_row_holds_stops_the_turn_before_its_first_request():
+    row = _HeldRow(PlanLimit("seven_day", datetime.now(UTC) + timedelta(days=1)))
+    async with FakeMessagesAPI(first_party=True) as api:
+        launcher = LocalLauncher(env={**api.cli_env(), "CLAUDE_CODE_MAX_RETRIES": "0"}, token=TOKEN, plan=row)
+        with pytest.raises(PlanStopped) as stopped:
+            await run_turn(SPEC, launcher, new_graph(), "t-held", [HumanMessage("hello")])
+        assert api.model_requests == [], "the CLI is asked nothing once the row says the plan is used up"
+    assert (stopped.value.window, stopped.value.credits_billed) == ("seven_day", False)
+    assert row.reads == [("saved", SPEC.model)]
+
+
+async def test_under_stop_a_turn_resumed_from_its_tool_results_asks_nothing_once_the_row_holds_a_limit():
+    """A resumed CLI carries on as soon as it is initialized, with no query
+    to hold back, so the gate is asked first, however slow its read."""
+    graph = new_graph()
+    async with FakeMessagesAPI(first_party=True) as api:
+        env = {**api.cli_env(), "CLAUDE_CODE_MAX_RETRIES": "0"}
+        await run_turn(SPEC, LocalLauncher(env=env, token=TOKEN), graph, "t-resume-held", [HumanMessage("RUN_TOOL please")])
+        history = [s async for s in graph.aget_state_history({"configurable": {"thread_id": "t-resume-held"}})]
+        after_tools = next(s for s in history if s.next == ("model",) and isinstance(s.values["messages"][-1], ToolMessage))
+        asked = len(api.model_requests)
+        row = _HeldRow(PlanLimit("seven_day", datetime.now(UTC) + timedelta(days=1)), read_s=0.5)
+        turn = ClaudeTurn(SPEC, LocalLauncher(env=env, token=TOKEN, plan=row), identity="test-user", thread_key="t-resume-held")
+        config = {"configurable": {"thread_id": "t-resume-held", TURN_KEY: turn,
+                                   "checkpoint_id": after_tools.config["configurable"]["checkpoint_id"]}}
+        try:
+            with pytest.raises(PlanStopped):
+                await asyncio.wait_for(graph.ainvoke(None, config), 60)
+        finally:
+            await turn.close()
+        assert api.model_requests[asked:] == [], "the resumed CLI asks nothing before the gate answers"
 
 
 async def test_usage_is_recorded_under_the_stamp_the_spec_carries():
@@ -1056,7 +1157,7 @@ async def test_a_steer_sent_while_a_call_runs_reaches_claude_right_after_its_res
     assert isinstance(result, ToolMessage) and isinstance(reply, AIMessage)
     assert steering.content == STEERED
     assert steering.additional_kwargs["held_jobs"] == {"run_id": "run-1", "job_ids": ["job-0"]}
-    assert [e["type"] for e in events] == ["steering_delivered"]
+    assert [e["type"] for e in events if e["type"] != "stream_heartbeat"] == ["steering_delivered"]
     assert inbox.confirmed == ["job-0"]
     told = [m["content"] if isinstance(m["content"], str) else m["content"][0]["text"] for m in after if m["role"] == "system"]
     assert any(t.startswith("The user sent a new message while you were working:\nUse the other file.\n") for t in told)
@@ -1075,7 +1176,7 @@ async def test_steers_waiting_as_a_query_ends_are_the_turns_next_query_up_to_its
     assert trigger.content == "User sent additional instructions." and trigger.additional_kwargs["lc_source"] == "orchestrator"
     assert steering.content == STEERED and inbox.confirmed == ["job-0"]
     assert [b["text"] for b in again["content"] if b["type"] == "text"][-2:] == [trigger.content, STEERED]
-    assert [e["type"] for e in events] == ["steering_delivered"]
+    assert [e["type"] for e in events if e["type"] != "stream_heartbeat"] == ["steering_delivered"]
 
     async with FakeMessagesAPI() as api:
         await _steered_turn(api, _Inbox(endless=True), ToolNode([]), "t-endless", [HumanMessage("hello")])
@@ -1098,7 +1199,7 @@ async def test_the_steers_a_turn_opened_with_are_shown_and_closed_once_claude_ha
             events = [e async for e in graph.astream({"messages": [ahead, user]}, config, stream_mode="custom")]
         finally:
             await claude.close()
-    assert [e["type"] for e in events] == ["steering_delivered"]
+    assert [e["type"] for e in events if e["type"] != "stream_heartbeat"] == ["steering_delivered"]
     assert inbox.confirmed == ["job-0"]
 
 
@@ -1227,3 +1328,62 @@ async def test_a_turn_leaves_the_rules_it_ran_under_for_the_composers_reading_be
     told = await thread_status.read_next_summary("t-rules", latest={})
     assert told["reason"] == "cold" and told["at"] > told["now"]
 
+
+
+class _Resumes(_Inbox):
+    """And a task whose run ended before it read the message left for it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.released: list[tuple] = []
+        self.resumes = [TaskResume(task_id="k1", job_ids=["job-r"], entries=[{"input_id": "i-1", "content": "Also check Q3."}])]
+
+    async def take_resumes(self, thread_id, run_id):
+        taken, self.resumes = self.resumes, []
+        return taken
+
+    async def release_resumes(self, thread_id, run_id, task_id, job_ids, *, counted=True):
+        self.released.append((thread_id, run_id, task_id, job_ids))
+
+
+async def test_a_task_left_a_message_resumes_as_the_turn_opens_with_no_request_of_its_own():
+    """As a langalpha turn's steering does before its first model call: the
+    resume is the steering's call, run with no CLI through the agent's tool
+    stack, which settles the rows it holds by its result (here a resume that
+    started no run of its own gives them back), and Claude, which made no call
+    for it, reads its result after the notice it came with."""
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    inbox, resumed = _Resumes(), []
+
+    @tool("Task")
+    async def task(action: str, task_id: str, prompt: str) -> str:
+        """Launch or resume a background task."""
+        resumed.append((action, task_id, prompt))
+        return "Resumed **Task-1** in background with new instructions."
+
+    steering = SteeringMiddleware(report_inbox=inbox, kinds=("steer", "resume"))
+    agent = create_agent(FakeListChatModel(responses=["x"]), tools=[task], middleware=[steering])
+    graph = build_claude_code_graph(agent.builder.nodes["tools"].runnable, checkpointer=InMemorySaver())
+    async with FakeMessagesAPI() as api:
+        launcher = LocalLauncher(env={**api.cli_env(), "CLAUDE_CODE_MAX_RETRIES": "0"})
+        claude = ClaudeTurn(SPEC, launcher, identity="test-user", thread_key="t-resume", steering=steering)
+        config = {"configurable": {"thread_id": "t-resume", TURN_KEY: claude}, "metadata": {"run_id": "run-1"}}
+        try:
+            with mock.patch("ptc_agent.agent.claude_code.mid_turn.build_message_checker", inbox.checker):
+                await graph.ainvoke({"messages": [HumanMessage("Follow-up instructions arrived.")]}, config)
+        finally:
+            await claude.close()
+        requests = list(api.model_requests)
+    values = (await graph.aget_state({"configurable": {"thread_id": "t-resume"}})).values
+    _, call, result, reply = values["messages"]
+    assert [(a, t) for a, t, _ in resumed] == [("resume", "k1")] and "Also check Q3." in resumed[0][2]
+    assert call.additional_kwargs["lc_source"] == "steering" and result.tool_call_id == call.tool_calls[0]["id"]
+    assert inbox.released == [("t-resume", "run-1", "k1", ["job-r"])]
+    assert isinstance(reply, AIMessage) and len(requests) == 1
+    [asked] = [m for m in requests[0]["messages"] if m["role"] == "user"]
+    assert asked["content"] == [
+        {"type": "text", "text": "Follow-up instructions arrived."},
+        {"type": "text", "text": frame_reminder("Resumed **Task-1** in background with new instructions.")},
+    ]

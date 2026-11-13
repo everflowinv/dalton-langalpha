@@ -638,6 +638,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             sandbox=MagicMock(),
             claude_code_launcher=lambda sandbox, hosted, saved: MagicMock(),
         )
-    assert "reply_to_comment" not in {
-        t.name for t in graph.turn.spec.tools
-    }
+    # Upstream #729: a Claude Code graph's turn is the run named by config.
+    # The tool list lives on the ClaudeTurn that call returns.
+    turn = graph.turn({"configurable": {"thread_id": "t-switch-1", "checkpoint_ns": ""}})
+    assert "reply_to_comment" not in {t.name for t in turn.spec.tools}

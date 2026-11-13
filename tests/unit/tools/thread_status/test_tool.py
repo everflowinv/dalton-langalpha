@@ -544,7 +544,7 @@ class TestStopTask:
 
         message = await _call(_tool(registry=registry), stop=given)
 
-        cancel.assert_awaited_once_with(THREAD, "k7Xm2p")
+        cancel.assert_awaited_once_with(THREAD, "k7Xm2p", None)
         read.assert_awaited_once_with(THREAD, ["k7Xm2p"])
         db.stop_thread_command.assert_not_awaited()
         assert message.content == "Stopped Task-k7Xm2p."
@@ -598,7 +598,7 @@ class TestStopTask:
 
         message = await _call(stop="Task-k7Xm2p")
 
-        cancel.assert_awaited_once_with(THREAD, "k7Xm2p")
+        cancel.assert_awaited_once_with(THREAD, "k7Xm2p", None)
         read.assert_not_awaited()
         assert message.content == (
             "Cannot stop Task-k7Xm2p: no such task in this conversation."

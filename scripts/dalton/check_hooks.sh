@@ -625,8 +625,8 @@ pinned_modified_sha256 = {
     "direct:get_daily_prices": "8ac5caef9f4daf0aaeba4243dd3523871fe4d1b5887004580b510a7d5c026098",
     "direct:get_quote": "3048022c2ebe1b63286a638dcfb09da38f4510fb24b3006b840c8a1a54ca93cd",
     # sync4 S4: upstream #694/#698 docstrings plus Dalton extended_hours
-    "mcp:price_data:get_asset_data": "3298104ce597a535188c0e6b997e7bb433ac6caf44ce0840ddf026b16e0ff5f6",
-    "mcp:price_data:get_stock_data": "7725a587e0702118bbcd29f9e5f4084347153d3b8812c21a6bff8bc724119692",
+    "mcp:price_data:get_asset_data": "cf937d4670546aecb251949c1ce56bd1b7a284817d57558607fcdd36c5fd70dc",
+    "mcp:price_data:get_stock_data": "21e82fce6d7fc091ec3beb45d9f6eb9cadd5a4be9f30f51e010e0e0722e30f83",
     # Prod-fix batch 2 (FMP 402): routes US statements to researchdata SEC
     # first and names the yfinance fallback source. sync4 S6: plus upstream
     # #715 fallback_from in Returns.

@@ -22,6 +22,7 @@ import {
 import { applyCallUsage, handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
 // DALTON-HOOK(provenance-batch): batch replay provenance per assistant message and flush once at replay end
 import { accumulateReplayProvenance, flushReplayProvenance } from '../stream/provenanceBatch';
+import { handlePlanBilled } from '../stream/mainEventHandlers';
 import {
   handleHistoryUserMessage,
   handleHistoryReasoningSignal,
@@ -324,6 +325,24 @@ export async function loadConversationHistory(
             if (msg.role !== 'assistant') return msg;
             return appendNotificationSegmentOnce(msg as AssistantMessage, segment);
           }));
+        }
+        return;
+      }
+
+      // A reply whose last request was billed to usage credits replays its
+      // notice under it, as the live stream drew it. Main agent only.
+      if (eventType === 'claude_code_plan') {
+        const msgId = currentActivePairIndex !== null
+          ? (assistantMessagesByPair.get(currentActivePairIndex) ?? null) : null;
+        if (!isSubagent && msgId) {
+          handlePlanBilled({
+            assistantMessageId: msgId,
+            event: event as Record<string, unknown>,
+            order: event._eventId != null
+              ? Number(event._eventId)
+              : (currentActivePairState ? ++currentActivePairState.contentOrderCounter : 0),
+            setMessages: setMessagesForHandlers,
+          });
         }
         return;
       }
