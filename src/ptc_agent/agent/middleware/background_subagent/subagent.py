@@ -170,13 +170,17 @@ DEFAULT_SUBAGENT_PROMPT = "In order to complete the objective that the user asks
 #    and no clear meaning for returning them from a subagent to the main agent.
 _EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
 
+# DALTON-HOOK(user-visible-text): the task-card title is user-visible. The
+# Args line below is the one description of `description` (one sentence, the
+# user's language, no internal id or tool name). The parameter annotations
+# do not repeat it.
 TASK_TOOL_DESCRIPTION = """Launch a subagent for complex, multi-step tasks.
 
 Use for: Complex tasks, isolated research, context-heavy operations.
 NOT for: Simple 1-2 tool operations (do directly).
 
 Args:
-    description: Short 1-2 sentence title shown on the task card. Think commit subject line.
+    description: Short title shown on the task card, in the user's language: one brief sentence saying what the work is doing. Do not include internal ids or tool names.
     prompt: The subagent's complete instructions. It sees nothing of this conversation, so include all the context, data and expected output format it needs.
     subagent_type: Which subagent to use (e.g. "general-purpose"). Required for "init".
     action: "init" (new task, default), "update" (instruct a running task), "resume" (continue a completed or stopped task from its checkpoint, with its prior context intact)
@@ -700,10 +704,8 @@ def _create_task_tool(
         return md
 
     def task(
-        description: Annotated[
-            str,
-            "Short 1-2 sentence summary of the task (displayed as title)",
-        ],
+        # DALTON-HOOK(user-visible-text): described once, in TASK_TOOL_DESCRIPTION.
+        description: str,
         prompt: Annotated[
             str,
             "Detailed instructions for the subagent to execute",
@@ -799,10 +801,8 @@ def _create_task_tool(
         return return_command_with_state_update(result, runtime.tool_call_id)
 
     async def atask(
-        description: Annotated[
-            str,
-            "Short 1-2 sentence summary of the task (displayed as title)",
-        ],
+        # DALTON-HOOK(user-visible-text): described once, in TASK_TOOL_DESCRIPTION.
+        description: str,
         prompt: Annotated[
             str,
             "Detailed instructions for the subagent to execute",

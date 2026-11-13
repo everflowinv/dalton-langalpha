@@ -74,6 +74,13 @@
 <citation_rules>
 {% include 'components/citation_rules.md.j2' %}
 </citation_rules>
+{# DALTON-HOOK(user-visible-text): every subagent on this base gets the shared rule. output_guidelines includes the same component, so skip this copy when that section is on. #}
+{% if not section_output_guidelines | default(false) %}
+
+<output_guidelines>
+{% include 'components/user_visible_text.md.j2' %}
+</output_guidelines>
+{% endif %}
 {% if section_workspace_context | default(false) %}
 
 <workspace_context>

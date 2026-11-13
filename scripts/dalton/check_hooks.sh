@@ -101,6 +101,10 @@ ALLOWED_HOOKS=(
   "workflow-subject-kind"
   "subagent-model-pin"
   "html-md-canonical"
+  # One user-visible-text rule in the main agent's output guidelines and in
+  # every subagent prompt (built-in and custom), plus the task-card title and
+  # background-notice wording that follows it.
+  "user-visible-text"
   "hermetic-prebuilt-workflows"
   "market-data-fallback"
   "yfinance-cache"

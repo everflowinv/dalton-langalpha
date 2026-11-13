@@ -325,6 +325,7 @@ RULES_SAMPLE = (
     "值得注意的是，本季的驱动并不是价格因素，而是基本面驱动。客观来说，我们并不认为这意味着需求见顶。\n\n"
     "3Q 打印显示营收落地在 512 亿美元，beat 了预期；指引的上修这对于估值来说是一个积极的信号。\n\n"
     "公司在电话会上未披露 TPU 外售金额；本轮未取得分部毛利数据，不加仓（管理层 8-K [引用3]）。\n"
+    "已调用 knowledge_update 写入 thesis v13。\n"
 )
 
 
@@ -337,6 +338,12 @@ def test_review_instructions_carry_the_two_new_rule_families() -> None:
     # The boundary: fact-bearing negations stay, and English terms are exempt.
     assert "承载事实" in instructions and "未披露" in instructions
     assert "术语" in instructions and "guidance" in instructions
+    # User-facing prose that leaks internal identifiers is its own check.
+    assert "internal_identifier" in instructions
+    assert "知识层编号" in instructions
+    assert "知识文件版本号" in instructions
+    assert "用户未要求技术细节" in instructions
+    assert "是否适合出现在当前交付物" not in instructions
 
 
 @pytest.mark.asyncio
@@ -356,6 +363,7 @@ async def test_new_issue_types_accepted_and_bogus_types_dropped(
                     _issue("3Q 打印", "translationese"),
                     _issue("beat 了预期", "translationese"),
                     _issue("公司在电话会上未披露 TPU 外售金额", "negation_defensive"),
+                    _issue("thesis v13", "internal_identifier"),
                     {**_issue("指引的上修", "made_up_type")},
                 ]
             )
@@ -366,6 +374,7 @@ async def test_new_issue_types_accepted_and_bogus_types_dropped(
     types = [i["issue_type"] for i in res["issues"]]
     assert types.count("negation_defensive") == 2
     assert types.count("translationese") == 2
+    assert types.count("internal_identifier") == 1
     assert "made_up_type" not in types
     assert res["dropped_issue_types"] == 1
     assert "issue_type 非法" in res["message"]

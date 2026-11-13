@@ -9,8 +9,8 @@
 
 ## 2. 正文给人读
 
-1. **正文和推送不出现机器内部标识与报错原文**：
-   - 报告正文和推送正文（飞书 / Discord 推送）一律不写知识层编号（如论点支柱 `P1`、多空分歧 `D1`、触发器 `T25`、待验证项 `V-013`、证据 `E-20261023-01` 等）、枚举值（如 `NO_CHANGE`、`THESIS_STRENGTHENED`、`clearly_above`、`sector_beta`、`act_now`、`wait_evidence`、`frozen_pre_event=true` 等）、英文字段名（如 `stance`、`conviction`、`actionability`、`binding_constraint`、`breakeven_verdict`、`b_row`、`debate_ids`、`0y`、`+1y` 等）、函数名、脚本名（如 `price_reaction.py`、`implied_model.py`、`move_quant.py`）、工具名（如 `knowledge_update`、`researchdata`）、工作区文件路径（如 `data/consensus/...`、`predictions.json`）和工具报错原文。例外：报告内部给读者看的章节序号和短名（如多空讨论里的“Debate 1：云业务利润率能否守住”）可以保留，禁止的是知识层内部编号（`D1`、`P1`、`V-013` 这类）。
+1. **用户可见文字不出现机器内部标识与报错原文**（总规则见系统提示词「用户可见文字」，以下为 Dalton 报告与推送中的具体替换规范）：
+   - 进度消息、任务卡标题、最终回复、报告正文、推送正文（飞书 / Discord 推送）和外部渠道正文一律不写知识层编号（如论点支柱 `P1`、多空分歧 `D1`、触发器 `T25`、待验证项 `V-013`、证据 `E-20261023-01` 等）、枚举值（如 `NO_CHANGE`、`THESIS_STRENGTHENED`、`clearly_above`、`sector_beta`、`act_now`、`wait_evidence`、`frozen_pre_event=true` 等）、英文字段名（如 `stance`、`conviction`、`actionability`、`binding_constraint`、`breakeven_verdict`、`b_row`、`debate_ids`、`0y`、`+1y` 等）、函数名、脚本名（如 `price_reaction.py`、`implied_model.py`、`move_quant.py`）、工具名（如 `knowledge_update`、`researchdata`）、知识文件版本号和工具报错原文。工作区文件路径（如 `data/consensus/...`、`predictions.json`）正文不写；链接目标可以包含定位文件所需的真实路径。例外：报告内部给读者看的章节序号和短名（如多空讨论里的“Debate 1：云业务利润率能否守住”）可以保留，禁止的是知识层内部编号（`D1`、`P1`、`V-013` 这类）。
    - **正面写法**：提到某条分歧或支柱时，用一句话直接写出它的具体内容；提到胜率裁决时写中文（“显著高于门槛”“在门槛附近”“低于门槛”“无法判断”；裁决所评的方向写“做多 / 做空”），提到事件五词结论时写中文（“无变化”“强化”“削弱”“证伪”“新论点”），提到方向、确信度、行动分类与限制变量时写中文（方向：“看多 / 看空 / 中性 / 暂不表态”；确信度：“高 / 中 / 低”，暂不表态时为“无”；行动分类：“立即行动 / 等待买点 / 等待证据 / 暂不参与”；限制变量：“无 / 价格 / 关键证据待验证 / 催化剂时点 / 下行路径风险 / 交易执行条件”）；数据缺口与取数失败的披露位置见本节第 5 条（不贴工具报错原文，渠道失败不得写成“没有新信息”）。
    - **示例 1**：
      - 改前：`结论：强化（THESIS_STRENGTHENED）——1Q26 实际业绩与 2Q26 指引同时验证 P1（美国餐饮主业现金牛稳固）、P2（新零售与杂货规模效应跨过盈亏平衡拐点）及 D1（2026 年投资周期属于可控的短期节奏错配）。`
@@ -20,8 +20,8 @@
      - 改后：`投资倾向为看多（确信度：中），当前建议等待证据，待 2Q26 平台改造费用达峰与新零售单位经济转正得到验证后再行动。按基准情景 25% 与 50% 测试权重测算，当前股价隐含胜率均在门槛附近 [引用1]。`
 
 2. **机器文件照常写编号与枚举；`## 引用` 保留核验前缀，`## 来源` 行末可带文档编号**：
-   - 知识层编号、枚举值与字段名照常写进 JSON、知识层写入（`knowledge_update`、`knowledge_append_verdict`）和机器文件（如 `predictions.json`、`*.gates.json`），本节规则只管给人读的报告正文与推送正文。
-   - 文末 `## 引用` 节每一行的格式不变：冒号后**先写**核验目标（`evidence:`、`model:`、`prov:`、`f:` 开头，发布前的数字核验只认冒号后的第一段），然后在括号里写人能读懂的来源说明（来源类型、机构、标题、日期），文档编号（`doc_id`、accession 等）放在括号内最后。`## 来源` 节（推送和快讯）每行先写来源说明，文档编号（`doc_id`、accession、`mail:ID`、`funda:ID` 等）放在行末，方便追溯。正文段落里不写文档编号。
+   - 知识层编号、枚举值与字段名照常写进 JSON、知识层写入（`knowledge_update`、`knowledge_append_verdict`）和机器文件（如 `predictions.json`、`*.gates.json`）。
+   - 文末 `## 引用` 节每一行的格式不变：冒号后**先写**核验目标（`evidence:`、`model:`、`prov:`、`f:` 开头，发布前的数字核验只认冒号后的第一段），然后在括号里写人能读懂的来源说明（来源类型、机构、标题、日期），文档编号（`doc_id`、accession〔SEC 申报受理号〕等）放在括号内最后。`## 来源` 节（推送和快讯）每行先写来源说明，文档编号（`doc_id`、accession、`mail:ID`、`funda:ID` 等）放在行末，方便追溯。正文段落里不写文档编号。
    - **示例**：
      - 改前：`已调用 knowledge_update(doc="thesis") 写入 NO_CHANGE，一致预期快照见 data/consensus/DASH-2026-10-30.json，2Q26 GOV 共识中位数为 298 亿美元。`
      - 改后：正文写 `卖方一致预期 2Q26 GOV（订单总金额）中位数为 298 亿美元 [引用5]。`；文末 `## 引用` 写 `[引用5]: model:model/DASH-model-v02.xlsx!Summary!D14 （行情与模型｜一致预期快照与模型对比｜2026-10-30｜data/consensus/DASH-2026-10-30.json）`。

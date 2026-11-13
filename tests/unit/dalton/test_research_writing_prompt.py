@@ -212,7 +212,9 @@ def test_writing_md_deduplicated_and_retains_dalton_mechanisms() -> None:
     # Dalton-specific mechanisms and restored structural rules remain in writing.md
     assert "「跟踪」节" in writing_md
     assert "准确口径" in writing_md
-    assert "正文和推送不出现机器内部标识与报错原文" in writing_md
+    assert "用户可见文字不出现机器内部标识与报错原文" in writing_md
+    assert "进度消息" in writing_md
+    assert "只管给人读的报告正文与推送正文" not in writing_md
     assert "## 引用" in writing_md
     assert "一句话里的事实数字一般不超过两个" in writing_md
     assert "缺口只说一次，放对位置" in writing_md

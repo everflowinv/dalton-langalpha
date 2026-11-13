@@ -355,6 +355,19 @@ class BackgroundSubagentOrchestrator:
 
         # Sort by task_id for consistent ordering
         sorted_tasks = sorted(tasks, key=lambda t: t.task_id)
+        # DALTON-HOOK(user-visible-text): same sentence as report_back's task
+        # notices. This text is an internal notice to the model, and an English
+        # notice must not switch the language of the reply to the user.
+        language_notice = (
+            "This notice is from the system, not the user. Keep writing to the user "
+            "in the language of their request."
+        )
+        # DALTON-HOOK(user-visible-text): one check sentence, folded into the
+        # TaskOutput line. Stopped tasks are not told to call TaskOutput.
+        delivery_notice = (
+            "check the result and any files it wrote before telling the user "
+            "the work is done."
+        )
 
         # Build notification message
         if len(sorted_tasks) == 1:
@@ -367,11 +380,14 @@ class BackgroundSubagentOrchestrator:
                     f"Your background subagent task was stopped before it "
                     f"finished: **{task.display_id}**. No result was produced, "
                     f"and the stop was deliberate — report it and await "
-                    f"instruction rather than re-dispatching."
+                    f"instruction rather than re-dispatching.\n\n"
+                    f"{language_notice}"
                 )
             return (
-                f"Your background subagent task has completed: **{task.display_id}**.\n\n"
-                f"Call `TaskOutput(task_id=\"{task.task_id}\")` to see the result."
+                f"Your background subagent task's run has ended: **{task.display_id}**.\n\n"
+                f"Call `TaskOutput(task_id=\"{task.task_id}\")` to retrieve the result, "
+                f"and {delivery_notice}\n\n"
+                f"{language_notice}"
             )
 
         task_list = ", ".join(
@@ -379,10 +395,13 @@ class BackgroundSubagentOrchestrator:
             + (" (stopped)" if t.terminal_status == "cancelled" else "")
             for t in sorted_tasks
         )
+        # DALTON-HOOK(user-visible-text): multi-task notice asks to fetch and check, keeps the user's language
         return (
-            f"Your background subagent tasks have completed: {task_list}.\n\n"
-            f"Call `TaskOutput(task_id=\"...\")` for each task's result. A task "
-            f"marked stopped produced no result; do not re-dispatch it unless asked."
+            f"Your background subagent tasks' runs have ended: {task_list}.\n\n"
+            f"Call `TaskOutput(task_id=\"...\")` for each finished task's result, "
+            f"and {delivery_notice} A task "
+            f"marked stopped produced no result; do not re-dispatch it unless asked.\n\n"
+            f"{language_notice}"
         )
 
     def get_pending_tasks_status(self) -> dict[str, Any]:
