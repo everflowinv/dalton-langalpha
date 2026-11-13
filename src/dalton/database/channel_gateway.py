@@ -1967,7 +1967,7 @@ async def create_bind_code(
 
 
 async def _ensure_platform_default_settings(
-    cur: Any, user_id: str, platform: str
+    cur: Any, user_id: str, platform: str, *, same_account: bool = True
 ) -> None:
     await cur.execute(
         """
@@ -1988,7 +1988,24 @@ async def _ensure_platform_default_settings(
         )
     else:
         apps = dict(row.get("apps") or {})
-        apps[platform] = default_app
+        existing = apps.get(platform)
+        # A rebind keeps the Dalton user's registered group chats and automation
+        # output choices: resetting them silently dropped group targets
+        # (2026-11-10). Group delivery is gated on the Dalton user (tier and
+        # workspace access), not on the platform account. Personal routing
+        # (preferred target, agent-message allowlist) is reset when the bound
+        # account changes, so no address of the old account survives.
+        # Only an explicit unbind clears the platform's settings.
+        if isinstance(existing, dict):
+            kept = existing if same_account else {
+                k: v for k, v in existing.items() if k in ("chats", "automation_output")
+            }
+            merged = {**default_app, **kept}
+        else:
+            merged = default_app
+        if merged == existing:
+            return
+        apps[platform] = merged
         next_ver = bump_version_str(row.get("version"))
         await cur.execute(
             """
@@ -2097,6 +2114,17 @@ async def _bind_identity_in_tx(
     `_WeixinSettingsLockSetChanged` before any identity change.
     """
     reject_company_system_auth(user_id)
+    await cur.execute(
+        """
+        SELECT platform_user_id FROM dalton_channel_identities
+        WHERE user_id = %s AND platform = %s
+        """,
+        (user_id, platform),
+    )
+    prior_identity = await cur.fetchone()
+    same_account = bool(prior_identity) and str(
+        prior_identity.get("platform_user_id") or ""
+    ) == str(platform_user_id)
     await cur.execute(
         """
         SELECT user_id FROM dalton_channel_identities
@@ -2413,7 +2441,9 @@ async def _bind_identity_in_tx(
     gen_row = await cur.fetchone()
     current_gen = int(gen_row["generation"]) if gen_row else 1
 
-    await _ensure_platform_default_settings(cur, user_id, platform)
+    await _ensure_platform_default_settings(
+        cur, user_id, platform, same_account=same_account
+    )
     return current_gen
 
 

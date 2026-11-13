@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
 from langchain_core.runnables import RunnableConfig
@@ -35,6 +36,64 @@ EXTERNAL_PUBLISH_FORBIDDEN_MESSAGE = (
     "请如实告知用户这一身份限制，不要尝试绕过。"
 )
 
+# One sentence, attached by the tool on every structured-output parse failure.
+# language.py does not repeat it.
+_PARSE_FAILURE_SENTENCE = (
+    "这是审查服务的结构化输出解析失败，与稿件内容无关，不要为此修改稿件；"
+    "可再试一次，仍失败就跳过语言审查并在交付里注明未完成语言审查"
+)
+
+
+def _infer_language_error(message: str) -> tuple[str, bool]:
+    """Classify a check_language failure that did not already name its type.
+
+    Returns (error_type, retryable). Input problems are not worth a blind retry.
+    """
+    msg = message or ""
+    if any(
+        token in msg
+        for token in ("JSONDecodeError", "ValidationError", "解析失败", "Expecting value")
+    ):
+        return "parse_failure", True
+    if any(
+        token in msg
+        for token in (
+            "round 只能是",
+            "Draft file not found",
+            "未配置模型",
+            "规则文件缺失",
+            "不可解析",
+            "第 2 轮必须在第 1 轮之后",
+            "filesystem backend is unavailable",
+            "审查期间稿件已改动",
+        )
+    ):
+        return "input_problem", False
+    return "upstream_unavailable", True
+
+
+def _language_tool_result(res: dict[str, Any]) -> str:
+    """Success stays the plain summary. Failures name ok, error type, and retryable."""
+    if res.get("ok"):
+        return str(res.get("message") or "")
+    message = str(res.get("message") or "")
+    if res.get("error_type"):
+        error_type = str(res["error_type"])
+        retryable = bool(res.get("retryable"))
+    else:
+        error_type, retryable = _infer_language_error(message)
+    if error_type == "parse_failure" and message.count(_PARSE_FAILURE_SENTENCE) == 0:
+        message = f"{message}{_PARSE_FAILURE_SENTENCE}"
+    return json.dumps(
+        {
+            "ok": False,
+            "error_type": error_type,
+            "retryable": retryable,
+            "message": message,
+        },
+        ensure_ascii=False,
+    )
+
 
 def _build_check_language_tool(
     filesystem_backend: Any = None,
@@ -54,8 +113,8 @@ def _build_check_language_tool(
     ) -> str:
         """审查正式产物草稿的语言问题，只标问题、不改稿，逐条给原句引用与修改方向。
 
-        审查对象是给人读的 .md 正式产物（drafts/、research/ 下的笔记与草稿，含 research/push/ 下的推送稿）；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的抓取原文、知识层渲染文件（thesis.md 等）、research/topics/conversations/ 机器纪要、published/ 归档稿（其审查以对应草稿为准）与 .audit/.annotated/.language 侧车不审。round=1 在初稿写完、第一次独立审稿之前；round=2 在内容定稿后（一次写完的笔记即第 1 轮改完后），且要求已做过第 1 轮。每条 issue 的 quote 逐字摘自草稿，找不到的会被丢弃并计数。审查模型在 设置 → 模型 → 高级 → 语言审查 配置。改稿由你按清单自己做；本工具失败（模型不可用、超时）时不写侧车、不算通过。
-        Returns: 一行摘要：轮次、问题数、丢弃的引用数与清单路径 <draft>.language.md。
+        审查对象是给人读的 .md 正式产物（drafts/、research/ 下的笔记与草稿，含 research/push/ 下的推送稿）；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的抓取原文、知识层渲染文件（thesis.md 等）、research/topics/conversations/ 机器纪要、published/ 归档稿（其审查以对应草稿为准）与附属审查记录（`.audit` / `.annotated` / `.language`）不审。round=1 在初稿写完、第一次独立审稿之前；round=2 在内容定稿后（一次写完的笔记即第 1 轮改完后），且要求已做过第 1 轮。每条问题项（issue）的原句引用（quote）逐字摘自草稿，找不到的会被丢弃并计数。审查模型在 设置 → 模型 → 高级 → 语言审查 配置。改稿由你按清单自己做；本工具失败（模型不可用、超时）时不写附属审查记录文件（`.language.json` / `.language.md`），不算通过。解析失败（error_type=parse_failure，结构化输出解析失败）是审查服务的问题，与稿件内容无关，不要为此修改稿件。
+        Returns: 成功时一行摘要：轮次、问题数、丢弃的引用数与清单路径 <draft>.language.md。失败时为 JSON：ok（是否成功，失败为 false）、error_type（parse_failure〔解析失败〕/ upstream_unavailable〔上游服务不可用〕/ input_problem〔输入或前置条件错误〕）、retryable（是否可重试）、message（错误说明）。
         """
         user_id, workspace_id, thread_id, _ = _extract_run_identity(config)
         if not user_id:
@@ -78,7 +137,7 @@ def _build_check_language_tool(
             user_id=user_id,
             thread_id=thread_id,
         )
-        return str(res["message"])
+        return _language_tool_result(res)
 
     return _check_language
 

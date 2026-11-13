@@ -65,6 +65,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - 检查返回的 JSON：
      - `ok` 必须为 `true`，且 `data_ok` 必须为 `true`。若最新一根日线尚未生成导致 `data_ok: false`，**立即停止归因**，向用户说明“最新交易日行情尚未就绪，暂不下归因结论”（运行日志记录 `data_ok=false`，面向用户或 PM 的正文不写字段名）。
      - 记录核心量化指标：未复权收盘价 `close`、复权计算的区间涨跌幅 `change_pct`、逐日明细 `daily[]`（每行含逐日基准收益 `benchmark_pct`；无同组公司时 `peer_median_pct` 为 `null`）、当日成交量对前 20 日均量倍数 `volume_vs_adtv`、同组各成员涨跌 `peers[]` 与实际参与计算的成员 `peers_used[]`、同组来源 `peer_source`（`explicit` / `coverage` / `default_map` / `none`）、同组中位数 `peer_median`、板块 ETF 涨跌 `etf_change`、超额收益 `alpha_vs_peers` 与 `alpha_vs_sector`（盘前 / 盘后另有 `alpha_vs_futures`）、60 日日超额标准差 `sigma_60d_pct`、单日 `day_z`、窗口 `window_z`，以及分类判定 `assessment`（`sector_beta` / `stock_specific` / `mixed`；报告正文与对话回复统一写中文“板块共振 / 个股驱动 / 两者兼具”，不出现 `sector_beta` 等脚本判定值）；输出末尾的 `computed_at` 是本次计算的 ISO 时间，引用指标时用它核对输出版本。
+     - **盘中成交量**：`session_complete`（当日交易时段是否已收盘）为 `false` 时，`volume_vs_adtv` 的含义是「截至当前的累计成交量占日均量比例」，并带已开盘分钟数 `session_elapsed_minutes`、全天交易分钟数 `session_length_minutes` 和时段进度 `session_progress`。盘中不得直接拿 `volume_vs_adtv` 单独判断缩量或放量，必须改看同进度比较值 `volume_comparison.scaled_vs_adtv`：当 `volume_comparison.basis == "same_time"`（与历史同一时刻累计均量对比）时，直接引用该比值；当 `volume_comparison.basis == "session_progress_scaled"`（缺少历史分时数据，按时段进度线性折算）时，正文引用该比值必须写明「按盘中时段进度折算」。美股的 `session_length_minutes` 用当天实际收盘时间（提前收市日短于常规全日）。港股与 A 股没有交易所半日市日历，输出 `session_calendar` 为 `regular_only`，说明中写「未识别半日市，提前收市日的折算值偏高」。收盘后（`session_complete` 为 `true`）`volume_vs_adtv` 仍是全日成交量相对前 20 日均量倍数。
      - **按 `benchmark` 写准对比基准**：`benchmark == "peers"` 时才是同组口径；`benchmark == "sector_etf"`（无同组公司，`peers` 为空、`peer_median` 与 `alpha_vs_peers` 为 `null`）时只能写“**相对板块 ETF**”；`benchmark == "futures"`（盘前 / 盘后且板块 ETF 数据缺失）时只能写“**相对指数期货**”；都不能写成“相对同组”或“对同组超额”，也不要和手算的同组数字混用。两类时段输出的指标不同：**日线窗口（`--session regular`）**按所选基准统一计算 `sigma_60d_pct`、`day_z`、`window_z` 与 `assessment`；**盘前 / 盘后（`--session pre|post`）**不输出 `sigma_60d_pct`、`day_z`、`window_z`，只按所选基准的超额收益（`alpha_vs_peers` / `alpha_vs_sector` / `alpha_vs_futures`）判定 `assessment`。
      - **更换同组后必须重跑**：用 `--peers A,B,C` 指定新同组后重新运行脚本，超额收益、`sigma_60d_pct`、`day_z`、`window_z` 与 `assessment` 一律采用**新输出的全部数字**；不要把新同组的手算超额和旧输出的 σ、z 值拼在一起用，两者基准不同，不可比。
 2. **读公司知识层**：按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读取本工作区的 `agent.md` 托管块、`thesis.md`、`debate.md`（及按需 `drivers.md`、`verdicts.md`、`agenda.md`），明确当前支柱与关键 debate 的确认 / 警告 / 证伪阈值，后续判断异动是否触及这些阈值。
@@ -197,11 +198,11 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - **主要驱动**：个股事件 / 板块共振 / 宏观与利率 / 资金面与仓位挤压 / 原因暂缺，并给出催化剂主次排序；
    - **主要归因与关键竞争解释**：第 0 步冻结的 2–3 个竞争解释逐条核验记在内部底稿；报告正文写主要归因，以及会改变结论的竞争解释（不逐条罗列已排除的无关解释）；
    - **对 thesis 的含义**：这次异动背后的事实是否触及某个核心支柱（确认/警告/证伪阈值）或某条关键 debate？当前市场定价是对还是错（过度反应 / 反应不足 / 合理反映了基本面变化）？
-   - **收尾三问（报告正文必答，并把第三问的结论写进 `verdict` 的 `payoff_assessment` 字段）**：经营变了吗？预期变了吗？赔率变了吗？——分别回答事件是否改变经营事实、是否改变市场预期（当前定价水平），以及是否改变当前价格下的赔率。赔率比较的**基准是上一份带日期、锚价和期限的报告里的三情景价带与所需胜率**；尚无历史基准时明确写"本轮建立基准"（此时 `payoff_assessment` 填 `{"changed": false, "reason": "none"}`），不得声称已经比较出了变化。赔率变好 / 变差 / 没变都要写明方向与依据。
-     - `payoff_assessment` 的填法：赔率没变填 `{"changed": false, "reason": "none"}`；赔率变了填 `{"changed": true, "reason": "<枚举值>"}`，`reason` 按本次赔率变化的主因从以下五个枚举值中选一个：
-       - `"price_crossed_band"`：**我们的三情景（`Bear` / `Base` / `Bull`）估值假设未改**，单纯股价涨跌越过了上一版三情景价带端点（如跌破 `Bear` 下沿、涨穿 `Base` / `Bull` 上沿）或进入了事先设定的买点价带。
-       - `"scenario_revised"`：本次事件带来新基本面证据，**我们重算并调整了三情景的 EPS 或估值倍数假设**，使三情景目标价带本身上移或下移。
-       - `"expectations_migrated"`：**我们的三情景假设未改**，但 **Street consensus 或买方 bogey 明显上移或下移**，改变了当前价格隐含的预期差与所需胜率。
+   - **收尾三问（报告正文必答，并把第三问的结论写进 `verdict` 的 `payoff_assessment` 字段）**：经营变了吗？预期变了吗？赔率变了吗？——分别回答事件是否改变经营事实、是否改变市场预期（当前定价水平），以及是否改变当前价格下的赔率。赔率比较的**基准是上一份带日期、锚价和期限的报告里的三情景价带与所需胜率**。没有这份历史基准时，正文写「尚未评估」，不得写成赔率没变，也不得声称已经比较出了变化。有基准且预期收益或所需胜率发生变化时，正文列出变动前后的数值与差额（例如预期收益从 +17.3% 到 +21.8%，差额 +4.5 个百分点；所需熊市权重从约 34% 到约 24%，差额约 -10 个百分点）。若仅因股价在原价带内波动产生差额、未触发下列五种情形之一，则 `changed` 仍填 `false`、`reason` 仍填 `"none"`。是否推送仍按第 7 步规则判定。除「尚未评估」外，赔率变好、变差或没变都要写明方向与依据。
+     - `payoff_assessment` 的填法：尚未评估填 `{"comparable": false, "changed": false, "reason": "none"}`；比过之后赔率没变填 `{"changed": false, "reason": "none"}`（有差额就带上 `expected_return_delta` 与 `required_probability_delta`）；赔率变了填 `{"changed": true, "reason": "<枚举值>"}`，`reason` 按本次赔率变化的主因从以下五个枚举值中选一个：
+       - `"price_crossed_band"`：**我们的三情景（`Bear`（悲观）/ `Base`（基准）/ `Bull`（乐观））估值假设未改**，单纯股价涨跌越过了上一版三情景价带端点（如跌破 `Bear` 下沿、涨穿 `Base` / `Bull` 上沿）或进入了事先设定的买点价带。
+       - `"scenario_revised"`：本次事件带来新基本面证据，**我们重算并调整了三情景的 EPS（每股收益）或估值倍数假设**，使三情景目标价带本身上移或下移。
+       - `"expectations_migrated"`：**我们的三情景假设未改**，但 **Street consensus（卖方一致预期）或买方 bogey（买方预期门槛）明显上移或下移**，改变了当前价格隐含的预期差与所需胜率。
        - `"catalyst_expired"`：此前支撑该笔投资的催化剂已兑现、落空或过期，未来 1–2 个季度进入催化剂真空期。
        - `"protection_failed"`：三层下行保护（生存层融资/现金流、价值层实际股本缩减/资产托底、路径层借券/逼空）中的任一条件失效，扩大了下行风险敞口。
      - **论点与赔率分开如实填写**：论点没变但赔率变了时，`verdict` 仍填 `"NO_CHANGE"`、`payoff_assessment.changed` 填 `true`——既不得为了触发推送而把 `verdict` 改写成 `"THESIS_STRENGTHENED"` / `"THESIS_WEAKENED"` 等，也不得为了与 `"NO_CHANGE"` 表面一致而把已变化的赔率写成 `"changed": false`。
@@ -217,7 +218,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 0. **收尾前自检**：若尚不能完成归因（拟定结论包含“证据不足 / 原因暂缺”），先在内部核对未查的相关来源并补齐取证，确无结果后再在报告正文说明关键缺口与下一步补查动作；除已在正文说明过影响的缺口外，其余检索失败的渠道只在报告 `## 附注`（推送稿在 `## 来源`）用一句话记一笔（不得写成“没有新研报”），不在报告正文或对话回复中附上已核查来源清单或解释为何未做无关检查。
 1. **写入事件结论**：调用 `knowledge_append_verdict(verdict=VERDICT, agenda_ops=AGENDA_OPS)`：
    - `verdict.verdict`：五词正式枚举（如 `"NO_CHANGE"`、`"THESIS_STRENGTHENED"` 等）；
-   - `verdict.payoff_assessment`：**必填**。收尾三问第三问（赔率变了吗）的结论按第 6 步的填法写入：赔率没变填 `{"changed": false, "reason": "none"}`；变了填 `{"changed": true, "reason": "<五个原因之一>"}`；
+   - `verdict.payoff_assessment`：**必填**，按第 6 步 `payoff_assessment` 的填法写入。
    - `verdict.trigger.kind`：`"price_move"`（若由价格触发唤醒，`trigger.ref` 填入触发任务名或信号 id）；
    - `verdict.next_validation`：必填 `what` 与 `due`；
    - `verdict.progress`：有新实质证据或进展填 `"some"`（若彻底解答待验证问题填 `"resolved"`），纯板块 beta 无新事件填 `"none"`。

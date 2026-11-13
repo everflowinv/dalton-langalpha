@@ -5,7 +5,7 @@
 {% if verdicts %}
 | 结论 ID | 时间 | 结论（五词） | 赔率 | 触发类型 | 事件概述 | 核心依据 | 下一步验证 |
 |---|---|---|---|---|---|---|---|
-{% for v in verdicts %}| **{{ v.id }}** | {{ v.at[:16] }} | **{{ verdict_zh.get(v.verdict, v.verdict) }}** (`{{ v.verdict }}`) | {% if v.payoff_assessment %}{% if v.payoff_assessment.changed %}{% set r_zh = payoff_reason_zh.get(v.payoff_assessment.reason) %}赔率变了{% if r_zh %}：{{ r_zh }}{% endif %}{% else %}赔率未变{% endif %}{% else %}—（未评估）{% endif %} | `{{ v.trigger.kind }}`{% if v.trigger.ref %} ({{ v.trigger.ref }}){% endif %} | {{ v.event }} | {{ v.rationale }} | {{ v.next_validation.what }} ({{ v.next_validation.due }}) |
+{% for v in verdicts %}| **{{ v.id }}** | {{ v.at[:16] }} | **{{ verdict_zh.get(v.verdict, v.verdict) }}** (`{{ v.verdict }}`) | {% if v.payoff_assessment %}{% if v.payoff_assessment.comparable is sameas false %}尚未评估{% if v.payoff_assessment.expected_return_delta %}（预期收益差额 {{ v.payoff_assessment.expected_return_delta }}）{% endif %}{% if v.payoff_assessment.required_probability_delta %}（所需概率差额 {{ v.payoff_assessment.required_probability_delta }}）{% endif %}{% elif v.payoff_assessment.changed %}{% set r_zh = payoff_reason_zh.get(v.payoff_assessment.reason) %}赔率变了{% if r_zh %}：{{ r_zh }}{% endif %}{% else %}赔率未变{% if v.payoff_assessment.expected_return_delta %}（预期收益差额 {{ v.payoff_assessment.expected_return_delta }}）{% endif %}{% if v.payoff_assessment.required_probability_delta %}（所需概率差额 {{ v.payoff_assessment.required_probability_delta }}）{% endif %}{% endif %}{% else %}—（未评估）{% endif %} | `{{ v.trigger.kind }}`{% if v.trigger.ref %} ({{ v.trigger.ref }}){% endif %} | {{ v.event }} | {{ v.rationale }} | {{ v.next_validation.what }} ({{ v.next_validation.due }}) |
 {% endfor %}
 {% else %}
 暂无事件结论记录。

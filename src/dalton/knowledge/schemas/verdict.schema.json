@@ -24,9 +24,12 @@
     "payoff_assessment": {"type": "object", "additionalProperties": false,
       "properties": {"changed": {"type": "boolean"},
                      "reason": {"enum": ["price_crossed_band","scenario_revised","expectations_migrated","catalyst_expired","protection_failed","none"],
-                                "description": "changed=false 时必须是 none；changed=true 时不得是 none（组合校验在 validate_verdict）"}},
+                                "description": "changed=false 时必须是 none；changed=true 时不得是 none（组合校验在 validate_verdict）"},
+                     "comparable": {"type": "boolean", "description": "false 表示缺少历史比较依据，正文写尚未评估；此时 changed 必须是 false 且 reason 必须是 none。缺省表示沿用 changed。"},
+                     "expected_return_delta": {"type": "string", "description": "预期收益相对上一份锚价报告的差额，有变化就写，未越过原因阈值时 changed 仍为 false。"},
+                     "required_probability_delta": {"type": "string", "description": "所需概率或所需熊市权重相对上一份锚价报告的差额。"}},
       "required": ["changed","reason"],
-      "description": "赔率评估：论点没变时，当前价格下的赔率是否变了。dalton-stock-move 与 dalton-thesis-delta 的 verdict 必填；其他技能可选（不填视为未评估）。旧记录无此字段，读取与渲染按未评估处理。"}
+      "description": "赔率评估：论点没变时，当前价格下的赔率是否变了。dalton-stock-move 与 dalton-thesis-delta 的 verdict 必填；其他技能可选（不填视为未评估）。旧记录无此字段，读取与渲染按未评估处理。comparable 为 false 时是尚未评估，不是赔率没变。"}
   },
   "required": ["at","trigger","event","verdict","rationale","next_validation","progress"]
 }

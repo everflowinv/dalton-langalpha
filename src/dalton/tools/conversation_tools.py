@@ -48,6 +48,7 @@ def create_conversation_tools() -> list[BaseTool]:
         """Use when asked about any company, topic, or sector to check the team's prior views, model assumptions, decisions, and open todos first, or when verbatim quotes and OpenClaw provenance are needed.
         Admins and internal members only: external members are refused outright (tell the user to use global search on their own conversations instead of retrying).
         Covers `source_type=conversation` discussion cards only, not external filings or research documents; `limit` is capped at 50.
+        若消息是上传的转写、转发或引文材料，卡片另附 `viewpoint_author`（观点作者，无法唯一定位时为 `"未识别"`）与 `uploaded_by`（上传该材料的成员）。引用观点时归属给 `viewpoint_author`，不要归属给 `uploaded_by`。只有附件、正文没有多人说话人结构时，作者仍是发送者，并额外带 `uploaded_by`。
 
         Args:
             query: Natural-language question, company name, or keyword phrase.
@@ -111,6 +112,18 @@ def create_conversation_tools() -> list[BaseTool]:
                 for f in figs
             ):
                 card["verification"] = "unsupported_numbers"
+            speaker = card.get("speaker") if isinstance(card.get("speaker"), dict) else {}
+            uploaded = card.get("uploaded_by")
+            if not isinstance(uploaded, dict):
+                uploaded = speaker.get("uploaded_by") if isinstance(speaker.get("uploaded_by"), dict) else None
+            if isinstance(uploaded, dict):
+                author = speaker.get("name") or "未识别"
+                card["uploaded_by"] = uploaded
+                card["viewpoint_author"] = author
+                card["attribution"] = {
+                    "viewpoint_author": author,
+                    "uploaded_by": uploaded,
+                }
         logger.info(
             "[dalton.conversations.audit] conversation_search caller_user_id=%s workspace_id=%s thread_id=%s run_id=%s count=%d",
             user_id,

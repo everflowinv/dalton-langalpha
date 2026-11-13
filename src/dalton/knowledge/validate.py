@@ -2576,4 +2576,16 @@ def validate_verdict(
                     ),
                 }
             )
+        if payoff.get("comparable") is False and (changed is not False or reason != "none"):
+            errors.append(
+                {
+                    "code": "payoff_not_comparable",
+                    "path": "/payoff_assessment/comparable",
+                    "message": (
+                        "payoff_assessment.comparable=false 表示尚未评估，"
+                        "changed 必须是 false 且 reason 必须是 none；"
+                        "不要把缺少比较依据写成赔率变了"
+                    ),
+                }
+            )
     return ValidationResult(errors=errors, warnings=warnings)

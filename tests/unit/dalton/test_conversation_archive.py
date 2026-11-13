@@ -5344,14 +5344,15 @@ async def test_non_transient_schema_validation_failure_marks_failed_and_blocked_
     assert inc_by_id["ev-sw1-1"]["segment_index"] == 1
     assert inc_by_id["ev-sw1-1"]["status"] == "failed"
     assert inc_by_id["ev-sw1-1"]["reason"] == "extraction_error:ValidationError"
-    assert inc_by_id["ev-sw1-1"]["total_tokens"] == 300
+    # Primary and fallback each make the original call plus one repair retry (4 x 150), all billed.
+    assert inc_by_id["ev-sw1-1"]["total_tokens"] == 600
     assert inc_by_id["ev-sw1-2"]["segment_index"] == 2
     assert inc_by_id["ev-sw1-2"]["status"] == "blocked"
     assert inc_by_id["ev-sw1-2"]["reason"] == "blocked_by_incomplete_prefix"
     assert inc_by_id["ev-sw1-2"]["total_tokens"] == 150
-    # Week 1: seg 0 (150) + seg 1 primary+fallback (300) + seg 2 (150) = 600; Week 2: seg 0 (150) -> 750 total
-    assert summary["batches"][0]["total_tokens"] == 600
-    assert summary["total_tokens"] == 750
+    # Week 1: seg 0 (150) + seg 1 primary+fallback with repairs (600) + seg 2 (150) = 900; Week 2: seg 0 (150) -> 1050 total
+    assert summary["batches"][0]["total_tokens"] == 900
+    assert summary["total_tokens"] == 1050
 
 
 @pytest.mark.asyncio

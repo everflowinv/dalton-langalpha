@@ -138,6 +138,11 @@ def build_card_search_text(card: dict[str, Any]) -> str:
     sp = card.get("speaker")
     if isinstance(sp, dict) and sp.get("name"):
         parts.append(str(sp["name"]))
+    uploader = sp.get("uploaded_by") if isinstance(sp, dict) else None
+    if not isinstance(uploader, dict):
+        uploader = card.get("uploaded_by")
+    if isinstance(uploader, dict) and uploader.get("name"):
+        parts.append(str(uploader["name"]))
     return " | ".join(parts)
 
 

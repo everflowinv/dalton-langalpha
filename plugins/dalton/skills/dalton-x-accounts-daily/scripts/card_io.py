@@ -111,6 +111,32 @@ def write_bytes_exclusive(path: Path, payload: bytes) -> None:
         raise
 
 
+def write_bytes_new(path: Path, payload: bytes) -> bool:
+    """Create ``path`` atomically, never replacing an existing file.
+
+    Returns False when the file already exists (another run created it first).
+    """
+    if path.is_symlink():
+        raise ValueError("refusing symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        try:
+            _write_all(fd, payload)
+        finally:
+            os.close(fd)
+        try:
+            os.link(name, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+
 def _scan(value: Any) -> None:
     if isinstance(value, str):
         for needle in _NEEDLES:
@@ -178,18 +204,24 @@ def render_markdown(
     else:
         text = json.dumps(card, ensure_ascii=False, indent=2) + "\n"
     encoded = text.encode("utf-8")
-    reused = False
-    if output.exists():
-        if output.is_symlink():
-            raise ValueError("refusing symlink")
-        if output.read_bytes() != encoded:
-            return {
-                "ok": False,
-                "error": "card_conflict",
-                "hint": "existing card differs; left the file unchanged",
-                "path": output_rel,
-            }
-        reused = True
-    else:
-        write_bytes_exclusive(output, encoded)
-    return {"ok": True, "reused": reused, "path": output_rel, "card": card}
+    if not output.exists() and write_bytes_new(output, encoded):
+        return {"ok": True, "reused": False, "path": output_rel, "card": card}
+    # The card already exists, or another run created it between the check and the write.
+    if output.is_symlink():
+        raise ValueError("refusing symlink")
+    if output.read_bytes() != encoded:
+        return {
+            "ok": False,
+            "error": "card_conflict",
+            "hint": (
+                "已有卡片与本次内容不同，文件保持原样。"
+                "禁止删除或覆盖已有卡片文件（不要 unlink，也不要换路径重写）。"
+                "先读已保存的正文（summary.md）、卡片（card.json）和 "
+                "automation_report(action=\"status\", report_run_id=RUN_ID) 的发送状态；"
+                "若 status=\"sent\" 且 delivery_confirmed=true，最终回复写 NO_REPLY；"
+                "若尚未确认，保持 start_iso 与 end_iso，用已保存的 card.json 和同一 "
+                "report_run_id（x-accounts-daily-<summary_date>）提交。"
+            ),
+            "path": output_rel,
+        }
+    return {"ok": True, "reused": True, "path": output_rel, "card": card}
