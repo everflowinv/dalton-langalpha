@@ -708,6 +708,21 @@ def extract_summary_lines(
     return selected
 
 
+VERDICT_WORD_LABEL_ZH: dict[str, str] = {
+    "NO_CHANGE": "论点不变",
+    "THESIS_STRENGTHENED": "论点加强",
+    "THESIS_WEAKENED": "论点削弱",
+    "THESIS_BROKEN": "论点失效",
+    "NEW_THESIS": "新论点",
+}
+
+
+def verdict_label_zh(verdict_word: str | None) -> str:
+    """The verdict as readers see it: the internal enum never reaches a message."""
+    cleaned = (verdict_word or "").strip()
+    return VERDICT_WORD_LABEL_ZH.get(cleaned.upper(), cleaned)
+
+
 def format_notify_message(
     classification: NotifyClassification,
     *,
@@ -726,7 +741,7 @@ def format_notify_message(
     )
     lines: list[str] = [headline]
 
-    cleaned_word = (verdict_word or "").strip()
+    cleaned_word = verdict_label_zh(verdict_word)
     if cleaned_word:
         lines.append(f"结论：{cleaned_word}")
 
@@ -862,7 +877,7 @@ def build_feishu_notify_card(
     title_override: str | None = None,
 ) -> dict[str, Any]:
     """Build Feishu Card Schema 2.0 dictionary for a Dalton automation notification."""
-    cleaned_word = (verdict_word or "").strip()
+    cleaned_word = verdict_label_zh(verdict_word)
     ts_label = (timestamp_str or "").strip()
     if not ts_label:
         ts_label = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
@@ -886,7 +901,7 @@ def build_feishu_notify_card(
             "tag": "plain_text",
             "content": subtitle_text,
         },
-        "template": map_verdict_to_header_template(cleaned_word),
+        "template": map_verdict_to_header_template(verdict_word),
         "text_tag_list": [
             {
                 "tag": "text_tag",

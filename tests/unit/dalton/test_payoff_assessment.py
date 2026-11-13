@@ -262,7 +262,8 @@ def test_title_override_only_replaces_the_headline() -> None:
     assert (
         message.splitlines()[0] == "META · 论点未变、赔率变了：股价越过三情景或买点价带"
     )
-    assert "结论：NO_CHANGE" in message
+    assert "结论：论点不变" in message
+    assert "NO_CHANGE" not in message
     card = build_feishu_notify_card(
         classification_move,
         verdict_word="NO_CHANGE",

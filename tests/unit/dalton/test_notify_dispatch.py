@@ -1203,7 +1203,7 @@ def test_format_notify_message_and_frontend_url_resolution(
     )
     lines_with_link = msg_with_link.splitlines()
     assert lines_with_link[0] == "GOOGL · 财报 T0 快讯"
-    assert "THESIS_STRENGTHENED" in lines_with_link[1]
+    assert lines_with_link[1] == "结论：论点加强"
     assert lines_with_link[-1] == "https://dalton.example.com/chat/t/thread-789"
 
     msg_without_link = format_notify_message(
