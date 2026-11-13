@@ -151,6 +151,8 @@ web/src/pages/ChatAgent/session/history/__tests__/replayHistory.provenanceBatch.
 src/dalton/tools/notify_tools.py
 # PW-1: permanent Chinese research judgment and writing rules prompt component.
 src/ptc_agent/agent/prompts/templates/components/research_writing.md.j2
+# User-visible text rule shared by the main agent and every subagent prompt.
+src/ptc_agent/agent/prompts/templates/components/user_visible_text.md.j2
 # OC-1 Phase 0 PR 0-1: scheduled data jobs layer foundation (migration, manifest,
 # scheduler core, container runner, wrapper process, evaluators & unit tests).
 src/dalton/migrations/versions/d029_data_tasks.py

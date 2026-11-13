@@ -57,8 +57,8 @@ _CONCURRENCY = 4
 _HEADING_RE = re.compile(r"^#{1,3} ", re.MULTILINE)
 
 # The closed set of issue types, mirroring dalton-language SKILL's flag list.
-# The addendum's two new families (negation_defensive, translationese) live
-# here, in the output schema and in the review prompt — one list, three uses.
+# negation_defensive, translationese and internal_identifier live here, in
+# the accepted set and in the review prompt — one list, three uses.
 ISSUE_TYPES: tuple[str, ...] = (
     "filler_opening",
     "meta_transitional",
@@ -67,6 +67,7 @@ ISSUE_TYPES: tuple[str, ...] = (
     "credentialing",
     "negation_defensive",
     "translationese",
+    "internal_identifier",
 )
 
 _ISSUES_SCHEMA: dict[str, Any] = {
@@ -231,6 +232,11 @@ def _review_instructions(round_no: int) -> str:
         "重点覆盖否定式/防御式句式（negation_defensive：先否定再肯定的套路、预防式免责与情态堆叠；"
         "承载事实或判断的否定必须保留）与英文直译腔（translationese：'3Q 打印''落地在 X''beat 了预期'"
         "'指引的上修'这类句式与动词直译；Dalton 约定保留的英文术语不报）。"
+        "用户可见文字里应当隐藏的内部标识（internal_identifier：知识层编号、工具名、函数或脚本名、"
+        "机器字段、枚举值、任务或线程编号、内部文件路径与知识文件名、模型单元格坐标、"
+        "知识文件版本号、原始错误码或报错原文、思考过程或自我审查记录）标为问题。"
+        "代码块与引语内部措辞不改；用户明确要求代码或技术诊断时，路径、命令和文件名按原文保留。"
+        "用户未要求技术细节时，正文里的内部标识仍要标出。报告给读者看的章节序号不算内部标识。"
         "没有明确问题就返回空 issues，不凑条数；不输出改写稿、评分或“AI 含量”，"
         "也不判断文章是不是 AI 写的。"
     )

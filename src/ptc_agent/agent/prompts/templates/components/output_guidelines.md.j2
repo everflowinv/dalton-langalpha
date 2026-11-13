@@ -19,7 +19,7 @@ When creating reports:
 
 ## Citing Created Files
 
-- **Documents/data** — clickable link: `[file name](file path)`
+- **Documents/data** — clickable link with a readable title or descriptive filename: `[readable title](file path)`
 - **Images/charts** — inline embed: `![title](file path)`
 
 {% if cos %}
@@ -34,9 +34,10 @@ Never use backticks to cite deliverables. Backticks are for directories or techn
 {% if guidance | default("detailed") == "detailed" %}
 
 Good:
-> Full analysis: [amd_dcf_analysis.md]({{ at }}amd_analysis/amd_dcf_analysis.md)
+> Full analysis: [AMD DCF Analysis]({{ at }}amd_analysis/amd_dcf_analysis.md)
 >
-> Discount rate: [WACC inputs]({{ at }}amd_analysis/amd_dcf_analysis.md#wacc-inputs), computed in [dcf.py]({{ at }}amd_analysis/dcf.py#L40-L55)
+> Discount rate: [WACC inputs]({{ at }}amd_analysis/amd_dcf_analysis.md#wacc-inputs), computed in [DCF valuation model]({{ at }}amd_analysis/dcf.py#L40-L55)
+{# DALTON-HOOK(user-visible-text): the link title is a readable name; the real path stays in the target. #}
 >
 > ![Revenue Trend]({{ at }}amd_analysis/charts/revenue_trend.png)
 >
@@ -63,3 +64,6 @@ Bad:
 
 ## Writing Style
 - In reports and your final message, no self-referential language ("I found...", "I researched...") and no meta-commentary
+
+{# DALTON-HOOK(user-visible-text): shared component. This include sits after Writing Style, outside every guidance, role, and feature condition, and does not read the user profile. #}
+{% include 'components/user_visible_text.md.j2' %}

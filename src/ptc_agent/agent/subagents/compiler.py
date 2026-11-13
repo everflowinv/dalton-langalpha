@@ -312,6 +312,15 @@ class SubagentCompiler:
                     **template_kwargs,
                 )
 
+        # DALTON-HOOK(user-visible-text): custom_prompt and custom_prompt_template
+        # skip subagent_base, which includes this component (and output_guidelines
+        # includes it when that section is on). Append the rendered component
+        # once only when that full text is absent. A heading of the same name
+        # is not the rule.
+        rule = loader.get_component("user_visible_text").strip()
+        if rule not in body:
+            body = f"{body.rstrip()}\n\n{rule}" if body.strip() else rule
+
         # DALTON-HOOK(subagent-workspace-root): inject workspace absolute root
         # and skills path prefix at the shared exit of all three prompt paths
         # (custom_prompt, custom_prompt_template, and default base template).

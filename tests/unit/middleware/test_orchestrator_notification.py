@@ -59,6 +59,17 @@ class TestCheckAndGetNotification:
         assert notification is not None
         assert "Task-abc123" in notification
         assert 'TaskOutput(task_id="abc123")' in notification
+        assert "has completed" not in notification
+        assert (
+            "check the result and any files it wrote before telling the user "
+            "the work is done."
+        ) in notification
+        assert "not the same as delivery being complete" not in notification
+        assert "Retrieve the result" not in notification
+        assert (
+            "This notice is from the system, not the user. Keep writing to the user "
+            "in the language of their request."
+        ) in notification
         assert task.result_seen is True
 
     @pytest.mark.asyncio

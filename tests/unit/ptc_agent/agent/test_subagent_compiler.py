@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 
 import pytest
 
+from ptc_agent.agent.subagents.builtins import BUILTIN_SUBAGENTS
 from ptc_agent.agent.subagents.compiler import SubagentCompiler
 from ptc_agent.agent.subagents.definition import SubagentDefinition
 from ptc_agent.config import AgentConfig, LLMConfig
@@ -221,3 +222,56 @@ class TestSubagentPreloadedSkills:
         assert prompt.startswith("You are ops.")
         assert "<preloaded_skills>" not in prompt
         assert "Workspace root directory (absolute): `/home/workspace`" in prompt
+
+
+_USER_VISIBLE = "所有直接面向用户的文字使用用户当前要求的语言"
+
+
+class TestUserVisibleTextReachesSubagents:
+    """The shared rule is on the base template and on prompts that skip it."""
+
+    def test_report_builder_prompt_includes_the_rule_once(self):
+        prompt = _compiler(config=_config()).compile(
+            BUILTIN_SUBAGENTS["report-builder"]
+        )["system_prompt"]
+        assert prompt.count(_USER_VISIBLE) == 1
+
+    def test_custom_prompt_includes_the_rule_once(self):
+        prompt = _compiler().compile(
+            SubagentDefinition(name="ops", description="d", custom_prompt="You are ops.")
+        )["system_prompt"]
+        assert prompt.count(_USER_VISIBLE) == 1
+        assert prompt.startswith("You are ops.")
+
+    def test_heading_only_custom_prompt_or_template_still_gets_the_full_rule_once(
+        self, monkeypatch
+    ):
+        """A heading with the same name is not the rule. Both custom paths
+        still receive the rendered component exactly once."""
+        from ptc_agent.agent.prompts import get_loader
+        from ptc_agent.agent.prompts.loader import PromptLoader
+
+        rule = get_loader().get_component("user_visible_text").strip()
+        original = PromptLoader.render
+
+        def render(self, template_name, **kwargs):
+            if template_name == "heading_only.md.j2":
+                return "## 用户可见文字"
+            return original(self, template_name, **kwargs)
+
+        monkeypatch.setattr(PromptLoader, "render", render)
+        cases = [
+            SubagentDefinition(
+                name="ops", description="d", custom_prompt="## 用户可见文字"
+            ),
+            SubagentDefinition(
+                name="ops",
+                description="d",
+                custom_prompt_template="heading_only.md.j2",
+            ),
+        ]
+        for defn in cases:
+            prompt = _compiler().compile(defn)["system_prompt"]
+            assert prompt.count(rule) == 1
+            assert prompt.count("## 用户可见文字") == 2
+            assert prompt.startswith("## 用户可见文字")
