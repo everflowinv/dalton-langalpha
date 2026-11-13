@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 FREEZE_DIR_NAME = ".dalton-freeze"
 DONE_FILENAME = "done.json"
+# Parity only compares matching slots, while some tasks freeze hundreds of MB per run
+# on the host's internal disk; older slots are pruned after each successful freeze.
+FREEZE_KEEP_SLOTS = 3
 
 _ISO_DATE_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})(?:[T\s].*)?$")
 _COMPACT_DATE_RE = re.compile(r"^(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])$")
@@ -534,4 +537,45 @@ def freeze_task_run_artifacts(
             pass
         raise
 
+    try:
+        prune_old_freeze_slots(job_dir, keep=FREEZE_KEEP_SLOTS, current_slot=slot_str)
+    except OSError as exc:
+        logger.warning(
+            "Failed to prune old freeze slots for job_key=%s: %s", resolved_job_key, exc
+        )
     return done_path
+
+
+def _parse_slot_name(name: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(name)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def prune_old_freeze_slots(job_dir: Path, *, keep: int, current_slot: str) -> list[str]:
+    """Delete all but the newest ``keep`` slot directories under ``job_dir``.
+
+    Only real directories whose names parse as UTC slot timestamps are considered;
+    the slot just written is always kept. Returns the removed slot names.
+    """
+    if keep < 1 or job_dir.is_symlink() or not job_dir.is_dir():
+        return []
+    slots: list[tuple[datetime, Path]] = []
+    for child in job_dir.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            continue
+        parsed = _parse_slot_name(child.name)
+        if parsed is not None:
+            slots.append((parsed, child))
+    slots.sort(key=lambda item: item[0], reverse=True)
+    removed: list[str] = []
+    for _parsed, child in slots[keep:]:
+        if child.name == current_slot:
+            continue
+        shutil.rmtree(child)
+        removed.append(child.name)
+    return removed
