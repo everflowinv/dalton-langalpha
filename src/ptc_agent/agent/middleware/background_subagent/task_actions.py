@@ -170,6 +170,8 @@ async def _stop_orphaned_writer(
     return None
 
 
+# DALTON-HOOK(prompt-compaction): resume wording matches the task-status
+# rule. This docstring does not change which tasks the handler accepts.
 async def handle_task_action(
     mw: "BackgroundSubagentMiddleware",
     request: ToolCallRequest,
@@ -178,7 +180,7 @@ async def handle_task_action(
     """Route an intercepted Task tool call by its ``action`` argument.
 
     1. ``action="update"`` + ``task_id`` → send a follow-up into the running task
-    2. ``action="resume"`` + ``task_id`` → reset a completed or stopped task and respawn it
+    2. ``action="resume"`` + ``task_id`` → resume only a task the tool marks recoverable; a task the user cancelled is not resumed
     3. ``action="init"`` (default) → new task spawn
     """
     tool_call = request.tool_call
@@ -435,8 +437,14 @@ async def _handle_update(
         )
 
     if not task.is_pending:
+        # DALTON-HOOK(prompt-compaction): the model-facing text matches the
+        # status rule. The branch above is unchanged.
         return ToolMessage(
-            content=f"Error: Task-{target_task_id} is not running. Use action='resume' to resume a completed or stopped task.",
+            content=(
+                f"Error: Task-{target_task_id} is not running. "
+                "Resume only a task the tool marks recoverable. "
+                "A task the user cancelled is not resumed."
+            ),
             tool_call_id=tool_call_id,
             name="Task",
             status="error",

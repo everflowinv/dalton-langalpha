@@ -267,7 +267,7 @@ async def test_default_off_omits_tool_prompt_and_data_map_card_line(
         assert "conversation_search" not in prompt
         assert "回答某家公司或主题时，先用" not in prompt
         assert "归档统计：" not in prompt
-        assert "说“证据不足/无法确定”之前，先对照下方数据地图看还有哪些相关来源没查" in prompt
+        assert "说“证据不足/无法确定”之前，对照下方数据地图，看是否还有会改变结论的直接相关来源没查" in prompt
 
 
 @pytest.mark.asyncio
@@ -741,6 +741,6 @@ async def test_home_turn_follows_user_level_switch(
         role="chief_of_staff",
         conversation_search_enabled=resolved_on,
     )
-    assert "first call `conversation_search` to check the team's prior views" in cos_prompt_on
+    assert "first call `conversation_search` to check the team's prior views, assumptions and decisions" in cos_prompt_on
     assert "回答某家公司或主题时，先用 `conversation_search`" in cos_prompt_on
     assert "归档统计：" in cos_prompt_on

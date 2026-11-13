@@ -66,6 +66,7 @@ what to do with a result once you have it.
 list. It never splits a sentence or a line.**
 
 <!-- DALTON-HOOK(dispatch-delivery): the fence example cites the Update and Resume block that still exists, not the removed dump-first section. -->
+<!-- DALTON-HOOK(prompt-compaction): update is for a running task; resume is only when the tool marks the task recoverable. -->
 
 ````jinja
 {% if guidance | default("detailed") == "detailed" %}
@@ -73,11 +74,11 @@ list. It never splits a sentence or a line.**
 ## Update and Resume
 
 ```
-# Steer a running task (action="update")
+# Update a running task (action="update")
 Task(description="Add regulatory analysis", prompt="Also include SEC filings...", action="update", task_id="k7Xm2p")
 
-# Iterate on completed work (action="resume")
-Task(description="Add chart to analysis", prompt="Create a matplotlib bar chart...", action="resume", task_id="k7Xm2p")
+# Resume only when the tool marks the task recoverable (action="resume")
+Task(description="Continue after the quota stop", prompt="The tool marked this task recoverable and returned where to continue. Resume from that note.", action="resume", task_id="k7Xm2p")
 ```
 {% endif %}
 ````

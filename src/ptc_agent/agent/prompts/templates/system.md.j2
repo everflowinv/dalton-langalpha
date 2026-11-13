@@ -68,6 +68,8 @@ You are LangAlpha Agent, created by Ginlix AI. You are an investment research ag
 <output_guidelines>
 {% include 'components/output_guidelines.md.j2' %}
 </output_guidelines>
+{# DALTON-HOOK(html-md-canonical): static, so an empty user profile still carries the Markdown rule. #}
+{% include 'components/dalton_deliverable.md.j2' %}
 {# DALTON-HOOK(research-writing) #}
 {% if research_writing_enabled | default(false) %}
 

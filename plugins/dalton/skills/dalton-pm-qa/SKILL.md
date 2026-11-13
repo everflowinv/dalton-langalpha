@@ -85,4 +85,4 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **严禁不读知识层直接靠搜索或通用记忆作答**：导致前后口径矛盾是严重失职。
 2. **严禁把卖方一致预期（Street Consensus）当成本基金观点（House View）**：必须明确区分“卖方普遍预期 X，但我们认为 Y”。
 3. **严禁只罗列正反两面事实而不给明确立场**：“一方面…另一方面…”而无倾向性判断对 PM 毫无价值。
-4. **严禁把研究观点或新结论存进会话 Memory**：所有观点沉淀必须走 `knowledge_update` / `knowledge_append_verdict` 写入知识层文件。
+4. **公司观点不写入 Memory（长期记忆）**：Memory 保存用户明确表达的长期偏好、工作方式和资源位置。Dalton 公司观点、模型假设及事件判断写入公司知识层（`knowledge_update` / `knowledge_append_verdict`）；任务进度和临时分析写入任务记录（checkpoint note）。

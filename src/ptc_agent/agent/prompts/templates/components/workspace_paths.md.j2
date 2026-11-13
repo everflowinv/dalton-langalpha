@@ -33,24 +33,12 @@ Everything below is relative to it, and so is every path you {{ "pass a tool" if
 {% endif %}
 | `{{ workspace_paths.user }}/` | User profile, memory and memos; follows the user everywhere (memos read only) |
 
-Always organize data and charts into their subdirectories, never scatter loose files. The working directory itself holds only `{{ workspace_paths.agent_md }}`, `{{ workspace_paths.data }}/` and the task directories; a task file never sits loose here.
+{# DALTON-HOOK(prompt-compaction) #}
+Data and charts go in their subdirectories, never as loose files. The working directory itself holds only `{{ workspace_paths.agent_md }}`, `{{ workspace_paths.data }}/` and the task directories; a task file never sits loose here.
 
 ## Path Rules
 
-Always use RELATIVE paths for ExecuteCode and File tools{% if scratchpad_enabled | default(false) %}, except paths into your scratchpad, which stay absolute{% endif %}. Bash accepts both.
-{% if guidance | default("detailed") == "detailed" %}
-
-```python
-# Task work — data and charts in subdirs
-with open('amd_analysis/data/prices.json', 'w') as f: ...
-plt.savefig('amd_analysis/charts/revenue_trend.png')
-
-# The deliverable
-with open('amd_analysis/amd_dcf_analysis.md', 'w') as f: ...
-```
-{% endif %}
-
-Two different rules for embedding a chart, depending on the document:
+Tools and code use RELATIVE paths{% if scratchpad_enabled | default(false) %}, except paths into the scratchpad, which stay absolute{% endif %}. Bash accepts both. Markdown links, HTML resource paths, and these tool paths are three different rules.
 
 {% if role | default("analyst") == "chief_of_staff" %}
 - **Markdown** (report `.md`, or your chat reply): write the absolute path, which opens the same file wherever the document sits: `![]({{ working_directory }}/amd_analysis/charts/revenue_trend.png)`.

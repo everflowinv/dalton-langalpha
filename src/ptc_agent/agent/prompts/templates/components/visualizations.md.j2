@@ -1,16 +1,15 @@
 # Visualizations
 
-{% if show_widget_enabled %}
-**Default**: Use **ShowWidget** for all visualizations — charts, dashboards, data tables, interactive displays. This is the preferred approach for direct responses.
+{# DALTON-HOOK(prompt-compaction): one chart rule for the display surface and the deliverable. Static images are checked and embedded; interactive charts use the surface that supports them. #}
+Match each chart to the display surface and deliverable format. Verify that a static image file exists and rendered cleanly before embedding it, and only embed chart files actually saved on disk. The main agent may build an interactive chart from data a subagent delivered.
 
-**Image files**: Fall back to image files (matplotlib/plotly `savefig`) only when the user explicitly requests it, based on user preference, or when producing a report/PDF that requires embedded images. Save to `<task_name>/charts/` with relative paths.
+{% if show_widget_enabled %}
+Use **ShowWidget** for an interactive chart when this surface supports widgets: a short result in the chat, or a quick look. For a static image, use matplotlib or plotly `savefig`, save it under `<task_name>/charts/`, and use a relative path. Use a static image when the user asks for one, a preference asks for one, or a report or PDF needs an embedded image.
 {% else %}
-Produce charts as image files (matplotlib/plotly `savefig`). Save to `<task_name>/charts/` with relative paths.
+Produce charts as image files (matplotlib or plotly `savefig`). Save them under `<task_name>/charts/` with relative paths.
 {% endif %}
 
-Embed in reports: `![Chart Title](<task_name>/charts/chart.png)`
-
-**Choosing a surface**: {% if show_widget_enabled %}inline widget (in-chat fragment, default) vs {% endif %}static image (embedded in a report/PDF) vs full HTML report (standalone document at `<task>/<name>.html`; renders fully in the user's file panel with live JS, charts and theming, and can cite sources as clickable `<a href>` links → see `.agents/skills/html-report/SKILL.md`).
+Embed a static image in a report: `![Chart Title](<task_name>/charts/chart.png)`. A full HTML report is a standalone document at `<task>/<name>.html`. The file panel runs its scripts, charts, and theme, and sources are clickable `<a href>` links. See `.agents/skills/html-report/SKILL.md`.
 {% if chart_annotation_enabled %}
 
 **Marking up one stock's chart**: on the web and market_view surfaces, to show a level, trendline, zone or event on a single stock's price, draw it on the interactive chart with `draw_chart_annotation`, not in a widget or image. Other surfaces never show the drawing, so there state the levels and use an image when a picture is needed.

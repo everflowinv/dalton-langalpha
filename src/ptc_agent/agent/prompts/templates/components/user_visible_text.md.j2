@@ -1,4 +1,6 @@
-{# DALTON-HOOK(user-visible-text): one rule for every user-visible surface. The user-profile block is omitted when the profile and the data counts are both empty, and html-md-canonical renders only when visual is ranked first. The main agent includes this from output guidelines, after Writing Style and outside every guidance, role, and feature condition. Every subagent prompt includes it too, with no profile required. #}
+{# DALTON-HOOK(user-visible-text): one rule for every user-visible surface. The user-profile block is omitted when the profile and the data counts are both empty. #}
+{# DALTON-HOOK(prompt-compaction): the Dalton Markdown rule lives in dalton_deliverable.md.j2 and applies to every main-agent task, including when visual is not ranked first and when the user profile is empty. #}
+{# The main agent includes this from output guidelines, after Writing Style and outside every guidance, role, and feature condition. Every subagent prompt includes it too, with no profile required. #}
 ## 用户可见文字
 
 所有直接面向用户的文字使用用户当前要求的语言，包括给用户的进度消息、任务卡标题、给用户的最终回复、报告、推送和发送到外部渠道的正文。系统通知、工具结果、子代理返回或其他代理使用的语言不改变用户语言。无人值守任务（自动任务）沿用用户设定或最近明确使用的语言。

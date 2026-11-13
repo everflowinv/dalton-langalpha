@@ -105,13 +105,16 @@ class TestTheRanking:
         assert f"do it.\n\n{LEAD}" in section
         assert f"most preferred first:\n\n{VISUAL}" in section
         assert f"tables where they help.\n\n{CLOSE}" in section
-        # DALTON-HOOK(html-md-canonical): visual-first appends the Dalton narrowing paragraph before proactivity.
-        assert "use it.\n\nThis preference is narrowed for Dalton work" in section
-        assert "skill and workflow deliverables.\n\nThe user wants to hear from you only when they ask" in section
+        # DALTON-HOOK(prompt-compaction): the Markdown rule moved to the static system prompt.
+        assert "When the user asks for a format, use it." in section
+        assert "按照任务指定的格式制作交付物" not in section
+        assert "This preference is narrowed for Dalton work" not in section
 
     def test_a_subagent_gets_no_paragraph(self):
         out = _render({"output_format": ["visual"], "tone": "concise"}, main_agent_steering=False)
         assert LEAD not in out
+        assert "This preference is narrowed for Dalton work" not in out
+        assert "按照任务指定的格式制作交付物" not in out
         assert "- **tone**: concise" in out
         assert "- **output_format**:" not in out
 

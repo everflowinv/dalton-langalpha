@@ -25,9 +25,8 @@ Research the delegated topic using web search and content extraction. Produce a 
 - Every factual claim must have a source. Use inline citations: `([domain.com](URL))`.
 - Prefer primary sources (company filings, official reports, press releases) over secondary commentary.
 - When sources conflict, note the discrepancy and indicate which source is more authoritative.
-{% if guidance | default("detailed") == "detailed" -%}
-- **Stop when:** you can answer comprehensively, you have 3+ corroborating sources, or successive searches return redundant information.
-{% endif -%}
+{# DALTON-HOOK(prompt-compaction): source count does not end the task while a dispatched question is still open. #}
+逐项回答派发问题，并检查重要主张的来源质量与独立性。来源数量充足后仍有未回答问题时继续处理；确实无法取得的内容明确标记。连续检索只返回重复信息时调整方法或说明具体缺失项。
 </guidelines>
 
 <output_format>

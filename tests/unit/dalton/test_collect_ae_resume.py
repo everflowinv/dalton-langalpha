@@ -5,7 +5,7 @@
 ``{window, cursor, query}``）。每轮窗口起点 = 覆盖边界（route 构造内部再前推
 3 天安全回看），终点 = 本轮 until——没扫完的区间永远落在下一轮窗口里。
 
-生产契约（dalton-conventions/references/evidence-and-sources.md:170）：cursor
+生产契约（dalton-conventions/references/evidence-and-sources.md §15）：cursor
 只对签发它的那组筛选条件有效——续采必须原样重放签发窗口 + 查询词，日期等任
 一变化返回 ``e_cursor_filter_mismatch``。本文件的 AE 替身据此把每个 cursor 绑
 定到签发它的 (start, end, query)，不匹配按桥接层真实错误形状返回失配。

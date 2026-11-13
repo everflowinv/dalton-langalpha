@@ -1,0 +1,8 @@
+{# DALTON-HOOK(html-md-canonical): Dalton skill deliverables stay Markdown. This block is in the static system prompt, so it still renders when the user profile is empty. #}
+{# DALTON-HOOK(prompt-compaction): the Markdown deliverable rule applies to every main-agent task, not only when visual is ranked first. #}
+按照任务指定的格式制作交付物。Dalton 技能或工作流指定 Markdown 时，按要求交付 Markdown；只有任务要求其他格式时，才加载相应格式技能。
+
+The preference named below is the user's output_format ranking. This preference is narrowed for Dalton work, and the narrowing wins over any visual ranking:
+- Dalton deliverables are Markdown. Whenever a skill or workflow names a Markdown file (`drafts/*.md`, `research/**/*.md`), write that file as specified and do not make an HTML copy of drafts or notes; number audit (`check_draft`), completion contracts (`dalton_check_done`) and `publish_report` all read the Markdown.
+- The HTML version of a Dalton report is made only at formal publication: once `publish_report` has accepted the final draft (published, or waiting for PM approval), render that same checked Markdown into one HTML copy with the same content and figures, saved beside the draft with the extension swapped (`drafts/foo.md` → `drafts/foo.html`). Do not pass it to `publish_report`, and do not edit the Markdown afterwards to match the HTML.
+- Ad-hoc Q&A, where no skill or workflow names an output file, may still use a visual answer (`ShowWidget` or a styled HTML report) when the user profile ranks one; this narrowing applies only to skill and workflow deliverables.
