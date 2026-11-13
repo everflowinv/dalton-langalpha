@@ -12,15 +12,16 @@ Shared research layer: .agents/skills/research-conventions/SKILL.md.
 
 当开始覆盖一家新公司、或为已有覆盖名单中的标的初始化工作区目录时，使用本 skill 建立标准工作区骨架（对齐 PK.1 文件布局与 PK.6 `agent.md` 托管块规范）。
 
-- **本脚本只建骨架，不写 `data/*.json` 知识文档**：
-  - 4 家存量迁移公司（`META`、`AMZN`、`GOOGL`、`MSFT`）的知识文档由 P1.4 经 PK.7 导入 API 创建；
-  - 新覆盖公司的知识文档（`data/{company,thesis,debate,drivers,management,lessons,agenda}.json`）由分析师在首次产出认知时调用 `knowledge_update(doc="...", ops=[{"op": "create", "value": {...}}], reason="...", base_version=None)` 创建，从而保证所有结构化文档均经过 Schema 校验与版本记录。
+- **本脚本建立目录骨架，并写入初始 `data/company.json`**（公司标识、交易所、一句话介绍；写入前用技能自带的 company schema 校验）。其余知识文档（`data/{thesis,debate,drivers,management,lessons,agenda}.json`）仍由分析师在首次产出认知时调用 `knowledge_update(doc="...", ops=[{"op": "create", "value": {...}}], reason="...", base_version=None)` 创建，从而经过 schema 校验与版本记录。
+  - 4 家存量迁移公司（`META`、`AMZN`、`GOOGL`、`MSFT`）的其他知识文档由 P1.4 经 PK.7 导入 API 创建。
+  - 覆盖名单没有给出交易所时，`exchange` 写 `OTHER`，脚本输出的 `notes` 里有「交易所待核」。核实实际交易所后，用知识库更新改成 `NASDAQ`、`NYSE`、`HKEX`、`SSE` 或 `SZSE`。
 
 ## 2. 生成的工作区骨架
 
 ```text
 <TICKER>/                        # 工作区根目录
 ├── agent.md                     # 注入上下文（含 PK.6 托管块标记与 LangAlpha 种子小节）
+├── data/company.json            # 初始公司文档；缺交易所时 exchange 为 OTHER
 ├── data/consensus/README.md     # 卖方一致预期快照规范与 JSON schema
 ├── model/README.md              # 财务模型命名与版本规范（<TICKER>-model-v<NN>.xlsx）
 ├── research/README.md           # 事件笔记与专题研究目录说明
@@ -32,7 +33,7 @@ Shared research layer: .agents/skills/research-conventions/SKILL.md.
 
 ## 3. 在沙箱工作区中执行方式
 
-在目标公司工作区根目录下运行（脚本仅依赖 Python 标准库）：
+在目标公司工作区根目录下运行（需要已安装的 `jsonschema`；校验用的 schema 在技能的 `references/schemas/`）：
 
 ```bash
 # 先预览将要写入或跳过的文件（默认 dry-run）
