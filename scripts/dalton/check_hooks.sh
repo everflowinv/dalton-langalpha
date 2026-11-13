@@ -108,6 +108,10 @@ ALLOWED_HOOKS=(
   # Dense images and tables: crop from the original, transcribe, re-read,
   # and do not rewrite a cell to close a sum. Main agent and every subagent.
   "dense-image-reading"
+  # Dispatch briefs, subagent file delivery, and empty-result wording.
+  # The checklist renders in lean and detailed. A run that ended is not a
+  # finished delivery until the required files have been checked.
+  "dispatch-delivery"
   "hermetic-prebuilt-workflows"
   "market-data-fallback"
   "yfinance-cache"

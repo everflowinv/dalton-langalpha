@@ -65,25 +65,22 @@ what to do with a result once you have it.
 **A fence wraps whole blocks — a `##` section, a worked example, a bullet
 list. It never splits a sentence or a line.**
 
-```jinja
-# Data Processing
+<!-- DALTON-HOOK(dispatch-delivery): the fence example cites the Update and Resume block that still exists, not the removed dump-first section. -->
 
-**Core principle**: Always dump data first, then process.
-
-Write raw tool output to your task directory before working with it.
+````jinja
 {% if guidance | default("detailed") == "detailed" %}
 
-## Dump First, Then Process
+## Update and Resume
 
-1. **Dump raw result** → ...
+```
+# Steer a running task (action="update")
+Task(description="Add regulatory analysis", prompt="Also include SEC filings...", action="update", task_id="k7Xm2p")
 
-## Storage and Summary Pattern
-
-```python
-result = some_mcp_tool(query="...")
+# Iterate on completed work (action="resume")
+Task(description="Add chart to analysis", prompt="Create a matplotlib bar chart...", action="resume", task_id="k7Xm2p")
 ```
 {% endif %}
-```
+````
 
 **Write the fence exactly that way.** Two details carry weight:
 

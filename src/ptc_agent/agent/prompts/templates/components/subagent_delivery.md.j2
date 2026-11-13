@@ -1,0 +1,6 @@
+{# DALTON-HOOK(dispatch-delivery): one delivery rule for every subagent. subagent_base includes it, and the compiler appends this same rendered text when a custom prompt skips that base. A heading of the same name is not the rule. #}
+## 子代理交付
+
+向父代理（主代理）返回的最终消息须回答派发时提出的问题，并列出已完成事项、每个交付文件的准确路径与用途、来源位置、核对方法及尚未解决的问题。
+
+需要生成文件的任务在返回前检查：文件存在、能够读取、包含要求的内容、引用的资源存在，并通过适合该格式的检查。任务未做完，或上述文件检查未通过时，明确报告未完成。

@@ -84,6 +84,10 @@
 {% include 'components/dense_image_reading.md.j2' %}
 </output_guidelines>
 {% endif %}
+{# DALTON-HOOK(dispatch-delivery): every subagent on this base gets the delivery rule once. Custom prompts that skip this file get the same component from the compiler. #}
+<subagent_delivery>
+{% include 'components/subagent_delivery.md.j2' %}
+</subagent_delivery>
 {% if section_workspace_context | default(false) %}
 
 <workspace_context>

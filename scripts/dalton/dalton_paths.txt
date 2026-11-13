@@ -155,6 +155,8 @@ src/ptc_agent/agent/prompts/templates/components/research_writing.md.j2
 src/ptc_agent/agent/prompts/templates/components/user_visible_text.md.j2
 # Dense image and table reading, shared the same way.
 src/ptc_agent/agent/prompts/templates/components/dense_image_reading.md.j2
+# Subagent delivery rule: final message, file paths, and the file check.
+src/ptc_agent/agent/prompts/templates/components/subagent_delivery.md.j2
 # OC-1 Phase 0 PR 0-1: scheduled data jobs layer foundation (migration, manifest,
 # scheduler core, container runner, wrapper process, evaluators & unit tests).
 src/dalton/migrations/versions/d029_data_tasks.py

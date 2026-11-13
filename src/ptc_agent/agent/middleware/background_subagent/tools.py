@@ -229,9 +229,19 @@ async def _compose_missing_reply(registry, task_id: str, run: dict | None) -> st
         if recovered:
             return _archived_reply(task_id, recovered)
         if status == "completed":
+            # DALTON-HOOK(dispatch-delivery): a completed run whose result
+            # text is gone is not a finished delivery. Read files required at
+            # dispatch; if none were required, or a required file is missing
+            # or unreadable, do not announce the work as done. Stopped and
+            # failed runs use their own notices and are not told to recover.
             return (
-                f"Task-{task_id} completed but its result text is no longer "
-                f"available; recover it from the workspace files it produced."
+                f"Task-{task_id}'s run has ended, but its result text is no "
+                f"longer available. Recover what you can by reading the workspace "
+                f"files it was asked to produce. Check that every file required at "
+                f"dispatch exists and is readable before telling the user the "
+                f"work is done. If no files were required, or if any required file "
+                f"is missing or unreadable, the task is not complete — do not "
+                f"announce it as done."
             )
         # The id arrives normalized, so nothing recorded means it names no
         # task. Read as a fate ("never recorded", "cannot be resumed"), a
@@ -482,7 +492,17 @@ def extract_result_content(result: dict[str, Any] | Any) -> tuple[bool, str]:
     if result.get("success"):
         inner = result.get("result")
         if inner is None:
-            return (True, "Task completed successfully (no output)")
+            # DALTON-HOOK(dispatch-delivery): a successful run with no content
+            # is not delivery complete, including when dispatch required no
+            # files. Stopped and failed results use the error branch below.
+            return (
+                True,
+                "This run has ended but returned no content. Check that every "
+                "file required at dispatch exists and is readable before telling "
+                "the user the work is done. If no files were required, or if any "
+                "required file is missing or unreadable, do not treat this as "
+                "delivery complete.",
+            )
         if hasattr(inner, "content"):
             return (True, str(inner.content))
         # Handle Command type
