@@ -337,10 +337,18 @@ class TestDispatchAndDeliveryPrompt:
             else:
                 assert phrase not in prompt, phrase
 
-    def test_update_and_resume_example_stays_detailed_only(self):
+    def test_update_and_resume_status_is_the_same_in_both_modes(self):
+        """Update is for a running task; resume is only when the tool marks it recoverable."""
         loader = init_loader()
         kwargs = dict(subagent_summary="")
         detailed = loader.get_system_prompt(**guidance_template_vars("detailed"), **kwargs)
         lean = loader.get_system_prompt(**guidance_template_vars("lean"), **kwargs)
-        assert "Add regulatory analysis" in detailed
+        status = (
+            "更新用于正在运行的任务；恢复仅用于工具明确标为可恢复的任务。"
+            "用户取消的任务不自动恢复或重新派发。"
+            "因超时、额度或执行中断而停止的任务，按返回的原因和恢复说明处理。"
+        )
+        assert status in detailed
+        assert status in lean
+        assert "Add regulatory analysis" not in detailed
         assert "Add regulatory analysis" not in lean

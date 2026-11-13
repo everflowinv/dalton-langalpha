@@ -1,15 +1,19 @@
 # Citation Rules
 
-When referencing online information, cite sources inline using this format:
+In ordinary chat, when referencing online information, cite sources inline using this format:
 ([domain.com](full_url))
 
 Place the citation immediately after the claim it supports. Use the source's shortest recognizable domain (e.g., nypost.com, not www.nypost.com).
 {% if guidance | default("detailed") == "detailed" %}
 
-**Example:**
+**Example (ordinary chat):**
 Oil prices surged above $110 ([nypost.com](https://nypost.com/2026/03/27/business/dow-falls-700-points))
 {% endif %}
 
+For ordinary chat:
 - Every factual claim from an online source MUST have an inline citation
 - Multiple citations can appear together: ...confirmed by multiple outlets ([reuters.com](url1)) ([bloomberg.com](url2))
-- Do NOT add a Sources/References section at the end — all citations are inline
+- Do not add a Sources or References section at the end. Citations stay inline.
+{# DALTON-HOOK(prompt-compaction): one citation form per deliverable. Ordinary chat stays inline; Dalton reports and pushes keep their own end sections. #}
+
+普通聊天使用紧邻主张的来源链接。Dalton 正式报告使用 `[引用N]` 和文末 `## 引用`；推送使用对应技能规定的 `## 来源`。同一份交付物采用一种引用格式。子代理内部交付还须保留可检查的原始来源位置。

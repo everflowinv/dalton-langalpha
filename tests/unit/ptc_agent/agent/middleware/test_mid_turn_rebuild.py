@@ -174,13 +174,12 @@ async def test_the_rows_and_the_summary_read_as_approved():
     step = [STEP[0], AIMessage("", id="a1", tool_calls=[{"name": "Read", "args": {"file_path": "a.md"}, "id": "toolu_1"}]), ToolMessage("hello", tool_call_id="toolu_1")]
 
     assert update_text(rebuild_notes_ask(step, "/w/note", {})) == (
+        # DALTON-HOOK(prompt-compaction): the rebuild note row was shortened
         "This conversation will be summarized after your next step\n\n"
         "The summary will keep none of this conversation word for word, so after it you continue from the summary, "
-        "your checkpoint notes in `/w/note/`, and the results of your next step. Bring the note of each task under "
-        "way up to date now, one terse line each, starting the note if there is none: the steps finished and what they "
-        "produced, the step in progress and what its latest result showed, work you delegated and its id, findings with "
-        "their source, what the user decided or told you, approaches you took or dropped and why, and what remains. "
-        "Correct in place, or remove, any line that is no longer true. Then carry on where you left off."
+        "your checkpoint notes in `/w/note/`, and the results of your next step. "
+        "Bring each task's note up to date now, and start the note if there is none. "
+        "Correct or remove any line that is no longer true. Then carry on where you left off."
     )
     assert update_text(await last_step_row(step, backend=None, folder=FOLDER)) == (
         "Your last step\n\n"

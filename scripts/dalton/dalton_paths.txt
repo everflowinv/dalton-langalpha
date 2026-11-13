@@ -401,3 +401,5 @@ tests/unit/dalton/test_researchdata_bridge_gcal.py
 plugins/dalton/skills/dalton-wiki-auto-ingest/
 tests/unit/dalton/test_agentturn_wiki_ingest.py
 tests/unit/dalton/test_researchdata_bridge_discord_history.py
+src/ptc_agent/agent/prompts/templates/components/dalton_deliverable.md.j2
+tests/unit/ptc_agent/agent/prompts/test_prompt_compaction.py

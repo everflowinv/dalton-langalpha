@@ -149,9 +149,12 @@ TURN_TIME_LIMIT_KEY = "turn_time_limit"
 TIME_UP_ASK_BEFORE = timedelta(minutes=20)
 TIME_UP_TOOLS_STOP_BEFORE = timedelta(minutes=10)
 
+# DALTON-HOOK(prompt-compaction): a refused call stops new work and names the
+# resume point. It does not say a user reply will continue this turn.
 TIME_UP_REFUSAL = (
-    "Not run: this turn is out of time. Answer the user now with what you have, "
-    "say what is left undone, and that they can reply to have you continue."
+    "Not run: this turn is out of time. Stop starting new work. "
+    "In your final reply, state how far the work got and the exact place to resume. "
+    "Say it will continue on its own only when a later run is already scheduled."
 )
 #: The ``refusal`` tag on a call the tool stop refused.
 TIME_UP_REFUSAL_TAG = "time_up"

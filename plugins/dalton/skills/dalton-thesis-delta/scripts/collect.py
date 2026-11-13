@@ -1238,7 +1238,7 @@ def _is_cursor_invalid_error(res: dict[str, Any], data: dict[str, Any]) -> bool:
     """游标不可复用的两类错误（researchdata_bridge 的既有分类）：
     e_cursor_expired（已失效或过期）与 e_cursor_filter_mismatch（翻页筛选条件
     与签发时不一致——日期窗口、查询词任一变化都会触发，生产契约见
-    dalton-conventions/references/evidence-and-sources.md:170）。两者都要求
+    dalton-conventions/references/evidence-and-sources.md §15）。两者都要求
     丢弃 cursor 从窗口起点重查、禁止重复提交旧 cursor。"""
     code = str(data.get("error_code") or "").strip().lower()
     text = str(res.get("error") or data.get("error") or "").strip().lower()
@@ -1544,7 +1544,7 @@ def collect_internal_and_ae(
         # 回看，seen 去重）；边界只在窗口完整扫完时推进，与全局 last_run.until
         # 解耦——没扫完的区间永远落在下一轮窗口里。
         boundary = min(str(ae_covered_until or since), until)
-        # cursor 只对签发它的那组筛选条件有效（evidence-and-sources.md:170）：
+        # cursor 只对签发它的那组筛选条件有效（evidence-and-sources.md §15）：
         # 续采必须原样重放签发窗口 {since, until} + 查询词，不能换成本轮 until，
         # 否则上游返回 e_cursor_filter_mismatch。查询词变化则 cursor 作废。
         resume_window: tuple[str, str] | None = None

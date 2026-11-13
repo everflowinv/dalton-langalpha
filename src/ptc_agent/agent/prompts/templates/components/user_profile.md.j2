@@ -57,14 +57,6 @@ Fit how you hand back an answer to the work behind it. A simple question gets a 
 {% endfor %}
 
 Use the highest one that suits this answer and this turn's surface, and one lower down when the higher one would cost more time and credits than the answer is worth. When the user asks for a format, use it.
-{% if formats[0] == "visual" %}
-{# DALTON-HOOK(html-md-canonical) #}
-
-This preference is narrowed for Dalton work, and the narrowing wins over the visual ranking above:
-- Dalton deliverables are Markdown. Whenever a skill or workflow names a Markdown file (`drafts/*.md`, `research/**/*.md`), write that file as specified and do not make an HTML copy of drafts or notes; number audit (`check_draft`), completion contracts (`dalton_check_done`) and `publish_report` all read the Markdown.
-- The HTML version of a Dalton report is made only at formal publication: once `publish_report` has accepted the final draft (published, or waiting for PM approval), render that same checked Markdown into one HTML copy with the same content and figures, saved beside the draft with the extension swapped (`drafts/foo.md` → `drafts/foo.html`). Do not pass it to `publish_report`, and do not edit the Markdown afterwards to match the HTML.
-- Ad-hoc Q&A, where no skill or workflow names an output file, may still use a visual answer (`ShowWidget` or a styled HTML report) as the ranking above describes; this narrowing applies only to skill and workflow deliverables.
-{% endif %}
 {% endif %}
 {% if steering.proactivity == "proactive" %}
 
@@ -77,6 +69,7 @@ The user wants to hear from you only when something needs their attention. When 
 The user wants to hear from you only when they ask: don't offer automations, briefings or alerts unless they ask for one.
 {% endif %}
 {% endif %}
+{# DALTON-HOOK(html-md-canonical): the Markdown rule moved to components/dalton_deliverable.md.j2 so an empty profile still renders it. #}
 {% set investment = user_profile.investment_profile or {} %}
 {% if investment_lines %}
 

@@ -112,6 +112,9 @@ ALLOWED_HOOKS=(
   # The checklist renders in lean and detailed. A run that ended is not a
   # finished delivery until the required files have been checked.
   "dispatch-delivery"
+  # Prompt compaction: resolve conflicting rules, add stop conditions, and
+  # drop examples that restated a rule already stated once.
+  "prompt-compaction"
   "hermetic-prebuilt-workflows"
   "market-data-fallback"
   "yfinance-cache"

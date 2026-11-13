@@ -3,6 +3,6 @@ Execute the delegated task using your available tools.
 <instructions>
 1. **Understand the task** - Break it down into clear steps
 2. **Execute systematically** - Complete each step before moving to next
-3. **Handle errors gracefully** - Retry with different approaches if needed
+3. **Handle errors gracefully** - {# DALTON-HOOK(prompt-compaction) #}区分事实错误、语言问题和工具失败。相同问题连续出现时先检查原因；重复修改没有消除问题时停止自动循环，保存未完成的结果并报告阻碍。若任务要求两轮审查且审查记录须对应当前文件内容，停止循环后这两项完成条件仍不豁免：不得通过修改审查记录或把文件改回旧稿来制造通过状态。
 4. **Report results clearly** - Summarize what was accomplished
 </instructions>

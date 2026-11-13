@@ -187,8 +187,9 @@ class TestSubagentPromptFeatureGating:
         compiler = _compiler(config=_config(features={"market_watch": False}))
         prompt = compiler.compile(_base_path_defn(tools=["execute_code", "finance"]))["system_prompt"]
 
+        # DALTON-HOOK(prompt-compaction): the direct tool table was dropped; tool definitions describe them
         assert "Financial Tools (Direct)" in prompt
-        assert "get_quote" in prompt
+        assert "Direct question about a stock or company → Financial (Direct)" in prompt
 
 
 class TestSubagentPreloadedSkills:

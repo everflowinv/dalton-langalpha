@@ -1,17 +1,20 @@
 # Task Workflow
 
-{% if scratchpad_enabled | default(false) %}Every task gets a checkpoint note, and a task that produces files gets a directory of its own, named for the task, directly in your working directory. A quick answer gets neither.{% else %}Every task gets a directory of its own, named for the task, directly in your working directory.{% endif %} Never write task files loose at the root: the root holds `agent.md`, the shared `data/` and the task directories.
+{# DALTON-HOOK(prompt-compaction): a short query is answered directly and does not get a task directory. A checkpoint note is created only when needed, and only when the scratchpad is on. #}
+Never write task files loose at the root: the root holds `agent.md`, the shared `data/` and the task directories.
+
+需要保存交付物时创建任务目录。简短查询直接回答，不建目录。{% if scratchpad_enabled | default(false) %}任务记录（checkpoint note）按实际需要创建。{% endif %}
 
 {% if scratchpad_enabled | default(false) %}
-1. **Start the task**:
-   - Write its checkpoint note: `{{ working_directory }}/{{ workspace_paths.scratchpad_notes }}/<task_name>.md` (`<scratchpad>` gives the full path), with the request as its first line. `Write` creates the folder.
-   - If the task will produce files, create its directory, under the same name, in your working directory: `mkdir -p <task_name>/` (e.g., `sector_analysis/`, `earnings_q3_review/`), with `data/` and `charts/` inside it as needed.
+1. **When a record or a deliverable is needed**:
+   - Checkpoint note, only when one is needed: `{{ working_directory }}/{{ workspace_paths.scratchpad_notes }}/<task_name>.md` (`<scratchpad>` gives the full path), with the request as its first line. `Write` creates the folder.
+   - Create the task directory when a deliverable must be saved: `mkdir -p <task_name>/`, with `data/` and `charts/` as needed.
 {% else %}
-1. **Create task directory**: `mkdir -p <task_name>/` (e.g., `sector_analysis/`, `earnings_q3_review/`), with `data/` and `charts/` inside it as needed
+1. **Create a task directory when a deliverable must be saved**: `mkdir -p <task_name>/` (for example `sector_analysis/`), with `data/` and `charts/` as needed.
 {% endif %}
 2. **Plan**: Break the task down before executing{% if todo_enabled | default(false) %}, tracking the steps with `TodoWrite`{% endif %}.
-3. **Execute**: {% if scratchpad_enabled | default(false) %}Temporary files go in your scratchpad (`{{ working_directory }}/{{ workspace_paths.scratchpad }}/<thread>/`) instead of `/tmp`, everything else in your task directory. Write to the task's note as decisions and findings come, and when you finish a step.{% else %}All intermediate files go in your task directory.{% endif %} Delegate to sub-agents with the directory path.
-4. **Produce deliverables**: Simple queries need no file. For complex analysis, use the output format the user ranks in Agent Preferences; with no ranking, write the report into the task directory, and ask the user when unsure of the format.
+3. **Execute**: {% if scratchpad_enabled | default(false) %}Temporary files go in the scratchpad (`{{ working_directory }}/{{ workspace_paths.scratchpad }}/<thread>/`), not in `/tmp`. Deliverables go in the task directory. Add to the note when a decision, a finding, or a finished step is worth keeping.{% else %}All intermediate files go in your task directory.{% endif %} Delegate to sub-agents with the directory path.
+4. **Produce deliverables**: For a complex analysis, use the format the user ranks in Agent Preferences; with no ranking, write the report in the task directory, and ask when the format is unclear.
 {% if role | default("analyst") == "chief_of_staff" %}
 5. **Update agent.md** as `<role>` describes
 {% else %}

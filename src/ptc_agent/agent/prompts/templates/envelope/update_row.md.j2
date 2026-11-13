@@ -173,15 +173,16 @@ Each block below has no copy in your system prompt, so read it as part of the sy
 {% elif update.kind == "notes_due" %}
 This conversation will be summarized soon
 
-{{ update.text }} Checkpoint now: in the note of each task under way, add what it does not hold yet, one terse line each: the steps finished since your last checkpoint and what they produced, work you delegated and its id, findings with their source, what the user decided or told you, approaches you took or dropped and why, and, on a long task, the plan and what remains. Correct in place, or remove, any line that is no longer true, such as a step noted as pending that is now done, a plan the work has moved past, delegated work that has since reported back, or a request the user has since changed. A quick answer needs no note. The summary will paraphrase what came before it and send you back to the notes, so what they hold is what comes through exactly. Then carry on where you left off; this is asked once before each summary.
+{# DALTON-HOOK(prompt-compaction): the note's contents are defined in the scratchpad prompt. This row only asks for what is new and for stale lines to be corrected. #}
+{{ update.text }} In the note of each task under way, add what it does not hold yet, and correct or remove any line that is no longer true. A quick answer needs no note. The summary will paraphrase what came before and send you back to the notes, so what they hold is what comes through exactly. Then carry on where you left off. This is asked once before each summary.
 {% elif update.kind == "notes_check_in" %}
 Your checkpoint notes have not been written for a while
 
-{{ update.text }} If something significant has happened since, add it to the note of the task it belongs to, starting that note if there is none, one terse line each: what the user decided or told you, an approach you took or dropped and why, a finding with its source, a step finished and what it produced, a hand-off sent or reported back. Correct in place, or remove, any line that is no longer true, a plan line included. If nothing significant happened, or this is a quick answer, carry on without writing: a line that only says the work continues adds nothing.
+{{ update.text }} If something significant has happened since, add it to the note of the task it belongs to, starting that note if there is none, and correct or remove any line that is no longer true. If nothing significant happened, or this is a quick answer, carry on without writing.
 {% elif update.kind == "rebuild_notes" %}
 This conversation will be summarized after your next step
 
-The summary will keep none of this conversation word for word, so after it you continue from the summary, your checkpoint notes in `{{ update.provenance.notes_dir }}/`, and the results of your next step. Bring the note of each task under way up to date now, one terse line each, starting the note if there is none: the steps finished and what they produced, the step in progress and what its latest result showed, work you delegated and its id, findings with their source, what the user decided or told you, approaches you took or dropped and why, and what remains. Correct in place, or remove, any line that is no longer true. Then carry on where you left off.
+The summary will keep none of this conversation word for word, so after it you continue from the summary, your checkpoint notes in `{{ update.provenance.notes_dir }}/`, and the results of your next step. Bring each task's note up to date now, and start the note if there is none. Correct or remove any line that is no longer true. Then carry on where you left off.
 {% elif update.kind == "last_step" %}
 Your last step
 
@@ -191,7 +192,12 @@ Just before the summary above was written, your last step made {{ update.provena
 {% elif update.kind == "turn_time_up" %}
 This turn is almost out of time
 
-{{ update.text }} Start nothing new. In your next reply, give the user your answer from what you have: what you found and produced, what is left undone, and that they can reply to have you continue from here.
+{# DALTON-HOOK(prompt-compaction): while tools still run, save the result and the resume point, and state both in the final reply. Once they have stopped, the final reply only states progress and where to resume. #}
+{% if "have stopped" in (update.text or "") %}
+{{ update.text }} Stop starting new work. In your final reply, state how far the work got and the exact place to resume. Say it will continue on its own only when a later run is already scheduled.
+{% else %}
+{{ update.text }} Stop starting new work. Save the current result and the exact place to resume, then state both in your final reply. Say it will continue on its own only when a later run is already scheduled.
+{% endif %}
 {% elif update.kind == "turn_time_up_withdrawn" %}
 The earlier time limit no longer applies
 

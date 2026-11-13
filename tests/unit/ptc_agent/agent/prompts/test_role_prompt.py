@@ -26,8 +26,10 @@ def test_lean_keeps_the_role_and_drops_its_examples():
     loader = get_loader()
     lean = loader.get_system_prompt(**_BASE, role="chief_of_staff", guidance="lean")
     assert "delegate_to_analyst" in lean
+    # DALTON-HOOK(prompt-compaction): Examples table removed; Workspace tier no longer lists Thesis
+    # The scenario table is gone from both modes. The role and the hand-off rules stay.
     assert "## Examples" not in lean
-    assert "## Examples" in loader.get_system_prompt(**_BASE, role="chief_of_staff")
+    assert "## Examples" not in loader.get_system_prompt(**_BASE, role="chief_of_staff")
 
 
 def test_no_shared_section_tells_the_chief_of_staff_to_keep_a_workspace_index():
@@ -42,7 +44,7 @@ def test_no_shared_section_tells_the_chief_of_staff_to_keep_a_workspace_index():
         "Key findings, what each task produced",
         "`agent.md` is about the workspace",
         "What this workspace is doing",
-        "project_q2_rebalance_thesis.md",
+        "project_working_agreements.md",
     ):
         assert analyst_only in analyst
         assert analyst_only not in chief

@@ -1,5 +1,6 @@
-"""DALTON-HOOK(html-md-canonical): when visual is ranked first in output_format,
-Dalton skill deliverables stay Markdown and HTML is made only at formal publication.
+"""DALTON-HOOK(html-md-canonical): Dalton skill deliverables stay Markdown and
+HTML is made only at formal publication. The rule lives in the static system
+prompt, so an empty user profile still carries it.
 
 DALTON-HOOK(user-visible-text) is in the main agent's static system prompt
 (output guidelines), not the profile block: both roles and both guidance
@@ -52,30 +53,52 @@ def _reset_loader():
     ],
 )
 def test_visual_first_preference_gets_dalton_narrowing(pref):
-    out = _render(pref)
-    assert NARROWING in out
-    assert out.index("1. A visual answer.") < out.index(NARROWING)
-    assert "only at formal publication" in out
-    assert "`publish_report`" in out
-    assert "Do not pass it to `publish_report`" in out
-    assert "where no skill or workflow names an output file, may still use a visual answer" in out
-    assert "`drafts/foo.md` → `drafts/foo.html`" in out
+    """The ranking stays in the profile. The narrowing is in the static prompt."""
+    profile = _render(pref)
+    assert "1. A visual answer." in profile
+    assert NARROWING not in profile
+    text = get_loader().get_system_prompt(**_SYSTEM, role="analyst", guidance="detailed")
+    assert NARROWING in text
+    assert "only at formal publication" in text
+    assert "`publish_report`" in text
+    assert "Do not pass it to `publish_report`" in text
+    assert "where no skill or workflow names an output file, may still use a visual answer" in text
+    assert "`drafts/foo.md` → `drafts/foo.html`" in text
 
 
 @pytest.mark.parametrize(
-    "pref,steer",
+    "pref",
     [
-        ({"output_format": ["markdown", "visual", "text"]}, True),
-        ({"output_format": ["text", "visual", "markdown"]}, True),
-        ({"output_format": "markdown"}, True),
-        ({"deliverable": "text"}, True),
-        ({"output_format": ["visual", "markdown", "text"]}, False),
-        ({"output_format": "html"}, False),
-        (None, True),
+        {"output_format": ["markdown", "visual", "text"]},
+        {"output_format": ["text", "visual", "markdown"]},
+        {"output_format": "markdown"},
+        {"deliverable": "text"},
+        None,
     ],
 )
-def test_no_narrowing_without_visual_first_main_agent(pref, steer):
-    assert NARROWING not in _render(pref, main_agent_steering=steer)
+def test_main_agent_narrows_dalton_deliverables_without_visual_first(pref):
+    """The Markdown rule applies to every main-agent task, including no ranking."""
+    assert NARROWING not in _render(pref, main_agent_steering=True)
+    text = get_loader().get_system_prompt(**_SYSTEM, role="analyst", guidance="lean")
+    assert NARROWING in text
+    assert "按照任务指定的格式制作交付物" in text
+    assert "only at formal publication" in text
+    assert "`publish_report`" in text
+
+
+@pytest.mark.parametrize(
+    "pref",
+    [
+        {"output_format": ["visual", "markdown", "text"]},
+        {"output_format": ["markdown", "visual", "text"]},
+        {"output_format": "html"},
+        None,
+    ],
+)
+def test_subagent_does_not_get_the_dalton_narrowing(pref):
+    assert NARROWING not in _render(pref, main_agent_steering=False)
+    base = get_loader().get_subagent_base_prompt(identity_line="You research.", role_prompt="Do the task.")
+    assert NARROWING not in base
 
 
 @pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
@@ -116,3 +139,17 @@ def test_user_visible_text_rule_when_user_profile_is_empty():
     assert block == ""
     text = get_loader().get_system_prompt(**_SYSTEM, role="analyst", guidance="lean")
     assert USER_VISIBLE in text
+
+
+def test_dalton_markdown_rule_when_user_profile_is_empty():
+    """baseline.py returns no profile block when the profile and the counts are empty.
+    The Markdown rule is in the static prompt, so it is still there."""
+    block = BaselineContextMiddleware(
+        user_profile={}, user_data_counts={}
+    )._user_profile_block(None)
+    assert block == ""
+    assert NARROWING not in block
+    text = get_loader().get_system_prompt(**_SYSTEM, role="analyst", guidance="lean")
+    assert NARROWING in text
+    assert "按照任务指定的格式制作交付物" in text
+    assert "only at formal publication" in text
