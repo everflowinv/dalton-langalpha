@@ -12,6 +12,7 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 from ptc_agent.agent.middleware.background_subagent.outcomes import Outcome
 from src.llms.content_utils import extract_reasoning_summary_index
 from src.server.utils.content_normalizer import normalize_text_content
+from src.server.utils.thinking_leak import CardTextFilter  # DALTON-HOOK(thinking-leak)
 
 logger = structlog.get_logger(__name__)
 
@@ -65,6 +66,12 @@ class _SubagentTokenForwarder:
         # Whitespace-only reasoning deltas seen before the reasoning section
         # opened, held until visible reasoning follows.
         self._reasoning_whitespace_held = ""
+        # DALTON-HOOK(thinking-leak): card text uses the same opening-only
+        # rule as the main stream. A card cannot see a later tool call, so
+        # an opening marker is shown as a final reply. Classified once per
+        # message, then passed through. Flushed on a new message id and
+        # in finalize.
+        self._card = CardTextFilter()
 
     def _signal_record(self, msg_id: str, content: str) -> dict[str, Any]:
         return {
@@ -142,6 +149,9 @@ class _SubagentTokenForwarder:
         # carried-over section index / pending separator / held whitespace so
         # the first chunk of the new message isn't falsely prefixed.
         if self._last_msg_id is not None and msg_id != self._last_msg_id:
+            # DALTON-HOOK(thinking-leak): flush the previous message's card hold.
+            await self._emit_card_hold(self._last_msg_id)
+            self._card = CardTextFilter()
             self._reasoning_block_index = None
             self._reasoning_separator_pending = False
             self._reasoning_whitespace_held = ""
@@ -218,10 +228,14 @@ class _SubagentTokenForwarder:
                 text = "\n\n" + text
                 self._reasoning_separator_pending = False
 
-            await self.registry.append_captured_event(
-                self.tool_call_id,
-                self._chunk_record(msg_id, text, content_type),
-            )
+            # DALTON-HOOK(thinking-leak): same markers as the main-stream filter.
+            if content_type == "text":
+                text = self._card.feed(text)
+            if text:
+                await self.registry.append_captured_event(
+                    self.tool_call_id,
+                    self._chunk_record(msg_id, text, content_type),
+                )
 
         self._last_msg_id = msg_id
 
@@ -305,10 +319,21 @@ class _SubagentTokenForwarder:
         (``_run_background_task``'s finally) writes it after the terminal meta
         and the unconsumed-steering sweep, keeping it the stream's last record.
         """
+        # DALTON-HOOK(thinking-leak): stream end flushes a held card paragraph.
+        if self._last_msg_id is not None:
+            await self._emit_card_hold(self._last_msg_id)
         if self._reasoning_active and self._last_msg_id is not None:
             await self.registry.append_captured_event(
                 self.tool_call_id,
                 self._signal_record(self._last_msg_id, "complete"),
             )
             self._reasoning_active = False
+
+    async def _emit_card_hold(self, msg_id: str) -> None:
+        shown = self._card.flush()
+        if not shown:
+            return
+        await self.registry.append_captured_event(
+            self.tool_call_id, self._chunk_record(msg_id, shown, "text")
+        )
 

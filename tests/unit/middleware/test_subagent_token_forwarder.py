@@ -907,3 +907,50 @@ async def test_a_malformed_call_answer_is_not_subagent_prose():
     await fw.finalize()
 
     assert not [r for r in task._test_records if r["event"] == "message_chunk"]
+
+
+def _card_text(task) -> str:
+    return "".join(
+        event["data"]["content"]
+        for event in task._test_records
+        if event["event"] == "message_chunk" and event["data"].get("content_type") == "text"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_card_text_keeps_a_mid_body_marker():
+    # DALTON-HOOK(thinking-leak): a card keeps a marker that does not open the message.
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    await fw.forward(_chunk("Answer <thinking>se"))
+    await fw.forward(_chunk("cret</thinking> done"))
+    await fw.forward(_chunk("\n\nNEED MORE "))
+    await fw.forward(_chunk("THINKING: let me plan."))
+    await fw.finalize()
+
+    assert _card_text(task) == (
+        "Answer <thinking>secret</thinking> done\n\nNEED MORE THINKING: let me plan."
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_card_text_strips_an_opening_marker():
+    # DALTON-HOOK(thinking-leak): a card strips only an opening marker, then passes text through.
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    await fw.forward(_chunk("We "))
+    await fw.forward(_chunk("NEED MORE THINKING about this."))
+    await fw.finalize()
+    assert _card_text(task) == "We NEED MORE THINKING about this."
+
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry, task_id_override="abd")
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abd")
+    await fw.forward(_chunk("<thinking>se"))
+    await fw.forward(_chunk("cret</thinking>\n\nNEED MORE THINKING: plan.\n\nDone"))
+    await fw.finalize()
+    assert _card_text(task) == "\n\nNEED MORE THINKING: plan.\n\nDone"

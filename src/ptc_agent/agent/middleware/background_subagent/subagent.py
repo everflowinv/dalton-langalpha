@@ -177,6 +177,8 @@ _EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
 # DALTON-HOOK(prompt-compaction): update is running-only; resume is only for a
 # task the tool marks recoverable. The prompt arg names the parameter; the
 # items under 派发任务 live in <subagent_coordination>.
+# DALTON-HOOK(subagent-cancel): update appends instructions to a running task
+# and does not stop it; stopping uses ThreadStatus's stop.
 TASK_TOOL_DESCRIPTION = """Launch a subagent for complex, multi-step tasks.
 
 Use for: Complex tasks, isolated research, context-heavy operations.
@@ -186,7 +188,7 @@ Args:
     description: Short title shown on the task card, in the user's language: one brief sentence saying what the work is doing. Do not include internal ids or tool names.
     prompt: The subagent's instructions. It sees nothing of this conversation, so this prompt is the whole task. Include every item required under "派发任务" in <subagent_coordination> in the system prompt.
     subagent_type: Which subagent to use (e.g. "general-purpose"). Required for "init".
-    action: "init" (new task, default), "update" (instruct a running task), or "resume". 更新用于正在运行的任务；恢复仅用于工具明确标为可恢复的任务。用户取消的任务不自动恢复或重新派发。因超时、额度或执行中断而停止的任务，按返回的原因和恢复说明处理。
+    action: "init" (new task, default), "update" (append instructions to a running task; to stop it, use ThreadStatus's stop), or "resume". 更新用于正在运行的任务；恢复仅用于工具明确标为可恢复的任务。用户取消的任务不自动恢复或重新派发。因超时、额度或执行中断而停止的任务，按返回的原因和恢复说明处理。
     task_id: The target task's short alphanumeric ID. Required for "update" and "resume".
 
 Returns:

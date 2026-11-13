@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME = "ThreadStatus"
 
+# DALTON-HOOK(subagent-cancel): stop names a background command or a subagent
+# task. Stopping a task may still be confirming; its status shows stopped
+# once it has ended.
 THREAD_STATUS_DOC = """\
 What is running or set to report back to this conversation: background commands and code runs, subagent tasks, wakeups, automations that run here, and analysts you handed work to.
 
@@ -63,7 +66,7 @@ Args:
     type: Only this type: command (Bash and ExecuteCode), task, wakeup, automation or analyst.
     status: Only this status: running, pending (set to report back later), completed, failed or stopped.
     id: One item's id as the listing shows it (bg-…, Task-…, w_…, or an automation's file name), for its detail.
-    stop: A background command's id to stop it. A stopped command does not report back.
+    stop: A background command's id (bg-…) or a subagent task's id (Task-… or its 6-character id) to stop it. Stopping a task may return that the stop is still being confirmed; the task's status shows stopped once it has ended. A stopped command does not report back.
 
 Omit type, status and id for the full view.
 
@@ -312,16 +315,25 @@ class _Reader:
             owned_missed = owned_missed or source.owns(item_id)
         return _unknown(item_id), None
 
-    async def stop(self, command_id: str) -> tuple[str, dict[str, Any] | None]:
-        if not command_id.startswith("bg-"):
+    async def stop(self, item_id: str) -> tuple[str, dict[str, Any] | None]:
+        if item_id.startswith("bg-"):
+            # Named on the result as a hand-off names its command, so a view whose
+            # stream never saw this call (one reconnected since) still re-reads
+            # the thread's commands.
+            return await self._stop(item_id), {"command_id": item_id}
+        task_id = _task_id(item_id)
+        if task_id is None:
             return (
-                f"ERROR: {command_id} is not a background command. stop takes a "
-                "command's id (bg-…) only."
+                f"ERROR: {item_id} is not a background command or a subagent task. "
+                "stop takes a command's id (bg-…) or a task's id "
+                "(Task-… or its 6-character id)."
             ), None
-        # Named on the result as a hand-off names its command, so a view whose
-        # stream never saw this call (one reconnected since) still re-reads
-        # the thread's commands.
-        return await self._stop(command_id), {"command_id": command_id}
+        # DALTON-HOOK(subagent-cancel): same path as the web cancel — persist
+        # intent, then notify the worker that holds the run. This process's
+        # registry is not asked whether the task exists or has stopped.
+        # Workflow children (owner_task_id) are cancelled when that worker's
+        # writer unwinds through cancel_owner_children.
+        return await self._stop_task(task_id), None
 
     async def _stop(self, command_id: str) -> str:
         try:
@@ -351,6 +363,94 @@ class _Reader:
                     f"{command_id} is not running: "
                     f"{listing.command_state(row, self.now)}. {wrote}"
                 )
+
+    async def _stop_task(self, task_id: str) -> str:
+        # DALTON-HOOK(subagent-cancel): say stopped only when the ledger
+        # status is cancelled AND this task's namespace lock is free. The
+        # executor writes that row, then waits out stragglers, and only
+        # then releases N(thread, task:{id}). A held lock or a failed
+        # probe is still confirming.
+        shown = f"Task-{task_id}"
+        from fastapi import HTTPException
+
+        from src.server.services.cancel_dispatch import _cancel_subagent_task
+
+        try:
+            outcome = await _cancel_subagent_task(self.thread_id, task_id)
+        except HTTPException as e:
+            logger.warning("[ThreadStatus] stop of %s failed", shown, exc_info=True)
+            detail = e.detail if isinstance(e.detail, str) else "Failed to cancel task."
+            return f"ERROR: Could not stop {shown}: {detail}"
+        except Exception as e:
+            logger.warning("[ThreadStatus] stop of %s failed", shown, exc_info=True)
+            return f"ERROR: Could not stop {shown}: {e}"
+        if not outcome.get("cancelled"):
+            return await self._task_not_stopped(shown, task_id, outcome)
+        status, read_ok = await self._task_run_status(task_id)
+        if (
+            read_ok
+            and status == "cancelled"
+            and await self._task_namespace_free(task_id)
+        ):
+            return f"Stopped {shown}."
+        if read_ok and status not in (None, "in_progress", "cancelled"):
+            return _already_ended(shown, status)
+        return _confirming_stop(shown)
+
+    async def _task_namespace_free(self, task_id: str) -> bool:
+        # DALTON-HOOK(subagent-cancel): pg_locks read only. Acquiring the
+        # fence here would refuse the writer that still holds it.
+        from src.server.services.writer_guard import held_task_namespaces
+
+        try:
+            held = await held_task_namespaces(self.thread_id, [task_id])
+        except Exception:
+            logger.warning(
+                "[ThreadStatus] stop of Task-%s could not read the namespace lock",
+                task_id,
+                exc_info=True,
+            )
+            return False
+        if held is None:
+            return False
+        return task_id not in held
+
+    async def _task_not_stopped(
+        self, shown: str, task_id: str, outcome: Mapping[str, Any]
+    ) -> str:
+        state = outcome.get("state")
+        if state == "task_not_found":
+            return f"Cannot stop {shown}: no such task in this conversation."
+        if state == "run_not_found":
+            return f"Cannot stop {shown}: it has no run in progress."
+        if state == "already_finished":
+            # DALTON-HOOK(subagent-cancel): a cancelled row whose namespace
+            # lock is still held is confirming, not already ended. The
+            # parenthetical status is ThreadStatus's own word.
+            status, read_ok = await self._task_run_status(task_id)
+            if (
+                read_ok
+                and status == "cancelled"
+                and not await self._task_namespace_free(task_id)
+            ):
+                return _confirming_stop(shown)
+            if read_ok and status:
+                return _already_ended(shown, status)
+            return f"Cannot stop {shown}: it has already ended."
+        message = outcome.get("message") or "it could not be stopped."
+        return f"Cannot stop {shown}: {message}"
+
+    async def _task_run_status(self, task_id: str) -> tuple[str | None, bool]:
+        try:
+            statuses = await subagent_runs.get_latest_run_statuses(self.thread_id, [task_id])
+        except Exception:
+            logger.warning(
+                "[ThreadStatus] stop of Task-%s could not re-read the ledger",
+                task_id,
+                exc_info=True,
+            )
+            return None, False
+        return statuses.get(task_id), True
 
 
 @dataclass(frozen=True)
@@ -418,10 +518,15 @@ class _Tasks:
 
 
 def _task_id(item_id: str) -> str | None:
-    """The task an id names: ``Task-`` and its id, or a bare id, which minted
-    ids being url-safe can hold _ or -."""
-    if item_id.startswith("Task-") and len(item_id) > 6:
-        return item_id.removeprefix("Task-")
+    """The task an id names: ``Task-`` plus its 6-character id, or that id alone.
+
+    A string that already starts with ``Task-`` is only the prefixed form.
+    It is not also tried as a bare 6-character id.
+    """
+    # DALTON-HOOK(subagent-cancel): Task-… is parsed only as Task-<id>.
+    if item_id.startswith("Task-"):
+        bare = item_id.removeprefix("Task-")
+        return bare if _BARE_TASK_ID.fullmatch(bare) else None
     return item_id if _BARE_TASK_ID.fullmatch(item_id) else None
 
 
@@ -522,6 +627,25 @@ class _Automations:
                 )
                 return Shown(detail, item.status if item is not None else None)
         return None
+
+
+def _confirming_stop(shown: str) -> str:
+    """DALTON-HOOK(subagent-cancel): the stop is requested and not yet confirmed."""
+    return (
+        f"Stop requested for {shown}; confirming it has stopped. "
+        "When it ends, its status shows stopped."
+    )
+
+
+def _already_ended(shown: str, status: str | None) -> str:
+    """DALTON-HOOK(subagent-cancel): the parenthetical is the listing's word.
+
+    ``completed``, ``failed`` and ``stopped``, from ``listing._TASK_STATUS``.
+    """
+    if not status:
+        return f"Cannot stop {shown}: it has already ended."
+    word = listing.task_status({"status": status})
+    return f"Cannot stop {shown}: it has already ended ({word})."
 
 
 def _could_not_read(types: Sequence[ItemType]) -> str:

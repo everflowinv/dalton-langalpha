@@ -383,6 +383,10 @@ ALLOWED_HOOKS=(
   # threshold-priced subscription models (e.g. Muse Ember 1.0) evaluate per
   # request while keeping cash and platform cost at zero.
   "notional-pricing"
+  # P7: ThreadStatus stop cancels a subagent task on the web cancel path.
+  "subagent-cancel"
+  # P7: hide harness thinking markers from assistant text before display and replay.
+  "thinking-leak"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

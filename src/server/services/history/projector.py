@@ -39,6 +39,8 @@ from src.server.utils.content_normalizer import normalize_text_content
 from src.server.utils.error_sanitization import (
     sanitize_error_text as _sanitize_error_text,
 )
+# DALTON-HOOK(thinking-leak): replay shows the same filtered assistant text as the live stream.
+from src.server.utils.thinking_leak import visible_assistant_text
 from src.server.utils.text_phase import agreed_phase, block_phase
 
 if TYPE_CHECKING:
@@ -295,6 +297,9 @@ def _project_ai_message(
     events.extend(_stamped_summary(message, agent))
     text, reasoning, phase = split_content_blocks(message.content)
     tool_calls = _filter_tool_calls(message.tool_calls or [])
+    # DALTON-HOOK(thinking-leak): the checkpoint message is left as stored.
+    if text:
+        text = visible_assistant_text(text, followed_by_tool_call=bool(tool_calls)) or None
 
     if reasoning:
         events.append(
