@@ -434,6 +434,22 @@ def build_route_probe_spec(
     if rid == "tmeet":
         # Login state only. A search probe is not an operation this route accepts.
         return "research", {"route": "tmeet", "operation": "auth_status"}
+    if rid == "gcal":
+        # Valid short read for contract checks. The health loop does not call it.
+        start = datetime.combine(
+            _probe_today(), datetime.min.time(), tzinfo=ZoneInfo("America/New_York")
+        )
+        end = start + timedelta(days=1)
+        return (
+            "research",
+            {
+                "route": "gcal",
+                "operation": "list_events",
+                "time_min": start.isoformat(),
+                "time_max": end.isoformat(),
+                "limit": 1,
+            },
+        )
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
@@ -801,6 +817,23 @@ async def _execute_probes(
                 }
 
             tasks.append(asyncio.create_task(_unprobed_last30days()))
+            continue
+
+        if rid == "gcal":
+            async def _unprobed_gcal(
+                r_id: str = rid, r_cat: str = cat
+            ) -> dict[str, Any]:
+                return {
+                    "source_id": r_id,
+                    "category": r_cat,
+                    "status": "unprobed",
+                    "latency_ms": 0,
+                    "latest_date": None,
+                    "error_type": "私有日历不探测",
+                    "detail": {"reason": "私有日历不探测"},
+                }
+
+            tasks.append(asyncio.create_task(_unprobed_gcal()))
             continue
 
         if rid == "all":

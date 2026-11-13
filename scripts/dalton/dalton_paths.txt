@@ -387,3 +387,8 @@ tests/unit/dalton/test_agentturn_tmeet.py
 # OC-1 AI application weekly monitor (db refresh + change report).
 plugins/dalton/skills/dalton-ai-app-weekly-monitor/
 tests/unit/dalton/test_agentturn_ai_app.py
+
+# OC-1 Richard earnings weekly (host gcal route).
+plugins/dalton/skills/dalton-richard-earnings/
+tests/unit/dalton/test_agentturn_richard_earnings.py
+tests/unit/dalton/test_researchdata_bridge_gcal.py

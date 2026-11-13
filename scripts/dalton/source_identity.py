@@ -1071,6 +1071,78 @@ def _declare_tmeet(
     ]
 
 
+def _gcal_as_of(event: dict[str, Any], fallback: str) -> str:
+    start = event.get("start")
+    raw = ""
+    if isinstance(start, dict):
+        raw = str(start.get("date") or start.get("dateTime") or "")
+    elif isinstance(start, str):
+        raw = start
+    if len(raw) >= 10 and raw[:4].isdigit() and raw[4:5] == "-":
+        return raw[:10]
+    if len(fallback) >= 10 and fallback[:4].isdigit():
+        return fallback[:10]
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _gcal_source_events(
+    operation: str,
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_data = payload.get("data")
+    if operation == "list_events":
+        source = raw_data if isinstance(raw_data, dict) else inner
+        rows = source.get("events") if isinstance(source, dict) else None
+        if not isinstance(rows, list) and isinstance(inner, dict):
+            rows = inner.get("events")
+        if not isinstance(rows, list):
+            return []
+        return [
+            row
+            for row in rows
+            if isinstance(row, dict) and str(row.get("id") or "").strip()
+        ]
+    source = raw_data if isinstance(raw_data, dict) else inner
+    if isinstance(source, dict) and str(source.get("id") or "").strip():
+        return [source]
+    return []
+
+
+def _declare_gcal(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    operation = str(arguments.get("operation") or "").strip() or "list_events"
+    events = _gcal_source_events(operation, payload, inner)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in events:
+        event_id = str(event.get("id") or "").strip()
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        summary = str(event.get("summary") or "").strip()
+        out.append(
+            _make_entry(
+                document_id=f"gcal:{event_id}",
+                route="gcal",
+                identity="internal_note",
+                publisher="Google Calendar",
+                title=summary or f"财报日历 {event_id}",
+                as_of=_gcal_as_of(event, fallback_as_of),
+                as_of_basis="event_time",
+                source_type="calendar_event",
+                private=True,
+            )
+        )
+        if len(out) >= MAX_SOURCES_PER_CALL:
+            break
+    return out[:MAX_SOURCES_PER_CALL]
+
+
 def _declare_x_timeline(
     arguments: dict[str, Any],
     payload: dict[str, Any],
@@ -1252,5 +1324,7 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
         return _declare_x_timeline(args, payload, inner, fallback_as_of)
     if route == "tmeet":
         return _declare_tmeet(args, payload, inner, fallback_as_of)
+    if route == "gcal":
+        return _declare_gcal(args, payload, inner, fallback_as_of)
 
     return []

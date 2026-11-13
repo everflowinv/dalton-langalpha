@@ -92,6 +92,7 @@ REPORT_PROFILES = frozenset(
         "mark-weekly-newenergy",
         "tmeet-weekly-minutes",
         "ai-app-weekly",
+        "richard-earnings",
     }
 )
 MAX_CARDS = 20
