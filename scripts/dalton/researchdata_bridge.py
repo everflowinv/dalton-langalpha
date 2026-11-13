@@ -168,6 +168,7 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "employee": (120, 120),
     "last30days": (600, 600),
     "x-timeline": (60, 60),
+    "tmeet": (120, 180),
 }
 
 BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
@@ -1121,6 +1122,12 @@ class BridgeConfig:
             os.environ.get(
                 "DALTON_XREACH_BIN",
                 "~/.openclaw/tools/node/bin/xreach",
+            )
+        ).expanduser().resolve()
+        self.tmeet_bin: Path = Path(
+            os.environ.get(
+                "DALTON_TMEET_BIN",
+                "~/.openclaw/tools/node/bin/tmeet",
             )
         ).expanduser().resolve()
         self.employee_python: Path = Path(
@@ -3019,6 +3026,51 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "community(route=\"x-timeline\", operation=\"search\", query=\"Meta Llama\", since=\"2026-10-01\", until=\"2026-10-23\", count=20)",
         ],
     },
+    "tmeet": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["auth_status", "record_search", "record_content"],
+        "default_operation": "auth_status",
+        "operation_aliases": {},
+        "accepted_params": [
+            "start",
+            "end",
+            "query",
+            "limit",
+            "record_file_id",
+            "action",
+            "lang",
+            "pid",
+        ],
+        "accepted_nested_params": [],
+        "required_params": {
+            "auth_status": [],
+            "record_search": ["start", "end"],
+            "record_content": ["record_file_id", "action"],
+        },
+        "optional_params": ["query", "limit", "lang", "pid"],
+        "param_formats": {
+            "start": "日期 YYYY-MM-DD 或 ISO 时间；按 Asia/Shanghai 墙钟转成 +08:00。日期的开始是当天 00:00:00",
+            "end": "同 start。只有日期时结束是当天 23:59:59+08:00，不截到今天",
+            "query": "主题关键字，只在 bridge 里过滤 subject，不传给 CLI",
+            "limit": "过滤后最多返回的条数，1-100，默认 50",
+            "record_file_id": "1-32 位数字",
+            "action": "minutes、todos、transcript。这是内容子命令，不是 operation 的别名",
+            "lang": "minutes 与 todos 的语言，默认 zh",
+            "pid": "transcript 分页起点，数字字符串",
+        },
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\", \"data\": {...}, \"_sources\": [...]}. "
+            "auth_status 只含 logged_in 与 refresh_token_days_left。"
+            "record_search 的记录在 data.records。record_content 按 action 返回 minute、todos 或转写段落。"
+        ),
+        "examples": [
+            'research(route="tmeet", operation="auth_status")',
+            'research(route="tmeet", operation="record_search", start="2026-11-09T00:00:00+08:00", end="2026-11-13T15:00:00+08:00", query="预定的会议", limit=20)',
+            'research(route="tmeet", operation="record_content", action="minutes", record_file_id="900001", lang="zh")',
+            'research(route="tmeet", operation="record_content", action="transcript", record_file_id="900001", pid="0", limit=100)',
+        ],
+    },
 }
 
 TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
@@ -3034,6 +3086,7 @@ TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
         "sales-mail",
         "tmtb",
         "funda-ai",
+        "tmeet",
     ),
     "community": ("xueqiu", "employee", "last30days", "x-timeline"),
 }
@@ -3637,6 +3690,9 @@ def _normalize_and_validate_call_args(
         # while `accession` is the filing accession number (`params.accession`).
         eff_alias.pop("accession", None)
         eff_alias.pop("accession_number", None)
+    elif route == "tmeet":
+        # `action` is the content subcommand, not an alias of `operation`.
+        eff_alias.pop("action", None)
 
     grouped: dict[str, list[tuple[str, Any]]] = {}
     none_keys: set[str] = set()
@@ -3717,7 +3773,7 @@ def _normalize_and_validate_call_args(
             else:
                 normalized["query"] = folded_query
 
-    if not is_comm:
+    if not is_comm and route != "tmeet":
         for date_k in _DATE_PARAM_FIELDS:
             raw_date = normalized.get(date_k)
             if raw_date is None:
@@ -6178,6 +6234,334 @@ def _is_empty_community_output(route: str, operation: str, parsed: Any) -> bool:
     return False
 
 
+_TMEET_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_TMEET_PAGE_SIZE = 30
+_TMEET_PAGE_CAP = 10
+_TMEET_DEFAULT_LIMIT = 50
+_TMEET_MAX_LIMIT = 100
+_TMEET_QUERY_MAX = 200
+_TMEET_ACTIONS = ("minutes", "todos", "transcript")
+_TMEET_RECORD_KEYS = (
+    "meeting_record_id",
+    "record_file_id",
+    "file_type",
+    "subject",
+    "meeting_start_time",
+    "record_start_time",
+    "record_end_time",
+    "duration_seconds",
+    "has_smart_minutes",
+    "has_transcript_content",
+)
+_TMEET_FILE_ID_RE = re.compile(r"^[0-9]{1,32}$")
+_TMEET_PAGE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/-]{1,512}$")
+_TMEET_LANG_RE = re.compile(r"^[a-z]{2}(?:-[A-Za-z0-9]{2,8})?$")
+_TMEET_PID_RE = re.compile(r"^[0-9]{1,12}$")
+_TMEET_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TMEET_NOT_LOGGED_RE = re.compile(
+    r"not\s+logged\s+in|login\s+required|unauthorized|token\s+expired|未登录|请先登录|登录已过期",
+    re.IGNORECASE,
+)
+_TMEET_LOGGED_IN_RE = re.compile(r"(?<!not\s)logged\s+in|已登录", re.IGNORECASE)
+_TMEET_DAYS_RE = re.compile(r"(\d+)\s*days?|剩余\s*(\d+)\s*天", re.IGNORECASE)
+_TMEET_EXPIRY_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
+_TMEET_HINT_MISSING = "宿主机上没有 tmeet 可执行文件。请检查 DALTON_TMEET_BIN。"
+_TMEET_HINT_LOGIN = "需要在宿主机重新登录 tmeet。本路由不提供登录。"
+_TMEET_HINT_CONTRACT = "tmeet 的输出不再是约定结构（非 JSON，或出现 unknown command）。请核对 CLI 是否仍为 v1.1.0。"
+_TMEET_HINT_TIMEOUT = "tmeet 调用超时。可稍后重试同一次只读查询。"
+_TMEET_HINT_ACTION = "record_content 的 action 只能是 minutes、todos、transcript。"
+_TMEET_HINT_FILE_ID = "record_file_id 只能是 1 到 32 位数字。"
+_TMEET_HINT_ORDER = "start 必须不晚于 end。"
+_TMEET_HINT_TRUNCATED = "已达到 10 页上限，结果可能不完整。请缩小 start/end 后重试。"
+
+TMEET_CATALOG_ENTRY: dict[str, Any] = {
+    "id": "tmeet",
+    "tool": "research",
+    "category": "research",
+    "kind": "bridge_readonly",
+    "name": "Tencent Meeting recordings",
+    "description": "只读查询腾讯会议登录状态、云录制列表和纪要转写。不提供建会、登录或授权。",
+    "operations": ["auth_status", "record_search", "record_content"],
+    "rules": [
+        "不并入 all。",
+        "action 是 record_content 的内容子命令，不是 operation 的别名。",
+        "不返回 token、OpenId 或用户名。",
+    ],
+}
+
+
+def _tmeet_failure(
+    status: str,
+    error_code: str,
+    hint: str,
+    category: str,
+    *,
+    error: str | None = None,
+    stderr: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": False,
+        "status": status,
+        "error_code": error_code,
+        "error_category": category,
+        "error": error or hint,
+        "hint": hint,
+        "_tmeet_hint": hint,
+        "data": None,
+    }
+    if stderr:
+        payload["stderr"] = stderr
+    return payload
+
+
+def _tmeet_param_error(hint: str, *, error_code: str = "invalid_arguments", error: str | None = None) -> dict[str, Any]:
+    return _tmeet_failure(error_code if error_code == "invalid_arguments" else "invalid_arguments", error_code, hint, "参数错误", error=error or hint)
+
+
+def _tmeet_shanghai_iso(value: Any, *, end: bool) -> str:
+    """Convert a date or ISO timestamp to an Asia/Shanghai `+08:00` wall clock."""
+    text = str(value).strip() if value is not None else ""
+    if not text or not isinstance(value, str):
+        raise ValueError("bad time")
+    if _TMEET_DATE_ONLY_RE.fullmatch(text):
+        clock = "23:59:59" if end else "00:00:00"
+        return f"{text}T{clock}+08:00"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("bad time") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_TMEET_SHANGHAI)
+    else:
+        parsed = parsed.astimezone(_TMEET_SHANGHAI)
+    return parsed.replace(microsecond=0).isoformat()
+
+
+def _tmeet_refresh_days(text: str, *, today: date | None = None) -> int | None:
+    """Read a remaining-day count, else an expiry date minus Shanghai today.
+
+    ``tmeet auth status`` prints the access token (hours left) before the refresh
+    token; only the refresh-token line decides whether a re-login is due.
+    """
+    refresh_lines = [ln for ln in text.splitlines() if re.search(r"refresh|刷新", ln, re.IGNORECASE)]
+    if refresh_lines:
+        text = "\n".join(refresh_lines)
+        compact = re.search(r"remaining\s+(\d+)d\b", text, re.IGNORECASE)
+        if compact:
+            return int(compact.group(1))
+    match = _TMEET_DAYS_RE.search(text)
+    if match:
+        raw = match.group(1) or match.group(2)
+        return int(raw)
+    expiry = _TMEET_EXPIRY_RE.search(text)
+    if expiry is None:
+        return None
+    current = today or datetime.now(_TMEET_SHANGHAI).date()
+    return (date.fromisoformat(expiry.group(1)) - current).days
+
+
+def _tmeet_parse_json(text: str) -> dict[str, Any] | None:
+    raw = text.strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    for line in reversed(raw.splitlines()):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _tmeet_cli_text_failure(stdout_text: str, stderr_text: str) -> dict[str, Any] | None:
+    """Classify a non-JSON or failed CLI response. JSON bodies are not scanned for login words."""
+    parsed = _tmeet_parse_json(stdout_text)
+    scan = stderr_text if isinstance(parsed, dict) else f"{stdout_text}\n{stderr_text}"
+    if _TMEET_NOT_LOGGED_RE.search(scan):
+        return _tmeet_failure("not_logged_in", "not_logged_in", _TMEET_HINT_LOGIN, "权限或额度")
+    if "unknown command" in scan.lower():
+        return _tmeet_failure(
+            "cli_contract_changed",
+            "cli_contract_changed",
+            _TMEET_HINT_CONTRACT,
+            "上游不可用",
+            stderr=sanitize_stderr_text(stderr_text) or None,
+        )
+    return None
+
+
+def _tmeet_limit(value: Any, *, default: int | None) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("bad limit")
+    if value < 1 or value > _TMEET_MAX_LIMIT:
+        raise ValueError("bad limit")
+    return value
+
+
+def _tmeet_copy_record(raw: dict[str, Any]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for key in _TMEET_RECORD_KEYS:
+        if key not in raw:
+            continue
+        val = raw[key]
+        if key in ("has_smart_minutes", "has_transcript_content"):
+            if isinstance(val, bool):
+                copied[key] = val
+            continue
+        if key == "duration_seconds":
+            if isinstance(val, int) and not isinstance(val, bool):
+                copied[key] = val
+            continue
+        if isinstance(val, str):
+            copied[key] = val
+    return copied
+
+
+def _tmeet_strip_avatar(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _tmeet_strip_avatar(item) for key, item in value.items() if key != "avatar_url"}
+    if isinstance(value, list):
+        return [_tmeet_strip_avatar(item) for item in value]
+    return value
+
+
+def _tmeet_executor_nicks(item: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    executors = item.get("executor_list")
+    if not isinstance(executors, list):
+        return found
+    for person in executors:
+        if not isinstance(person, dict):
+            continue
+        nick = person.get("nick")
+        if isinstance(nick, str) and nick.strip():
+            found.append(nick.strip())
+    return found
+
+
+def _tmeet_todo_items(raw_list: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if not isinstance(raw_list, list):
+        return items
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        items.append(
+            {
+                "content": content if isinstance(content, str) else ("" if content is None else str(content)),
+                "executors": _tmeet_executor_nicks(item),
+            }
+        )
+    return items
+
+
+def _tmeet_message_success(parsed: dict[str, Any]) -> bool:
+    message = parsed.get("message")
+    return isinstance(message, str) and message.strip().lower() == "success"
+
+
+def _tmeet_content_ok(parsed: dict[str, Any], action: str) -> bool:
+    """Success is `message == success` and object or null `data`.
+
+    A missing or null field is empty content: minutes become "", todos [], and
+    transcript paragraphs [] with more false. ``action`` only gates the known commands.
+    """
+    if action not in _TMEET_ACTIONS or not _tmeet_message_success(parsed):
+        return False
+    if "data" not in parsed:
+        return False
+    data = parsed.get("data")
+    return data is None or isinstance(data, dict)
+
+
+def _tmeet_minutes_view(parsed: dict[str, Any], *, action: str, record_file_id: str) -> dict[str, Any]:
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    if action == "todos":
+        return {
+            "action": action,
+            "record_file_id": record_file_id,
+            "todos": _tmeet_todo_items(data.get("todos")),
+        }
+    if isinstance(data.get("meeting_minute"), dict):
+        minute_obj = data["meeting_minute"]
+    elif isinstance(data.get("minutes"), dict):
+        minute_obj = data["minutes"]
+    else:
+        minute_obj = {}
+    minute = minute_obj.get("minute") if isinstance(minute_obj.get("minute"), str) else ""
+    todos = _tmeet_todo_items(minute_obj.get("todos"))
+    if not todos:
+        todos = _tmeet_todo_items(data.get("todos"))
+    return {"action": action, "record_file_id": record_file_id, "minute": minute, "todos": todos}
+
+
+def _tmeet_paragraph_view(parsed: dict[str, Any], *, action: str, record_file_id: str) -> dict[str, Any]:
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    minutes = data.get("minutes") if isinstance(data.get("minutes"), dict) else {}
+    paragraphs = minutes.get("paragraphs") if isinstance(minutes.get("paragraphs"), list) else None
+    if paragraphs is None:
+        paragraphs = data.get("paragraphs") if isinstance(data.get("paragraphs"), list) else []
+    cleaned = _tmeet_strip_avatar(paragraphs)
+    more_raw = data.get("more") if "more" in data else minutes.get("more")
+    more = bool(more_raw)
+    next_pid: str | None = None
+    if more and isinstance(cleaned, list) and cleaned:
+        numeric = [
+            int(str(item.get("pid")))
+            for item in cleaned
+            if isinstance(item, dict) and str(item.get("pid") or "").isdigit()
+        ]
+        if numeric:
+            next_pid = str(max(numeric) + 1)
+    return {
+        "action": action,
+        "record_file_id": record_file_id,
+        "more": more,
+        "next_pid": next_pid,
+        "paragraphs": cleaned,
+    }
+
+
+def _tmeet_allowed_keys(operation: str, action: str | None) -> set[str]:
+    allowed = {"route", "operation", "timeout"}
+    if operation == "record_search":
+        allowed |= {"start", "end", "query", "limit"}
+    elif operation == "record_content":
+        allowed |= {"record_file_id", "action"}
+        if action in ("minutes", "todos"):
+            allowed.add("lang")
+        elif action == "transcript":
+            allowed |= {"pid", "limit"}
+    return allowed
+
+
+def _tmeet_file_id(value: Any) -> str:
+    if isinstance(value, bool):
+        raise ValueError("bad file id")
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        raise ValueError("bad file id")
+    if _TMEET_FILE_ID_RE.fullmatch(text) is None:
+        raise ValueError("bad file id")
+    return text
+
+
 class UnsupportedSkillLauncherError(ValueError):
     """Raised when an explicit skill `run.sh` path is not a verified launcher for the target skill."""
 
@@ -6219,6 +6603,7 @@ class ResearchDataBridge:
         self._resolved_embed_dims: int | None = None
         self._file_cache: dict[str, tuple[int, int, Any]] = {}
         self._xreach_version_cache: tuple[float, dict[str, Any]] | None = None
+        self._tmeet_version_cache: tuple[float, dict[str, Any]] | None = None
         self._archive_run_lock = asyncio.Lock()
         self._archive_proc: Any = None
         self._archive_watch_task: asyncio.Task[Any] | None = None
@@ -6424,6 +6809,31 @@ class ResearchDataBridge:
                         props["params"]["description"] = (
                             f"{p_desc} 分页范围：offset >= 0，max_chars 1–30000。"
                         ).strip()
+                if isinstance(route_prop, dict) and isinstance(route_prop.get("enum"), list):
+                    if "tmeet" not in route_prop["enum"]:
+                        route_prop["enum"].append("tmeet")
+                if isinstance(props, dict):
+                    props.setdefault(
+                        "record_file_id",
+                        {
+                            "type": "string",
+                            "description": "tmeet record_content: numeric record file id (1-32 digits).",
+                        },
+                    )
+                    props.setdefault(
+                        "lang",
+                        {
+                            "type": "string",
+                            "description": "tmeet minutes/todos language, default zh.",
+                        },
+                    )
+                    props.setdefault(
+                        "pid",
+                        {
+                            "type": "string",
+                            "description": "tmeet transcript page start pid (numeric string).",
+                        },
+                    )
             elif tool_name == "community":
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.COMMUNITY_DESCRIPTION_SUFFIX.strip() not in desc:
@@ -7942,6 +8352,361 @@ class ResearchDataBridge:
                 outcome = {"ok": False, "status": "error", "error": type(exc).__name__}
         self._xreach_version_cache = (now, outcome)
         return outcome
+
+    def _tmeet_subprocess_env(self) -> dict[str, str]:
+        """Reuse the stripped community env and prepend the tmeet binary directory to PATH."""
+        env = self._build_community_subprocess_env()
+        bin_dir = str(self.cfg.tmeet_bin.parent)
+        current = env.get("PATH", "")
+        env["PATH"] = bin_dir if not current else f"{bin_dir}{os.pathsep}{current}"
+        return env
+
+    async def _exec_tmeet(self, argv: list[str], timeout_s: float) -> tuple[int, bytes, bytes]:
+        """Run one tmeet argv list. The only tmeet `create_subprocess_exec` site."""
+        env = self._tmeet_subprocess_env()
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except BaseException:
+            await _terminate_and_reap_process(proc, term_timeout_s=COMMUNITY_SIGTERM_GRACE_S)
+            raise
+        returncode = proc.returncode if isinstance(proc.returncode, int) else 1
+        return returncode, stdout_bytes or b"", stderr_bytes or b""
+
+    async def probe_tmeet_version(self) -> dict[str, Any]:
+        """Run offline `tmeet --version` for `/healthz` (cached 60s); status only, never secrets."""
+        now = time.monotonic()
+        if self._tmeet_version_cache is not None and now - self._tmeet_version_cache[0] < 60.0:
+            return self._tmeet_version_cache[1]
+        bin_path = self.cfg.tmeet_bin
+        if not bin_path.is_file():
+            outcome: dict[str, Any] = {
+                "ok": False,
+                "status": "missing",
+                "error": f"tmeet binary not found: {bin_path}",
+            }
+        else:
+            try:
+                returncode, stdout_bytes, _stderr_bytes = await self._exec_tmeet(
+                    [str(bin_path), "--version"],
+                    8.0,
+                )
+                version_lines = stdout_bytes.decode("utf-8", errors="replace").splitlines()
+                version = sanitize_stderr_text(version_lines[0] if version_lines else "", max_len=120)
+                if returncode == 0 and version:
+                    outcome = {"ok": True, "status": "ok", "version": version}
+                else:
+                    outcome = {
+                        "ok": False,
+                        "status": "error",
+                        "error": f"tmeet --version exited with code {returncode}",
+                    }
+            except asyncio.TimeoutError:
+                outcome = {"ok": False, "status": "timeout", "error": "tmeet --version timed out"}
+            except Exception as exc:  # noqa: BLE001 - healthz reports the exception type only
+                outcome = {"ok": False, "status": "error", "error": type(exc).__name__}
+        self._tmeet_version_cache = (now, outcome)
+        return outcome
+
+    def _tmeet_finish(
+        self,
+        operation: str,
+        arguments: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        hint = payload.pop("_tmeet_hint", None)
+        norm = payload.pop("_tmeet_norm", None)
+        if not isinstance(norm, dict):
+            norm = _build_normalized_params_view(arguments)
+        _apply_error_and_empty_contract("research", "tmeet", operation, payload, norm)
+        if isinstance(hint, str) and hint:
+            payload["hint"] = hint
+        declared = source_identity.declare(
+            "research",
+            {
+                "route": "tmeet",
+                "operation": operation,
+                **{key: value for key, value in arguments.items() if key not in {"timeout", "route", "operation"}},
+            },
+            payload,
+        )
+        payload["_declared_sources"] = declared
+        payload["_sources"] = declared
+        return payload
+
+    def _tmeet_reject_extras(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        action = arguments.get("action")
+        action_text = action.strip() if isinstance(action, str) else None
+        allowed = _tmeet_allowed_keys(operation, action_text)
+        unknown = sorted(
+            key for key, value in arguments.items() if value is not None and key not in allowed
+        )
+        if not unknown:
+            return None
+        hint = f"本操作不接受参数 {unknown}。请只传该 operation 允许的字段。"
+        return _tmeet_param_error(hint, error_code="unknown_parameters", error=hint)
+
+    async def _tmeet_auth(self, bin_path: str, timeout_s: float) -> dict[str, Any]:
+        _returncode, stdout_bytes, stderr_bytes = await self._exec_tmeet(
+            [bin_path, "auth", "status"],
+            timeout_s,
+        )
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        combined = f"{stdout_text}\n{stderr_text}"
+        if _TMEET_NOT_LOGGED_RE.search(combined):
+            return _tmeet_failure("not_logged_in", "not_logged_in", _TMEET_HINT_LOGIN, "权限或额度")
+        if "unknown command" in combined.lower():
+            return _tmeet_failure(
+                "cli_contract_changed",
+                "cli_contract_changed",
+                _TMEET_HINT_CONTRACT,
+                "上游不可用",
+            )
+        if _TMEET_LOGGED_IN_RE.search(combined):
+            return {
+                "ok": True,
+                "status": "ok",
+                "data": {
+                    "logged_in": True,
+                    "refresh_token_days_left": _tmeet_refresh_days(combined),
+                },
+            }
+        return _tmeet_failure(
+            "cli_contract_changed",
+            "cli_contract_changed",
+            _TMEET_HINT_CONTRACT,
+            "上游不可用",
+        )
+
+    async def _tmeet_search(
+        self,
+        bin_path: str,
+        arguments: dict[str, Any],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        if not isinstance(arguments.get("start"), str) or not isinstance(arguments.get("end"), str):
+            return _tmeet_param_error("record_search 需要 start 和 end。")
+        try:
+            start_iso = _tmeet_shanghai_iso(arguments.get("start"), end=False)
+            end_iso = _tmeet_shanghai_iso(arguments.get("end"), end=True)
+        except ValueError:
+            return _tmeet_param_error("start 和 end 需为日期 YYYY-MM-DD 或 ISO 时间，并按 Asia/Shanghai 转成 +08:00。")
+        if datetime.fromisoformat(start_iso) > datetime.fromisoformat(end_iso):
+            return _tmeet_param_error(_TMEET_HINT_ORDER)
+        query = arguments.get("query")
+        if query is not None and not isinstance(query, str):
+            return _tmeet_param_error("query 只能是字符串。")
+        query_text = query.strip() if isinstance(query, str) else ""
+        if len(query_text) > _TMEET_QUERY_MAX:
+            return _tmeet_param_error("query 最长 200 个字符。")
+        try:
+            limit = _tmeet_limit(arguments.get("limit"), default=_TMEET_DEFAULT_LIMIT)
+        except ValueError:
+            return _tmeet_param_error("limit 只能是 1 到 100 的整数。")
+        if limit is None:
+            return _tmeet_param_error("limit 只能是 1 到 100 的整数。")
+        collected: list[dict[str, Any]] = []
+        page_token: str | None = None
+        pages = 0
+        truncated = False
+        deadline = time.monotonic() + timeout_s
+        while pages < _TMEET_PAGE_CAP:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return _tmeet_failure("timeout", "timeout", _TMEET_HINT_TIMEOUT, "上游不可用")
+            argv = [
+                bin_path,
+                "record",
+                "search",
+                "--start",
+                start_iso,
+                "--end",
+                end_iso,
+                "--page-size",
+                str(_TMEET_PAGE_SIZE),
+                "--format",
+                "json",
+            ]
+            if page_token is not None:
+                argv.extend(["--page-token", page_token])
+            returncode, stdout_bytes, stderr_bytes = await self._exec_tmeet(argv, remaining)
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+            parsed = _tmeet_parse_json(stdout_text) if returncode == 0 else None
+            data = parsed.get("data") if isinstance(parsed, dict) else None
+            records = data.get("records") if isinstance(data, dict) else None
+            if not isinstance(records, list):
+                failure = _tmeet_cli_text_failure(stdout_text, stderr_text)
+                if failure is not None:
+                    return failure
+                return _tmeet_failure(
+                    "cli_contract_changed",
+                    "cli_contract_changed",
+                    _TMEET_HINT_CONTRACT,
+                    "上游不可用",
+                    stderr=sanitize_stderr_text(stderr_text) or None,
+                )
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                copied = _tmeet_copy_record(item)
+                subject = str(copied.get("subject") or "")
+                if query_text and query_text.casefold() not in subject.casefold():
+                    continue
+                collected.append(copied)
+            pages += 1
+            has_more = bool(data.get("has_more")) if isinstance(data, dict) else False
+            if not has_more:
+                break
+            if pages >= _TMEET_PAGE_CAP:
+                truncated = True
+                break
+            token = data.get("next_page_token") if isinstance(data, dict) else None
+            token_text = token if isinstance(token, str) else ""
+            if _TMEET_PAGE_TOKEN_RE.fullmatch(token_text) is None:
+                return _tmeet_failure(
+                    "cli_contract_changed",
+                    "cli_contract_changed",
+                    _TMEET_HINT_CONTRACT,
+                    "上游不可用",
+                    stderr=sanitize_stderr_text(stderr_text) or None,
+                )
+            page_token = token_text
+        page_capped = truncated
+        if len(collected) > limit:
+            collected = collected[:limit]
+            truncated = True
+        payload = {
+            "ok": True,
+            "status": "ok",
+            "data": {
+                "records": collected,
+                "record_count": len(collected),
+                "truncated": truncated,
+                "pages_scanned": pages,
+            },
+            "_tmeet_norm": {
+                **_build_normalized_params_view(arguments),
+                "start": start_iso,
+                "end": end_iso,
+            },
+        }
+        if truncated:
+            hint = _TMEET_HINT_TRUNCATED if page_capped else "结果已按 limit 截断。"
+            payload["hint"] = hint
+            payload["_tmeet_hint"] = hint
+        return payload
+
+    async def _tmeet_content(
+        self,
+        bin_path: str,
+        arguments: dict[str, Any],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        action = arguments.get("action")
+        if not isinstance(action, str) or action not in _TMEET_ACTIONS:
+            return _tmeet_param_error(_TMEET_HINT_ACTION)
+        try:
+            record_file_id = _tmeet_file_id(arguments.get("record_file_id"))
+        except ValueError:
+            return _tmeet_param_error(_TMEET_HINT_FILE_ID)
+        argv = [bin_path, "record", "content", "--action", action, "--record-file-id", record_file_id]
+        if action in ("minutes", "todos"):
+            lang = arguments.get("lang") if arguments.get("lang") is not None else "zh"
+            if not isinstance(lang, str) or _TMEET_LANG_RE.fullmatch(lang) is None:
+                return _tmeet_param_error("lang 只能是语言代码，例如 zh。")
+            argv.extend(["--lang", lang])
+        elif action == "transcript":
+            pid = arguments.get("pid")
+            if pid is not None:
+                if not isinstance(pid, str) or _TMEET_PID_RE.fullmatch(pid) is None:
+                    return _tmeet_param_error("pid 只能是数字字符串。")
+                argv.extend(["--pid", pid])
+            if arguments.get("limit") is not None:
+                try:
+                    limit = _tmeet_limit(arguments.get("limit"), default=None)
+                except ValueError:
+                    return _tmeet_param_error("limit 只能是 1 到 100 的整数。")
+                if limit is not None:
+                    argv.extend(["--limit", str(limit)])
+        returncode, stdout_bytes, stderr_bytes = await self._exec_tmeet(argv, timeout_s)
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        parsed = _tmeet_parse_json(stdout_text) if returncode == 0 else None
+        if not isinstance(parsed, dict) or not _tmeet_content_ok(parsed, action):
+            failure = _tmeet_cli_text_failure(stdout_text, stderr_text) if not isinstance(parsed, dict) else None
+            if failure is not None:
+                return failure
+            return _tmeet_failure(
+                "cli_contract_changed",
+                "cli_contract_changed",
+                _TMEET_HINT_CONTRACT,
+                "上游不可用",
+                stderr=None if isinstance(parsed, dict) else (sanitize_stderr_text(stderr_text) or None),
+            )
+        if action in ("minutes", "todos"):
+            data = _tmeet_minutes_view(parsed, action=action, record_file_id=record_file_id)
+        else:
+            data = _tmeet_paragraph_view(parsed, action=action, record_file_id=record_file_id)
+        return {"ok": True, "status": "ok", "data": data}
+
+    async def _tmeet_run(
+        self,
+        arguments: dict[str, Any],
+        operation: str,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        extra = self._tmeet_reject_extras(operation, arguments)
+        if extra is not None:
+            return extra
+        if operation == "record_search":
+            if arguments.get("start") is None or arguments.get("end") is None:
+                return _tmeet_param_error("record_search 需要 start 和 end。")
+        elif operation == "record_content":
+            if arguments.get("record_file_id") is None or arguments.get("action") is None:
+                return _tmeet_param_error("record_content 需要 record_file_id 和 action。")
+        elif operation != "auth_status":
+            return _tmeet_param_error("tmeet 只提供 auth_status、record_search、record_content。")
+        bin_path = self.cfg.tmeet_bin
+        if not bin_path.is_file():
+            return _tmeet_failure("source_missing", "source_missing", _TMEET_HINT_MISSING, "上游不可用")
+        if operation == "auth_status":
+            return await self._tmeet_auth(str(bin_path), timeout_s)
+        if operation == "record_search":
+            return await self._tmeet_search(str(bin_path), arguments, timeout_s)
+        return await self._tmeet_content(str(bin_path), arguments, timeout_s)
+
+    async def _handle_tmeet_call(
+        self,
+        req_id: Any,
+        arguments: dict[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        operation = str(arguments.get("operation") or "auth_status").strip() or "auth_status"
+        try:
+            payload = await self._tmeet_run(arguments, operation, float(eff_timeout))
+        except asyncio.TimeoutError:
+            payload = _tmeet_failure("timeout", "timeout", _TMEET_HINT_TIMEOUT, "上游不可用")
+        except OSError:
+            payload = _tmeet_failure("source_missing", "source_missing", _TMEET_HINT_MISSING, "上游不可用")
+        except Exception as exc:  # noqa: BLE001 - tmeet failures stay on the tool envelope
+            payload = _tmeet_failure(
+                "error",
+                "error",
+                "tmeet 调用失败。",
+                "上游不可用",
+                error=type(exc).__name__,
+            )
+        finished = self._tmeet_finish(operation, arguments, payload)
+        return self._make_tool_result_response(req_id, finished, is_error=finished.get("ok") is False)
 
     def _validate_and_build_community_cmd(
         self,
@@ -9472,6 +10237,8 @@ class ResearchDataBridge:
             return await self._handle_community_call(
                 req_id, route, arguments, eff_timeout
             )
+        if tool_name == "research" and route == "tmeet":
+            return await self._handle_tmeet_call(req_id, arguments, eff_timeout)
         call_args = dict(arguments)
         if tool_name == "catalog":
             call_args.pop("route", None)
@@ -9980,6 +10747,7 @@ class ResearchDataBridge:
                             )
                         include_community = not req_category or req_category == "community"
                         include_macro = not req_category or req_category == "macro"
+                        include_research = not req_category or req_category == "research"
                         kept_routes: list[dict[str, Any]] = []
                         seen_comm: set[str] = set()
                         for r in payload["routes"]:
@@ -10019,6 +10787,14 @@ class ResearchDataBridge:
                             }
                             if "market-regime" not in existing_ids:
                                 kept_routes.append(dict(MARKET_REGIME_CATALOG_ENTRY))
+                        if include_research:
+                            research_ids = {
+                                str(r.get("id") or "")
+                                for r in kept_routes
+                                if isinstance(r, dict)
+                            }
+                            if "tmeet" not in research_ids:
+                                kept_routes.append(dict(TMEET_CATALOG_ENTRY))
                         if include_community:
                             for comm_id in ("xueqiu", "employee", "last30days", "x-timeline"):
                                 if comm_id not in seen_comm and comm_id not in handoff:
@@ -20814,6 +21590,7 @@ async def _handle_client(
                 "caller_budget_s": bridge.cfg.caller_budget_s,
                 "alphaengine_get_document_today": bridge._read_usage_today(),
                 "xreach": await bridge.probe_xreach_version(),
+                "tmeet": await bridge.probe_tmeet_version(),
             }
             await _send_http(writer, 200, "OK", health_payload)
             return

@@ -995,6 +995,82 @@ def _declare_employee(
     return out[:MAX_SOURCES_PER_CALL]
 
 
+def _declare_tmeet(
+    arguments: dict[str, Any],
+    payload: dict[str, Any],
+    inner: dict[str, Any],
+    fallback_as_of: str,
+) -> list[dict[str, Any]]:
+    operation = str(arguments.get("operation") or "").strip() or "auth_status"
+    today = datetime.now(_BEIJING_TZ).date().isoformat()
+    retrieved = fallback_as_of if len(fallback_as_of) >= 10 and fallback_as_of[:4].isdigit() else today
+
+    if operation == "record_search":
+        raw_data = payload.get("data")
+        records: list[dict[str, Any]] = []
+        if isinstance(raw_data, dict) and isinstance(raw_data.get("records"), list):
+            records = [item for item in raw_data["records"] if isinstance(item, dict)]
+        elif isinstance(inner.get("records"), list):
+            records = [item for item in inner["records"] if isinstance(item, dict)]
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in records:
+            file_id = str(record.get("record_file_id") or "").strip()
+            if not file_id or file_id in seen:
+                continue
+            seen.add(file_id)
+            iso = str(record.get("meeting_start_time") or record.get("record_start_time") or "").strip()
+            as_of = iso[:10] if len(iso) >= 10 and iso[:4].isdigit() else retrieved
+            title = str(record.get("subject") or f"腾讯会议 {file_id}").strip()
+            out.append(
+                _make_entry(
+                    document_id=f"tmeet:{file_id}",
+                    route="tmeet",
+                    identity="internal_note",
+                    publisher="腾讯会议",
+                    title=title,
+                    as_of=as_of,
+                    as_of_basis="meeting_time",
+                    source_type="meeting_minutes",
+                    private=True,
+                )
+            )
+            if len(out) >= MAX_SOURCES_PER_CALL:
+                break
+        return out[:MAX_SOURCES_PER_CALL]
+
+    if operation == "auth_status":
+        return [
+            _make_entry(
+                document_id="tmeet:auth",
+                route="tmeet",
+                identity="internal_note",
+                publisher="腾讯会议",
+                title="腾讯会议登录状态",
+                as_of=retrieved,
+                as_of_basis="retrieved_at",
+                source_type="meeting_minutes",
+                private=True,
+            )
+        ]
+
+    file_id = str(arguments.get("record_file_id") or inner.get("record_file_id") or "content").strip() or "content"
+    action = str(arguments.get("action") or inner.get("action") or "content").strip() or "content"
+    return [
+        _make_entry(
+            document_id=f"tmeet:{file_id}",
+            route="tmeet",
+            identity="internal_note",
+            publisher="腾讯会议",
+            title=f"腾讯会议 {action}",
+            as_of=retrieved,
+            as_of_basis="retrieved_at",
+            source_type="meeting_minutes",
+            private=True,
+        )
+    ]
+
+
 def _declare_x_timeline(
     arguments: dict[str, Any],
     payload: dict[str, Any],
@@ -1174,5 +1250,7 @@ def declare(tool: str, arguments: dict[str, Any] | None, payload: dict[str, Any]
         return _declare_last30days(args, payload, inner, fallback_as_of)
     if route == "x-timeline":
         return _declare_x_timeline(args, payload, inner, fallback_as_of)
+    if route == "tmeet":
+        return _declare_tmeet(args, payload, inner, fallback_as_of)
 
     return []

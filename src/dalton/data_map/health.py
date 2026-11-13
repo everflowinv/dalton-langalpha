@@ -431,6 +431,9 @@ def build_route_probe_spec(
             "community",
             {"route": "x-timeline", "operation": "tweets", "handle": "nvidia", "count": 3},
         )
+    if rid == "tmeet":
+        # Login state only. A search probe is not an operation this route accepts.
+        return "research", {"route": "tmeet", "operation": "auth_status"}
 
     tool_name = cat if cat in ("research", "finance", "macro", "news", "community") else "research"
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
