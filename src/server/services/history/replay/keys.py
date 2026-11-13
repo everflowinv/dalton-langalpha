@@ -58,6 +58,8 @@ def projection_sources() -> list[Path]:
             _SRC / "server/utils/error_sanitization.py",
             _SRC / "server/utils/content_normalizer.py",
             _SRC / "server/utils/text_phase.py",
+            # DALTON-HOOK(thinking-leak): the display filter shapes replayed assistant text
+            _SRC / "server/utils/thinking_leak.py",
             _SRC / "server/database/provenance.py",
             _SRC / "server/services/runs/credit_usage.py",
             _SRC / "server/contracts/status.py",

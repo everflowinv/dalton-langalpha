@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+# DALTON-HOOK(subagent-cancel): task-stop tests use signature-checked doubles.
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
@@ -469,11 +471,292 @@ class TestStop:
         assert message.content.startswith("No bg-000000000001 in this conversation.")
 
     @pytest.mark.asyncio
-    async def test_only_a_command_can_be_stopped(self, db):
-        message = await _call(stop="Task-k7Xm2p")
+    async def test_only_a_command_or_a_task_can_be_stopped(self, db):
+        # DALTON-HOOK(subagent-cancel): a task id is stopped on the cancel path;
+        # anything else is still refused before that path.
+        message = await _call(stop="not-a-task")
 
         db.stop_thread_command.assert_not_awaited()
-        assert message.content.startswith("ERROR: Task-k7Xm2p is not a background command.")
+        assert message.content == (
+            "ERROR: not-a-task is not a background command or a subagent task. "
+            "stop takes a command's id (bg-…) or a task's id "
+            "(Task-… or its 6-character id)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_task_prefix_is_not_read_as_a_bare_id(self, db):
+        # DALTON-HOOK(subagent-cancel): Task-… is only Task-<id>, never a bare id.
+        message = await _call(stop="Task-X")
+
+        db.stop_thread_command.assert_not_awaited()
+        assert message.content == (
+            "ERROR: Task-X is not a background command or a subagent task. "
+            "stop takes a command's id (bg-…) or a task's id "
+            "(Task-… or its 6-character id)."
+        )
+
+
+def _patch_task_cancel(
+    monkeypatch, outcome, statuses=None, *, status_error=None, held=frozenset()
+):
+    """The web cancel path, the ledger re-read, and the namespace-lock probe."""
+    # DALTON-HOOK(subagent-cancel): the lock probe is signature-checked too.
+    from src.server.database.runs import subagent_runs
+    from src.server.services.cancel_dispatch import _cancel_subagent_task
+    from src.server.services.writer_guard import held_task_namespaces
+
+    if isinstance(outcome, BaseException):
+        cancel = create_autospec(_cancel_subagent_task, side_effect=outcome)
+    else:
+        cancel = create_autospec(_cancel_subagent_task, return_value=outcome)
+    monkeypatch.setattr(
+        "src.server.services.cancel_dispatch._cancel_subagent_task", cancel
+    )
+    if status_error is not None:
+        read = create_autospec(
+            subagent_runs.get_latest_run_statuses, side_effect=status_error
+        )
+    else:
+        read = create_autospec(
+            subagent_runs.get_latest_run_statuses,
+            return_value={} if statuses is None else statuses,
+        )
+    monkeypatch.setattr(subagent_runs, "get_latest_run_statuses", read)
+    locks = create_autospec(
+        held_task_namespaces, return_value=None if held is None else set(held)
+    )
+    monkeypatch.setattr(
+        "src.server.services.writer_guard.held_task_namespaces", locks
+    )
+    return cancel, read
+
+
+class TestStopTask:
+    """DALTON-HOOK(subagent-cancel): ThreadStatus stop uses the web cancel path."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("given", ["Task-k7Xm2p", "k7Xm2p"])
+    async def test_a_task_the_ledger_shows_cancelled_is_stopped(self, db, monkeypatch, given):
+        registry = BackgroundTaskRegistry(thread_id=THREAD)
+        cancel, read = _patch_task_cancel(
+            monkeypatch, {"cancelled": True}, {"k7Xm2p": "cancelled"}
+        )
+
+        message = await _call(_tool(registry=registry), stop=given)
+
+        cancel.assert_awaited_once_with(THREAD, "k7Xm2p")
+        read.assert_awaited_once_with(THREAD, ["k7Xm2p"])
+        db.stop_thread_command.assert_not_awaited()
+        assert message.content == "Stopped Task-k7Xm2p."
+        assert not message.artifact
+
+    @pytest.mark.asyncio
+    async def test_a_stop_still_being_confirmed_does_not_say_stopped(self, monkeypatch):
+        _patch_task_cancel(monkeypatch, {"cancelled": True}, {"k7Xm2p": "in_progress"})
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == (
+            "Stop requested for Task-k7Xm2p; confirming it has stopped. "
+            "When it ends, its status shows stopped."
+        )
+        assert not message.content.startswith("Stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_missing_ledger_row_is_still_confirming(self, monkeypatch):
+        _patch_task_cancel(monkeypatch, {"cancelled": True}, {})
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert "confirming it has stopped" in message.content
+        assert not message.content.startswith("Stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_ledger_read_failure_does_not_say_stopped(self, monkeypatch):
+        _patch_task_cancel(
+            monkeypatch, {"cancelled": True}, status_error=RuntimeError("db down")
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert "confirming it has stopped" in message.content
+        assert not message.content.startswith("Stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_ended_another_way_is_not_called_stopped(self, monkeypatch):
+        _patch_task_cancel(monkeypatch, {"cancelled": True}, {"k7Xm2p": "completed"})
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == "Cannot stop Task-k7Xm2p: it has already ended (completed)."
+
+    @pytest.mark.asyncio
+    async def test_a_task_another_conversation_does_not_have_is_refused(self, monkeypatch):
+        cancel, read = _patch_task_cancel(
+            monkeypatch, {"cancelled": False, "state": "task_not_found"}
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        cancel.assert_awaited_once_with(THREAD, "k7Xm2p")
+        read.assert_not_awaited()
+        assert message.content == (
+            "Cannot stop Task-k7Xm2p: no such task in this conversation."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_task_with_no_run_in_progress_is_refused(self, monkeypatch):
+        _patch_task_cancel(monkeypatch, {"cancelled": False, "state": "run_not_found"})
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == "Cannot stop Task-k7Xm2p: it has no run in progress."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ledger", "word"),
+        [("error", "failed"), ("interrupted", "stopped"), ("completed", "completed")],
+    )
+    async def test_an_already_finished_task_uses_the_listing_status_word(
+        self, monkeypatch, ledger, word
+    ):
+        # DALTON-HOOK(subagent-cancel): the parenthetical is completed, failed
+        # or stopped, the same words as the listing.
+        _patch_task_cancel(
+            monkeypatch,
+            {"cancelled": False, "state": "already_finished"},
+            {"k7Xm2p": ledger},
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == f"Cannot stop Task-k7Xm2p: it has already ended ({word})."
+
+    @pytest.mark.asyncio
+    async def test_an_already_finished_cancel_whose_lock_is_held_is_still_confirming(
+        self, monkeypatch
+    ):
+        # DALTON-HOOK(subagent-cancel): cancelled on the ledger is confirming
+        # while N(thread, task:{id}) is still held, even when the cancel
+        # path says the run had already finished.
+        _patch_task_cancel(
+            monkeypatch,
+            {"cancelled": False, "state": "already_finished"},
+            {"k7Xm2p": "cancelled"},
+            held={"k7Xm2p"},
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == (
+            "Stop requested for Task-k7Xm2p; confirming it has stopped. "
+            "When it ends, its status shows stopped."
+        )
+        assert not message.content.startswith("Stopped")
+
+    @pytest.mark.asyncio
+    async def test_an_already_finished_cancel_whose_lock_is_free_has_stopped(
+        self, monkeypatch
+    ):
+        # DALTON-HOOK(subagent-cancel): a free namespace lock means the
+        # cancelled run has ended; the word is stopped, not the ledger's.
+        _patch_task_cancel(
+            monkeypatch,
+            {"cancelled": False, "state": "already_finished"},
+            {"k7Xm2p": "cancelled"},
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == "Cannot stop Task-k7Xm2p: it has already ended (stopped)."
+        assert not message.content.startswith("Stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_that_fails_does_not_say_stopped(self, monkeypatch):
+        from fastapi import HTTPException
+
+        cancel, read = _patch_task_cancel(
+            monkeypatch, HTTPException(status_code=500, detail="Failed to cancel task.")
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        cancel.assert_awaited_once()
+        read.assert_not_awaited()
+        assert message.content == "ERROR: Could not stop Task-k7Xm2p: Failed to cancel task."
+
+    @pytest.mark.asyncio
+    async def test_a_background_command_does_not_take_the_task_cancel_path(self, db, monkeypatch):
+        cancel, _read = _patch_task_cancel(monkeypatch, {"cancelled": True})
+        db.stop_thread_command.return_value = StopResult(
+            "stopped", _row("bg-000000000001", "stopped", stopped_by="agent")
+        )
+
+        message = await _call(stop="bg-000000000001")
+
+        cancel.assert_not_awaited()
+        assert message.content.startswith("Stopped bg-000000000001.")
+        assert message.artifact == {"command_id": "bg-000000000001"}
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_task_whose_namespace_lock_is_held_is_still_confirming(
+        self, monkeypatch
+    ):
+        # DALTON-HOOK(subagent-cancel): ledger cancelled is not stopped while
+        # N(thread, task:{id}) is still held.
+        _patch_task_cancel(
+            monkeypatch,
+            {"cancelled": True},
+            {"k7Xm2p": "cancelled"},
+            held={"k7Xm2p"},
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert message.content == (
+            "Stop requested for Task-k7Xm2p; confirming it has stopped. "
+            "When it ends, its status shows stopped."
+        )
+        assert not message.content.startswith("Stopped")
+
+    @pytest.mark.asyncio
+    async def test_a_namespace_lock_probe_failure_does_not_say_stopped(self, monkeypatch):
+        _patch_task_cancel(
+            monkeypatch,
+            {"cancelled": True},
+            {"k7Xm2p": "cancelled"},
+            held=None,
+        )
+
+        message = await _call(stop="Task-k7Xm2p")
+
+        assert "confirming it has stopped" in message.content
+        assert not message.content.startswith("Stopped")
+
+
+def test_the_stop_argument_names_a_task_and_that_it_may_still_be_confirming():
+    # DALTON-HOOK(subagent-cancel): the tool description is the prompt surface.
+    from src.ptc_agent.agent.middleware.background_subagent.subagent import (
+        TASK_TOOL_DESCRIPTION,
+    )
+    from src.tools.thread_status.tool import THREAD_STATUS_DOC
+
+    assert "subagent task" in THREAD_STATUS_DOC
+    assert "still being confirmed" in THREAD_STATUS_DOC
+    assert "does not report back" in THREAD_STATUS_DOC
+    assert "append instructions to a running task" in TASK_TOOL_DESCRIPTION
+    assert "ThreadStatus's stop" in TASK_TOOL_DESCRIPTION
+    text = (
+        Path(__file__).resolve().parents[4]
+        / "src/ptc_agent/agent/prompts/templates/components/subagent_coordination.md.j2"
+    ).read_text(encoding="utf-8")
+    assert (
+        "用户要求停止时，用 ThreadStatus 的 stop 停止对应任务："
+        "只在返回已停止时报告已停止，返回正在确认时如实说明正在确认；"
+        "给任务发送更新不能代替停止。用户要求停止全部工作时，停止本对话所有运行中的任务。"
+    ) in text
+    assert "6-character id" in THREAD_STATUS_DOC
+    assert "to stop it, use ThreadStatus's stop" in TASK_TOOL_DESCRIPTION
 
 
 def _source(kind: str, *items: Any) -> SimpleNamespace:

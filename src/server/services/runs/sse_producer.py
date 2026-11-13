@@ -27,6 +27,8 @@ from src.server.utils.content_normalizer import (
     normalize_text_content,
     is_thinking_status_signal,
 )
+# DALTON-HOOK(thinking-leak): live assistant text is filtered before it is framed.
+from src.server.utils.thinking_leak import ThinkingLeakGate
 from src.server.utils.pg_sanitize import finite_json_dumps
 from src.server.contracts.status import classify_interrupts
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
@@ -294,6 +296,14 @@ class RunSSEProducer:
         # with the full content at node completion. This set prevents re-emitting that
         # duplicate content while still allowing non-streaming AIMessage content through.
         self._streamed_content_ids: Set[str] = set()
+        # DALTON-HOOK(thinking-leak): holds an opening marker until this
+        # message's tool call or finish decides whether it is shown.
+        # A hold is also flushed as a final reply when a later message
+        # starts, a complete message has no finish metadata, the turn is
+        # interrupted, or the stream ends open (flush_open_thinking).
+        # Cancel and timeout drop the hold; replay uses the same rule.
+        self._thinking_leak = ThinkingLeakGate()
+        self._thinking_agent: dict[str, str] = {}
 
         # Namespace tuples currently inside a "summarize" window. Opened on
         # the context_window summarize start signal, closed on complete OR
@@ -546,6 +556,10 @@ class RunSSEProducer:
                 if isinstance(event_data, dict) and "__interrupt__" in event_data:
                     self.saw_interrupt = True
                     self._pending_interrupts.append(event_data)
+                    # DALTON-HOOK(thinking-leak): the turn paused before this
+                    # message's finish, so the hold is shown as a final reply.
+                    for frame in self.flush_open_thinking():
+                        yield frame
                     continue  # Skip further processing for interrupt events
                 
                 
@@ -837,6 +851,11 @@ class RunSSEProducer:
                 ):
                     yield event
 
+            # DALTON-HOOK(thinking-leak): the stream ended with a message
+            # still open, so its hold is shown as a final reply.
+            for frame in self.flush_open_thinking():
+                yield frame
+
             # I8 durability barrier. The graph iterator is exhausted, so the
             # executor has torn down and awaited its submitted saver tasks;
             # now verify a run-matching pending interrupt actually reached
@@ -1111,6 +1130,35 @@ class RunSSEProducer:
 
         return str(message_metadata.get("langgraph_node", "agent"))
 
+    def _frames_for_released(self, released: list[tuple[str, str]]) -> list[StreamFrame]:
+        frames: list[StreamFrame] = []
+        for message_id, text in released:
+            frames.append(
+                self._build_sse_event(
+                    "message_chunk",
+                    {
+                        "thread_id": self.thread_id,
+                        "agent": self._thinking_agent.get(message_id, "main"),
+                        "id": message_id,
+                        "role": "assistant",
+                        "content": text,
+                        "content_type": "text",
+                    },
+                )
+            )
+        return frames
+
+    def flush_open_thinking(self) -> list[StreamFrame]:
+        """DALTON-HOOK(thinking-leak): show held text as a final reply.
+
+        Holds flush when the message finishes or a tool call is known
+        (settle), when a later message starts or a complete message has
+        no finish metadata (release_except / the no-finish branch), and
+        when the turn is interrupted or the stream ends with the message
+        still open (this method). Cancel and timeout do not flush.
+        """
+        return self._frames_for_released(self._thinking_leak.release_all())
+
     async def _process_message_chunk(
         self,
         message_chunk: BaseMessage,
@@ -1371,6 +1419,39 @@ class RunSSEProducer:
         # result and leak the extraction model's reasoning to the user.
         # ToolMessages themselves carry the tool's actual return value and
         # MUST flow through (their content becomes ``tool_call_result``).
+        # DALTON-HOOK(thinking-leak): assistant text only. A ToolMessage
+        # and every other role pass through unchanged. A previous message
+        # that never got finish metadata is flushed before this one starts.
+        if (
+            not is_compaction
+            and not is_inner_llm_chunk
+            and isinstance(message_chunk, (AIMessage, AIMessageChunk))
+        ):
+            for frame in self._frames_for_released(
+                self._thinking_leak.release_except(message_id)
+            ):
+                yield frame
+        if (
+            text_content
+            and content_type == "text"
+            and not is_inner_llm_chunk
+            and not is_compaction
+            and isinstance(message_chunk, (AIMessage, AIMessageChunk))
+        ):
+            # Hold a marker-prefixed body until this message's tool call
+            # or finish. The final AIMessage does not feed the raw text
+            # again when its chunks already did.
+            self._thinking_agent[message_id] = agent_name
+            replayed_complete = (
+                isinstance(message_chunk, AIMessage)
+                and not isinstance(message_chunk, AIMessageChunk)
+                and self._thinking_leak.seen(message_id)
+            )
+            if replayed_complete:
+                text_content = None
+            else:
+                text_content = self._thinking_leak.feed(message_id, text_content)
+
         if text_content and content_type and not is_inner_llm_chunk:
             # Check if we need to emit reasoning completion signal
             if content_type != "reasoning" and agent_name in self.reasoning_active:
@@ -1566,6 +1647,54 @@ class RunSSEProducer:
                     f"response_metadata={message_chunk.response_metadata}"
                 )
 
+        # DALTON-HOOK(thinking-leak): a tool call hides a body that opens
+        # with a marker; a final reply drops only that opening marker.
+        leak_unsent = False
+        if (
+            not is_compaction
+            and not is_inner_llm_chunk
+            and isinstance(message_chunk, (AIMessage, AIMessageChunk))
+            and event_stream_message.get("content_type") != "reasoning"
+            and (finish_reason or getattr(message_chunk, "tool_calls", None))
+        ):
+            leak_unsent = self._thinking_leak.pending(message_id)
+            already = event_stream_message.get("content")
+            visible = self._thinking_leak.settle(
+                message_id,
+                tool_call=(
+                    finish_reason == "tool_calls"
+                    or bool(getattr(message_chunk, "tool_calls", None))
+                ),
+                already_visible=already if isinstance(already, str) else None,
+            )
+            if visible:
+                event_stream_message["content"] = visible
+                event_stream_message["content_type"] = "text"
+            elif event_stream_message.get("content_type") == "text":
+                event_stream_message.pop("content", None)
+                event_stream_message.pop("content_type", None)
+                event_stream_message.pop("phase", None)
+        elif (
+            not is_compaction
+            and not is_inner_llm_chunk
+            and isinstance(message_chunk, AIMessage)
+            and not isinstance(message_chunk, AIMessageChunk)
+            and event_stream_message.get("content_type") != "reasoning"
+            and self._thinking_leak.pending(message_id)
+        ):
+            # DALTON-HOOK(thinking-leak): this message has no finish
+            # metadata, so the hold is shown as a final reply.
+            leak_unsent = True
+            already = event_stream_message.get("content")
+            visible = self._thinking_leak.settle(
+                message_id,
+                tool_call=False,
+                already_visible=already if isinstance(already, str) else None,
+            )
+            if visible:
+                event_stream_message["content"] = visible
+                event_stream_message["content_type"] = "text"
+
         # Handle different message types
         if isinstance(message_chunk, ToolMessage):
             # Tool Message - Return the result of the tool call
@@ -1615,7 +1744,13 @@ class RunSSEProducer:
             is_chunk = isinstance(message_chunk, AIMessageChunk)
             is_complete_msg = not is_chunk
 
-            if is_complete_msg and message_id in self._streamed_content_ids:
+            # DALTON-HOOK(thinking-leak): text still held for the marker check
+            # has not been shown, so this final message must be able to emit it.
+            if (
+                is_complete_msg
+                and message_id in self._streamed_content_ids
+                and not leak_unsent
+            ):
                 # Content was already streamed via chunks — skip duplicate emission.
                 # Still let finish_reason through (handled by earlier code above this block).
                 pass

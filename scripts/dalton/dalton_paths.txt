@@ -403,3 +403,7 @@ tests/unit/dalton/test_agentturn_wiki_ingest.py
 tests/unit/dalton/test_researchdata_bridge_discord_history.py
 src/ptc_agent/agent/prompts/templates/components/dalton_deliverable.md.j2
 tests/unit/ptc_agent/agent/prompts/test_prompt_compaction.py
+
+# P7: display filter for harness thinking markers leaked into assistant text.
+src/server/utils/thinking_leak.py
+tests/unit/server/utils/test_thinking_leak.py
