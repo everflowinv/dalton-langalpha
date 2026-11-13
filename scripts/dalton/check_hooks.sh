@@ -105,6 +105,9 @@ ALLOWED_HOOKS=(
   # every subagent prompt (built-in and custom), plus the task-card title and
   # background-notice wording that follows it.
   "user-visible-text"
+  # Dense images and tables: crop from the original, transcribe, re-read,
+  # and do not rewrite a cell to close a sum. Main agent and every subagent.
+  "dense-image-reading"
   "hermetic-prebuilt-workflows"
   "market-data-fallback"
   "yfinance-cache"

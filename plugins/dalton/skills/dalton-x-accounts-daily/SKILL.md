@@ -59,9 +59,9 @@ community(
 
 `items` 用工具返回的列表。纯转推且没有本人评论会在筛选时丢掉。带本人观点的 quote 保留。置顶旧帖按 `created_at` 排除，不按它还钉在主页上保留。
 
-## 3. 一次补充检索
+## 3. 补充检索
 
-四个时间线都处理完之后，只调用一次 `x_search`。它只补充时间线，四个账号的时间线仍是底表。
+四个时间线都处理完之后，先调用一次 `x_search` 做宽检索。它只补充时间线，四个账号的时间线仍是底表。单帖的图片或视频补充在下面，最多 2 条，不算进这一次。
 
 ```python
 x_search(
@@ -72,17 +72,29 @@ x_search(
 )
 ```
 
-这个工具没有 `allowed_x_handles`，用 `handles`。也没有 `enable_image_understanding` 或 `enable_video_understanding`。返回的是摘要摘录，不是保证完整的原文。图片和视频内容读不到时，在数据备注写明可读文本是正文或摘录，不要描述图片里的内容。
+这个工具没有 `allowed_x_handles`，用 `handles`。返回的是摘要摘录，不是保证完整的原文。上面这一次补充检索不要传图片或视频开关。
 
-补充结果再按精确 24 小时过滤，并按 status id 和 URL 与时间线去重。只有 URL、作者和时间都核验过、作者是这四个账号之一、且落在窗口内，才补入。补充失败时继续用时间线，把 `x_search.ok` 设为 false。
+宽检索结果先按精确 24 小时过滤，并按推文 ID（`status id`）和 URL 与时间线去重。只有 URL、作者和时间都核验过、作者是这四个账号之一、且落在窗口内，才补入。宽检索失败时继续用时间线，把 `x_search.ok` 设为 false。
 
-若入选帖仍然依赖未读的图片、视频或长线程，最多再对 2 条精确状态调用：
+若入选帖依赖未读的图片或视频，最多再对 2 条单帖调用 `x_search`：查询写该帖 URL，含图片传 `enable_image_understanding=True`，含视频传 `enable_video_understanding=True`，两者都有则两个都传。仍读不到时，才在数据备注写明可读文本是正文或摘录，不要猜测或描述未读到的图片、视频内容。URL 查询未召回该帖时按补充失败处理，继续用时间线，不要反复重试。
 
 ```python
-community(route="x-timeline", operation="tweet", url="https://x.com/<handle>/status/<id>")
+x_search(
+    query="https://x.com/<handle>/status/<id>",
+    from_date=START_DATE,
+    to_date=END_DATE,
+    handles=["<handle>"],
+    enable_image_understanding=True,  # 视频帖改传或同传 enable_video_understanding=True
+)
 ```
 
-长线程用 `operation="thread"`。这两次同样读不到图片和视频。普通纯文字帖不要重复查。
+若入选帖依赖未展开的连帖（thread），最多再对 2 条调用：
+
+```python
+community(route="x-timeline", operation="thread", url="https://x.com/<handle>/status/<id>")
+```
+
+`x-timeline` 读不到图片和视频。普通纯文字帖不要重复查。
 
 ## 4. 筛选
 
@@ -100,7 +112,7 @@ python3 .agents/skills/dalton-x-accounts-daily/scripts/x_accounts_daily.py \
 
 每条帖用一句中文概括，保留关键数字、公司或产品名、时间点和方向。不要把不同帖合并成一条。英文只在术语或原句必要时留短语。摘要不要自己写链接。
 
-把摘要写到 `temp/x-accounts-daily/<summary_date>/summaries.json`，键是 status id：
+把摘要写到 `temp/x-accounts-daily/<summary_date>/summaries.json`，键是推文 ID（`status id`）：
 
 ```json
 {"summaries": {"123": "一句中文"}}

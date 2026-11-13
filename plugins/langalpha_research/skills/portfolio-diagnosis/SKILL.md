@@ -14,6 +14,16 @@ A one-minute read of what the user holds, measured against what they told you th
 - A brokerage in `<mcp-servers>`: take positions and cash balances from it, unless this turn already fetched them. Its quantities and market values win over the file. If they differ from `portfolio.json`, say so in one line and offer to re-import. Don't write the file here.
 - No holdings: say the diagnosis needs them and ask for a few positions as ticker and quantity.
 
+### 截图输入
+
+持仓来自截图或图片表格时，按下面在工作区文件中保存和核对。券商已经返回的数量和市值仍以券商为准；下面禁止的是为了凑市值或合计去改读数。<!-- DALTON-HOOK(dense-image-reading): a gap is an exception list, never a rewritten reading -->
+
+- 原始读数和计算字段分开保存。原始读数是标的、数量、价格、金额（或市值）、合计和单位；权重、希腊值和其他计算字段另存，不写回原始读数。
+- 数量、价格、金额（或市值）及合计分别复读。转录文件中每个单元格或每行标“已复读一致”“尚未复核”或“无法辨认”。
+- 加总或比例对不上时，只记录异常清单并写明差额。禁止反向修改数量、价格、金额（或市值）及合计去消除差额。
+- 跨日数量变化必须与用户申报或交易记录对应。对不上就列入异常清单，不改写任何一天的数量。
+- 作为子代理向父代理返回结果时，附上异常清单，以及数量、价格、金额（或市值）里影响结论的关键变更；直接向用户输出诊断时，在 Data 行用自然语言说明差额与无法辨认项，不展示内部核对状态标签。
+
 ## 2. Compute, in one `execute_code` call
 
 ```python

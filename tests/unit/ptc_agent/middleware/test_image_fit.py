@@ -62,8 +62,10 @@ def _media_type(block: dict) -> str:
 _HEIC = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic" + b"\0" * 64
 
 
-async def _fit(messages, limit=100, accepted=COMMON_IMAGE_TYPES):
-    result, _, _left_out = await fit_images(messages, accepted, lambda count: limit)  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
+async def _fit(messages, limit=100, accepted=COMMON_IMAGE_TYPES, capability=None):
+    result, _, _left_out = await fit_images(  # DALTON-HOOK(attachment-native-cap): third return: byte-total ids
+        messages, accepted, lambda count: limit, capability=capability
+    )
     return result
 
 
@@ -349,9 +351,19 @@ def _upload(raw: bytes, saved_to: str | None):
     return [HumanMessage(content=message["content"])]
 
 
+# DALTON-HOOK(dense-image-reading): no tool list states both; code crops; otherwise hand off.
 _IN_SANDBOX = (
     "[Image downscaled from 40x300 to 13x100 pixels to fit this model's "
-    "limit. For fine detail, crop the original in the sandbox.]"
+    "limit. 读取密集文字或表格时，若当前可以执行代码，从保存的原图裁剪相关区域后查看并核对转录结果；"
+    "否则把读不清的密集区域交给具备代码执行能力的代理裁剪。]"
+)
+_IN_SANDBOX_CODE = (
+    "[Image downscaled from 40x300 to 13x100 pixels to fit this model's "
+    "limit. 读取密集文字或表格时，从保存的原图裁剪相关区域后查看，并核对转录结果。]"
+)
+_IN_SANDBOX_NO_CODE = (
+    "[Image downscaled from 40x300 to 13x100 pixels to fit this model's "
+    "limit. 读不清的密集区域交给具备代码执行能力的代理裁剪。]"
 )
 _NOWHERE = "[Image downscaled from 40x300 to 13x100 pixels to fit this model's limit.]"
 
@@ -361,6 +373,17 @@ class TestTheNoteNamesTheOriginal:
     async def test_a_read_of_a_workspace_path_points_at_the_sandbox(self):
         result = await _fit(_read("work/charts/tall.png", _encode((40, 300))))
         assert result[1].content[-1]["text"] == _IN_SANDBOX
+
+    @pytest.mark.asyncio
+    async def test_a_downscale_with_code_tells_the_model_to_crop(self):
+        result = await _fit(_read("work/charts/tall.png", _encode((40, 300))), capability="code")
+        assert result[1].content[-1]["text"] == _IN_SANDBOX_CODE
+
+    @pytest.mark.asyncio
+    async def test_a_downscale_without_code_hands_the_crop_off(self):
+        result = await _fit(_read("work/charts/tall.png", _encode((40, 300))), capability="image")
+        assert result[1].content[-1]["text"] == _IN_SANDBOX_NO_CODE
+        assert "从保存的原图裁剪" not in result[1].content[-1]["text"]
 
     @pytest.mark.asyncio
     async def test_a_read_of_a_url_has_no_original_there(self):

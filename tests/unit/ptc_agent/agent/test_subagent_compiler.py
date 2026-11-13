@@ -276,3 +276,46 @@ class TestUserVisibleTextReachesSubagents:
             assert prompt.count(rule) == 1
             assert prompt.count("## 用户可见文字") == 2
             assert prompt.startswith("## 用户可见文字")
+
+
+_DENSE_IMAGE = "不得修改转录值来消除差额"
+
+
+class TestDenseImageReadingReachesSubagents:
+    """DALTON-HOOK(dense-image-reading): one copy on the base, on output
+    guidelines, and on prompts that skip the base. A matching heading is not
+    the component."""
+
+    def test_report_builder_prompt_includes_the_component_once(self):
+        prompt = _compiler(config=_config()).compile(
+            BUILTIN_SUBAGENTS["report-builder"]
+        )["system_prompt"]
+        assert prompt.count(_DENSE_IMAGE) == 1
+        assert prompt.count("## 密集图片与表格") == 1
+
+    def test_output_guidelines_section_includes_the_component_once(self):
+        defn = SubagentDefinition(
+            name="ops",
+            description="d",
+            role_prompt="Do ops.",
+            sections={"output_guidelines": True},
+        )
+        prompt = _compiler(config=_config()).compile(defn)["system_prompt"]
+        assert prompt.count(_DENSE_IMAGE) == 1
+
+    def test_custom_prompt_includes_the_component_once(self):
+        prompt = _compiler().compile(
+            SubagentDefinition(name="ops", description="d", custom_prompt="You are ops.")
+        )["system_prompt"]
+        assert prompt.count(_DENSE_IMAGE) == 1
+        assert prompt.startswith("You are ops.")
+
+    def test_heading_only_custom_prompt_still_gets_the_full_component_once(self):
+        prompt = _compiler().compile(
+            SubagentDefinition(
+                name="ops", description="d", custom_prompt="## 密集图片与表格"
+            )
+        )["system_prompt"]
+        assert prompt.count(_DENSE_IMAGE) == 1
+        assert prompt.count("## 密集图片与表格") == 2
+        assert prompt.startswith("## 密集图片与表格")

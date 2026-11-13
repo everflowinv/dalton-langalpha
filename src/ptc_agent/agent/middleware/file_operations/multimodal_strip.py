@@ -12,6 +12,7 @@ agent wires both: an agent with no filesystem tool has nothing to intercept,
 but still inherits history full of blocks it may not be able to read.
 """
 
+import inspect
 from collections.abc import Callable, Collection
 from typing import Annotated, Any, Literal
 
@@ -132,8 +133,65 @@ def _unsaved(block: Any) -> bool:
     return isinstance(block, dict) and block.get("unsaved") is True
 
 
+def _unsaved_image(content: list, index: int, block: Any) -> bool:
+    """An uploaded image whose label names no saved path.
+
+    Composer images do not carry ``unsaved=True``. The adjacent
+    ``[Attached image: …]`` label is the mark, the same role ``unsaved``
+    plays on a PDF. A label that says ``saved to`` is a real copy.
+    """
+    # DALTON-HOOK(dense-image-reading): unsaved images are labelled, not flagged
+    if block_type(block) not in IMAGE_BLOCK_TYPES or index < 1:
+        return False
+    return unsaved_upload_name(content[index - 1]) is not None
+
+
+def _pdf_strip_reason(block: Any, has_pdf: bool, max_pdf_pages: int | None) -> str | None:
+    """Why a PDF block is replaced: ``unsupported``, ``over_pages``, or None.
+
+    None means this block is not a PDF being stripped for either reason.
+    """
+    if block_type(block) not in FILE_BLOCK_TYPES:
+        return None
+    if not has_pdf:
+        return "unsupported"
+    pages = block.get("pages") if isinstance(block, dict) else None
+    if max_pdf_pages is not None and isinstance(pages, int) and pages > max_pdf_pages:
+        return "over_pages"
+    return None
+
+
 def _source(msg: Any, sources: dict[str, str]) -> str | None:
     return sources.get(msg.tool_call_id) or None if isinstance(msg, ToolMessage) else None
+
+
+# DALTON-HOOK(dense-image-reading): the block kind the placeholder guidance branches on
+def _content_kind(block: Any) -> str | None:
+    """``image``, ``pdf``, or None for a block this strip does not replace."""
+    kind = block_type(block)
+    if kind in IMAGE_BLOCK_TYPES:
+        return "image"
+    if kind in FILE_BLOCK_TYPES:
+        return "pdf"
+    return None
+
+
+_GUIDANCE_FIELDS = frozenset({"kind", "model_sees_images", "pdf_reason"})
+
+
+def _guidance_keywords(guidance: Callable[..., Any]) -> frozenset[str]:
+    """Which of kind, vision, and PDF reason this callable accepts.
+
+    A callable that only takes the path stays on that path, so a one-argument
+    caller does not raise TypeError.
+    """
+    try:
+        params = inspect.signature(guidance).parameters
+    except (TypeError, ValueError):
+        return frozenset()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return _GUIDANCE_FIELDS
+    return frozenset(params) & _GUIDANCE_FIELDS
 
 
 def strip_unsupported_content_blocks(
@@ -141,7 +199,7 @@ def strip_unsupported_content_blocks(
     has_image: bool,
     has_pdf: bool,
     max_pdf_pages: int | None = None,
-    guidance: str | Callable[[str | None], str] = "",
+    guidance: str | Callable[..., str] = "",  # DALTON-HOOK(dense-image-reading): callable may take kind/model_sees_images
     unreadable: Collection[tuple[int, int]] = (),
 ) -> list:
     """Replace image/file blocks this target can't read with text placeholders.
@@ -155,8 +213,13 @@ def strip_unsupported_content_blocks(
     created it — the same document is fine on a 1M-context route and rejected on
     a 200K one, and only this side knows which one is being called.
 
-    ``guidance`` is one text for every block, or the text for a block given the
-    path or URL its Read was given (None for any other attachment).
+    # DALTON-HOOK(dense-image-reading): guidance can depend on the block kind and the model modality
+    ``guidance`` is one text for every block, or a callable. The callable is
+    given the path or URL its Read was given (None for any other attachment).
+    When it accepts them, it is also given ``kind`` (``image``, ``pdf``, or
+    None), ``model_sees_images`` (this call's ``has_image`` flag, the same
+    modality check that decides an image is stripped), and ``pdf_reason``
+    (``unsupported``, ``over_pages``, or None).
 
     Returns the original list when nothing changed, and never mutates a message:
     these are checkpoint objects shared with the rest of the graph.
@@ -164,11 +227,12 @@ def strip_unsupported_content_blocks(
     result: list = []
     modified = False
     sources = read_sources(messages) if callable(guidance) else {}
-    # Each guidance rides on the first placeholder it applies to only: the
-    # advice is the same for every block from the same place, and the first
-    # is the one whose text never moves when a later turn adds another
-    # attachment, so the prefix behind it stays cached.
+    # Each distinct guidance is written on the first placeholder that uses it.
+    # A later block with the same wording stays bare, so the earlier text does
+    # not move when another attachment arrives and the prefix stays cached.
     said: set[str] = set()
+    # DALTON-HOOK(dense-image-reading): pass kind, modality, and PDF reason when accepted
+    accepted = _guidance_keywords(guidance) if callable(guidance) else frozenset()
 
     for i, msg in enumerate(messages):
         content = getattr(msg, "content", None)
@@ -176,13 +240,30 @@ def strip_unsupported_content_blocks(
             result.append(msg)
             continue
 
-        advice = guidance(_source(msg, sources)) if callable(guidance) else guidance
+        source = _source(msg, sources) if callable(guidance) else None
         new_blocks = []
         changed = False
         for j, block in enumerate(content):
+            if not callable(guidance):
+                advice = guidance
+            elif accepted:  # DALTON-HOOK(dense-image-reading): kind, modality, and PDF reason
+                fields = {
+                    "kind": _content_kind(block),
+                    "model_sees_images": has_image,
+                    "pdf_reason": _pdf_strip_reason(block, has_pdf, max_pdf_pages),
+                }
+                advice = guidance(source, **{key: fields[key] for key in accepted})
+            else:
+                advice = guidance(source)
             # Extraction advice would send the model after a copy that does
-            # not exist, so an unsaved block keeps only what to tell the user.
-            tail = _IF_NOT if advice and _unsaved(block) else advice
+            # not exist. An unsaved image is only the adjacent label; an
+            # unsaved PDF carries the flag. Either way, ask for a new upload.
+            if advice and _unsaved_image(content, j, block):
+                tail = _UNSAVED_IMAGE
+            elif advice and _unsaved(block):
+                tail = _IF_NOT
+            else:
+                tail = advice
             placeholder = _placeholder_for(
                 block,
                 has_image and (i, j) not in unreadable,
@@ -208,32 +289,242 @@ def strip_unsupported_content_blocks(
 # placeholder rather than in the system prompt, so the advice is decided on the
 # call where the target is known (a fallback or a subagent is judged on its own
 # model) without the cached prefix moving.
+# DALTON-HOOK(dense-image-reading): unsaved blocks have no file to extract.
+# The closing line only says what is missing. It does not order a Python extract.
 _IF_NOT = (
-    "If that cannot answer the question, tell the user: an unsupported input type "
-    "means switching to a model that accepts it, a page-limit rejection means "
-    "splitting the document or a longer-context model. Answer in best effort otherwise."
+    "无法取得可读内容时，说明具体缺少的内容，"
+    "并请求所需页面或清晰图片；不填写无法读取的数字。"
 )
+# DALTON-HOOK(dense-image-reading): an unsaved image has no file to extract or crop.
+_UNSAVED_IMAGE = "没有保存副本，请用户重新上传。" + _IF_NOT
+_UNVERIFIED = (
+    "未经原图或页面图像复核的提取结果标为“尚未复核”。" + _IF_NOT
+)
+# Tools unknown: do not require an operation this call may not have.
 PLACEHOLDER_GUIDANCE = (
-    "The file is still in the workspace: extract it yourself with Python in the "
-    "sandbox (a PDF's text or page renders, OCR or image analysis) before giving up. "
+    "先使用实际可用的文本提取或 OCR（光学字符识别）工具，"
+    "或交由具备看图能力的代理读取。" + _UNVERIFIED
+)
+_CODE_GUIDANCE = (
+    "文件仍在工作区：先用 Python 提取"
+    "（PDF 文本、页面渲染、OCR（光学字符识别）或图像分析）。" + _UNVERIFIED
+)
+_NONE_GUIDANCE = (
+    "当前环境不能执行代码，也不能查看图片；请交由具备相应能力的代理读取。"
     + _IF_NOT
 )
+# DALTON-HOOK(dense-image-reading): an image the model cannot see is handed off, even when Read exists.
+_IMAGE_NONE = (
+    "当前环境不能执行代码，也不能查看图片；请交由具备看图能力的代理读取。"
+    + _IF_NOT
+)
+# DALTON-HOOK(dense-image-reading): pick the unreadable-content guidance by the tools this call can use
+_CODE_TOOLS = frozenset({"ExecuteCode", "execute_code", "Bash", "bash"})
+_IMAGE_TOOLS = frozenset({"Read"})
 
 
-def placeholder_guidance(source: str | None) -> str:
+def _tool_name(tool: Any) -> str:
+    """The name on a tool object or on either dict shape a request may carry."""
+    if isinstance(tool, dict):
+        name = tool.get("name")
+        if not name and isinstance(tool.get("function"), dict):
+            name = tool["function"].get("name")
+    else:
+        name = getattr(tool, "name", None)
+    return name if isinstance(name, str) else ""
+
+
+def _read_capability(tools: Any) -> str | None:
+    """``code``, ``image``, ``none``, or None when this call exposes no tool list.
+
+    ``request.tools`` is how this middleware sees the current agent's tools.
+    None means the list is absent, not empty: an empty list is ``none``.
+    Code wins over Read, because a call that can run code may extract or crop.
+    A call that can only Read must not be told to run Python or to crop.
+    """
+    if tools is None:
+        return None
+    names = {_tool_name(tool) for tool in tools}
+    if names & _CODE_TOOLS:
+        return "code"
+    if names & _IMAGE_TOOLS:
+        return "image"
+    return "none"
+
+
+def _where(located: str) -> str:
+    """A workspace file is still there; a URL is only at that URL."""
+    return located or "文件仍在工作区："
+
+
+def _code_extract(located: str) -> str:
+    """PDF or untagged block when this call can run code."""
+    if located:
+        return (
+            f"{located}先在沙箱下载并用 Python 提取"
+            f"（PDF 文本、页面渲染、OCR（光学字符识别）或图像分析）。{_UNVERIFIED}"
+        )
+    return _CODE_GUIDANCE
+
+
+def _image_block_guidance(located: str, capability: str, sees: bool) -> str:
+    """Image block. Vision and code are separate: Read cannot crop.
+
+    A model that cannot see the image is told to hand it to an agent that
+    can, whether or not this call has Read. Code may also extract text and
+    crop. A model that can see, with only Read, reads the original and is
+    not told to crop.
+    """
+    # DALTON-HOOK(dense-image-reading): image guidance follows vision and code, not the tool name alone
+    if capability == "code":
+        if located:
+            extra = (
+                "可先在沙箱下载并用 Python 提取文字（含 OCR（光学字符识别）），"
+                "也可裁剪后再读。"
+            )
+        else:
+            extra = (
+                "可先用 Python 提取文字（含 OCR（光学字符识别）），"
+                "也可从原图裁剪后再读。"
+            )
+        if sees:
+            return _where(located) + extra + _UNVERIFIED
+        return (
+            _where(located)
+            + "当前模型不能查看图片，请交由具备看图能力的代理读取。"
+            + extra
+            + _UNVERIFIED
+        )
+    if capability == "image":
+        if sees:
+            return (
+                _where(located)
+                + "直接读取原图。密集内容读不清时，请交由具备代码执行能力的代理继续读取，"
+                "不要自行改动原图。"
+                + _IF_NOT
+            )
+        if located:
+            return (
+                f"{located}当前环境不能执行代码下载，请交由具备看图能力的代理下载并读取。"
+                + _IF_NOT
+            )
+        return (
+            "文件仍在工作区：当前模型不能查看图片，请交由具备看图能力的代理读取。"
+            "不要自行查看或改动原图。" + _IF_NOT
+        )
+    if capability == "none":
+        return located + _IMAGE_NONE
+    return located + PLACEHOLDER_GUIDANCE
+
+
+def _pdf_unsupported(located: str, capability: str) -> str:
+    """The model cannot accept a PDF. Do not tell it to read by page."""
+    # DALTON-HOOK(dense-image-reading): unsupported PDF is a handoff, not a page read
+    handoff = "当前模型不支持 PDF，请交由具备 PDF 读取能力的代理读取。"
+    if capability == "code":
+        return (
+            _where(located)
+            + handoff
+            + "可先用 Python 提取文本，结果标为“尚未复核”。"
+            + _IF_NOT
+        )
+    return (located or "") + handoff + _IF_NOT
+
+
+def _pdf_over_pages(located: str, capability: str) -> str:
+    """The model accepts PDFs, but this one is over its page ceiling."""
+    if capability == "code":
+        return (
+            _where(located)
+            + "这份 PDF 超过当前模型的页数上限，请分页读取需要的页面。"
+            + "也可以先用 Python 提取文本，结果标为“尚未复核”。"
+        )
+    if capability == "image":
+        return (
+            _where(located)
+            + "这份 PDF 超过当前模型的页数上限，请分页读取需要的页面。"
+            + "不要调用当前没有的代码执行。"
+            + _IF_NOT
+        )
+    if capability == "none":
+        return (
+            located
+            + "这份 PDF 超过当前模型的页数上限，请交由具备 PDF 读取能力的代理分页读取。"
+            + _IF_NOT
+        )
+    return located + PLACEHOLDER_GUIDANCE
+
+
+def _pdf_block_guidance(located: str, capability: str, reason: str | None = None) -> str:
+    """PDF block. Unsupported is a handoff; only an over-page PDF is read by page."""
+    if reason == "unsupported":
+        return _pdf_unsupported(located, capability)
+    if reason == "over_pages":
+        return _pdf_over_pages(located, capability)
+    if capability == "code":
+        return _code_extract(located)
+    if capability == "image":
+        return (
+            _where(located)
+            + "用现有的读取工具按页读取。不要调用当前没有的代码执行。"
+            + _IF_NOT
+        )
+    if capability == "none":
+        return located + _NONE_GUIDANCE
+    return located + PLACEHOLDER_GUIDANCE
+
+
+def placeholder_guidance(  # DALTON-HOOK(dense-image-reading): kind and vision, not the tool name alone
+    source: str | None,
+    capability: str | None = None,
+    *,
+    kind: str | None = None,
+    model_sees_images: bool | None = None,
+    pdf_reason: str | None = None,
+) -> str:
     """The guidance for a block read from ``source``.
 
     A URL's bytes are fetched by the server and never written to the
     workspace, so telling the model the file is there sends it looking for
     something that does not exist.
+
+    ``capability`` is this call's tool list: ``code`` may extract or crop,
+    ``image`` may Read, ``none`` must ask an agent that can, and None (the
+    list was not on the request) stays on the generic wording.
+
+    ``kind`` is ``image`` or ``pdf`` for the block being replaced. None keeps
+    the tool-only wording. ``model_sees_images`` is the modality flag for this
+    call; None is not treated as able to see the image. ``pdf_reason`` is
+    ``unsupported`` when the model cannot accept a PDF, ``over_pages`` when
+    the file is over that model's page ceiling, and None when the caller
+    does not know which.
     """
-    if source and source.startswith(("http://", "https://")):
+    # DALTON-HOOK(dense-image-reading): capability, block kind, and vision
+    url = source if source and source.startswith(("http://", "https://")) else None
+    located = f"文件在 {url}，不在工作区。" if url else ""
+    # Tools unknown: do not require an operation this call may not have.
+    if capability is None:
+        return located + PLACEHOLDER_GUIDANCE
+    if kind == "image":
+        return _image_block_guidance(located, capability, model_sees_images is True)
+    if kind == "pdf":
+        return _pdf_block_guidance(located, capability, pdf_reason)
+    if capability == "code":
+        return _code_extract(located)
+    if capability == "image":
+        if located:
+            return (
+                f"{located}当前环境不能执行代码下载，请交由具备相应能力的代理下载并读取。"
+                + _IF_NOT
+            )
         return (
-            f"The file is at {source}: download it in the sandbox and extract it "
-            "yourself with Python (a PDF's text or page renders, OCR or image "
-            "analysis) before giving up. " + _IF_NOT
+            "文件仍在工作区：若当前模型支持看图，直接读取原图；"
+            "否则请交由具备看图能力的代理读取。"
+            "不要调用当前没有的代码执行。" + _IF_NOT
         )
-    return PLACEHOLDER_GUIDANCE
+    if capability == "none":
+        return located + _NONE_GUIDANCE
+    return located + PLACEHOLDER_GUIDANCE
 
 
 def _removed_placeholder(
@@ -469,6 +760,8 @@ class MultimodalStripMiddleware(AgentMiddleware):
         updates: dict[str, Any] = {}
         if has_image:
             side = get_max_image_side_by_count if rule == "count" else get_max_image_side
+            # DALTON-HOOK(dense-image-reading): the downscale note crops only when this call can run code.
+            capability = _read_capability(getattr(request, "tools", None))
 
             def fit(count: int) -> int | None:
                 return side(route, count)
@@ -494,7 +787,7 @@ class MultimodalStripMiddleware(AgentMiddleware):
                     remove_attachments(messages, already, pages=pdf_pages), already_unsent
                 )
             messages, unreadable, left_out = await fit_images(
-                messages, get_image_types(route), fit
+                messages, get_image_types(route), fit, capability=capability
             )
             # DALTON-HOOK(attachment-native-cap): the byte total's cut moves
             # between calls — what fits changes as images arrive — so it is
@@ -525,7 +818,7 @@ class MultimodalStripMiddleware(AgentMiddleware):
                     already_unsent | unsent_all,
                 )
                 messages, unreadable, left_out = await fit_images(
-                    messages, get_image_types(route), fit
+                    messages, get_image_types(route), fit, capability=capability
                 )
             if recorded != already:
                 updates["_removed_attachment_ids"] = recorded
@@ -538,12 +831,27 @@ class MultimodalStripMiddleware(AgentMiddleware):
         # every placeholder, an image the fit could not use among them, is
         # written in this one pass so each guidance stays on the first it
         # applies to.
+        # DALTON-HOOK(dense-image-reading): an image note follows whether this
+        # model can see images and whether this call can run code. A model
+        # that cannot see the image is told to hand it off, even with Read.
+        # A model that can see, with only Read, reads the original and is not
+        # told to crop. A PDF the model cannot accept is handed to an agent
+        # that can read PDFs; only a PDF over the page ceiling is read by page.
+        # No tool list stays generic.
         messages = strip_unsupported_content_blocks(
             messages,
             has_image,
             has_pdf,
             max_pdf_pages,
-            placeholder_guidance,
+            lambda source, *, kind=None, model_sees_images=None, pdf_reason=None: (
+                placeholder_guidance(
+                    source,
+                    _read_capability(getattr(request, "tools", None)),
+                    kind=kind,
+                    model_sees_images=model_sees_images,
+                    pdf_reason=pdf_reason,
+                )
+            ),
             unreadable=unreadable,
         )
         if messages is not request.messages:
