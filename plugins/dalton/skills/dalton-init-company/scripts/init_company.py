@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Initialize or upgrade a Dalton company coverage workspace skeleton.
 
-Standard library only. Can be executed directly inside a sandbox workspace or
-imported by host-side scripts (`scripts/dalton/init_company_workspace.py`).
+Depends on ``jsonschema`` and ``referencing`` (Draft 2020-12). Schema files
+live in ``references/schemas`` beside this skill, so a sandbox that only
+receives the skill directory can still validate ``data/company.json``.
+Host scripts may import this module
+(``scripts/dalton/init_company_workspace.py``).
 """
 
 from __future__ import annotations
@@ -101,6 +104,172 @@ def resolve_ticker_cik(ticker: str, entry: dict[str, Any] | None = None) -> str 
     return builtin.zfill(10) if builtin else None
 
 
+EXCHANGE_PENDING_NOTE = "交易所待核"
+
+
+class CompanyDocError(ValueError):
+    """Raised when ``data/company.json`` does not satisfy the company schema."""
+
+
+class CompanySchemaUnavailable(Exception):
+    """Raised when the bundled schema or jsonschema cannot be loaded.
+
+    ``main`` turns this into ``company_schema_unavailable`` and writes nothing.
+    """
+
+
+# Shipped next to the skill. A synced sandbox does not contain ``src/``.
+SCHEMAS_DIR = Path(__file__).resolve().parent.parent / "references" / "schemas"
+_BUNDLED_SCHEMA_NAMES = ("common", "company")
+
+
+def infer_market(ticker: str, entry: dict[str, Any]) -> str:
+    """Market code from the coverage entry, otherwise the ticker suffix."""
+    raw = entry.get("market")
+    if raw:
+        return str(raw)
+    if ticker.endswith(".HK"):
+        return "HK"
+    if ticker.endswith((".SS", ".SZ")):
+        return "CN"
+    return "US"
+
+
+def resolve_exchange(ticker: str, entry: dict[str, Any], market: str) -> tuple[str, bool]:
+    """Return ``(exchange, pending)``.
+
+    Hong Kong, Shanghai and Shenzhen listings stay inferred from the market or
+    the ticker suffix. A listing with no exchange in ``entry`` uses the schema
+    value ``OTHER`` and ``pending`` is true.
+    """
+    raw = entry.get("exchange")
+    if raw:
+        return str(raw), False
+    if market == "HK":
+        return "HKEX", False
+    if ticker.endswith(".SS"):
+        return "SSE", False
+    if ticker.endswith(".SZ"):
+        return "SZSE", False
+    return "OTHER", True
+
+
+def _import_jsonschema():
+    """Import Draft 2020-12 pieces. Failure refuses to write ``company.json``."""
+    try:
+        from jsonschema import Draft202012Validator, FormatChecker
+        from referencing import Registry, Resource
+    except Exception as exc:  # noqa: BLE001 - 沙箱缺少 jsonschema 时拒绝写出 company.json
+        raise CompanySchemaUnavailable(
+            "jsonschema import failed: " + str(exc)
+        ) from exc
+    return Draft202012Validator, FormatChecker, Registry, Resource
+
+
+def _load_bundled_company_schema() -> tuple[dict[str, Any], Any]:
+    """Load skill-local company/common schemas and a Draft 2020-12 validator.
+
+    Registry keys are each file's ``$id``, the same resolution
+    ``_load_schemas_and_registry`` uses for ``common#/$defs/...`` references.
+    """
+    Draft202012Validator, FormatChecker, Registry, Resource = _import_jsonschema()
+    schemas: dict[str, dict[str, Any]] = {}
+    resources: list[tuple[str, Any]] = []
+    for name in _BUNDLED_SCHEMA_NAMES:
+        path = SCHEMAS_DIR / f"{name}.schema.json"
+        if not path.is_file():
+            raise CompanySchemaUnavailable(
+                f"missing schema file {name}.schema.json"
+            )
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CompanySchemaUnavailable(
+                f"schema file {name}.schema.json is unreadable: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise CompanySchemaUnavailable(
+                f"schema file {name}.schema.json is not an object"
+            )
+        try:
+            Draft202012Validator.check_schema(raw)
+        except Exception as exc:  # noqa: BLE001 - schema 自身不合法时拒绝写出 company.json
+            raise CompanySchemaUnavailable(
+                f"schema file {name}.schema.json failed draft 2020-12 check: {exc}"
+            ) from exc
+        schemas[name] = raw
+        uri = raw.get("$id") or f"https://dalton.local/schemas/{name}"
+        try:
+            resources.append((str(uri), Resource.from_contents(raw)))
+        except Exception as exc:  # noqa: BLE001 - e.g. no $schema to pick a draft; refuse to write
+            raise CompanySchemaUnavailable(
+                f"schema file {name}.schema.json cannot be registered: {exc}"
+            ) from exc
+    try:
+        registry = Registry().with_resources(resources)
+        validator = Draft202012Validator(
+            schemas["company"],
+            registry=registry,
+            format_checker=FormatChecker(),
+        )
+    except Exception as exc:  # noqa: BLE001 - validator setup failure means no trustworthy check
+        raise CompanySchemaUnavailable(f"schema validator setup failed: {exc}") from exc
+    return schemas["company"], validator
+
+
+def _one_liner_max_length() -> int:
+    """``one_liner`` maxLength from the skill-local company schema."""
+    company, _validator = _load_bundled_company_schema()
+    props = company.get("properties") if isinstance(company, dict) else None
+    one = props.get("one_liner") if isinstance(props, dict) else None
+    max_len = one.get("maxLength") if isinstance(one, dict) else None
+    if isinstance(max_len, int) and max_len > 0:
+        return max_len
+    raise CompanySchemaUnavailable("company schema is missing one_liner.maxLength")
+
+
+def _company_one_liner(
+    name: str,
+    ticker: str,
+    tier_display: str,
+    *,
+    exchange_pending: bool,
+) -> str:
+    """One-line description. A missing US exchange keeps the pending note."""
+    suffix = f"（{EXCHANGE_PENDING_NOTE}）" if exchange_pending else ""
+    limit = _one_liner_max_length()
+    base = f"{name} ({ticker}) — {tier_display} coverage"
+    if len(base) + len(suffix) <= limit:
+        return base + suffix
+    room = limit - len(suffix)
+    if room <= 0:
+        return suffix[:limit]
+    return base[:room] + suffix
+
+
+def _company_doc_problems(doc: dict[str, Any]) -> list[str]:
+    """Validate ``doc`` with the skill-local Draft 2020-12 company schema."""
+    _company, validator = _load_bundled_company_schema()
+    try:
+        errors = sorted(validator.iter_errors(doc), key=lambda err: list(err.path))
+    except Exception as exc:  # noqa: BLE001 - $ref 解析失败时拒绝写出 company.json
+        raise CompanySchemaUnavailable(
+            "company schema could not be applied: " + str(exc)
+        ) from exc
+    problems: list[str] = []
+    for err in errors:
+        path = "/" + "/".join(str(part) for part in err.path) if err.path else "/"
+        problems.append(f"{path}: {err.message}")
+    return problems
+
+
+def validate_company_doc(doc: dict[str, Any]) -> None:
+    """Raise ``CompanyDocError`` when ``doc`` fails the company schema."""
+    problems = _company_doc_problems(doc)
+    if problems:
+        raise CompanyDocError("; ".join(problems))
+
+
 def render(
     ticker: str,
     coverage_entry: dict[str, Any] | None = None,
@@ -116,7 +285,7 @@ def render(
     name = str(entry.get("name") or norm_ticker)
     tier_raw = str(entry.get("tier") or "watch").lower()
     tier_display = "Core" if tier_raw == "core" else ("Watch" if tier_raw == "watch" else tier_raw)
-    market = str(entry.get("market") or ("HK" if norm_ticker.endswith(".HK") else ("CN" if norm_ticker.endswith((".SS", ".SZ")) else "US")))
+    market = infer_market(norm_ticker, entry)
     coverage_stage = str(entry.get("coverage_stage") or "none")
     as_of = str(entry.get("as_of") or "2026-10-09")
     cik = resolve_ticker_cik(norm_ticker, entry)
@@ -153,8 +322,11 @@ def render(
             content = raw
         out[relpath] = content
 
-    exchange = str(entry.get("exchange") or ("HKEX" if market == "HK" else ("SSE" if norm_ticker.endswith(".SS") else ("SZSE" if norm_ticker.endswith(".SZ") else "NASDAQ"))))
+    exchange, exchange_pending = resolve_exchange(norm_ticker, entry, market)
     stage_schema = coverage_stage if coverage_stage in ("onboarding", "initial", "full", "maintenance", "paused") else "onboarding"
+    identifiers: dict[str, str] = {}
+    if cik:
+        identifiers["cik"] = cik
     company_doc: dict[str, Any] = {
         "schema_version": 1,
         "ticker": norm_ticker,
@@ -162,12 +334,17 @@ def render(
         "name": name,
         "coverage_tier": "core" if tier_raw == "core" else "watch",
         "coverage_stage": stage_schema,
-        "cik": cik,
-        "identifiers": {"cik": cik} if cik else {},
+        "identifiers": identifiers,
         "peers": peers_list,
-        "one_liner": f"{name} ({norm_ticker}) — {tier_display} coverage",
+        "one_liner": _company_one_liner(
+            name,
+            norm_ticker,
+            tier_display,
+            exchange_pending=exchange_pending,
+        ),
         "covered_since": rendered_date,
     }
+    validate_company_doc(company_doc)
     out["data/company.json"] = json.dumps(company_doc, ensure_ascii=False, indent=2) + "\n"
     return out
 
@@ -374,9 +551,40 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    files = render(args.ticker, entry, TEMPLATE_VERSION, init_date=init_date)
+    try:
+        files = render(args.ticker, entry, TEMPLATE_VERSION, init_date=init_date)
+    except CompanySchemaUnavailable as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "company_schema_unavailable",
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 1
+    except CompanyDocError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "company_schema_invalid",
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 1
     result = apply(args.root, files, template_version=TEMPLATE_VERSION, dry_run=not args.apply)
     output = {k: v for k, v in result.items() if k != "manifest"}
+    norm_ticker = args.ticker.strip().upper()
+    _, exchange_pending = resolve_exchange(
+        norm_ticker, entry, infer_market(norm_ticker, entry)
+    )
+    if exchange_pending:
+        output["notes"] = [EXCHANGE_PENDING_NOTE]
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 

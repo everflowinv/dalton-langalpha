@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dalton.local/schemas/common",
+  "$defs": {
+    "isoTime": {"type": "string", "format": "date-time"},
+    "isoDate": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+    "period": {"type": "string", "pattern": "^(FY\\d{4}|[1-4]Q\\d{2}|1H\\d{2}|2H\\d{2}|LTM(-\\d{4}-\\d{2})?|\\d{4}-\\d{2}(-\\d{2})?|NTM|spot)$",
+               "description": "FY2026 / 3Q26 / 1H26 / LTM / LTM-2026-09 / 2026-09 / 2026-09-30 / NTM / spot"},
+    "unit": {"type": "string", "enum": ["USD","USD_mn","USD_bn","HKD","HKD_mn","HKD_bn","CNY","CNY_mn","CNY_bn","CNY_100mn","pct","bp","x","count","count_mn","per_share","other"]},
+    "label": {"type": "string", "enum": ["reported","company_guidance","consensus","estimate","assumption","research_judgement"],
+              "description": "蓝图 §3.1 第 2 条：估计、假设、公司指引、一致预期分层标注"},
+    "sourceTier": {"type": "integer", "minimum": 1, "maximum": 6,
+                   "description": "1 filing(监管财报) > 2 company_release/transcript(公司公告/电话会或业绩会转写，含 AlphaEngine ASR 稿) > 3 broker_report/consensus(署名研报/一致预期) > 4 official_data(官方/协会数据) > 5 expert/internal_note(专家标身份/团队内部对话或纪要) > 6 news(新闻，只作线索)；新增的 model 证据必须引用模型单元格并且不能标 tier 1（默认 2-3）"},
+    "sourceType": {"type": "string",
+                   "enum": ["filing","company_release","transcript","broker_report","consensus","official_data","expert","news","model","internal_note","legacy_thesis","market_color"],
+                   "description": "证据来源类型及默认可信度等级（`tier`）：`filing`=1（监管财报）、`company_release`=2（公司公告/新闻稿）、`transcript`=2（电话会/业绩会转写，包括 AlphaEngine ASR 稿；卖方回访记 3）、`broker_report`=3（署名研报）、`consensus`=3（一致预期）、`official_data`=4（官方/协会数据）、`expert`=5（专家访谈，标身份）、`news`=6（新闻，只作线索）、`model`=2-3（本方模型推导；新增的 `model` 证据必须引用模型单元格，并且不能标 `tier` 1）、`internal_note`=3-5（团队内部对话或纪要，默认 5）、`legacy_thesis`=3-5（历史迁移论点）、`market_color`=3-5（市场预期与仓位观察，只能支撑 `market_view` 与 `expectations`；不得绑定 `pillar_ids`、不得支撑 `label` 为 `reported` 或 `company_guidance` 的 `figures`，且不得被 `underwriting` 下的任何字段引用）"},
+    "range": {
+      "type": "object", "additionalProperties": false,
+      "description": "数值区间，必填 `lo` 与 `hi` 且 `lo <= hi`（单点值填 `lo == hi`）",
+      "properties": {
+        "lo": {"type": "number"},
+        "hi": {"type": "number"},
+        "unit": {"type": "string"}
+      },
+      "required": ["lo", "hi"]
+    },
+    "sourceRef": {
+      "description": "来源引用：可填证据 ID 字符串（如 `E-20261015-01`）、模型单元格（如 `model/dcf.xlsx#Summary!G42`）或引用对象",
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "ref": {"type": "string", "minLength": 1},
+            "kind": {"enum": ["evidence", "provenance", "memo", "model", "file", "model_cell", "url", "publication", "filing", "assumption"]},
+            "provenance_record_id": {"type": "string"},
+            "path": {"type": "string"},
+            "cell": {"type": "string"},
+            "sheet": {"type": "string"},
+            "evidence_id": {"type": "string"},
+            "url": {"type": "string"},
+            "accession": {"type": "string"},
+            "form": {"type": "string"},
+            "period": {"type": "string"},
+            "section": {"type": "string"},
+            "publication_id": {"type": "string"},
+            "chain_id": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "sourceRefList": {
+      "type": "array",
+      "description": "来源引用列表，每项为证据 ID、模型单元格或引用对象",
+      "items": {"$ref": "#/$defs/sourceRef"}
+    },
+    "evidenceRef": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "kind": {"enum": ["provenance","file","model_cell","evidence","url","publication","filing"]},
+        "provenance_record_id": {"type": "string", "format": "uuid"},
+        "path": {"type": "string"},
+        "cell": {"type": "string", "description": "Sheet!A1，如 Model!F42"},
+        "evidence_id": {"type": "string", "pattern": "^(E-\\d{8}-\\d{2,3}|EV-[A-Z0-9-]+-\\d{3})$"},
+        "url": {"type": "string"},
+        "accession": {"type": "string"},
+        "form": {"type": "string"},
+        "period": {"type": "string"},
+        "section": {"type": "string"},
+        "publication_id": {"type": "string", "format": "uuid"},
+        "chain_id": {"type": "string", "description": "同一份研报被多处转述只算一条来源链（§3.1-3）"}
+      },
+      "required": ["kind"]
+    },
+    "knowledgeRef": {
+      "type": "object", "additionalProperties": false,
+      "description": "跨知识引用（行业层 P2）：指向另一覆盖单元/工作区某个知识版本里的条目。定位优先按 unit_id；目标未登记覆盖单元（如兼容规则识别的老公司工作区）时省略 unit_id，按 workspace_id 解析。带版本的引用是稳定锚点：被引方后续改版不改动本条，传播机制按版本差异判定影响",
+      "properties": {
+        "unit_id": {"type": "string", "format": "uuid", "description": "目标覆盖单元；目标未登记时省略"},
+        "workspace_id": {"type": "string", "format": "uuid"},
+        "doc_key": {"enum": ["company","sector","thesis","debate","drivers","management","lessons","agenda","models"]},
+        "version_no": {"type": "integer", "minimum": 1},
+        "entry_id": {"type": "string", "minLength": 1, "maxLength": 64, "description": "被引条目 id：支柱 P\\d+、证据 E-…/EV-…、问题 Q-\\d{3} 等"},
+        "relation": {"enum": ["supports","contradicts","assumes","derived_from"], "description": "supports=支持本条；contradicts=与本条矛盾（会通知对方生成更新候选）；assumes=采用了对方的假设/支柱（对方改版时会生成本方待复核）；derived_from=由对方推导而来"}
+      },
+      "required": ["workspace_id","doc_key","version_no","entry_id","relation"]
+    },
+    "figure": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "metric": {"type": "string"}, "value": {"type": "number"}, "unit": {"$ref": "#/$defs/unit"},
+        "period": {"$ref": "#/$defs/period"}, "label": {"$ref": "#/$defs/label"}
+      },
+      "required": ["metric","value","unit","period","label"]
+    },
+    "threshold": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^T\\d+$"},
+        "metric": {"type": "string"},
+        "operator": {"enum": [">=","<=",">","<","between","event"]},
+        "value": {"type": "number"}, "value2": {"type": "number"},
+        "unit": {"$ref": "#/$defs/unit"}, "period": {"$ref": "#/$defs/period"},
+        "event_text": {"type": "string", "description": "operator=event 时描述触发事件"},
+        "label": {"$ref": "#/$defs/label"},
+        "source_hint": {"type": "string", "description": "去哪里取读数：如 10-Q 分部表、公司电话会"}
+      },
+      "required": ["id","metric","operator","label"]
+    },
+    "signal": {"enum": ["strongly_confirming","confirming","mildly_confirming","neutral","mildly_weakening","weakening","strongly_weakening","mixed","invalidating","untested"],
+               "description": "每个信号单独判断，按 dalton-earnings-deep 的 calibration.md 第二节的刻度；不要把多个信号相加成一个分数"},
+    "pillarStatus": {"enum": ["strengthening","intact","watch","impaired","broken","changed","untested","retired"]},
+    "verdictWord": {"enum": ["NO_CHANGE","THESIS_STRENGTHENED","THESIS_WEAKENED","THESIS_BROKEN","NEW_THESIS"],
+                    "description": "Playbook 正式词形；md 和界面显示 无变化/强化/削弱/证伪/新论点"}
+  }
+}

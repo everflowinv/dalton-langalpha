@@ -147,6 +147,16 @@ def _resolve_container_at_path(doc: dict[str, Any], path: str) -> Any:
     return curr
 
 
+def _schema_top_level_fields(doc_key: str) -> list[str]:
+    """Top-level property names declared by ``doc_key``'s JSON Schema."""
+    schemas, _ = _load_schemas_and_registry()
+    schema_obj = schemas.get(doc_key) or {}
+    props = schema_obj.get("properties")
+    if not isinstance(props, dict):
+        return []
+    return list(props.keys())
+
+
 async def _repair_ops_paths_with_assist(
     doc_key: str,
     base_doc: dict[str, Any] | None,
@@ -155,18 +165,30 @@ async def _repair_ops_paths_with_assist(
     user_id: str | None = None,
     workspace_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Use difflib suggestions + assist_json('knowledge.repair_field') to confirm unknown top-level op paths."""
+    """Confirm unknown top-level op paths via assist_json('knowledge.repair_field').
+
+    A field declared on the document schema is applied as-is, even when this
+    version of the document does not have it yet. Only names absent from both
+    the schema and the document are sent for repair. A suggested target that
+    already exists on the document is refused: renaming onto it would overwrite
+    the stored value.
+    """
     if not isinstance(base_doc, dict) or not ops:
         return ops, []
 
-    valid_keys = [k for k in base_doc.keys() if k != "official"]
+    schema_fields = _schema_top_level_fields(doc_key)
+    # ``official`` is publish-only and must not be offered as a rename target.
+    repair_targets = [name for name in schema_fields if name != "official"]
+    repair_target_set = set(repair_targets)
+    present_keys = set(base_doc.keys())
+    legal_tops = set(schema_fields) | present_keys
     unknown_tops: list[str] = []
     for raw_op in ops:
         if not isinstance(raw_op, dict) or raw_op.get("op") == "create":
             continue
         path = str(raw_op.get("path") or "")
         segs = [s for s in path.split("/") if s]
-        if segs and segs[0] not in base_doc:
+        if segs and segs[0] not in legal_tops:
             top = segs[0]
             if top not in unknown_tops:
                 unknown_tops.append(top)
@@ -174,19 +196,20 @@ async def _repair_ops_paths_with_assist(
     if not unknown_tops:
         return ops, []
 
-    unknown_suggestions = suggest_close_fields(unknown_tops, valid_keys)
+    unknown_suggestions = suggest_close_fields(unknown_tops, repair_targets)
 
     res = await assist_json(
         task="knowledge.repair_field",
         instructions=(
-            "将知识库更新操作中未识别的顶层路径字段名映射为文档中的合法字段名。"
-            "参考 difflib_suggestions 中的候选建议，确认后返回 {\"mappings\": {\"原字段名\": \"合法字段名\"}}。"
+            "将知识库更新操作中不在 schema 里的顶层路径字段名映射为 allowed_schema_fields 中的字段名。"
+            "参考 difflib_suggestions 里的候选，只返回 {\"mappings\": {\"原字段名\": \"合法字段名\"}}。"
+            "不要映射到文档里已经存在的字段。"
         ),
         payload={
             "doc_key": doc_key,
             "unknown_fields": unknown_tops,
             "difflib_suggestions": unknown_suggestions,
-            "schema_properties": valid_keys,
+            "allowed_schema_fields": repair_targets,
         },
         schema=_REPAIR_FIELD_SCHEMA,
         user_id=user_id,
@@ -195,11 +218,29 @@ async def _repair_ops_paths_with_assist(
     if not (res.ok and isinstance(res.data, dict) and isinstance(res.data.get("mappings"), dict)):
         return ops, []
 
-    mappings = {
-        str(k).lstrip("/"): str(v).lstrip("/")
-        for k, v in res.data["mappings"].items()
-        if k and v and str(v).lstrip("/") in valid_keys
-    }
+    unknown_set = set(unknown_tops)
+    mappings: dict[str, str] = {}
+    blocked: list[tuple[str, str]] = []
+    for raw_key, raw_value in res.data["mappings"].items():
+        src = str(raw_key).lstrip("/")
+        dst = str(raw_value).lstrip("/")
+        if src not in unknown_set or not dst or dst not in repair_target_set:
+            continue
+        if dst in present_keys:
+            blocked.append((src, dst))
+            continue
+        mappings[src] = dst
+    if blocked:
+        detail = ", ".join(
+            f"{src!r} 改成已存在的 {dst!r}" for src, dst in blocked
+        )
+        raise OpError(
+            "repair_target_exists",
+            f"/{blocked[0][0]}",
+            "自动修复拒绝把 "
+            + detail
+            + "，因为会覆盖文档里的已有值。请改用 schema 中的字段名后重试。",
+        )
     if not mappings:
         return ops, []
 
@@ -834,6 +875,7 @@ async def apply_update(
 
     # Step 1: Fetch latest version from DB. If none exists and data/<doc>.json is already in sandbox,
     # record it as a direct_edit v1 first (PK.4 step 1).
+    imported_initial_v1 = False
     latest = await db_knowledge.latest_version(workspace_id, doc_key)
     if latest is None and backend is not None and source == "tool":
         existing_raw = await backend.aread_text(data_path(doc_key))
@@ -880,28 +922,54 @@ async def apply_update(
                         "content": parsed,
                         "schema_valid": val_existing.ok,
                     }
+                    if latest.get("version_no") == 1:
+                        imported_initial_v1 = True
                 else:
-                    latest = await db_knowledge.insert_version(
-                        user_id=user_id,
-                        workspace_id=workspace_id,
-                        doc_key=doc_key,
-                        base_version_no=None,
-                        content=parsed,
-                        content_sha256=sha,
-                        ops=None,
-                        reason="检测到工作区已有的初始文件（direct_edit）",
-                        evidence_refs=[],
-                        source="direct_edit",
-                        warnings=[*val_existing.errors, *val_existing.warnings],
-                        schema_valid=val_existing.ok,
-                        edited_path=data_path(doc_key),
-                    )
+                    try:
+                        # enforce_base + base None inserts only while the doc is
+                        # still empty. A concurrent writer that already stored a
+                        # version makes this insert raise VersionConflict.
+                        latest = await db_knowledge.insert_version(
+                            user_id=user_id,
+                            workspace_id=workspace_id,
+                            doc_key=doc_key,
+                            base_version_no=None,
+                            content=parsed,
+                            content_sha256=sha,
+                            ops=None,
+                            reason="检测到工作区已有的初始文件（direct_edit）",
+                            evidence_refs=[],
+                            source="direct_edit",
+                            warnings=[*val_existing.errors, *val_existing.warnings],
+                            schema_valid=val_existing.ok,
+                            edited_path=data_path(doc_key),
+                            enforce_base=True,
+                        )
+                    except VersionConflict:
+                        latest = await db_knowledge.latest_version(
+                            workspace_id, doc_key
+                        )
+                    else:
+                        if (
+                            isinstance(latest, dict)
+                            and latest.get("version_no") == 1
+                        ):
+                            imported_initial_v1 = True
             except Exception as e:
                 logger.warning("Could not import existing %s as direct_edit: %s", doc_key, e)
 
-    # Step 2: Check base_version for tool / import paths
+    # Step 2: Check base_version for tool / import paths.
+    # knowledge_read only queries the database, so the caller passes null when
+    # this call is the one that just imported the workspace file as v1
+    # (including the in-memory v1 of a dry run). That null matches this v1.
+    # A lost race (insert rejected because a version already exists) leaves
+    # imported_initial_v1 false, so null stays a hard conflict against the
+    # version re-read above. Any v1 stored before this call is the same.
     latest_no = latest["version_no"] if latest else None
-    if source == "tool" and base_version != latest_no:
+    accepted_base = base_version
+    if imported_initial_v1 and base_version is None and latest_no == 1:
+        accepted_base = latest_no
+    if source == "tool" and accepted_base != latest_no:
         base_v_row = None
         if base_version is not None and hasattr(db_knowledge, "get_version"):
             try:
@@ -1120,7 +1188,7 @@ async def apply_update(
             user_id=user_id,
             workspace_id=workspace_id,
             doc_key=doc_key,
-            base_version_no=base_version,
+            base_version_no=accepted_base,
             content=new_doc,
             content_sha256=content_sha,
             ops=repaired_ops,

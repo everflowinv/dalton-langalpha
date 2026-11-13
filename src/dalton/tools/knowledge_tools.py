@@ -14,7 +14,7 @@ from langchain_core.tools import BaseTool, tool
 from src.dalton.auth import verify_workspace_access
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import verdicts as db_verdicts
-from src.dalton.knowledge.paths import ALL_DOC_KEYS
+from src.dalton.knowledge.paths import ALL_DOC_KEYS, data_path
 from src.dalton.knowledge.reconcile import apply_pending
 from src.dalton.knowledge.scenario_math import evaluate_underwriting
 from src.dalton.knowledge.service import append_verdict, apply_update
@@ -403,6 +403,27 @@ def _format_underwriting_summary(
     return "\n".join(lines)
 
 
+_INITIAL_FILE_NOTE = "工作区已有初始文件，首次更新传 base_version=null 即可"
+
+
+async def _initial_workspace_file_note(backend: Any, doc_key: str) -> str | None:
+    """Read-only hint when the database has no version but the workspace file does.
+
+    Does not write a version. Returns None when this tool has no backend for the
+    workspace, or when the file cannot be read.
+    """
+    if backend is None or not hasattr(backend, "aread_text"):
+        return None
+    try:
+        raw = await backend.aread_text(data_path(doc_key))
+    except Exception as exc:  # noqa: BLE001 - 读初始文件失败时只省略提示，不中断 knowledge_read
+        logger.debug(f"knowledge_read skipped initial-file note for {doc_key}: {exc}")
+        return None
+    if raw and str(raw).strip():
+        return _INITIAL_FILE_NOTE
+    return None
+
+
 def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     """Build ``[knowledge_update, knowledge_append_verdict, knowledge_read]`` bound to ``filesystem_backend``."""
     reconciled_workspaces: set[str] = set()
@@ -715,6 +736,15 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                 ),
                 "content": content_val,
             }
+            if latest_row is None:
+                eff_backend = (
+                    filesystem_backend
+                    if target_ws_id == cfg_workspace_id
+                    else None
+                )
+                note = await _initial_workspace_file_note(eff_backend, cleaned_doc)
+                if note:
+                    payload["note"] = note
             if (
                 cleaned_doc == "thesis"
                 and isinstance(content_val, dict)

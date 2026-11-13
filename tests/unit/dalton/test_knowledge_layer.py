@@ -925,7 +925,8 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     saved_q = store["agenda"][-1]["content"]["open_questions"][0]
     assert saved_q["question"] == "Will AWS capacity double by 2027?"
 
-    # Test assist_json(task="knowledge.repair_field") confirming difflib suggestion on fuzzy path `/open_questons`
+    # assist_json may suggest open_questons -> open_questions, but that target
+    # already exists on the document, so the rename is refused instead of applied.
     mock_assist_repair = create_autospec(assist_json)
 
     async def _assist_repair_impl(
@@ -943,7 +944,9 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     ) -> AssistResult:
         assert task == "knowledge.repair_field"
         assert "difflib_suggestions" in payload
-        assert payload["difflib_suggestions"].get("open_questons") == ["open_questions"]
+        assert "schema_properties" not in payload
+        assert "open_questions" in payload["allowed_schema_fields"]
+        assert payload["difflib_suggestions"].get("open_questons", [None])[0] == "open_questions"
         return AssistResult(
             ok=True,
             data={"mappings": {"open_questons": "open_questions"}},
@@ -976,9 +979,12 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
         reason="Add question with fuzzy path confirmed by assist_json",
         base_version=2,
     )
-    assert res_assist["ok"] is True, res_assist
-    assert any("knowledge.repair_field" in w["message"] for w in res_assist["warnings"])
-    assert len(store["agenda"][-1]["content"]["open_questions"]) == 2
+    assert res_assist["ok"] is False, res_assist
+    assert res_assist["error"] == "repair_target_exists"
+    assert len(store["agenda"]) == 2
+    saved_questions = store["agenda"][-1]["content"]["open_questions"]
+    assert len(saved_questions) == 1
+    assert saved_questions[0]["question"] == "Will AWS capacity double by 2027?"
 
 
 
@@ -3034,7 +3040,17 @@ def _setup_in_memory_knowledge_db(monkeypatch: pytest.MonkeyPatch) -> tuple[dict
         thread_id: str | None = None,
         run_id: str | None = None,
         tool_call_id: str | None = None,
+        enforce_base: bool = False,
     ) -> dict[str, Any]:
+        existing = store.get(doc_key, [])
+        latest_row = existing[-1] if existing else None
+        latest_no = latest_row["version_no"] if latest_row else None
+        # Matches insert_version(enforce_base=True): base None inserts only
+        # while this doc has no row, so a second initial-file import cannot append.
+        if enforce_base and base_version_no != latest_no:
+            from src.dalton.database.knowledge import VersionConflict
+
+            raise VersionConflict(doc_key, base_version_no, latest_row)
         rows = store.setdefault(doc_key, [])
         v_no = len(rows) + 1
         row = {
@@ -3339,10 +3355,21 @@ async def test_apply_update_initial_direct_edit_thesis_validates_models_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """First-time import of preset data/thesis.json loads models context ({} when absent) so unregistered model refs are marked schema_valid=False."""
+    from unittest.mock import create_autospec
+
     from src.dalton.database import knowledge as db_knowledge
     from src.dalton.knowledge import service
+    from src.dalton.llm.assist import AssistResult, assist_json
 
     _store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+    monkeypatch.setattr(
+        service,
+        "assist_json",
+        create_autospec(
+            assist_json,
+            return_value=AssistResult(ok=False, data=None, error="disabled"),
+        ),
+    )
 
     preset_thesis = _sample_thesis_v2_with_underwriting()
     preset_thesis["underwriting"]["states"][1]["calc"] = {
@@ -3363,8 +3390,9 @@ async def test_apply_update_initial_direct_edit_thesis_validates_models_context(
         backend=backend,
         skip_access_check=True,
     )
-    # Initial file was imported as v1 (direct_edit), so base_version=None triggers base_version_mismatch,
-    # and the imported v1 row must be marked schema_valid=False with unresolvable_reference_ref in warnings.
+    # Null base_version matches the v1 this call just imported, so the update is
+    # attempted. The unregistered model ref still fails validation and is not
+    # saved: the only row is the direct_edit v1, schema_valid=False.
     assert res["ok"] is False
     v1_row = await db_knowledge.latest_version("ws-meta", "thesis")
     assert v1_row is not None
@@ -4029,6 +4057,385 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         )
 
     assert all_problems == [], f"Schema field/enum mismatches in skill prompts: {all_problems}"
+
+
+def _sample_spot_company() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ticker": "SPOT",
+        "exchange": "NYSE",
+        "name": "Spotify Technology S.A.",
+        "coverage_tier": "watch",
+        "coverage_stage": "onboarding",
+        "identifiers": {"cik": "0001639920"},
+        "one_liner": "Spotify (SPOT) — Watch coverage",
+        "covered_since": "2026-11-01",
+    }
+
+
+@pytest.mark.asyncio
+async def test_schema_field_add_skips_repair_and_existing_target_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """name_zh is a schema field and must not be renamed; a real unknown field is.
+
+    A repair whose target already exists is returned as an error and does not
+    overwrite the stored value.
+    """
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+    from src.dalton.llm.assist import AssistResult, assist_json
+    from src.server.database import workspace as ws_db
+
+    _store, _backend = _setup_in_memory_knowledge_db(monkeypatch)
+    monkeypatch.setattr(
+        ws_db,
+        "update_workspace",
+        create_autospec(ws_db.update_workspace, return_value=None),
+    )
+    assist = create_autospec(assist_json)
+    assist.side_effect = AssertionError("assist_json should not be called")
+    monkeypatch.setattr(service, "assist_json", assist)
+
+    created = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "create", "value": _sample_spot_company()}],
+        reason="创建公司文档",
+        base_version=None,
+        skip_access_check=True,
+    )
+    assert created["ok"] is True, created
+    assist.assert_not_called()
+
+    added = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/name_zh", "value": "声田"}],
+        reason="补中文名",
+        base_version=1,
+        skip_access_check=True,
+    )
+    assert added["ok"] is True, added
+    assert added["content"]["name"] == "Spotify Technology S.A."
+    assert added["content"]["name_zh"] == "声田"
+    assist.assert_not_called()
+
+    async def _map_unknown(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        assert task == "knowledge.repair_field"
+        assert "schema_properties" not in payload
+        assert "sector" in payload["allowed_schema_fields"]
+        assert payload["unknown_fields"] == ["sektor"]
+        return AssistResult(ok=True, data={"mappings": {"sektor": "sector"}}, error=None)
+
+    assist.side_effect = _map_unknown
+    renamed = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/sektor", "value": "Internet"}],
+        reason="补行业",
+        base_version=2,
+        skip_access_check=True,
+    )
+    assert renamed["ok"] is True, renamed
+    assert renamed["content"]["sector"] == "Internet"
+    assert renamed["content"]["name"] == "Spotify Technology S.A."
+    assert assist.call_count == 1
+
+    async def _map_onto_name(
+        task: str,
+        instructions: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        **kwargs: Any,
+    ) -> AssistResult:
+        return AssistResult(ok=True, data={"mappings": {"nme": "name"}}, error=None)
+
+    assist.side_effect = _map_onto_name
+    refused = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/nme", "value": "Spotify"}],
+        reason="错误简称",
+        base_version=3,
+        skip_access_check=True,
+    )
+    assert refused["ok"] is False, refused
+    assert refused["error"] == "repair_target_exists"
+    saved = await db_knowledge.latest_version("ws-meta", "company")
+    assert saved is not None
+    assert saved["version_no"] == 3
+    assert saved["content"]["name"] == "Spotify Technology S.A."
+    assert "nme" not in saved["content"]
+
+
+@pytest.mark.asyncio
+async def test_null_base_matches_only_the_initial_file_imported_this_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """base_version null matches a v1 imported from the workspace file in this call.
+
+    A v1 that was already in the database still conflicts. dry_run does not write it.
+    """
+    from unittest.mock import create_autospec
+
+    from src.dalton.knowledge import service
+    from src.dalton.llm.assist import assist_json
+    from src.server.database import workspace as ws_db
+
+    store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+    monkeypatch.setattr(
+        ws_db,
+        "update_workspace",
+        create_autospec(ws_db.update_workspace, return_value=None),
+    )
+    assist = create_autospec(assist_json)
+    assist.side_effect = AssertionError("assist_json should not be called")
+    monkeypatch.setattr(service, "assist_json", assist)
+
+    company = _sample_spot_company()
+    backend.files["data/company.json"] = json.dumps(company, ensure_ascii=False)
+    ops = [{"op": "set", "path": "/name_zh", "value": "声田"}]
+
+    dry = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=ops,
+        reason="试写中文名",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        dry_run=True,
+        skip_access_check=True,
+    )
+    assert dry["ok"] is True, dry
+    assert dry["dry_run"] is True
+    assert dry["would_be_version_no"] == 2
+    assert dry["preview_doc"]["name"] == "Spotify Technology S.A."
+    assert dry["preview_doc"]["name_zh"] == "声田"
+    assert store.get("company", []) == []
+    assist.assert_not_called()
+
+    saved = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=ops,
+        reason="写入中文名",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        dry_run=False,
+        skip_access_check=True,
+    )
+    assert saved["ok"] is True, saved
+    assert saved["version_no"] == 2
+    assert saved["content"]["name"] == "Spotify Technology S.A."
+    assert saved["content"]["name_zh"] == "声田"
+    rows = store["company"]
+    assert rows[0]["source"] == "direct_edit"
+    assert rows[0]["version_no"] == 1
+    assert rows[1]["version_no"] == 2
+    assert rows[1]["base_version_no"] == 1
+    assert rows[1]["content"]["name_zh"] == "声田"
+    assist.assert_not_called()
+
+    conflict = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/sector", "value": "Internet"}],
+        reason="再次不带版本号",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        skip_access_check=True,
+    )
+    assert conflict["ok"] is False
+    assert conflict["error"] == "version_conflict"
+    assert len(store["company"]) == 2
+    assert store["company"][-1]["content"]["name"] == "Spotify Technology S.A."
+    assert "sector" not in store["company"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_preexisting_v1_still_conflicts_when_base_version_is_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A v1 already stored before this call is not treated as an initial-file import."""
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+
+    store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+    company = _sample_spot_company()
+    await db_knowledge.insert_version(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        base_version_no=None,
+        content=company,
+        content_sha256="c1",
+        ops=[],
+        reason="已有版本",
+        source="tool",
+    )
+    backend.files["data/company.json"] = json.dumps(company, ensure_ascii=False)
+
+    conflict = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/name_zh", "value": "声田"}],
+        reason="不带版本号",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        skip_access_check=True,
+    )
+    assert conflict["ok"] is False
+    assert conflict["error"] == "version_conflict"
+    assert conflict["latest_version"] == 1
+    assert len(store["company"]) == 1
+    assert store["company"][0]["content"]["name"] == "Spotify Technology S.A."
+    assert "name_zh" not in store["company"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_knowledge_read_notes_initial_workspace_file_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """knowledge_read reports a workspace seed file and does not insert a version."""
+    from src.dalton.tools.knowledge_tools import create_knowledge_tools
+
+    store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+    backend.files["data/company.json"] = json.dumps(
+        _sample_spot_company(), ensure_ascii=False
+    )
+    tools = {tool.name: tool for tool in create_knowledge_tools(filesystem_backend=backend)}
+    cfg = {"configurable": {"user_id": "u-1", "workspace_id": "ws-meta"}}
+    msg = await tools["knowledge_read"].ainvoke(
+        {
+            "name": "knowledge_read",
+            "args": {"doc": "company"},
+            "id": "tc-read-seed",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    payload = json.loads(str(msg.content if hasattr(msg, "content") else msg))
+    assert payload["latest_version_no"] is None
+    assert payload["content"] is None
+    assert payload["note"] == "工作区已有初始文件，首次更新传 base_version=null 即可"
+    assert store.get("company", []) == []
+
+    bare = {tool.name: tool for tool in create_knowledge_tools(None)}
+    bare_msg = await bare["knowledge_read"].ainvoke(
+        {
+            "name": "knowledge_read",
+            "args": {"doc": "company"},
+            "id": "tc-read-nobackend",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    bare_payload = json.loads(
+        str(bare_msg.content if hasattr(bare_msg, "content") else bare_msg)
+    )
+    assert bare_payload["latest_version_no"] is None
+    assert "note" not in bare_payload
+
+
+@pytest.mark.asyncio
+async def test_lost_initial_import_keeps_the_committed_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B still sees an empty database, but A's v2 is stored before B inserts.
+
+    enforce_base rejects B's import. B then conflicts, and the latest row
+    stays A's v2.
+    """
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+    from src.dalton.llm.assist import assist_json
+    from src.server.database import workspace as ws_db
+
+    real_latest = db_knowledge.latest_version
+    store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+    monkeypatch.setattr(
+        ws_db,
+        "update_workspace",
+        create_autospec(ws_db.update_workspace, return_value=None),
+    )
+    assist = create_autospec(assist_json)
+    assist.side_effect = AssertionError("assist_json should not be called")
+    monkeypatch.setattr(service, "assist_json", assist)
+
+    company = _sample_spot_company()
+    backend.files["data/company.json"] = json.dumps(company, ensure_ascii=False)
+    winner = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/name_zh", "value": "声田"}],
+        reason="A 写入中文名",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        skip_access_check=True,
+    )
+    assert winner["ok"] is True, winner
+    assert winner["version_no"] == 2
+    assert store["company"][1]["content"]["name_zh"] == "声田"
+
+    reads = {"n": 0}
+
+    async def _first_read_sees_empty(workspace_id: str, doc_key: str):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return None
+        rows = store.get(doc_key, [])
+        return rows[-1] if rows else None
+
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_version",
+        create_autospec(real_latest, side_effect=_first_read_sees_empty),
+    )
+    loser = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="company",
+        ops=[{"op": "set", "path": "/sector", "value": "Internet"}],
+        reason="B 在导入被拒后仍带空版本号",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        skip_access_check=True,
+    )
+    assert loser["ok"] is False, loser
+    assert loser["error"] == "version_conflict"
+    assert loser["latest_version"] == 2
+    assert len(store["company"]) == 2
+    latest = store["company"][-1]["content"]
+    assert latest["name"] == "Spotify Technology S.A."
+    assert latest["name_zh"] == "声田"
+    assert "sector" not in latest
+    assist.assert_not_called()
 
 
 
