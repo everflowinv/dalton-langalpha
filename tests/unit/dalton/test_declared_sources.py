@@ -1213,8 +1213,8 @@ class TestDaltonSkillRegistrySingleSource:
         )
         from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
 
-        assert len(_DALTON_SKILL_SPECS) == 42
-        assert len(DALTON_SKILL_DEFINITIONS) == 42
+        assert len(_DALTON_SKILL_SPECS) == 43
+        assert len(DALTON_SKILL_DEFINITIONS) == 43
 
         for name, skill_def in DALTON_SKILL_DEFINITIONS.items():
             skill_md = DALTON_SKILLS_DIR / name / "SKILL.md"

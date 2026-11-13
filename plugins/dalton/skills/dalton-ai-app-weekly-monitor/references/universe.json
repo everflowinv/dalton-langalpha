@@ -1,0 +1,3328 @@
+{
+  "note": "AI Application weekly monitor 覆盖池。三条赛道 x 两个市场（AH / 美股及其他海外主上市地）。加减公司只改本文件，不动代码。ticker 为 yfinance 口径，均已实测可解析。scan_tier=1 为核心池，每周完整跑五条信源；scan_tier=2 为观察池，只在本周有财报、重大公告或 AI 关键词命中时进流程。注意 scan_tier 是扫描频率，与 screen 输出里的增速分档 tier 是两回事。 ai_purity 是业务纯度，判据为公司交付的核心产品有多依赖 AI，与是否披露 AI 收入无关。native=产品即 AI 交付；embedded=AI 已织进主产品并影响用量或定价；adjacent=AI 只是众多驱动之一。通道二用它决定归因举证门槛的松紧：native 允许在无归因原话时进 AI 原生加速档，embedded 放宽归因时效到最近四期，adjacent 维持最近两期 A/B 级归因的原门槛。 自动驾驶与具身智能标的（Symbotic、Aurora、小马智行、文远知行等）归 humanoid-robot-weekly-monitor，本池不重复覆盖；算力与云基础设施（CoreWeave、Nebius 等）不属 AI 应用层，不入池。",
+  "version": "2.1.0",
+  "last_reviewed": "2026-08-15",
+  "tracks": {
+    "toc_internet": "ToC 互联网：面向消费者的 AI 产品与变现",
+    "tob_software": "ToB 软件：面向企业的 AI 产品、Agent 与订阅",
+    "ai_for_science": "AI for Science：制药、材料、生命科学、EDA 与科研工具"
+  },
+  "scan_tiers": {
+    "1": "核心池：每周完整跑 filing、业绩会、研报、专家、社区五条信源",
+    "2": "观察池：事件触发。本周有财报、重大公告或 AI 关键词命中新闻才进流程，否则记「本周无事件」"
+  },
+  "ai_purity_levels": {
+    "native": "公司交付的核心产品就是 AI 模型 / AI 决策 / AI agent，没有 AI 就没有这门生意",
+    "embedded": "AI 已织进主产品并影响用量或定价，但主业存在独立于 AI 的价值",
+    "adjacent": "AI 目前只是众多驱动之一，公司级加速大概率与 AI 无关"
+  },
+  "universe": [
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "0700.HK",
+      "name": "腾讯",
+      "name_en": "Tencent Holdings",
+      "watch": "元宝、微信 AI 入口、广告 eCPM、游戏内 AI",
+      "tier_rules": [
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "9988.HK",
+      "name": "阿里巴巴",
+      "name_en": "Alibaba Group",
+      "watch": "夸克、通义、AI 电商工具、云上应用收入",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "1024.HK",
+      "name": "快手",
+      "name_en": "Kuaishou",
+      "watch": "可灵 AI 收入与订阅、AI 广告投放工具",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "BIDU",
+      "name": "百度",
+      "name_en": "Baidu",
+      "watch": "文心、AI 搜索改造、AI 广告变现替代率",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "NTES",
+      "name": "网易",
+      "name_en": "NetEase",
+      "watch": "游戏内 AI NPC、有道 AI 订阅",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TME",
+      "name": "腾讯音乐",
+      "name_en": "Tencent Music",
+      "watch": "AI 生成音乐、AI 推荐带来的付费转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BILI",
+      "name": "哔哩哔哩",
+      "name_en": "Bilibili",
+      "watch": "AI 创作工具、AI 广告"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "3690.HK",
+      "name": "美团",
+      "name_en": "Meituan",
+      "watch": "AI 客服与调度、Keeta AI 应用"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "PDD",
+      "name": "拼多多",
+      "name_en": "PDD Holdings",
+      "watch": "AI 商家工具、Temu AI 选品"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TCOM",
+      "name": "携程",
+      "name_en": "Trip.com",
+      "watch": "TripGenie 使用量与转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "1810.HK",
+      "name": "小米",
+      "name_en": "Xiaomi",
+      "watch": "端侧 AI、澎湃 OS AI 功能付费"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "1357.HK",
+      "name": "美图公司",
+      "name_en": "Meitu",
+      "watch": "AI 订阅收入与付费渗透率，中国 ToC AI 订阅最纯标的",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "300418.SZ",
+      "name": "昆仑万维",
+      "name_en": "Kunlun Tech",
+      "watch": "天工、Opus、AI 音乐与短剧海外收入",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "300624.SZ",
+      "name": "万兴科技",
+      "name_en": "Wondershare",
+      "watch": "AI 创意软件订阅、海外 ARR",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "601360.SS",
+      "name": "三六零",
+      "name_en": "360 Security",
+      "watch": "纳米 AI 搜索、AI 浏览器",
+      "tier_rules": [
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "2400.HK",
+      "name": "心动公司",
+      "name_en": "XD Inc",
+      "watch": "游戏内 AI、TapTap AI 分发"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "0772.HK",
+      "name": "阅文集团",
+      "name_en": "China Literature",
+      "watch": "AI 翻译出海、AI 有声与漫改"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "002602.SZ",
+      "name": "世纪华通",
+      "name_en": "Century Huatong",
+      "watch": "AI 游戏与数据中心"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "0100.HK",
+      "name": "MiniMax",
+      "name_en": "MiniMax",
+      "watch": "海螺 AI、API 与订阅收入，基座+应用双属性",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "2513.HK",
+      "name": "智谱",
+      "name_en": "Zhipu AI",
+      "watch": "API 用量、企业客户数、消费级产品",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "META",
+      "name": "Meta",
+      "name_en": "Meta Platforms",
+      "watch": "Meta AI MAU、AI 广告工具带来的 eCPM 提升",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel",
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "GOOGL",
+      "name": "谷歌",
+      "name_en": "Alphabet",
+      "watch": "AI Overviews 变现、Gemini 订阅、AI Mode 转化",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel",
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "MSFT",
+      "name": "微软",
+      "name_en": "Microsoft",
+      "watch": "Copilot 席位、消费级订阅涨价",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "APP",
+      "name": "AppLovin",
+      "name_en": "AppLovin",
+      "watch": "Axon 模型迭代带来的广告 ROI 与 take rate"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DUOL",
+      "name": "Duolingo",
+      "name_en": "Duolingo",
+      "watch": "Max/Video Call 订阅渗透率与 ARPU 提升"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "SPOT",
+      "name": "Spotify",
+      "name_en": "Spotify",
+      "watch": "AI DJ、AI 播客翻译带来的留存"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "RDDT",
+      "name": "Reddit",
+      "name_en": "Reddit",
+      "watch": "数据授权收入、Reddit Answers 使用量",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "PINS",
+      "name": "Pinterest",
+      "name_en": "Pinterest",
+      "watch": "AI 视觉搜索与广告转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "RBLX",
+      "name": "Roblox",
+      "name_en": "Roblox",
+      "watch": "生成式创作工具对 UGC 供给的放大",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "U",
+      "name": "Unity",
+      "name_en": "Unity",
+      "watch": "Vector 模型对广告变现的提升"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "NFLX",
+      "name": "Netflix",
+      "name_en": "Netflix",
+      "watch": "AI 制作降本、AI 推荐与广告"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "SHOP",
+      "name": "Shopify",
+      "name_en": "Shopify",
+      "watch": "Sidekick 使用、AI 代理式购物流量",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "FIG",
+      "name": "Figma",
+      "name_en": "Figma",
+      "watch": "Figma Make 等 AI 席位与用量计费",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TTD",
+      "name": "The Trade Desk",
+      "name_en": "The Trade Desk",
+      "watch": "Kokai AI 投放效果与客户迁移"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "COUR",
+      "name": "Coursera",
+      "name_en": "Coursera",
+      "watch": "AI 课程需求、Coach 使用"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CHGG",
+      "name": "Chegg",
+      "name_en": "Chegg",
+      "watch": "反向对照：AI 侵蚀原有订阅的样本，用于证伪"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "0268.HK",
+      "name": "金蝶国际",
+      "name_en": "Kingdee",
+      "watch": "苍穹 AI、Agent 订阅 ARR",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "600588.SS",
+      "name": "用友网络",
+      "name_en": "Yonyou",
+      "watch": "YonGPT 合同额与云订阅",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "688111.SS",
+      "name": "金山办公",
+      "name_en": "Kingsoft Office",
+      "watch": "WPS AI 付费用户数与 ARPU，ToC/ToB 双属性",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "002230.SZ",
+      "name": "科大讯飞",
+      "name_en": "iFlytek",
+      "watch": "星火行业落地、AI 学习机与办公硬件",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "0020.HK",
+      "name": "商汤",
+      "name_en": "SenseTime",
+      "watch": "生成式 AI 分部收入占比与增速",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "6682.HK",
+      "name": "第四范式",
+      "name_en": "4Paradigm",
+      "watch": "先知平台、AI Agent 产品收入",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "2556.HK",
+      "name": "迈富时",
+      "name_en": "Marketingforce",
+      "watch": "SaaS AI 营销 Agent 订阅",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "1860.HK",
+      "name": "汇量科技",
+      "name_en": "Mobvista",
+      "watch": "AI 投放算法带来的 take rate"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "2706.HK",
+      "name": "海致科技",
+      "name_en": "Haizhi",
+      "watch": "图智能与行业大模型落地"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "1384.HK",
+      "name": "滴普科技",
+      "name_en": "Deepexi",
+      "watch": "企业大模型平台收入结构"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "3317.HK",
+      "name": "迅策科技",
+      "name_en": "Sunrise Tech",
+      "watch": "金融数据 AI 平台"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688777.SS",
+      "name": "中控技术",
+      "name_en": "Supcon",
+      "watch": "工业 TPT 模型、流程工业 AI"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "002410.SZ",
+      "name": "广联达",
+      "name_en": "Glodon",
+      "watch": "建筑 AI 造价与设计"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "603039.SS",
+      "name": "泛微网络",
+      "name_en": "Weaver Network",
+      "watch": "协同办公 AI Agent 订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "600570.SS",
+      "name": "恒生电子",
+      "name_en": "Hundsun",
+      "watch": "金融行业 LightGPT 落地"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "300033.SZ",
+      "name": "同花顺",
+      "name_en": "Hithink Flush",
+      "watch": "问财 AI、AI 投顾付费",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300253.SZ",
+      "name": "卫宁健康",
+      "name_en": "Winning Health",
+      "watch": "WiNEX Copilot 医疗 AI"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688083.SS",
+      "name": "中望软件",
+      "name_en": "ZWSOFT",
+      "watch": "CAD/CAE AI 功能与订阅转型"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "300229.SZ",
+      "name": "拓尔思",
+      "name_en": "TRS",
+      "watch": "行业知识库与政务 AI",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "PLTR",
+      "name": "Palantir",
+      "name_en": "Palantir",
+      "watch": "AIP 客户数、美国商业收入增速，当前板块估值锚",
+      "tier_rules": [
+        "native_purity",
+        "has_attribution",
+        "embedded_accel",
+        "pinned"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "NOW",
+      "name": "ServiceNow",
+      "name_en": "ServiceNow",
+      "watch": "Now Assist ACV、Pro Plus 附加率",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "CRM",
+      "name": "Salesforce",
+      "name_en": "Salesforce",
+      "watch": "Agentforce ARR、按对话计费口径",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "ADBE",
+      "name": "Adobe",
+      "name_en": "Adobe",
+      "watch": "AI 直接影响 ARR 口径、Firefly 用量",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "SAP",
+      "name": "SAP",
+      "name_en": "SAP SE",
+      "watch": "Joule 附加率、云订单中含 AI 比例"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "WDAY",
+      "name": "Workday",
+      "name_en": "Workday",
+      "watch": "AI SKU 定价与附加率"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "TEAM",
+      "name": "Atlassian",
+      "name_en": "Atlassian",
+      "watch": "Rovo 打包进标准版后的用量与升级",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "HUBS",
+      "name": "HubSpot",
+      "name_en": "HubSpot",
+      "watch": "Breeze 用量计费、seat 定价改革"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "MNDY",
+      "name": "monday.com",
+      "name_en": "monday.com",
+      "watch": "AI 积分制计费的消耗速度",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "TWLO",
+      "name": "Twilio",
+      "name_en": "Twilio",
+      "watch": "ConversationRelay、AI 语音用量",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "DDOG",
+      "name": "Datadog",
+      "name_en": "Datadog",
+      "watch": "AI 原生客户贡献的收入占比，观察 AI 应用侧景气的先行指标",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "NET",
+      "name": "Cloudflare",
+      "name_en": "Cloudflare",
+      "watch": "Workers AI、按爬虫付费等新计费方式",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "MDB",
+      "name": "MongoDB",
+      "name_en": "MongoDB",
+      "watch": "向量检索与 AI 应用带来的 Atlas 消耗"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "SNOW",
+      "name": "Snowflake",
+      "name_en": "Snowflake",
+      "watch": "Cortex 用量、AI 产品收入口径",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ESTC",
+      "name": "Elastic",
+      "name_en": "Elastic",
+      "watch": "向量搜索客户数与消耗"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "IOT",
+      "name": "Samsara",
+      "name_en": "Samsara",
+      "watch": "物理世界 AI 视频与安全模块附加"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BRZE",
+      "name": "Braze",
+      "name_en": "Braze",
+      "watch": "AI 营销编排用量"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "KVYO",
+      "name": "Klaviyo",
+      "name_en": "Klaviyo",
+      "watch": "AI 生成内容对 ARPU 的抬升"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "FRSH",
+      "name": "Freshworks",
+      "name_en": "Freshworks",
+      "watch": "Freddy AI 按解决量计费的落地"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ASAN",
+      "name": "Asana",
+      "name_en": "Asana",
+      "watch": "AI Studio 用量计费 ARR"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ZM",
+      "name": "Zoom",
+      "name_en": "Zoom Communications",
+      "watch": "AI Companion 付费版附加率"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DOCU",
+      "name": "DocuSign",
+      "name_en": "DocuSign",
+      "watch": "IAM 平台 AI 合约分析"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "PATH",
+      "name": "UiPath",
+      "name_en": "UiPath",
+      "watch": "Agentic automation 收入，RPA 被替代还是被增强",
+      "tier_rules": [
+        "native_purity",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "AI",
+      "name": "C3.ai",
+      "name_en": "C3.ai",
+      "watch": "项目制 AI 收入的可持续性反面样本",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "BBAI",
+      "name": "BigBear.ai",
+      "name_en": "BigBear.ai",
+      "watch": "题材股对照，用于校准市场对增速的反应",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "SOUN",
+      "name": "SoundHound AI",
+      "name_en": "SoundHound AI",
+      "watch": "语音 Agent 收入增速与并购口径",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "INOD",
+      "name": "Innodata",
+      "name_en": "Innodata",
+      "watch": "数据标注需求，模型侧资本开支的下游",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DT",
+      "name": "Dynatrace",
+      "name_en": "Dynatrace",
+      "watch": "Davis AI 与可观测性 AI 附加"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "IBM",
+      "name": "IBM",
+      "name_en": "IBM",
+      "watch": "watsonx 生成式 AI 累计签约额（累计口径，非季度收入）；2026-03 并入 Confluent 后的数据流 AI 口径变化",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "2228.HK",
+      "name": "晶泰科技",
+      "name_en": "XtalPi",
+      "watch": "AI 药物发现与新材料订单、机器人干湿闭环",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "3696.HK",
+      "name": "英矽智能",
+      "name_en": "Insilico Medicine",
+      "watch": "Pharma.AI 软件收入、管线里程碑付款",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "adjacent",
+      "ticker": "603259.SS",
+      "name": "药明康德",
+      "name_en": "WuXi AppTec",
+      "watch": "AI 辅助 CRDMO 效率、客户 AI 项目占比",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "2269.HK",
+      "name": "药明生物",
+      "name_en": "WuXi Biologics",
+      "watch": "AI 分子设计与工艺优化"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "2158.HK",
+      "name": "医渡科技",
+      "name_en": "Yidu Tech",
+      "watch": "医疗大模型与真实世界数据商业化",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "2506.HK",
+      "name": "讯飞医疗",
+      "name_en": "iFlytek Healthcare",
+      "watch": "基层诊疗 AI 使用量与付费方式",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "2251.HK",
+      "name": "鹰瞳科技",
+      "name_en": "Airdoc",
+      "watch": "AI 影像筛查的检查量与单价",
+      "tier_rules": [
+        "native_purity",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "688114.SS",
+      "name": "华大智造",
+      "name_en": "MGI Tech",
+      "watch": "测序仪装机与 AI 分析软件"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "688222.SS",
+      "name": "成都先导",
+      "name_en": "HitGen",
+      "watch": "DEL 库与 AI 结合的分子发现订单"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "688131.SS",
+      "name": "皓元医药",
+      "name_en": "Haoyuan ChemExpress",
+      "watch": "分子砌块需求，AI 药物发现的上游景气"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "301269.SZ",
+      "name": "华大九天",
+      "name_en": "Empyrean",
+      "watch": "EDA 中的 AI 优化功能"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "688206.SS",
+      "name": "概伦电子",
+      "name_en": "Primarius",
+      "watch": "器件建模 AI 与良率优化"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "SDGR",
+      "name": "Schrodinger",
+      "name_en": "Schrodinger",
+      "watch": "软件收入增速与大客户扩容，物理+AI 混合方法",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "RXRX",
+      "name": "Recursion",
+      "name_en": "Recursion Pharmaceuticals",
+      "watch": "管线进展与合作里程碑，注意研发型公司无常规收入",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "TEM",
+      "name": "Tempus AI",
+      "name_en": "Tempus AI",
+      "watch": "基因组学检测量、数据授权收入增速",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CERT",
+      "name": "Certara",
+      "name_en": "Certara",
+      "watch": "生物模拟软件的 AI 模块附加"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "SLP",
+      "name": "Simulations Plus",
+      "name_en": "Simulations Plus",
+      "watch": "模拟软件订阅与 AI 功能"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "ABSI",
+      "name": "Absci",
+      "name_en": "Absci",
+      "watch": "生成式抗体设计合作数与首付款",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "DNA",
+      "name": "Ginkgo Bioworks",
+      "name_en": "Ginkgo Bioworks",
+      "watch": "数据点与自动化实验室服务收入"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "TXG",
+      "name": "10x Genomics",
+      "name_en": "10x Genomics",
+      "watch": "单细胞与空间组学数据量，AI 训练语料上游"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "ILMN",
+      "name": "Illumina",
+      "name_en": "Illumina",
+      "watch": "测序通量与 AI 变异解读软件"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "TWST",
+      "name": "Twist Bioscience",
+      "name_en": "Twist Bioscience",
+      "watch": "合成 DNA 需求，AI 设计后的湿实验验证量"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "NTRA",
+      "name": "Natera",
+      "name_en": "Natera",
+      "watch": "AI 辅助检测的检测量与报销"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "GH",
+      "name": "Guardant Health",
+      "name_en": "Guardant Health",
+      "watch": "液体活检 AI 模型与检测量"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "VEEV",
+      "name": "Veeva",
+      "name_en": "Veeva Systems",
+      "watch": "生命科学 AI Agent 与数据云"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "BRKR",
+      "name": "Bruker",
+      "name_en": "Bruker",
+      "watch": "科研仪器景气与 AI 分析软件"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DASTY",
+      "name": "Dassault Systemes",
+      "name_en": "Dassault Systemes ADR",
+      "watch": "BIOVIA、虚拟孪生中的 AI"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CDNS",
+      "name": "Cadence",
+      "name_en": "Cadence Design Systems",
+      "watch": "Cerebrus AI 设计工具与分子模拟业务"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "SNPS",
+      "name": "Synopsys",
+      "name_en": "Synopsys",
+      "watch": "AI 驱动 EDA 与仿真，注意并购后口径变化",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "PANW",
+      "name": "Palo Alto Networks",
+      "name_en": "Palo Alto Networks",
+      "watch": "AI ARR（Cortex/XSIAM）、平台化合约中的 AI 占比",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "CRWD",
+      "name": "CrowdStrike",
+      "name_en": "CrowdStrike Holdings",
+      "watch": "Charlotte AI 采用率、Falcon Flex 中 AI 模块附加",
+      "tier_rules": [
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "FTNT",
+      "name": "Fortinet",
+      "name_en": "Fortinet",
+      "watch": "FortiAI 附加率与安全运营自动化收入",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "ZS",
+      "name": "Zscaler",
+      "name_en": "Zscaler",
+      "watch": "AI 分析类 ARR、Data Security 与 AI 席位定价",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "S",
+      "name": "SentinelOne",
+      "name_en": "SentinelOne",
+      "watch": "Purple AI ARR 与附加率，纯 AI SKU 口径较干净"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TENB",
+      "name": "Tenable",
+      "name_en": "Tenable Holdings",
+      "watch": "ExposureAI 采用与暴露面管理续费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "QLYS",
+      "name": "Qualys",
+      "name_en": "Qualys",
+      "watch": "AI 风险评分模块的附加与定价"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "RPD",
+      "name": "Rapid7",
+      "name_en": "Rapid7",
+      "watch": "AI 驱动的 MDR 服务毛利与人力替代"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "VRNS",
+      "name": "Varonis",
+      "name_en": "Varonis Systems",
+      "watch": "AI 数据治理，SaaS 转型中的 AI SKU"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "OKTA",
+      "name": "Okta",
+      "name_en": "Okta",
+      "watch": "Identity for AI Agents、非人身份的计费方式"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "GEN",
+      "name": "Gen Digital",
+      "name_en": "Gen Digital",
+      "watch": "消费级安全中的 AI 反诈功能与订阅 ARPU"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "ORCL",
+      "name": "甲骨文",
+      "name_en": "Oracle",
+      "watch": "OCI 上 AI 应用收入、Fusion 内嵌 Agent 的附加率",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel",
+        "pinned"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "INTU",
+      "name": "Intuit",
+      "name_en": "Intuit",
+      "watch": "AI Agent 对报税与 QuickBooks ARPU 的抬升，AI 定价改革"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ADSK",
+      "name": "Autodesk",
+      "name_en": "Autodesk",
+      "watch": "AI 生成式设计功能与 Token 计费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ROP",
+      "name": "Roper",
+      "name_en": "Roper Technologies",
+      "watch": "旗下垂直软件的 AI 模块附加，分部口径"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "FICO",
+      "name": "FICO",
+      "name_en": "Fair Isaac",
+      "watch": "决策平台 AI 与按用量计费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TYL",
+      "name": "Tyler Technologies",
+      "name_en": "Tyler Technologies",
+      "watch": "政府 SaaS 中的 AI 助手与交易类收入"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "PTC",
+      "name": "PTC",
+      "name_en": "PTC",
+      "watch": "CAD/PLM 的 AI 功能与订阅转化"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TRMB",
+      "name": "Trimble",
+      "name_en": "Trimble",
+      "watch": "建筑与地理空间 AI，硬件转软件的口径变化"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "OTEX",
+      "name": "OpenText",
+      "name_en": "Open Text",
+      "watch": "Aviator AI 系列附加率，注意资产剥离扰动口径"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CVLT",
+      "name": "Commvault",
+      "name_en": "Commvault Systems",
+      "watch": "数据保护 AI 与 SaaS 订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "NTNX",
+      "name": "Nutanix",
+      "name_en": "Nutanix",
+      "watch": "GPT-in-a-Box 等 AI 基础设施带来的节点扩容"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "GTLB",
+      "name": "GitLab",
+      "name_en": "GitLab",
+      "watch": "Duo 席位数与附加率，代码 AI 变现最直接读数之一",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "RBRK",
+      "name": "Rubrik",
+      "name_en": "Rubrik",
+      "watch": "Annapurna、Agent Rewind 等 AI 数据安全 ARR"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TTAN",
+      "name": "ServiceTitan",
+      "name_en": "ServiceTitan",
+      "watch": "现场服务 AI（Dispatch Pro 等）用量计费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "PCOR",
+      "name": "Procore",
+      "name_en": "Procore Technologies",
+      "watch": "建筑 AI Agent 与平台交易额"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BILL",
+      "name": "BILL",
+      "name_en": "BILL Holdings",
+      "watch": "AP/AR 自动化中的 AI 审核，按笔计费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "GWRE",
+      "name": "Guidewire",
+      "name_en": "Guidewire Software",
+      "watch": "保险核心系统的 AI 理赔与核保模块"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "NCNO",
+      "name": "nCino",
+      "name_en": "nCino",
+      "watch": "Banking Advisor 等 AI 模块 ARR"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "QTWO",
+      "name": "Q2 Holdings",
+      "name_en": "Q2 Holdings",
+      "watch": "数字银行 AI 助手与交易分成"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BSY",
+      "name": "Bentley Systems",
+      "name_en": "Bentley Systems",
+      "watch": "基建工程 AI 与数字孪生订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ACIW",
+      "name": "ACI Worldwide",
+      "name_en": "ACI Worldwide",
+      "watch": "支付反欺诈 AI 与按交易计费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "MANH",
+      "name": "Manhattan Associates",
+      "name_en": "Manhattan Associates",
+      "watch": "供应链 AI Agent 与云订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DSGX",
+      "name": "Descartes",
+      "name_en": "Descartes Systems Group",
+      "watch": "物流网络 AI 与按用量计费"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CCC",
+      "name": "CCC Intelligent",
+      "name_en": "CCC Intelligent Solutions",
+      "watch": "车险定损 AI，AI 应用渗透率披露较细"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "APPF",
+      "name": "AppFolio",
+      "name_en": "AppFolio",
+      "watch": "Realm-X AI 助手用量与 ARPU 抬升"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "AGYS",
+      "name": "Agilysys",
+      "name_en": "Agilysys",
+      "watch": "酒店 SaaS 的 AI 模块附加"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "VERX",
+      "name": "Vertex",
+      "name_en": "Vertex Inc",
+      "watch": "税务自动化 AI 与云迁移"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "INTA",
+      "name": "Intapp",
+      "name_en": "Intapp",
+      "watch": "专业服务 AI（Applied AI）ARR 与附加率"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "PEGA",
+      "name": "Pegasystems",
+      "name_en": "Pegasystems",
+      "watch": "Blueprint 与 Agentic 工作流，Pega GenAI 用量"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "APPN",
+      "name": "Appian",
+      "name_en": "Appian",
+      "watch": "流程自动化中的 AI Agent 与云订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ZETA",
+      "name": "Zeta Global",
+      "name_en": "Zeta Global",
+      "watch": "AI 营销智能带来的 ARPU 与 take rate"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CXM",
+      "name": "Sprinklr",
+      "name_en": "Sprinklr",
+      "watch": "客服 AI（Service）ARR 与席位替代"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TDC",
+      "name": "Teradata",
+      "name_en": "Teradata",
+      "watch": "AI 分析平台的云消耗与转型"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DBX",
+      "name": "Dropbox",
+      "name_en": "Dropbox",
+      "watch": "Dash AI 搜索的付费转化"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BOX",
+      "name": "Box",
+      "name_en": "Box",
+      "watch": "Box AI 与企业内容智能的定价改革"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "WK",
+      "name": "Workiva",
+      "name_en": "Workiva",
+      "watch": "监管报告 AI 助手与订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "RNG",
+      "name": "RingCentral",
+      "name_en": "RingCentral",
+      "watch": "AIR、AI Receptionist 的付费渗透"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "FIVN",
+      "name": "Five9",
+      "name_en": "Five9",
+      "watch": "AI Revenue（AI 与自动化收入）分项，客服 AI 最干净读数之一",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "ACN",
+      "name": "埃森哲",
+      "name_en": "Accenture",
+      "watch": "GenAI 新签订单与人力规模，AI 替代人天的先行读数",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "INFY",
+      "name": "Infosys",
+      "name_en": "Infosys",
+      "watch": "AI 交付带来的人力弹性与定价压力",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "WIT",
+      "name": "Wipro",
+      "name_en": "Wipro",
+      "watch": "AI 项目收入与传统外包缩量"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CTSH",
+      "name": "Cognizant",
+      "name_en": "Cognizant",
+      "watch": "AI 生产力对人头与利润率的影响"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "EPAM",
+      "name": "EPAM",
+      "name_en": "EPAM Systems",
+      "watch": "AI 工程服务与传统外包被替代的净效应",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "GLOB",
+      "name": "Globant",
+      "name_en": "Globant",
+      "watch": "AI Pods 计费方式改变",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DAVA",
+      "name": "Endava",
+      "name_en": "Endava",
+      "watch": "中型外包被 AI 挤压的样本"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CNXC",
+      "name": "Concentrix",
+      "name_en": "Concentrix",
+      "watch": "BPO 座席被 AI 替代的直接读数"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TASK",
+      "name": "TaskUs",
+      "name_en": "TaskUs",
+      "watch": "AI 数据标注与内容审核双向暴露"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TTEC",
+      "name": "TTEC",
+      "name_en": "TTEC Holdings",
+      "watch": "客服外包被 AI 侵蚀的反向样本"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "IBEX",
+      "name": "IBEX",
+      "name_en": "IBEX Limited",
+      "watch": "离岸客服 AI 替代率"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "AMZN",
+      "name": "亚马逊",
+      "name_en": "Amazon",
+      "watch": "Rufus、Alexa+ 订阅、卖家 AI 工具与广告",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "AAPL",
+      "name": "苹果",
+      "name_en": "Apple",
+      "watch": "Apple Intelligence 对服务收入与换机的拉动",
+      "tier_rules": [
+        "pinned"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "UBER",
+      "name": "Uber",
+      "name_en": "Uber Technologies",
+      "watch": "AI 调度与自动驾驶合作，AI 数据标注新业务"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "LYFT",
+      "name": "Lyft",
+      "name_en": "Lyft",
+      "watch": "AI 调度与自动驾驶合作"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ABNB",
+      "name": "Airbnb",
+      "name_en": "Airbnb",
+      "watch": "AI 客服替代率与旅行 Agent"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BKNG",
+      "name": "Booking",
+      "name_en": "Booking Holdings",
+      "watch": "AI Trip Planner 转化与客服成本"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "EXPE",
+      "name": "Expedia",
+      "name_en": "Expedia Group",
+      "watch": "Romie 等 AI 助手与 B2B 分发"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "TRIP",
+      "name": "TripAdvisor",
+      "name_en": "TripAdvisor",
+      "watch": "AI 行程规划与会员转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "DASH",
+      "name": "DoorDash",
+      "name_en": "DoorDash",
+      "watch": "AI 推荐与广告，配送调度自动化",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "MTCH",
+      "name": "Match Group",
+      "name_en": "Match Group",
+      "watch": "AI 匹配与付费转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "BMBL",
+      "name": "Bumble",
+      "name_en": "Bumble",
+      "watch": "AI 匹配与订阅重构"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ZG",
+      "name": "Zillow",
+      "name_en": "Zillow Group",
+      "watch": "AI 找房与经纪转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "EBAY",
+      "name": "eBay",
+      "name_en": "eBay",
+      "watch": "AI 商品描述与推荐带来的 GMV take rate"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "ETSY",
+      "name": "Etsy",
+      "name_en": "Etsy",
+      "watch": "AI 搜索与个性化对转化的影响"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "SE",
+      "name": "Sea Limited",
+      "name_en": "Sea Limited",
+      "watch": "Shopee AI 客服与广告，东南亚 AI 渗透",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "GRAB",
+      "name": "Grab",
+      "name_en": "Grab Holdings",
+      "watch": "AI 调度与金融风控"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CPNG",
+      "name": "Coupang",
+      "name_en": "Coupang",
+      "watch": "AI 供应链与广告变现"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "MELI",
+      "name": "MercadoLibre",
+      "name_en": "MercadoLibre",
+      "watch": "AI 广告与信贷风控",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "CVNA",
+      "name": "Carvana",
+      "name_en": "Carvana",
+      "watch": "AI 定价与库存周转"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "HIMS",
+      "name": "Hims & Hers",
+      "name_en": "Hims & Hers Health",
+      "watch": "AI 个性化处方与订阅留存"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "WIX",
+      "name": "Wix",
+      "name_en": "Wix.com",
+      "watch": "AI 建站与 AI 订阅套餐渗透"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "GDDY",
+      "name": "GoDaddy",
+      "name_en": "GoDaddy",
+      "watch": "Airo AI 对 ARPU 的抬升"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "YELP",
+      "name": "Yelp",
+      "name_en": "Yelp",
+      "watch": "AI 客服与广告匹配"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "PTON",
+      "name": "Peloton",
+      "name_en": "Peloton Interactive",
+      "watch": "AI 私教与订阅留存，反向样本"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "TTWO",
+      "name": "Take-Two",
+      "name_en": "Take-Two Interactive",
+      "watch": "游戏内 AI 生产降本与 UGC"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "SNAP",
+      "name": "Snap",
+      "name_en": "Snap",
+      "watch": "My AI 使用量与广告变现"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "DAO",
+      "name": "有道",
+      "name_en": "Youdao",
+      "watch": "AI 订阅服务收入分项，中国最纯的 AI 订阅读数之一",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TAL",
+      "name": "好未来",
+      "name_en": "TAL Education",
+      "watch": "学习机 AI 与 AI 课程渗透"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "EDU",
+      "name": "新东方",
+      "name_en": "New Oriental",
+      "watch": "AI 教学工具与东方甄选 AI 选品"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "GOTU",
+      "name": "高途",
+      "name_en": "Gaotu Techedu",
+      "watch": "AI 助教与获客成本"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "JD",
+      "name": "京东",
+      "name_en": "JD.com",
+      "watch": "AI 客服与营销工具、言犀大模型"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "WB",
+      "name": "微博",
+      "name_en": "Weibo",
+      "watch": "AI 内容与广告匹配"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ZH",
+      "name": "知乎",
+      "name_en": "Zhihu",
+      "watch": "知乎直答等 AI 搜索产品与付费"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "VIPS",
+      "name": "唯品会",
+      "name_en": "Vipshop",
+      "watch": "AI 推荐与供应链"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "ATHM",
+      "name": "汽车之家",
+      "name_en": "Autohome",
+      "watch": "AI 智能客服与数字人销售"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "YMM",
+      "name": "满帮",
+      "name_en": "Full Truck Alliance",
+      "watch": "AI 定价与匹配效率"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "BEKE",
+      "name": "贝壳",
+      "name_en": "KE Holdings",
+      "watch": "AI 带看与经纪效率"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "HUYA",
+      "name": "虎牙",
+      "name_en": "HUYA",
+      "watch": "AI 直播工具与游戏服务"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "FUTU",
+      "name": "富途",
+      "name_en": "Futu Holdings",
+      "watch": "AI 投研助手与用户转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TIGR",
+      "name": "老虎证券",
+      "name_en": "UP Fintech",
+      "watch": "AI 投顾与交易转化"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "API",
+      "name": "声网",
+      "name_en": "Agora",
+      "watch": "实时互动 AI（对话式 AI Engine）用量计费"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "TUYA",
+      "name": "涂鸦智能",
+      "name_en": "Tuya",
+      "watch": "AI Agent 开发平台与 IoT 设备智能化"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "3888.HK",
+      "name": "金山软件",
+      "name_en": "Kingsoft",
+      "watch": "WPS AI 与游戏 AI，金山办公母公司口径"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "0354.HK",
+      "name": "中软国际",
+      "name_en": "Chinasoft International",
+      "watch": "解放号与 AI 交付，人力被替代的反向读数",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "2013.HK",
+      "name": "微盟集团",
+      "name_en": "Weimob",
+      "watch": "WAI 产品订阅与 SaaS 客单价",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "0909.HK",
+      "name": "明源云",
+      "name_en": "Mingyuan Cloud",
+      "watch": "地产 SaaS 的 AI 模块与订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "0861.HK",
+      "name": "神州控股",
+      "name_en": "Digital China Holdings",
+      "watch": "燕云 DaaS 与政企 AI 落地"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "6608.HK",
+      "name": "百融云创",
+      "name_en": "Bairong",
+      "watch": "BR-Maas 模型即服务收入，AI 分项披露较细",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "9678.HK",
+      "name": "云知声",
+      "name_en": "Unisound",
+      "watch": "山海大模型在医疗与物联的落地收入",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "2121.HK",
+      "name": "创新奇智",
+      "name_en": "AInnovation",
+      "watch": "制造业 AI 与生成式 AI 收入占比",
+      "tier_rules": [
+        "native_purity",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "3738.HK",
+      "name": "阜博集团",
+      "name_en": "Vobile",
+      "watch": "AI 内容识别与版权变现"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "6060.HK",
+      "name": "众安在线",
+      "name_en": "ZhongAn Online",
+      "watch": "保险 AI 核保理赔与科技输出"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "9880.HK",
+      "name": "优必选",
+      "name_en": "UBTECH",
+      "watch": "具身智能订单与交付，订单非收入需标注",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity",
+        "has_attribution",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "0777.HK",
+      "name": "网龙",
+      "name_en": "NetDragon",
+      "watch": "AI 教育硬件与游戏 AI"
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "0780.HK",
+      "name": "同程旅行",
+      "name_en": "Tongcheng Travel",
+      "watch": "AI 行程助手与客服替代"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "300058.SZ",
+      "name": "蓝色光标",
+      "name_en": "BlueFocus",
+      "watch": "AI 生成营销内容收入分项，披露相对具体",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300496.SZ",
+      "name": "中科创达",
+      "name_en": "Thundersoft",
+      "watch": "端侧 AI 与滴水 OS，智能汽车 AI"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688095.SS",
+      "name": "福昕软件",
+      "name_en": "Foxit",
+      "watch": "PDF AI 助手与海外订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "688088.SS",
+      "name": "虹软科技",
+      "name_en": "ArcSoft",
+      "watch": "视觉 AI 算法授权与智能汽车",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "002315.SZ",
+      "name": "焦点科技",
+      "name_en": "Focus Technology",
+      "watch": "AI 麦哲伦外贸助手订阅数"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300687.SZ",
+      "name": "赛意信息",
+      "name_en": "SIE Consulting",
+      "watch": "企业 AI 落地与实施收入"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300170.SZ",
+      "name": "汉得信息",
+      "name_en": "Hand Enterprise",
+      "watch": "企业 AI 中台与实施，人力替代反向读数"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "002153.SZ",
+      "name": "石基信息",
+      "name_en": "Shiji Group",
+      "watch": "酒店与零售 SaaS 的 AI 模块"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300002.SZ",
+      "name": "神州泰岳",
+      "name_en": "Ultrapower",
+      "watch": "AI 算法与游戏出海双线"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "688327.SS",
+      "name": "云从科技",
+      "name_en": "CloudWalk",
+      "watch": "人机协同操作系统收入，注意持续亏损与口径",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "300785.SZ",
+      "name": "值得买",
+      "name_en": "Smzdm",
+      "watch": "AI 导购与内容生成，ToC 侧读数"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "600845.SS",
+      "name": "宝信软件",
+      "name_en": "Baosight",
+      "watch": "工业 AI 与钢铁行业模型"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "603171.SS",
+      "name": "税友股份",
+      "name_en": "Servyou",
+      "watch": "税务 SaaS 与 AI 报税助手，口径较干净",
+      "tier_rules": [
+        "disclosed_ai_metric"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300996.SZ",
+      "name": "普联软件",
+      "name_en": "Pulian",
+      "watch": "集团财务与司库 AI，央国企侧落地"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688369.SS",
+      "name": "致远互联",
+      "name_en": "Seeyon",
+      "watch": "协同 OA 与 AI Agent，与泛微对标"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "300454.SZ",
+      "name": "深信服",
+      "name_en": "Sangfor",
+      "watch": "安全 GPT 与云计算 AI，A 股安全 AI 主要读数",
+      "tier_rules": [
+        "embedded_accel"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "688561.SS",
+      "name": "奇安信",
+      "name_en": "QAX",
+      "watch": "Q-GPT 安全机器人订单与交付",
+      "tier_rules": [
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "002439.SZ",
+      "name": "启明星辰",
+      "name_en": "Venustech",
+      "watch": "安全运营 AI 与中移动协同"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688023.SS",
+      "name": "安恒信息",
+      "name_en": "DBAPPSecurity",
+      "watch": "恒脑安全大模型与订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300378.SZ",
+      "name": "鼎捷数智",
+      "name_en": "Digiwin",
+      "watch": "制造业 ERP 的 AI Agent 订阅"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "002368.SZ",
+      "name": "太极股份",
+      "name_en": "Taiji Computer",
+      "watch": "政务与央国企 AI 集成"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "301236.SZ",
+      "name": "软通动力",
+      "name_en": "iSoftStone",
+      "watch": "AI 交付与算力硬件双线，人力替代反向读数"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "603383.SS",
+      "name": "顶点软件",
+      "name_en": "Apexsoft",
+      "watch": "证券 IT 的 AI 模块"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688318.SS",
+      "name": "财富趋势",
+      "name_en": "Wealth Trend",
+      "watch": "AI 投顾与终端付费，与同花顺同赛道"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300663.SZ",
+      "name": "科蓝软件",
+      "name_en": "Cansoft",
+      "watch": "银行数字化中的 AI 应用"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688031.SS",
+      "name": "星环科技",
+      "name_en": "Transwarp",
+      "watch": "数据平台与行业大模型收入"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "688787.SS",
+      "name": "海天瑞声",
+      "name_en": "Haitian Ruisheng",
+      "watch": "训练数据服务收入，模型训练需求最直接读数",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "688568.SS",
+      "name": "中科星图",
+      "name_en": "GEOVIS",
+      "watch": "空天信息与 GEOVIS 大模型"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300451.SZ",
+      "name": "创业慧康",
+      "name_en": "B-Soft",
+      "watch": "医疗信息化 AI，与卫宁健康配对"
+    },
+    {
+      "track": "tob_software",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "300339.SZ",
+      "name": "润和软件",
+      "name_en": "Hoperun",
+      "watch": "AI 交付与信创，人力被替代的反向读数"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "IQV",
+      "name": "IQVIA",
+      "name_en": "IQVIA Holdings",
+      "watch": "AI 临床试验设计与真实世界数据变现"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "CRL",
+      "name": "Charles River",
+      "name_en": "Charles River Laboratories",
+      "watch": "AI 药物发现对临床前需求的影响，反向读数"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DOCS",
+      "name": "Doximity",
+      "name_en": "Doximity",
+      "watch": "Doximity GPT 医生使用量与广告变现"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "HCAT",
+      "name": "Health Catalyst",
+      "name_en": "Health Catalyst",
+      "watch": "医疗数据 AI 与 Ignite 订阅"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "PACB",
+      "name": "PacBio",
+      "name_en": "Pacific Biosciences",
+      "watch": "长读长测序与 AI 分析"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "MYGN",
+      "name": "Myriad Genetics",
+      "name_en": "Myriad Genetics",
+      "watch": "AI 变异解读与检测量"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "CDXS",
+      "name": "Codexis",
+      "name_en": "Codexis",
+      "watch": "AI 酶设计与生物制造"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "RLAY",
+      "name": "Relay Therapeutics",
+      "name_en": "Relay Therapeutics",
+      "watch": "动态蛋白结构计算与管线进展"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "A",
+      "name": "安捷伦",
+      "name_en": "Agilent Technologies",
+      "watch": "科研仪器景气与 AI 分析软件"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "TMO",
+      "name": "赛默飞",
+      "name_en": "Thermo Fisher Scientific",
+      "watch": "科研与生物制药资本开支，AI 软件平台"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "RVTY",
+      "name": "Revvity",
+      "name_en": "Revvity",
+      "watch": "诊断与生命科学软件的 AI 模块"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "688271.SS",
+      "name": "联影医疗",
+      "name_en": "United Imaging",
+      "watch": "uAI 影像平台装机与软件收入",
+      "tier_rules": [
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "300347.SZ",
+      "name": "泰格医药",
+      "name_en": "Tigermed",
+      "watch": "AI 临床试验运营效率"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "300676.SZ",
+      "name": "华大基因",
+      "name_en": "BGI Genomics",
+      "watch": "AI 基因解读与检测量"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "6618.HK",
+      "name": "京东健康",
+      "name_en": "JD Health",
+      "watch": "京医千询大模型与在线问诊替代率"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "0241.HK",
+      "name": "阿里健康",
+      "name_en": "Alibaba Health",
+      "watch": "AI 医疗助手与医药电商转化"
+    },
+    {
+      "track": "ai_for_science",
+      "market": "AH",
+      "scan_tier": 2,
+      "ai_purity": "adjacent",
+      "ticker": "1833.HK",
+      "name": "平安好医生",
+      "name_en": "Ping An Healthcare",
+      "watch": "平安医家人 AI 与会员转化"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "NICE",
+      "name": "NICE",
+      "name_en": "NICE Ltd",
+      "watch": "CXone Mpower 自主坐席、AI ARR、席位替代率",
+      "tier_rules": [
+        "disclosed_ai_metric",
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "CRNC",
+      "name": "Cerence",
+      "name_en": "Cerence",
+      "watch": "车载语音助手装机量、xUI 大模型上车节奏、单车授权费",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "FSLY",
+      "name": "Fastly",
+      "name_en": "Fastly",
+      "watch": "AI 爬虫与推理流量、边缘计算用量、AI Accelerator 采用"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "embedded",
+      "ticker": "AKAM",
+      "name": "Akamai",
+      "name_en": "Akamai Technologies",
+      "watch": "推理边缘节点、安全 AI 产品线、计算分部增速",
+      "tier_rules": [
+        "has_attribution"
+      ]
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "PD",
+      "name": "PagerDuty",
+      "name_en": "PagerDuty",
+      "watch": "AIOps 事故自动处置率、AI 附加率、席位净留存"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "DV",
+      "name": "DoubleVerify",
+      "name_en": "DoubleVerify",
+      "watch": "AI 生成内容识别量、社媒验证覆盖、计费量增速"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CGNX",
+      "name": "Cognex",
+      "name_en": "Cognex",
+      "watch": "深度学习视觉产品占比、物流与半导体订单、AI 视觉附加率"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "UPST",
+      "name": "Upstart",
+      "name_en": "Upstart Holdings",
+      "watch": "模型自动核批率、放款转化、承销模型迭代",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "PGY",
+      "name": "Pagaya",
+      "name_en": "Pagaya Technologies",
+      "watch": "AI 承销网络放款额、合作方数量、损失率验证",
+      "tier_rules": [
+        "native_purity"
+      ]
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "LMND",
+      "name": "Lemonade",
+      "name_en": "Lemonade",
+      "watch": "AI 理赔自动率、单均处理成本、承保利润率"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "QFIN",
+      "name": "奇富科技",
+      "name_en": "Qifu Technology",
+      "watch": "AI 风控自动审批率、获客成本、撮合规模"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "FINV",
+      "name": "信也科技",
+      "name_en": "FinVolution",
+      "watch": "AI 风控模型、国际业务放款、逾期率"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "LX",
+      "name": "乐信",
+      "name_en": "LexinFintech",
+      "watch": "AI 风控与催收自动化、撮合规模、take rate"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "BZ",
+      "name": "BOSS直聘",
+      "name_en": "Kanzhun",
+      "watch": "AI 匹配与简历生成、付费企业数、ARPU"
+    },
+    {
+      "track": "toc_internet",
+      "market": "US",
+      "scan_tier": 2,
+      "ai_purity": "embedded",
+      "ticker": "CART",
+      "name": "Instacart",
+      "name_en": "Maplebear",
+      "watch": "AI 广告投放、Carrot Ads 外部客户、GTV 与广告 take rate"
+    }
+  ],
+  "private_watchlist": {
+    "note": "未上市，不可交易。作用是领先指标：新变现方式与新产品形态通常先在这里出现，再传导到上市公司。只做定性追踪，不进增速筛选表。",
+    "companies": [
+      "OpenAI",
+      "Anthropic",
+      "xAI",
+      "Mistral",
+      "月之暗面 Moonshot",
+      "深度求索 DeepSeek",
+      "Anysphere (Cursor)",
+      "Sierra",
+      "Harvey",
+      "Abridge",
+      "Glean",
+      "Perplexity",
+      "ElevenLabs",
+      "Suno",
+      "Synthesia",
+      "Decagon",
+      "Clay",
+      "Lovable",
+      "Replit",
+      "Isomorphic Labs",
+      "Chai Discovery",
+      "EvolutionaryScale",
+      "深势科技 DP Technology",
+      "剂泰医药 METiS"
+    ]
+  },
+  "delisted_removed": {
+    "note": "复核时因并购退市移除，保留记录以免下次误加回。",
+    "2026-08-14": [
+      {
+        "ticker": "CFLT",
+        "name": "Confluent",
+        "reason": "2026-03-17 IBM 以约 110 亿美元完成收购，Nasdaq 退市；信号并入 IBM"
+      },
+      {
+        "ticker": "CWAN",
+        "name": "Clearwater Analytics",
+        "reason": "2026-06-25 Permira/Warburg Pincus 财团完成私有化，NYSE 退市"
+      },
+      {
+        "ticker": "EXAS",
+        "name": "Exact Sciences",
+        "reason": "2026-03-23 雅培完成收购，Nasdaq 退市；信号并入 ABT，暂不加入池"
+      }
+    ],
+    "2026-08-15": [
+      {
+        "ticker": "VRNT",
+        "name": "Verint Systems",
+        "reason": "2025-11 Thoma Bravo 旗下 Calabrio 完成收购，2025-11-25 停牌、11-28 起 Nasdaq 摘牌"
+      },
+      {
+        "ticker": "SMAR",
+        "name": "Smartsheet",
+        "reason": "2025-01-22 Blackstone 与 Vista 完成 84 亿美元私有化，NYSE 退市"
+      },
+      {
+        "ticker": "IAS",
+        "name": "Integral Ad Science",
+        "reason": "2025-12-23 Novacap 完成 19 亿美元私有化，12-24 起 Nasdaq 停止交易"
+      }
+    ]
+  }
+}
