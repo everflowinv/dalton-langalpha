@@ -319,3 +319,79 @@ class TestDenseImageReadingReachesSubagents:
         assert prompt.count(_DENSE_IMAGE) == 1
         assert prompt.count("## 密集图片与表格") == 2
         assert prompt.startswith("## 密集图片与表格")
+
+
+# DALTON-HOOK(dispatch-delivery): built-in and custom subagent prompts include
+# the delivery rule once. A heading of the same name is not the rule.
+_DELIVERY = "向父代理（主代理）返回的最终消息须回答派发时提出的问题"
+
+
+class TestSubagentDeliveryReachesSubagents:
+    @pytest.mark.parametrize("name", sorted(BUILTIN_SUBAGENTS))
+    def test_builtin_prompt_includes_the_rule_once(self, name):
+        prompt = _compiler(config=_config()).compile(BUILTIN_SUBAGENTS[name])[
+            "system_prompt"
+        ]
+        assert prompt.count(_DELIVERY) == 1
+        assert prompt.count("## 子代理交付") == 1
+
+    def test_custom_prompt_includes_the_rule_once(self):
+        prompt = _compiler().compile(
+            SubagentDefinition(name="ops", description="d", custom_prompt="You are ops.")
+        )["system_prompt"]
+        assert prompt.count(_DELIVERY) == 1
+        assert prompt.startswith("You are ops.")
+
+    def test_custom_template_includes_the_rule_once(self):
+        prompt = _compiler().compile(
+            SubagentDefinition(
+                name="ops",
+                description="d",
+                custom_prompt_template="subagents/roles/general.md.j2",
+            )
+        )["system_prompt"]
+        assert prompt.count(_DELIVERY) == 1
+
+    def test_output_guidelines_on_still_includes_delivery_once(self):
+        prompt = _compiler(config=_config()).compile(
+            SubagentDefinition(
+                name="ops",
+                description="d",
+                role_prompt="Do the work.",
+                tools=["filesystem"],
+                sections={"output_guidelines": True},
+            )
+        )["system_prompt"]
+        assert prompt.count(_DELIVERY) == 1
+        assert prompt.count("所有直接面向用户的文字使用用户当前要求的语言") == 1
+
+    def test_heading_only_custom_prompt_or_template_still_gets_the_full_rule_once(
+        self, monkeypatch
+    ):
+        from ptc_agent.agent.prompts import get_loader
+        from ptc_agent.agent.prompts.loader import PromptLoader
+
+        rule = get_loader().get_component("subagent_delivery").strip()
+        original = PromptLoader.render
+
+        def render(self, template_name, **kwargs):
+            if template_name == "delivery_heading_only.md.j2":
+                return "## 子代理交付"
+            return original(self, template_name, **kwargs)
+
+        monkeypatch.setattr(PromptLoader, "render", render)
+        cases = [
+            SubagentDefinition(
+                name="ops", description="d", custom_prompt="## 子代理交付"
+            ),
+            SubagentDefinition(
+                name="ops",
+                description="d",
+                custom_prompt_template="delivery_heading_only.md.j2",
+            ),
+        ]
+        for defn in cases:
+            prompt = _compiler().compile(defn)["system_prompt"]
+            assert prompt.count(rule) == 1
+            assert prompt.count("## 子代理交付") == 2
+            assert prompt.startswith("## 子代理交付")

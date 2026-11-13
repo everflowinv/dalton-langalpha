@@ -396,3 +396,116 @@ async def test_a_task_the_ledger_shows_in_progress_is_pending_on_another_worker(
 
     assert is_pending_read(await _read(create_task_output_tool(running), "k7Xm2p"))
     assert not is_pending_read(await _read(create_task_output_tool(finished), "k7Xm2p"))
+
+
+# DALTON-HOOK(dispatch-delivery): an ended run with no content, and a completed
+# run whose result text is gone, are not delivery complete.
+def test_an_ended_run_with_no_content_is_not_delivery_complete():
+    from ptc_agent.agent.middleware.background_subagent.tools import extract_result_content
+
+    ok, text = extract_result_content({"success": True})
+    assert ok is True
+    assert text == (
+        "This run has ended but returned no content. Check that every "
+        "file required at dispatch exists and is readable before telling "
+        "the user the work is done. If no files were required, or if any "
+        "required file is missing or unreadable, do not treat this as "
+        "delivery complete."
+    )
+    assert "Task completed successfully (no output)" not in text
+    assert extract_result_content({"success": True, "result": None}) == (True, text)
+    assert extract_result_content({"success": True, "result": "the table"}) == (
+        True,
+        "the table",
+    )
+    failed_ok, failed_text = extract_result_content(
+        {"success": False, "status": "error", "error": "boom"}
+    )
+    assert failed_ok is False
+    assert failed_text == "ERROR: boom"
+    assert "If no files were required" not in failed_text
+    assert "Recover what you can" not in failed_text
+
+
+@pytest.mark.asyncio
+async def test_missing_result_text_requires_each_required_file():
+    from unittest.mock import create_autospec
+
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.tools import (
+        _compose_missing_reply,
+    )
+
+    registry = create_autospec(BackgroundTaskRegistry, instance=True)
+    registry.resolve_result_text.return_value = None
+
+    text = await _compose_missing_reply(
+        registry,
+        "k7Xm2p",
+        {"status": "completed", "task_run_id": "run-9"},
+    )
+
+    # DALTON-HOOK(dispatch-delivery): no required file, or a missing one,
+    # means this completed run is not delivery complete.
+    assert text == (
+        "Task-k7Xm2p's run has ended, but its result text is no "
+        "longer available. Recover what you can by reading the workspace "
+        "files it was asked to produce. Check that every file required at "
+        "dispatch exists and is readable before telling the user the "
+        "work is done. If no files were required, or if any required file "
+        "is missing or unreadable, the task is not complete — do not "
+        "announce it as done."
+    )
+    assert "completed but its result text is no longer available" not in text
+    registry.resolve_result_text.assert_awaited_once_with("k7Xm2p", "run-9")
+
+
+# DALTON-HOOK(dispatch-delivery): a stopped or failed run is not told to
+# recover files. Only a completed run with no result text is.
+@pytest.mark.asyncio
+async def test_stopped_or_failed_runs_are_not_told_to_recover_files():
+    from unittest.mock import create_autospec
+
+    from ptc_agent.agent.middleware.background_subagent.registry import (
+        BackgroundTaskRegistry,
+    )
+    from ptc_agent.agent.middleware.background_subagent.tools import (
+        _compose_missing_reply,
+        _stop_notice,
+    )
+
+    registry = create_autospec(BackgroundTaskRegistry, instance=True)
+    registry.resolve_result_text.return_value = None
+    registry.resolve_archived_result_text.return_value = None
+
+    stopped = await _compose_missing_reply(
+        registry,
+        "k7Xm2p",
+        {"status": "cancelled", "task_run_id": "run-9"},
+    )
+    assert "was stopped before finishing" in stopped
+    assert "check with the user before re-dispatching" in stopped
+    assert "Recover what you can" not in stopped
+    assert "If no files were required" not in stopped
+
+    failed = await _compose_missing_reply(
+        registry,
+        "k7Xm2p",
+        {
+            "status": "error",
+            "task_run_id": "run-9",
+            "failure": {"error": "boom"},
+        },
+    )
+    assert "failed and produced no result" in failed
+    assert "Error: boom" in failed
+    assert "Recover what you can" not in failed
+    assert "If no files were required" not in failed
+
+    notice = _stop_notice(
+        SimpleNamespace(display_id="Task-k7Xm2p", subagent_type="research")
+    )
+    assert "Report the stop and await instruction" in notice
+    assert "Recover what you can" not in notice

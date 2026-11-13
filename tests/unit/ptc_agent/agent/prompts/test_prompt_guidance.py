@@ -236,3 +236,111 @@ class TestBucketIsInvisibleToThePrompt:
         assert "prompt_guidance" not in rendered
         # Ordinary preferences still reach the model.
         assert "proactive_questions" in rendered
+
+
+# DALTON-HOOK(dispatch-delivery): the dispatch checklist and the source-bearing
+# summary render in lean and detailed. Mechanical split rules and the duplicate
+# dump example do not.
+_DISPATCH_REQUIRED = (
+    "派发说明必须包含",
+    "核对状态和已知缺失项",
+    "本线程任务目录（<task_name>/）",
+    "必须生成的文件及完成标准",
+    "单次工具调用或简单查询直接做，不派发",
+    "同一张截图的转录、复读与差异处理",
+    "派发返回的编号只说明任务已建立",
+    "打开交付文件检查必要内容",
+    "只有成功结束但交付不完整",
+    "报告状态并等待指示",
+    "用户主动停止的，报告状态并等待指示",
+    "按工具给出的恢复或重试说明处理",
+    "保持任务未完成",
+    "发现未解决差异时",
+    "后台任务",
+    "不通过循环查询或休眠等待",
+    "sleep …; ls …",
+    "Launch up to",
+)
+
+_DISPATCH_ABSENT = (
+    "3+ tool calls",
+    "Worked Example",
+    "1 sub-agent per element",
+    "1 sub-agent per source",
+    "18 minutes",
+    "Research Python async frameworks",
+    "背景任务",
+    "end your turn",
+    "Do not sleep or poll",
+    "Always name this thread's task directory",
+    "运行已经结束，但结果为空",
+    "Sequence on arrival",
+    "Be specific in prompts",
+)
+
+_SUMMARY_REQUIRED = (
+    "结构化或批量",
+    "原始数据路径",
+    "覆盖范围",
+    "核对状态",
+    "未核实项",
+    "重要差异",
+    "父代理（主代理）",
+    "用户可见文字",
+    "不展开内部路径",
+)
+
+_SUMMARY_ABSENT = (
+    "Dump data first",
+    "Dump First, Then Process",
+    "some_mcp_tool",
+    "Return ONLY summary",
+    "对话里只放摘要",
+    "使主代理能恢复来源",
+    "未核实项目",
+    "未核实状态",
+)
+
+_CHIEF_HANDOFF = (
+    "向工作区分析师派发任务",
+    "记录并沿用对应的工作区和线程",
+    "不再自行做同一套正式计算",
+    "明确标为临时估算",
+    "跨工作区或外部渠道写入要求",
+    "用户最新变更",
+    "确认文件存在、可读且包含要求的内容",
+    "读取线程结果（`agent_output`）",
+    "而不是线程原文",
+)
+
+
+class TestDispatchAndDeliveryPrompt:
+    @pytest.mark.parametrize("guidance", ["lean", "detailed"])
+    @pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
+    def test_dispatch_checklist_and_summary_render_in_both_modes(self, guidance, role):
+        prompt = init_loader().get_system_prompt(
+            subagent_summary="",
+            role=role,
+            **guidance_template_vars(guidance),
+        )
+        for phrase in _DISPATCH_REQUIRED:
+            assert phrase in prompt, phrase
+        for phrase in _DISPATCH_ABSENT:
+            assert phrase not in prompt, phrase
+        for phrase in _SUMMARY_REQUIRED:
+            assert phrase in prompt, phrase
+        for phrase in _SUMMARY_ABSENT:
+            assert phrase not in prompt, phrase
+        for phrase in _CHIEF_HANDOFF:
+            if role == "chief_of_staff":
+                assert phrase in prompt, phrase
+            else:
+                assert phrase not in prompt, phrase
+
+    def test_update_and_resume_example_stays_detailed_only(self):
+        loader = init_loader()
+        kwargs = dict(subagent_summary="")
+        detailed = loader.get_system_prompt(**guidance_template_vars("detailed"), **kwargs)
+        lean = loader.get_system_prompt(**guidance_template_vars("lean"), **kwargs)
+        assert "Add regulatory analysis" in detailed
+        assert "Add regulatory analysis" not in lean
