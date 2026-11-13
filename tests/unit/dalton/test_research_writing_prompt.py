@@ -222,4 +222,4 @@ def test_writing_md_deduplicated_and_retains_dalton_mechanisms() -> None:
     assert '"相当于" vs "占"' in writing_md
     assert "严禁使用波浪号 `~`" in writing_md
     assert "严禁使用 `$` 符号" in writing_md
-    assert "The stock works if" in writing_md
+    assert "成立的条件：" in writing_md
