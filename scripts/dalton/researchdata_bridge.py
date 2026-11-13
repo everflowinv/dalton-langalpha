@@ -169,6 +169,7 @@ ROUTE_TIMEOUTS: dict[str, tuple[int, int]] = {
     "last30days": (600, 600),
     "x-timeline": (60, 60),
     "tmeet": (120, 180),
+    "gcal": (90, 120),
 }
 
 BRIDGE_COMMUNITY_ROUTES: frozenset[str] = frozenset(
@@ -1128,6 +1129,12 @@ class BridgeConfig:
             os.environ.get(
                 "DALTON_TMEET_BIN",
                 "~/.openclaw/tools/node/bin/tmeet",
+            )
+        ).expanduser().resolve()
+        self.gws_bin: Path = Path(
+            os.environ.get(
+                "DALTON_GWS_BIN",
+                "~/.openclaw/tools/node/bin/gws",
             )
         ).expanduser().resolve()
         self.employee_python: Path = Path(
@@ -3071,6 +3078,52 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             'research(route="tmeet", operation="record_content", action="transcript", record_file_id="900001", pid="0", limit=100)',
         ],
     },
+    "gcal": {
+        "tool": "research",
+        "category": "research",
+        "operations": ["list_events", "insert_event", "delete_event"],
+        "default_operation": "list_events",
+        "operation_aliases": {},
+        "accepted_params": [
+            "query",
+            "time_min",
+            "time_max",
+            "limit",
+            "summary",
+            "description",
+            "start",
+            "end",
+            "event_id",
+        ],
+        "accepted_nested_params": [],
+        "required_params": {
+            "list_events": ["time_min", "time_max"],
+            "insert_event": ["summary", "description", "start", "end"],
+            "delete_event": ["event_id"],
+        },
+        "optional_params": ["query", "limit"],
+        "param_formats": {
+            "query": "单个 ticker 或短串，1-64 位字母数字及 . _ -",
+            "time_min": "ISO 时间或 YYYY-MM-DD；日期按 UTC 午夜。与 time_max 的窗口不超过 400 天",
+            "time_max": "同 time_min，且必须晚于 time_min",
+            "limit": "1-250 的整数，默认 50",
+            "summary": "事件标题，1-300 字",
+            "description": "事件说明，最长 8000 字。bridge 会在末尾追加固定标记行",
+            "start": '{"date": "YYYY-MM-DD"} 或 {"dateTime": "...", "timeZone": "..."}',
+            "end": "与 start 同一种形状，且晚于 start",
+            "event_id": "5-128 位字母、数字、_ 或 -",
+        },
+        "return_shape": (
+            "{\"ok\": true, \"status\": \"ok\", \"data\": {...}, \"_sources\": [...]}. "
+            "list_events 的事件在 data.events，只含 id、summary、description、start、end。"
+            "insert_event 返回新事件 id。delete_event 在核对 tracker 标记后才删除。"
+        ),
+        "examples": [
+            'research(route="gcal", operation="list_events", query="AAPL", time_min="2026-11-14T00:00:00Z", time_max="2026-11-15T00:00:00Z", limit=20)',
+            'research(route="gcal", operation="insert_event", summary="Example (AAPL) Earnings — Q1 2027 [BMO]", description="https://example.test/ir\\nScanned 2026-11-14\\nConfidence: high", start={"dateTime": "2026-11-20T08:00:00", "timeZone": "America/New_York"}, end={"dateTime": "2026-11-20T08:30:00", "timeZone": "America/New_York"})',
+            'research(route="gcal", operation="delete_event", event_id="evt-example-1")',
+        ],
+    },
 }
 
 TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
@@ -3087,6 +3140,7 @@ TOOL_VALID_ROUTES: dict[str, tuple[str, ...]] = {
         "tmtb",
         "funda-ai",
         "tmeet",
+        "gcal",
     ),
     "community": ("xueqiu", "employee", "last30days", "x-timeline"),
 }
@@ -3773,7 +3827,7 @@ def _normalize_and_validate_call_args(
             else:
                 normalized["query"] = folded_query
 
-    if not is_comm and route != "tmeet":
+    if not is_comm and route not in {"tmeet", "gcal"}:
         for date_k in _DATE_PARAM_FIELDS:
             raw_date = normalized.get(date_k)
             if raw_date is None:
@@ -6290,6 +6344,319 @@ TMEET_CATALOG_ENTRY: dict[str, Any] = {
 }
 
 
+_GCAL_MARKER = "Created by Dalton earnings tracker"
+_GCAL_SUMMARY_MAX = 300
+_GCAL_DESCRIPTION_MAX = 8000
+_GCAL_DEFAULT_LIMIT = 50
+_GCAL_MAX_LIMIT = 250
+_GCAL_MAX_WINDOW = timedelta(days=400)
+_GCAL_QUERY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GCAL_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{5,128}$")
+_GCAL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_GCAL_TRACKER_SUMMARY_RE = re.compile(r"^.+ \([A-Z0-9.]+\) Earnings — ")
+_GCAL_AUTH_RE = re.compile(r"auth\s+login", re.IGNORECASE)
+_GCAL_STATUS_RE = re.compile(r"\b(401|403|404|410)\b")
+_GCAL_HINT_CALENDAR = "日历未配置。请在宿主机设置 DALTON_GCAL_CALENDAR_ID。"
+_GCAL_HINT_MISSING = "宿主机上没有 gws 可执行文件。请检查 DALTON_GWS_BIN。"
+_GCAL_HINT_LOGIN = "需要在宿主机重新登录 gws。本路由不提供登录。"
+_GCAL_HINT_TIMEOUT = "gws 调用超时。可稍后重试。"
+_GCAL_HINT_RESPONSE = "gws 的输出不是 JSON。请核对 CLI。"
+_GCAL_HINT_WINDOW = "time_min 到 time_max 的窗口不能超过 400 天。"
+_GCAL_HINT_ORDER = "time_min 必须早于 time_max。"
+_GCAL_HINT_TIME = "time_min 和 time_max 需为 YYYY-MM-DD 或带时区的 ISO 时间。"
+_GCAL_HINT_SHAPE = 'start 和 end 只能是 {"date": "YYYY-MM-DD"} 或 {"dateTime", "timeZone"}。'
+_GCAL_HINT_WHEN_ORDER = "end 必须晚于 start。"
+_GCAL_HINT_REFUSED = "该事件不是财报跟踪事件，已拒绝删除。"
+_GCAL_HINT_NOT_FOUND = "日历里没有这个事件。"
+_GCAL_HINT_UPSTREAM = "gws 调用失败。"
+_GCAL_HINT_QUERY = "query 只能是单个 ticker 或短串。"
+_GCAL_HINT_LIMIT = "limit 只能是 1 到 250 的整数。"
+_GCAL_HINT_SUMMARY = "summary 只能是 1 到 300 个字符的字符串。"
+_GCAL_HINT_SUMMARY_FORMAT = "summary 必须是「名称 (代码) Earnings — 」这种财报跟踪标题。"
+_GCAL_HINT_DESCRIPTION = "description 只能是不超过 8000 个字符的字符串。"
+_GCAL_HINT_EVENT_ID = "event_id 只能是 5 到 128 位字母、数字、下划线或连字符。"
+_GCAL_OLD_MARKERS = ("Scanned ", "扫描日期：")
+_GCAL_COMMON_KEYS = {"route", "operation", "timeout", "mode"}
+_GCAL_OP_KEYS = {
+    "list_events": {"query", "time_min", "time_max", "limit"},
+    "insert_event": {"summary", "description", "start", "end"},
+    "delete_event": {"event_id"},
+}
+
+GCAL_CATALOG_ENTRY: dict[str, Any] = {
+    "id": "gcal",
+    "tool": "research",
+    "category": "research",
+    "kind": "bridge_calendar",
+    "name": "Richard earnings calendar",
+    "description": "列、新建和删除 Richard 财报日期事件。日历 ID 由宿主机配置。删除前必须取回事件并核对 tracker 标记。",
+    "operations": ["list_events", "insert_event", "delete_event"],
+    "rules": [
+        "不并入 all。",
+        "日历 ID 不由调用方传入。",
+        "删除前必须取回并核对 tracker 标记。",
+        "写操作不用于健康探测。",
+    ],
+}
+
+
+def _gcal_failure(
+    status: str,
+    error_code: str,
+    hint: str,
+    category: str,
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": status,
+        "error_code": error_code,
+        "error_category": category,
+        "error": error or hint,
+        "hint": hint,
+        "_gcal_hint": hint,
+        "data": None,
+    }
+
+
+def _gcal_param_error(hint: str, *, error_code: str = "invalid_arguments") -> dict[str, Any]:
+    return _gcal_failure("invalid_arguments", error_code, hint, "参数错误")
+
+
+def _gcal_parse_json(text: str) -> Any:
+    """Parse a gws payload, skipping non-JSON preamble lines such as keyring notices."""
+    raw = text.strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    lines = raw.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("{") and not stripped.startswith("["):
+            continue
+        try:
+            return json.loads("\n".join(lines[index:]))
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _gcal_redact(value: Any, calendar_id: str) -> Any:
+    if not calendar_id:
+        return value
+    if isinstance(value, str):
+        return value.replace(calendar_id, "[calendar]")
+    if isinstance(value, list):
+        return [_gcal_redact(item, calendar_id) for item in value]
+    if isinstance(value, dict):
+        return {key: _gcal_redact(item, calendar_id) for key, item in value.items()}
+    return value
+
+
+def _gcal_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _gcal_limit(value: Any) -> int:
+    if value is None:
+        return _GCAL_DEFAULT_LIMIT
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("bad limit")
+    if value < 1 or value > _GCAL_MAX_LIMIT:
+        raise ValueError("bad limit")
+    return value
+
+
+def _gcal_parse_bound(value: Any) -> tuple[datetime, str]:
+    if not isinstance(value, str):
+        raise ValueError("bad time")
+    text = value.strip()
+    if _GCAL_DATE_RE.fullmatch(text):
+        parsed = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+        return parsed, f"{text}T00:00:00Z"
+    probe = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(probe)
+    except ValueError as exc:
+        raise ValueError("bad time") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("naive")
+    return parsed.astimezone(timezone.utc), text
+
+
+def _gcal_when(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("shape")
+    if set(value) == {"date"}:
+        day = value.get("date")
+        if not isinstance(day, str) or _GCAL_DATE_RE.fullmatch(day) is None:
+            raise ValueError("shape")
+        date.fromisoformat(day)
+        return {"date": day}
+    if set(value) == {"dateTime", "timeZone"}:
+        stamp = value.get("dateTime")
+        zone = value.get("timeZone")
+        if not isinstance(stamp, str) or not stamp.strip():
+            raise ValueError("shape")
+        if not isinstance(zone, str) or not zone.strip():
+            raise ValueError("shape")
+        probe = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+        try:
+            datetime.fromisoformat(probe)
+            ZoneInfo(zone)
+        except (KeyError, ValueError) as exc:
+            raise ValueError("shape") from exc
+        return {"dateTime": stamp, "timeZone": zone}
+    raise ValueError("shape")
+
+
+def _gcal_stamp(value: dict[str, str]) -> datetime:
+    stamp = value["dateTime"]
+    probe = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+    parsed = datetime.fromisoformat(probe)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(value["timeZone"]))
+    return parsed
+
+
+def _gcal_when_before(start: dict[str, str], end: dict[str, str]) -> bool:
+    if "date" in start or "date" in end:
+        if "date" not in start or "date" not in end:
+            raise ValueError("shape")
+        return date.fromisoformat(start["date"]) < date.fromisoformat(end["date"])
+    return _gcal_stamp(start) < _gcal_stamp(end)
+
+
+def _gcal_with_marker(description: str) -> str:
+    text = description.rstrip()
+    lines = text.splitlines()
+    if lines and lines[-1].strip() == _GCAL_MARKER:
+        return text
+    if not text:
+        return _GCAL_MARKER
+    return f"{text}\n{_GCAL_MARKER}"
+
+
+def _gcal_copy_when(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    if isinstance(value.get("date"), str):
+        return {"date": value["date"]}
+    copied: dict[str, str] = {}
+    if isinstance(value.get("dateTime"), str):
+        copied["dateTime"] = value["dateTime"]
+    if isinstance(value.get("timeZone"), str):
+        copied["timeZone"] = value["timeZone"]
+    return copied or None
+
+
+def _gcal_normalize_event(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    event_id = raw.get("id")
+    if not isinstance(event_id, str) or not event_id.strip():
+        return None
+    summary = raw.get("summary") if isinstance(raw.get("summary"), str) else ""
+    description = raw.get("description") if isinstance(raw.get("description"), str) else ""
+    return {
+        "id": event_id.strip(),
+        "summary": summary,
+        "description": description,
+        "start": _gcal_copy_when(raw.get("start")),
+        "end": _gcal_copy_when(raw.get("end")),
+    }
+
+
+def _gcal_is_tracker(event: dict[str, Any]) -> bool:
+    summary = event.get("summary") if isinstance(event.get("summary"), str) else ""
+    description = event.get("description") if isinstance(event.get("description"), str) else ""
+    if _GCAL_TRACKER_SUMMARY_RE.match(summary) is None:
+        return False
+    if _GCAL_MARKER in description:
+        return True
+    return any(marker in description for marker in _GCAL_OLD_MARKERS)
+
+
+def _gcal_error_code(parsed: Any) -> int | None:
+    if not isinstance(parsed, dict):
+        return None
+    err = parsed.get("error")
+    raw = err.get("code") if isinstance(err, dict) else parsed.get("code")
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int) and raw in (401, 403, 404, 410):
+        return raw
+    if isinstance(raw, str) and raw.strip() in {"401", "403", "404", "410"}:
+        return int(raw.strip())
+    return None
+
+
+def _gcal_transport_failure(
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    parsed: Any,
+    *,
+    allow_empty: bool,
+) -> dict[str, Any] | None:
+    if allow_empty and returncode == 0 and parsed is None and not stdout.strip():
+        return None
+    combined = f"{stdout}\n{stderr}"
+    code = _gcal_error_code(parsed)
+    structured_ok = returncode == 0 and parsed is not None and code is None
+    if not structured_ok:
+        if code in (401, 403) or _GCAL_AUTH_RE.search(combined) or (
+            _GCAL_STATUS_RE.search(combined) and _GCAL_STATUS_RE.search(combined).group(1) in {"401", "403"}
+        ):
+            return _gcal_failure("not_logged_in", "not_logged_in", _GCAL_HINT_LOGIN, "权限或额度")
+        if code in (404, 410) or (
+            _GCAL_STATUS_RE.search(combined) and _GCAL_STATUS_RE.search(combined).group(1) in {"404", "410"}
+        ):
+            return _gcal_failure("event_not_found", "event_not_found", _GCAL_HINT_NOT_FOUND, "没有匹配")
+        if parsed is None:
+            return _gcal_failure("invalid_response", "invalid_response", _GCAL_HINT_RESPONSE, "上游不可用")
+        if returncode != 0:
+            return _gcal_failure("error", "upstream_error", _GCAL_HINT_UPSTREAM, "上游不可用")
+    return None
+
+
+def _gcal_items(parsed: Any) -> list[Any] | None:
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return parsed["items"]
+    if isinstance(parsed, dict) and "error" not in parsed and "id" not in parsed:
+        return []
+    return None
+
+
+def _gcal_reject_extras(operation: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = _GCAL_COMMON_KEYS | _GCAL_OP_KEYS.get(operation, set())
+    unknown = sorted(key for key, value in arguments.items() if value is not None and key not in allowed)
+    if not unknown:
+        return None
+    hint = f"本操作不接受参数 {unknown}。"
+    return _gcal_param_error(hint, error_code="unknown_parameters")
+
+
+def _gcal_missing(operation: str, arguments: dict[str, Any]) -> str | None:
+    required = {
+        "list_events": ("time_min", "time_max"),
+        "insert_event": ("summary", "description", "start", "end"),
+        "delete_event": ("event_id",),
+    }.get(operation)
+    if required is None:
+        return "gcal 只提供 list_events、insert_event、delete_event。"
+    missing = [key for key in required if arguments.get(key) is None]
+    if missing:
+        return f"{operation} 需要 {'、'.join(missing)}。"
+    return None
+
+
 def _tmeet_failure(
     status: str,
     error_code: str,
@@ -6812,6 +7179,8 @@ class ResearchDataBridge:
                 if isinstance(route_prop, dict) and isinstance(route_prop.get("enum"), list):
                     if "tmeet" not in route_prop["enum"]:
                         route_prop["enum"].append("tmeet")
+                    if "gcal" not in route_prop["enum"]:
+                        route_prop["enum"].append("gcal")
                 if isinstance(props, dict):
                     props.setdefault(
                         "record_file_id",
@@ -6834,6 +7203,33 @@ class ResearchDataBridge:
                             "description": "tmeet transcript page start pid (numeric string).",
                         },
                     )
+                    props.setdefault(
+                        "time_min",
+                        {"type": "string", "description": "gcal list_events window start, ISO or YYYY-MM-DD."},
+                    )
+                    props.setdefault(
+                        "time_max",
+                        {"type": "string", "description": "gcal list_events window end, ISO or YYYY-MM-DD."},
+                    )
+                    props.setdefault(
+                        "event_id",
+                        {"type": "string", "description": "gcal delete_event id."},
+                    )
+                    props.setdefault(
+                        "summary",
+                        {"type": "string", "description": "gcal insert_event title."},
+                    )
+                    props.setdefault(
+                        "description",
+                        {"type": "string", "description": "gcal insert_event description."},
+                    )
+                    for bound_name in ("start", "end"):
+                        bound = props.get(bound_name)
+                        if isinstance(bound, dict) and "anyOf" not in bound:
+                            bound.pop("type", None)
+                            bound["anyOf"] = [{"type": "string"}, {"type": "object"}]
+                            note = " gcal insert_event passes an object; other routes keep a date string."
+                            bound["description"] = (str(bound.get("description") or "") + note).strip()
             elif tool_name == "community":
                 desc = str(tool_copy.get("description") or "").rstrip()
                 if self.COMMUNITY_DESCRIPTION_SUFFIX.strip() not in desc:
@@ -8708,6 +9104,291 @@ class ResearchDataBridge:
         finished = self._tmeet_finish(operation, arguments, payload)
         return self._make_tool_result_response(req_id, finished, is_error=finished.get("ok") is False)
 
+    def _gws_subprocess_env(self) -> dict[str, str]:
+        """Reuse the stripped community env and prepend the gws binary directory to PATH."""
+        env = self._build_community_subprocess_env()
+        env.pop("DALTON_GCAL_CALENDAR_ID", None)
+        bin_dir = str(self.cfg.gws_bin.parent)
+        current = env.get("PATH", "")
+        env["PATH"] = bin_dir if not current else f"{bin_dir}{os.pathsep}{current}"
+        return env
+
+    async def _exec_gws(self, argv: list[str], timeout_s: float) -> tuple[int, bytes, bytes]:
+        """Run one gws argv list. The only gcal `create_subprocess_exec` site.
+
+        `gws events delete` writes a 0-byte download.html into cwd, so the process
+        runs inside a temporary directory.
+        """
+        env = self._gws_subprocess_env()
+        with tempfile.TemporaryDirectory(prefix="dalton-gws-") as cwd:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_s
+                )
+            except BaseException:
+                await _terminate_and_reap_process(proc, term_timeout_s=COMMUNITY_SIGTERM_GRACE_S)
+                raise
+        returncode = proc.returncode if isinstance(proc.returncode, int) else 1
+        return returncode, stdout_bytes or b"", stderr_bytes or b""
+
+    def _gcal_finish(
+        self,
+        operation: str,
+        arguments: dict[str, Any],
+        payload: dict[str, Any],
+        calendar_id: str,
+    ) -> dict[str, Any]:
+        hint = payload.pop("_gcal_hint", None)
+        norm = _build_normalized_params_view(arguments)
+        _apply_error_and_empty_contract("research", "gcal", operation, payload, norm)
+        if isinstance(hint, str) and hint:
+            payload["hint"] = hint
+        declared = source_identity.declare(
+            "research",
+            {
+                "route": "gcal",
+                "operation": operation,
+                **{
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in {"timeout", "route", "operation"}
+                },
+            },
+            payload,
+        )
+        payload["_declared_sources"] = declared
+        payload["_sources"] = declared
+        redacted = _gcal_redact(payload, calendar_id)
+        return redacted if isinstance(redacted, dict) else payload
+
+    async def _gcal_invoke(
+        self,
+        argv: list[str],
+        timeout_s: float,
+        *,
+        allow_empty: bool,
+    ) -> tuple[Any, dict[str, Any] | None]:
+        returncode, stdout_bytes, stderr_bytes = await self._exec_gws(argv, timeout_s)
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        parsed = _gcal_parse_json(stdout)
+        failure = _gcal_transport_failure(
+            returncode, stdout, stderr, parsed, allow_empty=allow_empty
+        )
+        return parsed, failure
+
+    async def _gcal_list(
+        self,
+        bin_path: str,
+        calendar_id: str,
+        arguments: dict[str, Any],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        try:
+            start_dt, start_text = _gcal_parse_bound(arguments.get("time_min"))
+            end_dt, end_text = _gcal_parse_bound(arguments.get("time_max"))
+        except ValueError:
+            return _gcal_param_error(_GCAL_HINT_TIME)
+        if end_dt <= start_dt:
+            return _gcal_param_error(_GCAL_HINT_ORDER)
+        if end_dt - start_dt > _GCAL_MAX_WINDOW:
+            return _gcal_param_error(_GCAL_HINT_WINDOW)
+        query = arguments.get("query")
+        if query is not None and (not isinstance(query, str) or _GCAL_QUERY_RE.fullmatch(query) is None):
+            return _gcal_param_error(_GCAL_HINT_QUERY)
+        try:
+            limit = _gcal_limit(arguments.get("limit"))
+        except ValueError:
+            return _gcal_param_error(_GCAL_HINT_LIMIT)
+        params: dict[str, Any] = {
+            "calendarId": calendar_id,
+            "maxResults": limit,
+            "singleEvents": True,
+            "timeMax": end_text,
+            "timeMin": start_text,
+        }
+        if isinstance(query, str):
+            params["q"] = query
+        parsed, failure = await self._gcal_invoke(
+            [bin_path, "calendar", "events", "list", "--params", _gcal_json(params)],
+            timeout_s,
+            allow_empty=False,
+        )
+        if failure is not None:
+            return failure
+        items = _gcal_items(parsed)
+        if items is None:
+            return _gcal_failure("invalid_response", "invalid_response", _GCAL_HINT_RESPONSE, "上游不可用")
+        events = [
+            event
+            for item in items
+            if (event := _gcal_normalize_event(item)) is not None
+        ]
+        data: dict[str, Any] = {"events": events, "event_count": len(events)}
+        if isinstance(parsed, dict) and parsed.get("nextPageToken"):
+            data["truncated"] = True
+        return {"ok": True, "status": "ok", "data": data}
+
+    async def _gcal_insert(
+        self,
+        bin_path: str,
+        calendar_id: str,
+        arguments: dict[str, Any],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        summary = arguments.get("summary")
+        description = arguments.get("description")
+        if not isinstance(summary, str) or not summary.strip() or len(summary) > _GCAL_SUMMARY_MAX:
+            return _gcal_param_error(_GCAL_HINT_SUMMARY)
+        if _GCAL_TRACKER_SUMMARY_RE.match(summary.strip()) is None:
+            return _gcal_param_error(_GCAL_HINT_SUMMARY_FORMAT)
+        if not isinstance(description, str) or len(description) > _GCAL_DESCRIPTION_MAX:
+            return _gcal_param_error(_GCAL_HINT_DESCRIPTION)
+        try:
+            start = _gcal_when(arguments.get("start"))
+            end = _gcal_when(arguments.get("end"))
+            ordered = _gcal_when_before(start, end)
+        except ValueError:
+            return _gcal_param_error(_GCAL_HINT_SHAPE)
+        if not ordered:
+            return _gcal_param_error(_GCAL_HINT_WHEN_ORDER)
+        body = {
+            "description": _gcal_with_marker(description),
+            "end": end,
+            "start": start,
+            "summary": summary.strip(),
+        }
+        parsed, failure = await self._gcal_invoke(
+            [
+                bin_path,
+                "calendar",
+                "events",
+                "insert",
+                "--params",
+                _gcal_json({"calendarId": calendar_id}),
+                "--json",
+                _gcal_json(body),
+            ],
+            timeout_s,
+            allow_empty=False,
+        )
+        if failure is not None:
+            return failure
+        event = _gcal_normalize_event(parsed)
+        if event is None and isinstance(parsed, dict):
+            event = _gcal_normalize_event(parsed.get("event") or parsed.get("data"))
+        if event is None:
+            return _gcal_failure("invalid_response", "invalid_response", _GCAL_HINT_RESPONSE, "上游不可用")
+        if _GCAL_MARKER not in event["description"]:
+            event["description"] = _gcal_with_marker(event["description"])
+        return {"ok": True, "status": "ok", "data": event}
+
+    async def _gcal_delete(
+        self,
+        bin_path: str,
+        calendar_id: str,
+        arguments: dict[str, Any],
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        event_id = arguments.get("event_id")
+        if not isinstance(event_id, str) or _GCAL_EVENT_ID_RE.fullmatch(event_id) is None:
+            return _gcal_param_error(_GCAL_HINT_EVENT_ID)
+        # get 与 delete 之间没有条件删除；这份日历的写者只有主人与本路由。
+        parsed, failure = await self._gcal_invoke(
+            [
+                bin_path,
+                "calendar",
+                "events",
+                "get",
+                "--params",
+                _gcal_json({"calendarId": calendar_id, "eventId": event_id}),
+            ],
+            timeout_s,
+            allow_empty=False,
+        )
+        if failure is not None:
+            return failure
+        if not isinstance(parsed, dict) or not _gcal_is_tracker(parsed):
+            return _gcal_failure(
+                "refused_not_tracker_event",
+                "refused_not_tracker_event",
+                _GCAL_HINT_REFUSED,
+                "没有匹配",
+            )
+        _deleted, delete_failure = await self._gcal_invoke(
+            [
+                bin_path,
+                "calendar",
+                "events",
+                "delete",
+                "--params",
+                _gcal_json({"calendarId": calendar_id, "eventId": event_id}),
+            ],
+            timeout_s,
+            allow_empty=True,
+        )
+        if delete_failure is not None:
+            return delete_failure
+        return {"ok": True, "status": "ok", "data": {"deleted": True, "id": event_id}}
+
+    async def _gcal_run(
+        self,
+        arguments: dict[str, Any],
+        operation: str,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        extra = _gcal_reject_extras(operation, arguments)
+        if extra is not None:
+            return extra
+        missing = _gcal_missing(operation, arguments)
+        if missing is not None:
+            return _gcal_param_error(missing)
+        calendar_id = os.environ.get("DALTON_GCAL_CALENDAR_ID", "").strip()
+        if not calendar_id:
+            return _gcal_failure("source_missing", "source_missing", _GCAL_HINT_CALENDAR, "上游不可用")
+        bin_path = self.cfg.gws_bin
+        if not bin_path.is_file():
+            return _gcal_failure("source_missing", "source_missing", _GCAL_HINT_MISSING, "上游不可用")
+        if operation == "list_events":
+            return await self._gcal_list(str(bin_path), calendar_id, arguments, timeout_s)
+        if operation == "insert_event":
+            return await self._gcal_insert(str(bin_path), calendar_id, arguments, timeout_s)
+        return await self._gcal_delete(str(bin_path), calendar_id, arguments, timeout_s)
+
+    async def _handle_gcal_call(
+        self,
+        req_id: Any,
+        arguments: dict[str, Any],
+        eff_timeout: int,
+    ) -> dict[str, Any]:
+        operation = str(arguments.get("operation") or "list_events").strip() or "list_events"
+        try:
+            payload = await self._gcal_run(arguments, operation, float(eff_timeout))
+        except asyncio.TimeoutError:
+            payload = _gcal_failure("timeout", "timeout", _GCAL_HINT_TIMEOUT, "上游不可用")
+        except OSError:
+            payload = _gcal_failure("source_missing", "source_missing", _GCAL_HINT_MISSING, "上游不可用")
+        except Exception as exc:  # noqa: BLE001 - gcal failures stay on the tool envelope
+            payload = _gcal_failure(
+                "error",
+                "error",
+                "gws 调用失败。",
+                "上游不可用",
+                error=type(exc).__name__,
+            )
+        calendar_id = os.environ.get("DALTON_GCAL_CALENDAR_ID", "").strip()
+        finished = self._gcal_finish(operation, arguments, payload, calendar_id)
+        return self._make_tool_result_response(req_id, finished, is_error=finished.get("ok") is False)
+
     def _validate_and_build_community_cmd(
         self,
         route: str,
@@ -10239,6 +10920,8 @@ class ResearchDataBridge:
             )
         if tool_name == "research" and route == "tmeet":
             return await self._handle_tmeet_call(req_id, arguments, eff_timeout)
+        if tool_name == "research" and route == "gcal":
+            return await self._handle_gcal_call(req_id, arguments, eff_timeout)
         call_args = dict(arguments)
         if tool_name == "catalog":
             call_args.pop("route", None)
@@ -10795,6 +11478,8 @@ class ResearchDataBridge:
                             }
                             if "tmeet" not in research_ids:
                                 kept_routes.append(dict(TMEET_CATALOG_ENTRY))
+                            if "gcal" not in research_ids:
+                                kept_routes.append(dict(GCAL_CATALOG_ENTRY))
                         if include_community:
                             for comm_id in ("xueqiu", "employee", "last30days", "x-timeline"):
                                 if comm_id not in seen_comm and comm_id not in handoff:

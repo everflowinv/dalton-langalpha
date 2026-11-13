@@ -100,6 +100,11 @@ catalog_routes:
     title: X固定账号时间线
     rules: "tweets/tweet/thread/search,count≤100;与x_search按原帖URL去重"
     description: "固定账号建不漏底表；跨账号观点与媒体补充用x_search。"
+  gcal:
+    category: research
+    title: Richard 财报日历
+    rules: "不并入 all;日历 ID 不由调用方传入;删除前核对 tracker 标记;写操作不用于健康探测"
+    description: "只读写 Richard 财报跟踪日历上的 tracker 事件。日历 ID 来自宿主机配置。"
 
 direct_tools:
   conversation_search:
