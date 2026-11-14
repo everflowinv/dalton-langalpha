@@ -6466,3 +6466,392 @@ async def test_materialize_multi_target_sibling_deleted_during_later_transfer_ra
     assert len(notes) == 2
     assert rel_b_ok in notes[0]
     assert rel_a_ok in notes[1]
+
+
+@pytest.mark.asyncio
+async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_and_reject_invalid(
+    upload_env,
+) -> None:
+    """DALTON-HOOK(chat-large-upload): staged #782 attachment_id items resolve real sizes/owners,
+    share message count and byte budgets with chat_upload items, and steer cleanly."""
+    from src.server.database import chat_attachments as chat_attachments_db
+    from src.server.services import chat_attachment_turns as chat_attachment_turns
+    from src.server.services import chat_attachments as chat_attachments_svc
+
+    owner = "user-staged-att"
+    other = "user-other-att"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+    }
+
+    att_img_id = str(uuid.uuid4())
+    att_large_small_id = str(uuid.uuid4())
+    att_second_small_id = str(uuid.uuid4())
+    att_foreign_id = str(uuid.uuid4())
+    att_expired_id = str(uuid.uuid4())
+    att_uploading_id = str(uuid.uuid4())
+    att_missing_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    img_bytes = b"\x89PNG\r\n\x1a\n" + b"pixel-" * 16
+
+    staged_rows: dict[str, dict[str, Any]] = {
+        att_img_id: {
+            "attachment_id": att_img_id,
+            "user_id": owner,
+            "name": "chart_note.png",
+            "mime_type": "image/png",
+            "size": len(img_bytes),
+            "mode": "relay",
+            "object_key": None,
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": True,
+            "state": "ready",
+            "error": None,
+            "expires_at": now - timedelta(minutes=5),
+            "lease_until": None,
+            "created_at": now - timedelta(minutes=20),
+            "updated_at": now - timedelta(minutes=19),
+            "ready_at": now - timedelta(minutes=19),
+            "sent_at": None,
+            "cleaned_at": None,
+        },
+        att_large_small_id: {
+            "attachment_id": att_large_small_id,
+            "user_id": owner,
+            "name": "model_a.pdf",
+            "mime_type": "application/pdf",
+            "size": 50 * 1024 * 1024,
+            "mode": "relay",
+            "object_key": f"attachments/{att_large_small_id}/model_a.pdf",
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": False,
+            "state": "ready",
+            "error": None,
+            "expires_at": now + timedelta(hours=1),
+            "lease_until": None,
+            "created_at": now - timedelta(minutes=5),
+            "updated_at": now - timedelta(minutes=4),
+            "ready_at": now - timedelta(minutes=4),
+            "sent_at": None,
+            "cleaned_at": None,
+        },
+        att_second_small_id: {
+            "attachment_id": att_second_small_id,
+            "user_id": owner,
+            "name": "model_b.pdf",
+            "mime_type": "application/pdf",
+            "size": 20 * 1024 * 1024,
+            "mode": "relay",
+            "object_key": f"attachments/{att_second_small_id}/model_b.pdf",
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": False,
+            "state": "ready",
+            "error": None,
+            "expires_at": now + timedelta(hours=1),
+            "lease_until": None,
+            "created_at": now - timedelta(minutes=5),
+            "updated_at": now - timedelta(minutes=4),
+            "ready_at": now - timedelta(minutes=4),
+            "sent_at": None,
+            "cleaned_at": None,
+        },
+        att_foreign_id: {
+            "attachment_id": att_foreign_id,
+            "user_id": other,
+            "name": "secret.pdf",
+            "mime_type": "application/pdf",
+            "size": 1024,
+            "mode": "relay",
+            "object_key": None,
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": True,
+            "state": "ready",
+            "error": None,
+            "expires_at": now + timedelta(hours=1),
+            "lease_until": None,
+            "created_at": now,
+            "updated_at": now,
+            "ready_at": now,
+            "sent_at": None,
+            "cleaned_at": None,
+        },
+        att_expired_id: {
+            "attachment_id": att_expired_id,
+            "user_id": owner,
+            "name": "stale.pdf",
+            "mime_type": "application/pdf",
+            "size": 1024,
+            "mode": "relay",
+            "object_key": None,
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": True,
+            "state": "ready",
+            "error": None,
+            "expires_at": now - timedelta(hours=25),
+            "lease_until": None,
+            "created_at": now - timedelta(hours=26),
+            "updated_at": now - timedelta(hours=25),
+            "ready_at": now - timedelta(hours=25),
+            "sent_at": None,
+            "cleaned_at": None,
+        },
+        att_uploading_id: {
+            "attachment_id": att_uploading_id,
+            "user_id": owner,
+            "name": "pending.pdf",
+            "mime_type": "application/pdf",
+            "size": 1024,
+            "mode": "relay",
+            "object_key": None,
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": False,
+            "state": "uploading",
+            "error": None,
+            "expires_at": now + timedelta(minutes=10),
+            "lease_until": None,
+            "created_at": now,
+            "updated_at": now,
+            "ready_at": None,
+            "sent_at": None,
+            "cleaned_at": None,
+        },
+    }
+
+    async def _get_attachment(attachment_id: str):
+        row = staged_rows.get(attachment_id)
+        return dict(row) if row is not None else None
+
+    async def _find_for_turn(attachment_ids: list[str], uid: str):
+        return [
+            dict(staged_rows[aid])
+            for aid in attachment_ids
+            if aid in staged_rows
+            and staged_rows[aid]["user_id"] == uid
+            and staged_rows[aid]["state"] == "ready"
+        ]
+
+    async def _get_content(attachment_id: str) -> bytes | None:
+        if attachment_id == att_img_id:
+            return img_bytes
+        return None
+
+    async def _make_ready_chat_upload(name: str, reported_size_bytes: int) -> str:
+        payload = b"x" * 64
+        created = await svc.initiate_chat_upload(
+            user_id=owner,
+            workspace_id=ws_id,
+            filename=name,
+            size_bytes=len(payload),
+            mime_type="application/octet-stream",
+        )
+        uid = created["upload_id"]
+        await svc.receive_chat_upload_part(
+            upload_id=uid,
+            part_number=1,
+            user_id=owner,
+            stream=_bytes_stream(payload),
+        )
+        await svc.complete_chat_upload(upload_id=uid, user_id=owner)
+        upload_env["ledger"].rows[uid]["size_bytes"] = reported_size_bytes
+        return uid
+
+    uid_large_a = await _make_ready_chat_upload("big_a.parquet", 190 * 1024 * 1024)
+    uid_large_b = await _make_ready_chat_upload("big_b.parquet", 190 * 1024 * 1024)
+    uid_large_c = await _make_ready_chat_upload("big_c.parquet", 190 * 1024 * 1024)
+
+    with (
+        patch.object(
+            chat_attachments_db,
+            "get_attachment",
+            create_autospec(chat_attachments_db.get_attachment, side_effect=_get_attachment),
+        ),
+        patch.object(
+            chat_attachments_db,
+            "get_content",
+            create_autospec(chat_attachments_db.get_content, side_effect=_get_content),
+        ),
+        patch.object(
+            chat_attachments_db,
+            "find_for_turn",
+            create_autospec(chat_attachments_db.find_for_turn, side_effect=_find_for_turn),
+        ),
+    ):
+        # 1. Staged normal attachment only -> passes Dalton pre-stream validation & resolves for turn
+        staged_only = [
+            MultimodalContext(
+                type="image",
+                attachment_id=uuid.UUID(att_img_id),
+                description="chart_note.png",
+            )
+        ]
+        claimed_only = await svc.validate_and_claim_request_attachments(
+            staged_only,
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key="req:staged-only",
+        )
+        assert claimed_only == []
+        resolved = await chat_attachment_turns.resolve_turn_attachments(staged_only, owner)
+        assert [a.name for a in resolved.files] == ["chart_note.png"]
+        assert resolved.missing == []
+
+        # 2. Mixed staged normal attachment + Dalton chunked upload -> passes, preserves order,
+        # and enforces combined count (5) and size budgets (60 MiB small, 600 MiB total).
+        mixed_ok = [
+            MultimodalContext(
+                type="pdf",
+                attachment_id=uuid.UUID(att_large_small_id),
+                description="model_a.pdf",
+            ),
+            ChatUploadContext(
+                upload_id=uid_large_a,
+                name="big_a.parquet",
+                mime_type="application/octet-stream",
+                size=190 * 1024 * 1024,
+            ),
+        ]
+        claimed_mixed = await svc.validate_and_claim_request_attachments(
+            mixed_ok,
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key="req:mixed-ok",
+        )
+        assert [r["upload_id"] for r in claimed_mixed] == [uid_large_a]
+        ordered_meta = await svc.build_ordered_turn_attachment_metadata(
+            mixed_ok,
+            inline_metadata=[{"type": "pdf", "name": "model_a.pdf", "size": 50 * 1024 * 1024}],
+            user_id=owner,
+            workspace_id=ws_id,
+        )
+        assert [m["name"] for m in ordered_meta] == ["model_a.pdf", "big_a.parquet"]
+        await svc.release_request_chat_uploads(
+            user_id=owner, claim_key="req:mixed-ok", additional_context=mixed_ok
+        )
+
+        # Exceeds MAX_TOTAL_ATTACHMENTS_BYTES (60 MiB): 50 MiB + 20 MiB = 70 MiB -> 413
+        with pytest.raises(HTTPException) as small_cap_exc:
+            await svc.validate_and_claim_request_attachments(
+                [
+                    MultimodalContext(type="pdf", attachment_id=uuid.UUID(att_large_small_id)),
+                    MultimodalContext(type="pdf", attachment_id=uuid.UUID(att_second_small_id)),
+                ],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:small-cap",
+            )
+        assert small_cap_exc.value.status_code == 413
+
+        # Exceeds MAX_TOTAL_CHAT_UPLOAD_BYTES (600 MiB): 50 MiB staged + 3*190 MiB chunked = 620 MiB -> 413
+        with pytest.raises(HTTPException) as total_cap_exc:
+            await svc.validate_and_claim_request_attachments(
+                [
+                    MultimodalContext(type="pdf", attachment_id=uuid.UUID(att_large_small_id)),
+                    ChatUploadContext(upload_id=uid_large_a, name="big_a.parquet", size=190 * 1024 * 1024),
+                    ChatUploadContext(upload_id=uid_large_b, name="big_b.parquet", size=190 * 1024 * 1024),
+                    ChatUploadContext(upload_id=uid_large_c, name="big_c.parquet", size=190 * 1024 * 1024),
+                ],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:total-cap",
+            )
+        assert total_cap_exc.value.status_code == 413
+
+        # Exceeds MAX_MESSAGE_ATTACHMENTS (5): 3 staged + 3 chunked = 6 -> 400
+        with pytest.raises(HTTPException) as count_cap_exc:
+            await svc.validate_and_claim_request_attachments(
+                [
+                    MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)),
+                    MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)),
+                    MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)),
+                    ChatUploadContext(upload_id=uid_large_a, name="big_a.parquet", size=64),
+                    ChatUploadContext(upload_id=uid_large_b, name="big_b.parquet", size=64),
+                    ChatUploadContext(upload_id=uid_large_c, name="big_c.parquet", size=64),
+                ],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:count-cap",
+            )
+        assert count_cap_exc.value.status_code == 400
+        assert "At most 5" in str(count_cap_exc.value.detail)
+
+        # 3. Missing, foreign-owned, expired, or still-uploading staged attachment -> upstream errors
+        for bad_id in (att_missing_id, att_foreign_id):
+            with pytest.raises(HTTPException) as not_found_exc:
+                await svc.validate_and_claim_request_attachments(
+                    [MultimodalContext(type="file", attachment_id=uuid.UUID(bad_id))],
+                    user_id=owner,
+                    workspace_id=ws_id,
+                    claim_key=f"req:bad-{bad_id}",
+                )
+            assert not_found_exc.value.status_code == 404
+            assert not_found_exc.value.detail == "Attachment not found"
+
+        with pytest.raises(HTTPException) as expired_exc:
+            await svc.validate_and_claim_request_attachments(
+                [MultimodalContext(type="pdf", attachment_id=uuid.UUID(att_expired_id))],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:expired",
+            )
+        assert expired_exc.value.status_code == 409
+        assert expired_exc.value.detail == chat_attachments_svc.ATTACHMENT_ENDED
+
+        with pytest.raises(HTTPException) as uploading_exc:
+            await svc.validate_and_claim_request_attachments(
+                [MultimodalContext(type="pdf", attachment_id=uuid.UUID(att_uploading_id))],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:uploading",
+            )
+        assert uploading_exc.value.status_code == 409
+        assert "still uploading" in str(uploading_exc.value.detail)
+
+        # 4. Legacy inline payload with empty data still fails with "Empty attachment is not allowed"
+        with pytest.raises(HTTPException) as empty_inline_exc:
+            await svc.validate_and_claim_request_attachments(
+                [{"type": "image", "data": "", "description": "empty.png"}],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:empty-inline",
+            )
+        assert empty_inline_exc.value.status_code == 400
+        assert empty_inline_exc.value.detail == "Empty attachment is not allowed"
+
+        # 5. Steer path handles staged attachment_id items without "Empty attachment" error
+        steer_descriptors, newly_staged = await svc.stage_request_attachments_for_steer(
+            [
+                MultimodalContext(
+                    type="image",
+                    attachment_id=uuid.UUID(att_img_id),
+                    description="chart_note.png",
+                ),
+                ChatUploadContext(
+                    upload_id=uid_large_a,
+                    name="big_a.parquet",
+                    mime_type="application/octet-stream",
+                    size=190 * 1024 * 1024,
+                ),
+            ],
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key="req:steer-staged",
+        )
+        assert len(steer_descriptors) == 2
+        assert len(newly_staged) == 1
+        assert [d["name"] for d in steer_descriptors] == ["chart_note.png", "big_a.parquet"]
+        assert [d["source_kind"] for d in steer_descriptors] == ["image", "chat_upload"]
