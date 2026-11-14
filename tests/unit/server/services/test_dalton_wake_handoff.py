@@ -99,16 +99,6 @@ async def _run_handed_off_execution(
         stack.enter_context(patch.object(executor_mod, "_turn_place", turn_place_mock))
         stack.enter_context(patch.object(executor_mod, "_keep_alive", keep_alive_mock))
         stack.enter_context(patch.object(executor_mod, "_thread_busy", create_autospec(executor_mod._thread_busy, return_value=False)))
-        fake_task = create_autospec(executor_mod.asyncio.Task, instance=True)
-        stack.enter_context(
-            patch(
-                f"{_EXEC_MOD}.asyncio.create_task",
-                create_autospec(
-                    executor_mod.asyncio.create_task,
-                    side_effect=lambda coro, **_kw: (coro.close(), fake_task)[1],
-                ),
-            )
-        )
         stack.enter_context(patch.object(AutomationExecutor, "_start_delivery", start_delivery_mock))
         stack.enter_context(patch.object(AutomationExecutor, "_run_turn", run_turn_mock))
 

@@ -4382,3 +4382,20 @@ async def test_decide_backfills_wake_context_for_early_return_wakes(
         assert kwargs["wake_context"] == "<dalton_wake>price</dalton_wake>"
     else:
         inserter.assert_not_awaited()
+
+
+def test_dalton_migration_graph_has_a_single_head() -> None:
+    """Dalton 迁移编号不按顺序接（d031→d035→d036→d032→d033），新迁移挂错父节点会形成两个末端，
+    部署入口的 `alembic upgrade head` 会失败。"""
+    import importlib
+    import pkgutil
+
+    import src.dalton.migrations.versions as versions_pkg
+
+    revisions: dict[str, Optional[str]] = {}
+    for info in pkgutil.iter_modules(versions_pkg.__path__):
+        mod = importlib.import_module(f"src.dalton.migrations.versions.{info.name}")
+        revisions[mod.revision] = mod.down_revision
+    parents = {down for down in revisions.values() if down}
+    heads = sorted(rev for rev in revisions if rev not in parents)
+    assert heads == ["d037"], heads
