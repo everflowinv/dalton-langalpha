@@ -1180,6 +1180,8 @@ _LONG_AGO = datetime(2026, 1, 1, tzinfo=timezone.utc)
 def pass_over(monkeypatch):
     """A running workspace holding the records a test names, each cut by a
     stub, and the release answering with what the test says it let go."""
+    # DALTON-HOOK(artifact-publishing-off): enable publishing for upstream keep_updated_after_turn tests
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
     found = SimpleNamespace(
         kept=AsyncMock(return_value=[]),
         listed=AsyncMock(return_value=frozenset({_LISTED})),

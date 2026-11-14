@@ -7,6 +7,7 @@ import Main, { LegacyConnectorsRedirect } from '../Main';
 // DALTON-HOOK(hide-trading): mock Main dependencies to test /orders route redirect
 vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => false }));
 vi.mock('@/hooks/useSyncUserLocale', () => ({ useSyncUserLocale: () => {} }));
+vi.mock('@/lib/preferencesChannel', () => ({ usePreferencesSync: () => {} }));
 vi.mock('@/components/NetworkBanner/NetworkBanner', () => ({ default: () => null }));
 vi.mock('@/components/ui/ContextOverflowPill', () => ({ ContextOverflowPill: () => null }));
 vi.mock('@/pages/Dashboard/DashboardRouter', () => ({

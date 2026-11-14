@@ -65,6 +65,9 @@ export interface Verbs extends Names {
    * its place, as from the sidebar.
    */
   archiveThread: (thread: ThreadRef) => void;
+  // DALTON-HOOK(colleague-dispatch): workspace-level thread-creation permission & loading state for Ask
+  canCreateThreadIn?: (workspaceId?: string) => boolean;
+  permissionsLoading?: boolean;
 }
 
 type Actions = [PaletteAction, ...PaletteAction[]];
@@ -292,7 +295,9 @@ export function tickerRow(symbol: string, name: string, meta: string | undefined
  */
 export function askRow(place: Place | null, text: string, v: Verbs): PaletteItem | null {
   const words = text.trim();
-  if (!words || (!place && !v.newWork.canStartThread)) return null;
+  // DALTON-HOOK(colleague-dispatch): hide Ask while identity/permissions load or on a read-only workspace place
+  if (!words || v.permissionsLoading || (!place && !v.newWork.canStartThread)) return null;
+  if (place?.kind === 'workspace' && v.canCreateThreadIn && !v.canCreateThreadIn(place.workspaceId)) return null;
   const row = (meta: string | undefined, action: PaletteAction): PaletteItem => ({
     id: 'ask',
     icon: Sparkles,

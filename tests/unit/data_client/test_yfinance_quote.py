@@ -105,12 +105,14 @@ def test_a_settled_prior_bar_is_kept_off_the_futures_venue():
     assert (snap["previous_close"], snap["change"]) == (101.0, 2.0)
 
 
+# DALTON-HOOK(yfinance-prev-close): when daily history is empty, validated_previous_close
+# returns None instead of falling back to unverified chartPreviousClose.
 def test_an_empty_daily_series_still_quotes_from_the_chart_close():
     snap = _snapshot(
         "AAPL", "America/New_York", {},
         {"regularMarketPrice": 50.0, "chartPreviousClose": 49.0, "regularMarketTime": _at("2026-11-04 10:00", "America/New_York")},
     )
-    assert (snap["price"], snap["previous_close"]) == (50.0, 49.0)
+    assert (snap["price"], snap["previous_close"]) == (50.0, None)
 
 
 def test_a_venue_without_a_calendar_reads_its_own_dates():

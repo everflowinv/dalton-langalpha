@@ -46,7 +46,10 @@ _ERROR_MAX = 2000
 
 
 def reports_enabled() -> bool:
-    return HOST_MODE != "oss" and bool(AUTH_SERVICE_URL)
+    # DALTON-HOOK(problem-reports-off): disable problem reporting endpoints & thumb-down auto-forward unless explicitly enabled.
+    from src.dalton.settings import is_problem_reports_enabled
+
+    return is_problem_reports_enabled() and HOST_MODE != "oss" and bool(AUTH_SERVICE_URL)
 
 
 @dataclass(frozen=True)

@@ -47,6 +47,8 @@ vi.mock('@/lib/quotes', async (importOriginal) => ({
 }));
 vi.mock('@/contexts/ThemeContext', () => ({ useTheme: () => ({ theme: 'light' }) }));
 vi.mock('@/hooks/useAppearance', () => ({ useAppearance: () => ({ pickTheme: vi.fn() }) }));
+// DALTON-HOOK(team-credentials): useLocalSources calls useDaltonSettingsVisibility -> useTeamCredentials -> useAuth.
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ userId: null, logout: vi.fn() }) }));
 vi.mock('@/components/nav/useNavItems', () => ({ useNavItems: () => [] }));
 vi.mock('@/pages/Settings/panels/usePreferenceWrite', () => ({ useSaveFailureToast: () => vi.fn() }));
 vi.mock('@/components/CreateWorkspaceHost', () => ({ useOpenCreateWorkspace: () => null }));
@@ -70,8 +72,9 @@ function renderShell(route = '/') {
   );
 }
 
+// DALTON-HOOK(global-search): CommandPalette opens on ⌘⇧K / Ctrl+Shift+K.
 const shortcut = () =>
-  fireEvent.keyDown(document.activeElement ?? window, { key: 'k', ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }) });
+  fireEvent.keyDown(document.activeElement ?? window, { key: 'k', shiftKey: true, ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }) });
 const field = () => screen.findByRole('combobox') as Promise<HTMLInputElement>;
 const option = (name: string | RegExp) => screen.getByRole('option', { name });
 const closed = () => waitFor(() => expect(screen.queryByRole('combobox')).not.toBeInTheDocument());

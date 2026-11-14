@@ -387,6 +387,8 @@ ALLOWED_HOOKS=(
   "subagent-cancel"
   # P7: hide harness thinking markers from assistant text before display and replay.
   "thinking-leak"
+  # S3 fix: default-off deployment switch for problem reporting & thumb-down forwarding.
+  "problem-reports-off"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

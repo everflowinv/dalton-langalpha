@@ -1,4 +1,5 @@
 import { Suspense, createContext, lazy, useCallback, useContext, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
+import { closeGlobalSearch, GLOBAL_SEARCH_OPEN_EVENT } from '@/components/dalton/globalSearchHost'; // DALTON-HOOK(global-search)
 import { clientOs, type ClientOs } from '@/lib/clientOs';
 import { focusWithoutRing } from '@/lib/inputModality';
 
@@ -52,7 +53,7 @@ function opensPalette(e: KeyboardEvent, os: ClientOs): boolean {
 }
 
 /**
- * The command palette's host: the global ⌘K shortcut, and the open state any
+ * The command palette's host: the global ⌘⇧K shortcut, and the open state any
  * surface (the sidebar's search row) can reach through `useCommandPalette`.
  * Mounted once inside the router, beside the app's shell.
  */
@@ -69,7 +70,7 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
     setUsed(false);
     setCommandPalette(() => lazyPalette());
   }, []);
-  // What is typed between ⌘K and the field taking focus: a reader types the
+  // DALTON-HOOK(global-search): What is typed between ⌘⇧K and the field taking focus: a reader types the
   // moment they press it, and the palette can take longer than a keystroke
   // to draw. Collected until focus is inside the palette, then handed to it.
   const [typed, setTyped] = useState('');
@@ -80,11 +81,11 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
   // Where focus was when the palette was asked to open, which it hands back
   // on close. Taken here, before the shortcut moves focus to the stand-in.
   const returnToRef = useRef<HTMLElement | null>(null);
-  // A stand-in field that holds focus from ⌘K until the palette's own takes
+  // A stand-in field that holds focus from ⌘⇧K until the palette's own takes
   // it. Swallowing keydowns keeps plain keys off the page, but an IME's text
   // arrives as a composition, not keys, and lands in whatever has focus: a
   // composer under the palette would take Chinese or Japanese typed straight
-  // after ⌘K. With focus here the composition happens in this field, and
+  // after ⌘⇧K. With focus here the composition happens in this field, and
   // each finished one joins what was typed. Redirecting focus beats trying
   // to cancel the composition elsewhere (compositionstart cannot be
   // cancelled, and beforeinput for it is not cancellable in every browser).
@@ -95,6 +96,8 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
     if (next && !isOpenRef.current && was instanceof HTMLElement && was !== standInRef.current && !was.closest('.command-palette')) {
       returnToRef.current = was === document.body ? null : was;
     }
+    // DALTON-HOOK(global-search): keep Global Search and Command Palette mutually exclusive.
+    if (next) closeGlobalSearch();
     isOpenRef.current = next;
     bufferingRef.current = next;
     if (next) setTyped('');
@@ -108,6 +111,17 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
   }, []);
   const open = useCallback(() => setOpen(true), [setOpen]);
   const close = useCallback(() => setOpen(false), [setOpen]);
+
+  // DALTON-HOOK(global-search): opening Global Search closes Command Palette without stealing focus back.
+  useEffect(() => {
+    const onGlobalSearchOpen = () => {
+      if (!isOpenRef.current) return;
+      returnToRef.current = null;
+      setOpen(false);
+    };
+    window.addEventListener(GLOBAL_SEARCH_OPEN_EVENT, onGlobalSearchOpen);
+    return () => window.removeEventListener(GLOBAL_SEARCH_OPEN_EVENT, onGlobalSearchOpen);
+  }, [setOpen]);
   const preload = useCallback(() => void loadPalette().catch(() => {}), []);
   const returnFocus = useCallback(() => returnToRef.current, []);
 
@@ -123,7 +137,7 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
     if (bufferingRef.current) setTyped((was) => was + text);
   }, []);
 
-  // Its code is fetched once the page is idle, so the first ⌘K opens at once
+  // Its code is fetched once the page is idle, so the first ⌘⇧K opens at once
   // and the keys typed straight after it land in the field. A failed fetch is
   // tried again by the first open.
   useEffect(() => {
@@ -178,7 +192,7 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
         if (e.key === 'Escape') close();
       }
     };
-    // Capture: a field that handles its own keys still lets ⌘K through.
+    // DALTON-HOOK(global-search): Capture: a field that handles its own keys still lets ⌘⇧K through.
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [close, setOpen]);

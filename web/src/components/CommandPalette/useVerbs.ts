@@ -3,16 +3,20 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useChatRoute } from '@/components/Sidebar/useChatRoute';
 import { toast } from '@/components/ui/use-toast';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
+import { useUser } from '@/hooks/useUser'; // DALTON-HOOK(colleague-dispatch)
+import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-dispatch)
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { copyText } from '@/lib/clipboard';
 import { isDesktopShell } from '@/lib/desktop';
 import { relativeTime } from '@/lib/format';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { useArchiveThreadConfirm } from '@/pages/ChatAgent/components/threadArchiveAction';
+import { useTeamWorkspaces } from '@/pages/ChatAgent/components/dalton/TeamSharing'; // DALTON-HOOK(colleague-dispatch)
 import { archiveThreadRow, pinThreadRow, renameThreadRow } from '@/pages/ChatAgent/hooks/threadRowMutations';
 import { useRemoveThread } from '@/pages/ChatAgent/hooks/useRemoveThread';
 import { buildMarketViewUrl } from '@/pages/MarketView/utils/marketRoute';
@@ -21,14 +25,70 @@ import {
   resolveNavWorkspacePermissions,
   useNavAccessContext,
 } from '@/pages/ChatAgent/components/NavigationRows';
+import type { Workspace } from '@/types/api';
 import { fileHref, type Names, type NewWork, type ThreadRef, type Verbs } from './rows';
+
+/**
+ * DALTON-HOOK(colleague-dispatch): Subscribe to user identity and team
+ * workspaces so palette permissions stay reactive instead of reading a stale cache snapshot.
+ */
+export function usePaletteAccess() {
+  const { user: currentUser, isLoading: userLoading } = useUser({ enabled: isDaltonAuth });
+  const {
+    data: teamData,
+    isPending: teamPending,
+    isLoading: teamLoading,
+    isFetching: teamFetching,
+  } = useTeamWorkspaces(isDaltonAuth);
+  const currentUserId = isDaltonAuth ? (currentUser?.user_id ?? null) : undefined;
+  const callerTier = isDaltonAuth ? (teamData?.caller_tier ?? null) : undefined;
+  const access = useNavAccessContext(currentUserId, callerTier);
+  const permissionsLoading =
+    isDaltonAuth &&
+    Boolean(
+      userLoading ||
+        teamPending ||
+        teamLoading ||
+        (!teamData && teamFetching),
+    );
+
+  const teamWorkspaceById = new Map<string, Workspace>();
+  // DALTON-HOOK(external-share-guard): do not surface colleague workspaces while loading or for external members.
+  if (!permissionsLoading && teamData?.caller_tier !== 'external') {
+    for (const member of teamData?.members ?? []) {
+      if (currentUser?.user_id && member.user_id === currentUser.user_id) continue;
+      for (const ws of member.workspaces) {
+        if (!teamWorkspaceById.has(ws.workspace_id)) {
+          teamWorkspaceById.set(ws.workspace_id, {
+            workspace_id: ws.workspace_id,
+            user_id: member.user_id,
+            name: ws.name,
+            description: ws.description ?? undefined,
+            status: (ws.status as Workspace['status']) ?? 'stopped',
+            is_home: Boolean(ws.is_home),
+            created_at: ws.created_at ?? '',
+            updated_at: ws.updated_at ?? '',
+            effective_web_access: ws.web_access ?? ws.access ?? 'ro',
+            colleague_dispatch_enabled: teamData?.colleague_dispatch_enabled,
+          } as unknown as Workspace);
+        }
+      }
+    }
+  }
+  return { access, permissionsLoading, teamWorkspaceById };
+}
 
 /** The user's workspaces by id, and Home as its own lookup knows it. */
 function useWorkspaces() {
   const { data, isPending: homePending } = useQuery(homeWorkspaceQuery(useQueryClient()));
   const { data: all } = useAllWorkspaces({ sortBy: 'activity', includeHome: true });
+  // DALTON-HOOK(colleague-dispatch): include shared colleague workspaces alongside the user's own
+  const { teamWorkspaceById } = usePaletteAccess();
   const workspaces = all?.workspaces ?? [];
-  return { workspaces, byId: new Map(workspaces.map((ws) => [ws.workspace_id, ws])), home: data, homePending };
+  const byId = new Map<string, Workspace>();
+  for (const [id, ws] of teamWorkspaceById) byId.set(id, ws);
+  for (const ws of workspaces) byId.set(ws.workspace_id, ws);
+  return { workspaces, byId, home: data, homePending };
 }
 
 /** How rows (and the preview) name workspaces, agents and times. */
@@ -58,12 +118,24 @@ export function usePlace(): NewWork {
   const label = useWorkspaceLabel();
   const { currentWorkspaceId, resolvingWorkspace } = useChatRoute();
   const { workspaces, byId, home, homePending } = useWorkspaces();
+  const { data: currentWsDetail, isPending: currentWsPending, isLoading: currentWsLoading } = useWorkspace(currentWorkspaceId);
   const workspaceId = currentWorkspaceId ?? home?.workspace_id ?? workspaces.find(isHomeWorkspace)?.workspace_id;
   // Outside a workspace on a cold load, Home may not be read yet either.
   const pending = resolvingWorkspace || (!workspaceId && homePending);
-  const workspace = workspaceId ? byId.get(workspaceId) : undefined;
-  // DALTON-HOOK(colleague-dispatch): a read-only colleague workspace cannot start a thread from the palette
-  const access = useNavAccessContext();
+  const cachedWs = workspaceId ? byId.get(workspaceId) : undefined;
+  const workspace =
+    workspaceId && workspaceId === currentWorkspaceId && currentWsDetail
+      ? ({ ...cachedWs, ...currentWsDetail } as Workspace)
+      : cachedWs;
+  // DALTON-HOOK(colleague-dispatch): wait for identity/team permissions and current workspace detail before enabling creation
+  const { access, permissionsLoading } = usePaletteAccess();
+  const detailPending = Boolean(
+    isDaltonAuth &&
+      currentWorkspaceId &&
+      !workspace &&
+      (currentWsPending || currentWsLoading),
+  );
+  const blockedByPermissions = permissionsLoading || detailPending;
   const placePerms = workspace ? resolveNavWorkspacePermissions(workspace, access) : null;
   return {
     workspaceId,
@@ -72,7 +144,9 @@ export function usePlace(): NewWork {
     // in whichever workspace was in view last, so rows that start one are
     // left out. (A thread whose lookup fails is left for the chat home,
     // where Home is the place.)
-    canStartThread: pending || (!!workspaceId && (placePerms ? placePerms.canCreateThread : true)),
+    canStartThread: blockedByPermissions
+      ? false
+      : pending || (!!workspaceId && (placePerms ? placePerms.canCreateThread : !isDaltonAuth)),
     where: pending
       ? undefined
       : (workspace ? isHomeWorkspace(workspace) : !currentWorkspaceId)
@@ -116,6 +190,9 @@ export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
   const label = useWorkspaceLabel();
   const { currentWorkspaceId, currentThreadId } = useChatRoute();
   const { byId } = useWorkspaces();
+  // DALTON-HOOK(colleague-dispatch): subscribe to identity/team permissions and live workspace access
+  const { data: currentWsDetail } = useWorkspace(currentWorkspaceId);
+  const { access, permissionsLoading } = usePaletteAccess();
   const names = useNames();
   const newWork = usePlace();
 
@@ -123,6 +200,20 @@ export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
     ...names,
     t,
     newWork,
+    // DALTON-HOOK(colleague-dispatch): expose reactive creation permission gate to Ask and target workspace rows
+    permissionsLoading,
+    canCreateThreadIn: (targetWorkspaceId) => {
+      if (permissionsLoading) return false;
+      const targetId = targetWorkspaceId ?? newWork.workspaceId;
+      if (!targetId) return newWork.canStartThread;
+      const cached = byId.get(targetId);
+      const ws =
+        targetId === currentWorkspaceId && currentWsDetail
+          ? ({ ...cached, ...currentWsDetail } as Workspace)
+          : cached;
+      if (!ws) return !isDaltonAuth;
+      return resolveNavWorkspacePermissions(ws, access).canCreateThread;
+    },
     // A thread opens in its workspace without looking it up, as a restored
     // session does; a match opens it at the turn (ChatView reads `focusTurn`).
     openThread: (threadId, workspaceId, also = {}) => navigate(`/chat/t/${threadId}`, { state: { workspaceId, ...also } }),

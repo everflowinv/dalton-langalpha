@@ -59,3 +59,68 @@ def test_a_capability_in_a_failed_turns_error_does_not_leave():
     assert "GRANT1" not in redact_capability_paths(text) and "SHARE9" not in redact_capability_paths(text)
     assert redact_capability_paths("/chat/t/abc/assets/s/x") == "/chat/t/abc/assets/s/x"
     assert redact_capability_paths("(see https://app.x/s/SHARE9)") == "(see https://app.x/s/[redacted])"
+
+
+@pytest.mark.asyncio
+async def test_problem_reports_default_off_even_with_platform_and_auth_url(monkeypatch):
+    """DALTON-HOOK(problem-reports-off): reports stay off by default unless DALTON_PROBLEM_REPORTS_ENABLED is set."""
+    from uuid import uuid4
+
+    from fastapi import BackgroundTasks, HTTPException
+
+    from src.dalton import settings as dalton_settings
+    from src.server.app import reports as reports_app
+    from src.server.models.report import ReportClient, ReportCreate, ReportError
+    from src.server.services import feedback as feedback_svc
+
+    monkeypatch.delenv("DALTON_PROBLEM_REPORTS_ENABLED", raising=False)
+    monkeypatch.setattr(reports, "HOST_MODE", "platform")
+    monkeypatch.setattr(reports, "AUTH_SERVICE_URL", "https://auth.example.test")
+    dalton_settings.get_dalton_config.cache_clear()
+
+    assert reports.reports_enabled() is False
+    cfg = await reports_app.get_reports_config("u1")
+    assert cfg.enabled is False
+
+    body = ReportCreate(
+        report_id=uuid4(),
+        event="error_report",
+        source="error_banner",
+        error=ReportError(type="internal_error", message="boom"),
+        client=ReportClient(surface="web"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await reports_app.create_report(body, "u1", BackgroundTasks())
+    assert exc.value.status_code == 404
+
+    with patch.object(feedback_svc, "get_feedback_for_turn", AsyncMock(return_value=None)), \
+         patch.object(
+             feedback_svc,
+             "upsert_feedback",
+             AsyncMock(
+                 return_value={
+                     "conversation_feedback_id": "fb-1",
+                     "rating": "thumbs_down",
+                     "report_id": None,
+                 }
+             ),
+         ), \
+         patch.object(feedback_svc, "_send_report", AsyncMock()) as mock_send, \
+         patch.object(feedback_svc, "_withdraw_report", AsyncMock()):
+        row, report_status = await feedback_svc.submit(
+            thread_id="t-1",
+            turn_index=0,
+            user_id="u1",
+            rating="thumbs_down",
+            issue_categories=["inaccurate"],
+            comment="bad",
+            consent_human_review=False,
+            client=None,
+        )
+    assert row["rating"] == "thumbs_down"
+    assert report_status is None
+    mock_send.assert_not_called()
+
+    monkeypatch.setenv("DALTON_PROBLEM_REPORTS_ENABLED", "1")
+    assert reports.reports_enabled() is True
+    assert (await reports_app.get_reports_config("u1")).enabled is True

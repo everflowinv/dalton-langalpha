@@ -241,6 +241,16 @@ class DaltonArtifactPublishingConfig(BaseModel):
     enabled: bool = False
 
 
+class DaltonProblemReportsConfig(BaseModel):
+    """Master flag for problem report submission & thumb-down forwarding.
+
+    Off (the default): ``/api/v1/reports/config`` answers ``enabled=false``,
+    ``POST /api/v1/reports`` answers 404, and thumb-down feedback stays local.
+    """
+
+    enabled: bool = False
+
+
 class DaltonCoverageUnitsConfig(BaseModel):
     """Coverage-unit identity registry switch (`dalton_coverage_units`, d023, sector layer P0).
 
@@ -403,6 +413,9 @@ class DaltonConfig(BaseModel):
     artifact_publishing: DaltonArtifactPublishingConfig = Field(
         default_factory=DaltonArtifactPublishingConfig
     )
+    problem_reports: DaltonProblemReportsConfig = Field(
+        default_factory=DaltonProblemReportsConfig
+    )
     coverage_units: DaltonCoverageUnitsConfig = Field(
         default_factory=DaltonCoverageUnitsConfig
     )
@@ -504,6 +517,14 @@ def is_artifact_publishing_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().artifact_publishing.enabled
+
+
+def is_problem_reports_enabled() -> bool:
+    """Whether problem report submission and thumb-down forwarding are enabled (default False)."""
+    env_flag = os.getenv("DALTON_PROBLEM_REPORTS_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes")
+    return get_dalton_config().problem_reports.enabled
 
 
 def is_coverage_units_enabled() -> bool:

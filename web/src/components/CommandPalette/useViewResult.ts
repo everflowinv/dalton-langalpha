@@ -7,14 +7,12 @@ import { readMarkedTicker, readTypedTicker } from '@/lib/marketUtils';
 import { queryKeys } from '@/lib/queryKeys';
 import { queryWords } from '@/lib/textMatch';
 // DALTON-HOOK(colleague-dispatch): palette recent threads follow the sidebar's open and isolation rules
-import {
-  resolveNavThreadPermissions,
-  useNavAccessContext,
-} from '@/pages/ChatAgent/components/NavigationRows';
+import { resolveNavThreadPermissions } from '@/pages/ChatAgent/components/NavigationRows';
 import { getRecentThreads } from '@/pages/ChatAgent/utils/api';
 import { workspaceThreadsQuery } from '@/pages/ChatAgent/utils/threadQueries';
-import type { Thread } from '@/types/api';
+import type { Thread, Workspace } from '@/types/api';
 import { askRow, fileRow, threadOfHit, threadOfList, threadRow, tickerRow, turnRow, type Verbs } from './rows';
+import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
 import { searchWithin } from './scope';
 import { arrangeSearch, findItems, mergeThreads, serverGroup, type Hit } from './search';
 import type { LocalSources } from './useLocalSources';
@@ -141,16 +139,22 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
   const filePages = useSearchPages(text, 'files', view === 'files', within);
 
   // DALTON-HOOK(colleague-dispatch): recent threads follow the sidebar's open and isolation rules
-  // DALTON-HOOK(external-share-guard): isolated external threads stay out of recent
-  const access = useNavAccessContext();
+  // DALTON-HOOK(external-share-guard): isolated external threads stay out of recent and stay hidden while loading
+  const { access, permissionsLoading, teamWorkspaceById } = usePaletteAccess();
   const { data: workspacesData } = useAllWorkspaces({ sortBy: 'activity', includeHome: true });
-  const workspaceById = new Map((workspacesData?.workspaces ?? []).map((ws) => [ws.workspace_id, ws]));
+  const workspaceById = new Map<string, Workspace>();
+  for (const [id, ws] of teamWorkspaceById) workspaceById.set(id, ws);
+  for (const ws of workspacesData?.workspaces ?? []) workspaceById.set(ws.workspace_id, ws);
   const threadShown = (thread: Thread) => {
+    const ws = workspaceById.get(thread.workspace_id);
     const perms = resolveNavThreadPermissions(
       { ...thread, title: thread.title ?? undefined },
-      workspaceById.get(thread.workspace_id),
+      ws,
       access,
     );
+    if (permissionsLoading && (perms.isColleagueWorkspace || perms.isForeignThread || !access.currentUserId || !ws)) {
+      return false;
+    }
     return perms.canCopyOrOpen && !perms.isIsolatedExternal;
   };
   const visibleRecentThreads = recent.threads.filter(threadShown);
@@ -182,6 +186,7 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
         if (!searching) {
           // Recent places, newest first: threads and the charts opened lately.
           const mixed = [
+            // DALTON-HOOK(colleague-dispatch): keep timestamps aligned with filtered visibleRecentThreads
             ...recentRows.slice(0, 5).map((item, i) => ({ item, at: Date.parse(visibleRecentThreads[i].updated_at ?? '') || 0 })),
             ...recentTickers(RECENT_TICKERS.main).map(({ row, item }) => ({ item, at: row.at })),
           ].sort((a, b) => b.at - a.at);

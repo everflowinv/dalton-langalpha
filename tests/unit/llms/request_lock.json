@@ -104,7 +104,7 @@
    "pricing_model_id": "claude-fable-5-2",
    "pricing_provider": "anthropic",
    "provider_route": "anthropic",
-   "reasoning_effort": "medium"
+   "reasoning_effort": "high"
   },
   "request": {
    "body": {
@@ -117,7 +117,7 @@
     ],
     "model": "claude-fable-5-2",
     "output_config": {
-     "effort": "medium"
+     "effort": "high"
     },
     "stream": true,
     "system": "You are a lock probe.",
@@ -372,7 +372,7 @@
    "pricing_model_id": "claude-fable-5-2",
    "pricing_provider": "claude-oauth",
    "provider_route": "claude-oauth",
-   "reasoning_effort": "medium"
+   "reasoning_effort": "high"
   },
   "request": {
    "body": {
@@ -385,7 +385,7 @@
     ],
     "model": "claude-fable-5-2",
     "output_config": {
-     "effort": "medium"
+     "effort": "high"
     },
     "stream": true,
     "system": [

@@ -358,16 +358,19 @@ async def test_off_legacy_first_read_still_cuts_v1(
     from src.server.services.artifacts import snapshot
 
     artifact = _artifact()
-    cut = create_autospec(
-        snapshot._cut,
+    legacy_version = create_autospec(
+        snapshot.artifacts_db.legacy_version,
         return_value=SimpleNamespace(
-            artifact=dataclasses.replace(artifact, latest_seq=1)
+            cut=True,
+            artifact=dataclasses.replace(artifact, latest_seq=1),
         ),
     )
     captured = SimpleNamespace(
         entries=[SimpleNamespace(size=10, as_dict=lambda: {"path": "report.html"})],
         total=10,
         files=[SimpleNamespace(path="report.html")],
+        blobs={},
+        title=None,
     )
     with (
         patch.object(
@@ -383,12 +386,13 @@ async def test_off_legacy_first_read_still_cuts_v1(
             ),
         ),
         patch.object(snapshot, "_capture", create_autospec(snapshot._capture, return_value=captured)),
-        patch.object(snapshot, "_cut", cut),
+        patch.object(snapshot, "_store_blobs", create_autospec(snapshot._store_blobs)),
+        patch.object(snapshot.artifacts_db, "legacy_version", legacy_version),
+        patch.object(snapshot, "_announce", create_autospec(snapshot._announce)),
     ):
         result = await snapshot.legacy_snapshot(artifact)
     assert result.latest_seq == 1
-    cut.assert_awaited_once()
-    assert cut.await_args.kwargs.get("origin") == "legacy"
+    legacy_version.assert_awaited_once()
 
 
 # --- switch off: an old link still unshares ---------------------------------
@@ -629,6 +633,8 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
         filesystem=FilesystemConfig(),
     )
     # DALTON-HOOK(artifact-publishing-off): upstream #741/#746/#749 gates Claude Code on claude_code_admitted and passes (sandbox, admitted).
+    from ptc_agent.agent.claude_code.launcher import LocalLauncher
+
     config.claude_code_admitted = Admitted()
     target = create_llm("claude-haiku-5-5-code")
     with patch.object(AgentConfig, "get_llm_client", return_value=target):
@@ -638,7 +644,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             user_id="u-1",
             mcp_registry=MagicMock(),
             sandbox=MagicMock(),
-            claude_code_launcher=lambda sandbox, admitted: MagicMock(),
+            claude_code_launcher=lambda sandbox, admitted: LocalLauncher(),
         )
     # Upstream #729: a Claude Code graph's turn is the run named by config.
     # The tool list lives on the ClaudeTurn that call returns.

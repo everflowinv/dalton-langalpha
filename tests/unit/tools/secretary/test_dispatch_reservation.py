@@ -149,6 +149,77 @@ async def test_a_server_failure_with_words_still_reads_as_a_failed_dispatch(cach
     assert _reservation(cache) is None
 
 
+# DALTON-HOOK(colleague-dispatch): verify colleague error codes, error fallback, and string passthrough
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected_sub"),
+    [
+        (
+            403,
+            {"detail": {"code": "colleague_access_revoked", "message": "Colleague access revoked"}},
+            "colleague_access_revoked: Colleague access revoked",
+        ),
+        (
+            403,
+            {"error": {"code": "colleague_access_revoked", "message": "Access removed"}},
+            "colleague_access_revoked: Access removed",
+        ),
+        (
+            400,
+            {"detail": "Quota exceeded for workspace"},
+            "Quota exceeded for workspace",
+        ),
+    ],
+    ids=["code-and-message", "top-level-error-fallback", "string-detail-passthrough"],
+)
+async def test_colleague_dispatch_preserves_error_code_and_fallbacks(
+    cache, monkeypatch, status, body, expected_sub
+):
+    """Colleague dispatches preserve structured error codes (e.g. colleague_access_revoked),
+    top-level ``error`` fallback, and string ``detail``."""
+    monkeypatch.setattr("src.dalton.settings.is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr("src.dalton.settings.is_colleague_dispatch_enabled", lambda: True)
+    colleague_ws = {
+        "user_id": "owner-colleague",
+        "workspace_id": WORKSPACE_ID,
+        "name": "Colleague WS",
+        "_caller_cos_access": "rw",
+    }
+    monkeypatch.setattr(
+        "src.dalton.sharing.require_workspace_access", AsyncMock(return_value=colleague_ws)
+    )
+    monkeypatch.setattr(
+        "src.dalton.sharing.build_dispatched_by_meta",
+        AsyncMock(return_value={"user_id": USER_ID, "channel": "cos"}),
+    )
+    monkeypatch.setattr(
+        "src.server.database.conversation.create_thread", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        "src.server.database.conversation.delete_thread",
+        AsyncMock(return_value=True),
+    )
+    with patch(
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(
+            return_value={
+                "user_id": "owner-colleague",
+                "workspace_id": WORKSPACE_ID,
+                "name": "Colleague WS",
+            }
+        ),
+    ), patch(
+        "src.tools.secretary.dispatch.hitl_confirm", return_value=(True, {})
+    ), patch(
+        "aiohttp.ClientSession", return_value=FakeSession(FakeResp(status=status, body=body))
+    ):
+        result = await delegate_to_analyst.ainvoke(_new_thread(), config=_config())
+
+    payload = _payload(result)
+    assert payload["success"] is False
+    assert expected_sub in payload["error"]
+
+
 @pytest.mark.asyncio
 async def test_dispatch_error_status_rolls_back_the_reservation(cache):
     """A >=400 dispatch response (e.g. the credit gate) proves the run never

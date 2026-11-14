@@ -27,14 +27,14 @@ const SERVER_LEAD_WAIT_MS = 2000;
 interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
-  /** What was typed after ⌘K before the field had focus. */
+  /** DALTON-HOOK(global-search): What was typed after ⌘⇧K before the field had focus. */
   typed: string;
   /** Where focus was when the palette was asked to open, to hand it back on close. */
   returnFocus: () => HTMLElement | null;
 }
 
 /**
- * The ⌘K command palette: one field that finds threads, what was said in
+ * DALTON-HOOK(global-search): The ⌘⇧K command palette: one field that finds threads, what was said in
  * them, files, tickers, workspaces, skills, pages, settings and actions, and
  * hands what was typed to the agent. A prefix typed first narrows it to one
  * kind (`$ / # " @ >`), and Tab on a workspace or thread to that place.
@@ -55,7 +55,7 @@ export default function CommandPalette({ open, onClose, typed, returnFocus }: Co
           className="command-palette"
           onOpenAutoFocus={(e) => {
             returnRef.current = returnFocus();
-            // ⌘K opens a place to type, not a walk through the page with the
+            // DALTON-HOOK(global-search): ⌘⇧K opens a place to type, not a walk through the page with the
             // keyboard, so the field takes focus as a clicked one would: no ring.
             e.preventDefault();
             focusWithoutRing((e.currentTarget as HTMLElement | null)?.querySelector('input'));

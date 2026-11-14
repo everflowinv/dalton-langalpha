@@ -90,17 +90,24 @@ async def test_a_colleague_turn_cuts_the_owners_link_as_the_owner(
     capture = create_autospec(
         snapshot._capture, return_value=_captured(*artifact.files)
     )
-    cut = create_autospec(snapshot._cut)
+    store_blobs = create_autospec(snapshot._store_blobs)
+    turn_version = create_autospec(
+        snapshot.artifacts_db.turn_version,
+        return_value=SimpleNamespace(cut=True, artifact=artifact),
+    )
     monkeypatch.setattr(snapshot, "_capture", capture)
-    monkeypatch.setattr(snapshot, "_cut", cut)
+    monkeypatch.setattr(snapshot, "_store_blobs", store_blobs)
+    monkeypatch.setattr(snapshot.artifacts_db, "turn_version", turn_version)
+    monkeypatch.setattr(snapshot, "_announce", create_autospec(snapshot._announce))
 
     await snapshot.keep_updated_after_turn(workspace_id="ws-1", user_id=_SENDER)
 
     capture.assert_awaited_once()
     assert capture.await_args.kwargs["user_id"] == _OWNER
-    cut.assert_awaited_once()
-    assert cut.await_args.kwargs["user_id"] == _OWNER
-    assert cut.await_args.kwargs["origin"] == "keep_updated"
+    store_blobs.assert_awaited_once()
+    assert store_blobs.await_args.args[0] == _OWNER
+    turn_version.assert_awaited_once()
+    assert turn_version.await_args.kwargs["user_id"] == _OWNER
 
 
 @pytest.mark.asyncio

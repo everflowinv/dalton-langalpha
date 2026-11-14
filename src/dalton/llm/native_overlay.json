@@ -893,89 +893,17 @@
           "parameters.thinking.type": "enabled"
         }
       }
-    },
+    }
+  },
+  "model_overrides": {
     "claude-fable-5-2": {
-      "prompt_guidance": "lean",
-      "model_id": "claude-fable-5-2",
-      "provider": "anthropic",
-      "display_name": "Claude Fable 5.2",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 5,
-      "context": 1000000,
-      "compaction_profile": "expansive",
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf"
-      ],
-      "parameters": {
-        "max_tokens": 128000,
-        "thinking": {
-          "type": "adaptive",
-          "display": "summarized",
-          "block_binding": {
-            "prefix_mismatch_behavior": "drop_block"
-          }
-        }
-      },
-      "additional_betas": [
-        "thinking-binding-controls-2026-08-01",
-        "mid-conversation-system-clear-at-2026-08-21",
-        "compact-2026-09-04"
-      ],
       "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default": "high",
-        "write": "parameters.output_config.effort"
+        "default": "high"
       }
     },
     "claude-fable-5-2-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "claude-fable-5-2",
-      "provider": "claude-oauth",
-      "display_name": "Claude Fable 5.2",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 5,
-      "context": 1000000,
-      "compaction_profile": "expansive",
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf"
-      ],
-      "parameters": {
-        "max_tokens": 128000,
-        "thinking": {
-          "type": "adaptive",
-          "display": "summarized",
-          "block_binding": {
-            "prefix_mismatch_behavior": "drop_block"
-          }
-        }
-      },
-      "additional_betas": [
-        "thinking-binding-controls-2026-08-01",
-        "mid-conversation-system-clear-at-2026-08-21",
-        "compact-2026-09-04"
-      ],
       "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default": "high",
-        "write": "parameters.output_config.effort"
+        "default": "high"
       }
     }
   },
@@ -1092,25 +1020,15 @@
           "context_window": 131072,
           "max_output": 32768
         }
-      ],
-      "anthropic": [
-        {
-          "id": "claude-fable-5-2",
-          "name": "Claude Fable 5.2",
-          "is_reasoning": true,
-          "description": "Claude Fable 5.2 model",
-          "pricing": {
-            "input": 8.0,
-            "cached_input": 0.2,
-            "cache_5m": 10.0,
-            "cache_1h": 16.0,
-            "output": 40.0,
-            "unit": "per_1m_tokens"
-          },
+      ]
+    },
+    "model_overrides": {
+      "anthropic": {
+        "claude-fable-5-2": {
           "context_window": 1000000,
           "max_output": 128000
         }
-      ]
+      }
     }
   },
   "dalton_meta": {

@@ -378,16 +378,22 @@ async def dispatch(
             return "dispatch_failed"
         if not isinstance(err_body, dict):
             return "dispatch_failed"
+        # DALTON-HOOK(colleague-dispatch): restore S2 top-level `error` fallback and preserve
+        # oauth_required / colleague error codes alongside message; upstream refusals
+        # (e.g. claude_code_off) surface only `message` via _REFUSED.
         detail = err_body.get("detail")
+        if detail is None:
+            detail = err_body.get("error")
         if isinstance(detail, dict):
             err_code = detail.get("type") or detail.get("code")
             err_msg = detail.get("message") or detail.get("detail")
-            # DALTON-HOOK(colleague-dispatch): preserve oauth_required (and colleague error codes) alongside message;
-            # upstream refusals (e.g. claude_code_off) surface only `message` via _REFUSED.
-            if err_code == "oauth_required" and err_msg:
-                return f"{err_code}: {err_msg}"
             if isinstance(err_msg, str) and err_msg.strip():
-                return err_msg.strip()
+                msg = err_msg.strip()
+                if err_code in ("oauth_required", "colleague_access_revoked") or (
+                    is_colleague_ws and err_code
+                ):
+                    return f"{err_code}: {msg}"
+                return msg
             if is_colleague_ws and err_code:
                 return str(err_code)
             return "dispatch_failed"

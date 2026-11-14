@@ -4648,7 +4648,7 @@ async def test_target_lock_inode_stability_and_multiprocess_flock_coordination(
     src_dir = os.path.join(repo_root, "src")
     subproc_env_base = {
         **os.environ,
-        "PYTHONPATH": f"{src_dir}:{repo_root}",
+        "PYTHONPATH": f"{src_dir}:{repo_root}:{os.path.join(repo_root, 'libs', 'chartkit')}:{os.path.join(repo_root, 'libs', 'market-protocol')}",
     }
 
     direct_worker_code = (
@@ -5026,7 +5026,7 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
         shell=True,
         env={
             **os.environ,
-            "PYTHONPATH": f"{src_dir}:{repo_root}",
+            "PYTHONPATH": f"{src_dir}:{repo_root}:{os.path.join(repo_root, 'libs', 'chartkit')}:{os.path.join(repo_root, 'libs', 'market-protocol')}",
             "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN": f"{restore_ready}:{restore_resume}",
         },
         stdout=subprocess.PIPE,
@@ -5310,7 +5310,7 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
             str(b1_out),
             payload.hex(),
         ],
-        env={**os.environ, "PYTHONPATH": f"{src_dir}:{repo_root}"},
+        env={**os.environ, "PYTHONPATH": f"{src_dir}:{repo_root}:{os.path.join(repo_root, 'libs', 'chartkit')}:{os.path.join(repo_root, 'libs', 'market-protocol')}"},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -5328,7 +5328,7 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
             str(b2_out),
             payload.hex(),
         ],
-        env={**os.environ, "PYTHONPATH": f"{src_dir}:{repo_root}"},
+        env={**os.environ, "PYTHONPATH": f"{src_dir}:{repo_root}:{os.path.join(repo_root, 'libs', 'chartkit')}:{os.path.join(repo_root, 'libs', 'market-protocol')}"},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -5545,7 +5545,7 @@ async def test_materialize_chat_uploads_direct_and_chunked_revoked_after_bytes_r
                         out_file,
                         env={
                             **os.environ,
-                            "PYTHONPATH": f"{src_dir}:{repo_root}",
+                            "PYTHONPATH": f"{src_dir}:{repo_root}:{os.path.join(repo_root, 'libs', 'chartkit')}:{os.path.join(repo_root, 'libs', 'market-protocol')}",
                             "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN": f"{_ready_flag}:{_resume_flag}",
                         },
                         stdout=asyncio.subprocess.PIPE,

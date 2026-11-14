@@ -167,4 +167,25 @@ describe('CommandPaletteProvider vs GlobalSearchHost shortcuts', () => {
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
     expect(screen.queryByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).not.toBeInTheDocument();
   });
+
+  it('closes GlobalSearch when CommandPalette opens and closes CommandPalette when GlobalSearch opens', async () => {
+    renderShell();
+
+    // Open GlobalSearch via ⌘K, then open CommandPalette via ⌘⇧K -> GlobalSearch closes
+    fireEvent.keyDown(window, { key: 'k', metaKey: true, shiftKey: false });
+    expect(await screen.findByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'K', metaKey: true, shiftKey: true });
+    expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).not.toBeInTheDocument();
+    });
+
+    // Now press ⌘K while CommandPalette is open -> GlobalSearch opens and CommandPalette closes
+    fireEvent.keyDown(window, { key: 'k', metaKey: true, shiftKey: false });
+    expect(await screen.findByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
+    });
+  });
 });

@@ -4,6 +4,7 @@ import { FolderOpen, FolderPlus, Layers, Moon, Settings, Sparkles, SquarePen, Su
 import { useOpenCreateWorkspace } from '@/components/CreateWorkspaceHost';
 import { useNavItems } from '@/components/nav/useNavItems';
 import { useTheme } from '@/contexts/ThemeContext';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
 import { useAppearance } from '@/hooks/useAppearance';
 import { useSkills } from '@/hooks/useSkills';
@@ -14,16 +15,14 @@ import { readRecentTickers } from '@/lib/recentTickers';
 import { useStorageUser } from '@/lib/userStorage';
 import type { SkillInfo } from '@/pages/ChatAgent/utils/api/skills';
 // DALTON-HOOK(colleague-dispatch): palette reads the sidebar's workspace permissions
-import {
-  resolveNavWorkspacePermissions,
-  useNavAccessContext,
-} from '@/pages/ChatAgent/components/NavigationRows';
+import { resolveNavWorkspacePermissions } from '@/pages/ChatAgent/components/NavigationRows';
 import { useSaveFailureToast } from '@/pages/Settings/panels/usePreferenceWrite';
 // DALTON-HOOK(settings-section): palette settings use the rail's card visibility
 import { useDaltonSettingsVisibility } from '@/pages/Settings/components/SettingsRail';
 import { SECTIONS, searchableSettings, settingSearchText } from '@/pages/Settings/sections';
 import type { Workspace } from '@/types/api';
 import { runs, type Verbs } from './rows';
+import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
 import type { PaletteItem } from './types';
 
 /**
@@ -43,7 +42,7 @@ export function useLocalSources(v: Verbs) {
   const openCreateWorkspace = useOpenCreateWorkspace();
   // DALTON-HOOK(colleague-dispatch): palette search and new-thread actions follow the sidebar's workspace permissions
   // DALTON-HOOK(external-share-guard): an isolated external member does not see colleague workspaces
-  const access = useNavAccessContext();
+  const { access, permissionsLoading, teamWorkspaceById } = usePaletteAccess();
   // DALTON-HOOK(settings-section): settings in the palette use the same card visibility as the settings rail
   // DALTON-HOOK(hide-trading): trading settings stay out through sectionShown
   const daltonVisibility = useDaltonSettingsVisibility();
@@ -72,7 +71,7 @@ export function useLocalSources(v: Verbs) {
           navigate(`/chat/${ws.workspace_id}`, { state: { workspaceName: name, workspaceStatus: ws.status ?? null } }),
         ),
         // DALTON-HOOK(colleague-dispatch): new-thread only where the sidebar would allow creating one
-        ...(perms.canCreateThread
+        ...(!permissionsLoading && perms.canCreateThread
           ? [runs('new-thread', t('palette.do.newThreadIn', { workspace: name }), SquarePen, () => v.newThread(ws.workspace_id))]
           : []),
       ],
@@ -170,9 +169,26 @@ export function useLocalSources(v: Verbs) {
     ),
   ];
 
-  // DALTON-HOOK(external-share-guard): an isolated external member does not see colleague workspaces
+  // DALTON-HOOK(external-share-guard): an isolated external member does not see colleague workspaces,
+  // and colleague rows stay hidden until identity/team permissions settle.
+  const candidateWorkspaces: Workspace[] = [...(workspacesData?.workspaces ?? [])];
+  const seenWorkspaceIds = new Set(candidateWorkspaces.map((ws) => ws.workspace_id));
+  for (const [wsId, ws] of teamWorkspaceById) {
+    if (!seenWorkspaceIds.has(wsId)) {
+      seenWorkspaceIds.add(wsId);
+      candidateWorkspaces.push(ws);
+    }
+  }
+  const visibleWorkspaces = candidateWorkspaces.filter((ws) => {
+    const perms = resolveNavWorkspacePermissions(ws, access);
+    if (permissionsLoading && (perms.isColleagueWorkspace || (isDaltonAuth && !access.currentUserId))) {
+      return false;
+    }
+    return !perms.isIsolatedExternal;
+  });
+
   return {
-    workspaces: (workspacesData?.workspaces ?? []).filter((ws) => !resolveNavWorkspacePermissions(ws, access).isIsolatedExternal).map(workspaceRow),
+    workspaces: visibleWorkspaces.map(workspaceRow),
     skills: skills.map(skillRow),
     pages,
     settings,
