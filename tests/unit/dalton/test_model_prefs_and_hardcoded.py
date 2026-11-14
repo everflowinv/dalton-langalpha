@@ -209,6 +209,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert empty_cfg.conversations.prompt_version == "conv_card_v2_3"
     assert empty_cfg.conversations.embedding_model == ""
     assert empty_cfg.conversations.embedding_model_preferred == ""
+    assert empty_cfg.internal_llm.allowed_models == []
 
     # agent_config.dalton.yaml must not define llm.assist (single source in src/dalton/dalton.yaml)
     agent_dalton_cfg = yaml.safe_load(
@@ -229,6 +230,11 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert real_settings.publish.audit_timeout_s == 300.0
     assert 60 <= real_settings.publish.audit_timeout_s <= 1800
     assert len(real_settings.publish.reviewer_models) >= 1
+    assert real_settings.internal_llm.allowed_models == [
+        "gemini-4-hydrogen-high-oauth",
+        "gemini-4-argon-medium-oauth",
+        "gpt-6.1-sol-oauth",
+    ]
     assert real_settings.conversations.extractor_model == "deepseek-flash"
     assert not hasattr(real_settings.publish, "extract_model")
 

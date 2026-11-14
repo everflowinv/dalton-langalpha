@@ -2301,10 +2301,12 @@ from src.dalton.app.automation_notifications_router import (  # noqa: E402
 from src.dalton.app.data_task_notifications_router import (  # noqa: E402
     data_task_notifications_router,
 )
+from src.dalton.app.internal_llm_router import internal_llm_router  # noqa: E402
 
 router.include_router(channels_router)
 router.include_router(data_task_notifications_router)
 router.include_router(automation_notifications_router)
+router.include_router(internal_llm_router)
 
 
 

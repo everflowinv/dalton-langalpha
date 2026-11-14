@@ -102,7 +102,7 @@ def test_t34_manifest_matches_openclaw_schedule() -> None:
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
     by_key = manifest.by_job_key()
-    assert len(manifest.tasks) == 36
+    assert len(manifest.tasks) == 37
     assert "T34" in by_code
     entry = by_code["T34"]
     assert entry is by_key[JOB_KEY]
@@ -128,10 +128,11 @@ def test_t34_manifest_matches_openclaw_schedule() -> None:
     assert entry.notify_enabled is False
     assert entry.enabled is False
     job_keys = {task.job_key for task in manifest.tasks}
-    assert "podcast-weekly-pipeline" not in job_keys
+    assert "podcast-weekly-pipeline" in job_keys
+    assert "T60" in by_code
     assert "podcast-weekly-watch" not in job_keys
     assert "podcast-weekly-publish" not in job_keys
-    for code in ("T60", "T63", "T65"):
+    for code in ("T63", "T65"):
         assert code not in by_code
 
 
@@ -497,7 +498,7 @@ def test_seed_copies_kweb_code_and_fills_missing_state_only(tmp_path: Path) -> N
     assert not (dst / "state/kweb-dashboard/cos_secret.json").exists()
     assert not (dst / "research-outputs/kweb-dashboard/index.html").exists()
     assert not (dst / "config/kweb_cos_secret.json").exists()
-    assert not (dst / "skills/podcast-weekly-digest").exists()
+    assert "echo podcast" not in (dst / "skills/podcast-weekly-digest/scripts/run.sh").read_text(encoding="utf-8")
 
     (dst / "state/kweb-dashboard/portfolio_state.json").write_text("KEEP-STATE\n", encoding="utf-8")
     (dst / "state/kweb-dashboard/etf_aum.json").write_text("KEEP-AUM\n", encoding="utf-8")
@@ -617,11 +618,12 @@ def test_none_payload_source_ignores_stdout_trigger_fields(tmp_path: Path) -> No
         "gs-pb-weekly-rundown",  # T58
         "fde-hiring-snapshot-daily",  # T9
         "richard-relative-dashboard-refresh",  # T34
+        "podcast-weekly-pipeline",  # T60
     }
     assert {key for key, source in TASK_NOTIFY_PAYLOAD_SOURCES.items() if source == "none"} == none_jobs
     assert {
         key for key, source in _TASK_ID_PAYLOAD_SOURCE_ALIASES.items() if source == "none"
-    } == {"T42", "T58", "T9", "T34"}
+    } == {"T42", "T58", "T9", "T34", "T60"}
     batch4_jobs = {
         "e-watch-daily",
         "e-watch-intraday",

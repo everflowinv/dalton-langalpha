@@ -164,3 +164,9 @@ conversations:
     - "main"
     - "chem"
     - "marco"
+
+internal_llm:
+  allowed_models:
+    - "gemini-4-hydrogen-high-oauth"
+    - "gemini-4-argon-medium-oauth"
+    - "gpt-6.1-sol-oauth"

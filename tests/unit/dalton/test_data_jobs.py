@@ -238,7 +238,7 @@ def _parse_task_baseline_markdown() -> dict[str, dict[str, object]]:
 
 def test_manifest_matches_baseline_and_approved_changes() -> None:
     manifest = load_data_task_manifest()
-    assert len(manifest.tasks) == 36
+    assert len(manifest.tasks) == 37
 
     baseline_rows = _parse_task_baseline_markdown()
     assert len(baseline_rows) == 19
@@ -256,7 +256,7 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
         "T83",
     }
     batch4_codes = {"T2", "T23", "T24", "T35", "T38", "T41", "T43"}
-    batch5_codes = {"T34"}
+    batch5_codes = {"T34", "T60"}
     assert set(baseline_rows).issubset(by_code)
     assert set(by_code) - set(baseline_rows) == batch3_codes | batch4_codes | batch5_codes
 
@@ -322,8 +322,8 @@ async def test_sync_manifest_to_db_restores_t25_redacted_python() -> None:
 
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
-    assert count == 36
-    assert len(state["executed"]) == 36
+    assert count == 37
+    assert len(state["executed"]) == 37
 
     # T28 syncs active baseline cron/timezone ("40 9 * * 1-5" / "America/New_York"), not cutover values
     t28_params = next(p for _, p in state["executed"] if p["job_key"] == "tw-leverage-daily")
@@ -5292,7 +5292,7 @@ async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_termina
     ]
     batch3_codes = {"T9", "T16", "T20", "T36", "T42", "T58", "T73", "T76", "T83"}
     batch4_codes = {"T2", "T23", "T24", "T35", "T38", "T41", "T43"}
-    batch5_codes = {"T34"}
+    batch5_codes = {"T34", "T60"}
     for code, entry in by_code.items():
         if (
             code in ("T5", "T18")
@@ -7691,7 +7691,7 @@ async def test_pr12_round2_overlay_redaction_and_manifest_sync_preserves_schedul
     manifest = load_data_task_manifest()
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
-    assert count == 36
+    assert count == 37
     sql_executed, params_executed = state["executed"][0]
     insert_clause, conflict_clause = sql_executed.split(
         "ON CONFLICT (job_key) DO UPDATE SET", 1

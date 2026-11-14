@@ -2184,6 +2184,34 @@ def _manifest_host_command(job_key: str) -> tuple[list[str], str] | None:
     return list(entry.command_argv), str(entry.cwd)
 
 
+# DALTON-HOOK(host-job-secrets): manifest plain env and log_tail *** scrubbing for host tasks
+def _manifest_host_env(job_key: str) -> dict[str, str]:
+    """Return non-secret manifest `env` entries for a host task."""
+    try:
+        entry = load_data_task_manifest().by_job_key().get(job_key)
+    except Exception:
+        return {}
+    if entry is None or entry.runner != "host" or not entry.env:
+        return {}
+    return {str(k): str(v) for k, v in entry.env.items() if str(k).strip()}
+
+
+def _scrub_log_tail_secrets(text: str, secret_values: Sequence[str]) -> str:
+    """Mask host secret values in `log_tail` with `***` before persisting to DB."""
+    if not text or not secret_values:
+        return text
+    patterns = sorted(
+        {s for raw in secret_values for s in (str(raw or ""), str(raw or "").strip()) if len(s) >= 4},
+        key=len,
+        reverse=True,
+    )
+    out = text
+    for pattern in patterns:
+        if pattern in out:
+            out = out.replace(pattern, "***")
+    return out
+
+
 async def execute_claimed_host_run(
     conn: Any,
     *,
@@ -2232,6 +2260,31 @@ async def execute_claimed_host_run(
         slot_dt = slot_dt.replace(tzinfo=timezone.utc)
     scheduled_slot_iso = slot_dt.astimezone(timezone.utc).isoformat()
 
+    # DALTON-HOOK(host-job-secrets): resolve Vault secrets from primary PM admin for host runs
+    host_secrets: dict[str, str] = {}
+    declared_secret_names = [
+        str(s).strip() for s in (claimed.required_secrets or ()) if str(s).strip()
+    ]
+    if declared_secret_names:
+        resolved = await resolve_task_vault_secrets(declared_secret_names)
+        missing_secrets = [
+            name for name in declared_secret_names if not str(resolved.get(name) or "")
+        ]
+        if missing_secrets:
+            logger.warning(
+                "Host task %s (run_id=%s) missing Vault secret(s): %s",
+                claimed.job_key,
+                claimed.run_id,
+                ", ".join(missing_secrets),
+            )
+        host_secrets = {
+            name: str(resolved[name])
+            for name in declared_secret_names
+            if resolved.get(name) not in (None, "")
+        }
+    host_plain_env = _manifest_host_env(claimed.job_key)
+    host_secret_values = tuple(host_secrets.values())
+
     async def _run_once_with_heartbeats(gen: int) -> tuple[HostRunOutcome | None, bool]:
         await check_scheduler_lock(lock_conn)
         host_command_kwargs: dict[str, Any] = {}
@@ -2243,6 +2296,10 @@ async def execute_claimed_host_run(
             elif claimed.command_argv:
                 host_command_kwargs["command_argv"] = list(claimed.command_argv)
                 host_command_kwargs["cwd"] = claimed.workdir
+        if host_secrets:
+            host_command_kwargs["secrets"] = dict(host_secrets)
+        if host_plain_env:
+            host_command_kwargs["env"] = dict(host_plain_env)
         run_coro = host_client.run_host_task(
             generation=gen,
             run_id=claimed.run_id,
@@ -2299,6 +2356,8 @@ async def execute_claimed_host_run(
         return outcome_local, timed_out_local
 
     host_outcome, scheduler_timed_out = await _run_once_with_heartbeats(claimed.generation)
+    if host_outcome is not None and host_outcome.log_tail and host_secret_values:
+        host_outcome.log_tail = _scrub_log_tail_secrets(host_outcome.log_tail, host_secret_values)
 
     # On `fence_lost`: bump generation + 1 in tx, call host-kill, and if confirmed retry host-run once.
     if (
@@ -2355,6 +2414,8 @@ async def execute_claimed_host_run(
                 )
         claimed.generation = new_gen
         host_outcome, scheduler_timed_out = await _run_once_with_heartbeats(new_gen)
+        if host_outcome is not None and host_outcome.log_tail and host_secret_values:
+            host_outcome.log_tail = _scrub_log_tail_secrets(host_outcome.log_tail, host_secret_values)
 
     is_timeout = scheduler_timed_out or (
         host_outcome is not None

@@ -37,6 +37,12 @@ class DaltonModelsConfig(BaseModel):
     probe_models: dict[str, str] = Field(default_factory=dict)
 
 
+class DaltonInternalLLMConfig(BaseModel):
+    """Host internal LLM endpoint allowlist (read from `dalton.yaml`)."""
+
+    allowed_models: list[str] = Field(default_factory=list)
+
+
 class DaltonBudgetDefaults(BaseModel):
     """Default parameters for LocalBudgetPort (P0.8)."""
 
@@ -422,6 +428,7 @@ class DaltonConfig(BaseModel):
         default_factory=DaltonChatUploadsConfig
     )
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
+    internal_llm: DaltonInternalLLMConfig = Field(default_factory=DaltonInternalLLMConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
     mandate: DaltonMandateSettings = Field(default_factory=DaltonMandateSettings)
