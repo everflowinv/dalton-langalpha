@@ -8,7 +8,7 @@ import importlib.util
 import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import create_autospec
 from zoneinfo import ZoneInfo
 
@@ -4314,7 +4314,7 @@ def test_d037_preflight_log_wake_context_migration(monkeypatch: pytest.MonkeyPat
 
     mig = importlib.import_module("src.dalton.migrations.versions.d037_preflight_log_wake_context")
     assert mig.revision == "d037"
-    assert mig.down_revision == "d036"
+    assert mig.down_revision == "d033"
 
     executed: list[str] = []
 
@@ -4335,3 +4335,50 @@ def test_d037_preflight_log_wake_context_migration(monkeypatch: pytest.MonkeyPat
         for stmt in executed
     )
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_logged", [None, "earlier context"])
+async def test_decide_backfills_wake_context_for_early_return_wakes(
+    monkeypatch: pytest.MonkeyPatch, already_logged: Optional[str]
+) -> None:
+    """价格触发、保守超时这类提前返回的唤醒也要留下 wake_context；已有记录时不重复写。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.database import watch as watch_db_mod
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    price_result = preflight_mod.PreflightResult(
+        should_wake=True,
+        decision="wake",
+        reason="price_trigger",
+        signals=[{"probe": "price", "signal_key": "trigger:exec-pri", "priority": "P0", "summary": "x"}],
+        wake_context="<dalton_wake>price</dalton_wake>",
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "retry_failed_notify_deliveries",
+        create_autospec(dispatch_mod.retry_failed_notify_deliveries, return_value=None),
+    )
+    monkeypatch.setattr(
+        preflight_mod,
+        "preflight_check",
+        create_autospec(preflight_mod.preflight_check, return_value=price_result),
+    )
+    getter = create_autospec(watch_db_mod.get_preflight_wake_context, return_value=already_logged)
+    inserter = create_autospec(watch_db_mod.insert_preflight_log, return_value=None)
+    monkeypatch.setattr(preflight_mod.watch_db, "get_preflight_wake_context", getter)
+    monkeypatch.setattr(preflight_mod.watch_db, "insert_preflight_log", inserter)
+
+    automation = _company_watch_automation()
+    result = await preflight_mod.decide(automation, "exec-price-1")
+
+    assert result is price_result
+    getter.assert_awaited_once_with("exec-price-1")
+    if already_logged is None:
+        inserter.assert_awaited_once()
+        kwargs = inserter.await_args.kwargs
+        assert kwargs["automation_execution_id"] == "exec-price-1"
+        assert kwargs["decision"] == "wake"
+        assert kwargs["wake_context"] == "<dalton_wake>price</dalton_wake>"
+    else:
+        inserter.assert_not_awaited()

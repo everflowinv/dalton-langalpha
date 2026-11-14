@@ -2363,6 +2363,19 @@ async def decide(
             )
         if res.decision == "passthrough":
             return None
+        # DALTON-HOOK(preflight): every waking branch (price trigger and conservative
+        # timeout return early) leaves its final context for a restart handoff to read back.
+        if res.should_wake and res.wake_context:
+            try:
+                if await watch_db.get_preflight_wake_context(execution_id) is None:
+                    await _log_wake_result(
+                        automation_id=str(automation.get("automation_id") or "") or None,
+                        execution_id=execution_id,
+                        workspace_id=str(automation.get("workspace_id") or "") or None,
+                        result=res,
+                    )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] 唤醒上下文补记失败: %s", e)
         return res
     except Exception as e:
         logger.warning("[DALTON_PREFLIGHT] decide() unexpected error (skipping fail-closed): %s", e)

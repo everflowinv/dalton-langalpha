@@ -1,7 +1,7 @@
 """Dalton d037: persist rendered wake_context on dalton_preflight_log.
 
 Revision ID: d037
-Revises: d036
+Revises: d033
 Create Date: 2026-11-13
 """
 
@@ -12,7 +12,7 @@ from typing import Union
 from alembic import op
 
 revision: str = "d037"
-down_revision: Union[str, None] = "d036"
+down_revision: Union[str, None] = "d033"
 branch_labels = None
 depends_on = None
 
