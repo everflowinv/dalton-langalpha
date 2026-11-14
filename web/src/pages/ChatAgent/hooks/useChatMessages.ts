@@ -2970,20 +2970,8 @@ export function useChatMessages(
       return outcome ?? true;
     }
 
-    // A steer reaches the running turn as its text alone, so the server
-    // refuses one naming staged files. Such a send waits instead and opens
-    // the next turn, as a refused steer does, behind any sent before it; a
-    // stop gives its files back to the composer with its text.
-    if (isLoading && namesStagedFiles(additionalContext)) {
-      let resolveQueued: (sent: boolean) => void = () => {};
-      const outcome = onAccepted
-        ? new Promise<boolean>((resolve) => {
-            resolveQueued = resolve;
-          })
-        : null;
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, resend, outcome ? resolveQueued : undefined);
-      return outcome ?? true;
-    }
+    // DALTON-HOOK(chat-large-upload): staged attachment_id sends steer running
+    // turns directly via handleSendSteering, just like inline and chat_upload files.
 
     // If agent is already streaming, send as steering message
     if (isLoading) {

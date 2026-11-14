@@ -6474,6 +6474,7 @@ async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_a
 ) -> None:
     """DALTON-HOOK(chat-large-upload): staged #782 attachment_id items resolve real sizes/owners,
     share message count and byte budgets with chat_upload items, and steer cleanly."""
+
     from src.server.database import chat_attachments as chat_attachments_db
     from src.server.services import chat_attachment_turns as chat_attachment_turns
     from src.server.services import chat_attachments as chat_attachments_svc
@@ -6632,9 +6633,12 @@ async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_a
         },
     }
 
-    async def _get_attachment(attachment_id: str):
-        row = staged_rows.get(attachment_id)
-        return dict(row) if row is not None else None
+    async def _get_attachments_by_ids(attachment_ids: list[str]):
+        return {
+            aid: dict(staged_rows[aid])
+            for aid in attachment_ids
+            if aid in staged_rows
+        }
 
     async def _find_for_turn(attachment_ids: list[str], uid: str):
         return [
@@ -6677,9 +6681,17 @@ async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_a
     with (
         patch.object(
             chat_attachments_db,
+            "get_attachments_by_ids",
+            create_autospec(
+                chat_attachments_db.get_attachments_by_ids,
+                side_effect=_get_attachments_by_ids,
+            ),
+        ) as mock_batch_get,
+        patch.object(
+            chat_attachments_db,
             "get_attachment",
-            create_autospec(chat_attachments_db.get_attachment, side_effect=_get_attachment),
-        ),
+            create_autospec(chat_attachments_db.get_attachment),
+        ) as mock_single_get,
         patch.object(
             chat_attachments_db,
             "get_content",
@@ -6855,3 +6867,427 @@ async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_a
         assert len(newly_staged) == 1
         assert [d["name"] for d in steer_descriptors] == ["chart_note.png", "big_a.parquet"]
         assert [d["source_kind"] for d in steer_descriptors] == ["image", "chat_upload"]
+        assert mock_single_get.await_count == 0
+        assert mock_batch_get.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_staged_attachment_steer_end_to_end_reaches_model(upload_env, tmp_path, monkeypatch):
+    """DALTON-HOOK(chat-large-upload): sending a staged image while a turn runs passes steer_allowed,
+    admits via wait_or_steer, materializes into the sandbox, and includes the file reminder for the model."""
+    from unittest.mock import AsyncMock
+
+    from src.server.database import chat_attachments as chat_attachments_db
+    from src.server.database import workspace as ws_db
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.handlers.chat.admission_gate import steer_allowed, wait_or_steer
+    from src.server.models.chat import ChatRequest
+    from src.server.services.report_back import steer as steer_svc
+
+    owner = "user-steer-e2e"
+    ws_id = str(uuid.uuid4())
+    thread_id = "thread-steer-e2e"
+    att_id = str(uuid.uuid4())
+    img_bytes = b"\x89PNG\r\n\x1a\n" + b"img-payload-123"
+
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+        "dir_name": "SteerE2EWS",
+    }
+    att_row = {
+        "attachment_id": att_id,
+        "user_id": owner,
+        "name": "chart_steer.png",
+        "mime_type": "image/png",
+        "size": len(img_bytes),
+        "mode": "relay",
+        "object_key": None,
+        "store_upload_id": None,
+        "part_size": None,
+        "part_count": None,
+        "has_content": True,
+        "state": "ready",
+        "error": None,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+        "lease_until": None,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+        "ready_at": datetime.now(timezone.utc),
+        "sent_at": None,
+        "cleaned_at": None,
+    }
+
+    chat_req = ChatRequest(
+        messages=[{"role": "user", "content": "Inspect this steered chart"}],
+        additional_context=[
+            MultimodalContext(
+                type="image",
+                attachment_id=uuid.UUID(att_id),
+                description="chart_steer.png",
+            )
+        ],
+        request_key=str(uuid.uuid4()),
+    )
+    assert steer_allowed(chat_req, dispatched=False, steerable=True) is True
+
+    root_dir = str(tmp_path / "posix_steer_e2e_root")
+    sbx = _RealPosixSandbox(root_dir, dir_name="SteerE2EWS")
+    sbx.provider.direct_blob_transfer = False
+    project = ProjectContext(workspace_id=ws_id, dir_name="SteerE2EWS")
+
+    def _iter_stored_object_chunks(key: str, chunk_size: int = 4194304):
+        raw_blob = upload_env["store"].objects[key]
+        for idx in range(0, len(raw_blob), chunk_size):
+            yield raw_blob[idx : idx + chunk_size]
+
+    monkeypatch.setattr(svc.storage, "iter_stored_object_chunks", _iter_stored_object_chunks)
+
+    admitted_payloads: list[dict[str, Any]] = []
+
+    class _FakeManager:
+        async def wait_for_admission(self, _tid: str):
+            return "running", {"conversation_response_id": "run-active-1"}
+
+    async def _admit_steer(*, thread_id: str, payload: dict[str, Any], upload_claim_key: str | None = None, **_kw):
+        await svc.confirm_request_chat_uploads(
+            payload.get("chat_uploads"),
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key=upload_claim_key,
+        )
+        admitted_payloads.append(payload)
+        return {"state": "accepted", "position": 1, "job": {"id": "job-steer-1"}}
+
+    class _FakeTurnSession:
+        def __init__(self, sandbox):
+            self.sandbox = sandbox
+
+        async def get_sandbox(self):
+            return self.sandbox
+
+    monkeypatch.setattr(outbox_db, "admit_steer", create_autospec(outbox_db.admit_steer, side_effect=_admit_steer))
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": ws_id,
+                "user_id": owner,
+                "status": "running",
+                "dir_name": "SteerE2EWS",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.handlers.chat.admission_gate.dedup_retransmit_or_raise",
+        AsyncMock(return_value=None),
+    )
+
+    with (
+        patch.object(
+            chat_attachments_db,
+            "get_attachments_by_ids",
+            create_autospec(chat_attachments_db.get_attachments_by_ids, return_value={att_id: dict(att_row)}),
+        ),
+        patch.object(
+            chat_attachments_db,
+            "get_content",
+            create_autospec(chat_attachments_db.get_content, return_value=img_bytes),
+        ),
+    ):
+        await svc.validate_and_claim_request_attachments(
+            chat_req.additional_context,
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key=svc.chat_upload_claim_key(request_key=str(chat_req.request_key), run_id="run-steer-1"),
+        )
+        async with svc.ChatUploadSendScope(
+            additional_context=chat_req.additional_context,
+            user_id=owner,
+            workspace_id=ws_id,
+            request_key=str(chat_req.request_key),
+            run_id="run-steer-1",
+            preclaimed=False,
+        ) as scope:
+            ready, sse_event = await wait_or_steer(
+                manager=_FakeManager(),
+                thread_id=thread_id,
+                user_input="Inspect this steered chart",
+                user_id=owner,
+                steer_only=True,
+                can_steer=steer_allowed(chat_req, dispatched=False, steerable=True),
+                request_key=str(chat_req.request_key),
+                workspace_id=ws_id,
+                additional_context=chat_req.additional_context,
+                upload_claim_key=scope.claim_key,
+            )
+            assert ready is False
+            assert isinstance(sse_event, str) and sse_event.startswith("event: steering_accepted\n")
+            scope.mark_admitted()
+
+    assert len(admitted_payloads) == 1
+    steer_payload = admitted_payloads[0]
+    assert len(steer_payload["chat_uploads"]) == 1
+
+    # Model delivery phase: materializes into sandbox and appends file path reminder
+    reminder, attachments = await svc.materialize_steered_chat_uploads(
+        steer_payload,
+        session=_FakeTurnSession(sbx),
+        project=project,
+    )
+    assert attachments is not None and len(attachments) == 1
+    assert "work/uploads/" in reminder
+    assert "chart_steer" in reminder
+    layout = sbx.workspace(project)
+    uploaded_matches = list(
+        (tmp_path / "posix_steer_e2e_root" / "SteerE2EWS" / "work" / "uploads").rglob(
+            "*chart_steer*.png"
+        )
+    )
+    assert len(uploaded_matches) == 1
+    assert uploaded_matches[0].read_bytes() == img_bytes
+    assert layout.workspace in str(uploaded_matches[0])
+    offer = steer_svc._steer_offer(
+        {"hook_outbox_id": "job-steer-1", "payload": steer_payload},
+        model_reminder=reminder,
+        attachments=attachments,
+    )
+    assert "Inspect this steered chart" in offer.content
+    assert "work/uploads/" in offer.content
+    assert offer.shown["attachments"] == attachments
+
+
+@pytest.mark.asyncio
+async def test_staged_attachment_validation_checks_count_first_batches_queries_and_reuses_in_scope(
+    upload_env,
+):
+    """DALTON-HOOK(chat-large-upload): over-cap requests exit before any DB query, valid batches use one
+    batch lookup, and ChatUploadSendScope in the same request reuses the validation with zero extra queries."""
+
+    from src.server.database import chat_attachments as chat_attachments_db
+
+    owner = "user-query-count"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+    }
+
+    ids = [str(uuid.uuid4()) for _ in range(svc.MAX_MESSAGE_ATTACHMENTS + 1)]
+    rows = {
+        aid: {
+            "attachment_id": aid,
+            "user_id": owner,
+            "name": f"doc_{i}.pdf",
+            "mime_type": "application/pdf",
+            "size": 1024,
+            "mode": "relay",
+            "object_key": None,
+            "store_upload_id": None,
+            "part_size": None,
+            "part_count": None,
+            "has_content": True,
+            "state": "ready",
+            "error": None,
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+            "lease_until": None,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "ready_at": datetime.now(timezone.utc),
+            "sent_at": None,
+            "cleaned_at": None,
+        }
+        for i, aid in enumerate(ids)
+    }
+
+    batch_mock = create_autospec(
+        chat_attachments_db.get_attachments_by_ids,
+        side_effect=lambda req_ids: {aid: dict(rows[aid]) for aid in req_ids if aid in rows},
+    )
+    single_mock = create_autospec(chat_attachments_db.get_attachment)
+
+    with (
+        patch.object(chat_attachments_db, "get_attachments_by_ids", batch_mock),
+        patch.object(chat_attachments_db, "get_attachment", single_mock),
+    ):
+        # 1. Over-cap (> 5 attachments): rejected BEFORE any DB lookup
+        over_cap_ctx = [
+            MultimodalContext(type="pdf", attachment_id=uuid.UUID(aid), description=f"doc_{i}.pdf")
+            for i, aid in enumerate(ids)
+        ]
+        with pytest.raises(HTTPException) as cap_exc:
+            await svc.validate_and_claim_request_attachments(
+                over_cap_ctx,
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:over-cap:1",
+            )
+        assert cap_exc.value.status_code == 400
+        assert batch_mock.await_count == 0
+        assert single_mock.await_count == 0
+
+        # 2. Valid 3-item staged batch: pre-stream validate + ChatUploadSendScope reuse -> 1 DB batch call total
+        three_ctx = over_cap_ctx[:3]
+        shared_claim = svc.chat_upload_claim_key(request_key="rk-reuse", run_id="run-reuse")
+        await svc.validate_and_claim_request_attachments(
+            three_ctx,
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key=shared_claim,
+        )
+        assert batch_mock.await_count == 1
+        assert single_mock.await_count == 0
+
+        async with svc.ChatUploadSendScope(
+            additional_context=three_ctx,
+            user_id=owner,
+            workspace_id=ws_id,
+            request_key="rk-reuse",
+            run_id="run-reuse",
+            preclaimed=False,
+        ):
+            pass
+        assert batch_mock.await_count == 1
+        assert single_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_staged_upstream_steer_holds_memory_budget_and_distinguishes_store_errors(upload_env):
+    """DALTON-HOOK(chat-large-upload): re-staging an object_key upstream attachment holds held_bytes_budget(),
+    returns 409 when genuinely missing, and returns retryable 503 on transient object-store read failures."""
+    from botocore.exceptions import ClientError
+
+
+    from src.server.database import chat_attachments as chat_attachments_db
+    from src.server.services import chat_attachments as chat_attachments_svc
+    from src.server.services.persistence.transfer import held_bytes_budget
+
+    owner = "user-budget-store"
+    ws_id = str(uuid.uuid4())
+    att_id = str(uuid.uuid4())
+    payload = b"upstream-object-bytes-" * 64
+    obj_key = f"attachments/{att_id}/report.pdf"
+
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+    }
+    att_row = {
+        "attachment_id": att_id,
+        "user_id": owner,
+        "name": "report.pdf",
+        "mime_type": "application/pdf",
+        "size": len(payload),
+        "mode": "direct",
+        "object_key": obj_key,
+        "store_upload_id": "up-1",
+        "part_size": len(payload),
+        "part_count": 1,
+        "has_content": False,
+        "state": "ready",
+        "error": None,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+        "lease_until": None,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+        "ready_at": datetime.now(timezone.utc),
+        "sent_at": None,
+        "cleaned_at": None,
+    }
+    steer_ctx = [
+        MultimodalContext(
+            type="pdf",
+            attachment_id=uuid.UUID(att_id),
+            description="report.pdf",
+        )
+    ]
+
+    budget = held_bytes_budget()
+    observed_hold_sizes: list[int] = []
+    real_hold = budget.hold
+
+    @asynccontextmanager
+    async def _recording_hold(size: int | None):
+        observed_hold_sizes.append(int(size or 0))
+        async with real_hold(size):
+            yield
+
+    with (
+        patch.object(
+            chat_attachments_db,
+            "get_attachments_by_ids",
+            create_autospec(
+                chat_attachments_db.get_attachments_by_ids,
+                return_value={att_id: dict(att_row)},
+            ),
+        ),
+        patch.object(budget, "hold", side_effect=_recording_hold),
+    ):
+        # 1. Normal object_key steer re-staging holds held_bytes_budget().hold(len(payload)) and releases cleanly
+        with patch.object(svc, "get_upstream_attachment_bytes", return_value=payload):
+            descriptors, _ = await svc.stage_request_attachments_for_steer(
+                steer_ctx,
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:budget:ok",
+            )
+            assert len(descriptors) == 1
+        assert observed_hold_sizes == [len(payload)]
+        assert budget._bytes == 0
+        assert budget._files == 0
+
+        # 2. Missing object (404/NoSuchKey) -> 409 ATTACHMENT_ENDED
+        with (
+            patch.object(svc, "get_upstream_attachment_bytes", return_value=None),
+            patch("src.utils.storage.get_provider_id", return_value="s3"),
+            patch("src.utils.storage.s3_compatible._get_client") as mock_s3_client,
+        ):
+            mock_s3_client.return_value.head_object.side_effect = ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+                "HeadObject",
+            )
+            with pytest.raises(HTTPException) as missing_exc:
+                await svc.stage_request_attachments_for_steer(
+                    steer_ctx,
+                    user_id=owner,
+                    workspace_id=ws_id,
+                    claim_key="req:missing:409",
+                )
+            assert missing_exc.value.status_code == 409
+            assert missing_exc.value.detail == chat_attachments_svc.ATTACHMENT_ENDED
+
+        # 3. Transient object-store failure (timeout or 5xx on get_bytes/head_object) -> retryable 503
+        with (
+            patch.object(svc, "get_upstream_attachment_bytes", return_value=None),
+            patch("src.utils.storage.get_provider_id", return_value="s3"),
+            patch("src.utils.storage.s3_compatible._get_client") as mock_s3_client,
+        ):
+            mock_s3_client.return_value.head_object.side_effect = ClientError(
+                {"Error": {"Code": "InternalError", "Message": "Backend 500"}, "ResponseMetadata": {"HTTPStatusCode": 500}},
+                "HeadObject",
+            )
+            with pytest.raises(HTTPException) as transient_exc:
+                await svc.stage_request_attachments_for_steer(
+                    steer_ctx,
+                    user_id=owner,
+                    workspace_id=ws_id,
+                    claim_key="req:transient:503",
+                )
+            assert transient_exc.value.status_code == 503
+
+        with patch.object(svc, "get_upstream_attachment_bytes", side_effect=TimeoutError("S3 read timeout")):
+            with pytest.raises(HTTPException) as timeout_exc:
+                await svc.stage_request_attachments_for_steer(
+                    steer_ctx,
+                    user_id=owner,
+                    workspace_id=ws_id,
+                    claim_key="req:timeout:503",
+                )
+            assert timeout_exc.value.status_code == 503
+        assert budget._bytes == 0
+        assert budget._files == 0

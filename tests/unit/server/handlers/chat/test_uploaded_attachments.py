@@ -368,10 +368,11 @@ async def test_a_file_that_could_not_be_saved_is_said_so():
     assert "could not be saved where you can open it" in content
 
 
-async def test_a_steer_naming_uploaded_files_waits_for_a_turn_of_its_own():
+# DALTON-HOOK(chat-large-upload): staged attachment_id requests steer running turns like inline/chat_upload
+async def test_a_steer_naming_uploaded_files_is_allowed_to_steer():
     from src.server.handlers.chat.admission_gate import steer_allowed
 
-    assert not steer_allowed(_request(("file", CSV_ID, "prices.csv")), dispatched=False, steerable=True)
+    assert steer_allowed(_request(("file", CSV_ID, "prices.csv")), dispatched=False, steerable=True)
     inline = ChatRequest(
         messages=[{"role": "user", "content": "look"}],
         additional_context=[{"type": "image", "data": "data:image/png;base64,AA==", "description": "x.png"}],

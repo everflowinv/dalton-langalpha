@@ -36,7 +36,6 @@ from ptc_agent.agent.middleware.runtime_context.frozen_prompt import STATE_SYSTE
 from ptc_agent.agent.middleware.tool_surface import ToolSurfaceMiddleware
 from ptc_agent.agent.prompts import release
 from ptc_agent.config.agent import CompactionConfig
-from src.config import features
 # DALTON-HOOK(native-compaction-lines): with_ttl is what writes the hour onto the request.
 from src.llms.cache_markers import with_ttl
 from src.server.services.idle_compaction import plan_firing

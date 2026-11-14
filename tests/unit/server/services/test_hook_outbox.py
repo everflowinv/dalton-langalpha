@@ -6,7 +6,6 @@ applicability (ordinary runs no-op) and RAISE on transport failure so the
 drainer's nack/backoff — not a swallowed log line — is the retry path.
 """
 
-import dataclasses
 # DALTON-HOOK(handoff-report-quiescence): create_autospec for the probe stub
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 

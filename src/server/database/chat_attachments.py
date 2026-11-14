@@ -8,6 +8,7 @@ its expiry: whichever takes the row lock first decides.
 
 from __future__ import annotations
 
+from collections.abc import Sequence  # DALTON-HOOK(chat-large-upload): batch lookup of staged attachments
 from datetime import datetime, timedelta
 from typing import Any, Literal, TypedDict, cast
 
@@ -183,6 +184,20 @@ async def get_attachment(attachment_id: str) -> ChatAttachmentRow | None:
         f"SELECT {_COLUMNS} FROM chat_attachments WHERE attachment_id = %(id)s",
         {"id": attachment_id},
     )
+
+
+# DALTON-HOOK(chat-large-upload): batch-load staged attachment rows for single-query validation
+async def get_attachments_by_ids(
+    attachment_ids: Sequence[str],
+) -> dict[str, ChatAttachmentRow]:
+    unique_ids = list(dict.fromkeys(str(aid) for aid in attachment_ids if aid))
+    if not unique_ids:
+        return {}
+    rows = await _many(
+        f"SELECT {_COLUMNS} FROM chat_attachments WHERE attachment_id = ANY(%(ids)s::uuid[])",
+        {"ids": unique_ids},
+    )
+    return {str(row["attachment_id"]): row for row in rows}
 
 
 async def get_content(attachment_id: str) -> bytes | None:
