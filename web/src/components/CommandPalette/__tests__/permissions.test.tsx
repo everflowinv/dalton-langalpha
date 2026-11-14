@@ -31,6 +31,8 @@ const state = vi.hoisted(() => ({
   wsDetails: {} as Record<string, Workspace>,
   allWorkspaces: [] as Workspace[],
   recentThreads: [] as Array<Record<string, unknown>>,
+  workspaceThreads: {} as Record<string, Array<Record<string, unknown>>>,
+  searchThreads: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock('@/config/daltonAuth', () => ({ isDaltonAuth: true }));
@@ -73,10 +75,24 @@ vi.mock('@/hooks/useSkills', () => ({
 }));
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getRecentThreads: vi.fn(async () => ({ threads: state.recentThreads })),
-  getWorkspaceThreads: vi.fn(async () => ({ threads: [] })),
+  getWorkspaceThreads: vi.fn(async (workspaceId: string) => ({
+    threads: state.workspaceThreads[workspaceId] ?? [],
+  })),
 }));
 vi.mock('@/api/search', () => ({
-  searchConversations: vi.fn(async () => ({ threads: [], turns: [], files: [], next_cursor: { threads: null, turns: null, files: null }, failed: [] })),
+  searchConversations: vi.fn(async ({ q }: { q: string }) => {
+    const qLower = q.toLowerCase();
+    const matched = state.searchThreads.filter((th) =>
+      String(th.title ?? '').toLowerCase().includes(qLower),
+    );
+    return {
+      threads: matched,
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    };
+  }),
   getSearchPreview: vi.fn(async () => {
     throw new Error('no preview');
   }),
@@ -130,6 +146,8 @@ beforeEach(() => {
     { thread_id: 't-own', title: 'Own Thread', workspace_id: 'ws-own', user_id: 'u-self', updated_at: '2026-11-10T00:00:00Z' },
     { thread_id: 't-colleague', title: 'Colleague Thread', workspace_id: 'ws-colleague-ro', user_id: 'u-colleague', workspace_owner_id: 'u-colleague', updated_at: '2026-11-11T00:00:00Z' },
   ];
+  state.workspaceThreads = {};
+  state.searchThreads = [];
 });
 
 afterEach(() => {
@@ -240,123 +258,206 @@ describe('CommandPalette permissions & loading gate', () => {
     expect(within(dialog).queryByText(/Ask “thesis”|提问“thesis”/i)).not.toBeInTheDocument();
   });
 
-  it('hides Ask inside a read-only colleague thread scope, while showing Ask inside own thread scope', async () => {
-    // 1. Read-only colleague thread (in ws-colleague-ro) -> no Ask after Tab into thread scope
-    const roView = renderWithProviders(
-      <CommandPaletteProvider>
-        <div />
-      </CommandPaletteProvider>,
-    );
-    fireEvent.keyDown(document.activeElement ?? window, {
-      key: 'k',
-      shiftKey: true,
-      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
-    });
-    const dialog1 = await screen.findByRole('dialog');
-    const input1 = within(dialog1).getByRole('combobox');
-
-    await waitFor(() => {
-      expect(within(dialog1).getByText('Colleague Thread')).toBeInTheDocument();
-    });
-    fireEvent.change(input1, { target: { value: 'Colleague Thread' } });
-    await waitFor(() => {
-      expect(within(dialog1).getAllByRole('option').length).toBeGreaterThan(0);
-    });
-    fireEvent.keyDown(input1, { key: 'Tab' });
-    await waitFor(() => {
-      expect(within(dialog1).getByRole('combobox')).toHaveValue('');
-    });
-    fireEvent.change(within(dialog1).getByRole('combobox'), { target: { value: 'follow up' } });
-    expect(within(dialog1).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
-    roView.unmount();
-
-    // 2. Colleague-owned thread inside an rw colleague workspace -> also no Ask in thread scope
-    state.teamData = {
-      ...state.teamData!,
-      members: [
+  describe('thread-scope Ask permissions via real entry paths (no colleague threads in getRecentThreads)', () => {
+    beforeEach(() => {
+      state.teamData = {
+        members: [
+          {
+            user_id: 'u-colleague',
+            email: 'colleague@dalton.test',
+            display_name: 'Colleague',
+            workspaces: [
+              {
+                workspace_id: 'ws-colleague-rw',
+                user_id: 'u-colleague',
+                owner_name: 'Colleague',
+                owner_email: 'colleague@dalton.test',
+                name: 'Colleague RW',
+                web_access: 'rw',
+                status: 'running',
+              },
+            ],
+          },
+        ],
+        caller_tier: 'internal',
+        colleague_dispatch_enabled: true,
+      };
+      // Real backend SQL for getRecentThreads never returns colleague-owned threads.
+      state.recentThreads = [
+        { thread_id: 't-own', title: 'Own Thread', workspace_id: 'ws-own', user_id: 'u-self', updated_at: '2026-11-10T00:00:00Z' },
+      ];
+      state.workspaceThreads = {
+        'ws-colleague-rw': [
+          {
+            thread_id: 't-colleague-in-rw',
+            title: 'Colleague RW Thread',
+            workspace_id: 'ws-colleague-rw',
+            user_id: 'u-colleague',
+            workspace_owner_id: 'u-colleague',
+            updated_at: '2026-11-11T00:00:00Z',
+          },
+          {
+            thread_id: 't-self-in-rw',
+            title: 'My Thread In RW',
+            workspace_id: 'ws-colleague-rw',
+            user_id: 'u-self',
+            workspace_owner_id: 'u-colleague',
+            updated_at: '2026-11-12T00:00:00Z',
+          },
+        ],
+      };
+      state.searchThreads = [
         {
+          thread_id: 't-search-colleague',
+          title: 'Search Colleague Hit',
+          workspace_id: 'ws-colleague-rw',
+          workspace_name: 'Colleague RW',
+          automation_name: null,
+          updated_at: '2026-11-11T00:00:00Z',
+          is_pinned: false,
+          has_title: true,
+          match: [[0, 6]],
           user_id: 'u-colleague',
-          email: 'colleague@dalton.test',
-          display_name: 'Colleague',
-          workspaces: [
-            {
-              workspace_id: 'ws-colleague-rw',
-              user_id: 'u-colleague',
-              owner_name: 'Colleague',
-              owner_email: 'colleague@dalton.test',
-              name: 'Colleague RW',
-              web_access: 'rw',
-              status: 'running',
-            },
-          ],
         },
-      ],
-    };
-    state.recentThreads = [
-      {
-        thread_id: 't-colleague-in-rw',
-        title: 'Colleague RW Thread',
-        workspace_id: 'ws-colleague-rw',
-        user_id: 'u-colleague',
-        workspace_owner_id: 'u-colleague',
-        updated_at: '2026-11-11T00:00:00Z',
-      },
-      {
-        thread_id: 't-own',
-        title: 'Own Thread',
-        workspace_id: 'ws-own',
-        user_id: 'u-self',
-        updated_at: '2026-11-10T00:00:00Z',
-      },
-    ];
-    const rwColleagueView = renderWithProviders(
-      <CommandPaletteProvider>
-        <div />
-      </CommandPaletteProvider>,
-    );
-    fireEvent.keyDown(document.activeElement ?? window, {
-      key: 'k',
-      shiftKey: true,
-      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
+        {
+          thread_id: 't-search-unknown',
+          title: 'Unknown Owner Hit',
+          workspace_id: 'ws-colleague-rw',
+          workspace_name: 'Colleague RW',
+          automation_name: null,
+          updated_at: '2026-11-11T00:00:00Z',
+          is_pinned: false,
+          has_title: true,
+          match: [[0, 7]],
+        },
+      ];
     });
-    const dialog2 = await screen.findByRole('dialog');
-    const input2 = within(dialog2).getByRole('combobox');
-    await waitFor(() => {
-      expect(within(dialog2).getByText('Colleague RW Thread')).toBeInTheDocument();
-    });
-    fireEvent.change(input2, { target: { value: 'Colleague RW Thread' } });
-    fireEvent.keyDown(input2, { key: 'Tab' });
-    await waitFor(() => {
-      expect(within(dialog2).getByRole('combobox')).toHaveValue('');
-    });
-    fireEvent.change(within(dialog2).getByRole('combobox'), { target: { value: 'follow up' } });
-    expect(within(dialog2).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
-    rwColleagueView.unmount();
 
-    // 3. Own thread scope -> Ask IS offered
-    renderWithProviders(
-      <CommandPaletteProvider>
-        <div />
-      </CommandPaletteProvider>,
-    );
-    fireEvent.keyDown(document.activeElement ?? window, {
-      key: 'k',
-      shiftKey: true,
-      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
+    it('hides Ask after drilling down into rw colleague workspace and Tab-scoping into a colleague thread', async () => {
+      openPalette();
+      const dialog = await screen.findByRole('dialog');
+      const input = within(dialog).getByRole('combobox');
+
+      fireEvent.change(input, { target: { value: '@Colleague RW' } });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /Colleague RW/i })).toHaveAttribute('aria-selected', 'true');
+      });
+      fireEvent.keyDown(input, { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /Colleague RW Thread/i })).toBeInTheDocument();
+      });
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'Colleague RW Thread' } });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /^Colleague RW Thread/i })).toHaveAttribute('aria-selected', 'true');
+      });
+      fireEvent.keyDown(within(dialog).getByRole('combobox'), { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'follow up' } });
+      expect(within(dialog).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
     });
-    const dialog3 = await screen.findByRole('dialog');
-    const input3 = within(dialog3).getByRole('combobox');
-    await waitFor(() => {
-      expect(within(dialog3).getByText('Own Thread')).toBeInTheDocument();
+
+    it('hides Ask when Tab-scoping into a colleague thread returned by server search', async () => {
+      openPalette();
+      const dialog = await screen.findByRole('dialog');
+      const input = within(dialog).getByRole('combobox');
+
+      fireEvent.change(input, { target: { value: 'Search Colleague Hit' } });
+      await waitFor(
+        () => {
+          expect(within(dialog).getByRole('option', { name: /Search Colleague Hit.*Colleague RW/i })).toHaveAttribute('aria-selected', 'true');
+        },
+        { timeout: 2500 },
+      );
+      fireEvent.keyDown(input, { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'follow up' } });
+      expect(within(dialog).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
     });
-    fireEvent.change(input3, { target: { value: 'Own Thread' } });
-    fireEvent.keyDown(input3, { key: 'Tab' });
-    await waitFor(() => {
-      expect(within(dialog3).getByRole('combobox')).toHaveValue('');
+
+    it('shows Ask inside own thread drilled down in an rw colleague workspace', async () => {
+      openPalette();
+      const dialog = await screen.findByRole('dialog');
+      const input = within(dialog).getByRole('combobox');
+
+      fireEvent.change(input, { target: { value: '@Colleague RW' } });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /Colleague RW/i })).toHaveAttribute('aria-selected', 'true');
+      });
+      fireEvent.keyDown(input, { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /My Thread In RW/i })).toBeInTheDocument();
+      });
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'My Thread In RW' } });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /^My Thread In RW/i })).toHaveAttribute('aria-selected', 'true');
+      });
+      fireEvent.keyDown(within(dialog).getByRole('combobox'), { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'follow up' } });
+      await waitFor(() => {
+        expect(within(dialog).getByText(/Ask “follow up”|提问“follow up”/i)).toBeInTheDocument();
+      });
     });
-    fireEvent.change(within(dialog3).getByRole('combobox'), { target: { value: 'follow up' } });
-    await waitFor(() => {
-      expect(within(dialog3).getByText(/Ask “follow up”|提问“follow up”/i)).toBeInTheDocument();
+
+    it('shows Ask inside a thread in own workspace', async () => {
+      openPalette();
+      const dialog = await screen.findByRole('dialog');
+      const input = within(dialog).getByRole('combobox');
+
+      await waitFor(() => {
+        expect(within(dialog).getByText('Own Thread')).toBeInTheDocument();
+      });
+      fireEvent.change(input, { target: { value: 'Own Thread' } });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('option', { name: /^Own Thread/i })).toHaveAttribute('aria-selected', 'true');
+      });
+      fireEvent.keyDown(input, { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'follow up' } });
+      await waitFor(() => {
+        expect(within(dialog).getByText(/Ask “follow up”|提问“follow up”/i)).toBeInTheDocument();
+      });
+    });
+
+    it('conservatively hides Ask in a colleague workspace thread when owner is unknown', async () => {
+      openPalette();
+      const dialog = await screen.findByRole('dialog');
+      const input = within(dialog).getByRole('combobox');
+
+      fireEvent.change(input, { target: { value: 'Unknown Owner Hit' } });
+      await waitFor(
+        () => {
+          expect(within(dialog).getByRole('option', { name: /Unknown Owner Hit.*Colleague RW/i })).toHaveAttribute('aria-selected', 'true');
+        },
+        { timeout: 2500 },
+      );
+      fireEvent.keyDown(input, { key: 'Tab' });
+      await waitFor(() => {
+        expect(within(dialog).getByRole('combobox')).toHaveValue('');
+      });
+
+      fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: 'follow up' } });
+      expect(within(dialog).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
     });
   });
 });

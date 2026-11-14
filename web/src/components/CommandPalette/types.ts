@@ -12,7 +12,14 @@ export type Kind = 'tickers' | 'files' | 'threads' | 'turns' | 'workspaces' | 'a
 /** A workspace or a thread the search keeps to (Tab on its row). */
 export type Place =
   | { kind: 'workspace'; workspaceId: string; name: string }
-  | { kind: 'thread'; threadId: string; workspaceId: string; title: string };
+  | {
+      kind: 'thread';
+      threadId: string;
+      workspaceId: string;
+      title: string;
+      // DALTON-HOOK(colleague-dispatch): preserve thread owner identity across Tab into thread scope
+      ownerUserId?: string | null;
+    };
 
 /**
  * What a view shows alone, and how it was asked for: one kind, by its prefix

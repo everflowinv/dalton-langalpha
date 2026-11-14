@@ -103,6 +103,8 @@ export interface ThreadRef {
   at: string | null | undefined;
   /** Pinned to the top of its workspace. */
   pinned: boolean;
+  // DALTON-HOOK(colleague-dispatch): effective thread owner id (from thread or search hit row) for thread-scope Ask checks
+  ownerUserId?: string | null;
 }
 
 /**
@@ -129,6 +131,18 @@ function threadChanges(ref: ThreadRef, v: Verbs): PaletteAction[] {
   ];
 }
 
+// DALTON-HOOK(colleague-dispatch): read effective thread owner from thread list or search hit rows
+function rowOwnerUserId(row: unknown): string | null | undefined {
+  if (!row || typeof row !== 'object') return undefined;
+  const r = row as Record<string, unknown>;
+  const rawDispatched = (r.dispatched_by ?? (r.metadata as Record<string, unknown> | undefined)?.dispatched_by) as
+    | { user_id?: string | null }
+    | null
+    | undefined;
+  const owner = (r.thread_user_id as string | null | undefined) ?? (r.user_id as string | null | undefined) ?? rawDispatched?.user_id;
+  return owner || undefined;
+}
+
 export function threadOfList(thread: Thread, names: Names): ThreadRef {
   return {
     threadId: thread.thread_id,
@@ -138,6 +152,7 @@ export function threadOfList(thread: Thread, names: Names): ThreadRef {
     where: names.workspaceName(thread.workspace_id),
     at: thread.updated_at,
     pinned: !!thread.is_pinned,
+    ownerUserId: rowOwnerUserId(thread),
   };
 }
 
@@ -153,6 +168,7 @@ export function threadOfHit(hit: SearchThreadHit, names: Names): ThreadRef {
     where: hit.automation_name ?? names.workspaceName(hit.workspace_id, hit.workspace_name),
     at: hit.updated_at,
     pinned: hit.is_pinned,
+    ownerUserId: rowOwnerUserId(hit), // DALTON-HOOK(colleague-dispatch)
   };
 }
 
@@ -166,6 +182,7 @@ function threadOfTurn(hit: SearchTurnHit, names: Names): ThreadRef {
     where: names.workspaceName(hit.workspace_id, hit.workspace_name),
     at: null,
     pinned: hit.is_pinned,
+    ownerUserId: rowOwnerUserId(hit),
   };
 }
 
@@ -187,7 +204,14 @@ export function threadRow(ref: ThreadRef, v: Verbs): PaletteItem {
     ...face,
     spans: ref.spans,
     preview: { kind: 'thread', threadId },
-    place: { kind: 'thread', threadId, workspaceId, title: face.title },
+    // DALTON-HOOK(colleague-dispatch): attach ownerUserId when available for thread-scope Ask guard
+    place: {
+      kind: 'thread',
+      threadId,
+      workspaceId,
+      title: face.title,
+      ...(ref.ownerUserId ? { ownerUserId: ref.ownerUserId } : {}),
+    },
     actions: [
       runs('open', v.t('palette.do.open'), MessageSquare, () => v.openThread(threadId, workspaceId)),
       ...threadElsewhere(threadId, v),
@@ -228,7 +252,14 @@ export function turnRow(hit: SearchTurnHit, v: Verbs, { inThread = false } = {})
     pinned,
     meta: [v.workspaceName(workspaceId, hit.workspace_name), v.when(hit.turn_at)].filter(Boolean).join(' · '),
     detail: { label: speaker, text: hit.snippet, spans: hit.matches },
-    place: { kind: 'thread', threadId, workspaceId, title },
+    // DALTON-HOOK(colleague-dispatch): attach ownerUserId when available for thread-scope Ask guard
+    place: {
+      kind: 'thread',
+      threadId,
+      workspaceId,
+      title,
+      ...(thread.ownerUserId ? { ownerUserId: thread.ownerUserId } : {}),
+    },
   };
 }
 

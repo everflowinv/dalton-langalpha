@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import type { SearchKind } from '@/api/search';
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
 import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 import { resolveDualName } from '@/lib/displayName';
@@ -7,7 +8,10 @@ import { readMarkedTicker, readTypedTicker } from '@/lib/marketUtils';
 import { queryKeys } from '@/lib/queryKeys';
 import { queryWords } from '@/lib/textMatch';
 // DALTON-HOOK(colleague-dispatch): palette recent threads follow the sidebar's open and isolation rules
-import { resolveNavThreadPermissions } from '@/pages/ChatAgent/components/NavigationRows';
+import {
+  resolveNavThreadPermissions,
+  resolveNavWorkspacePermissions,
+} from '@/pages/ChatAgent/components/NavigationRows';
 import { getRecentThreads } from '@/pages/ChatAgent/utils/api';
 import { workspaceThreadsQuery } from '@/pages/ChatAgent/utils/threadQueries';
 import type { Thread, Workspace } from '@/types/api';
@@ -314,21 +318,24 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
   // ⌘↵ asks the place's agent, or where new work goes; a prefix says what is
   // being looked for, so it asks nothing. The Ask row is a view of
   // everything's (a place's included) last row.
-  // DALTON-HOOK(colleague-dispatch): also hide Ask in thread scope when the thread itself is not writable
-  // (e.g. a colleague-owned thread inside a read-write colleague workspace).
-  const placeThread =
-    place?.kind === 'thread'
-      ? recent.threads.find((th) => th.thread_id === place.threadId)
-      : undefined;
-  const threadAskBlocked = Boolean(
-    place?.kind === 'thread' &&
-      placeThread &&
-      !resolveNavThreadPermissions(
-        { ...placeThread, title: placeThread.title ?? undefined },
-        workspaceById.get(place.workspaceId),
+  // DALTON-HOOK(colleague-dispatch): judge thread-scope Ask from Place ownerUserId and workspace
+  // permissions instead of recent.threads. When ownerUserId is missing on a hit, allow own workspaces
+  // and conservatively hide Ask in colleague or unresolved workspaces.
+  let threadAskBlocked = false;
+  if (place?.kind === 'thread') {
+    const ws = workspaceById.get(place.workspaceId);
+    const wsPerms = resolveNavWorkspacePermissions(ws ?? { workspace_id: place.workspaceId }, access);
+    if (place.ownerUserId) {
+      const threadPerms = resolveNavThreadPermissions(
+        { thread_id: place.threadId, workspace_id: place.workspaceId, user_id: place.ownerUserId },
+        ws,
         access,
-      ).canMutateThread,
-  );
+      );
+      threadAskBlocked = !threadPerms.canMutateThread;
+    } else if (wsPerms.isColleagueWorkspace || (isDaltonAuth && !ws)) {
+      threadAskBlocked = true;
+    }
+  }
   const ask = lens?.via === 'prefix' || threadAskBlocked ? null : askRow(place, text, v);
   const pages = view === 'threads' ? threadPages : view === 'files' ? filePages : view === 'turns' || view === 'ticker' || view === 'thread' ? turnPages : null;
   const failure = shown.failure ?? null;
