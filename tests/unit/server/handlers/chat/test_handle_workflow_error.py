@@ -12,11 +12,11 @@ setup-error workflow dies.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch  # DALTON-HOOK(chat-large-upload)
 
 import pytest
 
-from src.server.dependencies import usage_limits as usage_limits_deps
+from src.server.dependencies import usage_limits as usage_limits_deps  # DALTON-HOOK(chat-large-upload)
 from src.server.handlers.chat import error_handling
 from src.server.models.additional_context import SkillContext
 from src.server.services.runs.admission import RunScope
