@@ -9,10 +9,13 @@
 import { readFile } from "node:fs/promises";
 
 const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
-const ALERT_CODES = new Set(["backend_down", "backend_recovered"]);
-const ALLOWED_BODY_KEYS = new Set(["code"]);
+const ALERT_CODES = new Set(["backend_down", "backend_recovered", "backup_failed"]);
+const ALLOWED_BODY_KEYS = new Set(["code", "detail"]);
 const ALLOWED_CONFIG_KEYS = new Set(["targets", "messages"]);
-const ALLOWED_MESSAGE_KEYS = new Set(["backend_down", "backend_recovered"]);
+const ALLOWED_MESSAGE_KEYS = new Set(["backend_down", "backend_recovered", "backup_failed"]);
+const REQUIRED_MESSAGE_KEYS = new Set(["backend_down", "backend_recovered"]);
+const DEFAULT_BACKUP_FAILED_TEMPLATE = "Dalton 备份失败：{detail}";
+const MAX_BACKUP_DETAIL_CHARS = 300;
 
 export interface OpsAlertSender {
   (targetAddress: string, text: string): Promise<{ messageId: string }>;
@@ -88,14 +91,41 @@ async function loadOpsAlertConfig(configPath: string | undefined): Promise<
     targets.push(item.trim());
   }
   const messages: Record<string, string> = {};
-  for (const code of ALLOWED_MESSAGE_KEYS) {
+  for (const code of REQUIRED_MESSAGE_KEYS) {
     const text = parsed.messages[code];
     if (typeof text !== "string" || text.trim().length === 0) {
       return { ok: false };
     }
     messages[code] = text;
   }
+  const rawBackupFailed = parsed.messages.backup_failed;
+  if (rawBackupFailed !== undefined) {
+    if (typeof rawBackupFailed !== "string" || rawBackupFailed.trim().length === 0) {
+      return { ok: false };
+    }
+    messages.backup_failed = rawBackupFailed;
+  } else {
+    messages.backup_failed = DEFAULT_BACKUP_FAILED_TEMPLATE;
+  }
   return { ok: true, targets, messages };
+}
+
+export function sanitizeBackupAlertDetail(raw: string): string {
+  // Replace line breaks/tabs with spaces and strip remaining ASCII control characters.
+  const withoutControls = raw
+    .replace(/[\r\n\t]+/g, " ")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .trim();
+  return Array.from(withoutControls).slice(0, MAX_BACKUP_DETAIL_CHARS).join("");
+}
+
+function renderBackupFailedMessage(template: string, rawDetail: string): string {
+  const detail = sanitizeBackupAlertDetail(rawDetail) || "未知原因";
+  if (template.includes("{detail}")) {
+    return template.replaceAll("{detail}", () => detail);
+  }
+  return `${template}：${detail}`;
 }
 
 export async function handleOpsAlert(options: {
@@ -132,7 +162,31 @@ export async function handleOpsAlert(options: {
       data: {
         ok: false,
         code: "invalid_request",
-        message: "code must be backend_down or backend_recovered.",
+        message: "code must be backend_down, backend_recovered, or backup_failed.",
+      },
+    };
+  }
+  if (code !== "backup_failed" && options.body.detail !== undefined) {
+    return {
+      status: 400,
+      data: {
+        ok: false,
+        code: "invalid_request",
+        message: "detail is only supported for backup_failed.",
+      },
+    };
+  }
+  if (
+    code === "backup_failed" &&
+    options.body.detail !== undefined &&
+    typeof options.body.detail !== "string"
+  ) {
+    return {
+      status: 400,
+      data: {
+        ok: false,
+        code: "invalid_request",
+        message: "detail must be a string.",
       },
     };
   }
@@ -143,7 +197,13 @@ export async function handleOpsAlert(options: {
   if (!config.ok) {
     return invalidConfig();
   }
-  const text = config.messages[code] ?? "";
+  const text =
+    code === "backup_failed"
+      ? renderBackupFailedMessage(
+          config.messages.backup_failed ?? DEFAULT_BACKUP_FAILED_TEMPLATE,
+          typeof options.body.detail === "string" ? options.body.detail : "",
+        )
+      : (config.messages[code] ?? "");
   const results: Array<Record<string, unknown>> = [];
   let anyFailed = false;
   for (const target of config.targets) {
