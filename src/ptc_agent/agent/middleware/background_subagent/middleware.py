@@ -34,6 +34,15 @@ from ptc_agent.agent.middleware.background_subagent import (
 )
 from ptc_agent.config.agent import SubagentModel
 
+#: Why a resume on Claude Code is refused for a task another model last
+#: answered (a pin that ran on the turn's model then), as the refusal reads
+#: after "could not start <task>".
+OTHER_MODEL_TASK_REFUSAL = (
+    "another model wrote its last reply, which Claude Code's session does not hold. "
+    "To go on with it on Claude Code, launch a new task and give it the task's assignment "
+    "and what it found so far, since the new task starts with none of it"
+)
+
 if TYPE_CHECKING:
     pass
 
@@ -99,6 +108,9 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         self.claude_code_stored = False
         #: The model each of those types' CLIs runs, by type.
         self.claude_code_models: dict[str, str] = {}
+        #: The own computer those CLIs run on for a workspace on another
+        #: computer, whose count bounds them rather than the thread's.
+        self.cli_computer: str | None = None
         # Task ids with a resume mid-flight: the liveness check and the
         # writer spawn are separated by awaits, so two parallel resume calls
         # in one model step could otherwise both pass and double-spawn (the
@@ -211,6 +223,14 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                     "its checkpoint namespace could not be fenced. Try again"
                 )
 
+        if (
+            cause == "resume"
+            and task.subagent_type in self.claude_code_types
+            and await self._another_model_answered(task)
+        ):
+            await self._release_task_ns(task.task_id)
+            raise TaskRunRefused(OTHER_MODEL_TASK_REFUSAL, final=True)
+
         ledger = getattr(self.registry, "run_ledger", None)
         if ledger is None:
             return ""
@@ -226,6 +246,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 claude_code=task.subagent_type in self.claude_code_types,
                 stored_token=self.claude_code_stored,
                 claude_code_model=self.claude_code_models.get(task.subagent_type),
+                cli_computer=self.cli_computer,
             )
         except TaskRunRejected as e:
             logger.warning(
@@ -235,7 +256,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 reason=e.reason,
             )
             await self._release_task_ns(task.task_id)
-            raise TaskRunRefused(e.reason, busy=e.busy, whole=e.whole) from e
+            raise TaskRunRefused(e.reason, busy=e.busy, whole=e.whole, final=e.final) from e
         except Exception as e:
             logger.error(
                 "task-run ledger unavailable; refusing spawn",
@@ -245,6 +266,38 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
             )
             await self._release_task_ns(task.task_id)
             raise RunLedgerUnavailable("its run could not be recorded. Try again") from e
+
+    async def _another_model_answered(self, task: BackgroundTask) -> bool:
+        """Whether another model wrote the task's last reply, which a Claude
+        Code run of it would fail on (``another_model_replied_last``), read
+        off its replayed history. A failed read leaves that to the run."""
+        from ptc_agent.agent.main_state import MainAgentState
+        from ptc_agent.agent.middleware.background_subagent.workflow.ui_snapshot import (
+            task_namespace_graph,
+        )
+        from src.llms.claude_code import another_model_replied_last
+
+        if not self.checkpointer or not self.registry.thread_id:
+            return False
+        try:
+            # A no-op graph that replays the namespace, whose messages are a
+            # delta channel a raw checkpoint read does not materialize. Built
+            # per read: one kept per saver would keep each run's saver alive.
+            graph = task_namespace_graph(MainAgentState, self.checkpointer)
+            state = await graph.aget_state(
+                {
+                    "configurable": {
+                        "thread_id": self.registry.thread_id,
+                        "checkpoint_ns": f"task:{task.task_id}",
+                    }
+                }
+            )
+        except Exception:
+            logger.warning(
+                "task history read failed", task_id=task.task_id, exc_info=True
+            )
+            return False
+        return another_model_replied_last((state.values or {}).get("messages") or [])
 
     async def _abort_admitted_run(self, task: BackgroundTask, exc: Exception) -> None:
         """Post-INSERT setup failure: settle the just-born row as error

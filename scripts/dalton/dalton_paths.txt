@@ -407,3 +407,4 @@ tests/unit/ptc_agent/agent/prompts/test_prompt_compaction.py
 # P7: display filter for harness thinking markers leaked into assistant text.
 src/server/utils/thinking_leak.py
 tests/unit/server/utils/test_thinking_leak.py
+web/src/components/CommandPalette/__tests__/CommandPaletteProvider.test.tsx

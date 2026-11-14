@@ -47,6 +47,7 @@ import { createApprovalEvidence, recordApprovalEvidence } from '../interrupts/cl
 import { projectHistoryInterrupt } from '../interrupts/fromHistoryEvent';
 import type { HistoryRuntime } from '../runtime';
 import type { HistoryPageInfo, LoadedHistoryPage } from './olderPages';
+import type { PageBudget } from './pageBudget';
 import { applyHistoryToolResult, markSteeredResumeCards, settleResumedInterrupts } from './resumeSettlement';
 import { readStreamFailure } from '../stream/streamFailure';
 
@@ -69,8 +70,8 @@ export interface ReplayHistoryDeps {
    *  what the load will return. The caller settles here what only it can judge
    *  (a run that is over), so the transcript never appears unsettled first. */
   beforeReveal?: (ok: boolean) => void;
-  /** Page size for the newest page; omitted replays the whole thread. */
-  limit?: number;
+  /** What the newest page may carry; omitted replays the whole thread. */
+  page?: PageBudget;
   /** Replay the page before this turn instead, into a transcript of its own:
    *  an older page (loadOlderHistoryPage), with `signal` to abort its fetch. */
   beforeTurn?: number;
@@ -867,7 +868,7 @@ export async function loadConversationHistory(
       }
     };
       const result = await replayThreadHistory(threadIdToUse, onEvent, {
-        limit: deps.limit, beforeTurn: deps.beforeTurn, signal: deps.signal,
+        page: deps.page, beforeTurn: deps.beforeTurn, signal: deps.signal,
       });
       // DALTON-HOOK(provenance-batch): an overtaken replay ends here, before it strips, stamps or reveals the newer transcript; the replay that overtook it owns the loading state
       if (deps.isCurrent && !deps.isCurrent()) return false;
@@ -959,12 +960,11 @@ export async function loadConversationHistory(
       lastTurnIndex: maxReplayedTurnIndex,
       carry: { events: carryEvents, subagents: subagentHistoryByTaskId, steeredAgentIds },
     });
+    // The thread's ratings (best-effort), started before the transcript shows
+    // so its turns read as loading rather than unrated.
+    const feedbackLoad = rt.threadId ? deps.loadFeedback(rt.threadId) : null;
     reveal(true);
-
-    // Fetch feedback state for the thread (best-effort)
-    if (rt.threadId) {
-      await deps.loadFeedback(rt.threadId);
-    }
+    await feedbackLoad;
     return true;
   } catch (error: unknown) {
     if (olderPage) throw error;

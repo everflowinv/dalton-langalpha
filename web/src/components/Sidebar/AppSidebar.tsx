@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, ArrowRight, LayoutGrid, PanelLeftClose, PanelLeftOpen, Plus, Search, SquarePen } from 'lucide-react'; // DALTON-HOOK(global-search)
@@ -12,12 +12,12 @@ import { useNavItems } from '../nav/useNavItems';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import NavigationPanel from '@/pages/ChatAgent/components/NavigationPanel';
 import NavDisplayOptions from '@/pages/ChatAgent/components/NavDisplayOptions';
-import { useCreateWorkspace } from '@/pages/ChatAgent/hooks/useCreateWorkspace';
 import { useNavTreeProps } from '@/pages/ChatAgent/hooks/useNavTreeProps';
 import type { NavWorkspace } from '@/pages/ChatAgent/hooks/useNavigationData';
-import type { Workspace } from '@/types/api';
 import AccountMenu from './AccountMenu';
 import { useChatRoute } from './useChatRoute';
+import { paletteKeyShortcuts, paletteShortcut, useCommandPalette } from '../CommandPalette/CommandPaletteProvider';
+import { useOpenCreateWorkspace } from '../CreateWorkspaceHost';
 import { useSidebarAgents } from '@/pages/ChatAgent/components/sidebarAgentsBridge';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { GettingStartedGate } from '@/pages/Onboarding';
@@ -68,8 +68,6 @@ function HistoryButtons() {
   );
 }
 
-// Off the entry chunk: the modal is only needed once the button is pressed.
-const CreateWorkspaceModal = lazy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'));
 // DALTON-HOOK(global-search): global search trigger
 import { openGlobalSearch } from '@/components/dalton/globalSearchHost';
 
@@ -182,13 +180,10 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
   }, [navigate]);
 
   const openGallery = useCallback(() => navigate('/chat'), [navigate]);
+  const palette = useCommandPalette();
 
   // Same create flow as the gallery, without leaving the current page first.
-  const [isCreateOpen, setIsCreateOpen] = useState(false);
-  const createWorkspace = useCreateWorkspace();
-  const openCreatedWorkspace = useCallback((ws: Workspace) => {
-    navigate(`/chat/${ws.workspace_id}`, { state: { workspaceName: ws.name, workspaceStatus: null } });
-  }, [navigate]);
+  const openCreateWorkspace = useOpenCreateWorkspace();
 
   // DALTON-HOOK(global-search): global search shortcut label
   const shortcutLabel =
@@ -243,6 +238,24 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         </TooltipProvider>
         <nav className="sidebar-nav">
           <TooltipProvider delayDuration={300}>
+            {palette && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    className="sidebar-nav-item"
+                    onClick={palette.open}
+                    onPointerEnter={palette.preload}
+                    aria-label={t('palette.search')}
+                    aria-keyshortcuts={paletteKeyShortcuts()}
+                  >
+                    <Search className="sidebar-nav-icon" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  {t('palette.search')} <span className="sidebar-shortcut">{paletteShortcut()}</span>
+                </TooltipContent>
+              </Tooltip>
+            )}
             {navItems.map((item) => {
               const Icon = item.icon;
               const label = t(item.labelKey);
@@ -314,6 +327,18 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
       </div>
 
       <nav className="sidebar-panel-nav">
+        {palette && (
+          <button
+            className="sidebar-panel-item"
+            onClick={palette.open}
+            onPointerEnter={palette.preload}
+            aria-keyshortcuts={paletteKeyShortcuts()}
+          >
+            <Search className="sidebar-panel-item-icon" />
+            <span>{t('palette.search')}</span>
+            <kbd className="sidebar-shortcut" aria-hidden>{paletteShortcut()}</kbd>
+          </button>
+        )}
         <button className="sidebar-panel-item" onClick={handleNewChat}>
           <SquarePen className="sidebar-panel-item-icon" />
           <span>{t('sidebar.newChat')}</span>
@@ -342,7 +367,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         <div className="sidebar-section-actions">
           <button
             className="nav-panel-dismiss-btn sidebar-section-action-btn"
-            onClick={() => setIsCreateOpen(true)}
+            onClick={() => openCreateWorkspace?.()}
             aria-label={t('workspace.newWorkspace')}
             title={t('workspace.newWorkspace')}
           >
@@ -373,17 +398,6 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
       <div className="sidebar-panel-bottom">
         <AccountMenu variant="row" />
       </div>
-
-      {isCreateOpen && (
-        <Suspense fallback={null}>
-          <CreateWorkspaceModal
-            isOpen
-            onClose={() => setIsCreateOpen(false)}
-            onCreate={createWorkspace}
-            onComplete={openCreatedWorkspace}
-          />
-        </Suspense>
-      )}
 
       {/* Edge drag = resize (double-click resets to the default width). */}
       <div

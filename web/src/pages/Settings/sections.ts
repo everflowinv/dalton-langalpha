@@ -13,6 +13,7 @@ import {
   Plug,
   SlidersHorizontal,
 } from 'lucide-react';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isPlatformMode } from '@/config/hostMode';
 import { TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 
@@ -205,6 +206,25 @@ const LEGACY_SECTIONS: Record<string, Section> = {
   llm: 'model',
   dalton: 'model',
 };
+
+/**
+ * The words a setting is found by: its name, what it does, its aliases and the
+ * section it sits in. One list for every search over settings, so the page's
+ * rail and the command palette find the same setting for the same words.
+ */
+export function settingSearchText(
+  entry: SettingEntry,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  return [
+    t(entry.labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)
+    entry.descKey ? t(entry.descKey, { brand: BRAND_NAME }) : '', // DALTON-HOOK(brand-name)
+    ...(entry.alsoKeys ?? []).map((key) => t(key, { brand: BRAND_NAME })), // DALTON-HOOK(brand-name)
+    t(SECTIONS[entry.section].labelKey),
+    // DALTON-HOOK(settings-section): match bilingual keywords so Chinese and English queries always hit
+    entry.keywords ?? '',
+  ].join(' ');
+}
 
 function asSection(param: string | null): Section | null {
   if (!param) return null;

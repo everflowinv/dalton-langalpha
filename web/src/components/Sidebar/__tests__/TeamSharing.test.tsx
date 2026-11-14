@@ -136,7 +136,12 @@ const STABLE_CHAT_HELPERS = vi.hoisted(() => ({
     get: () => mockMessages.current,
     subscribe: () => () => {},
   },
-  olderHistory: { status: 'idle' as const, load: vi.fn(() => Promise.resolve()) },
+  // DALTON-HOOK(team-sharing): the history window is a snapshot plus load and backfill
+  olderHistory: {
+    snapshot: { status: 'idle' as const, aligned: false, hasAhead: false },
+    load: vi.fn(() => Promise.resolve()),
+    backfill: vi.fn(() => Promise.resolve()),
+  },
   threadModels: [] as string[],
   stopWorkflow: vi.fn(() => Promise.resolve()),
   stopCompaction: vi.fn(() => Promise.resolve()),
@@ -193,6 +198,9 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     olderHistory: STABLE_CHAT_HELPERS.olderHistory,
     isReconnecting: false,
     messageError: null,
+    // DALTON-HOOK(team-sharing): upstream #748 feedback follow-up fields
+    handleThumbDownFollowUp: vi.fn(),
+    feedbackLoading: false,
     threadId: 'th-1',
     isShared: true,
     threadModels: STABLE_CHAT_HELPERS.threadModels,

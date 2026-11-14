@@ -15,7 +15,7 @@ from typing import Any
 from ptc_agent.agent.roles import AgentRole
 from ptc_agent.agent.subagents.merge import turn_roster
 
-from src.llms.claude_code import is_claude_code_model
+from src.llms.claude_code import FEATURE, is_claude_code_model, rows_available
 from src.llms.preferences import (
     Tuning,
     compaction_profile_for,
@@ -41,10 +41,11 @@ from .availability import (
 from . import logger
 
 from .capabilities import PlanTier, gate_capabilities
-from .claude_code import drop_claude_code_roles, require_runnable
+from .claude_code import chief_of_staff_default_runs, claude_code_placement, drop_claude_code_roles, require_runnable
 from .clients import resolve_clients
 from .subagents import (
     demote_clientless,
+    pins_claude_code,
     read_user_subagents,
     resolve_user_subagents,
     subagent_models,
@@ -517,7 +518,7 @@ async def resolve_llm_config(
     workspace_id: str | None = None,
     user_facing: bool = True,
     role: AgentRole = "analyst",
-    unattended: bool = False,
+    checkpoint_id: str | None = None,
 ):
     """Resolve the final LLM config for one turn: which model runs, how it is
     tuned, what it is allowed to reach, and every client it can call.
@@ -528,9 +529,10 @@ async def resolve_llm_config(
     them, and ``role`` is the agent the turn builds, whose subagents alone get
     clients. ``user_facing=False`` is a call no user is waiting on (a title, memo
     metadata): nobody would see the ``model_removed`` CTA, so its own saved
-    model is read like a role and nothing is scrubbed. ``unattended`` is a
-    turn nobody started (``claude_code.unattended``), which Claude Code
-    admission refuses on a stored token before its plan.
+    model is read like a role and nothing is scrubbed. ``checkpoint_id``
+    is where an edit or a regenerate starts the turn on the thread, whose
+    history there decides whether the Chief of Staff runs a Claude Code
+    Default (``chief_of_staff_default_runs``).
     """
     reads: asyncio.Task | None = None
     try:
@@ -554,13 +556,12 @@ async def resolve_llm_config(
         model_pref, dropped = drop_dead_models(saved_pref, role_keys)
         if dropped:
             logger.info(f"[CHAT] Ignoring saved models not in the manifest for user={user_id}: {dropped}")
-        # Chief of Staff does not run on a Claude Code row either, so its turn
-        # reads such a default as unset and runs the deployment's model, as a
-        # Background job does (one chat model call, which such a row does not
-        # make); a Claude Code row named for the turn is refused.
+        # A Background job reads a Claude Code default as unset and runs the
+        # deployment's model (one chat model call, which such a row does not
+        # make); a Claude Code row named for the turn is refused there.
+        default_key = _SLOT_MODEL_MAP[slot][1]
         model_pref, _ = drop_claude_code_roles(
-            model_pref,
-            [*role_keys, _SLOT_MODEL_MAP[slot][1]] if role == "chief_of_staff" or slot == "background" else role_keys,
+            model_pref, [*role_keys, default_key] if slot == "background" else role_keys,
         )
 
         # One tier read for every plan gate the turn runs.
@@ -578,11 +579,26 @@ async def resolve_llm_config(
             reads = asyncio.create_task(read_user_subagents(user_id, base_config.subagents))
 
         await load_user_context(config, user_id, workspace_id, model_pref)
+        # So does the Chief of Staff where it would not run that default
+        # (``chief_of_staff_default_runs``), read once the user's flags are,
+        # unless the turn names its model; where it would, admission reads the
+        # placement it found.
+        where = None
+        if (
+            role == "chief_of_staff" and request_model is None
+            and is_claude_code_model(model_pref.get(default_key) or "")
+        ):
+            if rows_available() and config.feature_enabled(FEATURE):
+                where = await chief_of_staff_default_runs(
+                    user_id, workspace_id, thread_id=thread_id, checkpoint_id=checkpoint_id,
+                )
+            if where is None:
+                model_pref, _ = drop_claude_code_roles(model_pref, [default_key])
         selection = select_model(config, model_pref, slot, request_model)
         if is_claude_code_model(selection.effective_model):
-            config.claude_code_hosted, config.claude_code_saved = await require_runnable(
-                config, selection.effective_model, role, user_id=user_id, workspace_id=workspace_id,
-                thread_id=thread_id, unattended=unattended,
+            config.claude_code_admitted = await require_runnable(
+                config, selection.effective_model, user_id=user_id, workspace_id=workspace_id,
+                thread_id=thread_id, where=where,
             )
             config.claude_code = True
             # A Claude Code turn stops when its plan runs out rather than move
@@ -607,11 +623,18 @@ async def resolve_llm_config(
         # After the gate, whose tier check the merge reuses, and before the
         # clients, which read the merged definitions for their roles.
         if reads is not None:
+            subagent_reads = await reads
+            # A Claude Code pin on a turn of another model runs on Claude
+            # Code where the workspace has it now, else on the turn's model.
+            if not config.claude_code and pins_claude_code(subagent_reads):
+                config.claude_code_pins = await claude_code_placement(
+                    config, user_id=user_id, workspace_id=workspace_id,
+                )
             config.subagents.resolved = await resolve_user_subagents(
-                user_id, await reads, model_pref=model_pref, permits=permits,
+                user_id, subagent_reads, model_pref=model_pref, permits=permits,
                 is_byok=is_byok, search_api=config.search_api,
                 search_depth=config.search_depth, requested=enabled_subagents,
-                claude_code_turn=config.claude_code,
+                claude_code=config.claude_code or config.claude_code_pins is not None,
             )
     finally:
         # A stage above that raises must not leave the reads running, or let

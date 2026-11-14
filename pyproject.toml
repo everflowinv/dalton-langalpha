@@ -139,6 +139,10 @@ dependencies = [
     "opencc-python-reimplemented",
     "curl_cffi>=0.14",
     "openpyxl>=3.1.5",
+    # Error tracking, off unless SENTRY_DSN is set. A base dependency rather
+    # than part of `observability`, so setting the DSN never meets an image
+    # built without the SDK.
+    "sentry-sdk[fastapi]>=2.44",
 ]
 
 [tool.uv.sources]

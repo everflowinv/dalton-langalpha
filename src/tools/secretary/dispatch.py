@@ -35,6 +35,7 @@ _THREAD_BUSY = (
     "sent. Tell the user it is busy: they can wait for that turn and ask "
     "again or stop it, or you can start a new thread with workspace_id."
 )
+_REFUSED = "The analyst's thread refused this hand-off: {message}"
 
 
 async def _confirm_dispatch_admission(
@@ -381,17 +382,17 @@ async def dispatch(
         if isinstance(detail, dict):
             err_code = detail.get("type") or detail.get("code")
             err_msg = detail.get("message") or detail.get("detail")
-            if err_code and err_msg:
+            # DALTON-HOOK(colleague-dispatch): preserve oauth_required (and colleague error codes) alongside message;
+            # upstream refusals (e.g. claude_code_off) surface only `message` via _REFUSED.
+            if err_code == "oauth_required" and err_msg:
                 return f"{err_code}: {err_msg}"
-            if err_msg:
-                return str(err_msg)
-            if err_code:
+            if isinstance(err_msg, str) and err_msg.strip():
+                return err_msg.strip()
+            if is_colleague_ws and err_code:
                 return str(err_code)
-        elif isinstance(detail, str) and detail.strip():
+            return "dispatch_failed"
+        if is_colleague_ws and isinstance(detail, str) and detail.strip():
             return detail.strip()
-        err_str = err_body.get("error")
-        if isinstance(err_str, str) and err_str.strip():
-            return err_str.strip()
         return "dispatch_failed"
 
     # reserve() takes a cap slot + records the PTC origin, rolling back on any
@@ -521,10 +522,19 @@ async def dispatch(
                             return error_command(
                                 _THREAD_BUSY, tool_call_id, **handed_to
                             )
+                        # A 5xx is the server failing, not the thread refusing.
                         # DALTON-HOOK(colleague-dispatch): propagate error detail (e.g. oauth_required) to Chief of Staff
+                        if resp.status >= 500:
+                            return error_command(
+                                "dispatch_failed", tool_call_id, **handed_to
+                            )
                         err_detail = await _extract_dispatch_error(resp)
                         return error_command(
-                            err_detail, tool_call_id, **handed_to
+                            "dispatch_failed"
+                            if err_detail == "dispatch_failed"
+                            else _REFUSED.format(message=err_detail),
+                            tool_call_id,
+                            **handed_to,
                         )
                     if resp.status != 200:
                         # Not the endpoint's reply (it answers exactly 200;

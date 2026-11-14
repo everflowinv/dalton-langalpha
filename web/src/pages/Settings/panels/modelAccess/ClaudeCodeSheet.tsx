@@ -10,7 +10,7 @@ import type { ClaudeCodeComputer, ClaudeCodePlan, ClaudeCodeSetup } from '@/api/
 import { DESKTOP_DOWNLOAD_URL } from '@/config/supportLinks';
 import { isPlatformMode } from '@/config/hostMode';
 import { useFeatures, useSetFeatureOverride } from '@/hooks/useFeatures';
-import { useClaudeCodeStatus } from '@/hooks/useClaudeCode';
+import { useClaudeCodeComputers, useClaudeCodeStatus } from '@/hooks/useClaudeCode';
 import { useNow } from '@/hooks/useNow';
 import { useClaudeCodeCustody } from '@/hooks/useClaudeCodeCustody';
 import { ClaudeCodeTokenModal, TokenActions } from '@/components/modelAccess/ClaudeCodeToken';
@@ -32,6 +32,7 @@ import { useSaveFailedToast } from '../usePreferenceWrite';
 import { Group } from './AccessRows';
 import { ClaudeCodeHostedChoice } from './ClaudeCodeHostedChoice';
 import { ClaudeCodePlanOutChoice } from './ClaudeCodePlanOutChoice';
+import { ComputerClis } from './ComputerClis';
 import { claudeCodeHeadline } from './claudeCodeHeadline';
 
 const S = 'modelAccess.claudeCode.setup';
@@ -54,15 +55,18 @@ const iconOf = (kind: ClaudeCodeComputer['kind'] | undefined) => glyph(kind === 
  * on the table's columns, or, where its token reported no use yet, says
  * so. A row with no use to show takes the usage columns for its text, so
  * its detail has the room it has outside the table, and wraps only where it
- * would there.
+ * would there. A computer's own setting (`setting`) sits under its detail,
+ * and in the table on a line under the row (`below`), since the usage
+ * columns leave the text too narrow for it.
  */
-function SetupRow({ icon, name, detail, status, action, plan }: {
+function SetupRow({ icon, name, detail, status, action, plan, setting }: {
   icon: ReactNode;
   name: string;
   detail: ReactNode;
   status?: RowStatus;
   action: ReactNode;
   plan?: ClaudeCodePlan | null;
+  setting?: ReactNode;
 }) {
   const steps = useContext(UsageTableContext);
   const clock = usePlanClock();
@@ -86,6 +90,7 @@ function SetupRow({ icon, name, detail, status, action, plan }: {
           {status ? <StatusLabel status={status} className="whitespace-nowrap" /> : <span />}
           <div className="flex">{action}</div>
         </div>
+        {setting && <div className={steps.below}>{setting}</div>}
       </li>
     );
   }
@@ -95,6 +100,7 @@ function SetupRow({ icon, name, detail, status, action, plan }: {
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="text-sm font-medium wrap-break-word" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
         {detail && <span className="text-xs text-pretty wrap-break-word" style={{ color: 'var(--color-text-tertiary)' }}>{detail}</span>}
+        {setting}
       </div>
       {status ? <StatusLabel status={status} className="whitespace-nowrap" /> : <span />}
       <div className="flex">{action}</div>
@@ -176,7 +182,6 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
   // choice is still offered: with none read, warn of it wherever a hosted
   // server keeps the user's token.
   const storedMayGo = custody ? custody.mode === 'stored' : isPlatformMode && claudeCodeStatus.saved;
-  const now = useNow();
   // An operator may gate the flag so the user cannot turn it on or off
   // (`none`, or a plan); only an opt-in or opt-out gate takes their pick,
   // so a gate not yet read takes none.
@@ -227,7 +232,15 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
     />
   );
 
-  const headline = setup && claudeCodeHeadline(t, setup, now);
+  const { cliComputer, computers, clisMax } = useClaudeCodeComputers();
+  // How many agents each computer runs at once, set on its row once Claude
+  // Code is on and the server offers the setting.
+  const clisOf = (computerId: string) => {
+    const clis = computers.find((c) => c.computer_id === computerId)?.clis;
+    return on && clisMax && clis != null ? <ComputerClis computerId={computerId} clis={clis} max={clisMax} /> : undefined;
+  };
+  const now = useNow();
+  const headline = setup && claudeCodeHeadline(t, setup, now, cliComputer);
   const kindOf = new Map((setup?.computers ?? []).map((c) => [c.computer_id, c.kind]));
   // A saved token left behind after Claude Code was turned off still shows, to be removed.
   const savedRow = tokenRows.find(({ key }) => key === 'saved');
@@ -260,6 +273,7 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
           status={offline ? 'offline' : line.status}
           plan={offline ? undefined : line.plan}
           action={offline ? viewComputer(key) : actions(line.actions, target, { row, offline })}
+          setting={clisOf(key)}
         />
       );
     })
@@ -301,7 +315,7 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
     || (!offeredSaved && !setup.computers.some((c) => c.state === 'off' && c.source !== 'machine'))
   );
   const remoteControl = canRemoteControl();
-  const bigger = biggerComputer();
+  const bigger = biggerComputer(false);
   const tooSmall = setup?.too_small ?? [];
   const savedOnCloud = isPlatformMode ? setup?.cloud : setup?.cli_in_sandbox;
   const savedDetail = savedOnCloud ? t(S + '.savedDetailCloud') : !isPlatformMode ? t(S + '.savedDetailServer') : null;
@@ -349,6 +363,7 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
         <div className="flex flex-col gap-1">
           <h3 className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{headline.title}</h3>
           <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{headline.body}</div>
+          {headline.runsOn && <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{headline.runsOn}</div>}
         </div>
       )}
 

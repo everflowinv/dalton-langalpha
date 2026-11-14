@@ -1760,7 +1760,8 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       await waitFor(() => {
         expect(hookState).not.toBeNull();
         expect(hookState!.isLoadingThread).toBe(false);
-        expect(hookState!.olderHistory.status).toBe('idle');
+        // DALTON-HOOK(chat-large-upload): paging status is on the history snapshot
+        expect(hookState!.olderHistory.snapshot.status).toBe('idle');
       });
 
       // 1. While only turns 5..24 are loaded:
@@ -1824,7 +1825,8 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       });
 
       await waitFor(() => {
-        expect(hookState!.olderHistory.status).toBe('end');
+        // DALTON-HOOK(chat-large-upload): paging status is on the history snapshot
+        expect(hookState!.olderHistory.snapshot.status).toBe('end');
       });
 
       // Turn 2's failed steer now appears EXACTLY ONCE, positioned at turn 2 (after history-assistant-2, before history-user-3)!

@@ -9,6 +9,7 @@ import { useAllModels } from '@/hooks/useAllModels';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
+import { useTurnDefaultModel } from '@/hooks/useTurnModels';
 import { modelLabel } from '@/lib/modelLabel';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey } from '@/lib/threadFieldMutations';
@@ -46,6 +47,9 @@ interface UseThreadModelOptions {
   /** The model a navigation's first message went out with, which the thread
    *  row does not carry until that send has stored it. */
   initialModel?: string | null;
+  /** Whether the thread is the Chief of Staff's, whose turn may start on
+   *  another Default than the account's (`useTurnDefaultModel`). */
+  chiefOfStaff?: boolean;
 }
 
 /**
@@ -53,10 +57,17 @@ interface UseThreadModelOptions {
  * next send names, and the one place a pick on it is saved.
  *
  * The thread row is the source. The model starts on the row's model while it
- * is reachable (else the account default) and follows the row when it moves; a
+ * is reachable (else the Default its turn starts on, the Chief of Staff's
+ * for a thread in Home) and follows the row when it moves; a
  * pick holds in between and is saved on the row (`useThreadFieldSave`). A
  * thread not created yet has no row to write, so its pick is held here and
  * goes out with the first send, which stores it.
+ *
+ * A thread whose row names no model, or one that left the catalog, shows the
+ * Default it would start on but sends none until a pick (`sendModel`), so
+ * the server clears the model that left and resolves the Default with the
+ * thread's history: it drops a Claude Code Default where another model
+ * replied, and refuses a send that names one there.
  *
  * A pick also raises the offer to make that model the account default, shown
  * while the composer still shows the pick and it differs from the default.
@@ -65,6 +76,7 @@ export function useThreadModel({
   threadId,
   isLoading,
   initialModel = null,
+  chiefOfStaff = false,
 }: UseThreadModelOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -82,13 +94,14 @@ export function useThreadModel({
   // and the send would store the default over the model the thread holds.
   // With no model named, the server runs the thread's own.
   const unread = !!liveThreadId && !thread && !initialModel;
+  const own = thread?.llm_model || initialModel || null;
+  // Only a thread whose row names no model it runs starts on the Default,
+  // so only there is the server asked what this thread's Default is.
+  const followsDefault = !unread && !(own && isModelAvailable(own, catalogModelNames));
+  const startsOn = useTurnDefaultModel(chiefOfStaff, followsDefault ? liveThreadId : null);
   const { seed, retired: retiredName } = unread
     ? { seed: null, retired: null }
-    : resolveComposerModel(
-      thread?.llm_model || initialModel || null,
-      defaultModel,
-      catalogModelNames,
-    );
+    : resolveComposerModel(own, startsOn, catalogModelNames);
 
   // DALTON-HOOK(ui-model-pick): hold an unconfirmed pick (or initialModel on a
   // new thread whose row is not read yet) across stale mid-turn row reads
@@ -164,7 +177,7 @@ export function useThreadModel({
         ? null
         : resolveComposerModel(
           restoredRow?.llm_model || initialModel || null,
-          defaultModel,
+          startsOn,
           catalogModelNames,
         ).seed;
       if (pendingRef.current === value) {
@@ -196,7 +209,7 @@ export function useThreadModel({
         }
         setPending((current) => (current === saved.llm_model ? null : current));
       }
-      const to = saved.llm_model || defaultModel;
+      const to = saved.llm_model || startsOn;
       if (!saved.summary_handoff || !to) return;
       toast({ description: t('chat.threadModel.handoff', { model: modelLabel(to, metadata) }) });
     },
@@ -227,8 +240,8 @@ export function useThreadModel({
   shownThreadRef.current = liveThreadId;
   const isLoadingRef = useRef(isLoading);
   isLoadingRef.current = isLoading;
-  const defaultModelRef = useRef(defaultModel);
-  defaultModelRef.current = defaultModel;
+  const startsOnRef = useRef(startsOn);
+  startsOnRef.current = startsOn;
   const catalogModelNamesRef = useRef(catalogModelNames);
   catalogModelNamesRef.current = catalogModelNames;
 
@@ -262,7 +275,7 @@ export function useThreadModel({
       }
       const nextModel = resolveComposerModel(
         freshModel,
-        defaultModelRef.current,
+        startsOnRef.current,
         catalogModelNamesRef.current,
       ).seed;
       pendingRef.current = null;
@@ -286,6 +299,9 @@ export function useThreadModel({
       queryKey: key,
       ...(saving ? { refetchType: 'none' as const } : {}),
     });
+    // The turn may have been another model's reply, which moves the Default
+    // a Home thread starts on.
+    void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeChiefOfStaff(liveThreadId) });
     if (saving) {
       deferredCheckRef.current = id;
       return;
@@ -317,8 +333,8 @@ export function useThreadModel({
   // Named only once there is a default to name beside it, and never when the
   // default is the retired model too: the row would promise a move that the
   // composer cannot make.
-  const retired: RetiredModel | null = retiredName && defaultModel && retiredName !== defaultModel
-    ? { model: retiredName, fallback: defaultModel }
+  const retired: RetiredModel | null = retiredName && startsOn && retiredName !== startsOn
+    ? { model: retiredName, fallback: startsOn }
     : null;
   const lapsedProvider = lapsedOf(model);
   const lapsed: LapsedSignIn | null = model && lapsedProvider ? { model, provider: lapsedProvider } : null;
@@ -326,6 +342,8 @@ export function useThreadModel({
     ? { model: offered, defaultModel }
     : null;
 
+  const sendModel = thread && seed !== own && model === seed ? null : model;
+
   // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
-  return { model, retired, lapsed, offer, pickModel, dismissOffer, thread };
+  return { model, sendModel, retired, lapsed, offer, pickModel, dismissOffer, thread };
 }

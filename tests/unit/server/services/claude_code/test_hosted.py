@@ -23,13 +23,15 @@ from ptc_agent.agent.claude_code.launcher import Credential
 from ptc_agent.config.core import SandboxConfig
 from src.llms.claude_code import ClaudeTurnFailed
 from src.server.app import claude_code as route
-from src.server.database.claude_code_hosted import CLAUDE_CODE_TURN, CLOUD_TURN, Custody
+from src.server.database.claude_code_hosted import CLAUDE_CODE_TURN, CLI_COMPUTER, CLOUD_TURN, Custody
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.services.claude_code import hosted as hosted_module
 from src.server.services.claude_code.launchers import HostedCredential
 from src.server.services.claude_code.saved import token_hash
 from src.server.services.computer_manager._providers import ProviderMixin
 from src.server.services.llm.claude_code import (
     CLAUDE_CODE_OFF,
+    Admitted,
     claude_code_off_message,
     claude_code_refusal,
     require_runnable,
@@ -44,6 +46,7 @@ LAUNCHERS = "src.server.services.claude_code.launchers"
 CODE = "claude-haiku-5-5-code"
 CLOUD = {"computer_id": "c-2", "name": "Research", "kind": "daytona", "resource_tier": "performance"}
 OWN = {"computer_id": "c-1", "kind": "ssh"}
+STUDIO = {"computer_id": "c-9", "name": "Studio", "kind": "ssh"}
 TOKEN = "sk-ant-oat01-" + "t" * 40
 ROW = {"access_token": TOKEN, "updated_at": "saved-at"}
 
@@ -64,16 +67,23 @@ def sizer(sandbox):
 
 
 @contextmanager
-def platform(*, stored=True, mode="local", blocked=False, live=0, computer=CLOUD, placement=True):
+def platform(
+    *, stored=True, mode="local", blocked=False, live=0, computer=CLOUD, placement=True, cli=(None, None), memory=800,
+):
     """A platform deployment with the runtime on, the CLI placed in cloud
-    computers' sandboxes (`placement`), storing a setup token offered as
-    given (`stored`), a stored token known to work, and one user's choice,
-    running turns and computer, which `reads.computer` hands the run's start."""
+    computers' sandboxes (``placement``), storing a setup token offered as
+    given (``stored``), a stored token known to work, and one user's choice,
+    running turns and computer, which ``reads.computer`` hands the run's start.
+    ``memory`` is the operator's count of each cloud CLI's memory.
+    ``cli`` is the own computer picked to run the CLI where cloud computers
+    run none, and the offline one's name (``machine.cli_computer``)."""
     reads = SimpleNamespace(
         mode=AsyncMock(return_value=Custody(mode, blocked)), live=AsyncMock(return_value=live),
         computer=AsyncMock(return_value=computer),
     )
-    config = SimpleNamespace(stored_custody=stored, hosted_turns_per_user=3, sandbox_placement=placement)
+    config = SimpleNamespace(
+        stored_custody=stored, hosted_turns_per_user=3, sandbox_placement=placement, cli_memory_mb=memory,
+    )
     with ExitStack() as stack:
         for target, value in [
             ("src.config.settings.HOST_MODE", "platform"),
@@ -91,6 +101,7 @@ def platform(*, stored=True, mode="local", blocked=False, live=0, computer=CLOUD
             ("src.server.services.computer_manager.ComputerManager.get_instance", lambda: sizer(SandboxConfig())),
             ("src.server.services.computer_manager.ComputerManager.current", lambda: sizer(SandboxConfig())),
             (f"{SERVICE}.read_answer", AsyncMock(return_value=None)),
+            ("src.server.services.claude_code.machine.pick_cli_computer", AsyncMock(return_value=cli)),
         ]:
             stack.enter_context(patch(target, value))
         yield reads
@@ -99,7 +110,7 @@ def platform(*, stored=True, mode="local", blocked=False, live=0, computer=CLOUD
 async def _admit():
     config = SimpleNamespace(feature_enabled=lambda _: True)
     try:
-        await require_runnable(config, CODE, "analyst", user_id="user-1", workspace_id="ws-1")
+        await require_runnable(config, CODE, user_id="user-1", workspace_id="ws-1")
     except HTTPException as e:
         return e.detail
     return None
@@ -109,12 +120,14 @@ async def _admit():
 
 
 @pytest.mark.asyncio
-async def test_with_the_switch_off_a_cloud_computer_is_refused_as_before_and_no_choice_is_read():
+async def test_with_the_switch_off_a_cloud_computer_runs_its_cli_on_an_own_computer_and_no_choice_is_read():
     with platform(stored=False) as reads:
         assert await _admit() == {
-            "message": CLAUDE_CODE_OFF["needs_own_computer"], "type": "claude_code_off", "model": CODE,
-            "reason": "needs_own_computer",
+            "message": CLAUDE_CODE_OFF["no_own_computer"], "type": "claude_code_off", "model": CODE,
+            "reason": "no_own_computer",
         }
+    with platform(stored=False, cli=(STUDIO, None)) as reads:
+        assert await _admit() is None
         assert await hosted_module.custody("user-1") is None
     reads.mode.assert_not_awaited()
     reads.live.assert_not_awaited()
@@ -132,15 +145,20 @@ async def test_an_own_computer_never_reads_the_choice_for_cloud_computers():
 
 
 @pytest.mark.asyncio
-async def test_a_user_who_chose_nothing_runs_nothing_on_a_cloud_computer():
+async def test_a_user_who_chose_their_own_computers_runs_a_cloud_workspaces_cli_on_one_or_is_told_which():
     with platform(mode="local"):
         detail = await _admit()
-    assert detail["reason"] == "hosted_off"
+    assert detail["reason"] == "no_own_computer"
     assert detail["message"] == (
-        "Claude Code runs only on your own computers for your account, so workspaces on cloud computers "
-        "can't use Claude Code models. Choose where it runs in Settings under Model access, or move this "
-        "workspace to one of your computers."
+        "Claude Code runs on your own computers, and none of yours with its own setup token is online now. "
+        "Turn one on, or add a token for one in Settings under Model access."
     )
+    with platform(mode="local", cli=(None, "Studio")):
+        detail = await _admit()
+    assert detail == {
+        "message": "Studio, where Claude Code runs for you, is offline. Turn it on, or pick another model.",
+        "type": "claude_code_off", "model": CODE, "reason": "cli_computer_offline", "name": "Studio",
+    }
 
 
 
@@ -149,11 +167,14 @@ async def test_a_user_who_chose_nothing_runs_nothing_on_a_cloud_computer():
 async def test_admission_hands_on_what_the_turn_runs_on():
     config = SimpleNamespace(feature_enabled=lambda _: True)
     with platform(mode="stored"):
-        assert await require_runnable(config, CODE, "analyst", user_id="user-1", workspace_id="ws-1") == (
+        assert await require_runnable(config, CODE, user_id="user-1", workspace_id="ws-1") == Admitted(
             "stored_token", "stored_token",
         )
     with platform(computer=OWN):
-        assert await require_runnable(config, CODE, "analyst", user_id="user-1", workspace_id="ws-1") == (None, None)
+        assert await require_runnable(config, CODE, user_id="user-1", workspace_id="ws-1") == Admitted()
+    with platform(mode="local", cli=(STUDIO, None)):
+        admitted = await require_runnable(config, CODE, user_id="user-1", workspace_id="ws-1")
+        assert admitted == Admitted(cli_computer="c-9")
 
 
 @pytest.mark.asyncio
@@ -175,7 +196,7 @@ async def test_the_stored_choice_runs_until_the_users_cap_of_turns_at_once():
 async def test_a_message_to_a_thread_does_not_count_that_threads_own_run_against_the_cap():
     config = SimpleNamespace(feature_enabled=lambda _: True)
     with platform(mode="stored", live=2) as reads:
-        await require_runnable(config, CODE, "analyst", user_id="user-1", workspace_id="ws-1", thread_id="t-1")
+        await require_runnable(config, CODE, user_id="user-1", workspace_id="ws-1", thread_id="t-1")
     reads.live.assert_awaited_once_with("user-1", besides="t-1")
 
 
@@ -185,11 +206,12 @@ async def test_a_message_to_a_thread_does_not_count_that_threads_own_run_against
 
 @pytest.mark.asyncio
 async def test_a_run_whose_choice_changed_since_admission_never_starts_and_says_why():
+    """Sent again, it runs on the user's own computer."""
     with platform(mode="local"), patch(f"{LAUNCHERS}.stored_row", AsyncMock(return_value=ROW)) as read:
         with pytest.raises(ClaudeTurnFailed) as refused:
             await HostedCredential("user-1", "stored_token", "c-2").read()
     read.assert_not_awaited()
-    assert claude_code_refusal(refused.value, CODE)["reason"] == "hosted_off"
+    assert claude_code_refusal(refused.value, CODE)["reason"] == "choice_changed"
 
 
 @pytest.mark.asyncio
@@ -202,10 +224,10 @@ async def test_a_run_admitted_on_an_own_computer_that_starts_on_a_cloud_one_neve
 
 
 @pytest.mark.asyncio
-async def test_with_the_switch_turned_off_since_admission_the_run_is_refused_as_before():
+async def test_with_the_switch_turned_off_since_admission_the_run_is_refused_to_be_sent_again():
     with platform(stored=False), pytest.raises(ClaudeTurnFailed) as refused:
         await HostedCredential("user-1", "stored_token", "c-2").read()
-    assert claude_code_refusal(refused.value, CODE)["reason"] == "needs_own_computer"
+    assert claude_code_refusal(refused.value, CODE)["reason"] == "choice_changed"
 
 
 
@@ -215,8 +237,8 @@ async def test_a_refused_setup_token_is_flagged_and_ends_the_turn_saying_so():
     credential = HostedCredential("user-1", "saved_token", None)
     with (
         patch(
-            f"{LAUNCHERS}.cloud_placement",
-            AsyncMock(return_value=hosted_module.Placement("worker", hosted=hosted_module.Hosted("saved_token"))),
+            f"{LAUNCHERS}.cli_placement",
+            AsyncMock(return_value=hosted_module.OnCloud(hosted_module.Hosted("saved_token"))),
         ),
         patch(f"{LAUNCHERS}.stored_row", AsyncMock(return_value=saved)),
         patch(f"{LAUNCHERS}.refuse", AsyncMock()) as flag,
@@ -246,8 +268,8 @@ async def test_a_refused_setup_token_is_flagged_and_ends_the_turn_saying_so():
 )
 async def test_where_the_cli_runs_by_the_computer_and_this_servers_switches(backend, given, computer, runs_in):
     with platform(computer=computer, **given), patch(f"{HOSTED}.backend_available", lambda: backend):
-        where = await hosted_module.placement("user-1", "ws-1")
-        assert (where.own_computer is not None) == (runs_in == "own_computer")
+        where = await hosted_module.cli_placement("user-1", "ws-1")
+        assert isinstance(where, hosted_module.OnOwn) == (runs_in == "own_computer")
         if computer is CLOUD:
             assert hosted_module.cloud_runs_in() == runs_in
 
@@ -260,15 +282,17 @@ async def test_only_the_worker_placement_minds_an_organizations_policy_on_the_wo
         patch(f"{HOSTED}.backend_available", lambda: True),
         patch("ptc_agent.core.claude_code_managed.local_managed", AsyncMock(return_value=["managed-settings.json"])),
     ):
-        assert (await hosted_module.placement("user-1", "ws-1")).refusal == refusal
+        where = await hosted_module.cli_placement("user-1", "ws-1")
+        assert (where.reason if isinstance(where, hosted_module.Refused) else None) == refusal
 
 
 # -- The tier gate: the CLI runs inside the computer's own sandbox --
 
 SMALL = {"computer_id": "c-3", "name": "Scratch", "kind": "daytona", "resource_tier": "standard"}
 TOO_SMALL = (
-    "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. "
-    "Change its spec or upgrade your LangAlpha plan, or move this workspace to a computer of your own."
+    "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its "
+    "spec or upgrade your LangAlpha plan, or choose to run Claude Code on your own computers in Settings under "
+    "Model access."
 )
 TOO_SMALL_SELF_HOSTED = (
     "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. "
@@ -324,6 +348,49 @@ def test_a_computer_runs_a_cli_per_800_mb_of_its_smallest_size_and_an_own_one_as
     cannot tell caps nothing."""
     with platform():
         assert hosted_module.cli_cap(computer) == cap
+
+
+@pytest.mark.parametrize(
+    ("config", "cap"),
+    [({"claude_code_clis": 6}, 6), ({"claude_code_clis": 8}, 8), ({"claude_code_clis": 1}, 1), ({}, 4), (None, 4),
+     ({"claude_code_clis": 9}, 4), ({"claude_code_clis": 0}, 4), ({"claude_code_clis": "6"}, 4),
+     ({"claude_code_clis": True}, 4)],
+)
+def test_an_own_computer_runs_as_many_clis_as_its_owner_set_for_it(config, cap):
+    """A count that is not one Settings could have saved reads as the default."""
+    with platform():
+        assert hosted_module.cli_cap({**OWN, "config": config}) == cap
+
+
+@pytest.mark.parametrize(("memory", "cap"), [(400, 10), (1600, 2), (8192, 1)], ids=["400", "1600", "past-its-memory"])
+def test_a_cloud_computer_runs_as_many_clis_as_the_memory_the_operator_counts_each_at_fits(memory, cap):
+    with platform(memory=memory):
+        assert hosted_module.cli_cap({**CLOUD, "resource_tier": "performance"}) == cap
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("computer", "clis"),
+    [
+        ({**CLOUD, "resource_tier": "performance"}, 5),
+        ({**OWN, "config": {"claude_code_clis": 6}}, 6),
+        ({**CLOUD, "resource_tier": "retired"}, 4),
+        (None, 4),
+    ],
+    ids=["cloud", "own", "size-unknown", "gone"],
+)
+async def test_a_cli_starting_on_a_computer_is_held_to_its_cap_and_one_unsized_or_gone_to_the_default(computer, clis):
+    with platform(computer=computer):
+        assert await hosted_module.computer_clis("c-x") == clis
+
+
+def test_the_memory_each_cloud_cli_is_counted_at_is_read_from_the_claude_code_config_section():
+    from src.config.models import ClaudeCodeConfig
+
+    assert ClaudeCodeConfig().cli_memory_mb == 800
+    assert ClaudeCodeConfig(cli_memory_mb=512).cli_memory_mb == 512
+    with pytest.raises(ValueError):
+        ClaudeCodeConfig(cli_memory_mb=64)
 
 
 @pytest.mark.parametrize("tier", ["standard", "max", "retired"])
@@ -397,9 +464,9 @@ async def test_a_self_hosted_server_runs_the_saved_token_and_gates_the_size_only
     placement, refusal,
 ):
     with platform(placement=placement, computer=SMALL), patch(f"{HOSTED}.backend_available", lambda: True):
-        where = await hosted_module.placement("user-1", "ws-1")
+        where = await hosted_module.cli_placement("user-1", "ws-1")
     assert where.hosted == hosted_module.Hosted("saved_token")
-    assert where.refusal == refusal
+    assert (where.reason if isinstance(where, hosted_module.Refused) else None) == refusal
 
 
 @pytest.mark.asyncio
@@ -423,26 +490,38 @@ async def test_a_computer_below_the_tier_is_refused_at_admission_saying_how_to_f
     with platform(mode="stored", computer=SMALL):
         assert await _admit() == {
             "message": TOO_SMALL, "type": "claude_code_off", "model": CODE, "reason": "needs_bigger_computer",
+            "home": False,
         }
 
 
-@pytest.mark.parametrize(("mode", "message"), [("platform", TOO_SMALL), ("oss", TOO_SMALL_SELF_HOSTED)])
-def test_the_platform_fixes_a_computer_too_small_with_a_plan_and_a_self_hosted_server_with_its_size(mode, message):
+@pytest.mark.parametrize(
+    ("mode", "message", "home"),
+    [
+        ("platform", TOO_SMALL, TOO_SMALL.replace("this workspace's computer", "Home's computer")),
+        (
+            "oss", TOO_SMALL_SELF_HOSTED,
+            "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec.",
+        ),
+    ],
+)
+def test_the_platform_fixes_a_computer_too_small_with_a_plan_and_a_self_hosted_server_with_its_size(mode, message, home):
+    """Home moves to no other computer, so a self-hosted server offers only its spec."""
     with patch("src.config.settings.HOST_MODE", mode):
         assert claude_code_off_message("needs_bigger_computer") == message
-        assert claude_code_off_message("hosted_off") == CLAUDE_CODE_OFF["hosted_off"]
+        assert claude_code_off_message("needs_bigger_computer", home=True) == home
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("given", "reason"),
     [
-        ({"mode": "local"}, "hosted_off"),
-        ({"mode": "stored", "blocked": True}, "stored_blocked"),
+        ({"mode": "local"}, "no_own_computer"),
+        ({"mode": "stored", "blocked": True}, "no_own_computer"),
         ({"mode": "stored", "live": 3}, "needs_bigger_computer"),
     ],
 )
 async def test_the_size_is_told_only_once_the_credential_would_run(given, reason):
+    """On the user's own computers, a cloud computer's size is never theirs."""
     with platform(computer=SMALL, **given):
         assert (await _admit())["reason"] == reason
 
@@ -458,18 +537,36 @@ async def test_a_stored_token_known_not_to_work_is_told_before_the_size():
 
 @pytest.mark.asyncio
 async def test_a_computer_downsized_between_two_turns_of_a_thread_stops_the_second_as_it_starts():
-    with platform(mode="stored") as reads, patch(f"{LAUNCHERS}.stored_row", AsyncMock(return_value=ROW)) as token:
+    downsized = AsyncMock(return_value={**CLOUD, "resource_tier": "standard"})
+    with platform(mode="stored"), patch(f"{LAUNCHERS}.stored_row", AsyncMock(return_value=ROW)) as token:
         assert await _admit() is None
-        assert await HostedCredential("user-1", "stored_token", "c-2").read() == Credential(TOKEN)
-        reads.computer.return_value = {**CLOUD, "resource_tier": "standard"}
+        assert await HostedCredential("user-1", "stored_token", "ws-1").read() == Credential(TOKEN)
         token.reset_mock()
-        with pytest.raises(ClaudeTurnFailed) as refused:
-            await HostedCredential("user-1", "stored_token", "c-2").read()
+        with (
+            patch("src.server.database.computer.get_computer_for_workspace", downsized),
+            pytest.raises(ClaudeTurnFailed) as refused,
+        ):
+            await HostedCredential("user-1", "stored_token", "ws-1").read()
         assert claude_code_refusal(refused.value, CODE) == {
             "message": TOO_SMALL, "type": "claude_code_off", "model": CODE, "reason": "needs_bigger_computer",
+            "home": False,
         }
-    reads.computer.assert_awaited_with("c-2")
+    downsized.assert_awaited_with("ws-1", conn=None)
     token.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_home_downsized_since_its_turn_was_admitted_is_refused_as_it_starts_naming_homes_computer():
+    """Home moves to no other computer, so the words name its own."""
+    with platform(mode="stored", computer={**CLOUD, "resource_tier": "standard"}):
+        with pytest.raises(ClaudeTurnFailed) as refused:
+            await HostedCredential("user-1", "stored_token", get_home_workspace_id("user-1")).read()
+        words = claude_code_off_message("needs_bigger_computer", home=True)
+        refusal = claude_code_refusal(refused.value, CODE)
+    assert "Home's computer is smaller" in words
+    assert refusal == {
+        "message": words, "type": "claude_code_off", "model": CODE, "reason": "needs_bigger_computer", "home": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -479,7 +576,7 @@ async def test_the_credential_is_told_before_the_size_as_the_run_starts_too():
         pytest.raises(ClaudeTurnFailed) as refused,
     ):
         await HostedCredential("user-1", "stored_token", "c-3").read()
-    assert refused.value.kind == "hosted_off"
+    assert refused.value.kind == "choice_changed"
     with (
         platform(mode="stored", computer=SMALL),
         pytest.raises(ClaudeTurnFailed) as refused,
@@ -489,14 +586,16 @@ async def test_the_credential_is_told_before_the_size_as_the_run_starts_too():
 
 
 @pytest.mark.asyncio
-async def test_the_run_reads_no_computer_where_its_size_cannot_refuse_it():
+async def test_the_run_is_not_sized_where_its_size_cannot_refuse_it():
     saved = {"access_token": "sk-ant-oat01-tok", "updated_at": "saved-at"}
     with (
-        platform(placement=False) as reads, patch(f"{HOSTED}.backend_available", lambda: True),
+        platform(placement=False, computer=SMALL), patch(f"{HOSTED}.backend_available", lambda: True),
+        patch("ptc_agent.core.claude_code_managed.local_managed", AsyncMock(return_value=())),
+        patch(f"{HOSTED}.tier_refusal") as sized,
         patch(f"{LAUNCHERS}.stored_row", AsyncMock(return_value=saved)),
     ):
-        assert await HostedCredential("user-1", "saved_token", "c-2").read() == Credential("sk-ant-oat01-tok")
-    reads.computer.assert_not_awaited()
+        assert await HostedCredential("user-1", "saved_token", "ws-1").read() == Credential("sk-ant-oat01-tok")
+    sized.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -526,8 +625,21 @@ async def test_the_computers_list_names_each_cloud_computer_too_small_while_clau
 async def test_each_cloud_computer_is_read_by_the_rule_admission_gives_it():
     unsized = {"computer_id": "c-9", "kind": "mainframe", "resource_tier": "max"}
     computers = AsyncMock(return_value=[CLOUD, SMALL, OWN, unsized])
-    with platform(mode="local"), patch("src.server.database.computer.get_computers_for_user", computers):
-        assert await hosted_module.cloud_refusals("user-1") == {"c-3": "needs_bigger_computer"}
+    with platform(mode="stored"), patch("src.server.database.computer.get_computers_for_user", computers):
+        refusals, _ = await hosted_module.cloud_view("user-1")
+    assert refusals == {"c-3": "needs_bigger_computer"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("given", [{"mode": "local"}, {"mode": "stored", "blocked": True}, {"stored": False}])
+async def test_no_cloud_computer_is_too_small_where_their_cli_runs_on_the_users_own_computers(given):
+    """A small cloud computer refuses nothing there: its turns' CLIs run on an own computer."""
+    computers = AsyncMock(return_value=[CLOUD, SMALL, OWN])
+    with platform(**given), patch("src.server.database.computer.get_computers_for_user", computers):
+        refusals, where = await hosted_module.cloud_view("user-1")
+    assert refusals == {}
+    assert hosted_module.picks_own(where)
+    computers.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -536,14 +648,19 @@ async def test_each_cloud_computer_is_read_by_the_rule_admission_gives_it():
     [({"placement": False}, False), ({"stored": False}, False), ({"placement": False}, True)],
 )
 async def test_no_cloud_computer_is_too_small_where_none_runs_claude_code_in_its_sandbox(given, backend):
-    with platform(**given), patch(f"{HOSTED}.backend_available", lambda: backend):
-        assert await hosted_module.cloud_refusals("user-1") == {}
+    with (
+        platform(**given), patch(f"{HOSTED}.backend_available", lambda: backend),
+        patch("ptc_agent.core.claude_code_managed.local_managed", AsyncMock(return_value=())),
+    ):
+        refusals, _ = await hosted_module.cloud_view("user-1")
+    assert refusals == {}
 
 
 @pytest.mark.asyncio
 async def test_a_self_hosted_server_with_the_cli_in_the_sandbox_names_its_cloud_computers_too_small():
     with platform(computer=SMALL), patch(f"{HOSTED}.backend_available", lambda: True):
-        assert await hosted_module.cloud_refusals("user-1") == {"c-3": "needs_bigger_computer"}
+        refusals, _ = await hosted_module.cloud_view("user-1")
+    assert refusals == {"c-3": "needs_bigger_computer"}
 
 
 # -- The run's row, which the cap counts --
@@ -562,9 +679,15 @@ async def test_a_self_hosted_server_with_the_cli_in_the_sandbox_names_its_cloud_
 def test_a_turn_admitted_on_a_cloud_computer_is_counted_on_any_server(mode, claude_code, hosted, saved, stamp):
     """Every Claude Code turn is counted as a CLI its computer runs, and one
     on a cloud computer as a turn of its user's there too."""
-    config = SimpleNamespace(claude_code=claude_code, claude_code_hosted=hosted, claude_code_saved=saved)
+    config = SimpleNamespace(claude_code=claude_code, claude_code_admitted=Admitted(hosted, saved))
     with patch("src.config.settings.HOST_MODE", mode):
         assert run_stamp(config) == stamp
+
+
+def test_a_turn_whose_cli_runs_on_an_own_computer_for_another_names_that_computer():
+    """So that computer counts it as one of its CLIs, and the workspace's does not."""
+    config = SimpleNamespace(claude_code=True, claude_code_admitted=Admitted(cli_computer="c-9"))
+    assert run_stamp(config) == {**CLAUDE_CODE_TURN, CLI_COMPUTER: "c-9"}
 
 
 # -- Settings --
@@ -603,7 +726,7 @@ async def test_settings_reads_and_saves_the_choice(client):
         api_key = await client.put("/api/v1/claude-code/custody", json={"mode": "api_key"})
     assert got.json() == {
         "mode": "local", "offered": ["stored"], "blocked": False, "runs_on": None,
-        "refusal": "hosted_off", "disclosure": "2026-11-v1",
+        "refusal": "hosted_off",
     }
     assert put.status_code == 200
     saved.assert_awaited_once_with("test-user-123", "local", block_reason=None)
@@ -617,14 +740,16 @@ async def test_settings_reads_and_saves_the_choice(client):
 async def test_an_automation_on_a_cloud_computer_is_refused_where_its_turns_would_be():
     from src.server.services.automations.lifecycle import AutomationRefusal, _check_claude_code_hosted
 
-    with platform(mode="local"), pytest.raises(AutomationRefusal) as refused:
-        await _check_claude_code_hosted("user-1", CODE, "ws-1")
-    assert (str(refused.value), refused.value.field) == (CLAUDE_CODE_OFF["hosted_off"], "llm_model")
+    for cli in [(None, None), (None, "Studio"), (STUDIO, None)]:
+        with platform(mode="local", computer=SMALL, cli=cli):
+            await _check_claude_code_hosted("user-1", CODE, "ws-1")
     with platform(mode="local", computer=OWN):
         await _check_claude_code_hosted("user-1", CODE, "ws-1")
-    with platform(mode="local", computer=SMALL), pytest.raises(AutomationRefusal) as refused:
+    with platform(mode="stored"):
         await _check_claude_code_hosted("user-1", CODE, "ws-1")
-    assert str(refused.value) == CLAUDE_CODE_OFF["hosted_off"], "the credential is told first"
+    with platform(mode="stored", computer=SMALL), pytest.raises(AutomationRefusal) as refused:
+        await _check_claude_code_hosted("user-1", CODE, "ws-1")
+    assert (str(refused.value), refused.value.field) == (TOO_SMALL, "llm_model")
     with (
         platform(computer=SMALL), patch("src.config.settings.HOST_MODE", "oss"),
         patch(f"{HOSTED}.backend_available", lambda: True), pytest.raises(AutomationRefusal) as refused,
@@ -637,17 +762,14 @@ async def test_an_automation_on_a_cloud_computer_is_refused_where_its_turns_woul
 
 
 @pytest.mark.asyncio
-async def test_an_automation_relayed_a_stored_token_is_refused_with_the_cli_off_the_sandbox():
-    from src.server.services.automations.lifecycle import AutomationRefusal, _check_claude_code_hosted
+async def test_an_automation_relayed_a_stored_token_is_saved_with_the_cli_off_the_sandbox():
+    from src.server.services.automations.lifecycle import _check_claude_code_hosted
 
     with (
         platform(mode="stored", placement=False, computer=OWN),
-        patch("src.server.services.automations.lifecycle.relayed_token", AsyncMock(return_value="stored_token")),
         patch("src.server.services.claude_code.machine.read_answer", AsyncMock(return_value=None)),
-        pytest.raises(AutomationRefusal) as refused,
     ):
         await _check_claude_code_hosted("user-1", CODE, "ws-1")
-    assert str(refused.value) == CLAUDE_CODE_OFF["stored_unattended"]
 
 
 @pytest.mark.asyncio
@@ -658,10 +780,20 @@ async def test_an_automation_checked_inside_a_save_reads_on_the_saves_own_connec
 
     conn = object()
     with (
-        platform(mode="local") as reads,
-        patch("src.server.database.computer.get_computer_for_workspace", AsyncMock(return_value=CLOUD)) as computer,
+        platform(mode="stored") as reads,
+        patch("src.server.database.computer.get_computer_for_workspace", AsyncMock(return_value=SMALL)) as computer,
         pytest.raises(AutomationRefusal),
     ):
         await _check_claude_code_hosted("user-1", CODE, "ws-1", conn)
     computer.assert_awaited_once_with("ws-1", conn=conn)
     reads.mode.assert_awaited_once_with("user-1", conn=conn)
+
+
+def test_the_web_sends_the_disclosure_version_of_the_copy_it_shows():
+    """The consent dialog submits its own bundle's version, so the two move together."""
+    from pathlib import Path
+
+    from src.server.services.claude_code.hosted import DISCLOSURE
+
+    web = (Path(__file__).parents[5] / "web" / "src" / "lib" / "claudeCode.ts").read_text()
+    assert f"export const CLAUDE_CODE_DISCLOSURE = '{DISCLOSURE}';" in web

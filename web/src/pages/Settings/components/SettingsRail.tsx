@@ -3,19 +3,20 @@ import { Link, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-section)
 import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(settings-section)
 import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
+import { matchesAllWords, queryWords } from '@/lib/textMatch';
 // DALTON-HOOK(settings-section): filter searchable Dalton settings by live card visibility
 import {
   useUserCosSharingQuery,
   type DaltonSettingVisibilityContext,
 } from '../panels/dalton/DaltonCosSharingCard';
-import { GROUPS, SECTIONS, searchableSettings, sectionShown, type Section, type SettingEntry } from '../sections';
+import { GROUPS, SECTIONS, searchableSettings, sectionShown, settingSearchText, type Section, type SettingEntry } from '../sections';
 
-function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
+// DALTON-HOOK(settings-section): the command palette filters settings with the same card visibility
+export function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
   const { canInvite, isPm, callerTier: credCallerTier } = useTeamCredentials();
   const { data } = useUserCosSharingQuery(isDaltonAuth);
   return {
@@ -68,20 +69,10 @@ export function SettingsRail({ section }: { section: Section }) {
     () => searchableSettings(isDesktopShell(), daltonVisibility),
     [daltonVisibility],
   );
-  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const words = queryWords(query);
   const matches = words.length === 0
     ? []
-    : entries.filter((entry) => {
-        const text = [
-          t(entry.labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)
-          entry.descKey ? t(entry.descKey, { brand: BRAND_NAME }) : '', // DALTON-HOOK(brand-name)
-          ...(entry.alsoKeys ?? []).map((key) => t(key, { brand: BRAND_NAME })), // DALTON-HOOK(brand-name)
-          t(SECTIONS[entry.section].labelKey),
-          // DALTON-HOOK(settings-section): match bilingual keywords so Chinese and English queries always hit
-          entry.keywords ?? '',
-        ].join(' ').toLowerCase();
-        return words.every((word) => text.includes(word));
-      });
+    : entries.filter((entry) => matchesAllWords(settingSearchText(entry, t), words));
   const searching = words.length > 0;
   const shownActive = Math.min(active, Math.max(matches.length - 1, 0));
 

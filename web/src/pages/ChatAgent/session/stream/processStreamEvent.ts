@@ -325,8 +325,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         // as an internal failure would, banner and all, over any notice.
         deps.clearModelStatus();
         rt.setFallbackSuggestion(null);
-        rt.setMessageError({ message: '', kind: 'internal' });
-        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true });
+        // The run that ended, for a report to name.
+        const runId = rt.currentRunIdRef?.current ?? undefined;
+        rt.setMessageError({ message: '', kind: 'internal', runId });
+        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true, runId });
       }
       return;
     }
@@ -934,6 +936,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       const structured: StructuredError | undefined = busyCode !== null
         ? { message: errorMessage as string, kind: 'notice' }
         : readStreamFailure(event, errorMessage as string, rt.workspaceId, rt.t);
+      // A live failure's frame does not name its run; the stream's metadata did.
+      const latchedRunId = rt.currentRunIdRef?.current;
+      if (structured && !structured.runId && latchedRunId) structured.runId = latchedRunId;
 
       // DALTON-HOOK(colleague-dispatch): terminal non-retryable error when workspace owner revokes colleague access
       if (event.code === 'colleague_access_revoked') {
@@ -958,8 +963,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         // (settleFailedBubble).
         // The headline alone, as a reload shows it: the frame's text is the
         // server's raw exception and stays on the wire for other readers.
-        rt.setMessageError({ message: '', kind: 'internal' });
-        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true });
+        rt.setMessageError({ message: '', kind: 'internal', runId: structured?.runId });
+        settleFailedBubble({
+          assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true, runId: structured?.runId,
+        });
       } else {
         // Upstream (or unclassified legacy) — render inline. Clear any
         // stale banner from a prior turn so the error lives in one place.

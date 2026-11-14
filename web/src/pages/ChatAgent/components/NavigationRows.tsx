@@ -511,7 +511,8 @@ export function resolveNavThreadPermissions(
   };
 }
 
-function useNavAccessContext(
+// DALTON-HOOK(colleague-dispatch): the command palette reads the same cached caller and team permissions as the sidebar
+export function useNavAccessContext(
   currentUserIdProp?: string | null,
   callerTierProp?: string | null,
 ): NavAccessContext {

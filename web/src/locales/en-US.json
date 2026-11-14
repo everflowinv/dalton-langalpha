@@ -183,7 +183,7 @@
     "plugins": "Plugins",
     "orders": "Orders",
     "menu": "Menu",
-    "search": "Search ({{shortcut}})",
+    "search": "Search research ({{shortcut}})",
     "globalSearch": {
       "title": "Search",
       "placeholder": "Search conversations and documents…",
@@ -2778,7 +2778,10 @@
       "claudeCodeNeedsOwnComputer": "Runs only on workspaces on your own computers",
       "claudeCodePolicyBlocked": "Your organization's Claude Code policy keeps it from running on this computer",
       "claudeCodeHostedOff": "Choose in Settings how it runs on cloud computers",
+      "claudeCodeNoOwnComputer": "Needs a computer of yours with its own setup token online",
+      "claudeCodeCliComputerOffline": "{{name}} is offline",
       "claudeCodeNeedsBiggerComputer": "Needs a Medium or larger cloud computer, or a computer of your own",
+      "claudeCodeNeedsBiggerComputerHome": "Needs a Medium or larger cloud computer",
       "claudeCodeNeedsBiggerComputerPlan": "Needs a Medium or larger cloud computer: change its spec or upgrade your LangAlpha plan, or use a computer of your own"
     },
     "voice": {
@@ -2922,13 +2925,14 @@
       "off": {
         "account": "Claude Code is off for your account. Turn it on in Settings under Model access, or pick another model.",
         "token_refused": "Claude refused your setup token. It may have expired or been revoked. Add a new one in Settings under Model access to use this model.",
-        "hosted_off": "Claude Code runs only on your own computers for your account, so workspaces on cloud computers can't use Claude Code models. Choose where it runs in Settings under Model access, or move this workspace to one of your computers.",
+        "no_own_computer": "Claude Code runs on your own computers, and none of yours with its own setup token is online now. Turn one on, or add a token for one in Settings under Model access.",
+        "cli_computer_offline": "{{name}}, where Claude Code runs for you, is offline. Turn it on, or pick another model.",
         "too_many_turns": "You've reached the limit on Claude Code threads running at once on cloud computers ({{n}}). Try again when one finishes.",
-        "stored_blocked": "Storing a setup token isn't available for your account, so Claude Code runs only on your own computers. Pick another model, or move this workspace to one of them.",
-        "stored_unattended": "Automations, wakeups and work another agent starts on its own don't run on the setup token LangAlpha stores for you. To run them on Claude Code, choose to run it on your own computers in Settings under Model access.",
         "choice_changed": "How Claude Code runs on cloud computers changed as this turn started. Send your message again.",
         "needs_bigger_computer": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec, or move this workspace to a computer of your own.",
-        "needs_bigger_computer_plan": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec or upgrade your LangAlpha plan, or move this workspace to a computer of your own."
+        "needs_bigger_computer_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec.",
+        "needs_bigger_computer_plan": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec or upgrade your LangAlpha plan, or choose to run Claude Code on your own computers in Settings under Model access.",
+        "needs_bigger_computer_plan_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec or upgrade your LangAlpha plan, or choose to run Claude Code on your own computers in Settings under Model access."
       }
     }
   },
@@ -6827,6 +6831,7 @@
       "modelAria": "Model for {{name}}",
       "modelHint": "Leave it on Thread's model to follow whatever the thread runs.",
       "modelUnavailableHint": "The saved model isn't available to you now, so it runs on the thread's model. Pick another to clear this.",
+      "claudeCodePinHint": "Runs on your Claude plan where the thread's workspace runs Claude Code, and on the thread's model elsewhere.",
       "modelUnavailableOption": "{{model}} (unavailable)",
       "unavailableOption": "{{name}} (unavailable)",
       "effort": "Effort",
@@ -7146,7 +7151,9 @@
         "savedRejected": "Claude refused your saved token. It may have expired or been revoked.",
         "offline": "This computer isn't running, so its token can't be checked.",
         "addOwn": "Add its own token",
-        "checking": "Asking Claude whether its token works"
+        "checking": "Asking Claude whether its token works",
+        "clis": "Claude Code agents at once",
+        "clisHelp": "How many Claude Code agents this computer runs at the same time, subagents included. Above 4, LangAlpha opens a second connection to it."
       },
       "optOut": {
         "saved": "Claude Code is off, but your setup token is still saved.",
@@ -7155,9 +7162,9 @@
       "savedTag": "Setup token",
       "hosted": {
         "heading": "Where Claude Code runs",
-        "local": "Only on your own computers",
-        "localDetail": "Claude Code runs on your own computers, each with its own setup token, and LangAlpha keeps no copy. Workspaces on cloud computers can't use Claude Code models.",
-        "stored": "Also for cloud computers, with your setup token stored by LangAlpha",
+        "local": "On your own computers",
+        "localDetail": "Claude Code runs on a computer of yours with its own setup token, for every workspace, including those on cloud computers. Their files and commands stay on the cloud computer, and LangAlpha keeps no copy of the token.",
+        "stored": "On cloud computers, with your setup token stored by LangAlpha",
         "storedDetail": "For workspaces on Medium or larger cloud computers, Claude Code runs on the cloud computer itself. Your own computers without a token of their own run Claude Code themselves too. For each turn, LangAlpha sends your setup token, kept encrypted, to the computer that runs it. Usage counts against your Claude plan.",
         "paused": "Claude Code on cloud computers is paused on this server. Your choice is kept, and Claude Code still runs on your own computers.",
         "blocked": "Storing a setup token isn't available for your account. Claude Code still runs on your own computers."
@@ -7165,7 +7172,7 @@
       "consent": {
         "title": "Let LangAlpha store your setup token?",
         "encrypted": "LangAlpha keeps your token encrypted and uses it only to run Claude Code for your threads. For each turn, it sends the token to the computer that runs the turn. LangAlpha's servers also use the token to check that it still works.",
-        "unattended": "Usage counts against your Claude plan. Automations, wakeups and turns another agent sends don't use this token.",
+        "unattended": "Usage counts against your Claude plan, including automations, wakeups and turns another agent sends.",
         "terms": "Anthropic's terms for your Claude plan apply to this use, and you're responsible for following them. Anthropic may limit or suspend accounts that it finds break them.",
         "undo": "You can switch back at any time, and LangAlpha deletes the token right away.",
         "confirm": "Store my token",
@@ -7229,8 +7236,9 @@
         },
         "connected": {
           "title": "Claude Code is ready",
-          "body": "Claude Code models are in your model picker for workspaces on these computers.",
-          "bodyAny": "Claude Code models are in your model picker."
+          "body": "Claude Code models are in your model picker.",
+          "cliOwn": "Claude Code for your cloud workspaces and your Chief of Staff runs on {{name}}.",
+          "cliHome": "Your Chief of Staff runs Claude Code on Home's computer, {{name}}."
         },
         "checking": {
           "title": "Checking your setup tokens",
@@ -7816,6 +7824,138 @@
       "failed": "Couldn't reach Claude to check usage. Try again later.",
       "computerUnreached": "Couldn't reach this computer to check usage. Try again later.",
       "unsaved": "Claude answered, but the usage couldn't be updated. Try again later."
+    }
+  },
+  "palette": {
+    "copyFailed": "Couldn't copy to the clipboard",
+    "title": "Search and commands",
+    "label": "Search threads, tickers, skills, settings, or ask anything",
+    "placeholder": "Search threads, tickers, skills, settings, or ask anything",
+    "untitledThread": "Untitled thread",
+    "analystIn": "Analyst in {{workspace}}",
+    "askTitle": "Ask “{{query}}”",
+    "actionsFor": "Actions for {{name}}",
+    "group": {
+      "recent": "Recent",
+      "actions": "Actions",
+      "topHit": "Top hit",
+      "threads": "Threads",
+      "tickers": "Tickers",
+      "workspaces": "Workspaces",
+      "skills": "Skills",
+      "places": "Pages and settings",
+      "ask": "Ask"
+    },
+    "kind": {
+      "workspace": "Workspace",
+      "page": "Page",
+      "chart": "Chart"
+    },
+    "do": {
+      "open": "Open",
+      "openInNewTab": "Open in new tab",
+      "copyLink": "Copy link",
+      "openChart": "Open chart",
+      "newThreadAbout": "New thread about {{symbol}}",
+      "copySymbol": "Copy symbol",
+      "newThreadIn": "New thread in {{workspace}}",
+      "openInPlugins": "Open in Plugins",
+      "useSkill": "Use in new thread",
+      "run": "Run",
+      "ask": "Ask",
+      "back": "Back",
+      "move": "Move",
+      "close": "Close",
+      "actions": "Actions"
+    },
+    "action": {
+      "newThread": "New thread",
+      "newWorkspace": "New workspace",
+      "newAutomation": "New automation",
+      "lightTheme": "Switch to light theme",
+      "darkTheme": "Switch to dark theme"
+    },
+    "keywords": {
+      "newThread": "chat conversation start ask agent",
+      "newWorkspace": "create folder project",
+      "newAutomation": "schedule alert recurring briefing",
+      "theme": "appearance dark light mode color"
+    },
+    "search": "Commands & jump"
+  },
+  "report": {
+    "menuItem": "Report a problem",
+    "bannerAction": "Report this",
+    "title": "Report a problem",
+    "titleError": "Report this error",
+    "description": "Tell us about a bug, or anything you'd like changed.",
+    "descriptionError": "Send this failure to our engineers.",
+    "categoryLabel": "What is it about?",
+    "category": {
+      "bug": "Bug",
+      "feedback": "Feedback",
+      "billing": "Billing",
+      "other": "Other"
+    },
+    "noteLabel": "What happened?",
+    "noteLabelOptional": "Anything to add? (optional)",
+    "notePlaceholder": "What you were doing, and what went wrong or could be better.",
+    "notePlaceholderError": "What you asked for, or what you expected to happen.",
+    "privacy": "We receive your note and the IDs our engineers need to look into it. Your conversations are not sent.",
+    "privacyError": "We receive the error, the IDs of this conversation and run, and your note.",
+    "send": "Send report",
+    "sending": "Sending…",
+    "sent": "Thanks, we got your report.",
+    "duplicate": "This report was already sent.",
+    "sentDetail": "Our team reads every report.",
+    "rateLimited": "You've sent several reports recently. Try again later.",
+    "rateLimitedIn": "You've sent several reports recently. Try again in {{minutes}} min.",
+    "unavailable": "The report couldn't be sent right now. Try again in a moment.",
+    "thumbsHint": "A problem with a specific answer? Use the thumbs-down under it, so our team knows which conversation it was in.",
+    "thumbsSent": "Thanks, your feedback was sent to our team.",
+    "thumbsSentReview": "Thanks. Our team will review this conversation.",
+    "thumbs": {
+      "title": "Report an issue",
+      "description": "This goes to our team with the conversation's ID. Your messages are only shared if you ask for a human review.",
+      "descriptionLocal": "Help us improve the quality of responses",
+      "whatWentWrong": "What went wrong?",
+      "commentLabel": "Additional comments (optional)",
+      "commentPlaceholder": "Tell us more about the issue…",
+      "reviewTitle": "Request human review",
+      "reviewBody": "Share this conversation with our engineering team. Credits will be refunded for confirmed issues.",
+      "submit": "Submit report",
+      "categories": {
+        "incorrectData": "Incorrect data or numbers",
+        "wrongTicker": "Wrong ticker or company",
+        "outdated": "Outdated information",
+        "flawedAnalysis": "Flawed analysis",
+        "missingRisks": "Missing risk factors",
+        "codeErrors": "Code execution errors",
+        "ignoredInstructions": "Didn't follow instructions",
+        "incomplete": "Incomplete research",
+        "tooSlow": "Too slow"
+      }
+    },
+    "followUp": {
+      "title": "Feedback sent",
+      "sentAt": "Sent to our team · {{time}}",
+      "notSent": "Saved. It hasn't reached our team yet.",
+      "addLabel": "Add to your report (optional)",
+      "addPlaceholder": "Anything else our team should know…",
+      "addedAt": "Added {{time}}",
+      "reviewRequested": "Human review requested. Our team will look at this conversation.",
+      "send": "Send",
+      "sendAgain": "Send to our team",
+      "withdraw": "Withdraw report",
+      "withdrawTitle": "Withdraw this report?",
+      "withdrawBody": "Your rating is removed and your words are taken out of the report. Our team will see that it was withdrawn. If you asked for a human review, it is cancelled; a review that's already done stays as it is.",
+      "keep": "Keep it",
+      "withdrawConfirm": "Withdraw",
+      "added": "Added to your report.",
+      "reviewSent": "Human review requested. Our team will look at this conversation.",
+      "withdrawn": "Report withdrawn.",
+      "gone": "This report can no longer be changed.",
+      "noteLimit": "This report already has as many notes as it can take. For more, use Report a problem."
     }
   }
 }

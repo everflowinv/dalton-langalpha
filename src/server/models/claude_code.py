@@ -3,7 +3,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, StrictInt
+
+from ptc_agent.core.claude_code_clis import CLIS_MAX
 
 from src.llms.claude_code import PlanWindow
 
@@ -101,6 +103,9 @@ class ClaudeCodeComputer(BaseModel):
     check_in: int | None = None
     #: Whether a check would be billed (``ClaudeCodeStatus``).
     check_bills: bool = False
+    #: How many Claude Code CLIs it runs at once, turns' and subagents'
+    #: together (``hosted.own_clis``).
+    clis: int
 
 
 #: Why a cloud computer refuses a turn whatever its credential
@@ -108,12 +113,53 @@ class ClaudeCodeComputer(BaseModel):
 ComputerRefusal = Literal["needs_bigger_computer"]
 
 
+#: Why no Claude Code turn runs in a workspace (``hosted.Refused``), each a
+#: ``CLAUDE_CODE_OFF`` reason.
+PlacementRefusal = Literal[
+    "needs_own_computer", "no_own_computer", "cli_computer_offline", "policy_blocked", "signed_out",
+    "token_refused", "needs_bigger_computer",
+]
+#: Where a turn's CLI runs: on the workspace's own computer (``own``), on an
+#: own computer the server picked for a workspace on a cloud computer that
+#: runs none (``picked``), inside Home's cloud computer's sandbox
+#: (``home_cloud``), or in this server's workers (``server``).
+CliKind = Literal["own", "picked", "home_cloud", "server"]
+
+
+class ClaudeCodeRunsOn(BaseModel):
+    """Where the CLI of some of the user's Claude Code turns runs (``kind``),
+    on the computer ``computer_id`` (named ``name``) where one does, or
+    refused for ``refusal``, naming the computer it would run on where one
+    is offline."""
+
+    kind: CliKind
+    computer_id: str | None = None
+    name: str | None = None
+    refusal: PlacementRefusal | None = None
+
+
+class ClaudeCodeChiefOfStaff(ClaudeCodeRunsOn):
+    """Where the Chief of Staff's CLI runs, and whether it runs a Claude Code
+    Default the user saved (``default_runs``, ``chief_of_staff_default_runs``
+    for Home), the one answer the composer starts Home's turns by."""
+
+    default_runs: bool = False
+
+
 class ClaudeCodeComputers(BaseModel):
     computers: list[ClaudeCodeComputer]
+    #: Where the CLI of turns in workspaces on cloud computers, Home's
+    #: included, runs where those computers run none for the user
+    #: (``hosted.picks_own``): on one of their own computers (``picked``),
+    #: or refused (``no_own_computer``, ``cli_computer_offline``). None where
+    #: cloud computers run it themselves.
+    cli_computer: ClaudeCodeRunsOn | None = None
     #: Each of the user's cloud computers that refuses a turn whatever the
     #: credential, by computer id (``hosted.cloud_refusals``). A turn there is
     #: told it only once its credential would run.
     cloud_refusals: dict[str, ComputerRefusal] = Field(default_factory=dict)
+    #: The most CLIs a computer of the user's own may be set to run at once.
+    clis_max: int = CLIS_MAX
 
 
 class ClaudeCodeCloudComputer(BaseModel):
@@ -143,7 +189,8 @@ class ClaudeCodeSetup(BaseModel):
     a cloud computer runs Claude Code inside that computer's sandbox, not on
     this server (``hosted.in_sandbox``). ``too_small``: their cloud
     computers that refuse it whatever the credential
-    (``hosted.cloud_refusals``), so the entry names what to resize."""
+    (``hosted.cloud_refusals``), so the entry names what to resize.
+    ``chief_of_staff``: where the Chief of Staff's Claude Code runs."""
 
     state: SetupState
     on: bool
@@ -152,6 +199,10 @@ class ClaudeCodeSetup(BaseModel):
     cloud: bool = False
     cli_in_sandbox: bool = False
     too_small: list[ClaudeCodeCloudComputer] = Field(default_factory=list)
+    #: Where the Chief of Staff's Claude Code runs (``hosted.cli_placement``
+    #: for Home), or why it can't, and whether it runs a saved Claude Code
+    #: Default; None until the user turns Claude Code on.
+    chief_of_staff: ClaudeCodeChiefOfStaff | None = None
 
 
 #: The credentials a user may choose for their turns on a cloud computer.
@@ -173,18 +224,23 @@ class ClaudeCodeCustody(BaseModel):
     blocked: bool = False
     runs_on: Literal["stored_token"] | None = None
     refusal: str | None = None
-    #: The version of the consent text storing a token needs accepted now.
-    disclosure: str | None = None
 
 
 class CustodyBody(BaseModel):
     mode: Literal["local", "stored"]
-    #: The version of the consent text accepted, which storing a token needs.
+    #: The version of the consent text the client showed, which storing a
+    #: token needs to be the current one (``hosted.DISCLOSURE``). The view never
+    #: names it, so a tab showing older copy cannot echo it back.
     disclosure: str | None = Field(default=None, max_length=32)
 
 
 class TokenBody(BaseModel):
     token: SecretStr
+
+
+class ClisBody(BaseModel):
+    #: How many Claude Code CLIs the computer runs at once, 1 to ``clis_max``.
+    clis: StrictInt = Field(ge=1, le=CLIS_MAX)
 
 
 class CodeBody(BaseModel):

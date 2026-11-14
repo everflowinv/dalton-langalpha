@@ -379,7 +379,7 @@ async def test_a_computer_whose_token_claude_refused_spent_its_check(computer, h
 
 def test_a_computer_shows_the_hold_of_the_credential_its_turns_sign_in_with():
     plans = {"saved": CredentialPlan(None, 100), "computer:c-1": CredentialPlan(None, 200)}
-    entry = ClaudeCodeComputer(computer_id="c-1", name="Studio Mac", kind="ssh", state="signed_in", source="saved")
+    entry = ClaudeCodeComputer(clis=4, computer_id="c-1", name="Studio Mac", kind="ssh", state="signed_in", source="saved")
     assert machine._with_plan(entry, plans).check_in == 100
     assert machine._with_plan(entry.model_copy(update={"source": "machine"}), plans).check_in == 200
 
@@ -401,7 +401,7 @@ async def test_a_sign_in_code_pasted_again_answers_with_the_plan_and_the_hold_as
         return SimpleNamespace(file="works")
 
     async def from_answer(user_id, computer, answer, relayed):
-        return ClaudeCodeComputer(computer_id="c-1", name="Studio Mac", kind="ssh", state="signed_in", source="machine")
+        return ClaudeCodeComputer(clis=4, computer_id="c-1", name="Studio Mac", kind="ssh", state="signed_in", source="machine")
 
     async def relayed(user_id):
         return None
@@ -464,6 +464,38 @@ async def test_a_machines_check_says_when_claude_answered(monkeypatch):
     computer_id = "00000000-0000-4000-8000-000000000001"
     answer = await machine.check_machine(SimpleNamespace(link=AsyncMock()), "u", computer_id, None, answered=lambda: heard.append(True))
     assert (answer.file, heard) == ("works", [True])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("works", "expires_at", "kept"),
+    [
+        pytest.param(True, "2020-01-01T00:00:00+00:00", None, id="served-past-expiry"),
+        pytest.param(True, "2999-01-01T00:00:00+00:00", "2999-01-01T00:00:00+00:00", id="served-before-expiry"),
+        pytest.param(False, "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", id="refused"),
+    ],
+)
+async def test_a_check_claude_serves_drops_an_expiry_already_past(monkeypatch, works, expires_at, kept):
+    """A token put there by hand since the sign-in that gave the expiry would
+    otherwise read as expired, and be refused, however often Claude served it."""
+    from ptc_agent.agent.claude_code import machine_token
+
+    class Plan:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def written(self):
+            pass
+
+    monkeypatch.setattr(machine_token, "machine_state", AsyncMock(return_value=SimpleNamespace(file="file", present=True, folder=None)))
+    monkeypatch.setattr(machine, "run_check", AsyncMock(return_value=works))
+    monkeypatch.setattr(machine, "check_launcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(machine, "UserPlan", Plan)
+    monkeypatch.setattr(machine, "check_would_bill", AsyncMock(return_value=False))
+    last = machine.MachineAnswer("works", email="a@example.com", expires_at=expires_at)
+    answer = await machine.check_machine(SimpleNamespace(link=AsyncMock()), "u", "00000000-0000-4000-8000-000000000001", last)
+    assert answer.file == ("works" if works else "refused"), answer
+    assert (answer.email, answer.expires_at) == ("a@example.com", kept)
 
 
 @pytest.mark.asyncio

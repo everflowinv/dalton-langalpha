@@ -1,8 +1,8 @@
 import { useEffect } from 'react';
-import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import {
-  getClaudeCodeComputers, getClaudeCodeSetup, getClaudeCodeStatus, type ClaudeCodeComputer, type ClaudeCodeComputers, type ClaudeCodeState,
-  type ClaudeCodeStatus,
+  getClaudeCodeComputers, getClaudeCodeSetup, getClaudeCodeStatus, setClaudeCodeComputerClis, type ClaudeCodeComputer,
+  type ClaudeCodeComputers, type ClaudeCodeState, type ClaudeCodeStatus,
 } from '@/api/model';
 import { TOKEN_WORKS } from '@/lib/claudeCode';
 import { queryKeys } from '@/lib/queryKeys';
@@ -37,6 +37,19 @@ function untilBillingEnds(entry: Pick<ClaudeCodeStatus, 'check_bills' | 'plan'> 
   return ends.length > 0 ? Math.min(Math.min(...ends) + 1_000, MAX_DELAY_MS) : false;
 }
 
+/** When an own computer's token that works is read again: as its expiry
+ *  passes, so a reader judging it at the read's time (`readAt`) finds it past
+ *  then without a clock of its own, and as often as a token past its expiry
+ *  is (`untilExpiry`) until a read lands after it, since a read that fails
+ *  leaves the last one standing. False once one has, since the server keeps
+ *  its last check's answer until the next. */
+function untilComputerExpiry({ state, expires_at: expiresAt }: ClaudeCodeComputer, readAt: number): number | false {
+  const at = expiresAt && TOKEN_WORKS.has(state) ? Date.parse(expiresAt) : NaN;
+  if (Number.isNaN(at) || readAt >= at) return false;
+  const left = at - Date.now();
+  return left >= 0 ? Math.min(left + 1_000, MAX_DELAY_MS) : PAST_EXPIRY_POLL_MS;
+}
+
 /** The earlier of two reads again, either of which may be none. */
 const sooner = (a: number | false, b: number | false) => (a === false ? b : b === false ? a : Math.min(a, b));
 
@@ -64,6 +77,28 @@ export function updateComputers(
       return next.check_in ? { ...next, check_in: next.check_in + since } : next;
     }),
   }), { updatedAt: listAt });
+}
+
+/**
+ * Saves how many Claude Code agents the user's own computer `computerId`
+ * runs at once. A list read already in flight is cancelled first, so it
+ * cannot land after the save and put the old number back; the entry the
+ * server answers replaces the computer's in the list, and the list and setup
+ * are read again, so every reader shows the new number.
+ */
+export function useSetComputerClis(computerId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (clis: number) => setClaudeCodeComputerClis(computerId, clis),
+    onMutate: () => queryClient.cancelQueries({ queryKey: queryKeys.features.claudeCodeComputers() }),
+    onSuccess: (entry) => {
+      updateComputers(queryClient, (c) => c.computer_id === entry.computer_id, () => entry);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeComputers() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeSetup() });
+    },
+  });
 }
 
 /** `whenOff`: read even while the user's flag is off, for a token left in
@@ -120,8 +155,8 @@ export function useClaudeCodeStatus({ whenOff = false }: ReadOptions = {}) {
 /**
  * The user's own computers (SSH, and a Mac through Remote control) and the
  * token each one's Claude Code turns use, read again every 5 s while any of
- * them is being checked, and as the saved token expires while one signs in
- * with it. The saved token read as refused while one still signs in with it
+ * them is being checked, as the saved token expires while one signs in
+ * with it, and as a token of one's own expires. The saved token read as refused while one still signs in with it
  * reads them again too, since the status may be read first (a refocus) and
  * the expiry timer then never fires. With the flag off the server says
  * `off` for each, still naming a token left on one.
@@ -139,7 +174,8 @@ export function useClaudeCodeComputers({ whenOff = false }: ReadOptions = {}) {
       const computers = query.state.data?.computers ?? [];
       if (computers.some((c) => c.state === 'checking')) return CHECKING_POLL_MS;
       const expiry = computers.some((c) => c.source === 'saved') ? untilExpiry(saved.state, saved.expiresAt) : false;
-      return computers.map(untilBillingEnds).reduce(sooner, expiry);
+      const expiries = computers.map((c) => untilComputerExpiry(c, query.state.dataUpdatedAt));
+      return [...computers.map(untilBillingEnds), ...expiries].reduce(sooner, expiry);
     },
   });
   const queryClient = useQueryClient();
@@ -150,8 +186,12 @@ export function useClaudeCodeComputers({ whenOff = false }: ReadOptions = {}) {
   }, [behindSaved, queryClient]);
   // A failed read again keeps the list it had, which still says whose they are.
   return {
-    computers: data?.computers ?? [], cloudRefusals: data?.cloud_refusals ?? {}, isLoading: featuresLoading || isLoading,
+    computers: data?.computers ?? [], cloudRefusals: data?.cloud_refusals ?? {}, cliComputer: data?.cli_computer ?? null,
+    clisMax: data?.clis_max ?? null,
+    isLoading: featuresLoading || isLoading,
     unread: isError && !data,
+    /** When the list arrived, by this clock: the time a token's expiry is judged at. */
+    readAt: dataUpdatedAt,
     checkAfterOf: (entry: ClaudeCodeComputer) => holdUntil(entry.check_in, dataUpdatedAt),
   };
 }
@@ -164,19 +204,21 @@ export function useClaudeCodeComputers({ whenOff = false }: ReadOptions = {}) {
  * checked, and as the next working token expires; every token change and the opt-in reread it with the other
  * Claude Code reads, as a computer added, removed or started does. Read
  * again whenever Settings opens, since a computer can come online (a Mac's
- * Remote control turned on) with no change made here.
+ * Remote control turned on) with no change made here. Not read while
+ * `enabled` is false.
  */
-export function useClaudeCodeSetup() {
+export function useClaudeCodeSetup({ enabled = true }: { enabled?: boolean } = {}) {
   const saved = useClaudeCodeStatus();
   const { data, isLoading, isError } = useQuery({
     queryKey: queryKeys.features.claudeCodeSetup(),
     queryFn: () => getClaudeCodeSetup(),
+    enabled,
     staleTime: 60_000,
     refetchOnMount: 'always',
     retry: 1,
     refetchInterval: (query) => {
       const setup = query.state.data;
-      if (setup?.state === 'checking') return CHECKING_POLL_MS;
+      if (setup?.state === 'checking' || setup?.pin_state === 'checking') return CHECKING_POLL_MS;
       if (setup?.state !== 'connected') return false;
       // Read again as the next working token expires, which may be the one it is connected by.
       const waits = [{ state: saved.state, expires_at: saved.expiresAt }, ...setup.computers]

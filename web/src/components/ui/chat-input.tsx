@@ -34,8 +34,7 @@ import {
 } from './chat-input.composerParts';
 import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
 import type { ModelRowStatus } from './chat-input.modelPicker';
-import { CLAUDE_CODE_CHOICE_URL, biggerComputer, claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
-import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
+import { claudeCodeHold, isClaudeCodeModel } from '@/lib/claudeCode';
 import { usePlanReader } from '@/hooks/useClaudeCodePlan';
 import { creditsRefused, pickerPlanHold, planOutOf } from '@/lib/claudeCodePlan';
 import { deriveRecentModels } from './chat-input.models';
@@ -88,7 +87,8 @@ export interface ChatInputHandle {
    * mounted chat input sees it.
    */
   addWidgetSnapshot: (snapshot: WidgetContextSnapshot) => void;
-  setValue: (text: string) => void;
+  /** Replaces the text: pills it no longer names drop, and `commands` are picked beside it. */
+  setValue: (text: string, commands?: SlashCommand[]) => void;
   /**
    * Puts back what was written elsewhere, or sent and handed back, without
    * losing what is typed here: the text into an empty box, else after it, a
@@ -171,6 +171,9 @@ export interface ChatInputProps {
    */
   model?: string | null;
   onPickModel?: ((model: string) => void) | null;
+  /** The model a send names where the host's thread names another than the
+   *  pill shows (`useThreadModel`'s `sendModel`); unset, the pill's. */
+  sendModel?: string | null;
   /**
    * The thread's own reasoning effort and fast mode, over what Settings gives
    * its model, owned by a thread host (`useThreadTuning`), which also receives
@@ -249,6 +252,7 @@ function ChatInput({
   // Model selector
   model: hostModel,
   onPickModel = null,
+  sendModel: hostSendModel,
   // Thread effort and fast mode
   tuning: hostTuning,
   onPickReasoningEffort = null,
@@ -322,10 +326,13 @@ function ChatInput({
   // holds it, starting on the account default, which with nothing saved is
   // the deployment's (see useSlotDefaultModels for why it waits on the
   // preference), and following the default when it changes. A turn in Home
-  // swaps a model it never runs for the default (see useTurnModels).
-  const turn = useTurnModels(inHome || scope === 'all');
+  // starts on the deployment's over a Claude Code one the server does not
+  // run there (see useTurnDefaultModel).
+  const chiefOfStaff = inHome || scope === 'all';
+  const turn = useTurnModels(chiefOfStaff, selectedWorkspaceId);
   const [ownModel, setOwnModel] = useSeededModel(turn.defaultModel);
-  const pillModel = turn.resolve(hostModel === undefined ? ownModel : hostModel);
+  const pillModel = hostModel === undefined ? ownModel : hostModel;
+  const sentModel = hostSendModel === undefined ? pillModel : hostSendModel;
 
   // Per-model tuning is an account preference, not a device one: the server
   // resolves ``profiles[<model>]`` for turns this input never starts (schedules,
@@ -553,7 +560,7 @@ function ChatInput({
   useImperativeHandle(ref, () => ({
     getModelOptions() {
       return {
-        model: pillModel,
+        model: sentModel,
         reasoningEffort: sentEffort,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
@@ -596,9 +603,17 @@ function ChatInput({
         return [...prev, snapshot];
       });
     },
-    setValue(text) {
+    setValue(text, commands = []) {
+      // Dictation rewrites the draft from what it held when it started.
+      abandonListening();
       setMessage(text);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      // Pills follow the text, as typing prunes them: one the new text no
+      // longer names would otherwise ride the next send unseen.
+      pruneDraft(text);
+      restoreSlash(commands);
+      // A draft handed in by another surface (a palette's Enter, a starter's
+      // click) carries on that action, so it draws no keyboard ring.
+      setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
     giveBack(text, files = [], { mentions = [], commands = [], focus = true } = {}) {
       // DALTON-HOOK(composer-drafts): handed-back draft waits for an open IME composition
@@ -639,7 +654,7 @@ function ChatInput({
     focus() {
       textareaRef.current?.focus();
     },
-  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, handleFiles, abandonListening, setMessage, giveBackDraft]);
+  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -893,7 +908,7 @@ function ChatInput({
         commands: slashCommands,
         message: finalMessage,
         modelOptions: {
-          model: pillModel,
+          model: sentModel,
           reasoningEffort: sentEffort,
           fastMode: resolvedFastMode,
           marketWatch: effectiveMarketWatch,
@@ -923,7 +938,7 @@ function ChatInput({
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
   }, [hasContent, disabled, hasIncompleteUploads, message, effectiveMarketWatch, draftSubagents, attachedFiles, clearFiles, consumeSentFiles, onSend, onAction,
     heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
-    pillModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
+    sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
     sendRef.current = () => {
       if (!hasContent || disabled || hasIncompleteUploads) return false;
@@ -1038,14 +1053,15 @@ function ChatInput({
 
   const favorites = useFavoriteModels();
   const { entryFor } = useProviderCatalog();
-  // A Claude Code model runs a turn while the token where the workspace's
-  // computer runs it works or could not be checked, as admission lets it;
+  // A Claude Code model runs a turn while the token where the turn's
+  // workspace (Home's for the Chief of Staff) runs it works or could not be
+  // checked, as admission lets it;
   // otherwise its row says why, and where the user can fix it: that
   // computer's token, or the saved one. One whose Claude plan is used up for
   // it waits for the reset, unless usage credits carry it, told by the
   // picker's own minute clock (`now`), so the composer does not turn with the
   // minute.
-  const claudeCode = useWorkspaceClaudeCode(selectedWorkspaceId);
+  const { claudeCode } = turn;
   const planReader = usePlanReader();
   const modelGroupList = useMemo(() => modelGroups({
     models: turn.models,
@@ -1060,23 +1076,18 @@ function ChatInput({
     },
   }), [turn.models, visibleModels, payers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
-    .filter((m) => !favorites.models.includes(m) && turn.offers(m));
-  const tokenUrl = claudeCodeTokenUrl(selectedWorkspaceId);
+    .filter((m) => !favorites.models.includes(m));
   const modelRowStatus = (m: string, now: number): ModelRowStatus => {
     if (isClaudeCodeModel(modelMetadata[m])) {
-      switch (claudeCode.state) {
-        case 'checking': return { unavailable: t('modelAccess.status.working') };
-        case 'no_token': return { unavailable: t('chat.modelSelector.claudeCodeSignedOut'), fix: () => navigate(tokenUrl) };
-        case 'rejected': return { unavailable: t('chat.modelSelector.claudeCodeRejected'), fix: () => navigate(tokenUrl) };
-        case 'needs_own_computer': return { unavailable: t('chat.modelSelector.claudeCodeNeedsOwnComputer') };
-        case 'hosted_off': return { unavailable: t('chat.modelSelector.claudeCodeHostedOff'), fix: () => navigate(CLAUDE_CODE_CHOICE_URL) };
-        case 'needs_bigger_computer': {
-          const { rowKey, link } = biggerComputer();
-          return { unavailable: t(rowKey), fix: link ? () => window.open(link.url, '_blank', 'noopener,noreferrer') : undefined };
-        }
-        case 'policy_blocked': return { unavailable: t('chat.modelSelector.claudeCodePolicyBlocked') };
-        case 'needs_perl': return { unavailable: t('modelAccess.claudeCode.fail.needs_perl') };
-        case 'computer_unsupported': return { unavailable: t('modelAccess.claudeCode.fail.computer_unsupported') };
+      const hold = claudeCodeHold(claudeCode.state, turn.workspaceId, {
+        home: chiefOfStaff, cliComputerName: claudeCode.cliComputerName,
+      });
+      if (hold) {
+        const { link } = hold;
+        return {
+          unavailable: t(hold.messageKey, hold.messageValues),
+          fix: link ? () => (link.external ? window.open(link.url, '_blank', 'noopener,noreferrer') : navigate(link.url)) : undefined,
+        };
       }
       const planOut = planOutOf(preferences?.other_preference);
       const planHold = pickerPlanHold(t, claudeCode.plan, planOut, m, { ...planReader, now });
@@ -1376,7 +1387,7 @@ function ChatInput({
                 metadata={modelMetadata}
                 payers={payers}
                 groups={modelGroupList}
-                favorites={favorites.models.filter(turn.offers)}
+                favorites={favorites.models}
                 recent={recentModels}
                 onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
                 onSelectModel={handlePickModel}

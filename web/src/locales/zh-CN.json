@@ -183,7 +183,7 @@
     "plugins": "插件",
     "orders": "订单",
     "menu": "菜单",
-    "search": "搜索 ({{shortcut}})",
+    "search": "搜索研究 ({{shortcut}})",
     "globalSearch": {
       "title": "全局搜索",
       "placeholder": "搜索历史对话与文档…",
@@ -2803,7 +2803,10 @@
       "claudeCodeNeedsOwnComputer": "仅可在你自己电脑上的工作区中使用",
       "claudeCodePolicyBlocked": "你所在组织的 Claude Code 策略不允许它在这台电脑上运行",
       "claudeCodeHostedOff": "请在设置中选择它在云端计算机上的运行方式",
+      "claudeCodeNoOwnComputer": "需要一台有独立 setup token 的电脑在线",
+      "claudeCodeCliComputerOffline": "{{name}} 目前离线",
       "claudeCodeNeedsBiggerComputer": "需要中型及以上规格的云端计算机，或你自己的电脑",
+      "claudeCodeNeedsBiggerComputerHome": "需要中型及以上规格的云端计算机",
       "claudeCodeNeedsBiggerComputerPlan": "需要中型及以上规格的云端计算机：可更改规格或升级 LangAlpha 套餐，或使用你自己的电脑"
     },
     "voice": {
@@ -2947,13 +2950,14 @@
       "off": {
         "account": "你的账户未开启 Claude Code。请在设置的“模型接入”中开启，或选择其他模型。",
         "token_refused": "Claude 拒绝了你的 setup token，它可能已过期或被撤销。请在设置的“模型接入”中添加新的 token 后使用此模型。",
-        "hosted_off": "你的账户设置为只在你自己的电脑上运行 Claude Code，所以云端计算机上的工作区无法使用 Claude Code 模型。请在设置的“模型接入”中选择运行位置，或把此工作区移到你自己的电脑上。",
+        "no_own_computer": "Claude Code 会在你自己的电脑上运行，但目前没有一台有独立 setup token 的电脑在线。请开启其中一台，或在设置的“模型接入”中为一台电脑添加 token。",
+        "cli_computer_offline": "为你运行 Claude Code 的 {{name}} 目前离线。请开启它，或选择其他模型。",
         "too_many_turns": "你在云端计算机上同时运行的 Claude Code 对话已达上限（{{n}} 个），请等其中一个结束后再试。",
-        "stored_blocked": "你的账户无法保存 setup token，因此 Claude Code 只能在你自己的电脑上运行。请选择其他模型，或把此工作区移到你自己的电脑上。",
-        "stored_unattended": "自动化、唤醒以及其他 Agent 自行发起的工作不会使用 LangAlpha 为你保存的 setup token 运行。如需用 Claude Code 运行它们，请在设置的“模型接入”中改为在你自己的电脑上运行。",
         "choice_changed": "本轮开始时，云端计算机上 Claude Code 的运行方式发生了变化。请重新发送你的消息。",
         "needs_bigger_computer": "Claude Code 可在中型及以上规格的云端计算机上运行，而此工作区所在的计算机规格较小。你可以更改这台计算机的规格，或把此工作区移到你自己的电脑上。",
-        "needs_bigger_computer_plan": "Claude Code 可在中型及以上规格的云端计算机上运行，而此工作区所在的计算机规格较小。你可以更改这台计算机的规格或升级 LangAlpha 套餐，或把此工作区移到你自己的电脑上。"
+        "needs_bigger_computer_home": "Claude Code 可在中型及以上规格的云端计算机上运行，而 Home 所在的计算机规格较小。你可以更改这台计算机的规格。",
+        "needs_bigger_computer_plan": "Claude Code 只在中型及以上规格的云端计算机上运行，而此工作区所在的计算机规格更小。请更改它的规格或升级 LangAlpha 套餐，或在设置的“模型接入”中改为在你自己的电脑上运行 Claude Code。",
+        "needs_bigger_computer_plan_home": "Claude Code 只在中型及以上规格的云端计算机上运行，而 Home 所在的计算机规格更小。请更改它的规格或升级 LangAlpha 套餐，或在设置的“模型接入”中改为在你自己的电脑上运行 Claude Code。"
       }
     }
   },
@@ -6737,6 +6741,7 @@
       "modelAria": "{{name}} 的模型",
       "modelHint": "保持“对话的模型”即可跟随对话所用的模型。",
       "modelUnavailableHint": "保存的模型目前对你不可用，因此它会使用对话的模型。选择其他模型即可清除这条提示。",
+      "claudeCodePinHint": "对话所在的工作区能运行 Claude Code 时，使用你的 Claude 套餐运行；其他情况下使用对话的模型。",
       "modelUnavailableOption": "{{model}}（不可用）",
       "unavailableOption": "{{name}}（不可用）",
       "effort": "推理强度",
@@ -7056,7 +7061,9 @@
         "savedRejected": "Claude 拒绝了你已保存的 token，它可能已过期或被撤销。",
         "offline": "这台电脑未在运行，无法检查它的 token。",
         "addOwn": "为它添加 token",
-        "checking": "正在向 Claude 确认它的 token 是否有效"
+        "checking": "正在向 Claude 确认它的 token 是否有效",
+        "clis": "同时运行的 Claude Code Agent 数",
+        "clisHelp": "这台电脑同时运行的 Claude Code Agent 数量，包括子 Agent。超过 4 个时，LangAlpha 会为它再建立一条连接。"
       },
       "optOut": {
         "saved": "Claude Code 已关闭，但你的 setup token 仍处于保存状态。",
@@ -7065,9 +7072,9 @@
       "savedTag": "Setup token",
       "hosted": {
         "heading": "Claude Code 在哪里运行",
-        "local": "仅在你自己的电脑上",
-        "localDetail": "Claude Code 在你自己的电脑上运行，每台电脑各用自己的 setup token，LangAlpha 不保留副本。云端计算机上的工作区无法使用 Claude Code 模型。",
-        "stored": "也用于云端计算机，使用由 LangAlpha 保存的 setup token",
+        "local": "在你自己的电脑上",
+        "localDetail": "Claude Code 在你自己的、有独立 setup token 的电脑上运行，所有工作区都是如此，包括云端计算机上的工作区。这些工作区的文件和命令仍在云端计算机上运行，LangAlpha 不会保留 token 的副本。",
+        "stored": "在云端计算机上，使用 LangAlpha 为你保存的 setup token",
         "storedDetail": "在中型及以上规格的云端计算机上，工作区的 Claude Code 直接在这台计算机上运行；没有独立 token 的你自己的电脑也在本机运行 Claude Code。每轮对话由 LangAlpha 把加密保存的 setup token 发给运行它的计算机。用量计入你的 Claude 套餐。",
         "paused": "此服务器已暂停在云端计算机上运行 Claude Code。你的选择会保留，Claude Code 在你自己的电脑上照常运行。",
         "blocked": "你的账户无法保存 setup token。Claude Code 在你自己的电脑上照常运行。"
@@ -7075,7 +7082,7 @@
       "consent": {
         "title": "让 LangAlpha 保存你的 setup token？",
         "encrypted": "LangAlpha 会加密保存你的 token，只用于为你的对话运行 Claude Code。每轮对话，LangAlpha 会把 token 发给运行这轮对话的计算机。LangAlpha 的服务器也会用它检查 token 是否仍然可用。",
-        "unattended": "用量计入你的 Claude 套餐。自动化、唤醒以及其他 Agent 发来的对话不会使用此 token。",
+        "unattended": "用量计入你的 Claude 套餐，包括自动化、唤醒以及其他 Agent 发来的对话。",
         "terms": "这种使用方式适用 Anthropic 为你的 Claude 套餐制定的条款，你需要自行确保遵守。Anthropic 可能会限制或停用它认定违反条款的账户。",
         "undo": "你可以随时切换回来，LangAlpha 会立即删除此 token。",
         "confirm": "保存我的 token",
@@ -7139,8 +7146,9 @@
         },
         "connected": {
           "title": "Claude Code 已可使用",
-          "body": "在这些电脑上的工作区中，模型选择器里已有 Claude Code 模型。",
-          "bodyAny": "模型选择器里已有 Claude Code 模型。"
+          "body": "模型选择器里已有 Claude Code 模型。",
+          "cliOwn": "你的云端工作区和 Chief of Staff Agent 都在 {{name}} 上运行 Claude Code。",
+          "cliHome": "你的 Chief of Staff Agent 在 Home 所在的计算机 {{name}} 上运行 Claude Code。"
         },
         "checking": {
           "title": "正在检查 setup token",
@@ -7726,6 +7734,138 @@
       "failed": "无法连接 Claude 检查用量，请稍后再试。",
       "computerUnreached": "无法连接这台电脑查看用量，请稍后再试。",
       "unsaved": "Claude 已响应，但用量未能更新，请稍后再试。"
+    }
+  },
+  "palette": {
+    "copyFailed": "无法复制到剪贴板",
+    "title": "搜索与命令",
+    "label": "搜索对话、股票代码、技能、设置，或直接提问",
+    "placeholder": "搜索对话、股票代码、技能、设置，或直接提问",
+    "untitledThread": "未命名对话",
+    "analystIn": "{{workspace}} 的分析师",
+    "askTitle": "提问“{{query}}”",
+    "actionsFor": "{{name}} 的操作",
+    "group": {
+      "recent": "最近",
+      "actions": "操作",
+      "topHit": "最佳匹配",
+      "threads": "对话",
+      "tickers": "股票代码",
+      "workspaces": "工作区",
+      "skills": "技能",
+      "places": "页面与设置",
+      "ask": "提问"
+    },
+    "kind": {
+      "workspace": "工作区",
+      "page": "页面",
+      "chart": "图表"
+    },
+    "do": {
+      "open": "打开",
+      "openInNewTab": "在新标签页打开",
+      "copyLink": "复制链接",
+      "openChart": "打开图表",
+      "newThreadAbout": "新建关于 {{symbol}} 的对话",
+      "copySymbol": "复制代码",
+      "newThreadIn": "在 {{workspace}} 新建对话",
+      "openInPlugins": "在插件中打开",
+      "useSkill": "在新对话中使用",
+      "run": "执行",
+      "ask": "提问",
+      "back": "返回",
+      "move": "移动",
+      "close": "关闭",
+      "actions": "操作"
+    },
+    "action": {
+      "newThread": "新建对话",
+      "newWorkspace": "新建工作区",
+      "newAutomation": "新建自动化",
+      "lightTheme": "切换到浅色主题",
+      "darkTheme": "切换到深色主题"
+    },
+    "keywords": {
+      "newThread": "对话 聊天 开始 提问 Agent chat new thread",
+      "newWorkspace": "创建 文件夹 项目 workspace",
+      "newAutomation": "定时 提醒 周期 简报 automation",
+      "theme": "外观 深色 浅色 模式 颜色 theme dark light"
+    },
+    "search": "命令与跳转"
+  },
+  "report": {
+    "menuItem": "报告问题",
+    "bannerAction": "报告此问题",
+    "title": "报告问题",
+    "titleError": "报告此错误",
+    "description": "告诉我们遇到的 bug，或希望改进的地方。",
+    "descriptionError": "将这次失败发送给我们的工程师。",
+    "categoryLabel": "关于什么？",
+    "category": {
+      "bug": "Bug",
+      "feedback": "反馈",
+      "billing": "账单",
+      "other": "其他"
+    },
+    "noteLabel": "发生了什么？",
+    "noteLabelOptional": "还有要补充的吗？（可选）",
+    "notePlaceholder": "你当时在做什么，哪里出了问题或可以改进。",
+    "notePlaceholderError": "你的请求是什么，或你预期会发生什么。",
+    "privacy": "我们会收到你的说明，以及工程师排查所需的 ID。你的对话内容不会被发送。",
+    "privacyError": "我们会收到错误信息、此对话和此次运行的 ID，以及你的说明。",
+    "send": "发送报告",
+    "sending": "发送中…",
+    "sent": "谢谢，我们已收到你的报告。",
+    "duplicate": "此报告已发送过。",
+    "sentDetail": "我们的团队会阅读每一份报告。",
+    "rateLimited": "你最近发送的报告较多，请稍后再试。",
+    "rateLimitedIn": "你最近发送的报告较多，请在 {{minutes}} 分钟后再试。",
+    "unavailable": "报告暂时无法发送，请稍后再试。",
+    "thumbsHint": "是某条回答的问题？请点该回答下方的「踩」，这样团队能知道是哪段对话。",
+    "thumbsSent": "谢谢，你的反馈已发送给我们的团队。",
+    "thumbsSentReview": "谢谢，我们的团队会审阅这段对话。",
+    "thumbs": {
+      "title": "报告问题",
+      "description": "此报告会连同对话 ID 发送给我们的团队。只有在你申请人工审核时，才会分享你的消息。",
+      "descriptionLocal": "帮助我们提升回答质量",
+      "whatWentWrong": "哪里出了问题？",
+      "commentLabel": "补充说明（可选）",
+      "commentPlaceholder": "详细描述一下问题…",
+      "reviewTitle": "申请人工审核",
+      "reviewBody": "将这段对话分享给我们的工程团队。经确认的问题将退还积分。",
+      "submit": "提交报告",
+      "categories": {
+        "incorrectData": "数据或数字错误",
+        "wrongTicker": "股票代码或公司错误",
+        "outdated": "信息过时",
+        "flawedAnalysis": "分析有误",
+        "missingRisks": "遗漏风险因素",
+        "codeErrors": "代码执行错误",
+        "ignoredInstructions": "没有按指示操作",
+        "incomplete": "研究不完整",
+        "tooSlow": "太慢"
+      }
+    },
+    "followUp": {
+      "title": "反馈已发送",
+      "sentAt": "已发送给我们的团队 · {{time}}",
+      "notSent": "已保存，但尚未送达我们的团队。",
+      "addLabel": "补充到报告（可选）",
+      "addPlaceholder": "还有什么想让团队知道的…",
+      "addedAt": "补充于 {{time}}",
+      "reviewRequested": "已申请人工审核，我们的团队会查看这段对话。",
+      "send": "发送",
+      "sendAgain": "发送给团队",
+      "withdraw": "撤回报告",
+      "withdrawTitle": "撤回此报告？",
+      "withdrawBody": "你的评价会被移除，你写的内容会从报告中删除。我们的团队会看到报告已撤回。如果你申请了人工审核，它将被取消；已完成的审核结果不变。",
+      "keep": "保留",
+      "withdrawConfirm": "撤回",
+      "added": "已补充到你的报告。",
+      "reviewSent": "已申请人工审核，我们的团队会查看这段对话。",
+      "withdrawn": "报告已撤回。",
+      "gone": "此报告已无法更改。",
+      "noteLimit": "此报告的补充说明已达上限。如需补充更多，请使用「报告问题」。"
     }
   }
 }

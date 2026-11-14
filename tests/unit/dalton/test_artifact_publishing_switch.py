@@ -609,7 +609,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
     """The tool's absence is the whole guard: it writes to the comments tables
     in its own body, out of the HTTP layer's reach."""
     from ptc_agent.agent.agent import PTCAgent
-    from ptc_agent.config.agent import AgentConfig, LLMConfig
+    from ptc_agent.config.agent import Admitted, AgentConfig, LLMConfig
     from ptc_agent.config.core import (
         DaytonaConfig,
         FilesystemConfig,
@@ -628,6 +628,8 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
         mcp=MCPConfig(),
         filesystem=FilesystemConfig(),
     )
+    # DALTON-HOOK(artifact-publishing-off): upstream #741/#746/#749 gates Claude Code on claude_code_admitted and passes (sandbox, admitted).
+    config.claude_code_admitted = Admitted()
     target = create_llm("claude-haiku-5-5-code")
     with patch.object(AgentConfig, "get_llm_client", return_value=target):
         graph = PTCAgent(config).create_agent(
@@ -636,7 +638,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             user_id="u-1",
             mcp_registry=MagicMock(),
             sandbox=MagicMock(),
-            claude_code_launcher=lambda sandbox, hosted, saved: MagicMock(),
+            claude_code_launcher=lambda sandbox, admitted: MagicMock(),
         )
     # Upstream #729: a Claude Code graph's turn is the run named by config.
     # The tool list lives on the ClaudeTurn that call returns.

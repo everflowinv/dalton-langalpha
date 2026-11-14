@@ -679,7 +679,7 @@ async def _handle_send_message(
 
         # Resolve LLM config eagerly — credit check must happen before SSE stream starts
         from src.server.services.llm import thread_model
-        from src.server.services.llm.claude_code import require_attended, require_claude_code_continues, unattended
+        from src.server.services.llm.claude_code import require_claude_code_continues
         from src.server.services.thread_agent import thread_resolver
         from src.server.dependencies.usage_limits import enforce_credit_limit
         from ptc_agent.config.agent import CredentialSource
@@ -706,7 +706,7 @@ async def _handle_send_message(
             reasoning_effort=getattr(request, "reasoning_effort", None),
             fast_mode=getattr(request, "fast_mode", None),
             enabled_subagents=request.subagents_enabled,
-            unattended=unattended(request),
+            checkpoint_id=request.checkpoint_id,
         )
 
         # A report-back or a channel message has nobody at a client to
@@ -735,9 +735,6 @@ async def _handle_send_message(
             await require_claude_code_continues(
                 thread_id, config.llm.name if config.llm else None, request.checkpoint_id
             )
-        # A turn nobody started runs no stored setup token, refused before the
-        # stream so a server-posted turn reads the refusal.
-        require_attended(config, request)
 
         # is_byok is True only when the stamped credential_source confirms the user
         # supplied their own key (OAUTH or BYOK), not merely that a client object exists.
@@ -1275,6 +1272,24 @@ async def replay_thread_messages(
             "previous page's ``history_page.first_turn_index``."
         ),
     ),
+    max_bytes: int | None = Query(
+        None,
+        ge=1,
+        description=(
+            "Paged replay: stop short of ``limit`` once the page's turns pass "
+            "this many bytes of lines (whole turns, at least ``min_turns``). "
+            "Ignored without ``limit``."
+        ),
+    ),
+    min_turns: int = Query(
+        1,
+        ge=1,
+        description=(
+            "With ``max_bytes``: the fewest turns the page carries, however "
+            "large, and the fewest a cut may leave for the next page (fewer "
+            "are taken into this one)."
+        ),
+    ),
 ):
     """Replay a thread as SSE.
 
@@ -1317,20 +1332,26 @@ async def replay_thread_messages(
 
         from src.server.services.history.replay import (
             CheckpointReplayUnavailable,
+            PageBudget,
             finish_lines,
             read_replay_page,
         )
 
+        budget = (
+            PageBudget(min_turns=min_turns, max_bytes=max_bytes)
+            if max_bytes is not None and limit is not None
+            else None
+        )
         try:
             # DALTON-HOOK(team-sharing): non-owner reads project in memory without DB writeback
-            replay_kwargs: dict[str, object] = {
-                "source": source,
-                "before_turn": before_turn,
-                "limit": limit,
-            }
-            if is_non_owner_reader:
-                replay_kwargs["persist"] = False
-            page, resolved_source = await read_replay_page(rows, **replay_kwargs)
+            page, resolved_source = await read_replay_page(
+                rows,
+                source=source,
+                before_turn=before_turn,
+                limit=limit,
+                budget=budget,
+                persist=not is_non_owner_reader,
+            )
         except CheckpointReplayUnavailable as e:
             raise HTTPException(
                 status_code=409,

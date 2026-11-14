@@ -18,6 +18,7 @@ from ptc_agent.agent.claude_code.compaction import NO_RULES
 from ptc_agent.agent.claude_code.launcher import _THREAD_KEY, LocalLauncher
 from ptc_agent.agent.claude_code.runtime import TURN_KEY
 from ptc_agent.agent.claude_code.tools_bridge import tool_specs
+from ptc_agent.config.agent import Admitted
 from src.llms.llm import create_llm
 
 
@@ -218,9 +219,9 @@ def _built(*, saved: str | None = None, **kwargs) -> ClaudeCodeGraph:
         llm=LLMConfig(name="claude-haiku-5-5-code"), security=SecurityConfig(), logging=LoggingConfig(),
         sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test-key")), mcp=MCPConfig(), filesystem=FilesystemConfig(),
     )
-    config.claude_code_saved = saved
+    config.claude_code_admitted = Admitted(saved=saved)
     target = create_llm("claude-haiku-5-5-code")
-    kwargs = {"sandbox": MagicMock(), "claude_code_launcher": lambda sandbox, hosted, saved: LocalLauncher(), **kwargs}
+    kwargs = {"sandbox": MagicMock(), "claude_code_launcher": lambda sandbox, admitted: LocalLauncher(), **kwargs}
     with patch.object(AgentConfig, "get_llm_client", return_value=target):
         graph = PTCAgent(config).create_agent(
             llm=target, thread_id="t-1", user_id="u-1", mcp_registry=MagicMock(), **kwargs
@@ -360,9 +361,12 @@ def test_every_tool_description_reaches_claude_whole(role):
 def test_the_turn_runs_where_the_callers_launcher_puts_it_for_the_turns_sandbox():
     sandbox, launcher = MagicMock(), LocalLauncher()
     seen = []
-    graph = _built(sandbox=sandbox, claude_code_launcher=lambda s, hosted, saved: seen.append(s) or launcher)
+    graph = _built(
+        saved="saved_token", sandbox=sandbox,
+        claude_code_launcher=lambda s, admitted: seen.append((s, admitted)) or launcher,
+    )
     turn = graph.turn(_RUN)
-    assert seen == [sandbox] and turn.launcher is launcher
+    assert seen == [(sandbox, Admitted(saved="saved_token"))] and turn.launcher is launcher
 
 
 def test_a_claude_code_turn_built_with_no_launcher_is_refused():
@@ -420,7 +424,7 @@ def test_a_subagent_of_a_claude_code_turn_runs_each_run_in_a_cli_of_its_own():
 
     with patch.object(cc_agent, "claude_code_graph", side_effect=graph), \
          patch.object(cc_agent, "build_claude_code_graph", side_effect=build):
-        main = _built(claude_code_launcher=lambda sandbox, hosted, saved, **kw: launched.append(kw) or LocalLauncher())
+        main = _built(claude_code_launcher=lambda sandbox, admitted, **kw: launched.append(kw) or LocalLauncher())
     [(kw, sub, built)] = [(kw, g, b) for (kw, g), b in zip(graphs, builds, strict=True) if g is not main]
     turn = sub.turn({"configurable": {"thread_id": "t-1", "checkpoint_ns": "task:k1"}})
     assert turn.run_key == "t-1-k1" and launched == [{"slot_wait_s": 30}]
@@ -449,3 +453,116 @@ def test_a_subagent_is_admitted_on_the_credential_its_turn_was_let_to_sign_in_wi
     [middleware] = made
     assert middleware.claude_code_types
     assert middleware.claude_code_stored is (saved is not None)
+
+
+def test_a_claude_code_pin_on_a_turn_of_another_model_runs_each_run_in_a_cli_of_its_own(monkeypatch):
+    """As a Claude Code turn's subagent does, on what admission let the pins
+    sign in with (``claude_code_pins``), counted by its computer, its main
+    agent untouched; and a build that could not launch it is refused."""
+    from ptc_agent.agent.agent import PTCAgent
+    from ptc_agent.agent.claude_code import agent as cc_agent
+    from ptc_agent.agent.middleware.background_subagent.middleware import BackgroundSubagentMiddleware
+    from ptc_agent.config.agent import AgentConfig, LLMConfig
+    from ptc_agent.config.core import DaytonaConfig, FilesystemConfig, LoggingConfig, MCPConfig, SandboxConfig, SecurityConfig
+
+    config = AgentConfig(
+        llm=LLMConfig(name="claude-haiku-5-5"), security=SecurityConfig(), logging=LoggingConfig(),
+        sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test-key")), mcp=MCPConfig(), filesystem=FilesystemConfig(),
+    )
+    config.subsidiary_llm_clients["subagent:general-purpose"] = create_llm("claude-haiku-5-5-code")
+    config.claude_code_pins = Admitted("stored_token", "stored_token", "c-9")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    main_model = FakeListChatModel(responses=["x"])
+    graphs, launched, made = [], [], []
+    real_graph, real_init = cc_agent.claude_code_graph, BackgroundSubagentMiddleware.__init__
+
+    def graph(*args, **kw):
+        graphs.append(real_graph(*args, **kw))
+        return graphs[-1]
+
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        made.append(self)
+
+    def build(**kw):
+        with patch.object(AgentConfig, "get_llm_client", return_value=main_model):
+            return PTCAgent(config).create_agent(
+                llm=main_model, thread_id="t-1", user_id="u-1", mcp_registry=MagicMock(), sandbox=MagicMock(), **kw,
+            )
+
+    with patch.object(cc_agent, "claude_code_graph", side_effect=graph), \
+         patch.object(BackgroundSubagentMiddleware, "__init__", init):
+        main = build(
+            claude_code_launcher=lambda sandbox, admitted, **kw: launched.append((admitted, kw)) or LocalLauncher(),
+        )
+    assert not isinstance(main, ClaudeCodeGraph)
+    [sub] = graphs
+    sub.turn({"configurable": {"thread_id": "t-1", "checkpoint_ns": "task:k1"}})
+    assert launched == [(Admitted("stored_token", "stored_token", "c-9"), {"slot_wait_s": 30})]
+    [middleware] = made
+    assert middleware.claude_code_types == {"general-purpose"} and middleware.claude_code_stored
+    assert middleware.cli_computer == "c-9"
+    with pytest.raises(RuntimeError, match="claude_code_launcher"):
+        build(claude_code_launcher=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claude_replied", "on_claude_code", "refused"),
+    [
+        pytest.param(False, True, True, id="another-model-replied"),
+        pytest.param(True, True, False, id="claude-replied"),
+        pytest.param(False, False, False, id="not-on-claude-code"),
+    ],
+)
+async def test_a_task_another_model_last_answered_is_not_resumed_on_claude_code(
+    claude_replied, on_claude_code, refused,
+):
+    """Read off the task's replayed history, two runs deep in a real saver,
+    since its messages are a delta channel. Claude's session would hold none
+    of that reply, and no later turn changes that, so the steers waiting on
+    the resume are settled."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from ptc_agent.agent.main_state import MainAgentState
+    from ptc_agent.agent.middleware.background_subagent.middleware import (
+        OTHER_MODEL_TASK_REFUSAL,
+        BackgroundSubagentMiddleware,
+    )
+    from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTask, BackgroundTaskRegistry
+    from ptc_agent.agent.middleware.background_subagent.spawn import TaskRunRefused
+    from src.llms.claude_code import MESSAGE_ID_KEY
+
+    saver = InMemorySaver()
+    replies = iter([{MESSAGE_ID_KEY: "msg_1"}, {MESSAGE_ID_KEY: "msg_2"} if claude_replied else {}])
+    task_graph = (
+        StateGraph(MainAgentState)
+        .add_node("agent", lambda s: {"messages": [AIMessage("done", id=str(uuid.uuid4()), response_metadata=next(replies))]})
+        .add_edge(START, "agent")
+        .compile(checkpointer=saver)
+    )
+    config = {"configurable": {"thread_id": "t-1", "checkpoint_ns": "task:k1", "__pregel_task_id": "parent-task"}}
+    for prompt in ("go", "and again"):
+        await task_graph.ainvoke({"messages": [HumanMessage(prompt, id=str(uuid.uuid4()))]}, config)
+
+    registry = BackgroundTaskRegistry("t-1")
+    registry.run_ledger = SimpleNamespace(start_task_run=AsyncMock(return_value="tr-3"))
+    mw = BackgroundSubagentMiddleware(subagent_types=["research"], registry=registry, checkpointer=saver)
+    mw.claude_code_types = frozenset({"research"} if on_claude_code else ())
+    task = BackgroundTask(tool_call_id="c", task_id="k1", description="d", prompt="p", subagent_type="research")
+
+    async def resume():
+        return await mw.admit_task_run(
+            task, cause="resume", description="d", launch_tool_call_id="c", parent_run_id="run-A", acquire_fence=False,
+        )
+
+    if not refused:
+        assert await resume() == "tr-3"
+        return
+    with pytest.raises(TaskRunRefused) as caught:
+        await resume()
+    assert (caught.value.reason, caught.value.final, caught.value.busy) == (OTHER_MODEL_TASK_REFUSAL, True, False)
+    registry.run_ledger.start_task_run.assert_not_awaited()

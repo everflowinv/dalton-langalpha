@@ -30,6 +30,9 @@ export const queryKeys = {
   models: {
     all: ['models'],
   },
+  reports: {
+    config: ['reports', 'config'],
+  },
   features: {
     all:  ['features'],
     list: () => [...queryKeys.features.all, 'list'],
@@ -40,6 +43,7 @@ export const queryKeys = {
     claudeCodeStatus: () => [...queryKeys.features.claudeCode(), 'status'],
     claudeCodeComputers: () => [...queryKeys.features.claudeCode(), 'computers'],
     claudeCodeSetup: () => [...queryKeys.features.claudeCode(), 'setup'],
+    claudeCodeChiefOfStaff: (threadId: string) => [...queryKeys.features.claudeCodeSetup(), 'chief-of-staff', threadId],
     // Check now's mutations, each carrying its credential as variables.
     claudeCodePlanCheck: () => [...queryKeys.features.claudeCode(), 'plan-check'],
   },
