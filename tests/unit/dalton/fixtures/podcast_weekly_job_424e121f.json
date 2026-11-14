@@ -1,0 +1,66 @@
+{
+ "id": "424e121f-33b9-4da7-9537-6adaec216b51",
+ "displayName": "播客周报 · 校对发布 → Eve tracking",
+ "agentId": "main",
+ "name": "podcast-weekly-publish",
+ "description": "每周日 09:30 HKT 对 06:00 流水线产出的每期做二次校对、写内容提要、发飞书文档，并把周汇总发到 Eve tracking 群",
+ "enabled": true,
+ "createdAtMs": 1789656166962,
+ "schedule": {
+  "kind": "cron",
+  "expr": "30 9 * * 0",
+  "tz": "Asia/Hong_Kong",
+  "staggerMs": 0
+ },
+ "sessionTarget": "isolated",
+ "wakeMode": "now",
+ "payload": {
+  "kind": "agentTurn",
+  "message": "执行播客周报的校对、发布和汇总环节。汇总发飞书 Eve tracking 群，再同步一份到 eee 的 Discord 私聊（见第 6 步），不发其他私聊。\n\n1. 完整读 /Users/everflow/.openclaw/workspace/skills/podcast-weekly-digest/SKILL.md，从第 3 步开始严格按它执行（第 3 步二次校对并写内容提要、第 4 步发飞书、第 5 步发汇总）。收件人与排期以本 prompt 为准。\n2. 先跑 `bash skills/podcast-weekly-digest/scripts/run.sh --json status --pending` 看当天 06:00 HKT 的流水线任务留下了什么。\n   - 有期次的 `stage` 还没到 `ready`：补跑一次 `bash skills/podcast-weekly-digest/scripts/run.sh --json pipeline --since-days 7 --video-model gemini-4-argon --text-model gemini-4-argon`。`exec` 单次最多 10 分钟，被杀后重跑同一条命令会从断点续上；最多补跑 6 次，仍没到 `ready` 的期次记为失败，写进汇总末尾，其余期次照常发。\n   - 没有任何待处理期次：在 Eve tracking 群发一行「播客周报｜本周 All-In 和 a16z 没有新节目」，然后结束。\n3. 校对时保留说话人原话：数字、公司名、人名听上去像口误也不替说话人改，只在「校正说明」里标「待核」。说话人归属只在有硬证据（被直呼其名、自报身份、一问一答接得上）时才改，拿不准的保留原判并写明「未改，引用前回看视频」。\n4. 内容提要里的每个数字都要能在该期 `.zh.md` 里找到；嘉宾的单方说法标明「嘉宾自述，未独立核实」。\n5. 每期 `publish` 返回 `ok: true` 和 `doc_url` 后才算发布成功；抽一篇回读，确认内容提要、中文全文、校正说明、英文校订稿四个部分都在。\n6. 汇总用 `message(action=\"send\", channel=\"feishu\", target=\"chat:oc_397207208fb52a0b09969794ef3cd421\", ...)` 发出，格式按 SKILL.md 第 5 步。飞书里金额写「美元」，数字区间写「至」，不用大号标题。群里发送成功后，再用 `message(action=\"send\", channel=\"discord\", target=\"user:1134818575211839498\", ...)` 把同一份汇总同步一份；第 2 步「没有新节目」那一行同样同步。Discord 不用 Markdown 表格，多个链接用 <> 包住；Discord 这一步失败不重发飞书群，在最终回复写明。\n7. 二次校对的模型与 thinking 以本条为准，覆盖 SKILL.md 中旧的模型分配：常规校对子任务显式传 `model: \"openai/gpt-6.1-sol\", thinking: \"medium\"`，不再默认使用 Opus。遇到影响结论的数字、姓名或说话人归属冲突，先读原文／视频证据；只把已定位的争议片段及证据交给 `model: \"claude-cli-gateway/claude-opus-5-5\", thinking: \"high\"` 复核一次，不把整期全文重交 Opus。若 Sol 因服务或额度问题启动失败，改用 `model: \"google/gemini-4-argon\", thinking: \"medium\"` 重派一次；权限拒绝停止，不换入口。仍失败则由主任务按 SKILL.md 第 3 步校对；证据不足保留待核，不凭模型判断改说话人原话。校对没做完的期次不发布，写进汇总末尾。\n8. 面向用户的中文按 workspace 的中文表达验收写：先给判断，句子用中文主谓结构，删空话。\n9. 最后一条回复写清：本周共几期、各期文档链接、失败或跳过的期次和原因、汇总是否发送成功。未验证的部分点名写出。\n\n【撰写硬规则：严禁防御性否定表达】\n本任务自行撰写的标题、正文、摘要、分析、研究底稿、图注、卡片、报告、纪要及最终回复，严禁使用防御性否定表达，包括“不代表”“并非”“而不是”“不能”“不构成”“不应”；同义改写的防御性否定句同样禁用。\n先直接给出判断，再写事实、依据、适用条件和具体待核项。需要说明边界或不确定性时，用正面、具体、简洁的陈述写清证据范围、置信度及改判条件。\n保存或投递成稿前逐句检查，发现上述措辞就整句改写，保留事实、数字、责任归属、结论强弱和必要的风险信息。逐字引文、原始转写、代码、命令、原始报错及固定协议字段保持原样；原任务的栏目、验证、失败披露、来源和投递要求照常执行。\n如原流程会委托子任务或调用其他模型撰稿，须将本条完整传入对应 prompt，并在汇总时复核；沿用原有子任务权限与限制。",
+  "model": "openai/gpt-6.1-sol",
+  "fallbacks": [
+   "google/gemini-4-argon"
+  ],
+  "thinking": "low",
+  "timeoutSeconds": 7200,
+  "lightContext": true,
+  "toolsAllow": [
+   "*"
+  ]
+ },
+ "delivery": {
+  "mode": "none",
+  "channel": "last"
+ },
+ "failureAlert": {
+  "after": 1,
+  "channel": "discord",
+  "to": "user:1333343845827739700"
+ },
+ "scheduledToolPolicy": {
+  "version": 1,
+  "mode": "trusted"
+ },
+ "state": {
+  "nextRunAtMs": 1794706200000,
+  "lastRunAtMs": 1794101400053,
+  "lastRunStatus": "ok",
+  "lastStatus": "ok",
+  "lastDurationMs": 1448029,
+  "lastDeliveryStatus": "not-requested",
+  "lastFailureNotificationDeliveryStatus": "not-requested",
+  "consecutiveErrors": 0,
+  "consecutiveSkipped": 0,
+  "lastDelivered": false
+ },
+ "updatedAtMs": 1794102848082,
+ "configRevision": "sha256:y1IlTZO8FJy56oINKeZqMVZq1Vgng0AngXjz29V6vAI",
+ "nextRunAtMs": 1794706200000,
+ "lastRunAtMs": 1794101400053,
+ "lastRunStatus": "ok",
+ "lastDelivered": false,
+ "lastDeliveryStatus": "not-requested",
+ "lastFailureNotificationDeliveryStatus": "not-requested",
+ "effectiveAgentId": "main",
+ "status": "ok"
+}

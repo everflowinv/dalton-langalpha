@@ -312,7 +312,7 @@ def test_frontmatter_registry_profile_and_hard_rule() -> None:
     assert len(description) <= 120
     assert "触发词" not in description
     assert (SKILL_NAME, None, ("dalton-conventions", "research-conventions")) in _DALTON_SKILL_SPECS
-    assert len(_DALTON_SKILL_SPECS) == 45
+    assert len(_DALTON_SKILL_SPECS) == 46
     assert PROFILE in REPORT_PROFILES
     body, _heading, rules = text.partition("## 撰写硬规则")
     assert text.count("## 撰写硬规则") == 1

@@ -2994,9 +2994,9 @@ async def test_data_jobs_visibility_permissions_http_and_service_and_cos_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify §7.1 items 1, 2, 3, 6, 7:
-    - classify_system_job_key recognizes `data:<job_key>` for the 36 registered tasks and rejects unknown `data:*` keys;
+    - classify_system_job_key recognizes `data:<job_key>` for the 37 registered tasks and rejects unknown `data:*` keys;
     - External members cannot see any `data` tasks in `list_system_jobs` and are rejected with 403/PermissionError on both HTTP and service layers;
-    - Internal and admin members see all 36 `data` tasks with `can_toggle`, `can_run_now`, `can_rollback`, and can operate on them with runtime owner resolved to `DALTON_PM_USER_IDS[0]`;
+    - Internal and admin members see all 37 `data` tasks with `can_toggle`, `can_run_now`, `can_rollback`, and can operate on them with runtime owner resolved to `DALTON_PM_USER_IDS[0]`;
     - Missing `DALTON_PM_USER_IDS` returns HTTP 503 on `data:*` mutations;
     - Company/sector analysts in a workspace are blocked on `data:*` in `dalton_system_jobs`, while Chief of Staff with an internal user succeeds.
     """
@@ -3028,12 +3028,14 @@ async def test_data_jobs_visibility_permissions_http_and_service_and_cos_tool(
     assert not [j for j in ext_list["jobs"] if j["scope"] == "data"]
     assert "data" not in ext_list["groups"]
 
-    # Internal member sees all 36 `data` tasks with can_toggle=True, can_run_now=False, can_rollback=False initially
+    # Internal member sees all 37 `data` tasks with can_toggle=True, can_run_now=False, can_rollback=False initially
     int_list = await system_jobs_mod.list_system_jobs("internal-colleague")
     data_jobs = [j for j in int_list["jobs"] if j["scope"] == "data"]
-    assert len(data_jobs) == 36
-    assert len(int_list["groups"]["data"]) == 36
+    assert len(data_jobs) == 37
+    assert len(int_list["groups"]["data"]) == 37
     for dj in data_jobs:
+        assert "env" not in dj
+        assert "secret_names" not in dj
         assert dj["can_toggle"] is True
         assert dj["can_run_now"] is False
         assert dj["can_rollback"] is False

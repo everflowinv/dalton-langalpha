@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import httpx
 
@@ -168,6 +168,14 @@ async def _post_bridge_data_tasks(
     return data
 
 
+# DALTON-HOOK(host-job-secrets): strip secret values before any request logging
+def strip_secrets_from_host_run_body(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of a host-run payload without any ``secrets`` field."""
+    cleaned = dict(body)
+    cleaned.pop("secrets", None)
+    return cleaned
+
+
 async def post_bridge_host_run(
     *,
     generation: int,
@@ -179,6 +187,8 @@ async def post_bridge_host_run(
     no_output_timeout: int | None = None,
     command_argv: list[str] | None = None,
     cwd: str | None = None,
+    secrets: Mapping[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> HostRunOutcome:
     """Send `POST /internal/data-tasks/host-run` and wait synchronously for the outcome."""
     body: dict[str, Any] = {
@@ -194,6 +204,10 @@ async def post_bridge_host_run(
         body["command_argv"] = list(command_argv)
     if cwd is not None:
         body["cwd"] = str(cwd)
+    if secrets:
+        body["secrets"] = {str(k): str(v) for k, v in secrets.items() if str(k).strip()}
+    if env:
+        body["env"] = {str(k): str(v) for k, v in env.items() if str(k).strip()}
     http_timeout = max(30.0, float(timeout) + HOST_RUN_HTTP_OVERHEAD_S)
     try:
         payload = await _post_bridge_data_tasks(
@@ -376,8 +390,15 @@ class DataTaskHostBridgeClient:
         no_output_timeout: int | None = None,
         command_argv: list[str] | None = None,
         cwd: str | None = None,
+        secrets: Mapping[str, str] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> HostRunOutcome:
         """Execute a host data task via `POST /internal/data-tasks/host-run` and return a structured outcome."""
+        extra_kwargs: dict[str, Any] = {}
+        if secrets:
+            extra_kwargs["secrets"] = secrets
+        if env:
+            extra_kwargs["env"] = env
         return await post_bridge_host_run(
             generation=generation,
             run_id=run_id,
@@ -388,6 +409,7 @@ class DataTaskHostBridgeClient:
             no_output_timeout=no_output_timeout,
             command_argv=command_argv,
             cwd=cwd,
+            **extra_kwargs,
         )
 
     async def kill_host_tasks(

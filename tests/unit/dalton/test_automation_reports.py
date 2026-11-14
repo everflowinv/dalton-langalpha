@@ -90,6 +90,7 @@ def test_profile_accepts_only_named_profiles() -> None:
         "ai-app-weekly",
         "richard-earnings",
         "wiki-auto-ingest",
+        "podcast-weekly",
     ):
         parsed, err = parse_report_profile(_profile(profile_id))
         assert err is None
@@ -120,6 +121,7 @@ def test_profile_accepts_only_named_profiles() -> None:
         "ai-app-weekly",
         "richard-earnings",
         "wiki-auto-ingest",
+        "podcast-weekly",
     }
 
 

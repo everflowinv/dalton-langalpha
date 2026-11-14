@@ -389,6 +389,8 @@ ALLOWED_HOOKS=(
   "thinking-leak"
   # S3 fix: default-off deployment switch for problem reporting & thumb-down forwarding.
   "problem-reports-off"
+  # Host data-task Vault secret passthrough, manifest allowlist, plain env, and log scrubbing.
+  "host-job-secrets"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -1,0 +1,35 @@
+{
+  "min_duration_sec": 300,
+  "channels": [
+    {
+      "name": "All-In Podcast",
+      "handle": "allin",
+      "scan_limit": 25,
+      "hosts": [
+        "Jason Calacanis",
+        "Chamath Palihapitiya",
+        "David Sacks",
+        "David Friedberg"
+      ]
+    },
+    {
+      "name": "a16z",
+      "handle": "a16z",
+      "scan_limit": 25,
+      "hosts": []
+    }
+  ],
+  "hotwords": [
+    "Chamath",
+    "Friedberg",
+    "Sacks",
+    "Calacanis",
+    "a16z",
+    "Andreessen Horowitz",
+    "Anthropic",
+    "OpenAI",
+    "Nvidia",
+    "xAI"
+  ],
+  "feishu_folder_token": "TIwFfn5UAlfMrpdby0bcVDb5nwg"
+}

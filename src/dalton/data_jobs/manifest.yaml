@@ -871,7 +871,7 @@ tasks:
     notify_enabled: false
     enabled: false
 
-  # OC-1 batch 5. Only T34. Podcast jobs stay on OpenClaw until a Gemini API key is configured.
+  # OC-1 batch 5 host tasks.
   - task_code: "T34"
     job_key: "richard-relative-dashboard-refresh"
     title: "richard-relative-dashboard-refresh"
@@ -893,6 +893,47 @@ tasks:
     secret_names: []
     freeze_paths:
       - "research-outputs/kweb-dashboard/index.html"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T60"
+    job_key: "podcast-weekly-pipeline"
+    title: "podcast-weekly-pipeline"
+    batch_no: 1
+    runner: "host"
+    host_mode: "run"
+    cron: "0 6 * * 0"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 10800
+    no_output_timeout_seconds: 3600
+    output_max_bytes: 100000
+    cwd: "var/dalton/openclaw-data"
+    command: "bash skills/podcast-weekly-digest/scripts/run.sh --json pipeline --since-days 7 --video-model gemini-4-argon --text-backend dalton --text-model gemini-4-hydrogen-high-oauth"
+    command_argv:
+      - "bash"
+      - "skills/podcast-weekly-digest/scripts/run.sh"
+      - "--json"
+      - "pipeline"
+      - "--since-days"
+      - "7"
+      - "--video-model"
+      - "gemini-4-argon"
+      - "--text-backend"
+      - "dalton"
+      - "--text-model"
+      - "gemini-4-hydrogen-high-oauth"
+    env:
+      DALTON_BACKEND_URL: "http://127.0.0.1:8000"
+    secret_names:
+      - "GEMINI_API_KEY"
+      - "INTERNAL_SERVICE_TOKEN"
+      - "SEED_ASR_APP_ID"
+      - "SEED_ASR_ACCESS_KEY"
+      - "VOLC_TOS_AK"
+      - "VOLC_TOS_SK"
+      - "VOLC_TOS_BUCKET"
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
