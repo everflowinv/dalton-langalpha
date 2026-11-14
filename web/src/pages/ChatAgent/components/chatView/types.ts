@@ -39,6 +39,11 @@ export interface LocationState {
    */
   draftCommands?: SlashCommand[];
   /**
+   * Put `draftMessage` after what is already typed rather than over it: an
+   * existing thread's composer may hold the user's own words.
+   */
+  draftAppend?: boolean;
+  /**
    * The first send opens its turn with no message of its own, its
    * `initialMessage` empty (`SendOptions.hiddenOpener`): the welcome flow
    * asking the agent where to start (pages/Onboarding/welcome/kickoff.ts).
@@ -55,6 +60,13 @@ export interface LocationState {
   handoff?: boolean;
   workspaceId?: string;
   workspaceName?: string;
+  /**
+   * The backend turn index to open the thread at: its opening bubble is
+   * brought under the viewport top and tinted, with older pages loaded back
+   * to it (useFocusTurn). The command palette's "In conversations" hit. A
+   * turn the thread does not have leaves the reader at the newest one.
+   */
+  focusTurn?: number;
   fromThreadId?: string;
   fromWorkspaceId?: string;
   // DALTON-HOOK(global-search): file or memo path to open in the right panel after navigation
@@ -73,6 +85,8 @@ export interface LocationState {
    * to metadata, so replay re-renders them regardless).
    */
   chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
+  /** What MarketView's chart showed at the send, for `initialMessage`'s `chart_views`. */
+  chartViews?: import('@/pages/MarketView/types/chartView').ChartView[];
   /**
    * Skill names to preload as hidden skills (chart-annotation forwarding from
    * MarketView). Merged into `additionalContext` as `{type:'skills',name}` on

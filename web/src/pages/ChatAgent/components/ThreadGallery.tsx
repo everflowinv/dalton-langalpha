@@ -14,7 +14,6 @@ import { useNavigate, useParams, useLocation } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '../../../lib/queryKeys';
-import { patchThreadRows, rollbackThreadRows } from '@/lib/threadRowActions';
 import { patchThreadTitle } from '@/lib/threadListCache';
 import { threadGalleryQuery } from '../utils/threadGalleryQuery';
 import { useWorkspace } from '../../../hooks/useWorkspace';
@@ -24,6 +23,7 @@ import RenameThreadModal from './RenameThreadModal';
 import { useArchiveThreadConfirm } from './threadArchiveAction';
 import { useThreadDeleteConfirm } from './threadDeleteAction';
 import { deleteThreadRow } from '../hooks/deleteThreadRow';
+import { setThreadArchived } from '../hooks/threadRowMutations';
 import ChatInput from '../../../components/ui/chat-input';
 import type { ChatInputHandle } from '../../../components/ui/chat-input';
 import type { ComposerSend, ContextPayload } from '../../../components/ui/chat-input.types';
@@ -31,12 +31,13 @@ import { attachmentsToContexts } from '../utils/fileUpload';
 import FilePanel, { SYSTEM_DIR_PREFIXES } from './FilePanel';
 import { clampPanelWidth as clampPanelWidthUtil } from '@/lib/panelUtils';
 import SandboxSettingsPanel from './SandboxSettingsPanel';
-import { updateThreadTitle, updateThread } from '../utils/api';
+import { updateThreadTitle } from '../utils/api';
 import { isValidUuid } from '../utils/uuid';
 import { WorkspaceProvider } from '../contexts/WorkspaceContext';
 import { useComputerFolders } from '../hooks/useComputerFolders';
 import { usePanelFiles } from './chatView/usePanelFiles';
 import { usePanelAsks, usePanelLinkOpen } from './chatView/usePanelLinks';
+import { useFileDeepLink } from './chatView/useFileDeepLink';
 import { saveChatSession } from '../hooks/utils/chatSessionRestore';
 import iconComputerLight from '../../../assets/img/icon-computer.svg';
 import iconComputerDark from '../../../assets/img/icon-computer-dark.svg';
@@ -61,6 +62,7 @@ import { AutoIngestToggle } from './dalton/AutoIngestToggle';
 // DALTON-HOOK(coverage-tree): sector/company affiliation bar under the header
 import { CoverageAffiliationBar } from './dalton/CoverageAffiliationBar';
 import { DURATION, EASE_OUT, TWEEN } from '@/lib/motion';
+import { PaletteSearchButton } from '@/components/nav/PaletteSearchButton';
 
 /** Placeholder rows while the list is read: the first screen's worth. */
 const THREAD_SKELETON_ROWS = 5;
@@ -303,8 +305,14 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     }
   }, [wsNotFound, accessDenied, navigate]);
 
+  // Measured at the moment it opens when the observer has not reported yet:
+  // a ?file= link opens the panel from the first commit's effects, before it does.
   const clampPanelWidth = useCallback(
-    (desired: number) => clampPanelWidthUtil(desired, containerWidthRef.current),
+    (desired: number) =>
+      clampPanelWidthUtil(
+        desired,
+        containerWidthRef.current || containerRef.current?.offsetWidth || window.innerWidth,
+      ),
     [],
   );
 
@@ -357,6 +365,17 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     });
   }, []);
 
+  // The panel opens at its usual width, or stays as wide as it was left.
+  const openFilePanel = useCallback(() => {
+    if (!showFilePanel) setFilePanelWidth(clampPanelWidth(850));
+    setShowFilePanel(true);
+  }, [showFilePanel, clampPanelWidth]);
+  // The ?file= link (a file picked in the command palette) opens the panel at it.
+  const openLinkedFile = useCallback((path: string) => {
+    handleOpenFile(path);
+    openFilePanel();
+  }, [handleOpenFile, openFilePanel]);
+  useFileDeepLink(true, workspaceId, openLinkedFile);
   // Track container width via ResizeObserver
   useEffect(() => {
     const el = containerRef.current;
@@ -434,21 +453,13 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
   // Archive (from the active view) or unarchive (from the archived view).
   // Either way the row leaves the CURRENT list. Optimistic so the card's exit
-  // animation IS the feedback; the prefix invalidation then refreshes both
-  // views plus the sidebar's page caches, and a failure puts the row back.
+  // animation IS the feedback; every other list holding the thread (the
+  // sidebar's, the recent threads, the palette's search answers) follows, the
+  // lists are read again once saved, and a failure puts the row back.
   const handleArchiveToggle = useCallback(async (thread: Record<string, unknown>, archived: boolean) => {
     const threadId = thread.thread_id as string | undefined;
     if (!threadId) return;
-    const snapshot = patchThreadRows(queryClient, queryKeys.threads.byWorkspace(workspaceId), (rows) =>
-      rows.some((th) => th.thread_id === threadId) ? rows.filter((th) => th.thread_id !== threadId) : rows,
-    );
-    try {
-      await updateThread(threadId, { archived });
-      queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(workspaceId) });
-    } catch (err) {
-      rollbackThreadRows(queryClient, snapshot);
-      console.error('Error updating thread archive state:', err);
-    }
+    await setThreadArchived(queryClient, workspaceId, threadId, archived);
   }, [workspaceId, queryClient]);
 
   // Stable per-direction wrappers — inline `(th) => handleArchiveToggle(...)`
@@ -605,10 +616,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       // The card is the workspace's own files; a sibling shown before the
       // panel closed was reached through a link.
       setPanelOverride(null);
-      setFilePanelWidth(clampPanelWidth(850));
-      setShowFilePanel(true);
+      openFilePanel();
     }
-  }, [showFilePanel, clampPanelWidth, setPanelOverride]);
+  }, [showFilePanel, openFilePanel, setPanelOverride]);
 
   /**
    * Handle drag panel width
@@ -690,7 +700,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
             in the desktop shell: it is the top bar the content column already
             has, so it costs no layout, and the back button wins its own clicks
             back through the `no-drag` list in chrome.css. */}
-        <div className="shrink-0 px-6 py-4" data-chrome="drag" style={{ paddingTop: 'calc(var(--page-top) - 4px)' }}>
+        <div className="shrink-0 px-6 py-4 flex items-center justify-between" data-chrome="drag" style={{ paddingTop: 'calc(var(--page-top) - 4px)' }}>
           <button
             onClick={onBack}
             className="p-2 rounded-md transition-colors"
@@ -701,6 +711,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
           >
             <ArrowLeft className="h-5 w-5" />
           </button>
+          {isMobile && <PaletteSearchButton />}
         </div>
 
         {/* Main Content - Centered with max width */}
@@ -847,8 +858,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                             // sibling's on show gives way to them.
                             setPanelOverride(null);
                             askPanel({ kind: 'file', path: filePath });
-                            setFilePanelWidth(clampPanelWidth(850));
-                            setShowFilePanel(true);
+                            openFilePanel();
                           }}
                         >
                           <FileText className="h-3.5 w-3.5 shrink-0" />

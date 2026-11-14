@@ -963,6 +963,7 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       workspaceId: 'ws-1',
       threadId: 'thread-1',
       t: (key: string) => key,
+      queryClient: new QueryClient(),
       updateSubagentCard: null,
       onWorkspaceCreated: null,
       onFileArtifact: null,

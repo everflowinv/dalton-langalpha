@@ -36,7 +36,7 @@ import { computeSteeringBoundary } from '../session/stream/steeringRollback';
 import { isSteeringUserMessage, opensTurn } from '../components/messageList/messagePredicates';
 import { hasTurn, hiddenOpenerTurns, newestTurn, projectTurns, turnOf } from '../components/messageList/turnProjection';
 import { isSubagentEvent } from '../session/subagents/liveEventHandlers';
-import { bumpThreadNavOrder } from './useNavigationData';
+import { bumpThreadNavOrder } from './navOrderFreeze';
 import { invalidateNewWorkspace } from './workspaceRowActions';
 import { ensureThreadId } from '../session/threadCreation';
 export { removeStoredThreadId } from './utils/threadStorage';
@@ -59,11 +59,6 @@ import { useMarketWatch } from './useMarketWatch';
 import { invalidateThreadWakeups } from './useWakeups';
 import { invalidateThreadCommands } from './useCommands';
 import { refreshComputersAfterTurn } from './useComputers';
-// Chart-annotation live bridge: writes agent-drawn annotations into the
-// shared MarketView store so the desktop MarketView chat panel (which uses
-// this engine for both Chief of Staff and PTC threads) renders them live.
-// Harmless on the standalone /chat page: the store simply has no chart
-// consumer there.
 
 // --- Module scope extracted to session/types + utils (W1) ---
 import type {
@@ -813,6 +808,7 @@ export function useChatMessages(
     setIsReconnecting,
     onFileArtifact,
     onPreviewUrl,
+    queryClient,
     // setters (stable)
     setMessages,
     queueMessages: liveMessages.queue,
@@ -1189,7 +1185,7 @@ export function useChatMessages(
     isTaskLive: (agentId) => muxOpenTaskIds().has(agentId.replace(/^task:/, '')),
     liveOutcome: (agentId) => terminalTaskOutcomesRef.current.get(agentId.replace(/^task:/, '')),
   });
-  const loadOlderHistory = useStableHandler((place?: HoldPlace) => olderHistory().load(place));
+  const loadOlderHistory = useStableHandler((place?: HoldPlace, reachTo?: number) => olderHistory().load(place, reachTo));
   const backfillOlderHistory = useStableHandler((place?: HoldPlace) =>
     olderHistory().backfill(place, getIsMobileSnapshot()));
 
@@ -1259,7 +1255,7 @@ export function useChatMessages(
     noteLiveRun({ latestRunIdRef, latestRunEpochRef }, runId);
     const transcript = liveMessages.get();
     const at = transcript.findIndex((m) => m.id === assistantMessageId);
-    void streamFromCheckpoint(retryRequest(runId, request.additionalContext, { keepFullContext: request.keepFullContext }), at === -1 ? transcript.length : at, transcript, modelOptions, spent > 0 ? { rerun: { spent } } : {});
+    void streamFromCheckpoint(retryRequest(runId, request.additionalContext, { keepFullContext: request.keepFullContext, chartViews: request.chartViews }), at === -1 ? transcript.length : at, transcript, modelOptions, spent > 0 ? { rerun: { spent } } : {});
     return true;
   };
 
@@ -2408,7 +2404,7 @@ export function useChatMessages(
       acceptedFired = true;
       onAccepted?.();
     };
-    const { widgetSnapshots, chartSelections, artifactComments } = modelOptions;
+    const { widgetSnapshots, chartSelections, artifactComments, chartViews } = modelOptions;
     const commentSend = commentSendOf(artifactComments);
     // The refused-steer queue the steer belongs to, for a refusal to rejoin
     // it only if no thread switch has ended it since.
@@ -2491,6 +2487,7 @@ export function useChatMessages(
         requestKey,
         steerOnly: true,
         artifactComments: commentSend,
+        chartViews,
       });
       const frame = answered.refusal;
       if (frame) {
@@ -2823,7 +2820,7 @@ export function useChatMessages(
   };
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
     // What the request carries, and a resend of it again.
     const commentSend = commentSendOf(artifactComments);
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0) || !!commentSend;
@@ -2906,7 +2903,7 @@ export function useChatMessages(
         message,
         additionalContext,
         attachmentMeta,
-        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext },
+        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext, chartViews },
         messageId: queuedMessage.id as string,
         requestKey,
         onAccepted,
@@ -2937,13 +2934,13 @@ export function useChatMessages(
         : null;
       // DALTON-HOOK(composer-drafts): as above — the resolver rides the entry
       // only when a composer is behind it.
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken }, resend.shown, outcome ? resolveQueued : undefined);
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, onAccepted, onHandedOff, onNotTaken }, resend.shown, outcome ? resolveQueued : undefined);
       return outcome ?? true;
     }
 
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
+      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
     }
 
     // Store model options so HITL resume can forward them
@@ -3085,7 +3082,7 @@ export function useChatMessages(
       userId: userMessage?.id ?? null,
       assistantId: assistantMessageId,
       turnIndex,
-      request: { ...sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey },
+      request: { ...sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), requestKey },
       watermarkBefore,
       // DALTON-HOOK(composer-drafts): keeps the send's acceptance with the Retry a plain failure leaves.
       onAccepted: notifyAccepted,
@@ -3148,6 +3145,7 @@ export function useChatMessages(
         requestKey,
         threadSettings: { subagentsAllowed },
         artifactComments: commentSend,
+        chartViews,
       });
 
       // The user hit stop: stopWorkflow already finalized the message and ran
@@ -3188,7 +3186,7 @@ export function useChatMessages(
       // logical request. A chain that gives up or a stop that cancels the
       // backoff settles the draft back whole (onNotTaken), and the failed
       // reply's Retry, its held acceptance included, can still settle it sent.
-      if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode, onAccepted: notifyAccepted, onNotTaken }, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey, null, admission.unstarted())) {
+      if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode, onAccepted: notifyAccepted, onNotTaken }, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), requestKey, null, admission.unstarted())) {
         wasDisconnected = true;
         ended = 'handedOff';
         onHandedOff?.();
@@ -3256,7 +3254,7 @@ export function useChatMessages(
           // accepted (its response was lost) — adopt that run instead of
           // erroring; the reconnect owns finalization from here.
           if (
-            retryFailedDuplicate(err, assistantMessageId, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), { model, reasoningEffort, fastMode }, requestKey)
+            retryFailedDuplicate(err, assistantMessageId, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), { model, reasoningEffort, fastMode }, requestKey)
             || adoptDuplicateRun(err, assistantMessageId, requestKey)
           ) {
             wasDisconnected = true;
@@ -3936,6 +3934,7 @@ export function useChatMessages(
             retryOf.runId ?? latestRunIdRef.current,
             request.additionalContext,
             request.keepFullContext,
+            request.chartViews,
           )
         : await sendChatMessageStream(message || '', workspaceId, threadId, {
             onEvent: processEvent,
@@ -3955,6 +3954,7 @@ export function useChatMessages(
             keepFullContext: request.keepFullContext,
             threadSettings: { subagentsAllowed: request.subagentsAllowed },
             artifactComments: request.artifactComments,
+            chartViews: request.chartViews,
           });
 
       // User hit stop: stopWorkflow already finalized + tore down. Exception: a

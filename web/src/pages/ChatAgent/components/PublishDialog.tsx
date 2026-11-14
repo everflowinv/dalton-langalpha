@@ -24,6 +24,7 @@ import {
   useFileLeftOutPending,
   useArtifactVersions,
   useOwnedArtifact,
+  sharedSeq,
 } from '@/hooks/useArtifact';
 import { usePageScout } from './viewers/html/usePageScout';
 import type { ArtifactStatus, ArtifactVersion, ShareFileEntry } from '@/types/api';
@@ -329,6 +330,8 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const owned = useOwnedArtifact(workspaceId, path, { root });
   const artifact = owned.record ?? null;
   const latestSeq = artifact?.latest_seq ?? 0;
+  // What the dialog says of visitors is said of their version, not the newest.
+  const visitorsAt = sharedSeq(artifact);
   // DALTON-HOOK(external-share-guard): stop-only mode reviews nothing, so it
   // neither runs the page scout nor reads the status.
   const scout = usePageScout(workspaceId, unshareOnly ? null : (artifact?.path ?? null));
@@ -444,9 +447,9 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   let stateHint: string;
   if (!shared) stateHint = latestSeq > 0 ? t('publish.privateWithVersions') : t('publish.privateHint');
   else if (legacyRefused) stateHint = t('publish.legacyRefused');
-  else if (latestSeq === 0 || status?.changed == null) stateHint = t('publish.sharedHint');
-  else if (upToDate) stateHint = t('publish.upToDate', { seq: latestSeq });
-  else stateHint = t('publish.changedSince', { seq: latestSeq });
+  else if (visitorsAt === 0 || status?.changed == null) stateHint = t('publish.sharedHint');
+  else if (upToDate) stateHint = t('publish.upToDate', { seq: visitorsAt });
+  else stateHint = t('publish.changedSince', { seq: visitorsAt });
 
   const listHeading = !shared
     ? t('publish.filesPublish', { count: files.length })
@@ -526,7 +529,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
                   {!shared
                     ? t('publish.private')
-                    : latestSeq > 0 ? t('publish.publishedAt', { seq: latestSeq }) : t('publish.published')}
+                    : visitorsAt > 0 ? t('publish.publishedAt', { seq: visitorsAt }) : t('publish.published')}
                 </span>
                 <span className="text-xs" style={{ color: legacyRefused ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}>{stateHint}</span>
               </div>

@@ -184,15 +184,10 @@ redis:
       "4hour": 16200
       "1day": 86400
 
-  # Cache Invalidation
-  cache_invalidate_on_write: true  # Invalidate cache on writes
-
   # Stale-While-Revalidate (SWR) Configuration
   # SWR returns stale data immediately while refreshing in background
   swr:
-    enabled: true  # Enable SWR for cache reads
     soft_ttl_ratio: 0.6  # Used by OHLCV cache envelope _needs_refresh()
-    warm_after_invalidation: true  # Pre-populate cache after invalidation
 
 
 # =============================================================================
@@ -261,6 +256,16 @@ order_reconcile:
   open_after_seconds: 60          # How often an unsettled order is re-read
   batch_limit: 50                 # Attempts examined per pass
   match_window_seconds: 900       # How long after the attempt a listed order may be placed
+
+# Conversation search: each turn is indexed as it settles; this sweep finds the
+# recent turns that missed it, and a process's first pass backfills the ones
+# from before search existed. One worker sweeps at a time. Off, turns are
+# still indexed as they settle.
+thread_search:
+  enabled: true
+  interval_seconds: 120   # How often a worker looks for turns left unindexed
+  batch_threads: 10       # Threads per batch; the backfill walks newest first
+  pause_seconds: 0.5      # Least rest between backfill slices (each rests as long as it worked)
 
 # RunWorkflow programmatic subagent orchestration
 workflow:

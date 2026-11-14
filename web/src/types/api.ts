@@ -2,6 +2,8 @@
 
 import type { CommandFailureReason, CommandTool } from './commands';
 import type { ArtifactCommentSendFields } from './artifacts';
+import type { ChartView } from '@/pages/MarketView/types/chartView';
+import type { PublishedLayer } from '@/pages/MarketView/types/chartLayer';
 
 // --- User ---
 
@@ -695,6 +697,9 @@ export type ReportSource =
       /** The call it started from, whose tool card the report opens; null
        *  for a command whose call had no id. */
       tool_call_id?: string | null;
+      /** The chart layers the command published after it was handed off,
+       *  which an inline call's result lists as its own. */
+      chart_layers?: PublishedLayer[] | null;
     };
 
 export interface ThreadMetadata {
@@ -828,6 +833,11 @@ export interface AppShareLink extends ShareLinkBase {
   path: string | null;
   port: number;
   artifact_id?: null;
+  /**
+   * 16 hex of the sha256 of the command that starts the app, null when none is
+   * stored; absent from an older server. The app's grants are kept under it.
+   */
+  command_key?: string | null;
 }
 
 /** One item's stable `/a/<code>` link. Private unless `shared`. */
@@ -1016,6 +1026,8 @@ export interface ChatMessageBody extends ArtifactCommentSendFields {
   locale: string;
   timezone: string;
   additional_context?: unknown;
+  /** What the charts beside the composer show, for the agent's snapshots. */
+  chart_views?: ChartView[];
   checkpoint_id?: string;
   fork_from_turn?: number;
   expected_latest_run_id?: string;

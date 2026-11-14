@@ -2108,7 +2108,10 @@
     "unarchive": "取消归档",
     "archived": "已归档",
     "archivedTasks": "已归档任务",
-    "noArchivedThreads": "暂无已归档的对话"
+    "noArchivedThreads": "暂无已归档的对话",
+    "failedPinThread": "置顶对话失败，请重试。",
+    "failedUnpinThread": "取消置顶对话失败，请重试。",
+    "failedArchiveThread": "归档对话失败，请重试。"
   },
   "share": {
     "shareConversation": "分享对话",
@@ -2749,7 +2752,7 @@
       "sector-overviewDesc": "行业全景报告：市场规模、竞争格局、公司概览、估值背景",
       "competitive-analysisDesc": "竞争格局分析：市场定位、评分卡、护城河评估、份额趋势",
       "initiating-coverageDesc": "全面研究启动：公司研究、财务模型、估值、图表、30-50 页报告",
-      "chart-annotationDesc": "标注价格图表：价格线、趋势线、区间和事件标记，实时显示在 MarketView，或作为聊天中的图表卡片"
+      "chart-annotationDesc": "将分析作为图层绘制在价格图表上：价位、线条、区间、指标和预测，实时显示在 MarketView，或作为聊天中的图表卡片"
     },
     "compactedNotification": "上下文已压缩 · {{from}} 条消息 → 摘要",
     "taskErrorNotification": "子任务运行失败",
@@ -2871,24 +2874,19 @@
       "toolCallCompleted": "已完成",
       "toolCallFailed": "已失败"
     },
-    "chartAnnotationCard": {
-      "name": "{{symbol}} {{interval}} 图表",
-      "labelSeparator": "、",
-      "metaCount_one": "{{count}} 个标注",
-      "metaCount_other": "{{count}} 个标注",
-      "cardAria_one": "{{name}}，{{count}} 个标注。打开标注图表。",
-      "cardAria_other": "{{name}}，{{count}} 个标注。打开标注图表。",
-      "cardAriaPricesOnly_one": "{{name}}，{{count}} 个标注。打开图表。",
-      "cardAriaPricesOnly_other": "{{name}}，{{count}} 个标注。打开图表。",
-      "chipJumpTitle": "将图表切换到 {{symbol}} · {{timeframe}} 以显示这些标注",
-      "chipShowTitle": "在图表上显示这些标注",
+    "chartLayerCard": {
+      "name": "{{symbol}} {{interval}} 图层",
+      "showMore": "展开",
+      "showLess": "收起",
+      "open": "打开图表",
+      "openAria": "{{name}}。打开带有这些图层的图表。",
+      "openAriaPricesOnly": "{{name}}。打开图表。",
+      "chipJumpTitle": "将图表切换到 {{symbol}} · {{timeframe}} 以显示这些图层",
       "chipShownTitle": "已显示在图表上",
-      "chipViewCount_one": "在图表上查看 {{count}} 个标注",
-      "chipViewCount_other": "在图表上查看 {{count}} 个标注",
-      "chipShowCount_one": "在图表上显示 {{count}} 个标注",
-      "chipShowCount_other": "在图表上显示 {{count}} 个标注",
-      "chipShownCount_one": "图表上有 {{count}} 个标注",
-      "chipShownCount_other": "图表上有 {{count}} 个标注"
+      "chipViewCount_one": "在图表上查看 {{count}} 个图层",
+      "chipViewCount_other": "在图表上查看 {{count}} 个图层",
+      "chipShownCount_one": "图表上有 {{count}} 个图层",
+      "chipShownCount_other": "图表上有 {{count}} 个图层"
     },
     "duration": {
       "subSecond": "不到 1 秒",
@@ -3242,6 +3240,7 @@
     },
     "pageTab": "网页",
     "pageLatest": "最新",
+    "pageShared": "访问者看到的版本",
     "pageVersion": "v{{seq}}",
     "pageVersionName": "版本 {{seq}}",
     "pageUpdated": "已更新到 v{{seq}}",
@@ -4012,6 +4011,7 @@
       "manageAutomation": "管理自动化",
       "annotateChart": "标注图表",
       "manageAnnotations": "管理标注",
+      "manageChartLayers": "管理图表图层",
       "skill": "技能",
       "memory": "记忆",
       "workspaceMemory": "工作区记忆",
@@ -4116,8 +4116,7 @@
       "creatingAutomation": "创建自动化...",
       "actionAutomation": "{{action}} 自动化...",
       "managingAutomation": "管理自动化...",
-      "annotatingChart": "正在标注图表...",
-      "updatingAnnotations": "正在更新标注...",
+      "updatingChartLayers": "正在更新图表图层...",
       "sendingTo": "发送到 {{app}}...",
       "sendingMessage": "发送消息...",
       "listingMessageTargets": "获取发送目标...",
@@ -4679,10 +4678,7 @@
       "askStockPlaceholder": "询问这只股票…"
     },
     "chart": {
-      "clearAnnotations": "清除",
-      "clearAnnotationsTitle": "从图表中清除标注（已保留在对话中，点击该结果可恢复）",
       "modeLabel": "模式",
-      "newsEventAria": "新闻事件：{{title}}",
       "light": "简版",
       "advanced": "高级",
       "log": "对数",
@@ -4743,6 +4739,64 @@
       "chipRegion": "区域 · {{symbol}} {{timeframe}}",
       "chipPriceLevel": "价格 {{price}} · {{symbol}} {{timeframe}}",
       "removeChip": "移除选择"
+    },
+    "layers": {
+      "legendLabel": "Agent 图层",
+      "count_one": "{{count}} 个图层",
+      "count_other": "{{count}} 个图层",
+      "asOf": "截至 {{date}}",
+      "hidden": "已隐藏",
+      "hide": "隐藏图层",
+      "show": "显示图层",
+      "remove": "移除图层",
+      "ask": "向 Agent 询问这个图层",
+      "askDraft": "关于 {{label}}：",
+      "askUnavailable": "请先打开聊天，再向 Agent 询问这一项。",
+      "removeFailed": "无法移除该图层，它已恢复到图表上。"
+    },
+    "layerExplain": {
+      "ask": "就此提问",
+      "asked": "已加入聊天",
+      "pinHint": "点击固定并提问",
+      "close": "关闭",
+      "types": {
+        "segment": "趋势线",
+        "vline": "时间标记",
+        "channel": "平行通道",
+        "pitchfork": "安德鲁音叉",
+        "box": "区域",
+        "label": "标签",
+        "arrow": "箭头",
+        "path": "形态",
+        "fib": "斐波那契回撤",
+        "cone": "预测锥",
+        "forecast": "预测",
+        "analog": "历史类比",
+        "position": "仓位",
+        "measure": "测量",
+        "profile": "成交量分布",
+        "series": "序列",
+        "level": "价位",
+        "marker": "标记",
+        "regime": "市场状态",
+        "alert": "提醒",
+        "element": "元素"
+      }
+    },
+    "layerCanvas": {
+      "hit": "命中",
+      "missed": "未达",
+      "replay": "重演",
+      "replayed": "重演自 {{dates}}",
+      "long": "做多",
+      "short": "做空",
+      "target": "目标",
+      "targetN": "目标{{n}}",
+      "stop": "止损",
+      "riskReward": "盈亏比",
+      "bars_other": "{{count}} 根 K 线",
+      "days": "{{count}}天",
+      "poc": "POC"
     },
     "overview": {
       "noData": "暂无数据",
@@ -7739,8 +7793,8 @@
   "palette": {
     "copyFailed": "无法复制到剪贴板",
     "title": "搜索与命令",
-    "label": "搜索对话、股票代码、技能、设置，或直接提问",
-    "placeholder": "搜索对话、股票代码、技能、设置，或直接提问",
+    "label": "搜索对话、文件、股票代码、设置，或直接提问",
+    "placeholder": "搜索对话、文件、股票代码、设置，或直接提问",
     "untitledThread": "未命名对话",
     "analystIn": "{{workspace}} 的分析师",
     "askTitle": "提问“{{query}}”",
@@ -7754,7 +7808,11 @@
       "workspaces": "工作区",
       "skills": "技能",
       "places": "页面与设置",
-      "ask": "提问"
+      "ask": "提问",
+      "turns": "对话内容",
+      "ticker": "股票",
+      "threadsOn": "与 {{symbol}} 相关的对话",
+      "files": "文件"
     },
     "kind": {
       "workspace": "工作区",
@@ -7776,7 +7834,12 @@
       "back": "返回",
       "move": "移动",
       "close": "关闭",
-      "actions": "操作"
+      "actions": "操作",
+      "openAtTurn": "定位到这一轮",
+      "openThread": "打开对话",
+      "threadsMentioning": "提及 {{symbol}} 的对话",
+      "searchIn": "在其中搜索",
+      "copyPath": "复制路径"
     },
     "action": {
       "newThread": "新建对话",
@@ -7791,7 +7854,80 @@
       "newAutomation": "定时 提醒 周期 简报 automation",
       "theme": "外观 深色 浅色 模式 颜色 theme dark light"
     },
-    "search": "命令与跳转"
+    "search": "命令与跳转",
+    "inThisThread": "{{agent}}，在此对话中",
+    "you": "你",
+    "narrowPlaceholder": "在与 {{symbol}} 相关的对话中筛选",
+    "busy": "搜索过于频繁，请稍后再试。",
+    "searchFailed": "无法搜索对话。",
+    "kindFailed": {
+      "threads": "暂时无法搜索对话标题。",
+      "turns": "暂时无法搜索对话内容。",
+      "files": "暂时无法搜索文件。"
+    },
+    "noMatches": "无匹配结果",
+    "showAll": {
+      "threads": "显示全部对话",
+      "turns": "显示全部对话内容匹配",
+      "files": "显示全部文件"
+    },
+    "preview": {
+      "missing": "暂无可预览的内容。",
+      "failed": "无法加载预览。"
+    },
+    "scope": {
+      "label": "在 {{scope}} 中搜索",
+      "leave": "退出此范围",
+      "workspacePlaceholder": "搜索这里的对话和文件，或向 Agent 提问",
+      "threadPlaceholder": "在此对话中搜索，或继续写",
+      "tickersHint": "输入股票代码或公司名称。",
+      "threadHint": "在此对话中搜索",
+      "noThreads": "这里还没有对话。",
+      "kinds": {
+        "tickers": "股票代码",
+        "files": "文件",
+        "threads": "对话",
+        "turns": "对话内容",
+        "workspaces": "工作区",
+        "actions": "操作"
+      },
+      "placeholders": {
+        "tickers": "按代码或公司名搜索股票",
+        "files": "按文件名或路径搜索文件",
+        "threads": "搜索对话标题",
+        "turns": "搜索对话中说过的内容",
+        "workspaces": "搜索工作区",
+        "actions": "搜索操作、页面与设置"
+      },
+      "kindIn": "在 {{place}} 中搜索{{kind}}",
+      "filesHint": "输入文件名或路径的一部分。",
+      "turnsHint": "输入你或 Agent 说过的话。"
+    },
+    "keys": {
+      "enter": "回车：{{action}}。",
+      "actions": "右方向键：更多操作。",
+      "askMac": "Command 加回车：向 Agent 提问。",
+      "askOther": "Ctrl 加回车：向 Agent 提问。",
+      "back": "左方向键或 Esc：返回。",
+      "scope": "Tab：在其中搜索。",
+      "leave": "退格键或 Esc：退出在 {{scope}} 中的搜索。",
+      "editBack": "Esc，或在输入框为空时按退格键：返回。"
+    },
+    "prefixes": {
+      "label": "先输入以下前缀，只搜索一类内容：",
+      "tickers": "股票代码",
+      "files": "文件",
+      "threads": "对话",
+      "turns": "对话内容",
+      "workspaces": "工作区",
+      "actions": "操作"
+    },
+    "pinned": "已置顶",
+    "unpinned": "已取消置顶",
+    "editLabel": "{{action}}：{{name}}",
+    "rename": {
+      "placeholder": "新标题"
+    }
   },
   "report": {
     "menuItem": "报告问题",
@@ -7866,6 +8002,147 @@
       "withdrawn": "报告已撤回。",
       "gone": "此报告已无法更改。",
       "noteLimit": "此报告的补充说明已达上限。如需补充更多，请使用「报告问题」。"
+    }
+  },
+  "customDashboard": {
+    "untitled": "你的仪表盘",
+    "builtIn": "内置仪表盘",
+    "switchLabel": "仪表盘：{{name}}",
+    "emptyHint": "让 Agent 为你做一个仪表盘页面，然后在页面上选择“设为仪表盘”。电脑关机时页面也能打开。随时可以切换回来。",
+    "build": "让 Agent 做一个",
+    "remove": "移除 {{name}}",
+    "removed": "已移除 {{name}}",
+    "undo": "撤销",
+    "full": "你已有 {{max}} 个仪表盘。请先移除一个再添加。",
+    "manage": "管理",
+    "notLoaded": "仪表盘列表还在加载，请稍后再试。",
+    "saveFailed": "无法保存你的仪表盘，请重试。",
+    "edit": "让 Agent 修改",
+    "reload": "重新加载",
+    "reloadFailed": "无法刷新 {{name}}",
+    "starting": "正在启动 {{name}}…",
+    "startingPage": "正在打开 {{name}}…",
+    "showBuiltIn": "先显示内置仪表盘",
+    "setAsDashboard": "设为仪表盘",
+    "isDashboard": "当前仪表盘",
+    "pinned": "{{name}} 已设为你的仪表盘",
+    "view": "查看",
+    "agentFailed": "无法打开与 Agent 的对话，请重试。",
+    "buildDraft": "帮我做一个 LangAlpha 仪表盘页面。我想看到",
+    "editDraft": "修改我的仪表盘 {{name}}：",
+    "editDraftPort": "修改我的仪表盘 {{name}}（端口 {{port}} 上的应用）：",
+    "away": {
+      "waiting": "{{name}} 启动期间先显示内置仪表盘",
+      "waitingPage": "{{name}} 打开期间先显示内置仪表盘",
+      "ready": "{{name}} 已就绪",
+      "failed": "{{name}} 没有打开，当前显示内置仪表盘",
+      "failedDetail": "它的电脑可能在休眠或没有响应。",
+      "failedDetailPage": "LangAlpha 无法读取它保存的副本。",
+      "gone": "{{name}} 已不可用",
+      "goneDetail": "它的应用或工作区已被删除。",
+      "goneDetailPage": "它的页面或工作区已被删除。",
+      "open": "打开 {{name}}",
+      "retry": "重试",
+      "remove": "移除",
+      "noVersion": "还没有保存这个页面的副本。保存时会从它的电脑读取，电脑关机时会先启动。",
+      "keepNow": "立即保存副本"
+    },
+    "editDraftPath": "修改我的仪表盘 {{name}}（{{path}}）：",
+    "keepFailed": "无法将此页面设为仪表盘",
+    "access": {
+      "label": "数据访问",
+      "title": "此仪表盘可以读取的内容",
+      "hint": "行情数据始终可用。以下是你的个人数据，只有在你允许时才会读取。",
+      "scope": {
+        "portfolio": "持仓",
+        "threads": "最近对话"
+      }
+    }
+  },
+  "appBridge": {
+    "accessLabel": "应用访问",
+    "asksApp": "此应用请求读取你的{{scopes}}。",
+    "asksPage": "此页面请求读取你的{{scopes}}。",
+    "and": "和",
+    "allow": "允许",
+    "notNow": "暂不",
+    "saveFailed": "无法保存这项设置，请重试。",
+    "scope": {
+      "quotes": "行情",
+      "watchlists": "自选列表",
+      "news": "新闻",
+      "brief": "每日简报",
+      "earnings": "财报日历",
+      "portfolio": "持仓",
+      "threads": "最近对话"
+    }
+  },
+  "kit": {
+    "notConnected": "未连接到 LangAlpha",
+    "noAnswer": "LangAlpha 未响应 {{method}}",
+    "offline": "请在 LangAlpha 中打开此页面以查看实时数据。",
+    "scopePending": "请在 LangAlpha 中允许访问{{name}}，以显示此内容。",
+    "scopeMissing": "此仪表盘无权访问{{name}}。",
+    "scope": {
+      "quotes": "行情",
+      "watchlists": "你的自选列表",
+      "news": "新闻",
+      "brief": "每日简报",
+      "earnings": "财报日历",
+      "portfolio": "你的持仓",
+      "threads": "你的对话"
+    },
+    "rate": "请求过于频繁，稍后自动重试。",
+    "unavailable": "暂时不可用。",
+    "loadFailed": "加载失败。",
+    "loadFailedBecause": "加载失败：{{message}}",
+    "stale": "刷新失败 · 显示的是{{ago}}的数据 · 正在重试",
+    "source": "来源：{{source}}",
+    "asOf": "截至 {{time}}",
+    "setSymbol": "请设置股票代码。",
+    "noQuote": "没有 {{symbol}} 的报价。",
+    "noData": "暂无数据。",
+    "noChartData": "没有 {{symbol}} 的图表数据。",
+    "noWatchlists": "还没有自选列表。",
+    "emptyWatchlist": "此自选列表为空。",
+    "noNews": "暂无新闻。",
+    "noBrief": "今天还没有简报。",
+    "earningsNeedWatchlist": "将股票加入自选列表后，即可在此查看其财报。",
+    "noEarnings": "未来 {{days}} 天内没有财报。",
+    "noEarningsOwn": "你的自选列表中未来 {{days}} 天内没有财报。",
+    "earningsTime": {
+      "bmo": "盘前",
+      "amc": "盘后",
+      "dmh": "盘中"
+    },
+    "eps": "每股收益 {{value}}",
+    "column": {
+      "symbol": "代码",
+      "name": "名称",
+      "quantity": "数量",
+      "price": "价格",
+      "value": "市值",
+      "pl": "盈亏",
+      "cost": "成本"
+    },
+    "total": "合计",
+    "partialTotal": "{{all}} 项中的 {{part}} 项",
+    "noHoldings": "还没有持仓。",
+    "noThreads": "还没有对话。",
+    "untitled": "未命名",
+    "noDataYet": "暂无数据",
+    "updated": "{{ago}}更新",
+    "updatedMissed": "{{ago}}更新 · 错过了 {{run}} 的更新",
+    "updatedAt": "更新于 {{time}}",
+    "ago": {
+      "justNow": "刚刚",
+      "soon": "马上",
+      "minutes": "{{n}} 分钟前",
+      "hours": "{{n}} 小时前",
+      "days": "{{n}} 天前",
+      "inMinutes": "{{n}} 分钟后",
+      "inHours": "{{n}} 小时后",
+      "inDays": "{{n}} 天后"
     }
   }
 }

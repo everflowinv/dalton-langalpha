@@ -35,6 +35,7 @@ from src.server.database.home_workspace import is_unbound
 from src.server.database.computer import get_computer
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.workspace_manager import WorkspaceManager
+from src.server.services.artifacts.snapshot import keep_updated_after_change
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.persistence.download_link import (
     live_download_link,
@@ -74,6 +75,7 @@ from src.server.services.served_paths import (
     is_hidden_path,
     is_text_content_type,
     is_utf8,
+    panel_lists_stored_file,
 )
 from src.server.services.workspace_files import (
     HOME_NOT_ON_COMPUTER_REASON,
@@ -225,10 +227,10 @@ async def list_workspace_files(
         files = [
             f["path"]
             for f in file_tree
-            if not is_always_hidden_path(f["path"])
             # DALTON-HOOK(workspace-sharing-settings): non-owners never take system paths
-            and (allow_system or not _is_system_path(f["path"]))
-            and (allow_hidden or not is_hidden_path(f["path"]))
+            if panel_lists_stored_file(
+                f["path"], include_system=allow_system, include_hidden=allow_hidden
+            )
             # A row at a virtual path predates the backup skipping its folder;
             # a read answers from the DB, so only the splice may list one.
             and not _virtual_file(f["path"])
@@ -736,6 +738,7 @@ async def write_workspace_file(
             pass
 
     record_fs_bytes("write", len(content_bytes))
+    keep_updated_after_change(workspace_id=workspace_id, user_id=x_user_id)
 
     return {
         "workspace_id": workspace_id,
@@ -1523,6 +1526,7 @@ async def upload_workspace_file(
 
     client_path = to_client_path(sandbox, normalized, work_dir)
     record_fs_bytes("upload", len(content))
+    keep_updated_after_change(workspace_id=workspace_id, user_id=x_user_id)
     return {
         "workspace_id": workspace_id,
         "path": client_path,
@@ -1912,4 +1916,6 @@ async def delete_workspace_files(
                             )
                         deleted = []
 
+    if deleted:
+        keep_updated_after_change(workspace_id=workspace_id, user_id=x_user_id)
     return {"deleted": deleted, "errors": errors}

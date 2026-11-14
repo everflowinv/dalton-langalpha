@@ -2074,7 +2074,10 @@
     "unarchive": "Unarchive",
     "archived": "Archived",
     "archivedTasks": "Archived tasks",
-    "noArchivedThreads": "No archived threads"
+    "noArchivedThreads": "No archived threads",
+    "failedPinThread": "Failed to pin thread. Please try again.",
+    "failedUnpinThread": "Failed to unpin thread. Please try again.",
+    "failedArchiveThread": "Failed to archive thread. Please try again."
   },
   "share": {
     "shareConversation": "Share conversation",
@@ -2724,7 +2727,7 @@
       "sector-overviewDesc": "Industry landscape report: market size, competitive dynamics, company profiles, valuation context",
       "competitive-analysisDesc": "Competitive landscape analysis: positioning, scorecards, moat assessment, market share trends",
       "initiating-coverageDesc": "Full equity research initiation: company research, financial model, valuation, charts, 30-50 page report",
-      "chart-annotationDesc": "Annotate a price chart: price lines, trendlines, zones, and event markers, live on MarketView or as a chart card in chat"
+      "chart-annotationDesc": "Draw an analysis on a price chart as a layer: levels, lines, zones, indicators, and projections, live on MarketView or as a chart card in chat"
     },
     "compactedNotification": "Context compacted · {{from}} messages → summary",
     "taskErrorNotification": "Subagent run failed",
@@ -2846,24 +2849,19 @@
       "toolCallCompleted": "completed",
       "toolCallFailed": "failed"
     },
-    "chartAnnotationCard": {
-      "name": "{{symbol}} {{interval}} chart",
-      "labelSeparator": ", ",
-      "metaCount_one": "{{count}} annotation",
-      "metaCount_other": "{{count}} annotations",
-      "cardAria_one": "{{name}}, {{count}} annotation. Open annotated chart.",
-      "cardAria_other": "{{name}}, {{count}} annotations. Open annotated chart.",
-      "cardAriaPricesOnly_one": "{{name}}, {{count}} annotation. Open chart.",
-      "cardAriaPricesOnly_other": "{{name}}, {{count}} annotations. Open chart.",
-      "chipJumpTitle": "Switch the chart to {{symbol}} · {{timeframe}} to show these annotations",
-      "chipShowTitle": "Show these annotations on the chart",
+    "chartLayerCard": {
+      "name": "{{symbol}} {{interval}} layers",
+      "showMore": "Show more",
+      "showLess": "Show less",
+      "open": "Open chart",
+      "openAria": "{{name}}. Open chart with these layers.",
+      "openAriaPricesOnly": "{{name}}. Open chart.",
+      "chipJumpTitle": "Switch the chart to {{symbol}} · {{timeframe}} to show these layers",
       "chipShownTitle": "Shown on the chart",
-      "chipViewCount_one": "View {{count}} annotation on chart",
-      "chipViewCount_other": "View {{count}} annotations on chart",
-      "chipShowCount_one": "Show {{count}} annotation on chart",
-      "chipShowCount_other": "Show {{count}} annotations on chart",
-      "chipShownCount_one": "{{count}} annotation on chart",
-      "chipShownCount_other": "{{count}} annotations on chart"
+      "chipViewCount_one": "View {{count}} layer on chart",
+      "chipViewCount_other": "View {{count}} layers on chart",
+      "chipShownCount_one": "{{count}} layer on chart",
+      "chipShownCount_other": "{{count}} layers on chart"
     },
     "duration": {
       "subSecond": "<1s",
@@ -3226,6 +3224,7 @@
     },
     "pageTab": "Page",
     "pageLatest": "Latest",
+    "pageShared": "Visitors see this",
     "pageVersion": "v{{seq}}",
     "pageVersionName": "Version {{seq}}",
     "pageUpdated": "Updated to v{{seq}}",
@@ -4015,6 +4014,7 @@
       "manageAutomation": "Manage Automation",
       "annotateChart": "Annotate Chart",
       "manageAnnotations": "Manage Annotations",
+      "manageChartLayers": "Manage Chart Layers",
       "skill": "Skill",
       "memory": "Memory",
       "workspaceMemory": "Workspace Memory",
@@ -4119,8 +4119,7 @@
       "creatingAutomation": "creating automation...",
       "actionAutomation": "{{action}} automation...",
       "managingAutomation": "managing automation...",
-      "annotatingChart": "annotating chart...",
-      "updatingAnnotations": "updating annotations...",
+      "updatingChartLayers": "updating chart layers...",
       "sendingTo": "sending to {{app}}...",
       "sendingMessage": "sending message...",
       "listingMessageTargets": "listing message targets...",
@@ -4698,10 +4697,7 @@
       "askStockPlaceholder": "Ask about this stock..."
     },
     "chart": {
-      "clearAnnotations": "Clear",
-      "clearAnnotationsTitle": "Clear annotations from the chart (kept in chat — click the artifact to restore)",
       "modeLabel": "Mode",
-      "newsEventAria": "News event: {{title}}",
       "light": "Light",
       "advanced": "Advanced",
       "log": "Log",
@@ -4762,6 +4758,65 @@
       "chipRegion": "Region · {{symbol}} {{timeframe}}",
       "chipPriceLevel": "Price {{price}} · {{symbol}} {{timeframe}}",
       "removeChip": "Remove selection"
+    },
+    "layers": {
+      "legendLabel": "Agent layers",
+      "count_one": "{{count}} layer",
+      "count_other": "{{count}} layers",
+      "asOf": "as of {{date}}",
+      "hidden": "Hidden",
+      "hide": "Hide layer",
+      "show": "Show layer",
+      "remove": "Remove layer",
+      "ask": "Ask agent about this layer",
+      "askDraft": "About {{label}}: ",
+      "askUnavailable": "Open the chat to ask the agent about this.",
+      "removeFailed": "Couldn't remove the layer, so it is back on the chart."
+    },
+    "layerExplain": {
+      "ask": "Ask about this",
+      "asked": "Added to chat",
+      "pinHint": "Click to pin and ask",
+      "close": "Close",
+      "types": {
+        "segment": "Trend line",
+        "vline": "Time marker",
+        "channel": "Parallel channel",
+        "pitchfork": "Pitchfork",
+        "box": "Zone",
+        "label": "Label",
+        "arrow": "Arrow",
+        "path": "Pattern",
+        "fib": "Fib retracement",
+        "cone": "Forecast cone",
+        "forecast": "Forecast",
+        "analog": "Historical analog",
+        "position": "Position",
+        "measure": "Measure",
+        "profile": "Volume profile",
+        "series": "Series",
+        "level": "Level",
+        "marker": "Marker",
+        "regime": "Regime",
+        "alert": "Alert",
+        "element": "Element"
+      }
+    },
+    "layerCanvas": {
+      "hit": "Hit",
+      "missed": "Missed",
+      "replay": "Replay",
+      "replayed": "Replayed: {{dates}}",
+      "long": "Long",
+      "short": "Short",
+      "target": "Target",
+      "targetN": "T{{n}}",
+      "stop": "Stop",
+      "riskReward": "R:R",
+      "bars_one": "{{count}} bar",
+      "bars_other": "{{count}} bars",
+      "days": "{{count}}d",
+      "poc": "POC"
     },
     "overview": {
       "noData": "No data available",
@@ -7829,8 +7884,8 @@
   "palette": {
     "copyFailed": "Couldn't copy to the clipboard",
     "title": "Search and commands",
-    "label": "Search threads, tickers, skills, settings, or ask anything",
-    "placeholder": "Search threads, tickers, skills, settings, or ask anything",
+    "label": "Search threads, files, tickers, settings, or ask anything",
+    "placeholder": "Search threads, files, tickers, settings, or ask anything",
     "untitledThread": "Untitled thread",
     "analystIn": "Analyst in {{workspace}}",
     "askTitle": "Ask “{{query}}”",
@@ -7844,7 +7899,11 @@
       "workspaces": "Workspaces",
       "skills": "Skills",
       "places": "Pages and settings",
-      "ask": "Ask"
+      "ask": "Ask",
+      "turns": "In conversations",
+      "ticker": "Ticker",
+      "threadsOn": "Your threads on {{symbol}}",
+      "files": "Files"
     },
     "kind": {
       "workspace": "Workspace",
@@ -7866,7 +7925,12 @@
       "back": "Back",
       "move": "Move",
       "close": "Close",
-      "actions": "Actions"
+      "actions": "Actions",
+      "openAtTurn": "Open at this turn",
+      "openThread": "Open thread",
+      "threadsMentioning": "Threads mentioning {{symbol}}",
+      "searchIn": "Search in",
+      "copyPath": "Copy path"
     },
     "action": {
       "newThread": "New thread",
@@ -7881,7 +7945,80 @@
       "newAutomation": "schedule alert recurring briefing",
       "theme": "appearance dark light mode color"
     },
-    "search": "Commands & jump"
+    "search": "Commands & jump",
+    "inThisThread": "{{agent}}, in this thread",
+    "you": "You",
+    "narrowPlaceholder": "Narrow your threads on {{symbol}}",
+    "busy": "Too many searches at once. Try again in a moment.",
+    "searchFailed": "Couldn't search your conversations.",
+    "kindFailed": {
+      "threads": "Couldn't search your thread titles right now.",
+      "turns": "Couldn't search what was said in your conversations right now.",
+      "files": "Couldn't search your files right now."
+    },
+    "noMatches": "No matches",
+    "showAll": {
+      "threads": "Show all threads",
+      "turns": "Show all conversation matches",
+      "files": "Show all files"
+    },
+    "preview": {
+      "missing": "Nothing to preview yet.",
+      "failed": "Couldn't load the preview."
+    },
+    "scope": {
+      "label": "Search in {{scope}}",
+      "leave": "Stop searching here",
+      "workspacePlaceholder": "Search these threads and files, or ask the agent",
+      "threadPlaceholder": "Search this thread, or write to it",
+      "tickersHint": "Type a symbol or company name.",
+      "threadHint": "Search in this thread",
+      "noThreads": "No threads here yet.",
+      "kinds": {
+        "tickers": "Tickers",
+        "files": "Files",
+        "threads": "Threads",
+        "turns": "Conversations",
+        "workspaces": "Workspaces",
+        "actions": "Actions"
+      },
+      "placeholders": {
+        "tickers": "Search tickers by symbol or company",
+        "files": "Search files by name or path",
+        "threads": "Search thread titles",
+        "turns": "Search what was said in your conversations",
+        "workspaces": "Search workspaces",
+        "actions": "Search actions, pages and settings"
+      },
+      "kindIn": "Search {{kind}} in {{place}}",
+      "filesHint": "Type part of a file's name or path.",
+      "turnsHint": "Type words you or the agent said."
+    },
+    "keys": {
+      "enter": "Enter: {{action}}.",
+      "actions": "Right arrow: more actions.",
+      "askMac": "Command Enter: ask the agent.",
+      "askOther": "Control Enter: ask the agent.",
+      "back": "Left arrow or Escape: back.",
+      "scope": "Tab: search in it.",
+      "leave": "Backspace or Escape: stop searching in {{scope}}.",
+      "editBack": "Escape, or Backspace in the empty field: back."
+    },
+    "prefixes": {
+      "label": "Type one of these first to search one kind:",
+      "tickers": "tickers",
+      "files": "files",
+      "threads": "threads",
+      "turns": "conversations",
+      "workspaces": "workspaces",
+      "actions": "actions"
+    },
+    "pinned": "Pinned",
+    "unpinned": "Unpinned",
+    "editLabel": "{{action}}: {{name}}",
+    "rename": {
+      "placeholder": "New title"
+    }
   },
   "report": {
     "menuItem": "Report a problem",
@@ -7956,6 +8093,147 @@
       "withdrawn": "Report withdrawn.",
       "gone": "This report can no longer be changed.",
       "noteLimit": "This report already has as many notes as it can take. For more, use Report a problem."
+    }
+  },
+  "customDashboard": {
+    "untitled": "Your dashboard",
+    "builtIn": "Built-in dashboard",
+    "switchLabel": "Dashboard: {{name}}",
+    "emptyHint": "Ask the agent to build you a dashboard page, then choose Set as dashboard on it. A page opens even while your computer is off. You can switch back here anytime.",
+    "build": "Build one with the agent",
+    "remove": "Remove {{name}}",
+    "removed": "Removed {{name}}",
+    "undo": "Undo",
+    "full": "You have {{max}} dashboards. Remove one to add this.",
+    "manage": "Manage",
+    "notLoaded": "Your dashboards are still loading. Try again in a moment.",
+    "saveFailed": "Couldn't save your dashboards. Try again.",
+    "edit": "Edit with the agent",
+    "reload": "Reload",
+    "reloadFailed": "Couldn't refresh {{name}}",
+    "starting": "Starting {{name}}…",
+    "startingPage": "Opening {{name}}…",
+    "showBuiltIn": "Show the built-in dashboard meanwhile",
+    "setAsDashboard": "Set as dashboard",
+    "isDashboard": "Your dashboard",
+    "pinned": "{{name}} is now your dashboard",
+    "view": "View",
+    "agentFailed": "Couldn't open a chat with the agent. Try again.",
+    "buildDraft": "Build my LangAlpha Dashboard page. I want to see ",
+    "editDraft": "Change my dashboard {{name}}: ",
+    "editDraftPort": "Change my dashboard {{name}}, the app on port {{port}}: ",
+    "away": {
+      "waiting": "Showing the built-in dashboard while {{name}} starts",
+      "waitingPage": "Showing the built-in dashboard while {{name}} opens",
+      "ready": "{{name}} is ready",
+      "failed": "{{name}} didn't open, so this is the built-in dashboard",
+      "failedDetail": "Its computer may be asleep or not answering.",
+      "failedDetailPage": "LangAlpha couldn't read its saved copy.",
+      "gone": "{{name}} is no longer available",
+      "goneDetail": "Its app or workspace was removed.",
+      "goneDetailPage": "Its page or workspace was removed.",
+      "open": "Open {{name}}",
+      "retry": "Try again",
+      "remove": "Remove",
+      "noVersion": "No copy of the page is kept yet. Saving one reads it from its computer, which starts if it's off.",
+      "keepNow": "Save a copy now"
+    },
+    "editDraftPath": "Change my dashboard {{name}} ({{path}}): ",
+    "keepFailed": "Couldn't set this page as your dashboard",
+    "access": {
+      "label": "Data access",
+      "title": "What this dashboard can read",
+      "hint": "Market data is always available. These are yours, so it reads them only while you allow it.",
+      "scope": {
+        "portfolio": "Portfolio",
+        "threads": "Recent threads"
+      }
+    }
+  },
+  "appBridge": {
+    "accessLabel": "App access",
+    "asksApp": "This app asks to read your {{scopes}}.",
+    "asksPage": "This page asks to read your {{scopes}}.",
+    "and": " and ",
+    "allow": "Allow",
+    "notNow": "Not now",
+    "saveFailed": "Couldn't save that choice. Try again.",
+    "scope": {
+      "quotes": "market prices",
+      "watchlists": "watchlists",
+      "news": "news",
+      "brief": "daily brief",
+      "earnings": "earnings calendar",
+      "portfolio": "portfolio",
+      "threads": "recent threads"
+    }
+  },
+  "kit": {
+    "notConnected": "Not connected to LangAlpha",
+    "noAnswer": "LangAlpha did not answer {{method}}",
+    "offline": "Open this page from LangAlpha to see live data.",
+    "scopePending": "Allow access to {{name}} in LangAlpha to show this.",
+    "scopeMissing": "This dashboard has no access to {{name}}.",
+    "scope": {
+      "quotes": "market quotes",
+      "watchlists": "your watchlists",
+      "news": "news",
+      "brief": "the daily brief",
+      "earnings": "the earnings calendar",
+      "portfolio": "your portfolio",
+      "threads": "your threads"
+    },
+    "rate": "Too many requests; retrying shortly.",
+    "unavailable": "Not available right now.",
+    "loadFailed": "Couldn't load.",
+    "loadFailedBecause": "Couldn't load: {{message}}",
+    "stale": "Couldn't refresh · as of {{ago}} · retrying",
+    "source": "Source: {{source}}",
+    "asOf": "As of {{time}}",
+    "setSymbol": "Set a symbol.",
+    "noQuote": "No quote for {{symbol}}.",
+    "noData": "No data.",
+    "noChartData": "No chart data for {{symbol}}.",
+    "noWatchlists": "No watchlists yet.",
+    "emptyWatchlist": "This watchlist is empty.",
+    "noNews": "No news right now.",
+    "noBrief": "No brief yet today.",
+    "earningsNeedWatchlist": "Add names to a watchlist to see their earnings here.",
+    "noEarnings": "No earnings in the next {{days}} days.",
+    "noEarningsOwn": "No earnings in the next {{days}} days for your watchlists.",
+    "earningsTime": {
+      "bmo": "Before open",
+      "amc": "After close",
+      "dmh": "During market"
+    },
+    "eps": "EPS {{value}}",
+    "column": {
+      "symbol": "Symbol",
+      "name": "Name",
+      "quantity": "Qty",
+      "price": "Price",
+      "value": "Value",
+      "pl": "P/L",
+      "cost": "Cost"
+    },
+    "total": "Total",
+    "partialTotal": "{{part}} of {{all}} holdings",
+    "noHoldings": "No holdings yet.",
+    "noThreads": "No threads yet.",
+    "untitled": "Untitled",
+    "noDataYet": "No data yet",
+    "updated": "Updated {{ago}}",
+    "updatedMissed": "Updated {{ago}} · missed the {{run}} update",
+    "updatedAt": "Updated {{time}}",
+    "ago": {
+      "justNow": "just now",
+      "soon": "in a moment",
+      "minutes": "{{n}}m ago",
+      "hours": "{{n}}h ago",
+      "days": "{{n}}d ago",
+      "inMinutes": "in {{n}}m",
+      "inHours": "in {{n}}h",
+      "inDays": "in {{n}}d"
     }
   }
 }

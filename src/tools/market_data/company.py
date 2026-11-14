@@ -49,7 +49,7 @@ from .segments import SegmentBreakdown, fetch_segments, segment_lines
 from .utils import finite_or_none, format_percentage, get_market_session
 from src.dalton.extended_hours import snapshot_quote_time_labels  # DALTON-HOOK(extended-hours-quotes)
 from src.data_client import get_financial_data_provider, get_market_data_provider
-from src.data_client.ginlix_data.directory import display_names
+from src.data_client.ginlix_data.directory import display_names, profile_name
 from src.data_client.normalize import change_from, minor_unit_places
 from src.utils.market_hours import ET
 from market_protocol import AssetClass, InstrumentRef
@@ -283,7 +283,7 @@ async def _gather_company(
         ref=ref,
         cur=cur,
         profile=profile,
-        name=profile.get("nameLocal") or local_name or profile.get("companyName", symbol),
+        name=profile_name(profile, local_name) or symbol,
         name_en=profile.get("companyName") or directory_en,
         income=income,
         # Earnings rows are consensus figures per listed security, in its

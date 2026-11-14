@@ -70,6 +70,7 @@ import { DispatchStatusProvider } from '../hooks/usePTCDispatchStatus';
 import JumpToLatestPill from './JumpToLatestPill';
 import ShareButton from './ShareButton';
 import { WorkspaceProvider } from '../contexts/WorkspaceContext';
+import { ChartComposerContext } from '@/components/chart/chartComposer';
 import { ShareLinkOpenerContext } from '../contexts/ShareLinkOpenerContext';
 import { RouteLeaveGuardContext } from '../contexts/RouteLeaveGuardContext';
 import SubagentStatusBar from './SubagentStatusBar';
@@ -77,6 +78,8 @@ import TodoDrawer from './TodoDrawer';
 import { ComposerTray, ReconnectingChip, TrayDock } from './chatView/ComposerTray';
 import { useTrayContents } from './chatView/useTrayContents';
 import { useHistoryBackfill } from './chatView/useHistoryBackfill';
+import { useFocusTurn } from './chatView/useFocusTurn';
+import { PaletteSearchButton } from '@/components/nav/PaletteSearchButton';
 import { OlderHistorySkeleton } from './chatView/OlderHistorySkeleton';
 import { useThreadCommands } from '../hooks/useCommands';
 import { ThreadCommandsContext } from './commands/threadCommandsContext';
@@ -134,7 +137,7 @@ import { useRightPanel } from './chatView/useRightPanel';
 import { handOffToggleFocus } from './filePanel/panelToggleFocus';
 import { PanelLoadingStrip } from './filePanel/PanelLoadingStrip';
 import { usePanelFiles } from './chatView/usePanelFiles';
-import { usePanelChartSelections } from './chatView/usePanelChartSelections';
+import { usePanelChart } from './chatView/usePanelChart';
 import { SelectionChips } from '@/pages/MarketView/components/SelectionChips';
 import { useMessageActionBundles } from './chatView/useMessageActionBundles';
 // DALTON-HOOK(team-sharing): read-only state, banner, and disabled composer for colleague threads
@@ -656,6 +659,24 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     [resolveSubagentTelemetry],
   );
 
+  // A navigation naming a turn (the command palette's "In conversations" hit)
+  // opens the thread there, once its entry has landed.
+  const showMainTranscript = useCallback(() => handleSelectAgent('main'), [handleSelectAgent]);
+  const focusNewest = useCallback(() => pinToBottom('auto'), [pinToBottom]);
+  useFocusTurn({
+    isActive,
+    ready: entryRestored,
+    onMain: activeAgentId === 'main',
+    showMain: showMainTranscript,
+    messages,
+    status: olderHistory.status,
+    load: loadOlderHistory,
+    place: holdPlace,
+    reveal: revealMessage,
+    toNewest: focusNewest,
+    scrollRoot: getMainScrollRoot,
+  });
+
   // Whether the open subagent's turn is still running. A bubble's own
   // `isStreaming` goes false between two model calls of one agent loop, so a
   // transcript that judged liveness by the bubble alone would fold a working
@@ -797,7 +818,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
   }, [isCompacting, isLoading, handleStop, stableStopCompaction]);
 
-  const { chips: chartSelectionChips, takeForSend: takeChartSelections } = usePanelChartSelections(isActive);
+  const panelChart = usePanelChart(isActive, chatInputRef);
 
   // Wrapper: converts ChatInput's send into handleSendMessage(message,
   // additionalContext, attachmentMeta), the send itself the draft it gives back.
@@ -830,7 +851,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
 
     // Watch toggle activates the market-watch skill (re-sent every turn while
-    // on, like MarketView's chart-annotation). Dedup against a manually-typed
+    // on, as MarketView's sends carry the chart-annotation skill). Dedup against a manually-typed
     // /market-watch pill added by the loop above (SkillsMiddleware also dedups
     // the body, but this keeps the context list clean).
     if (modelOptions.marketWatch && marketWatchEnabled && !contexts.some((c) => c.type === 'skills' && c.name === 'market-watch')) {
@@ -851,8 +872,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       contexts.push(...(items as unknown as Record<string, unknown>[]));
     }
 
-    // Regions and price levels picked on a panel chart tab.
-    const picked = takeChartSelections(message);
+    // Regions and price levels picked on a panel chart tab, and what each chart shows.
+    const { picked, chartViews } = panelChart.takeForSend(message);
     if (picked) {
       contexts.push(...picked.contexts);
       if (picked.attachments.length > 0) attachmentMeta = [...(attachmentMeta ?? []), ...picked.attachments];
@@ -871,6 +892,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         ...modelOptions,
         ...(picked ? { chartSelections: picked.snapshots } : {}),
         ...(artifactComments ? { artifactComments } : {}),
+        ...(chartViews.length > 0 ? { chartViews } : {}),
         // DALTON-HOOK(composer-drafts): the box as the person wrote it — a
         // send the server refuses while the transcript is out of view goes
         // back to the composer whole (attachments, mentions and commands too)
@@ -878,7 +900,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         draft: send,
       }),
     );
-  }, [marketWatchEnabled, stableSendMessage, takeChartSelections, takeQueuedComments, composerSendOptions]);
+  }, [marketWatchEnabled, stableSendMessage, panelChart, takeQueuedComments, composerSendOptions]);
 
   const planReader = useLatestRef(usePlanReader());
 
@@ -1108,7 +1130,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // The queued comments ride above the text box and count as something to
   // send. Folded as the sheet starts over the chat, so it docks folded.
   const composerDeck = {
-    hasExternalContext: chartSelectionChips.length > 0 || commentDeck.ready.length > 0,
+    hasExternalContext: panelChart.chips.length > 0 || commentDeck.ready.length > 0,
     placeholder: commentDeck.placeholder ?? chatPlaceholder,
     // DALTON-HOOK(team-sharing): a colleague's workspace or a read-only
     // thread shows no docked comment box — comments are sent into the thread
@@ -1413,6 +1435,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         fastMode,
         widgetSnapshots,
         chartSelections,
+        chartViews,
         skills,
         hiddenOpener,
         threadTitle,
@@ -1428,6 +1451,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           fastMode,
           widgetSnapshots,
           chartSelections,
+          chartViews,
           subagentsAllowed: subagentsToSend,
           ...tuningToSend,
           hiddenOpener,
@@ -1475,8 +1499,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     if ((!snaps?.length && !draft) || navState?.initialMessage) return;
     reseededKeyRef.current = location.key;
     snaps?.forEach((s) => chatInputRef.current?.addWidgetSnapshot(s));
-    if (draft) chatInputRef.current?.setValue(draft, navState?.draftCommands);
-    navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined, draftMessage: undefined, draftCommands: undefined } });
+    if (draft && navState?.draftAppend) chatInputRef.current?.giveBack(draft);
+    else if (draft) chatInputRef.current?.setValue(draft, navState?.draftCommands);
+    navigate(location.pathname, { replace: true, state: { ...navState, widgetSnapshots: undefined, draftMessage: undefined, draftCommands: undefined, draftAppend: undefined } });
   }, [isActive, location.key, location.state, location.pathname, navigate, isThreadReadOnly]); // DALTON-HOOK(colleague-dispatch): re-check when read-only changes
 
 
@@ -1548,6 +1573,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }
 
   return (
+    <ChartComposerContext value={panelChart.composer}>
     <WorkspaceProvider workspaceId={workspaceId} downloadFile={null} folders={chatFolders}>
     {/* A link in the transcript that changes the route unmounts the file
         panel beside it, so it leaves through the panel's guard like the
@@ -1667,6 +1693,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 />
               </>
             )}
+            {/* A phone has no sidebar search row and, mostly, no ⌘K. */}
+            {isMobile && <PaletteSearchButton />}
             {/* DALTON-HOOK(workspace-sharing-settings): hide ShareButton for colleagues */}
             {/* DALTON-HOOK(colleague-dispatch): hide ShareButton on read-only foreign threads */}
             {/* DALTON-HOOK(external-share-guard): pass callerTier so external members only see ShareButton when closing an active share */}
@@ -1988,7 +2016,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     />
                     <ThreadOffers model={threadModel} subagents={threadSubagents} summary={summaryHint} />
                     <ClaudeCodePlanRow workspaceId={workspaceId} chiefOfStaff={isHome} model={threadModel.model} />
-                    <SelectionChips chips={chartSelectionChips} />
+                    <SelectionChips chips={panelChart.chips} />
                     {/* At a file's foot the transcript is out of view, so the
                         turn's progress comes along with the composer. */}
                     {composerDock.docked && <DockTurnStatus running={isLoading} messages={messages} />}
@@ -2251,6 +2279,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     </ShareLinkOpenerContext>
     </RouteLeaveGuardContext>
     </WorkspaceProvider>
+    </ChartComposerContext>
   );
 }
 

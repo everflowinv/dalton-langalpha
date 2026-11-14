@@ -392,6 +392,7 @@ function FilePanel({
     active: isActive,
     readAt: readAt ?? null,
     ui: comments,
+    threadId,
   });
   const htmlArtifactPath = artifactTab.path;
   // The agent's edit to the HTML file in front is read at once, unlike other
@@ -839,6 +840,7 @@ function FilePanel({
           // DALTON-HOOK(team-sharing): disable preview refresh in colleague mirror mode
           refreshDisabled={teamReadOnly}
           workspaceId={workspaceId}
+          threadId={threadId}
           readOnly={readOnly}
         />
       )}
@@ -976,7 +978,7 @@ function FilePanel({
                 />
               )}
               {/* DALTON-HOOK(team-sharing): pass teamReadOnly so colleague mirror does not start preview sandbox */}
-              <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} teamReadOnly={teamReadOnly} />
+              <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} teamReadOnly={teamReadOnly} workspaceId={readOnly ? null : workspaceId} />
               {!treeFull && (
               <ActiveTabBody
                 activeTab={activeTab}

@@ -16,6 +16,7 @@ import { trackVisualViewport } from './lib/visualViewport'
 import { Toaster } from './components/ui/toaster'
 import { StaleBuildBoundary } from './components/StaleBuildBoundary'
 import { captureException, initSentry } from './lib/sentry'
+import { tolerateTranslatedDom } from './lib/translatedDom'
 
 // Initialize a global QueryClient for data fetching and caching
 const queryClient = new QueryClient({
@@ -29,9 +30,11 @@ const queryClient = new QueryClient({
 })
 
 document.title = BRAND_NAME // DALTON-HOOK(brand-name)
+tolerateTranslatedDom()
 applyCardStyle(getCardStyle())
 trackVisualViewport()
-initSentry()
+// This module is the entry chunk once built, so its URL names the release.
+initSentry(import.meta.url)
 
 // Nothing renders until the active locale's catalog is in, or the first paint
 // shows raw keys. A catalog that fails leaves #root to index.html's pre-boot

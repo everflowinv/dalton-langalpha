@@ -1,6 +1,8 @@
 import React, { Suspense, useEffect, useMemo } from 'react';
+import { useShareLink } from '@/hooks/useShareLink';
+import { appGrantKey } from '@/lib/appBridge/useAppScopes';
 import type { FileTab } from './useFileTabs';
-import type { PreviewsApi } from './usePreviews';
+import type { PreviewEntry, PreviewsApi } from './usePreviews';
 import './PreviewPanes.css';
 
 const PreviewViewer = React.lazy(() => import('../viewers/PreviewViewer'));
@@ -11,6 +13,8 @@ interface PreviewPanesProps {
   previews: PreviewsApi;
   // DALTON-HOOK(team-sharing): suppress preview registration, ensure, and refresh in colleague mirror mode
   teamReadOnly?: boolean;
+  /** The owner's workspace; null on a read-only panel, whose apps read nothing. */
+  workspaceId?: string | null;
 }
 
 /**
@@ -18,7 +22,7 @@ interface PreviewPanesProps {
  * tab switch must not reload a running server, drop its scroll position or
  * discard what was typed into it.
  */
-export function PreviewPanes({ tabs, activeId, previews, teamReadOnly = false }: PreviewPanesProps): React.ReactElement | null {
+export function PreviewPanes({ tabs, activeId, previews, teamReadOnly = false, workspaceId = null }: PreviewPanesProps): React.ReactElement | null {
   const previewTabs = useMemo(
     () => tabs.filter((t): t is Extract<FileTab, { kind: 'preview' }> => t.kind === 'preview'),
     [tabs],
@@ -55,14 +59,11 @@ export function PreviewPanes({ tabs, activeId, previews, teamReadOnly = false }:
         const entry = byPort.get(tab.port);
         return (
           <div key={tab.id} className="file-panel-preview-pane" hidden={tab.id !== activeId}>
-            <PreviewViewer
-              chrome={false}
-              url={entry?.url ?? ''}
-              port={tab.port}
-              title={tab.title}
-              loading={entry?.loading ?? true}
-              error={entry?.error}
-              reloadToken={entry?.reloadToken}
+            <PreviewPane
+              tab={tab}
+              entry={entry}
+              active={tab.id === activeId}
+              workspaceId={workspaceId}
               // DALTON-HOOK(team-sharing): do not refresh preview in colleague mirror mode
               onRefresh={teamReadOnly ? undefined : () => previews.refresh(tab.port)}
             />
@@ -70,5 +71,39 @@ export function PreviewPanes({ tabs, activeId, previews, teamReadOnly = false }:
         );
       })}
     </Suspense>
+  );
+}
+
+interface PreviewPaneProps {
+  tab: Extract<FileTab, { kind: 'preview' }>;
+  entry: PreviewEntry | undefined;
+  /** The tab picked: the others stay mounted, hidden, and may open nothing. */
+  active: boolean;
+  workspaceId: string | null;
+  onRefresh: (() => void) | undefined;
+}
+
+/**
+ * One app's frame. Its `/a/` code and start command key what the user let it
+ * read (`appGrantKey`), the same grant it has as the dashboard. The command
+ * comes with the URL it started, so a new program on the port asks again; the
+ * crumb row asks for the same link, so the code costs no second request.
+ */
+function PreviewPane({ tab, entry, active, workspaceId, onRefresh }: PreviewPaneProps): React.ReactElement {
+  const { data: link } = useShareLink(workspaceId, { kind: 'app', port: tab.port });
+  return (
+    <PreviewViewer
+      chrome={false}
+      url={entry?.url ?? ''}
+      port={tab.port}
+      title={tab.title}
+      loading={entry?.loading ?? true}
+      error={entry?.error}
+      reloadToken={entry?.reloadToken}
+      onRefresh={onRefresh}
+      bridge={workspaceId
+        ? { grantKey: link && entry?.url ? appGrantKey({ code: link.code, command_key: entry.commandKey }) : null, active }
+        : undefined}
+    />
   );
 }

@@ -47,13 +47,14 @@ import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
 import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
 import { readMarketViewRoute } from '../utils/marketRoute';
-import { normalizeTimeframe } from '../stores/chartAnnotationStore';
+import { normalizeTimeframe } from '../utils/chartInstanceKey';
 import { chartSelectionStore, useChartSelections, isConfirmedFor } from '../stores/chartSelectionStore';
-import { buildChartSelectionSend } from '../utils/selectionSend';
+import { buildMarketSendContexts } from '../utils/selectionSend';
+import { layerAskContext } from '../utils/layerAsk';
 import { SelectionChips } from './SelectionChips';
-import { marketViewAnnotationContext } from '../constants/annotationPrompt';
 // DALTON-HOOK(composer-drafts): clear new-chat draft on explicit New Chat action
 import { clear as clearChatDraft } from '@/lib/dalton/chatDrafts';
+import { useChartAskHandler, useChartComposer } from '@/components/chart/chartComposer';
 import './MarketPanel.css';
 
 /** Compact status banner shown above the input (interrupt, compaction, etc.). */
@@ -303,6 +304,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const previewPortRef = useRef<number | null>(null);
   // ChatInput handle — lets edit/regenerate/retry read the current model picker.
   const chatInputRef = useRef<ChatInputHandle>(null);
+  // The chart's "ask about this layer" lands in this composer as a pill.
+  useChartAskHandler((req) => chatInputRef.current?.addContext(layerAskContext(req)));
+  const { collectViews } = useChartComposer();
   // Set when the user stops a running turn, so the input placeholder reflects it.
   const [wasStopped, setWasStopped] = useState(false);
 
@@ -327,17 +331,17 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const emptyWorkspacesHint = workspaces.length === 0 ? t('agents.market.workspaceDisabledReason') : null;
 
   // MarketView always has the live chart beside the chat, so inline
-  // chart-annotation cards collapse to a confirmation chip. Tell the chip
+  // chart layer cards collapse to a confirmation chip. Tell the chip
   // which instance is on screen + how to switch the chart, so a chip for a
   // different ticker/timeframe can jump the chart to it.
   const chartSurface = useMemo<ChartSurface>(
     () => ({
       chartPresent: true,
       activeSymbol: symbol ? symbol.toUpperCase() : undefined,
-      // Raw interval, not normalized: the chip compares this against an
-      // annotation's timeframe to decide "shown vs jump". A view-only interval
+      // Raw interval, not normalized: the chip compares this against a
+      // layer's timeframe to decide "shown vs jump". A view-only interval
       // like 1s (which collapses to 1day) must NOT read as active for a 1day
-      // annotation that the 1s chart can't actually display.
+      // layer that the 1s chart can't actually display.
       activeTimeframe: interval,
       onJumpToChart,
     }),
@@ -506,19 +510,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     ({ message, files, commands, modelOptions }: ComposerSend) => {
       const attachments = files as unknown as AttachmentItem[];
       const slashCommands = commands as SlashCommandLike[];
-      // The drawing tools are always bound; inject the chart-annotation skill
-      // every send for its drawing guide and to tell the agent which ticker +
-      // timeframe "the chart" is (chart_id = SYMBOL:timeframe — drawing on the
-      // wrong timeframe won't show on the view the user is looking at).
-      const sym = symbol ? symbol.toUpperCase() : '';
-      const tf = normalizeTimeframe(interval);
-      const contexts: Record<string, unknown>[] = [
-        {
-          type: 'skills',
-          name: 'chart-annotation',
-          instruction: sym ? marketViewAnnotationContext(sym, tf) : undefined,
-        },
-      ];
+      const send = buildMarketSendContexts(symbol, interval, message, collectViews());
+      const contexts: Record<string, unknown>[] = [send.skill];
 
       // Skill contexts from typed slash commands (mirrors ChatView). Skip a
       // second chart-annotation context — it's always injected above.
@@ -555,18 +548,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         });
       }
 
-      // Append every confirmed chart selection (region/price level + note) for
-      // the live (sym, tf); a stale one is dropped. The same set is snapshotted
-      // for the sent message's cards, and a lone note becomes the message text
-      // when the user typed nothing (so the bubble isn't empty).
-      const {
-        contexts: selectionContexts,
-        snapshots: selectionSnapshots,
-        attachments: selectionAttachments,
-        outgoingMessage,
-      } = buildChartSelectionSend(sym, tf, message);
-      contexts.push(...selectionContexts);
-      metaItems.push(...selectionAttachments);
+      // The confirmed selections on the chart on screen; a lone note becomes
+      // the message text when the user typed nothing (so the bubble isn't empty).
+      contexts.push(...send.contexts);
+      metaItems.push(...send.attachments);
 
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
@@ -577,15 +562,16 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       // leaves them on the chart to send again.
       // Spend only what this send carried: a selection confirmed or a screenshot retaken while
       // it waited for acceptance belongs to the next send.
-      const sentSelectionIds = chartSelectionStore.getConfirmedFor(sym, tf).map((sel) => sel.id);
+      const sentSelectionIds = chartSelectionStore.getConfirmedFor(liveSym, liveTf).map((sel) => sel.id);
       const sentImage = chartImage;
       const spendChartContext = () => {
         if (sentImage && chartImageRef.current === sentImage) onClearChartImage();
         for (const id of sentSelectionIds) chartSelectionStore.remove(id);
       };
-      const sent = handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
+      const sent = handleSendMessage(send.outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,
-        ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
+        ...(send.snapshots.length > 0 ? { chartSelections: send.snapshots } : {}),
+        ...(send.chartViews.length > 0 ? { chartViews: send.chartViews } : {}),
         subagentsAllowed: subagentsToSend,
         ...tuningToSend,
         onAccepted: () => {
@@ -595,7 +581,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews],
   );
 
   // Stop the running turn (the input's Stop button). Mirrors ChatView: the hook's
