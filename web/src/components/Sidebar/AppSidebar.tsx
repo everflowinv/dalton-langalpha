@@ -244,7 +244,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
                 <TooltipTrigger asChild>
                   <button
                     className="sidebar-nav-item tap-target"
-                    onClick={palette.open}
+                    onClick={() => palette.open()}
                     onPointerEnter={palette.preload}
                     aria-label={t('palette.search')}
                     aria-keyshortcuts={paletteKeyShortcuts()}
@@ -331,7 +331,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         {palette && (
           <button
             className="sidebar-panel-item"
-            onClick={palette.open}
+            onClick={() => palette.open()}
             onPointerEnter={palette.preload}
             aria-keyshortcuts={paletteKeyShortcuts()}
           >

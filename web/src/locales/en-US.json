@@ -170,6 +170,12 @@
     "marketView": "Market View",
     "automations": "Automations",
     "settings": "Settings",
+    "help": "Help",
+    "whatsNew": "What's new",
+    "changelog": "Changelog",
+    "documentation": "Documentation",
+    "opensInNewTab": "(opens in a new tab)",
+    "contactSupport": "Contact support",
     "account": "Usage & Plan",
     "integrations": "Integrations",
     "newChat": "New chat",
@@ -755,15 +761,13 @@
     "searchPlaceholder": "Search by symbol or company name...",
     "searching": "Searching...",
     "noResults": "No results found",
-    "contactMessage": "If you have any questions or suggestions, please contact us through the following methods",
     "prefIncomplete": "Preference Information Incomplete",
     "prefIncompleteMsg": "Your preference information is not complete. Please complete your preferences to get the best experience with the agent.",
     "ignoreFor24h": "Ignore for 24 hours",
     "proceed": "Proceed",
     "header": {
       "editLayout": "Edit layout",
-      "exitEditLayout": "Exit edit layout",
-      "emailLabel": "Email"
+      "exitEditLayout": "Exit edit layout"
     },
     "widgets": {
       "common": {
@@ -2194,6 +2198,28 @@
     "attachmentEmpty": "{{name}} is empty and was not attached.",
     "attachmentTooLarge": "{{name}} exceeds the {{max}} MB limit and was not attached.",
     "attachmentsTotalTooLarge": "{{name}} was not attached: attachments in one message cannot exceed {{max}} MB in total.",
+    "contextPanel": {
+      "trigger": "Context window, {{percent}} used",
+      "title": "Context",
+      "used": "{{used}} / {{threshold}} used ({{percent}})",
+      "compactAt": "Compact at",
+      "thread": "This thread",
+      "input": "Input",
+      "output": "Output",
+      "cacheHitRate": "Cache hit rate",
+      "lastCall": "last call {{percent}}",
+      "counting": "Counting context",
+      "computerStopped": "Breakdown is available while the computer is running.",
+      "parts": {
+        "system": "System prompt",
+        "tools": "Tools",
+        "mcp": "MCP servers",
+        "skills": "Skills",
+        "memory": "Memory",
+        "environment": "Environment",
+        "conversation": "Conversation"
+      }
+    },
     "artifactComments": {
       "sendFailed": "These did not send, so they are still queued.",
       "message": {
@@ -7964,7 +7990,8 @@
     },
     "preview": {
       "missing": "Nothing to preview yet.",
-      "failed": "Couldn't load the preview."
+      "failed": "Couldn't load the preview.",
+      "today": "Today"
     },
     "scope": {
       "label": "Search in {{scope}}",

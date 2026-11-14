@@ -65,6 +65,7 @@ async def _start(request: ChatRequest, prior: PriorThread, failed_run: dict):
         patch(f"{PTC}._resolve_origin_meta", new=AsyncMock(return_value={})),
         patch(f"{PTC}.carry.carried_pair", new=AsyncMock(return_value={})),
         patch(f"{PTC}.carry.carried_delivery", new=AsyncMock(return_value=None)),
+        patch(f"{PTC}.carry.carried_firing", new=AsyncMock(return_value={})),
         patch(f"{PTC}.init_tracking", return_value=(MagicMock(), MagicMock())),
         patch(f"{PTC}.begin_run", new=AsyncMock(side_effect=_Admitted())) as begin,
         patch(f"{PREP}.tl_db.get_run", new=AsyncMock(return_value=failed_run)) as get_run,
@@ -124,7 +125,7 @@ async def test_a_retry_of_a_channel_turn_runs_on_the_channel():
 @pytest.mark.asyncio
 async def test_a_retry_of_a_web_turn_on_a_channel_thread_stays_on_the_web():
     stamped, context, _ = await _start(
-        _retry(), PriorThread(platform="slack"), failed_run={"metadata": {}}
+        _retry(), PriorThread(attempt_platform="slack"), failed_run={"metadata": {}}
     )
 
     assert (context.platform, context.surface_rules) == (None, None)

@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import type { SearchKind } from '@/api/search';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
@@ -5,6 +6,7 @@ import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
 import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 import { resolveDualName } from '@/lib/displayName';
 import { readMarkedTicker, readTypedTicker } from '@/lib/marketUtils';
+import type { RecentTicker } from '@/lib/recentTickers';
 import { queryKeys } from '@/lib/queryKeys';
 import { queryWords } from '@/lib/textMatch';
 // DALTON-HOOK(colleague-dispatch): palette recent threads follow the sidebar's open and isolation rules
@@ -18,8 +20,10 @@ import type { Thread, Workspace } from '@/types/api';
 import { askRow, fileRow, threadOfHit, threadOfList, threadRow, tickerRow, turnRow, type Verbs } from './rows';
 import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
 import { searchWithin } from './scope';
+import { boostOwnTickers } from './ownTickers';
 import { arrangeSearch, findItems, mergeThreads, serverGroup, type Hit } from './search';
 import type { LocalSources } from './useLocalSources';
+import { useOwnTickers } from './useOwnTickers';
 import { useConversationSearch, useSearchPages, type SearchFailure } from './useServerSearch';
 import type { PaletteGroup, PaletteItem, PreviewTarget, ViewSpec } from './types';
 
@@ -85,13 +89,18 @@ function useRecentThreads(workspaceId: string | null) {
   return { threads: data?.threads ?? [], loading: isLoading };
 }
 
-/** The tickers the symbol search finds for `query`, the exact symbol typed ranked first. */
-function useTickerHits(query: string, cap: number, enabled: boolean, v: Verbs) {
+/**
+ * The tickers the symbol search finds for `query`: the exact symbol typed
+ * first, then the user's own that it names (held, watched, opened lately),
+ * then the search's order.
+ */
+function useTickerHits(query: string, cap: number, enabled: boolean, v: Verbs, recent: readonly RecentTicker[]) {
   const { hits, loading } = useSymbolSearch(query, cap, { enabled });
+  const own = useOwnTickers(enabled, recent);
   const typed = readTypedTicker(query);
   // The last query's hits stay while the next one loads; they answer
   // another question, so no row offers them.
-  const found: Hit[] = (loading || !enabled ? [] : hits)
+  const found: Hit[] = (loading || !enabled ? [] : boostOwnTickers(hits, query, own).slice(0, cap))
     .map((hit, index) => {
       const name = resolveDualName(hit, hit.symbol);
       return {
@@ -127,14 +136,16 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
   const { t } = v;
   // A ticker's view searches for the symbol, and for what is typed with it.
   const text = lens?.kind === 'ticker' ? `${lens.symbol} ${query}`.trim() : query;
-  const words = queryWords(text);
+  // One array per query, not per render: the preview pane parses its turn
+  // again, and scrolls back to the first match, when its words change.
+  const words = useMemo(() => queryWords(text), [text]);
   const searching = words.length > 0;
   const within = searchWithin(place);
   const view = lens ? lens.kind : place?.kind === 'thread' ? 'thread' : 'all';
 
   const recent = useRecentThreads(place?.kind === 'workspace' ? place.workspaceId : null);
   const alone = view === 'tickers';
-  const tickers = useTickerHits(query, TICKER_HITS[alone ? 'alone' : 'main'], searching && (alone || (view === 'all' && !place)), v);
+  const tickers = useTickerHits(query, TICKER_HITS[alone ? 'alone' : 'main'], searching && (alone || (view === 'all' && !place)), v, local.recentTickers);
   const capped = useConversationSearch(query, SERVER_LIMIT, view === 'all' && searching, within);
   const threadPages = useSearchPages(text, 'threads', view === 'threads', within);
   // The ticker's view asks for its threads with its first page of

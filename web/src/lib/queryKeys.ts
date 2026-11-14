@@ -236,6 +236,9 @@ export const queryKeys = {
     // The commands that outlasted their tool's wait and ran on in the
     // background. Under the prefix for the same reason as the wakeups.
     commands:    (threadId: string) => [...queryKeys.threads.all, 'commands', threadId],
+    // What the thread's next call sends ahead of its messages, part by part,
+    // read when the context panel opens.
+    context:     (threadId: string) => [...queryKeys.threads.all, 'context', threadId],
     // Batched dispatch-liveness read for a turn's PTC cards: their threads,
     // the hand-offs' own runs, and the steers of those steered into a run
     // already going. The base key targets every id-set variant for
@@ -416,6 +419,12 @@ export const queryKeys = {
   quote: {
     all:    ['quote'],
     detail: (symbol: string) => [...queryKeys.quote.all, symbol],
+  },
+  // A ticker's latest trading session as a line (lib/bars/sessionQuery).
+  // Key = display spelling.
+  intradaySession: {
+    all:    ['intradaySession'],
+    detail: (symbol: string) => [...queryKeys.intradaySession.all, symbol],
   },
   insights: {
     all:         ['insights'],

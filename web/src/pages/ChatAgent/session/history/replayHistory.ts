@@ -19,7 +19,8 @@ import type { HtmlWidgetData, MessageRecord } from '../../hooks/utils/types';
 import {
   buildModelFallbackSegment, appendNotificationSegmentOnce, mapToolCallIdToAgentId,
 } from '../../hooks/utils/messageFinalizers';
-import { applyCallUsage, handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
+import { handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
+import { applyCallUsage } from '../tokenUsage';
 // DALTON-HOOK(provenance-batch): batch replay provenance per assistant message and flush once at replay end
 import { accumulateReplayProvenance, flushReplayProvenance } from '../stream/provenanceBatch';
 import { handlePlanBilled } from '../stream/mainEventHandlers';
