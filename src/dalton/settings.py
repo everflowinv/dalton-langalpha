@@ -134,7 +134,16 @@ class DaltonAutonomyConfig(BaseModel):
     min_wake_usd: float = Field(default=0.50, ge=0)
     reserve_for_events_usd: float = Field(default=5.00, ge=0)
     event_reserve_ratio: float = Field(default=0.2, ge=0, le=1.0)
+    # Probe-phase budget. A finished run then triages historical filings with a
+    # fresh wait of this same length, so one preflight can take about twice
+    # preflight_timeout_s.
     preflight_timeout_s: float = Field(default=45.0, gt=0)
+    # Company-watch only. One reminder per consecutive-timeout cycle, checked
+    # at the start of the next run. The cycle starts when the count goes from
+    # 0 to 1. The streak resets only when every probe this run requested
+    # actually succeeded. Backoff, a degraded or partial probe, an exhausted
+    # budget, and any early return do not reset it.
+    preflight_timeout_streak: int = Field(default=3, ge=1)
     data_health_timeout_s: float = Field(default=600.0, gt=0)
     backoff: DaltonBackoffConfig = Field(default_factory=DaltonBackoffConfig)
     vendor_quota_alert_ratio: float = Field(default=0.8, gt=0, le=1.0)

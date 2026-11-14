@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.config-git-backup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/scripts/dalton/ops/dalton_config_git_backup.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>DALTON_REPO_PYTHON</key>
+        <string>__PYTHON_BIN__</string>
+        <key>DALTON_OFFSITE_BACKUP_ENV_FILE</key>
+        <string>__HOME__/.config/dalton/offsite-backup.env</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>0</integer>
+            <key>Minute</key>
+            <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>6</integer>
+            <key>Minute</key>
+            <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>15</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>15</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/dalton-config-git-backup.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/dalton-config-git-backup.err.log</string>
+</dict>
+</plist>

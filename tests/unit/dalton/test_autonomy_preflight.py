@@ -58,7 +58,23 @@ from src.dalton.tools.knowledge_tools import (
     extract_verdict_signal_refs,
     resolve_verdict_signals,
 )
+from src.server.database.workspace import get_workspace as _REAL_GET_WORKSPACE
 from src.server.services.automation_settlement import _POLICIES, Outcome, _schedule_action
+
+# Bound at import, before a test replaces the module attribute. A second
+# create_autospec on the replacement raises InvalidSpecError.
+_REAL_GET_BUDGET_TODAY = budget_service.get_budget_today
+_REAL_UPSERT_SIGNAL = watch_db.upsert_signal
+_REAL_CLAIM_SIGNALS_WOKEN = watch_db.claim_signals_woken
+_REAL_INSERT_PREFLIGHT_LOG = watch_db.insert_preflight_log
+_REAL_UPSERT_WATCH_STATE = watch_db.upsert_watch_state
+_REAL_GET_WATCH_STATE = watch_db.get_watch_state
+_REAL_EXPIRE_OLD_SIGNALS = watch_db.expire_old_signals
+_REAL_LIST_UNWOKEN_SIGNALS = watch_db.list_unwoken_signals
+_REAL_BUMP_PREFLIGHT_TIMEOUT_STREAK = watch_db.bump_preflight_timeout_streak
+_REAL_RESET_PREFLIGHT_TIMEOUT_STREAK = watch_db.reset_preflight_timeout_streak
+_REAL_MARK_PREFLIGHT_TIMEOUT_REMINDED = watch_db.mark_preflight_timeout_reminded
+_REAL_RESOLVE_SIGNALS = watch_db.resolve_signals
 
 
 def test_five_company_probes_and_deleted_price_consensus():
@@ -667,12 +683,15 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
         "exhausted": False,
     }
 
-    # A3: 45s timeout (tested with timeout_s=0.05) wakes conservatively with reason="preflight_timeout"
-    async def slow_probe_sec(workspace_id=None, ticker="", watch_state=None, company_doc=None, submissions_override=None, allow_network=True, now=None):
+    # A3: 45s timeout (tested with timeout_s=0.05). Company watch skips; it does not wake.
+    async def slow_probe_sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
         await asyncio.sleep(0.3)
-        return [], watch_state or {}
+        return [], dict(kwargs.get("watch_state") or {})
 
-    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", slow_probe_sec)
+    monkeypatch.setattr(
+        "src.dalton.autonomy.preflight.probe_sec",
+        create_autospec(probe_sec, side_effect=slow_probe_sec),
+    )
     res_timeout = await preflight_check(
         {
             "automation_id": "11111111-1111-1111-1111-111111111111",
@@ -684,9 +703,14 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
         "exec-timeout",
         persist=False,
         timeout_s=0.05,
+        agenda_doc_override={},
     )
-    assert res_timeout.should_wake is True
+    assert res_timeout.should_wake is False
+    assert res_timeout.decision == "skip"
     assert res_timeout.reason == "preflight_timeout"
+    assert res_timeout.signals == []
+    assert "sec" in res_timeout.incomplete_probes
+    assert "earnings" not in res_timeout.incomplete_probes
     monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", probe_sec)
 
     # A5: dalton_agenda_note op passes apply_ops + validate_update("agenda", ...) against real agenda.schema.json
@@ -2126,7 +2150,7 @@ def test_topic_research_validate_stale_unmarked() -> None:
 
 @pytest.mark.asyncio
 async def test_watch_preflight_probe_runners_exclude_internal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify company_watch preflight runs only agenda, sec, cnhk, earnings and never runs internal probe."""
+    """Verify company_watch runs agenda, earnings, then sec, cnhk, and never an internal probe."""
     from src.dalton.autonomy import preflight as preflight_mod
     from src.server.database import workspace as ws_db
 
@@ -2143,10 +2167,19 @@ async def test_watch_preflight_probe_runners_exclude_internal(monkeypatch: pytes
         ),
     )
 
-    mock_agenda = create_autospec(probe_agenda, return_value=([], {}))
-    mock_sec = create_autospec(probe_sec, return_value=([], {}))
-    mock_cnhk = create_autospec(probe_cnhk_filings, return_value=([], {}))
-    mock_earnings = create_autospec(probe_earnings, return_value=([], {}))
+    order: list[str] = []
+
+    def _ordered(name: str, spec: Any) -> Any:
+        async def _inner(*_args: Any, **_kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+            order.append(name)
+            return [], {}
+
+        return create_autospec(spec, side_effect=_inner)
+
+    mock_agenda = _ordered("agenda", probe_agenda)
+    mock_sec = _ordered("sec", probe_sec)
+    mock_cnhk = _ordered("cnhk", probe_cnhk_filings)
+    mock_earnings = _ordered("earnings", probe_earnings)
 
     monkeypatch.setattr(preflight_mod, "probe_agenda", mock_agenda)
     monkeypatch.setattr(preflight_mod, "probe_sec", mock_sec)
@@ -2172,6 +2205,7 @@ async def test_watch_preflight_probe_runners_exclude_internal(monkeypatch: pytes
     assert mock_sec.await_count == 1
     assert mock_cnhk.await_count == 1
     assert mock_earnings.await_count == 1
+    assert order == ["agenda", "earnings", "sec", "cnhk"]
 
 
 @pytest.mark.asyncio
@@ -2702,3 +2736,1521 @@ async def test_stale_todos_dry_run_keeps_its_key_until_it_rides_a_wake(monkeypat
     assert second.should_wake is True, second
     assert "过期超过 30 天" in second.wake_context
     assert any("stale_todos" in str(k) for k in state.get("_woken_signal_keys") or [])
+
+
+_PREFLIGHT_WS = "22222222-2222-2222-2222-222222222222"
+_PREFLIGHT_USER = "local-dev-user"
+_PREFLIGHT_AUTO = "11111111-1111-1111-1111-111111111111"
+_SEC_ACCESSION = "0000320193-26-000010"
+_ALLOWED_PREFLIGHT_DECISIONS = frozenset({"wake", "skip", "passthrough"})
+
+
+def _company_watch_automation() -> dict[str, Any]:
+    return {
+        "automation_id": _PREFLIGHT_AUTO,
+        "name": "dalton-meta-watch",
+        "trigger_type": "cron",
+        "user_id": _PREFLIGHT_USER,
+        "workspace_id": _PREFLIGHT_WS,
+    }
+
+
+def _install_company_preflight_doubles(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    unwoken: list[dict[str, Any]] | None = None,
+    bump_results: list[int] | None = None,
+    watch_state_error: BaseException | None = None,
+    signal_save_error: BaseException | None = None,
+    fail_keys_once: set[str] | None = None,
+) -> dict[str, Any]:
+    """替身只覆盖公司预检会碰到的数据库和预算调用。"""
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            _REAL_GET_WORKSPACE,
+            return_value={"workspace_id": _PREFLIGHT_WS, "user_id": _PREFLIGHT_USER},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.dalton.budget.service.get_budget_today",
+        create_autospec(
+            _REAL_GET_BUDGET_TODAY,
+            return_value={"cap_usd": 45.0, "spent_usd": 0.0, "open_reserved_usd": 0.0},
+        ),
+    )
+
+    trace: list[tuple[str, Any]] = []
+    logs: list[dict[str, Any]] = []
+    claims: list[list[str]] = []
+    states: list[dict[str, Any]] = []
+    fail_once = {str(key) for key in (fail_keys_once or set())}
+
+    async def _upsert_signal(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        key = kwargs.get("signal_key")
+        trace.append(("signal", key))
+        if str(key) in fail_once:
+            fail_once.remove(str(key))
+            raise RuntimeError("signal insert failed")
+        if signal_save_error is not None:
+            raise signal_save_error
+        return (
+            {
+                "signal_id": f"sig-{len(trace)}",
+                "signal_key": kwargs.get("signal_key"),
+                "status": "pending",
+            },
+            True,
+        )
+
+    async def _claim(signal_ids: Any, execution_id: Any, **kwargs: Any) -> list[dict[str, str]]:
+        claimed = [str(item) for item in signal_ids]
+        claims.append(claimed)
+        return [{"signal_id": item} for item in claimed]
+
+    async def _log(**kwargs: Any) -> dict[str, Any]:
+        logs.append(dict(kwargs))
+        return {}
+
+    async def _save_state(workspace_id: Any, ticker: Any, state: Any, **kwargs: Any) -> dict[str, Any]:
+        copied = copy.deepcopy(state) if isinstance(state, dict) else {}
+        states.append(copied)
+        seen = copied.get("seen_accessions") if isinstance(copied.get("seen_accessions"), list) else []
+        trace.append(("state", list(seen)))
+        return {}
+
+    async def _load_state(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if watch_state_error is not None:
+            raise watch_state_error
+        return {}
+
+    upsert_signal = create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert_signal)
+    claim = create_autospec(_REAL_CLAIM_SIGNALS_WOKEN, side_effect=_claim)
+    save_state = create_autospec(_REAL_UPSERT_WATCH_STATE, side_effect=_save_state)
+    load_state = create_autospec(_REAL_GET_WATCH_STATE, side_effect=_load_state)
+    if bump_results is None:
+        bump = create_autospec(_REAL_BUMP_PREFLIGHT_TIMEOUT_STREAK, return_value=1)
+    else:
+        remaining_bumps = list(bump_results)
+
+        async def _bump(*args: Any, **kwargs: Any) -> int:
+            return remaining_bumps.pop(0)
+
+        bump = create_autospec(_REAL_BUMP_PREFLIGHT_TIMEOUT_STREAK, side_effect=_bump)
+    reset = create_autospec(_REAL_RESET_PREFLIGHT_TIMEOUT_STREAK, return_value=None)
+    mark = create_autospec(_REAL_MARK_PREFLIGHT_TIMEOUT_REMINDED, return_value=None)
+    list_unwoken = create_autospec(_REAL_LIST_UNWOKEN_SIGNALS, return_value=list(unwoken or []))
+    monkeypatch.setattr(watch_db, "upsert_signal", upsert_signal)
+    monkeypatch.setattr(watch_db, "claim_signals_woken", claim)
+    monkeypatch.setattr(watch_db, "insert_preflight_log", create_autospec(_REAL_INSERT_PREFLIGHT_LOG, side_effect=_log))
+    monkeypatch.setattr(watch_db, "upsert_watch_state", save_state)
+    monkeypatch.setattr(watch_db, "get_watch_state", load_state)
+    monkeypatch.setattr(watch_db, "expire_old_signals", create_autospec(_REAL_EXPIRE_OLD_SIGNALS, return_value=[]))
+    monkeypatch.setattr(watch_db, "list_unwoken_signals", list_unwoken)
+    monkeypatch.setattr(watch_db, "bump_preflight_timeout_streak", bump)
+    monkeypatch.setattr(watch_db, "reset_preflight_timeout_streak", reset)
+    monkeypatch.setattr(watch_db, "mark_preflight_timeout_reminded", mark)
+    monkeypatch.setattr(watch_db, "resolve_signals", create_autospec(_REAL_RESOLVE_SIGNALS, return_value=None))
+    return {
+        "trace": trace,
+        "logs": logs,
+        "claims": claims,
+        "states": states,
+        "bump": bump,
+        "reset": reset,
+        "mark": mark,
+        "claim": claim,
+        "save_state": save_state,
+        "list_unwoken": list_unwoken,
+    }
+
+
+def _patch_company_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sec: Any,
+    cnhk: Any,
+    agenda: Any = None,
+    earnings: Any = None,
+) -> None:
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    async def _empty(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    monkeypatch.setattr(
+        preflight_mod,
+        "probe_agenda",
+        create_autospec(probe_agenda, side_effect=_empty if agenda is None else agenda),
+    )
+    monkeypatch.setattr(
+        preflight_mod,
+        "probe_earnings",
+        create_autospec(probe_earnings, side_effect=_empty if earnings is None else earnings),
+    )
+    monkeypatch.setattr(preflight_mod, "probe_sec", create_autospec(probe_sec, side_effect=sec))
+    monkeypatch.setattr(preflight_mod, "probe_cnhk_filings", create_autospec(probe_cnhk_filings, side_effect=cnhk))
+
+
+@pytest.mark.asyncio
+async def test_company_timeout_saves_sec_signal_before_seen_watermark(monkeypatch: pytest.MonkeyPatch) -> None:
+    """超时前发现的 SEC 披露先落成信号。超时不再写已读水位，超时分支不返回、不领取。"""
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    filing_key = f"filing:{_SEC_ACCESSION}"
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["seen_accessions"] = [_SEC_ACCESSION]
+        state["last_sec_accession"] = _SEC_ACCESSION
+        signal = ProbeSignal(
+            probe="sec",
+            signal_key=filing_key,
+            priority="P0",
+            summary="META 新 SEC 披露：10-Q",
+            payload={"form": "10-Q", "accession_number": _SEC_ACCESSION},
+        )
+        return [signal], state
+
+    async def _hang(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec, cnhk=_hang)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-sec-timeout",
+        persist=True,
+        timeout_s=0.5,
+        agenda_doc_override={},
+    )
+
+    assert result.should_wake is False
+    assert result.decision == "skip"
+    assert result.reason == "preflight_timeout"
+    assert result.signals == []
+    assert "cnhk" in result.incomplete_probes
+    assert "sec" not in result.incomplete_probes
+    assert doubles["claim"].await_count == 0
+    assert doubles["list_unwoken"].await_count == 0
+    assert ("signal", filing_key) in doubles["trace"]
+    assert all(_SEC_ACCESSION not in seen for _kind, seen in doubles["trace"] if _kind == "state")
+    assert doubles["logs"][0]["decision"] == "skip"
+    assert doubles["logs"][0]["reason"] == "preflight_timeout"
+    assert doubles["logs"][0]["decision"] in _ALLOWED_PREFLIGHT_DECISIONS
+
+
+@pytest.mark.asyncio
+async def test_saved_sec_signal_is_claimed_on_the_next_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """已读水位已前移、探针不再报这条披露时，下次运行仍领取已保存的信号。"""
+    saved = {
+        "signal_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "probe": "sec",
+        "signal_key": f"filing:{_SEC_ACCESSION}",
+        "priority": "P0",
+        "summary": "META 新 SEC 披露：10-Q",
+        "payload": {"form": "10-Q", "accession_number": _SEC_ACCESSION},
+    }
+    doubles = _install_company_preflight_doubles(monkeypatch, unwoken=[saved])
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-sec-next",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert result.should_wake is True
+    assert result.decision == "wake"
+    assert any(item.get("signal_key") == saved["signal_key"] for item in result.signals)
+    assert doubles["claims"] == [[saved["signal_id"]]]
+    assert doubles["list_unwoken"].await_count == 1
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    assert preflight_mod.probe_sec.await_count == 1
+    assert result.decision in _ALLOWED_PREFLIGHT_DECISIONS
+
+
+@pytest.mark.asyncio
+async def test_sec_signal_save_failure_does_not_advance_seen_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """信号没写上时，随后的状态写回不得把这条披露标成已读。"""
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    doubles = _install_company_preflight_doubles(
+        monkeypatch,
+        signal_save_error=RuntimeError("signal insert failed"),
+    )
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["seen_accessions"] = [_SEC_ACCESSION]
+        state["last_sec_accession"] = _SEC_ACCESSION
+        signal = ProbeSignal(
+            probe="sec",
+            signal_key=f"filing:{_SEC_ACCESSION}",
+            priority="P0",
+            summary="META 新 SEC 披露：10-Q",
+            payload={"form": "10-Q", "accession_number": _SEC_ACCESSION},
+        )
+        return [signal], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec, cnhk=_quiet)
+    await preflight_check(
+        _company_watch_automation(),
+        "exec-sec-save-failed",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert all(_SEC_ACCESSION not in seen for _kind, seen in doubles["trace"] if _kind == "state")
+    assert all(_SEC_ACCESSION not in json.dumps(state, default=str) for state in doubles["states"])
+
+
+@pytest.mark.asyncio
+async def test_due_earnings_wakes_before_network_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """到期财报在网络之前就算完。网络挂起时这次不唤醒；财报不在未完成探针里。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": _PREFLIGHT_WS, "user_id": _PREFLIGHT_USER},
+        ),
+    )
+    started = {"sec": 0, "cnhk": 0}
+
+    async def _hang_sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        started["sec"] += 1
+        await asyncio.sleep(5)
+        return [], {}
+
+    async def _hang_cnhk(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        started["cnhk"] += 1
+        await asyncio.sleep(5)
+        return [], {}
+
+    monkeypatch.setattr(preflight_mod, "probe_sec", create_autospec(probe_sec, side_effect=_hang_sec))
+    monkeypatch.setattr(
+        preflight_mod,
+        "probe_cnhk_filings",
+        create_autospec(probe_cnhk_filings, side_effect=_hang_cnhk),
+    )
+    earn_on = datetime.now(ZoneInfo("Asia/Shanghai")).date() + timedelta(days=2)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-earnings-before-network",
+        persist=False,
+        timeout_s=0.4,
+        agenda_doc_override={},
+        watch_state_override={
+            "next_earnings_date": earn_on.isoformat(),
+            "next_earnings_period": "2026Q3",
+        },
+    )
+
+    assert result.should_wake is False
+    assert result.decision == "skip"
+    assert result.reason == "preflight_timeout"
+    assert started["sec"] >= 1
+    assert "earnings" not in result.incomplete_probes
+
+
+@pytest.mark.asyncio
+async def test_saved_local_earnings_signal_is_claimed_on_the_next_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T+1 财报信号在网络超时前已保存且不领取。T+2 探针不再生成时，正常完成仍领取并唤醒。"""
+    saved_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    earn_key = _due_earnings_signal().signal_key
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        probe_name = str(kwargs.get("probe") or "")
+        signal_key = str(kwargs.get("signal_key") or "")
+        doubles["trace"].append(("signal", signal_key))
+        pair = (probe_name, signal_key)
+        row = saved_rows.get(pair)
+        if row is None:
+            row = {
+                "signal_id": f"sig-kept-{len(saved_rows) + 1}",
+                "probe": probe_name,
+                "signal_key": signal_key,
+                "priority": kwargs.get("priority") or "P1",
+                "summary": kwargs.get("summary") or "",
+                "payload": dict(kwargs.get("payload") or {}),
+                "status": "pending",
+            }
+            saved_rows[pair] = row
+        return dict(row), True
+
+    async def _list(workspace_id: Any, ticker: Any = None) -> list[dict[str, Any]]:
+        return [dict(row) for row in saved_rows.values()]
+
+    listed = create_autospec(_REAL_LIST_UNWOKEN_SIGNALS, side_effect=_list)
+    monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert))
+    monkeypatch.setattr(watch_db, "list_unwoken_signals", listed)
+
+    phase = {"day": 1}
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        if phase["day"] == 1:
+            return [_due_earnings_signal()], state
+        return [], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _hang_then_quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        if phase["day"] == 1:
+            await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_hang_then_quiet, earnings=_earnings)
+    timed_out = await preflight_check(
+        _company_watch_automation(),
+        "exec-local-window-timeout",
+        persist=True,
+        timeout_s=0.4,
+        agenda_doc_override={},
+    )
+
+    assert timed_out.should_wake is False
+    assert timed_out.decision == "skip"
+    assert timed_out.reason == "preflight_timeout"
+    assert timed_out.signals == []
+    assert "earnings" not in timed_out.incomplete_probes
+    assert "cnhk" in timed_out.incomplete_probes
+    assert doubles["claim"].await_count == 0
+    assert listed.await_count == 0
+    assert [key for kind, key in doubles["trace"] if kind == "signal"] == [earn_key]
+    assert saved_rows[("earnings", earn_key)]["signal_id"] == "sig-kept-1"
+
+    phase["day"] = 2
+    finished = await preflight_check(
+        _company_watch_automation(),
+        "exec-local-window-next",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert finished.should_wake is True
+    assert finished.decision == "wake"
+    assert [item.get("signal_key") for item in finished.signals] == [earn_key]
+    assert finished.signals[0]["signal_id"] == "sig-kept-1"
+    assert doubles["claims"] == [["sig-kept-1"]]
+    assert listed.await_count == 1
+    assert [key for kind, key in doubles["trace"] if kind == "signal"] == [earn_key]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_timeouts_wake_once_and_success_clears_the_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连续超时只记次数并跳过，不领取。完整成功后清零。"""
+    from src.dalton.settings import DaltonAutonomyConfig, get_dalton_settings
+
+    assert DaltonAutonomyConfig.model_fields["preflight_timeout_streak"].default == 3
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    doubles = _install_company_preflight_doubles(monkeypatch, bump_results=[1, 2, 3, 4])
+    hang = {"cnhk": True}
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        if hang["cnhk"]:
+            await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk)
+
+    async def _run(execution_id: str, *, timeout: bool) -> Any:
+        return await preflight_check(
+            _company_watch_automation(),
+            execution_id,
+            persist=True,
+            timeout_s=0.5 if timeout else None,
+            agenda_doc_override={},
+        )
+
+    first = await _run("exec-streak-1", timeout=True)
+    second = await _run("exec-streak-2", timeout=True)
+    third = await _run("exec-streak-3", timeout=True)
+
+    assert first.should_wake is False and first.reason == "preflight_timeout"
+    assert second.should_wake is False and second.reason == "preflight_timeout"
+    assert third.should_wake is False and third.reason == "preflight_timeout"
+    assert first.signals == [] and second.signals == [] and third.signals == []
+    assert doubles["claims"] == []
+    assert doubles["claim"].await_count == 0
+    assert doubles["list_unwoken"].await_count == 0
+    assert doubles["mark"].await_count == 0
+    assert doubles["bump"].await_count == 3
+    assert doubles["reset"].await_count == 0
+
+    hang["cnhk"] = False
+    success = await _run("exec-streak-ok", timeout=False)
+    assert success.should_wake is False
+    assert success.reason == "no_new_signals"
+    assert doubles["reset"].await_count == 1
+    assert doubles["bump"].await_count == 3
+
+    hang["cnhk"] = True
+    fourth = await _run("exec-streak-4", timeout=True)
+    assert fourth.should_wake is False
+    assert fourth.reason == "preflight_timeout"
+    assert doubles["bump"].await_count == 4
+    assert doubles["reset"].await_count == 1
+    assert doubles["claims"] == []
+    assert [item["decision"] for item in doubles["logs"]] == [
+        "skip",
+        "skip",
+        "skip",
+        "skip",
+        "skip",
+    ]
+    assert [item["reason"] for item in doubles["logs"]] == [
+        "preflight_timeout",
+        "preflight_timeout",
+        "preflight_timeout",
+        "no_new_signals",
+        "preflight_timeout",
+    ]
+    assert all(item["decision"] in _ALLOWED_PREFLIGHT_DECISIONS for item in doubles["logs"])
+    assert all(item["decision"] != "preflight_timeout" for item in doubles["logs"])
+
+
+@pytest.mark.asyncio
+async def test_timeout_streak_bump_and_reset_use_atomic_sql(monkeypatch: pytest.MonkeyPatch) -> None:
+    """两次超时各发一条带 jsonb_set 与 + 1 的语句，参数里没有客户端算好的计数。"""
+    from psycopg import AsyncConnection
+
+    from src.dalton.database import watch as watch_mod
+
+    class _ExecCursorProto:
+        async def __aenter__(self) -> Any: ...  # noqa: E704
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any: ...  # noqa: E704
+        async def execute(self, query: Any, params: Any = None) -> Any: ...  # noqa: E704
+        async def fetchone(self) -> Any: ...  # noqa: E704
+
+    executed: list[tuple[str, tuple[Any, ...]]] = []
+    cursor = create_autospec(_ExecCursorProto, instance=True)
+    cursor.__aenter__.return_value = cursor
+    cursor.__aexit__.return_value = None
+
+    async def _execute(query: Any, params: Any = None) -> None:
+        executed.append((" ".join(str(query).split()), tuple(params or ())))
+
+    cursor.execute.side_effect = _execute
+    streak_rows = iter(({"streak": 1}, {"streak": 2}))
+
+    async def _fetchone() -> dict[str, int]:
+        return next(streak_rows)
+
+    cursor.fetchone.side_effect = _fetchone
+    connection = create_autospec(AsyncConnection, instance=True)
+    connection.cursor.return_value = cursor
+
+    class _ConnCtx:
+        async def __aenter__(self) -> Any:
+            return connection
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        watch_mod,
+        "get_db_connection",
+        create_autospec(watch_mod.get_db_connection, side_effect=lambda: _ConnCtx()),
+    )
+
+    first = await watch_mod.bump_preflight_timeout_streak(_PREFLIGHT_WS, _PREFLIGHT_AUTO, "META")
+    second = await watch_mod.bump_preflight_timeout_streak(_PREFLIGHT_WS, _PREFLIGHT_AUTO, "META")
+    assert (first, second) == (1, 2)
+    assert len(executed) == 2
+    assert executed[0][0] == executed[1][0]
+    for sql, params in executed:
+        assert sql.startswith("INSERT")
+        assert "ON CONFLICT (workspace_id) DO UPDATE" in sql
+        assert "jsonb_set" in sql
+        assert "+ 1" in sql
+        assert "cycle_started_at" in sql
+        assert "to_jsonb(NOW())" in sql
+        assert "NULLIF" in sql
+        assert "ELSE to_jsonb(NOW())" in sql
+        assert "ELSE 'null'::jsonb" not in sql
+        assert "reminded" in sql
+        assert "SELECT" not in sql
+        assert len(params) == 23
+        assert params.count(_PREFLIGHT_AUTO) == 21
+        assert not any(isinstance(param, int) for param in params)
+        assert _PREFLIGHT_AUTO in params
+
+    await watch_mod.reset_preflight_timeout_streak(_PREFLIGHT_WS, _PREFLIGHT_AUTO)
+    reset_sql, reset_params = executed[2]
+    assert reset_sql.startswith("UPDATE")
+    assert "jsonb_set" in reset_sql
+    assert " - %s::text" in reset_sql
+    assert "+ 1" not in reset_sql
+    assert "SELECT" not in reset_sql
+    assert not any(isinstance(param, int) for param in reset_params)
+
+    cycle = "2026-04-01T00:00:00+00:00"
+    await watch_mod.mark_preflight_timeout_reminded(_PREFLIGHT_WS, _PREFLIGHT_AUTO, cycle)
+    mark_sql, mark_params = executed[3]
+    assert mark_sql.startswith("UPDATE")
+    assert "reminded" in mark_sql
+    assert "cycle_started_at" in mark_sql
+    assert "SELECT" not in mark_sql
+    assert cycle in mark_params
+    assert mark_params.count(_PREFLIGHT_AUTO) == 2
+
+
+@pytest.mark.asyncio
+async def test_legacy_integer_streak_reminds_on_the_next_run_then_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧整数已达阈值。再超时后保留次数并补上周期，下一次开头提醒，成功后清零。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    cycle = "2026-04-02T03:00:00+00:00"
+    store: dict[str, Any] = {"preflight_timeout_streaks": {_PREFLIGHT_AUTO: 3}}
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _load(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(store)
+
+    async def _bump(workspace_id: Any, automation_id: Any, ticker: Any = None) -> int:
+        key = str(automation_id or "").strip() or "_"
+        streaks = store.setdefault("preflight_timeout_streaks", {})
+        entry = streaks.get(key)
+        reminded = False
+        kept_cycle = ""
+        if isinstance(entry, int) and not isinstance(entry, bool):
+            previous = entry
+        elif isinstance(entry, dict):
+            try:
+                previous = int(entry.get("streak") or 0)
+            except (TypeError, ValueError):
+                previous = 0
+            raw_cycle = entry.get("cycle_started_at")
+            kept_cycle = str(raw_cycle).strip() if raw_cycle is not None else ""
+            if kept_cycle.lower() == "null":
+                kept_cycle = ""
+            reminded = entry.get("reminded") is True
+        else:
+            previous = 0
+        new_streak = previous + 1
+        if previous == 0 or not kept_cycle:
+            streaks[key] = {
+                "streak": new_streak,
+                "cycle_started_at": cycle,
+                "reminded": False,
+            }
+        else:
+            streaks[key] = {
+                "streak": new_streak,
+                "cycle_started_at": kept_cycle,
+                "reminded": reminded,
+            }
+        return new_streak
+
+    async def _reset(workspace_id: Any, automation_id: Any) -> None:
+        key = str(automation_id or "").strip() or "_"
+        streaks = store.get("preflight_timeout_streaks")
+        if isinstance(streaks, dict):
+            streaks.pop(key, None)
+
+    monkeypatch.setattr(
+        watch_db,
+        "get_watch_state",
+        create_autospec(_REAL_GET_WATCH_STATE, side_effect=_load),
+    )
+    bump = create_autospec(_REAL_BUMP_PREFLIGHT_TIMEOUT_STREAK, side_effect=_bump)
+    reset = create_autospec(_REAL_RESET_PREFLIGHT_TIMEOUT_STREAK, side_effect=_reset)
+    monkeypatch.setattr(watch_db, "bump_preflight_timeout_streak", bump)
+    monkeypatch.setattr(watch_db, "reset_preflight_timeout_streak", reset)
+
+    hang = {"cnhk": True}
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        if hang["cnhk"]:
+            await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk)
+    timed_out = await preflight_check(
+        _company_watch_automation(),
+        "exec-legacy-timeout",
+        persist=True,
+        timeout_s=0.4,
+        agenda_doc_override={},
+    )
+
+    assert timed_out.should_wake is False
+    assert timed_out.reason == "preflight_timeout"
+    assert doubles["claim"].await_count == 0
+    assert doubles["mark"].await_count == 0
+    assert bump.await_count == 1
+    assert reset.await_count == 0
+    assert store["preflight_timeout_streaks"][_PREFLIGHT_AUTO] == {
+        "streak": 4,
+        "cycle_started_at": cycle,
+        "reminded": False,
+    }
+
+    hang["cnhk"] = False
+    reminded = await preflight_check(
+        _company_watch_automation(),
+        "exec-legacy-remind",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert reminded.should_wake is True
+    assert reminded.decision == "wake"
+    assert reminded.signals[0]["signal_key"] == _reminder_key(cycle)
+    assert reminded.signals[0]["summary"] == "预检连续 4 次超时，需要检查数据源"
+    assert reminded.signals[0]["payload"]["streak"] == 4
+    assert doubles["mark"].await_count == 1
+    assert doubles["mark"].await_args.args[2] == cycle
+    assert reset.await_count == 1
+    assert _PREFLIGHT_AUTO not in store["preflight_timeout_streaks"]
+    assert bump.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_watch_state_read_failure_does_not_write_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """跟踪状态读失败时不写回，也不把超时计数清成 0。"""
+    doubles = _install_company_preflight_doubles(
+        monkeypatch,
+        watch_state_error=RuntimeError("watch state unreadable"),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-read-failed",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert result.decision == "skip"
+    assert result.reason == "no_new_signals"
+    assert doubles["save_state"].await_count == 0
+    assert doubles["reset"].await_count == 0
+    assert doubles["bump"].await_count == 0
+    assert result.decision in _ALLOWED_PREFLIGHT_DECISIONS
+
+
+def _due_earnings_signal() -> Any:
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    return ProbeSignal(
+        probe="earnings",
+        signal_key="earnings:2026Q3:T-3",
+        priority="P0",
+        summary="财报将于 2 天后发布",
+        payload={"window": "T-3"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_claimed_wake_survives_a_later_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """探针已经返回后，领取里的等待长于预检超时，领取仍完成并带回唤醒。"""
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _hang_claim(signal_ids: Any, execution_id: Any, **kwargs: Any) -> list[dict[str, str]]:
+        await asyncio.sleep(0.4)
+        claimed = [str(item) for item in signal_ids]
+        doubles["claims"].append(claimed)
+        return [{"signal_id": item} for item in claimed]
+
+    claim = create_autospec(_REAL_CLAIM_SIGNALS_WOKEN, side_effect=_hang_claim)
+    monkeypatch.setattr(watch_db, "claim_signals_woken", claim)
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [_due_earnings_signal()], dict(kwargs.get("watch_state") or {})
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_earnings)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-claim-outside-timeout",
+        persist=True,
+        timeout_s=0.1,
+        agenda_doc_override={},
+    )
+
+    assert result.should_wake is True
+    assert result.decision == "wake"
+    assert any(item.get("probe") == "earnings" for item in result.signals)
+    assert claim.await_count == 1
+    assert len(doubles["claims"]) == 1
+    assert doubles["reset"].await_count == 1
+    assert any(item["decision"] == "wake" for item in doubles["logs"])
+    assert all(item["decision"] in _ALLOWED_PREFLIGHT_DECISIONS for item in doubles["logs"])
+
+
+@pytest.mark.asyncio
+async def test_local_wake_survives_historical_filing_triage_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """历史披露的分诊超时只丢下那些披露。本地到期项仍由同一次收尾领取。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    historical_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    historical = {
+        "signal_id": historical_id,
+        "probe": "sec",
+        "signal_key": "filing:0000320193-26-000099",
+        "priority": "P1",
+        "summary": "META 8-K",
+        "payload": {"form": "8-K", "items": ["1.01"]},
+    }
+    doubles = _install_company_preflight_doubles(monkeypatch, unwoken=[historical])
+
+    async def _hang_triage(**kwargs: Any) -> tuple[list[Any], list[Any], str]:
+        await asyncio.sleep(5)
+        return [], [], "hung"
+
+    monkeypatch.setattr(
+        preflight_mod,
+        "_triage_signals_with_llm",
+        create_autospec(preflight_mod._triage_signals_with_llm, side_effect=_hang_triage),
+    )
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [_due_earnings_signal()], dict(kwargs.get("watch_state") or {})
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_earnings)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-triage-timeout",
+        persist=True,
+        timeout_s=1.0,
+        agenda_doc_override={},
+    )
+
+    claimed = [item for batch in doubles["claims"] for item in batch]
+    assert result.should_wake is True
+    assert result.decision == "wake"
+    assert any(item.get("probe") == "earnings" for item in result.signals)
+    assert all(item.get("signal_key") != historical["signal_key"] for item in result.signals)
+    assert historical_id not in claimed
+    assert doubles["list_unwoken"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_local_wake_keeps_finished_network_signal_when_later_probe_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """后面的探针挂起时不领取、不唤醒。已完成的 SEC 信号留在库里，已读水位不前移。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    filing_key = f"filing:{_SEC_ACCESSION}"
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [_due_earnings_signal()], dict(kwargs.get("watch_state") or {})
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["seen_accessions"] = [_SEC_ACCESSION]
+        state["last_sec_accession"] = _SEC_ACCESSION
+        return [
+            ProbeSignal(
+                probe="sec",
+                signal_key=filing_key,
+                priority="P0",
+                summary="META 新 SEC 披露：10-Q",
+                payload={"form": "10-Q", "accession_number": _SEC_ACCESSION},
+            )
+        ], state
+
+    async def _hang(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec, cnhk=_hang, earnings=_earnings)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-local-and-sec",
+        persist=True,
+        timeout_s=0.6,
+        agenda_doc_override={},
+    )
+
+    assert result.should_wake is False
+    assert result.decision == "skip"
+    assert result.reason == "preflight_timeout"
+    assert doubles["claim"].await_count == 0
+    assert doubles["claims"] == []
+    assert ("signal", filing_key) in doubles["trace"]
+    assert all(_SEC_ACCESSION not in seen for _kind, seen in doubles["trace"] if _kind == "state")
+    assert preflight_mod.probe_sec.await_count >= 1
+    assert "cnhk" in result.incomplete_probes
+    assert "sec" not in result.incomplete_probes
+    assert "earnings" not in result.incomplete_probes
+    assert doubles["reset"].await_count == 0
+
+
+@pytest.mark.asyncio
+def _timeout_cycle_state(streak: int, cycle: str, *, reminded: bool = False) -> dict[str, Any]:
+    return {
+        "preflight_timeout_streaks": {
+            _PREFLIGHT_AUTO: {
+                "streak": streak,
+                "cycle_started_at": cycle,
+                "reminded": reminded,
+            }
+        }
+    }
+
+
+def _reminder_key(cycle: str) -> str:
+    return f"preflight_timeout_streak:{_PREFLIGHT_AUTO}:{cycle}"
+
+
+@pytest.mark.asyncio
+async def test_timeout_reminder_is_claimed_on_the_next_completed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """连续超时达到阈值后，下一次完整跑完带出提醒。另一周期也能提醒；本周期不重复。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    cycle_a = "2026-04-01T00:00:00+00:00"
+    cycle_b = "2026-05-01T00:00:00+00:00"
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+
+    async def _run(execution_id: str, state: dict[str, Any]) -> Any:
+        return await preflight_check(
+            _company_watch_automation(),
+            execution_id,
+            persist=True,
+            agenda_doc_override={},
+            watch_state_override=state,
+        )
+
+    first = await _run("exec-remind-a", _timeout_cycle_state(3, cycle_a))
+    assert first.should_wake is True
+    assert first.decision == "wake"
+    assert first.signals[0]["signal_key"] == _reminder_key(cycle_a)
+    assert first.signals[0]["summary"] == "预检连续 3 次超时，需要检查数据源"
+    assert first.signals[0]["payload"]["kind"] == "preflight_timeout_streak"
+    assert first.signals[0]["payload"]["cycle_started_at"] == cycle_a
+    assert len(doubles["claims"]) == 1
+    assert doubles["mark"].await_count == 1
+    assert doubles["mark"].await_args.args[1] == _PREFLIGHT_AUTO
+    assert doubles["mark"].await_args.args[2] == cycle_a
+
+    second = await _run("exec-remind-b", _timeout_cycle_state(5, cycle_b))
+    assert second.should_wake is True
+    assert second.signals[0]["signal_key"] == _reminder_key(cycle_b)
+    assert second.signals[0]["summary"] == "预检连续 5 次超时，需要检查数据源"
+    assert len(doubles["claims"]) == 2
+    assert doubles["mark"].await_count == 2
+    assert doubles["mark"].await_args.args[2] == cycle_b
+
+    quiet = await _run("exec-remind-again", _timeout_cycle_state(3, cycle_a, reminded=True))
+    assert quiet.should_wake is False
+    assert quiet.reason == "no_new_signals"
+    assert doubles["mark"].await_count == 2
+    assert len(doubles["claims"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_timeout_reminder_retries_when_its_own_run_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """提醒所在的那次又超时，不记已提醒。下一次完整跑完仍用同一去重键补发。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    cycle = "2026-04-01T00:00:00+00:00"
+    key = _reminder_key(cycle)
+    doubles = _install_company_preflight_doubles(monkeypatch, fail_keys_once={key})
+    hang = {"cnhk": True}
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        if hang["cnhk"]:
+            await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk)
+    state = _timeout_cycle_state(3, cycle)
+
+    timed_out = await preflight_check(
+        _company_watch_automation(),
+        "exec-remind-timeout",
+        persist=True,
+        timeout_s=0.4,
+        agenda_doc_override={},
+        watch_state_override=state,
+    )
+    assert timed_out.should_wake is False
+    assert timed_out.reason == "preflight_timeout"
+    assert doubles["claim"].await_count == 0
+    assert doubles["mark"].await_count == 0
+
+    hang["cnhk"] = False
+    failed_save = await preflight_check(
+        _company_watch_automation(),
+        "exec-remind-save-fail",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=state,
+    )
+    assert failed_save.should_wake is False
+    assert failed_save.reason == "no_new_signals"
+    assert doubles["mark"].await_count == 0
+    assert doubles["reset"].await_count == 0
+    assert [item for kind, item in doubles["trace"] if kind == "signal" and item == key] == [key]
+
+    sent = await preflight_check(
+        _company_watch_automation(),
+        "exec-remind-retry",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=state,
+    )
+    assert sent.should_wake is True
+    assert sent.signals[0]["signal_key"] == key
+    assert "exec-remind-" not in key
+    assert len(doubles["claims"]) == 1
+    assert doubles["mark"].await_count == 1
+    assert doubles["reset"].await_count == 1
+    assert [item for kind, item in doubles["trace"] if kind == "signal" and item == key] == [key, key]
+
+
+@pytest.mark.asyncio
+async def test_already_woken_timeout_reminder_marks_the_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """提醒行已经领取过时，仍记下本周期已提醒，避免下次反复重试。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    cycle = "2026-04-01T00:00:00+00:00"
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        key = str(kwargs.get("signal_key") or "")
+        return (
+            {"signal_id": "sig-old", "signal_key": key, "status": "woken"},
+            not key.startswith("preflight_timeout_streak:"),
+        )
+
+    monkeypatch.setattr(
+        watch_db,
+        "upsert_signal",
+        create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-remind-already",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=_timeout_cycle_state(3, cycle),
+    )
+
+    assert result.should_wake is False
+    assert result.reason == "no_new_signals"
+    assert doubles["claim"].await_count == 0
+    assert doubles["mark"].await_count == 1
+    assert doubles["mark"].await_args.args[2] == cycle
+
+
+@pytest.mark.asyncio
+async def test_expired_unclaimed_timeout_reminder_retries_until_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """过期且从未领取的提醒不算已提醒。新后缀被本次领取后才标记本周期。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    cycle = "2026-04-01T00:00:00+00:00"
+    base_key = _reminder_key(cycle)
+    retry_key = f"{base_key}:retry:1"
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    block_claim = {"on": True}
+    recorded: list[list[str]] = []
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        key = str(kwargs.get("signal_key") or "")
+        doubles["trace"].append(("signal", key))
+        if key == base_key:
+            return (
+                {
+                    "signal_id": "sig-expired",
+                    "signal_key": key,
+                    "status": "expired",
+                    "expired_at": "2026-04-08T00:00:00+00:00",
+                },
+                False,
+            )
+        if key == retry_key:
+            return (
+                {"signal_id": "sig-retry-1", "signal_key": key, "status": "pending"},
+                True,
+            )
+        return ({"signal_id": "sig-other", "signal_key": key, "status": "pending"}, True)
+
+    async def _claim(signal_ids: Any, execution_id: Any, **kwargs: Any) -> list[dict[str, str]]:
+        ids = [str(item) for item in signal_ids]
+        recorded.append(ids)
+        if block_claim["on"]:
+            return []
+        return [{"signal_id": item} for item in ids]
+
+    monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert))
+    monkeypatch.setattr(
+        watch_db,
+        "claim_signals_woken",
+        create_autospec(_REAL_CLAIM_SIGNALS_WOKEN, side_effect=_claim),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+
+    async def _run(execution_id: str) -> Any:
+        return await preflight_check(
+            _company_watch_automation(),
+            execution_id,
+            persist=True,
+            agenda_doc_override={},
+            watch_state_override=_timeout_cycle_state(3, cycle),
+        )
+
+    blocked = await _run("exec-expired-unclaimed")
+    assert blocked.should_wake is False
+    assert blocked.reason == "already_claimed_by_concurrent_run"
+    assert recorded == [["sig-retry-1"]]
+    assert "sig-expired" not in recorded[0]
+    assert doubles["mark"].await_count == 0
+    assert doubles["reset"].await_count == 0
+    assert [key for kind, key in doubles["trace"] if kind == "signal"] == [base_key, retry_key]
+
+    block_claim["on"] = False
+    sent = await _run("exec-expired-retry-claimed")
+    assert sent.should_wake is True
+    assert sent.decision == "wake"
+    assert sent.signals[0]["signal_key"] == retry_key
+    assert sent.signals[0]["signal_id"] == "sig-retry-1"
+    assert sent.signals[0]["summary"] == "预检连续 3 次超时，需要检查数据源"
+    assert recorded == [["sig-retry-1"], ["sig-retry-1"]]
+    assert doubles["mark"].await_count == 1
+    assert doubles["mark"].await_args.args[2] == cycle
+    assert doubles["reset"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_reminder_recovers_after_every_fixed_retry_key_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """原键与五个固定后缀都已过期未领取时，本次运行另起一个键，仍能领取并清零。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    cycle = "2026-04-01T00:00:00+00:00"
+    base_key = _reminder_key(cycle)
+    fixed = {base_key} | {f"{base_key}:retry:{n}" for n in range(1, 6)}
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    recorded: list[list[str]] = []
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        key = str(kwargs.get("signal_key") or "")
+        doubles["trace"].append(("signal", key))
+        if key in fixed:
+            return ({"signal_id": f"closed-{key[-1]}", "signal_key": key, "status": "expired"}, False)
+        return ({"signal_id": "sig-run-key", "signal_key": key, "status": "pending"}, True)
+
+    async def _claim(signal_ids: Any, execution_id: Any, **kwargs: Any) -> list[dict[str, str]]:
+        ids = [str(item) for item in signal_ids]
+        recorded.append(ids)
+        return [{"signal_id": item} for item in ids]
+
+    monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert))
+    monkeypatch.setattr(
+        watch_db,
+        "claim_signals_woken",
+        create_autospec(_REAL_CLAIM_SIGNALS_WOKEN, side_effect=_claim),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+
+    sent = await preflight_check(
+        _company_watch_automation(),
+        "exec-run-key",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=_timeout_cycle_state(3, cycle),
+    )
+    assert sent.should_wake is True
+    assert recorded == [["sig-run-key"]]
+    keys = [key for kind, key in doubles["trace"] if kind == "signal"]
+    assert keys[:6] == [base_key] + [f"{base_key}:retry:{n}" for n in range(1, 6)]
+    assert keys[6].startswith(f"{base_key}:retry:2") and len(keys) == 7
+    assert doubles["mark"].await_count == 1
+    assert doubles["reset"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reminder_someone_resolved_settles_the_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """有人已手动处理（resolved）的提醒算本周期已提醒，不再另起重试键。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    cycle = "2026-04-01T00:00:00+00:00"
+    base_key = _reminder_key(cycle)
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        key = str(kwargs.get("signal_key") or "")
+        doubles["trace"].append(("signal", key))
+        return ({"signal_id": "sig-resolved", "signal_key": key, "status": "resolved"}, False)
+
+    monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert))
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-resolved",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=_timeout_cycle_state(3, cycle),
+    )
+    assert result.should_wake is False
+    assert [key for kind, key in doubles["trace"] if kind == "signal"] == [base_key]
+    assert doubles["mark"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_streak_resets_only_after_every_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """预算耗尽、探针未完成、本地唤醒后网络挂起都不清零；全部探针跑完才清零。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    budget = {"exhausted": False}
+    hang = {"cnhk": False}
+    earn = {"on": False}
+
+    async def _budget(*args: Any, **kwargs: Any) -> dict[str, float]:
+        if budget["exhausted"]:
+            return {"cap_usd": 45.0, "spent_usd": 45.0, "open_reserved_usd": 0.0}
+        return {"cap_usd": 45.0, "spent_usd": 0.0, "open_reserved_usd": 0.0}
+
+    monkeypatch.setattr(
+        "src.dalton.budget.service.get_budget_today",
+        create_autospec(_REAL_GET_BUDGET_TODAY, side_effect=_budget),
+    )
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        if not earn["on"]:
+            return [], state
+        return [_due_earnings_signal()], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        if hang["cnhk"]:
+            await asyncio.sleep(5)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk, earnings=_earnings)
+
+    budget["exhausted"] = True
+    skipped = await preflight_check(
+        _company_watch_automation(),
+        "exec-budget",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert skipped.should_wake is False
+    assert skipped.reason == "budget_exhausted"
+    assert doubles["reset"].await_count == 0
+    assert preflight_mod.probe_sec.await_count == 0
+
+    budget["exhausted"] = False
+    hang["cnhk"] = True
+    timed_out = await preflight_check(
+        _company_watch_automation(),
+        "exec-incomplete",
+        persist=True,
+        timeout_s=0.4,
+        agenda_doc_override={},
+    )
+    assert timed_out.should_wake is False
+    assert timed_out.reason == "preflight_timeout"
+    assert doubles["reset"].await_count == 0
+
+    hang["cnhk"] = False
+    finished = await preflight_check(
+        _company_watch_automation(),
+        "exec-complete",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert finished.should_wake is False
+    assert finished.reason == "no_new_signals"
+    assert doubles["reset"].await_count == 1
+
+    earn["on"] = True
+    hang["cnhk"] = True
+    local_wake = await preflight_check(
+        _company_watch_automation(),
+        "exec-local-hang",
+        persist=True,
+        timeout_s=0.4,
+        agenda_doc_override={},
+    )
+    assert local_wake.should_wake is False
+    assert local_wake.reason == "preflight_timeout"
+    assert doubles["claim"].await_count == 0
+    assert doubles["reset"].await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_backoff_probe_does_not_reset_timeout_streak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """退避中的探针没有请求网络。这次预检不算完整跑完，不清零连续超时计数。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+    not_before = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-backoff-no-reset",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={
+            "probe_backoff": {
+                "sec": {"not_before": not_before, "attempt": 1},
+            }
+        },
+    )
+
+    assert result.should_wake is False
+    assert result.reason == "no_new_signals"
+    assert doubles["reset"].await_count == 0
+    assert preflight_mod.probe_sec.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_degraded_or_partial_probe_does_not_reset_timeout_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC 降级、巨潮部分结果、巨潮降级都不是完整成功，不清零。"""
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _sec_degraded(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["sec_probe_degraded"] = True
+        return [], state
+
+    async def _cnhk_partial(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["cnhk_probe_partial"] = True
+        state["cnhk_probe_degraded"] = False
+        return [], state
+
+    async def _cnhk_degraded(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["cnhk_probe_degraded"] = True
+        return [], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [_due_earnings_signal()], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec_degraded, cnhk=_quiet, earnings=_earnings)
+    degraded = await preflight_check(
+        _company_watch_automation(),
+        "exec-sec-degraded",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert degraded.should_wake is True
+    assert any(item.get("probe") == "earnings" for item in degraded.signals)
+    assert doubles["reset"].await_count == 0
+    assert len(doubles["claims"]) == 1
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_partial)
+    partial = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-partial",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert partial.should_wake is False
+    assert partial.reason == "no_new_signals"
+    assert doubles["reset"].await_count == 0
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_degraded)
+    cnhk_bad = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-degraded",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert cnhk_bad.should_wake is False
+    assert doubles["reset"].await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_one_preflight_claims_reminder_and_saved_signal_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一次完整预检只领取一次，提醒和已保存披露在同一批里。"""
+    from src.dalton.settings import get_dalton_settings
+
+    monkeypatch.setattr(get_dalton_settings().autonomy, "preflight_timeout_streak", 3)
+    saved_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    saved = {
+        "signal_id": saved_id,
+        "probe": "sec",
+        "signal_key": f"filing:{_SEC_ACCESSION}",
+        "priority": "P0",
+        "summary": "META 新 SEC 披露：10-Q",
+        "payload": {"form": "10-Q", "accession_number": _SEC_ACCESSION},
+    }
+    doubles = _install_company_preflight_doubles(monkeypatch, unwoken=[saved])
+    cycle = "2026-04-01T00:00:00+00:00"
+
+    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [_due_earnings_signal()], dict(kwargs.get("watch_state") or {})
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_earnings)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-one-claim",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=_timeout_cycle_state(3, cycle),
+    )
+
+    assert result.should_wake is True
+    assert len(doubles["claims"]) == 1
+    claimed = doubles["claims"][0]
+    assert saved_id in claimed
+    assert any(item.get("probe") == "earnings" for item in result.signals)
+    assert any(
+        isinstance(item.get("payload"), dict) and item["payload"].get("kind") == "preflight_timeout_streak"
+        for item in result.signals
+    )
+    assert doubles["list_unwoken"].await_count == 1
+    assert doubles["mark"].await_count == 1
+    assert all(item.get("signal_id") in claimed for item in result.signals if item.get("signal_id"))
+
+
+@pytest.mark.asyncio
+async def test_successful_run_writes_sec_signal_before_seen_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """完整跑完时，含该 accession 的状态写入都在信号写入之后。"""
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    filing_key = f"filing:{_SEC_ACCESSION}"
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["seen_accessions"] = [_SEC_ACCESSION]
+        state["last_sec_accession"] = _SEC_ACCESSION
+        return [
+            ProbeSignal(
+                probe="sec",
+                signal_key=filing_key,
+                priority="P0",
+                summary="META 新 SEC 披露：10-Q",
+                payload={"form": "10-Q", "accession_number": _SEC_ACCESSION},
+            )
+        ], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec, cnhk=_quiet)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-sec-success",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    signal_at = doubles["trace"].index(("signal", filing_key))
+    seen_writes = [
+        index
+        for index, item in enumerate(doubles["trace"])
+        if item[0] == "state" and _SEC_ACCESSION in item[1]
+    ]
+    assert result.should_wake is True
+    assert seen_writes
+    assert all(signal_at < index for index in seen_writes)

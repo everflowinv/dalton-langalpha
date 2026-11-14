@@ -203,7 +203,8 @@ def _recording_conn(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple[An
 
 
 @pytest.mark.asyncio
-async def test_upsert_watch_state_company_sql_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_upsert_watch_state_company_preserves_timeout_streak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """公司整份状态替换不得盖掉原子超时计数，也不写入行业列。"""
     from src.dalton.database import watch as watch_db
 
     executed = _recording_conn(monkeypatch)
@@ -213,12 +214,17 @@ async def test_upsert_watch_state_company_sql_unchanged(monkeypatch: pytest.Monk
         "INSERT INTO dalton_watch_state (workspace_id, ticker, state, updated_at) "
         "VALUES (%s, %s, %s, NOW()) "
         "ON CONFLICT (workspace_id) DO UPDATE "
-        "SET ticker = EXCLUDED.ticker, state = EXCLUDED.state, updated_at = NOW() "
+        "SET ticker = EXCLUDED.ticker, "
+        "state = (EXCLUDED.state - 'preflight_timeout_streaks') || "
+        "jsonb_build_object('preflight_timeout_streaks', "
+        "COALESCE(dalton_watch_state.state->'preflight_timeout_streaks', '{}'::jsonb)), "
+        "updated_at = NOW() "
         "RETURNING workspace_id, ticker, state, updated_at"
     )
     assert params[1] == "NVDA"
-    # 公司分支不触碰新列
+    # 公司分支不触碰行业列；计数键留在库内的当前值上
     assert "subject_kind" not in sql and "unit_id" not in sql
+    assert "preflight_timeout_streaks" in sql
 
 
 @pytest.mark.asyncio
@@ -2095,20 +2101,28 @@ async def test_preflight_timeout_sector_task_skips_via_outer_function(
 
 
 @pytest.mark.asyncio
-async def test_preflight_timeout_company_task_still_wakes_via_outer_function(
+async def test_preflight_timeout_company_task_skips_without_wake(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """对照：公司任务超时仍保守唤醒（P3 前行为逐字不变）。"""
+    """公司任务超时不再保守唤醒：decision=skip，reason=preflight_timeout，不领取信号。"""
     import src.dalton.autonomy.preflight as preflight_mod
+    from src.dalton.database import watch as watch_db
 
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
-    _install_outer_preflight_doubles(monkeypatch)
+    doubles = _install_outer_preflight_doubles(monkeypatch)
 
     async def _hang_probe(**kwargs: Any):
         await asyncio.sleep(5)
         raise AssertionError("should have been cancelled")
 
     monkeypatch.setattr(preflight_mod, "probe_agenda", create_autospec(preflight_mod.probe_agenda, side_effect=_hang_probe))
+    monkeypatch.setattr(
+        watch_db,
+        "bump_preflight_timeout_streak",
+        create_autospec(watch_db.bump_preflight_timeout_streak, return_value=1),
+    )
+    claim = create_autospec(watch_db.claim_signals_woken, return_value=[])
+    monkeypatch.setattr(watch_db, "claim_signals_woken", claim)
 
     from src.dalton.budget.service import get_budget_today
 
@@ -2126,9 +2140,14 @@ async def test_preflight_timeout_company_task_still_wakes_via_outer_function(
         "metadata": {"dalton_managed": True, "dalton_kind": "company_watch", "ticker": "NVDA"},
     }
     res = await preflight_mod.preflight_check(company, "exec-r3-co-timeout", persist=True, timeout_s=0.05)
-    assert res.decision == "wake"
+    assert res.decision == "skip"
     assert res.reason == "preflight_timeout"
-    assert res.should_wake is True
+    assert res.should_wake is False
+    assert res.signals == []
+    assert "agenda" in res.incomplete_probes
+    assert claim.await_count == 0
+    assert doubles["insert_preflight_log"].await_args.kwargs["decision"] == "skip"
+    assert doubles["insert_preflight_log"].await_args.kwargs["reason"] == "preflight_timeout"
 
 
 def test_collect_commit_first_incomplete_keeps_window_at_since(tmp_path: Any) -> None:

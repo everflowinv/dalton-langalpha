@@ -413,3 +413,8 @@ web/src/components/CommandPalette/__tests__/CommandPaletteProvider.test.tsx
 web/src/components/CommandPalette/__tests__/permissions.test.tsx
 # S3/S4 fix: default-off problem reporting frontend entry gating tests.
 web/src/components/Sidebar/__tests__/ReportGating.test.tsx
+
+# Offsite backup: config git backup & weekly external SSD + rclone Google Drive backup.
+scripts/dalton/ops/
+tests/unit/dalton/test_offsite_backup.py
+integrations/dalton-channel-gateway/test/ops-alerts.test.ts
