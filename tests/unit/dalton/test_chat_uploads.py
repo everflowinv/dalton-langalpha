@@ -7219,10 +7219,10 @@ async def test_staged_upstream_steer_holds_memory_budget_and_distinguishes_store
 
     with (
         patch.object(
-            chat_attachments_db,
+            svc.chat_attachments_db,
             "get_attachments_by_ids",
             create_autospec(
-                chat_attachments_db.get_attachments_by_ids,
+                svc.chat_attachments_db.get_attachments_by_ids,
                 return_value={att_id: dict(att_row)},
             ),
         ),
@@ -7291,3 +7291,207 @@ async def test_staged_upstream_steer_holds_memory_budget_and_distinguishes_store
             assert timeout_exc.value.status_code == 503
         assert budget._bytes == 0
         assert budget._files == 0
+
+
+# DALTON-HOOK(chat-large-upload): budget stays held until background read thread settles across cancel
+@pytest.mark.asyncio
+async def test_steer_object_read_cancellation_holds_budget_until_thread_finishes(
+    upload_env,
+) -> None:
+    import asyncio
+    import threading
+    from src.server.services.persistence.transfer import held_bytes_budget
+
+    owner = "user-steer-cancel-hold"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {"workspace_id": ws_id, "user_id": owner, "status": "running"}
+
+    payload = b"C" * (512 * 1024)
+    att_id = str(uuid.uuid4())
+    att_row = {
+        "attachment_id": att_id,
+        "user_id": owner,
+        "name": "large_image.png",
+        "mime_type": "image/png",
+        "size": len(payload),
+        "mode": "direct",
+        "has_content": False,
+        "content": None,
+        "object_key": f"chat-attachments/{owner}/{att_id}/large_image.png",
+        "state": "ready",
+        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
+        "cleaned_at": None,
+    }
+    steer_ctx = [
+        MultimodalContext(
+            type="image",
+            attachment_id=uuid.UUID(att_id),
+            description="large_image.png",
+        )
+    ]
+
+    budget = held_bytes_budget()
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    def _blocking_read(object_key: str) -> bytes:
+        read_started.set()
+        release_read.wait(timeout=5.0)
+        return payload
+
+    with (
+        patch.object(
+            svc.chat_attachments_db,
+            "get_attachments_by_ids",
+            create_autospec(
+                svc.chat_attachments_db.get_attachments_by_ids,
+                return_value={att_id: dict(att_row)},
+            ),
+        ),
+        patch.object(
+            svc,
+            "get_upstream_attachment_bytes",
+            create_autospec(svc.get_upstream_attachment_bytes, side_effect=_blocking_read),
+        ),
+    ):
+        task = asyncio.create_task(
+            svc.stage_request_attachments_for_steer(
+                steer_ctx,
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:cancel:in-flight",
+            )
+        )
+        assert await asyncio.to_thread(read_started.wait, 2.0)
+        assert budget._bytes == len(payload)
+        assert budget._files == 1
+
+        task.cancel()
+        await asyncio.sleep(0.05)
+        # Worker thread is still blocked; budget must remain held until the thread exits.
+        assert not task.done()
+        assert budget._bytes == len(payload)
+        assert budget._files == 1
+
+        release_read.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert budget._bytes == 0
+        assert budget._files == 0
+
+
+# DALTON-HOOK(chat-large-upload): consecutive cancel + retry cannot exceed concurrent byte budget
+@pytest.mark.asyncio
+async def test_steer_consecutive_cancel_and_retry_never_exceeds_budget(
+    upload_env,
+) -> None:
+    import asyncio
+    import threading
+    from src.server.services.persistence.transfer import ByteBudget
+
+    owner = "user-steer-cancel-resend"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {"workspace_id": ws_id, "user_id": owner, "status": "running"}
+
+    payload = b"R" * (24 * 1024)
+    tight_budget = ByteBudget(max_bytes=30 * 1024, max_files=2)
+
+    att_id = str(uuid.uuid4())
+    att_row = {
+        "attachment_id": att_id,
+        "user_id": owner,
+        "name": "retry.pdf",
+        "mime_type": "application/pdf",
+        "size": len(payload),
+        "mode": "direct",
+        "has_content": False,
+        "content": None,
+        "object_key": f"chat-attachments/{owner}/{att_id}/retry.pdf",
+        "state": "ready",
+        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
+        "cleaned_at": None,
+    }
+    steer_ctx = [
+        MultimodalContext(
+            type="pdf",
+            attachment_id=uuid.UUID(att_id),
+            description="retry.pdf",
+        )
+    ]
+
+    lock = threading.Lock()
+    active_reads = 0
+    max_active_reads = 0
+    first_started = threading.Event()
+    release_first = threading.Event()
+    call_count = 0
+
+    def _tracked_read(object_key: str) -> bytes:
+        nonlocal active_reads, max_active_reads, call_count
+        with lock:
+            call_count += 1
+            idx = call_count
+            active_reads += 1
+            max_active_reads = max(max_active_reads, active_reads)
+        try:
+            if idx == 1:
+                first_started.set()
+                release_first.wait(timeout=5.0)
+            return payload
+        finally:
+            with lock:
+                active_reads -= 1
+
+    with (
+        patch.object(
+            svc,
+            "held_bytes_budget",
+            create_autospec(svc.held_bytes_budget, return_value=tight_budget),
+        ),
+        patch.object(
+            svc.chat_attachments_db,
+            "get_attachments_by_ids",
+            create_autospec(
+                svc.chat_attachments_db.get_attachments_by_ids,
+                return_value={att_id: dict(att_row)},
+            ),
+        ),
+        patch.object(
+            svc,
+            "get_upstream_attachment_bytes",
+            create_autospec(svc.get_upstream_attachment_bytes, side_effect=_tracked_read),
+        ),
+    ):
+        task1 = asyncio.create_task(
+            svc.stage_request_attachments_for_steer(
+                steer_ctx,
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:cancel-resend:1",
+            )
+        )
+        assert await asyncio.to_thread(first_started.wait, 2.0)
+        task1.cancel()
+
+        # Immediately start retry while task1 is cancelling; tight_budget blocks task2
+        # until task1's worker thread completes and drops its hold.
+        task2 = asyncio.create_task(
+            svc.stage_request_attachments_for_steer(
+                steer_ctx,
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:cancel-resend:2",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert max_active_reads == 1
+        assert tight_budget._bytes == len(payload)
+
+        release_first.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task1
+        descriptors, _ = await task2
+        assert len(descriptors) == 1
+        assert max_active_reads == 1
+        assert tight_budget._bytes == 0
+        assert tight_budget._files == 0

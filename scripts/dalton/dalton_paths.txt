@@ -422,3 +422,5 @@ integrations/dalton-channel-gateway/test/ops-alerts.test.ts
 # sync5 S5 round 2: wake_context persistence across handoff/refire and resumed turn firing identity.
 tests/unit/server/services/test_dalton_wake_handoff.py
 tests/unit/server/handlers/test_ptc_run_firing_identity.py
+# S6 r5: staged-attachment steer storage failures reach the composer as retryable.
+web/src/pages/ChatAgent/hooks/__tests__/useChatMessages.steerRetryableError.test.tsx

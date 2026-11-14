@@ -2478,6 +2478,7 @@
     "sendReturned": "消息未能发送，已放回下方输入框。",
     "resendLastMessage": "此回复无法重试。请重新发送您的上一条消息，如有附件请一并添加。",
     "busyRunning": "此对话中当时仍有回复在进行，操作未完成。请重试。",
+    "steerTemporaryRetry": "暂时失败，可重试。",
     "busyStopping": "此对话中的回复当时仍在停止，请稍后重试。",
     "busyCompacting": "此对话当时正在压缩上下文，请稍后重试。",
     "busyRunningSend": "此对话中另一条回复仍在进行，此消息未发送。请在其完成后重试。",

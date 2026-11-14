@@ -616,3 +616,105 @@ async def test_http_body_still_aborts_on_a_failure_with_no_frame():
 
     with pytest.raises(ConnectionError):
         await _consume(error_handling.end_after_failure_frame(stream))
+
+
+# DALTON-HOOK(chat-large-upload): transient 5xx storage errors on steer_only emit structured recoverable error frame
+@pytest.mark.asyncio
+async def test_transient_http_503_on_steer_only_emits_recoverable_error_frame(coordinator):
+    import json
+    from src.dalton.services import chat_uploads as chat_uploads_svc
+    from src.server.services.runs.sse_producer import RunSSEProducer
+
+    # Trigger the real _read_upstream_object_bytes exception path rather than hand-crafting it.
+    with patch.object(
+        chat_uploads_svc,
+        "get_upstream_attachment_bytes",
+        side_effect=TimeoutError("S3 timed out"),
+    ):
+        with pytest.raises(chat_uploads_svc.HTTPException) as exc_info:
+            await chat_uploads_svc._read_upstream_object_bytes("chat-attachments/u-1/a-1/doc.pdf")
+
+    err = exc_info.value
+    assert err.status_code == 503
+    classification = error_handling.classify_error(err)
+    assert classification["is_recoverable"] is True
+    assert classification["error_type"] == "transient_error"
+
+    req = _make_request(messages=[{"role": "user", "content": "check"}])
+    req.steer_only = True
+
+    producer = RunSSEProducer(thread_id="t-steer-503", run_id="r-steer-503")
+
+    with patch(RELEASE, new=AsyncMock()), patch.object(
+        error_handling, "get_max_workflow_retries", return_value=3
+    ):
+        raw_frames = await _consume(
+            error_handling.handle_workflow_error(
+                e=err,
+                thread_id="t-steer-503",
+                user_id="u-1",
+                workspace_id="ws-1",
+                handler=producer,
+                token_callback=None,
+                scope=_scope(None),
+                start_time=0.0,
+                request=req,
+                is_byok=False,
+            )
+        )
+
+    assert len(raw_frames) == 1
+    lines = dict(line.split(": ", 1) for line in raw_frames[0].strip().splitlines())
+    assert lines["event"] == "error"
+    payload = json.loads(lines["data"])
+    assert payload["type"] == "workflow_error"
+    assert payload["error_type"] == "transient_error"
+    assert payload["is_recoverable"] is True
+    assert payload["retryable"] is True
+    assert payload["status_code"] == 503
+    assert payload["recovery"] == "resend"
+    assert "Temporarily unable to read attachment" in payload["error"]
+    coordinator.finalize_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transient_http_503_on_normal_send_keeps_retry_frame(coordinator):
+    import json
+    from src.dalton.services import chat_uploads as chat_uploads_svc
+
+    with patch.object(
+        chat_uploads_svc,
+        "get_upstream_attachment_bytes",
+        side_effect=TimeoutError("S3 timed out"),
+    ):
+        with pytest.raises(chat_uploads_svc.HTTPException) as exc_info:
+            await chat_uploads_svc._read_upstream_object_bytes("chat-attachments/u-1/a-1/doc.pdf")
+
+    err = exc_info.value
+    req = _make_request(messages=[{"role": "user", "content": "check"}])
+    req.steer_only = False
+
+    with patch(RELEASE, new=AsyncMock()), patch.object(
+        error_handling, "get_max_workflow_retries", return_value=3
+    ):
+        raw_frames = await _consume(
+            error_handling.handle_workflow_error(
+                e=err,
+                thread_id="t-normal-503",
+                user_id="u-1",
+                workspace_id="ws-1",
+                handler=None,
+                token_callback=None,
+                scope=_scope(None),
+                start_time=0.0,
+                request=req,
+                is_byok=False,
+            )
+        )
+
+    assert len(raw_frames) == 1
+    lines = dict(line.split(": ", 1) for line in raw_frames[0].strip().splitlines())
+    assert lines["event"] == "retry"
+    payload = json.loads(lines["data"])
+    assert payload["error_type"] == "transient_error"
+    assert payload["recovery"] == "resend"

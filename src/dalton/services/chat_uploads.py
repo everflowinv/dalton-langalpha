@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -23,7 +23,7 @@ import math
 import posixpath
 import re
 import shlex
-from typing import Any
+from typing import Any, TypeVar
 import uuid
 
 from fastapi import HTTPException
@@ -1672,7 +1672,8 @@ async def _stage_single_bytes_attachment(
             part_num = idx + 1
             chunk = raw_bytes[idx * part_size : (idx + 1) * part_size]
             part_sha = hashlib.sha256(chunk).hexdigest()
-            etag = await asyncio.to_thread(
+            # DALTON-HOOK(chat-large-upload): await thread settlement so chunk bytes and budget do not outlive cancel
+            etag = await _run_in_thread_until_settled(
                 storage.upload_part_bytes,
                 object_key,
                 store_upload_id,
@@ -1855,6 +1856,58 @@ def _probe_upstream_object_missing(object_key: str) -> bool:
     return not bool(upstream_storage.does_object_exist(object_key))
 
 
+_T = TypeVar("_T")
+
+
+# DALTON-HOOK(chat-large-upload): transient object-store read failure stays an HTTP 503 for
+# direct routes while carrying an explicit marker for classify_error() on SSE steer turns.
+class _TransientAttachmentStorageError(HTTPException):
+    is_transient_storage_error = True
+
+    def __init__(
+        self,
+        detail: str = "Temporarily unable to read attachment from storage. Please retry.",
+    ) -> None:
+        super().__init__(status_code=503, detail=detail)
+
+
+# DALTON-HOOK(chat-large-upload): keep blocking object reads inside held_bytes_budget across cancellation
+async def _run_in_thread_until_settled(
+    fn: Callable[..., _T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> _T:
+    """Run ``fn`` in a worker thread, awaiting settlement before raising ``CancelledError``."""
+    task: asyncio.Task[Any] | None = asyncio.create_task(
+        asyncio.to_thread(fn, *args, **kwargs)
+    )
+    cancelled_exc: asyncio.CancelledError | None = None
+    result: Any = None
+    try:
+        while True:
+            try:
+                assert task is not None
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError as exc:
+                if cancelled_exc is None:
+                    cancelled_exc = exc
+                if task is not None and task.done():
+                    if not task.cancelled():
+                        task.exception()
+                    task = None
+                    raise cancelled_exc
+    finally:
+        if task is not None and task.done() and not task.cancelled():
+            task.exception()
+        task = None
+    if cancelled_exc is not None:
+        result = None
+        raise cancelled_exc
+    return result
+
+
 async def _read_upstream_object_bytes(object_key: str) -> bytes:
     """Read upstream attachment object bytes; 409 when absent, 503 on transient store errors."""
     def _read() -> bytes | None:
@@ -1863,12 +1916,9 @@ async def _read_upstream_object_bytes(object_key: str) -> bytes:
         except Exception as exc:
             if _is_missing_object_error(exc):
                 return None
-            raise HTTPException(
-                status_code=503,
-                detail="Temporarily unable to read attachment from storage. Please retry.",
-            ) from exc
+            raise _TransientAttachmentStorageError() from exc
 
-    raw_bytes = await asyncio.to_thread(_read)
+    raw_bytes = await _run_in_thread_until_settled(_read)
     if raw_bytes is not None:
         return raw_bytes
 
@@ -1878,16 +1928,10 @@ async def _read_upstream_object_bytes(object_key: str) -> bytes:
         except Exception as exc:
             if _is_missing_object_error(exc):
                 return True
-            raise HTTPException(
-                status_code=503,
-                detail="Temporarily unable to read attachment from storage. Please retry.",
-            ) from exc
+            raise _TransientAttachmentStorageError() from exc
 
-    if not await asyncio.to_thread(_confirm_missing):
-        raise HTTPException(
-            status_code=503,
-            detail="Temporarily unable to read attachment from storage. Please retry.",
-        )
+    if not await _run_in_thread_until_settled(_confirm_missing):
+        raise _TransientAttachmentStorageError()
     raise HTTPException(
         status_code=409,
         detail=chat_attachments_svc.ATTACHMENT_ENDED,
@@ -1914,49 +1958,52 @@ async def _stage_single_upstream_attachment(
     expected_size = max(0, int(att_row.get("size") or 0))
     async with held_bytes_budget().hold(expected_size):
         raw_bytes: bytes | None = None
-        if att_row.get("has_content"):
-            raw_bytes = await chat_attachments_db.get_content(att_id)
+        try:
+            if att_row.get("has_content"):
+                raw_bytes = await chat_attachments_db.get_content(att_id)
+                if raw_bytes is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=chat_attachments_svc.ATTACHMENT_ENDED,
+                    )
+            elif att_row.get("object_key"):
+                raw_bytes = await _read_upstream_object_bytes(str(att_row["object_key"]))
             if raw_bytes is None:
                 raise HTTPException(
                     status_code=409,
                     detail=chat_attachments_svc.ATTACHMENT_ENDED,
                 )
-        elif att_row.get("object_key"):
-            raw_bytes = await _read_upstream_object_bytes(str(att_row["object_key"]))
-        if raw_bytes is None:
-            raise HTTPException(
-                status_code=409,
-                detail=chat_attachments_svc.ATTACHMENT_ENDED,
+            if len(raw_bytes) <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Empty attachment cannot be staged for steering",
+                )
+            mime_type = (
+                str(att_row.get("mime_type") or "").strip().lower()
+                or (
+                    "application/pdf"
+                    if fallback_type == "pdf"
+                    else "image/png"
+                    if fallback_type == "image"
+                    else "application/octet-stream"
+                )
+            )[:120]
+            raw_name = (
+                str(description or "").strip()
+                or str(att_row.get("name") or "").strip()
+                or fallback_type
             )
-        if len(raw_bytes) <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Empty attachment cannot be staged for steering",
+            if "." not in posixpath.basename(raw_name.replace("\\", "/")):
+                raw_name = f"{raw_name}{_INLINE_MIME_EXT.get(mime_type, '')}"
+            return await _stage_single_bytes_attachment(
+                raw_bytes=raw_bytes,
+                mime_type=mime_type,
+                raw_name=raw_name,
+                user_id=user_id,
+                canonical_ws=canonical_ws,
             )
-        mime_type = (
-            str(att_row.get("mime_type") or "").strip().lower()
-            or (
-                "application/pdf"
-                if fallback_type == "pdf"
-                else "image/png"
-                if fallback_type == "image"
-                else "application/octet-stream"
-            )
-        )[:120]
-        raw_name = (
-            str(description or "").strip()
-            or str(att_row.get("name") or "").strip()
-            or fallback_type
-        )
-        if "." not in posixpath.basename(raw_name.replace("\\", "/")):
-            raw_name = f"{raw_name}{_INLINE_MIME_EXT.get(mime_type, '')}"
-        return await _stage_single_bytes_attachment(
-            raw_bytes=raw_bytes,
-            mime_type=mime_type,
-            raw_name=raw_name,
-            user_id=user_id,
-            canonical_ws=canonical_ws,
-        )
+        finally:
+            raw_bytes = None
 
 
 async def cleanup_unaccepted_staged_uploads(

@@ -106,6 +106,20 @@ import {
 import { collectRenderedInterruptIds, finalizeTodoListProcessesInMessages } from './utils/messageFinalizers';
 export { finalizeTodoListProcessesInMessages, mapToolCallIdToAgentId } from './utils/messageFinalizers';
 
+// DALTON-HOOK(chat-large-upload): recoverable categories emitted by backend classify_error()
+const RECOVERABLE_STEER_ERROR_TYPES = new Set([
+  'transient_error',
+  'timeout_error',
+  'connection_error',
+  'api_error',
+]);
+
+function isRetryableSteerFrame(frame: Record<string, unknown>): boolean {
+  if (frame.retryable === true || frame.is_recoverable === true) return true;
+  if (typeof frame.error_type === 'string' && RECOVERABLE_STEER_ERROR_TYPES.has(frame.error_type)) return true;
+  return typeof frame.status_code === 'number' && frame.status_code >= 500;
+}
+
 /** A send the server started no run of. Its automatic resends carry it, so
  * the one that ends the chain can mark it never kept and give its turn back.
  * A hidden opener drew no message, so it has no user bubble to carry. */
@@ -2345,6 +2359,13 @@ export function useChatMessages(
         answered: false,
       };
     }
+    // DALTON-HOOK(chat-large-upload): transient steer storage/upstream errors surface as retryable notices
+    if (errorInfo?.retryable === true || errorInfo?.is_recoverable === true) {
+      return {
+        banner: { message: t('chat.steerTemporaryRetry'), kind: 'notice' },
+        answered: false,
+      };
+    }
     if (errorInfo?.link) {
       // Backend scrubbed stale model names from the user's saved
       // preferences — invalidate our cached copy so the selector and
@@ -2521,9 +2542,22 @@ export function useChatMessages(
       const frame = answered.refusal;
       if (frame) {
         const text = typeof frame.error === 'string' ? frame.error : '';
+        // DALTON-HOOK(chat-large-upload): preserve recoverable steer markers instead of masking as HTTP 409 refusal
+        const retryable = isRetryableSteerFrame(frame);
+        const status =
+          typeof frame.status_code === 'number' && frame.status_code >= 400
+            ? frame.status_code
+            : retryable
+              ? 503
+              : 409;
         throw Object.assign(new Error(text || 'Failed to send message'), {
-          status: 409,
-          errorInfo: { code: frame.code, message: text },
+          status,
+          errorInfo: {
+            code: frame.code,
+            type: typeof frame.error_type === 'string' ? frame.error_type : undefined,
+            message: text,
+            ...(retryable ? { retryable: true, is_recoverable: true } : {}),
+          },
         });
       }
       // No answer, and no way to know: a delivery can still clear this. An
@@ -2605,6 +2639,27 @@ export function useChatMessages(
       // carried past the next one: a reload may be waiting on this answer,
       // or asked for and yet to run.
       const banner = refusalBanner(err).banner ?? 'Failed to send message';
+      // DALTON-HOOK(chat-large-upload): on structured recoverable steer errors (e.g. 503 storage),
+      // return draft + attachments whole to the composer so the user can retry without re-attaching.
+      const errInfo = (err as { errorInfo?: { retryable?: boolean; is_recoverable?: boolean } })?.errorInfo;
+      const isRetryableSteer = !refused && (errInfo?.retryable === true || errInfo?.is_recoverable === true);
+      const steerDraft = modelOptions.draft;
+      if (isRetryableSteer && steerDraft) {
+        ended = { refused: banner };
+        requestKeys.spend(requestKey);
+        modelOptions.onReturnedUnsent?.();
+        setReturnedDraft((prev) => (prev
+          ? {
+              text: [prev.text, steerDraft.text].filter(Boolean).join('\n'),
+              files: [...prev.files, ...steerDraft.files],
+              mentions: [...prev.mentions, ...steerDraft.mentions],
+              commands: [...prev.commands, ...steerDraft.commands],
+            }
+          : steerDraft));
+        setMessages((prev) => prev.filter((m) => m.id !== userMessage.id));
+        setMessageError(banner);
+        return false;
+      }
       refusalAfterReloadRef.current = { epoch: sessionEpochRef.current, banner };
       ended = { refused: banner };
       // Update user message to show steering failure. A stream end or a
@@ -2975,7 +3030,7 @@ export function useChatMessages(
 
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
+      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
     }
 
     // Store model options so HITL resume can forward them

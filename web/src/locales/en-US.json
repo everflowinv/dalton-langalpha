@@ -2442,6 +2442,7 @@
     "sendReturned": "Couldn't send your message. It's back in the box below.",
     "resendLastMessage": "This reply can't be retried. Send your last message again, with any attachments.",
     "busyRunning": "A reply was still running in this chat, so this didn't go through. Try again.",
+    "steerTemporaryRetry": "Temporary failure — please retry.",
     "busyStopping": "A reply in this chat was still stopping. Try again in a moment.",
     "busyCompacting": "This chat was being compacted. Try again in a moment.",
     "busyRunningSend": "Another reply was still running in this chat, so this message wasn't sent. Retry once it finishes.",
