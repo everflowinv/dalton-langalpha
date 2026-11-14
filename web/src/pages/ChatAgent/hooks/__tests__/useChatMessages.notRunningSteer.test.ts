@@ -702,3 +702,111 @@ describe('useChatMessages: refused steers belong to their view, not to a thread 
     expect(posts[4].opts.requestKey).not.toBe(posts[1].opts.requestKey);
   });
 });
+
+// DALTON-HOOK(chat-large-upload): staged attachment_id sends steer running turns like inline/chat_upload files
+describe('useChatMessages: a send naming staged files while a turn runs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCancel.mockResolvedValue({ cancelled: true, message: 'ok' });
+  });
+
+  const csv = new File(['a,b\n'], 'a.csv', { type: 'text/csv' });
+  const FILES = [{ type: 'file', attachment_id: 'att-1', description: 'a.csv' }];
+  const META = [{ name: 'a.csv', type: 'text/csv', size: 4, file: csv }];
+
+  async function steerFiles(hook: Hook, message: string): Promise<{ sent: Promise<unknown> }> {
+    let sent: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      sent = hook.result.current.handleSendMessage(message, FILES, META);
+      await Promise.resolve();
+    });
+    return { sent };
+  }
+
+  it('steers immediately with its files when accepted while a turn runs', async () => {
+    const { hook, posts } = await startTurn();
+    const { sent } = await steerFiles(hook, 'read this');
+    expect(posts).toHaveLength(2);
+    expect(posts[1].message).toBe('read this');
+    expect(posts[1].opts.steerOnly).toBe(true);
+    expect((posts[1].opts as SendOpts & { additionalContext?: unknown }).additionalContext).toEqual(FILES);
+    expect(userBubbles(hook, 'read this')).toMatchObject([{ steering: true }]);
+
+    await settle(async () => {
+      posts[1].opts.onEvent({ event: 'steering_accepted', position: 1 });
+      posts[1].end();
+      await sent;
+    });
+
+    await settle(() => posts[0].end());
+    expect(posts).toHaveLength(2);
+  });
+
+  // DALTON-HOOK(chat-large-upload): staged attachments now steer into the running turn (Dalton converts them to chat_upload)
+  it('if refused as not_running, opens the next turn with its files ahead of later sends', async () => {
+    const { hook, posts } = await startTurn();
+    const first = await steerFiles(hook, 'read this');
+    await settle(async () => {
+      posts[1].refuse('not_running');
+      await first.sent;
+    });
+    expect(posts).toHaveLength(2);
+    expect(userBubbles(hook, 'read this')).toMatchObject([{ steering: true }]);
+    const waitingId = userBubbles(hook, 'read this')[0].id;
+
+    // What comes after waits behind it rather than steering past it.
+    await settle(() => hook.result.current.handleSendMessage('and then this'));
+    expect(posts).toHaveLength(2);
+
+    await settle(() => posts[0].end());
+    await waitFor(() => expect(posts).toHaveLength(3));
+    expect(posts[2].message).toBe('read this');
+    expect(posts[2].opts.steerOnly).toBeFalsy();
+    expect((posts[2].opts as SendOpts & { additionalContext?: unknown }).additionalContext).toEqual(FILES);
+    expect(userBubbles(hook, 'read this')).toMatchObject([{ id: waitingId }]);
+
+    await settle(() => posts[2].end());
+    await waitFor(() => expect(posts).toHaveLength(4));
+    expect(posts[3].message).toBe('and then this');
+  });
+
+  // DALTON-HOOK(chat-large-upload): request indices shift because staged files steer first
+  it('goes back to the composer with its files on a stop when waiting after not_running', async () => {
+    const { hook, posts } = await startTurn();
+    const first = await steerFiles(hook, 'read this');
+    await settle(async () => {
+      posts[1].refuse('not_running');
+      await first.sent;
+    });
+    await settle(() => hook.result.current.stopWorkflow());
+
+    expect(hook.result.current.returnedSteering).toBe('read this');
+    expect(hook.result.current.returnedDraft?.files).toEqual([{ file: csv, type: 'text/csv', attachmentId: 'att-1' }]);
+    expect(userBubbles(hook, 'read this')).toEqual([]);
+    await settle(() => {});
+    expect(posts).toHaveLength(2);
+  });
+
+  // DALTON-HOOK(chat-large-upload): request indices shift because staged files steer first
+  it('keeps its files on the Retry when the server refuses the queued follow-up as running', async () => {
+    const { hook, posts } = await startTurn();
+    const first = await steerFiles(hook, 'read this');
+    await settle(async () => {
+      posts[1].refuse('not_running');
+      await first.sent;
+    });
+    mockSendStream.mockImplementationOnce(async () => {
+      throw refusal('running');
+    });
+    await settle(() => posts[0].end());
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(hook.result.current.isLoading).toBe(false));
+    expect(hook.result.current.messages.at(-1)).toMatchObject({ error: true, unadmitted: true });
+
+    // The resend's stream stays open, so it is not awaited.
+    await settle(() => { void hook.result.current.handleRetry(); });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(4));
+    expect(mockSendStream.mock.lastCall?.[0]).toBe('read this');
+    expect(mockSendStream.mock.lastCall?.[3]).toMatchObject({ additionalContext: FILES });
+  });
+});

@@ -7,7 +7,7 @@ adapter instead of rippling through replay.
 
 Artifact derivation mirrors the live emitters: ``file_operation``/``todo_update``
 payloads are rebuilt from tool-call args (the same source the middleware reads),
-``html_widget``/``preview_url``/``chart_annotation`` from the checkpointed
+``html_widget``/``preview_url`` from the checkpointed
 ToolMessage artifact, and ``task`` from ``additional_kwargs.task_artifact``.
 Non-derivable payloads (image URL rewrites, widget ``data``) are merged by the
 replay endpoint from persisted sources, not synthesized here.
@@ -25,16 +25,17 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMes
 from ptc_agent.agent.middleware.background_subagent.workflow.emitter import (
     WORKFLOW_FRAME_FIELDS,
 )
+from ptc_agent.agent.middleware.compaction.brief import HANDOFF_UI_NAME
 from ptc_agent.agent.middleware.compaction.utils import (
     compaction_summary,
-    context_threshold,
     parse_summary_message,
 )
+from ptc_agent.agent.middleware.compaction.usage_event import token_usage_fields
 from ptc_agent.agent.middleware.tool.argument_parsing import parse_tool_args
 from ptc_agent.agent.tools.computer_reach import ran_elsewhere
 from ptc_agent.agent.transcript.classify import STEERING_MARKERS, human_kind
+from src.llms.claude_code import PLAN_NOTICE_KEY
 from src.llms.content_utils import extract_content_with_type
-from src.llms.token_counter import extract_token_usage
 from src.server.utils.content_normalizer import normalize_text_content
 from src.server.utils.error_sanitization import (
     sanitize_error_text as _sanitize_error_text,
@@ -58,14 +59,13 @@ HistoryEventKind = Literal[
     "steering-delivered",
     "context-window",
     "user-message",
+    "claude-code-plan",
 ]
 
 _FILE_OPERATION_TOOLS = {"Write", "Edit"}
 _ARTIFACT_FROM_TOOL_MESSAGE = {
     "ShowWidget": "html_widget",
     "GetPreviewUrl": "preview_url",
-    "draw_chart_annotation": "chart_annotation",
-    "manage_chart_annotations": "chart_annotation",
 }
 
 
@@ -222,6 +222,13 @@ def history_events_to_sse(
                     {"thread_id": thread_id, "agent": event.agent, **event.data},
                 )
             )
+        elif event.kind == "claude-code-plan":
+            items.append(
+                _sse(
+                    "claude_code_plan",
+                    {"thread_id": thread_id, "agent": event.agent, **event.data},
+                )
+            )
     return items
 
 
@@ -329,23 +336,16 @@ def _project_ai_message(
             HistoryEvent("tool-call", agent, message_id, {"tool_calls": tool_calls})
         )
 
-    # Mirror the live token_usage emitter (compaction middleware): same
-    # extractor, same >0 gate, same total — parity by construction.
-    usage = extract_token_usage(message)
-    input_tokens = usage.get("input_tokens", 0)
-    if input_tokens > 0:
-        output_tokens = usage.get("output_tokens", 0)
-        usage_data: dict[str, Any] = {
-            "action": "token_usage",
-            "signal": "complete",
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        }
-        threshold = context_threshold(message)
-        if threshold is not None:
-            usage_data["threshold"] = threshold
+    # The live token_usage emitter (compaction middleware) builds its event
+    # from the same fields, so the two cannot part.
+    usage = token_usage_fields(message)
+    if usage is not None:
+        usage_data = {"action": "token_usage", "signal": "complete", **usage}
         events.append(HistoryEvent("context-window", agent, message_id, usage_data))
+    # A reply the Claude plan ran out during: its notice, after it, as live.
+    notice = (message.response_metadata or {}).get(PLAN_NOTICE_KEY)
+    if isinstance(notice, dict):
+        events.append(HistoryEvent("claude-code-plan", agent, message_id, dict(notice)))
     return events
 
 
@@ -717,6 +717,25 @@ def _summary_texts(
     if isinstance(message, HumanMessage) and message.id:
         texts[message.id] = parse_summary_message(message)
     return texts
+
+
+def handoff_items(thread_id: str, turn: SpanDelta) -> list[dict[str, Any]]:
+    """The mark of a turn that opened on another model's brief
+    (``handoff_mark``), as the ``context_window`` signal it streamed."""
+    return [
+        {
+            "event": "context_window",
+            "data": {
+                "thread_id": thread_id,
+                "agent": MAIN_AGENT,
+                "action": "brief",
+                "signal": "complete",
+                **(record.get("props") or {}),
+            },
+        }
+        for record in turn.new_ui_records
+        if record.get("name") == HANDOFF_UI_NAME
+    ]
 
 
 def context_signal_items(

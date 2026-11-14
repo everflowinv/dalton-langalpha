@@ -208,6 +208,44 @@ class TestCancelWorkflowForceCancelsInner:
         assert task_info.explicit_cancel is True
         assert task_info.user_stop is False
 
+    @pytest.mark.asyncio
+    async def test_restart_cancel_marks_the_run_for_resume(self):
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        btm.executions[("thread-1", "run-1")] = task_info
+
+        assert await btm.signal_cancel(
+            "thread-1", "run-1", user_initiated=False, restart=True
+        ) is True
+        assert task_info.restart is True
+        assert task_info.user_stop is False
+
+    @pytest.mark.asyncio
+    async def test_restart_cancel_after_a_user_stop_stays_the_users(self):
+        """Nothing resumes a turn the user stopped, whichever cancel came
+        first to the still-RUNNING task."""
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        btm.executions[("thread-1", "run-1")] = task_info
+
+        assert await btm.signal_cancel("thread-1", user_initiated=True) is True
+        assert await btm.signal_cancel(
+            "thread-1", "run-1", user_initiated=False, restart=True
+        ) is True
+        assert task_info.user_stop is True
+        assert task_info.restart is False
+
+    @pytest.mark.asyncio
+    async def test_a_user_stop_after_the_restart_cancel_unmarks_the_run(self):
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        btm.executions[("thread-1", "run-1")] = task_info
+
+        await btm.signal_cancel("thread-1", "run-1", user_initiated=False, restart=True)
+        await btm.signal_cancel("thread-1", user_initiated=True)
+        assert task_info.user_stop is True
+        assert task_info.restart is False
+
 
 # ---------------------------------------------------------------------------
 # cancel_stale_workflow — COMPLETED (no-op)
@@ -617,6 +655,7 @@ class TestFailedRunRecordsItsModelCall:
         task_info = _make_task_info(thread_id="thread-fail", run_id="run-fail")
         handler = MagicMock()
         handler.agent_config.credential_source = credential_source
+        handler.agent_config.credential_payer = None  # recorded at turn start
         task_info.metadata = {
             "workspace_id": "ws-1",
             "user_id": "user-1",
@@ -2360,6 +2399,55 @@ class TestAppendRunEndEvent:
             return_value=None,
         ) as read:
             yield read
+
+    @pytest.fixture(autouse=True)
+    def images(self):
+        with patch(
+            "src.server.services.runs.finalization.settled_images",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as read:
+            yield read
+
+    @pytest.mark.asyncio
+    async def test_terminal_frame_carries_the_runs_image_urls(self, images):
+        """The reply streamed each image as a path; the frame says where each
+        one was captured, which the live view shows in its place."""
+        import json as _json
+
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+        images.return_value = {"charts/a.png": "https://cdn.example/a.png"}
+        calls: list = []
+
+        with patch(
+            "src.server.services.runs.stream_writer.get_cache_client",
+            return_value=_sentinel_cache(calls),
+        ):
+            await btm.append_run_end_event("t-1", "r-1", "completed")
+
+        images.assert_awaited_once_with("r-1")
+        wire = next(c for c in calls if c[0] == "xadd")[2][b"event"].decode("utf-8")
+        assert _json.loads(wire.split("data: ", 1)[1])["images"] == {
+            "charts/a.png": "https://cdn.example/a.png",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_run_without_images_sends_no_image_field(self):
+        import json as _json
+
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+        calls: list = []
+
+        with patch(
+            "src.server.services.runs.stream_writer.get_cache_client",
+            return_value=_sentinel_cache(calls),
+        ):
+            await btm.append_run_end_event("t-1", "r-1", "completed")
+
+        wire = next(c for c in calls if c[0] == "xadd")[2][b"event"].decode("utf-8")
+        assert "images" not in _json.loads(wire.split("data: ", 1)[1])
 
     @pytest.mark.asyncio
     async def test_returned_chat_app_steers_close_the_stream_ahead_of_run_end(

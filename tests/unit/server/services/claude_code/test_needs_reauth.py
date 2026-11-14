@@ -7,6 +7,7 @@ on the token's hash and the save it was read from, is what admission,
 Settings and a relay read after it.
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -15,12 +16,12 @@ import pytest
 from fastapi import HTTPException
 
 from src.server.services.claude_code import saved
-from src.server.services.claude_code.machine import ComputerToken
+from src.server.services.claude_code.machine import ComputerToken, MachineAnswer
 from ptc_agent.agent.claude_code.launcher import Credential
 from src.llms.claude_code import ClaudeTurnFailed
 from src.server.services.claude_code.launchers import HostedCredential
 from src.server.services.claude_code.saved import token_check_key, token_hash
-from src.server.services.claude_code.hosted import cloud_placement
+from src.server.services.claude_code.hosted import Refused, cloud_placement
 from src.server.services.llm.claude_code import (
     CLAUDE_CODE_OFF,
     _refusal,
@@ -60,7 +61,7 @@ async def _admission_reason(row, cache):
     """What admission refuses a self-hosted turn on a cloud computer for, as it reads the saved token."""
     with serving(cache), _store(row), patch("src.server.services.claude_code.hosted.backend_available", lambda: True):
         where = await cloud_placement("user-1", None, token=True)
-    return _refusal(CODE, where.refusal) if where.refusal else None
+    return _refusal(CODE, where.reason, **where.fields) if isinstance(where, Refused) else None
 
 
 async def _refused_turn(cache, row=None):
@@ -152,7 +153,7 @@ async def test_a_status_check_flags_a_refused_token_and_clears_the_flag_of_one_c
         patch(f"{SAVED}.clear_access_token_refused", new_callable=AsyncMock) as clear,
         patch("ptc_agent.agent.claude_code.runtime.token_works", AsyncMock(return_value=works)),
     ):
-        await saved._check("user-1", _row(flagged=flagged), token_check_key(TOKEN), AsyncMock(return_value=True))
+        await saved.check_token("user-1", _row(flagged=flagged), token_check_key(TOKEN), AsyncMock(return_value=True))
     assert flag.await_count == int(not works)
     if not works:
         assert flag.await_args.kwargs["saved_at"] == SAVED_AT
@@ -177,7 +178,7 @@ async def test_a_refusal_a_turn_met_while_a_status_check_ran_stands_over_its_ans
         patch(f"{SAVED}.clear_access_token_refused", new_callable=AsyncMock) as clear,
         patch("ptc_agent.agent.claude_code.runtime.token_works", served_then_refused),
     ):
-        await saved._check("user-1", _row(), token_check_key(TOKEN), AsyncMock(return_value=True))
+        await saved.check_token("user-1", _row(), token_check_key(TOKEN), AsyncMock(return_value=True))
         assert await saved.token_state("user-1", _row(flagged=True)) == "rejected"
     clear.assert_not_awaited()
     assert cache.values == {token_check_key(TOKEN): False}
@@ -197,7 +198,7 @@ async def test_a_check_of_a_flagged_token_leaves_a_refusal_a_turn_met_while_it_r
         patch(f"{SAVED}.clear_access_token_refused", new_callable=AsyncMock, return_value=False) as clear,
         patch("ptc_agent.agent.claude_code.runtime.token_works", served_then_refused),
     ):
-        await saved._check("user-1", _row(flagged=True), token_check_key(TOKEN), AsyncMock(return_value=True))
+        await saved.check_token("user-1", _row(flagged=True), token_check_key(TOKEN), AsyncMock(return_value=True))
         assert await saved.token_state("user-1", restamped) == "rejected"
     assert clear.await_args.kwargs["flagged_at"] == NOW, "the clear names the flag the check read"
     assert cache.values == {token_check_key(TOKEN): False}
@@ -247,9 +248,23 @@ async def test_a_computer_that_signs_in_with_the_relayed_token_is_refused_once_c
     answer = SimpleNamespace(relays=True, fresh=fresh)
     with (
         serving(Cache()), _store(_row(flagged=True)),
-        patch("src.server.services.llm.claude_code.read_answer", AsyncMock(return_value=answer)),
         patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
         pytest.raises(HTTPException) as refused,
     ):
-        await require_computer_signed_in(CODE, "user-1", "c-1")
+        await require_computer_signed_in(CODE, "user-1", answer)
+    assert refused.value.detail["reason"] == "token_refused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ago", [10, 10**7], ids=["fresh", "lapsed"])
+@pytest.mark.parametrize("file", ["works", "unknown"])
+async def test_a_computer_whose_own_token_is_past_its_expiry_is_refused_however_old_the_answer(file, ago):
+    """Claude refuses such a token, so its turn would fail at the first request."""
+    def answer(expires_at):
+        return MachineAnswer(file, expires_at=expires_at.isoformat(), checked_at=time.time() - ago)
+
+    with serving(Cache()), patch("src.server.services.claude_code.hosted.backend_available", lambda: True):
+        assert await require_computer_signed_in(CODE, "user-1", answer(NOW + timedelta(days=30))) is None
+        with pytest.raises(HTTPException) as refused:
+            await require_computer_signed_in(CODE, "user-1", answer(NOW - timedelta(minutes=1)))
     assert refused.value.detail["reason"] == "token_refused"

@@ -43,6 +43,8 @@ import { GALLERY_COLUMN, GALLERY_FRAME, GALLERY_GRID, GALLERY_PAGE } from './wor
 import { useGalleryReorder } from './workspaceGallery/useGalleryReorder';
 import { WorkspaceCard, WorkspaceCardSkeleton } from './workspaceGallery/WorkspaceCard';
 import type { WorkspaceRecord } from './workspaceGallery/types';
+import './workspaceGallery/WorkspaceCard.css';
+import { PaletteSearchButton } from '@/components/nav/PaletteSearchButton';
 
 /**
  * The order the user last picked, a per-browser convenience. Nothing stored,
@@ -361,7 +363,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
             style={{ paddingTop: 'calc(var(--page-top) - 4px)' }}
           >
             <div className="flex w-full items-center justify-between gap-4" style={{ minHeight: 36 }}>
-              <h1 className="text-2xl font-semibold title-font" style={{ color: 'var(--color-text-primary)' }}>
+              <h1 className="title-font text-[length:var(--cs-text-title,1.5rem)] leading-8 font-semibold tracking-[var(--cs-title-track,-0.01em)]" style={{ color: 'var(--color-text-primary)' }}>
                 {t('workspace.workspaces')}
               </h1>
               <GalleryActions onNewWorkspace={() => setIsModalOpen(true)} />
@@ -372,9 +374,13 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
             {/* Below a laptop's width the labeled action does not fit beside
                 the title, so it takes the row beneath it. */}
             <div className="flex flex-col gap-3 mb-4 md:hidden">
-              <h1 className="text-xl font-semibold title-font" style={{ color: 'var(--color-text-primary)' }}>
-                {t('workspace.workspaces')}
-              </h1>
+              <div className="flex items-center justify-between gap-3">
+                <h1 className="title-font text-[length:var(--cs-text-title,1.25rem)] leading-7 font-semibold tracking-[var(--cs-title-track,-0.01em)]" style={{ color: 'var(--color-text-primary)' }}>
+                  {t('workspace.workspaces')}
+                </h1>
+                {/* -mr-2: the icon, not the button's pad, lines up with the column's edge. */}
+                <PaletteSearchButton className="-my-1 -mr-2" />
+              </div>
               <GalleryActions stacked onNewWorkspace={() => setIsModalOpen(true)} />
             </div>
 
@@ -415,7 +421,7 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
             toolbar's gap gives up, so the first row is not clipped. */}
         <div
           ref={scrollRef}
-          className={`pt-1 pb-8 md:flex-1 md:min-h-0 md:overflow-y-auto ${GALLERY_FRAME}`}
+          className={`workspace-grid pt-1 pb-8 md:flex-1 md:min-h-0 md:overflow-y-auto ${GALLERY_FRAME}`}
           data-testid="workspace-grid"
         >
           <div className={GALLERY_COLUMN}>

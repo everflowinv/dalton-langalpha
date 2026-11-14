@@ -30,7 +30,12 @@ from enum import StrEnum
 from typing import Any, Dict, Literal, Optional
 
 from src.observability import automation_executions, safe_add
-from src.server.contracts.status import INTERRUPT_REASON_CREDIT_PAUSE, is_user_stop
+from src.server.contracts.status import (
+    INTERRUPT_REASON_CREDIT_PAUSE,
+    is_restart_interrupted,
+    is_user_stop,
+    restart_resume_expired,
+)
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.pool import get_db_connection
@@ -76,6 +81,14 @@ class Outcome(StrEnum):
     # alert ends instead: re-armed, it would fire into the same limit every
     # few minutes for as long as its condition holds.
     LIMITED = "limited"
+    # The Claude plan of the automation's Claude Code model refused the
+    # firing or stopped its run, until it resets: a usage limit, but the
+    # user's Claude plan rather than their LangAlpha plan, so it is told apart.
+    PLAN_LIMITED = "plan_limited"
+    # Another subscription's limit (ChatGPT, a Claude sign-in, Grok) refused
+    # the run's model call until it resets: the same wait, told apart because
+    # it is not the Claude Code plan.
+    SUBSCRIPTION_LIMITED = "subscription_limited"
     # Our outage, such as the credit gate's 503 when the quota service gives
     # no verdict, or a provider refusing the platform's own key. A restart
     # landing on a schedule window must not quietly switch off a user's
@@ -114,6 +127,20 @@ class _Policy:
     failure_reason: Optional[FailureReason] = None
 
 
+def _limit_policy(failure_reason: FailureReason) -> _Policy:
+    """A usage limit's: no strike toward auto-disable, and a one-shot price
+    alert closes, since the wait outlasts what it watched for."""
+    return _Policy(
+        status="failed",
+        from_statuses=("pending", "waiting", "running"),
+        metric="limited",
+        schedule="close_alert",
+        webhook="automation.failed",
+        finish="failed",
+        failure_reason=failure_reason,
+    )
+
+
 _POLICIES: Dict[Outcome, _Policy] = {
     Outcome.COMPLETED: _Policy(
         status="completed",
@@ -143,15 +170,9 @@ _POLICIES: Dict[Outcome, _Policy] = {
         finish="failed",
         failure_reason="provider_auth",
     ),
-    Outcome.LIMITED: _Policy(
-        status="failed",
-        from_statuses=("pending", "waiting", "running"),
-        metric="limited",
-        schedule="close_alert",
-        webhook="automation.failed",
-        finish="failed",
-        failure_reason="usage_limit",
-    ),
+    Outcome.LIMITED: _limit_policy("usage_limit"),
+    Outcome.PLAN_LIMITED: _limit_policy("claude_plan"),
+    Outcome.SUBSCRIPTION_LIMITED: _limit_policy("plan_limit"),
     Outcome.FAILED_OURS: _Policy(
         status="failed",
         from_statuses=("pending", "waiting", "running"),
@@ -202,18 +223,25 @@ _POLICIES: Dict[Outcome, _Policy] = {
 
 
 # The outcomes a run's own ledger row explains, in ``run_failure_message``.
-RUN_FAILURES = frozenset(
-    {Outcome.FAILED, Outcome.KEY_REJECTED, Outcome.LIMITED, Outcome.FAILED_OURS}
-)
+RUN_FAILURES = frozenset({
+    Outcome.FAILED, Outcome.KEY_REJECTED, Outcome.LIMITED, Outcome.PLAN_LIMITED,
+    Outcome.SUBSCRIPTION_LIMITED, Outcome.FAILED_OURS,
+})
+# The outcomes of a usage limit, which never count toward auto-disable.
+LIMITS = frozenset(outcome for outcome, policy in _POLICIES.items() if policy.metric == "limited")
 
 
 def ledger_outcome(run: Optional[Dict[str, Any]]) -> Optional[Outcome]:
     """How a firing ended, by its admitted run's ledger row; None while the
     run is still going.
 
-    A cancel the reader did not ask for is a server stopping, and an error
+    A run a restart stopped goes on in the turn that takes it over, for as
+    long as one may (``carried_firing``). Any other cancel the reader did
+    not ask for is a server stopping, and an error
     written by the ledger's recovery is a worker lost: both are ours. A run
-    the credit gate paused hit a usage limit. A model call refused 401/403
+    the credit gate paused hit a usage limit, and one the Claude plan stopped
+    (``claude_plan``, ``plan_stop_metadata``) the plan's, and one another
+    subscription refused at its limit (``plan_limit``) that one's. A model call refused 401/403
     is our outage when the key was the platform's; a row that does not say
     whose it was is treated as ours, so no disable rests on a guess. On the
     user's own key a 401 is the key rejected and a 403 an ordinary failure. A run paused on any other
@@ -228,12 +256,21 @@ def ledger_outcome(run: Optional[Dict[str, Any]]) -> Optional[Outcome]:
         return Outcome.COMPLETED
     metadata = run.get("metadata") or {}
     if status == "cancelled":
+        if is_restart_interrupted(run) and not restart_resume_expired(
+            run["cancel_requested_at"]
+        ):
+            return None
         return Outcome.STOPPED if is_user_stop(run) else Outcome.INTERRUPTED
     if status == "interrupted" and run.get("interrupt_reason") == INTERRUPT_REASON_CREDIT_PAUSE:
         return Outcome.LIMITED
     if status == "error":
         if metadata.get("recovery"):
             return Outcome.INTERRUPTED
+        if metadata.get("claude_plan"):
+            return Outcome.PLAN_LIMITED
+        upstream = metadata.get("upstream") or {}
+        if upstream.get("reason") == "plan_limit" and upstream.get("payer") == "subscription":
+            return Outcome.SUBSCRIPTION_LIMITED
         code = metadata.get("error_status_code")
         if code in _AUTH_STATUSES:
             if metadata.get("error_credential_owned") is not True:
@@ -241,6 +278,49 @@ def ledger_outcome(run: Optional[Dict[str, Any]]) -> Optional[Outcome]:
             if code == _KEY_REFUSED:
                 return Outcome.KEY_REJECTED
     return Outcome.FAILED
+
+
+async def take_over_firing(execution_id: str, run_id: str) -> None:
+    """Point the firing of a turn a restart stopped at the turn that took it
+    over (``carry.carried_firing``), so the live run opens from the firing
+    and a sweep settles it by this run, not the stopped one."""
+    await exec_db.transition_execution(
+        execution_id,
+        from_statuses=("running",),
+        to="running",
+        conversation_response_id=run_id,
+    )
+
+
+async def settle_unresumed(run_id: str) -> None:
+    """Settle as interrupted the firing a restart stopped that still points
+    at the stopped run, once a user's newer turn took the resume's place. A
+    firing a newer turn took over (``carry.carried_firing``) is that turn's
+    to settle, even before it relinked the firing: its START stamp says so."""
+    from src.server.database.runs import lifecycle as tl_db
+
+    row = await exec_db.get_running_execution_for_run(run_id)
+    if row is None:
+        return
+    latest = await tl_db.get_latest_attempt(str(row["conversation_thread_id"]))
+    if latest is not None and str(latest["conversation_response_id"]) != run_id and (
+        (latest.get("metadata") or {}).get("automation_execution_id")
+        == str(row["automation_execution_id"])
+    ):
+        return
+    automation = await auto_db.get_automation(str(row["automation_id"]), row["user_id"])
+    if automation is None:
+        return
+    execution_id = str(row["automation_execution_id"])
+    thread_id = str(row["conversation_thread_id"])
+    workspace_id = row.get("workspace_id") or automation.get("workspace_id")
+    await settle(
+        automation, execution_id, Outcome.INTERRUPTED,
+        thread_id=thread_id, run_id=run_id, workspace_id=workspace_id,
+        delivery=automation_delivery.delivery_of_run(
+            await exec_db.get_settling_run(run_id), execution_id
+        ),
+    )
 
 
 def clean_error_text(text: str) -> str:
@@ -267,6 +347,27 @@ def run_failure_message(run: Dict[str, Any]) -> Optional[str]:
         f"workflow run finished as '{run['status']}' "
         f"(run_id={run['conversation_response_id']})"
     )
+
+
+async def plan_message(
+    detail: Dict[str, Any], user_id: str, reword: Optional[Callable[[Dict[str, Any], Optional[str]], str]] = None,
+) -> Optional[str]:
+    """A plan's used-up limit in words, with its reset on the automation
+    owner's clock, since its report and delivery are theirs to read; None
+    where the stamp can't be worded. ``reword`` words ``detail``: the Claude
+    plan's refusal (``reword_plan``) unless given another subscription's."""
+    from src.server.database.automation import get_user_timezone
+    from src.server.services.llm.claude_code import reword_plan
+
+    try:
+        zone = await get_user_timezone(user_id) if user_id else None
+    except Exception:
+        zone = None
+    try:
+        return clean_error_text((reword or reword_plan)(detail, zone))
+    except Exception:
+        logger.warning("[AUTOMATION_SETTLE] Unreadable plan stamp", exc_info=True)
+        return None
 
 
 def _one_shot_price(automation: Dict[str, Any]) -> bool:
@@ -736,7 +837,7 @@ async def _finish_again(
 
 # Reasons that refuse firing after firing until something outside the
 # automation changes: a usage limit until it resets, our outage until it ends.
-_STREAK_REASONS = frozenset({"usage_limit", "server_error"})
+_STREAK_REASONS = frozenset(_POLICIES[outcome].failure_reason for outcome in (*LIMITS, Outcome.FAILED_OURS))
 
 
 def _repeats_a_refusal(
@@ -796,7 +897,16 @@ async def settle_by_run(
     error = excerpt = final_text = None
     if outcome in RUN_FAILURES:
         error = run_failure_message(run)
-        log = logger.warning if outcome is Outcome.LIMITED else logger.error
+        owner = str(automation.get("user_id") or "")
+        if outcome is Outcome.PLAN_LIMITED:
+            error = await plan_message(run["metadata"]["claude_plan"], owner) or error
+        elif outcome is Outcome.SUBSCRIPTION_LIMITED and (
+            limit := (run["metadata"].get("upstream") or {}).get("plan_limit")
+        ):
+            from src.server.services.llm.claude_code import reword_subscription_limit
+
+            error = await plan_message(limit, owner, reword_subscription_limit) or error
+        log = logger.warning if outcome in LIMITS else logger.error
         log(
             f"[AUTOMATION_SETTLE] Run ended as {outcome}: "
             f"execution_id={execution_id} run_id={run_id} error={error}"

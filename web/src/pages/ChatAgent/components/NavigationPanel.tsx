@@ -2,7 +2,6 @@ import React, { useState, useCallback, useMemo, useRef, useSyncExternalStore } f
 import { useTranslation } from 'react-i18next';
 import type { DragStartEvent, DragEndEvent, Modifier } from '@dnd-kit/core';
 import { ChevronsDown } from 'lucide-react';
-import { ScrollArea } from '../../../components/ui/scroll-area';
 import { useWorkspaceActions } from './workspaceActions';
 import { isEffectivelyPinned } from '../hooks/useNavigationData';
 import type { NavWorkspace } from '../hooks/useNavigationData';
@@ -29,6 +28,7 @@ import { useArchiveThreadConfirm } from './threadArchiveAction';
 import { useThreadDeleteConfirm } from './threadDeleteAction';
 import ShareThreadDialog, { type ShareThreadTarget } from './ShareThreadDialog';
 import { NavTreeContext, useNavTreeKit } from './navTreeKit';
+import { isThreadRemoved } from '@/lib/deletedThreads';
 import './NavigationPanel.css';
 
 interface NavigationPanelProps {
@@ -202,7 +202,10 @@ function NavigationPanel({
   // first page of recents), which would leave it highlighted-but-hidden. Page in
   // successive batches until it surfaces so the open folder always holds the
   // current thread — re-runs as each page lands, walking the tail. Bounded by
-  // MAX_REVEAL_PAGES.
+  // MAX_REVEAL_PAGES. A thread known archived or deleted is in no page:
+  // archiving the open thread drops its row before the navigation off it
+  // lands, and a navigation is a transition that each landed page defers
+  // again, so paging for it walked the whole tail.
   const revealAttemptRef = useRef<{ key: string; pages: number }>({ key: '', pages: 0 });
   React.useEffect(() => {
     // Only the visible ChatView's panel pages threads. Up to 5 panels stay
@@ -218,6 +221,7 @@ function NavigationPanel({
     if (!data || data.loading) return;
     const loaded = data.threads || [];
     if (loaded.some((thr) => thr.thread_id === currentThreadId)) return; // already visible
+    if (isThreadRemoved(currentThreadId)) return; // archived or deleted: no page holds it
     if (typeof data.total !== 'number' || loaded.length >= data.total) return; // nothing more to page
 
     const key = `${currentWorkspaceId}:${currentThreadId}`;
@@ -375,7 +379,10 @@ function NavigationPanel({
           {headerActions}
         </div>
       )}
-      <ScrollArea className="flex-1">
+      {/* No scrollbar: the app's styled one is a classic bar that takes its lane
+          out of the rows, narrowing every title the moment a section expands
+          past the panel. The row cut off at the bottom says there is more. */}
+      <div className="flex-1 overflow-y-auto scrollbar-none">
         <div className="py-2">
           <NavTreeContext value={navTree}>
           <TreeRoot
@@ -462,7 +469,7 @@ function NavigationPanel({
             </div>
           )}
         </div>
-      </ScrollArea>
+      </div>
       {wsActions.dialogs}
       {archiveDialog}
       {deleteDialog}

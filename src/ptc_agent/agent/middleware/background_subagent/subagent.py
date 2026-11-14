@@ -47,6 +47,7 @@ from ptc_agent.agent.middleware.runtime_context.turn import (
     TURN_TIME_LIMIT_KEY,
 )
 from ptc_agent.agent.state import DeltaAgentState
+from src.llms.claude_code import ClaudeCodeTarget
 from src.llms.content_utils import extract_text_blocks  # DALTON-HOOK(subagent-spill-recovery)
 from src.llms.llm import narrow_prompt_cache_key
 from src.observability.langsmith_tracer import with_run_tracer
@@ -200,6 +201,11 @@ You are notified when the task finishes. TaskOutput then returns its
 result."""
 
 
+#: Builds the graph a subagent on a Claude Code row runs: from its compiled
+#: agent, its spec and the row's target.
+ClaudeCodeSubagent = Callable[[Any, "SubAgent", ClaudeCodeTarget], Any]
+
+
 def _get_subagents(
     *,
     default_model: str | BaseChatModel,
@@ -209,11 +215,13 @@ def _get_subagents(
     subagents: list[SubAgent | CompiledSubAgent],
     general_purpose_agent: bool,
     checkpointer: Any | None = None,
+    claude_code: ClaudeCodeSubagent | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Build compiled subagent instances from specs.
 
     Returns ``(agent_dict, description_list)`` where ``agent_dict`` maps
-    agent names to runnable instances.
+    agent names to runnable instances. A spec whose model is a Claude Code
+    row runs on Claude Code, through ``claude_code``, when it is given.
     """
     # Use empty list if None (no default middleware)
     default_subagent_middleware = default_middleware or []
@@ -263,7 +271,7 @@ def _get_subagents(
         if interrupt_on:
             _middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
-        agents[agent_["name"]] = create_agent(
+        compiled = create_agent(
             narrow_prompt_cache_key(subagent_model, agent_["name"]),
             system_prompt=agent_["system_prompt"],
             tools=_tools,
@@ -272,6 +280,9 @@ def _get_subagents(
             checkpointer=checkpointer,
             state_schema=DeltaAgentState,
         )
+        if claude_code is not None and isinstance(subagent_model, ClaudeCodeTarget):
+            compiled = claude_code(compiled, agent_, subagent_model)
+        agents[agent_["name"]] = compiled
     return agents, subagent_descriptions
 
 
@@ -986,6 +997,8 @@ class SubAgentMiddleware(AgentMiddleware):
             the agent's system message via middleware.
         general_purpose_agent: Whether to include the general-purpose agent.
         task_description: Description for the Task tool.
+        claude_code: Builds the graph of a subagent whose model is a Claude
+            Code row; without it every subagent runs on ``create_agent``.
 
     Example:
         ```python
@@ -1030,6 +1043,7 @@ class SubAgentMiddleware(AgentMiddleware):
         task_description: str = TASK_TOOL_DESCRIPTION,
         registry: BackgroundTaskRegistry | None = None,
         checkpointer: Any | None = None,
+        claude_code: ClaudeCodeSubagent | None = None,
     ) -> None:
         super().__init__()
         self.system_prompt = system_prompt
@@ -1044,6 +1058,7 @@ class SubAgentMiddleware(AgentMiddleware):
             subagents=subagents or [],
             general_purpose_agent=general_purpose_agent,
             checkpointer=checkpointer,
+            claude_code=claude_code,
         )
         task_tool = _create_task_tool(
             subagent_graphs=self.subagent_graphs,

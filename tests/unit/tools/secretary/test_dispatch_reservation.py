@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch  # DALTON-HOOK(colleague-dispatch): autospec doubles
 
 import aiohttp
 import pytest
 
+from src.server.database.workspace import get_workspace as _REAL_GET_WORKSPACE  # DALTON-HOOK(colleague-dispatch)
 from src.server.services.report_back.handoff import keys, reserve
 from src.tools.secretary.chief_of_staff import delegate_to_analyst
 from tests.unit.server.handlers.chat.redis_fakes import FakeCache as _FakeCache
@@ -104,6 +105,129 @@ async def test_a_full_cap_refuses_before_any_request(cache):
     payload = _payload(result)
     assert payload["success"] is False
     assert "too many concurrent analyses" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("detail", "error"),
+    [
+        (
+            {"message": "Turn on a computer of yours.", "type": "claude_code_off", "reason": "no_own_computer"},
+            "The analyst's thread refused this hand-off: Turn on a computer of yours.",
+        ),
+        ({"message": "Not enough credits."}, "The analyst's thread refused this hand-off: Not enough credits."),
+        ("Workspace not found", "dispatch_failed"),
+        ({"reason": "no_own_computer"}, "dispatch_failed"),
+    ],
+    ids=["claude-code", "any-refusal", "words-without-a-message", "no-words"],
+)
+async def test_a_refusal_s_words_reach_the_chief_of_staff(cache, detail, error):
+    with patch(
+        "src.tools.secretary.dispatch.hitl_confirm", return_value=(True, {})
+    ), patch(
+        "aiohttp.ClientSession", return_value=FakeSession(FakeResp(status=400, body={"detail": detail}))
+    ):
+        result = await delegate_to_analyst.ainvoke(_new_thread(), config=_config())
+
+    payload = _payload(result)
+    assert (payload["success"], payload["error"]) == (False, error)
+    assert _reservation(cache) is None
+
+
+@pytest.mark.asyncio
+async def test_a_server_failure_with_words_still_reads_as_a_failed_dispatch(cache):
+    """A 503 carries its own message too, but nothing refused the hand-off."""
+    body = {"detail": {"message": "Live updates are unavailable, retry shortly.", "type": "transport_unavailable"}}
+    with patch(
+        "src.tools.secretary.dispatch.hitl_confirm", return_value=(True, {})
+    ), patch(
+        "aiohttp.ClientSession", return_value=FakeSession(FakeResp(status=503, body=body))
+    ):
+        result = await delegate_to_analyst.ainvoke(_new_thread(), config=_config())
+
+    payload = _payload(result)
+    assert (payload["success"], payload["error"]) == (False, "dispatch_failed")
+    assert _reservation(cache) is None
+
+
+# DALTON-HOOK(colleague-dispatch): verify colleague error codes, error fallback, and string passthrough
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body", "expected_sub"),
+    [
+        (
+            403,
+            {"detail": {"code": "colleague_access_revoked", "message": "Colleague access revoked"}},
+            "colleague_access_revoked: Colleague access revoked",
+        ),
+        (
+            403,
+            {"error": {"code": "colleague_access_revoked", "message": "Access removed"}},
+            "colleague_access_revoked: Access removed",
+        ),
+        (
+            400,
+            {"detail": "Quota exceeded for workspace"},
+            "Quota exceeded for workspace",
+        ),
+    ],
+    ids=["code-and-message", "top-level-error-fallback", "string-detail-passthrough"],
+)
+async def test_colleague_dispatch_preserves_error_code_and_fallbacks(
+    cache, monkeypatch, status, body, expected_sub
+):
+    """Colleague dispatches preserve structured error codes (e.g. colleague_access_revoked),
+    top-level ``error`` fallback, and string ``detail``."""
+    from src.dalton import sharing as sharing_mod
+    from src.server.database import conversation as conv_db
+
+    monkeypatch.setattr("src.dalton.settings.is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr("src.dalton.settings.is_colleague_dispatch_enabled", lambda: True)
+    colleague_ws = {
+        "user_id": "owner-colleague",
+        "workspace_id": WORKSPACE_ID,
+        "name": "Colleague WS",
+        "_caller_cos_access": "rw",
+    }
+    monkeypatch.setattr(
+        "src.dalton.sharing.require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, return_value=colleague_ws),
+    )
+    monkeypatch.setattr(
+        "src.dalton.sharing.build_dispatched_by_meta",
+        create_autospec(
+            sharing_mod.build_dispatched_by_meta,
+            return_value={"user_id": USER_ID, "channel": "cos"},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.conversation.create_thread",
+        create_autospec(conv_db.create_thread, return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.server.database.conversation.delete_thread",
+        create_autospec(conv_db.delete_thread, return_value=True),
+    )
+    with patch(
+        "src.server.database.workspace.get_workspace",
+        create_autospec(
+            _REAL_GET_WORKSPACE,
+            return_value={
+                "user_id": "owner-colleague",
+                "workspace_id": WORKSPACE_ID,
+                "name": "Colleague WS",
+            },
+        ),
+    ), patch(
+        "src.tools.secretary.dispatch.hitl_confirm", return_value=(True, {})
+    ), patch(
+        "aiohttp.ClientSession", return_value=FakeSession(FakeResp(status=status, body=body))
+    ):
+        result = await delegate_to_analyst.ainvoke(_new_thread(), config=_config())
+
+    payload = _payload(result)
+    assert payload["success"] is False
+    assert expected_sub in payload["error"]
 
 
 @pytest.mark.asyncio

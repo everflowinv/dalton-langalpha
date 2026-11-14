@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, memo } from 'react';
+import { useTranslation } from 'react-i18next';
 import ActivityBlock from '../ActivityBlock';
 import type { ActivityItem } from './activityTypes';
 import { INLINE_ARTIFACT_MAP, openCardTarget } from '../charts/InlineArtifactCards';
+import { InlineChartLayerCard } from '../charts/InlineChartLayerCard';
 import { PILL_ROW_CLASS } from '../charts/pillArtifacts';
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import UserQuestionCard from '../UserQuestionCard';
@@ -23,6 +25,10 @@ import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import InlineWidget from '../viewers/InlineWidget';
 import { NotificationDivider } from './NotificationDivider';
+import { NoticeLine } from '@/components/ui/error-banner';
+import { usePlanClock } from '@/hooks/useClaudeCodePlan';
+import type { PlanBilled } from '@/api/model';
+import { planBilledText } from '@/lib/claudeCodePlan';
 import { normalizeSubagentText } from './normalizeSubagentText';
 import StructuredResultBlock from './StructuredResultBlock';
 import { parseStructuredResult } from '../../utils/structuredResult';
@@ -104,10 +110,17 @@ interface TextBlockProps {
  *  did. Nothing is held past the turn either: the hold only applies while the
  *  message streams, so a settle or an error releases it. */
 const HOLDS_FOR_PROSE = new Set<RenderBlock['type']>([
-  'activity', 'subagent_task', 'html_widget', 'compact_artifact', 'notification',
+  'activity', 'subagent_task', 'html_widget', 'compact_artifact', 'chart_layers', 'notification',
 ]);
 
 type RunKind = 'pill' | 'line' | 'subagent' | 'analyst';
+
+/** Under a reply whose last request was billed to usage credits, worded in
+ *  the reader's zone. */
+function PlanBilledNotice({ billed }: { billed: PlanBilled }): React.ReactElement {
+  const { t } = useTranslation();
+  return <NoticeLine message={planBilledText(t, billed, usePlanClock())} className="py-1.5" />;
+}
 
 /** Whitespace between two blocks, such as the "\n\n" a model writes between
  *  two tool calls. It draws nothing, so it is treated as nothing: it neither
@@ -199,7 +212,10 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
   const projection = useMemo(() => {
     if (contentProjection && (contentProjection.nextExpiry === null || contentProjection.nextExpiry > now)) return contentProjection;
-    return projectContent({ segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root }, contentProjection);
+    return projectContent({
+      segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root,
+      cardedCharts: contentProjection?.cardedCharts,
+    }, contentProjection);
   }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root]);
   const { blocks: renderBlocks, preparingToolCall, nextExpiry } = projection;
 
@@ -390,10 +406,19 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           );
         }
 
+        if (block.type === 'chart_layers') {
+          return (
+            <div key={block.key}>
+              <InlineChartLayerCard card={block.card} />
+            </div>
+          );
+        }
+
         if (block.type === 'notification') {
           const notifSeg = (block as NotificationRenderBlock).segment;
+          if (notifSeg.planBilled) return <PlanBilledNotice key={block.key} billed={notifSeg.planBilled} />;
           return (
-            <NotificationDivider key={block.key} content={notifSeg.content} fallback={notifSeg.fallback} detail={notifSeg.detail} detailKind={notifSeg.detailKind} />
+            <NotificationDivider key={block.key} content={notifSeg.content} fallback={notifSeg.fallback} handoff={notifSeg.handoff} detail={notifSeg.detail} detailKind={notifSeg.detailKind} />
           );
         }
 

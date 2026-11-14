@@ -16,6 +16,7 @@ import json
 import time
 from datetime import datetime
 from functools import partial
+from typing import Any
 
 from fastapi import HTTPException
 from langgraph.types import Command
@@ -30,7 +31,7 @@ from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
 from src.server.services.history.window import runs_held
-from src.server.services.llm.claude_code import require_attended, run_stamp
+from src.server.services.llm.claude_code import run_stamp
 from src.server.services.runs.pending_input import needs_resend, pending_input_stamp
 from src.server.services.runs.sse_producer import RunSSEProducer
 from src.server.models.chat import (
@@ -38,6 +39,7 @@ from src.server.models.chat import (
     serialize_hitl_response_map,
 )
 from src.server.services.background_registry_store import BackgroundRegistryStore
+from src.server.services.runs import restart_drain
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.workspace_manager import WorkspaceManager
 from src.observability import (
@@ -59,12 +61,20 @@ from src.server.utils.chart_selection_context import (
     serialize_chart_selections_for_metadata,
 )
 from src.server.utils.credit_resume_context import build_credit_resume_update
+from src.server.models.chat_attachment import TurnAttachments
+from src.server.services.chat_attachment_turns import (
+    mark_sent as mark_attachments_sent,
+    refuse_too_large,
+    resolve_turn_attachments,
+)
+from src.server.database.conversation.queries import set_run_query_metadata
 from src.server.utils.multimodal_context import (
     build_attachment_metadata,
-    parse_multimodal_contexts,
+    drop_gone_metadata,
 )
 
 from ptc_agent.agent.graph import build_ptc_graph_with_session
+from ptc_agent.agent.middleware.compaction.brief import BRIEF_CONFIG_KEY
 from ptc_agent.agent.middleware.credit_gate import run_with_credit_gate
 
 from .request_prep import (
@@ -94,7 +104,7 @@ from .request_prep import (
     with_resolved_model,  # DALTON-HOOK(turn-row-model-line)
 )
 from src.server.contracts.turn_kinds import announced
-from src.server.services import automation_delivery
+from src.server.services import automation_delivery, automation_settlement
 from src.server.services.credit_gate_port import build_run_credit_gate
 from src.server.services.report_back.handoff import carry
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
@@ -109,7 +119,7 @@ from src.server.services.turn_runtime import TurnRoute
 from .admission_gate import agent_steer_of, steer_allowed, wait_or_steer
 from .attachments import attach_request_files
 from .error_handling import handle_workflow_error
-from .agent_change import cancel_tool_calls_it_lacks
+from .agent_change import cancel_tool_calls_it_lacks, opens_afresh
 from src.llms.claude_code import is_claude_code_model
 from src.server.services.llm.clients import is_own_key_turn
 from src.server.services.llm.config import apply_fetch_override, resolve_llm_config
@@ -117,12 +127,33 @@ from src.server.services.llm.thread_model import NamedModel
 from .steering import open_with_steers_ahead
 from .run_stream_reader import stream_from_log
 from .detached import fire_and_forget as _fire_and_forget
+from src.server.handlers.handoff_brief import brief_for_turn, brief_kept_at_head, brief_owed_at
 
 
 def _turn_held(data: dict) -> str:
     """A ``turn_held`` frame. Id 0 like ``workspace_status``: it comes before
     the run has a stream to resume, so no cursor counts it."""
     return f"id: 0\nevent: turn_held\ndata: {json.dumps(data)}\n\n"
+
+
+async def _admit_attachments(
+    attachments: TurnAttachments,
+    conn: Any,
+    *,
+    run_id: str,
+    history: tuple[list, list] | None,
+) -> None:
+    """Stamp the turn's files sent in its START transaction, and correct the
+    query row written there when one was no longer there to stamp, so the
+    history shows what the agent is told."""
+    if await mark_attachments_sent(attachments, conn) and history:
+        entries, listed = history
+        await set_run_query_metadata(
+            conn,
+            run_id,
+            "attachments",
+            drop_gone_metadata(entries, listed, attachments),
+        )
 
 
 async def _resolve_origin_meta(request, thread_id: str) -> dict:
@@ -486,8 +517,6 @@ async def astream_ptc_workflow(
                 feedback_action = None
                 query_content = user_input
                 effective_model = config.llm.name if config and config.llm else None
-                if config is not None:
-                    require_attended(config, request)
                 # DALTON-HOOK(turn-row-model-line): the anchor row states the model
                 # the server resolved for this turn (the automation's llm_model, a
                 # client-named model, or the account default) as a settled fact.
@@ -506,12 +535,20 @@ async def astream_ptc_workflow(
 
                 # Extract attachment and context metadata for display in history
                 # (skipped for HITL resumes)
+                turn_attachments = TurnAttachments()
+                # The history's entries and the files they were built from.
+                attachment_history: tuple[list, list] | None = None
                 widget_ctxs = parse_widget_contexts(request.additional_context)
                 chart_selections = parse_chart_selection_contexts(
                     request.additional_context
                 )
                 if request.additional_context and not request.hitl_response:
-                    multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
+                    # Resolved once, for this user, before anything reads them; a
+                    # retry resolves the same uploaded ids again.
+                    turn_attachments = await resolve_turn_attachments(
+                        request.additional_context, user_id
+                    )
+                    await refuse_too_large(turn_attachments, user_id, workspace_id)
                     # DALTON-HOOK(chat-large-upload): record ordered history attachment metadata for inline + chat_upload items
                     from src.dalton.services.chat_uploads import (
                         build_ordered_turn_attachment_metadata,
@@ -523,12 +560,17 @@ async def astream_ptc_workflow(
                     )
                     # A retry writes no query row, so a second upload would be
                     # stored for nothing.
-                    if (multimodal_ctxs or chat_upload_ctxs) and not request.retry_of_run_id:
+                    if (turn_attachments or chat_upload_ctxs) and not request.retry_of_run_id:
                         inline_meta = (
-                            await build_attachment_metadata(multimodal_ctxs, thread_id)
-                            if multimodal_ctxs
+                            await build_attachment_metadata(turn_attachments, thread_id)
+                            if turn_attachments
                             else []
                         )
+                        if inline_meta and not chat_upload_ctxs:
+                            attachment_history = (
+                                inline_meta,
+                                list(turn_attachments.files),
+                            )
                         att_meta = await build_ordered_turn_attachment_metadata(
                             request.additional_context,
                             inline_metadata=inline_meta,
@@ -550,6 +592,7 @@ async def astream_ptc_workflow(
                 # (serialize_context_metadata's slash-command branch already guards
                 # on `not request.hitl_response`, so this is safe to call always.)
                 if not request.hitl_response:
+                    # DALTON-HOOK(skills-registry): pass per-user skill commands and allowed skills into slash-command detection
                     serialize_context_metadata(
                         request,
                         query_metadata,
@@ -578,14 +621,35 @@ async def astream_ptc_workflow(
                 # continuation), and stamping the durable row with the inherited gen
                 # while re-marking the tracker with None would make a live admitted
                 # run read as unadmitted to the fenced-teardown probe.
+                # A firing's turn is not started on a process that is draining:
+                # its executor hands the firing to the next process instead.
+                if (run_metadata or {}).get("automation_execution_id") and restart_drain.draining():
+                    raise restart_drain.Draining()
                 origin_meta = await _resolve_origin_meta(request, thread_id)
                 carried = await carry.carried_pair(request, thread_id)
+                firing = await carry.carried_firing(request, thread_id)
                 # A resume or a retry names no automation run of its own: it sends for
                 # the one the turn it continues sent for.
                 if automation_delivery.delivery_of_turn(extra_configurable or {}) is None:
                     sends_for = await carry.carried_delivery(request, thread_id)
                     if sends_for:
                         extra_configurable = {**(extra_configurable or {}), **sends_for}
+                # DALTON-HOOK(dispatch-delivery): restore automation execution identity on resumed firing turns
+                if firing:
+                    updated_configurable = dict(extra_configurable or {})
+                    if firing.get("automation_execution_id") and not updated_configurable.get(
+                        "automation_execution_id"
+                    ):
+                        updated_configurable["automation_execution_id"] = str(
+                            firing["automation_execution_id"]
+                        )
+                    if firing.get("automation_id") and not updated_configurable.get(
+                        "turn_origin_automation_id"
+                    ):
+                        updated_configurable["turn_origin_automation_id"] = str(
+                            firing["automation_id"]
+                        )
+                    extra_configurable = updated_configurable
                 run_handle = await begin_run(
                     request,
                     scope=scope,
@@ -610,8 +674,19 @@ async def astream_ptc_workflow(
                         ),
                         **automation_delivery.turn_metadata(extra_configurable),
                         **run_stamp(config),
+                        **firing,
                         **(run_metadata or {}),
                     },
+                    in_start=(
+                        partial(
+                            _admit_attachments,
+                            turn_attachments,
+                            run_id=run_id,
+                            history=attachment_history,
+                        )
+                        if turn_attachments
+                        else None
+                    ),
                 )
                 # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
                 if getattr(run_handle, "tail_turn_no_new_work", False):
@@ -620,6 +695,10 @@ async def astream_ptc_workflow(
                         run_metadata["tail_turn_no_new_work"] = True
                 upload_claims.mark_admitted()
                 await comments.admitted()
+                if firing:
+                    await automation_settlement.take_over_firing(
+                        firing["automation_execution_id"], run_id
+                    )
         if not is_checkpoint_replay:
             logger.debug(
                 f"[PTC_CHAT] Run started: workspace_id={workspace_id} "
@@ -879,23 +958,34 @@ async def astream_ptc_workflow(
         base_checkpoint_id = await turn_start_checkpoint_id(
             thread_id, request, getattr(ptc_graph, "checkpointer", None)
         )
+        on_claude_code = is_claude_code_model(effective_model)
         cancelled_calls = []
-        if (
-            (route.role == "chief_of_staff" or not is_claude_code_model(effective_model))
-            and request.hitl_response
-            and not request.checkpoint_id
-        ):
+        if request.hitl_response and not request.checkpoint_id:
             # A Home thread the retired Flash agent ran may be waiting on a
-            # step only Flash had, and a thread Claude Code paused on one only
-            # its graph runs. A resume has no base: the route refused one
+            # step only Flash had, a thread Claude Code paused on one only its
+            # graph runs, and a thread another model paused on one Claude
+            # Code's graph lacks. A resume has no base: the route refused one
             # whose pause is off the branch, so the newest checkpoint is the
             # pause it answers.
             cancelled_calls = await cancel_tool_calls_it_lacks(
                 ptc_graph,
                 thread_id,
                 user_id=user_id,
-                by_name=route.role == "chief_of_staff",
+                by_name=route.role == "chief_of_staff" and not on_claude_code,
+                claude_code=on_claude_code,
             )
+        # Read where the turn starts, so an edit or a regenerate is briefed
+        # on the history it runs from. The client shows the turn held while
+        # one is written, as at a switch.
+        handoff_brief = None
+        if on_claude_code and (
+            owed := await brief_owed_at(ptc_graph, thread_id, request.checkpoint_id or base_checkpoint_id)
+        ) is not None and (handoff_brief := await brief_kept_at_head(ptc_graph, thread_id, owed)) is None:
+            yield _turn_held({"status": "held", "reason": "brief"})
+            handoff_brief = await brief_for_turn(
+                owed, session, inputs, user_id=user_id, route=route, reader=effective_model
+            )
+            yield _turn_held({"status": "released"})
 
         if session.sandbox:
             sandbox_id = getattr(session.sandbox, "sandbox_id", None)
@@ -935,7 +1025,7 @@ async def astream_ptc_workflow(
         # DALTON-HOOK(chat-large-upload): pass caller and workspace identity for verified chat_upload materialization
         messages = await attach_request_files(
             messages,
-            request,
+            turn_attachments,
             session,
             effective_model,
             config,
@@ -943,6 +1033,7 @@ async def astream_ptc_workflow(
             user_id=user_id,
             workspace_id=workspace_id,
             is_existing_colleague_thread=(workspace_owner_id != str(user_id)),
+            additional_context=(None if request.hitl_response else request.additional_context),
         )
 
         # Build input state or resume command
@@ -975,6 +1066,14 @@ async def astream_ptc_workflow(
                 "current_agent": "ptc",  # For FileOperationMiddleware SSE events
             }
             # Skill tools auto-load via SkillsMiddleware (sets loaded_skills in state).
+        # A step another model's graph left is one Claude Code's cannot carry
+        # on: the turn opens afresh on the history there, on the brief, as a
+        # regenerate of a turn's start does, keeping a resume's update.
+        if on_claude_code and not isinstance(input_state, dict) and await opens_afresh(
+            ptc_graph, thread_id, request.checkpoint_id
+        ):
+            resumed = input_state.update if isinstance(input_state, Command) else None
+            input_state = {"messages": [], **(resumed or {})}
 
         # =====================================================================
         # Inline Context Injection (directive + widget + chart selection)
@@ -1053,6 +1152,8 @@ async def astream_ptc_workflow(
         # LangSmith / checkpoint inspection can correlate by this UUID.
         graph_config["run_id"] = run_id
         # DALTON-HOOK(chat-large-upload): pass verified project and session into deferred steer materialization
+        if handoff_brief is not None:
+            graph_config["configurable"][BRIEF_CONFIG_KEY] = handoff_brief
         steer_input_id = await open_with_steers_ahead(
             thread_id,
             run_id,
@@ -1251,6 +1352,9 @@ async def astream_ptc_workflow(
         # surface raw as HTTP errors — never SSE frames into a stream whose
         # run was never dispatched (nothing durable exists yet).
         if dispatched and run_handle is None:
+            raise
+        # A firing refused for a drain never started: its executor hands it on.
+        if isinstance(e, restart_drain.Draining):
             raise
         # A resend carries these comments again under a key of its own, so they
         # wait again before the frame asking for it goes out.

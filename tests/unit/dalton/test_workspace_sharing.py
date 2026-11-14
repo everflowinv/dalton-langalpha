@@ -1139,11 +1139,13 @@ class TestWebChannelEndpoints:
             "extend_upload",
             create_autospec(ws_files_uploads.db.extend_upload, return_value=upload_row),
         )
+        from src.server.services import store_multipart
+
         monkeypatch.setattr(
-            ws_files_uploads,
+            store_multipart,
             "sign_upload_part",
             create_autospec(
-                ws_files_uploads.sign_upload_part,
+                store_multipart.sign_upload_part,
                 return_value="https://s3.example/part1",
             ),
         )

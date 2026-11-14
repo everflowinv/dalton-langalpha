@@ -10,6 +10,8 @@ type Action<K extends keyof MessageActions> = NonNullable<MessageActions[K]>;
 
 /** ChatView's raw handlers, before their identities are pinned. */
 export interface MessageActionSources {
+  reportThreadId?: string;
+  feedbackLoading?: boolean;
   onOpenFile: Action<'onOpenFile'>;
   onDownloadFile: Action<'onDownloadFile'>;
   onPublishFile: Action<'onPublishFile'>;
@@ -44,6 +46,7 @@ export interface MessageActionSources {
   onRejectToolCall: Action<'onRejectToolCall'>;
   onThumbUp: Action<'onThumbUp'>;
   onThumbDown: Action<'onThumbDown'>;
+  onThumbDownFollowUp: Action<'onThumbDownFollowUp'>;
   /** Already identity-stable in ChatView; reused here as `onWidgetSendPrompt`. */
   onWidgetSendPrompt: Action<'onWidgetSendPrompt'>;
   /** These three read the composer's current model options at call time. */
@@ -107,6 +110,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
   // re-render the whole transcript through the context value.
   const stableThumbUp = useStableHandler(src.onThumbUp);
   const stableThumbDown = useStableHandler(src.onThumbDown);
+  const stableThumbDownFollowUp = useStableHandler(src.onThumbDownFollowUp);
   const stableSendMessage = src.onWidgetSendPrompt;
 
   // The main transcript's action surface. Every member is identity-stable, so
@@ -160,17 +164,20 @@ export function useMessageActionBundles(src: MessageActionSources): {
           editDrafts,
           onThumbUp: stableThumbUp,
           onThumbDown: stableThumbDown,
+          onThumbDownFollowUp: stableThumbDownFollowUp,
           onWidgetSendPrompt: stableSendMessage,
+          reportThreadId: src.reportThreadId,
+          feedbackLoading: src.feedbackLoading,
         }
   ), [
     readOnly,
-    stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
-    stableOpenChart, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
+    stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
+    stableOpenChart, stableOpenArtifactComment, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableSendMessage, publishAllowed, // DALTON-HOOK(external-share-guard)
+    stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableSendMessage, publishAllowed, src.reportThreadId, src.feedbackLoading, // DALTON-HOOK(external-share-guard)
   ]);
 
   // The subagent transcript is a DIFFERENT surface: its cards belong to a task,

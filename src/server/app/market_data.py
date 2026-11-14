@@ -20,6 +20,9 @@ from src.server.models.market_data import (
     CacheMetadata,
     BatchCacheStats,
     CompanyOverviewResponse,
+    CompanyProfile,
+    CompanyProfilesRequest,
+    CompanyProfilesResponse,
     StockSearchResult,
     StockSearchResponse,
     PriceTargetSummary,
@@ -38,9 +41,10 @@ from src.server.services.cache.intraday_cache_service import (
 from src.server.services.cache.daily_cache_service import (
     DailyCacheService,
 )
-from src.data_client.normalize import series_lineage
+from src.data_client.normalize import listing_currency, series_lineage
 from src.data_client.fmp.fmp_client import FmpQuotaExhausted  # DALTON-HOOK(market-data-fallback)
 from src.server.services.cache.quote_cache_service import QuoteCacheService
+from src.server.services.cache.profile_cache_service import get_profiles
 from src.data_client.freshness import measure_bars, measure_daily, measure_quote
 from market_protocol import (
     InstrumentRef, display_spelling, is_family_index, to_canonical, to_legacy_api,
@@ -85,8 +89,7 @@ def _price_ref(symbol: str, *, is_index: bool = False, equity: bool = False):
 
 
 def _currency_of(symbol: str, *, is_index: bool = False, equity: bool = False) -> Optional[str]:
-    ref = _price_ref(symbol, is_index=is_index, equity=equity)
-    return ref.price_currency if ref else None
+    return listing_currency(_price_ref(symbol, is_index=is_index, equity=equity))
 
 
 class _SeriesMeta(NamedTuple):
@@ -109,7 +112,7 @@ def _series_meta(symbol: str, result, *, is_index: bool = False, equity: bool = 
     treatment, tier = series_lineage(header.get("publisher"), ref)
     return _SeriesMeta(
         fields={
-            "currency": ref.price_currency if ref else None,
+            "currency": listing_currency(ref),
             "timezone": ref.tz if ref else None,
             "price_treatment": header.get("price_treatment") or treatment,
         },
@@ -441,7 +444,9 @@ async def search_stocks(
     Search for stocks by keyword.
     
     Searches both ticker symbols and company names. Returns matching stocks
-    with their symbols, names, and exchange information.
+    with their symbols, names, and exchange information, the closest matches
+    first and the most traded first among equally close ones
+    (:mod:`src.server.services.symbol_search`).
     
     Example queries:
     - "AAPL" - Find by symbol
@@ -452,53 +457,28 @@ async def search_stocks(
         raise HTTPException(status_code=422, detail="Query parameter is required and cannot be empty")
 
     try:
-        from src.utils.cache.redis_cache import get_cache_client
-        from src.data_client import get_financial_data_provider
-        from src.data_client.financial_data_provider import PartialSearch
+        from src.server.services.symbol_search import NoSearchSource, search_symbols
 
-        cache = get_cache_client()
-        cache_key = f"search:{query.strip().lower()}:{limit}"
-
-        cached = await cache.get(cache_key)
-        if cached is not None:
-            results = [StockSearchResult(**r) for r in cached["results"]]
-            if exchange:
-                exchange_set = {e.upper() for e in exchange}
-                results = [r for r in results if r.exchangeShortName and r.exchangeShortName.upper() in exchange_set]
-            return StockSearchResponse(query=query.strip(), results=results, count=len(results))
-
-        provider = await get_financial_data_provider()
-        if provider.financial is None:
+        try:
+            rows = await search_symbols(query, limit, user_id, frozenset(e.upper() for e in exchange))
+        except NoSearchSource:
             raise HTTPException(status_code=503, detail="No financial data provider available")
 
-        complete = True
-        try:
-            raw_results = await provider.financial.search_stocks(query=query.strip(), limit=limit)
-        except PartialSearch as partial:
-            # A directory failed: answer with what the others found, uncached,
-            # so the next search asks it again.
-            raw_results, complete = partial.rows, False
-
-        results = []
-        for item in raw_results:
-            result = StockSearchResult(
+        # Cut before validating: the rows past the limit are never shown, and
+        # a provider row with a null name would otherwise fail the request.
+        results = [
+            StockSearchResult(
                 symbol=item.get("symbol", ""),
-                name=item.get("name", ""),
+                name=item.get("name") or "",
                 nameLocal=item.get("nameLocal"),
                 nameEn=item.get("nameEn"),
                 currency=item.get("currency"),
                 stockExchange=item.get("stockExchange"),
                 exchangeShortName=item.get("exchangeShortName"),
+                match=item.get("match"),
             )
-            results.append(result)
-
-        # Cache unfiltered results
-        if complete:
-            await cache.set(cache_key, {"results": [r.model_dump() for r in results]}, ttl=300)
-
-        if exchange:
-            exchange_set = {e.upper() for e in exchange}
-            results = [r for r in results if r.exchangeShortName and r.exchangeShortName.upper() in exchange_set]
+            for item in rows[:limit]
+        ]
 
         return StockSearchResponse(query=query.strip(), results=results, count=len(results))
 
@@ -574,6 +554,42 @@ async def get_company_overview(symbol: str, user_id: DataReadUserId) -> CompanyO
     except Exception as e:
         logger.error(f"Error fetching company overview for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch company overview: {str(e)}")
+
+
+# =============================================================================
+# Company Profiles Endpoint
+# =============================================================================
+
+@router.post(
+    "/profiles",
+    response_model=CompanyProfilesResponse,
+    summary="Get company profiles",
+    description="Name, sector, industry, market cap, currency, exchange and country for up to 50 stocks.",
+)
+async def get_company_profiles(
+    request: CompanyProfilesRequest,
+    user_id: DataReadUserId,
+) -> CompanyProfilesResponse:
+    """Profiles for many listings, each cached on its own instrument."""
+    errors: dict[str, str] = {}
+    # Keyed by the spelling as sent, so a caller finds each answer under what it
+    # asked for (600519.SS, which answers as 600519.SH); two spellings of one
+    # listing share a read.
+    listings: dict[str, str] = {}
+    for raw in dict.fromkeys(s.strip().upper() for s in request.symbols if s and s.strip()):
+        try:
+            listings[raw] = _listing_symbol(raw)
+        except HTTPException as e:
+            errors[raw] = str(e.detail)
+
+    profiles = await get_profiles(list(dict.fromkeys(listings.values())))
+    results: dict[str, CompanyProfile] = {}
+    for requested, listing in listings.items():
+        if listing in profiles.failed:
+            errors[requested] = profiles.failed[listing]
+        elif profiles.found.get(listing):
+            results[requested] = CompanyProfile(symbol=_requested(requested), **profiles.found[listing])
+    return CompanyProfilesResponse(results=results, errors=errors)
 
 
 # =============================================================================
@@ -759,7 +775,7 @@ def _snapshot(
     """
     return SnapshotData(**{
         **row,
-        "currency": row.get("currency") or ref.price_currency,
+        "currency": row.get("currency") or listing_currency(ref),
         "asset_class": ref.asset_class.value,
         "symbol": symbol,
         "requested": requested,

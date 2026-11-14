@@ -97,11 +97,21 @@ class SubagentRunCoordinator:
         parent_run_id: Optional[str] = None,
         launch_tool_call_id: Optional[str] = None,
         model: Optional[SubagentModel] = None,
+        claude_code: bool = False,
+        stored_token: bool = False,
+        claude_code_model: Optional[str] = None,
+        cli_computer: Optional[str] = None,
     ) -> str:
         """Bear the run row (in_progress) and open its v2 stream; returns the
         new task_run_id. ``model`` is the model the run will use, given only
         when it is not its launcher's; the row and ``lane_open`` both carry
-        it, so a live card and a replayed one agree.
+        it, so a live card and a replayed one agree. A run on Claude Code
+        (``claude_code``) is refused once the computer that runs its CLI runs
+        as many as it may (``hosted.cli_cap``): the own computer
+        ``cli_computer`` where one runs it for a workspace on another, which
+        the row names, else the thread's; and while the Claude plan it would
+        sign in on there is used up for ``claude_code_model``, the model its
+        CLI runs (``subagent_plan_refusal``).
 
         Called under the task's namespace guard, BEFORE the writer spawns.
         Any constraint conflict raises TaskRunRejected — the spawn/resume
@@ -124,6 +134,22 @@ class SubagentRunCoordinator:
             # pred is None for a pre-ledger task resumed after the ledger
             # shipped: the upsert adopts it with an unchained first run.
 
+        from src.config.settings import HOST_MODE
+        from src.server.services.claude_code.hosted import cli_host
+
+        computer = await cli_host(self.thread_id, cli_computer) if claude_code else None
+        if computer is not None and claude_code_model:
+            from src.server.services.llm.claude_code import subagent_plan_refusal
+
+            # A replay of a Task call that already started its run is told
+            # so below (``DuplicateLaunchError``), not that it never started.
+            if (refusal := await subagent_plan_refusal(computer, claude_code_model, stored_token)) and not (
+                parent_run_id
+                and launch_tool_call_id
+                and await sr_db.find_run_by_launch_call(parent_run_id, launch_tool_call_id)
+            ):
+                raise TaskRunRejected(refusal, whole=True)
+
         try:
             run_row = await sr_db.start_task_run(
                 task_run_id=task_run_id,
@@ -137,7 +163,15 @@ class SubagentRunCoordinator:
                 predecessor_run_id=predecessor_run_id,
                 start_checkpoint_id=start_checkpoint_id,
                 model=model,
+                claude_code=claude_code,
+                stored_token=claude_code and stored_token and HOST_MODE == "platform",
+                cli_cap=self._cli_cap(computer),
+                cli_computer=cli_computer if claude_code else None,
             )
+        except sr_db.ClaudeCodeCapError as e:
+            from src.server.services.claude_code.hosted import cli_cap_refusal
+
+            raise TaskRunRejected(cli_cap_refusal(e.cap, alone=e.alone), busy=not e.alone, final=e.alone) from e
         except sr_db.DuplicateLaunchError as e:
             raise TaskRunRejected(
                 f"this Task call already spawned run "
@@ -221,6 +255,15 @@ class SubagentRunCoordinator:
             parent_run_id=parent_run_id,
         )
         return str(run_row["task_run_id"])
+
+    @staticmethod
+    def _cli_cap(computer: Optional[Dict[str, Any]]) -> Optional[tuple[str, int]]:
+        """The computer that runs the run's CLI and how many Claude Code CLIs
+        it runs at once; None where it has none or its size is unknown."""
+        from src.server.services.claude_code.hosted import cli_cap
+
+        cap = cli_cap(computer) if computer is not None else None
+        return (str(computer["computer_id"]), cap) if cap is not None else None
 
     async def _mark_delivered_quietly(self, task_run_id: str) -> None:
         """Stamp the delivery, never failing the caller for it.

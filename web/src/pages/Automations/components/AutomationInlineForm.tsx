@@ -149,7 +149,7 @@ export default function AutomationInlineForm({
     <motion.div {...PANE_ENTER} exit={{ opacity: 0, transition: TWEEN.exit }}>
       <form onSubmit={handleSubmit} className="automation-form">
         {notice}
-        <div className="automation-form-rows">
+        <div className="automation-form-rows rule-t rule-b">
           <FormRow label={t('common.name')} htmlFor={ids.name}>
             <Input
               id={ids.name}

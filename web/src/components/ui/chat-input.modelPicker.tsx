@@ -12,10 +12,15 @@ import { ComposerPopover, MENU_ROW, usePickToDraft } from './chat-input.composer
 import { getModelDisplayName } from './chat-input.helpers';
 import { cn } from '@/lib/utils';
 import { llmProviderArt } from '@/lib/brandArt';
+import { isClaudeCodeModel } from '@/lib/claudeCode';
+import { CheckNowFor } from '@/components/modelAccess/PlanCheck';
+import { PickerPlanMeter, type PickerMeter } from '@/components/modelAccess/PlanUsage';
+import type { CheckTarget } from '@/components/modelAccess/usePlanCheck';
 import { isImeComposing } from '@/lib/ime';
 import type { ModelConnection, ModelGroup } from '@/lib/modelGroups';
 import { isSubscription, subscriptionPayer, type Payer } from '@/lib/modelPayer';
 import { usePayerLabel } from '@/hooks/usePayerLabel';
+import { useNow } from '@/hooks/useNow';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { ModelMark, MarkedModelName } from '@/components/model/ModelMark';
 import { PayerBadge } from '@/components/model/PayerBadge';
@@ -27,8 +32,10 @@ type Metadata = Record<string, ModelMetadataEntry>;
 /** What a row says about its model: a tag beside the name for one that is a
  *  pick, or, for one that is not, why, under its name where a sentence fits.
  *  A row held back by something the user can fix takes them there instead of
- *  picking, through `fix`. */
-export type ModelRowStatus = { tag?: string } | { unavailable: string; fix?: () => void };
+ *  picking, through `fix`. One a check may free offers Check now, through
+ *  `check`, and stays enabled so the control is reached as a row's second
+ *  one is, though a press on the row itself does nothing. */
+export type ModelRowStatus = { tag?: string } | { unavailable: string; fix?: () => void; check?: CheckTarget };
 
 interface ListProps {
   selectedModel: string | null;
@@ -41,7 +48,12 @@ interface ListProps {
    *  under the favorites so the current model is always on the first tab. */
   recent: string[];
   onToggleFavorite: (model: string, favorite: boolean) => void;
-  rowStatus: (model: string) => ModelRowStatus;
+  /** What the row says at `now`, the picker's minute clock, so a hold that
+   *  ends while the picker is open ends there too. */
+  rowStatus: (model: string, now: number) => ModelRowStatus;
+  /** The Claude plan Claude Code's models run on here, which heads their
+   *  tab, and Favorites while the current model is one of them. */
+  planMeter?: PickerMeter;
 }
 
 /**
@@ -82,10 +94,11 @@ export function ModelPicker({
       <ModelList
         {...list}
         onPick={(model) => {
-          const status = list.rowStatus(model);
+          const status = list.rowStatus(model, Date.now());
           if ('unavailable' in status) {
+            if (!status.fix) return;
             onOpenChange(false);
-            status.fix?.();
+            status.fix();
             return;
           }
           onPick(model);
@@ -138,10 +151,11 @@ function viewOf({ query, tab, connectionTab, groups, favorites, recent, selected
 /** The picker's content, mounted while it is open, so the search, the tab and
  *  the brand's payer start over on each opening. */
 function ModelList({
-  selectedModel, metadata, payers, groups, favorites, recent, onToggleFavorite, rowStatus, onPick, onManage,
+  selectedModel, metadata, payers, groups, favorites, recent, onToggleFavorite, rowStatus, planMeter, onPick, onManage,
 }: ListProps & { onPick: (model: string) => void; onManage: () => void }) {
   const { t } = useTranslation();
   const payerLabel = usePayerLabel();
+  const now = useNow();
   const [query, setQuery] = useState('');
   const [tab, setTab] = useState<string | null>(null);
   const [connectionTab, setConnectionTab] = useState<string | null>(null);
@@ -166,7 +180,12 @@ function ModelList({
   // The tab's own subscription (Claude Code's) is named by its header already.
   const headerNamesPayer = view.kind === 'brand' && headerPayer === subscriptionPayer(view.group.id);
   const inThread = view.kind === 'favorites' ? view.recent : [];
-  const first = [...view.rows, ...inThread].find((m) => !('unavailable' in rowStatus(m)));
+  const first = [...view.rows, ...inThread].find((m) => !('unavailable' in rowStatus(m, now)));
+  // Claude Code's plan heads the tab of its models, and Favorites while the
+  // current model is one of them.
+  const isClaudeCode = (m: string | null) => !!m && isClaudeCodeModel(metadata?.[m]);
+  const meter = (view.kind === 'brand' && view.connection.models.some(isClaudeCode))
+    || (view.kind === 'favorites' && isClaudeCode(selectedModel)) ? planMeter : undefined;
   const favoriteSet = new Set(favorites);
 
   // The current model's check is what the user looks for on opening, and a
@@ -198,14 +217,14 @@ function ModelList({
       payer={headerPayer ? undefined : payers[m]}
       selected={m === selectedModel}
       favorite={favoriteSet.has(m)}
-      status={rowStatus(m)}
+      status={rowStatus(m, now)}
       onToggleFavorite={onToggleFavorite}
     />
   );
 
   return (
     <>
-      <div className="flex flex-none items-center border-b border-(--color-border-muted) pr-2">
+      <div className="rule-b flex flex-none items-center pr-2">
         {/* A grid takes no virtual focus from a search field, so the field
             hands over itself: Down moves into the list, and Enter picks the
             top row. Any other key goes on, so Escape still closes. */}
@@ -228,7 +247,8 @@ function ModelList({
             }
           }}
           autoFocus
-          className="min-w-0 flex-1 border-b-0"
+          ruled={false}
+          className="min-w-0 flex-1"
         />
         <Button
           aria-label={t('chat.modelSelector.manageModels')}
@@ -246,7 +266,7 @@ function ModelList({
       <div className="flex h-[11.5rem] min-h-0">
         {/* Out of the flow, so a long rail scrolls rather than sets the
             height; a curated list keeps the picker short. */}
-        <div className="relative w-11 flex-none border-r border-(--color-border-muted)">
+        <div className="relative w-11 flex-none border-r border-[color:var(--color-shell-divider,var(--color-border-muted))]">
           {/* The toggle group takes no ref, so a box of its own scrolls it. */}
           <div
             ref={attachRail}
@@ -269,7 +289,7 @@ function ModelList({
                   key={g.id}
                   id={g.id}
                   label={g.label}
-                  dot={g.connections.some((c) => isSubscription(c.payer) && c.models.some((m) => !('unavailable' in rowStatus(m))))}
+                  dot={g.connections.some((c) => isSubscription(c.payer) && c.models.some((m) => !('unavailable' in rowStatus(m, now))))}
                 >
                   <RailIcon provider={g.id} label={g.label} />
                 </RailTab>
@@ -280,7 +300,7 @@ function ModelList({
         <div className="flex min-w-0 flex-1 flex-col">
           {header && (
             <div className="flex flex-none items-center justify-between gap-2 px-3 pb-1 pt-2 text-xs text-(--color-text-tertiary)">
-              <span className="truncate">{header}</span>
+              {meter ? <PickerPlanMeter meter={meter} /> : <span data-slot="menu-label" className="truncate">{header}</span>}
               {view.kind === 'brand' && view.group.connections.length > 1 ? (
                 <ToggleButtonGroup
                   aria-label={t('chat.modelSelector.paidBy')}
@@ -291,7 +311,10 @@ function ModelList({
                     const [next] = keys;
                     if (next !== undefined) setConnectionTab(String(next));
                   }}
-                  className="flex flex-none gap-0.5 rounded-md bg-(--color-bg-tag) p-0.5"
+                  // One of the segmented controls, which the open card
+                  // styles draw without a track (styles/cardStyle.css).
+                  data-slot="segmented"
+                  className="flex flex-none gap-0.5 rounded-md bg-[var(--color-shell-fill,var(--color-bg-tag))] p-0.5"
                 >
                   {view.group.connections.map((c) => (
                     <ToggleButton
@@ -299,7 +322,7 @@ function ModelList({
                       id={c.id}
                       className={cn(
                         'rounded px-1.5 py-px text-[0.625rem] font-medium leading-normal text-(--color-text-tertiary) outline-hidden',
-                        'data-hovered:text-(--color-text-secondary) data-selected:bg-(--color-bg-elevated) data-selected:text-(--color-text-primary)',
+                        'data-hovered:text-(--color-text-secondary) data-selected:bg-[var(--color-shell-fill,var(--color-bg-elevated))] data-selected:text-(--color-text-primary)',
                         'data-focus-visible:outline-current',
                       )}
                     >
@@ -328,7 +351,7 @@ function ModelList({
             {view.rows.map(row)}
             {inThread.length > 0 && (
               <GridListSection>
-                <GridListHeader className="px-2 pb-1 pt-2.5 text-xs text-(--color-text-tertiary)">
+                <GridListHeader data-slot="menu-label" className="px-2 pb-1 pt-2.5 text-xs text-(--color-text-tertiary)">
                   {t('chat.modelSelector.inThread')}
                 </GridListHeader>
                 {inThread.map(row)}
@@ -385,8 +408,10 @@ function RailTab({ id, label, dot = false, children }: {
       id={id}
       aria-label={label}
       className={cn(
-        'relative flex h-8 w-8 flex-none items-center justify-center rounded-lg outline-hidden',
-        'data-hovered:bg-(--color-bg-hover) data-selected:bg-(--color-bg-tag)',
+        'relative flex h-8 w-8 flex-none items-center justify-center rounded-[var(--cs-radius-control,var(--radius-lg))] outline-hidden',
+        // The open card styles pick a provider with the front tab's edge, not a fill.
+        'data-hovered:bg-(--color-bg-hover) data-selected:bg-[color:var(--color-shell-fill,var(--color-bg-tag))]',
+        'data-selected:shadow-[inset_0_0_0_1px_var(--color-shell-front,transparent)]',
         'data-focus-visible:outline-current',
       )}
     >
@@ -426,7 +451,8 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
   const provider = metadata?.[model]?.provider;
   const name = getModelDisplayName(model, metadata);
   const reason = 'unavailable' in status ? status.unavailable : undefined;
-  const fixable = 'unavailable' in status && !!status.fix;
+  const check = 'unavailable' in status ? status.check : undefined;
+  const actionable = 'unavailable' in status && (!!status.fix || !!check);
   const tag = 'tag' in status ? status.tag : undefined;
   return (
     <GridListItem
@@ -435,8 +461,9 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
       // A row a reason holds back says it as part of its name, which is all a
       // screen reader reads of a row.
       textValue={reason ? `${name}, ${reason}` : name}
-      isDisabled={reason !== undefined && !fixable}
-      className={cn('group', MENU_ROW, 'data-disabled:text-(--color-text-tertiary)', fixable && 'text-(--color-text-tertiary)')}
+      isDisabled={reason !== undefined && !actionable}
+      data-slot="menu-item"
+      className={cn('group', MENU_ROW, 'data-disabled:text-(--color-text-tertiary)', actionable && 'text-(--color-text-tertiary)')}
     >
       {/* One line holds the name and everything after it, so the check and
           the star sit level with the name whether or not a reason goes under. */}
@@ -445,7 +472,7 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
           <span className="flex min-w-0 flex-1 items-center gap-2">
             <MarkedModelName provider={provider} name={name} nameClassName="min-w-0 truncate" />
           </span>
-          <PayerBadge payer={payer} />
+          <PayerBadge payer={payer} markLegacy={false} />
           {tag && <span className="flex-none text-xs text-(--color-text-tertiary)">{tag}</span>}
           <Check aria-hidden className={cn('h-4 w-4 flex-none text-(--color-accent-primary)', !selected && 'invisible')} />
           {selected && <span className="sr-only">{t('chat.modelSelector.current')}</span>}
@@ -465,10 +492,12 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
             <Star aria-hidden className="h-3.5 w-3.5" fill={favorite ? 'currentColor' : 'none'} />
           </Button>
         </span>
-        {/* Under the name itself, past the mark and its gap, and clear of the star's column. */}
+        {/* Under the name itself, past the mark and its gap, and clear of the
+            star's column, which Check now takes on this line where it is offered. */}
         {reason && (
-          <span className={cn('pe-7 text-xs text-pretty text-(--color-text-tertiary)', provider && llmProviderArt(provider) && 'ps-[1.375rem]')}>
-            {reason}
+          <span className={cn('flex items-start gap-2 text-xs text-(--color-text-tertiary)', !check && 'pe-7', provider && llmProviderArt(provider) && 'ps-[1.375rem]')}>
+            <span className="min-w-0 flex-1 text-pretty">{reason}</span>
+            {check && <CheckNowFor target={check} icon />}
           </span>
         )}
       </span>

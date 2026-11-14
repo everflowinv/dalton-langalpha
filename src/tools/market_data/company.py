@@ -49,7 +49,7 @@ from .segments import SegmentBreakdown, fetch_segments, segment_lines
 from .utils import finite_or_none, format_percentage, get_market_session
 from src.dalton.extended_hours import snapshot_quote_time_labels  # DALTON-HOOK(extended-hours-quotes)
 from src.data_client import get_financial_data_provider, get_market_data_provider
-from src.data_client.ginlix_data.directory import display_names
+from src.data_client.ginlix_data.directory import display_names, profile_name
 from src.data_client.normalize import change_from, minor_unit_places
 from src.utils.market_hours import ET
 from market_protocol import AssetClass, InstrumentRef
@@ -185,6 +185,13 @@ class CompanyInputs:
         # headline price; the profile is the fallback when there is no snapshot.
         return current_price(self.snapshot or {}) or self.profile.get("price")
 
+    @property
+    def money(self) -> DisplaySpec:
+        # Earnings and statement figures print at two places in the listing's
+        # currency, and bare for a venue whose currency is unknown, never in
+        # the dollars a missing code would default to.
+        return DisplaySpec(self.cur.currency, 2, bare=self.cur.bare)
+
 
 async def _first_row(rows_aw: Any) -> Optional[Dict[str, Any]]:
     return _first(await rows_aw)
@@ -276,7 +283,7 @@ async def _gather_company(
         ref=ref,
         cur=cur,
         profile=profile,
-        name=profile.get("nameLocal") or local_name or profile.get("companyName", symbol),
+        name=profile_name(profile, local_name) or symbol,
         name_en=profile.get("companyName") or directory_en,
         income=income,
         # Earnings rows are consensus figures per listed security, in its
@@ -787,7 +794,7 @@ def _filing_lines(inp: CompanyInputs) -> List[str]:
 def _cash_flow_lines(inp: CompanyInputs) -> List[str]:
     if not inp.cash_flow:
         return []
-    cur = inp.cash_flow_cur
+    cur = inp.cash_flow_cur or inp.money
     out = [
         "### Cash Flow (Quarterly)",
         "",
@@ -893,11 +900,11 @@ def _company_text(inp: CompanyInputs) -> str:
         *_performance_lines(inp),
         *_metrics_lines(inp),
         *_filing_lines(inp),
-        *next_earnings_lines(inp.earnings, inp.cur.currency),
-        *earnings_lines(inp.earnings, inp.cur.currency),
+        *next_earnings_lines(inp.earnings, inp.money),
+        *earnings_lines(inp.earnings, inp.money),
         *_cash_flow_lines(inp),
         *_analyst_lines(inp),
-        *segment_lines(inp.segments, inp.fiscal, inp.stmt_cur),
+        *segment_lines(inp.segments, inp.fiscal, inp.stmt_cur or inp.money),
     ]
     # Best-effort: a malformed snapshot must never blow away the assembled overview.
     stamp = None

@@ -12,6 +12,7 @@ import AuthConfirm from './pages/Login/AuthConfirm';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from './contexts/AuthContext';
 import { useIsMobile } from './hooks/useIsMobile';
+import { useSyncAppearance } from './hooks/useAppearance';
 import { useLocale } from './hooks/useLocale';
 import { useSetupGate } from './hooks/useSetupGate';
 import { isPlatformMode, APP_ENTRY_PATH } from './config/hostMode';
@@ -31,6 +32,10 @@ import { forgetHostedSignIn, hostedSignInReturn, landAfterSignIn } from './lib/h
 import { markBooted, reloadIfStale, watchStaleBuild } from './lib/staleBuild';
 import { appSectionOf } from './lib/appRoutes';
 import { lazyWithMotion } from './lib/lazyWithMotion';
+import { CommandPaletteProvider } from './components/CommandPalette/CommandPaletteProvider';
+import { CreateWorkspaceHost } from './components/CreateWorkspaceHost';
+import { DesktopMenuCommands } from './lib/desktopMenuCommands/DesktopMenuCommands';
+import { setSentryUser } from './lib/sentry';
 import './App.css';
 
 // Login carries the market-tape canvas subsystem (~2k lines that only a
@@ -48,6 +53,8 @@ const SetupWizard = lazyWithMotion(() => import('./pages/Setup/SetupWizard'));
 // shell's to load rather than one of Main's routes.
 const Welcome = lazyWithMotion(() => import('./pages/Onboarding/welcome/Welcome'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
+// The desktop shell's menu bar panel, loaded only in that window.
+const DesktopMenubar = React.lazy(() => import('./pages/DesktopMenubar/MenubarPage'));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
@@ -384,23 +391,26 @@ function AuthenticatedShell() {
           </Suspense>
         )
       ) : (
-        <>
-          <div className="app-layout">
-            {!isMobile && (
-              <AppSidebar
-                collapsed={sidebarCollapsed}
-                onToggleCollapse={toggleSidebar}
-                width={sidebarWidth}
-                onWidthChange={handleSidebarWidthChange}
-              />
-            )}
-            {isMobile && !hideTabBar && <BottomTabBar />}
-            <main ref={mainRef} className={`app-main${hideTabBar ? ' app-main--no-tab' : ''}`}>
-              <Main />
-            </main>
-          </div>
-          <OnboardingHostGate />
-        </>
+        <CreateWorkspaceHost>
+          <CommandPaletteProvider>
+            <div className="app-layout">
+              {!isMobile && (
+                <AppSidebar
+                  collapsed={sidebarCollapsed}
+                  onToggleCollapse={toggleSidebar}
+                  width={sidebarWidth}
+                  onWidthChange={handleSidebarWidthChange}
+                />
+              )}
+              {isMobile && !hideTabBar && <BottomTabBar />}
+              <main ref={mainRef} className={`app-main${hideTabBar ? ' app-main--no-tab' : ''}`}>
+                <Main />
+              </main>
+            </div>
+            <OnboardingHostGate />
+            <DesktopMenuCommands onToggleSidebar={isMobile ? undefined : toggleSidebar} />
+          </CommandPaletteProvider>
+        </CreateWorkspaceHost>
       )}
       <ConnectConsentHost />
       <ConnectLandingHost />
@@ -418,8 +428,19 @@ function AriaLocale({ children }: { children: React.ReactNode }) {
   return <I18nProvider locale={locale}>{children}</I18nProvider>;
 }
 
+/** The account's look, applied on every signed-in page: the setup wizard and
+ *  the welcome flow render outside Main, and a fresh browser has to show the
+ *  account's look there too. Mounted only while signed in, so a sign-out ends
+ *  it and the next account's sign-in starts it afresh. */
+function AppearanceSync() {
+  useSyncAppearance();
+  return null;
+}
+
 function App() {
-  const { isLoggedIn, isInitialized } = useAuth();
+  const { isLoggedIn, isInitialized, userId } = useAuth();
+
+  useEffect(() => setSentryUser(isLoggedIn ? userId : null), [isLoggedIn, userId]);
 
   // App, not AuthenticatedShell: this has to cover the logged-out routes too,
   // and a stale /login chunk is just as fatal as a stale /dashboard one. Mount
@@ -453,6 +474,7 @@ function App() {
 
   return (
     <AriaLocale>
+    {isLoggedIn && <AppearanceSync />}
     <Routes>
       <Route path={APP_ENTRY_PATH} element={appEntryElement} />
       {isPlatformMode && APP_ENTRY_PATH === '/' && (
@@ -513,6 +535,14 @@ function App() {
         ) : (
           <Navigate to={APP_ENTRY_PATH} replace />
         )
+      } />
+      {/* The desktop shell's menu bar window. None of the app shell, and its
+          own signed-out state rather than the entry's: a sign-in started
+          here would take over a panel too small to hold it. */}
+      <Route path="/desktop/menubar" element={
+        <Suspense fallback={null}>
+          <DesktopMenubar />
+        </Suspense>
       } />
       <Route path="/*" element={
         isLoggedIn ? <AuthenticatedShell /> : <Navigate to={APP_ENTRY_PATH} replace />

@@ -4,6 +4,25 @@ import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import { ErrorBanner } from '../error-banner';
 import type { StructuredError } from '@/utils/rateLimitError';
 
+// The model's display name comes from the cached catalog, which the app's
+// query client holds; here the key stands for it.
+vi.mock('@/hooks/useModelName', () => ({ useModelName: () => (id: string) => id }));
+// A plan's reset is told in the reader's zone; here a fixed one.
+vi.mock('@/hooks/useClaudeCodePlan', () => ({
+  usePlanClock: () => ({ locale: 'en-US', zone: 'America/New_York', now: Date.parse('2026-11-06T19:05:00Z') }),
+}));
+
+const desktop = vi.hoisted(() => ({ shell: false }));
+vi.mock('@/lib/desktop', async (original) => ({
+  ...(await original<typeof import('@/lib/desktop')>()),
+  isDesktopShell: () => desktop.shell,
+}));
+// The control for a computer too small for Claude Code decides what it reads
+// from the computer's row and plan; here it only names the computer.
+vi.mock('@/pages/ChatAgent/components/MediumActionLink', () => ({
+  MediumActionLink: ({ computerId }: { computerId: string }) => <span>{`medium:${computerId}`}</span>,
+}));
+
 function LocationProbe({ onPath }: { onPath: (path: string) => void }) {
   const loc = useLocation();
   onPath(loc.pathname);
@@ -111,6 +130,52 @@ describe('ErrorBanner', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
   });
 
+  it('draws a link that resizes a computer as the control for it, not an anchor to the link\'s own url', () => {
+    const err: StructuredError = {
+      message: 'Claude Code needs a Medium cloud computer.',
+      links: [{ url: '?resize=c-1', label: 'Change spec', resize: 'c-1' }],
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('medium:c-1')).toBeInTheDocument();
+    expect(screen.queryByRole('link')).toBeNull();
+    expect(screen.queryByText('Change spec')).toBeNull();
+  });
+
+  it('opens an account console page in a new tab in a browser', () => {
+    desktop.shell = false;
+    const err: StructuredError = {
+      message: 'Monthly credit limit reached.',
+      links: [{ url: '/account/plans', label: 'Upgrade plan', console: true }],
+    };
+    let currentPath = '';
+    renderInRouter(<ErrorBanner error={err} />, (p) => { currentPath = p; });
+    const link = screen.getByRole('link', { name: 'Upgrade plan' });
+    expect(link).toHaveAttribute('href', '/account/plans');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    fireEvent.click(link);
+    expect(currentPath).toBe('/start');
+  });
+
+  it('opens an account console page in this window in the desktop app, which would send a new tab to a signed-out browser', () => {
+    desktop.shell = true;
+    const err: StructuredError = {
+      message: 'Monthly credit limit reached.',
+      links: [{ url: '/account/plans', label: 'Upgrade plan', console: true }],
+    };
+    let currentPath = '';
+    renderInRouter(<ErrorBanner error={err} />, (p) => { currentPath = p; });
+    const link = screen.getByRole('link', { name: 'Upgrade plan' });
+    expect(link).toHaveAttribute('href', '/account/plans');
+    expect(link).not.toHaveAttribute('target');
+    const stayPut = (e: Event) => e.preventDefault();
+    document.addEventListener('click', stayPut);
+    fireEvent.click(link);
+    document.removeEventListener('click', stayPut);
+    expect(currentPath).toBe('/start');
+    desktop.shell = false;
+  });
+
   it('renders upstream hints as a bulleted list', () => {
     const err: StructuredError = {
       message: 'Upstream provider error',
@@ -190,6 +255,28 @@ describe('ErrorBanner', () => {
     expect(row).toHaveTextContent(err.message);
     expect(row.getAttribute('style')).toContain('var(--color-text-tertiary)');
     expect(container.innerHTML).not.toContain('--color-loss');
+  });
+
+  it("shows a subscription's limit as the plan card, without the provider's words or hints", () => {
+    const err: StructuredError = {
+      message: "Error code: 429 - {'error': {'type': 'usage_limit_reached'}}",
+      kind: 'upstream',
+      statusCode: 429,
+      payer: 'subscription',
+      account: 'ChatGPT',
+      reason: 'plan_limit',
+      hints: ['try_another_model'],
+      planLimit: { plan: 'ChatGPT Plus', window: 'seven_day', until: '2026-11-06T20:40:00Z' },
+    };
+    renderInRouter(<ErrorBanner error={err} />);
+    expect(screen.getByText('ChatGPT Plus plan limit reached')).toBeInTheDocument();
+    expect(screen.getByText(
+      "Your ChatGPT Plus plan's weekly limit is used up. It resets at 3:40 PM. Pick another model, or send this again after it resets.",
+    )).toBeInTheDocument();
+    expect(screen.queryByText(/usage_limit_reached/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/The model provider returned an error/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/connected subscription/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('listitem')).not.toBeInTheDocument();
   });
 
   it('keeps the error style for a failure', () => {

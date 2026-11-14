@@ -12,11 +12,13 @@ setup-error workflow dies.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch  # DALTON-HOOK(chat-large-upload)
 
 import pytest
 
+from src.server.dependencies import usage_limits as usage_limits_deps  # DALTON-HOOK(chat-large-upload)
 from src.server.handlers.chat import error_handling
+from src.server.models.additional_context import SkillContext
 from src.server.services.runs.admission import RunScope
 
 # The scope routes releases through the definition site — patch it there.
@@ -339,7 +341,7 @@ _SEND = {"messages": [{"role": "user", "content": "what moved NVDA?"}]}
         ),
         # Context sent beside the text is kept by no row: a retry brings it.
         (
-            {**_SEND, "additional_context": [{"type": "skills", "name": "dcf-model"}]},
+            {**_SEND, "additional_context": [SkillContext(name="dcf-model")]},
             {"checkpoint_id": None, "context": True},
             "retry",
         ),
@@ -615,3 +617,283 @@ async def test_http_body_still_aborts_on_a_failure_with_no_frame():
 
     with pytest.raises(ConnectionError):
         await _consume(error_handling.end_after_failure_frame(stream))
+
+
+# DALTON-HOOK(chat-large-upload): transient 5xx storage errors on steer_only emit structured recoverable error frame
+@pytest.mark.asyncio
+async def test_transient_http_503_on_steer_only_emits_recoverable_error_frame(coordinator):
+    import json
+    from src.dalton.services import chat_uploads as chat_uploads_svc
+    from src.server.services.runs.sse_producer import RunSSEProducer
+
+    # Trigger the real _read_upstream_object_bytes exception path rather than hand-crafting it.
+    with patch.object(
+        chat_uploads_svc,
+        "get_upstream_attachment_bytes",
+        create_autospec(
+            chat_uploads_svc.get_upstream_attachment_bytes,
+            side_effect=TimeoutError("S3 timed out"),
+        ),
+    ):
+        with pytest.raises(chat_uploads_svc.HTTPException) as exc_info:
+            await chat_uploads_svc._read_upstream_object_bytes("chat-attachments/u-1/a-1/doc.pdf")
+
+    err = exc_info.value
+    assert err.status_code == 503
+    classification = error_handling.classify_error(err)
+    assert classification["is_recoverable"] is True
+    assert classification["error_type"] == "transient_error"
+
+    req = _make_request(messages=[{"role": "user", "content": "check"}])
+    req.steer_only = True
+
+    producer = RunSSEProducer(thread_id="t-steer-503", run_id="r-steer-503")
+
+    with (
+        patch(RELEASE, new=create_autospec(usage_limits_deps.release_burst_slot)),
+        patch.object(
+            error_handling,
+            "get_max_workflow_retries",
+            create_autospec(error_handling.get_max_workflow_retries, return_value=3),
+        ),
+    ):
+        raw_frames = await _consume(
+            error_handling.handle_workflow_error(
+                e=err,
+                thread_id="t-steer-503",
+                user_id="u-1",
+                workspace_id="ws-1",
+                handler=producer,
+                token_callback=None,
+                scope=_scope(None),
+                start_time=0.0,
+                request=req,
+                is_byok=False,
+            )
+        )
+
+    assert len(raw_frames) == 1
+    lines = dict(line.split(": ", 1) for line in raw_frames[0].strip().splitlines())
+    assert lines["event"] == "error"
+    payload = json.loads(lines["data"])
+    assert payload["type"] == "workflow_error"
+    assert payload["error_type"] == "transient_error"
+    assert payload["is_recoverable"] is True
+    assert payload["retryable"] is True
+    assert payload["status_code"] == 503
+    assert payload["recovery"] == "resend"
+    assert "Temporarily unable to read attachment" in payload["error"]
+    coordinator.finalize_run.assert_not_awaited()
+
+
+# DALTON-HOOK(chat-large-upload): write-stage multipart part upload and complete failures are also recoverable on steer_only SSE
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_detail"),
+    [
+        ("part_upload", "Failed to stage inline attachment part. Please retry."),
+        ("complete", "Failed to assemble staged inline attachment."),
+    ],
+)
+async def test_steer_write_stage_503_emits_recoverable_error_frame(
+    coordinator, failure_stage: str, expected_detail: str
+):
+    import json
+    from src.dalton.services import chat_uploads as chat_uploads_svc
+    from src.server.services.runs.sse_producer import RunSSEProducer
+
+    def _create_upload_guarded(**kwargs):
+        return {
+            "upload_id": kwargs["upload_id"],
+            "object_key": kwargs["object_key"],
+            "store_upload_id": kwargs["store_upload_id"],
+            "state": "uploading",
+        }
+
+    def _record_uploaded_part(upload_id: str, **kwargs):
+        return {"upload_id": upload_id, "state": "uploading"}
+
+    def _claim_complete(upload_id: str, **kwargs):
+        return {"upload_id": upload_id, "claim_token": "claim-1", "state": "completing"}
+
+    def _mark_failed(upload_id: str, **kwargs):
+        return {
+            "upload_id": upload_id,
+            "object_key": "chat-uploads/ws-1/up/report.pdf",
+            "store_upload_id": "mp-write-1",
+            "state": "failed",
+        }
+
+    def _abort_upload(upload_id: str, **kwargs):
+        return {
+            "upload_id": upload_id,
+            "object_key": "chat-uploads/ws-1/up/report.pdf",
+            "store_upload_id": "mp-write-1",
+            "state": "aborted",
+        }
+
+    part_return = None if failure_stage == "part_upload" else '"etag-1"'
+    complete_return = False if failure_stage == "complete" else True
+
+    with (
+        patch.object(
+            chat_uploads_svc.storage,
+            "open_multipart_upload",
+            create_autospec(chat_uploads_svc.storage.open_multipart_upload, return_value="mp-write-1"),
+        ),
+        patch.object(
+            chat_uploads_svc.storage,
+            "upload_part_bytes",
+            create_autospec(chat_uploads_svc.storage.upload_part_bytes, return_value=part_return),
+        ),
+        patch.object(
+            chat_uploads_svc.storage,
+            "complete_multipart_upload",
+            create_autospec(chat_uploads_svc.storage.complete_multipart_upload, return_value=complete_return),
+        ),
+        patch.object(
+            chat_uploads_svc.storage,
+            "abort_multipart_upload",
+            create_autospec(chat_uploads_svc.storage.abort_multipart_upload, return_value=True),
+        ),
+        patch.object(
+            chat_uploads_svc.storage,
+            "delete_object",
+            create_autospec(chat_uploads_svc.storage.delete_object, return_value=True),
+        ),
+        patch.object(
+            chat_uploads_svc.db,
+            "create_upload_guarded",
+            create_autospec(chat_uploads_svc.db.create_upload_guarded, side_effect=_create_upload_guarded),
+        ),
+        patch.object(
+            chat_uploads_svc.db,
+            "record_uploaded_part",
+            create_autospec(chat_uploads_svc.db.record_uploaded_part, side_effect=_record_uploaded_part),
+        ),
+        patch.object(
+            chat_uploads_svc.db,
+            "claim_complete",
+            create_autospec(chat_uploads_svc.db.claim_complete, side_effect=_claim_complete),
+        ),
+        patch.object(
+            chat_uploads_svc.db,
+            "abort_upload",
+            create_autospec(chat_uploads_svc.db.abort_upload, side_effect=_abort_upload),
+        ),
+        patch.object(
+            chat_uploads_svc.db,
+            "mark_failed",
+            create_autospec(chat_uploads_svc.db.mark_failed, side_effect=_mark_failed),
+        ),
+        patch.object(
+            chat_uploads_svc.db,
+            "mark_cleaned",
+            create_autospec(chat_uploads_svc.db.mark_cleaned, return_value={}),
+        ),
+    ):
+        with pytest.raises(chat_uploads_svc.HTTPException) as exc_info:
+            await chat_uploads_svc._stage_single_bytes_attachment(
+                raw_bytes=b"%PDF-1.4\npayload",
+                raw_name="report.pdf",
+                mime_type="application/pdf",
+                user_id="u-1",
+                canonical_ws="ws-1",
+            )
+
+    err = exc_info.value
+    assert err.status_code == 503
+    classification = error_handling.classify_error(err)
+    assert classification["is_recoverable"] is True
+    assert classification["error_type"] == "transient_error"
+
+    req = _make_request(messages=[{"role": "user", "content": "check"}])
+    req.steer_only = True
+    producer = RunSSEProducer(thread_id=f"t-steer-{failure_stage}", run_id=f"r-steer-{failure_stage}")
+
+    with (
+        patch(RELEASE, new=create_autospec(usage_limits_deps.release_burst_slot)),
+        patch.object(
+            error_handling,
+            "get_max_workflow_retries",
+            create_autospec(error_handling.get_max_workflow_retries, return_value=3),
+        ),
+    ):
+        raw_frames = await _consume(
+            error_handling.handle_workflow_error(
+                e=err,
+                thread_id=f"t-steer-{failure_stage}",
+                user_id="u-1",
+                workspace_id="ws-1",
+                handler=producer,
+                token_callback=None,
+                scope=_scope(None),
+                start_time=0.0,
+                request=req,
+                is_byok=False,
+            )
+        )
+
+    assert len(raw_frames) == 1
+    lines = dict(line.split(": ", 1) for line in raw_frames[0].strip().splitlines())
+    assert lines["event"] == "error"
+    payload = json.loads(lines["data"])
+    assert payload["type"] == "workflow_error"
+    assert payload["error_type"] == "transient_error"
+    assert payload["is_recoverable"] is True
+    assert payload["retryable"] is True
+    assert payload["status_code"] == 503
+    assert payload["recovery"] == "resend"
+    assert payload["error"] == expected_detail
+    coordinator.finalize_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transient_http_503_on_normal_send_keeps_retry_frame(coordinator):
+    import json
+    from src.dalton.services import chat_uploads as chat_uploads_svc
+
+    with patch.object(
+        chat_uploads_svc,
+        "get_upstream_attachment_bytes",
+        create_autospec(
+            chat_uploads_svc.get_upstream_attachment_bytes,
+            side_effect=TimeoutError("S3 timed out"),
+        ),
+    ):
+        with pytest.raises(chat_uploads_svc.HTTPException) as exc_info:
+            await chat_uploads_svc._read_upstream_object_bytes("chat-attachments/u-1/a-1/doc.pdf")
+
+    err = exc_info.value
+    req = _make_request(messages=[{"role": "user", "content": "check"}])
+    req.steer_only = False
+
+    with (
+        patch(RELEASE, new=create_autospec(usage_limits_deps.release_burst_slot)),
+        patch.object(
+            error_handling,
+            "get_max_workflow_retries",
+            create_autospec(error_handling.get_max_workflow_retries, return_value=3),
+        ),
+    ):
+        raw_frames = await _consume(
+            error_handling.handle_workflow_error(
+                e=err,
+                thread_id="t-normal-503",
+                user_id="u-1",
+                workspace_id="ws-1",
+                handler=None,
+                token_callback=None,
+                scope=_scope(None),
+                start_time=0.0,
+                request=req,
+                is_byok=False,
+            )
+        )
+
+    assert len(raw_frames) == 1
+    lines = dict(line.split(": ", 1) for line in raw_frames[0].strip().splitlines())
+    assert lines["event"] == "retry"
+    payload = json.loads(lines["data"])
+    assert payload["error_type"] == "transient_error"
+    assert payload["recovery"] == "resend"

@@ -1,6 +1,7 @@
 /** ChatView's local type contracts, carved out of ChatView.tsx (5.9b). */
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
+import type { AttachmentMeta } from '../../utils/fileUpload';
 import type { SubagentTokenUsage } from '../../utils/tokenUsage';
 
 export type { MessageRecord } from '../../hooks/utils/types';
@@ -9,7 +10,7 @@ export interface LocationState {
   workspaceStatus?: string | null;
   initialMessage?: string;
   additionalContext?: Record<string, unknown>[] | null;
-  attachmentMeta?: Record<string, unknown>[] | null;
+  attachmentMeta?: AttachmentMeta[] | null;
   model?: string;
   /** The level `initialMessage` runs at, as the sending composer showed it. */
   reasoningEffort?: string;
@@ -32,6 +33,18 @@ export interface LocationState {
    */
   draftMessage?: string;
   /**
+   * Slash commands to leave picked beside `draftMessage`, as the composer's
+   * own menu would have picked them: the command palette's "use this skill"
+   * hands over `/dcf-model ` with the skill as its pill, so the send carries
+   * the skill rather than leaning on the server reading the text.
+   */
+  draftCommands?: SlashCommand[];
+  /**
+   * Put `draftMessage` after what is already typed rather than over it: an
+   * existing thread's composer may hold the user's own words.
+   */
+  draftAppend?: boolean;
+  /**
    * The first send opens its turn with no message of its own, its
    * `initialMessage` empty (`SendOptions.hiddenOpener`): the welcome flow
    * asking the agent where to start (pages/Onboarding/welcome/kickoff.ts).
@@ -48,6 +61,13 @@ export interface LocationState {
   handoff?: boolean;
   workspaceId?: string;
   workspaceName?: string;
+  /**
+   * The backend turn index to open the thread at: its opening bubble is
+   * brought under the viewport top and tinted, with older pages loaded back
+   * to it (useFocusTurn). The command palette's "In conversations" hit. A
+   * turn the thread does not have leaves the reader at the newest one.
+   */
+  focusTurn?: number;
   fromThreadId?: string;
   fromWorkspaceId?: string;
   // DALTON-HOOK(global-search): file or memo path to open in the right panel after navigation
@@ -66,6 +86,8 @@ export interface LocationState {
    * to metadata, so replay re-renders them regardless).
    */
   chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
+  /** What MarketView's chart showed at the send, for `initialMessage`'s `chart_views`. */
+  chartViews?: import('@/pages/MarketView/types/chartView').ChartView[];
   /**
    * Skill names to preload as hidden skills (chart-annotation forwarding from
    * MarketView). Merged into `additionalContext` as `{type:'skills',name}` on

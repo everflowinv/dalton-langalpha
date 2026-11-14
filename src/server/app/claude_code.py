@@ -2,11 +2,13 @@
 saving, removing, and whether it works, for Settings and the model picker.
 
 - GET    /api/v1/claude-code/setup           Where the user's Claude Code stands as a whole, opted in or not
+- GET    /api/v1/claude-code/chief-of-staff  Where a Home thread's Claude Code runs, and whether its Default does
 - GET    /api/v1/claude-code/status          Whether the user's Claude Code models can run
 - POST   /api/v1/claude-code/sign-in         Start a sign-in that makes a setup token
 - POST   /api/v1/claude-code/sign-in/code    Finish it with the code Claude's page shows
 - PUT    /api/v1/claude-code/token           Save a setup token the user made themselves
 - DELETE /api/v1/claude-code/token           Remove the saved token
+- POST   /api/v1/claude-code/check           Check now: read the saved token's Claude plan with one minimal request
 - GET    /api/v1/claude-code/custody         How turns on cloud computers run, where the user chooses it
 - PUT    /api/v1/claude-code/custody         Choose it
 
@@ -16,13 +18,15 @@ and the choice for cloud computers ``hosted``.
 
 from fastapi import APIRouter, Response
 
-from src.server.models.claude_code import ClaudeCodeCustody, ClaudeCodeSetup, ClaudeCodeStatus, CodeBody, CustodyBody, TokenBody
+from src.server.models.claude_code import (
+    ClaudeCodeChiefOfStaff, ClaudeCodeCustody, ClaudeCodeSetup, ClaudeCodeStatus, CodeBody, CustodyBody, TokenBody,
+)
 from src.server.services.claude_code import flow, hosted, saved
 from src.server.services.claude_code.flow import backend_on, pasted_code, pasted_token, require
 from src.server.services.claude_code.saved import SavedHome
-from src.server.services.claude_code.setup_state import setup_state
+from src.server.services.claude_code.setup_state import chief_of_staff, setup_state
 from src.server.services.oauth_signin import OAuthRefusal
-from src.server.utils.api import CurrentUserId
+from src.server.utils.api import CurrentUserId, require_thread_owner
 
 router = APIRouter(prefix="/api/v1/claude-code", tags=["claude-code"])
 
@@ -32,6 +36,16 @@ async def get_setup(x_user_id: CurrentUserId):
     current = await setup_state(x_user_id)
     require(current is not None, "This server doesn't offer Claude Code.")
     return current
+
+
+@router.get("/chief-of-staff", response_model=ClaudeCodeChiefOfStaff)
+async def get_chief_of_staff(thread_id: str, x_user_id: CurrentUserId):
+    """The Chief of Staff's answer in ``setup``, asked for one Home thread by
+    web builds from before every Home thread ran the Claude Code Default
+    alike; the thread no longer changes it."""
+    await require_thread_owner(thread_id, x_user_id)
+    require(await flow.rows_on(x_user_id))
+    return await chief_of_staff(x_user_id)
 
 
 @router.get("/status", response_model=ClaudeCodeStatus)
@@ -61,6 +75,12 @@ async def save_token(body: TokenBody, x_user_id: CurrentUserId):
 @router.delete("/token", status_code=204)
 async def remove_token(x_user_id: CurrentUserId):
     await flow.remove(SavedHome(x_user_id))
+    return Response(status_code=204)
+
+
+@router.post("/check", status_code=204)
+async def check_saved(x_user_id: CurrentUserId):
+    await saved.check_now(x_user_id)
     return Response(status_code=204)
 
 

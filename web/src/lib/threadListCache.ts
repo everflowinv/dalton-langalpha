@@ -65,8 +65,12 @@ export function patchThreadTitle(
     const rowTs = Date.parse(row.updated_at);
     return !Number.isNaN(rowTs) && eventTs <= rowTs;
   };
+  // A search hit says whether its title is the thread's own (has_title), its
+  // title otherwise standing for the first message: a title written here is.
   const apply = <T extends Thread>(row: T): T =>
-    isStale(row) ? row : { ...row, title, ...(updatedAt ? { updated_at: updatedAt } : {}) };
+    isStale(row)
+      ? row
+      : { ...row, title, ...('has_title' in row ? { has_title: !!title } : {}), ...(updatedAt ? { updated_at: updatedAt } : {}) };
   patchThreadRows(queryClient, queryKeys.threads.all, (rows) =>
     rows.some((t) => t.thread_id === threadId)
       ? rows.map((t) => (t.thread_id === threadId ? apply(t) : t))
@@ -224,4 +228,15 @@ export function patchThreadSeen(
         )
       : rows,
   );
+}
+
+/**
+ * The rows a cache entry under the `threads` prefix holds, whichever of its two
+ * shapes it is: a plain list (`{threads}`) or the gallery's infinite query
+ * (`{pages: [{threads}]}`). Empty for anything else (a detail entry).
+ */
+export function threadRowsOf(data: unknown): Thread[] {
+  const shaped = data as { threads?: unknown; pages?: Array<{ threads?: Thread[] } | null> } | null | undefined;
+  if (Array.isArray(shaped?.pages)) return shaped.pages.flatMap((page) => page?.threads ?? []);
+  return Array.isArray(shaped?.threads) ? (shaped.threads as Thread[]) : [];
 }

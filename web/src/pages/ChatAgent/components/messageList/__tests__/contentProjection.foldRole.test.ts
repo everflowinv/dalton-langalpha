@@ -10,7 +10,7 @@ import { projectMessageContent } from '../contentProjection';
 import { INLINE_ARTIFACT_MAP } from '../../charts/InlineArtifactCards';
 import type { MessageRecord } from '../types';
 
-const RETAINED = ['preview_url', 'chart_annotation', 'order_receipt', 'message_delivery', 'artifact_comment'];
+const RETAINED = ['preview_url', 'order_receipt', 'message_delivery', 'artifact_comment'];
 
 /** What a type's card needs to draw at all: a reply names its comment. */
 const FIELDS: Record<string, Record<string, unknown>> = {
@@ -48,6 +48,42 @@ function roleOf(artifactType: string): string | undefined {
 describe('what survives a collapsed turn', () => {
   it.each(RETAINED)('keeps %s, which is an outcome rather than a lookup', (type) => {
     expect(roleOf(type)).toBe('retain');
+  });
+
+  it('keeps the notice that a reply was billed to usage credits, which is what it cost', () => {
+    const message = {
+      id: 'a0',
+      role: 'assistant',
+      content: 'Done.',
+      contentType: 'text',
+      contentSegments: [
+        { type: 'text', content: 'Done.', order: 1 },
+        { type: 'notification', order: 2, planBilled: { window: 'five_hour', until: '2026-11-06T20:40:00Z' } },
+      ],
+      reasoningProcesses: {},
+      toolCallProcesses: {},
+    } as unknown as MessageRecord;
+    const projection = projectMessageContent(message);
+    const block = projection.blocks.find((b) => b.type === 'notification');
+    expect(projection.roles.get(block!.key)).toBe('retain');
+  });
+
+  it('keeps the mark of a turn that opened on another model\'s brief, which says what it was written from', () => {
+    const message = {
+      id: 'a0',
+      role: 'assistant',
+      content: 'Done.',
+      contentType: 'text',
+      contentSegments: [
+        { type: 'notification', order: 1, handoff: { from: 'deepseek-flash', to: 'claude-sonnet-5-5-code' }, detail: 'The brief.', detailKind: 'brief' },
+        { type: 'text', content: 'Done.', order: 2 },
+      ],
+      reasoningProcesses: {},
+      toolCallProcesses: {},
+    } as unknown as MessageRecord;
+    const projection = projectMessageContent(message);
+    const block = projection.blocks.find((b) => b.type === 'notification');
+    expect(projection.roles.get(block!.key)).toBe('retain');
   });
 
   it.each(Object.keys(INLINE_ARTIFACT_MAP).filter((t) => !RETAINED.includes(t)))(

@@ -43,9 +43,10 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.runnables.base import RunnableBindingBase
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.config import get_config, get_stream_writer
 from langgraph.constants import TAG_NOSTREAM
@@ -63,16 +64,26 @@ from src.llms.cache_markers import CacheScope, cache_scope
 from src.llms.error_classification import is_context_overflow
 from src.llms.provider_compaction import (
     compaction_settings,
-    is_opaque,
     kept_user_texts,
     native_answer,
     native_kind,
+    replays,
 )
 
 from ptc_agent.agent.state import ensure_message_ids
 from ptc_agent.agent.middleware._utils import run_ids
 from ptc_agent.agent.middleware.model_resilience import FALLBACK_KEY
-from ptc_agent.agent.middleware.compaction.between_turns import Ask, HandOff, IdleCompact, IdleSkipped, Measure, asked
+from ptc_agent.agent.middleware.compaction.between_turns import (
+    Ask,
+    HandOff,
+    IdleCompact,
+    IdleSkipped,
+    Measure,
+    Parts,
+    WriteBrief,
+    asked,
+)
+from ptc_agent.agent.middleware.compaction.brief import brief_cut
 from ptc_agent.agent.middleware.compaction.types import CompactionState, OffloadSettings
 from ptc_agent.agent.middleware.compaction.fitting import Fit, Fitted, reported_usage
 from ptc_agent.agent.middleware.compaction.compact import (
@@ -92,6 +103,9 @@ from ptc_agent.agent.middleware.compaction.measure import (
     sent_ahead,
     stamp_context_growth,
 )
+from ptc_agent.agent.middleware.compaction.model import max_input_tokens
+from ptc_agent.agent.middleware.compaction.parts import ahead_parts
+from ptc_agent.agent.middleware.runtime_context.baseline import block_of
 from ptc_agent.agent.middleware.compaction.summarize import (
     is_other_model,
     summary_text,
@@ -117,14 +131,14 @@ from ptc_agent.agent.middleware.compaction.summary_request import (
 )
 from ptc_agent.agent.middleware.compaction.utils import (
     get_effective_messages,
-    handed_off,
     provider_cutoff,
+    provider_only,
     read_ahead,
     stamp_compaction_summary,
-    stamp_context_threshold,
     target_cost,
     with_summary_text,
 )
+from ptc_agent.agent.middleware.compaction.usage_event import stamp_usage
 from ptc_agent.agent.middleware.compaction.offloading import (
     is_idle,
     offload_view,
@@ -325,8 +339,8 @@ class CompactionMiddleware(AgentMiddleware):
         self._carries: tuple[WindowCarry, ...] = ()
         # When a due prompt is rebuilt; see with_turn_start_rebuilds.
         self._rebuilds: StalePinRebuilds = StalePinRebuilds()
-        # The baseline block a call is sent; see with_baseline.
-        self._baseline: Callable[[Any], str] | None = None
+        # The baseline sections a call is sent; see with_baseline.
+        self._sections: Callable[[Any], Mapping[str, str]] | None = None
 
     @classmethod
     def for_agent(
@@ -377,18 +391,18 @@ class CompactionMiddleware(AgentMiddleware):
         context reaches the threshold, or when the model refuses the view as
         too long, and taking attachments out of what is kept until it fits.
         A call made between turns (``between_turns``) is answered with what
-        it asks instead. Each answer is stamped with when its request
-        started (``stamp_request_start``)."""
-        handler = stamping(handler)
+        it asks instead. With the turn's user on idle compaction, each answer
+        is stamped with when its request started (``stamp_request_start``)."""
+        if isinstance(self._rebuilds, TurnStartRebuilds) and self._rebuilds.idle_compaction:
+            handler = stamping(handler)
         ensure_message_ids(request.messages)
-        view = await self.view(request.messages, request.state)
-        await read_ahead(view)
         between = asked()
         if between is not None:
-            between.answer = await self._between_turns(request, handler, view, between.ask)
+            between.answer = await self._between_turns(request, handler, between.ask)
             between.answered = True
             return ModelResponse(result=[])
 
+        view = await self._read_view(request)
         estimate = self._estimate(request.model)
         reading = await context_tokens(request.state, view, estimate, functools.partial(self._ahead, request))
         tokens = reading.tokens
@@ -585,7 +599,11 @@ class CompactionMiddleware(AgentMiddleware):
         its system message too, where the stack has one (``with_baseline``).
         Built off the loop, since every tool schema is converted and
         serialized."""
-        return sent_ahead(request, self._baseline(request.state) if self._baseline is not None else "")
+        return sent_ahead(request, block_of(self._baseline_sections(request.state)))
+
+    def _baseline_sections(self, state: Any) -> Mapping[str, str]:
+        """The baseline's sections a call with ``state`` is sent (``with_baseline``)."""
+        return self._sections(state) if self._sections is not None else {}
 
     def _cutoff(self, view: list[AnyMessage], model: Any) -> int:
         """Where a summary of ``view`` for ``model`` ends (``keep_cutoff``)."""
@@ -603,15 +621,26 @@ class CompactionMiddleware(AgentMiddleware):
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-        view: list[AnyMessage],
         ask: Ask,
-    ) -> Compaction | HumanMessage | int | None:
+    ) -> Compaction | HumanMessage | dict[str, int] | int | None:
         """What a call between turns asks for (see ``between_turns``)."""
+        if isinstance(ask, Parts):
+            # Ahead of the view: the parts are of what is sent before it.
+            return await ahead_parts(
+                request.system_message,
+                request.tools,
+                self._baseline_sections(request.state),
+                model=request.model,
+                counter=self._estimate(request.model).counter,
+            )
+        view = await self._read_view(request)
         if isinstance(ask, Measure):
             ahead = functools.partial(self._ahead, request)
             return (await context_tokens(request.state, view, self._estimate(request.model), ahead)).tokens
         if isinstance(ask, HandOff):
             return await self._hand_off(request, handler, view, notes=self._notes_dir is not None)
+        if isinstance(ask, WriteBrief):
+            return await self._brief(request, handler, view, ask)
         if isinstance(ask, IdleCompact):
             return await self._idle(request, handler, view)
         # A due thread's summary keeps no turns here too, so the next turn
@@ -667,6 +696,49 @@ class CompactionMiddleware(AgentMiddleware):
             _log_rebuild("yes", plan.reason)
         return compaction
 
+    async def _brief(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        view: list[AnyMessage],
+        ask: WriteBrief,
+    ) -> Compaction:
+        """The view through its last reply written out for a model that has
+        seen none of it (``WriteBrief``): by this model as text from its own
+        request where it reads the thread cheaply there (``_reads_cheaply``),
+        never as its provider's compaction, which no other model can read;
+        else, or when it writes none, by the compaction model; past that the
+        reader is handed the history itself.
+
+        Raises:
+            ValueError: When the view holds no reply to summarize.
+        """
+        cut = brief_cut(view)
+        if cut <= 0:
+            raise ValueError(NOTHING_TO_COMPACT)
+        own = (
+            functools.partial(
+                self._self_summary, request, handler, notes=self._notes_dir is not None, kind="brief"
+            )
+            if ask.by_own and self._reads_cheaply(request, view)
+            else None
+        )
+        return await self._compact(
+            request, view, cut, self._transcript_target(), own, brief_room=ask.room
+        )
+
+    def _reads_cheaply(self, request: ModelRequest, view: list[AnyMessage]) -> bool:
+        """Whether this model reads ``view`` from its own request at little
+        cost: the view opens on a summary only its provider can read, which
+        no other model can write out, and this model is sent it; the user's
+        subscription pays for the read; or its prompt cache is warm."""
+        client = request.model.bound if isinstance(request.model, RunnableBindingBase) else request.model
+        if view and provider_only(view[0]) and replays(view[0], client):
+            return True
+        if (getattr(client, "metadata", None) or {}).get("billing_type") == "oauth":
+            return True
+        return not self._rebuilds.cold(request, view, time.time())
+
     @staticmethod
     async def _hand_off(
         request: ModelRequest,
@@ -685,7 +757,7 @@ class CompactionMiddleware(AgentMiddleware):
         so a failure is never moved to a fallback model or retried without it.
         """
         head = view[0] if view and is_summary_message(view[0]) else None
-        if not isinstance(head, HumanMessage) or not is_opaque(head) or handed_off(head):
+        if not isinstance(head, HumanMessage) or not provider_only(head):
             return None
         prompt = summary_prompt("handoff", keeps_turns(view[1:]), notes)
         with as_sent():
@@ -713,10 +785,11 @@ class CompactionMiddleware(AgentMiddleware):
         *,
         carried: bool = False,
         own_only: bool = False,
+        brief_room: int | None = None,
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, by ``own`` when given,
-        this agent's model being the fallback unless ``own_only`` (see
-        ``Summarizer.compact``).
+        this agent's model being the fallback unless ``own_only`` or a
+        ``brief_room`` (see ``Summarizer.compact``).
 
         Start is outside the try, so a start that fails opened no window. A
         cancellation still emits error before it propagates: otherwise the
@@ -742,6 +815,7 @@ class CompactionMiddleware(AgentMiddleware):
                 own=own,
                 carried=carried,
                 own_only=own_only,
+                brief_room=brief_room,
             )
         except BaseException as e:
             self._emit_context_signal("summarize", "error", error=str(e))
@@ -800,9 +874,11 @@ class CompactionMiddleware(AgentMiddleware):
         notes: bool,
         scope: CacheScope | None = None,
         carried: bool = False,
+        kind: Literal["self", "brief"] = "self",
     ) -> str:
         """The agent's model writing the summary of ``to_summarize`` as text,
-        asked in the last user message of its own request.
+        asked in the last user message of its own request: for itself, or as
+        a brief for another model (``kind``).
 
         Sent through ``handler`` with the turn's tools and settings unchanged,
         so the request opens on the prefix the provider has cached; none may
@@ -817,7 +893,7 @@ class CompactionMiddleware(AgentMiddleware):
                 request.override(
                     messages=[
                         *to_summarize,
-                        HumanMessage(summary_prompt("self", kept, notes, carried=carried)),
+                        HumanMessage(summary_prompt(kind, kept, notes, carried=carried)),
                     ]
                 )
             )
@@ -863,7 +939,7 @@ class CompactionMiddleware(AgentMiddleware):
         first call is past once it answers (see ``abefore_agent``), an arm lasts one
         call (see ``rebuild``) unless ``update`` sets it again, and the main agent's
         final answer leaves the idle clock (``idle.idle_clock``)."""
-        answer, input_tokens, output_tokens = self._extract_token_usage(response, reading)
+        answer, input_tokens, output_tokens = self._extract_token_usage(request, response, reading)
         opened = {"_run_first_call": False} if request.state.get("_run_first_call") else {}
         disarmed = {"_rebuild_armed": None} if request.state.get("_rebuild_armed") else {}
         cached_input = max(input_tokens - spared, 0)
@@ -898,28 +974,29 @@ class CompactionMiddleware(AgentMiddleware):
         )
 
     def _extract_token_usage(
-        self, response: ModelResponse, reading: ContextReading | None = None
+        self,
+        request: ModelRequest,
+        response: ModelResponse,
+        reading: ContextReading | None = None,
     ) -> tuple[AIMessage | None, int, int]:
         """The newest AI message that reports usage and its (input, output)
-        tokens, emitted to the frontend with the threshold they fill and
-        stamped with it for replay, and with its growth from ``reading``, or
-        (None, 0, 0) when none does."""
+        tokens, or (None, 0, 0) when none does. The message is stamped with
+        what replay shows of its call and emitted to the frontend as replay
+        will read it (``stamp_usage``), and with its growth from ``reading``."""
         usage = reported_usage(response)
         if usage is None:
             return (None, 0, 0)
         msg, input_tokens, output_tokens = usage
         logger.debug("[Compaction] Token usage: input=%d, output=%d", input_tokens, output_tokens)
-        stamp_context_threshold(msg, self._token_threshold)
+        # A fallback's answer came from another model than ``request``'s, whose
+        # window is not known here, so it carries none.
+        fallback = FALLBACK_KEY in (msg.response_metadata or {})
+        limit = None if fallback else max_input_tokens(request.model)
+        fields = stamp_usage(msg, self._token_threshold, limit)
         if reading is not None:
             stamp_context_growth(msg, reading, input_tokens)
-        self._emit_context_signal(
-            "token_usage",
-            "complete",
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            total_tokens=input_tokens + output_tokens,
-            threshold=self._token_threshold,
-        )
+        if fields is not None:
+            self._emit_context_signal("token_usage", "complete", **fields)
         return (msg, input_tokens, output_tokens)
 
     # =========================================================================
@@ -1031,15 +1108,17 @@ class CompactionMiddleware(AgentMiddleware):
         main._rebuilds = rebuilds
         return main
 
-    def with_baseline(self, block: Callable[[Any], str]) -> CompactionMiddleware:
+    def with_baseline(self, sections: Callable[[Any], Mapping[str, str]]) -> CompactionMiddleware:
         """This middleware, counting the baseline block a call is sent,
-        ``block`` of the state, where nothing measured the context: the
-        context stack appends it to the system message further in, so the
-        request this middleware reads does not hold it yet. For the main
-        agent's stack, whose baseline sits inside compaction.
+        ``sections`` of the state joined, where nothing measured the
+        context: the context stack appends it to the system message further
+        in, so the request this middleware reads does not hold it yet. A
+        ``Parts`` ask counts each under the part of the context it belongs
+        to. For the main agent's stack, whose baseline sits inside
+        compaction.
         """
         main = copy.copy(self)
-        main._baseline = block
+        main._sections = sections
         return main
 
     def with_scratchpad_notes(self, notes_dir: str) -> CompactionMiddleware:
@@ -1063,6 +1142,13 @@ class CompactionMiddleware(AgentMiddleware):
             transcript=self._transcript_target(),
             shell=shell_reads_transcripts(self._backend),
         )
+
+    async def _read_view(self, request: ModelRequest) -> list[AnyMessage]:
+        """The view of ``request``'s messages, read ahead for the counts
+        taken of it (``read_ahead``)."""
+        view = await self.view(request.messages, request.state)
+        await read_ahead(view)
+        return view
 
     def _transcript_target(self) -> TranscriptTarget | None:
         """This agent's transcript, or None where nothing serves one."""

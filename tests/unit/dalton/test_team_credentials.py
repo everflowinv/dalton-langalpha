@@ -1977,6 +1977,11 @@ async def test_oauth_demotion_mid_flow_rejects_callback_and_poll_without_write(
         "throttle",
         create_autospec(oauth_app.throttle, return_value=True),
     )
+    monkeypatch.setattr(
+        oauth_app,
+        "user_feature_enabled",
+        create_autospec(oauth_app.user_feature_enabled, return_value=True),
+    )
     fake_device_code = DeviceCode(
         state={"device_auth_id": "da-1", "user_code": "UC-CODEX"},
         user_code="UC-CODEX",

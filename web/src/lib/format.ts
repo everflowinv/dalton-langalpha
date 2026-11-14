@@ -133,6 +133,8 @@ export const compactNumber = createFormatter({ notation: 'compact', maximumFract
 export const grouped = createFormatter({ maximumFractionDigits: 3 });
 export const grouped2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2 });
 export const integer = createFormatter({ maximumFractionDigits: 0 });
+// A share as a whole percent, from a ratio: `0.284 → "28%"`.
+export const percent = createFormatter({ style: 'percent', maximumFractionDigits: 0 });
 
 // The quote-strip variants. Two fixed decimals so a column of figures keeps
 // its width from one tick to the next; grouping off because a stock price
@@ -179,6 +181,18 @@ export function formatCalendarDayRange(from: string, to: string, locale: string)
   if (!a || !b) return [from, to].filter(Boolean).join(' – ');
   // Older engines throw on a reversed range rather than printing it.
   return a <= b ? calendarDayRange(locale).formatRange(a, b) : calendarDayRange(locale).formatRange(b, a);
+}
+
+// A chart's wall clock: seconds that write the exchange's local time as if it
+// were UTC (an intraday bar's time), so printed in UTC to keep the clock.
+const wallClockRange = perLocale((locale) => new Intl.DateTimeFormat(locale, {
+  month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC',
+}));
+
+/** "Mar 31, 10:30 AM – 3:00 PM" for two wall-clock times in chart seconds. */
+export function formatWallClockRange(fromSecs: number, toSecs: number, locale: string): string {
+  const [a, b] = fromSecs <= toSecs ? [fromSecs, toSecs] : [toSecs, fromSecs];
+  return wallClockRange(locale).formatRange(new Date(a * 1000), new Date(b * 1000));
 }
 
 const byteAmount = createFormatter({ maximumFractionDigits: 1 });

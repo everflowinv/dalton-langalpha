@@ -3,48 +3,10 @@
  * usage). Extracted verbatim from useChatMessages module scope (W1).
  */
 
-import type { SSEEvent, ContextWindowCallbacks, TokenUsage } from '../../session/types';
-import type { AssistantMessage } from '@/types/chat';
-import type { ThreadTokenTotals } from '../../utils/api/messages';
+import type { SSEEvent, ContextWindowCallbacks } from '../../session/types';
+import type { AssistantMessage, NotificationSegment } from '@/types/chat';
+import { applyCallUsage } from '../../session/tokenUsage';
 import { updateMessage } from './messageHelpers';
-
-/**
- * One model call's usage folded into the ring's state. The newest call sets
- * the window. A live call adds to the totals. A replayed one adds only when
- * the server sent no count, since a count already holds every call a replay
- * delivers.
- */
-function applyCallUsage(prev: TokenUsage | null, event: SSEEvent, live: boolean): TokenUsage {
-  const callInput = event.input_tokens || 0;
-  const callOutput = event.output_tokens || 0;
-  const fromServer = prev?.fromServer ?? false;
-  const adds = live || !fromServer;
-  return {
-    totalInput: (prev?.totalInput || 0) + (adds ? callInput : 0),
-    totalOutput: (prev?.totalOutput || 0) + (adds ? callOutput : 0),
-    fromServer,
-    lastOutput: callOutput,
-    total: event.total_tokens || 0,
-    threshold: event.threshold || prev?.threshold || 0,
-  };
-}
-
-/** The ring's state with the server's count as the totals; the window stays. */
-function withServerTotals(prev: TokenUsage | null, counted: ThreadTokenTotals): TokenUsage {
-  return {
-    lastOutput: 0, total: 0, threshold: 0, ...prev,
-    totalInput: counted.input_tokens, totalOutput: counted.output_tokens, fromServer: true,
-  };
-}
-
-/**
- * The ring's state for a load the server sent no count for, because its read
- * failed or it predates the count. The totals restart from zero and sum the
- * calls the load replays, so a reload does not add them a second time.
- */
-function withoutServerTotals(prev: TokenUsage | null): TokenUsage | null {
-  return prev && { ...prev, totalInput: 0, totalOutput: 0, fromServer: false };
-}
 
 /**
  * Shared handler for context_window SSE events (token_usage, summarize, offload).
@@ -92,19 +54,23 @@ function handleContextWindowEvent(event: SSEEvent, { getMsgId, nextOrder, setMes
       const detail = (event.summary_text as string | undefined) || undefined;
       const msgId = getMsgId();
       if (msgId) {
-        const order = nextOrder();
-        setMessages((prev) => updateMessage(prev,msgId, (msg) => {
-          if (msg.role !== 'assistant') return msg;
-          const aMsg = msg as AssistantMessage;
-          return {
-            ...aMsg,
-            contentSegments: [...(aMsg.contentSegments || []), { type: 'notification' as const, content: text, order, detail }],
-          };
-        }));
+        appendNotification(setMessages, msgId, { content: text, order: nextOrder(), detail });
       } else {
         insertNotification(text, 'info', detail);
       }
     }
+    return;
+  }
+
+  // The turn opened on another model's brief. Its mark rides the turn's
+  // reply, which a turn always has by now: the brief comes ahead of any call.
+  if (action === 'brief') {
+    const msgId = getMsgId();
+    const to = event.to_model;
+    if (!msgId || typeof to !== 'string') return;
+    const from = typeof event.from_model === 'string' ? event.from_model : undefined;
+    const detail = (event.summary_text as string | undefined) || undefined;
+    appendNotification(setMessages, msgId, { handoff: { from, to }, order: nextOrder(), detail, detailKind: 'brief' });
     return;
   }
 
@@ -143,15 +109,7 @@ function handleContextWindowEvent(event: SSEEvent, { getMsgId, nextOrder, setMes
 
         if (text) {
           if (msgId) {
-            const order = nextOrder();
-            setMessages((prev) => updateMessage(prev,msgId, (msg) => {
-              if (msg.role !== 'assistant') return msg;
-              const aMsg = msg as AssistantMessage;
-              return {
-                ...aMsg,
-                contentSegments: [...(aMsg.contentSegments || []), { type: 'notification' as const, content: text, order }],
-              };
-            }));
+            appendNotification(setMessages, msgId, { content: text, order: nextOrder() });
           } else {
             insertNotification(text);
           }
@@ -166,6 +124,19 @@ function handleContextWindowEvent(event: SSEEvent, { getMsgId, nextOrder, setMes
   }
 }
 
+/** Add a notification segment to the end of assistant message `msgId`. */
+function appendNotification(
+  setMessages: ContextWindowCallbacks['setMessages'],
+  msgId: string,
+  segment: Omit<NotificationSegment, 'type'>,
+): void {
+  setMessages((prev) => updateMessage(prev, msgId, (msg) => {
+    if (msg.role !== 'assistant') return msg;
+    const aMsg = msg as AssistantMessage;
+    return { ...aMsg, contentSegments: [...(aMsg.contentSegments || []), { type: 'notification', ...segment }] };
+  }));
+}
+
 /** Write a debounced offload notice now, if one is waiting. */
 function flushOffloadBatch(batch: ContextWindowCallbacks['offloadBatch']): void {
   const { timer, flush } = batch.current;
@@ -175,4 +146,4 @@ function flushOffloadBatch(batch: ContextWindowCallbacks['offloadBatch']): void 
 }
 
 
-export { applyCallUsage, withServerTotals, withoutServerTotals, handleContextWindowEvent, flushOffloadBatch };
+export { handleContextWindowEvent, flushOffloadBatch };

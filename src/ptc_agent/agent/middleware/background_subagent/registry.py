@@ -48,6 +48,9 @@ CANCEL_UNWIND_TIMEOUT = 15.0
 # What a stop for running past the clock cancels a writer with, so its settle
 # records the time limit rather than a user's stop.
 TIME_LIMIT_CANCEL = "subagent ran past its time limit"
+# What a graceful restart cancels a writer with, so its settle records a stop
+# the next process can resume rather than a user's stop.
+RESTART_CANCEL = "subagent stopped by a restart"
 
 # Cap on the pre-signal durable cancel-intent stamp (``stamp_cancel_intent``):
 # a hung ledger call must not block the user-facing local cancel.
@@ -87,12 +90,27 @@ class TaskRunRejected(Exception):
     Defined here — not in the server — so middleware code can catch it
     without importing server modules; the server-side ledger raises it.
     ``existing`` carries the conflicting run row when the rejection is a
-    duplicate/slot conflict rather than an infra failure.
+    duplicate/slot conflict rather than an infra failure. ``busy`` marks a
+    refusal that lifts by itself, the computer running as many Claude Code
+    CLIs as it may, and ``final`` one that lasts as long as the task.
+    ``whole``: ``reason`` is the agent's whole answer, not the end of a
+    "could not start" line.
     """
 
-    def __init__(self, reason: str, existing: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        reason: str,
+        existing: dict[str, Any] | None = None,
+        *,
+        busy: bool = False,
+        whole: bool = False,
+        final: bool = False,
+    ):
         self.reason = reason
         self.existing = existing
+        self.busy = busy
+        self.whole = whole
+        self.final = final
         super().__init__(reason)
 
 
@@ -1027,8 +1045,11 @@ class BackgroundTaskRegistry:
 
         return cancelled
 
-    async def cancel_task(self, task_id: str, *, force: bool = False) -> bool:
-        """Cancel one live task by its short id (user-targeted stop).
+    async def cancel_task(
+        self, task_id: str, *, force: bool = False, task_run_id: str | None = None
+    ) -> bool:
+        """Cancel one live task by its short id (user-targeted stop), only
+        while its run is ``task_run_id`` when one is given.
 
         Same stamp-then-cancel flow as ``cancel_all``; the entry stays
         registered — its turn collector still claims and drains it.
@@ -1037,7 +1058,9 @@ class BackgroundTaskRegistry:
             intent_targets = [
                 t
                 for t in self._tasks.values()
-                if t.task_id == task_id and self._cancellable(t)
+                if t.task_id == task_id
+                and self._cancellable(t)
+                and task_run_id in (None, t.task_run_id)
             ]
         if not intent_targets:
             return False
@@ -1063,15 +1086,35 @@ class BackgroundTaskRegistry:
         cancel. Scan and cancel share one lock hold, so a round resumed
         meanwhile under another owner is never touched.
         """
+        return await self._stop_writers_where(predicate, TIME_LIMIT_CANCEL)
+
+    async def stop_writers_for_restart(
+        self, run_id: str | None = None
+    ) -> list[asyncio.Task]:
+        """Stop the writers of every task, or of those ``run_id`` spawned,
+        for a graceful restart, and return the handles still unwinding.
+
+        Each settles as a stop with its checkpoint intact (``RESTART_CANCEL``),
+        which the next process offers back for resume. Like the time limit's
+        stop, no cancel intent is stamped, since that would settle it as a
+        user's stop.
+        """
+        return await self._stop_writers_where(
+            lambda task: run_id is None or task.spawned_run_id == run_id, RESTART_CANCEL
+        )
+
+    async def _stop_writers_where(
+        self, predicate: Callable[[BackgroundTask], bool], message: str
+    ) -> list[asyncio.Task]:
         async with self._lock:
             stopping = [
-                (writer, None if task.terminal_status else TIME_LIMIT_CANCEL)
+                (writer, None if task.terminal_status else message)
                 for task in self._tasks.values()
                 if predicate(task)
                 for writer in task.live_writers
             ]
-            for writer, message in stopping:
-                writer.cancel(message)
+            for writer, reason in stopping:
+                writer.cancel(reason)
             return [writer for writer, _ in stopping]
 
     async def cancel_run_tasks(

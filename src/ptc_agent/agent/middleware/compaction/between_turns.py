@@ -1,4 +1,5 @@
-"""Compaction between turns, sent as the agent's own model call.
+"""Compaction between turns, and what it measures, sent as the agent's own
+model call.
 
 A provider checks a compaction request against the conversation's own: the
 system prompt, tools and thinking it was sent with, which its cache and the
@@ -6,7 +7,10 @@ thinking in the kept turns are verified against. Between turns no such
 request exists, so manual /compact and the hand-off at a model switch run the
 agent's model node outside a graph run, on the thread's state, and the
 ``CompactionMiddleware`` in its chain does the work where it does it mid-turn
-(:func:`asked`) instead of calling the model for an answer.
+(:func:`asked`) instead of calling the model for an answer. The context's
+size (``Measure``) and what the call sends ahead of its messages (``Parts``)
+are asked the same way, since only that chain builds the request a turn's
+call would send.
 
 Nothing is written here: the caller installs the answer, as manual /compact
 always has.
@@ -43,9 +47,34 @@ class HandOff:
 
 
 @dataclass(frozen=True)
+class WriteBrief:
+    """Have the view, through its last reply, written out as text for a
+    model that keeps a session of its own (Claude Code) and has seen none of
+    it. Nothing stays after it, and what follows the reply (the user's newest
+    messages) is left for that model to read as it is.
+
+    The agent's model writes it from its own request where ``by_own`` and it
+    reads the thread cheaply there, else the compaction model; when that
+    writes none, the reader is handed the history itself, fitted to
+    ``room`` tokens (``thread_summary``): half the 200k a Claude Code CLI
+    compacts at by default, when the reader's own threshold is not known.
+    """
+
+    by_own: bool = True
+    room: int = 100_000
+
+
+@dataclass(frozen=True)
 class Measure:
     """The context the next turn start reads (``context_tokens``), of the
     view the state makes now."""
+
+
+@dataclass(frozen=True)
+class Parts:
+    """What the next call sends ahead of its messages, in tokens by part
+    (``parts.ahead_parts``): the system prompt, the tools and the
+    baseline's sections."""
 
 
 @dataclass(frozen=True)
@@ -55,7 +84,7 @@ class IdleCompact:
     expires, natively, or nothing (see ``rebuild.TurnStartRebuilds.idle``)."""
 
 
-Ask = Compact | HandOff | Measure | IdleCompact
+Ask = Compact | HandOff | WriteBrief | Measure | Parts | IdleCompact
 
 
 class NoCompaction(RuntimeError):
@@ -75,7 +104,7 @@ class Asked:
     """An ask on its way through the model node, and what answered it."""
 
     ask: Ask
-    answer: Compaction | HumanMessage | int | None = None
+    answer: Compaction | HumanMessage | dict[str, int] | int | None = None
     answered: bool = False
 
 
@@ -95,14 +124,17 @@ async def ask_between_turns(
     *,
     thread_id: str,
     store: Any | None = None,
-) -> Compaction | HumanMessage | int | None:
-    """``ask`` answered by the ``CompactionMiddleware`` in ``agent``'s model
-    chain, ``state`` being the thread's checkpoint values.
+) -> Compaction | HumanMessage | dict[str, int] | int | None:
+    """``ask``, a compaction or a measure of the context, answered by the
+    ``CompactionMiddleware`` in ``agent``'s model chain, ``state`` being the
+    thread's checkpoint values.
 
     A ``Compact`` answers with the compaction to install, a ``HandOff`` with
     the summary message to put in place of the view's opening one, or None
-    when that summary is not one only its provider can read, and a
-    ``Measure`` with the context's size, calling no model. The calls made
+    when that summary is not one only its provider can read, a ``WriteBrief``
+    with the compaction whose summary message is the brief, a ``Measure``
+    with the context's size and a ``Parts`` with what is sent ahead of the
+    messages by part, neither calling a model. The calls made
     for it report to the callbacks of the caller's runnable config, which bill
     and trace them, as a turn's summarizer call reports to the turn's.
 

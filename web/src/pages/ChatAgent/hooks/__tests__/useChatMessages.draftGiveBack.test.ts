@@ -74,6 +74,7 @@ describe('useChatMessages: a refused send goes back to the composer whole', () =
           files: [
             {
               file: new File(['x'], 'page.png', { type: 'image/png' }),
+              attachmentId: 'att-page',
               dataUrl: 'data:image/png;base64,eA==',
               type: 'image/png',
               preview: null,
@@ -113,6 +114,7 @@ describe('useChatMessages: a refused send goes back to the composer whole', () =
           files: [
             {
               file: new File(['x'], 'exhibit.txt', { type: 'text/plain' }),
+              attachmentId: 'att-exhibit',
               dataUrl: 'data:text/plain;base64,eA==',
               type: 'text/plain',
               preview: null,

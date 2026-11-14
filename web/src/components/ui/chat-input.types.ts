@@ -1,17 +1,30 @@
+import type { UploadFailure } from '@/pages/ChatAgent/utils/partUpload';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 
+/** Where a composer file's upload stands. */
+export type TileUpload =
+  /** `percent` sent; null once the bytes are in and the server is storing them. */
+  | { status: 'uploading'; percent: number | null }
+  | { status: 'ready'; attachmentId: string }
+  | { status: 'failed'; failure: UploadFailure };
+
+/**
+ * A file in the composer. It uploads from the moment it is added; the message
+ * names it by its attachment id once it is ready.
+ */
 export interface FileAttachment {
   id: string;
   file: File;
   type: string;
-  preview: string | null;
+  upload?: TileUpload;
   // DALTON-HOOK(chat-large-upload): multipart upload progress, error state and server upload id
-  uploadStatus: 'pending' | 'uploading' | 'complete' | 'error';
+  preview?: string | null;
+  uploadStatus?: 'pending' | 'uploading' | 'complete' | 'error';
   uploadProgress?: number;
   uploadId?: string;
   uploadWorkspaceKey?: string;
   errorMessage?: string;
-  dataUrl: string | null;
+  dataUrl?: string | null;
 }
 
 /** A whole file, whose `@path` is a word of the draft. */
@@ -136,13 +149,17 @@ export interface ModelOptions {
   onReturnedUnsent?: () => void;
 }
 
+/** A file a send carries, already on the server under `attachmentId` or `uploadId`. */
 export interface ReadyAttachment {
   file: File;
-  dataUrl: string | null;
+  attachmentId: string;
   type: string;
-  preview: string | null;
-  // DALTON-HOOK(chat-large-upload): server-issued upload_id for stored attachments
+  /** When the server had it ready, which its expiry counts from; unknown is now. */
+  readyAt?: number;
+  // DALTON-HOOK(chat-large-upload): server-issued upload_id for stored large attachments
+  preview?: string | null;
   uploadId?: string;
+  dataUrl?: string | null;
 }
 
 /**

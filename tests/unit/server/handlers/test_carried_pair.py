@@ -42,6 +42,19 @@ async def test_the_turn_after_an_interrupted_summary_takes_its_pair():
 
 
 @pytest.mark.asyncio
+async def test_the_turn_after_a_summary_a_restart_stopped_takes_its_pair():
+    """The restart left the summary unfinished; the turn that resumes it owes
+    the release. A user's stop, which leaves no restart stamp, ended it, and
+    it released its own."""
+    stopped = _attempt("cancelled", interrupted_by_restart=True, **_SUMMARY_PAIR)
+    with patch(_LATEST, AsyncMock(return_value=stopped)):
+        assert await carried_pair(_request(), "cos-1") == _SUMMARY_PAIR
+    user_stop = _attempt("cancelled", cancelled_by_user=True, **_SUMMARY_PAIR)
+    with patch(_LATEST, AsyncMock(return_value=user_stop)):
+        assert await carried_pair(_request(), "cos-1") == {}
+
+
+@pytest.mark.asyncio
 async def test_a_summary_names_its_own_pair_and_reads_nothing():
     latest = AsyncMock(return_value=_attempt("interrupted", **_SUMMARY_PAIR))
     with patch(_LATEST, latest):
@@ -91,7 +104,7 @@ async def test_the_carrying_turn_releases_the_pair_under_its_generation():
     }
 
     jobs = build_finalize_jobs_from_run_row(row)("completed")
-    assert sorted(j.hook_type for j in jobs) == ["user_feed", "watch_clear"]
+    assert sorted(j.hook_type for j in jobs) == ["user_feed", "user_notification", "watch_clear"]
     (wc,) = [j for j in jobs if j.hook_type == "watch_clear"]
     assert wc.payload == {
         "ptc_thread_id": "ptc-9",
@@ -101,5 +114,6 @@ async def test_the_carrying_turn_releases_the_pair_under_its_generation():
     }
     assert wc.ordering_key == "home-1"
     assert [j.hook_type for j in build_finalize_jobs_from_run_row(row)("interrupted")] == [
-        "user_feed"
+        "user_feed",
+        "user_notification",
     ]

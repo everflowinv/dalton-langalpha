@@ -5,6 +5,7 @@ import type {
   AutomationReadPageQuery,
   AutomationRunReadQuery,
 } from '@/types/automation';
+import type { SearchKind } from '@/api/search';
 
 /**
  * Hierarchical query key factory for React Query, plus the query `meta`
@@ -22,15 +23,16 @@ export const queryKeys = {
     me:          () => [...queryKeys.user.all, 'me'],
     preferences: () => [...queryKeys.user.all, 'preferences'],
     apiKeys:     () => [...queryKeys.user.all, 'api-keys'],
-    // Under the keys: it says whether an Anthropic key is saved, so a key
-    // saved or removed reads it again.
-    claudeCodeCustody: () => [...queryKeys.user.apiKeys(), 'claude-code-custody'],
+    claudeCodeCustody: () => [...queryKeys.user.all, 'claude-code-custody'],
     // Its own entry, not part of preferences: the server keeps it apart so the
     // agent, which can write preferences, cannot raise it.
     tradingPermission: () => [...queryKeys.user.all, 'trading-permission'],
   },
   models: {
     all: ['models'],
+  },
+  reports: {
+    config: ['reports', 'config'],
   },
   features: {
     all:  ['features'],
@@ -42,6 +44,8 @@ export const queryKeys = {
     claudeCodeStatus: () => [...queryKeys.features.claudeCode(), 'status'],
     claudeCodeComputers: () => [...queryKeys.features.claudeCode(), 'computers'],
     claudeCodeSetup: () => [...queryKeys.features.claudeCode(), 'setup'],
+    // Check now's mutations, each carrying its credential as variables.
+    claudeCodePlanCheck: () => [...queryKeys.features.claudeCode(), 'plan-check'],
   },
   platform: {
     all:    ['platform'],
@@ -149,13 +153,23 @@ export const queryKeys = {
     // `key` is the normalized entry path for a file, the port for an app.
     link:        (wsId: string, kind: string, key: string) => [...queryKeys.shareLinks.links(wsId), kind, key],
     shared:      (wsId: string) => [...queryKeys.shareLinks.byWorkspace(wsId), 'shared'],
+    // One of the owner's links read by its code, where the workspace is not at hand.
+    byCode:      (code: string) => [...queryKeys.shareLinks.all, 'code', code],
   },
   // What an `/s/` or `/a/` page resolves to. The visitor flag is part of the
   // question: the owner gets a different answer for the same code.
   share: {
     all:      ['share'],
+    // Every answer for one code, whoever asked and at whatever page.
+    metadataOf: (code: string) => [...queryKeys.share.all, 'metadata', code],
     metadata: (code: string, viewer: string | null, asVisitor: boolean, path: string | null) =>
-      [...queryKeys.share.all, 'metadata', code, viewer, asVisitor, path],
+      [...queryKeys.share.metadataOf(code), viewer, asVisitor, path],
+  },
+  // What a framed app read through the bridge, by its checked arguments;
+  // shared by every app on the page. Quotes are the page's own quote rows.
+  appBridge: {
+    all:    ['appBridge'],
+    method: (method: string, args: unknown) => [...queryKeys.appBridge.all, method, args],
   },
   // One projection of a machine: the list. A detail entry would be a second
   // place for a status to disagree with itself, and every surface that shows a
@@ -203,6 +217,15 @@ export const queryKeys = {
     recentAll:   () => [...queryKeys.threads.all, 'recent'],
     recent:      (limit: number) => [...queryKeys.threads.recentAll(), limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
+    // The search across every thread (the command palette). Under the prefix,
+    // so a rename, archive or delete rereads the results already on screen.
+    searchAll:   () => [...queryKeys.threads.all, 'search'],
+    // `workspaceId` / `threadId` narrow it to one workspace or one thread.
+    search:      (params: { q: string; kinds?: SearchKind | readonly SearchKind[]; limit: number; paged?: boolean; workspaceId?: string; threadId?: string }) =>
+      [...queryKeys.threads.searchAll(), params],
+    // One turn as the palette's preview shows it; null is the newest turn.
+    searchPreview: (threadId: string, turnIndex: number | null) =>
+      [...queryKeys.threads.searchAll(), 'preview', threadId, turnIndex],
     // The thread's public link: whether it is shared, its URL, what visitors
     // may open. The chat header and every share panel read this one entry.
     share:       (threadId: string) => [...queryKeys.threads.all, 'share', threadId],
@@ -212,6 +235,9 @@ export const queryKeys = {
     // The commands that outlasted their tool's wait and ran on in the
     // background. Under the prefix for the same reason as the wakeups.
     commands:    (threadId: string) => [...queryKeys.threads.all, 'commands', threadId],
+    // What the thread's next call sends ahead of its messages, part by part,
+    // read when the context panel opens.
+    context:     (threadId: string) => [...queryKeys.threads.all, 'context', threadId],
     // Batched dispatch-liveness read for a turn's PTC cards: their threads,
     // the hand-offs' own runs, and the steers of those steered into a run
     // already going. The base key targets every id-set variant for
@@ -285,6 +311,13 @@ export const queryKeys = {
       url,
       headers,
     ],
+  },
+  // The layers an agent published on charts, one entry per (workspace,
+  // symbol) holding every timeframe, so switching the interval reads the same
+  // entry. `symbol` is the display spelling (`chartKeyParts`).
+  chartLayers: {
+    all:      ['chartLayers'],
+    bySymbol: (workspaceId: string, symbol: string) => [...queryKeys.chartLayers.all, workspaceId, symbol],
   },
   // The brokerage connectors this build ships. Deliberately its own family
   // rather than a child of `mcp`: it is static and user-independent, so the
@@ -386,6 +419,12 @@ export const queryKeys = {
     all:    ['quote'],
     detail: (symbol: string) => [...queryKeys.quote.all, symbol],
   },
+  // A ticker's latest trading session as a line (lib/bars/sessionQuery).
+  // Key = display spelling.
+  intradaySession: {
+    all:    ['intradaySession'],
+    detail: (symbol: string) => [...queryKeys.intradaySession.all, symbol],
+  },
   insights: {
     all:         ['insights'],
     // Today's market-wide brief, as markdown for the agent.
@@ -444,6 +483,17 @@ export const queryKeys = {
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
     channelBindings: () => [...queryKeys.dalton.all, 'channels', 'bindings'],
   },
+  // The user's watchlists themselves (id, name), for picking one. What is on
+  // the default list is read under `['watchlistData']` (hooks/membershipQueries).
+  watchlists: {
+    all:   ['watchlists'],
+    list:  () => [...queryKeys.watchlists.all, 'list'],
+    // One list's entries by id, for a list other than the default one.
+    items: (id: string) => [...queryKeys.watchlists.all, 'items', id],
+  },
+  // The US session (open, pre, after, closed), which every quote row's
+  // extended-hours split reads.
+  marketStatus: () => ['marketStatus'],
 };
 
 /**

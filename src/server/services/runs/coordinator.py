@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional
 from uuid import uuid4
 
+from src.server.contracts.turn_kinds import RUN_ORIGIN_META, classify_origin
 from src.server.database.runs import lifecycle as tl_db
 from src.server.database.runs.lifecycle import (  # re-exported for callers
     AttemptConflictError,
@@ -239,6 +240,12 @@ class RunCoordinator:
             metadata["user_id"] = user_id
         if workspace_id:
             metadata["workspace_id"] = workspace_id
+        # Classified here, the one place that knows whether the run asks a
+        # query of its own; the settle reads the stamp back (``run_origin``).
+        origin = classify_origin(
+            metadata, query.query_type if query is not None else None
+        )
+        metadata[RUN_ORIGIN_META] = origin
 
         guard = None
         handle = None
@@ -299,6 +306,7 @@ class RunCoordinator:
             #   (unlike run_settled, which rides the outbox). Time-bounded, and
             #   a timeout is swallowed HERE so it can't reach the guard-release
             #   below and fail the turn over a hint.
+            from src.server.services.notices import compose_started
             from src.server.services.thread_control_stream import (
                 announce_run_started,
             )
@@ -315,6 +323,12 @@ class RunCoordinator:
                             workspace_id=metadata.get("workspace_id"),
                             run_id=run_id,
                             run_seq=row.get("run_seq"),
+                            origin=origin,
+                            notification=compose_started(
+                                origin,
+                                row.get("thread_title"),
+                                metadata.get("automation_name"),
+                            ),
                         ),
                         timeout=1.0,
                     )
@@ -759,13 +773,14 @@ class RunCoordinator:
         self, thread_id: str, run: Optional[Dict[str, Any]]
     ) -> None:
         """The uniform after-a-won-CAS tail: every site that applies a
-        terminal transition schedules the replay refresh and the
-        transcript export and nudges the drainer, so they never drift apart
+        terminal transition schedules the replay refresh, the search index
+        and the transcript export and nudges the drainer, so they never drift apart
         per call site. The export runs at every terminal status, since each
         stamps the checkpoint and another thread may read this one's
         transcript, and so does the check on artifacts kept updated, since a
         failed or cancelled turn may have changed their files too."""
         self._schedule_replay_refresh(thread_id)
+        self._schedule_search_index(thread_id)
         self._schedule_transcript_export(thread_id, run)
         self._schedule_keep_updated(run)
         self._schedule_archive_prune(thread_id)
@@ -792,6 +807,19 @@ class RunCoordinator:
             logger.warning(
                 f"[RunCoordinator] replay refresh scheduling failed for "
                 f"{thread_id}",
+                exc_info=True,
+            )
+
+    def _schedule_search_index(self, thread_id: str) -> None:
+        # After the replay refresh, which the indexer waits out to read the
+        # turns it projects.
+        try:
+            from src.server.services.search.index import schedule_search_index
+
+            schedule_search_index(thread_id)
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] search index scheduling failed for {thread_id}",
                 exc_info=True,
             )
 

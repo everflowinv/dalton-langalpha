@@ -167,10 +167,11 @@ async def replace_refreshed_tokens(
 
 
 async def get_oauth_tokens(
-    user_id: str, provider: str
+    user_id: str, provider: str, *, conn=None
 ) -> Optional[Dict[str, Any]]:
     """
-    Get decrypted OAuth tokens for a provider.
+    Get decrypted OAuth tokens for a provider, on ``conn`` where a caller
+    holding locks on it passes one.
 
     Returns:
         {access_token, refresh_token, account_id, email, plan_type, expires_at,
@@ -178,7 +179,7 @@ async def get_oauth_tokens(
     """
     user_id = credential_user_id(user_id)  # DALTON-HOOK(team-credentials): read team credential holder tokens
     enc_key = get_encryption_key()
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """

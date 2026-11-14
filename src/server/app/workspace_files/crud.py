@@ -18,7 +18,7 @@ from fastapi import APIRouter, Body, File, HTTPException, Query, Request, Upload
 from pydantic import BaseModel, Field
 
 from src.server.utils.api import CurrentUserId, require_workspace_owner
-from src.server.services.persistence.transfer import scan_cap_bytes
+from src.server.services.persistence.transfer import held_bytes_budget, scan_cap_bytes
 from ptc_agent.agent.backends.db_json_route import DbJsonRoute
 from ptc_agent.core.sandbox.runtime import STREAM_CHUNK_BYTES
 from ptc_agent.core.paths import logged_path
@@ -35,6 +35,7 @@ from src.server.database.home_workspace import is_unbound
 from src.server.database.computer import get_computer
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.workspace_manager import WorkspaceManager
+from src.server.services.artifacts.snapshot import keep_updated_after_change
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.persistence.download_link import (
     live_download_link,
@@ -67,6 +68,9 @@ from src.server.services.workspace_file_containment import (
     is_within,
     normalize_requested_path,
     read_contained_sandbox_file,
+    read_contained_sandbox_file_versioned,
+    stamps_of_etag,
+    version_etag,
     read_contained_sandbox_range,
 )
 from src.server.services.served_paths import (
@@ -74,6 +78,7 @@ from src.server.services.served_paths import (
     is_hidden_path,
     is_text_content_type,
     is_utf8,
+    panel_lists_stored_file,
 )
 from src.server.services.workspace_files import (
     HOME_NOT_ON_COMPUTER_REASON,
@@ -89,12 +94,10 @@ from src.server.services.workspace_files import (
 )
 
 from ._shared import (
-    held_bytes_budget,
     streamed_download_budget,
     DEFAULT_READ_LIMIT_LINES,
     TOO_LARGE_DETAIL,
     MAX_UPLOAD_BYTES,
-    _CACHEABLE_IMAGE_TYPES,
     _decode_file_text,
     previous_roots_of,
     _is_binary,
@@ -225,10 +228,10 @@ async def list_workspace_files(
         files = [
             f["path"]
             for f in file_tree
-            if not is_always_hidden_path(f["path"])
             # DALTON-HOOK(workspace-sharing-settings): non-owners never take system paths
-            and (allow_system or not _is_system_path(f["path"]))
-            and (allow_hidden or not is_hidden_path(f["path"]))
+            if panel_lists_stored_file(
+                f["path"], include_system=allow_system, include_hidden=allow_hidden
+            )
             # A row at a virtual path predates the backup skipping its folder;
             # a read answers from the DB, so only the splice may list one.
             and not _virtual_file(f["path"])
@@ -736,6 +739,7 @@ async def write_workspace_file(
             pass
 
     record_fs_bytes("write", len(content_bytes))
+    keep_updated_after_change(workspace_id=workspace_id, user_id=x_user_id)
 
     return {
         "workspace_id": workspace_id,
@@ -827,17 +831,21 @@ def _build_download_response(
     mime: str,
     request: Request,
     disposition: str = "inline",
+    etag: str | None = None,
 ) -> Response:
-    """Build a download response with caching headers for image types."""
-    etag = hashlib.md5(content).hexdigest()
+    """A download the browser revalidates on every read.
+
+    The agent rewrites a file in place (a chart re-rendered at the same path),
+    so a max-age would hand a later read the bytes it replaced; the ETag keeps
+    an unchanged file to a bodiless 304. ``etag`` is the file's version when
+    the bytes go as the file holds them; anything else is told by its bytes.
+    """
+    etag = etag or hashlib.md5(content).hexdigest()
     headers: dict[str, str] = {
         "Content-Disposition": content_disposition(filename, disposition=disposition),
         "ETag": f'"{etag}"',
+        "Cache-Control": "private, no-cache",
     }
-    if mime in _CACHEABLE_IMAGE_TYPES:
-        headers["Cache-Control"] = "private, max-age=300"
-    else:
-        headers["Cache-Control"] = "private, no-cache"
 
     # Return 304 if client already has this version
     if_none_match = request.headers.get("if-none-match")
@@ -966,7 +974,7 @@ async def _live_range_response(
         sliced.content,
         first,
         sliced.size,
-        f"{sliced.size}-{sliced.version}",
+        version_etag(sliced.size, sliced.version),
         filename,
         mime,
         disposition,
@@ -1235,16 +1243,20 @@ async def download_workspace_file(
             )
             if ranged is not None:
                 return ranged
+        # A browser asking again names the version it holds, and a file still
+        # at it is answered without a byte of it read or sent.
+        if_none_match = request.headers.get("if-none-match")
         try:
-            resolved = await read_contained_sandbox_file(
-                sandbox, candidate, work_dir=work_dir
+            read = await read_contained_sandbox_file_versioned(
+                sandbox, candidate, work_dir=work_dir, unless=stamps_of_etag(if_none_match)
             )
             too_large = None
         except FileTooLargeToServe as e:
-            resolved, too_large = (e.canonical, b""), e
-        if resolved is None:
+            read, too_large = None, e
+        if read is None and too_large is None:
             raise HTTPException(status_code=404, detail="File not found")
-        normalized, content = resolved
+        normalized = too_large.canonical if too_large is not None else read.canonical
+        content = (read.content if read is not None else None) or b""
 
         # DALTON-HOOK(workspace-sharing-settings): reject hidden/system/virtual canonical targets and binary files for non-owner
         client_path = to_client_path(sandbox, normalized, work_dir)
@@ -1265,6 +1277,21 @@ async def download_workspace_file(
             raise HTTPException(
                 status_code=403,
                 detail="Binary file download is not available in read-only mode",
+            )
+
+        if read is not None and read.content is None:
+            return Response(
+                status_code=304,
+                headers={
+                    "Content-Disposition": content_disposition(
+                        filename, disposition=disposition
+                    ),
+                    # Its stamps matched one of ours, aged before it went out.
+                    "ETag": f'"{version_etag(read.size, read.version)}"'
+                    if read.version
+                    else (if_none_match or ""),
+                    "Cache-Control": "private, no-cache",
+                },
             )
 
         if too_large is not None:
@@ -1288,13 +1315,24 @@ async def download_workspace_file(
                 workspace_id, sandbox, too_large, filename, mime, disposition, folder=folder
             )
 
+        # Redacted bytes are not the file's, so only the file's own go out
+        # under its version.
+        version = read.version if read is not None else None
         if is_text_content_type(mime) or is_utf8(content):
             vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
+            version = None
 
         record_fs_bytes("download", len(content))
 
-        return _build_download_response(content, filename, mime, request, disposition)
+        return _build_download_response(
+            content,
+            filename,
+            mime,
+            request,
+            disposition,
+            etag=version_etag(len(content), version) if version else None,
+        )
 
 
 async def _large_file_may_be_text(
@@ -1523,6 +1561,7 @@ async def upload_workspace_file(
 
     client_path = to_client_path(sandbox, normalized, work_dir)
     record_fs_bytes("upload", len(content))
+    keep_updated_after_change(workspace_id=workspace_id, user_id=x_user_id)
     return {
         "workspace_id": workspace_id,
         "path": client_path,
@@ -1912,4 +1951,6 @@ async def delete_workspace_files(
                             )
                         deleted = []
 
+    if deleted:
+        keep_updated_after_change(workspace_id=workspace_id, user_id=x_user_id)
     return {"deleted": deleted, "errors": errors}

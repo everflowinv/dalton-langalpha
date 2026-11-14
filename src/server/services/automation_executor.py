@@ -12,12 +12,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import HTTPException
 
+from src.server.contracts.status import is_restart_interrupted, restart_resume_expired
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.api_keys import is_byok_active
@@ -27,10 +28,14 @@ from src.server.dependencies.usage_limits import enforce_credit_limit
 from src.server.models.chat import ChatMessage, ChatRequest, ThreadOrigin
 from src.server.services import automation_delivery
 from src.server.services.automation_settlement import (
+    LIMITS,
     Outcome,
     clean_error_text,
+    plan_message,
     settle,
 )
+from src.server.database.runs.hook_jobs import AUTOMATION_HANDOFF_HOOK, automation_handoff_job
+from src.server.services.runs import restart_drain
 from src.server.services.runs.admission import BUSY_STATES
 from src.server.services.thread_lifecycle_feed import publish_automation_wait
 from src.server.services.turn_runtime import TurnRoute, turn_route
@@ -60,6 +65,59 @@ _RUNNABLE = frozenset({"active", "executing"})
 
 # ``_look_again``'s answer while the thread is still busy.
 _STILL_WAITING = object()
+
+async def hand_off(
+    automation: Dict[str, Any], execution_id: str, thread_id: str, *, from_status: str
+) -> None:
+    """Leave a firing this draining process has not started a turn for to the
+    next process: back to ``pending``, with a job that starts it there."""
+    job = automation_handoff_job(
+        execution_id=execution_id,
+        automation_id=str(automation["automation_id"]),
+        user_id=automation["user_id"],
+    )
+    handed = await exec_db.hand_off_execution(
+        execution_id, from_statuses=(from_status,), thread_id=thread_id, job=job
+    )
+    logger.info(
+        f"[AUTOMATION_EXEC] Draining, {'handed' if handed else 'could not hand'} "
+        f"the firing to the next process: execution_id={execution_id}"
+    )
+
+
+async def start_handed_off(job: Dict[str, Any]) -> None:
+    """The ``automation_handoff`` job: start the firing a draining process
+    handed over, which runs on the thread its row records. A process that is
+    itself draining hands the job back. One older than the sweep's margin is
+    left to the sweep, which settles it as lost: a firing that late is not
+    the one the user expects."""
+    from src.server.services.automation_scheduler import AutomationScheduler
+
+    if restart_drain.draining():
+        raise RuntimeError("draining; the next process starts it")
+    if datetime.now(timezone.utc) - job["created_at"] > timedelta(
+        seconds=ABANDONED_AFTER_SECONDS
+    ):
+        logger.warning(
+            f"[AUTOMATION_EXEC] Leaving a stale hand-off to the sweep: "
+            f"execution_id={job['payload']['execution_id']}"
+        )
+        return
+    payload = job["payload"]
+    automation = await auto_db.get_automation(payload["automation_id"], payload["user_id"])
+    if automation is None:
+        return
+    AutomationScheduler.get_instance().dispatch(
+        automation,
+        payload["execution_id"],
+        name=f"handed_exec_{payload['automation_id'][:8]}",
+    )
+
+
+def register_outbox_executors() -> None:
+    from src.server.services.hook_outbox import register_hook_executor
+
+    register_hook_executor(AUTOMATION_HANDOFF_HOOK, start_handed_off)
 
 
 @dataclass
@@ -108,14 +166,21 @@ class _Firing:
 
 
 async def _thread_busy(thread_id: str) -> bool:
-    """A turn is live on the thread, or a compact or offload is rewriting it.
+    """A turn is live on the thread, a turn a restart stopped waits for its
+    resume (``report_back.restart``), or a compact or offload is rewriting
+    it.
 
-    Both are read where every worker sees them: the run ledger and the
+    All are read where every worker sees them: the run ledger and the
     mutation registry's advertised op.
     """
     from src.server.services.thread_mutation import ThreadMutationRunner
 
     if await tl_db.get_active_run(thread_id) is not None:
+        return True
+    latest = await tl_db.get_latest_attempt(thread_id)
+    if is_restart_interrupted(latest) and not restart_resume_expired(
+        latest["cancel_requested_at"]
+    ):
         return True
     return await ThreadMutationRunner.get_instance().is_mutating(thread_id)
 
@@ -487,7 +552,12 @@ class AutomationExecutor:
                     )
                 except asyncio.TimeoutError:
                     continue
-                await self._skip_interrupted(automation, execution_id)
+                # The server is stopping: one draining for a restart hands the
+                # firing on, still in line for the thread.
+                if restart_drain.draining():
+                    await hand_off(automation, execution_id, thread_id, from_status="waiting")
+                else:
+                    await self._skip_interrupted(automation, execution_id)
                 return None
         except asyncio.CancelledError:
             await self._skip_interrupted(automation, execution_id)
@@ -754,10 +824,14 @@ class AutomationExecutor:
                 "automation_execution_id": execution_id,
                 "automation_id": str(automation["automation_id"]),
             }
-            # Every server-started run names its execution row. A held run
-            # then keeps that hold's stamp intact, including the id its
-            # sends use. On the first start that id is this execution; a
-            # restarted hold keeps the id it was filed under.
+            if name := (automation.get("name") or "").strip():
+                # What the run's start and settle notices call it
+                # (``services/notices``).
+                run_metadata["automation_name"] = name
+            # DALTON-HOOK(dispatch-delivery): Every server-started run names its
+            # execution row. A held run then keeps that hold's stamp intact,
+            # including the id its sends use. On the first start that id is
+            # this execution; a restarted hold keeps the id it was filed under.
             extra_configurable: dict[str, Any] = {
                 "automation_execution_id": execution_id,
             }
@@ -858,7 +932,8 @@ class AutomationExecutor:
         it sat in line. Once its turn reached the run ledger, the run's
         finalize settles it. Every other exit goes through ``settle`` here,
         which refuses when a skip or the sweep ended the firing first; the
-        firing then stays as they recorded it.
+        firing then stays as they recorded it. A firing a draining process
+        handed over (``hand_off``) runs on the thread it had there.
         """
         automation_id = str(automation["automation_id"])
         user_id = automation["user_id"]
@@ -874,30 +949,52 @@ class AutomationExecutor:
         )
         try:
             # DALTON-HOOK(company-automations): pending→running only while the parent is not deleted
-            if not await exec_db.begin_execution_if_not_deleted(
+            started = await exec_db.begin_execution_if_not_deleted(
                 execution_id,
                 started_at=datetime.now(timezone.utc),
-            ):
+            )
+            if not started:
                 logger.warning(
                     f"[AUTOMATION_EXEC] Not starting: execution_id={execution_id} "
                     f"was settled or its automation was deleted"
                 )
                 keep_alive.cancel()
                 return
-            from src.dalton.autonomy import preflight as dalton_preflight
+            handed_thread = started.get("conversation_thread_id")
+            if handed_thread:
+                # A handed-off or refired execution already passed preflight and
+                # claimed its signals on the previous process; do not re-run
+                # preflight so claim_signals_woken does not reject its own claim.
+                decision = None
+                # DALTON-HOOK(preflight): restore persisted wake_context from dalton_preflight_log on handoff/refire
+                from src.dalton.autonomy import preflight as dalton_preflight
+                from src.dalton.database import watch as watch_db
 
-            decision = await dalton_preflight.decide(automation, execution_id)
-            if decision is not None and decision.skip:
-                await settle(
-                    automation,
-                    execution_id,
-                    Outcome.PRECHECK_SKIPPED,
-                    workspace_id=str(automation.get("workspace_id") or "") or None,
-                    skip_reason="precheck",
-                    excerpt=decision.summary[:300],
-                )
-                keep_alive.cancel()
-                return
+                if dalton_preflight.is_dalton_automation(automation):
+                    wake_context = await watch_db.get_preflight_wake_context(execution_id)
+                    if wake_context is None:
+                        logger.warning(
+                            f"[AUTOMATION_EXEC] Missing persisted wake_context for handed-off/refired "
+                            f"Dalton execution_id={execution_id}"
+                        )
+                else:
+                    wake_context = None
+            else:
+                from src.dalton.autonomy import preflight as dalton_preflight
+
+                decision = await dalton_preflight.decide(automation, execution_id)
+                if decision is not None and decision.skip:
+                    await settle(
+                        automation,
+                        execution_id,
+                        Outcome.PRECHECK_SKIPPED,
+                        workspace_id=str(automation.get("workspace_id") or "") or None,
+                        skip_reason="precheck",
+                        excerpt=decision.summary[:300],
+                    )
+                    keep_alive.cancel()
+                    return
+                wake_context = decision.context if decision else None
         except asyncio.CancelledError:
             # A cancel during preflight never started the turn. Record it as
             # interrupted, then keep propagating the cancel. The heartbeat
@@ -963,7 +1060,7 @@ class AutomationExecutor:
 
         firing = _Firing(
             automation=automation,
-            wake_context=decision.context if decision else None,  # DALTON-HOOK(preflight)
+            wake_context=wake_context,  # DALTON-HOOK(preflight)
         )
         wait_deadline = time.monotonic() + _WAIT_CAP_SECONDS
         try:
@@ -992,8 +1089,10 @@ class AutomationExecutor:
             route = turn_route(user_id, place.workspace)
             await route.bind(user_id, place.workspace)
             firing.route = route
-            firing.thread_id = await self._resolve_thread(
-                firing.automation, place, firing.workspace_id
+            firing.thread_id = (
+                str(handed_thread)
+                if handed_thread
+                else await self._resolve_thread(firing.automation, place, firing.workspace_id)
             )
             # The thread exists from here on, so record it on the run now: a
             # live run can then be opened and watched while it streams, not
@@ -1033,13 +1132,29 @@ class AutomationExecutor:
                 )
             _exec_span.set_attribute("status", "handed_to_run")
 
+        except restart_drain.Draining:
+            await hand_off(
+                firing.automation, execution_id, firing.thread_id, from_status="running"
+            )
+            _exec_span.set_attribute("status", "handed_off")
         except Exception as e:
             _exec_span.record_exception(e)
             if await self._left_to_run(execution_id, e, firing):
                 _exec_span.set_attribute("status", "handed_to_run")
                 return
+            # Lazy: the Claude Code services import the automation tools.
+            from src.server.services.llm.claude_code import plan_detail
+
             limit_message = _limit_message(e)
-            if limit_message is not None:
+            plan = plan_detail(e)
+            if plan is not None:
+                outcome = Outcome.PLAN_LIMITED
+                error_msg = await plan_message(plan, user_id) or clean_error_text(str(plan.get("message")))
+                logger.warning(
+                    f"[AUTOMATION_EXEC] The Claude plan refused the firing, no "
+                    f"strike: execution_id={execution_id}"
+                )
+            elif limit_message is not None:
                 outcome, error_msg = Outcome.LIMITED, limit_message
                 logger.warning(
                     f"[AUTOMATION_EXEC] A usage limit refused the firing, no "
@@ -1067,7 +1182,7 @@ class AutomationExecutor:
             _exec_span.set_attribute(
                 "status",
                 "settled_elsewhere" if not settled
-                else "limited" if outcome is Outcome.LIMITED else "failure",
+                else "limited" if outcome in LIMITS else "failure",
             )
         except asyncio.CancelledError:
             # The server is stopping. A cancel inside a wait already skipped

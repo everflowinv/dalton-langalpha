@@ -1,4 +1,6 @@
+import { useContext } from 'react';
 import { useTranslation } from 'react-i18next';
+import type { ClaudeCodePlan } from '@/api/model';
 import { Button } from '@/components/ui/button';
 import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { llmProviderArt } from '@/lib/brandArt';
@@ -8,10 +10,15 @@ import type { KeyPlace } from '@/hooks/useProviderCatalog';
 import { useAvailableModels } from '@/hooks/useProviderModels';
 import { isKnownEndpoint, useKnownHosts } from '@/components/modelAccess/endpointTrust';
 import { regionTag } from '@/components/modelAccess/optionLabels';
-import { QuietNote, StatusActions, type RowStatus } from '@/components/modelAccess/parts';
+import { QuietNote, StatusActions, StatusLabel, type RowStatus } from '@/components/modelAccess/parts';
+import { UsageCells, UsageDetail } from '@/components/modelAccess/PlanUsage';
+import { UsageTableContext } from '@/components/modelAccess/usageSteps';
 import { keyDetail } from './keyDetail';
 
-/** One connection's row: its mark and name, what it is, its live status, Manage. */
+/** One connection's row: its mark and name, what it is, its live status,
+ *  Manage. In a usage table (`UsageTableContext`) it lays out on the table's
+ *  columns, with the use of the Claude plan behind it (`plan`) in them;
+ *  a row with no plan takes those columns for its text. */
 export function AccessRow({
   provider,
   name,
@@ -19,8 +26,11 @@ export function AccessRow({
   unverified = false,
   detail,
   wrapDetail = false,
+  plan,
+  limited = false,
   status,
   action,
+  notice,
 }: {
   provider: string;
   name: string;
@@ -31,27 +41,58 @@ export function AccessRow({
   detail?: React.ReactNode;
   /** A detail worded as a sentence, which wraps rather than loses its end. */
   wrapDetail?: boolean;
+  /** The Claude plan whose use the row shows, on one line with its detail,
+   *  and whether its detail names a limit, which stands alone there. */
+  plan?: ClaudeCodePlan;
+  limited?: boolean;
   status: RowStatus;
   action: React.ReactNode;
+  /** A sentence under the detail that the user should act on, such as the
+   *  day the connection stops working. */
+  notice?: React.ReactNode;
 }) {
   const { t } = useTranslation();
+  const steps = useContext(UsageTableContext);
+  const noticeLine = notice && <span className="text-xs text-pretty wrap-break-word" style={{ color: 'var(--color-text-secondary)' }}>{notice}</span>;
+  const nameLine = (
+    <span className="flex min-w-0 items-baseline gap-2">
+      <span className="truncate text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
+      {tag && <span className="shrink-0 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{tag}</span>}
+      {unverified && <span className="shrink-0 text-xs" style={{ color: 'var(--color-warning)' }}>{t('modelAccess.unverifiedTag')}</span>}
+    </span>
+  );
+  // A masked key reads as one in the code face; an account or URL does not.
+  const detailClass = cn('text-xs', wrapDetail ? 'wrap-break-word' : 'truncate', typeof detail === 'string' && detail.includes('...') && 'font-mono');
+  if (steps) {
+    return (
+      <li className={cn('col-span-full flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3', steps.row)}>
+        <BrandMark name={name} art={llmProviderArt(provider)} size="sm" className="rounded-md" />
+        <div className={cn('flex min-w-0 flex-[1_1_12rem] flex-col gap-0.5', !plan && steps.spanUsage)}>
+          {nameLine}
+          {detail && (
+            <span data-row-detail className={plan ? 'text-xs' : detailClass} style={{ color: 'var(--color-text-tertiary)' }}>
+              {plan ? <UsageDetail text={detail} plan={plan} tail="bars" whole={limited} /> : detail}
+            </span>
+          )}
+          {noticeLine}
+        </div>
+        {plan && <UsageCells plan={plan} />}
+        <div className={cn('ml-auto flex shrink-0 items-center gap-3', steps.tail)}>
+          <StatusLabel status={status} className="shrink-0 whitespace-nowrap" />
+          <div className="shrink-0">{action}</div>
+        </div>
+      </li>
+    );
+  }
   return (
     // Too narrow for the name and its detail beside the status and actions,
     // the status and actions take a line of their own under them.
     <li className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3">
       <BrandMark name={name} art={llmProviderArt(provider)} size="sm" className="rounded-md" />
       <div className="flex min-w-0 flex-[1_1_12rem] flex-col gap-0.5">
-        <span className="flex min-w-0 items-baseline gap-2">
-          <span className="truncate text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
-          {tag && <span className="shrink-0 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{tag}</span>}
-          {unverified && <span className="shrink-0 text-xs" style={{ color: 'var(--color-warning)' }}>{t('modelAccess.unverifiedTag')}</span>}
-        </span>
-        {detail && (
-          // A masked key reads as one in the code face; an account or URL does not.
-          <span className={cn('text-xs', wrapDetail ? 'wrap-break-word' : 'truncate', typeof detail === 'string' && detail.includes('...') && 'font-mono')} style={{ color: 'var(--color-text-tertiary)' }}>
-            {detail}
-          </span>
-        )}
+        {nameLine}
+        {detail && <span className={detailClass} style={{ color: 'var(--color-text-tertiary)' }}>{detail}</span>}
+        {noticeLine}
       </div>
       <StatusActions status={status}>
         <div className="shrink-0">{action}</div>
@@ -94,9 +135,22 @@ export function Group({ title, children, empty, subgrid = false }: {
 }) {
   return (
     <div className={subgrid ? 'col-span-full grid grid-cols-subgrid gap-y-1.5' : 'flex flex-col gap-1.5'}>
-      <h3 className={cn('text-xs font-medium', subgrid && 'col-span-full')} style={{ color: 'var(--color-text-tertiary)' }}>{title}</h3>
+      {/* A section label, in the open card styles' label voice. */}
+      <h3
+        className={cn('text-xs font-medium open-style:label-text', subgrid && 'col-span-full')}
+        style={{ color: 'var(--color-shell-label, var(--color-text-tertiary))' }}
+      >
+        {title}
+      </h3>
       {children.length > 0 ? (
-        <ul className={cn('divide-y rounded-lg', subgrid && 'col-span-full grid grid-cols-subgrid')} style={{ background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)', borderColor: 'var(--color-border-muted)' }}>
+        // A card of rows: an open box in the open card styles, its rows parted
+        // by a card's divider.
+        <ul
+          className={cn(
+            'shell-box divide-y divide-[color:var(--color-shell-divider,hsl(var(--border)))] [&>*]:[border-style:var(--cs-rule-style,solid)]',
+            subgrid && 'col-span-full grid grid-cols-subgrid',
+          )}
+        >
           {children}
         </ul>
       ) : (

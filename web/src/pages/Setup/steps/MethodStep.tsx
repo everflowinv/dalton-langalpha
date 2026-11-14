@@ -82,13 +82,7 @@ function ConnectedSummary({
   const marks = [...new Map(providers.map((p) => [markOf(p)?.src ?? p.provider, p])).values()].slice(0, 6);
 
   return (
-    <div
-      className="rounded-lg overflow-hidden"
-      style={{
-        background: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-    >
+    <div className="shell-box overflow-hidden">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
@@ -279,13 +273,7 @@ export default function MethodStep() {
       {/* Invitation-redeemed note (when no other providers configured); the
           way on from it is the footer's skip */}
       {!userLoading && hasPlatformAccess && !hasConfigured && (
-        <div
-          className="flex items-center gap-2 rounded-lg p-4"
-          style={{
-            background: 'var(--color-bg-card)',
-            border: '1px solid var(--color-border-muted)',
-          }}
-        >
+        <div className="shell-box flex items-center gap-2 p-4">
           <CheckCircle2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-success)' }} />
           <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
             {t('setup.invitationRedeemed')}
@@ -304,8 +292,7 @@ export default function MethodStep() {
               <button
                 type="button"
                 onClick={() => choose(method.id)}
-                className="flex w-full items-center gap-3 rounded-lg px-4 py-3.5 text-left transition-colors hover:bg-(--color-bg-hover)"
-                style={{ background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
+                className="shell-box flex w-full items-center gap-3 px-4 py-3.5 text-left transition-colors"
               >
                 {/* DALTON-HOOK(team-credentials) */}
                 <span className="flex w-12 shrink-0 justify-center"><MethodMark method={method.id} /></span>
@@ -334,13 +321,7 @@ export default function MethodStep() {
               {t('setup.invitationCodeLink')}
             </button>
           ) : (
-            <div
-              className="flex flex-col gap-3 rounded-lg p-4"
-              style={{
-                background: 'var(--color-bg-card)',
-                border: '1px solid var(--color-border-muted)',
-              }}
-            >
+            <div className="shell-box flex flex-col gap-3 p-4">
               <label
                 className="text-sm font-medium"
                 style={{ color: 'var(--color-text-primary)' }}

@@ -28,7 +28,9 @@ import {
   type LoadedHistoryPage,
   type OlderHistoryPage,
 } from '../olderPages';
-import { HISTORY_PAGE_TURNS } from '../historyWindow';
+import { HISTORY_PAGE_TURNS, type PageBudget } from '../pageBudget';
+
+const PAGE: PageBudget = { limit: HISTORY_PAGE_TURNS, minTurns: 5, maxBytes: 3_000_000 };
 import { buildRuntime, makeDeps, replayOf } from './replayHarness';
 import type { HistoryRuntime } from '../../runtime';
 import type { TokenUsage } from '../../types';
@@ -72,7 +74,7 @@ async function loadNewest(rt: ReturnType<typeof buildRuntime>['rt'], items: Item
   const reported: { page?: LoadedHistoryPage | null } = {};
   await loadConversationHistory(rt, {
     ...makeDeps(),
-    limit,
+    page: { ...PAGE, limit },
     onPage: (p) => {
       reported.page = p;
     },
@@ -81,7 +83,7 @@ async function loadNewest(rt: ReturnType<typeof buildRuntime>['rt'], items: Item
 }
 
 function olderRequest(beforeTurn: number, signal = new AbortController().signal) {
-  return { threadId: 'thread-1', beforeTurn, limit: HISTORY_PAGE_TURNS, signal };
+  return { threadId: 'thread-1', beforeTurn, page: PAGE, signal };
 }
 
 /** One main-agent model call's usage, as replay sends it. */
@@ -90,6 +92,7 @@ const call = (k: number, input: number, output: number): Item => ({
   data: {
     turn_index: k, action: 'token_usage', signal: 'complete',
     input_tokens: input, output_tokens: output, total_tokens: input + output, threshold: 1000,
+    cached_tokens: input / 2,
   },
 });
 
@@ -112,13 +115,13 @@ const commitDeps = () => ({
 beforeEach(() => vi.clearAllMocks());
 
 describe('history replay: the newest page', () => {
-  it('asks for the page it was given a limit for', async () => {
+  it('asks for the page it was given a budget for', async () => {
     const { rt } = buildRuntime();
     await loadNewest(rt, [header(73, true), ...turns(73, 75), DONE], 25);
-    expect(api.replayThreadHistory).toHaveBeenCalledWith('thread-1', expect.any(Function), { limit: 25 });
+    expect(api.replayThreadHistory).toHaveBeenCalledWith('thread-1', expect.any(Function), { page: { ...PAGE, limit: 25 } });
   });
 
-  it('replays the whole thread when no limit is given', async () => {
+  it('replays the whole thread when no budget is given', async () => {
     const { rt } = buildRuntime();
     api.replayThreadHistory.mockImplementationOnce(replayOf([...turns(0, 1), DONE]));
     await loadConversationHistory(rt, makeDeps());
@@ -165,10 +168,16 @@ describe('history replay: the newest page', () => {
     const { rt } = buildRuntime();
     const usage = trackUsage(rt);
     // The load puts the server's count in before the replay runs.
-    usage.current = { totalInput: 9000, totalOutput: 700, fromServer: true, lastOutput: 0, total: 0, threshold: 0 };
+    usage.current = {
+      totalInput: 9000, totalOutput: 700, totalCached: 4000, fromServer: true,
+      lastInput: 0, lastCached: null, total: 0, threshold: 0, contextLimit: null,
+    };
     const items = [header(73, true), ...turns(73, 75), call(74, 100, 10), call(75, 300, 20), DONE];
     await loadNewest(rt, items);
-    const loaded = { totalInput: 9000, totalOutput: 700, fromServer: true, lastOutput: 20, total: 320, threshold: 1000 };
+    const loaded = {
+      totalInput: 9000, totalOutput: 700, totalCached: 4000, fromServer: true,
+      lastInput: 300, lastCached: 150, total: 320, threshold: 1000, contextLimit: null,
+    };
     expect(usage.current).toEqual(loaded);
 
     // A reload, reaching back further or not, replays calls the count holds.
@@ -182,7 +191,7 @@ describe('history replay: the newest page', () => {
     const { rt } = buildRuntime();
     api.replayThreadHistory.mockRejectedValueOnce(new Error('HTTP 500'));
     const onPage = vi.fn();
-    await loadConversationHistory(rt, { ...makeDeps(), limit: HISTORY_PAGE_TURNS, onPage });
+    await loadConversationHistory(rt, { ...makeDeps(), page: PAGE, onPage });
     expect(onPage).not.toHaveBeenCalled();
   });
 });
@@ -199,7 +208,7 @@ describe('history replay: an older page', () => {
     expect(api.replayThreadHistory).toHaveBeenLastCalledWith(
       'thread-1',
       expect.any(Function),
-      { beforeTurn: 73, limit: HISTORY_PAGE_TURNS, signal },
+      { beforeTurn: 73, page: PAGE, signal },
     );
   });
 
@@ -346,9 +355,15 @@ describe('history replay: an older page', () => {
   it('leaves the token totals and the window as the newest page set them', async () => {
     const { rt } = buildRuntime();
     const usage = trackUsage(rt);
-    usage.current = { totalInput: 9000, totalOutput: 700, fromServer: true, lastOutput: 0, total: 0, threshold: 0 };
+    usage.current = {
+      totalInput: 9000, totalOutput: 700, totalCached: 4000, fromServer: true,
+      lastInput: 0, lastCached: null, total: 0, threshold: 0, contextLimit: null,
+    };
     const page = await loadNewest(rt, [header(73, true), ...turns(73, 75), call(75, 300, 20), DONE]);
-    const newest = { totalInput: 9000, totalOutput: 700, fromServer: true, lastOutput: 20, total: 320, threshold: 1000 };
+    const newest = {
+      totalInput: 9000, totalOutput: 700, totalCached: 4000, fromServer: true,
+      lastInput: 300, lastCached: 150, total: 320, threshold: 1000, contextLimit: null,
+    };
     expect(usage.current).toEqual(newest);
 
     api.replayThreadHistory.mockImplementationOnce(replayOf([
@@ -364,7 +379,10 @@ describe('history replay: an older page', () => {
     const { rt } = buildRuntime();
     const usage = trackUsage(rt);
     const page = await loadNewest(rt, [header(73, true), ...turns(73, 75), call(75, 300, 20), DONE]);
-    const newest = { totalInput: 300, totalOutput: 20, fromServer: false, lastOutput: 20, total: 320, threshold: 1000 };
+    const newest = {
+      totalInput: 300, totalOutput: 20, totalCached: 150, fromServer: false,
+      lastInput: 300, lastCached: 150, total: 320, threshold: 1000, contextLimit: null,
+    };
     expect(usage.current).toEqual(newest);
 
     api.replayThreadHistory.mockImplementationOnce(replayOf([
@@ -375,7 +393,7 @@ describe('history replay: an older page', () => {
     expect(usage.current).toEqual(newest);
 
     commitOlderHistoryPage(rt, commitDeps(), older!);
-    expect(usage.current).toEqual({ ...newest, totalInput: 600, totalOutput: 45 });
+    expect(usage.current).toEqual({ ...newest, totalInput: 600, totalOutput: 45, totalCached: 300 });
   });
 
   it('puts the page runs of a task a live stream wrote to ahead of what it wrote', () => {
@@ -399,7 +417,7 @@ describe('history replay: an older page', () => {
       threadModels: [],
       subagents: new Map([['task:done', task], ['task:live', task], ['task:quiet', task]]),
       ownSubagents: new Map([['task:done', own], ['task:live', own], ['task:quiet', own]]),
-      tokens: { input: 0, output: 0 },
+      tokens: { input: 0, output: 0, cached: 0 },
     };
     const deps = {
       ...commitDeps(),

@@ -1,0 +1,381 @@
+/* The ⌘K palette. A field, a list that scrolls, and a footer naming the keys.
+   The dialog variant pins it near the top (components/ui/dialog.tsx), so the
+   list grows downward and the field never moves under the reader's eyes. */
+
+.command-palette {
+  padding: 0;
+  gap: 0;
+  color: var(--color-text-primary);
+}
+
+/* The list, and in a drilled-in view the preview beside it. */
+.command-palette-main {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* A drilled-in view is wider by the pane, and keeps one height whatever the
+   list holds, so neither the pane's width nor its height moves as the
+   selection does. */
+.command-palette:has(.command-palette-main.is-paned) { max-width: 700px; }
+.command-palette-main.is-paned {
+  flex: 0 0 auto;
+  height: min(26rem, calc(100dvh - 14rem));
+}
+
+.command-palette-list {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 6px 6px;
+  /* Rows scrolled to by the keys keep a little of the list above and below. */
+  scroll-padding-block: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-elevated) transparent;
+}
+
+.command-palette-group {
+  padding: 12px 10px 4px;
+  font-family: var(--font-mono);
+  font-size: 0.65625rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+}
+.command-palette-list > :first-child .command-palette-group { padding-top: 6px; }
+/* A header that opens its group alone, for a pointer. */
+.command-palette-group.is-drillable {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  cursor: pointer;
+}
+.command-palette-group.is-drillable svg { width: 11px; height: 11px; opacity: 0; }
+.command-palette-group.is-drillable:hover { color: var(--color-text-secondary); }
+.command-palette-group.is-drillable:hover svg { opacity: 1; }
+
+.command-palette-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+.command-palette-row.is-active { background: var(--color-bg-hover); }
+@media (pointer: coarse) {
+  /* A finger's worth of row (web/AGENTS.md, .tap-target): the rows touch, so
+     the row grows rather than its hit area spilling onto its neighbours. */
+  .command-palette-row { min-height: 44px; }
+}
+
+/* A two-line row (a conversation match) keeps its icon on the first line. */
+.command-palette-row.has-detail { align-items: flex-start; }
+.command-palette-row.has-detail .command-palette-row-icon { margin-top: 2px; }
+.command-palette-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.command-palette-row-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.command-palette-detail {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+.command-palette-detail mark {
+  background: none;
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+/* Who said it: quiet, so the words lead. */
+.command-palette-detail-label {
+  margin-right: 6px;
+  color: var(--color-text-tertiary);
+}
+.command-palette-detail-label::after { content: ':'; }
+
+/* One leading column: every label starts at one x (DESIGN.md § Alignment). */
+.command-palette-row-icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  color: var(--color-icon-muted);
+}
+.command-palette-row-icon.is-accent { color: var(--color-accent-primary); }
+
+.command-palette-symbol {
+  flex-shrink: 0;
+  /* Room for the common symbols (NVDA.TO, 0700.HK), so the names after
+     them start at one x down a run of tickers. */
+  min-width: 8ch;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 0.8125rem;
+}
+/* A ticker leads with its symbol; the company name is its caption. */
+.command-palette-symbol + .command-palette-title { color: var(--color-text-secondary); }
+.command-palette-title {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.command-palette-title mark {
+  background: none;
+  color: inherit;
+  font-weight: 600;
+}
+.command-palette-meta {
+  /* A long title gives way first, so where a row was found stays readable;
+     only a meta longer than this (a skill's description) is cut. */
+  flex: 0 0 auto;
+  max-width: 45%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.75rem;
+  color: var(--color-text-tertiary);
+}
+
+/* What trails a row sits flush with its right edge. */
+.command-palette-trailing {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.command-palette-quote {
+  display: flex;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary);
+}
+.command-palette-quote > :last-child {
+  /* Changes line up down the list whatever the price's width. */
+  min-width: 7ch;
+  text-align: right;
+}
+.command-palette-pin { color: var(--color-text-quaternary); }
+.command-palette-pin svg { width: 12px; height: 12px; }
+.command-palette-quote .is-up { color: var(--color-profit); }
+.command-palette-quote .is-down { color: var(--color-loss); }
+
+/* A row's other actions, for a pointer: on the row under it or selected,
+   and always under a finger, which has no hover. Hidden rather than absent,
+   so a row keeps its layout as the selection moves. */
+.command-palette-more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+  border-radius: 5px;
+  color: var(--color-icon-muted);
+  visibility: hidden;
+}
+.command-palette-trailing + .command-palette-more { margin-left: 0; }
+.command-palette-more svg { width: 14px; height: 14px; }
+.command-palette-more:hover { background: var(--color-border-muted); color: var(--color-text-primary); }
+.command-palette-row:hover .command-palette-more,
+.command-palette-row.is-active .command-palette-more { visibility: visible; }
+@media (pointer: coarse) {
+  .command-palette-more { visibility: visible; }
+}
+
+.command-palette-note {
+  padding: 18px 10px;
+  font-size: 0.8125rem;
+  color: var(--color-text-tertiary);
+}
+
+/* The preview of the selected row in a drilled-in view. Fixed width. */
+.command-palette-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 280px;
+  width: 280px;
+  min-height: 0;
+  border-left: 1px solid var(--color-border-muted);
+}
+.command-palette-pane-scroll {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 16px 18px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-elevated) transparent;
+}
+.command-palette-pane-head { margin-bottom: 14px; }
+.command-palette-pane-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.command-palette-pane-meta {
+  margin-top: 3px;
+  font-size: 0.71875rem;
+  color: var(--color-text-tertiary);
+}
+.command-palette-pane-kicker {
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.65625rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+}
+.command-palette-pane-turn + .command-palette-pane-turn { margin-top: 16px; }
+/* A turn's text: plain while the Markdown renderer loads, then rendered at
+   the same size, so the swap changes the marks' styling and nothing else. */
+.command-palette-pane-plain,
+.command-palette-pane-md {
+  overflow-wrap: anywhere;
+  font-size: 0.78125rem;
+  line-height: 1.55;
+}
+/* In the ink the compact Markdown draws in (Markdown.tsx's variants). */
+.command-palette-pane-plain {
+  white-space: pre-wrap;
+  color: var(--color-text-primary);
+  opacity: 0.9;
+}
+.command-palette-pane-turn mark,
+.command-palette-pane-turn .markdown-root mark {
+  padding: 0;
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  font-weight: 600;
+  border-radius: 2px;
+}
+/* A link is shown, not followed (rehypePreview). */
+.command-palette-pane-link {
+  color: var(--color-accent-primary);
+  text-decoration: underline;
+}
+/* An image, and a cited source, by name. */
+.command-palette-pane-alt,
+.command-palette-pane-cite {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+.command-palette-pane-note {
+  padding: 18px 16px;
+  font-size: 0.75rem;
+  color: var(--color-text-tertiary);
+}
+.command-palette-pane-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px 16px;
+}
+.command-palette-pane-loading span {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--color-bg-hover);
+}
+.command-palette-pane-loading span:nth-child(2) { width: 80%; }
+.command-palette-pane-loading span:nth-child(3) { width: 60%; }
+.command-palette-pane-ticker {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.command-palette-pane-symbol {
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  font-weight: 600;
+}
+.command-palette-pane-price {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.command-palette-pane-price > :first-child { font-size: 1.25rem; }
+.command-palette-pane-price > :last-child { font-size: 0.75rem; color: var(--color-text-secondary); }
+.command-palette-pane-price .is-up { color: var(--color-profit); }
+.command-palette-pane-price .is-down { color: var(--color-loss); }
+.command-palette-pane-spark { margin: 14px 0 0; }
+.command-palette-pane-spark svg { display: block; overflow: visible; }
+.command-palette-pane-spark figcaption {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.65625rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-tertiary);
+}
+
+.command-palette kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--color-bg-hover);
+  box-shadow: inset 0 -1px 0 var(--color-border-muted);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1;
+  color: var(--color-text-secondary);
+}
+
+/* The prefixes, under an empty field: quieter than the keys below them. */
+.command-palette-prefixes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  flex-shrink: 0;
+  padding: 9px 16px;
+  border-top: 1px solid var(--color-border-muted);
+  font-size: 0.71875rem;
+  color: var(--color-text-tertiary);
+}
+.command-palette-prefixes > span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+
+.command-palette-footer {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-shrink: 0;
+  padding: 9px 16px;
+  border-top: 1px solid var(--color-border-muted);
+  font-size: 0.71875rem;
+  color: var(--color-text-tertiary);
+}
+.command-palette-footer > span { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+.command-palette-footer-end { margin-left: auto; }
+
+@media (max-width: 640px) {
+  /* A phone has no keys to name. */
+  .command-palette-footer { display: none; }
+}

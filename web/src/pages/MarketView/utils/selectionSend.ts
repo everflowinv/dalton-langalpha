@@ -7,27 +7,16 @@
  * the selections after send stays the caller's job (the two paths clear at
  * different points in their flow).
  */
-import { chartSelectionToContext, describeSelectionImage } from '../../ChatAgent/utils/fileUpload';
+import { chartSelectionToContext, describeSelectionImage, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
+import { marketViewAnnotationContext } from '../constants/annotationPrompt';
+import type { ChartView } from '../types/chartView';
+import { normalizeTimeframe } from './chartInstanceKey';
 import {
   chartSelectionStore,
   promoteSelectionComment,
   toSelectionSnapshot,
   type ChartSelectionSnapshot,
 } from '../stores/chartSelectionStore';
-
-/**
- * Display-only metadata for a region crop's thumbnail in the live user bubble.
- * The index signature mirrors the consumers' `AttachmentMeta` shape so this is
- * assignable to both send paths' `metaItems` without a cast.
- */
-export interface SelectionAttachmentMeta {
-  name: string;
-  type: string;
-  size: number;
-  preview: string;
-  dataUrl: string;
-  [key: string]: unknown;
-}
 
 export interface ChartSelectionSend {
   /** `additional_context` items to append to the send (empty when none confirmed). */
@@ -36,10 +25,10 @@ export interface ChartSelectionSend {
   snapshots: ChartSelectionSnapshot[];
   /**
    * Display-only attachment metas for region crops, so the live user bubble
-   * shows the screenshot immediately from the base64 `preview`. The durable
+   * shows the screenshot immediately from the base64 `dataUrl`. The durable
    * replay copy is the backend-persisted attachment, not these.
    */
-  attachments: SelectionAttachmentMeta[];
+  attachments: AttachmentMeta[];
   /** Message to send — the lone selection's note when the user typed nothing. */
   outgoingMessage: string;
 }
@@ -51,20 +40,14 @@ export function buildChartSelectionSend(
 ): ChartSelectionSend {
   const confirmed = chartSelectionStore.getConfirmedFor(symbol, timeframe);
   const contexts: Record<string, unknown>[] = [];
-  const attachments: SelectionAttachmentMeta[] = [];
+  const attachments: AttachmentMeta[] = [];
   for (const selection of confirmed) {
-    contexts.push(
-      ...(chartSelectionToContext(selection, { symbol, timeframe }) as unknown as Record<
-        string,
-        unknown
-      >[]),
-    );
+    contexts.push(...chartSelectionToContext(selection, { symbol, timeframe }));
     if (selection.croppedImage) {
       attachments.push({
         name: describeSelectionImage(selection),
         type: 'image',
         size: 0,
-        preview: selection.croppedImage,
         dataUrl: selection.croppedImage,
       });
     }
@@ -74,5 +57,37 @@ export function buildChartSelectionSend(
     snapshots: confirmed.map(toSelectionSnapshot),
     attachments,
     outgoingMessage: promoteSelectionComment(message, confirmed),
+  };
+}
+
+export interface MarketSendContexts extends ChartSelectionSend {
+  /** The chart-annotation skill, first in the send's `additional_context`. */
+  skill: Record<string, unknown>;
+  /** What the charts beside the composer show (`chart_views`). */
+  chartViews: ChartView[];
+}
+
+/**
+ * What every MarketView send carries about the chart on screen: the
+ * chart-annotation skill, for its drawing guide and to say which ticker and
+ * timeframe "the chart" is (drawing on another timeframe would not show on
+ * this one), the confirmed selections for that chart, and its view.
+ */
+export function buildMarketSendContexts(
+  symbol: string,
+  interval: string,
+  message: string,
+  chartViews: ChartView[],
+): MarketSendContexts {
+  const sym = symbol.toUpperCase();
+  const tf = normalizeTimeframe(interval);
+  return {
+    skill: {
+      type: 'skills',
+      name: 'chart-annotation',
+      instruction: sym ? marketViewAnnotationContext(sym, tf) : undefined,
+    },
+    ...buildChartSelectionSend(sym, tf, message),
+    chartViews,
   };
 }

@@ -2385,11 +2385,20 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
     # 6. Existing public share links and public shared threads remain accessible via public route
     # A published record (v1 exists) is what a public visitor reads.
     published_ext_artifact = dataclasses.replace(
-        artifact_ext, shared_at=now, latest_seq=1, revision=1
+        artifact_ext, shared_at=now, latest_seq=1, shared_seq=1, revision=1
     )
     published_ext_link = dataclasses.replace(
         shared_ext_link, artifact=published_ext_artifact
     )
+
+    async def _fake_get_version(_aid: str, _seq: int) -> Any:
+        return SimpleNamespace(
+            seq=1,
+            entry_path=published_ext_artifact.path,
+            title=None,
+        )
+
+    monkeypatch.setattr(pub_app.artifacts_db, "get_version", _fake_get_version)
 
     monkeypatch.setattr(
         pub_app,

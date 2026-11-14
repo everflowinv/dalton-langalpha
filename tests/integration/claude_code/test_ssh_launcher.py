@@ -43,7 +43,8 @@ from ptc_agent.core.claude_code_managed import claude_code_managed_sh, parse_man
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox.providers import _ssh_transport
 from ptc_agent.core.sandbox.providers._ssh_connect import SSHTarget
-from ptc_agent.core.sandbox.providers._ssh_transport import Link, pool
+from ptc_agent.core.sandbox.providers._ssh_pool import pool
+from ptc_agent.core.sandbox.providers._ssh_transport import Link
 from tests.unit.ptc_agent.agent.claude_code.fake_api import TOKEN, FakeMessagesAPI
 from tests.unit.ptc_agent.agent.claude_code.harness import run_turn, spec
 
@@ -499,10 +500,11 @@ async def test_a_replacement_claude_refuses_leaves_the_token_in_use_on_the_machi
 
     link = await machine.link()
     await write_machine_token(link, TOKEN)
-    checked = []
+    checked, plans = [], []
 
-    def check_launcher(handle, user_id, token_file):
+    def check_launcher(handle, user_id, token_file, *, plan=None):
         checked.append(token_file)
+        plans.append(plan)
         return _launcher(machine, api, token_file=token_file)
 
     async def held() -> bool:
@@ -517,6 +519,7 @@ async def test_a_replacement_claude_refuses_leaves_the_token_in_use_on_the_machi
             await flow._save(home, "sk-ant-oat01-revoked", held=held, rejected=rejected, retryable=True,
                              expires_at=datetime.now(timezone.utc))
     assert refused.value is rejected and checked[0].startswith(f".staged.{CID}.")
+    assert plans[0] is home.checked, "the check's plan reports are kept for the token it places"
     assert machine.sh(f"cat {TOKEN_FILE}").strip() == TOKEN
     assert machine.sh(f"ls -A {TOKEN_DIR}").split() == [CID], "the staged token is gone"
     await _turn(machine, api, "t-kept", "ECHO hi")

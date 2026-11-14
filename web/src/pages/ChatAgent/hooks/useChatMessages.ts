@@ -7,7 +7,6 @@
 import { failAssistantMessage, finalizeAssistantMessage } from '../session/stream/finalizeMessage';
 import type React from 'react';
 import { useState, useRef, useEffect, useCallback, useSyncExternalStore } from 'react';
-import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
@@ -15,6 +14,7 @@ import { randomUUID } from '@/lib/randomUUID'; // DALTON-HOOK(fork-message-ident
 import { claudeCodeRefusal } from '@/lib/claudeCode';
 import { holdReload } from '@/lib/reloadHolds';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
+import { getIsMobileSnapshot } from '@/hooks/useIsMobile';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useUser } from '@/hooks/useUser';
 import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
@@ -36,12 +36,14 @@ import { computeSteeringBoundary } from '../session/stream/steeringRollback';
 import { isSteeringUserMessage, opensTurn } from '../components/messageList/messagePredicates';
 import { hasTurn, hiddenOpenerTurns, newestTurn, projectTurns, turnOf } from '../components/messageList/turnProjection';
 import { isSubagentEvent } from '../session/subagents/liveEventHandlers';
-import { bumpThreadNavOrder } from './useNavigationData';
+import { bumpThreadNavOrder } from './navOrderFreeze';
 import { invalidateNewWorkspace } from './workspaceRowActions';
 import { ensureThreadId } from '../session/threadCreation';
 export { removeStoredThreadId } from './utils/threadStorage';
 // DALTON-HOOK(chat-large-upload): normalize server-verified and caller-owned steer attachments
-import { carriesContext, createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, mergeAcceptedAttachments, normalizeAttachments, type AttachmentMeta } from './utils/messageHelpers';
+import { carriesContext, createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, mergeAcceptedAttachments, normalizeAttachments } from './utils/messageHelpers';
+import { namesStagedFiles, stagedFilesOf, type AttachmentMeta } from '../utils/fileUpload';
+import { discardAttachment, freshenStaged } from '../utils/attachmentUpload';
 import type { HitlResponseBody } from '@/types/api';
 import type { AssistantMessage, UserMessage, ChatMessage } from '@/types/chat';
 import type { ArtifactCommentsShown } from '@/types/api';
@@ -50,7 +52,7 @@ import type { ComposerDraft } from '@/components/ui/chat-input.types';
 import { createRecentlySentTracker } from './utils/recentlySentTracker';
 import { createRequestKeyTracker, sendFingerprint, type SendOutcome } from './utils/requestKey';
 import { commentSendOf, openerMatchText, readArtifactCommentsShown } from '../components/artifactComments/artifactCommentSend';
-import { withServerTotals, withoutServerTotals } from './utils/contextWindowEvent';
+import { withServerTotals, withoutServerTotals } from '../session/tokenUsage';
 import { BUSY_REFUSAL_KEYS, admissionRefusalWords, createForkRefusalRecovery, forkRefusalMessage, isBusyCode, isRecoverableRetryRefusal, isStaleForkRefusal, type BusyCode, type ForkCut } from './utils/forkRefusal';
 import { createEditDraftStore, sameDraftMessage, type EditDraft } from './utils/editDrafts';
 import { settleStoppedBubble } from '../session/stream/stopBubble';
@@ -59,11 +61,6 @@ import { useMarketWatch } from './useMarketWatch';
 import { invalidateThreadWakeups } from './useWakeups';
 import { invalidateThreadCommands } from './useCommands';
 import { refreshComputersAfterTurn } from './useComputers';
-// Chart-annotation live bridge: writes agent-drawn annotations into the
-// shared MarketView store so the desktop MarketView chat panel (which uses
-// this engine for both Chief of Staff and PTC threads) renders them live.
-// Harmless on the standalone /chat page: the store simply has no chart
-// consumer there.
 
 // --- Module scope extracted to session/types + utils (W1) ---
 import type {
@@ -88,8 +85,9 @@ import { prependSubagentRuns, projectSubagentHistory } from '../session/subagent
 import { createSubagentMuxController, getTaskIdFromEvent } from '../session/subagents/muxSink';
 import { sendTaskInstruction } from '../session/subagents/sendTaskInstruction';
 import { loadConversationHistory as replayConversationHistory } from '../session/history/replayHistory';
-import { loadOlderHistoryPage, commitOlderHistoryPage } from '../session/history/olderPages';
-import { createHistoryWindow, HISTORY_PAGE_TURNS } from '../session/history/historyWindow';
+import { createHistoryWindow } from '../session/history/historyWindow';
+import { createOlderHistory, type HoldPlace } from '../session/history/olderHistory';
+import { currentScreenBudget } from '../session/history/pageBudget';
 import { createStreamEventProcessor, type StreamRouterDeps } from '../session/stream/processStreamEvent';
 import { foldFailedSteer } from '../session/stream/steeringDelivery';
 import { DROPPED_BEFORE_RUN, forkRequest, retryRequest, retryRequestFor, sendRequest, settleRetryNotice, type HeldRetry, type RetryNotice, type TurnRequest } from '../session/stream/autoRetry';
@@ -107,6 +105,20 @@ import {
 } from '../session/stream/lifecycle';
 import { collectRenderedInterruptIds, finalizeTodoListProcessesInMessages } from './utils/messageFinalizers';
 export { finalizeTodoListProcessesInMessages, mapToolCallIdToAgentId } from './utils/messageFinalizers';
+
+// DALTON-HOOK(chat-large-upload): recoverable categories emitted by backend classify_error()
+const RECOVERABLE_STEER_ERROR_TYPES = new Set([
+  'transient_error',
+  'timeout_error',
+  'connection_error',
+  'api_error',
+]);
+
+function isRetryableSteerFrame(frame: Record<string, unknown>): boolean {
+  if (frame.retryable === true || frame.is_recoverable === true) return true;
+  if (typeof frame.error_type === 'string' && RECOVERABLE_STEER_ERROR_TYPES.has(frame.error_type)) return true;
+  return typeof frame.status_code === 'number' && frame.status_code >= 500;
+}
 
 /** A send the server started no run of. Its automatic resends carry it, so
  * the one that ends the chain can mark it never kept and give its turn back.
@@ -171,12 +183,16 @@ export function useChatMessages(
 ) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  // A refused token can be the saved one or a computer's, and a cloud
-  // computer's refusal may mean the user's choice for it changed: all are
-  // read again.
+  // A refused token can be the saved one or a computer's, a cloud computer's
+  // refusal may mean the user's choice for it changed, and a Claude plan's
+  // limit is news to the plan they report: all are read again.
   const refreshClaudeCode = () => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCode() });
     void queryClient.invalidateQueries({ queryKey: queryKeys.user.claudeCodeCustody() });
+  };
+  const refreshClaudeCodePlan = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeStatus() });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeComputers() });
   };
 
   // User locale/timezone — prefer saved preference, fall back to browser detection
@@ -286,7 +302,7 @@ export function useChatMessages(
   const queuedSendRef = useRef<{
     message: string;
     additionalContext: Record<string, unknown>[] | null;
-    attachmentMeta: Record<string, unknown>[] | null;
+    attachmentMeta: AttachmentMeta[] | null;
     modelOptions: SendOptions;
     // id of the optimistic shimmer bubble shown while parked, so it can be
     // removed on flush (before the real send re-adds it) or on stop.
@@ -319,7 +335,7 @@ export function useChatMessages(
     gen: number;
     message: string;
     additionalContext: Record<string, unknown>[] | null;
-    attachmentMeta: Record<string, unknown>[] | null;
+    attachmentMeta: AttachmentMeta[] | null;
     modelOptions: SendOptions;
     requestKey: string;
     /** The steer's bubble, which waits on screen until its send replaces it. */
@@ -332,10 +348,15 @@ export function useChatMessages(
      * queue — so a composer behind the send settles by what really went out.
      */
     settleQueued?: (sent: boolean) => void;
+    /** Its files checked as it goes out, and staged again if they were old. */
+    fresh?: boolean;
   }[]>([]);
   // Orders the queue above by when each message was sent: refusals come back
   // on separate POSTs, in whatever order those answer.
   const steerSeqRef = useRef(0);
+  // The head of that queue while its files are staged again, which holds the
+  // rest behind it.
+  const freshening = useRef<object | null>(null);
   // Ends the queue above, and any refusal still on its way to it. The queue
   // lives with its own thread's view, so only an in-place thread switch ends
   // it: the '__default__' → real id move of a new chat's first send keeps it,
@@ -426,7 +447,7 @@ export function useChatMessages(
   const newMessagesStartIndexRef = useRef(0); // Index where new messages start
   // Where the loaded transcript starts and the older page in flight.
   const [historyWindow] = useState(createHistoryWindow);
-  const olderHistoryStatus = useSyncExternalStore(historyWindow.subscribe, historyWindow.snapshot);
+  const olderHistorySnapshot = useSyncExternalStore(historyWindow.subscribe, historyWindow.snapshot);
   // Guards against the load-history effect doing a redundant replay when
   // (workspaceId, threadId, reloadTrigger) re-resolve to a tuple this hook
   // already loaded — most often during React 18 StrictMode's mount→unmount→
@@ -494,7 +515,7 @@ export function useChatMessages(
 
   const releaseStreamOwnership = () => releaseOwnership(runtime);
 
-  const { handleThumbUp, handleThumbDown, feedbackByTurn, loadFeedback } = useChatFeedback(threadId);
+  const { handleThumbUp, handleThumbDown, handleThumbDownFollowUp, feedbackByTurn, feedbackLoading, loadFeedback } = useChatFeedback(threadId);
 
   // Track if history replay found an unresolved interrupt (skip reconnection in that case)
   const historyHasUnresolvedInterruptRef = useRef(false);
@@ -808,6 +829,7 @@ export function useChatMessages(
     setIsReconnecting,
     onFileArtifact,
     onPreviewUrl,
+    queryClient,
     // setters (stable)
     setMessages,
     queueMessages: liveMessages.queue,
@@ -1147,7 +1169,7 @@ export function useChatMessages(
     // The newest turn the thread has: /status's count, or what this view has
     // seen when the count is missing or behind.
     const newest = Math.max(latestTurnIndex ?? -1, newestKnownTurn());
-    const limit = historyWindow.reloadLimit(tid, newest);
+    const page = historyWindow.newestPageBudget(tid, newest, currentScreenBudget());
     // A replay already running refuses this one, and owns the window.
     const token = historyLoadingRef.current ? null : historyWindow.beginReload();
     // DALTON-HOOK(provenance-batch): each replay's generation, so an overtaken one keeps its sources off the transcript.
@@ -1164,54 +1186,29 @@ export function useChatMessages(
         // A failed reload leaves a transcript that cannot say what is gone.
         if (ok) settleEditDrafts();
       },
-      limit,
-      onPage: (page) => {
-        if (token !== null) historyWindow.land(token, tid, page);
+      page,
+      onPage: (landed) => {
+        if (token !== null) historyWindow.land(token, tid, landed);
       },
     });
   };
 
-  /**
-   * Replay the page of turns before the oldest one loaded and put it above the
-   * transcript, when the window lets one start. A page that a reload, a thread
-   * switch or a fork overtook is dropped, and the trigger asks again.
-   * `place` is handed the page's bubble count and the commit, which renders
-   * before it returns, so the view holds the reader's place across it in one
-   * task: no scroll can land between the place read and the page shown.
-   */
-  const loadOlderHistory = useStableHandler(async (place?: (prepended: number, commit: () => void) => void) => {
-    const tid = threadIdRef.current;
-    const request = historyWindow.request(tid);
-    if (!request) return;
-    const { beforeTurn, carry, signal, token } = request;
-
-    let older: Awaited<ReturnType<typeof loadOlderHistoryPage>> = null;
-    try {
-      older = await loadOlderHistoryPage(runtime, { threadId: tid, beforeTurn, limit: HISTORY_PAGE_TURNS, signal }, carry);
-    } catch (err) {
-      console.warn('[History] Older page failed to load:', err);
-    }
-    if (!historyWindow.isCurrent(token)) return;
-    if (!older) {
-      historyWindow.fail(token);
-      return;
-    }
-
-    const landed = older;
-    const commit = () => flushSync(() => commitOlderHistoryPage(
-      runtime,
-      {
-        projectSubagentHistory: (byTaskId) => projectSubagentHistory(runtime, byTaskId),
-        prependSubagentRuns: (agentId, runs) => prependSubagentRuns(runtime, agentId, runs),
-        isTaskLive: (agentId) => muxOpenTaskIds().has(agentId.replace(/^task:/, '')),
-        liveOutcome: (agentId) => terminalTaskOutcomesRef.current.get(agentId.replace(/^task:/, '')),
-      },
-      landed,
-    ));
-    if (place) place(landed.messages.length, commit);
-    else commit();
-    historyWindow.land(token, tid, landed.page);
+  /** Older pages, put above the transcript as the reader scrolls up
+   *  (`load`, under the view's `place`) and behind first paint while a newest
+   *  load cut short on its bytes is owed more (`backfill`): session/history/
+   *  olderHistory, bound at each call to the runtime of the latest render. */
+  const olderHistory = () => createOlderHistory({
+    window: historyWindow,
+    runtime,
+    threadId: () => threadIdRef.current,
+    projectSubagentHistory: (byTaskId) => projectSubagentHistory(runtime, byTaskId),
+    prependSubagentRuns: (agentId, runs) => prependSubagentRuns(runtime, agentId, runs),
+    isTaskLive: (agentId) => muxOpenTaskIds().has(agentId.replace(/^task:/, '')),
+    liveOutcome: (agentId) => terminalTaskOutcomesRef.current.get(agentId.replace(/^task:/, '')),
   });
+  const loadOlderHistory = useStableHandler((place?: HoldPlace, reachTo?: number) => olderHistory().load(place, reachTo));
+  const backfillOlderHistory = useStableHandler((place?: HoldPlace) =>
+    olderHistory().backfill(place, getIsMobileSnapshot()));
 
   /** Recovery/ownership lifecycle lives in session/stream/lifecycle; the hook
    * binds the runtime and the composition-level recovery callbacks. */
@@ -1279,7 +1276,7 @@ export function useChatMessages(
     noteLiveRun({ latestRunIdRef, latestRunEpochRef }, runId);
     const transcript = liveMessages.get();
     const at = transcript.findIndex((m) => m.id === assistantMessageId);
-    void streamFromCheckpoint(retryRequest(runId, request.additionalContext, { keepFullContext: request.keepFullContext }), at === -1 ? transcript.length : at, transcript, modelOptions, spent > 0 ? { rerun: { spent } } : {});
+    void streamFromCheckpoint(retryRequest(runId, request.additionalContext, { keepFullContext: request.keepFullContext, chartViews: request.chartViews }), at === -1 ? transcript.length : at, transcript, modelOptions, spent > 0 ? { rerun: { spent } } : {});
     return true;
   };
 
@@ -2015,6 +2012,7 @@ export function useChatMessages(
     muxOpenTaskIds,
     armReportBackWatch,
     hydrateTaskTranscript,
+    refreshClaudeCodePlan,
   });
 
   const cleanupAfterStreamEnd = (assistantMessageId: string) => {
@@ -2223,6 +2221,8 @@ export function useChatMessages(
         new Set([...composerSteerKeysRef.current, ...settledComposerSteerKeysRef.current]),
       );
       settledComposerSteerKeysRef.current.clear();
+      // The aborted reader never hears the run_end that rereads the plan.
+      refreshClaudeCodePlan();
     } else {
       giveBackStoppedSteers([], unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued), composerSteerKeysRef.current);
       settledComposerSteerKeysRef.current.clear();
@@ -2238,7 +2238,13 @@ export function useChatMessages(
    */
   const giveBackStoppedSteers = (
     returned: readonly HeldSteer[],
-    unsent: readonly { message: string; steerId: string }[],
+    unsent: readonly {
+      message: string;
+      steerId: string;
+      additionalContext?: Record<string, unknown>[] | null;
+      attachmentMeta?: AttachmentMeta[] | null;
+      modelOptions?: SendOptions;
+    }[],
     // DALTON-HOOK(composer-drafts): request keys of steers still in flight
     // with a composer draft behind them — their POST's own not-taken settle
     // seats the copy back whole, so the text channel must skip them or the
@@ -2277,9 +2283,25 @@ export function useChatMessages(
       // DALTON-HOOK(composer-drafts): text channel skips draft-owned returns.
       if (steer.content && !ownedByDraft) texts.push(steer.content);
     }
-    for (const u of unsent) texts.push(u.message);
+    // One that never went comes back as the composer held it, its pills and
+    // files with its text; one sent without that, as the text that went.
+    const drafts: ComposerDraft[] = [];
+    for (const u of unsent) {
+      const draft = u.modelOptions?.draft;
+      if (draft) drafts.push(draft);
+      else texts.push(u.message);
+    }
     if (drop.size > 0) setMessages((prev) => prev.filter((m) => !drop.has(m.id as string)));
     if (texts.length > 0) giveBackSteering(texts.join('\n'));
+    const files = unsent.flatMap((u) => (u.modelOptions?.draft ? [] : stagedFilesOf(u.additionalContext, u.attachmentMeta)));
+    if (drafts.length > 0 || files.length > 0) {
+      setReturnedDraft((prev) => ({
+        text: [prev?.text, ...drafts.map((d) => d.text)].filter(Boolean).join('\n'),
+        files: [...(prev?.files ?? []), ...drafts.flatMap((d) => d.files), ...files],
+        mentions: [...(prev?.mentions ?? []), ...drafts.flatMap((d) => d.mentions)],
+        commands: [...(prev?.commands ?? []), ...drafts.flatMap((d) => d.commands)],
+      }));
+    }
   };
 
   /**
@@ -2337,6 +2359,13 @@ export function useChatMessages(
         answered: false,
       };
     }
+    // DALTON-HOOK(chat-large-upload): transient steer storage/upstream errors surface as retryable notices
+    if (errorInfo?.retryable === true || errorInfo?.is_recoverable === true) {
+      return {
+        banner: { message: t('chat.steerTemporaryRetry'), kind: 'notice' },
+        answered: false,
+      };
+    }
     if (errorInfo?.link) {
       // Backend scrubbed stale model names from the user's saved
       // preferences — invalidate our cached copy so the selector and
@@ -2388,10 +2417,12 @@ export function useChatMessages(
     const worded = typeof errorInfo?.message === 'string' && errorInfo.message ? errorInfo.message : null;
     // A Claude Code turn the server cannot run says what to change, and a
     // retry meets the same refusal. Without a working token, the change is
-    // one the user makes in Settings.
+    // one the user makes in Settings. A Claude plan's limit is worded where it
+    // is drawn, in the reader's zone.
     if (errorInfo?.type === 'claude_code_off' && worded) {
-      const { reread, link, messageKey, messageValues } = claudeCodeRefusal(errorInfo.reason, workspaceId, errorInfo.limit);
+      const { reread, link, messageKey, messageValues, planRefusal } = claudeCodeRefusal(errorInfo, workspaceId);
       if (reread) refreshClaudeCode();
+      if (planRefusal) return { banner: { message: worded, planRefusal }, answered: true };
       const message = messageKey ? t(messageKey, messageValues) : worded;
       return { banner: link ? { message, links: [link] } : { message }, answered: true };
     }
@@ -2411,7 +2442,7 @@ export function useChatMessages(
   const handleSendSteering = async (
     message: string,
     additionalContext: Record<string, unknown>[] | null = null,
-    attachmentMeta: Record<string, unknown>[] | null = null,
+    attachmentMeta: AttachmentMeta[] | null = null,
     modelOptions: SendOptions = {},
     resend: Resend = {},
     // DALTON-HOOK(composer-drafts): acceptance callback for the composer's draft lifecycle
@@ -2423,7 +2454,7 @@ export function useChatMessages(
       acceptedFired = true;
       onAccepted?.();
     };
-    const { widgetSnapshots, chartSelections, artifactComments } = modelOptions;
+    const { widgetSnapshots, chartSelections, artifactComments, chartViews } = modelOptions;
     const commentSend = commentSendOf(artifactComments);
     // The refused-steer queue the steer belongs to, for a refusal to rejoin
     // it only if no thread switch has ended it since.
@@ -2438,7 +2469,7 @@ export function useChatMessages(
     // key for its own re-send.
     const requestKey = requestKeys.take(sendFingerprint(threadId, message, commentSend), { alongside: true, key: resend.requestKey, comments: artifactComments });
     const userMessage: ChatMessage = {
-      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta as AttachmentMeta[] | null, widgetSnapshots, chartSelections, artifactComments, id: resend.shown?.userId }),
+      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta, widgetSnapshots, chartSelections, artifactComments, id: resend.shown?.userId }),
       steering: true,
       requestKey,
       ...(currentRunIdRef.current ? { steeredRunId: currentRunIdRef.current } : {}),
@@ -2506,13 +2537,27 @@ export function useChatMessages(
         requestKey,
         steerOnly: true,
         artifactComments: commentSend,
+        chartViews,
       });
       const frame = answered.refusal;
       if (frame) {
         const text = typeof frame.error === 'string' ? frame.error : '';
+        // DALTON-HOOK(chat-large-upload): preserve recoverable steer markers instead of masking as HTTP 409 refusal
+        const retryable = isRetryableSteerFrame(frame);
+        const status =
+          typeof frame.status_code === 'number' && frame.status_code >= 400
+            ? frame.status_code
+            : retryable
+              ? 503
+              : 409;
         throw Object.assign(new Error(text || 'Failed to send message'), {
-          status: 409,
-          errorInfo: { code: frame.code, message: text },
+          status,
+          errorInfo: {
+            code: frame.code,
+            type: typeof frame.error_type === 'string' ? frame.error_type : undefined,
+            message: text,
+            ...(retryable ? { retryable: true, is_recoverable: true } : {}),
+          },
         });
       }
       // No answer, and no way to know: a delivery can still clear this. An
@@ -2594,6 +2639,27 @@ export function useChatMessages(
       // carried past the next one: a reload may be waiting on this answer,
       // or asked for and yet to run.
       const banner = refusalBanner(err).banner ?? 'Failed to send message';
+      // DALTON-HOOK(chat-large-upload): on structured recoverable steer errors (e.g. 503 storage),
+      // return draft + attachments whole to the composer so the user can retry without re-attaching.
+      const errInfo = (err as { errorInfo?: { retryable?: boolean; is_recoverable?: boolean } })?.errorInfo;
+      const isRetryableSteer = !refused && (errInfo?.retryable === true || errInfo?.is_recoverable === true);
+      const steerDraft = modelOptions.draft;
+      if (isRetryableSteer && steerDraft) {
+        ended = { refused: banner };
+        requestKeys.spend(requestKey);
+        modelOptions.onReturnedUnsent?.();
+        setReturnedDraft((prev) => (prev
+          ? {
+              text: [prev.text, steerDraft.text].filter(Boolean).join('\n'),
+              files: [...prev.files, ...steerDraft.files],
+              mentions: [...prev.mentions, ...steerDraft.mentions],
+              commands: [...prev.commands, ...steerDraft.commands],
+            }
+          : steerDraft));
+        setMessages((prev) => prev.filter((m) => m.id !== userMessage.id));
+        setMessageError(banner);
+        return false;
+      }
       refusalAfterReloadRef.current = { epoch: sessionEpochRef.current, banner };
       ended = { refused: banner };
       // Update user message to show steering failure. A stream end or a
@@ -2647,7 +2713,7 @@ export function useChatMessages(
     gen: number,
     message: string,
     additionalContext: Record<string, unknown>[] | null,
-    attachmentMeta: Record<string, unknown>[] | null,
+    attachmentMeta: AttachmentMeta[] | null,
     modelOptions: SendOptions,
     requestKey: string,
     seq: number,
@@ -2688,25 +2754,27 @@ export function useChatMessages(
   /**
    * A message sent while refused steers wait to go out joins them, behind the
    * last: the first of them opens the next turn, and steered into that turn
-   * this one would reach the model ahead of the others, typed before it.
+   * this one would reach the model ahead of the others, typed before it. So
+   * does one naming staged files while a turn runs, which a steer cannot
+   * carry: it opens the next turn itself.
    */
   const queueBehindRefused = (
     message: string,
     additionalContext: Record<string, unknown>[] | null,
-    attachmentMeta: Record<string, unknown>[] | null,
+    attachmentMeta: AttachmentMeta[] | null,
     modelOptions: SendOptions,
-    shown?: ShownBubbles,
+    { requestKey: key, shown }: Resend = {},
     // DALTON-HOOK(composer-drafts): resolves the queueing call's deferred boolean.
     settleQueued?: (sent: boolean) => void,
   ): void => {
     // Parked with the others, it holds its comments until it goes out.
     const requestKey = requestKeys.take(
       sendFingerprint(threadId, message, commentSendOf(modelOptions.artifactComments)),
-      { alongside: true, comments: modelOptions.artifactComments },
+      { alongside: true, key, comments: modelOptions.artifactComments },
     );
     const waiting: ChatMessage = {
       ...createUserMessage(message, newestTurn(liveMessages.get()) ?? undefined, {
-        attachments: attachmentMeta as AttachmentMeta[] | null,
+        attachments: attachmentMeta,
         widgetSnapshots: modelOptions.widgetSnapshots,
         chartSelections: modelOptions.chartSelections,
         artifactComments: modelOptions.artifactComments,
@@ -2838,7 +2906,7 @@ export function useChatMessages(
   };
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: AttachmentMeta[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
     // What the request carries, and a resend of it again.
     const commentSend = commentSendOf(artifactComments);
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0) || !!commentSend;
@@ -2887,7 +2955,7 @@ export function useChatMessages(
       queuedSendRef.current?.settleQueued(false);
       // A placeholder: the send it becomes adds a bubble of its own.
       const queuedMsg = createUserMessage(message, undefined, {
-        attachments: attachmentMeta as AttachmentMeta[] | null,
+        attachments: attachmentMeta,
         widgetSnapshots,
         chartSelections,
         artifactComments,
@@ -2921,7 +2989,8 @@ export function useChatMessages(
         message,
         additionalContext,
         attachmentMeta,
-        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext },
+        // The draft rides along, for a stop to give back as the composer held it.
+        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext, chartViews, draft },
         messageId: queuedMessage.id as string,
         requestKey,
         onAccepted,
@@ -2952,13 +3021,16 @@ export function useChatMessages(
         : null;
       // DALTON-HOOK(composer-drafts): as above — the resolver rides the entry
       // only when a composer is behind it.
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken }, resend.shown, outcome ? resolveQueued : undefined);
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, { shown: resend.shown }, outcome ? resolveQueued : undefined);
       return outcome ?? true;
     }
 
+    // DALTON-HOOK(chat-large-upload): staged attachment_id sends steer running
+    // turns directly via handleSendSteering, just like inline and chat_upload files.
+
     // If agent is already streaming, send as steering message
     if (isLoading) {
-      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
+      return handleSendSteering(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent }, resend, notifyAccepted);
     }
 
     // Store model options so HITL resume can forward them
@@ -2969,7 +3041,7 @@ export function useChatMessages(
     // it carries, since the empty query it stores draws no row to match.
     const turnIndex = newestKnownTurn() + 1;
     const userMessage = hiddenOpener ? null : createUserMessage(message, turnIndex, {
-      attachments: attachmentMeta as AttachmentMeta[] | null,
+      attachments: attachmentMeta,
       widgetSnapshots,
       chartSelections,
       artifactComments,
@@ -3100,7 +3172,7 @@ export function useChatMessages(
       userId: userMessage?.id ?? null,
       assistantId: assistantMessageId,
       turnIndex,
-      request: { ...sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey },
+      request: { ...sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), requestKey },
       watermarkBefore,
       // DALTON-HOOK(composer-drafts): keeps the send's acceptance with the Retry a plain failure leaves.
       onAccepted: notifyAccepted,
@@ -3163,6 +3235,7 @@ export function useChatMessages(
         requestKey,
         threadSettings: { subagentsAllowed },
         artifactComments: commentSend,
+        chartViews,
       });
 
       // The user hit stop: stopWorkflow already finalized the message and ran
@@ -3203,7 +3276,7 @@ export function useChatMessages(
       // logical request. A chain that gives up or a stop that cancels the
       // backoff settles the draft back whole (onNotTaken), and the failed
       // reply's Retry, its held acceptance included, can still settle it sent.
-      if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode, onAccepted: notifyAccepted, onNotTaken }, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey, null, admission.unstarted())) {
+      if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode, onAccepted: notifyAccepted, onNotTaken }, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), requestKey, null, admission.unstarted())) {
         wasDisconnected = true;
         ended = 'handedOff';
         onHandedOff?.();
@@ -3271,7 +3344,7 @@ export function useChatMessages(
           // accepted (its response was lost) — adopt that run instead of
           // erroring; the reconnect owns finalization from here.
           if (
-            retryFailedDuplicate(err, assistantMessageId, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), { model, reasoningEffort, fastMode }, requestKey)
+            retryFailedDuplicate(err, assistantMessageId, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend, chartViews }), { model, reasoningEffort, fastMode }, requestKey)
             || adoptDuplicateRun(err, assistantMessageId, requestKey)
           ) {
             wasDisconnected = true;
@@ -3389,6 +3462,41 @@ export function useChatMessages(
     if (!next) return;
     for (const [seq, gen] of steersInFlightRef.current) {
       if (seq < next.seq && gen === next.gen) return;
+    }
+    if (freshening.current) return;
+    // Held while a long turn ran, a file may be near the time the server
+    // keeps it unsent: it is staged again first, as the composer would.
+    if (!next.fresh && !namesStagedFiles(next.additionalContext)) next.fresh = true;
+    if (!next.fresh) {
+      freshening.current = next;
+      void freshenStaged(next.additionalContext, next.attachmentMeta, workspaceId).then((parts) => {
+        freshening.current = null;
+        // Stopped or left meanwhile: what was staged again is not needed, and
+        // whatever queued since waited on this one.
+        if (!notRunningSendsRef.current.includes(next)) {
+          for (const r of parts?.restaged.values() ?? []) discardAttachment(r.attachmentId);
+          setNotRunningTick((n) => n + 1);
+          return;
+        }
+        if (parts) {
+          next.additionalContext = parts.contexts;
+          next.attachmentMeta = parts.meta;
+          const draft = next.modelOptions.draft;
+          if (draft && parts.restaged.size > 0) {
+            next.modelOptions = { ...next.modelOptions, draft: { ...draft, files: draft.files.map((f) => ({ ...f, ...parts.restaged.get(f.attachmentId) })) } };
+          }
+          next.fresh = true;
+        } else {
+          // Gone from the server and not staged again: back to the composer,
+          // where sending again uploads it.
+          notRunningSendsRef.current.splice(notRunningSendsRef.current.indexOf(next), 1);
+          requestKeys.spend(next.requestKey);
+          requestKeys.settle(next.requestKey, 'dropped');
+          giveBackStoppedSteers([], [next]);
+        }
+        setNotRunningTick((n) => n + 1);
+      });
+      return;
     }
     queue.shift();
     // The send's bubble takes the waiting one's place, in the same batch.
@@ -3951,6 +4059,7 @@ export function useChatMessages(
             retryOf.runId ?? latestRunIdRef.current,
             request.additionalContext,
             request.keepFullContext,
+            request.chartViews,
           )
         : await sendChatMessageStream(message || '', workspaceId, threadId, {
             onEvent: processEvent,
@@ -3970,6 +4079,7 @@ export function useChatMessages(
             keepFullContext: request.keepFullContext,
             threadSettings: { subagentsAllowed: request.subagentsAllowed },
             artifactComments: request.artifactComments,
+            chartViews: request.chartViews,
           });
 
       // User hit stop: stopWorkflow already finalized + tore down. Exception: a
@@ -4382,6 +4492,7 @@ export function useChatMessages(
     armReportBack: (owed) => armReportBackWatch(threadIdRef.current, null, null, undefined, owed),
     refreshWorkspaces: () => invalidateNewWorkspace(queryClient),
     refreshClaudeCode,
+    refreshClaudeCodePlan,
     // A turn other than the one this view counted for the run's bubble means
     // turns were added where the view never saw them. The stream stamps the
     // server's number, and only a reload shows those turns.
@@ -4433,8 +4544,13 @@ export function useChatMessages(
     isLoadingHistory,
     historyLoadFailed,
     isLoadingThread,
-    // Older history, paged in above the transcript as the reader scrolls up.
-    olderHistory: { status: olderHistoryStatus, load: loadOlderHistory },
+    // Older history, paged in above the transcript as the reader scrolls up,
+    // and behind first paint when the newest page stopped short on its bytes.
+    olderHistory: {
+      snapshot: olderHistorySnapshot,
+      load: loadOlderHistory,
+      backfill: backfillOlderHistory,
+    },
     isReconnecting,
     modelStatus,
     fallbackSuggestion,
@@ -4469,7 +4585,9 @@ export function useChatMessages(
     handleRetry,
     handleThumbUp,
     handleThumbDown,
+    handleThumbDownFollowUp,
     feedbackByTurn,
+    feedbackLoading,
     resolveSubagentIdToAgentId,
     getSubagentHistory,
     getTaskRuns,

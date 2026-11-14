@@ -349,6 +349,22 @@ async def test_update_preferences(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("out", "forgets"), [("credits", True), ("stop", False)])
+async def test_choosing_usage_credits_forgets_what_the_plan_said_of_them(client, out, forgets):
+    with (
+        patch(f"{DB}.db_get_user", new_callable=AsyncMock, return_value=_user()),
+        patch(f"{DB}.upsert_user_preferences", new_callable=AsyncMock, return_value=_prefs()),
+        patch(f"{DB}.maybe_complete_onboarding", new_callable=AsyncMock),
+        patch(f"{DB}.credits_unknown", new_callable=AsyncMock) as unknown,
+    ):
+        resp = await client.put(
+            "/api/v1/users/me/preferences", json={"other_preference": {"claude_code_plan_out": out}},
+        )
+    assert resp.status_code == 200
+    assert unknown.await_count == (1 if forgets else 0), "the next turn's first request says whether they pay"
+
+
+@pytest.mark.asyncio
 async def test_update_preferences_user_not_found(client):
     with patch(
         f"{DB}.db_get_user",
@@ -572,6 +588,23 @@ async def test_update_preferences_unrelated_other_preference_keys_untouched(clie
     assert mock_upsert.await_args.kwargs["other_preference"] == {"voice_input_enabled": True}
 
 
+@pytest.mark.asyncio
+async def test_update_preferences_refuses_feature_overrides(client):
+    """A grant is the server's to write: through this route a user could grant
+    themselves a feature the ``grant`` gate keeps from them."""
+    with (
+        patch(f"{DB}.db_get_user", new_callable=AsyncMock, return_value=_user()),
+        patch(f"{DB}.upsert_user_preferences", new_callable=AsyncMock) as mock_upsert,
+    ):
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"other_preference": {"feature_overrides": {"claude_oauth": True}}},
+        )
+
+    assert resp.status_code == 422
+    mock_upsert.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # DELETE /api/v1/users/me/preferences
 # ---------------------------------------------------------------------------
@@ -589,17 +622,19 @@ async def test_delete_preferences(client):
         patch(
             f"{DB}.db_delete_user_preferences",
             new_callable=AsyncMock,
-        ),
+        ) as delete,
         patch(
             f"{DB}.db_update_user",
             new_callable=AsyncMock,
         ),
+        patch(f"{DB}.granted_override_keys", return_value=["claude_oauth"]),
     ):
         resp = await client.delete("/api/v1/users/me/preferences")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
+    assert delete.await_args.kwargs == {"keep_overrides": ["claude_oauth"]}
 
 
 @pytest.mark.asyncio
@@ -1883,7 +1918,9 @@ async def test_delete_preferences_preserves_data_task_routes_for_primary_admin_o
         resp_other = await client.delete("/api/v1/users/me/preferences")
 
     assert resp_other.status_code == 200
-    delete_mock.assert_awaited_once_with("test-user-123")
+    delete_mock.assert_awaited_once_with(
+        "test-user-123", keep_overrides=users_mod.granted_override_keys()
+    )
     upsert_mock.assert_not_awaited()
     audit_mock.assert_not_awaited()
 

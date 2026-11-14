@@ -100,6 +100,7 @@ from ptc_agent.agent.middleware.system_prompt_caching import SystemPromptCacheMi
 from ptc_agent.agent.middleware.tool_surface import ToolSurfaceMiddleware
 from ptc_agent.agent.middleware.runtime_context.frozen_prompt import SystemPinMiddleware
 from ptc_agent.agent.middleware.runtime_context import (
+    BaselineContextMiddleware,
     FrozenPromptMiddleware,
     RowCarrierMiddleware,
     TimeUpToolStopMiddleware,
@@ -135,6 +136,7 @@ from ptc_agent.agent.tools import (
     create_show_widget_tool,
     TodoWrite,
 )
+from ptc_agent.agent.tools.context_file_policy import agent_md_for
 from ptc_agent.agent.tools.computer_reach import (
     REACHABLE_TOOLS,
     ComputerReach,
@@ -156,7 +158,7 @@ from src.tools.market_data.tool import (
     screen_stocks,
 )
 from src.tools.market_watch import watch_market
-from src.tools.chart_annotation import CHART_ANNOTATION_TOOLS
+from src.tools.chart_annotation import CHART_LAYER_TOOLS
 from src.tools.messaging import build_messaging_tools, messaging_enabled
 from src.tools.wakeups.tool import build_schedule_wakeup_tool
 from src.tools.thread_status.tool import build_thread_status_tool
@@ -311,7 +313,7 @@ class PTCAgent:
         workspace_owner_id: str | None = None,
         tail_turn_no_new_work: bool = False,
         computers: ComputerReach | None = None,
-        claude_code_launcher: "Callable[[PTCSandbox, str | None, str | None], Launcher] | None" = None,
+        claude_code_launcher: "Callable[..., Launcher] | None" = None,
         # DALTON-HOOK(team-memory-toggle): per-workspace / Home user-level Team Memory switch
         team_memory_enabled: bool = False,
         # DALTON-HOOK(research-writing): permanent Chinese research judgment and writing rules
@@ -367,19 +369,23 @@ class PTCAgent:
             computers: The user's other computers, which the Chief of Staff's
                 own Bash, ExecuteCode and file tools take a ``computer`` to run
                 on. None leaves every tool on this computer.
-            claude_code_launcher: Where a Claude Code turn's CLI runs, given
-                the sandbox, the credential admission let a turn on a cloud
-                computer run on (``claude_code_hosted``) and the saved setup
-                token it let the turn sign in with (``claude_code_saved``); the
-                server picks it, and the token it signs in with.
+            claude_code_launcher: Where a Claude Code CLI runs, given the
+                sandbox and what admission let it run on (``Admitted``): the
+                turn's (``claude_code_admitted``), or its subagents' Claude
+                Code pins' on a turn of another model (``claude_code_pins``);
+                the server picks it, and the token it signs in with.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
         """
         turn = turn_model(self.config, llm, self.llm, background=False)
         claude_code = isinstance(turn.client, ClaudeCodeTarget)
-        # A subagent does not run on the Claude Code runtime yet.
-        disable_subagents = disable_subagents or claude_code
+        # Where a Claude Code CLI here runs and what it signs in with: the
+        # turn's own, else its subagents' Claude Code pins' on a turn of
+        # another model.
+        claude_code_cli = self.config.claude_code_admitted if claude_code else self.config.claude_code_pins
+        if claude_code_cli is not None and claude_code_launcher is None:
+            raise RuntimeError("a Claude Code CLI needs a claude_code_launcher")
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
@@ -535,10 +541,12 @@ class PTCAgent:
         # `filesystem_backend` is the composite when a store is wired; otherwise
         # it's the plain sandbox backend. Tools see a uniform rich-method
         # surface either way.
+        agent_md = agent_md_for(role)
         read_file, write_file, edit_file = create_filesystem_tools(
             filesystem_backend,
             operation_callback=operation_callback,
             record_creators=True,
+            agent_md=agent_md,
         )
         search_tools = [
             create_glob_tool(filesystem_backend),  # overrides middleware glob
@@ -562,6 +570,7 @@ class PTCAgent:
                     subagent_files,
                     operation_callback=operation_callback,
                     record_creators=True,
+                    agent_md=agent_md,
                 ),
                 *search_tools,
             ]
@@ -723,15 +732,16 @@ class PTCAgent:
         # middleware, and its tool hook must wrap the Task interceptor so a
         # resume it calls settles on that call's result. Without subagents
         # there is no TaskOutput to read a task report's result with, nor a
-        # task to resume, so only steers are taken in. A Claude Code turn runs
-        # no subagents but takes the other reports in (a command's end, a
-        # wakeup, an alert), which its tool hook hands Claude mid-turn.
+        # task to resume, so only steers are taken in. A Claude Code turn
+        # takes the other reports in either way (a command's end, a wakeup,
+        # an alert), which its tool hook hands Claude mid-turn, and resumes
+        # only as it opens.
         steering = SteeringMiddleware(
             report_inbox=_bg_registry.report_inbox,
             kinds=(
-                ("report", "steer")
-                if claude_code
-                else ("steer",) if disable_subagents else ("report", "steer", "resume")
+                ("report", "steer") if claude_code and disable_subagents
+                else ("steer",) if disable_subagents
+                else ("report", "steer", "resume")
             ),
         )
         main_only_middleware.append(steering)
@@ -1003,6 +1013,7 @@ class PTCAgent:
                     settled_at=turn_context.previous_run_settled_at if turn_context else None,
                     cold_tokens=self.config.compaction.cold_compact_tokens,
                     idle_tokens=self.config.compaction.idle_tokens,
+                    idle_compaction=self.config.feature_enabled("idle_compaction"),
                     keep_full_context=bool(turn_context and turn_context.keep_full_context),
                     sent_at=turn_context.sent_at if turn_context else None,
                 )
@@ -1019,10 +1030,15 @@ class PTCAgent:
         )
 
         # SubagentSteeringMiddleware must be first so follow-up messages are visible before other middleware.
+        subagent_steering = SubagentSteeringMiddleware(registry=background_middleware.registry)
+        subagent_turn_context = TurnContextMiddleware(
+            timezone=timezone_str or "UTC",
+            is_subagent=True,
+        )
         subagent_middleware = [
             m
             for m in [
-                SubagentSteeringMiddleware(registry=background_middleware.registry),
+                subagent_steering,
                 # Outermost of the tool wrappers, so each result streams as
                 # the checkpoint keeps it, the time-up refusal included, and
                 # live agrees with replay. It acts only on what comes back,
@@ -1042,10 +1058,7 @@ class PTCAgent:
                 # is injected: this stack is built once per parent turn and run
                 # for every subagent, so the row reads the clock when its own
                 # turn opens.
-                TurnContextMiddleware(
-                    timezone=timezone_str or "UTC",
-                    is_subagent=True,
-                ),
+                subagent_turn_context,
                 LargeResultEvictionMiddleware(
                     backend=backend, eviction_dir=eviction_dir
                 ),
@@ -1113,7 +1126,7 @@ class PTCAgent:
             role=role,
         )
         if main_compaction is not None:
-            main_compaction = main_compaction.with_baseline(context.baseline.sent_block)
+            main_compaction = main_compaction.with_baseline(context.baseline.sent_sections)
 
         # Compiled subagent graphs live on this middleware; the RunWorkflow
         # dispatcher below shares the same instances so direct dispatches get
@@ -1123,6 +1136,41 @@ class PTCAgent:
         # provider of the Task tool, so skipping it (plus the TaskOutput extend
         # above) makes a notification turn structurally unable to spawn
         # subagents, and RunWorkflow drops with it below.
+        # A subagent on a Claude Code row runs each of its runs in a Claude
+        # Code CLI of its own, where a Claude Code turn runs its CLI. As that
+        # turn does, it takes its prompt, tools and stack from its compiled
+        # agent, opens with the hooks that write its rows, and takes in what
+        # is sent into its task between calls.
+        claude_code_launcher_for = (
+            partial(claude_code_launcher, sandbox, claude_code_cli)
+            if claude_code_cli is not None and claude_code_launcher is not None
+            else None
+        )
+
+        def claude_code_subagent(compiled: Any, spec: Any, target: ClaudeCodeTarget) -> Any:
+            from ptc_agent.agent.claude_code.agent import claude_code_graph
+            from ptc_agent.agent.claude_code.compaction import CompactionRules
+            from ptc_agent.agent.claude_code.mid_turn import TaskSteering
+            from ptc_agent.agent.claude_code.ssh_launcher import SUBAGENT_CLI_SLOT_WAIT_S
+
+            background_middleware.claude_code_types |= {spec["name"]}
+            background_middleware.claude_code_stored = bool(claude_code_cli.saved)
+            background_middleware.claude_code_models[spec["name"]] = target.model
+            background_middleware.cli_computer = claude_code_cli.cli_computer
+            own = list(spec.get("middleware") or [])
+            baseline = next((m for m in own if isinstance(m, BaselineContextMiddleware)), None)
+            return claude_code_graph(
+                compiled, system_prompt=spec["system_prompt"], target=target,
+                user_id=user_id, checkpointer=checkpointer,
+                launcher=partial(claude_code_launcher_for, slot_wait_s=SUBAGENT_CLI_SLOT_WAIT_S),
+                entry=(subagent_skill_middleware, subagent_turn_context, *own),
+                middleware=[*subagent_middleware, *own],
+                baseline=baseline.frozen_block if baseline is not None else None,
+                steering=TaskSteering(subagent_steering),
+                compaction=CompactionRules.of_subagent(self.config.compaction, backend=backend,
+                                                      workspace_id=workspace_id_for_memory),
+            )
+
         # DALTON-HOOK(colleague-dispatch): withhold Task/RunWorkflow on tail turns while keeping TaskOutput
         subagent_task_middleware = (
             task_middleware(
@@ -1132,6 +1180,7 @@ class PTCAgent:
                 middleware=subagent_middleware,
                 registry=background_middleware.registry,
                 checkpointer=checkpointer,
+                claude_code=claude_code_subagent if claude_code_launcher_for is not None else None,
             )
             if not disable_subagents and not tail_turn_no_new_work
             else None
@@ -1164,12 +1213,12 @@ class PTCAgent:
             )
             tools.append(run_workflow_tool)
 
-        # Chart annotations, main agent only: appended after the subagent
+        # The chart-layer tool, main agent only: appended after the subagent
         # snapshot above, which the default general-purpose subagent is built
         # from. A drawing is part of the reply the user sees, and a subagent
         # answers the main agent, not the user.
         if chart_annotation:
-            tools.extend(CHART_ANNOTATION_TOOLS)
+            tools.extend(CHART_LAYER_TOOLS)
 
         # Messaging the user (send_message, list_message_targets), present only
         # when a channel gateway is configured. Main agent only, added after the
@@ -1344,13 +1393,10 @@ class PTCAgent:
             from ptc_agent.agent.claude_code.agent import claude_code_graph
             from ptc_agent.agent.claude_code.compaction import CompactionRules
 
-            if claude_code_launcher is None:
-                raise RuntimeError("a Claude Code turn needs a claude_code_launcher")
-
             return claude_code_graph(
                 agent, system_prompt=system_prompt, target=turn.client,
-                user_id=user_id, thread_id=thread_id, checkpointer=checkpointer,
-                launcher=claude_code_launcher(sandbox, self.config.claude_code_hosted, self.config.claude_code_saved),
+                user_id=user_id, checkpointer=checkpointer,
+                launcher=claude_code_launcher_for,
                 entry=(skill_loader_middleware, context.turn, context.baseline),
                 middleware=deepagent_middleware,
                 baseline=context.baseline.frozen_block,

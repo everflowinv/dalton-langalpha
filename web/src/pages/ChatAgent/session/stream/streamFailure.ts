@@ -1,4 +1,5 @@
-import { isUpstreamHint, RECONNECT_ACCOUNT_LINK, type StructuredError } from '@/utils/rateLimitError';
+import { RECONNECT_ACCOUNT_LINK, type StructuredError } from '@/utils/rateLimitError';
+import { readUpstreamDetail } from '@/lib/upstreamFailure';
 import { claudeCodeRefusal } from '@/lib/claudeCode';
 import type { SSEEvent } from '../types';
 
@@ -7,14 +8,17 @@ import type { SSEEvent } from '../types';
  * `error_kind` says whose fault it was (the model provider's, or this
  * service's), with the status, hints and models an upstream failure carries.
  * Undefined for a frame the server did not classify. A Claude Code refusal
- * the app words reads in its words, in the user's language. The live stream
+ * the app words reads in its words, in the user's language, and a Claude
+ * plan's limit carries its window and reset for the card to word in the
+ * reader's zone. The live stream
  * and a reload both read it, so a failed turn shows the same card either way.
  */
 export function readStreamFailure(
   event: SSEEvent, message: string, workspaceId: string, t: (key: string, opts?: Record<string, unknown>) => string,
 ): StructuredError | undefined {
   if (event.type === 'claude_code_off') {
-    const { link, messageKey, messageValues } = claudeCodeRefusal(event.reason, workspaceId, event.limit);
+    const { link, messageKey, messageValues, planRefusal } = claudeCodeRefusal(event, workspaceId);
+    if (planRefusal) return { message, planRefusal };
     const worded = messageKey ? t(messageKey, messageValues) : message;
     if (link) return { message: worded, links: [link] };
     if (messageKey) return { message: worded };
@@ -36,23 +40,22 @@ export function readStreamFailure(
         }))
         .filter((m) => m.model)
     : undefined;
-  const hints = kind === 'upstream' && Array.isArray(event.hints)
-    ? (event.hints.filter(isUpstreamHint) as StructuredError['hints'])
-    : undefined;
+  // What only the provider's failure carries: an internal error gets none
+  // even if a future server sends it.
+  const upstream = kind === 'upstream' ? readUpstreamDetail(event) : {};
   return {
     message,
     kind,
     // The hint says the sign-in must be renewed; this is where.
-    links: hints?.includes('reconnect_account') ? [RECONNECT_ACCOUNT_LINK] : undefined,
+    links: upstream.hints?.includes('reconnect_account') ? [RECONNECT_ACCOUNT_LINK] : undefined,
     statusCode: typeof event.status_code === 'number' ? event.status_code : undefined,
-    // ``hints`` are only meaningful for upstream provider errors (the bullets
-    // say "check your API key / plan / provider status"). An internal error
-    // doesn't get hints even if the backend ever starts emitting them for
-    // some future variant.
-    hints,
+    ...upstream,
     // User-configured model + the full attempt list, so the display can show
     // a model-aware headline and an "Also tried" line.
     model: typeof event.model === 'string' ? event.model : undefined,
     attemptedModels: attemptedModels && attemptedModels.length > 0 ? attemptedModels : undefined,
+    // A replayed frame names its run as `response_id`.
+    runId: typeof event.run_id === 'string' ? event.run_id
+      : typeof event.response_id === 'string' ? event.response_id : undefined,
   };
 }

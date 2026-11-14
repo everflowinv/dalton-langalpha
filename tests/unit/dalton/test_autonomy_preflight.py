@@ -8,7 +8,7 @@ import importlib.util
 import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import create_autospec
 from zoneinfo import ZoneInfo
 
@@ -4254,3 +4254,148 @@ async def test_successful_run_writes_sec_signal_before_seen_watermark(
     assert result.should_wake is True
     assert seen_writes
     assert all(signal_at < index for index in seen_writes)
+
+
+@pytest.mark.asyncio
+async def test_wake_decision_persists_full_wake_context_with_coverage_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预检判定 wake 时，写入日志的 wake_context 等于最终交给执行器的完整文本（含 coverage 块）。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    monkeypatch.setattr(
+        "src.dalton.autonomy.preflight._sync_home_coverage_for_preflight",
+        create_autospec(
+            preflight_mod._sync_home_coverage_for_preflight,
+            return_value="updated NVDA sector coverage",
+        ),
+    )
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["seen_accessions"] = [_SEC_ACCESSION]
+        return [
+            ProbeSignal(
+                probe="sec",
+                signal_key=f"filing:{_SEC_ACCESSION}",
+                priority="P0",
+                summary="META 新 SEC 披露：10-Q",
+                payload={"form": "10-Q", "accession_number": _SEC_ACCESSION},
+            )
+        ], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec, cnhk=_quiet)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-wake-ctx-1",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert result.decision == "wake"
+    assert result.wake_context is not None
+    assert "<coverage_group_refresh>" in result.wake_context
+    assert "updated NVDA sector coverage" in result.wake_context
+    wake_logs = [entry for entry in doubles["logs"] if entry.get("decision") == "wake"]
+    assert len(wake_logs) == 1
+    assert wake_logs[0]["wake_context"] == result.wake_context
+
+
+def test_d037_preflight_log_wake_context_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """d037 迁移文件头及 dalton_preflight_log.wake_context 升降级 SQL 正确。"""
+    import importlib
+
+    from alembic import op
+
+    mig = importlib.import_module("src.dalton.migrations.versions.d037_preflight_log_wake_context")
+    assert mig.revision == "d037"
+    assert mig.down_revision == "d033"
+
+    executed: list[str] = []
+
+    def _record_sql(sql: Any, *_args: Any, **_kwargs: Any) -> None:
+        executed.append(" ".join(str(sql).split()))
+
+    monkeypatch.setattr(op, "execute", create_autospec(op.execute, side_effect=_record_sql))
+    mig.upgrade()
+    assert any(
+        "ALTER TABLE dalton_preflight_log ADD COLUMN IF NOT EXISTS wake_context TEXT" in stmt
+        for stmt in executed
+    )
+
+    executed.clear()
+    mig.downgrade()
+    assert any(
+        "ALTER TABLE dalton_preflight_log DROP COLUMN IF EXISTS wake_context" in stmt
+        for stmt in executed
+    )
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_logged", [None, "earlier context"])
+async def test_decide_backfills_wake_context_for_early_return_wakes(
+    monkeypatch: pytest.MonkeyPatch, already_logged: Optional[str]
+) -> None:
+    """价格触发、保守超时这类提前返回的唤醒也要留下 wake_context；已有记录时不重复写。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.database import watch as watch_db_mod
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    price_result = preflight_mod.PreflightResult(
+        should_wake=True,
+        decision="wake",
+        reason="price_trigger",
+        signals=[{"probe": "price", "signal_key": "trigger:exec-pri", "priority": "P0", "summary": "x"}],
+        wake_context="<dalton_wake>price</dalton_wake>",
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "retry_failed_notify_deliveries",
+        create_autospec(dispatch_mod.retry_failed_notify_deliveries, return_value=None),
+    )
+    monkeypatch.setattr(
+        preflight_mod,
+        "preflight_check",
+        create_autospec(preflight_mod.preflight_check, return_value=price_result),
+    )
+    getter = create_autospec(watch_db_mod.get_preflight_wake_context, return_value=already_logged)
+    inserter = create_autospec(watch_db_mod.insert_preflight_log, return_value=None)
+    monkeypatch.setattr(preflight_mod.watch_db, "get_preflight_wake_context", getter)
+    monkeypatch.setattr(preflight_mod.watch_db, "insert_preflight_log", inserter)
+
+    automation = _company_watch_automation()
+    result = await preflight_mod.decide(automation, "exec-price-1")
+
+    assert result is price_result
+    getter.assert_awaited_once_with("exec-price-1")
+    if already_logged is None:
+        inserter.assert_awaited_once()
+        kwargs = inserter.await_args.kwargs
+        assert kwargs["automation_execution_id"] == "exec-price-1"
+        assert kwargs["decision"] == "wake"
+        assert kwargs["wake_context"] == "<dalton_wake>price</dalton_wake>"
+    else:
+        inserter.assert_not_awaited()
+
+
+def test_dalton_migration_graph_has_a_single_head() -> None:
+    """Dalton 迁移编号不按顺序接（d031→d035→d036→d032→d033），新迁移挂错父节点会形成两个末端，
+    部署入口的 `alembic upgrade head` 会失败。"""
+    import importlib
+    import pkgutil
+
+    import src.dalton.migrations.versions as versions_pkg
+
+    revisions: dict[str, Optional[str]] = {}
+    for info in pkgutil.iter_modules(versions_pkg.__path__):
+        mod = importlib.import_module(f"src.dalton.migrations.versions.{info.name}")
+        revisions[mod.revision] = mod.down_revision
+    parents = {down for down in revisions.values() if down}
+    heads = sorted(rev for rev in revisions if rev not in parents)
+    assert heads == ["d037"], heads

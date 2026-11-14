@@ -3,10 +3,12 @@
  * status, thread watch, reconnect, turns, and the v2 thread mux.
  */
 import { api } from '@/api/client';
+import type { ChartView } from '@/pages/MarketView/types/chartView';
 import type { ArtifactCommentSendFields, CommentSend, WorkflowRunStatus } from '@/types/api';
 import type { CancelOutcome, HeldSteer } from '../cancelOutcome';
 import { bearerTokenOf, refreshAccessToken } from '@/lib/authToken';
 import { PING_STREAM_BEAT_MS, RUN_STREAM_BEAT_MS, watchStreamSilence } from '@/lib/streamSilence';
+import type { PageBudget } from '../../session/history/pageBudget';
 import { baseURL, getAuthHeaders, streamFetch, postSSEStream } from './transport';
 
 /**
@@ -15,8 +17,9 @@ import { baseURL, getAuthHeaders, streamFetch, postSSEStream } from './transport
  * saying where the page starts and whether older turns remain.
  */
 export interface ReplayPageRequest {
-  /** The newest this many checkpointed turns (before `beforeTurn` if given). */
-  limit?: number;
+  /** The newest turns the page's budget allows (before `beforeTurn` if
+   *  given). A server that predates the bytes sends `limit` turns. */
+  page?: PageBudget;
   /** Only turns older than this one: the previous page's first turn. */
   beforeTurn?: number;
   signal?: AbortSignal;
@@ -25,11 +28,15 @@ export interface ReplayPageRequest {
 export async function replayThreadHistory(
   threadId: string,
   onEvent: (event: Record<string, unknown>) => void = () => {},
-  { limit, beforeTurn, signal }: ReplayPageRequest = {},
+  { page, beforeTurn, signal }: ReplayPageRequest = {},
 ) {
   if (!threadId) throw new Error('Thread ID is required');
   const params = new URLSearchParams();
-  if (limit != null) params.set('limit', String(limit));
+  if (page) {
+    params.set('limit', String(page.limit));
+    params.set('max_bytes', String(page.maxBytes));
+    params.set('min_turns', String(page.minTurns));
+  }
   if (beforeTurn != null) params.set('before_turn', String(beforeTurn));
   const query = params.toString();
   const authHeaders = await getAuthHeaders();
@@ -85,6 +92,8 @@ export interface SendChatMessageOptions extends StreamTurnOptions {
   artifactComments?: CommentSend | null;
   /** Start this turn without the summary a cold thread would get first. */
   keepFullContext?: boolean;
+  /** What the charts beside the composer show, for the agent's snapshots. */
+  chartViews?: ChartView[] | null;
 }
 
 export type SendHitlResponseOptions = StreamTurnOptions;
@@ -132,6 +141,7 @@ export async function sendChatMessageStream(
     steerOnly = false,
     artifactComments = null,
     keepFullContext = false,
+    chartViews = null,
   }: SendChatMessageOptions = {},
 ) {
   // For checkpoint replay (regenerate/retry), send empty messages
@@ -153,6 +163,7 @@ export async function sendChatMessageStream(
   if (additionalContext) {
     body.additional_context = additionalContext;
   }
+  if (chartViews?.length) body.chart_views = chartViews;
   if (checkpointId) {
     body.checkpoint_id = checkpointId;
   }
@@ -183,8 +194,9 @@ export async function sendChatMessageStream(
  * attempt and resolves the retry checkpoint itself — no client-side
  * checkpoint fetch, no fork/truncation. Streams the same SSE contract as a
  * normal send. `runId` names the failed run, so the server refuses it (409)
- * rather than retry a different turn's attempt. `additionalContext` is the
- * failed send's, which the server uses only when that message runs again.
+ * rather than retry a different turn's attempt. `additionalContext` and
+ * `chartViews` are the failed send's, which the server uses only when that
+ * message runs again.
  */
 export async function sendRetryStream(
   workspaceId: string,
@@ -199,6 +211,7 @@ export async function sendRetryStream(
   runId: string | null = null,
   additionalContext: Record<string, unknown>[] | null = null,
   keepFullContext = false,
+  chartViews: ChartView[] | null = null,
 ) {
   const body: Record<string, unknown> = { workspace_id: workspaceId };
   if (llmModel) body.llm_model = llmModel;
@@ -207,6 +220,7 @@ export async function sendRetryStream(
   if (requestKey) body.request_key = requestKey;
   if (runId) body.run_id = runId;
   if (additionalContext) body.additional_context = additionalContext;
+  if (chartViews?.length) body.chart_views = chartViews;
   if (keepFullContext) body.keep_full_context = true;
   return await postSSEStream(`/api/v1/threads/${threadId}/retry`, body, { onEvent, onRunIdResolved, signal });
 }
@@ -301,8 +315,9 @@ export { decodeReportBackSignal, shouldArmReportBack } from '../reportBackSignal
 
 export type { ReportBackSignal } from '../reportBackSignal';
 
-/** Tokens a thread has used, as the server counts them. */
-export type ThreadTokenTotals = { input_tokens: number; output_tokens: number };
+/** Tokens a thread has used, as the server counts them. `cached_tokens`, the
+ *  cache reads within `input_tokens`, is absent from a server before it. */
+export type ThreadTokenTotals = { input_tokens: number; output_tokens: number; cached_tokens?: number };
 
 /**
  * What a thread's next send summarizes before it runs (`next_summary` on the

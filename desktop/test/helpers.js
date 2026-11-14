@@ -27,6 +27,19 @@ const STASHED_BUILD_CONFIG = fs.existsSync(BUILD_CONFIG) ? fs.readFileSync(BUILD
 const opened = []
 const errorBoxes = []
 const exits = []
+// Every `app.quit()` the shell asked for, since the last `loadShell`.
+const quits = []
+// Whether `app.whenReady()` resolves. Off by default, so requiring main.js
+// registers its policy and stops there; a test of what only a ready app does
+// (the menu bar window, closing the last window, quitting) turns it on.
+let ready = false
+// The menu bar icons the shell made, in order, since the last `loadShell`.
+const trays = []
+// What `Menu.setApplicationMenu` was last given: the template, since
+// `buildFromTemplate` hands it back as it is.
+let applicationMenu = null
+// What `screen` reports: one display, a 1512x982 Mac screen under a 33px menu bar.
+const display = { bounds: { x: 0, y: 0, width: 1512, height: 982 }, workArea: { x: 0, y: 33, width: 1512, height: 949 } }
 const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'la-test-'))
 
 // Mutable so a test can put the machine offline, which is the one input to the
@@ -61,6 +74,12 @@ function resetLoginItems() {
 // What `ipcMain.handle` was given, by channel, so a test can call a handler the
 // way a renderer's invoke reaches it.
 const ipcHandlers = new Map()
+// And what `ipcMain.on` was given, for the messages a renderer sends rather
+// than invokes.
+const ipcListeners = new Map()
+// What main answers the preload's `shell:window-facts` with while `loadPreload`
+// runs it.
+let preloadFacts = null
 
 // What Electron falls back to with no `productName`: the package.json `name`.
 // Nothing should ever run on it — main sets the edition's name before anything
@@ -87,10 +106,11 @@ class FakeWebContents extends EventEmitter {
   constructor(window) {
     super()
     this.window = window
-    this.navigationHistory = { canGoBack: () => false, canGoForward: () => false }
+    this.navigationHistory = { canGoBack: () => false, canGoForward: () => false, getAllEntries: () => [] }
   }
 
   getURL() { return this.window.loaded.at(-1) || '' }
+  loadURL(url) { return this.window.loadURL(url) }
   setWindowOpenHandler() {}
   send() {}
   async executeJavaScript() { return null }
@@ -115,18 +135,48 @@ class FakeBrowserWindow extends EventEmitter {
   static fromWebContents(wc) { return (wc && wc.window) || null }
 
   isDestroyed() { return this.destroyed }
+  getBounds() { return this.bounds || { x: 0, y: 0, width: this.options.width || 0, height: this.options.height || 0 } }
+  setBounds(bounds) { this.bounds = { ...bounds }; (this.boundsSet ||= []).push({ ...bounds }) }
   loadURL(url) { this.loaded.push(url); return Promise.resolve() }
   loadFile(file) { this.loaded.push(`file://${file}`); return Promise.resolve() }
-  show() {}
+  show() { this.visible = true }
+  hide() { this.visible = false }
+  isVisible() { return Boolean(this.visible) }
   focus() { focusOrder.push(this) }
   isMinimized() { return false }
+  isFocused() { return false }
   restore() {}
   setBackgroundColor() {}
+  setVisibleOnAllWorkspaces() {}
+  setOverlayIcon() {}
   close() {
     if (this.destroyed) return
     this.destroyed = true
     this.emit('closed')
   }
+}
+
+// The menu bar icon, as much of Electron's as tray.js touches.
+class FakeTray extends EventEmitter {
+  constructor(image) {
+    super()
+    this.image = image
+    this.destroyed = false
+    this.bounds = { x: 1000, y: 0, width: 24, height: 33 }
+    trays.push(this)
+  }
+
+  isDestroyed() { return this.destroyed }
+  destroy() { this.destroyed = true }
+  getBounds() { return this.bounds }
+  setTitle(title, options) {
+    this.title = title
+    this.titleOptions = options
+  }
+
+  setToolTip(tip) { this.tooltip = tip }
+  setContextMenu(menu) { this.menu = menu }
+  popUpContextMenu(menu) { this.popped = menu }
 }
 
 // What the remote-page preload handed to the page, keyed as the page sees it.
@@ -167,9 +217,14 @@ const electronStub = {
       loginItems.status = settings.openAtLogin ? loginItems.onRegister : 'not-registered'
     },
     exit: (code) => { exits.push(code) },
-    // Never resolves, so requiring main.js registers its policy and stops there
-    // rather than trying to open windows in a runtime that has none.
-    whenReady: () => new Promise(() => {}),
+    quit: () => { quits.push(Date.now()) },
+    // Windows-only calls, reached when a test runs the shell as Windows.
+    setAppUserModelId: () => {},
+    setUserTasks: () => {},
+    // Never resolves unless a test asked for a ready app, so requiring main.js
+    // registers its policy and stops there rather than trying to open windows
+    // in a runtime that has none.
+    whenReady: () => (ready ? Promise.resolve() : new Promise(() => {})),
   },
   shell: {
     openExternal: async (url) => { opened.push(url) },
@@ -183,12 +238,48 @@ const electronStub = {
     showSaveDialog: async () => saveDialog,
   },
   BrowserWindow: FakeBrowserWindow,
-  Menu: { buildFromTemplate: (t) => t, setApplicationMenu: () => {} },
-  ipcMain: { on: () => {}, handle: (channel, handler) => { ipcHandlers.set(channel, handler) } },
+  Tray: FakeTray,
+  nativeImage: {
+    createFromBuffer: () => ({ addRepresentation() {}, setTemplateImage() {} }),
+  },
+  powerMonitor: new EventEmitter(),
+  nativeTheme: { themeSource: 'system' },
+  screen: {
+    getDisplayMatching: () => display,
+    getDisplayNearestPoint: () => display,
+    getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+  },
+  Menu: {
+    buildFromTemplate: (t) => t,
+    setApplicationMenu: (menu) => { applicationMenu = menu },
+    getApplicationMenu: () => (applicationMenu
+      ? { items: applicationMenu, getMenuItemById: (id) => findMenuItem(applicationMenu, (i) => i.id === id) }
+      : null),
+  },
+  ipcMain: {
+    on: (channel, handler) => { ipcListeners.set(channel, handler) },
+    handle: (channel, handler) => { ipcHandlers.set(channel, handler) },
+  },
   // The renderer half, for running the real preload rather than reading it.
   contextBridge: { exposeInMainWorld: (key, api) => { exposed[key] = api } },
-  ipcRenderer: { invoke: async () => undefined, sendSync: () => undefined },
+  ipcRenderer: {
+    invoke: async () => undefined,
+    sendSync: (channel) => (channel === 'shell:window-facts' ? preloadFacts : undefined),
+  },
 }
+
+/** The first item in a menu template, at any depth, that `match` takes. */
+function findMenuItem(template, match) {
+  for (const item of template || []) {
+    if (match(item)) return item
+    const inner = findMenuItem(item.submenu, match)
+    if (inner) return inner
+  }
+  return null
+}
+
+/** An item of the application menu the shell installed, by its label. */
+const appMenuItem = (label) => findMenuItem(applicationMenu, (i) => i.label === label)
 
 const load = Module._load
 Module._load = function (request, ...rest) {
@@ -203,7 +294,24 @@ Module._load = function (request, ...rest) {
 /** Every shell loaded here, so `cleanup` can close what each one opened. */
 const SHELLS = []
 
-function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = null, loginPath, settings } = {}) {
+/**
+ * `platform` is what `process.platform` reads while the modules load, which is
+ * when main reads its platform traits; it is put back before this returns.
+ */
+function loadShell({ platform, ...options } = {}) {
+  if (!platform) return loadShellAs(options)
+  const real = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { value: platform })
+  try {
+    return loadShellAs(options)
+  } finally {
+    Object.defineProperty(process, 'platform', real)
+  }
+}
+
+function loadShellAs({
+  edition = 'oss', appOrigin, platformOrigin, serverUrl = null, loginPath, settings, ready: readyApp = false,
+} = {}) {
   if (edition === 'saas') {
     fs.writeFileSync(BUILD_CONFIG, JSON.stringify({
       edition: 'saas',
@@ -223,6 +331,10 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
   appHandlers.clear()
   windows.length = 0
   focusOrder.length = 0
+  quits.length = 0
+  trays.length = 0
+  applicationMenu = null
+  ready = readyApp
   fs.rmSync(path.join(userData, 'settings.json'), { force: true })
   // Written before the store is required, so a test can hand it the contents of
   // a settings.json rather than a shape the store itself produced. That is the
@@ -245,6 +357,7 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
     captive: require(path.join(SRC, 'captive.js')),
     remoteControl: require(path.join(SRC, 'remoteControl.js')),
     main: require(path.join(SRC, 'main.js')),
+    pageFacts: require(path.join(SRC, 'pageFacts.js')),
   }
   // `oauth` is the one module here that can own an OS resource. A callback
   // listener outlives the suite that opened it -- and a suite need not have
@@ -291,6 +404,111 @@ function quietly(fn) {
   return warned
 }
 
+/** Run `fn` with console.log and console.warn captured, and answer with every line, in order. */
+function logged(fn) {
+  const lines = []
+  const { log, warn } = console
+  console.log = (...a) => lines.push(a.join(' '))
+  console.warn = (...a) => lines.push(a.join(' '))
+  try {
+    fn()
+  } finally {
+    console.log = log
+    console.warn = warn
+  }
+  return lines
+}
+
+/**
+ * An IPC event from `win`'s page at `url`: the window is moved there and its
+ * main frame runs as `origin` (the URL's own unless said otherwise), which is
+ * what the shell's sender checks read.
+ */
+function from(win, url, origin = new URL(url).origin) {
+  win.loadURL(url)
+  win.webContents.mainFrame = { origin }
+  return { sender: win.webContents, senderFrame: win.webContents.mainFrame }
+}
+
+/** A `close` event, which records whether a handler refused it. */
+const closeEvent = () => ({ prevented: false, preventDefault() { this.prevented = true } })
+
+/** What Electron does to a window in a quit's sweep: asks, and closes it if nobody refused. */
+function sweep(win) {
+  const event = closeEvent()
+  win.emit('close', event)
+  if (!event.prevented) win.close()
+  return event
+}
+
+/** The menu bar window the shell has open, if any. */
+function menubarWindow() {
+  const isMenubar = (w) => !w.destroyed && new URL(w.loaded.at(-1) || 'about:blank').pathname === '/desktop/menubar'
+  return windows.filter(isMenubar).at(-1) || null
+}
+
+/**
+ * A shell whose app is ready: `whenReady` has run, so the menu bar window and
+ * its icon exist, and closing or quitting is decided as it is at a desk. A test
+ * ends it the way the app ends, with `emitApp('will-quit')`.
+ */
+async function readyShell(options) {
+  const shell = loadShell({ ...options, ready: true })
+  // The ready handler awaits the sign-in callback server before it opens anything.
+  for (let i = 0; i < 50 && !menubarWindow(); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  if (!menubarWindow()) throw new Error('the ready app made no menu bar window')
+  // The page calls in as it mounts, which is what lets the panel open.
+  const bar = menubarWindow()
+  ipcListeners.get('shell:set-tray-items')(from(bar, bar.loaded.at(-1)), [], { refreshMs: 300000 })
+  return shell
+}
+
+/** Intervals that run when told to, by period. */
+function fakeTimers() {
+  const live = new Map()
+  let id = 0
+  return {
+    setInterval(fn, ms) { live.set(++id, { fn, ms }); return id },
+    clearInterval(handle) { live.delete(handle) },
+    periods: () => [...live.values()].map((t) => t.ms).sort((a, b) => a - b),
+    fire(ms) { for (const t of [...live.values()]) if (t.ms === ms) t.fn() },
+  }
+}
+
+// Electron's Notification, as much of it as notify.js touches. Not on the stub
+// unless a test puts it there (`useNotifications`): without it the shell reads
+// notifications as unsupported, which is what every other test wants.
+const notifications = []
+class FakeNotification extends EventEmitter {
+  static isSupported() { return FakeNotification.supported }
+  static remove(ids) { FakeNotification.removed.push(...[].concat(ids)) }
+  constructor(options) {
+    super()
+    this.options = options
+    this.closed = false
+    notifications.push(this)
+  }
+
+  show() { this.shown = true }
+  close() { this.closed = true; this.emit('close', {}) }
+}
+FakeNotification.supported = true
+FakeNotification.removed = []
+
+/** Put the fake Notification on the stub, with nothing posted yet. */
+function useNotifications() {
+  notifications.length = 0
+  FakeNotification.removed.length = 0
+  FakeNotification.supported = true
+  electronStub.Notification = FakeNotification
+}
+
+function dropNotifications() {
+  delete electronStub.Notification
+}
+
 /**
  * Load the packaged entry rather than main, with a config written to fail
  * validation. The entry's whole job is what happens when a require throws, so it
@@ -308,23 +526,23 @@ function loadEntryWith(buildConfig) {
 }
 
 /**
- * Run the real remote-page preload and answer with what it exposed. It reads
- * `location` to decide whether it is on the outage page, so a remote page is
- * stood in for while it runs.
+ * Run the real remote-page preload and answer with what it exposed. `facts` is
+ * what main answers its `shell:window-facts` with. It reads `location` to decide
+ * whether it is on the outage page, so a remote page is stood in for while it
+ * runs.
  */
-function loadPreload(argv = []) {
+function loadPreload(facts = null) {
   const file = path.join(SRC, 'preload.js')
   delete require.cache[file]
   for (const key of Object.keys(exposed)) delete exposed[key]
   const had = Object.prototype.hasOwnProperty.call(globalThis, 'location')
   const saved = globalThis.location
   globalThis.location = { protocol: 'https:' }
-  const savedArgv = process.argv
-  process.argv = [...savedArgv, ...argv]
+  preloadFacts = facts
   try {
     require(file)
   } finally {
-    process.argv = savedArgv
+    preloadFacts = null
     if (had) globalThis.location = saved
     else delete globalThis.location
   }
@@ -352,5 +570,7 @@ function cleanup() {
 module.exports = {
   loadShell, loadEntryWith, loadPreload, cleanup, opened, electronStub, setOnline, setSaveDialog, tempDir,
   emitApp, windows, focusOrder, signedIn, openUrl, isAccount, navigateFrom, quietly,
-  loginItems, resetLoginItems, messageBoxes, setMessageBox, ipcHandlers,
+  loginItems, resetLoginItems, messageBoxes, setMessageBox, ipcHandlers, ipcListeners, quits, trays, display,
+  logged, from, closeEvent, sweep, menubarWindow, readyShell, fakeTimers, appMenuItem, findMenuItem,
+  notifications, FakeNotification, useNotifications, dropNotifications,
 }

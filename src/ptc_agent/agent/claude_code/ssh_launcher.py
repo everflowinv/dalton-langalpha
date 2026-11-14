@@ -76,8 +76,10 @@ from ptc_agent.agent.claude_code.machine_token import (
 from ptc_agent.core.claude_code_managed import claude_code_managed_sh, parse_managed
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox.providers._ssh_shell import check_env
+from ptc_agent.agent.claude_code.plan import PlanLog, SignedIn
 from ptc_agent.agent.claude_code.shell_link import ShellLink, ShellProcess
-from ptc_agent.core.sandbox.providers._ssh_transport import _CLI_SLOTS, TRANSPORT_ERRORS, Machine, SlotWaitTimeout
+from ptc_agent.core.claude_code_clis import agents
+from ptc_agent.core.sandbox.providers._ssh_transport import TRANSPORT_ERRORS, Machine, SlotWaitTimeout
 from ptc_agent.core.sandbox.providers.ssh import IS_MUSL_SH, MUSL_UNSUPPORTED
 from src.llms.claude_code import ClaudeTurnFailed, is_token_text
 
@@ -92,7 +94,10 @@ EXIT_GRACE_S = 5
 #: How long a turn's CLI waits for one of the link's CLI slots, apart from
 #: its start: as long as another turn there may take to finish.
 CLI_SLOT_WAIT_S = 600
-CLI_SLOTS_FULL = f"Claude Code is already running {_CLI_SLOTS} turns on this computer. Try again when one finishes."
+#: How long a subagent's CLI waits for one: its Task was admitted under the
+#: computer's count of its CLIs (``hosted.cli_cap``), so a wait means a
+#: count that raced or another worker's link, and the run fails past it.
+SUBAGENT_CLI_SLOT_WAIT_S = 30
 COMMAND_SLOTS_FULL = "This computer is busy running other commands. Try again when one finishes."
 #: A turn's config dir left this long is one a lost connection orphaned.
 _STALE_MINUTES = 2 * 24 * 60
@@ -100,6 +105,11 @@ _SCRIPT_S = 30
 _PID_MARK = "__langalpha__ pid "
 _ANNOUNCE = re.compile(rb"langalpha-token (file|relay|none)")
 _NOISE_MAX = 64 * 1024
+
+
+def cli_slots_full(n: int) -> str:
+    """Why a CLI did not start: ``n`` already run where it waited."""
+    return f"Claude Code is already running {agents(n)} on this computer. Try again when {'it' if n == 1 else 'one'} finishes."
 
 
 def kill_if_cli(pid: int, cli: str, sig: str) -> str:
@@ -137,7 +147,8 @@ class SSHLauncher:
     the computer's own, or a staged one a check is about; None reads none,
     so the run's credential is the relayed one or nothing. ``slot_wait_s`` is
     how long the CLI waits for a free CLI slot on the computer's connection;
-    a check passes a short one.
+    a check passes a short one. ``cli_slot(wait_s)`` holds one of the CLIs
+    the computer runs at once before that, within the same wait.
 
     ``credential``, given only where the deployment relays one, is read only
     once the machine has said it has no token of its own, and told if
@@ -150,6 +161,9 @@ class SSHLauncher:
     ``on_unsupported(present)`` that it runs musl, each with whether
     anything is at ``token_file``'s path there. ``source`` is where the last
     run's credential came from. One launcher serves one run at a time. ``env`` is for a test endpoint.
+    ``plan`` keeps what the CLI reports of the Claude plan behind that
+    credential: the token file, given only where it is the computer's own,
+    or a relayed setup token, the saved one.
     """
 
     machine: Machine[ShellLink]
@@ -158,6 +172,7 @@ class SSHLauncher:
     token_file: str | None
     install: bool = True
     slot_wait_s: float = CLI_SLOT_WAIT_S
+    cli_slot: Callable[[float], contextlib.AbstractAsyncContextManager[None]] | None = None
     credential: TokenStore | None = None
     on_announced: Callable[[TokenOrigin], Awaitable[None]] | None = None
     on_file_refused: Callable[[], Awaitable[None]] | None = None
@@ -165,7 +180,10 @@ class SSHLauncher:
     on_no_perl: Callable[[bool], Awaitable[None]] | None = None
     on_unsupported: Callable[[bool], Awaitable[None]] | None = None
     env: dict[str, str] = field(default_factory=dict, repr=False)
+    plan: PlanLog | None = None
     source: TokenOrigin | None = field(default=None, init=False)
+    #: Whether the last run was relayed the saved setup token.
+    relayed: bool = field(default=False, init=False)
     _link: ShellLink | None = field(default=None, init=False, repr=False)
     _cli: str | None = field(default=None, init=False)
     _root: str | None = field(default=None, init=False)
@@ -173,6 +191,12 @@ class SSHLauncher:
     def __post_init__(self) -> None:
         if self.token_file is not None:
             checked_name(self.token_file)
+
+    @property
+    def signed_in(self) -> SignedIn | None:
+        if self.source == "file":
+            return "machine"
+        return "saved" if self.source == "relay" and self.relayed else None
 
     @property
     def base(self) -> str:
@@ -351,9 +375,10 @@ class SSHLauncher:
             + " ".join(map(word, argv))
         )
 
-    async def started(self, source: TokenOrigin) -> None:
-        """The run's CLI started on a token from ``source``, as the shim announced it."""
-        self.source = source
+    async def started(self, source: TokenOrigin, relayed: bool = False) -> None:
+        """The run's CLI started on a token from ``source``, as the shim
+        announced it, ``relayed`` the saved one where it was relayed one."""
+        self.source, self.relayed = source, relayed
         if self.on_announced is None:
             return
         try:
@@ -370,14 +395,16 @@ class SSHTransport(Transport):
     ends the CLI: its input is closed, then it is signalled by pid until it
     goes, then the channel is closed.
 
-    The CLI holds one of the link's CLI slots and keeps the link in use from
-    its start to the end of its shutdown, so commands always find a slot and
+    The CLI holds one of the computer's CLIs (``cli_slot``) and a CLI slot
+    on one of the login's connections, where it is signalled, and keeps the
+    link in use from its start to the end of its shutdown, so commands always find a slot and
     a link shed from the pool closes only once the turn is over.
     """
 
     def __init__(self, launcher: SSHLauncher, link: ShellLink, options: ClaudeAgentOptions) -> None:
         self._launcher = launcher
         self._link = link
+        self._cli_link = link
         self._options = options
         self._process: ShellProcess | None = None
         self._ready = False
@@ -396,17 +423,24 @@ class SSHTransport(Transport):
         if self._process is not None:
             return
         script = self._launcher.command(self._options)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._launcher.slot_wait_s
         try:
-            start = await self._holds.enter_async_context(self._link.cli_hold(self._launcher.slot_wait_s))
+            if self._launcher.cli_slot is not None:
+                await self._holds.enter_async_context(self._launcher.cli_slot(self._launcher.slot_wait_s))
+            hold = await self._holds.enter_async_context(self._link.cli_hold(max(0.0, deadline - loop.time())))
         except BaseException as e:
             await self.close()
             if isinstance(e, SlotWaitTimeout):
-                raise CLIConnectionError(CLI_SLOTS_FULL if e.which == "cli" else COMMAND_SLOTS_FULL) from None
+                raise CLIConnectionError(cli_slots_full(e.n) if e.which == "cli" else COMMAND_SLOTS_FULL) from None
             raise
+        self._cli_link = hold.link
         relayed = False
         try:
             async with asyncio.timeout(START_TIMEOUT_S):
-                self._process = await start(STREAM_BOOT)
+                if self._launcher.plan is not None:
+                    await self._launcher.plan.launching()
+                self._process = await hold.start(STREAM_BOOT)
                 self._stderr_task = asyncio.ensure_future(self._read_stderr())
                 self._process.stdin.write(script.encode() + b"\n")
                 await self._process.stdin.drain()
@@ -416,16 +450,18 @@ class SSHTransport(Transport):
                     credential = await store.read() if store is not None else None
                     if credential is not None and not is_token_text(credential.secret):
                         raise CLIConnectionError("The stored credential is not one line of text, so it was not sent")
-                    line = f"{credential.kind} {credential.secret}" if credential is not None else ""
+                    line = credential.secret if credential is not None else ""
                     self._process.stdin.write(line.encode() + b"\n")
                     relayed = credential is not None
                     await self._process.stdin.drain()
+                    if relayed and self._launcher.plan is not None:
+                        await self._launcher.plan.took(credential.secret)
         except BaseException as e:
             await self.close()
             if isinstance(e, CLIConnectionError | ClaudeTurnFailed | asyncio.CancelledError):
                 raise
             raise CLIConnectionError(f"Claude Code did not start on {self._link.host}: {e or type(e).__name__}") from e
-        await self._launcher.started("none" if how == "relay" and not relayed else how)
+        await self._launcher.started("none" if how == "relay" and not relayed else how, relayed)
         self._ready = True
 
     async def _announced(self) -> TokenOrigin:
@@ -555,10 +591,10 @@ class SSHTransport(Transport):
             if self._pid is not None or self._stderr_task is None or self._stderr_task.done():
                 break
             await asyncio.sleep(0.1)
-        if self._pid is None or not self._link.usable:
+        if self._pid is None or not self._cli_link.usable:
             return
         with contextlib.suppress(Exception):
-            await self._link.run(kill_if_cli(self._pid, str(self._options.cli_path), sig), timeout=EXIT_GRACE_S + 10, kill=True)
+            await self._cli_link.run(kill_if_cli(self._pid, str(self._options.cli_path), sig), timeout=EXIT_GRACE_S + 10, kill=True)
 
     async def _shutdown(self) -> None:
         try:

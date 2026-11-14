@@ -87,16 +87,6 @@ def is_own_key_turn(config: Any) -> bool:
     )
 
 
-def may_use_platform_key(config: Any, *, users_choice: bool) -> bool:
-    """May a client this turn builds run on the platform's key?
-
-    A turn moves onto the platform's key only for a model the user picked, or
-    when the platform already pays for it, so a refused key or subscription
-    never quietly becomes the same model on credits.
-    """
-    return users_choice or not is_own_key_turn(config)
-
-
 async def _resolve_custom_model_byok(
     user_id: str,
     model_name: str,
@@ -120,6 +110,9 @@ async def _resolve_custom_model_byok(
        Unlike a system model's walk, this one crosses a separate credential
        (``own_api_key``): the client is built against the endpoint of the slug
        that held the key, so the key still goes to the service that issued it.
+
+    Returns the key, its base URL, the entry to build from, and the slug that
+    held the key, whose account the calls bill.
     """
     provider = custom_config["provider"]
 
@@ -131,7 +124,7 @@ async def _resolve_custom_model_byok(
             parent = cp_by_name["parent_provider"]
             base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
             custom_config = user_models.route_custom_entry(custom_config, cp_by_name, mc)
-            return byok_config, base_url, custom_config
+            return byok_config, base_url, custom_config, model_name
 
     # 2. Provider field is a custom sub-provider
     cp_by_provider = await user_models.get_custom_provider_config(user_id, provider, _pref_cache=_pref_cache)
@@ -141,7 +134,7 @@ async def _resolve_custom_model_byok(
             parent = cp_by_provider["parent_provider"]
             base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
             custom_config = user_models.route_custom_entry(custom_config, cp_by_provider, mc)
-            return byok_config, base_url, custom_config
+            return byok_config, base_url, custom_config, provider
 
     # 3. System provider — walk [provider → parent → sibling variants] for a
     #    stored key. The sibling step covers the mirror case where a custom
@@ -159,9 +152,9 @@ async def _resolve_custom_model_byok(
         base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
         if endpoint != provider:
             custom_config = {**custom_config, "provider": endpoint}
-        return byok_config, base_url, custom_config
+        return byok_config, base_url, custom_config, holding
 
-    return None, None, custom_config
+    return None, None, custom_config, None
 
 
 async def _custom_provider_model(
@@ -307,13 +300,13 @@ async def byok_key(
         if entry is None:
             return None
     if source in (ModelSource.CUSTOM, ModelSource.UNKNOWN):
-        byok_config, base_url, custom_config = await _resolve_custom_model_byok(
+        byok_config, base_url, custom_config, holding = await _resolve_custom_model_byok(
             user_id, model_name, entry, mc,
             _pref_cache=_pref_cache, _byok_cache=_byok_cache,
         )
         if not byok_config:
             return None
-        return OwnKeyRoute(byok_config, base_url, custom_config["provider"], custom_config)
+        return OwnKeyRoute(byok_config, base_url, custom_config["provider"], custom_config, holding=holding)
 
     provider = entry["provider"]
     byok_config, holding = await walk_byok_candidates(
@@ -823,9 +816,8 @@ async def _resolve_role_clients(
     gets ``main_model`` at the summary level instead, so a summary keeps its
     level, and a keyless role with a set effort gets it at that effort.
     """
-    # A role is never the user's pick of a stand-in, so it stays on the key
-    # the turn runs on.
-    platform_ok = may_use_platform_key(config, users_choice=False)
+    # A turn on the user's own key or subscription never moves onto credits.
+    platform_ok = not is_own_key_turn(config)
 
     def _needs_own_client(role: LLMRole) -> bool:
         """Whether this role has to be materialized rather than left to its name.
@@ -961,33 +953,32 @@ async def _resolve_role_clients(
 
 async def _resolve_fallback_clients(
     config, user_id: str, model_pref: dict, byok_cache: dict,
-    *, is_byok: bool, cache_key: str | None, users_fallbacks: bool,
+    *, is_byok: bool, cache_key: str | None,
     reasoning_effort: str | None = None, fast_mode: bool | None = None,
 ) -> None:
     """Resolve ``config.llm.fallback`` names into client instances in place.
 
-    A turn never moves onto a payer the user did not choose. Fallbacks the
-    user saved (``users_fallbacks``) are their choice, each running as they
-    picked it, on credits included. The deployment's own list is not: on a
-    turn the user's key or subscription pays for, a default fallback they
-    hold no credential for is skipped rather than built on the platform's
-    key (``may_use_platform_key``). On any other turn a SYSTEM fallback
-    without a user key yields a platform client. Custom/unknown fallbacks
-    without a usable key warn + skip.
+    A fallback never mixes our bill with the user's, whoever saved the list.
+    On a turn the user's key or subscription pays for, a fallback they hold no
+    credential for is skipped rather than built on the platform's key
+    (``is_own_key_turn``). On a platform turn a SYSTEM fallback without a
+    user key yields a platform client; one the user holds a key for is still
+    built on it, for a subagent on their key, and the resilience middleware
+    keeps each call to fallbacks its own payer bills. Custom/unknown
+    fallbacks without a usable key warn + skip.
 
     A fallback takes the turn-level overrides, unlike a role: it stands in for
     the model the request named, so "think harder this turn" still applies.
     Everything under that resolves on the fallback's own name, so the primary's
     speed is not charged to a model whose profile did not ask for it.
     """
-    config.fallback_users_choice = users_fallbacks
     fallback_models = config.llm.fallback or []
     if not fallback_models:
         config.fallback_llm_clients = []
         config.fallback_llm_names = []
         return
 
-    platform_ok = may_use_platform_key(config, users_choice=users_fallbacks)
+    platform_ok = not is_own_key_turn(config)
 
     async def _resolve_one(model_name: str):
         try:
@@ -1059,11 +1050,39 @@ async def _resolve_fallback_clients(
         )
 
 
+async def _stamp_credential_payer(
+    config, user_id: str, model_name: str, *, is_byok: bool, model_pref: dict, byok_cache: dict,
+) -> None:
+    """Record who the main model's credential bills, for a failed turn to name.
+
+    Asked of the same ladder that built the client, from the caches it read,
+    so no lookup repeats, as the picker's badge asks it. On the deployment's
+    credential only a local server answers from the route (a server on the
+    machine is nobody's account, as the badge says); otherwise, or failing
+    that, the source does.
+    """
+    from src.llms.llm import LLM as LLMFactory
+
+    from .payers import route_payer, source_payer  # lazy: payers imports this module
+
+    config.credential_payer = source_payer(config.credential_source)
+    own = config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK)
+    try:
+        route = await credential_route(
+            user_id, model_name, is_byok=is_byok, _pref_cache=model_pref, _byok_cache=byok_cache,
+        )
+        named = route_payer(route, LLMFactory.get_model_config())
+        if named is not None and (own or named.payer == "local"):
+            config.credential_payer = named
+    except Exception:
+        # Naming the account is wording only; the turn runs without it.
+        logger.warning("[CHAT] Could not name the credential for %s", model_name, exc_info=True)
+
+
 async def resolve_clients(
     config, user_id: str, effective_model: str, model_pref: dict,
     subagent_roles: list[LLMRole], *, is_byok: bool, thread_id: str | None,
     reasoning_effort: str | None, fast_mode: bool | None, user_defined: bool,
-    users_fallbacks: bool,
 ) -> None:
     """Build every client this turn can reach, tuned and stamped as it is built.
 
@@ -1079,8 +1098,7 @@ async def resolve_clients(
 
     ``subagent_roles`` are the roles of the subagents this build compiles;
     the role list is built here because both things that read it, the BYOK
-    prefetch and the role resolver, are below this line. ``users_fallbacks``
-    says the fallback list is one the user saved (``select_model``).
+    prefetch and the role resolver, are below this line.
     """
     main_tuning = resolve_turn_tuning(
         model_pref, effective_model,
@@ -1111,6 +1129,10 @@ async def resolve_clients(
     # Always store credential_source (even NONE) — single source of truth
     # downstream (credit gate, materialization gate, billing signal).
     config.credential_source = main.credential_source
+    await _stamp_credential_payer(
+        config, user_id, effective_model, is_byok=is_byok,
+        model_pref=model_pref, byok_cache=byok_cache,
+    )
     if main.client is not None:
         _stamp(config, main.client, config.prompt_guidance)
         config.llm_client = main.client
@@ -1136,7 +1158,7 @@ async def resolve_clients(
         ),
         _resolve_fallback_clients(
             config, user_id, model_pref, byok_cache,
-            is_byok=is_byok, cache_key=thread_id, users_fallbacks=users_fallbacks,
+            is_byok=is_byok, cache_key=thread_id,
             reasoning_effort=reasoning_effort, fast_mode=fast_mode,
         ),
     )

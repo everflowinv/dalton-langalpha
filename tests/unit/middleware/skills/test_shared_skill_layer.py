@@ -148,3 +148,14 @@ def test_dalton_layer_goes_when_every_dependent_is_off():
     assert DALTON_LAYER not in registry
     assert "dalton-bullbear-tracker" in registry
 
+
+def test_dashboard_apps_keep_the_kit_they_read():
+    """interactive-dashboard's apps read the LangAlpha kit from dashboard-page's
+    references, so dashboard-page's disable alone does not take it away."""
+    assert "dashboard-page" in SKILL_REGISTRY["interactive-dashboard"].requires
+    assert "dashboard-page" in build_effective_skill_registry(
+        disabled_skills={"dashboard-page"}
+    )
+    assert "dashboard-page" not in build_effective_skill_registry(
+        disabled_skills={"dashboard-page", "interactive-dashboard"}
+    )

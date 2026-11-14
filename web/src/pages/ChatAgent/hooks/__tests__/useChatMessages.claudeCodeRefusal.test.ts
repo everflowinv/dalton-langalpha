@@ -14,6 +14,9 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('@/lib/supabase', () => ({ supabase: null }));
 
+// The self-hosted wording: a build with no plan page, whatever the run's host mode.
+vi.mock('@/config/supportLinks', async (original) => ({ ...(await original<typeof import('@/config/supportLinks')>()), PLAN_URL: null }));
+
 vi.mock('../utils/threadStorage', () => ({
   getStoredThreadId: vi.fn().mockReturnValue(null),
   setStoredThreadId: vi.fn(),
@@ -88,10 +91,10 @@ describe('useChatMessages: a Claude Code refusal', () => {
     await waitFor(() => expect(result.current.messageError).toEqual({ message: 'chat.claudeCode.off.too_many_turns:{"n":3}' }));
   });
 
-  it('at admission links a cloud computer kept off to Model access, and reads the choice for it again', async () => {
-    const worded = "Claude Code doesn't run on cloud computers for your account yet.";
+  it('at admission links no own computer online to Model access, and reads the choice again', async () => {
+    const worded = 'No computer of yours with its own setup token is online.';
     mockSendStream.mockRejectedValue(
-      Object.assign(new Error(worded), { status: 400, errorInfo: { type: 'claude_code_off', message: worded, reason: 'hosted_off' } }),
+      Object.assign(new Error(worded), { status: 400, errorInfo: { type: 'claude_code_off', message: worded, reason: 'no_own_computer' } }),
     );
     const { result, queryClient } = renderHookWithProviders(() => useChatMessages('ws-test'));
     const reread = vi.spyOn(queryClient, 'invalidateQueries');
@@ -99,13 +102,50 @@ describe('useChatMessages: a Claude Code refusal', () => {
       await result.current.handleSendMessage('hello');
     });
     await waitFor(() => expect(result.current.messageError).toMatchObject({
-      message: 'chat.claudeCode.off.hosted_off',
+      message: 'chat.claudeCode.off.no_own_computer',
       links: [{ url: CLAUDE_CODE_CHOICE_URL, labelKey: 'modelAccess.title' }],
     }));
     expect(reread).toHaveBeenCalledWith({ queryKey: queryKeys.user.claudeCodeCustody() });
   });
 
-  it.each(['api_key_refused', 'needs_bigger_computer'])("mid-turn words %s on the turn in the app's words", async (reason) => {
+  it("at admission carries a Claude plan's limit to the banner, and reads the plan again", async () => {
+    const worded = "Your Claude plan's 5-hour limit is used up.";
+    const until = '2026-11-06T20:40:00Z';
+    mockSendStream.mockRejectedValue(Object.assign(new Error(worded), {
+      status: 400, errorInfo: { type: 'claude_code_off', message: worded, reason: 'plan_limited', window: 'five_hour', until },
+    }));
+    const { result, queryClient } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    const reread = vi.spyOn(queryClient, 'invalidateQueries');
+    await act(async () => {
+      await result.current.handleSendMessage('hello');
+    });
+    await waitFor(() => expect(result.current.messageError).toEqual({
+      message: worded, planRefusal: { reason: 'plan_limited', window: 'five_hour', until, creditsBilled: false },
+    }));
+    expect(reread).toHaveBeenCalledWith({ queryKey: queryKeys.features.claudeCode() });
+  });
+
+  it("mid-turn reads the plan again when a Claude plan's limit stops the turn", async () => {
+    mockSendStream.mockImplementation(async (_m: string, _w: string, _t: string | null, { onEvent }: { onEvent: (e: Record<string, unknown>) => void }) => {
+      onEvent({
+        event: 'error', error: 'Server words.', message: 'Server words.', type: 'claude_code_off',
+        reason: 'plan_stopped', window: 'five_hour', until: '2026-11-06T20:40:00Z',
+      });
+      return { disconnected: false };
+    });
+    const { result, queryClient } = renderHookWithProviders(() => useChatMessages('ws-test'));
+    const reread = vi.spyOn(queryClient, 'invalidateQueries');
+    await act(async () => {
+      await result.current.handleSendMessage('hello');
+    });
+    await waitFor(() => {
+      const reply = result.current.messages.find((m) => m.role === 'assistant') as { structuredError?: { planRefusal?: unknown } } | undefined;
+      expect(reply?.structuredError?.planRefusal).toMatchObject({ reason: 'plan_stopped' });
+    });
+    expect(reread).toHaveBeenCalledWith({ queryKey: queryKeys.features.claudeCode() });
+  });
+
+  it.each(['needs_bigger_computer'])("mid-turn words %s on the turn in the app's words", async (reason) => {
     mockSendStream.mockImplementation(async (_m: string, _w: string, _t: string | null, { onEvent }: { onEvent: (e: Record<string, unknown>) => void }) => {
       onEvent({ event: 'error', error: 'Server words.', message: 'Server words.', type: 'claude_code_off', reason });
       return { disconnected: false };

@@ -5,14 +5,16 @@
  * one, says so and leads to where a token is added.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import ChatInput, { type ChatInputProps } from '../chat-input';
 import type { ModelRowStatus } from '../chat-input.modelPicker';
-import type { ClaudeCodeComputer, ClaudeCodeState } from '@/api/model';
+import type { ClaudeCodeComputer, ClaudeCodePlan, ClaudeCodeState } from '@/api/model';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { claudeCodeTokenUrl } from '@/lib/claudeCode';
+import { queryKeys } from '@/lib/queryKeys';
+import { getHomeWorkspace } from '@/pages/ChatAgent/utils/api';
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
@@ -20,10 +22,20 @@ vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getHomeWorkspace: vi.fn().mockResolvedValue({ workspace_id: 'home-1', name: 'Home', status: 'running', is_home: true }),
 }));
 
-const mocks = vi.hoisted(() => ({ state: 'signed_in' as ClaudeCodeState, computers: [] as ClaudeCodeComputer[] }));
+const mocks = vi.hoisted(() => ({
+  state: 'signed_in' as ClaudeCodeState,
+  computers: [] as ClaudeCodeComputer[],
+  plan: undefined as ClaudeCodePlan | undefined,
+  planOut: undefined as string | undefined,
+  useNow: vi.fn(() => Date.now()),
+}));
 
 vi.mock('@/hooks/usePreferences', () => ({
-  usePreferences: () => ({ preferences: { model_preference: { preferred_model: 'claude-x' } }, isLoading: false, isLoaded: true }),
+  usePreferences: () => ({
+    preferences: { model_preference: { preferred_model: 'claude-x' }, other_preference: { claude_code_plan_out: mocks.planOut } },
+    isLoading: false,
+    isLoaded: true,
+  }),
 }));
 
 vi.mock('@/hooks/useAllModels', () => ({
@@ -45,12 +57,23 @@ vi.mock('@/hooks/useAllModels', () => ({
 }));
 
 // A self-hosted server, running the workspace's turns on the saved token: a
-// hosted computer, none of the user's own.
+// hosted computer, none of the user's own; and the Chief of Staff's in its
+// workers.
 vi.mock('@/hooks/useClaudeCode', () => ({
-  useClaudeCodeStatus: () => ({ enabled: mocks.state !== 'off', runsHere: mocks.state !== 'off', state: mocks.state }),
-  useClaudeCodeComputers: () => ({ computers: mocks.computers, cloudRefusals: {}, isLoading: false }),
+  useClaudeCodeStatus: () => ({ enabled: mocks.state !== 'off', runsHere: mocks.state !== 'off', state: mocks.state, plan: mocks.plan }),
+  useClaudeCodeComputers: () => ({ computers: mocks.computers, cloudRefusals: {}, isLoading: false, checkAfterOf: () => null }),
+  useClaudeCodeSetup: () => ({
+    setup: { on: true, chief_of_staff: { kind: 'server', computer_id: null, name: null, refusal: null, default_runs: true } }, isLoading: false, unread: false,
+  }),
 }));
 vi.mock('@/hooks/useWorkspace', () => ({ useWorkspace: () => ({ data: { computer_id: 'cmp-hosted' }, isPending: false }) }));
+
+// The minute clock, which the composer must not read: a tick would draw it
+// again each minute for nothing the user can see.
+vi.mock('@/hooks/useNow', async (original) => ({
+  ...(await original<typeof import('@/hooks/useNow')>()),
+  useNow: mocks.useNow,
+}));
 
 vi.mock('@/hooks/useUpdatePreferences', () => ({
   useUpdatePreferences: () => ({ mutateAsync: vi.fn(), mutate: vi.fn() }),
@@ -64,12 +87,12 @@ vi.mock('../use-toast', () => ({
 // The menu stands in for the picker: it shows what the composer says of each
 // row, and runs a row's fix as a press on it would.
 vi.mock('../chat-input.modelMenu', () => ({
-  ChatInputModelMenu: ({ rowStatus }: { rowStatus: (m: string) => ModelRowStatus }) => {
+  ChatInputModelMenu: ({ rowStatus }: { rowStatus: (m: string, now: number) => ModelRowStatus }) => {
     const read = (m: string) => {
-      const s = rowStatus(m);
-      return 'unavailable' in s ? `held:${s.unavailable}${s.fix ? ':fix' : ''}` : 'pick';
+      const s = rowStatus(m, Date.now());
+      return 'unavailable' in s ? `held:${s.unavailable}${s.fix ? ':fix' : ''}${s.check ? `:check:${s.check.credential.kind}` : ''}` : 'pick';
     };
-    const code = rowStatus('claude-x-code');
+    const code = rowStatus('claude-x-code', Date.now());
     return (
       <>
         <span>{`claude-x:${read('claude-x')}`}</span>
@@ -87,9 +110,10 @@ function Where() {
   return <span>{`at:${pathname}${search}`}</span>;
 }
 
-function renderInput() {
+function renderInput(props: Partial<ChatInputProps> = {}) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+    <QueryClientProvider client={queryClient}>
       <MemoryRouter>
         <ChatInput
           onSend={vi.fn()}
@@ -98,11 +122,13 @@ function renderInput() {
           workspaces={[{ workspace_id: 'ws-1', name: 'Alpha desk' }] as ChatInputProps['workspaces']}
           selectedWorkspaceId="ws-1"
           onWorkspaceChange={vi.fn()}
+          {...props}
         />
         <Where />
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return queryClient;
 }
 
 const codeRow = () => screen.getByText(/^claude-x-code:/).textContent;
@@ -112,6 +138,25 @@ describe('ChatInput: Claude Code rows by state', () => {
     ContextBus.__resetForTests();
     ChatInputRegistry.__resetForTests();
     Element.prototype.scrollIntoView = vi.fn();
+    mocks.plan = undefined;
+    mocks.planOut = undefined;
+  });
+
+  it.each([
+    ['holds them until the reset once the plan is used up', undefined, 'on', /^claude-x-code:held:Plan limit used up until (?!.*:check)\S/],
+    ['holds them under Stop, with no check, where usage credits are off', undefined, 'off', /^claude-x-code:held:Plan limit used up until (?!.*:check)\S/],
+    ['offers them on the usage credits the user chose', 'credits', 'on', /^claude-x-code:pick$/],
+    ['holds them with Check now where the usage credits the user chose are off', 'credits', 'off', /^claude-x-code:held:Plan limit used up until .+:check:saved$/],
+  ] as const)('%s', (_, planOut, credits, row) => {
+    mocks.state = 'signed_in';
+    mocks.planOut = planOut;
+    mocks.plan = {
+      five_hour: null, seven_day: null, credits, observed_at: new Date().toISOString(),
+      limits: [{ window: 'five_hour', family: null, until: new Date(Date.now() + 3_600_000).toISOString(), reset_known: true }],
+    };
+    renderInput();
+    expect(codeRow()).toMatch(row);
+    expect(mocks.useNow).not.toHaveBeenCalled();
   });
 
   it.each(['signed_in', 'unverified'] as const)('offers the models as a pick while %s', (state) => {
@@ -135,6 +180,24 @@ describe('ChatInput: Claude Code rows by state', () => {
     expect(codeRow()).toBe(`claude-x-code:held:${words}:fix`);
     fireEvent.click(screen.getByRole('button', { name: 'fix' }));
     expect(screen.getByText(/^at:/)).toHaveTextContent(`at:${claudeCodeTokenUrl('ws-1')}`);
+  });
+
+  it("leads the Chief of Staff's row to adding a token for Home, where its turn runs", async () => {
+    mocks.state = 'no_token';
+    const queryClient = renderInput({ scope: 'all' });
+    await waitFor(() => expect(queryClient.getQueryData(queryKeys.workspaces.home())).toBeDefined());
+    fireEvent.click(screen.getByRole('button', { name: 'fix' }));
+    expect(screen.getByText(/^at:/)).toHaveTextContent(`at:${claudeCodeTokenUrl('home-1')}`);
+  });
+
+  // Reading Home's id upserts Home and refetches the MCP catalog.
+  it("never reads Home from a workspace's composer", async () => {
+    vi.mocked(getHomeWorkspace).mockClear();
+    mocks.state = 'no_token';
+    renderInput();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(codeRow()).toBe('claude-x-code:held:Add a setup token in Settings to use this model:fix');
+    expect(getHomeWorkspace).not.toHaveBeenCalled();
   });
 
   it("says the organization's policy keeps them off the workspace's own computer, with nothing to fix", () => {

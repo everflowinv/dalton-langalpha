@@ -2,6 +2,8 @@
 
 import type { CommandFailureReason, CommandTool } from './commands';
 import type { ArtifactCommentSendFields } from './artifacts';
+import type { ChartView } from '@/pages/MarketView/types/chartView';
+import type { PublishedLayer } from '@/pages/MarketView/types/chartLayer';
 
 // --- User ---
 
@@ -77,7 +79,7 @@ export interface FeatureState {
   /** Honest cost of opting in to an experimental feature, null when none. */
   tradeoffs: string | null;
   enabled: boolean;
-  gate: 'none' | 'opt_in' | 'opt_out' | 'plan';
+  gate: 'none' | 'opt_in' | 'opt_out' | 'plan' | 'grant';
   min_tier: number | null;
   user_override: boolean | null;
   /** Where the user turns it on when not in Experiments: Claude Code's
@@ -208,6 +210,8 @@ export interface ComputerSsh {
   tunnel: boolean;
   /** Whether the tunnel is up now; null when the computer has none. */
   tunnel_connected: boolean | null;
+  /** The tunnel is down because its machine paired again, as with another LangAlpha account or server. Reconnecting brings it back. */
+  paired_elsewhere?: boolean;
   /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
   helper: boolean;
   /** The system as `uname -s` names it ("Darwin", "Linux"); null on a computer added before it was kept. */
@@ -695,6 +699,9 @@ export type ReportSource =
       /** The call it started from, whose tool card the report opens; null
        *  for a command whose call had no id. */
       tool_call_id?: string | null;
+      /** The chart layers the command published after it was handed off,
+       *  which an inline call's result lists as its own. */
+      chart_layers?: PublishedLayer[] | null;
     };
 
 export interface ThreadMetadata {
@@ -724,8 +731,13 @@ export interface Thread {
   /** Only on a model change's response: the model the thread was on is
    *  writing out, for the new one, a summary only its provider can read. */
   summary_handoff?: boolean | null;
+  /** Only on a model change's response: the model the thread was on is
+   *  writing a brief of the thread for the Claude Code model it moved to. */
+  brief_handoff?: boolean | null;
   /** Turn count (list responses only). */
   turn_count?: number;
+  /** The first message sent in the thread (list responses only), which names an untitled one. */
+  first_query_content?: string;
   created_at?: string;
   updated_at?: string;
   // Lifecycle enrichment (present on list responses for threads with runs).
@@ -826,6 +838,11 @@ export interface AppShareLink extends ShareLinkBase {
   path: string | null;
   port: number;
   artifact_id?: null;
+  /**
+   * 16 hex of the sha256 of the command that starts the app, null when none is
+   * stored; absent from an older server. The app's grants are kept under it.
+   */
+  command_key?: string | null;
 }
 
 /** One item's stable `/a/<code>` link. Private unless `shared`. */
@@ -1014,6 +1031,8 @@ export interface ChatMessageBody extends ArtifactCommentSendFields {
   locale: string;
   timezone: string;
   additional_context?: unknown;
+  /** What the charts beside the composer show, for the agent's snapshots. */
+  chart_views?: ChartView[];
   checkpoint_id?: string;
   fork_from_turn?: number;
   expected_latest_run_id?: string;

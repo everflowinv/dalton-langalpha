@@ -17,6 +17,7 @@ from src.config.models import (
     McpDescriptionsConfig,
     NewsPollConfig,
     OrderReconcileConfig,
+    ThreadSearchConfig,
     WorkflowOrchestrationConfig,
 )
 
@@ -227,6 +228,11 @@ def get_order_reconcile_config() -> OrderReconcileConfig:
     return get_infrastructure_config().order_reconcile
 
 
+def get_thread_search_config() -> ThreadSearchConfig:
+    """Conversation search index sweep config (enabled / cadence / batch)."""
+    return get_infrastructure_config().thread_search
+
+
 def get_redis_max_connections() -> int:
     """Get Redis connection pool max connections.
 
@@ -409,10 +415,6 @@ def get_redis_ttl_memo_metadata_inflight() -> int:
 def get_redis_ttl_memo_metadata_cancel() -> int:
     """Cooperative cross-worker memo metadata cancel flag TTL (seconds)."""
     return get_infrastructure_config().redis.ttl.memo_metadata_cancel
-
-
-def is_cache_invalidate_on_write_enabled() -> bool:
-    return get_infrastructure_config().redis.cache_invalidate_on_write
 
 
 # Fallback TTLs matching config.yaml defaults (interval_seconds × 1.5)

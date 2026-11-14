@@ -11,8 +11,8 @@ import { readRetryNotice } from './autoRetry';
 import { noteLiveRun } from '../latestRun';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { claudeCodeRefusal } from '@/lib/claudeCode';
-import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
+import { invalidateReportedLayers } from '@/pages/MarketView/utils/chartLayerCache';
 import { CREDIT_STOP_ERROR_TYPE, isDeliveredNotice, isDeliveredReport, isDeliveredSteer } from '@/types/sse';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { createAssistantMessage, updateMessage } from '../../hooks/utils/messageHelpers';
@@ -31,12 +31,13 @@ import {
   buildModelFallbackSegment, appendNotificationSegmentOnce,
   isWorkspaceChangingToolSuccess, mapToolCallIdToAgentId,
 } from '../../hooks/utils/messageFinalizers';
-import { handleContextWindowEvent, withServerTotals } from '../../hooks/utils/contextWindowEvent';
+import { handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
+import { withServerTotals } from '../tokenUsage';
 import { BUSY_REPLY_KEYS, isBusyCode } from '../../hooks/utils/forkRefusal';
 import {
   handleReasoningSignal, handleReasoningContent, handleTextContent,
   handleToolCalls, handleToolCallResult, handleToolCallChunks,
-  handleTodoUpdate, handleHtmlWidget,
+  handleTodoUpdate, handleHtmlWidget, handlePlanBilled,
 } from './mainEventHandlers';
 // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
 import { createProvenanceFrameBuffer } from './provenanceBatch';
@@ -57,6 +58,8 @@ import { projectLiveInterrupt } from '../interrupts/fromLiveEvent';
 import type { StreamRuntime } from '../runtime';
 import { preapprovedReportBack } from '../../utils/preapprovedCards';
 import { dispatchResultFields } from '../../utils/dispatchResult';
+import { applySideChannelArtifact } from './sideChannelArtifact';
+import { pinCapturedImages } from './capturedImages';
 
 type RefreshOnResult = 'refreshMarketWatch' | 'refreshWakeups' | 'refreshCommands';
 
@@ -97,6 +100,9 @@ export interface StreamRouterDeps {
   /** Re-read the user's Claude Code tokens, after Anthropic refused the one
    *  a turn ran on mid-turn. */
   refreshClaudeCode: () => void;
+  /** Re-read the Claude plan behind the user's Claude Code tokens, which
+   *  each request of a turn on one reports. */
+  refreshClaudeCodePlan: () => void;
   /** Hears the turn the server admitted the run to, before the run's bubbles
    *  take it, while they still carry the turn the view counted. */
   onAdmittedTurn?: (bubbleId: string, turnIndex: number) => void;
@@ -243,7 +249,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           const beforeId = rt.currentMessageRef.current;
           rt.setMessages((prev) => withLiveReportRow(prev, runId, source, beforeId, turn));
           // The command it reports on has ended, which its tool card shows.
-          if (source.kind === 'command_report') deps.refreshCommands();
+          if (source.kind === 'command_report') {
+            deps.refreshCommands();
+            // Layers it published after the hand-off came with no stream.
+            invalidateReportedLayers(rt.queryClient, source.chart_layers);
+          }
         } else {
           // A wake, attached live, draws its opener row from this frame,
           // keyed on the turn as replay keys it, so a later load replaces it
@@ -302,6 +312,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     if (eventType === 'run_end' && !isSubagent) {
       // DALTON-HOOK(provenance-batch): flush buffered provenance immediately on run_end
       provenanceBuffer.flush();
+      // A turn on a Claude Code model moved its Claude plan, which the
+      // picker's meter and the composer's row read. The stream does not say
+      // which model ran, and only reads on screen go out again.
+      deps.refreshClaudeCodePlan();
       const counted = event.token_totals;
       if (counted) rt.setTokenUsage((prev) => withServerTotals(prev, counted));
       // A frame without the field could not read it, and the stream's end
@@ -309,6 +323,12 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       const told = 'next_summary' in event;
       if (told) rt.setNextSummary(event.next_summary ?? null);
       rt.nextSummaryOwedRef.current = !told;
+      // Each image the reply streamed as a path, and where it was captured:
+      // the copy the reply showed, which a later rewrite of the file leaves.
+      const images = event.images;
+      if (images && Object.keys(images).length) {
+        queueMessagesForHandlers((prev) => pinCapturedImages(prev, assistantMessageId, images));
+      }
       if (event.outcome === 'cancelled') {
         settleStoppedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers });
       } else if (event.outcome === 'error' && !refs.retryNotice && !turnShowsFailure()) {
@@ -318,8 +338,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         // as an internal failure would, banner and all, over any notice.
         deps.clearModelStatus();
         rt.setFallbackSuggestion(null);
-        rt.setMessageError({ message: '', kind: 'internal' });
-        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true });
+        // The run that ended, for a report to name.
+        const runId = rt.currentRunIdRef?.current ?? undefined;
+        rt.setMessageError({ message: '', kind: 'internal', runId });
+        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true, runId });
       }
       return;
     }
@@ -385,8 +407,12 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // chip and the Status panel show.
       if (entries.some(isDeliveredNotice)) deps.refreshWakeups();
       // A command's report taken into the turn: the command has ended.
-      if (entries.some((entry) => isDeliveredReport(entry) && entry.report_source.kind === 'command_report')) {
+      const commandReports = entries.flatMap((entry) =>
+        isDeliveredReport(entry) && entry.report_source.kind === 'command_report' ? [entry.report_source] : [],
+      );
+      if (commandReports.length > 0) {
         deps.refreshCommands();
+        for (const source of commandReports) invalidateReportedLayers(rt.queryClient, source.chart_layers);
       }
 
       // 1. Roll back old assistant message to the snapshot taken at steering_accepted
@@ -636,6 +662,21 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       return;
     }
 
+    // A reply whose last request was billed to usage credits gets its notice
+    // under it, as a reload replays it. Main agent only.
+    if (eventType === 'claude_code_plan') {
+      if (!isSubagent) {
+        const billed = handlePlanBilled({
+          assistantMessageId,
+          event,
+          order: event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current,
+          setMessages: setMessagesForHandlers,
+        });
+        if (billed) deps.refreshClaudeCode();
+      }
+      return;
+    }
+
     // A `retry` ends the stream of a run that failed before it reached the
     // agent. After `metadata` the run lives on in the background executor, so
     // a `retry` there, which only an older server sends, means only this
@@ -731,25 +772,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
             updateSubagentCard: rt.updateSubagentCard,
           });
         } else if (eventType === 'artifact') {
-          // Task-lane artifacts don't render in the main chat view — but
-          // thread-scoped side-channel pings stay honored regardless of
-          // lane: a subagent's file writes / preview servers change the
-          // same workspace the panels show. Everything else (todo_update,
-          // widgets) is task-internal until the detail view renders them.
-          const taskArtifactType = event.artifact_type as string;
-          if (taskArtifactType === 'file_operation' && rt.onFileArtifact) {
-            rt.onFileArtifact(event);
-          } else if (taskArtifactType === 'preview_url' && rt.onPreviewUrl) {
-            const payload = (event.payload || {}) as Record<string, unknown>;
-            rt.onPreviewUrl({
-              url: '',  // resolved by ChatView via authenticated endpoint
-              port: payload.port as number,
-              title: payload.title as string | undefined,
-              command: payload.command as string | undefined,
-              path: payload.path as string | undefined,
-              loading: true,
-            });
-          }
+          // Task-lane artifacts don't render in the main chat view, but the
+          // ones about the workspace apply from either lane. Everything else
+          // (todo_update, widgets) is task-internal until the detail view
+          // renders them.
+          applySideChannelArtifact(event, rt, refs);
         } else if (eventType === 'workflow_lifecycle') {
           handleWorkflowLifecycle({
             taskId,
@@ -890,9 +917,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // as a notice: the server's name the CLI's commands, and the reply's
       // Retry sends the message again.
       const busyCode = event.error_type === 'admission_conflict' && isBusyCode(event.code) ? event.code : null;
-      // A Claude Code refusal the server's next read of the tokens says:
-      // Settings and the picker take that now.
-      if (event.type === 'claude_code_off' && claudeCodeRefusal(event.reason, rt.workspaceId).reread) deps.refreshClaudeCode();
+      // A Claude Code refusal the server's next read of the tokens or of the
+      // Claude plan says: Settings, the picker and the composer take that now.
+      if (event.type === 'claude_code_off' && claudeCodeRefusal(event, rt.workspaceId).reread) deps.refreshClaudeCode();
       // Only the frame that ends the server's own retries carries `max_retries`.
       const errorMessage = busyCode !== null
         ? rt.t(BUSY_REPLY_KEYS[busyCode])
@@ -912,6 +939,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       const structured: StructuredError | undefined = busyCode !== null
         ? { message: errorMessage as string, kind: 'notice' }
         : readStreamFailure(event, errorMessage as string, rt.workspaceId, rt.t);
+      // A live failure's frame does not name its run; the stream's metadata did.
+      const latchedRunId = rt.currentRunIdRef?.current;
+      if (structured && !structured.runId && latchedRunId) structured.runId = latchedRunId;
 
       // DALTON-HOOK(colleague-dispatch): terminal non-retryable error when workspace owner revokes colleague access
       if (event.code === 'colleague_access_revoked') {
@@ -936,8 +966,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         // (settleFailedBubble).
         // The headline alone, as a reload shows it: the frame's text is the
         // server's raw exception and stays on the wire for other readers.
-        rt.setMessageError({ message: '', kind: 'internal' });
-        settleFailedBubble({ assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true });
+        rt.setMessageError({ message: '', kind: 'internal', runId: structured?.runId });
+        settleFailedBubble({
+          assistantMessageId, refs, setMessages: setMessagesForHandlers, internal: true, runId: structured?.runId,
+        });
       } else {
         // Upstream (or unclassified legacy) — render inline. Clear any
         // stale banner from a prior turn so the error lives in one place.
@@ -955,6 +987,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       });
       return;
     } else if (eventType === 'artifact') {
+      if (applySideChannelArtifact(event, rt, refs)) return;
       const artifactType = event.artifact_type as string;
       if (artifactType === 'todo_update') {
         handleTodoUpdate({
@@ -975,20 +1008,6 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           refs,
           setMessages: setMessagesForHandlers,
           eventId: event._eventId as number,
-        });
-      } else if (artifactType === 'chart_annotation') {
-        applyAnnotationArtifact(artifactType, (event.payload || {}) as Record<string, unknown>);
-      } else if (artifactType === 'file_operation' && rt.onFileArtifact) {
-        rt.onFileArtifact(event);
-      } else if (artifactType === 'preview_url' && rt.onPreviewUrl) {
-        const payload = (event.payload || {}) as Record<string, unknown>;
-        rt.onPreviewUrl({
-          url: '',  // resolved by ChatView via authenticated endpoint
-          port: payload.port as number,
-          title: payload.title as string | undefined,
-          command: payload.command as string | undefined,
-          path: payload.path as string | undefined,
-          loading: true,
         });
       } else if (artifactType === 'task') {
         const payload = (event.payload || {}) as Record<string, unknown>;

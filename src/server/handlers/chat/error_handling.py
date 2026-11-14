@@ -141,17 +141,23 @@ def classify_error(e: Exception) -> dict:
         or "server" in error_type_name
     )
 
+    # DALTON-HOOK(chat-large-upload): transient object storage HTTP 503 maps to existing transient_error category
+    is_transient_storage = isinstance(e, HTTPException) and bool(
+        getattr(e, "is_transient_storage_error", False)
+    )
+
     is_recoverable = (
         is_sandbox_error
         or is_postgres_connection
         or is_timeout
         or is_network_issue
         or is_api_error
+        or is_transient_storage
     ) and not is_non_recoverable
 
     # Determine specific error_type label
     if is_recoverable:
-        if is_sandbox_error:
+        if is_sandbox_error or is_transient_storage:
             error_type = "transient_error"
         elif is_postgres_connection or is_network_issue:
             error_type = "connection_error"
@@ -643,6 +649,31 @@ async def handle_workflow_error(
             }
             yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
         else:
+            # DALTON-HOOK(chat-large-upload): steer_only POSTs only read steering_accepted or
+            # error frames; emit structured recoverable metadata on event: error so the
+            # frontend prompts retry and preserves attachments instead of wrapping as 409.
+            if getattr(request, "steer_only", False):
+                detail_msg = (
+                    e.detail
+                    if isinstance(e, HTTPException) and isinstance(e.detail, str)
+                    else str(e)
+                )
+                error_payload = {
+                    "thread_id": thread_id,
+                    "error": detail_msg or "Temporary error occurred, please retry.",
+                    "type": "workflow_error",
+                    "error_type": error_type,
+                    "error_class": type(e).__name__,
+                    "is_recoverable": True,
+                    "retryable": True,
+                    "recovery": recovery,
+                    **run_named,
+                }
+                if isinstance(e, HTTPException):
+                    error_payload["status_code"] = e.status_code
+                yield _emit_sse_error(handler, error_payload)
+                return
+
             logger.warning(
                 f"[PTC_CHAT] Recoverable error ({error_type}) for thread_id={thread_id} "
                 f"(retry {retry_count}/{MAX_RETRIES}): "

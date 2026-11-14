@@ -55,9 +55,15 @@ class FakeLedger:
         reject: str | None = None,
         infra_down: bool = False,
         journal: list | None = None,
+        busy: bool = False,
+        whole: bool = False,
+        final: bool = False,
     ) -> None:
         self.admit = admit
         self.reject = reject
+        self.busy = busy
+        self.whole = whole
+        self.final = final
         self.infra_down = infra_down
         self.started: list[dict] = []
         self.finalized: list[tuple] = []
@@ -71,7 +77,7 @@ class FakeLedger:
     async def start_task_run(self, **kwargs) -> str:
         self.started.append(kwargs)
         if self.reject:
-            raise TaskRunRejected(self.reject)
+            raise TaskRunRejected(self.reject, busy=self.busy, whole=self.whole, final=self.final)
         if self.infra_down:
             raise RuntimeError("ledger db down")
         return self.admit
@@ -130,6 +136,35 @@ def _middleware(owner, ledger, subagent_models=None) -> BackgroundSubagentMiddle
 # ---------------------------------------------------------------------------
 # init admission
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", [True, False])
+async def test_a_task_is_admitted_with_the_credential_its_build_launches_it_on(stored):
+    owner = FakeOwner()
+    ledger = FakeLedger(reject="stop here")
+    mw = _middleware(owner, ledger)
+    mw.claude_code_types = frozenset({"general-purpose"})
+    mw.claude_code_stored = stored
+
+    await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _ok_handler)
+
+    assert ledger.started[0]["claude_code"] is True
+    assert ledger.started[0]["stored_token"] is stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("computer", ["c-9", None])
+async def test_a_task_is_admitted_on_the_own_computer_its_build_runs_the_cli_on(computer):
+    owner = FakeOwner()
+    ledger = FakeLedger(reject="stop here")
+    mw = _middleware(owner, ledger)
+    mw.claude_code_types = frozenset({"general-purpose"})
+    mw.cli_computer = computer
+
+    await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _ok_handler)
+
+    assert ledger.started[0]["cli_computer"] == computer
 
 
 @pytest.mark.asyncio
@@ -426,6 +461,42 @@ async def test_resume_rejected_before_reset_leaves_task_resumable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("busy", "final"), [(True, False), (False, False), (False, True)])
+async def test_a_resume_refused_while_the_computer_is_busy_marks_its_steers_uncounted(
+    busy, final,
+):
+    """A refusal that lifts once a CLI on the computer ends: the steers the
+    resume opens with go back without using up their refusals. One that
+    lasts as long as the task settles them."""
+    from ptc_agent.agent.middleware.background_subagent.context import (
+        current_steer_resume,
+    )
+
+    owner = FakeOwner()
+    ledger = FakeLedger(reject="the computer is full", busy=busy, final=final)
+    mw = _middleware(owner, ledger)
+    task = await _register_settled_task(mw)
+    mw._reset_task_for_resume = AsyncMock()
+    resume = {"task_id": task.task_id, "delivered": []}
+
+    token = current_steer_resume.set(resume)
+    try:
+        result = await mw.awrap_tool_call(
+            _request(
+                {"action": "resume", "task_id": task.task_id, "prompt": "more"},
+                tool_call_id="tc-2",
+            ),
+            _ok_handler,
+        )
+    finally:
+        current_steer_resume.reset(token)
+
+    assert "the computer is full" in result.content
+    assert (resume.get("busy", False), resume.get("final", False)) == (busy, final)
+    assert task.completed and task.task_run_id == "run-uuid-prev"
+
+
+@pytest.mark.asyncio
 async def test_resume_of_a_type_off_the_roster_is_refused_before_admission():
     """A subagent deleted, renamed or turned off since its task ran. Spawned,
     the Task tool's refusal came after a reply saying the task resumed, and
@@ -713,3 +784,49 @@ async def test_run_end_skipped_when_the_stream_is_torn(monkeypatch):
 
     assert ledger.finalized  # the CAS still lands (error/transport_lost)
     assert not any(entry[0] == "run_end" for entry in journal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("types", [frozenset({"general-purpose"}), frozenset()])
+async def test_admission_says_whether_the_run_is_a_claude_code_cli_its_computer_counts(types):
+    ledger = FakeLedger(admit="run-uuid-9")
+    mw = _middleware(FakeOwner(), ledger)
+    mw.claude_code_types = types
+    mw.registry.write_task_meta = AsyncMock()
+
+    await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _ok_handler)
+    await mw.registry._tasks["tc-1"].asyncio_task
+
+    assert ledger.started[0]["claude_code"] is bool(types)
+
+
+M2 = (
+    "Not started: the Claude plan's 5-hour limit is used up until Jan 3, 20:40 UTC, so Claude Code subagents "
+    "can't run before then."
+)
+
+
+@pytest.mark.asyncio
+async def test_a_task_the_claude_plan_refuses_answers_in_the_refusals_own_words():
+    ledger = FakeLedger(reject=M2, whole=True)
+    mw = _middleware(FakeOwner(), ledger)
+    mw.claude_code_types = frozenset({"general-purpose"})
+    mw.claude_code_models = {"general-purpose": "claude-sonnet-5-5"}
+
+    result = await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _ok_handler)
+
+    assert (result.content, result.status) == (M2, "error")
+    assert ledger.started[0]["claude_code_model"] == "claude-sonnet-5-5"
+    assert mw.registry._tasks["tc-1"].terminal_status == "never_started"
+
+
+@pytest.mark.asyncio
+async def test_a_task_on_a_platform_model_names_no_claude_code_model():
+    ledger = FakeLedger(reject="stop here")
+    mw = _middleware(FakeOwner(), ledger)
+    mw.claude_code_models = {"research": "claude-sonnet-5-5"}
+
+    await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _ok_handler)
+
+    assert (ledger.started[0]["claude_code"], ledger.started[0]["claude_code_model"]) == (False, None)
+

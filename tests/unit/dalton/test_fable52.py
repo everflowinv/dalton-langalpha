@@ -72,10 +72,6 @@ USAGE = {
 }
 _SAMPLING = ("temperature", "top_p", "top_k")
 _UNTOUCHED = (
-    "src/llms/manifest/models.json",
-    "src/llms/manifest/providers.json",
-    "src/llms/manifest/task_costs.json",
-    "tests/unit/llms/request_lock.json",
     "agent_config.yaml",
     "agent_config.dalton.yaml",
     "config.yaml",
@@ -111,10 +107,17 @@ def test_merged_catalogue_registers_both_routes_without_touching_upstream():
     config = LLM.get_model_config()
     raw_models = json.loads((REPO_ROOT / "src/llms/manifest/models.json").read_text(encoding="utf-8"))
     raw_providers = json.loads((REPO_ROOT / "src/llms/manifest/providers.json").read_text(encoding="utf-8"))
-    assert API not in raw_models
-    assert OAUTH not in raw_models
+    raw_overlay = json.loads((REPO_ROOT / "src/dalton/llm/native_overlay.json").read_text(encoding="utf-8"))
+    assert API in raw_models
+    assert OAUTH in raw_models
     upstream_ids = [item["id"] for item in raw_providers["models"]["anthropic"]]
-    assert MODEL_ID not in upstream_ids
+    assert MODEL_ID in upstream_ids
+    # Downstream overlay must not duplicate upstream #751 Fable 5.2 definitions.
+    overlay_models = raw_overlay.get("models") or {}
+    assert API not in overlay_models
+    assert OAUTH not in overlay_models
+    overlay_anthropic = ((raw_overlay.get("providers") or {}).get("models") or {}).get("anthropic") or []
+    assert MODEL_ID not in [item["id"] for item in overlay_anthropic]
 
     api = config.get_model_config(API)
     oauth = config.get_model_config(OAUTH)
@@ -176,12 +179,8 @@ def test_shipped_defaults_and_protected_files_do_not_name_fable_52():
     for rel in _UNTOUCHED:
         text = (REPO_ROOT / rel).read_text(encoding="utf-8")
         assert MODEL_ID not in text, rel
-    lock = json.loads((REPO_ROOT / "tests/unit/llms/request_lock.json").read_text(encoding="utf-8"))
-    manifest = json.loads((REPO_ROOT / "src/llms/manifest/models.json").read_text(encoding="utf-8"))
-    assert set(lock) == set(manifest)
-    assert task_cost(API, EFFORTS) is None
-    assert task_cost(OAUTH, EFFORTS) is None
-    assert task_cost("claude-fable-5-1", EFFORTS) is not None
+    assert task_cost("claude-fable-5-1", EFFORTS) is None
+    assert task_cost(API, ("low", "high", "xhigh", "max")) is not None
 
 
 @pytest.mark.parametrize(

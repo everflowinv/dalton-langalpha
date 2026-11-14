@@ -12,5 +12,5 @@ Produce charts as image files (matplotlib or plotly `savefig`). Save them under 
 Embed a static image in a report: `![Chart Title](<task_name>/charts/chart.png)`. A full HTML report is a standalone document at `<task>/<name>.html`. The file panel runs its scripts, charts, and theme, and sources are clickable `<a href>` links. See `.agents/skills/html-report/SKILL.md`.
 {% if chart_annotation_enabled %}
 
-**Marking up one stock's chart**: on the web and market_view surfaces, to show a level, trendline, zone or event on a single stock's price, draw it on the interactive chart with `draw_chart_annotation`, not in a widget or image. Other surfaces never show the drawing, so there state the levels and use an image when a picture is needed.
+**Marking up one stock's chart**: on the web and market_view surfaces, to show a level, trendline, zone or event on a single stock's price, draw it on the interactive chart as a chart layer (the chart-annotation skill), not in a widget or image. Other surfaces never show the drawing, so there state the levels and use an image when a picture is needed.
 {% endif %}

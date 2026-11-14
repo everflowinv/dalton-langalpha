@@ -16,33 +16,27 @@ import type { Attachment } from '@/types/sse';
 import type { ArtifactCommentsShown } from '@/types/api';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
+import type { AttachmentMeta } from '../../utils/fileUpload';
 
 // Re-export types for consumers
-export type { ChatMessage, AssistantMessage, UserMessage, NotificationMessage, NotificationVariant };
+export type { ChatMessage, AssistantMessage, UserMessage, NotificationMessage, NotificationVariant, AttachmentMeta };
 
 // Keeps ids made within the same millisecond apart: a message is updated by
 // id, so two sharing one are both updated.
 let _idSeq = 0;
-
-export interface AttachmentMeta {
-  file?: File;
-  name?: string;
-  filename?: string;
-  dataUrl?: string | null;
-  preview?: string | null;
-  url?: string;
-  type?: string;
-  mime_type?: string;
-  size?: number;
-  upload_id?: string;
-  uploadId?: string;
-}
 
 // DALTON-HOOK(chat-large-upload): normalize caller-owned and server-returned attachment metadata into Attachment[]
 function readUploadId(item: Record<string, unknown> | undefined): string | undefined {
   if (!item) return undefined;
   if (typeof item.upload_id === 'string' && item.upload_id) return item.upload_id;
   if (typeof item.uploadId === 'string' && item.uploadId) return item.uploadId;
+  return undefined;
+}
+
+function readAttachmentId(item: Record<string, unknown> | undefined): string | undefined {
+  if (!item) return undefined;
+  if (typeof item.attachment_id === 'string' && item.attachment_id) return item.attachment_id;
+  if (typeof item.attachmentId === 'string' && item.attachmentId) return item.attachmentId;
   return undefined;
 }
 
@@ -80,6 +74,7 @@ function normalizeAttachmentRecord(raw: unknown, prior?: Attachment): Attachment
         ? prior.size
         : fileObj?.size;
   const uploadId = readUploadId(rec) ?? readUploadId(priorRec);
+  const attachmentId = readAttachmentId(rec) ?? readAttachmentId(priorRec);
   const status = (typeof rec.status === 'string' && rec.status)
     ? rec.status
     : (typeof priorRec?.status === 'string' && priorRec.status)
@@ -100,6 +95,16 @@ function normalizeAttachmentRecord(raw: unknown, prior?: Attachment): Attachment
     : (typeof priorRec?.preview === 'string' && priorRec.preview)
       ? priorRec.preview
       : undefined;
+  const readyAt = typeof rec.readyAt === 'number'
+    ? rec.readyAt
+    : typeof priorRec?.readyAt === 'number'
+      ? (priorRec.readyAt as number)
+      : undefined;
+  const missing = typeof rec.missing === 'boolean'
+    ? rec.missing
+    : typeof priorRec?.missing === 'boolean'
+      ? (priorRec.missing as boolean)
+      : undefined;
 
   const normalized: Attachment = {
     name,
@@ -109,10 +114,13 @@ function normalizeAttachmentRecord(raw: unknown, prior?: Attachment): Attachment
   };
   if (mimeType) normalized.mime_type = mimeType;
   if (uploadId) normalized.upload_id = uploadId;
+  if (attachmentId) normalized.attachment_id = attachmentId;
   if (status) normalized.status = status;
   if (dataUrl) normalized.dataUrl = dataUrl;
   if (preview) normalized.preview = preview;
   if (fileObj) normalized.file = fileObj;
+  if (readyAt !== undefined) normalized.readyAt = readyAt;
+  if (missing !== undefined) normalized.missing = missing;
   return normalized;
 }
 
@@ -141,6 +149,7 @@ export function mergeAcceptedAttachments(
     if (!entry || typeof entry !== 'object') continue;
     const rec = entry as Record<string, unknown>;
     const incomingUid = readUploadId(rec);
+    const incomingAid = readAttachmentId(rec);
     const incomingName = typeof rec.name === 'string' && rec.name
       ? rec.name
       : typeof rec.filename === 'string' && rec.filename
@@ -150,6 +159,11 @@ export function mergeAcceptedAttachments(
     if (incomingUid) {
       matchIdx = pool.findIndex(
         (p, idx) => !usedIndices.has(idx) && readUploadId(p as Record<string, unknown>) === incomingUid,
+      );
+    }
+    if (matchIdx === -1 && incomingAid) {
+      matchIdx = pool.findIndex(
+        (p, idx) => !usedIndices.has(idx) && readAttachmentId(p as Record<string, unknown>) === incomingAid,
       );
     }
     if (matchIdx === -1 && incomingName) {
@@ -169,7 +183,6 @@ export function mergeAcceptedAttachments(
 
   return merged.length > 0 ? merged : undefined;
 }
-
 /**
  * `turnIndex` is the backend turn the bubble belongs to, or undefined for one
  * whose turn the transcript's count names (see projectTurns). Required, so
@@ -201,6 +214,7 @@ export function createUserMessage(
   };
   const normalizedAttachments = normalizeAttachments(attachments);
   if (normalizedAttachments) {
+    // The send-time record; history's carries a url instead. The bubble reads either.
     msg.attachments = normalizedAttachments;
   }
   if (widgetSnapshots && widgetSnapshots.length > 0) {

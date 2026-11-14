@@ -39,6 +39,7 @@ vi.mock('@/hooks/useApiKeys', () => ({
 const providersMock = vi.hoisted(() => ({ current: { statusError: false } }));
 vi.mock('@/hooks/useConfiguredProviders', () => ({
   useConfiguredProviders: () => providersMock.current,
+  useOAuthStatus: () => ({ data: undefined, isLoading: false, isError: false }),
 }));
 
 vi.mock('@/hooks/useWorkspaces', () => ({

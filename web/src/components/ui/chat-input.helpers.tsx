@@ -73,7 +73,7 @@ export const MAX_FILE_SIZE = 30 * 1024 * 1024;
 // the request can carry. Files past the budget are not added.
 export const MAX_TOTAL_ATTACHMENTS_BYTES = 60 * 1024 * 1024;
 // DALTON-HOOK(chat-large-upload): per-file (200 MiB) and per-message (600 MiB) caps for stored uploads;
-// MAX_FILE_SIZE (30 MiB) and MAX_TOTAL_ATTACHMENTS_BYTES (60 MiB) remain the inline base64 budget.
+// MAX_FILE_SIZE (30 MiB) and MAX_TOTAL_ATTACHMENTS_BYTES (60 MiB) remain the small-file budget.
 export { MAX_CHAT_UPLOAD_FILE_SIZE, MAX_TOTAL_CHAT_UPLOAD_BYTES };
 export const MAX_FILES = 5;
 export const PASTE_PILL_MIN_CHARS = 1500;

@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://langalpha.ai"><strong>LangAlpha を試す ↗</strong></a> ·
+  <a href="https://docs.langalpha.ai"><strong>ドキュメント ↗</strong></a> ·
   <a href="#使い始める"><strong>使い始める</strong></a> ·
   <a href="#agent-トレーディング"><strong>Agent トレーディング</strong></a> ·
   <a href="#harness-設計"><strong>Harness 設計</strong></a> ·
@@ -25,6 +26,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-green?style=flat-square" alt="ライセンス：Apache 2.0" />
   <img src="https://img.shields.io/badge/python-3.13+-blue?style=flat-square" alt="Python 3.13+" />
   <a href="https://github.com/langchain-ai/langchain"><img src="https://img.shields.io/badge/LangChain-1c3c3c?style=flat-square&logo=langchain&logoColor=white" alt="LangChain" /></a>
+  <a href="https://docs.langalpha.ai"><img src="https://img.shields.io/badge/docs-docs.langalpha.ai-1c3c3c?style=flat-square" alt="ドキュメント" /></a>
   <a href="https://github.com/ginlix-ai/langalpha/releases"><img src="https://img.shields.io/badge/desktop-macOS%20%7C%20Windows%20%7C%20Linux-555?style=flat-square" alt="デスクトップアプリ" /></a>
 </p>
 
@@ -180,7 +182,9 @@ make config   # wizard: model, data sources, sandbox, web search
 make up       # Postgres, Redis, backend and web app
 ```
 
-[http://localhost:5173](http://localhost:5173) を開いてください。API はポート 8000 で待ち受けており、インタラクティブなドキュメントは `/docs` にあります。
+[http://localhost:5173](http://localhost:5173) を開いてください。API はポート 8000 で待ち受けており、インタラクティブなドキュメントは `/docs` にあります。手順は[セルフホストのクイックスタート](https://docs.langalpha.ai/get-started/self-hosting-quickstart/)（英語）を参照してください。
+
+**ドキュメント**。[LangAlpha とは](https://docs.langalpha.ai/get-started/what-is-langalpha/)でプロダクトの全体像を、[CLI リファレンス](https://docs.langalpha.ai/cli/overview/)でターミナルとスクリプトから使う `langalpha`（短縮形 `la`）を紹介しています。ドキュメントは英語です。
 
 **セルフホストとの違い。** agent、workspace、automation、skill、統制された注文は同じように動きます。それ以外は次のように異なります。
 
@@ -204,7 +208,7 @@ make up       # Postgres, Redis, backend and web app
 | `FMP_API_KEY` | ファンダメンタルズ、財務諸表、マクロ、アナリストデータ（[無料枠あり](https://site.financialmodelingprep.com/)） |
 | `DAYTONA_API_KEY` | [Daytona](https://www.daytona.io/) のクラウド sandbox。設定しない場合、sandbox はローカルの Docker で動く |
 | `R2_*`、`S3_*` または `OSS_*` と `storage.provider` | Cloudflare R2、AWS S3、Alibaba OSS、MinIO のオブジェクトストレージ。workspace のファイルスナップショット、memo、添付ファイル、skill のアーカイブ、大きなトランスクリプト、チャットウィジェットのデータを保持し、署名付きリンクでダウンロードを提供する。バケットがない場合、これらのデータは Postgres に保存され、チャート画像のキャプチャは無効になる |
-| `TAVILY_API_KEY`、`SERPER_API_KEY`、`EXA_API_KEY`、`PARALLEL_API_KEY`、`BOCHA_API_KEY` | Web 検索。使うエンジンは `agent_config.yaml` の `search_api`（デフォルトは `tavily`）か、ユーザーごとに Settings で選ぶ |
+| `TAVILY_API_KEY`、`SERPER_API_KEY`、`EXA_API_KEY`、`PARALLEL_API_KEY`、`BOCHA_API_KEY`、`DEEPSEEK_API_KEY` | Web 検索。使うエンジンは `agent_config.yaml` の `search_api`（デフォルトは `tavily`）か、ユーザーごとに Settings で選ぶ |
 | `FIRECRAWL_API_KEY` | 強化された Web 取得とサイトのクロール。組み込みのクローラーは key 不要 |
 | `X_BEARER_TOKEN` | X の投稿検索とスレッドの参照。Plugins ページで vault secret として追加する |
 | `LANGSMITH_API_KEY`、`OTEL_EXPORTER_OTLP_ENDPOINT` | トレースとメトリクス |
@@ -261,7 +265,7 @@ LangAlpha は 2026 年 1 月の最初のリリース以来、programmatic tool c
 
 LangAlpha 独自のデータ server は、コードで扱いやすいように作られています。市場データツールはすべて同じエンベロープ（`symbol`、`currency`、`timezone`、`count`、`data`、`source`）を返し、時系列は古い順に並び、失敗は型付きのエラーコードとして返ります。そのため agent のコードは、文章を解析するのではなく、結果をそのままインデックスで参照できます。
 
-provider は市場ごとにフォールバックします。米国データには LangAlpha.ai のリアルタイムフィード、ファンダメンタルズとマクロには FMP、無料のフォールバック先として Yahoo Finance を使います。Web 検索は Tavily、Serper、Exa、Parallel、Bocha に対応します。Web 取得は組み込みのクローラーを使い、オプションで Firecrawl に委譲でき、provider ごとのサーキットブレーカーで保護されています。
+provider は市場ごとにフォールバックします。米国データには LangAlpha.ai のリアルタイムフィード、ファンダメンタルズとマクロには FMP、無料のフォールバック先として Yahoo Finance を使います。Web 検索は Tavily、Serper、Exa、Parallel、Bocha、DeepSeek に対応します。Web 取得は組み込みのクローラーを使い、オプションで Firecrawl か DeepSeek に委譲でき、provider ごとのサーキットブレーカーで保護されています。
 
 データ以外に、agent は次のツールを使います。
 

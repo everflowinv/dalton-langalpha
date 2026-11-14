@@ -143,9 +143,15 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Takes tunnels no computer uses off their machines; a claim on each
     # tunnel's row in Postgres dedups it across workers.
     ("TunnelSweeper", "src.server.services.ssh_tunnel_sweep"),
+    # Deletes sandboxes a create gave up on once their provider lets it; a
+    # claim on each row in Postgres dedups it across workers.
+    ("AbandonedSandboxSweeper", "src.server.services.abandoned_sandbox_sweep"),
     # Ends uploads their browser abandoned and takes over pulls whose worker
     # died; a claim on each upload's row in Postgres dedups it across workers.
     ("UploadSweeper", "src.server.services.workspace_upload_pull"),
+    # Ends chat attachments their composer abandoned and drops the bytes of
+    # ones past use; a claim on each row in Postgres dedups it across workers.
+    ("AttachmentSweeper", "src.server.services.chat_attachments"),
     # Follows handed-off background commands to their end and keeps their
     # computers up while covered; claims on each command's row in Postgres
     # dedup it across workers.
@@ -153,6 +159,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Has a model describe MCP servers; a claim on each job's row under its
     # scope's advisory lock dedups it across workers.
     ("McpDescriptionWorker", "src.server.services.mcp_descriptions.worker"),
+    # Indexes for conversation search the turns their settle missed, and
+    # backfills older ones; an advisory lock keeps it to one worker a pass.
+    ("ThreadSearchSweeper", "src.server.services.search.sweep"),
 )
 
 
@@ -258,6 +267,10 @@ async def lifespan(app: FastAPI):
     # per-worker so BatchSpanProcessor / PeriodicExportingMetricReader daemon
     # threads are owned by the worker process, not a dead pre-fork parent.
     init_otel_runtime()
+
+    from src.observability.sentry import init_sentry
+
+    init_sentry()
 
     from src.observability.langsmith_tracer import configure_trace_payloads
 
@@ -483,6 +496,14 @@ async def lifespan(app: FastAPI):
         install_client_key_loader()
         install_gateway_loader()
 
+        # A create that fails may still leave a sandbox running; the provider
+        # records it for the sweep, in whichever worker the create ran.
+        from src.server.services.abandoned_sandbox_sweep import (
+            install_abandoned_sink,
+        )
+
+        install_abandoned_sink()
+
         # Platform-secret migration sweep: converges running sandboxes left
         # behind the fleet generation (always-on sandboxes never re-init, so
         # only this sweep ever scrubs them). Inert without an active catalog.
@@ -612,9 +633,11 @@ async def lifespan(app: FastAPI):
     # permanently off behind one WARN line (report-backs undelivered, burst
     # slots leaking).
     from src.server.services.report_back import command as command_report
+    from src.server.services.report_back import restart as restart_resume
+    from src.server.services import automation_executor
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
-    from src.server.services import automation_settlement, idle_compaction, thread_lifecycle_feed
+    from src.server.services import automation_settlement, idle_compaction, notices, thread_lifecycle_feed
     from src.server.services.features import register_feature_off_hook
     from src.server.services.hook_outbox import HookOutboxDrainer
     from src.server.services.market_targets import delivery as market_target_delivery
@@ -625,10 +648,13 @@ async def lifespan(app: FastAPI):
     handoff_core.register_outbox_executors()
     subagent.register_outbox_executors()
     command_report.register_outbox_executors()
+    restart_resume.register_outbox_executors()
+    automation_executor.register_outbox_executors()
     steer_executor.register_outbox_executors()
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
     market_target_delivery.register_outbox_executors()
+    notices.register_outbox_executors()
     # Registered with push off too: its rows then ack as no-ops.
     push_notify.register_outbox_executors()
     idle_compaction.register_outbox_executors()
@@ -660,6 +686,12 @@ async def lifespan(app: FastAPI):
         scanner.start()
     except Exception as e:
         logger.warning(f"Recovery scanner startup failed: {e}")
+
+    # Graceful restart: drain on request or on SIGTERM, leaving this worker's
+    # running work for the next process to resume.
+    from src.server.services.runs import restart_drain
+
+    restart_drain.start(asyncio.get_running_loop())
 
     # Turn-cancel nudge listener (v4 Phase 2.4e): a /cancel landing on
     # another worker signals this one's executor via pub/sub.
@@ -903,6 +935,14 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Application shutdown started...")
+    # Before anything stops: running turns and subagents are cancelled and
+    # recorded for the next process to resume, while every pool is open.
+    try:
+        from src.server.services.runs import restart_drain
+
+        await restart_drain.stop()
+    except Exception as e:
+        logger.warning(f"Error draining for restart: {e}")
     # DALTON-HOOK(data-map): cancel startup data-source health task on shutdown
     if _dalton_health_startup_task is not None:
         _dalton_health_startup_task.cancel()
@@ -1501,6 +1541,7 @@ from src.server.app.computers_ssh import router as computers_ssh_router
 from src.server.app.workspaces import router as workspaces_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
+from src.server.app.attachments import router as attachments_router
 from src.server.app.workspace_sandbox import router as workspace_sandbox_router
 from src.server.app.chart_annotations import router as chart_annotations_router
 from src.server.app.artifact_frames import frame_router as artifact_frame_router
@@ -1511,6 +1552,7 @@ from src.server.app.market_data import router as market_data_router
 from src.server.app.bars import router as bars_router
 from src.server.app.user_events import router as user_events_router
 from src.server.app.users import router as users_router
+from src.server.app.reports import router as reports_router
 from src.server.app.trading_permission import router as trading_permission_router
 from src.server.app.push_devices import router as push_devices_router
 from src.server.app.features import router as features_router
@@ -1548,6 +1590,7 @@ from src.server.app.plugins import router as plugins_router
 from src.server.app.marketplace import router as marketplace_router
 from src.server.app.user_vault import router as user_vault_router
 from src.server.app.mcp_servers import router as mcp_servers_router
+from src.server.app.search import router as search_router
 
 # Conditionally import ginlix-data WS proxy (only when GINLIX_DATA_WS_URL is set)
 from src.config.settings import GINLIX_DATA_ENABLED
@@ -1571,6 +1614,7 @@ else:
 
 # Include all routers
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
+app.include_router(search_router)  # /api/v1/search - Conversation search (command palette)
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
 app.include_router(workspaces_router)  # /api/v1/workspaces/* - Workspace CRUD
 app.include_router(
@@ -1582,6 +1626,9 @@ app.include_router(
 app.include_router(
     workspace_files_router
 )  # /api/v1/workspaces/{id}/files/* - Live file access
+app.include_router(
+    attachments_router
+)  # /api/v1/attachments/* - Chat composer attachments, uploaded before the message
 app.include_router(
     workspace_sandbox_router
 )  # /api/v1/workspaces/{id}/sandbox/* - Sandbox stats & packages
@@ -1599,6 +1646,7 @@ app.include_router(
     bars_router
 )  # /api/v1/market-data/bars/* - Protocol-native progressive bars
 app.include_router(users_router)  # /api/v1/users/* - User management
+app.include_router(reports_router)  # /api/v1/reports - Reports forwarded to the platform
 app.include_router(
     trading_permission_router
 )  # /api/v1/users/me/trading-permission - Order approval level

@@ -63,6 +63,8 @@ THIRD_PARTY_LIBRARIES = [
     'httpx',
     'httpx2',  # DALTON-HOOK(httpx2-log-level): its INFO request line prints full URLs (query credentials)
     'httpcore',
+    'httpx2',  # the OpenAI SDK's transport: an INFO line per model call
+    'httpcore2',
     'urllib3',
     'requests',
     'litellm',

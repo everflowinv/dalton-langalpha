@@ -1,4 +1,6 @@
-import type { ModelFallbackNotice, TextChunkMark } from '@/types/chat';
+import type { HandOffNotice, ModelFallbackNotice, NotificationDetailKind, TextChunkMark } from '@/types/chat';
+import type { PlanBilled } from '@/api/model';
+import type { ThreadFeedback } from '../../utils/api/feedback';
 
 // Stable empty object to avoid defeating React.memo with fresh `|| {}` fallbacks
 export const EMPTY_OBJ = {} as Record<string, never>;
@@ -30,10 +32,14 @@ export interface ContentSegmentRecord {
   widgetId?: string;
   /** Notification-only: a model switch, labeled when shown. */
   fallback?: ModelFallbackNotice;
-  /** Notification-only: longer text (compaction summary / fallback error) shown under toggle. */
+  /** Notification-only: a hand-off to Claude Code, labeled when shown. */
+  handoff?: HandOffNotice;
+  /** Notification-only: longer text (compaction summary, hand-off brief, fallback error) shown under toggle. */
   detail?: string;
   /** Notification-only: expander toggle label flavor. */
-  detailKind?: 'summary' | 'error';
+  detailKind?: NotificationDetailKind;
+  /** Notification-only: a reply billed to usage credits, drawn as a notice line. */
+  planBilled?: PlanBilled;
 }
 
 /** Subagent info for opening subagent task tabs */
@@ -44,8 +50,6 @@ export interface SubagentInfo {
   status?: string;
 }
 
-/** Feedback result from API */
-export interface FeedbackResult {
-  rating: string | null;
-  [key: string]: unknown;
-}
+/** A turn's rating as a bubble reads it: the server's row, or only the
+ *  rating a click settled on. */
+export type FeedbackResult = { rating: string | null } & Partial<Omit<ThreadFeedback, 'rating'>>;
