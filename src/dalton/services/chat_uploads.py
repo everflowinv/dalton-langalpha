@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
@@ -1629,14 +1629,29 @@ async def _stage_single_bytes_attachment(
     part_count = max(1, math.ceil(size_bytes / part_size))
     object_key = storage.build_chat_upload_key(canonical_ws, upload_id, safe_name)
 
-    store_upload_id = await asyncio.to_thread(
-        storage.open_multipart_upload,
-        object_key,
-        content_type=mime_type,
+    # DALTON-HOOK(chat-large-upload): settle open_multipart_upload and abort created sid on cancel
+    async def _cleanup_untracked_multipart(sid: str | None) -> None:
+        if not sid:
+            return
+        await _run_in_thread_until_settled(
+            storage.abort_multipart_upload,
+            object_key,
+            sid,
+        )
+        await _run_in_thread_until_settled(storage.delete_object, object_key)
+
+    store_upload_id = await _await_task_until_settled(
+        asyncio.create_task(
+            asyncio.to_thread(
+                storage.open_multipart_upload,
+                object_key,
+                content_type=mime_type,
+            )
+        ),
+        on_cancelled_result=_cleanup_untracked_multipart,
     )
     if not store_upload_id:
-        raise HTTPException(
-            status_code=503,
+        raise _TransientAttachmentStorageError(
             detail="Could not stage inline attachment. Please try again.",
         )
 
@@ -1672,7 +1687,7 @@ async def _stage_single_bytes_attachment(
             part_num = idx + 1
             chunk = raw_bytes[idx * part_size : (idx + 1) * part_size]
             part_sha = hashlib.sha256(chunk).hexdigest()
-            # DALTON-HOOK(chat-large-upload): await thread settlement so chunk bytes and budget do not outlive cancel
+            # DALTON-HOOK(chat-large-upload): await thread settlement and preserve transient 503 recovery marker
             etag = await _run_in_thread_until_settled(
                 storage.upload_part_bytes,
                 object_key,
@@ -1681,8 +1696,7 @@ async def _stage_single_bytes_attachment(
                 data=chunk,
             )
             if not etag:
-                raise HTTPException(
-                    status_code=503,
+                raise _TransientAttachmentStorageError(
                     detail="Failed to stage inline attachment part. Please retry.",
                 )
             updated = await db.record_uploaded_part(
@@ -1693,8 +1707,7 @@ async def _stage_single_bytes_attachment(
                 sha256=part_sha,
             )
             if updated is None:
-                raise HTTPException(
-                    status_code=503,
+                raise _TransientAttachmentStorageError(
                     detail="Failed to record staged inline attachment part.",
                 )
             ordered_parts.append((part_num, etag))
@@ -1705,39 +1718,35 @@ async def _stage_single_bytes_attachment(
             expected_sha256=expected_sha,
         )
         if claimed is None:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to finalize staged inline attachment.",
             )
         claim_token = str(claimed.get("claim_token") or "")
 
-        completed = await asyncio.to_thread(
+        completed = await _run_in_thread_until_settled(
             storage.complete_multipart_upload,
             object_key,
             store_upload_id,
             ordered_parts,
         )
         if not completed:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to assemble staged inline attachment.",
             )
 
-        digest = await asyncio.to_thread(
+        digest = await _run_in_thread_until_settled(
             storage.compute_stored_object_digest,
             object_key,
         )
         if digest is None:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to verify staged inline attachment.",
             )
         actual_size, actual_sha = digest
         if actual_size != size_bytes or not hmac.compare_digest(
             actual_sha, expected_sha
         ):
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Staged inline attachment verification mismatch.",
             )
 
@@ -1748,8 +1757,7 @@ async def _stage_single_bytes_attachment(
             claim_token=claim_token,
         )
         if ready_row is None:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to mark staged inline attachment ready.",
             )
         return ready_row
@@ -1773,10 +1781,7 @@ async def _stage_single_bytes_attachment(
                             aborted, mark_cleaned_on_success=True
                         )
             else:
-                await asyncio.to_thread(
-                    storage.abort_multipart_upload, object_key, store_upload_id
-                )
-                await asyncio.to_thread(storage.delete_object, object_key)
+                await _cleanup_untracked_multipart(store_upload_id)
         except Exception:
             logger.warning(
                 "Cleanup after failed inline steer staging failed for %s",
@@ -1859,7 +1864,7 @@ def _probe_upstream_object_missing(object_key: str) -> bool:
 _T = TypeVar("_T")
 
 
-# DALTON-HOOK(chat-large-upload): transient object-store read failure stays an HTTP 503 for
+# DALTON-HOOK(chat-large-upload): transient object-store failure stays an HTTP 503 for
 # direct routes while carrying an explicit marker for classify_error() on SSE steer turns.
 class _TransientAttachmentStorageError(HTTPException):
     is_transient_storage_error = True
@@ -1871,7 +1876,52 @@ class _TransientAttachmentStorageError(HTTPException):
         super().__init__(status_code=503, detail=detail)
 
 
-# DALTON-HOOK(chat-large-upload): keep blocking object reads inside held_bytes_budget across cancellation
+# DALTON-HOOK(chat-large-upload): keep blocking object calls inside held_bytes_budget and run cancel cleanup after settlement
+async def _await_task_until_settled(
+    task: asyncio.Task[_T],
+    *,
+    on_cancelled_result: Callable[[_T], Awaitable[None]] | None = None,
+) -> _T:
+    """Await ``task`` to completion before propagating ``CancelledError``."""
+    cancelled_exc: asyncio.CancelledError | None = None
+    has_result = False
+    result: Any = None
+    try:
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                has_result = True
+                break
+            except asyncio.CancelledError as exc:
+                if cancelled_exc is None:
+                    cancelled_exc = exc
+                if task.done():
+                    if not task.cancelled():
+                        if task.exception() is not None:
+                            raise cancelled_exc
+                        result = task.result()
+                        has_result = True
+                    break
+    finally:
+        if task.done() and not task.cancelled():
+            task.exception()
+    if cancelled_exc is not None:
+        if has_result and on_cancelled_result is not None:
+            cleanup_task = asyncio.create_task(on_cancelled_result(result))
+            try:
+                await _await_task_until_settled(cleanup_task)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Post-cancel cleanup failed after task settled",
+                    exc_info=True,
+                )
+        result = None
+        raise cancelled_exc
+    return result
+
+
 async def _run_in_thread_until_settled(
     fn: Callable[..., _T],
     /,
@@ -1879,33 +1929,9 @@ async def _run_in_thread_until_settled(
     **kwargs: Any,
 ) -> _T:
     """Run ``fn`` in a worker thread, awaiting settlement before raising ``CancelledError``."""
-    task: asyncio.Task[Any] | None = asyncio.create_task(
-        asyncio.to_thread(fn, *args, **kwargs)
+    return await _await_task_until_settled(
+        asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
     )
-    cancelled_exc: asyncio.CancelledError | None = None
-    result: Any = None
-    try:
-        while True:
-            try:
-                assert task is not None
-                result = await asyncio.shield(task)
-                break
-            except asyncio.CancelledError as exc:
-                if cancelled_exc is None:
-                    cancelled_exc = exc
-                if task is not None and task.done():
-                    if not task.cancelled():
-                        task.exception()
-                    task = None
-                    raise cancelled_exc
-    finally:
-        if task is not None and task.done() and not task.cancelled():
-            task.exception()
-        task = None
-    if cancelled_exc is not None:
-        result = None
-        raise cancelled_exc
-    return result
 
 
 async def _read_upstream_object_bytes(object_key: str) -> bytes:

@@ -41,6 +41,7 @@ from src.server.utils.api import get_current_user_id
 
 _REAL_COMPUTE_STORED_OBJECT_DIGEST = chat_upload_storage.compute_stored_object_digest
 _REAL_COMPLETE_MULTIPART_UPLOAD = chat_upload_storage.complete_multipart_upload
+_REAL_OPEN_MULTIPART_UPLOAD = chat_upload_storage.open_multipart_upload
 _REAL_UPLOAD_PART_BYTES = chat_upload_storage.upload_part_bytes
 _REAL_PULL_DIRECT = svc.pull_direct
 _REAL_CLAIM_CLEANUP_BATCH = db_chat_uploads.claim_cleanup_batch
@@ -7494,3 +7495,101 @@ async def test_steer_consecutive_cancel_and_retry_never_exceeds_budget(
         assert max_active_reads == 1
         assert tight_budget._bytes == 0
         assert tight_budget._files == 0
+
+
+# DALTON-HOOK(chat-large-upload): cancel during open_multipart_upload awaits creation, aborts created sid, then raises
+@pytest.mark.asyncio
+async def test_steer_cancel_during_open_multipart_aborts_orphan_upload(
+    upload_env,
+) -> None:
+    from src.server.services.persistence.transfer import ByteBudget
+
+    owner = "user-steer-cancel-open"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {"workspace_id": ws_id, "user_id": owner, "status": "running"}
+
+    payload = b"O" * (8 * 1024)
+    budget = ByteBudget(max_bytes=64 * 1024, max_files=2)
+    att_id = str(uuid.uuid4())
+    att_row = {
+        "attachment_id": att_id,
+        "user_id": owner,
+        "name": "open-cancel.pdf",
+        "mime_type": "application/pdf",
+        "size": len(payload),
+        "mode": "direct",
+        "has_content": False,
+        "content": None,
+        "object_key": f"chat-attachments/{owner}/{att_id}/open-cancel.pdf",
+        "state": "ready",
+        "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
+        "cleaned_at": None,
+    }
+    steer_ctx = [
+        MultimodalContext(
+            type="pdf",
+            attachment_id=uuid.UUID(att_id),
+            description="open-cancel.pdf",
+        )
+    ]
+
+    store = upload_env["store"]
+    open_started = threading.Event()
+    release_open = threading.Event()
+    created: dict[str, str | None] = {}
+
+    def _blocking_open(object_key: str, *, content_type: str) -> str | None:
+        open_started.set()
+        release_open.wait(timeout=5.0)
+        sid = store.open_multipart_upload(object_key, content_type=content_type)
+        created["key"] = object_key
+        created["sid"] = sid
+        return sid
+
+    open_spy = create_autospec(_REAL_OPEN_MULTIPART_UPLOAD, side_effect=_blocking_open)
+
+    with (
+        patch.object(
+            svc,
+            "held_bytes_budget",
+            create_autospec(svc.held_bytes_budget, return_value=budget),
+        ),
+        patch.object(
+            svc.chat_attachments_db,
+            "get_attachments_by_ids",
+            create_autospec(
+                svc.chat_attachments_db.get_attachments_by_ids,
+                return_value={att_id: dict(att_row)},
+            ),
+        ),
+        patch.object(
+            svc,
+            "get_upstream_attachment_bytes",
+            create_autospec(svc.get_upstream_attachment_bytes, return_value=payload),
+        ),
+        patch.object(svc.storage, "open_multipart_upload", open_spy),
+    ):
+        task = asyncio.create_task(
+            svc.stage_request_attachments_for_steer(
+                steer_ctx,
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key="req:cancel-open:1",
+            )
+        )
+        assert await asyncio.to_thread(open_started.wait, 2.0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        release_open.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert created["key"]
+    assert created["sid"]
+    svc.storage.abort_multipart_upload.assert_called_once_with(created["key"], created["sid"])
+    svc.storage.delete_object.assert_called_once_with(created["key"])
+    assert (created["key"], created["sid"]) not in store.open_uploads
+    assert budget._bytes == 0
+    assert budget._files == 0

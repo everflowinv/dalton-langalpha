@@ -5,7 +5,7 @@
  * structured recoverable 503 storage error frame from handle_workflow_error.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useCallback, useEffect, useRef } from 'react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -124,10 +124,26 @@ describe('steer transient 503 SSE flow preserves attachments and prompts retry',
   });
 
   afterEach(() => {
+    cleanup();
     vi.unstubAllGlobals();
   });
 
-  it('routes backend recoverable steer SSE error through streamFetch -> useChatMessages -> ChatInput', async () => {
+  it.each([
+    {
+      label: 'upstream object read failure',
+      error: 'Temporarily unable to read attachment from storage. Please retry.',
+    },
+    {
+      label: 'multipart part upload failure',
+      error: 'Failed to stage inline attachment part. Please retry.',
+    },
+    {
+      label: 'multipart complete failure',
+      error: 'Failed to assemble staged inline attachment.',
+    },
+  ])(
+    'routes backend recoverable steer SSE error ($label) through streamFetch -> useChatMessages -> ChatInput',
+    async ({ error }) => {
     // Keep the initial turn stream open so isLoading stays true when steering fires
     let releaseInitialTurn: () => void = () => {};
     const postedBodies: Array<Record<string, unknown>> = [];
@@ -189,7 +205,7 @@ describe('steer transient 503 SSE flow preserves attachments and prompts retry',
             event: 'error',
             data: {
               thread_id: 'th-steer-sse',
-              error: 'Temporarily unable to read attachment from storage. Please retry.',
+              error,
               type: 'workflow_error',
               error_type: 'transient_error',
               error_class: 'HTTPException',
