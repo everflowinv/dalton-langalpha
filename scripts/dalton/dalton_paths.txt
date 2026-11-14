@@ -424,3 +424,7 @@ src/dalton/app/internal_usage_router.py
 scripts/dalton/openclaw_overlays/skills/model-usage-cost/
 scripts/dalton/openclaw_overlays/scripts/token_weekly_usage_tracker.py
 tests/unit/dalton/test_weekly_token_usage.py
+# 11-13 production fixes (vendor nested data, known-crowding carry-over, empty series) kept in the overlay so a reseed does not drop them.
+scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/fetch_history.py
+scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/official_mirror.py
+scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/backtest.py
