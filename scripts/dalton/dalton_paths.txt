@@ -418,3 +418,9 @@ src/dalton/app/internal_llm_router.py
 scripts/dalton/openclaw_overlays/skills/podcast-weekly-digest/
 plugins/dalton/skills/dalton-podcast-weekly/
 tests/unit/dalton/test_podcast_weekly_migration.py
+
+# Weekly token usage report migration (internal usage router + overlay skill/tracker).
+src/dalton/app/internal_usage_router.py
+scripts/dalton/openclaw_overlays/skills/model-usage-cost/
+scripts/dalton/openclaw_overlays/scripts/token_weekly_usage_tracker.py
+tests/unit/dalton/test_weekly_token_usage.py

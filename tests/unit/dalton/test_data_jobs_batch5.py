@@ -102,7 +102,7 @@ def test_t34_manifest_matches_openclaw_schedule() -> None:
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
     by_key = manifest.by_job_key()
-    assert len(manifest.tasks) == 37
+    assert len(manifest.tasks) == 38
     assert "T34" in by_code
     entry = by_code["T34"]
     assert entry is by_key[JOB_KEY]
