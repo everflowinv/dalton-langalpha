@@ -7162,7 +7162,6 @@ async def test_staged_upstream_steer_holds_memory_budget_and_distinguishes_store
     from botocore.exceptions import ClientError
 
 
-    from src.server.database import chat_attachments as chat_attachments_db
     from src.server.services import chat_attachments as chat_attachments_svc
     from src.server.services.persistence.transfer import held_bytes_budget
 
