@@ -26,8 +26,8 @@ import { deleteThreadRow } from '../hooks/deleteThreadRow';
 import { setThreadArchived } from '../hooks/threadRowMutations';
 import ChatInput from '../../../components/ui/chat-input';
 import type { ChatInputHandle } from '../../../components/ui/chat-input';
-import type { ComposerSend, ContextPayload } from '../../../components/ui/chat-input.types';
-import { attachmentsToContexts } from '../utils/fileUpload';
+import type { ComposerSend, ContextPayload, ReadyAttachment } from '../../../components/ui/chat-input.types';
+import { attachmentSendParts } from '../utils/fileUpload';
 import FilePanel, { SYSTEM_DIR_PREFIXES } from './FilePanel';
 import { clampPanelWidth as clampPanelWidthUtil } from '@/lib/panelUtils';
 import SandboxSettingsPanel from './SandboxSettingsPanel';
@@ -538,7 +538,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
    */
   const handleSendMessage = async (
     message: string,
-    attachments: Array<{ file: File; type: string; preview: string | null; dataUrl: string | null }> = [],
+    attachments: ReadyAttachment[] = [],
     slashCommands: Array<{ type: string; skillName?: string; name?: string }> = [],
     {
       model, reasoningEffort, fastMode, subagentsAllowed, reasoningEffortOverride, fastModeOverride,
@@ -558,18 +558,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
     setIsSendingMessage(true);
     try {
-      const contexts: Array<Record<string, unknown>> = [];
-      let attachmentMeta: Array<Record<string, unknown>> | null = null;
-      if (attachments && attachments.length > 0) {
-        contexts.push(...attachmentsToContexts(attachments as any) as unknown as Array<Record<string, unknown>>); // TODO: type properly — attachment shapes differ
-        attachmentMeta = attachments.map((a) => ({
-          name: a.file.name,
-          type: a.type,
-          size: a.file.size,
-          preview: null,
-          dataUrl: a.dataUrl,
-        }));
-      }
+      const attached = attachmentSendParts(attachments);
+      const contexts: Array<Record<string, unknown>> = [...attached.contexts];
 
       // Skill contexts from slash commands
       for (const cmd of slashCommands) {
@@ -588,7 +578,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
           initialMessage: message.trim(),
           ...(subagentsAllowed !== undefined ? { subagentsAllowed } : {}),
           ...(additionalContext ? { additionalContext } : {}),
-          ...(attachmentMeta ? { attachmentMeta } : {}),
+          ...(attached.meta.length > 0 ? { attachmentMeta: attached.meta } : {}),
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
           ...(typeof fastMode === 'boolean' ? { fastMode } : {}),

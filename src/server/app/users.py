@@ -49,6 +49,7 @@ from src.server.services.llm.thread_model import (
 )
 from src.server.services.llm.user_models import model_preference_of
 from src.server.services.claude_code.plan import credits_unknown
+from src.server.services.features import granted_override_keys
 from src.server.services.onboarding import maybe_complete_onboarding
 from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES, check_profile
 from src.server.models.user import (
@@ -489,6 +490,14 @@ def _refuse_renamed_model_keys(*bags: dict | None) -> None:
                 )
 
 
+def _refuse_server_owned_keys(other_pref: dict | None) -> None:
+    """Refuse ``feature_overrides``, which only the server writes: a user sets
+    a feature through PUT /features, which refuses the gates they may not set
+    (a ``grant`` among them)."""
+    if other_pref and "feature_overrides" in other_pref:
+        raise HTTPException(status_code=422, detail="feature_overrides is set through /api/v1/features.")
+
+
 def _validate_default_model_choices(model_pref: dict) -> None:
     """Refuse a ``default_model_scope`` or ``background_follows`` no reader
     acts on. None = key deletion."""
@@ -550,6 +559,7 @@ async def update_preferences(
     model_pref = request.model_preference.model_dump(exclude_unset=True) if request.model_preference else None
 
     _refuse_renamed_model_keys(model_pref, other_pref)
+    _refuse_server_owned_keys(other_pref)
 
     # DALTON-HOOK(notify-routes): the three notify keys live in
     # model_preference only — a write under other_preference would skip every
@@ -877,7 +887,9 @@ async def update_preferences(
 @router.delete("/users/me/preferences", status_code=200)
 @handle_api_exceptions("delete preferences", logger)
 async def delete_preferences(user_id: CurrentUserId):
-    """Delete all user preferences and reset onboarding_completed to false."""
+    """Delete all user preferences and reset onboarding_completed to false.
+    A feature the server granted (``granted_override_keys``) stays granted: the
+    user never set it, and a grant lost here could not be given back."""
     user = await db_get_user(user_id)
     if not user:
         raise_not_found("User")
@@ -890,16 +902,23 @@ async def delete_preferences(user_id: CurrentUserId):
 
     pm_ids = get_configured_pm_user_ids()
     uid_clean = str(user_id or "").strip()
+    keep_overrides = granted_override_keys()
     if pm_ids and uid_clean == pm_ids[0]:
         async with get_db_connection() as conn, conn.transaction():
             locked = await db_lock_user_preferences(user_id, conn=conn)
             locked_model_pref = (locked or {}).get("model_preference") or {}
             locked_other_pref = (locked or {}).get("other_preference") or {}
             preserved_notify_prefs: dict[str, object] = {}
+            preserved_other_pref: dict[str, object] = {}
             if isinstance(locked_other_pref, dict):
                 for k, v in locked_other_pref.items():
                     if isinstance(k, str) and k.strip().startswith("dalton_notify"):
                         preserved_notify_prefs[k.strip()] = v
+                overrides = locked_other_pref.get("feature_overrides")
+                if isinstance(overrides, dict):
+                    kept = {k: v for k, v in overrides.items() if k in keep_overrides}
+                    if kept:
+                        preserved_other_pref["feature_overrides"] = kept
             if isinstance(locked_model_pref, dict):
                 for k, v in locked_model_pref.items():
                     if isinstance(k, str) and k.strip().startswith("dalton_notify"):
@@ -910,15 +929,17 @@ async def delete_preferences(user_id: CurrentUserId):
                     risk_preference={},
                     investment_preference={},
                     agent_preference={},
-                    other_preference={},
+                    other_preference=preserved_other_pref,
                     model_preference=preserved_notify_prefs,
                     replace=True,
                     conn=conn,
                 )
             else:
-                await db_delete_user_preferences(user_id, conn=conn)
+                await db_delete_user_preferences(
+                    user_id, conn=conn, keep_overrides=keep_overrides
+                )
     else:
-        await db_delete_user_preferences(user_id)
+        await db_delete_user_preferences(user_id, keep_overrides=keep_overrides)
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)
     await db_update_user(user_id=user_id, onboarding_completed=False)

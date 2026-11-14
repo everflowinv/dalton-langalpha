@@ -16,7 +16,10 @@ import json_repair
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langgraph.types import Overwrite
 
-from ptc_agent.agent.middleware.image_capture import collect_sandbox_paths
+from ptc_agent.agent.middleware.image_capture import (
+    collect_sandbox_paths,
+    recorded_images,
+)
 
 from ptc_agent.agent.middleware.runtime_context.turn import (
     TURN_DEADLINE_KEY,
@@ -46,7 +49,7 @@ from src.utils.stream_coalescing import (
     StreamFrame,
     delta_piece,
 )
-from src.llms.content_utils import extract_reasoning_summary_index
+from src.llms.content_utils import ReasoningSpacer
 from src.config.settings import (
     get_workflow_timeout,
     is_sse_event_log_enabled,
@@ -259,15 +262,14 @@ class RunSSEProducer:
         # The last error frame the main agent's stream sent, for the finalize
         # of a failed run to keep.
         self._error_frame: Optional[Dict[str, Any]] = None
-        # The sandbox image paths each message the main graph saved still
-        # names, by message id: a later write of the message replaces its
-        # entry.
-        self._saved_image_paths: Dict[str, Set[str]] = {}
+        # The sandbox image paths each message the main graph saved names,
+        # by message id, each with the URL its model-time capture went to, or
+        # None where that capture missed it: a later write of the message
+        # replaces its entry.
+        self._saved_images: Dict[str, Dict[str, Optional[str]]] = {}
 
-        # Track reasoning block index per agent to detect block transitions
-        # When index changes (e.g., 0→1), a separator (\n\n) is needed between blocks
-        self._reasoning_block_index: dict[str, int] = {}
-        self._reasoning_separator_pending: Set[str] = set()
+        # Each agent's open reasoning, spaced into its sections.
+        self._reasoning_spacers: dict[str, ReasoningSpacer] = {}
         # Whitespace-only reasoning deltas seen before an agent's reasoning
         # section opened, held with their message id until visible reasoning
         # follows.
@@ -583,7 +585,7 @@ class RunSSEProducer:
                                         "summary_tokens", "truncated_count", "error",
                                         "kind", "offloaded_args", "offloaded_reads",
                                         "threshold", "cached_tokens",
-                                        "context_limit"):
+                                        "context_limit", "from_model", "to_model"):
                                 if key in event_data:
                                     cw_data[key] = event_data[key]
                             if event_data.get("action") == "token_usage":
@@ -1209,8 +1211,7 @@ class RunSSEProducer:
                     if agent_name in self.reasoning_active:
                         yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                         self.reasoning_active.discard(agent_name)
-                    self._reasoning_block_index.pop(agent_name, None)
-                    self._reasoning_separator_pending.discard(agent_name)
+                    self._reasoning_spacers.pop(agent_name, None)
                 else:
                     # Reasoning started - emit start signal
                     if agent_name not in self.reasoning_active:
@@ -1233,8 +1234,7 @@ class RunSSEProducer:
                         if agent_name in self.reasoning_active:
                             yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                             self.reasoning_active.discard(agent_name)
-                        self._reasoning_block_index.pop(agent_name, None)
-                        self._reasoning_separator_pending.discard(agent_name)
+                        self._reasoning_spacers.pop(agent_name, None)
                     else:
                         # Reasoning started - emit start signal
                         if agent_name not in self.reasoning_active:
@@ -1367,15 +1367,6 @@ class RunSSEProducer:
                         yield self._build_sse_event("tool_call_chunks", event_stream_message)
                         return  # Don't process input_json_delta as regular content
 
-        # Detect reasoning summary_text index transitions before normalization
-        # When the summary_text index changes (e.g., 0→1), a new reasoning thought started
-        reasoning_idx = self._extract_reasoning_summary_index(message_chunk.content)
-        if reasoning_idx is not None:
-            prev_idx = self._reasoning_block_index.get(agent_name)
-            self._reasoning_block_index[agent_name] = reasoning_idx
-            if prev_idx is not None and reasoning_idx != prev_idx:
-                self._reasoning_separator_pending.add(agent_name)
-
         # Resolve before normalization: the frame that announces the phase has
         # empty text and is dropped below, so the table must be filled first.
         text_phase = self._text_phase.resolve(agent_name, message_id, message_chunk.content)
@@ -1411,11 +1402,6 @@ class RunSSEProducer:
                 if agent_name not in self.reasoning_active and not text_content.strip():
                     self._reasoning_whitespace_held[agent_name] = (message_id, text_content)
                     text_content = None
-
-        # Prepend separator when transitioning between reasoning blocks
-        if text_content and content_type == "reasoning" and agent_name in self._reasoning_separator_pending:
-            text_content = "\n\n" + text_content
-            self._reasoning_separator_pending.discard(agent_name)
 
         event_stream_message: dict[str, Any] = {
             "thread_id": self.thread_id,
@@ -1471,8 +1457,11 @@ class RunSSEProducer:
                 # Reasoning completed, emit completion signal before this content
                 yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                 self.reasoning_active.discard(agent_name)
-                self._reasoning_block_index.pop(agent_name, None)
-                self._reasoning_separator_pending.discard(agent_name)
+                self._reasoning_spacers.pop(agent_name, None)
+
+            if content_type == "reasoning":
+                spacer = self._reasoning_spacers.setdefault(agent_name, ReasoningSpacer())
+                text_content = spacer.space(message_chunk.content, text_content)
 
             event_stream_message["content"] = text_content
             event_stream_message["content_type"] = content_type  # "text" or "reasoning"
@@ -1563,8 +1552,7 @@ class RunSSEProducer:
             if agent_name in self.reasoning_active:
                 yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                 self.reasoning_active.discard(agent_name)
-                self._reasoning_block_index.pop(agent_name, None)
-                self._reasoning_separator_pending.discard(agent_name)
+                self._reasoning_spacers.pop(agent_name, None)
 
             # Unified tool call completion handler for all providers
             # After normalization, both Response API "completed" and Anthropic "tool_use"
@@ -1820,16 +1808,6 @@ class RunSSEProducer:
 
         return filtered_tool_calls
 
-    @staticmethod
-    def _extract_reasoning_summary_index(content: Any) -> Optional[int]:
-        """Extract the summary_text item index from reasoning content.
-
-        Thin delegate to ``content_utils.extract_reasoning_summary_index`` —
-        the shared implementation is reused by the subagent token forwarder so
-        both streaming paths separate reasoning sections identically.
-        """
-        return extract_reasoning_summary_index(content)
-
     def _build_reasoning_signal(
         self,
         agent_name: str,
@@ -1873,15 +1851,33 @@ class RunSSEProducer:
                 messages = [messages]
             for message in messages:
                 if isinstance(message, AIMessage) and message.id:
-                    self._saved_image_paths[message.id] = collect_sandbox_paths(
-                        [message]
-                    )
+                    captured = recorded_images(message)
+                    self._saved_images[message.id] = {
+                        path: captured.get(path)
+                        for path in collect_sandbox_paths([message])
+                    }
 
     @property
     def saved_image_paths(self) -> Set[str]:
-        """The sandbox images the main agent's saved messages name, which
-        the model-time capture left as paths."""
-        return set().union(*self._saved_image_paths.values())
+        """The sandbox images the main agent's saved messages name that the
+        model-time capture did not capture."""
+        return {
+            path
+            for images in self._saved_images.values()
+            for path, url in images.items()
+            if url is None
+        }
+
+    @property
+    def captured_images(self) -> Dict[str, str]:
+        """The URL each sandbox image the main agent's saved messages name
+        was captured to at model time."""
+        return {
+            path: url
+            for images in self._saved_images.values()
+            for path, url in images.items()
+            if url is not None
+        }
 
     def record(self, stop_events: Optional[List[Dict[str, Any]]] = None) -> ProducerRecord:
         """What the finalize stores beside the status that the checkpoint
@@ -1956,8 +1952,8 @@ class RunSSEProducer:
                 self.thread_id,
                 error_message,
                 exc=exc,
-                credential_source=getattr(self.agent_config, "credential_source", None),
                 model=getattr(getattr(self.agent_config, "llm", None), "name", None),
+                config=self.agent_config,
             ),
         )
         self._error_frame = kept_error_frame(frame.data)

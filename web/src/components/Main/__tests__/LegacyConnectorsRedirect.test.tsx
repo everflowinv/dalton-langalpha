@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
+import { renderWithProviders } from '@/test/utils';
 import Main, { LegacyConnectorsRedirect } from '../Main';
 
 // DALTON-HOOK(hide-trading): mock Main dependencies to test /orders route redirect
@@ -61,11 +62,12 @@ describe('LegacyConnectorsRedirect', () => {
 
   // DALTON-HOOK(hide-trading): /orders route redirects and never mounts Orders page
   it('redirects /orders away from /orders and does not mount Orders page', async () => {
-    render(
-      <MemoryRouter initialEntries={['/orders']}>
+    renderWithProviders(
+      <>
         <Main />
         <LocationProbe />
-      </MemoryRouter>,
+      </>,
+      { route: '/orders' },
     );
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).not.toBe('/orders');
@@ -75,11 +77,12 @@ describe('LegacyConnectorsRedirect', () => {
 
   it('redirects /orders to /chat when VITE_DALTON_MODE=1', async () => {
     vi.stubEnv('VITE_DALTON_MODE', '1');
-    render(
-      <MemoryRouter initialEntries={['/orders']}>
+    renderWithProviders(
+      <>
         <Main />
         <LocationProbe />
-      </MemoryRouter>,
+      </>,
+      { route: '/orders' },
     );
     expect(await screen.findByTestId('chat-page')).toBeInTheDocument();
     expect(screen.queryByTestId('orders-page')).not.toBeInTheDocument();

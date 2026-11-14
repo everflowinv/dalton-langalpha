@@ -5,6 +5,7 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSyncUserLocale } from '@/hooks/useSyncUserLocale';
 import { ContextOverflowPill } from '@/components/ui/ContextOverflowPill';
 import NetworkBanner from '@/components/NetworkBanner/NetworkBanner';
+import ClaudeCodeAnnouncement from '@/components/ClaudeCodeAnnouncement/ClaudeCodeAnnouncement';
 import { StaleBuildBoundary } from '@/components/StaleBuildBoundary';
 import { lazyWithMotion, preloadableLazy } from '@/lib/lazyWithMotion';
 import type { AppSection } from '@/lib/appRoutes';
@@ -63,12 +64,7 @@ const routePreloads = {
 export function preloadRouteChunk(pathname: string): void {
   const chunkFor: Record<string, () => Promise<unknown>> = routePreloads;
   const segment = pathname.split('/')[1] || 'dashboard';
-  // Swallowed on purpose, but it must be caught: a deploy deletes the previous
-  // build's chunks, so this rejects routinely for a stale tab, and an unhandled
-  // rejection is noise that hides real ones. The failure still surfaces — Vite
-  // fires vite:preloadError (index.html reports it), and React.lazy retries the
-  // same import at mount, where StaleBuildBoundary catches it.
-  void (chunkFor[segment] ?? routePreloads.dashboard)().catch(() => {});
+  void (chunkFor[segment] ?? routePreloads.dashboard)();
 }
 
 // Warmed in the order the rail lists them, the likeliest next stops first.
@@ -89,10 +85,7 @@ function useWarmSections(): void {
     };
     const warm = (i: number) => {
       if (cancelled || i >= WARM_ORDER.length) return;
-      // A failed warm is the mount's to retry (see preloadRouteChunk).
-      void routePreloads[WARM_ORDER[i]]()
-        .catch(() => {})
-        .then(() => idle(() => warm(i + 1)));
+      void routePreloads[WARM_ORDER[i]]().then(() => idle(() => warm(i + 1)));
     };
     idle(() => warm(0));
     return () => {
@@ -170,6 +163,7 @@ function Main() {
     return (
       <div className="main" style={{ height: '100%' }}>
         <NetworkBanner />
+        <ClaudeCodeAnnouncement />
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
           {routes}
         </div>
@@ -181,6 +175,7 @@ function Main() {
   return (
     <div className="main">
       <NetworkBanner />
+      <ClaudeCodeAnnouncement />
       {/* Keyed on the section so a new one mounts fresh. It swaps in at once:
           the page under it draws in its final frame, and a fade over that
           only delays it. */}

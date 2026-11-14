@@ -872,6 +872,8 @@ describe('Dalton Team Sharing', () => {
   });
 
   it('does not send POST /seen in colleague mode or before workspace ownership is confirmed', () => {
+    const focusSpy = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    onTestFinished(() => focusSpy.mockRestore());
     applySnapshot({
       as_of_seq: 10,
       oldest_included_unseen_seq: 0,

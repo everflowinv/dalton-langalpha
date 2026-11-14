@@ -4,30 +4,290 @@ import type { ButtonHTMLAttributes, CSSProperties, ReactNode, Ref } from 'react'
 import { FileText, RotateCcw, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Loader } from '@/components/ui/loader';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useLocale } from '@/hooks/useLocale';
+import { useObjectUrl } from '@/hooks/useObjectUrl';
+import { formatBytes } from '@/lib/format';
 import { motion, useIsPresent } from '@/lib/framer';
 import { cn } from '@/lib/utils';
 import ImageLightbox from '@/pages/ChatAgent/components/ImageLightbox';
+import { isImageFile } from '@/pages/ChatAgent/utils/fileUpload';
+import type { UploadFailure } from '@/pages/ChatAgent/utils/partUpload';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import { WidgetContextDeck } from '@/pages/Dashboard/widgets/framework/WidgetContextDeck';
 import { CHIP_PRESENCE, MENU_PRESENCE, getSlashCommandIcon } from './chat-input.helpers';
 import { SUBAGENT_CORE, SUBAGENT_SEATS } from './subagents-rings.geometry';
-import type { FileAttachment, SlashCommand } from './chat-input.types';
+import type { FileAttachment, SlashCommand, TileUpload } from './chat-input.types';
 
-const formatFileSize = (bytes: number): string => {
-  if (bytes === 0) return '0 Bytes';
-  const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
+/** A ring of `percent` around nothing, over an uploading image's thumbnail. */
+function ProgressRing({ percent }: { percent: number }) {
+  const r = 11;
+  const c = 2 * Math.PI * r;
+  return (
+    <svg width={28} height={28} viewBox="0 0 28 28" aria-hidden className="-rotate-90">
+      <circle cx={14} cy={14} r={r} fill="none" strokeWidth={2.5} className="stroke-white/30" />
+      <circle
+        cx={14}
+        cy={14}
+        r={r}
+        fill="none"
+        strokeWidth={2.5}
+        strokeLinecap="round"
+        strokeDasharray={c}
+        strokeDashoffset={c * (1 - percent / 100)}
+        className="stroke-white transition-[stroke-dashoffset] duration-quick ease-out"
+      />
+    </svg>
+  );
+}
 
-/* --- FILE PREVIEW CARD ---
- * Its root is a motion element: rendered as a child of an AnimatePresence, it
- * plays CHIP_PRESENCE on the way in and on the way out. */
-// DALTON-HOOK(chat-large-upload): show chunked upload progress, cancel/remove, and failure + retry
+/* --- FILE TILES ---
+ * A file uploads from the moment it is added (via staged #782 or Dalton
+ * chunked multipart upload), and its tile shows how far it has gone: a ring
+ * over an image, a thin bar under any other file's name, and once failed,
+ * why, with a way to send it again. Each tile's root is a motion element:
+ * rendered as a child of an AnimatePresence, it plays CHIP_PRESENCE on the
+ * way in and on the way out. */
+
+const FAILURE_KEYS = {
+  send: 'chat.composer.attachment.sendFailed',
+  tooLarge: 'chat.composer.attachment.tooLarge',
+  refused: 'chat.composer.attachment.failed',
+  unknown: 'chat.composer.attachment.failed',
+} as const satisfies Record<UploadFailure['kind'], string>;
+
+// DALTON-HOOK(chat-large-upload): normalize legacy Dalton uploadStatus fixtures alongside staged #782 uploads
+/** Normalize legacy Dalton `uploadStatus` fixtures to `TileUpload`. */
+function resolveTileUpload(file: FileAttachment): TileUpload {
+  if (file.upload) return file.upload;
+  if (file.uploadStatus === 'complete') return { status: 'ready', attachmentId: file.uploadId ?? '' };
+  if (file.uploadStatus === 'error') {
+    return { status: 'failed', failure: { kind: 'refused', message: file.errorMessage ?? null } };
+  }
+  return { status: 'uploading', percent: typeof file.uploadProgress === 'number' ? file.uploadProgress : 0 };
+}
+
+/** A failure in the current language; the server's own words when it gave them. */
+function failureText(t: TFunction, failure: UploadFailure): string {
+  return (failure.kind === 'refused' && failure.message) || t(FAILURE_KEYS[failure.kind]);
+}
+
+type TileProps = { file: FileAttachment; onRemove: (id: string) => void; onRetry?: (id: string) => void };
+
+/** The upload's state, over an image's thumbnail or inline under another file's name. */
+function UploadState({ file, variant, onRetry }: Omit<TileProps, 'onRemove'> & { variant: 'overlay' | 'inline' }) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const size = formatBytes(file.file.size, locale);
+  const overlay = variant === 'overlay';
+  const caption = (text: string, saving = false) => (
+    <p
+      className={cn(
+        'flex items-center gap-1 text-[0.625rem] tabular-nums',
+        overlay ? 'text-white/90' : 'text-(--color-text-tertiary)',
+      )}
+      title={file.file.name}
+    >
+      <span className="truncate">{text}</span>
+      {saving && !overlay && <Loader size={10} label={t('chat.composer.attachment.saving')} style={{ color: 'inherit' }} />}
+    </p>
+  );
+  const strip = (children: ReactNode) => (
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-linear-to-t from-black/70 to-transparent px-2 pb-1.5 pt-4">{children}</div>
+  );
+  const upload = resolveTileUpload(file);
+
+  switch (upload.status) {
+    // DALTON-HOOK(chat-large-upload): show uploading progress overlay and progress bar for chunked & staged uploads
+    case 'uploading': {
+      const { percent } = upload;
+      const meta = percent === null ? size : `${size} · ${percent}%`;
+      if (overlay) {
+        return (
+          <div data-testid="attachment-uploading" className="pointer-events-none">
+            <div className="absolute inset-0 flex items-center justify-center text-white">
+              {percent === null
+                ? <Loader size={16} label={t('chat.composer.attachment.saving')} className="text-white" />
+                : <ProgressRing percent={percent} />}
+            </div>
+            {strip(caption(meta))}
+          </div>
+        );
+      }
+      return (
+        <div data-testid="attachment-uploading">
+          {caption(meta, percent === null)}
+          <div className="h-0.5 w-full overflow-hidden rounded-full bg-(--color-border-muted)" aria-hidden>
+            <div
+              className="h-full rounded-full bg-(--color-text-tertiary) transition-[width] duration-quick ease-out"
+              style={{ width: `${percent ?? 100}%` }}
+            />
+          </div>
+        </div>
+      );
+    }
+    case 'ready':
+      return overlay ? strip(caption(size)) : caption(size);
+    case 'failed': {
+      const reason = failureText(t, upload.failure);
+      const failure = (
+        <div data-testid="attachment-upload-error" className="pointer-events-auto relative flex min-w-0 flex-col items-start gap-0.5">
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <p
+                  tabIndex={0}
+                  className={cn('w-full truncate text-[0.625rem] leading-tight', overlay ? 'text-white' : 'text-(--color-loss)')}
+                >
+                  {reason}
+                </p>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="max-w-64">{reason}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+          {/* DALTON-HOOK(chat-large-upload): retry button triggers per-file re-upload for failed staged or chunked uploads */}
+          <button
+            type="button"
+            data-testid="attachment-retry-upload"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRetry?.(file.id);
+            }}
+            className={cn(
+              'tap-target inline-flex items-center gap-1 rounded text-[0.625rem] font-medium underline-offset-2 hover:underline',
+              overlay ? 'text-white' : 'text-(--color-text-primary)',
+            )}
+          >
+            <RotateCcw className="w-2.5 h-2.5" aria-hidden />
+            {t('chat.composer.attachment.retry')}
+          </button>
+        </div>
+      );
+      return overlay ? (
+        <div className="absolute inset-x-0 bottom-0 bg-linear-to-t from-black/75 to-transparent px-2 pb-1.5 pt-4">{failure}</div>
+      ) : failure;
+    }
+  }
+}
+
+/** The tile around either kind of file: its name for assistive tech, the failed border, and remove. */
+function TileShell({ file, onRemove, children }: Omit<TileProps, 'onRetry'> & { children: ReactNode }) {
+  const { t } = useTranslation();
+  const isMobile = useIsMobile();
+  const upload = resolveTileUpload(file);
+  const name = file.file.name;
+  const label = upload.status === 'uploading'
+    ? t('chat.composer.attachment.uploadingLabel', { name, percent: upload.percent ?? 100 })
+    : upload.status === 'failed'
+      ? t('chat.composer.attachment.failedLabel', { name, error: failureText(t, upload.failure) })
+      : name;
+  const failed = upload.status === 'failed';
+  return (
+    <motion.div
+      {...CHIP_PRESENCE}
+      role="group"
+      aria-label={label}
+      data-status={upload.status}
+      className={cn(
+        'relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border bg-(--color-bg-elevated) transition-colors',
+        failed ? 'border-(--color-border-loss)' : 'border-(--color-border-muted) hover:border-(--color-border-default)',
+      )}
+    >
+      {children}
+      {/* DALTON-HOOK(composer-attachment-preview): Remove Button Overlay —
+          stopPropagation keeps the remove a remove, never a preview open. */}
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onRemove(file.id); }}
+        aria-label={t('chat.composer.remove')}
+        // The tile clips what reaches past its corner, so the finger's box
+        // moves in by that much and keeps its whole 44px inside the tile.
+        className={cn(
+          'tap-target [--tap-target-x:-8px] [--tap-target-y:8px] z-20 absolute top-1 right-1 p-1 bg-black/50 hover:bg-black/70 rounded-full text-white transition-opacity',
+          isMobile || failed ? 'opacity-60' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100',
+        )}
+      >
+        <X className="w-3 h-3" />
+      </button>
+    </motion.div>
+  );
+}
+
+/**
+ * An image's tile. The thumbnail opens the lightbox; the strip along the
+ * bottom (size, or why it failed and Retry) sits beside that target rather
+ * than over it, so Retry never zooms.
+ */
+function ImageTile({ file, onRemove, onRetry }: TileProps) {
+  const { t } = useTranslation();
+  const objectSrc = useObjectUrl(file.preview ? undefined : file.file);
+  const src = file.preview ?? objectSrc;
+  // DALTON-HOOK(composer-attachment-preview): open shared ImageLightbox with trapFocus
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const busy = resolveTileUpload(file).status !== 'ready';
+  return (
+    <TileShell file={file} onRemove={onRemove}>
+      <button
+        type="button"
+        onClick={(e) => {
+          // The composer's container focuses its textarea on any click that
+          // reaches it, which would hand the next Enter to the send handler
+          // under the open preview (and pop the mobile keyboard); the preview
+          // dialog takes focus itself, so the opening click stops here.
+          e.stopPropagation();
+          setPreviewOpen(true);
+        }}
+        aria-label={t('chat.composer.previewImage')}
+        className="group/preview relative block w-full h-full rounded-xl border-none bg-transparent p-0 cursor-zoom-in focus-visible:outline-hidden"
+      >
+        {src && <img src={src} alt={file.file.name} className="w-full h-full object-cover" />}
+        <span
+          aria-hidden
+          className={cn('pointer-events-none absolute inset-0 transition-colors', busy ? 'bg-black/45' : 'bg-black/20 group-hover:bg-black/0')}
+        />
+        {/* Focus indicator as its own layer, after the image in DOM order:
+            a ring on the button itself is an inset box-shadow, painted under
+            the full-bleed image it would mark. */}
+        <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-inset ring-(--color-focus-ring) opacity-0 group-focus-visible/preview:opacity-100" />
+      </button>
+      <UploadState file={file} variant="overlay" onRetry={onRetry} />
+      {src && <ImageLightbox src={src} alt={file.file.name} open={previewOpen} onClose={() => setPreviewOpen(false)} trapFocus />}
+    </TileShell>
+  );
+}
+
+/** Any other file's tile: its extension, its name, and the upload's state under it. */
+function DocTile({ file, onRemove, onRetry }: TileProps) {
+  return (
+    <TileShell file={file} onRemove={onRemove}>
+      <div className="w-full h-full p-3 flex flex-col justify-between">
+        <div className="flex items-center gap-2">
+          <div className="p-1.5 rounded" style={{ background: 'var(--color-border-muted)' }}>
+            <FileText className="w-4 h-4" style={{ color: 'var(--color-text-tertiary)' }} />
+          </div>
+          <span className="text-[0.625rem] font-medium uppercase tracking-wider truncate" style={{ color: 'var(--color-text-tertiary)' }}>
+            {file.file.name.split('.').pop()}
+          </span>
+        </div>
+        <div className="space-y-0.5 min-w-0">
+          <p className="text-xs font-medium truncate" style={{ color: 'var(--color-text-muted)' }} title={file.file.name}>
+            {file.file.name}
+          </p>
+          <UploadState file={file} variant="inline" onRetry={onRetry} />
+        </div>
+      </div>
+    </TileShell>
+  );
+}
+
+export function FileTile(props: TileProps) {
+  return isImageFile({ type: props.file.type, name: props.file.file.name }) ? <ImageTile {...props} /> : <DocTile {...props} />;
+}
+
+// DALTON-HOOK(composer-attachment-preview): keep FilePreviewCard alias for existing callers and tests
 export const FilePreviewCard = ({
   file,
   onRemove,
@@ -36,156 +296,7 @@ export const FilePreviewCard = ({
   file: FileAttachment;
   onRemove: (id: string) => void;
   onRetry?: (id: string) => void;
-}) => {
-  const { t } = useTranslation();
-  const isMobilePreview = useIsMobile();
-  const isImage = file.type.startsWith('image/') && file.preview;
-  const isError = file.uploadStatus === 'error';
-  const isUploading = file.uploadStatus === 'uploading';
-  const progressPct =
-    typeof file.uploadProgress === 'number'
-      ? Math.max(0, Math.min(100, Math.round(file.uploadProgress)))
-      : null;
-  // DALTON-HOOK(composer-attachment-preview): the thumbnail opens the shared
-  // ImageLightbox, the one workspace images already use — the 96px card alone
-  // gave no way to look at an attached image again. A double click re-sets the
-  // same state, so it cannot open twice.
-  const [previewOpen, setPreviewOpen] = useState(false);
-
-  return (
-    <motion.div
-      {...CHIP_PRESENCE}
-      className={cn(
-        'relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border bg-(--color-bg-elevated) transition-colors',
-        isError
-          ? 'border-(--color-border-loss)'
-          : 'border-(--color-border-muted) hover:border-(--color-border-default)',
-      )}
-    >
-      {isImage ? (
-        <button
-          type="button"
-          onClick={(e) => {
-            // The composer's container focuses its textarea on any click that
-            // reaches it, which would hand the next Enter to the send handler
-            // under the open preview (and pop the mobile keyboard); the preview
-            // dialog takes focus itself, so the opening click stops here.
-            // Keyboard activation reaches this same handler as a click.
-            e.stopPropagation();
-            setPreviewOpen(true);
-          }}
-          aria-label={t('chat.composer.previewImage')}
-          className="group/preview relative block w-full h-full rounded-xl border-none bg-transparent p-0 cursor-zoom-in focus-visible:outline-hidden"
-        >
-          <img src={file.preview!} alt={file.file.name} className="w-full h-full object-cover" />
-          <span className="pointer-events-none absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
-          {/* Focus indicator as its own layer, after the image in DOM order:
-              a ring on the button itself is an inset box-shadow, painted under
-              the full-bleed image it would mark (same shape as the ::after
-              focus ring in HandoffParts' STRETCHED_BUTTON). */}
-          <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-inset ring-(--color-focus-ring) opacity-0 group-focus-visible/preview:opacity-100" />
-        </button>
-      ) : (
-        <div className="w-full h-full p-3 flex flex-col justify-between">
-          <div className="flex items-center gap-2">
-            <div className="p-1.5 rounded" style={{ background: 'var(--color-border-muted)' }}>
-              <FileText className="w-4 h-4" style={{ color: 'var(--color-text-tertiary)' }} />
-            </div>
-            <span className="text-[0.625rem] font-medium uppercase tracking-wider truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-              {file.file.name.split('.').pop()}
-            </span>
-          </div>
-          <div className="space-y-0.5">
-            <p className="text-xs font-medium truncate" style={{ color: 'var(--color-text-muted)' }} title={file.file.name}>
-              {file.file.name}
-            </p>
-            <p className="text-[0.625rem]" style={{ color: 'var(--color-text-tertiary)' }}>
-              {formatFileSize(file.file.size)}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* DALTON-HOOK(composer-attachment-preview): Remove Button Overlay —
-          stopPropagation keeps the remove a remove, never a preview open. */}
-      <button
-        type="button"
-        onClick={(e) => { e.stopPropagation(); onRemove(file.id); }}
-        aria-label={t('chat.composer.remove')}
-        className={`z-20 absolute top-1 right-1 p-1 bg-black/60 hover:bg-black/80 rounded-full text-white transition-opacity ${
-          isMobilePreview || isUploading || isError ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
-        }`}
-      >
-        <X className="w-3 h-3" />
-      </button>
-
-      {/* DALTON-HOOK(chat-large-upload): Upload progress & error retry overlays */}
-      {isUploading && (
-        <div
-          data-testid="attachment-uploading"
-          className="absolute inset-0 z-10 bg-black/55 flex flex-col items-center justify-center gap-1 pointer-events-none"
-        >
-          <Loader size={18} label={t('chat.composer.uploading')} className="text-white" />
-          {progressPct !== null && (
-            <span className="text-[0.625rem] font-medium tabular-nums text-white">
-              {progressPct}%
-            </span>
-          )}
-          {progressPct !== null && (
-            <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
-              <div
-                className="h-full transition-[width]"
-                style={{
-                  width: `${progressPct}%`,
-                  background: 'var(--color-accent-primary)',
-                }}
-              />
-            </div>
-          )}
-        </div>
-      )}
-
-      {isError && (
-        <div
-          data-testid="attachment-upload-error"
-          title={file.errorMessage || t('chat.composer.uploadFailed')}
-          className="absolute inset-0 z-10 bg-black/75 flex flex-col items-center justify-center gap-1.5 px-1.5 text-center"
-        >
-          <span className="text-[0.625rem] font-medium leading-tight text-(--color-loss) line-clamp-2">
-            {t('chat.composer.uploadFailed')}
-          </span>
-          {onRetry && (
-            <button
-              type="button"
-              data-testid="attachment-retry-upload"
-              onClick={(e) => {
-                e.stopPropagation();
-                onRetry(file.id);
-              }}
-              aria-label={t('chat.composer.retryUpload')}
-              className="inline-flex items-center gap-1 rounded-md bg-white/15 hover:bg-white/25 px-2 py-0.5 text-[0.625rem] font-medium text-white transition-colors"
-            >
-              <RotateCcw className="w-2.5 h-2.5" />
-              <span>{t('chat.composer.retryUpload')}</span>
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* DALTON-HOOK(composer-attachment-preview): the full-size view the
-          thumbnail button opens; Esc, the backdrop, or the × closes it. */}
-      {isImage && (
-        <ImageLightbox
-          src={file.preview!}
-          alt={file.file.name}
-          open={previewOpen}
-          onClose={() => setPreviewOpen(false)}
-          trapFocus
-        />
-      )}
-    </motion.div>
-  );
-};
+}) => <FileTile file={file} onRemove={onRemove} onRetry={onRetry ?? (() => {})} />;
 
 /**
  * The single composer pill: every labeled control in the action bar (scope,

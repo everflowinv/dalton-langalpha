@@ -41,7 +41,9 @@ import { invalidateNewWorkspace } from './workspaceRowActions';
 import { ensureThreadId } from '../session/threadCreation';
 export { removeStoredThreadId } from './utils/threadStorage';
 // DALTON-HOOK(chat-large-upload): normalize server-verified and caller-owned steer attachments
-import { carriesContext, createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, mergeAcceptedAttachments, normalizeAttachments, type AttachmentMeta } from './utils/messageHelpers';
+import { carriesContext, createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, mergeAcceptedAttachments, normalizeAttachments } from './utils/messageHelpers';
+import { namesStagedFiles, stagedFilesOf, type AttachmentMeta } from '../utils/fileUpload';
+import { discardAttachment, freshenStaged } from '../utils/attachmentUpload';
 import type { HitlResponseBody } from '@/types/api';
 import type { AssistantMessage, UserMessage, ChatMessage } from '@/types/chat';
 import type { ArtifactCommentsShown } from '@/types/api';
@@ -286,7 +288,7 @@ export function useChatMessages(
   const queuedSendRef = useRef<{
     message: string;
     additionalContext: Record<string, unknown>[] | null;
-    attachmentMeta: Record<string, unknown>[] | null;
+    attachmentMeta: AttachmentMeta[] | null;
     modelOptions: SendOptions;
     // id of the optimistic shimmer bubble shown while parked, so it can be
     // removed on flush (before the real send re-adds it) or on stop.
@@ -319,7 +321,7 @@ export function useChatMessages(
     gen: number;
     message: string;
     additionalContext: Record<string, unknown>[] | null;
-    attachmentMeta: Record<string, unknown>[] | null;
+    attachmentMeta: AttachmentMeta[] | null;
     modelOptions: SendOptions;
     requestKey: string;
     /** The steer's bubble, which waits on screen until its send replaces it. */
@@ -332,10 +334,15 @@ export function useChatMessages(
      * queue — so a composer behind the send settles by what really went out.
      */
     settleQueued?: (sent: boolean) => void;
+    /** Its files checked as it goes out, and staged again if they were old. */
+    fresh?: boolean;
   }[]>([]);
   // Orders the queue above by when each message was sent: refusals come back
   // on separate POSTs, in whatever order those answer.
   const steerSeqRef = useRef(0);
+  // The head of that queue while its files are staged again, which holds the
+  // rest behind it.
+  const freshening = useRef<object | null>(null);
   // Ends the queue above, and any refusal still on its way to it. The queue
   // lives with its own thread's view, so only an in-place thread switch ends
   // it: the '__default__' → real id move of a new chat's first send keeps it,
@@ -2217,7 +2224,13 @@ export function useChatMessages(
    */
   const giveBackStoppedSteers = (
     returned: readonly HeldSteer[],
-    unsent: readonly { message: string; steerId: string }[],
+    unsent: readonly {
+      message: string;
+      steerId: string;
+      additionalContext?: Record<string, unknown>[] | null;
+      attachmentMeta?: AttachmentMeta[] | null;
+      modelOptions?: SendOptions;
+    }[],
     // DALTON-HOOK(composer-drafts): request keys of steers still in flight
     // with a composer draft behind them — their POST's own not-taken settle
     // seats the copy back whole, so the text channel must skip them or the
@@ -2256,9 +2269,25 @@ export function useChatMessages(
       // DALTON-HOOK(composer-drafts): text channel skips draft-owned returns.
       if (steer.content && !ownedByDraft) texts.push(steer.content);
     }
-    for (const u of unsent) texts.push(u.message);
+    // One that never went comes back as the composer held it, its pills and
+    // files with its text; one sent without that, as the text that went.
+    const drafts: ComposerDraft[] = [];
+    for (const u of unsent) {
+      const draft = u.modelOptions?.draft;
+      if (draft) drafts.push(draft);
+      else texts.push(u.message);
+    }
     if (drop.size > 0) setMessages((prev) => prev.filter((m) => !drop.has(m.id as string)));
     if (texts.length > 0) giveBackSteering(texts.join('\n'));
+    const files = unsent.flatMap((u) => (u.modelOptions?.draft ? [] : stagedFilesOf(u.additionalContext, u.attachmentMeta)));
+    if (drafts.length > 0 || files.length > 0) {
+      setReturnedDraft((prev) => ({
+        text: [prev?.text, ...drafts.map((d) => d.text)].filter(Boolean).join('\n'),
+        files: [...(prev?.files ?? []), ...drafts.flatMap((d) => d.files), ...files],
+        mentions: [...(prev?.mentions ?? []), ...drafts.flatMap((d) => d.mentions)],
+        commands: [...(prev?.commands ?? []), ...drafts.flatMap((d) => d.commands)],
+      }));
+    }
   };
 
   /**
@@ -2392,7 +2421,7 @@ export function useChatMessages(
   const handleSendSteering = async (
     message: string,
     additionalContext: Record<string, unknown>[] | null = null,
-    attachmentMeta: Record<string, unknown>[] | null = null,
+    attachmentMeta: AttachmentMeta[] | null = null,
     modelOptions: SendOptions = {},
     resend: Resend = {},
     // DALTON-HOOK(composer-drafts): acceptance callback for the composer's draft lifecycle
@@ -2419,7 +2448,7 @@ export function useChatMessages(
     // key for its own re-send.
     const requestKey = requestKeys.take(sendFingerprint(threadId, message, commentSend), { alongside: true, key: resend.requestKey, comments: artifactComments });
     const userMessage: ChatMessage = {
-      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta as AttachmentMeta[] | null, widgetSnapshots, chartSelections, artifactComments, id: resend.shown?.userId }),
+      ...createUserMessage(message, steeredTurn, { attachments: attachmentMeta, widgetSnapshots, chartSelections, artifactComments, id: resend.shown?.userId }),
       steering: true,
       requestKey,
       ...(currentRunIdRef.current ? { steeredRunId: currentRunIdRef.current } : {}),
@@ -2629,7 +2658,7 @@ export function useChatMessages(
     gen: number,
     message: string,
     additionalContext: Record<string, unknown>[] | null,
-    attachmentMeta: Record<string, unknown>[] | null,
+    attachmentMeta: AttachmentMeta[] | null,
     modelOptions: SendOptions,
     requestKey: string,
     seq: number,
@@ -2670,25 +2699,27 @@ export function useChatMessages(
   /**
    * A message sent while refused steers wait to go out joins them, behind the
    * last: the first of them opens the next turn, and steered into that turn
-   * this one would reach the model ahead of the others, typed before it.
+   * this one would reach the model ahead of the others, typed before it. So
+   * does one naming staged files while a turn runs, which a steer cannot
+   * carry: it opens the next turn itself.
    */
   const queueBehindRefused = (
     message: string,
     additionalContext: Record<string, unknown>[] | null,
-    attachmentMeta: Record<string, unknown>[] | null,
+    attachmentMeta: AttachmentMeta[] | null,
     modelOptions: SendOptions,
-    shown?: ShownBubbles,
+    { requestKey: key, shown }: Resend = {},
     // DALTON-HOOK(composer-drafts): resolves the queueing call's deferred boolean.
     settleQueued?: (sent: boolean) => void,
   ): void => {
     // Parked with the others, it holds its comments until it goes out.
     const requestKey = requestKeys.take(
       sendFingerprint(threadId, message, commentSendOf(modelOptions.artifactComments)),
-      { alongside: true, comments: modelOptions.artifactComments },
+      { alongside: true, key, comments: modelOptions.artifactComments },
     );
     const waiting: ChatMessage = {
       ...createUserMessage(message, newestTurn(liveMessages.get()) ?? undefined, {
-        attachments: attachmentMeta as AttachmentMeta[] | null,
+        attachments: attachmentMeta,
         widgetSnapshots: modelOptions.widgetSnapshots,
         chartSelections: modelOptions.chartSelections,
         artifactComments: modelOptions.artifactComments,
@@ -2820,7 +2851,7 @@ export function useChatMessages(
   };
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: AttachmentMeta[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, onNotTaken, onReturnedUnsent, keepFullContext = false, chartViews }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
     // What the request carries, and a resend of it again.
     const commentSend = commentSendOf(artifactComments);
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0) || !!commentSend;
@@ -2869,7 +2900,7 @@ export function useChatMessages(
       queuedSendRef.current?.settleQueued(false);
       // A placeholder: the send it becomes adds a bubble of its own.
       const queuedMsg = createUserMessage(message, undefined, {
-        attachments: attachmentMeta as AttachmentMeta[] | null,
+        attachments: attachmentMeta,
         widgetSnapshots,
         chartSelections,
         artifactComments,
@@ -2903,7 +2934,8 @@ export function useChatMessages(
         message,
         additionalContext,
         attachmentMeta,
-        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext, chartViews },
+        // The draft rides along, for a stop to give back as the composer held it.
+        modelOptions: { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, artifactComments, keepFullContext, chartViews, draft },
         messageId: queuedMessage.id as string,
         requestKey,
         onAccepted,
@@ -2934,7 +2966,22 @@ export function useChatMessages(
         : null;
       // DALTON-HOOK(composer-drafts): as above — the resolver rides the entry
       // only when a composer is behind it.
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, onAccepted, onHandedOff, onNotTaken }, resend.shown, outcome ? resolveQueued : undefined);
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, { shown: resend.shown }, outcome ? resolveQueued : undefined);
+      return outcome ?? true;
+    }
+
+    // A steer reaches the running turn as its text alone, so the server
+    // refuses one naming staged files. Such a send waits instead and opens
+    // the next turn, as a refused steer does, behind any sent before it; a
+    // stop gives its files back to the composer with its text.
+    if (isLoading && namesStagedFiles(additionalContext)) {
+      let resolveQueued: (sent: boolean) => void = () => {};
+      const outcome = onAccepted
+        ? new Promise<boolean>((resolve) => {
+            resolveQueued = resolve;
+          })
+        : null;
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, chartViews, draft, onAccepted, onHandedOff, onNotTaken }, resend, outcome ? resolveQueued : undefined);
       return outcome ?? true;
     }
 
@@ -2951,7 +2998,7 @@ export function useChatMessages(
     // it carries, since the empty query it stores draws no row to match.
     const turnIndex = newestKnownTurn() + 1;
     const userMessage = hiddenOpener ? null : createUserMessage(message, turnIndex, {
-      attachments: attachmentMeta as AttachmentMeta[] | null,
+      attachments: attachmentMeta,
       widgetSnapshots,
       chartSelections,
       artifactComments,
@@ -3372,6 +3419,41 @@ export function useChatMessages(
     if (!next) return;
     for (const [seq, gen] of steersInFlightRef.current) {
       if (seq < next.seq && gen === next.gen) return;
+    }
+    if (freshening.current) return;
+    // Held while a long turn ran, a file may be near the time the server
+    // keeps it unsent: it is staged again first, as the composer would.
+    if (!next.fresh && !namesStagedFiles(next.additionalContext)) next.fresh = true;
+    if (!next.fresh) {
+      freshening.current = next;
+      void freshenStaged(next.additionalContext, next.attachmentMeta, workspaceId).then((parts) => {
+        freshening.current = null;
+        // Stopped or left meanwhile: what was staged again is not needed, and
+        // whatever queued since waited on this one.
+        if (!notRunningSendsRef.current.includes(next)) {
+          for (const r of parts?.restaged.values() ?? []) discardAttachment(r.attachmentId);
+          setNotRunningTick((n) => n + 1);
+          return;
+        }
+        if (parts) {
+          next.additionalContext = parts.contexts;
+          next.attachmentMeta = parts.meta;
+          const draft = next.modelOptions.draft;
+          if (draft && parts.restaged.size > 0) {
+            next.modelOptions = { ...next.modelOptions, draft: { ...draft, files: draft.files.map((f) => ({ ...f, ...parts.restaged.get(f.attachmentId) })) } };
+          }
+          next.fresh = true;
+        } else {
+          // Gone from the server and not staged again: back to the composer,
+          // where sending again uploads it.
+          notRunningSendsRef.current.splice(notRunningSendsRef.current.indexOf(next), 1);
+          requestKeys.spend(next.requestKey);
+          requestKeys.settle(next.requestKey, 'dropped');
+          giveBackStoppedSteers([], [next]);
+        }
+        setNotRunningTick((n) => n + 1);
+      });
+      return;
     }
     queue.shift();
     // The send's bubble takes the waiting one's place, in the same batch.

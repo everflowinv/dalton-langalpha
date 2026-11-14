@@ -143,9 +143,15 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Takes tunnels no computer uses off their machines; a claim on each
     # tunnel's row in Postgres dedups it across workers.
     ("TunnelSweeper", "src.server.services.ssh_tunnel_sweep"),
+    # Deletes sandboxes a create gave up on once their provider lets it; a
+    # claim on each row in Postgres dedups it across workers.
+    ("AbandonedSandboxSweeper", "src.server.services.abandoned_sandbox_sweep"),
     # Ends uploads their browser abandoned and takes over pulls whose worker
     # died; a claim on each upload's row in Postgres dedups it across workers.
     ("UploadSweeper", "src.server.services.workspace_upload_pull"),
+    # Ends chat attachments their composer abandoned and drops the bytes of
+    # ones past use; a claim on each row in Postgres dedups it across workers.
+    ("AttachmentSweeper", "src.server.services.chat_attachments"),
     # Follows handed-off background commands to their end and keeps their
     # computers up while covered; claims on each command's row in Postgres
     # dedup it across workers.
@@ -490,6 +496,14 @@ async def lifespan(app: FastAPI):
         install_client_key_loader()
         install_gateway_loader()
 
+        # A create that fails may still leave a sandbox running; the provider
+        # records it for the sweep, in whichever worker the create ran.
+        from src.server.services.abandoned_sandbox_sweep import (
+            install_abandoned_sink,
+        )
+
+        install_abandoned_sink()
+
         # Platform-secret migration sweep: converges running sandboxes left
         # behind the fleet generation (always-on sandboxes never re-init, so
         # only this sweep ever scrubs them). Inert without an active catalog.
@@ -623,7 +637,7 @@ async def lifespan(app: FastAPI):
     from src.server.services import automation_executor
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
-    from src.server.services import automation_settlement, idle_compaction, thread_lifecycle_feed
+    from src.server.services import automation_settlement, idle_compaction, notices, thread_lifecycle_feed
     from src.server.services.features import register_feature_off_hook
     from src.server.services.hook_outbox import HookOutboxDrainer
     from src.server.services.market_targets import delivery as market_target_delivery
@@ -640,6 +654,7 @@ async def lifespan(app: FastAPI):
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
     market_target_delivery.register_outbox_executors()
+    notices.register_outbox_executors()
     # Registered with push off too: its rows then ack as no-ops.
     push_notify.register_outbox_executors()
     idle_compaction.register_outbox_executors()
@@ -1526,6 +1541,7 @@ from src.server.app.computers_ssh import router as computers_ssh_router
 from src.server.app.workspaces import router as workspaces_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
+from src.server.app.attachments import router as attachments_router
 from src.server.app.workspace_sandbox import router as workspace_sandbox_router
 from src.server.app.chart_annotations import router as chart_annotations_router
 from src.server.app.artifact_frames import frame_router as artifact_frame_router
@@ -1610,6 +1626,9 @@ app.include_router(
 app.include_router(
     workspace_files_router
 )  # /api/v1/workspaces/{id}/files/* - Live file access
+app.include_router(
+    attachments_router
+)  # /api/v1/attachments/* - Chat composer attachments, uploaded before the message
 app.include_router(
     workspace_sandbox_router
 )  # /api/v1/workspaces/{id}/sandbox/* - Sandbox stats & packages

@@ -335,6 +335,34 @@ async def test_delete_user_preferences(user_mock_db, mock_cursor):
 
 
 @pytest.mark.asyncio
+async def test_delete_user_preferences_keeps_the_overrides_it_is_told_to(user_mock_db, mock_cursor):
+    """Reset keeps a server-written grant, and nothing else of the row."""
+    from src.server.database.user import delete_user_preferences
+
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchone.return_value = {
+        "other_preference": {"theme": "dark", "feature_overrides": {"claude_oauth": True, "market_watch": True}},
+    }
+
+    assert await delete_user_preferences("user-1", keep_overrides=["claude_oauth"]) is True
+    sql, params = mock_cursor.execute.call_args[0]
+    assert "INSERT INTO user_preferences" in sql
+    assert params[0] == "user-1"
+    assert params[1].obj == {"feature_overrides": {"claude_oauth": True}}
+
+
+@pytest.mark.asyncio
+async def test_delete_user_preferences_writes_nothing_back_without_a_kept_override(user_mock_db, mock_cursor):
+    from src.server.database.user import delete_user_preferences
+
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchone.return_value = {"other_preference": {"feature_overrides": {"market_watch": True}}}
+
+    await delete_user_preferences("user-1", keep_overrides=["claude_oauth"])
+    assert "DELETE FROM user_preferences" in mock_cursor.execute.call_args[0][0]
+
+
+@pytest.mark.asyncio
 async def test_delete_user_preferences_not_found(user_mock_db, mock_cursor):
     """delete_user_preferences returns False when no row exists."""
     from src.server.database.user import delete_user_preferences

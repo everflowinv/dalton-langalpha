@@ -6,6 +6,7 @@ user preferences in PostgreSQL.
 """
 
 import logging
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -526,8 +527,9 @@ async def upsert_user(
 _USER_PREFS_TTL = 86400  # 24h — freshness via explicit invalidation
 
 # Cached-shape version, as for the profile below. A migration that rewrites
-# these rows in raw SQL, as 072 renamed the Background slot's keys, passes no
-# application write path, so it bumps this to retire every row cached before.
+# these rows in raw SQL, as 072 renamed the Background slot's keys and 121
+# granted the Claude sign-in, passes no application write path, so it bumps
+# this to retire every row cached before.
 # DALTON-HOOK(prefs-cache-shape): 096 rewrites agent_preference in raw SQL
 # (output_format becomes a ranking) without bumping these, so a cached row
 # would serve the pre-096 value for up to a day after the upgrade.
@@ -845,25 +847,40 @@ async def lock_user_preferences(user_id: str, *, conn) -> Optional[Dict[str, Any
         return dict(row) if row else None
 
 
-async def delete_user_preferences(user_id: str, conn=None) -> bool:  # DALTON-HOOK(data-jobs): allow callers to delete inside an existing transaction and profile lock
+async def delete_user_preferences(  # DALTON-HOOK(data-jobs): allow callers to delete inside an existing transaction and profile lock
+    user_id: str,
+    conn=None,
+    *,
+    keep_overrides: Collection[str] = (),
+) -> bool:
     """
-    Delete all preferences for a user.
+    Delete all preferences for a user, except the ``feature_overrides`` named
+    in ``keep_overrides``, which only the server writes.
 
     Args:
         user_id: User ID
         conn: Optional existing database connection
+        keep_overrides: Server-granted feature_overrides keys to preserve
 
     Returns:
         True if a row was deleted, False if no preferences existed
     """
     async with get_db_connection(conn) as conn, conn.transaction():
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await lock_user_profile(cur, user_id)
             await cur.execute(
-                "DELETE FROM user_preferences WHERE user_id = %s",
+                "DELETE FROM user_preferences WHERE user_id = %s RETURNING other_preference",
                 (user_id,),
             )
             deleted = cur.rowcount > 0
+            row = await cur.fetchone() if deleted and keep_overrides else None
+            overrides = ((row or {}).get("other_preference") or {}).get("feature_overrides")
+            kept = {k: v for k, v in overrides.items() if k in keep_overrides} if isinstance(overrides, dict) else {}
+            if kept:
+                await cur.execute(
+                    "INSERT INTO user_preferences (user_id, other_preference) VALUES (%s, %s)",
+                    (user_id, Json({"feature_overrides": kept})),
+                )
             logger.info(f"[user_db] delete_user_preferences user_id={user_id} deleted={deleted}")
             return deleted
 

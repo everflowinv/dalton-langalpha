@@ -4,15 +4,16 @@ import { useTranslation } from 'react-i18next';
 import Markdown from './Markdown';
 import { useModelName } from '@/hooks/useModelName';
 import { usePlanClock } from '@/hooks/useClaudeCodePlan';
-import type { PlanRefusal } from '@/api/model';
-import { planRefusalText } from '@/lib/claudeCodePlan';
 import { useAnimatedText } from '@/components/ui/animated-text';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import { parseErrorMessage, type ParsedError } from '../utils/parseErrorMessage';
 import type { OpenFileHandler } from '../utils/fileLocation';
-import { UPSTREAM_HINT_I18N_KEY, type StructuredError } from '@/utils/rateLimitError';
+import type { StructuredError } from '@/utils/rateLimitError';
 import { ErrorLink, NoticeLine } from '@/components/ui/error-banner';
+import {
+  planStopCopy, planStopOf, UPSTREAM_HINT_I18N_KEY, upstreamFailureCopy, type PlanStop,
+} from '@/lib/upstreamFailure';
 
 interface TextMessageContentProps {
   content: string;
@@ -79,12 +80,14 @@ function TextMessageContent({ content, isStreaming, onOpenFile, onRevealed }: Te
  * kind is the server's classification, so a classified failure gets its
  * headline from the kind rather than from keywords in its text; only a
  * failure nobody classified (a client-side send failure, an older server's
- * frame) is still read by `parseErrorMessage`. A Claude plan's limit has a
- * headline of its own, over the sentence that says until when.
+ * frame) is still read by `parseErrorMessage`. A Claude plan's limit, and a
+ * subscription's, has a headline of its own, over the sentence that says
+ * until when.
  */
 function TurnErrorCard({ err }: { err: StructuredError }): React.ReactElement {
   const { t } = useTranslation();
-  if (err.planRefusal) return <PlanRefusalCard refusal={err.planRefusal} />;
+  const stop = planStopOf(err);
+  if (stop) return <PlanStopCard stop={stop} />;
   if (err.kind === 'notice') return <NoticeLine message={err.message} className="py-1.5" />;
   if (err.kind === 'upstream') return <StructuredErrorDisplay err={err} />;
   if (err.kind === 'internal') {
@@ -93,14 +96,12 @@ function TurnErrorCard({ err }: { err: StructuredError }): React.ReactElement {
   return <ErrorDisplay parsed={parseErrorMessage(err.message)} />;
 }
 
-function PlanRefusalCard({ refusal }: { refusal: PlanRefusal }): React.ReactElement {
+/** A plan's limit, worded in the reader's zone. A leaf of its own, so the
+ *  plan clock's per-minute tick redraws only this. */
+function PlanStopCard({ stop }: { stop: PlanStop }): React.ReactElement {
   const { t } = useTranslation();
-  const clock = usePlanClock();
-  return (
-    <ErrorDisplay
-      parsed={{ title: t('claudeCodePlan.limitTitle'), detail: planRefusalText(t, refusal, clock), model: null, statusCode: null }}
-    />
-  );
+  const { title, text } = planStopCopy(t, stop, usePlanClock());
+  return <ErrorDisplay parsed={{ title, detail: text, model: null, statusCode: null }} />;
 }
 
 interface ErrorDisplayProps {
@@ -160,8 +161,8 @@ interface StructuredErrorDisplayProps {
  * StructuredErrorDisplay
  *
  * Inline error card for classified upstream-provider failures. Renders the
- * kind-aware headline (with status code when known), the raw error message,
- * and the hint list ("check your API key", etc.). Used instead of the
+ * headline, whose account the failure came from, the provider's message (or a
+ * generic line on credits), and the hint list ("check your API key", etc.). Used instead of the
  * regex-based ``ErrorDisplay`` when the backend has already classified the
  * error source — ``parseErrorMessage`` can't tell "Authentication error" from
  * the provider apart from the kind-routed message our own service returns.
@@ -169,15 +170,8 @@ interface StructuredErrorDisplayProps {
 function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.ReactElement {
   const { t } = useTranslation();
   const name = useModelName();
-  // When the failure is attributable to a specific model, name it in the
-  // headline; otherwise fall back to the generic "model provider" copy.
-  const headline = err.model
-    ? (err.statusCode
-        ? t('chat.errorUpstreamHeadlineModelStatus', { model: name(err.model), status: err.statusCode })
-        : t('chat.errorUpstreamHeadlineModel', { model: name(err.model) }))
-    : (err.statusCode
-        ? t('chat.errorUpstreamHeadlineStatus', { status: err.statusCode })
-        : t('chat.errorUpstreamHeadline'));
+  // Worded by who pays the provider: see `upstreamFailureCopy`.
+  const { headline, detail, source, providerWords } = upstreamFailureCopy(err, t, name);
   // Models other than the primary that were also tried before giving up. Only
   // shown when the middleware actually attempted more than one model.
   const alsoTried = (err.attemptedModels && err.attemptedModels.length > 1)
@@ -199,9 +193,14 @@ function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.Rea
         <div className="font-medium" style={{ color: 'var(--color-loss)' }}>
           {headline}
         </div>
-        {err.message && (
+        {source && (
+          <div style={{ color: 'var(--color-text-secondary)' }}>
+            {source}
+          </div>
+        )}
+        {detail && (
           <div className="wrap-break-word" style={{ color: 'var(--color-text-tertiary)' }}>
-            {err.message}
+            {detail}
           </div>
         )}
         {err.links && err.links.length > 0 && (
@@ -228,7 +227,7 @@ function StructuredErrorDisplay({ err }: StructuredErrorDisplayProps): React.Rea
               <React.Fragment key={m.model}>
                 {i > 0 && ', '}
                 {/* Per-model error text lives in the tooltip, not inline. */}
-                <span title={m.error || undefined}>{name(m.model)}</span>
+                <span title={(providerWords && m.error) || undefined}>{name(m.model)}</span>
               </React.Fragment>
             ))}
           </div>

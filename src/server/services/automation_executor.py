@@ -824,10 +824,14 @@ class AutomationExecutor:
                 "automation_execution_id": execution_id,
                 "automation_id": str(automation["automation_id"]),
             }
-            # Every server-started run names its execution row. A held run
-            # then keeps that hold's stamp intact, including the id its
-            # sends use. On the first start that id is this execution; a
-            # restarted hold keeps the id it was filed under.
+            if name := (automation.get("name") or "").strip():
+                # What the run's start and settle notices call it
+                # (``services/notices``).
+                run_metadata["automation_name"] = name
+            # DALTON-HOOK(dispatch-delivery): Every server-started run names its
+            # execution row. A held run then keeps that hold's stamp intact,
+            # including the id its sends use. On the first start that id is
+            # this execution; a restarted hold keeps the id it was filed under.
             extra_configurable: dict[str, Any] = {
                 "automation_execution_id": execution_id,
             }

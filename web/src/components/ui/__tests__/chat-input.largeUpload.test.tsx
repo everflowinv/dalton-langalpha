@@ -151,7 +151,35 @@ function installDefaultUploadApiMocks(resolvedWorkspaceId = 'ws-resolved-1') {
     }
   >();
 
+  let smallAttSeq = 0;
   apiPostMock.mockImplementation((url: string, body?: Record<string, unknown>) => {
+    // DALTON-HOOK(chat-large-upload): support upstream <=30 MiB staged attachment calls alongside >30 MiB chunked uploads
+    if (url === '/api/v1/attachments') {
+      smallAttSeq += 1;
+      return Promise.resolve(
+        okResponse(
+          {
+            attachment_id: `att-test-${smallAttSeq}`,
+            mode: 'relay',
+            max_bytes: 256 * 1024 * 1024,
+          },
+          201,
+        ),
+      );
+    }
+    const stagedContentMatch = /^\/api\/v1\/attachments\/([^/]+)\/content$/.exec(url);
+    if (stagedContentMatch) {
+      return Promise.resolve(
+        okResponse({
+          attachment_id: stagedContentMatch[1],
+          state: 'ready',
+          name: 'file',
+          size: 16,
+          mime_type: 'application/octet-stream',
+          error: null,
+        }),
+      );
+    }
     if (url === '/api/v1/dalton/chat-uploads') {
       seq += 1;
       const uploadId = `up-test-${seq}`;
@@ -405,7 +433,8 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
     expect(JSON.stringify(contexts)).not.toContain('data:');
   });
 
-  it('accepts >30 MiB files via drag/drop and clipboard paste while keeping <=30 MiB files on inline dataUrl', async () => {
+  // DALTON-HOOK(chat-large-upload): keep >30 MiB files on Dalton chunked uploads while <=30 MiB files take upstream #782 staged upload
+  it('accepts >30 MiB files via drag/drop and clipboard paste while routing <=30 MiB files through staged attachments', async () => {
     installDefaultUploadApiMocks('ws-home');
     const readAsDataURLSpy = vi.spyOn(FileReader.prototype, 'readAsDataURL');
 
@@ -468,10 +497,10 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
 
     await waitFor(() => {
       expect(URL.createObjectURL).toHaveBeenCalledWith(smallPng);
-      expect(readAsDataURLSpy).toHaveBeenCalledTimes(1);
       expect(screen.queryByTestId('attachment-uploading')).toBeNull();
       expect(sendButton()).not.toBeDisabled();
     });
+    expect(readAsDataURLSpy).not.toHaveBeenCalled();
 
     fireEvent.keyDown(box, { key: 'Enter' });
     expect(onSend).toHaveBeenCalledTimes(1);
@@ -488,10 +517,10 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       upload_id: 'up-test-2',
       name: 'recording.wav',
     });
-    expect(contexts[2]).toMatchObject({
+    expect(contexts[2]).toEqual({
       type: 'image',
+      attachment_id: 'att-test-1',
       description: 'chart.png',
-      data: expect.stringMatching(/^data:image\/png;base64,/),
     });
   });
 

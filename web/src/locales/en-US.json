@@ -33,7 +33,16 @@
     "failed": "Failed",
     "language": "Language",
     "languageCurrent": "Language: {{language}}",
-    "optional": "(Optional)"
+    "optional": "(Optional)",
+    "sortable": {
+      "handle": "Move {{name}}",
+      "instructions": "To pick up an item, press Space or Enter. Use the arrow keys to move it, Space or Enter again to drop it, or Escape to cancel.",
+      "pickedUp": "Picked up {{name}}.",
+      "over": "{{name}} is over {{over}}.",
+      "inPlace": "{{name}} is back in its place.",
+      "dropped": "{{name}} was dropped over {{over}}.",
+      "cancelled": "Moving {{name}} was cancelled."
+    }
   },
   "auth": {
     "login": "Sign in",
@@ -595,6 +604,7 @@
       "appearance": "Appearance",
       "chat": "Chat",
       "artifacts": "Artifacts",
+      "desktop": "Desktop app",
       "agent": "Behavior",
       "model": "Models",
       "integrations": "Integrations",
@@ -609,6 +619,7 @@
       "appearance": "The theme, its style and light or dark, and the text size.",
       "chat": "How replies come in and what the chat shows while the agent works.",
       "artifacts": "Defaults for your comments on the files the agent makes.",
+      "desktop": "Notifications, the menu bar and how the app starts on this computer.",
       "agent": "How the agent answers, what it may do without asking, and how it searches the web.",
       "model": "The models you can reach and the ones the agent runs on.",
       "integrations": "Talk to your agent from your chat apps, and manage the apps signed in with your account.",
@@ -752,6 +763,80 @@
       "channelPlatformDiscord": "Discord",
       "systemJobsLabel": "System scheduled jobs",
       "systemJobsDesc": "Inspect and trigger system-level background jobs such as wiki sync and filing scans."
+    },
+    "desktop": {
+      "notificationsGroup": "Notifications",
+      "notificationsGroupDesc": "Shown by your computer when you are not looking at the thread.",
+      "notifyTurn": "Finished turns",
+      "notifyTurnDesc": "When a reply you asked for is ready.",
+      "notifyNeedsInput": "Needs your input",
+      "notifyNeedsInputDesc": "When the agent stops to ask you something.",
+      "notifyWakeup": "Wakeups and price alerts",
+      "notifyWakeupDesc": "When the agent checks back in on its own, or a price alert fires.",
+      "notifyAutomation": "Automations",
+      "notifyAutomationDesc": "When an automation finishes a run.",
+      "notifyStarted": "Show when a background run starts",
+      "notifyStartedDesc": "A silent notice as a price alert or automation begins, replaced by its result. A wakeup tells you only when it found something.",
+      "menubarGroup": "Menu bar",
+      "menubarIcon": "Show icon in the menu bar",
+      "menubarIconDesc": "Markets, your portfolio and the agent's activity, a click away.",
+      "menubarItems": "In the menu bar",
+      "menubarItemsDesc": "Shown next to the icon. Drag to reorder.",
+      "menubarItemsDescTooltip": "Shown in the tray icon's tooltip. Drag to reorder.",
+      "menubarItemsDescMenu": "Shown at the top of the tray menu. Drag to reorder.",
+      "itemPortfolio": "Portfolio",
+      "addSymbol": "Add symbol",
+      "addPortfolio": "Add portfolio",
+      "addTile": "Add",
+      "itemsFull": "Up to {{count}}",
+      "removeItem": "Remove {{name}}",
+      "menubarStyle": "With more than one",
+      "menubarStyleDesc": "Rotate keeps the width fixed.",
+      "menubarStyleRotate": "Rotate",
+      "menubarStyleSide": "Side by side",
+      "rotateEvery": "Rotate every",
+      "rotateSeconds_one": "Every {{count}}s",
+      "rotateSeconds_other": "Every {{count}}s",
+      "menubarShow": "Show",
+      "menubarShowDesc": "What each item shows.",
+      "menubarShowChange": "Change",
+      "menubarShowPrice": "Price",
+      "menubarShowBoth": "Both",
+      "menubarExtended": "Extended hours",
+      "menubarExtendedDesc": "Show the pre-market or after-hours move when there is one.",
+      "panelGroup": "Panel",
+      "panelGroupDesc": "What opens when you click the icon.",
+      "panelSections": "Sections",
+      "panelSectionsDesc": "Shown in this order. Drag to reorder.",
+      "section": {
+        "market": "Market",
+        "portfolio": "Portfolio",
+        "watchlist": "Watchlist",
+        "agent": "Agent"
+      },
+      "panelTiles": "Market tiles",
+      "panelTilesDesc": "Up to 4: any index, ETF, crypto or stock.",
+      "panelWatchlist": "Watchlist",
+      "panelWatchlistDesc": "Which list, and how many rows.",
+      "watchlistWhich": "Which watchlist",
+      "watchlistDefault": "Default",
+      "watchlistDefaultNamed": "{{name}} (default)",
+      "watchlistRowsLabel": "Rows",
+      "watchlistRows_one": "{{count}} row",
+      "watchlistRows_other": "{{count}} rows",
+      "shortcut": "Keyboard shortcut",
+      "shortcutDesc": "Opens the menu bar panel from any app. Click, then press the keys.",
+      "shortcutNone": "Record shortcut",
+      "shortcutRecording": "Press keys…",
+      "shortcutClear": "Clear",
+      "shortcutError": "Could not use this shortcut: {{error}}",
+      "startupGroup": "Startup",
+      "openAtLogin": "Open at login",
+      "openAtLoginDesc": "Start LangAlpha in the background when you sign in to this computer.",
+      "openAtLoginWindowDesc": "Open LangAlpha when you sign in to this computer. With the icon on, it starts in the background instead.",
+      "keepRunning": "Keep running in the tray when closed",
+      "keepRunningDesc": "Closing the window leaves notifications and the tray icon running.",
+      "unavailable": "The desktop app did not answer. Restart it and try again."
     }
   },
   "dashboard": {
@@ -1978,6 +2063,7 @@
       "provider": "Remote control",
       "asAccount": "as {{account}}",
       "notConnected": "Not connected",
+      "pairedElsewhere": "Connected to another account",
       "paused": "Remote control is paused. Resume it from the LangAlpha menu.",
       "removeTurnsOff": "Remote control on this Mac turns off too.",
       "cardTitlePc": "This PC",
@@ -2305,7 +2391,23 @@
       "draftAttachmentsRestored": "Attachments are not kept in drafts — add them again before sending.",
       "inFlightDraftRestore": "Put back into the message box",
       "inFlightDraftDiscard": "Discard",
-      "inFlightDraftMore": "{{count}} more unanswered send(s)"
+      "inFlightDraftMore": "{{count}} more unanswered send(s)",
+      "attachment": {
+        "retry": "Retry",
+        "preview": "Preview {{name}}",
+        "saving": "Saving",
+        "failed": "Upload failed",
+        "sendFailed": "Couldn't send the file. Check your connection.",
+        "tooLarge": "This file is too large to attach.",
+        "uploadingLabel": "{{name}}, uploading, {{percent}}%",
+        "failedLabel": "{{name}}, upload failed: {{error}}",
+        "holdUploading_one": "Uploading {{count}} file…",
+        "holdUploading_other": "Uploading {{count}} files…",
+        "holdFailed_one": "Retry or remove {{count}} file",
+        "holdFailed_other": "Retry or remove {{count}} files",
+        "notReceived": "Not received",
+        "notReceivedLabel": "{{name}}, not received"
+      }
     },
     "mention": {
       "noMatching": "No matching files",
@@ -2349,9 +2451,37 @@
     "editReplacesLater": "Messages after this one will be replaced and can't be recovered.",
     "errorHintApiKey": "Check that your API key is correct and hasn't been revoked.",
     "errorHintModelAccess": "Confirm your plan or subscription allows access to this model.",
+    "errorHintProviderBalance": "Your account with this model's provider is out of credit. Add funds on the provider's site, then try again.",
     "errorHintProviderStatus": "Check the provider's status page for ongoing incidents.",
     "errorHintTryAnotherModel": "Try switching to a different model in the model picker.",
     "errorHintReconnectAccount": "Your subscription sign-in needs to be renewed. Reconnect it in Settings.",
+    "errorPlatformHeadline": "The model couldn't finish this reply",
+    "errorPlatformHeadlineModel": "{{model}} couldn't finish this reply",
+    "errorPlatformDetail": "The model service had a problem on our side. Nothing on your account needs fixing.",
+    "errorSourceOwnKeyNamed": "This error came from {{account}}, through your own API key.",
+    "errorSourceOwnKey": "This error came from the model's provider, through your own API key.",
+    "errorSourceSubscriptionNamed": "This error came from {{account}}, through your connected subscription.",
+    "errorSourceSubscription": "This error came from the model's provider, through your connected subscription.",
+    "errorSourceServerKey": "This error came from the model's provider, through the API key this server is configured with.",
+    "errorSourceLocal": "This error came from your own model server.",
+    "errorHintLocalServer": "Check that your local model server is running and reachable.",
+    "errorHintRetryLater": "Try again in a few minutes.",
+    "errorHintNewThread": "If it keeps happening in this thread, start a new one.",
+    "errorHintRateLimited": "The provider is limiting how fast requests can be sent. Wait a minute and try again.",
+    "errorHintProviderOverloaded": "The provider is overloaded right now. Try again in a few minutes.",
+    "errorHintContentBlocked": "The provider's content filter blocked this request. Rephrase it or switch to another model.",
+    "errorHintProviderQuota": "Your plan with this provider doesn't have quota left for this model. Check its billing settings.",
+    "planLimitTitle": "{{plan}} plan limit reached",
+    "planLimitWindowReset": "Your {{plan}} plan's {{window}} limit is used up. It resets at {{time}}. Pick another model, or send this again after it resets.",
+    "planLimitReset": "Your {{plan}} plan's limit is used up. It resets at {{time}}. Pick another model, or send this again after it resets.",
+    "planLimitUnknown": "Your {{plan}} plan's limit is used up. Pick another model, or send this again later.",
+    "planLimitWindow": {
+      "five_hour": "5-hour",
+      "seven_day": "weekly",
+      "seven_day_opus": "weekly Opus",
+      "seven_day_sonnet": "weekly Sonnet",
+      "seven_day_overage_included": "weekly Fable"
+    },
     "errorLinkManagePlan": "Manage plan",
     "errorLinkViewUsage": "View usage",
     "errorLinkReconnect": "Reconnect",
@@ -2428,6 +2558,7 @@
       "lapsed": "Your {{account}} sign-in has expired. Reconnect it to use {{model}}.",
       "offer": "This thread uses {{model}}. New threads start on {{defaultModel}}.",
       "handoff": "OpenAI compacted part of this thread into a summary only its models can read. The previous model is writing it out for {{model}}, so your next message may take a little longer to start.",
+      "brief": "Handing this thread's context to {{model}} so it can pick up where it left off. Your next message may take a little longer to start.",
       "makeDefault": "Make {{model}} my default"
     },
     "backgroundTasksRunning": "Background tasks are still running",
@@ -2716,6 +2847,8 @@
     "offloading": "Offloading context...",
     "turnHeld": {
       "handoff": "Waiting for the previous model to write out its summary...",
+      "brief": "Handing off context to {{model}}...",
+      "briefNoModel": "Handing off context to the new model...",
       "other": "Waiting for the current operation on this conversation to finish..."
     },
     "compactionStopped": "Compaction stopped",
@@ -2756,12 +2889,16 @@
       "chart-annotationDesc": "Draw an analysis on a price chart as a layer: levels, lines, zones, indicators, and projections, live on MarketView or as a chart card in chat"
     },
     "compactedNotification": "Context compacted · {{from}} messages → summary",
+    "handOffNotification": "Context handed off · {{from}} → {{to}}",
+    "handOffNotificationDigest": "Context handed off → {{to}}",
     "taskErrorNotification": "Subagent run failed",
     "taskStoppedNotification": "Subagent run stopped",
     "taskSteeringReturnedNotification": "Steering message returned — the run ended before it was delivered",
     "taskSteeringNotSentNotification": "Steering message not sent",
     "viewSummary": "View summary",
     "hideSummary": "Hide summary",
+    "viewBrief": "View brief",
+    "hideBrief": "Hide brief",
     "offloadedArgsNotification": "Tool arguments offloaded · {{count}} tools",
     "offloadedReadsNotification": "Stale read results offloaded · {{count}} reads",
     "offloadedNotification": "Context offloaded · {{args}} tool args, {{reads}} reads",
@@ -2811,7 +2948,10 @@
       "claudeCodeCliComputerOffline": "{{name}} is offline",
       "claudeCodeNeedsBiggerComputer": "Needs a Medium or larger cloud computer, or a computer of your own",
       "claudeCodeNeedsBiggerComputerHome": "Needs a Medium or larger cloud computer",
-      "claudeCodeNeedsBiggerComputerPlan": "Needs a Medium or larger cloud computer: change its spec or upgrade your LangAlpha plan, or use a computer of your own"
+      "claudeCodeNeedsBiggerComputerPlan": "Needs a Medium or larger cloud computer: change its spec or upgrade your LangAlpha plan, or use a computer of your own",
+      "claudeCodeNeedsMedium": "Needs a Medium or larger cloud computer. Select to change its spec.",
+      "claudeCodeNeedsMediumPlan": "Needs a Medium or larger cloud computer, which isn't on your plan. Select to upgrade.",
+      "claudeCodeNeedsMediumResizing": "Its computer is changing to Medium."
     },
     "voice": {
       "start": "Start voice input",
@@ -3710,6 +3850,7 @@
     "stateKeyRejected": "API key rejected",
     "stateUsageLimit": "Usage limit reached",
     "stateClaudePlan": "Claude plan limit reached",
+    "statePlanLimit": "Plan limit reached",
     "statePaused": "Paused",
     "stateFinished": "Finished",
     "stateWatching": "Watching",
@@ -4430,7 +4571,7 @@
     "methodTitle": "How would you like to connect?",
     "methodSubtitle": "Choose how you'll access AI models. You can add more providers later.",
     "methodOAuth": "Use a subscription",
-    "methodOAuthDesc": "Sign in to ChatGPT, Claude or Grok, or add a coding plan from Kimi, GLM, MiniMax or OpenCode.",
+    "methodOAuthDesc": "Use Claude Code, sign in to ChatGPT or Grok, or add a coding plan from Kimi, GLM, MiniMax or OpenCode.",
     "methodApiKey": "I have an API key",
     "methodApiKeyDesc": "Pay per token, from any provider.",
     "methodLocal": "I run models locally",
@@ -5215,7 +5356,8 @@
         "remove": "Remove {{name}}",
         "tooMany": "Up to {{max}} screenshots; the rest were left out.",
         "notImage": "{{name}} isn't a PNG, JPEG, WebP or GIF image.",
-        "unreadable": "{{name}} couldn't be read."
+        "unreadable": "{{name}} couldn't be read.",
+        "uploadFailed": "{{name}} couldn't be uploaded. Try adding it again."
       }
     }
   },
@@ -7145,7 +7287,7 @@
       "open": "Open OpenAI"
     },
     "claudeCode": {
-      "detail": "Its own setup token, not your Claude Code sign-in",
+      "detail": "Its own setup token",
       "rejected": "Claude refused this token. It may have expired or been revoked.",
       "add": "Add setup token",
       "addNew": "Add new token",
@@ -7154,14 +7296,13 @@
       "moreActions": "More actions",
       "addTitle": "Add a setup token",
       "replaceTitle": "Replace setup token",
-      "intro": "Claude Code mode runs your Claude threads on your own Claude plan. It signs in with a setup token made for LangAlpha.",
-      "separate": "This token is a separate credential made for LangAlpha, never your Claude Code sign-in. Usage counts against your Claude plan. It's stored encrypted and used only for your requests.",
+      "separate": "LangAlpha keeps this token encrypted.",
       "stepInstall": "Install Claude Code if you don't have it yet.",
       "installLink": "Install guide",
       "stepRun": "In a terminal, on this computer or any other, run:",
       "stepSignIn": "Sign in to Claude in the browser window it opens.",
-      "stepCopy": "Copy the token it prints. A long token can wrap onto a second line, so copy all of it.",
-      "stepPaste": "Paste it below and save.",
+      "stepCopy": "Copy the whole token it prints, even if it wraps.",
+      "stepPaste": "Paste it below.",
       "fieldLabel": "Setup token",
       "fieldPlaceholder": "Paste your setup token",
       "save": "Save token",
@@ -7181,7 +7322,7 @@
         "unknown": "Couldn't save the token. Try again."
       },
       "removeTitle": "Remove the Claude Code setup token?",
-      "removeBody": "LangAlpha deletes the token. Claude Code models stay listed but won't run until you add a new token. Your own Claude Code sign-in isn't affected.",
+      "removeBody": "Claude Code won't run where it uses this token until you add a new one.",
       "removeConfirm": "Remove token",
       "removeFailed": "Couldn't remove the token. Try again.",
       "turnsRunning": "Your token is deleted, but a Claude Code turn using it couldn't be stopped. Stop it in its thread.",
@@ -7190,7 +7331,7 @@
       "expired": "This token expired by <date>{{date}}</date>. Add a new one to keep using Claude Code.",
       "expiresSoon": "This token expires by <date>{{date}}</date>. Add a new one before then so Claude Code keeps running.",
       "signIn": {
-        "intro": "Sign in to Claude in a new tab. LangAlpha then makes a setup token for itself, so there's nothing to run in a terminal.",
+        "intro": "Sign in to Claude, and LangAlpha makes the token for you.",
         "start": "Sign in with Claude",
         "codeHint": "After you approve, Claude shows a code. Copy all of it and paste it here.",
         "fieldLabel": "Code from Claude",
@@ -7217,14 +7358,13 @@
         }
       },
       "computer": {
-        "intro": "Claude Code runs your Claude threads on {{name}}, on your own Claude plan. It signs in with a setup token made for LangAlpha, kept on that computer.",
-        "separate": "This token is a separate credential made for LangAlpha, never your Claude Code sign-in. Usage counts against your Claude plan. It stays on {{name}}, and LangAlpha doesn't keep a copy.",
-        "signInIntro": "Sign in to Claude in a new tab. LangAlpha then makes a setup token and puts it on {{name}}, so there's nothing to run in a terminal.",
+        "separate": "This token stays on {{name}}.",
+        "signInIntro": "Sign in to Claude, and LangAlpha puts a token on {{name}}.",
         "addTitle": "Add a setup token for {{name}}",
         "replaceTitle": "Replace the setup token on {{name}}",
         "removeTitle": "Remove the setup token from {{name}}?",
-        "removeBody": "LangAlpha deletes the token from {{name}}. Claude Code won't run there until you add a new one. Your own Claude Code sign-in isn't affected.",
-        "removeBodySaved": "LangAlpha deletes the token from {{name}}. Claude Code there then uses your saved token. Your own Claude Code sign-in isn't affected.",
+        "removeBody": "Claude Code won't run there until you add a new one.",
+        "removeBodySaved": "Claude Code there then uses your saved token.",
         "ownToken": "Uses its own token",
         "savedToken": "Uses your saved token",
         "noToken": "No setup token for this computer yet",
@@ -7244,10 +7384,10 @@
       "hosted": {
         "heading": "Where Claude Code runs",
         "local": "On your own computers",
-        "localDetail": "Claude Code runs on a computer of yours with its own setup token, for every workspace, including those on cloud computers. Their files and commands stay on the cloud computer, and LangAlpha keeps no copy of the token.",
+        "localDetail": "A computer of yours runs it, with a setup token LangAlpha doesn't keep.",
         "stored": "On cloud computers, with your setup token stored by LangAlpha",
-        "storedDetail": "For workspaces on Medium or larger cloud computers, Claude Code runs on the cloud computer itself. Your own computers without a token of their own run Claude Code themselves too. For each turn, LangAlpha sends your setup token, kept encrypted, to the computer that runs it. Usage counts against your Claude plan.",
-        "paused": "Claude Code on cloud computers is paused on this server. Your choice is kept, and Claude Code still runs on your own computers.",
+        "storedDetail": "Medium or larger cloud computers run it. LangAlpha keeps your setup token encrypted.",
+        "paused": "Paused on cloud computers on this server. It still runs on your own computers.",
         "blocked": "Storing a setup token isn't available for your account. Claude Code still runs on your own computers."
       },
       "consent": {
@@ -7261,13 +7401,15 @@
       },
       "leaveStored": {
         "title": "Stop storing your setup token?",
-        "body": "LangAlpha deletes your stored setup token now, and Claude Code turns using it stop. Threads on cloud computers won't run on your Claude plan until you store a token again. Computers with their own token aren't affected.",
+        "body": "LangAlpha deletes it now, and turns using it stop. Computers with their own token aren't affected.",
         "confirm": "Delete token",
         "failed": "Couldn't switch. Your token is still stored. Try again."
       },
       "setup": {
         "pickNote": "Claude Pro or Max, run on your computer",
-        "lead": "Claude Code mode runs Anthropic's Claude Code through the Claude Agent SDK, inside LangAlpha's harness and tools. Usage counts against your Claude plan.",
+        "pickNoteCloud": "Claude Pro or Max, run on your computer or a cloud computer",
+        "pickNoteServer": "Claude Pro or Max, run on this server or your computer",
+        "lead": "Runs Claude Code on your Claude plan.",
         "learnMore": "Learn more",
         "waysTitle": "Ways to connect a computer",
         "yourComputers": "Your computers",
@@ -7289,8 +7431,7 @@
         },
         "noComputer": {
           "title": "Connect a computer of your own first",
-          "body": "Claude Code runs on a computer of your own, and none is connected to LangAlpha yet. Connect one either way below, then come back here to sign in to Claude.",
-          "bodyCloud": "Claude Code runs on a computer of your own or a Medium or larger cloud computer, and none of yours can run it yet. Connect a computer of your own either way below, then come back here to sign in to Claude."
+          "body": "Connect one below, then come back here to sign in to Claude."
         },
         "unsupported": {
           "title": "Claude Code can't run on your computers",
@@ -7299,7 +7440,8 @@
         "offline": {
           "title": "{{name}} is offline",
           "titleMany": "Your computers are offline",
-          "body": "Claude Code runs on a computer of your own, and LangAlpha can't reach yours right now. Once one is back online, you can sign in to Claude here.",
+          "body": "You can sign in to Claude here once it's back online.",
+          "bodyMany": "You can sign in to Claude here once one is back online.",
           "helper": "Open LangAlpha on this Mac and check that Remote control is on.",
           "ssh": "Check that it's on and accepts SSH from LangAlpha."
         },
@@ -7309,17 +7451,20 @@
           "titleKept": "Turn Claude Code back on",
           "bodyKept": "{{name}} still has its setup token. Turn on Claude Code to use it again.",
           "bodyKeptMany": "Your computers below still have their setup tokens. Turn on Claude Code to use them again.",
-          "body": "Claude Code can run on {{name}}. Add a setup token for it, and Claude Code models join your model picker.",
-          "bodyMany": "Claude Code can run on the computers below. Add a setup token on each one you want it on.",
-          "bodySaved": "Add a setup token below, and Claude Code models join your model picker.",
-          "bodyCloud": "Choose how Claude Code runs on cloud computers below, and its models join your model picker.",
-          "bodyTurnOn": "Turn on Claude Code to choose how it runs on cloud computers."
+          "body": "Add a setup token for {{name}} below.",
+          "bodyMany": "Add a setup token for each computer you want it on.",
+          "bodySaved": "Add a setup token below.",
+          "bodyCloud": "Choose where it runs below.",
+          "bodyTurnOn": "Turn it on to choose where it runs."
         },
         "connected": {
           "title": "Claude Code is ready",
-          "body": "Claude Code models are in your model picker.",
-          "cliOwn": "Claude Code for your cloud workspaces and your Chief of Staff runs on {{name}}.",
-          "cliHome": "Your Chief of Staff runs Claude Code on Home's computer, {{name}}."
+          "body": "Its models are in your model picker.",
+          "cliOwn": "It runs on {{name}} for your cloud workspaces and Chief of Staff.",
+          "cliHome": "Your Chief of Staff runs it on {{name}}.",
+          "almostTitle": "Claude Code is almost ready",
+          "almostBody": "It runs once {{name}} is Medium or larger.",
+          "startChat": "Start a chat"
         },
         "checking": {
           "title": "Checking your setup tokens",
@@ -7327,20 +7472,32 @@
         },
         "refused": {
           "title": "Sign in to Claude again",
-          "body": "Claude refused the setup token on {{name}}. It may have expired or been revoked. Add a new token to keep using Claude Code.",
-          "bodyAny": "Claude refused a setup token. It may have expired or been revoked. Add a new token to keep using Claude Code."
+          "body": "Claude refused the setup token on {{name}}. Add a new one.",
+          "bodyAny": "Claude refused a setup token. Add a new one."
         },
         "turnOff": {
           "action": "Turn off Claude Code",
           "title": "Turn off Claude Code?",
-          "body": "Claude Code models leave your model picker. Setup tokens on your computers stay until you remove them, so you can turn it back on here at any time.",
+          "body": "Its models leave your model picker. Setup tokens on your computers stay until you remove them.",
           "confirm": "Turn off",
-          "bodyStored": "Claude Code models leave your model picker, and the setup token for cloud computers is removed. Tokens on your own computers stay until you remove them."
+          "bodyStored": "Its models leave your model picker, and LangAlpha deletes the token stored for cloud computers."
         },
         "savedName": "Your setup token",
         "savedDetailCloud": "Runs Claude Code on your cloud computers",
         "savedDetailServer": "Runs Claude Code on this server",
         "tooSmallTitle": "Too small for Claude Code"
+      },
+      "medium": {
+        "resize": "Change to Medium",
+        "isSmall": "{{name}} is Small, and Claude Code runs on Medium or larger cloud computers.",
+        "restarts": "Changing it to Medium restarts it, and its workspaces are back in a few minutes.",
+        "notOnPlan": "Medium isn't on your plan.",
+        "changing": "It's changing to Medium now.",
+        "ownInstead": "Or run Claude Code on your own computers: your Mac with Remote control, or a computer over SSH.",
+        "row": "Claude Code runs on Medium or larger cloud computers.",
+        "rowResize": "Claude Code runs on Medium or larger. Changing it restarts it for a few minutes.",
+        "rowPlan": "Claude Code runs on Medium or larger, and Medium isn't on your plan.",
+        "rowResizing": "Changing to Medium. Claude Code runs here once it's done."
       }
     },
     "claude": {
@@ -7375,13 +7532,19 @@
         "upstream_unavailable": "Claude couldn't be reached. Send the code again.",
         "save_failed": "Your account couldn't be saved.",
         "redis_unavailable": "Connecting accounts isn't available right now. Send the code again in a moment.",
+        "unavailable": "Signing in with Claude isn't available for this account.",
         "unknown": "Something went wrong while connecting."
       },
       "signInLabel": "Sign in on claude.ai",
       "open": "Open claude.ai",
       "expiresIn": "Sign-in link expires in {{time}}",
       "stepConnect": "Connecting your plan",
-      "paste": "Paste"
+      "paste": "Paste",
+      "endsOn": "This sign-in ends on {{date}}.",
+      "switchToClaudeCode": "Switch to Claude Code",
+      "legacy": "Legacy",
+      "legacyName": "{{name}} (legacy)",
+      "useClaudeCode": "Native Claude Code mode is now generally available. Use it instead of this sign-in."
     },
     "grok": {
       "name": "Grok",
@@ -7907,6 +8070,14 @@
       "unsaved": "Claude answered, but the usage couldn't be updated. Try again later."
     }
   },
+  "claudeCodeAnnouncement": {
+    "title": "Native Claude Code mode is here",
+    "body": "It runs Claude Code itself, the same as running it yourself, and it's the way we recommend.",
+    "endsOn": "The old sign-in ends on {{date}}. To keep using your Claude plan, switch before then.",
+    "switch": "Switch to Claude Code",
+    "learnMore": "Learn more",
+    "dismiss": "Dismiss"
+  },
   "palette": {
     "copyFailed": "Couldn't copy to the clipboard",
     "title": "Search and commands",
@@ -8262,5 +8433,88 @@
       "inHours": "in {{n}}h",
       "inDays": "in {{n}}d"
     }
+  },
+  "menubar": {
+    "open": "Open LangAlpha",
+    "settings": "Desktop app settings",
+    "market": {
+      "title": "Market",
+      "open": "Market open",
+      "pre": "Pre-market",
+      "after": "After hours",
+      "closed": "Market closed",
+      "unknown": "Market",
+      "closesIn": "Closes in {{time}}",
+      "opensIn": "Opens in {{time}}",
+      "endsIn": "Ends in {{time}}"
+    },
+    "duration": {
+      "hoursMinutes": "{{h}}h {{m}}m",
+      "minutes": "{{m}}m"
+    },
+    "portfolio": {
+      "title": "Portfolio · today",
+      "showValues": "Show values",
+      "hideValues": "Hide values",
+      "weight": "{{pct}}%",
+      "manualNote": "From the holdings you entered",
+      "otherCurrencies": "{{list}} not included",
+      "empty": "No holdings yet.",
+      "add": "Add holdings in LangAlpha"
+    },
+    "watchlist": {
+      "title": "Watchlist",
+      "count": "{{shown}} of {{total}}",
+      "empty": "Your watchlist is empty.",
+      "add": "Add symbols in LangAlpha"
+    },
+    "agent": {
+      "title": "Agent",
+      "running": "Running",
+      "needsInput": "Needs input",
+      "finished": "Finished",
+      "untitled": "Untitled thread",
+      "empty": "Nothing running or waiting for you.",
+      "more": "{{count}} more"
+    },
+    "signedOut": {
+      "title": "Sign in to LangAlpha",
+      "body": "The market, your portfolio and your agent's work show here once you're signed in.",
+      "action": "Sign in"
+    },
+    "tray": {
+      "portfolio": "Port"
+    },
+    "feed": {
+      "offline": "Offline",
+      "overdue": "Not updating",
+      "updated": "Updated {{time}}",
+      "more": "+{{count}} more"
+    }
+  },
+  "marketIndex": {
+    "GSPC": {
+      "long": "S&P 500",
+      "short": "S&P"
+    },
+    "IXIC": {
+      "long": "Nasdaq",
+      "short": "Nasdaq"
+    },
+    "DJI": {
+      "long": "Dow",
+      "short": "Dow"
+    },
+    "RUT": {
+      "long": "Russell 2000",
+      "short": "Russell"
+    },
+    "VIX": {
+      "long": "VIX",
+      "short": "VIX"
+    }
+  },
+  "desktopApp": {
+    "untitledThread": "Untitled thread"
   }
 }

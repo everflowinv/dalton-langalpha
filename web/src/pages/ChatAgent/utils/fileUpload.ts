@@ -1,19 +1,26 @@
+import type { ReadyAttachment } from '@/components/ui/chat-input.types';
 import { selectionPriceBounds } from './selectionBounds';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import type { ChartSelection } from '@/pages/MarketView/stores/chartSelectionStore';
 
+/** An image by its MIME type, the server's `image` tag, or its name, for a file the browser could not type. */
+export function isImageFile({ type = '', name = '' }: { type?: string; name?: string }): boolean {
+  return type.startsWith('image/') || type === 'image' || /\.(jpe?g|png|gif|webp)$/i.test(name);
+}
+
 export interface Attachment {
   file: File;
-  dataUrl: string | null;
+  dataUrl?: string | null;
   type: string;
+  attachmentId?: string;
   // DALTON-HOOK(chat-large-upload): server-issued upload reference for stored attachments
   uploadId?: string;
 }
 
 export type AttachmentContext =
   | {
-      type: string;
-      data: string;
+      type: 'image' | 'pdf' | 'file';
+      attachment_id: string;
       description: string;
     }
   | {
@@ -22,20 +29,104 @@ export type AttachmentContext =
       name: string;
       mime_type: string;
       size: number;
+    }
+  | {
+      type: string;
+      data: string;
+      description: string;
     };
 
-export function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
-    reader.readAsDataURL(file);
-  });
+/**
+ * The sent bubble's record of an attachment, until history replaces it with
+ * the server's. A staged file carries itself, which survives the route state
+ * a send from another page travels in; a chart capture carries its image as
+ * `dataUrl`, having no file behind it.
+ */
+export type AttachmentMeta = {
+  name?: string;
+  filename?: string;
+  type: string;
+  mime_type?: string;
+  size?: number;
+  file?: File;
+  dataUrl?: string | null;
+  preview?: string | null;
+  url?: string;
+  // DALTON-HOOK(chat-large-upload): preserve server upload id on client draft/bubble metadata
+  upload_id?: string;
+  uploadId?: string;
+  attachment_id?: string;
+  /** History only: the turn never received this file, so there is nothing to show. */
+  missing?: boolean;
+  /** When the staged file became ready, kept so a send handed back to the
+   *  composer re-stages it before the server's expiry. Never sent. */
+  readyAt?: number;
+};
+
+/**
+ * What a send carries for its attached files: `additional_context` items
+ * (`chat_upload` for Dalton chunked uploads, `attachment_id` for upstream
+ * staged files) and the bubble's record of them.
+ */
+export function attachmentSendParts(files: readonly ReadyAttachment[]): { contexts: AttachmentContext[]; meta: AttachmentMeta[] } {
+  const contexts: AttachmentContext[] = [];
+  const meta: AttachmentMeta[] = [];
+  for (const a of files) {
+    if (a.uploadId) {
+      contexts.push({
+        type: 'chat_upload',
+        upload_id: a.uploadId,
+        name: a.file.name,
+        mime_type: a.type || 'application/octet-stream',
+        size: a.file.size,
+      });
+      meta.push({
+        name: a.file.name,
+        type: a.type,
+        size: a.file.size,
+        file: a.file,
+        upload_id: a.uploadId,
+      });
+    } else if (a.attachmentId) {
+      contexts.push({
+        type: isImageFile({ type: a.type, name: a.file.name }) ? 'image' : a.type === 'application/pdf' ? 'pdf' : 'file',
+        attachment_id: a.attachmentId,
+        description: a.file.name,
+      });
+      meta.push({
+        name: a.file.name,
+        type: a.type,
+        size: a.file.size,
+        file: a.file,
+        ...(a.readyAt !== undefined ? { readyAt: a.readyAt } : {}),
+      });
+    } else if (a.dataUrl != null) {
+      contexts.push({
+        type: isImageFile({ type: a.type, name: a.file.name }) ? 'image' : a.type === 'application/pdf' ? 'pdf' : 'file',
+        data: a.dataUrl,
+        description: a.file.name,
+      });
+      meta.push({
+        name: a.file.name,
+        type: a.type,
+        size: a.file.size,
+        file: a.file,
+        dataUrl: a.dataUrl,
+      });
+    }
+  }
+  return { contexts, meta };
+}
+
+/** Whether a send's `additional_context` names files staged on the server. */
+export function namesStagedFiles(contexts: readonly Record<string, unknown>[] | null | undefined): boolean {
+  return !!contexts?.some((c) => typeof c.attachment_id === 'string');
 }
 
 /**
  * Convert attachments to additional_context format with accurate type tags.
  * Stored uploads → "chat_upload" reference (no inline bytes);
+ * staged files → "attachment_id" reference;
  * inline images → "image", PDFs → "pdf", everything else → "file".
  */
 // DALTON-HOOK(chat-large-upload): serialize stored uploads by upload_id without base64 payloads
@@ -49,6 +140,18 @@ export function attachmentsToContexts(attachments: Attachment[]): AttachmentCont
         name: a.file.name,
         mime_type: a.type || 'application/octet-stream',
         size: a.file.size,
+      });
+      continue;
+    }
+    if (a.attachmentId) {
+      result.push({
+        type: isImageFile({ type: a.type, name: a.file.name })
+          ? 'image'
+          : a.type === 'application/pdf'
+            ? 'pdf'
+            : 'file',
+        attachment_id: a.attachmentId,
+        description: a.file.name,
       });
       continue;
     }
@@ -68,6 +171,31 @@ export function attachmentsToContexts(attachments: Attachment[]): AttachmentCont
 }
 
 /**
+ * The staged files a send carries, as the composer holds them, read back from
+ * what `attachmentSendParts` made of them: its items name them in the order
+ * its records hold the files.
+ */
+// DALTON-HOOK(chat-large-upload): round-trip both staged attachment_id and chat_upload upload_id through draft restore
+export function stagedFilesOf(
+  contexts: readonly Record<string, unknown>[] | null | undefined,
+  meta: readonly AttachmentMeta[] | null | undefined,
+): ReadyAttachment[] {
+  const files = (meta ?? []).filter((m): m is AttachmentMeta & { file: File } => !!m.file);
+  const refs = (contexts ?? []).flatMap((c): Array<{ attachmentId: string; uploadId?: string }> => {
+    if (typeof c.attachment_id === 'string') return [{ attachmentId: c.attachment_id }];
+    if (c.type === 'chat_upload' && typeof c.upload_id === 'string') return [{ attachmentId: '', uploadId: c.upload_id }];
+    return [];
+  });
+  return refs.slice(0, files.length).map((ref, i) => ({
+    file: files[i].file,
+    type: files[i].type,
+    attachmentId: ref.attachmentId,
+    ...(ref.uploadId ? { uploadId: ref.uploadId } : {}),
+    ...(files[i].readyAt !== undefined ? { readyAt: files[i].readyAt } : {}),
+  }));
+}
+
+/**
  * Per-widget snapshot serialization for `additional_context`.
  *
  * Each snapshot becomes ONE `{type:"widget", ...}` item. Image-bearing
@@ -82,7 +210,7 @@ export function attachmentsToContexts(attachments: Attachment[]): AttachmentCont
  */
 const MAX_DATA_BYTES_PER_SNAPSHOT = 100 * 1024;
 
-interface WidgetCtxItem {
+type WidgetCtxItem = {
   type: 'widget';
   widget_type: string;
   widget_id: string;
@@ -91,13 +219,13 @@ interface WidgetCtxItem {
   data: Record<string, unknown>;
   captured_at?: string;
   description?: string;
-}
+};
 
-interface WidgetImageItem {
+type WidgetImageItem = {
   type: 'image';
   data: string;
   description: string;
-}
+};
 
 export function widgetSnapshotsToContexts(
   snapshots: WidgetContextSnapshot[],
@@ -135,7 +263,7 @@ export function widgetSnapshotsToContexts(
   return out;
 }
 
-interface ChartSelectionCtxItem {
+type ChartSelectionCtxItem = {
   type: 'chart_selection';
   symbol: string;
   timeframe: string;
@@ -147,13 +275,13 @@ interface ChartSelectionCtxItem {
   bars: ChartSelection['bars'];
   bars_truncated: boolean;
   label?: string;
-}
+};
 
-interface ChartSelectionImageItem {
+type ChartSelectionImageItem = {
   type: 'image';
   data: string;
   description: string;
-}
+};
 
 /**
  * A selection time as the agent's structured block prints it: the exchange's

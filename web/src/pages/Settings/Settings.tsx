@@ -13,11 +13,13 @@ import { GeneralPanel } from './panels/GeneralPanel';
 import { AppearancePanel } from './panels/AppearancePanel';
 import { ChatPanel } from './panels/ChatPanel';
 import { ArtifactsPanel } from './panels/ArtifactsPanel';
+import { DesktopPanel } from './panels/DesktopPanel';
 import { AgentPanel } from './panels/AgentPanel';
 import { ModelsPanel } from './panels/ModelsPanel';
 import { PlanPanel } from './panels/PlanPanel';
 import { IntegrationsPanel } from './panels/IntegrationsPanel';
 import { SettingsRail } from './components/SettingsRail';
+import ComputersDialogHost from '@/pages/ChatAgent/components/ComputersDialogHost';
 import { readSection, SECTIONS, type Section } from './sections';
 import '@/styles/pageRail.css';
 import './Settings.css';
@@ -52,6 +54,7 @@ function SectionBody({ section }: { section: Section }) {
     case 'appearance': return <AppearancePanel />;
     case 'chat': return <ChatPanel />;
     case 'artifacts': return <ArtifactsPanel />;
+    case 'desktop': return <DesktopPanel />;
     case 'agent': return <AgentPanel />;
     case 'model': return <ModelsPanel />;
     case 'integrations': return <IntegrationsPanel />;
@@ -152,6 +155,9 @@ function Settings() {
           </div>
         </div>
       </div>
+      {/* Change spec, opened over Claude Code's view in Model access, so
+          the user stays where they started while the computer resizes. */}
+      <ComputersDialogHost overSheet planInPlace />
     </div>
   );
 }

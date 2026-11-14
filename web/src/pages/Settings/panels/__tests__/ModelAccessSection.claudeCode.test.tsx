@@ -25,11 +25,17 @@ vi.mock('@/hooks/useClaudeCode', () => ({
   useClaudeCodeStatus: () => ({ ...status.current, enabled: status.current.state !== 'off', runsHere: status.current.state !== 'off', saved: false }),
   useClaudeCodeComputers: () => ({ computers: [], isLoading: false }),
 }));
+vi.mock('@/hooks/useAllModels', () => ({ useAllModels: () => ({ models: {}, metadata: {} }) }));
+vi.mock('@/hooks/useSlotDefaultModels', async (original) => ({
+  ...(await original<typeof import('@/hooks/useSlotDefaultModels')>()),
+  useDefaultModel: () => null,
+}));
 vi.mock('@/hooks/useProviderCatalog', () => ({
   useProviderCatalog: () => ({ keyGroups: [], planGroups: [], localEntries: [], placeOf: () => undefined, optionFor: () => null }),
 }));
 vi.mock('@/hooks/useConfiguredProviders', () => ({
   useConfiguredProviders: () => ({ providers: [], withdrawn: [], configuredSet: new Set(), statusLoading: false, statusError: false }),
+  useOAuthStatus: () => ({ data: undefined }),
 }));
 vi.mock('@/api/model', () => ({ saveClaudeCodeToken: vi.fn(), removeClaudeCodeToken: vi.fn() }));
 // DALTON-HOOK(team-credentials): the section reads the shared-credential
@@ -84,7 +90,7 @@ describe('ModelAccessSection: Claude Code', () => {
     expect(within(row()).getByText('Not connected')).toBeInTheDocument();
     fireEvent.click(within(row()).getByRole('button', { name: 'Add setup token' }));
     expect(screen.getByRole('dialog', { name: 'Add a setup token' })).toBeInTheDocument();
-    expect(screen.getByLabelText('Setup token')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Sign in with Claude' })).toBeInTheDocument();
   });
 
   // A check that never answers must not hold the token out of reach.
@@ -106,14 +112,15 @@ describe('ModelAccessSection: Claude Code', () => {
     expect(within(row()).getAllByRole('button').map((b) => b.textContent || b.getAttribute('aria-label'))).toEqual(['Replace', 'More actions']);
   });
 
-  it('once connected, replaces or removes the token, removal confirmed first', () => {
+  it('once connected, replaces or removes the token, removal confirmed first', async () => {
     status.current = { ...base, state: 'signed_in' };
     renderWithProviders(<ModelAccessSection />);
     openView();
     expect(within(row()).getByText('Connected')).toBeInTheDocument();
     fireEvent.click(within(row()).getByRole('button', { name: 'Replace' }));
-    expect(screen.getByRole('dialog', { name: 'Replace setup token' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Replace setup token' })).getByRole('button', { name: 'Close' }));
+    // Uncovered, the view is exposed again once its inert attribute is gone.
+    await screen.findByRole('dialog', { name: 'Claude Code' });
     clickRemove(row());
     expect(screen.getByRole('dialog', { name: 'Remove the Claude Code setup token?' })).toBeInTheDocument();
   });
@@ -202,8 +209,7 @@ describe('ModelAccessSection: Claude Code', () => {
 
   it('opens the sheet from a link, and closing it drops the link', () => {
     renderWithProviders(<ModelAccessSection />, { route: CLAUDE_CODE_TOKEN_URL });
-    expect(screen.getByRole('dialog', { name: 'Add a setup token' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Add a setup token' })).getByRole('button', { name: 'Close' }));
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 

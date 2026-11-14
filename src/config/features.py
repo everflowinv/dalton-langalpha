@@ -11,6 +11,8 @@ Each feature carries two orthogonal controls:
     * ``plan``    — requires a platform plan whose access tier meets the
       feature's ``min_tier`` (OSS/self-hosted deployments bypass plan gates,
       matching the search-provider tier-gating convention)
+    * ``grant``   — off unless granted to the user: an override the server
+      or a migration writes, which the user can neither see nor set
 
 Three definition layers, resolved in order:
 
@@ -23,7 +25,8 @@ Three definition layers, resolved in order:
    override of ``enabled`` / ``gate`` / ``min_tier``; unset fields inherit
    the catalog.
 3. **User override** (``user_preferences.other_preference.feature_overrides``,
-   server-side): honored only for ``opt_in``/``opt_out`` gates.
+   server-side): honored only for ``opt_in``/``opt_out``/``grant`` gates,
+   and set by the user only for the first two.
 
 Server code resolves per-user via ``src.server.services.features``; this
 module stays user-agnostic so the agent library can consult defaults.
@@ -42,6 +45,7 @@ class FeatureGate(StrEnum):
     OPT_IN = "opt_in"
     OPT_OUT = "opt_out"
     PLAN = "plan"
+    GRANT = "grant"
 
 
 # Gates whose features accept a per-user override (the Settings toggle).
@@ -170,31 +174,30 @@ FEATURES: dict[str, FeatureSpec] = {
             "gets that record, which leaves out the earlier tool results."
         ),
     ),
-    # Off in every deployment until an operator turns it on; then each user
-    # opts in. The system switch lists the Claude Code models
-    # (``src.llms.claude_code.rows_available``) and a user's opt-in lets
-    # their turns run on one (``resolve_llm_config``).
+    # On for everyone. The models are listed only where the backend can run
+    # them (``src.llms.claude_code.rows_available``: the ``claude-code`` extra
+    # and the at-rest key), and a user's turns run on one once they connect a
+    # setup token under Model access. A deployment that wants a per-user
+    # switch sets the gate to ``opt_in``.
     "claude_code_runtime": FeatureSpec(
         key="claude_code_runtime",
-        label="Claude Code runtime (preview)",
+        label="Claude Code mode",
         description=(
             "Runs your Claude threads through Claude Code on your own Claude "
-            "plan. It signs in with a setup token, a separate credential you "
-            "make for LangAlpha that never touches your own Claude Code "
-            "sign-in. Claude Code runs on your own computers, and where this "
+            "plan. It signs in with a setup token made for LangAlpha. Claude "
+            "Code runs on your own computers, and where this "
             "server offers it, also on cloud computers, with your setup token. "
             "Choose where it runs in Settings under Model access."
         ),
-        enabled=False,
-        gate=FeatureGate.OPT_IN,
+        enabled=True,
+        gate=FeatureGate.NONE,
         home="model_access",
     ),
-    # Off in every deployment until an operator turns it on in config.yaml's
-    # ``features:``; no user toggle, since "Summarize long threads after a
-    # break" (``Tuning.cold_compaction``) already decides it per user. On, a
-    # completed turn arms its thread's summary while the thread is idle on a
-    # warm cache (``services.idle_compaction``), on routes whose cache entries
-    # live an hour only.
+    # Each user opts in. For one who has, a completed turn arms its thread's
+    # summary while the thread is idle on a warm cache
+    # (``services.idle_compaction``), on routes whose cache entries live an
+    # hour only; "Summarize long threads after a break"
+    # (``Tuning.cold_compaction``) turned off still keeps it from summarizing.
     "idle_compaction": FeatureSpec(
         key="idle_compaction",
         label="Idle compaction",
@@ -202,10 +205,32 @@ FEATURES: dict[str, FeatureSpec] = {
             "Summarizes a long Claude thread while it sits idle, before its "
             "hour-long prompt cache expires, so the next message neither waits "
             "for a summary nor sends the whole conversation again. Applies only "
-            "where the cache lasts an hour, such as a Claude subscription."
+            "where the cache lasts an hour, such as the Claude sign-in (legacy); "
+            "threads in Claude Code mode are not summarized this way."
         ),
-        enabled=False,
-        gate=FeatureGate.NONE,
+        enabled=True,
+        gate=FeatureGate.OPT_IN,
+        tradeoffs=(
+            "Each summary costs like a turn: it reads the thread from the "
+            "warm cache and writes the summary. It runs whether or not you "
+            "come back, so a thread you leave for good still pays for one."
+        ),
+    ),
+    # Who may start a new Claude sign-in (the ``claude-oauth`` provider),
+    # which Claude Code replaces: only the users migration 121 granted it to,
+    # every one with a Claude sign-in stored, who keep reconnecting it. A
+    # sign-in already stored keeps working either way. A deployment still
+    # offering it to everyone sets the gate to ``none``.
+    "claude_oauth": FeatureSpec(
+        key="claude_oauth",
+        label="Claude sign-in (legacy)",
+        description=(
+            "Uses a Claude Pro or Max plan through a sign-in to your Claude "
+            "account, with LangAlpha calling Claude directly. Claude Code mode "
+            "replaces it."
+        ),
+        enabled=True,
+        gate=FeatureGate.GRANT,
     ),
     "a_share_pack": FeatureSpec(
         key="a_share_pack",
@@ -291,7 +316,7 @@ def effective_flags(
         override = override if isinstance(override, bool) else None
         if flag.gate is FeatureGate.NONE:
             resolved[key] = True
-        elif flag.gate is FeatureGate.OPT_IN:
+        elif flag.gate in (FeatureGate.OPT_IN, FeatureGate.GRANT):
             resolved[key] = override is True
         elif flag.gate is FeatureGate.OPT_OUT:
             resolved[key] = override is not False

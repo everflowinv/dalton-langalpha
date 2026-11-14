@@ -31,11 +31,13 @@ import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.hel
 import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
-  ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
+  ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
 } from './chat-input.composerParts';
 import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
 import type { ModelRowStatus } from './chat-input.modelPicker';
 import { claudeCodeHold, isClaudeCodeModel } from '@/lib/claudeCode';
+import { followErrorLink } from '@/lib/desktop';
+import { useMediumHold } from '@/pages/ChatAgent/hooks/useMediumAction';
 import { usePlanReader } from '@/hooks/useClaudeCodePlan';
 import { creditsRefused, pickerPlanHold, planOutOf } from '@/lib/claudeCodePlan';
 import { deriveRecentModels } from './chat-input.models';
@@ -102,9 +104,12 @@ export interface ChatInputHandle {
     files?: ReadyAttachment[],
     rest?: Partial<Pick<ComposerDraft, 'mentions' | 'commands'>> & { focus?: boolean },
   ) => void;
-  /** Sends what is written, as Enter does. Returns whether there was
-   *  anything to send. */
+  /** Sends what is written, as Enter does. Returns whether it went: false
+   *  when there was nothing to send, or files hold it (`holdsSend`). */
   send: () => boolean;
+  /** Whether files still uploading, or failed, hold the send. The hint
+   *  beside Send says which; the draft waits in the box. */
+  holdsSend: () => boolean;
   focus: () => void;
 }
 
@@ -305,23 +310,29 @@ function ChatInput({
     getDraftParts: () => draftPartsRef.current,
     onSendReturned: (sentText, parts) => returnSendRef.current?.(sentText, parts),
   });
+  // Where the message is going: Home for the Chief of Staff, else the
+  // selected workspace. File uploads and the slash menu both aim at it.
+  const queryClient = useQueryClient();
+  const { data: homeWorkspaceId = null } = useQuery({
+    ...homeWorkspaceQuery(queryClient),
+    enabled: scope === 'all',
+    select: (workspace) => workspace.workspace_id,
+  });
+  const slashWorkspaceId = scope === 'all' ? homeWorkspaceId : selectedWorkspaceId;
+  // Read when a file starts uploading, which is outside any render.
+  const targetWorkspaceRef = useRef<string | null>(null);
   // DALTON-HOOK(chat-large-upload): scope multipart uploads to Home or the active workspace
   const uploadWorkspaceKey = inHome || scope === 'all' ? 'home' : (selectedWorkspaceId || 'home');
   const {
-    attachedFiles,
-    isDragging,
-    handleFiles,
-    restoreFiles,
-    removeFile,
-    retryFile,
-    consumeSentFiles,
-    clearFiles,
-    onDragEnter,
-    onDragOver,
-    onDragLeave,
-    onDrop,
-    handlePaste,
-  } = useFileAttachments({ disabled, workspaceId: uploadWorkspaceKey });
+    attachedFiles, uploadingCount, failedCount, isDragging,
+    handleFiles, retryFile, restoreFiles, removeFile, discardFiles, takeFiles, holdsStale, consumeSentFiles,
+    onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste,
+  } = useFileAttachments({
+    disabled,
+    workspaceIdRef: targetWorkspaceRef,
+    workspaceId: slashWorkspaceId ?? null,
+    largeUploadWorkspaceId: uploadWorkspaceKey,
+  });
   const [watchMode, setWatchMode] = useState(false);
   // The toggle state survives the feature going off (the pill just hides), so
   // every payload derives from this gated value.
@@ -447,13 +458,9 @@ function ChatInput({
   // skills included, its disables applied). The Chief of Staff runs in Home,
   // which loads its skills as any workspace does, so the menu lists Home's
   // rather than those of the workspace the picker remembers.
-  const queryClient = useQueryClient();
-  const { data: homeWorkspaceId = null } = useQuery({
-    ...homeWorkspaceQuery(queryClient),
-    enabled: scope === 'all',
-    select: (workspace) => workspace.workspace_id,
-  });
-  const slashWorkspaceId = scope === 'all' ? homeWorkspaceId : selectedWorkspaceId;
+  useEffect(() => {
+    targetWorkspaceRef.current = slashWorkspaceId ?? null;
+  }, [slashWorkspaceId]);
   const slash = useSlashCommands({ textareaRef, message, setMessage, workspaceId: slashWorkspaceId });
   const {
     mentionedFiles, setMentionedFiles, pruneRemoved: pruneMentions, detectTrigger: detectMention,
@@ -560,6 +567,7 @@ function ChatInput({
 
   // The handle is built before the send below, so it reaches it through here.
   const sendRef = useRef<() => boolean>(() => false);
+  const holdsRef = useRef(false);
 
   // Expose addContext method for external callers (e.g. FilePanel, message selection)
   useImperativeHandle(ref, () => ({
@@ -656,11 +664,14 @@ function ChatInput({
     send() {
       return sendRef.current();
     },
+    holdsSend() {
+      return holdsRef.current || holdsStale();
+    },
     // DALTON-HOOK(composer-drafts): include setMessage and giveBackDraft from useComposerDraft
     focus() {
       textareaRef.current?.focus();
     },
-  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft]);
+  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -852,11 +863,14 @@ function ChatInput({
 
   // --- Send ---
   const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext;
+  // A file still uploading has nothing to send yet, and a failed one is never
+  // dropped unseen: either holds the send until it is ready or removed.
   // DALTON-HOOK(chat-large-upload): hold send until all selected attachments finish uploading
-  const hasIncompleteUploads = attachedFiles.some((f) => f.uploadStatus !== 'complete');
+  const filesHold = uploadingCount > 0 || failedCount > 0;
 
-  const handleSend = useCallback(() => {
-    if (!hasContent || disabled || hasIncompleteUploads) return;
+  /** Whether it sent. */
+  const handleSend = useCallback((): boolean => {
+    if (!hasContent || disabled || filesHold) return false;
 
     // System action commands (/compact, /offload) are standalone: they run on
     // send rather than starting a chat turn. If any are present, fire them and
@@ -869,27 +883,25 @@ function ChatInput({
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
       resetSlash();
-      // DALTON-HOOK(chat-large-upload): cancel any unsent server uploads on standalone action commands
-      clearFiles();
+      // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
+      discardFiles();
       resetMentions();
       if (widgetSnapshots.length > 0) {
         ContextBus.clear();
       }
       setDeckFanned(false);
       settleAfterSend(textareaRef.current);
-      return;
+      return true;
     }
 
-    // DALTON-HOOK(chat-large-upload): carry either inline dataUrl or server uploadId
-    const readyAttachments = attachedFiles
-      .filter((f) => f.uploadStatus === 'complete' && (f.dataUrl || f.uploadId))
-      .map((f) => ({
-        file: f.file,
-        dataUrl: f.dataUrl,
-        type: f.type,
-        preview: f.uploadId ? null : f.preview,
-        ...(f.uploadId ? { uploadId: f.uploadId } : {}),
-      }));
+    const totalBeforeTake = attachedFiles.length;
+    const readyAttachments = takeFiles();
+    // A file too old to name uploads again, and the send waits for it as for
+    // any upload; the hold shows before the render that counts it.
+    if (!readyAttachments) {
+      holdsRef.current = true;
+      return false;
+    }
     // Quotes go where they sit among the typed words. Chips' blocks trail.
     let finalMessage = spellOutQuotes(message, quotes);
     if (chips.length > 0) {
@@ -928,7 +940,7 @@ function ChatInput({
         },
       }),
       // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
-      { filesWithheld: readyAttachments.length < attachedFiles.length },
+      { filesWithheld: readyAttachments.length < totalBeforeTake },
     );
     // DALTON-HOOK(chat-large-upload): mark sent uploadIds so unmount cleanup keeps them intact
     consumeSentFiles();
@@ -941,17 +953,20 @@ function ChatInput({
     }
     setDeckFanned(false);
     settleAfterSend(textareaRef.current);
+    return true;
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
-  }, [hasContent, disabled, hasIncompleteUploads, message, effectiveMarketWatch, draftSubagents, attachedFiles, clearFiles, consumeSentFiles, onSend, onAction,
+  }, [hasContent, disabled, filesHold, message, effectiveMarketWatch, draftSubagents, attachedFiles.length, discardFiles, takeFiles, consumeSentFiles, onSend, onAction,
     heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
     sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
+    holdsRef.current = filesHold;
     sendRef.current = () => {
-      if (!hasContent || disabled || hasIncompleteUploads) return false;
-      handleSend();
-      return true;
+      // Held by its files, the draft is still there to send, and the hint
+      // beside Send says what it waits on; nothing went.
+      if (!hasContent || disabled || filesHold) return false;
+      return handleSend();
     };
-  }, [hasContent, disabled, hasIncompleteUploads, handleSend]);
+  }, [hasContent, disabled, filesHold, handleSend]);
 
   // --- Keyboard & Language Detection ---
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1068,6 +1083,9 @@ function ChatInput({
   // picker's own minute clock (`now`), so the composer does not turn with the
   // minute.
   const { claudeCode } = turn;
+  // A computer too small for Claude Code holds its models back with what gets
+  // it to Medium, which picking one of them does.
+  const mediumHold = useMediumHold(claudeCode.state === 'needs_bigger_computer' ? claudeCode.smallComputerId : null);
   const planReader = usePlanReader();
   const modelGroupList = useMemo(() => modelGroups({
     models: turn.models,
@@ -1085,6 +1103,7 @@ function ChatInput({
     .filter((m) => !favorites.models.includes(m));
   const modelRowStatus = (m: string, now: number): ModelRowStatus => {
     if (isClaudeCodeModel(modelMetadata[m])) {
+      if (mediumHold) return mediumHold;
       const hold = claudeCodeHold(claudeCode.state, turn.workspaceId, {
         home: chiefOfStaff, cliComputerName: claudeCode.cliComputerName,
       });
@@ -1092,7 +1111,7 @@ function ChatInput({
         const { link } = hold;
         return {
           unavailable: t(hold.messageKey, hold.messageValues),
-          fix: link ? () => (link.external ? window.open(link.url, '_blank', 'noopener,noreferrer') : navigate(link.url)) : undefined,
+          fix: link ? () => followErrorLink(link, navigate) : undefined,
         };
       }
       const planOut = planOutOf(preferences?.other_preference);
@@ -1415,10 +1434,12 @@ function ChatInput({
                   onToggle={toggleListening}
                 />
               )}
+              {/* Also beside Stop: Enter steering a running turn waits on the files too. */}
+              {filesHold && <FilesHoldHint uploading={uploadingCount} failed={failedCount} />}
               {/* DALTON-HOOK(chat-large-upload): disable send button while uploads are in flight or failed */}
               <SendStopButton
                 running={isLoading || isCompacting}
-                canSend={!!hasContent && !disabled && !hasIncompleteUploads}
+                canSend={!!hasContent && !disabled && !filesHold}
                 onSend={handleSend}
                 onStop={onStop}
               />

@@ -8,6 +8,7 @@ import { FileChangedError, markStale, parseContentRange, type RangedFile } from 
 import { withDownloadNotice, workspaceDownloadKey, type DownloadProgressReport } from '../downloadNotice';
 import type { FileRefResolution } from '../../components/filePanel/types';
 import type { BackupResponse, BackupStatusResponse } from '@/types/api';
+import type { SignedUploadPart } from '../partUpload';
 
 /**
  * Resolve a file reference to one workspace path in a single server lookup.
@@ -340,13 +341,6 @@ export type UploadBegin =
     part_count: number;
     expires_at: string;
   };
-
-export interface SignedUploadPart {
-  part_number: number;
-  offset: number;
-  size: number;
-  url: string;
-}
 
 export interface UploadStatus {
   upload_id: string;

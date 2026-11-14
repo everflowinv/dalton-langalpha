@@ -10,6 +10,7 @@ import pytest
 
 from src.config.features import FeatureGate
 from src.server.database.home_workspace import get_home_workspace_id
+from src.server.database.claude_code_hosted import Custody
 from src.server.models.claude_code import (
     ClaudeCodeChiefOfStaff, ClaudeCodeComputer, ClaudeCodeCustody, ClaudeCodeStatus,
 )
@@ -37,38 +38,56 @@ def _own(state, expires_at=None):
 
 
 @pytest.mark.parametrize(
-    ("states", "status", "cloud_ready", "expected"),
+    ("states", "status", "cloud", "expected"),
     [
-        (["offline", "signed_in"], OFF, False, "connected"),
-        (["rejected", "unverified"], OFF, False, "connected"),
-        (["rejected", "checking"], OFF, False, "checking"),
-        (["no_token", "rejected"], OFF, False, "refused"),
-        (["no_token", "offline"], OFF, False, "not_connected"),
-        (["off", "offline"], OFF, False, "not_connected"),
-        (["offline"], OFF, True, "not_connected"),
-        (["offline", "needs_perl"], OFF, False, "offline"),
-        (["needs_perl", "policy_blocked", "computer_unsupported"], OFF, False, "unsupported"),
-        ([], OFF, False, "no_computer"),
-        ([], ClaudeCodeStatus(state="no_token"), False, "not_connected"),
-        ([], ClaudeCodeStatus(state="signed_in"), False, "connected"),
-        ([], ClaudeCodeStatus(state="policy_blocked"), False, "unsupported"),
+        (["offline", "signed_in"], OFF, None, "connected"),
+        (["rejected", "unverified"], OFF, None, "connected"),
+        (["rejected", "checking"], OFF, None, "checking"),
+        (["no_token", "rejected"], OFF, None, "refused"),
+        (["no_token", "offline"], OFF, None, "not_connected"),
+        (["off", "offline"], OFF, None, "not_connected"),
+        (["offline"], OFF, "ready", "not_connected"),
+        (["offline", "needs_perl"], OFF, None, "offline"),
+        (["needs_perl", "policy_blocked", "computer_unsupported"], OFF, None, "unsupported"),
+        ([], OFF, None, "no_computer"),
+        ([], ClaudeCodeStatus(state="no_token"), None, "not_connected"),
+        ([], ClaudeCodeStatus(state="signed_in"), None, "connected"),
+        ([], ClaudeCodeStatus(state="policy_blocked"), None, "unsupported"),
     ],
 )
-def test_the_first_state_that_holds_over_every_way_it_runs_wins(states, status, cloud_ready, expected):
+def test_the_first_state_that_holds_over_every_way_it_runs_wins(states, status, cloud, expected):
     computers = [_own(s) for s in states]
-    assert summary(computers, status, cloud_ready=cloud_ready, now=NOW) == expected
+    assert summary(computers, status, cloud=cloud, now=NOW) == expected
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        (["offline"], "offline"),
+        (["offline", "needs_perl"], "offline"),
+        (["no_token", "offline"], "not_connected"),
+        (["needs_perl"], "not_connected"),
+        ([], "not_connected"),
+    ],
+)
+def test_an_offline_computer_is_said_first_where_cloud_computers_wait_on_the_users_choice(states, expected):
+    computers = [_own(s) for s in states]
+    assert summary(computers, OFF, cloud="chosen", now=NOW) == expected
 
 
 def test_a_token_past_its_expiry_is_refused_though_its_last_check_passed():
     past, later = NOW - timedelta(minutes=1), NOW + timedelta(days=1)
-    assert summary([_own("signed_in", past)], OFF, cloud_ready=False, now=NOW) == "refused"
+    assert summary([_own("signed_in", past)], OFF, cloud=None, now=NOW) == "refused"
     saved = ClaudeCodeStatus(state="unverified", expires_at=past)
-    assert summary([], saved, cloud_ready=False, now=NOW) == "refused"
-    assert summary([_own("signed_in", later)], OFF, cloud_ready=False, now=NOW) == "connected"
+    assert summary([], saved, cloud=None, now=NOW) == "refused"
+    assert summary([_own("signed_in", later)], OFF, cloud=None, now=NOW) == "connected"
 
 
 async def _setup(world, **switches):  # noqa: F811
+    """A deployment that gates Claude Code ``opt_in`` unless ``gate`` says
+    otherwise, since a user before opting in exists only there."""
     with (
+        patch(f"{SETUP}.system_flag", return_value=SimpleNamespace(gate=switches.get("gate", FeatureGate.OPT_IN))),
         patch(f"{SETUP}.rows_available", side_effect=lambda: world.rows),
         patch(f"{SETUP}.user_feature_enabled", new_callable=AsyncMock, side_effect=lambda *_: world.opted_in),
         patch(f"{SETUP}.backend_available", return_value=switches.get("backend", False)),
@@ -76,8 +95,7 @@ async def _setup(world, **switches):  # noqa: F811
         patch(f"{SETUP}.hosted.custody", new_callable=AsyncMock, return_value=switches.get("custody")),
         patch(f"{SETUP}.hosted.choice_offered", return_value=switches.get("offered", False)),
         patch(
-            f"{SETUP}.hosted.cloud_view", new_callable=AsyncMock,
-            return_value=(switches.get("refusals", {}), OnCloud(Hosted("saved_token"))),
+            f"{SETUP}.hosted.tier_refusals", new_callable=AsyncMock, return_value=switches.get("refusals", {}),
         ),
         patch(f"{SETUP}.hosted.in_sandbox", return_value=switches.get("sandbox", False)),
         patch(f"{SETUP}.get_computers_for_user", switches.get("listed", AsyncMock(return_value=[]))),
@@ -101,8 +119,7 @@ async def test_a_server_that_offers_no_claude_code_answers_nothing(world):  # no
 ])
 async def test_a_user_the_gate_keeps_off_has_nothing_to_set_up(world, gate, opted_in, answers):  # noqa: F811
     world.opted_in = opted_in
-    with patch(f"{SETUP}.system_flag", return_value=SimpleNamespace(gate=gate)):
-        answer = await _setup(world)
+    answer = await _setup(world, gate=gate)
     assert (answer is not None) is answers
 
 
@@ -149,6 +166,31 @@ async def test_with_no_own_computer_and_not_on_it_is_ready_only_where_something_
         answer = await _setup(world, backend=backend, custody=custody)
     assert (answer.state, answer.computers, answer.saved_token_runs) == (state, [], backend)
     assert answer.cloud is (custody is not None and bool(custody.offered) and custody.refusal != "needs_own_computer")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("opted_in", "state"), [(False, "not_connected"), (True, "offline")])
+async def test_an_offline_computer_is_said_first_only_once_on_where_cloud_computers_wait_on_the_users_choice(
+    world, opted_in, state,  # noqa: F811
+):
+    """Off, where it runs is not chosen yet, and storing a token for cloud
+    computers is still open: the entry offers to turn it on rather than wait
+    on a computer of theirs that is out of reach."""
+    world.opted_in = opted_in
+    world.computer, world.tunnel_live = _computer("running"), False
+    with patch("src.server.services.claude_code.hosted.get_custody", new_callable=AsyncMock, return_value=Custody()):
+        answer = await _setup(world, offered=True, custody=_custody())
+    assert (answer.state, answer.computers[0].state) == (state, "offline")
+
+
+@pytest.mark.asyncio
+async def test_once_on_with_no_own_computer_storing_a_token_for_cloud_computers_is_what_is_left(world):  # noqa: F811
+    with (
+        patch("src.server.services.claude_code.machine.get_computer_roster", new_callable=AsyncMock, return_value=[]),
+        patch("src.server.services.claude_code.hosted.get_custody", new_callable=AsyncMock, return_value=Custody()),
+    ):
+        answer = await _setup(world, offered=True, custody=_custody())
+    assert (answer.on, answer.state) == (True, "not_connected")
 
 
 @pytest.mark.asyncio
@@ -234,6 +276,19 @@ async def test_once_on_a_computer_the_idle_sweep_stopped_reads_as_its_token_last
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["starting", "stopping"])
+async def test_once_on_a_computer_this_server_is_starting_or_stopping_reads_as_its_token_last_worked(world, status):  # noqa: F811
+    """A turn waits the start or stop out and runs there, so the computer
+    and the Chief of Staff's placement on it are not offline meanwhile."""
+    world.machine.token = "sk-ant-oat01-mine"
+    await _setup(world)
+    assert (await _setup(world)).state == "connected"
+    world.computer = _computer(status)
+    answer = await _setup(world)
+    assert (answer.state, answer.computers[0].state) == ("connected", "signed_in")
+
+
+@pytest.mark.asyncio
 async def test_once_on_a_computer_that_went_out_of_reach_reads_offline_though_its_token_last_worked(world):  # noqa: F811
     world.machine.token = "sk-ant-oat01-mine"
     await _setup(world)
@@ -289,29 +344,6 @@ async def test_the_chief_of_staff_runs_on_the_own_computer_a_home_turn_would_or_
     assert answer.model_dump() == {**shown, "default_runs": default_runs}
     placed.assert_awaited_once_with(USER, HOME, token=True)
     ran.assert_awaited_once_with(USER, where)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("default_runs", "replied", "runs"),
-    [(True, False, True), (True, True, False), (False, False, False), (False, True, False)],
-)
-async def test_a_home_thread_another_model_last_replied_on_runs_the_deployments_default(default_runs, replied, runs):
-    """As its turn is admitted (``chief_of_staff_default_runs``), so the composer starts that thread
-    on the model the server runs. The checkpoint is read only where the Default would run otherwise."""
-    read = AsyncMock(return_value=replied)
-    with (
-        patch(f"{SETUP}.hosted.cli_placement", AsyncMock(return_value=OnOwn(STUDIO, picked=True))),
-        patch(f"{SETUP}.hosted.in_sandbox", lambda: False),
-        patch(DEFAULT_RUNS, AsyncMock(return_value=default_runs)),
-        patch("src.server.services.llm.claude_code.another_model_replied", read),
-    ):
-        answer = await chief_of_staff(USER, thread_id="t-1")
-    assert answer.default_runs is runs
-    if default_runs:
-        read.assert_awaited_once_with("t-1")
-    else:
-        read.assert_not_awaited()
 
 
 @pytest.mark.asyncio

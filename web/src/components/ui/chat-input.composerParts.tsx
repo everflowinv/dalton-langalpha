@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils';
 import { CHIP_PRESENCE, mentionPillKeys } from './chat-input.helpers';
 import { escapeToken } from './chat-input.quoteTokens';
 import { QuoteCard } from './chat-input.quoteCard';
-import { FilePreviewCard } from './chat-input.parts';
+import { FileTile } from './chat-input.parts';
 import type { ToolbarItem } from './chat-input.useToolbarFold';
 import type { ChipContext, FileAttachment, QuoteMention } from './chat-input.types';
 
@@ -189,7 +189,7 @@ export function ComposerAttachments({
         )}
         {/* DALTON-HOOK(chat-large-upload): wire per-card retry action for failed uploads */}
         {files.map((file) => (
-          <FilePreviewCard
+          <FileTile
             key={file.id}
             file={file}
             onRemove={onRemoveFile}
@@ -198,6 +198,28 @@ export function ComposerAttachments({
         ))}
       </AnimatePresence>
     </div>
+  );
+}
+
+/**
+ * Why Send is held by the attached files, left of it: some still uploading,
+ * or some that failed and wait to be retried or removed.
+ */
+export function FilesHoldHint({ uploading, failed }: { uploading: number; failed: number }) {
+  const { t } = useTranslation();
+  const text = failed > 0
+    ? t('chat.composer.attachment.holdFailed', { count: failed })
+    : t('chat.composer.attachment.holdUploading', { count: uploading });
+  return (
+    <span
+      role="status"
+      className={cn(
+        'mr-1 min-w-0 truncate text-xs tabular-nums',
+        failed > 0 ? 'text-(--color-loss)' : 'text-(--color-text-tertiary)',
+      )}
+    >
+      {text}
+    </span>
   );
 }
 

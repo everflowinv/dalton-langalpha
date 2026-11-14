@@ -33,7 +33,16 @@
     "failed": "失败",
     "language": "语言",
     "languageCurrent": "语言：{{language}}",
-    "optional": "（可选）"
+    "optional": "（可选）",
+    "sortable": {
+      "handle": "移动 {{name}}",
+      "instructions": "按空格键或回车键拿起一项，用方向键移动，再按空格键或回车键放下，按 Esc 取消。",
+      "pickedUp": "已拿起 {{name}}。",
+      "over": "{{name}} 位于 {{over}} 上方。",
+      "inPlace": "{{name}} 回到原位。",
+      "dropped": "{{name}} 已放到 {{over}} 的位置。",
+      "cancelled": "已取消移动 {{name}}。"
+    }
   },
   "auth": {
     "login": "登录",
@@ -287,8 +296,17 @@
         "tradeoffs": "OpenAI 的摘要是加密的，只有 OpenAI 模型能读取，所以压缩卡片显示的是对话的简要记录。把这样的对话切换到其他服务商的模型后，新模型拿到的就是这份记录，其中不含早先的工具结果。"
       },
       "claude_code_runtime": {
-        "label": "Claude Code 运行时（预览版）",
-        "description": "通过 Claude Code 运行你的 Claude 对话，用量计入你自己的 Claude 套餐。它用 setup token 登录，这是专为 LangAlpha 生成的独立凭据，不会影响你自己的 Claude Code 登录。Claude Code 在你自己的电脑上运行；如果此服务器提供该选项，也可以在云端计算机上运行，使用你的 setup token。请在设置的“模型接入”中选择运行位置。"
+        "label": "Claude Code 模式",
+        "description": "通过 Claude Code 运行你的 Claude 对话，用量计入你自己的 Claude 套餐。它用专为 LangAlpha 生成的 setup token 登录。Claude Code 在你自己的电脑上运行；如果此服务器提供该选项，也可以在云端计算机上运行，使用你的 setup token。请在设置的“模型接入”中选择运行位置。"
+      },
+      "idle_compaction": {
+        "label": "空闲时压缩",
+        "description": "长的 Claude 对话空闲时，在它一小时的提示词缓存过期之前先做好摘要，这样你下次发消息时既不用等摘要，也不必把整段对话重新发送一遍。只在缓存能保留一小时的情况下生效，比如通过 Claude 登录（旧版）使用时；Claude Code 模式下的对话不会这样做摘要。",
+        "tradeoffs": "每次摘要的用量和一轮对话相当：要从仍有效的缓存中读取整个对话，再写出摘要。不管你回不回来它都会运行，所以就算这个对话你不再继续，也要为这次摘要付费。"
+      },
+      "claude_oauth": {
+        "label": "Claude 登录（旧版）",
+        "description": "通过登录你的 Claude 账户使用 Claude Pro 或 Max 套餐，由 LangAlpha 直接调用 Claude。Claude Code 模式将取代它。"
       },
       "a_share_pack": {
         "label": "A 股市场包",
@@ -633,6 +651,7 @@
       "appearance": "外观",
       "chat": "对话",
       "artifacts": "Artifact",
+      "desktop": "桌面应用",
       "agent": "行为",
       "model": "模型",
       "integrations": "集成",
@@ -647,6 +666,7 @@
       "appearance": "主题（样式与浅色或深色）和字号。",
       "chat": "回复如何呈现，以及 Agent 工作时对话里显示什么。",
       "artifacts": "评论 Agent 生成的文件时的默认设置。",
+      "desktop": "这台电脑上的通知、菜单栏，以及应用如何启动。",
       "agent": "Agent 如何作答、哪些操作无需询问，以及如何搜索网页。",
       "model": "你可用的模型，以及 Agent 实际使用的模型。",
       "integrations": "在聊天应用中与你的 Agent 对话，并管理用你的账户登录的应用。",
@@ -790,6 +810,78 @@
       "channelPlatformDiscord": "Discord",
       "systemJobsLabel": "系统自动任务",
       "systemJobsDesc": "查看并手动触发知识库同步、研报增量扫描、公司近况巡检等系统任务。"
+    },
+    "desktop": {
+      "notificationsGroup": "通知",
+      "notificationsGroupDesc": "当你没在看对应对话时，由系统弹出通知。",
+      "notifyTurn": "回复完成",
+      "notifyTurnDesc": "你发起的回复准备好时。",
+      "notifyNeedsInput": "需要你的输入",
+      "notifyNeedsInputDesc": "Agent 停下来向你提问时。",
+      "notifyWakeup": "唤醒与价格提醒",
+      "notifyWakeupDesc": "Agent 按约定回来查看，或价格提醒触发时。",
+      "notifyAutomation": "自动化",
+      "notifyAutomationDesc": "自动化完成一次运行时。",
+      "notifyStarted": "后台任务开始时也通知",
+      "notifyStartedDesc": "价格提醒或自动化开始时静默显示一条通知，完成后替换为结果。唤醒只在有发现时通知你。",
+      "menubarGroup": "菜单栏",
+      "menubarIcon": "在菜单栏显示图标",
+      "menubarIconDesc": "行情、持仓和 Agent 动态，一键可见。",
+      "menubarItems": "菜单栏显示",
+      "menubarItemsDesc": "显示在图标旁边。拖动可调整顺序。",
+      "menubarItemsDescTooltip": "显示在托盘图标的提示中。拖动可调整顺序。",
+      "menubarItemsDescMenu": "显示在托盘菜单顶部。拖动可调整顺序。",
+      "itemPortfolio": "持仓",
+      "addSymbol": "添加代码",
+      "addPortfolio": "添加持仓",
+      "addTile": "添加",
+      "itemsFull": "最多 {{count}} 个",
+      "removeItem": "移除 {{name}}",
+      "menubarStyle": "多于一项时",
+      "menubarStyleDesc": "轮播时宽度保持不变。",
+      "menubarStyleRotate": "轮播",
+      "menubarStyleSide": "并排",
+      "rotateEvery": "轮播间隔",
+      "rotateSeconds_other": "每 {{count}} 秒",
+      "menubarShow": "显示",
+      "menubarShowDesc": "每一项显示的内容。",
+      "menubarShowChange": "涨跌幅",
+      "menubarShowPrice": "价格",
+      "menubarShowBoth": "两者",
+      "menubarExtended": "盘前盘后",
+      "menubarExtendedDesc": "有盘前或盘后变动时显示。",
+      "panelGroup": "面板",
+      "panelGroupDesc": "点击图标时打开的内容。",
+      "panelSections": "板块",
+      "panelSectionsDesc": "按此顺序显示。拖动可调整顺序。",
+      "section": {
+        "market": "市场",
+        "portfolio": "持仓",
+        "watchlist": "自选",
+        "agent": "Agent"
+      },
+      "panelTiles": "行情卡片",
+      "panelTilesDesc": "最多 4 个：指数、ETF、加密货币或股票均可。",
+      "panelWatchlist": "自选列表",
+      "panelWatchlistDesc": "显示哪个列表，以及显示几行。",
+      "watchlistWhich": "选择自选列表",
+      "watchlistDefault": "默认",
+      "watchlistDefaultNamed": "{{name}}（默认）",
+      "watchlistRowsLabel": "行数",
+      "watchlistRows_other": "{{count}} 行",
+      "shortcut": "快捷键",
+      "shortcutDesc": "在任何应用中打开菜单栏面板。点击后按下按键。",
+      "shortcutNone": "录制快捷键",
+      "shortcutRecording": "请按键…",
+      "shortcutClear": "清除",
+      "shortcutError": "无法使用此快捷键：{{error}}",
+      "startupGroup": "启动",
+      "openAtLogin": "登录时打开",
+      "openAtLoginDesc": "登录这台电脑时在后台启动 LangAlpha。",
+      "openAtLoginWindowDesc": "登录这台电脑时打开 LangAlpha 窗口。开启图标后，改为在后台启动。",
+      "keepRunning": "关闭窗口后在托盘中继续运行",
+      "keepRunningDesc": "关闭窗口后，通知和托盘图标仍会继续工作。",
+      "unavailable": "桌面应用没有响应，请重启后再试。"
     }
   },
   "dashboard": {
@@ -2012,6 +2104,7 @@
       "provider": "远程控制",
       "asAccount": "以 {{account}} 身份",
       "notConnected": "未连接",
+      "pairedElsewhere": "已连接到其他账号",
       "paused": "远程控制已暂停，可在 LangAlpha 菜单中恢复。",
       "removeTurnsOff": "这台 Mac 上的远程控制也会随之关闭。",
       "cardTitlePc": "这台电脑",
@@ -2334,7 +2427,23 @@
       "draftAttachmentsRestored": "草稿不保留附件，重新发送前请重新添加。",
       "inFlightDraftRestore": "放回输入框",
       "inFlightDraftDiscard": "丢弃",
-      "inFlightDraftMore": "还有 {{count}} 条未确认的发送"
+      "inFlightDraftMore": "还有 {{count}} 条未确认的发送",
+      "attachment": {
+        "retry": "重试",
+        "preview": "预览 {{name}}",
+        "saving": "保存中",
+        "failed": "上传失败",
+        "sendFailed": "文件没能发出去，请检查网络连接。",
+        "tooLarge": "文件太大，无法添加。",
+        "uploadingLabel": "{{name}}，正在上传，{{percent}}%",
+        "failedLabel": "{{name}} 上传失败：{{error}}",
+        "holdUploading_one": "还有 {{count}} 个文件在上传…",
+        "holdUploading_other": "还有 {{count}} 个文件在上传…",
+        "holdFailed_one": "有 {{count}} 个文件需要重试或移除",
+        "holdFailed_other": "有 {{count}} 个文件需要重试或移除",
+        "notReceived": "未收到",
+        "notReceivedLabel": "{{name}}，未收到"
+      }
     },
     "mention": {
       "noMatching": "无匹配文件",
@@ -2378,9 +2487,37 @@
     "editReplacesLater": "此消息之后的内容将被替换，且无法恢复。",
     "errorHintApiKey": "请确认 API 密钥正确且未被撤销。",
     "errorHintModelAccess": "请确认您的套餐或订阅允许访问此模型。",
+    "errorHintProviderBalance": "该模型提供商的账户余额不足，请到提供商网站充值后重试。",
     "errorHintProviderStatus": "请查看提供商状态页，了解是否存在服务中断。",
     "errorHintTryAnotherModel": "请尝试在模型选择器中切换到其他模型。",
     "errorHintReconnectAccount": "您的订阅登录需要更新，请前往设置重新连接。",
+    "errorPlatformHeadline": "模型未能完成这次回复",
+    "errorPlatformHeadlineModel": "{{model}} 未能完成这次回复",
+    "errorPlatformDetail": "模型服务在我们这边出了问题，您的账户无需任何处理。",
+    "errorSourceOwnKeyNamed": "此错误来自 {{account}}，通过您自己的 API 密钥调用。",
+    "errorSourceOwnKey": "此错误来自模型提供商，通过您自己的 API 密钥调用。",
+    "errorSourceSubscriptionNamed": "此错误来自 {{account}}，通过您连接的订阅调用。",
+    "errorSourceSubscription": "此错误来自模型提供商，通过您连接的订阅调用。",
+    "errorSourceServerKey": "此错误来自模型提供商，通过本服务器配置的 API 密钥调用。",
+    "errorSourceLocal": "此错误来自您自己的模型服务器。",
+    "errorHintLocalServer": "请确认您的本地模型服务器正在运行且可以访问。",
+    "errorHintRetryLater": "请过几分钟再试。",
+    "errorHintNewThread": "如果在这个对话中反复出现，请新建一个对话。",
+    "errorHintRateLimited": "提供商限制了请求频率，请稍等一分钟再试。",
+    "errorHintProviderOverloaded": "提供商当前负载过高，请过几分钟再试。",
+    "errorHintContentBlocked": "提供商的内容审核拦截了此请求，请换一种说法或切换到其他模型。",
+    "errorHintProviderQuota": "您在该提供商的套餐对此模型已无可用额度，请检查其账单设置。",
+    "planLimitTitle": "{{plan}} 套餐额度已用完",
+    "planLimitWindowReset": "您的 {{plan}} 套餐的{{window}}已用完，将于 {{time}} 重置。可以换一个模型，或等重置后再发送。",
+    "planLimitReset": "您的 {{plan}} 套餐额度已用完，将于 {{time}} 重置。可以换一个模型，或等重置后再发送。",
+    "planLimitUnknown": "您的 {{plan}} 套餐额度已用完。可以换一个模型，或稍后再发送。",
+    "planLimitWindow": {
+      "five_hour": " 5 小时额度",
+      "seven_day": "每周额度",
+      "seven_day_opus": "每周 Opus 额度",
+      "seven_day_sonnet": "每周 Sonnet 额度",
+      "seven_day_overage_included": "每周 Fable 额度"
+    },
     "errorLinkManagePlan": "管理套餐",
     "errorLinkViewUsage": "查看用量",
     "errorLinkReconnect": "重新连接",
@@ -2455,6 +2592,7 @@
       "lapsed": "你的 {{account}} 登录已过期。重新连接后即可使用 {{model}}。",
       "offer": "此对话使用 {{model}}，新对话默认使用 {{defaultModel}}。",
       "handoff": "OpenAI 已将此对话的一部分压缩成只有其模型能读取的摘要。之前的模型正在为 {{model}} 把它写成文字，下一条消息可能要稍等片刻才会开始。",
+      "brief": "正在把这段对话的上下文交接给 {{model}}，好让它接着往下做。下一条消息可能要稍等片刻才会开始。",
       "makeDefault": "将 {{model}} 设为默认"
     },
     "backgroundTasksRunning": "后台任务仍在运行",
@@ -2741,6 +2879,8 @@
     "offloading": "正在转存上下文...",
     "turnHeld": {
       "handoff": "正在等待上一个模型写出摘要...",
+      "brief": "正在把上下文交接给 {{model}}...",
+      "briefNoModel": "正在把上下文交接给新模型...",
       "other": "正在等待此对话上的当前操作完成..."
     },
     "compactionStopped": "压缩已停止",
@@ -2781,12 +2921,16 @@
       "chart-annotationDesc": "将分析作为图层绘制在价格图表上：价位、线条、区间、指标和预测，实时显示在 MarketView，或作为聊天中的图表卡片"
     },
     "compactedNotification": "上下文已压缩 · {{from}} 条消息 → 摘要",
+    "handOffNotification": "上下文已交接 · {{from}} → {{to}}",
+    "handOffNotificationDigest": "上下文已交接 → {{to}}",
     "taskErrorNotification": "子任务运行失败",
     "taskStoppedNotification": "子任务运行已停止",
     "taskSteeringReturnedNotification": "引导消息已退回 · 运行在送达前已结束",
     "taskSteeringNotSentNotification": "引导消息未发送",
     "viewSummary": "查看摘要",
     "hideSummary": "隐藏摘要",
+    "viewBrief": "查看交接摘要",
+    "hideBrief": "隐藏交接摘要",
     "offloadedArgsNotification": "工具参数已转存 · {{count}} 个工具",
     "offloadedReadsNotification": "过期读取结果已转存 · {{count}} 个读取",
     "offloadedNotification": "上下文已转存 · {{args}} 个工具参数, {{reads}} 个读取",
@@ -2836,7 +2980,10 @@
       "claudeCodeCliComputerOffline": "{{name}} 目前离线",
       "claudeCodeNeedsBiggerComputer": "需要中型及以上规格的云端计算机，或你自己的电脑",
       "claudeCodeNeedsBiggerComputerHome": "需要中型及以上规格的云端计算机",
-      "claudeCodeNeedsBiggerComputerPlan": "需要中型及以上规格的云端计算机：可更改规格或升级 LangAlpha 套餐，或使用你自己的电脑"
+      "claudeCodeNeedsBiggerComputerPlan": "需要中型及以上规格的云端计算机：可更改规格或升级 LangAlpha 套餐，或使用你自己的电脑",
+      "claudeCodeNeedsMedium": "需要中型及以上的云端计算机。选择即可更改规格。",
+      "claudeCodeNeedsMediumPlan": "需要中型及以上的云端计算机，当前套餐不含。选择即可升级套餐。",
+      "claudeCodeNeedsMediumResizing": "所在计算机正在改为中型。"
     },
     "voice": {
       "start": "开启语音输入",
@@ -3718,6 +3865,7 @@
     "stateKeyRejected": "API 密钥被拒",
     "stateUsageLimit": "已达用量上限",
     "stateClaudePlan": "Claude 套餐已达限额",
+    "statePlanLimit": "套餐已达限额",
     "statePaused": "已暂停",
     "stateFinished": "已结束",
     "stateWatching": "监控中",
@@ -4412,7 +4560,7 @@
     "methodTitle": "你想如何连接？",
     "methodSubtitle": "选择访问 AI 模型的方式。你可以稍后添加更多提供商。",
     "methodOAuth": "使用订阅",
-    "methodOAuthDesc": "登录 ChatGPT、Claude 或 Grok，或添加 Kimi、GLM、MiniMax 或 OpenCode 的编程套餐。",
+    "methodOAuthDesc": "使用 Claude Code，登录 ChatGPT 或 Grok，或添加 Kimi、GLM、MiniMax 或 OpenCode 的编程套餐。",
     "methodApiKey": "我有 API 密钥",
     "methodApiKeyDesc": "按用量付费，支持任意提供商。",
     "methodLocal": "我在本地运行模型",
@@ -5195,7 +5343,8 @@
         "remove": "移除 {{name}}",
         "tooMany": "最多只能添加 {{max}} 张截图，其余的已忽略。",
         "notImage": "{{name}} 不是 PNG、JPEG、WebP 或 GIF 图片。",
-        "unreadable": "无法读取 {{name}}。"
+        "unreadable": "无法读取 {{name}}。",
+        "uploadFailed": "{{name}} 上传失败，请重新添加。"
       }
     }
   },
@@ -7054,7 +7203,7 @@
       "open": "打开 OpenAI"
     },
     "claudeCode": {
-      "detail": "专用的 setup token，不使用你的 Claude Code 登录",
+      "detail": "专用的 setup token",
       "rejected": "Claude 拒绝了此 token，它可能已过期或被撤销。",
       "add": "添加 setup token",
       "addNew": "添加新 token",
@@ -7063,14 +7212,13 @@
       "moreActions": "更多操作",
       "addTitle": "添加 setup token",
       "replaceTitle": "替换 setup token",
-      "intro": "Claude Code 模式让你的 Claude 对话使用你自己的 Claude 套餐运行。它通过专为 LangAlpha 生成的 setup token 登录。",
-      "separate": "此 token 是专为 LangAlpha 生成的独立凭据，绝不是你的 Claude Code 登录。用量计入你的 Claude 套餐。它经加密存储，仅用于你自己的请求。",
+      "separate": "LangAlpha 会加密保存此 token。",
       "stepInstall": "如果尚未安装 Claude Code，请先安装。",
       "installLink": "安装指南",
       "stepRun": "在本机或任意一台电脑的终端中运行：",
       "stepSignIn": "在它打开的浏览器窗口中登录 Claude。",
-      "stepCopy": "复制它输出的 token。较长的 token 可能换到第二行，请完整复制。",
-      "stepPaste": "粘贴到下方并保存。",
+      "stepCopy": "完整复制它输出的 token，换行的部分也要复制。",
+      "stepPaste": "粘贴到下方。",
       "fieldLabel": "Setup token",
       "fieldPlaceholder": "粘贴你的 setup token",
       "save": "保存 token",
@@ -7090,7 +7238,7 @@
         "unknown": "无法保存 token，请重试。"
       },
       "removeTitle": "移除 Claude Code 的 setup token？",
-      "removeBody": "LangAlpha 将删除此 token。Claude Code 模型仍会列出，但在你添加新 token 前无法运行。你自己的 Claude Code 登录不受影响。",
+      "removeBody": "在你添加新 token 前，使用此 token 的 Claude Code 无法运行。",
       "removeConfirm": "移除 token",
       "removeFailed": "无法移除 token，请重试。",
       "turnsRunning": "你的 token 已删除，但仍有一个使用它的 Claude Code 对话未能停止。请在该对话中手动停止。",
@@ -7099,7 +7247,7 @@
       "expired": "此 token 最晚已于 <date>{{date}}</date> 过期。请添加新的 token 以继续使用 Claude Code。",
       "expiresSoon": "此 token 最晚将于 <date>{{date}}</date> 过期。请在此之前添加新的 token，让 Claude Code 继续运行。",
       "signIn": {
-        "intro": "在新标签页中登录 Claude，LangAlpha 随后会为自己生成 setup token，无需在终端中运行任何命令。",
+        "intro": "登录 Claude，LangAlpha 会为你生成 token。",
         "start": "使用 Claude 登录",
         "codeHint": "批准后，Claude 会显示一段代码。请完整复制并粘贴到这里。",
         "fieldLabel": "来自 Claude 的代码",
@@ -7126,14 +7274,13 @@
         }
       },
       "computer": {
-        "intro": "Claude Code 在 {{name}} 上运行你的 Claude 对话，使用你自己的 Claude 套餐。它通过专为 LangAlpha 生成的 setup token 登录，token 保存在这台电脑上。",
-        "separate": "此 token 是专为 LangAlpha 生成的独立凭据，绝不是你的 Claude Code 登录。用量计入你的 Claude 套餐。它只保存在 {{name}} 上，LangAlpha 不保留副本。",
-        "signInIntro": "在新标签页中登录 Claude，LangAlpha 随后会生成 setup token 并放到 {{name}} 上，无需在终端中运行任何命令。",
+        "separate": "此 token 只保存在 {{name}} 上。",
+        "signInIntro": "登录 Claude，LangAlpha 会把 token 放到 {{name}} 上。",
         "addTitle": "为 {{name}} 添加 setup token",
         "replaceTitle": "替换 {{name}} 上的 setup token",
         "removeTitle": "从 {{name}} 移除 setup token？",
-        "removeBody": "LangAlpha 将从 {{name}} 删除此 token。在你添加新 token 前，Claude Code 无法在这台电脑上运行。你自己的 Claude Code 登录不受影响。",
-        "removeBodySaved": "LangAlpha 将从 {{name}} 删除此 token，之后这台电脑上的 Claude Code 将使用你已保存的 token。你自己的 Claude Code 登录不受影响。",
+        "removeBody": "在你添加新 token 前，Claude Code 无法在这台电脑上运行。",
+        "removeBodySaved": "之后这台电脑上的 Claude Code 将使用你已保存的 token。",
         "ownToken": "使用这台电脑自己的 token",
         "savedToken": "使用你已保存的 token",
         "noToken": "这台电脑还没有 setup token",
@@ -7153,10 +7300,10 @@
       "hosted": {
         "heading": "Claude Code 在哪里运行",
         "local": "在你自己的电脑上",
-        "localDetail": "Claude Code 在你自己的、有独立 setup token 的电脑上运行，所有工作区都是如此，包括云端计算机上的工作区。这些工作区的文件和命令仍在云端计算机上运行，LangAlpha 不会保留 token 的副本。",
+        "localDetail": "由你自己的电脑运行，LangAlpha 不保留 setup token。",
         "stored": "在云端计算机上，使用 LangAlpha 为你保存的 setup token",
-        "storedDetail": "在中型及以上规格的云端计算机上，工作区的 Claude Code 直接在这台计算机上运行；没有独立 token 的你自己的电脑也在本机运行 Claude Code。每轮对话由 LangAlpha 把加密保存的 setup token 发给运行它的计算机。用量计入你的 Claude 套餐。",
-        "paused": "此服务器已暂停在云端计算机上运行 Claude Code。你的选择会保留，Claude Code 在你自己的电脑上照常运行。",
+        "storedDetail": "由中型及以上的云端计算机运行，LangAlpha 加密保存你的 setup token。",
+        "paused": "此服务器已暂停在云端计算机上运行，你自己的电脑照常运行。",
         "blocked": "你的账户无法保存 setup token。Claude Code 在你自己的电脑上照常运行。"
       },
       "consent": {
@@ -7170,13 +7317,15 @@
       },
       "leaveStored": {
         "title": "停止保存你的 setup token？",
-        "body": "LangAlpha 会立即删除你已保存的 setup token，正在使用它的 Claude Code 会停止运行。在你重新保存 token 之前，云端计算机上的对话不会使用你的 Claude 套餐运行。有自己 token 的电脑不受影响。",
+        "body": "LangAlpha 会立即删除它，正在使用它的对话会停止。有自己 token 的电脑不受影响。",
         "confirm": "删除 token",
         "failed": "切换失败，你的 token 仍处于保存状态。请重试。"
       },
       "setup": {
         "pickNote": "Claude Pro 或 Max，在你的电脑上运行",
-        "lead": "Claude Code 模式通过 Anthropic 的 Claude Agent SDK 运行 Claude Code，并接入 LangAlpha 的 Agent 框架和工具。用量计入你的 Claude 套餐。",
+        "pickNoteCloud": "Claude Pro 或 Max，在你的电脑或云端计算机上运行",
+        "pickNoteServer": "Claude Pro 或 Max，在此服务器或你的电脑上运行",
+        "lead": "用你的 Claude 套餐运行 Claude Code。",
         "learnMore": "了解更多",
         "waysTitle": "连接电脑的方式",
         "yourComputers": "你的电脑",
@@ -7198,8 +7347,7 @@
         },
         "noComputer": {
           "title": "请先连接一台你自己的电脑",
-          "body": "Claude Code 在你自己的电脑上运行，但你还没有把任何电脑连接到 LangAlpha。用下面任一方式连接一台，再回到这里登录 Claude。",
-          "bodyCloud": "Claude Code 在你自己的电脑或中型及以上的云端计算机上运行，但你目前还没有能运行它的计算机。用下面任一方式连接一台你自己的电脑，再回到这里登录 Claude。"
+          "body": "用下面任一方式连接一台，再回到这里登录 Claude。"
         },
         "unsupported": {
           "title": "你的电脑无法运行 Claude Code",
@@ -7208,7 +7356,8 @@
         "offline": {
           "title": "{{name}} 处于离线状态",
           "titleMany": "你的电脑都处于离线状态",
-          "body": "Claude Code 在你自己的电脑上运行，但 LangAlpha 现在连接不到你的电脑。等其中一台重新上线，就可以在这里登录 Claude。",
+          "body": "等它重新上线，就可以在这里登录 Claude。",
+          "bodyMany": "等其中一台重新上线，就可以在这里登录 Claude。",
           "helper": "在这台 Mac 上打开 LangAlpha，确认远程控制已开启。",
           "ssh": "确认它已开机，并允许 LangAlpha 通过 SSH 连接。"
         },
@@ -7218,17 +7367,20 @@
           "titleKept": "重新开启 Claude Code",
           "bodyKept": "{{name}} 上仍保留着 setup token。开启 Claude Code 即可再次使用。",
           "bodyKeptMany": "下面的电脑上仍保留着 setup token。开启 Claude Code 即可再次使用。",
-          "body": "Claude Code 可以在 {{name}} 上运行。为它添加 setup token 后，Claude Code 模型就会出现在模型选择器中。",
-          "bodyMany": "Claude Code 可以在下面的电脑上运行。在你想使用它的每台电脑上添加 setup token。",
-          "bodySaved": "在下面添加 setup token 后，Claude Code 模型就会出现在模型选择器中。",
-          "bodyCloud": "在下面选择 Claude Code 在云端计算机上的运行方式后，它的模型就会出现在模型选择器中。",
-          "bodyTurnOn": "开启 Claude Code 后，即可选择它在云端计算机上的运行方式。"
+          "body": "在下面为 {{name}} 添加 setup token。",
+          "bodyMany": "为你想使用它的每台电脑添加 setup token。",
+          "bodySaved": "在下面添加 setup token。",
+          "bodyCloud": "在下面选择它的运行位置。",
+          "bodyTurnOn": "开启后即可选择它的运行位置。"
         },
         "connected": {
           "title": "Claude Code 已可使用",
-          "body": "模型选择器里已有 Claude Code 模型。",
-          "cliOwn": "你的云端工作区和 Chief of Staff Agent 都在 {{name}} 上运行 Claude Code。",
-          "cliHome": "你的 Chief of Staff Agent 在 Home 所在的计算机 {{name}} 上运行 Claude Code。"
+          "body": "它的模型已在模型选择器中。",
+          "cliOwn": "你的云端工作区和 Chief of Staff Agent 都在 {{name}} 上运行它。",
+          "cliHome": "你的 Chief of Staff Agent 在 {{name}} 上运行它。",
+          "almostTitle": "Claude Code 即将就绪",
+          "almostBody": "{{name}} 改为中型及以上后即可运行。",
+          "startChat": "开始对话"
         },
         "checking": {
           "title": "正在检查 setup token",
@@ -7236,20 +7388,32 @@
         },
         "refused": {
           "title": "请重新登录 Claude",
-          "body": "Claude 拒绝了 {{name}} 上的 setup token，它可能已过期或被撤销。添加新的 token 即可继续使用 Claude Code。",
-          "bodyAny": "Claude 拒绝了一个 setup token，它可能已过期或被撤销。添加新的 token 即可继续使用 Claude Code。"
+          "body": "Claude 拒绝了 {{name}} 上的 setup token。请添加新的 token。",
+          "bodyAny": "Claude 拒绝了一个 setup token。请添加新的 token。"
         },
         "turnOff": {
           "action": "关闭 Claude Code",
           "title": "关闭 Claude Code？",
-          "body": "Claude Code 模型将从模型选择器中移除。电脑上的 setup token 会一直保留到你将其移除，因此你随时可以在这里重新开启。",
+          "body": "它的模型将从模型选择器中移除。电脑上的 setup token 会保留，直到你将其移除。",
           "confirm": "关闭",
-          "bodyStored": "Claude Code 模型将从模型选择器中移除，用于云端计算机的 setup token 也会被移除。你自己电脑上的 token 会一直保留，直到你将其移除。"
+          "bodyStored": "它的模型将从模型选择器中移除，LangAlpha 会删除为云端计算机保存的 token。"
         },
         "savedName": "你的 setup token",
         "savedDetailCloud": "用于在你的云端计算机上运行 Claude Code",
         "savedDetailServer": "用于在此服务器上运行 Claude Code",
         "tooSmallTitle": "规格不足，无法运行 Claude Code"
+      },
+      "medium": {
+        "resize": "改为中型",
+        "isSmall": "{{name}} 是小型计算机，而 Claude Code 只在中型及以上的云端计算机上运行。",
+        "restarts": "改为中型会重启它，几分钟后工作区即可恢复使用。",
+        "notOnPlan": "当前套餐不含中型计算机。",
+        "changing": "它正在改为中型。",
+        "ownInstead": "也可以在你自己的电脑上运行 Claude Code：开启远程控制的 Mac，或通过 SSH 连接的电脑。",
+        "row": "Claude Code 只在中型及以上的云端计算机上运行。",
+        "rowResize": "Claude Code 只在中型及以上的计算机上运行。改为中型会让它重启几分钟。",
+        "rowPlan": "Claude Code 只在中型及以上的计算机上运行，而当前套餐不含中型。",
+        "rowResizing": "正在改为中型，完成后 Claude Code 即可在此运行。"
       }
     },
     "claude": {
@@ -7284,13 +7448,19 @@
         "upstream_unavailable": "无法连接到 Claude，请再次提交代码。",
         "save_failed": "无法保存您的账户。",
         "redis_unavailable": "暂时无法连接账户，请稍后再次提交代码。",
+        "unavailable": "此账户无法使用 Claude 登录。",
         "unknown": "连接时出现问题。"
       },
       "signInLabel": "在 claude.ai 上登录",
       "open": "打开 claude.ai",
       "expiresIn": "登录链接将在 {{time}} 后过期",
       "stepConnect": "正在连接您的套餐",
-      "paste": "粘贴"
+      "paste": "粘贴",
+      "endsOn": "此登录方式将于 {{date}} 停用。",
+      "switchToClaudeCode": "切换到 Claude Code",
+      "legacy": "旧版",
+      "legacyName": "{{name}}（旧版）",
+      "useClaudeCode": "原生 Claude Code 模式已正式上线，请用它替换此登录方式。"
     },
     "grok": {
       "name": "Grok",
@@ -7816,6 +7986,14 @@
       "unsaved": "Claude 已响应，但用量未能更新，请稍后再试。"
     }
   },
+  "claudeCodeAnnouncement": {
+    "title": "原生 Claude Code 模式上线了",
+    "body": "它直接运行 Claude Code，和你自己运行一样，也是我们推荐的用法。",
+    "endsOn": "旧的登录方式将于 {{date}} 停用。如需继续使用你的 Claude 套餐，请在此之前切换。",
+    "switch": "切换到 Claude Code",
+    "learnMore": "了解更多",
+    "dismiss": "关闭"
+  },
   "palette": {
     "copyFailed": "无法复制到剪贴板",
     "title": "搜索与命令",
@@ -8171,5 +8349,88 @@
       "inHours": "{{n}} 小时后",
       "inDays": "{{n}} 天后"
     }
+  },
+  "menubar": {
+    "open": "打开 LangAlpha",
+    "settings": "桌面应用设置",
+    "market": {
+      "title": "市场",
+      "open": "交易中",
+      "pre": "盘前",
+      "after": "盘后",
+      "closed": "已休市",
+      "unknown": "市场",
+      "closesIn": "{{time}}后收盘",
+      "opensIn": "{{time}}后开盘",
+      "endsIn": "{{time}}后结束"
+    },
+    "duration": {
+      "hoursMinutes": "{{h}} 小时 {{m}} 分钟",
+      "minutes": "{{m}} 分钟"
+    },
+    "portfolio": {
+      "title": "投资组合 · 今日",
+      "showValues": "显示数值",
+      "hideValues": "隐藏数值",
+      "weight": "{{pct}}%",
+      "manualNote": "基于您手动录入的持仓",
+      "otherCurrencies": "未计入 {{list}}",
+      "empty": "还没有持仓。",
+      "add": "在 LangAlpha 中添加持仓"
+    },
+    "watchlist": {
+      "title": "自选股",
+      "count": "{{shown}} / {{total}}",
+      "empty": "自选列表为空。",
+      "add": "在 LangAlpha 中添加股票"
+    },
+    "agent": {
+      "title": "Agent",
+      "running": "运行中",
+      "needsInput": "等待输入",
+      "finished": "已完成，未查看",
+      "untitled": "未命名对话",
+      "empty": "没有正在运行或等待您处理的任务。",
+      "more": "还有 {{count}} 个"
+    },
+    "signedOut": {
+      "title": "登录 LangAlpha",
+      "body": "登录后，这里会显示市场行情、您的投资组合和 Agent 的工作进度。",
+      "action": "登录"
+    },
+    "tray": {
+      "portfolio": "持仓"
+    },
+    "feed": {
+      "offline": "离线",
+      "overdue": "未在更新",
+      "updated": "更新于 {{time}}",
+      "more": "另 {{count}} 个"
+    }
+  },
+  "marketIndex": {
+    "GSPC": {
+      "long": "标普 500",
+      "short": "标普"
+    },
+    "IXIC": {
+      "long": "纳斯达克",
+      "short": "纳指"
+    },
+    "DJI": {
+      "long": "道琼斯",
+      "short": "道指"
+    },
+    "RUT": {
+      "long": "罗素 2000",
+      "short": "罗素"
+    },
+    "VIX": {
+      "long": "VIX",
+      "short": "VIX"
+    }
+  },
+  "desktopApp": {
+    "untitledThread": "未命名对话"
   }
 }

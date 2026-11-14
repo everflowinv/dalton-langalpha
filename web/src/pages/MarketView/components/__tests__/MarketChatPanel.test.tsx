@@ -796,7 +796,6 @@ describe('MarketChatPanel', () => {
     expect(attachmentMeta).toEqual(expect.arrayContaining([
       expect.objectContaining({
         type: 'image',
-        preview: 'data:image/jpeg;base64,WIRED',
         dataUrl: 'data:image/jpeg;base64,WIRED',
       }),
     ]));

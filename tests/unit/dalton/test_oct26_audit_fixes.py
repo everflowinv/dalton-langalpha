@@ -1239,7 +1239,6 @@ async def test_b12_zero_budget_blocks_fallback_on_main_and_subagent(
         primary_client=primary_client,
         fallbacks=[("deepseek-flash", fallback_client)],
         max_retries=0,
-        users_fallbacks=True,
     )
     emit_fallback_spy = create_autospec(mw._emit_fallback)
     monkeypatch.setattr(mw, "_emit_fallback", emit_fallback_spy)
@@ -1360,7 +1359,6 @@ async def test_b12_saved_empty_fallback_list_never_falls_back_to_system_defaults
         "claude-opus-4-7",
     )
     assert selection.effective_model == "claude-opus-4-7"
-    assert selection.users_fallbacks is True
     assert cfg.llm.fallback == []
 
     # 3. _resolve_fallback_clients and build_fallback_pairs keep [] without loading defaults
@@ -1371,7 +1369,6 @@ async def test_b12_saved_empty_fallback_list_never_falls_back_to_system_defaults
         {},
         is_byok=False,
         cache_key=None,
-        users_fallbacks=selection.users_fallbacks,
     )
     assert cfg.fallback_llm_clients == []
     assert cfg.fallback_llm_names == []
@@ -1386,7 +1383,6 @@ async def test_b12_saved_empty_fallback_list_never_falls_back_to_system_defaults
         primary_client=primary_client,
         fallbacks=build_fallback_pairs(cfg),
         max_retries=0,
-        users_fallbacks=selection.users_fallbacks,
     )
     req = create_autospec(ModelRequest, instance=True)
     req.model = primary_client

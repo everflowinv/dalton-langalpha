@@ -2,14 +2,18 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Info } from 'lucide-react';
-import { UPSTREAM_HINT_I18N_KEY, type ErrorLinkSpec, type StructuredError } from '@/utils/rateLimitError';
+import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
 import { parseErrorMessage } from '@/pages/ChatAgent/utils/parseErrorMessage';
 import { usePlanClock } from '@/hooks/useClaudeCodePlan';
-import type { PlanRefusal } from '@/api/model';
-import { planRefusalText } from '@/lib/claudeCodePlan';
 import { cn } from '@/lib/utils';
+import { isDesktopShell } from '@/lib/desktop';
+import { useModelName } from '@/hooks/useModelName';
+import {
+  isReportable, planStopCopy, planStopOf, UPSTREAM_HINT_I18N_KEY, upstreamFailureCopy, type PlanStop,
+} from '@/lib/upstreamFailure';
 import { ReportDialog } from '@/components/report/ReportDialog';
 import { useReportsEnabled } from '@/hooks/useReportsEnabled';
+import { MediumActionLink } from '@/pages/ChatAgent/components/MediumActionLink';
 
 interface ErrorBannerProps {
   error: string | StructuredError | null | undefined;
@@ -20,18 +24,20 @@ interface ErrorBannerProps {
   reportThreadId?: string;
 }
 
-export function ErrorLink({ url, label, labelKey, external }: ErrorLinkSpec): React.ReactElement {
+export function ErrorLink({ url, label, labelKey, external, console: consolePage, resize }: ErrorLinkSpec): React.ReactElement {
   const navigate = useNavigate();
   const { t } = useTranslation();
+  if (resize) return <MediumActionLink computerId={resize} />;
   // A leading slash is not enough to claim a URL as ours: with a path-shaped
   // VITE_PLATFORM_URL the account portal answers on /account/*, same origin but
   // a different app, and routing to it lands on our catch-all with no network
   // request at all. So the call site declares `external` and we believe it.
-  const isRouterPath = !external && url.startsWith('/') && !url.startsWith('//');
+  const isRouterPath = !external && !consolePage && url.startsWith('/') && !url.startsWith('//');
   // Cross-origin URLs (an upstream provider's status page) open in a new tab so
   // the chat survives the detour; `external` asks for the same treatment on our
-  // own origin, for banners whose state would not survive a navigation.
-  const opensNewTab = external || (!isRouterPath && (() => {
+  // own origin, for banners whose state would not survive a navigation. The
+  // desktop app shows the console in this window instead.
+  const opensNewTab = consolePage ? !isDesktopShell() : external || (!isRouterPath && (() => {
     try {
       return new URL(url, window.location.href).origin !== window.location.origin;
     } catch {
@@ -70,19 +76,22 @@ export function NoticeLine({ message, className, style }: { message: string; cla
   );
 }
 
-/** A turn a Claude plan's limit refused, worded in the reader's zone. */
-function PlanRefusalWords({ refusal }: { refusal: PlanRefusal }): React.ReactElement {
+/** A plan's limit, worded in the reader's zone. A leaf of its own, so the
+ *  plan clock's per-minute tick redraws only this. */
+function PlanStopBanner({ stop, className, style }: {
+  stop: PlanStop; className: string; style: React.CSSProperties;
+}): React.ReactElement {
   const { t } = useTranslation();
-  return <>{planRefusalText(t, refusal, usePlanClock())}</>;
-}
-
-/** The banner's headline over a failure the server classified, or over a
- *  Claude plan's limit; none for any other, whose message says it all. */
-function headlineOf(err: StructuredError, t: (key: string, opts?: Record<string, unknown>) => string): string | null {
-  if (err.planRefusal) return t('claudeCodePlan.limitTitle');
-  if (err.kind === 'internal') return t('chat.errorInternalHeadline');
-  if (err.kind !== 'upstream') return null;
-  return err.statusCode ? t('chat.errorUpstreamHeadlineStatus', { status: err.statusCode }) : t('chat.errorUpstreamHeadline');
+  const { title, text } = planStopCopy(t, stop, usePlanClock());
+  return (
+    <div className={className} style={style}>
+      <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-loss)' }} />
+      <div className="flex flex-col gap-1 min-w-0">
+        <span className="font-medium">{title}</span>
+        <span className="wrap-break-word">{text}</span>
+      </div>
+    </div>
+  );
 }
 
 /** "Report this" and its dialog, for a turn that failed. */
@@ -91,8 +100,10 @@ export function ReportFailure({ error, threadId }: { error: StructuredError; thr
   const enabled = useReportsEnabled();
   const [open, setOpen] = useState(false);
   if (!enabled) return null;
+  // The payer and reason ride on the type so whoever reads the report sees at
+  // once whose account failed and what the provider said of it.
   const type = error.kind === 'upstream'
-    ? `upstream_error${error.statusCode ? ` ${error.statusCode}` : ''}`
+    ? [`upstream_error${error.statusCode ? ` ${error.statusCode}` : ''}`, error.payer, error.reason].filter(Boolean).join(' · ')
     : 'internal_error';
   return (
     <>
@@ -120,6 +131,7 @@ export function ReportFailure({ error, threadId }: { error: StructuredError; thr
 
 export function ErrorBanner({ error, className, style, reportThreadId }: ErrorBannerProps): React.ReactElement | null {
   const { t } = useTranslation();
+  const name = useModelName();
   if (!error) return null;
 
   // Nothing failed: the same quiet row as the thread's other notices.
@@ -141,18 +153,24 @@ export function ErrorBanner({ error, className, style, reportThreadId }: ErrorBa
 
   if (typeof error === 'object' && 'message' in error) {
     const err = error as StructuredError;
-    const headline = headlineOf(err, t);
+    const stop = planStopOf(err);
+    if (stop) return <PlanStopBanner stop={stop} className={baseClass} style={baseStyle} />;
+    // Worded by who pays the provider: see `upstreamFailureCopy`.
+    const upstream = err.kind === 'upstream' ? upstreamFailureCopy(err, t, name) : null;
+    const headline = err.kind === 'internal' ? t('chat.errorInternalHeadline') : upstream?.headline;
+    const message = upstream ? (upstream.detail ?? '') : err.message;
     const hasHints = err.kind === 'upstream' && err.hints && err.hints.length > 0;
     return (
       <div className={baseClass} style={baseStyle}>
         <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" style={{ color: 'var(--color-loss)' }} />
         <div className="flex flex-col gap-1 min-w-0">
           {headline && <span className="font-medium">{headline}</span>}
+          {upstream?.source && <span>{upstream.source}</span>}
           {/* A failure the server reports by its outcome alone has no text,
               and its headline is the whole message. */}
-          {(err.message || (err.links && err.links.length > 0)) && (
+          {(message || (err.links && err.links.length > 0)) && (
             <span className="wrap-break-word">
-              {err.planRefusal ? <PlanRefusalWords refusal={err.planRefusal} /> : err.message}
+              {message}
               {err.links?.map((l, i) => (
                 <React.Fragment key={`${l.url}|${l.label}`}>
                   {i === 0 ? ' ' : <span aria-hidden="true"> · </span>}
@@ -168,8 +186,7 @@ export function ErrorBanner({ error, className, style, reportThreadId }: ErrorBa
               ))}
             </ul>
           )}
-          {/* A plan's limit is the plan working, not a failure to report. */}
-          {reportThreadId && (err.kind === 'upstream' || err.kind === 'internal') && !err.planRefusal && (
+          {reportThreadId && isReportable(err) && (
             <ReportFailure error={err} threadId={reportThreadId} />
           )}
         </div>

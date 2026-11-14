@@ -1,7 +1,9 @@
-import { useContext, useEffect, useId, useState, type ReactNode } from 'react';
+import { useContext, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
 import { Cloud, ExternalLink, KeyRound, Laptop, SquareTerminal } from 'lucide-react';
+import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { buttonClass } from '@/components/ui/button-class';
@@ -25,9 +27,14 @@ import type { TokenAction, TokenRow } from '@/components/modelAccess/tokenLine';
 import { SAVED_TOKEN, computerTokenTarget, type SheetAction, type TokenTarget } from '@/components/modelAccess/tokenTarget';
 import { canRemoteControl } from '@/lib/desktop';
 import { cn } from '@/lib/utils';
-import { CLAUDE_CODE_DOCS_URL, CLAUDE_CODE_FEATURE, CLAUDE_CODE_REQUIREMENTS_URL, biggerComputer } from '@/lib/claudeCode';
+import { useAllModels } from '@/hooks/useAllModels';
+import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
+import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
+import { CLAUDE_CODE, CLAUDE_CODE_DOCS, CLAUDE_CODE_FEATURE, claudeCodeStartModel } from '@/lib/claudeCode';
 import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
-import { openComputerSpec, openComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
+import { MediumActionButton } from '@/pages/ChatAgent/components/MediumActionLink';
+import { openComputersPanel, useComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
+import { useMediumAction, type MediumAction } from '@/pages/ChatAgent/hooks/useMediumAction';
 import { useSaveFailedToast } from '../usePreferenceWrite';
 import { Group } from './AccessRows';
 import { ClaudeCodeHostedChoice } from './ClaudeCodeHostedChoice';
@@ -36,9 +43,16 @@ import { ComputerClis } from './ComputerClis';
 import { claudeCodeHeadline } from './claudeCodeHeadline';
 
 const S = 'modelAccess.claudeCode.setup';
+const M = 'modelAccess.claudeCode.medium';
 
-/** The states where nothing the user has can run Claude Code yet. */
-const CANNOT_RUN_YET = new Set<ClaudeCodeSetup['state']>(['no_computer', 'unsupported', 'offline']);
+/** The docs section the view's Learn more opens, by what the view asks of
+ *  the user: what a computer needs, where it runs while one is out of reach,
+ *  else how it runs. */
+const LEARN_MORE: Partial<Record<ClaudeCodeSetup['state'], string>> = {
+  no_computer: CLAUDE_CODE_DOCS.requirements,
+  unsupported: CLAUDE_CODE_DOCS.requirements,
+  offline: CLAUDE_CODE_DOCS.whereItRuns,
+};
 
 const glyph = (Icon: typeof Laptop) => <Icon aria-hidden="true" className="h-4 w-4" style={{ color: 'var(--color-text-secondary)' }} />;
 const iconOf = (kind: ClaudeCodeComputer['kind'] | undefined) => glyph(kind === 'helper' ? Laptop : SquareTerminal);
@@ -103,8 +117,79 @@ function SetupRow({ icon, name, detail, status, action, plan, setting }: {
         {setting}
       </div>
       {status ? <StatusLabel status={status} className="whitespace-nowrap" /> : <span />}
-      <div className="flex">{action}</div>
+      {/* On a phone the button goes under the text, which keeps the width. */}
+      <div className="flex max-sm:col-[2/-1] max-sm:mt-2">{action}</div>
     </li>
+  );
+}
+
+/**
+ * A new Chief of Staff thread, whose turns run where the headline says, with
+ * its composer on the Claude Code model `claudeCodeStartModel` picks. Where
+ * Home cannot be read, the chat page.
+ */
+function StartChatButton({ onLeave }: { onLeave?: () => void }) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  // Until the models are read the pick is unknown, and a chat would start
+  // on the Default.
+  const { models, metadata, isLoading } = useAllModels();
+  const accountDefault = useDefaultModel();
+  const model = claudeCodeStartModel(models[CLAUDE_CODE]?.models ?? [], metadata, accountDefault);
+  // A Home read that lands after the user left this view takes them nowhere.
+  const shown = useRef(true);
+  useEffect(() => {
+    shown.current = true;
+    return () => {
+      shown.current = false;
+    };
+  }, []);
+  // No Claude Code model to start on (the catalog could not be read, or
+  // lists none): a chat here would start on the Default.
+  if (!isLoading && !model) return null;
+  const start = () => {
+    queryClient.fetchQuery(homeWorkspaceQuery(queryClient)).then(
+      (home) => {
+        if (!shown.current) return;
+        onLeave?.();
+        navigate('/chat/t/__default__', {
+          state: { workspaceId: home.workspace_id, workspaceName: t('agents.chiefOfStaff'), model },
+        });
+      },
+      () => {
+        if (!shown.current) return;
+        onLeave?.();
+        navigate('/chat');
+      },
+    );
+  };
+  return (
+    <Button type="button" size="sm" className="tap-target mt-2 self-start" disabled={isLoading} onClick={start}>
+      {t(S + '.connected.startChat')}
+    </Button>
+  );
+}
+
+/** What a cloud computer too small for Claude Code says under its name, by
+ *  what gets it to Medium (`useMediumAction`). */
+function mediumDetail(t: TFunction, action: MediumAction | null): string {
+  if (!action) return t(M + '.row');
+  if (action.kind === 'plan') return t(M + '.rowPlan');
+  return t(action.kind === 'resizing' ? M + '.rowResizing' : M + '.rowResize');
+}
+
+/** A cloud computer too small for Claude Code, with what gets it to Medium. */
+function TooSmallRow({ computerId, name }: { computerId: string; name: string }) {
+  const { t } = useTranslation();
+  const action = useMediumAction(computerId);
+  return (
+    <SetupRow
+      icon={glyph(Cloud)}
+      name={name}
+      detail={mediumDetail(t, action)}
+      action={action ? <MediumActionButton action={action} className={ROW_BUTTON} /> : <span />}
+    />
   );
 }
 
@@ -166,11 +251,14 @@ const ROWS = 'grid grid-cols-[auto_minmax(0,1fr)_auto_auto] gap-x-3 gap-y-5';
  * it; what opens is portaled out of its panel, which goes inert and fades
  * while covered.
  */
-export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
+export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover, onLeave }: {
   setup: ClaudeCodeSetup | null;
   tokenRows: TokenRow[];
   onRemoveToken: (target: TokenTarget) => void;
   onCover: (covered: boolean) => void;
+  /** Called before a computer action leaves for the computers panel in the
+   *  app: setup passes its exit, so the user is not sent back to it. */
+  onLeave?: () => void;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -191,7 +279,9 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
   const [token, setToken] = useState<{ target: TokenTarget; action: SheetAction } | null>(null);
   const [asking, setAsking] = useState(false);
   const [turningOff, setTurningOff] = useState(false);
-  const covered = token !== null || asking || turningOff;
+  // Change spec opens over the view from the page's own host.
+  const resizing = useComputersPanel().specComputerId !== null;
+  const covered = token !== null || asking || turningOff || resizing;
   useEffect(() => {
     onCover(covered);
     return () => onCover(false);
@@ -209,8 +299,12 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
     if (!on && !(await turn(true))) return;
     setToken({ target, action });
   };
-  const onComputers = (panel: Parameters<typeof openComputersPanel>[0]) => {
+  const toChat = () => {
+    onLeave?.();
     navigate('/chat');
+  };
+  const onComputers = (panel: Parameters<typeof openComputersPanel>[0]) => {
+    toChat();
     openComputersPanel(panel);
   };
   const viewComputer = (computerId: string) => (
@@ -314,42 +408,24 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
     || setup.cloud
     || (!offeredSaved && !setup.computers.some((c) => c.state === 'off' && c.source !== 'machine'))
   );
+  // The ways to connect a computer, where none can run it yet, and where the
+  // user chose to run it on their own computers and has none.
+  const offerComputers = setup?.state === 'no_computer' || setup?.state === 'unsupported'
+    || (on && custody?.mode === 'local' && setup?.computers.length === 0);
   const remoteControl = canRemoteControl();
-  const bigger = biggerComputer(false);
-  const tooSmall = setup?.too_small ?? [];
+  // Named wherever its turns would run inside a cloud computer: where the
+  // user chose that, or where the server offers no choice. Before they
+  // choose it, the choice itself warns of them.
+  const tooSmall = custody && custody.mode !== 'stored' ? [] : setup?.too_small ?? [];
   const savedOnCloud = isPlatformMode ? setup?.cloud : setup?.cli_in_sandbox;
   const savedDetail = savedOnCloud ? t(S + '.savedDetailCloud') : !isPlatformMode ? t(S + '.savedDetailServer') : null;
-  const resize = (computerId: string) => (bigger.link ? (
-    <a
-      href={bigger.link.url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className={buttonClass({ variant: 'outline', size: 'sm', className: cn('gap-1.5', ROW_BUTTON) })}
-    >
-      {bigger.link.labelKey ? t(bigger.link.labelKey) : bigger.link.label}
-      <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
-    </a>
-  ) : (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      className={ROW_BUTTON}
-      onClick={() => {
-        navigate('/chat');
-        openComputerSpec(computerId);
-      }}
-    >
-      {t('workspace.changeSpec')}
-    </Button>
-  ));
 
   return (
     <div className="flex flex-col gap-5">
       <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
         {t(S + '.lead')}{' '}
         <a
-          href={setup && CANNOT_RUN_YET.has(setup.state) ? CLAUDE_CODE_REQUIREMENTS_URL : CLAUDE_CODE_DOCS_URL}
+          href={(setup && LEARN_MORE[setup.state]) ?? CLAUDE_CODE_DOCS.howItRuns}
           target="_blank"
           rel="noopener noreferrer"
           className="tap-target inline-flex items-center gap-0.5 underline underline-offset-2 hover:opacity-80"
@@ -364,6 +440,9 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
           <h3 className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{headline.title}</h3>
           <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{headline.body}</div>
           {headline.runsOn && <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{headline.runsOn}</div>}
+          {headline.ready && (
+            <StartChatButton onLeave={onLeave} />
+          )}
         </div>
       )}
 
@@ -416,6 +495,7 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
 
       {on && (
         <ClaudeCodeHostedChoice
+          tooSmall={setup?.too_small ?? []}
           onAddToken={() => setToken({ target: SAVED_TOKEN, action: 'add' })}
           onAsking={setAsking}
         />
@@ -424,14 +504,12 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover }: {
       {tooSmall.length > 0 && (
         <div className={ROWS}>
           <Group subgrid title={t(S + '.tooSmallTitle')} empty="">
-            {tooSmall.map((c) => (
-              <SetupRow key={c.computer_id} icon={glyph(Cloud)} name={c.name} detail={t(bigger.rowKey)} action={resize(c.computer_id)} />
-            ))}
+            {tooSmall.map((c) => <TooSmallRow key={c.computer_id} computerId={c.computer_id} name={c.name} />)}
           </Group>
         </div>
       )}
 
-      {(setup?.state === 'no_computer' || setup?.state === 'unsupported') && (
+      {offerComputers && (
         <div className={ROWS}>
           <Group subgrid title={t(S + '.waysTitle')} empty="">
             {[

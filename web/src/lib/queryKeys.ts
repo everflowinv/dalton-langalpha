@@ -44,7 +44,6 @@ export const queryKeys = {
     claudeCodeStatus: () => [...queryKeys.features.claudeCode(), 'status'],
     claudeCodeComputers: () => [...queryKeys.features.claudeCode(), 'computers'],
     claudeCodeSetup: () => [...queryKeys.features.claudeCode(), 'setup'],
-    claudeCodeChiefOfStaff: (threadId: string) => [...queryKeys.features.claudeCodeSetup(), 'chief-of-staff', threadId],
     // Check now's mutations, each carrying its credential as variables.
     claudeCodePlanCheck: () => [...queryKeys.features.claudeCode(), 'plan-check'],
   },
@@ -484,6 +483,17 @@ export const queryKeys = {
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
     channelBindings: () => [...queryKeys.dalton.all, 'channels', 'bindings'],
   },
+  // The user's watchlists themselves (id, name), for picking one. What is on
+  // the default list is read under `['watchlistData']` (hooks/membershipQueries).
+  watchlists: {
+    all:   ['watchlists'],
+    list:  () => [...queryKeys.watchlists.all, 'list'],
+    // One list's entries by id, for a list other than the default one.
+    items: (id: string) => [...queryKeys.watchlists.all, 'items', id],
+  },
+  // The US session (open, pre, after, closed), which every quote row's
+  // extended-hours split reads.
+  marketStatus: () => ['marketStatus'],
 };
 
 /**

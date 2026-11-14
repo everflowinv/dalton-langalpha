@@ -93,6 +93,7 @@ function reconnectedSsh(row: Computer, { ssh: target, fingerprint, helper }: Rec
     helper,
     tunnel,
     tunnel_connected: tunnel ? true : null,
+    paired_elsewhere: false,
   };
 }
 
@@ -207,7 +208,8 @@ export function useComputerActions() {
   // afterwards; the list polls while it does, and ComputersDialogHost reports
   // how it went.
   const spec = useMutation({
-    mutationFn: ({ computerId, tier }: { computerId: string; tier: ResourceTier }) => setComputerSpec(computerId, tier),
+    mutationFn: ({ computerId, tier, planChanged }: { computerId: string; tier: ResourceTier; planChanged?: boolean }) =>
+      setComputerSpec(computerId, tier, planChanged),
     onSuccess: async (row, { computerId, tier }) => {
       // A list read that left before the request would land after this patch
       // and put the row back without its change, which also stops the poll.

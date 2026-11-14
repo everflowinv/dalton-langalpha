@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, NotRequired, Optional, TypedDict
 
 from src.config import env
-from src.config.features import is_feature_enabled_system
 from src.server.contracts.status import is_restart_interrupted, to_public
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
 
@@ -142,9 +141,10 @@ class UserFeedPayload(TypedDict):
     last_seen_run_seq: NotRequired[int]
 
 
-class PushPayload(TypedDict):
-    """A settle the user's phones may hear of. Whether they do, and what it
-    says, the ``push`` executor decides from the run row and the thread."""
+class SettleNewsPayload(TypedDict):
+    """A settle the user may hear of. Whether they do, and what it says, the
+    executor decides from the run row and the thread
+    (``services/notices.settle_news``)."""
 
     user_id: str
     thread_id: str
@@ -155,10 +155,16 @@ class PushPayload(TypedDict):
     interrupt_reason: Optional[str]
 
 
-#: How long a finished turn's push waits for a client to mark the thread
-#: seen, so a turn watched on the web or another phone does not buzz this one.
-#: An interrupted run cannot be marked seen, so its push goes at once.
-PUSH_SEEN_GRACE_SECONDS = 8.0
+#: The news of a settle for the user's feed, which the desktop app notifies
+#: from. Its own job, not the push's: a slow or failing APNs must not hold a
+#: desktop notice back behind the push's quota and per-thread chain.
+USER_NOTIFICATION_HOOK = "user_notification"
+
+#: How long a finished turn's news waits for a client to mark the thread
+#: seen, so a turn watched on the web or another phone does not buzz this one
+#: or show on the desktop.
+#: An interrupted run cannot be marked seen, so its news goes at once.
+SETTLE_NEWS_GRACE_SECONDS = 8.0
 
 
 #: Run metadata key for where an attempt ran ({"platform", ...}), stamped at
@@ -167,6 +173,10 @@ SURFACE_META = "surface"
 
 #: Run metadata key for how a wake turn ended quietly: {"changed"}.
 WAKEUP_QUIET_META = "wakeup_quiet"
+
+#: Run metadata key, true when the turn ran for a user with the
+#: ``idle_compaction`` feature on; stamped by the finalize.
+IDLE_COMPACTION_META = "idle_compaction"
 
 
 def is_unchanged_quiet(meta: Mapping[str, Any]) -> bool:
@@ -195,6 +205,7 @@ def build_finalize_jobs(
     last_seen_run_seq: Optional[int] = None,
     push_enabled: bool = False,
     restart_interrupted: bool = False,
+    idle_compaction: bool = False,
 ) -> Callable[[str], List[HookJob]]:
     """The one decision table mapping a run's final status to its hook jobs.
 
@@ -245,50 +256,48 @@ def build_finalize_jobs(
                 )
             )
 
-        if (
-            push_enabled
-            and user_id
-            and not superseded
-            and final_status != "cancelled"
-        ):
+        if user_id and not superseded and final_status != "cancelled":
             # A stop, or a run that was never the firing's turn, is news to
-            # nobody. Which other settles reach a phone is the executor's call
-            # (``services/push/notify.push_owed``), from the run row.
-            jobs.append(
-                HookJob(
-                    hook_type="push",
-                    idempotency_key=f"{run_id}:push",
-                    payload=PushPayload(
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        run_seq=run_seq,
-                        status=final_status,
-                        interrupt_reason=(
-                            interrupt_reason
-                            if final_status == "interrupted"
-                            else None
+            # nobody. Which other settles are news is the executors' call
+            # (``services/notices.settle_news``), from the run row.
+            for hook in (USER_NOTIFICATION_HOOK, *(["push"] if push_enabled else [])):
+                jobs.append(
+                    HookJob(
+                        hook_type=hook,
+                        idempotency_key=f"{run_id}:{hook}",
+                        payload=SettleNewsPayload(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            workspace_id=workspace_id,
+                            run_id=run_id,
+                            run_seq=run_seq,
+                            status=final_status,
+                            interrupt_reason=(
+                                interrupt_reason
+                                if final_status == "interrupted"
+                                else None
+                            ),
                         ),
-                    ),
-                    delay_seconds=(
-                        None
-                        if final_status == "interrupted"
-                        else PUSH_SEEN_GRACE_SECONDS
-                    ),
-                    # A thread's pushes reach APNs in run order, so an older
-                    # one sent slowly can't land after, and replace, a newer.
-                    ordering_key=f"push:{thread_id}",
+                        delay_seconds=(
+                            None
+                            if final_status == "interrupted"
+                            else SETTLE_NEWS_GRACE_SECONDS
+                        ),
+                        # A thread's news reaches the feed, and APNs, in run
+                        # order, so an older one sent slowly can't land after,
+                        # and replace, a newer. Per hook, so a slow APNs holds
+                        # back only the push.
+                        ordering_key=f"{hook}:{thread_id}",
+                    )
                 )
-            )
 
-        if user_id and final_status == "completed" and is_feature_enabled_system("idle_compaction"):
+        if user_id and final_status == "completed" and idle_compaction:
             # A completed turn may leave its thread idle on a warm prompt
             # cache, which an idle compaction summarizes before it expires.
             # Whether it does is read off the checkpoint the turn committed,
             # so the job runs after the commit. No ordering_key: the executor
-            # arms only for the thread's latest run. With the feature off no
-            # job is written, so a turn costs nothing.
+            # arms only for the thread's latest run. With the feature off for
+            # the turn's user no job is written, so a turn costs nothing.
             jobs.append(
                 HookJob(
                     hook_type=IDLE_COMPACT_HOOK,
@@ -418,6 +427,7 @@ def build_finalize_jobs_from_run_row(
         last_seen_run_seq=last_seen_run_seq,
         push_enabled=env.APNS_ENABLED,
         restart_interrupted=not as_ordinary_stop and is_restart_interrupted(run),
+        idle_compaction=meta.get(IDLE_COMPACTION_META) is True,
     )
 
 
