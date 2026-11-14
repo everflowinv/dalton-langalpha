@@ -407,3 +407,8 @@ tests/unit/ptc_agent/agent/prompts/test_prompt_compaction.py
 # P7: display filter for harness thinking markers leaked into assistant text.
 src/server/utils/thinking_leak.py
 tests/unit/server/utils/test_thinking_leak.py
+
+# Offsite backup: config git backup & weekly external SSD + rclone Google Drive backup.
+scripts/dalton/ops/
+tests/unit/dalton/test_offsite_backup.py
+integrations/dalton-channel-gateway/test/ops-alerts.test.ts
