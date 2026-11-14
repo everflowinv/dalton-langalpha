@@ -7593,3 +7593,36 @@ async def test_steer_cancel_during_open_multipart_aborts_orphan_upload(
     assert (created["key"], created["sid"]) not in store.open_uploads
     assert budget._bytes == 0
     assert budget._files == 0
+
+
+
+@pytest.mark.asyncio
+async def test_cancelled_thread_result_is_not_held_by_the_traceback() -> None:
+    """DALTON-HOOK(chat-large-upload): after a cancel the read bytes must not stay
+    reachable from the propagated CancelledError (the budget is already released)."""
+    import asyncio
+    import threading
+
+    from src.dalton.services import chat_uploads as svc
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _read() -> bytes:
+        started.set()
+        release.wait(5)
+        return b"x" * 1024
+
+    outer = asyncio.create_task(svc._run_in_thread_until_settled(_read))
+    await asyncio.to_thread(started.wait, 5)
+    outer.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as info:
+        await outer
+    tb = info.value.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "_await_task_until_settled":
+            assert tb.tb_frame.f_locals.get("task") is None
+            assert tb.tb_frame.f_locals.get("result") is None
+        tb = tb.tb_next

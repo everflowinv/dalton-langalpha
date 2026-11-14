@@ -1918,6 +1918,10 @@ async def _await_task_until_settled(
                     exc_info=True,
                 )
         result = None
+        # DALTON-HOOK(chat-large-upload): the finished task holds the thread's
+        # return value, and this frame stays reachable from the traceback, so
+        # drop it before raising or the bytes outlive the released budget.
+        task = None  # type: ignore[assignment]
         raise cancelled_exc
     return result
 
