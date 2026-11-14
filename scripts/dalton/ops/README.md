@@ -61,9 +61,13 @@ chmod 600 ~/.config/dalton/backup.key
 ## 4. 安装与启用 launchd 定时任务（由主助手在宿主机执行）
 
 替换模板占位符 `__REPO_ROOT__`、`__HOME__`、`__PYTHON_BIN__` 后安装到 `~/Library/LaunchAgents/`：
-- `com.dalton.config-git-backup.plist`：每 6 小时（00:15 / 06:15 / 12:15 / 18:15）执行 `dalton_config_git_backup.sh`
+- `com.dalton.config-git-backup.plist`：每 6 小时（00:15 / 06:15 / 12:15 / 18:15）执行 `dalton_config_git_backup.sh`（**配置备份只管小而常变的配置与轻量状态**；`DALTON_CONFIG_VAR_EXCLUDES` 默认排除 `venv`/`.venv`、`__pycache__`、`.dalton-freeze`、`openclaw-data/skills/*/{data,output,temp,state,events}`、`asr_jobs`、`reextract` 等大目录与产物，大数据由每周数据包负责）
 - `com.dalton.db-offsite.plist`：每天 03:40 执行 `dalton_db_offsite.sh`（将最新完整 `dalton-pg-*.dump` 流式加密上传至 `<remote>:DaltonBackup/db/<日期>/`，先上传 `.partial-<随机>` 并带 `--size`，核对远端大小与 MD5 后原子 `moveto` 为正式 `.enc`，失败自动清理临时对象；保留 `DALTON_DB_RETAIN_COUNT` 默认 7 份；上传前检查 `rclone about` 剩余空间不少于 2 倍）
-- `com.dalton.data-backup.plist`：每周日 05:00 执行 `dalton_data_backup.sh`（MinIO 卷、沙箱 `/home/workspace`、Redis 快照经管道流式加密与 `rclone rcat` 上传 `.partial-<随机>`，核对远端大小与 MD5 后 `moveto` 为正式 `.enc`，保留 4 周，不再重复包含 Postgres）
+- `com.dalton.data-backup.plist`：每周日 05:00 执行 `dalton_data_backup.sh`（MinIO 卷、沙箱 `/home/workspace`、Redis 快照以及宿主机 `DALTON_PROD_VAR_DIR` 即 `var/dalton` 经管道流式加密与 `rclone rcat` 上传 `.partial-<随机>`，核对远端大小与 MD5 后 `moveto` 为正式 `.enc`，保留 4 周，不再重复包含 Postgres；其中 `var-dalton-<日期>.tar.gz.enc` 由 `DALTON_DATA_VAR_EXCLUDES` 排除可重建的 `venv`/`.venv`/`__pycache__`/`node_modules`/临时文件与 `run-secrets`，保留 `.dalton-freeze`、技能 `data/state/output/events`、`asr_jobs`、`reextract` 等大数据）。
+  - `var-dalton` 打包前按文件头 `SQLite format 3\0`（不限扩展名）识别未排除的 SQLite 库，通过 `sqlite3` 在线备份 API 在外置盘临时 staging 目录生成一致副本，归档时排除原库及 `-wal`/`-shm`/`-journal` 并把副本按相同相对路径合入同一归档，用完即删；若 `tar` 因打包期间文件消失失败，会清理 `.partial` 后整项重试一次（重新快照并打包上传），第二次仍失败才告警。
+  - 清单生成后、`tar` 读到之前才新建的 SQLite 库不会做一致副本，会按原样打包，下周备份会正常纳入快照处理。
+  - 只读打开带残留 `-wal` 的库时，SQLite 需要能创建或写入 `-shm`；库所在目录不可写、`-shm` 无法创建或写入时，快照会失败并每周告警。处理办法：确认没有进程使用后，用 `sqlite3 <库> "PRAGMA wal_checkpoint(TRUNCATE);"` 打开一次。
+  - **只有 SQLite 做一致副本，DuckDB / neo4j 依赖备份时段没有写入**（其他格式不处理，原样打包）。
 
 首次安装后可手动运行一次并查看日志 `~/Library/Logs/dalton-offsite-backup.log` 与 `~/Library/Logs/dalton-offsite-backup-alerts.log`：
 ```bash

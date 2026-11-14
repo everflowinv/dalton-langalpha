@@ -10,6 +10,7 @@ OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${OPS_DIR}/_common.sh"
 
 RUN_TMP_DIR=""
+VAR_SQLITE_STAGING=""
 CURRENT_PARTIAL_OBJ=""
 RCLONE_LOG_FILE=""
 RCLONE_CACHE_DIR=""
@@ -39,6 +40,9 @@ cleanup() {
         delete_partial_remote "${CURRENT_PARTIAL_OBJ}"
         CURRENT_PARTIAL_OBJ=""
     fi
+    if [[ -n "${VAR_SQLITE_STAGING:-}" ]] && [[ -d "${VAR_SQLITE_STAGING}" ]]; then
+        rm -rf "${VAR_SQLITE_STAGING}" 2>/dev/null || true
+    fi
     if [[ -n "${RUN_TMP_DIR:-}" ]] && [[ -d "${RUN_TMP_DIR}" ]]; then
         rm -rf "${RUN_TMP_DIR}" 2>/dev/null || true
     fi
@@ -57,6 +61,9 @@ SANDBOX_PREFIX="${DALTON_SANDBOX_CONTAINER_PREFIX:-langalpha-sandbox-}"
 SANDBOX_MAX_GB="${DALTON_SANDBOX_MAX_SIZE_GB:-5}"
 REDIS_CONTAINER="${DALTON_REDIS_CONTAINER:-dalton-langalpha-redis-1}"
 PROD_ENV_FILE="${DALTON_PROD_ENV_FILE:-${HOME}/Projects/dalton-langalpha/.env}"
+PROD_CHECKOUT_DIR="${DALTON_PROD_CHECKOUT_DIR:-${HOME}/Projects/dalton-langalpha}"
+PROD_VAR_DIR="${DALTON_PROD_VAR_DIR:-${PROD_CHECKOUT_DIR}/var/dalton}"
+DATA_VAR_EXCLUDES="${DALTON_DATA_VAR_EXCLUDES:-venv,.venv,__pycache__,*.pyc,node_modules,.DS_Store,pr_baseline,tmp,openclaw-data/temp,openclaw-data/skills/*/temp,run-secrets,.dalton-outbox-*}"
 
 RCLONE_REMOTE="${DALTON_RCLONE_REMOTE:-gdrive}"
 RCLONE_DRIVE_DIR="${DALTON_RCLONE_DRIVE_DIR:-DaltonBackup}"
@@ -208,7 +215,7 @@ set -e
 restore_err_trap
 
 if [[ "${PIPE_STATUS[0]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[1]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[2]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[3]:-1}" -ne 0 ]]; then
-    MINIO_ERR="$(tr '\n' ' ' < "${RUN_TMP_DIR}/minio.err" "${RUN_TMP_DIR}/minio-enc.err" "${RUN_TMP_DIR}/minio-rcat.err" 2>/dev/null || true)"
+    MINIO_ERR="$(cat "${RUN_TMP_DIR}/minio.err" "${RUN_TMP_DIR}/minio-enc.err" "${RUN_TMP_DIR}/minio-hash.err" "${RUN_TMP_DIR}/minio-rcat.err" 2>/dev/null | tr '\n' ' ' || true)"
     delete_partial_remote "${MINIO_PARTIAL_OBJ}"
     CURRENT_PARTIAL_OBJ=""
     fail_with_alert "MINIO_BACKUP_FAILED" "MinIO stream failed (pipe=${PIPE_STATUS[*]}): ${MINIO_ERR}"
@@ -339,12 +346,95 @@ set -e
 restore_err_trap
 
 if [[ "${PIPE_STATUS[0]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[1]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[2]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[3]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[4]:-1}" -ne 0 ]]; then
-    REDIS_ERR="$(tr '\n' ' ' < "${RUN_TMP_DIR}/redis.err" "${RUN_TMP_DIR}/redis-hdr.err" "${RUN_TMP_DIR}/redis-enc.err" "${RUN_TMP_DIR}/redis-rcat.err" 2>/dev/null || true)"
+    REDIS_ERR="$(cat "${RUN_TMP_DIR}/redis.err" "${RUN_TMP_DIR}/redis-hdr.err" "${RUN_TMP_DIR}/redis-enc.err" "${RUN_TMP_DIR}/redis-hash.err" "${RUN_TMP_DIR}/redis-rcat.err" 2>/dev/null | tr '\n' ' ' || true)"
     delete_partial_remote "${REDIS_PARTIAL_OBJ}"
     CURRENT_PARTIAL_OBJ=""
     fail_with_alert "REDIS_BACKUP_FAILED" "Redis stream failed on ${REDIS_CONTAINER} (pipe=${PIPE_STATUS[*]}): ${REDIS_ERR}"
 fi
 verify_and_promote_partial "${REDIS_PARTIAL_OBJ}" "${REDIS_FINAL_OBJ}" "${REDIS_META}" "redis"
+
+# 4. Host var/dalton directory streaming backup -> snapshot SQLite -> openssl enc -> stream-hash-meta -> rclone rcat (.partial -> moveto)
+if [[ ! -d "${PROD_VAR_DIR}" ]]; then
+    fail_with_alert "VAR_DALTON_BACKUP_FAILED" "var/dalton directory not found: ${PROD_VAR_DIR}"
+fi
+
+VAR_FINAL_OBJ="${REMOTE_WEEK_DEST}/var-dalton-${DATE_STAMP}.tar.gz.enc"
+VAR_SQLITE_STAGING="${RUN_TMP_DIR}/var-dalton-sqlite-staging"
+VAR_SQLITE_LIST="${RUN_TMP_DIR}/var-dalton-sqlite.nul"
+VAR_SQLITE_ERR="${RUN_TMP_DIR}/var-dalton-sqlite.err"
+VAR_META="${RUN_TMP_DIR}/var-dalton.meta.json"
+VAR_MAX_ATTEMPTS=2
+VAR_ATTEMPT=1
+
+while true; do
+    rm -rf "${VAR_SQLITE_STAGING}" "${VAR_SQLITE_LIST}" "${VAR_SQLITE_ERR}" "${VAR_META}" \
+        "${RUN_TMP_DIR}/var-dalton.err" "${RUN_TMP_DIR}/var-dalton-enc.err" \
+        "${RUN_TMP_DIR}/var-dalton-hash.err" "${RUN_TMP_DIR}/var-dalton-rcat.err"
+    mkdir -p "${VAR_SQLITE_STAGING}"
+
+    if ! "${PY_BIN}" "${BACKUP_LIB}" snapshot-sqlite \
+        --src-dir "${PROD_VAR_DIR}" \
+        --dest-dir "${VAR_SQLITE_STAGING}" \
+        --excludes "${DATA_VAR_EXCLUDES}" \
+        >"${VAR_SQLITE_LIST}" 2>"${VAR_SQLITE_ERR}"; then
+        SNAP_ERR="$(tr '\n' ' ' < "${VAR_SQLITE_ERR}" 2>/dev/null || true)"
+        rm -rf "${VAR_SQLITE_STAGING}" "${VAR_SQLITE_LIST}" "${VAR_SQLITE_ERR}"
+        fail_with_alert "VAR_DALTON_BACKUP_FAILED" "SQLite snapshot failed for ${PROD_VAR_DIR}: ${SNAP_ERR}"
+    fi
+
+    VAR_TAR_CMD=()
+    while IFS= read -r -d '' tok; do
+        VAR_TAR_CMD+=("${tok}")
+    done < <("${PY_BIN}" "${BACKUP_LIB}" var-dalton-tar-cmd \
+        --src-dir "${PROD_VAR_DIR}" \
+        --excludes "${DATA_VAR_EXCLUDES}" \
+        --sqlite-manifest "${VAR_SQLITE_LIST}" \
+        --staging-dir "${VAR_SQLITE_STAGING}")
+    if [[ "${#VAR_TAR_CMD[@]}" -lt 4 ]] || [[ "${VAR_TAR_CMD[0]}" != "tar" ]]; then
+        rm -rf "${VAR_SQLITE_STAGING}" "${VAR_SQLITE_LIST}" "${VAR_SQLITE_ERR}"
+        fail_with_alert "VAR_DALTON_BACKUP_FAILED" "Failed to construct var/dalton tar command for ${PROD_VAR_DIR}"
+    fi
+
+    RAND_VAR="$(openssl rand -hex 6)"
+    VAR_PARTIAL_OBJ="${VAR_FINAL_OBJ}.partial-${RAND_VAR}"
+    CURRENT_PARTIAL_OBJ="${VAR_PARTIAL_OBJ}"
+
+    log_msg "INFO" "Streaming var/dalton ${PROD_VAR_DIR} -> ${VAR_PARTIAL_OBJ} (attempt ${VAR_ATTEMPT}/${VAR_MAX_ATTEMPTS})"
+    suspend_err_trap
+    set +e
+    COPYFILE_DISABLE=1 "${VAR_TAR_CMD[@]}" 2>"${RUN_TMP_DIR}/var-dalton.err" \
+        | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${DALTON_BACKUP_KEY_FILE}" 2>"${RUN_TMP_DIR}/var-dalton-enc.err" \
+        | "${PY_BIN}" "${BACKUP_LIB}" stream-hash-meta --meta-out "${VAR_META}" 2>"${RUN_TMP_DIR}/var-dalton-hash.err" \
+        | rclone_noproxy rcat "${VAR_PARTIAL_OBJ}" \
+            --cache-dir "${RCLONE_CACHE_DIR}" \
+            --temp-dir "${RUN_TMP_DIR}" \
+            --log-file "${RCLONE_LOG_FILE}" \
+            --log-level INFO 2>"${RUN_TMP_DIR}/var-dalton-rcat.err"
+    PIPE_STATUS=("${PIPESTATUS[@]}")
+    set -e
+    restore_err_trap
+
+    TAR_RC="${PIPE_STATUS[0]:-1}"
+    VAR_PIPE_STR="${TAR_RC} ${PIPE_STATUS[1]:-1} ${PIPE_STATUS[2]:-1} ${PIPE_STATUS[3]:-1}"
+    if [[ "${TAR_RC}" -ne 0 ]] || [[ "${PIPE_STATUS[1]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[2]:-1}" -ne 0 ]] || [[ "${PIPE_STATUS[3]:-1}" -ne 0 ]]; then
+        delete_partial_remote "${VAR_PARTIAL_OBJ}"
+        CURRENT_PARTIAL_OBJ=""
+        if "${PY_BIN}" "${BACKUP_LIB}" should-retry-tar --attempt "${VAR_ATTEMPT}" --pipe-status "${VAR_PIPE_STR}" --max-retries 1; then
+            TAR_REASON="$("${PY_BIN}" "${BACKUP_LIB}" summarize-tar-stderr --err-file "${RUN_TMP_DIR}/var-dalton.err" 2>/dev/null || echo "tar exited ${TAR_RC}")"
+            log_msg "WARN" "var/dalton tar failed on attempt ${VAR_ATTEMPT}, retrying once: ${TAR_REASON}"
+            rm -rf "${VAR_SQLITE_STAGING}" "${VAR_SQLITE_LIST}" "${VAR_SQLITE_ERR}" "${VAR_META}"
+            VAR_ATTEMPT=$((VAR_ATTEMPT + 1))
+            continue
+        fi
+        VAR_ERR="$(cat "${RUN_TMP_DIR}/var-dalton.err" "${RUN_TMP_DIR}/var-dalton-enc.err" "${RUN_TMP_DIR}/var-dalton-hash.err" "${RUN_TMP_DIR}/var-dalton-rcat.err" 2>/dev/null | tr '\n' ' ' || true)"
+        rm -rf "${VAR_SQLITE_STAGING}" "${VAR_SQLITE_LIST}" "${VAR_SQLITE_ERR}" "${VAR_META}"
+        fail_with_alert "VAR_DALTON_BACKUP_FAILED" "var/dalton stream failed (pipe=${PIPE_STATUS[*]}): ${VAR_ERR}"
+    fi
+
+    rm -rf "${VAR_SQLITE_STAGING}" "${VAR_SQLITE_LIST}" "${VAR_SQLITE_ERR}"
+    verify_and_promote_partial "${VAR_PARTIAL_OBJ}" "${VAR_FINAL_OBJ}" "${VAR_META}" "var-dalton"
+    break
+done
 
 # Prune Google Drive weekly/ keeping DRIVE_RETAIN_WEEKS (only YYYY-MM-DD directories)
 REMOTE_WEEKLY_BASE="${RCLONE_REMOTE}:${RCLONE_DRIVE_DIR}/weekly"

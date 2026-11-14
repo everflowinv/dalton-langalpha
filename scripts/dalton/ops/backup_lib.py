@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -100,9 +101,62 @@ PROXY_ENV_VARS = (
     "NO_PROXY",
 )
 
+DEFAULT_CONFIG_VAR_EXCLUDES = (
+    "openclaw-data/temp",
+    "openclaw-data/research-outputs",
+    "pr_baseline",
+    "tmp",
+    ".dalton-runs",
+    "backups",
+    "*.dump",
+    "*.sqlite",
+    "*.sqlite-wal",
+    "*.sqlite-shm",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "*.pyc",
+    "node_modules",
+    ".dalton-freeze",
+    "reextract",
+    "*.db",
+    "*.duckdb",
+    ".DS_Store",
+    ".dalton-outbox-*",
+    "openclaw-data/skills/*/data",
+    "openclaw-data/skills/*/output",
+    "openclaw-data/skills/*/temp",
+    "openclaw-data/skills/*/state",
+    "openclaw-data/skills/*/events",
+    "asr_jobs",
+    "smoke",
+    "trial-runs",
+)
+
+DEFAULT_DATA_VAR_EXCLUDES = (
+    "venv",
+    ".venv",
+    "__pycache__",
+    "*.pyc",
+    "node_modules",
+    ".DS_Store",
+    "pr_baseline",
+    "tmp",
+    "openclaw-data/temp",
+    "openclaw-data/skills/*/temp",
+    "run-secrets",
+    ".dalton-outbox-*",
+)
+
+SQLITE_FILE_HEADER = b"SQLite format 3\x00"
+
 
 class MountCheckError(RuntimeError):
     """Raised when the external backup drive is missing, unmounted, or mismatched."""
+
+
+class SqliteSnapshotError(RuntimeError):
+    """Raised when online SQLite backup fails for one or more database files."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,23 +358,39 @@ def parse_pattern_list(raw: str | Iterable[str] | None) -> tuple[str, ...]:
     return tuple(str(tok).strip() for tok in raw if str(tok).strip())
 
 
+def _normalize_rel_path(raw: str) -> str:
+    cleaned = raw.replace("\\", "/").strip("/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned
+
+
 def matches_exclude(rel_path: str, patterns: Iterable[str]) -> bool:
-    """Return True if ``rel_path`` (POSIX relative path) matches any exclude rule."""
-    rel = rel_path.replace("\\", "/").strip("/")
+    """Return True if ``rel_path`` (POSIX relative path) matches any exclude rule.
+
+    Patterns containing ``/`` are anchored to the root directory (matching the path
+    itself or any descendant); patterns without ``/`` match any path component.
+    """
+    rel = _normalize_rel_path(rel_path)
     if not rel:
         return False
     parts = rel.split("/")
     basename = parts[-1]
     for raw_pat in patterns:
-        pat = raw_pat.replace("\\", "/").strip("/")
+        pat = _normalize_rel_path(raw_pat)
         if not pat:
             continue
         if "/" in pat:
-            if rel == pat or rel.startswith(pat + "/") or fnmatch.fnmatch(rel, pat):
+            if (
+                rel == pat
+                or rel.startswith(pat + "/")
+                or fnmatch.fnmatchcase(rel, pat)
+                or fnmatch.fnmatchcase(rel, pat + "/*")
+            ):
                 return True
         else:
-            if fnmatch.fnmatch(basename, pat) or any(
-                fnmatch.fnmatch(seg, pat) for seg in parts
+            if fnmatch.fnmatchcase(basename, pat) or any(
+                fnmatch.fnmatchcase(seg, pat) for seg in parts
             ):
                 return True
     return False
@@ -344,6 +414,243 @@ def matches_include(rel_path: str, include_globs: Iterable[str]) -> bool:
             if fnmatch.fnmatch(basename, clean) or fnmatch.fnmatch(rel, clean):
                 return True
     return False
+
+
+def build_tar_exclude_args(
+    excludes: str | Iterable[str] | None = None,
+) -> list[str]:
+    """Build ``--exclude <pattern>`` flags for streaming ``tar`` from an exclude list.
+
+    Patterns containing ``/`` are emitted with a ``^./`` prefix so bsdtar anchors
+    them to the archive root ``.`` instead of matching nested subdirectories.
+    """
+    raw = DEFAULT_DATA_VAR_EXCLUDES if excludes is None else excludes
+    args: list[str] = []
+    for raw_pat in parse_pattern_list(raw):
+        clean = _normalize_rel_path(raw_pat)
+        if not clean:
+            continue
+        tar_pat = f"^./{clean}" if "/" in clean else clean
+        args.extend(["--exclude", tar_pat])
+    return args
+
+
+def _escape_posix_bre(text: str) -> str:
+    return re.sub(r"([\\.^$[*])", r"\\\1", text)
+
+
+def _escape_tar_glob(text: str) -> str:
+    # bsdtar pathmatch treats these as wildcards, and a trailing ``$`` as an end anchor.
+    return re.sub(r"([\\\[\]*?$^])", r"\\\1", text)
+
+
+def is_sqlite_file(path: Path) -> bool:
+    """Return True if ``path`` starts with the 16-byte SQLite 3 file header."""
+    try:
+        with path.open("rb") as fh:
+            return fh.read(len(SQLITE_FILE_HEADER)) == SQLITE_FILE_HEADER
+    except OSError:
+        return False
+
+
+def snapshot_sqlite(
+    src_dir: Path,
+    dest_dir: Path,
+    excludes: str | Iterable[str] | None = None,
+) -> list[str]:
+    """Create consistent online backups of SQLite files under ``src_dir`` into ``dest_dir``.
+
+    Detection checks the 16-byte ``SQLite format 3\\0`` header regardless of extension.
+    Excluded paths and symlinks are skipped. Returns sorted relative POSIX paths.
+    """
+    if not src_dir.is_dir():
+        raise SqliteSnapshotError(f"Source directory does not exist: {src_dir}")
+
+    patterns = parse_pattern_list(
+        DEFAULT_DATA_VAR_EXCLUDES if excludes is None else excludes
+    )
+    snapshotted: list[str] = []
+
+    for root, dirs, files in os.walk(src_dir, followlinks=False):
+        root_path = Path(root)
+        rel_dir = root_path.relative_to(src_dir).as_posix()
+        kept_dirs: list[str] = []
+        for d in sorted(dirs):
+            sub_rel = d if rel_dir == "." else f"{rel_dir}/{d}"
+            if matches_exclude(sub_rel, patterns):
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
+
+        for fname in sorted(files):
+            fpath = root_path / fname
+            if fpath.is_symlink() or not fpath.is_file():
+                continue
+            rel_path = fname if rel_dir == "." else f"{rel_dir}/{fname}"
+            if matches_exclude(rel_path, patterns):
+                continue
+            if not is_sqlite_file(fpath):
+                continue
+
+            dst_file = dest_dir / rel_path
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            dst_file.unlink(missing_ok=True)
+            src_uri = f"{fpath.resolve().as_uri()}?mode=ro"
+            src_conn: sqlite3.Connection | None = None
+            dst_conn: sqlite3.Connection | None = None
+            try:
+                src_conn = sqlite3.connect(src_uri, uri=True, timeout=30.0)
+                dst_conn = sqlite3.connect(str(dst_file))
+                src_conn.backup(dst_conn)
+            except (sqlite3.Error, OSError) as exc:
+                if dst_conn is not None:
+                    dst_conn.close()
+                    dst_conn = None
+                dst_file.unlink(missing_ok=True)
+                raise SqliteSnapshotError(f"{rel_path}: {exc}") from exc
+            finally:
+                if dst_conn is not None:
+                    dst_conn.close()
+                if src_conn is not None:
+                    src_conn.close()
+            try:
+                shutil.copystat(fpath, dst_file)
+            except OSError:
+                pass
+            snapshotted.append(rel_path)
+
+    return sorted(snapshotted)
+
+
+def build_var_dalton_tar_cmd(
+    src_dir: Path,
+    excludes: str | Iterable[str] | None = None,
+    *,
+    sqlite_paths: Iterable[str] = (),
+    staging_dir: Path | None = None,
+) -> list[str]:
+    """Build the streaming ``tar czf -`` command for ``var/dalton`` with excludes.
+
+    When ``sqlite_paths`` is non-empty, live database files and their ``-wal``/``-shm``/
+    ``-journal`` sidecars are excluded from ``src_dir`` and the consistent copies under
+    ``staging_dir`` are added at identical ``./<rel_path>`` archive paths via ``-s``.
+    """
+    seen_sqlite: set[str] = set()
+    clean_sqlite: list[str] = []
+    for raw_rel in sqlite_paths:
+        rel = str(raw_rel).strip("/")
+        while rel.startswith("./"):
+            rel = rel[2:].lstrip("/")
+        if rel and rel not in seen_sqlite:
+            seen_sqlite.add(rel)
+            clean_sqlite.append(rel)
+    exclude_args = build_tar_exclude_args(excludes)
+    if not clean_sqlite:
+        return [
+            "tar",
+            "czf",
+            "-",
+            *exclude_args,
+            "-C",
+            str(src_dir),
+            ".",
+        ]
+
+    if staging_dir is None:
+        raise ValueError("staging_dir is required when sqlite_paths is non-empty")
+    staging_path = Path(staging_dir)
+    if not staging_path.name:
+        raise ValueError(f"staging_dir must have a non-empty basename: {staging_dir}")
+    staging_parent = str(staging_path.parent) or "."
+    staging_name = staging_path.name
+
+    sqlite_exclude_args: list[str] = []
+    for rel in clean_sqlite:
+        escaped_rel = _escape_tar_glob(rel)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            sqlite_exclude_args.extend(["--exclude", f"^./{escaped_rel}{suffix}"])
+
+    return [
+        "tar",
+        "czf",
+        "-",
+        *exclude_args,
+        *sqlite_exclude_args,
+        "-s",
+        f"/^{_escape_posix_bre(staging_name)}/./HS",
+        "-C",
+        str(src_dir),
+        ".",
+        "-C",
+        staging_parent,
+        *[f"{staging_name}/{rel}" for rel in clean_sqlite],
+    ]
+
+
+def _parse_pipe_status(pipe_status: str | Iterable[int]) -> tuple[int, ...]:
+    if isinstance(pipe_status, str):
+        tokens = [tok for tok in pipe_status.strip().split() if tok]
+        if not tokens:
+            raise ValueError("pipe_status must not be empty")
+        return tuple(int(tok) for tok in tokens)
+    values = tuple(int(code) for code in pipe_status)
+    if not values:
+        raise ValueError("pipe_status must not be empty")
+    return values
+
+
+def should_retry_tar_failure(
+    attempt: int,
+    pipe_status: str | Iterable[int],
+    *,
+    max_retries: int = 1,
+) -> bool:
+    """Return True only when ``tar`` (stage 0) failed while all downstream stages exited 0."""
+    if attempt > max_retries:
+        return False
+    codes = _parse_pipe_status(pipe_status)
+    if len(codes) != 4:
+        # tar | openssl | stream-hash-meta | rclone: anything else is a caller bug, never retry.
+        return False
+    tar_rc, *downstream_rcs = codes
+    return tar_rc != 0 and all(rc == 0 for rc in downstream_rcs)
+
+
+def summarize_tar_stderr(stderr_text: str, *, max_chars: int = 240) -> str:
+    """Collapse ``tar`` stderr into a single sanitized log summary line."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", stderr_text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "tar exited non-zero with empty stderr"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def filter_var_dalton_paths(
+    root_dir: Path,
+    excludes: str | Iterable[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Walk ``root_dir`` and return sorted ``(included_files, excluded_files)`` relative paths."""
+    patterns = parse_pattern_list(
+        DEFAULT_DATA_VAR_EXCLUDES if excludes is None else excludes
+    )
+    included: list[str] = []
+    excluded: list[str] = []
+    if not root_dir.is_dir():
+        return included, excluded
+
+    for root, dirs, files in os.walk(root_dir, followlinks=False):
+        dirs.sort()
+        root_path = Path(root)
+        rel_dir = root_path.relative_to(root_dir).as_posix()
+        for fname in sorted(files):
+            rel_path = fname if rel_dir == "." else f"{rel_dir}/{fname}"
+            if matches_exclude(rel_path, patterns):
+                excluded.append(rel_path)
+            else:
+                included.append(rel_path)
+    return included, excluded
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -1379,6 +1686,65 @@ def _cmd_emit_alert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_snapshot_sqlite(args: argparse.Namespace) -> int:
+    excludes: str | None = None if args.excludes is None else args.excludes
+    try:
+        paths = snapshot_sqlite(
+            Path(args.src_dir),
+            Path(args.dest_dir),
+            excludes=excludes,
+        )
+    except SqliteSnapshotError as exc:
+        print(f"SQLite snapshot failed: {exc}", file=sys.stderr)
+        return 1
+    if paths:
+        sys.stdout.buffer.write(b"\0".join(p.encode("utf-8") for p in paths) + b"\0")
+        sys.stdout.buffer.flush()
+    return 0
+
+
+def _cmd_var_dalton_tar_cmd(args: argparse.Namespace) -> int:
+    excludes: str | None = None if args.excludes is None else args.excludes
+    sqlite_paths: list[str] = list(args.sqlite_path or ())
+    if args.sqlite_manifest:
+        raw = Path(args.sqlite_manifest).read_bytes()
+        for item in raw.split(b"\0"):
+            if item:
+                sqlite_paths.append(item.decode("utf-8"))
+    staging_dir = Path(args.staging_dir) if args.staging_dir else None
+    cmd = build_var_dalton_tar_cmd(
+        Path(args.src_dir),
+        excludes=excludes,
+        sqlite_paths=sqlite_paths,
+        staging_dir=staging_dir,
+    )
+    sys.stdout.buffer.write(b"\0".join(tok.encode("utf-8") for tok in cmd) + b"\0")
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def _cmd_should_retry_tar(args: argparse.Namespace) -> int:
+    try:
+        ok = should_retry_tar_failure(
+            int(args.attempt),
+            args.pipe_status,
+            max_retries=int(args.max_retries),
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return 0 if ok else 1
+
+
+def _cmd_summarize_tar_stderr(args: argparse.Namespace) -> int:
+    if args.err_file:
+        text = Path(args.err_file).read_text(encoding="utf-8", errors="replace")
+    else:
+        text = sys.stdin.read()
+    print(summarize_tar_stderr(text, max_chars=int(args.max_chars)))
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Dalton offsite backup helper")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1480,6 +1846,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_al.add_argument("--gateway-env-file", default="")
     p_al.add_argument("--default-file", default="")
     p_al.set_defaults(func=_cmd_emit_alert)
+
+    p_ss = sub.add_parser("snapshot-sqlite")
+    p_ss.add_argument("--src-dir", required=True)
+    p_ss.add_argument("--dest-dir", required=True)
+    p_ss.add_argument("--excludes", default=None)
+    p_ss.set_defaults(func=_cmd_snapshot_sqlite)
+
+    p_vt = sub.add_parser("var-dalton-tar-cmd")
+    p_vt.add_argument("--src-dir", required=True)
+    p_vt.add_argument("--excludes", default=None)
+    p_vt.add_argument("--sqlite-manifest", default="")
+    p_vt.add_argument("--sqlite-path", action="append", default=[])
+    p_vt.add_argument("--staging-dir", default="")
+    p_vt.set_defaults(func=_cmd_var_dalton_tar_cmd)
+
+    p_rt = sub.add_parser("should-retry-tar")
+    p_rt.add_argument("--attempt", type=int, required=True)
+    p_rt.add_argument("--pipe-status", required=True)
+    p_rt.add_argument("--max-retries", type=int, default=1)
+    p_rt.set_defaults(func=_cmd_should_retry_tar)
+
+    p_st = sub.add_parser("summarize-tar-stderr")
+    p_st.add_argument("--err-file", default="")
+    p_st.add_argument("--max-chars", type=int, default=240)
+    p_st.set_defaults(func=_cmd_summarize_tar_stderr)
 
     return ap
 
