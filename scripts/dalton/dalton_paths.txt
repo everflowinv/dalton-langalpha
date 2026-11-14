@@ -418,3 +418,7 @@ web/src/components/Sidebar/__tests__/ReportGating.test.tsx
 scripts/dalton/ops/
 tests/unit/dalton/test_offsite_backup.py
 integrations/dalton-channel-gateway/test/ops-alerts.test.ts
+
+# sync5 S5 round 2: wake_context persistence across handoff/refire and resumed turn firing identity.
+tests/unit/server/services/test_dalton_wake_handoff.py
+tests/unit/server/handlers/test_ptc_run_firing_identity.py

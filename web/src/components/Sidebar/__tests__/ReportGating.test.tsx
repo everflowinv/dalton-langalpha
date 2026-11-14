@@ -51,8 +51,8 @@ describe('DALTON-HOOK(problem-reports-off): frontend report entry gating', () =>
         />
       </>,
     );
-    expect(screen.queryByText(/Report a problem|问题反馈/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Report this|上报此问题/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Report a problem|报告问题/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Report this|报告此问题/i)).not.toBeInTheDocument();
   });
 
   it('shows report menu item and error-banner report action when reports are enabled', () => {
@@ -66,7 +66,7 @@ describe('DALTON-HOOK(problem-reports-off): frontend report entry gating', () =>
         />
       </>,
     );
-    expect(screen.getByText(/Report a problem|问题反馈/i)).toBeInTheDocument();
-    expect(screen.getByText(/Report this|上报此问题/i)).toBeInTheDocument();
+    expect(screen.getByText(/Report a problem|报告问题/i)).toBeInTheDocument();
+    expect(screen.getByText(/Report this|报告此问题/i)).toBeInTheDocument();
   });
 });

@@ -591,6 +591,22 @@ async def astream_ptc_workflow(
                     sends_for = await carry.carried_delivery(request, thread_id)
                     if sends_for:
                         extra_configurable = {**(extra_configurable or {}), **sends_for}
+                # DALTON-HOOK(dispatch-delivery): restore automation execution identity on resumed firing turns
+                if firing:
+                    updated_configurable = dict(extra_configurable or {})
+                    if firing.get("automation_execution_id") and not updated_configurable.get(
+                        "automation_execution_id"
+                    ):
+                        updated_configurable["automation_execution_id"] = str(
+                            firing["automation_execution_id"]
+                        )
+                    if firing.get("automation_id") and not updated_configurable.get(
+                        "turn_origin_automation_id"
+                    ):
+                        updated_configurable["turn_origin_automation_id"] = str(
+                            firing["automation_id"]
+                        )
+                    extra_configurable = updated_configurable
                 run_handle = await begin_run(
                     request,
                     scope=scope,

@@ -1963,6 +1963,7 @@ async def _log_wake_result(
 ) -> None:
     """Write the wake log. A failure only warns; the wake itself still stands."""
     try:
+        # DALTON-HOOK(preflight): persist complete wake_context (with optional coverage_group_refresh block)
         await watch_db.insert_preflight_log(
             automation_id=automation_id,
             automation_execution_id=execution_id,
@@ -1970,6 +1971,7 @@ async def _log_wake_result(
             decision=_allowed_decision(result.decision),
             reason=str(result.reason or ""),
             signals=list(result.signals),
+            wake_context=result.wake_context,
         )
     except Exception as e:
         logger.warning("[DALTON_PREFLIGHT] 唤醒已领取，日志写入失败: %s", e)

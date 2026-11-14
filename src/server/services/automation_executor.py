@@ -962,6 +962,19 @@ class AutomationExecutor:
                 # claimed its signals on the previous process; do not re-run
                 # preflight so claim_signals_woken does not reject its own claim.
                 decision = None
+                # DALTON-HOOK(preflight): restore persisted wake_context from dalton_preflight_log on handoff/refire
+                from src.dalton.autonomy import preflight as dalton_preflight
+                from src.dalton.database import watch as watch_db
+
+                if dalton_preflight.is_dalton_automation(automation):
+                    wake_context = await watch_db.get_preflight_wake_context(execution_id)
+                    if wake_context is None:
+                        logger.warning(
+                            f"[AUTOMATION_EXEC] Missing persisted wake_context for handed-off/refired "
+                            f"Dalton execution_id={execution_id}"
+                        )
+                else:
+                    wake_context = None
             else:
                 from src.dalton.autonomy import preflight as dalton_preflight
 
@@ -977,6 +990,7 @@ class AutomationExecutor:
                     )
                     keep_alive.cancel()
                     return
+                wake_context = decision.context if decision else None
         except asyncio.CancelledError:
             # A cancel during preflight never started the turn. Record it as
             # interrupted, then keep propagating the cancel. The heartbeat
@@ -1042,7 +1056,7 @@ class AutomationExecutor:
 
         firing = _Firing(
             automation=automation,
-            wake_context=decision.context if decision else None,  # DALTON-HOOK(preflight)
+            wake_context=wake_context,  # DALTON-HOOK(preflight)
         )
         wait_deadline = time.monotonic() + _WAIT_CAP_SECONDS
         try:

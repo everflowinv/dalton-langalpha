@@ -4254,3 +4254,84 @@ async def test_successful_run_writes_sec_signal_before_seen_watermark(
     assert result.should_wake is True
     assert seen_writes
     assert all(signal_at < index for index in seen_writes)
+
+
+@pytest.mark.asyncio
+async def test_wake_decision_persists_full_wake_context_with_coverage_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预检判定 wake 时，写入日志的 wake_context 等于最终交给执行器的完整文本（含 coverage 块）。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.autonomy.probes import ProbeSignal
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    monkeypatch.setattr(
+        "src.dalton.autonomy.preflight._sync_home_coverage_for_preflight",
+        create_autospec(
+            preflight_mod._sync_home_coverage_for_preflight,
+            return_value="updated NVDA sector coverage",
+        ),
+    )
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        state = dict(kwargs.get("watch_state") or {})
+        state["seen_accessions"] = [_SEC_ACCESSION]
+        return [
+            ProbeSignal(
+                probe="sec",
+                signal_key=f"filing:{_SEC_ACCESSION}",
+                priority="P0",
+                summary="META 新 SEC 披露：10-Q",
+                payload={"form": "10-Q", "accession_number": _SEC_ACCESSION},
+            )
+        ], state
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_sec, cnhk=_quiet)
+    result = await preflight_check(
+        _company_watch_automation(),
+        "exec-wake-ctx-1",
+        persist=True,
+        agenda_doc_override={},
+    )
+
+    assert result.decision == "wake"
+    assert result.wake_context is not None
+    assert "<coverage_group_refresh>" in result.wake_context
+    assert "updated NVDA sector coverage" in result.wake_context
+    wake_logs = [entry for entry in doubles["logs"] if entry.get("decision") == "wake"]
+    assert len(wake_logs) == 1
+    assert wake_logs[0]["wake_context"] == result.wake_context
+
+
+def test_d037_preflight_log_wake_context_migration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """d037 迁移文件头及 dalton_preflight_log.wake_context 升降级 SQL 正确。"""
+    import importlib
+
+    from alembic import op
+
+    mig = importlib.import_module("src.dalton.migrations.versions.d037_preflight_log_wake_context")
+    assert mig.revision == "d037"
+    assert mig.down_revision == "d036"
+
+    executed: list[str] = []
+
+    def _record_sql(sql: Any, *_args: Any, **_kwargs: Any) -> None:
+        executed.append(" ".join(str(sql).split()))
+
+    monkeypatch.setattr(op, "execute", create_autospec(op.execute, side_effect=_record_sql))
+    mig.upgrade()
+    assert any(
+        "ALTER TABLE dalton_preflight_log ADD COLUMN IF NOT EXISTS wake_context TEXT" in stmt
+        for stmt in executed
+    )
+
+    executed.clear()
+    mig.downgrade()
+    assert any(
+        "ALTER TABLE dalton_preflight_log DROP COLUMN IF EXISTS wake_context" in stmt
+        for stmt in executed
+    )
+
