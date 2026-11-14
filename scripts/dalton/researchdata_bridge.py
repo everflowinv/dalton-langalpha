@@ -33,6 +33,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16964,6 +16965,7 @@ class ResearchDataBridge:
 
     def recover_host_runner_state_sync(self) -> dict[str, Any]:
         """Synchronously check `.dalton-host-runner-fence-lost` and state file, restore `max_seen_generation`, and stop/verify recorded `pgid`s."""
+        _cleanup_stale_host_outbox_staging_dirs()  # DALTON-HOOK(host-job-secrets)
         marker_exists = self._has_fence_lost_marker_file_sync()
         loaded_gen, loaded_active, is_corrupt, _file_fence_lost = self._read_host_runner_state_file_sync()
         if is_corrupt:
@@ -17720,12 +17722,14 @@ class ResearchDataBridge:
             if self._host_task_command_override is not None:
                 gate_spec = {
                     "mode": "command",
+                    "job_key": job_key,
                     "command_argv": [str(x) for x in self._host_task_command_override],
                     "cwd": str(data_root),
                 }
             elif host_mode == "mirror":
                 gate_spec = {
                     "mode": "mirror",
+                    "job_key": job_key,
                     "ocw_root": str(ocw_root),
                     "data_root": str(data_root),
                     "scheduled_slot_utc": str(scheduled_slot_utc),
@@ -17750,18 +17754,29 @@ class ResearchDataBridge:
                 host_workspace_env = str(run_spec["workspace_env"])
                 gate_spec = {
                     "mode": "command",
+                    "job_key": job_key,
                     "command_argv": list(run_spec["command_argv"]),
                     "cwd": str(run_spec["cwd"]),
                 }
 
-            child_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
-                dict(os.environ)
+            # DALTON-HOOK(host-job-secrets): validate host-task Vault secrets & plain env against manifest.yaml
+            accepted_secrets, manifest_plain_env = _resolve_host_task_env_from_manifest(
+                job_key,
+                requested_secrets=body.get("secrets"),
+            )
+            child_env = bridge_subprocess_env.build_host_task_subprocess_env(
+                dict(os.environ),
+                allowed_secrets=accepted_secrets,
+                plain_env=manifest_plain_env,
             )
             run_outbox_file = data_root / ".dalton-runs" / str(run_id) / "outbox.json"
             run_outbox_file.parent.mkdir(parents=True, exist_ok=True)
+            data_root.mkdir(parents=True, exist_ok=True)
+            outbox_staging_dir = _create_host_outbox_staging_dir()  # DALTON-HOOK(host-job-secrets)
+            staging_outbox_file = outbox_staging_dir / "outbox.json"
             child_env["DALTON_RUN_ID"] = str(run_id)
             child_env["DALTON_RUN_DIR"] = str(run_outbox_file.parent)
-            child_env["DALTON_OUTBOX_FILE"] = str(run_outbox_file)
+            child_env["DALTON_OUTBOX_FILE"] = str(staging_outbox_file)
             if host_mode == "run":
                 child_env["OPENCLAW_WORKSPACE"] = host_workspace_env
                 child_env["DALTON_PYTHON_BIN"] = str(os.environ.get("DALTON_PYTHON_BIN") or py_bin)
@@ -17771,20 +17786,23 @@ class ResearchDataBridge:
                 child_env.setdefault("TZ", "America/New_York")
                 child_env["DALTON_NO_DIRECT_SEND"] = "1"
 
-            data_root.mkdir(parents=True, exist_ok=True)
-            proc = await asyncio.create_subprocess_exec(
-                py_bin,
-                "-u",
-                str(Path(__file__).resolve()),
-                HOST_TASK_GATE_FLAG,
-                json.dumps(gate_spec, ensure_ascii=False),
-                cwd=str(data_root),
-                env=child_env,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    py_bin,
+                    "-u",
+                    str(Path(__file__).resolve()),
+                    HOST_TASK_GATE_FLAG,
+                    json.dumps(gate_spec, ensure_ascii=False),
+                    cwd=str(data_root),
+                    env=child_env,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except Exception:
+                shutil.rmtree(outbox_staging_dir, ignore_errors=True)
+                raise
             pgid = int(proc.pid)
             leader_lstart: str | None = None
             try:
@@ -17814,6 +17832,7 @@ class ResearchDataBridge:
                     await proc.stdin.drain()
                     proc.stdin.close()
             except Exception as exc:
+                shutil.rmtree(outbox_staging_dir, ignore_errors=True)
                 if proc.stdin is not None:
                     try:
                         proc.stdin.close()
@@ -17843,7 +17862,7 @@ class ResearchDataBridge:
                     "error": f"gate_registration_failed:{type(exc).__name__}",
                 }
 
-        redactor = HostSecretRedactor()
+        redactor = _HostTaskVaultRedactor(accepted_secrets.values())  # DALTON-HOOK(host-job-secrets)
         timed_out = False
         timeout_kind: str | None = None
         exit_code: int = 1
@@ -17864,7 +17883,48 @@ class ResearchDataBridge:
                     ps_list_fn=self._get_ps_list_fn(),
                 )
             )
+            stdout_text = redactor.redact_text(stdout_text)
+            stderr_text = redactor.redact_text(stderr_text)
+            combined_tail = stdout_text
+            if stderr_text:
+                combined_tail = (stdout_text.rstrip("\n") + "\n" + stderr_text) if stdout_text else stderr_text
+            combined_tail = redactor.redact_text(combined_tail)
+            # DALTON-HOOK(host-job-secrets): drain staging outbox into memory, delete staging file, redact, then atomically write final outbox
+            try:
+                await asyncio.to_thread(
+                    _finalize_host_run_outbox_file,
+                    staging_outbox_file,
+                    run_outbox_file,
+                    redactor,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Host task outbox redaction failed (run_id=%s job_key=%s error=%s)",
+                    run_id,
+                    job_key,
+                    type(exc).__name__,
+                )
+                try:
+                    if run_outbox_file.exists() or run_outbox_file.is_symlink():
+                        run_outbox_file.unlink()
+                except OSError:
+                    pass
+                return 500, {
+                    "ok": False,
+                    "error": "outbox_redaction_failed",
+                    "outbox_redaction_failed": True,
+                    "run_id": run_id,
+                    "job_key": job_key,
+                    "generation": generation,
+                    "exit_code": int(exit_code),
+                    "timed_out": bool(timed_out),
+                    "timeout_kind": timeout_kind,
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                    "log_tail": combined_tail,
+                }
         finally:
+            shutil.rmtree(outbox_staging_dir, ignore_errors=True)
             async with self._host_runner_lock:
                 self._host_running_procs.pop(pgid, None)
                 if pgid in self._host_active_runs:
@@ -17889,9 +17949,6 @@ class ResearchDataBridge:
         # check could not confirm stays registered, and the scheduler must not
         # free the slot on this answer (it kills and confirms first).
         exit_confirmed = pgid not in self._host_active_runs
-        combined_tail = stdout_text
-        if stderr_text:
-            combined_tail = (stdout_text.rstrip("\n") + "\n" + stderr_text) if stdout_text else stderr_text
         return 200, {
             "ok": exit_code == 0 and not timed_out and not killed_by_host_kill,
             "run_id": run_id,
@@ -18889,6 +18946,77 @@ def resolve_host_run_command_spec(
         "cwd": str(resolved),
         "workspace_env": str(resolved),
     }
+
+
+# DALTON-HOOK(host-job-secrets): resolve host-task Vault secrets & manifest plain env
+def _resolve_host_task_manifest_entry(job_key: str) -> Any | None:
+    key = str(job_key or "").strip()
+    if not key:
+        return None
+    try:
+        manifest = _load_host_job_manifest()
+        entry = manifest.by_job_key().get(key)
+    except Exception:
+        return None
+    if entry is None or getattr(entry, "runner", None) != "host":
+        return None
+    return entry
+
+
+def _resolve_host_task_env_from_manifest(
+    job_key: str,
+    *,
+    requested_secrets: Any = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Filter Vault-supplied secrets against `manifest.yaml` `secret_names` and return `(accepted_secrets, plain_env)`.
+
+    Never reads host-task secrets from bridge `os.environ`. Undeclared keys sent by a
+    caller are dropped and logged (names only); missing declared keys are logged as
+    warnings (names only) and do not block execution.
+    """
+    entry = _resolve_host_task_manifest_entry(job_key)
+    declared_names: list[str] = (
+        [str(s).strip() for s in getattr(entry, "secret_names", ()) if str(s).strip()]
+        if entry is not None
+        else []
+    )
+    declared_set = set(declared_names)
+    plain_env: dict[str, str] = (
+        {
+            str(k).strip(): str(v)
+            for k, v in (getattr(entry, "env", None) or {}).items()
+            if str(k).strip() and v is not None
+        }
+        if entry is not None
+        else {}
+    )
+
+    accepted_secrets: dict[str, str] = {}
+    if isinstance(requested_secrets, Mapping):
+        undeclared = sorted(
+            str(k).strip()
+            for k in requested_secrets.keys()
+            if str(k).strip() and str(k).strip() not in declared_set
+        )
+        if undeclared:
+            logger.warning(
+                "Dropping undeclared host secret(s) for job_key=%s: %s",
+                job_key,
+                ", ".join(undeclared),
+            )
+        for name in declared_names:
+            val = requested_secrets.get(name)
+            if val is not None and str(val) != "":
+                accepted_secrets[name] = str(val)
+
+    missing = [name for name in declared_names if name not in accepted_secrets]
+    if missing:
+        logger.warning(
+            "Host task %s starting with missing Vault secret(s): %s",
+            job_key,
+            ", ".join(missing),
+        )
+    return accepted_secrets, plain_env
 
 
 def parse_notify_target(raw: str) -> tuple[str, str]:
@@ -20903,6 +21031,159 @@ class HostSecretRedactor:
         return obj
 
 
+# DALTON-HOOK(host-job-secrets): mask Vault-injected host secrets with "***" in logs/tail/outbox
+class _HostTaskVaultRedactor(HostSecretRedactor):
+    """Mask host-task Vault secret values with `***` before applying `HostSecretRedactor`."""
+
+    def __init__(self, vault_secret_values: Any = ()) -> None:
+        super().__init__()
+        vault_collected: set[str] = set()
+        for raw in vault_secret_values:
+            _collect_host_secret_strings(raw, vault_collected)
+        self._vault_patterns: tuple[str, ...] = tuple(
+            sorted((s for s in vault_collected if s), key=len, reverse=True)
+        )
+
+    def redact_text(self, text: str) -> str:
+        if not text:
+            return text
+        out = text
+        for pattern in self._vault_patterns:
+            if pattern in out:
+                out = out.replace(pattern, "***")
+        return super().redact_text(out)
+
+
+# DALTON-HOOK(host-job-secrets): host outbox staging dir & strict redaction/cleanup helpers
+_HOST_OUTBOX_STAGING_PREFIX = ".dalton-outbox-"
+# Well past the longest host task timeout (3 h), so a directory still in use by a
+# live run (or another bridge/test process sharing this user's $TMPDIR) is never touched.
+_HOST_OUTBOX_STALE_AGE_S = 12 * 3600
+_HOST_OUTBOX_CLEANUP_EXTRA_DIRS: tuple[str, ...] = ("/dev/shm",)
+
+
+def _cleanup_stale_host_outbox_staging_dirs(min_age_s: float = _HOST_OUTBOX_STALE_AGE_S) -> int:
+    """Remove leftover `.dalton-outbox-*` dirs owned by the current user under `$TMPDIR` and `/dev/shm`.
+
+    Runs only at bridge startup recovery; age-gated because `$TMPDIR` is shared with
+    any other process of the same user.
+    """
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for raw_base in (tempfile.gettempdir(), *_HOST_OUTBOX_CLEANUP_EXTRA_DIRS):
+        if not raw_base:
+            continue
+        norm = os.path.normpath(str(raw_base))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        candidates.append(Path(norm))
+
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    removed = 0
+    for base in candidates:
+        try:
+            base_st = base.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(base_st.st_mode):
+            continue
+        try:
+            with os.scandir(base) as it:
+                for entry in it:
+                    if not entry.name.startswith(_HOST_OUTBOX_STAGING_PREFIX):
+                        continue
+                    entry_path = Path(entry.path)
+                    try:
+                        est = entry_path.lstat()
+                    except OSError:
+                        continue
+                    # Never follow symlinks and only touch directories owned by the current user.
+                    if stat.S_ISLNK(est.st_mode) or not stat.S_ISDIR(est.st_mode):
+                        continue
+                    if current_uid is not None and est.st_uid != current_uid:
+                        continue
+                    if time.time() - est.st_mtime < min_age_s:
+                        continue
+                    shutil.rmtree(entry_path, ignore_errors=True)
+                    removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _create_host_outbox_staging_dir() -> Path:
+    """Create a private `0700` staging directory for one host run's readable/appendable outbox."""
+    shm_dir = Path("/dev/shm")
+    use_shm = (
+        os.name == "posix"
+        and not shm_dir.is_symlink()
+        and shm_dir.is_dir()
+        and os.access(shm_dir, os.W_OK | os.X_OK)
+    )
+    if use_shm:
+        staging_dir = Path(tempfile.mkdtemp(prefix=_HOST_OUTBOX_STAGING_PREFIX, dir=str(shm_dir)))
+    else:
+        staging_dir = Path(tempfile.mkdtemp(prefix=_HOST_OUTBOX_STAGING_PREFIX))
+    os.chmod(staging_dir, 0o700)
+    return staging_dir
+
+
+def _finalize_host_run_outbox_file(
+    staging_file: Path,
+    final_outbox_path: Path,
+    redactor: HostSecretRedactor,
+) -> None:
+    """Read `staging_file` into RAM, remove it immediately, redact strictly, and atomically write `final_outbox_path`."""
+    if staging_file.is_symlink():
+        try:
+            staging_file.unlink()
+        except OSError:
+            pass
+        raise RuntimeError("outbox_staging_symlink")
+    if not staging_file.exists():
+        return
+    try:
+        raw = staging_file.read_text(encoding="utf-8")
+    finally:
+        try:
+            staging_file.unlink()
+        except OSError:
+            pass
+
+    if not raw.strip():
+        return
+
+    parsed = json.loads(raw)
+    scrubbed_obj = redactor.redact_value(parsed)
+    scrubbed_json = json.dumps(scrubbed_obj, ensure_ascii=False, indent=2)
+    vault_patterns = tuple(getattr(redactor, "_vault_patterns", ()))
+    for pattern in vault_patterns:
+        if pattern and pattern in scrubbed_json:
+            raise RuntimeError("outbox_redaction_incomplete")
+
+    final_outbox_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".outbox.",
+        suffix=".tmp",
+        dir=str(final_outbox_path.parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(scrubbed_json)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, final_outbox_path)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _normalize_lstart(val: Any) -> str:
     """Normalize a `ps -o lstart=` string by collapsing internal whitespace."""
     return " ".join(str(val or "").split())
@@ -21726,12 +22007,29 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
     if not isinstance(cmd_argv, list) or not cmd_argv:
         return 1
     cwd = spec.get("cwd") or None
+    # DALTON-HOOK(host-job-secrets): re-enforce manifest allowlist in gate->child Hop 2
+    hop2_entry = _resolve_host_task_manifest_entry(str(spec.get("job_key") or ""))
+    hop2_secrets: dict[str, str] = {}
+    hop2_plain_env: dict[str, str] = {}
+    if hop2_entry is not None:
+        for name in getattr(hop2_entry, "secret_names", ()):
+            clean_name = str(name).strip()
+            if clean_name and clean_name in os.environ:
+                hop2_secrets[clean_name] = os.environ[clean_name]
+        for k, v in (getattr(hop2_entry, "env", None) or {}).items():
+            clean_k = str(k).strip()
+            if clean_k and v is not None:
+                hop2_plain_env[clean_k] = str(v)
     child = subprocess.Popen(
         [str(x) for x in cmd_argv],
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         start_new_session=False,
-        env=bridge_subprocess_env.build_nonarchive_subprocess_env(dict(os.environ)),
+        env=bridge_subprocess_env.build_host_task_subprocess_env(
+            dict(os.environ),
+            allowed_secrets=hop2_secrets,
+            plain_env=hop2_plain_env,
+        ),
     )
 
     def _forward_term(signum: int, _frame: Any) -> None:

@@ -145,6 +145,7 @@ NONARCHIVE_STRIPPED_PROVIDER_AND_SECRET_KEYS: frozenset[str] = frozenset(
         "DB_PASSWORD",
         "DALTON_REEXTRACT_DSN",
         "DATABASE_URL",
+        "INTERNAL_SERVICE_TOKEN",
         "DAYTONA_API_KEY",
         "E2B_API_KEY",
     }
@@ -348,6 +349,54 @@ def build_nonarchive_subprocess_env(
         cleaned.pop(str(key), None)
     if not cleaned.get("PATH", "").strip():
         cleaned["PATH"] = DEFAULT_SYSTEM_PATH
+    return cleaned
+
+
+# DALTON-HOOK(host-job-secrets): controlled Vault secret + plain env injection for runner=host
+def build_host_task_subprocess_env(
+    base_env: Mapping[str, str] | None = None,
+    *,
+    allowed_secrets: Mapping[str, str] | None = None,
+    plain_env: Mapping[str, str] | None = None,
+    extra_env: Mapping[str, str] | None = None,
+    repo_root: Path | None = None,
+) -> dict[str, str]:
+    """Build subprocess env for `runner: host` tasks with Vault-supplied secrets.
+
+    Always starts from `build_nonarchive_subprocess_env` so no credentials leak from
+    the bridge process's own environment, then injects manifest-validated `plain_env`
+    and `allowed_secrets` (never shell-injection or bridge-token keys).
+    """
+    cleaned = build_nonarchive_subprocess_env(
+        base_env,
+        extra_env=extra_env,
+        repo_root=repo_root,
+    )
+    stripped_provider_keys = _nonarchive_stripped_provider_keys(repo_root)
+    if plain_env:
+        for raw_key, raw_val in plain_env.items():
+            key = str(raw_key or "").strip()
+            if (
+                not key
+                or raw_val is None
+                or key in BRIDGE_TOKEN_ENV_KEYS
+                or _is_shell_injection_key(key)
+                or _is_stripped_credential_key(key)
+                or key in stripped_provider_keys
+            ):
+                continue
+            cleaned[key] = str(raw_val)
+    if allowed_secrets:
+        for raw_key, raw_val in allowed_secrets.items():
+            key = str(raw_key or "").strip()
+            if (
+                not key
+                or raw_val is None
+                or key in BRIDGE_TOKEN_ENV_KEYS
+                or _is_shell_injection_key(key)
+            ):
+                continue
+            cleaned[key] = str(raw_val)
     return cleaned
 
 

@@ -94,6 +94,7 @@ REPORT_PROFILES = frozenset(
         "ai-app-weekly",
         "richard-earnings",
         "wiki-auto-ingest",
+        "podcast-weekly",
     }
 )
 MAX_CARDS = 20

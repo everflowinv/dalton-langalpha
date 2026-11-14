@@ -412,3 +412,9 @@ tests/unit/server/utils/test_thinking_leak.py
 scripts/dalton/ops/
 tests/unit/dalton/test_offsite_backup.py
 integrations/dalton-channel-gateway/test/ops-alerts.test.ts
+
+# OC-1 podcast weekly migration (host pipeline overlay + internal LLM router + agentTurn skill).
+src/dalton/app/internal_llm_router.py
+scripts/dalton/openclaw_overlays/skills/podcast-weekly-digest/
+plugins/dalton/skills/dalton-podcast-weekly/
+tests/unit/dalton/test_podcast_weekly_migration.py

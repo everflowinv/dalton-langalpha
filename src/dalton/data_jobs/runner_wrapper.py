@@ -99,6 +99,7 @@ TASK_NOTIFY_PAYLOAD_SOURCES: dict[str, str] = {
     "china-2c-us-monitor": "outbox_file",  # T24
     "a-share-bottom-volume-watch": "stdout_text",  # T38
     "richard-relative-dashboard-refresh": "none",  # T34
+    "podcast-weekly-pipeline": "none",  # T60
 }
 
 _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
@@ -130,6 +131,7 @@ _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
     "T24": "outbox_file",
     "T38": "stdout_text",
     "T34": "none",
+    "T60": "none",
 }
 
 
