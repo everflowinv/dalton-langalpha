@@ -143,7 +143,7 @@ beforeEach(() => {
     colleague_dispatch_enabled: true,
   };
   state.recentThreads = [
-    { thread_id: 't-own', title: 'Own Thread', workspace_id: 'ws-own', user_id: 'u-self', updated_at: '2026-11-10T00:00:00Z' },
+    { thread_id: 't-own', title: 'Own Thread', workspace_id: 'ws-own', thread_user_id: 'u-self', updated_at: '2026-11-10T00:00:00Z' },
     { thread_id: 't-colleague', title: 'Colleague Thread', workspace_id: 'ws-colleague-ro', user_id: 'u-colleague', workspace_owner_id: 'u-colleague', updated_at: '2026-11-11T00:00:00Z' },
   ];
   state.workspaceThreads = {};
@@ -284,7 +284,7 @@ describe('CommandPalette permissions & loading gate', () => {
       };
       // Real backend SQL for getRecentThreads never returns colleague-owned threads.
       state.recentThreads = [
-        { thread_id: 't-own', title: 'Own Thread', workspace_id: 'ws-own', user_id: 'u-self', updated_at: '2026-11-10T00:00:00Z' },
+        { thread_id: 't-own', title: 'Own Thread', workspace_id: 'ws-own', thread_user_id: 'u-self', updated_at: '2026-11-10T00:00:00Z' },
       ];
       state.workspaceThreads = {
         'ws-colleague-rw': [
@@ -292,7 +292,8 @@ describe('CommandPalette permissions & loading gate', () => {
             thread_id: 't-colleague-in-rw',
             title: 'Colleague RW Thread',
             workspace_id: 'ws-colleague-rw',
-            user_id: 'u-colleague',
+            // Real list rows carry the owner as thread_user_id (COALESCE(t.user_id, w.user_id)).
+            thread_user_id: 'u-colleague',
             workspace_owner_id: 'u-colleague',
             updated_at: '2026-11-11T00:00:00Z',
           },
@@ -300,7 +301,7 @@ describe('CommandPalette permissions & loading gate', () => {
             thread_id: 't-self-in-rw',
             title: 'My Thread In RW',
             workspace_id: 'ws-colleague-rw',
-            user_id: 'u-self',
+            thread_user_id: 'u-self',
             workspace_owner_id: 'u-colleague',
             updated_at: '2026-11-12T00:00:00Z',
           },
@@ -316,8 +317,8 @@ describe('CommandPalette permissions & loading gate', () => {
           updated_at: '2026-11-11T00:00:00Z',
           is_pinned: false,
           has_title: true,
+          // Search hits carry no owner field (web/src/api/search.ts), so the guard falls back to workspace rules.
           match: [[0, 6]],
-          user_id: 'u-colleague',
         },
         {
           thread_id: 't-search-unknown',
