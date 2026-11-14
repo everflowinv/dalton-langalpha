@@ -1,3 +1,5 @@
+// DALTON-HOOK(colleague-dispatch): CommandPalette permission gating, loading gate, and thread-scope Ask tests
+// DALTON-HOOK(external-share-guard): external member isolation for colleague workspaces/threads
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { queryOptions } from '@tanstack/react-query';
@@ -199,7 +201,23 @@ describe('CommandPalette permissions & loading gate', () => {
       ).toBeInTheDocument();
     });
     // Ask row must not be offered for a read-only colleague workspace
-    expect(within(dialog).queryByText(/Ask about/i)).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/Ask “preview”|提问“preview”/i)).not.toBeInTheDocument();
+  });
+
+  it('shows Ask when viewing an own writable workspace', async () => {
+    state.currentWorkspaceId = 'ws-own';
+    openPalette();
+    const dialog = await screen.findByRole('dialog');
+    const input = within(dialog).getByRole('combobox');
+
+    await waitFor(() => {
+      expect(within(dialog).getByText('New thread')).toBeInTheDocument();
+    });
+
+    fireEvent.change(input, { target: { value: 'preview' } });
+    await waitFor(() => {
+      expect(within(dialog).getByText(/Ask “preview”|提问“preview”/i)).toBeInTheDocument();
+    });
   });
 
   it('hides colleague entries and disables create actions while identity/team permissions load', async () => {
@@ -219,6 +237,126 @@ describe('CommandPalette permissions & loading gate', () => {
     expect(within(dialog).queryByText('Colleague Thread')).not.toBeInTheDocument();
 
     fireEvent.change(input, { target: { value: 'thesis' } });
-    expect(within(dialog).queryByText(/Ask about/i)).not.toBeInTheDocument();
+    expect(within(dialog).queryByText(/Ask “thesis”|提问“thesis”/i)).not.toBeInTheDocument();
+  });
+
+  it('hides Ask inside a read-only colleague thread scope, while showing Ask inside own thread scope', async () => {
+    // 1. Read-only colleague thread (in ws-colleague-ro) -> no Ask after Tab into thread scope
+    const roView = renderWithProviders(
+      <CommandPaletteProvider>
+        <div />
+      </CommandPaletteProvider>,
+    );
+    fireEvent.keyDown(document.activeElement ?? window, {
+      key: 'k',
+      shiftKey: true,
+      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
+    });
+    const dialog1 = await screen.findByRole('dialog');
+    const input1 = within(dialog1).getByRole('combobox');
+
+    await waitFor(() => {
+      expect(within(dialog1).getByText('Colleague Thread')).toBeInTheDocument();
+    });
+    fireEvent.change(input1, { target: { value: 'Colleague Thread' } });
+    await waitFor(() => {
+      expect(within(dialog1).getAllByRole('option').length).toBeGreaterThan(0);
+    });
+    fireEvent.keyDown(input1, { key: 'Tab' });
+    await waitFor(() => {
+      expect(within(dialog1).getByRole('combobox')).toHaveValue('');
+    });
+    fireEvent.change(within(dialog1).getByRole('combobox'), { target: { value: 'follow up' } });
+    expect(within(dialog1).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
+    roView.unmount();
+
+    // 2. Colleague-owned thread inside an rw colleague workspace -> also no Ask in thread scope
+    state.teamData = {
+      ...state.teamData!,
+      members: [
+        {
+          user_id: 'u-colleague',
+          email: 'colleague@dalton.test',
+          display_name: 'Colleague',
+          workspaces: [
+            {
+              workspace_id: 'ws-colleague-rw',
+              user_id: 'u-colleague',
+              owner_name: 'Colleague',
+              owner_email: 'colleague@dalton.test',
+              name: 'Colleague RW',
+              web_access: 'rw',
+              status: 'running',
+            },
+          ],
+        },
+      ],
+    };
+    state.recentThreads = [
+      {
+        thread_id: 't-colleague-in-rw',
+        title: 'Colleague RW Thread',
+        workspace_id: 'ws-colleague-rw',
+        user_id: 'u-colleague',
+        workspace_owner_id: 'u-colleague',
+        updated_at: '2026-11-11T00:00:00Z',
+      },
+      {
+        thread_id: 't-own',
+        title: 'Own Thread',
+        workspace_id: 'ws-own',
+        user_id: 'u-self',
+        updated_at: '2026-11-10T00:00:00Z',
+      },
+    ];
+    const rwColleagueView = renderWithProviders(
+      <CommandPaletteProvider>
+        <div />
+      </CommandPaletteProvider>,
+    );
+    fireEvent.keyDown(document.activeElement ?? window, {
+      key: 'k',
+      shiftKey: true,
+      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
+    });
+    const dialog2 = await screen.findByRole('dialog');
+    const input2 = within(dialog2).getByRole('combobox');
+    await waitFor(() => {
+      expect(within(dialog2).getByText('Colleague RW Thread')).toBeInTheDocument();
+    });
+    fireEvent.change(input2, { target: { value: 'Colleague RW Thread' } });
+    fireEvent.keyDown(input2, { key: 'Tab' });
+    await waitFor(() => {
+      expect(within(dialog2).getByRole('combobox')).toHaveValue('');
+    });
+    fireEvent.change(within(dialog2).getByRole('combobox'), { target: { value: 'follow up' } });
+    expect(within(dialog2).queryByText(/Ask “follow up”|提问“follow up”/i)).not.toBeInTheDocument();
+    rwColleagueView.unmount();
+
+    // 3. Own thread scope -> Ask IS offered
+    renderWithProviders(
+      <CommandPaletteProvider>
+        <div />
+      </CommandPaletteProvider>,
+    );
+    fireEvent.keyDown(document.activeElement ?? window, {
+      key: 'k',
+      shiftKey: true,
+      ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }),
+    });
+    const dialog3 = await screen.findByRole('dialog');
+    const input3 = within(dialog3).getByRole('combobox');
+    await waitFor(() => {
+      expect(within(dialog3).getByText('Own Thread')).toBeInTheDocument();
+    });
+    fireEvent.change(input3, { target: { value: 'Own Thread' } });
+    fireEvent.keyDown(input3, { key: 'Tab' });
+    await waitFor(() => {
+      expect(within(dialog3).getByRole('combobox')).toHaveValue('');
+    });
+    fireEvent.change(within(dialog3).getByRole('combobox'), { target: { value: 'follow up' } });
+    await waitFor(() => {
+      expect(within(dialog3).getByText(/Ask “follow up”|提问“follow up”/i)).toBeInTheDocument();
+    });
   });
 });

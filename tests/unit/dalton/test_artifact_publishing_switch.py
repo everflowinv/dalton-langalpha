@@ -393,6 +393,12 @@ async def test_off_legacy_first_read_still_cuts_v1(
         result = await snapshot.legacy_snapshot(artifact)
     assert result.latest_seq == 1
     legacy_version.assert_awaited_once()
+    call_kwargs = legacy_version.await_args.kwargs
+    assert call_kwargs["user_id"] == "u-owner-1"
+    assert call_kwargs["artifact_id"] == artifact.artifact_id
+    assert call_kwargs["read"] == snapshot.ReadBasis.of(artifact)
+    assert call_kwargs["files"] == captured.files
+    assert call_kwargs["title"] == captured.title
 
 
 # --- switch off: an old link still unshares ---------------------------------

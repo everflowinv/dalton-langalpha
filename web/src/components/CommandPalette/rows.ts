@@ -295,9 +295,9 @@ export function tickerRow(symbol: string, name: string, meta: string | undefined
  */
 export function askRow(place: Place | null, text: string, v: Verbs): PaletteItem | null {
   const words = text.trim();
-  // DALTON-HOOK(colleague-dispatch): hide Ask while identity/permissions load or on a read-only workspace place
+  // DALTON-HOOK(colleague-dispatch): hide Ask while identity/permissions load or on a read-only workspace/thread place
   if (!words || v.permissionsLoading || (!place && !v.newWork.canStartThread)) return null;
-  if (place?.kind === 'workspace' && v.canCreateThreadIn && !v.canCreateThreadIn(place.workspaceId)) return null;
+  if (place && v.canCreateThreadIn && !v.canCreateThreadIn(place.workspaceId)) return null;
   const row = (meta: string | undefined, action: PaletteAction): PaletteItem => ({
     id: 'ask',
     icon: Sparkles,

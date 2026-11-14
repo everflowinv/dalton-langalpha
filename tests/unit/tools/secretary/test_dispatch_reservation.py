@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch  # DALTON-HOOK(colleague-dispatch): autospec doubles
 
 import aiohttp
 import pytest
 
+from src.server.database.workspace import get_workspace as _REAL_GET_WORKSPACE  # DALTON-HOOK(colleague-dispatch)
 from src.server.services.report_back.handoff import keys, reserve
 from src.tools.secretary.chief_of_staff import delegate_to_analyst
 from tests.unit.server.handlers.chat.redis_fakes import FakeCache as _FakeCache
@@ -177,6 +178,9 @@ async def test_colleague_dispatch_preserves_error_code_and_fallbacks(
 ):
     """Colleague dispatches preserve structured error codes (e.g. colleague_access_revoked),
     top-level ``error`` fallback, and string ``detail``."""
+    from src.dalton import sharing as sharing_mod
+    from src.server.database import conversation as conv_db
+
     monkeypatch.setattr("src.dalton.settings.is_dalton_supabase_auth_enabled", lambda: True)
     monkeypatch.setattr("src.dalton.settings.is_colleague_dispatch_enabled", lambda: True)
     colleague_ws = {
@@ -186,27 +190,33 @@ async def test_colleague_dispatch_preserves_error_code_and_fallbacks(
         "_caller_cos_access": "rw",
     }
     monkeypatch.setattr(
-        "src.dalton.sharing.require_workspace_access", AsyncMock(return_value=colleague_ws)
+        "src.dalton.sharing.require_workspace_access",
+        create_autospec(sharing_mod.require_workspace_access, return_value=colleague_ws),
     )
     monkeypatch.setattr(
         "src.dalton.sharing.build_dispatched_by_meta",
-        AsyncMock(return_value={"user_id": USER_ID, "channel": "cos"}),
+        create_autospec(
+            sharing_mod.build_dispatched_by_meta,
+            return_value={"user_id": USER_ID, "channel": "cos"},
+        ),
     )
     monkeypatch.setattr(
-        "src.server.database.conversation.create_thread", AsyncMock(return_value=None)
+        "src.server.database.conversation.create_thread",
+        create_autospec(conv_db.create_thread, return_value=None),
     )
     monkeypatch.setattr(
         "src.server.database.conversation.delete_thread",
-        AsyncMock(return_value=True),
+        create_autospec(conv_db.delete_thread, return_value=True),
     )
     with patch(
         "src.server.database.workspace.get_workspace",
-        AsyncMock(
+        create_autospec(
+            _REAL_GET_WORKSPACE,
             return_value={
                 "user_id": "owner-colleague",
                 "workspace_id": WORKSPACE_ID,
                 "name": "Colleague WS",
-            }
+            },
         ),
     ), patch(
         "src.tools.secretary.dispatch.hitl_confirm", return_value=(True, {})

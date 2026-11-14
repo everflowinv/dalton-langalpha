@@ -4,7 +4,7 @@ not read as a report already gone."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch  # DALTON-HOOK(problem-reports-off): autospec doubles
 
 import httpx
 import pytest
@@ -93,20 +93,29 @@ async def test_problem_reports_default_off_even_with_platform_and_auth_url(monke
         await reports_app.create_report(body, "u1", BackgroundTasks())
     assert exc.value.status_code == 404
 
-    with patch.object(feedback_svc, "get_feedback_for_turn", AsyncMock(return_value=None)), \
-         patch.object(
-             feedback_svc,
-             "upsert_feedback",
-             AsyncMock(
-                 return_value={
-                     "conversation_feedback_id": "fb-1",
-                     "rating": "thumbs_down",
-                     "report_id": None,
-                 }
-             ),
-         ), \
-         patch.object(feedback_svc, "_send_report", AsyncMock()) as mock_send, \
-         patch.object(feedback_svc, "_withdraw_report", AsyncMock()):
+    from src.server.database.conversation import upsert_feedback as real_upsert_feedback
+    from src.server.database.conversation.feedback import get_feedback_for_turn as real_get_feedback_for_turn
+
+    report_id = uuid4()
+    fb_row = {
+        "conversation_feedback_id": "fb-1",
+        "conversation_response_id": "resp-1",
+        "user_id": "u1",
+        "rating": "thumbs_down",
+        "issue_categories": ["inaccurate"],
+        "comment": "bad",
+        "consent_human_review": False,
+        "reported_at": None,
+        "report_id": str(report_id),
+    }
+    mock_get_fb = create_autospec(real_get_feedback_for_turn, return_value=None)
+    mock_upsert_fb = create_autospec(real_upsert_feedback, return_value=fb_row)
+    mock_send_off = create_autospec(feedback_svc._send_report)
+    mock_withdraw = create_autospec(feedback_svc._withdraw_report)
+    with patch.object(feedback_svc, "get_feedback_for_turn", mock_get_fb), \
+         patch.object(feedback_svc, "upsert_feedback", mock_upsert_fb), \
+         patch.object(feedback_svc, "_send_report", mock_send_off), \
+         patch.object(feedback_svc, "_withdraw_report", mock_withdraw):
         row, report_status = await feedback_svc.submit(
             thread_id="t-1",
             turn_index=0,
@@ -119,8 +128,31 @@ async def test_problem_reports_default_off_even_with_platform_and_auth_url(monke
         )
     assert row["rating"] == "thumbs_down"
     assert report_status is None
-    mock_send.assert_not_called()
+    mock_send_off.assert_not_called()
 
     monkeypatch.setenv("DALTON_PROBLEM_REPORTS_ENABLED", "1")
+    dalton_settings.get_dalton_config.cache_clear()
     assert reports.reports_enabled() is True
     assert (await reports_app.get_reports_config("u1")).enabled is True
+
+    mock_send_on = create_autospec(
+        feedback_svc._send_report,
+        return_value=(reports.PlatformResult("accepted"), fb_row),
+    )
+    with patch.object(feedback_svc, "get_feedback_for_turn", mock_get_fb), \
+         patch.object(feedback_svc, "upsert_feedback", mock_upsert_fb), \
+         patch.object(feedback_svc, "_send_report", mock_send_on), \
+         patch.object(feedback_svc, "_withdraw_report", mock_withdraw):
+        row_on, report_status_on = await feedback_svc.submit(
+            thread_id="t-1",
+            turn_index=0,
+            user_id="u1",
+            rating="thumbs_down",
+            issue_categories=["inaccurate"],
+            comment="bad",
+            consent_human_review=False,
+            client=None,
+        )
+    assert row_on["report_id"] == str(report_id)
+    assert report_status_on == "accepted"
+    mock_send_on.assert_awaited_once()

@@ -107,7 +107,7 @@ def test_a_settled_prior_bar_is_kept_off_the_futures_venue():
 
 # DALTON-HOOK(yfinance-prev-close): when daily history is empty, validated_previous_close
 # returns None instead of falling back to unverified chartPreviousClose.
-def test_an_empty_daily_series_still_quotes_from_the_chart_close():
+def test_an_empty_daily_series_returns_none_for_previous_close():
     snap = _snapshot(
         "AAPL", "America/New_York", {},
         {"regularMarketPrice": 50.0, "chartPreviousClose": 49.0, "regularMarketTime": _at("2026-11-04 10:00", "America/New_York")},

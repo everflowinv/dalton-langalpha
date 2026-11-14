@@ -314,7 +314,22 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
   // ⌘↵ asks the place's agent, or where new work goes; a prefix says what is
   // being looked for, so it asks nothing. The Ask row is a view of
   // everything's (a place's included) last row.
-  const ask = lens?.via === 'prefix' ? null : askRow(place, text, v);
+  // DALTON-HOOK(colleague-dispatch): also hide Ask in thread scope when the thread itself is not writable
+  // (e.g. a colleague-owned thread inside a read-write colleague workspace).
+  const placeThread =
+    place?.kind === 'thread'
+      ? recent.threads.find((th) => th.thread_id === place.threadId)
+      : undefined;
+  const threadAskBlocked = Boolean(
+    place?.kind === 'thread' &&
+      placeThread &&
+      !resolveNavThreadPermissions(
+        { ...placeThread, title: placeThread.title ?? undefined },
+        workspaceById.get(place.workspaceId),
+        access,
+      ).canMutateThread,
+  );
+  const ask = lens?.via === 'prefix' || threadAskBlocked ? null : askRow(place, text, v);
   const pages = view === 'threads' ? threadPages : view === 'files' ? filePages : view === 'turns' || view === 'ticker' || view === 'thread' ? turnPages : null;
   const failure = shown.failure ?? null;
   // A kind the server ran out of time on is said once, above the rows; the others still show.
