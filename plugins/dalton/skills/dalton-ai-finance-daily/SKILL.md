@@ -110,7 +110,11 @@ ai_finance_report("finalize", batch_id)
 
 `finalize` 只带 action 和 `batch_id`。它在发送确认之后写入新闻 seen 和 GitHub 播报 seen。本轮不传 `last_ts`、`last_daily_gain`、`last_bucket`、`last_complete_through`。工具从已保存的展示记录写入这些字段：`last_ts` 为 unix 秒，`last_daily_gain` 为官方 `momentum.daily_gain`，`last_bucket` 为 `momentum.phase`，`last_complete_through` 为 `complete_through`。新闻键保留 7 天。GitHub 播报记录保留 30 天。`displayed` 为 false 的仓库不写入。采集维护的观察池另行保留。
 
-pending、unknown 以及尚未确认的发送都保留已保存正文。提交返回 `seen_pending` 时做一次 `finalize`。提交或 `finalize` 的返回已满足第 6 节时用成功行。其余结果停住，并写当次 `code`。
+pending、unknown 以及尚未确认的发送都保留已保存正文。提交返回 `seen_pending` 时做一次 `finalize`。提交或 `finalize` 的返回已满足第 6 节时用成功行。
+
+提交返回 `report_invalid` 时，正文没有保存。按返回的 `violations` 逐条改正文，只改被指出的地方，不重写其他部分；改完逐条核对 `violations` 指出的地方都已改正，再带 `markdown` 和 `news_events` 重新提交一次，校验由提交操作完成。同一批次只重交这一次，重交仍是 `report_invalid` 时停住，写当次 `code` 和 `violations`。
+
+除上述情况外，其余结果停住，并写当次 `code`。
 
 ## 6. 结束
 

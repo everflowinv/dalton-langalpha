@@ -118,7 +118,26 @@ def validate_markdown(path: Path, violations: list[str]) -> dict[str, int]:
         violations.append(f"GitHub total item count exceeds {REPORT_LIMIT}: {github_items + followup_items}")
     if "####" in github or re.search(r"(?m)^\s*[-*+]\s+(?:\*\*)?\[", github):
         violations.append("GitHub projects must share one numbered list; no follow-up or reserve lists")
-    if re.search(r"[%％]|(?:3|三)\s*日均速|(?:7|七)\s*日\s*(?:新增|增量|\+)|周增|增速|斜率|breakout_score|velocity|(?:动量|爆发)?评分", github, re.I):
+    # Bare metric words (评分, 增速, %, 7 日) are checked only in each item's stats region, from
+    # the end of the repo link to the "—" before the description, because a description may
+    # name a feature such as "Playwright 评分器". Section-wide checks keep internal field names
+    # and metric wording followed by a figure, which never reads like a description word.
+    # The stats region runs from the end of the bold repo link to the "—" that starts the
+    # description (or to the end of the line when the item has no description).
+    stats = " ".join(re.findall(r"(?m)^\d+\. \*\*\[[^\]]*\]\([^)]*\)\*\*([^\n—]*)", github_main))
+    if re.search(r"[%％]|(?:3|三)\s*日均速|(?:7|七)\s*日|周增|增速|斜率|评分|分值", stats) or re.search(
+        r"breakout_score|velocity|(?:动量|爆发)\s*评分|(?:3|三)\s*日均速|周增"
+        # Numeric metric forms stay banned section-wide: a number with a percent sign or a
+        # multi-day gain with a figure. They never read like a description word ("评分器").
+        r"|\d\s*[%％]"
+        # "N 日新增 +700" style gains, the figure right after the gain word. Calendar dates
+        # ("11 月 7 日新增支持 GPT-5") are removed first so they never read as a day count.
+        r"|(?:\d+|[一二三四五六七八九十多近])\s*日\s*(?:(?:新增|增量|增长|累计|增星|涨)\s*)+[:：]?\s*[+\-]?\d"
+        r"|(?:\d+|[一二三四五六七八九十多近])\s*日\s*[+＋]\s*\d"
+        r"|(?:周增|增速|斜率|评分|分值)\s*[:：]?\s*[+\-]?\d",
+        re.sub(r"\d{1,2}\s*月\s*\d{1,2}\s*日", "", github),
+        re.I,
+    ):
         violations.append("GitHub display must show total stars and completed-day gain only; hide percentages, multi-day gains and scores")
     if len(github) > 3000:
         violations.append(f"GitHub section exceeds 3000 characters: {len(github)}")
