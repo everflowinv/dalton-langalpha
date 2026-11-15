@@ -48,7 +48,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.messages.ai import OutputTokenDetails, UsageMetadata
+from langchain_core.messages.ai import InputTokenDetails, OutputTokenDetails, UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
 
@@ -832,6 +832,11 @@ class ChatAntigravity(BaseChatModel):
         # R6-13: include thoughts in output_tokens so input_tokens + output_tokens == total_tokens
         output_tokens = candidates_tokens + thoughts
         details = {"output_token_details": OutputTokenDetails(reasoning=thoughts)} if thoughts else {}
+        # promptTokenCount already includes the cached part; record it so usage and
+        # cost see the cache hit instead of billing every prompt token at full price.
+        cached = usage.get("cachedContentTokenCount") or 0
+        if cached:
+            details["input_token_details"] = InputTokenDetails(cache_read=cached)
         return UsageMetadata(
             input_tokens=input_tokens,
             output_tokens=output_tokens,

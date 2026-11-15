@@ -1031,6 +1031,10 @@ def load_crowding(workspace: Path) -> dict[str, Any]:
 
 def index_history_frame(payload: dict[str, Any]) -> pd.DataFrame:
     """供应商单个指数的长历史，收盘价与拥挤度同源同交易日。"""
+    # 2026-11-13: the vendor started nesting the series as {"data": {"data": [...]}}.
+    inner = payload.get("data")
+    if isinstance(inner, dict) and isinstance(inner.get("data"), list):
+        payload = {**payload, "data": inner["data"]}
     rows = payload.get("data") or []
     if not rows:
         return pd.DataFrame()
@@ -1057,9 +1061,42 @@ def index_history_fetch(code: str, timeout: int = HISTORY_TIMEOUT) -> dict[str, 
         payload = json.loads(response.read().decode("utf-8", "replace"))
     if payload.get("code") != 0:
         raise RuntimeError(payload.get("error") or f"vendor code={payload.get('code')}")
+    # 2026-11-13: the vendor started nesting the series as {"data": {"data": [...]}}.
+    inner = payload.get("data")
+    if isinstance(inner, dict) and isinstance(inner.get("data"), list):
+        payload = {**payload, "data": inner["data"]}
     if not (payload.get("data") or []):
         raise RuntimeError("vendor returned an empty series")
     return payload
+
+
+def _fill_known_crowding(payload: dict[str, Any], sources: list[Path]) -> dict[str, Any]:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return payload
+    known: dict[str, dict[str, Any]] = {}
+    for src in sources:
+        try:
+            old = json.loads(src.read_text(encoding="utf-8")).get("data") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(old, dict):
+            old = old.get("data") or []
+        for item in old:
+            if isinstance(item, dict) and item.get("value") is not None:
+                known.setdefault(str(item.get("tradeDt")), item)
+    merged, seen = [], set()
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        dt = str(item.get("tradeDt"))
+        seen.add(dt)
+        if item.get("value") is None and dt in known:
+            item = {**item, "value": known[dt].get("value"), "crowded": known[dt].get("crowded")}
+        merged.append(item)
+    merged += [item for dt, item in known.items() if dt not in seen]
+    merged.sort(key=lambda item: str(item.get("tradeDt")))
+    return {**payload, "data": merged}
 
 
 def load_index_history(codes: Iterable[str], workspace: Path, refresh: bool = True) -> dict[str, Any]:
@@ -1092,6 +1129,9 @@ def load_index_history(codes: Iterable[str], workspace: Path, refresh: bool = Tr
         stem = code.replace(".", "_")
         payload = fetched.get(code)
         if payload is not None:
+            # Since 2026-11 the vendor nulls the recent crowding values without a VIP account;
+            # keep values already known from our own cache or the index-crowding cache.
+            payload = _fill_known_crowding(payload, [cache_dir / f"{stem}.json", seed_dir / f"{stem}.json"])
             cache_dir.mkdir(parents=True, exist_ok=True)
             temp_path = cache_dir / f"{stem}.json.tmp"
             temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1458,7 +1498,8 @@ def china_stock_indicators(stock: pd.Series, benchmark: pd.Series, period: int =
 
     def blocks(values: pd.Series, compute) -> pd.Series:
         if values.empty:
-            return pd.Series(dtype=float)
+            # Keep a date index so callers can still slice by date when a benchmark is missing.
+            return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
         groups = values.index.to_series().diff().dt.days.fillna(0).gt(14).cumsum()
         return pd.concat([compute(part) for _, part in values.groupby(groups)]).dropna()
 

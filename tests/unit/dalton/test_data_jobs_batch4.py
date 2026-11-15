@@ -233,7 +233,7 @@ def test_batch4_manifest_matches_openclaw_schedule() -> None:
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
     assert set(BATCH4_EXPECTATIONS).issubset(by_code)
-    assert len(manifest.tasks) == 37
+    assert len(manifest.tasks) == 38
     for code, expected in BATCH4_EXPECTATIONS.items():
         entry = by_code[code]
         assert entry.job_key == expected["job_key"]

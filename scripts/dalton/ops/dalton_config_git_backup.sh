@@ -28,7 +28,7 @@ BACKUP_SCRIPTS_DIR="${DALTON_BACKUP_SCRIPTS_DIR:-${HOME}/Backups/dalton}"
 COLIMA_DIR="${DALTON_COLIMA_DIR:-${HOME}/.colima}"
 
 MAX_FILE_MB="${DALTON_CONFIG_MAX_FILE_MB:-20}"
-VAR_EXCLUDES="${DALTON_CONFIG_VAR_EXCLUDES:-openclaw-data/temp,openclaw-data/research-outputs,pr_baseline,tmp,.dalton-runs,backups,*.dump,*.sqlite,*.sqlite-wal,*.sqlite-shm}"
+VAR_EXCLUDES="${DALTON_CONFIG_VAR_EXCLUDES:-openclaw-data/temp,openclaw-data/research-outputs,pr_baseline,tmp,.dalton-runs,backups,*.dump,*.sqlite,*.sqlite-wal,*.sqlite-shm,venv,.venv,__pycache__,*.pyc,node_modules,.dalton-freeze,reextract,*.db,*.duckdb,.DS_Store,.dalton-outbox-*,openclaw-data/skills/*/data,openclaw-data/skills/*/output,openclaw-data/skills/*/temp,openclaw-data/skills/*/state,openclaw-data/skills/*/events,asr_jobs,smoke,trial-runs}"
 USER_EXCLUDES="${DALTON_CONFIG_USER_EXCLUDES:-*.log,*.pid,*.sock}"
 LAUNCHAGENTS_GLOBS="${DALTON_LAUNCHAGENTS_GLOBS:-com.dalton.*.plist}"
 BACKUP_SCRIPTS_GLOBS="${DALTON_BACKUP_SCRIPTS_GLOBS:-*.sh,*.py}"

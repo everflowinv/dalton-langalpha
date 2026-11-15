@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -945,6 +946,11 @@ elif cmd == "rcat":
     rel = remote_spec.split(":", 1)[1].lstrip("/")
     dst = drive_root / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
+    fail_match = os.environ.get("FAKE_RCLONE_FAIL_MATCH", "")
+    if fail_match and fail_match in rel:
+        dst.write_bytes(b"partial")
+        sys.stderr.write(f"simulated rcat failure for {{rel}}\\n")
+        sys.exit(1)
     payload = sys.stdin.buffer.read()
     with sizes_log.open("a") as fh:
         fh.write(json.dumps({{"rel": rel, "size_flag": rcat_size, "actual": len(payload)}}) + "\\n")
@@ -985,6 +991,10 @@ elif cmd == "moveto":
     shutil.move(str(src_p), str(dst_p))
 elif cmd == "deletefile":
     rel = clean[1].split(":", 1)[1].lstrip("/")
+    del_log = os.environ.get("FAKE_RCLONE_DELETE_LOG")
+    if del_log:
+        with pathlib.Path(del_log).open("a") as fh:
+            fh.write(rel + "\\n")
     target = drive_root / rel
     if target.is_file():
         target.unlink()
@@ -1546,6 +1556,7 @@ install_failure_trap
     assert "UNEXPECTED_FAILURE" in alerts_file.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs bsdtar: -s rewrite and ^ anchoring")
 def test_weekly_streaming_upload_partial_verify_docker_ps_fail_and_redis_stdin(
     tmp_path: Path,
 ) -> None:
@@ -1636,6 +1647,60 @@ sys.exit(1)
         rcat_sizes_log=rcat_sizes_log,
     )
 
+    prod_var = prod_dir / "var"
+    for rel_keep in (
+        ".dalton-freeze/snapshot.bin",
+        "openclaw-data/skills/x/data/dataset.json",
+        "openclaw-data/skills/x/state/state.json",
+        "openclaw-data/skills/x/output/report.md",
+        "openclaw-data/skills/x/events/events.jsonl",
+        "asr_jobs/job1/transcript.txt",
+        "reextract/item.json",
+        "nested/openclaw-data/temp/a",
+        "nested/openclaw-data/skills/x/temp/a",
+        "ai-finance/fake.sqlite",
+    ):
+        p = prod_var / rel_keep
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"keep:{rel_keep}\n", encoding="utf-8")
+    for rel_drop in (
+        "openclaw-data/skills/x/venv/lib/site.py",
+        ".venv/pyvenv.cfg",
+        "__pycache__/mod.cpython-313.pyc",
+        "loose.pyc",
+        "node_modules/pkg/index.js",
+        ".DS_Store",
+        "pr_baseline/report.json",
+        "tmp/scratch.txt",
+        "openclaw-data/temp/drop.txt",
+        "openclaw-data/skills/x/temp/drop.tmp",
+        "run-secrets/secret.txt",
+        "openclaw-data/skills/x/run-secrets/k.txt",
+        ".dalton-outbox-123/msg.json",
+    ):
+        p = prod_var / rel_drop
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"drop:{rel_drop}\n", encoding="utf-8")
+
+    # Live WAL-mode SQLite databases (including .db extension) with uncheckpointed writes.
+    sig_db = prod_var / "ai-finance" / "ai_signal_memory.sqlite"
+    sig_db.parent.mkdir(parents=True, exist_ok=True)
+    sig_conn = sqlite3.connect(sig_db)
+    sig_conn.execute("PRAGMA journal_mode=WAL")
+    sig_conn.execute("PRAGMA wal_autocheckpoint=0")
+    sig_conn.execute("CREATE TABLE signals(id INT, sym TEXT)")
+    sig_conn.execute("INSERT INTO signals VALUES (1, 'NVDA'), (2, 'MSFT')")
+    sig_conn.commit()
+
+    vec_db = prod_var / "openclaw-data" / "skills" / "market-digest" / "vectors.db"
+    vec_db.parent.mkdir(parents=True, exist_ok=True)
+    vec_conn = sqlite3.connect(vec_db)
+    vec_conn.execute("PRAGMA journal_mode=WAL")
+    vec_conn.execute("PRAGMA wal_autocheckpoint=0")
+    vec_conn.execute("CREATE TABLE vec(id INT, tag TEXT)")
+    vec_conn.execute("INSERT INTO vec VALUES (10, 'wal-live')")
+    vec_conn.commit()
+
     key_file = home_dir / ".config" / "dalton" / "backup.key"
     alerts_file = home_dir / "Library" / "Logs" / "alerts.log"
     log_file = home_dir / "Library" / "Logs" / "backup.log"
@@ -1648,7 +1713,7 @@ sys.exit(1)
         alerts_file=alerts_file,
         log_file=log_file,
         prod_checkout=prod_dir,
-        prod_var=prod_dir / "var",
+        prod_var=prod_var,
         user_config=home_dir / ".config" / "dalton",
         launchagents=home_dir / "Library" / "LaunchAgents",
         backup_scripts=tmp_path / "bs",
@@ -1693,16 +1758,21 @@ sys.exit(1)
     assert list(week_drive.glob("*.partial-*")) == []
 
     # Case 3: Happy path streams MinIO + Sandbox + Redis directly, Redis password only via stdin, 0 local archives.
-    res_ok = subprocess.run(
-        ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
-        env=sub_env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        res_ok = subprocess.run(
+            ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
+            env=sub_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        sig_conn.close()
+        vec_conn.close()
     assert res_ok.returncode == 0, res_ok.stderr
     assert not proxy_check_file.exists()
     assert not (ext_mount / "Dalton" / "backups" / "weekly" / today_str).exists()
+    assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
     assert list(week_drive.glob("*.partial-*")) == []
 
     assert (week_drive / f"minio-{today_str}.tar.gz.enc").is_file()
@@ -1710,6 +1780,8 @@ sys.exit(1)
     assert not (week_drive / f"sandbox-langalpha-sandbox-noworkspace-{today_str}.tar.gz.enc").exists()
     redis_enc = week_drive / f"redis-{today_str}.rdb.enc"
     assert redis_enc.is_file()
+    var_enc = week_drive / f"var-dalton-{today_str}.tar.gz.enc"
+    assert var_enc.is_file()
 
     # Verify Redis password passed via stdin and NEVER exposed in docker exec argv.
     exec_info = json.loads(redis_exec_record.read_text(encoding="utf-8"))
@@ -1733,6 +1805,92 @@ sys.exit(1)
         check=True,
     )
     assert dec.stdout == b"REDIS0011synthetic-rdb-payload"
+
+    # Decrypt streamed var-dalton tar.gz and verify included/excluded archive members and extracted SQLite integrity.
+    var_tar_gz = _openssl_decrypt(var_enc, key_file)
+    with tarfile.open(fileobj=io.BytesIO(var_tar_gz), mode="r:gz") as tf:
+        var_members = {m.name.removeprefix("./") for m in tf.getmembers() if m.isfile()}
+    assert {
+        ".dalton-freeze/snapshot.bin",
+        "openclaw-data/skills/x/data/dataset.json",
+        "openclaw-data/skills/x/state/state.json",
+        "openclaw-data/skills/x/output/report.md",
+        "openclaw-data/skills/x/events/events.jsonl",
+        "asr_jobs/job1/transcript.txt",
+        "reextract/item.json",
+        "nested/openclaw-data/temp/a",
+        "nested/openclaw-data/skills/x/temp/a",
+        "ai-finance/fake.sqlite",
+        "ai-finance/ai_signal_memory.sqlite",
+        "openclaw-data/skills/market-digest/vectors.db",
+    }.issubset(var_members)
+    for excluded_rel in (
+        "openclaw-data/skills/x/venv/lib/site.py",
+        ".venv/pyvenv.cfg",
+        "__pycache__/mod.cpython-313.pyc",
+        "loose.pyc",
+        "node_modules/pkg/index.js",
+        ".DS_Store",
+        "pr_baseline/report.json",
+        "tmp/scratch.txt",
+        "openclaw-data/temp/drop.txt",
+        "openclaw-data/skills/x/temp/drop.tmp",
+        "run-secrets/secret.txt",
+        "openclaw-data/skills/x/run-secrets/k.txt",
+        ".dalton-outbox-123/msg.json",
+        "ai-finance/ai_signal_memory.sqlite-wal",
+        "ai-finance/ai_signal_memory.sqlite-shm",
+        "ai-finance/ai_signal_memory.sqlite-journal",
+        "openclaw-data/skills/market-digest/vectors.db-wal",
+        "openclaw-data/skills/market-digest/vectors.db-shm",
+        "openclaw-data/skills/market-digest/vectors.db-journal",
+    ):
+        assert excluded_rel not in var_members
+
+    # Extract with real tar and verify restored SQLite databases at original paths pass integrity_check.
+    extract_dir = tmp_path / "var_extracted"
+    extract_dir.mkdir()
+    subprocess.run(
+        ["tar", "xzf", "-", "-C", str(extract_dir)],
+        input=var_tar_gz,
+        capture_output=True,
+        check=True,
+    )
+    restored_sig = sqlite3.connect(extract_dir / "ai-finance" / "ai_signal_memory.sqlite")
+    try:
+        assert restored_sig.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert restored_sig.execute("SELECT id, sym FROM signals ORDER BY id").fetchall() == [
+            (1, "NVDA"),
+            (2, "MSFT"),
+        ]
+    finally:
+        restored_sig.close()
+    restored_vec = sqlite3.connect(
+        extract_dir / "openclaw-data" / "skills" / "market-digest" / "vectors.db"
+    )
+    try:
+        assert restored_vec.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert restored_vec.execute("SELECT id, tag FROM vec").fetchall() == [(10, "wal-live")]
+    finally:
+        restored_vec.close()
+
+    # Case 4: Missing DALTON_PROD_VAR_DIR emits VAR_DALTON_BACKUP_FAILED alert.
+    missing_env_file = tmp_path / "offsite-backup-missing-var.env"
+    missing_env_file.write_text(
+        env_file.read_text(encoding="utf-8")
+        + f'\nDALTON_PROD_VAR_DIR="{tmp_path / "does-not-exist-var"}"\n',
+        encoding="utf-8",
+    )
+    missing_var_env = {**sub_env, "DALTON_OFFSITE_BACKUP_ENV_FILE": str(missing_env_file)}
+    res_missing_var = subprocess.run(
+        ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
+        env=missing_var_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_missing_var.returncode != 0
+    assert "VAR_DALTON_BACKUP_FAILED" in alerts_file.read_text(encoding="utf-8")
 
 
 
@@ -2119,3 +2277,642 @@ def test_existing_repo_root_files_do_not_block_commits(tmp_path):
     (repo / "README.md").write_text("API_KEY=sk-live-abcdef0123456789\n", encoding="utf-8")
     findings = backup_lib.scan_plaintext_tree(repo)
     assert [rel for rel, _ in findings] == ["README.md"]
+
+
+def test_var_dalton_pure_helpers_escaping_and_retry_logic(tmp_path: Path) -> None:
+    """Pure-Python tar-cmd escaping, exclude filtering, and pipe-status retry checks."""
+    # F1: SQLite paths containing glob metacharacters must be backslash-escaped in --exclude.
+    cmd = backup_lib.build_var_dalton_tar_cmd(
+        tmp_path / "src",
+        excludes="tmp",
+        sqlite_paths=[r"state/cache[1].db", r"weird\a*b?.sqlite"],
+        staging_dir=tmp_path / "staging",
+    )
+    assert r"^./state/cache\[1\].db" in cmd
+    assert r"^./state/cache\[1\].db-wal" in cmd
+    assert r"^./state/cache\[1\].db-shm" in cmd
+    assert r"^./state/cache\[1\].db-journal" in cmd
+    assert r"^./weird\\a\*b\?.sqlite" in cmd
+    assert r"^./weird\\a\*b\?.sqlite-wal" in cmd
+    cmd = backup_lib.build_var_dalton_tar_cmd(
+        tmp_path / "src",
+        excludes="tmp",
+        sqlite_paths=["state/cash$", "state/a^b"],
+        staging_dir=tmp_path / "staging",
+    )
+    assert r"^./state/cash\$" in cmd
+    assert r"^./state/cash\$-wal" in cmd
+    assert r"^./state/a\^b" in cmd
+
+    # F2: Retry only when tar (stage 0) failed and all downstream stages exited 0.
+    assert backup_lib.should_retry_tar_failure(1, "1 0 0 0") is True
+    # Only the full four-stage pipe status may trigger a retry.
+    assert backup_lib.should_retry_tar_failure(1, "1 0") is False
+    assert backup_lib.should_retry_tar_failure(1, "1 0 0") is False
+    assert backup_lib.should_retry_tar_failure(1, "1 0 0 0 0") is False
+    assert backup_lib.should_retry_tar_failure(1, "141 1 1 7") is False
+    assert backup_lib.should_retry_tar_failure(1, "0 0 0 1") is False
+    assert backup_lib.should_retry_tar_failure(2, "1 0 0 0") is False
+
+    for attempt, pipe_str, expected_rc in (
+        ("1", "1 0 0 0", 0),
+        ("1", "141 1 1 7", 1),
+        ("1", "0 0 0 1", 1),
+        ("2", "1 0 0 0", 1),
+    ):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(OPS_DIR / "backup_lib.py"),
+                "should-retry-tar",
+                "--attempt",
+                attempt,
+                "--pipe-status",
+                pipe_str,
+                "--max-retries",
+                "1",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        assert proc.returncode == expected_rc
+
+    summary = backup_lib.summarize_tar_stderr(
+        "tar: ./vanished.tmp: Cannot stat: No such file or directory\ntar: Error exit delayed\n"
+    )
+    assert "\n" not in summary
+    assert "./vanished.tmp: Cannot stat: No such file or directory" in summary
+    assert len(backup_lib.summarize_tar_stderr("x" * 500, max_chars=50)) == 50
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs bsdtar: -s rewrite and ^ anchoring")
+def test_var_dalton_excludes_and_tar_cmd(tmp_path: Path) -> None:
+    """var-dalton weekly excludes anchor slash rules to root while skipping nested non-slash names."""
+    import tarfile
+
+    var_dir = tmp_path / "var" / "dalton"
+    expected_excluded = {
+        "skills/x/venv/lib/python.py",
+        "venv/bin/activate",
+        ".venv/pyvenv.cfg",
+        "__pycache__/mod.cpython-313.pyc",
+        "skills/x/__pycache__/helper.cpython-313.pyc",
+        "root_compiled.pyc",
+        "node_modules/pkg/index.js",
+        ".DS_Store",
+        "skills/x/.DS_Store",
+        "pr_baseline/summary.json",
+        "tmp/scratch.txt",
+        "openclaw-data/temp/a",
+        "openclaw-data/skills/x/temp/scratch.tmp",
+        "run-secrets/token.json",
+        "openclaw-data/skills/x/run-secrets/api.key",
+        ".dalton-outbox-99/pending.json",
+    }
+    expected_included = {
+        "skills/x/data/metrics.json",
+        "openclaw-data/skills/x/data/table.parquet",
+        "openclaw-data/skills/x/state/cursor.json",
+        "openclaw-data/skills/x/output/report.md",
+        "openclaw-data/skills/x/events/stream.jsonl",
+        "openclaw-data/skills/x/temp-keep/a",
+        "nested/openclaw-data/temp/a",
+        "nested/openclaw-data/skills/x/temp/a",
+        ".dalton-freeze/2026-11-14.tar",
+        "asr_jobs/job-001/transcript.txt",
+        "reextract/doc-123.json",
+    }
+    for rel in expected_excluded | expected_included:
+        fpath = var_dir / rel
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(f"payload:{rel}\n", encoding="utf-8")
+
+    included, excluded = backup_lib.filter_var_dalton_paths(var_dir)
+    assert set(included) == expected_included
+    assert set(excluded) == expected_excluded
+
+    # Slash rules emit `^./` prefix to anchor at archive root; non-slash rules match at any depth.
+    exclude_args = backup_lib.build_tar_exclude_args()
+    expected_exclude_args = [
+        arg
+        for pat in backup_lib.DEFAULT_DATA_VAR_EXCLUDES
+        for arg in ("--exclude", f"^./{pat}" if "/" in pat else pat)
+    ]
+    assert exclude_args == expected_exclude_args
+    tar_cmd = backup_lib.build_var_dalton_tar_cmd(var_dir)
+    assert tar_cmd == ["tar", "czf", "-", *exclude_args, "-C", str(var_dir), "."]
+
+    # Exercise create_autospec runner double with constructed tar cmd.
+    captured_cmds: list[list[str]] = []
+
+    def _run_stub(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured_cmds.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"TAR", stderr=b"")
+
+    fake_run = create_autospec(subprocess.run, side_effect=_run_stub)
+    fake_run(tar_cmd, capture_output=True, check=True)
+    assert captured_cmds == [tar_cmd]
+
+    # Run real tar with constructed args to verify bsdtar archive matches pure filter
+    # (specifically keeping nested/openclaw-data/temp/a while excluding openclaw-data/temp/a).
+    tar_proc = subprocess.run(
+        tar_cmd,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
+        capture_output=True,
+        check=True,
+    )
+    with tarfile.open(fileobj=io.BytesIO(tar_proc.stdout), mode="r:gz") as tf:
+        archived_files = {
+            m.name.removeprefix("./") for m in tf.getmembers() if m.isfile()
+        }
+    assert archived_files == expected_included
+    assert "nested/openclaw-data/temp/a" in archived_files
+    assert "openclaw-data/temp/a" not in archived_files
+    assert archived_files.isdisjoint(expected_excluded)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs bsdtar: -s rewrite and ^ anchoring")
+def test_snapshot_sqlite_wal_header_detection_excludes_and_failure(
+    tmp_path: Path,
+) -> None:
+    src_dir = tmp_path / "var_dalton"
+    staging_dir = tmp_path / "sqlite-staging"
+    src_dir.mkdir()
+
+    # 1. WAL-mode DB (.sqlite) with committed uncheckpointed writes + uncommitted write.
+    wal_db = src_dir / "ai-finance" / "ai_signal_memory.sqlite"
+    wal_db.parent.mkdir(parents=True)
+    c_wal = sqlite3.connect(wal_db)
+    c_wal.execute("PRAGMA journal_mode=WAL")
+    c_wal.execute("PRAGMA wal_autocheckpoint=0")
+    c_wal.execute("CREATE TABLE items(id INT, val TEXT)")
+    c_wal.execute("INSERT INTO items VALUES (1, 'base')")
+    c_wal.commit()
+    c_wal.execute("INSERT INTO items VALUES (2, 'uncheckpointed-wal')")
+    c_wal.commit()
+    c_wal.execute("BEGIN IMMEDIATE")
+    c_wal.execute("INSERT INTO items VALUES (3, 'uncommitted')")
+
+    # 2. .db extension and extensionless SQLite files must be detected by 16-byte header.
+    db_ext = src_dir / "openclaw-data" / "skills" / "market-digest" / "vectors.db"
+    db_ext.parent.mkdir(parents=True)
+    c_vec = sqlite3.connect(db_ext)
+    c_vec.execute("CREATE TABLE v(k TEXT)")
+    c_vec.execute("INSERT INTO v VALUES ('ok-db')")
+    c_vec.commit()
+    c_vec.close()
+
+    noext_db = src_dir / "custom_store"
+    c_noext = sqlite3.connect(noext_db)
+    c_noext.execute("CREATE TABLE s(v INT)")
+    c_noext.execute("INSERT INTO s VALUES (42)")
+    c_noext.commit()
+    c_noext.close()
+
+    # 3. File named x.sqlite with non-SQLite contents must NOT be treated as SQLite.
+    fake_sqlite = src_dir / "x.sqlite"
+    fake_sqlite.write_text("not actually a sqlite database", encoding="utf-8")
+
+    # 4. SQLite databases inside excluded directories must NOT be processed.
+    for ex_rel in (
+        "openclaw-data/temp/skip.db",
+        "openclaw-data/skills/s1/temp/skip.sqlite",
+        "run-secrets/secret.db",
+        ".venv/env.sqlite",
+    ):
+        ex_path = src_dir / ex_rel
+        ex_path.parent.mkdir(parents=True, exist_ok=True)
+        c_ex = sqlite3.connect(ex_path)
+        c_ex.execute("CREATE TABLE skip(x INT)")
+        c_ex.commit()
+        c_ex.close()
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(OPS_DIR / "backup_lib.py"),
+                "snapshot-sqlite",
+                "--src-dir",
+                str(src_dir),
+                "--dest-dir",
+                str(staging_dir),
+                "--excludes",
+                ",".join(backup_lib.DEFAULT_DATA_VAR_EXCLUDES),
+            ],
+            capture_output=True,
+            check=True,
+        )
+    finally:
+        c_wal.rollback()
+        c_wal.close()
+
+    manifest_paths = [
+        item.decode("utf-8") for item in proc.stdout.split(b"\0") if item
+    ]
+    assert manifest_paths == [
+        "ai-finance/ai_signal_memory.sqlite",
+        "custom_store",
+        "openclaw-data/skills/market-digest/vectors.db",
+    ]
+    assert not (staging_dir / "x.sqlite").exists()
+    assert not (staging_dir / "openclaw-data" / "temp" / "skip.db").exists()
+    assert not (staging_dir / "openclaw-data" / "skills" / "s1" / "temp" / "skip.sqlite").exists()
+    assert not (staging_dir / "run-secrets" / "secret.db").exists()
+    assert not (staging_dir / ".venv" / "env.sqlite").exists()
+
+    snap_wal = sqlite3.connect(staging_dir / "ai-finance" / "ai_signal_memory.sqlite")
+    try:
+        assert snap_wal.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert snap_wal.execute("SELECT id, val FROM items ORDER BY id").fetchall() == [
+            (1, "base"),
+            (2, "uncheckpointed-wal"),
+        ]
+    finally:
+        snap_wal.close()
+
+    # Verify build_var_dalton_tar_cmd excludes live DBs + -wal/-shm/-journal and archives staging copies.
+    tar_cmd = backup_lib.build_var_dalton_tar_cmd(
+        src_dir,
+        sqlite_paths=manifest_paths,
+        staging_dir=staging_dir,
+    )
+    for rel in manifest_paths:
+        for sfx in ("", "-wal", "-shm", "-journal"):
+            assert f"^./{rel}{sfx}" in tar_cmd
+    tar_out = subprocess.run(
+        tar_cmd,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
+        capture_output=True,
+        check=True,
+    ).stdout
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    subprocess.run(
+        ["tar", "xzf", "-", "-C", str(extracted)],
+        input=tar_out,
+        capture_output=True,
+        check=True,
+    )
+    assert (extracted / "x.sqlite").read_text(encoding="utf-8") == "not actually a sqlite database"
+    chk = sqlite3.connect(extracted / "ai-finance" / "ai_signal_memory.sqlite")
+    try:
+        assert chk.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert chk.execute("SELECT id, val FROM items ORDER BY id").fetchall() == [
+            (1, "base"),
+            (2, "uncheckpointed-wal"),
+        ]
+    finally:
+        chk.close()
+
+    # Corrupt file with SQLite header must fail snapshot-sqlite with non-zero exit & stderr message.
+    corrupt_db = src_dir / "broken.sqlite"
+    corrupt_db.write_bytes(backup_lib.SQLITE_FILE_HEADER + b"\xff" * 200)
+    proc_fail = subprocess.run(
+        [
+            sys.executable,
+            str(OPS_DIR / "backup_lib.py"),
+            "snapshot-sqlite",
+            "--src-dir",
+            str(src_dir),
+            "--dest-dir",
+            str(tmp_path / "staging-fail"),
+            "--excludes",
+            ",".join(backup_lib.DEFAULT_DATA_VAR_EXCLUDES),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_fail.returncode != 0
+    assert "broken.sqlite" in proc_fail.stderr
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs bsdtar: -s rewrite and ^ anchoring")
+def test_var_dalton_tar_sqlite_glob_escaping_e2e(tmp_path: Path) -> None:
+    """Real bsdtar E2E: SQLite path with `[1]` excludes itself/WAL without excluding `cache1.db`."""
+    src_dir = tmp_path / "var_dalton"
+    staging_dir = tmp_path / "sqlite-staging"
+    state_dir = src_dir / "state"
+    state_dir.mkdir(parents=True)
+
+    glob_db = state_dir / "cache[1].db"
+    conn = sqlite3.connect(glob_db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE cache(k TEXT)")
+    conn.execute("INSERT INTO cache VALUES ('snap-cache-1')")
+    conn.commit()
+
+    plain_sibling = state_dir / "cache1.db"
+    plain_sibling.write_text("plain-cache1-unchanged", encoding="utf-8")
+
+    # A name ending in `$` must not become an end anchor that drops its plain sibling `cash`.
+    dconn = sqlite3.connect(state_dir / "cash$")
+    dconn.execute("CREATE TABLE t(k TEXT)")
+    dconn.execute("INSERT INTO t VALUES ('snap-cash')")
+    dconn.commit()
+    dconn.close()
+    (state_dir / "cash").write_text("plain-cash-unchanged", encoding="utf-8")
+
+    try:
+        sqlite_paths = backup_lib.snapshot_sqlite(
+            src_dir, staging_dir, excludes=backup_lib.DEFAULT_DATA_VAR_EXCLUDES
+        )
+    finally:
+        conn.close()
+
+    assert sqlite_paths == ["state/cache[1].db", "state/cash$"]
+    # Keep a stale -wal next to the source DB to confirm bsdtar excludes it while keeping cache1.db.
+    (state_dir / "cache[1].db-wal").write_bytes(b"stale-wal-bytes")
+
+    tar_cmd = backup_lib.build_var_dalton_tar_cmd(
+        src_dir,
+        excludes=backup_lib.DEFAULT_DATA_VAR_EXCLUDES,
+        sqlite_paths=sqlite_paths,
+        staging_dir=staging_dir,
+    )
+    tar_out = subprocess.run(
+        tar_cmd,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    subprocess.run(
+        ["tar", "xzf", "-", "-C", str(extracted)],
+        input=tar_out,
+        capture_output=True,
+        check=True,
+    )
+    assert not (extracted / "state" / "cache[1].db-wal").exists()
+    assert (extracted / "state" / "cache1.db").read_text(encoding="utf-8") == "plain-cache1-unchanged"
+    assert (extracted / "state" / "cash").read_text(encoding="utf-8") == "plain-cash-unchanged"
+    members = subprocess.run(
+        ["tar", "tzf", "-"], input=tar_out, capture_output=True, check=True
+    ).stdout.decode().splitlines()
+    assert members.count("./state/cash$") == 1
+    restored_dollar = sqlite3.connect(extracted / "state" / "cash$")
+    try:
+        assert restored_dollar.execute("SELECT k FROM t").fetchall() == [("snap-cash",)]
+    finally:
+        restored_dollar.close()
+    restored = sqlite3.connect(extracted / "state" / "cache[1].db")
+    try:
+        assert restored.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert restored.execute("SELECT k FROM cache").fetchall() == [("snap-cache-1",)]
+    finally:
+        restored.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs bsdtar: -s rewrite and ^ anchoring")
+def test_var_dalton_tar_retry_on_vanished_file(tmp_path: Path) -> None:
+    import tarfile
+
+    assert backup_lib.should_retry_tar_failure(1, "1 0 0 0") is True
+    assert backup_lib.should_retry_tar_failure(1, "141 1 1 7") is False
+    assert backup_lib.should_retry_tar_failure(1, "0 0 0 1") is False
+    assert backup_lib.should_retry_tar_failure(2, "1 0 0 0") is False
+    summary = backup_lib.summarize_tar_stderr(
+        "tar: ./vanished.tmp: Cannot stat: No such file or directory\ntar: Error exit delayed\n"
+    )
+    assert "\n" not in summary
+    assert "./vanished.tmp: Cannot stat: No such file or directory" in summary
+    assert len(backup_lib.summarize_tar_stderr("x" * 500, max_chars=50)) == 50
+
+    home_dir = tmp_path / "home"
+    fake_bin = tmp_path / "bin"
+    drive_store = tmp_path / "drive_store"
+    ext_mount = tmp_path / "ext_ssd"
+    prod_dir = tmp_path / "prod"
+    prod_var = prod_dir / "var"
+    for d in (home_dir, fake_bin, drive_store, ext_mount, prod_var):
+        d.mkdir(parents=True)
+
+    (prod_dir / ".env").write_text("REDIS_PASSWORD=pw\n", encoding="utf-8")
+    (prod_var / "keep.txt").write_text("hello-var\n", encoding="utf-8")
+
+    minio_tar = tmp_path / "minio.tar.gz"
+    minio_inner = tmp_path / "m.txt"
+    minio_inner.write_text("m", encoding="utf-8")
+    with tarfile.open(minio_tar, "w:gz") as tf:
+        tf.add(minio_inner, arcname="m.txt")
+
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"""#!/usr/bin/env python3
+import pathlib, sys
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd in ("info", "volume", "inspect", "ps"):
+    sys.exit(0)
+if cmd == "run":
+    sys.stdout.buffer.write(pathlib.Path({str(minio_tar)!r}).read_bytes())
+    sys.exit(0)
+if cmd == "exec":
+    sys.stdin.read()
+    sys.stdout.buffer.write(b"REDIS0011ok")
+    sys.exit(0)
+sys.exit(1)
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    about_file = tmp_path / "about.json"
+    about_file.write_text('{"free": 100000000}\n', encoding="utf-8")
+    proxy_check_file = tmp_path / "proxy_seen.txt"
+    rcat_sizes_log = tmp_path / "rcat_sizes.jsonl"
+    _write_fake_rclone(
+        fake_bin,
+        drive_store=drive_store,
+        about_file=about_file,
+        proxy_check_file=proxy_check_file,
+        rcat_sizes_log=rcat_sizes_log,
+    )
+
+    real_tar = shutil.which("tar") or "/usr/bin/tar"
+    tar_counter = tmp_path / "tar_count.txt"
+    fake_tar = fake_bin / "tar"
+    fake_tar.write_text(
+        f"""#!/usr/bin/env python3
+import os, pathlib, subprocess, sys
+cnt_path = pathlib.Path({str(tar_counter)!r})
+count = int(cnt_path.read_text()) if cnt_path.exists() else 0
+count += 1
+cnt_path.write_text(str(count))
+fail_times = int(os.environ.get("FAKE_TAR_FAIL_COUNT", "0"))
+if count <= fail_times:
+    sys.stdout.buffer.write(b"partial-tar-bytes")
+    sys.stdout.buffer.flush()
+    sys.stderr.write("tar: ./ephemeral.tmp: Cannot stat: No such file or directory\\n")
+    sys.exit(1)
+os.execv({real_tar!r}, ["tar", *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    fake_tar.chmod(0o755)
+
+    key_file = home_dir / ".config" / "dalton" / "backup.key"
+    alerts_file = home_dir / "Library" / "Logs" / "alerts.log"
+    log_file = home_dir / "Library" / "Logs" / "backup.log"
+    env_file = tmp_path / "offsite-backup.env"
+    _write_test_env(
+        env_file,
+        home_dir=home_dir,
+        repo_dir=tmp_path / "repo",
+        key_file=key_file,
+        alerts_file=alerts_file,
+        log_file=log_file,
+        prod_checkout=prod_dir,
+        prod_var=prod_var,
+        user_config=home_dir / ".config" / "dalton",
+        launchagents=home_dir / "Library" / "LaunchAgents",
+        backup_scripts=tmp_path / "bs",
+        colima=home_dir / ".colima",
+        ext_mount=ext_mount,
+    )
+    with env_file.open("a", encoding="utf-8") as fh:
+        fh.write(f'DALTON_PROD_ENV_FILE="{prod_dir / ".env"}"\n')
+
+    delete_log = tmp_path / "rclone_deletes.log"
+    mounted_py = _make_mounted_python_wrapper(tmp_path, ext_mount)
+    base_env = {
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": str(home_dir),
+        "DALTON_OFFSITE_BACKUP_ENV_FILE": str(env_file),
+        "DALTON_REPO_PYTHON": str(mounted_py),
+        "FAKE_RCLONE_DELETE_LOG": str(delete_log),
+    }
+
+    # Case 1: First tar fails, second succeeds -> zero alerts, .partial deleted once, retry reason logged.
+    res_retry_ok = subprocess.run(
+        ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
+        env={**base_env, "FAKE_TAR_FAIL_COUNT": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_retry_ok.returncode == 0, res_retry_ok.stderr
+    assert not alerts_file.exists()
+    deleted_objs = delete_log.read_text(encoding="utf-8").splitlines()
+    assert len(deleted_objs) == 1
+    assert "var-dalton-" in deleted_objs[0] and ".partial-" in deleted_objs[0]
+    today_str = dt.datetime.now().strftime("%Y-%m-%d")
+    week_drive = drive_store / "DaltonBackup" / "weekly" / today_str
+    assert list(week_drive.glob("*.partial-*")) == []
+    assert (week_drive / f"var-dalton-{today_str}.tar.gz.enc").is_file()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "retrying once: tar: ./ephemeral.tmp: Cannot stat: No such file or directory" in log_text
+    assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
+
+    # Case 2: Both attempts fail -> .partial deleted twice more, VAR_DALTON_BACKUP_FAILED alert emitted.
+    tar_counter.unlink(missing_ok=True)
+    delete_log.unlink(missing_ok=True)
+    res_retry_fail = subprocess.run(
+        ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
+        env={**base_env, "FAKE_TAR_FAIL_COUNT": "2"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_retry_fail.returncode != 0
+    assert "VAR_DALTON_BACKUP_FAILED" in alerts_file.read_text(encoding="utf-8")
+    assert len(delete_log.read_text(encoding="utf-8").splitlines()) == 2
+    assert list(week_drive.glob("*.partial-*")) == []
+    assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
+
+    # Case 3: Downstream rclone rcat failure on var-dalton must alert immediately WITHOUT retrying tar.
+    alerts_file.unlink(missing_ok=True)
+    tar_counter.unlink(missing_ok=True)
+    delete_log.unlink(missing_ok=True)
+    res_rcat_fail = subprocess.run(
+        ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
+        env={
+            **base_env,
+            "FAKE_TAR_FAIL_COUNT": "0",
+            "FAKE_RCLONE_FAIL_MATCH": "var-dalton-",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_rcat_fail.returncode != 0
+    assert int(tar_counter.read_text(encoding="utf-8")) == 1
+    assert "VAR_DALTON_BACKUP_FAILED" in alerts_file.read_text(encoding="utf-8")
+    assert len(delete_log.read_text(encoding="utf-8").splitlines()) == 1
+    assert list(week_drive.glob("*.partial-*")) == []
+    assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
+
+    # Case 4: SQLite snapshot failure emits VAR_DALTON_BACKUP_FAILED and cleans up staging.
+    alerts_file.unlink(missing_ok=True)
+    tar_counter.unlink(missing_ok=True)
+    (prod_var / "corrupt.sqlite").write_bytes(backup_lib.SQLITE_FILE_HEADER + b"\xff" * 200)
+    res_snap_fail = subprocess.run(
+        ["bash", str(OPS_DIR / "dalton_data_backup.sh")],
+        env={**base_env, "FAKE_TAR_FAIL_COUNT": "0"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_snap_fail.returncode != 0
+    assert "VAR_DALTON_BACKUP_FAILED" in alerts_file.read_text(encoding="utf-8")
+    assert "SQLite snapshot failed" in alerts_file.read_text(encoding="utf-8")
+    assert list((ext_mount / "Dalton" / "backups" / ".tmp").glob("*")) == []
+
+
+def test_config_and_data_var_excludes_match_env_example() -> None:
+    """Default exclude lists in shell scripts must match offsite-backup.env.example."""
+    import re
+
+    assert "openclaw-data/skills/*/temp" in backup_lib.DEFAULT_DATA_VAR_EXCLUDES
+    assert "run-secrets" in backup_lib.DEFAULT_DATA_VAR_EXCLUDES
+
+    cfg_sh = (OPS_DIR / "dalton_config_git_backup.sh").read_text(encoding="utf-8")
+    data_sh = (OPS_DIR / "dalton_data_backup.sh").read_text(encoding="utf-8")
+    env_ex = (OPS_DIR / "offsite-backup.env.example").read_text(encoding="utf-8")
+
+    m_cfg_sh = re.search(
+        r'^VAR_EXCLUDES="\$\{DALTON_CONFIG_VAR_EXCLUDES:-([^"]+)\}"',
+        cfg_sh,
+        re.MULTILINE,
+    )
+    m_cfg_ex = re.search(
+        r'^DALTON_CONFIG_VAR_EXCLUDES="([^"]+)"',
+        env_ex,
+        re.MULTILINE,
+    )
+    assert m_cfg_sh is not None
+    assert m_cfg_ex is not None
+    assert m_cfg_sh.group(1) == m_cfg_ex.group(1)
+    assert m_cfg_sh.group(1) == ",".join(backup_lib.DEFAULT_CONFIG_VAR_EXCLUDES)
+
+    m_data_sh = re.search(
+        r'^DATA_VAR_EXCLUDES="\$\{DALTON_DATA_VAR_EXCLUDES:-([^"]+)\}"',
+        data_sh,
+        re.MULTILINE,
+    )
+    m_data_ex = re.search(
+        r'^DALTON_DATA_VAR_EXCLUDES="([^"]+)"',
+        env_ex,
+        re.MULTILINE,
+    )
+    assert m_data_sh is not None
+    assert m_data_ex is not None
+    assert m_data_sh.group(1) == m_data_ex.group(1)
+    assert m_data_sh.group(1) == ",".join(backup_lib.DEFAULT_DATA_VAR_EXCLUDES)
+
+
+def test_ops_shell_scripts_bash_syntax() -> None:
+    """All shell scripts in scripts/dalton/ops pass `bash -n` syntax validation."""
+    scripts = sorted(OPS_DIR.glob("*.sh"))
+    assert scripts
+    for script in scripts:
+        proc = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"{script.name}: {proc.stderr}"
