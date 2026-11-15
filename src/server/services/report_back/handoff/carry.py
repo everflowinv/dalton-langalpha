@@ -84,13 +84,52 @@ async def carried_delivery(request, thread_id: str) -> dict | None:
     return automation_delivery.turn_configurable(run, earlier)
 
 
+async def _report_source_firing(request, thread_id: str) -> dict:
+    """Resolve an open automation firing for background report-back turns.
+
+    DALTON-HOOK(automation-continuation-identity): only a server-initiated
+    report-back turn (`query_type == "system"` with a `command_report` or
+    `task` report_source) whose background work was launched by a still-running
+    automation execution on `thread_id` inherits that firing's identity.
+    """
+    from collections.abc import Mapping
+    from src.server.database import automation_executions as exec_db
+
+    source = getattr(request, "report_source", None)
+    if source is None:
+        return {}
+    if isinstance(source, Mapping):
+        kind = source.get("kind")
+        command_id = source.get("command_id")
+        task_run_id = source.get("task_run_id")
+    else:
+        kind = getattr(source, "kind", None)
+        command_id = getattr(source, "command_id", None)
+        task_run_id = getattr(source, "task_run_id", None)
+
+    row = None
+    if kind == "command_report" and command_id:
+        row = await exec_db.get_open_execution_for_command(thread_id, str(command_id))
+    elif kind == "task" and task_run_id:
+        row = await exec_db.get_open_execution_for_task(thread_id, str(task_run_id))
+    if not row or not (row.get("automation_execution_id") and row.get("automation_id")):
+        return {}
+    return {
+        "automation_execution_id": str(row["automation_execution_id"]),
+        "automation_id": str(row["automation_id"]),
+    }
+
+
 async def carried_firing(request, thread_id: str) -> dict:
     """START metadata naming the automation firing of a turn a restart
     stopped, which settled nothing, for the turn that takes it over: its
     retry, or the server's own next turn, the resume or one that took the
     resume's place. The firing settles by this turn's ending instead, as by
     its own run's, and sends what ``carried_delivery`` stamps. A user's
-    message past the stop is a turn of their own."""
+    message past the stop is a turn of their own.
+
+    Also restores firing identity on report-back continuation turns triggered
+    by background commands or subagent tasks of a still-open execution."""
     from src.server.database.runs import lifecycle as tl_db
 
     retry_of = getattr(request, "retry_of_run_id", None)
@@ -100,9 +139,11 @@ async def carried_firing(request, thread_id: str) -> dict:
         prev = await tl_db.get_latest_attempt(thread_id)
     else:
         return {}
-    if not is_restart_interrupted(prev):
-        return {}
-    meta = prev.get("metadata") or {}
-    if not (meta.get("automation_execution_id") and meta.get("automation_id")):
-        return {}
-    return {key: meta[key] for key in ("automation_execution_id", "automation_id")}
+    if is_restart_interrupted(prev):
+        meta = prev.get("metadata") or {}
+        if meta.get("automation_execution_id") and meta.get("automation_id"):
+            return {key: meta[key] for key in ("automation_execution_id", "automation_id")}
+    # DALTON-HOOK(automation-continuation-identity): inherit identity for background report-back continuations
+    if not retry_of and getattr(request, "query_type", None) == "system":
+        return await _report_source_firing(request, thread_id)
+    return {}

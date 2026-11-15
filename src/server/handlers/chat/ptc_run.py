@@ -650,6 +650,20 @@ async def astream_ptc_workflow(
                             firing["automation_id"]
                         )
                     extra_configurable = updated_configurable
+                # DALTON-HOOK(automation-continuation-identity): take over firing inside START txn after FOR UPDATE lock on execution
+                async def _on_start(conn) -> None:
+                    if turn_attachments:
+                        await _admit_attachments(
+                            turn_attachments,
+                            conn,
+                            run_id=run_id,
+                            history=attachment_history,
+                        )
+                    if firing:
+                        await automation_settlement.take_over_firing(
+                            firing["automation_execution_id"], run_id, conn=conn
+                        )
+
                 run_handle = await begin_run(
                     request,
                     scope=scope,
@@ -677,16 +691,7 @@ async def astream_ptc_workflow(
                         **firing,
                         **(run_metadata or {}),
                     },
-                    in_start=(
-                        partial(
-                            _admit_attachments,
-                            turn_attachments,
-                            run_id=run_id,
-                            history=attachment_history,
-                        )
-                        if turn_attachments
-                        else None
-                    ),
+                    in_start=_on_start if (turn_attachments or firing) else None,
                 )
                 # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
                 if getattr(run_handle, "tail_turn_no_new_work", False):
@@ -695,10 +700,6 @@ async def astream_ptc_workflow(
                         run_metadata["tail_turn_no_new_work"] = True
                 upload_claims.mark_admitted()
                 await comments.admitted()
-                if firing:
-                    await automation_settlement.take_over_firing(
-                        firing["automation_execution_id"], run_id
-                    )
         if not is_checkpoint_replay:
             logger.debug(
                 f"[PTC_CHAT] Run started: workspace_id={workspace_id} "

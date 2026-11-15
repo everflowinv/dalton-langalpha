@@ -23,7 +23,7 @@ says it instead, so a run the service holds still ends there.
 import asyncio
 import functools
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping  # DALTON-HOOK(automation-continuation-identity)
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -57,6 +57,8 @@ logger = logging.getLogger(__name__)
 
 INTERRUPTED_ERROR = "The server restarted during the run"
 STOPPED_ERROR = "Stopped by the user"
+# DALTON-HOOK(automation-continuation-identity): hard timeout error message
+TIMEOUT_ERROR = "Automation execution timed out"
 
 _ERROR_MAX_CHARS = 500
 
@@ -103,6 +105,7 @@ class Outcome(StrEnum):
     STOPPED = "stopped"
     SKIPPED = "skipped"
     PRECHECK_SKIPPED = "precheck_skipped"  # DALTON-HOOK(precheck-outcome)
+    TIMEOUT = "timeout"  # DALTON-HOOK(automation-continuation-identity)
 
 
 @dataclass(frozen=True)
@@ -219,6 +222,17 @@ _POLICIES: Dict[Outcome, _Policy] = {
         metric="precheck_skipped",
         schedule="close",
     ),
+    # DALTON-HOOK(automation-continuation-identity): hard timeout cap settles as failed-equivalent
+    Outcome.TIMEOUT: _Policy(
+        status="timeout",
+        from_statuses=("pending", "waiting", "running"),
+        metric="timeout",
+        strike="count",
+        schedule="rearm_price",
+        webhook="automation.failed",
+        finish="failed",
+        error=TIMEOUT_ERROR,
+    ),
 }
 
 
@@ -280,16 +294,39 @@ def ledger_outcome(run: Optional[Dict[str, Any]]) -> Optional[Outcome]:
     return Outcome.FAILED
 
 
-async def take_over_firing(execution_id: str, run_id: str) -> None:
-    """Point the firing of a turn a restart stopped at the turn that took it
-    over (``carry.carried_firing``), so the live run opens from the firing
-    and a sweep settles it by this run, not the stopped one."""
-    await exec_db.transition_execution(
-        execution_id,
-        from_statuses=("running",),
-        to="running",
-        conversation_response_id=run_id,
-    )
+# --- DALTON-HOOK(automation-continuation-identity): single-source timeout check and guarded takeover ---
+execution_timeout_seconds = exec_db.execution_timeout_seconds
+
+
+def is_execution_timed_out(
+    exec_row: Mapping[str, Any],
+    automation: Optional[Mapping[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True once elapsed time since execution start reaches its timeout cap."""
+    anchor = exec_row.get("started_at") or exec_row.get("created_at")
+    if not isinstance(anchor, datetime):
+        return False
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    ref_now = now or datetime.now(timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+    return (ref_now - anchor).total_seconds() >= execution_timeout_seconds(automation)
+
+
+async def take_over_firing(
+    execution_id: str, run_id: str, *, conn: Any = None
+) -> None:
+    """Point a running firing at the continuation/resumed turn ``run_id`` atomically."""
+    taken = await exec_db.take_over_execution_run(execution_id, run_id, conn=conn)
+    if not taken:
+        logger.warning(
+            f"[AUTOMATION_SETTLE] Failed to take over firing: "
+            f"execution_id={execution_id} run_id={run_id}"
+        )
+# --- DALTON-HOOK(automation-continuation-identity): end ---
 
 
 async def settle_unresumed(run_id: str) -> None:
@@ -419,6 +456,8 @@ async def settle(
     quiet_for: Optional[int] = None,
     delivery: Optional[automation_delivery.Delivery] = None,
     final_text: Optional[str] = None,
+    expected_run_id: Any = exec_db.UNSET_RUN_ID,
+    check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
 ) -> bool:
     """End a firing as ``outcome``; False when it was no longer in a state
     that outcome can end, because someone else settled it first.
@@ -448,6 +487,12 @@ async def settle(
             settled, final_text,
         )
 
+    extra_settle_kwargs: Dict[str, Any] = {}
+    if expected_run_id is not exec_db.UNSET_RUN_ID:
+        extra_settle_kwargs["expected_run_id"] = expected_run_id
+    if check_run_state_in_lock is not None:
+        extra_settle_kwargs["check_run_state_in_lock"] = check_run_state_in_lock
+
     row = await exec_db.settle_execution(
         execution_id,
         automation_id=str(automation["automation_id"]),
@@ -464,6 +509,7 @@ async def settle(
         skip_reason=skip_reason or policy.skip_reason,
         failure_reason=policy.failure_reason,
         completed_at=datetime.now(timezone.utc),
+        **extra_settle_kwargs,
     )
     if row is None:
         logger.info(
@@ -870,6 +916,9 @@ async def settle_by_run(
     workspace_id: Optional[str],
     quiet_for: Optional[int] = None,
     retry_read: bool = False,
+    # DALTON-HOOK(automation-continuation-identity): propagate lock/CAS settlement guards
+    expected_run_id: Any = exec_db.UNSET_RUN_ID,
+    check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
 ) -> Optional[Outcome]:
     """Settle a firing as ``run``, its turn's ledger row, ended; the outcome,
     or None while the run is still going or once someone else settled it.
@@ -927,26 +976,168 @@ async def settle_by_run(
         # A run that sent its result last wrote something else, such as
         # where it sent it: the chats it didn't reach get that result.
         final_text = answer.sent or answer.text
+    settle_kwargs: Dict[str, Any] = {}
+    if expected_run_id is not exec_db.UNSET_RUN_ID:
+        settle_kwargs["expected_run_id"] = expected_run_id
+    if check_run_state_in_lock is not None:
+        settle_kwargs["check_run_state_in_lock"] = check_run_state_in_lock
     settled = await settle(
         automation, execution_id, outcome,
         thread_id=thread_id, run_id=run_id, workspace_id=workspace_id,
         error=error, excerpt=excerpt, quiet_for=quiet_for,
         delivery=delivery, final_text=final_text,
+        **settle_kwargs,
     )
     return outcome if settled else None
+
+
+# --- DALTON-HOOK(automation-continuation-identity): unified background hold, timeout, and race-safe settlement ---
+async def _settle_timeout_for_run(
+    automation: Dict[str, Any],
+    execution_id: str,
+    run_id: Optional[str],
+    *,
+    thread_id: Optional[str],
+    workspace_id: Optional[str],
+    run: Optional[Dict[str, Any]] = None,
+    quiet_for: Optional[int] = None,
+    expected_run_id: Any = exec_db.UNSET_RUN_ID,
+) -> bool:
+    """Settle a stalled execution with no live turn that exceeded its timeout cap."""
+    if run is None and run_id:
+        run = await exec_db.get_settling_run(run_id)
+    delivery = automation_delivery.delivery_of_run(run, execution_id) if run else None
+    settle_kwargs: Dict[str, Any] = {"check_run_state_in_lock": "timeout"}
+    if expected_run_id is not exec_db.UNSET_RUN_ID:
+        settle_kwargs["expected_run_id"] = expected_run_id
+    return await settle(
+        automation,
+        execution_id,
+        Outcome.TIMEOUT,
+        thread_id=thread_id,
+        run_id=run_id,
+        workspace_id=workspace_id,
+        error=TIMEOUT_ERROR,
+        quiet_for=quiet_for,
+        delivery=delivery,
+        **settle_kwargs,
+    )
+
+
+async def _resolve_execution_settlement(
+    automation: Dict[str, Any],
+    execution_id: str,
+    exec_row: Optional[Mapping[str, Any]],
+    run_id: Optional[str],
+    run: Optional[Dict[str, Any]],
+    *,
+    thread_id: Optional[str],
+    workspace_id: Optional[str],
+    quiet_for: Optional[int] = None,
+    retry_read: bool = False,
+    excluding_run_id: Optional[str] = None,
+    expected_run_id: Any = exec_db.UNSET_RUN_ID,
+) -> Optional[Outcome]:
+    """Shared decision order for finished turns, idle callbacks, and sweep:
+
+    1. A live (``in_progress`` or restart-resumable) linked run never settles or times out.
+    2. A terminal run already ``completed`` with no open background work settles as COMPLETED,
+       even if elapsed time crossed the timeout cap while settlement waited.
+    3. A completed run with open background work stays open until work finishes or,
+       with no live turn running, crosses the hard timeout cap.
+    4. Any other terminal run settles with its own outcome.
+    """
+    timed_out = (
+        exec_row is not None
+        and exec_row.get("status") == "running"
+        and is_execution_timed_out(exec_row, automation)
+    )
+    if run is not None:
+        outcome = ledger_outcome(run)
+        if outcome is None:
+            return None
+        if outcome is Outcome.COMPLETED:
+            pending = bool(
+                thread_id
+                and await exec_db.has_pending_background_work(
+                    execution_id,
+                    thread_id=thread_id,
+                    excluding_run_id=excluding_run_id,
+                )
+            )
+            if pending:
+                if timed_out:
+                    settled = await _settle_timeout_for_run(
+                        automation,
+                        execution_id,
+                        run_id,
+                        thread_id=thread_id,
+                        workspace_id=workspace_id,
+                        run=run,
+                        quiet_for=None,
+                        expected_run_id=expected_run_id,
+                    )
+                    return Outcome.TIMEOUT if settled else None
+                logger.info(
+                    f"[AUTOMATION_SETTLE] Keeping execution open while background work "
+                    f"is running: execution_id={execution_id} run_id={run_id}"
+                )
+                return None
+            return await settle_by_run(
+                automation,
+                execution_id,
+                run_id,
+                run,
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+                quiet_for=None if timed_out else quiet_for,
+                retry_read=retry_read,
+                expected_run_id=expected_run_id,
+                check_run_state_in_lock="completed_idle",
+            )
+        return await settle_by_run(
+            automation,
+            execution_id,
+            run_id,
+            run,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            quiet_for=None if timed_out else quiet_for,
+            retry_read=retry_read,
+            expected_run_id=expected_run_id,
+            check_run_state_in_lock="terminal",
+        )
+    if timed_out:
+        settled = await _settle_timeout_for_run(
+            automation,
+            execution_id,
+            run_id,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            run=None,
+            quiet_for=None,
+            expected_run_id=expected_run_id,
+        )
+        return Outcome.TIMEOUT if settled else None
+    return await settle_by_run(
+        automation,
+        execution_id,
+        run_id,
+        None,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        quiet_for=quiet_for,
+        retry_read=retry_read,
+        expected_run_id=expected_run_id,
+    )
 
 
 async def settle_abandoned(
     automation: Dict[str, Any], row: Dict[str, Any], quiet_for: int
 ) -> Optional[Outcome]:
     """Settle a firing whose process stopped holding it; the outcome, or
-    None when it was left alone or someone else settled it.
-
-    A wait is skipped. Anything else settles by its run, and a firing that
-    never had one linked was interrupted. A run still going is left to a
-    later pass, since its worker may be draining it and the ledger's own
-    recovery ends a run whose worker died.
-    """
+    None when it was left alone or someone else settled it."""
+    # DALTON-HOOK(automation-continuation-identity): sweep routes through _resolve_execution_settlement
     execution_id = str(row["automation_execution_id"])
     thread_id = (
         str(row["conversation_thread_id"]) if row["conversation_thread_id"] else None
@@ -962,26 +1153,26 @@ async def settle_abandoned(
             automation, execution_id, Outcome.SKIPPED,
             thread_id=thread_id, run_id=run_id, workspace_id=workspace_id,
             skip_reason="interrupted", quiet_for=quiet_for,
+            expected_run_id=run_id,
         )
         return Outcome.SKIPPED if settled else None
-    return await settle_by_run(
-        automation, execution_id, run_id,
-        await exec_db.get_settling_run(run_id) if run_id else None,
-        thread_id=thread_id, workspace_id=workspace_id, quiet_for=quiet_for,
+    run = await exec_db.get_settling_run(run_id) if run_id else None
+    return await _resolve_execution_settlement(
+        automation,
+        execution_id,
+        row,
+        run_id,
+        run,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
+        quiet_for=quiet_for,
+        expected_run_id=run_id,
     )
 
 
 async def _settle_finished_run(job: Dict[str, Any]) -> None:
     """The ``automation_settle`` outbox job: settle the firing whose turn
-    the finalized run was, as the run ended.
-
-    Exactly once however often it runs: ``settle`` ends the execution row
-    under its lock only from an unsettled status, so a retry, a reclaimed
-    lease or the sweep getting there first finds it settled and sends
-    nothing. A failure raises, for the drainer to retry, and so does a held
-    run's failed answer read until the job's last attempt, which settles
-    without the answer rather than leave the firing running.
-    """
+    the finalized run was, as the run ended."""
     from src.server.services.hook_outbox import MAX_ATTEMPTS
 
     payload = job.get("payload") or {}
@@ -992,14 +1183,79 @@ async def _settle_finished_run(job: Dict[str, Any]) -> None:
     )
     if automation is None:
         return
+    execution_id = str(payload["execution_id"])
     run_id = str(job["run_id"])
-    await settle_by_run(
-        automation, payload["execution_id"], run_id,
-        await exec_db.get_settling_run(run_id),
-        thread_id=str(job["conversation_thread_id"]),
-        workspace_id=payload.get("workspace_id"),
+    thread_id = str(job["conversation_thread_id"])
+    workspace_id = payload.get("workspace_id")
+    exec_row = await exec_db.get_execution_for_settlement(execution_id)
+    expected_run_id: Any = exec_db.UNSET_RUN_ID
+    if exec_row is not None:
+        if exec_row.get("status") not in ("pending", "waiting", "running"):
+            return
+        linked_run_id = exec_row.get("conversation_response_id")
+        if linked_run_id and str(linked_run_id) != run_id:
+            logger.debug(
+                f"[AUTOMATION_SETTLE] Skipping stale finalize for superseded run: "
+                f"execution_id={execution_id} job_run_id={run_id} "
+                f"linked_run_id={linked_run_id}"
+            )
+            return
+        expected_run_id = str(linked_run_id) if linked_run_id else None
+    run = await exec_db.get_settling_run(run_id)
+    await _resolve_execution_settlement(
+        automation,
+        execution_id,
+        exec_row,
+        run_id,
+        run,
+        thread_id=thread_id,
+        workspace_id=workspace_id,
         retry_read=job["attempts"] < MAX_ATTEMPTS,
+        # DALTON-HOOK(automation-continuation-identity): pass run CAS + exclude finished run from pending check
+        excluding_run_id=run_id,
+        expected_run_id=expected_run_id,
     )
+
+
+async def settle_thread_execution_if_idle(thread_id: str) -> Optional[Outcome]:
+    """Settle each running execution on ``thread_id`` whose linked turn reached a
+    terminal state and has no remaining background work or live turns.
+
+    Called when a background command or report-back closes without opening a
+    continuation turn; checks every running execution on the thread (for shared
+    threads or ``thread_strategy: continue``).
+    """
+    last_settled: Optional[Outcome] = None
+    for exec_row in await exec_db.get_running_executions_for_thread(thread_id):
+        execution_id = str(exec_row["automation_execution_id"])
+        automation = await auto_db.get_automation_including_deleted(
+            str(exec_row["automation_id"]), exec_row.get("user_id")
+        )
+        if automation is None:
+            continue
+        run_id = (
+            str(exec_row["conversation_response_id"])
+            if exec_row.get("conversation_response_id")
+            else None
+        )
+        if not run_id and not is_execution_timed_out(exec_row, automation):
+            continue
+        workspace_id = exec_row.get("workspace_id") or automation.get("workspace_id")
+        run = await exec_db.get_settling_run(run_id) if run_id else None
+        settled = await _resolve_execution_settlement(
+            automation,
+            execution_id,
+            exec_row,
+            run_id,
+            run,
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            expected_run_id=run_id,
+        )
+        if settled is not None:
+            last_settled = settled
+    return last_settled
+# --- DALTON-HOOK(automation-continuation-identity): end ---
 
 
 def register_outbox_executors() -> None:

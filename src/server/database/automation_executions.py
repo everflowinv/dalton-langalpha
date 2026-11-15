@@ -1,8 +1,11 @@
 """Execution history queries for automations: transitions, settlement, delivery and the run feed."""
 
 import logging
+import math
+import re
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from psycopg.rows import dict_row
@@ -15,12 +18,145 @@ from src.server.database.automation import (
     UNSETTLED_STATUSES,
     not_a_server_skip,
 )
-from src.server.contracts.status import RESTART_INTERRUPTED_META, RESTART_RESUME_TTL
+from src.server.contracts.status import (
+    RESTART_INTERRUPTED_META,
+    RESTART_RESUME_TTL,
+    is_restart_interrupted,
+    restart_resume_expired,
+)
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 from src.server.utils.db import UpdateQueryBuilder
 
 logger = logging.getLogger(__name__)
+
+# DALTON-HOOK(automation-continuation-identity): single-source execution timeout cap & pending background work SQL
+EXECUTION_TIMEOUT_MIN_SECONDS = 3 * 3600
+_TIMEOUT_JSONB_FIELDS = ("metadata", "trigger_config")
+_POSITIVE_INT_STR_RE = re.compile(r"^[0-9]+(?:\.0+)?$")
+UNSET_RUN_ID = object()
+
+
+def _parse_positive_int_seconds(raw: Any) -> Optional[float]:
+    """Accept positive int or string/float losslessly convertible to one; reject junk."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return float(raw) if raw > 0 else None
+    if isinstance(raw, float):
+        if math.isfinite(raw) and raw > 0 and raw.is_integer():
+            return float(int(raw))
+        return None
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not _POSITIVE_INT_STR_RE.fullmatch(stripped):
+            return None
+        val = int(stripped.split(".", 1)[0])
+        return float(val) if val > 0 else None
+    return None
+
+
+def default_execution_timeout_seconds() -> float:
+    """Default execution timeout cap: max(3 hours, platform workflow_timeout)."""
+    from src.config.settings import get_workflow_timeout
+
+    try:
+        workflow_timeout = float(get_workflow_timeout())
+    except Exception:
+        workflow_timeout = 0.0
+    if not math.isfinite(workflow_timeout) or workflow_timeout < 0:
+        workflow_timeout = 0.0
+    return float(max(EXECUTION_TIMEOUT_MIN_SECONDS, workflow_timeout))
+
+
+def execution_timeout_seconds(automation: Optional[Mapping[str, Any]]) -> float:
+    """Single timeout parser used by both Python checks and SQL parameter assembly."""
+    if isinstance(automation, Mapping):
+        for field in _TIMEOUT_JSONB_FIELDS:
+            container = automation.get(field)
+            raw = container.get("timeout_seconds") if isinstance(container, Mapping) else None
+            parsed = _parse_positive_int_seconds(raw)
+            if parsed is not None:
+                return parsed
+    return default_execution_timeout_seconds()
+
+
+def _bool_row(row: Any) -> bool:
+    if isinstance(row, Mapping):
+        return bool(next(iter(row.values()), False))
+    return bool(row and row[0])
+
+
+def _pending_background_work_sql(
+    *,
+    execution_id_sql: str,
+    thread_id_sql: str,
+    linked_run_id_sql: str,
+    exclude_run_id_sql: str = "NULL::uuid",
+) -> str:
+    """SQL predicate for open background work or continuation turns of an execution."""
+    def _belongs_to_exec(run_col: str) -> str:
+        return (
+            f"(({linked_run_id_sql} IS NOT NULL AND {run_col} = {linked_run_id_sql})"
+            f" OR EXISTS (SELECT 1 FROM conversation_responses pr"
+            f" WHERE pr.conversation_response_id = {run_col}"
+            f" AND pr.metadata->>'automation_execution_id' = ({execution_id_sql})::text))"
+        )
+
+    excluded_dispatch = (
+        f"({exclude_run_id_sql} IS NULL"
+        f" OR COALESCE(o.payload->>'dispatched_run_id', '') <> ({exclude_run_id_sql})::text)"
+    )
+    return f"""(
+        EXISTS (
+            SELECT 1 FROM subagent_runs sr
+            WHERE sr.thread_id = {thread_id_sql}
+              AND sr.status = 'in_progress'
+              AND {_belongs_to_exec("sr.parent_run_id")}
+        )
+        OR EXISTS (
+            SELECT 1 FROM command_runs cr
+            WHERE cr.conversation_thread_id = {thread_id_sql}
+              AND cr.status = 'running'
+              AND {_belongs_to_exec("cr.run_id")}
+        )
+        OR EXISTS (
+            SELECT 1 FROM conversation_responses r_live
+            WHERE r_live.conversation_thread_id = {thread_id_sql}
+              AND r_live.status = 'in_progress'
+              AND r_live.metadata->>'automation_execution_id' = ({execution_id_sql})::text
+              AND ({exclude_run_id_sql} IS NULL
+                   OR r_live.conversation_response_id <> {exclude_run_id_sql})
+        )
+        OR EXISTS (
+            SELECT 1 FROM hook_outbox o
+            LEFT JOIN subagent_runs sr
+              ON sr.task_run_id::text = o.payload->>'task_run_id'
+            JOIN conversation_responses pr
+              ON pr.conversation_response_id = COALESCE(o.run_id, sr.parent_run_id)
+            WHERE o.ordering_key = ({thread_id_sql})::text
+              AND o.hook_type = 'task_report_back'
+              AND o.status IN ('pending', 'claimed')
+              AND (sr.task_run_id IS NULL OR sr.result_delivered_at IS NULL)
+              AND pr.metadata->>'automation_execution_id' = ({execution_id_sql})::text
+              AND {excluded_dispatch}
+        )
+        OR EXISTS (
+            SELECT 1 FROM hook_outbox o
+            JOIN command_runs cr
+              ON cr.command_id = o.payload->>'command_id'
+            JOIN conversation_responses pr
+              ON pr.conversation_response_id = cr.run_id
+            WHERE o.ordering_key = ({thread_id_sql})::text
+              AND o.hook_type = 'command_report_back'
+              AND o.status IN ('pending', 'claimed')
+              AND cr.result_delivered_at IS NULL
+              AND (cr.status IN ('completed', 'failed')
+                   OR (cr.status = 'stopped' AND cr.stopped_by = 'user'))
+              AND pr.metadata->>'automation_execution_id' = ({execution_id_sql})::text
+              AND {excluded_dispatch}
+        )
+    )"""
 
 
 async def _count_strike(cur, automation_id: str, *, fuse: bool = False) -> int:
@@ -192,6 +328,55 @@ _SCHEDULE_SQL = {
 ScheduleAction = Literal["close_once", "defer_once_1d", "close_price", "rearm_price"]
 
 
+# DALTON-HOOK(automation-continuation-identity): in-lock liveness predicate and shared pending-work check
+def _is_run_live(run_row: Optional[Mapping[str, Any]]) -> bool:
+    """True when ``run_row`` is still ``in_progress`` or awaiting restart resume."""
+    if run_row is None:
+        return False
+    status = run_row.get("status")
+    if status == "in_progress":
+        return True
+    return bool(
+        status == "cancelled"
+        and is_restart_interrupted(run_row)
+        and not restart_resume_expired(run_row.get("cancel_requested_at"))
+    )
+
+
+async def _has_pending_background_work_on_cur(
+    cur: Any,
+    execution_id: str,
+    *,
+    thread_id: Optional[str],
+    excluding_run_id: Optional[str] = None,
+) -> bool:
+    if not thread_id:
+        return False
+    pred = _pending_background_work_sql(
+        execution_id_sql="e.automation_execution_id",
+        thread_id_sql="%(thread_id)s::uuid",
+        linked_run_id_sql="e.conversation_response_id",
+        exclude_run_id_sql="%(exclude_run_id)s::uuid",
+    )
+    await cur.execute(
+        f"""
+        SELECT EXISTS (
+            SELECT 1 FROM automation_executions e
+            WHERE e.automation_execution_id = %(execution_id)s::uuid
+              AND e.status = 'running'
+              AND {pred}
+        )
+        """,
+        {
+            "execution_id": execution_id,
+            "thread_id": thread_id,
+            "exclude_run_id": excluding_run_id,
+        },
+    )
+    row = await cur.fetchone()
+    return _bool_row(row)
+
+
 async def settle_execution(
     execution_id: str,
     *,
@@ -201,6 +386,9 @@ async def settle_execution(
     strike: Optional[Literal["count", "fuse", "reset"]] = None,
     schedule: Optional[ScheduleAction] = None,
     quiet_for: Optional[int] = None,
+    # DALTON-HOOK(automation-continuation-identity): lock/CAS options for settlement
+    expected_run_id: Any = UNSET_RUN_ID,
+    check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
     in_transaction: Optional[Callable[[Any, Dict[str, Any]], Awaitable[Any]]] = None,
     **fields: Any,
 ) -> Optional[Dict[str, Any]]:
@@ -225,7 +413,7 @@ async def settle_execution(
                 # Automation first, execution second: the order a delete's
                 # cascade takes the same two rows in.
                 await cur.execute("""
-                    SELECT 1 FROM automations WHERE automation_id = %s
+                    SELECT 1 FROM automations WHERE automation_id = %s::uuid
                     FOR NO KEY UPDATE
                 """, (automation_id,))
                 if await cur.fetchone() is None:
@@ -233,12 +421,13 @@ async def settle_execution(
                 quiet = ""
                 params: list = [execution_id, automation_id]
                 if quiet_for is not None:
-                    quiet = "AND heartbeat_at < NOW() - make_interval(secs => %s)"
+                    quiet = "AND heartbeat_at < NOW() - make_interval(secs => %s::double precision)"
                     params.append(quiet_for)
                 await cur.execute(f"""
-                    SELECT status, created_at, delivery
+                    SELECT status, created_at, delivery,
+                           conversation_thread_id, conversation_response_id
                     FROM automation_executions
-                    WHERE automation_execution_id = %s AND automation_id = %s
+                    WHERE automation_execution_id = %s::uuid AND automation_id = %s::uuid
                       {quiet}
                     FOR UPDATE
                 """, tuple(params))
@@ -246,10 +435,69 @@ async def settle_execution(
                 if prior is None or prior["status"] not in from_statuses:
                     return None
 
+                # DALTON-HOOK(automation-continuation-identity): CAS on linked run and re-read state under FOR UPDATE
+                prior_run_id = (
+                    str(prior["conversation_response_id"])
+                    if prior.get("conversation_response_id") is not None
+                    else None
+                )
+                exp_run = None
+                if expected_run_id is not UNSET_RUN_ID:
+                    exp_run = str(expected_run_id) if expected_run_id is not None else None
+                    if prior_run_id != exp_run:
+                        return None
+
+                thread_id_val = (
+                    str(prior["conversation_thread_id"])
+                    if prior.get("conversation_thread_id") is not None
+                    else None
+                )
+                if thread_id_val is not None:
+                    await cur.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM conversation_responses r_live
+                            WHERE r_live.conversation_thread_id = %s::uuid
+                              AND r_live.status = 'in_progress'
+                              AND r_live.metadata->>'automation_execution_id' = %s::text
+                        )
+                    """, (thread_id_val, execution_id))
+                    if _bool_row(await cur.fetchone()):
+                        return None
+
+                if check_run_state_in_lock is not None and prior_run_id is not None:
+                    await cur.execute("""
+                        SELECT status, metadata, cancel_requested_at
+                        FROM conversation_responses
+                        WHERE conversation_response_id = %s::uuid
+                    """, (prior_run_id,))
+                    live_row = await cur.fetchone()
+                    if _is_run_live(live_row):
+                        return None
+                    if check_run_state_in_lock == "completed_idle":
+                        if live_row is None or live_row.get("status") != "completed":
+                            return None
+                        if thread_id_val and await _has_pending_background_work_on_cur(
+                            cur,
+                            execution_id,
+                            thread_id=thread_id_val,
+                            excluding_run_id=prior_run_id,
+                        ):
+                            return None
+                    elif check_run_state_in_lock == "timeout":
+                        if live_row is not None and live_row.get("status") == "completed":
+                            if not thread_id_val or not await _has_pending_background_work_on_cur(
+                                cur,
+                                execution_id,
+                                thread_id=thread_id_val,
+                                excluding_run_id=prior_run_id,
+                            ):
+                                return None
+
+                # DALTON-HOOK(automation-continuation-identity): explicit uuid casts for prior/CAS queries
                 await cur.execute(f"""
                     SELECT p.failure_reason, p.delivery_result
                     FROM automation_executions p
-                    WHERE p.automation_id = %s AND p.automation_execution_id <> %s
+                    WHERE p.automation_id = %s::uuid AND p.automation_execution_id <> %s::uuid
                       AND p.status NOT IN {UNSETTLED_STATUSES}
                       AND {not_a_server_skip("p")}
                     ORDER BY p.created_at DESC, p.automation_execution_id DESC
@@ -257,11 +505,23 @@ async def settle_execution(
                 """, (automation_id, execution_id))
                 previous = await cur.fetchone()
 
+                if expected_run_id is not UNSET_RUN_ID:
+                    where_clause = (
+                        "automation_execution_id = %s::uuid "
+                        "AND conversation_response_id IS NOT DISTINCT FROM %s::uuid"
+                    )
+                    where_params = [execution_id, exp_run]
+                else:
+                    where_clause = "automation_execution_id = %s::uuid"
+                    where_params = [execution_id]
                 query, update_params = _execution_update(
-                    to, "automation_execution_id = %s", [execution_id], fields
+                    to, where_clause, where_params, fields
                 )
                 await cur.execute(query, update_params)
-                row = dict(await cur.fetchone())
+                updated_row = await cur.fetchone()
+                if updated_row is None:
+                    return None
+                row = dict(updated_row)
 
                 if strike in ("count", "fuse"):
                     await _count_strike(cur, automation_id, fuse=strike == "fuse")
@@ -555,36 +815,260 @@ async def settle_legacy_executions(error_message: str) -> int:
 async def list_abandoned_executions(
     quiet_seconds: int, limit: int = 50
 ) -> List[Dict[str, Any]]:
-    """Firings whose heartbeat has been quiet ``quiet_seconds``, oldest first,
-    with what settling each needs: its owner, thread, workspace and run.
+    """Firings whose heartbeat has been quiet ``quiet_seconds``, or past their
+    hard timeout cap with no live turn running, oldest first, with what
+    settling each needs: its owner, thread, workspace and run.
 
-    A firing whose run is still going, or still owed a restart's resume, is
-    left out: the sweep would leave it alone anyway, and a page of them would
-    starve the rest.
+    A firing whose run is still ``in_progress``, owed a restart's resume, or
+    waiting on unfinished background work / continuation turns (within its
+    hard timeout cap) is left out.
     """
+    # DALTON-HOOK(automation-continuation-identity): compute per-automation timeouts in Python once and bind into SQL
+    pending_sql = _pending_background_work_sql(
+        execution_id_sql="e.automation_execution_id",
+        thread_id_sql="e.conversation_thread_id",
+        linked_run_id_sql="e.conversation_response_id",
+    )
+    default_timeout = default_execution_timeout_seconds()
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT DISTINCT a.automation_id, a.metadata, a.trigger_config
+                FROM automation_executions e
+                JOIN automations a ON a.automation_id = e.automation_id
+                WHERE e.status = 'running'
+                  AND (a.metadata ? 'timeout_seconds'
+                       OR a.trigger_config ? 'timeout_seconds')
+            """)
+            override_ids: list[str] = []
+            override_secs: list[float] = []
+            for ov in await cur.fetchall():
+                override_ids.append(str(ov["automation_id"]))
+                override_secs.append(execution_timeout_seconds(ov))
+
+            # DALTON-HOOK(automation-continuation-identity): bind Python-parsed timeouts and live-turn exclusion
             await cur.execute(f"""
+                WITH ov AS (
+                    SELECT * FROM unnest(%s::uuid[], %s::double precision[])
+                        AS t(automation_id, timeout_secs)
+                )
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.conversation_response_id,
+                       e.started_at, e.created_at,
+                       a.user_id, t.workspace_id
+                FROM automation_executions e
+                JOIN automations a ON a.automation_id = e.automation_id
+                LEFT JOIN ov ON ov.automation_id = a.automation_id
+                LEFT JOIN conversation_threads t
+                    ON t.conversation_thread_id = e.conversation_thread_id
+                WHERE e.status IN {UNSETTLED_STATUSES}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM conversation_responses r
+                      WHERE (
+                          r.conversation_response_id = e.conversation_response_id
+                          AND (r.status = 'in_progress'
+                               OR (r.status = 'cancelled' AND r.metadata ? %s::text
+                                   AND r.cancel_requested_at > NOW() - %s::interval))
+                      ) OR (
+                          e.conversation_thread_id IS NOT NULL
+                          AND r.conversation_thread_id = e.conversation_thread_id
+                          AND r.status = 'in_progress'
+                          AND r.metadata->>'automation_execution_id' = e.automation_execution_id::text
+                      )
+                  )
+                  AND (
+                      (e.status = 'running'
+                       AND COALESCE(e.started_at, e.created_at)
+                           < NOW() - make_interval(
+                               secs => COALESCE(ov.timeout_secs, %s::double precision)
+                           ))
+                      OR (
+                          e.heartbeat_at < NOW() - make_interval(secs => %s::double precision)
+                          AND (
+                              e.conversation_thread_id IS NULL
+                              OR NOT {pending_sql}
+                          )
+                      )
+                  )
+                ORDER BY e.heartbeat_at
+                LIMIT %s::integer
+            """, (
+                override_ids,
+                override_secs,
+                RESTART_INTERRUPTED_META,
+                RESTART_RESUME_TTL,
+                default_timeout,
+                quiet_seconds,
+                limit,
+            ))
+            return [dict(row) for row in await cur.fetchall()]
+
+
+# --- DALTON-HOOK(automation-continuation-identity): execution background work & identity queries ---
+async def get_execution_for_settlement(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Columns of ``execution_id`` consulted before settling a finished run."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT automation_execution_id, automation_id, status,
+                       conversation_thread_id, conversation_response_id,
+                       started_at, created_at, heartbeat_at
+                FROM automation_executions
+                WHERE automation_execution_id = %s::uuid
+            """, (execution_id,))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_running_executions_for_thread(thread_id: str) -> List[Dict[str, Any]]:
+    """All ``running`` automation executions pinned to ``thread_id``, oldest first."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT e.automation_execution_id, e.automation_id, e.status,
+                       e.conversation_thread_id, e.conversation_response_id,
+                       e.started_at, e.created_at,
                        a.user_id, t.workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
                 LEFT JOIN conversation_threads t
                     ON t.conversation_thread_id = e.conversation_thread_id
-                WHERE e.status IN {UNSETTLED_STATUSES}
-                  AND e.heartbeat_at < NOW() - make_interval(secs => %s)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM conversation_responses r
-                      WHERE r.conversation_response_id = e.conversation_response_id
-                        AND (r.status = 'in_progress'
-                             OR (r.status = 'cancelled' AND r.metadata ? %s
-                                 AND r.cancel_requested_at > NOW() - %s))
-                  )
-                ORDER BY e.heartbeat_at
-                LIMIT %s
-            """, (quiet_seconds, RESTART_INTERRUPTED_META, RESTART_RESUME_TTL, limit))
+                WHERE e.conversation_thread_id = %s::uuid
+                  AND e.status = 'running'
+                ORDER BY e.created_at ASC, e.automation_execution_id ASC
+            """, (thread_id,))
             return [dict(row) for row in await cur.fetchall()]
+
+
+async def has_pending_background_work(
+    execution_id: str,
+    *,
+    thread_id: Optional[str],
+    excluding_run_id: Optional[str] = None,
+) -> bool:
+    """Whether ``execution_id`` on ``thread_id`` still has unfinished background
+    commands, subagent tasks, unclosed report-back jobs, or another live turn."""
+    if not thread_id:
+        return False
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            return await _has_pending_background_work_on_cur(
+                cur,
+                execution_id,
+                thread_id=thread_id,
+                excluding_run_id=excluding_run_id,
+            )
+
+
+async def get_open_execution_for_command(
+    thread_id: str, command_id: str
+) -> Optional[Dict[str, str]]:
+    """Open automation firing that launched ``command_id`` on ``thread_id``."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT e.automation_execution_id, e.automation_id
+                FROM command_runs cr
+                JOIN conversation_responses pr
+                  ON pr.conversation_response_id = cr.run_id
+                JOIN automation_executions e
+                  ON e.automation_execution_id::text = pr.metadata->>'automation_execution_id'
+                WHERE cr.command_id = %s::text
+                  AND cr.conversation_thread_id = %s::uuid
+                  AND e.conversation_thread_id = %s::uuid
+                  AND e.status = 'running'
+                LIMIT 1
+            """, (command_id, thread_id, thread_id))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return {
+                "automation_execution_id": str(row["automation_execution_id"]),
+                "automation_id": str(row["automation_id"]),
+            }
+
+
+async def get_open_execution_for_task(
+    thread_id: str, task_run_id: str
+) -> Optional[Dict[str, str]]:
+    """Open automation firing that launched the exact subagent run ``task_run_id``."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT e.automation_execution_id, e.automation_id
+                FROM subagent_runs sr
+                JOIN conversation_responses pr
+                  ON pr.conversation_response_id = sr.parent_run_id
+                JOIN automation_executions e
+                  ON e.automation_execution_id::text = pr.metadata->>'automation_execution_id'
+                WHERE sr.thread_id = %s::uuid
+                  AND sr.task_run_id = %s::uuid
+                  AND e.conversation_thread_id = %s::uuid
+                  AND e.status = 'running'
+                LIMIT 1
+            """, (thread_id, task_run_id, thread_id))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return {
+                "automation_execution_id": str(row["automation_execution_id"]),
+                "automation_id": str(row["automation_id"]),
+            }
+
+
+async def take_over_execution_run(
+    execution_id: str, run_id: str, *, conn: Any = None
+) -> bool:
+    """Advance a running execution's ``conversation_response_id`` to ``run_id``.
+
+    Acquires ``FOR UPDATE`` on the execution row first (on the caller's START
+    transaction connection when supplied) so settlement cannot interleave with
+    the START transaction, then updates only while ``execution_id`` is
+    ``running`` and ``run_id`` is an ``in_progress`` turn on that execution's
+    thread with non-older ``run_seq``.
+    """
+    @asynccontextmanager
+    async def _tx():
+        if conn is not None:
+            yield conn
+            return
+        async with get_db_connection() as pooled:
+            async with pooled.transaction():
+                yield pooled
+
+    async with _tx() as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute("""
+                SELECT 1
+                FROM automation_executions
+                WHERE automation_execution_id = %(execution_id)s::uuid
+                FOR UPDATE
+            """, {"execution_id": execution_id})
+            await cur.execute("""
+                UPDATE automation_executions e
+                SET conversation_response_id = %(run_id)s::uuid,
+                    heartbeat_at = NOW()
+                WHERE e.automation_execution_id = %(execution_id)s::uuid
+                  AND e.status = 'running'
+                  AND EXISTS (
+                      SELECT 1 FROM conversation_responses r
+                      WHERE r.conversation_response_id = %(run_id)s::uuid
+                        AND r.conversation_thread_id = e.conversation_thread_id
+                        AND r.status = 'in_progress'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM conversation_responses cur
+                      JOIN conversation_responses cand
+                        ON cand.conversation_response_id = %(run_id)s::uuid
+                      WHERE cur.conversation_response_id = e.conversation_response_id
+                        AND cur.conversation_thread_id = e.conversation_thread_id
+                        AND cur.conversation_response_id <> cand.conversation_response_id
+                        AND cur.run_seq > cand.run_seq
+                  )
+            """, {"execution_id": execution_id, "run_id": run_id})
+            return cur.rowcount == 1
+# --- DALTON-HOOK(automation-continuation-identity): end ---
 
 
 async def hand_off_execution(

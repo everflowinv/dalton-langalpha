@@ -234,9 +234,29 @@ async def settle(
             logger.debug(f"[COMMANDS] discard after {row['command_id']} ended failed: {e}")
     if outcome.report == "now":
         _nudge_hook_drainer()
+    else:
+        # DALTON-HOOK(automation-continuation-identity): settle execution if final command closed without a report-back turn
+        await _settle_thread_execution_if_idle(ended)
     if runtime is not None:
         await mirror_after_end(ended)
     return ended
+
+
+async def _settle_thread_execution_if_idle(ended: Mapping[str, Any]) -> None:
+    thread_id = ended.get("conversation_thread_id")
+    if not thread_id:
+        return
+    try:
+        from src.server.services.automation_settlement import (
+            settle_thread_execution_if_idle,
+        )
+
+        await settle_thread_execution_if_idle(str(thread_id))
+    except Exception:
+        logger.debug(
+            f"[COMMANDS] Idle automation settle check failed for thread {thread_id}",
+            exc_info=True,
+        )
 
 
 def _nudge_hook_drainer() -> None:

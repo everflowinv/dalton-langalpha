@@ -203,6 +203,19 @@ async def _on_command_report_back_closed(job: dict) -> None:
     thread_id = job.get("conversation_thread_id")
     if thread_id:
         await publish_cleared_wake(str(thread_id))
+        # DALTON-HOOK(automation-continuation-identity): settle open execution when last report closes without a turn
+        if not (job.get("payload") or {}).get("dispatched_run_id"):
+            try:
+                from src.server.services.automation_settlement import (
+                    settle_thread_execution_if_idle,
+                )
+
+                await settle_thread_execution_if_idle(str(thread_id))
+            except Exception:
+                logger.debug(
+                    f"{_LOG_PREFIX} Idle automation settle check failed for thread {thread_id}",
+                    exc_info=True,
+                )
 
 
 def register_outbox_executors() -> None:

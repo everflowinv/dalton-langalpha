@@ -388,6 +388,8 @@ class TaskReport(BaseModel):
     description: Optional[str] = None
     failed: bool = False
     subagent_type: Optional[str] = None
+    # DALTON-HOOK(automation-continuation-identity): exact task run id for identity carry
+    task_run_id: Optional[str] = None
 
 
 class CommandReport(BaseModel):

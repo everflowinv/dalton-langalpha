@@ -392,6 +392,10 @@ ALLOWED_HOOKS=(
   "problem-reports-off"
   # Host data-task Vault secret passthrough, manifest allowlist, plain env, and log scrubbing.
   "host-job-secrets"
+  # Keep automation executions open until spawned background commands/subagents
+  # and continuation turns finish (with 3h default hard cap) and propagate
+  # automation identity to report-back continuation turns.
+  "automation-continuation-identity"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
