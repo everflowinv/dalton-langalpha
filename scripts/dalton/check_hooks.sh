@@ -25,6 +25,7 @@ done
 ALLOWED_HOOKS=(
   # P0 & P0N platform hooks
   "llm-overlay"
+  "critical-path-budget"
   "llm-sdk-dispatch"
   "oauth-dispatch"
   "provider-kill-switch"

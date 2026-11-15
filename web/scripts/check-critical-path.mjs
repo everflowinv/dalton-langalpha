@@ -36,7 +36,11 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // deliberately thin, so routine growth shows up here instead of being quietly
 // absorbed. Raise it only for a measured cause, and put that cause in the commit
 // message that raises it; the line's history is the record of why it moved.
-const MAX_EAGER_KB = 500
+// DALTON-HOOK(critical-path-budget): Dalton ships zh-CN as the default locale with its own
+// UI strings (the largest catalog, always counted) and Dalton-only entry code; measured
+// 511.1 kB gz on the sync5 merge (703606e63) against upstream's 500. Raised to 525 for
+// that measured cause, leaving the same thin headroom upstream keeps.
+const MAX_EAGER_KB = 525
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')
