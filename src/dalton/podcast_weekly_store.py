@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +47,8 @@ ARTIFACT_EXTENSION_MAP: dict[str, str] = {
     "summary": ".summary.md",
 }
 WRITABLE_ARTIFACTS: frozenset[str] = frozenset({"zh", "en", "notes", "summary"})
+STAGE_ARTIFACTS: tuple[str, ...] = ("notes", "zh", "en", "merged")
+DEFAULT_COLLECT_ARTIFACTS: tuple[str, ...] = ("zh", "en", "notes", "summary")
 
 
 class RecordUnreadableError(RuntimeError):
@@ -53,6 +57,10 @@ class RecordUnreadableError(RuntimeError):
 
 class PodcastStoreSecurityError(ValueError):
     """Raised when a path, filename, or video_id escapes the podcast-weekly boundary."""
+
+
+class PublishInProgressError(RuntimeError):
+    """Raised when another publish_doc call already holds the per-episode lock."""
 
 
 def resolve_host_openclaw_data_root() -> Path:
@@ -158,6 +166,52 @@ def _research_dir(root: Path) -> Path:
 
 def _state_dir(root: Path) -> Path:
     return safe_podcast_path(root, ALLOWED_PODCAST_REL_DIRS[1])
+
+
+_PUBLISH_LOCKS_GUARD = threading.Lock()
+_ACTIVE_PUBLISH_LOCKS: set[str] = set()
+
+
+def doc_publish_lock_path(root: Path, vid: str) -> Path:
+    ep_dir = _doc_dir(root, vid)
+    if ep_dir.exists() and not ep_dir.is_dir():
+        raise PodcastStoreSecurityError(f"非目录状态路径: {ep_dir}")
+    return _safe_child_in_dir(ep_dir, "publish.lock")
+
+
+@contextlib.contextmanager
+def episode_publish_lock(root: Path, vid: str) -> Iterator[None]:
+    """Acquire non-blocking exclusive per-episode lock (`docs/<vid>/publish.lock`).
+
+    Raises `PublishInProgressError` immediately without waiting when held by
+    another worker process or another in-process task.
+    """
+    safe_vid = validate_video_id(vid)
+    lock_file = doc_publish_lock_path(root, safe_vid)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_key = str(lock_file.resolve())
+    with _PUBLISH_LOCKS_GUARD:
+        if lock_key in _ACTIVE_PUBLISH_LOCKS:
+            raise PublishInProgressError(f"{safe_vid} 正在发布中")
+        _ACTIVE_PUBLISH_LOCKS.add(lock_key)
+    acquired_flock = False
+    try:
+        with open(lock_file, "a+", encoding="utf-8") as lock_fh:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired_flock = True
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    raise PublishInProgressError(f"{safe_vid} 正在发布中") from exc
+                raise
+            try:
+                yield
+            finally:
+                if acquired_flock:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        with _PUBLISH_LOCKS_GUARD:
+            _ACTIVE_PUBLISH_LOCKS.discard(lock_key)
 
 
 @contextlib.contextmanager
@@ -420,6 +474,8 @@ def resolve_artifact_path(
 def _doc_is_complete(doc_rec: dict[str, Any]) -> bool:
     if not doc_rec or not str(doc_rec.get("doc_url") or "").strip():
         return False
+    if isinstance(doc_rec.get("in_flight_write"), dict) and doc_rec.get("in_flight_write"):
+        return False
     status = str(doc_rec.get("body_status") or "").strip().lower()
     if status == "incomplete":
         return False
@@ -526,6 +582,8 @@ def _classify_episode_bucket(
         return "published"
     if doc_rec and (doc_url or str(doc_rec.get("document_id") or "").strip()) and not is_doc_done:
         return "incomplete_docs"
+    if len(doc_rec.get("abandoned_documents") or []) >= 2:
+        return "stage_incomplete"
     if int((failed_doc or {}).get("attempts") or 0) >= 2:
         return "stage_incomplete"
     if str(row.get("stage") or "") == "ready":
@@ -660,8 +718,15 @@ def _compute_status_unlocked(
         is_doc_done = bucket == "published"
         doc_url = str(doc_rec.get("doc_url") or row.get("doc_url") or "").strip()
         doc_failed_attempts = int(failed_doc.get("attempts") or 0)
+        abandoned_docs = [
+            dict(entry)
+            for entry in (doc_rec.get("abandoned_documents") or [])
+            if isinstance(entry, dict)
+        ]
         stage_error = str(row.get("stage_error") or "")
-        if not stage_error and doc_failed_attempts >= 2:
+        if not stage_error and len(abandoned_docs) >= 2:
+            stage_error = "doc_uncertain_twice"
+        elif not stage_error and doc_failed_attempts >= 2:
             stage_error = str(failed_doc.get("last_error") or "doc_create_failed_twice")
         item: dict[str, Any] = {
             "video_id": vid,
@@ -677,6 +742,7 @@ def _compute_status_unlocked(
             "body_status": str(doc_rec.get("body_status") or ("complete" if is_doc_done else "")),
             "completed_parts": list(doc_rec.get("completed_parts") or []),
             "total_parts": doc_rec.get("total_parts"),
+            "abandoned_documents": abandoned_docs,
             "published_at": row.get("published_at") or doc_rec.get("published_at") or "",
         }
         if bucket == "published":
@@ -832,6 +898,8 @@ def write_artifact(
     vid: str,
     artifact: str,
     content: str,
+    *,
+    target_filename: str | None = None,
 ) -> dict[str, Any]:
     """Write proofread `.zh.md`, `.en.md`, `.notes.json`, or `.summary.md` back to `research-outputs/podcast-weekly`."""
     safe_vid = validate_video_id(vid)
@@ -849,7 +917,14 @@ def write_artifact(
     lpath = ledger_path(root)
     ledger = read_json_dict(lpath) if lpath.exists() else {}
     row = ledger.get(safe_vid) if isinstance(ledger.get(safe_vid), dict) else {}
-    target = resolve_artifact_path(root, safe_vid, key, row=row, for_write=True)
+    if target_filename:
+        ext = _artifact_ext(key)
+        clean_name = str(target_filename).strip()
+        if not clean_name.endswith(f"-{safe_vid}{ext}"):
+            raise PodcastStoreSecurityError(f"目标文件名与预期产物不匹配: {target_filename!r}")
+        target = _safe_child_in_dir(_research_dir(root), clean_name)
+    else:
+        target = resolve_artifact_path(root, safe_vid, key, row=row, for_write=True)
 
     if key == "notes":
         parsed = json.loads(content)
@@ -861,10 +936,11 @@ def write_artifact(
                 "error": "video_id_mismatch",
                 "message": "notes.json 的 video_id 与目标不一致",
             }
-        atomic_write_json(target, parsed)
+        written_text = json.dumps(parsed, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(target, written_text)
     else:
-        text = content if content.endswith("\n") else content + "\n"
-        atomic_write_text(target, text)
+        written_text = content if content.endswith("\n") else content + "\n"
+        atomic_write_text(target, written_text)
 
     return {
         "ok": True,
@@ -872,7 +948,118 @@ def write_artifact(
         "artifact": key,
         "filename": target.name,
         "bytes": target.stat().st_size,
+        "sha256": hashlib.sha256(written_text.encode("utf-8")).hexdigest(),
     }
+
+
+def _load_ledger_row(root: Path, safe_vid: str) -> dict[str, Any]:
+    lpath = ledger_path(root)
+    ledger = read_json_dict(lpath) if lpath.exists() else {}
+    row = ledger.get(safe_vid)
+    return row if isinstance(row, dict) else {}
+
+
+def load_stage_artifacts(root: Path, vid: str) -> dict[str, Any]:
+    """Read the 4 host artifacts (`notes`, `zh`, `en`, `merged`) for staging into a sandbox."""
+    safe_vid = validate_video_id(vid)
+    row = _load_ledger_row(root, safe_vid)
+    items: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    for key in STAGE_ARTIFACTS:
+        try:
+            target = resolve_artifact_path(root, safe_vid, key, row=row, for_write=False)
+            raw_bytes = _read_text_nofollow(target).encode("utf-8")
+        except (
+            FileNotFoundError,
+            OSError,
+            PodcastStoreSecurityError,
+            RecordUnreadableError,
+            UnicodeDecodeError,
+        ) as exc:
+            failed.append({"artifact": key, "error": type(exc).__name__, "message": str(exc)})
+            continue
+        items.append(
+            {
+                "artifact": key,
+                "filename": target.name,
+                "bytes": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "content_bytes": raw_bytes,
+            }
+        )
+    if failed:
+        missing_artifacts = [entry["artifact"] for entry in failed if entry["error"] == "FileNotFoundError"]
+        rejected_artifacts = [entry["artifact"] for entry in failed if entry["error"] != "FileNotFoundError"]
+        err_code = "missing_artifact" if missing_artifacts and not rejected_artifacts else "artifact_read_failed"
+        detail = "; ".join(f"{entry['artifact']}: {entry['message']}" for entry in failed)
+        return {
+            "ok": False,
+            "error": err_code,
+            "video_id": safe_vid,
+            "missing_artifacts": missing_artifacts,
+            "rejected_artifacts": rejected_artifacts,
+            "failed": failed,
+            "message": f"宿主机产物缺失或读取失败: {detail}",
+        }
+    return {"ok": True, "video_id": safe_vid, "items": items}
+
+
+def _find_existing_stage_stem(root: Path, safe_vid: str, row: dict[str, Any]) -> str | None:
+    for art in STAGE_ARTIFACTS:
+        ext = ARTIFACT_EXTENSION_MAP[art]
+        try:
+            existing = resolve_artifact_path(root, safe_vid, art, row=row, for_write=False)
+        except (FileNotFoundError, OSError, PodcastStoreSecurityError, RecordUnreadableError):
+            continue
+        if existing.name.endswith(ext):
+            return existing.name[: -len(ext)]
+    return None
+
+
+def resolve_collect_targets(
+    root: Path,
+    vid: str,
+    artifacts: list[str] | tuple[str, ...],
+) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Resolve expected host filenames for writable artifacts without aborting on one invalid key."""
+    safe_vid = validate_video_id(vid)
+    row = _load_ledger_row(root, safe_vid)
+    existing_stem = _find_existing_stage_stem(root, safe_vid, row)
+    targets: dict[str, str] = {}
+    invalid: dict[str, dict[str, str]] = {}
+    allowed = ", ".join(sorted(WRITABLE_ARTIFACTS))
+    for raw_art in artifacts:
+        key = str(raw_art or "").strip().lower()
+        if not key or key in targets or key in invalid:
+            continue
+        if key not in WRITABLE_ARTIFACTS:
+            invalid[key or str(raw_art)] = {
+                "error": "artifact_not_writable",
+                "message": f"仅允许写入 {allowed}，收到 {raw_art!r}",
+            }
+            continue
+        try:
+            # Prefer matching an existing host file (keeps stage/collect stems aligned even when
+            # disk uses YYYY-MM-DD- while row.upload_date is YYYYMMDD), then staged stem, then date.
+            try:
+                target = resolve_artifact_path(root, safe_vid, key, row=row, for_write=False)
+            except FileNotFoundError:
+                if existing_stem:
+                    target = _safe_child_in_dir(_research_dir(root), f"{existing_stem}{_artifact_ext(key)}")
+                else:
+                    target = resolve_artifact_path(root, safe_vid, key, row=row, for_write=True)
+            targets[key] = target.name
+        except (
+            OSError,
+            PodcastStoreSecurityError,
+            RecordUnreadableError,
+            ValueError,
+        ) as exc:
+            invalid[key] = {
+                "error": type(exc).__name__,
+                "message": str(exc),
+            }
+    return targets, invalid
 
 
 def _chunk_manifest_path(root: Path, vid: str) -> Path:
@@ -900,11 +1087,17 @@ def _persist_chunks_unlocked(
     cdir.mkdir(parents=True, exist_ok=True)
     parts_meta: list[dict[str, Any]] = []
     expected_files: set[str] = {"manifest.json"}
+    cursor = 0
     for item in chunks:
         idx = int(item["part"])
         body = str(item["content"])
+        start_pos = int(item.get("start") if item.get("start") is not None else cursor)
+        end_pos = int(item.get("end") if item.get("end") is not None else start_pos + len(body))
+        cursor = end_pos
         digest = str(item.get("sha256") or hashlib.sha256(body.encode("utf-8")).hexdigest())
         item["sha256"] = digest
+        item["start"] = start_pos
+        item["end"] = end_pos
         fname = f"part-{idx:03d}.md"
         expected_files.add(fname)
         atomic_write_text(_safe_child_in_dir(cdir, fname), body)
@@ -913,6 +1106,8 @@ def _persist_chunks_unlocked(
                 "part": idx,
                 "total": len(chunks),
                 "chars": len(body),
+                "start": start_pos,
+                "end": end_pos,
                 "sha256": digest,
                 "file": fname,
             }
@@ -947,6 +1142,7 @@ def _load_persisted_chunks_unlocked(root: Path, vid: str) -> tuple[dict[str, Any
     if total_parts != len(raw_parts):
         raise RecordUnreadableError(f"分段清单数量不一致: {mpath}")
     chunks: list[dict[str, Any]] = []
+    cursor = 0
     for idx, entry in enumerate(sorted(raw_parts, key=lambda x: int(x.get("part") or 0)), start=1):
         if not isinstance(entry, dict) or int(entry.get("part") or 0) != idx:
             raise RecordUnreadableError(f"分段序号不连续: {mpath}")
@@ -959,11 +1155,16 @@ def _load_persisted_chunks_unlocked(root: Path, vid: str) -> tuple[dict[str, Any
         actual_sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
         if not expected_sha or actual_sha != expected_sha:
             raise RecordUnreadableError(f"持久化分段校验和不一致: {part_path}")
+        start_pos = int(entry.get("start") if entry.get("start") is not None else cursor)
+        end_pos = int(entry.get("end") if entry.get("end") is not None else start_pos + len(body))
+        cursor = end_pos
         chunks.append(
             {
                 "part": idx,
                 "total": total_parts,
                 "chars": len(body),
+                "start": start_pos,
+                "end": end_pos,
                 "sha256": actual_sha,
                 "content": body,
             }
@@ -1082,7 +1283,32 @@ def prepare_doc(
                 "video_id": safe_vid,
                 "detail": str(exc),
             }
-        if not existing_doc and int(failed_doc.get("attempts") or 0) >= 2:
+        abandoned_docs = [
+            dict(entry)
+            for entry in (existing_doc.get("abandoned_documents") or [])
+            if isinstance(entry, dict)
+        ]
+        has_active_doc = bool(
+            existing_doc
+            and (
+                str(existing_doc.get("document_id") or "").strip()
+                or str(existing_doc.get("doc_url") or "").strip()
+            )
+        )
+        if not redo and len(abandoned_docs) >= 2:
+            return {
+                "ok": False,
+                "create": False,
+                "resume_append": False,
+                "stopped": True,
+                "code": "doc_uncertain_twice",
+                "error": "doc_uncertain_twice",
+                "reason": "doc_uncertain_twice",
+                "video_id": safe_vid,
+                "abandoned_documents": abandoned_docs,
+                "message": "该期文档已连续 2 次写入结果不确定并作废，已停止自动重建，请人工核对作废文档链接",
+            }
+        if not has_active_doc and int(failed_doc.get("attempts") or 0) >= 2:
             return {
                 "ok": False,
                 "create": False,
@@ -1180,16 +1406,22 @@ def prepare_doc(
                 ]
             )
             raw_chunks = split_markdown_for_feishu(markdown, max(1000, int(max_chars)))
-            chunks = [
-                {
-                    "part": idx,
-                    "total": len(raw_chunks),
-                    "chars": len(body),
-                    "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-                    "content": body,
-                }
-                for idx, body in enumerate(raw_chunks, start=1)
-            ]
+            chunks: list[dict[str, Any]] = []
+            cursor = 0
+            for idx, body in enumerate(raw_chunks, start=1):
+                end_pos = cursor + len(body)
+                chunks.append(
+                    {
+                        "part": idx,
+                        "total": len(raw_chunks),
+                        "chars": len(body),
+                        "start": cursor,
+                        "end": end_pos,
+                        "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                        "content": body,
+                    }
+                )
+                cursor = end_pos
             _persist_chunks_unlocked(
                 root,
                 safe_vid,
@@ -1199,7 +1431,7 @@ def prepare_doc(
                 chunks=chunks,
             )
 
-        if not redo and existing_doc and (existing_doc.get("document_id") or existing_doc.get("doc_url")):
+        if not redo and has_active_doc:
             completed = {
                 int(p)
                 for p in (existing_doc.get("completed_parts") or [])
@@ -1260,6 +1492,52 @@ def _promote_published_in_ledger_unlocked(
         atomic_write_json(lpath, ledger)
 
 
+def _doc_identity_matches(
+    existing: dict[str, Any],
+    *,
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
+    incoming_document_id: str = "",
+) -> bool:
+    cur_id = str(existing.get("document_id") or "").strip()
+    cur_url = str(existing.get("doc_url") or "").strip()
+    if expected_document_id is not None:
+        exp_id = str(expected_document_id or "").strip()
+        if exp_id:
+            return cur_id == exp_id
+        if cur_id:
+            return False
+        if expected_doc_url is not None:
+            return cur_url == str(expected_doc_url or "").strip()
+        return cur_url == ""
+    clean_incoming = str(incoming_document_id or "").strip()
+    return not (cur_id and clean_incoming and cur_id != clean_incoming)
+
+
+def _doc_identity_mismatch_result(
+    safe_vid: str,
+    existing: dict[str, Any],
+    *,
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
+    incoming_document_id: str = "",
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "video_id": safe_vid,
+        "code": "doc_identity_mismatch",
+        "error": "doc_identity_mismatch",
+        "expected_document_id": (
+            str(expected_document_id or "").strip()
+            if expected_document_id is not None
+            else str(incoming_document_id or "").strip()
+        ),
+        "actual_document_id": str(existing.get("document_id") or "").strip(),
+        "expected_doc_url": str(expected_doc_url or "").strip(),
+        "actual_doc_url": str(existing.get("doc_url") or "").strip(),
+    }
+
+
 def _save_doc_unlocked(
     root: Path,
     vid: str,
@@ -1270,6 +1548,8 @@ def _save_doc_unlocked(
     total_parts: int = 1,
     completed_parts: list[int] | None = None,
     body_complete: bool | None = None,
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
 ) -> dict[str, Any]:
     safe_vid = validate_video_id(vid)
     clean_url = str(doc_url or "").strip()
@@ -1279,6 +1559,19 @@ def _save_doc_unlocked(
 
     dpath = doc_record_path(root, safe_vid)
     existing = read_json_dict(dpath) if dpath.exists() else {}
+    if not _doc_identity_matches(
+        existing,
+        expected_document_id=expected_document_id,
+        expected_doc_url=expected_doc_url,
+        incoming_document_id=clean_doc_id,
+    ):
+        return _doc_identity_mismatch_result(
+            safe_vid,
+            existing,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
+            incoming_document_id=clean_doc_id,
+        )
 
     persisted_total = _persisted_total_parts_unlocked(root, safe_vid)
     existing_total = int(existing.get("total_parts") or 0)
@@ -1317,6 +1610,12 @@ def _save_doc_unlocked(
     if is_complete and not sorted_parts:
         sorted_parts = list(range(1, n_total + 1))
 
+    abandoned_docs = [
+        dict(entry)
+        for entry in (existing.get("abandoned_documents") or [])
+        if isinstance(entry, dict)
+    ]
+
     missing = [p for p in range(1, n_total + 1) if p not in set(sorted_parts)]
     rec: dict[str, Any] = {
         "video_id": safe_vid,
@@ -1329,6 +1628,8 @@ def _save_doc_unlocked(
         "next_part": missing[0] if missing else None,
         "updated_at": now,
     }
+    if abandoned_docs:
+        rec["abandoned_documents"] = abandoned_docs
     if is_complete:
         rec["published_at"] = str(existing.get("published_at") or now)
 
@@ -1350,6 +1651,8 @@ def save_doc(
     total_parts: int = 1,
     completed_parts: list[int] | None = None,
     body_complete: bool | None = None,
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
 ) -> dict[str, Any]:
     """Persist Feishu `document_id` + `doc_url` under unified state lock."""
     with podcast_state_lock(root):
@@ -1362,6 +1665,8 @@ def save_doc(
             total_parts=total_parts,
             completed_parts=completed_parts,
             body_complete=body_complete,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
         )
 
 
@@ -1373,12 +1678,27 @@ def record_chunk(
     total_parts: int,
     document_id: str = "",
     doc_url: str = "",
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
 ) -> dict[str, Any]:
     """Record one appended Feishu chunk under unified state lock and promote `complete` only when all locked parts finish."""
     safe_vid = validate_video_id(vid)
     with podcast_state_lock(root):
         dpath = doc_record_path(root, safe_vid)
-        existing = read_json_dict(dpath)
+        existing = read_json_dict(dpath) if dpath.exists() else {}
+        if expected_document_id is not None and not _doc_identity_matches(
+            existing,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
+            incoming_document_id=document_id,
+        ):
+            return _doc_identity_mismatch_result(
+                safe_vid,
+                existing,
+                expected_document_id=expected_document_id,
+                expected_doc_url=expected_doc_url,
+                incoming_document_id=document_id,
+            )
         if not existing and not doc_url and not document_id:
             raise FileNotFoundError(f"缺少 {safe_vid}.doc.json，需先 save_doc 登记 document_id/doc_url")
         persisted_total = _persisted_total_parts_unlocked(root, safe_vid)
@@ -1407,7 +1727,246 @@ def record_chunk(
             total_parts=n_total,
             completed_parts=merged_parts,
             body_complete=all_done,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
         )
+
+
+def mark_in_flight_write(
+    root: Path,
+    vid: str,
+    *,
+    operation: str,
+    part: int,
+    document_id: str = "",
+    doc_url: str = "",
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
+) -> dict[str, Any]:
+    """Persist an in-flight Feishu write marker before issuing a remote request."""
+    safe_vid = validate_video_id(vid)
+    with podcast_state_lock(root):
+        dpath = doc_record_path(root, safe_vid)
+        existing = read_json_dict(dpath) if dpath.exists() else {}
+        if not _doc_identity_matches(
+            existing,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
+            incoming_document_id=document_id,
+        ):
+            return _doc_identity_mismatch_result(
+                safe_vid,
+                existing,
+                expected_document_id=expected_document_id,
+                expected_doc_url=expected_doc_url,
+                incoming_document_id=document_id,
+            )
+        now = datetime.now(HK_TZ).isoformat()
+        inflight = {
+            "operation": str(operation or "write").strip(),
+            "part": int(part),
+            "document_id": str(document_id or existing.get("document_id") or "").strip(),
+            "doc_url": str(doc_url or existing.get("doc_url") or "").strip(),
+            "started_at": now,
+        }
+        rec: dict[str, Any] = (
+            dict(existing)
+            if existing
+            else {
+                "video_id": safe_vid,
+                "document_id": "",
+                "doc_url": "",
+                "zh_title": "",
+                "body_status": "",
+                "total_parts": None,
+                "completed_parts": [],
+                "next_part": None,
+            }
+        )
+        rec["video_id"] = safe_vid
+        rec["in_flight_write"] = inflight
+        rec["updated_at"] = now
+        atomic_write_json(dpath, rec)
+        return {"ok": True, "video_id": safe_vid, "in_flight_write": inflight}
+
+
+def clear_in_flight_write(
+    root: Path,
+    vid: str,
+    *,
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
+) -> dict[str, Any]:
+    """Clear the `in_flight_write` marker after a deterministic Feishu outcome."""
+    safe_vid = validate_video_id(vid)
+    with podcast_state_lock(root):
+        dpath = doc_record_path(root, safe_vid)
+        if not dpath.exists():
+            return {"ok": True, "video_id": safe_vid, "cleared": False}
+        existing = read_json_dict(dpath)
+        if not _doc_identity_matches(
+            existing,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
+        ):
+            return _doc_identity_mismatch_result(
+                safe_vid,
+                existing,
+                expected_document_id=expected_document_id,
+                expected_doc_url=expected_doc_url,
+            )
+        if "in_flight_write" not in existing:
+            return {"ok": True, "video_id": safe_vid, "cleared": False}
+        rec = dict(existing)
+        rec.pop("in_flight_write", None)
+        has_meaningful_state = bool(
+            str(rec.get("document_id") or "").strip()
+            or str(rec.get("doc_url") or "").strip()
+            or rec.get("abandoned_documents")
+            or rec.get("published_at")
+            or rec.get("completed_parts")
+        )
+        if not has_meaningful_state:
+            dpath.unlink(missing_ok=True)
+        else:
+            rec["updated_at"] = datetime.now(HK_TZ).isoformat()
+            atomic_write_json(dpath, rec)
+        return {"ok": True, "video_id": safe_vid, "cleared": True}
+
+
+def _abandon_uncertain_doc_unlocked(
+    root: Path,
+    safe_vid: str,
+    *,
+    document_id: str = "",
+    doc_url: str = "",
+    reason: str = "",
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
+) -> dict[str, Any]:
+    dpath = doc_record_path(root, safe_vid)
+    existing = read_json_dict(dpath) if dpath.exists() else {}
+    if not _doc_identity_matches(
+        existing,
+        expected_document_id=expected_document_id,
+        expected_doc_url=expected_doc_url,
+        incoming_document_id=document_id,
+    ):
+        return _doc_identity_mismatch_result(
+            safe_vid,
+            existing,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
+            incoming_document_id=document_id,
+        )
+    prior_abandoned = [
+        dict(entry)
+        for entry in (existing.get("abandoned_documents") or [])
+        if isinstance(entry, dict)
+    ]
+    clean_doc_id = str(document_id or existing.get("document_id") or "").strip()
+    clean_doc_url = str(doc_url or existing.get("doc_url") or "").strip()
+    clean_reason = str(reason or "uncertain_write").strip()[:500]
+    now = datetime.now(HK_TZ).isoformat()
+    abandoned_entry = {
+        "document_id": clean_doc_id,
+        "doc_url": clean_doc_url,
+        "reason": clean_reason,
+        "at": now,
+    }
+    abandoned_docs = [*prior_abandoned, abandoned_entry]
+    stopped = len(abandoned_docs) >= 2
+    code = "doc_uncertain_twice" if stopped else "doc_abandoned_uncertain"
+
+    rec: dict[str, Any] = {
+        "video_id": safe_vid,
+        "document_id": "",
+        "doc_url": "",
+        "zh_title": "",
+        "body_status": "",
+        "total_parts": None,
+        "completed_parts": [],
+        "next_part": None,
+        "abandoned_documents": abandoned_docs,
+        "updated_at": now,
+    }
+    atomic_write_json(dpath, rec)
+    return {
+        "ok": False,
+        "video_id": safe_vid,
+        "code": code,
+        "error": code,
+        "stopped": stopped,
+        "abandoned_count": len(abandoned_docs),
+        "abandoned_document": abandoned_entry,
+        "abandoned_documents": abandoned_docs,
+    }
+
+
+def abandon_uncertain_doc(
+    root: Path,
+    vid: str,
+    *,
+    document_id: str = "",
+    doc_url: str = "",
+    reason: str = "",
+    expected_document_id: str | None = None,
+    expected_doc_url: str | None = None,
+) -> dict[str, Any]:
+    """Mark an uncertain Feishu document as abandoned and clear active doc progress.
+
+    At most one rebuild is allowed per episode; the second uncertain outcome sets
+    `code='doc_uncertain_twice'` and `stopped=True`.
+    """
+    safe_vid = validate_video_id(vid)
+    with podcast_state_lock(root):
+        return _abandon_uncertain_doc_unlocked(
+            root,
+            safe_vid,
+            document_id=document_id,
+            doc_url=doc_url,
+            reason=reason,
+            expected_document_id=expected_document_id,
+            expected_doc_url=expected_doc_url,
+        )
+
+
+def resolve_in_flight_write(root: Path, vid: str) -> dict[str, Any]:
+    """Abandon any lingering `in_flight_write` left by an interrupted publish run."""
+    safe_vid = validate_video_id(vid)
+    with podcast_state_lock(root):
+        dpath = doc_record_path(root, safe_vid)
+        if not dpath.exists():
+            return {"ok": True, "video_id": safe_vid, "had_in_flight": False}
+        existing = read_json_dict(dpath)
+        inflight = existing.get("in_flight_write")
+        if not isinstance(inflight, dict) or not inflight:
+            return {"ok": True, "video_id": safe_vid, "had_in_flight": False}
+        inf_op = str(inflight.get("operation") or "write").strip()
+        inf_part = inflight.get("part")
+        inf_doc_id = str(inflight.get("document_id") or existing.get("document_id") or "").strip()
+        inf_doc_url = str(inflight.get("doc_url") or existing.get("doc_url") or "").strip()
+        reason = (
+            f"interrupted_in_flight:{inf_op}:part_{inf_part}"
+            if inf_part is not None
+            else f"interrupted_in_flight:{inf_op}"
+        )
+        abandoned = _abandon_uncertain_doc_unlocked(
+            root,
+            safe_vid,
+            document_id=inf_doc_id,
+            doc_url=inf_doc_url,
+            reason=reason,
+            expected_document_id=str(existing.get("document_id") or "").strip(),
+            expected_doc_url=str(existing.get("doc_url") or "").strip(),
+        )
+        return {
+            "ok": True,
+            "video_id": safe_vid,
+            "had_in_flight": True,
+            "in_flight_write": inflight,
+            "abandoned": abandoned,
+        }
 
 
 def record_failure(root: Path, vid: str, error: str) -> dict[str, Any]:

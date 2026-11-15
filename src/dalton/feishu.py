@@ -18,6 +18,38 @@ logger = logging.getLogger(__name__)
 
 FEISHU_HTTP_TIMEOUT_S = 45.0
 
+# Errors that occur after a connection was established and the request may have
+# been transmitted/processed by the bridge (contrast with ConnectError/ConnectTimeout).
+_POST_SEND_HTTP_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.DecodingError,
+    httpx.CloseError,
+)
+
+_UNCERTAIN_BRIDGE_ERRORS: frozenset[str] = frozenset(
+    {
+        "feishu_network_error",
+        "feishu_invalid_response",
+        "feishu_empty_error_response",
+        "invalid_json",
+    }
+)
+
+
+def is_uncertain_bridge_error(error_code: str | None, outcome: str | None = None) -> bool:
+    """Return whether a bridge failure leaves commit state unknown rather than definitely unwritten."""
+    norm_outcome = str(outcome or "").strip().lower()
+    if norm_outcome == "unknown":
+        return True
+    if norm_outcome:
+        return False
+    code = str(error_code or "").strip()
+    return code in _UNCERTAIN_BRIDGE_ERRORS or code.startswith(("feishu_http_5", "http_5"))
+
 FEISHU_ROUTES = frozenset(
     {
         "doc/read",
@@ -91,7 +123,10 @@ async def post_bridge_feishu(route: str, body: dict[str, Any]) -> dict[str, Any]
             resp = await client.post(f"{base_url}/feishu/{route}", json=body, headers=headers)
     except httpx.HTTPError as exc:
         logger.warning("Feishu bridge call %s failed: %s", route, type(exc).__name__)
-        raise FeishuBridgeError("bridge_unreachable", type(exc).__name__) from exc
+        err_payload: dict[str, Any] = {}
+        if isinstance(exc, _POST_SEND_HTTP_ERRORS):
+            err_payload["outcome"] = "unknown"
+        raise FeishuBridgeError("bridge_unreachable", type(exc).__name__, payload=err_payload) from exc
     if resp.status_code == 401:
         raise FeishuBridgeError("bridge_unauthorized", "bridge rejected the admin token")
     if not resp.is_success:
@@ -103,16 +138,24 @@ async def post_bridge_feishu(route: str, body: dict[str, Any]) -> dict[str, Any]
         except ValueError:
             error_body = {}
         if isinstance(error_body, dict) and str(error_body.get("error") or "").strip():
+            err_code = str(error_body["error"]).strip()
+            err_payload = dict(error_body)
+            if (
+                not str(err_payload.get("outcome") or "").strip()
+                and is_uncertain_bridge_error(err_code)
+            ):
+                err_payload["outcome"] = "unknown"
             raise FeishuBridgeError(
-                str(error_body["error"]),
+                err_code,
                 str(error_body.get("message") or "")[:200],
-                payload=error_body,
+                payload=err_payload,
             )
-        raise FeishuBridgeError(f"http_{resp.status_code}")
+        unknown_payload = {"outcome": "unknown"} if resp.status_code >= 500 else {}
+        raise FeishuBridgeError(f"http_{resp.status_code}", payload=unknown_payload)
     try:
         data = resp.json() if resp.content else {}
     except ValueError as exc:
-        raise FeishuBridgeError("invalid_json") from exc
+        raise FeishuBridgeError("invalid_json", payload={"outcome": "unknown"}) from exc
     if not isinstance(data, dict):
-        raise FeishuBridgeError("invalid_json")
+        raise FeishuBridgeError("invalid_json", payload={"outcome": "unknown"})
     return data

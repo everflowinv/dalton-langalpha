@@ -16174,6 +16174,12 @@ class ResearchDataBridge:
         except (TypeError, ValueError):
             max_chars = FEISHU_DEFAULT_CONTENT_CHARS
         max_chars = max(1000, min(max_chars, FEISHU_MAX_CONTENT_CHARS))
+        # DALTON-HOOK(feishu-docs): paginated doc/read offset support
+        try:
+            raw_offset = int(body.get("offset") or 0)
+        except (TypeError, ValueError):
+            raw_offset = 0
+        offset = max(0, raw_offset)
 
         def _read(client: FeishuClient) -> dict[str, Any]:
             if pre_resolved:
@@ -16182,13 +16188,19 @@ class ResearchDataBridge:
                 document_id, node = resolve_feishu_document(client, kind, token)
             document = client.get_document(document_id)
             content = client.raw_content(document_id)
-            truncated = len(content) > max_chars
+            total_chars = len(content)
+            segment = content[offset : offset + max_chars]
+            end_offset = offset + len(segment)
+            truncated = end_offset < total_chars
+            next_offset = end_offset if truncated else None
             payload: dict[str, Any] = {
                 "ok": True,
                 "document_id": document_id,
                 "title": str(document.get("title") or node.get("title") or ""),
-                "content": content[:max_chars] if truncated else content,
-                "total_chars": len(content),
+                "content": segment,
+                "offset": offset,
+                "total_chars": total_chars,
+                "next_offset": next_offset,
                 "truncated": truncated,
             }
             if node:

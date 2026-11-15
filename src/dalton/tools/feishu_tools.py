@@ -20,7 +20,12 @@ from langchain_core.tools import BaseTool, tool
 
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.database.feishu import get_read_scope_space_ids, list_read_scopes
-from src.dalton.feishu import FeishuBridgeError, describe_feishu_error, post_bridge_feishu
+from src.dalton.feishu import (
+    FeishuBridgeError,
+    describe_feishu_error,
+    is_uncertain_bridge_error,
+    post_bridge_feishu,
+)
 from src.dalton.settings import get_dalton_invite_email_domain
 from src.dalton.tools.conversation_tools import _extract_caller_identity
 
@@ -75,8 +80,11 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
     try:
         return await post_bridge_feishu(route, body)
     except FeishuBridgeError as exc:
-        if exc.error_code == "content_insert_failed" and exc.payload.get("url"):
-            url = str(exc.payload["url"])
+        if exc.error_code == "content_insert_failed" and (
+            exc.payload.get("url") or (route == "doc/create" and exc.payload.get("document_id"))
+        ):
+            url = str(exc.payload.get("url") or "")
+            doc_id = str(exc.payload.get("document_id") or "")
             detail = str(exc.payload.get("detail") or "").strip()
             if route == "doc/append":
                 lead = (
@@ -90,14 +98,21 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
                     else f"{lead}，文档地址：{url}"
                 )
             else:
-                msg = f"文档已创建但正文没写进去，请到 {url} 手动处理。"
+                msg = (
+                    f"文档已创建但正文没写进去，请到 {url} 手动处理。"
+                    if url
+                    else f"文档已创建但正文没写进去（document_id={doc_id}）。"
+                )
             err_payload: dict[str, Any] = {
                 "ok": False,
                 "error": "content_insert_failed",
                 "message": msg,
-                "document_id": str(exc.payload.get("document_id") or ""),
+                "document_id": doc_id,
                 "url": url,
             }
+            outcome = str(exc.payload.get("outcome") or "").strip()
+            if outcome:
+                err_payload["outcome"] = outcome
             if detail:
                 err_payload["detail"] = detail
             return _dump(err_payload)
@@ -110,14 +125,23 @@ async def _bridge(route: str, body: dict[str, Any]) -> dict[str, Any] | str:
                     "document_id": str(exc.payload.get("document_id") or ""),
                     "images": exc.payload.get("images") or {},
                     **({"url": exc.payload["url"]} if exc.payload.get("url") else {}),
+                    **({"node_token": exc.payload["node_token"]} if exc.payload.get("node_token") else {}),
                 }
             )
         bridge_message = str(exc.payload.get("message") or "").strip()
         described = describe_feishu_error(exc.error_code)
+        extra_fields: dict[str, Any] = {}
+        if exc.payload.get("detail"):
+            extra_fields["detail"] = str(exc.payload.get("detail") or "")
+        outcome = str(exc.payload.get("outcome") or "").strip()
+        if not outcome and is_uncertain_bridge_error(exc.error_code):
+            outcome = "unknown"
+        if outcome:
+            extra_fields["outcome"] = outcome
         return _error_payload(
             bridge_message or described,
             error=exc.error_code,
-            **({"detail": str(exc.payload.get("detail") or "")} if exc.payload.get("detail") else {}),
+            **extra_fields,
         )
 
 
@@ -196,6 +220,8 @@ def _image_bind_failed_payload(res: dict[str, Any]) -> str:
     }
     if res.get("url"):
         payload["url"] = str(res["url"])
+    if res.get("node_token"):
+        payload["node_token"] = str(res["node_token"])
     return _dump(payload)
 
 
@@ -250,6 +276,132 @@ def _grant_email_for(email: str) -> str:
     return email
 
 
+def _normalize_bridge_write_failure(res: dict[str, Any] | str) -> dict[str, Any]:
+    """Convert a failed `_bridge` result for `doc/create` or `doc/append` into a dict."""
+    if isinstance(res, str):
+        return json.loads(res)
+    if not isinstance(res, dict):
+        return {"ok": False, "error": "bridge_error", "message": describe_feishu_error("bridge_error")}
+    if str(res.get("error") or "") == "image_bind_failed":
+        return json.loads(_image_bind_failed_payload(res))
+    err_code = str(res.get("error") or "bridge_error")
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": err_code,
+        "message": str(res.get("message") or "").strip() or describe_feishu_error(err_code),
+    }
+    for key in ("document_id", "url", "detail", "outcome"):
+        if res.get(key) is not None:
+            payload[key] = res[key]
+    if not str(payload.get("outcome") or "").strip() and is_uncertain_bridge_error(err_code):
+        payload["outcome"] = "unknown"
+    return payload
+
+
+async def create_feishu_doc_on_server(
+    *,
+    user_id: str,
+    title: str,
+    markdown: str,
+    space_id: Optional[str] = None,
+    parent_node_token: Optional[str] = None,
+    folder_token: Optional[str] = None,
+    filesystem_backend: Any = None,
+    tier: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create a Feishu doc via the host bridge, returning the structured response dict."""
+    image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
+    if image_err is not None:
+        return {"ok": False, "error": "image_read_failed", "message": image_err}
+    body: dict[str, Any] = {"title": title, "markdown": markdown}
+    if image_files:
+        body["image_files"] = image_files
+    if space_id:
+        body["space_id"] = space_id
+    if parent_node_token:
+        body["parent_node_token"] = parent_node_token
+    if folder_token:
+        body["folder_token"] = folder_token
+    grant_email = _grant_email_for(await _caller_email(user_id))
+    if grant_email:
+        body["grant_email"] = grant_email
+    res = await _bridge("doc/create", body)
+    if _bridge_failed(res):
+        return _normalize_bridge_write_failure(res)
+    assert isinstance(res, dict)
+    payload: dict[str, Any] = {"ok": True}
+    if tier is not None:
+        payload["tier"] = tier
+    payload.update({k: v for k, v in res.items() if k != "ok"})
+    if payload.get("warning"):
+        payload["message"] = "文档已创建，但部分自动分享失败（详见 warning），请手动分享。"
+    return payload
+
+
+async def append_feishu_doc_on_server(
+    *,
+    token: str,
+    markdown: str,
+    filesystem_backend: Any = None,
+    tier: Optional[str] = None,
+) -> dict[str, Any]:
+    """Append markdown to an existing Feishu doc via the host bridge, returning a dict."""
+    image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
+    if image_err is not None:
+        return {"ok": False, "error": "image_read_failed", "message": image_err}
+    append_body: dict[str, Any] = {"token": token, "markdown": markdown}
+    if image_files:
+        append_body["image_files"] = image_files
+    res = await _bridge("doc/append", append_body)
+    if _bridge_failed(res):
+        return _normalize_bridge_write_failure(res)
+    assert isinstance(res, dict)
+    payload: dict[str, Any] = {"ok": True}
+    if tier is not None:
+        payload["tier"] = tier
+    payload.update({k: v for k, v in res.items() if k != "ok"})
+    return payload
+
+
+async def read_feishu_doc_on_server(
+    *,
+    token: str,
+    max_chars: int = DEFAULT_READ_CHARS,
+    offset: int = 0,
+    resolved_document_id: Optional[str] = None,
+    tier: Optional[str] = None,
+    extra_meta: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Read a Feishu doc (optionally paginated by `offset`) via the host bridge, returning a structured dict."""
+    budget = max(1000, min(int(max_chars or DEFAULT_READ_CHARS), MAX_READ_CHARS))
+    start_offset = max(0, int(offset or 0))
+    body: dict[str, Any] = {"token": token, "max_chars": budget}
+    if start_offset > 0:
+        body["offset"] = start_offset
+    if resolved_document_id:
+        body["document_id"] = resolved_document_id
+    res = await _bridge("doc/read", body)
+    if _bridge_failed(res):
+        if isinstance(res, str):
+            return json.loads(res)
+        if isinstance(res, dict):
+            err_code = str(res.get("error") or "bridge_error")
+            return {"ok": False, "error": err_code, "message": describe_feishu_error(err_code)}
+        return {"ok": False, "error": "bridge_error", "message": describe_feishu_error("bridge_error")}
+    assert isinstance(res, dict)
+    payload: dict[str, Any] = {"ok": True}
+    if tier is not None:
+        payload["tier"] = tier
+    payload.update({k: v for k, v in res.items() if k != "ok"})
+    if extra_meta:
+        for key, value in extra_meta.items():
+            if key not in payload:
+                payload[key] = value
+    if payload.get("truncated"):
+        payload["note"] = f"内容超过 {budget} 字被截断（全文 {payload.get('total_chars')} 字），需要更多时提高 max_chars 重读。"
+    return payload
+
+
 def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     """Build `[feishu_read, feishu_list_wiki, feishu_create_doc, feishu_append,
     feishu_grant_access]` for both roles.
@@ -280,31 +432,29 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         if err is not None:
             return err
         tier = await get_user_tier(user_id)
-        body: dict[str, Any] = {"token": token, "max_chars": max_chars}
-        check_node: dict[str, Any] = {}
+        resolved_id: Optional[str] = None
+        extra_meta: dict[str, Any] = {}
         if tier == "external":
             denial, check_node = await _external_read_allowed(token)
             if denial is not None:
                 return denial
             # Reuse the permission check's resolution: the read must act on
             # the same document the whitelist verdict was made for.
-            resolved_id = str(check_node.get("obj_token") or "").strip()
-            if resolved_id:
-                body["document_id"] = resolved_id
-        max_chars = max(1000, min(int(max_chars or DEFAULT_READ_CHARS), MAX_READ_CHARS))
-        body["max_chars"] = max_chars
-        res = await _bridge("doc/read", body)
-        if _bridge_failed(res):
-            if isinstance(res, dict):
-                return _error_payload(describe_feishu_error(str(res.get("error") or "bridge_error")), error=str(res.get("error") or "bridge_error"))
-            return res
-        payload = {"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}}
-        if check_node and "space_id" not in payload:
-            payload["space_id"] = str(check_node.get("space_id") or "")
-            payload["node_token"] = str(check_node.get("node_token") or "")
-        if payload.get("truncated"):
-            payload["note"] = f"内容超过 {max_chars} 字被截断（全文 {payload.get('total_chars')} 字），需要更多时提高 max_chars 重读。"
-        return _dump(payload)
+            resolved_id = str(check_node.get("obj_token") or "").strip() or None
+            if check_node:
+                extra_meta = {
+                    "space_id": str(check_node.get("space_id") or ""),
+                    "node_token": str(check_node.get("node_token") or ""),
+                }
+        return _dump(
+            await read_feishu_doc_on_server(
+                token=token,
+                max_chars=max_chars,
+                resolved_document_id=resolved_id,
+                tier=tier,
+                extra_meta=extra_meta or None,
+            )
+        )
 
     @tool("feishu_list_wiki")
     async def _feishu_list_wiki(
@@ -399,31 +549,16 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
-        image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
-        if image_err is not None:
-            return _error_payload(image_err, error="image_read_failed")
-        body: dict[str, Any] = {"title": title, "markdown": markdown}
-        if image_files:
-            body["image_files"] = image_files
-        if space_id:
-            body["space_id"] = space_id
-        if parent_node_token:
-            body["parent_node_token"] = parent_node_token
-        if folder_token:
-            body["folder_token"] = folder_token
-        grant_email = _grant_email_for(await _caller_email(user_id))
-        if grant_email:
-            body["grant_email"] = grant_email
-        res = await _bridge("doc/create", body)
-        if _bridge_failed(res):
-            if isinstance(res, dict):
-                if str(res.get("error") or "") == "image_bind_failed":
-                    return _image_bind_failed_payload(res)
-                return _error_payload(describe_feishu_error(str(res.get("error") or "bridge_error")), error=str(res.get("error") or "bridge_error"))
-            return res
-        payload = {"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}}
-        if payload.get("warning"):
-            payload["message"] = "文档已创建，但部分自动分享失败（详见 warning），请手动分享。"
+        payload = await create_feishu_doc_on_server(
+            user_id=user_id,
+            title=title,
+            markdown=markdown,
+            space_id=space_id,
+            parent_node_token=parent_node_token,
+            folder_token=folder_token,
+            filesystem_backend=filesystem_backend,
+            tier=tier,
+        )
         return _dump(payload)
 
     @tool("feishu_append")
@@ -449,20 +584,13 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
-        image_files, image_err = await _collect_markdown_image_files(markdown, filesystem_backend)
-        if image_err is not None:
-            return _error_payload(image_err, error="image_read_failed")
-        append_body: dict[str, Any] = {"token": token, "markdown": markdown}
-        if image_files:
-            append_body["image_files"] = image_files
-        res = await _bridge("doc/append", append_body)
-        if _bridge_failed(res):
-            if isinstance(res, dict):
-                if str(res.get("error") or "") == "image_bind_failed":
-                    return _image_bind_failed_payload(res)
-                return _error_payload(describe_feishu_error(str(res.get("error") or "bridge_error")), error=str(res.get("error") or "bridge_error"))
-            return res
-        return _dump({"ok": True, "tier": tier, **{k: v for k, v in res.items() if k != "ok"}})
+        payload = await append_feishu_doc_on_server(
+            token=token,
+            markdown=markdown,
+            filesystem_backend=filesystem_backend,
+            tier=tier,
+        )
+        return _dump(payload)
 
     @tool("feishu_grant_access")
     async def _feishu_grant_access(

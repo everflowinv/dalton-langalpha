@@ -31,21 +31,25 @@ python3 .agents/skills/dalton-podcast-weekly/scripts/podcast_publish.py status -
 
 ## 2. 每期二次校对并写内容提要
 
-对 `ready` 中的每一期执行二次校对与内容提要撰写。
+对 `ready`（待校对发布）中的每一期执行二次校对与内容提要撰写（`incomplete_docs` 直接进入第 3 步续传，无需再校对）。
 
-- **拉取宿主机产物到本地沙箱临时工作区**：主任务先调用 `podcast_weekly_read(action="read_artifact", video_id="<video_id>", artifact="zh", offset=0, max_chars=16000)`（依次拉取 `notes`、`zh`、`en`、`merged`；若 `has_more == true` 按 `next_offset` 续读），写入沙箱临时目录 `.work/podcast-weekly/<video_id>/` 后再交给子代理处理。禁止未先拉取就直接假定沙箱本地已有宿主机产物。
-- **子代理派发规则**：每期派发 1 个 `general-purpose` 子代理（继承当前运行模型，省略 `model` 参数），同时最多运行 2 个子代理。派发指令中明确要求：
-  1. 只修改沙箱内本期 `.work/podcast-weekly/<video_id>/` 下的 `.zh.md`、`.en.md`、`.notes.json` 并新建 `.summary.md`，禁止修改其余期次或台账，禁止再派嵌套子代理；
-  2. 原文附上本技能末尾的「撰写硬规则」；
-  3. 完成后仅返回本期中文标题、3 至 5 条核心看点、输出文件路径及仍留待核对的事项；
-  4. 遇到证据不足以推翻原判的数字、专名或说话人疑点时，保留原文并在校正说明标注「待核」，无需额外派发模型复核争议片段。
+- **将宿主机产物放入沙箱**：主任务每期调用一次：
+  ```text
+  podcast_weekly_read(action="stage", video_id="<video_id>")
+  ```
+  服务端会把该期 `notes`、`zh`、`en`、`merged` 四份宿主机产物写入当前沙箱 `.work/podcast-weekly/<video_id>/`（文件名保留宿主机原名 `<日期>-<video_id>.*`），只返回沙箱相对路径、字节数与 `sha256`（文件校验值），不把正文读入主对话。若返回 `ok: false`（如缺失宿主机文件），**跳过该期**（不进入校对与发布，也不写入周报汇总正文），在本次最终回复写明报错与缺失文件。
+- **子代理派发规则**：每期派发 1 个 `general-purpose`（通用型）子代理（继承当前运行模型，省略 `model` 参数），同时最多运行 2 个子代理。派发指令须写明 `.work/podcast-weekly/<video_id>/` 路径及文件名前缀，并明确要求：
+  1. 仅读写沙箱内本期 `.work/podcast-weekly/<video_id>/` 下的 `.zh.md`、`.en.md`、`.notes.json`，并新建同前缀 `.summary.md`（例如 `<日期>-<video_id>.summary.md`）；禁止改动其余期次文件或状态文件，禁止再派发下级子代理；
+  2. 将本技能末尾的「撰写硬规则」原文附入子代理指令；
+  3. 完成后仅向主任务返回本期中文标题、3 至 5 条核心看点、输出文件路径及仍待核对事项（正文留在沙箱文件内）；
+  4. 遇到证据不足、无法推翻原判的数字、专有名词或说话人疑点时，保留原文并在校正说明标「待核」，无需额外调用其他模型复核争议片段。
 
-每期子任务按以下规则处理：
+每期子任务按以下规则在沙箱本地处理：
 
 1. **读 `.notes.json` 并逐条处理标记项**：
    - `amount_warnings`（金额数量级警示）：回 `.en.md` 找原句核对 billion（十亿）/ million（百万）数量级；确有译错则改 `.zh.md`，核对后清空该数组（`[]`），并将修改说明写入 `corrections`。
    - `speaker_flags`（说话人疑点标记）：仅在具备确凿证据（直呼其名、自报身份、前后问答严丝合缝）时才调整说话人，在 `.zh.md` 与 `.en.md` 同一位置插入 `**姓名** [时间]` 拆分段落，并把该条改写为 `时间 说话人校正：哪句从谁改给谁（依据）`；证据不足时保留原判，将条目改写为 `未改，引用前回看视频`。
-   - `short_blocks`（过短段落标记）：校订稿词数明显少于逐字稿的段落，对照已拉取的 `.merged.md` 补齐漏句。
+   - `short_blocks`（过短段落标记）：词数明显少于 `.merged.md` 合并逐字稿的段落，对照 `.merged.md` 补齐漏句。
    - `corrections`（校正记录）中的「待核」及 `unclear`（听不清片段）：保留说话人原话，数字、公司名、人名即使疑似口误也只写进校正说明并标「待核」，保持原文与发言；`unclear` 处留白，不猜测补写。
 2. **通读 `.zh.md`**：修正翻译腔、漏译与人名/公司名拼写不统一；数字、说话人、时间戳仅在对照 `.en.md` 确证错误后改动。
 3. **写 `.summary.md`**：
@@ -57,32 +61,35 @@ python3 .agents/skills/dalton-podcast-weekly/scripts/podcast_publish.py status -
    - 最后一组固定为 `**投资看点**`：点明涉及的公司、资产类别与核心判断变化；嘉宾单方陈述写明「嘉宾自述，未独立核实」；主持人与嘉宾存在利益关联时一并标出。
    - 用词规范：优先使用「是、会、要、做、查」，删去「呈现、体现、围绕、赋能」等空话；同一对象全篇保持同一称呼；首次出现的专业术语附一句简明解释；正文只使用 `- ` 列表与 `**加粗**`，金额单位写「美元」，数字区间写「至」。
    - 交稿前逐条复读：每条脱离上下文后仍独立清晰。
-4. **回写宿主机产物**：子代理完成后，主任务依次为 `zh`、`en`、`notes` 及新建的 `summary` 调用 `podcast_weekly_write(action="write_artifact", video_id="<video_id>", artifact="summary", content="<更新后全文>")`（对其余产物分别传入 `"zh"`、`"en"`、`"notes"`），将结果写回宿主机 `research-outputs/podcast-weekly/`。
+4. **回写宿主机产物**：子代理完成后，主任务每期调用一次：
+   ```text
+   podcast_weekly_write(action="collect", video_id="<video_id>", artifacts=["zh", "en", "notes", "summary"])
+   ```
+   服务端从沙箱 `.work/podcast-weekly/<video_id>/` 读取这些文件，逐项校验后写回宿主机 `research-outputs/podcast-weekly/`，只返回各文件字节数与 `sha256` 校验值（不返回正文）。任一文件缺失或校验失败时，该文件保留未写入并在 `failed` 中给出原因，其余有效文件正常保存。
 
-校对没做完或缺失 `.summary.md` 的期次跳过发布，不写入周报汇总正文，只在本次最终回复里列出跳过原因。
+若 `collect` 未全部成功（`ok: false`）、校对未完成或缺失 `.summary.md`，**跳过该期发布**（不写入周报汇总正文），只在本次最终回复列出跳过原因。
 
-## 3. 生成文稿、创建飞书文档与断点续传
+## 3. 服务端建档飞书文档与断点续传
 
-对 `incomplete_docs`（未写完的飞书文档）与通过第 2 步校对的 `ready`（待发布）期次，按顺序调用 `podcast_weekly_read` 准备飞书文档数据：
+对 `incomplete_docs`（未写完的飞书文档）与通过第 2 步校对的 `ready`（待发布）期次，主任务按顺序每期调用一次：
 
 ```text
-podcast_weekly_read(action="prepare_doc", video_id="<video_id>")
+podcast_weekly_write(action="publish_doc", video_id="<video_id>")
 ```
 
-- 返回 `ok: false`（如 `doc_record_unreadable`、`doc_create_failed_twice`、`doc_failed_record_unreadable`、`chunks_record_unreadable`）：立即停止该期建档并保持现有状态文件原样，只在本次最终回复里说明原因，不写入周报汇总的失败段；周报汇总的失败段统一以第 3 步完成后刷新 `status` 返回的 `report_failed` 为准。
-- 返回 `already_exists: true`：直接复用返回的 `doc_url`，跳过重复建档。
-- 返回 `resume_append: true`（即已有 `document_id` 与 `doc_url`，但部分分段尚未追加完成）：禁止重新调用 `feishu_create_doc`。直接对 `remaining_chunks` 中的每一段顺序调用 `feishu_append(token="<document_id>", markdown=<chunk.content>)`，每成功追加一段立即调用：
-  `podcast_weekly_write(action="record_chunk", video_id="<video_id>", document_id="<document_id>", doc_url="<doc_url>", part=<chunk.part>, total_parts=<total_parts>)`。
-  全部 `1..total_parts` 登记完成后，后台自动将该期标为 `body_status: "complete"` 并写入 `episodes.json`。
-- 返回 `create: true`：
-  1. 提取输出的 `title`、`folder_token`（对应 `references/channels.json` 中配置的飞书目标文件夹）、`zh_title`、`total_parts` 以及 `chunks`。
-  2. 调用 `feishu_create_doc(title=<title>, folder_token=<folder_token>, markdown=<chunks[0].content>)` 创建飞书文档。
-  3. **只要返回值包含 `document_id` 或 `url`——包括建档后正文写入报错 `error: "content_insert_failed"` 的情况**——立即登记文档 ID 与链接：
-     - 若首段已随建档成功写入：按 `prepare_doc` 返回的 `total_parts` 与 `chunks[0].part` 调用 `podcast_weekly_write(action="save_doc", video_id="<video_id>", document_id="<document_id>", doc_url="<url>", zh_title="<zh_title>", part=<chunks[0].part>, total_parts=<total_parts>, body_complete=<true_if_total_parts_eq_1_else_false>)`；当 `total_parts` 大于 1 时传 `body_complete=false`，并对后续每个 `chunk` 顺序调用 `feishu_append(token="<document_id>", markdown=<chunk.content>)` 并登记 `podcast_weekly_write(action="record_chunk", video_id="<video_id>", document_id="<document_id>", doc_url="<doc_url>", part=<chunk.part>, total_parts=<total_parts>)`。
-     - 若返回 `content_insert_failed`（文档已建成但首段正文未写入）：调用 `podcast_weekly_write(action="save_doc", video_id="<video_id>", document_id="<document_id>", doc_url="<url>", zh_title="<zh_title>", part=0, total_parts=<total_parts>, body_complete=false)` 立即保留 `document_id` 与 `doc_url`，禁止再次调用 `feishu_create_doc`，改为对所有 `chunk` 顺序调用 `feishu_append(token="<document_id>", markdown=<chunk.content>)` 并登记 `podcast_weekly_write(action="record_chunk", video_id="<video_id>", document_id="<document_id>", doc_url="<doc_url>", part=<chunk.part>, total_parts=<total_parts>)` 补完全部正文。
-  4. 仅当 `feishu_create_doc` 既失败又未返回任何 `document_id`/`url` 时，调用 `podcast_weekly_write(action="record_failure", video_id="<video_id>", error="<报错>")` 记录失败；同一期累计失败 2 次后停止建档，待刷新 `status` 进入 `report_failed` 后写入周报汇总的失败段（单次失败仍跳过本次建档，只在本次最终回复列出原因）。
+服务端直接从宿主机产物切分正文分块，按 `references/channels.json` 目标文件夹建档，逐段追加剩余分块并登记完成状态（正文不进入主对话）；同时自动跳过已完整建档的期次，并对未写完的文档续传剩余分块：
+
+- **返回 `already_exists: true`**：该期已存在完整飞书文档，直接复用返回的 `doc_url`，跳过重复建档。
+- **返回 `ok: true`**：建档与全部正文分块（含续传剩余分块）均已完成，记录返回的 `doc_url` 与 `document_id`。若返回带有 `warning`（警告提示，如自动分享失败或图片绑定失败 `image_bind_failed`），**不得重发正文**，并在**最终回复**里转人工处理（说明需人工开通文档权限，或附上 `warning` 中列出的失败图片提示人工补图）。
+- **返回 `code: "doc_abandoned_uncertain"`**：某个分块（含建档首段）写入结果不确定，服务端已将该文档标为作废并清空当前文档进度。**跳过该期**（不写入周报汇总正文），下次运行会自动重建文档；在本次最终回复说明该期已作废跳过（若返回带有 `warning` 或作废文档链接，一并列出）。
+- **返回 `code: "doc_uncertain_twice"`**：该期已连续 2 次写入结果不确定并作废，服务端已停止自动重建（刷新 `status` 后会进入 `report_failed`，按第 4 步写入周报汇总的失败段）；在**最终回复**里完整列出 `abandoned_documents` 中的作废文档链接，转人工核对。
+- **返回其他 `ok: false`**：按具体情况停止或跳过该期，**不要自行写入周报汇总的失败段**（失败段统一以第 3 步完成后刷新 `status` 返回的 `report_failed` 为准）：
+  - `publish_in_progress`：该期当前正在写入飞书文档。**跳过该期**（本次不重试），在最终回复说明原因。
+  - `doc_record_unreadable`、`doc_failed_record_unreadable`、`chunks_record_unreadable`：状态文件损坏或不可读。立即停止该期并保持现有状态文件原样，**跳过该期并在最终回复写明报错，转人工排查**。
+  - `doc_create_failed_twice`（无 `document_id` 的建档确定失败累计 2 次，`stopped: true`）：服务端已停止自动建档（刷新 `status` 后会进入 `report_failed`），在最终回复说明原因并转人工排查。
+  - 单次建档或追加确定失败（`stopped: false`）：立即停止该期并保持现有状态文件原样，**跳过该期**（若已建档成功，服务端会保留 `document_id` 以便下次续传剩余分块；若返回同时带有 `warning` 提示前面分块发生过 `image_bind_failed`，已写入飞书的分块无需重发，在最终回复提示人工补图）。
 - **读回抽查**：全部建档完成后，抽取至少 1 篇用 `feishu_read` 读回文档正文，确认「内容提要」「中文全文」「校正说明」「英文校订稿」四个部分完整存在。
-- **刷新状态并进入第 4 步**：第 3 步可建档的期次全部处理完成后（跳过的期次按规则记录原因），提交周报汇总前**必须重新调用一次** `podcast_weekly_read(action="status", pending_only=false)`。若存在跳过或未完成的期次而使 `next_action` 仍为 `publish`，**禁止退回第 2 步**，只按刷新后的 `report_success` 与 `report_failed` 直接推进第 4 步汇报已完成部分（跳过与未完成的期次会在下次运行时再进入 `to_publish`）；若刷新后 `report_success` 与 `report_failed` 均为空，只回复说明本次各期跳过原因并结束。
+- **刷新状态并进入第 4 步**：所有待建档期次处理完成后（跳过期次只记录原因），提交周报汇总前**必须重新调用一次** `podcast_weekly_read(action="status", pending_only=false)`。即使因存在跳过或未完成期次导致 `next_action` 仍为 `publish`，也**禁止退回第 2 步**，直接按刷新后的 `report_success` 与 `report_failed` 推进第 4 步汇报已完成部分（跳过与未完成期次留待下次运行再进入 `to_publish`）；若刷新后 `report_success` 与 `report_failed` 均为空，则只回复说明本次各期跳过原因并结束本次运行。
 
 ## 4. 提交周报汇总（`automation_report`）并完成已报告登记
 
