@@ -93,6 +93,7 @@ REPORT_PROFILES = frozenset(
         "tmeet-weekly-minutes",
         "ai-app-weekly",
         "richard-earnings",
+        "richard-coverage-weekly",
         "wiki-auto-ingest",
         "podcast-weekly",
     }

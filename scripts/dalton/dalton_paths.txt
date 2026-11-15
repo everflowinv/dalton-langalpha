@@ -397,6 +397,10 @@ plugins/dalton/skills/dalton-richard-earnings/
 tests/unit/dalton/test_agentturn_richard_earnings.py
 tests/unit/dalton/test_researchdata_bridge_gcal.py
 
+# OC-5 Richard coverage weekly.
+plugins/dalton/skills/dalton-richard-coverage-weekly/
+tests/unit/dalton/test_richard_coverage_weekly.py
+
 # OC-1 Discord wiki auto-ingest (host discord-history route).
 plugins/dalton/skills/dalton-wiki-auto-ingest/
 tests/unit/dalton/test_agentturn_wiki_ingest.py

@@ -89,6 +89,7 @@ def test_profile_accepts_only_named_profiles() -> None:
         "tmeet-weekly-minutes",
         "ai-app-weekly",
         "richard-earnings",
+        "richard-coverage-weekly",
         "wiki-auto-ingest",
         "podcast-weekly",
     ):
@@ -120,6 +121,7 @@ def test_profile_accepts_only_named_profiles() -> None:
         "tmeet-weekly-minutes",
         "ai-app-weekly",
         "richard-earnings",
+        "richard-coverage-weekly",
         "wiki-auto-ingest",
         "podcast-weekly",
     }
