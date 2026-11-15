@@ -209,6 +209,8 @@ def task_report(payload: dict) -> "TaskReport":
     from src.server.models.chat import TaskReport
 
     task_id = payload.get("task_id")
+    # DALTON-HOOK(automation-continuation-identity): carry exact task_run_id for continuation lookup
+    task_run_id = payload.get("task_run_id")
     return TaskReport(
         kind="task",
         task_id=str(task_id),
@@ -218,6 +220,7 @@ def task_report(payload: dict) -> "TaskReport":
         # status; only completed runs were enqueued then.
         failed=payload.get("final_status") == "error",
         subagent_type=payload.get("subagent_type") or None,
+        task_run_id=str(task_run_id) if task_run_id else None,
     )
 
 
@@ -431,6 +434,19 @@ async def _on_subagent_report_back_closed(job: dict) -> None:
     ).get("thread_id")
     if thread_id:
         await publish_cleared_wake(thread_id)
+        # DALTON-HOOK(automation-continuation-identity): settle open execution when last report closes without a turn
+        if not (job.get("payload") or {}).get("dispatched_run_id"):
+            try:
+                from src.server.services.automation_settlement import (
+                    settle_thread_execution_if_idle,
+                )
+
+                await settle_thread_execution_if_idle(str(thread_id))
+            except Exception:
+                logger.debug(
+                    f"[TASK_REPORT_BACK] Idle automation settle check failed for thread {thread_id}",
+                    exc_info=True,
+                )
 
 
 def register_outbox_executors() -> None:

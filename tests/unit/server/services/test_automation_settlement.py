@@ -85,6 +85,8 @@ EXPECTED = {
     # DALTON-HOOK(precheck-outcome): zero-token preflight skip settles from
     # pending or running, no strike, no webhook, and counts as the schedule's run.
     Outcome.PRECHECK_SKIPPED: ("skipped", ("pending", "running"), None, CLOSES, None, None, None, "precheck_skipped"),
+    # DALTON-HOOK(automation-continuation-identity): hard timeout cap settles via failure webhook/finish
+    Outcome.TIMEOUT: ("timeout", _ANY, "count", REARMS, "automation.failed", None, None, "timeout"),
 }
 
 
@@ -136,6 +138,13 @@ def _settlement(row):
         db=MagicMock(
             settle_execution=AsyncMock(side_effect=_settles(row)),
             record_delivery=AsyncMock(),
+            # DALTON-HOOK(automation-continuation-identity): defaults for background/timeout checks
+            get_execution_for_settlement=create_autospec(
+                settlement_mod.exec_db.get_execution_for_settlement, return_value=None
+            ),
+            has_pending_background_work=create_autospec(
+                settlement_mod.exec_db.has_pending_background_work, return_value=False
+            ),
         ),
         fire=AsyncMock(return_value=[{"method": "slack", "success": True}]),
         finish=AsyncMock(return_value=Finish(_LANDED)),
@@ -265,6 +274,8 @@ FINISHES = {
     Outcome.FAILED_OURS: "failed",
     Outcome.INTERRUPTED: "failed",
     Outcome.STOPPED: "stopped",
+    # DALTON-HOOK(automation-continuation-identity): timeout finishes held delivery as failed
+    Outcome.TIMEOUT: "failed",
 }
 
 
@@ -1398,6 +1409,13 @@ def _sweep(run_row):
         patch(f"{_MOD}.settle", new=fx.settle),
         patch(f"{_MOD}.exec_db.get_settling_run", new=fx.get_run),
         patch(f"{_MOD}.read_run_answer", new=fx.excerpt),
+        # DALTON-HOOK(automation-continuation-identity): default no pending background work in sweep fixture
+        patch(
+            f"{_MOD}.exec_db.has_pending_background_work",
+            new=create_autospec(
+                settlement_mod.exec_db.has_pending_background_work, return_value=False
+            ),
+        ),
     ):
         yield fx
 
