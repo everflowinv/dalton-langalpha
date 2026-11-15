@@ -1183,3 +1183,54 @@ async def test_bridge_feishu_dedicated_config_never_falls_back_to_openclaw_or_ga
     err_msg = describe_feishu_error("feishu_not_configured")
     assert "FEISHU_APP_ID" in err_msg and "FEISHU_APP_SECRET" in err_msg
     assert "openclaw.json" not in err_msg
+
+
+@pytest.mark.asyncio
+async def test_doc_read_pagination_with_offset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """V1: doc/read slices by character `offset` and returns total_chars/next_offset/truncated."""
+    bridge = _make_bridge(monkeypatch, tmp_path)
+    full_text = "".join(f"P{i:06d}_" for i in range(15000))  # 120,000 chars
+    assert len(full_text) == 120000
+    _stub_feishu_client(bridge, raw_content=full_text, get_document={"title": "Long Doc"})
+
+    c1, p1 = await bridge.handle_feishu_doc_read(
+        {"token": "https://x.feishu.cn/docx/doccnLong", "max_chars": 50000, "offset": 0}
+    )
+    assert c1 == 200 and p1["ok"] is True
+    assert p1["offset"] == 0
+    assert p1["total_chars"] == 120000
+    assert p1["truncated"] is True
+    assert p1["next_offset"] == 50000
+    assert p1["content"] == full_text[:50000]
+
+    c2, p2 = await bridge.handle_feishu_doc_read(
+        {"token": "https://x.feishu.cn/docx/doccnLong", "max_chars": 50000, "offset": 50000}
+    )
+    assert c2 == 200 and p2["ok"] is True
+    assert p2["offset"] == 50000
+    assert p2["total_chars"] == 120000
+    assert p2["truncated"] is True
+    assert p2["next_offset"] == 100000
+    assert p2["content"] == full_text[50000:100000]
+
+    c3, p3 = await bridge.handle_feishu_doc_read(
+        {"token": "https://x.feishu.cn/docx/doccnLong", "max_chars": 50000, "offset": 100000}
+    )
+    assert c3 == 200 and p3["ok"] is True
+    assert p3["offset"] == 100000
+    assert p3["total_chars"] == 120000
+    assert p3["truncated"] is False
+    assert p3["next_offset"] is None
+    assert p3["content"] == full_text[100000:]
+
+    c4, p4 = await bridge.handle_feishu_doc_read(
+        {"token": "https://x.feishu.cn/docx/doccnLong", "max_chars": 50000, "offset": 150000}
+    )
+    assert c4 == 200 and p4["ok"] is True
+    assert p4["offset"] == 150000
+    assert p4["total_chars"] == 120000
+    assert p4["truncated"] is False
+    assert p4["next_offset"] is None
+    assert p4["content"] == ""

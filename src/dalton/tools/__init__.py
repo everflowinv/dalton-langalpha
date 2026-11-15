@@ -124,7 +124,7 @@ def build_dalton_tools(
                 create_podcast_weekly_tools,
             )
 
-            tools.extend(create_podcast_weekly_tools())
+            tools.extend(create_podcast_weekly_tools(filesystem_backend=filesystem_backend))
         except Exception as e:
             logger.debug("[DALTON_TOOLS] podcast_weekly_tools not loaded: %s", e)
 

@@ -11,6 +11,7 @@ import sys
 from io import StringIO
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Any
 from unittest.mock import create_autospec
 
 import pytest
@@ -663,7 +664,21 @@ def test_dalton_podcast_weekly_skill_contract_and_safety() -> None:
 
     assert "general-purpose" in body
     assert "同时最多运行 2 个" in body
-    assert "feishu_create_doc" in body
+    assert 'action="stage"' in body
+    assert 'action="collect"' in body
+    assert 'action="publish_doc"' in body
+    assert "feishu_read" in body
+    for legacy in (
+        'action="read_artifact"',
+        'action="write_artifact"',
+        'action="prepare_doc"',
+        "feishu_create_doc",
+        "feishu_append",
+        'action="record_chunk"',
+        'action="record_failure"',
+        'action="save_doc"',
+    ):
+        assert legacy not in body
     assert "automation_report" in body
     assert "播客周报｜本周 All-In 和 a16z 没有新节目" in body
     for token in (
@@ -1293,17 +1308,28 @@ def test_persisted_chunks_freeze_total_parts_and_content_on_resume(tmp_path: Pat
         res_p = store.record_chunk(data_root, "ep_chunks", part=p, total_parts=n_parts)
     assert res_p["body_status"] == "complete"
 
-    # Verify SKILL.md no longer hardcodes part=1/total_parts=1 or part=2/total_parts=2
+    # Verify SKILL.md delegates doc chunking/appending to publish_doc rather than hardcoded part=1/2 calls
     skill_text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     assert "part=2, total_parts=2" not in skill_text
     assert "part=1, total_parts=1" not in skill_text
-    assert "total_parts=<total_parts>" in skill_text
-    assert "part=<chunk.part>" in skill_text
+    assert 'action="publish_doc"' in skill_text
 
 
-def test_stateless_status_hash_determinism_and_cross_day_unreported_recovery(tmp_path: Path) -> None:
+def test_stateless_status_hash_determinism_and_cross_day_unreported_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """get_status writes no files, builds deterministic report_run_id hashes, and recovers unreported Day 1 episodes on Day 2."""
     from src.dalton import podcast_weekly_store as store
+
+    # mark_reported stamps reported_at with the real clock, and "already reported today"
+    # compares that stamp's Hong Kong date with the queried day. Pin the clock to Day 1 so
+    # the Day 2 assertions do not depend on the date the suite happens to run.
+    class _Day1Clock(store.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return store.datetime(2026, 11, 15, 12, 0, tzinfo=store.HK_TZ).astimezone(tz) if tz else store.datetime(2026, 11, 15, 12, 0)
+
+    monkeypatch.setattr(store, "datetime", _Day1Clock)
 
     data_root = tmp_path / "openclaw-data"
     st_dir = data_root / "state" / "podcast-weekly"
@@ -2363,8 +2389,1502 @@ def test_empty_week_cross_day_reported_at_prevents_same_day_duplicate_empty_week
     assert st_next_week["next_action"] == "empty_week"
 
 
+def _setup_podcast_tool_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    internal_user: str = "usr_internal",
+):
+    from src.dalton import podcast_weekly_store as store
+    from src.dalton.tools import podcast_weekly_tools as pwt
+
+    var_dir = tmp_path / "var_dalton"
+    data_root = var_dir / "openclaw-data"
+    (data_root / "state" / "podcast-weekly").mkdir(parents=True)
+    (data_root / "research-outputs" / "podcast-weekly").mkdir(parents=True)
+    monkeypatch.setenv("DALTON_BACKEND_VAR_DIR", str(var_dir))
+
+    async def _is_internal(uid: str) -> bool:
+        return uid == internal_user
+
+    fake_auth = create_autospec(_is_internal, instance=False, spec_set=True)
+    fake_auth.side_effect = _is_internal
+    monkeypatch.setattr(pwt, "is_internal_or_admin", fake_auth)
+    return store, pwt, data_root
 
 
+def _tool_config(user_id: str = "usr_internal") -> dict[str, Any]:
+    return {"configurable": {"user_id": user_id, "thread_id": "thr_podcast_1", "workspace_id": "ws_1"}}
+
+
+def _write_host_episode(
+    store: Any,
+    data_root: Path,
+    video_id: str,
+    *,
+    date_prefix: str = "20261115",
+    include_summary: bool = False,
+    zh_body: str = "中文全文测试内容 [01:23]\n\n说话人 A 讨论要点。",
+    en_body: str = "English transcript body [01:23]\n\nSpeaker A discussed key points.",
+    merged_body: str = "[01:23] Merged raw transcript content.",
+    notes_obj: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    out_dir = data_root / "research-outputs" / "podcast-weekly"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+    notes_data = notes_obj if notes_obj is not None else {
+        "video_id": video_id,
+        "title": f"Original Show {video_id}",
+        "channel": "a16z",
+        "upload_date": date_prefix.replace("-", ""),
+        "amount_warnings": [],
+        "speaker_flags": [],
+        "short_blocks": [],
+        "corrections": ["无须修改"],
+        "unclear": [],
+    }
+    p_notes = out_dir / f"{date_prefix}-{video_id}.notes.json"
+    p_zh = out_dir / f"{date_prefix}-{video_id}.zh.md"
+    p_en = out_dir / f"{date_prefix}-{video_id}.en.md"
+    p_merged = out_dir / f"{date_prefix}-{video_id}.merged.md"
+    p_notes.write_text(json.dumps(notes_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    p_zh.write_text(zh_body, encoding="utf-8")
+    p_en.write_text(en_body, encoding="utf-8")
+    p_merged.write_text(merged_body, encoding="utf-8")
+    paths.update({"notes": p_notes, "zh": p_zh, "en": p_en, "merged": p_merged})
+    if include_summary:
+        p_sum = out_dir / f"{date_prefix}-{video_id}.summary.md"
+        p_sum.write_text("# 中文节目标题\n\n核心判断摘要内容。\n", encoding="utf-8")
+        paths["summary"] = p_sum
+
+    ledger = store.read_json_dict(store.ledger_path(data_root), required=False)
+    ledger[video_id] = {
+        "stage": "ready",
+        "title": f"Original Show {video_id}",
+        "channel": "a16z",
+        "upload_date": date_prefix.replace("-", ""),
+    }
+    store.atomic_write_json(store.ledger_path(data_root), ledger)
+    return paths
+
+
+def _make_local_sandbox_backend(tmp_path: Path):
+    """Build a SandboxBackend autospec backed by real temp dirs with separate root_dir vs workspace_dir."""
+    import subprocess
+    from types import SimpleNamespace
+
+    from deepagents.backends.protocol import FileDownloadResponse, FileUploadResponse
+
+    from src.ptc_agent.agent.backends.sandbox import SandboxBackend
+
+    computer_root = tmp_path / "computer_root"
+    workspace_dir = computer_root / "workspaces" / "ws_1"
+    computer_root.mkdir(parents=True, exist_ok=True)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = create_autospec(SandboxBackend, instance=True)
+    backend.root_dir = str(computer_root)
+    backend.workspace_dir = str(workspace_dir)
+
+    def _norm(p: str) -> str:
+        rel = p.lstrip("/")
+        if p.startswith(str(workspace_dir)):
+            return p
+        return str((workspace_dir / rel).as_posix())
+
+    backend.normalize_path.side_effect = _norm
+    executed_cmds: list[str] = []
+
+    async def _exec(cmd: str, *, timeout: int | None = None):
+        executed_cmds.append(cmd)
+        proc = subprocess.run(
+            ["bash", "-lc", cmd],
+            cwd=str(computer_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return SimpleNamespace(
+            output=(proc.stdout or "") + (proc.stderr or ""),
+            exit_code=proc.returncode,
+            truncated=False,
+        )
+
+    async def _upload(files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        out: list[FileUploadResponse] = []
+        for rel_p, data in files:
+            target = workspace_dir / rel_p
+            if not target.parent.is_dir():
+                out.append(FileUploadResponse(path=rel_p, error="parent_missing"))
+            else:
+                target.write_bytes(data)
+                out.append(FileUploadResponse(path=rel_p, error=None))
+        return out
+
+    async def _download(paths: list[str]) -> list[FileDownloadResponse]:
+        out: list[FileDownloadResponse] = []
+        for rel_p in paths:
+            target = workspace_dir / rel_p
+            if not target.exists():
+                out.append(FileDownloadResponse(path=rel_p, content=None, error="file_not_found"))
+            else:
+                out.append(FileDownloadResponse(path=rel_p, content=target.read_bytes(), error=None))
+        return out
+
+    backend.aexecute.side_effect = _exec
+    backend.aupload_files.side_effect = _upload
+    backend.adownload_files.side_effect = _download
+    return backend, computer_root, workspace_dir, executed_cmds
+
+
+@pytest.mark.asyncio
+async def test_stage_writes_four_files_to_sandbox_without_body_and_reports_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    from deepagents.backends.protocol import FileUploadResponse
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    host_files = _write_host_episode(store, data_root, "vid_stage_01")
+
+    backend, computer_root, workspace_dir, executed_cmds = _make_local_sandbox_backend(tmp_path)
+
+    # M1: Seed stale summary and leftover file from a previous run; stage must delete both.
+    stale_dir = workspace_dir / ".work" / "podcast-weekly" / "vid_stage_01"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    stale_summary = stale_dir / "20261115-vid_stage_01.summary.md"
+    stale_extra = stale_dir / "stale-old-run.txt"
+    stale_summary.write_text("# stale summary from prior run\n", encoding="utf-8")
+    stale_extra.write_text("leftover\n", encoding="utf-8")
+
+    # M3: Fail the first aupload_files call to force mkdir -p retry at resolved workspace_dir (not computer_root).
+    orig_upload = backend.aupload_files.side_effect
+    upload_calls = 0
+
+    async def _flaky_first_upload(files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        nonlocal upload_calls
+        upload_calls += 1
+        if upload_calls == 1:
+            return [FileUploadResponse(path=p, error="parent_dir_missing") for p, _ in files]
+        return await orig_upload(files)
+
+    backend.aupload_files.side_effect = _flaky_first_upload
+    read_tool, _ = pwt.create_podcast_weekly_tools(filesystem_backend=backend)
+
+    raw_res = await read_tool.ainvoke(
+        {"action": "stage", "video_id": "vid_stage_01"},
+        config=_tool_config("usr_internal"),
+    )
+    res = json.loads(raw_res)
+    assert res["ok"] is True
+    assert res["sandbox_dir"] == ".work/podcast-weekly/vid_stage_01"
+    assert sorted(res["cleaned_files"]) == ["20261115-vid_stage_01.summary.md", "stale-old-run.txt"]
+    assert not stale_summary.exists()
+    assert not stale_extra.exists()
+
+    # Verify M3 mkdir retry targeted workspace_dir (never relative path inside computer_root)
+    mkdir_cmds = [c for c in executed_cmds if "mkdir -p " in c]
+    assert mkdir_cmds and str(workspace_dir) in mkdir_cmds[0]
+    assert not (computer_root / ".work").exists()
+
+    for art_key in ("notes", "zh", "en", "merged"):
+        raw_bytes = host_files[art_key].read_bytes()
+        rel_path = f".work/podcast-weekly/vid_stage_01/{host_files[art_key].name}"
+        assert (workspace_dir / rel_path).read_bytes() == raw_bytes
+        meta = res["files"][art_key]
+        assert meta["path"] == rel_path
+        assert meta["filename"] == host_files[art_key].name
+        assert meta["bytes"] == len(raw_bytes)
+        assert meta["sha256"] == hashlib.sha256(raw_bytes).hexdigest()
+
+    # Body text must never leak into model conversation
+    assert "中文全文测试内容" not in raw_res
+    assert "English transcript body" not in raw_res
+    assert "Merged raw transcript" not in raw_res
+
+    # M2: Sandbox symlink on target file or episode directory must fail closed before upload
+    backend.aupload_files.reset_mock()
+    outside_secret = tmp_path / "outside_secret.txt"
+    outside_secret.write_text("secret", encoding="utf-8")
+    zh_target = stale_dir / host_files["zh"].name
+    zh_target.unlink()
+    os.symlink(outside_secret, zh_target)
+    sym_res = json.loads(
+        await read_tool.ainvoke(
+            {"action": "stage", "video_id": "vid_stage_01"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert sym_res["ok"] is False
+    assert sym_res["error"] == "symlink_rejected"
+    assert backend.aupload_files.await_count == 0
+    zh_target.unlink()
+
+    # External user remains denied
+    denied = json.loads(
+        await read_tool.ainvoke(
+            {"action": "stage", "video_id": "vid_stage_01"},
+            config=_tool_config("usr_external"),
+        )
+    )
+    assert denied["ok"] is False and denied["error"] == "not_allowed"
+
+    # Missing host artifact + L2: symlinked host artifact goes to rejected_artifacts, missing goes to missing_artifacts
+    host_files["en"].unlink()
+    host_files["merged"].unlink()
+    os.symlink(outside_secret, host_files["merged"])
+    backend.aupload_files.reset_mock()
+    missing_res = json.loads(
+        await read_tool.ainvoke(
+            {"action": "stage", "video_id": "vid_stage_01"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert missing_res["ok"] is False
+    assert missing_res["missing_artifacts"] == ["en"]
+    assert missing_res["rejected_artifacts"] == ["merged"]
+    assert "20261115-vid_stage_01.en.md" in missing_res["message"]
+    assert backend.aupload_files.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_collect_reads_from_sandbox_validates_writes_host_and_handles_partial_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    host_files = _write_host_episode(store, data_root, "vid_collect_01")
+
+    new_zh = "校对后中文全文 [01:23]\n\n补充完整对话。\n"
+    new_en = "Proofread English transcript [01:23]\n\nUpdated paragraph.\n"
+    new_notes = (
+        json.dumps(
+            {
+                "video_id": "vid_collect_01",
+                "title": "Original Show vid_collect_01",
+                "amount_warnings": [],
+                "speaker_flags": [],
+                "short_blocks": [],
+                "corrections": ["核对金额无误"],
+                "unclear": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    )
+    new_summary = "# 中文测试节目标题\n\n核心判断一句总结。\n\n**投资看点**\n- 看点条一，嘉宾自述，未独立核实 [01:23]\n"
+
+    backend, _computer_root, workspace_dir, _cmds = _make_local_sandbox_backend(tmp_path)
+    sb_ep_dir = workspace_dir / ".work" / "podcast-weekly" / "vid_collect_01"
+    sb_ep_dir.mkdir(parents=True, exist_ok=True)
+    sandbox_contents = {
+        "20261115-vid_collect_01.zh.md": new_zh.encode("utf-8"),
+        "20261115-vid_collect_01.en.md": new_en.encode("utf-8"),
+        "20261115-vid_collect_01.notes.json": new_notes.encode("utf-8"),
+        "20261115-vid_collect_01.summary.md": new_summary.encode("utf-8"),
+    }
+    for fname, raw_bytes in sandbox_contents.items():
+        (sb_ep_dir / fname).write_bytes(raw_bytes)
+
+    _, write_tool = pwt.create_podcast_weekly_tools(filesystem_backend=backend)
+
+    raw_res = await write_tool.ainvoke(
+        {
+            "action": "collect",
+            "video_id": "vid_collect_01",
+            "artifacts": ["zh", "en", "notes", "summary"],
+        },
+        config=_tool_config("usr_internal"),
+    )
+    res = json.loads(raw_res)
+    assert res["ok"] is True
+    assert res["partial"] is False
+    assert res["failed"] == {}
+    for art_key, expected_text in (
+        ("zh", new_zh),
+        ("en", new_en),
+        ("notes", new_notes),
+        ("summary", new_summary),
+    ):
+        expected_bytes = expected_text.encode("utf-8")
+        info = res["collected"][art_key]
+        assert info["bytes"] == len(expected_bytes)
+        assert info["sha256"] == hashlib.sha256(expected_bytes).hexdigest()
+        host_written = (
+            data_root / "research-outputs" / "podcast-weekly" / f"20261115-vid_collect_01{store.ARTIFACT_EXTENSION_MAP[art_key]}"
+        )
+        assert host_written.read_text(encoding="utf-8") == expected_text
+
+    # No file body text returned
+    assert "校对后中文全文" not in raw_res
+    assert "Proofread English transcript" not in raw_res
+    assert "核心判断一句总结" not in raw_res
+
+    # M2 + Partial failure: summary becomes a symlink in sandbox + notes is invalid JSON; zh & en still save
+    updated_zh_2 = "第二次校对中文 [02:00]\n"
+    (sb_ep_dir / "20261115-vid_collect_01.zh.md").write_bytes(updated_zh_2.encode("utf-8"))
+    (sb_ep_dir / "20261115-vid_collect_01.notes.json").write_bytes(b"{not valid json")
+    outside_target = tmp_path / "outside.md"
+    outside_target.write_text("# hijacked", encoding="utf-8")
+    (sb_ep_dir / "20261115-vid_collect_01.summary.md").unlink()
+    os.symlink(outside_target, sb_ep_dir / "20261115-vid_collect_01.summary.md")
+
+    partial_res = json.loads(
+        await write_tool.ainvoke(
+            {"action": "collect", "video_id": "vid_collect_01"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert partial_res["ok"] is False
+    assert partial_res["partial"] is True
+    assert "zh" in partial_res["collected"] and "en" in partial_res["collected"]
+    assert partial_res["failed"]["summary"]["error"] == "symlink_rejected"
+    assert "notes" in partial_res["failed"]
+    assert host_files["zh"].read_text(encoding="utf-8") == updated_zh_2
+    assert json.loads(host_files["notes"].read_text(encoding="utf-8"))["corrections"] == ["核对金额无误"]
+
+    # M4: Hyphenated host filenames (2026-11-15-) vs 8-digit row.upload_date (20261115), plus per-file target isolation
+    hyph_files = _write_host_episode(store, data_root, "vid_hyph_01", date_prefix="2026-11-15")
+    ledger_h = store.read_json_dict(store.ledger_path(data_root))
+    ledger_h["vid_hyph_01"]["upload_date"] = "20261115"
+    store.atomic_write_json(store.ledger_path(data_root), ledger_h)
+    hyph_sb_dir = workspace_dir / ".work" / "podcast-weekly" / "vid_hyph_01"
+    hyph_sb_dir.mkdir(parents=True, exist_ok=True)
+    (hyph_sb_dir / "2026-11-15-vid_hyph_01.zh.md").write_text("连字符日期中文\n", encoding="utf-8")
+    (hyph_sb_dir / "2026-11-15-vid_hyph_01.en.md").write_text("Hyphenated EN\n", encoding="utf-8")
+    (hyph_sb_dir / "2026-11-15-vid_hyph_01.notes.json").write_text(hyph_files["notes"].read_text(encoding="utf-8"), encoding="utf-8")
+    (hyph_sb_dir / "2026-11-15-vid_hyph_01.summary.md").write_text("# 标题\n\n摘要正文\n", encoding="utf-8")
+    hyph_collect = json.loads(
+        await write_tool.ainvoke(
+            {"action": "collect", "video_id": "vid_hyph_01"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert hyph_collect["ok"] is True
+    assert hyph_collect["collected"]["summary"]["filename"] == "2026-11-15-vid_hyph_01.summary.md"
+    assert (data_root / "research-outputs" / "podcast-weekly" / "2026-11-15-vid_hyph_01.summary.md").exists()
+
+    # M4 per-item exception tolerance in resolve_collect_targets: symlinked host summary fails alone while zh resolves
+    (data_root / "research-outputs" / "podcast-weekly" / "2026-11-15-vid_hyph_01.summary.md").unlink()
+    os.symlink(outside_target, data_root / "research-outputs" / "podcast-weekly" / "2026-11-15-vid_hyph_01.summary.md")
+    targets_m4, invalid_m4 = store.resolve_collect_targets(data_root, "vid_hyph_01", ["zh", "summary"])
+    assert targets_m4 == {"zh": "2026-11-15-vid_hyph_01.zh.md"}
+    assert "summary" in invalid_m4
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_multichunk_already_exists_resume_and_failure_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+
+    # 1) H1 + M5: Realistic bridge returns document_id WITHOUT `url`, plus sharing `warning`.
+    # Derived `https://feishu.cn/docx/<id>` must promote the episode into `report_success` (NOT incomplete_docs).
+    long_zh = "\n\n".join(
+        f"第 {i} 段：" + ("这是中文测试段落内容，用于触发多段切分。" * 80)
+        for i in range(1, 22)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_pub_multi", include_summary=True, zh_body=long_zh)
+
+    feishu_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _bridge_ok_no_url(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {
+                "ok": True,
+                "document_id": "dox_multi_1",
+                "warning": "部分自动分享失败，请手动加权",
+            }
+        if route == "doc/append":
+            return {"ok": True}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True, side_effect=_bridge_ok_no_url)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    read_tool, write_tool = pwt.create_podcast_weekly_tools()
+
+    raw_pub = await write_tool.ainvoke(
+        {"action": "publish_doc", "video_id": "vid_pub_multi"},
+        config=_tool_config("usr_internal"),
+    )
+    pub = json.loads(raw_pub)
+    assert pub["ok"] is True
+    assert pub["already_exists"] is False
+    assert pub["document_id"] == "dox_multi_1"
+    assert pub["doc_url"] == "https://feishu.cn/docx/dox_multi_1"
+    assert pub["warning"] == "部分自动分享失败，请手动加权"
+    assert pub["total_parts"] >= 2
+    assert pub["appended_parts"] == list(range(2, pub["total_parts"] + 1))
+    assert "这是中文测试段落内容" not in raw_pub
+    assert feishu_calls[0][0] == "doc/create"
+    assert feishu_calls[0][1]["folder_token"] == store.channels_folder_token()
+    assert len(feishu_calls) == pub["total_parts"]
+    doc_rec = store.read_json_dict(store.doc_record_path(data_root, "vid_pub_multi"))
+    assert doc_rec["body_status"] == "complete"
+    assert doc_rec["doc_url"] == "https://feishu.cn/docx/dox_multi_1"
+
+    st_after_pub = json.loads(
+        await read_tool.ainvoke(
+            {"action": "status", "date": "2026-11-15"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert st_after_pub["incomplete_docs"] == []
+    assert [it["video_id"] for it in st_after_pub["report_success"]] == ["vid_pub_multi"]
+
+    # H1 wiki node_token variant (without explicit url) derives https://feishu.cn/wiki/<node_token>
+    _write_host_episode(store, data_root, "vid_pub_wiki", include_summary=True)
+
+    async def _bridge_wiki_node(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        return {"ok": True, "document_id": "dox_w1", "node_token": "wikcnNode99"}
+
+    fake_bridge.side_effect = _bridge_wiki_node
+    feishu_calls.clear()
+    wiki_pub = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_wiki"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert wiki_pub["ok"] is True
+    assert wiki_pub["doc_url"] == "https://feishu.cn/wiki/wikcnNode99"
+
+    # Re-calling publish_doc hits already_exists with zero Feishu calls
+    feishu_calls.clear()
+    idem = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_multi"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert idem["ok"] is True
+    assert idem["already_exists"] is True
+    assert idem["document_id"] == "dox_multi_1"
+    assert idem["total_parts"] == pub["total_parts"]
+    assert idem["appended_parts"] == []
+    assert feishu_calls == []
+
+    # 2) resume_append appends ONLY remaining chunks (never doc/create)
+    _write_host_episode(store, data_root, "vid_pub_resume", include_summary=True, zh_body=long_zh)
+    prep_resume = store.prepare_doc(data_root, "vid_pub_resume", max_chars=25000)
+    res_total = prep_resume["total_parts"]
+    assert res_total >= 2
+    store.save_doc(
+        data_root,
+        "vid_pub_resume",
+        doc_url="https://feishu.cn/docx/dox_res_1",
+        document_id="dox_res_1",
+        zh_title="中文节目标题",
+        total_parts=res_total,
+        completed_parts=[1],
+        body_complete=False,
+    )
+    fake_bridge.side_effect = _bridge_ok_no_url
+    feishu_calls.clear()
+    resumed = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_resume"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert resumed["ok"] is True
+    assert resumed["already_exists"] is False
+    assert resumed["appended_parts"] == list(range(2, res_total + 1))
+    assert [r for r, _ in feishu_calls] == ["doc/append"] * (res_total - 1)
+    assert store.read_json_dict(store.doc_record_path(data_root, "vid_pub_resume"))["body_status"] == "complete"
+
+    # 3) Create fails without document_id -> 2 failures stop permanently
+    _write_host_episode(store, data_root, "vid_pub_fail2", include_summary=True)
+
+    async def _bridge_fail(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        return {"ok": False, "error": "bridge_502", "message": "upstream 502"}
+
+    fake_bridge.side_effect = _bridge_fail
+    feishu_calls.clear()
+    f1 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_fail2"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert f1["ok"] is False and f1["attempts"] == 1 and f1["stopped"] is False
+    f2 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_fail2"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert f2["ok"] is False and f2["attempts"] == 2 and f2["stopped"] is True
+    assert f2["reason"] == "doc_create_failed_twice"
+    assert len(feishu_calls) == 2
+
+    feishu_calls.clear()
+    f3 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_fail2"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert f3["ok"] is False and f3["stopped"] is True and f3["reason"] == "doc_create_failed_twice"
+    assert feishu_calls == []
+
+    # 4) W1: content_insert_failed with document_id abandons doc, clears active doc.json, and recreates next run
+    _write_host_episode(store, data_root, "vid_pub_cif", include_summary=True)
+
+    async def _bridge_cif(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {
+                "ok": False,
+                "error": "content_insert_failed",
+                "document_id": "dox_cif_1",
+                "message": "first block insert timed out",
+            }
+        raise AssertionError(f"Should not immediately append after create content_insert_failed: {route}")
+
+    fake_bridge.side_effect = _bridge_cif
+    feishu_calls.clear()
+    cif_res = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_cif"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert cif_res["ok"] is False
+    assert cif_res["code"] == "doc_abandoned_uncertain"
+    assert cif_res["error"] == "doc_abandoned_uncertain"
+    assert cif_res["stopped"] is False
+    assert cif_res["document_id"] == ""
+    assert cif_res["doc_url"] == ""
+    assert cif_res["appended_parts"] == []
+    assert [d["document_id"] for d in cif_res["abandoned_documents"]] == ["dox_cif_1"]
+    assert cif_res["abandoned_documents"][0]["doc_url"] == "https://feishu.cn/docx/dox_cif_1"
+    assert [r for r, _ in feishu_calls] == ["doc/create"]
+    cif_doc = store.read_json_dict(store.doc_record_path(data_root, "vid_pub_cif"))
+    assert cif_doc["document_id"] == ""
+    assert cif_doc["doc_url"] == ""
+    assert cif_doc["completed_parts"] == []
+    assert cif_doc["body_status"] == ""
+    assert len(cif_doc["abandoned_documents"]) == 1
+    assert not store.doc_failed_path(data_root, "vid_pub_cif").exists()
+
+    # Status does NOT leave 1st-abandoned episode in incomplete_docs or report_failed; still in to_publish
+    cif_status = store.get_status(data_root)
+    assert all(it["video_id"] != "vid_pub_cif" for it in cif_status["incomplete_docs"])
+    assert all(it["video_id"] != "vid_pub_cif" for it in cif_status["report_failed"])
+    assert any(it["video_id"] == "vid_pub_cif" for it in cif_status["to_publish"])
+
+    # Next run recreates brand-new document from scratch (NO doc/read)
+    async def _bridge_cif_rebuild_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_cif_2"}
+        if route == "doc/append":
+            assert payload["token"] == "dox_cif_2"
+            return {"ok": True, "document_id": "dox_cif_2"}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_cif_rebuild_ok
+    feishu_calls.clear()
+    cif_done = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_cif"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert cif_done["ok"] is True
+    assert cif_done["document_id"] == "dox_cif_2"
+    assert cif_done["doc_url"] == "https://feishu.cn/docx/dox_cif_2"
+    assert feishu_calls[0][0] == "doc/create"
+    assert [r for r, _ in feishu_calls[1:]] == ["doc/append"] * (cif_done["total_parts"] - 1)
+    assert cif_done["appended_parts"] == list(range(2, cif_done["total_parts"] + 1))
+    rebuilt_doc = store.read_json_dict(store.doc_record_path(data_root, "vid_pub_cif"))
+    assert rebuilt_doc["body_status"] == "complete"
+    assert len(rebuilt_doc["abandoned_documents"]) == 1
+
+    # L1 + W4: deterministic tail chunk append failure preserves doc_id/progress and resumes remaining parts
+    long_zh = "\n\n".join(
+        f"第 {i} 段：用于检验尾部追加错误透传的长段落内容。" * 80 for i in range(1, 22)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_pub_l1", include_summary=True, zh_body=long_zh)
+
+    async def _bridge_tail_busy(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_l1_1"}
+        return {"ok": False, "error": "append_busy", "message": "still busy"}
+
+    fake_bridge.side_effect = _bridge_tail_busy
+    l1_res = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_l1"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert l1_res["ok"] is False and l1_res["error"] == "append_busy"
+    assert l1_res["document_id"] == "dox_l1_1"
+    l1_doc = store.read_json_dict(store.doc_record_path(data_root, "vid_pub_l1"))
+    assert l1_doc["document_id"] == "dox_l1_1" and l1_doc["completed_parts"] == [1]
+
+    feishu_calls.clear()
+
+    async def _bridge_tail_resume_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/append":
+            return {"ok": True}
+        raise AssertionError(f"Should only append remaining parts on deterministic resume: {route}")
+
+    fake_bridge.side_effect = _bridge_tail_resume_ok
+    l1_resumed = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_pub_l1"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert l1_resumed["ok"] is True
+    assert l1_resumed["document_id"] == "dox_l1_1"
+    assert l1_resumed["appended_parts"] == list(range(2, l1_resumed["total_parts"] + 1))
+    assert all(r == "doc/append" for r, _ in feishu_calls)
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_append_unknown_outcome_abandons_and_recreates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1/W3/W4: outcome='unknown' during create append or resume append abandons doc, clears progress, and next publish_doc recreates from scratch without doc/read."""
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    long_zh = "\n\n".join(
+        f"第 {i} 段：标记片段 ALPHA-{i:02d} " + ("用于分段写入不确定时作废重建测试。" * 100)
+        for i in range(1, 22)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_unk_recreate", include_summary=True, zh_body=long_zh)
+    _write_host_episode(store, data_root, "vid_resume_unk", include_summary=True, zh_body=long_zh)
+
+    feishu_calls: list[tuple[str, dict[str, Any]]] = []
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    # Case A: create succeeds on dox_unk_1, part 2 append raises outcome="unknown" -> abandon & clear
+    async def _bridge_unk_first(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_unk_1"}
+        if route == "doc/append":
+            raise FeishuBridgeError(
+                "content_insert_failed",
+                "追加请求结果未知",
+                payload={
+                    "ok": False,
+                    "error": "content_insert_failed",
+                    "outcome": "unknown",
+                    "detail": "timeout",
+                    "document_id": "dox_unk_1",
+                    "url": "https://feishu.cn/docx/dox_unk_1",
+                },
+            )
+        raise AssertionError(f"Unexpected route (no doc/read allowed): {route}")
+
+    fake_bridge.side_effect = _bridge_unk_first
+    res_a1 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_unk_recreate"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert res_a1["ok"] is False
+    assert res_a1["code"] == "doc_abandoned_uncertain"
+    assert res_a1["error"] == "doc_abandoned_uncertain"
+    assert res_a1["stopped"] is False
+    assert res_a1["document_id"] == ""
+    assert res_a1["doc_url"] == ""
+    assert [d["document_id"] for d in res_a1["abandoned_documents"]] == ["dox_unk_1"]
+    doc_a1 = store.read_json_dict(store.doc_record_path(data_root, "vid_unk_recreate"))
+    assert doc_a1["document_id"] == ""
+    assert doc_a1["doc_url"] == ""
+    assert doc_a1["completed_parts"] == []
+    assert doc_a1["body_status"] == ""
+    assert len(doc_a1["abandoned_documents"]) == 1
+    assert [r for r, _ in feishu_calls] == ["doc/create", "doc/append"]
+
+    # Next publish_doc creates fresh dox_unk_2 from scratch and completes all parts (NO doc/read)
+    feishu_calls.clear()
+
+    async def _bridge_rebuild_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_unk_2"}
+        if route == "doc/append":
+            assert payload["token"] == "dox_unk_2"
+            return {"ok": True}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_rebuild_ok
+    res_a2 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_unk_recreate"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert res_a2["ok"] is True
+    assert res_a2["document_id"] == "dox_unk_2"
+    assert res_a2["doc_url"] == "https://feishu.cn/docx/dox_unk_2"
+    total_parts = res_a2["total_parts"]
+    assert res_a2["appended_parts"] == list(range(2, total_parts + 1))
+    assert feishu_calls[0][0] == "doc/create"
+    assert [r for r, _ in feishu_calls[1:]] == ["doc/append"] * (total_parts - 1)
+    doc_a2 = store.read_json_dict(store.doc_record_path(data_root, "vid_unk_recreate"))
+    assert doc_a2["body_status"] == "complete"
+    assert [d["document_id"] for d in doc_a2["abandoned_documents"]] == ["dox_unk_1"]
+    status_after = store.get_status(data_root)
+    assert any(it["video_id"] == "vid_unk_recreate" for it in status_after["report_success"])
+
+    # Case B: deterministic append failure keeps incomplete doc, then resume hits outcome="unknown" -> abandon -> 3rd run creates fresh doc
+    async def _bridge_det_fail(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_res_1"}
+        return {"ok": False, "error": "rate_limited", "message": "try later"}
+
+    fake_bridge.side_effect = _bridge_det_fail
+    feishu_calls.clear()
+    r_b1 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_resume_unk"}, config=_tool_config("usr_internal"))
+    )
+    assert r_b1["ok"] is False and r_b1["error"] == "rate_limited" and r_b1["document_id"] == "dox_res_1"
+
+    async def _bridge_resume_unk(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/append":
+            return {"ok": False, "error": "timeout", "outcome": "unknown", "message": "write unknown on resume"}
+        raise AssertionError(f"Expected doc/append on deterministic resume, got {route}")
+
+    fake_bridge.side_effect = _bridge_resume_unk
+    feishu_calls.clear()
+    r_b2 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_resume_unk"}, config=_tool_config("usr_internal"))
+    )
+    assert r_b2["ok"] is False and r_b2["code"] == "doc_abandoned_uncertain"
+    assert [d["document_id"] for d in r_b2["abandoned_documents"]] == ["dox_res_1"]
+
+    async def _bridge_rebuild_b_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_res_2"}
+        if route == "doc/append":
+            assert payload["token"] == "dox_res_2"
+            return {"ok": True}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_rebuild_b_ok
+    feishu_calls.clear()
+    r_b3 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_resume_unk"}, config=_tool_config("usr_internal"))
+    )
+    assert r_b3["ok"] is True and r_b3["document_id"] == "dox_res_2"
+    assert feishu_calls[0][0] == "doc/create"
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_uncertain_twice_stops_and_enters_report_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W2: At most 1 rebuild per episode; second uncertain failure stops with doc_uncertain_twice and moves episode to report_failed."""
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    long_zh = "\n\n".join(
+        f"第 {i} 段：标记片段 TWICE-{i:02d} " + ("用于验证同一期连续两次不确定停止自动重建。" * 100)
+        for i in range(1, 22)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_twice_unk", include_summary=True, zh_body=long_zh)
+
+    feishu_calls: list[tuple[str, dict[str, Any]]] = []
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    create_seq = 0
+
+    async def _bridge_always_uncertain_append(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        nonlocal create_seq
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            create_seq += 1
+            return {"ok": True, "document_id": f"dox_tw_{create_seq}"}
+        if route == "doc/append":
+            return {"ok": False, "error": "content_insert_failed", "outcome": "unknown", "message": "uncertain append"}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_always_uncertain_append
+
+    res1 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_twice_unk"}, config=_tool_config("usr_internal"))
+    )
+    assert res1["ok"] is False
+    assert res1["code"] == "doc_abandoned_uncertain"
+    assert res1["stopped"] is False
+    assert [d["document_id"] for d in res1["abandoned_documents"]] == ["dox_tw_1"]
+
+    res2 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_twice_unk"}, config=_tool_config("usr_internal"))
+    )
+    assert res2["ok"] is False
+    assert res2["code"] == "doc_uncertain_twice"
+    assert res2["error"] == "doc_uncertain_twice"
+    assert res2["stopped"] is True
+    assert res2["document_id"] == ""
+    assert [d["document_id"] for d in res2["abandoned_documents"]] == ["dox_tw_1", "dox_tw_2"]
+    assert [d["doc_url"] for d in res2["abandoned_documents"]] == [
+        "https://feishu.cn/docx/dox_tw_1",
+        "https://feishu.cn/docx/dox_tw_2",
+    ]
+    assert create_seq == 2
+
+    # 3rd publish_doc must NOT call Feishu at all
+    feishu_calls.clear()
+    res3 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_twice_unk"}, config=_tool_config("usr_internal"))
+    )
+    assert feishu_calls == []
+    assert res3["ok"] is False
+    assert res3["code"] == "doc_uncertain_twice"
+    assert res3["error"] == "doc_uncertain_twice"
+    assert res3["stopped"] is True
+    assert [d["document_id"] for d in res3["abandoned_documents"]] == ["dox_tw_1", "dox_tw_2"]
+
+    # Status removes episode from to_publish and classifies it under report_failed with abandoned_documents
+    st = store.get_status(data_root)
+    assert all(it["video_id"] != "vid_twice_unk" for it in st["to_publish"])
+    assert all(it["video_id"] != "vid_twice_unk" for it in st["incomplete_docs"])
+    failed_entry = next(it for it in st["report_failed"] if it["video_id"] == "vid_twice_unk")
+    assert failed_entry["stage_error"] == "doc_uncertain_twice"
+    assert [d["document_id"] for d in failed_entry["abandoned_documents"]] == ["dox_tw_1", "dox_tw_2"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_post_send_errors_mark_outcome_unknown_vs_connect_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1/W4: ReadTimeout/ReadError/RemoteProtocolError/invalid_json yield outcome='unknown' (abandons doc); ConnectError/ConnectTimeout keep deterministic failure/resume semantics."""
+    import httpx
+
+    from src.dalton import feishu as feishu_client_mod
+    from src.dalton.feishu import FeishuBridgeError, post_bridge_feishu
+
+    monkeypatch.setenv("DALTON_BRIDGE_BASE_URL", "http://bridge.invalid:9111")
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "tok-test")
+    real_client_cls = httpx.AsyncClient
+
+    def _mock_transport(handler):
+        def _factory(**kwargs: Any):
+            return real_client_cls(transport=httpx.MockTransport(handler), timeout=kwargs.get("timeout"))
+
+        monkeypatch.setattr(
+            feishu_client_mod.httpx,
+            "AsyncClient",
+            create_autospec(real_client_cls, side_effect=_factory),
+        )
+
+    for exc_factory in (
+        lambda req: httpx.ReadTimeout("read timeout", request=req),
+        lambda req: httpx.ReadError("reset after write", request=req),
+        lambda req: httpx.RemoteProtocolError("truncated response", request=req),
+    ):
+        _mock_transport(lambda req, fn=exc_factory: (_ for _ in ()).throw(fn(req)))
+        with pytest.raises(FeishuBridgeError) as excinfo:
+            await post_bridge_feishu("doc/append", {"token": "dox1", "markdown": "hi"})
+        assert excinfo.value.error_code == "bridge_unreachable"
+        assert excinfo.value.payload.get("outcome") == "unknown"
+
+    _mock_transport(lambda req: httpx.Response(200, content=b"{not-json"))
+    with pytest.raises(FeishuBridgeError) as exc_json:
+        await post_bridge_feishu("doc/append", {"token": "dox1", "markdown": "hi"})
+    assert exc_json.value.error_code == "invalid_json"
+    assert exc_json.value.payload.get("outcome") == "unknown"
+
+    for exc_factory in (
+        lambda req: httpx.ConnectError("connection refused", request=req),
+        lambda req: httpx.ConnectTimeout("connect timeout", request=req),
+    ):
+        _mock_transport(lambda req, fn=exc_factory: (_ for _ in ()).throw(fn(req)))
+        with pytest.raises(FeishuBridgeError) as excinfo_conn:
+            await post_bridge_feishu("doc/append", {"token": "dox1", "markdown": "hi"})
+        assert excinfo_conn.value.error_code == "bridge_unreachable"
+        assert "outcome" not in excinfo_conn.value.payload
+
+    # End-to-end through publish_doc (Real _bridge + post_bridge_feishu -> httpx MockTransport)
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    long_zh = "\n\n".join(
+        f"第 {i} 段：用于检验 HTTP 超时与连接失败分支区分的文本内容。" * 45 for i in range(1, 20)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_v3_timeout", include_summary=True, zh_body=long_zh)
+    _write_host_episode(store, data_root, "vid_v3_conn", include_summary=True, zh_body=long_zh)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    def _handler_read_timeout(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/doc/create"):
+            return httpx.Response(200, json={"ok": True, "document_id": "dox_v3_t"})
+        raise httpx.ReadTimeout("bridge read timed out after request sent", request=req)
+
+    _mock_transport(_handler_read_timeout)
+    r_timeout = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_v3_timeout"}, config=_tool_config("usr_internal"))
+    )
+    assert r_timeout["ok"] is False and r_timeout["code"] == "doc_abandoned_uncertain"
+    doc_timeout = store.read_json_dict(store.doc_record_path(data_root, "vid_v3_timeout"))
+    assert doc_timeout["document_id"] == ""
+    assert [d["document_id"] for d in doc_timeout["abandoned_documents"]] == ["dox_v3_t"]
+
+    def _handler_connect_err(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/doc/create"):
+            return httpx.Response(200, json={"ok": True, "document_id": "dox_v3_c"})
+        raise httpx.ConnectError("connection refused before request sent", request=req)
+
+    _mock_transport(_handler_connect_err)
+    r_conn = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_v3_conn"}, config=_tool_config("usr_internal"))
+    )
+    assert r_conn["ok"] is False and r_conn.get("code") is None
+    doc_conn = store.read_json_dict(store.doc_record_path(data_root, "vid_v3_conn"))
+    assert doc_conn["document_id"] == "dox_v3_c" and doc_conn["completed_parts"] == [1]
+    assert "abandoned_documents" not in doc_conn
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_create_timeout_abandons_vs_connect_error_records_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1/W4: doc/create ReadTimeout (outcome='unknown', no ID) abandons & clears; ConnectError uses deterministic record_failure (2 attempts stop)."""
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    _write_host_episode(store, data_root, "vid_create_rt", include_summary=True)
+    _write_host_episode(store, data_root, "vid_create_ce", include_summary=True)
+
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    async def _bridge_create_timeout(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        raise FeishuBridgeError("bridge_unreachable", "ReadTimeout", payload={"outcome": "unknown"})
+
+    fake_bridge.side_effect = _bridge_create_timeout
+    r1 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_create_rt"}, config=_tool_config("usr_internal"))
+    )
+    assert r1["ok"] is False and r1["code"] == "doc_abandoned_uncertain"
+    assert not store.doc_failed_path(data_root, "vid_create_rt").exists()
+
+    async def _bridge_create_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        return {"ok": True, "document_id": "dox_rt_ok"}
+
+    fake_bridge.side_effect = _bridge_create_ok
+    r2 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_create_rt"}, config=_tool_config("usr_internal"))
+    )
+    assert r2["ok"] is True and r2["document_id"] == "dox_rt_ok"
+
+    # ConnectError on doc/create without document_id or outcome='unknown' uses deterministic 2-attempt record_failure
+    async def _bridge_create_conn(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        raise FeishuBridgeError("bridge_unreachable", "ConnectError")
+
+    fake_bridge.side_effect = _bridge_create_conn
+    ce1 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_create_ce"}, config=_tool_config("usr_internal"))
+    )
+    assert ce1["ok"] is False and ce1["stopped"] is False and ce1.get("code") is None
+    ce2 = json.loads(
+        await write_tool.ainvoke({"action": "publish_doc", "video_id": "vid_create_ce"}, config=_tool_config("usr_internal"))
+    )
+    assert ce2["ok"] is False and ce2["stopped"] is True and ce2["reason"] == "doc_create_failed_twice"
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_node_token_only_multichunk_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V5: when doc/create returns only `node_token` (no `document_id` or `url`), multi-chunk appends send `node_token` rather than empty string."""
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    long_zh = "\n\n".join(
+        f"第 {i} 段：仅返回 node_token 时的多分块追加测试内容段落。" * 45 for i in range(1, 20)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_v5_node_only", include_summary=True, zh_body=long_zh)
+
+    feishu_calls: list[tuple[str, dict[str, Any]]] = []
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    async def _bridge_node_only(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        feishu_calls.append((route, dict(payload)))
+        if route == "doc/create":
+            return {"ok": True, "node_token": "wikicnOnly99"}
+        if route == "doc/append":
+            assert payload["token"] == "wikicnOnly99"
+            return {"ok": True}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_node_only
+    res = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_v5_node_only"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert res["ok"] is True
+    assert res["doc_url"] == "https://feishu.cn/wiki/wikicnOnly99"
+    assert res["total_parts"] >= 2
+    assert res["appended_parts"] == list(range(2, res["total_parts"] + 1))
+    append_calls = [p for r, p in feishu_calls if r == "doc/append"]
+    assert len(append_calls) == res["total_parts"] - 1
+    assert all(call["token"] == "wikicnOnly99" for call in append_calls)
+    doc_rec = store.read_json_dict(store.doc_record_path(data_root, "vid_v5_node_only"))
+    assert doc_rec["doc_url"] == "https://feishu.cn/wiki/wikicnOnly99"
+    assert doc_rec["body_status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_x1_feishu_network_error_is_uncertain_not_deterministic_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X1: HTTP 502 `feishu_network_error` without document_id or outcome is classified uncertain and triggers abandon+rebuild instead of `record_failure`."""
+    # Verify raw bridge layer converts HTTP 502 `feishu_network_error` (without outcome) into `outcome="unknown"`.
+    from typing import Self
+
+    import httpx
+
+    from src.dalton import feishu as feishu_mod
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as ft
+
+    monkeypatch.setattr(feishu_mod, "get_dalton_bridge_base_url", lambda: "http://bridge.invalid")
+    monkeypatch.setattr(feishu_mod, "get_dalton_bridge_admin_token", lambda: "tok_test")
+
+    class _FakeAsyncClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                502,
+                content=b'{"ok": false, "error": "feishu_network_error", "detail": "read timed out"}',
+            )
+
+    monkeypatch.setattr(feishu_mod.httpx, "AsyncClient", _FakeAsyncClient)
+    with pytest.raises(FeishuBridgeError) as exc_info:
+        await feishu_mod.post_bridge_feishu("doc/create", {"title": "T", "markdown": "M"})
+    assert exc_info.value.error_code == "feishu_network_error"
+    assert (exc_info.value.payload or {}).get("outcome") == "unknown"
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    _write_host_episode(store, data_root, "vid_x1_net", include_summary=True)
+    _write_host_episode(store, data_root, "vid_x1_rejected", include_summary=True)
+
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    async def _bridge_502_net(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        raise FeishuBridgeError(
+            "feishu_network_error",
+            "HTTP 502 bad gateway",
+            payload={"ok": False, "error": "feishu_network_error", "detail": "upstream read timeout"},
+        )
+
+    fake_bridge.side_effect = _bridge_502_net
+    r1 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x1_net"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert r1["ok"] is False
+    assert r1["code"] == "doc_abandoned_uncertain"
+    assert r1["stopped"] is False
+    assert not store.doc_failed_path(data_root, "vid_x1_net").exists()
+    doc_rec = store.read_json_dict(store.doc_record_path(data_root, "vid_x1_net"))
+    assert len(doc_rec["abandoned_documents"]) == 1
+    assert "in_flight_write" not in doc_rec
+
+    # Next publish_doc rebuilds cleanly from scratch
+    async def _bridge_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        return {"ok": True, "document_id": "dox_x1_rebuilt", "url": "https://feishu.cn/docx/dox_x1_rebuilt"}
+
+    fake_bridge.side_effect = _bridge_ok
+    r2 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x1_net"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert r2["ok"] is True
+    assert r2["document_id"] == "dox_x1_rebuilt"
+
+    # Explicit rejection (`ConnectError` / `feishu_http_400`) remains a deterministic failure via `record_failure`
+    async def _bridge_rejected(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        raise FeishuBridgeError(
+            "feishu_http_400",
+            "invalid request",
+            payload={"ok": False, "error": "feishu_http_400", "outcome": "rejected"},
+        )
+
+    fake_bridge.side_effect = _bridge_rejected
+    det1 = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x1_rejected"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert det1["ok"] is False
+    assert det1.get("code") is None
+    assert det1["stopped"] is False
+    assert store.doc_failed_path(data_root, "vid_x1_rejected").exists()
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_x2_image_bind_failed_records_chunk_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X2: `image_bind_failed` on create or append marks the body chunk completed, never resends it, and emits a manual image-fix warning."""
+    from src.dalton.feishu import FeishuBridgeError
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    long_zh = "\n\n".join(
+        f"第 {i} 段：图片绑定失败时正文已落库不再重发验证。" * 45 for i in range(1, 35)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_x2_append_img", include_summary=True, zh_body=long_zh)
+    _write_host_episode(store, data_root, "vid_x2_create_img", include_summary=True, zh_body=long_zh)
+
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    append_calls: list[dict[str, Any]] = []
+
+    async def _bridge_append_img_fail(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_x2_app", "url": "https://feishu.cn/docx/dox_x2_app"}
+        if route == "doc/append":
+            append_calls.append(dict(payload))
+            if len(append_calls) == 1:
+                raise FeishuBridgeError(
+                    "image_bind_failed",
+                    "body appended, image failed",
+                    payload={
+                        "ok": False,
+                        "error": "image_bind_failed",
+                        "document_id": "dox_x2_app",
+                        "url": "https://feishu.cn/docx/dox_x2_app",
+                        "images": {"total": 1, "bound": 0, "failed": [{"ref": "chart_p2.png", "reason": "upload_failed"}]},
+                    },
+                )
+            return {"ok": True, "document_id": "dox_x2_app"}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_append_img_fail
+    res_app = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x2_append_img"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert res_app["ok"] is True
+    assert res_app["document_id"] == "dox_x2_app"
+    assert res_app["total_parts"] >= 2
+    assert len(append_calls) == res_app["total_parts"] - 1
+    assert res_app["appended_parts"] == list(range(2, res_app["total_parts"] + 1))
+    assert "chart_p2.png" in str(res_app.get("warning") or "")
+    assert "人工补图" in str(res_app.get("warning") or "")
+    doc_app = store.read_json_dict(store.doc_record_path(data_root, "vid_x2_append_img"))
+    assert doc_app["body_status"] == "complete"
+    assert doc_app["completed_parts"] == list(range(1, res_app["total_parts"] + 1))
+
+    # Also verify doc/create (part 1) `image_bind_failed` records part 1 and continues tail appends without re-creating
+    create_calls = 0
+
+    async def _bridge_create_img_fail(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        nonlocal create_calls
+        if route == "doc/create":
+            create_calls += 1
+            raise FeishuBridgeError(
+                "image_bind_failed",
+                "doc created with body, cover image failed",
+                payload={
+                    "ok": False,
+                    "error": "image_bind_failed",
+                    "document_id": "dox_x2_cre",
+                    "url": "https://feishu.cn/docx/dox_x2_cre",
+                    "images": {"total": 1, "bound": 0, "failed": [{"ref": "cover_p1.png", "reason": "bind_timeout"}]},
+                },
+            )
+        if route == "doc/append":
+            return {"ok": True, "document_id": "dox_x2_cre"}
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_create_img_fail
+    res_cre = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x2_create_img"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert res_cre["ok"] is True
+    assert create_calls == 1
+    assert res_cre["document_id"] == "dox_x2_cre"
+    assert "cover_p1.png" in str(res_cre.get("warning") or "")
+    assert "人工补图" in str(res_cre.get("warning") or "")
+
+    skill_text = (Path(__file__).resolve().parents[3] / "plugins/dalton/skills/dalton-podcast-weekly/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "image_bind_failed" in skill_text
+    assert "人工补图" in skill_text
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_x3_interrupted_in_flight_write_abandons_and_rebuilds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X3: crashed write leaves `in_flight_write`; next `publish_doc` abandons it, counts toward rebuild cap, and rebuilds (or stops on 2nd)."""
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    long_zh = "\n\n".join(
+        f"第 {i} 段：请求发出后进程中断恢复测试段落。" * 45 for i in range(1, 35)
+    ) + "\n"
+    _write_host_episode(store, data_root, "vid_x3_crash", include_summary=True, zh_body=long_zh)
+    _write_host_episode(store, data_root, "vid_x3_twice", include_summary=True, zh_body=long_zh)
+
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    async def _bridge_crash_append(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        if route == "doc/create":
+            return {"ok": True, "document_id": "dox_x3_old", "url": "https://feishu.cn/docx/dox_x3_old"}
+        if route == "doc/append":
+            raise RuntimeError("simulated worker SIGKILL")
+        raise AssertionError(f"Unexpected route: {route}")
+
+    fake_bridge.side_effect = _bridge_crash_append
+    with pytest.raises(RuntimeError, match="simulated worker SIGKILL"):
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x3_crash"},
+            config=_tool_config("usr_internal"),
+        )
+
+    crashed_rec = store.read_json_dict(store.doc_record_path(data_root, "vid_x3_crash"))
+    assert crashed_rec["document_id"] == "dox_x3_old"
+    assert crashed_rec["in_flight_write"]["operation"] == "append"
+    assert crashed_rec["in_flight_write"]["part"] == 2
+    assert crashed_rec["in_flight_write"]["document_id"] == "dox_x3_old"
+    assert crashed_rec["in_flight_write"]["started_at"]
+
+    # Recovery run abandons old doc, counts toward rebuild cap, and creates a new doc cleanly
+    seen_routes: list[str] = []
+
+    async def _bridge_rebuild_ok(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        seen_routes.append(route)
+        return {"ok": True, "document_id": "dox_x3_new", "url": "https://feishu.cn/docx/dox_x3_new"}
+
+    fake_bridge.side_effect = _bridge_rebuild_ok
+    rebuilt = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x3_crash"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert rebuilt["ok"] is True
+    assert rebuilt["document_id"] == "dox_x3_new"
+    assert seen_routes[0] == "doc/create"
+    final_rec = store.read_json_dict(store.doc_record_path(data_root, "vid_x3_crash"))
+    assert "in_flight_write" not in final_rec
+    assert len(final_rec["abandoned_documents"]) == 1
+    assert final_rec["abandoned_documents"][0]["document_id"] == "dox_x3_old"
+    assert "interrupted_in_flight:append:part_2" in final_rec["abandoned_documents"][0]["reason"]
+
+    # If 1 abandoned doc already exists and a lingering in_flight_write is found again -> doc_uncertain_twice
+    store.abandon_uncertain_doc(data_root, "vid_x3_twice", document_id="dox_prior", reason="prior_unknown")
+    store.mark_in_flight_write(data_root, "vid_x3_twice", operation="create", part=1, document_id="", doc_url="")
+    fake_bridge.reset_mock()
+    stopped_res = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x3_twice"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert stopped_res["ok"] is False
+    assert stopped_res["code"] == "doc_uncertain_twice"
+    assert stopped_res["stopped"] is True
+    assert fake_bridge.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_publish_doc_x4_per_episode_lock_and_doc_identity_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X4: concurrent `publish_doc` for the same video_id returns `publish_in_progress` immediately, and identity mismatch aborts state writes."""
+    import asyncio
+    import contextlib
+    import fcntl
+
+    from src.dalton.tools import feishu_tools as ft
+
+    store, pwt, data_root = _setup_podcast_tool_env(tmp_path, monkeypatch)
+    _write_host_episode(store, data_root, "vid_x4_lock", include_summary=True)
+    _write_host_episode(store, data_root, "vid_x4_other", include_summary=True)
+    _write_host_episode(store, data_root, "vid_x4_mismatch", include_summary=True)
+
+    entered_create = asyncio.Event()
+    release_create = asyncio.Event()
+
+    async def _slow_bridge(route: str, payload: dict[str, Any], user_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        if payload.get("title") and "vid_x4_other" not in str(payload.get("title")) and not entered_create.is_set():
+            entered_create.set()
+            await release_create.wait()
+            return {"ok": True, "document_id": "dox_x4_1", "url": "https://feishu.cn/docx/dox_x4_1"}
+        return {"ok": True, "document_id": "dox_x4_other", "url": "https://feishu.cn/docx/dox_x4_other"}
+
+    fake_bridge = create_autospec(ft.post_bridge_feishu, spec_set=True, side_effect=_slow_bridge)
+    monkeypatch.setattr(ft, "post_bridge_feishu", fake_bridge)
+    _, write_tool = pwt.create_podcast_weekly_tools()
+
+    first_task = asyncio.create_task(
+        write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x4_lock"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    await entered_create.wait()
+
+    # Contending same-episode publish returns immediately with publish_in_progress
+    contend = json.loads(
+        await asyncio.wait_for(
+            write_tool.ainvoke(
+                {"action": "publish_doc", "video_id": "vid_x4_lock"},
+                config=_tool_config("usr_internal"),
+            ),
+            timeout=1.0,
+        )
+    )
+    assert contend["ok"] is False
+    assert contend["code"] == "publish_in_progress"
+
+    # Unrelated episode is NOT blocked
+    other_res = json.loads(
+        await write_tool.ainvoke(
+            {"action": "publish_doc", "video_id": "vid_x4_other"},
+            config=_tool_config("usr_internal"),
+        )
+    )
+    assert other_res["ok"] is True
+
+    release_create.set()
+    first_res = json.loads(await first_task)
+    assert first_res["ok"] is True
+
+    # Cross-process flock simulation via an externally held fd on publish.lock
+    @contextlib.contextmanager
+    def _hold_external_flock(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a+", encoding="utf-8") as ext_fh:
+            fcntl.flock(ext_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                yield
+            finally:
+                fcntl.flock(ext_fh.fileno(), fcntl.LOCK_UN)
+
+    lock_path = store.doc_publish_lock_path(data_root, "vid_x4_lock")
+    with _hold_external_flock(lock_path):
+        ext_contend = json.loads(
+            await asyncio.wait_for(
+                write_tool.ainvoke(
+                    {"action": "publish_doc", "video_id": "vid_x4_lock"},
+                    config=_tool_config("usr_internal"),
+                ),
+                timeout=1.0,
+            )
+        )
+        assert ext_contend["ok"] is False
+        assert ext_contend["code"] == "publish_in_progress"
+
+    # Doc identity verification rejects mismatched save/record_chunk/abandon without overwriting disk
+    store.save_doc(
+        data_root,
+        "vid_x4_mismatch",
+        doc_url="https://feishu.cn/docx/dox_real",
+        document_id="dox_real",
+        total_parts=2,
+        completed_parts=[1],
+        body_complete=False,
+    )
+    bad_save = store.save_doc(
+        data_root,
+        "vid_x4_mismatch",
+        doc_url="https://feishu.cn/docx/dox_other",
+        document_id="dox_other",
+        total_parts=2,
+        completed_parts=[1],
+        body_complete=False,
+    )
+    assert bad_save["ok"] is False and bad_save["code"] == "doc_identity_mismatch"
+
+    bad_chunk = store.record_chunk(
+        data_root,
+        "vid_x4_mismatch",
+        part=2,
+        total_parts=2,
+        document_id="dox_real",
+        expected_document_id="dox_stale",
+    )
+    assert bad_chunk["ok"] is False and bad_chunk["code"] == "doc_identity_mismatch"
+
+    bad_abandon = store.abandon_uncertain_doc(
+        data_root,
+        "vid_x4_mismatch",
+        document_id="dox_other",
+        reason="wrong_doc",
+    )
+    assert bad_abandon["ok"] is False and bad_abandon["code"] == "doc_identity_mismatch"
+
+    preserved = store.read_json_dict(store.doc_record_path(data_root, "vid_x4_mismatch"))
+    assert preserved["document_id"] == "dox_real"
+    assert preserved["completed_parts"] == [1]
+    assert preserved.get("abandoned_documents", []) == []
 
 
 
