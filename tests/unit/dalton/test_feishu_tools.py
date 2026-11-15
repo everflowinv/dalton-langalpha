@@ -605,3 +605,189 @@ async def test_external_bare_docx_token_resolves_via_reverse_lookup(monkeypatch:
     )
     assert payload["ok"] is False and payload["error"] == "external_space_not_allowed"
     assert "doc/read" not in [route for route, _ in bridge_calls[2:]]
+
+
+# ---------------------------------------------------------------------------
+# Bound Feishu open_id lookup & grant propagation
+# ---------------------------------------------------------------------------
+
+
+class _FakeConnCtx:
+    def __init__(self, target: Any) -> None:
+        self._target = target
+
+    async def __aenter__(self) -> Any:
+        return self._target
+
+    async def __aexit__(self, *args: Any) -> bool:
+        return False
+
+
+def _install_channel_gateway_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    from psycopg import AsyncConnection, AsyncCursor
+    import src.dalton.database.channel_gateway as cg_mod
+
+    state: dict[str, Any] = {"rows": [], "error": None}
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = False
+
+    async def _execute(*args: Any, **kwargs: Any) -> None:
+        if state["error"] is not None:
+            raise state["error"]
+
+    async def _fetchall() -> list[dict[str, Any]]:
+        return list(state["rows"])
+
+    cur.execute.side_effect = _execute
+    cur.fetchall.side_effect = _fetchall
+
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.cursor.return_value = cur
+    ctx = _FakeConnCtx(conn)
+    monkeypatch.setattr(
+        cg_mod,
+        "get_db_connection",
+        create_autospec(cg_mod.get_db_connection, side_effect=lambda existing=None: ctx),
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_get_feishu_open_id_for_user_cases(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+    from src.dalton.database.channel_gateway import get_feishu_open_id_for_user
+
+    secret_oid = "ou_SecretBound99"
+    state = _install_channel_gateway_db(monkeypatch)
+    state["rows"] = [{"platform_user_id": secret_oid}]
+    assert await get_feishu_open_id_for_user("u-1") == secret_oid
+
+    # 0 rows -> "", logged.
+    state["rows"] = []
+    with caplog.at_level(logging.INFO, logger="src.dalton.database.channel_gateway"):
+        assert await get_feishu_open_id_for_user("u-none") == ""
+    assert any("no binding" in r.getMessage() and "u-none" in r.getMessage() for r in caplog.records)
+
+    # Multiple rows -> "", logged without open_id plaintext.
+    caplog.clear()
+    state["rows"] = [{"platform_user_id": secret_oid}, {"platform_user_id": "ou_Second2"}]
+    with caplog.at_level(logging.WARNING, logger="src.dalton.database.channel_gateway"):
+        assert await get_feishu_open_id_for_user("u-multi") == ""
+    assert any("multiple rows" in r.getMessage() for r in caplog.records)
+    assert all(secret_oid not in r.getMessage() and "ou_Second2" not in r.getMessage() for r in caplog.records)
+
+    # Query error -> "", logged.
+    caplog.clear()
+    state["rows"] = []
+    state["error"] = RuntimeError("db down")
+    with caplog.at_level(logging.WARNING, logger="src.dalton.database.channel_gateway"):
+        assert await get_feishu_open_id_for_user("u-err") == ""
+    assert any("failed" in r.getMessage() and "RuntimeError" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_create_doc_and_grant_access_propagate_bound_open_id(
+    monkeypatch: pytest.MonkeyPatch, tools
+) -> None:
+    import src.dalton.database.channel_gateway as cg_mod
+    from src.server.database import user as user_db
+
+    ts, bridge_calls, _, _ = tools
+    _set_tier(monkeypatch, "internal")
+    monkeypatch.setenv("DALTON_INVITE_EMAIL_DOMAIN", "team.dalton.local")
+
+    orig_get_user = user_db.get_user
+    orig_get_oid = cg_mod.get_feishu_open_id_for_user
+
+    # 1) Bound open_id + real email: doc/create carries both grant_open_id & grant_email.
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(orig_get_user, return_value={"user_id": "u-1", "email": "User@Corp.com"}),
+    )
+    monkeypatch.setattr(
+        cg_mod,
+        "get_feishu_open_id_for_user",
+        create_autospec(orig_get_oid, return_value="ou_BoundOwner1"),
+    )
+    feishu_create_doc = ts[2]
+    feishu_grant_access = ts[4]
+
+    payload = _parse(
+        await feishu_create_doc.ainvoke(
+            {"title": "T", "markdown": "# hi"}, config=_config("u-1")
+        )
+    )
+    assert payload["ok"] is True
+    create_body = next(b for route, b in bridge_calls if route == "doc/create")
+    assert create_body["grant_open_id"] == "ou_BoundOwner1"
+    assert create_body["grant_email"] == "user@corp.com"
+
+    # feishu_grant_access sends both email and open_id.
+    bridge_calls.clear()
+    grant_payload = _parse(
+        await feishu_grant_access.ainvoke({"token": "doccn1"}, config=_config("u-1"))
+    )
+    assert grant_payload["ok"] is True
+    grant_body = next(b for route, b in bridge_calls if route == "doc/grant")
+    assert grant_body == {"token": "doccn1", "email": "user@corp.com", "open_id": "ou_BoundOwner1"}
+
+    # 2) Bound open_id + synthetic invite email: doc/create omits grant_email, keeps grant_open_id;
+    #    feishu_grant_access sends open_id instead of returning no_grant_email.
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(
+            orig_get_user, return_value={"user_id": "u-inv", "email": "alice@team.dalton.local"}
+        ),
+    )
+    bridge_calls.clear()
+    await feishu_create_doc.ainvoke({"title": "T", "markdown": "# hi"}, config=_config("u-inv"))
+    create_body = next(b for route, b in bridge_calls if route == "doc/create")
+    assert create_body["grant_open_id"] == "ou_BoundOwner1"
+    assert "grant_email" not in create_body
+
+    bridge_calls.clear()
+    grant_payload = _parse(
+        await feishu_grant_access.ainvoke({"token": "doccn1"}, config=_config("u-inv"))
+    )
+    assert grant_payload["ok"] is True
+    grant_body = next(b for route, b in bridge_calls if route == "doc/grant")
+    assert grant_body == {"token": "doccn1", "open_id": "ou_BoundOwner1"}
+
+    # 3) No bound open_id + real email: body omits grant_open_id / open_id.
+    monkeypatch.setattr(
+        cg_mod,
+        "get_feishu_open_id_for_user",
+        create_autospec(orig_get_oid, return_value=""),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(orig_get_user, return_value={"user_id": "u-email", "email": "a@corp.com"}),
+    )
+    bridge_calls.clear()
+    await feishu_create_doc.ainvoke({"title": "T", "markdown": "# hi"}, config=_config("u-email"))
+    create_body = next(b for route, b in bridge_calls if route == "doc/create")
+    assert "grant_open_id" not in create_body
+    assert create_body["grant_email"] == "a@corp.com"
+
+    # 4) Neither bound open_id nor valid email: feishu_grant_access returns no_grant_email.
+    monkeypatch.setattr(
+        user_db,
+        "get_user",
+        create_autospec(orig_get_user, return_value={"user_id": "u-none", "email": ""}),
+    )
+    bridge_calls.clear()
+    err_payload = _parse(
+        await feishu_grant_access.ainvoke({"token": "doccn1"}, config=_config("u-none"))
+    )
+    assert err_payload["ok"] is False
+    assert err_payload["error"] == "no_grant_email"
+    assert "open_id" in err_payload["message"] and "邮箱" in err_payload["message"]
+    assert bridge_calls == []

@@ -412,7 +412,7 @@ def _grant_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     bridge.cfg.wiki_ingest_audit_file = tmp_path / "wiki_ingest_audit.jsonl"
     bridge._feishu_client_instance = create_autospec(rb.FeishuClient, instance=True)
     bridge._feishu_client_instance.grant_full_access_with_phases.return_value = (
-        "openid:ou_1",
+        "openid",
         [],
     )
     return bridge

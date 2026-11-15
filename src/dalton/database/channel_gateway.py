@@ -5219,6 +5219,60 @@ async def get_channel_internal_state(
     }
 
 
+async def get_feishu_open_id_for_user(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> str:
+    """Return the Feishu ``open_id`` bound to ``user_id``, or ``""`` when absent, ambiguous, or lookup fails."""
+    cleaned_uid = str(user_id or "").strip()
+    if not cleaned_uid:
+        logger.info("feishu bound open_id lookup skipped: empty user_id")
+        return ""
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT platform_user_id
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s AND platform = 'feishu'
+                    """,
+                    (cleaned_uid,),
+                )
+                rows = await cur.fetchall()
+    except Exception as exc:
+        logger.warning(
+            "feishu bound open_id lookup failed for user_id=%s: %s",
+            cleaned_uid,
+            type(exc).__name__,
+        )
+        return ""
+    if not rows:
+        logger.info(
+            "feishu bound open_id lookup found no binding for user_id=%s",
+            cleaned_uid,
+        )
+        return ""
+    if len(rows) > 1:
+        logger.warning(
+            "feishu bound open_id lookup found multiple rows (%d) for user_id=%s",
+            len(rows),
+            cleaned_uid,
+        )
+        return ""
+    first_row = rows[0]
+    raw_open_id = first_row.get("platform_user_id") if isinstance(first_row, dict) else None
+    open_id = str(raw_open_id or "").strip()
+    if not open_id:
+        logger.info(
+            "feishu bound open_id lookup found empty platform_user_id for user_id=%s",
+            cleaned_uid,
+        )
+        return ""
+    return open_id
+
+
 # ---------------------------------------------------------------------------
 # I-5: Update User Channel Settings (with CAS & Colleague Workspace Validation)
 # ---------------------------------------------------------------------------
