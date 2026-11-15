@@ -34,6 +34,7 @@ DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
     "alembic.ini",
     "config/dalton",
     "libs/market-protocol",
+    "libs/chartkit",
     "src",
     "scripts",
     "migrations",
