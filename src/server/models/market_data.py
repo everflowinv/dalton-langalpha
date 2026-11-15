@@ -4,7 +4,7 @@ Pydantic models for market data endpoints.
 This module provides request and response models for FMP intraday data proxy endpoints.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Measured alongside the data it describes, so the model lives with the
@@ -249,6 +249,33 @@ class CompanyOverviewResponse(BaseModel):
     revenueByGeo: Optional[Dict[str, Any]] = Field(None, description="Revenue breakdown by geography")
 
 
+class CompanyProfilesRequest(BaseModel):
+    """Request for the company profiles of several listings."""
+    # Each spelling is capped too: one the route refuses is echoed back in
+    # ``errors``, keyed and worded with what was sent.
+    symbols: List[Annotated[str, Field(max_length=32)]] = Field(
+        ..., description="Stock symbols (max 50, each up to 32 characters)", min_length=1, max_length=50
+    )
+
+
+class CompanyProfile(BaseModel):
+    """The slow-moving facts about a listing: what it is, not how it trades."""
+    symbol: str = Field(..., description="Stock symbol, in the caller's spelling with our venue suffix (600519.SS answers as 600519.SH)")
+    name: Optional[str] = Field(None, description="Company name, local-market name first")
+    sector: Optional[str] = Field(None, description="Sector")
+    industry: Optional[str] = Field(None, description="Industry")
+    marketCap: Optional[float] = Field(None, description="Market capitalization, in the listing currency")
+    currency: Optional[str] = Field(None, description="ISO 4217 code the listing trades in")
+    exchange: Optional[str] = Field(None, description="Exchange short name (e.g. NASDAQ)")
+    country: Optional[str] = Field(None, description="Country of the company")
+
+
+class CompanyProfilesResponse(BaseModel):
+    """Profiles keyed by the spelling as sent; a symbol with no profile is in neither map."""
+    results: Dict[str, CompanyProfile] = Field(default_factory=dict, description="Profile by symbol")
+    errors: Dict[str, str] = Field(default_factory=dict, description="Error message by symbol")
+
+
 class PriceTargetSummary(BaseModel):
     """Price target summary from analyst consensus."""
     targetHigh: Optional[float] = Field(None, description="Highest price target")
@@ -351,6 +378,11 @@ class StockSearchResult(BaseModel):
     currency: Optional[str] = Field(None, description="Currency code")
     stockExchange: Optional[str] = Field(None, description="Stock exchange name")
     exchangeShortName: Optional[str] = Field(None, description="Short exchange name")
+    match: Optional[Literal["exact", "symbol_prefix", "name_word", "other"]] = Field(
+        None,
+        description="How directly the row answers the query: the symbol itself, a symbol starting "
+        "with it, a name word starting with it, or neither (closest first)",
+    )
 
 
 class StockSearchResponse(BaseModel):

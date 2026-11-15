@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.server.database.workspace_file import WorkspaceSyncBusy
+from src.server.services import store_multipart
 from src.server.services import workspace_upload_pull as upload_pull
 from src.server.services.workspace_upload_pull import (
     _LOCAL_PULLS_MAX,
@@ -28,7 +29,6 @@ from src.server.services.workspace_upload_pull import (
     Assembly,
     _assemble,
     _ClaimLost,
-    _clean_store,
     _heartbeat,
     _pull_once,
     _Refused,
@@ -66,9 +66,9 @@ def _held(*sizes: int) -> list[dict]:
 
 def _store(*, parts, held_size, completed=True):
     return (
-        patch.object(upload_pull, "list_uploaded_parts", MagicMock(return_value=parts)),
-        patch.object(upload_pull, "object_size", MagicMock(return_value=held_size)),
-        patch.object(upload_pull, "complete_multipart_upload", MagicMock(return_value=completed)),
+        patch.object(store_multipart, "list_uploaded_parts", MagicMock(return_value=parts)),
+        patch.object(store_multipart, "object_size", MagicMock(return_value=held_size)),
+        patch.object(store_multipart, "complete_multipart_upload", MagicMock(return_value=completed)),
     )
 
 
@@ -692,11 +692,18 @@ def _clean(*, aborted: bool, listing, deleted: bool = True):
         return call
 
     patches = (
-        patch.object(upload_pull, "abort_multipart_upload", record("abort", aborted)),
-        patch.object(upload_pull, "list_uploaded_parts", record("list", listing)),
-        patch.object(upload_pull, "delete_object", record("delete", deleted)),
+        patch.object(store_multipart, "abort_multipart_upload", record("abort", aborted)),
+        patch.object(store_multipart, "list_uploaded_parts", record("list", listing)),
+        patch.object(store_multipart, "delete_object", record("delete", deleted)),
     )
     return calls, patches
+
+
+def _clean_store(row: dict) -> bool:
+    """What cleaning up ``row`` leaves: only a pull assembles the parts."""
+    return store_multipart.discard_upload(
+        row["object_key"], row["store_upload_id"], assembled=row["attempts"] > 0
+    )
 
 
 def test_an_unassembled_upload_is_aborted_before_its_object_is_deleted():
@@ -939,8 +946,8 @@ async def test_write_access_revoked_during_download_refuses_and_cleans_staged_an
         return_value=_row(state="failed", error="Workspace write access revoked"),
     )
     release = create_autospec(upload_pull.db.release_pull, return_value=True)
-    delete_obj = create_autospec(upload_pull.delete_object, return_value=True)
-    abort_mp = create_autospec(upload_pull.abort_multipart_upload, return_value=True)
+    delete_obj = create_autospec(store_multipart.delete_object, return_value=True)
+    abort_mp = create_autospec(store_multipart.abort_multipart_upload, return_value=True)
     mark_cleaned = create_autospec(upload_pull.db.mark_cleaned, return_value=None)
 
     with ExitStack() as stack:
@@ -949,8 +956,8 @@ async def test_write_access_revoked_during_download_refuses_and_cleans_staged_an
         stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
         stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
-        stack.enter_context(patch.object(upload_pull, "delete_object", delete_obj))
-        stack.enter_context(patch.object(upload_pull, "abort_multipart_upload", abort_mp))
+        stack.enter_context(patch.object(store_multipart, "delete_object", delete_obj))
+        stack.enter_context(patch.object(store_multipart, "abort_multipart_upload", abort_mp))
         stack.enter_context(patch.object(upload_pull.db, "mark_cleaned", mark_cleaned))
 
         await pull_upload(_row(state="pulling", attempts=1))

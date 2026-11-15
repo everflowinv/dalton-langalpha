@@ -2293,11 +2293,12 @@ async def test_thread_commands_feedback_and_seen_endpoints_for_non_creator_reade
     """Item 4: authorized non-creator reader (e.g. workspace owner B viewing A's thread)
     gets 200 on GET /commands, GET /feedback, and POST /seen (no-op without stamping DB),
     while write endpoints (stop command, submit/delete feedback) remain 403."""
+    from fastapi import BackgroundTasks
     from src.server.app.threads import commands as threads_commands
     from src.server.app.threads import crud as threads_crud
     from src.server.app.threads import feedback as threads_feedback
     from src.server.database.runs import command_runs as cr_db
-    from src.server.models.conversation import FeedbackRequest
+    from src.server.models.conversation import FeedbackFollowUpRequest, FeedbackRequest
 
     _setup_roles(
         monkeypatch,
@@ -2348,10 +2349,11 @@ async def test_thread_commands_feedback_and_seen_endpoints_for_non_creator_reade
         "list_for_thread",
         create_autospec(cr_db.list_for_thread, return_value=[]),
     )
+    # DALTON-HOOK(colleague-dispatch): upstream #748 moved feedback DB calls into services.feedback (threads_feedback.ratings).
     monkeypatch.setattr(
-        threads_feedback,
-        "get_feedback_for_thread",
-        create_autospec(threads_feedback.get_feedback_for_thread, return_value=[]),
+        threads_feedback.ratings,
+        "for_thread",
+        create_autospec(threads_feedback.ratings.for_thread, return_value=[]),
     )
     stamp_mock = create_autospec(
         threads_crud.stamp_thread_seen,
@@ -2402,8 +2404,28 @@ async def test_thread_commands_feedback_and_seen_endpoints_for_non_creator_reade
             thread_id,
             FeedbackRequest(turn_index=0, rating="thumbs_up"),
             x_user_id="u-internal-b",
+            background=BackgroundTasks(),
         )
     assert exc_fb_post.value.status_code == 403
+
+    # DALTON-HOOK(colleague-dispatch): upstream #748 follow-up and delete feedback routes also enforce thread owner.
+    with pytest.raises(HTTPException) as exc_fb_followup:
+        await threads_feedback.follow_up_feedback(
+            thread_id,
+            FeedbackFollowUpRequest(turn_index=0, human_review=True),
+            x_user_id="u-internal-b",
+            background=BackgroundTasks(),
+        )
+    assert exc_fb_followup.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc_fb_del:
+        await threads_feedback.remove_feedback(
+            thread_id,
+            turn_index=0,
+            x_user_id="u-internal-b",
+            background=BackgroundTasks(),
+        )
+    assert exc_fb_del.value.status_code == 403
 
 
 def test_lifecycle_fields_clamps_last_seen_run_seq_for_non_creator() -> None:

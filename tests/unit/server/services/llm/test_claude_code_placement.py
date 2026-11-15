@@ -48,8 +48,9 @@ async def _admit(computer, *, backend=False, cache=None, saved=None):
         patch("src.server.database.computer.get_computer_for_workspace", new_callable=AsyncMock, return_value=computer),
         patch(f"{SAVED}.stored_row", new_callable=AsyncMock, return_value={"access_token": saved} if saved else None),
         patch(f"{MACHINES}.machine_of", new=dial),
+        patch(f"{MACHINES}.get_computer_roster", new_callable=AsyncMock, return_value=[]),
     ):
-        await require_runnable(config, CODE, "analyst", user_id="user-1", workspace_id="ws-1")
+        await require_runnable(config, CODE, user_id="user-1", workspace_id="ws-1")
 
 
 def _reason(refused):
@@ -60,8 +61,8 @@ def _reason(refused):
 async def test_a_hosted_sandbox_needs_the_backend_and_is_refused_where_it_does_not_run():
     with pytest.raises(HTTPException) as refused:
         await _admit(HOSTED, backend=False, saved="sk-ant-oat01-saved")
-    assert _reason(refused) == "needs_own_computer"
-    assert refused.value.detail["message"] == CLAUDE_CODE_OFF["needs_own_computer"]
+    assert _reason(refused) == "no_own_computer"
+    assert refused.value.detail["message"] == CLAUDE_CODE_OFF["no_own_computer"]
     await _admit(HOSTED, backend=True, saved="sk-ant-oat01-saved")
 
 
@@ -200,7 +201,7 @@ async def test_resolve_names_the_turns_workspace_to_the_placement_check():
         pytest.raises(HTTPException),
     ):
         await resolve_llm_config(_base(), "user-1", None, False, workspace_id="ws-1")
-    assert seen.await_args.kwargs == {"user_id": "user-1", "workspace_id": "ws-1", "thread_id": None}
+    assert seen.await_args.kwargs == {"user_id": "user-1", "workspace_id": "ws-1", "thread_id": None, "where": None}
 
 
 # -- What a turn on an own computer records --

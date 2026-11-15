@@ -13,7 +13,7 @@ import pytest
 from fastapi import HTTPException
 
 from ptc_agent.agent.claude_code.launcher import Credential
-from src.server.database.claude_code_hosted import STORED_TURN, CLOUD_TURN
+from src.server.database.claude_code_hosted import CLAUDE_CODE_TURN, STORED_TURN, CLOUD_TURN
 from src.server.services.claude_code import hosted as hosted_module
 from src.server.services.claude_code.flow import backend_on
 from src.server.services.claude_code.hosted import DISCLOSURE, Hosted, drop_stored, opted_out
@@ -24,10 +24,8 @@ from src.llms.claude_code import ClaudeTurnFailed
 from src.server.services.llm.claude_code import (
     CLAUDE_CODE_OFF,
     claude_code_refusal,
-    require_attended,
     require_runnable,
     run_stamp,
-    unattended,
 )
 from src.server.services.oauth_signin import OAuthRefusal
 from tests.unit.server.services.claude_code.fakes import Cache, serving
@@ -38,6 +36,8 @@ from tests.unit.server.services.claude_code.test_hosted import (
     LAUNCHERS,
     OWN,
     SERVICE,
+    SMALL,
+    TOO_SMALL,
     _admit,
     platform,
 )
@@ -54,16 +54,21 @@ SAVED_REFUSAL = "src.server.services.claude_code.saved.saved_refusal"
 # -- The choice --
 
 
+@pytest.fixture(autouse=True)
+def no_stored_task_runs():
+    """No subagent run on the stored token unless a test says otherwise."""
+    with patch(f"{HOSTED}.live_stored_task_runs", AsyncMock(return_value=[])) as runs:
+        yield runs
+
+
 @pytest.mark.asyncio
-async def test_with_only_its_switch_on_storing_is_the_one_choice_offered(client):
-    with platform(switch=False, stored=True, key=True), patch(ROWS_ON, AsyncMock(return_value=True)):
+async def test_with_its_switch_on_storing_is_the_one_choice_offered(client):
+    with platform(stored=True), patch(ROWS_ON, AsyncMock(return_value=True)):
         got = await client.get("/api/v1/claude-code/custody")
-        api_key = await client.put("/api/v1/claude-code/custody", json={"mode": "api_key"})
     assert got.json() == {
-        "mode": "local", "api_key_saved": True, "offered": ["stored"], "blocked": False, "runs_on": None,
-        "refusal": "hosted_off", "disclosure": DISCLOSURE,
+        "mode": "local", "offered": ["stored"], "blocked": False, "runs_on": None,
+        "refusal": "hosted_off",
     }
-    assert api_key.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -85,8 +90,8 @@ async def test_a_blocked_user_is_not_offered_storing_and_cannot_choose_it(client
         got = await client.get("/api/v1/claude-code/custody")
         stored = await client.put("/api/v1/claude-code/custody", json={"mode": "stored", "disclosure": DISCLOSURE})
     assert got.json() == {
-        "mode": "local", "api_key_saved": True, "offered": ["api_key"], "blocked": True, "runs_on": None,
-        "refusal": "hosted_off", "disclosure": DISCLOSURE,
+        "mode": "local", "offered": [], "blocked": True, "runs_on": None,
+        "refusal": "stored_blocked",
     }
     assert stored.status_code == 403
 
@@ -96,10 +101,8 @@ async def test_a_blocked_user_is_not_offered_storing_and_cannot_choose_it(client
     ("given", "expected"),
     [
         ({"stored": True, "mode": "stored"}, Hosted("stored_token")),
-        ({"stored": False, "mode": "stored"}, Hosted(refusal="hosted_paused")),
-        ({"switch": False, "stored": True, "mode": "api_key"}, Hosted(refusal="hosted_paused")),
-        ({"switch": False, "stored": True, "mode": "local", "blocked": True}, Hosted(refusal="stored_blocked")),
-        ({"stored": True, "mode": "local", "blocked": True}, Hosted(refusal="hosted_off")),
+        ({"stored": False, "mode": "stored"}, None),
+        ({"stored": True, "mode": "local", "blocked": True}, Hosted(refusal="stored_blocked")),
         ({"stored": True, "mode": "stored", "blocked": True}, Hosted(refusal="stored_blocked")),
         ({"stored": True, "mode": "local"}, Hosted(refusal="hosted_off")),
     ],
@@ -123,9 +126,11 @@ async def test_a_turn_on_the_stored_token_runs_while_it_is_usable_up_to_the_user
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["hosted_paused", "stored_blocked"])
-async def test_a_paused_or_blocked_choice_refuses_the_turn_in_its_own_words(reason):
-    given = {"stored": False, "mode": "stored"} if reason == "hosted_paused" else {"switch": False, "stored": True, "blocked": True}
+@pytest.mark.parametrize(
+    ("given", "reason"),
+    [({"stored": False, "mode": "stored"}, "no_own_computer"), ({"stored": True, "blocked": True}, "no_own_computer")],
+)
+async def test_a_choice_switched_off_or_blocked_runs_the_cli_on_an_own_computer_or_says_none_is_there(given, reason):
     with platform(**given):
         assert await _admit() == {
             "message": CLAUDE_CODE_OFF[reason], "type": "claude_code_off", "model": CODE, "reason": reason,
@@ -135,9 +140,9 @@ async def test_a_paused_or_blocked_choice_refuses_the_turn_in_its_own_words(reas
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("given", "reason"),
-    [({"stored": False, "mode": "stored"}, "hosted_paused"), ({"switch": False, "stored": True, "blocked": True}, "stored_blocked")],
+    [({"stored": False, "mode": "stored"}, "choice_changed"), ({"stored": True, "blocked": True}, "choice_changed")],
 )
-async def test_a_run_paused_or_blocked_since_admission_never_starts_and_says_why(given, reason):
+async def test_a_run_switched_off_or_blocked_since_admission_never_starts_and_says_why(given, reason):
     with platform(**given), pytest.raises(ClaudeTurnFailed) as refused:
         await HostedCredential("user-1", "stored_token", "c-2").read()
     assert claude_code_refusal(refused.value, CODE)["reason"] == reason
@@ -153,7 +158,7 @@ async def test_the_run_reads_the_stored_token_as_it_starts_for_the_token_descrip
 @pytest.mark.asyncio
 async def test_a_run_admitted_on_one_credential_never_starts_on_another_its_row_was_not_stamped_for():
     with platform(stored=True, mode="stored"), pytest.raises(ClaudeTurnFailed) as refused:
-        await HostedCredential("user-1", "api_key", "c-2").read()
+        await HostedCredential("user-1", "saved_token", "c-2").read()
     assert claude_code_refusal(refused.value, CODE) == {
         "message": "How Claude Code runs on cloud computers changed as this turn started. Send your message again.",
         "type": "claude_code_off", "model": CODE, "reason": "choice_changed",
@@ -165,10 +170,9 @@ async def test_a_run_admitted_on_one_credential_never_starts_on_another_its_row_
     ("given", "computer", "answer", "stamp"),
     [
         ({"stored": True, "mode": "stored"}, CLOUD, None, {**CLOUD_TURN, **STORED_TURN}),
-        ({"stored": True, "mode": "api_key"}, CLOUD, None, CLOUD_TURN),
         ({"stored": True, "mode": "stored"}, OWN, None, STORED_TURN),
-        ({"stored": True, "mode": "stored"}, OWN, SimpleNamespace(relays=True, fresh=False), STORED_TURN),
-        ({"stored": True, "mode": "stored"}, OWN, SimpleNamespace(relays=False, fresh=False), {}),
+        ({"stored": True, "mode": "stored"}, OWN, SimpleNamespace(relays=True, fresh=False, expired=False), STORED_TURN),
+        ({"stored": True, "mode": "stored"}, OWN, SimpleNamespace(relays=False, fresh=False, expired=False), {}),
         ({"stored": True, "mode": "local"}, OWN, None, {}),
         ({"stored": False}, OWN, None, {}),
     ],
@@ -182,103 +186,50 @@ async def test_a_run_that_may_hold_the_stored_token_is_marked_so_it_can_be_stopp
 
 
 async def _stamp() -> dict:
-    """The stamp a turn's row gets from what admission let it run on."""
+    """The stamp a turn's row gets from what admission let it run on, past
+    the one every Claude Code turn gets."""
     admitted = await require_runnable(
-        SimpleNamespace(feature_enabled=lambda _: True), CODE, "analyst", user_id="user-1", workspace_id="ws-1",
+        SimpleNamespace(feature_enabled=lambda _: True), CODE, user_id="user-1", workspace_id="ws-1",
     )
-    return run_stamp(SimpleNamespace(claude_code_hosted=admitted.hosted, claude_code_saved=admitted.saved))
+    stamp = run_stamp(SimpleNamespace(claude_code=True, claude_code_admitted=admitted))
+    return {k: v for k, v in stamp.items() if k not in CLAUDE_CODE_TURN}
 
 
-# -- Turns nobody starts --
-
-
-def _request(**fields) -> SimpleNamespace:
-    return SimpleNamespace(**{"query_type": None, "wakeup": None, "market_target": None, "origin": None, **fields})
-
-
-@pytest.mark.parametrize(
-    ("request_fields", "nobody"),
-    [
-        ({}, False),
-        ({"query_type": "initial"}, False),
-        ({"query_type": "system"}, False),
-        ({"wakeup": {"v": 1}}, True),
-        ({"market_target": {"key": "k"}}, True),
-        ({"origin": SimpleNamespace(type="automation")}, True),
-        ({"origin": SimpleNamespace(type="agent", agent="chief_of_staff")}, True),
-        ({"origin": SimpleNamespace(type="agent", agent="cli")}, True),
-        ({"origin": SimpleNamespace(type="system")}, False),
-    ],
-)
-def test_a_turn_nobody_started_never_runs_on_the_stored_token(request_fields, nobody):
-    request = _request(**request_fields)
-    assert unattended(request) is nobody
-    def config(hosted, saved):
-        return SimpleNamespace(claude_code_hosted=hosted, claude_code_saved=saved, llm=SimpleNamespace(name=CODE))
-
-    for stored in (config("stored_token", "stored_token"), config(None, "stored_token")):
-        if nobody:
-            with pytest.raises(HTTPException) as refused:
-                require_attended(stored, request)
-            assert refused.value.detail["reason"] == "stored_unattended"
-        else:
-            require_attended(stored, request)
-    for hosted, saved in (("api_key", None), (None, None), ("saved_token", "saved_token"), (None, "saved_token")):
-        require_attended(config(hosted, saved), request)
+# -- Automations on the stored token --
 
 
 @pytest.mark.asyncio
-async def test_an_own_computer_relayed_the_stored_token_runs_no_turn_nobody_started():
-    with (
-        platform(computer=OWN, stored=True, mode="stored"), patch(f"{SERVICE}.read_answer", AsyncMock(return_value=None)),
-        patch(f"{SERVICE}.saved_refusal", AsyncMock(return_value=None)),
-    ):
-        admitted = await require_runnable(
-            SimpleNamespace(feature_enabled=lambda _: True), CODE, "analyst", user_id="user-1", workspace_id="ws-1",
-        )
-    config = SimpleNamespace(claude_code_hosted=admitted.hosted, claude_code_saved=admitted.saved, llm=SimpleNamespace(name=CODE))
-    with pytest.raises(HTTPException) as refused:
-        require_attended(config, _request(wakeup={"v": 1}))
-    assert refused.value.detail["reason"] == "stored_unattended"
-    require_attended(config, _request())
+async def test_an_automation_on_the_stored_token_is_saved():
+    from src.server.services.automations.lifecycle import _check_claude_code_hosted
 
-
-@pytest.mark.asyncio
-async def test_an_automation_on_the_stored_token_is_refused_as_it_is_saved():
-    from src.server.services.automations.lifecycle import AutomationRefusal, _check_claude_code_hosted
-
-    with platform(stored=True, mode="stored"), pytest.raises(AutomationRefusal) as refused:
+    with platform(stored=True, mode="stored"):
         await _check_claude_code_hosted("user-1", CODE, "ws-1")
-    assert str(refused.value) == CLAUDE_CODE_OFF["stored_unattended"]
 
 
 @pytest.mark.asyncio
 async def test_an_automation_naming_no_model_is_judged_on_the_default_its_firing_runs():
     from src.server.services.automations.lifecycle import AutomationRefusal, _check_claude_code_hosted
 
-    with platform(stored=True, mode="stored"), pytest.raises(AutomationRefusal) as refused:
+    with platform(stored=True, mode="stored", computer=SMALL), pytest.raises(AutomationRefusal) as refused:
         await _check_claude_code_hosted("user-1", None, "ws-1", pref={"preferred_model": CODE})
-    assert str(refused.value) == CLAUDE_CODE_OFF["stored_unattended"]
-    with platform(stored=True, mode="stored"):
+    assert str(refused.value) == TOO_SMALL
+    with platform(stored=True, mode="stored", computer=SMALL):
         await _check_claude_code_hosted("user-1", None, "ws-1", pref={"preferred_model": "gpt-5"})
         with patch("src.server.services.automations.lifecycle.is_home_id", lambda *_: True):
             await _check_claude_code_hosted("user-1", None, "ws-1", pref={"preferred_model": CODE})
 
 
 @pytest.mark.asyncio
-async def test_an_automation_on_an_own_computer_relayed_the_stored_token_is_refused_as_it_is_saved():
-    from src.server.services.automations.lifecycle import AutomationRefusal, _check_claude_code_hosted
+async def test_an_automation_on_an_own_computer_relayed_the_stored_token_is_saved():
+    from src.server.services.automations.lifecycle import _check_claude_code_hosted
     from src.server.services.claude_code.machine import MachineAnswer
 
-    def answered(answer):
-        return patch("src.server.services.claude_code.machine.read_answer", AsyncMock(return_value=answer))
-
-    for answer in (None, MachineAnswer("none")):
-        with platform(computer=OWN, stored=True, mode="stored"), answered(answer), pytest.raises(AutomationRefusal) as refused:
+    for answer in (None, MachineAnswer("none"), MachineAnswer("works")):
+        with (
+            platform(computer=OWN, stored=True, mode="stored"),
+            patch("src.server.services.claude_code.machine.read_answer", AsyncMock(return_value=answer)),
+        ):
             await _check_claude_code_hosted("user-1", CODE, "ws-1")
-        assert str(refused.value) == CLAUDE_CODE_OFF["stored_unattended"]
-    with platform(computer=OWN, stored=True, mode="stored"), answered(MachineAnswer("works")):
-        await _check_claude_code_hosted("user-1", CODE, "ws-1")
 
 
 # -- Own computers and the token sheet --
@@ -297,7 +248,7 @@ async def test_an_own_computer_without_a_token_is_relayed_the_stored_one_only_wh
         with platform(stored=True, mode="local"):
             assert await ComputerToken("user-1", "c-1").read() is None
     assert row.await_count == 1
-    with platform(switch=True, stored=False):
+    with platform(stored=False):
         assert not hosted_module.relay_offered()
 
 
@@ -306,7 +257,7 @@ async def test_a_token_is_pasted_on_the_platform_only_while_the_user_stores_it()
     enabled = AsyncMock(return_value=True)
     with platform(stored=True, mode="stored"), patch("src.server.services.claude_code.flow.user_feature_enabled", enabled):
         assert await backend_on("user-1")
-    with platform(stored=True, mode="api_key"), patch("src.server.services.claude_code.flow.user_feature_enabled", enabled):
+    with platform(stored=True, mode="local"), patch("src.server.services.claude_code.flow.user_feature_enabled", enabled):
         assert not await backend_on("user-1")
 
 
@@ -367,28 +318,35 @@ async def test_any_choice_but_storing_takes_the_token_with_it():
         platform(stored=True, mode="stored"), patch(f"{HOSTED}.drop_stored", drop),
         patch(f"{HOSTED}.write_custody", saved),
     ):
-        await hosted_module.choose("user-1", "api_key")
         await hosted_module.choose("user-1", "local")
         await hosted_module.choose("user-1", "stored", DISCLOSURE)
-    assert drop.await_args_list == [call("user-1", "api_key"), call("user-1", "local")]
+    assert drop.await_args_list == [call("user-1", "local")]
     saved.assert_awaited_once_with("user-1", "stored", disclosure=DISCLOSURE)
 
 
 @pytest.mark.asyncio
-async def test_dropping_the_stored_token_forgets_its_check_and_stops_each_turn_that_may_hold_it():
+async def test_dropping_the_stored_token_forgets_its_check_and_stops_each_turn_and_subagent_run_that_may_hold_it(
+    no_stored_task_runs,
+):
+    """A subagent run on it can outlive the turn that launched it."""
     cache = SimpleNamespace(delete=AsyncMock())
+    no_stored_task_runs.return_value = [("t-3", "k1", "tr-3")]
     with (
         patch("src.config.settings.HOST_MODE", "platform"),
         patch(f"{HOSTED}.write_custody", AsyncMock(return_value=TOKEN)) as leave,
         patch(f"{HOSTED}.live_stored_turns", AsyncMock(return_value=[("t-1", "r-1"), ("t-2", "r-2")])),
         patch("src.server.services.cancel_dispatch.cancel_workflow", AsyncMock()) as cancel,
+        patch("src.server.services.cancel_dispatch.cancel_subagent_task", AsyncMock()) as cancel_task,
         patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache),
     ):
         stopped = await drop_stored("user-1", block_reason="terms")
     leave.assert_awaited_once_with("user-1", "local", block_reason="terms")
     cache.delete.assert_awaited_once_with(token_check_key(TOKEN))
     assert cancel.await_args_list == [call("t-1", "r-1", by_user=False), call("t-2", "r-2", by_user=False)]
-    assert stopped == 2
+    # By its run: a stop reaching the task after that run ended stops nothing.
+    cancel_task.assert_awaited_once_with("t-3", "k1", task_run_id="tr-3")
+    no_stored_task_runs.assert_awaited_once_with("user-1")
+    assert stopped == 3
 
 
 @pytest.mark.asyncio
@@ -411,7 +369,7 @@ async def test_turning_claude_code_off_on_the_platform_drops_the_stored_token():
         await opted_out("user-1")
     drop.assert_awaited_once_with("user-1")
     with (
-        platform(stored=True, mode="api_key"), patch(f"{HOSTED}.drop_stored", AsyncMock()) as drop,
+        platform(stored=True, mode="local"), patch(f"{HOSTED}.drop_stored", AsyncMock()) as drop,
         patch(f"{HOSTED}.stop_stored_turns", AsyncMock(return_value=0)) as stop,
     ):
         await opted_out("user-1")
@@ -581,8 +539,8 @@ async def test_removing_the_token_whose_turn_did_not_stop_says_so_not_that_remov
 
 
 @pytest.mark.asyncio
-async def test_with_both_switches_off_no_choice_is_read_anywhere():
-    with platform(switch=False, stored=False, computer=OWN) as reads:
+async def test_with_the_switch_off_no_choice_is_read_anywhere():
+    with platform(stored=False, computer=OWN) as reads:
         assert not await hosted_module.saved_token_runs("user-1")
         assert not hosted_module.relay_offered()
         assert await _stamp() == {}

@@ -19,9 +19,11 @@ import type { HtmlWidgetData, MessageRecord } from '../../hooks/utils/types';
 import {
   buildModelFallbackSegment, appendNotificationSegmentOnce, mapToolCallIdToAgentId,
 } from '../../hooks/utils/messageFinalizers';
-import { applyCallUsage, handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
+import { handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
+import { applyCallUsage } from '../tokenUsage';
 // DALTON-HOOK(provenance-batch): batch replay provenance per assistant message and flush once at replay end
 import { accumulateReplayProvenance, flushReplayProvenance } from '../stream/provenanceBatch';
+import { handlePlanBilled } from '../stream/mainEventHandlers';
 import {
   handleHistoryUserMessage,
   handleHistoryReasoningSignal,
@@ -46,6 +48,7 @@ import { createApprovalEvidence, recordApprovalEvidence } from '../interrupts/cl
 import { projectHistoryInterrupt } from '../interrupts/fromHistoryEvent';
 import type { HistoryRuntime } from '../runtime';
 import type { HistoryPageInfo, LoadedHistoryPage } from './olderPages';
+import type { PageBudget } from './pageBudget';
 import { applyHistoryToolResult, markSteeredResumeCards, settleResumedInterrupts } from './resumeSettlement';
 import { readStreamFailure } from '../stream/streamFailure';
 
@@ -68,8 +71,8 @@ export interface ReplayHistoryDeps {
    *  what the load will return. The caller settles here what only it can judge
    *  (a run that is over), so the transcript never appears unsettled first. */
   beforeReveal?: (ok: boolean) => void;
-  /** Page size for the newest page; omitted replays the whole thread. */
-  limit?: number;
+  /** What the newest page may carry; omitted replays the whole thread. */
+  page?: PageBudget;
   /** Replay the page before this turn instead, into a transcript of its own:
    *  an older page (loadOlderHistoryPage), with `signal` to abort its fetch. */
   beforeTurn?: number;
@@ -328,6 +331,24 @@ export async function loadConversationHistory(
         return;
       }
 
+      // A reply whose last request was billed to usage credits replays its
+      // notice under it, as the live stream drew it. Main agent only.
+      if (eventType === 'claude_code_plan') {
+        const msgId = currentActivePairIndex !== null
+          ? (assistantMessagesByPair.get(currentActivePairIndex) ?? null) : null;
+        if (!isSubagent && msgId) {
+          handlePlanBilled({
+            assistantMessageId: msgId,
+            event: event as Record<string, unknown>,
+            order: event._eventId != null
+              ? Number(event._eventId)
+              : (currentActivePairState ? ++currentActivePairState.contentOrderCounter : 0),
+            setMessages: setMessagesForHandlers,
+          });
+        }
+        return;
+      }
+
       // An errored turn replays its persisted error event: the fallback
       // model didn't save the turn, so drop any switch suggestion its
       // model_fallback events set above, and mark the turn's reply failed
@@ -564,12 +585,12 @@ export async function loadConversationHistory(
       // Handle artifact events (e.g., todo_update)
       // In history replay, artifacts DO have turn_index, so we can use it directly
       //
-      // NOTE: `chart_annotation` artifacts are intentionally NOT replayed here
-      // (only the live stream applies them to the annotation store). On reload,
+      // NOTE: `chart_layer` artifacts are intentionally NOT replayed here
+      // (only the live stream applies them to the layer store). On reload,
       // every live chart (MarketView's, and the chat's chart tab through
       // `MarketChartSurface`) repopulates the store from Postgres with
-      // `useChartAnnotationSync`, and the inline card renders from the
-      // replayed `tool_call_result.artifact`.
+      // `useChartLayerSync`, and the inline card renders from the replayed
+      // tool result's `chart_layers`.
       if (eventType === 'artifact') {
         const artifactType = event.artifact_type;
         if (artifactType === 'todo_update') {
@@ -848,7 +869,7 @@ export async function loadConversationHistory(
       }
     };
       const result = await replayThreadHistory(threadIdToUse, onEvent, {
-        limit: deps.limit, beforeTurn: deps.beforeTurn, signal: deps.signal,
+        page: deps.page, beforeTurn: deps.beforeTurn, signal: deps.signal,
       });
       // DALTON-HOOK(provenance-batch): an overtaken replay ends here, before it strips, stamps or reveals the newer transcript; the replay that overtook it owns the loading state
       if (deps.isCurrent && !deps.isCurrent()) return false;
@@ -940,12 +961,11 @@ export async function loadConversationHistory(
       lastTurnIndex: maxReplayedTurnIndex,
       carry: { events: carryEvents, subagents: subagentHistoryByTaskId, steeredAgentIds },
     });
+    // The thread's ratings (best-effort), started before the transcript shows
+    // so its turns read as loading rather than unrated.
+    const feedbackLoad = rt.threadId ? deps.loadFeedback(rt.threadId) : null;
     reveal(true);
-
-    // Fetch feedback state for the thread (best-effort)
-    if (rt.threadId) {
-      await deps.loadFeedback(rt.threadId);
-    }
+    await feedbackLoad;
     return true;
   } catch (error: unknown) {
     if (olderPage) throw error;

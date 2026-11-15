@@ -5,9 +5,12 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSyncUserLocale } from '@/hooks/useSyncUserLocale';
 import { ContextOverflowPill } from '@/components/ui/ContextOverflowPill';
 import NetworkBanner from '@/components/NetworkBanner/NetworkBanner';
+import ClaudeCodeAnnouncement from '@/components/ClaudeCodeAnnouncement/ClaudeCodeAnnouncement';
 import { StaleBuildBoundary } from '@/components/StaleBuildBoundary';
 import { lazyWithMotion, preloadableLazy } from '@/lib/lazyWithMotion';
 import type { AppSection } from '@/lib/appRoutes';
+import { whenIdle } from '@/lib/whenIdle';
+import { usePreferencesSync } from '@/lib/preferencesChannel';
 
 // Chunk thunks shared by the lazy components and preloadRouteChunk — import()
 // is deduped by the module system, so a preload and the lazy mount share one
@@ -61,12 +64,7 @@ const routePreloads = {
 export function preloadRouteChunk(pathname: string): void {
   const chunkFor: Record<string, () => Promise<unknown>> = routePreloads;
   const segment = pathname.split('/')[1] || 'dashboard';
-  // Swallowed on purpose, but it must be caught: a deploy deletes the previous
-  // build's chunks, so this rejects routinely for a stale tab, and an unhandled
-  // rejection is noise that hides real ones. The failure still surfaces — Vite
-  // fires vite:preloadError (index.html reports it), and React.lazy retries the
-  // same import at mount, where StaleBuildBoundary catches it.
-  void (chunkFor[segment] ?? routePreloads.dashboard)().catch(() => {});
+  void (chunkFor[segment] ?? routePreloads.dashboard)();
 }
 
 // Warmed in the order the rail lists them, the likeliest next stops first.
@@ -82,23 +80,14 @@ function useWarmSections(): void {
   useEffect(() => {
     let cancelled = false;
     let cancelWait = () => {};
-    const whenIdle = (run: () => void) => {
-      if (typeof window.requestIdleCallback === 'function') {
-        const id = window.requestIdleCallback(run, { timeout: WARM_IDLE_TIMEOUT_MS });
-        cancelWait = () => window.cancelIdleCallback(id);
-      } else {
-        const id = window.setTimeout(run, WARM_IDLE_TIMEOUT_MS);
-        cancelWait = () => window.clearTimeout(id);
-      }
+    const idle = (run: () => void) => {
+      cancelWait = whenIdle(run, { timeout: WARM_IDLE_TIMEOUT_MS, fallbackMs: WARM_IDLE_TIMEOUT_MS });
     };
     const warm = (i: number) => {
       if (cancelled || i >= WARM_ORDER.length) return;
-      // A failed warm is the mount's to retry (see preloadRouteChunk).
-      void routePreloads[WARM_ORDER[i]]()
-        .catch(() => {})
-        .then(() => whenIdle(() => warm(i + 1)));
+      void routePreloads[WARM_ORDER[i]]().then(() => idle(() => warm(i + 1)));
     };
-    whenIdle(() => warm(0));
+    idle(() => warm(0));
     return () => {
       cancelled = true;
       cancelWait();
@@ -119,6 +108,7 @@ function Main() {
   const location = useLocation();
   const isMobile = useIsMobile();
   useSyncUserLocale();
+  usePreferencesSync();
   useWarmSections();
   // Key by top-level path segment so /chat sub-routes share a key (no re-animation)
   const pageKey = location.pathname.split('/')[1] || 'dashboard';
@@ -173,6 +163,7 @@ function Main() {
     return (
       <div className="main" style={{ height: '100%' }}>
         <NetworkBanner />
+        <ClaudeCodeAnnouncement />
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
           {routes}
         </div>
@@ -184,6 +175,7 @@ function Main() {
   return (
     <div className="main">
       <NetworkBanner />
+      <ClaudeCodeAnnouncement />
       {/* Keyed on the section so a new one mounts fresh. It swaps in at once:
           the page under it draws in its final frame, and a fade over that
           only delays it. */}

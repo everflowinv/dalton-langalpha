@@ -2,11 +2,12 @@
  * Shared market utilities used across Dashboard and MarketView.
  */
 import { api } from '@/api/client';
-import { displaySpelling } from '@/lib/bars/exchanges';
+import { displaySpelling, venueLabelForSymbol } from '@/lib/bars/exchanges';
 import {
   getExtendedHoursInfo as computeExtendedHoursInfo,
   type ExtendedHoursInfo,
 } from '@/lib/dalton/quotes/extendedHoursCore'; // DALTON-HOOK(extended-hours-quotes)
+import { queryKeys } from '@/lib/queryKeys';
 
 export type { ExtendedHoursInfo };
 
@@ -56,6 +57,8 @@ export interface StockSearchHit {
   exchangeShortName?: string;
   stockExchange?: string;
   currency?: string;
+  /** How directly the row answers the query, as the server's ranking read it. */
+  match?: 'exact' | 'symbol_prefix' | 'name_word' | 'other';
 }
 
 interface StockSearchResult {
@@ -208,6 +211,22 @@ export function readTypedTicker(raw: string): string | null {
   return TICKER_RE.test(sym) ? sym : null;
 }
 
+/** Bare exchange codes and the providers' instrument forms, none of which a word takes.
+ *  Four digits only with a leading zero (`0700`): any other four could be a year. */
+const MARKED_TICKER_RE = /^(?:\d{5,6}|0\d{3}|[A-Z0-9]{1,10}=[XF]|\^[A-Z0-9]{1,10}|[A-Z]:[A-Z0-9]{2,14})$/;
+
+/**
+ * A typed ticker in a form no word takes, so it is one even when no search
+ * confirms it: a known venue suffix (`600519.SH`, `0700.HK`), a bare exchange
+ * code (`600519`), or an instrument form (`EURUSD=X`, `ES=F`, `^GSPC`,
+ * `X:BTCUSD`). A plain one (`NVDA`, `DARK`) could as well be a word, and only
+ * a search hit says which.
+ */
+export function readMarkedTicker(raw: string): string | null {
+  const sym = readTypedTicker(raw);
+  return sym && (venueLabelForSymbol(sym) || MARKED_TICKER_RE.test(sym)) ? sym : null;
+}
+
 export async function searchStocks(
   query: string,
   limit = 50,
@@ -245,4 +264,28 @@ export async function fetchMarketStatus({ signal }: { signal?: AbortSignal } = {
     console.error('[API] fetchMarketStatus failed:', err?.message);
     return {};
   }
+}
+
+/**
+ * The US session, one entry for every reader (the Dashboard, a stock's page,
+ * the desktop menu bar). Each reader adds its own polling.
+ */
+export function marketStatusQuery() {
+  // A plain object, not `queryOptions`: node-environment suites import this module, and react-query reads `window` on load.
+  return {
+    queryKey: queryKeys.marketStatus(),
+    queryFn: ({ signal }: { signal: AbortSignal }) => fetchMarketStatus({ signal }),
+    staleTime: 30_000,
+  };
+}
+
+export type MarketPhase = 'open' | 'pre' | 'after' | 'closed' | 'unknown';
+
+/** Which US session the market status describes. */
+export function marketPhase(status: MarketStatusData | null | undefined): MarketPhase {
+  if (!status || !status.market) return 'unknown';
+  if (status.earlyHours) return 'pre';
+  if (status.afterHours) return 'after';
+  if (status.market === 'open') return 'open';
+  return 'closed';
 }

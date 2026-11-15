@@ -24,6 +24,7 @@ import {
   useFileLeftOutPending,
   useArtifactVersions,
   useOwnedArtifact,
+  sharedSeq,
 } from '@/hooks/useArtifact';
 import { usePageScout } from './viewers/html/usePageScout';
 import type { ArtifactStatus, ArtifactVersion, ShareFileEntry } from '@/types/api';
@@ -298,7 +299,7 @@ function PublishDialog({ open, workspaceId, path, onClose, unshareOnly = false }
     <Dialog open={open} onOpenChange={(o) => { if (!o && !busy.current) onClose(); }}>
       <DialogContent
         className="sm:max-w-lg"
-        style={{ backgroundColor: 'var(--color-bg-page)', borderColor: 'var(--color-border-muted)' }}
+        style={{ backgroundColor: 'var(--color-shell-float, var(--color-bg-page))', borderColor: 'var(--color-shell-edge, var(--color-border-muted))' }}
       >
         {/* Mounted only while the dialog shows, so every open starts a fresh
             review, and the exit animation plays over the last one. */}
@@ -329,6 +330,8 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const owned = useOwnedArtifact(workspaceId, path, { root });
   const artifact = owned.record ?? null;
   const latestSeq = artifact?.latest_seq ?? 0;
+  // What the dialog says of visitors is said of their version, not the newest.
+  const visitorsAt = sharedSeq(artifact);
   // DALTON-HOOK(external-share-guard): stop-only mode reviews nothing, so it
   // neither runs the page scout nor reads the status.
   const scout = usePageScout(workspaceId, unshareOnly ? null : (artifact?.path ?? null));
@@ -444,9 +447,9 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   let stateHint: string;
   if (!shared) stateHint = latestSeq > 0 ? t('publish.privateWithVersions') : t('publish.privateHint');
   else if (legacyRefused) stateHint = t('publish.legacyRefused');
-  else if (latestSeq === 0 || status?.changed == null) stateHint = t('publish.sharedHint');
-  else if (upToDate) stateHint = t('publish.upToDate', { seq: latestSeq });
-  else stateHint = t('publish.changedSince', { seq: latestSeq });
+  else if (visitorsAt === 0 || status?.changed == null) stateHint = t('publish.sharedHint');
+  else if (upToDate) stateHint = t('publish.upToDate', { seq: visitorsAt });
+  else stateHint = t('publish.changedSince', { seq: visitorsAt });
 
   const listHeading = !shared
     ? t('publish.filesPublish', { count: files.length })
@@ -472,8 +475,10 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   return (
     <>
       {scout.element}
-      <DialogTitle className="text-base font-semibold truncate pr-6" style={{ color: 'var(--color-text-primary)' }} title={name}>
-        {t('publish.title', { file: name })}
+      {/* The ellipsis is the words' own, so Terminal's brackets (data-bracket,
+          on the title) both stay in view around a long name. */}
+      <DialogTitle className="flex min-w-0 text-base font-semibold pr-6" style={{ color: 'var(--color-text-primary)' }} title={name}>
+        <span className="truncate">{t('publish.title', { file: name })}</span>
       </DialogTitle>
       <DialogDescription className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
         {t('publish.description')}
@@ -524,7 +529,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
                   {!shared
                     ? t('publish.private')
-                    : latestSeq > 0 ? t('publish.publishedAt', { seq: latestSeq }) : t('publish.published')}
+                    : visitorsAt > 0 ? t('publish.publishedAt', { seq: visitorsAt }) : t('publish.published')}
                 </span>
                 <span className="text-xs" style={{ color: legacyRefused ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}>{stateHint}</span>
               </div>

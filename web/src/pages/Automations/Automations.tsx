@@ -1,6 +1,6 @@
 // DALTON-HOOK(company-automations): manage reads three scopes and keeps an open company draft across independent paging.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router';
+import { useLocation, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useInfiniteQuery, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { SwapCell } from '@/components/ui/crossfade';
@@ -40,7 +40,7 @@ import {
   isScriptTask,
   type ManageTask,
 } from './utils/taskKind';
-import { type TemplateId, applyTemplate } from './utils/templates';
+import { AUTOMATION_TEMPLATES, type TemplateId, applyTemplate } from './utils/templates';
 import './Automations.css';
 
 const VIEW_STORAGE_KEY = 'automations:view';
@@ -562,6 +562,30 @@ export default function Automations() {
     },
     [deletedRow, detailTask, pool],
   );
+
+  // `?new=<template>` opens the create form, for a link from elsewhere (the
+  // command palette's "New automation"). Consumed at once, so a reload or a
+  // step back does not open a second form. Opened during render rather than
+  // through `startCreate` in an effect, which would set state there and keep
+  // the compiler off this page.
+  const newTemplate = searchParams.get('new');
+  const location = useLocation();
+  const [newFrom, setNewFrom] = useState<string | null>(null);
+  if (newTemplate && newFrom !== location.key) {
+    setNewFrom(location.key);
+    const template = AUTOMATION_TEMPLATES.find((tpl) => tpl.id === newTemplate)?.id ?? 'custom';
+    // A fresh nonce without reading the clock in render: one past the form it replaces.
+    leaveForm(() => setForm((prev) => ({ kind: 'create', template, nonce: (prev?.kind === 'create' ? prev.nonce : 0) + 1 })));
+    setStoredView('manage');
+  }
+  useEffect(() => {
+    if (!newTemplate) return;
+    const params = new URLSearchParams(searchParams);
+    params.delete('new');
+    params.set('view', 'manage');
+    storeView('manage');
+    setSearchParams(params, { replace: true });
+  }, [newTemplate, searchParams, setSearchParams]);
 
   const versionFor = useCallback(
     (id: string): number | null => {

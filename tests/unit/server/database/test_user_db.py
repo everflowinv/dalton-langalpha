@@ -335,6 +335,34 @@ async def test_delete_user_preferences(user_mock_db, mock_cursor):
 
 
 @pytest.mark.asyncio
+async def test_delete_user_preferences_keeps_the_overrides_it_is_told_to(user_mock_db, mock_cursor):
+    """Reset keeps a server-written grant, and nothing else of the row."""
+    from src.server.database.user import delete_user_preferences
+
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchone.return_value = {
+        "other_preference": {"theme": "dark", "feature_overrides": {"claude_oauth": True, "market_watch": True}},
+    }
+
+    assert await delete_user_preferences("user-1", keep_overrides=["claude_oauth"]) is True
+    sql, params = mock_cursor.execute.call_args[0]
+    assert "INSERT INTO user_preferences" in sql
+    assert params[0] == "user-1"
+    assert params[1].obj == {"feature_overrides": {"claude_oauth": True}}
+
+
+@pytest.mark.asyncio
+async def test_delete_user_preferences_writes_nothing_back_without_a_kept_override(user_mock_db, mock_cursor):
+    from src.server.database.user import delete_user_preferences
+
+    mock_cursor.rowcount = 1
+    mock_cursor.fetchone.return_value = {"other_preference": {"feature_overrides": {"market_watch": True}}}
+
+    await delete_user_preferences("user-1", keep_overrides=["claude_oauth"])
+    assert "DELETE FROM user_preferences" in mock_cursor.execute.call_args[0][0]
+
+
+@pytest.mark.asyncio
 async def test_delete_user_preferences_not_found(user_mock_db, mock_cursor):
     """delete_user_preferences returns False when no row exists."""
     from src.server.database.user import delete_user_preferences
@@ -440,6 +468,37 @@ async def test_get_user_preferences_cache_miss():
     stored = json.loads(set_call[0][1])
     assert stored["user_id"] == "user-1"
     assert set_call[1]["ex"] == 86400
+
+@pytest.mark.asyncio
+async def test_get_user_preferences_uncached_reads_the_row_and_leaves_the_cache_alone():
+    """A read that must see the latest write skips a stale cached copy and never writes one."""
+    cache = _make_cache(get_return=json.dumps({"user_id": "stale"}).encode())
+    cursor = AsyncMock()
+    cursor.fetchone = AsyncMock(return_value=_prefs_row())
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def _cursor_cm(**kwargs):
+        yield cursor
+
+    conn.cursor = _cursor_cm
+
+    @asynccontextmanager
+    async def _fake_db():
+        yield conn
+
+    with patch(
+        "src.utils.cache.redis_cache.get_cache_client", return_value=cache
+    ), patch(
+        "src.server.database.user.get_db_connection", new=_fake_db
+    ):
+        from src.server.database.user import get_user_preferences
+
+        result = await get_user_preferences("user-1", cached=False)
+
+    assert result["user_id"] == "user-1"
+    cache.client.get.assert_not_awaited()
+    cache.client.set.assert_not_awaited()
 
 
 @pytest.mark.asyncio

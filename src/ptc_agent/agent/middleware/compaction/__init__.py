@@ -39,9 +39,11 @@ from ptc_agent.agent.middleware.compaction.between_turns import (
     Compact,
     HandOff,
     Measure,
+    Parts,
     IdleCompact,
     IdleSkipped,
     NoCompaction,
+    WriteBrief,
     ask_between_turns,
 )
 from ptc_agent.agent.middleware.compaction.compact import (
@@ -56,9 +58,11 @@ __all__ = [
     "Compaction",
     "HandOff",
     "Measure",
+    "Parts",
     "IdleCompact",
     "IdleSkipped",
     "NoCompaction",
+    "WriteBrief",
     "ask_between_turns",
     "CompactionMiddleware",
     "CompactionEvent",

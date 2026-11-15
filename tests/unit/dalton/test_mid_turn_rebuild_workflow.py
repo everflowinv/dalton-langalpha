@@ -92,7 +92,9 @@ def _quiet(monkeypatch):
 
     from ptc_agent.agent.middleware.compaction import utils as compaction_utils
 
-    fake = SimpleNamespace(encode=lambda text: [0] * (len(text) // 4 + 1))
+    fake = SimpleNamespace(
+        encode=lambda text, disallowed_special=(): [0] * (len(text) // 4 + 1)
+    )
     monkeypatch.setattr(compaction_utils, "_get_tiktoken_encoder", lambda: fake)
 
 

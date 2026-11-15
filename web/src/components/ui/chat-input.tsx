@@ -3,7 +3,8 @@ import { Plus, ChartCandlestick } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { TokenUsageRing, type TokenUsageData } from './token-usage-ring';
+import { TokenUsageRing } from './token-usage-ring';
+import type { TokenUsage } from '@/pages/ChatAgent/session/tokenUsage';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useTurnModels } from '@/hooks/useTurnModels';
 import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfile';
@@ -30,13 +31,15 @@ import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.hel
 import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
-  ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
+  ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
 } from './chat-input.composerParts';
 import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
 import type { ModelRowStatus } from './chat-input.modelPicker';
-import { ANTHROPIC_KEY_URL, CLAUDE_CODE_CHOICE_URL, biggerComputer, claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
-import type { Payer } from '@/lib/modelPayer';
-import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
+import { claudeCodeHold, isClaudeCodeModel } from '@/lib/claudeCode';
+import { followErrorLink } from '@/lib/desktop';
+import { useMediumHold } from '@/pages/ChatAgent/hooks/useMediumAction';
+import { usePlanReader } from '@/hooks/useClaudeCodePlan';
+import { creditsRefused, pickerPlanHold, planOutOf } from '@/lib/claudeCodePlan';
 import { deriveRecentModels } from './chat-input.models';
 import { modelGroups } from '@/lib/modelGroups';
 import { useEffortToolbarItem, useToolbarItems } from './chat-input.toolbar';
@@ -87,7 +90,8 @@ export interface ChatInputHandle {
    * mounted chat input sees it.
    */
   addWidgetSnapshot: (snapshot: WidgetContextSnapshot) => void;
-  setValue: (text: string) => void;
+  /** Replaces the text: pills it no longer names drop, and `commands` are picked beside it. */
+  setValue: (text: string, commands?: SlashCommand[]) => void;
   /**
    * Puts back what was written elsewhere, or sent and handed back, without
    * losing what is typed here: the text into an empty box, else after it, a
@@ -100,9 +104,12 @@ export interface ChatInputHandle {
     files?: ReadyAttachment[],
     rest?: Partial<Pick<ComposerDraft, 'mentions' | 'commands'>> & { focus?: boolean },
   ) => void;
-  /** Sends what is written, as Enter does. Returns whether there was
-   *  anything to send. */
+  /** Sends what is written, as Enter does. Returns whether it went: false
+   *  when there was nothing to send, or files hold it (`holdsSend`). */
   send: () => boolean;
+  /** Whether files still uploading, or failed, hold the send. The hint
+   *  beside Send says which; the draft waits in the box. */
+  holdsSend: () => boolean;
   focus: () => void;
 }
 
@@ -159,7 +166,10 @@ export interface ChatInputProps {
    * sendable — the selection carries its own instruction.
    */
   hasExternalContext?: boolean;
-  tokenUsage?: TokenUsageData | null;
+  tokenUsage?: TokenUsage | null;
+  /** The thread the context panel breaks down; absent for a chat with no
+   *  thread yet. */
+  threadId?: string | null;
   onAction?: ((cmd: SlashCommand) => void) | null;
   /**
    * The model the pill shows and a send names, owned by the host's thread
@@ -170,6 +180,9 @@ export interface ChatInputProps {
    */
   model?: string | null;
   onPickModel?: ((model: string) => void) | null;
+  /** The model a send names where the host's thread names another than the
+   *  pill shows (`useThreadModel`'s `sendModel`); unset, the pill's. */
+  sendModel?: string | null;
   /**
    * The thread's own reasoning effort and fast mode, over what Settings gives
    * its model, owned by a thread host (`useThreadTuning`), which also receives
@@ -243,11 +256,13 @@ function ChatInput({
   hasExternalContext = false,
   // Token usage (context window progress)
   tokenUsage = null,
+  threadId,
   // Action commands (e.g. /compact) — dispatched on send, not on selection
   onAction = null,
   // Model selector
   model: hostModel,
   onPickModel = null,
+  sendModel: hostSendModel,
   // Thread effort and fast mode
   tuning: hostTuning,
   onPickReasoningEffort = null,
@@ -295,23 +310,29 @@ function ChatInput({
     getDraftParts: () => draftPartsRef.current,
     onSendReturned: (sentText, parts) => returnSendRef.current?.(sentText, parts),
   });
+  // Where the message is going: Home for the Chief of Staff, else the
+  // selected workspace. File uploads and the slash menu both aim at it.
+  const queryClient = useQueryClient();
+  const { data: homeWorkspaceId = null } = useQuery({
+    ...homeWorkspaceQuery(queryClient),
+    enabled: scope === 'all',
+    select: (workspace) => workspace.workspace_id,
+  });
+  const slashWorkspaceId = scope === 'all' ? homeWorkspaceId : selectedWorkspaceId;
+  // Read when a file starts uploading, which is outside any render.
+  const targetWorkspaceRef = useRef<string | null>(null);
   // DALTON-HOOK(chat-large-upload): scope multipart uploads to Home or the active workspace
   const uploadWorkspaceKey = inHome || scope === 'all' ? 'home' : (selectedWorkspaceId || 'home');
   const {
-    attachedFiles,
-    isDragging,
-    handleFiles,
-    restoreFiles,
-    removeFile,
-    retryFile,
-    consumeSentFiles,
-    clearFiles,
-    onDragEnter,
-    onDragOver,
-    onDragLeave,
-    onDrop,
-    handlePaste,
-  } = useFileAttachments({ disabled, workspaceId: uploadWorkspaceKey });
+    attachedFiles, uploadingCount, failedCount, isDragging,
+    handleFiles, retryFile, restoreFiles, removeFile, discardFiles, takeFiles, holdsStale, consumeSentFiles,
+    onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste,
+  } = useFileAttachments({
+    disabled,
+    workspaceIdRef: targetWorkspaceRef,
+    workspaceId: slashWorkspaceId ?? null,
+    largeUploadWorkspaceId: uploadWorkspaceKey,
+  });
   const [watchMode, setWatchMode] = useState(false);
   // The toggle state survives the feature going off (the pill just hides), so
   // every payload derives from this gated value.
@@ -321,10 +342,13 @@ function ChatInput({
   // holds it, starting on the account default, which with nothing saved is
   // the deployment's (see useSlotDefaultModels for why it waits on the
   // preference), and following the default when it changes. A turn in Home
-  // swaps a model it never runs for the default (see useTurnModels).
-  const turn = useTurnModels(inHome || scope === 'all');
+  // starts on the deployment's over a Claude Code one the server does not
+  // run there (see useTurnDefaultModel).
+  const chiefOfStaff = inHome || scope === 'all';
+  const turn = useTurnModels(chiefOfStaff, selectedWorkspaceId);
   const [ownModel, setOwnModel] = useSeededModel(turn.defaultModel);
-  const pillModel = turn.resolve(hostModel === undefined ? ownModel : hostModel);
+  const pillModel = hostModel === undefined ? ownModel : hostModel;
+  const sentModel = hostSendModel === undefined ? pillModel : hostSendModel;
 
   // Per-model tuning is an account preference, not a device one: the server
   // resolves ``profiles[<model>]`` for turns this input never starts (schedules,
@@ -434,13 +458,9 @@ function ChatInput({
   // skills included, its disables applied). The Chief of Staff runs in Home,
   // which loads its skills as any workspace does, so the menu lists Home's
   // rather than those of the workspace the picker remembers.
-  const queryClient = useQueryClient();
-  const { data: homeWorkspaceId = null } = useQuery({
-    ...homeWorkspaceQuery(queryClient),
-    enabled: scope === 'all',
-    select: (workspace) => workspace.workspace_id,
-  });
-  const slashWorkspaceId = scope === 'all' ? homeWorkspaceId : selectedWorkspaceId;
+  useEffect(() => {
+    targetWorkspaceRef.current = slashWorkspaceId ?? null;
+  }, [slashWorkspaceId]);
   const slash = useSlashCommands({ textareaRef, message, setMessage, workspaceId: slashWorkspaceId });
   const {
     mentionedFiles, setMentionedFiles, pruneRemoved: pruneMentions, detectTrigger: detectMention,
@@ -547,12 +567,13 @@ function ChatInput({
 
   // The handle is built before the send below, so it reaches it through here.
   const sendRef = useRef<() => boolean>(() => false);
+  const holdsRef = useRef(false);
 
   // Expose addContext method for external callers (e.g. FilePanel, message selection)
   useImperativeHandle(ref, () => ({
     getModelOptions() {
       return {
-        model: pillModel,
+        model: sentModel,
         reasoningEffort: sentEffort,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
@@ -595,9 +616,17 @@ function ChatInput({
         return [...prev, snapshot];
       });
     },
-    setValue(text) {
+    setValue(text, commands = []) {
+      // Dictation rewrites the draft from what it held when it started.
+      abandonListening();
       setMessage(text);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      // Pills follow the text, as typing prunes them: one the new text no
+      // longer names would otherwise ride the next send unseen.
+      pruneDraft(text);
+      restoreSlash(commands);
+      // A draft handed in by another surface (a palette's Enter, a starter's
+      // click) carries on that action, so it draws no keyboard ring.
+      setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
     giveBack(text, files = [], { mentions = [], commands = [], focus = true } = {}) {
       // DALTON-HOOK(composer-drafts): handed-back draft waits for an open IME composition
@@ -626,7 +655,8 @@ function ChatInput({
           restoreFiles(files);
           if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
           restoreSlash(commands);
-          if (focus) setTimeout(() => textareaRef.current?.focus(), 0);
+          // Handed back by the app, not reached by a key: no keyboard ring.
+          if (focus) setTimeout(() => focusWithoutRing(textareaRef.current), 0);
           return back.text;
         },
       });
@@ -634,11 +664,14 @@ function ChatInput({
     send() {
       return sendRef.current();
     },
+    holdsSend() {
+      return holdsRef.current || holdsStale();
+    },
     // DALTON-HOOK(composer-drafts): include setMessage and giveBackDraft from useComposerDraft
     focus() {
       textareaRef.current?.focus();
     },
-  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, handleFiles, abandonListening, setMessage, giveBackDraft]);
+  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -830,11 +863,14 @@ function ChatInput({
 
   // --- Send ---
   const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext;
+  // A file still uploading has nothing to send yet, and a failed one is never
+  // dropped unseen: either holds the send until it is ready or removed.
   // DALTON-HOOK(chat-large-upload): hold send until all selected attachments finish uploading
-  const hasIncompleteUploads = attachedFiles.some((f) => f.uploadStatus !== 'complete');
+  const filesHold = uploadingCount > 0 || failedCount > 0;
 
-  const handleSend = useCallback(() => {
-    if (!hasContent || disabled || hasIncompleteUploads) return;
+  /** Whether it sent. */
+  const handleSend = useCallback((): boolean => {
+    if (!hasContent || disabled || filesHold) return false;
 
     // System action commands (/compact, /offload) are standalone: they run on
     // send rather than starting a chat turn. If any are present, fire them and
@@ -847,27 +883,25 @@ function ChatInput({
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
       resetSlash();
-      // DALTON-HOOK(chat-large-upload): cancel any unsent server uploads on standalone action commands
-      clearFiles();
+      // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
+      discardFiles();
       resetMentions();
       if (widgetSnapshots.length > 0) {
         ContextBus.clear();
       }
       setDeckFanned(false);
       settleAfterSend(textareaRef.current);
-      return;
+      return true;
     }
 
-    // DALTON-HOOK(chat-large-upload): carry either inline dataUrl or server uploadId
-    const readyAttachments = attachedFiles
-      .filter((f) => f.uploadStatus === 'complete' && (f.dataUrl || f.uploadId))
-      .map((f) => ({
-        file: f.file,
-        dataUrl: f.dataUrl,
-        type: f.type,
-        preview: f.uploadId ? null : f.preview,
-        ...(f.uploadId ? { uploadId: f.uploadId } : {}),
-      }));
+    const totalBeforeTake = attachedFiles.length;
+    const readyAttachments = takeFiles();
+    // A file too old to name uploads again, and the send waits for it as for
+    // any upload; the hold shows before the render that counts it.
+    if (!readyAttachments) {
+      holdsRef.current = true;
+      return false;
+    }
     // Quotes go where they sit among the typed words. Chips' blocks trail.
     let finalMessage = spellOutQuotes(message, quotes);
     if (chips.length > 0) {
@@ -892,7 +926,7 @@ function ChatInput({
         commands: slashCommands,
         message: finalMessage,
         modelOptions: {
-          model: pillModel,
+          model: sentModel,
           reasoningEffort: sentEffort,
           fastMode: resolvedFastMode,
           marketWatch: effectiveMarketWatch,
@@ -906,7 +940,7 @@ function ChatInput({
         },
       }),
       // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
-      { filesWithheld: readyAttachments.length < attachedFiles.length },
+      { filesWithheld: readyAttachments.length < totalBeforeTake },
     );
     // DALTON-HOOK(chat-large-upload): mark sent uploadIds so unmount cleanup keeps them intact
     consumeSentFiles();
@@ -919,17 +953,20 @@ function ChatInput({
     }
     setDeckFanned(false);
     settleAfterSend(textareaRef.current);
+    return true;
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
-  }, [hasContent, disabled, hasIncompleteUploads, message, effectiveMarketWatch, draftSubagents, attachedFiles, clearFiles, consumeSentFiles, onSend, onAction,
+  }, [hasContent, disabled, filesHold, message, effectiveMarketWatch, draftSubagents, attachedFiles.length, discardFiles, takeFiles, consumeSentFiles, onSend, onAction,
     heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
-    pillModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
+    sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
+    holdsRef.current = filesHold;
     sendRef.current = () => {
-      if (!hasContent || disabled || hasIncompleteUploads) return false;
-      handleSend();
-      return true;
+      // Held by its files, the draft is still there to send, and the hint
+      // beside Send says what it waits on; nothing went.
+      if (!hasContent || disabled || filesHold) return false;
+      return handleSend();
     };
-  }, [hasContent, disabled, hasIncompleteUploads, handleSend]);
+  }, [hasContent, disabled, filesHold, handleSend]);
 
   // --- Keyboard & Language Detection ---
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1037,18 +1074,22 @@ function ChatInput({
 
   const favorites = useFavoriteModels();
   const { entryFor } = useProviderCatalog();
-  // A Claude Code model runs a turn while the token where the workspace's
-  // computer runs it works or could not be checked, as admission lets it;
+  // A Claude Code model runs a turn while the token where the turn's
+  // workspace (Home's for the Chief of Staff) runs it works or could not be
+  // checked, as admission lets it;
   // otherwise its row says why, and where the user can fix it: that
-  // computer's token, or the saved one. On a cloud computer it may run on
-  // the user's Anthropic API key, which then pays for it.
-  const claudeCode = useWorkspaceClaudeCode(selectedWorkspaceId);
-  const pickerPayers = useMemo((): Record<string, Payer> => (claudeCode.state === 'api_key'
-    ? Object.fromEntries(Object.entries(payers).map(([m, payer]) => [m, isClaudeCodeModel(modelMetadata[m]) ? 'own_key' : payer]))
-    : payers), [claudeCode.state, payers, modelMetadata]);
+  // computer's token, or the saved one. One whose Claude plan is used up for
+  // it waits for the reset, unless usage credits carry it, told by the
+  // picker's own minute clock (`now`), so the composer does not turn with the
+  // minute.
+  const { claudeCode } = turn;
+  // A computer too small for Claude Code holds its models back with what gets
+  // it to Medium, which picking one of them does.
+  const mediumHold = useMediumHold(claudeCode.state === 'needs_bigger_computer' ? claudeCode.smallComputerId : null);
+  const planReader = usePlanReader();
   const modelGroupList = useMemo(() => modelGroups({
     models: turn.models,
-    payers: pickerPayers,
+    payers,
     brandOf: (group) => {
       const entry = entryFor(group);
       if (!entry?.group || entry.group === group) return undefined;
@@ -1057,29 +1098,29 @@ function ChatInput({
         label: visibleModels[entry.group]?.display_name ?? entry.group_display_name ?? entry.display_name,
       };
     },
-  }), [turn.models, visibleModels, pickerPayers, entryFor]);
+  }), [turn.models, visibleModels, payers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
-    .filter((m) => !favorites.models.includes(m) && turn.offers(m));
-  const tokenUrl = claudeCodeTokenUrl(selectedWorkspaceId);
-  const modelRowStatus = (m: string): ModelRowStatus => {
+    .filter((m) => !favorites.models.includes(m));
+  const modelRowStatus = (m: string, now: number): ModelRowStatus => {
     if (isClaudeCodeModel(modelMetadata[m])) {
-      switch (claudeCode.state) {
-        case 'checking': return { unavailable: t('modelAccess.status.working') };
-        case 'no_token': return { unavailable: t('chat.modelSelector.claudeCodeSignedOut'), fix: () => navigate(tokenUrl) };
-        case 'rejected': return { unavailable: t('chat.modelSelector.claudeCodeRejected'), fix: () => navigate(tokenUrl) };
-        case 'needs_own_computer': return { unavailable: t('chat.modelSelector.claudeCodeNeedsOwnComputer') };
-        case 'hosted_paused': return { unavailable: t('chat.modelSelector.claudeCodePaused') };
-        case 'hosted_off': return { unavailable: t('chat.modelSelector.claudeCodeHostedOff'), fix: () => navigate(CLAUDE_CODE_CHOICE_URL) };
-        case 'needs_api_key': return { unavailable: t('chat.modelSelector.claudeCodeNeedsApiKey'), fix: () => navigate(ANTHROPIC_KEY_URL) };
-        case 'api_key_endpoint': return { unavailable: t('chat.modelSelector.claudeCodeApiKeyEndpoint'), fix: () => navigate(ANTHROPIC_KEY_URL) };
-        case 'needs_bigger_computer': {
-          const { rowKey, link } = biggerComputer();
-          return { unavailable: t(rowKey), fix: link ? () => window.open(link.url, '_blank', 'noopener,noreferrer') : undefined };
-        }
-        case 'policy_blocked': return { unavailable: t('chat.modelSelector.claudeCodePolicyBlocked') };
-        case 'needs_perl': return { unavailable: t('modelAccess.claudeCode.fail.needs_perl') };
-        case 'computer_unsupported': return { unavailable: t('modelAccess.claudeCode.fail.computer_unsupported') };
+      if (mediumHold) return mediumHold;
+      const hold = claudeCodeHold(claudeCode.state, turn.workspaceId, {
+        home: chiefOfStaff, cliComputerName: claudeCode.cliComputerName,
+      });
+      if (hold) {
+        const { link } = hold;
+        return {
+          unavailable: t(hold.messageKey, hold.messageValues),
+          fix: link ? () => followErrorLink(link, navigate) : undefined,
+        };
       }
+      const planOut = planOutOf(preferences?.other_preference);
+      const planHold = pickerPlanHold(t, claudeCode.plan, planOut, m, { ...planReader, now });
+      const credential = claudeCode.meter?.credential;
+      if (planHold && credential && creditsRefused(claudeCode.plan, planOut, m, now)) {
+        return { unavailable: planHold, check: { credential, checkAfter: claudeCode.meter?.checkAfter ?? null } };
+      }
+      if (planHold) return { unavailable: planHold };
     }
     return { tag: lapsedSignIn(m) ? t('modelAccess.status.needsReauth') : undefined };
   };
@@ -1092,12 +1133,15 @@ function ChatInput({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {/* Main Container. 22px is concentric with the 12px send button 10px in
-          from the bottom edge (DESIGN.md, Radius); the drag and recording
-          overlays repeat it. */}
+      {/* Main Container. 16px, concentric with the 8px send button set 8px
+          into the corner (DESIGN.md, Radius). Terminal and Soft state
+          their own corners for the composer, its send button and the rows
+          stacked on it (--cs-composer-*, styles/cardStyle.css); the drag and
+          recording overlays repeat the corner, and the open styles draw the
+          edge in theirs. */}
       <div
         ref={attachChatContainer}
-        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
+        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[var(--cs-composer-radius,16px)] cursor-text border border-[color:var(--color-shell-edge,var(--color-border-input))] bg-(--color-bg-card)', isListening && 'recording')}
         onClick={(event) => {
           // A press on a control in the box is that control's, and the deck
           // above the text is its own surface: focusing the text there would
@@ -1306,7 +1350,7 @@ function ChatInput({
 
               {/* Token Usage Ring */}
               {ringVisible && tokenUsage && (
-                <TokenUsageRing tokenUsage={tokenUsage} />
+                <TokenUsageRing tokenUsage={tokenUsage} threadId={threadId} />
               )}
 
               {/* Chart Capture (trading only) */}
@@ -1366,13 +1410,14 @@ function ChatInput({
               <ChatInputModelMenu
                 selectedModel={pillModel}
                 metadata={modelMetadata}
-                payers={pickerPayers}
+                payers={payers}
                 groups={modelGroupList}
-                favorites={favorites.models.filter(turn.offers)}
+                favorites={favorites.models}
                 recent={recentModels}
                 onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
                 onSelectModel={handlePickModel}
                 rowStatus={modelRowStatus}
+                planMeter={claudeCode.meter}
                 dropdownDirection={dropdownDirection}
                 container={chatContainer}
                 draftRef={textareaRef}
@@ -1389,10 +1434,12 @@ function ChatInput({
                   onToggle={toggleListening}
                 />
               )}
+              {/* Also beside Stop: Enter steering a running turn waits on the files too. */}
+              {filesHold && <FilesHoldHint uploading={uploadingCount} failed={failedCount} />}
               {/* DALTON-HOOK(chat-large-upload): disable send button while uploads are in flight or failed */}
               <SendStopButton
                 running={isLoading || isCompacting}
-                canSend={!!hasContent && !disabled && !hasIncompleteUploads}
+                canSend={!!hasContent && !disabled && !filesHold}
                 onSend={handleSend}
                 onStop={onStop}
               />

@@ -358,16 +358,19 @@ async def test_off_legacy_first_read_still_cuts_v1(
     from src.server.services.artifacts import snapshot
 
     artifact = _artifact()
-    cut = create_autospec(
-        snapshot._cut,
+    legacy_version = create_autospec(
+        snapshot.artifacts_db.legacy_version,
         return_value=SimpleNamespace(
-            artifact=dataclasses.replace(artifact, latest_seq=1)
+            cut=True,
+            artifact=dataclasses.replace(artifact, latest_seq=1),
         ),
     )
     captured = SimpleNamespace(
         entries=[SimpleNamespace(size=10, as_dict=lambda: {"path": "report.html"})],
         total=10,
         files=[SimpleNamespace(path="report.html")],
+        blobs={},
+        title=None,
     )
     with (
         patch.object(
@@ -383,12 +386,19 @@ async def test_off_legacy_first_read_still_cuts_v1(
             ),
         ),
         patch.object(snapshot, "_capture", create_autospec(snapshot._capture, return_value=captured)),
-        patch.object(snapshot, "_cut", cut),
+        patch.object(snapshot, "_store_blobs", create_autospec(snapshot._store_blobs)),
+        patch.object(snapshot.artifacts_db, "legacy_version", legacy_version),
+        patch.object(snapshot, "_announce", create_autospec(snapshot._announce)),
     ):
         result = await snapshot.legacy_snapshot(artifact)
     assert result.latest_seq == 1
-    cut.assert_awaited_once()
-    assert cut.await_args.kwargs.get("origin") == "legacy"
+    legacy_version.assert_awaited_once()
+    call_kwargs = legacy_version.await_args.kwargs
+    assert call_kwargs["user_id"] == "u-owner-1"
+    assert call_kwargs["artifact_id"] == artifact.artifact_id
+    assert call_kwargs["read"] == snapshot.ReadBasis.of(artifact)
+    assert call_kwargs["files"] == captured.files
+    assert call_kwargs["title"] == captured.title
 
 
 # --- switch off: an old link still unshares ---------------------------------
@@ -609,7 +619,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
     """The tool's absence is the whole guard: it writes to the comments tables
     in its own body, out of the HTTP layer's reach."""
     from ptc_agent.agent.agent import PTCAgent
-    from ptc_agent.config.agent import AgentConfig, LLMConfig
+    from ptc_agent.config.agent import Admitted, AgentConfig, LLMConfig
     from ptc_agent.config.core import (
         DaytonaConfig,
         FilesystemConfig,
@@ -628,6 +638,10 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
         mcp=MCPConfig(),
         filesystem=FilesystemConfig(),
     )
+    # DALTON-HOOK(artifact-publishing-off): upstream #741/#746/#749 gates Claude Code on claude_code_admitted and passes (sandbox, admitted).
+    from ptc_agent.agent.claude_code.launcher import LocalLauncher
+
+    config.claude_code_admitted = Admitted()
     target = create_llm("claude-haiku-5-5-code")
     with patch.object(AgentConfig, "get_llm_client", return_value=target):
         graph = PTCAgent(config).create_agent(
@@ -636,8 +650,9 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             user_id="u-1",
             mcp_registry=MagicMock(),
             sandbox=MagicMock(),
-            claude_code_launcher=lambda sandbox, hosted, saved: MagicMock(),
+            claude_code_launcher=lambda sandbox, admitted: LocalLauncher(),
         )
-    assert "reply_to_comment" not in {
-        t.name for t in graph.turn.spec.tools
-    }
+    # Upstream #729: a Claude Code graph's turn is the run named by config.
+    # The tool list lives on the ClaudeTurn that call returns.
+    turn = graph.turn({"configurable": {"thread_id": "t-switch-1", "checkpoint_ns": ""}})
+    assert "reply_to_comment" not in {t.name for t in turn.spec.tools}

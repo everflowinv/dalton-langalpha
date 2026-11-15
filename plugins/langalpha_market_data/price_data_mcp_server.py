@@ -47,6 +47,7 @@ from data_client.ginlix_data import (
 )
 from data_client.market_data_provider import symbol_market
 from data_client.normalize import (  # DALTON-HOOK(market-data-fallback)
+    listing_currency,
     minor_unit_places,
     normalize_bars,
     populated,
@@ -167,7 +168,7 @@ def _resolve(symbol: str, asset_class: Optional[AssetClass] = None) -> _Resolved
     """
     try:
         ref = to_canonical(symbol, asset_class=asset_class)
-        return to_request_spelling(ref), to_legacy_api(ref), ref.price_currency, ref.tz, ref
+        return to_request_spelling(ref), to_legacy_api(ref), listing_currency(ref), ref.tz, ref
     except Exception:  # noqa: BLE001
         return symbol, symbol, None, None, None
 
@@ -941,7 +942,7 @@ async def get_stock_data(
         extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
-        dict: {symbol, interval, currency, timezone, count, data, source,
+        dict: {symbol, interval, currency?, timezone, count, data, source,
         price_treatment, name?, in_progress?, truncated?, incomplete?}. data:
         list of {date, open, high, low, close, volume} ascending (oldest first);
         date exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
@@ -993,7 +994,7 @@ async def get_asset_data(
         extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
-        dict: {symbol, asset_type, interval, currency, timezone, count, data,
+        dict: {symbol, asset_type, interval, currency?, timezone, count, data,
         source, price_treatment, name?, in_progress?, truncated?, incomplete?}.
         data: list of {date, open, high, low, close, volume} ascending; date
         exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major

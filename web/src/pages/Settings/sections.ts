@@ -1,5 +1,6 @@
 import type { ComponentType } from 'react';
 import {
+  AppWindow,
   Bot,
   CandlestickChart,
   CircleUser,
@@ -13,7 +14,9 @@ import {
   Plug,
   SlidersHorizontal,
 } from 'lucide-react';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isPlatformMode } from '@/config/hostMode';
+import { canDesktopSettings } from '@/lib/desktop';
 import { TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 
 interface SectionMeta {
@@ -23,6 +26,8 @@ interface SectionMeta {
   icon: ComponentType<{ className?: string }>;
   /** Points into the hosted account console, which a self-hosted build has none of. */
   platformOnly?: boolean;
+  /** Settings the desktop shell keeps, so drawn only in a shell that can read and write them. */
+  desktopOnly?: boolean;
 }
 
 /**
@@ -39,6 +44,7 @@ export const SECTIONS = {
   chat: { labelKey: 'settings.section.chat', descKey: 'settings.definition.chat', icon: MessageSquare },
   // An HTML file's glyph everywhere else in the app (`fileKindIcon('page')`).
   artifacts: { labelKey: 'settings.section.artifacts', descKey: 'settings.definition.artifacts', icon: Globe },
+  desktop: { labelKey: 'settings.section.desktop', descKey: 'settings.definition.desktop', icon: AppWindow, desktopOnly: true },
   agent: { labelKey: 'settings.section.agent', descKey: 'settings.definition.agent', icon: Bot },
   model: { labelKey: 'settings.section.model', descKey: 'settings.definition.model', icon: Cpu },
   integrations: { labelKey: 'settings.section.integrations', descKey: 'settings.definition.integrations', icon: Plug, platformOnly: true },
@@ -54,12 +60,13 @@ export function sectionShown(section: Section): boolean {
   // DALTON-HOOK(hide-experiments): Dalton does not expose experimental labs in Settings
   if (section === 'trading' || section === 'experiments') return false;
   const meta: SectionMeta = SECTIONS[section];
+  if (meta.desktopOnly && !canDesktopSettings()) return false;
   return isPlatformMode || !meta.platformOnly;
 }
 
 export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }[] = [
   { labelKey: 'settings.group.account', sections: ['account', 'preferences', 'plan'] },
-  { labelKey: 'settings.group.app', sections: ['general', 'appearance', 'chat', 'artifacts'] },
+  { labelKey: 'settings.group.app', sections: ['general', 'appearance', 'chat', 'artifacts', 'desktop'] },
   { labelKey: 'settings.group.agent', sections: ['agent', 'model', 'integrations', 'trading'] },
   { labelKey: 'settings.group.labs', sections: ['experiments'] },
 ];
@@ -92,12 +99,14 @@ export interface SettingEntry {
   anchor: string;
   labelKey: string;
   descKey?: string;
-  /** Drawn only in the desktop app, so only found there. */
+  /** Drawn only in the desktop app, so only found there. A whole section's
+   *  rows are kept out by the section's own flag. */
   desktopOnly?: boolean;
   /** Drawn only in the Models section's advanced view, which opening it turns on. */
   advanced?: boolean;
-  /** Names of rows drawn only some of the time beside this one, which a
-   *  search finds here so it never opens on a row that is not there. */
+  /** Other names the search finds this row by, though the row does not show
+   *  them: rows drawn only some of the time beside it, so a search never opens
+   *  on a row that is not there, or the name of the group the row sits in. */
   alsoKeys?: readonly string[];
   // DALTON-HOOK(settings-section): bilingual search terms and card-level visibility predicate
   keywords?: string;
@@ -118,7 +127,8 @@ export const SETTINGS = {
   timezone: { section: 'general', anchor: 'timezone', labelKey: 'settings.timezone', descKey: 'settings.timezoneDesc' },
   linkTarget: { section: 'general', anchor: 'link-target', labelKey: 'settings.shareLinkOpen', descKey: 'settings.shareLinkOpenDesc', desktopOnly: true },
   guides: { section: 'general', anchor: 'guides', labelKey: 'onboarding.settings.sectionTitle', descKey: 'onboarding.settings.description' },
-  theme: { section: 'appearance', anchor: 'theme', labelKey: 'settings.theme', descKey: 'settings.themeDesc' },
+  // Drawn as Mode under the Theme heading, and still looked for as the theme.
+  theme: { section: 'appearance', anchor: 'theme', labelKey: 'settings.themeMode', descKey: 'settings.themeDesc', alsoKeys: ['settings.theme'] },
   fontSize: { section: 'appearance', anchor: 'font-size', labelKey: 'settings.fontSize', descKey: 'settings.fontSizeDesc' },
   cardStyle: { section: 'appearance', anchor: 'card-style', labelKey: 'settings.cardStyle', descKey: 'settings.cardStyleDesc', keywords: '卡片样式 card style' },
   turnDisplay: { section: 'chat', anchor: 'stream-reasoning', labelKey: 'settings.turnDisplay', descKey: 'settings.turnDisplayDesc' },
@@ -126,11 +136,27 @@ export const SETTINGS = {
   toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings.toolCallLayout', descKey: 'settings.toolCallLayoutDesc' },
   turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings.turnEndScroll', descKey: 'settings.turnEndScrollDesc' },
   voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings.voiceInput', descKey: 'settings.voiceInputDesc' },
+  // DALTON-HOOK(settings-section): bilingual search keywords for artifacts & output settings
   commentDestination: { section: 'artifacts', anchor: 'comment-destination', labelKey: 'settings.artifacts.destination', descKey: 'settings.artifacts.destinationDesc', keywords: '评论去向 comment destination' },
   commentEnter: { section: 'artifacts', anchor: 'comment-enter', labelKey: 'settings.artifacts.enter', descKey: 'settings.artifacts.enterDesc', keywords: '评论 回车 comment enter' },
   artifactAnswers: { section: 'artifacts', anchor: 'artifact-answers', labelKey: 'settings.artifacts.answers', descKey: 'settings.artifacts.answersDesc', keywords: '评论 回答 artifact answers' },
+  notifyTurn: { section: 'desktop', anchor: 'notify-turn', labelKey: 'settings.desktop.notifyTurn', descKey: 'settings.desktop.notifyTurnDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyNeedsInput: { section: 'desktop', anchor: 'notify-needs-input', labelKey: 'settings.desktop.notifyNeedsInput', descKey: 'settings.desktop.notifyNeedsInputDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyWakeup: { section: 'desktop', anchor: 'notify-wakeup', labelKey: 'settings.desktop.notifyWakeup', descKey: 'settings.desktop.notifyWakeupDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyAutomation: { section: 'desktop', anchor: 'notify-automation', labelKey: 'settings.desktop.notifyAutomation', descKey: 'settings.desktop.notifyAutomationDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyStarted: { section: 'desktop', anchor: 'notify-started', labelKey: 'settings.desktop.notifyStarted', descKey: 'settings.desktop.notifyStartedDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  // The rows under it are drawn only where the platform can do them.
+  menubarIcon: { section: 'desktop', anchor: 'menubar-icon', labelKey: 'settings.desktop.menubarIcon', descKey: 'settings.desktop.menubarIconDesc', alsoKeys: ['settings.desktop.shortcut', 'settings.desktop.keepRunning', 'settings.desktop.openAtLogin'] },
+  // Drawn while the icon is on, which it is by default. Rotate / side by side
+  // is drawn only where the text sits beside the icon (macOS), so it is found
+  // through the list it lays out.
+  menubarItems: { section: 'desktop', anchor: 'menubar-items', labelKey: 'settings.desktop.menubarItems', descKey: 'settings.desktop.menubarItemsDesc', alsoKeys: ['settings.desktop.menubarStyle', 'settings.desktop.menubarStyleRotate', 'settings.desktop.menubarStyleSide', 'settings.desktop.addSymbol'] },
+  menubarShow: { section: 'desktop', anchor: 'menubar-show', labelKey: 'settings.desktop.menubarShow', descKey: 'settings.desktop.menubarShowDesc', alsoKeys: ['settings.desktop.menubarGroup'] },
+  menubarExtendedHours: { section: 'desktop', anchor: 'menubar-extended-hours', labelKey: 'settings.desktop.menubarExtended', descKey: 'settings.desktop.menubarExtendedDesc', alsoKeys: ['settings.desktop.menubarGroup'] },
+  panelSections: { section: 'desktop', anchor: 'panel-sections', labelKey: 'settings.desktop.panelSections', descKey: 'settings.desktop.panelSectionsDesc', alsoKeys: ['settings.desktop.panelGroup'] },
+  panelTiles: { section: 'desktop', anchor: 'panel-tiles', labelKey: 'settings.desktop.panelTiles', descKey: 'settings.desktop.panelTilesDesc', alsoKeys: ['settings.desktop.panelGroup'] },
+  panelWatchlist: { section: 'desktop', anchor: 'panel-watchlist', labelKey: 'settings.desktop.panelWatchlist', descKey: 'settings.desktop.panelWatchlistDesc', alsoKeys: ['settings.desktop.panelGroup'] },
   outputFormat: { section: 'agent', anchor: 'output-format', labelKey: 'settings.outputFormat', descKey: 'settings.outputFormatDesc', keywords: '输出格式 output format' },
-
   researchDepth: { section: 'agent', anchor: 'research-depth', labelKey: 'settings.researchDepth', descKey: 'settings.researchDepthDesc' },
   reachingOut: { section: 'agent', anchor: 'reaching-out', labelKey: 'settings.reachingOut', descKey: 'settings.reachingOutDesc' },
   subagents: { section: 'agent', anchor: 'subagents', labelKey: 'settings.subagentsDefault', descKey: 'settings.subagentsDefaultDesc' },
@@ -203,6 +229,25 @@ const LEGACY_SECTIONS: Record<string, Section> = {
   llm: 'model',
   dalton: 'model',
 };
+
+/**
+ * The words a setting is found by: its name, what it does, its aliases and the
+ * section it sits in. One list for every search over settings, so the page's
+ * rail and the command palette find the same setting for the same words.
+ */
+export function settingSearchText(
+  entry: SettingEntry,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  return [
+    t(entry.labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)
+    entry.descKey ? t(entry.descKey, { brand: BRAND_NAME }) : '', // DALTON-HOOK(brand-name)
+    ...(entry.alsoKeys ?? []).map((key) => t(key, { brand: BRAND_NAME })), // DALTON-HOOK(brand-name)
+    t(SECTIONS[entry.section].labelKey),
+    // DALTON-HOOK(settings-section): match bilingual keywords so Chinese and English queries always hit
+    entry.keywords ?? '',
+  ].join(' ');
+}
 
 function asSection(param: string | null): Section | null {
   if (!param) return null;

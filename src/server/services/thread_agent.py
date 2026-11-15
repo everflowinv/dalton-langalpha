@@ -19,7 +19,7 @@ from fastapi import HTTPException
 if TYPE_CHECKING:
     from ptc_agent.agent.claude_code.launcher import Launcher
     from ptc_agent.agent.roles import AgentRole
-    from ptc_agent.config.agent import AgentConfig
+    from ptc_agent.config.agent import Admitted, AgentConfig
     from ptc_agent.core.project_context import ProjectContext
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
     from src.server.services.computer_manager._types import WorkspaceToolView
@@ -179,12 +179,17 @@ class AgentInputs:
             kwargs["workspace_owner_id"] = self.workspace_owner_id
         return kwargs
 
-    def claude_code_launcher(self, sandbox: PTCSandbox, admitted: str | None, saved: str | None) -> Launcher:
-        """Where a Claude Code turn's CLI runs, on the token it signs in with:
-        on a cloud computer the credential admission let it run on
-        (``admitted``), and the setup token the user saved where admission let
-        it sign in with that (``saved``). Imported here, never at the top: the
-        SDK loads only for such a turn."""
+    def claude_code_launcher(
+        self, sandbox: PTCSandbox, admitted: Admitted, *, slot_wait_s: float | None = None,
+    ) -> Launcher:
+        """Where a Claude Code CLI runs, a turn's or a subagent's, and the token
+        it signs in with, by what admission let it run on (``admitted``).
+        ``slot_wait_s`` is how long a CLI on an own computer waits for a slot
+        there, a subagent's shorter than a turn's. Imported here, never at the
+        top: the SDK loads only for such a CLI."""
         from src.server.services.claude_code.launchers import turn_launcher
 
-        return turn_launcher(sandbox, computer_id=self.computer_id, user_id=self.user_id, admitted=admitted, saved=saved)
+        return turn_launcher(
+            sandbox, computer_id=self.computer_id, workspace_id=self.workspace_id, user_id=self.user_id,
+            admitted=admitted, slot_wait_s=slot_wait_s,
+        )

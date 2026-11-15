@@ -8,6 +8,7 @@ from uuid import UUID
 from market_protocol import display_spelling
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, field_validator
 
+from src.llms.claude_code import PlanOut
 from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES
 
 
@@ -136,6 +137,16 @@ class OtherPreference(BaseModel):
     )
     auto_approve_workspace_creation: Optional[StrictBool] = Field(
         None, description="Create workspaces without asking; absent means ask."
+    )
+    # Strict too: a value that is not one of the two would read as Stop,
+    # so it is refused rather than saved as if it meant something.
+    claude_code_plan_out: Optional[PlanOut] = Field(
+        None,
+        description=(
+            "What Claude Code turns do once the Claude plan is used up: stop "
+            "and wait for it to reset, or go on on the account's usage "
+            "credits; absent means stop."
+        ),
     )
 
 
@@ -282,6 +293,13 @@ class UserPreferencesUpdate(UserPreferencesBase):
         "to existing threads: 'existing_threads' moves the threads still on the "
         "old default to the new one, 'new_threads' leaves them. Never stored; "
         "absent, model_preference.default_model_scope decides.",
+    )
+    expect_other_preference: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Keys of other_preference with the value each held when "
+        "the client read it (null = absent). The write applies only if every "
+        "named key still holds exactly that, else 409 with code "
+        "'preference_changed' and nothing written. Never stored.",
     )
 
 

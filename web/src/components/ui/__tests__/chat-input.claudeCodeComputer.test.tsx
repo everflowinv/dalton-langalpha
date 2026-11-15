@@ -4,7 +4,9 @@
  * fix links Settings to the workspace, which opens that computer's sheet;
  * on a hosted computer where no saved token runs, nowhere, which the rows
  * say with nothing to fix, unless the user chose how it runs there: then
- * Settings fixes it, and on their Anthropic API key the rows say that pays.
+ * Settings fixes it. Where the CLI runs on an own computer the server picks,
+ * the rows say none is online, or name the one that is offline. The Chief
+ * of Staff's rows follow where the server places its CLI.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
@@ -14,7 +16,7 @@ import ChatInput, { type ChatInputProps } from '../chat-input';
 import type { ModelRowStatus } from '../chat-input.modelPicker';
 import type { WorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
-import { ANTHROPIC_KEY_URL, CLAUDE_CODE_CHOICE_URL, claudeCodeTokenUrl } from '@/lib/claudeCode';
+import { CLAUDE_CODE_CHOICE_URL, claudeCodeTokenUrl } from '@/lib/claudeCode';
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
@@ -24,6 +26,7 @@ vi.mock('@/pages/ChatAgent/utils/api', () => ({
 
 const mocks = vi.hoisted(() => ({
   where: { state: 'signed_in', computerId: null, known: true } as WorkspaceClaudeCode, asked: [] as unknown[], planUrl: null as string | null,
+  medium: null as { kind: 'resize' | 'plan' | 'resizing'; go: () => void } | null, mediumAsked: undefined as unknown, go: vi.fn(),
 }));
 
 vi.mock('@/config/supportLinks', async (original) => ({
@@ -31,8 +34,17 @@ vi.mock('@/config/supportLinks', async (original) => ({
   get PLAN_URL() { return mocks.planUrl; },
 }));
 
+// The hold's own copy is pinned in useMediumAction.test; here, that the row
+// carries it and its fix.
+vi.mock('@/pages/ChatAgent/hooks/useMediumAction', () => ({
+  useMediumHold: (computerId: string | null) => {
+    mocks.mediumAsked = computerId;
+    return mocks.medium && { unavailable: `hold:${mocks.medium.kind}`, fix: mocks.medium.go };
+  },
+}));
+
 vi.mock('@/hooks/useWorkspaceClaudeCode', () => ({
-  useWorkspaceClaudeCode: (...args: unknown[]) => {
+  useTurnClaudeCode: (...args: unknown[]) => {
     mocks.asked = args;
     return mocks.where;
   },
@@ -73,15 +85,15 @@ vi.mock('../use-toast', () => ({
 // row, and runs a row's fix as a press on it would.
 vi.mock('../chat-input.modelMenu', () => ({
   ChatInputModelMenu: ({ rowStatus, payers, groups }: {
-    rowStatus: (m: string) => ModelRowStatus;
+    rowStatus: (m: string, now: number) => ModelRowStatus;
     payers: Record<string, string>;
     groups: { id: string; connections: { payer?: string }[] }[];
   }) => {
     const read = (m: string) => {
-      const s = rowStatus(m);
+      const s = rowStatus(m, Date.now());
       return 'unavailable' in s ? `held:${s.unavailable}${s.fix ? ':fix' : ''}` : 'pick';
     };
-    const code = rowStatus('claude-x-code');
+    const code = rowStatus('claude-x-code', Date.now());
     return (
       <>
         <span>{`claude-x:${read('claude-x')}`}</span>
@@ -101,13 +113,13 @@ function Where() {
   return <span>{`at:${pathname}${search}`}</span>;
 }
 
-function renderInput() {
+function renderInput(scope: ChatInputProps['scope'] = 'workspace') {
   return render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
       <MemoryRouter>
         <ChatInput
           onSend={vi.fn()}
-          scope="workspace"
+          scope={scope}
           onScopeChange={vi.fn()}
           workspaces={[{ workspace_id: 'ws-1', name: 'Alpha desk' }] as ChatInputProps['workspaces']}
           selectedWorkspaceId="ws-1"
@@ -124,6 +136,9 @@ const codeRow = () => screen.getByText(/^claude-x-code:/).textContent;
 describe("ChatInput: Claude Code rows by the workspace's computer", () => {
   beforeEach(() => {
     mocks.planUrl = null;
+    mocks.medium = null;
+    mocks.mediumAsked = undefined;
+    mocks.go.mockReset();
     ContextBus.__resetForTests();
     ChatInputRegistry.__resetForTests();
     Element.prototype.scrollIntoView = vi.fn();
@@ -131,7 +146,7 @@ describe("ChatInput: Claude Code rows by the workspace's computer", () => {
 
   it('asks after the selected workspace', () => {
     renderInput();
-    expect(mocks.asked).toEqual(['ws-1']);
+    expect(mocks.asked).toEqual([false, 'ws-1']);
   });
 
   it.each([
@@ -166,15 +181,12 @@ describe("ChatInput: Claude Code rows by the workspace's computer", () => {
     expect(screen.getByText(/^claude-x:/)).toHaveTextContent('claude-x:pick');
   });
 
-  it.each([
-    ['hosted_off', 'Choose in Settings how it runs on cloud computers', CLAUDE_CODE_CHOICE_URL],
-    ['needs_api_key', 'Add your Anthropic API key in Settings to use it on cloud computers', ANTHROPIC_KEY_URL],
-  ] as const)('on a hosted computer while %s, leads to Settings', (state, words, url) => {
-    mocks.where = { state, computerId: null, known: true };
+  it('on a hosted computer while the choice for cloud computers is off, leads to Settings', () => {
+    mocks.where = { state: 'hosted_off', computerId: null, known: true };
     renderInput();
-    expect(codeRow()).toBe(`claude-x-code:held:${words}:fix`);
+    expect(codeRow()).toBe('claude-x-code:held:Choose in Settings how it runs on cloud computers:fix');
     fireEvent.click(screen.getByRole('button', { name: 'fix' }));
-    expect(screen.getByText(/^at:/).textContent).toBe(`at:${url}`);
+    expect(screen.getByText(/^at:/).textContent).toBe(`at:${CLAUDE_CODE_CHOICE_URL}`);
   });
 
   it('holds them on a cloud computer too small for Claude Code, with nothing to fix here', () => {
@@ -182,6 +194,30 @@ describe("ChatInput: Claude Code rows by the workspace's computer", () => {
     renderInput();
     expect(codeRow()).toBe('claude-x-code:held:Needs a Medium or larger cloud computer, or a computer of your own');
     expect(screen.queryByRole('button', { name: 'fix' })).toBeNull();
+  });
+
+  it.each(['resize', 'plan', 'resizing'] as const)('on a named cloud computer too small for Claude Code, holds the row with the fix when that is to %s, and does it', (kind) => {
+    mocks.medium = { kind, go: mocks.go };
+    mocks.where = { state: 'needs_bigger_computer', computerId: null, known: true, smallComputerId: 'cmp-small' };
+    renderInput();
+    expect(mocks.mediumAsked).toBe('cmp-small');
+    expect(codeRow()).toBe(`claude-x-code:held:hold:${kind}:fix`);
+    fireEvent.click(screen.getByRole('button', { name: 'fix' }));
+    expect(mocks.go).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/^at:/).textContent).toBe('at:/');
+  });
+
+  it('asks after no computer unless the workspace\'s is too small for Claude Code', () => {
+    mocks.where = { state: 'signed_in', computerId: 'cmp-mac', known: true, smallComputerId: 'cmp-small' };
+    renderInput();
+    expect(mocks.mediumAsked).toBeNull();
+  });
+
+  it('falls back to the plain hold where nothing gets the named computer to Medium', () => {
+    mocks.where = { state: 'needs_bigger_computer', computerId: null, known: true, smallComputerId: 'cmp-small' };
+    renderInput();
+    expect(mocks.mediumAsked).toBe('cmp-small');
+    expect(codeRow()).toBe('claude-x-code:held:Needs a Medium or larger cloud computer, or a computer of your own');
   });
 
   it('where the build names a plan page, leads a cloud computer too small for Claude Code to it', () => {
@@ -195,20 +231,29 @@ describe("ChatInput: Claude Code rows by the workspace's computer", () => {
     opened.mockRestore();
   });
 
-  it('holds them where the user\'s choice for cloud computers is paused, with nothing to fix', () => {
-    mocks.where = { state: 'hosted_paused', computerId: null, known: true };
+  it('holds them where no computer of the user\'s own with its own token is online, leading to Claude Code in Settings', () => {
+    mocks.where = { state: 'no_own_computer', computerId: null, known: true };
     renderInput();
-    expect(codeRow()).toBe('claude-x-code:held:Paused on cloud computers on this server');
+    expect(codeRow()).toBe('claude-x-code:held:Needs a computer of yours with its own setup token online:fix');
+    fireEvent.click(screen.getByRole('button', { name: 'fix' }));
+    expect(screen.getByText(/^at:/).textContent).toBe(`at:${CLAUDE_CODE_CHOICE_URL}`);
+  });
+
+  it('holds them while the computer that runs Claude Code is offline, naming it, with nothing to fix', () => {
+    mocks.where = { state: 'cli_computer_offline', computerId: null, known: true, cliComputerName: 'Studio Mac' };
+    renderInput();
+    expect(codeRow()).toBe('claude-x-code:held:Studio Mac is offline');
     expect(screen.queryByRole('button', { name: 'fix' })).toBeNull();
   });
 
-  it("runs them on a hosted computer on the user's Anthropic API key, which pays for them there", () => {
-    mocks.where = { state: 'api_key', computerId: null, known: true };
-    const { unmount } = renderInput();
-    expect(codeRow()).toBe('claude-x-code:pick');
-    expect(screen.getByText(/^paid:/)).toHaveTextContent('paid:credits,own_key');
-    expect(screen.getByText(/^tab:/)).toHaveTextContent('tab:own_key');
-    unmount();
+  it("asks after the Chief of Staff's turn, and words Home's computer too small without a move to an own computer", () => {
+    mocks.where = { state: 'needs_bigger_computer', computerId: null, known: true };
+    renderInput('all');
+    expect(mocks.asked[0]).toBe(true);
+    expect(codeRow()).toBe('claude-x-code:held:Needs a Medium or larger cloud computer');
+  });
+
+  it("runs them on the user's own computer, where the subscription pays for them", () => {
     mocks.where = { state: 'signed_in', computerId: 'cmp-mac', known: true };
     renderInput();
     expect(screen.getByText(/^paid:/)).toHaveTextContent('paid:credits,subscription:claude-code');

@@ -151,12 +151,13 @@ async def test_reasoning_lifecycle_emits_inline_start_and_complete_on_transition
     ]
 
 
-def _reasoning_summary(text, index, msg_id="msg-1"):
-    """OpenAI Response API reasoning chunk: a summary_text item carrying the
-    thought-step ``index`` the forwarder uses to detect section boundaries."""
+def _reasoning_summary(text, index, msg_id="msg-1", item=0):
+    """OpenAI Response API reasoning chunk: a summary part (``index``) of one
+    reasoning item (``item``, langchain-openai's block index)."""
     return _chunk(
         {
             "type": "reasoning",
+            "index": item,
             "summary": [{"index": index, "type": "summary_text", "text": text}],
         },
         msg_id=msg_id,
@@ -191,6 +192,28 @@ async def test_reasoning_section_transition_inserts_separator():
         ("reasoning_signal", "complete"),
         ("text", "here is the answer"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_new_reasoning_item_inserts_separator_at_same_summary_index():
+    """A response can hold several reasoning items, each numbering its summary
+    parts from 0: a one-part item followed by another is still a new section,
+    or the two titles glue into ``**A****B**``."""
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    await fw.forward(_reasoning_summary("**Researching partnerships**", 0, item=0))
+    await fw.forward(_reasoning_summary("**Refining ticker scope**", 0, item=1))
+    await fw.finalize()
+
+    contents = [
+        e["data"].get("content")
+        for e in task._test_records
+        if e["event"] == "message_chunk"
+        and e["data"].get("content_type") == "reasoning"
+    ]
+    assert contents == ["**Researching partnerships**", "\n\n**Refining ticker scope**"]
 
 
 @pytest.mark.asyncio
@@ -762,6 +785,35 @@ async def test_forward_custom_sends_file_operation_as_path_only_artifact() -> No
         "operation": "Write",
         "file_path": "x.md",
         "error": "denied",
+    }
+
+
+@pytest.mark.asyncio
+async def test_forward_custom_sends_a_published_chart_layer() -> None:
+    """A layer a subagent's code published is stored already; the open chart
+    refetches it on the task lane's add, so the forwarder passes its address
+    and never its body, which can run to megabytes."""
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry, task_id_override="cl1")
+    fwd = _SubagentTokenForwarder(registry, task.tool_call_id, "task:cl1")
+    payload = {
+        "op": "add",
+        "workspace_id": "w",
+        "chart_id": "NVDA:1day",
+        "symbol": "NVDA",
+        "timeframe": "1day",
+        "layer_id": "lyr_x",
+        "layer": {"id": "x"},
+        "type": "message_chunk",
+    }
+
+    await fwd.forward_custom({"artifact_type": "chart_layer", "artifact_id": "lyr_x", "payload": payload})
+
+    (record,) = task._test_records
+    assert record["event"] == "artifact"
+    assert record["data"]["agent"] == "task:cl1"
+    assert record["data"]["payload"] == {
+        k: v for k, v in payload.items() if k not in ("type", "layer")
     }
 
 

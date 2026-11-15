@@ -8,19 +8,20 @@ import type { Mock } from 'vitest';
 import { QueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 
-vi.mock('@/lib/quotes/snapshotApi', () => ({
-  getSnapshotStocks: vi.fn(),
-  getSnapshotIndexes: vi.fn(),
+const { mockGetSnapshotStocks, mockGetSnapshotIndexes } = vi.hoisted(() => ({
+  mockGetSnapshotStocks: vi.fn() as Mock,
+  mockGetSnapshotIndexes: vi.fn() as Mock,
 }));
 
-import { getSnapshotStocks, getSnapshotIndexes } from '@/lib/quotes/snapshotApi';
+vi.mock('@/lib/quotes/snapshotApi', () => ({
+  fetchSnapshotBatch: (kind: 'stocks' | 'indexes', symbols: string[]) =>
+    (kind === 'stocks' ? mockGetSnapshotStocks : mockGetSnapshotIndexes)(symbols),
+}));
+
 import { getQuoteBatcher, QuoteBatcher } from '../quoteBatcher';
 import { snapshotToStockPrice } from '../quoteAdapters';
 import { writeQuoteFromWs } from '../quoteWriteThrough';
 import { deriveQuoteDisplay, roundQuote2 } from '@/lib/dalton/quotes/deriveQuoteDisplay'; // DALTON-HOOK(extended-hours-quotes)
-
-const mockGetSnapshotStocks = getSnapshotStocks as Mock;
-const mockGetSnapshotIndexes = getSnapshotIndexes as Mock;
 
 describe('QuoteBatcher', () => {
   let client: QueryClient;
@@ -109,9 +110,24 @@ describe('QuoteBatcher', () => {
     expect(a).toBe(b);
   });
 
-  it('resolves every pending symbol to null when the batch call throws', async () => {
-    mockGetSnapshotStocks.mockRejectedValue(new Error('network'));
-    await expect(batcher.request('AAPL')).resolves.toBeNull();
+  it('keeps a known row and its age when a refresh drops the symbol or fails', async () => {
+    mockGetSnapshotStocks.mockResolvedValueOnce({ snapshots: [{ symbol: 'AAPL', price: 100 }] });
+    await batcher.request('AAPL');
+    const updatedAt = client.getQueryState(queryKeys.quote.detail('AAPL'))?.dataUpdatedAt;
+    mockGetSnapshotStocks.mockResolvedValueOnce({ snapshots: [] });
+    await expect(batcher.request('AAPL')).rejects.toThrow('No quote for AAPL');
+    mockGetSnapshotStocks.mockRejectedValueOnce(new Error('network'));
+    await expect(batcher.request('AAPL')).rejects.toThrow('network');
+    expect(client.getQueryData(queryKeys.quote.detail('AAPL'))).toMatchObject({ price: 100 });
+    expect(client.getQueryState(queryKeys.quote.detail('AAPL'))?.dataUpdatedAt).toBe(updatedAt);
+  });
+
+  it('rejects every pending symbol when the batch call throws, and asks again next time', async () => {
+    mockGetSnapshotStocks.mockRejectedValueOnce(new Error('network'));
+    await expect(batcher.request('AAPL')).rejects.toThrow('network');
+    expect(client.getQueryData(queryKeys.quote.detail('AAPL'))).toBeUndefined();
+    mockGetSnapshotStocks.mockResolvedValueOnce({ snapshots: [{ symbol: 'AAPL', price: 101 }] });
+    await expect(batcher.request('AAPL')).resolves.toMatchObject({ price: 101 });
   });
 
   it('binds one batcher per QueryClient', () => {
@@ -170,6 +186,25 @@ describe('snapshotToStockPrice', () => {
       session: { previousClose: 101.69 },
     });
     expect(roundQuote2(adapted.price)).toBe(100.46);
+  });
+
+  it('quotes a row with no close yet at the previous close, keeping its pre-market move', () => {
+    // A new day's snapshot before the regular session prints: what every
+    // US stock looks like from 4:00 ET until its first tick lands.
+    expect(
+      snapshotToStockPrice('AAPL', {
+        symbol: 'AAPL', price: null, change: 1.36, previous_close: 354.88,
+        last_minute_close: 356.23, early_trading_change: 1.36, early_trading_change_percent: 0.38,
+      }),
+    ).toMatchObject({
+      price: 354.88,
+      change: 0,
+      changePercent: 0,
+      quoteAvailable: true,
+      session: { previousClose: 354.88, lastMinuteClose: 356.23, earlyTradingChangePercent: 0.38 },
+    });
+    expect(snapshotToStockPrice('AAPL', { symbol: 'AAPL', price: null }).quoteAvailable).toBe(false);
+    expect(snapshotToStockPrice('AAPL', { symbol: 'AAPL', price: null, previous_close: 0 }).quoteAvailable).toBe(false);
   });
 
   it('keeps a sub-cent tick and a CN fund price unrounded', () => {

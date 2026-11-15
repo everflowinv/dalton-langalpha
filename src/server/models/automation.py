@@ -742,10 +742,12 @@ ExecutionStatus = Literal[
 # waiting), or the server stopped while it waited.
 SkipReason = Literal["user", "thread_busy", "interrupted", "precheck"]  # DALTON-HOOK(precheck-skip-reason)
 # Why a ``failed`` firing failed, when it was not the automation's own doing:
-# a usage limit refused it or paused its run, the provider rejected the
+# a usage limit refused it or paused its run, the Claude plan of its Claude
+# Code model refused or stopped it (``claude_plan``), another subscription's
+# usage limit refused its model call (``plan_limit``), the provider rejected the
 # user's own key, the service failed it (``server_error``), or the server cut
 # its run off (``interrupted``).
-FailureReason = Literal["usage_limit", "provider_auth", "server_error", "interrupted"]
+FailureReason = Literal["usage_limit", "claude_plan", "plan_limit", "provider_auth", "server_error", "interrupted"]
 
 
 class AutomationExecutionResponse(BaseModel):

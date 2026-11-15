@@ -38,7 +38,7 @@ from ptc_agent.agent.transcript import TranscriptTarget
 from ptc_agent.agent.transcript.classify import LEGACY_SUMMARY_PREFIX, is_summary_message
 from ptc_agent.agent.transcript.pointer import SummarySpan, transcript_note
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
-from src.llms.provider_compaction import SIDECAR_KEY, sidecar
+from src.llms.provider_compaction import SIDECAR_KEY, is_opaque, sidecar
 from ptc_agent.agent.middleware.compaction.types import (
     CONTEXT_SUMMARY_PREFIX,
     NON_CRITICAL_READ_PREFIXES,
@@ -114,7 +114,14 @@ def _extract_text_from_content(content: str | list) -> str:
 def count_tokens_tiktoken(messages: Iterable[MessageLikeRepresentation]) -> int:
     """Count tokens using tiktoken (accurate for all languages including CJK)."""
     enc = _get_tiktoken_encoder()
-    return sum(len(enc.encode(text)) + 3 for text in _sent_texts(messages))
+    return sum(len(_encoded(enc, text)) + 3 for text in _sent_texts(messages))
+
+
+def _encoded(enc: tiktoken.Encoding, text: str) -> list[int]:
+    """``text`` as tokens, a special token's spelling (``<|endoftext|>``)
+    counted as the text it is in a message: tiktoken refuses it by default,
+    which would fail the count of any thread that quotes one."""
+    return enc.encode(text, disallowed_special=())
 
 
 #: Claude's count from tiktoken's, fitted to 175 samples Claude's
@@ -146,8 +153,8 @@ def count_tokens_claude(messages: Iterable[MessageLikeRepresentation]) -> int:
     enc = _get_tiktoken_encoder()
     total = 0
     for text in _sent_texts(messages):
-        tokens = len(enc.encode(text))
-        other = sum(len(enc.encode(run)) for run in _NON_ASCII.findall(text))
+        tokens = len(_encoded(enc, text))
+        other = sum(len(_encoded(enc, run)) for run in _NON_ASCII.findall(text))
         digits = sum(map(text.count, "0123456789"))
         estimate = (
             _CLAUDE_PER_ASCII * (tokens - other)
@@ -1033,27 +1040,6 @@ _SUMMARY_SOURCE = "summarization"
 #: summarizes it: the span of turns, and the skills its note listed.
 SUMMARIZED_KEY = "summarized"
 
-#: The ``response_metadata`` key holding the summary trigger a model call ran
-#: under. The trigger is per turn (the user's or the model's compaction
-#: preset), and the checkpoint is all replay has of the turn, so it rides on
-#: the response whose usage the ring shows.
-CONTEXT_THRESHOLD_KEY = "context_threshold"
-
-
-def stamp_context_threshold(message: AIMessage, threshold: int) -> None:
-    message.response_metadata = {
-        **(message.response_metadata or {}),
-        CONTEXT_THRESHOLD_KEY: threshold,
-    }
-
-
-def context_threshold(message: Any) -> int | None:
-    """The summary trigger stamped on ``message``, or None for a message
-    saved before the stamp."""
-    value = (getattr(message, "response_metadata", None) or {}).get(CONTEXT_THRESHOLD_KEY)
-    return value if isinstance(value, int) and value > 0 else None
-
-
 #: The ``response_metadata`` key holding the summary a model call compacted
 #: to before it ran. The summary message lives only in
 #: ``_summarization_event``, which the next compaction overwrites, so each
@@ -1210,6 +1196,13 @@ def handed_off(message: Any) -> bool:
     text by its model, so its text is a summary rather than a digest."""
     stamp = (getattr(message, "additional_kwargs", None) or {}).get("summarize_complete")
     return isinstance(stamp, dict) and stamp.get("handed_off") is True
+
+
+def provider_only(message: Any) -> bool:
+    """Whether ``message`` is a summary only its provider can read that its
+    model has not written out as text, so another model reads only its
+    digest."""
+    return is_opaque(message) and not handed_off(message)
 
 
 def with_summary_text(message: HumanMessage, text: str) -> HumanMessage | None:

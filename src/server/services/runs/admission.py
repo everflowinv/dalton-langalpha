@@ -453,6 +453,7 @@ async def begin_run(
     fork,
     is_checkpoint_replay: bool,
     extra_run_metadata: Optional[dict] = None,
+    in_start: Optional[Callable[[Any], Awaitable[None]]] = None,
 ):
     """The one START-txn entrypoint: maps a ChatRequest onto the durable
     attempt chain — retries chain onto the failed run's turn, forked
@@ -471,7 +472,8 @@ async def begin_run(
     (``claim_steer_or_refuse``). START runs in a task of its own, which a
     client leaving mid-START does not cancel: the run of a START whose
     request was cancelled is settled as stopped, message kept, once START
-    is done."""
+    is done. ``in_start`` runs inside that transaction too, on its
+    connection, for a write that must commit with the run or not at all."""
     from uuid import uuid4
 
     from src.server.services.runs.coordinator import (
@@ -558,8 +560,9 @@ async def begin_run(
                     run_id=run_id,
                     user_id=user_id,
                     workspace_id=workspace_id,
+                    then=in_start,
                 )
-                if request.request_key or request.steer_job_id or has_chat_uploads
+                if request.request_key or request.steer_job_id or has_chat_uploads or in_start
                 else None
             ),
         ),
@@ -597,6 +600,7 @@ async def _start_checks(
     run_id: str,
     user_id: str | None = None,
     workspace_id: str | None = None,
+    then: Optional[Callable[[Any], Awaitable[None]]] = None,
 ) -> None:
     if request.request_key:
         await refuse_copy_read_as_steer(
@@ -622,6 +626,8 @@ async def _start_checks(
                 ),
                 conn=conn,
             )
+    if then is not None:
+        await then(conn)
 
 
 async def _settle_after_start(

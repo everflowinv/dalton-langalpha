@@ -129,11 +129,50 @@ class BackgroundRegistryStore:
                 )
             return registry
 
+    async def live_task_runs(self) -> list[tuple[str, str, str]]:
+        """The thread, task and run of each task run this worker is running
+        that no cancel has reached yet."""
+        async with self._lock:
+            registries = list(self._registries.items())
+        return [
+            (thread_id, task.task_id, task.task_run_id)
+            for thread_id, registry in registries
+            for task in list(registry._tasks.values())
+            if task.task_run_id and not task.completed
+        ]
+
+    async def stop_all_for_restart(self) -> tuple[list[asyncio.Task], set[str]]:
+        """Stop every task this worker runs for a graceful restart: the
+        writers still unwinding, and the threads whose tasks were stopped."""
+        async with self._lock:
+            registries = list(self._registries.items())
+        writers: list[asyncio.Task] = []
+        threads: set[str] = set()
+        for thread_id, registry in registries:
+            stopped = await registry.stop_writers_for_restart()
+            if stopped:
+                writers.extend(stopped)
+                threads.add(thread_id)
+        return writers, threads
+
+    async def stop_run_writers_for_restart(
+        self, thread_id: str, run_id: str
+    ) -> list[asyncio.Task]:
+        """Stop the tasks ``run_id`` spawned for a graceful restart, ahead of
+        its own stop's kill: the writers still unwinding."""
+        async with self._lock:
+            registry = self._registries.get(thread_id)
+        if registry is None:
+            return []
+        return await registry.stop_writers_for_restart(run_id)
+
     async def get_registry(self, thread_id: str) -> BackgroundTaskRegistry | None:
         async with self._lock:
             return self._registries.get(thread_id)
 
-    async def cancel_task(self, thread_id: str, task_id: str) -> bool:
+    async def cancel_task(
+        self, thread_id: str, task_id: str, *, task_run_id: str | None = None
+    ) -> bool:
         """Cancel one task if this worker owns its live writer; False otherwise.
 
         force=True: a user-targeted stop must interrupt the handler itself —
@@ -144,7 +183,7 @@ class BackgroundRegistryStore:
             registry = self._registries.get(thread_id)
         if registry is None:
             return False
-        return await registry.cancel_task(task_id, force=True)
+        return await registry.cancel_task(task_id, force=True, task_run_id=task_run_id)
 
     async def cancel_run_tasks(
         self,

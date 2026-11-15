@@ -98,6 +98,9 @@ class ShareLinkResponse(BaseModel):
     shared_at: datetime | None
     shared_files: list[str] | None
     created_at: datetime
+    #: An app's start command, fingerprinted, which its permission grant is
+    #: tied to beside the code; null for a file or an app with none stored.
+    command_key: str | None = None
 
 
 class FileGrantResponse(BaseModel):
@@ -119,6 +122,7 @@ def _to_model(link: ShareLink) -> ShareLinkResponse:
         shared_at=link.shared_at,
         shared_files=list(link.files) if link.shared and link.files else None,
         created_at=link.created_at,
+        command_key=link.command_key,
     )
 
 

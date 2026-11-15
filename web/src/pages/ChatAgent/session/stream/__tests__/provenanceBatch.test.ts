@@ -232,6 +232,7 @@ describe('createProvenanceFrameBuffer', () => {
       clearModelStatus: () => {},
       armReportBack: vi.fn(),
       refreshWorkspaces: vi.fn(),
+      refreshClaudeCodePlan: vi.fn(), // DALTON-HOOK(provenance-batch): upstream #740 dep
     };
     const refs = {
       contentOrderCounterRef: { current: 0 },

@@ -54,6 +54,7 @@ from langgraph.constants import TAG_NOSTREAM
 
 from ptc_agent.agent.claude_code.cli import RuntimeSpec, compaction_failure, compacts_at, is_haiku, launch, pointed, received, turn_failure
 from ptc_agent.agent.claude_code.launcher import Launcher, Prepared
+from ptc_agent.agent.claude_code.plan import PlanWatch
 from ptc_agent.agent.claude_code.relay import ClaudeStreamRelay
 from ptc_agent.agent.claude_code.session import (
     SETTLE_TIMEOUT_S,
@@ -64,15 +65,17 @@ from ptc_agent.agent.claude_code.session import (
     compacted,
 )
 from ptc_agent.agent.claude_code.tools_bridge import ToolResults
+from ptc_agent.agent.middleware.compaction import brief
+from ptc_agent.agent.middleware.compaction.brief import HandOffBrief
 from ptc_agent.agent.middleware.compaction.rebuild import NextSummary, cold_threshold
-from ptc_agent.agent.middleware.compaction.utils import attachment_tokens, stamp_context_threshold
+from ptc_agent.agent.middleware.compaction.usage_event import stamp_usage
+from ptc_agent.agent.middleware.compaction.utils import attachment_tokens
 from ptc_agent.agent.prompts import release
 from ptc_agent.agent.transcript import Window
 from ptc_agent.agent.transcript.pointer import aexport_transcript, transcript_note, transcript_target
 from src.config.settings import get_compaction_timeout
 from src.llms.cache_markers import ttl_seconds
-from src.llms.claude_code import ClaudeTurnFailed
-from src.llms.token_counter import extract_token_usage
+from src.llms.claude_code import ClaudeTurnFailed, PlanStopped
 from src.server.utils.error_sanitization import sanitize_error_text
 
 if TYPE_CHECKING:
@@ -215,6 +218,20 @@ class CompactionRules:
             keep_full_context=bool(turn and turn.keep_full_context),
         )
 
+    @classmethod
+    def of_subagent(cls, settings: CompactionConfig, *, backend: SandboxBackend | None = None,
+                    workspace_id: str | None = None) -> CompactionRules:
+        """A subagent run's rules: its CLI compacts at the thread's threshold.
+        A run is bounded by its clock, so, as a langalpha subagent's, it makes
+        no turn-start rebuild and no cold compaction."""
+        return cls(
+            0,
+            threshold=compacts_at(settings.token_threshold) if settings.enabled else 0,
+            backend=backend,
+            workspace_id=workspace_id,
+            enabled=settings.enabled,
+        )
+
     def reading(self) -> dict[str, Any]:
         """What ``next_summary`` reads of this turn's rules between turns
         (``RULES_KEY``), the user's settings included, and when it was read."""
@@ -236,19 +253,40 @@ class CompactionRules:
         settled = self.settled_at.replace(tzinfo=self.settled_at.tzinfo or UTC).timestamp() if self.settled_at else 0.0
         return max(_last_activity(entries), settled) + cache_ttl(entries)
 
-    async def transcript_note(self, thread_id: str, state: Mapping[str, Any]) -> str:
-        """What the compaction summaries in the thread's session records end
-        on: the pointer an API thread's summary ends on, once the transcript
-        of the thread's messages is saved where the file tools reach it, as
-        the compaction middleware saves it before it points; else nothing."""
+    async def transcript_note(self, thread_id: str, state: Mapping[str, Any], checkpoint_ns: str = "") -> str:
+        """What the compaction summaries in the session records of the run in
+        ``checkpoint_ns`` end on: the pointer an API thread's summary ends on,
+        once the transcript of its messages is saved where the file tools
+        reach it, as the compaction middleware saves it before it points;
+        else nothing."""
         entries = (state.get("claude_session") or {}).get("entries") or []
         if not any(e.get("isCompactSummary") for e in entries):
             return ""
         exported = await aexport_transcript(
-            self.backend, transcript_target(self.backend, thread_id), state["messages"],
+            self.backend, transcript_target(self.backend, thread_id, checkpoint_ns), state["messages"],
             workspace_id=self.workspace_id, window=Window.of(state),
         )
         return transcript_note(exported) if exported else ""
+
+    async def digest_brief(self, thread_id: str, state: Mapping[str, Any], checkpoint_ns: str = "") -> HandOffBrief | None:
+        """The brief a turn opens on when no model wrote one for it
+        (``brief.digest_brief``), pointing at the transcript where the file
+        tools reach it; None when Claude replied last."""
+        return await brief.digest_brief(
+            state["messages"], backend=self.backend, workspace_id=self.workspace_id,
+            transcript=transcript_target(self.backend, thread_id, checkpoint_ns), window=Window.of(state),
+        )
+
+    async def thread_brief(
+        self, thread_id: str, state: Mapping[str, Any], room: int, checkpoint_ns: str = ""
+    ) -> HandOffBrief | None:
+        """The thread itself as the brief a turn opens on, fitted to ``room``
+        (``brief.thread_brief``): state keeps such a brief without its text
+        (``brief.kept``)."""
+        return await brief.thread_brief(
+            state["messages"], room, backend=self.backend, workspace_id=self.workspace_id,
+            transcript=transcript_target(self.backend, thread_id, checkpoint_ns), window=Window.of(state),
+        )
 
     def repin_plan(self, records: SessionRecords, current: SessionPin, now: float,
                    pending: int = 0) -> tuple[bool, str] | None:
@@ -344,15 +382,18 @@ def next_summary(rules: Mapping[str, Any], records: SessionRecords, *, settled_a
 NO_RULES = CompactionRules(floor_tokens=0)
 
 
-async def compact(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, thread_key: str, identity: str,
-                  records: SessionRecords, transcript_note: Awaitable[str] | None = None) -> list[SessionWrite]:
+async def compact(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, plan: PlanWatch, thread_key: str,
+                  identity: str, records: SessionRecords,
+                  transcript_note: Awaitable[str] | None = None) -> list[SessionWrite]:
     """Have the CLI compact the session on the pin it runs on, in a launch of
     its own that takes no turn, and return the records it wrote; none when
     there was nothing to summarize. A launch or a summary request that fails
     raises as a turn's would, a refused login reported as a turn reports it,
     and the whole of it is held to the compaction budget an API thread's is,
     the transcript's save for ``transcript_note`` included: admission holds
-    a send for about that budget.
+    a send for about that budget. ``plan`` is the turn's watch of the Claude
+    plan: the launch stops at its limit as a run's does, and what the summary
+    request said stops the run after it.
 
     Its own launch, because the summary request is then the session's own
     prefix, thinking included, and a launch that does not compact leaves the
@@ -362,24 +403,23 @@ async def compact(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, thr
     try:
         async with asyncio.timeout(budget):
             note = await transcript_note if transcript_note is not None else ""
-            return await _compacted(spec, pin, launcher, thread_key=thread_key, identity=identity, records=records,
-                                    transcript_note=note)
+            return await _compacted(spec, pin, launcher, plan=plan, thread_key=thread_key, identity=identity,
+                                    records=records, transcript_note=note)
     except TimeoutError:
         raise ClaudeTurnFailed("api_error", f"the compaction did not finish within {budget:g}s") from None
 
 
-async def _compacted(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, thread_key: str, identity: str,
-                     records: SessionRecords, transcript_note: str) -> list[SessionWrite]:
+async def _compacted(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, plan: PlanWatch, thread_key: str,
+                     identity: str, records: SessionRecords, transcript_note: str) -> list[SessionWrite]:
     store = CheckpointSessionStore()
     prepared, client, _ = await launch(
         spec, pin, launcher, thread_key=thread_key, identity=identity,
         records=noted(records) if is_haiku(spec.model) else records, store=store,
-        results=ToolResults(), query="/compact", compaction=True, transcript_note=transcript_note,
+        results=ToolResults(), query="/compact", compaction=True, transcript_note=transcript_note, plan=plan,
     )
     try:
         boundary, result, failed = None, None, None
         errors: list[tuple[str, str]] = []
-        limits: list[RateLimitEvent] = []
         try:
             async for m in received(client):
                 if isinstance(m, SystemMessage) and m.subtype == "init" and m.data.get("model") != spec.model:
@@ -391,7 +431,7 @@ async def _compacted(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, 
                 elif isinstance(m, AssistantMessage) and m.error and m.parent_tool_use_id is None:
                     errors.append((m.error, " ".join(getattr(b, "text", "") for b in m.content).strip()))
                 elif isinstance(m, RateLimitEvent):
-                    limits.append(m)
+                    plan.seen(m)
                 elif isinstance(m, ResultMessage):
                     result = m
                     break
@@ -403,11 +443,13 @@ async def _compacted(spec: RuntimeSpec, pin: SessionPin, launcher: Launcher, *, 
         if result is not None:
             await _metered(spec, result)
         if boundary is None:
-            failed = failed or turn_failure(result, errors, limits)
+            failed = turn_failure(result, errors, plan, failed)
             if failed is None:
                 return []
             if failed.kind == "auth_failed":
                 await launcher.refused()
+            if isinstance(failed, PlanStopped):
+                await plan.settled()
             raise failed
         await store.arrived.wait([boundary], SETTLE_TIMEOUT_S)
     finally:
@@ -547,10 +589,6 @@ def report_usage(ai: AIMessage, threshold: int) -> None:
     call, so the live ring and replay show the threshold the CLI compacts at."""
     if not threshold:
         return
-    usage = extract_token_usage(ai)
-    input_tokens, output_tokens = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
-    if input_tokens <= 0:
-        return
-    stamp_context_threshold(ai, threshold)
-    context_signal("token_usage", "complete", input_tokens=input_tokens, output_tokens=output_tokens,
-                   total_tokens=input_tokens + output_tokens, threshold=threshold)
+    fields = stamp_usage(ai, threshold)
+    if fields is not None:
+        context_signal("token_usage", "complete", **fields)

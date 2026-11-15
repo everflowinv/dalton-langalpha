@@ -321,12 +321,21 @@ class SteeredReportInbox:
             )
 
     async def release_resumes(
-        self, thread_id: str, run_id: str, task_id: str, job_ids: list[str]
+        self,
+        thread_id: str,
+        run_id: str,
+        task_id: str,
+        job_ids: list[str],
+        *,
+        counted: bool = True,
+        final: bool = False,
     ) -> None:
         from src.server.services.report_back.task_steer import release_resumes
 
         try:
-            await release_resumes(thread_id, run_id, task_id, job_ids)
+            await release_resumes(
+                thread_id, run_id, task_id, job_ids, counted=counted, final=final
+            )
         except Exception:
             logger.warning(
                 f"[TASK_STEER] Releasing resumes {job_ids} for run {run_id} failed",

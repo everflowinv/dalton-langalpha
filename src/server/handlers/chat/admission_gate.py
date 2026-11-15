@@ -119,7 +119,13 @@ def steer_allowed(
     if dispatched:
         return steerable and _is_agent_hand_off(request)
     is_fork = request.fork_from_turn is not None and bool(request.checkpoint_id)
-    return steerable and request.retry_of_run_id is None and not is_fork
+    # DALTON-HOOK(chat-large-upload): allow steers naming staged attachment_id files;
+    # wait_or_steer stages them into chat-uploads/ alongside inline data.
+    return (
+        steerable
+        and request.retry_of_run_id is None
+        and not is_fork
+    )
 
 
 def _is_agent_hand_off(request: ChatRequest) -> bool:

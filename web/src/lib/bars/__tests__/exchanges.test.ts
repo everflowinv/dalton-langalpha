@@ -9,6 +9,7 @@ import {
   isIndexListing,
   isUSEquity,
   quoteCurrency,
+  regularHoursForSymbol,
   timezoneForSymbol,
   venueLabelForSymbol,
 } from '../exchanges';
@@ -35,6 +36,17 @@ describe('exchange suffix table', () => {
     expect(currencyForSymbol('BRK.B')).toBe('USD'); // dot, but "B" is not an exchange
     expect(currencyForSymbol('')).toBe('USD');
     expect(currencyForSymbol(null)).toBe('USD');
+  });
+
+  it('names no currency for a suffix no venue here knows', () => {
+    expect(currencyForSymbol('PETR4.SA')).toBeNull();
+    expect(currencyForSymbol('petr4.sa')).toBeNull();
+    expect(quoteCurrency(null, 'PETR4.SA')).toBeNull();
+    expect(quoteCurrency('BRL', 'PETR4.SA')).toBe('BRL');
+    expect(currencyForSymbol('BRK-B')).toBe('USD');
+    expect(currencyForSymbol('GC=F')).toBe('USD');
+    expect(currencyForSymbol('SPY.US')).toBe('USD');
+    expect(currencyForSymbol('BRK.B.US')).toBe('USD');
   });
 
   it('classifies foreign listings as non-US (and US/indexes correctly)', () => {
@@ -97,6 +109,24 @@ describe('exchange suffix table', () => {
     expect(currencyForSymbol('005930.KS')).toBe('KRW');
     expect(currencyForSymbol('2330.TW')).toBe('TWD');
     expect(currencyForSymbol('NESN.SW')).toBe('CHF');
+  });
+});
+
+describe('regularHoursForSymbol', () => {
+  it("reads a venue's hours, a lunch break as two spans", () => {
+    expect(regularHoursForSymbol('7203.T')).toEqual([[540, 690], [750, 930]]);
+    expect(regularHoursForSymbol('0700.HK')).toEqual([[570, 720], [780, 960]]);
+    expect(regularHoursForSymbol('^HSI')).toEqual(regularHoursForSymbol('0700.HK'));
+  });
+
+  it('falls back to US hours where the timezone falls back to ET', () => {
+    for (const symbol of ['AAPL', 'BRK.B', '^GSPC', 'PETR4.SA', null]) {
+      expect(regularHoursForSymbol(symbol)).toEqual([[570, 960]]);
+    }
+  });
+
+  it('is null for a listed venue with no hours here', () => {
+    expect(regularHoursForSymbol('NESN.SW')).toBeNull();
   });
 });
 

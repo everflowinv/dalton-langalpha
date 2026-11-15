@@ -54,6 +54,20 @@ def steer_resume_held(task_id: str) -> dict | None:
     return held.get("held_jobs") if held else None
 
 
+def steer_resume_busy(task_id: str) -> None:
+    """Mark a resume of ``task_id`` as refused only while its computer is
+    busy, so its rows are given back without counting the refusal."""
+    if (held := _resume_of(task_id)) is not None:
+        held["busy"] = True
+
+
+def steer_resume_final(task_id: str) -> None:
+    """Mark a resume of ``task_id`` as refused for as long as the task
+    lasts, so its rows are settled rather than given back."""
+    if (held := _resume_of(task_id)) is not None:
+        held["final"] = True
+
+
 async def hand_off_steer_resume(task_id: str, task_run_id: str) -> bool:
     """Hand the steers a resume of ``task_id`` opens with to ``task_run_id``,
     the run it admitted. False when they could not be handed over, which

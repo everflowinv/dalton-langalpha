@@ -21,11 +21,17 @@ vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({ userId: null, logout: vi.fn() }),
 }));
 
+vi.mock('@/hooks/useAllModels', () => ({ useAllModels: () => ({ models: {}, metadata: {} }) }));
+vi.mock('@/hooks/useSlotDefaultModels', async (original) => ({
+  ...(await original<typeof import('@/hooks/useSlotDefaultModels')>()),
+  useDefaultModel: () => null,
+}));
 vi.mock('@/hooks/useProviderCatalog', () => ({
   useProviderCatalog: () => ({ keyGroups: [], planGroups: [], localEntries: [], placeOf: () => undefined, optionFor: () => null }),
 }));
 vi.mock('@/hooks/useConfiguredProviders', () => ({
   useConfiguredProviders: () => ({ providers: [], withdrawn: [], configuredSet: new Set(), statusLoading: false, statusError: false }),
+  useOAuthStatus: () => ({ data: undefined }),
 }));
 vi.mock('@/api/model', () => ({
   getClaudeCodeSetup: vi.fn(),
@@ -113,11 +119,11 @@ function clickRemove(row: HTMLElement) {
 describe('ModelAccessSection: Claude Code on own computers', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('gives each own computer a row that says it uses its own token, and replaces or removes it', async () => {
+  it('gives each own computer a row that names its account, not that the token is its own, and replaces or removes it', async () => {
     render();
     const row = await rowOf('Studio Mac');
     expect(within(row).getByText('Connected')).toBeInTheDocument();
-    expect(within(row).getByText('Oct 29, 2027').parentElement).toHaveTextContent(/^Uses its own token · user@example\.com · Expires by Oct 29, 2027$/);
+    expect(within(row).getByText('Oct 29, 2027').parentElement).toHaveTextContent(/^user@example\.com · Expires by Oct 29, 2027$/);
     expect(buttonsOf(row)).toEqual(['Replace', 'More actions']);
   });
 
@@ -246,10 +252,11 @@ describe('ModelAccessSection: Claude Code on own computers', () => {
     const { queryClient } = render();
     fireEvent.click(within(await rowOf('Lab box')).getByRole('button', { name: 'Add setup token' }));
     const dialog = screen.getByRole('dialog', { name: 'Add a setup token for Lab box' });
-    expect(within(dialog).getByText(/runs your Claude threads on Lab box/)).toBeInTheDocument();
-    expect(within(dialog).getByText(/puts it on Lab box/)).toBeInTheDocument();
-    // Sign in leads; paste follows under it.
+    expect(within(dialog).getByText(/This token stays on Lab box\./)).toBeInTheDocument();
+    expect(within(dialog).getByText(/puts a token on Lab box/)).toBeInTheDocument();
+    // Sign in leads; paste follows under it, folded until asked for.
     const signIn = within(dialog).getByRole('button', { name: 'Sign in with Claude' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Already have a setup token? Paste it' }));
     const paste = within(dialog).getByLabelText('Setup token');
     expect(signIn.compareDocumentPosition(paste) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.change(paste, { target: { value: TOKEN } });
@@ -274,7 +281,7 @@ describe('ModelAccessSection: Claude Code on own computers', () => {
   it('says the saved token takes over, where this server runs turns on one', async () => {
     render({ account: status({ state: 'signed_in', saved: true }) });
     const mac = await rowOf('Studio Mac');
-    await within(mac).findByText('Uses its own token', { exact: false });
+    await within(mac).findByText('user@example.com', { exact: false });
     clickRemove(mac);
     expect(screen.getByText(/Claude Code there then uses your saved token/)).toBeInTheDocument();
   });

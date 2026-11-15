@@ -3,9 +3,10 @@ import type { TFunction } from 'i18next';
 import {
   removeClaudeCodeComputerToken, removeClaudeCodeToken, saveClaudeCodeComputerToken, saveClaudeCodeToken,
   startClaudeCodeComputerSignIn, startClaudeCodeSignIn, submitClaudeCodeComputerSignInCode, submitClaudeCodeSignInCode,
-  type ClaudeCodeComputer, type ClaudeCodeComputers, type ClaudeCodeStatus,
+  type ClaudeCodeComputer, type ClaudeCodeStatus,
 } from '@/api/model';
 import { readOAuthError } from '@/api/oauth';
+import { updateComputers } from '@/hooks/useClaudeCode';
 import { CLAUDE_CODE_UNRUNNABLE } from '@/lib/claudeCode';
 import { queryKeys } from '@/lib/queryKeys';
 
@@ -22,7 +23,6 @@ export const computerTokenTarget = (c: Pick<ClaudeCodeComputer, 'computer_id' | 
 export type SheetAction = 'add' | 'replace';
 
 const SAVED_COPY = {
-  intro: 'modelAccess.claudeCode.intro',
   separate: 'modelAccess.claudeCode.separate',
   signInIntro: 'modelAccess.claudeCode.signIn.intro',
   addTitle: 'modelAccess.claudeCode.addTitle',
@@ -32,7 +32,6 @@ const SAVED_COPY = {
 };
 
 const COMPUTER_COPY: typeof SAVED_COPY = {
-  intro: 'modelAccess.claudeCode.computer.intro',
   separate: 'modelAccess.claudeCode.computer.separate',
   signInIntro: 'modelAccess.claudeCode.computer.signInIntro',
   addTitle: 'modelAccess.claudeCode.computer.addTitle',
@@ -96,10 +95,7 @@ export function useTokenRoutes(target: TokenTarget) {
     }
   };
   const store = (entry: ClaudeCodeComputer) => {
-    queryClient.setQueryData<ClaudeCodeComputers>(queryKeys.features.claudeCodeComputers(), (list) => list && ({
-      ...list,
-      computers: list.computers.map((c) => (c.computer_id === entry.computer_id ? entry : c)),
-    }));
+    updateComputers(queryClient, (c) => c.computer_id === entry.computer_id, () => entry);
     void reread(queryKeys.features.claudeCodeStatus());
     void reread(queryKeys.features.claudeCodeSetup());
   };

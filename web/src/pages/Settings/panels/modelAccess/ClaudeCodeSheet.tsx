@@ -1,40 +1,58 @@
-import { useEffect, useId, useState, type ReactNode } from 'react';
+import { useContext, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
 import { Cloud, ExternalLink, KeyRound, Laptop, SquareTerminal } from 'lucide-react';
+import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { buttonClass } from '@/components/ui/button-class';
 import { ModalShell } from '@/components/ui/ModalShell';
-import type { ClaudeCodeComputer, ClaudeCodeSetup } from '@/api/model';
+import type { ClaudeCodeComputer, ClaudeCodePlan, ClaudeCodeSetup } from '@/api/model';
 import { DESKTOP_DOWNLOAD_URL } from '@/config/supportLinks';
 import { isPlatformMode } from '@/config/hostMode';
-import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { useFeatures, useSetFeatureOverride } from '@/hooks/useFeatures';
-import { useClaudeCodeStatus } from '@/hooks/useClaudeCode';
+import { useClaudeCodeComputers, useClaudeCodeStatus } from '@/hooks/useClaudeCode';
 import { useNow } from '@/hooks/useNow';
 import { useClaudeCodeCustody } from '@/hooks/useClaudeCodeCustody';
 import { ClaudeCodeTokenModal, TokenActions } from '@/components/modelAccess/ClaudeCodeToken';
-import { ProviderTitle } from '@/components/modelAccess/KeyProviderPicker';
+import { CheckNowButton, CheckNowMenuItem } from '@/components/modelAccess/PlanCheck';
+import { UsageCells, UsageDetail, UsageHeaderRow } from '@/components/modelAccess/PlanUsage';
+import { UsageTableContext, VIEW_WIDTHS, useUsageSteps } from '@/components/modelAccess/usageSteps';
+import { usePlanCheck, type CheckTarget } from '@/components/modelAccess/usePlanCheck';
+import { usePlanClock } from '@/hooks/useClaudeCodePlan';
+import { credentialKey, planWindows } from '@/lib/claudeCodePlan';
 import { QuietNote, ROW_BUTTON, StatusLabel, type RowStatus } from '@/components/modelAccess/parts';
 import type { TokenAction, TokenRow } from '@/components/modelAccess/tokenLine';
 import { SAVED_TOKEN, computerTokenTarget, type SheetAction, type TokenTarget } from '@/components/modelAccess/tokenTarget';
-import type { KeyOption, ProviderGroup } from '@/components/modelAccess/providerOptions';
 import { canRemoteControl } from '@/lib/desktop';
 import { cn } from '@/lib/utils';
-import { CLAUDE_CODE_DOCS_URL, CLAUDE_CODE_FEATURE, CLAUDE_CODE_REQUIREMENTS_URL, biggerComputer } from '@/lib/claudeCode';
+import { useAllModels } from '@/hooks/useAllModels';
+import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
+import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
+import { CLAUDE_CODE, CLAUDE_CODE_DOCS, CLAUDE_CODE_FEATURE, claudeCodeStartModel } from '@/lib/claudeCode';
 import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
-import { openComputerSpec, openComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
+import { MediumActionButton } from '@/pages/ChatAgent/components/MediumActionLink';
+import { openComputersPanel, useComputersPanel } from '@/pages/ChatAgent/hooks/computerPanelStore';
+import { useMediumAction, type MediumAction } from '@/pages/ChatAgent/hooks/useMediumAction';
 import { useSaveFailedToast } from '../usePreferenceWrite';
 import { Group } from './AccessRows';
 import { ClaudeCodeHostedChoice } from './ClaudeCodeHostedChoice';
+import { ClaudeCodePlanOutChoice } from './ClaudeCodePlanOutChoice';
+import { ComputerClis } from './ComputerClis';
 import { claudeCodeHeadline } from './claudeCodeHeadline';
-import { KeySheet } from './KeySheet';
 
 const S = 'modelAccess.claudeCode.setup';
+const M = 'modelAccess.claudeCode.medium';
 
-/** The states where nothing the user has can run Claude Code yet. */
-const CANNOT_RUN_YET = new Set<ClaudeCodeSetup['state']>(['no_computer', 'unsupported', 'offline']);
+/** The docs section the view's Learn more opens, by what the view asks of
+ *  the user: what a computer needs, where it runs while one is out of reach,
+ *  else how it runs. */
+const LEARN_MORE: Partial<Record<ClaudeCodeSetup['state'], string>> = {
+  no_computer: CLAUDE_CODE_DOCS.requirements,
+  unsupported: CLAUDE_CODE_DOCS.requirements,
+  offline: CLAUDE_CODE_DOCS.whereItRuns,
+};
 
 const glyph = (Icon: typeof Laptop) => <Icon aria-hidden="true" className="h-4 w-4" style={{ color: 'var(--color-text-secondary)' }} />;
 const iconOf = (kind: ClaudeCodeComputer['kind'] | undefined) => glyph(kind === 'helper' ? Laptop : SquareTerminal);
@@ -45,25 +63,165 @@ const iconOf = (kind: ClaudeCodeComputer['kind'] | undefined) => glyph(kind === 
  * then its button. The rows of the cards stacked in one `ROWS` grid share
  * its columns, so every row's status and button start at the same x, and
  * only the detail wraps.
+ *
+ * In the token cards' usage table (`VIEW_WIDTHS`) a row whose token runs
+ * (`plan` given) keeps its detail on one line and lays its plan's use out
+ * on the table's columns, or, where its token reported no use yet, says
+ * so. A row with no use to show takes the usage columns for its text, so
+ * its detail has the room it has outside the table, and wraps only where it
+ * would there. A computer's own setting (`setting`) sits under its detail,
+ * and in the table on a line under the row (`below`), since the usage
+ * columns leave the text too narrow for it.
  */
-function SetupRow({ icon, name, detail, status, action }: {
+function SetupRow({ icon, name, detail, status, action, plan, setting }: {
   icon: ReactNode;
   name: string;
   detail: ReactNode;
   status?: RowStatus;
   action: ReactNode;
+  plan?: ClaudeCodePlan | null;
+  setting?: ReactNode;
 }) {
+  const steps = useContext(UsageTableContext);
+  const clock = usePlanClock();
+  if (steps) {
+    const runs = plan !== undefined;
+    const used = planWindows(plan, clock.now).length > 0;
+    const pending = runs && status === 'connected' && !used;
+    return (
+      <li className={cn('col-span-full flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3', steps.row)}>
+        <IdentityTile name={name} size="sm">{icon}</IdentityTile>
+        <div className={cn('flex min-w-0 flex-1 flex-col gap-0.5', !used && steps.spanUsage)}>
+          <span className="text-sm font-medium wrap-break-word" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
+          {(detail || pending) && (
+            <span data-row-detail className={cn('text-xs', !runs && 'text-pretty wrap-break-word')} style={{ color: 'var(--color-text-tertiary)' }}>
+              {runs ? <UsageDetail text={detail} plan={plan} tail={pending ? 'pending' : status === 'connected' ? 'bars' : null} whole={status === 'limit_reached'} /> : detail}
+            </span>
+          )}
+        </div>
+        {used && <UsageCells plan={plan} />}
+        <div className={cn('flex basis-full items-center justify-end gap-3', steps.tail)}>
+          {status ? <StatusLabel status={status} className="whitespace-nowrap" /> : <span />}
+          <div className="flex">{action}</div>
+        </div>
+        {setting && <div className={steps.below}>{setting}</div>}
+      </li>
+    );
+  }
   return (
     <li className="col-span-full grid grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-x-3 px-4 py-3 supports-[grid-template-columns:subgrid]:grid-cols-subgrid">
       <IdentityTile name={name} size="sm">{icon}</IdentityTile>
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="text-sm font-medium wrap-break-word" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
         {detail && <span className="text-xs text-pretty wrap-break-word" style={{ color: 'var(--color-text-tertiary)' }}>{detail}</span>}
+        {setting}
       </div>
       {status ? <StatusLabel status={status} className="whitespace-nowrap" /> : <span />}
-      <div className="flex">{action}</div>
+      {/* On a phone the button goes under the text, which keeps the width. */}
+      <div className="flex max-sm:col-[2/-1] max-sm:mt-2">{action}</div>
     </li>
   );
+}
+
+/**
+ * A new Chief of Staff thread, whose turns run where the headline says, with
+ * its composer on the Claude Code model `claudeCodeStartModel` picks. Where
+ * Home cannot be read, the chat page.
+ */
+function StartChatButton({ onLeave }: { onLeave?: () => void }) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  // Until the models are read the pick is unknown, and a chat would start
+  // on the Default.
+  const { models, metadata, isLoading } = useAllModels();
+  const accountDefault = useDefaultModel();
+  const model = claudeCodeStartModel(models[CLAUDE_CODE]?.models ?? [], metadata, accountDefault);
+  // A Home read that lands after the user left this view takes them nowhere.
+  const shown = useRef(true);
+  useEffect(() => {
+    shown.current = true;
+    return () => {
+      shown.current = false;
+    };
+  }, []);
+  // No Claude Code model to start on (the catalog could not be read, or
+  // lists none): a chat here would start on the Default.
+  if (!isLoading && !model) return null;
+  const start = () => {
+    queryClient.fetchQuery(homeWorkspaceQuery(queryClient)).then(
+      (home) => {
+        if (!shown.current) return;
+        onLeave?.();
+        navigate('/chat/t/__default__', {
+          state: { workspaceId: home.workspace_id, workspaceName: t('agents.chiefOfStaff'), model },
+        });
+      },
+      () => {
+        if (!shown.current) return;
+        onLeave?.();
+        navigate('/chat');
+      },
+    );
+  };
+  return (
+    <Button type="button" size="sm" className="tap-target mt-2 self-start" disabled={isLoading} onClick={start}>
+      {t(S + '.connected.startChat')}
+    </Button>
+  );
+}
+
+/** What a cloud computer too small for Claude Code says under its name, by
+ *  what gets it to Medium (`useMediumAction`). */
+function mediumDetail(t: TFunction, action: MediumAction | null): string {
+  if (!action) return t(M + '.row');
+  if (action.kind === 'plan') return t(M + '.rowPlan');
+  return t(action.kind === 'resizing' ? M + '.rowResizing' : M + '.rowResize');
+}
+
+/** A cloud computer too small for Claude Code, with what gets it to Medium. */
+function TooSmallRow({ computerId, name }: { computerId: string; name: string }) {
+  const { t } = useTranslation();
+  const action = useMediumAction(computerId);
+  return (
+    <SetupRow
+      icon={glyph(Cloud)}
+      name={name}
+      detail={mediumDetail(t, action)}
+      action={action ? <MediumActionButton action={action} className={ROW_BUTTON} /> : <span />}
+    />
+  );
+}
+
+/** A token row's buttons, with Check now in its More actions menu where
+ *  the usage table is too narrow for its header row (`checkTarget`). */
+function RowActions({ actions, checkTarget, onOpen, onRemove }: {
+  actions: TokenAction[];
+  checkTarget: CheckTarget | null;
+  onOpen: (action: SheetAction) => void;
+  onRemove: () => void;
+}) {
+  const check = usePlanCheck(checkTarget ? [checkTarget] : []);
+  return (
+    <TokenActions actions={actions} onOpen={onOpen} onRemove={onRemove} menuItems={checkTarget && <CheckNowMenuItem check={check} />} />
+  );
+}
+
+/** Whether a row's token runs, so Check now can read its plan: it works or
+ *  is at a limit, on a computer that is not offline, and a check would not
+ *  be billed to usage credits. */
+const checkable = ({ line, checkBills }: TokenRow, offline: boolean) =>
+  !offline && !checkBills && (line.status === 'connected' || line.status === 'limit_reached');
+
+/** One target per credential: computers on the relayed saved token share its plan. */
+function checkTargets(rows: { row: TokenRow; offline: boolean }[]): CheckTarget[] {
+  const seen = new Set<string>();
+  return rows.flatMap(({ row, offline }) => {
+    const { credential, checkAfter } = row;
+    if (!credential || !checkable(row, offline) || seen.has(credentialKey(credential))) return [];
+    seen.add(credentialKey(credential));
+    return [{ credential, checkAfter }];
+  });
 }
 
 /** The grid the cards of `SetupRow`s stack in: tile, text, status, button.
@@ -88,23 +246,22 @@ const ROWS = 'grid grid-cols-[auto_minmax(0,1fr)_auto_auto] gap-x-3 gap-y-5';
  * Where the server no longer offers Claude Code at all (`setup` null), only
  * tokens left behind show, each offered for removal.
  *
- * The Anthropic key, a token's sheet and the turn-off question each open
- * over the view, which stays mounted under them, so a choice that waits on
- * the key carries on once it is saved. `onCover` says whether something is
- * open over it; what opens is portaled out of its panel, which goes inert
- * and fades while covered.
+ * A token's sheet and the turn-off question each open over the view, which
+ * stays mounted under them. `onCover` says whether something is open over
+ * it; what opens is portaled out of its panel, which goes inert and fades
+ * while covered.
  */
-export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, onRemoveToken, onCover }: {
+export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover, onLeave }: {
   setup: ClaudeCodeSetup | null;
   tokenRows: TokenRow[];
-  anthropicKey: { group: ProviderGroup; option: KeyOption } | null;
-  configured: ConfiguredProvider[];
   onRemoveToken: (target: TokenTarget) => void;
   onCover: (covered: boolean) => void;
+  /** Called before a computer action leaves for the computers panel in the
+   *  app: setup passes its exit, so the user is not sent back to it. */
+  onLeave?: () => void;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const keyTitleId = useId();
   const offTitleId = useId();
   const toggle = useSetFeatureOverride();
   const { custody, isLoading: custodyLoading } = useClaudeCodeCustody();
@@ -113,18 +270,18 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
   // choice is still offered: with none read, warn of it wherever a hosted
   // server keeps the user's token.
   const storedMayGo = custody ? custody.mode === 'stored' : isPlatformMode && claudeCodeStatus.saved;
-  const now = useNow();
   // An operator may gate the flag so the user cannot turn it on or off
   // (`none`, or a plan); only an opt-in or opt-out gate takes their pick,
   // so a gate not yet read takes none.
   const gate = useFeatures().data?.find((f) => f.key === CLAUDE_CODE_FEATURE)?.gate;
   const toggleable = gate === 'opt_in' || gate === 'opt_out';
   const toastSaveFailed = useSaveFailedToast();
-  const [keyThen, setKeyThen] = useState<(() => void) | null>(null);
   const [token, setToken] = useState<{ target: TokenTarget; action: SheetAction } | null>(null);
   const [asking, setAsking] = useState(false);
   const [turningOff, setTurningOff] = useState(false);
-  const covered = keyThen !== null || token !== null || asking || turningOff;
+  // Change spec opens over the view from the page's own host.
+  const resizing = useComputersPanel().specComputerId !== null;
+  const covered = token !== null || asking || turningOff || resizing;
   useEffect(() => {
     onCover(covered);
     return () => onCover(false);
@@ -142,8 +299,12 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
     if (!on && !(await turn(true))) return;
     setToken({ target, action });
   };
-  const onComputers = (panel: Parameters<typeof openComputersPanel>[0]) => {
+  const toChat = () => {
+    onLeave?.();
     navigate('/chat');
+  };
+  const onComputers = (panel: Parameters<typeof openComputersPanel>[0]) => {
+    toChat();
     openComputersPanel(panel);
   };
   const viewComputer = (computerId: string) => (
@@ -151,11 +312,29 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
       {t(S + '.viewComputer')}
     </Button>
   );
-  const actions = (list: TokenAction[], target: TokenTarget) => list.length > 0 && (
-    <TokenActions actions={list} onOpen={(action) => void openToken(target, action)} onRemove={() => onRemoveToken(target)} />
+  // The token cards are a usage table once Claude Code is on, and Check
+  // now leaves its header for each row's menu where the table is too narrow
+  // for that header.
+  const [table, setTable] = useState<HTMLDivElement | null>(null);
+  const steps = useUsageSteps(table, on ? VIEW_WIDTHS : null);
+  const actions = (list: TokenAction[], target: TokenTarget, row?: { row: TokenRow; offline: boolean }) => list.length > 0 && (
+    <RowActions
+      actions={list}
+      checkTarget={steps && !steps.columns && row ? checkTargets([row])[0] ?? null : null}
+      onOpen={(action) => void openToken(target, action)}
+      onRemove={() => onRemoveToken(target)}
+    />
   );
 
-  const headline = setup && claudeCodeHeadline(t, setup, now);
+  const { cliComputer, computers, clisMax } = useClaudeCodeComputers();
+  // How many agents each computer runs at once, set on its row once Claude
+  // Code is on and the server offers the setting.
+  const clisOf = (computerId: string) => {
+    const clis = computers.find((c) => c.computer_id === computerId)?.clis;
+    return on && clisMax && clis != null ? <ComputerClis computerId={computerId} clis={clis} max={clisMax} /> : undefined;
+  };
+  const now = useNow();
+  const headline = setup && claudeCodeHeadline(t, setup, now, cliComputer);
   const kindOf = new Map((setup?.computers ?? []).map((c) => [c.computer_id, c.kind]));
   // A saved token left behind after Claude Code was turned off still shows, to be removed.
   const savedRow = tokenRows.find(({ key }) => key === 'saved');
@@ -163,10 +342,22 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
   // found it out of reach; before, only whether it can be reached. With
   // Claude Code gone from the server, the lines of tokens left behind.
   const unreached = new Set((setup?.computers ?? []).filter((c) => c.state === 'offline').map((c) => c.computer_id));
+  const computerTokenRows = tokenRows
+    .filter((row) => row.target.kind === 'computer')
+    .map((row) => ({ row, offline: row.line.status === 'offline' || unreached.has(row.key) }));
+  // Each card's header offers Check now while a token in it runs.
+  const computerTargets = checkTargets(computerTokenRows);
+  const savedTargets = savedRow ? checkTargets([{ row: savedRow, offline: false }]) : [];
+  const computersCheck = usePlanCheck(computerTargets);
+  const savedCheck = usePlanCheck(savedTargets);
+  // A card names the windows only where one of its rows has use to show in them.
+  const clock = usePlanClock();
+  const used = (plan: ClaudeCodePlan | null | undefined) => planWindows(plan, clock.now).length > 0;
+  const computersUsed = computerTokenRows.some(({ row, offline }) => !offline && used(row.line.plan));
   const offlineDetail = (kind: ClaudeCodeComputer['kind'] | undefined) => t(kind === 'helper' ? S + '.offline.helper' : S + '.offline.ssh');
   const computerRows = on || !setup
-    ? tokenRows.filter((row) => row.target.kind === 'computer').map(({ key, target, tag, line }) => {
-      const offline = line.status === 'offline' || unreached.has(key);
+    ? computerTokenRows.map(({ row, offline }) => {
+      const { key, target, tag, line } = row;
       return (
         <SetupRow
           key={key}
@@ -174,7 +365,9 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
           name={tag ?? ''}
           detail={offline && line.status !== 'offline' ? offlineDetail(kindOf.get(key)) : line.detail}
           status={offline ? 'offline' : line.status}
-          action={offline ? viewComputer(key) : actions(line.actions, target)}
+          plan={offline ? undefined : line.plan}
+          action={offline ? viewComputer(key) : actions(line.actions, target, { row, offline })}
+          setting={clisOf(key)}
         />
       );
     })
@@ -215,42 +408,24 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
     || setup.cloud
     || (!offeredSaved && !setup.computers.some((c) => c.state === 'off' && c.source !== 'machine'))
   );
+  // The ways to connect a computer, where none can run it yet, and where the
+  // user chose to run it on their own computers and has none.
+  const offerComputers = setup?.state === 'no_computer' || setup?.state === 'unsupported'
+    || (on && custody?.mode === 'local' && setup?.computers.length === 0);
   const remoteControl = canRemoteControl();
-  const bigger = biggerComputer();
-  const tooSmall = setup?.too_small ?? [];
+  // Named wherever its turns would run inside a cloud computer: where the
+  // user chose that, or where the server offers no choice. Before they
+  // choose it, the choice itself warns of them.
+  const tooSmall = custody && custody.mode !== 'stored' ? [] : setup?.too_small ?? [];
   const savedOnCloud = isPlatformMode ? setup?.cloud : setup?.cli_in_sandbox;
   const savedDetail = savedOnCloud ? t(S + '.savedDetailCloud') : !isPlatformMode ? t(S + '.savedDetailServer') : null;
-  const resize = (computerId: string) => (bigger.link ? (
-    <a
-      href={bigger.link.url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className={buttonClass({ variant: 'outline', size: 'sm', className: cn('gap-1.5', ROW_BUTTON) })}
-    >
-      {bigger.link.labelKey ? t(bigger.link.labelKey) : bigger.link.label}
-      <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
-    </a>
-  ) : (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      className={ROW_BUTTON}
-      onClick={() => {
-        navigate('/chat');
-        openComputerSpec(computerId);
-      }}
-    >
-      {t('workspace.changeSpec')}
-    </Button>
-  ));
 
   return (
     <div className="flex flex-col gap-5">
       <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
         {t(S + '.lead')}{' '}
         <a
-          href={setup && CANNOT_RUN_YET.has(setup.state) ? CLAUDE_CODE_REQUIREMENTS_URL : CLAUDE_CODE_DOCS_URL}
+          href={(setup && LEARN_MORE[setup.state]) ?? CLAUDE_CODE_DOCS.howItRuns}
           target="_blank"
           rel="noopener noreferrer"
           className="tap-target inline-flex items-center gap-0.5 underline underline-offset-2 hover:opacity-80"
@@ -264,34 +439,63 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
         <div className="flex flex-col gap-1">
           <h3 className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{headline.title}</h3>
           <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{headline.body}</div>
+          {headline.runsOn && <div className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{headline.runsOn}</div>}
+          {headline.ready && (
+            <StartChatButton onLeave={onLeave} />
+          )}
         </div>
       )}
 
       {!setup && tokenRows.length === 0 && <QuietNote>{t('modelAccess.status.unknownLong')}</QuietNote>}
 
       {(computerRows.length > 0 || savedRow || offeredSaved) && (
-        <div className={ROWS}>
-          {computerRows.length > 0 && <Group subgrid title={t(S + '.yourComputers')} empty="">{computerRows}</Group>}
-          {(savedRow || offeredSaved) && (
-            <Group subgrid title={t('modelAccess.claudeCode.savedTag')} empty="">
-              {[(
-                <SetupRow
-                  key="saved"
-                  icon={glyph(KeyRound)}
-                  name={t(S + '.savedName')}
-                  detail={savedRow?.line.detail ?? savedDetail}
-                  status={savedRow ? savedRow.line.status : 'not_connected'}
-                  action={actions(savedRow ? savedRow.line.actions : ['add'], SAVED_TOKEN)}
-                />
-              )]}
-            </Group>
-          )}
+        <div ref={setTable}>
+          <UsageTableContext.Provider value={steps}>
+            <div className={steps ? cn('grid gap-x-3 gap-y-5', steps.grid) : ROWS}>
+              {computerRows.length > 0 && (
+                <Group subgrid title={t(S + '.yourComputers')} empty="">
+                  {[
+                    <UsageHeaderRow
+                      key="header"
+                      first={t('claudeCodePlan.table.computer')}
+                      windows={computersUsed}
+                      aside={computerTargets.length > 0 && <CheckNowButton check={computersCheck} />}
+                    />,
+                    ...computerRows,
+                  ]}
+                </Group>
+              )}
+              {(savedRow || offeredSaved) && (
+                <Group subgrid title={t('modelAccess.claudeCode.savedTag')} empty="">
+                  {[
+                    <UsageHeaderRow
+                      key="header"
+                      first={t('claudeCodePlan.table.token')}
+                      windows={!!savedRow && used(savedRow.line.plan)}
+                      aside={savedTargets.length > 0 && <CheckNowButton check={savedCheck} />}
+                    />,
+                    <SetupRow
+                      key="saved"
+                      icon={glyph(KeyRound)}
+                      name={t(S + '.savedName')}
+                      detail={savedRow?.line.detail ?? savedDetail}
+                      status={savedRow ? savedRow.line.status : 'not_connected'}
+                      plan={savedRow?.line.plan}
+                      action={actions(savedRow ? savedRow.line.actions : ['add'], SAVED_TOKEN, savedRow && { row: savedRow, offline: false })}
+                    />,
+                  ]}
+                </Group>
+              )}
+            </div>
+          </UsageTableContext.Provider>
         </div>
       )}
 
+      {on && (computerRows.length > 0 || savedRow) && <ClaudeCodePlanOutChoice tokenRows={tokenRows} />}
+
       {on && (
         <ClaudeCodeHostedChoice
-          onAddApiKey={(then) => (anthropicKey ? setKeyThen(() => then) : then())}
+          tooSmall={setup?.too_small ?? []}
           onAddToken={() => setToken({ target: SAVED_TOKEN, action: 'add' })}
           onAsking={setAsking}
         />
@@ -300,14 +504,12 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
       {tooSmall.length > 0 && (
         <div className={ROWS}>
           <Group subgrid title={t(S + '.tooSmallTitle')} empty="">
-            {tooSmall.map((c) => (
-              <SetupRow key={c.computer_id} icon={glyph(Cloud)} name={c.name} detail={t(bigger.rowKey)} action={resize(c.computer_id)} />
-            ))}
+            {tooSmall.map((c) => <TooSmallRow key={c.computer_id} computerId={c.computer_id} name={c.name} />)}
           </Group>
         </div>
       )}
 
-      {(setup?.state === 'no_computer' || setup?.state === 'unsupported') && (
+      {offerComputers && (
         <div className={ROWS}>
           <Group subgrid title={t(S + '.waysTitle')} empty="">
             {[
@@ -361,33 +563,6 @@ export function ClaudeCodeSheet({ setup, tokenRows, anthropicKey, configured, on
         </Button>
       )}
 
-      {keyThen && anthropicKey && createPortal(
-        <ModalShell
-          labelId={keyTitleId}
-          title={(
-            <ProviderTitle
-              name={anthropicKey.group.name}
-              markProvider={anthropicKey.group.markProvider}
-              title={t('setup.connectTitle', { provider: anthropicKey.group.name })}
-            />
-          )}
-          onClose={() => setKeyThen(null)}
-          width="wide"
-          stacked
-        >
-          <KeySheet
-            option={anthropicKey.option}
-            group={anthropicKey.group}
-            configured={configured}
-            onSaved={() => {
-              keyThen();
-              setKeyThen(null);
-            }}
-            onCancel={() => setKeyThen(null)}
-          />
-        </ModalShell>,
-        document.body,
-      )}
       {token && createPortal(
         <ClaudeCodeTokenModal target={token.target} action={token.action} onClose={() => setToken(null)} />,
         document.body,

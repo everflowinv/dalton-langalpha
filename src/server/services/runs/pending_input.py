@@ -333,6 +333,7 @@ async def input_rerun_request(
         checkpoint_id=pending.checkpoint_id,
         # DALTON-HOOK(chat-large-upload): pass recovered chat_upload context into retried request
         additional_context=resolved_context,
+        chart_views=body.chart_views if body else None,
         locale=run_meta.get("locale"),
         timezone=run_meta.get("timezone"),
         subagents_enabled=run_meta.get("subagents_enabled"),

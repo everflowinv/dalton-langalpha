@@ -2,7 +2,8 @@
 
 生产镜像不装 ``claude-code`` extra，所以这个接口必须在 SDK 缺失时照常工作：
 B4 时它经 ``_changing()`` 顶层导入 SDK 会 500；#652 重构（864627504）后
-删除路径只走 Redis 锁和 token 库。本测试在一个新解释器里、导入任何
+删除路径走 Redis 锁和 token 库，上游 #729 起再在同一条连接上忘掉该凭据的
+计划行（``forget_plan``）。本测试在一个新解释器里、导入任何
 ``src`` 模块之前用 ``sys.modules['claude_agent_sdk'] = None`` 模拟没装
 SDK（本套件的其他测试会把运行时连 SDK 一起导入，同一进程测不出），
 然后导入整个应用、以已认证用户实际调用路由，断言 204 且删除逻辑
@@ -36,6 +37,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
+from psycopg import AsyncCursor
 
 from src.server.app import claude_code as route
 from src.server.services.claude_code import checks, flow, saved
@@ -45,7 +47,21 @@ from tests.conftest import create_test_app
 
 USER = "test-user-123"
 TOKEN = "sk-ant-oat01-" + "x" * 40
-CONN = object()
+# 上游删除在同一条连接上调用 forget_plan，它要 conn.cursor()。裸 object 没有。
+cur = create_autospec(AsyncCursor, instance=True)
+
+
+@asynccontextmanager
+async def _cursor(*_args, **_kwargs):
+    yield cur
+
+
+class _Conn:
+    def cursor(self, *args, **kwargs):
+        return _cursor(*args, **kwargs)
+
+
+CONN = _Conn()
 
 # Redis 替身：autospec 实例。enabled/client 是 __init__ 里的实例属性，
 # autospec 类上看不到，按真实运行时的样子补上。
@@ -95,6 +111,9 @@ assert response.status_code == 204, (response.status_code, response.text)
 stored_token.assert_awaited_once_with(USER)
 assert change_calls == [(USER, "claude-code")]
 delete_tokens.assert_awaited_once_with(USER, "claude-code", conn=CONN)
+# 同一条连接上忘掉 saved 凭据的计划行；没有新 token，digest 为空。
+cur.execute.assert_awaited_once()
+assert cur.execute.await_args.args[1] == (USER, saved.SAVED, None)
 # 有存量 token，删除后其检查答案也一并清掉。
 cache.delete.assert_awaited_once()
 assert cache.delete.await_args.args[0].startswith("claude_code:token_check:")

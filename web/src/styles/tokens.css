@@ -101,7 +101,7 @@ html {
      | token        | surface                                                |
      |--------------|--------------------------------------------------------|
      | bg-page      | the app ground: chat page, settings, auth               |
-     | bg-canvas    | ground behind filled cards (orders); = page in dark     |
+     | bg-canvas    | a recessed well: the PDF viewer; = page in dark        |
      | bg-card      | a card/panel sitting on page or canvas                  |
      | bg-card-hover| hover fill of a clickable card row (solid twin of card) |
      | bg-tool-card | agent tool/artifact cards inside the transcript         |
@@ -221,6 +221,17 @@ html {
   --color-ext-post: #60A5FA;
   --color-success: #3FB950;
   --color-success-soft: rgba(63, 185, 80, 0.12);
+  /* The parts of the context window, in the composer's context panel: a hue
+     each, in the order the context is sent, so a legend row finds its stretch
+     of the bar. Identity only, never state. Neighbours are checked apart for
+     color-deficient readers on bg-elevated, each theme with its own steps. */
+  --color-context-system: #3987E5;
+  --color-context-tools: #D95926;
+  --color-context-mcp: #199E70;
+  --color-context-skills: #C98500;
+  --color-context-memory: #D55181;
+  --color-context-environment: #008300;
+  --color-context-conversation: #9085E9;
   --color-accent-light: #F2B67C;
   --color-btn-primary-bg: #ECECEA;
   --color-btn-primary-text: #1A1B1D;
@@ -356,7 +367,7 @@ html {
      border-only outlines on the same white. */
   --color-bg-canvas: #F4F4F4;
   /* Filled surfaces in the chat (task cards, the subagent bar, the chart
-     annotation chip): the canvas fill, the inverse of the canvas pairing
+     layer chip): the canvas fill, the inverse of the canvas pairing
      (on the orders page white cards sit on tinted canvas; here tinted cards
      sit on the white chat page). The data cards are unfilled frames, and the
      detail panel's chart canvases draw on a transparent ground, so neither
@@ -435,6 +446,13 @@ html {
   --color-ext-post: #2563EB;
   --color-success: #1A7F37;
   --color-success-soft: rgba(26, 127, 55, 0.08);
+  --color-context-system: #2A78D6;
+  --color-context-tools: #EB6834;
+  --color-context-mcp: #1BAF7A;
+  --color-context-skills: #EDA100;
+  --color-context-memory: #E87BA4;
+  --color-context-environment: #008300;
+  --color-context-conversation: #6250D6;
   --color-accent-light: #E09A57;
   /* Confirm/approve buttons in chat — deliberately ink, not the accent, so
      approving a request never reads as the same affordance as a brand action. */
@@ -515,7 +533,7 @@ html {
   --input: 0 0% 96.5%;
   /* The light theme's text ink, for the same reason. */
   --ring: var(--foreground);
-  /* Kept tight rather than dropped: floating overlays (AgentEventOverlay,
+  /* Kept tight rather than dropped: floating overlays (ChartLayerOverlay,
      SelectionCommentOverlay, JumpToLatestPill) rely on this to separate from
      a now-pure-white page — the workspace cards carry their own border. */
   --shadow-card: 0 1px 2px rgba(31, 29, 26, 0.04), 0 2px 8px rgba(31, 29, 26, 0.05);
@@ -701,7 +719,9 @@ html {
    built instead of coming back to edit this selector. It must: the halo is
    a shadow, and a shadow draws on a borderless field too, as a faint
    rectangle inside a box already lit. The block below hands that box the
-   edge on its field's behalf, the way `.rings-within` hands it the ring. */
+   edge on its field's behalf, the way `.rings-within` hands it the ring; a
+   box that draws its focus otherwise says so in `--focus-edge`/`--focus-halo`
+   (the dashboard search, in ink in the open card styles). */
 :where(input, textarea, select):focus:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="submit"], [type="button"], [aria-invalid="true"], .owns-its-edge, .owns-its-edge *) {
   border-color: var(--color-accent-primary) !important;
   box-shadow: 0 0 0 1px var(--color-accent-soft) !important;
@@ -709,8 +729,8 @@ html {
 
 @supports selector(:has(*)) {
   .owns-its-edge:has(> :where(input, textarea):focus) {
-    border-color: var(--color-accent-primary) !important;
-    box-shadow: 0 0 0 1px var(--color-accent-soft) !important;
+    border-color: var(--focus-edge, var(--color-accent-primary)) !important;
+    box-shadow: var(--focus-halo, 0 0 0 1px var(--color-accent-soft)) !important;
   }
 }
 
@@ -752,6 +772,15 @@ html {
 
 ::-webkit-scrollbar-thumb:hover {
   background-color: var(--color-text-tertiary);
+}
+
+/* Tailwind's scrollbar-none sets only scrollbar-width, which Safari reads from
+   18.2; before that the styled bar above still draws. This adds a second rule
+   under the same name, after the built-in one. */
+@utility scrollbar-none {
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 /* Monaco's own scrollbar, inset through CodeEditor's options. Its arrows are

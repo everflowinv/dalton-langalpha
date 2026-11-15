@@ -41,6 +41,10 @@ export interface ModelSelectorProps {
   nameOf?: (model: string) => string
   // DALTON-HOOK(automation-model): render the select with placeholder & missingLabel even when models is empty
   allowEmpty?: boolean
+  /** Why a listed model is held back, printed after its name; one the user
+   *  can fix stays a pick, and the fix is the surrounding block's to offer,
+   *  since an option holds text only. */
+  heldBy?: (model: string) => { reason: string; pickable: boolean } | null
 }
 
 export function ModelSelector({
@@ -60,6 +64,7 @@ export function ModelSelector({
   missingLabel,
   nameOf,
   allowEmpty = false,
+  heldBy,
 }: ModelSelectorProps) {
   const { t } = useTranslation()
   const payerLabel = usePayerLabel()
@@ -160,9 +165,10 @@ export function ModelSelector({
               <optgroup key={provider} label={display}>
                 {modelList.map((m) => {
                   const payer = payers?.[m]
-                  const suffix = payer ? ` · ${payerLabel(payer)}` : ""
+                  const held = heldBy?.(m)
+                  const suffix = [payer && payerLabel(payer), held?.reason].filter(Boolean).map((s) => ` · ${s}`).join("")
                   return (
-                    <option key={m} value={m}>
+                    <option key={m} value={m} disabled={held ? !held.pickable : undefined}>
                       {name(m)}{suffix}
                     </option>
                   )

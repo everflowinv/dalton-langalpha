@@ -124,17 +124,17 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         # frontmatter drives the sandbox skill manifest), so they must not
         # drift.
         description=(
-            "Extra guidance for draw_chart_annotation, which works without "
-            "loading this. Covers choosing between similar variants, aligning "
-            "times to bars, several charts in one turn, and answering a chart "
-            "selection the user sends."
+            "Drawing on the user's chart from Python with chartkit, as one "
+            "chart layer per analysis (levels, lines, zones, indicators, "
+            "channels, fibs, projections, trade setups). Also answering a "
+            "chart selection the user sends."
         ),
-        switched_tools=("draw_chart_annotation", "manage_chart_annotations"),
+        switched_tools=("manage_chart_layers",),
         skill_md_path="skills/chart-annotation/SKILL.md",
-        # Guidance-only: every chat in the app can open the chart a drawing
+        # Guidance-only: every chat in the app can open the chart a layer
         # lands on (MarketView's, or the chart tab a chat card opens), so the
-        # main agent binds both annotation tools without loading this, and
-        # drops them when this skill is switched off.
+        # main agent binds manage_chart_layers without loading this, and
+        # drops it when this skill is switched off.
         # MarketView still injects it each turn, because its per-turn
         # instruction carries the active chart's symbol and timeframe.
         command="chart-annotation",
@@ -377,8 +377,16 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     ),
     "interactive-dashboard": SkillDefinition(
         name="interactive-dashboard",
-        description="Interactive web dashboards: stock trackers, sector heatmaps, portfolio monitors, served via preview URL",
+        description="Interactive web apps served from the computer via preview URL: dashboards, trackers, screeners, monitors, tools, multi-page or React apps, anything that needs a running server",
         skill_md_path="skills/interactive-dashboard/SKILL.md",
+        command="web-app",
+        # Its apps read the LangAlpha kit from dashboard-page's references.
+        requires=("dashboard-page",),
+    ),
+    "dashboard-page": SkillDefinition(
+        name="dashboard-page",
+        description="The user's own LangAlpha Dashboard: build or change the page they see when they open LangAlpha, with live market data and custom data refreshed on a schedule",
+        skill_md_path="skills/dashboard-page/SKILL.md",
         command="dashboard",
     ),
     "initiating-coverage": SkillDefinition(

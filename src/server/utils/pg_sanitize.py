@@ -49,6 +49,13 @@ def normalize_uuid(value: object) -> str | None:
         return None
 
 
+def like_escape(value: str) -> str:
+    """``value`` matching literally inside a ``LIKE`` pattern: its ``\\``,
+    ``%`` and ``_`` escaped under ``\\``, which is LIKE's default escape
+    (spell ``ESCAPE '\\'`` anyway, so the reading never depends on it)."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def uuid_text(value: str) -> str:
     """``normalize_uuid`` as a model field's validator: a value that is not a
     UUID is the client's 422 rather than the insert's 500."""
@@ -131,6 +138,13 @@ async def safe_jsonb_array(items: list[Any]) -> Jsonb:
 
 def _as_is(data: bytes) -> bytes:
     return data
+
+
+def encoded_jsonb(value: Any) -> Jsonb:
+    """``SafeJson``'s encoding done now rather than at bind time, so a caller
+    can do it off the event loop (``asyncio.to_thread``) for a value large
+    enough to stall it."""
+    return Jsonb(_safe_dumps(value).encode(), dumps=_as_is)
 
 
 class SafeJson(Json):

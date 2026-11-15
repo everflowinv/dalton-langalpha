@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useLayoutEffect,
 import { faviconHref } from '../config/brand'; // DALTON-HOOK(brand-name)
 import { desktop } from '../lib/desktop';
 
-type ThemePreference = 'light' | 'dark' | 'auto';
+export type ThemePreference = 'light' | 'dark' | 'auto';
 export type ResolvedTheme = 'light' | 'dark';
 
 export interface ThemeContextValue {
@@ -36,6 +36,19 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
+  // Another tab of this browser picked or followed a theme: shown here too.
+  // Storing it again below is the same value, which raises no event, so the
+  // tabs do not echo it back and forth. Removed means the default.
+  useEffect(() => {
+    const handler = (e: StorageEvent) => {
+      if (e.key !== 'theme' && e.key !== null) return;
+      const next = e.newValue;
+      setPreference(next === 'light' || next === 'dark' ? next : 'auto');
+    };
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
+  }, []);
+
   // Resolved theme: what actually gets applied
   const theme: ResolvedTheme = preference === 'auto' ? systemTheme : preference;
 
@@ -52,7 +65,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     // live resize the frame outruns the paint and that colour fills the gap.
     // Optional call: an older shell predates this method and simply does not
     // get told, which is the browser's behaviour and costs nothing.
-    desktop?.setTheme?.(theme);
+    desktop?.setTheme?.(theme, preference);
   }, [theme, preference]);
 
   const setTheme = (value: ThemePreference) => setPreference(value);

@@ -20,13 +20,12 @@ from typing import Any, Mapping, Optional, Union
 from market_protocol import InstrumentRef
 
 from src.server.database.wakeups.contract import as_datetime, as_float
-from src.server.services.brokerage_orders.view import order_view, plain
+from src.server.services.brokerage_orders.view import order_price, order_view, plain
 from src.server.services.market_targets.listing import (
     PCT_FROM_TOOL,
     listing_ref,
     shown_symbol,
 )
-from src.tools.market_data.currency import fmt_price
 from src.tools.market_data.display import price_text
 from src.tools.market_data.quote_format import current_price
 from src.tools.wakeups.clock import clock, when, zone_name, zone_of
@@ -97,6 +96,8 @@ class OrderNotice:
     avg_fill_price: Optional[float]
     currency: Optional[str]
     reason: Optional[str]
+    #: The average fill as the line prints it, at the order's own places. Not sent.
+    avg_fill: str
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -200,15 +201,17 @@ def notice_payload(row: Mapping[str, Any], notice: str, seq: int) -> WakeNotice:
         outcome = row.get("order_outcome") or {}
         # The brokerage's own words, of any length and content.
         reason = outcome.get("reason")
+        avg_fill_price = as_float(outcome.get("avg_fill_price"))
         order = OrderNotice(
             vendor_order_id=row.get("vendor_order_id"),
             summary=(view.summary_live or view.summary) if view else None,
             outcome=outcome.get("outcome"),
             filled_qty=as_float(outcome.get("filled_qty")),
             qty=as_float(outcome.get("qty")),
-            avg_fill_price=as_float(outcome.get("avg_fill_price")),
+            avg_fill_price=avg_fill_price,
             currency=view.currency if view else None,
             reason=quoted_line(reason, _REASON_CHARS) or None if isinstance(reason, str) else None,
+            avg_fill=order_price(view.order if view else None, avg_fill_price),
         )
     schedule = schedule_of(row)
     # The next check is past the slots skipped while this one waited, or it
@@ -232,10 +235,6 @@ def notice_payload(row: Mapping[str, Any], notice: str, seq: int) -> WakeNotice:
         set_at=as_datetime(row.get("created_at")),
         next_at=schedule[upcoming] if upcoming < len(schedule) else None,
     )
-
-
-def _money(value: Optional[float], currency: Optional[str]) -> str:
-    return fmt_price(value, currency or "USD", group=True) if value is not None else "N/A"
 
 
 def wake_line(
@@ -325,7 +324,7 @@ def wake_line(
         order_id=order.vendor_order_id,
         qty=plain(qty) if qty is not None else "?",
         filled=plain(order.filled_qty) if order.filled_qty is not None else "?",
-        avg=_money(order.avg_fill_price, order.currency),
+        avg=order.avg_fill,
         reason=order.reason or "no reason given",
         fire_time=clock(fired_at, zone, fired_at),
     )
@@ -382,9 +381,13 @@ async def render_notice(
     *,
     user_tz: Optional[str] = None,
     quote_timeout: float = _QUOTE_TIMEOUT,
+    plan_hold: Optional[Mapping[str, Any]] = None,
 ) -> tuple[str, dict[str, Any]]:
     """The notice's line and its WakeNotice. ``user_tz`` saves a read when
-    the caller renders several of one user's notices."""
+    the caller renders several of one user's notices. A notice held until
+    the Claude plan reset (``plan_hold``) says when it was due, unless the
+    plan still holds back the credential and model that held it: the turn
+    then runs on usage credits or another model, not after a reset."""
     user_id = str(row.get("user_id") or "")
     if user_tz is None:
         user_tz = await user_timezone(user_id)
@@ -399,4 +402,42 @@ async def render_notice(
             last_price = quote_price(quote)
         except Exception:
             logger.debug(f"{_LOG} last price unavailable", exc_info=True)
-    return wake_line(wake, last_price=last_price, user_tz=user_tz), wake.to_json()
+    line = wake_line(wake, last_price=last_price, user_tz=user_tz)
+    if (
+        plan_hold
+        and (waited := plan_waited_line(wake, plan_hold, user_tz=user_tz))
+        and not await _plan_still_holds(user_id, plan_hold)
+    ):
+        line = f"{line} {waited}"
+    return line, wake.to_json()
+
+
+async def _plan_still_holds(user_id: str, plan_hold: Mapping[str, Any]) -> bool:
+    from src.server.services.llm.claude_code import plan_still_holds
+
+    credential, model_id = plan_hold.get("credential"), plan_hold.get("model_id")
+    if not credential or not model_id:
+        return False
+    return await plan_still_holds(model_id, user_id, credential)
+
+
+def plan_waited_line(notice: WakeNotice, plan_hold: Mapping[str, Any], *, user_tz: str) -> Optional[str]:
+    """When a notice the Claude plan held was due and when it ran, on the
+    clock its own line reads; None where it runs before the hold's end, in
+    a turn the plan's limit did not hold back (another model's, or one on
+    usage credits)."""
+    from src.server.services.llm.claude_code import PLAN_WINDOW_WORDS
+
+    now = datetime.now(timezone.utc)
+    if (reset := as_datetime(plan_hold.get("reset_at"))) is not None and now < reset:
+        return None
+    due = notice.fired_at or now
+    if notice.price is not None:
+        zone = venue_zone(notice.price.ref, due)
+    else:
+        zone = zone_of(notice.timezone, user_tz)
+    fields = {"due": clock(due, zone, now), "ran": clock(now, zone, now)}
+    window = PLAN_WINDOW_WORDS.get(plan_hold.get("window") or "")
+    if window is None:
+        return BUILD_WAKE_LINES["plan_waited_unnamed"].format(**fields)
+    return WAKE_LINES["plan_waited"].format(window=window, **fields)

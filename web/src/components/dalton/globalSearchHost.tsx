@@ -2,6 +2,8 @@ import React, { Suspense, lazy, useEffect, useSyncExternalStore } from 'react';
 
 const LazyGlobalSearchModal = lazy(() => import('./GlobalSearchModal'));
 
+export const GLOBAL_SEARCH_OPEN_EVENT = 'dalton:global-search-open';
+
 let globalSearchOpenState = false;
 const globalSearchListeners = new Set<() => void>();
 
@@ -12,6 +14,9 @@ function notifyGlobalSearchListeners() {
 export function openGlobalSearch(): void {
   if (globalSearchOpenState) return;
   globalSearchOpenState = true;
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(GLOBAL_SEARCH_OPEN_EVENT));
+  }
   notifyGlobalSearchListeners();
 }
 
@@ -23,6 +28,9 @@ export function closeGlobalSearch(): void {
 
 export function toggleGlobalSearch(): void {
   globalSearchOpenState = !globalSearchOpenState;
+  if (globalSearchOpenState && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(GLOBAL_SEARCH_OPEN_EVENT));
+  }
   notifyGlobalSearchListeners();
 }
 

@@ -4,16 +4,9 @@
    box, so the title cuts the edge with the ground's own fill: a surface that
    puts the cards on another fill sets --term-ground. */
 
-/* The voice, Terminal's: the words' case and tracking (a multiplier on each
-   rule's own), their face, and the brackets around a tag, a state or a door.
-   The other card styles flip these (termCardStyles.css). */
-:root {
-  --term-case: uppercase;
-  --term-track: 1;
-  --term-words: var(--font-mono);
-  --term-open: '[';
-  --term-close: ']';
-}
+/* The voice (--term-case, --term-track, --term-words, --term-open/close) is
+   the app's, declared per card style in styles/cardStyle.css, which loads
+   with the app; this sheet loads with the cards. */
 
 .term-card,
 .term-pill {
@@ -342,6 +335,9 @@ button.term-card-title {
 .term-chg[data-dir='up'] { color: var(--color-profit); }
 .term-chg[data-dir='down'] { color: var(--color-loss); }
 .term-chg[data-dir='flat'] { color: var(--color-term-text-tertiary); }
+/* A figure from an older session than the one shown, such as an option not traded today. */
+.term-stale, .term-stale .term-chg[data-dir] { color: var(--color-term-text-tertiary); }
+.term-stale .term-range-at { background: var(--color-term-text-tertiary); }
 .term-chg-mark {
   width: 0.62em;
   height: 0.54em;

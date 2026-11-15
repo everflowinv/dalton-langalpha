@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -22,7 +23,7 @@ import math
 import posixpath
 import re
 import shlex
-from typing import Any
+from typing import Any, TypeVar
 import uuid
 
 from fastapi import HTTPException
@@ -38,11 +39,20 @@ from src.dalton.settings import (
     get_dalton_settings,
     is_chat_upload_cleanup_enabled,
 )
+from src.server.database import chat_attachments as chat_attachments_db
+from src.server.database.blob_keys import RELAY_MAX_BYTES
 from src.server.database.home_workspace import get_home_workspace_id, is_home_id, is_home_row
+from src.server.services import chat_attachments as chat_attachments_svc
 from src.server.services.computer_disk import CRITICAL_FREE_BYTES, disk_command, parse_df
-from src.server.services.persistence.transfer import pull_direct, transfer_timeout_s
+from src.server.services.persistence.transfer import (
+    held_bytes_budget,
+    pull_direct,
+    transfer_timeout_s,
+)
+from src.server.services.store_multipart import shown_state
 from src.server.services.turn_runtime import requested_workspace, turn_route
 from src.server.utils.multimodal_context import data_url_decoded_size
+from src.utils.storage import get_bytes as get_upstream_attachment_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -1205,30 +1215,244 @@ def _row_to_history_attachment(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# DALTON-HOOK(chat-large-upload): resolve and validate upstream staged chat_attachments rows by attachment_id
+def _context_field(item: Any, field: str, default: Any = None) -> Any:
+    return (
+        item.get(field, default)
+        if isinstance(item, dict)
+        else getattr(item, field, default)
+    )
+
+
+def _validate_staged_attachment_row(
+    row: Mapping[str, Any] | None,
+    *,
+    user_id: str,
+    now_utc: datetime,
+) -> int:
+    if row is None or str(row["user_id"]) != str(user_id):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    state = str(row["state"])
+    exp = _as_utc(row.get("expires_at"))
+    effective_state = shown_state(state, exp) if exp is not None else state
+    if effective_state == "uploading":
+        raise HTTPException(
+            status_code=409,
+            detail="Attachment is still uploading. Wait for it to finish before sending.",
+        )
+    if (
+        effective_state != "ready"
+        or row.get("cleaned_at") is not None
+        or not (row.get("has_content") or row.get("object_key"))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=chat_attachments_svc.ATTACHMENT_ENDED,
+        )
+    ready_at = _as_utc(row.get("ready_at"))
+    if (
+        row.get("sent_at") is None
+        and ready_at is not None
+        and ready_at + chat_attachments_svc.UNSENT_TTL <= now_utc
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=chat_attachments_svc.ATTACHMENT_ENDED,
+        )
+    size = int(row["size"])
+    if size < 0:
+        raise HTTPException(status_code=400, detail="Invalid attachment size")
+    return size
+
+
+# DALTON-HOOK(chat-large-upload): request-scoped cache so ChatUploadSendScope and steer staging
+# reuse pre-stream _validate_attachment_batch results (including staged chat_attachments rows).
+_PREVALIDATED_BATCH_CACHE: ContextVar[dict[tuple[Any, ...], dict[str, Any]] | None] = (
+    ContextVar("_PREVALIDATED_BATCH_CACHE", default=None)
+)
+_PREVALIDATED_CACHE_MAX_ENTRIES = 8
+
+
+def _batch_signature(additional_context: Sequence[Any] | None) -> tuple[Any, ...]:
+    sig: list[Any] = []
+    for item in additional_context or ():
+        item_type = str(_context_field(item, "type") or "")
+        if item_type in ("image", "pdf", "file"):
+            att_id = _context_field(item, "attachment_id")
+            data = _context_field(item, "data", "") or ""
+            desc = _context_field(item, "description")
+            data_digest = (
+                hashlib.sha256(
+                    str(data).encode("utf-8", errors="surrogatepass")
+                ).hexdigest()
+                if data
+                else ""
+            )
+            sig.append(
+                (
+                    item_type,
+                    str(att_id) if att_id is not None else None,
+                    data_digest,
+                    str(desc) if desc is not None else None,
+                )
+            )
+        elif item_type == "chat_upload":
+            sig.append(
+                (
+                    "chat_upload",
+                    str(_context_field(item, "upload_id") or ""),
+                    str(_context_field(item, "name") or ""),
+                    _context_field(item, "size"),
+                )
+            )
+        else:
+            sig.append((item_type,))
+    return tuple(sig)
+
+
+def _get_cached_batch_validation(
+    *,
+    claim_key: str | None,
+    user_id: str,
+    workspace_id: str,
+    is_existing_colleague_thread: bool,
+    additional_context: Sequence[Any] | None,
+) -> dict[str, Any] | None:
+    key = str(claim_key or "").strip()
+    if not key or key.startswith("ephemeral:"):
+        return None
+    cache = _PREVALIDATED_BATCH_CACHE.get()
+    if not cache:
+        return None
+    entry = cache.get(
+        (
+            key,
+            str(user_id),
+            bool(is_existing_colleague_thread),
+            _batch_signature(additional_context),
+        )
+    )
+    if entry is None:
+        return None
+    ws_str = str(workspace_id or "")
+    allowed_ws = {entry["raw_ws"]}
+    if entry["canonical_ws"]:
+        allowed_ws.add(entry["canonical_ws"])
+    if ws_str not in allowed_ws:
+        return None
+    return entry
+
+
+def _store_cached_batch_validation(
+    *,
+    claim_key: str | None,
+    user_id: str,
+    workspace_id: str,
+    is_existing_colleague_thread: bool,
+    additional_context: Sequence[Any] | None,
+    canonical_ws: str,
+    upload_ids: list[str],
+    verified_rows: list[dict[str, Any]],
+    staged_rows_by_id: dict[str, Mapping[str, Any]],
+) -> None:
+    key = str(claim_key or "").strip()
+    if not key or key.startswith("ephemeral:"):
+        return
+    existing = _PREVALIDATED_BATCH_CACHE.get() or {}
+    items = list(existing.items())
+    cache_key = (
+        key,
+        str(user_id),
+        bool(is_existing_colleague_thread),
+        _batch_signature(additional_context),
+    )
+    items = [(k, v) for k, v in items if k != cache_key]
+    if len(items) >= _PREVALIDATED_CACHE_MAX_ENTRIES:
+        items = items[-(_PREVALIDATED_CACHE_MAX_ENTRIES - 1) :]
+    items.append(
+        (
+            cache_key,
+            {
+                "raw_ws": str(workspace_id or ""),
+                "canonical_ws": canonical_ws,
+                "upload_ids": list(upload_ids),
+                "verified_rows": list(verified_rows),
+                "staged_rows_by_id": dict(staged_rows_by_id),
+            },
+        )
+    )
+    _PREVALIDATED_BATCH_CACHE.set(dict(items))
+
+
+def _evict_cached_batch_validation(claim_key: str | None) -> None:
+    key = str(claim_key or "").strip()
+    cache = _PREVALIDATED_BATCH_CACHE.get()
+    if not key or not cache:
+        return
+    filtered = {k: v for k, v in cache.items() if k[0] != key}
+    _PREVALIDATED_BATCH_CACHE.set(filtered or None)
+
+
 async def _validate_attachment_batch(
     additional_context: Sequence[Any] | None,
     *,
     user_id: str,
     workspace_id: str,
     is_existing_colleague_thread: bool = False,
+    claim_key: str | None = None,
+    staged_rows_out: dict[str, Mapping[str, Any]] | None = None,
 ) -> tuple[str, list[str], list[dict[str, Any]]]:
     """Validate the entire inline + ``chat_upload`` batch before mutating any DB state."""
     if not additional_context:
         return "", [], []
 
-    inline_count = 0
-    inline_bytes = 0
-    for item in additional_context:
-        item_type = (
-            item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+    cached = _get_cached_batch_validation(
+        claim_key=claim_key,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        is_existing_colleague_thread=is_existing_colleague_thread,
+        additional_context=additional_context,
+    )
+    if cached is not None:
+        if staged_rows_out is not None:
+            staged_rows_out.update(cached["staged_rows_by_id"])
+        return (
+            cached["canonical_ws"],
+            list(cached["upload_ids"]),
+            list(cached["verified_rows"]),
         )
-        if item_type in ("image", "pdf", "file"):
-            inline_count += 1
-            data_url = (
-                item.get("data", "")
-                if isinstance(item, dict)
-                else getattr(item, "data", "")
-            ) or ""
+
+    # DALTON-HOOK(chat-large-upload): check total attachment count BEFORE any DB query,
+    # then fetch all staged attachment_id rows in a single batch call.
+    multimodal_items = [
+        item
+        for item in additional_context
+        if _context_field(item, "type") in ("image", "pdf", "file")
+    ]
+    upload_items = extract_chat_upload_contexts(additional_context)
+    total_attachments = len(multimodal_items) + len(upload_items)
+    if total_attachments > MAX_MESSAGE_ATTACHMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {MAX_MESSAGE_ATTACHMENTS} attachments are allowed per message",
+        )
+
+    inline_bytes = 0
+    staged_refs: list[str] = []
+    for item in multimodal_items:
+        item_type = _context_field(item, "type")
+        raw_attachment_id = _context_field(item, "attachment_id")
+        data_url = _context_field(item, "data", "") or ""
+        if raw_attachment_id is not None and data_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Attachment cannot specify both data and attachment_id",
+            )
+        if raw_attachment_id is not None:
+            staged_refs.append(
+                _validate_uuid(str(raw_attachment_id), field_name="attachment_id")
+            )
+        else:
             decoded = data_url_decoded_size(str(data_url))
             if decoded <= 0:
                 raise HTTPException(
@@ -1247,15 +1471,55 @@ async def _validate_attachment_batch(
                     detail="Inline attachments exceed the 60 MB total inline limit",
                 )
 
-    upload_items = extract_chat_upload_contexts(additional_context)
-    total_attachments = inline_count + len(upload_items)
-    if total_attachments > MAX_MESSAGE_ATTACHMENTS:
+    staged_rows_by_id: dict[str, Mapping[str, Any]] = {}
+    if staged_refs:
+        unique_staged_ids = list(dict.fromkeys(staged_refs))
+        fetched = await chat_attachments_db.get_attachments_by_ids(unique_staged_ids)
+        staged_rows_by_id.update(fetched)
+        now_utc = datetime.now(timezone.utc)
+        takes_large: bool | None = None
+        for att_id in staged_refs:
+            row = staged_rows_by_id.get(att_id)
+            size = _validate_staged_attachment_row(
+                row, user_id=user_id, now_utc=now_utc
+            )
+            if size > RELAY_MAX_BYTES and workspace_id:
+                if takes_large is None:
+                    takes_large = await chat_attachments_svc.computer_takes_large(
+                        user_id, str(workspace_id)
+                    )
+                if not takes_large:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=chat_attachments_svc._too_large_for_computer(size),
+                    )
+            inline_bytes += size
+            if inline_bytes > MAX_INLINE_TOTAL_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Inline attachments exceed the 60 MB total inline limit",
+                )
+
+    if inline_bytes > MAX_TOTAL_MESSAGE_UPLOAD_BYTES:
         raise HTTPException(
-            status_code=400,
-            detail=f"At most {MAX_MESSAGE_ATTACHMENTS} attachments are allowed per message",
+            status_code=413,
+            detail="Attachments exceed the per-message total size limit",
         )
 
     if not upload_items:
+        if staged_rows_out is not None:
+            staged_rows_out.update(staged_rows_by_id)
+        _store_cached_batch_validation(
+            claim_key=claim_key,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            is_existing_colleague_thread=is_existing_colleague_thread,
+            additional_context=additional_context,
+            canonical_ws="",
+            upload_ids=[],
+            verified_rows=[],
+            staged_rows_by_id=staged_rows_by_id,
+        )
         return "", [], []
 
     _ensure_feature_ready()
@@ -1330,24 +1594,32 @@ async def _validate_attachment_batch(
             )
         verified_rows.append(row)
 
+    if staged_rows_out is not None:
+        staged_rows_out.update(staged_rows_by_id)
+    _store_cached_batch_validation(
+        claim_key=claim_key,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        is_existing_colleague_thread=is_existing_colleague_thread,
+        additional_context=additional_context,
+        canonical_ws=canonical_ws,
+        upload_ids=upload_ids,
+        verified_rows=verified_rows,
+        staged_rows_by_id=staged_rows_by_id,
+    )
     return canonical_ws, upload_ids, verified_rows
 
 
-async def _stage_single_inline_attachment(
+async def _stage_single_bytes_attachment(
     *,
-    data_url: str,
-    description: str | None,
-    fallback_type: str,
+    raw_bytes: bytes,
+    mime_type: str,
+    raw_name: str,
     user_id: str,
     canonical_ws: str,
 ) -> dict[str, Any]:
-    """Persist one validated inline attachment into ``chat-uploads/`` + ``ready`` ledger row."""
-    raw_bytes, mime_type = _decode_inline_data_url(
-        data_url, fallback_type=fallback_type
-    )
-    raw_name = str(description or "").strip() or fallback_type
-    if "." not in posixpath.basename(raw_name.replace("\\", "/")):
-        raw_name = f"{raw_name}{_INLINE_MIME_EXT.get(mime_type, '')}"
+    """Persist one validated byte payload into ``chat-uploads/`` + ``ready`` ledger row."""
+    # DALTON-HOOK(chat-large-upload): shared helper for staging inline data and upstream attachments on steers
     display_name, safe_name = sanitize_chat_upload_filename(raw_name)
 
     size_bytes = len(raw_bytes)
@@ -1357,14 +1629,29 @@ async def _stage_single_inline_attachment(
     part_count = max(1, math.ceil(size_bytes / part_size))
     object_key = storage.build_chat_upload_key(canonical_ws, upload_id, safe_name)
 
-    store_upload_id = await asyncio.to_thread(
-        storage.open_multipart_upload,
-        object_key,
-        content_type=mime_type,
+    # DALTON-HOOK(chat-large-upload): settle open_multipart_upload and abort created sid on cancel
+    async def _cleanup_untracked_multipart(sid: str | None) -> None:
+        if not sid:
+            return
+        await _run_in_thread_until_settled(
+            storage.abort_multipart_upload,
+            object_key,
+            sid,
+        )
+        await _run_in_thread_until_settled(storage.delete_object, object_key)
+
+    store_upload_id = await _await_task_until_settled(
+        asyncio.create_task(
+            asyncio.to_thread(
+                storage.open_multipart_upload,
+                object_key,
+                content_type=mime_type,
+            )
+        ),
+        on_cancelled_result=_cleanup_untracked_multipart,
     )
     if not store_upload_id:
-        raise HTTPException(
-            status_code=503,
+        raise _TransientAttachmentStorageError(
             detail="Could not stage inline attachment. Please try again.",
         )
 
@@ -1400,7 +1687,8 @@ async def _stage_single_inline_attachment(
             part_num = idx + 1
             chunk = raw_bytes[idx * part_size : (idx + 1) * part_size]
             part_sha = hashlib.sha256(chunk).hexdigest()
-            etag = await asyncio.to_thread(
+            # DALTON-HOOK(chat-large-upload): await thread settlement and preserve transient 503 recovery marker
+            etag = await _run_in_thread_until_settled(
                 storage.upload_part_bytes,
                 object_key,
                 store_upload_id,
@@ -1408,8 +1696,7 @@ async def _stage_single_inline_attachment(
                 data=chunk,
             )
             if not etag:
-                raise HTTPException(
-                    status_code=503,
+                raise _TransientAttachmentStorageError(
                     detail="Failed to stage inline attachment part. Please retry.",
                 )
             updated = await db.record_uploaded_part(
@@ -1420,8 +1707,7 @@ async def _stage_single_inline_attachment(
                 sha256=part_sha,
             )
             if updated is None:
-                raise HTTPException(
-                    status_code=503,
+                raise _TransientAttachmentStorageError(
                     detail="Failed to record staged inline attachment part.",
                 )
             ordered_parts.append((part_num, etag))
@@ -1432,39 +1718,35 @@ async def _stage_single_inline_attachment(
             expected_sha256=expected_sha,
         )
         if claimed is None:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to finalize staged inline attachment.",
             )
         claim_token = str(claimed.get("claim_token") or "")
 
-        completed = await asyncio.to_thread(
+        completed = await _run_in_thread_until_settled(
             storage.complete_multipart_upload,
             object_key,
             store_upload_id,
             ordered_parts,
         )
         if not completed:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to assemble staged inline attachment.",
             )
 
-        digest = await asyncio.to_thread(
+        digest = await _run_in_thread_until_settled(
             storage.compute_stored_object_digest,
             object_key,
         )
         if digest is None:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to verify staged inline attachment.",
             )
         actual_size, actual_sha = digest
         if actual_size != size_bytes or not hmac.compare_digest(
             actual_sha, expected_sha
         ):
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Staged inline attachment verification mismatch.",
             )
 
@@ -1475,8 +1757,7 @@ async def _stage_single_inline_attachment(
             claim_token=claim_token,
         )
         if ready_row is None:
-            raise HTTPException(
-                status_code=503,
+            raise _TransientAttachmentStorageError(
                 detail="Failed to mark staged inline attachment ready.",
             )
         return ready_row
@@ -1500,10 +1781,7 @@ async def _stage_single_inline_attachment(
                             aborted, mark_cleaned_on_success=True
                         )
             else:
-                await asyncio.to_thread(
-                    storage.abort_multipart_upload, object_key, store_upload_id
-                )
-                await asyncio.to_thread(storage.delete_object, object_key)
+                await _cleanup_untracked_multipart(store_upload_id)
         except Exception:
             logger.warning(
                 "Cleanup after failed inline steer staging failed for %s",
@@ -1511,6 +1789,251 @@ async def _stage_single_inline_attachment(
                 exc_info=True,
             )
         raise
+
+
+async def _stage_single_inline_attachment(
+    *,
+    data_url: str,
+    description: str | None,
+    fallback_type: str,
+    user_id: str,
+    canonical_ws: str,
+) -> dict[str, Any]:
+    """Persist one validated inline attachment into ``chat-uploads/`` + ``ready`` ledger row."""
+    raw_bytes, mime_type = _decode_inline_data_url(
+        data_url, fallback_type=fallback_type
+    )
+    raw_name = str(description or "").strip() or fallback_type
+    if "." not in posixpath.basename(raw_name.replace("\\", "/")):
+        raw_name = f"{raw_name}{_INLINE_MIME_EXT.get(mime_type, '')}"
+    return await _stage_single_bytes_attachment(
+        raw_bytes=raw_bytes,
+        mime_type=mime_type,
+        raw_name=raw_name,
+        user_id=user_id,
+        canonical_ws=canonical_ws,
+    )
+
+
+# DALTON-HOOK(chat-large-upload): distinguish missing upstream objects (409) from transient
+# object-store failures (503) and enforce held_bytes_budget while re-staging steers.
+_MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def _is_missing_object_error(exc: BaseException) -> bool:
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping):
+        err = response.get("Error") or {}
+        code = str(err.get("Code") or "")
+        http_status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        if code in _MISSING_OBJECT_CODES or http_status == 404:
+            return True
+    return False
+
+
+def _probe_upstream_object_missing(object_key: str) -> bool:
+    """Return True only when object storage confirms the object is absent."""
+    import src.utils.storage as upstream_storage
+
+    provider = upstream_storage.get_provider_id()
+    if provider == "oss":
+        from src.utils.storage import oss_uploader
+
+        client = oss_uploader.get_oss_client()
+        client.head_object(
+            oss_uploader.oss.HeadObjectRequest(
+                bucket=oss_uploader.OSSConfig.BUCKET_NAME,
+                key=oss_uploader.full_key(object_key),
+            )
+        )
+        return False
+    if provider != "none":
+        from src.utils.storage import s3_compatible
+
+        client = s3_compatible._get_client()
+        client.head_object(
+            Bucket=s3_compatible.StorageConfig.BUCKET_NAME,
+            Key=object_key,
+        )
+        return False
+    return not bool(upstream_storage.does_object_exist(object_key))
+
+
+_T = TypeVar("_T")
+
+
+# DALTON-HOOK(chat-large-upload): transient object-store failure stays an HTTP 503 for
+# direct routes while carrying an explicit marker for classify_error() on SSE steer turns.
+class _TransientAttachmentStorageError(HTTPException):
+    is_transient_storage_error = True
+
+    def __init__(
+        self,
+        detail: str = "Temporarily unable to read attachment from storage. Please retry.",
+    ) -> None:
+        super().__init__(status_code=503, detail=detail)
+
+
+# DALTON-HOOK(chat-large-upload): keep blocking object calls inside held_bytes_budget and run cancel cleanup after settlement
+async def _await_task_until_settled(
+    task: asyncio.Task[_T],
+    *,
+    on_cancelled_result: Callable[[_T], Awaitable[None]] | None = None,
+) -> _T:
+    """Await ``task`` to completion before propagating ``CancelledError``."""
+    cancelled_exc: asyncio.CancelledError | None = None
+    has_result = False
+    result: Any = None
+    try:
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                has_result = True
+                break
+            except asyncio.CancelledError as exc:
+                if cancelled_exc is None:
+                    cancelled_exc = exc
+                if task.done():
+                    if not task.cancelled():
+                        if task.exception() is not None:
+                            raise cancelled_exc
+                        result = task.result()
+                        has_result = True
+                    break
+    finally:
+        if task.done() and not task.cancelled():
+            task.exception()
+    if cancelled_exc is not None:
+        if has_result and on_cancelled_result is not None:
+            cleanup_task = asyncio.create_task(on_cancelled_result(result))
+            try:
+                await _await_task_until_settled(cleanup_task)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Post-cancel cleanup failed after task settled",
+                    exc_info=True,
+                )
+        result = None
+        # DALTON-HOOK(chat-large-upload): the finished task holds the thread's
+        # return value, and this frame stays reachable from the traceback, so
+        # drop it before raising or the bytes outlive the released budget.
+        task = None  # type: ignore[assignment]
+        raise cancelled_exc
+    return result
+
+
+async def _run_in_thread_until_settled(
+    fn: Callable[..., _T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> _T:
+    """Run ``fn`` in a worker thread, awaiting settlement before raising ``CancelledError``."""
+    return await _await_task_until_settled(
+        asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    )
+
+
+async def _read_upstream_object_bytes(object_key: str) -> bytes:
+    """Read upstream attachment object bytes; 409 when absent, 503 on transient store errors."""
+    def _read() -> bytes | None:
+        try:
+            return get_upstream_attachment_bytes(object_key)
+        except Exception as exc:
+            if _is_missing_object_error(exc):
+                return None
+            raise _TransientAttachmentStorageError() from exc
+
+    raw_bytes = await _run_in_thread_until_settled(_read)
+    if raw_bytes is not None:
+        return raw_bytes
+
+    def _confirm_missing() -> bool:
+        try:
+            return _probe_upstream_object_missing(object_key)
+        except Exception as exc:
+            if _is_missing_object_error(exc):
+                return True
+            raise _TransientAttachmentStorageError() from exc
+
+    if not await _run_in_thread_until_settled(_confirm_missing):
+        raise _TransientAttachmentStorageError()
+    raise HTTPException(
+        status_code=409,
+        detail=chat_attachments_svc.ATTACHMENT_ENDED,
+    )
+
+
+async def _stage_single_upstream_attachment(
+    *,
+    attachment_id: str,
+    description: str | None,
+    fallback_type: str,
+    user_id: str,
+    canonical_ws: str,
+    att_row: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist one upstream staged ``chat_attachments`` row into ``chat-uploads/`` for steering."""
+    att_id = _validate_uuid(attachment_id, field_name="attachment_id")
+    if att_row is None:
+        att_row = await chat_attachments_db.get_attachment(att_id)
+    _validate_staged_attachment_row(
+        att_row, user_id=user_id, now_utc=datetime.now(timezone.utc)
+    )
+    assert att_row is not None
+    expected_size = max(0, int(att_row.get("size") or 0))
+    async with held_bytes_budget().hold(expected_size):
+        raw_bytes: bytes | None = None
+        try:
+            if att_row.get("has_content"):
+                raw_bytes = await chat_attachments_db.get_content(att_id)
+                if raw_bytes is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=chat_attachments_svc.ATTACHMENT_ENDED,
+                    )
+            elif att_row.get("object_key"):
+                raw_bytes = await _read_upstream_object_bytes(str(att_row["object_key"]))
+            if raw_bytes is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=chat_attachments_svc.ATTACHMENT_ENDED,
+                )
+            if len(raw_bytes) <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Empty attachment cannot be staged for steering",
+                )
+            mime_type = (
+                str(att_row.get("mime_type") or "").strip().lower()
+                or (
+                    "application/pdf"
+                    if fallback_type == "pdf"
+                    else "image/png"
+                    if fallback_type == "image"
+                    else "application/octet-stream"
+                )
+            )[:120]
+            raw_name = (
+                str(description or "").strip()
+                or str(att_row.get("name") or "").strip()
+                or fallback_type
+            )
+            if "." not in posixpath.basename(raw_name.replace("\\", "/")):
+                raw_name = f"{raw_name}{_INLINE_MIME_EXT.get(mime_type, '')}"
+            return await _stage_single_bytes_attachment(
+                raw_bytes=raw_bytes,
+                mime_type=mime_type,
+                raw_name=raw_name,
+                user_id=user_id,
+                canonical_ws=canonical_ws,
+            )
+        finally:
+            raw_bytes = None
 
 
 async def cleanup_unaccepted_staged_uploads(
@@ -1572,15 +2095,18 @@ async def stage_request_attachments_for_steer(
         workspace_id,
         is_existing_colleague_thread=is_existing_colleague_thread,
     )
+    eff_key = str(claim_key or "").strip() or chat_upload_claim_key()
+    staged_rows_by_id: dict[str, Mapping[str, Any]] = {}
     _, _, verified_existing_rows = await _validate_attachment_batch(
         additional_context,
         user_id=user_id,
         workspace_id=canonical_ws,
         is_existing_colleague_thread=is_existing_colleague_thread,
+        claim_key=eff_key,
+        staged_rows_out=staged_rows_by_id,
     )
     existing_by_id = {str(r["upload_id"]): r for r in verified_existing_rows}
 
-    eff_key = str(claim_key or "").strip() or chat_upload_claim_key()
     ordered_descriptors: list[dict[str, Any]] = []
     staged_inline_ids: list[str] = []
 
@@ -1615,23 +2141,30 @@ async def stage_request_attachments_for_steer(
                     }
                 )
             elif item_type in ("image", "pdf", "file"):
-                data_url = (
-                    item.get("data", "")
-                    if isinstance(item, dict)
-                    else getattr(item, "data", "")
-                ) or ""
-                desc = (
-                    item.get("description")
-                    if isinstance(item, dict)
-                    else getattr(item, "description", None)
-                )
-                staged_row = await _stage_single_inline_attachment(
-                    data_url=str(data_url),
-                    description=desc,
-                    fallback_type=str(item_type),
-                    user_id=user_id,
-                    canonical_ws=canonical_ws,
-                )
+                # DALTON-HOOK(chat-large-upload): support both upstream attachment_id and legacy inline data on steers
+                raw_attachment_id = _context_field(item, "attachment_id")
+                data_url = _context_field(item, "data", "") or ""
+                desc = _context_field(item, "description")
+                if raw_attachment_id is not None and not data_url:
+                    norm_att_id = _validate_uuid(
+                        str(raw_attachment_id), field_name="attachment_id"
+                    )
+                    staged_row = await _stage_single_upstream_attachment(
+                        attachment_id=norm_att_id,
+                        description=desc,
+                        fallback_type=str(item_type),
+                        user_id=user_id,
+                        canonical_ws=canonical_ws,
+                        att_row=staged_rows_by_id.get(norm_att_id),
+                    )
+                else:
+                    staged_row = await _stage_single_inline_attachment(
+                        data_url=str(data_url),
+                        description=desc,
+                        fallback_type=str(item_type),
+                        user_id=user_id,
+                        canonical_ws=canonical_ws,
+                    )
                 staged_uid = str(staged_row["upload_id"])
                 staged_inline_ids.append(staged_uid)
                 ordered_descriptors.append(
@@ -1692,6 +2225,7 @@ async def validate_and_claim_request_attachments(
         user_id=user_id,
         workspace_id=workspace_id,
         is_existing_colleague_thread=is_existing_colleague_thread,
+        claim_key=claim_key,
     )
     if not upload_ids:
         return []
@@ -1816,22 +2350,25 @@ class ChatUploadSendScope:
         self._admitted = True
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if self._has_uploads and not self._admitted and self.user_id:
-            try:
-                await asyncio.shield(
-                    release_request_chat_uploads(
-                        user_id=self.user_id,
-                        claim_key=self.claim_key,
-                        request_key=self.request_key,
-                        additional_context=self.additional_context,
+        try:
+            if self._has_uploads and not self._admitted and self.user_id:
+                try:
+                    await asyncio.shield(
+                        release_request_chat_uploads(
+                            user_id=self.user_id,
+                            claim_key=self.claim_key,
+                            request_key=self.request_key,
+                            additional_context=self.additional_context,
+                        )
                     )
-                )
-            except Exception:
-                logger.warning(
-                    "Releasing provisional chat upload claims failed for key %s",
-                    self.claim_key,
-                    exc_info=True,
-                )
+                except Exception:
+                    logger.warning(
+                        "Releasing provisional chat upload claims failed for key %s",
+                        self.claim_key,
+                        exc_info=True,
+                    )
+        finally:
+            _evict_cached_batch_validation(self.claim_key)
         return False
 
 

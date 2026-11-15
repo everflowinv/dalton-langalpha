@@ -48,6 +48,7 @@ from src.server.services import workspace_files as ws_files_service
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.turn_runtime import requested_workspace
 from src.server.services.workspace_file_containment import (
+    ContainedFile,
     ContainedSlice,
     FileTooLargeToServe,
 )
@@ -1667,13 +1668,15 @@ class TestRangeDownloadPermissionMatrix:
 
         monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", _acquire)
 
-        read_mock = create_autospec(ws_files_crud.read_contained_sandbox_file)
-        read_mock.return_value = (
-            "/home/workspace/NVDA_Deep_Dive/report.pdf",
-            b"%PDF-1.7 binary",
+        read_mock = create_autospec(ws_files_crud.read_contained_sandbox_file_versioned)
+        read_mock.return_value = ContainedFile(
+            canonical="/home/workspace/NVDA_Deep_Dive/report.pdf",
+            size=len(b"%PDF-1.7 binary"),
+            version="9000000 1 2 3",
+            content=b"%PDF-1.7 binary",
         )
         monkeypatch.setattr(
-            ws_files_crud, "read_contained_sandbox_file", read_mock
+            ws_files_crud, "read_contained_sandbox_file_versioned", read_mock
         )
         monkeypatch.setattr(
             ws_files_crud,
@@ -1953,10 +1956,15 @@ class TestRwColleagueFileDownloads:
         )
         monkeypatch.setattr(
             ws_files_crud,
-            "read_contained_sandbox_file",
+            "read_contained_sandbox_file_versioned",
             create_autospec(
-                ws_files_crud.read_contained_sandbox_file,
-                return_value=(canonical, returns),
+                ws_files_crud.read_contained_sandbox_file_versioned,
+                return_value=ContainedFile(
+                    canonical=canonical,
+                    size=len(returns),
+                    version="9000000 1 2 3",
+                    content=returns,
+                ),
             ),
         )
         return ws
@@ -2338,9 +2346,9 @@ class TestRwColleagueLargeFileStreams:
         )
         monkeypatch.setattr(
             ws_files_crud,
-            "read_contained_sandbox_file",
+            "read_contained_sandbox_file_versioned",
             create_autospec(
-                ws_files_crud.read_contained_sandbox_file,
+                ws_files_crud.read_contained_sandbox_file_versioned,
                 side_effect=FileTooLargeToServe(canonical, size),
             ),
         )
@@ -2647,9 +2655,9 @@ class TestRwColleagueRangeBlockedPaths:
             return_value=self._blocked_slice(),
         )
         monkeypatch.setattr(ws_files_crud, "read_contained_sandbox_range", range_mock)
-        whole_read_mock = create_autospec(ws_files_crud.read_contained_sandbox_file)
+        whole_read_mock = create_autospec(ws_files_crud.read_contained_sandbox_file_versioned)
         monkeypatch.setattr(
-            ws_files_crud, "read_contained_sandbox_file", whole_read_mock
+            ws_files_crud, "read_contained_sandbox_file_versioned", whole_read_mock
         )
         with pytest.raises(HTTPException) as exc:
             await ws_files_crud.download_workspace_file(

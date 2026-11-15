@@ -13,25 +13,12 @@ import type { DecisionTarget } from './interrupts/toolApprovalCard';
 import type { StreamRefs, UpdateSubagentCard } from './streamRefs';
 import type { RetryNotice } from './stream/autoRetry';
 import type { NextSummary, ThreadTokenTotals } from '../utils/api/messages';
+import type { TokenUsage } from './tokenUsage';
 
 // --- Internal types for useChatMessages ---
 
 /** React state setter for messages array. */
 type SetMessages = React.Dispatch<React.SetStateAction<ChatMessage[]>>;
-
-/** Token usage state for context window progress ring. The totals are the
- *  thread's: the server's count when it loaded, plus live calls since. The
- *  rest is the newest call's. */
-interface TokenUsage {
-  totalInput: number;
-  totalOutput: number;
-  /** Whether the totals started from the server's count. Without one they
-   *  sum the calls the view has loaded, the closest it can come. */
-  fromServer: boolean;
-  lastOutput: number;
-  total: number;
-  threshold: number;
-}
 
 /** Pending HITL interrupt state. */
 interface PendingInterrupt {
@@ -80,6 +67,10 @@ interface SSEEvent {
   output_tokens?: number;
   total_tokens?: number;
   threshold?: number;
+  /** Cache-read input tokens of a `token_usage` call, held in `input_tokens`. */
+  cached_tokens?: number;
+  /** The model's context window, on a `token_usage` call. */
+  context_limit?: number;
   original_message_count?: number;
   /** About how many tokens a summary being written has written so far. */
   summary_tokens?: number;
@@ -107,6 +98,9 @@ interface SSEEvent {
   token_totals?: ThreadTokenTotals | null;
   /** What the thread's next send summarizes first, on a `run_end` frame. */
   next_summary?: NextSummary | null;
+  /** Where each sandbox image the run's reply named was captured, by the path
+   *  as written, on a `run_end` frame. */
+  images?: Record<string, string>;
   [key: string]: unknown;
 }
 
@@ -236,6 +230,9 @@ interface SendOptions extends ModelOptions {
   /** This turn starts without the summary a cold thread would get first. An
    *  edit, regenerate or Retry takes it as an argument of its own. */
   keepFullContext?: boolean;
+  /** What the charts beside the composer show, sent as `chart_views` so the
+   *  agent's snapshot paints the same view. */
+  chartViews?: import('@/pages/MarketView/types/chartView').ChartView[];
 }
 
 /** Offload batch ref state. */

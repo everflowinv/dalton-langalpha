@@ -87,6 +87,15 @@ def load_overlay_data(path: Path | None = None) -> dict[str, Any] | None:
         return None
 
 
+def _deep_merge_patch(target: dict[str, Any], patch: dict[str, Any]) -> None:
+    """Recursively overwrite only the keys listed in `patch` onto `target`."""
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(target.get(k), dict):
+            _deep_merge_patch(target[k], v)
+        else:
+            target[k] = copy.deepcopy(v)
+
+
 def _merge_single_overlay(
     overlay: dict[str, Any],
     source_name: str,
@@ -109,6 +118,23 @@ def _merge_single_overlay(
                 )
                 continue
             llm_config[key] = copy.deepcopy(entry)
+
+    # DALTON-HOOK(llm-overlay): allow patching listed fields onto existing upstream models
+    # without duplicating full model entries in native_overlay.json.
+    model_overrides = overlay.get("model_overrides") or {}
+    if isinstance(model_overrides, dict):
+        for key, patch in model_overrides.items():
+            if not isinstance(patch, dict):
+                continue
+            existing = llm_config.get(key)
+            if not isinstance(existing, dict):
+                logger.error(
+                    "Dalton %s overlay model_overrides references unknown model %r; skipping.",
+                    source_name,
+                    key,
+                )
+                continue
+            _deep_merge_patch(existing, patch)
 
     providers_block = overlay.get("providers") or {}
     if not isinstance(providers_block, dict):
@@ -181,6 +207,41 @@ def _merge_single_overlay(
                     target_models[p_name].append(copy.deepcopy(item))
                     if item_id:
                         existing_ids.add(item_id)
+
+    # DALTON-HOOK(llm-overlay): allow patching listed fields onto existing upstream
+    # pricing cards without duplicating cards in native_overlay.json.
+    prov_model_overrides = providers_block.get("model_overrides") or {}
+    if isinstance(prov_model_overrides, dict):
+        target_models = manifest.setdefault("models", {})
+        for p_name, patches_by_id in prov_model_overrides.items():
+            if not isinstance(patches_by_id, dict):
+                continue
+            cards = target_models.get(p_name)
+            if not isinstance(cards, list):
+                logger.error(
+                    "Dalton %s overlay providers.model_overrides references unknown provider %r; skipping.",
+                    source_name,
+                    p_name,
+                )
+                continue
+            by_id = {
+                str(item.get("id")): item
+                for item in cards
+                if isinstance(item, dict) and item.get("id")
+            }
+            for card_id, patch in patches_by_id.items():
+                if not isinstance(patch, dict):
+                    continue
+                card = by_id.get(str(card_id))
+                if card is None:
+                    logger.error(
+                        "Dalton %s overlay providers.model_overrides references unknown card %r.%r; skipping.",
+                        source_name,
+                        p_name,
+                        card_id,
+                    )
+                    continue
+                _deep_merge_patch(card, patch)
 
 
 _UPSTREAM_RAW_MANIFEST_TESTS = (

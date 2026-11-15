@@ -726,6 +726,7 @@ async def insert_preflight_log(
     decision: str,
     reason: Optional[str],
     signals: Optional[list[dict[str, Any]]] = None,
+    wake_context: Optional[str] = None,
 ) -> dict[str, Any]:
     """Record a preflight check outcome in dalton_preflight_log."""
     auto_uuid = uuid.UUID(str(automation_id)) if automation_id else None
@@ -737,11 +738,11 @@ async def insert_preflight_log(
                 """
                 INSERT INTO dalton_preflight_log (
                     automation_id, automation_execution_id, workspace_id,
-                    decision, reason, signals, checked_at
+                    decision, reason, signals, wake_context, checked_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING log_id, automation_id, automation_execution_id, workspace_id,
-                          decision, reason, signals, checked_at
+                          decision, reason, signals, wake_context, checked_at
                 """,
                 (
                     auto_uuid,
@@ -750,10 +751,42 @@ async def insert_preflight_log(
                     decision,
                     reason,
                     Jsonb(signals or []),
+                    wake_context,
                 ),
             )
             row = await cur.fetchone()
             return dict(row) if row else {}
+
+
+# DALTON-HOOK(preflight): restore persisted wake directive for handed-off/refired executions
+async def get_preflight_wake_context(
+    automation_execution_id: Optional[str],
+) -> Optional[str]:
+    """Return the latest ``wake_context`` logged for a waking execution, if any."""
+    if not automation_execution_id:
+        return None
+    try:
+        exec_uuid = uuid.UUID(str(automation_execution_id))
+    except (ValueError, TypeError):
+        return None
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT wake_context
+                FROM dalton_preflight_log
+                WHERE automation_execution_id = %s
+                  AND decision = 'wake'
+                ORDER BY checked_at DESC, log_id DESC
+                LIMIT 1
+                """,
+                (exec_uuid,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            val = row.get("wake_context")
+            return str(val) if val is not None else None
 
 
 async def list_preflight_logs(

@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://langalpha.ai"><strong>试用 LangAlpha ↗</strong></a> ·
+  <a href="https://docs.langalpha.ai"><strong>文档 ↗</strong></a> ·
   <a href="#快速开始"><strong>快速开始</strong></a> ·
   <a href="#agent-交易"><strong>Agent 交易</strong></a> ·
   <a href="#harness-设计"><strong>Harness 设计</strong></a> ·
@@ -25,6 +26,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-green?style=flat-square" alt="许可证：Apache 2.0" />
   <img src="https://img.shields.io/badge/python-3.13+-blue?style=flat-square" alt="Python 3.13+" />
   <a href="https://github.com/langchain-ai/langchain"><img src="https://img.shields.io/badge/LangChain-1c3c3c?style=flat-square&logo=langchain&logoColor=white" alt="LangChain" /></a>
+  <a href="https://docs.langalpha.ai"><img src="https://img.shields.io/badge/docs-docs.langalpha.ai-1c3c3c?style=flat-square" alt="文档" /></a>
   <a href="https://github.com/ginlix-ai/langalpha/releases"><img src="https://img.shields.io/badge/desktop-macOS%20%7C%20Windows%20%7C%20Linux-555?style=flat-square" alt="桌面应用" /></a>
 </p>
 
@@ -180,7 +182,9 @@ make config   # wizard: model, data sources, sandbox, web search
 make up       # Postgres, Redis, backend and web app
 ```
 
-打开 [http://localhost:5173](http://localhost:5173)。API 监听 8000 端口，交互式文档位于 `/docs`。
+打开 [http://localhost:5173](http://localhost:5173)。API 监听 8000 端口，交互式文档位于 `/docs`。分步说明见[自托管快速开始](https://docs.langalpha.ai/get-started/self-hosting-quickstart/)（英文）。
+
+**阅读文档**。[LangAlpha 是什么](https://docs.langalpha.ai/get-started/what-is-langalpha/)介绍产品全貌，[CLI 参考](https://docs.langalpha.ai/cli/overview/)说明在终端和脚本里使用的 `langalpha`（简写 `la`）。文档目前为英文。
 
 **自托管有哪些不同**。Agent、工作区、自动化、技能和受控订单的运行方式完全相同，其余部分有差异：
 
@@ -204,7 +208,7 @@ make up       # Postgres, Redis, backend and web app
 | `FMP_API_KEY` | 基本面、财务报表、宏观和分析师数据（[有免费额度](https://site.financialmodelingprep.com/)） |
 | `DAYTONA_API_KEY` | 来自 [Daytona](https://www.daytona.io/) 的云端沙箱。没有它时，沙箱运行在本地 Docker 中 |
 | `R2_*`、`S3_*` 或 `OSS_*`，配合 `storage.provider` | Cloudflare R2、AWS S3、阿里云 OSS 或 MinIO 上的对象存储。用于保存工作区文件快照、备忘录、附件、技能归档、大型对话记录和对话小组件数据，并通过签名链接提供下载。没有存储桶时，这些数据保存在 Postgres 中，图表截图功能也会关闭 |
-| `TAVILY_API_KEY`、`SERPER_API_KEY`、`EXA_API_KEY`、`PARALLEL_API_KEY`、`BOCHA_API_KEY` | 网页搜索。搜索引擎由 `agent_config.yaml` 中的 `search_api` 决定（默认 `tavily`），也可以由每个用户在设置中自行选择 |
+| `TAVILY_API_KEY`、`SERPER_API_KEY`、`EXA_API_KEY`、`PARALLEL_API_KEY`、`BOCHA_API_KEY`、`DEEPSEEK_API_KEY` | 网页搜索。搜索引擎由 `agent_config.yaml` 中的 `search_api` 决定（默认 `tavily`），也可以由每个用户在设置中自行选择 |
 | `FIRECRAWL_API_KEY` | 增强的网页抓取和站点爬取。内置爬虫不需要 key |
 | `X_BEARER_TOKEN` | X 帖子搜索和推文串查询。在插件页面把它存入密钥库 |
 | `LANGSMITH_API_KEY`、`OTEL_EXPORTER_OTLP_ENDPOINT` | 追踪和指标 |
@@ -261,7 +265,7 @@ LangAlpha 从 2026 年 1 月首次发布起，就围绕程序化工具调用（p
 
 LangAlpha 自己的数据 server 专为代码处理而设计：每个市场数据工具都返回同样的外层结构（`symbol`、`currency`、`timezone`、`count`、`data`、`source`），时间序列按从旧到新排列，失败时返回带类型的错误码，因此 Agent 代码直接按索引取用结果，不必解析文字。
 
-数据服务商按市场逐级回退：美股数据用 LangAlpha.ai 上的实时数据源，基本面和宏观用 FMP，Yahoo Finance 作为免费兜底。网页搜索支持 Tavily、Serper、Exa、Parallel 和博查；网页抓取使用内置爬虫，可选择交给 Firecrawl 处理，每个服务商都有各自的熔断器保护。
+数据服务商按市场逐级回退：美股数据用 LangAlpha.ai 上的实时数据源，基本面和宏观用 FMP，Yahoo Finance 作为免费兜底。网页搜索支持 Tavily、Serper、Exa、Parallel、博查和 DeepSeek；网页抓取使用内置爬虫，可选择交给 Firecrawl 或 DeepSeek 处理，每个服务商都有各自的熔断器保护。
 
 除了数据，Agent 还能使用以下工具：
 

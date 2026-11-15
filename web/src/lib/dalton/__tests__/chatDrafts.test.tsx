@@ -26,6 +26,24 @@ import {
 
 const mockGetHomeWorkspace = vi.fn().mockResolvedValue({ workspace_id: 'ws-home' });
 
+// DALTON-HOOK(chat-large-upload): small composer attachments now stage via #782 uploadAttachment rather than FileReader
+const pendingStages = vi.hoisted(
+  () => [] as Array<{ resolve: (id: string) => void; reject: (err: unknown) => void }>,
+);
+const stageSeqRef = vi.hoisted(() => ({ current: 0 }));
+const mockUploadAttachment = vi.hoisted(() => vi.fn());
+const mockDiscardAttachment = vi.hoisted(() => vi.fn());
+
+vi.mock('@/pages/ChatAgent/utils/attachmentUpload', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/attachmentUpload')>();
+  return {
+    ...actual,
+    uploadAttachment: mockUploadAttachment,
+    stageAttachment: mockUploadAttachment,
+    discardAttachment: mockDiscardAttachment,
+  };
+});
+
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
   getModelMetadata: vi.fn().mockResolvedValue({}),
@@ -905,44 +923,41 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     });
   };
 
-  /** Stages an attachment with a controlled FileReader whose completion the test drives. */
-  const attachFileWithControlledReader = (
+  /** Stages an attachment with a controlled #782 uploadAttachment promise the test drives. */
+  const attachFileWithControlledStage = (
     view: ReturnType<typeof renderComposer>,
     name = 'page.txt',
-    dataUrl = 'data:text/plain;base64,eA==',
   ) => {
-    let finishRead!: () => void;
-    const OriginalFileReader = globalThis.FileReader;
-    class ControlledFileReader {
-      result: string | ArrayBuffer | null = null;
-      onload: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
-      onerror: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
-      readAsDataURL() {
-        finishRead = () => {
-          this.result = dataUrl;
-          this.onload?.call(this as unknown as FileReader, new ProgressEvent('load') as ProgressEvent<FileReader>);
-        };
-      }
-    }
-    globalThis.FileReader = ControlledFileReader as unknown as typeof FileReader;
-    try {
-      attachFile(view, name);
-    } finally {
-      globalThis.FileReader = OriginalFileReader;
-    }
-    return () => {
-      act(() => {
-        finishRead();
+    attachFile(view, name);
+    const entry = pendingStages.at(-1);
+    return async () => {
+      stageSeqRef.current += 1;
+      const id = `att-draft-${stageSeqRef.current}`;
+      await act(async () => {
+        entry?.resolve(id);
+        await Promise.resolve();
+        await Promise.resolve();
       });
     };
   };
 
-  /** Stages an attachment and synchronously finishes its FileReader so it is ready to send. */
-  const attachReadyFile = (view: ReturnType<typeof renderComposer>, name = 'page.txt') => {
-    attachFileWithControlledReader(view, name)();
+  /** Stages an attachment and resolves its upload so it is ready to send. */
+  const attachReadyFile = async (view: ReturnType<typeof renderComposer>, name = 'page.txt') => {
+    await attachFileWithControlledStage(view, name)();
   };
 
   beforeEach(() => {
+    pendingStages.length = 0;
+    stageSeqRef.current = 0;
+    mockUploadAttachment.mockImplementation((_file: File, opts?: { signal?: AbortSignal }) =>
+      new Promise<string>((resolve, reject) => {
+        const entry = { resolve, reject };
+        pendingStages.push(entry);
+        opts?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'));
+        });
+      }),
+    );
     localStorage.clear();
     Element.prototype.scrollIntoView = vi.fn();
   });
@@ -1071,7 +1086,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
 
     const reopened = renderComposer({ draftKey: 'thread:t-att-reset', onSend }, { userId: 'u-1' });
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
-    attachReadyFile(reopened, 'page-again.txt');
+    await attachReadyFile(reopened, 'page-again.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).toHaveBeenCalledTimes(1);
 
@@ -1144,15 +1159,15 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     );
     const ref = createRef<ChatInputHandle>();
     const view = renderComposer({ draftKey: 'thread:t-host-unread', onSend }, { userId: 'u-1', ref });
-    const finishRead = attachFileWithControlledReader(view, 'page.txt');
+    const finishStage = attachFileWithControlledStage(view, 'page.txt');
     fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read', selectionStart: 29 } });
-    // While the FileReader has not finished, sending is blocked.
+    // While staging has not finished, sending is blocked.
     expect(screen.getByLabelText('Send message')).toBeDisabled();
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).not.toHaveBeenCalled();
 
-    // Once the FileReader completes, the send proceeds with the attachment.
-    finishRead();
+    // Once staging completes, the send proceeds with the attachment.
+    await finishStage();
     expect(screen.getByLabelText('Send message')).not.toBeDisabled();
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).toHaveBeenCalledTimes(1);
@@ -1164,7 +1179,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     act(() => {
       ref.current!.giveBack(sent.text, sent.files);
     });
-    expect(screen.getByText('page.txt')).toBeTruthy();
+    await waitFor(() => expect(screen.getByText('page.txt')).toBeTruthy());
     fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read!', selectionStart: 30 } });
     view.unmount();
 
@@ -1191,10 +1206,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     );
     const ref = createRef<ChatInputHandle>();
     const view = renderComposer({ draftKey: 'thread:t-host-files', onSend }, { userId: 'u-1', ref });
-    attachFile(view, 'page.txt');
-    // The file is read asynchronously (FileReader); a send before its data is
-    // ready carries none.
-    await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+    await attachReadyFile(view, 'page.txt');
     fireEvent.change(view.getTextarea(), { target: { value: 'went with a file', selectionStart: 16 } });
     fireEvent.click(screen.getByLabelText('Send message'));
     const sent = onSend.mock.calls[0][0];
@@ -1223,7 +1235,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     reopened.unmount();
   });
 
-  it('a failed send of a draft with a quote and attachments restores text, chip and notice in place, and a resend carries the quote whole', () => {
+  it('a failed send of a draft with a quote and attachments restores text, chip and notice in place, and a resend carries the quote whole', async () => {
     const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
     const ref = createRef<ChatInputHandle>();
     const view = renderComposer({ draftKey: 'thread:t-fail', onSend }, { userId: 'u-1', ref });
@@ -1235,7 +1247,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), {
       target: { value: `${withToken}why?`, selectionStart: (withToken + 'why?').length },
     });
-    attachReadyFile(view, 'exhibit.txt');
+    await attachReadyFile(view, 'exhibit.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).toHaveBeenCalledTimes(1);
 
@@ -1404,7 +1416,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped', from: ANALYST });
     });
     const withToken = view.getTextarea().value;
-    attachReadyFile(view, 'exhibit.txt');
+    await attachReadyFile(view, 'exhibit.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(view.getTextarea().value).toBe('');
 
@@ -1480,7 +1492,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     view.unmount();
   });
 
-  it('keeps the attachments-again notice through the edits that follow a restore', () => {
+  it('keeps the attachments-again notice through the edits that follow a restore', async () => {
     vi.useFakeTimers();
     const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
     const view = renderComposer({ draftKey: 'thread:t-att-keep', onSend }, { userId: 'u-1' });
@@ -1488,7 +1500,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), {
       target: { value: 'draft with a file', selectionStart: 16 },
     });
-    attachReadyFile(view, 'page.txt');
+    await attachReadyFile(view, 'page.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
 
@@ -1910,7 +1922,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'send A plain', selectionStart: 13 } });
     fireEvent.click(screen.getByLabelText('Send message'));
     fireEvent.change(view.getTextarea(), { target: { value: 'send B with file', selectionStart: 17 } });
-    attachReadyFile(view, 'exhibit.txt');
+    await attachReadyFile(view, 'exhibit.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
 
     // B (newer) not taken: its words and its attachment notice come back.
@@ -2266,7 +2278,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       fireEvent.change(view.getTextarea(), {
         target: { value: `${tokenB}quoted send B`, selectionStart: (tokenB + 'quoted send B').length },
       });
-      attachReadyFile(view, 'exhibit.txt');
+      await attachReadyFile(view, 'exhibit.txt');
       fireEvent.click(screen.getByLabelText('Send message'));
 
       // Settled newest-first while composing, matching settleQueued(false)

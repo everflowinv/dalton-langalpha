@@ -4,6 +4,7 @@ Pydantic models for infrastructure configuration.
 These models define the schema for config.yaml (infrastructure settings).
 """
 
+from datetime import date
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -164,13 +165,9 @@ class RedisTTLConfig(BaseModel):
 class RedisSWRConfig(BaseModel):
     """Stale-While-Revalidate configuration for Redis cache."""
 
-    enabled: bool = Field(default=True, description="Enable SWR for cache reads")
     soft_ttl_ratio: float = Field(
         default=0.6,
         description="Refresh when remaining TTL < this ratio of original",
-    )
-    warm_after_invalidation: bool = Field(
-        default=True, description="Pre-populate cache after invalidation"
     )
 
 
@@ -207,9 +204,6 @@ class RedisConfig(BaseModel):
         default=5, description="Redis socket connect timeout in seconds"
     )
     ttl: RedisTTLConfig = Field(default_factory=RedisTTLConfig)
-    cache_invalidate_on_write: bool = Field(
-        default=True, description="Invalidate cache on writes"
-    )
     swr: RedisSWRConfig = Field(default_factory=RedisSWRConfig)
 
 
@@ -311,6 +305,26 @@ class McpDescriptionsConfig(BaseModel):
     interval_seconds: int = Field(default=20, ge=5)
 
 
+class ThreadSearchConfig(BaseModel):
+    """The sweep that keeps conversation search's index whole.
+
+    A turn is indexed as it settles, in the process that ran it; each pass
+    finds the recently settled turns that trigger missed (a worker lost, a
+    deploy) and retries the answers whose read failed, and the deployment
+    walks every thread, the backfill for turns that settled before search
+    existed, then again each day. One worker sweeps at a time. Each batch
+    takes ``batch_threads`` threads; the walk goes in slices of a few
+    seconds' work, each resting at least as long as it took and never less
+    than ``pause_seconds``, so a backfill never holds the database or the
+    checkpoint reader for long. Off, turns are still indexed as they settle.
+    """
+
+    enabled: bool = Field(default=True)
+    interval_seconds: int = Field(default=120, ge=10)
+    batch_threads: int = Field(default=10, ge=1, le=200)
+    pause_seconds: float = Field(default=0.5, ge=0)
+
+
 class FeatureFlagOverride(BaseModel):
     """Deployment override for a code-declared feature (src/config/features.py).
 
@@ -321,11 +335,11 @@ class FeatureFlagOverride(BaseModel):
     enabled: Optional[bool] = Field(
         default=None, description="Kill switch: false turns the feature off for everyone"
     )
-    gate: Optional[Literal["none", "opt_in", "opt_out", "plan"]] = Field(
+    gate: Optional[Literal["none", "opt_in", "opt_out", "plan", "grant"]] = Field(
         default=None,
         description=(
             "Access model while enabled: everyone / user opt-in / user opt-out "
-            "/ platform plan tier"
+            "/ platform plan tier / granted to the user"
         ),
     )
     min_tier: Optional[int] = Field(
@@ -354,10 +368,6 @@ class ClaudeCodeConfig(BaseModel):
     turn on a cloud computer runs inside that computer's own sandbox, and only
     on Medium computers or larger (``hosted.SANDBOX_MIN_TIER``)."""
 
-    hosted_api_key: bool = Field(
-        default=False,
-        description="Run Claude Code turns on cloud computers on the user's own Anthropic API key",
-    )
     stored_custody: bool = Field(
         default=False,
         description="Run Claude Code turns on cloud computers on a setup token the user lets the server store",
@@ -368,6 +378,17 @@ class ClaudeCodeConfig(BaseModel):
     )
     hosted_turns_per_user: int = Field(
         default=3, ge=1, description="Claude Code turns one user runs at once on cloud computers"
+    )
+    cli_memory_mb: int = Field(
+        default=800,
+        ge=256,
+        description="Memory each Claude Code CLI on a cloud computer is counted at: its size's memory over this "
+        "is how many it runs at once",
+    )
+    claude_oauth_ends_on: Optional[date] = Field(
+        default=None,
+        description="The day the Claude sign-in (claude-oauth) stops working on this deployment; set, the app "
+        "marks it legacy and asks the users signed in with it to move to Claude Code",
     )
 
 
@@ -588,3 +609,5 @@ class InfrastructureConfig(BaseModel):
     order_reconcile: OrderReconcileConfig = Field(
         default_factory=OrderReconcileConfig
     )
+    # Conversation search index sweep
+    thread_search: ThreadSearchConfig = Field(default_factory=ThreadSearchConfig)

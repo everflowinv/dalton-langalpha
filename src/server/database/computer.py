@@ -238,6 +238,23 @@ async def get_computer_for_workspace(
     return dict(row) if row else None
 
 
+async def get_computer_for_thread(thread_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
+    """The computer the thread's workspace is bound to; None for an unbound Home."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            SELECT {computer_cols("c")}
+            FROM computers c
+            JOIN workspaces w ON w.computer_id = c.computer_id
+            JOIN conversation_threads t ON t.workspace_id = w.workspace_id
+            WHERE t.conversation_thread_id = %s AND c.{FENCE_NOT_DELETED}
+            """,
+            (thread_id,),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
 async def get_computer(
     computer_id: str,
     *,
@@ -331,7 +348,8 @@ async def get_computer_roster(
     conn=None,
 ) -> List[Dict[str, Any]]:
     """The user's live computers by id and name, with the kind and provider
-    config (whether it is a machine of the user's own), root (where its
+    config (whether it is a machine of the user's own), its settings
+    (``config``: how many Claude Code CLIs it runs at once), root (where its
     workspace folders sit) and status, and ``is_home`` on the one the user's
     Home is on, read in the same snapshot as the names.
 
@@ -341,7 +359,7 @@ async def get_computer_roster(
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            SELECT c.computer_id, c.name, c.kind, c.provider_config, c.root_dir, c.status,
+            SELECT c.computer_id, c.name, c.kind, c.provider_config, c.config, c.root_dir, c.status,
                    c.computer_id IS NOT DISTINCT FROM (
                        SELECT h.computer_id FROM workspaces h
                        WHERE h.workspace_id = %(home_id)s AND h.{FENCE_NOT_DELETED}
@@ -492,6 +510,26 @@ async def clear_computer_retirement_pending(
                     @> '{{"retire_when_empty": true}}'::jsonb
             """,
             (computer_id,),
+        )
+        return cur.rowcount > 0
+
+
+async def set_computer_setting(
+    computer_id: str, user_id: str, key: str, value: Any, *, conn=None
+) -> bool:
+    """Set one of the user's computer's settings in its ``config``. False
+    where the computer is gone or not theirs."""
+    async with _computer_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE computers
+            SET config = jsonb_set(COALESCE(config, '{{}}'::jsonb), %s, %s::jsonb),
+                updated_at = NOW()
+            WHERE computer_id = %s
+              AND user_id = %s
+              AND {FENCE_NOT_DELETED}
+            """,
+            ([key], Json(value), computer_id, user_id),
         )
         return cur.rowcount > 0
 
@@ -848,32 +886,59 @@ async def try_bind_computer_provider_ref(
 
 
 async def stamp_computer_host_unavailable(
-    computer_id: str, sandbox_id: str
+    computer_id: str, sandbox_id: str, stuck_in: Optional[str] = None
 ) -> Optional[tuple[datetime, timedelta]]:
-    """Start the outage clock for the sandbox the row names, and read it.
+    """Run the outage clock for the sandbox the row names, and read it.
 
-    The first refused start stamps and every later one keeps that stamp, so the
-    answer is when the host started refusing and for how long, whichever worker
-    asked. None when the row names another sandbox, or none: a replacement has
-    its own clock, and this failure says nothing about it.
+    A refused start, or with *stuck_in* a sandbox left in that transition,
+    keeps a clock started the same way and starts it afresh otherwise, so the
+    answer is how long the host has failed the sandbox this way, whichever
+    worker asked. None when the row names another sandbox, or none: a
+    replacement has its own clock, and this failure says nothing about it.
     """
     async with _computer_cursor() as cur:
         await cur.execute(
             """
             UPDATE computers
-            SET host_unavailable_since = COALESCE(host_unavailable_since, NOW())
+            SET host_unavailable_since = CASE
+                    WHEN host_unavailable_stuck_in IS NOT DISTINCT FROM %(stuck_in)s
+                    THEN COALESCE(host_unavailable_since, NOW())
+                    ELSE NOW()
+                END,
+                host_unavailable_stuck_in = %(stuck_in)s
             WHERE computer_id = %(computer_id)s
               AND provider_ref = %(sandbox_id)s
               AND status != 'deleted'
             RETURNING host_unavailable_since,
                       NOW() - host_unavailable_since AS unavailable_for
             """,
-            {"computer_id": computer_id, "sandbox_id": sandbox_id},
+            {"computer_id": computer_id, "sandbox_id": sandbox_id, "stuck_in": stuck_in},
         )
         row = await cur.fetchone()
     if row is None:
         return None
     return row["host_unavailable_since"], row["unavailable_for"]
+
+
+async def end_moved_host_outage(computer_id: str, sandbox_id: str, state: str) -> None:
+    """End a stuck-transition clock once a read finds its sandbox in *state*.
+
+    A sandbox found out of the transition it was stuck in moved on, so a later
+    sighting is a new outage. A clock refused starts run is left alone: such a
+    sandbox reads as stopped between tries. A no-op while no clock runs.
+    """
+    async with _computer_cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE computers
+            SET host_unavailable_since = NULL
+            WHERE computer_id = %(computer_id)s
+              AND provider_ref = %(sandbox_id)s
+              AND host_unavailable_since IS NOT NULL
+              AND host_unavailable_stuck_in <> %(state)s
+            """,
+            {"computer_id": computer_id, "sandbox_id": sandbox_id, "state": state},
+        )
 
 
 async def clear_computer_host_unavailable(

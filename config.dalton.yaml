@@ -65,6 +65,13 @@ features:
   # the operator decision that opens those surfaces.
   claude_code_runtime:
     enabled: false
+  # SYNC5 S6 (#772 #776 #781): upstream gates new Claude sign-ins by grant
+  # because Claude Code mode replaces them. Dalton keeps Claude Code off and its
+  # Claude models (Fable, Opus) run on each user's own Claude sign-in, so a new
+  # colleague must still be able to sign in: the gate stays open to everyone.
+  claude_oauth:
+    enabled: true
+    gate: none
   # SYNC3 B7 (#658): upstream turned the scratchpad on by default (catalog
   # enabled=True with an OPT_OUT gate). The kill switch turns it off for
   # every Dalton user: a disabled feature never reaches the per-user

@@ -38,6 +38,56 @@ export async function getAvailableModels(): Promise<ModelsResponse> {
  *  it would run, so Claude Code does not run there, whatever the token. */
 export type ClaudeCodeState = 'off' | 'no_token' | 'checking' | 'unverified' | 'signed_in' | 'rejected' | 'policy_blocked';
 
+/** A Claude plan's usage window, as Claude names it. `seven_day_overage_included`
+ *  is the weekly Fable limit. */
+export type ClaudeCodePlanWindow = 'five_hour' | 'seven_day' | 'seven_day_opus' | 'seven_day_sonnet' | 'seven_day_overage_included';
+
+/** A window a Claude plan is held at, and until when: both null where
+ *  Claude didn't say when it resets. */
+export interface ClaudeCodePlanLimit {
+  window: ClaudeCodePlanWindow | null;
+  until: string | null;
+}
+
+/** A limit the plan holds now, and the model family it binds: null for one
+ *  that binds every model. Where Claude didn't say when it resets
+ *  (`reset_known` false), `until` only bounds the hold and is never shown,
+ *  and `window` is null where Claude named none. */
+export interface ClaudeCodePlanHeld {
+  window: ClaudeCodePlanWindow | null;
+  until: string;
+  family: 'opus' | 'sonnet' | 'fable' | null;
+  reset_known: boolean;
+}
+
+/** How much of the Claude plan behind a token its last request reported
+ *  used: each window's share (0 to 1) and when it resets, every limit still
+ *  ahead, in no particular order, and whether the account bills past the
+ *  limit to usage credits (null until reported). A window that has passed is
+ *  sent as null. */
+export interface ClaudeCodePlan {
+  five_hour: { used: number; resets_at: string } | null;
+  seven_day: { used: number; resets_at: string } | null;
+  limits: ClaudeCodePlanHeld[];
+  credits: 'on' | 'off' | null;
+  observed_at: string;
+}
+
+/** The Claude plan a Check now reads: the saved token's, or a computer's own token's. */
+export type PlanCredential = { kind: 'saved' } | { kind: 'computer'; computerId: string };
+
+/** A turn a Claude plan's limit ended: stopped partway (`plan_stopped`, with
+ *  whether requests already under way were billed to usage credits), or
+ *  refused before it started (`plan_limited`). */
+export interface PlanRefusal extends ClaudeCodePlanLimit {
+  reason: 'plan_stopped' | 'plan_limited';
+  creditsBilled: boolean;
+}
+
+/** A reply whose last request was billed to usage credits: the window that
+ *  ran out during it, and when it resets, both null where Claude didn't say. */
+export type PlanBilled = ClaudeCodePlanLimit;
+
 /** `GET /api/v1/claude-code/status`, and the answer to a token saved. A
  *  server that predates it answers 404, which reads as `off`. */
 export interface ClaudeCodeStatus {
@@ -52,6 +102,18 @@ export interface ClaudeCodeStatus {
   /** A token is saved, whatever `state` says: one is still there to remove
    *  once Claude Code is off. Absent from a server that predates it. */
   saved?: boolean;
+  /** The saved token's plan, null until a request on it reported one.
+   *  Absent from a server that predates it. */
+  plan?: ClaudeCodePlan | null;
+  /** Whole seconds until Check now may run on the saved token again, null
+   *  while it may run now. Counted on the server's clock, so it is read
+   *  from when the answer arrived, never against a server time. Absent from
+   *  a server that predates it. */
+  check_in?: number | null;
+  /** Whether a check would be billed to usage credits: under Stop the plan
+   *  holds a limit on the model a check asks for, and usage credits are not
+   *  known to be off. Check now is not offered then. */
+  check_bills?: boolean;
 }
 
 /** Where Claude Code stands on one of the user's own computers. `off`: their
@@ -79,6 +141,17 @@ export interface ClaudeCodeComputer {
   own_file?: boolean;
   email: string | null;
   expires_at: string | null;
+  /** The plan of the token its turns use: the saved token's on `saved`.
+   *  Absent from a server that predates it. */
+  plan?: ClaudeCodePlan | null;
+  /** Whole seconds until Check now may run on that token again, null while
+   *  it may run now, as `ClaudeCodeStatus.check_in` counts them. */
+  check_in?: number | null;
+  /** Whether a check of that token would be billed (`ClaudeCodeStatus.check_bills`). */
+  check_bills?: boolean;
+  /** How many Claude Code agents it runs at once, subagents included.
+   *  Absent from a server that predates the setting. */
+  clis?: number;
 }
 
 /** The user's own computers, and each cloud computer of theirs that refuses
@@ -86,10 +159,49 @@ export interface ClaudeCodeComputer {
  *  reason (`needs_bigger_computer`: below the size Claude Code runs at). */
 export type ClaudeCodeComputerRefusal = 'needs_bigger_computer';
 
+/** Where a turn's Claude Code CLI runs: the workspace's own computer
+ *  (`own`); for every cloud workspace and Home, the own computer the server
+ *  picked where the user's cloud computers run none (`picked`); inside Home's
+ *  cloud computer (`home_cloud`); or in this server's workers, on no computer
+ *  of the user's (`server`). */
+export type ClaudeCodeCliKind = 'own' | 'picked' | 'home_cloud' | 'server';
+
+/** Why a turn's Claude Code CLI can run nowhere. */
+export type ClaudeCodePlacementRefusal =
+  | 'no_own_computer' | 'cli_computer_offline' | 'needs_own_computer' | 'needs_bigger_computer'
+  | 'policy_blocked' | 'signed_out' | 'token_refused' | 'needs_perl' | 'computer_unsupported';
+
+/** Where a turn's Claude Code CLI runs (`kind`), on the computer `computer_id`
+ *  and `name` name, or the reason it can run nowhere (`refusal`), with
+ *  `name` the computer that names (the offline one on
+ *  `cli_computer_offline`). */
+export interface ClaudeCodeCliPlacement {
+  kind: ClaudeCodeCliKind;
+  computer_id: string | null;
+  name: string | null;
+  refusal: ClaudeCodePlacementRefusal | null;
+}
+
+export interface ClaudeCodeChiefOfStaff extends ClaudeCodeCliPlacement {
+  /** Whether the Chief of Staff runs the user's saved Claude Code Default:
+   *  false where its CLI has nowhere to run, where the token there is known
+   *  not to work, or where it would sign in with the setup token the user
+   *  stored. */
+  default_runs: boolean;
+}
+
 export interface ClaudeCodeComputers {
   computers: ClaudeCodeComputer[];
   /** Absent from a server that predates it. */
   cloud_refusals?: Record<string, ClaudeCodeComputerRefusal>;
+  /** Where the user's cloud computers run no CLI themselves, the own
+   *  computer, one of `computers`, that runs it for every cloud workspace
+   *  and Home (`picked`), or `no_own_computer` or `cli_computer_offline`.
+   *  Null where they do; absent from a server that predates it. */
+  cli_computer?: ClaudeCodeCliPlacement | null;
+  /** The most a computer may be set to run at once (`clis`). Absent from a
+   *  server that predates the setting, which offers none. */
+  clis_max?: number;
 }
 
 /** A server from before per-computer tokens has no such route, and runs
@@ -106,6 +218,15 @@ export async function getClaudeCodeComputers(): Promise<ClaudeCodeComputers> {
 
 const computerPath = (computerId: string) => `/api/v1/claude-code/computers/${encodeURIComponent(computerId)}`;
 
+/** `POST /api/v1/claude-code/check` or `.../computers/{id}/check`: one
+ *  minimal request on the credential's plan, run where its own check runs,
+ *  so its windows are read now. Answers 204; refused with 429 `check_held`
+ *  (and `check_in`) within 5 minutes of the last. */
+export async function checkClaudeCodePlan(credential: PlanCredential): Promise<void> {
+  const path = credential.kind === 'saved' ? '/api/v1/claude-code/check' : `${computerPath(credential.computerId)}/check`;
+  await api.post(path);
+}
+
 /** Puts a setup token on the computer once Anthropic takes it; the refusals
  *  are `saveClaudeCodeToken`'s. */
 export async function saveClaudeCodeComputerToken(computerId: string, token: string): Promise<ClaudeCodeComputer> {
@@ -120,6 +241,13 @@ export async function startClaudeCodeComputerSignIn(computerId: string): Promise
 
 export async function submitClaudeCodeComputerSignInCode(computerId: string, code: string): Promise<ClaudeCodeComputer> {
   const { data } = await api.post(`${computerPath(computerId)}/sign-in/code`, { code });
+  return data as ClaudeCodeComputer;
+}
+
+/** `PUT .../computers/{id}/clis`: how many Claude Code agents the computer
+ *  runs at once, from its next one on. Answers the computer's entry. */
+export async function setClaudeCodeComputerClis(computerId: string, clis: number): Promise<ClaudeCodeComputer> {
+  const { data } = await api.put(`${computerPath(computerId)}/clis`, { clis });
   return data as ClaudeCodeComputer;
 }
 
@@ -152,6 +280,13 @@ export interface ClaudeCodeSetup {
   /** The user's cloud computers too small for Claude Code, in their order.
    *  Absent from a server that predates it. */
   too_small?: { computer_id: string; name: string }[];
+  /** `state` for a subagent's Claude Code pin, from a server that still
+   *  keeps pins off the setup token the user stored; a newer one omits it,
+   *  since a pin there runs as the turn's own CLI does. */
+  pin_state?: ClaudeCodeSetupState;
+  /** Where the Chief of Staff's CLI runs, whenever Claude Code is on for the
+   *  user. Null while it is off; absent from a server that predates it. */
+  chief_of_staff?: ClaudeCodeChiefOfStaff | null;
 }
 
 /** Null where this server offers no Claude Code (404), or one from before
@@ -172,28 +307,24 @@ export async function getClaudeCodeStatus(): Promise<ClaudeCodeStatus> {
 }
 
 /** Whether Claude Code runs for the user on cloud computers: it runs only on
- *  their own computers (`local`), or on cloud computers too, with their
- *  Anthropic API key (`api_key`) or on the setup token they let the server
- *  store (`stored`). */
-export type ClaudeCodeCustodyMode = 'local' | 'api_key' | 'stored';
+ *  their own computers (`local`), or on cloud computers too, on the setup
+ *  token they let the server store (`stored`). */
+export type ClaudeCodeCustodyMode = 'local' | 'stored';
 
 /** `GET /api/v1/claude-code/custody`, and the answer to a choice made. */
 export interface ClaudeCodeCustody {
   mode: ClaudeCodeCustodyMode;
-  /** An Anthropic API key is saved under Model access, the one `api_key` runs on. */
-  api_key_saved: boolean;
-  /** What the server lets the user choose now. A mode chosen before its
-   *  switch went off is kept, and paused. */
+  /** What the server lets the user choose now: none while storing is
+   *  blocked for them (`blocked`). */
   offered: Exclude<ClaudeCodeCustodyMode, 'local'>[];
   /** An operator turned storing a token off for this user: `stored` is never
    *  offered, and the mode is `local`. */
   blocked: boolean;
   /** The server's verdict for a turn on a cloud computer: what it runs on,
    *  else the reason it is refused for (a `claude_code_off` refusal reason). */
-  runs_on: 'api_key' | 'stored_token' | null;
+  runs_on: 'stored_token' | null;
   refusal: string | null;
   /** The version of the consent text storing a token needs accepted now. */
-  disclosure: string | null;
 }
 
 /** Null where this server offers no choice for cloud computers (404): a
@@ -211,7 +342,7 @@ export async function getClaudeCodeCustody(): Promise<ClaudeCodeCustody | null> 
 
 /** A refusal carries the OAuth routes' `error` body (`readOAuthError`): a
  *  mode not offered now (`unavailable`), storing blocked for the user
- *  (`stored_blocked`), or `stored` without the current `disclosure`.
+ *  (`stored_blocked`), or `stored` without the current `disclosure`, the version of the consent copy the dialog showed.
  *  Leaving `stored` deletes the stored token before it answers. */
 export async function setClaudeCodeCustody(mode: ClaudeCodeCustodyMode, disclosure?: string): Promise<ClaudeCodeCustody> {
   const { data } = await api.put('/api/v1/claude-code/custody', disclosure ? { mode, disclosure } : { mode });

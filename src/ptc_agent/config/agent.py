@@ -9,7 +9,7 @@ Use src.config.loaders for file-based loading.
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -53,6 +53,19 @@ class CredentialSource(StrEnum):
     BYOK = "byok"
     PLATFORM = "platform"
     NONE = "none"
+
+
+#: Who a model call bills, as the model picker and a failed turn's card name
+#: it. ``local`` is a server on the user's machine, which nobody bills.
+Payer = Literal["subscription", "own_key", "credits", "server_key", "local"]
+
+
+class CredentialPayer(NamedTuple):
+    """Who the turn's credential bills, and the user's account it bills when
+    it is theirs (``DeepSeek``, ``ChatGPT``, ``GLM Coding Plan``)."""
+
+    payer: Payer
+    account: str | None = None
 
 
 class IdleCompactConfig(BaseModel):
@@ -342,6 +355,20 @@ class LLMConfig(BaseModel):
         return list(dict.fromkeys(m for m in self.fallback or () if m and m != model))
 
 
+class Admitted(NamedTuple):
+    """What admission let a Claude Code CLI run on: ``hosted``, its credential
+    on a cloud computer (``saved_token`` or ``stored_token``, None on an own
+    computer), ``saved``, which setup token the user saved it may sign in
+    with, there or relayed to an own computer (named as ``hosted`` is), None
+    where it may sign in with none, and ``cli_computer``, the own computer
+    the server picked to run it for a workspace on a cloud computer that runs
+    none, None where the workspace's computer or the server runs it."""
+
+    hosted: str | None = None
+    saved: str | None = None
+    cli_computer: str | None = None
+
+
 class AgentConfig(BaseModel):
     """Agent-specific configuration.
 
@@ -377,7 +404,7 @@ class AgentConfig(BaseModel):
     #: what the deployment and the manifest declare.
     prompt_guidance: str | None = None
 
-    # Search API provider (tavily, serper, bocha, exa, parallel)
+    # Search API provider (tavily, serper, bocha, exa, parallel, deepseek)
     search_api: str = "tavily"
 
     # Search depth level name from the provider's manifest entry
@@ -422,6 +449,8 @@ class AgentConfig(BaseModel):
     credential_source: CredentialSource = Field(
         default=CredentialSource.NONE, exclude=True
     )
+    # Who that credential bills, as a failed turn names it; set beside it.
+    credential_payer: CredentialPayer | None = Field(default=None, exclude=True)
     subsidiary_llm_clients: dict[str, Any] = Field(default_factory=dict, exclude=True)
     # Scaffolding level per role key, for the model that role actually runs.
     # Written alongside the clients above, because a role without a client of
@@ -433,22 +462,21 @@ class AgentConfig(BaseModel):
     subagent_models: dict[str, SubagentModel] = Field(
         default_factory=dict, exclude=True
     )
-    # What a Claude Code turn on a cloud computer was admitted to sign in
-    # with, None on any other turn; the run's row is stamped from it, so the
-    # turn is counted as what admission let it run on.
-    claude_code_hosted: str | None = Field(default=None, exclude=True)
-    # Which setup token the user saved it may sign in with, there or relayed
-    # to an own computer (``saved_token`` or ``stored_token``), None for none.
-    claude_code_saved: str | None = Field(default=None, exclude=True)
+    # Whether admission let the turn run on Claude Code, which its run's row
+    # is stamped with, so its computer counts its CLI.
+    claude_code: bool = Field(default=False, exclude=True)
+    # What admission let a Claude Code turn run on, None on any other turn;
+    # the run's row is stamped from it, so the turn is counted as what it was
+    # let run on, and its CLI signs in with it.
+    claude_code_admitted: Admitted | None = Field(default=None, exclude=True)
+    # On a turn of another model, what admission let its subagents' Claude
+    # Code pins run on; None where they run the turn's model.
+    claude_code_pins: Admitted | None = Field(default=None, exclude=True)
     # None permits standalone name resolution; [] means resolution rejected all candidates.
     fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)
     # Display names aligned index-for-index with ``fallback_llm_clients``
     # (skipped fallbacks drop from both lists).
     fallback_llm_names: list[str] | None = Field(default=None, exclude=True)
-    # Whether the fallbacks are a list the user saved rather than the
-    # deployment's. Only the user's may move a call their own key or
-    # subscription pays for onto the platform's key.
-    fallback_users_choice: bool = Field(default=False, exclude=True)
     # Forwarded by ``get_llm_client()`` to ``create_llm(cache_key=...)`` for
     # the lazy factory path.
     cache_key: str | None = Field(default=None, exclude=True)

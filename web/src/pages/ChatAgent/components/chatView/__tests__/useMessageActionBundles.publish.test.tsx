@@ -41,6 +41,8 @@ function sources(overrides: Partial<MessageActionSources> = {}): MessageActionSo
     onRejectToolCall: noop,
     onThumbUp: async () => null,
     onThumbDown: async () => null,
+    // DALTON-HOOK(external-share-guard): follow-up is part of the action sources; this gate still only checks Publish
+    onThumbDownFollowUp: async () => ({ status: 'ok' as const }),
     onWidgetSendPrompt: noop,
     onEditMessage: noop,
     onRegenerate: noop,

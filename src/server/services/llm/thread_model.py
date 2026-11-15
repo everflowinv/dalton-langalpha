@@ -16,7 +16,6 @@ from typing import TypeVar
 
 from fastapi import HTTPException
 
-from src.llms.claude_code import is_claude_code_model
 from src.server.database.conversation import threads_read, threads_write
 
 from . import logger, user_models
@@ -45,7 +44,12 @@ class NamedModel:
 
 
 async def turn_model(
-    user_id: str, thread_id: str, *, named: str | None, held: str | None
+    user_id: str,
+    thread_id: str,
+    *,
+    named: str | None,
+    held: str | None,
+    clear_dead: bool = True,
 ) -> str | None:
     """The model this turn runs: the one it names, else the one the thread
     holds; None runs the account default.
@@ -58,6 +62,9 @@ async def turn_model(
     shows the default rather than resending it. A clear that loses to a pick
     saved since the send read the thread runs the pick, as the send's own
     write would yield to it.
+
+    A read of what the next turn would run passes ``clear_dead=False``: it
+    gets the same answer and leaves the clearing to that turn.
     """
     if named and named != held:
         return named  # nothing of the thread's at stake; the resolver judges it
@@ -67,6 +74,8 @@ async def turn_model(
     prefs = await user_models.get_model_preference(user_id)
     if model_resolves(prefs, model):
         return model
+    if not clear_dead:
+        return named
     if await threads_write.clear_thread_llm_model(thread_id, model):
         logger.info(
             f"[CHAT] Cleared thread {thread_id}'s model {model!r}: no longer available"
@@ -120,6 +129,7 @@ async def resolve_turn_config(
     held: str | None,
     fall_back: bool,
     resolve: Callable[[str | None], Awaitable[_Config]],
+    clear_dead: bool = True,
 ) -> _Config:
     """Resolve what a turn on this thread runs: ``turn_model``'s choice, or,
     with ``fall_back``, the account default when the thread's own model cannot
@@ -129,9 +139,10 @@ async def resolve_turn_config(
     reconnect the account or add the key; a person gets the refusal, which says
     what to fix. A send and a manual compaction both come through here, so a
     summary runs on the model and credential the thread's turns do. ``resolve``
-    maps a model name (None for the account default) to the caller's config.
+    maps a model name (None for the account default) to the caller's config,
+    and ``clear_dead`` is ``turn_model``'s.
     """
-    model = await turn_model(user_id, thread_id, named=named, held=held)
+    model = await turn_model(user_id, thread_id, named=named, held=held, clear_dead=clear_dead)
     try:
         return await resolve(model)
     except HTTPException as exc:
@@ -187,9 +198,10 @@ async def carry_default_change(
     if scope != "existing_threads":
         return 0
     old, new = effective_default_model(before), effective_default_model(after)
-    # With no old default no thread can be on it. Nor does a thread move onto
-    # a Claude Code row, which continues only threads it replied on.
-    if not old or old == new or is_claude_code_model(new):
+    # With no old default no thread can be on it. A thread moved onto a
+    # Claude Code row opens its next turn on the brief its model writes then
+    # (``brief_for_turn``).
+    if not old or old == new:
         return 0
     moved = await threads_write.reassign_thread_llm_models(user_id, old, new, conn=conn)
     logger.info(
@@ -197,3 +209,25 @@ async def carry_default_change(
         f"{old} -> {new}"
     )
     return moved
+
+
+async def next_turn_runs_claude_code(user_id: str, workspace_id: str | None, held: str | None) -> bool:
+    """Whether the thread's next turn, naming no model, runs on Claude Code:
+    on the thread's own model, ``held``, while it still resolves (``turn_model``),
+    else on the account default (``effective_default_model``), which the
+    Chief of Staff runs only where ``chief_of_staff_default_runs`` lets it,
+    as ``resolve_llm_config`` does, and on the deployment's Default
+    otherwise. Never while the user's Claude Code models are off
+    (``rows_on``): a held one is refused at the send, and a brief written
+    for it would be paid for and never read."""
+    from src.llms.claude_code import is_claude_code_model
+    from src.server.database.home_workspace import is_home_id
+    from src.server.services.claude_code.flow import rows_on
+    from src.server.services.llm.claude_code import chief_of_staff_default_runs
+
+    prefs = await user_models.get_model_preference(user_id)
+    if held and model_resolves(prefs, held):
+        return is_claude_code_model(held) and await rows_on(user_id)
+    if not is_claude_code_model(effective_default_model(prefs)) or not await rows_on(user_id):
+        return False
+    return not is_home_id(user_id, workspace_id) or await chief_of_staff_default_runs(user_id, workspace_id) is not None

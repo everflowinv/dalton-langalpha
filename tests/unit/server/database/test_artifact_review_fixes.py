@@ -130,14 +130,13 @@ async def test_a_legacy_first_cut_keeps_the_owners_keep_updated_off(
     async def fetchone():
         return after
 
+    before = artifacts.artifact_from_row(_row(keep_updated=False, shared_at=_NOW))
     monkeypatch.setattr(
         versions,
         "lock_owned",
         create_autospec(
             versions.lock_owned,
-            return_value=artifacts.artifact_from_row(
-                _row(keep_updated=False, shared_at=_NOW)
-            ),
+            return_value=before,
         ),
     )
     monkeypatch.setattr(
@@ -147,18 +146,21 @@ async def test_a_legacy_first_cut_keeps_the_owners_keep_updated_off(
     )
     mock_cursor.fetchone = fetchone
 
-    result = await artifacts.publish_version(
+    result = await artifacts.legacy_version(
         user_id=_U,
         artifact_id=_A,
-        origin="legacy",
+        read=versions.ReadBasis.of(before),
         files=[_file("first view")],
+        title=None,
     )
 
     assert result.cut is True
     updates = [i for i, s in enumerate(_sql(mock_cursor)) if "UPDATE share_links" in s]
     assert updates, "the record's row must move with the cut"
+    update_sql = _sql(mock_cursor)[updates[0]]
     update_params = mock_cursor.execute.call_args_list[updates[0]].args[1]
-    # None falls to the row's current value in the UPDATE's COALESCE — the
-    # owner's keep_updated=FALSE survives the link's first view.
-    assert update_params["keep_updated"] is None
+    # legacy_version never writes keep_updated — the owner's keep_updated=FALSE
+    # survives the link's first view.
+    assert "keep_updated" not in update_sql.split("RETURNING")[0]
+    assert "keep_updated" not in update_params
     assert result.artifact.keep_updated is False
