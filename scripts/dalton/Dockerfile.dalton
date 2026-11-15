@@ -1,6 +1,22 @@
 # Dalton backend image extending deploy/Dockerfile.dev with build-time git installation
 # and mandatory build-time git SHA + dirty flag + file manifest recording (P0J Round-4 Must-Fix #7).
 # Shares the exact top layers of deploy/Dockerfile.dev for 100% Docker layer cache reuse.
+# sync5 (#752): the chart render page chartkit snapshots with, built apart from the web
+# app (web/vite.chart-render.config.js) exactly as deploy/Dockerfile.dev does. Without it a
+# snapshot reports itself unavailable.
+FROM node:24-alpine AS chart-render
+WORKDIR /web
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+COPY web/patches/ patches/
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
+# Plain install, no BuildKit cache mount: the production host builds with the classic builder
+# (no buildx), which rejects `RUN --mount`.
+RUN pnpm install --frozen-lockfile
+COPY web/chart-render.html web/vite.chart-render.config.js web/postcss.config.js web/tsconfig*.json ./
+COPY web/scripts/react-plugins.ts scripts/react-plugins.ts
+COPY web/src/ src/
+RUN CHART_RENDER_OUT_DIR=/chart-render pnpm run build:chart-render
+
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1
@@ -20,6 +36,8 @@ COPY pyproject.toml uv.lock README.md ./
 # feature is off; cli/ is neither built nor packaged, and computer_cli_tokens
 # never mint). The backend imports nothing from it; pnpm builds it in cli/.
 COPY libs/market-protocol/ libs/market-protocol/
+# sync5: libs/chartkit is a path dependency in pyproject.toml, so uv sync needs it here.
+COPY libs/chartkit/ libs/chartkit/
 
 ARG INSTALL_OBSERVABILITY=false
 ARG UV_CONCURRENT_DOWNLOADS=4
@@ -44,6 +62,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -s /app/.venv/bin/python /opt/homebrew/bin/python3.14
 
 COPY src/ src/
+# compose bind-mounts ./libs/chartkit, which hides the render page copied into it, so a
+# second copy sits outside the mount (same as deploy/Dockerfile.dev).
+COPY --from=chart-render /chart-render/ libs/chartkit/chartkit/render/
+COPY --from=chart-render /chart-render/ /opt/chart-render/
+ENV CHARTKIT_RENDER_DIR=/opt/chart-render
 COPY server.py .
 COPY scripts/ scripts/
 COPY config*.yaml ./
