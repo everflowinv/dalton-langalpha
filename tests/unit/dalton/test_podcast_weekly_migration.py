@@ -636,7 +636,7 @@ def test_dalton_podcast_weekly_skill_contract_and_safety() -> None:
     assert "触发词" not in fm["description"]
 
     assert ("dalton-podcast-weekly", None, ()) in _DALTON_SKILL_SPECS
-    assert len(_DALTON_SKILL_SPECS) == 46
+    assert len(_DALTON_SKILL_SPECS) == 47
     assert "dalton-podcast-weekly" in DALTON_SKILL_DEFINITIONS
     assert "dalton-podcast-weekly" in SKILL_REGISTRY
     assert "podcast-weekly" in REPORT_PROFILES
