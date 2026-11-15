@@ -14242,17 +14242,18 @@ class ResearchDataBridge:
         self,
         document_id: str,
         *,
-        creator_email: str,
+        creator_email: str = "",
+        creator_open_id: str = "",
         title: str = "",
         space_id: str = "",
         node_token: str = "",
     ) -> None:
         """Record a doc this bridge created, so `/feishu/doc/grant` can scope itself (C1).
 
-        The registry names the creating user's email — the same address the
-        create-time auto-grant used — and the grant endpoint accepts only it.
-        A failed write only logs: an unregistered doc then fails closed at
-        grant time, which is the safe direction.
+        The registry names the creating user's email and/or bound open_id —
+        the same identities the create-time auto-grant used — and the grant
+        endpoint accepts only them. A failed write only logs: an unregistered
+        doc then fails closed at grant time, which is the safe direction.
         """
         import fcntl
 
@@ -14260,13 +14261,16 @@ class ResearchDataBridge:
         try:
             reg_path.parent.mkdir(parents=True, exist_ok=True)
             lock_path = reg_path.with_suffix(".lock")
-            record = {
+            record: dict[str, Any] = {
                 "creator_email": creator_email.strip().lower(),
                 "title": title,
                 "space_id": space_id,
                 "node_token": node_token,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
+            norm_open_id = _normalize_feishu_open_id(creator_open_id)
+            if norm_open_id:
+                record["creator_open_id"] = norm_open_id
             with lock_path.open("a", encoding="utf-8") as lock_fh:
                 fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
                 try:
@@ -16282,6 +16286,7 @@ class ResearchDataBridge:
         parent_node_token = str(body.get("parent_node_token") or "").strip()
         folder_token = str(body.get("folder_token") or "").strip()
         grant_email = str(body.get("grant_email") or "").strip().lower()
+        grant_open_id = _normalize_feishu_open_id(body.get("grant_open_id"))
 
         def _create(client: FeishuClient) -> dict[str, Any]:
             block_ids, blocks = client.convert_markdown(markdown)
@@ -16308,6 +16313,7 @@ class ResearchDataBridge:
             self._register_feishu_created_doc(
                 document_id,
                 creator_email=grant_email,
+                creator_open_id=grant_open_id,
                 title=title,
                 space_id=space_id,
                 node_token=node_token,
@@ -16394,11 +16400,16 @@ class ResearchDataBridge:
                         f"grant_failed: document created, but sharing it with the team "
                         f"group failed ({sanitized}); share it manually."
                     )
-            if grant_email:
+            if grant_email or grant_open_id:
                 try:
-                    spelling, _grant_phases = client.grant_full_access_with_phases(
-                        document_id, grant_email
-                    )
+                    if grant_open_id:
+                        spelling, _grant_phases = client.grant_full_access_with_phases(
+                            document_id, grant_email, open_id=grant_open_id
+                        )
+                    else:
+                        spelling, _grant_phases = client.grant_full_access_with_phases(
+                            document_id, grant_email
+                        )
                 except FeishuApiError as exc:
                     # C1 + R7 r2 (codex #3): keep Feishu's own code and msg
                     # (sanitized) so the caller can tell an unmatched email
@@ -16410,12 +16421,13 @@ class ResearchDataBridge:
                     # matching the re-grant endpoint.
                     sanitized = _sanitize_feishu_response_preview(
                         f"{exc.error_code}: {exc}",
-                        secrets=(client.app_secret, client._tenant_token),
+                        secrets=(client.app_secret, client._tenant_token, grant_open_id),
                         dynamic_ids=(document_id, node_token, space_id, parent_node_token, folder_token),
                         limit=600,
                     )
+                    target_desc = grant_email or "bound feishu user"
                     warnings.append(
-                        f"grant_failed: document created, but granting {grant_email} "
+                        f"grant_failed: document created, but granting {target_desc} "
                         f"full access failed ({sanitized}); share it manually or "
                         f"re-grant with feishu_grant_access."
                     )
@@ -16467,7 +16479,10 @@ class ResearchDataBridge:
         if not token:
             return 400, {"ok": False, "error": "invalid_token"}
         email = str(body.get("email") or "").strip().lower()
-        if not email or "@" not in email:
+        open_id = _normalize_feishu_open_id(body.get("open_id"))
+        if email and "@" not in email:
+            return 400, {"ok": False, "error": "invalid_email"}
+        if not email and not open_id:
             return 400, {"ok": False, "error": "invalid_email"}
 
         def _grant(client: FeishuClient) -> dict[str, Any]:
@@ -16483,23 +16498,32 @@ class ResearchDataBridge:
                         "不能通过本端点补授权；请在飞书客户端手动分享。"
                     ),
                 }
-            creator = str(record.get("creator_email") or "").strip().lower()
-            if not creator:
+            creator_email = str(record.get("creator_email") or "").strip().lower()
+            creator_open_id = _normalize_feishu_open_id(record.get("creator_open_id"))
+            if not creator_email and not creator_open_id:
                 return {
                     "ok": False,
                     "error": "grant_scope_denied",
                     "document_id": document_id,
                     "message": (
-                        "该文档创建时没有记录创建者邮箱，无法核验补授权对象；"
+                        "该文档创建时没有记录创建者身份，无法核验补授权对象；"
                         "请在飞书客户端手动分享。"
                     ),
                 }
-            if email != creator:
+            confirmed_email = (
+                email if (email and creator_email and email == creator_email) else ""
+            )
+            confirmed_open_id = (
+                open_id
+                if (open_id and creator_open_id and open_id == creator_open_id)
+                else ""
+            )
+            if not confirmed_email and not confirmed_open_id:
                 return {
                     "ok": False,
                     "error": "grant_scope_denied",
                     "document_id": document_id,
-                    "message": "补授权邮箱与文档创建者不一致，只允许给创建者本人补授权。",
+                    "message": "补授权对象与文档创建者不一致，只允许给创建者本人补授权。",
                 }
             # R7 §3: the permission call only speaks ``type=docx`` — a wiki
             # link must resolve to a docx node (obj_token with
@@ -16523,12 +16547,19 @@ class ResearchDataBridge:
                 if isinstance(node, dict) and node.get("node_token")
                 else (token if kind == "wiki" else "")
             )
-            spelling, grant_phases = client.grant_full_access_with_phases(document_id, email)
+            if confirmed_open_id:
+                spelling, grant_phases = client.grant_full_access_with_phases(
+                    document_id, confirmed_email, open_id=confirmed_open_id
+                )
+            else:
+                spelling, grant_phases = client.grant_full_access_with_phases(
+                    document_id, confirmed_email
+                )
             return {
                 "ok": True,
                 "document_id": document_id,
                 "url": feishu_doc_url(document_id, node_token),
-                "granted": email,
+                "granted": confirmed_email or "bound_openid",
                 "grant_member": spelling,
                 # R7 r3 (codex #1): same key as the 502 failure answer —
                 # success keeps the per-stage results too.
@@ -16546,7 +16577,7 @@ class ResearchDataBridge:
             phases = result.get("phases")
             detail = _sanitize_feishu_response_preview(
                 str(result.get("detail") or ""),
-                secrets=(),
+                secrets=(open_id,) if open_id else (),
                 dynamic_ids=(token,),
                 limit=200,
             )
@@ -19820,6 +19851,17 @@ def _feishu_error_payload_ids(payload: dict[str, Any]) -> tuple[str, str, str]:
 #: not know (`ou_…`). Scrubbed here, bridge-local; the shared
 #: `log_redaction.py` is deliberately untouched (R7 r2, codex #1).
 _FEISHU_OPEN_ID_RE = re.compile(r"\bou_[A-Za-z0-9_\-]+")
+#: Strict validation for caller-supplied bound Feishu open_id (`ou_…`, <= 64
+#: chars, letters/digits/underscore only). Anything else is treated as absent.
+_FEISHU_BOUND_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_]{1,61}$")
+
+
+def _normalize_feishu_open_id(raw: Any) -> str:
+    """Validate and return a Feishu ``open_id`` (``ou_...``, <=64 chars, alnum/underscore), or ``""``."""
+    candidate = raw.strip() if isinstance(raw, str) else ""
+    if not candidate or not _FEISHU_BOUND_OPEN_ID_RE.match(candidate):
+        return ""
+    return candidate
 
 
 def _feishu_scrub_member_text(
@@ -20794,40 +20836,46 @@ class FeishuClient:
             },
         )
 
-    def grant_full_access(self, token: str, email: str) -> str:
-        """Grant *email* full access; returns the member spelling that worked.
+    def grant_full_access(self, token: str, email: str = "", open_id: str = "") -> str:
+        """Grant *email* / *open_id* full access; returns the member spelling that worked.
 
         Thin wrapper over `grant_full_access_with_phases` for callers that
-        only need the spelling; see there for the three-stage contract.
+        only need the spelling; see there for the staged grant contract.
         """
-        spelling, _phases = self.grant_full_access_with_phases(token, email)
+        if open_id:
+            spelling, _phases = self.grant_full_access_with_phases(
+                token, email, open_id=open_id
+            )
+        else:
+            spelling, _phases = self.grant_full_access_with_phases(token, email)
         return spelling
 
     def grant_full_access_with_phases(
-        self, token: str, email: str
+        self, token: str, email: str = "", open_id: str = ""
     ) -> tuple[str, list[dict[str, str]]]:
-        """Grant *email* full access; returns ``(member spelling, phases)``.
+        """Grant *email* / *open_id* full access; returns ``(member spelling, phases)``.
 
-        R7 §3: the three stages — directory lookup, openid grant, email
-        grant — each keep their own result (bridge code, Feishu's own
-        code/msg, log_id) in the log line, in the returned phase list, and
-        in any raised error, so the last attempt can no longer mask an
-        earlier failure (the 10-30 incident surfaced only the email
-        attempt's 1063001). Successes record their stage too, so an
-        "openid refused for identity → email granted" outcome answers with
-        both. The email spelling runs only when the lookup found no account,
-        or the openid grant was refused for the member's *identity*
-        (`_grant_refusal_class`); parameter / permission / transport /
-        unclassified refusals raise with every stage so far instead of
-        retrying. Both grant requests ask Feishu not to notify the member.
+        When a valid ``open_id`` is supplied (DALTON-HOOK(feishu-docs)), grant
+        with it first (stage ``bound_openid``) and return immediately on success
+        without hitting the email directory lookup. On failure, fall back to
+        the existing three-stage email flow (``lookup`` -> ``openid`` ->
+        ``email``) only when the refusal class is in
+        ``_FEISHU_GRANT_FALLBACK_CLASSES`` (and an email is available);
+        otherwise fail immediately. When ``open_id`` is omitted or malformed,
+        behavior matches the existing three-stage email flow.
         """
+        bound_open_id = _normalize_feishu_open_id(open_id)
+        if not bound_open_id and not email:
+            raise FeishuApiError("feishu_grant_failed", "no grant member", phases=[])
         phases: list[dict[str, str]] = []
-        member_ids: tuple[str, ...] = (email,)
+        member_ids: tuple[str, ...] = tuple(m for m in (email, bound_open_id) if m)
 
         def _masked_member() -> str:
-            # Unified log redaction: the address itself never enters a log
-            # line, only the fact that the member was addressed by email.
-            return _log_redaction.clean_log_field(email, max_len=64)
+            # Unified log redaction + bridge-local open_id scrubbing: neither
+            # the email address nor the open_id ever enters a log line.
+            return _feishu_scrub_member_text(
+                email or bound_open_id, member_ids, max_len=64
+            )
 
         def _fail(cause: FeishuApiError) -> FeishuApiError:
             summary = self._grant_phases_summary(phases)
@@ -20836,8 +20884,42 @@ class FeishuClient:
             )
             return FeishuApiError("feishu_grant_failed", summary, phases=phases)
 
+        if bound_open_id:
+            try:
+                self._request(
+                    "POST",
+                    f"/open-apis/drive/v1/permissions/{token}/members",
+                    query={"type": "docx", "need_notification": "false"},
+                    json_body={
+                        "member_type": "openid",
+                        "member_id": bound_open_id,
+                        "perm": "full_access",
+                    },
+                )
+            except FeishuApiError as exc:
+                refusal_class = self._grant_refusal_class(exc)
+                phases.append(
+                    self._grant_phase(
+                        "bound_openid",
+                        status="failed",
+                        exc=exc,
+                        note=f"class={refusal_class}",
+                        member_ids=member_ids,
+                    )
+                )
+                if refusal_class not in self._FEISHU_GRANT_FALLBACK_CLASSES or not email:
+                    raise _fail(exc) from exc
+            else:
+                phases.append(self._grant_phase("bound_openid", status="ok"))
+                logger.info(
+                    "feishu_grant outcome=ok member=%s stages=%s",
+                    _masked_member(),
+                    self._grant_phases_summary(phases),
+                )
+                return "openid", phases
+
         try:
-            open_id = self.user_open_id_by_email(email)
+            looked_up_open_id = self.user_open_id_by_email(email)
         except FeishuApiError as exc:
             # A failed lookup is not "user not found" — the directory call
             # itself broke (scope / permission / transport), and an email
@@ -20852,12 +20934,14 @@ class FeishuClient:
             )
             raise _fail(exc) from exc
         phases.append(
-            self._grant_phase("lookup", status="ok", note="not_found" if not open_id else "found")
+            self._grant_phase(
+                "lookup", status="ok", note="not_found" if not looked_up_open_id else "found"
+            )
         )
-        if open_id:
-            member_ids = (email, open_id)
+        if looked_up_open_id and looked_up_open_id not in member_ids:
+            member_ids = (*member_ids, looked_up_open_id)
 
-        if open_id:
+        if looked_up_open_id:
             try:
                 self._request(
                     "POST",
@@ -20865,7 +20949,7 @@ class FeishuClient:
                     query={"type": "docx", "need_notification": "false"},
                     json_body={
                         "member_type": "openid",
-                        "member_id": open_id,
+                        "member_id": looked_up_open_id,
                         "perm": "full_access",
                     },
                 )
@@ -20898,7 +20982,7 @@ class FeishuClient:
                     _masked_member(),
                     self._grant_phases_summary(phases),
                 )
-                return f"openid:{open_id}", phases
+                return "openid", phases
         else:
             phases.append(
                 self._grant_phase(

@@ -2989,7 +2989,7 @@ async def test_feishu_resource_apis_with_dedicated_credentials_and_mock_http(
     )
     assert code_create == 200 and body_create["ok"] is True
     assert body_create["document_id"] == "doccn_created_1"
-    assert body_create["grant_member"] == "openid:ou_analyst_1"
+    assert body_create["grant_member"] == "openid"
     assert any(
         "/permissions/doccn_created_1/members" in c["url"]
         and "oc_dedicated_team_group" in c["body"]
@@ -3005,7 +3005,7 @@ async def test_feishu_resource_apis_with_dedicated_credentials_and_mock_http(
     )
     assert code_grant == 200 and body_grant["ok"] is True
     assert body_grant["document_id"] == "doccn_created_1"
-    assert body_grant["grant_member"] == "openid:ou_analyst_1"
+    assert body_grant["grant_member"] == "openid"
 
     code_wcreate, body_wcreate = await bridge.handle_feishu_doc_create(
         {

@@ -276,6 +276,21 @@ def _grant_email_for(email: str) -> str:
     return email
 
 
+async def _caller_feishu_open_id(user_id: str) -> str:
+    """Return the caller's bound Feishu open_id ('' when missing or lookup fails)."""
+    try:
+        from src.dalton.database.channel_gateway import get_feishu_open_id_for_user
+
+        return str(await get_feishu_open_id_for_user(user_id) or "").strip()
+    except Exception as exc:
+        logger.warning(
+            "feishu caller open_id lookup failed for user_id=%s: %s",
+            user_id,
+            type(exc).__name__,
+        )
+        return ""
+
+
 def _normalize_bridge_write_failure(res: dict[str, Any] | str) -> dict[str, Any]:
     """Convert a failed `_bridge` result for `doc/create` or `doc/append` into a dict."""
     if isinstance(res, str):
@@ -325,6 +340,9 @@ async def create_feishu_doc_on_server(
     grant_email = _grant_email_for(await _caller_email(user_id))
     if grant_email:
         body["grant_email"] = grant_email
+    grant_open_id = await _caller_feishu_open_id(user_id)
+    if grant_open_id:
+        body["grant_open_id"] = grant_open_id
     res = await _bridge("doc/create", body)
     if _bridge_failed(res):
         return _normalize_bridge_write_failure(res)
@@ -600,13 +618,13 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
     ) -> str:
         """Re-grant the caller full access to a doc Dalton created, only when the user asks to fix sharing on a doc they cannot edit (admin and internal members only).
         Use it when a doc was created but the automatic share failed (its warning said so), or the user reports they cannot edit a doc.
-        It grants only the caller themself — the email comes from their Dalton account, and only docs the bridge itself created can be re-granted.
+        It grants only the caller themself — using their bound Feishu account or Dalton account email, and only docs the bridge itself created can be re-granted.
 
         Args:
             token: Feishu document URL (`.../docx/<id>` or `.../wiki/<id>`) or the raw document/wiki token of the doc that was created through Dalton.
 
         Returns:
-            JSON with the granted email, the doc `url`, and the member spelling used; a failure carries Feishu's own code/msg.
+            JSON with `granted` (the email or `bound_openid`), the doc `url`, and the `grant_member` spelling used; a failure carries Feishu's own code/msg.
         """
         user_id, err = await _require_authenticated_user(config)
         if err is not None:
@@ -614,16 +632,22 @@ def create_feishu_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         tier = await get_user_tier(user_id)
         if tier == "external":
             return _error_payload(EXTERNAL_READ_ONLY_MESSAGE, error="external_write_forbidden")
-        # Self-service only: the grant targets the caller's own account email
-        # (the same source doc/create's automatic share uses), never an
-        # arbitrary address the model was handed.
+        # Self-service only: the grant targets the caller's own bound Feishu
+        # open_id and/or account email (the same sources doc/create's automatic
+        # share uses), never an arbitrary identity the model was handed.
         grant_email = _grant_email_for(await _caller_email(user_id))
-        if not grant_email:
+        grant_open_id = await _caller_feishu_open_id(user_id)
+        if not grant_email and not grant_open_id:
             return _error_payload(
-                "当前用户没有可授权的邮箱（账户记录缺少邮箱，或为邀请注册的合成地址）。",
+                "当前用户既没有绑定的飞书 open_id，也没有可授权的邮箱（账户记录缺少邮箱，或为邀请注册的合成地址）。",
                 error="no_grant_email",
             )
-        res = await _bridge("doc/grant", {"token": token, "email": grant_email})
+        grant_body: dict[str, Any] = {"token": token}
+        if grant_email:
+            grant_body["email"] = grant_email
+        if grant_open_id:
+            grant_body["open_id"] = grant_open_id
+        res = await _bridge("doc/grant", grant_body)
         if _bridge_failed(res):
             if isinstance(res, dict):
                 message = str(res.get("message") or describe_feishu_error(str(res.get("error") or "bridge_error")))
