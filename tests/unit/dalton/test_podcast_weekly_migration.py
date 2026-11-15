@@ -3888,3 +3888,68 @@ async def test_publish_doc_x4_per_episode_lock_and_doc_identity_verification(
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_stage_guard_tolerates_parallel_stage_creating_shared_dir(tmp_path: Path) -> None:
+    """Two episodes staged in parallel both see `.work` missing; the loser of the mkdir race continues."""
+    import shlex
+    import subprocess
+    from types import SimpleNamespace
+
+    from src.dalton.tools.podcast_weekly_tools import _run_sandbox_guard
+    from src.ptc_agent.agent.backends.sandbox import SandboxBackend
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    hook_dir = tmp_path / "hook"
+    hook_dir.mkdir()
+    # The other stage call wins the race: the directory appears just before our mkdir.
+    (hook_dir / "sitecustomize.py").write_text(
+        "import os\n"
+        "_real = os.mkdir\n"
+        "def _racing_mkdir(path, mode=0o777, *a, **k):\n"
+        "    if str(path).endswith('.work'):\n"
+        "        _real(path, mode)\n"
+        "        raise FileExistsError(17, 'File exists', str(path))\n"
+        "    return _real(path, mode, *a, **k)\n"
+        "os.mkdir = _racing_mkdir\n",
+        encoding="utf-8",
+    )
+    backend = create_autospec(SandboxBackend, instance=True)
+
+    async def _exec(cmd: str, *, timeout: int | None = None):
+        argv = shlex.split(cmd)
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PYTHONPATH": str(hook_dir)},
+        )
+        return SimpleNamespace(output=proc.stdout + proc.stderr, exit_code=proc.returncode, truncated=False)
+
+    backend.aexecute.side_effect = _exec
+    res = await _run_sandbox_guard(
+        backend, mode="prepare_stage", ws_root=str(ws),
+        rel_parts=[".work", "podcast-weekly", "vid1"], files=["a.zh.md"],
+    )
+    assert res.get("ok") is True, res
+    assert (ws / ".work" / "podcast-weekly" / "vid1").is_dir()
+
+    # A non-directory left at the path is still rejected after the race.
+    ws2 = tmp_path / "ws2"
+    ws2.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(
+        "import os\n"
+        "_real = os.mkdir\n"
+        "def _racing_mkdir(path, mode=0o777, *a, **k):\n"
+        "    if str(path).endswith('.work'):\n"
+        "        open(path, 'w').close()\n"
+        "        raise FileExistsError(17, 'File exists', str(path))\n"
+        "    return _real(path, mode, *a, **k)\n"
+        "os.mkdir = _racing_mkdir\n",
+        encoding="utf-8",
+    )
+    res2 = await _run_sandbox_guard(
+        backend, mode="prepare_stage", ws_root=str(ws2),
+        rel_parts=[".work", "podcast-weekly", "vid1"], files=["a.zh.md"],
+    )
+    assert res2.get("ok") is False and res2.get("error") == "not_a_directory", res2
