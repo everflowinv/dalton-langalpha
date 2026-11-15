@@ -814,6 +814,35 @@ pathlib.Path({str(env_dump)!r}).write_text("\\n".join(lines) + "\\n")
     assert dumped == [f"{k}=<UNSET>" for k in backup_lib.PROXY_ENV_VARS]
 
 
+
+def test_rclone_noproxy_sets_large_drive_chunk_size(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    dump = tmp_path / "chunk.txt"
+    fake_rclone = fake_bin / "rclone"
+    fake_rclone.write_text(
+        f"""#!/usr/bin/env python3
+import os, pathlib
+pathlib.Path({str(dump)!r}).write_text(os.environ.get("RCLONE_DRIVE_CHUNK_SIZE", "<UNSET>"))
+""",
+        encoding="utf-8",
+    )
+    fake_rclone.chmod(0o755)
+    base_env = {"PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}", "HOME": str(tmp_path)}
+    script = f'source "{OPS_DIR / "_common.sh"}" && rclone_noproxy version'
+
+    subprocess.run(["bash", "-c", script], env=base_env, check=True, capture_output=True, text=True)
+    assert dump.read_text(encoding="utf-8") == "128M"
+
+    subprocess.run(
+        ["bash", "-c", script],
+        env={**base_env, "RCLONE_DRIVE_CHUNK_SIZE": "32M"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert dump.read_text(encoding="utf-8") == "32M"
+
 def test_db_offsite_helpers_and_weekly_excludes_postgres() -> None:
     assert backup_lib.expected_openssl_enc_size(0) == 32
     assert backup_lib.expected_openssl_enc_size(16) == 48
