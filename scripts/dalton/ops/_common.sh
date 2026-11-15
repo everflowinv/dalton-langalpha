@@ -68,10 +68,13 @@ load_offsite_backup_env() {
 
 # B8b: Google Drive uploads bypass proxy env vars because proxy bandwidth quota is limited
 # and direct connectivity to googleapis.com works on this host.
+# Larger Drive upload chunks (default 8M) cut API requests ~16x; a streamed rcat
+# cannot resume, so one 403 'Requests per minute' near the end loses the whole upload.
 rclone_noproxy() {
     env \
         -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
         -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+        RCLONE_DRIVE_CHUNK_SIZE="${RCLONE_DRIVE_CHUNK_SIZE:-128M}" \
         rclone "$@"
 }
 
