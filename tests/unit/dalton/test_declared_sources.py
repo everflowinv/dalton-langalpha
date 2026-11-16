@@ -1199,7 +1199,7 @@ class TestToolsListResearchDescription:
         assert rb.RESEARCH_EVIDENCE_AND_ROUTE_GUIDE.replace("\n", " ") in srv["instruction"]
         assert "Keep date windows narrow" not in srv["instruction"]
         assert "AlphaEngine full text is quota-limited, so read only what you need" not in srv["instruction"]
-        assert "检索可以放开，全文阅读（get_document）计配额，读最相关的几篇" in srv["instruction"]
+        assert "每次检索（search_library）都扣一次额度，参数完全相同也扣；同一篇文档读过一次全文后再读不扣。检索前先合并关键词：同一公司或同一主题的相关词放进一次检索，不要拆成多次相近的检索" in srv["instruction"]
 
 
 class TestDaltonSkillRegistrySingleSource:
