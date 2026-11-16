@@ -22,8 +22,9 @@ function livePrefixOf(pathname) {
 var livePrefix = livePrefixOf(location.pathname);
 // The part of the address a renewed grant replaces: the live view's prefix, or
 // a published version's grant (/artifacts/g/<grant>/v/<seq>/ on the API
-// origin, /g/<grant>/v/<seq>/ on a version's own host).
-var GRANT_PREFIX = /^.*?\/(?:wsfiles\/g\/[^\/]+|api\/v1\/public\/shared\/[^\/]+\/files\/serve|g\/[^\/]+\/v\/[0-9]+)\//;
+// origin, /g/<grant>/v/<seq>/ on a version's own host, or /dalton/monitors/g/<grant>/v/<seq>/).
+// DALTON-HOOK(monitors): recognize monitor grant and public permalink prefixes too.
+var GRANT_PREFIX = /^.*?\/(?:wsfiles\/g\/[^\/]+|api\/v1\/public\/shared\/[^\/]+\/files\/serve|(?:dalton\/monitors\/)?(?:g|public)\/[^\/]+\/v\/[0-9]+)\//;
 
 /** @param {string} pathname */
 function grantPrefixOf(pathname) {
@@ -145,6 +146,13 @@ function saveOwnFile(link) {
  * @returns {(() => void) | null}
  */
 function linkAction(link) {
+  // DALTON-HOOK(monitors): cross-monitor /monitors/* links inside a sandboxed
+  // monitor frame (where location.origin is "null") route through the outer
+  // app shell instead of opening a new tab, so target permissions are re-checked.
+  if (/^\/monitors(?:\/.*)?$/.test(link.pathname) && link.host === location.host && /^\/api\/v1\/dalton\/monitors\/g\//.test(location.pathname)) {
+    var monitorPath = link.pathname + link.search + link.hash;
+    return function () { send({ type: 'page:navigate-monitor', path: monitorPath }); };
+  }
   // Another site opens in a tab of its own: the viewer lets a page's frame load
   // only the page's own origin and the mail and phone hand-offs, so followed in
   // place it would be a dead click.

@@ -52,6 +52,33 @@ async def _require_non_external_for_share(user_id: str | None) -> None:
         )
 
 
+# DALTON-HOOK(monitors): enabling public thread sharing with workspace files
+# exposes non-public monitor source files; require administrator privilege.
+PUBLIC_THREAD_FILES_FORBIDDEN_DETAIL = "仅管理员可开启附带工作区文件的公开对话分享"
+
+
+async def _require_admin_for_share_files(user_id: str | None) -> None:
+    """Reject non-admin users from enabling public thread sharing with workspace file access."""
+    from src.dalton import access_tiers as _access_tiers
+    from src.dalton import sharing as _dalton_sharing
+
+    if get_user_tier is not _default_get_user_tier:
+        tier_fn = get_user_tier
+    elif _access_tiers.get_user_tier is not _default_get_user_tier:
+        tier_fn = _access_tiers.get_user_tier
+    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
+        tier_fn = _dalton_sharing.get_user_tier
+    else:
+        tier_fn = _default_get_user_tier
+    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+        return
+    if await tier_fn(user_id) != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail=PUBLIC_THREAD_FILES_FORBIDDEN_DETAIL,
+        )
+
+
 
 from ._deps import router
 
@@ -102,6 +129,15 @@ async def update_thread_share(
         if merged.get("allow_download") and not merged.get("allow_files"):
             merged["allow_files"] = True
         kwargs["share_permissions"] = merged
+        effective_perms = merged
+    else:
+        effective_perms = existing_perms
+
+    # DALTON-HOOK(monitors): block public shared-thread file exposure by non-admins
+    if request.is_shared and (
+        effective_perms.get("allow_files") or effective_perms.get("allow_download")
+    ):
+        await _require_admin_for_share_files(x_user_id)
 
     updated = await update_thread_sharing(thread_id, **kwargs)
     if not updated:

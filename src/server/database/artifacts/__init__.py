@@ -102,6 +102,7 @@ from src.server.database.artifacts.versions import (
     StoredVersionFile,
     Version,
     VersionFile,
+    cut_monitor_artifact_version,  # DALTON-HOOK(monitors)
     get_shared_version_file,
     get_version,
     get_version_file,
@@ -152,6 +153,7 @@ __all__ = [
     "comment_counts",
     "confirm_claim",
     "create_comment",
+    "cut_monitor_artifact_version",  # DALTON-HOOK(monitors)
     "delete_comment",
     "destinations",
     "ensure_artifact",

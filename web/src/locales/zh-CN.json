@@ -8735,5 +8735,70 @@
   },
   "desktopApp": {
     "untitledThread": "未命名对话"
+  },
+  "monitors": {
+    "navLabel": "监控面板",
+    "title": "监控面板",
+    "subtitle": "将工作区网页或数据任务看板发布给团队成员浏览",
+    "emptyTitle": "暂无可见的监控面板",
+    "emptyDesc": "在工作区文件预览中点击发布，即可将页面挂到监控面板栏目。",
+    "loadFailed": "加载监控面板失败",
+    "backToList": "返回面板列表",
+    "copyLink": "复制链接",
+    "linkCopied": "已复制固定链接",
+    "openInNewWindow": "新窗口打开",
+    "goToSource": "前往源文件",
+    "versionSelect": "切换版本",
+    "versionOption": "v{{seq}}",
+    "pageUpdatedAt": "页面更新时间：{{time}}",
+    "dataUpdatedAt": "数据时间：{{time}}",
+    "ownerLabel": "发布人：{{owner}}",
+    "lastPublishFailed": "最近一次更新失败：{{time}}",
+    "forbiddenTitle": "无权查看此监控面板",
+    "forbiddenDesc": "请联系面板所有者或管理员开通访问权限。",
+    "notFoundTitle": "监控面板不存在",
+    "notFoundDesc": "该面板可能已被删除或地址有误。",
+    "categories": {
+      "overview": "市场总览",
+      "us": "美股",
+      "cn": "A 股",
+      "hk": "港股",
+      "asia": "日韩台",
+      "stocks": "个股",
+      "portfolio": "组合",
+      "other": "其他"
+    },
+    "visibility": {
+      "label": "谁能看",
+      "own": "仅自己",
+      "members": "指定同事",
+      "company": "全公司",
+      "public": "任何人（公开链接）"
+    },
+    "dialog": {
+      "titleField": "面板标题",
+      "titlePlaceholder": "输入面板标题",
+      "categoryField": "所属分类",
+      "visibilityField": "谁能看",
+      "membersField": "指定可看的公司成员",
+      "membersEmpty": "暂无可选公司成员",
+      "membersLoading": "正在加载公司成员…",
+      "membersRequired": "请至少选择一位公司成员",
+      "keepUpdated": "文件更新后自动更新",
+      "keepUpdatedHint": "研究助手每轮对话结束发现文件变化时自动发布新版本",
+      "externalOwnOnlyHint": "外部成员仅支持发布为“仅自己”可见",
+      "nonAdminPublicDowngradeHint": "你没有公开权限，发布后可见范围会改为全公司",
+      "publicConfirmTitle": "确认公开发布？",
+      "publicConfirmMessage": "设为“任何人（公开链接）”后，互联网上任何持有链接的人都可以查看此监控面板及其实时数据。确认继续发布？",
+      "publicConfirmButton": "确认公开",
+      "publishedToast": "已发布到监控面板"
+    },
+    "demo": {
+      "title": "实时数据监控示例",
+      "waiting": "等待数据刷新…",
+      "unavailable": "数据暂不可用",
+      "dataAsOfPrefix": "数据时间：",
+      "requestFailed": "请求失败"
+    }
   }
 }

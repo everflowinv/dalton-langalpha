@@ -45,7 +45,8 @@ export interface AuthContextValue {
   updatePassword: (password: string) => Promise<UserResponse | void>;
 }
 
-const AuthContext = createContext<AuthContextValue | null>(null);
+// DALTON-HOOK(monitors): export AuthContext and default local value for test wrappers
+export const AuthContext = createContext<AuthContextValue | null>(null);
 
 import { isPlatformMode } from '@/config/hostMode';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(dalton-auth): enable Supabase auth in OSS mode
@@ -58,7 +59,7 @@ const baseURL = (import.meta.env.VITE_API_BASE_URL as string) ?? '';
  * Static provider value used when Supabase auth is disabled.
  * Presents the app as permanently logged-in with a local-dev identity.
  */
-const _localDevValue: AuthContextValue = {
+export const _localDevValue: AuthContextValue = {
   userId: LOCAL_USER_ID,
   isInitialized: true,
   isLoggedIn: true,

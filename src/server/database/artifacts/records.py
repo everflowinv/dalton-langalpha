@@ -250,28 +250,62 @@ async def lock_owned(cur, *, user_id: str, artifact_id: str) -> Artifact:
     return artifact
 
 
+# DALTON-HOOK(monitors): expose cur-level record mutations so monitor permission
+# changes and upstream unshare share one atomic database transaction.
+async def set_record_in_cur(
+    cur,
+    *,
+    user_id: str,
+    artifact_id: str,
+    assignments: str,
+    params: dict[str, Any],
+) -> Artifact:
+    """Apply ``assignments`` to the user's record using an open transaction cursor."""
+    await cur.execute(
+        f"""
+        UPDATE share_links l
+           SET {assignments}
+          FROM workspaces w
+         WHERE l.artifact_id = %(artifact_id)s AND l.kind = 'file'
+           AND w.workspace_id = l.workspace_id
+           AND w.user_id = %(user_id)s AND w.status <> 'deleted'
+        RETURNING {ARTIFACT_COLUMNS}
+        """,
+        {"artifact_id": artifact_id, "user_id": user_id, **params},
+    )
+    artifact = artifact_from_row(await cur.fetchone())
+    if artifact is None:
+        raise ArtifactNotFound(artifact_id)
+    return artifact
+
+
 async def set_record(
     *, user_id: str, artifact_id: str, assignments: str, params: dict[str, Any]
 ) -> Artifact:
     """Apply ``assignments`` to the user's record, or ``ArtifactNotFound``."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                f"""
-                UPDATE share_links l
-                   SET {assignments}
-                  FROM workspaces w
-                 WHERE l.artifact_id = %(artifact_id)s AND l.kind = 'file'
-                   AND w.workspace_id = l.workspace_id
-                   AND w.user_id = %(user_id)s AND w.status <> 'deleted'
-                RETURNING {ARTIFACT_COLUMNS}
-                """,
-                {"artifact_id": artifact_id, "user_id": user_id, **params},
+            return await set_record_in_cur(
+                cur,
+                user_id=user_id,
+                artifact_id=artifact_id,
+                assignments=assignments,
+                params=params,
             )
-            artifact = artifact_from_row(await cur.fetchone())
-    if artifact is None:
-        raise ArtifactNotFound(artifact_id)
-    return artifact
+
+
+async def unshare_in_cur(cur, *, user_id: str, artifact_id: str) -> Artifact:
+    """DALTON-HOOK(monitors): Stop sharing inside an open transaction cursor, keeping every version."""
+    return await set_record_in_cur(
+        cur,
+        user_id=user_id,
+        artifact_id=artifact_id,
+        assignments=(
+            "shared_at = NULL, files = NULL, shared_seq = 0, "
+            "revision = l.revision + 1"
+        ),
+        params={},
+    )
 
 
 async def set_keep_updated(

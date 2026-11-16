@@ -1,0 +1,1148 @@
+"""Core service layer for Dalton Monitors: publish, version cutting, ACLs, auto-update, serving, and data."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import posixpath
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import HTTPException
+
+from src.config.env import PREVIEW_PROXY_FRAME_ANCESTORS
+from src.dalton.access_tiers import get_user_tier
+from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+from src.dalton.monitors import db as monitor_db
+from src.dalton.monitors.data_job_registry import (
+    HostDirFileSource,
+    MonitorDataJobBinding,
+    get_registered_monitor_job,
+)
+from src.dalton.monitors.grants import (
+    MonitorGrantError,
+    data_prefix,
+    frame_prefix,
+    mint_monitor_grant,
+    verify_monitor_grant,
+)
+from src.dalton.monitors.models import (
+    CompanyMember,
+    MonitorDataEntry,
+    MonitorRecord,
+    PublishMonitorRequest,
+    RepublishMonitorRequest,
+    UpdateMonitorRequest,
+    is_valid_data_key,
+    is_valid_slug,
+)
+from src.dalton.monitors.permissions import (
+    can_manage_monitor_fields,
+    can_view_monitor,
+    require_monitor_view,
+    validate_publish_permissions,
+)
+from src.dalton.settings import is_artifact_publishing_enabled
+from src.server.database import artifacts as artifacts_db
+from src.server.database.artifacts import VersionFile
+from src.server.database.artifacts.versions import (
+    LeftOutChanged,
+    Origin,
+    PublishResult,
+    ReadBasis,
+    SharingChanged,
+    VersionMoved,
+)
+from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.database.workspace_file_blobs import fetch_blob
+from src.server.preview_proxy.artifacts import (
+    ArtifactFileUnavailable,
+    ServedArtifactFile,
+    _charset_is_utf8,
+    _content_type,
+    _etag_matches,
+    _headers,
+    _is_html,
+    _valid_path,
+)
+from src.server.preview_proxy.page_bridge import bridge_for, with_bridge
+from src.server.services.artifacts import snapshot as artifact_snapshot
+from src.server.services.artifacts.manifest import REASON_LOADED
+from src.server.services.artifacts.reader import ReadMode, Reader
+from src.server.services.file_grants import seconds_left
+from src.server.services.served_paths import may_be_artifact
+from src.server.services.workspace_file_containment import contained_relative_path
+from src.server.services.workspace_files import (
+    owned_workspace_on_computer,
+    owner_work_dir,
+    previous_dir_names_of,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _require_publishing_enabled() -> None:
+    if not is_artifact_publishing_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "artifact_publishing_disabled"},
+        )
+
+
+def _normalize_workspace_entry_path(workspace: dict[str, Any], raw_path: str) -> str:
+    """Resolve a workspace HTML file or folder path (defaulting folders to ``index.html``)."""
+    work_dir = owner_work_dir(workspace)
+    prev_dirs = previous_dir_names_of(workspace)
+    clean = str(raw_path or "").strip().rstrip("/")
+    relative = contained_relative_path(clean, work_dir, prev_dirs)
+    if relative is None:
+        raise HTTPException(status_code=400, detail="无效的工作区文件路径")
+    last_segment = relative.rsplit("/", 1)[-1]
+    if not may_be_artifact(relative) or "." not in last_segment:
+        candidate = f"{relative.rstrip('/')}/index.html"
+        if may_be_artifact(candidate):
+            return candidate
+    if not may_be_artifact(relative):
+        raise HTTPException(status_code=400, detail="该文件不能发布为监控面板")
+    return relative
+
+
+PUBLIC_PERMISSION_LOST_MESSAGE = "发布人已无公开权限"
+
+
+class PublicAuthorityLostError(PermissionError):
+    """Raised when a public monitor's publisher or approver is no longer an admin."""
+
+
+def _can_manage_monitor(monitor: MonitorRecord, user_id: str, tier: str) -> bool:
+    return can_manage_monitor_fields(
+        owner_user_id=monitor.owner_user_id,
+        visibility=monitor.visibility,
+        caller_id=user_id,
+        caller_tier=tier,
+    )
+
+
+async def _resolve_workspace_owner_id(monitor: MonitorRecord) -> str:
+    if monitor.workspace_id:
+        ws = await db_get_workspace(monitor.workspace_id)
+        if ws and ws.get("user_id"):
+            return str(ws["user_id"])
+    return monitor.owner_user_id
+
+
+async def _verify_user_is_admin(user_id: str) -> None:
+    if await get_user_tier(user_id) != "admin":
+        raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+
+
+async def _abort_if_absent_dependencies(
+    artifact_id: str,
+    prev_seq: int,
+    snap: artifact_snapshot.Snapshot,
+) -> None:
+    if prev_seq <= 0 or not snap.absent:
+        return
+    prev_hashes = await artifacts_db.get_version_hashes(artifact_id, prev_seq)
+    missing = sorted(set(snap.absent) & set(prev_hashes))
+    if missing:
+        raise RuntimeError(
+            f"缺少上一版依赖文件，已保留上一版: {', '.join(missing)}"
+        )
+
+
+async def cut_monitor_version(
+    *,
+    monitor: MonitorRecord,
+    owner_user_id: str,
+    files: list[VersionFile],
+    title: str | None,
+    label: str | None = None,
+    read_basis: ReadBasis | None = None,
+    origin: Origin = "owner",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+    run_id: str | None = None,
+    artifact: Any | None = None,
+    new_owner_user_id: str | None = None,
+    verify_public_authority: Any = None,
+) -> tuple[MonitorRecord, PublishResult | None, bool]:
+    """Cut a monitor version atomically with visibility lock re-read, unshare, and run_id dedup."""
+    _ = artifact
+    return await monitor_db.commit_monitor_version_tx(
+        monitor_id=monitor.monitor_id,
+        artifact_id=monitor.artifact_id,
+        workspace_owner_id=owner_user_id,
+        files=files,
+        title=title or monitor.title,
+        label=label,
+        read_basis=read_basis,
+        origin=origin,
+        loaded_files=loaded_files,
+        left_out_files=left_out_files,
+        run_id=run_id,
+        new_owner_user_id=new_owner_user_id,
+        verify_public_authority=verify_public_authority,
+    )
+
+
+def _translate_snapshot_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, artifact_snapshot.SnapshotRefused):
+        if exc.code == "file_missing":
+            return HTTPException(status_code=404, detail={"code": "file_missing"})
+        if exc.code == "files_changed":
+            return HTTPException(
+                status_code=409,
+                detail={
+                    "code": "files_changed",
+                    "files": [entry.as_dict() for entry in exc.files or ()],
+                },
+            )
+        if exc.code == "needs_computer":
+            return HTTPException(status_code=409, detail={"code": "needs_computer"})
+        return HTTPException(
+            status_code=422, detail={"code": exc.code, "limit": exc.limit}
+        )
+    if isinstance(exc, artifact_snapshot.SnapshotUnavailable):
+        return HTTPException(
+            status_code=503,
+            detail="文件暂不可读取，请稍后重试。",
+        )
+    if isinstance(exc, LeftOutChanged):
+        return HTTPException(status_code=409, detail={"code": "files_changed"})
+    if isinstance(exc, SharingChanged):
+        return HTTPException(status_code=409, detail={"code": "sharing_changed"})
+    if isinstance(exc, VersionMoved):
+        return HTTPException(status_code=409, detail={"code": "version_moved"})
+    if isinstance(exc, PublicAuthorityLostError):
+        return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, HTTPException):
+        return exc
+    return HTTPException(status_code=500, detail=str(exc))
+
+
+async def _build_monitor_detail_payload(
+    monitor: MonitorRecord,
+    *,
+    viewer_id: str,
+) -> dict[str, Any]:
+    versions = await monitor_db.list_monitor_versions(
+        monitor.monitor_id, monitor.artifact_id
+    )
+    grant = await mint_monitor_grant(
+        monitor.monitor_id, viewer_id, monitor.acl_revision
+    )
+    tier = await get_user_tier(viewer_id)
+    return {
+        "monitor": serialize_monitor(monitor, can_manage=_can_manage_monitor(monitor, viewer_id, tier)),
+        "versions": [
+            {
+                "seq": v.seq,
+                "entry_path": v.entry_path,
+                "origin": v.origin,
+                "title": v.title,
+                "label": v.label,
+                "byte_len": v.byte_len,
+                "published_at": v.published_at.isoformat(),
+            }
+            for v in versions
+        ],
+        "monitor_grant": grant.token,
+        "frame_base": frame_prefix(grant),
+        "data_base": data_prefix(grant),
+        "expires_in": seconds_left(grant.expires_at),
+    }
+
+
+async def get_public_monitor_detail(slug: str) -> dict[str, Any]:
+    """Return trimmed read-only monitor detail for an anonymous viewer when ``visibility == 'public'``."""
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None or monitor.visibility != "public":
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+    serialized = serialize_monitor(monitor, can_manage=False)
+    for internal_key in (
+        "workspace_id",
+        "artifact_id",
+        "artifact_code",
+        "owner_user_id",
+        "entry_path",
+        "source_ref",
+        "last_publish_error",
+        "last_publish_failed_at",
+    ):
+        serialized.pop(internal_key, None)
+    serialized["owner_email"] = None
+    serialized["member_user_ids"] = []
+    return {
+        "monitor": serialized,
+        "versions": [],
+        "monitor_grant": "",
+        "frame_base": f"/api/v1/dalton/monitors/public/{monitor.slug}/",
+        "data_base": f"/api/v1/dalton/monitors/public/{monitor.slug}/data",
+        "expires_in": 0,
+    }
+
+
+def serialize_monitor(monitor: MonitorRecord, *, can_manage: bool = False) -> dict[str, Any]:
+    return {
+        "monitor_id": monitor.monitor_id,
+        "slug": monitor.slug,
+        "artifact_id": monitor.artifact_id,
+        "artifact_code": monitor.artifact_code,
+        "workspace_id": monitor.workspace_id,
+        "entry_path": monitor.entry_path,
+        "owner_user_id": monitor.owner_user_id,
+        "owner_name": monitor.owner_name,
+        "owner_email": monitor.owner_email,
+        "title": monitor.title,
+        "category": monitor.category,
+        "sort_order": monitor.sort_order,
+        "visibility": monitor.visibility,
+        "member_user_ids": list(monitor.member_user_ids),
+        "published_seq": monitor.published_seq,
+        "keep_updated": monitor.keep_updated,
+        "source_kind": monitor.source_kind,
+        "source_ref": monitor.source_ref,
+        "acl_revision": monitor.acl_revision,
+        "last_publish_error": monitor.last_publish_error,
+        "last_publish_failed_at": (
+            monitor.last_publish_failed_at.isoformat()
+            if monitor.last_publish_failed_at
+            else None
+        ),
+        "data_as_of": monitor.data_as_of.isoformat() if monitor.data_as_of else None,
+        "created_at": monitor.created_at.isoformat(),
+        "updated_at": monitor.updated_at.isoformat(),
+        "can_manage": can_manage,
+    }
+
+
+async def list_monitors_for_user(user_id: str) -> list[dict[str, Any]]:
+    tier = await get_user_tier(user_id)
+    rows = await monitor_db.list_all_monitors()
+    visible: list[dict[str, Any]] = []
+    for m in rows:
+        if await can_view_monitor(m, user_id):
+            visible.append(serialize_monitor(m, can_manage=_can_manage_monitor(m, user_id, tier)))
+    return visible
+
+
+async def list_company_members_for_user(user_id: str) -> list[dict[str, Any]]:
+    tier = await get_user_tier(user_id)
+    if tier not in ("admin", "internal"):
+        raise HTTPException(status_code=403, detail="仅公司成员可查看成员列表")
+    members: list[CompanyMember] = await monitor_db.list_company_members()
+    return [
+        {
+            "user_id": m.user_id,
+            "email": m.email,
+            "name": m.name,
+            "tier": m.tier,
+        }
+        for m in members
+    ]
+
+
+async def get_monitor_detail(slug: str, *, viewer_id: str) -> dict[str, Any]:
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+    await require_monitor_view(monitor, viewer_id)
+    return await _build_monitor_detail_payload(monitor, viewer_id=viewer_id)
+
+
+async def get_monitor_by_artifact(
+    artifact_id: str, *, viewer_id: str
+) -> dict[str, Any] | None:
+    monitor = await monitor_db.get_monitor_by_artifact_id(artifact_id)
+    if monitor is None:
+        return None
+    await require_monitor_view(monitor, viewer_id)
+    tier = await get_user_tier(viewer_id)
+    return serialize_monitor(monitor, can_manage=_can_manage_monitor(monitor, viewer_id, tier))
+
+
+async def mint_grant_for_monitor(slug: str, *, viewer_id: str) -> dict[str, Any]:
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+    await require_monitor_view(monitor, viewer_id)
+    grant = await mint_monitor_grant(
+        monitor.monitor_id, viewer_id, monitor.acl_revision
+    )
+    return {
+        "monitor_grant": grant.token,
+        "frame_base": frame_prefix(grant),
+        "data_base": data_prefix(grant),
+        "expires_in": seconds_left(grant.expires_at),
+        "acl_revision": monitor.acl_revision,
+    }
+
+
+async def publish_workspace_monitor(
+    payload: PublishMonitorRequest, *, caller_id: str
+) -> dict[str, Any]:
+    members = await validate_publish_permissions(
+        caller_id=caller_id,
+        visibility=payload.visibility,
+        member_user_ids=payload.member_user_ids,
+    )
+    try:
+        workspace = await owned_workspace_on_computer(payload.workspace_id, caller_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Workspace not found") from None
+        raise
+    if workspace.get("status") == "deleted":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    rel_path = _normalize_workspace_entry_path(workspace, payload.path)
+
+    artifact = await artifacts_db.ensure_artifact(
+        str(workspace["workspace_id"]), rel_path
+    )
+    existing = await monitor_db.get_monitor_by_artifact_id(artifact.artifact_id)
+    is_downgrade_only = (
+        existing is not None
+        and existing.visibility == "public"
+        and payload.visibility != "public"
+    )
+    if not is_artifact_publishing_enabled():
+        if not is_downgrade_only:
+            _require_publishing_enabled()
+        assert existing is not None
+        tier = await get_user_tier(caller_id)
+        if not _can_manage_monitor(existing, caller_id, tier):
+            raise HTTPException(status_code=403, detail="无权修改此监控面板")
+        updated_downgraded = await monitor_db.update_monitor_settings_tx(
+            existing.monitor_id,
+            artifact_id=existing.artifact_id,
+            owner_user_id=caller_id,
+            caller_id=caller_id,
+            title=(payload.title or "").strip() or None,
+            category=payload.category,
+            sort_order=payload.sort_order,
+            visibility=payload.visibility,
+            keep_updated=payload.keep_updated,
+            member_user_ids=members if payload.visibility == "members" else [],
+            resolve_caller_tier=get_user_tier,
+        )
+        detail = await _build_monitor_detail_payload(updated_downgraded, viewer_id=caller_id)
+        detail["cut"] = False
+        return detail
+
+    if existing is not None:
+        tier = await get_user_tier(caller_id)
+        if not _can_manage_monitor(existing, caller_id, tier):
+            raise HTTPException(status_code=403, detail="无权修改此监控面板")
+        slug = existing.slug
+    else:
+        if payload.slug is not None:
+            candidate = payload.slug.strip().lower()
+            if not is_valid_slug(candidate):
+                raise HTTPException(status_code=422, detail="固定地址 slug 格式无效或为保留名称")
+            if await monitor_db.get_monitor_by_slug(candidate) is not None:
+                raise HTTPException(status_code=409, detail="该固定地址已被占用")
+            slug = candidate
+        else:
+            slug = await monitor_db.pick_available_slug(
+                payload.title or rel_path.rsplit("/", 1)[-1].removesuffix(".html")
+            )
+
+    title = (payload.title or "").strip() or (
+        existing.title if existing else rel_path.rsplit("/", 1)[-1]
+    )
+
+    try:
+        snap = await artifact_snapshot.capture_workspace_monitor_snapshot(
+            artifact,
+            user_id=caller_id,
+            mode=ReadMode.OWNER,
+            reviewed=payload.files,
+            loaded=tuple(payload.loaded),
+            earlier=tuple(payload.earlier),
+            reviewed_page=payload.page_sha256,
+        )
+    except Exception as exc:
+        if existing is not None:
+            await monitor_db.record_monitor_publish_failure(
+                existing.monitor_id,
+                error_message=str(exc),
+            )
+        raise _translate_snapshot_error(exc) from None
+
+    effective_title = (payload.title or "").strip() or snap.title or title
+    try:
+        updated_monitor, result = await monitor_db.commit_monitor_publish_tx(
+            slug=slug,
+            artifact_id=artifact.artifact_id,
+            workspace_owner_id=caller_id,
+            monitor_owner_id=caller_id,
+            title=effective_title,
+            category=payload.category,
+            sort_order=payload.sort_order,
+            visibility=payload.visibility,
+            keep_updated=payload.keep_updated,
+            source_kind="workspace",
+            source_ref=f"{workspace['workspace_id']}:{rel_path}",
+            member_user_ids=members,
+            files=snap.files,
+            label=payload.label,
+            read_basis=ReadBasis.of(artifact),
+            origin="owner",
+            loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
+            left_out_files=[e.path for e in snap.left_out],
+            verify_public_authority=_verify_user_is_admin,
+        )
+    except Exception as exc:
+        if existing is not None:
+            await monitor_db.record_monitor_publish_failure(
+                existing.monitor_id, error_message=str(exc)
+            )
+        raise _translate_snapshot_error(exc) from None
+
+    detail = await _build_monitor_detail_payload(updated_monitor, viewer_id=caller_id)
+    detail["cut"] = result.cut
+    return detail
+
+
+async def update_monitor_settings(
+    slug: str, payload: UpdateMonitorRequest, *, caller_id: str
+) -> dict[str, Any]:
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+
+    tier = await get_user_tier(caller_id)
+    if not _can_manage_monitor(monitor, caller_id, tier):
+        raise HTTPException(status_code=403, detail="只有面板所有者或管理员可修改设置")
+
+    validated_members: list[str] | None = None
+    if payload.visibility is not None or payload.member_user_ids is not None:
+        if payload.visibility is not None:
+            # Validate caller tier against explicit visibility change; if member_user_ids
+            # was omitted when keeping/setting 'members', check existing/locked members inside tx.
+            if tier == "external" and payload.visibility != "own":
+                raise HTTPException(
+                    status_code=403,
+                    detail="外部成员发布监控面板时只能选择“仅自己”可见",
+                )
+            if payload.visibility == "public" and tier != "admin":
+                raise HTTPException(
+                    status_code=403,
+                    detail="只有管理员可以将监控面板设为公开链接",
+                )
+            if payload.visibility == "public" and monitor.visibility != "public":
+                _require_publishing_enabled()
+        if payload.member_user_ids is not None:
+            if tier == "external" and payload.member_user_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="外部成员发布监控面板时只能选择“仅自己”可见",
+                )
+            if payload.visibility == "members" or (
+                payload.visibility is None and payload.member_user_ids
+            ):
+                validated_members = await validate_publish_permissions(
+                    caller_id=caller_id,
+                    visibility="members",
+                    member_user_ids=payload.member_user_ids,
+                )
+            else:
+                validated_members = []
+
+    next_title = (payload.title or "").strip() or None if payload.title is not None else None
+    workspace_owner_id = await _resolve_workspace_owner_id(monitor)
+
+    try:
+        updated = await monitor_db.update_monitor_settings_tx(
+            monitor.monitor_id,
+            artifact_id=monitor.artifact_id,
+            owner_user_id=workspace_owner_id,
+            caller_id=caller_id,
+            title=next_title,
+            category=payload.category,
+            sort_order=payload.sort_order,
+            visibility=payload.visibility,
+            keep_updated=payload.keep_updated,
+            member_user_ids=validated_members,
+            require_publishing_enabled_fn=_require_publishing_enabled,
+            verify_public_authority=_verify_user_is_admin,
+            resolve_caller_tier=get_user_tier,
+        )
+    except PublicAuthorityLostError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+
+    return await _build_monitor_detail_payload(updated, viewer_id=caller_id)
+
+
+async def republish_workspace_monitor(
+    slug: str,
+    payload: RepublishMonitorRequest,
+    *,
+    caller_id: str,
+) -> dict[str, Any]:
+    _require_publishing_enabled()
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+    tier = await get_user_tier(caller_id)
+    if not _can_manage_monitor(monitor, caller_id, tier):
+        raise HTTPException(status_code=403, detail="无权重新发布此监控面板")
+    if monitor.source_kind != "workspace":
+        raise HTTPException(status_code=400, detail="数据任务面板请由数据任务触发更新")
+    if monitor.visibility == "public" and tier != "admin":
+        await monitor_db.record_monitor_publish_failure(
+            monitor.monitor_id, error_message=PUBLIC_PERMISSION_LOST_MESSAGE
+        )
+        raise HTTPException(status_code=403, detail=PUBLIC_PERMISSION_LOST_MESSAGE)
+
+    workspace_owner_id = await _resolve_workspace_owner_id(monitor)
+    artifact = await artifacts_db.get_artifact(
+        monitor.artifact_id, user_id=workspace_owner_id
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="关联文件不存在")
+
+    takeover_owner = (
+        caller_id
+        if monitor.visibility == "public" and tier == "admin" and caller_id != monitor.owner_user_id
+        else None
+    )
+
+    try:
+        snap = await artifact_snapshot.capture_workspace_monitor_snapshot(
+            artifact,
+            user_id=workspace_owner_id,
+            mode=ReadMode.OWNER,
+            reviewed=payload.files,
+            loaded=tuple(payload.loaded),
+            earlier=tuple(payload.earlier),
+            reviewed_page=payload.page_sha256,
+        )
+        updated, result, _deduped = await cut_monitor_version(
+            monitor=monitor,
+            owner_user_id=workspace_owner_id,
+            files=snap.files,
+            title=monitor.title,
+            label=payload.label,
+            read_basis=ReadBasis.of(artifact),
+            origin="owner",
+            loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
+            left_out_files=[e.path for e in snap.left_out],
+            new_owner_user_id=takeover_owner,
+            verify_public_authority=_verify_user_is_admin,
+        )
+    except Exception as exc:
+        await monitor_db.record_monitor_publish_failure(
+            monitor.monitor_id, error_message=str(exc)
+        )
+        raise _translate_snapshot_error(exc) from None
+
+    detail = await _build_monitor_detail_payload(updated, viewer_id=caller_id)
+    detail["cut"] = bool(result.cut) if result is not None else False
+    return detail
+
+
+async def delete_monitor_by_slug(slug: str, *, caller_id: str) -> dict[str, Any]:
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+    tier = await get_user_tier(caller_id)
+    if not _can_manage_monitor(monitor, caller_id, tier):
+        raise HTTPException(status_code=403, detail="无权删除此监控面板")
+    workspace_owner_id = await _resolve_workspace_owner_id(monitor)
+    await monitor_db.delete_monitor_tx(
+        monitor.monitor_id,
+        artifact_id=monitor.artifact_id,
+        workspace_owner_id=workspace_owner_id,
+        caller_id=caller_id,
+        resolve_caller_tier=get_user_tier,
+    )
+    return {"deleted": True, "slug": slug}
+
+
+async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
+    """Refresh every workspace monitor with ``keep_updated=TRUE`` after a turn completes.
+
+    Runs independently of ``share_links.shared_at`` and ``kept_at``. Preserves the
+    previous ``published_seq`` and records ``last_publish_error`` if a cut fails,
+    dependency files are absent, or a public monitor's publisher lost admin rights.
+    """
+    if not is_artifact_publishing_enabled():
+        return
+    monitors = await monitor_db.list_workspace_auto_update_monitors(workspace_id)
+    if not monitors:
+        return
+    workspace = await db_get_workspace(workspace_id)
+    if not workspace or workspace.get("status") != "running":
+        return
+    workspace_owner_id = str(workspace["user_id"])
+
+    for monitor in monitors:
+        try:
+            if monitor.visibility == "public":
+                if await get_user_tier(monitor.owner_user_id) != "admin":
+                    raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+            artifact = await artifacts_db.get_artifact(
+                monitor.artifact_id, user_id=workspace_owner_id
+            )
+            if artifact is None:
+                continue
+            snap = await artifact_snapshot.capture_workspace_monitor_snapshot(
+                artifact,
+                user_id=workspace_owner_id,
+                mode=ReadMode.WARM_ONLY,
+            )
+            await _abort_if_absent_dependencies(
+                monitor.artifact_id,
+                monitor.published_seq or artifact.latest_seq,
+                snap,
+            )
+            await cut_monitor_version(
+                monitor=monitor,
+                owner_user_id=workspace_owner_id,
+                files=snap.files,
+                title=monitor.title,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                loaded_files=[
+                    e.path for e in snap.entries if e.reason == REASON_LOADED
+                ],
+                artifact=artifact,
+                verify_public_authority=_verify_user_is_admin,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Auto-updating workspace monitor %s (%s) failed: %s",
+                monitor.slug,
+                monitor.monitor_id,
+                exc,
+                exc_info=True,
+            )
+            await monitor_db.record_monitor_publish_failure(
+                monitor.monitor_id, error_message=str(exc)
+            )
+
+
+async def _verify_data_job_public_approver(
+    binding: MonitorDataJobBinding,
+    *,
+    is_existing_public: bool = False,
+) -> None:
+    approver = (binding.approved_by_admin_user_id or "").strip()
+    if not approver:
+        detail = (
+            PUBLIC_PERMISSION_LOST_MESSAGE
+            if is_existing_public
+            else "公开数据任务监控必须在登记表中指定审批管理员"
+        )
+        raise PublicAuthorityLostError(detail)
+    if await get_user_tier(approver) != "admin":
+        raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+
+
+async def republish_data_job_monitor(
+    *,
+    job_key: str,
+    run_id: str,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
+    """Republish a registered data-job monitor from its pre-registered host output dir."""
+    _require_publishing_enabled()
+    binding = get_registered_monitor_job(job_key)
+    if binding is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"未登记的数据任务监控映射: {job_key}",
+        )
+
+    clean_run_id = str(run_id or "").strip()
+    if not clean_run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
+    if existing is not None and await monitor_db.has_processed_monitor_run(
+        existing.monitor_id, clean_run_id
+    ):
+        return {
+            "monitor_id": existing.monitor_id,
+            "slug": existing.slug,
+            "published_seq": existing.published_seq,
+            "cut": False,
+            "deduplicated": True,
+        }
+
+    if binding.visibility == "public" and not (binding.approved_by_admin_user_id or "").strip():
+        if existing is not None:
+            await monitor_db.record_monitor_publish_failure(
+                existing.monitor_id,
+                error_message=PUBLIC_PERMISSION_LOST_MESSAGE,
+            )
+        raise HTTPException(
+            status_code=403,
+            detail="公开数据任务监控必须在登记表中指定审批管理员",
+        )
+
+    is_public_target = binding.visibility == "public" or (
+        existing is not None and existing.visibility == "public"
+    )
+    if is_public_target:
+        try:
+            await _verify_data_job_public_approver(
+                binding,
+                is_existing_public=(existing is not None and existing.visibility == "public"),
+            )
+        except PublicAuthorityLostError as exc:
+            if existing is not None:
+                await monitor_db.record_monitor_publish_failure(
+                    existing.monitor_id, error_message=str(exc)
+                )
+            raise HTTPException(status_code=403, detail=str(exc)) from None
+
+    workspace_id = await monitor_db.ensure_company_monitor_workspace()
+    artifact = await artifacts_db.ensure_artifact(workspace_id, binding.entry_file)
+
+    monitor = existing
+    if monitor is None:
+        slug = (
+            binding.slug
+            if is_valid_slug(binding.slug)
+            and await monitor_db.get_monitor_by_slug(binding.slug) is None
+            else await monitor_db.pick_available_slug(binding.slug)
+        )
+        monitor = await monitor_db.upsert_monitor(
+            slug=slug,
+            artifact_id=artifact.artifact_id,
+            owner_user_id=COMPANY_SYSTEM_USER_ID,
+            title=binding.title,
+            category=binding.category,
+            sort_order=0,
+            visibility=binding.visibility,
+            keep_updated=True,
+            source_kind="data_job",
+            source_ref=binding.job_key,
+            member_user_ids=(),
+        )
+
+    if data_root is None:
+        from src.dalton.settings import get_dalton_backend_var_dir
+
+        data_root = Path(get_dalton_backend_var_dir()) / "openclaw-data"
+
+    async def _verify_job_public_in_tx(_owner_id: str) -> None:
+        await _verify_data_job_public_approver(binding, is_existing_public=True)
+
+    try:
+        work_dir = str(data_root / binding.rel_dir)
+        with HostDirFileSource.open_registered(data_root, binding) as source:
+            extra_files = source.list_artifact_files()
+            reader = Reader(
+                files=source,
+                work_dir=work_dir,
+                previous_dirs=(),
+            )
+            snap = await artifact_snapshot.capture_reader_monitor_snapshot(
+                reader,
+                owner_id=COMPANY_SYSTEM_USER_ID,
+                entry_path=binding.entry_file,
+                extra_paths=extra_files,
+            )
+        await _abort_if_absent_dependencies(
+            monitor.artifact_id,
+            monitor.published_seq or artifact.latest_seq,
+            snap,
+        )
+        updated, result, deduped = await cut_monitor_version(
+            monitor=monitor,
+            owner_user_id=COMPANY_SYSTEM_USER_ID,
+            files=snap.files,
+            title=monitor.title,
+            read_basis=ReadBasis.of(artifact),
+            origin="owner",
+            run_id=clean_run_id,
+            artifact=artifact,
+            verify_public_authority=_verify_job_public_in_tx,
+        )
+    except Exception as exc:
+        await monitor_db.record_monitor_publish_failure(
+            monitor.monitor_id,
+            error_message=str(exc),
+        )
+        raise _translate_snapshot_error(exc) from None
+
+    return {
+        "monitor_id": updated.monitor_id,
+        "slug": updated.slug,
+        "published_seq": updated.published_seq,
+        "cut": bool(result.cut) if result is not None else False,
+        "deduplicated": deduped,
+    }
+
+
+async def maybe_publish_data_job_monitor(
+    *,
+    job_key: str,
+    run_id: str,
+    terminal_status: str,
+    failure_reason: str | None = None,
+    data_root: Path | None = None,
+) -> None:
+    """Scheduler post-run hook: republish on success, record failure without touching ``published_seq``."""
+    binding = get_registered_monitor_job(job_key)
+    if binding is None:
+        return
+    if not is_artifact_publishing_enabled():
+        return
+    if terminal_status == "succeeded":
+        await republish_data_job_monitor(
+            job_key=job_key, run_id=run_id, data_root=data_root
+        )
+        return
+    existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
+    if existing is not None:
+        await monitor_db.record_monitor_publish_failure(
+            existing.monitor_id,
+            error_message=failure_reason or terminal_status,
+        )
+
+
+async def _authorize_grant(grant_token: str) -> tuple[MonitorRecord, str]:
+    try:
+        verified = await verify_monitor_grant(grant_token)
+    except MonitorGrantError:
+        raise HTTPException(status_code=403, detail="监控面板授权无效或已过期") from None
+
+    monitor = await monitor_db.get_monitor_by_id(verified.monitor_id)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+
+    if monitor.acl_revision != verified.acl_revision:
+        raise HTTPException(status_code=403, detail="监控面板权限已变更，授权已失效")
+
+    await require_monitor_view(monitor, verified.user_id)
+    return monitor, verified.user_id
+
+
+async def _serve_monitor_version_file(
+    monitor: MonitorRecord,
+    seq: int,
+    path: str,
+    *,
+    if_none_match: str | None = None,
+    head: bool = False,
+) -> ServedArtifactFile:
+    if not await monitor_db.is_monitor_version_published(monitor.monitor_id, seq):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    stored = await artifacts_db.get_version_file(monitor.artifact_id, seq, path)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    content_type = _content_type(stored.content_type)
+    bridged = _is_html(content_type) and _charset_is_utf8(content_type)
+    bridge = bridge_for("view")
+    etag = f"{stored.sha256}-{bridge.digest}" if bridged else stored.sha256
+    headers = _headers(
+        content_type,
+        etag,
+        cache_control="private, no-cache",
+        sandboxed=True,
+        frame_ancestors=PREVIEW_PROXY_FRAME_ANCESTORS,
+    )
+    if if_none_match is not None and _etag_matches(if_none_match, etag):
+        return ServedArtifactFile(body=b"", headers=headers, status=304)
+    if head:
+        if not bridged:
+            headers.append(("content-length", str(stored.byte_len)))
+        return ServedArtifactFile(body=b"", headers=headers)
+
+    if stored.content is not None:
+        body = stored.content
+    else:
+        try:
+            body = await fetch_blob(stored.user_id, stored.sha256)
+        except Exception as exc:
+            raise ArtifactFileUnavailable(str(exc)) from exc
+
+    if bridged:
+        body = await asyncio.to_thread(with_bridge, body, bridge)
+    headers.append(("content-length", str(len(body))))
+    return ServedArtifactFile(body=body, headers=headers)
+
+
+async def serve_monitor_file(
+    grant_token: str,
+    seq: str,
+    path: str,
+    *,
+    if_none_match: str | None = None,
+    head: bool = False,
+) -> ServedArtifactFile:
+    """Serve a published monitor version file under ``CSP: sandbox`` (opaque origin)."""
+    monitor, _viewer_id = await _authorize_grant(grant_token)
+
+    if not seq.isdigit() or int(seq) < 1 or not _valid_path(path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return await _serve_monitor_version_file(
+        monitor,
+        int(seq),
+        path,
+        if_none_match=if_none_match,
+        head=head,
+    )
+
+
+async def serve_public_monitor_file(
+    slug: str,
+    seq: str,
+    path: str,
+    *,
+    if_none_match: str | None = None,
+    head: bool = False,
+) -> ServedArtifactFile:
+    """Anonymously serve the current published version file when ``visibility == 'public'``."""
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None or monitor.visibility != "public":
+        raise HTTPException(status_code=404, detail="File not found")
+    target_path = path or (monitor.entry_path or "")
+    if (
+        not seq.isdigit()
+        or int(seq) < 1
+        or monitor.published_seq <= 0
+        or int(seq) != monitor.published_seq
+        or not target_path
+        or not _valid_path(target_path)
+    ):
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        return await _serve_monitor_version_file(
+            monitor,
+            int(seq),
+            target_path,
+            if_none_match=if_none_match,
+            head=head,
+        )
+    except HTTPException as exc:
+        entry_dir = posixpath.dirname(monitor.entry_path or "")
+        if exc.status_code == 404 and path and entry_dir:
+            nested = posixpath.normpath(f"{entry_dir}/{path}")
+            if nested.startswith(f"{entry_dir}/") and _valid_path(nested):
+                return await _serve_monitor_version_file(
+                    monitor,
+                    int(seq),
+                    nested,
+                    if_none_match=if_none_match,
+                    head=head,
+                )
+        raise
+
+
+async def _read_monitor_data_response(
+    monitor: MonitorRecord,
+    data_key: str,
+    *,
+    if_none_match: str | None = None,
+) -> tuple[int, dict[str, Any] | None, dict[str, str]]:
+    entry = await monitor_db.get_monitor_data(monitor.monitor_id, data_key)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Monitor data key not found")
+
+    response_body = {
+        "monitor_id": monitor.monitor_id,
+        "slug": monitor.slug,
+        "key": entry.data_key,
+        "as_of": entry.as_of.isoformat(),
+        "sha256": entry.sha256,
+        "updated_at": entry.updated_at.isoformat(),
+        "data": entry.payload,
+    }
+    etag = hashlib.sha256(
+        json.dumps(
+            response_body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    headers = {
+        "ETag": f'"{etag}"',
+        "Cache-Control": "private, no-cache",
+    }
+    if if_none_match is not None and _etag_matches(if_none_match, etag):
+        return 304, None, headers
+
+    return 200, response_body, headers
+
+
+async def read_monitor_data_by_grant(
+    grant_token: str,
+    data_key: str,
+    *,
+    if_none_match: str | None = None,
+) -> tuple[int, dict[str, Any] | None, dict[str, str]]:
+    """Read realtime monitor JSON data via ``monitor_grant`` with live ACL re-check and ETag/304."""
+    if not is_valid_data_key(data_key):
+        raise HTTPException(status_code=400, detail="Invalid data key")
+
+    monitor, _viewer_id = await _authorize_grant(grant_token)
+    return await _read_monitor_data_response(
+        monitor, data_key, if_none_match=if_none_match
+    )
+
+
+async def read_public_monitor_data(
+    slug: str,
+    data_key: str,
+    *,
+    if_none_match: str | None = None,
+) -> tuple[int, dict[str, Any] | None, dict[str, str]]:
+    """Anonymously read realtime monitor JSON data when ``visibility == 'public'``."""
+    if not is_valid_data_key(data_key):
+        raise HTTPException(status_code=400, detail="Invalid data key")
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None or monitor.visibility != "public":
+        raise HTTPException(status_code=404, detail="Monitor not found")
+    return await _read_monitor_data_response(
+        monitor, data_key, if_none_match=if_none_match
+    )
+
+
+async def write_monitor_data_internal(
+    slug: str,
+    data_key: str,
+    payload: Any,
+    *,
+    as_of: datetime | None = None,
+) -> dict[str, Any]:
+    if not is_valid_data_key(data_key):
+        raise HTTPException(status_code=400, detail="Invalid data key")
+    monitor = await monitor_db.get_monitor_by_slug(slug)
+    if monitor is None:
+        raise HTTPException(status_code=404, detail="监控面板不存在")
+    if monitor.source_kind != "data_job" or not monitor.source_ref:
+        raise HTTPException(
+            status_code=403,
+            detail="仅 data_job 类型的监控面板支持内部实时数据写入",
+        )
+    binding = get_registered_monitor_job(monitor.source_ref)
+    if binding is None or data_key not in binding.data_keys:
+        raise HTTPException(
+            status_code=403,
+            detail=f"data_key '{data_key}' 未在监控面板数据任务白名单中",
+        )
+    entry: MonitorDataEntry = await monitor_db.upsert_monitor_data(
+        monitor.monitor_id,
+        data_key,
+        payload,
+        as_of=as_of,
+    )
+    return {
+        "monitor_id": entry.monitor_id,
+        "slug": monitor.slug,
+        "key": entry.data_key,
+        "as_of": entry.as_of.isoformat(),
+        "sha256": entry.sha256,
+        "updated_at": entry.updated_at.isoformat(),
+    }

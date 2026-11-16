@@ -454,3 +454,10 @@ tests/unit/dalton/test_weekly_token_usage.py
 scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/fetch_history.py
 scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/official_mirror.py
 scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/backtest.py
+# Monitors (Round 1: Platform): Dalton monitor module, migration, and frontend pages/API/tests.
+src/dalton/monitors/
+src/dalton/migrations/versions/d038_monitors.py
+src/dalton/migrations/versions/d039_monitor_publish_runs.py
+tests/unit/dalton/test_monitors.py
+web/src/pages/Monitors/
+web/src/pages/ChatAgent/components/__tests__/PublishDialog.monitors.test.tsx

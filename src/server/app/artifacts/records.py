@@ -45,6 +45,7 @@ from src.server.services.workspace_files import (
     owned_workspace_on_computer,
     previous_dir_names_of,
 )
+from src.dalton.access_tiers import get_user_tier as _default_get_user_tier  # DALTON-HOOK(monitors)
 from src.server.utils.api import CurrentUserId
 from src.server.utils.pg_sanitize import normalize_uuid
 
@@ -186,6 +187,32 @@ async def _require_non_external_for_publish(user_id: str) -> None:
     await require_non_external_for_share(user_id)
 
 
+# DALTON-HOOK(monitors): bare upstream publish creates a public /a/{code} link
+# directly, bypassing monitor ACLs; only admins may call it directly, while
+# regular users publish through /api/v1/dalton/monitors.
+async def _require_admin_for_public_publish(user_id: str) -> None:
+    from src.dalton import access_tiers as _access_tiers
+    from src.dalton import sharing as _dalton_sharing
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.server.app import share_links as _share_links
+
+    if _share_links.get_user_tier is not _default_get_user_tier:
+        tier_fn = _share_links.get_user_tier
+    elif _access_tiers.get_user_tier is not _default_get_user_tier:
+        tier_fn = _access_tiers.get_user_tier
+    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
+        tier_fn = _dalton_sharing.get_user_tier
+    else:
+        tier_fn = _default_get_user_tier
+    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+        return
+    if await tier_fn(user_id) != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="仅管理员可公开分享文件，请通过监控面板发布",
+        )
+
+
 async def _workspace_path(
     workspace_id: str, path: str, user_id: str
 ) -> tuple[str, str]:
@@ -246,6 +273,11 @@ async def update_artifact(
         _refuse_publishing_disabled()
         # DALTON-HOOK(external-share-guard): external members may not set it either
         await _require_non_external_for_publish(x_user_id)
+        # DALTON-HOOK(monitors): enabling keep_updated on a publicly shared
+        # artifact auto-publishes public content and requires an active admin.
+        existing = await owned(artifact_id, x_user_id)
+        if existing.shared:
+            await _require_admin_for_public_publish(x_user_id)
     with db_errors():
         artifact = await artifacts_db.set_keep_updated(
             user_id=x_user_id,
@@ -269,6 +301,10 @@ async def set_artifact_kept(
     refused leaves the record as it was.
     """
     artifact = await owned(artifact_id, x_user_id)
+    # DALTON-HOOK(monitors): enabling kept on an already-public artifact widens
+    # automatic cuts to all walked dependencies; require an active admin.
+    if body.kept and artifact.shared:
+        await _require_admin_for_public_publish(x_user_id)
     with db_errors(), _snapshot_errors():
         if body.kept:
             artifact = await snapshot.keep(
@@ -445,6 +481,8 @@ async def publish_artifact(
     _refuse_publishing_disabled()
     # DALTON-HOOK(external-share-guard): external members cannot publish
     await _require_non_external_for_publish(x_user_id)
+    # DALTON-HOOK(monitors): non-admin callers cannot call bare public publish
+    await _require_admin_for_public_publish(x_user_id)
     artifact = await owned(artifact_id, x_user_id)
     with db_errors(), _snapshot_errors():
         result = await snapshot.publish(

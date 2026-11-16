@@ -28,6 +28,8 @@ interface HtmlArtifactTabOptions {
   readAt: number | null;
   /** The owner's comment controls; left out, the panel is not the owner's and the file shows alone. */
   ui: CommentUi | undefined;
+  /** DALTON-HOOK(monitors): independently enables monitor publishing in own workspace (incl. external members). */
+  canPublishMonitor?: boolean;
   /** The thread beside the panel, where a dashboard set from here is edited. */
   threadId?: string | null;
 }
@@ -58,7 +60,7 @@ export interface HtmlArtifactTab {
  * is made as soon as its tab is in front (`useArtifactVersionView`).
  */
 export function useHtmlArtifactTab({
-  workspaceId, tabId, file, html, source, active, readAt, ui, threadId = null,
+  workspaceId, tabId, file, html, source, active, readAt, ui, canPublishMonitor, threadId = null,
 }: HtmlArtifactTabOptions): HtmlArtifactTab {
   const root = useWorkspaceFolders()?.rootDir;
   const path = ui && html ? file : null;
@@ -78,7 +80,10 @@ export function useHtmlArtifactTab({
     if (path) void LazyCommentLayer.preload();
   }, [path]);
 
-  const openPublish = ui ? (target: string) => setPublishing({ path: target, open: true }) : null;
+  // DALTON-HOOK(monitors): allow opening the Monitor Publish dialog even when comment UI is withheld for external members
+  const openPublish = (canPublishMonitor ?? !!ui)
+    ? (target: string) => setPublishing({ path: target, open: true })
+    : null;
   return {
     path,
     doc: path && ui ? ui.docOf(tabId, artifactPathKey(path, root)) : null,

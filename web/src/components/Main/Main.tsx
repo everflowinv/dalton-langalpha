@@ -22,6 +22,8 @@ const routeChunks = {
   market: () => import('../../pages/MarketView/MarketView'),
   news: () => import('../../pages/Detail/NewsDetailPage'),
   automations: () => import('../../pages/Automations/Automations'),
+  // DALTON-HOOK(monitors): Monitors primary section chunk
+  monitors: () => import('../../pages/Monitors/Monitors'),
   // DALTON-HOOK(hide-trading): the Orders page is not built; an /orders warm
   // takes the dashboard chunk, the same one the catch-all redirect lands on.
   orders: () => import('../../pages/Dashboard/Dashboard'),
@@ -37,6 +39,7 @@ const MarketView = lazyWithMotion(routeChunks.market);
 // Animates nothing, so it skips the framer download (see lib/lazyWithMotion).
 const NewsDetailPage = preloadableLazy(routeChunks.news);
 const Automations = lazyWithMotion(routeChunks.automations);
+const Monitors = lazyWithMotion(routeChunks.monitors); // DALTON-HOOK(monitors)
 // DALTON-HOOK(hide-trading): do not mount Orders page
 const Plugins = lazyWithMotion(routeChunks.plugins);
 const Settings = lazyWithMotion(routeChunks.settings);
@@ -50,6 +53,7 @@ const routePreloads = {
   market: MarketView.preload,
   news: NewsDetailPage.preload,
   automations: Automations.preload,
+  monitors: Monitors.preload, // DALTON-HOOK(monitors)
   // DALTON-HOOK(hide-trading): the Orders page is not mounted; /orders warms the dashboard.
   orders: Dashboard.preload,
   plugins: Plugins.preload,
@@ -69,7 +73,7 @@ export function preloadRouteChunk(pathname: string): void {
 
 // Warmed in the order the rail lists them, the likeliest next stops first.
 // DALTON-HOOK(hide-trading): no 'orders' — its warm is the dashboard's, already first.
-const WARM_ORDER = ['dashboard', 'chat', 'market', 'automations', 'plugins', 'settings', 'news'] as const satisfies readonly AppSection[];
+const WARM_ORDER = ['dashboard', 'chat', 'market', 'automations', 'monitors', 'plugins', 'settings', 'news'] as const satisfies readonly AppSection[]; // DALTON-HOOK(monitors)
 const WARM_IDLE_TIMEOUT_MS = 2000;
 
 /** Warms every section's chunk once the shell is idle, one at a time so none
@@ -137,6 +141,9 @@ function Main() {
           <Route path="/chat/:workspaceId" element={<ChatAgent />} />
           <Route path="/market" element={<MarketView />} />
           <Route path="/automations" element={<Automations />} />
+          {/* DALTON-HOOK(monitors): Monitors list & viewer routes */}
+          <Route path="/monitors" element={<Monitors />} />
+          <Route path="/monitors/:slug" element={<Monitors />} />
           <Route path="/orders" element={<Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />} /> {/* DALTON-HOOK(hide-trading) */}
           <Route path="/plugins" element={<Plugins />} />
           <Route path="/connectors" element={<LegacyConnectorsRedirect />} />

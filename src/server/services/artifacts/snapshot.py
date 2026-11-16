@@ -538,6 +538,104 @@ async def _announce(
     await publish_artifact_change(user_id, result.artifact)
 
 
+# DALTON-HOOK(monitors): expose snapshot capture + blob storage for workspace
+# and data-job monitors so they share upstream manifest walking, 200-file /
+# 25 MiB caps, secret redaction, and CAS blob storage.
+async def capture_workspace_monitor_snapshot(
+    artifact: Artifact,
+    *,
+    user_id: str,
+    mode: ReadMode = ReadMode.OWNER,
+    reviewed: list[str] | None = None,
+    loaded: tuple[str, ...] = (),
+    earlier: tuple[str, ...] = (),
+    reviewed_page: str | None = None,
+) -> Snapshot:
+    """Capture and seal a workspace artifact snapshot for a monitor."""
+    snapshot = await _capture(
+        artifact,
+        user_id=user_id,
+        mode=mode,
+        source=_Walked(reviewed, loaded, earlier),
+    )
+    if reviewed_page is not None and snapshot.page_sha256 != reviewed_page:
+        raise SnapshotRefused("files_changed", files=snapshot.entries)
+    await _store_blobs(user_id, snapshot)
+    return snapshot
+
+
+# DALTON-HOOK(monitors): capture and seal monitor snapshots from host/data-job Reader.
+async def capture_reader_monitor_snapshot(
+    reader: Reader,
+    *,
+    owner_id: str,
+    entry_path: str,
+    extra_paths: tuple[str, ...] = (),
+) -> Snapshot:
+    """Capture and seal a monitor snapshot from a custom ``Reader`` (e.g. registered data-job dir)."""
+    try:
+        manifest = await walk_manifest(reader, entry_path)
+        entries = list(manifest.entries)
+        seen = {e.path for e in entries}
+        scanned = dict(manifest.contents)
+        if extra_paths:
+            stat_hits = await reader.files.stat([p for p in extra_paths if p not in seen and may_be_artifact(p)])
+            for p, (canonical, size) in stat_hits.items():
+                if canonical not in seen:
+                    entries.append(ManifestEntry(canonical, size, "listed"))
+                    seen.add(canonical)
+        byte_total = sum({e.path: (e.size or 0) for e in entries}.values())
+        _VERSION_CAPS.check(
+            len(entries),
+            byte_total,
+            sum(e.size or 0 for e in entries),
+            Manifest(entries, manifest.left_out, byte_total, scanned, manifest.root_refs, manifest.absent),
+        )
+        contents = await _read_all(reader, entries, scanned)
+    except ManifestEntryMissing:
+        raise SnapshotRefused("file_missing") from None
+    except ManifestTooLarge as e:
+        raise SnapshotRefused(
+            e.code, limit=e.limit, files=e.entries, left_out=e.left_out
+        ) from None
+    except (SnapshotRefused, SnapshotUnavailable):
+        raise
+    except Exception as e:
+        logger.warning("Reading monitor source %s failed: %s", entry_path, e, exc_info=True)
+        raise SnapshotUnavailable(str(e)) from e
+
+    vault_secrets = await get_vault_secrets_for_redaction(owner_id)
+    files, blobs = await asyncio.to_thread(
+        _seal,
+        [(e.path, data) for e, data in zip(entries, contents)],
+        get_redactor(),
+        vault_secrets,
+        not is_storage_enabled(),
+    )
+    # DALTON-HOOK(monitors): enforce version caps and store blobs for monitor snapshots.
+    _VERSION_CAPS.check(
+        len(files),
+        sum({f.sha256: f.byte_len for f in files}.values()),
+        sum(f.byte_len for f in files),
+        Manifest(entries, manifest.left_out, sum(f.byte_len for f in files)),
+    )
+    entry = files[0]
+    title = _html_title(
+        entry.content if entry.content is not None else blobs[entry.sha256]
+    )
+    snap = Snapshot(
+        entries=entries,
+        left_out=manifest.left_out,
+        files=files,
+        blobs=blobs,
+        title=title,
+        root_refs=manifest.root_refs,
+        absent=manifest.absent,
+    )
+    await _store_blobs(owner_id, snap)
+    return snap
+
+
 def _drift(snapshot: Snapshot, before: dict[str, str]) -> Drift:
     now = {f.path: f.sha256 for f in snapshot.files}
     return Drift(
@@ -778,6 +876,19 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
     # vault are all owner-scoped, so the cut runs as the owner, the way the
     # legacy first read already does.
     try:
+        # DALTON-HOOK(monitors): refresh workspace monitors with keep_updated=TRUE
+        # regardless of share_links.shared_at / kept_at.
+        try:
+            from src.dalton.monitors.service import republish_workspace_monitors_after_turn
+
+            await republish_workspace_monitors_after_turn(workspace_id=workspace_id)
+        except Exception:
+            logger.warning(
+                "Keeping monitors updated in workspace %s failed",
+                workspace_id,
+                exc_info=True,
+            )
+
         kept = await artifacts_db.list_kept_updated(workspace_id)
         if not kept:
             return
@@ -789,6 +900,20 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
             return
         owner_id = str(workspace["user_id"])
         for artifact in kept:
+            # DALTON-HOOK(monitors): auto-updating a publicly shared /a/{code}
+            # artifact requires the owner to currently be an active admin.
+            if artifact.shared and artifact.keep_updated:
+                from src.dalton import access_tiers as _access_tiers
+                from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+                if is_dalton_supabase_auth_enabled():
+                    if await _access_tiers.get_user_tier(owner_id) != "admin":
+                        logger.info(
+                            "Skipping public keep_updated for artifact %s: owner %s is not admin",
+                            artifact.artifact_id,
+                            owner_id,
+                        )
+                        continue
             # One link's failure is its own: a record deleted or refused
             # mid-run must not stop the workspace's other links from updating.
             try:

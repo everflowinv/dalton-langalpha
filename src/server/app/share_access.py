@@ -15,6 +15,9 @@ from typing import Any
 
 from fastapi import HTTPException
 
+# DALTON-HOOK(monitors): enforce admin-only file sharing for public shared threads
+from src.dalton.access_tiers import get_user_tier as _default_get_user_tier
+from src.dalton.settings import is_dalton_supabase_auth_enabled
 from src.server.app.workspace_files._shared import work_dir_for
 from src.server.database.conversation import get_thread_by_share_token
 from src.server.database.share_codes import is_share_code
@@ -48,6 +51,47 @@ def get_permissions(thread: dict[str, Any]) -> dict[str, Any]:
     if isinstance(perms, str):
         perms = json.loads(perms)
     return perms
+
+
+get_user_tier = _default_get_user_tier
+
+
+# DALTON-HOOK(monitors): enforce admin-only file access on public shared threads
+# both at enable time and when serving legacy non-admin shared-thread file links.
+async def shared_thread_allows_files(
+    thread: dict[str, Any], workspace: dict[str, Any] | None = None
+) -> bool:
+    """Return True if a shared thread's owner currently satisfies admin-only file-share policy."""
+    from src.dalton import access_tiers as _access_tiers
+    from src.dalton import sharing as _dalton_sharing
+
+    if get_user_tier is not _default_get_user_tier:
+        tier_fn = get_user_tier
+    elif _access_tiers.get_user_tier is not _default_get_user_tier:
+        tier_fn = _access_tiers.get_user_tier
+    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
+        tier_fn = _dalton_sharing.get_user_tier
+    else:
+        tier_fn = _default_get_user_tier
+
+    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+        return True
+
+    owner_candidates: list[str] = []
+    for raw in (
+        thread.get("user_id"),
+        thread.get("owner_user_id"),
+        workspace.get("user_id") if workspace else None,
+    ):
+        val = str(raw or "").strip()
+        if val and val not in owner_candidates:
+            owner_candidates.append(val)
+    if not owner_candidates:
+        return False
+    for uid in owner_candidates:
+        if await tier_fn(uid) != "admin":
+            return False
+    return True
 
 
 def require_permission(perms: dict[str, Any], key: str) -> None:
@@ -131,6 +175,16 @@ async def resolve_shared_files(
 
     workspace_id = str(thread["workspace_id"])
     workspace, work_dir = await _serving_workspace(workspace_id)
+
+    # DALTON-HOOK(monitors): refuse historical or non-admin shared-thread workspace
+    # file access while keeping public conversation replay accessible.
+    if (require_files or require_download) and not await shared_thread_allows_files(
+        thread, workspace
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="仅管理员开启的公开对话分享允许访问工作区文件",
+        )
 
     raw_root = perms.get(SHARE_ROOT_PATH_KEY) or ""
     if not raw_root:

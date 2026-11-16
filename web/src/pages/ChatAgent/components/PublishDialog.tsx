@@ -1,6 +1,8 @@
-import { useEffect, useId, useRef, useState, type RefObject } from 'react';
+// DALTON-HOOK(monitors): integrate 4-tier monitor publishing, ACLs, and admin public confirmation
+import { useEffect, useId, useMemo, useRef, useState, type RefObject } from 'react';
 import { Check, Copy, ExternalLink, Link2, Lock } from 'lucide-react';
 import { Trans, useTranslation } from 'react-i18next';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -10,13 +12,18 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Loader } from '@/components/ui/loader';
+import { SegmentedControl, type SegmentedOption } from '@/components/ui/segmented-control';
+import { Select } from '@/components/ui/select';
 import { ToggleSwitch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from '@/components/ui/use-toast';
 import { cn } from '@/lib/utils';
 import { formatBytes, shortMonthDay } from '@/lib/format';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { queryKeys } from '@/lib/queryKeys';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import {
   useArtifactPublishing,
   useArtifactStatus,
@@ -26,12 +33,27 @@ import {
   useOwnedArtifact,
   sharedSeq,
 } from '@/hooks/useArtifact';
+// DALTON-HOOK(monitors): ConfirmDialog and Monitor API helpers for 4-tier publish
+import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
+import {
+  getMonitorByArtifact,
+  listCompanyMembers,
+  MONITOR_CATEGORIES,
+  monitorShareUrl,
+  publishMonitor,
+  updateMonitor,
+  type CompanyMemberOption,
+  type MonitorCategory,
+  type MonitorSummary,
+  type MonitorVisibility,
+} from '@/pages/Monitors/api';
+import { pageLoadsOf } from '@/lib/pageLoads';
 import { usePageScout } from './viewers/html/usePageScout';
 import type { ArtifactStatus, ArtifactVersion, ShareFileEntry } from '@/types/api';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { basename, dirname } from '../utils/fileRefResolver';
 import { shareLinkHref } from '../utils/api/shareLinks';
-import { refusalIn, usePublish, type PublishBody, type PublishRefusal } from './filePanel/usePublish';
+import { filesChangedIn, refusalIn, type PublishRefusal } from './filePanel/usePublish';
 
 /** The server takes a label of 1 to 200 characters. */
 const LABEL_MAX = 200;
@@ -325,7 +347,13 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
+  const qc = useQueryClient();
   const root = useWorkspaceFolders()?.rootDir;
+  // DALTON-HOOK(monitors): caller tier gates 4-tier visibility (external=own only, admin=public allowed)
+  const { callerTier } = useTeamCredentials();
+  const isExternal = callerTier === 'external';
+  const isAdmin = callerTier === 'admin' || !isDaltonAuth;
+
   // A file never recorded has no status to review, so this makes its private record.
   const owned = useOwnedArtifact(workspaceId, path, { root });
   const artifact = owned.record ?? null;
@@ -340,33 +368,43 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const statusQuery = useArtifactStatus(artifact, { always: true, report: true, enabled: !unshareOnly && scout.reads });
   const { unshare, keepUpdated } = useArtifactPublishing();
   const changingList = useFileLeftOutPending(artifact?.artifact_id ?? '');
-  const publish = usePublish(t('publish.failed'));
   const { copy, copiedCode } = useCopyShareLink();
 
+  // DALTON-HOOK(monitors): load existing monitor config for this artifact if already published
+  const existingMonitorQuery = useQuery<MonitorSummary | null>({
+    queryKey: queryKeys.daltonMonitors.byArtifact(artifact?.artifact_id ?? ''),
+    queryFn: () => getMonitorByArtifact(artifact!.artifact_id),
+    enabled: !unshareOnly && Boolean(artifact?.artifact_id),
+    staleTime: 10_000,
+  });
+  const existingMonitor = existingMonitorQuery.data ?? null;
+
   const [label, setLabel] = useState('');
-  // Sent with the first publish; a shared file toggles the record itself.
+  const [titleDraft, setTitleDraft] = useState<string | null>(null);
+  const [categoryDraft, setCategoryDraft] = useState<MonitorCategory | null>(null);
+  const [visibilityDraft, setVisibilityDraft] = useState<MonitorVisibility | null>(null);
+  const [membersDraft, setMembersDraft] = useState<string[] | null>(null);
   const [keepDraft, setKeepDraft] = useState<boolean | null>(null);
+  const [publicConfirmOpen, setPublicConfirmOpen] = useState(false);
+  const [publishingMonitor, setPublishingMonitor] = useState(false);
+  const [copiedPermalink, setCopiedPermalink] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
 
-  const busy = publish.pending || unshare.isPending || keepUpdated.isPending;
+  const busy = publishingMonitor || unshare.isPending || keepUpdated.isPending;
   useEffect(() => {
     busyRef.current = busy;
   }, [busy, busyRef]);
 
+  // DALTON-HOOK(monitors): track whether this artifact already has a public share or monitor record
   const shared = !!artifact?.shared;
+  const monitorPublished = !!existingMonitor;
   const status = statusQuery.data;
   scout.follow(status?.page_sha256);
   const statusRefusal = refusalIn(statusQuery.error);
-  // A cap or a missing file ends the review; a file unreadable for now is
-  // retried from the list.
-  // Said where the list would be, so not again below it.
   const statusFailure = statusRefusal?.kind === 'unavailable' ? t('publish.unavailable')
     : statusRefusal?.kind === 'needsComputer' ? t('publish.needsComputer') : null;
   const blocking = statusFailure ? null : statusRefusal;
-  // The page could not run to say what it loads: said and retried as a list
-  // unreadable for now is.
   const listFailure = statusFailure ?? (scout.failed ? t('publish.unavailable') : null);
-  // Past a cap the list still comes, for the owner to leave out what puts it over.
   const overCap = status?.over_cap ?? null;
   const refusal = blocking
     ?? (overCap ? { kind: 'cap' as const, cap: overCap } : null)
@@ -377,46 +415,114 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const drift = shared ? status?.drift ?? null : null;
   const added = new Set(drift?.added ?? []);
   const rootRefs = status?.root_refs ?? [];
-  const hasDrift = !!drift && drift.added.length + drift.removed.length + drift.changed.length > 0;
-  // An Update of an unchanged file cuts nothing, so it waits for a change.
-  const upToDate = shared && status?.changed === false && !hasDrift;
-  // Publishing sends the list on screen, so it waits for one that is current.
-  const listReady = !!status && !overCap && !statusQuery.isFetching && !statusQuery.isError && !scout.holding && !changingList;
-  // DALTON-HOOK(external-share-guard): no publishing in the stop-only mode
-  const canPublish = !unshareOnly && !!artifact && listReady && files.length > 0 && !busy && !upToDate;
-  const keepOn = shared ? !!artifact?.keep_updated : keepDraft ?? !!artifact?.keep_updated;
-  const recordFailed = !!owned.error;
-  const href = artifact ? shareLinkHref(artifact.code) : '';
-  const copied = !!artifact && copiedCode === artifact.code;
+
   const name = artifact?.name ?? basename(path);
+  const effectiveTitle = titleDraft ?? existingMonitor?.title ?? name.replace(/\.html?$/i, '');
+  const effectiveCategory: MonitorCategory = categoryDraft ?? existingMonitor?.category ?? 'other';
+  const rawVisibility: MonitorVisibility = visibilityDraft ?? existingMonitor?.visibility ?? 'own';
+  const effectiveVisibility: MonitorVisibility = isExternal
+    ? 'own'
+    : !isAdmin && rawVisibility === 'public'
+      ? 'company'
+      : rawVisibility;
+  const effectiveMembers = membersDraft ?? existingMonitor?.member_user_ids ?? [];
+  const keepOn = keepDraft ?? existingMonitor?.keep_updated ?? !!artifact?.keep_updated;
+
+  const companyMembersQuery = useQuery<CompanyMemberOption[]>({
+    queryKey: queryKeys.daltonMonitors.companyMembers(),
+    queryFn: listCompanyMembers,
+    enabled: !unshareOnly && !isExternal && effectiveVisibility === 'members',
+    staleTime: 60_000,
+  });
+
+  const visibilityOptions = useMemo<SegmentedOption<MonitorVisibility>[]>(() => {
+    if (isExternal) {
+      return [{ value: 'own', label: t('monitors.visibility.own') }];
+    }
+    const base: SegmentedOption<MonitorVisibility>[] = [
+      { value: 'own', label: t('monitors.visibility.own') },
+      { value: 'members', label: t('monitors.visibility.members') },
+      { value: 'company', label: t('monitors.visibility.company') },
+    ];
+    if (isAdmin) {
+      base.push({ value: 'public', label: t('monitors.visibility.public') });
+    }
+    return base;
+  }, [isExternal, isAdmin, t]);
+
+  const membersInvalid = effectiveVisibility === 'members' && effectiveMembers.length === 0;
+  const listReady = !!status && !overCap && !statusQuery.isFetching && !statusQuery.isError && !scout.holding && !changingList;
+  const canPublish = !unshareOnly && !!artifact && listReady && files.length > 0 && !busy && !membersInvalid;
+  const recordFailed = !!owned.error;
+  const href = existingMonitor
+    ? monitorShareUrl(existingMonitor.slug, existingMonitor.visibility)
+    : artifact
+      ? shareLinkHref(artifact.code)
+      : '';
+  const copied = existingMonitor ? copiedPermalink : (!!artifact && copiedCode === artifact.code);
 
   const failed = (err: unknown, description: string) => {
     console.error('[PublishDialog] Request failed:', err);
     toast({ description, variant: 'destructive' });
   };
 
-  const send = async () => {
+  // DALTON-HOOK(monitors): submit through /api/v1/dalton/monitors instead of bare /artifacts/{id}/publish
+  const executeMonitorPublish = async () => {
     if (!artifact || !canPublish) return;
-    // With the code it was read under: the server refuses the publish once
-    // the agent has changed it, and the review loads the page again.
-    const body: PublishBody = {
-      files: files.map((f) => f.path),
-      label: label.trim() || null,
-      page_sha256: status?.page_sha256 ?? undefined,
-    };
-    if (!shared) body.keep_updated = keepOn;
+    const loads = pageLoadsOf(artifact.workspace_id, artifact.path);
     const statusAt = statusQuery.dataUpdatedAt;
     setOutcome(null);
-    const result = await publish.send(artifact, body);
-    if (result.kind === 'published') {
+    setPublishingMonitor(true);
+    try {
+      const result = await publishMonitor({
+        workspace_id: workspaceId,
+        path: artifact.path,
+        title: effectiveTitle.trim() || name,
+        category: effectiveCategory,
+        visibility: effectiveVisibility,
+        member_user_ids: effectiveVisibility === 'members' ? effectiveMembers : [],
+        keep_updated: keepOn,
+        label: label.trim() || null,
+        files: files.map((f) => f.path),
+        loaded: loads.now,
+        earlier: loads.earlier,
+        page_sha256: status?.page_sha256 ?? undefined,
+      });
       setLabel('');
-      setKeepDraft(null);
-      if (!result.cut) setOutcome({ kind: 'unchanged', seq: result.version.seq });
-    } else if (result.kind === 'filesChanged') {
-      setOutcome({ kind: 'conflict', files: result.files, statusAt });
-    } else if (result.kind === 'refused') {
-      setOutcome({ kind: 'refused', refusal: result.refusal });
+      qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), result.monitor);
+      void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
+      void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
+      if (result.cut === false) {
+        setOutcome({ kind: 'unchanged', seq: result.monitor.published_seq });
+      } else {
+        toast({ description: t('monitors.dialog.publishedToast') });
+      }
+    } catch (err) {
+      const changed = filesChangedIn(err);
+      if (changed) {
+        setOutcome({ kind: 'conflict', files: changed, statusAt });
+        return;
+      }
+      const ref = refusalIn(err);
+      if (ref) {
+        setOutcome({ kind: 'refused', refusal: ref });
+        return;
+      }
+      failed(err, t('publish.failed'));
+    } finally {
+      setPublishingMonitor(false);
     }
+  };
+
+  // DALTON-HOOK(monitors): route publish through executeMonitorPublish with public confirmation,
+  // sync monitor keep_updated, and copy monitor permalink when already published.
+  const send = () => {
+    if (!artifact || !canPublish) return;
+    if (effectiveVisibility === 'public') {
+      setPublicConfirmOpen(true);
+      return;
+    }
+    void executeMonitorPublish();
   };
 
   const stop = () => {
@@ -427,42 +533,64 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 
   const toggleKeep = () => {
     if (!artifact || busy) return;
-    if (!shared) {
-      setKeepDraft(!keepOn);
-      return;
+    const next = !keepOn;
+    setKeepDraft(next);
+    if (existingMonitor) {
+      void updateMonitor(existingMonitor.slug, { keep_updated: next })
+        .then((res) => {
+          qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), res.monitor);
+          void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
+        })
+        .catch((err) => failed(err, t('publish.changeFailed')));
     }
-    keepUpdated.mutate(
-      { artifactId: artifact.artifact_id, on: !keepOn },
-      { onError: (err) => failed(err, t('publish.changeFailed')) },
-    );
+  };
+
+  const toggleMember = (memberId: string) => {
+    const next = effectiveMembers.includes(memberId)
+      ? effectiveMembers.filter((id) => id !== memberId)
+      : [...effectiveMembers, memberId];
+    setMembersDraft(next);
   };
 
   const close = () => {
     if (!busy) onClose();
   };
 
-  // A link shared before versions whose files were past the caps: visitors
-  // get nothing until a publish, which clears it.
+  const copyCurrentLink = () => {
+    if (existingMonitor) {
+      void navigator.clipboard.writeText(monitorShareUrl(existingMonitor.slug, existingMonitor.visibility)).then(() => {
+        setCopiedPermalink(true);
+        window.setTimeout(() => setCopiedPermalink(false), 2000);
+      });
+      return;
+    }
+    if (artifact) void copy(artifact.code);
+  };
+
+  // DALTON-HOOK(monitors): summarize monitor publication state or legacy artifact state
   const legacyRefused = shared && !!artifact?.legacy_refused;
   let stateHint: string;
-  if (!shared) stateHint = latestSeq > 0 ? t('publish.privateWithVersions') : t('publish.privateHint');
-  else if (legacyRefused) stateHint = t('publish.legacyRefused');
-  else if (visitorsAt === 0 || status?.changed == null) stateHint = t('publish.sharedHint');
-  else if (upToDate) stateHint = t('publish.upToDate', { seq: visitorsAt });
-  else stateHint = t('publish.changedSince', { seq: visitorsAt });
+  if (existingMonitor) {
+    stateHint = t('publish.publishedAt', { seq: existingMonitor.published_seq || latestSeq });
+  } else if (!shared) {
+    stateHint = latestSeq > 0 ? t('publish.privateWithVersions') : t('publish.privateHint');
+  } else if (legacyRefused) {
+    stateHint = t('publish.legacyRefused');
+  } else if (visitorsAt === 0 || status?.changed == null) {
+    stateHint = t('publish.sharedHint');
+  } else {
+    stateHint = t('publish.changedSince', { seq: visitorsAt });
+  }
 
-  const listHeading = !shared
+  const listHeading = !monitorPublished && !shared
     ? t('publish.filesPublish', { count: files.length })
-    : upToDate
-      ? t('publish.filesShared', { count: files.length })
-      : t('publish.filesUpdate', { count: files.length });
+    : t('publish.filesUpdate', { count: files.length });
 
   let refusalText: string | null = null;
   if (refusal?.kind === 'cap') {
     refusalText = refusal.cap.code === 'too_many_bytes'
       ? t('publish.tooManyBytes', { size: formatBytes(refusal.cap.limit, locale) })
       : t('publish.tooManyFiles', { limit: refusal.cap.limit });
-    // Said only where a box can bring it back under.
     if (overCap && files.some((f) => f.optional)) refusalText += ` ${t('publish.overCapLeaveOut')}`;
   } else if (refusal?.kind === 'missing') {
     refusalText = t('publish.missing');
@@ -475,8 +603,6 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   return (
     <>
       {scout.element}
-      {/* The ellipsis is the words' own, so Terminal's brackets (data-bracket,
-          on the title) both stay in view around a long name. */}
       <DialogTitle className="flex min-w-0 text-base font-semibold pr-6" style={{ color: 'var(--color-text-primary)' }} title={name}>
         <span className="truncate">{t('publish.title', { file: name })}</span>
       </DialogTitle>
@@ -504,7 +630,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               variant="outline"
               size="sm"
               className="gap-1.5 text-xs"
-              onClick={() => { if (artifact) void copy(artifact.code); }}
+              onClick={copyCurrentLink}
               disabled={!artifact}
             >
               {copied
@@ -515,26 +641,139 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           )}
         </div>
 
+        {/* DALTON-HOOK(monitors): monitor title, category, and 4-tier visibility controls */}
+        {!unshareOnly && (
+          <div className="flex flex-col gap-3 rounded-lg border p-3" style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-bg-card)' }}>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                  {t('monitors.dialog.titleField')}
+                </span>
+                <Input
+                  value={effectiveTitle}
+                  onChange={(e) => setTitleDraft(e.target.value)}
+                  placeholder={t('monitors.dialog.titlePlaceholder')}
+                  maxLength={300}
+                  disabled={busy}
+                  className="h-8 sm:text-xs bg-(--color-bg-input) border-(--color-border-muted) text-(--color-text-primary)"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                  {t('monitors.dialog.categoryField')}
+                </span>
+                <Select
+                  value={effectiveCategory}
+                  onChange={(e) => setCategoryDraft(e.target.value as MonitorCategory)}
+                  disabled={busy}
+                  style={{ height: '32px', fontSize: '0.75rem' }}
+                >
+                  {MONITOR_CATEGORIES.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {t(`monitors.categories.${cat}`)}
+                    </option>
+                  ))}
+                </Select>
+              </label>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                {t('monitors.dialog.visibilityField')}
+              </span>
+              <SegmentedControl
+                value={effectiveVisibility}
+                onChange={(val) => setVisibilityDraft(val)}
+                options={visibilityOptions}
+                label={t('monitors.dialog.visibilityField')}
+                disabled={busy}
+                size="compact"
+              />
+              {isExternal && (
+                <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
+                  {t('monitors.dialog.externalOwnOnlyHint')}
+                </p>
+              )}
+              {!isExternal && !isAdmin && existingMonitor?.visibility === 'public' && (
+                <p className="text-[0.6875rem]" role="note" style={{ color: 'var(--color-warning)' }}>
+                  {t('monitors.dialog.nonAdminPublicDowngradeHint')}
+                </p>
+              )}
+            </div>
+
+            {!isExternal && effectiveVisibility === 'members' && (
+              <div className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                  {t('monitors.dialog.membersField')}
+                </span>
+                {companyMembersQuery.isLoading ? (
+                  <div className="flex items-center gap-2 py-2 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    <Loader size={14} />
+                    {t('monitors.dialog.membersLoading')}
+                  </div>
+                ) : (companyMembersQuery.data ?? []).length === 0 ? (
+                  <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('monitors.dialog.membersEmpty')}
+                  </p>
+                ) : (
+                  <div
+                    className="max-h-32 overflow-y-auto rounded-md border divide-y"
+                    style={{ borderColor: 'var(--color-border-muted)' }}
+                  >
+                    {(companyMembersQuery.data ?? []).map((member) => {
+                      const selected = effectiveMembers.includes(member.user_id);
+                      const labelText = member.name
+                        ? `${member.name} (${member.email || member.user_id})`
+                        : member.email || member.user_id;
+                      return (
+                        <button
+                          key={member.user_id}
+                          type="button"
+                          onClick={() => toggleMember(member.user_id)}
+                          aria-pressed={selected}
+                          className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-(--color-bg-hover)"
+                          style={{ color: 'var(--color-text-primary)' }}
+                        >
+                          <span className="truncate">{labelText}</span>
+                          {selected && <Check className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-success)' }} />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {membersInvalid && (
+                  <p className="text-[0.6875rem]" style={{ color: 'var(--color-warning)' }}>
+                    {t('monitors.dialog.membersRequired')}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Where it stands, and keep updated */}
         <div
           className="flex flex-col rounded-lg border divide-y"
           style={{ borderColor: 'var(--color-border-muted)', backgroundColor: 'var(--color-bg-card)' }}
         >
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
+            {/* DALTON-HOOK(monitors): show monitor visibility badge or unshare control for legacy public links */}
             <div className="flex items-center gap-2 min-w-0">
-              {shared
+              {shared || monitorPublished
                 ? <Link2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
                 : <Lock className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />}
               <div className="flex flex-col min-w-0">
                 <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {!shared
-                    ? t('publish.private')
-                    : visitorsAt > 0 ? t('publish.publishedAt', { seq: visitorsAt }) : t('publish.published')}
+                  {monitorPublished
+                    ? t(`monitors.visibility.${existingMonitor.visibility}`)
+                    : !shared
+                      ? t('publish.private')
+                      : visitorsAt > 0 ? t('publish.publishedAt', { seq: visitorsAt }) : t('publish.published')}
                 </span>
                 <span className="text-xs" style={{ color: legacyRefused ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}>{stateHint}</span>
               </div>
             </div>
-            {shared && (
+            {shared && (unshareOnly || !existingMonitor) && (
               <Button
                 variant="outline"
                 size="sm"
@@ -555,10 +794,10 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           >
             <div className="flex flex-col min-w-0">
               <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
-                {t('publish.keepUpdated')}
+                {t('monitors.dialog.keepUpdated')}
               </span>
               <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                {t('publish.keepUpdatedHint')}
+                {t('monitors.dialog.keepUpdatedHint')}
               </span>
             </div>
             {keepUpdated.isPending
@@ -568,14 +807,12 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                   checked={keepOn}
                   onChange={toggleKeep}
                   disabled={!artifact || busy}
-                  ariaLabel={t('publish.keepUpdated')}
+                  ariaLabel={t('monitors.dialog.keepUpdated')}
                 />
               )}
           </div>
           )}
         </div>
-        {/* DALTON-HOOK(external-share-guard): the keep-updated row above is
-            the owner's; the stop-only view ends the card here */}
 
         {/* DALTON-HOOK(external-share-guard): versions are the owner's review */}
         {!unshareOnly && latestSeq > 0 && <VersionList artifactId={artifact?.artifact_id} />}
@@ -614,9 +851,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           </p>
         )}
 
-        {/* A refusal has no list to show, nor does a record that failed to load.
-            DALTON-HOOK(external-share-guard): nor does the unshare-only view,
-            which reviews nothing. */}
+        {/* DALTON-HOOK(monitors): submit monitor review list and version note via send() */}
         {!unshareOnly && !recordFailed && !blocking && (
           <ReviewList
             artifactId={artifact?.artifact_id ?? ''}
@@ -632,8 +867,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           />
         )}
 
-        {/* The version's note — DALTON-HOOK(external-share-guard): none to
-            write when only stopping a link */}
+        {/* DALTON-HOOK(monitors): disabled state syncs with publishingMonitor and send() handles Enter submit */}
         {!unshareOnly && (
         <label className="flex flex-col gap-1.5">
           <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
@@ -645,12 +879,12 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                void send();
+                send();
               }
             }}
             maxLength={LABEL_MAX}
             placeholder={t('publish.labelPlaceholder')}
-            disabled={busy || upToDate || !artifact}
+            disabled={busy || !artifact}
             className="h-8 sm:text-xs bg-(--color-bg-input) border-(--color-border-muted) text-(--color-text-primary)"
           />
         </label>
@@ -658,16 +892,16 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 
         {/* Footer */}
         <div className="flex items-center justify-between gap-3 pt-1">
-          {shared ? (
+          {existingMonitor ? (
             <a
-              href={`${href}?as=visitor`}
+              href={monitorShareUrl(existingMonitor.slug, existingMonitor.visibility)}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 text-xs hover:underline"
               style={{ color: 'var(--color-text-secondary)' }}
             >
               <ExternalLink className="h-3.5 w-3.5" />
-              {t('publish.viewAsVisitor')}
+              {t('monitors.openInNewWindow')}
             </a>
           ) : <span />}
           <div className="flex items-center gap-2">
@@ -676,14 +910,24 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             </Button>
             {/* DALTON-HOOK(external-share-guard): no publish button here */}
             {!unshareOnly && (
-            <Button size="sm" className="gap-1.5" onClick={() => void send()} disabled={!canPublish}>
-              {publish.pending && <Loader size={14} style={{ color: 'inherit' }} />}
-              {shared ? t('publish.update') : t('publish.publish')}
+            <Button size="sm" className="gap-1.5" onClick={send} disabled={!canPublish}>
+              {publishingMonitor && <Loader size={14} style={{ color: 'inherit' }} />}
+              {monitorPublished ? t('publish.update') : t('publish.publish')}
             </Button>
             )}
           </div>
         </div>
       </div>
+
+      {/* DALTON-HOOK(monitors): confirm dialog for public monitor link exposure */}
+      <ConfirmDialog
+        open={publicConfirmOpen}
+        onOpenChange={setPublicConfirmOpen}
+        title={t('monitors.dialog.publicConfirmTitle')}
+        message={t('monitors.dialog.publicConfirmMessage')}
+        confirmLabel={t('monitors.dialog.publicConfirmButton')}
+        onConfirm={executeMonitorPublish}
+      />
     </>
   );
 }
