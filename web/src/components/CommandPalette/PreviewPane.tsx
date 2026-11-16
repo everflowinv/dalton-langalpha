@@ -39,10 +39,29 @@ export function PreviewPane({ target, words }: PaneProps) {
     <aside className="command-palette-pane" aria-hidden>
       {target?.kind === 'ticker' ? (
         <TickerPreview symbol={target.symbol} />
+      ) : target?.kind === 'document' ? (
+        // DALTON-HOOK(global-search): render matched snippet preview for memos and workspace file content
+        <DocumentPreview target={target} />
       ) : target ? (
         <ConversationPreview target={target} words={words} />
       ) : null}
     </aside>
+  );
+}
+
+function DocumentPreview({ target }: { target: Extract<PreviewTarget, { kind: 'document' }> }) {
+  return (
+    <div className="command-palette-pane-scroll">
+      <div className="command-palette-pane-head">
+        <div className="command-palette-pane-title">{target.title}</div>
+        {target.meta && <div className="command-palette-pane-meta">{target.meta}</div>}
+      </div>
+      <section className="command-palette-pane-turn">
+        <p className="command-palette-pane-plain">
+          <Highlighted text={target.snippet} spans={target.spans} />
+        </p>
+      </section>
+    </div>
   );
 }
 
@@ -69,7 +88,8 @@ function PlainBody(props: TurnBodyProps) {
   );
 }
 
-function ConversationPreview({ target, words }: { target: Exclude<PreviewTarget, { kind: 'ticker' }>; words: readonly string[] }) {
+// DALTON-HOOK(global-search): exclude document preview targets from ConversationPreview
+function ConversationPreview({ target, words }: { target: Exclude<PreviewTarget, { kind: 'ticker' | 'document' }>; words: readonly string[] }) {
   const { t } = useTranslation();
   const names = useNames();
   // State, not a ref: on the commit that mounts the scroller the bodies'

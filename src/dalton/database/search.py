@@ -9,16 +9,22 @@ Colleague-shared workspaces are intentionally excluded.
 from __future__ import annotations
 
 import json
+import logging
 import posixpath
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import psycopg.errors
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
 
+logger = logging.getLogger(__name__)
+
 STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '5s'"
+CONTENT_STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '15s'"
 MEMO_INDEX_KEY = "memo.md"
 MEMO_USER_PATH_PREFIX = ".agents/user/memo"
 TRANSCRIPT_BATCH_SIZE = 200
@@ -167,14 +173,26 @@ def extract_transcript_turn_hit(
     return matched_text, turn_ts
 
 
+def parse_optional_uuid(value: str | None) -> str | None:
+    """Validate and canonicalize an optional UUID string before hitting Postgres."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return str(uuid.UUID(stripped))
+
+
 async def _run_timed_query(
     db_conn: Any,
     sql: str,
     params: tuple[Any, ...],
+    *,
+    timeout_sql: str = STATEMENT_TIMEOUT_SQL,
 ) -> list[dict[str, Any]]:
     async with db_conn.transaction():
         async with db_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(STATEMENT_TIMEOUT_SQL)
+            await cur.execute(timeout_sql)
             await cur.execute(sql, params)
             rows = await cur.fetchall()
             return [dict(r) for r in (rows or []) if isinstance(r, dict)]
@@ -274,14 +292,27 @@ _SQL_SEARCH_MEMOS = """
     LIMIT %s
 """
 
-_SQL_SEARCH_WORKSPACE_FILES = """
+def _build_workspace_files_sql(*, has_workspace_id: bool, include_content: bool) -> str:
+    """Build the single parameterized workspace_files query without touching content_text when unneeded."""
+    content_select = (
+        "f.content_text AS content_text,"
+        if include_content
+        else "NULL::text AS content_text,"
+    )
+    workspace_clause = "      AND f.workspace_id = %s::uuid\n" if has_workspace_id else ""
+    content_clause = (
+        "          OR (f.content_text IS NOT NULL AND f.content_text ILIKE %s ESCAPE '\\')\n"
+        if include_content
+        else ""
+    )
+    return f"""
     SELECT
         f.workspace_file_id::text AS file_id,
         f.workspace_id::text AS workspace_id,
         w.name AS workspace_name,
         f.file_path AS file_path,
         f.file_name AS file_name,
-        f.content_text AS content_text,
+        {content_select}
         f.sandbox_modified_at AS sandbox_modified_at,
         f.updated_at AS updated_at
     FROM workspace_files f
@@ -290,11 +321,10 @@ _SQL_SEARCH_WORKSPACE_FILES = """
     WHERE w.user_id = %s
       AND w.status != 'deleted'
       AND f.kind = 'file'
-      AND (
+{workspace_clause}      AND (
           f.file_name ILIKE %s ESCAPE '\\'
           OR f.file_path ILIKE %s ESCAPE '\\'
-          OR (f.content_text IS NOT NULL AND f.content_text ILIKE %s ESCAPE '\\')
-      )
+{content_clause}      )
     ORDER BY COALESCE(f.sandbox_modified_at, f.updated_at) DESC NULLS LAST
     LIMIT %s
 """
@@ -488,11 +518,43 @@ async def search_conversations(
     return [entry[5] for entry in sorted_entries[:clamped_limit]]
 
 
+async def _search_workspace_files_rows(
+    db_conn: Any,
+    user_id: str,
+    like_pattern: str,
+    clamped_limit: int,
+    *,
+    norm_workspace_id: str | None,
+    include_content: bool,
+) -> list[dict[str, Any]]:
+    sql = _build_workspace_files_sql(
+        has_workspace_id=norm_workspace_id is not None,
+        include_content=include_content,
+    )
+    params_list: list[Any] = [user_id]
+    if norm_workspace_id is not None:
+        params_list.append(norm_workspace_id)
+    params_list.extend([like_pattern, like_pattern])
+    if include_content:
+        params_list.append(like_pattern)
+    params_list.append(clamped_limit)
+    timeout_sql = CONTENT_STATEMENT_TIMEOUT_SQL if include_content else STATEMENT_TIMEOUT_SQL
+    return await _run_timed_query(
+        db_conn,
+        sql,
+        tuple(params_list),
+        timeout_sql=timeout_sql,
+    )
+
+
 async def search_documents(
     user_id: str,
     query: str,
     limit: int = 20,
     *,
+    workspace_id: str | None = None,
+    include_content: bool = True,
+    content_timed_out_out: list[bool] | None = None,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
     """Search personal memos (``<user_id>.memos``) and owned ``workspace_files``."""
@@ -500,6 +562,13 @@ async def search_documents(
     if len(norm_q) < 2:
         return []
     clamped_limit = max(1, min(int(limit), 50))
+    invalid_workspace_id = False
+    norm_workspace_id: str | None = None
+    try:
+        norm_workspace_id = parse_optional_uuid(workspace_id)
+    except ValueError:
+        invalid_workspace_id = True
+
     like_pattern = f"%{escape_like(norm_q)}%"
     memo_prefix = f"{user_id}.memos"
 
@@ -509,11 +578,41 @@ async def search_documents(
             _SQL_SEARCH_MEMOS,
             (memo_prefix, MEMO_INDEX_KEY, like_pattern, like_pattern, like_pattern, clamped_limit),
         )
-        file_rows = await _run_timed_query(
-            db_conn,
-            _SQL_SEARCH_WORKSPACE_FILES,
-            (user_id, like_pattern, like_pattern, like_pattern, clamped_limit),
-        )
+        if invalid_workspace_id:
+            file_rows: list[dict[str, Any]] = []
+        elif include_content:
+            try:
+                file_rows = await _search_workspace_files_rows(
+                    db_conn,
+                    user_id,
+                    like_pattern,
+                    clamped_limit,
+                    norm_workspace_id=norm_workspace_id,
+                    include_content=True,
+                )
+            except psycopg.errors.QueryCanceled:
+                logger.warning(
+                    "Workspace file content search timed out (15s); falling back to filename/path matches",
+                )
+                if content_timed_out_out is not None:
+                    content_timed_out_out.append(True)
+                file_rows = await _search_workspace_files_rows(
+                    db_conn,
+                    user_id,
+                    like_pattern,
+                    clamped_limit,
+                    norm_workspace_id=norm_workspace_id,
+                    include_content=False,
+                )
+        else:
+            file_rows = await _search_workspace_files_rows(
+                db_conn,
+                user_id,
+                like_pattern,
+                clamped_limit,
+                norm_workspace_id=norm_workspace_id,
+                include_content=False,
+            )
 
     results: list[tuple[float, dict[str, Any]]] = []
 
@@ -583,14 +682,16 @@ async def search_documents(
             continue
         if "kind" in row and row["kind"] != "file":
             continue
-        workspace_id = str(row.get("workspace_id") or "")
+        row_workspace_id = str(row.get("workspace_id") or "")
+        if norm_workspace_id is not None and row_workspace_id != norm_workspace_id:
+            continue
         workspace_name = str(row.get("workspace_name") or "")
         file_path = str(row.get("file_path") or "")
         file_name = str(row.get("file_name") or posixpath.basename(file_path))
         content_text = row.get("content_text")
 
         candidates: list[str] = []
-        if isinstance(content_text, str) and content_text:
+        if include_content and isinstance(content_text, str) and content_text:
             candidates.append(content_text)
         if file_path:
             candidates.append(file_path)
@@ -616,7 +717,7 @@ async def search_documents(
                 {
                     "kind": "workspace_file",
                     "memo_key": None,
-                    "workspace_id": workspace_id,
+                    "workspace_id": row_workspace_id,
                     "path": file_path,
                     "title": file_name or file_path,
                     "workspace_name": workspace_name,
@@ -636,16 +737,35 @@ async def global_search(
     query: str,
     limit: int = 20,
     *,
+    include_conversations: bool = True,
+    workspace_id: str | None = None,
+    include_content: bool = True,
     conn: Any = None,
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, Any]:
     """Run keyword global search across owned conversations and documents."""
     norm_q = (query or "").strip()
     if len(norm_q) < 2:
         raise ValueError("Search query must be at least 2 characters after trimming whitespace.")
     clamped_limit = max(1, min(int(limit), 50))
-    conversations = await search_conversations(user_id, norm_q, limit=clamped_limit, conn=conn)
-    documents = await search_documents(user_id, norm_q, limit=clamped_limit, conn=conn)
-    return {
+    conversations = (
+        await search_conversations(user_id, norm_q, limit=clamped_limit, conn=conn)
+        if include_conversations
+        else []
+    )
+    content_timed_out_flags: list[bool] = []
+    documents = await search_documents(
+        user_id,
+        norm_q,
+        limit=clamped_limit,
+        workspace_id=workspace_id,
+        include_content=include_content,
+        content_timed_out_out=content_timed_out_flags,
+        conn=conn,
+    )
+    payload: dict[str, Any] = {
         "conversations": conversations,
         "documents": documents,
     }
+    if content_timed_out_flags:
+        payload["content_timed_out"] = True
+    return payload

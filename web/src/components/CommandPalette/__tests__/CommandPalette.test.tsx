@@ -1,12 +1,15 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { queryOptions } from '@tanstack/react-query';
 import { useLocation } from 'react-router';
 import { renderWithProviders } from '@/test/utils';
 import { CreateWorkspaceHost } from '@/components/CreateWorkspaceHost';
 import { clientOs } from '@/lib/clientOs';
 import { searchConversations } from '@/api/search';
+// DALTON-HOOK(global-search): test Dalton document search integration inside CommandPalette
+import { fetchGlobalSearch, type GlobalSearchOptions, type GlobalSearchResponse } from '@/lib/dalton/searchApi';
 import { getRecentThreads } from '@/pages/ChatAgent/utils/api';
+import { MEMO_USER_DIR } from '@/pages/ChatAgent/utils/agentPaths.generated';
 import { CommandPaletteProvider, useCommandPalette } from '../CommandPaletteProvider';
 
 // The palette's sources answer with nothing, and at once: these tests are
@@ -24,6 +27,14 @@ vi.mock('@/api/search', () => ({
     throw new Error('no preview here');
   }),
 }));
+// DALTON-HOOK(global-search): stub Dalton search endpoint and home workspace helpers
+const resolveChatWorkspaceMock = vi.fn(async () => 'home');
+let mockHomeWorkspaceId: string | undefined = 'home';
+vi.mock('@/lib/dalton/searchApi', () => ({
+  fetchGlobalSearch: vi.fn<
+    (q: string, limit?: number, signal?: AbortSignal, options?: GlobalSearchOptions) => Promise<GlobalSearchResponse>
+  >(async () => ({ conversations: [], documents: [] })),
+}));
 vi.mock('@/hooks/useAllWorkspaces', () => ({
   useAllWorkspaces: () => ({ data: { workspaces: [{ workspace_id: 'ws1', name: 'Semis', status: 'running', is_home: false }] } }),
 }));
@@ -31,6 +42,8 @@ vi.mock('@/hooks/useSkills', () => ({ useSkills: () => ({ data: [] }) }));
 vi.mock('@/hooks/useHomeWorkspace', () => ({
   homeWorkspaceQuery: () =>
     queryOptions({ queryKey: ['workspaces', 'home'], queryFn: async () => ({ workspace_id: 'home', is_home: true, name: 'Home' }) }),
+  useHomeWorkspaceId: () => mockHomeWorkspaceId,
+  resolveChatWorkspace: (...args: unknown[]) => resolveChatWorkspaceMock(...(args as [])),
 }));
 vi.mock('@/hooks/useSymbolSearch', () => ({ useSymbolSearch: () => ({ hits: [], loading: false }) }));
 vi.mock('@/lib/quotes', async (importOriginal) => ({
@@ -80,9 +93,8 @@ function renderShell() {
 }
 const path = () => screen.getByLabelText('Path').textContent;
 
-// DALTON-HOOK(global-search): CommandPalette opens on ⌘⇧K / Ctrl+Shift+K.
 const shortcut = () =>
-  fireEvent.keyDown(document.activeElement ?? window, { key: 'k', shiftKey: true, ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }) });
+  fireEvent.keyDown(document.activeElement ?? window, { key: 'k', ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }) });
 /** A key pressed wherever focus is, as the browser would send it. */
 const press = (key: string) => fireEvent.keyDown(document.activeElement ?? window, { key });
 const field = () => screen.findByRole('combobox');
@@ -452,5 +464,647 @@ describe('Enter while the server answers', () => {
     fireEvent.change(input, { target: { value: 'zebra' } });
     await screen.findByRole('option', { name: /Zebra stripes/ });
     expect(screen.getByText("Couldn't search your files right now.")).toBeInTheDocument();
+  });
+});
+
+// DALTON-HOOK(global-search): Dalton memo and workspace file-content search tests inside CommandPalette
+describe('Dalton memo and file-content search in CommandPalette', () => {
+  function RouteStateSpy() {
+    const loc = useLocation();
+    return (
+      <>
+        <output aria-label="Path">{loc.pathname}</output>
+        <output aria-label="RouteState">{JSON.stringify(loc.state ?? null)}</output>
+      </>
+    );
+  }
+
+  function renderDocShell() {
+    return renderWithProviders(
+      <CreateWorkspaceHost>
+        <CommandPaletteProvider>
+          <textarea aria-label="Composer" />
+          <RouteStateSpy />
+        </CommandPaletteProvider>
+      </CreateWorkspaceHost>,
+    );
+  }
+
+  beforeEach(() => {
+    mockHomeWorkspaceId = 'home';
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({ conversations: [], documents: [] });
+  });
+
+  it('uses includeContent=false in root view, shows Memos and Search file content row, and enters File content with includeContent=true + deduplication', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [
+        { workspace_id: 'ws1', workspace_name: 'Semis', path: 'reports/dup.md', name: 'dup.md', size: 100, modified_at: '2026-11-08T00:00:00Z', match: [[8, 11]] },
+      ],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({
+      conversations: [],
+      documents: [
+        {
+          kind: 'memo',
+          memo_key: 'wafer-thesis.md',
+          workspace_id: null,
+          path: `${MEMO_USER_DIR}/wafer-thesis.md`,
+          title: 'Wafer Thesis Memo',
+          workspace_name: '',
+          timestamp: '2026-11-08T00:00:00Z',
+          snippet: 'TSMC wafer margin expanded',
+          highlights: [[11, 17]],
+        },
+        {
+          kind: 'workspace_file',
+          memo_key: null,
+          workspace_id: 'ws1',
+          path: 'reports/dup.md',
+          title: 'dup.md',
+          workspace_name: 'Semis',
+          timestamp: '2026-11-08T00:00:00Z',
+          snippet: 'Duplicate path margin note',
+          highlights: [[15, 21]],
+        },
+        {
+          kind: 'workspace_file',
+          memo_key: null,
+          workspace_id: 'ws1',
+          path: 'notes/body_hit.md',
+          title: 'body_hit.md',
+          workspace_name: 'Semis',
+          timestamp: '2026-11-08T00:00:00Z',
+          snippet: 'Matched margin inside body',
+          highlights: [[8, 14]],
+        },
+      ],
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    fireEvent.change(input, { target: { value: 'margin' } });
+
+    await screen.findByText('Wafer Thesis Memo');
+    expect(fetchGlobalSearch).toHaveBeenCalledWith('margin', 20, expect.anything(), {
+      includeConversations: false,
+      workspaceId: undefined,
+      includeContent: false,
+    });
+    expect(fetchGlobalSearch).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ includeContent: true }),
+    );
+
+    const groups = Array.from(document.querySelectorAll('.command-palette-group')).map((el) => el.textContent);
+    expect(groups.slice(0, 3)).toEqual(['Files', 'Memos', 'File content']);
+
+    // Root view shows Search file content trigger row instead of body hits
+    const triggerOpt = screen.getByRole('option', { name: 'Search file content for “margin”' });
+    expect(screen.queryByText('body_hit.md')).not.toBeInTheDocument();
+
+    // Selecting trigger row enters File content view and requests includeContent=true
+    fireEvent.click(triggerOpt);
+    await screen.findByRole('option', { name: /body_hit\.md/ });
+    expect(screen.getByRole('listbox')).toHaveAccessibleName('File content');
+    expect(fetchGlobalSearch).toHaveBeenLastCalledWith('margin', 20, expect.anything(), {
+      includeConversations: false,
+      workspaceId: undefined,
+      includeContent: true,
+    });
+
+    // `/` view deduplicates upstream dup.md from File content while keeping body_hit.md
+    fireEvent.keyDown(input, { key: 'Escape' });
+    fireEvent.change(input, { target: { value: '/' } });
+    fireEvent.change(input, { target: { value: 'margin' } });
+    await screen.findByRole('option', { name: /body_hit\.md/ });
+    const filesGroup = await screen.findByRole('group', { name: 'Files' });
+    await within(filesGroup).findByRole('option', { name: /dup\.md/ });
+    expect(screen.queryByText('Duplicate path margin note')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('option', { name: /dup\.md/ })).toHaveLength(1);
+    const marks = Array.from(document.querySelectorAll('.command-palette-detail mark')).map((el) => el.textContent);
+    expect(marks).toEqual(['margin', 'margin']);
+  });
+
+  it('uses 600ms debounce in `/` view (including PreviewPane) and skips non-file prefixes and < 2 char queries', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({
+      conversations: [],
+      documents: [
+        {
+          kind: 'workspace_file',
+          memo_key: null,
+          workspace_id: 'ws1',
+          path: 'notes/wafer.md',
+          title: 'wafer.md',
+          workspace_name: 'Semis',
+          timestamp: '2026-11-08T00:00:00Z',
+          snippet: 'Wafer allocation rose 20%',
+          highlights: [[0, 5]],
+        },
+      ],
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    vi.useFakeTimers();
+
+    // 1-char query skips /api/v1/dalton/search even after debounce
+    fireEvent.change(input, { target: { value: 'w' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    expect(fetchGlobalSearch).not.toHaveBeenCalled();
+
+    // `$` ticker prefix does NOT trigger /api/v1/dalton/search
+    fireEvent.change(input, { target: { value: '$wafer' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    expect(fetchGlobalSearch).not.toHaveBeenCalled();
+
+    // Leave `$` ticker chip back to root before entering `/` files prefix
+    fireEvent.keyDown(input, { key: 'Escape' });
+    fireEvent.change(input, { target: { value: '/wa' } });
+    fireEvent.change(input, { target: { value: 'wafer' } });
+    // Before 600ms passes, includeContent=true must NOT have fired yet
+    await act(async () => { await vi.advanceTimersByTimeAsync(350); });
+    expect(fetchGlobalSearch).not.toHaveBeenCalled();
+
+    // After 600ms passes, includeContent=true fires once
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    vi.useRealTimers();
+
+    expect(fetchGlobalSearch).toHaveBeenCalledTimes(1);
+    expect(fetchGlobalSearch).toHaveBeenCalledWith('wafer', 20, expect.anything(), {
+      includeConversations: false,
+      workspaceId: undefined,
+      includeContent: true,
+    });
+    await screen.findByRole('option', { name: /wafer\.md/ });
+    expect(document.querySelector('.command-palette-pane')?.textContent).toContain('Wafer allocation rose 20%');
+  });
+
+  it('never sends the content scan for words typed before switching into the files view', async () => {
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({ conversations: [], documents: [] });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    vi.useFakeTimers();
+
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+    expect(fetchGlobalSearch).toHaveBeenCalledWith('alpha', 20, expect.anything(), expect.objectContaining({ includeContent: false }));
+
+    fireEvent.change(input, { target: { value: '/be' } });
+    fireEvent.change(input, { target: { value: 'beta' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    vi.useRealTimers();
+
+    const contentCalls = vi.mocked(fetchGlobalSearch).mock.calls.filter(([, , , options]) => options?.includeContent);
+    expect(contentCalls.map(([q]) => q)).toEqual(['beta']);
+  });
+
+  it('keeps memo and triggers Search file content in workspace scope, and hides both in thread scope', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [
+        { thread_id: 't1', workspace_id: 'ws1', workspace_name: 'Semis', title: 'NVDA thread', has_title: true, is_pinned: false, updated_at: '2026-11-08T00:00:00Z', automation_name: null, match: [] },
+      ],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({
+      conversations: [],
+      documents: [
+        {
+          kind: 'memo',
+          memo_key: 'personal.md',
+          workspace_id: null,
+          path: `${MEMO_USER_DIR}/personal.md`,
+          title: 'Personal Memo',
+          workspace_name: '',
+          timestamp: null,
+          snippet: 'NVDA memo hit',
+          highlights: [[0, 4]],
+        },
+        {
+          kind: 'workspace_file',
+          memo_key: null,
+          workspace_id: 'ws1',
+          path: 'ws1.md',
+          title: 'ws1.md',
+          workspace_name: 'Semis',
+          timestamp: null,
+          snippet: 'NVDA in ws1',
+          highlights: [[0, 4]],
+        },
+        {
+          kind: 'workspace_file',
+          memo_key: null,
+          workspace_id: 'ws2',
+          path: 'ws2.md',
+          title: 'ws2.md',
+          workspace_name: 'Biotech',
+          timestamp: null,
+          snippet: 'NVDA in ws2',
+          highlights: [[0, 4]],
+        },
+      ],
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+
+    // Tab onto Semis workspace -> calls includeContent=false with workspaceId='ws1' and shows Personal Memo + trigger row
+    fireEvent.change(input, { target: { value: 'Semis' } });
+    await waitFor(() =>
+      expect(document.querySelector('[role="option"][aria-selected="true"]')).toHaveTextContent(/Semis/),
+    );
+    fireEvent.keyDown(input, { key: 'Tab' });
+    fireEvent.change(input, { target: { value: 'NVDA' } });
+
+    await screen.findByText('Personal Memo');
+    expect(fetchGlobalSearch).toHaveBeenCalledWith('NVDA', 20, expect.anything(), {
+      includeConversations: false,
+      workspaceId: 'ws1',
+      includeContent: false,
+    });
+    const wsTrigger = await screen.findByRole('option', { name: 'Search file content for “NVDA”' });
+    fireEvent.click(wsTrigger);
+    await screen.findByRole('option', { name: /ws1\.md/ });
+    expect(screen.queryByRole('option', { name: /ws2\.md/ })).not.toBeInTheDocument();
+    expect(fetchGlobalSearch).toHaveBeenLastCalledWith('NVDA', 20, expect.anything(), {
+      includeConversations: false,
+      workspaceId: 'ws1',
+      includeContent: true,
+    });
+
+    // Escape back to workspace view, select NVDA margins thread -> thread scope hides both and stops calling fetchGlobalSearch
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await screen.findByRole('option', { name: /NVDA margins/ });
+    while (!document.querySelector('[role="option"][aria-selected="true"]')?.textContent?.includes('NVDA margins')) {
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+    }
+    vi.mocked(fetchGlobalSearch).mockClear();
+    fireEvent.keyDown(input, { key: 'Tab' });
+    fireEvent.change(input, { target: { value: 'NVDA' } });
+    await waitFor(() => {
+      expect(screen.queryByText('Personal Memo')).not.toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /Search file content/ })).not.toBeInTheDocument();
+    });
+    expect(fetchGlobalSearch).not.toHaveBeenCalled();
+  });
+
+  it('navigates with openFilePath state when selecting a memo or workspace_file result', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({
+      conversations: [],
+      documents: [
+        {
+          kind: 'memo',
+          memo_key: 'pick.md',
+          workspace_id: null,
+          path: `${MEMO_USER_DIR}/pick.md`,
+          title: 'Pick Memo',
+          workspace_name: '',
+          timestamp: null,
+          snippet: 'Pick this memo',
+          highlights: [[0, 4]],
+        },
+        {
+          kind: 'workspace_file',
+          memo_key: null,
+          workspace_id: 'ws1',
+          path: 'models/dcf.xlsx',
+          title: 'dcf.xlsx',
+          workspace_name: 'Semis',
+          timestamp: null,
+          snippet: 'Pick this model',
+          highlights: [[0, 4]],
+        },
+      ],
+    });
+
+    renderDocShell();
+    shortcut();
+    let input = await field();
+    fireEvent.change(input, { target: { value: 'Pick' } });
+
+    const memoOpt = await screen.findByRole('option', { name: /Pick Memo/ });
+    fireEvent.click(memoOpt);
+    await waitFor(() => expect(path()).toBe('/chat/home'));
+    expect(JSON.parse(screen.getByLabelText('RouteState').textContent || 'null')).toEqual({
+      openFilePath: `${MEMO_USER_DIR}/pick.md`,
+      workspaceId: 'home',
+    });
+
+    shortcut();
+    input = await field();
+    fireEvent.change(input, { target: { value: 'Pick' } });
+    fireEvent.click(await screen.findByRole('option', { name: 'Search file content for “Pick”' }));
+    const fileOpt = await screen.findByRole('option', { name: /dcf\.xlsx/ });
+    fireEvent.click(fileOpt);
+    await waitFor(() => expect(path()).toBe('/chat/ws1'));
+    expect(JSON.parse(screen.getByLabelText('RouteState').textContent || 'null')).toEqual({
+      openFilePath: 'models/dcf.xlsx',
+      workspaceId: 'ws1',
+    });
+  });
+
+  it('passes workspaceId in File content view so >20 other-workspace hits do not crowd out workspace results', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockImplementation(async (_q, _limit, _signal, options) => {
+      if (options?.workspaceId === 'ws1') {
+        return {
+          conversations: [],
+          documents: [
+            {
+              kind: 'workspace_file',
+              memo_key: null,
+              workspace_id: 'ws1',
+              path: 'notes/semis_only.md',
+              title: 'semis_only.md',
+              workspace_name: 'Semis',
+              timestamp: null,
+              snippet: 'Alpha wafer yield',
+              highlights: [[0, 5]],
+            },
+          ],
+        };
+      }
+      return {
+        conversations: [],
+        documents: Array.from({ length: 20 }, (_, i) => ({
+          kind: 'workspace_file' as const,
+          memo_key: null,
+          workspace_id: 'ws-other',
+          path: `other/doc-${i}.md`,
+          title: `doc-${i}.md`,
+          workspace_name: 'Other',
+          timestamp: null,
+          snippet: `Alpha other ${i}`,
+          highlights: [[0, 5]] as [number, number][],
+        })),
+      };
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+
+    fireEvent.change(input, { target: { value: 'Semis' } });
+    await waitFor(() =>
+      expect(document.querySelector('[role="option"][aria-selected="true"]')).toHaveTextContent(/Semis/),
+    );
+    fireEvent.keyDown(input, { key: 'Tab' });
+    fireEvent.change(input, { target: { value: 'Alpha' } });
+
+    const trigger = await screen.findByRole('option', { name: 'Search file content for “Alpha”' });
+    fireEvent.click(trigger);
+    await screen.findByRole('option', { name: /semis_only\.md/ });
+    expect(screen.queryByRole('option', { name: /doc-0\.md/ })).not.toBeInTheDocument();
+  });
+
+  it('supports keyboard navigation to Search file content row and Show all memos in root and workspace scopes', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({
+      conversations: [],
+      documents: [
+        ...Array.from({ length: 6 }, (_, i) => ({
+          kind: 'memo' as const,
+          memo_key: `memo-${i}.md`,
+          workspace_id: null,
+          path: `${MEMO_USER_DIR}/memo-${i}.md`,
+          title: `Memo ${i}`,
+          workspace_name: '',
+          timestamp: null,
+          snippet: `Yield memo ${i}`,
+          highlights: [[0, 5]] as [number, number][],
+        })),
+        ...Array.from({ length: 6 }, (_, i) => ({
+          kind: 'workspace_file' as const,
+          memo_key: null,
+          workspace_id: 'ws1',
+          path: `notes/fc-${i}.md`,
+          title: `fc-${i}.md`,
+          workspace_name: 'Semis',
+          timestamp: null,
+          snippet: `Yield file ${i}`,
+          highlights: [[0, 5]] as [number, number][],
+        })),
+      ],
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    fireEvent.change(input, { target: { value: 'Yield' } });
+
+    const showAllMemos = await screen.findByRole('option', { name: 'Show all memos' });
+    const triggerRow = screen.getByRole('option', { name: 'Search file content for “Yield”' });
+    expect(screen.queryByText('Memo 5')).not.toBeInTheDocument();
+    expect(screen.queryByText('fc-0.md')).not.toBeInTheDocument();
+
+    // Activate "Show all memos" -> dedicated Memos view shows all 6 memos
+    fireEvent.click(showAllMemos);
+    await screen.findByRole('option', { name: /Memo 5/ });
+    expect(screen.getByRole('listbox')).toHaveAccessibleName('Memos');
+    expect(screen.queryByRole('option', { name: /fc-0\.md/ })).not.toBeInTheDocument();
+
+    // Escape back to root, arrow down onto Search file content trigger row, and press Enter
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await screen.findByRole('option', { name: 'Search file content for “Yield”' });
+    while (document.querySelector('[role="option"][aria-selected="true"]')?.textContent !== triggerRow.textContent) {
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+    }
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await screen.findByRole('option', { name: /fc-5\.md/ });
+    expect(screen.getByRole('listbox')).toHaveAccessibleName('File content');
+
+    // Escape back, scope into Semis workspace, verify Show all memos & trigger row also work there
+    fireEvent.keyDown(input, { key: 'Escape' });
+    fireEvent.change(input, { target: { value: 'Semis' } });
+    await waitFor(() =>
+      expect(document.querySelector('[role="option"][aria-selected="true"]')).toHaveTextContent(/Semis/),
+    );
+    fireEvent.keyDown(input, { key: 'Tab' });
+    fireEvent.change(input, { target: { value: 'Yield' } });
+
+    await screen.findByRole('option', { name: 'Show all memos' });
+    fireEvent.click(await screen.findByRole('option', { name: 'Search file content for “Yield”' }));
+    await screen.findByRole('option', { name: /fc-5\.md/ });
+    expect(screen.getByRole('listbox')).toHaveAccessibleName('File content');
+  });
+
+  it('shows timeout notice and preserves fallback name hits when content_timed_out is true, and aborts in-flight content request on query change/exit', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+
+    const abortedSignals: AbortSignal[] = [];
+    vi.mocked(fetchGlobalSearch).mockImplementation(async (q, _limit, signal, options) => {
+      if (options?.includeContent && q === 'slow') {
+        if (signal) abortedSignals.push(signal);
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })));
+        });
+      }
+      if (options?.includeContent && q === 'timeout') {
+        return {
+          conversations: [],
+          content_timed_out: true,
+          documents: [
+            {
+              kind: 'workspace_file',
+              memo_key: null,
+              workspace_id: 'ws1',
+              path: 'notes/timeout_name.md',
+              title: 'timeout_name.md',
+              workspace_name: 'Semis',
+              timestamp: null,
+              snippet: 'notes/timeout_name.md',
+              highlights: [[6, 13]],
+            },
+          ],
+        };
+      }
+      return { conversations: [], documents: [] };
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    fireEvent.change(input, { target: { value: 'timeout' } });
+
+    fireEvent.click(await screen.findByRole('option', { name: 'Search file content for “timeout”' }));
+    await screen.findByText('Too many files to search content in time. Try a more specific keyword or scope to a workspace.');
+    expect(screen.getByRole('option', { name: /timeout_name\.md/ })).toBeInTheDocument();
+
+    // Typing 'slow' inside File content triggers in-flight request; leaving with Escape aborts it cleanly
+    vi.useFakeTimers();
+    fireEvent.change(input, { target: { value: 'slow' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(650); });
+    vi.useRealTimers();
+    expect(abortedSignals).toHaveLength(1);
+    expect(abortedSignals[0].aborted).toBe(false);
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await waitFor(() => expect(abortedSignals[0].aborted).toBe(true));
+  });
+
+  it('hides PreviewPane when an upstream file row is selected in `/` view and shows it on memo/file-content rows', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [
+        {
+          workspace_id: 'ws1',
+          workspace_name: 'Semis',
+          path: 'reports/plain.md',
+          name: 'plain.md',
+          size: 120,
+          modified_at: '2026-11-08T00:00:00Z',
+          match: [[8, 13]],
+        },
+      ],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockResolvedValue({
+      conversations: [],
+      documents: [
+        {
+          kind: 'memo',
+          memo_key: 'note.md',
+          workspace_id: null,
+          path: `${MEMO_USER_DIR}/note.md`,
+          title: 'Plain Note Memo',
+          workspace_name: '',
+          timestamp: null,
+          snippet: 'Plain snippet preview body',
+          highlights: [[0, 5]],
+        },
+      ],
+    });
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    fireEvent.change(input, { target: { value: '/' } });
+    fireEvent.change(input, { target: { value: 'plain' } });
+
+    await screen.findByRole('option', { name: /plain\.md/ });
+    await screen.findByRole('option', { name: /Plain Note Memo/ });
+
+    // Row 0 is upstream ordinary file (`plain.md`): PreviewPane must remain hidden.
+    expect(document.querySelector('[role="option"][aria-selected="true"]')).toHaveTextContent(/plain\.md/);
+    expect(document.querySelector('.command-palette-pane')).toBeNull();
+    expect(document.querySelector('.command-palette-main')).not.toHaveClass('is-paned');
+
+    // ArrowDown onto Memo hit -> PreviewPane mounts with snippet.
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    await waitFor(() => expect(document.querySelector('.command-palette-pane')).not.toBeNull());
+    expect(document.querySelector('.command-palette-pane')?.textContent).toContain('Plain snippet preview body');
+
+    // ArrowUp back onto ordinary file -> PreviewPane hides again.
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    await waitFor(() => expect(document.querySelector('.command-palette-pane')).toBeNull());
+  });
+
+  it('shows palette.busy copy when Dalton document search returns 429', async () => {
+    vi.mocked(searchConversations).mockResolvedValue({
+      threads: [],
+      turns: [],
+      files: [],
+      next_cursor: { threads: null, turns: null, files: null },
+      failed: [],
+    });
+    vi.mocked(fetchGlobalSearch).mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 429'), { response: { status: 429, data: {} } }),
+    );
+
+    renderDocShell();
+    shortcut();
+    const input = await field();
+    fireEvent.change(input, { target: { value: 'margin' } });
+
+    await screen.findByText('Too many searches at once. Try again in a moment.');
+    expect(screen.queryByText("Couldn't search your memos and file contents right now.")).not.toBeInTheDocument();
   });
 });

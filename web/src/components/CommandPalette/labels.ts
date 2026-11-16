@@ -9,7 +9,10 @@ export function kindLabel(kind: Kind, t: T): string {
 
 /** A drilled-in view, named at the field's end: its kind, or the ticker it is about. */
 export function lensLabel(lens: Lens, t: T): string {
-  return lens.kind === 'ticker' ? lens.symbol : kindLabel(lens.kind, t);
+  // DALTON-HOOK(global-search): label Memos and File content drill-in views by their group title
+  if (lens.kind === 'ticker') return lens.symbol;
+  if (lens.kind === 'memos' || lens.kind === 'fileContent') return t(`palette.group.${lens.kind}`);
+  return kindLabel(lens.kind, t);
 }
 
 const placeName = (place: Place) => (place.kind === 'workspace' ? place.name : place.title);

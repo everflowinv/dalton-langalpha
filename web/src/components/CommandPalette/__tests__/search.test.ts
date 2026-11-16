@@ -72,6 +72,44 @@ describe('arrangeSearch, server groups', () => {
     ]);
     expect(groups[0].items[1].actions[0]).toMatchObject({ effect: 'open', view: { kind: 'turns', via: 'drill' } });
   });
+
+  // DALTON-HOOK(global-search): verify memos and fileContent sit immediately after upstream files group
+  it('places memos and fileContent groups right after files and before tickers/workspaces', () => {
+    expect(
+      shape({
+        turns: [hit('turn1', 0)],
+        files: [hit('file1', 0)],
+        memos: [item('memo:1', 'Memo 1')],
+        fileContent: [item('fc:1', 'File Content 1')],
+        tickers: [hit('NVDA', 0)],
+      }),
+    ).toEqual([
+      ['turns', ['turn1']],
+      ['files', ['file1']],
+      ['memos', ['memo:1']],
+      ['fileContent', ['fc:1']],
+      ['tickers', ['NVDA']],
+    ]);
+  });
+
+  // DALTON-HOOK(global-search): verify truncated memos/fileContent expose Show all rows and distinct drill lenses
+  it('appends Show all rows with distinct memos and fileContent drill lenses when truncated', () => {
+    const groups = arrangeSearch(
+      {
+        ...none,
+        memos: [item('memo:1', 'Memo 1')],
+        fileContent: [item('fc:1', 'File Content 1')],
+      },
+      { threads: false, turns: false, files: false, memos: true, fileContent: true },
+      t,
+    );
+    expect(groups.map((g) => [g.id, g.items.map((i) => i.id), g.open])).toEqual([
+      ['memos', ['memo:1', 'more:memos'], { kind: 'memos', via: 'drill' }],
+      ['fileContent', ['fc:1', 'more:fileContent'], { kind: 'fileContent', via: 'drill' }],
+    ]);
+    expect(groups[0].items[1].actions[0]).toMatchObject({ effect: 'open', view: { kind: 'memos', via: 'drill' } });
+    expect(groups[1].items[1].actions[0]).toMatchObject({ effect: 'open', view: { kind: 'fileContent', via: 'drill' } });
+  });
 });
 
 const thread = (id: string, title: string, meta = 'server meta'): PaletteItem => ({ ...item(`thread:${id}`, title), meta });

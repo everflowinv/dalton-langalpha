@@ -1,20 +1,24 @@
-import { useLocation, useNavigate } from 'react-router';
+import { useLocation, useNavigate, type NavigateFunction } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useChatRoute } from '@/components/Sidebar/useChatRoute';
 import { toast } from '@/components/ui/use-toast';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
-import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
+// DALTON-HOOK(global-search): resolve home workspace when opening memo results
+import { homeWorkspaceQuery, resolveChatWorkspace, useHomeWorkspaceId } from '@/hooks/useHomeWorkspace';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
 import { useUser } from '@/hooks/useUser'; // DALTON-HOOK(colleague-dispatch)
 import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-dispatch)
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { copyText } from '@/lib/clipboard';
+// DALTON-HOOK(global-search): Dalton document hit navigation types and memo directory path
+import type { GlobalSearchDocumentItem } from '@/lib/dalton/searchApi';
 import { isDesktopShell } from '@/lib/desktop';
 import { relativeTime } from '@/lib/format';
 import { isHomeWorkspace } from '@/lib/homeWorkspace';
+import { MEMO_USER_DIR } from '@/pages/ChatAgent/utils/agentPaths.generated';
 import { useArchiveThreadConfirm } from '@/pages/ChatAgent/components/threadArchiveAction';
 import { useTeamWorkspaces } from '@/pages/ChatAgent/components/dalton/TeamSharing'; // DALTON-HOOK(colleague-dispatch)
 import { archiveThreadRow, pinThreadRow, renameThreadRow } from '@/pages/ChatAgent/hooks/threadRowMutations';
@@ -204,6 +208,47 @@ export function useArchiveThread() {
   };
 }
 
+/**
+ * DALTON-HOOK(global-search): Navigate to a personal memo or workspace file-content hit
+ * via `location.state.openFilePath`, matching ThreadGallery's file-panel opener.
+ */
+export function navigateToDaltonDocument(
+  doc: Pick<GlobalSearchDocumentItem, 'kind' | 'memo_key' | 'workspace_id' | 'path'>,
+  {
+    homeWorkspaceId,
+    navigate,
+    queryClient,
+  }: {
+    homeWorkspaceId?: string;
+    navigate: NavigateFunction;
+    queryClient: QueryClient;
+  },
+): void {
+  if (doc.kind === 'memo') {
+    const memoPath = doc.memo_key ? `${MEMO_USER_DIR}/${doc.memo_key}` : doc.path;
+    const knownWorkspaceId = doc.workspace_id || homeWorkspaceId;
+    if (knownWorkspaceId) {
+      navigate(`/chat/${knownWorkspaceId}`, {
+        state: { openFilePath: memoPath, workspaceId: knownWorkspaceId },
+      });
+    } else {
+      void resolveChatWorkspace(queryClient, 'all').then((resolvedId) => {
+        if (resolvedId) {
+          navigate(`/chat/${resolvedId}`, {
+            state: { openFilePath: memoPath, workspaceId: resolvedId },
+          });
+        }
+      });
+    }
+    return;
+  }
+  if (doc.workspace_id) {
+    navigate(`/chat/${doc.workspace_id}`, {
+      state: { openFilePath: doc.path, workspaceId: doc.workspace_id },
+    });
+  }
+}
+
 /** What the palette's rows do in the app. Each runs after the palette has closed. */
 export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
   const { t } = useTranslation();
@@ -213,6 +258,7 @@ export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
   const label = useWorkspaceLabel();
   const { currentWorkspaceId, currentThreadId } = useChatRoute();
   const { byId } = useWorkspaces();
+  const homeWorkspaceId = useHomeWorkspaceId(); // DALTON-HOOK(global-search)
   // DALTON-HOOK(colleague-dispatch): subscribe to identity/team permissions and live workspace access
   const { data: currentWsDetail } = useWorkspace(currentWorkspaceId);
   const { access, permissionsLoading } = usePaletteAccess();
@@ -250,6 +296,8 @@ export function useVerbs(archiveThread: Verbs['archiveThread']): Verbs {
         navigate(fileHref(workspaceId, path), { state: { workspaceName: label(byId.get(workspaceId)) || undefined } });
       }
     },
+    // DALTON-HOOK(global-search): open Dalton memo and workspace file-content hits
+    openDocument: (doc) => navigateToDaltonDocument(doc, { homeWorkspaceId, navigate, queryClient }),
     openChart: (symbol) => navigate(buildMarketViewUrl({ symbol })),
     copy: (text) =>
       void copyText(text).then(

@@ -67,6 +67,16 @@ vi.mock('@/hooks/useAllWorkspaces', () => ({
 vi.mock('@/hooks/useHomeWorkspace', () => ({
   homeWorkspaceQuery: () =>
     queryOptions({ queryKey: ['workspaces', 'home'], queryFn: async () => ({ workspace_id: 'home', is_home: true, name: 'Home' }) }),
+  useHomeWorkspaceId: () => 'home',
+  resolveChatWorkspace: vi.fn(async () => 'home'),
+}));
+vi.mock('@/lib/dalton/searchApi', () => ({
+  fetchGlobalSearch: vi.fn<
+    (q: string, limit?: number, signal?: AbortSignal, options?: { includeConversations?: boolean }) => Promise<{
+      conversations: never[];
+      documents: never[];
+    }>
+  >(async () => ({ conversations: [], documents: [] })),
 }));
 vi.mock('@/hooks/useSkills', () => ({
   useSkills: () => ({

@@ -226,6 +226,9 @@ export const queryKeys = {
     // One turn as the palette's preview shows it; null is the newest turn.
     searchPreview: (threadId: string, turnIndex: number | null) =>
       [...queryKeys.threads.searchAll(), 'preview', threadId, turnIndex],
+    // DALTON-HOOK(global-search): Dalton memo & file-content search merged into Command Palette.
+    daltonDocuments: (q: string, limit = 20, workspaceId = '', includeContent = true) =>
+      [...queryKeys.threads.searchAll(), 'dalton-documents', q, limit, workspaceId, includeContent],
     // The thread's public link: whether it is shared, its URL, what visitors
     // may open. The chat header and every share panel read this one entry.
     share:       (threadId: string) => [...queryKeys.threads.all, 'share', threadId],
@@ -476,8 +479,6 @@ export const queryKeys = {
     // DALTON-HOOK(feishu-docs): Feishu wiki read-scope whitelist and bot-visible spaces
     feishuReadScopes: () => [...queryKeys.dalton.all, 'feishu', 'read-scopes'],
     feishuSpaces: () => [...queryKeys.dalton.all, 'feishu', 'spaces'],
-    // DALTON-HOOK(query-keys): global keyword search query key
-    search: (q: string, limit = 20) => [...queryKeys.dalton.all, 'search', q, limit],
     // DALTON-HOOK(team-memory-toggle): workspace and user-level Team Memory settings query keys
     workspaceSettings: (workspaceId: string) => [...queryKeys.dalton.all, 'workspace-settings', workspaceId],
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],

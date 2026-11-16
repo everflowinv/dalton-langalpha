@@ -67,13 +67,29 @@ export function mergeThreads(
 }
 
 /** The row at a capped group's end that opens the whole group. */
-export function showAllRow(kind: SearchKind, t: T): PaletteItem {
+// DALTON-HOOK(global-search): also allow "Show all" rows for Memos and File content groups
+export function showAllRow(kind: SearchKind | 'memos' | 'fileContent', t: T): PaletteItem {
   const title = t(`palette.showAll.${kind}`);
   return {
     id: `more:${kind}`,
     icon: ChevronsRight,
     title,
     actions: [{ id: 'open', label: title, icon: ChevronsRight, effect: 'open', view: { kind, via: 'drill' } }],
+  };
+}
+
+/** DALTON-HOOK(global-search): Memos or File content group with optional "Show all" row when truncated. */
+export function daltonDocGroup(
+  kind: 'memos' | 'fileContent',
+  items: PaletteItem[],
+  more: boolean,
+  t: T,
+): PaletteGroup {
+  return {
+    id: kind,
+    label: t(`palette.group.${kind}`),
+    open: { kind, via: 'drill' },
+    items: more && items.length > 0 ? [...items, showAllRow(kind, t)] : items,
   };
 }
 
@@ -88,6 +104,9 @@ export interface Found {
   turns: Hit[];
   /** Files in the user's workspaces, in the server's order (names matched first). */
   files: Hit[];
+  // DALTON-HOOK(global-search): Dalton personal memo and file-content hits shown after upstream files
+  memos?: PaletteItem[];
+  fileContent?: PaletteItem[];
   /** In the symbol search's order, the exact symbol typed (if found) ranked below zero. */
   tickers: Hit[];
   workspaces: Hit[];
@@ -109,7 +128,11 @@ export interface Found {
  * hit, since it arrives with the server's answer. A server group holding more
  * than it shows (`more`) ends with its Show all row.
  */
-export function arrangeSearch(found: Found, more: Readonly<Record<SearchKind, boolean>>, t: T): PaletteGroup[] {
+export function arrangeSearch(
+  found: Found,
+  more: Readonly<Record<SearchKind, boolean> & { memos?: boolean; fileContent?: boolean }>,
+  t: T,
+): PaletteGroup[] {
   const named = [found.workspaces, found.skills, found.places, found.actions]
     .map((hits) => hits[0])
     .find((hit) => hit?.rank === 0);
@@ -119,9 +142,14 @@ export function arrangeSearch(found: Found, more: Readonly<Record<SearchKind, bo
   const rest = (hits: Hit[]) => hits.filter((hit) => hit !== top).map((hit) => hit.item);
   const group = (id: string, label: string, hits: Hit[]): PaletteGroup => ({ id, label, items: rest(hits) });
   const tickers = group('tickers', t('palette.group.tickers'), found.tickers);
+  // DALTON-HOOK(global-search): place Memos and File content (with "Show all" when truncated) right after Files
+  const memosGroup = daltonDocGroup('memos', found.memos ?? [], !!more.memos, t);
+  const fileContentGroup = daltonDocGroup('fileContent', found.fileContent ?? [], !!more.fileContent, t);
   return [
     { id: 'top', label: t('palette.group.topHit'), items: top ? [top.item] : [] },
     ...(['threads', 'turns', 'files'] as const).map((kind) => serverGroup(kind, rest(found[kind]), found[kind].length > 0 && more[kind], t)),
+    memosGroup,
+    fileContentGroup,
     ...(exactTicker ? [tickers] : []),
     group('workspaces', t('palette.group.workspaces'), found.workspaces),
     group('skills', t('palette.group.skills'), found.skills),

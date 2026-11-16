@@ -15,20 +15,35 @@ import {
 } from '@/pages/ChatAgent/components/NavigationRows';
 import { recentThreadsQuery, workspaceThreadsQuery } from '@/pages/ChatAgent/utils/threadQueries';
 import type { Thread, Workspace } from '@/types/api';
-import { askRow, fileRow, threadOfHit, threadOfList, threadRow, tickerRow, turnRow, type Verbs } from './rows';
+import {
+  askRow,
+  fileContentRow,
+  fileRow,
+  memoRow,
+  searchFileContentRow,
+  threadOfHit,
+  threadOfList,
+  threadRow,
+  tickerRow,
+  turnRow,
+  type Verbs,
+} from './rows';
 import { usePaletteAccess } from './useVerbs'; // DALTON-HOOK(colleague-dispatch)
 import { searchWithin } from './scope';
 import { boostOwnTickers } from './ownTickers';
-import { arrangeSearch, findItems, mergeThreads, serverGroup, type Hit } from './search';
+import { arrangeSearch, daltonDocGroup, findItems, mergeThreads, serverGroup, type Hit } from './search';
 import type { LocalSources } from './useLocalSources';
 import { useOwnTickers } from './useOwnTickers';
-import { useConversationSearch, useSearchPages, type SearchFailure } from './useServerSearch';
+// DALTON-HOOK(global-search): query Dalton memos and workspace file-content hits
+import { useConversationSearch, useDaltonDocumentSearch, useSearchPages, type SearchFailure } from './useServerSearch';
 import type { PaletteGroup, PaletteItem, PreviewTarget, ViewSpec } from './types';
 
 /** How many rows each group of a view of everything shows. */
 const CAP = { threads: 5, turns: 4, files: 4, tickers: 5, workspaces: 4, skills: 4, places: 5, actions: 4 } as const;
 /** One more than a server group shows, so a full group knows it has more. */
 const SERVER_LIMIT = Math.max(CAP.threads, CAP.turns, CAP.files) + 1;
+/** DALTON-HOOK(global-search): page size fetched from `/api/v1/dalton/search`. */
+const DALTON_DOC_LIMIT = 20;
 /** How many recent threads the palette reads: the newest shown before a word is typed, and the titles matched at once while the server answers. */
 const RECENT_THREADS = 50;
 /** How many of them a view of threads shows before a word is typed. */
@@ -60,7 +75,8 @@ export interface ViewResult {
   /** Asks for the next page as the list nears its end; null for a view that is not paged. */
   loadMore: (() => void) | null;
   /** A preview pane beside the rows, and what it shows with no row's preview; null for none. */
-  preview: { fallback?: PreviewTarget } | null;
+  // DALTON-HOOK(global-search): requireTarget hides preview pane in files view when selecting path-only upstream rows
+  preview: { fallback?: PreviewTarget; requireTarget?: boolean } | null;
 }
 
 /** What one view's rows came to, before the parts every view shares. */
@@ -71,8 +87,11 @@ interface Shown {
   pending?: boolean;
   failure?: SearchFailure | null;
   /** Kinds the server's answer came back without (it ran out of time on them). */
-  failedKinds?: readonly SearchKind[];
+  // DALTON-HOOK(global-search): allow surfacing non-fatal Dalton document search failure note & timeout warning
+  failedKinds?: readonly (SearchKind | 'documents')[];
+  contentTimedOut?: boolean;
   hint?: string | null;
+  hasDocPreview?: boolean;
 }
 
 const group = (id: string, label: string, items: PaletteItem[]): PaletteGroup[] => (items.length > 0 ? [{ id, label, items }] : []);
@@ -150,6 +169,54 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
   // conversations, in one request: its threads never page.
   const turnPages = useSearchPages(text, 'turns', view === 'turns' || view === 'ticker' || view === 'thread', within, view === 'ticker' ? TICKER_FIRST : undefined);
   const filePages = useSearchPages(text, 'files', view === 'files', within);
+  // DALTON-HOOK(global-search): root/workspace views use include_content=false; only files/fileContent request content
+  const daltonDocsEnabled =
+    searching &&
+    (view === 'all' || view === 'files' || view === 'memos' || view === 'fileContent') &&
+    place?.kind !== 'thread';
+  const daltonIncludeContent = view === 'files' || view === 'fileContent';
+  const workspaceScopeId = place?.kind === 'workspace' ? place.workspaceId : undefined;
+  const daltonDocs = useDaltonDocumentSearch(
+    query,
+    DALTON_DOC_LIMIT,
+    daltonDocsEnabled,
+    workspaceScopeId,
+    daltonIncludeContent,
+  );
+  const buildDaltonDocGroups = (shownFileHits: readonly { workspace_id: string; path: string }[], cap?: number) => {
+    const shownKeys = new Set(shownFileHits.map((hit) => `${hit.workspace_id}:${hit.path}`));
+    const rawMemos = daltonDocs.documents.filter((doc) => doc.kind === 'memo');
+    const rawFileContent = daltonDocs.documents.filter(
+      (doc) =>
+        doc.kind === 'workspace_file' &&
+        (!place || place.kind !== 'workspace' || doc.workspace_id === place.workspaceId) &&
+        !shownKeys.has(`${doc.workspace_id ?? ''}:${doc.path}`),
+    );
+    const memoItems = (cap ? rawMemos.slice(0, cap) : rawMemos).map((doc) => memoRow(doc, v));
+    const fileContentItems = (cap ? rawFileContent.slice(0, cap) : rawFileContent).map((doc) => fileContentRow(doc, v));
+    return {
+      memoItems,
+      fileContentItems,
+      memosMore: !!cap && rawMemos.length > cap,
+      fileContentMore: !!cap && rawFileContent.length > cap,
+      hasDocPreview: memoItems.some((item) => !!item.preview) || fileContentItems.some((item) => !!item.preview),
+    };
+  };
+  const mergeDaltonFailure = (
+    upstreamFailure: SearchFailure | null,
+    upstreamFailedKinds: readonly SearchKind[],
+  ): { failure: SearchFailure | null; failedKinds: (SearchKind | 'documents')[] } => {
+    if (daltonDocs.failure === 'busy') {
+      return { failure: upstreamFailure ?? 'busy', failedKinds: [...upstreamFailedKinds] };
+    }
+    return {
+      failure: upstreamFailure,
+      failedKinds:
+        daltonDocs.failure === 'failed' && !upstreamFailure
+          ? [...upstreamFailedKinds, 'documents']
+          : [...upstreamFailedKinds],
+    };
+  };
 
   // DALTON-HOOK(colleague-dispatch): recent threads follow the sidebar's open and isolation rules
   // DALTON-HOOK(external-share-guard): isolated external threads stay out of recent and stay hidden while loading
@@ -228,14 +295,22 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
         // With nothing but Ask found here, Enter waits for the server's
         // answer rather than asking: what was typed most likely names
         // something it holds. A row found here stays the one Enter takes.
-        const onlyAsk = (found: number) => found === 0 && capped.settling;
-        const serverShown = { failure: capped.failure, failedKinds: capped.failedKinds };
+        const onlyAsk = (found: number) => found === 0 && (capped.settling || daltonDocs.settling);
+        // DALTON-HOOK(global-search): root & workspace views show Memos (include_content=false) and an on-demand trigger row for File content
+        const shownFileHits = answer.files.slice(0, CAP.files);
+        const { memoItems, memosMore } = buildDaltonDocGroups(shownFileHits, CAP.files);
+        const fileContentTrigger = query.trim().length >= 2 && !capped.settling ? [searchFileContentRow(query, v)] : [];
+        const serverShown = mergeDaltonFailure(capped.failure, capped.failedKinds);
         if (place) {
           // A workspace's own threads, conversations and files, each group opening whole.
           const items = { threads: threads.hits, turns: turns.slice(0, CAP.turns), files: files.slice(0, CAP.files) };
-          const groups = (['threads', 'turns', 'files'] as const).map((kind) =>
-            serverGroup(kind, items[kind].map((hit) => hit.item), more[kind], t),
-          );
+          const groups = [
+            ...(['threads', 'turns', 'files'] as const).map((kind) =>
+              serverGroup(kind, items[kind].map((hit) => hit.item), more[kind], t),
+            ),
+            daltonDocGroup('memos', memoItems, memosMore, t),
+            daltonDocGroup('fileContent', fileContentTrigger, false, t),
+          ];
           return {
             groups: groups.filter((g) => g.items.length > 0),
             rowsPending: recent.loading,
@@ -247,6 +322,9 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
           threads: threads.hits,
           turns: turns.slice(0, CAP.turns),
           files: files.slice(0, CAP.files),
+          // DALTON-HOOK(global-search): include memo hits and on-demand File content trigger row in arrangeSearch
+          memos: memoItems,
+          fileContent: fileContentTrigger,
           tickers: tickers.hits.slice(0, CAP.tickers),
           workspaces: findItems(local.workspaces, words, CAP.workspaces),
           skills: findItems(local.skills, words, CAP.skills),
@@ -255,7 +333,7 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
         };
         const here = [localThreads, found.tickers, found.workspaces, found.skills, found.places, found.actions];
         return {
-          groups: arrangeSearch(found, more, t),
+          groups: arrangeSearch(found, { ...more, memos: memosMore, fileContent: false }, t),
           rowsPending: (!!tickers.typed && tickers.loading) || recent.loading,
           serverMayLead: onlyAsk(here.reduce((n, hits) => n + hits.length, 0)),
           ...serverShown,
@@ -290,14 +368,70 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
         const { pending, failure } = threadPages;
         return { groups: group('threads', t('palette.group.threads'), rows), pending, failure, hint: noMatches(rows, pending, failure) };
       }
-      case 'turns':
-      case 'files': {
-        if (!searching) return { groups: [], hint: t(view === 'files' ? 'palette.scope.filesHint' : 'palette.scope.turnsHint') };
+      case 'turns': {
+        if (!searching) return { groups: [], hint: t('palette.scope.turnsHint') };
         // The server is their only source, so Enter waits for it.
-        const pages = view === 'files' ? filePages : turnPages;
-        const rows = view === 'files' ? filePages.files.map((hit) => fileRow(hit, v)) : turnRows();
-        const { settling, pending, failure } = pages;
-        return { groups: group(view, t(`palette.group.${view}`), rows), rowsPending: settling, pending, failure, hint: noMatches(rows, pending, failure) };
+        const rows = turnRows();
+        const { settling, pending, failure } = turnPages;
+        return { groups: group('turns', t('palette.group.turns'), rows), rowsPending: settling, pending, failure, hint: noMatches(rows, pending, failure) };
+      }
+      case 'files': {
+        if (!searching) return { groups: [], hint: t('palette.scope.filesHint') };
+        // DALTON-HOOK(global-search): `/` prefix & Files view include Memos, deduplicated File content, and timeout note
+        const rows = filePages.files.map((hit) => fileRow(hit, v));
+        const { memoItems, fileContentItems, hasDocPreview } = buildDaltonDocGroups(filePages.files);
+        const groups = [
+          ...group('files', t('palette.group.files'), rows),
+          ...group('memos', t('palette.group.memos'), memoItems),
+          ...group('fileContent', t('palette.group.fileContent'), fileContentItems),
+        ];
+        const settling = filePages.settling || daltonDocs.settling;
+        const pending = filePages.pending || daltonDocs.pending;
+        const { failure, failedKinds } = mergeDaltonFailure(filePages.failure, filePages.failedKinds);
+        const allItems = [...rows, ...memoItems, ...fileContentItems];
+        return {
+          groups,
+          rowsPending: settling,
+          pending,
+          failure,
+          failedKinds,
+          contentTimedOut: daltonDocs.contentTimedOut,
+          hasDocPreview,
+          hint:
+            daltonDocs.contentTimedOut && allItems.length === 0
+              ? null
+              : noMatches(allItems, pending, failure ?? daltonDocs.failure),
+        };
+      }
+      case 'memos': {
+        // DALTON-HOOK(global-search): dedicated drilled-in view showing all personal memo hits
+        if (!searching) return { groups: [], hint: t('palette.scope.placeholders.memos') };
+        const { memoItems } = buildDaltonDocGroups([]);
+        return {
+          groups: group('memos', t('palette.group.memos'), memoItems),
+          rowsPending: daltonDocs.settling,
+          pending: daltonDocs.pending,
+          failure: daltonDocs.failure,
+          hasDocPreview: memoItems.some((item) => !!item.preview),
+          hint: noMatches(memoItems, daltonDocs.pending, daltonDocs.failure),
+        };
+      }
+      case 'fileContent': {
+        // DALTON-HOOK(global-search): dedicated drilled-in view requesting include_content=true on demand
+        if (!searching) return { groups: [], hint: t('palette.scope.placeholders.fileContent') };
+        const { fileContentItems } = buildDaltonDocGroups([]);
+        return {
+          groups: group('fileContent', t('palette.group.fileContent'), fileContentItems),
+          rowsPending: daltonDocs.settling,
+          pending: daltonDocs.pending,
+          failure: daltonDocs.failure,
+          contentTimedOut: daltonDocs.contentTimedOut,
+          hasDocPreview: fileContentItems.some((item) => !!item.preview),
+          hint:
+            daltonDocs.contentTimedOut && fileContentItems.length === 0
+              ? null
+              : noMatches(fileContentItems, daltonDocs.pending, daltonDocs.failure),
+        };
       }
       case 'tickers': {
         // The charts opened lately until a word is typed.
@@ -349,9 +483,17 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
   const pages = view === 'threads' ? threadPages : view === 'files' ? filePages : view === 'turns' || view === 'ticker' || view === 'thread' ? turnPages : null;
   const failure = shown.failure ?? null;
   // A kind the server ran out of time on is said once, above the rows; the others still show.
-  const kindsNote = (shown.failedKinds ?? []).map((kind) => t(`palette.kindFailed.${kind}`)).join(' ') || null;
+  // DALTON-HOOK(global-search): include content timeout note and keep Ask leading when only trigger row exists
+  const kindsNote =
+    [
+      ...(shown.failedKinds ?? []).map((kind) => t(`palette.kindFailed.${kind}`)),
+      ...(shown.contentTimedOut ? [t('palette.contentTimedOut')] : []),
+    ].join(' ') || null;
+  const askGroup = ask ? [{ id: 'ask', label: t('palette.group.ask'), items: [ask] }] : [];
+  const onlyContentTrigger = shown.groups.length > 0 && shown.groups.every((g) => g.id === 'fileContent');
+  const groups = lens || !ask ? shown.groups : onlyContentTrigger ? [...askGroup, ...shown.groups] : [...shown.groups, ...askGroup];
   return {
-    groups: lens || !ask ? shown.groups : [...shown.groups, { id: 'ask', label: t('palette.group.ask'), items: [ask] }],
+    groups,
     rowsPending: searching && !!shown.rowsPending,
     serverMayLead: searching && !!shown.serverMayLead,
     pending: !!shown.pending,
@@ -359,7 +501,14 @@ export function useViewResult({ place, lens }: ViewSpec, query: string, v: Verbs
     ask,
     words,
     loadMore: pages?.loadMore ?? null,
-    // A file has no preview; a thread's own search shows its latest exchange until a row is picked.
-    preview: !pages || view === 'files' ? null : { fallback: place?.kind === 'thread' ? { kind: 'thread', threadId: place.threadId } : undefined },
+    // DALTON-HOOK(global-search): show preview in files/memos/fileContent views only when active row has a preview target
+    preview:
+      view === 'files' || view === 'memos' || view === 'fileContent'
+        ? shown.hasDocPreview
+          ? { requireTarget: true }
+          : null
+        : !pages
+          ? null
+          : { fallback: place?.kind === 'thread' ? { kind: 'thread', threadId: place.threadId } : undefined },
   };
 }

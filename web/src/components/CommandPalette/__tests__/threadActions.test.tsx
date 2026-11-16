@@ -32,6 +32,15 @@ vi.mock('@/api/search', () => ({
     throw new Error('no preview here');
   }),
 }));
+// DALTON-HOOK(global-search): stub Dalton document search & home workspace helpers
+vi.mock('@/lib/dalton/searchApi', () => ({
+  fetchGlobalSearch: vi.fn<
+    (q: string, limit?: number, signal?: AbortSignal, options?: { includeConversations?: boolean }) => Promise<{
+      conversations: never[];
+      documents: never[];
+    }>
+  >(async () => ({ conversations: [], documents: [] })),
+}));
 vi.mock('@/hooks/useAllWorkspaces', () => ({
   useAllWorkspaces: () => ({ data: { workspaces: [{ workspace_id: 'ws1', name: 'Semis', status: 'running', is_home: false }] } }),
 }));
@@ -39,6 +48,8 @@ vi.mock('@/hooks/useSkills', () => ({ useSkills: () => ({ data: [] }) }));
 vi.mock('@/hooks/useHomeWorkspace', () => ({
   homeWorkspaceQuery: () =>
     queryOptions({ queryKey: ['workspaces', 'home'], queryFn: async () => ({ workspace_id: 'home', is_home: true, name: 'Home' }) }),
+  useHomeWorkspaceId: () => 'home',
+  resolveChatWorkspace: vi.fn(async () => 'home'),
 }));
 vi.mock('@/hooks/useSymbolSearch', () => ({ useSymbolSearch: () => ({ hits: [], loading: false }) }));
 vi.mock('@/lib/quotes', async (importOriginal) => ({
@@ -72,7 +83,7 @@ function renderShell(route = '/') {
   );
 }
 
-// DALTON-HOOK(global-search): CommandPalette opens on ⌘⇧K / Ctrl+Shift+K.
+// DALTON-HOOK(global-search): ⌘K / ⌘⇧K（Ctrl+K / Ctrl+Shift+K）都打开
 const shortcut = () =>
   fireEvent.keyDown(document.activeElement ?? window, { key: 'k', shiftKey: true, ...(clientOs() === 'windows' ? { ctrlKey: true } : { metaKey: true }) });
 const field = () => screen.findByRole('combobox') as Promise<HTMLInputElement>;

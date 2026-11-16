@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SearchFileHit, SearchThreadHit, SearchTurnHit } from '@/api/search';
 import type { Thread } from '@/types/api';
 import { formatQuoteBlock } from '@/components/ui/chat-input.wire';
-import { askRow, fileRow, threadOfHit, threadOfList, threadRow, tickerRow, turnRow, type Verbs } from '../rows';
+import type { GlobalSearchDocumentItem } from '@/lib/dalton/searchApi';
+// DALTON-HOOK(global-search): unit tests for Dalton memo & file-content rows and code-point span conversion
+import { askRow, codePointSpansToUtf16, fileContentRow, fileRow, memoRow, threadOfHit, threadOfList, threadRow, tickerRow, turnRow, type Verbs } from '../rows';
 import type { PaletteAction } from '../types';
 
 const verbs = (extra: Partial<Verbs> = {}): Verbs => ({
@@ -246,5 +248,60 @@ describe('askRow', () => {
     expect(inThread?.actions[0]).not.toHaveProperty('startsThread');
     run(inThread!.actions[0]);
     expect(v.openThread).toHaveBeenCalledWith('t1', 'home', { draftMessage: 'again' });
+  });
+});
+
+// DALTON-HOOK(global-search): unit tests for codePointSpansToUtf16, memoRow, and fileContentRow
+describe('memoRow, fileContentRow, and codePointSpansToUtf16', () => {
+  it('converts Unicode code-point highlight offsets to UTF-16 slices for emoji/CJK text', () => {
+    const snippet = '📈 NVDA 财报 margin rose';
+    // Code points: 0='📈'(len 2), 1=' ', 2='N',3='V',4='D',5='A', 6=' ', 7='财', 8='报', 9=' ', 10..16='margin'
+    const spans = codePointSpansToUtf16(snippet, [[10, 16]]);
+    expect(spans).toEqual([[11, 17]]);
+    expect(snippet.slice(spans[0][0], spans[0][1])).toBe('margin');
+  });
+
+  it('builds a memoRow with snippet detail, preview target, and openDocument action', () => {
+    const doc: GlobalSearchDocumentItem = {
+      kind: 'memo',
+      memo_key: 'thesis.md',
+      workspace_id: null,
+      path: '.agents/memos/thesis.md',
+      title: 'Thesis Memo',
+      workspace_name: '',
+      timestamp: '2026-11-08T00:00:00Z',
+      snippet: '🚀 NVDA AI wafer demand',
+      highlights: [[2, 6]],
+    };
+    const openDocument = vi.fn<(item: GlobalSearchDocumentItem) => void>();
+    const v = verbs({ openDocument });
+    const row = memoRow(doc, v);
+    expect(row.meta).toBe('palette.kind.memo · at 2026-11-08T00:00:00Z');
+    expect(row.detail).toEqual({ text: '🚀 NVDA AI wafer demand', spans: [[3, 7]] });
+    expect(row.preview).toMatchObject({ kind: 'document', docKind: 'memo', title: 'Thesis Memo', spans: [[3, 7]] });
+    run(row.actions[0]);
+    expect(openDocument).toHaveBeenCalledWith(doc);
+  });
+
+  it('builds a fileContentRow with folder, workspace name, highlighted snippet, and openDocument action', () => {
+    const doc: GlobalSearchDocumentItem = {
+      kind: 'workspace_file',
+      memo_key: null,
+      workspace_id: 'ws',
+      path: 'reports/q3_margin.md',
+      title: 'q3_margin.md',
+      workspace_name: 'Semis',
+      timestamp: '2026-11-08T00:00:00Z',
+      snippet: 'Gross margin reached 75%',
+      highlights: [[6, 12]],
+    };
+    const openDocument = vi.fn<(item: GlobalSearchDocumentItem) => void>();
+    const v = verbs({ openDocument });
+    const row = fileContentRow(doc, v);
+    expect(row.meta).toBe('reports · Semis');
+    expect(row.detail).toEqual({ text: 'Gross margin reached 75%', spans: [[6, 12]] });
+    expect(row.preview).toMatchObject({ kind: 'document', docKind: 'workspace_file', title: 'q3_margin.md' });
+    run(row.actions[0]);
+    expect(openDocument).toHaveBeenCalledWith(doc);
   });
 });

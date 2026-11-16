@@ -27,14 +27,14 @@ const SERVER_LEAD_WAIT_MS = 2000;
 interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
-  /** DALTON-HOOK(global-search): What was typed after ⌘⇧K before the field had focus. */
+  /** What was typed after ⌘K before the field had focus. */
   typed: string;
   /** Where focus was when the palette was asked to open, to hand it back on close. */
   returnFocus: () => HTMLElement | null;
 }
 
 /**
- * DALTON-HOOK(global-search): The ⌘⇧K command palette: one field that finds threads, what was said in
+ * The ⌘K command palette: one field that finds threads, what was said in
  * them, files, tickers, workspaces, skills, pages, settings and actions, and
  * hands what was typed to the agent. A prefix typed first narrows it to one
  * kind (`$ / # " @ >`), and Tab on a workspace or thread to that place.
@@ -55,7 +55,7 @@ export default function CommandPalette({ open, onClose, typed, returnFocus }: Co
           className="command-palette"
           onOpenAutoFocus={(e) => {
             returnRef.current = returnFocus();
-            // DALTON-HOOK(global-search): ⌘⇧K opens a place to type, not a walk through the page with the
+            // ⌘K opens a place to type, not a walk through the page with the
             // keyboard, so the field takes focus as a clicked one would: no ring.
             e.preventDefault();
             focusWithoutRing((e.currentTarget as HTMLElement | null)?.querySelector('input'));
@@ -303,6 +303,8 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
   const rowName = actionsOf ? (actionsOf.symbol ?? actionsOf.title) : null;
   const trailing = editing ? null : (rowName ?? (drilled && spec.lens ? lensLabel(spec.lens, t) : null));
   const paneTarget = (actionsOf ?? active)?.preview ?? view.preview?.fallback;
+  // DALTON-HOOK(global-search): hide preview pane when the selected row has no preview target (e.g. path-only file hits)
+  const showPreview = !!view.preview && !isMobile && (!view.preview.requireTarget || !!paneTarget);
 
   return (
     <>
@@ -325,7 +327,8 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
         }}
       />
 
-      <div className={cn('command-palette-main', view.preview && !isMobile && 'is-paned')}>
+      {/* DALTON-HOOK(global-search): gate is-paned layout and PreviewPane on showPreview */}
+      <div className={cn('command-palette-main', showPreview && 'is-paned')}>
         <div
           ref={listRef}
           id={listId}
@@ -372,7 +375,8 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
             />
           )}
         </div>
-        {view.preview && !isMobile && <PreviewPane target={paneTarget} words={view.words} />}
+        {/* DALTON-HOOK(global-search): omit PreviewPane when selected file hit carries no document preview */}
+        {showPreview && <PreviewPane target={paneTarget} words={view.words} />}
       </div>
       {frames.length === 1 && !actionsOf && query === '' && <PrefixHint />}
 
