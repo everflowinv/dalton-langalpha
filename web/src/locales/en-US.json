@@ -198,18 +198,7 @@
     "plugins": "Plugins",
     "orders": "Orders",
     "menu": "Menu",
-    "search": "Search research ({{shortcut}})",
-    "globalSearch": {
-      "title": "Search",
-      "placeholder": "Search conversations and documents…",
-      "clear": "Clear search",
-      "conversations": "Conversations",
-      "documents": "Documents",
-      "memoTag": "Memo",
-      "idleHint": "Enter at least 2 characters to search your workspaces and memos.",
-      "noResults": "No matching conversations or documents found.",
-      "error": "Failed to load search results. Please try again."
-    }
+    "search": "Search research ({{shortcut}})"
   },
   "account": {
     "menuLabel": "Account menu"
@@ -8087,6 +8076,7 @@
     "untitledThread": "Untitled thread",
     "analystIn": "Analyst in {{workspace}}",
     "askTitle": "Ask “{{query}}”",
+    "searchFileContent": "Search file content for “{{query}}”",
     "actionsFor": "Actions for {{name}}",
     "group": {
       "recent": "Recent",
@@ -8101,12 +8091,15 @@
       "turns": "In conversations",
       "ticker": "Ticker",
       "threadsOn": "Your threads on {{symbol}}",
-      "files": "Files"
+      "files": "Files",
+      "memos": "Memos",
+      "fileContent": "File content"
     },
     "kind": {
       "workspace": "Workspace",
       "page": "Page",
-      "chart": "Chart"
+      "chart": "Chart",
+      "memo": "Memo"
     },
     "do": {
       "open": "Open",
@@ -8149,16 +8142,20 @@
     "narrowPlaceholder": "Narrow your threads on {{symbol}}",
     "busy": "Too many searches at once. Try again in a moment.",
     "searchFailed": "Couldn't search your conversations.",
+    "contentTimedOut": "Too many files to search content in time. Try a more specific keyword or scope to a workspace.",
     "kindFailed": {
       "threads": "Couldn't search your thread titles right now.",
       "turns": "Couldn't search what was said in your conversations right now.",
-      "files": "Couldn't search your files right now."
+      "files": "Couldn't search your files right now.",
+      "documents": "Couldn't search your memos and file contents right now."
     },
     "noMatches": "No matches",
     "showAll": {
       "threads": "Show all threads",
       "turns": "Show all conversation matches",
-      "files": "Show all files"
+      "files": "Show all files",
+      "memos": "Show all memos",
+      "fileContent": "Show all file content"
     },
     "preview": {
       "missing": "Nothing to preview yet.",
@@ -8184,6 +8181,8 @@
       "placeholders": {
         "tickers": "Search tickers by symbol or company",
         "files": "Search files by name or path",
+        "memos": "Search your memos",
+        "fileContent": "Search inside your files",
         "threads": "Search thread titles",
         "turns": "Search what was said in your conversations",
         "workspaces": "Search workspaces",

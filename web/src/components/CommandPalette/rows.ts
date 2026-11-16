@@ -12,9 +12,13 @@ import {
   PinOff,
   Search,
   Sparkles,
+  // DALTON-HOOK(global-search): icon for personal memo search hits
+  StickyNote,
 } from 'lucide-react';
 import type { MatchRange, SearchFileHit, SearchThreadHit, SearchTurnHit } from '@/api/search';
 import type { SlashCommand } from '@/components/ui/chat-input.types';
+// DALTON-HOOK(global-search): Dalton memo and workspace file-content search result types
+import type { GlobalSearchDocumentItem } from '@/lib/dalton/searchApi';
 import { fileGlyph } from '@/pages/ChatAgent/components/filePanel/fileMeta';
 import { sentMessageWords, threadName } from '@/pages/ChatAgent/components/messageList/sentMessage';
 import type { Thread } from '@/types/api';
@@ -53,6 +57,8 @@ export interface Verbs extends Names {
   /** A new thread in the workspace (where new work goes when unset), its composer holding a draft. */
   newThread: (workspaceId: string | undefined, draft?: { message?: string; commands?: SlashCommand[] }) => void;
   openFile: (workspaceId: string, path: string) => void;
+  // DALTON-HOOK(global-search): open Dalton memo or workspace file-content hit in target workspace
+  openDocument?: (doc: GlobalSearchDocumentItem) => void;
   openChart: (symbol: string) => void;
   copy: (text: string) => void;
   /** Opens an app path in a new tab; null in the desktop shell, which sends a new window to the system browser, signed out. */
@@ -288,6 +294,116 @@ export function fileRow(hit: SearchFileHit, v: Verbs): PaletteItem {
       ...inNewTab(fileHref(workspaceId, path), v),
       runs('copy-path', v.t('palette.do.copyPath'), Copy, () => v.copy(path)),
     ],
+  };
+}
+
+/**
+ * DALTON-HOOK(global-search): Convert Python Unicode code-point highlight spans
+ * into UTF-16 code-unit ranges expected by `Highlighted`.
+ */
+export function codePointSpansToUtf16(
+  text: string,
+  spans: readonly [number, number][],
+): [number, number][] {
+  if (!text || spans.length === 0) return [];
+  const cpOffsets: number[] = [0];
+  let utf16 = 0;
+  for (const ch of text) {
+    utf16 += ch.length;
+    cpOffsets.push(utf16);
+  }
+  const maxCp = cpOffsets.length - 1;
+  return spans.flatMap(([start, end]): [number, number][] => {
+    const s = Math.max(0, Math.min(start, maxCp));
+    const e = Math.max(s, Math.min(end, maxCp));
+    return e > s ? [[cpOffsets[s], cpOffsets[e]]] : [];
+  });
+}
+
+function openDocumentHit(doc: GlobalSearchDocumentItem, v: Verbs) {
+  if (v.openDocument) {
+    v.openDocument(doc);
+    return;
+  }
+  if (doc.workspace_id) {
+    v.openFile(doc.workspace_id, doc.path);
+  }
+}
+
+/**
+ * DALTON-HOOK(global-search): A personal memo hit from `/api/v1/dalton/search`.
+ */
+export function memoRow(doc: GlobalSearchDocumentItem, v: Verbs): PaletteItem {
+  const workspaceLabel = doc.workspace_id ? v.workspaceName(doc.workspace_id, doc.workspace_name) : '';
+  const meta = [workspaceLabel || v.t('palette.kind.memo'), v.when(doc.timestamp)].filter(Boolean).join(' · ');
+  const spans = doc.snippet ? codePointSpansToUtf16(doc.snippet, doc.highlights) : [];
+  return {
+    id: `memo:${doc.memo_key ?? doc.path}`,
+    icon: StickyNote,
+    title: doc.title,
+    meta: meta || undefined,
+    detail: doc.snippet ? { text: doc.snippet, spans } : undefined,
+    preview: doc.snippet
+      ? {
+          kind: 'document',
+          docKind: 'memo',
+          title: doc.title,
+          meta: workspaceLabel || v.t('palette.kind.memo'),
+          snippet: doc.snippet,
+          spans,
+        }
+      : undefined,
+    actions: [
+      runs('open', v.t('palette.do.open'), StickyNote, () => openDocumentHit(doc, v)),
+      runs('copy-path', v.t('palette.do.copyPath'), Copy, () => v.copy(doc.path)),
+    ],
+  };
+}
+
+/**
+ * DALTON-HOOK(global-search): A workspace file-content match from `/api/v1/dalton/search`.
+ */
+export function fileContentRow(doc: GlobalSearchDocumentItem, v: Verbs): PaletteItem {
+  const cut = doc.path.lastIndexOf('/') + 1;
+  const folder = doc.path.slice(0, Math.max(cut - 1, 0));
+  const workspaceLabel = doc.workspace_id ? v.workspaceName(doc.workspace_id, doc.workspace_name) : doc.workspace_name;
+  const meta = [folder, workspaceLabel].filter(Boolean).join(' · ');
+  const spans = doc.snippet ? codePointSpansToUtf16(doc.snippet, doc.highlights) : [];
+  const title = doc.title || doc.path.slice(cut);
+  return {
+    id: `file-content:${doc.workspace_id ?? ''}:${doc.path}`,
+    icon: fileGlyph(doc.path),
+    title,
+    meta: meta || undefined,
+    detail: doc.snippet ? { text: doc.snippet, spans } : undefined,
+    preview: doc.snippet
+      ? {
+          kind: 'document',
+          docKind: 'workspace_file',
+          title,
+          meta: meta || undefined,
+          snippet: doc.snippet,
+          spans,
+        }
+      : undefined,
+    actions: [
+      runs('open', v.t('palette.do.open'), FileText, () => openDocumentHit(doc, v)),
+      runs('copy-path', v.t('palette.do.copyPath'), Copy, () => v.copy(doc.path)),
+    ],
+  };
+}
+
+/**
+ * DALTON-HOOK(global-search): Selectable row in root/workspace views that opens
+ * the on-demand File content search view without scanning body text on every keystroke.
+ */
+export function searchFileContentRow(query: string, v: Verbs): PaletteItem {
+  const title = v.t('palette.searchFileContent', { query: query.trim() });
+  return {
+    id: 'search-file-content',
+    icon: Search,
+    title,
+    actions: [{ id: 'open', label: v.t('palette.do.open'), icon: Search, effect: 'open', view: { kind: 'fileContent', via: 'drill' } }],
   };
 }
 

@@ -58,8 +58,6 @@ const DesktopMenubar = React.lazy(() => import('./pages/DesktopMenubar/MenubarPa
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
-// DALTON-HOOK(global-search): persistent global search modal host and ⌘K listener across desktop and mobile
-import { GlobalSearchHost } from './components/dalton/globalSearchHost';
 // DALTON-HOOK(hide-trading): Dalton builds redirect /welcome onto the Chief of Staff interview
 import { isDaltonBuild } from './config/brand';
 import { DaltonOnboardingRedirect } from './pages/Onboarding/dalton/interview';
@@ -414,8 +412,6 @@ function AuthenticatedShell() {
       )}
       <ConnectConsentHost />
       <ConnectLandingHost />
-      {/* DALTON-HOOK(global-search): mount global search host at authenticated app shell */}
-      <GlobalSearchHost />
     </OnboardingProvider>
   );
 }

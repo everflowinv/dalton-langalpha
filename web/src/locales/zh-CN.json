@@ -198,18 +198,7 @@
     "plugins": "插件",
     "orders": "订单",
     "menu": "菜单",
-    "search": "搜索研究 ({{shortcut}})",
-    "globalSearch": {
-      "title": "全局搜索",
-      "placeholder": "搜索历史对话与文档…",
-      "clear": "清空搜索",
-      "conversations": "对话",
-      "documents": "文档",
-      "memoTag": "备忘录",
-      "idleHint": "输入至少 2 个字符，搜索你拥有的工作区与备忘录。",
-      "noResults": "未找到匹配的对话或文档。",
-      "error": "搜索失败，请稍后重试。"
-    }
+    "search": "搜索研究 ({{shortcut}})"
   },
   "account": {
     "menuLabel": "账号菜单"
@@ -8003,6 +7992,7 @@
     "untitledThread": "未命名对话",
     "analystIn": "{{workspace}} 的分析师",
     "askTitle": "提问“{{query}}”",
+    "searchFileContent": "在文件内容中搜索「{{query}}」",
     "actionsFor": "{{name}} 的操作",
     "group": {
       "recent": "最近",
@@ -8017,12 +8007,15 @@
       "turns": "对话内容",
       "ticker": "股票",
       "threadsOn": "与 {{symbol}} 相关的对话",
-      "files": "文件"
+      "files": "文件",
+      "memos": "备忘文档",
+      "fileContent": "文件内容"
     },
     "kind": {
       "workspace": "工作区",
       "page": "页面",
-      "chart": "图表"
+      "chart": "图表",
+      "memo": "备忘录"
     },
     "do": {
       "open": "打开",
@@ -8065,16 +8058,20 @@
     "narrowPlaceholder": "在与 {{symbol}} 相关的对话中筛选",
     "busy": "搜索过于频繁，请稍后再试。",
     "searchFailed": "无法搜索对话。",
+    "contentTimedOut": "文件太多，正文搜索超时，请换更具体的关键词或限定工作区",
     "kindFailed": {
       "threads": "暂时无法搜索对话标题。",
       "turns": "暂时无法搜索对话内容。",
-      "files": "暂时无法搜索文件。"
+      "files": "暂时无法搜索文件。",
+      "documents": "暂时无法搜索备忘文档和文件内容。"
     },
     "noMatches": "无匹配结果",
     "showAll": {
       "threads": "显示全部对话",
       "turns": "显示全部对话内容匹配",
-      "files": "显示全部文件"
+      "files": "显示全部文件",
+      "memos": "显示全部备忘文档",
+      "fileContent": "显示全部文件内容"
     },
     "preview": {
       "missing": "暂无可预览的内容。",
@@ -8100,6 +8097,8 @@
       "placeholders": {
         "tickers": "按代码或公司名搜索股票",
         "files": "按文件名或路径搜索文件",
+        "memos": "搜索备忘文档",
+        "fileContent": "搜索文件内容",
         "threads": "搜索对话标题",
         "turns": "搜索对话中说过的内容",
         "workspaces": "搜索工作区",

@@ -1,6 +1,6 @@
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
@@ -9,13 +9,10 @@ import {
   paletteKeyShortcuts,
   paletteShortcut,
 } from '../CommandPaletteProvider';
-import {
-  closeGlobalSearch,
-  GlobalSearchHost,
-} from '@/components/dalton/globalSearchHost';
 import AppSidebar from '@/components/Sidebar/AppSidebar';
+import BottomTabBar from '@/components/BottomTabBar/BottomTabBar';
 
-// DALTON-HOOK(global-search): test ⌘K (GlobalSearch) vs ⌘⇧K (CommandPalette) separation and sidebar labels.
+// DALTON-HOOK(global-search): test ⌘K / ⌘⇧K shortcuts, Monaco yield, sidebar buttons, and mobile BottomTabBar entry.
 vi.mock('../CommandPalette', () => ({
   default: ({ open, onClose }: { open: boolean; onClose: () => void }) =>
     open ? (
@@ -68,6 +65,14 @@ vi.mock('@/pages/ChatAgent/components/dalton/TeamSharing', () => ({
   useTeamWorkspaces: () => ({ data: undefined }),
 }));
 
+vi.mock('@/components/nav/useNavItems', () => ({
+  useNavItems: () => [],
+}));
+
+vi.mock('@/components/nav/useNavActive', () => ({
+  useNavActive: () => () => false,
+}));
+
 function setNavigatorPlatform(platform: string) {
   Object.defineProperty(navigator, 'platform', {
     configurable: true,
@@ -83,109 +88,109 @@ function setNavigatorPlatform(platform: string) {
   });
 }
 
-function renderShell() {
+function renderShell(collapsed = false) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={['/dashboard']}>
         <CommandPaletteProvider>
           <AppSidebar
-            collapsed={false}
+            collapsed={collapsed}
             onToggleCollapse={vi.fn()}
             width={260}
             onWidthChange={vi.fn()}
           />
+          <BottomTabBar />
           <div className="monaco-editor">
             <textarea data-testid="monaco-input" />
           </div>
         </CommandPaletteProvider>
-        <GlobalSearchHost />
       </MemoryRouter>
     </QueryClientProvider>,
   );
 }
 
-describe('CommandPaletteProvider vs GlobalSearchHost shortcuts', () => {
+describe('CommandPaletteProvider shortcuts and entry points', () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(navigator, 'platform');
   const originalUaData = Object.getOwnPropertyDescriptor(navigator, 'userAgentData');
   const originalTouch = Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints');
 
   beforeEach(() => {
-    closeGlobalSearch();
     setNavigatorPlatform('MacIntel');
   });
 
   afterEach(() => {
-    closeGlobalSearch();
     if (originalPlatform) Object.defineProperty(navigator, 'platform', originalPlatform);
     if (originalUaData) Object.defineProperty(navigator, 'userAgentData', originalUaData);
     if (originalTouch) Object.defineProperty(navigator, 'maxTouchPoints', originalTouch);
   });
 
-  it('opens only GlobalSearch on ⌘K and only CommandPalette on ⌘⇧K (Mac)', async () => {
-    renderShell();
+  it('opens CommandPalette on both ⌘K and ⌘⇧K on Mac and keeps ⌘K shortcut hints', async () => {
+    expect(paletteShortcut()).toBe('⌘K');
+    expect(paletteKeyShortcuts()).toBe('Meta+K');
+    const view = renderShell();
+    const sidebar = view.container.querySelector('aside.sidebar') as HTMLElement;
 
-    // Sidebar renders both distinct entries with their own shortcuts
-    expect(screen.getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ })).toBeInTheDocument();
-    const paletteBtn = screen.getByRole('button', { name: /Commands & jump|命令与跳转/ });
-    expect(paletteBtn).toBeInTheDocument();
-    expect(paletteBtn).toHaveAttribute('aria-keyshortcuts', 'Meta+Shift+K');
-    expect(paletteBtn).toHaveTextContent('⌘⇧K');
+    expect(within(sidebar).getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ })).toBeInTheDocument();
+    const paletteBtn = within(sidebar).getByRole('button', { name: /Commands & jump|命令与跳转/ });
+    expect(paletteBtn).toHaveAttribute('aria-keyshortcuts', 'Meta+K');
+    expect(paletteBtn).toHaveTextContent('⌘K');
 
-    // ⌘K opens only Dalton Global Search
+    // ⌘K opens Command Palette
     fireEvent.keyDown(window, { key: 'k', metaKey: true, shiftKey: false });
-    expect(await screen.findByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).toBeInTheDocument();
+    expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
+
+    // ⌘K toggles closed
+    fireEvent.keyDown(window, { key: 'k', metaKey: true, shiftKey: false });
     expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
 
-    act(() => {
-      closeGlobalSearch();
-    });
-    await waitFor(() => {
-      expect(screen.queryByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).not.toBeInTheDocument();
-    });
-
-    // ⌘⇧K opens only Command Palette
+    // ⌘⇧K also opens Command Palette
     fireEvent.keyDown(window, { key: 'K', metaKey: true, shiftKey: true });
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).not.toBeInTheDocument();
   });
 
-  it('does not steal ⌘⇧K inside .monaco-editor and formats Windows shortcuts as Ctrl+Shift+K', async () => {
+  it('does not steal ⌘K or ⌘⇧K inside .monaco-editor and formats Windows shortcuts as Ctrl K', async () => {
     setNavigatorPlatform('Win32');
-    expect(paletteShortcut()).toBe('Ctrl+Shift+K');
-    expect(paletteKeyShortcuts()).toBe('Control+Shift+K');
+    expect(paletteShortcut()).toBe('Ctrl K');
+    expect(paletteKeyShortcuts()).toBe('Control+K');
 
     renderShell();
 
-    // Monaco keeps ⌘⇧K / Ctrl+Shift+K
     const monacoInput = screen.getByTestId('monaco-input');
+    fireEvent.keyDown(monacoInput, { key: 'k', ctrlKey: true, shiftKey: false });
+    expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
+
     fireEvent.keyDown(monacoInput, { key: 'K', ctrlKey: true, shiftKey: true });
     expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
 
-    // Outside Monaco, Ctrl+Shift+K opens CommandPalette, not GlobalSearch
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true, shiftKey: false });
+    expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true, shiftKey: false });
+    expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
+
     fireEvent.keyDown(window, { key: 'K', ctrlKey: true, shiftKey: true });
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).not.toBeInTheDocument();
   });
 
-  it('closes GlobalSearch when CommandPalette opens and closes CommandPalette when GlobalSearch opens', async () => {
-    renderShell();
+  it('opens CommandPalette from expanded sidebar button, collapsed rail button, and BottomTabBar', async () => {
+    const expanded = renderShell(false);
 
-    // Open GlobalSearch via ⌘K, then open CommandPalette via ⌘⇧K -> GlobalSearch closes
-    fireEvent.keyDown(window, { key: 'k', metaKey: true, shiftKey: false });
-    expect(await screen.findByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: 'K', metaKey: true, shiftKey: true });
+    fireEvent.click(screen.getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ }));
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.queryByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).not.toBeInTheDocument();
-    });
+    fireEvent.click(screen.getByRole('button', { name: 'Close palette' }));
+    expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
 
-    // Now press ⌘K while CommandPalette is open -> GlobalSearch opens and CommandPalette closes
-    fireEvent.keyDown(window, { key: 'k', metaKey: true, shiftKey: false });
-    expect(await screen.findByPlaceholderText(/Search conversations and documents|搜索历史对话与文档/)).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
-    });
+    // Mobile BottomTabBar search button also opens CommandPalette
+    const bottomBar = expanded.container.querySelector('.bottom-tab-bar') as HTMLElement;
+    fireEvent.click(within(bottomBar).getByRole('button', { name: /Commands & jump|命令与跳转/ }));
+    expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
+
+    expanded.unmount();
+
+    // Collapsed sidebar rail search button opens CommandPalette
+    renderShell(true);
+    fireEvent.click(screen.getByRole('button', { name: /Search research \(⌘K\)|搜索研究 \(⌘K\)/ }));
+    expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
   });
 });

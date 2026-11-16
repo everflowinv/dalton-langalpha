@@ -26,7 +26,11 @@ export type Place =
  * or opened from its group (a drill-in), or one ticker and the threads and
  * conversations that name it.
  */
-export type Lens = { kind: Kind; via: 'prefix' | 'drill' } | { kind: 'ticker'; symbol: string; via: 'drill' };
+export type Lens =
+  | { kind: Kind; via: 'prefix' | 'drill' }
+  | { kind: 'ticker'; symbol: string; via: 'drill' }
+  // DALTON-HOOK(global-search): dedicated drill-in views for Memos and File content groups
+  | { kind: 'memos' | 'fileContent'; via: 'drill' };
 
 /** One view of the palette: everything or one lens, everywhere or within a place. */
 export interface ViewSpec {
@@ -80,7 +84,8 @@ export interface PaletteItem {
   /** A thread pinned to the top of its workspace: a quiet pin at the row's end. */
   pinned?: boolean;
   /** A second line: the words a conversation matched, after who said them. */
-  detail?: { label: string; text: string; spans?: [number, number][] };
+  // DALTON-HOOK(global-search): allow document snippets without a speaker label
+  detail?: { label?: string; text: string; spans?: [number, number][] };
   /** What the preview pane shows while the row is selected. */
   preview?: PreviewTarget;
   /** What Tab narrows the search to: the workspace or thread the row is. */
@@ -103,4 +108,13 @@ export type PreviewTarget =
   /** A thread's latest exchange. */
   | { kind: 'thread'; threadId: string }
   /** A ticker's price and change. */
-  | { kind: 'ticker'; symbol: string };
+  | { kind: 'ticker'; symbol: string }
+  // DALTON-HOOK(global-search): preview target for memo and file-content snippet matches
+  | {
+      kind: 'document';
+      docKind: 'memo' | 'workspace_file';
+      title: string;
+      meta?: string;
+      snippet: string;
+      spans?: [number, number][];
+    };

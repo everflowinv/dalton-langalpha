@@ -2277,6 +2277,9 @@ async def global_search_endpoint(
     user_id: CurrentUserId,
     q: str = Query(default=""),
     limit: int = Query(default=20, ge=1, le=50),
+    include_conversations: bool = Query(default=True),
+    workspace_id: str | None = Query(default=None),
+    include_content: bool = Query(default=True),
 ) -> dict[str, Any]:
     # Known limitation: when object storage is enabled for workspace_files,
     # file content is stored in external blobs rather than workspace_files.content_text
@@ -2289,9 +2292,24 @@ async def global_search_endpoint(
             status_code=422,
             detail="Search query 'q' must be at least 2 characters after trimming whitespace.",
         )
-    from src.dalton.database.search import global_search
+    from src.dalton.database.search import global_search, parse_optional_uuid
 
-    return await global_search(user_id, cleaned_q, limit=limit)
+    try:
+        canonical_workspace_id = parse_optional_uuid(workspace_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Query parameter 'workspace_id' must be a valid UUID.",
+        ) from None
+
+    return await global_search(
+        user_id,
+        cleaned_q,
+        limit=limit,
+        include_conversations=include_conversations,
+        workspace_id=canonical_workspace_id,
+        include_content=include_content,
+    )
 
 
 from src.dalton.app.channels_router import channels_router  # noqa: E402

@@ -69,9 +69,6 @@ function HistoryButtons() {
   );
 }
 
-// DALTON-HOOK(global-search): global search trigger
-import { openGlobalSearch } from '@/components/dalton/globalSearchHost';
-
 interface AppSidebarProps {
   collapsed: boolean;
   onToggleCollapse: () => void;
@@ -186,12 +183,8 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
   // Same create flow as the gallery, without leaving the current page first.
   const openCreateWorkspace = useOpenCreateWorkspace();
 
-  // DALTON-HOOK(global-search): global search shortcut label
-  const shortcutLabel =
-    typeof navigator !== 'undefined' && /Win|Linux/i.test(navigator.platform || navigator.userAgent || '')
-      ? 'Ctrl+K'
-      : '⌘K';
-  const searchLabel = t('sidebar.search', { shortcut: shortcutLabel });
+  // DALTON-HOOK(global-search): Command Palette shortcut label for sidebar search buttons
+  const searchLabel = t('sidebar.search', { shortcut: paletteShortcut() });
 
   // One persistent <aside> so the width transition runs across mode flips;
   // the keyed fragments force each mode's content to cleanly remount (React
@@ -225,8 +218,10 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
               <button
                 type="button"
                 className="sidebar-rail-toggle"
-                onClick={openGlobalSearch}
+                onClick={() => palette?.open()}
+                onPointerEnter={palette?.preload}
                 aria-label={searchLabel}
+                aria-keyshortcuts={paletteKeyShortcuts()}
                 title={searchLabel}
               >
                 <Search className="h-4 w-4" />
@@ -310,8 +305,10 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         <button
           type="button"
           className="sidebar-collapse-btn"
-          onClick={openGlobalSearch}
+          onClick={() => palette?.open()}
+          onPointerEnter={palette?.preload}
           aria-label={searchLabel}
+          aria-keyshortcuts={paletteKeyShortcuts()}
           title={searchLabel}
         >
           <Search className="h-4 w-4" />

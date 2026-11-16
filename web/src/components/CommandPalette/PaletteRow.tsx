@@ -68,7 +68,8 @@ export function PaletteRow({
         </span>
         {detail && (
           <span className="command-palette-detail">
-            <span className="command-palette-detail-label">{detail.label}</span>
+            {/* DALTON-HOOK(global-search): document snippet rows omit speaker prefix */}
+            {detail.label && <span className="command-palette-detail-label">{detail.label}</span>}
             <Highlighted text={detail.text} spans={detail.spans} />
           </span>
         )}
