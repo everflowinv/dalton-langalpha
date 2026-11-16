@@ -3,7 +3,9 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { TagBadge } from '@/components/mcp/McpPrimitives';
 import { SegmentedControl } from '@/components/ui/segmented-control';
-import { DaltonStatusBadge, type DaltonStatusTone } from '@/components/dalton/primitives';
+// Direct module imports: the primitives barrel also re-exports the
+// confirm dialog, which would pull its animation library onto first load.
+import { DaltonStatusBadge, type DaltonStatusTone } from '@/components/dalton/primitives/DaltonStatusBadge';
 import { useUser } from '@/hooks/useUser';
 import { queryKeys } from '@/lib/queryKeys';
 import { localDateStr } from '@/lib/utils';

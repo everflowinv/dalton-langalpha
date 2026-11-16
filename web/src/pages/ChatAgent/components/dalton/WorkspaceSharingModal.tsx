@@ -8,11 +8,10 @@ import { Button } from '@/components/ui/button';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { ToggleSwitch } from '@/components/ui/switch';
-import {
-  DaltonInlineNotice,
-  TOOLBAR_CHIP_CLASS,
-  toolbarChipStyle,
-} from '@/components/dalton/primitives';
+// Direct module imports: the primitives barrel also re-exports the
+// confirm dialog, which would pull its animation library onto first load.
+import { DaltonInlineNotice } from '@/components/dalton/primitives/DaltonStatusBadge';
+import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { queryKeys } from '@/lib/queryKeys';
 import { cn } from '@/lib/utils';
 import {
