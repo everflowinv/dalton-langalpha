@@ -117,8 +117,11 @@ export function InvestingProfilePanel() {
               <dl className="settings-facts grid grid-cols-[minmax(0,38%)_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-[0.8125rem] sm:grid-cols-[minmax(0,180px)_minmax(0,1fr)] sm:gap-x-4">
                 {entries.map(([key, value]) => (
                   <div key={key} className="contents">
+                    {/* DALTON-HOOK(settings-reorg): translate known onboarding preference keys while preserving fallback */}
                     <dt style={{ color: 'var(--color-text-tertiary)' }}>
-                      {key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}
+                      {t(`settings.investingProfileKeys.${key}`, {
+                        defaultValue: key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+                      })}
                     </dt>
                     <dd style={{ color: 'var(--color-text-primary)', wordBreak: 'break-word' }}>
                       {formatValue(value)}

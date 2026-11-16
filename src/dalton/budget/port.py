@@ -36,13 +36,13 @@ def format_daily_budget_exhausted_message(
     if not configured and cap_usd <= 0:
         return (
             "未设置日预算（当前按 $0.00 拒绝）。"
-            "请前往 设置 → 模型 → Dalton 预算 填写每日美元上限后再发起研究任务。"
+            "请前往 设置 → 用量与预算 填写每日美元上限后再发起研究任务。"
         )
     return (
         f"今日预算 ${cap_usd:.2f} 已用完（已结算 ${settled_usd:.2f}，"
         f"未结算预留 ${open_reserved_usd:.2f}）。"
         "订阅模型不占现金额度，但本轮的子智能体和后台任务使用现金模型。"
-        "可在 设置 → 模型 → Dalton 预算 调高额度，或等北京时间 00:00 重置。"
+        "可在 设置 → 用量与预算 调高额度，或等北京时间 00:00 重置。"
     )
 
 

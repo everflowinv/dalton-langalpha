@@ -1617,8 +1617,12 @@ async def test_bridge_state_write_oserror_returns_500_and_ok_false_and_cookie_ov
     assert "toggleDaltonSystemJob" not in card_src
     assert "runDaltonSystemJobNow" not in card_src
     assert "立即运行" not in card_src
-    assert "只读查看系统底层定时任务的运行状态" in card_src
-    assert 'data-testid="system-jobs-open-company"' in card_src
+    # The read-only promise now lives in the card's translated description.
+    zh = json.loads((repo_root / "web/src/locales/zh-CN.json").read_text(encoding="utf-8"))
+    assert zh["dalton"]["systemJobs"]["description"].startswith("只读查看")
+    assert "useRunDaltonSystemJobNow" not in card_src
+    assert "useToggleDaltonSystemJob" not in card_src
+    assert 'testId="dalton-system-jobs-automations-link"' in card_src
 
     toggle_src = (
         repo_root / "web/src/pages/ChatAgent/components/dalton/WorkspaceTrackingToggle.tsx"

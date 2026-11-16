@@ -1,523 +1,468 @@
-import React, { useEffect, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router';
-import { useTranslation } from 'react-i18next';
+import { useEffect, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, ChevronRight, ExternalLink, Loader2, Plus, RefreshCw } from 'lucide-react';
-import { useAuth } from '@/contexts/AuthContext';
+import { ArrowUpRight, ChevronDown, ChevronRight } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { useLocation, useNavigate } from 'react-router';
+import { Button } from '@/components/ui/button';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { Input } from '@/components/ui/input';
+import { Select } from '@/components/ui/select';
+import TimezonePicker from '@/components/TimezonePicker';
+import { useUser } from '@/hooks/useUser';
 import {
   archiveDaltonCoverageUnit,
   bindDaltonCoverageUnit,
   coverageUnitErrorCode,
-  type CoverageUnitDetail,
-  type CoverageUnitEntry,
-  type RegisterCoverageUnitPayload,
-  type SectorMember,
-  type UnclassifiedWorkspace,
   registerDaltonCoverageUnit,
   splitCoverageUnits,
   unbindDaltonCoverageUnit,
   useDaltonCoverageUnitDetail,
   useDaltonCoverageUnits,
+  type CoverageUnitDetail,
+  type CoverageUnitEntry,
+  type SectorMember,
+  type ThesisSummary,
+  type UnclassifiedWorkspace,
 } from '@/lib/dalton/coverage';
+
+type CoverageCompanyPayload = NonNullable<CoverageUnitDetail['company']>;
+type CoverageSectorPayload = NonNullable<CoverageUnitDetail['sector']>;
 import { queryKeys } from '@/lib/queryKeys';
-import { cn } from '@/lib/utils';
+import {
+  DaltonActionConfirmButton,
+  DaltonInlineNotice,
+  DaltonItemRow,
+  DaltonKeyValueList,
+  DaltonLoadingRow,
+  DaltonRefreshButton,
+  DaltonSettingsCard,
+  DaltonStatusBadge,
+  DaltonToolbarPill,
+} from './primitives';
 
 type CoverageTab = 'sectors' | 'companies' | 'unclassified';
 
-function StateBadge({ label, on }: { label: string; on: boolean }) {
-  return (
-    <span
-      data-testid={`coverage-badge-${label}`}
-      className={cn(
-        'rounded-full px-2 py-0.5 text-[11px] font-medium',
-        on
-          ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-          : 'bg-muted text-muted-foreground',
-      )}
-    >
-      {label}
-    </span>
-  );
+interface NoticeState {
+  tone: 'success' | 'error' | 'info';
+  message: string;
 }
 
-function UnitBadges({ unit }: { unit: CoverageUnitEntry }) {
-  const { t } = useTranslation();
-  return (
-    <span className="flex flex-wrap items-center gap-1">
-      <StateBadge label={t('dalton.coverage.readable')} on={unit.readable} />
-      <StateBadge label={t('dalton.coverage.delegatable')} on={unit.delegatable} />
-      <StateBadge label={t('dalton.coverage.autoTracked')} on={unit.auto_tracked} />
-    </span>
-  );
-}
-
-function OpenWorkspaceLink({ workspaceId }: { workspaceId: string }) {
-  const { t } = useTranslation();
+function OpenWorkspaceLink({
+  workspaceId,
+  label,
+}: {
+  workspaceId: string;
+  label: string;
+}) {
   const navigate = useNavigate();
   return (
-    <button
+    <Button
       type="button"
-      data-testid={`coverage-open-workspace-${workspaceId}`}
-      onClick={(e) => {
-        e.stopPropagation();
-        navigate(`/chat/${workspaceId}`);
-      }}
-      className="inline-flex items-center gap-1 rounded border border-border/60 bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+      variant="ghost"
+      size="sm"
+      className="h-7 gap-1 px-2 text-xs"
+      style={{ color: 'var(--color-accent-primary)' }}
+      onClick={() => navigate(`/chat/${workspaceId}`)}
+      data-testid={`dalton-coverage-open-ws-${workspaceId}`}
     >
-      <ExternalLink className="h-3 w-3" />
-      {t('dalton.coverage.openWorkspace')}
-    </button>
+      <span>{label}</span>
+      <ArrowUpRight className="h-3 w-3" />
+    </Button>
   );
 }
 
-type TFunc = ReturnType<typeof useTranslation>['t'];
-
-/** 写路径错误文案：有稳定错误码走 i18n，否则退回原始 message。 */
-function coverageMutationError(err: unknown, t: TFunc): string {
-  const code = coverageUnitErrorCode(err);
-  if (code) {
-    const keyed = t(`dalton.coverage.errors.${code}`, { defaultValue: '' });
-    if (keyed) return keyed;
-  }
-  return err instanceof Error && err.message
-    ? err.message
-    : t('dalton.coverage.errors.fallback');
-}
-
-/** 新建行业单元（P5）：只登记 sector；绑定在单元行上单独做。 */
-function RegisterSectorForm() {
+function UnitCapabilityBadges({
+  readable,
+  delegatable,
+  autoTracked,
+}: {
+  readable?: boolean;
+  delegatable?: boolean;
+  autoTracked?: boolean;
+}) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
-  const [slug, setSlug] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [researchTz, setResearchTz] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [createdSlug, setCreatedSlug] = useState<string | null>(null);
-
-  const registerMutation = useMutation({
-    mutationFn: (payload: RegisterCoverageUnitPayload) => registerDaltonCoverageUnit(payload),
-    onSuccess: (unit) => {
-      setError(null);
-      setCreatedSlug(unit.slug);
-      setSlug('');
-      setDisplayName('');
-      setResearchTz('');
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.coverageUnits() });
-    },
-    onError: (err: unknown) => {
-      setCreatedSlug(null);
-      setError(coverageMutationError(err, t));
-    },
-  });
-
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanSlug = slug.trim();
-    if (!cleanSlug) {
-      setError(t('dalton.coverage.errors.invalid_slug'));
-      return;
-    }
-    registerMutation.mutate({
-      kind: 'sector',
-      slug: cleanSlug,
-      display_name: displayName.trim() || undefined,
-      research_tz: researchTz.trim() || undefined,
-    });
-  };
-
   return (
-    <form
-      onSubmit={submit}
-      data-testid="coverage-register-form"
-      className="mb-3 rounded-md border border-border/50 bg-background/40 p-2"
-    >
-      <div className="flex flex-wrap items-center gap-2 pb-2">
-        <span className="inline-flex items-center gap-1 text-xs font-medium text-foreground">
-          <Plus className="h-3.5 w-3.5 text-muted-foreground" />
-          {t('dalton.coverage.registerTitle')}
-        </span>
-        <span className="text-[11px] text-muted-foreground">
-          {t('dalton.coverage.registerHint')}
-        </span>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          value={slug}
-          onChange={(e) => setSlug(e.target.value)}
-          placeholder={t('dalton.coverage.fieldSlug')}
-          aria-label={t('dalton.coverage.fieldSlug')}
-          data-testid="coverage-register-slug"
-          className="w-56 rounded border border-border/60 bg-background px-2 py-1 text-xs"
-        />
-        <input
-          value={displayName}
-          onChange={(e) => setDisplayName(e.target.value)}
-          placeholder={t('dalton.coverage.fieldDisplayName')}
-          aria-label={t('dalton.coverage.fieldDisplayName')}
-          data-testid="coverage-register-display-name"
-          className="w-44 rounded border border-border/60 bg-background px-2 py-1 text-xs"
-        />
-        <input
-          value={researchTz}
-          onChange={(e) => setResearchTz(e.target.value)}
-          placeholder={t('dalton.coverage.fieldResearchTz')}
-          aria-label={t('dalton.coverage.fieldResearchTz')}
-          data-testid="coverage-register-tz"
-          className="w-56 rounded border border-border/60 bg-background px-2 py-1 text-xs"
-        />
-        <button
-          type="submit"
-          disabled={registerMutation.isPending}
-          data-testid="coverage-register-submit"
-          className="rounded-md border border-border/60 bg-background px-2.5 py-1 text-xs font-medium hover:bg-muted/60 disabled:opacity-50"
-        >
-          {registerMutation.isPending
-            ? t('dalton.coverage.registering')
-            : t('dalton.coverage.register')}
-        </button>
-      </div>
-      {createdSlug && (
-        <div
-          data-testid="coverage-register-done"
-          className="pt-1 text-[11px] text-emerald-600 dark:text-emerald-400"
-        >
-          {t('dalton.coverage.registeredSlug', { slug: createdSlug })}
-        </div>
+    <>
+      {readable && (
+        <DaltonStatusBadge tone="neutral" label={t('dalton.coverage.readable')} />
       )}
-      {error && (
-        <div
-          role="alert"
-          data-testid="coverage-register-error"
-          className="pt-1 text-[11px] text-destructive"
-        >
-          {error}
-        </div>
+      {delegatable && (
+        <DaltonStatusBadge tone="accent" label={t('dalton.coverage.delegatable')} />
       )}
-    </form>
+      {autoTracked && (
+        <DaltonStatusBadge tone="success" label={t('dalton.coverage.autoTracked')} />
+      )}
+    </>
   );
 }
 
-/** UnitManageActions 只消费这两个字段；CoverageUnitEntry 与 CoverageUnitDetail 都结构满足。 */
-interface ManageableUnit {
-  unit_id: string;
-  workspace_id: string | null;
+interface ManageActionsProps {
+  unitId: string;
+  unitName: string;
+  workspaceId: string | null | undefined;
+  unclassified: UnclassifiedWorkspace[];
+  selectedWs: string;
+  onSelectWs: (workspaceId: string) => void;
+  onBind: (unitId: string, workspaceId: string) => Promise<void>;
+  onUnbind: (unitId: string) => Promise<void>;
+  onArchive: (unitId: string) => Promise<void>;
+  binding: boolean;
+  unbinding: boolean;
+  archiving: boolean;
 }
 
-/** 本人单元行上的管理操作（P5）：绑定（选本人的未绑定工作区）/ 解绑 / 归档。 */
 function UnitManageActions({
-  unit,
+  unitId,
+  unitName,
+  workspaceId,
   unclassified,
-}: {
-  unit: ManageableUnit;
-  unclassified: UnclassifiedWorkspace[];
-}) {
+  selectedWs,
+  onSelectWs,
+  onBind,
+  onUnbind,
+  onArchive,
+  binding,
+  unbinding,
+  archiving,
+}: ManageActionsProps) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
-  const [wsChoice, setWsChoice] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [hint, setHint] = useState<string | null>(null);
-
-  const invalidate = () => {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.coverageUnits() });
-    void queryClient.invalidateQueries({
-      queryKey: queryKeys.dalton.coverageUnitDetail(unit.unit_id),
-    });
-  };
-
-  const bindMutation = useMutation({
-    mutationFn: (wsId: string) => bindDaltonCoverageUnit(unit.unit_id, wsId),
-    onSuccess: (row) => {
-      setError(null);
-      setWsChoice('');
-      setHint(row.kind === 'sector' ? t('dalton.coverage.boundHintSector') : null);
-      invalidate();
-    },
-    onError: (err: unknown) => setError(coverageMutationError(err, t)),
-  });
-  const unbindMutation = useMutation({
-    mutationFn: () => unbindDaltonCoverageUnit(unit.unit_id),
-    onSuccess: () => {
-      setError(null);
-      setHint(null);
-      invalidate();
-    },
-    onError: (err: unknown) => setError(coverageMutationError(err, t)),
-  });
-  const archiveMutation = useMutation({
-    mutationFn: () => archiveDaltonCoverageUnit(unit.unit_id),
-    onSuccess: () => {
-      setError(null);
-      setHint(null);
-      invalidate();
-    },
-    onError: (err: unknown) => setError(coverageMutationError(err, t)),
-  });
-
-  const busy =
-    bindMutation.isPending || unbindMutation.isPending || archiveMutation.isPending;
-  const actionBtn =
-    'rounded border border-border/60 bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50';
+  const busy = binding || unbinding || archiving;
 
   return (
-    <div
-      className="flex w-full flex-col gap-1 pt-1"
-      data-testid={`coverage-manage-${unit.unit_id}`}
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        {!unit.workspace_id && (
-          <>
-            <select
-              value={wsChoice}
-              onChange={(e) => setWsChoice(e.target.value)}
-              data-testid={`coverage-bind-select-${unit.unit_id}`}
-              aria-label={t('dalton.coverage.bindTargetNone')}
-              disabled={busy || unclassified.length === 0}
-              className="max-w-56 rounded border border-border/60 bg-background px-1.5 py-0.5 text-[11px]"
-            >
-              <option value="">{t('dalton.coverage.bindTargetNone')}</option>
-              {unclassified.map((ws) => (
-                <option key={ws.workspace_id} value={ws.workspace_id}>
-                  {ws.name ?? ws.workspace_id}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={() => {
-                if (wsChoice) bindMutation.mutate(wsChoice);
-              }}
-              disabled={busy || !wsChoice}
-              data-testid={`coverage-bind-btn-${unit.unit_id}`}
-              className={actionBtn}
-            >
-              {bindMutation.isPending
-                ? t('dalton.coverage.binding')
-                : t('dalton.coverage.bind')}
-            </button>
-          </>
-        )}
-        {unit.workspace_id && (
-          <button
-            type="button"
-            onClick={() => unbindMutation.mutate()}
-            disabled={busy}
-            data-testid={`coverage-unbind-btn-${unit.unit_id}`}
-            className={actionBtn}
+    <div className="flex flex-wrap items-center gap-2">
+      {!workspaceId ? (
+        <>
+          <Select
+            value={selectedWs}
+            onChange={(e) => onSelectWs(e.target.value)}
+            aria-label={t('dalton.coverage.bindTargetNone')}
+            disabled={busy || unclassified.length === 0}
+            className="w-44 text-xs"
+            data-testid={`dalton-coverage-bind-select-${unitId}`}
           >
-            {t('dalton.coverage.unbind')}
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={() => archiveMutation.mutate()}
-          disabled={busy}
-          data-testid={`coverage-archive-btn-${unit.unit_id}`}
-          className={actionBtn}
-        >
-          {t('dalton.coverage.archiveUnit')}
-        </button>
-      </div>
-      {hint && (
-        <div
-          data-testid={`coverage-bind-hint-${unit.unit_id}`}
-          className="text-[11px] text-muted-foreground"
-        >
-          {hint}
-        </div>
+            <option value="">{t('dalton.coverage.bindTargetNone')}</option>
+            {unclassified.map((ws) => (
+              <option key={ws.workspace_id} value={ws.workspace_id}>
+                {ws.name || ws.workspace_id}
+              </option>
+            ))}
+          </Select>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 text-xs"
+            disabled={!selectedWs || busy}
+            onClick={() => void onBind(unitId, selectedWs)}
+            data-testid={`dalton-coverage-bind-btn-${unitId}`}
+          >
+            {binding ? t('dalton.coverage.binding') : t('dalton.coverage.bind')}
+          </Button>
+        </>
+      ) : (
+        <DaltonActionConfirmButton
+          label={t('dalton.coverage.unbind')}
+          confirmTitle={t('dalton.coverage.unbindTitle')}
+          confirmMessage={t('dalton.coverage.unbindConfirm', { unit: unitName })}
+          confirmLabel={t('dalton.coverage.unbind')}
+          busy={unbinding}
+          onConfirm={() => onUnbind(unitId)}
+          testId={`dalton-coverage-unbind-${unitId}`}
+        />
       )}
-      {error && (
-        <div
-          role="alert"
-          data-testid={`coverage-manage-error-${unit.unit_id}`}
-          className="text-[11px] text-destructive"
-        >
-          {error}
-        </div>
-      )}
+
+      <DaltonActionConfirmButton
+        label={t('dalton.coverage.archiveUnit')}
+        confirmTitle={t('dalton.coverage.archiveTitle')}
+        confirmMessage={t('dalton.coverage.archiveConfirm', { unit: unitName })}
+        confirmLabel={t('dalton.coverage.archiveUnit')}
+        busy={archiving}
+        onConfirm={() => onArchive(unitId)}
+        testId={`dalton-coverage-archive-${unitId}`}
+      />
     </div>
   );
 }
 
-/** 行业成员行：登记了公司单元的成员可展开该公司详情（关联行业 + 待复核）。 */
-function MemberRow({
-  member,
-  expanded,
-  onToggle,
-  unclassified,
-}: {
-  member: SectorMember;
-  expanded: boolean;
-  onToggle: () => void;
-  unclassified: UnclassifiedWorkspace[];
-}) {
+function ThesisBlock({ thesis }: { thesis: ThesisSummary | null | undefined }) {
   const { t } = useTranslation();
-  const { userId } = useAuth();
-  const detailQuery = useDaltonCoverageUnitDetail(
-    expanded && member.company_unit_id ? member.company_unit_id : null,
-  );
-  const hasUnit = Boolean(member.company_unit_id);
-  return (
-    <div
-      data-testid={`coverage-member-${member.member_id ?? member.name ?? ''}`}
-      className="py-1"
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        {hasUnit ? (
-          <button
-            type="button"
-            onClick={onToggle}
-            data-testid={`coverage-member-toggle-${member.member_id ?? ''}`}
-            className="inline-flex items-center gap-1 text-xs text-foreground hover:underline"
-          >
-            {expanded ? (
-              <ChevronDown className="h-3 w-3 text-muted-foreground" />
-            ) : (
-              <ChevronRight className="h-3 w-3 text-muted-foreground" />
-            )}
-            {member.name}
-          </button>
-        ) : (
-          <span className="text-xs text-foreground">{member.name}</span>
-        )}
-        {member.ticker && (
-          <code className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
-            {member.ticker}
-          </code>
-        )}
-        <span
-          data-testid={
-            member.workspace_created
-              ? `coverage-member-covered-${member.member_id ?? ''}`
-              : `coverage-member-uncovered-${member.member_id ?? ''}`
-          }
-          className={cn(
-            'rounded-full px-2 py-0.5 text-[11px] font-medium',
-            member.workspace_created
-              ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-              : 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
-          )}
-        >
-          {member.workspace_created
-            ? t('dalton.coverage.covered')
-            : t('dalton.coverage.notCovered')}
-        </span>
-        {member.scope && (
-          <span className="text-[11px] text-muted-foreground">{member.scope}</span>
-        )}
-        {member.workspace_id && <OpenWorkspaceLink workspaceId={member.workspace_id} />}
-      </div>
-      {hasUnit && expanded && (
-        <div className="ml-4 border-l border-border/40 pl-3">
-          {detailQuery.isLoading ? (
-            <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              {t('dalton.coverage.detailLoading')}
-            </div>
-          ) : detailQuery.isError ? (
-            <div className="py-2 text-xs text-destructive">
-              {t('dalton.coverage.detailError')}
-            </div>
-          ) : detailQuery.data ? (
-            <>
-              <CompanyDetail detail={detailQuery.data} />
-              {/* 成员公司同样有自己的管理入口（codex r2 #1）：归属判断用
-                  详情响应的 owner_user_id，与 UnitRow 同一规则；成员被
-                  "独立公司"入口排除，这里是本人公司单元唯一的行内入口。 */}
-              {detailQuery.data.owner_user_id === userId && (
-                <UnitManageActions unit={detailQuery.data} unclassified={unclassified} />
-              )}
-            </>
-          ) : null}
+  if (!thesis) {
+    return (
+      <div className="space-y-1">
+        <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('dalton.coverage.thesis')}
         </div>
-      )}
-    </div>
-  );
-}
-
-function DetailSection({
-  title,
-  count,
-  children,
-}: {
-  title: string;
-  count?: number;
-  children: React.ReactNode;
-}) {
+        <p style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.coverage.noDoc')}</p>
+      </div>
+    );
+  }
   return (
     <div className="space-y-1">
-      <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-        {title}
-        {typeof count === 'number' ? ` (${count})` : ''}
+      <div className="flex flex-wrap items-center gap-2 font-medium" style={{ color: 'var(--color-text-primary)' }}>
+        <span>{t('dalton.coverage.thesis')}</span>
+        {thesis.stance && (
+          <DaltonStatusBadge tone="accent" label={`${t('dalton.coverage.stance')}: ${thesis.stance}`} />
+        )}
+        {thesis.conviction && (
+          <DaltonStatusBadge
+            tone="neutral"
+            label={`${t('dalton.coverage.conviction')}: ${thesis.conviction}`}
+          />
+        )}
+        {thesis.pillars.length > 0 && (
+          <DaltonStatusBadge
+            tone="neutral"
+            label={t('dalton.coverage.pillarCount', { count: thesis.pillars.length })}
+          />
+        )}
       </div>
-      {children}
+      {thesis.one_liner && (
+        <p style={{ color: 'var(--color-text-secondary)' }}>{thesis.one_liner}</p>
+      )}
     </div>
   );
 }
 
-function SectorDetail({
-  detail,
-  unclassified,
-}: {
-  detail: CoverageUnitDetail;
+function CompanyDetailView({ company }: { company: CoverageCompanyPayload }) {
+  const { t } = useTranslation();
+  return (
+    <div className="space-y-3">
+      <ThesisBlock thesis={company.docs?.thesis} />
+
+      <div className="space-y-1">
+        <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('dalton.coverage.relatedSectors')} ({company.sectors.length})
+        </div>
+        {company.sectors.length === 0 ? (
+          <p style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.coverage.none')}</p>
+        ) : (
+          <div className="space-y-1">
+            {company.sectors.map((s) => (
+              <div
+                key={s.unit_id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded border px-2.5 py-1.5"
+                style={{ borderColor: 'var(--color-border-muted)' }}
+              >
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                    {s.display_name || s.slug || s.unit_id}
+                  </span>
+                  {s.scope && <DaltonStatusBadge tone="neutral" label={s.scope} />}
+                  {s.readable && (
+                    <DaltonStatusBadge tone="neutral" label={t('dalton.coverage.readable')} />
+                  )}
+                </div>
+                {s.workspace_id && s.readable !== false && (
+                  <OpenWorkspaceLink
+                    workspaceId={s.workspace_id}
+                    label={t('dalton.coverage.openWorkspace')}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-1">
+        <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('dalton.coverage.reReview')} ({company.re_review.length})
+        </div>
+        {company.re_review.length === 0 ? (
+          <p style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.coverage.none')}</p>
+        ) : (
+          <ul className="space-y-1" style={{ color: 'var(--color-text-secondary)' }}>
+            {company.re_review.map((r) => (
+              <li key={r.id}>
+                {r.question}
+                {r.value && (
+                  <span style={{ color: 'var(--color-text-tertiary)' }}> · {r.value}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface MemberManageHandlers {
+  currentUserId?: string;
   unclassified: UnclassifiedWorkspace[];
+  bindSelections: Record<string, string>;
+  onSelectWs: (unitId: string, workspaceId: string) => void;
+  onBind: (unitId: string, workspaceId: string) => Promise<void>;
+  onUnbind: (unitId: string) => Promise<void>;
+  onArchive: (unitId: string) => Promise<void>;
+  bindingUnitId: string | null;
+  unbindingUnitId: string | null;
+  archivingUnitId: string | null;
+}
+
+function SectorMemberRow({
+  member,
+  manage,
+}: {
+  member: SectorMember;
+  manage: MemberManageHandlers;
 }) {
   const { t } = useTranslation();
-  const [expandedMember, setExpandedMember] = useState<string | null>(null);
-  const sector = detail.sector;
-  if (!sector) return null;
-  const docs = sector.docs;
-  return (
-    <div className="flex flex-col gap-3 pt-1" data-testid={`coverage-detail-${detail.unit_id}`}>
-      <DetailSection title={t('dalton.coverage.thesis')}>
-        {docs?.thesis ? (
-          <div className="space-y-1 text-xs text-muted-foreground">
-            {docs.thesis.one_liner && <div>{docs.thesis.one_liner}</div>}
-            <div className="flex flex-wrap items-center gap-2">
-              {docs.thesis.stance && (
-                <span>
-                  {t('dalton.coverage.stance')}: {docs.thesis.stance}
-                </span>
-              )}
-              {docs.thesis.conviction && (
-                <span>
-                  {t('dalton.coverage.conviction')}: {docs.thesis.conviction}
-                </span>
-              )}
-              <span>
-                {t('dalton.coverage.pillarCount', { count: docs.thesis.pillars.length })}
-              </span>
-            </div>
-          </div>
-        ) : (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.noDoc')}</div>
-        )}
-      </DetailSection>
+  const [expanded, setExpanded] = useState(false);
+  const companyUnitId = member.company_unit_id ?? null;
+  const detailQuery = useDaltonCoverageUnitDetail(expanded && companyUnitId ? companyUnitId : null);
+  const memberLabel = member.name || member.ticker || member.member_id || '-';
 
-      <DetailSection title={t('dalton.coverage.drivers')}>
-        {docs?.drivers && docs.drivers.drivers.length > 0 ? (
-          <div className="space-y-1">
-            {docs.drivers.drivers.map((d) => (
-              <div key={d.id ?? d.name ?? ''} data-testid={`coverage-driver-${d.id ?? ''}`}>
-                <code className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                  {d.name ?? d.id}
-                </code>
-                {/* 指标名与最新读数在 driver 名下展开（codex p4 r1 #4） */}
-                {d.leading_indicators.length > 0 && (
-                  <ul className="mt-0.5 space-y-0.5 pl-3">
-                    {d.leading_indicators.map((ind) => (
-                      <li
-                        key={ind.id ?? ind.name ?? ''}
-                        data-testid={`coverage-indicator-${ind.id ?? ''}`}
-                        className="text-[11px] text-muted-foreground"
-                      >
-                        {ind.name ?? ind.id}
+  return (
+    <div
+      className="rounded border px-2.5 py-2 space-y-2"
+      style={{
+        borderColor: 'var(--color-border-muted)',
+        backgroundColor: 'var(--color-bg-elevated)',
+      }}
+      data-testid={companyUnitId ? `dalton-coverage-member-${companyUnitId}` : undefined}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          {companyUnitId && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 p-0"
+              aria-expanded={expanded}
+              aria-label={memberLabel}
+              onClick={() => setExpanded((v) => !v)}
+              data-testid={`dalton-coverage-expand-member-${companyUnitId}`}
+            >
+              {expanded ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" />
+              )}
+            </Button>
+          )}
+          <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {memberLabel}
+          </span>
+          {member.ticker && <DaltonStatusBadge tone="accent" label={member.ticker} />}
+          <DaltonStatusBadge
+            tone={member.workspace_created ? 'success' : 'neutral'}
+            label={
+              member.workspace_created
+                ? `${member.name || member.ticker} (${t('dalton.coverage.covered')})`
+                : `${member.name || member.ticker} (${t('dalton.coverage.notCovered')})`
+            }
+          />
+          {member.scope && <DaltonStatusBadge tone="neutral" label={member.scope} />}
+        </div>
+
+        {member.workspace_id && (
+          <OpenWorkspaceLink
+            workspaceId={member.workspace_id}
+            label={t('dalton.coverage.openWorkspace')}
+          />
+        )}
+      </div>
+
+      {expanded && companyUnitId && (
+        <div
+          className="pt-2 border-t space-y-3"
+          style={{ borderColor: 'var(--color-border-muted)' }}
+          data-testid={`dalton-coverage-member-detail-${companyUnitId}`}
+        >
+          {detailQuery.isLoading ? (
+            <DaltonLoadingRow label={t('dalton.coverage.detailLoading')} />
+          ) : detailQuery.isError || !detailQuery.data ? (
+            <DaltonInlineNotice tone="error">{t('dalton.coverage.detailError')}</DaltonInlineNotice>
+          ) : (
+            <>
+              {(!manage.currentUserId ||
+                detailQuery.data.owner_user_id === manage.currentUserId) && (
+                <UnitManageActions
+                  unitId={detailQuery.data.unit_id}
+                  unitName={
+                    detailQuery.data.display_name ||
+                    detailQuery.data.ticker ||
+                    detailQuery.data.slug ||
+                    detailQuery.data.unit_id
+                  }
+                  workspaceId={detailQuery.data.workspace_id}
+                  unclassified={manage.unclassified}
+                  selectedWs={manage.bindSelections[detailQuery.data.unit_id] ?? ''}
+                  onSelectWs={(wsId) => manage.onSelectWs(detailQuery.data!.unit_id, wsId)}
+                  onBind={manage.onBind}
+                  onUnbind={manage.onUnbind}
+                  onArchive={manage.onArchive}
+                  binding={manage.bindingUnitId === detailQuery.data.unit_id}
+                  unbinding={manage.unbindingUnitId === detailQuery.data.unit_id}
+                  archiving={manage.archivingUnitId === detailQuery.data.unit_id}
+                />
+              )}
+              {detailQuery.data.company && (
+                <CompanyDetailView company={detailQuery.data.company} />
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SectorDetailView({
+  sector,
+  manage,
+}: {
+  sector: CoverageSectorPayload;
+  manage: MemberManageHandlers;
+}) {
+  const { t } = useTranslation();
+  const driversDoc = sector.docs?.drivers;
+  const drivers = driversDoc?.drivers ?? [];
+  const questions = sector.agenda_todos?.questions ?? [];
+  const validations = sector.agenda_todos?.validations ?? [];
+  const events = sector.agenda_todos?.events ?? [];
+  const todoTotal = questions.length + validations.length + events.length;
+  const shownPendingCount = sector.ledger_gaps.length + sector.evidence_gaps.length;
+
+  return (
+    <div className="space-y-3">
+      <ThesisBlock thesis={sector.docs?.thesis} />
+
+      <div className="space-y-1.5">
+        <div className="flex flex-wrap items-center gap-2 font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          <span>
+            {t('dalton.coverage.drivers')} ({drivers.length})
+          </span>
+          {driversDoc?.as_of && (
+            <span className="text-[11px] font-normal" style={{ color: 'var(--color-text-tertiary)' }}>
+              as of {driversDoc.as_of}
+            </span>
+          )}
+        </div>
+        {drivers.length === 0 ? (
+          <p style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.coverage.noDoc')}</p>
+        ) : (
+          <div className="space-y-1.5">
+            {drivers.map((drv, idx) => (
+              <div key={drv.id ?? idx} className="space-y-1">
+                <div className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>
+                  {drv.name}
+                  {drv.kind ? ` (${drv.kind})` : ''}
+                </div>
+                {drv.leading_indicators.length > 0 && (
+                  <ul className="pl-3 space-y-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+                    {drv.leading_indicators.map((ind, iIdx) => (
+                      <li key={ind.id ?? iIdx} className="flex flex-wrap items-center gap-2">
+                        <span>{ind.name}</span>
                         {ind.latest && ind.latest.value != null && (
-                          <>
-                            ：{ind.latest.value}
+                          <span className="tabular-nums font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                            {ind.latest.value}
                             {ind.latest.unit ? ` ${ind.latest.unit}` : ''}
-                            {ind.latest.period ? `（${ind.latest.period}）` : ''}
+                            {ind.latest.period ? ` (${ind.latest.period})` : ''}
                             {ind.latest.as_of ? ` · ${String(ind.latest.as_of).slice(0, 10)}` : ''}
-                          </>
+                          </span>
                         )}
                       </li>
                     ))}
@@ -526,404 +471,482 @@ function SectorDetail({
               </div>
             ))}
           </div>
-        ) : (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.noDoc')}</div>
         )}
-      </DetailSection>
+      </div>
 
-      <DetailSection title={t('dalton.coverage.agendaTodos')}>
-        {sector.agenda_todos ? (
-          <div className="space-y-1 text-xs text-muted-foreground">
-            {sector.agenda_todos.questions.map((q) => (
-              <div key={q.id} data-testid={`coverage-agenda-question-${q.id}`}>
-                · {q.question}
-                {q.waiting_pm && (
-                  <span
-                    data-testid={`coverage-waiting-pm-${q.id}`}
-                    className="ml-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400"
-                  >
-                    {t('dalton.coverage.waitingPm')}
-                  </span>
-                )}
-              </div>
-            ))}
-            {sector.agenda_todos.validations.map((v) => (
-              <div key={v.id}>
-                · {t('dalton.coverage.agendaValidations')}: {v.what} ({v.due ?? '—'})
-              </div>
-            ))}
-            {sector.agenda_todos.events.map((e, i) => (
-              <div key={`${e.title}-${i}`}>
-                · {e.title} ({e.date ?? '—'})
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.noDoc')}</div>
-        )}
-      </DetailSection>
-
-      <DetailSection title={t('dalton.coverage.members')} count={sector.members.length}>
-        <div className="divide-y divide-border/40">
-          {sector.members.map((m) => (
-            <MemberRow
-              key={m.member_id ?? m.name ?? ''}
-              member={m}
-              expanded={expandedMember === (m.member_id ?? '')}
-              onToggle={() =>
-                setExpandedMember((prev) =>
-                  prev === (m.member_id ?? '') ? null : (m.member_id ?? ''),
-                )
-              }
-              unclassified={unclassified}
-            />
-          ))}
+      <div className="space-y-1">
+        <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('dalton.coverage.agendaTodos')} ({todoTotal})
         </div>
-      </DetailSection>
-
-      <DetailSection title={t('dalton.coverage.evidenceGaps')} count={sector.evidence_gaps.length}>
-        {sector.evidence_gaps.length === 0 ? (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.none')}</div>
+        {todoTotal === 0 ? (
+          <p style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.coverage.none')}</p>
         ) : (
-          <div className="space-y-1 text-xs text-muted-foreground">
-            {sector.evidence_gaps.map((g) => (
-              <div key={g.request_id ?? g.question ?? ''} data-testid={`coverage-evidence-gap-${g.request_id ?? ''}`}>
-                · {g.question}
-              </div>
-            ))}
-          </div>
-        )}
-      </DetailSection>
-
-      <DetailSection title={t('dalton.coverage.ledgerGaps')} count={sector.ledger_gaps.length}>
-        {sector.ledger_gaps.length === 0 ? (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.none')}</div>
-        ) : (
-          <div className="space-y-1 text-xs text-muted-foreground">
-            {sector.ledger_gaps.map((g) => (
-              <div key={g.request_id ?? g.question ?? ''} data-testid={`coverage-ledger-gap-${g.request_id ?? ''}`}>
-                · {g.question}
-              </div>
-            ))}
-          </div>
-        )}
-        {/* 台账在 SQL 里先过滤再截断（codex p4 r1 #2）：total 超过展示条数时提示 */}
-        {sector.pending_total >
-          sector.evidence_gaps.length + sector.ledger_gaps.length && (
-          <div
-            data-testid={`coverage-pending-truncated-${detail.unit_id}`}
-            className="pt-1 text-[11px] text-muted-foreground"
-          >
-            {t('dalton.coverage.pendingTruncated', {
-              count: sector.evidence_gaps.length + sector.ledger_gaps.length,
-              total: sector.pending_total,
-            })}
-          </div>
-        )}
-      </DetailSection>
-    </div>
-  );
-}
-
-function CompanyDetail({ detail }: { detail: CoverageUnitDetail }) {
-  const { t } = useTranslation();
-  const company = detail.company;
-  if (!company) return null;
-  return (
-    <div className="flex flex-col gap-3 pt-1" data-testid={`coverage-detail-${detail.unit_id}`}>
-      {company.docs?.thesis?.one_liner && (
-        <DetailSection title={t('dalton.coverage.thesis')}>
-          <div className="text-xs text-muted-foreground">{company.docs.thesis.one_liner}</div>
-        </DetailSection>
-      )}
-      <DetailSection title={t('dalton.coverage.relatedSectors')} count={company.sectors.length}>
-        {company.sectors.length === 0 ? (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.none')}</div>
-        ) : (
-          <div className="divide-y divide-border/40">
-            {company.sectors.map((s) => (
-              <div
-                key={s.unit_id}
-                data-testid={`coverage-related-sector-${s.unit_id}`}
-                className="flex flex-wrap items-center gap-2 py-1"
-              >
-                <span className="text-xs text-foreground">{s.display_name ?? s.slug}</span>
-                {s.scope && (
-                  <span className="text-[11px] text-muted-foreground">{s.scope}</span>
+          <ul className="space-y-1" style={{ color: 'var(--color-text-secondary)' }}>
+            {questions.map((q) => (
+              <li key={q.id} className="flex flex-wrap items-center gap-2">
+                <span>{q.question}</span>
+                {q.urgency && <DaltonStatusBadge tone="neutral" label={q.urgency} />}
+                {q.waiting_pm && (
+                  <DaltonStatusBadge tone="warning" label={t('dalton.coverage.waitingPm')} />
                 )}
-                <StateBadge label={t('dalton.coverage.readable')} on={s.readable} />
-                {s.workspace_id && <OpenWorkspaceLink workspaceId={s.workspace_id} />}
-              </div>
+              </li>
             ))}
-          </div>
+            {validations.map((v) => (
+              <li key={v.id}>
+                {v.what} ({v.due ?? '—'})
+              </li>
+            ))}
+            {events.map((ev, eIdx) => (
+              <li key={`${ev.title}-${eIdx}`}>
+                {ev.title}
+                {ev.date ? ` (${ev.date})` : ''}
+              </li>
+            ))}
+          </ul>
         )}
-      </DetailSection>
-      <DetailSection title={t('dalton.coverage.reReview')} count={company.re_review.length}>
-        {company.re_review.length === 0 ? (
-          <div className="text-xs text-muted-foreground">{t('dalton.coverage.none')}</div>
+      </div>
+
+      <div className="space-y-1.5">
+        <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('dalton.coverage.members')} ({sector.members.length})
+        </div>
+        {sector.members.length === 0 ? (
+          <p style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.coverage.none')}</p>
         ) : (
-          <div className="space-y-1 text-xs text-muted-foreground">
-            {company.re_review.map((r) => (
-              <div key={r.id} data-testid={`coverage-re-review-${r.id}`}>
-                · {r.question}
-              </div>
+          <div className="space-y-1.5">
+            {sector.members.map((member, idx) => (
+              <SectorMemberRow
+                key={member.member_id ?? `${member.ticker}-${idx}`}
+                member={member}
+                manage={manage}
+              />
             ))}
           </div>
         )}
-      </DetailSection>
+      </div>
+
+      {sector.evidence_gaps.length > 0 && (
+        <div className="space-y-1">
+          <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {t('dalton.coverage.evidenceGaps')} ({sector.evidence_gaps.length})
+          </div>
+          <ul className="space-y-1" style={{ color: 'var(--color-text-secondary)' }}>
+            {sector.evidence_gaps.map((g, idx) => (
+              <li key={g.request_id ?? idx}>{g.question}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {sector.ledger_gaps.length > 0 && (
+        <div className="space-y-1">
+          <div className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {t('dalton.coverage.ledgerGaps')} ({sector.ledger_gaps.length})
+          </div>
+          <ul className="space-y-1" style={{ color: 'var(--color-text-secondary)' }}>
+            {sector.ledger_gaps.map((g, idx) => (
+              <li key={g.request_id ?? idx}>{g.question}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {sector.pending_total > shownPendingCount && (
+        <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('dalton.coverage.pendingTruncated', {
+            count: shownPendingCount,
+            total: sector.pending_total,
+          })}
+        </p>
+      )}
     </div>
   );
 }
 
-function UnitRow({
-  unit,
-  expanded,
-  onToggle,
-  own,
-  unclassified,
+function CoverageUnitDetailSection({
+  unitId,
+  manage,
 }: {
-  unit: CoverageUnitEntry;
-  expanded: boolean;
-  onToggle: () => void;
-  own: boolean;
-  unclassified: UnclassifiedWorkspace[];
+  unitId: string;
+  manage: MemberManageHandlers;
 }) {
   const { t } = useTranslation();
-  const detailQuery = useDaltonCoverageUnitDetail(expanded ? unit.unit_id : null);
-  return (
-    <div className="py-1" data-testid={`coverage-unit-${unit.unit_id}`}>
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={onToggle}
-          data-testid={`coverage-unit-toggle-${unit.unit_id}`}
-          className="flex min-w-0 flex-1 flex-wrap items-center gap-2 rounded px-1 py-1 text-left hover:bg-muted/40"
-        >
-          {expanded ? (
-            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          )}
-          <span className="text-xs font-medium text-foreground">
-            {unit.display_name ?? unit.slug}
-          </span>
-          {unit.kind === 'company' && unit.ticker && (
-            <code className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
-              {unit.ticker}
-            </code>
-          )}
-          <UnitBadges unit={unit} />
-        </button>
-        {/* 已绑定工作区的单元自身可直接进入（codex p4 r1 #1）；未绑定的不显示 */}
-        {unit.workspace_id && <OpenWorkspaceLink workspaceId={unit.workspace_id} />}
-      </div>
-      {expanded && (
-        <div className="ml-5 border-l border-border/40 pl-3">
-          {detailQuery.isLoading ? (
-            <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              {t('dalton.coverage.detailLoading')}
-            </div>
-          ) : detailQuery.isError ? (
-            <div className="py-2 text-xs text-destructive">{t('dalton.coverage.detailError')}</div>
-          ) : detailQuery.data ? (
-            unit.kind === 'sector' ? (
-              <SectorDetail detail={detailQuery.data} unclassified={unclassified} />
-            ) : (
-              <CompanyDetail detail={detailQuery.data} />
-            )
-          ) : null}
-          {/* 登记 / 绑定 / 解绑 / 归档只出现在本人的单元行上（P5） */}
-          {own && <UnitManageActions unit={unit} unclassified={unclassified} />}
-        </div>
-      )}
-    </div>
-  );
-}
+  const detailQuery = useDaltonCoverageUnitDetail(unitId);
 
-/**
- * Dalton 覆盖视图（行业层 P4）：行业 / 独立公司 / 未分类工作区三个入口。
- *
- * 开关状态来自后端（列表响应的 `enabled` 字段）——`enabled:false` 或尚未
- * 加载时整个卡片不渲染，前端不做任何开关推断。权限同样只展示后端返回的
- * readable/delegatable/auto_tracked，不在前端二次判断。
- */
-export function DaltonCoverageCard(): React.ReactElement | null {
-  const { t } = useTranslation();
-  const { userId } = useAuth();
-  // 侧栏"未分类"入口带着 #dalton-coverage-unclassified 跳来：挂载时读到
-  // 该 hash 就直接落在"未分类工作区" tab（Settings 的 hash 机制会滚动到
-  // id 同名的 tab 按钮上）。
-  const [tab, setTab] = useState<CoverageTab>(() =>
-    typeof window !== 'undefined' && window.location.hash === '#dalton-coverage-unclassified'
-      ? 'unclassified'
-      : 'sectors',
-  );
-  const [expandedUnit, setExpandedUnit] = useState<string | null>(null);
-  const { data, isLoading, isFetching, refetch, error } = useDaltonCoverageUnits();
-  // Already on this page when the sidebar link is followed again: the card
-  // stays mounted, so the initializer above never re-reads the hash. Each
-  // navigation gets a new location.key, which re-runs this.
-  const location = useLocation();
-  useEffect(() => {
-    if (location.hash === '#dalton-coverage-unclassified') setTab('unclassified');
-  }, [location.hash, location.key]);
-
-  // 开关关闭（或还在加载/失败）时不渲染任何行业相关入口与文案
-  if (!data || data.enabled === false) return null;
-
-  // 行业 / 独立公司两分（独立公司 = 没被任何可见行业列为成员的公司单元）
-  // 与侧栏覆盖结构树、工作区从属标记共用同一推导（lib/dalton/coverage）。
-  const { sectors, standaloneCompanies } = splitCoverageUnits(data.units);
-  const unclassified = data.unclassified ?? [];
-
-  const tabs: Array<{ key: CoverageTab; label: string; count: number }> = [
-    { key: 'sectors', label: t('dalton.coverage.tabSectors'), count: sectors.length },
-    {
-      key: 'companies',
-      label: t('dalton.coverage.tabCompanies'),
-      count: standaloneCompanies.length,
-    },
-    {
-      key: 'unclassified',
-      label: t('dalton.coverage.tabUnclassified'),
-      count: unclassified.length,
-    },
-  ];
+  if (detailQuery.isLoading) {
+    return <DaltonLoadingRow label={t('dalton.coverage.detailLoading')} />;
+  }
+  if (detailQuery.isError || !detailQuery.data) {
+    return <DaltonInlineNotice tone="error">{t('dalton.coverage.detailError')}</DaltonInlineNotice>;
+  }
 
   return (
     <div
-      id="dalton-coverage"
-      className="rounded-lg p-4"
+      className="mt-2 rounded-md border p-3 text-xs"
       style={{
+        borderColor: 'var(--color-border-muted)',
         backgroundColor: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-muted)',
       }}
-      data-testid="dalton-coverage-card"
+      data-testid={`dalton-coverage-detail-${unitId}`}
     >
-      <div className="flex items-center justify-between gap-2 pb-3">
+      {detailQuery.data.sector && (
+        <SectorDetailView sector={detailQuery.data.sector} manage={manage} />
+      )}
+      {detailQuery.data.company && <CompanyDetailView company={detailQuery.data.company} />}
+    </div>
+  );
+}
+
+/** Coverage unit registration & workspace binding card (dedicated Coverage Settings section). */
+export function DaltonCoverageCard() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const location = useLocation();
+  const { user } = useUser();
+  const coverageQuery = useDaltonCoverageUnits(true);
+
+  const [activeTab, setActiveTab] = useState<CoverageTab>(
+    location.hash === '#dalton-coverage-unclassified' ? 'unclassified' : 'sectors',
+  );
+  const [expandedUnitId, setExpandedUnitId] = useState<string | null>(null);
+  const [slugInput, setSlugInput] = useState('');
+  const [displayNameInput, setDisplayNameInput] = useState('');
+  const [tzInput, setTzInput] = useState('');
+  const [bindSelections, setBindSelections] = useState<Record<string, string>>({});
+  const [notice, setNotice] = useState<NoticeState | null>(null);
+
+  useEffect(() => {
+    if (location.hash === '#dalton-coverage-unclassified') {
+      setActiveTab('unclassified');
+    }
+  }, [location.hash, location.key]);
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.coverageUnits() });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.all });
+  };
+
+  const resolveError = (err: unknown) => {
+    const code = coverageUnitErrorCode(err);
+    if (code) {
+      return t(`dalton.coverage.errors.${code}`, {
+        defaultValue: t('dalton.coverage.errors.fallback'),
+      });
+    }
+    return t('dalton.coverage.errors.fallback');
+  };
+
+  const registerMutation = useMutation({
+    mutationFn: () =>
+      registerDaltonCoverageUnit({
+        kind: 'sector',
+        slug: slugInput.trim(),
+        display_name: displayNameInput.trim() || undefined,
+        research_tz: tzInput.trim() || undefined,
+      }),
+    onSuccess: (created) => {
+      setSlugInput('');
+      setDisplayNameInput('');
+      setTzInput('');
+      setActiveTab('sectors');
+      setNotice({
+        tone: 'success',
+        message: t('dalton.coverage.registeredSlug', { slug: created.slug ?? '' }),
+      });
+      invalidate();
+    },
+    onError: (err) => {
+      setNotice({ tone: 'error', message: resolveError(err) });
+    },
+  });
+
+  const bindMutation = useMutation({
+    mutationFn: ({ unitId, workspaceId }: { unitId: string; workspaceId: string }) =>
+      bindDaltonCoverageUnit(unitId, workspaceId),
+    onSuccess: (unit) => {
+      setNotice({
+        tone: 'success',
+        message:
+          unit.kind === 'sector'
+            ? t('dalton.coverage.boundHintSector')
+            : t('dalton.common.saved'),
+      });
+      invalidate();
+    },
+    onError: (err) => {
+      setNotice({ tone: 'error', message: resolveError(err) });
+    },
+  });
+
+  const unbindMutation = useMutation({
+    mutationFn: (unitId: string) => unbindDaltonCoverageUnit(unitId),
+    onSuccess: () => {
+      setNotice({ tone: 'success', message: t('dalton.common.saved') });
+      invalidate();
+    },
+    onError: (err) => {
+      setNotice({ tone: 'error', message: resolveError(err) });
+    },
+  });
+
+  const archiveMutation = useMutation({
+    mutationFn: (unitId: string) => archiveDaltonCoverageUnit(unitId),
+    onSuccess: () => {
+      setNotice({ tone: 'success', message: t('dalton.common.saved') });
+      invalidate();
+    },
+    onError: (err) => {
+      setNotice({ tone: 'error', message: resolveError(err) });
+    },
+  });
+
+  if (coverageQuery.isLoading || !coverageQuery.data || coverageQuery.data.enabled === false) {
+    return null;
+  }
+
+  const units = coverageQuery.data.units;
+  const unclassified = coverageQuery.data.unclassified;
+  const { sectors, standaloneCompanies } = splitCoverageUnits(units);
+
+  const bindingUnitId = bindMutation.isPending ? (bindMutation.variables?.unitId ?? null) : null;
+  const unbindingUnitId = unbindMutation.isPending ? (unbindMutation.variables ?? null) : null;
+  const archivingUnitId = archiveMutation.isPending ? (archiveMutation.variables ?? null) : null;
+
+  const manageHandlers: MemberManageHandlers = {
+    currentUserId: user?.user_id,
+    unclassified,
+    bindSelections,
+    onSelectWs: (unitId, wsId) =>
+      setBindSelections((prev) => ({ ...prev, [unitId]: wsId })),
+    onBind: async (unitId, workspaceId) => {
+      await bindMutation.mutateAsync({ unitId, workspaceId });
+    },
+    onUnbind: async (unitId) => {
+      await unbindMutation.mutateAsync(unitId);
+    },
+    onArchive: async (unitId) => {
+      await archiveMutation.mutateAsync(unitId);
+    },
+    bindingUnitId,
+    unbindingUnitId,
+    archivingUnitId,
+  };
+
+  const renderUnitRow = (unit: CoverageUnitEntry) => {
+    const unitName = unit.display_name || unit.slug || unit.ticker || unit.unit_id;
+    const isOwner = !user?.user_id || unit.owner_user_id === user.user_id;
+    const isExpanded = expandedUnitId === unit.unit_id;
+    const canOpenWs = Boolean(unit.workspace_id && unit.readable !== false);
+
+    return (
+      <DaltonItemRow
+        key={unit.unit_id}
+        testId={`dalton-coverage-unit-${unit.unit_id}`}
+        leading={
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 w-7 p-0"
+            aria-expanded={isExpanded}
+            aria-label={unitName}
+            onClick={() => setExpandedUnitId(isExpanded ? null : unit.unit_id)}
+            data-testid={`dalton-coverage-expand-${unit.unit_id}`}
+          >
+            {isExpanded ? (
+              <ChevronDown className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5" />
+            )}
+          </Button>
+        }
+        title={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>{unitName}</span>
+            {unit.slug && <DaltonStatusBadge tone="neutral" label={unit.slug} />}
+            {unit.ticker && <DaltonStatusBadge tone="accent" label={unit.ticker} />}
+            <UnitCapabilityBadges
+              readable={unit.readable}
+              delegatable={unit.delegatable}
+              autoTracked={unit.auto_tracked}
+            />
+            {!unit.workspace_id && (
+              <DaltonStatusBadge tone="neutral" label={t('dalton.coverage.noWorkspace')} />
+            )}
+          </span>
+        }
+        trailing={
+          <div className="flex flex-wrap items-center gap-2">
+            {canOpenWs && unit.workspace_id && (
+              <OpenWorkspaceLink
+                workspaceId={unit.workspace_id}
+                label={t('dalton.coverage.openWorkspace')}
+              />
+            )}
+            {isOwner && (
+              <UnitManageActions
+                unitId={unit.unit_id}
+                unitName={unitName}
+                workspaceId={unit.workspace_id}
+                unclassified={unclassified}
+                selectedWs={bindSelections[unit.unit_id] ?? ''}
+                onSelectWs={(wsId) => manageHandlers.onSelectWs(unit.unit_id, wsId)}
+                onBind={manageHandlers.onBind}
+                onUnbind={manageHandlers.onUnbind}
+                onArchive={manageHandlers.onArchive}
+                binding={bindingUnitId === unit.unit_id}
+                unbinding={unbindingUnitId === unit.unit_id}
+                archiving={archivingUnitId === unit.unit_id}
+              />
+            )}
+          </div>
+        }
+      >
+        <Disclosure open={isExpanded}>
+          {isExpanded && (
+            <CoverageUnitDetailSection unitId={unit.unit_id} manage={manageHandlers} />
+          )}
+        </Disclosure>
+      </DaltonItemRow>
+    );
+  };
+
+  return (
+    <DaltonSettingsCard
+      id="dalton-coverage"
+      testId="dalton-coverage-card"
+      title={t('dalton.coverage.title')}
+      description={t('dalton.coverage.description')}
+      layout="padded"
+      bodyClassName="space-y-5"
+      action={
+        <DaltonRefreshButton
+          busy={coverageQuery.isFetching}
+          onClick={() => void coverageQuery.refetch()}
+          testId="dalton-coverage-refresh"
+        />
+      }
+    >
+      <div
+        className="rounded-md border p-3.5 space-y-2.5"
+        style={{
+          borderColor: 'var(--color-border-muted)',
+          backgroundColor: 'var(--color-bg-elevated)',
+        }}
+      >
         <div>
-          <h4 className="text-sm font-semibold" style={{ color: 'var(--color-text-primary)' }}>
-            {t('dalton.coverage.title')}
+          <h4 className="text-xs font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {t('dalton.coverage.registerTitle')}
           </h4>
-          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('dalton.coverage.subtitle')}
+          <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
+            {t('dalton.coverage.registerHint')}
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => void refetch()}
-          disabled={isLoading || isFetching}
-          className="inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-background px-2.5 py-1 text-xs font-medium hover:bg-muted/60 disabled:opacity-50"
-        >
-          <RefreshCw className={cn('h-3.5 w-3.5', isFetching && 'animate-spin')} />
-          {t('dalton.coverage.refresh')}
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            value={slugInput}
+            onChange={(e) => setSlugInput(e.target.value)}
+            placeholder={t('dalton.coverage.fieldSlug')}
+            data-testid="dalton-coverage-slug-input"
+            className="h-8 w-52 text-xs"
+          />
+          <Input
+            value={displayNameInput}
+            onChange={(e) => setDisplayNameInput(e.target.value)}
+            placeholder={t('dalton.coverage.fieldDisplayName')}
+            data-testid="dalton-coverage-name-input"
+            className="h-8 w-44 text-xs"
+          />
+          <TimezonePicker
+            value={tzInput}
+            onChange={setTzInput}
+            placeholder={t('dalton.coverage.fieldResearchTz')}
+            className="w-48"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 text-xs"
+            disabled={!slugInput.trim() || registerMutation.isPending}
+            onClick={() => registerMutation.mutate()}
+            data-testid="dalton-coverage-register-btn"
+          >
+            {registerMutation.isPending
+              ? t('dalton.coverage.registering')
+              : t('dalton.coverage.register')}
+          </Button>
+        </div>
       </div>
 
-      {error && (
-        <div className="mb-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          {error instanceof Error ? error.message : t('dalton.coverage.loadError')}
-        </div>
+      {notice && <DaltonInlineNotice tone={notice.tone}>{notice.message}</DaltonInlineNotice>}
+
+      <div className="flex flex-wrap items-center gap-2" role="tablist">
+        <DaltonToolbarPill
+          label={t('dalton.coverage.tabSectors')}
+          count={sectors.length}
+          active={activeTab === 'sectors'}
+          onClick={() => setActiveTab('sectors')}
+          testId="dalton-coverage-tab-sectors"
+        />
+        <DaltonToolbarPill
+          label={t('dalton.coverage.tabCompanies')}
+          count={standaloneCompanies.length}
+          active={activeTab === 'companies'}
+          onClick={() => setActiveTab('companies')}
+          testId="dalton-coverage-tab-companies"
+        />
+        <DaltonToolbarPill
+          id="dalton-coverage-unclassified"
+          label={t('dalton.coverage.tabUnclassified')}
+          count={unclassified.length}
+          active={activeTab === 'unclassified'}
+          onClick={() => setActiveTab('unclassified')}
+          testId="dalton-coverage-tab-unclassified"
+        />
+      </div>
+
+      {activeTab === 'sectors' && (
+        <DaltonKeyValueList isEmpty={sectors.length === 0} empty={t('dalton.coverage.empty')}>
+          {sectors.map(renderUnitRow)}
+        </DaltonKeyValueList>
       )}
 
-      {/* 新建行业单元：绑定目标 = 未分类工作区（本人的、未绑 active 单元、非 Home） */}
-      <RegisterSectorForm />
+      {activeTab === 'companies' && (
+        <DaltonKeyValueList
+          isEmpty={standaloneCompanies.length === 0}
+          empty={t('dalton.coverage.empty')}
+        >
+          {standaloneCompanies.map(renderUnitRow)}
+        </DaltonKeyValueList>
+      )}
 
-      <div className="mb-2 flex gap-1" data-testid="coverage-tabs">
-        {tabs.map(({ key, label, count }) => (
-          <button
-            key={key}
-            type="button"
-            data-testid={`coverage-tab-${key}`}
-            // Settings 的 hash 滚动机制以元素 id 为锚：#dalton-coverage-unclassified 落在未分类 tab 上
-            id={key === 'unclassified' ? 'dalton-coverage-unclassified' : undefined}
-            onClick={() => {
-              setTab(key);
-              setExpandedUnit(null);
-            }}
-            className={cn(
-              'rounded-md px-2.5 py-1 text-xs font-medium',
-              tab === key
-                ? 'bg-muted text-foreground'
-                : 'text-muted-foreground hover:bg-muted/40',
-            )}
-          >
-            {label} ({count})
-          </button>
-        ))}
-      </div>
-
-      <div className="rounded-md border border-border/50 bg-background/40 p-2">
-        {tab === 'sectors' &&
-          (sectors.length === 0 ? (
-            <div className="py-2 text-xs text-muted-foreground">
-              {t('dalton.coverage.empty')}
-            </div>
-          ) : (
-            <div className="divide-y divide-border/40">
-              {sectors.map((u) => (
-                <UnitRow
-                  key={u.unit_id}
-                  unit={u}
-                  expanded={expandedUnit === u.unit_id}
-                  onToggle={() =>
-                    setExpandedUnit((prev) => (prev === u.unit_id ? null : u.unit_id))
-                  }
-                  own={u.owner_user_id === userId}
-                  unclassified={unclassified}
-                />
-              ))}
-            </div>
-          ))}
-
-        {tab === 'companies' &&
-          (standaloneCompanies.length === 0 ? (
-            <div className="py-2 text-xs text-muted-foreground">
-              {t('dalton.coverage.empty')}
-            </div>
-          ) : (
-            <div className="divide-y divide-border/40">
-              {standaloneCompanies.map((u) => (
-                <UnitRow
-                  key={u.unit_id}
-                  unit={u}
-                  expanded={expandedUnit === u.unit_id}
-                  onToggle={() =>
-                    setExpandedUnit((prev) => (prev === u.unit_id ? null : u.unit_id))
-                  }
-                  own={u.owner_user_id === userId}
-                  unclassified={unclassified}
-                />
-              ))}
-            </div>
-          ))}
-
-        {tab === 'unclassified' &&
-          (unclassified.length === 0 ? (
-            <div className="py-2 text-xs text-muted-foreground">
-              {t('dalton.coverage.empty')}
-            </div>
-          ) : (
-            <div className="divide-y divide-border/40">
-              {unclassified.map((ws) => (
-                <div
-                  key={ws.workspace_id}
-                  data-testid={`coverage-unclassified-${ws.workspace_id}`}
-                  className="flex flex-wrap items-center gap-2 py-2"
-                >
-                  <span className="text-xs text-foreground">{ws.name}</span>
-                  {ws.description && (
-                    <span className="max-w-md truncate text-[11px] text-muted-foreground">
-                      {ws.description}
-                    </span>
-                  )}
-                  <OpenWorkspaceLink workspaceId={ws.workspace_id} />
+      {activeTab === 'unclassified' && (
+        <DaltonKeyValueList
+          isEmpty={unclassified.length === 0}
+          empty={t('dalton.coverage.empty')}
+        >
+          {unclassified.map((ws) => (
+            <DaltonItemRow
+              key={ws.workspace_id}
+              title={ws.name || ws.workspace_id}
+              subtitle={ws.description ?? undefined}
+              trailing={
+                <div className="flex items-center gap-2">
+                  <DaltonStatusBadge
+                    tone="neutral"
+                    label={t('dalton.coverage.unclassifiedLabel')}
+                  />
+                  <OpenWorkspaceLink
+                    workspaceId={ws.workspace_id}
+                    label={t('dalton.coverage.openWorkspace')}
+                  />
                 </div>
-              ))}
-            </div>
+              }
+            />
           ))}
-      </div>
-    </div>
+        </DaltonKeyValueList>
+      )}
+    </DaltonSettingsCard>
   );
 }

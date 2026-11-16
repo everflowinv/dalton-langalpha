@@ -1,376 +1,269 @@
-import React, { useState } from 'react';
-import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronRight,
-  Loader2,
-  Play,
-} from 'lucide-react';
+import { useState } from 'react';
+import { Link } from 'react-router';
+import { ChevronDown, ChevronRight, Wifi } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
-import type {
-  DaltonProviderProbeResponse,
-  DaltonProviderStatusItem,
-} from '../../utils/daltonApi';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useLocale } from '@/hooks/useLocale';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { formatTimestamp } from '@/lib/format';
+import type { DaltonProviderStatusItem } from '@/pages/Settings/utils/daltonApi';
 import { useProviderProbe } from '../../hooks/useProviderStatus';
+import {
+  DaltonInlineNotice,
+  DaltonItemRow,
+  DaltonStatusBadge,
+  type DaltonStatusTone,
+} from './primitives';
 
-export function ProviderRow({ item }: { item: DaltonProviderStatusItem }) {
-  const probeMutation = useProviderProbe();
-  const [errorsExpanded, setErrorsExpanded] = useState(false);
-  const [probeResult, setProbeResult] = useState<DaltonProviderProbeResponse | null>(null);
+const ROLE_LABELS: Record<string, string> = {
+  lead: 'dalton.providers.roles.lead',
+  background: 'dalton.providers.roles.background',
+  assist: 'dalton.providers.roles.assist',
+  audit: 'dalton.providers.roles.audit',
+  reviewer: 'dalton.providers.roles.reviewer',
+  extract: 'dalton.providers.roles.extract',
+};
 
-  const usedByRoles = item.used_by_roles ?? [];
-  const hasRoles = usedByRoles.length > 0;
-  const secondsLeft = item.credential?.seconds_left;
-  const refreshFailed = item.credential?.last_refresh?.ok === false;
-  const expiringSoon =
-    typeof secondsLeft === 'number' && secondsLeft < 1800 && refreshFailed;
+function billingLabel(
+  billing: DaltonProviderStatusItem['billing'],
+  t: (key: string) => string,
+): string {
+  return billing === 'subscription'
+    ? t('dalton.providers.subscriptionBadge')
+    : t('dalton.providers.cashBadge');
+}
 
-  // Status dot color logic per P0N.9 §2
-  let dotColor = 'var(--color-text-tertiary)';
-  let statusTitle = '已关闭';
-  if (!item.enabled) {
-    if (hasRoles) {
-      dotColor = 'var(--color-loss)';
-      statusTitle = '已关闭但仍被角色引用';
-    } else {
-      dotColor = 'var(--color-text-tertiary)';
-      statusTitle = '已关闭';
-    }
-  } else if (!item.configured) {
-    if (hasRoles) {
-      dotColor = 'var(--color-loss)';
-      statusTitle = '未配置凭据（被角色引用）';
-    } else {
-      dotColor = 'var(--color-text-tertiary)';
-      statusTitle = '未配置凭据';
-    }
-  } else if (probeResult && !probeResult.ok) {
-    dotColor = 'var(--color-loss)';
-    statusTitle = '最近一次探测失败';
-  } else if (expiringSoon || item.errors_24h > 0 || (item.warnings?.length ?? 0) > 0) {
-    dotColor = 'var(--color-warning)';
-    statusTitle = '凭据即将到期或最近 24h 有告警/错误';
-  } else {
-    dotColor = 'var(--color-profit)';
-    statusTitle = '已配置且正常';
+function deriveProviderState(item: DaltonProviderStatusItem): {
+  tone: DaltonStatusTone;
+  labelKey: string;
+} {
+  if (!item.enabled || !item.configured || item.credential.token_expired) {
+    return { tone: 'neutral', labelKey: 'dalton.providers.unconfiguredBadge' };
   }
+  if (item.errors_24h > 0 || item.warnings.length > 0 || item.credential.reconnect_required) {
+    return { tone: 'warning', labelKey: 'dalton.providers.degradedBadge' };
+  }
+  return { tone: 'success', labelKey: 'dalton.providers.configuredBadge' };
+}
 
-  const handleProbe = async () => {
-    setProbeResult(null);
-    try {
-      const res = await probeMutation.mutateAsync({
-        provider: item.provider,
-        model: item.default_probe_model ?? null,
-      });
-      setProbeResult(res);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setProbeResult({
-        ok: false,
-        provider: item.provider,
-        model: item.default_probe_model,
-        latency_ms: 0,
-        error_kind: 'network_error',
-        message: msg,
-      });
-    }
-  };
+function formatResetTimestamp(
+  raw: string | number | null | undefined,
+  locale: string,
+): string | null {
+  if (raw == null) return null;
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const ms = raw < 1e12 ? raw * 1000 : raw;
+    return formatTimestamp(new Date(ms).toISOString(), locale);
+  }
+  const str = String(raw).trim();
+  if (!str) return null;
+  if (/^\d+(\.\d+)?$/.test(str)) {
+    const n = Number(str);
+    const ms = n < 1e12 ? n * 1000 : n;
+    return formatTimestamp(new Date(ms).toISOString(), locale);
+  }
+  return formatTimestamp(str, locale);
+}
 
-  const formatSecondsLeft = (sec: number | null | undefined) => {
-    if (sec == null) return null;
-    if (sec <= 0) return '已到期（调用时自动刷新）';
-    const mins = Math.round(sec / 60);
-    if (mins < 60) return `余 ${mins}m`;
-    const hours = (mins / 60).toFixed(1);
-    return `余 ${hours}h`;
-  };
+export function ProviderRow({
+  item,
+  isAdmin = false,
+}: {
+  item: DaltonProviderStatusItem;
+  isAdmin?: boolean;
+}) {
+  const { t } = useTranslation();
+  const locale = useLocale();
+  const { isShared } = useTeamCredentials();
+  const probe = useProviderProbe();
+  const [expanded, setExpanded] = useState(false);
 
-  const formatLocalResetTime = (raw: string | number | null | undefined): string | null => {
-    if (raw == null || raw === '') return null;
-    let d: Date;
-    if (typeof raw === 'number') {
-      d = new Date(raw < 1e12 ? raw * 1000 : raw);
-    } else if (/^\d+$/.test(String(raw).trim())) {
-      const n = Number(String(raw).trim());
-      d = new Date(n < 1e12 ? n * 1000 : n);
-    } else {
-      d = new Date(raw);
-    }
-    if (Number.isNaN(d.getTime())) return String(raw);
-    return d.toLocaleString();
-  };
+  const state = deriveProviderState(item);
+  const subsUsage = item.subs_usage ?? item.credential.subs_usage;
+  const quota = item.quota ?? item.credential.quota;
+  const isProbing = probe.isPending && probe.variables?.provider === item.provider;
+  const probeResult =
+    probe.data?.provider === item.provider ? probe.data : null;
+  const probeErrorMessage =
+    probe.isError && probe.variables?.provider === item.provider
+      ? probe.error instanceof Error && probe.error.message
+        ? probe.error.message
+        : t('dalton.common.loadFailed')
+      : null;
+  // Team-shared mode manages team subscriptions on Team Management -> Models & Providers (#team-model-access).
+  const bindAccountPath =
+    isDaltonAuth && isShared
+      ? '/settings?tab=teamModels#team-model-access'
+      : '/settings?tab=model#model-access';
 
-  const isMuse = item.provider === 'muse-oauth';
-  const museSubsActive = item.is_subs_active ?? item.credential?.is_subs_active;
-  const museTierName = item.subs_tier_name ?? item.credential?.subs_tier_name;
-  const museUsage = item.subs_usage ?? item.credential?.subs_usage;
-  const museWindow = museUsage?.window;
-  const museWeekly = museUsage?.weekly;
-  const museWindowReset = formatLocalResetTime(museWindow?.resets_at);
-  const museWeeklyReset = formatLocalResetTime(museWeekly?.resets_at);
-
-  const showMuseSubsStatus =
-    isMuse && (typeof museSubsActive === 'boolean' || Boolean(museTierName));
-  const showMuseWindow =
-    isMuse && museWindow?.used_percent != null && museWindowReset != null;
-  const showMuseWeekly =
-    isMuse && museWeekly?.used_percent != null && museWeeklyReset != null;
+  const hasDetail =
+    item.recent_errors.length > 0 ||
+    item.warnings.length > 0 ||
+    Boolean(item.credential.status_message) ||
+    Boolean(item.credential.hint);
 
   return (
-    <div
-      className="rounded-md px-3 py-2.5 flex flex-col gap-1.5"
-      style={{
-        backgroundColor: 'var(--color-bg-subtle)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-      data-testid={`dalton-provider-row-${item.provider}`}
-    >
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span
-            className="inline-block h-2.5 w-2.5 rounded-full shrink-0"
-            style={{ backgroundColor: dotColor }}
-            title={statusTitle}
+    <DaltonItemRow
+      testId={`dalton-provider-row-${item.provider}`}
+      title={
+        <span className="flex flex-wrap items-center gap-2">
+          <span>{item.display_name || item.provider}</span>
+          <DaltonStatusBadge tone={state.tone} dot label={t(state.labelKey)} />
+          <DaltonStatusBadge
+            tone={item.billing === 'subscription' ? 'accent' : 'neutral'}
+            label={billingLabel(item.billing, t)}
           />
-          <span
-            className="text-xs font-medium"
-            style={{ color: 'var(--color-text-primary)' }}
-          >
-            {item.display_name}
-          </span>
-          <span
-            className="px-1.5 py-0.5 rounded text-[10px] font-medium"
-            style={
-              item.billing === 'subscription'
-                ? {
-                    backgroundColor: 'var(--color-bg-tag)',
-                    color: 'var(--color-text-secondary)',
-                  }
-                : {
-                    backgroundColor: 'var(--color-accent-soft)',
-                    color: 'var(--color-accent-primary)',
-                  }
-            }
-          >
-            {item.billing === 'subscription' ? '订阅' : '现金'}
-          </span>
           {item.tos_risk === 'high' && (
-            <span
-              className="px-1.5 py-0.5 rounded text-[10px]"
-              style={{
-                backgroundColor: 'var(--color-warning-soft)',
-                color: 'var(--color-warning)',
-              }}
-              title="订阅直连模仿官方 CLI 请求头，存在被限流或封号风险；可随时切换至现金模型。"
-            >
-              条款风险
-            </span>
+            <DaltonStatusBadge
+              tone="warning"
+              label={t('dalton.providers.tosRiskBadge')}
+            />
           )}
-          {usedByRoles.length > 0 && (
-            <span
-              className="text-[11px] font-mono"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            >
-              [{usedByRoles.map((r) => r.role).join(', ')}]
-            </span>
-          )}
-        </div>
-
-        <div className="flex items-center gap-2">
-          {!item.configured && (
-            <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
-              {item.access_type === 'oauth' ? (
-                <a
-                  href="#connected-accounts"
-                  className="underline"
-                  style={{ color: 'var(--color-accent-primary)' }}
-                >
-                  去连接 OAuth
-                </a>
-              ) : item.provider === 'xai' ? (
-                '未配置 xAI API key；Grok 请用 SuperGrok 订阅接入'
-              ) : item.provider === 'z-ai-cn-coding' || item.access_type === 'coding_plan' ? (
-                `在 .env 配置 ${item.credential?.env_key ?? 'ZAI_CN_CODING_API_KEY'} 后重建后端`
-              ) : (
-                `在 .env 配置 ${item.credential?.env_key ?? 'API_KEY'} 后重启`
+        </span>
+      }
+      subtitle={
+        <div className="space-y-1">
+          {item.credential.status_text && <div>{item.credential.status_text}</div>}
+          {(subsUsage?.window?.used_percent != null || subsUsage?.weekly?.used_percent != null) && (
+            <div className="tabular-nums" data-testid="dalton-muse-subs-usage">
+              {subsUsage?.window?.used_percent != null && (
+                <span>
+                  5h: {Math.round(subsUsage.window.used_percent)}%
+                  {formatResetTimestamp(subsUsage.window.resets_at, locale)
+                    ? ` (${formatResetTimestamp(subsUsage.window.resets_at, locale)})`
+                    : ''}
+                </span>
               )}
-            </span>
+              {subsUsage?.window?.used_percent != null && subsUsage?.weekly?.used_percent != null && ' · '}
+              {subsUsage?.weekly?.used_percent != null && (
+                <span>
+                  {t('dalton.providers.modelColQuota')}: {Math.round(subsUsage.weekly.used_percent)}%
+                  {formatResetTimestamp(subsUsage.weekly.resets_at, locale)
+                    ? ` (${formatResetTimestamp(subsUsage.weekly.resets_at, locale)})`
+                    : ''}
+                </span>
+              )}
+            </div>
           )}
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={!item.enabled || !item.configured || probeMutation.isPending}
-            onClick={() => void handleProbe()}
-            className="h-7 px-2.5 text-xs"
-            data-testid={`dalton-provider-probe-${item.provider}`}
-          >
-            {probeMutation.isPending ? (
-              <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-            ) : (
-              <Play className="h-3 w-3 mr-1" />
-            )}
-            测试连接
-          </Button>
-        </div>
-      </div>
-
-      {/* Metadata line */}
-      <div
-        className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]"
-        style={{ color: 'var(--color-text-tertiary)' }}
-      >
-        {item.access_type === 'oauth' ? (
-          <span>
-            {item.configured
-              ? `${item.credential?.email || '已连接'}${
-                  item.credential?.plan_type ? ` (${item.credential.plan_type})` : ''
-                }`
-              : '未连接'}
-          </span>
-        ) : (
-          <span>
-            {item.credential?.has_env
-              ? `.env (${item.credential.env_key}) 已配置${
-                  item.billing === 'subscription' ? '（订阅制）' : ''
-                }`
-              : item.credential?.has_byok
-                ? `BYOK 已配置${item.billing === 'subscription' ? '（订阅制）' : ''}`
-                : '未配置'}
-          </span>
-        )}
-        {formatSecondsLeft(secondsLeft) && <span>{formatSecondsLeft(secondsLeft)}</span>}
-        {(() => {
-          const q = item.quota ?? item.credential?.quota;
-          if (!q) return null;
-          if (q.token_expired) {
-            return <span style={{ color: 'var(--color-loss)' }}>额度：令牌已过期</span>;
-          }
-          if (typeof q.credit_usage_percent === 'number') {
-            return (
-              <span>
-                额度已用：{q.credit_usage_percent.toFixed(1)}%
-                {q.subscription_tier ? ` (${q.subscription_tier})` : ''}
-              </span>
-            );
-          }
-          if (typeof q.used === 'number' && typeof q.monthly_limit === 'number') {
-            return (
-              <span>
-                额度：{q.used}/{q.monthly_limit}
-                {q.subscription_tier ? ` (${q.subscription_tier})` : ''}
-              </span>
-            );
-          }
-          return null;
-        })()}
-        {item.last_success?.at && (
-          <span>
-            最近成功：{item.last_success.at.slice(0, 19).replace('T', ' ')} (
-            {item.last_success.model})
-          </span>
-        )}
-        <span>24h 调用：{item.calls_24h}</span>
-        {item.errors_24h > 0 && (
-          <span style={{ color: 'var(--color-warning)' }}>
-            24h 错误：{item.errors_24h}
-          </span>
-        )}
-      </div>
-
-      {/* Muse subscription & quota usage line */}
-      {(showMuseSubsStatus || showMuseWindow || showMuseWeekly) && (
-        <div
-          className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]"
-          style={{ color: 'var(--color-text-secondary)' }}
-          data-testid="dalton-muse-subs-usage"
-        >
-          {showMuseSubsStatus && (
-            <span>
-              {typeof museSubsActive === 'boolean'
-                ? `订阅：${museSubsActive ? '有效' : '未生效'}${
-                    museTierName ? ` (${museTierName})` : ''
-                  }`
-                : `订阅：${museTierName}`}
-            </span>
+          {quota?.credit_usage_percent != null && (
+            <div className="tabular-nums">
+              {t('dalton.providers.modelColQuota')}: {Math.round(quota.credit_usage_percent)}%
+            </div>
           )}
-          {showMuseWindow && (
-            <span>
-              5 小时窗口已用 {museWindow!.used_percent}%，{museWindowReset} 重置
-            </span>
-          )}
-          {showMuseWeekly && (
-            <span>
-              本周已用 {museWeekly!.used_percent}%，{museWeeklyReset} 重置
-            </span>
-          )}
-        </div>
-      )}
-
-      {/* Warnings */}
-      {(item.warnings ?? []).map((w, idx) => (
-        <div
-          key={`${w.code}-${idx}`}
-          className="flex items-center gap-1.5 text-[11px]"
-          style={{ color: 'var(--color-warning)' }}
-        >
-          <AlertTriangle className="h-3 w-3 shrink-0" />
-          <span>{w.message}</span>
-        </div>
-      ))}
-
-      {/* Probe inline feedback */}
-      {probeResult && (
-        <div
-          className="text-xs font-mono px-2 py-1 rounded"
-          style={{
-            backgroundColor: probeResult.ok
-              ? 'var(--color-profit-soft)'
-              : 'var(--color-loss-soft)',
-            color: probeResult.ok ? 'var(--color-profit)' : 'var(--color-loss)',
-          }}
-        >
-          {probeResult.ok
-            ? `✓ ${probeResult.model}: ${probeResult.message}`
-            : `✗ ${probeResult.model ?? item.provider} [${probeResult.error_kind ?? 'error'}]: ${probeResult.message}`}
-        </div>
-      )}
-
-      {/* Collapsible recent errors */}
-      {(item.recent_errors?.length ?? 0) > 0 && (
-        <div>
-          <button
-            type="button"
-            onClick={() => setErrorsExpanded((v) => !v)}
-            className="flex items-center gap-1 text-[11px]"
-            style={{ color: 'var(--color-text-secondary)' }}
-          >
-            {errorsExpanded ? (
-              <ChevronDown className="h-3 w-3" />
-            ) : (
-              <ChevronRight className="h-3 w-3" />
-            )}
-            <span>最近错误 ({item.recent_errors.length})</span>
-          </button>
-          {errorsExpanded && (
-            <div className="mt-1 space-y-1 text-[11px] font-mono">
-              {item.recent_errors.map((err, i) => (
-                <div
-                  key={i}
-                  className="px-2 py-1 rounded"
-                  style={{
-                    backgroundColor: 'var(--color-bg-card)',
-                    color: 'var(--color-loss)',
-                  }}
-                >
-                  [{err.at?.slice(0, 19).replace('T', ' ')}] {err.kind}{' '}
-                  {err.model ? `(${err.model})` : ''}: {err.message}
-                </div>
+          {item.used_by_roles.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+              {item.used_by_roles.map((r) => (
+                <DaltonStatusBadge
+                  key={`${r.role}:${r.model}`}
+                  tone="neutral"
+                  label={`${ROLE_LABELS[r.role] ? t(ROLE_LABELS[r.role]) : r.role}: ${r.model}`}
+                />
               ))}
             </div>
           )}
         </div>
+      }
+      meta={
+        <div className="flex flex-wrap items-center gap-3 tabular-nums">
+          <span>24h: {item.calls_24h}</span>
+          {item.errors_24h > 0 && (
+            <span style={{ color: 'var(--color-loss)' }}>
+              24h err: {item.errors_24h}
+            </span>
+          )}
+          {item.last_success?.at && (
+            <span>{formatTimestamp(item.last_success.at, locale)}</span>
+          )}
+        </div>
+      }
+      trailing={
+        <div className="flex items-center gap-1.5">
+          {!item.configured && item.billing === 'subscription' && (
+            <Link
+              to={bindAccountPath}
+              className="text-xs underline underline-offset-2 px-1.5"
+              style={{ color: 'var(--color-accent-primary)' }}
+              data-testid={`dalton-provider-connect-${item.provider}`}
+            >
+              {t('dalton.providers.goBindAccount')}
+            </Link>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1 text-xs"
+            disabled={!item.configured || isProbing}
+            onClick={() => probe.mutate({ provider: item.provider })}
+            data-testid={`dalton-provider-probe-${item.provider}`}
+          >
+            <Wifi className="h-3.5 w-3.5" />
+            <span>
+              {isProbing
+                ? t('dalton.providers.probing')
+                : t('dalton.providers.probeButton')}
+            </span>
+          </Button>
+          {hasDetail && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-8 px-2 text-xs"
+              onClick={() => setExpanded((v) => !v)}
+              aria-expanded={expanded}
+            >
+              {expanded ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" />
+              )}
+            </Button>
+          )}
+        </div>
+      }
+    >
+      {probeResult && (
+        <DaltonInlineNotice tone={probeResult.ok ? 'success' : 'error'}>
+          {probeResult.message} ({probeResult.latency_ms}ms)
+        </DaltonInlineNotice>
       )}
-    </div>
+      {probeErrorMessage && (
+        <DaltonInlineNotice tone="error" testId={`dalton-provider-probe-error-${item.provider}`}>
+          {t('dalton.providers.probeFailed', { error: probeErrorMessage })}
+        </DaltonInlineNotice>
+      )}
+
+      {hasDetail && (
+        <Disclosure open={expanded}>
+          <div className="space-y-2 pt-1 text-xs">
+            {item.credential.status_message && (
+              <DaltonInlineNotice tone="info">
+                {item.credential.status_message}
+              </DaltonInlineNotice>
+            )}
+            {isAdmin && item.credential.hint && (
+              <DaltonInlineNotice tone="warning">
+                {item.credential.hint}
+              </DaltonInlineNotice>
+            )}
+            {item.warnings.map((w, idx) => (
+              <DaltonInlineNotice key={idx} tone="warning">
+                {w.message}
+              </DaltonInlineNotice>
+            ))}
+            {item.recent_errors.map((err, idx) => (
+              <DaltonInlineNotice key={idx} tone="error">
+                {err.at ? `${formatTimestamp(err.at, locale)} · ` : ''}
+                {err.model ? `${err.model} · ` : ''}
+                {err.message}
+              </DaltonInlineNotice>
+            ))}
+          </div>
+        </Disclosure>
+      )}
+    </DaltonItemRow>
   );
 }

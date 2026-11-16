@@ -1,9 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'; // DALTON-HOOK(settings-reorg)
 import { useMutationState } from '@tanstack/react-query';
-import { Search, Pin } from 'lucide-react';
+import { ChevronDown, ChevronRight, Search, Pin } from 'lucide-react';
 import { Link, useLocation } from 'react-router';
+import { Button } from '@/components/ui/button';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { usePreferences } from '@/hooks/usePreferences';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { PREFERENCE_MUTATION_KEY, useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
 import { ModelSelector } from '@/components/model/ModelSelector';
@@ -19,9 +25,8 @@ import { useAllModels } from '@/hooks/useAllModels';
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { modelLabel, modelMatches } from '@/lib/modelLabel';
 import { Trans, useTranslation } from 'react-i18next';
+// DALTON-HOOK(settings-reorg): move Dalton cards to dedicated sections; keep personal model access + collapsed advanced routing here
 import { ModelAccessSection } from './ModelAccessSection';
-// DALTON-HOOK(settings-section): Dalton provider status, budget, and OAuth/native sync cards
-import { DaltonSection } from './dalton/DaltonSection';
 import { SettingRow, SettingsCardBody, SettingsGroup, ToggleRow } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SaveStatus } from '../components/SaveStatus';
@@ -224,7 +229,7 @@ export function ModelsPanel() {
       }
       const parsed = Number(trimmed);
       if (!Number.isInteger(parsed) || parsed < 60 || parsed > 1800) {
-        setAuditTimeoutError('数字核验超时必须在 60–1800 秒之间');
+        setAuditTimeoutError(t('settings.modelTuning.daltonAuditTimeoutError'));
         return;
       }
       setAuditTimeoutError(null);
@@ -232,8 +237,38 @@ export function ModelsPanel() {
         write({ dalton_audit_timeout_s: parsed });
       }
     },
-    [storedAuditTimeout, write],
+    [storedAuditTimeout, t, write],
   );
+
+  // DALTON-HOOK(settings-reorg): collapse background model routing by default under Advanced, fail closed on pending/error team-credentials read
+  const { isShared: isTeamShared, callerTierPending, callerTierError } = useTeamCredentials();
+  const accessPending = isDaltonAuth && callerTierPending === true;
+  const usePersonalAccessScope = isDaltonAuth && (isTeamShared || callerTierError === true);
+  const { hash: activeHash } = useLocation();
+  // DALTON-HOOK(settings-reorg): auto-expand folded advanced block when navigating directly to tuning or routing anchors
+  const routingAnchorSet = useMemo(
+    () =>
+      new Set([
+        `#${SETTINGS.accountDefaults.anchor}`,
+        `#${SETTINGS.perModel.anchor}`,
+        `#${SETTINGS.daltonRouting.anchor}`,
+        `#${SETTINGS.daltonAuditModel.anchor}`,
+        `#${SETTINGS.daltonLanguageModel.anchor}`,
+        `#${SETTINGS.daltonAuditFallbackModels.anchor}`,
+        `#${SETTINGS.daltonAuditTimeout.anchor}`,
+        `#${SETTINGS.daltonAssistModel.anchor}`,
+        `#${SETTINGS.daltonAssistFallbackModels.anchor}`,
+        `#${SETTINGS.daltonReviewerModels.anchor}`,
+        `#${SETTINGS.daltonExtractModel.anchor}`,
+      ]),
+    [],
+  );
+  const [daltonRoutingOpen, setDaltonRoutingOpen] = useState(() => routingAnchorSet.has(activeHash));
+  useEffect(() => {
+    if (routingAnchorSet.has(activeHash)) {
+      setDaltonRoutingOpen(true);
+    }
+  }, [activeHash, routingAnchorSet]);
 
   // Close starred-model picker on click outside
   useEffect(() => {
@@ -281,10 +316,20 @@ export function ModelsPanel() {
 
   return (
     <>
-      {/* Connections first: every pick below is among the models they reach. */}
-      <SettingsGroup title={t(SETTINGS.modelAccess.labelKey)}>
+      {/* DALTON-HOOK(settings-reorg): hold skeleton while credential scope resolves; keep personal access on error/shared */}
+      <SettingsGroup
+        title={t(usePersonalAccessScope ? 'settings.modelAccess.personalTitle' : SETTINGS.modelAccess.labelKey)}
+        description={usePersonalAccessScope ? t('settings.modelAccess.personalDesc') : undefined}
+      >
         <SettingsCardBody id={SETTINGS.modelAccess.anchor}>
-          <ModelAccessSection />
+          {accessPending ? (
+            <div className="space-y-2" aria-busy="true" data-testid="model-access-pending-skeleton">
+              <SkeletonBar className="h-9 w-full" />
+              <SkeletonBar className="h-9 w-2/3" />
+            </div>
+          ) : (
+            <ModelAccessSection scope={usePersonalAccessScope ? 'personal' : 'all'} />
+          )}
         </SettingsCardBody>
       </SettingsGroup>
 
@@ -439,30 +484,6 @@ export function ModelsPanel() {
 
       {isAdvanced && (
         <>
-          {/* Defaults first: they are the only place each setting is spelled
-              out, and the table below is bare columns. Read the explanation,
-              then the exceptions to it. */}
-          <SettingsGroup title={t(SETTINGS.accountDefaults.labelKey)}>
-            <SettingsCardBody id={SETTINGS.accountDefaults.anchor}>
-              <AccountTuningDefaults
-                metadata={modelMetadata}
-                validModelNames={validModelNames}
-                compactionProfiles={compactionProfiles}
-              />
-            </SettingsCardBody>
-          </SettingsGroup>
-
-          <SettingsGroup title={t(SETTINGS.perModel.labelKey)}>
-            <SettingsCardBody id={SETTINGS.perModel.anchor}>
-              <PerModelMatrix
-                metadata={modelMetadata}
-                validModelNames={validModelNames}
-                compactionProfiles={compactionProfiles}
-                pinnedGuidance={hookSystemDefaults?.prompt_guidance ?? null}
-              />
-            </SettingsCardBody>
-          </SettingsGroup>
-
           <SettingsGroup title={t(SETTINGS.routing.labelKey)}>
             <SettingsCardBody id={SETTINGS.routing.anchor} className="flex flex-col gap-4">
               <ModelSelector
@@ -534,16 +555,71 @@ export function ModelsPanel() {
                   </button>
                 </p>
               )}
+            </SettingsCardBody>
+          </SettingsGroup>
 
-              {/* DALTON-HOOK(settings-section): Dalton specialized model routing controls */}
-              <div
-                id={SETTINGS.daltonRouting.anchor}
-                className="pt-2 border-t flex flex-col gap-4"
-                style={{ borderColor: 'var(--color-border-muted)' }}
+          {/* DALTON-HOOK(settings-reorg): collapsed-by-default group combining per-model tuning, compaction profile, and background task models */}
+          <SettingsGroup
+            id={SETTINGS.daltonRouting.anchor}
+            title={t('settings.modelTuning.daltonHeading')}
+            description={t('settings.modelTuning.daltonRoutingDesc')}
+            action={
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-8 gap-1 text-xs"
+                aria-expanded={daltonRoutingOpen}
+                onClick={() => setDaltonRoutingOpen((open) => !open)}
+                data-testid="dalton-routing-toggle"
               >
-                <h4 className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-secondary)' }}>
-                  {t('settings.modelTuning.daltonHeading')}
-                </h4>
+                {daltonRoutingOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+                <span>
+                  {t(
+                    daltonRoutingOpen
+                      ? 'settings.modelTuning.collapseGroup'
+                      : 'settings.modelTuning.expandGroup',
+                  )}
+                </span>
+              </Button>
+            }
+          >
+            <Disclosure open={daltonRoutingOpen}>
+              <SettingsCardBody className="flex flex-col gap-5">
+                {/* DALTON-HOOK(settings-reorg): keep account defaults & compaction presets folded inside the advanced group */}
+                <div
+                  id={SETTINGS.accountDefaults.anchor}
+                  className="space-y-3 border-b pb-4"
+                  style={{ borderColor: 'var(--color-border-muted)' }}
+                >
+                  <div className="text-xs font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                    {t(SETTINGS.accountDefaults.labelKey)}
+                  </div>
+                  <AccountTuningDefaults
+                    metadata={modelMetadata}
+                    validModelNames={validModelNames}
+                    compactionProfiles={compactionProfiles}
+                  />
+                </div>
+                <div
+                  id={SETTINGS.perModel.anchor}
+                  className="space-y-3 border-b pb-4"
+                  style={{ borderColor: 'var(--color-border-muted)' }}
+                >
+                  <div className="text-xs font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                    {t(SETTINGS.perModel.labelKey)}
+                  </div>
+                  <PerModelMatrix
+                    metadata={modelMetadata}
+                    validModelNames={validModelNames}
+                    compactionProfiles={compactionProfiles}
+                    pinnedGuidance={hookSystemDefaults?.prompt_guidance ?? null}
+                  />
+                </div>
                 <div id={SETTINGS.daltonAuditModel.anchor}>
                   <ModelSelector
                     label={t('settings.modelTuning.daltonAuditModel')}
@@ -590,7 +666,8 @@ export function ModelsPanel() {
                   <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
                     {`${t('settings.modelTuning.daltonAuditTimeoutSDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_timeout_s ?? 300)}`}
                   </p>
-                  <input
+                  {/* DALTON-HOOK(settings-reorg): background audit timeout & model inputs */}
+                  <Input
                     id="dalton-audit-timeout-input"
                     type="number"
                     min={60}
@@ -609,16 +686,11 @@ export function ModelsPanel() {
                         commitAuditTimeout(e.currentTarget.value);
                       }
                     }}
-                    className="w-full max-w-xs rounded-md px-3 py-1.5 text-sm"
-                    style={{
-                      backgroundColor: 'var(--color-bg-input)',
-                      border: '1px solid var(--color-border-muted)',
-                      color: 'var(--color-text-primary)',
-                    }}
+                    className="w-full max-w-xs h-8 text-sm"
                     data-testid="dalton-audit-timeout-input"
                   />
                   {auditTimeoutError && (
-                    <p role="alert" className="text-xs" style={{ color: 'var(--color-icon-danger)' }}>
+                    <p role="alert" className="text-xs" style={{ color: 'var(--color-loss)' }}>
                       {auditTimeoutError}
                     </p>
                   )}
@@ -635,6 +707,7 @@ export function ModelsPanel() {
                     metadata={modelMetadata}
                   />
                 </div>
+                {/* DALTON-HOOK(settings-reorg): keep remaining background-task model pickers hooked */}
                 <div id={SETTINGS.daltonAssistFallbackModels.anchor}>
                   <FallbackModelsPicker
                     label={t('settings.modelTuning.daltonAssistFallbackModels')}
@@ -657,6 +730,7 @@ export function ModelsPanel() {
                     payers={payers}
                   />
                 </div>
+                {/* DALTON-HOOK(settings-reorg): extract model selector */}
                 <div id={SETTINGS.daltonExtractModel.anchor}>
                   <ModelSelector
                     label={t('settings.modelTuning.daltonExtractModel')}
@@ -669,14 +743,11 @@ export function ModelsPanel() {
                     metadata={modelMetadata}
                   />
                 </div>
-              </div>
-            </SettingsCardBody>
+              </SettingsCardBody>
+            </Disclosure>
           </SettingsGroup>
         </>
       )}
-
-      {/* DALTON-HOOK(settings-section): Dalton provider status, budget, and OAuth/native sync cards */}
-      <DaltonSection advanced={isAdvanced} />
     </>
   );
 }

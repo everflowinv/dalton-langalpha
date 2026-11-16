@@ -1,26 +1,37 @@
 import { useEffect, useRef } from 'react';
-import { useLocation, useSearchParams } from 'react-router';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useTranslation } from 'react-i18next';
 import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
+import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-reorg)
 import { SwapCell } from '@/components/ui/crossfade';
 import { SkeletonBar } from '@/components/ui/skeleton';
 import { AccountPanel } from './panels/AccountPanel';
 import { InvestingProfilePanel } from './panels/InvestingProfilePanel';
 import { GeneralPanel } from './panels/GeneralPanel';
-import { AppearancePanel } from './panels/AppearancePanel';
 import { ChatPanel } from './panels/ChatPanel';
-import { ArtifactsPanel } from './panels/ArtifactsPanel';
-import { DesktopPanel } from './panels/DesktopPanel';
-import { AgentPanel } from './panels/AgentPanel';
 import { ModelsPanel } from './panels/ModelsPanel';
-import { PlanPanel } from './panels/PlanPanel';
 import { IntegrationsPanel } from './panels/IntegrationsPanel';
-import { SettingsRail } from './components/SettingsRail';
+// DALTON-HOOK(settings-reorg): consolidated Dalton settings panels & permission guards
+import { DaltonBudgetPanel } from './panels/dalton/DaltonBudgetPanel';
+import { DaltonCoveragePanel } from './panels/dalton/DaltonCoveragePanel';
+import { DaltonTeamModelsPanel } from './panels/dalton/DaltonTeamModelsPanel';
+import { DaltonTeamMembersPanel } from './panels/dalton/DaltonTeamMembersPanel';
+import { DaltonTeamOpsPanel } from './panels/dalton/DaltonTeamOpsPanel';
+import { DaltonInlineNotice } from './panels/dalton/primitives';
+import { SettingsRail, useDaltonSettingsVisibility } from './components/SettingsRail';
 import ComputersDialogHost from '@/pages/ChatAgent/components/ComputersDialogHost';
-import { readSection, SECTIONS, type Section } from './sections';
+import {
+  readSection,
+  resolveRequestedSection,
+  resolveScrollAnchor,
+  SECTIONS,
+  tierSatisfies,
+  type Section,
+  type SectionMeta,
+} from './sections';
 import '@/styles/pageRail.css';
 import './Settings.css';
 
@@ -45,19 +56,20 @@ function SettingsSkeleton() {
   );
 }
 
+// DALTON-HOOK(settings-reorg): render consolidated Personal + Team Management panels
 function SectionBody({ section }: { section: Section }) {
   switch (section) {
     case 'account': return <AccountPanel />;
     case 'preferences': return <InvestingProfilePanel />;
-    case 'plan': return <PlanPanel />;
     case 'general': return <GeneralPanel />;
-    case 'appearance': return <AppearancePanel />;
     case 'chat': return <ChatPanel />;
-    case 'artifacts': return <ArtifactsPanel />;
-    case 'desktop': return <DesktopPanel />;
-    case 'agent': return <AgentPanel />;
     case 'model': return <ModelsPanel />;
+    case 'budget': return <DaltonBudgetPanel />;
     case 'integrations': return <IntegrationsPanel />;
+    case 'coverage': return <DaltonCoveragePanel />;
+    case 'teamModels': return <DaltonTeamModelsPanel />;
+    case 'teamMembers': return <DaltonTeamMembersPanel />;
+    case 'teamChannels': return <DaltonTeamOpsPanel />;
     // DALTON-HOOK(hide-trading): Dalton hides live brokerage trading section
     case 'trading': return <AccountPanel />;
     // DALTON-HOOK(hide-experiments): Dalton hides experimental labs section
@@ -73,22 +85,73 @@ function SectionBody({ section }: { section: Section }) {
 function Settings() {
   const [searchParams] = useSearchParams();
   const location = useLocation();
+  const navigate = useNavigate();
   const { hash } = location;
-  const focusSetting = (location.state as { focusSetting?: boolean } | null)?.focusSetting === true;
+  const locationState = location.state as { focusSetting?: boolean; deniedMessage?: string } | null;
+  const focusSetting = locationState?.focusSetting === true;
+  const deniedMessage = locationState?.deniedMessage;
   const { isLoading: isUserLoading } = useUser();
   const { isLoading: isPrefsLoading } = usePreferences();
+  const daltonVisibility = useDaltonSettingsVisibility();
   const { t } = useTranslation();
-  const section = readSection(searchParams, hash);
+
+  // DALTON-HOOK(settings-reorg): hold skeleton while tier/coverage permission resolves; redirect unauthorized direct visits cleanly using unified visibility
+  const requestedSection = resolveRequestedSection(searchParams, hash);
+  const requestedMeta: SectionMeta | undefined = requestedSection ? SECTIONS[requestedSection] : undefined;
+  const awaitingTier = Boolean(requestedMeta?.minTier && daltonVisibility.callerTierPending);
+  const awaitingCoverage = Boolean(requestedMeta?.coverageUnitsOnly && daltonVisibility.coverageUnitsPending);
+  const unauthorizedDaltonAuth = Boolean(requestedMeta?.daltonAuthOnly && !isDaltonAuth);
+  const unauthorizedTier = Boolean(
+    requestedMeta?.minTier &&
+    !daltonVisibility.callerTierPending &&
+    !tierSatisfies(daltonVisibility.callerTier, requestedMeta.minTier),
+  );
+  const disabledCoverage = Boolean(
+    requestedMeta?.coverageUnitsOnly &&
+    !daltonVisibility.coverageUnitsPending &&
+    daltonVisibility.coverageUnitsEnabled !== true,
+  );
+  const accessDenied = unauthorizedTier || unauthorizedDaltonAuth;
+
+  const section = readSection(searchParams, hash, daltonVisibility);
+  const displaySection =
+    (awaitingTier || awaitingCoverage) && requestedSection ? requestedSection : section;
   const pageRef = useRef<HTMLDivElement>(null);
-  useScrollMemory(pageRef, `page:settings:${section}`);
-  const isLoading = isUserLoading || isPrefsLoading;
+  useScrollMemory(pageRef, `page:settings:${displaySection}`);
+  const isLoading = isUserLoading || isPrefsLoading || awaitingTier || awaitingCoverage;
+
+  // DALTON-HOOK(settings-reorg): replace unauthorized deep link onto account tab with OSS-specific or tier-specific notice
+  useEffect(() => {
+    if (!accessDenied && !disabledCoverage) return;
+    const message = unauthorizedDaltonAuth
+      ? t('settings.daltonAuthOnly')
+      : unauthorizedTier
+        ? t(
+            requestedMeta?.minTier === 'admin'
+              ? 'settings.adminRequired'
+              : 'settings.internalRequired',
+          )
+        : undefined;
+    navigate('?tab=account', {
+      replace: true,
+      state: message ? { deniedMessage: message } : undefined,
+    });
+  }, [
+    accessDenied,
+    disabledCoverage,
+    unauthorizedDaltonAuth,
+    unauthorizedTier,
+    requestedMeta?.minTier,
+    navigate,
+    t,
+  ]);
 
   // The setting is brought into view as soon as it is drawn: a section that
   // waits on its own query (Experiments, Trading permission) draws it later. Keyed on
   // the navigation, not the hash alone, so finding the same setting twice
   // marks it twice.
   useEffect(() => {
-    const anchor = hash.replace(/^#/, '');
+    const anchor = resolveScrollAnchor(hash); // DALTON-HOOK(settings-reorg)
     const page = pageRef.current;
     if (isLoading || !anchor || !page) return;
     let marked: HTMLElement | null = null;
@@ -133,18 +196,26 @@ function Settings() {
           them, so it stays put once the page is scrolled. */}
       <div className="chrome-drag-strip" aria-hidden="true" />
       <div className="settings-body">
-        <SettingsRail section={section} />
+        <SettingsRail section={displaySection} />
         <div ref={pageRef} className="settings-scroll">
           <div className="settings-column">
             <header className="settings-head">
-              <h1 className="page-head-title">{t(SECTIONS[section].labelKey)}</h1>
-              <p className="settings-head-def">{t(SECTIONS[section].descKey, { brand: BRAND_NAME })}</p> {/* DALTON-HOOK(brand-name) */}
+              <h1 className="page-head-title">{t(SECTIONS[displaySection].labelKey)}</h1>
+              <p className="settings-head-def">{t(SECTIONS[displaySection].descKey, { brand: BRAND_NAME })}</p> {/* DALTON-HOOK(brand-name) */}
             </header>
-            {/* Only a cold load waits here: the app shell has usually read
-                both already. The section takes the placeholder rows' place in
-                a crossfade, and a section switch swaps with a short fade. */}
+            {/* DALTON-HOOK(settings-reorg): keep skeleton while resolving tier and never mount unauthorized sections */}
+            {deniedMessage && (
+              <DaltonInlineNotice
+                tone="warning"
+                testId="settings-permission-denied"
+                className="mb-4"
+              >
+                {deniedMessage}
+              </DaltonInlineNotice>
+            )}
             <SwapCell as="div" swapKey={isLoading ? 'loading' : 'ready'}>
-              {isLoading ? (
+              {/* DALTON-HOOK(settings-reorg): guard unauthorized or disabled section body before mount */}
+              {isLoading || accessDenied || disabledCoverage ? (
                 <SettingsSkeleton />
               ) : (
                 <div key={section} className="settings-content">

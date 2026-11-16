@@ -1,271 +1,247 @@
-import React from 'react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DaltonNotifyTargetsCard } from '../DaltonNotifyTargetsCard';
-import type { DaltonNotifyTestResponse } from '@/pages/Settings/utils/daltonApi';
+import type {
+  DaltonChannelBindingsResponse,
+  DaltonNotifyTestResponse,
+} from '@/pages/Settings/utils/daltonApi';
 
 const h = vi.hoisted(() => ({
-  preferences: {
-    model_preference: {} as Record<string, unknown>,
-    other_preference: {} as Record<string, unknown>,
+  prefs: {
+    model_preference: {
+      dalton_notify_enabled: true as boolean | null | undefined,
+      dalton_notify_targets: [] as string[],
+      dalton_notify_target_labels: undefined as Record<string, string> | undefined,
+    },
+    other_preference: {},
   },
-  isLoading: false,
-  isLoaded: true,
-  listeners: new Set<() => void>(),
-  mutateAsync: vi.fn(async (patch: Record<string, unknown>) => {
-    const mp = (patch.model_preference ?? {}) as Record<string, unknown>;
-    h.preferences = {
-      ...h.preferences,
-      model_preference: {
-        ...h.preferences.model_preference,
-        ...mp,
+  mutateAsync: vi.fn<
+    (payload: unknown) => Promise<{ model_preference?: Record<string, unknown> }>
+  >(),
+  bindings: {
+    user_id: 'u-1',
+    user_tier: 'internal',
+    home_workspace_id: 'home-ws',
+    bindings: {
+      feishu: {
+        linked: true,
+        platform: 'feishu',
+        platform_user_id: 'ou_ada',
+        platform_username: 'Ada Feishu',
+        updated_at: null,
       },
-    };
-    for (const listener of h.listeners) listener();
-    return h.preferences;
-  }),
-  sendTest: vi.fn<(target: string) => Promise<DaltonNotifyTestResponse>>(
-    async () => ({ ok: true, detail: null, error_code: null }),
-  ),
+      discord: {
+        linked: false,
+        platform: 'discord',
+        platform_user_id: null,
+        platform_username: null,
+        updated_at: null,
+      },
+      weixin: {
+        linked: false,
+        platform: 'weixin',
+        platform_user_id: null,
+        platform_username: null,
+        updated_at: null,
+      },
+    },
+    identities: {},
+    settings: { version: '1', apps: {} },
+    chat_bindings: [],
+    weixin_bot: null,
+  } as DaltonChannelBindingsResponse,
+  sendTest: vi.fn<(target: string) => Promise<DaltonNotifyTestResponse>>(),
 }));
 
 vi.mock('@/hooks/usePreferences', () => ({
-  usePreferences: () => {
-    const [, forceRender] = React.useState(0);
-    React.useEffect(() => {
-      const cb = () => forceRender((n) => n + 1);
-      h.listeners.add(cb);
-      return () => {
-        h.listeners.delete(cb);
-      };
-    }, []);
-    return {
-      preferences: h.preferences,
-      isLoading: h.isLoading,
-      isLoaded: h.isLoaded,
-    };
-  },
+  usePreferences: () => ({
+    preferences: h.prefs,
+    isLoading: false,
+    isLoaded: true,
+  }),
 }));
 
 vi.mock('@/hooks/useUpdatePreferences', () => ({
-  PREFERENCE_MUTATION_KEY: ['user-preferences'],
   useUpdatePreferences: () => ({
-    mutate: vi.fn(),
-    mutateAsync: h.mutateAsync,
+    isPending: false,
+    mutateAsync: (payload: unknown) => h.mutateAsync(payload),
   }),
 }));
 
 vi.mock('@/pages/Settings/utils/daltonApi', () => ({
+  fetchDaltonChannelBindings: async () => h.bindings,
   sendDaltonNotifyTest: (target: string) => h.sendTest(target),
 }));
 
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+function renderCard(allowManualInput = false) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <DaltonNotifyTargetsCard allowManualInput={allowManualInput} />
+    </QueryClientProvider>,
+  );
+}
+
 describe('DaltonNotifyTargetsCard', () => {
   beforeEach(() => {
-    h.preferences = { model_preference: {}, other_preference: {} };
-    h.isLoading = false;
-    h.isLoaded = true;
-    h.mutateAsync.mockClear();
-    h.sendTest.mockClear();
-    h.sendTest.mockImplementation(async () => ({ ok: true, detail: null, error_code: null }));
-  });
-
-  it('disables master switch, add button, and delete buttons before preferences finish loading', () => {
-    h.isLoading = true;
-    h.isLoaded = false;
-    h.preferences = {
+    h.prefs = {
       model_preference: {
-        dalton_notify_targets: ['feishu:user:ou_existing_01'],
+        dalton_notify_enabled: true,
+        dalton_notify_targets: [],
+        dalton_notify_target_labels: undefined,
       },
       other_preference: {},
     };
-
-    render(<DaltonNotifyTargetsCard />);
-
-    const masterSwitch = screen.getByRole('switch', { name: '推送总开关' });
-    const input = screen.getByLabelText('推送到');
-    const addButton = screen.getByRole('button', { name: /添加/ });
-    const deleteButton = screen.getByRole('button', { name: '删除 feishu:user:ou_existing_01' });
-
-    expect(masterSwitch).toBeDisabled();
-    expect(input).toBeDisabled();
-    expect(addButton).toBeDisabled();
-    expect(deleteButton).toBeDisabled();
-
-    fireEvent.click(masterSwitch);
-    fireEvent.click(addButton);
-    fireEvent.click(deleteButton);
-    expect(h.mutateAsync).not.toHaveBeenCalled();
+    h.mutateAsync.mockReset().mockResolvedValue({});
+    h.sendTest.mockReset().mockResolvedValue({ ok: true, detail: null, error_code: null });
   });
 
-  it('rejects group formats, adds and removes personal targets, and reads them back', async () => {
-    const { unmount } = render(<DaltonNotifyTargetsCard />);
+  it('derives bound-account switches from linked bindings without manual target input by default', async () => {
+    renderCard(false);
 
-    const input = screen.getByLabelText('推送到');
-    const addButton = screen.getByRole('button', { name: /添加/ });
+    expect(screen.queryByTestId('dalton-notify-manual-input')).not.toBeInTheDocument();
+    const feishuRow = await screen.findByTestId('dalton-notify-bound-feishu');
+    expect(feishuRow).toHaveTextContent('Ada Feishu');
 
-    // A group target is not a personal list entry (admin-only, per task).
-    fireEvent.change(input, { target: { value: 'feishu:chat:oc_research_group' } });
-    fireEvent.click(addButton);
-    expect(await screen.findByRole('alert')).toHaveTextContent('格式无效');
-    expect(h.mutateAsync).not.toHaveBeenCalled();
+    const accountToggle = screen.getByRole('switch', { name: 'Ada Feishu' });
+    expect(accountToggle).toHaveAttribute('aria-checked', 'false');
 
-    fireEvent.change(input, { target: { value: 'discord:user:not_numeric' } });
-    fireEvent.click(addButton);
-    expect(await screen.findByRole('alert')).toHaveTextContent('格式无效');
+    fireEvent.click(accountToggle);
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_targets: ['feishu:user:ou_ada'],
+        },
+      });
+    });
+  });
+
+  it('requires confirmation before disabling an enabled bound account switch', async () => {
+    h.prefs.model_preference.dalton_notify_targets = ['feishu:user:ou_ada'];
+    renderCard(false);
+
+    const accountToggle = await screen.findByRole('switch', { name: 'Ada Feishu' });
+    expect(accountToggle).toHaveAttribute('aria-checked', 'true');
+
+    fireEvent.click(accountToggle);
     expect(h.mutateAsync).not.toHaveBeenCalled();
 
-    await act(async () => {
-      fireEvent.change(input, { target: { value: 'feishu:user:ou_analyst_01' } });
-      fireEvent.click(addButton);
-    });
+    const confirmBtn = await screen.findByRole('button', { name: 'dalton.common.confirm' });
+    fireEvent.click(confirmBtn);
+
     await waitFor(() => {
       expect(h.mutateAsync).toHaveBeenCalledWith({
-        model_preference: {
-          dalton_notify_targets: ['feishu:user:ou_analyst_01'],
-        },
-      });
-    });
-
-    await act(async () => {
-      fireEvent.change(input, { target: { value: 'discord:user:123456789' } });
-      fireEvent.click(addButton);
-    });
-    await waitFor(() => {
-      expect(h.mutateAsync).toHaveBeenCalledWith({
-        model_preference: {
-          dalton_notify_targets: ['feishu:user:ou_analyst_01', 'discord:user:123456789'],
-        },
-      });
-    });
-
-    unmount();
-    render(<DaltonNotifyTargetsCard />);
-    expect(screen.getByText('feishu:user:ou_analyst_01')).toBeInTheDocument();
-    expect(screen.getByText('discord:user:123456789')).toBeInTheDocument();
-
-    const deleteFeishuBtn = screen.getByRole('button', { name: '删除 feishu:user:ou_analyst_01' });
-    await act(async () => {
-      fireEvent.click(deleteFeishuBtn);
-    });
-    await waitFor(() => {
-      expect(h.mutateAsync).toHaveBeenCalledWith({
-        model_preference: {
-          dalton_notify_targets: ['discord:user:123456789'],
-        },
-      });
-    });
-    expect(screen.queryByText('feishu:user:ou_analyst_01')).not.toBeInTheDocument();
-  });
-
-  it('shows the saved label and submits label edits as preference patches', async () => {
-    h.preferences = {
-      model_preference: {
-        dalton_notify_targets: ['feishu:user:ou_me_1'],
-        dalton_notify_target_labels: { 'feishu:user:ou_me_1': '我本人' },
-      },
-      other_preference: {},
-    };
-    render(<DaltonNotifyTargetsCard />);
-
-    const labelInput = screen.getByLabelText('目标别名 feishu:user:ou_me_1');
-    expect(labelInput).toHaveValue('我本人');
-
-    await act(async () => {
-      fireEvent.change(labelInput, { target: { value: '本人（新）' } });
-      fireEvent.blur(labelInput);
-    });
-    await waitFor(() => {
-      expect(h.mutateAsync).toHaveBeenCalledWith({
-        model_preference: {
-          dalton_notify_target_labels: { 'feishu:user:ou_me_1': '本人（新）' },
-        },
-      });
-    });
-
-    await act(async () => {
-      fireEvent.change(labelInput, { target: { value: '' } });
-      fireEvent.blur(labelInput);
-    });
-    await waitFor(() => {
-      expect(h.mutateAsync).toHaveBeenCalledWith({
-        model_preference: {
-          dalton_notify_target_labels: { 'feishu:user:ou_me_1': null },
-        },
+        model_preference: { dalton_notify_targets: [] },
       });
     });
   });
 
-  it('shows the test-send outcome per target, success and failure', async () => {
-    h.preferences = {
-      model_preference: {
-        dalton_notify_targets: ['feishu:user:ou_me_1', 'discord:user:1'],
-      },
-      other_preference: {},
-    };
-    h.sendTest.mockImplementation(async (target: string) =>
-      target === 'feishu:user:ou_me_1'
-        ? { ok: true, detail: null, error_code: null }
-        : {
-            ok: false,
-            detail: '发送失败（exit_code=1）',
-            error_code: 'exit_code=1',
-          },
-    );
-    render(<DaltonNotifyTargetsCard />);
+  it('requires confirmation before removing custom target in admin manual mode and supports test push', async () => {
+    h.prefs.model_preference.dalton_notify_targets = ['feishu:chat:oc_team1'];
+    renderCard(true);
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '发送测试 feishu:user:ou_me_1' }));
-    });
-    expect(await screen.findByText('测试已发送')).toBeInTheDocument();
-    expect(h.sendTest).toHaveBeenCalledWith('feishu:user:ou_me_1');
+    const input = await screen.findByTestId('dalton-notify-manual-input');
+    expect(input).toBeInTheDocument();
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '发送测试 discord:user:1' }));
+    fireEvent.click(screen.getByTestId('dalton-notify-remove-feishu:chat:oc_team1'));
+    expect(h.mutateAsync).not.toHaveBeenCalled();
+
+    const confirmBtns = await screen.findAllByRole('button', {
+      name: 'dalton.notifyTargets.removeLabel',
     });
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('发送失败（exit_code=1）');
+    fireEvent.click(confirmBtns[confirmBtns.length - 1]);
+
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: { dalton_notify_targets: [] },
+      });
+    });
   });
 
-  it('defaults master switch 推送总开关 to off, toggles on/off, and reads back saved value', async () => {
-    const { unmount } = render(<DaltonNotifyTargetsCard />);
-
+  it('defaults master toggle to off when dalton_notify_enabled is unset or null', async () => {
+    delete h.prefs.model_preference.dalton_notify_enabled;
+    const { unmount } = renderCard(false);
     expect(
-      screen.getByText('控制全部自动任务推送（飞书、Discord、群）。'),
-    ).toBeInTheDocument();
-
-    const masterSwitch = screen.getByRole('switch', { name: '推送总开关' });
-    expect(masterSwitch).toHaveAttribute('aria-checked', 'false');
-
-    await act(async () => {
-      fireEvent.click(masterSwitch);
-    });
-    await waitFor(() => {
-      expect(h.mutateAsync).toHaveBeenCalledWith({
-        model_preference: {
-          dalton_notify_enabled: true,
-        },
-      });
-    });
-    expect(masterSwitch).toHaveAttribute('aria-checked', 'true');
-    expect(screen.getByText('已开启推送总开关')).toBeInTheDocument();
-
+      await screen.findByRole('switch', { name: 'dalton.notifyTargets.masterSwitchLabel' }),
+    ).toHaveAttribute('aria-checked', 'false');
     unmount();
-    render(<DaltonNotifyTargetsCard />);
-    const remountedSwitch = screen.getByRole('switch', { name: '推送总开关' });
-    expect(remountedSwitch).toHaveAttribute('aria-checked', 'true');
 
-    await act(async () => {
-      fireEvent.click(remountedSwitch);
+    h.prefs.model_preference.dalton_notify_enabled = null;
+    renderCard(false);
+    expect(
+      await screen.findByRole('switch', { name: 'dalton.notifyTargets.masterSwitchLabel' }),
+    ).toHaveAttribute('aria-checked', 'false');
+  });
+
+  it('rejects group/channel targets with task-routing hint and accepts valid personal DM targets', async () => {
+    renderCard(true);
+
+    const input = await screen.findByTestId('dalton-notify-manual-input');
+    const addBtn = screen.getByTestId('dalton-notify-manual-add');
+
+    fireEvent.change(input, { target: { value: 'feishu:chat:oc_group1' } });
+    fireEvent.click(addBtn);
+    expect(await screen.findByRole('alert')).toHaveTextContent('dalton.notifyTargets.groupTargetHint');
+    expect(h.mutateAsync).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: 'discord:channel:123456' } });
+    fireEvent.click(addBtn);
+    expect(await screen.findByRole('alert')).toHaveTextContent('dalton.notifyTargets.groupTargetHint');
+    expect(h.mutateAsync).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: 'feishu:user:ou_newuser' } });
+    fireEvent.click(addBtn);
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: { dalton_notify_targets: ['feishu:user:ou_newuser'] },
+      });
     });
+  });
+
+  it('displays, edits, and saves dalton_notify_target_labels on blur', async () => {
+    h.prefs.model_preference.dalton_notify_targets = [
+      'feishu:user:ou_ada',
+      'discord:user:998877',
+    ];
+    h.prefs.model_preference.dalton_notify_target_labels = {
+      'feishu:user:ou_ada': 'Ada Primary',
+      'discord:user:998877': 'Night Desk',
+    };
+    renderCard(false);
+
+    const boundRow = await screen.findByTestId('dalton-notify-bound-feishu');
+    expect(boundRow).toHaveTextContent('Ada Primary');
+
+    const boundInput = screen.getByTestId(
+      'dalton-notify-label-feishu:user:ou_ada',
+    ) as HTMLInputElement;
+    expect(boundInput.value).toBe('Ada Primary');
+
+    const customInput = screen.getByTestId(
+      'dalton-notify-label-discord:user:998877',
+    ) as HTMLInputElement;
+    expect(customInput.value).toBe('Night Desk');
+
+    fireEvent.change(customInput, { target: { value: '  Morning Brief  ' } });
+    fireEvent.blur(customInput);
+
     await waitFor(() => {
       expect(h.mutateAsync).toHaveBeenCalledWith({
         model_preference: {
-          dalton_notify_enabled: false,
+          dalton_notify_target_labels: {
+            'feishu:user:ou_ada': 'Ada Primary',
+            'discord:user:998877': 'Morning Brief',
+          },
         },
       });
     });
-    expect(remountedSwitch).toHaveAttribute('aria-checked', 'false');
-    expect(screen.getByText('已关闭推送总开关')).toBeInTheDocument();
   });
 });

@@ -399,6 +399,9 @@ ALLOWED_HOOKS=(
   # and continuation turns finish (with 3h default hard cap) and propagate
   # automation identity to report-back continuation turns.
   "automation-continuation-identity"
+  # Settings page reorganization into Personal + Team Management with tier guards
+  # and Dalton card rewrites using upstream UI primitives.
+  "settings-reorg"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

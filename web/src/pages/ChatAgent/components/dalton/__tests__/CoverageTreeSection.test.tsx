@@ -234,6 +234,6 @@ describe('CoverageTreeSection', () => {
     const row = screen.getByTestId('coverage-tree-unclassified');
     expect(row.textContent).toContain('1');
     fireEvent.click(row);
-    expect(currentUrl()).toBe('/settings?tab=model#dalton-coverage-unclassified');
+    expect(currentUrl()).toBe('/settings?tab=coverage#dalton-coverage-unclassified');
   });
 });

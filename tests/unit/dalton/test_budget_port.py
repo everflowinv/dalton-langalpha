@@ -50,7 +50,7 @@ def test_budget_exhausted_messages_chinese():
         Decimal("0"), Decimal("0"), Decimal("0"), configured=False
     )
     assert "未设置日预算" in unconfigured
-    assert "Dalton 预算" in unconfigured
+    assert "设置 → 用量与预算" in unconfigured
 
     daily = format_daily_budget_exhausted_message(
         Decimal("30.00"), Decimal("28.50"), Decimal("1.50"), configured=True

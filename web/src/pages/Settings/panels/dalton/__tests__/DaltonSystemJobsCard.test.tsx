@@ -1,263 +1,140 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Mock } from 'vitest';
-import { fireEvent, screen } from '@testing-library/react';
-import { renderWithProviders } from '@/test/utils';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { fireEvent, render, screen } from '@testing-library/react';
+import '@testing-library/jest-dom';
+import { MemoryRouter } from 'react-router';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DaltonSystemJobsCard } from '../DaltonSystemJobsCard';
-import {
-  fetchDaltonSystemJobs,
-  toggleDaltonSystemJob,
-  runDaltonSystemJobNow,
-} from '../../../utils/daltonApi';
+import type {
+  DaltonSystemJobItem,
+  DaltonSystemJobRunResponse,
+  DaltonSystemJobsResponse,
+  DaltonSystemJobToggleResponse,
+} from '@/pages/Settings/utils/daltonApi';
 
-vi.mock('../../../utils/daltonApi', () => ({
-  fetchDaltonSystemJobs: vi.fn(),
-  toggleDaltonSystemJob: vi.fn(),
-  runDaltonSystemJobNow: vi.fn(),
+const h = vi.hoisted(() => ({
+  callerTier: 'internal' as string | null,
+  jobsResponse: {
+    ok: true,
+    jobs: [],
+  } as DaltonSystemJobsResponse,
+  toggleJob: vi.fn<
+    (key: string, enabled: boolean) => Promise<DaltonSystemJobToggleResponse>
+  >(),
+  runJob: vi.fn<(key: string) => Promise<DaltonSystemJobRunResponse>>(),
 }));
 
-const mockFetchJobs = fetchDaltonSystemJobs as Mock;
-const mockToggleJob = toggleDaltonSystemJob as Mock;
-const mockRunNow = runDaltonSystemJobNow as Mock;
+vi.mock('@/hooks/useTeamCredentials', () => ({
+  useTeamCredentials: () => ({
+    callerTier: h.callerTier,
+    callerTierPending: false,
+    callerTierError: false,
+  }),
+}));
+
+vi.mock('@/hooks/useLocale', () => ({
+  useLocale: () => 'zh-CN',
+}));
+
+vi.mock('@/pages/Settings/utils/daltonApi', () => ({
+  fetchDaltonSystemJobs: async () => h.jobsResponse,
+  toggleDaltonSystemJob: (key: string, enabled: boolean) => h.toggleJob(key, enabled),
+  runDaltonSystemJobNow: (key: string) => h.runJob(key),
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+function makeJob(overrides: Partial<DaltonSystemJobItem>): DaltonSystemJobItem {
+  return {
+    key: 'job-1',
+    kind: 'sync',
+    scope: 'company',
+    title: 'Company Filings Sync',
+    status: 'on',
+    enabled: true,
+    last_run_at: '2026-11-16T08:00:00Z',
+    last_result: 'ok',
+    next_run_at: null,
+    can_toggle: true,
+    can_run_now: true,
+    ...overrides,
+  };
+}
+
+function renderCard(scopes?: string[]) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <DaltonSystemJobsCard scopes={scopes} />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
 
 describe('DaltonSystemJobsCard', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    mockFetchJobs.mockResolvedValue({
+    localStorage.removeItem('settings:modelMode');
+    h.callerTier = 'internal';
+    h.toggleJob.mockReset().mockResolvedValue({ ok: true });
+    h.runJob.mockReset().mockResolvedValue({
       ok: true,
-      is_pm: true,
-      jobs: [
-        {
-          key: 'conversation-archive',
-          kind: 'conversation_archive',
-          scope: 'host',
-          title: '团队对话归档',
-          status: 'on',
-          enabled: true,
-          last_run_at: null,
-          last_result: null,
-          next_run_at: null,
-          can_toggle: true,
-          can_run_now: true,
-        },
-      ],
+      key: 'job-1',
+      scope: 'company',
+      async: true,
+      status: 'running',
     });
-  });
-
-  it('renders job status without a switch or run-now and links to company tasks', async () => {
-    renderWithProviders(<DaltonSystemJobsCard />);
-
-    expect(await screen.findByTestId('system-job-row-conversation-archive')).toBeInTheDocument();
-    expect(screen.queryByLabelText('切换 团队对话归档')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('system-job-run-conversation-archive')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('system-job-pause-all-conversation-archive')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('system-job-repair-conversation-archive')).not.toBeInTheDocument();
-    expect(screen.queryByText('全部暂停')).not.toBeInTheDocument();
-    expect(screen.queryByText('修复')).not.toBeInTheDocument();
-    expect(screen.queryByText('立即运行')).not.toBeInTheDocument();
-    expect(mockToggleJob).not.toHaveBeenCalled();
-    expect(mockRunNow).not.toHaveBeenCalled();
-    expect(screen.queryByText(/已关闭|已开启/)).not.toBeInTheDocument();
-    const link = screen.getByRole('link', { name: '前往 自动化 → 公司公共任务' });
-    expect(link).toHaveAttribute('href', '/automations?scope=company');
-  });
-
-  it('does not offer run-now on the read-only card', async () => {
-    renderWithProviders(<DaltonSystemJobsCard />);
-
-    expect(await screen.findByTestId('system-job-row-conversation-archive')).toBeInTheDocument();
-    expect(screen.queryByTestId('system-job-run-conversation-archive')).not.toBeInTheDocument();
-    expect(screen.queryByText('立即运行')).not.toBeInTheDocument();
-    expect(mockRunNow).not.toHaveBeenCalled();
-    const link = screen.getByTestId('system-jobs-open-company');
-    expect(link).toHaveAttribute('href', '/automations?scope=company');
-    expect(link).toHaveTextContent('前往 自动化 → 公司公共任务');
-  });
-
-  it('filters rendered scope groups and subtitle according to the scopes prop', async () => {
-    renderWithProviders(<DaltonSystemJobsCard scopes={['company', 'home']} />);
-
-    expect(await screen.findByTestId('system-jobs-group-company')).toBeInTheDocument();
-    expect(screen.getByTestId('system-jobs-group-home')).toBeInTheDocument();
-    expect(screen.queryByTestId('system-jobs-group-host')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('system-jobs-group-ops')).not.toBeInTheDocument();
-    expect(
-      screen.getByText('只读查看系统底层定时任务的运行状态（公司跟踪、Home 全局）'),
-    ).toBeInTheDocument();
-  });
-
-  it('hides log_tail when exit_code is 0 or 2, shows it when exit_code is 3, and formats daily schedule from next_run_at in local time', async () => {
-    const nextRun = '2026-10-26T01:15:00Z';
-    const dt = new Date(nextRun);
-    const expectedHh = String(dt.getHours()).padStart(2, '0');
-    const expectedMm = String(dt.getMinutes()).padStart(2, '0');
-
-    mockFetchJobs.mockResolvedValueOnce({
+    h.jobsResponse = {
       ok: true,
-      is_pm: true,
       jobs: [
-        {
-          key: 'conversation-archive',
-          kind: 'conversation_archive',
-          scope: 'host',
-          title: '团队对话归档',
-          schedule: null,
-          status: 'on',
-          enabled: true,
-          last_run_at: '2026-10-25T01:15:00Z',
-          last_result: '成功 (exit 0)',
-          next_run_at: nextRun,
-          exit_code: 0,
-          log_tail: '=== 2026-10-25 ===\nRuntimeError: cancel scope\n=== exit 0 ===',
-          can_toggle: true,
-          can_run_now: true,
-        },
-        {
-          key: 'conversation-archive-skipped',
-          kind: 'conversation_archive',
-          scope: 'host',
-          title: '团队对话归档（跳过）',
-          schedule: null,
-          status: 'on',
-          enabled: true,
-          last_run_at: '2026-10-25T01:15:00Z',
-          last_result: '已在运行，跳过',
-          next_run_at: null,
-          exit_code: 2,
-          log_tail: '=== 2026-10-25 ===\nalready running\n=== exit 2 ===',
-          can_toggle: true,
-          can_run_now: true,
-        },
-        {
-          key: 'conversation-archive-partial',
-          kind: 'conversation_archive',
-          scope: 'host',
-          title: '团队对话归档（部分未完成）',
-          schedule: null,
-          status: 'on',
-          enabled: true,
-          last_run_at: '2026-10-25T01:15:00Z',
-          last_result: '部分未完成 (exit_code=3)',
-          next_run_at: null,
-          exit_code: 3,
-          log_tail: '=== 2026-10-25 ===\nhourly budget reached\n=== exit 3 ===',
-          can_toggle: true,
-          can_run_now: true,
-        },
+        makeJob({ key: 'data-1', scope: 'data', title: 'Public Data Sync', can_toggle: true, can_run_now: true }),
+        makeJob({ key: 'company-1', scope: 'company', title: 'Company Track', can_toggle: false, can_run_now: false }),
+        makeJob({ key: 'sector-1', scope: 'sector', title: 'Sector Track', log_tail: 'ok line 1', can_toggle: false, can_run_now: false }),
+        makeJob({ key: 'ops-1', scope: 'ops', title: 'Bridge Maintenance', can_toggle: true, can_run_now: true }),
+        makeJob({ key: 'host-1', scope: 'host', title: 'Host Disk GC', can_toggle: true, can_run_now: true }),
       ],
-    });
-
-    renderWithProviders(<DaltonSystemJobsCard />);
-
-    expect(
-      await screen.findByText(`(每日 ${expectedHh}:${expectedMm})`),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByTestId('system-job-log-toggle-conversation-archive'),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByTestId('system-job-log-toggle-conversation-archive-skipped'),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.getByTestId('system-job-log-toggle-conversation-archive-partial'),
-    ).toBeInTheDocument();
+    };
   });
 
-  it('shows collapsed log toggle when last run failed and expands log on click', async () => {
-    mockFetchJobs.mockResolvedValueOnce({
-      ok: true,
-      is_pm: true,
-      jobs: [
-        {
-          key: 'conversation-archive',
-          kind: 'conversation_archive',
-          scope: 'host',
-          title: '团队对话归档',
-          schedule: null,
-          status: 'on',
-          enabled: true,
-          last_run_at: '2026-10-25T01:15:00Z',
-          last_result: '失败 (exit 1)',
-          next_run_at: '2026-10-26T01:15:00Z',
-          exit_code: 1,
-          log_tail: '=== 2026-10-25 ===\nError: something went wrong\n=== exit 1 ===',
-          can_toggle: true,
-          can_run_now: true,
-        },
-      ],
-    });
+  it('strictly hides host and ops jobs from non-admin members while honoring backend capabilities on public/data scopes', async () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    h.callerTier = 'internal';
+    renderCard();
 
-    renderWithProviders(<DaltonSystemJobsCard />);
+    expect(await screen.findByText('Public Data Sync')).toBeInTheDocument();
+    expect(screen.getByText('Company Track')).toBeInTheDocument();
+    expect(screen.getByText('Sector Track')).toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-system-jobs-ops-section')).not.toBeInTheDocument();
+    expect(screen.queryByText('Bridge Maintenance')).not.toBeInTheDocument();
+    expect(screen.queryByText('Host Disk GC')).not.toBeInTheDocument();
 
-    const toggleBtn = await screen.findByTestId('system-job-log-toggle-conversation-archive');
-    expect(toggleBtn).toHaveTextContent('查看日志');
-    expect(
-      screen.queryByTestId('system-job-log-conversation-archive'),
-    ).not.toBeInTheDocument();
-
-    fireEvent.click(toggleBtn);
-    expect(toggleBtn).toHaveTextContent('收起日志');
-    const pre = screen.getByTestId('system-job-log-conversation-archive');
-    expect(pre).toHaveTextContent('Error: something went wrong');
+    // Read-only card: running or pausing jobs lives on Automations, never here.
+    expect(screen.queryByTestId('dalton-system-job-run-data-1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
   });
 
-  it('renders and toggles sector-scope jobs with the same UI as company scope (P4)', async () => {
-    // 形状与后端 _build_sector_job_entry 的返回逐字段一致（system_jobs.py）
-    mockFetchJobs.mockResolvedValueOnce({
-      ok: true,
-      is_pm: true,
-      jobs: [
-        {
-          key: 'sector:ai-infrastructure',
-          kind: 'sector_tracking',
-          scope: 'sector',
-          title: 'AI Infrastructure 行业自动跟踪',
-          description: '',
-          schedule: '议程到期每 2 小时（研究时区）· 内部资料每周六 11:00 增量扫描 · 不跑证券探针',
-          workspace_id: '11111111-1111-1111-1111-111111111111',
-          unit_id: '22222222-2222-2222-2222-222222222222',
-          sector_slug: 'ai-infrastructure',
-          subject_kind: 'sector',
-          ticker: null,
-          status: 'on',
-          tracking_status: 'enabled',
-          enabled: true,
-          paused_by_user: false,
-          last_run_at: null,
-          last_result: null,
-          next_run_at: null,
-          can_toggle: true,
-          can_run_now: true,
-          missing_tasks: [],
-          paused_tasks: [],
-          active_tasks: [],
-          tasks: [],
-        },
-      ],
-    });
+  it('shows the host and ops section to admins, still without run or toggle controls', async () => {
+    h.callerTier = 'admin';
+    renderCard();
 
-    renderWithProviders(<DaltonSystemJobsCard scopes={['company', 'sector', 'home']} />);
+    expect(await screen.findByTestId('dalton-system-jobs-ops-section')).toBeInTheDocument();
+    expect(screen.getByText('Bridge Maintenance')).toBeInTheDocument();
+    expect(screen.getByText('Host Disk GC')).toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-system-job-run-ops-1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+  });
 
-    expect(await screen.findByTestId('system-jobs-group-sector')).toBeInTheDocument();
-    expect(
-      screen.getByTestId('system-job-row-sector:ai-infrastructure'),
-    ).toBeInTheDocument();
-    expect(screen.getByText('AI Infrastructure 行业自动跟踪')).toBeInTheDocument();
-    expect(screen.queryByLabelText('切换 AI Infrastructure 行业自动跟踪')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('system-job-run-sector:ai-infrastructure')).not.toBeInTheDocument();
-    expect(screen.queryByText('全部暂停')).not.toBeInTheDocument();
-    expect(screen.queryByText('修复')).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '前往 自动化 → 公司公共任务' })).toHaveAttribute(
-      'href',
-      '/automations?scope=company',
-    );
-    expect(screen.queryByTestId('system-jobs-group-host')).not.toBeInTheDocument();
-    // 摘要行包含行业跟踪（sector 摘要名走 i18n；jsdom 下组件测试以 en-US
-    // 渲染，原有四个 scope 的摘要名是组件内写死的中文，所以这里按 en-US
-    // 目录里的 sector 摘要名 'Sector tracking' 断言）
-    expect(
-      screen.getByText(
-        '只读查看系统底层定时任务的运行状态（公司跟踪、Sector tracking、Home 全局）',
-      ),
-    ).toBeInTheDocument();
+  it('supports scopes prop filter and expands log_tail disclosure cleanly', async () => {
+    h.callerTier = 'admin';
+    renderCard(['sector']);
+
+    expect(await screen.findByText('Sector Track')).toBeInTheDocument();
+    expect(screen.queryByText('Company Track')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'dalton.systemJobs.showLogs' }));
+    expect(await screen.findByText('ok line 1')).toBeInTheDocument();
   });
 });

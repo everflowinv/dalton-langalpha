@@ -1,136 +1,81 @@
-import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronRight,
-  RefreshCw,
-} from 'lucide-react';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useProviderStatus } from '../../hooks/useProviderStatus';
-import { ProviderRow } from './ProviderRow';
 import { NativeModelsCard } from './NativeModelsCard';
+import { ProviderRow } from './ProviderRow';
+import {
+  DaltonInlineNotice,
+  DaltonKeyValueList,
+  DaltonLoadingRow,
+  DaltonRefreshButton,
+  DaltonSettingsCard,
+} from './primitives';
 
+/** Team provider health dashboard + model catalog sync section (admin view in Team Models). */
 export function ProviderStatusCard() {
   const { t } = useTranslation();
+  const { isPm, callerTier } = useTeamCredentials();
+  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
   const statusQuery = useProviderStatus(true);
-  const [nativeModelsExpanded, setNativeModelsExpanded] = useState(false);
 
-  const data = statusQuery.data;
-  const providers = data?.providers ?? [];
-  const roleWarnings = data?.role_warnings ?? [];
-
-  // Summarize active role models from used_by_roles
-  const roleSummary: string[] = [];
-  for (const p of providers) {
-    for (const r of p.used_by_roles ?? []) {
-      if (r.role === 'lead' || r.role === 'background' || r.role === 'assist') {
-        roleSummary.push(`${r.role}: ${r.model}`);
-      }
-    }
-  }
+  const providers = statusQuery.data?.providers ?? [];
+  const roleWarnings = statusQuery.data?.role_warnings ?? [];
 
   return (
-    <div
-      className="flex flex-col gap-3 p-4 rounded-lg"
-      style={{
-        backgroundColor: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-default)',
-      }}
-      data-testid="dalton-provider-status-card"
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div>
-          <span
-            className="text-sm font-medium"
-            style={{ color: 'var(--color-text-primary)' }}
-          >
-            {t('dalton.providers.title', '模型供应商状态')}
-          </span>
-          {roleSummary.length > 0 && (
-            <p
-              className="text-xs font-mono mt-0.5"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            >
-              {roleSummary.join(' · ')}
-            </p>
-          )}
-        </div>
-        <button
-          type="button"
-          onClick={() => void statusQuery.refetch()}
-          className="flex items-center gap-1 text-xs underline underline-offset-2"
-          style={{ color: 'var(--color-text-tertiary)' }}
-        >
-          <RefreshCw
-            className={`h-3 w-3 ${statusQuery.isFetching ? 'animate-spin' : ''}`}
+    <div className="space-y-6">
+      <DaltonSettingsCard
+        id="dalton-providers"
+        testId="dalton-providers-card"
+        title={t('dalton.providers.title')}
+        description={t('dalton.providers.description')}
+        layout="padded"
+        bodyClassName="space-y-4"
+        action={
+          <DaltonRefreshButton
+            busy={statusQuery.isFetching}
+            onClick={() => void statusQuery.refetch()}
+            testId="dalton-providers-refresh"
           />
-          {t('dalton.providers.refresh', '刷新状态')}
-        </button>
-      </div>
-
-      {/* Role warnings at top */}
-      {roleWarnings.length > 0 && (
-        <div
-          className="rounded-md p-2.5 space-y-1 text-xs"
-          style={{
-            backgroundColor: 'var(--color-warning-soft)',
-            color: 'var(--color-warning)',
-          }}
-          data-testid="dalton-provider-role-warnings"
-        >
-          {roleWarnings.map((w, idx) => (
-            <div key={`${w.code}-${idx}`} className="flex items-center justify-between gap-2">
-              <span className="flex items-center gap-1.5">
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                <span>
-                  [{w.role}] {w.message}
-                </span>
-              </span>
-              {w.link && (
-                <a href={w.link} className="underline shrink-0">
-                  去设置
-                </a>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Provider rows */}
-      <div className="flex flex-col gap-2">
-        {providers.map((item) => (
-          <ProviderRow key={item.provider} item={item} />
-        ))}
-      </div>
-
-      {/* Native-subscription model sync card (check → confirm → add-only runtime overlay) */}
-      <div
-        className="pt-2.5 mt-1"
-        style={{ borderTop: '1px solid var(--color-border-muted)' }}
+        }
       >
-        <button
-          type="button"
-          onClick={() => setNativeModelsExpanded((v) => !v)}
-          className="flex items-center gap-2 text-xs font-medium w-full text-left"
-          style={{ color: 'var(--color-text-secondary)' }}
-          data-testid="dalton-native-models-toggle"
-        >
-          {nativeModelsExpanded ? (
-            <ChevronDown className="h-3.5 w-3.5" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5" />
-          )}
-          <span>
-            {t('dalton.providers.nativeModelsSectionTitle', '原生模型同步（订阅模型目录）')}
-          </span>
-        </button>
-        {nativeModelsExpanded && (
-          <div className="mt-2.5">
-            <NativeModelsCard embedded />
-          </div>
+        {statusQuery.isLoading ? (
+          <DaltonLoadingRow label={t('dalton.common.loading')} />
+        ) : statusQuery.isError ? (
+          <DaltonInlineNotice tone="error">
+            {t('dalton.providers.loadFailed')}
+          </DaltonInlineNotice>
+        ) : (
+          <>
+            {roleWarnings.length > 0 && (
+              <div className="space-y-1.5">
+                {roleWarnings.map((w, idx) => (
+                  <DaltonInlineNotice key={idx} tone="warning">
+                    {w.message}
+                  </DaltonInlineNotice>
+                ))}
+              </div>
+            )}
+
+            <DaltonKeyValueList
+              isEmpty={providers.length === 0}
+              empty={t('dalton.providers.emptyProviders')}
+            >
+              {providers.map((item) => (
+                <ProviderRow key={item.provider} item={item} isAdmin={isAdmin} />
+              ))}
+            </DaltonKeyValueList>
+
+            <DaltonInlineNotice tone="info">
+              {isAdmin
+                ? t('dalton.providers.configAdminNote')
+                : t('dalton.providers.configMemberNote')}
+            </DaltonInlineNotice>
+          </>
         )}
-      </div>
+      </DaltonSettingsCard>
+
+      <NativeModelsCard />
     </div>
   );
 }

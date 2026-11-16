@@ -5,6 +5,7 @@ import { Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-section)
 import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(settings-section)
+import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(settings-reorg)
 import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
 import { matchesAllWords, queryWords } from '@/lib/textMatch';
@@ -16,15 +17,24 @@ import {
 import { GROUPS, SECTIONS, searchableSettings, sectionShown, settingSearchText, type Section, type SettingEntry } from '../sections';
 
 // DALTON-HOOK(settings-section): the command palette filters settings with the same card visibility
+// DALTON-HOOK(settings-reorg): fail closed on callerTierError without cos-sharing fallback; keep OSS admin & coverage parity
 export function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
-  const { canInvite, isPm, callerTier: credCallerTier } = useTeamCredentials();
+  const { canInvite, isPm, callerTier, callerTierPending, callerTierError } = useTeamCredentials();
   const { data } = useUserCosSharingQuery(isDaltonAuth);
+  const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(true);
+  const effectiveTier = isDaltonAuth
+    ? (callerTierError ? null : (callerTier ?? null))
+    : (isPm ? 'admin' : null);
   return {
     canInvite,
     isPm,
-    callerTier: data?.caller_tier ?? credCallerTier ?? null,
+    callerTier: effectiveTier,
+    callerTierPending: isDaltonAuth ? callerTierPending : false,
+    callerTierError: isDaltonAuth ? callerTierError : false,
     colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
     cosSharingLoaded: data !== undefined,
+    coverageUnitsEnabled: coverageData?.enabled === true,
+    coverageUnitsPending: coverageLoading,
   };
 }
 
@@ -186,8 +196,9 @@ export function SettingsRail({ section }: { section: Section }) {
             <Search aria-hidden />
           </button>
           {/* DALTON-HOOK(hide-experiments): omit empty groups when all their sections are hidden */}
+          {/* DALTON-HOOK(settings-reorg): pass daltonVisibility to sectionShown for tier & coverage filtering */}
           {GROUPS.map((group) => {
-            const visible = group.sections.filter(sectionShown);
+            const visible = group.sections.filter((s) => sectionShown(s, daltonVisibility));
             if (visible.length === 0) return null;
             return (
             <div key={group.labelKey} className="settings-rail-group">

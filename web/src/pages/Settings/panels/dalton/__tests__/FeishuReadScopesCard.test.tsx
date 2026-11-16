@@ -1,172 +1,116 @@
-import React from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { FeishuReadScopesCard, canShowDaltonFeishuScopesCard } from '../FeishuReadScopesCard';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { FeishuReadScopesCard } from '../FeishuReadScopesCard';
+import type {
+  DaltonFeishuReadScopesResponse,
+  DaltonFeishuSpace,
+} from '@/pages/Settings/utils/daltonApi';
 
 const h = vi.hoisted(() => ({
-  canInvite: true,
-  fetchDaltonFeishuReadScopes: vi.fn(),
-  updateDaltonFeishuReadScopes: vi.fn(),
-  fetchDaltonFeishuSpaces: vi.fn(),
+  callerTier: 'admin' as string | null,
+  fetchScopes: vi.fn<() => Promise<DaltonFeishuReadScopesResponse>>(),
+  fetchSpaces: vi.fn<() => Promise<{ spaces: DaltonFeishuSpace[] }>>(),
+  updateScopes: vi.fn<
+    (scopes: Array<{ space_id: string; name: string }>) => Promise<DaltonFeishuReadScopesResponse>
+  >(),
+}));
+
+vi.mock('@/config/daltonAuth', () => ({
+  isDaltonAuth: true,
 }));
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
   useTeamCredentials: () => ({
-    isShared: true,
-    canDisconnect: h.canInvite,
-    canManage: h.canInvite,
-    isPm: h.canInvite,
-    canInvite: h.canInvite,
+    callerTier: h.callerTier,
+    callerTierPending: false,
+    callerTierError: false,
   }),
 }));
 
-vi.mock('../../../utils/daltonApi', () => ({
-  fetchDaltonFeishuReadScopes: (...args: unknown[]) => h.fetchDaltonFeishuReadScopes(...args),
-  updateDaltonFeishuReadScopes: (...args: unknown[]) => h.updateDaltonFeishuReadScopes(...args),
-  fetchDaltonFeishuSpaces: (...args: unknown[]) => h.fetchDaltonFeishuSpaces(...args),
+vi.mock('@/pages/Settings/utils/daltonApi', () => ({
+  fetchDaltonFeishuReadScopes: () => h.fetchScopes(),
+  fetchDaltonFeishuSpaces: () => h.fetchSpaces(),
+  updateDaltonFeishuReadScopes: (scopes: Array<{ space_id: string; name: string }>) =>
+    h.updateScopes(scopes),
 }));
 
-function renderWithQueryClient(ui: React.ReactElement) {
-  const qc = new QueryClient({
-    defaultOptions: {
-      queries: { retry: false },
-    },
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+function renderCard() {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>);
+  return render(
+    <QueryClientProvider client={client}>
+      <FeishuReadScopesCard />
+    </QueryClientProvider>,
+  );
 }
 
 describe('FeishuReadScopesCard', () => {
   beforeEach(() => {
-    h.canInvite = true;
-    h.fetchDaltonFeishuReadScopes.mockReset();
-    h.updateDaltonFeishuReadScopes.mockReset();
-    h.fetchDaltonFeishuSpaces.mockReset();
+    h.callerTier = 'admin';
+    h.fetchScopes.mockReset();
+    h.fetchSpaces.mockReset();
+    h.updateScopes.mockReset();
   });
 
-  it('does not render when the user is not an admin (canInvite false)', () => {
-    h.canInvite = false;
-    renderWithQueryClient(<FeishuReadScopesCard />);
+  it('does not render when user is not admin', () => {
+    h.callerTier = 'internal';
+    renderCard();
     expect(screen.queryByTestId('dalton-feishu-scopes-card')).not.toBeInTheDocument();
-    expect(h.fetchDaltonFeishuReadScopes).not.toHaveBeenCalled();
-    expect(canShowDaltonFeishuScopesCard({ canInvite: true })).toBe(false);
-    expect(canShowDaltonFeishuScopesCard({ isPm: false, canInvite: true, callerTier: 'internal' })).toBe(false);
-    expect(canShowDaltonFeishuScopesCard({ isPm: true })).toBe(true);
   });
 
-  it('shows whitelisted spaces checked and saves the new selection', async () => {
-    h.fetchDaltonFeishuReadScopes.mockResolvedValue({
+  it('preserves persisted scope names, toggles via Switch, and saves updated selection', async () => {
+    h.fetchScopes.mockResolvedValueOnce({
       scopes: [
-        { space_id: 'sp1', name: 'Research', added_by: 'pm', added_at: '2026-01-01T00:00:00Z' },
+        { space_id: 'sp_saved', name: 'Saved Space Only', added_by: 'u1', added_at: null },
       ],
     });
-    h.fetchDaltonFeishuSpaces.mockResolvedValue({
-      spaces: [
-        { space_id: 'sp1', name: 'Research' },
-        { space_id: 'sp2', name: 'Playbook' },
-      ],
+    h.fetchSpaces.mockResolvedValueOnce({
+      spaces: [{ space_id: 'sp_new', name: 'New Wiki Space' }],
     });
-    h.updateDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
+    h.updateScopes.mockResolvedValueOnce({ scopes: [] });
 
-    renderWithQueryClient(<FeishuReadScopesCard />);
+    renderCard();
 
-    const sp1 = await screen.findByTestId('dalton-feishu-scope-sp1');
-    const sp2 = screen.getByTestId('dalton-feishu-scope-sp2');
-    expect((sp1 as HTMLInputElement).checked).toBe(true);
-    expect((sp2 as HTMLInputElement).checked).toBe(false);
+    const savedSwitch = await screen.findByRole('switch', { name: 'Saved Space Only' });
+    const newSwitch = screen.getByRole('switch', { name: 'New Wiki Space' });
+    expect(savedSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(newSwitch).toHaveAttribute('aria-checked', 'false');
 
-    // Save is disabled until the selection changes.
-    const saveBtn = screen.getByTestId('dalton-feishu-scopes-save-btn');
-    expect(saveBtn).toBeDisabled();
+    fireEvent.click(newSwitch);
+    fireEvent.click(savedSwitch);
 
-    fireEvent.click(sp2);
+    fireEvent.click(screen.getByTestId('dalton-feishu-scopes-save'));
     await waitFor(() => {
-      expect((screen.getByTestId('dalton-feishu-scope-sp2') as HTMLInputElement).checked).toBe(true);
-    });
-    expect(saveBtn).toBeEnabled();
-
-    fireEvent.click(saveBtn);
-    await waitFor(() => {
-      // Names travel with the selection so saving does not wipe them.
-      expect(h.updateDaltonFeishuReadScopes).toHaveBeenCalledWith([
-        { space_id: 'sp1', name: 'Research' },
-        { space_id: 'sp2', name: 'Playbook' },
+      expect(h.updateScopes).toHaveBeenCalledWith([
+        { space_id: 'sp_new', name: 'New Wiki Space' },
       ]);
     });
   });
 
-  it('unchecking a whitelisted space removes it on save', async () => {
-    h.fetchDaltonFeishuReadScopes.mockResolvedValue({
-      scopes: [
-        { space_id: 'sp1', name: 'Research', added_by: 'pm', added_at: '2026-01-01T00:00:00Z' },
-      ],
-    });
-    h.fetchDaltonFeishuSpaces.mockResolvedValue({
-      spaces: [{ space_id: 'sp1', name: 'Research' }],
-    });
-    h.updateDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
+  it('shows empty state when spaces list is empty and refetches on Refresh click', async () => {
+    h.fetchScopes.mockResolvedValue({ scopes: [] });
+    h.fetchSpaces.mockResolvedValue({ spaces: [] });
 
-    renderWithQueryClient(<FeishuReadScopesCard />);
-    const sp1 = await screen.findByTestId('dalton-feishu-scope-sp1');
-    fireEvent.click(sp1);
-    fireEvent.click(screen.getByTestId('dalton-feishu-scopes-save-btn'));
+    renderCard();
 
-    await waitFor(() => {
-      expect(h.updateDaltonFeishuReadScopes).toHaveBeenCalledWith([]);
-    });
+    expect(await screen.findByText('auth.feishuScopes.empty')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('dalton-feishu-scopes-refresh'));
+    await waitFor(() => expect(h.fetchSpaces).toHaveBeenCalledTimes(2));
   });
 
-  it('keeps a name that only the persisted whitelist knows', async () => {
-    h.fetchDaltonFeishuReadScopes.mockResolvedValue({
-      scopes: [
-        { space_id: 'sp1', name: 'Research', added_by: 'pm', added_at: '2026-01-01T00:00:00Z' },
-      ],
-    });
-    // The bot can no longer see sp1, but its persisted name must survive a save.
-    h.fetchDaltonFeishuSpaces.mockResolvedValue({
-      spaces: [{ space_id: 'sp2', name: 'Playbook' }],
-    });
-    h.updateDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
+  it('shows API error when spaces request fails', async () => {
+    h.fetchScopes.mockResolvedValueOnce({ scopes: [] });
+    h.fetchSpaces.mockRejectedValueOnce(new Error('桥接层不可达'));
 
-    renderWithQueryClient(<FeishuReadScopesCard />);
-    await screen.findByTestId('dalton-feishu-scope-sp1');
-    fireEvent.click(screen.getByTestId('dalton-feishu-scope-sp2'));
-    fireEvent.click(screen.getByTestId('dalton-feishu-scopes-save-btn'));
+    renderCard();
 
-    await waitFor(() => {
-      expect(h.updateDaltonFeishuReadScopes).toHaveBeenCalledWith([
-        { space_id: 'sp1', name: 'Research' },
-        { space_id: 'sp2', name: 'Playbook' },
-      ]);
-    });
-  });
-
-  it('shows empty guidance when spaces list is empty and refetches on refresh click', async () => {
-    h.fetchDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
-    h.fetchDaltonFeishuSpaces.mockResolvedValue({ spaces: [] });
-
-    renderWithQueryClient(<FeishuReadScopesCard />);
-
-    const refreshBtn = await screen.findByTestId('dalton-feishu-scopes-refresh-btn');
-    await waitFor(() => {
-      expect(h.fetchDaltonFeishuSpaces).toHaveBeenCalledTimes(1);
-    });
-
-    fireEvent.click(refreshBtn);
-    await waitFor(() => {
-      expect(h.fetchDaltonFeishuSpaces).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  it('shows API error when spaces request fails instead of empty guidance', async () => {
-    h.fetchDaltonFeishuReadScopes.mockResolvedValue({ scopes: [] });
-    h.fetchDaltonFeishuSpaces.mockRejectedValue({
-      response: { data: { detail: '桥接层不可达' } },
-    });
-
-    renderWithQueryClient(<FeishuReadScopesCard />);
-
-    expect(await screen.findByText('桥接层不可达')).toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent('桥接层不可达');
   });
 });
