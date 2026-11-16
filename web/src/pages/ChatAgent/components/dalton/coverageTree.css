@@ -7,3 +7,32 @@
 .nav-panel-row.coverage-row-inert:hover {
   background-color: transparent;
 }
+
+/* A sector row's member count sits where the hover overlay's expand chevron
+   appears. Fade the count out whenever the overlay is up (same conditions as
+   .nav-panel-row-actions in NavigationPanel.css) so the two never overlap. */
+.coverage-row-count {
+  transition: opacity var(--motion-quick) var(--ease-out);
+}
+.nav-panel-row:hover .coverage-row-count:has(+ .nav-panel-row-actions),
+:root:not([data-pointer-focus]) .nav-panel-row:focus-within .coverage-row-count:has(+ .nav-panel-row-actions),
+.nav-panel-row:has([data-state='open']) .coverage-row-count:has(+ .nav-panel-row-actions) {
+  opacity: 0;
+}
+
+/* Touch screens keep the overlay up permanently: there the count stays visible,
+   moved left of the chevron, and the overlay drops its masking fade. */
+@media (hover: none), (any-pointer: coarse) {
+  .coverage-row-count:has(+ .nav-panel-row-actions) {
+    margin-right: 22px;
+  }
+  .coverage-row-count + .nav-panel-row-actions {
+    padding-left: 0;
+    background: none;
+  }
+  .nav-panel-row:hover .coverage-row-count:has(+ .nav-panel-row-actions),
+  :root:not([data-pointer-focus]) .nav-panel-row:focus-within .coverage-row-count:has(+ .nav-panel-row-actions),
+  .nav-panel-row:has([data-state='open']) .coverage-row-count:has(+ .nav-panel-row-actions) {
+    opacity: 1;
+  }
+}
