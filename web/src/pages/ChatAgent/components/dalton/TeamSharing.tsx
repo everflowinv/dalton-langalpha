@@ -7,7 +7,9 @@ import { ChevronRight, Folder, Lock, Send } from 'lucide-react';
 import { api } from '@/api/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives';
+// Direct module imports: the primitives barrel also re-exports the
+// confirm dialog, which would pull its animation library onto first load.
+import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';

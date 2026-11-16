@@ -6,11 +6,9 @@ import { ChevronDown, Clock, PauseCircle, Wrench } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { ToggleSwitch } from '@/components/ui/switch';
-import {
-  TOOLBAR_CHIP_CLASS,
-  toolbarChipStyle,
-  type DaltonToolbarChipTone,
-} from '@/components/dalton/primitives';
+// Direct module imports: the primitives barrel also re-exports the
+// confirm dialog, which would pull its animation library onto first load.
+import { TOOLBAR_CHIP_CLASS, toolbarChipStyle, type DaltonToolbarChipTone } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { useLocale } from '@/hooks/useLocale';
 import { formatTimestamp } from '@/lib/format';
 import { cn } from '@/lib/utils';

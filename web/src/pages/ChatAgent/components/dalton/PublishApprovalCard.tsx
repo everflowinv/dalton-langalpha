@@ -6,7 +6,9 @@ import { Button } from '@/components/ui/button';
 import { Disclosure } from '@/components/ui/Disclosure';
 import { Input } from '@/components/ui/input';
 import { Loader } from '@/components/ui/loader';
-import { DaltonInlineNotice } from '@/components/dalton/primitives';
+// Direct module imports: the primitives barrel also re-exports the
+// confirm dialog, which would pull its animation library onto first load.
+import { DaltonInlineNotice } from '@/components/dalton/primitives/DaltonStatusBadge';
 import { TWEEN } from '@/lib/motion'; // DALTON-HOOK(publish-card): house motion vocabulary replaces the literal tween
 import type { ToolApprovalState } from '@/types/chat';
 import { SettledStep } from '../SettledStep';

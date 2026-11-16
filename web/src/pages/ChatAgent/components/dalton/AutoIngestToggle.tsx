@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Inbox } from 'lucide-react';
-import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives';
+// Direct module imports: the primitives barrel also re-exports the
+// confirm dialog, which would pull its animation library onto first load.
+import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { cn } from '@/lib/utils';
 import { fetchAutoIngest, updateAutoIngest } from '../../utils/api/workspaces';
 
