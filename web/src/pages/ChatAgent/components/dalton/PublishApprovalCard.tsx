@@ -2,7 +2,11 @@ import React, { useState } from 'react';
 import { motion } from '@/lib/framer';
 import { Check, ChevronDown, ChevronRight, FileCheck2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { Button } from '@/components/ui/button';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { Input } from '@/components/ui/input';
 import { Loader } from '@/components/ui/loader';
+import { DaltonInlineNotice } from '@/components/dalton/primitives';
 import { TWEEN } from '@/lib/motion'; // DALTON-HOOK(publish-card): house motion vocabulary replaces the literal tween
 import type { ToolApprovalState } from '@/types/chat';
 import { SettledStep } from '../SettledStep';
@@ -91,6 +95,14 @@ interface ReviewerPayload {
   points?: string[];
 }
 
+const KNOWN_REPORT_KINDS = new Set([
+  'earnings',
+  'earnings_review',
+  'initiation',
+  'topic',
+  'update',
+]);
+
 export function PublishApprovalCard({
   data,
   onApprove,
@@ -99,14 +111,22 @@ export function PublishApprovalCard({
   const { t } = useTranslation();
   const [reason, setReason] = useState('');
   const [incidentalExpanded, setIncidentalExpanded] = useState(false);
+  const [techExpanded, setTechExpanded] = useState(false);
   const { status, args } = data;
   const isApproved = status === 'approved';
   const isRejected = status === 'rejected';
 
   const requestId = String(args?.request_id ?? '');
-  const title = String(args?.title ?? args?.slug ?? '研究报告发布审批');
+  const title = String(
+    args?.title ?? args?.slug ?? t('dalton.publish.defaultTitle'),
+  );
   const ticker = String(args?.ticker ?? args?.company ?? args?.['公司'] ?? '');
-  const kind = String(args?.kind ?? args?.report_type ?? args?.['类型'] ?? '');
+  const rawKind = String(args?.kind ?? args?.report_type ?? args?.['类型'] ?? '');
+  const kindLabel = rawKind
+    ? KNOWN_REPORT_KINDS.has(rawKind)
+      ? t(`dalton.publish.kindNames.${rawKind}`)
+      : rawKind
+    : '';
   const draftPath = String(args?.draft_path ?? args?.['草稿'] ?? '');
   const publishedPath = String(args?.published_path ?? args?.['发布为'] ?? '');
 
@@ -121,7 +141,7 @@ export function PublishApprovalCard({
     ? labeling.failed_batch_details
     : [];
   const labelingIncomplete = Boolean(
-    args?.labeling_incomplete ?? figSum?.labeling_incomplete ?? failedBatches > 0
+    args?.labeling_incomplete ?? figSum?.labeling_incomplete ?? failedBatches > 0,
   );
   // DALTON-HOOK(heavy-compute-isolation): the audit's finalize phase killed
   // at its grace skips the derived-matching pass; the PM must see why those
@@ -158,7 +178,13 @@ export function PublishApprovalCard({
   const incidentalCount = incidentalItems.length || Number(figSum?.incidental ?? 0);
 
   const auditSummary = figSum
-    ? `${figSum.verified ?? 0} 已核实 · ${figSum.contradicted ?? 0} 冲突 · ${figSum.unverified ?? 0} 未核实 · ${figSum.uncertain ?? 0} 未能判断 · ${figSum.exempt ?? 0} 豁免`
+    ? t('dalton.publish.auditSummaryLine', {
+        verified: figSum.verified ?? 0,
+        contradicted: figSum.contradicted ?? 0,
+        unverified: figSum.unverified ?? 0,
+        uncertain: figSum.uncertain ?? 0,
+        exempt: figSum.exempt ?? 0,
+      })
     : String(args?.audit_summary ?? args?.audit ?? args?.['数字核验'] ?? '');
 
   const revObj = (
@@ -166,8 +192,13 @@ export function PublishApprovalCard({
       ? (args.reviewer as ReviewerPayload)
       : null
   );
+  const verdictLabel = revObj
+    ? revObj.verdict === 'pass' || !revObj.verdict
+      ? t('dalton.publish.verdictPass')
+      : revObj.verdict
+    : '';
   const reviewerSummary = revObj
-    ? `${revObj.verdict === 'pass' ? '通过' : revObj.verdict ?? '通过'} · ${revObj.model ?? 'reviewer'}${revObj.family ? ` (${revObj.family})` : ''}`
+    ? `${verdictLabel}${revObj.model ? ` · ${revObj.model}` : ''}`
     : String(args?.reviewer_summary ?? args?.reviewer ?? args?.['独立审稿'] ?? '');
   const reviewerPoints: string[] = Array.isArray(revObj?.points) ? revObj.points : [];
 
@@ -175,13 +206,19 @@ export function PublishApprovalCard({
   const thesisVersion =
     args?.thesis_version ??
     args?.['thesis 正式版本'] ??
-    (typeof updatesThesis === 'boolean' ? (updatesThesis ? '是' : '不更新') : undefined);
+    (typeof updatesThesis === 'boolean'
+      ? updatesThesis
+        ? t('dalton.publish.thesisYes')
+        : t('dalton.publish.thesisNo')
+      : undefined);
+
+  const hasTechDetails = Boolean(requestId || draftPath || publishedPath || revObj?.family);
 
   const renderCandidatesList = (candidates?: CandidateSourceItem[]) => {
     const cands = Array.isArray(candidates) ? candidates.slice(0, 5) : [];
     if (cands.length === 0) return null;
     return (
-      <div className="pl-3 pt-1 space-y-0.5 text-[10.5px]" data-testid="publish-item-candidates">
+      <div className="pl-3 pt-1 space-y-0.5 text-[11px]" data-testid="publish-item-candidates">
         {cands.map((cand, cIdx) => {
           const srcLabel = cand.source_id || cand.id || cand.ref || cand.kind || 'source';
           const snippet = cand.text || cand.why || '';
@@ -195,8 +232,8 @@ export function PublishApprovalCard({
               className="flex flex-wrap items-baseline gap-1.5"
               style={{ color: 'var(--color-text-tertiary)' }}
             >
-              <code>[{srcLabel}]</code>
-              {valPart && <span className="font-medium">{valPart}</span>}
+              <code className="font-mono">[{srcLabel}]</code>
+              {valPart && <span className="font-medium tabular-nums">{valPart}</span>}
               {snippet && <span className="truncate">{snippet}</span>}
             </div>
           );
@@ -211,84 +248,59 @@ export function PublishApprovalCard({
       style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
     >
       {(labelingIncomplete || derivedMatchingIncomplete) && (
-        <div
-          className="rounded px-3 py-1.5 text-[11px] font-medium space-y-1"
-          style={{
-            backgroundColor: 'rgba(245, 158, 11, 0.12)',
-            border: '1px solid rgba(245, 158, 11, 0.35)',
-            color: 'var(--color-text-primary)',
-          }}
-          data-testid="publish-labeling-incomplete-warning"
+        <DaltonInlineNotice
+          tone="warning"
+          testId="publish-labeling-incomplete-warning"
+          className="px-3 py-1.5 text-[11px]"
         >
-          {labelingIncomplete && (
-            <div>
-              {t('dalton.publish.labelingIncompleteWarning', '标注未完成，口语数字和指标可能未核验')}
-              {failedBatches > 0 ? `（失败批次：${failedBatches}）` : ''}
-            </div>
-          )}
-          {derivedMatchingIncomplete && (
-            <div data-testid="publish-derived-incomplete-warning">
-              {t(
-                'dalton.publish.derivedMatchingIncompleteWarning',
-                '派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实'
-              )}
-            </div>
-          )}
-          {failedBatchDetails.length > 0 && (
-            <div className="text-[10.5px] font-normal space-y-0.5" data-testid="publish-failed-batch-details">
-              {failedBatchDetails.map((d, dIdx) => {
-                const batchNo = d.batch_index ?? dIdx + 1;
-                const startFig = d.start_fig ?? '?';
-                const endFig = d.end_fig ?? '?';
-                const isColloquialScan = Number(startFig) === 0 && Number(endFig) === 0;
-                return (
-                  <div key={`${batchNo}-${dIdx}`}>
-                    {isColloquialScan
-                      ? t('dalton.publish.failedBatchColloquialItem', {
-                          batch: batchNo,
-                          defaultValue: `第 ${batchNo} 批（口语数字扫描）标注失败`,
-                        })
-                      : t('dalton.publish.failedBatchDetailItem', {
-                          batch: batchNo,
-                          start: startFig,
-                          end: endFig,
-                          defaultValue: `第 ${batchNo} 批（第 ${startFig}–${endFig} 个数字）标注失败`,
-                        })}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+          <div className="space-y-1 font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {labelingIncomplete && (
+              <div>
+                {t('dalton.publish.labelingIncompleteWarning')}
+                {failedBatches > 0
+                  ? t('dalton.publish.failedBatchesCount', { count: failedBatches })
+                  : ''}
+              </div>
+            )}
+            {derivedMatchingIncomplete && (
+              <div data-testid="publish-derived-incomplete-warning">
+                {t('dalton.publish.derivedMatchingIncompleteWarning')}
+              </div>
+            )}
+            {failedBatchDetails.length > 0 && (
+              <div className="text-[11px] font-normal space-y-0.5" data-testid="publish-failed-batch-details">
+                {failedBatchDetails.map((d, dIdx) => {
+                  const batchNo = d.batch_index ?? dIdx + 1;
+                  const startFig = d.start_fig ?? '?';
+                  const endFig = d.end_fig ?? '?';
+                  const isColloquialScan = Number(startFig) === 0 && Number(endFig) === 0;
+                  return (
+                    <div key={`${batchNo}-${dIdx}`}>
+                      {isColloquialScan
+                        ? t('dalton.publish.failedBatchColloquialItem', { batch: batchNo })
+                        : t('dalton.publish.failedBatchDetailItem', {
+                            batch: batchNo,
+                            start: startFig,
+                            end: endFig,
+                          })}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </DaltonInlineNotice>
       )}
       <div className="flex items-center justify-between gap-2">
-        <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.titleLabel', '报告标题')}</span>
+        <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.titleLabel')}</span>
         <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>
           {ticker ? `[${ticker}] ` : ''}{title}
         </span>
       </div>
-      {requestId && (
+      {kindLabel && (
         <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.requestIdLabel', '请求 ID')}</span>
-          <code>{requestId.slice(0, 12)}</code>
-        </div>
-      )}
-      {kind && (
-        <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.kindLabel', '报告类型')}</span>
-          <code>{kind}</code>
-        </div>
-      )}
-      {draftPath && (
-        <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.draftLabel', '草稿路径')}</span>
-          <code>{draftPath}</code>
-        </div>
-      )}
-      {publishedPath && (
-        <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.publishedPathLabel', '发布路径')}</span>
-          <code>{publishedPath}</code>
+          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.kindLabel')}</span>
+          <span>{kindLabel}</span>
         </div>
       )}
       {hasLabelingCoverage && (
@@ -297,21 +309,20 @@ export function PublishApprovalCard({
           data-testid="publish-labeling-coverage"
         >
           <span style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('dalton.publish.labelingCoverageLabel', '标注覆盖')}
+            {t('dalton.publish.labelingCoverageLabel')}
           </span>
-          <span>
+          <span className="tabular-nums">
             {t('dalton.publish.labelingCoverageValue', {
               labeled: labeling?.labeled,
               total: labeling?.total,
-              defaultValue: `已标注 ${labeling?.labeled} / ${labeling?.total} 个数字`,
             })}
           </span>
         </div>
       )}
       {auditSummary && (
         <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.auditLabel', '数字核验')}</span>
-          <span>{auditSummary}</span>
+          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.auditLabel')}</span>
+          <span className="tabular-nums">{auditSummary}</span>
         </div>
       )}
       {verifiedByCounts && (
@@ -320,21 +331,20 @@ export function PublishApprovalCard({
           data-testid="publish-verified-breakdown"
         >
           <span style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('dalton.publish.verifiedBreakdownLabel', '已核实拆分')}
+            {t('dalton.publish.verifiedBreakdownLabel')}
           </span>
-          <span>
+          <span className="tabular-nums">
             {t('dalton.publish.verifiedBreakdownValue', {
               footnote: verifiedByCounts.footnote ?? 0,
               llm_judge: verifiedByCounts.llm_judge ?? 0,
               derived: verifiedByCounts.derived ?? 0,
-              defaultValue: `脚注 ${verifiedByCounts.footnote ?? 0} · LLM 判断 ${verifiedByCounts.llm_judge ?? 0} · 推算 ${verifiedByCounts.derived ?? 0}`,
             })}
           </span>
         </div>
       )}
       {reviewerSummary && (
         <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.reviewerLabel', '独立审稿')}</span>
+          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.reviewerLabel')}</span>
           <span>{reviewerSummary}</span>
         </div>
       )}
@@ -352,28 +362,25 @@ export function PublishApprovalCard({
       )}
       {thesisVersion !== undefined && (
         <div className="flex items-center justify-between gap-2">
-          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.thesisLabel', '更新正式 Thesis')}</span>
+          <span style={{ color: 'var(--color-text-tertiary)' }}>{t('dalton.publish.thesisLabel')}</span>
           <span>{String(thesisVersion)}</span>
         </div>
       )}
       {incidentalCount > 0 && (
         <div
-          className="mt-2 rounded px-3 py-1.5 space-y-1"
+          className="mt-2 rounded px-3 py-1.5"
           style={{ backgroundColor: 'var(--color-bg-subtle)', border: '1px solid var(--color-border-muted)' }}
           data-testid="publish-incidental-section"
         >
           <button
             type="button"
             onClick={() => setIncidentalExpanded((prev) => !prev)}
-            className="w-full flex items-center justify-between text-left font-medium text-[11px]"
+            className="w-full flex items-center justify-between text-left font-medium text-[11px] cursor-pointer"
             style={{ color: 'var(--color-text-primary)' }}
             data-testid="publish-incidental-toggle"
           >
             <span>
-              {t('dalton.publish.incidentalHeader', {
-                count: incidentalCount,
-                defaultValue: `非核验对象（${incidentalCount}）`,
-              })}
+              {t('dalton.publish.incidentalHeader', { count: incidentalCount })}
             </span>
             {incidentalExpanded ? (
               <ChevronDown className="h-3.5 w-3.5 shrink-0" />
@@ -381,23 +388,24 @@ export function PublishApprovalCard({
               <ChevronRight className="h-3.5 w-3.5 shrink-0" />
             )}
           </button>
-          {incidentalExpanded && incidentalItems.length > 0 && (
-            <div className="pt-1 space-y-0.5 text-[11px]" data-testid="publish-incidental-list">
+          <Disclosure open={incidentalExpanded && incidentalItems.length > 0}>
+            <div className="pt-1.5 space-y-0.5 text-[11px]" data-testid="publish-incidental-list">
               {incidentalItems.map((item, idx) => {
                 const cat =
                   item.incidental_category ||
                   item.category ||
-                  t('dalton.publish.incidentalCategoryMissing', '未给类别');
+                  t('dalton.publish.incidentalCategoryMissing');
                 return (
                   <div key={item.id ?? idx} style={{ color: 'var(--color-text-tertiary)' }}>
-                    <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
+                    <span>{t('dalton.publish.lineNumber', { line: item.line ?? '?' })}</span> ·{' '}
+                    <strong>{item.raw}</strong>
                     {cat ? ` [${cat}]` : ''}
                     {item.sentence ? ` — ${item.sentence}` : ''}
                   </div>
                 );
               })}
             </div>
-          )}
+          </Disclosure>
         </div>
       )}
       {llmVerifiedItems.length > 0 && (
@@ -407,7 +415,7 @@ export function PublishApprovalCard({
           data-testid="publish-llm-verified-items"
         >
           <div className="font-medium text-[11px]" style={{ color: 'var(--color-text-primary)' }}>
-            {t('dalton.publish.llmVerifiedHeader', 'LLM 判断核实 — 草稿与引文对照')}（{llmVerifiedItems.length}）
+            {t('dalton.publish.llmVerifiedHeader')}（{llmVerifiedItems.length}）
           </div>
           {llmVerifiedItems.map((item, idx) => (
             <div
@@ -418,10 +426,11 @@ export function PublishApprovalCard({
             >
               <div className="space-y-0.5">
                 <div className="font-medium" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('dalton.publish.draftSentenceLabel', '草稿原文')}
+                  {t('dalton.publish.draftSentenceLabel')}
                 </div>
                 <div>
-                  <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
+                  <span>{t('dalton.publish.lineNumber', { line: item.line ?? '?' })}</span> ·{' '}
+                  <strong>{item.raw}</strong>
                   {item.metric ? ` (${item.metric}${item.period ? ` · ${item.period}` : ''})` : ''}
                 </div>
                 {item.sentence && (
@@ -430,12 +439,12 @@ export function PublishApprovalCard({
               </div>
               <div className="space-y-0.5">
                 <div className="font-medium" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('dalton.publish.sourceQuoteLabel', '来源引文')}
+                  {t('dalton.publish.sourceQuoteLabel')}
                   {(item.matched_source || item.ref) ? ` · ${item.matched_source || item.ref}` : ''}
                 </div>
                 {item.quote_metric_raw && (
                   <div>
-                    <code>{item.quote_metric_raw}</code>
+                    <code className="font-mono">{item.quote_metric_raw}</code>
                   </div>
                 )}
                 {item.quote && (
@@ -453,22 +462,23 @@ export function PublishApprovalCard({
           data-testid="publish-unverified-items"
         >
           <div className="font-medium text-[11px]" style={{ color: 'var(--color-text-primary)' }}>
-            {t('dalton.publish.unverifiedHeader', '未核实条目与候选来源')}（{unverifiedItems.length}）
+            {t('dalton.publish.unverifiedHeader')}（{unverifiedItems.length}）
           </div>
           {unverifiedItems.map((item, idx) => (
             <div key={item.id ?? idx} className="text-[11px] space-y-0.5">
               <div>
-                <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
+                <span>{t('dalton.publish.lineNumber', { line: item.line ?? '?' })}</span> ·{' '}
+                <strong>{item.raw}</strong>
                 {item.metric ? ` (${item.metric}${item.period ? ` · ${item.period}` : ''})` : ''}
               </div>
               {item.sentence && (
                 <div className="truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-                  原文：{item.sentence}
+                  {t('dalton.publish.originalSentenceLabel', { text: item.sentence })}
                 </div>
               )}
               {item.hint && (
                 <div style={{ color: 'var(--color-text-tertiary)' }}>
-                  原因：{item.hint}
+                  {t('dalton.publish.reasonLabel', { text: item.hint })}
                 </div>
               )}
               {renderCandidatesList(item.candidates)}
@@ -483,27 +493,88 @@ export function PublishApprovalCard({
           data-testid="publish-uncertain-items"
         >
           <div className="font-medium text-[11px]" style={{ color: 'var(--color-text-primary)' }}>
-            {t('dalton.publish.uncertainHeader', '未能判断 — 交由 PM 决定')}（{uncertainItems.length}）
+            {t('dalton.publish.uncertainHeader')}（{uncertainItems.length}）
           </div>
           {uncertainItems.map((item, idx) => (
             <div key={item.id ?? idx} className="text-[11px] space-y-0.5">
               <div>
-                <code>L{item.line ?? '?'}</code> · <strong>{item.raw}</strong>
+                <span>{t('dalton.publish.lineNumber', { line: item.line ?? '?' })}</span> ·{' '}
+                <strong>{item.raw}</strong>
                 {item.metric ? ` (${item.metric}${item.period ? ` · ${item.period}` : ''})` : ''}
               </div>
               {item.sentence && (
                 <div className="truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-                  原文：{item.sentence}
+                  {t('dalton.publish.originalSentenceLabel', { text: item.sentence })}
                 </div>
               )}
               {item.hint && (
                 <div style={{ color: 'var(--color-text-tertiary)' }}>
-                  原因：{item.hint}
+                  {t('dalton.publish.reasonLabel', { text: item.hint })}
                 </div>
               )}
               {renderCandidatesList(item.candidates)}
             </div>
           ))}
+        </div>
+      )}
+      {hasTechDetails && (
+        <div className="pt-1" data-testid="publish-technical-details">
+          <button
+            type="button"
+            onClick={() => setTechExpanded((prev) => !prev)}
+            className="inline-flex items-center gap-1 text-[11px] cursor-pointer"
+            style={{ color: 'var(--color-text-tertiary)' }}
+            data-testid="publish-technical-toggle"
+          >
+            {techExpanded ? (
+              <ChevronDown className="h-3 w-3 shrink-0" />
+            ) : (
+              <ChevronRight className="h-3 w-3 shrink-0" />
+            )}
+            <span>{t('dalton.publish.moreInfoToggle')}</span>
+          </button>
+          <Disclosure open={techExpanded}>
+            <div
+              className="mt-1.5 rounded px-3 py-2 space-y-1 text-[11px]"
+              style={{
+                backgroundColor: 'var(--color-bg-subtle)',
+                border: '1px solid var(--color-border-muted)',
+              }}
+            >
+              {requestId && (
+                <div className="flex items-center justify-between gap-2">
+                  <span style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('dalton.publish.requestIdLabel')}
+                  </span>
+                  <code className="font-mono">{requestId.slice(0, 12)}</code>
+                </div>
+              )}
+              {draftPath && (
+                <div className="flex items-center justify-between gap-2">
+                  <span style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('dalton.publish.draftLabel')}
+                  </span>
+                  <code className="font-mono truncate">{draftPath}</code>
+                </div>
+              )}
+              {publishedPath && (
+                <div className="flex items-center justify-between gap-2">
+                  <span style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('dalton.publish.publishedPathLabel')}
+                  </span>
+                  <code className="font-mono truncate">{publishedPath}</code>
+                </div>
+              )}
+              {revObj?.family && (
+                <div className="flex items-center justify-between gap-2">
+                  <span style={{ color: 'var(--color-text-tertiary)' }}>
+                    {t('dalton.publish.reviewerLabel')}
+                  </span>
+                  <code className="font-mono">{revObj.family}</code>
+                </div>
+              )}
+            </div>
+          </Disclosure>
         </div>
       )}
     </div>
@@ -516,8 +587,8 @@ export function PublishApprovalCard({
         reason={isRejected ? data.reason : null}
         label={
           isApproved
-            ? t('dalton.publish.approvedLabel', { title, defaultValue: `已批准正式发布：${title}` })
-            : t('dalton.publish.rejectedLabel', { title, defaultValue: `已拒绝正式发布：${title}` })
+            ? t('dalton.publish.approvedLabel', { title })
+            : t('dalton.publish.rejectedLabel', { title })
         }
       >
         {detailBlock}
@@ -543,7 +614,7 @@ export function PublishApprovalCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[0.9375rem] font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-            {t('dalton.publish.cardTitle', '正式研究报告发布审批（PM 终审）')}
+            {t('dalton.publish.cardTitle')}
           </div>
           <div className="text-xs truncate" style={{ color: 'var(--color-text-tertiary)' }}>
             {ticker ? `${ticker} · ` : ''}{title}
@@ -556,45 +627,42 @@ export function PublishApprovalCard({
 
       {canAct && (
         <div className="pt-3 flex flex-wrap items-center gap-2">
-          <motion.button
+          <Button
             type="button"
+            size="sm"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
               onApprove?.();
             }}
             disabled={!onApprove}
-            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium transition-colors hover:brightness-110 disabled:opacity-50"
+            className="gap-1.5"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
           >
             <Check className="h-3.5 w-3.5 stroke-[2.5]" />
-            {t('dalton.publish.approveBtn', '批准正式发布')}
-          </motion.button>
-          <motion.button
+            {t('dalton.publish.approveBtn')}
+          </Button>
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             onClick={(e: React.MouseEvent) => {
               e.stopPropagation();
               onReject?.(reason.trim() || undefined);
             }}
             disabled={!onReject}
-            className="flex items-center gap-1.5 text-sm px-4 py-2 rounded-md font-medium transition-colors disabled:opacity-50"
-            style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
+            className="gap-1.5"
           >
             <X className="h-3.5 w-3.5" />
-            {t('dalton.publish.rejectBtn', '退回修改')}
-          </motion.button>
-          <input
+            {t('dalton.publish.rejectBtn')}
+          </Button>
+          <Input
             type="text"
             value={reason}
             onChange={(e) => setReason(e.target.value)}
             maxLength={200}
-            placeholder={t('dalton.publish.reasonPlaceholder', '批注或退回原因（可选）')}
-            aria-label={t('dalton.publish.reasonPlaceholder', '批注或退回原因（可选）')}
-            className="flex-1 min-w-40 text-sm px-3 py-2 rounded-md bg-transparent outline-hidden"
-            style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-primary)' }}
+            placeholder={t('dalton.publish.reasonPlaceholder')}
+            aria-label={t('dalton.publish.reasonPlaceholder')}
+            className="flex-1 min-w-40 h-8 text-xs"
           />
         </div>
       )}

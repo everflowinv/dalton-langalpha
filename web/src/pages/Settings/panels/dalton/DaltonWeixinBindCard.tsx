@@ -20,7 +20,7 @@ import {
   DaltonRefreshButton,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 /** Personal WeChat account binding card for Messaging & Channels. */
 export function DaltonWeixinBindCard() {

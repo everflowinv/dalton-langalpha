@@ -113,7 +113,7 @@ export function AntigravityConnect({
 
       {phase === 'waiting' && (
         <div
-          className="flex flex-col items-center gap-4 rounded-lg p-6"
+          className="shell-box flex flex-col items-center gap-4 rounded-lg p-6"
           style={{ background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
         >
           <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
@@ -148,8 +148,8 @@ export function AntigravityConnect({
               href={authorizeUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 text-sm font-medium"
-              style={{ color: 'var(--color-accent-primary)' }}
+              className="inline-flex items-center gap-1.5 text-sm font-medium underline underline-offset-2"
+              style={{ color: 'var(--color-text-primary)' }}
             >
               {t(`${ns}.openAgain`)}
               <ExternalLink className="h-3.5 w-3.5" />

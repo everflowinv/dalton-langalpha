@@ -13,6 +13,9 @@ interface ToggleSwitchProps {
   id?: string;
   /** The id of the line that describes what the switch does. */
   ariaDescribedBy?: string;
+  /** Optional busy/test attributes forwarded onto the switch button. // DALTON-HOOK(ui-unify) */
+  ariaBusy?: boolean;
+  testId?: string;
 }
 
 /**
@@ -20,14 +23,16 @@ interface ToggleSwitchProps {
  * Deliberately a plain button rather than the Radix switch — it preserves the
  * exact markup and theme-var styling both call sites already shipped.
  */
-export function ToggleSwitch({ checked, onChange, disabled, className, ariaLabel, id, ariaDescribedBy }: ToggleSwitchProps): React.ReactElement {
+export function ToggleSwitch({ checked, onChange, disabled, className, ariaLabel, id, ariaDescribedBy, ariaBusy, testId }: ToggleSwitchProps): React.ReactElement {
   return (
     <button
       id={id}
       type="button"
       role="switch"
       data-slot="switch"
+      data-testid={testId}
       aria-checked={checked}
+      aria-busy={ariaBusy}
       aria-label={ariaLabel}
       aria-describedby={ariaDescribedBy}
       onClick={onChange}

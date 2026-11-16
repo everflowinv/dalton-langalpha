@@ -4,10 +4,12 @@ import { useTranslation } from 'react-i18next';
 import { Pause, Pencil, Play, RotateCcw, Trash2, Undo2 } from 'lucide-react';
 import { HeaderButton, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { useLocale } from '@/hooks/useLocale';
+import { formatTimezoneName } from '@/lib/format'; // DALTON-HOOK(ui-unify)
 import type { ScriptAutomationRead } from '@/types/automation';
 import { useModificationHistory } from '../hooks/useModificationHistory';
 import { useAutomationExecutionReads } from '../hooks/useAutomationReads';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
+import { cronToHuman } from '../utils/cron'; // DALTON-HOOK(ui-unify)
 import { formatDateTimeShort } from '../utils/time';
 import { isCompanyTask, isDeletedTask, isForbiddenError, runStatusKey, scriptStatusLabelKey } from '../utils/taskKind';
 import { DeletedMeta, ModificationHistory, RecordTabs, RollbackDialog } from './ModificationHistory';
@@ -65,9 +67,10 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
         <dt>{t('automation.scriptStatus')}</dt>
         <dd>{statusKey ? t(statusKey) : script.status}</dd>
         <dt>{t('automation.scriptCron')}</dt>
-        <dd className="automation-mono">{script.cron_expression}</dd>
+        {/* DALTON-HOOK(ui-unify): render human-readable schedule and timezone name */}
+        <dd title={script.cron_expression}>{cronToHuman(script.cron_expression, t, locale)}</dd>
         <dt>{t('automation.scriptTimezone')}</dt>
-        <dd>{script.timezone}</dd>
+        <dd title={script.timezone}>{formatTimezoneName(script.timezone, locale)}</dd>
         {script.next_run_at && (
           <>
             <dt>{t('automation.scriptNextRun')}</dt>

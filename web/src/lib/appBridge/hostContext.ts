@@ -1,5 +1,6 @@
 import type { i18n as I18n } from 'i18next';
 import type { KitStrings, Theme } from './protocol';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(ui-unify)
 
 /** The tokens an app is handed, so a kit component looks like the page around it. */
 const THEME_VARS = [
@@ -29,7 +30,9 @@ export function readTheme(mode: 'light' | 'dark'): Theme {
 function flatten(node: unknown, prefix: string, out: KitStrings): KitStrings {
   if (node && typeof node === 'object') {
     for (const [key, value] of Object.entries(node)) {
-      if (typeof value === 'string') out[prefix + key] = value;
+      // DALTON-HOOK(ui-unify): the kit reads raw catalog strings, so the
+      // {{brand}} default variable i18n fills elsewhere is filled here.
+      if (typeof value === 'string') out[prefix + key] = value.split('{{brand}}').join(BRAND_NAME);
       else flatten(value, `${prefix}${key}.`, out);
     }
   }

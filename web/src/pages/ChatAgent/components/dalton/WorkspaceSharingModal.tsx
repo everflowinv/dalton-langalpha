@@ -4,8 +4,17 @@ import { createPortal } from 'react-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Share2 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import { ModalShell } from '@/components/ui/ModalShell';
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { ToggleSwitch } from '@/components/ui/switch';
+import {
+  DaltonInlineNotice,
+  TOOLBAR_CHIP_CLASS,
+  toolbarChipStyle,
+} from '@/components/dalton/primitives';
 import { queryKeys } from '@/lib/queryKeys';
+import { cn } from '@/lib/utils';
 import {
   fetchWorkspaceSettings,
   fetchWorkspaceSharing,
@@ -101,7 +110,7 @@ export function useUpdateWorkspaceSettings(workspaceId: string) {
 export function WorkspaceSharingModal({
   workspaceId,
   readOnly = false,
-  compact = false,
+  compact: _compact = false,
 }: {
   workspaceId: string;
   readOnly?: boolean;
@@ -109,6 +118,9 @@ export function WorkspaceSharingModal({
 }): React.ReactElement | null {
   const { t } = useTranslation();
   const titleId = useId();
+  const cosLegendId = useId();
+  const webLegendId = useId();
+  const teamMemoryTitleId = useId();
   const [open, setOpen] = useState(false);
   const { data, isLoading, isError } = useWorkspaceSharing(workspaceId);
   const { data: settingsData } = useWorkspaceSettings(workspaceId);
@@ -220,18 +232,15 @@ export function WorkspaceSharingModal({
         type="button"
         onClick={handleOpen}
         data-testid="workspace-sharing-button"
-        className={`inline-flex items-center gap-1.5 rounded-full border transition-colors hover:bg-foreground/5 ${
-          compact ? 'px-2.5 py-1 text-xs' : 'px-3 py-1.5 text-xs'
-        }`}
-        style={{
-          borderColor: 'var(--color-border-muted)',
-          backgroundColor: 'var(--color-bg-elevated)',
-          color: 'var(--color-text-secondary)',
-        }}
-        title={t('dalton.sharing.title', '共享设置')}
+        className={cn(
+          TOOLBAR_CHIP_CLASS,
+          'press cursor-pointer hover:bg-(--color-bg-subtle)',
+        )}
+        style={toolbarChipStyle('neutral')}
+        title={t('dalton.sharing.title')}
       >
         <Share2 className="h-3.5 w-3.5 shrink-0 opacity-75" />
-        <span>{t('dalton.sharing.title', '共享设置')}</span>
+        <span>{t('dalton.sharing.title')}</span>
       </button>
 
       {open &&
@@ -239,39 +248,36 @@ export function WorkspaceSharingModal({
         createPortal(
           <ModalShell
             labelId={titleId}
-            title={t('dalton.sharing.title', '共享设置')}
+            title={t('dalton.sharing.title')}
             onClose={handleClose}
             closeDisabled={isPending}
             width="narrow"
             density="form"
             footer={
               <div className="flex items-center justify-end gap-2">
-                <button
+                <Button
                   type="button"
+                  variant="outline"
+                  size="sm"
                   onClick={handleClose}
                   disabled={isPending}
                   data-testid="sharing-cancel-btn"
-                  className="px-3 py-1.5 rounded-md text-xs border transition-colors hover:bg-foreground/5 disabled:opacity-50"
-                  style={{
-                    borderColor: 'var(--color-border-muted)',
-                    color: 'var(--color-text-secondary)',
-                  }}
                 >
-                  {t('common.cancel', '取消')}
-                </button>
-                <button
+                  {t('common.cancel')}
+                </Button>
+                <Button
                   type="button"
+                  size="sm"
                   disabled={!canEdit || isPending}
                   onClick={() => void handleSave()}
                   data-testid="sharing-save-btn"
-                  className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     backgroundColor: 'var(--color-btn-primary-bg)',
                     color: 'var(--color-btn-primary-text)',
                   }}
                 >
-                  {t('common.save', '保存')}
-                </button>
+                  {t('common.save')}
+                </Button>
               </div>
             }
           >
@@ -296,32 +302,23 @@ export function WorkspaceSharingModal({
                     data-testid="sharing-cos-fieldset"
                   >
                     <legend
+                      id={cosLegendId}
                       className="text-xs font-medium mb-1"
                       style={{ color: 'var(--color-text-secondary)' }}
                     >
-                      {t('dalton.sharing.cosLabel', '别人的研究总监')}
+                      {t('dalton.sharing.cosLabel')}
                     </legend>
-                    <div className="flex items-center gap-4">
-                      {ACCESS_OPTIONS.map((opt) => (
-                        <label
-                          key={`cos-${opt.value}`}
-                          className={`inline-flex items-center gap-1.5 text-xs ${
-                            canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                          }`}
-                        >
-                          <input
-                            type="radio"
-                            name="cos_access"
-                            value={opt.value}
-                            checked={draftCos === opt.value}
-                            disabled={!canEdit || isPending}
-                            onChange={() => setDraftCos(opt.value)}
-                            data-testid={`sharing-cos-${opt.value}`}
-                          />
-                          <span>{t(opt.labelKey, opt.labelZh)}</span>
-                        </label>
-                      ))}
-                    </div>
+                    <SegmentedControl<WorkspaceAccessLevel>
+                      value={draftCos}
+                      onChange={setDraftCos}
+                      labelledBy={cosLegendId}
+                      disabled={!canEdit || isPending}
+                      options={ACCESS_OPTIONS.map((opt) => ({
+                        value: opt.value,
+                        label: t(opt.labelKey),
+                        testId: `sharing-cos-${opt.value}`,
+                      }))}
+                    />
                   </fieldset>
                 ))}
 
@@ -331,58 +328,55 @@ export function WorkspaceSharingModal({
                 data-testid="sharing-web-fieldset"
               >
                 <legend
+                  id={webLegendId}
                   className="text-xs font-medium mb-1"
                   style={{ color: 'var(--color-text-secondary)' }}
                 >
-                  {t('dalton.sharing.webLabel', '别人的网页界面')}
+                  {t('dalton.sharing.webLabel')}
                 </legend>
-                <div className="flex items-center gap-4">
-                  {ACCESS_OPTIONS.map((opt) => (
-                    <label
-                      key={`web-${opt.value}`}
-                      className={`inline-flex items-center gap-1.5 text-xs ${
-                        canEdit ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'
-                      }`}
-                    >
-                      <input
-                        type="radio"
-                        name="web_access"
-                        value={opt.value}
-                        checked={draftWeb === opt.value}
-                        disabled={!canEdit || isPending}
-                        onChange={() => setDraftWeb(opt.value)}
-                        data-testid={`sharing-web-${opt.value}`}
-                      />
-                      <span>{t(opt.labelKey, opt.labelZh)}</span>
-                    </label>
-                  ))}
-                </div>
+                <SegmentedControl<WorkspaceAccessLevel>
+                  value={draftWeb}
+                  onChange={setDraftWeb}
+                  labelledBy={webLegendId}
+                  disabled={!canEdit || isPending}
+                  options={ACCESS_OPTIONS.map((opt) => ({
+                    value: opt.value,
+                    label: t(opt.labelKey),
+                    testId: `sharing-web-${opt.value}`,
+                  }))}
+                />
               </fieldset>
 
               {draftWeb === 'rw' && (
-                <div
-                  data-testid="sharing-web-rw-warning"
-                  className="flex flex-col gap-1.5 rounded-md border px-3 py-2.5 text-xs"
-                  style={{
-                    borderColor: 'var(--color-warning, #f59e0b)',
-                    backgroundColor: 'rgba(245, 158, 11, 0.08)',
-                    color: 'var(--color-text-secondary)',
-                  }}
+                <DaltonInlineNotice
+                  tone="warning"
+                  testId="sharing-web-rw-warning"
                 >
-                  <div className="flex items-start gap-2 font-medium">
-                    <AlertTriangle
-                      className="h-4 w-4 shrink-0 mt-0.5"
-                      style={{ color: 'var(--color-warning, #f59e0b)' }}
-                    />
-                    <span>{t('dalton.sharing.webRwWarningTitle')}</span>
+                  <div className="flex flex-col gap-1.5">
+                    <div
+                      className="flex items-start gap-2 font-medium"
+                      style={{ color: 'var(--color-text-primary)' }}
+                    >
+                      <AlertTriangle
+                        className="h-4 w-4 shrink-0 mt-0.5"
+                        style={{ color: 'var(--color-warning)' }}
+                      />
+                      <span>{t('dalton.sharing.webRwWarningTitle')}</span>
+                    </div>
+                    <p
+                      className="text-xs pl-6"
+                      style={{ color: 'var(--color-text-secondary)' }}
+                    >
+                      {t('dalton.sharing.webDescRw')}
+                    </p>
+                    <p
+                      className="text-xs whitespace-pre-line pl-6"
+                      style={{ color: 'var(--color-text-secondary)' }}
+                    >
+                      {t('dalton.sharing.webRwWarningBody')}
+                    </p>
                   </div>
-                  <p className="text-xs opacity-90 pl-6">
-                    {t('dalton.sharing.webDescRw')}
-                  </p>
-                  <p className="text-xs whitespace-pre-line pl-6">
-                    {t('dalton.sharing.webRwWarningBody')}
-                  </p>
-                </div>
+                </DaltonInlineNotice>
               )}
 
               <p
@@ -390,42 +384,39 @@ export function WorkspaceSharingModal({
                 style={{ color: 'var(--color-text-tertiary)' }}
                 data-testid="sharing-home-note"
               >
-                {t('dalton.sharing.homeNote', 'Home 工作区始终不对他人开放')}
+                {t('dalton.sharing.homeNote')}
               </p>
 
               {showTeamMemorySection && (
                 <div
                   data-testid="workspace-team-memory-section"
-                  className="flex items-center justify-between gap-3 pt-3 border-t"
-                  style={{ borderColor: 'var(--color-border-muted)' }}
+                  className="rule-t flex items-center justify-between gap-3 pt-3"
                 >
                   <div className="flex flex-col gap-0.5 min-w-0">
                     <span
+                      id={teamMemoryTitleId}
                       className="text-xs font-medium"
                       style={{ color: 'var(--color-text-secondary)' }}
                     >
-                      {t('dalton.teamMemory.workspaceTitle', '团队记忆')}
+                      {t('dalton.teamMemory.workspaceTitle')}
                     </span>
                     <span
                       className="text-xs"
                       style={{ color: 'var(--color-text-tertiary)' }}
                     >
                       {!settingsLoaded
-                        ? t('dalton.teamMemory.loading', '正在加载设置…')
-                        : t(
-                            'dalton.teamMemory.workspaceDesc',
-                            '允许分析师查阅团队过去的对话记录（OpenClaw 对话卡片）',
-                          )}
+                        ? t('dalton.teamMemory.loading')
+                        : t('dalton.teamMemory.workspaceDesc')}
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={draftTeamMemory === true}
-                    aria-busy={!settingsLoaded || settingsMutation.isPending}
-                    aria-label={t('dalton.teamMemory.workspaceTitle', '团队记忆')}
+                  <ToggleSwitch
+                    checked={draftTeamMemory === true}
                     disabled={isTeamMemoryDisabled}
-                    onClick={() => {
+                    ariaBusy={!settingsLoaded || settingsMutation.isPending}
+                    ariaLabel={t('dalton.teamMemory.workspaceTitle')}
+                    ariaDescribedBy={teamMemoryTitleId}
+                    testId="workspace-team-memory-switch"
+                    onChange={() => {
                       if (isTeamMemoryDisabled) return;
                       setDraftTeamMemory(
                         (prev) =>
@@ -436,40 +427,20 @@ export function WorkspaceSharingModal({
                           ),
                       );
                     }}
-                    data-testid="workspace-team-memory-switch"
-                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                      isTeamMemoryDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
-                    }`}
-                    style={{
-                      backgroundColor:
-                        draftTeamMemory === true
-                          ? 'var(--color-accent-primary)'
-                          : 'var(--color-border-default)',
-                    }}
-                  >
-                    <span
-                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                        draftTeamMemory === true ? 'translate-x-4' : 'translate-x-1'
-                      }`}
-                    />
-                  </button>
+                  />
                 </div>
               )}
 
               {saveError && (
-                <div
-                  role="alert"
-                  data-testid="workspace-sharing-save-error"
-                  className="flex items-center gap-2 rounded-md border px-3 py-2 text-xs"
-                  style={{
-                    borderColor: 'var(--color-loss)',
-                    backgroundColor: 'var(--color-loss-soft)',
-                    color: 'var(--color-loss)',
-                  }}
+                <DaltonInlineNotice
+                  tone="error"
+                  testId="workspace-sharing-save-error"
                 >
-                  <AlertTriangle className="h-4 w-4 shrink-0" />
-                  <span>{saveError}</span>
-                </div>
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4 shrink-0" />
+                    <span>{saveError}</span>
+                  </div>
+                </DaltonInlineNotice>
               )}
 
             </div>

@@ -33,7 +33,8 @@ const POINTS: { key: string; fallback: string; icon: LucideIcon }[] = [
   },
   {
     key: 'computer.remoteControl.meansBackground',
-    fallback: 'It keeps working after you close LangAlpha. Remote control runs in the background and starts again when you log in, until you turn it off.',
+    // DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy
+    fallback: 'It keeps working after you close {{brand}}. Remote control runs in the background and starts again when you log in, until you turn it off.',
     icon: Power,
   },
   {
@@ -43,7 +44,7 @@ const POINTS: { key: string; fallback: string; icon: LucideIcon }[] = [
   },
   {
     key: 'computer.remoteControl.meansAccount',
-    fallback: 'Anyone who signs in to your LangAlpha account can direct it.',
+    fallback: 'Anyone who signs in to your {{brand}} account can direct it.',
     icon: Users,
   },
 ];
@@ -55,7 +56,7 @@ function Disclosure({ state, account, busy }: { state: RemoteControlSetupState; 
       <p className="text-sm" style={labelStyle}>
         {t(
           'computer.remoteControl.intro',
-          "LangAlpha's agent will work on this Mac as {{account}}, with everything that account can do.",
+          "{{brand}}'s agent will work on this Mac as {{account}}, with everything that account can do.",
           { account },
         )}
       </p>
@@ -73,11 +74,12 @@ function Disclosure({ state, account, busy }: { state: RemoteControlSetupState; 
       </div>
 
       <div className="flex flex-col gap-1">
+        {/* DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy */}
         <h4 className="font-medium" style={primaryStyle}>{t('computer.remoteControl.stopLabel', 'Stopping it')}</h4>
         <p style={labelStyle}>
           {t(
             'computer.remoteControl.stop',
-            'Pause it any time from the LangAlpha menu, or in System Settings under General, Login Items. Removing this computer in LangAlpha turns it off and deletes its keys from this Mac.',
+            'Pause it any time from the {{brand}} menu, or in System Settings under General, Login Items. Removing this computer in {{brand}} turns it off and deletes its keys from this Mac.',
           )}
         </p>
       </div>
@@ -85,7 +87,7 @@ function Disclosure({ state, account, busy }: { state: RemoteControlSetupState; 
       <p style={mutedStyle}>
         {t(
           'computer.remoteControl.folderPrompts',
-          "macOS may ask whether LangAlpha can open folders such as Documents or Desktop. You can say no: the agent's own folder does not need it.",
+          "macOS may ask whether {{brand}} can open folders such as Documents or Desktop. You can say no: the agent's own folder does not need it.",
         )}
       </p>
 
@@ -106,9 +108,10 @@ function Disclosure({ state, account, busy }: { state: RemoteControlSetupState; 
         style={primaryStyle}
       >
         <span>
+          {/* DALTON-HOOK(ui-unify): brand interpolation */}
           {t(
             'computer.remoteControl.acknowledge',
-            "I understand LangAlpha's agent can run commands and change files on this Mac as {{account}}.",
+            "I understand {{brand}}'s agent can run commands and change files on this Mac as {{account}}.",
             { account },
           )}
         </span>
@@ -137,7 +140,8 @@ function Progress({ phase }: { phase: RemoteControlPhase }) {
             <span>
               {t(
                 'computer.remoteControl.needsApproval',
-                'macOS needs your OK. In System Settings, under General, Login Items, allow LangAlpha in the background, then continue.',
+                // DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy
+                'macOS needs your OK. In System Settings, under General, Login Items, allow {{brand}} in the background, then continue.',
               )}
             </span>
           </span>

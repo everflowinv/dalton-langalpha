@@ -223,15 +223,15 @@ describe('WorkspaceSharingModal', () => {
     );
     expect(screen.queryByTestId('sharing-web-rw-warning')).toBeNull();
 
-    const webRw = screen.getByTestId('sharing-web-rw') as HTMLInputElement;
-    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
-    const webHidden = screen.getByTestId('sharing-web-hidden') as HTMLInputElement;
+    const webRw = screen.getByTestId('sharing-web-rw');
+    const webRo = screen.getByTestId('sharing-web-ro');
+    const webHidden = screen.getByTestId('sharing-web-hidden');
 
-    expect(webHidden.checked).toBe(true);
-    expect(webRo.checked).toBe(false);
+    expect(webHidden).toHaveAttribute('aria-pressed', 'true');
+    expect(webRo).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(webRw);
-    expect(webRw.checked).toBe(true);
+    expect(webRw).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByTestId('sharing-web-rw-warning')).toHaveTextContent(
       '同事在这里提问会在你的计算机上运行，等于信任这台计算机',
     );
@@ -275,11 +275,11 @@ describe('WorkspaceSharingModal', () => {
     expect(screen.queryByTestId('sharing-cos-settings-hint')).toBeNull();
     expect(screen.getByTestId('sharing-cos-fieldset')).toBeInTheDocument();
 
-    const cosRo = screen.getByTestId('sharing-cos-ro') as HTMLInputElement;
-    const cosHidden = screen.getByTestId('sharing-cos-hidden') as HTMLInputElement;
-    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
+    const cosRo = screen.getByTestId('sharing-cos-ro');
+    const cosHidden = screen.getByTestId('sharing-cos-hidden');
+    const webRo = screen.getByTestId('sharing-web-ro');
 
-    expect(cosRo.checked).toBe(true);
+    expect(cosRo).toHaveAttribute('aria-pressed', 'true');
     fireEvent.click(cosHidden);
     fireEvent.click(webRo);
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
@@ -356,7 +356,7 @@ describe('WorkspaceSharingModal', () => {
     const section = screen.getByTestId('workspace-team-memory-section');
     expect(section).toHaveTextContent('团队记忆');
     expect(section).toHaveTextContent(
-      '允许分析师查阅团队过去的对话记录（OpenClaw 对话卡片）',
+      '开启后，该工作区的分析师在回答问题时可参考团队过往沉淀的研究记录与结论。',
     );
     const toggle = screen.getByTestId('workspace-team-memory-switch');
     expect(toggle).toHaveAttribute('aria-checked', 'false');

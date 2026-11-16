@@ -1,8 +1,11 @@
 // DALTON-HOOK(company-automations): company script edits cron and timezone only.
+// DALTON-HOOK(ui-unify): reuse visual CronScheduleBuilder and TimezonePicker instead of raw text inputs.
 import React, { useEffect, useId, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import TimezonePicker from '@/components/TimezonePicker';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import { useHomeTimezone } from '@/hooks/useHomeTimezone';
+import CronScheduleBuilder from './CronScheduleBuilder';
 import FormRow from './FormRow';
 
 export interface ScriptSchedulePatch {
@@ -35,10 +38,11 @@ export default function ScriptScheduleForm({
   onDirtyChange,
 }: ScriptScheduleFormProps) {
   const { t } = useTranslation();
+  const homeZone = useHomeTimezone();
   const [opened] = useState({ cron: cronExpression, timezone });
   const [cron, setCron] = useState(cronExpression);
   const [zone, setZone] = useState(timezone);
-  const uid = useId();
+  const labelId = useId();
   const dirty = cron !== opened.cron || zone !== opened.timezone;
 
   useEffect(() => {
@@ -60,15 +64,28 @@ export default function ScriptScheduleForm({
     });
   };
 
+  const zoneSelect = (
+    <TimezonePicker
+      value={zone}
+      onChange={setZone}
+      home={{ zone: homeZone, label: t('timezone.yours') }}
+      className="min-w-40 max-w-64"
+    />
+  );
+
   return (
     <form onSubmit={handleSubmit} className="automation-form">
       {notice}
       <div className="automation-form-rows">
-        <FormRow label={t('automation.scriptCron')} htmlFor={`${uid}-cron`}>
-          <Input id={`${uid}-cron`} value={cron} onChange={(event) => setCron(event.target.value)} autoComplete="off" />
-        </FormRow>
-        <FormRow label={t('automation.scriptTimezone')} htmlFor={`${uid}-zone`}>
-          <Input id={`${uid}-zone`} value={zone} onChange={(event) => setZone(event.target.value)} autoComplete="off" />
+        <FormRow label={t('automation.scriptCron')} labelId={labelId}>
+          <div className="automation-form-trigger">
+            <CronScheduleBuilder
+              value={cron}
+              onChange={setCron}
+              zone={zoneSelect}
+              labelledBy={labelId}
+            />
+          </div>
         </FormRow>
       </div>
       <div className="automation-form-actions">

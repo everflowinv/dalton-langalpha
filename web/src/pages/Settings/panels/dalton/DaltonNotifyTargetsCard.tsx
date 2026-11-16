@@ -23,7 +23,7 @@ import {
   DaltonLoadingRow,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 const PERSONAL_TARGET_RE = /^(feishu:user:ou_[A-Za-z0-9_-]+|discord:user:[0-9]+)$/;
 const GROUP_TARGET_RE = /^(feishu:chat:|discord:channel:)/i;

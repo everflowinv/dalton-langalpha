@@ -1,7 +1,8 @@
-/* eslint-disable react-refresh/only-export-components */
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Inbox } from 'lucide-react';
+import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives';
+import { cn } from '@/lib/utils';
 import { fetchAutoIngest, updateAutoIngest } from '../../utils/api/workspaces';
 
 /**
@@ -65,16 +66,16 @@ export function AutoIngestToggle({
       onClick={toggle}
       disabled={readOnly || busy}
       data-testid="dalton-auto-ingest-toggle"
-      className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-colors ${
-        enabled
-          ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-          : 'border-border bg-surface-hover text-muted-foreground'
-      } ${readOnly ? 'cursor-not-allowed opacity-60' : 'hover:border-primary/40'}`}
+      className={cn(
+        TOOLBAR_CHIP_CLASS,
+        readOnly ? 'cursor-not-allowed opacity-60' : 'press cursor-pointer hover:bg-(--color-bg-subtle)',
+      )}
+      style={toolbarChipStyle(enabled ? 'success' : 'neutral')}
       title={enabled ? t('dalton.autoIngest.enabledHint') : t('dalton.autoIngest.disabledHint')}
     >
-      <Inbox className="size-3.5" />
+      <Inbox className="h-3.5 w-3.5 shrink-0" />
       <span>{enabled ? t('dalton.autoIngest.on') : t('dalton.autoIngest.off')}</span>
-      {error ? <span className="text-destructive">{error}</span> : null}
+      {error ? <span style={{ color: 'var(--color-loss)' }}>{error}</span> : null}
     </button>
   );
 }

@@ -19,7 +19,7 @@ import {
   DaltonSettingsCard,
   DaltonStatusBadge,
   type DaltonStatusTone,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 const OPS_SCOPES = new Set<DaltonSystemJobScope>(['host', 'ops']);
 

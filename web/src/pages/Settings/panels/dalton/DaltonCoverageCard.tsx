@@ -38,7 +38,7 @@ import {
   DaltonSettingsCard,
   DaltonStatusBadge,
   DaltonToolbarPill,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 type CoverageTab = 'sectors' | 'companies' | 'unclassified';
 

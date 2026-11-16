@@ -13,7 +13,7 @@ import {
   DaltonItemRow,
   DaltonKeyValueList,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 export interface NativeSyncDiffDialogProps {
   open: boolean;

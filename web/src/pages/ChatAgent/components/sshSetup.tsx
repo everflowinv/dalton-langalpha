@@ -243,7 +243,8 @@ function PairingView({
     >
       <p style={labelStyle}>
         {pairing.localOnly
-          ? t('computer.ssh.pairIntroLocal', 'Run this in a terminal on the computer running LangAlpha, as the user the agent should work as. To add another machine, set it up by hand.')
+          // DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy
+          ? t('computer.ssh.pairIntroLocal', 'Run this in a terminal on the computer running {{brand}}, as the user the agent should work as. To add another machine, set it up by hand.')
           : reconnecting
             ? t('computer.reconnect.pairIntro', 'Run this on the machine, as {{username}}:', { username: reconnecting.username })
             : t('computer.ssh.pairIntro', 'Run this on the machine you are adding (Linux or macOS), as the user the agent should work as:')}

@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router';
 import { Button } from '@/components/ui/button';
 import { buttonSlot } from '@/components/ui/button-class';
 import { Loader } from '@/components/ui/loader';
-import { SettingsCardBody, SettingsGroup } from '../../../components/SettingsLayout';
+import { SettingsCardBody, SettingsGroup } from '@/pages/Settings/components/SettingsLayout';
 
 export interface DaltonSettingsCardProps {
   id?: string;

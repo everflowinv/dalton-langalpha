@@ -11,10 +11,7 @@ import {
 // 与同页"共享设置"按钮同款 pill（rounded-full border + transition-colors +
 // hover:bg-foreground/5，WorkspaceSharingModal 的触发按钮）。
 const CHIP_CLASS =
-  'inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] transition-colors';
-const CHIP_STYLE = {
-  borderColor: 'var(--color-border-muted)',
-} as const;
+  'inline-flex items-center gap-1.5 rounded-full border border-[color:var(--color-shell-edge,var(--color-border-muted))] px-2 py-0.5 text-[11px] transition-colors';
 
 /** 可进入的 chip：文字 secondary（共享设置按钮同款），hover 态同款。 */
 function EnterableChip({ label, workspaceId }: { label: string; workspaceId: string }) {
@@ -23,9 +20,10 @@ function EnterableChip({ label, workspaceId }: { label: string; workspaceId: str
     <button
       type="button"
       data-testid="coverage-affiliation-chip"
+      data-bracket="chip"
       onClick={() => navigate(`/chat/${workspaceId}`)}
       className={`${CHIP_CLASS} cursor-pointer hover:bg-foreground/5`}
-      style={{ ...CHIP_STYLE, color: 'var(--color-text-secondary)' }}
+      style={{ color: 'var(--color-text-secondary)' }}
     >
       {label}
     </button>
@@ -38,8 +36,9 @@ function PlainChip({ label, reason }: { label: string; reason: string }) {
   return (
     <span
       data-testid="coverage-affiliation-chip"
+      data-bracket="chip"
       className={`${CHIP_CLASS} cursor-default`}
-      style={{ ...CHIP_STYLE, color: 'var(--color-text-quaternary)' }}
+      style={{ color: 'var(--color-text-quaternary)' }}
       title={reason}
     >
       {label}

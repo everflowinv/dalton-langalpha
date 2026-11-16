@@ -10,7 +10,7 @@ import {
   DaltonLoadingRow,
   DaltonRefreshButton,
   DaltonSettingsCard,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 /** Team provider health dashboard + model catalog sync section (admin view in Team Models). */
 export function ProviderStatusCard() {

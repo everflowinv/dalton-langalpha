@@ -12,7 +12,7 @@ import {
   DaltonLoadingRow,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 export function canShowDaltonHomeTeamMemoryCard(
   ctx?: DaltonSettingVisibilityContext | null,
