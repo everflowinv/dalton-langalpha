@@ -434,16 +434,16 @@ describe('a company script save', () => {
     const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '0 10 * * 1-5' } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
 
     expect(await screen.findByText(label('automation.currentVersion', { version: 4 }))).toBeInTheDocument();
     expect(screen.getByText(label('automation.serverSchedule', { cron: '15 8 * * 1-5', zone: 'UTC' }))).toBeInTheDocument();
-    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('0 10 * * 1-5');
+    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
     expect(vi.mocked(api.updateCompanyScript).mock.calls[0]).toEqual([
       id,
-      { expected_config_version: 3, cron_expression: '0 10 * * 1-5' },
+      { expected_config_version: 3, cron_expression: '0 9 * * 1,2,3,4,5,6' },
     ]);
 
     const retry = await screen.findByRole('button', { name: label('automation.retryWithCurrent') });
@@ -452,12 +452,11 @@ describe('a company script save', () => {
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.updateCompanyScript).mock.calls[1]).toEqual([
       id,
-      { expected_config_version: 4, cron_expression: '0 10 * * 1-5' },
+      { expected_config_version: 4, cron_expression: '0 9 * * 1,2,3,4,5,6' },
     ]);
   });
 
   it('clears the open draft when the task becomes forbidden', async () => {
-    const draft = '7 7 * * 7';
     let forbidden = false;
     const current = script({ automation_id: id, name: 'Close prices', cron_expression: '0 9 * * 1-5' });
     vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
@@ -477,19 +476,17 @@ describe('a company script save', () => {
     const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: draft } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
 
     expect(await screen.findByText(label('automation.detailForbidden'))).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByDisplayValue(draft)).not.toBeInTheDocument());
-    expect(screen.queryByText(draft)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
     expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: label('automation.edit') })).not.toBeInTheDocument();
     expect(screen.getByText('Close prices')).toBeInTheDocument();
   });
 
   it('hides a cached company detail and its draft when the company list is refused', async () => {
-    const draft = 'draft-cron-7-7';
     let companyRefused = false;
     const current = script({ automation_id: id, name: 'Close prices', cron_expression: '0 9 * * 1-5', config_version: 3 });
     vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
@@ -514,8 +511,9 @@ describe('a company script save', () => {
     const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: draft } });
-    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue(draft);
+    const sat = await screen.findByRole('button', { name: label('automation.daySat') });
+    fireEvent.click(sat);
+    expect(sat).toHaveAttribute('aria-pressed', 'true');
 
     companyRefused = true;
     fireEvent.click(screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupCompany')}` }));
@@ -523,8 +521,7 @@ describe('a company script save', () => {
     expect(await screen.findByText(label('automation.detailForbidden'))).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
     expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByDisplayValue(draft)).not.toBeInTheDocument());
-    expect(screen.queryByText(draft)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
     expect(screen.queryByText('Close prices')).not.toBeInTheDocument();
     expect(screen.queryByText('Quarterly ledger alpha')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
@@ -556,11 +553,11 @@ describe('a company script save', () => {
     const edit = () => inspector('Close prices').getByRole('button', { name: label('automation.edit') });
     await waitFor(() => expect(edit()).toBeEnabled());
     fireEvent.click(edit());
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
 
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.queryByDisplayValue('7 7 * * 7')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
     await waitFor(() => expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument());
     expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByText('Close prices')).not.toBeInTheDocument();
@@ -693,14 +690,14 @@ describe('cached reads and independent pages', () => {
     renderAt('/automations?view=manage');
     await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
     fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: `${label('automation.nextPage')} ${label('automation.groupResearch')}` }));
     await waitFor(() => expect(finishPage).toBeDefined());
-    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
     await act(async () => {
       finishPage({ data: { automations: [agent({ automation_id: 'research-50', name: 'Research second', scope: 'research_tracking' })], total: 51 } } as never);
     });
-    expect(await screen.findByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(await screen.findByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: /Research second/ })).toBeInTheDocument();
   });
 
@@ -721,19 +718,19 @@ describe('cached reads and independent pages', () => {
     const nextName = `${label('automation.nextPage')} ${label('automation.groupCompany')}`;
     await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
     fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: nextName }));
     const dialog = await screen.findByRole('dialog');
-    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(screen.getByRole('button', { name: label('automation.daySat'), hidden: true })).toHaveAttribute('aria-pressed', 'true');
     expect(pageTwo).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: label('common.cancel') }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue('7 7 * * 7');
+    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(pageTwo).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: nextName }));
     fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.discardDraft') }));
     expect(await screen.findByRole('button', { name: /Second company/ })).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByDisplayValue('7 7 * * 7')).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole('button', { name: label('automation.daySat') })).not.toBeInTheDocument());
   });
 
   it('returns to an existing page when the final page becomes empty', async () => {
@@ -766,19 +763,18 @@ describe('cached reads and independent pages', () => {
     const { queryClient } = renderAt('/automations?view=manage&id=data%3Aoffpage');
     await waitFor(() => expect(inspector('Off page script').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
     fireEvent.click(inspector('Off page script').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: '7 7 * * 7' } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     await act(async () => {
       failed = true;
       await queryClient.invalidateQueries();
     });
     await pastPaneExit();
-    expect(screen.getByDisplayValue('7 7 * * 7')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
   });
 
   it('keeps the draft when a conflict refetch fails and leaves retry off', async () => {
     const current = script({ automation_id: 'data:prices', name: 'Close prices', config_version: 3 });
-    const draft = '7 7 * * 7';
     let detailFails = false;
     vi.mocked(api.listAutomationReads).mockImplementation(async (params) => {
       if (params?.scope !== 'company') return emptyPage();
@@ -795,11 +791,11 @@ describe('cached reads and independent pages', () => {
     renderAt('/automations?view=manage');
     await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
     fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: draft } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
     await waitFor(() => expect(vi.mocked(api.getAutomationRead).mock.calls.length).toBeGreaterThan(1));
     await pastPaneExit();
-    expect(screen.getByLabelText(label('automation.scriptCron'))).toHaveValue(draft);
+    expect(screen.getByRole('button', { name: label('automation.daySat') })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: label('automation.retryWithCurrent') })).toBeDisabled();
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
@@ -807,7 +803,7 @@ describe('cached reads and independent pages', () => {
 
   it('retries a script with the later detail version and the same draft', async () => {
     const taskId = 'data:prices';
-    const draft = '7 7 * * 7';
+    const nextCron = '0 9 * * 1,2,3,4,5,6';
     const retryName = label('automation.retryWithCurrent');
     const listed = script({ automation_id: taskId, name: 'Close prices', config_version: 3, cron_expression: '0 9 * * 1-5' });
     const other = script({ automation_id: 'data:other', name: 'Other book', config_version: 11 });
@@ -828,23 +824,23 @@ describe('cached reads and independent pages', () => {
       throw httpError(409, 'Someone else saved this task.');
     });
     const { queryClient } = renderAt('/automations?view=manage');
-    const cron = () => screen.getByLabelText(label('automation.scriptCron'));
+    const sat = () => screen.getByRole('button', { name: label('automation.daySat') });
     const retry = () => screen.getByRole('button', { name: retryName });
 
     await waitFor(() => expect(inspector('Close prices').getByRole('button', { name: label('automation.edit') })).toBeEnabled());
     fireEvent.click(inspector('Close prices').getByRole('button', { name: label('automation.edit') }));
-    fireEvent.change(await screen.findByLabelText(label('automation.scriptCron')), { target: { value: draft } });
+    fireEvent.click(await screen.findByRole('button', { name: label('automation.daySat') }));
     fireEvent.click(screen.getByRole('button', { name: label('automation.saveChanges') }));
 
     await waitFor(() => {
       expect(retry()).toBeDisabled();
       expect(queryClient.isFetching({ queryKey: queryKeys.automations.all })).toBe(0);
     });
-    expect(cron()).toHaveValue(draft);
+    expect(sat()).toHaveAttribute('aria-pressed', 'true');
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
     expect(vi.mocked(api.updateCompanyScript).mock.calls[0]).toEqual([
       taskId,
-      { expected_config_version: 3, cron_expression: draft },
+      { expected_config_version: 3, cron_expression: nextCron },
     ]);
 
     await act(async () => {
@@ -853,7 +849,7 @@ describe('cached reads and independent pages', () => {
     });
     await waitFor(() => expect(queryClient.isFetching({ queryKey: queryKeys.automations.all })).toBe(0));
     expect(retry()).toBeDisabled();
-    expect(cron()).toHaveValue(draft);
+    expect(sat()).toHaveAttribute('aria-pressed', 'true');
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(label('automation.currentVersion', { version: 11 }))).not.toBeInTheDocument();
     expect(screen.queryByText(label('automation.notFound'))).not.toBeInTheDocument();
@@ -864,14 +860,14 @@ describe('cached reads and independent pages', () => {
     });
     await waitFor(() => expect(retry()).toBeEnabled());
     expect(api.updateCompanyScript).toHaveBeenCalledTimes(1);
-    expect(cron()).toHaveValue(draft);
+    expect(sat()).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByText(label('automation.currentVersion', { version: 8 }))).toBeInTheDocument();
 
     fireEvent.click(retry());
     await waitFor(() => expect(api.updateCompanyScript).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.updateCompanyScript).mock.calls[1]).toEqual([
       taskId,
-      { expected_config_version: 8, cron_expression: draft },
+      { expected_config_version: 8, cron_expression: nextCron },
     ]);
   });
 

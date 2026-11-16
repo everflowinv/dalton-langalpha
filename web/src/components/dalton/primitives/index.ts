@@ -35,5 +35,10 @@ export {
 
 export {
   DaltonToolbarPill,
+  DaltonToolbarChip,
+  TOOLBAR_CHIP_CLASS,
+  toolbarChipStyle,
   type DaltonToolbarPillProps,
+  type DaltonToolbarChipProps,
+  type DaltonToolbarChipTone,
 } from './DaltonToolbarPill';

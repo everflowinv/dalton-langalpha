@@ -29,7 +29,7 @@ import {
   DaltonRefreshButton,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 function formatUsd(n: number | null | undefined): string {
   const val = typeof n === 'number' && Number.isFinite(n) ? n : 0;

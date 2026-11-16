@@ -26,7 +26,7 @@ import {
   DaltonSettingsCard,
   DaltonStatusBadge,
   type DaltonStatusTone,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 export function canShowDaltonInviteAdminCard(
   ctx?: DaltonSettingVisibilityContext | null,

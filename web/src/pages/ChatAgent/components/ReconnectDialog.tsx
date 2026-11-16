@@ -134,11 +134,12 @@ function ReconnectDialog({ computer, thisMacIs, onClose, onSubmit, busy, error, 
             moving={!!moveTo}
           />
         )}
+        {/* DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy */}
         {way === 'elsewhere' && (
           <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }} data-testid="reconnect-elsewhere">
             {t(
               'computer.reconnect.onThatMac',
-              '{{name}} is connected by the LangAlpha app on its Mac. Open LangAlpha on that Mac and choose Reconnect there.',
+              '{{name}} is connected by the {{brand}} app on its Mac. Open {{brand}} on that Mac and choose Reconnect there.',
               { name: computer.name },
             )}
           </p>
@@ -147,7 +148,7 @@ function ReconnectDialog({ computer, thisMacIs, onClose, onSubmit, busy, error, 
           <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }} data-testid="reconnect-other-mac">
             {t(
               'computer.reconnect.otherMac',
-              'This Mac is already {{other}}. To reconnect {{name}}, open LangAlpha on the Mac it runs on and choose Reconnect there.',
+              'This Mac is already {{other}}. To reconnect {{name}}, open {{brand}} on the Mac it runs on and choose Reconnect there.',
               { other: thisMacIs, name: computer.name },
             )}
           </p>

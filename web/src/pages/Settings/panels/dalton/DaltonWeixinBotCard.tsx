@@ -21,7 +21,7 @@ import {
   DaltonRefreshButton,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 function mergeQrState(
   prev: DaltonWeixinQrPublicResponse | null,

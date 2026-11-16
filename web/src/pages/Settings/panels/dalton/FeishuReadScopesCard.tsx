@@ -21,7 +21,7 @@ import {
   DaltonRefreshButton,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 export function canShowDaltonFeishuScopesCard(
   ctx?: DaltonSettingVisibilityContext | null,

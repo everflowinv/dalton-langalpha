@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { BookOpen, Check, ChevronRight, Copy } from 'lucide-react';
+import { TagBadge } from '@/components/mcp/McpPrimitives';
 import type { ProvenanceRecord } from '@/types/chat';
 import { isTaskAgentId } from '@/pages/ChatAgent/utils/agentId';
 
@@ -16,6 +17,11 @@ const IDENTITY_LABELS_ZH: Record<string, string> = {
   street_estimate: '一致预期',
 };
 
+const CARD_CHROME =
+  'group relative flex items-center gap-2.5 rounded-[var(--cs-radius-box,var(--radius-lg))] border px-2.5 text-left transition-colors ' +
+  'border-[color:var(--color-shell-edge,var(--color-border-muted))] bg-[color:var(--color-shell-float,var(--color-bg-card))] ' +
+  'hover:border-[color:var(--color-shell-edge-hover,var(--color-border-default))] hover:bg-[color:var(--color-shell-float,var(--color-bg-elevated))]';
+
 export interface ResearchDocSourceProps {
   record: ProvenanceRecord;
   records?: ProvenanceRecord[];
@@ -30,7 +36,10 @@ export function ResearchDocSource({
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
 
-  const title = record.title || record.identifier || t('chat.sources.unknownSource', { defaultValue: 'Research Document' });
+  const title =
+    record.title ||
+    record.identifier ||
+    t('chat.sources.unknownSource', { defaultValue: 'Research Document' });
   const identityKey = record.detail || '';
   const badgeLabel = identityKey
     ? t(`dalton.sources.identity.${identityKey}`, {
@@ -51,44 +60,46 @@ export function ResearchDocSource({
 
   return (
     <div
-      role="button"
-      tabIndex={0}
-      onClick={() => onOpenRecord(record)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onOpenRecord(record);
-        }
+      className={CARD_CHROME}
+      style={{
+        height: 52,
+        boxShadow: 'var(--cs-frame-shadow, none)',
       }}
-      aria-label={`${title} — ${t('chat.sources.viewDetails', { defaultValue: 'View details' })}`}
-      className="group relative flex items-center gap-2.5 rounded-lg border border-(--color-border-muted) bg-(--color-bg-card) px-2.5 text-left outline-hidden cursor-pointer hover:border-(--color-border-default) hover:bg-(--color-bg-elevated) focus-visible:ring-2 focus-visible:ring-ring"
-      style={{ height: 52, boxShadow: '0 1px 2px rgba(20, 20, 23, 0.05)' }}
     >
-      <span
-        className="flex shrink-0 items-center justify-center rounded-md"
-        style={{ width: 28, height: 28, background: 'var(--color-bg-subtle)' }}
+      <button
+        type="button"
+        onClick={() => onOpenRecord(record)}
+        aria-label={`${title} — ${t('chat.sources.viewDetails', { defaultValue: 'View details' })}`}
+        className="flex min-w-0 flex-1 items-center gap-2.5 text-left outline-hidden cursor-pointer focus-visible:ring-2 focus-visible:ring-ring rounded-md"
       >
-        <BookOpen width={14} height={14} className="shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-      </span>
-
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className="flex items-center gap-1.5 min-w-0">
-          <span className="truncate text-sm" style={{ color: 'var(--color-text-primary)' }} title={title}>
-            {title}
-          </span>
-          {badgeLabel && (
-            <span
-              className="inline-flex shrink-0 items-center rounded px-1.5 py-0.2 text-[0.625rem] font-medium"
-              style={{
-                backgroundColor: 'var(--color-bg-subtle)',
-                color: 'var(--color-text-secondary)',
-              }}
-            >
-              {badgeLabel}
-            </span>
-          )}
+        <span
+          className="flex shrink-0 items-center justify-center rounded-[var(--cs-radius-mark,var(--radius-md))]"
+          style={{
+            width: 28,
+            height: 28,
+            background: 'var(--color-shell-fill, var(--color-bg-subtle))',
+            boxShadow: 'inset 0 0 0 1px var(--color-shell-rule, transparent)',
+          }}
+        >
+          <BookOpen
+            width={14}
+            height={14}
+            className="shrink-0"
+            style={{ color: 'var(--color-text-tertiary)' }}
+          />
         </span>
-        <span className="flex items-center gap-1.5 min-w-0">
+
+        <span className="flex min-w-0 flex-1 flex-col">
+          <span className="flex items-center gap-1.5 min-w-0">
+            <span
+              className="truncate text-sm"
+              style={{ color: 'var(--color-text-primary)' }}
+              title={title}
+            >
+              {title}
+            </span>
+            {badgeLabel && <TagBadge soft>{badgeLabel}</TagBadge>}
+          </span>
           {subtitle && (
             <span
               className="truncate text-xs"
@@ -98,41 +109,30 @@ export function ResearchDocSource({
               {subtitle}
             </span>
           )}
-          {record.identifier && (
-            <button
-              type="button"
-              onClick={handleCopyId}
-              title={`Copy ID: ${record.identifier}`}
-              className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.2 text-[0.625rem] opacity-70 hover:opacity-100 hover:bg-(--color-bg-subtle)"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            >
-              <span className="max-w-[110px] truncate font-mono">{record.identifier}</span>
-              {copied ? <Check className="h-2.5 w-2.5" /> : <Copy className="h-2.5 w-2.5" />}
-            </button>
-          )}
         </span>
-      </span>
+      </button>
 
-      {accessCount > 1 && (
-        <span
-          className="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
-          style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
+      {record.identifier && (
+        <button
+          type="button"
+          onClick={handleCopyId}
+          title={t('dalton.sources.copyId', { id: record.identifier })}
+          aria-label={t('dalton.sources.copyId', { id: record.identifier })}
+          className="relative z-10 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] opacity-75 hover:opacity-100 hover:bg-(--color-bg-subtle) cursor-pointer"
+          style={{ color: 'var(--color-text-tertiary)' }}
         >
-          ×{accessCount}
-        </span>
+          <span className="max-w-[96px] truncate font-mono">{record.identifier}</span>
+          {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+        </button>
       )}
 
-      {subagent && (
-        <span
-          className="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
-          style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
-        >
-          {t('chat.sources.subagent')}
-        </span>
-      )}
+      {accessCount > 1 && <TagBadge soft>×{accessCount}</TagBadge>}
+
+      {subagent && <TagBadge soft>{t('chat.sources.subagent')}</TagBadge>}
 
       <ChevronRight
-        className="h-4 w-4 shrink-0 opacity-0 transition-opacity group-hover:opacity-50"
+        aria-hidden="true"
+        className="h-4 w-4 shrink-0 opacity-0 transition-opacity group-hover:opacity-50 pointer-events-none"
         style={{ color: 'var(--color-text-tertiary)' }}
       />
     </div>

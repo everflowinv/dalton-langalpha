@@ -1,6 +1,9 @@
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { TagBadge } from '@/components/mcp/McpPrimitives';
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { DaltonStatusBadge, type DaltonStatusTone } from '@/components/dalton/primitives';
 import { useUser } from '@/hooks/useUser';
 import { queryKeys } from '@/lib/queryKeys';
 import { localDateStr } from '@/lib/utils';
@@ -53,40 +56,17 @@ export function EarningsScopeTabs({
   onScopeChange,
 }: EarningsScopeTabsProps) {
   const { t } = useTranslation();
-  const tabs: { key: EarningsScope; label: string }[] = [
-    { key: 'mine', label: t('dashboard.earningsCalendarCard.tabMine') },
-    { key: 'market', label: t('dashboard.earningsCalendarCard.tabMarket') },
-  ];
-
   return (
-    <div
-      className="inline-flex items-center rounded-lg p-0.5 border"
-      style={{
-        backgroundColor: 'var(--color-bg-tag)',
-        borderColor: 'var(--color-border-muted)',
-      }}
-      role="tablist"
-    >
-      {tabs.map((tab) => {
-        const active = scope === tab.key;
-        return (
-          <button
-            key={tab.key}
-            type="button"
-            role="tab"
-            aria-selected={active}
-            onClick={() => onScopeChange(tab.key)}
-            className="px-2.5 py-1 rounded-md text-xs font-medium transition-colors"
-            style={{
-              backgroundColor: active ? 'var(--color-accent-primary)' : 'transparent',
-              color: active ? '#fff' : 'var(--color-text-secondary)',
-            }}
-          >
-            {tab.label}
-          </button>
-        );
-      })}
-    </div>
+    <SegmentedControl<EarningsScope>
+      size="compact"
+      value={scope}
+      onChange={onScopeChange}
+      label={t('dashboard.widgets.earningsCalendar.title')}
+      options={[
+        { value: 'mine', label: t('dashboard.earningsCalendarCard.tabMine') },
+        { value: 'market', label: t('dashboard.earningsCalendarCard.tabMarket') },
+      ]}
+    />
   );
 }
 
@@ -104,17 +84,16 @@ export function UserEarningsBadges({ item }: UserEarningsBadgesProps) {
   const rawStatus = String(item.status || '').toLowerCase();
   const rawDateStatus = String(item.date_status || '').toLowerCase();
   let statusLabel = '';
-  let statusColor = 'var(--color-text-secondary)';
-  let statusBg = 'var(--color-bg-tag)';
+  let statusTone: DaltonStatusTone = 'neutral';
 
   if (rawStatus === 'reported' || rawDateStatus === 'reported') {
     statusLabel = t('dashboard.earningsCalendarCard.statusReported');
   } else if (rawStatus === 'confirmed' || rawDateStatus === 'confirmed') {
     statusLabel = t('dashboard.earningsCalendarCard.statusConfirmed');
-    statusColor = 'var(--color-accent-light, #10b981)';
+    statusTone = 'success';
   } else if (rawStatus === 'pending' || rawDateStatus === 'estimated') {
     statusLabel = t('dashboard.earningsCalendarCard.statusPending');
-    statusColor = '#f59e0b';
+    statusTone = 'warning';
   }
 
   const rawTiming = String(item.timing || '').toUpperCase();
@@ -132,43 +111,21 @@ export function UserEarningsBadges({ item }: UserEarningsBadgesProps) {
   return (
     <div className="flex flex-wrap items-center gap-1 mt-1">
       {(isCore || isWatch) && (
-        <span
-          className="px-1.5 py-0.5 rounded text-[0.625rem] font-semibold leading-none border"
-          style={{
-            backgroundColor: isCore ? 'var(--color-accent-overlay, rgba(59,130,246,0.12))' : 'var(--color-bg-tag)',
-            color: isCore ? 'var(--color-accent-light, #60a5fa)' : 'var(--color-text-secondary)',
-            borderColor: 'var(--color-border-muted)',
-          }}
-        >
+        <TagBadge soft={isWatch}>
           {isCore
             ? t('dashboard.earningsCalendarCard.tierCore')
             : t('dashboard.earningsCalendarCard.tierWatch')}
-        </span>
+        </TagBadge>
       )}
       {statusLabel && (
-        <span
-          className="px-1.5 py-0.5 rounded text-[0.625rem] font-medium leading-none border"
-          style={{
-            backgroundColor: statusBg,
-            color: statusColor,
-            borderColor: 'var(--color-border-muted)',
-          }}
-        >
-          {statusLabel}
-        </span>
+        <DaltonStatusBadge
+          tone={statusTone}
+          dot={statusTone !== 'neutral'}
+          label={statusLabel}
+          className="px-1.5 py-0 text-[10px]"
+        />
       )}
-      {timingLabel && (
-        <span
-          className="px-1.5 py-0.5 rounded text-[0.625rem] font-medium leading-none border"
-          style={{
-            backgroundColor: 'var(--color-bg-tag)',
-            color: 'var(--color-text-secondary)',
-            borderColor: 'var(--color-border-muted)',
-          }}
-        >
-          {timingLabel}
-        </span>
-      )}
+      {timingLabel && <TagBadge soft>{timingLabel}</TagBadge>}
     </div>
   );
 }

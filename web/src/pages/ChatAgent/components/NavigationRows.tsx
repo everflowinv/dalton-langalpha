@@ -1049,6 +1049,8 @@ function WorkspaceTreeRowImpl({
                   {coverageChip && (
                     <span
                       data-testid="coverage-role-chip"
+                      // DALTON-HOOK(ui-unify): bracketed chip in Terminal style
+                      data-bracket="chip"
                       title={coverageChip}
                       className="shrink-0 max-w-32 truncate rounded-full border px-1.5 py-0.5 text-[10px]"
                       style={{ borderColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}

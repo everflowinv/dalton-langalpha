@@ -3,11 +3,17 @@ import React, { useCallback, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronRight, Folder, Lock, Send, Users } from 'lucide-react';
+import { ChevronRight, Folder, Lock, Send } from 'lucide-react';
 import { api } from '@/api/client';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives';
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { queryKeys } from '@/lib/queryKeys';
+import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
+import { shortMonthDay } from '@/lib/format';
+import { queryKeys } from '@/lib/queryKeys';
+import { cn } from '@/lib/utils';
 
 export type TeamAccessMode = 'owner' | 'rw' | 'ro';
 
@@ -233,12 +239,14 @@ export function useTeamReadOnly(
   };
 }
 
-function formatShortTime(iso: string | null | undefined): string {
+function formatShortTime(iso: string | null | undefined, locale: string): string {
   if (!iso) return '';
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return '';
-  return `${date.getMonth() + 1}/${date.getDate()}`;
+  return shortMonthDay(date, locale);
 }
+
+const CHEVRON_CLASS = 'h-3.5 w-3.5 transition-transform duration-fold';
 
 /**
  * Sidebar collapsible "团队" section below "我的工作区".
@@ -249,6 +257,8 @@ export function TeamWorkspacesSection({
 }: {
   currentWorkspaceId?: string | null;
 }): React.ReactElement | null {
+  const { t } = useTranslation();
+  const locale = useLocale();
   const navigate = useNavigate();
   const { data } = useTeamWorkspaces();
   const [sectionExpanded, setSectionExpanded] = useState(true);
@@ -281,36 +291,42 @@ export function TeamWorkspacesSection({
 
   return (
     <div
-      className="sidebar-team-section shrink-0 mt-2 pt-2 pb-2 border-t"
-      style={{ borderColor: 'var(--color-border-muted)' }}
+      className="sidebar-team-section shrink-0 mt-2 pt-2 pb-2 rule-t"
       data-testid="team-workspaces-section"
     >
-      <div className="sidebar-section-header px-2 py-1 flex items-center justify-between">
+      <div className="sidebar-section-header">
         <button
           type="button"
-          className="sidebar-section-title flex items-center gap-1.5 text-xs font-medium w-full text-left"
+          className="sidebar-section-title"
           onClick={() => setSectionExpanded((v) => !v)}
           aria-expanded={sectionExpanded}
           data-testid="team-section-toggle"
         >
-          {sectionExpanded ? (
-            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
-          )}
-          <Users className="h-3.5 w-3.5 shrink-0" />
-          <span>团队</span>
+          {t('dalton.sharing.teamSectionTitle')}
         </button>
+        <div className="sidebar-section-actions">
+          <button
+            type="button"
+            className="nav-panel-dismiss-btn sidebar-section-action-btn"
+            onClick={() => setSectionExpanded((v) => !v)}
+            aria-label={t('dalton.sharing.teamSectionTitle')}
+          >
+            <ChevronRight
+              className={cn(CHEVRON_CLASS, sectionExpanded && 'rotate-90')}
+              style={{ color: 'var(--color-text-tertiary)' }}
+            />
+          </button>
+        </div>
       </div>
 
       {sectionExpanded && (
-        <div className="flex flex-col gap-0.5 px-1" data-testid="team-members-list">
+        <div className="flex flex-col py-1" data-testid="team-members-list">
           {members.length === 0 ? (
             <div
               className="px-3 py-1.5 text-xs"
               style={{ color: 'var(--color-text-tertiary)' }}
             >
-              暂无同事工作区
+              {t('dalton.sharing.teamEmpty')}
             </div>
           ) : (
             members.map((member) => {
@@ -327,19 +343,21 @@ export function TeamWorkspacesSection({
                     onClick={() => toggleMember(member.user_id)}
                     aria-expanded={isExpanded}
                     data-testid={`team-member-toggle-${member.user_id}`}
-                    className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-xs transition-colors hover:bg-foreground/5 text-left"
-                    style={{ color: 'var(--color-text-secondary)' }}
+                    className="nav-panel-row w-full text-left"
+                    style={{ paddingLeft: 10 }}
                   >
-                    <span className="flex items-center gap-1.5 min-w-0 truncate">
-                      {isExpanded ? (
-                        <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-                      ) : (
-                        <ChevronRight className="h-3.5 w-3.5 shrink-0" />
-                      )}
-                      <span className="truncate font-medium">{displayLabel}</span>
+                    <ChevronRight
+                      className={cn(CHEVRON_CLASS, 'shrink-0', isExpanded && 'rotate-90')}
+                      style={{ color: 'var(--color-text-tertiary)' }}
+                    />
+                    <span
+                      className="text-sm font-medium truncate"
+                      style={{ color: 'var(--color-text-secondary)' }}
+                    >
+                      {displayLabel}
                     </span>
                     <span
-                      className="text-[11px] shrink-0"
+                      className="ml-auto text-[11px] shrink-0 tabular-nums"
                       style={{ color: 'var(--color-text-tertiary)' }}
                     >
                       {member.workspaces.length}
@@ -348,14 +366,17 @@ export function TeamWorkspacesSection({
 
                   {isExpanded && (
                     <div
-                      className="flex flex-col pl-4 gap-0.5"
+                      className="flex flex-col"
                       data-testid={`team-member-workspaces-${member.user_id}`}
                     >
                       {member.workspaces.map((ws) => {
                         const active = currentWorkspaceId === ws.workspace_id;
-                        const timeLabel = formatShortTime(ws.last_activity_at || ws.updated_at);
+                        const timeLabel = formatShortTime(ws.last_activity_at || ws.updated_at, locale);
                         const wsAccess = (ws.web_access || ws.access) === 'rw' ? 'rw' : 'ro';
-                        const accessBadge = wsAccess === 'rw' ? '可读写' : '只读';
+                        const accessBadge =
+                          wsAccess === 'rw'
+                            ? t('dalton.sharing.levelRw')
+                            : t('dalton.sharing.levelRo');
                         return (
                           <button
                             key={ws.workspace_id}
@@ -373,21 +394,30 @@ export function TeamWorkspacesSection({
                                 },
                               })
                             }
-                            className={`flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-xs transition-colors hover:bg-foreground/5 text-left ${
-                              active ? 'bg-foreground/10 font-medium' : ''
-                            }`}
-                            style={{ color: 'var(--color-text-primary)' }}
+                            className={cn(
+                              'nav-panel-row w-full text-left',
+                              active && 'nav-panel-row-active',
+                            )}
+                            style={{ paddingLeft: 24 }}
                           >
-                            <span className="flex items-center gap-1.5 min-w-0 truncate">
-                              <Folder
-                                className="h-3.5 w-3.5 shrink-0"
-                                style={{ color: 'var(--color-text-tertiary)' }}
-                              />
-                              <span className="truncate">{ws.name}</span>
+                            <Folder
+                              className="h-4 w-4 shrink-0"
+                              style={{ color: 'var(--color-text-tertiary)' }}
+                            />
+                            <span
+                              className="text-sm font-medium truncate min-w-0 flex-1"
+                              style={{
+                                color: active
+                                  ? 'var(--color-text-primary)'
+                                  : 'var(--color-text-tertiary)',
+                              }}
+                            >
+                              {ws.name}
                             </span>
-                            <span className="flex items-center gap-1.5 shrink-0">
+                            <span className="flex items-center gap-1.5 shrink-0 ml-auto">
                               <span
                                 data-testid={`team-workspace-access-${ws.workspace_id}`}
+                                data-bracket="chip"
                                 className="text-[10px] px-1.5 py-0.5 rounded-full border"
                                 style={{
                                   borderColor: 'var(--color-border-muted)',
@@ -398,7 +428,7 @@ export function TeamWorkspacesSection({
                               </span>
                               {timeLabel && (
                                 <span
-                                  className="text-[11px] shrink-0"
+                                  className="text-[11px] shrink-0 tabular-nums"
                                   style={{ color: 'var(--color-text-tertiary)' }}
                                 >
                                   {timeLabel}
@@ -426,26 +456,25 @@ export function TeamWorkspacesSection({
 export function TeamReadOnlyBanner({
   ownerName,
   access = 'ro',
-  compact = false,
+  compact: _compact = false,
 }: {
   ownerName: string | null;
   access?: TeamAccessMode;
   compact?: boolean;
 }): React.ReactElement {
-  const modeLabel = access === 'rw' ? '可读写' : '只读';
-  const label = `${modeLabel} · 来自 ${ownerName || '同事'}`;
+  const { t } = useTranslation();
+  const modeLabel =
+    access === 'rw' ? t('dalton.sharing.levelRw') : t('dalton.sharing.levelRo');
+  const label = t('dalton.sharing.bannerLabel', {
+    mode: modeLabel,
+    name: ownerName || t('dalton.sharing.colleagueFallback'),
+  });
   return (
     <div
       data-testid="team-readonly-banner"
       role="status"
-      className={`inline-flex items-center gap-1.5 rounded-full border ${
-        compact ? 'px-2.5 py-0.5 text-xs' : 'px-3 py-1 text-xs'
-      }`}
-      style={{
-        borderColor: 'var(--color-border-muted)',
-        backgroundColor: 'var(--color-bg-subtle, rgba(128,128,128,0.08))',
-        color: 'var(--color-text-secondary)',
-      }}
+      className={TOOLBAR_CHIP_CLASS}
+      style={toolbarChipStyle('neutral')}
     >
       <Lock className="h-3 w-3 shrink-0" />
       <span>{label}</span>
@@ -471,46 +500,51 @@ export function TeamReadOnlyComposer({
   colleagueDispatchEnabled?: boolean;
 }): React.ReactElement {
   const { t } = useTranslation();
+  const name = ownerName || t('dalton.sharing.colleagueFallback');
   const label = revoked
     ? t('dalton.sharing.revokedThreadReadonlyHint')
     : dispatchedByName
       ? t('dalton.sharing.dispatchedThreadReadonlyHint', { name: dispatchedByName })
       : access === 'rw'
         ? colleagueDispatchEnabled
-          ? `可读写（文件） · 来自 ${ownerName || '同事'}（仅对话创建者可继续提问）`
-          : `可读写（文件） · 来自 ${ownerName || '同事'}（发送消息与派活：该功能下一期开放）`
-        : `只读 · 来自 ${ownerName || '同事'}（无法发送消息或新建对话）`;
+          ? t('dalton.sharing.rwDispatchReadonlyHint', { name })
+          : t('dalton.sharing.rwReadonlyHint', { name })
+        : t('dalton.sharing.roReadonlyHint', { name });
   const buttonTitle =
-    access === 'rw' && !colleagueDispatchEnabled ? '该功能下一期开放' : '只读模式下不可发送';
+    access === 'rw' && !colleagueDispatchEnabled
+      ? t('dalton.sharing.rwSendDisabledTitle')
+      : t('dalton.sharing.readonlySendTitle');
   return (
     <div
       data-testid="team-readonly-composer"
-      className="w-full rounded-xl border px-3 py-2.5 flex items-center justify-between gap-2 opacity-75"
+      className="w-full rounded-[var(--cs-composer-radius,var(--radius-xl))] border px-3 py-2.5 flex items-center justify-between gap-2 opacity-75"
       style={{
         borderColor: 'var(--color-border-muted)',
-        backgroundColor: 'var(--color-bg-input, rgba(128,128,128,0.05))',
+        backgroundColor: 'var(--color-bg-input)',
       }}
     >
-      <input
+      <Input
         type="text"
         disabled
         readOnly
         value=""
         placeholder={label}
-        aria-label="只读模式输入框"
-        className="flex-1 bg-transparent text-xs border-none outline-none cursor-not-allowed"
+        aria-label={t('dalton.sharing.readonlyInputLabel')}
+        className="flex-1 h-auto bg-transparent text-xs border-0 px-0 py-0 shadow-none focus-visible:ring-0 disabled:opacity-100 cursor-not-allowed"
         style={{ color: 'var(--color-text-tertiary)' }}
       />
-      <button
+      <Button
         type="button"
+        variant="ghost"
+        size="icon"
         disabled
-        aria-label="发送"
+        aria-label={t('dalton.sharing.sendLabel')}
         title={buttonTitle}
-        className="p-1.5 rounded-md cursor-not-allowed opacity-50"
+        className="h-auto w-auto p-1.5 rounded-md cursor-not-allowed opacity-50"
         style={{ color: 'var(--color-text-tertiary)' }}
       >
         <Send className="h-3.5 w-3.5" />
-      </button>
+      </Button>
     </div>
   );
 }

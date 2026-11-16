@@ -61,10 +61,10 @@ describe('PublishApprovalCard', () => {
 
     expect(screen.getByTestId('publish-approval-card')).toBeInTheDocument();
     expect(screen.getByTestId('publish-labeling-incomplete-warning')).toHaveTextContent(
-      '标注未完成，口语数字和指标可能未核验'
+      '部分数字标注未完成，正文中的口语化数字与指标可能未核验'
     );
     expect(
-      screen.getByText('42 已核实 · 0 冲突 · 0 未核实 · 2 未能判断 · 3 豁免')
+      screen.getByText('42 已核实 · 0 冲突 · 0 未核实 · 2 待复核 · 3 豁免')
     ).toBeInTheDocument();
     expect(screen.getByTestId('publish-uncertain-items')).toBeInTheDocument();
     expect(screen.getByText('88.8%')).toBeInTheDocument();
@@ -172,9 +172,9 @@ describe('PublishApprovalCard', () => {
       '已标注 50 / 50 个数字'
     );
 
-    // 2. Verified breakdown (footnote / LLM judge / derived)
+    // 2. Verified breakdown (footnote / AI semantic check / derived)
     expect(screen.getByTestId('publish-verified-breakdown')).toHaveTextContent(
-      '脚注 30 · LLM 判断 10 · 推算 5'
+      '脚注 30 · AI 语义核对 10 · 推算 5'
     );
 
     // 3. Incidental collapsible list (collapsed initially, expands on click, shows category + sentence)
@@ -290,13 +290,13 @@ describe('PublishApprovalCard', () => {
       'Batch 2 (figures 21–40) labeling failed'
     );
     expect(screen.getByTestId('publish-failed-batch-details')).toHaveTextContent(
-      'Batch 3 (colloquial figure scan) labeling failed'
+      'Batch 3 (colloquial phrasing figure scan) labeling failed'
     );
     fireEvent.click(screen.getByTestId('publish-incidental-toggle'));
     expect(screen.getByTestId('publish-incidental-list')).toHaveTextContent('[Uncategorized]');
     expect(screen.getByTestId('publish-incidental-list')).not.toHaveTextContent('[增速]');
     expect(
-      screen.getByText('Official Research Publication Approval (PM Final Review)')
+      screen.getByText('Official Research Publication Final Review')
     ).toBeInTheDocument();
   });
 
@@ -339,11 +339,11 @@ describe('PublishApprovalCard', () => {
     render(<PublishApprovalCard data={state} />);
 
     expect(screen.getByTestId('publish-derived-incomplete-warning')).toHaveTextContent(
-      '派生匹配因超时未完成：部分本可由派生关系核实的数字仍显示为未核实'
+      '部分推算指标核对超时，请人工留意未核实数字'
     );
     // Labeling itself completed: the labeling-incomplete line stays absent.
     expect(screen.getByTestId('publish-labeling-incomplete-warning')).not.toHaveTextContent(
-      '标注未完成'
+      '部分数字标注未完成'
     );
   });
 });

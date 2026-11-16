@@ -101,6 +101,8 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
           {dispatchedBy && (
             <span
               data-testid="thread-dispatched-by-badge"
+              // DALTON-HOOK(ui-unify): bracketed chip in Terminal style
+              data-bracket="chip"
               className="text-[11px] px-1.5 py-0.5 rounded-full border shrink-0"
               style={{
                 borderColor: 'var(--color-border-muted)',

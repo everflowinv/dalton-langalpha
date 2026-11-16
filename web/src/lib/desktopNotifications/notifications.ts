@@ -5,6 +5,7 @@
  * timers and the bridge.
  */
 import type { QueryClient } from '@tanstack/react-query';
+import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(ui-unify)
 import type { AttentionThread, DesktopNotification, DesktopNotificationKind } from '@/lib/desktop';
 import { queryKeys } from '@/lib/queryKeys';
 import { TERMINAL_FAMILY, type PublicRunStatus } from '@/lib/threadLifecycle/store';
@@ -63,7 +64,7 @@ export function threadPath(threadId: string): string {
 }
 
 /** The server words every notification; this is only for one it sent without a title. */
-const FALLBACK_TITLE = 'LangAlpha';
+const FALLBACK_TITLE = BRAND_NAME; // DALTON-HOOK(ui-unify)
 
 /**
  * One per thread (the id is the thread's), so a background run's start is

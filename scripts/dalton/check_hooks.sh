@@ -409,6 +409,10 @@ ALLOWED_HOOKS=(
   # AlphaEngine search cache: per-request caller identity across supervisor/bash
   # (mcp_client_runtime.py, supervisor_runtime/{protocol,daemon}.py, bash.py).
   "alphaengine-cache"
+  # UI & copy unification outside Settings (Round 1): brand interpolation,
+  # analyst-friendly copy, and Quiet Workspace primitives/tokens across ChatAgent,
+  # Automations, Dashboard, CommandPalette, and Dalton components.
+  "ui-unify"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

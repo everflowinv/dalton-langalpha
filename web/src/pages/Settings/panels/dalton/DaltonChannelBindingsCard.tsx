@@ -22,7 +22,7 @@ import {
   DaltonRefreshButton,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 type BindPlatform = Extract<DaltonChannelPlatform, 'feishu' | 'discord'>;
 

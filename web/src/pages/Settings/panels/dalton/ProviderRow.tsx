@@ -15,7 +15,7 @@ import {
   DaltonItemRow,
   DaltonStatusBadge,
   type DaltonStatusTone,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 const ROLE_LABELS: Record<string, string> = {
   lead: 'dalton.providers.roles.lead',

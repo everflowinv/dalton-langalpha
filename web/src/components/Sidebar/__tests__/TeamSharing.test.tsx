@@ -412,6 +412,12 @@ describe('Dalton Team Sharing', () => {
   });
 
   it('groups team workspaces by colleague and collapses each colleague group by default', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
     const queryClient = createTestQueryClient();
     queryClient.setQueryData(queryKeys.workspaces.team(), SAMPLE_TEAM_RESPONSE);
 
@@ -458,7 +464,13 @@ describe('Dalton Team Sharing', () => {
     expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
   });
 
-  it('enters read-only mode on colleague workspace and disables write operations', () => {
+  it('enters read-only mode on colleague workspace and disables write operations', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
     const queryClient = createTestQueryClient();
     queryClient.setQueryData(queryKeys.workspaces.team(), SAMPLE_TEAM_RESPONSE);
     queryClient.setQueryData(queryKeys.user.me(), {
@@ -503,7 +515,7 @@ describe('Dalton Team Sharing', () => {
     );
 
     expect(screen.getByTestId('team-readonly-banner')).toHaveTextContent(
-      '只读 · 来自 Richard Lu',
+      '仅可读 · 来自 Richard Lu',
     );
     const input = screen.getByLabelText('只读模式输入框') as HTMLInputElement;
     const sendBtn = screen.getByRole('button', { name: '发送' }) as HTMLButtonElement;
@@ -1201,7 +1213,13 @@ describe('Dalton Team Sharing', () => {
     }
   });
 
-  it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', () => {
+  it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
     const queryClient = createTestQueryClient();
     const teamWithLevels: TeamWorkspacesResponse = {
       caller_tier: 'internal',
@@ -1305,7 +1323,7 @@ describe('Dalton Team Sharing', () => {
       queryClient,
     });
     fireEvent.click(screen.getByTestId('team-member-toggle-u-richard'));
-    expect(screen.getByTestId('team-workspace-access-ws-ro-1')).toHaveTextContent('只读');
+    expect(screen.getByTestId('team-workspace-access-ws-ro-1')).toHaveTextContent('仅可读');
     expect(screen.getByTestId('team-workspace-access-ws-rw-1')).toHaveTextContent('可读写');
   });
 
@@ -1384,24 +1402,24 @@ describe('Dalton Team Sharing', () => {
     );
     expect(screen.getByText('别人的网页界面')).toBeInTheDocument();
     expect(screen.getByTestId('sharing-home-note')).toHaveTextContent(
-      'Home 工作区始终不对他人开放',
+      '总控工作区（研究总监）始终不对他人开放',
     );
 
-    const webRw = screen.getByTestId('sharing-web-rw') as HTMLInputElement;
-    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
-    const webHidden = screen.getByTestId('sharing-web-hidden') as HTMLInputElement;
+    const webRw = screen.getByTestId('sharing-web-rw');
+    const webRo = screen.getByTestId('sharing-web-ro');
+    const webHidden = screen.getByTestId('sharing-web-hidden');
 
-    expect(webHidden.checked).toBe(true);
-    expect(webRw.checked).toBe(false);
-    expect(webRo.checked).toBe(false);
+    expect(webHidden).toHaveAttribute('aria-pressed', 'true');
+    expect(webRw).toHaveAttribute('aria-pressed', 'false');
+    expect(webRo).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(webRw);
-    expect(webRw.checked).toBe(true);
+    expect(webRw).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByTestId('sharing-web-rw-warning')).toHaveTextContent(
       '同事在这里提问会在你的计算机上运行，等于信任这台计算机',
     );
     fireEvent.click(webRo);
-    expect(webRo.checked).toBe(true);
+    expect(webRo).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByTestId('sharing-web-rw-warning')).toBeNull();
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
 
@@ -1563,9 +1581,9 @@ describe('Dalton Team Sharing', () => {
     expect(screen.queryByTestId('sharing-cos-settings-hint')).toBeNull();
     expect(screen.getByTestId('sharing-web-fieldset')).toBeInTheDocument();
 
-    const webRo = screen.getByTestId('sharing-web-ro') as HTMLInputElement;
+    const webRo = screen.getByTestId('sharing-web-ro');
     fireEvent.click(webRo);
-    expect(webRo.checked).toBe(true);
+    expect(webRo).toHaveAttribute('aria-pressed', 'true');
 
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
     await waitFor(() => {
@@ -1737,7 +1755,13 @@ describe('Dalton Team Sharing', () => {
     expect(colleagueFlags.current.isUnseen).toBe(false);
   });
 
-  it('disables chat composer on web_access=rw colleague workspace when colleague_dispatch_enabled is false, and enables it when true', () => {
+  it('disables chat composer on web_access=rw colleague workspace when colleague_dispatch_enabled is false, and enables it when true', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
     const queryClient = createTestQueryClient();
     queryClient.setQueryData(queryKeys.user.me(), {
       user_id: 'u-chao',
@@ -1793,7 +1817,7 @@ describe('Dalton Team Sharing', () => {
     expect(screen.getByTestId('team-readonly-composer')).toBeInTheDocument();
     const disabledInput = screen.getByLabelText('只读模式输入框') as HTMLInputElement;
     expect(disabledInput.disabled).toBe(true);
-    expect(disabledInput.placeholder).toContain('发送消息与派活：该功能下一期开放');
+    expect(disabledInput.placeholder).toContain('同事可浏览和修改本工作区文件');
     unmountOff();
 
     // 2. Master switch ON (colleague_dispatch_enabled: true) -> writable composer enabled on __default__

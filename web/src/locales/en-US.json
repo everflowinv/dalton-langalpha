@@ -5,7 +5,7 @@
       "title": "A new version is available",
       "description": "Reload now to update. Your agents keep working.",
       "blockedTitle": "This page needs a reload",
-      "blockedDescription": "LangAlpha was updated while this tab was open. Reload to continue.",
+      "blockedDescription": "{{brand}} was updated while this tab was open. Reload to continue.",
       "reload": "Reload"
     },
     "networkBanner": {
@@ -91,8 +91,8 @@
     "confirming": "Confirming your email…",
     "confirmedSigningIn": "Email confirmed — signing you in…",
     "confirmError": "This link is invalid or has expired.",
-    "shellHandoffTitle": "Opening LangAlpha…",
-    "shellHandoffBody": "We handed this link to the LangAlpha app so you finish signing in there.",
+    "shellHandoffTitle": "Opening {{brand}}…",
+    "shellHandoffBody": "We handed this link to the {{brand}} app so you finish signing in there.",
     "shellHandoffFallback": "Continue in this browser",
     "requestNewLink": "Request a new link",
     "confirmPassword": "Confirm password",
@@ -557,7 +557,7 @@
     "codexStep3Desc": "Once approved, we'll automatically detect it and connect your account. No copy-pasting needed.",
     "codexSecurityTitle": "Security & Privacy",
     "codexSecurityDesc": "Your OAuth tokens are encrypted at rest and only decrypted when making API calls on your behalf. We never store your OpenAI password, and you can disconnect at any time to revoke access.",
-    "codexDisclaimerDesc": "Ginlix is not affiliated with, endorsed by, or sponsored by OpenAI. By proceeding, you connect your ChatGPT subscription at your own discretion and responsibility. Usage is subject to OpenAI's Terms of Service.",
+    "codexDisclaimerDesc": "{{brand}} is not affiliated with, endorsed by, or sponsored by OpenAI. By proceeding, you connect your ChatGPT subscription at your own discretion and responsibility. Usage is subject to OpenAI's Terms of Service.",
     "codexProceed": "Proceed to Connect",
     "codexWaitingApproval": "Waiting for approval...",
     "codexEnterCode": "and enter this code:",
@@ -580,7 +580,7 @@
     "claudeStep3Desc": "Paste the code into the input field to complete the connection.",
     "claudeSecurityTitle": "Security & Privacy",
     "claudeSecurityDesc": "Your tokens are encrypted at rest and only decrypted when making API calls on your behalf. You can disconnect at any time to revoke access.",
-    "claudeDisclaimerDesc": "Ginlix is not affiliated with, endorsed by, or sponsored by Anthropic. By proceeding, you connect your Anthropic subscription at your own discretion and responsibility. Usage is subject to Anthropic's Terms of Service.",
+    "claudeDisclaimerDesc": "{{brand}} is not affiliated with, endorsed by, or sponsored by Anthropic. By proceeding, you connect your Anthropic subscription at your own discretion and responsibility. Usage is subject to Anthropic's Terms of Service.",
     "claudeProceed": "Open claude.ai",
     "claudePastePrompt": "After authorizing on claude.ai, paste the code shown on the page below:",
     "claudePasteError": "Failed to exchange code. Please try again.",
@@ -843,8 +843,8 @@
       "shortcutError": "Could not use this shortcut: {{error}}",
       "startupGroup": "Startup",
       "openAtLogin": "Open at login",
-      "openAtLoginDesc": "Start LangAlpha in the background when you sign in to this computer.",
-      "openAtLoginWindowDesc": "Open LangAlpha when you sign in to this computer. With the icon on, it starts in the background instead.",
+      "openAtLoginDesc": "Start {{brand}} in the background when you sign in to this computer.",
+      "openAtLoginWindowDesc": "Open {{brand}} when you sign in to this computer. With the icon on, it starts in the background instead.",
       "keepRunning": "Keep running in the tray when closed",
       "keepRunningDesc": "Closing the window leaves notifications and the tray icon running.",
       "unavailable": "The desktop app did not answer. Restart it and try again."
@@ -1470,7 +1470,7 @@
       "conversation": {
         "title": "Workbench",
         "description": "A chat-first console: greeting, live chat input, and one-click resume.",
-        "placeholder": "Put {{brand}} to work — a ticker to unpack, a filing to parse, a thesis to stress-test…",
+        "placeholder": "Put the research assistant to work — a ticker to unpack, a filing to parse, a thesis to stress-test…",
         "resume": "Resume",
         "untitledThread": "Untitled thread",
         "greetingLate": "Up late",
@@ -1786,7 +1786,7 @@
     "openWorkspace": "Open Workspace",
     "fileTooLarge": "{{name}} is too large to upload ({{size}} MB).",
     "cosWorksOn": "Works on",
-    "cosComputerHint": "{{name}} works on your primary computer, in a Home folder beside your workspaces. Make another computer primary and it moves there."
+    "cosComputerHint": "{{name}} works on your primary computer, in its dedicated folder beside your workspaces. Make another computer primary and it moves there."
   },
   "computer": {
     "computers": "Computers",
@@ -1876,9 +1876,9 @@
     "removeTitle": "Remove {{name}}?",
     "removeBody": "Its sandbox and everything on its disk are deleted. This can't be undone.",
     "removeBodyOwnMachine": "We stop using this machine and remove what we set up there for it. Your files in {{folder}} stay.",
-    "removeBodyOwnMachineDelete": "We stop using this machine and delete what LangAlpha put there.",
-    "alsoDeleteFiles": "Also delete LangAlpha's files from this machine",
-    "alsoDeleteFilesHint": "Deletes {{folder}}, its workspaces' folders included, and LangAlpha's runtime in ~/.langalpha (about 3 GB) unless another computer uses it. Files you put in {{folder}} yourself stay. The machine has to be connected.",
+    "removeBodyOwnMachineDelete": "We stop using this machine and delete what {{brand}} put there.",
+    "alsoDeleteFiles": "Also delete {{brand}}'s files from this machine",
+    "alsoDeleteFilesHint": "Deletes {{folder}}, its workspaces' folders included, and {{brand}}'s runtime in ~/.langalpha (about 3 GB) unless another computer uses it. Files you put in {{folder}} yourself stay. The machine has to be connected.",
     "filesDeleted": "Its files were deleted from the machine.",
     "filesRootKept": "{{folder}} stays, since it holds files of yours.",
     "filesRuntimeKept": "~/.langalpha stays, since another computer uses it.",
@@ -2028,7 +2028,7 @@
       "previewLabel": "Preview",
       "previewNotice": "Connecting your own machine is new, so use it with care. The agent can do anything the account you connect can do, so connect an account made for it rather than your own.",
       "pairIntro": "Run this on the machine you are adding (Linux or macOS), as the user the agent should work as:",
-      "pairIntroLocal": "Run this in a terminal on the computer running LangAlpha, as the user the agent should work as. To add another machine, set it up by hand.",
+      "pairIntroLocal": "Run this in a terminal on the computer running {{brand}}, as the user the agent should work as. To add another machine, set it up by hand.",
       "pairLoading": "Getting your command...",
       "viewScript": "View script",
       "waiting": "Waiting for your machine...",
@@ -2089,24 +2089,24 @@
     },
     "remoteControl": {
       "cardTitle": "This Mac",
-      "cardDesc": "Works even with LangAlpha closed",
+      "cardDesc": "Works even with {{brand}} closed",
       "alreadyAdded": "Already added",
       "title": "Remote control of this Mac",
-      "intro": "LangAlpha's agent will work on this Mac as {{account}}, with everything that account can do.",
+      "intro": "{{brand}}'s agent will work on this Mac as {{account}}, with everything that account can do.",
       "meansLabel": "What it means",
       "meansAccess": "It can run any command and read or change any file {{account}} can, in any folder. Its work stays in the folder you pick, but nothing on this Mac holds it there.",
-      "meansBackground": "It keeps working after you close LangAlpha. Remote control runs in the background and starts again when you log in, until you turn it off.",
+      "meansBackground": "It keeps working after you close {{brand}}. Remote control runs in the background and starts again when you log in, until you turn it off.",
       "meansCredentials": "It can read what command line tools keep for {{account}}, such as Git and cloud sign-ins, and reach your home or office network.",
-      "meansAccount": "Anyone who signs in to your LangAlpha account can direct it.",
+      "meansAccount": "Anyone who signs in to your {{brand}} account can direct it.",
       "stopLabel": "Stopping it",
-      "stop": "Pause it any time from the LangAlpha menu, or in System Settings under General, Login Items. Removing this computer in LangAlpha turns it off and deletes its keys from this Mac.",
-      "folderPrompts": "macOS may ask whether LangAlpha can open folders such as Documents or Desktop. You can say no: the agent's own folder does not need it.",
+      "stop": "Pause it any time from the {{brand}} menu, or in System Settings under General, Login Items. Removing this computer in {{brand}} turns it off and deletes its keys from this Mac.",
+      "folderPrompts": "macOS may ask whether {{brand}} can open folders such as Documents or Desktop. You can say no: the agent's own folder does not need it.",
       "previewNotice": "Remote control is in preview while we build more safeguards. Until then the agent has the same access you do, so turn it on only on a Mac where that is all right.",
-      "acknowledge": "I understand LangAlpha's agent can run commands and change files on this Mac as {{account}}.",
+      "acknowledge": "I understand {{brand}}'s agent can run commands and change files on this Mac as {{account}}.",
       "turnOn": "Turn on remote control",
       "turningOn": "Turning on remote control…",
       "connecting": "Connecting this Mac…",
-      "needsApproval": "macOS needs your OK. In System Settings, under General, Login Items, allow LangAlpha in the background, then continue.",
+      "needsApproval": "macOS needs your OK. In System Settings, under General, Login Items, allow {{brand}} in the background, then continue.",
       "continue": "Continue",
       "tryAgain": "Try again",
       "failed": "Couldn't turn on remote control. Try again.",
@@ -2116,7 +2116,7 @@
       "asAccount": "as {{account}}",
       "notConnected": "Not connected",
       "pairedElsewhere": "Connected to another account",
-      "paused": "Remote control is paused. Resume it from the LangAlpha menu.",
+      "paused": "Remote control is paused. Resume it from the {{brand}} menu.",
       "removeTurnsOff": "Remote control on this Mac turns off too.",
       "cardTitlePc": "This PC",
       "windowsSoon": "Windows support is coming soon",
@@ -2146,7 +2146,7 @@
       "reconnect": "Reconnect…"
     },
     "restartRefused": {
-      "folderMarked": "That folder is another computer's, possibly one from another LangAlpha account or server.",
+      "folderMarked": "That folder is another computer's, possibly one from another {{brand}} account or server.",
       "folderOwned": "Another of your computers works in that folder. Remove it to free the folder.",
       "notStopped": "This computer is starting or running. Try again once it has stopped.",
       "specInProgress": "A spec change is running on this computer. Try again once it finishes.",
@@ -2160,7 +2160,7 @@
       "folderLabel": "Folder",
       "takeBack": "Take the folder back",
       "takeBackDesc": "Keep using {{folder}}. If another computer works in it now, that computer stops working on this machine. The files in the folder stay.",
-      "takeBackOwned": "Keep using {{folder}}. Another computer works in it now, possibly one from another LangAlpha account or server. That computer stops working on this machine. The files in the folder stay.",
+      "takeBackOwned": "Keep using {{folder}}. Another computer works in it now, possibly one from another {{brand}} account or server. That computer stops working on this machine. The files in the folder stay.",
       "newFolder": "Use a new folder",
       "newFolderDesc": "Start again in another folder on this machine. The old folder is left as it is.",
       "newFolderLabel": "New folder",
@@ -2178,8 +2178,8 @@
       "desc": "Connect this computer to its machine again. Its folder and workspaces stay as they are.",
       "pairIntro": "Run this on the machine, as {{username}}:",
       "folderKept": "Workspaces stay in {{folder}}.",
-      "onThatMac": "{{name}} is connected by the LangAlpha app on its Mac. Open LangAlpha on that Mac and choose Reconnect there.",
-      "otherMac": "This Mac is already {{other}}. To reconnect {{name}}, open LangAlpha on the Mac it runs on and choose Reconnect there.",
+      "onThatMac": "{{name}} is connected by the {{brand}} app on its Mac. Open {{brand}} on that Mac and choose Reconnect there.",
+      "otherMac": "This Mac is already {{other}}. To reconnect {{name}}, open {{brand}} on the Mac it runs on and choose Reconnect there.",
       "takeBackNote": "{{folder}} is this computer's folder. Taking it back stops the other computer working there. The files in it stay.",
       "submit": "Reconnect",
       "submitting": "Reconnecting...",
@@ -3001,7 +3001,7 @@
       "claudeCodeCliComputerOffline": "{{name}} is offline",
       "claudeCodeNeedsBiggerComputer": "Needs a Medium or larger cloud computer, or a computer of your own",
       "claudeCodeNeedsBiggerComputerHome": "Needs a Medium or larger cloud computer",
-      "claudeCodeNeedsBiggerComputerPlan": "Needs a Medium or larger cloud computer: change its spec or upgrade your LangAlpha plan, or use a computer of your own",
+      "claudeCodeNeedsBiggerComputerPlan": "Needs a Medium or larger cloud computer: change its spec or upgrade your {{brand}} plan, or use a computer of your own",
       "claudeCodeNeedsMedium": "Needs a Medium or larger cloud computer. Select to change its spec.",
       "claudeCodeNeedsMediumPlan": "Needs a Medium or larger cloud computer, which isn't on your plan. Select to upgrade.",
       "claudeCodeNeedsMediumResizing": "Its computer is changing to Medium."
@@ -3148,8 +3148,8 @@
         "choice_changed": "How Claude Code runs on cloud computers changed as this turn started. Send your message again.",
         "needs_bigger_computer": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec, or move this workspace to a computer of your own.",
         "needs_bigger_computer_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec.",
-        "needs_bigger_computer_plan": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec or upgrade your LangAlpha plan, or choose to run Claude Code on your own computers in Settings under Model access.",
-        "needs_bigger_computer_plan_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec or upgrade your LangAlpha plan, or choose to run Claude Code on your own computers in Settings under Model access."
+        "needs_bigger_computer_plan": "Claude Code runs on Medium or larger cloud computers, and this workspace's computer is smaller. Change its spec or upgrade your {{brand}} plan, or choose to run Claude Code on your own computers in Settings under Model access.",
+        "needs_bigger_computer_plan_home": "Claude Code runs on Medium or larger cloud computers, and Home's computer is smaller. Change its spec or upgrade your {{brand}} plan, or choose to run Claude Code on your own computers in Settings under Model access."
       }
     }
   },
@@ -3729,11 +3729,11 @@
     "fieldDelivery": "Delivery",
     "fieldEnabled": "Enabled",
     "fieldPaused": "Paused",
-    "fieldCosMode": "Collaboration mode",
-    "fieldNotifyStorage": "Notification storage",
+    "fieldCosMode": "Execution mode",
+    "fieldNotifyStorage": "Notification channel storage",
     "fieldStatus": "Status",
     "once": "Once",
-    "cronHelp": "5-field cron: minute hour day-of-month month day-of-week",
+    "cronHelp": "Schedule pattern (5 space-separated fields): minute hour day month weekday",
     "agentMode": "Agent",
     "selectWorkspace": "Select workspace...",
     "instruction": "Instruction",
@@ -3799,7 +3799,7 @@
     "freqMinutes": "Every N minutes",
     "freqHourly": "Hourly",
     "freqMonthly": "Monthly",
-    "freqCustom": "Custom cron",
+    "freqCustom": "Custom schedule rule",
     "every": "every",
     "atMinute": "at minute",
     "atTime": "at",
@@ -3814,7 +3814,7 @@
     "newAutomation": "New automation",
     "blankAutomation": "Blank automation",
     "fromTemplate": "From a template",
-    "tagline": "Run the agent on a schedule, or when a price moves.",
+    "tagline": "Run scheduled analysis automatically, or trigger alerts and research on price moves.",
     "startFrom": "Start from",
     "blankAutomationDesc": "Write the instruction and choose when it runs.",
     "cadencePrice": "on a price move",
@@ -3894,8 +3894,8 @@
     "scriptStatus": "Status",
     "scriptNextRun": "Next run",
     "scriptLastRun": "Last run",
-    "taskScript": "Script",
-    "taskAgent": "Agent",
+    "taskScript": "Data collection task",
+    "taskAgent": "Research assistant task",
     "stateRunning": "Running",
     "stateWaiting": "Waiting",
     "stateDisabled": "Switched off",
@@ -3919,7 +3919,7 @@
     "waitingNote": "It runs when the turn now running in its thread ends.",
     "skippedThreadBusy": "Skipped because its thread stayed busy.",
     "skippedInterrupted": "Skipped because the server restarted while it waited.",
-    "skippedPrecheck": "Skipped by zero-token preflight (no new signals).",
+    "skippedPrecheck": "No new signals; analysis skipped automatically (no usage consumed).",
     "failedServerError": "The server ran into a problem with this run. Your automation didn't cause it, and nothing needs changing.",
     "failedInterrupted": "The server stopped this run before it finished. Your automation didn't cause it, and nothing needs changing.",
     "skipRun": "Skip",
@@ -4922,7 +4922,7 @@
       "advanced": "Advanced",
       "log": "Log",
       "more": "More",
-      "fourHourNeedsProvider": "4H data requires FMP or Ginlix Data provider",
+      "fourHourNeedsProvider": "Requires a market data provider that supports this timeframe (e.g. FMP)",
       "overlay": "Overlay",
       "toolPercentScale": "Percentage scale",
       "toolMagnet": "Magnet mode",
@@ -5101,15 +5101,15 @@
         },
         "desktopApp": {
           "title": "Get the desktop app",
-          "desc": "LangAlpha in a window of its own, and on a Mac, your Mac as a computer."
+          "desc": "{{brand}} in a window of its own, and on a Mac, your Mac as a computer."
         },
         "remoteControl": {
           "title": "Turn on remote control",
-          "desc": "Let the agent work on this Mac, even with LangAlpha closed."
+          "desc": "Let the agent work on this Mac, even with {{brand}} closed."
         },
         "integrations": {
           "title": "Connect a chat app",
-          "desc": "Talk to {{brand}} from Slack, Telegram, iMessage, and more."
+          "desc": "Talk to the research assistant from Slack, Telegram, iMessage, and more."
         }
       }
     },
@@ -5151,7 +5151,7 @@
       "chat": {
         "greeting": "Hi {{name}}.",
         "greetingNoName": "Hi there.",
-        "intro": "I'm your LangAlpha Chief of Staff. I help you coordinate your AI analysts and manage your workspaces.",
+        "intro": "I'm your {{brand}} Chief of Staff. I help you coordinate your AI analysts and manage your workspaces.",
         "introNext": "First, a few questions about your portfolio and how you invest.",
         "editIntro": "Here's your investing profile. Change any answer, then save.",
         "lead": {
@@ -6083,7 +6083,7 @@
       "disconnectedDesc": "\"{{server}}\" is disconnected. Reconnect anytime; agent calls fail until then.",
       "disconnectedTitle": "Disconnected",
       "loopback": {
-        "no-listener": "LangAlpha could not open a local port to receive this broker's reply. Quit any other copy of the desktop app and try again.",
+        "no-listener": "{{brand}} could not open a local port to receive this broker's reply. Quit any other copy of the desktop app and try again.",
         "not-minted": "This server has not been set up to send the reply back to the desktop app. Try again in a few minutes.",
         "not-bound": "Another connection was started before this one finished. Try connecting again.",
         "shell-outdated": "This version of the desktop app cannot receive the provider's reply. Update the desktop app, then try again."
@@ -7074,7 +7074,7 @@
       "orphanBody": "The subagent these changes were made to no longer exists, so they do nothing. Remove them to clear this.",
       "collisionTitle": "A built-in subagent now has this name",
       "collisionBody": "The agent uses the built-in one. Duplicate this one under a new name to keep using it.",
-      "baseBanner": "Built-in instructions stay current as langalpha improves them. To write your own, start a new subagent from this one.",
+      "baseBanner": "Built-in instructions stay current as {{brand}} improves them. To write your own, start a new subagent from this one.",
       "baseBannerPlugin": "Instructions come from {{plugin}} and change when it updates. To write your own, start a new subagent from this one.",
       "baseBannerDeployment": "Instructions are set by whoever runs this server and change when they update them. To write your own, start a new subagent from this one.",
       "duplicateToEdit": "Duplicate to edit",
@@ -7238,7 +7238,7 @@
     "plan": "{{plan}} plan",
     "claudeCode": "Claude Code",
     "ownKey": "Your key",
-    "credits": "LangAlpha credits",
+    "credits": "{{brand}} credits",
     "serverKey": "Server key",
     "locked": "locked"
   },
@@ -7307,7 +7307,7 @@
       "intro": "Sign in with your ChatGPT account using a short code.",
       "pickNote": "ChatGPT Plus, Pro, Business or Enterprise",
       "need": "A ChatGPT Plus, Pro, Business or Enterprise plan.",
-      "usage": "Usage counts against your ChatGPT plan, not your LangAlpha credits.",
+      "usage": "Usage counts against your ChatGPT plan, not your {{brand}} credits.",
       "usageOss": "Usage counts against your ChatGPT plan.",
       "time": "About a minute.",
       "consent": "I'm connecting my own ChatGPT account. Usage counts against my ChatGPT plan, and my sign-in is stored encrypted.",
@@ -7349,7 +7349,7 @@
       "moreActions": "More actions",
       "addTitle": "Add a setup token",
       "replaceTitle": "Replace setup token",
-      "separate": "LangAlpha keeps this token encrypted.",
+      "separate": "{{brand}} keeps this token encrypted.",
       "stepInstall": "Install Claude Code if you don't have it yet.",
       "installLink": "Install guide",
       "stepRun": "In a terminal, on this computer or any other, run:",
@@ -7369,7 +7369,7 @@
         "redis_unavailable": "Saving a token isn't available right now. Try again in a moment.",
         "computer_not_found": "This computer isn't available anymore.",
         "needs_perl": "Claude Code needs perl on this computer. Install perl, then try again.",
-        "computer_unsupported": "This computer runs musl (for example Alpine Linux), which LangAlpha's runtime doesn't support yet.",
+        "computer_unsupported": "This computer runs musl (for example Alpine Linux), which {{brand}}'s runtime doesn't support yet.",
         "cli_unavailable": "Couldn't set up Claude Code on this computer. Try again.",
         "write_failed": "Couldn't save the token on this computer. Try again.",
         "unknown": "Couldn't save the token. Try again."
@@ -7384,7 +7384,7 @@
       "expired": "This token expired by <date>{{date}}</date>. Add a new one to keep using Claude Code.",
       "expiresSoon": "This token expires by <date>{{date}}</date>. Add a new one before then so Claude Code keeps running.",
       "signIn": {
-        "intro": "Sign in to Claude, and LangAlpha makes the token for you.",
+        "intro": "Sign in to Claude, and {{brand}} makes the token for you.",
         "start": "Sign in with Claude",
         "codeHint": "After you approve, Claude shows a code. Copy all of it and paste it here.",
         "fieldLabel": "Code from Claude",
@@ -7393,7 +7393,7 @@
           "unavailable": "Claude Code isn't on for your account. Turn it on in Settings, under Model access.",
           "computer_not_found": "This computer isn't available anymore.",
           "needs_perl": "Claude Code needs perl on this computer. Install perl, then try again.",
-          "computer_unsupported": "This computer runs musl (for example Alpine Linux), which LangAlpha's runtime doesn't support yet.",
+          "computer_unsupported": "This computer runs musl (for example Alpine Linux), which {{brand}}'s runtime doesn't support yet.",
           "cli_unavailable": "Couldn't set up Claude Code on this computer. Send the code again.",
           "write_failed_spent": "Couldn't save the token on this computer, and the code can't be used again. Sign in again.",
           "redis_unavailable": "Signing in isn't available right now. Try again in a moment.",
@@ -7405,14 +7405,14 @@
           "check_unavailable": "Couldn't reach Claude to check the token. Send the code again.",
           "check_unavailable_spent": "Couldn't reach Claude to check the token, and the code can't be used again. Sign in again.",
           "token_rejected": "Claude made a token but refused a request on it. Your Claude plan may not include Claude Code.",
-          "unexpected_grant": "Claude answered in a way LangAlpha didn't expect. Sign in again.",
+          "unexpected_grant": "Claude answered in a way {{brand}} didn't expect. Sign in again.",
           "check_in_progress": "A token is already being checked. Wait a moment, then try again.",
           "unknown": "Couldn't finish signing in. Try again."
         }
       },
       "computer": {
         "separate": "This token stays on {{name}}.",
-        "signInIntro": "Sign in to Claude, and LangAlpha puts a token on {{name}}.",
+        "signInIntro": "Sign in to Claude, and {{brand}} puts a token on {{name}}.",
         "addTitle": "Add a setup token for {{name}}",
         "replaceTitle": "Replace the setup token on {{name}}",
         "removeTitle": "Remove the setup token from {{name}}?",
@@ -7421,13 +7421,13 @@
         "ownToken": "Uses its own token",
         "savedToken": "Uses your saved token",
         "noToken": "No setup token for this computer yet",
-        "policyBlocked": "Your organization's Claude Code policy is installed on this computer, so LangAlpha can't run Claude Code here.",
+        "policyBlocked": "Your organization's Claude Code policy is installed on this computer, so {{brand}} can't run Claude Code here.",
         "savedRejected": "Claude refused your saved token. It may have expired or been revoked.",
         "offline": "This computer isn't running, so its token can't be checked.",
         "addOwn": "Add its own token",
         "checking": "Asking Claude whether its token works",
         "clis": "Claude Code agents at once",
-        "clisHelp": "How many Claude Code agents this computer runs at the same time, subagents included. Above 4, LangAlpha opens a second connection to it."
+        "clisHelp": "How many Claude Code agents this computer runs at the same time, subagents included. Above 4, {{brand}} opens a second connection to it."
       },
       "optOut": {
         "saved": "Claude Code is off, but your setup token is still saved.",
@@ -7437,24 +7437,24 @@
       "hosted": {
         "heading": "Where Claude Code runs",
         "local": "On your own computers",
-        "localDetail": "A computer of yours runs it, with a setup token LangAlpha doesn't keep.",
-        "stored": "On cloud computers, with your setup token stored by LangAlpha",
-        "storedDetail": "Medium or larger cloud computers run it. LangAlpha keeps your setup token encrypted.",
+        "localDetail": "A computer of yours runs it, with a setup token {{brand}} doesn't keep.",
+        "stored": "On cloud computers, with your setup token stored by {{brand}}",
+        "storedDetail": "Medium or larger cloud computers run it. {{brand}} keeps your setup token encrypted.",
         "paused": "Paused on cloud computers on this server. It still runs on your own computers.",
         "blocked": "Storing a setup token isn't available for your account. Claude Code still runs on your own computers."
       },
       "consent": {
-        "title": "Let LangAlpha store your setup token?",
-        "encrypted": "LangAlpha keeps your token encrypted and uses it only to run Claude Code for your threads. For each turn, it sends the token to the computer that runs the turn. LangAlpha's servers also use the token to check that it still works.",
+        "title": "Let {{brand}} store your setup token?",
+        "encrypted": "{{brand}} keeps your token encrypted and uses it only to run Claude Code for your threads. For each turn, it sends the token to the computer that runs the turn. {{brand}}'s servers also use the token to check that it still works.",
         "unattended": "Usage counts against your Claude plan, including automations, wakeups and turns another agent sends.",
         "terms": "Anthropic's terms for your Claude plan apply to this use, and you're responsible for following them. Anthropic may limit or suspend accounts that it finds break them.",
-        "undo": "You can switch back at any time, and LangAlpha deletes the token right away.",
+        "undo": "You can switch back at any time, and {{brand}} deletes the token right away.",
         "confirm": "Store my token",
         "termsLink": "Read Anthropic's terms"
       },
       "leaveStored": {
         "title": "Stop storing your setup token?",
-        "body": "LangAlpha deletes it now, and turns using it stop. Computers with their own token aren't affected.",
+        "body": "{{brand}} deletes it now, and turns using it stop. Computers with their own token aren't affected.",
         "confirm": "Delete token",
         "failed": "Couldn't switch. Your token is still stored. Try again."
       },
@@ -7472,8 +7472,8 @@
         "turnOn": "Turn on Claude Code",
         "mac": {
           "name": "Your Mac, with Remote control",
-          "noteBrowser": "Get the LangAlpha app for Mac, then turn on Remote control in it.",
-          "noteDesktop": "Lets the LangAlpha Agent work on this Mac, where Claude Code then runs.",
+          "noteBrowser": "Get the {{brand}} app for Mac, then turn on Remote control in it.",
+          "noteDesktop": "Lets the {{brand}} Agent work on this Mac, where Claude Code then runs.",
           "getApp": "Get the Mac app",
           "turnOn": "Turn on Remote control"
         },
@@ -7495,8 +7495,8 @@
           "titleMany": "Your computers are offline",
           "body": "You can sign in to Claude here once it's back online.",
           "bodyMany": "You can sign in to Claude here once one is back online.",
-          "helper": "Open LangAlpha on this Mac and check that Remote control is on.",
-          "ssh": "Check that it's on and accepts SSH from LangAlpha."
+          "helper": "Open {{brand}} on this Mac and check that Remote control is on.",
+          "ssh": "Check that it's on and accepts SSH from {{brand}}."
         },
         "ready": {
           "title": "Sign in to Claude to start",
@@ -7521,7 +7521,7 @@
         },
         "checking": {
           "title": "Checking your setup tokens",
-          "body": "LangAlpha is asking Claude whether each token works."
+          "body": "{{brand}} is asking Claude whether each token works."
         },
         "refused": {
           "title": "Sign in to Claude again",
@@ -7533,7 +7533,7 @@
           "title": "Turn off Claude Code?",
           "body": "Its models leave your model picker. Setup tokens on your computers stay until you remove them.",
           "confirm": "Turn off",
-          "bodyStored": "Its models leave your model picker, and LangAlpha deletes the token stored for cloud computers."
+          "bodyStored": "Its models leave your model picker, and {{brand}} deletes the token stored for cloud computers."
         },
         "savedName": "Your setup token",
         "savedDetailCloud": "Runs Claude Code on your cloud computers",
@@ -7556,9 +7556,9 @@
     "claude": {
       "name": "Claude",
       "intro": "Sign in on claude.ai, then paste the code it shows you.",
-      "pickNote": "Claude Pro or Max, called by LangAlpha",
+      "pickNote": "Claude Pro or Max, called by {{brand}}",
       "need": "A Claude Pro or Max plan.",
-      "usage": "Usage counts against your Claude plan, not your LangAlpha credits.",
+      "usage": "Usage counts against your Claude plan, not your {{brand}} credits.",
       "usageOss": "Usage counts against your Claude plan.",
       "time": "About a minute.",
       "consent": "I'm connecting my own Claude account. Usage counts against my Claude plan, and my sign-in is stored encrypted.",
@@ -7604,7 +7604,7 @@
       "intro": "Sign in with your Grok account using a short code.",
       "pickNote": "Grok plans that include API access",
       "need": "A Grok plan that includes API access.",
-      "usage": "Usage counts against your Grok plan, not your LangAlpha credits.",
+      "usage": "Usage counts against your Grok plan, not your {{brand}} credits.",
       "usageOss": "Usage counts against your Grok plan.",
       "time": "About a minute.",
       "consent": "I'm connecting my own Grok account. Usage counts against my Grok plan, and my sign-in is stored encrypted.",
@@ -7676,12 +7676,12 @@
       "showAll": "Show all ({{count}} more)",
       "hideAll": "Hide the rest",
       "notTuned": "Not tuned",
-      "notTunedNote": "LangAlpha hasn't tuned these models. They may handle tools or long research less well.",
+      "notTunedNote": "{{brand}} hasn't tuned these models. They may handle tools or long research less well.",
       "known": "Known",
       "filterPlaceholder": "Filter models",
       "searchLabel": "Find a model",
       "searchPlaceholder": "Search by name, e.g. sonnet or qwen",
-      "suggested": "Models LangAlpha knows:",
+      "suggested": "Models {{brand}} knows:",
       "noResults": "No tool-capable model matches \"{{query}}\". Try one of these:",
       "moreResults": "{{count}} more. Narrow the search to see them.",
       "context": "{{size}} context",
@@ -7925,18 +7925,18 @@
       "retireInUseItem": "{{model}}: still in use ({{roles}}), skipped"
     },
     "publish": {
-      "cardTitle": "Official Research Publication Approval (PM Final Review)",
+      "cardTitle": "Official Research Publication Final Review",
       "labelingIncompleteWarning": "Figure labeling incomplete; colloquial figures and metric labels may not be fully verified",
-      "derivedMatchingIncompleteWarning": "Derived-figure matching was skipped after a timeout: some figures it could have verified still show as unverified",
+      "derivedMatchingIncompleteWarning": "Some derived metrics timed out during verification; please review unverified figures manually",
       "failedBatchDetailItem": "Batch {{batch}} (figures {{start}}–{{end}}) labeling failed",
-      "failedBatchColloquialItem": "Batch {{batch}} (colloquial figure scan) labeling failed",
+      "failedBatchColloquialItem": "Batch {{batch}} (colloquial phrasing figure scan) labeling failed",
       "labelingCoverageLabel": "Labeling Coverage",
       "labelingCoverageValue": "Labeled {{labeled}} / {{total}} figures",
       "verifiedBreakdownLabel": "Verified Breakdown",
-      "verifiedBreakdownValue": "Footnote {{footnote}} · LLM Judge {{llm_judge}} · Derived {{derived}}",
+      "verifiedBreakdownValue": "Footnote {{footnote}} · AI Semantic Check {{llm_judge}} · Derived {{derived}}",
       "incidentalHeader": "Incidental / Non-Audited ({{count}})",
       "incidentalCategoryMissing": "Uncategorized",
-      "llmVerifiedHeader": "LLM Judge Verified — Draft vs. Source Quote",
+      "llmVerifiedHeader": "AI Semantic Check Passed — Draft vs. Source Quote",
       "draftSentenceLabel": "Draft Sentence",
       "sourceQuoteLabel": "Source Quote",
       "unverifiedHeader": "Unverified Figures & Candidate Sources",
@@ -7946,14 +7946,31 @@
       "draftLabel": "Draft Path",
       "publishedPathLabel": "Published Path",
       "auditLabel": "Figure Audit",
-      "uncertainHeader": "Uncertain Figures — Handed to PM for Decision",
+      "uncertainHeader": "Needs Manual Review — Uncertain Figures",
       "reviewerLabel": "Independent Review",
       "thesisLabel": "Updates Official Thesis",
       "approveBtn": "Approve & Publish",
       "rejectBtn": "Request Revisions",
       "reasonPlaceholder": "Note or revision reason (optional)",
       "approvedLabel": "Approved official publication: {{title}}",
-      "rejectedLabel": "Rejected official publication: {{title}}"
+      "rejectedLabel": "Rejected official publication: {{title}}",
+      "defaultTitle": "Research Publication Review",
+      "auditSummaryLine": "{{verified}} verified · {{contradicted}} contradicted · {{unverified}} unverified · {{uncertain}} uncertain · {{exempt}} exempt",
+      "verdictPass": "Pass",
+      "thesisYes": "Yes",
+      "thesisNo": "No change",
+      "failedBatchesCount": " (failed batches: {{count}})",
+      "lineNumber": "Line {{line}}",
+      "originalSentenceLabel": "Original: {{text}}",
+      "reasonLabel": "Reason: {{text}}",
+      "moreInfoToggle": "Technical details",
+      "kindNames": {
+        "earnings": "Earnings",
+        "earnings_review": "Earnings Review",
+        "initiation": "Initiation",
+        "topic": "Topic Report",
+        "update": "Update"
+      }
     },
     "providers": {
       "title": "Team providers & model health",
@@ -8012,7 +8029,7 @@
       "levelRw": "Read & Write",
       "levelRo": "Read Only",
       "levelHidden": "Hidden",
-      "homeNote": "Home workspace is never open to others",
+      "homeNote": "The Chief of Staff (global) workspace is never open to others",
       "externalOwnerNote": "External members' workspaces are visible to admins only; sharing settings do not apply",
       "nextPhaseNotice": "Available in the next phase",
       "cosUserToggleTitle": "Others' Chief of Staff",
@@ -8022,16 +8039,27 @@
       "cosManagedInSettingsHint": "Access for others' Chief of Staff is managed globally in Settings.",
       "webDescRw": "Internal colleagues can browse this workspace and start new threads on the web",
       "webRwWarningTitle": "Colleagues asking questions here will run on your computer, which equals trusting this computer",
-      "webRwWarningBody": "With web Read & Write enabled, threads started here by internal colleagues run on your computer:\n• Machine & knowledge base read/write: Threads can read and write all workspaces and Home, personal memory, and automations on this machine, and write to this workspace's knowledge base (verdicts, agenda, files).\n• Connections & external effects: Threads use your data connections and secrets; data is sent to the questioner's chosen model service, and linked external accounts may be written to or incur charges.\n• Resources & quotas: Threads consume your machine resources and third-party API quotas (LLM costs are billed to the questioner's daily budget).\n• Thread visibility & retention: You and members with workspace access can view these threads read-only; if you delete the workspace, the questioner can still view their thread history read-only.\n• Revocation limits: Reverting to Read-only or Hidden immediately blocks new questions while running tasks finish; revocation cannot recall data already read or undo effects already made.",
+      "webRwWarningBody": "With web Read & Write enabled, threads started here by internal colleagues run on your computer:\n• Machine & knowledge base read/write: Threads can read and write all workspaces and Home, personal memory, and automations on this machine, and write to this workspace's knowledge base (verdicts, agenda, files).\n• Connections & external effects: Threads use your data connections and secrets; data is sent to the questioner's chosen model service, and linked external accounts may be written to or incur charges.\n• Resources & quotas: Threads consume your machine resources and third-party API quotas (LLM costs are billed to the questioner's daily budget).\n• Thread visibility & retention: You and members with workspace access can view these threads read-only; if you delete the workspace, the questioner can still view their thread history read-only.\n• Revocation limits: Reverting to Read Only or Hidden immediately blocks new questions while running tasks finish; revocation cannot recall data already read or undo effects already made.",
       "dispatchedByBadge": "Dispatched by {{name}}",
       "dispatchedThreadReadonlyHint": "Dispatched by {{name}} · Only the creator can send follow-up messages",
-      "revokedThreadReadonlyHint": "The workspace owner has revoked write access · Historical conversation is read-only"
+      "revokedThreadReadonlyHint": "The workspace owner has revoked write access · Historical conversation is read-only",
+      "colleagueFallback": "Colleague",
+      "teamSectionTitle": "Team",
+      "teamEmpty": "No shared teammate workspaces",
+      "bannerLabel": "{{mode}} · From {{name}}",
+      "rwReadonlyHint": "Read & Write (Files) · From {{name}} (Colleagues can browse and edit workspace files)",
+      "rwDispatchReadonlyHint": "Read & Write (Files) · From {{name}} (Only the creator can ask follow-ups)",
+      "roReadonlyHint": "Read-only · From {{name}} (Cannot send messages or start threads)",
+      "readonlyInputLabel": "Read-only message input",
+      "sendLabel": "Send",
+      "readonlySendTitle": "Sending disabled in read-only mode",
+      "rwSendDisabledTitle": "File collaboration only; sending messages here is unavailable"
     },
     "teamMemory": {
       "workspaceTitle": "Team Memory",
-      "workspaceDesc": "Allow the analyst to search past team conversation records (OpenClaw conversation cards)",
-      "homeTitle": "Home Team Memory",
-      "homeDesc": "Allow Chief of Staff (Home) to search past team conversation records (OpenClaw conversation cards)",
+      "workspaceDesc": "Allow the analyst in this workspace to reference past team research records and conclusions.",
+      "homeTitle": "Shared Team Research History",
+      "homeDesc": "Allow Chief of Staff to reference past team research records and conclusions.",
       "loading": "Loading settings…",
       "saveFailed": "Failed to save settings. Please try again.",
       "toggleFailed": "Failed to update setting. Please try again."
@@ -8039,7 +8067,7 @@
     "autoIngest": {
       "on": "Auto-ingest: on",
       "off": "Auto-ingest: off",
-      "enabledHint": "With it on, material this workspace receives is routed into sales notes or the company wiki by who is speaking, answered with a one-line receipt; suspected duplicates or an undecided classification still ask.",
+      "enabledHint": "With it on, incoming materials are automatically filed into seller notes or the company research wiki by source with a brief receipt; suspected duplicates or unclear items still ask first.",
       "disabledHint": "With it off, ingests keep the two-step flow: preview first, write after the user confirms.",
       "error": "Failed to toggle, try again"
     },
@@ -8099,22 +8127,22 @@
       "unbind": "Unbind",
       "archiveUnit": "Archive",
       "bindTargetNone": "Choose a workspace to bind",
-      "boundHintSector": "Sector unit bound. Consider running dalton-init-sector in the workspace to build its knowledge layer (optional).",
+      "boundHintSector": "Sector unit bound. You can ask the assistant in that workspace to initialize the sector docs.",
       "errors": {
         "fallback": "Operation failed, try again.",
         "invalid_input": "Invalid input.",
-        "invalid_kind": "Kind must be sector or company.",
-        "invalid_slug": "Slug must be 1-64 chars, starting with a lowercase letter or digit, only a-z0-9._- (e.g. ai-infrastructure).",
-        "invalid_research_tz": "Research timezone must be an IANA zone (e.g. America/New_York).",
-        "invalid_ticker": "Invalid ticker (e.g. NVDA, 0700.HK).",
-        "invalid_id": "IDs must be UUIDs.",
-        "sector_ticker_refused": "A sector unit never carries a ticker.",
-        "slug_conflict": "This slug is already registered for this kind; pick another.",
+        "invalid_kind": "Invalid coverage unit type.",
+        "invalid_slug": "Identifier must be 1–64 chars, starting with a lowercase letter or digit (a-z, 0-9, ., _, -).",
+        "invalid_research_tz": "Please select a valid timezone.",
+        "invalid_ticker": "Invalid stock symbol format (e.g. NVDA, 0700.HK).",
+        "invalid_id": "Invalid workspace or unit identifier; please refresh and try again.",
+        "sector_ticker_refused": "Sector units do not take a stock symbol.",
+        "slug_conflict": "This name or identifier is already in use for this type; please choose another.",
         "workspace_conflict": "This workspace is already bound to another active unit; unbind or archive it first.",
-        "constraint_conflict": "A unique constraint was violated; check and retry.",
+        "constraint_conflict": "This name or identifier is already taken; please check and retry.",
         "workspace_not_found": "Workspace not found or deleted.",
         "workspace_not_owned": "Only your own workspaces can be bound.",
-        "home_workspace_refused": "The Home workspace never binds a coverage unit.",
+        "home_workspace_refused": "The Chief of Staff (global) workspace cannot bind a coverage unit.",
         "unit_not_found": "Coverage unit not found or archived."
       },
       "description": "Register sector or company coverage units and bind workspaces owned by your account.",
@@ -8295,6 +8323,42 @@
       "syncTimeLabel": "Last synced",
       "unnamedGroup": "Unnamed Feishu group",
       "loadFailed": "Could not load Feishu group list"
+    },
+    "tracking": {
+      "enabledShort": "Auto-tracking: On",
+      "disabledShort": "Auto-tracking: Off",
+      "incompleteShort": "Auto-tracking: Needs attention",
+      "enabledDetail": "Price watch every 30m · internal scan at 11:00 CST (Core daily, Watch weekly) · ±4% move trigger",
+      "disabledDetail": "Auto-tracking is paused. Turn it back on to resume price watches and post-close reviews.",
+      "switchAriaLabel": "Toggle auto-tracking",
+      "expandAriaLabel": "Show tracking tasks and next run times",
+      "pauseAll": "Pause all",
+      "repair": "Repair",
+      "nextRunPrefix": "Next run: {{time}}",
+      "statusMissing": "Missing",
+      "statusPaused": "Paused",
+      "triggerPrice": "Live price trigger (±4%)",
+      "statusPending": "Pending schedule",
+      "taskWatch": "Daily signal watch",
+      "taskDelta": "Post-close thesis review",
+      "taskMoveUp": "Daily +4% move attribution",
+      "taskMoveDown": "Daily -4% move attribution",
+      "taskSectorAgenda": "Sector agenda check",
+      "taskSectorDelta": "Sector weekly material scan"
+    },
+    "sources": {
+      "copyId": "Copy source ID: {{id}}",
+      "identity": {
+        "filing": "Primary Filing",
+        "company": "Company / Management",
+        "broker_report": "Broker Research",
+        "official_data": "Official Data",
+        "expert": "Expert Interview",
+        "news": "News",
+        "internal_note": "Internal Note",
+        "derived": "Secondary Summary",
+        "street_estimate": "Consensus Estimate"
+      }
     }
   },
   "claudeCodePlan": {
@@ -8326,7 +8390,7 @@
       "stopDetail": "Claude Code turns stop at your plan's limit and wait for it to reset. Nothing runs on another model.",
       "credits": "Use usage credits",
       "creditsDetail": "Claude Code keeps running on your usage credits, if they're on for your Claude account.",
-      "note": "Usage credits are on for the Claude account on {{names}}. Claude bills the first request past your limit to them before LangAlpha can stop, so turn them off in claude.ai if you never want them used.",
+      "note": "Usage credits are on for the Claude account on {{names}}. Claude bills the first request past your limit to them before {{brand}} can stop, so turn them off in claude.ai if you never want them used.",
       "noteLink": "Open claude.ai usage settings"
     },
     "short": {
@@ -8468,7 +8532,7 @@
     "scope": {
       "label": "Search in {{scope}}",
       "leave": "Stop searching here",
-      "workspacePlaceholder": "Search these threads and files, or ask the agent",
+      "workspacePlaceholder": "Search threads and files here, or ask directly",
       "threadPlaceholder": "Search this thread, or write to it",
       "tickersHint": "Type a symbol or company name.",
       "threadHint": "Search in this thread",
@@ -8498,8 +8562,8 @@
     "keys": {
       "enter": "Enter: {{action}}.",
       "actions": "Right arrow: more actions.",
-      "askMac": "Command Enter: ask the agent.",
-      "askOther": "Control Enter: ask the agent.",
+      "askMac": "Command Enter: ask directly.",
+      "askOther": "Ctrl Enter: ask directly.",
       "back": "Left arrow or Escape: back.",
       "scope": "Tab: search in it.",
       "leave": "Backspace or Escape: stop searching in {{scope}}.",
@@ -8620,7 +8684,7 @@
     "pinned": "{{name}} is now your dashboard",
     "view": "View",
     "agentFailed": "Couldn't open a chat with the agent. Try again.",
-    "buildDraft": "Build my LangAlpha Dashboard page. I want to see ",
+    "buildDraft": "Build my {{brand}} Dashboard page. I want to see ",
     "editDraft": "Change my dashboard {{name}}: ",
     "editDraftPort": "Change my dashboard {{name}}, the app on port {{port}}: ",
     "away": {
@@ -8629,7 +8693,7 @@
       "ready": "{{name}} is ready",
       "failed": "{{name}} didn't open, so this is the built-in dashboard",
       "failedDetail": "Its computer may be asleep or not answering.",
-      "failedDetailPage": "LangAlpha couldn't read its saved copy.",
+      "failedDetailPage": "{{brand}} couldn't read its saved copy.",
       "gone": "{{name}} is no longer available",
       "goneDetail": "Its app or workspace was removed.",
       "goneDetailPage": "Its page or workspace was removed.",
@@ -8670,10 +8734,10 @@
     }
   },
   "kit": {
-    "notConnected": "Not connected to LangAlpha",
-    "noAnswer": "LangAlpha did not answer {{method}}",
-    "offline": "Open this page from LangAlpha to see live data.",
-    "scopePending": "Allow access to {{name}} in LangAlpha to show this.",
+    "notConnected": "Not connected to {{brand}}",
+    "noAnswer": "{{brand}} did not answer {{method}}",
+    "offline": "Open this page from {{brand}} to see live data.",
+    "scopePending": "Allow access to {{name}} in {{brand}} to show this.",
     "scopeMissing": "This dashboard has no access to {{name}}.",
     "scope": {
       "quotes": "market quotes",
@@ -8738,7 +8802,7 @@
     }
   },
   "menubar": {
-    "open": "Open LangAlpha",
+    "open": "Open {{brand}}",
     "settings": "Desktop app settings",
     "market": {
       "title": "Market",
@@ -8763,13 +8827,13 @@
       "manualNote": "From the holdings you entered",
       "otherCurrencies": "{{list}} not included",
       "empty": "No holdings yet.",
-      "add": "Add holdings in LangAlpha"
+      "add": "Add holdings in {{brand}}"
     },
     "watchlist": {
       "title": "Watchlist",
       "count": "{{shown}} of {{total}}",
       "empty": "Your watchlist is empty.",
-      "add": "Add symbols in LangAlpha"
+      "add": "Add symbols in {{brand}}"
     },
     "agent": {
       "title": "Agent",
@@ -8781,7 +8845,7 @@
       "more": "{{count}} more"
     },
     "signedOut": {
-      "title": "Sign in to LangAlpha",
+      "title": "Sign in to {{brand}}",
       "body": "The market, your portfolio and your agent's work show here once you're signed in.",
       "action": "Sign in"
     },

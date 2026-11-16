@@ -181,7 +181,8 @@ export function thisMacOption(t: Translate, state: ThisMacCard): RadioCardOption
     title: t('computer.remoteControl.cardTitle', 'This Mac'),
     description: state === 'needsApp'
       ? t('computer.remoteControl.needsApp', 'Needs the desktop app')
-      : t('computer.remoteControl.cardDesc', 'Works even with LangAlpha closed'),
+      // DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy
+      : t('computer.remoteControl.cardDesc', 'Works even with {{brand}} closed'),
     note: state === 'added'
       ? t('computer.remoteControl.alreadyAdded', 'Already added')
       : state === 'offered' ? t('computer.ssh.previewLabel', 'Preview') : null,

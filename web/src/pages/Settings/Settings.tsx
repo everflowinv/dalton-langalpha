@@ -20,7 +20,7 @@ import { DaltonCoveragePanel } from './panels/dalton/DaltonCoveragePanel';
 import { DaltonTeamModelsPanel } from './panels/dalton/DaltonTeamModelsPanel';
 import { DaltonTeamMembersPanel } from './panels/dalton/DaltonTeamMembersPanel';
 import { DaltonTeamOpsPanel } from './panels/dalton/DaltonTeamOpsPanel';
-import { DaltonInlineNotice } from './panels/dalton/primitives';
+import { DaltonInlineNotice } from '@/components/dalton/primitives';
 import { SettingsRail, useDaltonSettingsVisibility } from './components/SettingsRail';
 import ComputersDialogHost from '@/pages/ChatAgent/components/ComputersDialogHost';
 import {

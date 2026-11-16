@@ -166,9 +166,9 @@ export default function InviteRedeemPage() {
                 autoComplete="username"
                 required
               />
-              <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+              <p className="login-page__view-subtitle">
                 {t('auth.invite.usernameHint')}
-              </span>
+              </p>
             </div>
 
             <div className="login-page__field">

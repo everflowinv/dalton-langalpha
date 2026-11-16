@@ -10,7 +10,7 @@ import {
   DaltonLoadingRow,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 export interface DaltonSettingVisibilityContext {
   callerTier?: string | null;

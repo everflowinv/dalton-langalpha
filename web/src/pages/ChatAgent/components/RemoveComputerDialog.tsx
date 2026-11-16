@@ -115,7 +115,8 @@ function RemoveComputerDialog({
       <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
         {filesKeptIn
           ? deleteFiles
-            ? t('computer.removeBodyOwnMachineDelete', 'We stop using this machine and delete what LangAlpha put there.')
+            // DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy
+            ? t('computer.removeBodyOwnMachineDelete', 'We stop using this machine and delete what {{brand}} put there.')
             : t(
                 'computer.removeBodyOwnMachine',
                 'We stop using this machine and remove what we set up there for it. Your files in {{folder}} stay.',
@@ -164,11 +165,12 @@ function RemoveComputerDialog({
           style={{ color: 'var(--color-text-primary)' }}
         >
           <span className="flex min-w-0 flex-col gap-0.5 break-words">
-            <span>{t('computer.alsoDeleteFiles', "Also delete LangAlpha's files from this machine")}</span>
+            {/* DALTON-HOOK(ui-unify): interpolate active brand name in fallback copy */}
+            <span>{t('computer.alsoDeleteFiles', "Also delete {{brand}}'s files from this machine")}</span>
             <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
               {t(
                 'computer.alsoDeleteFilesHint',
-                "Deletes {{folder}}, its workspaces' folders included, and LangAlpha's runtime in ~/.langalpha (about 3 GB) unless another computer uses it. Files you put in {{folder}} yourself stay. The machine has to be connected.",
+                "Deletes {{folder}}, its workspaces' folders included, and {{brand}}'s runtime in ~/.langalpha (about 3 GB) unless another computer uses it. Files you put in {{folder}} yourself stay. The machine has to be connected.",
                 { folder: filesKeptIn },
               )}
             </span>

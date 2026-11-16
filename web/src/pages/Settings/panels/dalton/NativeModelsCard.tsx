@@ -22,7 +22,7 @@ import {
   DaltonLoadingRow,
   DaltonSettingsCard,
   DaltonStatusBadge,
-} from './primitives';
+} from '@/components/dalton/primitives';
 
 /** Team model catalog sync status card inside Team Management -> Models & Providers. */
 export function NativeModelsCard() {

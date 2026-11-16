@@ -74,7 +74,8 @@ function CreateWorkspaceCard({ proposalData, onApprove, onReject }: CreateWorksp
       )}
       {(duplicate || duplicateUnknown) && (
         <div className="text-sm mt-2 flex items-start gap-1.5" style={{ color: 'var(--color-text-secondary)' }}>
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" style={{ color: 'var(--color-warning, #d97706)' }} />
+          {/* DALTON-HOOK(ui-unify): use declared semantic warning token without hex fallback */}
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" style={{ color: 'var(--color-warning)' }} />
           <span>
             {duplicate
               ? t('chat.createWorkspaceCard.duplicateExists', { duplicate })
