@@ -1,19 +1,14 @@
 import { useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, Play } from 'lucide-react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Disclosure } from '@/components/ui/Disclosure';
-import { ToggleSwitch } from '@/components/ui/switch';
 import { useLocale } from '@/hooks/useLocale';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { formatTimestamp } from '@/lib/format';
 import type { DaltonSystemJobItem, DaltonSystemJobScope } from '@/pages/Settings/utils/daltonApi';
-import {
-  useDaltonSystemJobs,
-  useRunDaltonSystemJobNow,
-  useToggleDaltonSystemJob,
-} from '../../hooks/useOpenClaw';
+import { useDaltonSystemJobs } from '../../hooks/useOpenClaw';
 import {
   DaltonInlineNotice,
   DaltonItemRow,
@@ -51,9 +46,9 @@ function scopeLabel(scope: DaltonSystemJobScope, t: (k: string, opts?: Record<st
 
 /**
  * Team automated system jobs card inside Team Management -> Team Channels & Ops.
- * Strict permission isolation: `host` and `ops` scopes are rendered ONLY when admin
- * (never based on any client-side advanced-mode toggle), while `data`/research scopes
- * follow backend-returned `can_run_now`/`can_toggle` capabilities.
+ * Read-only by design: running or pausing company jobs lives on Automations →
+ * company tasks, not here. `host` and `ops` scopes are shown only to admins
+ * (never based on the client-side advanced-mode toggle).
  */
 export function DaltonSystemJobsCard({
   scopes,
@@ -66,11 +61,8 @@ export function DaltonSystemJobsCard({
   const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
 
   const jobsQuery = useDaltonSystemJobs(true);
-  const toggleJob = useToggleDaltonSystemJob();
-  const runJob = useRunDaltonSystemJobNow();
 
   const [expandedLogs, setExpandedLogs] = useState<Set<string>>(new Set());
-  const [notice, setNotice] = useState<{ tone: 'success' | 'error'; message: string } | null>(null);
 
   const jobs = useMemo(() => {
     const raw = jobsQuery.data?.jobs ?? [];
@@ -97,44 +89,10 @@ export function DaltonSystemJobsCard({
     });
   };
 
-  const handleToggle = async (job: DaltonSystemJobItem, enabled: boolean) => {
-    setNotice(null);
-    try {
-      await toggleJob.mutateAsync({
-        key: job.key,
-        enabled,
-      });
-    } catch {
-      setNotice({ tone: 'error', message: t('dalton.common.saveFailed') });
-    }
-  };
-
-  const handleRunNow = async (job: DaltonSystemJobItem) => {
-    setNotice(null);
-    try {
-      await runJob.mutateAsync(job.key);
-      setNotice({
-        tone: 'success',
-        message: t('dalton.systemJobs.triggeredSuccess', {
-          name: job.title || job.key,
-        }),
-      });
-    } catch {
-      setNotice({ tone: 'error', message: t('dalton.systemJobs.triggeredFailed') });
-    }
-  };
-
   const renderJobList = (items: DaltonSystemJobItem[], emptyText: string) => (
     <DaltonKeyValueList isEmpty={items.length === 0} empty={emptyText}>
       {items.map((job) => {
         const logOpen = expandedLogs.has(job.key);
-        const isToggling =
-          toggleJob.isPending && toggleJob.variables?.key === job.key;
-        const isRunningNow =
-          runJob.isPending && runJob.variables === job.key;
-        const isOpsScope = OPS_SCOPES.has(job.scope);
-        const canControl = (isOpsScope ? isAdmin : true) && job.can_run_now;
-        const canToggle = (isOpsScope ? isAdmin : true) && job.can_toggle;
 
         return (
           <DaltonItemRow
@@ -193,32 +151,6 @@ export function DaltonSystemJobsCard({
                     </span>
                   </Button>
                 )}
-                {canControl && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 gap-1 text-xs"
-                    disabled={isRunningNow || job.running}
-                    onClick={() => void handleRunNow(job)}
-                    data-testid={`dalton-system-job-run-${job.key}`}
-                  >
-                    <Play className="h-3 w-3" />
-                    <span>
-                      {isRunningNow
-                        ? t('dalton.systemJobs.triggering')
-                        : t('dalton.systemJobs.triggerNow')}
-                    </span>
-                  </Button>
-                )}
-                {canToggle && (
-                  <ToggleSwitch
-                    checked={job.enabled !== false}
-                    disabled={isToggling}
-                    ariaLabel={job.title || job.key}
-                    onChange={() => void handleToggle(job, job.enabled === false)}
-                  />
-                )}
               </div>
             }
           >
@@ -271,8 +203,6 @@ export function DaltonSystemJobsCard({
         <DaltonInlineNotice tone="error">{t('dalton.systemJobs.loadFailed')}</DaltonInlineNotice>
       ) : (
         <>
-          {notice && <DaltonInlineNotice tone={notice.tone}>{notice.message}</DaltonInlineNotice>}
-
           <div className="space-y-2" data-testid="dalton-system-jobs-team-section">
             <div>
               <h4 className="text-xs font-medium" style={{ color: 'var(--color-text-primary)' }}>

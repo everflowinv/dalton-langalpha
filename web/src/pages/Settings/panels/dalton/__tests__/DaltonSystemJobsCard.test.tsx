@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -111,24 +111,20 @@ describe('DaltonSystemJobsCard', () => {
     expect(screen.queryByText('Bridge Maintenance')).not.toBeInTheDocument();
     expect(screen.queryByText('Host Disk GC')).not.toBeInTheDocument();
 
-    // Backend capability granted for internal on public data job; denied on company-1
-    expect(screen.getByTestId('dalton-system-job-run-data-1')).toBeInTheDocument();
-    expect(screen.queryByTestId('dalton-system-job-run-company-1')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId('dalton-system-job-run-data-1'));
-    await waitFor(() => expect(h.runJob).toHaveBeenCalledWith('data-1'));
+    // Read-only card: running or pausing jobs lives on Automations, never here.
+    expect(screen.queryByTestId('dalton-system-job-run-data-1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
   });
 
-  it('shows host and ops section + run/toggle controls only for admins', async () => {
+  it('shows the host and ops section to admins, still without run or toggle controls', async () => {
     h.callerTier = 'admin';
     renderCard();
 
     expect(await screen.findByTestId('dalton-system-jobs-ops-section')).toBeInTheDocument();
     expect(screen.getByText('Bridge Maintenance')).toBeInTheDocument();
     expect(screen.getByText('Host Disk GC')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByTestId('dalton-system-job-run-ops-1'));
-    await waitFor(() => expect(h.runJob).toHaveBeenCalledWith('ops-1'));
+    expect(screen.queryByTestId('dalton-system-job-run-ops-1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
   });
 
   it('supports scopes prop filter and expands log_tail disclosure cleanly', async () => {
