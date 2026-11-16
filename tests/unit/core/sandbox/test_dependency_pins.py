@@ -105,6 +105,7 @@ def test_sandbox_yfinance_is_the_version_the_server_locks():
     assert f"yfinance=={locked}" in DEFAULT_DEPENDENCIES
 
 
+# DALTON-HOOK(sandbox-edgartools): the 13F skill's EDGAR client follows uv.lock too.
 def test_sandbox_edgartools_is_the_version_the_server_locks():
     """Dockerfile.sandbox and DEFAULT_DEPENDENCIES must pin edgartools to the
     exact version uv.lock locks for the server."""

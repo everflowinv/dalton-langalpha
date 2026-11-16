@@ -291,6 +291,9 @@ ALLOWED_HOOKS=(
   # ffprobe the ASR pipeline probes recording duration with
   # (Dockerfile.sandbox).
   "sandbox-ffprobe"
+  # The sandbox image installs edgartools for the dalton-13f-tracker skill,
+  # pinned to uv.lock (Dockerfile.sandbox, _defaults.py, test_dependency_pins.py).
+  "sandbox-edgartools"
   # P6b: scrapling's browser/stealth tiers delegate to the dedicated crawl
   # service container (docker-compose.dalton.yml `crawler`,
   # src/dalton/crawl_service/) when crawler.browser_service_url is set — the

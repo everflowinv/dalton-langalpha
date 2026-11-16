@@ -23,6 +23,10 @@ description: "查询美股机构 SEC（美国证监会）13F 季度持仓、对�
 
 ---
 
+## 0) 依赖
+
+脚本依赖 `edgartools`（SEC 数据客户端），沙箱镜像已预装。如果运行时报 `ModuleNotFoundError: No module named 'edgar'`，说明当前沙箱创建得较早、缺少这个依赖：不要自行安装或改写抓取脚本，直接告诉用户当前沙箱缺少 edgartools，需要管理员补装后再运行。
+
 ## 1) 健康检查（首次运行建议先执行）
 
 ```bash

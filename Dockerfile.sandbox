@@ -123,6 +123,7 @@ ENV NUMEXPR_NUM_THREADS=${SANDBOX_CPUS}
 # ---------- Python packages ----------
 # Mirrors DEFAULT_DEPENDENCIES in src/ptc_agent/core/sandbox/_defaults.py
 # (the list the Daytona snapshot installs). Keep both in sync.
+# DALTON-HOOK(sandbox-edgartools): edgartools for the dalton-13f-tracker skill.
 # yfinance and edgartools are pinned to the versions the server locks (uv.lock),
 # so a rebuild cannot move the sandbox's Yahoo or SEC EDGAR client ahead of it.
 # --compile-bytecode: uv writes none by default, so each new container would

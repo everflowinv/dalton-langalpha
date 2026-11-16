@@ -76,7 +76,8 @@ DEFAULT_DEPENDENCIES = [
     # Pinned to the version uv.lock gives the server, so a rebuilt image
     # cannot move the sandbox's Yahoo client ahead of it.
     "yfinance==1.8.0",
-    # SEC EDGAR client for the dalton-13f-tracker skill, pinned to uv.lock.
+    # DALTON-HOOK(sandbox-edgartools): SEC EDGAR client for the dalton-13f-tracker
+    # skill, pinned to uv.lock.
     "edgartools==5.62.1",
     # market_protocol's session calendars, which tell the market-data servers
     # whether a bar has settled.
