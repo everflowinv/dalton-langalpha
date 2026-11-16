@@ -439,18 +439,10 @@ def _resolve_http(cfg, *, discovery=False):
 
         url = _re.sub(r"\$\{([^}]+)\}", _env_sub, cfg.url)
         headers = dict(_bearer_headers()) if cfg.data_token else {}
-        # DALTON-HOOK(sandbox-caller-identity): the job's env names who the
-        # call runs for; a builtin http server (the researchdata bridge) gets
-        # them as request headers for its usage ledger. Values that could
-        # break HTTP framing are dropped, never trimmed into something else.
-        for _env_name, _header in (
-            ("DALTON_CALLER_USER", "X-Dalton-User"),
-            ("DALTON_CALLER_WORKSPACE", "X-Dalton-Workspace"),
-            ("DALTON_CALLER_THREAD", "X-Dalton-Thread"),
-        ):
-            _value = os.environ.get(_env_name, "").strip()
-            if _value and not any(_ch in _value for _ch in "\r\n\t "):
-                headers[_header] = _value
+        # DALTON-HOOK(alphaengine-cache): X-Dalton-* caller headers are no longer
+        # read from the current process env inside _resolve_http; callers pass
+        # per-request identity explicitly into _http_tools_call so a persistent
+        # supervisor daemon never leaks or drops DALTON_CALLER_* across turns.
         return url, headers
 
     names = list(cfg.headers)
@@ -2109,6 +2101,44 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
         raise RuntimeError(msg) from e
 
 
+# DALTON-HOOK(alphaengine-cache): read per-execution DALTON_CALLER_* from the
+# caller's env (never in supervisor daemon) and apply as X-Dalton-* headers on
+# builtin non-relay HTTP calls (accounting only).
+def _caller_identity_from_env() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for _env_name, _key in (
+        ("DALTON_CALLER_USER", "user"),
+        ("DALTON_CALLER_WORKSPACE", "workspace"),
+        ("DALTON_CALLER_THREAD", "thread"),
+    ):
+        _val = os.environ.get(_env_name, "").strip()
+        if _val and not any(_ch in _val for _ch in "\r\n\t "):
+            out[_key] = _val
+    return out
+
+
+def _apply_caller_headers(
+    headers: dict[str, str], cfg: Any, caller: dict[str, str] | None
+) -> dict[str, str]:
+    if cfg.relay_bound or cfg.untrusted or not isinstance(caller, dict) or not caller:
+        return headers
+    out = dict(headers)
+    added = False
+    for _key, _header in (
+        ("user", "X-Dalton-User"),
+        ("workspace", "X-Dalton-Workspace"),
+        ("thread", "X-Dalton-Thread"),
+    ):
+        _val = str(caller.get(_key) or "").strip()
+        if _val and not any(_ch in _val for _ch in "\r\n\t "):
+            out[_header] = _val
+            added = True
+    if added:
+        # Marks headers as explicitly attached per-request rather than inherited from a daemon's env.
+        out["X-Dalton-Caller-Scope"] = "per-request"
+    return out
+
+
 # DALTON-HOOK(dalton-tools): with_flag only threads the settle verdict through
 # for the flag-preserving entry; the default path is unchanged.
 def _call_mcp_tool_http(
@@ -2120,7 +2150,13 @@ def _call_mcp_tool_http(
 ) -> Any:
     """Call an MCP tool via streamable HTTP transport."""
     try:
-        result = _http_exchange(server_name, tool_name, arguments)
+        # DALTON-HOOK(alphaengine-cache): in-process fallback reads the caller's env
+        result = _http_exchange(
+            server_name,
+            tool_name,
+            arguments,
+            caller=_caller_identity_from_env(),
+        )
         return _settle_reply(
             result, server_name, tool_name, arguments, with_flag=with_flag
         )
@@ -2130,7 +2166,13 @@ def _call_mcp_tool_http(
         raise
 
 
-def _http_exchange(server_name: str, tool_name: str, arguments: dict[str, Any]) -> dict:
+def _http_exchange(
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    caller: dict[str, str] | None = None,
+) -> dict:
     """One tools/call over streamable HTTP, with its bounded recoveries.
 
     A data-token server's failure comes back as an error-envelope reply rather
@@ -2139,10 +2181,11 @@ def _http_exchange(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     code already branches on the envelope. A reply the server did give, a
     JSON-RPC error included, is returned and settled as any server's is.
     """
+    # DALTON-HOOK(alphaengine-cache): forward per-request caller identity to HTTP transport
     if not _server_cfg(server_name).data_token:
-        return _http_tools_call(server_name, tool_name, arguments)
+        return _http_tools_call(server_name, tool_name, arguments, caller=caller)
     try:
-        return _http_tools_call(server_name, tool_name, arguments)
+        return _http_tools_call(server_name, tool_name, arguments, caller=caller)
     except _DataTokenError as exc:
         return _envelope_reply(exc.envelope)
     except (httpx.HTTPError, _ReplyError) as exc:
@@ -2156,13 +2199,19 @@ def _http_exchange(server_name: str, tool_name: str, arguments: dict[str, Any]) 
 
 
 def _http_tools_call(
-    server_name: str, tool_name: str, arguments: dict[str, Any]
+    server_name: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    caller: dict[str, str] | None = None,
 ) -> dict:
     # Negotiate once per interpreter, then speak the agreed era
     proto = _ensure_http_server(server_name)
 
     cfg = _server_cfg(server_name)
     url, _headers = _resolve_http(cfg)
+    # DALTON-HOOK(alphaengine-cache): forward per-request caller headers (skipped on untrusted/relay)
+    _headers = _apply_caller_headers(_headers, cfg, caller)
 
     params = {"name": tool_name, "arguments": arguments}
 
@@ -2348,6 +2397,7 @@ def raw_tool_reply(
     arguments: dict[str, Any],
     *,
     timeout: float = _CALL_TIMEOUT,
+    caller: dict[str, str] | None = None,
 ) -> dict:
     """One tools/call, returning the JSON-RPC reply unsettled.
 
@@ -2359,8 +2409,10 @@ def raw_tool_reply(
     cfg = _server_cfg(server_name)
     if cfg.transport == "sse":
         raise RuntimeError(_legacy_sse_refusal(server_name))
+    # DALTON-HOOK(alphaengine-cache): supervisor never reads DALTON_CALLER_* from
+    # its own process env; only the explicit per-request caller dict is used.
     if cfg.transport == "http":
-        return _http_exchange(server_name, tool_name, arguments)
+        return _http_exchange(server_name, tool_name, arguments, caller=caller or {})
     return _stdio_reply(server_name, tool_name, arguments, timeout=timeout)
 
 
@@ -2486,11 +2538,16 @@ def _start_supervisor(path: str) -> bool:
         # serving every workspace on the computer, so inheriting any would pin
         # it to whichever turn happened to start it. (_shared.TURN_CWD_ENV;
         # this file ships into the sandbox and cannot import it.)
+        # DALTON-HOOK(alphaengine-cache): strip DALTON_CALLER_* alongside turn-scoped
+        # vars so the long-lived supervisor never inherits the starter's identity.
         _CALLER_ONLY_ENV = (
             "MCP_TRACE_FILE",
             "PTC_TURN_CWD",
             "PTC_WORKSPACE_CONFIG",
             "PTC_ALLOWED_SERVERS",
+            "DALTON_CALLER_USER",
+            "DALTON_CALLER_WORKSPACE",
+            "DALTON_CALLER_THREAD",
         )
         env = {k: v for k, v in os.environ.items() if k not in _CALLER_ONLY_ENV}
         existing = env.get("PYTHONPATH") or ""
@@ -2518,9 +2575,69 @@ def _start_supervisor(path: str) -> bool:
         deadline = time.monotonic() + _SUPERVISOR_START_TIMEOUT
         while time.monotonic() < deadline:
             if _socket_alive(path):
+                with _supervisor_cap_lock:
+                    _supervisor_caller_cap_cache.pop(path, None)
                 return True
             time.sleep(0.05)
     return False
+
+
+# DALTON-HOOK(alphaengine-cache): per-supervisor-instance capability cache keyed
+# by `(path, socket stat stamp)` so retries/calls probe at most once per daemon.
+_supervisor_cap_lock = threading.Lock()
+_supervisor_caller_cap_cache: dict[
+    str, tuple[tuple[int, int, int], int | None, bool]
+] = {}
+
+
+def _supervisor_socket_stamp(path: str) -> tuple[int, int, int] | None:
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _probe_supervisor_caller_capability(
+    path: str, *, force: bool = False
+) -> bool:
+    """Return True if the live supervisor instance advertises `caller_identity`."""
+    # DALTON-HOOK(alphaengine-cache): probe supervisor health once per daemon
+    # instance (keyed by socket inode/mtime); never cache transient probe errors.
+    stamp = _supervisor_socket_stamp(path)
+    if not force and stamp is not None:
+        with _supervisor_cap_lock:
+            cached = _supervisor_caller_cap_cache.get(path)
+            if cached is not None and cached[0] == stamp:
+                return cached[2]
+    try:
+        kind, frame = _supervisor_exchange(
+            path,
+            {"v": _SUPERVISOR_PROTOCOL_VERSION, "id": 0, "op": "health"},
+        )
+    except _SupervisorBroke:
+        with _supervisor_cap_lock:
+            _supervisor_caller_cap_cache.pop(path, None)
+        return False
+    if kind != "result":
+        with _supervisor_cap_lock:
+            _supervisor_caller_cap_cache.pop(path, None)
+        return False
+    data = frame.get("data")
+    if not isinstance(data, dict):
+        with _supervisor_cap_lock:
+            _supervisor_caller_cap_cache.pop(path, None)
+        return False
+    supported = data.get("caller_identity") is True
+    daemon_pid = data.get("pid") if isinstance(data.get("pid"), int) else None
+    # Store only when the socket is the same instance before and after the
+    # probe; a restart mid-probe would file the old daemon's answer under the
+    # new one. A concurrent first probe may run twice; both answers agree.
+    new_stamp = _supervisor_socket_stamp(path)
+    if stamp is not None and new_stamp == stamp:
+        with _supervisor_cap_lock:
+            _supervisor_caller_cap_cache[path] = (new_stamp, daemon_pid, supported)
+    return supported
 
 
 def _socket_alive(path: str) -> bool:
@@ -2596,6 +2713,17 @@ def _supervisor_reply(
         return None
     path = _supervisor_socket_path()
     view = _workspace_view() or {}
+    # DALTON-HOOK(alphaengine-cache): carry caller identity from this execution's
+    # env into each supervisor call request.
+    caller_id = _caller_identity_from_env()
+    cfg = _SERVER_CONFIGS.get(server_name)
+    is_trusted_http = (
+        cfg is not None
+        and cfg.transport == "http"
+        and not cfg.relay_bound
+        and not cfg.untrusted
+    )
+    need_caller_probe = is_trusted_http or (cfg is None and bool(caller_id))
     request = {
         "v": _SUPERVISOR_PROTOCOL_VERSION,
         "id": 0,
@@ -2608,10 +2736,42 @@ def _supervisor_reply(
         "config_version": int(view.get("computer_config_version") or 0),
     }
     transport_failures = 0
+    probed_this_call = False
+    probed_stamp: tuple[int, int, int] | None = None
+    supports_caller = False
     for attempt in range(_SUPERVISOR_RETRY_ATTEMPTS):
-        if not _socket_alive(path) and not _start_supervisor(path):
-            _supervisor_unavailable = True
-            return None
+        started_here = False
+        if not _socket_alive(path):
+            if not _start_supervisor(path):
+                _supervisor_unavailable = True
+                return None
+            started_here = True
+        # DALTON-HOOK(alphaengine-cache): probe capability at most once per
+        # supervisor instance (never repeating on pre-ack retries); bypass legacy
+        # supervisors for trusted HTTP servers so starter-env never leaks.
+        if need_caller_probe:
+            cur_stamp = _supervisor_socket_stamp(path)
+            stamp_changed = (
+                cur_stamp is not None
+                and probed_stamp is not None
+                and cur_stamp != probed_stamp
+            )
+            if started_here or stamp_changed or not probed_this_call:
+                supports_caller = _probe_supervisor_caller_capability(
+                    path, force=started_here
+                )
+                probed_this_call = True
+                probed_stamp = _supervisor_socket_stamp(path) or cur_stamp
+            if not supports_caller:
+                if is_trusted_http:
+                    return None
+                request.pop("caller", None)
+            elif caller_id:
+                request["caller"] = caller_id
+            else:
+                request.pop("caller", None)
+        else:
+            request.pop("caller", None)
         # A fresh id per attempt, so a retry can never land on the in-flight
         # entry of the attempt it is replacing.
         request["id"] = _next_supervisor_id()

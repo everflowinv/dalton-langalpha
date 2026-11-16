@@ -71,6 +71,18 @@ class ServerBackend:
     ) -> dict[str, Any]:
         return self.call(server, tool, args)
 
+    # DALTON-HOOK(alphaengine-cache): forward per-request caller identity without
+    # breaking ServerBackend subclasses that only implement call_with_timeout.
+    def call_with_caller(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        timeout: float,
+        caller: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self.call_with_timeout(server, tool, args, timeout)
+
     def drop(self, server: str) -> None:
         raise NotImplementedError
 
@@ -125,6 +137,19 @@ class ClientBackend(ServerBackend):
         self, server: str, tool: str, args: dict[str, Any], timeout: float
     ) -> dict[str, Any]:
         return self._c.raw_tool_reply(server, tool, args, timeout=timeout)
+
+    # DALTON-HOOK(alphaengine-cache): pass per-request caller identity to raw_tool_reply
+    def call_with_caller(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        timeout: float,
+        caller: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self._c.raw_tool_reply(
+            server, tool, args, timeout=timeout, caller=caller
+        )
 
     def drop(self, server: str) -> None:
         self._c.drop_server(server)
@@ -461,9 +486,19 @@ class Supervisor:
             # Claimed before the call, not after it: a reply is what records a
             # call, and a tool that takes longer than the idle window would
             # otherwise be reaped out from under itself.
+            # DALTON-HOOK(alphaengine-cache): extract per-request caller identity (accounting only)
+            raw_caller = request.get("caller")
+            req_caller: dict[str, str] = {}
+            if isinstance(raw_caller, dict):
+                for c_key in ("user", "workspace", "thread"):
+                    c_val = str(raw_caller.get(c_key) or "").strip()
+                    if c_val and not any(ch in c_val for ch in "\r\n\t "):
+                        req_caller[c_key] = c_val
             self._claim(server)
             try:
-                reply = self.backend.call_with_timeout(server, tool, args, remaining)
+                reply = self.backend.call_with_caller(
+                    server, tool, args, remaining, caller=req_caller
+                )
             except Exception as exc:  # noqa: BLE001 - one bad server is not fatal
                 self._log(f"call failed {server}.{tool}: {exc}")
                 conn.send(
@@ -885,6 +920,8 @@ class Supervisor:
             "idle_window_s": self.idle_window_s,
             "known_servers": sorted(self.backend.names()),
             "servers": servers,
+            # DALTON-HOOK(alphaengine-cache): advertise per-request caller forwarding support
+            "caller_identity": True,
         }
 
 

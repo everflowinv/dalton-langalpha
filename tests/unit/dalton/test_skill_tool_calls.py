@@ -396,8 +396,22 @@ def _validate_researchdata_bridge_call(
             for k in call["kwargs"]:
                 if k in ("route", "source", "channel", "provider", "operation", "action", "params"):
                     continue
-                lits = _extract_quoted_literals(kwarg_values.get(k, ""))
-                synth_args[k] = lits[0] if lits else ("2026-01-01" if k in ("start", "end", "since", "until") else "META")
+                raw_expr = kwarg_values.get(k, "").strip()
+                lits = _extract_quoted_literals(raw_expr)
+                if lits:
+                    synth_args[k] = lits[0]
+                elif k in ("limit", "pages", "page", "offset", "max_chars", "size"):
+                    parsed_lit: Any = _UNPARSED_LIT
+                    if raw_expr:
+                        try:
+                            parsed_lit = ast.literal_eval(raw_expr)
+                        except (SyntaxError, ValueError):
+                            parsed_lit = _UNPARSED_LIT
+                    # Keep real literal types (e.g. `1.5`, `True`) so bridge type
+                    # validation catches them; only symbolic expressions default to `1`.
+                    synth_args[k] = 1 if parsed_lit is _UNPARSED_LIT else parsed_lit
+                else:
+                    synth_args[k] = "2026-01-01" if k in ("start", "end", "since", "until") else "META"
             if nested_keys is not None:
                 params_expr = kwarg_values.get("params", "")
                 synth_params: dict[str, Any] = {}
@@ -737,4 +751,22 @@ def test_scanner_rejects_invalid_nested_bridge_params():
     assert any(e[1] == 3 and "bad_nested" in e[3] for e in errors)
     assert not any(e[1] == 4 for e in errors)
     assert any(e[1] == 5 and "companies" in e[3] for e in errors)
+
+
+_UNPARSED_LIT = object()
+
+
+def test_scanner_rejects_non_int_literal_limit_and_keeps_variable_placeholder():
+    registry = build_tool_signature_registry()
+    sample = """
+    1. `researchdata.research(route="alphaengine", operation="search_library", query="META", limit=1.5)`
+    2. `researchdata.research(route="alphaengine", operation="search_library", query="META", limit=True)`
+    3. `researchdata.research(route="alphaengine", operation="search_library", query="META", limit=LIMIT)`
+    4. `researchdata.research(route="alphaengine", operation="search_library", query="META", limit=20)`
+    """
+    calls = extract_tool_calls_from_markdown(sample, registry)
+    errors = validate_extracted_calls("synthetic/SKILL.md", calls, registry)
+    assert any(e[1] == 2 and "limit" in e[3] for e in errors)
+    assert any(e[1] == 3 and "limit" in e[3] for e in errors)
+    assert not any(e[1] in (4, 5) for e in errors)
 
