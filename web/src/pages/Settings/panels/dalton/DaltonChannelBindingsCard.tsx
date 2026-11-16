@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { Check, Copy, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/hooks/useLocale';
 import { useNow } from '@/hooks/useNow';
@@ -11,320 +12,404 @@ import { queryKeys } from '@/lib/queryKeys';
 import {
   createDaltonChannelBindCode,
   fetchDaltonChannelBindings,
-  type DaltonChannelBindCodeCreateResponse,
   type DaltonChannelBindingState,
-  type DaltonChannelBindingsResponse,
+  type DaltonChannelBindCodeCreateResponse,
   type DaltonChannelPlatform,
 } from '@/pages/Settings/utils/daltonApi';
-import { SettingRow, SettingsCardBody, SettingsGroup } from '../../components/SettingsLayout';
-import { useSettingCopy } from '../../components/useSettingCopy';
-import { SETTINGS } from '../../sections';
+import {
+  DaltonInlineNotice,
+  DaltonLoadingRow,
+  DaltonRefreshButton,
+  DaltonSettingsCard,
+  DaltonStatusBadge,
+} from './primitives';
 
-const BIND_PLATFORMS = ['feishu', 'discord'] as const;
-type PersonalBindPlatform = (typeof BIND_PLATFORMS)[number];
+type BindPlatform = Extract<DaltonChannelPlatform, 'feishu' | 'discord'>;
 
-/** The server keeps a code for 10 minutes. Polling stops at that cap, on expiry, on link, or on unmount. */
-export const CHANNEL_BINDINGS_POLL_MS = 4_000;
-export const CHANNEL_BINDINGS_MAX_WAIT_MS = 10 * 60 * 1000;
-const EXPIRY_CLOCK_MS = 1_000;
+const PLATFORMS: BindPlatform[] = ['feishu', 'discord'];
 
-interface IssuedBindCode {
-  platform: PersonalBindPlatform;
-  command: string;
+export const CHANNEL_BINDINGS_POLL_MS = 5000;
+export const CHANNEL_BINDINGS_MAX_WAIT_MS = 5 * 60 * 1000;
+
+export interface IssuedBindCodeState {
+  code: string;
+  platform: BindPlatform;
+  expiresAt: string;
   expiresAtMs: number;
+  command: string;
 }
 
-function isPersonalPlatform(platform: DaltonChannelPlatform): platform is PersonalBindPlatform {
-  return platform === 'feishu' || platform === 'discord';
-}
-
-/** Keep the server command. Cap the wait so a far-future expiry cannot poll indefinitely. */
 export function issuedBindCode(
+  platform: BindPlatform,
   res: DaltonChannelBindCodeCreateResponse,
-  requested: PersonalBindPlatform,
-  nowMs: number,
-): IssuedBindCode | null {
-  if (!isPersonalPlatform(res.platform) || res.platform !== requested) return null;
-  const command = res.command.trim();
-  if (!command || !res.code.trim()) return null;
-  const parsed = Date.parse(res.expires_at);
-  const fromSeconds = Number.isFinite(res.expires_in_seconds)
-    ? nowMs + res.expires_in_seconds * 1000
-    : nowMs + CHANNEL_BINDINGS_MAX_WAIT_MS;
-  const serverExpiry = Number.isFinite(parsed) ? parsed : fromSeconds;
+  nowMs = Date.now(),
+): IssuedBindCodeState {
+  const parsed = res.expires_at ? Date.parse(res.expires_at) : NaN;
+  const fallbackMs =
+    nowMs +
+    Math.min(
+      Math.max((res.expires_in_seconds ?? 300) * 1000, 0),
+      CHANNEL_BINDINGS_MAX_WAIT_MS,
+    );
+  const cappedMs = Number.isFinite(parsed)
+    ? Math.min(parsed, nowMs + CHANNEL_BINDINGS_MAX_WAIT_MS)
+    : fallbackMs;
+
   return {
-    platform: requested,
-    command,
-    expiresAtMs: Math.min(serverExpiry, nowMs + CHANNEL_BINDINGS_MAX_WAIT_MS),
+    code: res.code,
+    platform,
+    expiresAt: res.expires_at,
+    expiresAtMs: cappedMs,
+    command: res.command,
   };
 }
 
-function bindingRow(
-  data: DaltonChannelBindingsResponse,
-  platform: PersonalBindPlatform,
-): DaltonChannelBindingState | null {
-  const row = data.bindings?.[platform];
-  if (!row || typeof row.linked !== 'boolean') return null;
-  return row;
-}
-
-function isLive(code: IssuedBindCode | undefined, nowMs: number): code is IssuedBindCode {
-  return code !== undefined && nowMs < code.expiresAtMs;
-}
-
-function readableGenerateError(err: unknown, fallback: string): string {
-  const detail = formatApiErrorDetail(err);
-  if (!detail || detail === 'Request failed' || detail.startsWith('Request failed with status code')) {
-    return fallback;
-  }
-  return `${fallback} ${detail}`;
-}
-
-export function DaltonChannelBindingsCard(): React.ReactElement {
+/** Personal Feishu and Discord account bindings built with SettingsGroup + Dalton primitives. */
+export function DaltonChannelBindingsCard() {
   const { t } = useTranslation();
   const locale = useLocale();
-  const copy = useSettingCopy();
-  const heading = copy(SETTINGS.daltonChannelBindings);
   const queryClient = useQueryClient();
-  const [codes, setCodes] = useState<Partial<Record<PersonalBindPlatform, IssuedBindCode>>>({});
-  const [pending, setPending] = useState<Partial<Record<PersonalBindPlatform, boolean>>>({});
-  const [actionError, setActionError] = useState<Partial<Record<PersonalBindPlatform, string | null>>>({});
-  const [copyState, setCopyState] = useState<Partial<Record<PersonalBindPlatform, 'copied' | 'failed' | null>>>({});
-  const inflight = useRef<Partial<Record<PersonalBindPlatform, boolean>>>({});
 
-  const now = useNow(EXPIRY_CLOCK_MS, (tick) => (
-    BIND_PLATFORMS.some((platform) => isLive(codes[platform], tick))
-  ));
-  const hasLiveCode = BIND_PLATFORMS.some((platform) => isLive(codes[platform], now));
+  const [codes, setCodes] = useState<Partial<Record<BindPlatform, IssuedBindCodeState>>>({});
+  const [pendingPlatforms, setPendingPlatforms] = useState<Partial<Record<BindPlatform, boolean>>>({});
+  const [generateError, setGenerateError] = useState<Partial<Record<BindPlatform, string>>>({});
+  const [copiedPlatform, setCopiedPlatform] = useState<BindPlatform | null>(null);
+  const [copyError, setCopyError] = useState<Partial<Record<BindPlatform, string>>>({});
+  const requestSeqRef = useRef<Record<BindPlatform, number>>({ feishu: 0, discord: 0 });
+  const inFlightRef = useRef<Record<BindPlatform, boolean>>({ feishu: false, discord: false });
+
+  const hasActiveCode = Object.values(codes).some((c) => Boolean(c));
+  const now = useNow(CHANNEL_BINDINGS_POLL_MS, hasActiveCode);
 
   const bindingsQuery = useQuery({
     queryKey: queryKeys.dalton.channelBindings(),
     queryFn: fetchDaltonChannelBindings,
-    staleTime: 30_000,
     retry: false,
-    refetchOnWindowFocus: 'always',
-    refetchInterval: hasLiveCode ? CHANNEL_BINDINGS_POLL_MS : false,
-    refetchIntervalInBackground: false,
   });
 
+  // Poll while an issued code is active and unlinked; refetch on window focus
   useEffect(() => {
-    const data = bindingsQuery.data;
-    if (!data) return;
+    const activeEntries = (
+      Object.entries(codes) as Array<[BindPlatform, IssuedBindCodeState | undefined]>
+    ).filter(([platform, code]) => {
+      if (!code) return false;
+      const linked = bindingsQuery.data?.bindings?.[platform]?.linked === true;
+      return !linked && code.expiresAtMs > Date.now();
+    });
+    if (activeEntries.length === 0) return;
+
+    const timer = window.setInterval(() => {
+      void bindingsQuery.refetch();
+    }, CHANNEL_BINDINGS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [codes, bindingsQuery]);
+
+  // Clear any issued code once its platform reports linked
+  useEffect(() => {
+    const b = bindingsQuery.data?.bindings;
+    if (!b) return;
     setCodes((prev) => {
       let changed = false;
       const next = { ...prev };
-      for (const platform of BIND_PLATFORMS) {
-        if (next[platform] && bindingRow(data, platform)?.linked === true) {
+      for (const platform of PLATFORMS) {
+        if (next[platform] && b[platform]?.linked === true) {
           delete next[platform];
           changed = true;
         }
       }
       return changed ? next : prev;
     });
-  }, [bindingsQuery.data]);
+  }, [bindingsQuery.data?.bindings]);
 
-  const platformLabel = (platform: PersonalBindPlatform): string => (
-    t(platform === 'feishu' ? 'settings.dalton.channelPlatformFeishu' : 'settings.dalton.channelPlatformDiscord')
-  );
+  useEffect(() => {
+    const onFocus = () => {
+      void bindingsQuery.refetch();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [bindingsQuery]);
 
-  const createCode = useMutation({
-    mutationFn: (platform: PersonalBindPlatform) => createDaltonChannelBindCode(platform),
-    onSuccess: (res, platform) => {
-      const issued = issuedBindCode(res, platform, Date.now());
-      if (!issued) {
-        setActionError((prev) => ({
-          ...prev,
-          [platform]: t('settings.dalton.channelBindingsGenerateError', { platform: platformLabel(platform) }),
-        }));
-        return;
-      }
-      setCodes((prev) => ({ ...prev, [platform]: issued }));
-      setActionError((prev) => ({ ...prev, [platform]: null }));
-      setCopyState((prev) => ({ ...prev, [platform]: null }));
-      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.channelBindings() });
-    },
-    onError: (err, platform) => {
-      setActionError((prev) => ({
-        ...prev,
-        [platform]: readableGenerateError(
-          err,
-          t('settings.dalton.channelBindingsGenerateError', { platform: platformLabel(platform) }),
-        ),
-      }));
-    },
-    // Each outstanding platform request clears its own pending state.
-    onSettled: (_data, _error, platform) => {
-      inflight.current[platform] = false;
-      setPending((prev) => ({ ...prev, [platform]: false }));
-    },
-  });
+  useEffect(() => {
+    if (!copiedPlatform) return;
+    const timer = window.setTimeout(() => setCopiedPlatform(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copiedPlatform]);
 
-  const requestCode = (platform: PersonalBindPlatform) => {
-    if (inflight.current[platform]) return;
-    inflight.current[platform] = true;
-    setPending((prev) => ({ ...prev, [platform]: true }));
-    setActionError((prev) => ({ ...prev, [platform]: null }));
-    // The server revokes the previous code when it accepts this request, even if the new response is lost.
+  const handleGenerate = async (platform: BindPlatform) => {
+    if (inFlightRef.current[platform]) return;
+    inFlightRef.current[platform] = true;
+    const seq = ++requestSeqRef.current[platform];
+
+    setPendingPlatforms((prev) => ({ ...prev, [platform]: true }));
     setCodes((prev) => {
-      if (!prev[platform]) return prev;
       const next = { ...prev };
       delete next[platform];
       return next;
     });
-    setCopyState((prev) => ({ ...prev, [platform]: null }));
-    createCode.mutate(platform);
-  };
-
-  const copyCommand = (platform: PersonalBindPlatform, command: string) => {
-    void copyText(command).then(() => {
-      setCopyState((prev) => ({ ...prev, [platform]: 'copied' }));
-    }, () => {
-      setCopyState((prev) => ({ ...prev, [platform]: 'failed' }));
+    setGenerateError((prev) => {
+      const next = { ...prev };
+      delete next[platform];
+      return next;
     });
+    setCopyError((prev) => {
+      const next = { ...prev };
+      delete next[platform];
+      return next;
+    });
+
+    const label =
+      platform === 'feishu'
+        ? t('settings.dalton.channelPlatformFeishu')
+        : t('settings.dalton.channelPlatformDiscord');
+
+    try {
+      const created = await createDaltonChannelBindCode(platform);
+      if (requestSeqRef.current[platform] !== seq) return;
+      if (created.platform && created.platform !== platform) {
+        setGenerateError((prev) => ({
+          ...prev,
+          [platform]: t('settings.dalton.channelBindingsGenerateError', { platform: label }),
+        }));
+        return;
+      }
+      setCodes((prev) => ({ ...prev, [platform]: issuedBindCode(platform, created) }));
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.channelBindings() });
+    } catch (err) {
+      if (requestSeqRef.current[platform] !== seq) return;
+      const detail = formatApiErrorDetail(err);
+      setGenerateError((prev) => ({
+        ...prev,
+        [platform]:
+          detail || t('settings.dalton.channelBindingsGenerateError', { platform: label }),
+      }));
+    } finally {
+      inFlightRef.current[platform] = false;
+      if (requestSeqRef.current[platform] === seq) {
+        setPendingPlatforms((prev) => ({ ...prev, [platform]: false }));
+      }
+    }
   };
 
+  const handleCopy = async (platform: BindPlatform, command: string) => {
+    const label =
+      platform === 'feishu'
+        ? t('settings.dalton.channelPlatformFeishu')
+        : t('settings.dalton.channelPlatformDiscord');
+    try {
+      await copyText(command);
+      setCopiedPlatform(platform);
+      setCopyError((prev) => {
+        const next = { ...prev };
+        delete next[platform];
+        return next;
+      });
+    } catch {
+      setCopyError((prev) => ({
+        ...prev,
+        [platform]: t('settings.dalton.channelBindingsCopyFailed', { platform: label }),
+      }));
+    }
+  };
+
+  const bindings = bindingsQuery.data?.bindings;
   const loadStatus = apiErrorStatus(bindingsQuery.error);
-  const loadFailed = bindingsQuery.isError && !bindingsQuery.data;
-  const refreshFailed = bindingsQuery.isError && Boolean(bindingsQuery.data);
-  const loadMessage = loadStatus === 401 || loadStatus === 403
-    ? t('settings.dalton.channelBindingsForbidden')
-    : t('settings.dalton.channelBindingsLoadError');
+  const loadForbidden = loadStatus === 401 || loadStatus === 403;
 
   return (
-    <SettingsGroup
-      id={heading.id}
-      title={heading.label}
-      description={heading.description}
-      action={bindingsQuery.isPending ? undefined : (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="tap-target h-auto min-h-9 max-w-full whitespace-normal"
-          disabled={bindingsQuery.isFetching}
-          onClick={() => { void bindingsQuery.refetch(); }}
-        >
-          {t('settings.dalton.channelBindingsRefresh')}
-        </Button>
-      )}
-    >
-      {bindingsQuery.isPending && (
-        <SettingsCardBody>
-          <p className="m-0 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('settings.dalton.channelBindingsLoading')}
-          </p>
-        </SettingsCardBody>
-      )}
-      {loadFailed && (
-        <SettingsCardBody>
-          <p role="alert" className="m-0 text-xs" style={{ color: 'var(--color-loss)' }}>
-            {loadMessage}
-          </p>
-          <Button
-            type="button"
-            size="sm"
-            className="tap-target mt-2 h-auto min-h-9 max-w-full whitespace-normal"
-            onClick={() => { void bindingsQuery.refetch(); }}
-          >
-            {t('settings.dalton.channelBindingsRetry')}
-          </Button>
-        </SettingsCardBody>
-      )}
-      {refreshFailed && (
-        <SettingsCardBody>
-          <p role="alert" className="m-0 text-xs" style={{ color: 'var(--color-loss)' }}>
+    <DaltonSettingsCard
+      id="dalton-channel-bindings"
+      testId="dalton-channel-bindings-card"
+      title={t('settings.dalton.channelBindingsLabel')}
+      description={t('settings.dalton.channelBindingsDesc')}
+      layout="rows"
+      action={
+        <DaltonRefreshButton
+          busy={bindingsQuery.isFetching}
+          label={t('settings.dalton.channelBindingsRefresh')}
+          onClick={() => void bindingsQuery.refetch()}
+          testId="dalton-channel-bindings-refresh"
+        />
+      }
+      below={
+        bindingsQuery.isError && bindings ? (
+          <DaltonInlineNotice tone="warning" className="mt-2">
             {t('settings.dalton.channelBindingsRefreshError')}
-          </p>
-        </SettingsCardBody>
-      )}
-      {bindingsQuery.data && BIND_PLATFORMS.map((platform) => {
-        const data = bindingsQuery.data;
-        if (!data) return null;
-        const label = platformLabel(platform);
-        const row = bindingRow(data, platform);
-        const issued = codes[platform];
-        const linked = row?.linked === true;
-        const liveCode = !linked && isLive(issued, now) ? issued : null;
-        const expired = !linked && issued !== undefined && liveCode === null;
-        const busy = pending[platform] === true;
-        const name = row?.platform_username?.trim() || '';
-        const accountId = row?.platform_user_id?.trim() || '';
-        const status = row === null
-          ? t('settings.dalton.channelBindingsUnavailable')
-          : row.linked
-            ? t('settings.dalton.channelBindingsLinked')
-            : t('settings.dalton.channelBindingsNotLinked');
-        const detail = [
-          status,
-          row?.linked && name ? t('settings.dalton.channelBindingsAccountName', { name }) : '',
-          row?.linked && accountId ? t('settings.dalton.channelBindingsAccountId', { id: accountId }) : '',
-        ].filter(Boolean).join(' · ');
-        return (
-          <div key={platform} data-testid={`channel-bind-${platform}`} className="min-w-0 max-w-full">
-            <SettingRow label={label} description={detail}>
-              {row && !row.linked && (
-                <Button
-                  type="button"
-                  size="sm"
-                  className="tap-target h-auto min-h-9 max-w-full whitespace-normal"
-                  disabled={busy}
-                  onClick={() => requestCode(platform)}
-                >
-                  {busy
-                    ? t('settings.dalton.channelBindingsGenerating', { platform: label })
-                    : t('settings.dalton.channelBindingsGenerate', { platform: label })}
-                </Button>
-              )}
-            </SettingRow>
-            {liveCode && (
-              <SettingsCardBody>
-                <p
-                  className="m-0 break-all font-mono text-[0.8125rem] leading-5"
-                  style={{ color: 'var(--color-text-primary)' }}
-                  data-testid={`channel-bind-command-${platform}`}
-                >
-                  {liveCode.command}
-                </p>
-                <p className="mb-0 mt-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('settings.dalton.channelBindingsExpires', {
-                    time: formatTimestamp(new Date(liveCode.expiresAtMs).toISOString(), locale),
-                  })}
-                </p>
-                <p className="mb-0 mt-1 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('settings.dalton.channelBindingsDmHint')}
-                </p>
+          </DaltonInlineNotice>
+        ) : undefined
+      }
+    >
+      {bindingsQuery.isLoading ? (
+        <div className="p-4">
+          <DaltonLoadingRow label={t('settings.dalton.channelBindingsLoading')} />
+        </div>
+      ) : bindingsQuery.isError && !bindings ? (
+        <div className="p-4">
+          <DaltonInlineNotice
+            tone={loadForbidden ? 'warning' : 'error'}
+            action={
+              !loadForbidden ? (
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="tap-target mt-2 h-auto min-h-9 max-w-full whitespace-normal"
-                  onClick={() => copyCommand(platform, liveCode.command)}
+                  className="h-8 gap-1.5 text-xs"
+                  onClick={() => void bindingsQuery.refetch()}
                 >
-                  {t('settings.dalton.channelBindingsCopy', { platform: label })}
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>{t('settings.dalton.channelBindingsRetry')}</span>
                 </Button>
-                <p className="mb-0 mt-1 text-xs" aria-live="polite" style={{ color: copyState[platform] === 'failed' ? 'var(--color-loss)' : 'var(--color-text-tertiary)' }}>
-                  {copyState[platform] === 'copied' && t('settings.dalton.channelBindingsCopied', { platform: label })}
-                  {copyState[platform] === 'failed' && t('settings.dalton.channelBindingsCopyFailed', { platform: label })}
-                </p>
-              </SettingsCardBody>
-            )}
-            {expired && (
-              <SettingsCardBody>
-                <p role="status" className="m-0 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('settings.dalton.channelBindingsExpired', { platform: label })}
-                </p>
-              </SettingsCardBody>
-            )}
-            {actionError[platform] && (
-              <SettingsCardBody>
-                <p role="alert" className="m-0 text-xs" style={{ color: 'var(--color-loss)' }}>
-                  {actionError[platform]}
-                </p>
-              </SettingsCardBody>
-            )}
-          </div>
-        );
-      })}
-    </SettingsGroup>
+              ) : undefined
+            }
+          >
+            {loadForbidden
+              ? t('settings.dalton.channelBindingsForbidden')
+              : t('settings.dalton.channelBindingsLoadError')}
+          </DaltonInlineNotice>
+        </div>
+      ) : (
+        PLATFORMS.map((platform) => {
+          const label =
+            platform === 'feishu'
+              ? t('settings.dalton.channelPlatformFeishu')
+              : t('settings.dalton.channelPlatformDiscord');
+          const state: DaltonChannelBindingState | undefined = bindings?.[platform];
+          const knownLinked = typeof state?.linked === 'boolean' ? state.linked : null;
+          const unavailable = knownLinked === null;
+          const linked = knownLinked === true;
+          const generated = codes[platform];
+          const isExpired = Boolean(generated && generated.expiresAtMs <= now);
+          const isGenerating = pendingPlatforms[platform] === true;
+          const isCopied = copiedPlatform === platform;
+          const accountName = state?.platform_username?.trim() || null;
+          const accountId = state?.platform_user_id?.trim() || null;
+
+          return (
+            <div key={platform} className="p-4 space-y-3" data-testid={`dalton-channel-row-${platform}`}>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="text-sm font-medium"
+                      style={{ color: 'var(--color-text-primary)' }}
+                    >
+                      {label}
+                    </span>
+                    <DaltonStatusBadge
+                      dot
+                      tone={unavailable ? 'neutral' : linked ? 'success' : 'neutral'}
+                      label={
+                        unavailable
+                          ? t('settings.dalton.channelBindingsUnavailable')
+                          : linked
+                            ? t('settings.dalton.channelBindingsLinked')
+                            : t('settings.dalton.channelBindingsNotLinked')
+                      }
+                    />
+                  </div>
+                  {linked && (accountName || accountId) && (
+                    <div
+                      className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs"
+                      style={{ color: 'var(--color-text-secondary)' }}
+                    >
+                      {accountName && (
+                        <span>
+                          {t('settings.dalton.channelBindingsAccountName', {
+                            name: accountName,
+                          })}
+                        </span>
+                      )}
+                      {accountId && (
+                        <span className="font-mono text-[11px]">
+                          {t('settings.dalton.channelBindingsAccountId', {
+                            id: accountId,
+                          })}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {!unavailable && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 text-xs"
+                    disabled={isGenerating}
+                    onClick={() => void handleGenerate(platform)}
+                    data-testid={`dalton-channel-generate-${platform}`}
+                  >
+                    {isGenerating
+                      ? t('settings.dalton.channelBindingsGenerating', { platform: label })
+                      : t('settings.dalton.channelBindingsGenerate', { platform: label })}
+                  </Button>
+                )}
+              </div>
+
+              {generateError[platform] && (
+                <DaltonInlineNotice tone="error">{generateError[platform]}</DaltonInlineNotice>
+              )}
+
+              {generated && (
+                <div
+                  className="rounded-md border px-3 py-2.5 space-y-2"
+                  style={{
+                    borderColor: 'var(--color-border-muted)',
+                    backgroundColor: 'var(--color-bg-elevated)',
+                  }}
+                >
+                  {isExpired ? (
+                    <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                      {t('settings.dalton.channelBindingsExpired', { platform: label })}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <code
+                          className="text-xs font-mono select-all break-all"
+                          style={{ color: 'var(--color-text-primary)' }}
+                        >
+                          {generated.command}
+                        </code>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-8 gap-1.5 text-xs shrink-0"
+                          onClick={() => void handleCopy(platform, generated.command)}
+                          data-testid={`dalton-channel-copy-${platform}`}
+                        >
+                          {isCopied ? (
+                            <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-success)' }} />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                          <span>
+                            {isCopied
+                              ? t('settings.dalton.channelBindingsCopied', { platform: label })
+                              : t('settings.dalton.channelBindingsCopy', { platform: label })}
+                          </span>
+                        </Button>
+                      </div>
+                      {copyError[platform] && (
+                        <DaltonInlineNotice tone="warning">{copyError[platform]}</DaltonInlineNotice>
+                      )}
+                      <div className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                        {t('settings.dalton.channelBindingsExpires', {
+                          time: formatTimestamp(generated.expiresAt, locale),
+                        })}
+                      </div>
+                      <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                        {t('settings.dalton.channelBindingsDmHint')}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })
+      )}
+    </DaltonSettingsCard>
   );
 }

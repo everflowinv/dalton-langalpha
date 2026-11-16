@@ -6,6 +6,18 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 const h = vi.hoisted(() => ({
   platformMode: false,
+  // DALTON-HOOK(settings-reorg): allow simulating pending/error credential queries in ModelsPanel tests
+  daltonAuth: false,
+  teamCreds: {
+    isShared: false,
+    canDisconnect: true,
+    canManage: true,
+    isPm: true,
+    canInvite: false,
+    callerTier: null as string | null,
+    callerTierPending: false,
+    callerTierError: false,
+  },
   payers: {} as Record<string, string>,
   mutate: vi.fn((_payload: unknown) => undefined),
   mutateAsync: vi.fn(async (_payload: unknown) => ({})),
@@ -182,14 +194,23 @@ vi.mock('@/pages/Settings/panels/dalton/DaltonSection', () => ({
   DaltonSection: () => null,
 }));
 
+// DALTON-HOOK(settings-reorg): control daltonAuth flag for ModelsPanel permission tests
+vi.mock('@/config/daltonAuth', () => ({
+  get isDaltonAuth() {
+    return h.daltonAuth;
+  },
+}));
+
 // DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint
+// DALTON-HOOK(settings-reorg): expose mutable team credentials state for loading/error fail-closed tests
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
-  useTeamCredentials: () => ({ isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false }),
+  useTeamCredentials: () => h.teamCreds,
 }));
 
 // Import after mocks are registered.
 import Settings from '../Settings';
+import { ModelAccessSection } from '../panels/ModelAccessSection';
 
 function renderModelTab() {
   const queryClient = new QueryClient({
@@ -355,11 +376,13 @@ describe('Settings: Auto defaults', () => {
   });
 });
 
-// DALTON-HOOK(settings-section): test Dalton timeout draft editing and system-only catalog filtering
+// DALTON-HOOK(settings-reorg): expand the collapsed background-models disclosure before asserting controls
 describe('Settings: Dalton routing controls', () => {
   it('allows typing 300 digit-by-digit from empty in the audit timeout input and saves on blur or Enter', async () => {
     localStorage.setItem('settings:modelMode', 'advanced');
     renderModelTab();
+
+    fireEvent.click(await screen.findByTestId('dalton-routing-toggle'));
 
     const timeoutInput = (await screen.findByLabelText(/Figure audit timeout/i)) as HTMLInputElement;
     expect(timeoutInput.value).toBe('');
@@ -367,7 +390,7 @@ describe('Settings: Dalton routing controls', () => {
 
     const auditSelect = screen.getByRole('combobox', { name: 'Figure audit model' }) as HTMLSelectElement;
     expect(auditSelect.options[0].textContent).toContain('gemini-4-argon-medium-oauth');
-    const extractSelect = screen.getByRole('combobox', { name: 'Conversation archive extraction model' }) as HTMLSelectElement;
+    const extractSelect = screen.getByRole('combobox', { name: 'Research memory extraction model' }) as HTMLSelectElement;
     expect(extractSelect.options[0].textContent).toContain('deepseek-flash');
     expect(
       screen.getByText(/gpt-6\.1-sol-oauth, claude-opus-5-5-oauth/),
@@ -392,12 +415,14 @@ describe('Settings: Dalton routing controls', () => {
       model_preference: { dalton_audit_timeout_s: 300 },
     });
 
-    // Out-of-range value on Enter shows Chinese error message and does not save
+    // Out-of-range value on Enter shows localized error message and does not save
     h.mutate.mockClear();
     fireEvent.change(timeoutInput, { target: { value: '45' } });
     fireEvent.keyDown(timeoutInput, { key: 'Enter' });
     expect(h.mutate).not.toHaveBeenCalled();
-    expect(screen.getByRole('alert')).toHaveTextContent('数字核验超时必须在 60–1800 秒之间');
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Enter an integer between 60 and 1800 seconds (1–30 minutes)',
+    );
   });
 
   // DALTON-HOOK(settings-section): verify Dalton dropdowns exclude custom_models
@@ -416,6 +441,7 @@ describe('Settings: Dalton routing controls', () => {
     };
     try {
       renderModelTab();
+      fireEvent.click(await screen.findByTestId('dalton-routing-toggle'));
       const auditSelect = (await screen.findByRole('combobox', { name: 'Figure audit model' })) as HTMLSelectElement;
       const optionValues = [...auditSelect.options].map((o) => o.value);
       expect(optionValues).toContain('gpt-sol');
@@ -434,6 +460,7 @@ describe('Settings: Dalton routing controls', () => {
   it('shows the language review default and saves the choice under dalton_language_model', async () => {
     localStorage.setItem('settings:modelMode', 'advanced');
     renderModelTab();
+    fireEvent.click(await screen.findByTestId('dalton-routing-toggle'));
 
     const langSelect = (await screen.findByRole('combobox', { name: 'Language review model' })) as HTMLSelectElement;
     // The empty option carries the effective system default (audit fallback).
@@ -453,6 +480,7 @@ describe('Settings: Dalton routing controls', () => {
     };
     try {
       renderModelTab();
+      fireEvent.click(await screen.findByTestId('dalton-routing-toggle'));
       const langSelect = (await screen.findByRole('combobox', { name: 'Language review model' })) as HTMLSelectElement;
       expect(langSelect.value).toBe('claude-big');
     } finally {
@@ -563,5 +591,126 @@ describe('payers in the default fallbacks and favorites', () => {
     renderModelTab();
     const chip = screen.getByRole('button', { name: /claude-big/i }).parentElement!;
     expect(chip).toHaveTextContent('Your key');
+  });
+
+  // DALTON-HOOK(settings-reorg): verify AccountDefaults + PerModelMatrix live inside the single collapsed advanced group with Expand/Collapse
+  it('folds account defaults & per-model matrix into the single collapsed group with Expand/Collapse toggle', () => {
+    localStorage.setItem('settings:modelMode', 'advanced');
+    renderModelTab();
+
+    const toggle = screen.getByTestId('dalton-routing-toggle');
+    expect(toggle).toHaveTextContent('Expand');
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveTextContent('Collapse');
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(document.getElementById('account-defaults')).toBeInTheDocument();
+    expect(document.getElementById('per-model')).toBeInTheDocument();
+    expect(document.getElementById('dalton-audit-model')).toBeInTheDocument();
+  });
+
+  // DALTON-HOOK(settings-reorg): ModelAccess on personal Models tab shows skeleton while loading and fails closed to personal-only on error
+  it('shows skeleton while team credentials are pending and fails closed to personal scope on error', () => {
+    h.daltonAuth = true;
+    h.teamCreds = {
+      isShared: false,
+      canDisconnect: false,
+      canManage: true,
+      isPm: false,
+      canInvite: false,
+      callerTier: null,
+      callerTierPending: true,
+      callerTierError: false,
+    };
+
+    const { unmount } = renderModelTab();
+    expect(screen.getByTestId('model-access-pending-skeleton')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Connect subscription' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add API key' })).not.toBeInTheDocument();
+    unmount();
+
+    // Fail closed when credentials query errors without cache: keep personal scope only, hide shared add buttons
+    h.teamCreds = {
+      ...h.teamCreds,
+      callerTierPending: false,
+      callerTierError: true,
+    };
+    renderModelTab();
+    expect(screen.queryByTestId('model-access-pending-skeleton')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Connect subscription' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add API key' })).not.toBeInTheDocument();
+
+    h.daltonAuth = false;
+    h.teamCreds = {
+      isShared: false,
+      canDisconnect: true,
+      canManage: true,
+      isPm: true,
+      canInvite: false,
+      callerTier: null,
+      callerTierPending: false,
+      callerTierError: false,
+    };
+  });
+
+  // DALTON-HOOK(settings-reorg): standalone ModelAccessSection(scope='all') also guards pending/error without leaking team controls
+  it('guards standalone ModelAccessSection on pending and error credential states', () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    h.daltonAuth = true;
+    h.teamCreds = {
+      isShared: false,
+      canDisconnect: false,
+      canManage: true,
+      isPm: false,
+      canInvite: false,
+      callerTier: null,
+      callerTierPending: true,
+      callerTierError: false,
+    };
+
+    const { rerender } = render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/settings?tab=model']}>
+          <ModelAccessSection scope="all" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId('model-access-pending-skeleton')).toBeInTheDocument();
+
+    h.teamCreds = {
+      ...h.teamCreds,
+      callerTierPending: false,
+      callerTierError: true,
+    };
+    rerender(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/settings?tab=model']}>
+          <ModelAccessSection scope="all" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId('model-access-pending-skeleton')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Connect subscription' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add API key' })).not.toBeInTheDocument();
+    expect(screen.queryByText('API keys')).not.toBeInTheDocument();
+    expect(screen.getByTestId('model-access-creds-error')).toHaveTextContent(
+      'Could not load team credentials status right now. Refresh to try again.',
+    );
+    expect(screen.queryByText(/managed by.*admin/i)).not.toBeInTheDocument();
+
+    h.daltonAuth = false;
+    h.teamCreds = {
+      isShared: false,
+      canDisconnect: true,
+      canManage: true,
+      isPm: true,
+      canInvite: false,
+      callerTier: null,
+      callerTierPending: false,
+      callerTierError: false,
+    };
   });
 });

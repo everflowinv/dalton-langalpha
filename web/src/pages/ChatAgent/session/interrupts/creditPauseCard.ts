@@ -25,8 +25,9 @@ export function buildCreditPauseState(
     (import.meta.env.VITE_PLATFORM_URL as string | undefined) || '/account',
   );
   // DALTON-HOOK(pause-links): point OSS credit pause card to Dalton budget settings
+  // DALTON-HOOK(settings-reorg): Dalton budget moved to ?tab=budget#dalton-budget
   if (!isPlatformMode && (Boolean(import.meta.env.VITE_DALTON_MODE) || message?.includes('Dalton') || message?.includes('今日预算') || message?.includes('任务预算'))) {
-    links = [{ label: '调整日预算', labelKey: 'dalton.budget.adjust', url: '/settings?tab=model#dalton-budget' }];
+    links = [{ label: '调整日预算', labelKey: 'dalton.budget.adjust', url: '/settings?tab=budget#dalton-budget' }];
   }
   return { status: 'pending', message, links, interruptId };
 }

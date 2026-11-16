@@ -12,12 +12,15 @@ import { applyLocale } from '@/hooks/useLocaleChoice';
 import { isSupported } from '@/lib/locale';
 import { deviceTimezone } from '@/lib/deviceTimezone';
 import { queryKeys } from '@/lib/queryKeys';
-import { isDesktopShell } from '@/lib/desktop';
+import { canDesktopSettings, isDesktopShell } from '@/lib/desktop';
 import { getShareLinkOpen, setShareLinkOpen } from '@/lib/shareLinkOpen';
 import { useOnboarding } from '@/pages/Onboarding';
 import { SegmentedRow, SettingRow, SettingsGroup } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SETTINGS } from '../sections';
+// DALTON-HOOK(settings-reorg): merge Appearance and conditional Desktop panels into General & Appearance
+import { AppearancePanel } from './AppearancePanel';
+import { DesktopPanel } from './DesktopPanel';
 import { useSaveFailureToast } from './usePreferenceWrite';
 
 const LOCALES = [
@@ -130,6 +133,10 @@ export function GeneralPanel() {
           </div>
         </SettingRow>
       </SettingsGroup>
+
+      {/* DALTON-HOOK(settings-reorg): merged Appearance & conditional Desktop settings */}
+      <AppearancePanel />
+      {canDesktopSettings() && <DesktopPanel />}
     </>
   );
 }

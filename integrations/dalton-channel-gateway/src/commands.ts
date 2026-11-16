@@ -35,13 +35,14 @@ export type ParsedSlashCommand =
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// DALTON-HOOK(settings-reorg): point personal channel bind help to Messaging & Channels tab
 /** Settings entry where the signed-in user generates a Feishu or Discord bind code. */
 export const PERSONAL_CHANNEL_BINDINGS_PATH =
-  "/settings?tab=model#dalton-channel-bindings";
+  "/settings?tab=integrations#dalton-channel-bindings";
 
-/** English labels of that entry: Models section, then the Feishu and Discord card. */
+/** English labels of that entry: Messaging & Channels section, then Feishu & Discord links. */
 export const PERSONAL_CHANNEL_BINDINGS_PLACE =
-  "Settings → Models → Feishu and Discord accounts";
+  "Settings → Messaging & Channels → Feishu & Discord account links";
 
 /** Shape of the command `POST /channels/bind-codes` returns. The code is `DLT-` plus two groups of four. */
 export const PERSONAL_BIND_COMMAND_SHAPE = "/bind DLT-XXXX-XXXX";

@@ -15,19 +15,27 @@ export function SettingsGroup({
   title,
   description,
   action,
+  'data-testid': dataTestId,
   children,
 }: {
   // DALTON-HOOK(settings-section): a settings hash, including personal channel bindings, scrolls to this group
+  // DALTON-HOOK(settings-reorg): allow cards wrapped in SettingsGroup to pass data-testid directly
   id?: string;
   title?: string;
   description?: ReactNode;
   /** A control for the whole group, level with its title. */
   action?: ReactNode;
+  'data-testid'?: string;
   children: ReactNode;
 }) {
   const titleId = useId();
   return (
-    <section id={id} className="settings-group" aria-labelledby={title ? titleId : undefined}>
+    <section
+      id={id}
+      data-testid={dataTestId}
+      className="settings-group"
+      aria-labelledby={title ? titleId : undefined}
+    >
       {(title || description || action) && (
         <div className="settings-group-head">
           <div className="min-w-0 flex-[1_1_220px]">

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   platformMode: false,
   daltonAuth: false, // DALTON-HOOK(hide-experiments)
   canInvite: false, // DALTON-HOOK(settings-section)
+  callerTier: undefined as string | null | undefined,
   mutateAsync: vi.fn(async (_payload: unknown) => ({})),
   user: null as Record<string, unknown> | null,
   preferences: null as Record<string, unknown> | null,
@@ -24,6 +25,9 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     canManage: h.canInvite,
     isPm: h.canInvite,
     canInvite: h.canInvite,
+    callerTier: h.callerTier !== undefined ? h.callerTier : (h.canInvite ? 'admin' : undefined),
+    callerTierPending: false,
+    callerTierError: false,
   }),
 }));
 
@@ -143,6 +147,7 @@ beforeEach(() => {
   h.platformMode = false;
   h.daltonAuth = false; // DALTON-HOOK(hide-experiments)
   h.canInvite = false; // DALTON-HOOK(settings-section)
+  h.callerTier = undefined;
   h.validModelNames = new Set<string>();
   h.mutateAsync.mockClear();
   h.mutateAsync.mockResolvedValue({});
@@ -359,27 +364,28 @@ describe("Settings: the user's instructions", () => {
     ).toBe('account');
   });
 
-  // DALTON-HOOK(settings-section): legacy Settings deep links and Dalton Chinese search keywords
+  // DALTON-HOOK(settings-reorg): legacy Settings deep links and Dalton Chinese search keywords
   it('resolves legacy tab params and hashes to their new sections', () => {
     expect(readSection(new URLSearchParams('tab=userInfo'), '')).toBe('account');
     expect(readSection(new URLSearchParams('tab=models'), '')).toBe('model');
     expect(readSection(new URLSearchParams('tab=dalton'), '')).toBe('model');
-    expect(readSection(new URLSearchParams('tab=preferences'), '#card-style')).toBe('appearance');
-    expect(readSection(new URLSearchParams('tab=preferences'), '#output-format')).toBe('agent');
-    expect(readSection(new URLSearchParams(), '#dalton-budget')).toBe('model');
-    expect(readSection(new URLSearchParams(), '#dalton-cos-sharing')).toBe('model');
+    expect(readSection(new URLSearchParams('tab=preferences'), '#card-style')).toBe('general');
+    expect(readSection(new URLSearchParams('tab=preferences'), '#output-format')).toBe('chat');
+    expect(readSection(new URLSearchParams(), '#dalton-budget')).toBe('budget');
+    expect(readSection(new URLSearchParams(), '#dalton-cos-sharing')).toBe('chat');
     expect(readSection(new URLSearchParams(), '#dalton-reviewer-models')).toBe('model');
+    expect(readSection(new URLSearchParams('tab=model'), '#connected-accounts')).toBe('model');
   });
 
-  // DALTON-HOOK(settings-section): Feishu and Discord bind codes stay on Models in platform and self-hosted modes
-  it('opens Feishu and Discord account bindings from the model settings hash', () => {
+  // DALTON-HOOK(settings-reorg): Feishu and Discord bind codes move to Messaging & Channels (integrations)
+  it('opens Feishu and Discord account bindings from the messaging & channels hash', () => {
     for (const platformMode of [false, true]) {
       h.platformMode = platformMode;
-      expect(sectionShown('model')).toBe(true);
-      expect(readSection(new URLSearchParams('tab=model'), '#dalton-channel-bindings')).toBe('model');
-      expect(readSection(new URLSearchParams('tab=integrations'), '#dalton-channel-bindings')).toBe('model');
+      expect(sectionShown('integrations')).toBe(true);
+      expect(readSection(new URLSearchParams('tab=model'), '#dalton-channel-bindings')).toBe('integrations');
+      expect(readSection(new URLSearchParams('tab=integrations'), '#dalton-channel-bindings')).toBe('integrations');
       const entry = searchableSettings(true).find((item) => item.anchor === 'dalton-channel-bindings');
-      expect(entry?.section).toBe('model');
+      expect(entry?.section).toBe('integrations');
       expect(entry?.labelKey).toBe('settings.dalton.channelBindingsLabel');
       expect(entry?.advanced).toBeUndefined();
       expect(entry?.visibleWhen).toBeUndefined();
@@ -391,10 +397,12 @@ describe("Settings: the user's instructions", () => {
     setupAndRender();
     const searchInput = await screen.findByRole('combobox', { name: /Search settings/i });
     fireEvent.change(searchInput, { target: { value: '绑定码' } });
-    expect(await screen.findByText('Feishu and Discord accounts')).toBeInTheDocument();
+    expect(await screen.findByText('Feishu & Discord account links')).toBeInTheDocument();
   });
 
   it('finds Dalton settings in search by Chinese keywords ("预算", "审稿", "研究总监")', async () => {
+    h.daltonAuth = true;
+    h.callerTier = 'internal';
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -412,32 +420,34 @@ describe("Settings: the user's instructions", () => {
     const searchInput = await screen.findByRole('combobox', { name: /Search settings/i });
 
     fireEvent.change(searchInput, { target: { value: '预算' } });
-    expect(await screen.findByText('Daily budget & spending limits')).toBeInTheDocument();
+    expect(await screen.findByText('Daily budget & spending limit')).toBeInTheDocument();
 
     fireEvent.change(searchInput, { target: { value: '审稿' } });
     expect(await screen.findByText('Independent reviewer candidates')).toBeInTheDocument();
 
     fireEvent.change(searchInput, { target: { value: '研究总监' } });
-    expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
+    const listbox = await screen.findByRole('listbox');
+    expect(within(listbox).getByText('Workspace collaboration sharing')).toBeInTheDocument();
   });
 
-  // DALTON-HOOK(settings-section): filter Dalton invite and Feishu scope settings in search by canInvite
+  // DALTON-HOOK(settings-reorg): filter Dalton invite and Feishu scope settings in search by minTier/callerTier
   it('hides invite and Feishu scope settings in search for non-admins and shows them for admins', async () => {
+    h.daltonAuth = true;
     h.canInvite = false;
     const { unmount } = setupAndRender({});
     const nonAdminSearch = await screen.findByRole('combobox', { name: /Search settings/i });
 
     fireEvent.change(nonAdminSearch, { target: { value: '邀请' } });
-    expect(screen.queryByText('Team invitations & member access')).not.toBeInTheDocument();
+    expect(screen.queryByText('Member invitations & access')).not.toBeInTheDocument();
     expect(screen.getByText('No settings match.')).toBeInTheDocument();
 
     fireEvent.change(nonAdminSearch, { target: { value: '飞书' } });
-    expect(screen.queryByText('Feishu read scopes')).not.toBeInTheDocument();
-    // The master push switch is every member's own card, so it still answers "飞书".
-    expect(await screen.findByText('Master push switch')).toBeInTheDocument();
+    expect(screen.queryByText('Feishu document access')).not.toBeInTheDocument();
+    // Push notifications card is every member's own card, so it still answers "飞书".
+    expect(await screen.findByText('Push notifications & recipients')).toBeInTheDocument();
     // DALTON-HOOK(settings-section): 推送总开关 is a search term for that card
     fireEvent.change(nonAdminSearch, { target: { value: '总开关' } });
-    expect(await screen.findByText('Master push switch')).toBeInTheDocument();
+    expect(await screen.findByText('Push notifications & recipients')).toBeInTheDocument();
     unmount();
 
     h.canInvite = true;
@@ -445,15 +455,16 @@ describe("Settings: the user's instructions", () => {
     const adminSearch = await screen.findByRole('combobox', { name: /Search settings/i });
 
     fireEvent.change(adminSearch, { target: { value: '邀请' } });
-    expect(await screen.findByText('Team invitations & member access')).toBeInTheDocument();
+    expect(await screen.findByText('Member invitations & access')).toBeInTheDocument();
 
     fireEvent.change(adminSearch, { target: { value: '飞书' } });
-    expect(await screen.findByText('Feishu read scopes')).toBeInTheDocument();
+    expect(await screen.findByText('Feishu document access')).toBeInTheDocument();
     unmountAdmin();
   });
 
   // DALTON-HOOK(settings-section): filter Chief of Staff sharing in search for external members and when dispatch is off
   it('hides Chief of Staff workspace sharing in search for external members and shows it for internal members when dispatch is enabled', async () => {
+    h.daltonAuth = true;
     const extClient = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -470,14 +481,16 @@ describe("Settings: the user's instructions", () => {
     const extSearch = await screen.findByRole('combobox', { name: /Search settings/i });
 
     fireEvent.change(extSearch, { target: { value: '研究总监' } });
-    expect(screen.queryByText('Chief of Staff workspace sharing')).not.toBeInTheDocument();
+    expect(screen.queryByText('Workspace collaboration sharing')).not.toBeInTheDocument();
     expect(screen.getByText('No settings match.')).toBeInTheDocument();
 
     fireEvent.change(extSearch, { target: { value: '邀请' } });
-    expect(screen.queryByText('Team invitations & member access')).not.toBeInTheDocument();
+    expect(screen.queryByText('Member invitations & access')).not.toBeInTheDocument();
     expect(screen.getByText('No settings match.')).toBeInTheDocument();
     unmountExt();
 
+    h.canInvite = true;
+    h.callerTier = 'internal';
     const intClient = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -494,14 +507,14 @@ describe("Settings: the user's instructions", () => {
     const intSearch = await screen.findByRole('combobox', { name: /Search settings/i });
 
     fireEvent.change(intSearch, { target: { value: '研究总监' } });
-    expect(await screen.findByText('Chief of Staff workspace sharing')).toBeInTheDocument();
+    expect(within(await screen.findByRole('listbox')).getByText('Workspace collaboration sharing')).toBeInTheDocument();
 
     // DALTON-HOOK(settings-section): internal employees can find Team invitations in search, while external members cannot
     fireEvent.change(intSearch, { target: { value: '邀请' } });
-    expect(await screen.findByText('Team invitations & member access')).toBeInTheDocument();
+    expect(within(await screen.findByRole('listbox')).getByText('Member invitations & access')).toBeInTheDocument();
 
     fireEvent.change(intSearch, { target: { value: '飞书' } });
-    expect(screen.queryByText('Feishu read scopes')).not.toBeInTheDocument();
+    expect(screen.queryByText('Feishu document access')).not.toBeInTheDocument();
     unmountInt();
   });
 
@@ -512,7 +525,18 @@ describe("Settings: the user's instructions", () => {
     const search = await screen.findByRole('combobox', { name: /Search settings/i });
 
     fireEvent.change(search, { target: { value: '研究总监' } });
-    expect(screen.queryByText('Chief of Staff workspace sharing')).not.toBeInTheDocument();
+    expect(screen.queryByText('Workspace collaboration sharing')).not.toBeInTheDocument();
     expect(screen.getByText('No settings match.')).toBeInTheDocument();
+  });
+
+  // DALTON-HOOK(settings-reorg): verify connectedApps row stays hidden in OSS mode
+  it('hides connectedApps row on Messaging & Channels in OSS mode', async () => {
+    h.daltonAuth = false;
+    setupAndRender({});
+
+    const integrationsNav = await screen.findByRole('link', { name: 'Messaging & Channels' });
+    fireEvent.click(integrationsNav);
+    await screen.findByTestId('dalton-notify-targets-card');
+    expect(document.getElementById('connected-apps')).not.toBeInTheDocument();
   });
 });

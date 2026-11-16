@@ -370,7 +370,7 @@ export async function fetchDaltonBudgetToday(): Promise<DaltonBudgetToday> {
   return data;
 }
 
-export type DaltonSystemJobScope = 'company' | 'sector' | 'home' | 'host' | 'ops';
+export type DaltonSystemJobScope = 'company' | 'sector' | 'home' | 'data' | 'host' | 'ops';
 export type DaltonSystemJobStatus = 'on' | 'off' | 'partial' | 'unknown';
 
 export interface DaltonSystemJobItem {

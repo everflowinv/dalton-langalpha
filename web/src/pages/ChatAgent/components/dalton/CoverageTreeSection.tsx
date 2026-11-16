@@ -244,8 +244,8 @@ export function CoverageTreeSection({
               title={t('dalton.coverage.openSettings')}
               role="button"
               tabIndex={0}
-              onClick={() => navigate('/settings?tab=model#dalton-coverage-unclassified')}
-              onKeyDown={rowKeyDown(() => navigate('/settings?tab=model#dalton-coverage-unclassified'))}
+              onClick={() => navigate('/settings?tab=coverage#dalton-coverage-unclassified')}
+              onKeyDown={rowKeyDown(() => navigate('/settings?tab=coverage#dalton-coverage-unclassified'))}
             >
               <Folder className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
               <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-tertiary)' }}>

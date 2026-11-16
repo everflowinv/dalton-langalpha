@@ -10,10 +10,16 @@ import {
   turnDisplayPatch,
 } from '@/lib/transcriptDisplay';
 import { SegmentedRow, SettingsGroup, ToggleRow } from '../components/SettingsLayout';
+import { useDaltonSettingsVisibility } from '../components/SettingsRail';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SETTINGS } from '../sections';
 import { usePreferenceWrite } from './usePreferenceWrite';
 import type { Preferences } from './types';
+// DALTON-HOOK(settings-reorg): merge Agent, Artifacts, Workspace Sharing, and Team Memory into Chat & Assistant
+import { AgentPanel } from './AgentPanel';
+import { ArtifactsPanel } from './ArtifactsPanel';
+import { DaltonCosSharingCard, isDaltonCosSharingSettingVisible } from './dalton/DaltonCosSharingCard';
+import { DaltonHomeTeamMemoryCard, isDaltonHomeTeamMemorySettingVisible } from './dalton/DaltonHomeTeamMemoryCard';
 
 /** Chat: how a reply streams in and what the transcript shows while it runs,
  *  where the view lands once it ends, and the composer's voice input. */
@@ -22,6 +28,7 @@ export function ChatPanel() {
   const copy = useSettingCopy();
   const { preferences: prefsData } = usePreferences();
   const write = usePreferenceWrite();
+  const daltonVisibility = useDaltonSettingsVisibility();
 
   const turnDisplay = readTurnDisplay(prefsData);
   const streamingMode = readStreamingMode(prefsData);
@@ -77,6 +84,16 @@ export function ChatPanel() {
           onChange={() => { void write({ other_preference: { voice_input_enabled: !voiceInput } }); }}
         />
       </SettingsGroup>
+
+      {/* DALTON-HOOK(settings-reorg): merged Agent, Artifacts, and collaboration controls */}
+      <AgentPanel />
+      <ArtifactsPanel />
+      {isDaltonCosSharingSettingVisible(daltonVisibility) && (
+        <DaltonCosSharingCard ctx={daltonVisibility} />
+      )}
+      {isDaltonHomeTeamMemorySettingVisible(daltonVisibility) && (
+        <DaltonHomeTeamMemoryCard ctx={daltonVisibility} />
+      )}
     </>
   );
 }

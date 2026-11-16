@@ -12,7 +12,7 @@ import {
 } from "../src/commands.js";
 
 describe("personal channel bind guidance", () => {
-  it("parses /bind the same way and points missing-code help at Models", () => {
+  it("parses /bind the same way and points missing-code help at Messaging & Channels", () => {
     const missing = parseSlashCommand("/bind");
     expect(missing).toMatchObject({ kind: "invalid", reason: "missing_bind_code" });
     if (missing?.kind !== "invalid") throw new Error("expected an invalid /bind");
@@ -47,11 +47,11 @@ describe("personal channel bind guidance", () => {
 
   it("builds the real settings link and keeps the unbound Dalton prefix", () => {
     expect(personalChannelBindingsUrl("https://app.ginlix.ai/")).toBe(
-      "https://app.ginlix.ai/settings?tab=model#dalton-channel-bindings",
+      "https://app.ginlix.ai/settings?tab=integrations#dalton-channel-bindings",
     );
     const denial = notLinkedBindHelp("https://app.ginlix.ai", "weixin");
     expect(denial.startsWith("Your weixin account is not linked to Dalton yet.")).toBe(true);
-    expect(denial).toContain("/settings?tab=model#dalton-channel-bindings");
+    expect(denial).toContain("/settings?tab=integrations#dalton-channel-bindings");
     expect(denial).toContain("/bind DLT-XXXX-XXXX");
     expect(denial).toContain("direct message");
     expect(denial).not.toContain("/settings/channels");
@@ -59,7 +59,7 @@ describe("personal channel bind guidance", () => {
     expect(expiredBindCodeUsage()).toContain(PERSONAL_CHANNEL_BINDINGS_PATH);
     expect(expiredBindCodeUsage()).not.toContain("https://");
     expect(notLinkedTargetMessage("https://app.ginlix.ai/", "discord")).toBe(
-      "Your discord account is not linked. Open https://app.ginlix.ai/settings?tab=model#dalton-channel-bindings to link it.",
+      "Your discord account is not linked. Open https://app.ginlix.ai/settings?tab=integrations#dalton-channel-bindings to link it.",
     );
   });
 });

@@ -1,301 +1,281 @@
-import React, { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, Link2, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { Check, Copy, UserPlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/hooks/useLocale';
+import { isDaltonAuth } from '@/config/daltonAuth';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { copyText } from '@/lib/clipboard';
 import { formatTimestamp } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
 import {
   createDaltonInvite,
   fetchDaltonInvites,
   revokeDaltonInvite,
-  type DaltonInviteCreateResponse,
   type DaltonInviteItem,
   type DaltonInviteStatus,
-} from '../../utils/daltonApi';
+} from '@/pages/Settings/utils/daltonApi';
 import type { DaltonSettingVisibilityContext } from './DaltonCosSharingCard';
-
-export const MAX_ACTIVE_DALTON_INVITES = 20;
+import {
+  DaltonActionConfirmButton,
+  DaltonInlineNotice,
+  DaltonItemRow,
+  DaltonKeyValueList,
+  DaltonLoadingRow,
+  DaltonSettingsCard,
+  DaltonStatusBadge,
+  type DaltonStatusTone,
+} from './primitives';
 
 export function canShowDaltonInviteAdminCard(
   ctx?: DaltonSettingVisibilityContext | null,
 ): boolean {
+  if (!isDaltonAuth) return false;
   if (!ctx) return false;
-  if (ctx.callerTier === 'external') return false;
-  if (ctx.callerTier === 'admin' || ctx.callerTier === 'internal') return true;
-  return Boolean(ctx.canInvite);
+  if (ctx.canInvite === false) return false;
+  return (
+    ctx.canInvite === true ||
+    ctx.callerTier === 'admin' ||
+    ctx.callerTier === 'internal'
+  );
 }
 
-function extractApiError(err: unknown, fallback: string): string {
-  if (err && typeof err === 'object') {
-    const detail = (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail;
-    if (typeof detail === 'string' && detail.trim()) {
-      return detail;
-    }
-    const msg = (err as { message?: unknown }).message;
-    if (typeof msg === 'string' && msg.trim()) {
-      return msg;
-    }
-  }
-  return fallback;
-}
+export const isDaltonInvitesSettingVisible = canShowDaltonInviteAdminCard;
 
-export function DaltonInvitesCard(): React.ReactElement | null {
-  const { canInvite, callerTier } = useTeamCredentials();
-  const locale = useLocale();
+const STATUS_TONE: Record<DaltonInviteStatus, DaltonStatusTone> = {
+  pending: 'accent',
+  used: 'success',
+  expired: 'neutral',
+  revoked: 'danger',
+};
+
+/** Single-use member invite links management card (internal & admin callers). */
+export function DaltonInvitesCard({
+  ctx,
+}: {
+  ctx?: DaltonSettingVisibilityContext | null;
+}) {
   const { t } = useTranslation();
+  const locale = useLocale();
+  const { canInvite } = useTeamCredentials();
   const queryClient = useQueryClient();
 
-  const [latestInvite, setLatestInvite] = useState<DaltonInviteCreateResponse | null>(null);
+  const [createdUrl, setCreatedUrl] = useState<{ url: string; expiresAt: string | null } | null>(
+    null,
+  );
   const [copied, setCopied] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [revokingId, setRevokingId] = useState<string | null>(null);
 
-  const showCard = canShowDaltonInviteAdminCard({ canInvite, callerTier });
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
 
-  const { data, isLoading } = useQuery({
+  const allowed = ctx ? isDaltonInvitesSettingVisible(ctx) : canInvite;
+
+  const invitesQuery = useQuery({
     queryKey: queryKeys.dalton.invites(),
     queryFn: fetchDaltonInvites,
-    enabled: showCard,
+    enabled: allowed,
   });
 
   const createMutation = useMutation({
     mutationFn: createDaltonInvite,
     onSuccess: (created) => {
-      setError(null);
-      setLatestInvite(created);
-      setCopied(false);
+      const origin = typeof window !== 'undefined' ? window.location.origin : '';
+      const rawUrl = created.url || created.invite_url || '';
+      const fullUrl = rawUrl.startsWith('http') ? rawUrl : `${origin}${rawUrl}`;
+      setCreatedUrl({ url: fullUrl, expiresAt: created.expires_at ?? null });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.invites() });
-    },
-    onError: (err: unknown) => {
-      setError(extractApiError(err, t('common.failed')));
     },
   });
 
   const revokeMutation = useMutation({
-    mutationFn: async (inviteId: string) => {
-      setRevokingId(inviteId);
-      return revokeDaltonInvite(inviteId);
-    },
+    mutationFn: (inviteId: string) => revokeDaltonInvite(inviteId),
     onSuccess: () => {
-      setError(null);
       void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.invites() });
-    },
-    onError: (err: unknown) => {
-      setError(extractApiError(err, t('common.failed')));
-    },
-    onSettled: () => {
-      setRevokingId(null);
     },
   });
 
-  if (!showCard) {
+  const handleCopy = async (url: string) => {
+    try {
+      await copyText(url);
+      setCopied(true);
+    } catch {
+      /* clipboard blocked */
+    }
+  };
+
+  if (!allowed) {
     return null;
   }
 
-  const invites: DaltonInviteItem[] = data?.invites ?? [];
+  const invites = invitesQuery.data?.invites ?? [];
   const activeCount =
-    typeof data?.active_count === 'number'
-      ? data.active_count
-      : invites.filter((item) => item.status === 'pending').length;
-  const maxActive =
-    typeof data?.max_active === 'number' ? data.max_active : MAX_ACTIVE_DALTON_INVITES;
+    invitesQuery.data?.active_count ??
+    invites.filter((i: DaltonInviteItem) => i.status === 'pending').length;
+  const maxActive = invitesQuery.data?.max_active;
 
-  const renderStatusLabel = (status: DaltonInviteStatus): string => {
+  const statusLabel = (status: DaltonInviteStatus) => {
     switch (status) {
+      case 'pending':
+        return t('auth.invites.statusPending');
       case 'used':
         return t('auth.invites.statusUsed');
       case 'expired':
         return t('auth.invites.statusExpired');
       case 'revoked':
         return t('auth.invites.statusRevoked');
-      case 'pending':
-      default:
-        return t('auth.invites.statusPending');
     }
   };
-
-  const handleCopy = async (url: string) => {
-    try {
-      await navigator.clipboard?.writeText(url);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
-  };
-
-  const latestUrl = latestInvite?.url || latestInvite?.invite_url || '';
 
   return (
-    <div
+    <DaltonSettingsCard
       id="dalton-invites"
-      className="flex flex-col gap-3 rounded-lg p-4"
-      style={{
-        backgroundColor: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-      data-testid="dalton-invites-card"
-    >
-      <div
-        className="flex items-start justify-between gap-4 border-b pb-3"
-        style={{ borderColor: 'var(--color-border-muted)' }}
-      >
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <span
-              className="text-sm font-semibold"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {t('auth.invites.title')}
+      testId="dalton-invites-card"
+      title={t('auth.invites.title')}
+      description={t('auth.invites.subtitle')}
+      layout="padded"
+      bodyClassName="space-y-3"
+      action={
+        <div className="flex items-center gap-2">
+          {typeof maxActive === 'number' && (
+            <DaltonStatusBadge
+              tone="neutral"
+              label={t('auth.invites.activeQuota', {
+                count: activeCount,
+                max: maxActive,
+              })}
+            />
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1.5 text-xs"
+            disabled={createMutation.isPending}
+            onClick={() => createMutation.mutate()}
+            data-testid="dalton-invites-generate"
+          >
+            <UserPlus className="h-3.5 w-3.5" />
+            <span>
+              {createMutation.isPending
+                ? t('auth.invites.generating')
+                : t('auth.invites.generate')}
             </span>
-            <span
-              className="text-xs font-medium"
-              style={{ color: 'var(--color-text-secondary)' }}
-              data-testid="dalton-invites-quota"
-            >
-              {t('auth.invites.activeQuota', { count: activeCount, max: maxActive })}
-            </span>
-          </div>
-          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('auth.invites.subtitle')}
-          </p>
+          </Button>
         </div>
-        <Button
-          type="button"
-          size="sm"
-          onClick={() => createMutation.mutate()}
-          disabled={createMutation.isPending}
-          data-testid="dalton-invite-generate-btn"
-        >
-          <Link2 className="mr-1.5 h-3.5 w-3.5" />
-          {createMutation.isPending ? t('auth.invites.generating') : t('auth.invites.generate')}
-        </Button>
-      </div>
+      }
+    >
+      {createMutation.isError && (
+        <DaltonInlineNotice tone="error">{t('dalton.common.saveFailed')}</DaltonInlineNotice>
+      )}
+      {revokeMutation.isError && (
+        <DaltonInlineNotice tone="error">{t('dalton.common.saveFailed')}</DaltonInlineNotice>
+      )}
 
-      {latestInvite && latestUrl && (
-        <div
-          className="flex flex-col gap-2 rounded p-3"
-          style={{
-            backgroundColor: 'var(--color-bg-tag)',
-            border: '1px solid var(--color-border-muted)',
-          }}
-          data-testid="dalton-invite-generated-box"
-        >
-          <div className="flex items-center justify-between gap-2">
-            <code
-              className="truncate text-xs font-mono"
-              style={{ color: 'var(--color-text-primary)' }}
-              data-testid="dalton-invite-generated-url"
-            >
-              {latestUrl}
-            </code>
+      {createdUrl && (
+        <DaltonInlineNotice
+          tone="success"
+          testId="dalton-invites-new-link"
+          action={
             <Button
               type="button"
-              size="sm"
               variant="outline"
-              onClick={() => void handleCopy(latestUrl)}
-              data-testid="dalton-invite-copy-btn"
+              size="sm"
+              className="h-8 gap-1.5 text-xs shrink-0"
+              onClick={() => void handleCopy(createdUrl.url)}
+              data-testid="dalton-invites-copy"
             >
               {copied ? (
-                <>
-                  <Check className="mr-1 h-3.5 w-3.5" />
-                  {t('auth.invites.copied')}
-                </>
+                <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-success)' }} />
               ) : (
-                <>
-                  <Copy className="mr-1 h-3.5 w-3.5" />
-                  {t('auth.invites.copyLink')}
-                </>
+                <Copy className="h-3.5 w-3.5" />
               )}
+              <span>{copied ? t('auth.invites.copied') : t('auth.invites.copyLink')}</span>
             </Button>
-          </div>
-          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('auth.invites.newLinkHint', {
-              expiresAt: formatTimestamp(latestInvite.expires_at, locale) || '—',
-            })}
-          </p>
-        </div>
-      )}
-
-      {error && (
-        <p role="alert" className="text-xs" style={{ color: 'var(--color-loss)' }}>
-          {error}
-        </p>
-      )}
-
-      {isLoading ? (
-        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          {t('common.loading')}
-        </p>
-      ) : invites.length === 0 ? (
-        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          {t('auth.invites.empty')}
-        </p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs" data-testid="dalton-invites-table">
-            <thead>
-              <tr
-                className="border-b"
-                style={{
-                  borderColor: 'var(--color-border-muted)',
-                  color: 'var(--color-text-tertiary)',
-                }}
-              >
-                <th className="py-1.5 pr-3 font-medium">{t('auth.invites.colStatus')}</th>
-                <th className="py-1.5 pr-3 font-medium">{t('auth.invites.colCreatedAt')}</th>
-                <th className="py-1.5 pr-3 font-medium">{t('auth.invites.colExpiresAt')}</th>
-                <th className="py-1.5 pr-3 font-medium">{t('auth.invites.colUsedBy')}</th>
-                <th className="py-1.5 text-right font-medium">{t('auth.invites.colActions')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {invites.map((item) => {
-                const usedBy = item.used_by_username || item.username || '—';
-                const isRevoking = revokingId === item.invite_id && revokeMutation.isPending;
-                return (
-                  <tr
-                    key={item.invite_id}
-                    className="border-b last:border-b-0"
-                    style={{ borderColor: 'var(--color-border-muted)' }}
-                    data-testid={`dalton-invite-row-${item.invite_id}`}
-                  >
-                    <td className="py-2 pr-3 font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                      {renderStatusLabel(item.status)}
-                    </td>
-                    <td className="py-2 pr-3" style={{ color: 'var(--color-text-secondary)' }}>
-                      {formatTimestamp(item.created_at, locale) || '—'}
-                    </td>
-                    <td className="py-2 pr-3" style={{ color: 'var(--color-text-secondary)' }}>
-                      {formatTimestamp(item.expires_at, locale) || '—'}
-                    </td>
-                    <td className="py-2 pr-3 font-mono" style={{ color: 'var(--color-text-primary)' }}>
-                      {usedBy}
-                    </td>
-                    <td className="py-2 text-right">
-                      {item.status === 'pending' && (
-                        <button
-                          type="button"
-                          onClick={() => revokeMutation.mutate(item.invite_id)}
-                          disabled={isRevoking}
-                          className="inline-flex items-center gap-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                          style={{ color: 'var(--color-loss)' }}
-                          data-testid={`dalton-invite-revoke-${item.invite_id}`}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                          {isRevoking ? t('auth.invites.revoking') : t('auth.invites.revoke')}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
+          }
+        >
+          <div className="space-y-1">
+            <div>
+              {t('auth.invites.newLinkHint', {
+                expiresAt: createdUrl.expiresAt
+                  ? formatTimestamp(createdUrl.expiresAt, locale)
+                  : '',
               })}
-            </tbody>
-          </table>
-        </div>
+            </div>
+            <code className="block font-mono text-xs select-all break-all">{createdUrl.url}</code>
+          </div>
+        </DaltonInlineNotice>
       )}
-    </div>
+
+      {invitesQuery.isLoading ? (
+        <DaltonLoadingRow label={t('dalton.common.loading')} />
+      ) : invitesQuery.isError ? (
+        <DaltonInlineNotice tone="error">{t('dalton.common.loadFailed')}</DaltonInlineNotice>
+      ) : (
+        <DaltonKeyValueList isEmpty={invites.length === 0} empty={t('auth.invites.empty')}>
+          {invites.map((item) => {
+            const usedBy = item.used_by_username || item.username;
+            const isRevoking =
+              revokeMutation.isPending && revokeMutation.variables === item.invite_id;
+            return (
+              <DaltonItemRow
+                key={item.invite_id}
+                testId={`dalton-invite-row-${item.invite_id}`}
+                leading={
+                  <DaltonStatusBadge
+                    tone={STATUS_TONE[item.status] ?? 'neutral'}
+                    label={statusLabel(item.status)}
+                  />
+                }
+                title={
+                  <span className="font-mono text-xs">{item.invite_id.slice(0, 12)}</span>
+                }
+                meta={
+                  <span className="flex flex-wrap gap-x-3 gap-y-0.5">
+                    {item.created_at && (
+                      <span>
+                        {t('auth.invites.colCreatedAt')}:{' '}
+                        {formatTimestamp(item.created_at, locale)}
+                      </span>
+                    )}
+                    {item.expires_at && (
+                      <span>
+                        {t('auth.invites.colExpiresAt')}:{' '}
+                        {formatTimestamp(item.expires_at, locale)}
+                      </span>
+                    )}
+                    {usedBy && (
+                      <span>
+                        {t('auth.invites.colUsedBy')}: {usedBy}
+                      </span>
+                    )}
+                  </span>
+                }
+                trailing={
+                  item.status === 'pending' ? (
+                    <DaltonActionConfirmButton
+                      label={
+                        isRevoking ? t('auth.invites.revoking') : t('auth.invites.revoke')
+                      }
+                      confirmTitle={t('auth.invites.revokeTitle')}
+                      confirmMessage={t('auth.invites.revokeConfirm')}
+                      confirmLabel={t('auth.invites.revoke')}
+                      busy={isRevoking}
+                      onConfirm={() =>
+                        revokeMutation.mutateAsync(item.invite_id).then(() => undefined)
+                      }
+                      testId={`dalton-invite-revoke-${item.invite_id}`}
+                    />
+                  ) : undefined
+                }
+              />
+            );
+          })}
+        </DaltonKeyValueList>
+      )}
+    </DaltonSettingsCard>
   );
 }

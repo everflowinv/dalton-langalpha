@@ -1,317 +1,521 @@
-import React, { useState } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
+import { Send } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ToggleSwitch } from '@/components/ui/switch';
+import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
-import { sendDaltonNotifyTest } from '@/pages/Settings/utils/daltonApi';
+import { queryKeys } from '@/lib/queryKeys';
+import {
+  fetchDaltonChannelBindings,
+  sendDaltonNotifyTest,
+} from '@/pages/Settings/utils/daltonApi';
+import { SettingRow } from '@/pages/Settings/components/SettingsLayout';
+import {
+  DaltonActionConfirmButton,
+  DaltonInlineNotice,
+  DaltonItemRow,
+  DaltonKeyValueList,
+  DaltonLoadingRow,
+  DaltonSettingsCard,
+  DaltonStatusBadge,
+} from './primitives';
 
-export const FEISHU_NOTIFY_TARGET_RE = /^feishu:user:ou_[A-Za-z0-9_-]+$/;
-export const DISCORD_NOTIFY_TARGET_RE = /^discord:user:[0-9]+$/;
+const PERSONAL_TARGET_RE = /^(feishu:user:ou_[A-Za-z0-9_-]+|discord:user:[0-9]+)$/;
+const GROUP_TARGET_RE = /^(feishu:chat:|discord:channel:)/i;
 
-/** Personal DM targets only; group pushes are the admin's, configured per task. */
-export function isValidDaltonNotifyTarget(raw: string): boolean {
-  const cleaned = raw.trim();
-  return FEISHU_NOTIFY_TARGET_RE.test(cleaned) || DISCORD_NOTIFY_TARGET_RE.test(cleaned);
+/** Personal DM targets only; group pushes are configured per task. */
+function isValidDaltonNotifyTarget(raw: string): boolean {
+  return PERSONAL_TARGET_RE.test(raw.trim());
 }
 
-/** A label is a plain printable name, at most 40 chars (same rule the server applies). */
-export function cleanDaltonNotifyLabel(raw: string): string {
-  // Control and format characters (the server's `isprintable` cut) never belong in a label.
+/** A label is a plain printable name, at most 40 chars (matching server validation). */
+function cleanDaltonNotifyLabel(raw: string): string {
   return raw.trim().replace(/[\p{Cc}\p{Cf}]/gu, '').slice(0, 40);
 }
 
-interface TargetTestState {
-  sending: boolean;
-  ok: boolean | null;
-  detail: string | null;
+export interface DaltonNotifyTargetsCardProps {
+  /** Only admins in Team Channels & Ops can manually enter raw target IDs. */
+  allowManualInput?: boolean;
 }
 
-export function DaltonNotifyTargetsCard(): React.ReactElement {
-  const { preferences, isLoading, isLoaded } = usePreferences();
-  const updatePreferences = useUpdatePreferences();
-  const prefsReady = Boolean(isLoaded) && !isLoading;
+interface BoundCandidate {
+  platform: 'feishu' | 'discord';
+  target: string;
+  label: string;
+  accountId: string;
+}
 
-  // Saved values are derived directly from React Query preferences (never copied into local state).
-  const prefs = modelPrefs(preferences);
-  const enabled = prefs.dalton_notify_enabled === true;
-  const targets = Array.isArray(prefs.dalton_notify_targets)
-    ? prefs.dalton_notify_targets
-    : [];
-  const labels = prefs.dalton_notify_target_labels ?? {};
+/**
+ * Push notification switches & linked-account recipient toggles.
+ * Replaces raw `feishu:user:ou_xxx` text entry for members by deriving bound accounts
+ * from `fetchDaltonChannelBindings()`.
+ */
+export function DaltonNotifyTargetsCard({
+  allowManualInput = false,
+}: DaltonNotifyTargetsCardProps) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const { preferences, isLoading: prefsLoading, isLoaded } = usePreferences();
+  const updatePrefs = useUpdatePreferences();
 
-  // Local state holds only the input draft and transient feedback messages.
-  const [draft, setDraft] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const bindingsQuery = useQuery({
+    queryKey: queryKeys.dalton.channelBindings(),
+    queryFn: fetchDaltonChannelBindings,
+    retry: false,
+  });
+
+  const [manualInput, setManualInput] = useState('');
   const [labelDrafts, setLabelDrafts] = useState<Record<string, string>>({});
-  const [testStates, setTestStates] = useState<Record<string, TargetTestState>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const [savedNotice, setSavedNotice] = useState(false);
+  const [pendingDisable, setPendingDisable] = useState<BoundCandidate | null>(null);
+  const [testNotice, setTestNotice] = useState<{
+    tone: 'success' | 'error';
+    message: string;
+  } | null>(null);
 
-  const handleToggleEnabled = async () => {
-    if (!prefsReady) return;
-    const next = !enabled;
-    setError(null);
-    setSaveMessage(null);
-    try {
-      await updatePreferences.mutateAsync(
-        splitPreferenceWrite({ dalton_notify_enabled: next }),
-      );
-      setSaveMessage(next ? '已开启推送总开关' : '已关闭推送总开关');
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error && err.message
-          ? err.message
-          : '保存推送总开关失败';
-      setError(msg);
+  const mp = modelPrefs(preferences);
+  // Backend defaults dalton_notify_enabled to False when unset or null (src/dalton/llm/model_prefs.py).
+  const masterEnabled = mp.dalton_notify_enabled === true;
+  const targets = useMemo(
+    () => (Array.isArray(mp.dalton_notify_targets) ? mp.dalton_notify_targets : []),
+    [mp.dalton_notify_targets],
+  );
+  const labels = useMemo(
+    () => mp.dalton_notify_target_labels ?? {},
+    [mp.dalton_notify_target_labels],
+  );
+
+  const boundCandidates = useMemo<BoundCandidate[]>(() => {
+    const bindings = bindingsQuery.data?.bindings;
+    if (!bindings) return [];
+    const list: BoundCandidate[] = [];
+    if (bindings.feishu?.linked && bindings.feishu.platform_user_id) {
+      list.push({
+        platform: 'feishu',
+        target: `feishu:user:${bindings.feishu.platform_user_id}`,
+        label: bindings.feishu.platform_username || bindings.feishu.platform_user_id,
+        accountId: bindings.feishu.platform_user_id,
+      });
     }
-  };
+    if (bindings.discord?.linked && bindings.discord.platform_user_id) {
+      list.push({
+        platform: 'discord',
+        target: `discord:user:${bindings.discord.platform_user_id}`,
+        label: bindings.discord.platform_username || bindings.discord.platform_user_id,
+        accountId: bindings.discord.platform_user_id,
+      });
+    }
+    return list;
+  }, [bindingsQuery.data?.bindings]);
 
-  const persistTargets = async (nextTargets: string[]) => {
-    setError(null);
-    setSaveMessage(null);
+  const boundTargetSet = useMemo(
+    () => new Set(boundCandidates.map((c) => c.target)),
+    [boundCandidates],
+  );
+
+  const customTargets = useMemo(
+    () => targets.filter((item) => !boundTargetSet.has(item)),
+    [targets, boundTargetSet],
+  );
+
+  const saveTargets = async (nextTargets: string[]) => {
+    setFormError(null);
+    setSavedNotice(false);
     try {
-      await updatePreferences.mutateAsync(
+      await updatePrefs.mutateAsync(
         splitPreferenceWrite({ dalton_notify_targets: nextTargets }),
       );
-      setSaveMessage('已保存推送目标');
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error && err.message
-          ? err.message
-          : '保存推送目标失败';
-      setError(msg);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+      setSavedNotice(true);
+    } catch {
+      setFormError(t('dalton.notifyTargets.saveFailed'));
     }
   };
 
-  const handleAdd = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!prefsReady) return;
-    setSaveMessage(null);
-    const cleaned = draft.trim();
-    if (!cleaned) {
-      setError('请输入推送目标');
+  const handleMasterToggle = async (checked: boolean) => {
+    setFormError(null);
+    setSavedNotice(false);
+    try {
+      await updatePrefs.mutateAsync(
+        splitPreferenceWrite({ dalton_notify_enabled: checked }),
+      );
+      void queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+      setSavedNotice(true);
+    } catch {
+      setFormError(t('dalton.notifyTargets.saveFailed'));
+    }
+  };
+
+  const handleCandidateToggle = async (item: BoundCandidate, checked: boolean) => {
+    if (!checked) {
+      setPendingDisable(item);
+      return;
+    }
+    const next = Array.from(new Set([...targets, item.target]));
+    await saveTargets(next);
+  };
+
+  const confirmDisableCandidate = async () => {
+    if (!pendingDisable) return;
+    const targetToRemove = pendingDisable.target;
+    setPendingDisable(null);
+    await saveTargets(targets.filter((tItem) => tItem !== targetToRemove));
+  };
+
+  const handleManualAdd = async () => {
+    const cleaned = manualInput.trim();
+    if (GROUP_TARGET_RE.test(cleaned)) {
+      setFormError(t('dalton.notifyTargets.groupTargetHint'));
       return;
     }
     if (!isValidDaltonNotifyTarget(cleaned)) {
-      setError('格式无效，请使用 feishu:user:<open_id> 或 discord:user:<数字id>（飞书群推送可在任务路由或对话里设置，内部成员可用）');
+      setFormError(t('dalton.notifyTargets.manualAddError'));
       return;
     }
     if (targets.includes(cleaned)) {
-      setDraft('');
-      setError(null);
+      setManualInput('');
+      setFormError(null);
       return;
     }
-    const next = [...targets, cleaned];
-    setDraft('');
-    await persistTargets(next);
-  };
-
-  const handleRemove = async (targetToRemove: string) => {
-    if (!prefsReady) return;
-    const next = targets.filter((item) => item !== targetToRemove);
-    await persistTargets(next);
+    const next = Array.from(new Set([...targets, cleaned]));
+    await saveTargets(next);
+    setManualInput('');
   };
 
   const commitLabel = async (target: string) => {
-    if (!prefsReady) return;
     const saved = labels[target] ?? '';
     const draftLabel = labelDrafts[target] ?? saved;
     const cleaned = cleanDaltonNotifyLabel(draftLabel);
     setLabelDrafts((prev) => ({ ...prev, [target]: cleaned }));
     if (cleaned === saved) return;
-    setError(null);
-    setSaveMessage(null);
+    setFormError(null);
+    setSavedNotice(false);
     try {
-      await updatePreferences.mutateAsync(
+      await updatePrefs.mutateAsync(
         splitPreferenceWrite({
           dalton_notify_target_labels: { ...labels, [target]: cleaned || null },
         }),
       );
-      setSaveMessage(cleaned ? '已保存目标别名' : '已清除目标别名');
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error && err.message
-          ? err.message
-          : '保存目标别名失败';
-      setError(msg);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+      setSavedNotice(true);
+    } catch {
+      setFormError(t('dalton.notifyTargets.saveFailed'));
     }
   };
 
-  const handleSendTest = async (target: string) => {
-    if (!prefsReady) return;
-    setError(null);
-    setSaveMessage(null);
-    setTestStates((prev) => ({ ...prev, [target]: { sending: true, ok: null, detail: null } }));
-    try {
-      const res = await sendDaltonNotifyTest(target);
-      setTestStates((prev) => ({
-        ...prev,
-        [target]: { sending: false, ok: res.ok, detail: res.detail },
-      }));
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error && err.message
-          ? err.message
-          : '发送测试失败';
-      setTestStates((prev) => ({
-        ...prev,
-        [target]: { sending: false, ok: false, detail: msg },
-      }));
-    }
+  const renderAliasInput = (target: string) => (
+    <Input
+      value={labelDrafts[target] ?? labels[target] ?? ''}
+      disabled={updatePrefs.isPending}
+      aria-label={t('dalton.notifyTargets.aliasAria', { target })}
+      placeholder={t('dalton.notifyTargets.aliasPlaceholder')}
+      data-testid={`dalton-notify-label-${target}`}
+      onChange={(e) =>
+        setLabelDrafts((prev) => ({ ...prev, [target]: e.target.value }))
+      }
+      onBlur={() => void commitLabel(target)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
+      className="mt-1 h-7 w-52 text-xs"
+    />
+  );
+
+  const handleRemoveTarget = async (target: string) => {
+    await saveTargets(targets.filter((item) => item !== target));
   };
+
+  const testMutation = useMutation({
+    mutationFn: (target: string) => sendDaltonNotifyTest(target),
+    onSuccess: (res, target) => {
+      if (res.ok) {
+        setTestNotice({
+          tone: 'success',
+          message: t('dalton.notifyTargets.testSuccess', { target }),
+        });
+      } else {
+        setTestNotice({
+          tone: 'error',
+          message: res.detail || t('dalton.notifyTargets.testFailed'),
+        });
+      }
+    },
+    onError: () => {
+      setTestNotice({ tone: 'error', message: t('dalton.notifyTargets.testFailed') });
+    },
+  });
 
   return (
-    <div
-      className="flex flex-col gap-3 rounded-lg p-4"
-      style={{
-        backgroundColor: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-      data-testid="dalton-notify-targets-card"
+    <DaltonSettingsCard
+      id={allowManualInput ? 'dalton-notify-targets-admin' : 'dalton-notify-targets'}
+      testId={allowManualInput ? 'dalton-notify-targets-admin-card' : 'dalton-notify-targets-card'}
+      title={
+        allowManualInput
+          ? t('dalton.notifyTargets.manualAddTitle')
+          : t('dalton.notifyTargets.title')
+      }
+      description={
+        allowManualInput
+          ? t('dalton.notifyTargets.manualAddDesc')
+          : t('dalton.notifyTargets.description')
+      }
+      layout="padded"
+      bodyClassName="space-y-4"
+      action={
+        !allowManualInput && !prefsLoading && isLoaded ? (
+          <DaltonStatusBadge
+            dot
+            tone={masterEnabled ? 'success' : 'neutral'}
+            label={
+              masterEnabled
+                ? t('dalton.notifyTargets.masterOn')
+                : t('dalton.notifyTargets.masterOff')
+            }
+          />
+        ) : undefined
+      }
     >
-      <div className="flex items-start justify-between gap-4 border-b pb-3" style={{ borderColor: 'var(--color-border-muted)' }}>
-        <div className="flex flex-col gap-1">
-          <span
-            className="text-sm font-semibold"
-            style={{ color: 'var(--color-text-primary)' }}
-          >
-            推送总开关
-          </span>
-          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            控制全部自动任务推送（飞书、Discord、群）。
-          </p>
-        </div>
-        <ToggleSwitch
-          checked={enabled}
-          onChange={() => void handleToggleEnabled()}
-          disabled={!prefsReady}
-          ariaLabel="推送总开关"
-          className="mt-0.5"
-        />
-      </div>
-
-      <div className="flex flex-col gap-1">
-        <label
-          htmlFor="dalton-notify-target-input"
-          className="text-sm font-semibold"
-          style={{ color: 'var(--color-text-primary)' }}
-        >
-          推送到
-        </label>
-        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          自动任务完成后推送到您本人的飞书或 Discord 私信（格式：feishu:user:ou_xxx 或 discord:user:123）；群推送可在下方「飞书群推送」、自动化列表或对话里按任务设置（内部成员可用）
-        </p>
-      </div>
-
-      {targets.length > 0 ? (
-        <ul className="flex flex-col gap-1.5 text-xs" data-testid="dalton-notify-target-list">
-          {targets.map((target) => {
-            const test = testStates[target];
-            return (
-              <li
-                key={target}
-                className="flex flex-col gap-1 rounded px-2.5 py-1.5"
-                style={{ backgroundColor: 'var(--color-bg-tag)' }}
-                data-testid={`dalton-notify-target-row-${target}`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <input
-                    value={labelDrafts[target] ?? labels[target] ?? ''}
-                    disabled={!prefsReady}
-                    aria-label={`目标别名 ${target}`}
-                    placeholder="未命名目标"
-                    onChange={(e) => {
-                      setLabelDrafts((prev) => ({ ...prev, [target]: e.target.value }));
-                    }}
-                    onBlur={() => void commitLabel(target)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') e.currentTarget.blur();
-                    }}
-                    className="min-w-0 flex-1 rounded border-0 bg-transparent text-xs font-semibold outline-none"
-                    style={{ color: 'var(--color-text-primary)' }}
-                  />
-                  <div className="flex shrink-0 items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleSendTest(target)}
-                      disabled={!prefsReady || test?.sending === true}
-                      aria-label={`发送测试 ${target}`}
-                      className="text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ color: 'var(--color-text-secondary)' }}
-                    >
-                      {test?.sending === true ? '发送中…' : '发送测试'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleRemove(target)}
-                      disabled={!prefsReady}
-                      aria-label={`删除 ${target}`}
-                      className="inline-flex items-center gap-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ color: 'var(--color-loss)' }}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                      删除
-                    </button>
-                  </div>
-                </div>
-                <span className="font-mono text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {target}
-                </span>
-                {test?.ok === true && (
-                  <p className="text-[11px]" style={{ color: 'var(--color-profit)' }}>
-                    测试已发送
-                  </p>
-                )}
-                {test?.ok === false && (
-                  <p role="alert" className="text-[11px]" style={{ color: 'var(--color-loss)' }}>
-                    {test.detail ?? '发送失败'}
-                  </p>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+      {prefsLoading ? (
+        <DaltonLoadingRow label={t('dalton.common.loading')} />
+      ) : !isLoaded ? (
+        <DaltonInlineNotice tone="error">{t('dalton.notifyTargets.loadFailed')}</DaltonInlineNotice>
       ) : (
-        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          暂未配置推送目标（不发送自动任务通知）
-        </p>
+        <>
+          {!allowManualInput && (
+            <>
+              <div
+                className="rounded-md border"
+                style={{
+                  borderColor: 'var(--color-border-muted)',
+                  backgroundColor: 'var(--color-bg-elevated)',
+                }}
+              >
+                <SettingRow
+                  id="dalton-notify-master-toggle"
+                  label={t('dalton.notifyTargets.masterSwitchLabel')}
+                  description={t('dalton.notifyTargets.masterSwitchDesc')}
+                >
+                  <ToggleSwitch
+                    id="dalton-notify-master-toggle-switch"
+                    ariaLabel={t('dalton.notifyTargets.masterSwitchLabel')}
+                    checked={masterEnabled}
+                    disabled={updatePrefs.isPending}
+                    onChange={() => void handleMasterToggle(!masterEnabled)}
+                  />
+                </SettingRow>
+              </div>
+
+              <div className="space-y-2">
+                <div>
+                  <h4
+                    className="text-xs font-medium"
+                    style={{ color: 'var(--color-text-primary)' }}
+                  >
+                    {t('dalton.notifyTargets.boundAccountsTitle')}
+                  </h4>
+                  <p
+                    className="text-xs mt-0.5"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    {t('dalton.notifyTargets.boundAccountsDesc')}
+                  </p>
+                </div>
+
+                {bindingsQuery.isLoading ? (
+                  <DaltonLoadingRow label={t('dalton.common.loading')} />
+                ) : boundCandidates.length === 0 ? (
+                  <DaltonInlineNotice tone="info" testId="dalton-notify-no-bound-accounts">
+                    {t('dalton.notifyTargets.noBoundAccounts')}
+                  </DaltonInlineNotice>
+                ) : (
+                  <DaltonKeyValueList>
+                    {boundCandidates.map((item) => {
+                      const active = targets.includes(item.target);
+                      const isTesting =
+                        testMutation.isPending && testMutation.variables === item.target;
+                      return (
+                        <DaltonItemRow
+                          key={item.target}
+                          testId={`dalton-notify-bound-${item.platform}`}
+                          title={
+                            <span>
+                              {item.platform === 'feishu'
+                                ? t('dalton.notifyTargets.platformFeishu')
+                                : t('dalton.notifyTargets.platformDiscord')}
+                              {' · '}
+                              {item.label}
+                              {labels[item.target] && (
+                                <span
+                                  className="ml-1.5 text-xs font-normal"
+                                  style={{ color: 'var(--color-text-secondary)' }}
+                                >
+                                  ({labels[item.target]})
+                                </span>
+                              )}
+                            </span>
+                          }
+                          subtitle={renderAliasInput(item.target)}
+                          meta={<span className="font-mono">{item.accountId}</span>}
+                          trailing={
+                            <div className="flex items-center gap-2">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 gap-1 text-xs"
+                                disabled={isTesting}
+                                onClick={() => testMutation.mutate(item.target)}
+                                data-testid={`dalton-notify-test-${item.platform}`}
+                              >
+                                <Send className="h-3.5 w-3.5" />
+                                <span>
+                                  {isTesting
+                                    ? t('dalton.notifyTargets.testing')
+                                    : t('dalton.notifyTargets.testButton')}
+                                </span>
+                              </Button>
+                              <ToggleSwitch
+                                checked={active}
+                                disabled={updatePrefs.isPending}
+                                ariaLabel={item.label}
+                                onChange={() =>
+                                  void handleCandidateToggle(item, !active)
+                                }
+                              />
+                            </div>
+                          }
+                        />
+                      );
+                    })}
+                  </DaltonKeyValueList>
+                )}
+              </div>
+            </>
+          )}
+
+          {allowManualInput && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                value={manualInput}
+                onChange={(e) => setManualInput(e.target.value)}
+                placeholder={t('dalton.notifyTargets.manualAddPlaceholder')}
+                data-testid="dalton-notify-manual-input"
+                className="h-8 w-72 text-xs font-mono"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                disabled={updatePrefs.isPending}
+                onClick={() => void handleManualAdd()}
+                data-testid="dalton-notify-manual-add"
+              >
+                {t('dalton.notifyTargets.manualAddButton')}
+              </Button>
+            </div>
+          )}
+
+          {(allowManualInput ? targets : customTargets).length > 0 && (
+            <div className="space-y-2">
+              {!allowManualInput && (
+                <div>
+                  <h4
+                    className="text-xs font-medium"
+                    style={{ color: 'var(--color-text-primary)' }}
+                  >
+                    {t('dalton.notifyTargets.customTargetsTitle')}
+                  </h4>
+                  <p
+                    className="text-xs mt-0.5"
+                    style={{ color: 'var(--color-text-tertiary)' }}
+                  >
+                    {t('dalton.notifyTargets.customTargetsDesc')}
+                  </p>
+                </div>
+              )}
+              <DaltonKeyValueList>
+                {(allowManualInput ? targets : customTargets).map((target) => {
+                  const isTesting =
+                    testMutation.isPending && testMutation.variables === target;
+                  return (
+                    <DaltonItemRow
+                      key={target}
+                      testId={`dalton-notify-custom-${target}`}
+                      title={
+                        labels[target] ? (
+                          <span className="text-xs font-medium">{labels[target]}</span>
+                        ) : (
+                          <code className="text-xs font-mono">{target}</code>
+                        )
+                      }
+                      subtitle={renderAliasInput(target)}
+                      meta={<code className="font-mono">{target}</code>}
+                      trailing={
+                        <div className="flex items-center gap-1.5">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 gap-1 text-xs"
+                            disabled={isTesting}
+                            onClick={() => testMutation.mutate(target)}
+                          >
+                            <Send className="h-3.5 w-3.5" />
+                            <span>
+                              {isTesting
+                                ? t('dalton.notifyTargets.testing')
+                                : t('dalton.notifyTargets.testButton')}
+                            </span>
+                          </Button>
+                          <DaltonActionConfirmButton
+                            label={t('dalton.notifyTargets.removeLabel')}
+                            confirmTitle={t('dalton.notifyTargets.removeTitle')}
+                            confirmMessage={t('dalton.notifyTargets.removeConfirm', {
+                              target,
+                            })}
+                            confirmLabel={t('dalton.notifyTargets.removeLabel')}
+                            busy={updatePrefs.isPending}
+                            onConfirm={() => handleRemoveTarget(target)}
+                            testId={`dalton-notify-remove-${target}`}
+                          />
+                        </div>
+                      }
+                    />
+                  );
+                })}
+              </DaltonKeyValueList>
+            </div>
+          )}
+
+          {formError && <DaltonInlineNotice tone="error">{formError}</DaltonInlineNotice>}
+          {savedNotice && (
+            <DaltonInlineNotice tone="success">{t('dalton.notifyTargets.saved')}</DaltonInlineNotice>
+          )}
+          {testNotice && (
+            <DaltonInlineNotice tone={testNotice.tone}>{testNotice.message}</DaltonInlineNotice>
+          )}
+        </>
       )}
 
-      <form onSubmit={(e) => void handleAdd(e)} className="flex items-center gap-2">
-        <Input
-          id="dalton-notify-target-input"
-          aria-label="推送到"
-          value={draft}
-          disabled={!prefsReady}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            if (error) setError(null);
-          }}
-          placeholder="例如 feishu:user:ou_xxx 或 discord:user:123"
-        />
-        <Button
-          type="submit"
-          size="sm"
-          disabled={!prefsReady}
-          className="shrink-0 whitespace-nowrap"
-        >
-          <Plus className="mr-1 h-3.5 w-3.5" />
-          添加
-        </Button>
-      </form>
-
-      {error && (
-        <p role="alert" className="text-xs" style={{ color: 'var(--color-loss)' }}>
-          {error}
-        </p>
-      )}
-      {saveMessage && !error && (
-        <p className="text-xs" style={{ color: 'var(--color-profit)' }}>
-          {saveMessage}
-        </p>
-      )}
-    </div>
+      <ConfirmDialog
+        open={Boolean(pendingDisable)}
+        title={t('dalton.notifyTargets.disableBoundTitle')}
+        message={t('dalton.notifyTargets.disableBoundConfirm', {
+          label: pendingDisable?.label ?? '',
+        })}
+        confirmLabel={t('dalton.common.confirm')}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setPendingDisable(null);
+        }}
+        onConfirm={() => void confirmDisableCandidate()}
+      />
+    </DaltonSettingsCard>
   );
 }

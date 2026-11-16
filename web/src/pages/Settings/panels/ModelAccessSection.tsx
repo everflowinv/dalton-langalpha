@@ -4,6 +4,7 @@ import { useNavigate, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { ModalShell } from '@/components/ui/ModalShell';
+import { SkeletonBar } from '@/components/ui/skeleton';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
@@ -118,7 +119,12 @@ function backFrom(sheet: Sheet): Sheet | null {
  * one sheet where each is connected and managed. The connect flows are the
  * ones the setup wizard renders.
  */
-export function ModelAccessSection() {
+// DALTON-HOOK(settings-reorg): support scope filtering ('personal' vs 'team') while keeping ?connect= deep link intact
+export function ModelAccessSection({
+  scope = 'all',
+}: {
+  scope?: 'all' | 'personal' | 'team';
+} = {}) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const sheetTitleId = useId();
@@ -127,10 +133,17 @@ export function ModelAccessSection() {
   // DALTON-HOOK(team-credentials): team-shared credentials hint; only PM
   // users may write them (connect, keys, base URLs) — the server refuses
   // everyone else, the UI just does not offer the buttons.
-  const { isShared: isTeamShared, canDisconnect, canManage } = useTeamCredentials();
-  const showTeamHint = isDaltonAuth && isTeamShared;
-  const allowDisconnect = !isDaltonAuth || canDisconnect;
-  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
+  const { isShared: isTeamShared, canDisconnect, canManage, callerTierPending, callerTierError } = useTeamCredentials();
+  const teamCredsPending = isDaltonAuth && callerTierPending === true;
+  const teamCredsError = isDaltonAuth && callerTierError === true;
+  const effectiveTeamShared = isTeamShared || teamCredsError;
+  const showTeamHint = isDaltonAuth && effectiveTeamShared;
+  const allowDisconnect = (!isDaltonAuth || canDisconnect) && !teamCredsPending && !teamCredsError;
+  const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage && !teamCredsError;
+  // DALTON-HOOK(settings-reorg): separate personal Claude Code access from team shared credentials and fail closed on unknown tier
+  const showTeamGroups = scope !== 'personal' && !teamCredsError;
+  const showPersonalClaudeCode = scope !== 'team';
+  const effectivePersonalOnly = scope === 'personal' || teamCredsError;
   const tokenRows = useClaudeCodeTokenRows();
   const { custody, isLoading: custodyLoading, unread: custodyUnread } = useClaudeCodeCustody();
   const { setup, unread: setupUnread } = useClaudeCodeSetup();
@@ -282,13 +295,41 @@ export function ModelAccessSection() {
   const rowStatus = (p: ConfiguredProvider): AccessStatus =>
     p.state === 'needs_reauth' ? 'needs_reauth' : 'connected';
 
+  if (teamCredsPending) {
+    return (
+      <div className="space-y-2" aria-busy="true" data-testid="model-access-pending-skeleton">
+        <SkeletonBar className="h-9 w-full" />
+        <SkeletonBar className="h-9 w-2/3" />
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.description')}</p>
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
-      {showTeamHint && !teamManagedByAdmin && (
+      {/* DALTON-HOOK(settings-reorg): scope-aware personal vs team credentials separation */}
+      {showTeamHint && !teamManagedByAdmin && scope === 'all' && !teamCredsError && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
           {TEAM_SHARED_CREDENTIALS_HINT}
+        </p>
+      )}
+      {scope === 'personal' && showTeamHint && canManage && !teamCredsError && (
+        <div className="flex items-center justify-between gap-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+          <span>{t('settings.modelAccess.personalDesc')}</span>
+          <button
+            type="button"
+            onClick={() => navigate('/settings?tab=teamModels#team-model-access')}
+            className="underline underline-offset-2 shrink-0 hover:opacity-80"
+            style={{ color: 'var(--color-accent-primary)' }}
+          >
+            {t('settings.modelAccess.goToTeamModels')}
+          </button>
+        </div>
+      )}
+      {teamCredsError && (
+        <p className="text-xs" role="status" style={{ color: 'var(--color-text-tertiary)' }} data-testid="model-access-creds-error">
+          {t('settings.modelAccess.statusUnavailable')}
         </p>
       )}
       {teamManagedByAdmin && (
@@ -297,11 +338,11 @@ export function ModelAccessSection() {
         </p>
       )}
 
-      <SummaryTable on={!!summary}>
-      <Group subgrid={!!summary} title={t('modelAccess.subscriptions')} empty={statusLoading ? '' : statusError ? t('modelAccess.status.unknownLong') : t('modelAccess.noneSubscriptions')}>
+      <SummaryTable on={!!summary && showPersonalClaudeCode}>
+      <Group subgrid={!!summary && showPersonalClaudeCode} title={t('modelAccess.subscriptions')} empty={statusLoading ? '' : statusError ? t('modelAccess.status.unknownLong') : t('modelAccess.noneSubscriptions')}>
         {[
-          ...(summary ? [<UsageHeaderRow key="header" first={t('claudeCodePlan.table.account')} />] : []),
-          ...subscriptionRows.map((p) => p.access_type === 'coding_plan' ? (
+          ...(showPersonalClaudeCode && summary ? [<UsageHeaderRow key="header" first={t('claudeCodePlan.table.account')} />] : []),
+          ...(showTeamGroups ? subscriptionRows.map((p) => p.access_type === 'coding_plan' ? (
             <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
           ) : (
             <AccessRow
@@ -319,11 +360,9 @@ export function ModelAccessSection() {
                 </Button>
               }
             />
-          )),
-          // Claude Code is one row once it is on, or while a token is left
-          // behind after it was turned off (or the server stopped offering
-          // it), which its view offers to remove.
-          ...(setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled) ? [(
+          )) : []),
+          // Claude Code is personal (account / computer token); keep in personal & all scopes
+          ...(showPersonalClaudeCode && (setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled)) ? [(
             <AccessRow
               key={CLAUDE_CODE}
               provider={CLAUDE_CODE}
@@ -344,33 +383,44 @@ export function ModelAccessSection() {
       </Group>
       </SummaryTable>
 
-      <Group title={t('modelAccess.apiKeys')} empty={t('modelAccess.noneKeys')}>
-        {[
-          ...keyRows.map((p) => (
-            <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
-          )),
-          // Nothing to manage on a key no provider takes any more: only removing it.
-          ...withdrawn.map((p) => (
-            <AccessRow
-              key={p.provider}
-              provider={p.provider}
-              name={nameOf(p)}
-              detail={p.masked_key}
-              status="withdrawn"
-              action={
-                // DALTON-HOOK(team-credentials): removing a key is a shared-credential write.
-                allowDisconnect ? (
-                  <Button type="button" variant="outline" size="sm" onClick={() => setRemoving(p)}>
-                    {t('modelAccess.remove.remove')}
-                  </Button>
-                ) : null
-              }
-            />
-          )),
-        ]}
-      </Group>
+      {effectivePersonalOnly && claudeCodeOffered && !(setup?.on || tokenRows.length > 0) && (
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'claude-code' })}>
+            <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+            {CLAUDE_CODE_CONNECTION.display_name}
+          </Button>
+        </div>
+      )}
 
-      {!isPlatformMode && (
+      {showTeamGroups && (
+        <Group title={t('modelAccess.apiKeys')} empty={t('modelAccess.noneKeys')}>
+          {[
+            ...keyRows.map((p) => (
+              <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
+            )),
+            // Nothing to manage on a key no provider takes any more: only removing it.
+            ...withdrawn.map((p) => (
+              <AccessRow
+                key={p.provider}
+                provider={p.provider}
+                name={nameOf(p)}
+                detail={p.masked_key}
+                status="withdrawn"
+                action={
+                  // DALTON-HOOK(team-credentials): removing a key is a shared-credential write.
+                  allowDisconnect ? (
+                    <Button type="button" variant="outline" size="sm" onClick={() => setRemoving(p)}>
+                      {t('modelAccess.remove.remove')}
+                    </Button>
+                  ) : null
+                }
+              />
+            )),
+          ]}
+        </Group>
+      )}
+
+      {showTeamGroups && !isPlatformMode && (
         <Group title={t('modelAccess.localServers')} empty={t('modelAccess.noneLocal')}>
           {localRows.map((p) => (
             <KeyRow key={p.provider} p={p} onManage={() => manage(p.provider)} />
@@ -380,7 +430,7 @@ export function ModelAccessSection() {
 
       {/* DALTON-HOOK(team-credentials): a non-PM member cannot write the
           shared credentials — the add buttons stay with the administrators. */}
-      {!teamManagedByAdmin && (
+      {showTeamGroups && !teamManagedByAdmin && (
         <div className="flex flex-wrap gap-2">
           <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
             <Plus aria-hidden="true" className="h-3.5 w-3.5" />
