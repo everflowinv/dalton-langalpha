@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import csv
 import difflib
 import hashlib
@@ -46,7 +47,7 @@ import zipfile
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 # Ensure sibling `source_identity.py` is importable regardless of cwd
@@ -55,6 +56,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import asr_jobs  # noqa: E402
+import alphaengine_search_cache as _ae_cache  # noqa: E402
 import bridge_subprocess_env  # noqa: E402
 import seed_asr_client  # noqa: E402
 import log_redaction as _log_redaction  # noqa: E402
@@ -1278,6 +1280,12 @@ class BridgeConfig:
                 os.path.expanduser("~/Library/Logs/alphaengine_usage.jsonl"),
             )
         )
+        self.alphaengine_cache_db: Path = Path(
+            os.environ.get(
+                "DALTON_ALPHAENGINE_CACHE_DB",
+                str(self.cache_dir / "alphaengine_search_cache.sqlite3"),
+            )
+        ).expanduser()
         self.archive_state_file: Path = Path(
             os.environ.get(
                 "DALTON_ARCHIVE_STATE_FILE",
@@ -1577,6 +1585,7 @@ def build_researchdata_plugin_instruction() -> str:
         'AlphaEngine 支持文档与机构/个人会议浏览与筛选（params.meeting_scope="institution"|"personal"，无关键词默认 sort="newest"，按公司检索请用关键词 query（公司名 + ticker）及必要时 search_in="title"）、'
         "录制任务与状态查询（list_recording_tasks/get_recording_status/get_recording_task）、文档基础信息与附件列表（get_document_info/list_attachments）、"
         "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；每次检索（search_library）都扣一次额度，参数完全相同也扣；同一篇文档读过一次全文后再读不扣。检索前先合并关键词：同一公司或同一主题的相关词放进一次检索，不要拆成多次相近的检索。"
+        "相同检索短时间内会直接返回缓存结果（看 `_bridge_cache`），只有确实需要最新结果时（例如财报刚发、用户明确要最新进展）才传 `params.fresh=true`。"
         "Guidepoint 仅返回问答摘录（无全文接口、无 cursor 翻页；limit 省略默认 3，最大 30，不能由 30 条摘录推断已扫完全部访谈；"
         "params.keywords 为 1–10 个非空字符串，多项 OR、词组内 AND，先筛访谈再排片段，不筛选时省略或传 null；"
         "params.recency_bias 为 1–100 整数，偏好近期一般从 30 起，只调排序非日期窗口；start/end 按 UTC 日期硬过滤）。"
@@ -2091,6 +2100,7 @@ ALPHAENGINE_OPERATION_NESTED_PARAMS: dict[str, list[str]] = {
         "cursor",
         "limit",
         "include_snippets",
+        "fresh",
     ],
     "get_document": [
         "doc_id",
@@ -2447,6 +2457,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "recency_bias",
             "start_date",
             "end_date",
+            "fresh",
         ],
         "required_params": {
             "search": ["query 或 ticker"],
@@ -2573,6 +2584,7 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
                 "注：companies / regions / watchlist_groups / watchlist_stocks 依赖上游公司 / 地区标签，可能漏召回或错配，不建议作为主要筛选）"
             ),
             "params.roadshow_id": "录制任务 ID（get_recording_task 必填，不可用 doc_id 代替）",
+            "params.fresh": "布尔值（默认 false）；相同检索短时间内会直接返回缓存结果（看 `_bridge_cache`），只有确实需要最新结果时（例如财报刚发、用户明确要最新进展）才传 true",
             "pagination_rules": (
                 "三种分页机制互不通用：1) search_library 文档检索用 params.cursor（直到 has_more=false；"
                 "newest 保留上游顺序，rank_date 是入库排序时间而非会议开始时间，日期筛选按 publish_time）；"
@@ -2664,15 +2676,16 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "read": "transcript",
             "get": "transcript",
         },
-        "accepted_params": ["ticker", "query", "start", "end", "limit"],
-        "accepted_nested_params": [],
+        "accepted_params": ["ticker", "query", "start", "end", "limit", "params"],
+        "accepted_nested_params": ["fresh"],
         "required_params": {"transcript": ["ticker"]},
-        "optional_params": ["operation", "query", "start", "end", "limit"],
+        "optional_params": ["operation", "query", "start", "end", "limit", "params"],
         "param_formats": {
             "ticker": "股票代码（必填，如 'META'、'GOOGL'、'00700'）",
             "query": "可选补充公司名，中英文用 | 分隔（如 '腾讯|Tencent'）；不能只传 query 不传 ticker，勿传主题词",
             "start": "YYYY-MM-DD",
             "end": "YYYY-MM-DD",
+            "params.fresh": "布尔值（默认 false）；传 true 时跳过读缓存并刷新写入",
         },
         "return_shape": (
             "{\"ok\": true, \"status\": \"ok\"|\"partial\"|\"empty\", \"data\": {\"source\": \"alphaengine\", "
@@ -4226,6 +4239,61 @@ def _normalize_and_validate_call_args(
                 }
                 return normalized, norm_view, err
 
+        if (
+            route in ("alphaengine", "all", "transcript")
+            and isinstance(normalized.get("params"), dict)
+            and "fresh" in normalized["params"]
+            and normalized["params"]["fresh"] is not None
+            and not isinstance(normalized["params"]["fresh"], bool)
+        ):
+            fresh_raw = normalized["params"]["fresh"]
+            return normalized, norm_view, {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "invalid_arguments",
+                "error_code": "invalid_nested_param_value",
+                "error_category": "参数错误",
+                "error": f"[参数错误] params.fresh 须为布尔值 true 或 false（当前为 {fresh_raw!r}）。",
+                "hint": "请将 params.fresh 设为 true 或 false，或省略该参数。",
+                "normalized_params": norm_view,
+            }
+
+        if route in ("alphaengine", "all", "transcript"):
+            if "limit" in normalized and normalized["limit"] is not None:
+                top_lim_int = _parse_int_param(normalized["limit"])
+                if top_lim_int is None or top_lim_int <= 0:
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_arguments",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] limit 须为正整数（>= 1，当前为 {normalized['limit']!r}）。",
+                        "hint": "请将 limit 设为大于 0 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+                normalized["limit"] = top_lim_int
+            p_lim_dict = normalized.get("params")
+            if isinstance(p_lim_dict, dict) and "limit" in p_lim_dict and p_lim_dict["limit"] is not None:
+                nest_lim_int = _parse_int_param(p_lim_dict["limit"])
+                if nest_lim_int is None or nest_lim_int <= 0:
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_arguments",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] params.limit 须为正整数（>= 1，当前为 {p_lim_dict['limit']!r}）。",
+                        "hint": "请将 params.limit 设为大于 0 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
+                p_lim_dict = dict(p_lim_dict)
+                p_lim_dict["limit"] = nest_lim_int
+                normalized["params"] = p_lim_dict
+
         # Validate required parameters and operation-specific rules aligned with upstream
         eff_op = op_str or str(spec.get("default_operation") or "").strip()
         if route == "cn-hk" and eff_op == "ask":
@@ -4304,6 +4372,55 @@ def _normalize_and_validate_call_args(
                         "normalized_params": norm_view,
                     }
                     return normalized, norm_view, err
+                if eff_op == "search_library":
+                    top_limit = normalized.get("limit")
+                    nested_limit = p_cur.get("limit")
+                    if (
+                        top_limit is not None
+                        and str(top_limit).strip() != ""
+                        and nested_limit is not None
+                        and str(nested_limit).strip() != ""
+                    ):
+                        t_li = _parse_int_param(top_limit)
+                        n_li = _parse_int_param(nested_limit)
+                        limit_same = (
+                            t_li == n_li
+                            if (t_li is not None and n_li is not None)
+                            else _values_equal_for_alias(top_limit, nested_limit)
+                        )
+                        if not limit_same:
+                            return normalized, norm_view, {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "parameter_conflict",
+                                "error_category": "参数错误",
+                                "error": (
+                                    f"[参数错误] 参数冲突：顶层 limit={top_limit!r} 与 "
+                                    f"params.limit={nested_limit!r} 不一致。"
+                                ),
+                                "hint": "请统一只传顶层 limit 或 params.limit 之一，或保证两者数值相同。",
+                                "normalized_params": norm_view,
+                            }
+                    for top_dk, nested_dk in (("start", "date_from"), ("end", "date_to")):
+                        top_dv = str(normalized.get(top_dk) or "").strip()
+                        nested_dv = str(p_cur.get(nested_dk) or "").strip()
+                        if top_dv and nested_dv and top_dv != nested_dv:
+                            return normalized, norm_view, {
+                                "_declared_sources": [],
+                                "_sources": [],
+                                "ok": False,
+                                "status": "invalid_arguments",
+                                "error_code": "parameter_conflict",
+                                "error_category": "参数错误",
+                                "error": (
+                                    f"[参数错误] 参数冲突：顶层 {top_dk}={top_dv!r} 与 "
+                                    f"params.{nested_dk}={nested_dv!r} 不一致。"
+                                ),
+                                "hint": f"请统一只传 {top_dk} 或 params.{nested_dk} 之一，或保证两者日期相同。",
+                                "normalized_params": norm_view,
+                            }
 
             if eff_op in ("get_document", "get_document_info", "list_attachments"):
                 raw_doc_id_val = p_cur.get("doc_id")
@@ -7200,6 +7317,24 @@ class UnsupportedSkillLauncherError(ValueError):
     """Raised when an explicit skill `run.sh` path is not a verified launcher for the target skill."""
 
 
+class _CachedSearchTimeoutError(asyncio.TimeoutError):
+    """Carries exact caller cache metadata and upstream attribution across timeout unwind."""
+
+    def __init__(
+        self,
+        *,
+        bridge_cache: dict[str, Any],
+        upstream_called: bool,
+        date_from: str,
+        date_to: str,
+    ) -> None:
+        super().__init__()
+        self.bridge_cache = bridge_cache
+        self.upstream_called = upstream_called
+        self.date_from = date_from
+        self.date_to = date_to
+
+
 class ResearchDataBridge:
     """HTTP-to-stdio MCP bridge for OpenClaw `researchdata`.
 
@@ -7255,6 +7390,8 @@ class ResearchDataBridge:
         self._host_abort_before_gate_release: bool = False
         self._discord_http: Any = None
         self._discord_sleep: Any = asyncio.sleep
+        self._alphaengine_cache: _ae_cache.AlphaEngineSearchCache | None = None
+        self._inflight_searches: dict[str, dict[str, Any]] = {}
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
@@ -7802,6 +7939,9 @@ class ResearchDataBridge:
             "operation": "search_library",
             "query": query,
         }
+        raw_mode = str(arguments.get("mode") or "").strip()
+        if raw_mode:
+            ae_args["mode"] = raw_mode
         start = str(arguments.get("start") or "").strip()
         end = str(arguments.get("end") or "").strip()
         if start:
@@ -7824,6 +7964,10 @@ class ResearchDataBridge:
             if limit > 50:
                 self._last_ae_fanout_limit_clamped = [limit, 50]
             ae_args["limit"] = min(limit, 50)
+
+        raw_params = arguments.get("params")
+        if isinstance(raw_params, dict) and raw_params.get("fresh") is True:
+            ae_args["params"] = {"fresh": True}
 
         ae_args["timeout"] = self._compute_fanout_timeout(
             arguments, FANOUT_ALPHAENGINE_TIMEOUT_S
@@ -7931,21 +8075,737 @@ class ResearchDataBridge:
         )
         return gp_args, gp_win_err
 
-    async def _run_alphaengine_fanout(
-        self, req_id: Any, ae_args: dict[str, Any], ae_budget_s: float
+    def _get_alphaengine_search_cache(self) -> _ae_cache.AlphaEngineSearchCache:
+        cache = getattr(self, "_alphaengine_cache", None)
+        if cache is None:
+            raw_db = getattr(self.cfg, "alphaengine_cache_db", None)
+            if isinstance(raw_db, (Path, str)) and str(raw_db):
+                db_path = Path(raw_db)
+            else:
+                raw_dir = getattr(self.cfg, "cache_dir", None)
+                base_dir = (
+                    Path(raw_dir)
+                    if isinstance(raw_dir, (Path, str)) and str(raw_dir)
+                    else Path(os.path.expanduser("~/Library/Caches/dalton-researchdata-bridge"))
+                )
+                db_path = base_dir / "alphaengine_search_cache.sqlite3"
+            cache = _ae_cache.AlphaEngineSearchCache(
+                db_path, today_fn=lambda: _bridge_today()
+            )
+            self._alphaengine_cache = cache
+        return cache
+
+    def _get_inflight_searches(self) -> dict[str, dict[str, Any]]:
+        inflight = getattr(self, "_inflight_searches", None)
+        if inflight is None:
+            inflight = {}
+            self._inflight_searches = inflight
+        return inflight
+
+    async def close(self) -> None:
+        """Cancel and await any pending shared AlphaEngine search tasks on shutdown."""
+        inflight = getattr(self, "_inflight_searches", None)
+        tasks: list[asyncio.Task[Any]] = []
+        if isinstance(inflight, dict):
+            for entry in list(inflight.values()):
+                if isinstance(entry, dict):
+                    t = entry.get("runner_task")
+                    if isinstance(t, asyncio.Task) and not t.done():
+                        t.cancel()
+                        tasks.append(t)
+            inflight.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @staticmethod
+    def _parse_alphaengine_or_transcript_response(
+        resps: list[dict[str, Any]] | None,
+        *,
+        op: str,
     ) -> dict[str, Any]:
-        """Run the parallel `route='alphaengine'` search and normalize its result or failure state."""
-        ae_timeout = int(ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S)
-        ae_rpc_req = {
+        """Unwrap JSON-RPC response and detect top-level or nested failures."""
+        if not resps or not isinstance(resps[0], dict):
+            return {
+                "ok": False,
+                "payload": None,
+                "rpc_error": None,
+                "is_error": True,
+                "raw_text": "",
+                "error_kind": "rpc_error",
+                "error_message": "Empty response from researchdata_mcp",
+            }
+        resp = resps[0]
+        if isinstance(resp.get("error"), dict):
+            err_msg = str(resp["error"].get("message") or "RPC error")[:200]
+            kind = (
+                "timeout"
+                if "timeout" in err_msg.lower() or "timed out" in err_msg.lower()
+                else "rpc_error"
+            )
+            return {
+                "ok": False,
+                "payload": None,
+                "rpc_error": dict(resp["error"]),
+                "is_error": True,
+                "raw_text": "",
+                "error_kind": kind,
+                "error_message": err_msg,
+            }
+        res_obj = resp.get("result")
+        payload: dict[str, Any] | None = None
+        raw_text = ""
+        if isinstance(res_obj, dict):
+            blocks = res_obj.get("content")
+            if (
+                isinstance(blocks, list)
+                and blocks
+                and isinstance(blocks[0], dict)
+                and isinstance(blocks[0].get("text"), str)
+            ):
+                raw_text = blocks[0]["text"]
+                try:
+                    parsed = json.loads(raw_text)
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except Exception:
+                    payload = None
+            if payload is None and isinstance(res_obj.get("structuredContent"), dict):
+                payload = dict(res_obj["structuredContent"])
+
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "payload": None,
+                "rpc_error": None,
+                "is_error": True,
+                "raw_text": raw_text,
+                "error_kind": "upstream_error",
+                "error_message": raw_text or "Invalid JSON payload from alphaengine",
+            }
+
+        inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        unwrapped = _unwrap_upstream_error_info(payload)
+        is_transcript_nomatch = (
+            op == _ae_cache.OP_TRANSCRIPT and _is_transcript_no_match_payload(payload)
+        )
+        is_err = (
+            bool(isinstance(res_obj, dict) and res_obj.get("isError"))
+            or bool(unwrapped["failed"])
+            or (payload.get("ok") is False and not is_transcript_nomatch)
+            or bool(isinstance(inner, dict) and inner.get("isError"))
+        )
+        if is_err:
+            err_text = str(
+                unwrapped["error"]
+                or payload.get("error")
+                or payload.get("reason")
+                or ""
+            ).strip()
+            if (
+                not err_text
+                and isinstance(inner, dict)
+                and isinstance(inner.get("content"), list)
+            ):
+                c_blocks = inner["content"]
+                if c_blocks and isinstance(c_blocks[0], dict):
+                    err_text = str(c_blocks[0].get("text") or "").strip()
+            raw_status = str(unwrapped["status"] or payload.get("status") or "").strip().lower()
+            return {
+                "ok": False,
+                "payload": payload,
+                "rpc_error": None,
+                "is_error": True,
+                "raw_text": raw_text,
+                "error_kind": "upstream_error",
+                "error_message": (
+                    err_text
+                    or (f"alphaengine status={raw_status}" if raw_status not in ("", "failed", "error") else "")
+                    or "alphaengine call returned error"
+                )[:200],
+            }
+
+        return {
+            "ok": True,
+            "payload": payload,
+            "rpc_error": None,
+            "is_error": False,
+            "raw_text": raw_text,
+            "error_kind": "",
+            "error_message": "",
+        }
+
+    async def _run_upstream_search_rpc(
+        self,
+        *,
+        req_id: Any,
+        upstream_arguments: dict[str, Any],
+        timeout_s: float,
+        on_upstream_start: Callable[[], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        rpc_req = {
             "jsonrpc": "2.0",
-            "id": f"{req_id}:alphaengine" if req_id is not None else "1:alphaengine",
+            "id": req_id if req_id is not None else 1,
             "method": "tools/call",
-            "params": {"name": "research", "arguments": ae_args},
+            "params": {"name": "research", "arguments": upstream_arguments},
+        }
+        resolve_delay = getattr(self.cfg, "resolve_test_delay_s", None)
+        test_delay_s = float(resolve_delay()) if callable(resolve_delay) else 0.0
+        async with self.sem:
+            t0 = time.monotonic()
+            if test_delay_s > 0.0:
+                await asyncio.wait_for(
+                    asyncio.sleep(test_delay_s),
+                    timeout=float(timeout_s),
+                )
+            remaining_s = max(5.0, float(timeout_s) - (time.monotonic() - t0))
+            if on_upstream_start is not None:
+                on_upstream_start()
+            return await self._run_stdio_rpc([rpc_req], timeout_s=remaining_s)
+
+    async def _execute_alphaengine_cached_search(
+        self,
+        *,
+        req_id: Any,
+        op: str,
+        arguments: dict[str, Any],
+        caller_identity: dict[str, str] | None,
+        caller_timeout_s: float,
+        shared_timeout_s: float,
+        fanout: bool = False,
+        cancel_ctx: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Shared exact-cache + singleflight + quota-fallback executor for direct `alphaengine.search_library`, `route='all'` fan-out, and `route='transcript'`."""
+        caller_user = str((caller_identity or {}).get("user") or "").strip()
+        plan = _ae_cache.prepare_alphaengine_search_request(
+            arguments,
+            op=op,
+            caller_user=caller_user,
+            fanout=fanout,
+        )
+        cache = self._get_alphaengine_search_cache()
+
+        async def _invoke_and_build(
+            *,
+            rpc_id: Any,
+            timeout_s: float,
+            is_fresh: bool,
+            allow_stale_fallback: bool,
+            allow_cache_write: bool,
+            status_override: str | None = None,
+            result_future: asyncio.Future[dict[str, Any]] | None = None,
+            on_upstream_start: Callable[[], None] | None = None,
+        ) -> dict[str, Any]:
+            nonlocal cache
+            parsed: dict[str, Any]
+            upstream_started = False
+
+            def _mark_started() -> None:
+                nonlocal upstream_started
+                upstream_started = True
+                if on_upstream_start is not None:
+                    on_upstream_start()
+
+            try:
+                resps = await self._run_upstream_search_rpc(
+                    req_id=rpc_id,
+                    upstream_arguments=plan.upstream_arguments,
+                    timeout_s=timeout_s,
+                    on_upstream_start=_mark_started,
+                )
+                parsed = self._parse_alphaengine_or_transcript_response(resps, op=plan.op)
+            except asyncio.TimeoutError:
+                parsed = {
+                    "ok": False,
+                    "payload": None,
+                    "rpc_error": None,
+                    "is_error": True,
+                    "raw_text": "",
+                    "error_kind": "timeout",
+                    "error_message": f"{plan.op} timed out after {int(timeout_s)}s",
+                }
+            except SubprocessExitError as exc:
+                parsed = {
+                    "ok": False,
+                    "payload": None,
+                    "rpc_error": None,
+                    "is_error": True,
+                    "raw_text": "",
+                    "error_kind": "subprocess_exit",
+                    "error_message": f"SubprocessExitError(exit_code={exc.exit_code})",
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                parsed = {
+                    "ok": False,
+                    "payload": None,
+                    "rpc_error": None,
+                    "is_error": True,
+                    "raw_text": "",
+                    "error_kind": "exception",
+                    "error_message": type(exc).__name__,
+                }
+
+            if parsed["ok"] and isinstance(parsed["payload"], dict):
+                payload = parsed["payload"]
+                if allow_cache_write:
+                    result_count, has_more = _ae_cache.extract_result_metrics(
+                        payload, op=plan.op
+                    )
+                    put_res = await cache.put(
+                        cache_key=plan.cache_key,
+                        base_key=plan.base_key,
+                        op=plan.op,
+                        user_scope=plan.user_scope,
+                        req_limit=plan.req_limit,
+                        result_count=result_count,
+                        has_more=has_more,
+                        payload=copy.deepcopy(payload),
+                        date_to=plan.date_to,
+                    )
+                    if put_res is not None:
+                        fetched_at, expires_at = put_res
+                        bc = {
+                            "status": status_override or ("fresh" if is_fresh else "miss"),
+                            "fetched_at": _ae_cache.iso_utc(fetched_at),
+                            "age_seconds": 0.0,
+                            "expires_at": _ae_cache.iso_utc(expires_at),
+                        }
+                    else:
+                        bc = {
+                            "status": "bypass",
+                            "fetched_at": _ae_cache.iso_utc(cache._now_fn()),
+                            "age_seconds": 0.0,
+                            "expires_at": None,
+                        }
+                    res_obj = {
+                        "ok": True,
+                        "payload": copy.deepcopy(payload),
+                        "rpc_error": None,
+                        "is_error": False,
+                        "raw_text": "",
+                        "error_kind": "",
+                        "error_message": "",
+                        "bridge_cache": bc,
+                        "upstream_called": upstream_started,
+                        "stale": False,
+                        "stale_reason": "",
+                        "date_from": plan.date_from,
+                        "date_to": plan.date_to,
+                    }
+                    if result_future is not None and not result_future.done():
+                        result_future.set_result(res_obj)
+                    return res_obj
+
+                now = cache._now_fn()
+                bc = {
+                    "status": status_override or "bypass",
+                    "fetched_at": _ae_cache.iso_utc(now),
+                    "age_seconds": 0.0,
+                    "expires_at": None,
+                }
+                res_obj = {
+                    "ok": True,
+                    "payload": copy.deepcopy(payload),
+                    "rpc_error": None,
+                    "is_error": False,
+                    "raw_text": "",
+                    "error_kind": "",
+                    "error_message": "",
+                    "bridge_cache": bc,
+                    "upstream_called": upstream_started,
+                    "stale": False,
+                    "stale_reason": "",
+                    "date_from": plan.date_from,
+                    "date_to": plan.date_to,
+                }
+                if result_future is not None and not result_future.done():
+                    result_future.set_result(res_obj)
+                return res_obj
+
+            # Upstream failure: check quota/auth fallback if cacheable
+            if allow_stale_fallback and plan.cacheable:
+                err_probe = (
+                    copy.deepcopy(parsed["payload"])
+                    if isinstance(parsed.get("payload"), dict)
+                    else {"error": parsed.get("error_message") or "error"}
+                )
+                err_route = "transcript" if plan.op == _ae_cache.OP_TRANSCRIPT else "alphaengine"
+                err_op = "transcript" if plan.op == _ae_cache.OP_TRANSCRIPT else "search_library"
+                err_cat, _ = _classify_error_category_and_hint(
+                    "research", err_route, err_op, err_probe
+                )
+                if err_cat == "权限或额度":
+                    stale_hit = await cache.get_stale(plan.cache_key)
+                    if stale_hit is not None:
+                        now = cache._now_fn()
+                        bc = {
+                            "status": "stale",
+                            "fetched_at": _ae_cache.iso_utc(stale_hit.fetched_at),
+                            "age_seconds": round(max(0.0, now - stale_hit.fetched_at), 3),
+                            "expires_at": _ae_cache.iso_utc(stale_hit.expires_at),
+                            "stale": True,
+                            "stale_reason": "quota",
+                        }
+                        stale_obj = {
+                            "ok": True,
+                            "payload": stale_hit.payload,
+                            "rpc_error": None,
+                            "is_error": False,
+                            "raw_text": "",
+                            "error_kind": "",
+                            "error_message": "",
+                            "bridge_cache": bc,
+                            "upstream_called": upstream_started,
+                            "stale": True,
+                            "stale_reason": "quota",
+                            "date_from": plan.date_from,
+                            "date_to": plan.date_to,
+                        }
+                        if result_future is not None and not result_future.done():
+                            result_future.set_result(stale_obj)
+                        return stale_obj
+
+            bc = {
+                "status": status_override or ("fresh" if is_fresh else "miss"),
+                "fetched_at": None,
+                "age_seconds": None,
+                "expires_at": None,
+            }
+            fail_obj = {
+                **parsed,
+                "bridge_cache": bc,
+                "upstream_called": upstream_started,
+                "stale": False,
+                "stale_reason": "",
+                "date_from": plan.date_from,
+                "date_to": plan.date_to,
+            }
+            if result_future is not None and not result_future.done():
+                result_future.set_result(fail_obj)
+            return fail_obj
+
+        # 1. Uncacheable requests (`mode="plan"`, `cursor`, or personal-scope meetings)
+        if not plan.cacheable:
+            bypass_state = {"upstream_started": False}
+            bypass_timeout_bc = {
+                "status": "bypass",
+                "fetched_at": None,
+                "age_seconds": None,
+                "expires_at": None,
+            }
+            try:
+                res = await asyncio.wait_for(
+                    _invoke_and_build(
+                        rpc_id=f"{req_id}:alphaengine" if (fanout and req_id is not None) else req_id,
+                        timeout_s=caller_timeout_s,
+                        is_fresh=False,
+                        allow_stale_fallback=False,
+                        allow_cache_write=False,
+                        status_override="bypass",
+                        on_upstream_start=lambda: bypass_state.__setitem__("upstream_started", True),
+                    ),
+                    timeout=caller_timeout_s,
+                )
+            except asyncio.CancelledError:
+                if cancel_ctx is not None:
+                    cancel_ctx.update(
+                        {
+                            "cache": "bypass",
+                            "upstream": bool(bypass_state["upstream_started"]),
+                            "date_from": plan.date_from,
+                            "date_to": plan.date_to,
+                        }
+                    )
+                raise
+            except asyncio.TimeoutError as exc:
+                if not fanout:
+                    raise _CachedSearchTimeoutError(
+                        bridge_cache=bypass_timeout_bc,
+                        upstream_called=bool(bypass_state["upstream_started"]),
+                        date_from=plan.date_from,
+                        date_to=plan.date_to,
+                    ) from exc
+                return {
+                    "ok": False,
+                    "payload": None,
+                    "rpc_error": None,
+                    "is_error": True,
+                    "raw_text": "",
+                    "error_kind": "timeout",
+                    "error_message": f"{plan.op} timed out after {int(caller_timeout_s)}s",
+                    "bridge_cache": bypass_timeout_bc,
+                    "upstream_called": bool(bypass_state["upstream_started"]),
+                    "stale": False,
+                    "stale_reason": "",
+                    "date_from": plan.date_from,
+                    "date_to": plan.date_to,
+                }
+            if res["error_kind"] == "timeout" and not fanout:
+                raise _CachedSearchTimeoutError(
+                    bridge_cache=dict(res["bridge_cache"]),
+                    upstream_called=bool(bypass_state["upstream_started"]),
+                    date_from=plan.date_from,
+                    date_to=plan.date_to,
+                )
+            return res
+
+        # 2. All cacheable requests (including `fresh` and degraded DB) join/register
+        #    inside `inflight` BEFORE reading cache so read -> upstream -> write is atomic per key.
+        inflight = self._get_inflight_searches()
+        inflight_key = f"{plan.cache_key}#fresh" if plan.fresh else plan.cache_key
+
+        async def _await_existing_flight(existing_entry: dict[str, Any]) -> dict[str, Any]:
+            wait_bc = {
+                "status": "coalesced",
+                "fetched_at": None,
+                "age_seconds": None,
+                "expires_at": None,
+            }
+            try:
+                shared_res = await asyncio.wait_for(
+                    asyncio.shield(existing_entry["result_future"]), timeout=caller_timeout_s
+                )
+            except asyncio.CancelledError:
+                if cancel_ctx is not None:
+                    fut = existing_entry["result_future"]
+                    c_status = "coalesced"
+                    if fut.done() and not fut.cancelled():
+                        try:
+                            done_res = fut.result()
+                            if isinstance(done_res, dict):
+                                if done_res.get("from_cache"):
+                                    c_status = "hit"
+                                elif done_res.get("stale"):
+                                    c_status = "stale"
+                        except Exception:
+                            pass
+                    cancel_ctx.update(
+                        {
+                            "cache": c_status,
+                            "upstream": False,
+                            "date_from": plan.date_from,
+                            "date_to": plan.date_to,
+                        }
+                    )
+                raise
+            except asyncio.TimeoutError as exc:
+                raise _CachedSearchTimeoutError(
+                    bridge_cache=wait_bc,
+                    upstream_called=False,
+                    date_from=plan.date_from,
+                    date_to=plan.date_to,
+                ) from exc
+            bc = dict(shared_res["bridge_cache"])
+            if shared_res.get("from_cache"):
+                bc["status"] = "hit"
+            elif shared_res["stale"]:
+                bc["status"] = "stale"
+            else:
+                bc["status"] = "coalesced"
+            if shared_res["error_kind"] == "timeout" and not fanout:
+                raise _CachedSearchTimeoutError(
+                    bridge_cache=bc,
+                    upstream_called=False,
+                    date_from=plan.date_from,
+                    date_to=plan.date_to,
+                )
+            return {
+                **shared_res,
+                "payload": (
+                    copy.deepcopy(shared_res["payload"])
+                    if shared_res["payload"] is not None
+                    else None
+                ),
+                "bridge_cache": bc,
+                "upstream_called": False,
+                "_persist_wait": None,
+            }
+
+        existing = inflight.get(inflight_key)
+        if existing is not None:
+            return await _await_existing_flight(existing)
+
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        call_state = {"upstream_started": False}
+
+        async def _leader_runner() -> dict[str, Any]:
+            try:
+                degraded = False
+                if not plan.fresh:
+                    hit, degraded = await cache.get(
+                        plan.cache_key, plan.base_key, plan.req_limit, op=plan.op
+                    )
+                    if hit is not None:
+                        now = cache._now_fn()
+                        hit_bc: dict[str, Any] = {
+                            "status": "hit",
+                            "fetched_at": _ae_cache.iso_utc(hit.fetched_at),
+                            "age_seconds": round(max(0.0, now - hit.fetched_at), 3),
+                            "expires_at": _ae_cache.iso_utc(hit.expires_at),
+                        }
+                        if hit.sliced_from_limit is not None:
+                            hit_bc["sliced_from_limit"] = hit.sliced_from_limit
+                        if hit.note:
+                            hit_bc["note"] = hit.note
+                        hit_obj = {
+                            "ok": True,
+                            "payload": hit.payload,
+                            "rpc_error": None,
+                            "is_error": False,
+                            "raw_text": "",
+                            "error_kind": "",
+                            "error_message": "",
+                            "bridge_cache": hit_bc,
+                            "upstream_called": False,
+                            "from_cache": True,
+                            "stale": False,
+                            "stale_reason": "",
+                            "date_from": plan.date_from,
+                            "date_to": plan.date_to,
+                        }
+                        if not result_future.done():
+                            result_future.set_result(hit_obj)
+                        return hit_obj
+
+                return await _invoke_and_build(
+                    rpc_id=f"{req_id}:alphaengine" if (fanout and req_id is not None) else req_id,
+                    timeout_s=shared_timeout_s,
+                    is_fresh=plan.fresh,
+                    allow_stale_fallback=not degraded,
+                    allow_cache_write=not degraded,
+                    status_override="bypass" if degraded else None,
+                    result_future=result_future,
+                    on_upstream_start=lambda: call_state.__setitem__("upstream_started", True),
+                )
+            except asyncio.CancelledError:
+                if not result_future.done():
+                    result_future.cancel()
+                raise
+            except Exception as exc:
+                err_obj = {
+                    "ok": False,
+                    "payload": None,
+                    "rpc_error": None,
+                    "is_error": True,
+                    "raw_text": "",
+                    "error_kind": "exception",
+                    "error_message": type(exc).__name__,
+                    "bridge_cache": {
+                        "status": "fresh" if plan.fresh else "miss",
+                        "fetched_at": None,
+                        "age_seconds": None,
+                        "expires_at": None,
+                    },
+                    "upstream_called": bool(call_state["upstream_started"]),
+                    "stale": False,
+                    "stale_reason": "",
+                    "date_from": plan.date_from,
+                    "date_to": plan.date_to,
+                }
+                if not result_future.done():
+                    result_future.set_result(err_obj)
+                return err_obj
+            finally:
+                if inflight.get(inflight_key) is entry:
+                    inflight.pop(inflight_key, None)
+
+        runner_task = asyncio.create_task(_leader_runner())
+        entry: dict[str, Any] = {
+            "result_future": result_future,
+            "runner_task": runner_task,
+        }
+        inflight[inflight_key] = entry
+
+        leader_timeout_bc = {
+            "status": "fresh" if plan.fresh else "miss",
+            "fetched_at": None,
+            "age_seconds": None,
+            "expires_at": None,
         }
         try:
-            ae_resps = await self._run_stdio_rpc(
-                [ae_rpc_req], timeout_s=ae_budget_s
+            shared_res = await asyncio.wait_for(
+                asyncio.shield(result_future), timeout=caller_timeout_s
             )
+        except asyncio.CancelledError:
+            if cancel_ctx is not None:
+                cancel_ctx.update(
+                    {
+                        "cache": (
+                            "bypass"
+                            if cache._degraded_warned
+                            else ("fresh" if plan.fresh else "miss")
+                        ),
+                        "upstream": bool(call_state["upstream_started"]),
+                        "date_from": plan.date_from,
+                        "date_to": plan.date_to,
+                    }
+                )
+            raise
+        except asyncio.TimeoutError as exc:
+            raise _CachedSearchTimeoutError(
+                bridge_cache=leader_timeout_bc,
+                upstream_called=bool(call_state["upstream_started"]),
+                date_from=plan.date_from,
+                date_to=plan.date_to,
+            ) from exc
+        if shared_res["error_kind"] == "timeout" and not fanout:
+            raise _CachedSearchTimeoutError(
+                bridge_cache=dict(shared_res["bridge_cache"]),
+                upstream_called=bool(shared_res.get("upstream_called")),
+                date_from=plan.date_from,
+                date_to=plan.date_to,
+            )
+        return {
+            **shared_res,
+            "payload": (
+                copy.deepcopy(shared_res["payload"])
+                if shared_res["payload"] is not None
+                else None
+            ),
+            "upstream_called": bool(shared_res.get("upstream_called")),
+            "_persist_wait": runner_task if fanout else None,
+        }
+
+    async def _run_alphaengine_fanout(
+        self,
+        req_id: Any,
+        ae_args: dict[str, Any],
+        ae_budget_s: float,
+        *,
+        caller_identity: dict[str, str] | None = None,
+        limit_clamped: list[int] | None = None,
+        cancel_ctx: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run the parallel `route='alphaengine'` search via the shared cache layer and normalize its result or failure state."""
+        ae_timeout = int(ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S)
+        shared_budget_s = max(float(ae_budget_s), float(DEFAULT_ROUTE_TIMEOUT_S))
+        try:
+            cached_res = await self._execute_alphaengine_cached_search(
+                req_id=req_id,
+                op=_ae_cache.OP_SEARCH_LIBRARY,
+                arguments=ae_args,
+                caller_identity=caller_identity,
+                caller_timeout_s=ae_budget_s,
+                shared_timeout_s=shared_budget_s,
+                fanout=True,
+                cancel_ctx=cancel_ctx,
+            )
+        except _CachedSearchTimeoutError as exc:
+            reason = f"alphaengine timed out after {ae_timeout}s"
+            logger.warning("alphaengine fanout timeout timeout_s=%d", ae_timeout)
+            return {
+                "ok": False,
+                "status": "timeout",
+                "route": "alphaengine",
+                "reason": reason,
+                "count": 0,
+                "results": [],
+                "raw_payload": None,
+                "upstream_called": exc.upstream_called,
+                "_bridge_cache": dict(exc.bridge_cache),
+            }
         except asyncio.TimeoutError:
             reason = f"alphaengine timed out after {ae_timeout}s"
             logger.warning("alphaengine fanout timeout timeout_s=%d", ae_timeout)
@@ -7957,123 +8817,68 @@ class ResearchDataBridge:
                 "count": 0,
                 "results": [],
                 "raw_payload": None,
-            }
-        except SubprocessExitError as exc:
-            reason = f"SubprocessExitError(exit_code={exc.exit_code})"
-            logger.warning("alphaengine fanout failed: %s", reason)
-            return {
-                "ok": False,
-                "status": "failed",
-                "route": "alphaengine",
-                "reason": reason,
-                "count": 0,
-                "results": [],
-                "raw_payload": None,
-            }
-        except Exception as exc:
-            reason = type(exc).__name__
-            logger.warning("alphaengine fanout failed: %s", reason)
-            return {
-                "ok": False,
-                "status": "failed",
-                "route": "alphaengine",
-                "reason": reason,
-                "count": 0,
-                "results": [],
-                "raw_payload": None,
+                "upstream_called": True,
+                "_bridge_cache": {
+                    "status": "miss",
+                    "fetched_at": None,
+                    "age_seconds": None,
+                    "expires_at": None,
+                },
             }
 
-        if not ae_resps or not isinstance(ae_resps[0], dict):
-            return {
-                "ok": False,
-                "status": "failed",
-                "route": "alphaengine",
-                "reason": "Empty response from researchdata_mcp",
-                "count": 0,
-                "results": [],
-                "raw_payload": None,
-            }
+        ae_payload = cached_res.get("payload")
+        bc = dict(cached_res.get("bridge_cache") or {})
+        upstream_called = bool(cached_res.get("upstream_called"))
+        persist_wait = cached_res.get("_persist_wait")
+        eff_clamped = (
+            list(limit_clamped)
+            if limit_clamped
+            else (
+                list(self._last_ae_fanout_limit_clamped)
+                if getattr(self, "_last_ae_fanout_limit_clamped", None)
+                else None
+            )
+        )
 
-        ae_resp = ae_resps[0]
-        if isinstance(ae_resp.get("error"), dict):
-            err_msg = str(ae_resp["error"].get("message") or "RPC error")[:200]
-            status = "timeout" if "timeout" in err_msg.lower() or "timed out" in err_msg.lower() else "failed"
-            return {
+        if not cached_res.get("ok"):
+            err_kind = str(cached_res.get("error_kind") or "")
+            err_msg = str(cached_res.get("error_message") or "alphaengine call returned error")[:200]
+            if err_kind == "timeout":
+                status = "timeout"
+                err_msg = f"alphaengine timed out after {ae_timeout}s"
+            elif isinstance(ae_payload, dict):
+                ae_unwrapped = _unwrap_upstream_error_info(ae_payload)
+                raw_status = str(ae_unwrapped["status"] or ae_payload.get("status") or "").strip().lower()
+                if raw_status == "timeout" or "timeout" in err_msg.lower() or "timed out" in err_msg.lower():
+                    status = "timeout"
+                elif raw_status in _SPECIFIC_FAILURE_STATUSES:
+                    status = raw_status
+                else:
+                    status = "failed"
+            else:
+                status = (
+                    "timeout"
+                    if "timeout" in err_msg.lower() or "timed out" in err_msg.lower()
+                    else "failed"
+                )
+            fail_out: dict[str, Any] = {
                 "ok": False,
                 "status": status,
                 "route": "alphaengine",
                 "reason": err_msg,
                 "count": 0,
                 "results": [],
-                "raw_payload": None,
+                "raw_payload": ae_payload if isinstance(ae_payload, dict) else None,
+                "upstream_called": upstream_called,
+                "_bridge_cache": bc,
+                "_persist_wait": persist_wait,
             }
+            if eff_clamped:
+                fail_out["limit_clamped"] = eff_clamped
+            return fail_out
 
-        res_obj = ae_resp.get("result")
-        ae_payload: dict[str, Any] | None = None
-        if isinstance(res_obj, dict):
-            blocks = res_obj.get("content")
-            if isinstance(blocks, list) and blocks and isinstance(blocks[0], dict) and isinstance(blocks[0].get("text"), str):
-                try:
-                    parsed = json.loads(blocks[0]["text"])
-                    if isinstance(parsed, dict):
-                        ae_payload = parsed
-                except Exception:
-                    ae_payload = None
-            if ae_payload is None and isinstance(res_obj.get("structuredContent"), dict):
-                ae_payload = res_obj["structuredContent"]
-
-        if not isinstance(ae_payload, dict):
-            return {
-                "ok": False,
-                "status": "failed",
-                "route": "alphaengine",
-                "reason": "Invalid JSON payload from alphaengine",
-                "count": 0,
-                "results": [],
-                "raw_payload": None,
-            }
-
+        assert isinstance(ae_payload, dict)
         inner = ae_payload.get("data") if isinstance(ae_payload.get("data"), dict) else ae_payload
-        ae_unwrapped = _unwrap_upstream_error_info(ae_payload)
-        is_err = (
-            bool(isinstance(res_obj, dict) and res_obj.get("isError"))
-            or bool(ae_unwrapped["failed"])
-            or ae_payload.get("ok") is False
-            or bool(isinstance(inner, dict) and inner.get("isError"))
-        )
-        if is_err:
-            err_text = str(
-                ae_unwrapped["error"]
-                or ae_payload.get("error")
-                or ae_payload.get("reason")
-                or ""
-            ).strip()
-            if not err_text and isinstance(inner, dict) and isinstance(inner.get("content"), list):
-                c_blocks = inner["content"]
-                if c_blocks and isinstance(c_blocks[0], dict):
-                    err_text = str(c_blocks[0].get("text") or "").strip()
-            raw_status = str(ae_unwrapped["status"] or ae_payload.get("status") or "").strip().lower()
-            if raw_status == "timeout" or "timeout" in err_text.lower() or "timed out" in err_text.lower():
-                status = "timeout"
-            elif raw_status in _SPECIFIC_FAILURE_STATUSES:
-                status = raw_status
-            else:
-                status = "failed"
-            reason = (
-                err_text
-                or (f"alphaengine status={status}" if status not in ("failed", "error") else "")
-                or "alphaengine call returned error"
-            )[:200]
-            return {
-                "ok": False,
-                "status": status,
-                "route": "alphaengine",
-                "reason": reason,
-                "count": 0,
-                "results": [],
-                "raw_payload": ae_payload,
-            }
-
         sc = (
             source_identity._unwrap_mcp_proxy_payload(inner)
             if isinstance(inner, dict)
@@ -8137,9 +8942,14 @@ class ResearchDataBridge:
             "has_more": bool(meta_dict.get("has_more")) if "has_more" in meta_dict else False,
             "total_upstream": meta_dict.get("total_upstream"),
             "filters": dict(meta_dict["filters"]) if isinstance(meta_dict.get("filters"), dict) else {},
+            "upstream_called": upstream_called,
+            "_bridge_cache": bc,
+            "stale": bool(cached_res.get("stale")),
+            "stale_reason": str(cached_res.get("stale_reason") or ""),
+            "_persist_wait": persist_wait,
         }
-        if getattr(self, "_last_ae_fanout_limit_clamped", None):
-            out_outcome["limit_clamped"] = list(self._last_ae_fanout_limit_clamped)
+        if eff_clamped:
+            out_outcome["limit_clamped"] = eff_clamped
         return out_outcome
 
     async def _run_guidepoint_fanout(
@@ -8164,10 +8974,13 @@ class ResearchDataBridge:
             "method": "tools/call",
             "params": {"name": "research", "arguments": gp_args},
         }
+        gp_t0 = time.monotonic()
         try:
-            gp_resps = await self._run_stdio_rpc(
-                [gp_rpc_req], timeout_s=gp_budget_s
-            )
+            async with self.sem:
+                remaining_s = max(5.0, float(gp_budget_s) - (time.monotonic() - gp_t0))
+                gp_resps = await self._run_stdio_rpc(
+                    [gp_rpc_req], timeout_s=remaining_s
+                )
         except asyncio.TimeoutError:
             reason = f"guidepoint timed out after {gp_timeout}s"
             logger.warning("guidepoint fanout timeout timeout_s=%d", gp_timeout)
@@ -8416,6 +9229,11 @@ class ResearchDataBridge:
                 "filters": dict(ae_filters) if isinstance(ae_filters, dict) else {},
                 "next_page_hint": next_page_hint,
             }
+            if isinstance(ae_outcome.get("_bridge_cache"), dict):
+                ae_section["_bridge_cache"] = dict(ae_outcome["_bridge_cache"])
+            if ae_outcome.get("stale"):
+                ae_section["stale"] = True
+                ae_section["stale_reason"] = str(ae_outcome.get("stale_reason") or "quota")
             if clamped_pair:
                 ae_section["limit_clamped"] = list(clamped_pair)
                 ae_section["note"] = (
@@ -8440,6 +9258,8 @@ class ResearchDataBridge:
                 "total_upstream": None,
                 "filters": {},
             }
+            if isinstance(ae_outcome.get("_bridge_cache"), dict):
+                ae_section["_bridge_cache"] = dict(ae_outcome["_bridge_cache"])
             if clamped_pair:
                 ae_section["limit_clamped"] = list(clamped_pair)
                 ae_section["note"] = (
@@ -8720,6 +9540,7 @@ class ResearchDataBridge:
         op_clean = str(operation or "").strip()
         return {
             "search_library": "search",
+            "transcript": "search",
             "list_filters": "search",
             "list_recording_tasks": "search",
             "get_document_info": "meta",
@@ -8737,6 +9558,8 @@ class ResearchDataBridge:
         if not isinstance(payload, dict) or not bool(payload.get("ok")):
             return 0
         op_clean = str(operation or "search_library").strip()
+        if op_clean == "transcript":
+            return len(_extract_transcript_candidates(payload))
         inner = (
             payload.get("data")
             if isinstance(payload.get("data"), dict)
@@ -8808,6 +9631,11 @@ class ResearchDataBridge:
         error_category: str | None,
         count: int,
         caller: dict[str, str] | None,
+        cache: str = "",
+        upstream: bool = True,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        pages_scanned: int | None = None,
     ) -> None:
         args = arguments if isinstance(arguments, dict) else {}
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
@@ -8822,6 +9650,28 @@ class ResearchDataBridge:
             "read": "read",
             "status": "状态",
         }.get(op_code, op_code)
+        eff_date_from = (
+            str(date_from).strip()
+            if date_from is not None
+            else str(
+                args.get("start")
+                or params.get("date_from")
+                or params.get("start_date")
+                or params.get("start")
+                or ""
+            ).strip()
+        )
+        eff_date_to = (
+            str(date_to).strip()
+            if date_to is not None
+            else str(
+                args.get("end")
+                or params.get("date_to")
+                or params.get("end_date")
+                or params.get("end")
+                or ""
+            ).strip()
+        )
         entry: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "op": op_code,
@@ -8837,7 +9687,13 @@ class ResearchDataBridge:
             "user": str((caller or {}).get("user") or ""),
             "workspace": str((caller or {}).get("workspace") or ""),
             "thread": str((caller or {}).get("thread") or ""),
+            "cache": str(cache or ""),
+            "upstream": bool(upstream),
+            "date_from": eff_date_from,
+            "date_to": eff_date_to,
         }
+        if pages_scanned is not None and isinstance(pages_scanned, int) and not isinstance(pages_scanned, bool):
+            entry["pages_scanned"] = pages_scanned
         if op_code == "read" or op_raw == "get_document":
             entry["content_field"] = str(params.get("content_field") or "auto").strip()
             off_parsed = _parse_int_param(params.get("offset"))
@@ -11525,9 +12381,15 @@ class ResearchDataBridge:
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = None
+        ae_limit_clamped: list[int] | None = None
         gp_args: dict[str, Any] | None = None
         if do_fanout:
             ae_args, ae_win_err = self._build_alphaengine_fanout_args(arguments)
+            ae_limit_clamped = (
+                list(self._last_ae_fanout_limit_clamped)
+                if getattr(self, "_last_ae_fanout_limit_clamped", None)
+                else None
+            )
             gp_args, gp_win_err = self._build_guidepoint_fanout_args(arguments)
             # A leg window the entry point's per-leg validation somehow let
             # through fails the whole call as a parameter error — the old code
@@ -11539,14 +12401,13 @@ class ResearchDataBridge:
                 )
         if tool_name == "research" and route == "all" and isinstance(call_args.get("params"), dict):
             # Guidepoint-only nested keys (`keywords`, `recency_bias`, `start_date`, `end_date`)
-            # are accepted on `route="all"` only for the Guidepoint fan-out leg; the local
-            # 4-library gateway rejects them on `route=all`, so strip them before building `rpc_req`.
-            gp_only_keys = ("keywords", "recency_bias", "start_date", "end_date")
-            if any(k in call_args["params"] for k in gp_only_keys):
+            # and cache-refresh `fresh` are never sent to the local 4-library gateway.
+            local_strip_keys = ("keywords", "recency_bias", "start_date", "end_date", "fresh")
+            if any(k in call_args["params"] for k in local_strip_keys):
                 local_all_params = {
                     k: v
                     for k, v in call_args["params"].items()
-                    if k not in gp_only_keys
+                    if k not in local_strip_keys
                 }
                 if local_all_params:
                     call_args["params"] = local_all_params
@@ -11554,31 +12415,96 @@ class ResearchDataBridge:
                     call_args.pop("params", None)
         ae_outcome: dict[str, Any] | None = None
         gp_outcome: dict[str, Any] | None = None
+        direct_cache_meta: dict[str, Any] | None = None
+        direct_upstream_called: bool = True
+        direct_stale: bool = False
+        direct_stale_reason: str = ""
+        direct_date_from: str = ""
+        direct_date_to: str = ""
+        eff_ae_op = operation or "search_library"
+        is_cached_direct = (
+            tool_name == "research"
+            and (
+                (route == "alphaengine" and eff_ae_op == "search_library")
+                or route == "transcript"
+            )
+        )
 
         t0 = time.monotonic()
         test_delay_s = self.cfg.resolve_test_delay_s()
-        async with self.sem:
-            try:
-                if test_delay_s > 0.0:
-                    await asyncio.wait_for(
-                        asyncio.sleep(test_delay_s),
-                        timeout=float(eff_timeout),
-                    )
-                elapsed_so_far = time.monotonic() - t0
-                remaining_budget_s = max(
-                    5.0, float(eff_timeout) - elapsed_so_far + 5.0
+        direct_cancel_ctx: dict[str, Any] = {}
+        fanout_ae_cancel_ctx: dict[str, Any] = {}
+        ae_task: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            if is_cached_direct:
+                cached_op = (
+                    _ae_cache.OP_TRANSCRIPT
+                    if route == "transcript"
+                    else _ae_cache.OP_SEARCH_LIBRARY
                 )
-                rpc_req = {
-                    "jsonrpc": "2.0",
-                    "id": req_id if req_id is not None else 1,
-                    "method": "tools/call",
-                    "params": {"name": tool_name, "arguments": call_args},
-                }
-                if tool_name != "catalog" and route == "market-regime":
-                    mr_payload = await asyncio.wait_for(
-                        self._handle_market_regime(arguments),
-                        timeout=remaining_budget_s,
-                    )
+                shared_budget_s = max(
+                    float(eff_timeout),
+                    float(
+                        LONG_READ_TIMEOUT_S
+                        if route == "transcript"
+                        else DEFAULT_ROUTE_TIMEOUT_S
+                    ),
+                )
+                cached_res = await self._execute_alphaengine_cached_search(
+                    req_id=req_id,
+                    op=cached_op,
+                    arguments=call_args,
+                    caller_identity=caller_identity,
+                    caller_timeout_s=float(eff_timeout),
+                    shared_timeout_s=shared_budget_s,
+                    fanout=False,
+                    cancel_ctx=direct_cancel_ctx,
+                )
+                direct_cache_meta = dict(cached_res.get("bridge_cache") or {})
+                direct_upstream_called = bool(cached_res.get("upstream_called"))
+                direct_stale = bool(cached_res.get("stale"))
+                direct_stale_reason = str(cached_res.get("stale_reason") or "")
+                direct_date_from = str(cached_res.get("date_from") or "")
+                direct_date_to = str(cached_res.get("date_to") or "")
+                if direct_upstream_called:
+                    stdio_attempts += 1
+                if cached_res.get("rpc_error") is not None:
+                    if (
+                        self._get_alphaengine_search_cache()._degraded_warned
+                        and direct_cache_meta.get("status") in ("miss", "fresh")
+                    ):
+                        direct_cache_meta["status"] = "bypass"
+                        direct_cache_meta["expires_at"] = None
+                    rpc_err = dict(cached_res["rpc_error"])
+                    existing_err_data = rpc_err.get("data")
+                    if isinstance(existing_err_data, dict):
+                        err_data_obj = dict(existing_err_data)
+                    elif existing_err_data is not None:
+                        err_data_obj = {"detail": existing_err_data}
+                    else:
+                        err_data_obj = {}
+                    err_data_obj["_bridge_cache"] = dict(direct_cache_meta)
+                    rpc_err["data"] = err_data_obj
+                    resps = [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id if req_id is not None else 1,
+                            "error": rpc_err,
+                        }
+                    ]
+                else:
+                    c_payload = cached_res.get("payload")
+                    if not isinstance(c_payload, dict):
+                        c_payload = {
+                            "_declared_sources": [],
+                            "_sources": [],
+                            "ok": False,
+                            "status": "failed",
+                            "error": str(
+                                cached_res.get("error_message")
+                                or "alphaengine call failed"
+                            ),
+                        }
                     resps = [
                         {
                             "jsonrpc": "2.0",
@@ -11588,231 +12514,415 @@ class ResearchDataBridge:
                                     {
                                         "type": "text",
                                         "text": json.dumps(
-                                            mr_payload, ensure_ascii=False
+                                            c_payload, ensure_ascii=False
                                         ),
                                     }
                                 ],
-                                "structuredContent": dict(mr_payload),
-                                "isError": not bool(mr_payload.get("ok")),
+                                "structuredContent": dict(c_payload),
+                                "isError": not bool(cached_res.get("ok")),
                             },
                         }
                     ]
-                elif ae_args is not None and gp_args is not None:
-                    ae_timeout = int(
-                        ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
+            elif ae_args is not None and gp_args is not None:
+                # Cache lookup, singleflight waiting, and fanout coordination run
+                # outside `self.sem` so waiting callers never hold semaphore slots.
+                ae_timeout = int(
+                    ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
+                )
+                ae_budget_s = max(5.0, float(ae_timeout) + 5.0)
+                gp_timeout = int(
+                    gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S
+                )
+                gp_budget_s = max(5.0, float(gp_timeout) + 5.0)
+                ae_task = asyncio.create_task(
+                    self._run_alphaengine_fanout(
+                        req_id,
+                        ae_args,
+                        ae_budget_s,
+                        caller_identity=caller_identity,
+                        limit_clamped=ae_limit_clamped,
+                        cancel_ctx=fanout_ae_cancel_ctx,
                     )
-                    ae_budget_s = max(
-                        5.0, float(ae_timeout) - elapsed_so_far + 5.0
-                    )
-                    gp_timeout = int(
-                        gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S
-                    )
-                    gp_budget_s = max(
-                        5.0, float(gp_timeout) - elapsed_so_far + 5.0
-                    )
-                    ae_task = asyncio.create_task(
-                        self._run_alphaengine_fanout(req_id, ae_args, ae_budget_s)
-                    )
-                    gp_task = asyncio.create_task(
-                        self._run_guidepoint_fanout(req_id, gp_args, gp_budget_s)
-                    )
+                )
+                gp_task = asyncio.create_task(
+                    self._run_guidepoint_fanout(req_id, gp_args, gp_budget_s)
+                )
+                try:
                     try:
-                        try:
+                        async with self.sem:
+                            if test_delay_s > 0.0:
+                                await asyncio.wait_for(
+                                    asyncio.sleep(test_delay_s),
+                                    timeout=float(eff_timeout),
+                                )
+                            elapsed_so_far = time.monotonic() - t0
+                            remaining_budget_s = max(
+                                5.0, float(eff_timeout) - elapsed_so_far + 5.0
+                            )
+                            rpc_req = {
+                                "jsonrpc": "2.0",
+                                "id": req_id if req_id is not None else 1,
+                                "method": "tools/call",
+                                "params": {"name": tool_name, "arguments": call_args},
+                            }
                             stdio_attempts += 1
                             resps = await self._run_stdio_rpc(
                                 [rpc_req], timeout_s=remaining_budget_s
                             )
-                        except (asyncio.TimeoutError, Exception) as local_exc:
-                            # Let online calls that are already done finish before cancelling the rest.
+                    except (asyncio.TimeoutError, Exception) as local_exc:
+                        is_local_timeout = isinstance(local_exc, asyncio.TimeoutError)
+                        # Let online calls that are already completing (including SQLite thread hops)
+                        # settle before cancelling genuinely hung legs.
+                        for _ in range(8):
+                            if ae_task.done() and gp_task.done():
+                                break
                             await asyncio.sleep(0)
-                            if not ae_task.done():
-                                ae_task.cancel()
-                            if not gp_task.done():
-                                gp_task.cancel()
-                            raw_ae, raw_gp = await asyncio.gather(
-                                ae_task, gp_task, return_exceptions=True
+                        pending_legs = [t for t in (ae_task, gp_task) if not t.done()]
+                        if pending_legs:
+                            await asyncio.wait(pending_legs, timeout=0.05)
+                        if not ae_task.done():
+                            ae_task.cancel()
+                        if not gp_task.done():
+                            gp_task.cancel()
+                        raw_ae, raw_gp = await asyncio.gather(
+                            ae_task, gp_task, return_exceptions=True
+                        )
+                        local_st = "timeout" if is_local_timeout else "failed"
+                        local_reason = (
+                            f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}"
+                            if is_local_timeout
+                            else (
+                                f"SubprocessExitError(exit_code={local_exc.exit_code})"
+                                if isinstance(local_exc, SubprocessExitError)
+                                else type(local_exc).__name__
                             )
-                            is_local_timeout = isinstance(local_exc, asyncio.TimeoutError)
-                            local_st = "timeout" if is_local_timeout else "failed"
-                            local_reason = (
-                                f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}"
-                                if is_local_timeout
-                                else (
-                                    f"SubprocessExitError(exit_code={local_exc.exit_code})"
-                                    if isinstance(local_exc, SubprocessExitError)
-                                    else type(local_exc).__name__
-                                )
-                            )
-                            ae_outcome = (
-                                raw_ae
-                                if isinstance(raw_ae, dict)
-                                else {
-                                    "ok": False,
-                                    "status": "canceled",
-                                    "route": "alphaengine",
-                                    "reason": f"canceled after local all {local_st}",
-                                    "count": 0,
-                                    "results": [],
-                                    "raw_payload": None,
-                                }
-                            )
-                            gp_outcome = (
-                                raw_gp
-                                if isinstance(raw_gp, dict)
-                                else {
-                                    "ok": False,
-                                    "status": "canceled",
-                                    "route": "guidepoint",
-                                    "reason": f"canceled after local all {local_st}",
-                                    "count": 0,
-                                    "results": [],
-                                    "raw_payload": None,
-                                }
-                            )
-                            fallback_payload: dict[str, Any] = {
+                        )
+                        ae_outcome = (
+                            raw_ae
+                            if isinstance(raw_ae, dict)
+                            else {
                                 "ok": False,
-                                "status": local_st,
-                                "error": local_reason,
+                                "status": "canceled",
+                                "route": "alphaengine",
+                                "reason": f"canceled after local all {local_st}",
+                                "count": 0,
                                 "results": [],
-                                "result_count": 0,
-                                "source_status": {
-                                    "local_all": {
-                                        "ok": False,
-                                        "status": local_st,
-                                        "reason": local_reason,
-                                        "error": local_reason,
-                                        "count": 0,
-                                    }
+                                "raw_payload": None,
+                                "upstream_called": False,
+                            }
+                        )
+                        gp_outcome = (
+                            raw_gp
+                            if isinstance(raw_gp, dict)
+                            else {
+                                "ok": False,
+                                "status": "canceled",
+                                "route": "guidepoint",
+                                "reason": f"canceled after local all {local_st}",
+                                "count": 0,
+                                "results": [],
+                                "raw_payload": None,
+                            }
+                        )
+                        fallback_payload: dict[str, Any] = {
+                            "ok": False,
+                            "status": local_st,
+                            "error": local_reason,
+                            "results": [],
+                            "result_count": 0,
+                            "source_status": {
+                                "local_all": {
+                                    "ok": False,
+                                    "status": local_st,
+                                    "reason": local_reason,
+                                    "error": local_reason,
+                                    "count": 0,
+                                }
+                            },
+                        }
+                        resps = [
+                            {
+                                "jsonrpc": "2.0",
+                                "id": req_id if req_id is not None else 1,
+                                "result": {
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": json.dumps(
+                                                fallback_payload,
+                                                ensure_ascii=False,
+                                            ),
+                                        }
+                                    ],
+                                    "structuredContent": dict(fallback_payload),
+                                    "isError": True,
                                 },
                             }
-                            resps = [
-                                {
-                                    "jsonrpc": "2.0",
-                                    "id": req_id if req_id is not None else 1,
-                                    "result": {
-                                        "content": [
-                                            {
-                                                "type": "text",
-                                                "text": json.dumps(
-                                                    fallback_payload,
-                                                    ensure_ascii=False,
-                                                ),
-                                            }
-                                        ],
-                                        "structuredContent": dict(fallback_payload),
-                                        "isError": True,
-                                    },
-                                }
-                            ]
-                        except BaseException:
-                            ae_task.cancel()
-                            gp_task.cancel()
-                            await asyncio.gather(
-                                ae_task, gp_task, return_exceptions=True
-                            )
-                            raise
-                        else:
-                            ae_outcome, gp_outcome = await asyncio.gather(ae_task, gp_task)
-                    finally:
-                        # Whatever ends the fan-out (an error, a cancel mid-handler), no online
-                        # subprocess outlives the call: cancel what is still running and reap it.
-                        await _cancel_and_reap((ae_task, gp_task))
-                else:
-                    stdio_attempts += 1
-                    try:
-                        resps = await self._run_stdio_rpc(
-                            [rpc_req], timeout_s=remaining_budget_s
+                        ]
+                    except BaseException:
+                        ae_task.cancel()
+                        gp_task.cancel()
+                        await asyncio.gather(
+                            ae_task, gp_task, return_exceptions=True
                         )
-                    except asyncio.TimeoutError:
-                        # P0 fix1 5: the outer asyncio.TimeoutError handler
-                        # below already writes this request's one
-                        # sec_call_failed line — logging here too would emit
-                        # two for the same failure.
                         raise
-                    except Exception as call_exc:
-                        # SEC observability: a stdio leg that died before any
-                        # payload (subprocess exit, spawn failure) still gets
-                        # its structured failure line.
-                        if route == "sec":
-                            _log_sec_call_outcome(
-                                corr_id=corr_id,
-                                operation=operation,
-                                arguments=arguments,
-                                payload=None,
-                                elapsed_ms=int((time.monotonic() - t0) * 1000),
-                                stdio_attempts=stdio_attempts,
-                                error_text=f"{type(call_exc).__name__}: {call_exc}",
-                                exc_type=type(call_exc).__name__,
-                            )
-                        raise
-            except asyncio.TimeoutError:
-                elapsed_ms = int((time.monotonic() - t0) * 1000)
-                # R7 r3 (codex #3): the timeout exit keeps the same SEC
-                # failure context as the normal exit — this branch returns
-                # early, so its own tools/call timeout line must carry the
-                # sec_* fields itself.
-                timeout_sec_suffix = ""
-                timeout_sec_args: tuple[str, ...] = ()
-                if route == "sec":
-                    timeout_ctx = _log_sec_call_outcome(
-                        corr_id=corr_id,
-                        operation=operation,
-                        arguments=arguments,
-                        payload=None,
-                        elapsed_ms=elapsed_ms,
-                        stdio_attempts=stdio_attempts,
-                        timeout_s=eff_timeout,
-                        exc_type="asyncio.TimeoutError",
+                    else:
+                        ae_outcome, gp_outcome = await asyncio.gather(ae_task, gp_task)
+                finally:
+                    # Whatever ends the fan-out (an error, a cancel mid-handler), no online
+                    # subprocess outlives the call: cancel what is still running and reap it.
+                    await _cancel_and_reap((ae_task, gp_task))
+                if isinstance(ae_outcome, dict):
+                    pw = ae_outcome.pop("_persist_wait", None)
+                    if isinstance(pw, asyncio.Task) and not pw.done():
+                        await asyncio.gather(asyncio.shield(pw), return_exceptions=True)
+                    if (
+                        self._get_alphaengine_search_cache()._degraded_warned
+                        and isinstance(ae_outcome.get("_bridge_cache"), dict)
+                        and ae_outcome["_bridge_cache"].get("status") in ("miss", "fresh")
+                    ):
+                        ae_outcome["_bridge_cache"]["status"] = "bypass"
+                        ae_outcome["_bridge_cache"]["expires_at"] = None
+            else:
+                async with self.sem:
+                    if test_delay_s > 0.0:
+                        await asyncio.wait_for(
+                            asyncio.sleep(test_delay_s),
+                            timeout=float(eff_timeout),
+                        )
+                    elapsed_so_far = time.monotonic() - t0
+                    remaining_budget_s = max(
+                        5.0, float(eff_timeout) - elapsed_so_far + 5.0
                     )
-                    if timeout_ctx:
-                        timeout_sec_suffix, timeout_sec_args = _sec_ctx_log_suffix(timeout_ctx)
-                logger.warning(
-                    "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d"
-                    + timeout_sec_suffix,
-                    corr_id,
-                    tool_name,
-                    route,
-                    operation,
-                    eff_timeout,
-                    elapsed_ms,
-                    *timeout_sec_args,
+                    rpc_req = {
+                        "jsonrpc": "2.0",
+                        "id": req_id if req_id is not None else 1,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": call_args},
+                    }
+                    if tool_name != "catalog" and route == "market-regime":
+                        mr_payload = await asyncio.wait_for(
+                            self._handle_market_regime(arguments),
+                            timeout=remaining_budget_s,
+                        )
+                        resps = [
+                            {
+                                "jsonrpc": "2.0",
+                                "id": req_id if req_id is not None else 1,
+                                "result": {
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": json.dumps(
+                                                mr_payload, ensure_ascii=False
+                                            ),
+                                        }
+                                    ],
+                                    "structuredContent": dict(mr_payload),
+                                    "isError": not bool(mr_payload.get("ok")),
+                                },
+                            }
+                        ]
+                    else:
+                        stdio_attempts += 1
+                        try:
+                            resps = await self._run_stdio_rpc(
+                                [rpc_req], timeout_s=remaining_budget_s
+                            )
+                        except asyncio.TimeoutError:
+                            # P0 fix1 5: the outer asyncio.TimeoutError handler
+                            # below already writes this request's one
+                            # sec_call_failed line — logging here too would emit
+                            # two for the same failure.
+                            raise
+                        except Exception as call_exc:
+                            # SEC observability: a stdio leg that died before any
+                            # payload (subprocess exit, spawn failure) still gets
+                            # its structured failure line.
+                            if route == "sec":
+                                _log_sec_call_outcome(
+                                    corr_id=corr_id,
+                                    operation=operation,
+                                    arguments=arguments,
+                                    payload=None,
+                                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                                    stdio_attempts=stdio_attempts,
+                                    error_text=f"{type(call_exc).__name__}: {call_exc}",
+                                    exc_type=type(call_exc).__name__,
+                                )
+                            raise
+        except asyncio.CancelledError:
+            if route in ("alphaengine", "transcript"):
+                c_cache = str(direct_cancel_ctx.get("cache") or "")
+                if not c_cache and is_cached_direct:
+                    raw_p = call_args.get("params")
+                    was_fresh = isinstance(raw_p, dict) and raw_p.get("fresh") is True
+                    c_cache = "fresh" if was_fresh else "miss"
+                # Uncached operations (get_document and the like) reached the
+                # upstream once their stdio call started.
+                c_upstream = (
+                    bool(direct_cancel_ctx.get("upstream", False))
+                    if is_cached_direct
+                    else stdio_attempts > 0
                 )
-                timeout_payload: dict[str, Any] = {
-                    "_declared_sources": [],
-                    "_sources": [],
-                    "ok": False,
-                    "status": "timeout",
-                    "error": f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}",
-                }
-                _apply_error_and_empty_contract(
-                    tool_name, route, operation, timeout_payload, norm_params_view
-                )
-                # B5: a timed-out AlphaEngine call was still a call — it lands
-                # in the ledger with its classified failure.
-                if route == "alphaengine":
-                    await self._record_alphaengine_usage(
-                        operation=operation or "search_library",
+                await asyncio.shield(
+                    self._record_alphaengine_usage(
+                        operation=(operation or "search_library")
+                        if route == "alphaengine"
+                        else "transcript",
                         arguments=arguments,
                         ok=False,
-                        error_category=str(timeout_payload.get("error_category") or ""),
+                        error_category="canceled",
                         count=0,
                         caller=caller_identity,
+                        cache=c_cache,
+                        upstream=c_upstream,
+                        date_from=str(direct_cancel_ctx.get("date_from") or "") or None,
+                        date_to=str(direct_cancel_ctx.get("date_to") or "") or None,
                     )
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json.dumps(
-                                    timeout_payload, ensure_ascii=False
-                                ),
-                            }
-                        ],
-                        "isError": True,
-                    },
-                }
+                )
+            elif ae_args is not None:
+                done_ae: dict[str, Any] | None = ae_outcome
+                if done_ae is None and ae_task is not None and ae_task.done() and not ae_task.cancelled():
+                    try:
+                        maybe_res = ae_task.result()
+                        if isinstance(maybe_res, dict):
+                            done_ae = maybe_res
+                    except Exception:
+                        done_ae = None
+                if done_ae is not None:
+                    ae_ok = bool(done_ae.get("ok"))
+                    ae_bc = done_ae.get("_bridge_cache")
+                    await asyncio.shield(
+                        self._record_alphaengine_usage(
+                            operation=str(ae_args.get("operation") or "search_library"),
+                            arguments=ae_args,
+                            ok=ae_ok,
+                            error_category=(
+                                ""
+                                if ae_ok
+                                else "canceled"
+                            ),
+                            count=int(done_ae.get("count") or 0),
+                            caller=caller_identity,
+                            cache=(
+                                str(ae_bc.get("status") or "")
+                                if isinstance(ae_bc, dict)
+                                else ""
+                            ),
+                            upstream=bool(done_ae.get("upstream_called", False)),
+                            date_from=str(ae_args.get("start") or "") or None,
+                            date_to=str(ae_args.get("end") or "") or None,
+                        )
+                    )
+                else:
+                    await asyncio.shield(
+                        self._record_alphaengine_usage(
+                            operation=str(ae_args.get("operation") or "search_library"),
+                            arguments=ae_args,
+                            ok=False,
+                            error_category="canceled",
+                            count=0,
+                            caller=caller_identity,
+                            cache=str(fanout_ae_cancel_ctx.get("cache") or ""),
+                            upstream=bool(fanout_ae_cancel_ctx.get("upstream", False)),
+                            date_from=str(ae_args.get("start") or "") or None,
+                            date_to=str(ae_args.get("end") or "") or None,
+                        )
+                    )
+            raise
+        except asyncio.TimeoutError as timeout_exc:
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            # R7 r3 (codex #3): the timeout exit keeps the same SEC
+            # failure context as the normal exit — this branch returns
+            # early, so its own tools/call timeout line must carry the
+            # sec_* fields itself.
+            timeout_sec_suffix = ""
+            timeout_sec_args: tuple[str, ...] = ()
+            if route == "sec":
+                timeout_ctx = _log_sec_call_outcome(
+                    corr_id=corr_id,
+                    operation=operation,
+                    arguments=arguments,
+                    payload=None,
+                    elapsed_ms=elapsed_ms,
+                    stdio_attempts=stdio_attempts,
+                    timeout_s=eff_timeout,
+                    exc_type="asyncio.TimeoutError",
+                )
+                if timeout_ctx:
+                    timeout_sec_suffix, timeout_sec_args = _sec_ctx_log_suffix(timeout_ctx)
+            logger.warning(
+                "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d"
+                + timeout_sec_suffix,
+                corr_id,
+                tool_name,
+                route,
+                operation,
+                eff_timeout,
+                elapsed_ms,
+                *timeout_sec_args,
+            )
+            timeout_payload: dict[str, Any] = {
+                "_declared_sources": [],
+                "_sources": [],
+                "ok": False,
+                "status": "timeout",
+                "error": f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}",
+            }
+            _apply_error_and_empty_contract(
+                tool_name, route, operation, timeout_payload, norm_params_view
+            )
+            timeout_cache_status = ""
+            timeout_upstream = True
+            timeout_date_from = ""
+            timeout_date_to = ""
+            if is_cached_direct:
+                if isinstance(timeout_exc, _CachedSearchTimeoutError):
+                    timeout_bc = dict(timeout_exc.bridge_cache)
+                    timeout_upstream = bool(timeout_exc.upstream_called)
+                    timeout_date_from = str(timeout_exc.date_from or "")
+                    timeout_date_to = str(timeout_exc.date_to or "")
+                else:
+                    raw_p = call_args.get("params")
+                    was_fresh = isinstance(raw_p, dict) and raw_p.get("fresh") is True
+                    timeout_bc = {
+                        "status": "fresh" if was_fresh else "miss",
+                        "fetched_at": None,
+                        "age_seconds": None,
+                        "expires_at": None,
+                    }
+                timeout_payload["_bridge_cache"] = timeout_bc
+                timeout_cache_status = str(timeout_bc.get("status") or "")
+            # B5: record timeout in ledger with accurate cache/upstream attribution.
+            if route in ("alphaengine", "transcript"):
+                await self._record_alphaengine_usage(
+                    operation=(operation or "search_library") if route == "alphaengine" else "transcript",
+                    arguments=arguments,
+                    ok=False,
+                    error_category=str(timeout_payload.get("error_category") or ""),
+                    count=0,
+                    caller=caller_identity,
+                    cache=timeout_cache_status,
+                    upstream=timeout_upstream,
+                    date_from=timeout_date_from or None,
+                    date_to=timeout_date_to or None,
+                )
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                timeout_payload, ensure_ascii=False
+                            ),
+                        }
+                    ],
+                    "isError": True,
+                },
+            }
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         resp = resps[0] if resps else {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": "Empty response from researchdata_mcp"}}
@@ -12032,6 +13142,18 @@ class ResearchDataBridge:
                         tool_name, route, operation, payload, norm_params_view
                     )
 
+                    if direct_cache_meta is not None:
+                        if (
+                            self._get_alphaengine_search_cache()._degraded_warned
+                            and direct_cache_meta.get("status") in ("miss", "fresh")
+                        ):
+                            direct_cache_meta["status"] = "bypass"
+                            direct_cache_meta["expires_at"] = None
+                        payload["_bridge_cache"] = dict(direct_cache_meta)
+                        if direct_stale:
+                            payload["stale"] = True
+                            payload["stale_reason"] = direct_stale_reason or "quota"
+
                     # Track AlphaEngine get_document quota usage (only after unwrapping/status classification)
                     if (
                         route == "alphaengine"
@@ -12048,7 +13170,7 @@ class ResearchDataBridge:
                         await self._record_alphaengine_get_doc(chars)
 
                     # B5: one ledger line per served AlphaEngine call — the
-                    # direct route and the route='all' fan-out leg each.
+                    # direct route, transcript, and the route='all' fan-out leg each.
                     # Unwrapping and error classification run first so ok,
                     # error_category, and structuredContent count are accurate.
                     if route == "alphaengine":
@@ -12062,10 +13184,47 @@ class ResearchDataBridge:
                                 eff_op_for_usage, payload
                             ),
                             caller=caller_identity,
+                            cache=(
+                                str(direct_cache_meta.get("status") or "")
+                                if direct_cache_meta is not None
+                                else ""
+                            ),
+                            upstream=direct_upstream_called if is_cached_direct else True,
+                            date_from=direct_date_from if is_cached_direct else None,
+                            date_to=direct_date_to if is_cached_direct else None,
+                        )
+                    elif tool_name == "research" and route == "transcript":
+                        tr_cov = _extract_transcript_coverage(payload)
+                        tr_pages = (
+                            tr_cov.get("pages_scanned")
+                            if isinstance(tr_cov, dict)
+                            and isinstance(tr_cov.get("pages_scanned"), int)
+                            and not isinstance(tr_cov.get("pages_scanned"), bool)
+                            else None
+                        )
+                        await self._record_alphaengine_usage(
+                            operation="transcript",
+                            arguments=arguments,
+                            ok=bool(payload.get("ok")),
+                            error_category=str(payload.get("error_category") or ""),
+                            count=self._extract_alphaengine_usage_count(
+                                "transcript", payload
+                            ),
+                            caller=caller_identity,
+                            cache=(
+                                str(direct_cache_meta.get("status") or "")
+                                if direct_cache_meta is not None
+                                else ""
+                            ),
+                            upstream=direct_upstream_called,
+                            date_from=direct_date_from,
+                            date_to=direct_date_to,
+                            pages_scanned=tr_pages,
                         )
                     if ae_outcome is not None and ae_args is not None:
                         ae_ok = bool(ae_outcome.get("ok"))
                         ae_reason = str(ae_outcome.get("reason") or "")
+                        ae_bc = ae_outcome.get("_bridge_cache")
                         await self._record_alphaengine_usage(
                             operation=str(ae_args.get("operation") or "search_library"),
                             arguments=ae_args,
@@ -12077,6 +13236,14 @@ class ResearchDataBridge:
                             ),
                             count=int(ae_outcome.get("count") or 0),
                             caller=caller_identity,
+                            cache=(
+                                str(ae_bc.get("status") or "")
+                                if isinstance(ae_bc, dict)
+                                else ""
+                            ),
+                            upstream=bool(ae_outcome.get("upstream_called", True)),
+                            date_from=str(ae_args.get("start") or ""),
+                            date_to=str(ae_args.get("end") or ""),
                         )
                     if params_mapped_hint:
                         cur_hint = str(payload.get("hint") or "").strip()
@@ -12130,6 +13297,26 @@ class ResearchDataBridge:
         # HTTP status and ensure the `tools/call` log line does not say `status=ok`
         # (only the log field changes; `resp` returned to the caller is untouched).
         top_error = resp.get("error") if isinstance(resp.get("error"), dict) else None
+        if is_cached_direct and top_error is not None:
+            err_msg = str(top_error.get("message") or "RPC error")
+            err_cat, _ = _classify_error_category_and_hint(
+                tool_name,
+                route,
+                eff_ae_op if route == "alphaengine" else "transcript",
+                {"error": err_msg},
+            )
+            await self._record_alphaengine_usage(
+                operation=eff_ae_op if route == "alphaengine" else "transcript",
+                arguments=arguments,
+                ok=False,
+                error_category=err_cat,
+                count=0,
+                caller=caller_identity,
+                cache=str((direct_cache_meta or {}).get("status") or ""),
+                upstream=direct_upstream_called,
+                date_from=direct_date_from,
+                date_to=direct_date_to,
+            )
         if (
             route == "sec"
             and not sec_outcome_logged
@@ -23215,13 +24402,24 @@ async def _handle_client(
                 return
 
             if rpc_method == "tools/call":
-                # B5: who the call runs for, as the sandbox's MCP client
-                # stamps it; missing headers record as empty identity.
-                caller_identity = {
-                    "user": headers.get("x-dalton-user", "").strip(),
-                    "workspace": headers.get("x-dalton-workspace", "").strip(),
-                    "thread": headers.get("x-dalton-thread", "").strip(),
-                }
+                # Only trust X-Dalton-User/-Workspace/-Thread headers when
+                # stamped per-request (`X-Dalton-Caller-Scope: per-request`),
+                # so legacy daemons/clients that read starter-process
+                # `DALTON_CALLER_*` env record empty identity rather than
+                # misattributing subsequent callers.
+                has_per_request_scope = (
+                    headers.get("x-dalton-caller-scope", "").strip().lower()
+                    == "per-request"
+                )
+                caller_identity = (
+                    {
+                        "user": headers.get("x-dalton-user", "").strip(),
+                        "workspace": headers.get("x-dalton-workspace", "").strip(),
+                        "thread": headers.get("x-dalton-thread", "").strip(),
+                    }
+                    if has_per_request_scope
+                    else {"user": "", "workspace": "", "thread": ""}
+                )
                 reply = await bridge.handle_tools_call(
                     req_id, rpc_params, caller_identity=caller_identity
                 )
@@ -23846,6 +25044,10 @@ async def main() -> None:
         await bridge.recover_host_runner_state_on_startup()
     except Exception as exc:
         logger.warning("Startup host data-task runner recovery warning: %s", type(exc).__name__)
+    try:
+        await bridge._get_alphaengine_search_cache().initialize()
+    except Exception as exc:
+        logger.warning("Startup AlphaEngine search cache init warning: %s", type(exc).__name__)
 
     server = await asyncio.start_server(
         lambda r, w: _handle_client(bridge, r, w),
@@ -23863,8 +25065,32 @@ async def main() -> None:
         cfg.max_inflight,
         cfg.caller_budget_s,
     )
-    async with server:
-        await server.serve_forever()
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    installed_signals: list[signal.Signals] = []
+    if main_task is not None:
+        def _cancel_on_signal() -> None:
+            if not main_task.done():
+                main_task.cancel()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _cancel_on_signal)
+                installed_signals.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+    try:
+        async with server:
+            await server.serve_forever()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        for sig in installed_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        await bridge.close()
 
 
 if __name__ == "__main__":

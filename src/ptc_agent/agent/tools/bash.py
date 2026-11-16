@@ -19,6 +19,8 @@ from pydantic.json_schema import SkipJsonSchema
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.tools import command_handoff
+# DALTON-HOOK(alphaengine-cache): reuse caller-identity binding helper for bash jobs
+from ptc_agent.agent.tools.code_execution import _bound_caller_identity
 from ptc_agent.agent.tools.command_handoff import CommandCall, HandOff
 from ptc_agent.agent.tools.mount_guard import run_guarded
 from ptc_agent.agent.tools.utils import resource_tier_of
@@ -324,18 +326,20 @@ def create_execute_bash_tool(
             except JobNotLaunched as e:
                 return await _not_launched(e, wait_s, call.config)
 
-        try:
-            return await command_handoff.run_command(
-                backend,
-                call,
-                launch,
-                _result,
-                hand_off=hand_off,
-                first_wait=first_wait,
-                background=background,
-            )
-        except Exception as e:
-            return _raised(e)
+        # DALTON-HOOK(alphaengine-cache): bind caller identity so Bash jobs carry DALTON_CALLER_*
+        with _bound_caller_identity(call.config, thread_id):
+            try:
+                return await command_handoff.run_command(
+                    backend,
+                    call,
+                    launch,
+                    _result,
+                    hand_off=hand_off,
+                    first_wait=first_wait,
+                    background=background,
+                )
+            except Exception as e:
+                return _raised(e)
 
     async def _not_launched(
         e: JobNotLaunched, wait_s: float, config: RunnableConfig

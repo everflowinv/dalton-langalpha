@@ -4,7 +4,8 @@
 Reads ``alphaengine_usage.jsonl`` — one line per served AlphaEngine call, as
 written by ``researchdata_bridge.py`` — and reports:
 
-- per day (UTC): search and read counts, split by success/failure;
+- per day (Beijing time, Asia/Shanghai): requests, upstream calls, cache
+  hits, coalesced, stale fallbacks, fresh refreshes, and failures;
 - per user and per thread: search + read counts;
 - documents read more than once, and queries (sha256 prefix) searched more
   than once;
@@ -25,7 +26,11 @@ import json
 import os
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_LEDGER = os.path.expanduser(
     os.environ.get("DALTON_ALPHAENGINE_USAGE_FILE", "~/Library/Logs/alphaengine_usage.jsonl")
@@ -36,6 +41,7 @@ _OPS = ("search", "read", "meta", "status")
 _OP_CATEGORY_MAP = {
     "search": "search",
     "search_library": "search",
+    "transcript": "search",
     "list_filters": "search",
     "list_recording_tasks": "search",
     "meta": "meta",
@@ -61,6 +67,19 @@ _META_OPERATIONS = frozenset(
 def _clean_identity(value: object) -> str:
     text = str(value or "").strip()
     return text if text else "(空)"
+
+
+def _beijing_day(ts_raw: object) -> str:
+    text = str(ts_raw or "").strip()
+    if not text:
+        return "(无时间)"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_BEIJING_TZ).strftime("%Y-%m-%d")
+    except ValueError:
+        return text[:10] if len(text) >= 10 else "(无时间)"
 
 
 def load_entries(paths: list[Path]) -> list[dict]:
@@ -89,9 +108,10 @@ def summarize(entries: list[dict]) -> dict:
     by_thread: dict[str, Counter] = defaultdict(Counter)
     doc_reads: Counter = Counter()
     query_searches: Counter = Counter()
+    totals: Counter = Counter()
 
     for entry in entries:
-        day = str(entry.get("ts") or "")[:10] or "(无时间)"
+        day = _beijing_day(entry.get("ts"))
         raw_op_field = str(entry.get("op") or "").strip()
         raw_operation = str(entry.get("operation") or "").strip()
         if raw_operation in _META_OPERATIONS or raw_op_field in _META_OPERATIONS:
@@ -102,11 +122,28 @@ def summarize(entries: list[dict]) -> dict:
                 _OP_CATEGORY_MAP.get(raw_operation, raw_op_field or "call"),
             )
         ok = bool(entry.get("ok"))
+        cache_state = str(entry.get("cache") or "").strip().lower()
+        upstream_flag = entry.get("upstream")
+        if isinstance(upstream_flag, bool):
+            is_upstream = upstream_flag
+        else:
+            is_upstream = cache_state not in ("hit", "coalesced")
+
         user = _clean_identity(entry.get("user"))
         thread = _clean_identity(entry.get("thread"))
         outcome = "ok" if ok else "fail"
         by_day[day][f"{op}.{outcome}"] += 1
         by_day[day]["total"] += 1
+        if is_upstream:
+            by_day[day]["upstream"] += 1
+            totals["upstream_calls"] += 1
+        if cache_state in ("hit", "coalesced", "stale", "fresh", "miss", "bypass"):
+            by_day[day][cache_state] += 1
+            totals[cache_state] += 1
+        if not ok:
+            by_day[day]["fail"] += 1
+            totals["failures"] += 1
+
         by_user[user][op] += 1
         by_user[user]["total"] += 1
         by_thread[thread][op] += 1
@@ -122,6 +159,14 @@ def summarize(entries: list[dict]) -> dict:
 
     return {
         "total_calls": len(entries),
+        "upstream_calls": totals["upstream_calls"],
+        "cache_hits": totals["hit"],
+        "coalesced": totals["coalesced"],
+        "stale": totals["stale"],
+        "fresh": totals["fresh"],
+        "misses": totals["miss"],
+        "bypasses": totals["bypass"],
+        "failures": totals["failures"],
         "by_day": {day: dict(counts) for day, counts in sorted(by_day.items())},
         "by_user": {
             user: {op: counts.get(op, 0) for op in (*_OPS, "total")}
@@ -147,18 +192,28 @@ def summarize(entries: list[dict]) -> dict:
 
 
 def _print_report(summary: dict) -> None:
-    print(f"AlphaEngine 用量汇总：共 {summary['total_calls']} 次调用")
-    print("\n按天（UTC）：")
+    print(
+        f"AlphaEngine 用量汇总：共 {summary['total_calls']} 次请求"
+        f"（调上游 {summary.get('upstream_calls', 0)}，"
+        f"命中 {summary.get('cache_hits', 0)}，"
+        f"合并 {summary.get('coalesced', 0)}，"
+        f"兜底 {summary.get('stale', 0)}，"
+        f"刷新 {summary.get('fresh', 0)}，"
+        f"失败 {summary.get('failures', 0)}）"
+    )
+    print("\n按天（北京时间）：")
     if not summary["by_day"]:
         print("  （无记录）")
     for day, counts in summary["by_day"].items():
         search = counts.get("search.ok", 0) + counts.get("search.fail", 0)
         read = counts.get("read.ok", 0) + counts.get("read.fail", 0)
-        fails = sum(v for k, v in counts.items() if k.endswith(".fail"))
+        fails = counts.get("fail", sum(v for k, v in counts.items() if k.endswith(".fail")))
         print(
-            f"  {day}  search={search}（失败 {counts.get('search.fail', 0)}）"
-            f"  read={read}（失败 {counts.get('read.fail', 0)}）  共 {counts.get('total', 0)} 次"
-            + (f"，失败 {fails} 次" if fails else "")
+            f"  {day}  请求={counts.get('total', 0)} 上游={counts.get('upstream', 0)}"
+            f" 命中={counts.get('hit', 0)} 合并={counts.get('coalesced', 0)}"
+            f" 兜底={counts.get('stale', 0)} 刷新={counts.get('fresh', 0)}"
+            f" 失败={fails} | search={search}（失败 {counts.get('search.fail', 0)}）"
+            f" read={read}（失败 {counts.get('read.fail', 0)}）"
         )
     print("\n按用户：")
     for user, counts in summary["by_user"].items():

@@ -12,6 +12,7 @@ mark a test with ``@pytest.mark.real_heavy_subprocess`` to keep the real runner.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -73,3 +74,22 @@ def _isolated_bridge_env_file(
     empty = tmp_path_factory.getbasetemp() / "isolated-bridge.env"
     empty.touch(exist_ok=True)
     monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(empty))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_alphaengine_ledger_and_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep AlphaEngine usage ledger and search cache inside per-test `tmp_path`."""
+    monkeypatch.setenv(
+        "DALTON_ALPHAENGINE_USAGE_FILE",
+        str(tmp_path / "alphaengine_usage.jsonl"),
+    )
+    monkeypatch.setenv(
+        "DALTON_ALPHAENGINE_CACHE_DB",
+        str(tmp_path / "alphaengine_search_cache.sqlite3"),
+    )
+    monkeypatch.setenv(
+        "DALTON_BRIDGE_CACHE_DIR",
+        str(tmp_path / "bridge_cache"),
+    )

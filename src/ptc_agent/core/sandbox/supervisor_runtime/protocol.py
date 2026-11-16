@@ -95,6 +95,7 @@ def call_request(
     workspace_id: str = "",
     config_path: str = "",
     config_version: int = 0,
+    caller: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """A ``call`` request.
 
@@ -102,7 +103,7 @@ def call_request(
     shipping its contents: the daemon reads the file itself, so what it
     enforces is the same view the workspace's own wrappers were built from.
     """
-    return {
+    req: dict[str, Any] = {
         "v": VERSION,
         "id": request_id,
         "op": OP_CALL,
@@ -113,6 +114,10 @@ def call_request(
         "config_path": config_path,
         "config_version": config_version,
     }
+    # DALTON-HOOK(alphaengine-cache): carry per-request caller identity to the daemon
+    if caller:
+        req["caller"] = dict(caller)
+    return req
 
 
 def simple_request(request_id: int, op: str) -> dict[str, Any]:

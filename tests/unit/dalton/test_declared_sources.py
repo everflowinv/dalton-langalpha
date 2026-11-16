@@ -567,7 +567,7 @@ class TestResearchAllAlphaEngineAndGuidepointFanout:
         assert ae_call["limit"] == 5
         assert ae_call["timeout"] == rb.FANOUT_ALPHAENGINE_TIMEOUT_S == 60
         assert "ticker" not in ae_call
-        assert "params" not in ae_call
+        assert ae_call.get("params") == {"sort": "relevance"}
         assert "document" not in ae_call
 
         gp_call = next(c for c in recorded_calls if c["route"] == "guidepoint")
@@ -3299,7 +3299,7 @@ class TestBridgeResearchParamsAndTranscriptGuards:
                     },
                 },
             )
-            assert forwarded_args[-1].get("query") == company_q
+            assert forwarded_args[-1].get("query") == " ".join(company_q.split())
 
         # 2. No-match on transcript returns ok=True with empty_reason and AlphaEngine-only hint (no roic mention)
         resp_no_match = await bridge.handle_tools_call(

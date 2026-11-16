@@ -406,6 +406,9 @@ ALLOWED_HOOKS=(
   # admin-only bare publish gate, keep_updated turn hook, data_jobs post-run
   # hook, URL-credential CORS route, page bridge links/grant messages, nav/routes.
   "monitors"
+  # AlphaEngine search cache: per-request caller identity across supervisor/bash
+  # (mcp_client_runtime.py, supervisor_runtime/{protocol,daemon}.py, bash.py).
+  "alphaengine-cache"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
