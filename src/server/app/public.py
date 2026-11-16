@@ -34,12 +34,13 @@ from fastapi.responses import StreamingResponse
 
 from src.observability import observe_replay_stream
 
-from src.server.app.share_access import (
+from src.server.app.share_access import (  # DALTON-HOOK(monitors): enforce admin file access on shared threads
     LINK_NOT_FOUND,
     LinkAccess,
     get_permissions,
     get_shared_thread,
     resolve_link,
+    shared_thread_allows_files,
 )
 from src.server.app.share_files import share_files_router
 from src.server.app.workspace_sandbox import owner_preview, with_preview_path
@@ -215,7 +216,11 @@ async def get_shared_thread_metadata(
         return await _link_metadata(access, viewer.user_id, path)
 
     perms = get_permissions(thread)
-    allow_files = perms.get("allow_files", False)
+    # DALTON-HOOK(monitors): mask workspace file permissions on non-admin historical shares
+    allow_files = bool(perms.get("allow_files", False)) and await shared_thread_allows_files(
+        thread
+    )
+    allow_download = allow_files and bool(perms.get("allow_download", False))
 
     return {
         "kind": "thread",
@@ -237,9 +242,10 @@ async def get_shared_thread_metadata(
             list(thread.get("previous_root_dirs") or ()) if allow_files else []
         ),
         "dir_name": thread.get("dir_name"),
+        # DALTON-HOOK(monitors): masked allow_files / allow_download for non-admin historical shares
         "permissions": {
             "allow_files": allow_files,
-            "allow_download": perms.get("allow_download", False),
+            "allow_download": allow_download,
         },
     }
 

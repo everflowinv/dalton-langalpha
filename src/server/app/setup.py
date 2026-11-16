@@ -1455,8 +1455,10 @@ logger.info(f"Allowed origins: {allowed_origins}")
 # Their documents run on an opaque origin, so their own reads arrive as
 # Origin: null; any origin may read them, and never with credentials, which
 # the app's CORS below would add by echoing that origin back.
+# DALTON-HOOK(monitors): include /api/v1/dalton/monitors/g/ and /public/ so sandboxed monitor
+# iframes (Origin: null) can load files and 1-minute realtime data with ETag.
 _URL_CREDENTIAL_ROUTES = re.compile(
-    r"/api/v1/(?:wsfiles/g/|artifacts/g/|public/shared/[^/]+/files/serve/)"
+    r"/api/v1/(?:wsfiles/g/|artifacts/g/|dalton/monitors/(?:g|public)/|public/shared/[^/]+/files/serve/)"
 )
 
 
@@ -1464,7 +1466,11 @@ class _CORSMiddleware(CORSMiddleware):
     def __init__(self, app, **options):
         super().__init__(app, **options)
         self._url_credential = CORSMiddleware(
-            app, allow_origins=["*"], allow_methods=["GET", "HEAD"]
+            app,
+            allow_origins=["*"],
+            allow_methods=["GET", "HEAD", "OPTIONS"],
+            allow_headers=["If-None-Match"],
+            expose_headers=["ETag"],
         )
 
     async def __call__(self, scope, receive, send):

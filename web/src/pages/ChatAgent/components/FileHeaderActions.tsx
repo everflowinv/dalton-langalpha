@@ -398,8 +398,9 @@ function FileHeaderActions({
           <Link2Off className="h-4 w-4" />
         </button>
       )}
-      {/* An HTML file takes comments, so its menu also says where they go. */}
-      {openPublish && (isHtml ? (
+      {/* An HTML file takes comments for owner panels, so its menu also says where they go. */}
+      {/* DALTON-HOOK(monitors): non-owner own-workspace panels (external members) open PublishDialog directly */}
+      {openPublish && (isHtml && access.kind === 'owner' ? (
         <ArtifactMenu
           workspaceId={workspaceId}
           path={artifactDoc ?? selectedFile}

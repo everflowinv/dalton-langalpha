@@ -58,6 +58,8 @@ const DesktopMenubar = React.lazy(() => import('./pages/DesktopMenubar/MenubarPa
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
+// DALTON-HOOK(monitors): anonymous read-only viewer route for public monitors (/m/:slug)
+const PublicMonitorPage = React.lazy(() => import('./pages/Monitors/PublicMonitorPage'));
 // DALTON-HOOK(hide-trading): Dalton builds redirect /welcome onto the Chief of Staff interview
 import { isDaltonBuild } from './config/brand';
 import { DaltonOnboardingRedirect } from './pages/Onboarding/dalton/interview';
@@ -513,6 +515,12 @@ function App() {
       <Route path="/a/:shareToken" element={
         <Suspense fallback={<PageLoading />}>
           <SharePage />
+        </Suspense>
+      } />
+      {/* DALTON-HOOK(monitors): anonymous read-only public monitor route */}
+      <Route path="/m/:slug" element={
+        <Suspense fallback={<PageLoading />}>
+          <PublicMonitorPage />
         </Suspense>
       } />
       {/* The policy is published at its own address; links made to this path

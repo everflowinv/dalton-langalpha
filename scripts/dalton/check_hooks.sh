@@ -402,6 +402,10 @@ ALLOWED_HOOKS=(
   # Settings page reorganization into Personal + Team Management with tier guards
   # and Dalton card rewrites using upstream UI primitives.
   "settings-reorg"
+  # Monitors (第 1 轮：平台): Dalton monitor layer over upstream artifacts,
+  # admin-only bare publish gate, keep_updated turn hook, data_jobs post-run
+  # hook, URL-credential CORS route, page bridge links/grant messages, nav/routes.
+  "monitors"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -2072,8 +2072,14 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
 
     monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
 
+    admin_u = "pm-admin-1"
+
     async def _tier_of(uid: str) -> str:
-        return "external" if uid == external_u else "standard"
+        if uid == external_u:
+            return "external"
+        if uid == admin_u:
+            return "admin"
+        return "internal"
 
     monkeypatch.setattr(
         dalton_access_tiers,
@@ -2199,13 +2205,23 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
     assert keep_off_resp.keep_updated is False
     set_keep_updated.assert_awaited_once()
 
-    # 3. Internal member may publish and set keep_updated=True.
-    int_publish_resp = await artifact_records_app.publish_artifact(
+    # 3. Bare /artifacts/{id}/publish is admin-only (DALTON-HOOK(monitors));
+    #    internal members are refused 403 on bare public publish while admins succeed.
+    with pytest.raises(HTTPException) as exc_int_publish:
+        await artifact_records_app.publish_artifact(
+            artifact_int.artifact_id,
+            PublishRequest(files=["report.md"], keep_updated=True),
+            x_user_id=internal_a,
+        )
+    assert exc_int_publish.value.status_code == 403
+    snapshot_publish.assert_not_called()
+
+    admin_publish_resp = await artifact_records_app.publish_artifact(
         artifact_int.artifact_id,
         PublishRequest(files=["report.md"], keep_updated=True),
-        x_user_id=internal_a,
+        x_user_id=admin_u,
     )
-    assert int_publish_resp.cut is True
+    assert admin_publish_resp.cut is True
     snapshot_publish.assert_awaited_once()
 
     int_keep_resp = await artifact_records_app.update_artifact(

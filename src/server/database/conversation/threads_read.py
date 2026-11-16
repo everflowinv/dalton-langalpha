@@ -947,6 +947,9 @@ async def get_thread_by_share_token(share_token: str) -> Optional[Dict[str, Any]
                         t.shared_at,
                         t.created_at,
                         t.updated_at,
+                        -- DALTON-HOOK(monitors): carry thread/workspace owners for shared-file admin checks
+                        COALESCE(t.user_id, w.user_id) AS user_id,
+                        w.user_id AS owner_user_id,
                         w.name AS workspace_name,
                         w.dir_name,
                         w.previous_root_dirs,

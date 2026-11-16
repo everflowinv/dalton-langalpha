@@ -1606,6 +1606,25 @@ async def finalize_task_run(
             freeze_exc,
         )
 
+    # DALTON-HOOK(monitors): publish or record failure for any monitor bound to this job_key.
+    try:
+        from src.dalton.monitors.service import maybe_publish_data_job_monitor
+
+        await maybe_publish_data_job_monitor(
+            job_key=claimed.job_key,
+            run_id=str(claimed.run_id),
+            terminal_status=terminal_status,
+            failure_reason=evaluation.failure_reason,
+            data_root=paths.backend_data_root,
+        )
+    except Exception as monitor_exc:
+        logger.warning(
+            "Failed to update monitor for data task run %s (%s): %s",
+            claimed.run_id,
+            claimed.job_key,
+            monitor_exc,
+        )
+
     if container_id and docker_client is not None:
         await check_scheduler_lock(lock_conn)
         try:

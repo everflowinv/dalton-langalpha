@@ -484,6 +484,14 @@ export const queryKeys = {
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
     channelBindings: () => [...queryKeys.dalton.all, 'channels', 'bindings'],
   },
+  // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, and company members
+  daltonMonitors: {
+    all: ['daltonMonitors'],
+    list: () => [...queryKeys.daltonMonitors.all, 'list'],
+    detail: (slug: string) => [...queryKeys.daltonMonitors.all, 'detail', slug],
+    byArtifact: (artifactId: string) => [...queryKeys.daltonMonitors.all, 'byArtifact', artifactId],
+    companyMembers: () => [...queryKeys.daltonMonitors.all, 'companyMembers'],
+  },
   // The user's watchlists themselves (id, name), for picking one. What is on
   // the default list is read under `['watchlistData']` (hooks/membershipQueries).
   watchlists: {

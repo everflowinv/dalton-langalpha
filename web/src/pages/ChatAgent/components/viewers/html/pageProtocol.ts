@@ -55,7 +55,9 @@ export type ViewerToPage =
   | { type: 'page:pointer-watch' }
   | { type: 'page:clear-selection' }
   /** The document's address under a renewed grant, which it moves to without loading again. */
-  | { type: 'page:address'; src: string };
+  | { type: 'page:address'; src: string }
+  /** DALTON-HOOK(monitors): deliver or renew a signed monitor grant for realtime data polling. */
+  | { type: 'page:monitor-grant'; grant: string; dataBase: string; expiresIn: number };
 
 // --- The page to the viewer ---
 
@@ -136,7 +138,9 @@ export type PageToViewer =
    * document. From the viewer's own frame, it says a script or a refresh took
    * the frame to that file without the view, so it carries the nested bridge.
    */
-  | { type: 'page:frame-loads'; doc: string };
+  | { type: 'page:frame-loads'; doc: string }
+  /** DALTON-HOOK(monitors): cross-monitor /monitors/* link clicked inside a sandboxed monitor frame. */
+  | { type: 'page:navigate-monitor'; path: string };
 
 /** Larger than any viewport, small enough that arithmetic on it stays exact. */
 const MAX_COORD = 1e6;
@@ -346,6 +350,11 @@ const pageToViewer = z.discriminatedUnion('type', [
   ),
   z.object({ type: z.literal('page:key'), key: z.enum(['Escape', 'c']) }),
   z.object({ type: z.literal('page:pointer-in') }),
+  // DALTON-HOOK(monitors): cross-monitor navigation requested from sandboxed monitor frame
+  z.object({
+    type: z.literal('page:navigate-monitor'),
+    path: z.string().check(z.maxLength(MAX_ADDRESS), z.regex(/^\/monitors(?:\/.*)?$/)),
+  }),
 ]);
 
 /**

@@ -314,6 +314,82 @@ async def legacy_version(
         )
 
 
+# DALTON-HOOK(monitors): cut an artifact version for a monitor; only public
+# monitors set share_links.shared_at / shared_seq, while non-public tiers keep
+# versions private and skip upstream's 10-version keep_updated pruning.
+async def cut_monitor_in_cur(
+    cur,
+    locked: Artifact,
+    *,
+    user_id: str,
+    files: list[VersionFile],
+    title: str | None,
+    label: str | None = None,
+    share_public: bool = False,
+    origin: Origin = "owner",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+) -> PublishResult:
+    """Cut a monitor version on ``cur`` inside an existing transaction under ``locked``."""
+    _distinct(files)
+    also_parts: list[str] = []
+    params: dict[str, Any] = {}
+    if loaded_files is not None:
+        also_parts.append("loaded_files = %(loaded_files)s::text[]")
+        params["loaded_files"] = loaded_files
+    if left_out_files is not None:
+        also_parts.append("left_out_files = %(left_out_files)s::text[]")
+        params["left_out_files"] = left_out_files
+    return await _cut(
+        cur,
+        locked,
+        files,
+        user_id=user_id,
+        origin=origin,
+        title=title,
+        label=label,
+        to_visitors=share_public,
+        share=share_public,
+        also=", ".join(also_parts),
+        params=params or None,
+        prune_keep_updated=False,
+    )
+
+
+# DALTON-HOOK(monitors): cut a monitor version under artifact row lock keeping non-public private.
+async def cut_monitor_artifact_version(
+    *,
+    user_id: str,
+    artifact_id: str,
+    read: ReadBasis | None,
+    files: list[VersionFile],
+    title: str | None,
+    label: str | None = None,
+    share_public: bool = False,
+    origin: Origin = "owner",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+) -> PublishResult:
+    """Cut a monitor version under the artifact row lock without making non-public monitors public."""
+    _distinct(files)
+    async with _locked(user_id, artifact_id) as (cur, locked):
+        if read is not None:
+            read.check(locked)
+        return await cut_monitor_in_cur(
+            cur,
+            locked,
+            user_id=user_id,
+            files=files,
+            title=title,
+            label=label,
+            share_public=share_public,
+            origin=origin,
+            loaded_files=loaded_files,
+            left_out_files=left_out_files,
+        )
+
+
+# DALTON-HOOK(monitors): prune_keep_updated lets monitor callers preserve up to 100 versions.
 async def _cut(
     cur,
     locked: Artifact,
@@ -327,6 +403,7 @@ async def _cut(
     label: str | None = None,
     also: str = "",
     params: dict[str, Any] | None = None,
+    prune_keep_updated: bool = True,
 ) -> PublishResult:
     """Cut the next version from ``files`` unless it would equal the latest
     (the same paths and hashes), prune, and move the record's pointers, in the
@@ -384,9 +461,10 @@ async def _cut(
                 for f in files
             ],
         )
-        await _prune_kept_updated(
-            cur, artifact_id=artifact_id, latest=seq, shared=shared_seq
-        )
+        if prune_keep_updated:  # DALTON-HOOK(monitors): monitor cuts keep up to 100 versions in dalton.monitors
+            await _prune_kept_updated(
+                cur, artifact_id=artifact_id, latest=seq, shared=shared_seq
+            )
     sets = ["latest_seq = %(seq)s", "shared_seq = %(shared_seq)s"]
     if to_visitors:
         sets += ["files = %(files)s::text[]", "legacy_refused = NULL"]

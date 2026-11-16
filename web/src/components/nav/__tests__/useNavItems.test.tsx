@@ -77,7 +77,8 @@ describe('the primary nav', () => {
     try {
       expect(keys()).not.toContain('/market');
       expect(keys()).not.toContain('/dashboard');
-      expect(keys()).toEqual(['/chat', '/automations', '/plugins']);
+      // DALTON-HOOK(monitors): include top-level /monitors route in DALTON_MODE nav list
+      expect(keys()).toEqual(['/chat', '/automations', '/monitors', '/plugins']);
     } finally {
       vi.unstubAllEnvs();
     }

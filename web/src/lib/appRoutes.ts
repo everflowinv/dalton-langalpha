@@ -5,6 +5,7 @@ export const APP_SECTIONS = [
   'market',
   'news',
   'automations',
+  'monitors', // DALTON-HOOK(monitors)
   'orders',
   'plugins',
   'settings',

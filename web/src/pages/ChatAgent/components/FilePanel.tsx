@@ -303,6 +303,10 @@ function FilePanel({
   // entry beside a read-only thread (teamReadOnly covers a colleague's
   // workspace; threadReadOnly a colleague's dispatched thread in it).
   const comments = access.kind === 'owner' && !threadReadOnly ? commentUi : undefined;
+  // DALTON-HOOK(monitors): external members cannot use comment/public-share UI,
+  // but in their own editable workspace they can publish 'own' monitors.
+  const canPublishMonitor =
+    !servePrefix && !teamReadOnly && !readOnly && !threadReadOnly && !!workspaceId;
 
   const { body, loading: fileLoading, error: readError, readAt, refetch } = useFileBody({
     cache, path: selectedFile, workspaceStatus: wsData?.status,
@@ -392,6 +396,8 @@ function FilePanel({
     active: isActive,
     readAt: readAt ?? null,
     ui: comments,
+    // DALTON-HOOK(monitors): decoupled monitor publishing permission
+    canPublishMonitor,
     threadId,
   });
   const htmlArtifactPath = artifactTab.path;

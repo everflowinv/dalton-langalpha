@@ -388,6 +388,18 @@ listen('page:scroll-to', function (data) {
   if (el && el.scrollIntoView) el.scrollIntoView();
 });
 
+// DALTON-HOOK(monitors): deliver/renew monitor_grant to sandboxed monitor pages.
+listen('page:monitor-grant', function (data) {
+  if (!data || typeof data.grant !== 'string' || typeof data.dataBase !== 'string') return;
+  var info = { grant: data.grant, dataBase: data.dataBase, expiresIn: Number(data.expiresIn) || 0 };
+  /** @type {any} */ (window).__DALTON_MONITOR__ = info;
+  try {
+    window.dispatchEvent(new CustomEvent('dalton:monitor-grant', { detail: info }));
+  } catch (e) {
+    // Ignore CustomEvent failure on restricted runtimes.
+  }
+});
+
 // A window the document has no tie to is not heard, by this bridge or the
 // document's own listeners. Anyone holding this page's link can open it and
 // reach its frames with a message, so a listener that writes what it hears into
