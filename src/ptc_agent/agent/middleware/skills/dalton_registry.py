@@ -113,6 +113,8 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-richard-coverage-weekly", None, ()),
     ("dalton-13f-tracker", None, ()),
     ("dalton-option-put-skew", None, ()),
+    ("dalton-short-screen", None, ()),
+    ("dalton-bdc-analyst", None, ()),
     ("dalton-wiki-auto-ingest", None, ("dalton-conventions", "research-conventions")),
     ("dalton-podcast-weekly", None, ()),  # DALTON-HOOK(skills-registry)
     ("dalton-language", None, ()),

@@ -406,6 +406,11 @@ plugins/dalton/skills/dalton-13f-tracker/
 plugins/dalton/skills/dalton-option-put-skew/
 tests/unit/dalton/test_13f_tracker_skill.py
 tests/unit/dalton/test_option_put_skew_skill.py
+# OpenClaw migration: short screen and BDC analyst (on-demand skills).
+plugins/dalton/skills/dalton-short-screen/
+plugins/dalton/skills/dalton-bdc-analyst/
+tests/unit/dalton/test_short_screen_skill.py
+tests/unit/dalton/test_bdc_analyst_skill.py
 
 # OC-1 Discord wiki auto-ingest (host discord-history route).
 plugins/dalton/skills/dalton-wiki-auto-ingest/
