@@ -132,7 +132,7 @@ def test_registry_report_profile_paths_and_skill_tree() -> None:
     from src.dalton.database.automation_reports import REPORT_PROFILES
 
     assert (SKILL_NAME, None, ()) in _DALTON_SKILL_SPECS
-    assert len(_DALTON_SKILL_SPECS) == 49
+    assert len(_DALTON_SKILL_SPECS) == 51
     assert SKILL_NAME in DALTON_SKILL_DEFINITIONS
     assert SKILL_NAME in SKILL_REGISTRY
     assert PROFILE in REPORT_PROFILES
