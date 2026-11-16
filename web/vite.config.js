@@ -15,14 +15,18 @@ import { versionManifest } from './scripts/vite-plugins/versionManifest.ts'
 // DALTON-HOOK(brand-name): the static index.html is what link unfurlers (Feishu,
 // Discord, Slack) read, before any script swaps the title or favicon, so the
 // brand has to be written into the HTML at build time.
+/**
+ * @param {Record<string, string>} env
+ * @returns {import('vite').Plugin | null}
+ */
 function brandIndexHtml(env) {
   const name = (env.VITE_BRAND_NAME || '').trim()
   if (!name) return null
   const everflow = (env.VITE_BRAND_MARK || '').trim() === 'everflow'
-  const esc = (v) => v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
+  const esc = (/** @type {string} */ v) => v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')
   return {
     name: 'dalton-brand-index-html',
-    transformIndexHtml(html) {
+    transformIndexHtml(/** @type {string} */ html) {
       let out = html.replace(/<title>[^<]*<\/title>/, `<title>${esc(name)}</title>`)
       if (everflow) out = out.replace('href="/logo-favicon.svg"', 'href="/everflow/favicon.svg"')
       const meta = [
