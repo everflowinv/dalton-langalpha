@@ -1,0 +1,19 @@
+{
+  "_comment": "Merge multiple share classes into one entity. Key=ticker, Value=canonical name.",
+  "GOOG": "Alphabet",
+  "GOOGL": "Alphabet",
+  "BRK.A": "Berkshire Hathaway",
+  "BRK.B": "Berkshire Hathaway",
+  "BRK-A": "Berkshire Hathaway",
+  "BRK-B": "Berkshire Hathaway",
+  "DISCA": "Warner Bros Discovery",
+  "DISCB": "Warner Bros Discovery",
+  "DISCK": "Warner Bros Discovery",
+  "FOX": "Fox Corp",
+  "FOXA": "Fox Corp",
+  "NWS": "News Corp",
+  "NWSA": "News Corp",
+  "LSXMA": "Liberty SiriusXM",
+  "LSXMB": "Liberty SiriusXM",
+  "LSXMK": "Liberty SiriusXM"
+}

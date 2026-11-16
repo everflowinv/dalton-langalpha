@@ -1,0 +1,5 @@
+{
+  "_comment": "SEC ticker → classification ticker. When SEC filing uses a different ticker than what's in classification.json, map it here. Auto-maintained by compare --auto-learn.",
+  "XRS": "TAL",
+  "FB": "META"
+}
