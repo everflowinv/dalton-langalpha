@@ -3655,4 +3655,468 @@ async def test_r4_4_public_monitor_detail_strips_internal_fields_and_serves_entr
         assert css_resp.content == b"body{margin:0}"
 
 
+def test_sentiment_dashboard_refresh_registers_six_company_panels() -> None:
+    from src.dalton.monitors import data_job_registry
+
+    bindings = data_job_registry.get_registered_monitor_bindings(
+        data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY
+    )
+    assert [b.slug for b in bindings] == [
+        "market-overview",
+        "us-market",
+        "cn-market",
+        "hk-market",
+        "asia-leverage",
+        "stocks",
+    ]
+    assert [b.category for b in bindings] == [
+        "overview",
+        "us",
+        "cn",
+        "hk",
+        "asia",
+        "stocks",
+    ]
+    for binding in bindings:
+        assert binding.visibility == "company"
+        assert binding.rel_dir == f"research-outputs/sentiment-dashboard/panels/{binding.slug}"
+        assert binding.shared_rel_dir == "research-outputs/sentiment-dashboard/panels/_shared"
+        assert binding.entry_file == "index.html"
+        assert (
+            data_job_registry.get_registered_monitor_binding_by_slug(
+                data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY, binding.slug
+            )
+            == binding
+        )
+
+
+@pytest.mark.asyncio
+async def test_republish_sentiment_dashboard_publishes_six_isolated_panels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.dalton.monitors import data_job_registry
+    from src.server.database import artifacts as artifacts_db
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    panels_dir = data_root / "research-outputs" / "sentiment-dashboard" / "panels"
+    shared_dir = panels_dir / "_shared"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "panel.css").write_text(":root{--dir-up:#ff6b6b}", encoding="utf-8")
+    (shared_dir / "panel.js").write_text("console.log('ok');", encoding="utf-8")
+
+    expected_slugs = [
+        b.slug
+        for b in data_job_registry.get_registered_monitor_bindings(
+            data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY
+        )
+    ]
+    for slug in expected_slugs:
+        pdir = panels_dir / slug
+        pdir.mkdir(parents=True)
+        (pdir / "index.html").write_text(
+            (
+                '<link rel="stylesheet" href="../_shared/panel.css">'
+                f'<h1>{slug}</h1>'
+                '<script src="../_shared/panel.js"></script>'
+            ),
+            encoding="utf-8",
+        )
+
+    created_monitors: dict[str, MonitorRecord] = {}
+    ensured_entry_paths: list[str] = []
+    cut_bundles: dict[str, set[str]] = {}
+    recorded_failures: list[str] = []
+
+    monkeypatch.setattr(
+        monitor_db,
+        "ensure_company_monitor_workspace",
+        create_autospec(monitor_db.ensure_company_monitor_workspace, return_value=WS_ID),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "list_monitors_by_data_job",
+        create_autospec(
+            monitor_db.list_monitors_by_data_job,
+            side_effect=lambda _job_key: list(created_monitors.values()),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "has_processed_monitor_run",
+        create_autospec(monitor_db.has_processed_monitor_run, return_value=False),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(
+            monitor_db.get_monitor_by_slug,
+            side_effect=lambda slug: created_monitors.get(slug),
+        ),
+    )
+
+    def _ensure_artifact(_ws_id: str, path: str) -> Artifact:
+        ensured_entry_paths.append(path)
+        return _make_artifact(
+            artifact_id=f"art-{len(ensured_entry_paths)}",
+            path=path,
+            latest_seq=0,
+        )
+
+    monkeypatch.setattr(
+        artifacts_db,
+        "ensure_artifact",
+        create_autospec(artifacts_db.ensure_artifact, side_effect=_ensure_artifact),
+    )
+
+    def _upsert_monitor(
+        *,
+        slug: str,
+        artifact_id: str,
+        owner_user_id: str,
+        title: str,
+        category: str,
+        sort_order: int,
+        visibility: str,
+        keep_updated: bool,
+        source_kind: str,
+        source_ref: str | None,
+        member_user_ids: Any,
+        bump_acl_revision: bool = False,
+    ) -> MonitorRecord:
+        assert owner_user_id == COMPANY_SYSTEM_USER_ID
+        rec = _make_monitor(
+            monitor_id=f"mon-{slug}",
+            slug=slug,
+            artifact_id=artifact_id,
+            owner_user_id=owner_user_id,
+            title=title,
+            category=category,
+            visibility=visibility,
+            keep_updated=keep_updated,
+            published_seq=0,
+        )
+        created_monitors[slug] = rec
+        return rec
+
+    monkeypatch.setattr(
+        monitor_db,
+        "upsert_monitor",
+        create_autospec(monitor_db.upsert_monitor, side_effect=_upsert_monitor),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "get_vault_secrets_for_redaction",
+        create_autospec(
+            monitor_service.artifact_snapshot.get_vault_secrets_for_redaction,
+            return_value={},
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "store_unregistered_blobs",
+        create_autospec(monitor_service.artifact_snapshot.store_unregistered_blobs),
+    )
+
+    async def _cut_version(
+        *,
+        monitor: MonitorRecord,
+        owner_user_id: str,
+        files: Any,
+        title: str | None,
+        read_basis: Any,
+        origin: str,
+        loaded_files: list[str] | None = None,
+        artifact: Artifact | None = None,
+        verify_public_authority: Any = None,
+        run_id: str | None = None,
+    ) -> tuple[MonitorRecord, PublishResult, bool]:
+        del owner_user_id, title, read_basis, origin, loaded_files, verify_public_authority, run_id
+        cut_bundles[monitor.slug] = {f.path for f in files}
+        next_seq = monitor.published_seq + 1
+        updated = _make_monitor(
+            monitor_id=monitor.monitor_id,
+            slug=monitor.slug,
+            artifact_id=monitor.artifact_id,
+            owner_user_id=monitor.owner_user_id,
+            title=monitor.title,
+            category=monitor.category,
+            visibility=monitor.visibility,
+            published_seq=next_seq,
+        )
+        created_monitors[monitor.slug] = updated
+        pub = PublishResult(
+            artifact=_make_artifact(
+                artifact_id=monitor.artifact_id,
+                path=artifact.path if artifact else f"{monitor.slug}/index.html",
+                latest_seq=next_seq,
+            ),
+            seq=next_seq,
+            cut=True,
+            shared_now=False,
+            changed=True,
+        )
+        return updated, pub, False
+
+    monkeypatch.setattr(
+        monitor_service,
+        "cut_monitor_version",
+        create_autospec(monitor_service.cut_monitor_version, side_effect=_cut_version),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "record_monitor_publish_failure",
+        create_autospec(
+            monitor_db.record_monitor_publish_failure,
+            side_effect=lambda monitor_id, **_k: recorded_failures.append(monitor_id),
+        ),
+    )
+
+    res = await monitor_service.republish_data_job_monitor(
+        job_key=data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY,
+        run_id="run-1",
+        data_root=data_root,
+    )
+    assert len(res["monitors"]) == 6
+    assert [m["slug"] for m in res["monitors"]] == expected_slugs
+    assert ensured_entry_paths == [f"{slug}/index.html" for slug in expected_slugs]
+
+    for slug in expected_slugs:
+        bundle_paths = cut_bundles[slug]
+        assert bundle_paths == {
+            f"{slug}/index.html",
+            "_shared/panel.css",
+            "_shared/panel.js",
+        }
+
+    # Failure run records failure on existing monitors without cutting a new version
+    await monitor_service.maybe_publish_data_job_monitor(
+        job_key=data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY,
+        run_id="run-fail",
+        terminal_status="failed",
+        failure_reason="upstream failed",
+        data_root=data_root,
+    )
+    assert len(recorded_failures) == 6
+    assert all(created_monitors[s].published_seq == 1 for s in expected_slugs)
+
+
+@pytest.mark.asyncio
+async def test_republish_data_job_slug_conflict_fails_without_renaming_and_logs_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.dalton.monitors import data_job_registry
+    from src.server.database import artifacts as artifacts_db
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    panels_dir = data_root / "research-outputs" / "sentiment-dashboard" / "panels"
+    shared_dir = panels_dir / "_shared"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "panel.css").write_text(":root{}", encoding="utf-8")
+    (shared_dir / "panel.js").write_text("// js", encoding="utf-8")
+    for b in data_job_registry.get_registered_monitor_bindings(
+        data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY
+    ):
+        pdir = panels_dir / b.slug
+        pdir.mkdir(parents=True)
+        (pdir / "index.html").write_text(f"<h1>{b.slug}</h1>", encoding="utf-8")
+
+    # Existing unrelated workspace monitor already owns 'us-market'
+    foreign_owner_monitor = _make_monitor(
+        monitor_id="mon-foreign-us",
+        slug="us-market",
+        source_kind="workspace",
+        source_ref=f"{WS_ID}:other.html",
+    )
+    monitors_by_slug: dict[str, MonitorRecord] = {"us-market": foreign_owner_monitor}
+    upserted_slugs: list[str] = []
+
+    monkeypatch.setattr(
+        monitor_db,
+        "ensure_company_monitor_workspace",
+        create_autospec(monitor_db.ensure_company_monitor_workspace, return_value=WS_ID),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "list_monitors_by_data_job",
+        create_autospec(monitor_db.list_monitors_by_data_job, return_value=[]),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(
+            monitor_db.get_monitor_by_slug,
+            side_effect=lambda s: monitors_by_slug.get(s),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "pick_available_slug",
+        create_autospec(
+            monitor_db.pick_available_slug,
+            side_effect=AssertionError("must not pick suffixed slug on conflict"),
+        ),
+    )
+    monkeypatch.setattr(
+        artifacts_db,
+        "ensure_artifact",
+        create_autospec(
+            artifacts_db.ensure_artifact,
+            side_effect=lambda _ws, p: _make_artifact(artifact_id=f"art-{p}", path=p, latest_seq=0),
+        ),
+    )
+
+    def _upsert_monitor(**kwargs: Any) -> MonitorRecord:
+        slug = kwargs["slug"]
+        upserted_slugs.append(slug)
+        rec = _make_monitor(
+            monitor_id=f"mon-{slug}",
+            slug=slug,
+            artifact_id=kwargs["artifact_id"],
+            owner_user_id=kwargs["owner_user_id"],
+            title=kwargs["title"],
+            category=kwargs["category"],
+            visibility=kwargs["visibility"],
+            published_seq=0,
+        )
+        monitors_by_slug[slug] = rec
+        return rec
+
+    monkeypatch.setattr(
+        monitor_db,
+        "upsert_monitor",
+        create_autospec(monitor_db.upsert_monitor, side_effect=_upsert_monitor),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "get_vault_secrets_for_redaction",
+        create_autospec(monitor_service.artifact_snapshot.get_vault_secrets_for_redaction, return_value={}),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "store_unregistered_blobs",
+        create_autospec(monitor_service.artifact_snapshot.store_unregistered_blobs),
+    )
+
+    async def _cut(**kwargs: Any) -> tuple[MonitorRecord, PublishResult, bool]:
+        m = kwargs["monitor"]
+        updated = _make_monitor(monitor_id=m.monitor_id, slug=m.slug, artifact_id=m.artifact_id, published_seq=1)
+        return updated, PublishResult(artifact=_make_artifact(latest_seq=1), seq=1, cut=True, shared_now=False, changed=True), False
+
+    monkeypatch.setattr(
+        monitor_service,
+        "cut_monitor_version",
+        create_autospec(monitor_service.cut_monitor_version, side_effect=_cut),
+    )
+
+    with caplog.at_level("ERROR"), pytest.raises(HTTPException) as exc_info:
+        await monitor_service.republish_data_job_monitor(
+            job_key=data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY,
+            run_id="run-conflict",
+            data_root=data_root,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "禁止自动改名" in exc_info.value.detail
+    assert any("slug collision" in r.message for r in caplog.records)
+    assert "us-market" not in upserted_slugs
+    assert all(not s.startswith("us-market-") for s in upserted_slugs)
+    # Non-conflicting siblings still published normally
+    assert upserted_slugs == ["market-overview", "cn-market", "hk-market", "asia-leverage", "stocks"]
+
+
+@pytest.mark.asyncio
+async def test_republish_data_job_first_publish_failure_leaves_no_orphan_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.dalton.monitors import data_job_registry
+    from src.server.database import artifacts as artifacts_db
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    # Note: market-overview/index.html is intentionally absent on first publish!
+    single_binding = data_job_registry.get_registered_monitor_binding_by_slug(
+        data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY, "market-overview"
+    )
+    assert single_binding is not None
+
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(monitor_db.get_monitor_by_slug, return_value=None),
+    )
+    ensure_mock = create_autospec(
+        artifacts_db.ensure_artifact,
+        side_effect=AssertionError("must not create artifact when snapshot fails"),
+    )
+    upsert_mock = create_autospec(
+        monitor_db.upsert_monitor,
+        side_effect=AssertionError("must not create orphan monitor row when snapshot fails"),
+    )
+    monkeypatch.setattr(artifacts_db, "ensure_artifact", ensure_mock)
+    monkeypatch.setattr(monitor_db, "upsert_monitor", upsert_mock)
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "get_vault_secrets_for_redaction",
+        create_autospec(monitor_service.artifact_snapshot.get_vault_secrets_for_redaction, return_value={}),
+    )
+
+    with pytest.raises(HTTPException):
+        await monitor_service._republish_single_binding(
+            single_binding,
+            clean_run_id="run-missing",
+            data_root=data_root,
+            existing=None,
+            is_multi=True,
+        )
+
+    assert ensure_mock.call_count == 0
+    assert upsert_mock.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_write_monitor_data_internal_requires_exact_slug_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.monitors import data_job_registry
+
+    mismatched_slug_monitor = _make_monitor(
+        slug="us-market-2",
+        source_kind="data_job",
+        source_ref=data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY,
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(monitor_db.get_monitor_by_slug, return_value=mismatched_slug_monitor),
+    )
+    # Give binding[0] an explicit data_keys allowlist to prove there is NO fallback to bindings[0]
+    first_binding = data_job_registry.get_registered_monitor_bindings(
+        data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY
+    )[0]
+    def _lookup_binding(job_key: str, slug: str) -> MonitorDataJobBinding | None:
+        del job_key
+        return first_binding if slug == first_binding.slug else None
+
+    monkeypatch.setattr(
+        monitor_service,
+        "get_registered_monitor_binding_by_slug",
+        create_autospec(
+            data_job_registry.get_registered_monitor_binding_by_slug,
+            side_effect=_lookup_binding,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await monitor_service.write_monitor_data_internal(
+            "us-market-2",
+            "live",
+            {"price": 1},
+        )
+    assert exc_info.value.status_code == 403
+
+
+
+
 

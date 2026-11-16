@@ -20,7 +20,9 @@ from src.dalton.monitors import db as monitor_db
 from src.dalton.monitors.data_job_registry import (
     HostDirFileSource,
     MonitorDataJobBinding,
-    get_registered_monitor_job,
+    ScopedMountFileSource,
+    get_registered_monitor_binding_by_slug,
+    get_registered_monitor_bindings,
 )
 from src.dalton.monitors.grants import (
     MonitorGrantError,
@@ -745,26 +747,46 @@ async def _verify_data_job_public_approver(
         raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
 
 
-async def republish_data_job_monitor(
+def _binding_entry_path(binding: MonitorDataJobBinding, *, is_multi: bool) -> str:
+    if is_multi or binding.shared_rel_dir:
+        return f"{binding.slug}/{binding.entry_file}"
+    return binding.entry_file
+
+
+def _open_binding_reader_source(
+    data_root: Path, binding: MonitorDataJobBinding, *, is_multi: bool
+) -> tuple[Any, str, tuple[str, ...]]:
+    """Open contained FileSource(s) for ``binding``, mounting ``_shared`` alongside ``<slug>/`` when configured."""
+    if not is_multi and not binding.shared_rel_dir:
+        source = HostDirFileSource.open_registered(data_root, binding)
+        work_dir = str(data_root / binding.rel_dir)
+        return source, work_dir, source.list_artifact_files()
+
+    panel_source = HostDirFileSource.open_registered(data_root, binding)
+    mounts: dict[str, HostDirFileSource] = {binding.slug: panel_source}
+    try:
+        if binding.shared_rel_dir:
+            shared_path = data_root / binding.shared_rel_dir
+            if shared_path.exists() or shared_path.is_symlink():
+                mounts["_shared"] = HostDirFileSource.open_registered_dir(
+                    data_root, binding.shared_rel_dir
+                )
+    except Exception:
+        panel_source.close()
+        raise
+    scoped = ScopedMountFileSource(mounts, primary_mount=binding.slug)
+    work_dir = str(data_root / Path(binding.rel_dir).parent)
+    return scoped, work_dir, scoped.list_primary_artifact_files()
+
+
+async def _republish_single_binding(
+    binding: MonitorDataJobBinding,
     *,
-    job_key: str,
-    run_id: str,
-    data_root: Path | None = None,
+    clean_run_id: str,
+    data_root: Path,
+    existing: MonitorRecord | None,
+    is_multi: bool,
 ) -> dict[str, Any]:
-    """Republish a registered data-job monitor from its pre-registered host output dir."""
-    _require_publishing_enabled()
-    binding = get_registered_monitor_job(job_key)
-    if binding is None:
-        raise HTTPException(
-            status_code=403,
-            detail=f"未登记的数据任务监控映射: {job_key}",
-        )
-
-    clean_run_id = str(run_id or "").strip()
-    if not clean_run_id:
-        raise HTTPException(status_code=400, detail="run_id is required")
-
-    existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
     if existing is not None and await monitor_db.has_processed_monitor_run(
         existing.monitor_id, clean_run_id
     ):
@@ -803,43 +825,38 @@ async def republish_data_job_monitor(
                 )
             raise HTTPException(status_code=403, detail=str(exc)) from None
 
-    workspace_id = await monitor_db.ensure_company_monitor_workspace()
-    artifact = await artifacts_db.ensure_artifact(workspace_id, binding.entry_file)
-
-    monitor = existing
-    if monitor is None:
-        slug = (
-            binding.slug
-            if is_valid_slug(binding.slug)
-            and await monitor_db.get_monitor_by_slug(binding.slug) is None
-            else await monitor_db.pick_available_slug(binding.slug)
-        )
-        monitor = await monitor_db.upsert_monitor(
-            slug=slug,
-            artifact_id=artifact.artifact_id,
-            owner_user_id=COMPANY_SYSTEM_USER_ID,
-            title=binding.title,
-            category=binding.category,
-            sort_order=0,
-            visibility=binding.visibility,
-            keep_updated=True,
-            source_kind="data_job",
-            source_ref=binding.job_key,
-            member_user_ids=(),
-        )
-
-    if data_root is None:
-        from src.dalton.settings import get_dalton_backend_var_dir
-
-        data_root = Path(get_dalton_backend_var_dir()) / "openclaw-data"
+    entry_path = _binding_entry_path(binding, is_multi=is_multi)
+    if existing is None:
+        if not is_valid_slug(binding.slug):
+            raise HTTPException(
+                status_code=500,
+                detail=f"数据任务登记表中的 slug '{binding.slug}' 不合法",
+            )
+        conflict = await monitor_db.get_monitor_by_slug(binding.slug)
+        if conflict is not None:
+            logger.error(
+                "Data-job monitor slug collision: job_key=%s slug=%s occupied_by=%s",
+                binding.job_key,
+                binding.slug,
+                conflict.monitor_id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"固定 slug '{binding.slug}' 已被已有监控面板占用"
+                    f"（monitor_id={conflict.monitor_id}），禁止自动改名"
+                ),
+            )
 
     async def _verify_job_public_in_tx(_owner_id: str) -> None:
         await _verify_data_job_public_approver(binding, is_existing_public=True)
 
+    monitor = existing
     try:
-        work_dir = str(data_root / binding.rel_dir)
-        with HostDirFileSource.open_registered(data_root, binding) as source:
-            extra_files = source.list_artifact_files()
+        source, work_dir, extra_files = _open_binding_reader_source(
+            data_root, binding, is_multi=is_multi
+        )
+        with source:
             reader = Reader(
                 files=source,
                 work_dir=work_dir,
@@ -848,8 +865,24 @@ async def republish_data_job_monitor(
             snap = await artifact_snapshot.capture_reader_monitor_snapshot(
                 reader,
                 owner_id=COMPANY_SYSTEM_USER_ID,
-                entry_path=binding.entry_file,
+                entry_path=entry_path,
                 extra_paths=extra_files,
+            )
+        workspace_id = await monitor_db.ensure_company_monitor_workspace()
+        artifact = await artifacts_db.ensure_artifact(workspace_id, entry_path)
+        if monitor is None:
+            monitor = await monitor_db.upsert_monitor(
+                slug=binding.slug,
+                artifact_id=artifact.artifact_id,
+                owner_user_id=COMPANY_SYSTEM_USER_ID,
+                title=binding.title,
+                category=binding.category,
+                sort_order=binding.sort_order,
+                visibility=binding.visibility,
+                keep_updated=True,
+                source_kind="data_job",
+                source_ref=binding.job_key,
+                member_user_ids=(),
             )
         await _abort_if_absent_dependencies(
             monitor.artifact_id,
@@ -868,10 +901,11 @@ async def republish_data_job_monitor(
             verify_public_authority=_verify_job_public_in_tx,
         )
     except Exception as exc:
-        await monitor_db.record_monitor_publish_failure(
-            monitor.monitor_id,
-            error_message=str(exc),
-        )
+        if monitor is not None:
+            await monitor_db.record_monitor_publish_failure(
+                monitor.monitor_id,
+                error_message=str(exc),
+            )
         raise _translate_snapshot_error(exc) from None
 
     return {
@@ -880,6 +914,81 @@ async def republish_data_job_monitor(
         "published_seq": updated.published_seq,
         "cut": bool(result.cut) if result is not None else False,
         "deduplicated": deduped,
+    }
+
+
+async def republish_data_job_monitor(
+    *,
+    job_key: str,
+    run_id: str,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
+    """Republish registered data-job monitor(s) from their pre-registered host output dir."""
+    _require_publishing_enabled()
+    bindings = get_registered_monitor_bindings(job_key)
+    if not bindings:
+        raise HTTPException(
+            status_code=403,
+            detail=f"未登记的数据任务监控映射: {job_key}",
+        )
+
+    clean_run_id = str(run_id or "").strip()
+    if not clean_run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    if data_root is None:
+        from src.dalton.settings import get_dalton_backend_var_dir
+
+        data_root = Path(get_dalton_backend_var_dir()) / "openclaw-data"
+
+    if len(bindings) == 1:
+        binding = bindings[0]
+        existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
+        return await _republish_single_binding(
+            binding,
+            clean_run_id=clean_run_id,
+            data_root=data_root,
+            existing=existing,
+            is_multi=False,
+        )
+
+    existing_rows = await monitor_db.list_monitors_by_data_job(job_key)
+    by_entry = {row.entry_path: row for row in existing_rows if row.entry_path}
+    by_slug = {row.slug: row for row in existing_rows}
+
+    results: list[dict[str, Any]] = []
+    first_exc: Exception | None = None
+    for binding in bindings:
+        entry_path = _binding_entry_path(binding, is_multi=True)
+        existing = by_entry.get(entry_path) or by_slug.get(binding.slug)
+        try:
+            res = await _republish_single_binding(
+                binding,
+                clean_run_id=clean_run_id,
+                data_root=data_root,
+                existing=existing,
+                is_multi=True,
+            )
+            results.append(res)
+        except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
+            logger.warning(
+                "Republishing data-job monitor %s (%s) failed: %s",
+                binding.slug,
+                binding.job_key,
+                exc,
+                exc_info=True,
+            )
+
+    if first_exc is not None:
+        raise first_exc
+
+    return {
+        "job_key": job_key,
+        "monitors": results,
+        "cut": any(r["cut"] for r in results),
+        "deduplicated": all(r["deduplicated"] for r in results),
     }
 
 
@@ -892,8 +1001,8 @@ async def maybe_publish_data_job_monitor(
     data_root: Path | None = None,
 ) -> None:
     """Scheduler post-run hook: republish on success, record failure without touching ``published_seq``."""
-    binding = get_registered_monitor_job(job_key)
-    if binding is None:
+    bindings = get_registered_monitor_bindings(job_key)
+    if not bindings:
         return
     if not is_artifact_publishing_enabled():
         return
@@ -902,8 +1011,12 @@ async def maybe_publish_data_job_monitor(
             job_key=job_key, run_id=run_id, data_root=data_root
         )
         return
-    existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
-    if existing is not None:
+    if len(bindings) == 1:
+        existing = await monitor_db.get_monitor_by_data_job(bindings[0].job_key)
+        existing_rows = [existing] if existing is not None else []
+    else:
+        existing_rows = await monitor_db.list_monitors_by_data_job(job_key)
+    for existing in existing_rows:
         await monitor_db.record_monitor_publish_failure(
             existing.monitor_id,
             error_message=failure_reason or terminal_status,
@@ -1126,7 +1239,7 @@ async def write_monitor_data_internal(
             status_code=403,
             detail="仅 data_job 类型的监控面板支持内部实时数据写入",
         )
-    binding = get_registered_monitor_job(monitor.source_ref)
+    binding = get_registered_monitor_binding_by_slug(monitor.source_ref, monitor.slug)
     if binding is None or data_key not in binding.data_keys:
         raise HTTPException(
             status_code=403,

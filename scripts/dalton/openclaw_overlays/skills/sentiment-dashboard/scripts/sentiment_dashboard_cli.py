@@ -31,6 +31,14 @@ from us_top_framework import TopFrameworkConfig, evaluate_top_framework, top_dig
 from us_top_framework_selftest import top_framework_checks as top_framework_checks
 from us_market_sections import MONITOR_CSS, bottom_monitor_section, state_monitor_section, top_monitor_section
 from gs_prime_positioning import evaluate_gs_prime_signals, render_gs_prime_section, update_gs_prime_store
+from dashboard_copy import (
+    UI_COPY,
+    display_asset_name,
+    display_currency_unit,
+    format_manual_snapshot_notice,
+    format_stale_notice,
+    humanize_summary,
+)
 
 
 def find_workspace(start: Path) -> Path:
@@ -118,7 +126,7 @@ def signed_fmt(value: Any, digits: int = 1, suffix: str = "%") -> str:
 
 
 def direction_fmt(value: Any, digits: int = 1, suffix: str = "%") -> str:
-    """Format market direction using overseas convention: green up, red down."""
+    """Format market direction using A-share convention: red up, green down."""
     x = finite(value)
     if x is None:
         return "暂无"
@@ -461,7 +469,7 @@ def zone_chips(items: list[dict[str, Any]], skip: Iterable[str] = ()) -> list[di
         elif scale == "z":
             hot, cold = ZONE_HOT, ZONE_COLD
             z = finite(item.get("z"))
-            label = f"{item['name']} 稳健z {z:+.2f}σ" if z is not None else item["name"]
+            label = f"{item['name']} 相对历史偏离 {z:+.2f}" if z is not None else item["name"]
         else:
             hot, cold = ZONE_HOT, ZONE_COLD
             label = f"{item['name']} 综合分 {x:.0f}/100"
@@ -570,15 +578,17 @@ def trend_note(stats: dict[str, Any] | None) -> str:
 
 
 def trend_fit_note(stats: dict[str, Any] | None) -> str:
-    """第二行图注：这条线是哪次拟合冻结下来的，以及至今的上下破比例。"""
+    """第二行图注：这条线从何时起用固定参数平移，以及至今的上下破比例。"""
     if not stats:
         return ""
     fitted = stats.get("fitted_on") or "首次"
-    parts = [f"线固定于{fitted}那次拟合，斜率 ${stats['slope']:.3f}/根K线，往后只随K线数平移。"]
+    parts = [f"自 {fitted} 采用预设参数平移（约每交易日平移 ${stats['slope']:.3f}）。"]
     if stats.get("break_pct") is not None:
-        parts.append(f"期间{stats['break_pct']:.1f}%的交易日上破顶、{stats['pierce_pct']:.1f}%下破底。")
+        parts.append(f"期间 {stats['break_pct']:.1f}% 的交易日上破顶、{stats['pierce_pct']:.1f}% 下破底。")
     else:
-        parts.append(f"期间{stats['pierce_pct']:.1f}%的交易日下破。")
+        parts.append(f"期间 {stats['pierce_pct']:.1f}% 的交易日下破。")
+    if stats.get("from_cache"):
+        parts.append(format_stale_notice("复权行情", stats.get("as_of")))
     return "".join(parts)
 
 
@@ -587,26 +597,31 @@ def trend_panel(stats: dict[str, Any] | None, ticker: str) -> str:
     if not stats:
         return (
             f'<article class="panel"><h3>{html.escape(ticker)} 上行支撑线</h3>'
-            f'<p class="empty">{html.escape(ticker)}的复权日线本次取不到，趋势底算不出来，不用旧值顶替。</p></article>'
+            f'<p class="empty">{html.escape(ticker)} 的日线行情本次拉取失败，趋势支撑位暂不可用，页面未沿用旧值顶替。</p></article>'
         )
     gap = stats["bottom_gap"]
     tone = "cold" if gap > -5 else "neutral"
+    stale_prefix = f"数据未更新（上次成功：{stats['as_of']} 美东时间） · " if stats.get("from_cache") else ""
     cards = (
         metric_card("当前趋势底", f"${stats['bottom']:.1f}", f"距现价 {gap:+.1f}%", tone,
-                    f"现价 ${stats['close']:.2f} · {stats['as_of']}")
-        + metric_card("未来6M抬升", f"+${stats['rise_6m']:.1f}", "126个交易日", "neutral",
-                      f"半年后趋势底 ${stats['bottom'] + stats['rise_6m']:.1f}")
-        + metric_card("未来12M抬升", f"+${stats['rise_12m']:.1f}", "252个交易日", "neutral",
-                      f"一年后趋势底 ${stats['bottom'] + stats['rise_12m']:.1f}")
+                    f"{stale_prefix}现价 ${stats['close']:.2f}（美元） · 截至 {stats['as_of']}（美东时间）")
+        + metric_card("未来6个月支撑上移", f"+${stats['rise_6m']:.1f}", "按126个交易日计算", "neutral",
+                      f"半年后趋势底约 ${stats['bottom'] + stats['rise_6m']:.1f}")
+        + metric_card("未来12个月支撑上移", f"+${stats['rise_12m']:.1f}", "按252个交易日计算", "neutral",
+                      f"一年后趋势底约 ${stats['bottom'] + stats['rise_12m']:.1f}")
     )
     note = (
-        f"{stats['start']}起，等距K线上对最低价做下包络，线固定于{stats.get('fitted_on') or '首次'}那次拟合，"
-        f"斜率 ${stats['slope']:.3f}/根，贴线低点{stats.get('bottom_pts', '—')}个，"
-        f"期间{stats['pierce_pct']:.1f}%的交易日曾下破。"
+        f"自 {stats['start']} 起按交易日等距拟合下沿支撑线（参数固定于 {stats.get('fitted_on') or '首次'}，不随每日行情重算），"
+        f"约每交易日上移 ${stats['slope']:.3f}，累计触及低点 {stats.get('bottom_pts', '—')} 次，"
+        f"期间 {stats['pierce_pct']:.1f}% 的交易日曾跌破。"
+    )
+    stale_banner = (
+        f'<p class="stale-banner">{html.escape(format_stale_notice(f"{ticker} 行情", stats["as_of"]))}</p>'
+        if stats.get("from_cache") else ""
     )
     return (
         f'<article class="panel"><h3>{html.escape(ticker)} 上行支撑线</h3>'
-        f'<p class="note">{html.escape(note)}</p><section class="cards">{cards}</section></article>'
+        f'{stale_banner}<p class="note">{html.escape(note)}</p><section class="cards">{cards}</section></article>'
     )
 
 
@@ -693,10 +708,12 @@ def parse_bbg(path: Path) -> dict[str, Any]:
             out[key] = paired(*pair)
         except Exception:
             out[key] = pd.Series(dtype=float)
+    series_as_of = {k: (series_last_obs(out.get(k))[1] or "") for k in specs}
     us_keys = ("cyc_price", "cyc_rsi", "momentum_rsi", "qqq_vol_1m", "qqq_vol_3m")
-    us_dates = [d for k in us_keys if (d := series_last_obs(out.get(k))[1])]
-    ah_dates = [d for k in ("ah_price", "ah_rsi") if (d := series_last_obs(out.get(k))[1])]
+    us_dates = [series_as_of[k] for k in us_keys if series_as_of.get(k)]
+    ah_dates = [series_as_of[k] for k in ("ah_price", "ah_rsi") if series_as_of.get(k)]
     all_dates = us_dates + ah_dates
+    out["series_as_of"] = series_as_of
     out["as_of"] = max(all_dates) if all_dates else "未知"
     out["us_as_of"] = max(us_dates) if us_dates else out["as_of"]
     out["ah_as_of"] = max(ah_dates) if ah_dates else out["as_of"]
@@ -1311,16 +1328,18 @@ def asia_country_charts(workspace: Path, config: dict[str, Any], refresh: bool =
             if raw.empty:
                 missing.append(f"{country['name']}·{indicator['label']}")
                 continue
-            payload = [series_payload(raw, f"{indicator['label']}（{indicator['unit']}）", indicator["color"], "left", True, 1400)]
+            unit_zh = display_currency_unit(indicator["unit"])
+            payload = [series_payload(raw, f"{indicator['label']}（{unit_zh}）", indicator["color"], "left", True, 1400)]
             if not index_series.empty:
                 payload.append(series_payload(index_series, country["msci_name"], country.get("msci_color", "#8fb7ff"), "right", False, 1400))
-            span = f"{iso_date(raw.index.min())} 起"
-            # 脚注只留口径一行；指标来源、回测评价等长说明留在 dashboard_config.json 的 note 和 methodology.md。
+            span = f"{iso_date(raw.index.min())} 至 {iso_date(raw.index.max())}"
             note = (
-                f"左轴 {indicator['label']}（{indicator['unit']}），右轴 {country['msci_name']}，{span}。两轴量纲不同，只比拐点和方向。"
+                f"左轴 {indicator['label']}（{unit_zh}），右轴 {country['msci_name']}（{span}）。两轴量纲不同，仅比较拐点与方向。"
             )
-            if index_series.empty:
-                note = f"⚠️ {country['msci_name']}取数失败，本图只有左轴。" + note
+            if state == "stale" and not index_series.empty:
+                note = format_stale_notice(country["msci_name"], iso_date(index_series.index.max())) + " " + note
+            elif index_series.empty:
+                note = f"⚠️ {country['msci_name']}本次拉取失败，仅展示左轴指标。" + note
             blocks.append(chart(f"{country['name']}：{indicator['label']} vs {country['msci_name']}", payload, note, None, 340))
             charts += 1
         if blocks:
@@ -1365,9 +1384,10 @@ def crowding_board(crowding: dict[str, Any]) -> str:
     Replaces the fixed 11-name table. Rows carry the vendor's own 0-100 score, so no
     local re-scaling happens here; sorting, filtering and the sparkline are presentation.
     """
+    cn_copy = UI_COPY["cn"]
     rows = crowding.get("rows", [])
     if not rows:
-        return '<article class="panel"><h3>指数与板块拥挤度</h3><p class="empty">拥挤度镜像本次不可用；看板不用旧值冒充当日值。</p></article>'
+        return f'<article class="panel"><h3>{html.escape(cn_copy["crowd_title"])}</h3><p class="empty">指数与板块拥挤度数据本次不可用，页面未沿用旧值顶替。</p></article>'
     board = crowding_board_rows(rows)
     overseas = sum(1 for r in board if r.get("category") == "海外")
     domestic = [r for r in board if r.get("category") != "海外"]
@@ -1387,26 +1407,31 @@ def crowding_board(crowding: dict[str, Any]) -> str:
     cat_options = '<option value="">全部类型</option>' + "".join(f"<option>{html.escape(c)}</option>" for c in cats)
     level_options = '<option value="">全部档位</option>' + "".join(f"<option>{lv}</option>" for lv in levels)
     encoded = json.dumps(board, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    trade_date = html.escape(str(crowding.get("trade_date", "未知")))
+    raw_trade_date = str(crowding.get("trade_date", "未知"))
+    trade_date = html.escape(raw_trade_date)
+    crowd_stale = stale_days(raw_trade_date)
+    stale_banner = (
+        f'<p class="stale-banner">{html.escape(format_stale_notice("指数拥挤度数据库", raw_trade_date))}</p>'
+        if crowd_stale is not None and crowd_stale > 4 else ""
+    )
     return (
-        '<article class="panel cb-panel"><div class="panel-head"><h3>指数与板块拥挤度</h3>'
-        f'<div class="shape">截止 {trade_date} · 中国 {len(domestic)} 个指数</div></div>'
-        f'<div class="cb-stats">{stats}</div>'
+        f'<article class="panel cb-panel"><div class="panel-head"><h3>{html.escape(cn_copy["crowd_title"])}</h3>'
+        f'<div class="shape">截至 {trade_date}（北京时间） · 中国 {len(domestic)} 个指数</div></div>'
+        f'{stale_banner}<div class="cb-stats">{stats}</div>'
         '<div class="cb-controls">'
         '<input id="cbSearch" type="search" placeholder="搜索指数名称或代码" autocomplete="off">'
         f'<select id="cbCat">{cat_options}</select>'
         f'<select id="cbLevel">{level_options}</select>'
         '<select id="cbSort"><option value="asc">拥挤度：低到高</option><option value="desc">拥挤度：高到低</option>'
-        '<option value="changeDesc">当日涨幅：高到低</option><option value="probDesc">历史概率：高到低</option></select>'
+        f'<option value="changeDesc">当日涨幅：高到低</option><option value="probDesc">{html.escape(cn_copy["crowd_prob_sort"])}</option></select>'
         f'<label class="cb-toggle"><input id="cbOverseas" type="checkbox">含海外 {overseas} 个</label>'
         '</div>'
         '<div class="cb-shell"><table><thead><tr><th>排名</th><th>指数</th><th>类型</th><th>拥挤度</th>'
         '<th><i class="cb-dot cb-dot-price"></i>价格 <i class="cb-dot cb-dot-crowd"></i>拥挤度（1年）</th>'
-        '<th>原版历史概率</th><th>回测周期</th><th>当日涨跌</th></tr></thead><tbody id="cbRows"></tbody></table>'
+        f'<th>{html.escape(cn_copy["crowd_prob_col"])}</th><th>回测周期</th><th>当日涨跌</th></tr></thead><tbody id="cbRows"></tbody></table>'
         '<div id="cbEmpty" class="empty" hidden>没有符合条件的指数</div></div>'
         f'<script id="cbData" type="application/json">{encoded}</script>'
-        '<p class="note">镜像原版公开排名字段，中国指数内部按拥挤度从低到高排序。'
-        f'小图每 {CROWD_SPARK_STEP} 个交易日取一点，只看形状：蓝线价格、橙线拥挤度，两线高度不可互比，读数以表格为准。悬停或聚焦可放大。</p>'
+        f'<p class="note">{html.escape(cn_copy["crowd_note_tpl"].format(step=CROWD_SPARK_STEP))}</p>'
         '</article><div id="cbZoom" class="cb-zoom" hidden></div>'
     )
 
@@ -1628,6 +1653,7 @@ def fetch_fund_flow(side_n: int = FLOW_SIDE_N, host: str = FLOW_HOST) -> dict[st
 
 
 def fund_flow_panel(snapshot: dict[str, Any], side_n: int = FLOW_SIDE_N, host: str = FLOW_HOST) -> str:
+    cn_copy = UI_COPY["cn"]
     payload = {
         "cfg": {
             **flow_endpoints(host),
@@ -1639,12 +1665,9 @@ def fund_flow_panel(snapshot: dict[str, Any], side_n: int = FLOW_SIDE_N, host: s
         "snapshot": snapshot,
     }
     encoded = html.escape(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), quote=True)
-    note = (
-        f"东方财富申万三级板块主力净流入当日累计，单位亿元；画净流入、净流出各 {side_n} 个。"
-        f"绿=净流入、红=净流出。盘中每 {FLOW_REFRESH_MIN} 分钟刷新。"
-    )
+    note = cn_copy["flow_note_tpl"].format(side_n=side_n, mins=FLOW_REFRESH_MIN)
     return (
-        '<article class="panel flow-panel"><div class="panel-head"><h3>A股盘中资金流向</h3>'
+        f'<article class="panel flow-panel"><div class="panel-head"><h3>{html.escape(cn_copy["flow_title"])}</h3>'
         '<div class="flow-status" data-flow-status>加载中…</div></div>'
         f'<div class="flow" data-flow="{encoded}"><canvas></canvas><div class="tooltip"></div></div>'
         '<div class="flow-rank" data-flow-rank></div>'
@@ -1751,14 +1774,14 @@ def turnover_baseline_note(names: str, snapshot: dict[str, Any]) -> str:
 
 def turnover_freshness_detail(snapshot: dict[str, Any]) -> str:
     """新鲜度表的量能说明。有完整交易日基数时沿用原句；没有基数时不写成前 0 个。"""
+    f_rows = UI_COPY["overview"]["freshness_rows"]
     days = snapshot.get("days")
     day_count = len(days) if isinstance(days, list) else None
-    refresh = f"页面每{FLOW_REFRESH_MIN}分钟自刷新"
     if day_count:
-        return f"沪深两市累计成交额；基线取前{day_count}个完整交易日，{refresh}"
+        return f_rows["turnover_desc_ok"].format(days=day_count, mins=FLOW_REFRESH_MIN)
     if not snapshot.get("ok"):
-        return f"沪深两市累计成交额；量能数据缺失，{refresh}"
-    return f"沪深两市累计成交额；完整交易日参考数据缺失，{refresh}"
+        return f_rows["turnover_desc_missing"].format(mins=FLOW_REFRESH_MIN)
+    return f_rows["turnover_desc_no_baseline"].format(mins=FLOW_REFRESH_MIN)
 
 
 def turnover_panel(snapshot: dict[str, Any], config: dict[str, Any]) -> str:
@@ -2165,7 +2188,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         frame = ohlc.get(item["ticker"], pd.DataFrame())
         stats = trend_line_stats(frame, item["start"], item["mode"], item.get("fit")) if not frame.empty else None
         if stats:
-            trend_stats[item["ticker"]] = {**stats, **{k: item[k] for k in ("mode", "label")}}
+            trend_stats[item["ticker"]] = {**stats, **{k: item[k] for k in ("mode", "label")}, "from_cache": item["ticker"] in trend_stale}
     trend_missing = [x["ticker"] for x in trend_cfg if x["ticker"] not in trend_stats]
     # 线只认 config 里的冻结参数。少了就报出来，不临时拟合一条顶上——那样图注会天天变。
     trend_unfrozen = [x["ticker"] for x in trend_cfg if not x.get("fit")]
@@ -2260,8 +2283,17 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         spx_rsi14=spx_rsi14, qqq_rsi14=qqq_rsi14, vix_price=vix_price, vvix_price=vvix_price,
     )
 
-    spx_trend_chart = chart("SPX 相对GDP/CPI长期趋势的折溢价", [series_payload(trend_premium.loc[trend_premium.index >= "2015-01-01"], "SPX折溢价", "#4da3ff", "left", True, 4000)], f"折溢价=(SPX实际值÷长期趋势−1)，当前{fmt(trend_dev,1,'%')}，更新到{iso_date(spx.index.max())}。", None, 390, None, False, [hline(0, "left", "趋势线", "zero")])
-    # ── 顶部状态机（CY 2026-09-03）：预警后并行检查过激与确认；过激非前置，弱预警只挂标签 ──
+    spx_trend_chart = chart(
+        "标普500（SPX）相对宏观均衡长期趋势的折溢价",
+        [series_payload(trend_premium.loc[trend_premium.index >= "2015-01-01"], "SPX相对长期趋势折溢价", "#4da3ff", "left", True, 4000)],
+        f"正数代表高于模型均衡水平、负数代表低于均衡水平；当前 {fmt(trend_dev,1,'%')}，行情截至 {iso_date(spx.index.max())}。{format_manual_snapshot_notice(seed['source_as_of'])}。",
+        None,
+        390,
+        None,
+        False,
+        [hline(0, "left", "均衡趋势线", "zero")],
+    )
+    # ── 顶部框架（CY 2026-09-03）：预警后并行检查过激与确认；过激非前置，弱预警只挂标签 ──
     top_cfg = TopFrameworkConfig(**config["us_top_framework"])
     top_framework = evaluate_top_framework(
         cyc_rsi30,
@@ -2280,20 +2312,18 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
     qqq_vs_200dma = ((qqq_price / qqq_price.rolling(200).mean() - 1.0) * 100).dropna() if not qqq_price.empty else pd.Series(dtype=float)
     spx_vs_20dma = ((spx / spx.rolling(top_cfg.confirm_ma_td).mean() - 1.0) * 100).dropna() if not spx.empty else pd.Series(dtype=float)
     qqq_vs_20dma = ((qqq_price / qqq_price.rolling(top_cfg.confirm_ma_td).mean() - 1.0) * 100).dropna() if not qqq_price.empty else pd.Series(dtype=float)
-    # Momentum 图 2026-09-04 从状态监控搬到顶部监控过激段（用户要求）：线画过激 75、超买 70、超卖 30，
-    # 70/30 是速览 Momentum 那行用的 thresholds.rsi_hot/rsi_cold，75 是顶部状态机的过激门槛。
     momentum_chart = chart(
-        "过激：Momentum RSI 与 NDX/SPW RSI14",
+        "过热阶段参考：高盛高动量股指数（GSCBHMOM）与纳指/标普等权相对强弱",
         [
-            series_payload(mom.loc[mom.index >= "2023-01-01"], f"GSCBHMOM RSI{mom_period or '?'}", "#f4f5f7", "left", False, 1000),
-            series_payload(ndx_spw_rsi.loc[ndx_spw_rsi.index >= "2023-01-01"], "NDX/SPW RSI14" + ("（RSP代理）" if ratio_proxy else ""), "#ffd447", "left", False, 1000),
+            series_payload(mom.loc[mom.index >= "2023-01-01"], f"高盛高动量指数 RSI{mom_period or '?'}", "#f4f5f7", "left", False, 1000),
+            series_payload(ndx_spw_rsi.loc[ndx_spw_rsi.index >= "2023-01-01"], "纳指100/标普等权 RSI14" + ("（RSP代理）" if ratio_proxy else ""), "#ffd447", "left", False, 1000),
         ],
-        f"左轴 GSCBHMOM RSI{mom_period or '?'}（过激≥{top_cfg.excess_momentum_rsi:.0f}）与 NDX/SPW RSI14；当前{fmt(last_mom,1)}、{fmt(last_ratio,1)}。",
+        f"左轴为高盛高动量股 RSI{mom_period or '?'}（≥{top_cfg.excess_momentum_rsi:.0f} 为过热确认）与纳指/标普等权 RSI14；当前 {fmt(last_mom,1)}、{fmt(last_ratio,1)}。",
         None,
         390,
         [0, 100],
         False,
-        [hline(top_cfg.excess_momentum_rsi, "left", f"过激{top_cfg.excess_momentum_rsi:.0f}", "hot"), hline(70, "left", "超买70", "hot"), hline(30, "left", "超卖30", "cold")],
+        [hline(top_cfg.excess_momentum_rsi, "left", f"过热{top_cfg.excess_momentum_rsi:.0f}", "hot"), hline(70, "left", "偏热70", "hot"), hline(30, "left", "偏冷30", "cold")],
     )
     top_monitor_html = top_monitor_section(
         chart=chart, series_payload=series_payload, hline=hline, metric_card=metric_card, fmt=fmt, finite=finite,
@@ -2307,140 +2337,226 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         momentum_chart=momentum_chart,
     )
 
+    # DALTON-HOOK(monitors): check every individual BBG series for staleness/missing (no intra-group max masking)
+    bbg_series_asof = bbg.get("series_as_of") or {}
+    bbg_us_series = [
+        ("周期/防御价格", bbg_series_asof.get("cyc_price", "")),
+        ("周期/防御RSI14", bbg_series_asof.get("cyc_rsi", "")),
+        ("高盛高动量股", bbg_series_asof.get("momentum_rsi", "")),
+        ("QQQ 1个月隐含波动率", bbg_series_asof.get("qqq_vol_1m", "")),
+        ("QQQ 3个月隐含波动率", bbg_series_asof.get("qqq_vol_3m", "")),
+    ]
+    bbg_ah_series = [
+        ("AH溢价指数", bbg_series_asof.get("ah_price", "")),
+        ("AH溢价RSI30", bbg_series_asof.get("ah_rsi", "")),
+    ]
+
+    def _collect_bbg_stale(items: list[tuple[str, str]], fallback_as_of: str) -> tuple[list[str], str, int | None]:
+        parts: list[str] = []
+        valid_dates: list[str] = []
+        max_stale_d: int | None = None
+        for label, s_date in items:
+            if s_date:
+                valid_dates.append(s_date)
+            d_stale = stale_days(s_date)
+            if d_stale is not None:
+                max_stale_d = d_stale if max_stale_d is None else max(max_stale_d, d_stale)
+            if not s_date:
+                parts.append(f"{label}缺失")
+            elif not bbg.get("ok") or (d_stale is not None and d_stale > BBG_STALE_DAYS):
+                parts.append(f"{label}截至 {s_date}")
+        oldest_date = min(valid_dates) if valid_dates else (fallback_as_of or "")
+        return parts, oldest_date, max_stale_d
+
+    bbg_us_stale_parts, us_bbg_min_date, us_bbg_max_stale = _collect_bbg_stale(
+        bbg_us_series, bbg.get("us_as_of") or ""
+    )
+    bbg_ah_stale_parts, ah_bbg_min_date, bbg_ah_stale_d = _collect_bbg_stale(
+        bbg_ah_series, bbg.get("ah_as_of") or ""
+    )
+    us_bbg_asof_display = us_bbg_min_date or "未知"
+    bbg_ah_asof_actual = ah_bbg_min_date
+    bbg_us_stale_banner = (
+        f'<p class="stale-banner">{html.escape(format_stale_notice("彭博美股序列（" + "、".join(bbg_us_stale_parts) + "）", us_bbg_asof_display))}</p>'
+        if bbg_us_stale_parts else ""
+    )
+    bbg_ah_stale_banner = (
+        f'<p class="stale-banner">{html.escape(format_stale_notice("彭博港股AH溢价序列（" + "、".join(bbg_ah_stale_parts) + "）", bbg_ah_asof_actual or "未知"))}</p>'
+        if bbg_ah_stale_parts else ""
+    )
+    bbg_stale_parts_all = list(bbg_us_stale_parts) + list(bbg_ah_stale_parts)
+    overview_bbg_asof = min(
+        (d for d in (us_bbg_asof_display, bbg_ah_asof_actual) if d and d != "未知"),
+        default="未知",
+    )
+    bbg_overview_stale_banner = (
+        f'<p class="stale-banner">{html.escape(format_stale_notice("彭博终端数据（" + "、".join(bbg_stale_parts_all) + "）", overview_bbg_asof))}</p>'
+        if bbg_stale_parts_all else ""
+    )
+    effective_bbg_stale_days = max(
+        (d for d in (bbg_stale_days, us_bbg_max_stale, bbg_ah_stale_d) if d is not None),
+        default=None,
+    )
+
+    us_state_copy = UI_COPY["us_state"]
+    macro_specs = us_state_copy["macro_specs"]
     macro_series = [
-        ("美国高收益债OAS", fred["BAMLH0A0HYM2"], "百分点评价信用压力", "#ff6b6b"),
-        ("美国10年实际利率", fred["DFII10"], "FRED DFII10", "#ffd447"),
-        ("10Y-2Y曲线", curve_series, "DGS10-DGS2", "#4da3ff"),
+        (macro_specs[0][0], fred["BAMLH0A0HYM2"], macro_specs[0][1], "#ff9d3c"),
+        (macro_specs[1][0], fred["DFII10"], macro_specs[1][1], "#ffd447"),
+        (macro_specs[2][0], curve_series, macro_specs[2][1], "#4da3ff"),
     ]
     macro_html = "".join(chart(t, [series_payload(s.iloc[-756:], t, c, "left")], n, None, 240) for t, s, n, c in macro_series if not s.empty)
     if not macro_html:
-        macro_html = '<article class="panel"><h3>MacroCharts</h3><p class="empty">FRED数据本次不可用；看板未用旧值冒充实时值。</p></article>'
+        macro_html = (
+            f'<article class="panel"><h3>{html.escape(us_state_copy["macro_missing_title"])}</h3>'
+            f'<p class="empty">{html.escape(us_state_copy["macro_missing_msg"])}</p></article>'
+        )
 
-    # 「左轴距200DMA、右轴相对基准RSI30」这一族图共用同一组参考线：美股行业、美股风格篮子、港股都在用。
-    style_hlines = [hline(0, "left", "200DMA", "zero"), hline(rel_signal["top_rsi"], "right", "", "hot"), hline(rel_signal["bottom_rsi"], "right", "", "cold")]
+    # 「左轴距200日均线、右轴相对基准RSI30」这一族图共用同一组参考线：美股行业、美股风格篮子、港股都在用。
+    style_hlines = [hline(0, "left", "200日均线", "zero"), hline(rel_signal["top_rsi"], "right", "", "hot"), hline(rel_signal["bottom_rsi"], "right", "", "cold")]
 
+    cn_copy = UI_COPY["cn"]
     cn_frame = cn["frame"].loc["2023-01-01":]
-    cn_margin_chart = chart("两融余额 RSI14 vs 中证1000", [series_payload(cn_frame["csi1000"], "中证1000", "#4da3ff", "left", True, 1200), series_payload(cn_frame["margin_rsi14"], "两融余额 RSI14", "#ffbf3c", "right", False, 1200)], "两融余额为沪深合计、单位亿元；RSI使用Wilder 14日口径。", [0, 100], 380, None, False, [hline(70, "right", "超买70", "hot"), hline(30, "right", "超卖30", "cold")])
+    cn_margin_stale_days = stale_days(cn.get("as_of", ""))
+    cn_margin_note = cn_copy["margin_note_tpl"].format(as_of=cn.get("as_of") or "未知")
+    if cn_margin_stale_days is not None and cn_margin_stale_days > BBG_STALE_DAYS:
+        cn_margin_note += " " + format_stale_notice("两融余额", cn.get("as_of") or "未知")
+    cn_margin_chart = chart(
+        cn_copy["margin_title"],
+        [series_payload(cn_frame["csi1000"], "中证1000", "#4da3ff", "left", True, 1200), series_payload(cn_frame["margin_rsi14"], "两融余额 14日RSI", "#ffbf3c", "right", False, 1200)],
+        cn_margin_note,
+        [0, 100],
+        380,
+        None,
+        False,
+        [hline(70, "right", "偏热70", "hot"), hline(30, "right", "偏冷30", "cold")],
+    )
+    hk_copy = UI_COPY["hk"]
     ah_charts = ""
     ah_price = bbg.get("ah_price", pd.Series(dtype=float))
     if isinstance(ah_price, pd.Series) and isinstance(ah_rsi, pd.Series):
         ah_price_plot = ah_price.loc[ah_price.index >= "2020-01-01"]
         ah_rsi_plot = ah_rsi.loc[ah_rsi.index >= "2020-01-01"]
         ah_charts += '<div class="grid two">'
-        ah_charts += chart("AH溢价指数 HSAHP（倒序）", [series_payload(ah_price_plot, "HSAHP", "#ff7a3d", "left", False, 2000)], "与每日cron一致：纵轴倒序，向上代表AH溢价收窄，向下代表溢价扩大。", None, 330, None, True)
-        ah_charts += chart("AH溢价 RSI30（Bloomberg口径）", [series_payload(ah_rsi_plot, "RSI30", "#4da3ff", "left", True, 2000)], f"与每日cron一致：BBG HT006直接取负，范围-100~0；超买-36、超卖-60，当前{fmt(last_ah,2)}。", None, 330, [-80, -20], False, [hline(-36, "left", "超买-36", "hot"), hline(-60, "left", "超卖-60", "cold")])
+        ah_charts += chart(hk_copy["ah_price_title"], [series_payload(ah_price_plot, "恒生AH溢价指数（HSAHP）", "#ff7a3d", "left", False, 2000)], hk_copy["ah_price_note"], None, 330, None, True)
+        ah_charts += chart(hk_copy["ah_rsi_title"], [series_payload(ah_rsi_plot, "AH溢价 30日强弱", "#4da3ff", "left", True, 2000)], hk_copy["ah_rsi_note_tpl"].format(val=fmt(last_ah, 2)), None, 330, [-80, -20], False, [hline(-36, "left", "偏热-36", "hot"), hline(-60, "left", "偏冷-60", "cold")])
         ah_charts += '</div>'
 
     # ── A股：指数点位 + 拥挤度，一格一个指数，顺序写死 ──
-    # 标了 featured 的那格单独提到盘中资金流上方，剩下的仍按配置顺序排成两列网格。
     cn_index_charts: list[str] = []
     cn_featured_charts: list[str] = []
     for item in cn_a_cfg:
-        name, code = item["name"], item["code"]
+        name, code = display_asset_name(item["name"]), item["code"]
         bucket = cn_featured_charts if item.get("featured") else cn_index_charts
         frame = hist_frames.get(code, pd.DataFrame())
         plot = frame.loc[HISTORY_START:] if not frame.empty else frame
         if plot.empty or len(plot) < 20:
-            bucket.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">拥挤度长历史本次不可用（{html.escape(code)}），不用空图或旧值顶替。</p></article>')
+            bucket.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">该指数历史拥挤度数据暂不可用（{html.escape(code)}），页面未用旧值替代。</p></article>')
             continue
         crowd_now = finite(plot["value"].iloc[-1])
+        note_text = (
+            f"代码 {code}；左轴为指数点位、右轴为 0–100 拥挤度分位（两轴量纲不同）。"
+            f"当前拥挤度 {fmt(crowd_now, 1)}，覆盖 {iso_date(plot.index.min())} 至 {iso_date(plot.index.max())}。"
+        )
+        if code in history["stale"]:
+            note_text += " " + format_stale_notice(name, iso_date(plot.index.max()) or history["as_of"])
         bucket.append(chart(
-            f"{name}：指数点位 + 拥挤度",
+            f"{name}：指数点位与拥挤度",
             [
                 series_payload(plot["close"], f"{name}点位", item["color"], "left", True, 1000),
                 series_payload(plot["value"], "拥挤度（右轴0–100）", "#ffbf3c", "right", False, 1000),
             ],
-            # 脚注只留口径；选样理由（国证2000 vs 中证2000）留在 config 的 note 和上方 cn_index_rule。
-            f"{code}；左轴指数点位、右轴 0–100 拥挤度，两轴不可互比。"
-            f"当前拥挤度{fmt(crowd_now,1)}，图面 {iso_date(plot.index.min())}—{iso_date(plot.index.max())}。",
+            note_text,
             [0, 100],
             330,
             None,
             False,
-            [hline(80, "right", "拥挤80", "hot"), hline(50, "right", "中位50", "zero"), hline(20, "right", "低位20", "cold")],
+            [hline(80, "right", "拥挤80", "hot"), hline(50, "right", "中性50", "zero"), hline(20, "right", "低位20", "cold")],
         ))
     cn_index_charts_html = '<div class="grid two">' + "".join(cn_index_charts) + "</div>" if cn_index_charts else ""
     cn_featured_html = "".join(cn_featured_charts)
-    cn_index_rule = (
-        f"彩色线是指数点位（左轴），橙线是拥挤度（右轴 0–100，≥80 拥挤、≤20 冷），{HISTORY_START} 起。"
-        f"小微盘用国证2000（中证2000 的拥挤度只有 2025-09 以来）。"
-    )
+    cn_index_rule = cn_copy["watchlist_rule_tpl"].format(start=HISTORY_START)
 
-    # ── A股宽基：指数点位 + 自身 RSI30，一只票一张图，排在国证2000 那张拥挤度图上方 ──
-    # 左轴是该指数自己的点位，右轴是它自身的 Wilder RSI。左轴没有有意义的零点，不做 0=50 对齐——
-    # 硬对齐会把点位轴一路拉到 0，指数线压成平线（同 A股拥挤度那七张图）。
-    # 2026-08-12 用户去掉了原来那两张「除以中证1000」的相对 RSI，只留自身动能。
+    # ── A股宽基：指数点位 + 自身 RSI30 ──
     rsi_period = rel_signal["rsi_period"]
     cn_broad_hlines = [
-        hline(rel_signal["top_rsi"], "right", f"强{rel_signal['top_rsi']}", "hot"),
-        hline(50, "right", "中位50", "zero"),
-        hline(rel_signal["bottom_rsi"], "right", f"弱{rel_signal['bottom_rsi']}", "cold"),
+        hline(rel_signal["top_rsi"], "right", f"偏强{rel_signal['top_rsi']}", "hot"),
+        hline(50, "right", "中性50", "zero"),
+        hline(rel_signal["bottom_rsi"], "right", f"偏弱{rel_signal['bottom_rsi']}", "cold"),
     ]
     cn_broad_charts: list[str] = []
     for item in cn_broad_members:
-        name, code, color = item["name"], item["code"], item["color"]
+        name, code, color = display_asset_name(item["name"]), item["code"], item["color"]
         frame = hist_frames.get(code, pd.DataFrame())
         if frame.empty or len(frame) < rsi_period * 4:
-            cn_broad_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">指数长历史本次不可用（{html.escape(code)}），不用空图或旧值顶替。</p></article>')
+            cn_broad_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">该宽基历史行情暂不可用（{html.escape(code)}），页面未用旧值替代。</p></article>')
             continue
         close_plot = frame["close"].loc[frame.index >= HISTORY_START]
         own_rsi = wilder_rsi(frame["close"], rsi_period)
         own_plot = own_rsi.loc[own_rsi.index >= HISTORY_START].dropna()
+        note_text = (
+            f"代码 {code}；左轴为指数点位、右轴为自身 {rsi_period} 日相对强弱（RSI{rsi_period}），两轴不可互比。"
+            f"截至 {iso_date(close_plot.index.max()) if not close_plot.empty else '—'}：点位 "
+            f"{fmt(finite(close_plot.iloc[-1]) if not close_plot.empty else None,1)}、RSI "
+            f"{fmt(finite(own_plot.iloc[-1]) if not own_plot.empty else None,1)}。"
+        )
+        if code in history["stale"]:
+            note_text += " " + format_stale_notice(name, iso_date(close_plot.index.max()) or history["as_of"])
         cn_broad_charts.append(chart(
-            f"{name}：指数点位 + RSI{rsi_period}",
+            f"{name}：指数点位与{rsi_period}日强弱（RSI{rsi_period}）",
             [
                 series_payload(close_plot, f"{name}点位", color, "left", True, 1000),
                 series_payload(own_plot, f"{name} RSI{rsi_period}", "#ffbf3c", "right", False, 1000),
             ],
-            f"{code}；左轴点位、右轴自身 Wilder RSI{rsi_period}，两轴不可互比。"
-            f"{iso_date(close_plot.index.max()) if not close_plot.empty else '—'} 点位"
-            f"{fmt(finite(close_plot.iloc[-1]) if not close_plot.empty else None,1)}、"
-            f"RSI{fmt(finite(own_plot.iloc[-1]) if not own_plot.empty else None,1)}。",
+            note_text,
             [0, 100],
             330,
             None,
             False,
             cn_broad_hlines,
         ))
-    # 一张图独占一行（用户 2026-08-12 的要求）：不套 grid two，直接把 article 交给外层 .stack，
-    # 和国证2000 那张 featured 图同样的排法。并排时每张只有半个页宽，2023 年以来 600 多根点位
-    # 挤在 700px 里，RSI 那根线的拐点基本看不出来。
     cn_broad_html = "".join(cn_broad_charts)
-    cn_broad_rule = (
-        f"彩色线是指数点位（左轴），橙线是该指数自身的 Wilder RSI{rsi_period}（右轴，参考线"
-        f"{rel_signal['top_rsi']}/50/{rel_signal['bottom_rsi']}），两轴不可互比，{HISTORY_START} 起。"
+    cn_broad_rule = cn_copy["broad_rule_tpl"].format(
+        rsi_period=rsi_period,
+        top_rsi=rel_signal["top_rsi"],
+        bottom_rsi=rel_signal["bottom_rsi"],
+        start=HISTORY_START,
     )
 
-    # ── 港股：完全套用美股行业那套（左轴距200DMA、右轴相对基准RSI30、左0右50同高）──
+    # ── 港股：200日均线乖离 + 相对基准RSI30 ──
     hk_bench_frame = hist_frames.get(hk_bench_cfg.get("code", ""), pd.DataFrame())
-    hk_bench_name = hk_bench_cfg.get("name", "基准")
+    hk_bench_name = display_asset_name(hk_bench_cfg.get("name", "基准"))
     hk_rel_rsi: dict[str, pd.Series] = {}
     hk_charts: list[str] = []
     for item in hk_members:
-        name, code = item["name"], item["code"]
+        name, code = display_asset_name(item["name"]), item["code"]
         frame = hist_frames.get(code, pd.DataFrame())
         if frame.empty or hk_bench_frame.empty:
-            hk_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">{html.escape(name)}或基准的长历史本次不可用（{html.escape(code)}），不用空图顶替。</p></article>')
+            hk_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">{html.escape(name)}或基准指数历史行情暂不可用（{html.escape(code)}）。</p></article>')
             continue
         pair = pd.concat([frame["close"].rename("idx"), hk_bench_frame["close"].rename("bench")], axis=1).dropna()
         if len(pair) < 220:
-            hk_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">与基准重叠的交易日不足220天，算不出200DMA乖离，本次不画图。</p></article>')
+            hk_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">与基准重叠交易日不足220天，暂无法计算200日均线乖离。</p></article>')
             continue
         dev200 = (pair["idx"] / pair["idx"].rolling(200).mean() - 1) * 100
         rel_rsi = wilder_rsi(pair["idx"] / pair["bench"], rel_signal["rsi_period"])
         hk_rel_rsi[code] = rel_rsi
         dev_plot = dev200.loc[dev200.index >= HISTORY_START].dropna()
         rsi_plot = rel_rsi.loc[rel_rsi.index >= HISTORY_START].dropna()
+        note_text = (
+            f"左轴为距200日均线乖离率，右轴为相对{hk_bench_name}的 {rel_signal['rsi_period']} 日强弱（RSI），左轴0与右轴50对齐。"
+            f"当前乖离 {fmt(finite(dev_plot.iloc[-1]) if not dev_plot.empty else None,1,'%')}，相对RSI {fmt(finite(rsi_plot.iloc[-1]) if not rsi_plot.empty else None,1)}；"
+            f"自 {iso_date(dev_plot.index.min()) if not dev_plot.empty else '—'} 起。"
+        )
+        if code in history["stale"] or hk_bench_cfg.get("code") in history["stale"]:
+            note_text += " " + format_stale_notice(name, iso_date(dev_plot.index.max()) or history["as_of"])
         hk_charts.append(chart(
-            f"{name}：200DMA乖离 + {name}/{hk_bench_name} RSI{rel_signal['rsi_period']}",
+            f"{name}：200日均线乖离与相对{hk_bench_name}强弱",
             [
-                series_payload(dev_plot, f"{name}距200DMA", item["color"], "left", True, 1000),
-                series_payload(rsi_plot, f"{name}/{hk_bench_name} RSI{rel_signal['rsi_period']}", "#ffbf3c", "right", False, 1000),
+                series_payload(dev_plot, f"{name}距200日均线", item["color"], "left", True, 1000),
+                series_payload(rsi_plot, f"相对{hk_bench_name} RSI{rel_signal['rsi_period']}", "#ffbf3c", "right", False, 1000),
             ],
-            # 脚注只留口径和读数；替代标的的理由留在 config 的 note 和上方 hk_rule。
-            f"左轴距200DMA，右轴相对{hk_bench_name}的 Wilder RSI{rel_signal['rsi_period']}，左轴0与右轴50同高。"
-            f"当前乖离{fmt(finite(dev_plot.iloc[-1]) if not dev_plot.empty else None,1,'%')}，相对RSI{fmt(finite(rsi_plot.iloc[-1]) if not rsi_plot.empty else None,1)}；"
-            f"乖离线自{iso_date(dev_plot.index.min()) if not dev_plot.empty else '—'}起。",
+            note_text,
             [0, 100],
             330,
             None,
@@ -2449,20 +2565,18 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             ALIGN_ZERO_TO_50,
         ))
     hk_charts_html = '<div class="grid two">' + "".join(hk_charts) + "</div>" if hk_charts else ""
-    hk_rule = (
-        f"左轴距 200 日均线，右轴与基准之比的 Wilder RSI{rel_signal['rsi_period']}，左轴 0 与右轴 50 同高。"
-        f"基准用{hk_bench_name}，红利那格用恒生港股通高股息低波动。"
+    hk_rule = hk_copy["sector_rule_tpl"].format(
+        rsi_period=rel_signal["rsi_period"], bench_name=hk_bench_name
     )
 
     crowd_rows = crowding.get("rows", [])
     crowd_board_html = crowding_board(crowding)
 
-    # 六大科技这张表不再列 BF P/E：本页读的是相对强弱和均线位置，估值倍数是另一套判断，
-    # 混在同一行会让人拿 P/E 去解释 RSI。指数与板块的 BF P/E 仍留在美股市场页的估值快照里。
+    stocks_copy = UI_COPY["stocks"]
     mags_rows = []
     megacap_charts = []
     megacap_alerts: list[dict[str, str]] = []
-    megacap_signals: list[dict[str, Any]] = []  # 每日速览用：只留读数和组合状态，不留序列
+    megacap_signals: list[dict[str, Any]] = []
     stock_lookup = {x["ticker"]: x for x in stocks}
     for ticker in config["mags"]:
         x = stock_lookup.get(ticker, {})
@@ -2481,94 +2595,95 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         low_now = finite(low_line.iloc[-1])
         high_now = finite(high_line.iloc[-1])
         if dev_now is not None and high_now is not None and dev_now > high_now:
-            position = f"高20%（线{high_now:+.1f}%）"
+            position = f"近2年偏高区间（前20%，参考线 {high_now:+.1f}%）"
         elif dev_now is not None and low_now is not None and dev_now < low_now:
-            position = f"低20%（线{low_now:+.1f}%）"
+            position = f"近2年偏低区间（后20%，参考线 {low_now:+.1f}%）"
         else:
-            position = "中间60%"
+            position = "近2年常规区间（中间60%）"
         top_combo = bool(rsi_now is not None and dev_now is not None and high_now is not None and rsi_now > rel_signal["top_rsi"] and dev_now > high_now and dev_now >= rel_signal["top_ma200_dev_pct"])
         bottom_combo = bool(rsi_now is not None and dev_now is not None and low_now is not None and rsi_now < rel_signal["bottom_rsi"] and dev_now < low_now and dev_now <= rel_signal["bottom_ma200_dev_pct"])
         if top_combo:
-            state = '<span class="pill off">顶部组合</span>'
-            megacap_alerts.append(chip(f"{ticker} 顶部组合触发", "hot"))
+            state = '<span class="pill off">触发顶部组合</span>'
+            megacap_alerts.append(chip(f"{ticker} 触发顶部过热组合", "hot"))
         elif bottom_combo:
-            state = '<span class="pill on">底部组合</span>'
-            megacap_alerts.append(chip(f"{ticker} 底部组合触发", "cold"))
+            state = '<span class="pill on">触发底部组合</span>'
+            megacap_alerts.append(chip(f"{ticker} 触发底部低估组合", "cold"))
         elif rsi_now is not None and rsi_now > rel_signal["top_rsi"]:
-            state = "相对偏热，绝对门未齐"
+            state = "相对偏热（未达顶部组合条件）"
         elif rsi_now is not None and rsi_now < rel_signal["bottom_rsi"]:
-            state = "相对偏冷，绝对门未齐"
+            state = "相对偏冷（未达底部组合条件）"
         else:
             state = "中性"
         mags_rows.append([ticker, fmt(rsi_now, 1), fmt(dev_now, 1, "%"), html.escape(position), state])
         megacap_signals.append({"ticker": ticker, "rel_rsi": rsi_now, "dev200": dev_now, "top_combo": top_combo, "bottom_combo": bottom_combo})
         panel = chart(
-            f"{ticker}：200DMA乖离 + 相对QQQ RSI30",
+            f"{ticker}：200日均线乖离与相对QQQ强弱",
             [
-                series_payload(dev200.loc[dev200.index >= "2023-01-01"], "距200DMA", "#4da3ff", "left", True, 1000),
+                series_payload(dev200.loc[dev200.index >= "2023-01-01"], "距200日均线乖离", "#4da3ff", "left", True, 1000),
                 series_payload(rel_rsi30.loc[rel_rsi30.index >= "2023-01-01"], f"相对QQQ RSI{rel_signal['rsi_period']}", "#ffbf3c", "right", False, 1000),
             ],
-            f"当前乖离{fmt(dev_now,1,'%')}，相对RSI{fmt(rsi_now,1)}，两年区间{position}。左轴0与右轴50同高。",
+            f"当前距200日均线乖离 {fmt(dev_now,1,'%')}，相对QQQ 30日RSI {fmt(rsi_now,1)}，处于{position}。左轴0与右轴50对齐。",
             [0, 100],
             315,
             None,
             False,
-            [hline(0, "left", "200DMA", "zero"), hline(rel_signal["top_rsi"], "right", "", "hot"), hline(rel_signal["bottom_rsi"], "right", "", "cold")],
+            [hline(0, "left", "200日均线", "zero"), hline(rel_signal["top_rsi"], "right", "", "hot"), hline(rel_signal["bottom_rsi"], "right", "", "cold")],
             ALIGN_ZERO_TO_50,
         )
-        # 通道读数挂在该股自己那张图下面，不另开面板：读者看的是同一只票，翻两处只会对不上。
         panel = append_note(panel, trend_note(trend_stats.get(ticker)))
         panel = append_note(panel, trend_fit_note(trend_stats.get(ticker)))
         megacap_charts.append(panel)
-    mags_table = table(["股票", "相对QQQ RSI30", "距MA200", "两年区间", "信号"], mags_rows)
-    megacap_rule = (
-        f"六张图同一口径：顶部需相对RSI>{rel_signal['top_rsi']}、乖离进两年最高20%且≥{rel_signal['top_ma200_dev_pct']:+.0f}%；"
-        f"底部需相对RSI<{rel_signal['bottom_rsi']}、进最低20%且≤{rel_signal['bottom_ma200_dev_pct']:+.0f}%。"
+    mags_table = table(stocks_copy["us_mags_headers"], mags_rows)
+    megacap_rule = stocks_copy["us_mags_rule_tpl"].format(
+        top_rsi=rel_signal["top_rsi"],
+        top_ma=rel_signal["top_ma200_dev_pct"],
+        bot_rsi=rel_signal["bottom_rsi"],
+        bot_ma=rel_signal["bottom_ma200_dev_pct"],
     )
     megacap_charts_html = f'<p class="note rule">{html.escape(megacap_rule)}</p><div class="grid two">' + "".join(megacap_charts) + '</div>'
 
-    # ── TSM / INTC / BRKB：口径同上，但均线周期和基准各按自己的行业换过 ──
     extra_benchmarks = {"SOX": sox_series, "SPW": spw, "QQQ": qqq}
     extra_charts: list[str] = []
-    extra_signals: dict[str, dict[str, Any]] = {}  # 每日速览用：TSM 距 100DMA 那条提醒读这里
+    extra_signals: dict[str, dict[str, Any]] = {}
     for item in config.get("relative_extras", []):
-        name, ticker, ma = item["name"], item["ticker"], int(item.get("ma", 200))
+        raw_name, ticker, ma = item["name"], item["ticker"], int(item.get("ma", 200))
+        name = display_asset_name(raw_name)
         bench_key = item["benchmark"]
         bench = extra_benchmarks.get(bench_key, prices.get(bench_key, pd.Series(dtype=float)))
         price = prices.get(ticker, pd.Series(dtype=float))
         if price.empty or bench.empty:
-            extra_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">{html.escape(ticker)}或基准{html.escape(bench_key)}本次取不到行情，不用空图顶替。</p></article>')
+            extra_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">{html.escape(ticker)}或基准{html.escape(bench_key)}本次暂未取到行情。</p></article>')
             continue
         pair = pd.concat([price.rename("stock"), bench.rename("bench")], axis=1).dropna()
         if len(pair) < ma + 60:
-            extra_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">与基准重叠的交易日不足{ma + 60}天，算不出{ma}DMA乖离，本次不画图。</p></article>')
+            extra_charts.append(f'<article class="panel"><h3>{html.escape(name)}</h3><p class="empty">与基准重叠交易日不足{ma + 60}天，暂无法计算{ma}日均线乖离。</p></article>')
             continue
         dev = (pair["stock"] / pair["stock"].rolling(ma).mean() - 1) * 100
         rel = wilder_rsi(pair["stock"] / pair["bench"], rel_signal["rsi_period"])
         dev_plot = dev.loc[dev.index >= "2023-01-01"].dropna()
         rel_plot = rel.loc[rel.index >= "2023-01-01"].dropna()
-        extra_signals[name] = {
+        extra_signals[raw_name] = {
             "ticker": ticker, "ma": ma, "benchmark": bench_key,
             "dev": finite(dev_plot.iloc[-1]) if not dev_plot.empty else None,
             "rel_rsi": finite(rel_plot.iloc[-1]) if not rel_plot.empty else None,
             "as_of": iso_date(dev_plot.index.max()) if not dev_plot.empty else "",
         }
         extra_charts.append(chart(
-            f"{name}：{ma}DMA乖离 + 相对{bench_key} RSI{rel_signal['rsi_period']}",
+            f"{name}：{ma}日均线乖离与相对{bench_key}强弱",
             [
-                series_payload(dev_plot, f"距{ma}DMA", item["color"], "left", True, 1000),
+                series_payload(dev_plot, f"距{ma}日均线", item["color"], "left", True, 1000),
                 series_payload(rel_plot, f"相对{bench_key} RSI{rel_signal['rsi_period']}", "#ffbf3c", "right", False, 1000),
             ],
-            f"左轴距{ma}DMA，右轴相对{bench_key}的 Wilder RSI{rel_signal['rsi_period']}，左轴0与右轴50同高。"
-            f"当前乖离{fmt(finite(dev_plot.iloc[-1]) if not dev_plot.empty else None,1,'%')}，相对RSI{fmt(finite(rel_plot.iloc[-1]) if not rel_plot.empty else None,1)}。",
+            f"左轴为距{ma}日均线乖离，右轴为相对{bench_key}的 {rel_signal['rsi_period']} 日强弱（RSI），左轴0与右轴50对齐。"
+            f"当前乖离 {fmt(finite(dev_plot.iloc[-1]) if not dev_plot.empty else None,1,'%')}，相对RSI {fmt(finite(rel_plot.iloc[-1]) if not rel_plot.empty else None,1)}。",
             [0, 100],
             315,
             None,
             False,
-            [hline(0, "left", f"{ma}DMA", "zero"), hline(rel_signal["top_rsi"], "right", "", "hot"), hline(rel_signal["bottom_rsi"], "right", "", "cold")],
+            [hline(0, "left", f"{ma}日均线", "zero"), hline(rel_signal["top_rsi"], "right", "", "hot"), hline(rel_signal["bottom_rsi"], "right", "", "cold")],
             ALIGN_ZERO_TO_50,
         ))
-    extra_rule = "半导体两只对 SOX、BRKB 对标普等权：基准换成各自的同类池子，才读得出个股相对同行的强弱。TSM、INTC 用100DMA，波动快一档。"
+    extra_rule = stocks_copy["us_extras_rule"]
     extra_charts_html = (
         f'<p class="note rule">{html.escape(extra_rule)}</p><div class="grid two">' + "".join(extra_charts) + "</div>"
         if extra_charts else ""
@@ -2579,19 +2694,19 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
     us_style_charts = ""
     sox_rel_rsi = pd.Series(dtype=float)
     sox = sox_series
-    sox_label = "SOX" if "^SOX" in prices else "SOXX代理"
+    sox_label = "费城半导体指数（SOX）" if "^SOX" in prices else "半导体ETF（SOXX代理）"
     if not sox.empty and not qqq.empty:
         sox_pair = pd.concat([sox.rename("sox"), qqq.rename("qqq")], axis=1).dropna()
         sox_dev200 = (sox_pair["sox"] / sox_pair["sox"].rolling(200).mean() - 1) * 100
         sox_rel_rsi = wilder_rsi(sox_pair["sox"] / sox_pair["qqq"], rel_signal["rsi_period"])
-        us_style_charts += chart("SOX：200DMA乖离 + SOX/QQQ RSI30", [series_payload(sox_dev200.loc[sox_dev200.index >= "2023-01-01"], f"{sox_label}距200DMA", "#a377ff", "left", True, 1000), series_payload(sox_rel_rsi.loc[sox_rel_rsi.index >= "2023-01-01"], "SOX/QQQ RSI30", "#ffbf3c", "right", False, 1000)], f"左轴距200DMA，右轴相对QQQ的Wilder RSI30，左轴0与右轴50同高。半导体在200DMA上方比例{fmt(semi_breadth,1,'%')}。", [0, 100], 360, None, False, style_hlines, ALIGN_ZERO_TO_50)
+        us_style_charts += chart("费城半导体指数（SOX）：200日均线乖离与相对QQQ强弱", [series_payload(sox_dev200.loc[sox_dev200.index >= "2023-01-01"], f"{sox_label}距200日均线", "#a377ff", "left", True, 1000), series_payload(sox_rel_rsi.loc[sox_rel_rsi.index >= "2023-01-01"], "SOX/QQQ RSI30", "#ffbf3c", "right", False, 1000)], f"左轴为距200日均线乖离，右轴为相对QQQ的30日强弱（RSI30），左轴0与右轴50对齐。站上200日均线成分股比例 {fmt(semi_breadth,1,'%')}。", [0, 100], 360, None, False, style_hlines, ALIGN_ZERO_TO_50)
     xsw_rel_rsi = pd.Series(dtype=float)
     xsw = prices.get("XSW", pd.Series(dtype=float))
     if not xsw.empty and not qqq.empty:
         xsw_pair = pd.concat([xsw.rename("xsw"), qqq.rename("qqq")], axis=1).dropna()
         xsw_dev200 = (xsw_pair["xsw"] / xsw_pair["xsw"].rolling(200).mean() - 1) * 100
         xsw_rel_rsi = wilder_rsi(xsw_pair["xsw"] / xsw_pair["qqq"], rel_signal["rsi_period"])
-        us_style_charts += chart("XSW：200DMA乖离 + XSW/QQQ RSI30", [series_payload(xsw_dev200.loc[xsw_dev200.index >= "2023-01-01"], "XSW距200DMA", "#4dd2ff", "left", True, 1000), series_payload(xsw_rel_rsi.loc[xsw_rel_rsi.index >= "2023-01-01"], "XSW/QQQ RSI30", "#ffbf3c", "right", False, 1000)], "口径同SOX图，起点2023-01-01；XSW 是等权软件ETF。左轴0与右轴50同高。", [0, 100], 360, None, False, style_hlines, ALIGN_ZERO_TO_50)
+        us_style_charts += chart("软件板块等权（XSW）：200日均线乖离与相对QQQ强弱", [series_payload(xsw_dev200.loc[xsw_dev200.index >= "2023-01-01"], "XSW距200日均线", "#4dd2ff", "left", True, 1000), series_payload(xsw_rel_rsi.loc[xsw_rel_rsi.index >= "2023-01-01"], "XSW/QQQ RSI30", "#ffbf3c", "right", False, 1000)], "标普软件等权ETF相对纳指100强弱（自2023-01-01起），左轴0与右轴50对齐。", [0, 100], 360, None, False, style_hlines, ALIGN_ZERO_TO_50)
     basket_rel_rsi: dict[str, pd.Series] = {}
     for basket in config.get("equal_weight_baskets", []):
         members = list(basket["members"])
@@ -2603,14 +2718,14 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         dev200 = (pair["idx"] / pair["idx"].rolling(200).mean() - 1) * 100
         rel_rsi = wilder_rsi(pair["idx"] / pair["bench"], rel_signal["rsi_period"])
         basket_rel_rsi[basket["key"]] = rel_rsi
-        label, bench_name = basket["label"], basket["benchmark"]
+        label, bench_name = display_asset_name(basket["label"]), basket["benchmark"]
         note = (
-            f"口径同SOX图，起点2023-01-01。成分{len(members)}只（{'、'.join(members)}），日频等权、复权价。左轴0与右轴50同高。"
+            f"自2023-01-01起；由{len(members)}只成分股（{'、'.join(members)}）日频等权合成、复权价计算，左轴0与右轴50对齐。"
         )
         us_style_charts += chart(
-            f"{label}：200DMA乖离 + {label}/{bench_name} RSI30",
+            f"{label}：200日均线乖离与相对{bench_name}强弱",
             [
-                series_payload(dev200.loc[dev200.index >= "2023-01-01"], f"{label}距200DMA", basket["color"], "left", True, 1000),
+                series_payload(dev200.loc[dev200.index >= "2023-01-01"], f"{label}距200日均线", basket["color"], "left", True, 1000),
                 series_payload(rel_rsi.loc[rel_rsi.index >= "2023-01-01"], f"{label}/{bench_name} RSI30", "#ffbf3c", "right", False, 1000),
             ],
             note,
@@ -2627,13 +2742,14 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         splv_pair = pd.concat([splv.rename("splv"), spy.rename("spy")], axis=1).dropna()
         splv_dev200 = (splv_pair["splv"] / splv_pair["splv"].rolling(200).mean() - 1) * 100
         splv_rel_rsi = wilder_rsi(splv_pair["splv"] / splv_pair["spy"], rel_signal["rsi_period"])
-        us_style_charts += chart("SPLV：200DMA乖离 + SPLV/SPX RSI30", [series_payload(splv_dev200.loc[splv_dev200.index >= "2023-01-01"], "SPLV距200DMA", "#38d39f", "left", True, 1000), series_payload(splv_rel_rsi.loc[splv_rel_rsi.index >= "2023-01-01"], "SPLV/SPX RSI30", "#ffbf3c", "right", False, 1000)], "口径同SOX图，SPX 用 SPY 复权总回报代理。SPLV 跑赢=防御占优，方向与本页其他图相反，不进温度带。左轴0与右轴50同高。", [0, 100], 360, None, False, style_hlines, ALIGN_ZERO_TO_50)
+        us_style_charts += chart("低波动防御ETF（SPLV）：200日均线乖离与相对标普500强弱", [series_payload(splv_dev200.loc[splv_dev200.index >= "2023-01-01"], "SPLV距200日均线", "#38d39f", "left", True, 1000), series_payload(splv_rel_rsi.loc[splv_rel_rsi.index >= "2023-01-01"], "SPLV/SPX RSI30", "#ffbf3c", "right", False, 1000)], "标普500采用SPY总回报代理；SPLV跑赢代表防御风格占优（与顺周期指标方向相反，因此未纳入温度带）。", [0, 100], 360, None, False, style_hlines, ALIGN_ZERO_TO_50)
 
     sector_charts: list[str] = []
-    sector_signals: list[dict[str, Any]] = []  # 每日速览用：只在相对 RSI 越过 60/40 时才进卡片
+    sector_signals: list[dict[str, Any]] = []
     if not spy.empty:
         for item in config.get("sp_sector_etfs", []):
             ticker = item["ticker"]
+            sector_name = display_asset_name(item["name"])
             sector = prices.get(ticker, pd.Series(dtype=float))
             if sector.empty:
                 continue
@@ -2642,14 +2758,14 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
                 continue
             dev200 = (pair["sector"] / pair["sector"].rolling(200).mean() - 1) * 100
             rel_rsi = wilder_rsi(pair["sector"] / pair["spy"], rel_signal["rsi_period"])
-            sector_signals.append({"name": item["name"], "ticker": ticker, "rel_rsi": finite(rel_rsi.iloc[-1]), "dev200": finite(dev200.iloc[-1])})
+            sector_signals.append({"name": sector_name, "ticker": ticker, "rel_rsi": finite(rel_rsi.iloc[-1]), "dev200": finite(dev200.iloc[-1])})
             sector_charts.append(chart(
-                f"{item['name']}（{ticker}）：200DMA乖离 + {ticker}/SPX RSI30",
+                f"{sector_name}（{ticker}）：200日均线乖离与相对标普500强弱",
                 [
-                    series_payload(dev200.loc[dev200.index >= "2023-01-01"], f"{ticker}距200DMA", item["color"], "left", True, 1000),
+                    series_payload(dev200.loc[dev200.index >= "2023-01-01"], f"{ticker}距200日均线", item["color"], "left", True, 1000),
                     series_payload(rel_rsi.loc[rel_rsi.index >= "2023-01-01"], f"{ticker}/SPX RSI30", "#ffbf3c", "right", False, 1000),
                 ],
-                f"{item['name']}一级行业ETF；左轴距200DMA，右轴为相对SPX的Wilder RSI30，左轴0与右轴50同高。",
+                f"{sector_name}行业ETF；左轴为距200日均线乖离，右轴为相对标普500的30日强弱（RSI30），左轴0与右轴50对齐。",
                 [0, 100],
                 315,
                 None,
@@ -2659,48 +2775,55 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             ))
     if sector_charts:
         us_style_charts += (
-            '<h2>S&amp;P 一级行业ETF</h2>'
-            '<p class="note rule">覆盖11个GICS一级行业。SPX 用 SPY 复权总回报代理，行业ETF 同样用复权价；图面从 2023-01-01 起。</p>'
+            '<h2>标普500一级行业ETF强弱</h2>'
+            '<p class="note rule">覆盖美股11个一级行业（GICS分类），基准采用标普500全收益指数代理（SPY复权价），展示2023-01-01以来走势。</p>'
             '<div class="grid two">' + "".join(sector_charts) + "</div>"
         )
 
-    # 美股这边的非六大科技只有 AFRM，它已经改成只报趋势底那张面板，不再进 RSI/趋势门表。
     china_stock_rows: list[list[str]] = []
     for x in stocks:
         if x["ticker"] in config["mags"] or not x["ticker"].endswith((".SS", ".SZ")):
             continue
+        cname = display_asset_name(x["name"])
         if not x.get("available"):
-            china_stock_rows.append([html.escape(x["name"]), html.escape(x["ticker"]), "暂无", "暂无", "暂无", "暂无", "<span class=\"pill off\">数据不足</span>"])
+            china_stock_rows.append([html.escape(cname), html.escape(x["ticker"]), "暂无", "暂无", "暂无", "暂无", '<span class="pill bear">数据不足</span>'])
             continue
-        gate_html = '<span class="pill on">有效</span>' if x["gate"] else '<span class="pill off">关闭</span>'
-        china_stock_rows.append([html.escape(x["name"]), html.escape(x["ticker"]), fmt(x["rsi14"], 1), direction_fmt(x["ret20"], 1, "%"), direction_fmt(x["ret60"], 1, "%"), direction_fmt(x["ma200_dev"], 1, "%"), gate_html])
-    china_stock_table = table(["公司", "Ticker", "RSI14", "20日", "60日", "距MA200", "趋势门"], china_stock_rows)
+        gate_html = f'<span class="pill bull">{html.escape(stocks_copy["cn_trend_on"])}</span>' if x["gate"] else f'<span class="pill bear">{html.escape(stocks_copy["cn_trend_off"])}</span>'
+        china_stock_rows.append([html.escape(cname), html.escape(x["ticker"]), fmt(x["rsi14"], 1), direction_fmt(x["ret20"], 1, "%"), direction_fmt(x["ret60"], 1, "%"), direction_fmt(x["ma200_dev"], 1, "%"), gate_html])
+    china_stock_table = table(stocks_copy["cn_headers"], china_stock_rows)
 
-    bench_names = {"000300.SS": "沪深300", "QQQ": "QQQ", "SPY": "SPX"}
+    bench_names = {"000300.SS": "沪深300", "QQQ": "QQQ", "SPY": "标普500"}
     china_stock_charts: list[str] = []
     china_stock_warnings: list[str] = []
     for item in config["single_stocks"]:
         ticker = item["ticker"]
         if not ticker.endswith((".SS", ".SZ")):
             continue
+        sname = display_asset_name(item["name"])
         stock = prices.get(ticker, pd.Series(dtype=float)).dropna()
         benchmark = prices.get(item["benchmark"], pd.Series(dtype=float)).dropna()
         if len(stock) < 260:
-            china_stock_charts.append(f'<article class="panel"><h3>{html.escape(item["name"])}</h3><p class="empty">历史不足260个交易日，本次不画图。</p></article>')
+            china_stock_charts.append(f'<article class="panel"><h3>{html.escape(sname)}</h3><p class="empty">历史交易日不足260天，暂无法计算200日均线乖离。</p></article>')
             continue
         cn_dev200, cn_rel_rsi = china_stock_indicators(stock, benchmark, rel_signal["rsi_period"])
         if cn_rel_rsi.empty:
-            china_stock_warnings.append(f"{item['name']}相对RSI缺少连续基准历史")
+            china_stock_warnings.append(f"{sname}相对RSI缺少连续基准历史")
         if "000300.SH" in history["stale"]:
             china_stock_warnings.append("中国个股沪深300基准使用未刷新缓存")
         bench_label = bench_names.get(item["benchmark"], item["benchmark"])
+        note_text = (
+            f"当前距200日均线乖离 {fmt((cn_dev200.iloc[-1] if not cn_dev200.empty else None),1,'%')}（截至 {iso_date(cn_dev200.index.max()) if not cn_dev200.empty else '暂无'}）；"
+            f"相对{bench_label} 30日RSI {fmt((cn_rel_rsi.iloc[-1] if not cn_rel_rsi.empty else None),1)}（截至 {iso_date(cn_rel_rsi.index.max()) if not cn_rel_rsi.empty else '暂无'}）。"
+        )
+        if "000300.SH" in history["stale"]:
+            note_text += " " + format_stale_notice("沪深300基准历史", history.get("as_of") or "未知")
         china_stock_charts.append(chart(
-            f"{item['name']}：200DMA乖离 + 相对{bench_label} RSI{rel_signal['rsi_period']}",
+            f"{sname}：200日均线乖离与相对{bench_label}强弱",
             [
-                series_payload(cn_dev200.loc[cn_dev200.index >= "2023-01-01"], "距200DMA", "#4da3ff", "left", True, 1000, max_gap_days=14),
+                series_payload(cn_dev200.loc[cn_dev200.index >= "2023-01-01"], "距200日均线乖离", "#4da3ff", "left", True, 1000, max_gap_days=14),
                 series_payload(cn_rel_rsi.loc[cn_rel_rsi.index >= "2023-01-01"], f"相对{bench_label} RSI{rel_signal['rsi_period']}", "#ffbf3c", "right", False, 1000, max_gap_days=14),
             ],
-            f"乖离{fmt((cn_dev200.iloc[-1] if not cn_dev200.empty else None),1,'%')}（{iso_date(cn_dev200.index.max()) if not cn_dev200.empty else '暂无'}）；相对RSI{fmt((cn_rel_rsi.iloc[-1] if not cn_rel_rsi.empty else None),1)}（{iso_date(cn_rel_rsi.index.max()) if not cn_rel_rsi.empty else '暂无'}）。沪深300：挖财指数日线。",
+            note_text,
             [0, 100],
             330,
             None,
@@ -2711,25 +2834,28 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
 
     def leverage_card(x: dict[str, Any]) -> str:
         tone = "hot" if x["score"] >= 75 else "warm" if x["score"] >= 55 else "neutral" if x["score"] >= 35 else "cold"
-        return metric_card(x["name"], f"{x['score']}/100", f"{x['level']} · {x['state']}", tone, x["core"])
+        core_text = display_currency_unit(str(x.get("core", "")))
+        sub_text = f"{x['level']} · {x['state']}"
+        if x.get("name") == "日本" and "周频" not in core_text:
+            core_text = f"{core_text} · 周频更新（自然滞后数日）" if core_text else "周频更新（自然滞后数日）"
+        return metric_card(x["name"], f"{x['score']}/100", sub_text, tone, core_text)
 
-    # 中国A股 的杠杆卡归 A股市场页，不再留在日韩台页：它和两融是同一件事的两种读法，
-    # 放在一起才能对着看，散在两页只会让人两边翻。
+    asia_copy = UI_COPY["asia"]
     asia_by_name = {x["name"]: x for x in asia}
     asia_cards = "".join(leverage_card(x) for x in asia if x["name"] != "中国A股")
     if not asia_cards:
-        asia_cards = metric_card("日韩台", "暂无", "跨市场杠杆卡未找到", "muted")
+        asia_cards = metric_card(asia_copy["card_missing_title"], "暂无", asia_copy["card_missing_sub"], "muted")
     cn_leverage = asia_by_name.get("中国A股")
     cn_leverage_card = (
         '<section class="cards">' + leverage_card(cn_leverage) + '</section>'
         if cn_leverage else
-        '<section class="cards">' + metric_card("中国A股杠杆", "暂无", "cn-leverage 跨市场卡未找到", "muted") + '</section>'
+        '<section class="cards">' + metric_card("A股整体融资杠杆", "暂无", "中国A股杠杆综合分暂未生成", "muted") + '</section>'
     )
 
     valuation_rows = [[html.escape(k), fmt(v, 1, "x")] for k, v in seed["valuation_snapshot"]["forward_pe"].items()]
-    valuation_table = table(["指数/板块", "BF P/E"], valuation_rows)
+    valuation_table = table(["指数 / 板块", "远期一致预期市盈率（P/E）"], valuation_rows)
     consensus_rows = [[year, fmt(v["real_gdp_pct"], 2, "%"), fmt(v["cpi_pct"], 2, "%"), fmt(v["real_gdp_pct"] + v["cpi_pct"], 2, "%")] for year, v in seed["consensus"].items()]
-    consensus_table = table(["年度", "GDP共识", "CPI共识", "名义GDP"], consensus_rows)
+    consensus_table = table(["年度", "实际GDP增速共识", "CPI通胀共识", "名义GDP估算"], consensus_rows)
 
     gs_prime_store = update_gs_prime_store(WORKSPACE)
     gs_prime_signal = evaluate_gs_prime_signals(gs_prime_store, config)
@@ -2738,64 +2864,99 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         chart=chart, series_payload=series_payload, hline=hline, metric_card=metric_card, fmt=fmt,
     )
 
-    freshness = [
-        ["Bloomberg CSV", bbg.get("as_of", "未知"), "动态识别GSCBHMOM RSI周期"],
-        ["公开行情", iso_date(max((s.index.max() for s in prices.values() if not s.empty), default=None)), "Yahoo复权日线"],
-        ["高盛Prime仓位", f"杠杆 {gs_prime_store.get('leverage_as_of') or '未知'} / Mag7 {gs_prime_store.get('mag7_as_of') or '未知'}", f"周报自动提取美股L/S杠杆（{gs_prime_store.get('leverage_count', 0)}期）与Mag7敞口（{gs_prime_store.get('mag7_count', 0)}点）"],
-        ["A股两融", cn["as_of"], "沪深交易所聚合历史库"],
-        ["指数拥挤度", crowding.get("trade_date", "未知"), f"原版镜像 {crowding.get('index_count',0)}项"],
-        ["指数长历史", history["as_of"], f"A股与港股看板用；本次刷新{len(history['refreshed'])}个、退回缓存{len(history['stale'])}个、缺失{len(history['missing'])}个"],
-        ["GDP/CPI与估值", seed["source_as_of"], "用户附件快照；不自动冒充最新"],
-        ["趋势线复权OHLC", max((v["as_of"] for v in trend_stats.values()), default="未知"), f"AMZN通道与AFRM支撑线；线用config冻结参数不重拟合，本次读出{len(trend_stats)}条、缺{len(trend_missing)}条"],
-    ]
-
+    overview_copy = UI_COPY["overview"]
+    f_rows = overview_copy["freshness_rows"]
     flow_cfg = config.get("cn_fund_flow", {})
     flow_side_n = int(flow_cfg.get("side_n", FLOW_SIDE_N))
-    flow_snapshot = fetch_fund_flow(flow_side_n) if flow_cfg.get("enabled", True) else {"ok": False, "error": "配置里已关闭该面板", "asof": "", "date": "", "boards": [], "rank": {"top": [], "bottom": []}}
-    freshness.append(["A股盘中资金流", flow_snapshot.get("asof") or ("服务器被封，页面实时拉取" if flow_snapshot.get("blocked") else "未取到"), f"东方财富板块主力净流入；页面每{FLOW_REFRESH_MIN}分钟自刷新"])
+    flow_snapshot = fetch_fund_flow(flow_side_n) if flow_cfg.get("enabled", True) else {"ok": False, "error": "盘中资金流模块已暂停展示", "asof": "", "date": "", "boards": [], "rank": {"top": [], "bottom": []}}
     turnover_snapshot = fetch_market_turnover(config)
-    freshness.append([
-        "A股全市场量能",
-        turnover_snapshot.get("asof") or "未取到",
-        turnover_freshness_detail(turnover_snapshot),
-    ])
+    bbg_asof_val = (
+        us_bbg_asof_display
+        if us_bbg_asof_display == bbg_ah_asof_actual
+        else f"美股 {us_bbg_asof_display} / AH溢价 {bbg_ah_asof_actual or '未知'}"
+    )
+    public_asof_val = iso_date(max((s.index.max() for s in prices.values() if not s.empty), default=None))
+    trend_asof_val = max((v["as_of"] for v in trend_stats.values()), default="未知")
+    freshness = [
+        [
+            f_rows["bbg_label"],
+            bbg_asof_val,
+            f_rows["bbg_desc_stale"].format(as_of="、".join(bbg_stale_parts_all) or bbg_asof_val)
+            if bbg_stale_parts_all else f_rows["bbg_desc_ok"],
+        ],
+        [f_rows["public_label"], public_asof_val, f_rows["public_desc"]],
+        [
+            f_rows["gs_prime_label"],
+            f_rows["gs_prime_val_tpl"].format(
+                lev_as_of=gs_prime_store.get("leverage_as_of") or "未知",
+                mag7_as_of=gs_prime_store.get("mag7_as_of") or "未知",
+            ),
+            f_rows["gs_prime_desc"].format(
+                lev_count=gs_prime_store.get("leverage_count", 0),
+                mag7_count=gs_prime_store.get("mag7_count", 0),
+            ),
+        ],
+        [f_rows["cn_margin_label"], cn["as_of"], f_rows["cn_margin_desc"]],
+        [f_rows["cn_crowd_label"], crowding.get("trade_date", "未知"), f_rows["cn_crowd_desc"].format(count=crowding.get("index_count", 0))],
+        [
+            f_rows["index_hist_label"],
+            history["as_of"],
+            f_rows["index_hist_desc_stale"].format(
+                as_of=history["as_of"],
+                stale_count=len(history["stale"]),
+                missing_count=len(history["missing"]),
+            ) if (history["stale"] or history["missing"]) else f_rows["index_hist_desc_ok"].format(refreshed=len(history["refreshed"])),
+        ],
+        [f_rows["seed_label"], seed["source_as_of"], f_rows["seed_desc"].format(as_of=seed["source_as_of"])],
+        [
+            f_rows["trend_label"],
+            trend_asof_val,
+            f_rows["trend_desc_stale"].format(as_of=trend_asof_val) if trend_stale else f_rows["trend_desc_ok"].format(ok_count=len(trend_stats)),
+        ],
+        [
+            f_rows["flow_label"],
+            flow_snapshot.get("asof") or ("浏览器打开时实时拉取" if flow_snapshot.get("blocked") else "未更新"),
+            f_rows["flow_desc"].format(mins=FLOW_REFRESH_MIN),
+        ],
+        [
+            f_rows["turnover_label"],
+            turnover_snapshot.get("asof") or "未更新",
+            turnover_freshness_detail(turnover_snapshot),
+        ],
+    ]
 
     mags_pair = pd.concat([mags_index.rename("m"), qqq.rename("q")], axis=1).dropna() if not mags_index.empty and not qqq.empty else pd.DataFrame()
     mags_rel_rsi = wilder_rsi(mags_pair["m"] / mags_pair["q"], rel_signal["rsi_period"]) if not mags_pair.empty else pd.Series(dtype=float)
 
+    strip_hints = overview_copy["strip_hints"]
     us_items = [
-        strip_item("周期/防御", cyc_rsi14, hint="周期股/防御股相对指数 RSI14（GSPUCYDE）"),
-        strip_item("Momentum", mom, hint=f"GSCBHMOM RSI{mom_period or '?'}"),
-        strip_item("纳指/等权", ndx_spw_rsi, hint="NDX/SPW RSI14"),
-        strip_item("六大科技", mags_rel_rsi, hint="六股等权/QQQ RSI30"),
-        strip_item("半导体", sox_rel_rsi, hint="SOX/QQQ RSI30"),
-        strip_item("XSW", xsw_rel_rsi, hint="XSW/QQQ RSI30，等权软件ETF"),
-        strip_item("互联网", basket_rel_rsi.get("INTERNET", pd.Series(dtype=float)), hint="Internet等权/QQQ RSI30：NFLX、BKNG、ABNB、DASH"),
-        strip_item("Staples", basket_rel_rsi.get("STAPLES", pd.Series(dtype=float)), hint="Staples等权/QQQ RSI30：WMT、COST、TMUS、PEP、CMCSA"),
+        strip_item("周期/防御", cyc_rsi14, hint=strip_hints["cyc"]),
+        strip_item("高盛动量股（GSCBHMOM）", mom, hint=strip_hints["mom"].format(period=mom_period or "?")),
+        strip_item("纳指/等权", ndx_spw_rsi, hint=strip_hints["ndx_spw"]),
+        strip_item("六大科技", mags_rel_rsi, hint=strip_hints["mags"]),
+        strip_item("半导体", sox_rel_rsi, hint=strip_hints["sox"]),
+        strip_item("软件板块（XSW）", xsw_rel_rsi, hint=strip_hints["xsw"]),
+        strip_item("互联网", basket_rel_rsi.get("INTERNET", pd.Series(dtype=float)), hint=strip_hints["internet"]),
+        strip_item("必选消费", basket_rel_rsi.get("STAPLES", pd.Series(dtype=float)), hint=strip_hints["staples"]),
     ]
-    # 冷热 chip 分两类：先是落进冷区/热区的行，然后是本来就有绝对阈值的那几条专用监控。
-    # 专用监控的行不再重复出 zone chip，否则同一行会挂两个说法不一样的提示。
     us_alerts = zone_chips(us_items, skip={"周期/防御"})
     if top_framework.get("active"):
-        us_alerts.append(chip(top_framework["summary"], "hot"))
-    # 指数 put 保护提醒（用户 2026-09-04）：VVIX/VIX 过线的每一天都在美股温度带上挂 chip，和状态机分离。
+        us_alerts.append(chip(humanize_summary(top_framework["summary"]), "hot"))
     if (top_framework.get("put_hedge") or {}).get("on"):
-        us_alerts.append(chip(f"指数 put 保护提醒：VVIX/VIX {fmt(top_framework['metrics'].get('vvix_vix'),2)}", "hot"))
+        us_alerts.append(chip(f"指数看跌期权（Put）对冲提醒：VVIX/VIX {fmt(top_framework['metrics'].get('vvix_vix'),2)}", "hot"))
     if bottom_framework.get("active"):
-        us_alerts.append(chip(bottom_framework["summary"], "cold"))
+        us_alerts.append(chip(humanize_summary(bottom_framework["summary"]), "cold"))
     elif alert_projection_lead(bottom_framework):
-        us_alerts.append(chip(f"美股底部：{alert_projection_lead(bottom_framework)}", "cold"))
+        us_alerts.append(chip(f"美股底部：{humanize_summary(alert_projection_lead(bottom_framework))}", "cold"))
     if vol_inverted:
-        us_alerts.append(chip("QQQ 近月隐波倒挂", "hot"))
+        us_alerts.append(chip("纳指100近期隐含波动率高于远期（近月隐波倒挂）", "hot"))
     us_alerts += megacap_alerts
     for gp_chip in gs_prime_signal.get("chips", []):
         us_alerts.append(chip(gp_chip["text"], gp_chip["tone"]))
 
     crowd_by_code = {str(r.get("index_code")): r for r in crowd_rows}
 
-    # A股带：第一行是自带历史序列的两融，其余七行是供应商 0-100 拥挤度。顺序写死，
-    # 不按当日冷热重排——这七个是刻意选的观察名单，位置换来换去就没法逐日对照。
-    cn_a_items = [strip_item("两融余额", cn["frame"]["margin_rsi14"], hint="沪深两融余额 RSI14")]
+    cn_a_items = [strip_item("两融余额", cn["frame"]["margin_rsi14"], hint=strip_hints["cn_margin"])]
     for item in cn_a_cfg:
         row = crowd_by_code.get(item["code"]) or match_crowding(crowd_rows, item["name"])
         if not row:
@@ -2803,7 +2964,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         score = finite(row.get("crowding_percentile"))
         trail = [finite(p[2]) for p in (row.get("history_1y") or []) if finite(p[2]) is not None]
         cn_a_items.append(strip_point(
-            item["name"],
+            display_asset_name(item["name"]),
             score,
             trail=trail[-(STRIP_TRAIL + 1) :],
             raw=fmt(score, 1, "%"),
@@ -2812,36 +2973,32 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         ))
     cn_a_alerts = zone_chips(cn_a_items, skip={"两融余额"})
     if last_margin is not None and last_margin <= 30:
-        cn_a_alerts.append(chip(f"两融余额 RSI14={fmt(last_margin,1)} ≤ 30（超卖）", "cold"))
+        cn_a_alerts.append(chip(f"两融余额 RSI14={fmt(last_margin,1)} ≤ 30（低位偏冷）", "cold"))
     if last_margin is not None and last_margin >= 70:
-        cn_a_alerts.append(chip(f"两融余额 RSI14={fmt(last_margin,1)} ≥ 70（超买）", "hot"))
+        cn_a_alerts.append(chip(f"两融余额 RSI14={fmt(last_margin,1)} ≥ 70（高位偏热）", "hot"))
 
-    # 港股带：AH 溢价动能 + 四条「板块/离岸中国基准」的相对强弱，全部走稳健 z，同一把尺子。
-    cn_hk_items = [strip_item("AH溢价动能", ah_rsi, digits=2, hint="BBG HT006取负，右=溢价收窄")]
+    cn_hk_items = [strip_item("AH溢价动能", ah_rsi, digits=2, hint=strip_hints["ah_rsi"])]
     for item in hk_members:
         series = hk_rel_rsi.get(item["code"], pd.Series(dtype=float))
         if series.empty:
             continue
+        dname = display_asset_name(item["name"])
         cn_hk_items.append(strip_item(
-            item["name"],
+            dname,
             series,
-            hint=f"{item['name']}/{hk_bench_name} RSI{rel_signal['rsi_period']}（{item['code']}）",
+            hint=f"{dname}/{hk_bench_name} RSI{rel_signal['rsi_period']}（{item['code']}）",
         ))
     cn_hk_alerts = zone_chips(cn_hk_items, skip={"AH溢价动能"})
     if last_ah is not None and last_ah >= -36:
-        cn_hk_alerts.append(chip(f"AH溢价 RSI30={fmt(last_ah,1)} ≥ -36（超买）", "hot"))
+        cn_hk_alerts.append(chip(f"AH溢价 RSI30={fmt(last_ah,1)} ≥ -36（溢价收窄偏热）", "hot"))
     if last_ah is not None and last_ah <= -60:
-        cn_hk_alerts.append(chip(f"AH溢价 RSI30={fmt(last_ah,1)} ≤ -60（超卖）", "cold"))
+        cn_hk_alerts.append(chip(f"AH溢价 RSI30={fmt(last_ah,1)} ≤ -60（溢价扩大偏冷）", "cold"))
 
-    # 综合分的历史序列由 crossview 落盘，这里只读；有历史的行才画得出 1W/1M 位移。
     asia_comp_hist = asia_composite_history(WORKSPACE / "temp/asia-leverage-crossview/composite_history.csv")
 
     def asia_row(x: dict[str, Any]) -> dict[str, Any] | None:
         series = asia_comp_hist.get(ASIA_COMPOSITE_KEYS.get(x["name"], ""), pd.Series(dtype=float))
         trail = [round(float(v), 1) for v in series.iloc[-(STRIP_TRAIL + 1):]] if not series.empty else []
-        # 日本是周频，往回数 20 个观测就是 20 周，1M 标记会跑到五个月前。周频行改按日历日
-        # 回溯：第 k 格对应 k×28/20 天前的最后一个已发布值，这样 -6 格正好是 7 天前、
-        # -21 格正好是 28 天前，和另外两行的 1W/1M 含义一致。
         if not series.empty and x["name"] == "日本":
             picks = []
             for k in range(STRIP_TRAIL, -1, -1):
@@ -2850,35 +3007,47 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             trail = [v for v in picks if v is not None] if picks[0] is not None else []
         if trail:
             trail = trail[:-1] + [float(x["score"])]
+        freq_note = " · 周频更新" if x["name"] == "日本" else ""
         return strip_point(
             x["name"], x["score"], trail=trail, raw=f"{x['score']}/100",
             asof=iso_date(series.index.max()) if not series.empty else "",
-            scale="score", hint=f"{x['level']} · {x['state']}" + ("" if trail else " · 综合分历史未落盘，本行只有当前值"),
+            scale="score", hint=f"{x['level']} · {x['state']}{freq_note}" + ("" if trail else " · 暂无历史路径，仅展示最新读数"),
         )
 
     asia_items = [asia_row(x) for x in asia if x["name"] in {"日本", "韩国", "台湾"}]
     asia_alerts = zone_chips(asia_items)
     asia_trail_rows = sum(1 for x in asia_items if x and x.get("trail"))
 
+    strip_titles = overview_copy["strip_titles"]
+    strip_notes = overview_copy["strip_notes"]
     strips_html = (
-        # 四条带的脚注各一行口径；详细规则统一放在下方“口径与限制”面板，不在脚注里重复解释。
-        strip_panel("美股", [x for x in us_items if x], us_alerts, "○ 1个月前，● 1周前，⬤ 当前；原值和日期见悬停。行序固定。", fixed=True)
-        + strip_panel("A股", [x for x in cn_a_items if x], cn_a_alerts, "第一行两融余额是自身历史的标准化位置，分隔线下七行是 0—100 拥挤度，两把尺子不可互比。", fixed=True)
-        + strip_panel("港股", [x for x in cn_hk_items if x], cn_hk_alerts, f"同一把尺子：AH 溢价动能，以及四个板块相对{hk_bench_name}的 Wilder RSI{rel_signal['rsi_period']}。", fixed=True)
+        strip_panel(strip_titles["us"], [x for x in us_items if x], us_alerts, strip_notes["us"], fixed=True)
+        + strip_panel(strip_titles["cn_a"], [x for x in cn_a_items if x], cn_a_alerts, strip_notes["cn_a"], fixed=True)
+        + strip_panel(strip_titles["cn_hk"], [x for x in cn_hk_items if x], cn_hk_alerts, strip_notes["cn_hk"].format(bench_name=hk_bench_name), fixed=True)
         + strip_panel(
-            "日韩台", [x for x in asia_items if x], asia_alerts,
-            "各地杠杆监控的 0—100 综合分，高分=可出清杠杆多，不等于卖出信号。"
-            + (
-                f"{asia_trail_rows} 行带 1W/1M 位移，日本为周频。"
-                if asia_trail_rows else "综合分历史文件尚未生成，本次只显示当前值。"
-            ),
+            strip_titles["asia"], [x for x in asia_items if x], asia_alerts,
+            strip_notes["asia_with_trail"].format(trail_rows=asia_trail_rows)
+            if asia_trail_rows else strip_notes["asia_no_trail"],
         )
     )
 
+    method_bullets_html = "".join(f"<li>{html.escape(b)}</li>" for b in overview_copy["methodology_bullets"])
+    overview_stale_banners = "".join(x for x in [
+        bbg_overview_stale_banner,
+        (f'<p class="stale-banner">{html.escape(format_manual_snapshot_notice(seed["source_as_of"]))}（宏观一致预期与估值快照）</p>'),
+    ] if x)
     sections = {
-        "overview": '<div class="stack">' + strips_html + '<div class="grid two"><article class="panel"><h3>数据新鲜度</h3>' + table(["数据", "日期", "说明"], freshness) + '</article><article class="panel"><h3>口径与限制</h3><ul><li>点的位置只表示该指标相对自身历史的高低，不代表上涨概率。</li><li>同一市场里各行越分散，内部差异越大；越聚拢则越同向。</li><li>“稳健 z”行以过去1年中位数为 0，每格为 1 个 MAD 标准化单位，横轴覆盖 ±2.5，超出后钳到边界；1个月前和1周前取目标日前后各2天的中位数，当前点使用当日值。</li><li>分位和综合分只表示所处区域，点之间的距离不能和稳健 z 行相比。</li><li>冷端只表示相对自身历史偏低，不等于绝对超卖。原值、1年区间和日期见悬停。</li><li>标题下方的蓝色/黄色提示对应图上的冷区和热区：稳健 z 行和综合分行按 0—100 轴的 20 / 80 判定；上游拥挤度分位天然贴边，收紧到 ≥90 / ≤5 才提示。带自己绝对阈值的行（两融 RSI、AH 溢价 RSI、周期防御、个股顶底组合）走各自的阈值，不重复出提示。</li><li>个股信号要结合趋势门和相对强弱，不能用单一指标直接下结论。</li><li>缺失或过期数据会明确标记，不以前值冒充实时值。</li></ul></article></div></div>',
+        "overview": (
+            '<div class="stack">'
+            + overview_stale_banners
+            + strips_html
+            + f'<div class="grid two"><article class="panel"><h3>{html.escape(overview_copy["freshness_title"])}</h3>'
+            + table(overview_copy["freshness_headers"], freshness)
+            + f'</article><article class="panel"><h3>{html.escape(overview_copy["methodology_title"])}</h3><ul>{method_bullets_html}</ul></article></div></div>'
+        ),
         "us": (
             '<div class="stack">'
+            + bbg_us_stale_banner
             + bottom_monitor_html
             + top_monitor_html
             + state_monitor_section(
@@ -2886,8 +3055,8 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
                 gs_prime_html=gs_prime_html,
                 us_style_charts=us_style_charts, macro_html=macro_html,
                 consensus_table=consensus_table, valuation_table=valuation_table,
-                model_note=f'公式：1.219×名义GDP−0.8269+2.2775+3.8761；2018年采用税改项13.8633；锚点2019-06-28 SPX 2941.76。共识截至{seed["source_as_of"]}。',
-                valuation_note=f'截至{seed["source_as_of"]}；来自附件，不自动滚动。',
+                model_note=f'模型公式：1.219×名义GDP−0.8269+2.2775+3.8761（2018年税改项13.8633，锚点2019-06-28 标普500=2941.76）。{format_manual_snapshot_notice(seed["source_as_of"])}。',
+                valuation_note=format_manual_snapshot_notice(seed["source_as_of"]),
             )
             + '</div>'
         ),
@@ -2895,13 +3064,13 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             '<div class="stack">'
             + cn_leverage_card
             + cn_margin_chart
-            + '<h2>宽基动能：指数点位与自身 RSI</h2>'
+            + f'<h2>{html.escape(cn_copy["broad_title"])}</h2>'
             + f'<p class="note rule">{html.escape(cn_broad_rule)}</p>'
             + cn_broad_html
             + cn_featured_html
             + fund_flow_panel(flow_snapshot, flow_side_n)
             + turnover_panel(turnover_snapshot, config)
-            + '<h2>观察名单：拥挤度与指数走势</h2>'
+            + f'<h2>{html.escape(cn_copy["watchlist_title"])}</h2>'
             + f'<p class="note rule">{html.escape(cn_index_rule)}</p>'
             + cn_index_charts_html
             + crowd_board_html
@@ -2909,8 +3078,9 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         ),
         "cn_hk": (
             '<div class="stack">'
+            + bbg_ah_stale_banner
             + ah_charts
-            + '<h2>板块相对强弱</h2>'
+            + f'<h2>{html.escape(hk_copy["sector_title"])}</h2>'
             + f'<p class="note rule">{html.escape(hk_rule)}</p>'
             + hk_charts_html
             + '</div>'
@@ -2918,13 +3088,21 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         "asia": (
             '<div class="stack">'
             + '<section class="cards">' + asia_cards + '</section>'
-            + '<article class="panel"><h3>口径</h3><p>上方三张卡直接复用现有日、韩、台杠杆监控的存量拥挤度和去杠杆状态；高分表示可出清燃料多，不等于当日卖出信号。</p>'
-            + f'<p class="note">下方每国两张图：左轴该国杠杆指标（同卡片“核心指标”口径），右轴该国 MSCI 指数（本币），起点 {html.escape(asia_charts_start)}。</p></article>'
+            + f'<article class="panel"><h3>{html.escape(asia_copy["method_title"])}</h3><p>{html.escape(asia_copy["method_body"])}</p>'
+            + f'<p class="note">{html.escape(asia_copy["method_note_tpl"].format(start=asia_charts_start))}</p></article>'
             + asia_charts["html"]
             + '</div>'
         ),
-        "us_stocks": '<div class="stack"><article class="panel"><h3>六大科技股相对信号</h3><p class="note">完全沿用每日cron跟踪名单：AMZN、GOOGL、META、MSFT、AAPL、NVDA；不用MAGS ETF。</p>' + mags_table + '</article>' + megacap_charts_html + extra_charts_html + afrm_html + '</div>',
-        "china_stocks": '<div class="stack"><article class="panel"><h3>覆盖名单</h3><p class="note">只跟宁德时代与长江电力两只（刻意选择，不是数据缺失），基准沪深300。趋势门：Close&gt;MA200 且 MA200 高于20个交易日前。</p>' + china_stock_table + '</article>' + china_stock_charts_html + '</div>',
+        "us_stocks": (
+            f'<div class="stack"><article class="panel"><h3>{html.escape(stocks_copy["us_mags_title"])}</h3>'
+            f'<p class="note">{html.escape(stocks_copy["us_mags_note"])}</p>' + mags_table + '</article>'
+            + megacap_charts_html + extra_charts_html + afrm_html + '</div>'
+        ),
+        "china_stocks": (
+            f'<div class="stack"><article class="panel"><h3>{html.escape(stocks_copy["cn_title"])}</h3>'
+            f'<p class="note">{html.escape(stocks_copy["cn_note"])}</p>' + china_stock_table + '</article>'
+            + china_stock_charts_html + '</div>'
+        ),
     }
 
     # ── 每日速览的结构化读数 ──
@@ -2982,7 +3160,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         ndx_spw_hits.append(f"{cold}扩散 · 纳指/等权 RSI14 {fmt(last_ratio,1)}（线 {rsi_cold:.0f}），等权跑赢纳指过快，资金从大权重股往外扩")
 
     # 科技内部轮动直接读总览温度带那五行，热区/冷区边界与页面完全一致。
-    rotation_names = {"六大科技": "Mega tech", "半导体": "半导体", "XSW": "软件(XSW)", "互联网": "互联网", "Staples": "Staples"}
+    rotation_names = {"六大科技": "六大科技", "半导体": "半导体", "软件板块（XSW）": "软件(XSW)", "互联网": "互联网", "必选消费": "必选消费"}
     tech_rotation = [
         {"name": rotation_names[x["name"]], "z": x["z"], "state": tech_state(x["z"]), "raw": x["raw"], "as_of": x["asof"]}
         for x in us_items if x and x["name"] in rotation_names
@@ -3144,56 +3322,92 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         "warnings": [],
     }
 
-    generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    html_doc = render_html(sections, generated_at, freshness)
+    data_as_of_candidates = [
+        str(d)
+        for d in (
+            us_as_of,
+            bbg.get("us_as_of"),
+            bbg.get("ah_as_of"),
+            cn.get("as_of"),
+            crowding.get("trade_date"),
+            history.get("as_of"),
+            gs_prime_store.get("leverage_as_of"),
+            trend_asof_val,
+            flow_snapshot.get("date"),
+            turnover_snapshot.get("date"),
+        )
+        if d and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(d))
+    ]
+    data_as_of = max(data_as_of_candidates) if data_as_of_candidates else "未知"
+
+    now_local = datetime.now().astimezone()
+    generated_at = now_local.isoformat(timespec="seconds")
+    generated_display = now_local.strftime("%Y-%m-%d %H:%M:%S")
+    tz_label = now_local.tzname() or f"UTC{now_local.strftime('%z')}"
+    html_doc = render_html(sections, generated_display, freshness, tz_label=tz_label)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html_doc, encoding="utf-8")
+    panels_dir = output.parent / "panels"
+    split_panels_meta = write_split_panels(panels_dir, sections, data_as_of)
     overlong_notes = long_notes(html_doc)
-    warnings = [x for x in ["NDX/SPW使用RSP代理" if ratio_proxy else None, "FRED部分数据不可用" if any(v.empty for v in fred.values()) else None, f"A股盘中资金流快照缺失：{flow_snapshot.get('error','')}" if not flow_snapshot.get("ok") and not flow_snapshot.get("blocked") else None, f"指数长历史缺失：{'、'.join(history['missing'])}" if history["missing"] else None, f"日韩台图缺数据：{'、'.join(asia_charts['missing'])}" if asia_charts["missing"] else None, f"MSCI指数用缓存未刷新：{'、'.join(asia_charts['stale'])}" if asia_charts["stale"] else None, f"A股量能取数失败：{turnover_snapshot.get('error','')}" if not turnover_snapshot.get("ok") else None, "日韩台综合分历史未落盘，1W/1M位移缺失" if not asia_trail_rows else None, f"行情缺失标的：{'、'.join(price_missing)}" if price_missing else None, f"趋势线算不出：{'、'.join(trend_missing)}" if trend_missing else None, f"config缺趋势线冻结参数：{'、'.join(trend_unfrozen)}（跑 refit-trend 生成）" if trend_unfrozen else None, f"趋势线OHLC取数失败，退回缓存：{'、'.join(trend_stale)}" if trend_stale else None, ("Bloomberg CSV未更新" if not bbg.get("ok") else f"Bloomberg CSV落后{bbg_stale_days}天（{bbg.get('as_of')}），跑 scripts/bbg_remote_refresh.sh" if bbg_stale_days is not None and bbg_stale_days > BBG_STALE_DAYS else None), *[f"美股底部框架：{x}" for x in bottom_framework.get("warnings", [])], *[f"美股底部环境：{x}" for x in bottom_environment.get("warnings", [])], *[f"美股顶部框架：{x}" for x in top_framework.get("warnings", [])], f"图注超过{NOTE_MAX_CHARS}字：{'；'.join(overlong_notes)}" if overlong_notes else None] if x]
+    warnings = [x for x in ["NDX/SPW使用RSP代理" if ratio_proxy else None, "FRED部分数据不可用" if any(v.empty for v in fred.values()) else None, f"A股盘中资金流快照缺失：{flow_snapshot.get('error','')}" if not flow_snapshot.get("ok") and not flow_snapshot.get("blocked") else None, f"指数长历史缺失：{'、'.join(history['missing'])}" if history["missing"] else None, f"日韩台图缺数据：{'、'.join(asia_charts['missing'])}" if asia_charts["missing"] else None, f"MSCI指数用缓存未刷新：{'、'.join(asia_charts['stale'])}" if asia_charts["stale"] else None, f"A股量能取数失败：{turnover_snapshot.get('error','')}" if not turnover_snapshot.get("ok") else None, "日韩台综合分历史未落盘，1W/1M位移缺失" if not asia_trail_rows else None, f"行情缺失标的：{'、'.join(price_missing)}" if price_missing else None, f"趋势线算不出：{'、'.join(trend_missing)}" if trend_missing else None, f"缺少趋势线冻结参数：{'、'.join(trend_unfrozen)}" if trend_unfrozen else None, f"趋势线OHLC取数失败，退回缓存：{'、'.join(trend_stale)}" if trend_stale else None, ("彭博数据未更新" if not bbg.get("ok") else f"彭博数据落后{effective_bbg_stale_days}天（{'、'.join(bbg_stale_parts_all) or bbg_asof_val}）" if effective_bbg_stale_days is not None and effective_bbg_stale_days > BBG_STALE_DAYS else None), *[f"美股底部框架：{x}" for x in bottom_framework.get("warnings", [])], *[f"美股底部环境：{x}" for x in bottom_environment.get("warnings", [])], *[f"美股顶部框架：{x}" for x in top_framework.get("warnings", [])], f"图注超过{NOTE_MAX_CHARS}字：{'；'.join(overlong_notes)}" if overlong_notes else None] if x]
     warnings.extend(dict.fromkeys(china_stock_warnings))
     signals["warnings"] = list(warnings)
     # notices 只进构建日志和 --json 结果，不上卡片：已知、已定性、不需要每天处理的取数缺口。
     notices = [f"A股盘中资金流：{flow_snapshot.get('error','')}"] if flow_snapshot.get("blocked") else []
     # signals.json 和 HTML 一起落盘：飞书速览卡片只读这份 JSON，页面和卡片因此同源。
     (output.parent / SIGNALS_NAME).write_text(json.dumps(signals, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {"ok": True, "overlong_notes": overlong_notes, "output": str(output), "bytes": output.stat().st_size, "generated_at": generated_at, "price_series": len(prices), "price_missing": price_missing, "trend_lines": {k: {m: round(float(v[m]), 3) for m in ("slope", "bottom", "bottom_gap", "rise_6m", "rise_12m", "pierce_pct", "break_pct") if v.get(m) is not None} | ({"top": round(float(v["top"]), 3), "top_gap": round(float(v["top_gap"]), 3)} if "top" in v else {}) | {"fitted_on": v.get("fitted_on", ""), "anchor": v.get("anchor", "")} for k, v in trend_stats.items()}, "trend_missing": trend_missing, "trend_unfrozen": trend_unfrozen, "trend_stale": trend_stale, "bbg_as_of": bbg.get("as_of", ""), "bbg_stale_days": bbg_stale_days, "stock_rows": len(stocks), "crowding_rows": len(crowd_rows), "bbg_momentum_period": mom_period, "fund_flow_boards": len(flow_snapshot.get("boards", [])), "fund_flow_asof": flow_snapshot.get("asof", ""), "cn_a_charts": len(cn_index_charts) + len(cn_featured_charts), "cn_a_featured": len(cn_featured_charts), "cn_broad_charts": len(cn_broad_charts), "hk_charts": len(hk_charts), "asia_charts": asia_charts["charts"], "asia_trail_rows": asia_trail_rows, "turnover": {"ok": turnover_snapshot.get("ok", False), "asof": turnover_snapshot.get("asof", ""), "baseline_days": len(turnover_snapshot.get("days") or []), "today_points": len(turnover_snapshot.get("today") or [])}, "index_history": {"refreshed": len(history["refreshed"]), "stale": history["stale"], "missing": history["missing"], "as_of": history["as_of"]}, "signals": str(output.parent / SIGNALS_NAME), "notices": notices, "signal_hits": sum(len(v) for v in (signals["us_market"]["topbottom"]["hits"], signals["us_market"]["momentum"]["hits"], signals["us_market"]["ndx_spw"]["hits"], signals["us_market"]["sectors"]["hits"], signals["us_market"]["gs_prime"]["hits"], signals["us_stocks"]["megacap"]["hits"], signals["cn_a"]["hits"], signals["hk"]["hits"], signals["asia"]["hits"])), "warnings": warnings}
+    return {"ok": True, "overlong_notes": overlong_notes, "output": str(output), "bytes": output.stat().st_size, "panels_dir": str(panels_dir), "panels": split_panels_meta, "generated_at": generated_at, "price_series": len(prices), "price_missing": price_missing, "trend_lines": {k: {m: round(float(v[m]), 3) for m in ("slope", "bottom", "bottom_gap", "rise_6m", "rise_12m", "pierce_pct", "break_pct") if v.get(m) is not None} | ({"top": round(float(v["top"]), 3), "top_gap": round(float(v["top_gap"]), 3)} if "top" in v else {}) | {"fitted_on": v.get("fitted_on", ""), "anchor": v.get("anchor", "")} for k, v in trend_stats.items()}, "trend_missing": trend_missing, "trend_unfrozen": trend_unfrozen, "trend_stale": trend_stale, "bbg_as_of": bbg.get("as_of", ""), "bbg_stale_days": bbg_stale_days, "stock_rows": len(stocks), "crowding_rows": len(crowd_rows), "bbg_momentum_period": mom_period, "fund_flow_boards": len(flow_snapshot.get("boards", [])), "fund_flow_asof": flow_snapshot.get("asof", ""), "cn_a_charts": len(cn_index_charts) + len(cn_featured_charts), "cn_a_featured": len(cn_featured_charts), "cn_broad_charts": len(cn_broad_charts), "hk_charts": len(hk_charts), "asia_charts": asia_charts["charts"], "asia_trail_rows": asia_trail_rows, "turnover": {"ok": turnover_snapshot.get("ok", False), "asof": turnover_snapshot.get("asof", ""), "baseline_days": len(turnover_snapshot.get("days") or []), "today_points": len(turnover_snapshot.get("today") or [])}, "index_history": {"refreshed": len(history["refreshed"]), "stale": history["stale"], "missing": history["missing"], "as_of": history["as_of"]}, "signals": str(output.parent / SIGNALS_NAME), "notices": notices, "signal_hits": sum(len(v) for v in (signals["us_market"]["topbottom"]["hits"], signals["us_market"]["momentum"]["hits"], signals["us_market"]["ndx_spw"]["hits"], signals["us_market"]["sectors"]["hits"], signals["us_market"]["gs_prime"]["hits"], signals["us_stocks"]["megacap"]["hits"], signals["cn_a"]["hits"], signals["hk"]["hits"], signals["asia"]["hits"])), "warnings": warnings}
 
 
-def render_html(sections: dict[str, str], generated_at: str, freshness: list[list[str]]) -> str:
-    nav = [
-        ("overview", "总览"), ("us", "美股市场"), ("cn_a", "A股市场"), ("cn_hk", "港股市场"),
-        ("asia", "日韩台市场"), ("us_stocks", "美股个股"), ("china_stocks", "中国个股"),
-    ]
-    buttons = "".join(f'<button data-tab="{k}" class="tab-btn{" active" if i == 0 else ""}">{v}</button>' for i, (k, v) in enumerate(nav))
-    bodies = "".join(f'<main id="tab-{k}" class="tab-page{" active" if i == 0 else ""}"><div class="section-title"><h1>{v}</h1></div>{sections[k]}</main>' for i, (k, v) in enumerate(nav))
-    css = r"""
-:root{--bg:#07101f;--panel:#0f1b2d;--panel2:#13243b;--line:#253a57;--text:#edf4ff;--muted:#91a3bd;--blue:#4da3ff;--yellow:#ffbf3c;--green:#38d39f;--red:#ff6b6b;--purple:#a377ff;--orange:#ff9d3c;--cold:#4da3ff;--tepid:#aebdd2}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -10%,#17335d 0,transparent 35%),var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}.top{padding:28px 32px 12px;max-width:1600px;margin:auto}.top h1{margin:0;font-size:28px}.top p{color:var(--muted);margin:8px 0}.tabs{position:sticky;top:0;z-index:20;display:flex;gap:8px;padding:10px 32px;background:rgba(7,16,31,.92);backdrop-filter:blur(16px);border-bottom:1px solid var(--line);overflow:auto}.tab-btn{border:1px solid var(--line);background:#0c1728;color:var(--muted);padding:9px 15px;border-radius:10px;cursor:pointer;white-space:nowrap}.tab-btn.active{background:var(--blue);border-color:var(--blue);color:#04101f;font-weight:700}.tab-page{display:none;max-width:1600px;margin:auto;padding:20px 32px 60px}.tab-page.active{display:block}.section-title h1{font-size:22px;margin:0 0 16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:18px}.metric,.panel{background:linear-gradient(145deg,rgba(19,36,59,.96),rgba(12,25,43,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 32px rgba(0,0,0,.18)}.metric{padding:17px;border-top:3px solid var(--tepid)}.metric.hot{border-top-color:var(--orange)}.metric.warm{border-top-color:#ffc266}.metric.cold{border-top-color:var(--cold)}.metric.cool{border-top-color:#7fc0ff}.metric.neutral{border-top-color:var(--tepid)}.metric.muted{opacity:.7}.up{color:var(--green)}.down{color:var(--red)}.metric-title{font-size:13px;color:var(--muted)}.metric-value{font-size:30px;font-weight:750;margin:7px 0}.metric-sub{font-size:14px}.metric-meta{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.35}.panel{padding:18px;min-width:0}.panel h3{margin:0 0 12px;font-size:17px}.panel p,.panel li{color:#c5d2e5;line-height:1.55}.panel-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.legend{display:flex;flex-wrap:wrap;gap:12px;color:var(--muted);font-size:12px}.legend span{white-space:nowrap}.legend i{display:inline-block;width:18px;height:3px;margin-right:5px;vertical-align:middle;border-radius:3px}.chart{position:relative;width:100%;margin-top:8px}.chart canvas{width:100%;height:100%;display:block}.tooltip{display:none;position:absolute;pointer-events:none;background:#050b15e8;border:1px solid #405777;border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.45;box-shadow:0 8px 24px #0008;white-space:nowrap}.note{font-size:12px!important;color:var(--muted)!important;margin:8px 0 0}.note.rule{background:#101d31;border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin:0 0 4px}.strip{position:relative;width:100%;margin-top:6px}.strip canvas{width:100%;display:block}.shape{font-size:13px;color:#e4edfa;background:#16273f;border:1px solid var(--line);padding:5px 11px;border-radius:999px;white-space:nowrap}.alerts{font-size:12px;color:var(--muted);margin-top:2px}.alerts.on span{display:inline-block;border-radius:999px;padding:3px 10px;margin:4px 6px 0 0;font-size:12px;border:1px solid transparent}.alerts.on span.hot{background:#3a2a15;border-color:#8a5f24;color:#ffc98a}.alerts.on span.cold{background:#122a45;border-color:#2f5f8a;color:#9ccbff}.strip-panel .panel-head{align-items:center}.stack{display:grid;gap:18px}.grid{display:grid;gap:18px}.grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-weight:600;background:#0b1728;position:sticky;top:0}.flow{position:relative;width:100%;height:470px;margin-top:8px}.flow canvas{width:100%;height:100%;display:block}.flow-status{font-size:12px;color:var(--muted);background:#16273f;border:1px solid var(--line);padding:5px 11px;border-radius:999px;white-space:nowrap}.flow-status.live{color:#8fe3c4;border-color:#2f6b57}.flow-status.stale{color:#ffc98a;border-color:#8a5f24}.flow-rank{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:12px}.flow-rank h4{margin:0 0 6px;font-size:13px;color:var(--muted);font-weight:600}.flow-rank ol{margin:0;padding-left:20px;font-size:12.5px;color:#c5d2e5;line-height:1.75}.flow-rank b{font-variant-numeric:tabular-nums}.vol{position:relative;width:100%;height:330px;margin-top:8px}.vol canvas{width:100%;height:100%;display:block}.vol-stat{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:12px}.vol-stat div{background:#101d31;border:1px solid var(--line);border-radius:10px;padding:9px 11px}.vol-stat span{display:block;font-size:11px;color:var(--muted)}.vol-stat b{font-size:19px;font-variant-numeric:tabular-nums}@media(max-width:900px){.flow-rank{grid-template-columns:1fr}.flow{height:520px}.vol-stat{grid-template-columns:1fr}}.cb-stats{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:10px;margin:2px 0 12px}.cb-stat{background:#101d31;border:1px solid var(--line);border-radius:10px;padding:9px 11px}.cb-stat span{display:block;font-size:11px;color:var(--muted)}.cb-stat b{font-size:19px;font-variant-numeric:tabular-nums}.cb-controls{display:grid;grid-template-columns:minmax(180px,1.6fr) repeat(3,minmax(0,1fr)) auto;gap:10px;margin-bottom:10px;align-items:center}.cb-controls input[type=search],.cb-controls select{background:#0c1728;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:8px 11px;font-size:13px;font-family:inherit;width:100%}.cb-controls input[type=search]::placeholder{color:var(--muted)}.cb-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap;cursor:pointer}.cb-shell{max-height:620px;overflow:auto;border:1px solid var(--line);border-radius:12px}.cb-shell table{font-size:12.5px}.cb-shell td{vertical-align:middle}.cb-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}.cb-dot-price{background:var(--blue)}.cb-dot-crowd{background:var(--yellow);margin-left:8px}.cb-rank{color:var(--muted);font-variant-numeric:tabular-nums}.cb-name a{color:var(--text);text-decoration:none;border-bottom:1px solid transparent}.cb-name a:hover{border-bottom-color:var(--blue)}.cb-code{font-size:11px;color:var(--muted)}.cb-tag{background:#16273f;border:1px solid var(--line);color:var(--muted);padding:2px 8px;border-radius:999px;font-size:11px}.cb-score-top{display:flex;gap:8px;justify-content:flex-end;align-items:baseline}.cb-score{font-variant-numeric:tabular-nums;font-weight:650}.cb-level{font-size:11px;color:var(--muted)}.cb-bar{height:4px;border-radius:3px;background:#1a2b45;margin-top:5px;min-width:84px}.cb-bar i{display:block;height:100%;border-radius:3px}.cb-spark{cursor:crosshair;outline:none;width:174px;margin-left:auto}.cb-spark svg{display:block;width:174px;height:56px}.cb-spark:focus-visible svg{outline:1px solid var(--blue)}.cb-grid{stroke:#22354f;stroke-width:1}.cb-price{fill:none;stroke:var(--blue);stroke-width:1.4}.cb-crowd{fill:none;stroke:var(--yellow);stroke-width:1.4}.cb-price-dot{fill:var(--blue)}.cb-crowd-dot{fill:var(--yellow)}.cb-spark-meta{display:flex;gap:10px;justify-content:flex-end;font-size:10.5px;color:var(--muted);margin-top:2px}.cb-spark-empty{font-size:11px;color:var(--muted)}.cb-zoom{position:fixed;z-index:60;background:#050b15f2;border:1px solid #405777;border-radius:12px;padding:12px 14px;box-shadow:0 14px 36px #000a;pointer-events:none}.cb-zoom svg{width:420px;height:136px}.cb-zoom .cb-spark-meta{font-size:12px}.cb-zoom-title{display:flex;gap:12px;justify-content:space-between;font-size:13px;color:var(--text);margin-bottom:6px}.cb-zoom-title span{color:var(--muted);font-size:11px}.cb-zoom-note{font-size:11px;color:var(--muted);margin-top:6px}@media(max-width:1100px){.cb-stats{grid-template-columns:repeat(4,minmax(0,1fr))}.cb-controls{grid-template-columns:1fr 1fr}}.pill{padding:3px 8px;border-radius:999px;font-size:11px}.pill.on{background:#143e35;color:#67e1b7}.pill.off{background:#3c2430;color:#ff9bac}.empty{padding:30px;text-align:center;color:var(--muted)}footer{max-width:1600px;margin:auto;padding:0 32px 30px;color:var(--muted);font-size:11px}@media(max-width:900px){.grid.two{grid-template-columns:1fr}.top,.tabs,.tab-page{padding-left:16px;padding-right:16px}.panel-head{display:block}.legend{margin-bottom:8px}}
-"""
-    css += r"""
+def shared_panel_css() -> str:
+    """Shared CSS variables and component styles for both single-page and split panels."""
+    base = r"""
+:root{--bg:#07101f;--panel:#0f1b2d;--panel2:#13243b;--line:#253a57;--text:#edf4ff;--muted:#91a3bd;--blue:#4da3ff;--yellow:#ffbf3c;--dir-up:#ff6b6b;--dir-down:#38d39f;--dir-up-bg:rgba(255,107,107,.05);--dir-down-bg:rgba(56,211,159,.05);--temp-cold:#4da3ff;--temp-cool:#7fc0ff;--temp-neutral:#aebdd2;--temp-warm:#ffc266;--temp-hot:#ff9d3c;--green:var(--dir-down);--red:var(--dir-up);--purple:#a377ff;--orange:var(--temp-hot);--cold:var(--temp-cold);--tepid:var(--temp-neutral)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -10%,#17335d 0,transparent 35%),var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
+.top{padding:24px 32px 12px;max-width:1600px;margin:auto}.top h1{margin:0;font-size:26px}.top p{color:var(--muted);margin:8px 0}
+.color-legend{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;background:#0e1a2d;border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin:10px 0 4px;font-size:12px;color:#c5d2e5}
+.lg-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.lg-swatch{display:inline-block;width:10px;height:10px;border-radius:3px}
+.lg-up{background:var(--dir-up)}.lg-down{background:var(--dir-down)}.lg-cold{background:var(--temp-cold)}.lg-neutral{background:var(--temp-neutral)}.lg-hot{background:var(--temp-hot)}
+.lg-sep{color:var(--line)}.lg-note{color:var(--muted)}
+.stale-banner{background:#342214;border:1px solid #8a5f24;color:#ffd099;border-radius:10px;padding:9px 13px;font-size:12.5px;margin:0}
+.panel-nav{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 32px;background:rgba(7,16,31,.92);backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
+.panel-nav-link{border:1px solid var(--line);background:#0c1728;color:var(--muted);padding:7px 14px;border-radius:10px;font-size:13px;text-decoration:none;white-space:nowrap}
+.panel-nav-link:hover{border-color:var(--blue);color:var(--text)}
+.panel-nav-link.active{background:var(--blue);border-color:var(--blue);color:#04101f;font-weight:700}
+.panel-main{max-width:1600px;margin:auto;padding:20px 32px 60px}
+.split-group{margin-bottom:26px}.split-group-title{font-size:20px;margin:0 0 12px}
+.tabs{position:sticky;top:0;z-index:20;display:flex;gap:8px;padding:10px 32px;background:rgba(7,16,31,.92);backdrop-filter:blur(16px);border-bottom:1px solid var(--line);overflow:auto}.tab-btn{border:1px solid var(--line);background:#0c1728;color:var(--muted);padding:9px 15px;border-radius:10px;cursor:pointer;white-space:nowrap}.tab-btn.active{background:var(--blue);border-color:var(--blue);color:#04101f;font-weight:700}.tab-page{display:none;max-width:1600px;margin:auto;padding:20px 32px 60px}.tab-page.active{display:block}.section-title h1{font-size:22px;margin:0 0 16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:18px}.metric,.panel{background:linear-gradient(145deg,rgba(19,36,59,.96),rgba(12,25,43,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 32px rgba(0,0,0,.18)}.metric{padding:17px;border-top:3px solid var(--temp-neutral)}.metric.hot{border-top-color:var(--temp-hot)}.metric.warm{border-top-color:var(--temp-warm)}.metric.cold{border-top-color:var(--temp-cold)}.metric.cool{border-top-color:var(--temp-cool)}.metric.neutral{border-top-color:var(--temp-neutral)}.metric.muted{opacity:.7}.up{color:var(--dir-up)}.down{color:var(--dir-down)}.metric-title{font-size:13px;color:var(--muted)}.metric-value{font-size:30px;font-weight:750;margin:7px 0}.metric-sub{font-size:14px}.metric-meta{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.35}.panel{padding:18px;min-width:0}.panel h3{margin:0 0 12px;font-size:17px}.panel p,.panel li{color:#c5d2e5;line-height:1.55}.panel-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.legend{display:flex;flex-wrap:wrap;gap:12px;color:var(--muted);font-size:12px}.legend span{white-space:nowrap}.legend i{display:inline-block;width:18px;height:3px;margin-right:5px;vertical-align:middle;border-radius:3px}.chart{position:relative;width:100%;margin-top:8px}.chart canvas{width:100%;height:100%;display:block}.tooltip{display:none;position:absolute;pointer-events:none;background:#050b15e8;border:1px solid #405777;border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.45;box-shadow:0 8px 24px #0008;white-space:nowrap}.note{font-size:12px!important;color:var(--muted)!important;margin:8px 0 0}.note.rule{background:#101d31;border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin:0 0 4px}.strip{position:relative;width:100%;margin-top:6px}.strip canvas{width:100%;display:block}.shape{font-size:13px;color:#e4edfa;background:#16273f;border:1px solid var(--line);padding:5px 11px;border-radius:999px;white-space:nowrap}.alerts{font-size:12px;color:var(--muted);margin-top:2px}.alerts.on span{display:inline-block;border-radius:999px;padding:3px 10px;margin:4px 6px 0 0;font-size:12px;border:1px solid transparent}.alerts.on span.hot{background:#3a2a15;border-color:#8a5f24;color:#ffc98a}.alerts.on span.cold{background:#122a45;border-color:#2f5f8a;color:#9ccbff}.strip-panel .panel-head{align-items:center}.stack{display:grid;gap:18px}.grid{display:grid;gap:18px}.grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-weight:600;background:#0b1728;position:sticky;top:0}.flow{position:relative;width:100%;height:470px;margin-top:8px}.flow canvas{width:100%;height:100%;display:block}.flow-status{font-size:12px;color:var(--muted);background:#16273f;border:1px solid var(--line);padding:5px 11px;border-radius:999px;white-space:nowrap}.flow-status.live{color:#8fe3c4;border-color:#2f6b57}.flow-status.stale{color:#ffc98a;border-color:#8a5f24}.flow-rank{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:12px}.flow-rank h4{margin:0 0 6px;font-size:13px;color:var(--muted);font-weight:600}.flow-rank ol{margin:0;padding-left:20px;font-size:12.5px;color:#c5d2e5;line-height:1.75}.flow-rank b{font-variant-numeric:tabular-nums}.vol{position:relative;width:100%;height:330px;margin-top:8px}.vol canvas{width:100%;height:100%;display:block}.vol-stat{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:12px}.vol-stat div{background:#101d31;border:1px solid var(--line);border-radius:10px;padding:9px 11px}.vol-stat span{display:block;font-size:11px;color:var(--muted)}.vol-stat b{font-size:19px;font-variant-numeric:tabular-nums}@media(max-width:900px){.flow-rank{grid-template-columns:1fr}.flow{height:520px}.vol-stat{grid-template-columns:1fr}}.cb-stats{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:10px;margin:2px 0 12px}.cb-stat{background:#101d31;border:1px solid var(--line);border-radius:10px;padding:9px 11px}.cb-stat span{display:block;font-size:11px;color:var(--muted)}.cb-stat b{font-size:19px;font-variant-numeric:tabular-nums}.cb-controls{display:grid;grid-template-columns:minmax(180px,1.6fr) repeat(3,minmax(0,1fr)) auto;gap:10px;margin-bottom:10px;align-items:center}.cb-controls input[type=search],.cb-controls select{background:#0c1728;border:1px solid var(--line);color:var(--text);border-radius:10px;padding:8px 11px;font-size:13px;font-family:inherit;width:100%}.cb-controls input[type=search]::placeholder{color:var(--muted)}.cb-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap;cursor:pointer}.cb-shell{max-height:620px;overflow:auto;border:1px solid var(--line);border-radius:12px}.cb-shell table{font-size:12.5px}.cb-shell td{vertical-align:middle}.cb-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}.cb-dot-price{background:var(--blue)}.cb-dot-crowd{background:var(--yellow);margin-left:8px}.cb-rank{color:var(--muted);font-variant-numeric:tabular-nums}.cb-name a{color:var(--text);text-decoration:none;border-bottom:1px solid transparent}.cb-name a:hover{border-bottom-color:var(--blue)}.cb-code{font-size:11px;color:var(--muted)}.cb-tag{background:#16273f;border:1px solid var(--line);color:var(--muted);padding:2px 8px;border-radius:999px;font-size:11px}.cb-score-top{display:flex;gap:8px;justify-content:flex-end;align-items:baseline}.cb-score{font-variant-numeric:tabular-nums;font-weight:650}.cb-level{font-size:11px;color:var(--muted)}.cb-bar{height:4px;border-radius:3px;background:#1a2b45;margin-top:5px;min-width:84px}.cb-bar i{display:block;height:100%;border-radius:3px}.cb-spark{cursor:crosshair;outline:none;width:174px;margin-left:auto}.cb-spark svg{display:block;width:174px;height:56px}.cb-spark:focus-visible svg{outline:1px solid var(--blue)}.cb-grid{stroke:#22354f;stroke-width:1}.cb-price{fill:none;stroke:var(--blue);stroke-width:1.4}.cb-crowd{fill:none;stroke:var(--yellow);stroke-width:1.4}.cb-price-dot{fill:var(--blue)}.cb-crowd-dot{fill:var(--yellow)}.cb-spark-meta{display:flex;gap:10px;justify-content:flex-end;font-size:10.5px;color:var(--muted);margin-top:2px}.cb-spark-empty{font-size:11px;color:var(--muted)}.cb-zoom{position:fixed;z-index:60;background:#050b15f2;border:1px solid #405777;border-radius:12px;padding:12px 14px;box-shadow:0 14px 36px #000a;pointer-events:none}.cb-zoom svg{width:420px;height:136px}.cb-zoom .cb-spark-meta{font-size:12px}.cb-zoom-title{display:flex;gap:12px;justify-content:space-between;font-size:13px;color:var(--text);margin-bottom:6px}.cb-zoom-title span{color:var(--muted);font-size:11px}.cb-zoom-note{font-size:11px;color:var(--muted);margin-top:6px}@media(max-width:1100px){.cb-stats{grid-template-columns:repeat(4,minmax(0,1fr))}.cb-controls{grid-template-columns:1fr 1fr}}.pill{padding:3px 8px;border-radius:999px;font-size:11px}.pill.on{background:#143e35;color:#67e1b7}.pill.off{background:#3c2430;color:#ff9bac}.pill.bull{background:rgba(255,107,107,.16);color:#ff9aa0}.pill.bear{background:rgba(56,211,159,.14);color:#67e1b7}.empty{padding:30px;text-align:center;color:var(--muted)}footer{max-width:1600px;margin:auto;padding:0 32px 30px;color:var(--muted);font-size:11px}@media(max-width:900px){.grid.two{grid-template-columns:1fr}.top,.tabs,.tab-page,.panel-nav,.panel-main{padding-left:16px;padding-right:16px}.panel-head{display:block}.legend{margin-bottom:8px}}
 .top-link{display:inline-block;margin-top:7px;color:var(--blue);font-size:14px;font-weight:650;text-decoration:none}.top-link:hover{text-decoration:underline}
 """
-    css += MONITOR_CSS
-    js = r"""
+    return base + MONITOR_CSS
+
+
+def shared_panel_js() -> str:
+    """Shared client-side rendering JS used by both single-page tabs and split monitor panels."""
+    cn_copy = UI_COPY["cn"]
+    js_body = r"""
 const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const _cs=getComputedStyle(document.documentElement),cssVar=(n,d)=>(_cs.getPropertyValue(n)||'').trim()||d;
+const TEMP_COLD=cssVar('--temp-cold','#4da3ff'),TEMP_COOL=cssVar('--temp-cool','#7fc0ff'),TEMP_NEUTRAL=cssVar('--temp-neutral','#aebdd2'),TEMP_WARM=cssVar('--temp-warm','#ffc266'),TEMP_HOT=cssVar('--temp-hot','#ff9d3c');
 $$('.tab-btn').forEach(b=>b.addEventListener('click',()=>{$$('.tab-btn').forEach(x=>x.classList.remove('active'));$$('.tab-page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('#tab-'+b.dataset.tab).classList.add('active');setTimeout(()=>redraw($('#tab-'+b.dataset.tab)),20)}));
+if(location.protocol==='file:'){$$('.panel-nav a[data-local-href]').forEach(a=>a.addEventListener('click',e=>{e.preventDefault();location.href=a.dataset.localHref}))}
 function niceStep(span,n){const raw=(Math.abs(span)||1)/n,p=Math.pow(10,Math.floor(Math.log10(Math.abs(raw)||1))),u=raw/p,s=u<=1?1:u<=2?2:u<=2.5?2.5:u<=5?5:10;return s*p}
 function chartSegments(data,maxGapDays){const groups=[];data.forEach(p=>{const group=groups.at(-1);if(!group||(maxGapDays&&(+new Date(p[0])-+new Date(group.at(-1)[0]))>maxGapDays*864e5))groups.push([p]);else group.push(p)});return groups;}
 function drawChart(el){const cv=$('canvas',el),ctx=cv.getContext('2d'),d=JSON.parse(el.dataset.chart),D=devicePixelRatio||1,w=el.clientWidth,h=el.clientHeight;if(w<20)return;cv.width=w*D;cv.height=h*D;ctx.setTransform(D,0,0,D,0,0);ctx.clearRect(0,0,w,h);const pad={l:58,r:58,t:14,b:28},pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;const all=d.series.flatMap(s=>s.data.map(p=>({t:+new Date(p[0]),v:+p[1],a:s.axis})));if(!all.length)return;const xmin=Math.min(...all.map(p=>p.t)),xmax=Math.max(...all.map(p=>p.t)),hasRight=d.series.some(s=>s.axis==='right'),hl=d.hlines||[];
 function range(axis){const fixed=axis==='right'?d.rightDomain:d.leftDomain;if(fixed)return fixed.slice();const vals=all.filter(p=>p.a===axis).map(p=>p.v);hl.filter(l=>(l.axis||'left')===axis).forEach(l=>vals.push(l.value));if(!vals.length)return[0,1];const lo=Math.min(...vals),hi=Math.max(...vals),step=niceStep((hi-lo)||Math.abs(hi)||1,4);return[Math.floor(lo/step)*step,Math.ceil(hi/step)*step]}
-// Pin one left-axis value onto one right-axis value: keep the right domain untouched and
-// restretch the left one so the two anchors land on the same pixel row. Only the anchor is
-// aligned; the other gridlines stay whatever each axis needs.
 function alignLeft(L,R,a){const rs=(R[1]-R[0]);if(!rs)return L;const p=(R[1]-a.right)/rs;if(!(p>1e-6&&p<1-1e-6))return L;const k=p/(1-p);let top=Math.max(L[1]-a.left,0),bot=Math.max(a.left-L[0],0);if(top<=0&&bot<=0)return L;bot=Math.max(bot,top/k);const step=niceStep(bot*(1+k),4);const span=Math.max(Math.ceil(bot*(1+k)/step)*step,step);const nb=span/(1+k);return[a.left-nb,a.left+k*nb]}
 let L=range('left');const R=range('right');
 if(d.align&&hasRight&&!d.leftDomain&&!d.reverseLeft)L=alignLeft(L,R,d.align);const xp=t=>pad.l+(t-xmin)/(xmax-xmin||1)*pw,yp=(v,a)=>{const q=a==='right'?R:L;if(a==='left'&&d.reverseLeft)return pad.t+(v-q[0])/(q[1]-q[0]||1)*ph;return pad.t+(q[1]-v)/(q[1]-q[0]||1)*ph};const dec=r=>{const s=Math.abs(r[1]-r[0])/4;return s<1?2:s<10?1:0},dl=dec(L),dr=dec(R);ctx.lineWidth=1;ctx.font='11px -apple-system,sans-serif';
 for(let i=0;i<=4;i++){const y=pad.t+ph*i/4;ctx.strokeStyle='#1f3251';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();const lv=d.reverseLeft?L[0]+(L[1]-L[0])*i/4:L[1]-(L[1]-L[0])*i/4,rv=R[1]-(R[1]-R[0])*i/4;ctx.fillStyle='#8294ae';ctx.textAlign='right';ctx.fillText(lv.toFixed(dl),pad.l-7,y+4);if(hasRight){ctx.textAlign='left';ctx.fillText(rv.toFixed(dr),w-pad.r+7,y+4)}}
-hl.forEach(l=>{const a=l.axis||'left',q=a==='right'?R:L;if(l.value<Math.min(q[0],q[1])||l.value>Math.max(q[0],q[1]))return;const y=yp(l.value,a),c=l.tone==='hot'?'#ff9d3c':l.tone==='cold'?'#4da3ff':'#93a7c2';ctx.save();ctx.strokeStyle=c+'99';ctx.setLineDash(l.tone==='zero'?[2,3]:[6,4]);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.restore();if(l.label){ctx.font='10px -apple-system,sans-serif';ctx.fillStyle=c+'cc';ctx.textAlign='left';ctx.fillText(l.label,pad.l+5,y-4);ctx.font='11px -apple-system,sans-serif'}});
+hl.forEach(l=>{const a=l.axis||'left',q=a==='right'?R:L;if(l.value<Math.min(q[0],q[1])||l.value>Math.max(q[0],q[1]))return;const y=yp(l.value,a),c=l.tone==='hot'?TEMP_HOT:l.tone==='cold'?TEMP_COLD:'#93a7c2';ctx.save();ctx.strokeStyle=c+'99';ctx.setLineDash(l.tone==='zero'?[2,3]:[6,4]);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();ctx.restore();if(l.label){ctx.font='10px -apple-system,sans-serif';ctx.fillStyle=c+'cc';ctx.textAlign='left';ctx.fillText(l.label,pad.l+5,y-4);ctx.font='11px -apple-system,sans-serif'}});
 const spanDays=(xmax-xmin)/864e5;ctx.textAlign='center';ctx.fillStyle='#8294ae';for(let i=0;i<5;i++){const t=xmin+(xmax-xmin)*i/4,dt=new Date(t),y=dt.getFullYear(),m=String(dt.getMonth()+1).padStart(2,'0');ctx.fillText(spanDays>150?y+'/'+m:m+'/'+String(dt.getDate()).padStart(2,'0'),xp(t),h-8)}
 d.series.forEach(s=>{const groups=chartSegments(s.data,s.maxGapDays).map(group=>group.map(p=>[xp(+new Date(p[0])),yp(+p[1],s.axis)]));if(!groups.length)return;groups.forEach(pts=>{if(s.fill){const g=ctx.createLinearGradient(0,pad.t,0,pad.t+ph);g.addColorStop(0,s.color+'55');g.addColorStop(1,s.color+'05');ctx.fillStyle=g;ctx.beginPath();ctx.moveTo(pts[0][0],pad.t+ph);pts.forEach(p=>ctx.lineTo(...p));ctx.lineTo(pts.at(-1)[0],pad.t+ph);ctx.closePath();ctx.fill()}ctx.strokeStyle=s.color;ctx.lineWidth=1.8;ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.stroke()});const last=groups.at(-1).at(-1);ctx.fillStyle=s.color;ctx.beginPath();ctx.arc(last[0],last[1],3.2,0,6.284);ctx.fill()});el._chart={d,xmin,xmax,xp,yp,pad,pw,ph,w,h,ctx};}
 function hover(e){const el=e.currentTarget,c=el._chart;if(!c)return;const r=el.getBoundingClientRect(),rawX=e.clientX-r.left,t=Math.min(c.xmax,Math.max(c.xmin,c.xmin+(rawX-c.pad.l)/c.pw*(c.xmax-c.xmin)));const lines=[];let nearest=null;c.d.series.forEach(s=>{if(!s.data.length)return;let best=s.data.reduce((a,b)=>Math.abs(+new Date(b[0])-t)<Math.abs(+new Date(a[0])-t)?b:a);const bt=+new Date(best[0]);if(s.maxGapDays&&Math.abs(bt-t)>s.maxGapDays*864e5/2){lines.push(`<span style="color:${s.color}">●</span> ${s.name}: 暂无数据`);return}if(nearest==null||Math.abs(bt-t)<Math.abs(nearest-t))nearest=bt;lines.push(`<span style="color:${s.color}">●</span> ${s.name}: <b>${(+best[1]).toFixed(2)}</b>`)});const hx=c.pad.l+((nearest==null?t:nearest)-c.xmin)/(c.xmax-c.xmin||1)*c.pw;c.ctx.save();c.ctx.strokeStyle='#8ea5c4aa';c.ctx.setLineDash([4,4]);c.ctx.beginPath();c.ctx.moveTo(hx,c.pad.t);c.ctx.lineTo(hx,c.pad.t+c.ph);c.ctx.stroke();c.ctx.restore();const dt=new Date(nearest==null?t:nearest).toISOString().slice(0,10),tip=$('.tooltip',el);tip.innerHTML=`<b>${dt}</b><br>${lines.join('<br>')}`;tip.style.display='block';tip.style.left=Math.min(Math.max(hx+12,8),c.w-tip.offsetWidth-8)+'px';tip.style.top='20px';}
 function leave(e){$('.tooltip',e.currentTarget).style.display='none';drawChart(e.currentTarget)}
-function zoneColor(x){return x>=80?'#ff9d3c':x<=20?'#4da3ff':'#aebdd2'}
-const SCALE_ORDER={z:0,pct:1,score:2},SCALE_TAG={z:'稳健z · 每格1σ',pct:'上游拥挤度1年分位',score:'杠杆综合分 0–100'},Z_FULL=2.5;
+function zoneColor(x){return x>=80?TEMP_HOT:x<=20?TEMP_COLD:TEMP_NEUTRAL}
+const SCALE_ORDER={z:0,pct:1,score:2},SCALE_TAG={z:'相对历史偏离度',pct:'拥挤度1年分位',score:'杠杆综合分 0–100'},Z_FULL=2.5;
 function drawStrip(el){const cv=$('canvas',el),ctx=cv.getContext('2d'),d=JSON.parse(el.dataset.strip),D=devicePixelRatio||1,w=el.clientWidth;if(w<20)return;ctx.setTransform(1,0,0,1,0,0);ctx.font='12px -apple-system,"PingFang SC",sans-serif';
 const rk=s=>SCALE_ORDER[s]!==undefined?SCALE_ORDER[s]:9,items=d.items.slice().sort((a,b)=>d.fixed?rk(a.scale)-rk(b.scale):rk(a.scale)-rk(b.scale)||b.x-a.x);
 const hasZ=items.some(it=>it.scale==='z'),hasRaw=items.some(it=>it.scale!=='z'),mixed=new Set(items.map(it=>it.scale)).size>1;let g=0;items.forEach(it=>{g=Math.max(g,ctx.measureText(it.name).width)});
@@ -3205,7 +3419,7 @@ ctx.fillStyle='rgba(255,255,255,.026)';ctx.fillRect(X(20),top,X(80)-X(20),bot-to
 ctx.fillStyle='rgba(255,157,60,.13)';ctx.fillRect(X(80),top,X(100)-X(80),bot-top);
 ctx.save();ctx.setLineDash([3,4]);ctx.strokeStyle='#2c4265';[20,50,80].forEach(v=>{ctx.beginPath();ctx.moveTo(X(v),top);ctx.lineTo(X(v),bot);ctx.stroke()});ctx.restore();
 ctx.font='10px -apple-system,"PingFang SC",sans-serif';ctx.fillStyle='#6f84a1';ctx.textAlign='center';const yZone=hasZ?pad.t-31:pad.t-15;ctx.fillText('冷区',(X(0)+X(20))/2,yZone);ctx.fillText('中性',(X(20)+X(80))/2,yZone);ctx.fillText('热区',(X(80)+X(100))/2,yZone);
-if(hasZ){[[-2,'−2σ'],[-1,'−1σ'],[0,'0'],[1,'+1σ'],[2,'+2σ']].forEach(p=>ctx.fillText(p[1],X(50+50*p[0]/Z_FULL),pad.t-14))}
+if(hasZ){[[-2,'偏低2档'],[-1,'偏低1档'],[0,'均值'],[1,'偏高1档'],[2,'偏高2档']].forEach(p=>ctx.fillText(p[1],X(50+50*p[0]/Z_FULL),pad.t-14))}
 if(mixed&&items.length){ctx.textAlign='right';ctx.fillStyle='#8fa4c0';ctx.fillText(SCALE_TAG[items[0].scale]||'',pad.l-11,hasZ?pad.t-14:pad.t-15)}
 ctx.font='12px -apple-system,"PingFang SC",sans-serif';
 items.forEach((it,i)=>{const y=pad.t+i*rowH+rowH/2,c=zoneColor(it.x),xn=X(it.x);
@@ -3222,20 +3436,19 @@ ctx.font='11px -apple-system,"PingFang SC",sans-serif';ctx.fillStyle='#7f93ae';c
 el._strip={items,w,h,rowH,top:pad.t};}
 function stripHover(e){const el=e.currentTarget,st=el._strip,tip=$('.tooltip',el);if(!st)return;const r=el.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let hit=null;st.items.forEach(it=>{if(Math.abs(my-it._y)<=st.rowH/2)hit=it});if(!hit){tip.style.display='none';return}
 const s0=v=>(v>=0?'+':'')+v.toFixed(0),s2=v=>(v>=0?'+':'')+v.toFixed(2),rows=[];
-if(hit.scale==='z'){rows.push(`稳健z <b>${s2(hit.z)}σ</b>`+(hit.z1w!=null?` · 1W ${s2(hit.z1w)}σ`:'')+(hit.z1m!=null?` · 1M ${s2(hit.z1m)}σ`:''));if(hit.pct!=null)rows.push(`1年分位 ${hit.pct.toFixed(0)}`)}
-else{const d1w=hit.x1w!=null?hit.x-hit.x1w:null,d1m=hit.x1m!=null?hit.x-hit.x1m:null;rows.push((hit.scale==='score'?'综合分 <b>':'1年分位 <b>')+hit.x.toFixed(0)+'</b>'+(d1w!=null?` · 1W ${s0(d1w)}`:'')+(d1m!=null?` · 1M ${s0(d1m)}`:'')+(d1w==null&&d1m==null?' · 无历史路径':''))}
+if(hit.scale==='z'){rows.push(`相对历史偏离 <b>${s2(hit.z)}</b>`+(hit.z1w!=null?` · 1周前 ${s2(hit.z1w)}`:'')+(hit.z1m!=null?` · 1个月前 ${s2(hit.z1m)}`:''));if(hit.pct!=null)rows.push(`1年分位 ${hit.pct.toFixed(0)}`)}
+else{const d1w=hit.x1w!=null?hit.x-hit.x1w:null,d1m=hit.x1m!=null?hit.x-hit.x1m:null;rows.push((hit.scale==='score'?'综合分 <b>':'1年分位 <b>')+hit.x.toFixed(0)+'</b>'+(d1w!=null?` · 1周变化 ${s0(d1w)}`:'')+(d1m!=null?` · 1个月变化 ${s0(d1m)}`:'')+(d1w==null&&d1m==null?' · 暂无历史路径':''))}
 if(hit.raw)rows.push(`原值 ${hit.raw}`+(hit.range?`<br>1年原值区间 ${hit.range}`:''));
-if(hit.scale==='z')rows.push('<span style="color:#8fa4c0">当前=当日原值 · 1W/1M=该日前后共5日中位</span>');
+if(hit.scale==='z')rows.push('<span style="color:#8fa4c0">当前=最新交易日 · 1周前/1个月前=目标日前后5日中位</span>');
 if(hit.hint)rows.push(hit.hint);if(hit.asof)rows.push(hit.asof);
 tip.innerHTML=`<b>${hit.name}</b><br>`+rows.join('<br>');
 tip.style.display='block';tip.style.left=Math.min(Math.max(mx+14,8),st.w-tip.offsetWidth-8)+'px';tip.style.top=Math.max(hit._y-14,4)+'px';}
-/* ── A股盘中资金流向：浏览器用 JSONP 直连东方财富，交易时段内自行刷新 ── */
-const FLOW_UP='#38d39f',FLOW_DOWN='#ff6b6b',FLOW_SPAN=240;
+/* ── A股盘中资金流向：颜色读取 :root CSS 变量（红=净流入、绿=净流出，A股习惯） ── */
+const FLOW_UP=cssVar('--dir-up','#ff6b6b'),FLOW_DOWN=cssVar('--dir-down','#38d39f'),FLOW_UP_BG=cssVar('--dir-up-bg','rgba(255,107,107,.05)'),FLOW_DOWN_BG=cssVar('--dir-down-bg','rgba(56,211,159,.05)'),FLOW_SPAN=240;
 function jsonp(url,ms=15000){return new Promise((ok,bad)=>{const cb='ocjp'+Math.random().toString(36).slice(2)+Date.now().toString(36),s=document.createElement('script');let t;const done=(e,v)=>{clearTimeout(t);try{delete window[cb]}catch(_){window[cb]=void 0}s.remove();e?bad(e):ok(v)};window[cb]=v=>done(null,v);t=setTimeout(()=>done(new Error('请求超时')),ms);s.onerror=()=>done(new Error('网络请求失败'));s.src=url+(url.includes('?')?'&':'?')+'cb='+cb+'&_='+Date.now();document.head.appendChild(s)})}
 async function pooled(items,n,fn){const out=[];for(let i=0;i<items.length;i+=n)out.push(...await Promise.all(items.slice(i,i+n).map(fn)));return out}
 function cnClock(tz){const p=new Intl.DateTimeFormat('en-GB',{timeZone:tz,weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).formatToParts(new Date()),g=k=>(p.find(x=>x.type===k)||{}).value||'';return{wd:g('weekday'),hm:g('hour')+':'+g('minute')}}
 function cnOpen(cfg){const n=cnClock(cfg.tz);if(n.wd==='Sat'||n.wd==='Sun')return false;return cfg.sessions.some(s=>n.hm>=s[0]&&n.hm<=s[1])}
-/* 午休 11:30-13:00 不占横轴：上午 09:30-11:30 映射到 0-120，下午 13:00-15:00 接着走 120-240 */
 function flowMin(t){const p=String(t).split(':'),v=+p[0]*60+ +p[1];return v<=690?v-570:v-660}
 function drawFlow(el){const cv=$('canvas',el),ctx=cv.getContext('2d'),st=el._flow;if(!st)return;const snap=st.snapshot||{},boards=(snap.boards||[]).filter(b=>b.points&&b.points.length),D=devicePixelRatio||1,w=el.clientWidth,h=el.clientHeight;if(w<20)return;cv.width=w*D;cv.height=h*D;ctx.setTransform(D,0,0,D,0,0);ctx.clearRect(0,0,w,h);ctx.font='12px -apple-system,"PingFang SC",sans-serif';
 if(!boards.length){ctx.fillStyle='#91a3bd';ctx.textAlign='center';ctx.fillText(snap.error||'暂无盘中数据',w/2,h/2);el._flowHit=null;return}
@@ -3244,8 +3457,8 @@ const pad={l:56,r:Math.min(gut+24,236),t:14,b:30},pw=w-pad.l-pad.r,ph=h-pad.t-pa
 let lo=0,hi=0;boards.forEach(b=>b.points.forEach(p=>{lo=Math.min(lo,p[1]);hi=Math.max(hi,p[1])}));
 const step=niceStep((hi-lo)||1,5);lo=Math.floor(lo/step)*step;hi=Math.ceil(hi/step)*step;
 const X=m=>pad.l+Math.max(0,Math.min(FLOW_SPAN,m))/FLOW_SPAN*pw,Y=v=>pad.t+(hi-v)/((hi-lo)||1)*ph;
-ctx.fillStyle='rgba(56,211,159,.05)';ctx.fillRect(pad.l,pad.t,pw,Math.max(0,Y(0)-pad.t));
-ctx.fillStyle='rgba(255,107,107,.05)';ctx.fillRect(pad.l,Y(0),pw,Math.max(0,pad.t+ph-Y(0)));
+ctx.fillStyle=FLOW_UP_BG;ctx.fillRect(pad.l,pad.t,pw,Math.max(0,Y(0)-pad.t));
+ctx.fillStyle=FLOW_DOWN_BG;ctx.fillRect(pad.l,Y(0),pw,Math.max(0,pad.t+ph-Y(0)));
 ctx.font='11px -apple-system,sans-serif';ctx.textAlign='right';ctx.lineWidth=1;
 for(let v=lo;v<=hi+1e-9;v+=step){const y=Y(v);ctx.strokeStyle=Math.abs(v)<1e-9?'#3d5b83':'#1f3251';ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+pw,y);ctx.stroke();ctx.fillStyle='#8294ae';ctx.fillText(v.toFixed(step<1?1:0)+'亿',pad.l-7,y+4)}
 ctx.save();ctx.setLineDash([3,4]);ctx.strokeStyle='#2c4265';ctx.beginPath();ctx.moveTo(X(120),pad.t);ctx.lineTo(X(120),pad.t+ph);ctx.stroke();ctx.restore();
@@ -3266,16 +3479,16 @@ function flowRender(el){drawFlow(el);const st=el._flow,snap=st.snapshot||{},art=
 const list=rows=>'<ol>'+rows.map(r=>r.name+' <b>'+(r.net>=0?'+':'')+r.net.toFixed(2)+'</b>').map(x=>'<li>'+x+'</li>').join('')+'</ol>';
 box.innerHTML=(rk.top&&rk.top.length)?'<div><h4>主力净流入前10（亿元）</h4>'+list(rk.top)+'</div><div><h4>主力净流出前10（亿元）</h4>'+list(rk.bottom||[])+'</div>':'';
 const open=cnOpen(st.cfg),mins=Math.round(st.cfg.refreshMs/60000);
-if(st.err)sb.className='flow-status stale',sb.textContent='刷新失败：'+st.err+(snap.asof?'（仍显示 '+snap.asof+'）':'');
-else if(!snap.ok)sb.className='flow-status stale',sb.textContent='取数失败：'+(snap.error||'未知');
+if(st.err)sb.className='flow-status stale',sb.textContent='数据未更新（上次成功：'+(snap.asof||'未知')+'）';
+else if(!snap.ok)sb.className='flow-status stale',sb.textContent='数据未更新（上次成功：'+(snap.asof||'未知')+'）';
 else sb.className='flow-status'+(open?' live':''),sb.textContent='更新于 '+(snap.asof||'—')+(open?' · 交易中，每'+mins+'分钟刷新':' · 非交易时段，停在最新一笔');}
 async function flowFetch(el){const st=el._flow,cfg=st.cfg;if(st.busy)return;st.busy=true;
 try{const side=async u=>{const r=await jsonp(u);return (((r||{}).data||{}).diff||[]).filter(x=>x&&x.f12&&isFinite(+x.f62)).map(x=>({code:String(x.f12),name:String(x.f14||x.f12),net:+(+x.f62/1e8).toFixed(2)}))};
 const pair=await Promise.all([side(cfg.rankTop),side(cfg.rankBottom)]),tops=pair[0],bots=pair[1];
-if(!tops.length&&!bots.length)throw new Error('板块排名接口返回空列表');
+if(!tops.length&&!bots.length)throw new Error('板块排名返回空列表');
 const n=cfg.sideN,seen={},picks=tops.slice(0,n).concat(bots.slice(0,n)).filter(b=>seen[b.code]?false:(seen[b.code]=1));
 const got=await pooled(picks,4,async b=>{try{const k=await jsonp(cfg.kline+b.code),ln=(k&&k.data&&k.data.klines)||[],pts=[];let stamp='';ln.forEach(s=>{const p=String(s).split(',');if(p.length<2)return;const v=+p[1];if(!isFinite(v))return;stamp=p[0];pts.push([p[0].slice(-5),+(v/1e8).toFixed(3)])});return{code:b.code,name:b.name,net:b.net,points:pts,stamp:stamp}}catch(_){return{code:b.code,name:b.name,net:b.net,points:[],stamp:''}}});
-const boards=got.filter(b=>b.points.length);if(!boards.length)throw new Error('分钟资金流接口没有返回任何曲线');
+const boards=got.filter(b=>b.points.length);if(!boards.length)throw new Error('分钟资金流未返回有效曲线');
 st.snapshot={ok:true,error:'',asof:boards.map(b=>b.stamp).filter(Boolean).sort().pop()||'',boards:boards,rank:{top:tops.slice(0,10),bottom:bots.slice(0,10)}};st.err='';}
 catch(e){st.err=String((e&&e.message)||e)}
 st.busy=false;st.last=Date.now();flowRender(el)}
@@ -3283,7 +3496,7 @@ function flowInit(el){try{el._flow=JSON.parse(el.dataset.flow)}catch(_){return}e
 const tick=()=>{const st=el._flow;if(st.busy)return;if(!st.last||(cnOpen(st.cfg)&&Date.now()-st.last>=st.cfg.refreshMs))flowFetch(el)};
 tick();setInterval(tick,30000);
 el.addEventListener('mousemove',flowHover);el.addEventListener('mouseleave',()=>{$('.tooltip',el).style.display='none';drawFlow(el)});}
-/* ── A股全市场量能：历史基线由构建时写入，今日曲线交易时段内自行刷新 ── */
+/* ── A股全市场量能 ── */
 const VOL_TODAY='#4da3ff',VOL_PREV='#8294ae',VOL_MED='#ffbf3c';
 function volLines(el){const st=el._vol;if(!st)return[];const s=st.snapshot||{};return[
 {k:'med',name:((s.days||[]).length?'前'+s.days.length+'日同一时刻中位':'历史参考数据缺失'),color:VOL_MED,dash:[5,4],pts:s.median||[]},
@@ -3321,12 +3534,12 @@ box.innerHTML=last?'<div><span>当前累计成交额（'+last[0]+'）</span><b>'
 +'<div><span>'+((s.days||[]).length?'较前'+s.days.length+'日同一时刻中位':'历史参考数据缺失')+'</span><b class="'+cls(dm)+'">'+fx(dm)+'</b></div>'
 +'<div><span>较上一交易日同一时刻</span><b class="'+cls(dp)+'">'+fx(dp)+'</b></div>':'';
 const open=cnOpen(st.cfg),mins=Math.round(st.cfg.refreshMs/60000);
-if(!s.ok)sb.className='flow-status stale',sb.textContent='取数失败：'+(s.error||'未知');
-else if(st.err)sb.className='flow-status stale',sb.textContent='盘中刷新失败：'+st.err+'，显示构建时曲线（'+(s.asof||'—')+'）';
+if(!s.ok)sb.className='flow-status stale',sb.textContent='数据未更新（上次成功：'+(s.asof||'未知')+'）';
+else if(st.err)sb.className='flow-status stale',sb.textContent='数据未更新（上次成功：'+(s.asof||'未知')+'）';
 else sb.className='flow-status'+(open?' live':''),sb.textContent='更新于 '+(st.liveAsof||s.asof||'—')+(open?' · 交易中，每'+mins+'分钟刷新':' · 非交易时段，停在当日最后一笔');}
 async function volFetch(el){const st=el._vol,cfg=st.cfg;if(st.busy)return;st.busy=true;
 try{const parts=await Promise.all(cfg.secids.map(async id=>{const r=await jsonp(cfg.trend+id),tr=(((r||{}).data||{}).trends)||[];const out={};tr.forEach(s=>{const p=String(s).split(',');const v=+p[3];if(p.length>3&&isFinite(v))out[p[0].slice(11,16)]=v});return out}));
-if(!parts.length||!Object.keys(parts[0]).length)throw new Error('分钟线接口返回空');
+if(!parts.length||!Object.keys(parts[0]).length)throw new Error('分钟线返回空');
 const labels=Object.keys(parts[0]).sort();let run=0;const pts=[];
 labels.forEach(t=>{let v=0,ok=true;parts.forEach(p=>{if(p[t]===undefined)ok=false;else v+=p[t]});if(!ok)return;run+=v;pts.push([t,+(run/cfg.unit).toFixed(4)])});
 if(pts.length<2)throw new Error('可用分钟数不足');
@@ -3342,12 +3555,12 @@ function redraw(root){$$('.chart',root||document).forEach(drawChart);$$('.strip'
 $$('.chart').forEach(el=>{drawChart(el);el.addEventListener('mousemove',e=>{drawChart(el);hover(e)});el.addEventListener('mouseleave',leave)});
 $$('.strip').forEach(el=>{drawStrip(el);el.addEventListener('mousemove',stripHover);el.addEventListener('mouseleave',()=>{$('.tooltip',el).style.display='none'})});
 $$('.flow').forEach(flowInit);
-/* --- crowding board (China tab) --- */
+/* --- crowding board (China panel) --- */
 (()=>{const node=document.getElementById('cbData');if(!node)return;let DATA=[];try{DATA=JSON.parse(node.textContent)}catch(e){return}
 const esc=s=>String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const num=v=>(v===null||v===undefined||!isFinite(v))?null:Number(v);
 const pct=v=>num(v)===null?'--':Number(v).toFixed(2)+'%';
-const cbColor=v=>num(v)===null?'#7f93ae':v<15?'#38d39f':v<40?'#7fd6b4':v<60?'#ffbf3c':v<85?'#ff9d3c':'#ff6b6b';
+const cbColor=v=>num(v)===null?'#7f93ae':v<15?TEMP_COLD:v<40?TEMP_COOL:v<60?TEMP_NEUTRAL:v<85?TEMP_WARM:TEMP_HOT;
 const path=(vals,min,max,w,h,pad)=>{const span=(max-min)||1;return vals.map((v,i)=>{const x=pad+i*(w-2*pad)/Math.max(1,vals.length-1);const y=h-pad-(v-min)*(h-2*pad)/span;return (i?'L':'M')+x.toFixed(2)+','+y.toFixed(2)}).join(' ')};
 function svgFor(r,w,h){const pad=3,hp=r.hp||[],hc=r.hc||[];if(hp.length<2)return'';
 const lo=Math.min.apply(null,hp),hi=Math.max.apply(null,hp),grow=Math.max((hi-lo)*0.06,0.8),pMin=lo-grow,pMax=hi+grow;
@@ -3358,8 +3571,8 @@ return '<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="'+esc(r.index_name
 +'<path class="cb-price" d="'+path(hp,pMin,pMax,w,h,pad)+'"></path><path class="cb-crowd" d="'+path(hc,0,100,w,h,pad)+'"></path>'
 +'<circle class="cb-price-dot" cx="'+(w-pad)+'" cy="'+py.toFixed(2)+'" r="2.1"></circle>'
 +'<circle class="cb-crowd-dot" cx="'+(w-pad)+'" cy="'+cy.toFixed(2)+'" r="2.1"></circle></svg>'}
-function meta(r){const hp=r.hp||[],hc=r.hc||[];const ret=hp[hp.length-1]-100;return '<div class="cb-spark-meta"><span>价格 '+(ret>=0?'+':'')+ret.toFixed(1)+'%</span><span>拥挤 '+hc[hc.length-1].toFixed(1)+'</span></div>'}
-function spark(r){if((r.hp||[]).length<2)return '<div class="cb-spark-empty">暂无一年历史</div>';
+function meta(r){const hp=r.hp||[],hc=r.hc||[];const ret=hp[hp.length-1]-100;return '<div class="cb-spark-meta"><span>'+esc(__CB_SPARK_PRICE__)+(ret>=0?'+':'')+ret.toFixed(1)+'%</span><span>'+esc(__CB_SPARK_CROWD__)+hc[hc.length-1].toFixed(1)+'</span></div>'}
+function spark(r){if((r.hp||[]).length<2)return '<div class="cb-spark-empty">'+esc(__CB_SPARK_EMPTY__)+'</div>';
 return '<div class="cb-spark" tabindex="0" data-code="'+esc(r.index_code)+'">'+svgFor(r,174,56)+meta(r)+'</div>'}
 const el=id=>document.getElementById(id),body=el('cbRows'),empty=el('cbEmpty'),zoom=el('cbZoom');
 const byCode={};DATA.forEach(r=>{byCode[r.index_code]=r});
@@ -3382,7 +3595,7 @@ return '<tr><td class="cb-rank">'+(rank??'--')+'</td>'
 empty.hidden=rows.length>0}
 function place(x,y){const m=12,w=zoom.offsetWidth,h=zoom.offsetHeight;let left=x+18,top=y-h/2;if(left+w+m>innerWidth)left=x-w-18;zoom.style.left=Math.max(m,left)+'px';zoom.style.top=Math.max(m,Math.min(innerHeight-h-m,top))+'px'}
 function show(s,x,y){const r=byCode[s.dataset.code];if(!r)return;
-zoom.innerHTML='<div class="cb-zoom-title">'+esc(r.index_name)+'<span>'+esc(r.hs)+' → '+esc(r.he)+'</span></div>'+svgFor(r,420,136)+meta(r)+'<div class="cb-zoom-note"><i class="cb-dot cb-dot-price"></i>蓝线：价格，窗口起点=100、独立纵轴　<i class="cb-dot cb-dot-crowd"></i>橙线：拥挤度0–100、独立纵轴</div>';
+zoom.innerHTML='<div class="cb-zoom-title">'+esc(r.index_name)+'<span>'+esc(r.hs)+' → '+esc(r.he)+'</span></div>'+svgFor(r,420,136)+meta(r)+'<div class="cb-zoom-note"><i class="cb-dot cb-dot-price"></i>'+esc(__CB_ZOOM_PRICE__)+'　<i class="cb-dot cb-dot-crowd"></i>'+esc(__CB_ZOOM_CROWD__)+'</div>';
 zoom.hidden=false;place(x,y)}
 body.addEventListener('pointerover',e=>{const s=e.target.closest('.cb-spark');if(s&&!s.contains(e.relatedTarget))show(s,e.clientX,e.clientY)});
 body.addEventListener('pointermove',e=>{if(!zoom.hidden)place(e.clientX,e.clientY)});
@@ -3393,7 +3606,132 @@ body.addEventListener('focusout',e=>{if(e.target.closest('.cb-spark'))zoom.hidde
 render();})();
 addEventListener('resize',()=>redraw());
 """
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>市场情绪追踪看板</title><style>{css}</style></head><body><header class="top"><h1>市场情绪追踪看板</h1><a class="top-link" href="https://eve.lumos.space/kweb.html">Richard 相对看板 →</a><p>每行是一个指标，依次标出1个月前、1周前和当前的位置。同行的点距表示变化幅度；同一市场的行越分散，内部差异越大。</p></header><nav class="tabs">{buttons}</nav>{bodies}<footer>生成时间 {html.escape(generated_at)}｜单文件离线 HTML｜RSI 和拥挤度只描述状态，不代表上涨概率</footer><script>{js}</script></body></html>'''
+    for token, key in (
+        ("__CB_SPARK_PRICE__", "crowd_spark_price_label"),
+        ("__CB_SPARK_CROWD__", "crowd_spark_crowd_label"),
+        ("__CB_SPARK_EMPTY__", "crowd_spark_empty"),
+        ("__CB_ZOOM_PRICE__", "crowd_zoom_price_legend"),
+        ("__CB_ZOOM_CROWD__", "crowd_zoom_crowd_legend"),
+    ):
+        js_body = js_body.replace(token, json.dumps(cn_copy[key], ensure_ascii=False))
+    return js_body
+
+
+def render_color_legend() -> str:
+    """Render unified A-share direction + independent temperature color legend from UI_COPY."""
+    site = UI_COPY["site"]
+    dir_items = "".join(
+        f'<span class="lg-item"><i class="lg-swatch {html.escape(cls)}"></i>{html.escape(label)}</span>'
+        for cls, label in site["color_legend_dir"]
+    )
+    temp_items = "".join(
+        f'<span class="lg-item"><i class="lg-swatch {html.escape(cls)}"></i>{html.escape(label)}</span>'
+        for cls, label in site["color_legend_temp"]
+    )
+    return (
+        f'<div class="color-legend" aria-label="{html.escape(site["color_legend_aria"])}">'
+        f'{dir_items}'
+        '<span class="lg-sep">|</span>'
+        f'{temp_items}'
+        f'<span class="lg-note">{html.escape(site["color_legend_note"])}</span>'
+        '</div>'
+    )
+
+
+def render_panel_nav(active_slug: str) -> str:
+    """Render top cross-panel navigation bar linking to /monitors/<slug>."""
+    links = []
+    for p in UI_COPY["panels"]:
+        slug = p["slug"]
+        cls = "panel-nav-link active" if slug == active_slug else "panel-nav-link"
+        links.append(
+            f'<a class="{cls}" href="/monitors/{html.escape(slug)}" data-local-href="../{html.escape(slug)}/index.html">{html.escape(p["nav"])}</a>'
+        )
+    return f'<nav class="panel-nav" aria-label="{html.escape(UI_COPY["site"]["nav_label"])}">' + "".join(links) + "</nav>"
+
+
+def render_panel_html(
+    panel_meta: dict[str, Any],
+    body_html: str,
+    data_as_of: str,
+) -> str:
+    """Render a standalone HTML page for one of the 6 monitor panels referencing ../_shared/."""
+    site = UI_COPY["site"]
+    slug = panel_meta["slug"]
+    title = f'{panel_meta["title"]} - {site["title"]}'
+    footer_text = site["panel_footer_template"].format(data_as_of=data_as_of)
+    nav_html = render_panel_nav(slug)
+    legend_html = render_color_legend()
+    return (
+        f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<title>{html.escape(title)}</title>'
+        f'<link rel="stylesheet" href="../_shared/panel.css">'
+        f'</head><body>'
+        f'{nav_html}'
+        f'<header class="top"><h1>{html.escape(panel_meta["title"])}</h1>'
+        f'<a class="top-link" href="{html.escape(site["top_link_href"])}">{html.escape(site["top_link_label"])}</a>'
+        f'<p>{html.escape(panel_meta["subtitle"])}</p>'
+        f'{legend_html}</header>'
+        f'<main class="panel-main">{body_html}</main>'
+        f'<footer>{html.escape(footer_text)}</footer>'
+        f'<script src="../_shared/panel.js"></script>'
+        f'</body></html>'
+    )
+
+
+def write_split_panels(
+    panels_root: Path,
+    sections: dict[str, str],
+    data_as_of: str,
+) -> list[dict[str, Any]]:
+    """Write panels/_shared/{panel.css,panel.js} and panels/<slug>/index.html for all 6 panels."""
+    shared_dir = panels_root / "_shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (shared_dir / "panel.css").write_text(shared_panel_css(), encoding="utf-8")
+    (shared_dir / "panel.js").write_text(shared_panel_js(), encoding="utf-8")
+
+    stocks_copy = UI_COPY["stocks"]
+    results: list[dict[str, Any]] = []
+    for panel_meta in UI_COPY["panels"]:
+        slug = panel_meta["slug"]
+        tab_key = panel_meta["tab_key"]
+        if tab_key == "stocks":
+            body_html = (
+                f'<section class="split-group"><h2 class="split-group-title">{html.escape(stocks_copy["split_us_heading"])}</h2>{sections["us_stocks"]}</section>'
+                f'<section class="split-group"><h2 class="split-group-title">{html.escape(stocks_copy["split_cn_heading"])}</h2>{sections["china_stocks"]}</section>'
+            )
+        else:
+            body_html = sections[tab_key]
+        out_path = panels_root / slug / "index.html"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        doc = render_panel_html(panel_meta, body_html, data_as_of)
+        out_path.write_text(doc, encoding="utf-8")
+        results.append({
+            "slug": slug,
+            "title": panel_meta["title"],
+            "category": panel_meta["category"],
+            "output": str(out_path),
+            "bytes": out_path.stat().st_size,
+        })
+    return results
+
+
+def render_html(
+    sections: dict[str, str],
+    generated_at: str,
+    freshness: list[list[str]],
+    tz_label: str = "UTC+08:00",
+) -> str:
+    site = UI_COPY["site"]
+    nav = UI_COPY["single_tabs"]
+    buttons = "".join(f'<button data-tab="{k}" class="tab-btn{" active" if i == 0 else ""}">{html.escape(v)}</button>' for i, (k, v) in enumerate(nav))
+    bodies = "".join(f'<main id="tab-{k}" class="tab-page{" active" if i == 0 else ""}"><div class="section-title"><h1>{html.escape(v)}</h1></div>{sections[k]}</main>' for i, (k, v) in enumerate(nav))
+    css = shared_panel_css()
+    js = shared_panel_js()
+    legend_html = render_color_legend()
+    footer_text = site["footer_template"].format(generated_at=generated_at, tz_label=tz_label)
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(site["title"])}</title><style>{css}</style></head><body><header class="top"><h1>{html.escape(site["title"])}</h1><a class="top-link" href="{html.escape(site["top_link_href"])}">{html.escape(site["top_link_label"])}</a><p>{html.escape(site["subtitle"])}</p>{legend_html}</header><nav class="tabs">{buttons}</nav>{bodies}<footer>{html.escape(footer_text)}</footer><script>{js}</script></body></html>'''
 
 
 def refit_trend(tickers: list[str], write: bool) -> dict[str, Any]:

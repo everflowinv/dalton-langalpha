@@ -174,6 +174,16 @@ async def get_monitor_by_data_job(job_key: str) -> MonitorRecord | None:
             return _row_to_record(await cur.fetchone())
 
 
+async def list_monitors_by_data_job(job_key: str) -> list[MonitorRecord]:
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"{_MONITOR_SELECT} WHERE m.source_kind = 'data_job' AND m.source_ref = %s ORDER BY m.sort_order, m.slug",
+                (job_key,),
+            )
+            return [r for row in await cur.fetchall() if (r := _row_to_record(row))]
+
+
 async def list_all_monitors() -> list[MonitorRecord]:
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
