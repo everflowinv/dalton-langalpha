@@ -52,7 +52,8 @@ def unavailable_page(status_code: int, *, chinese: bool) -> str:
             if status_code == 403
             else "该链接可能已被创建者关闭，或报告已不存在。"
         )
-        link_text = "前往 LangAlpha"
+        # DALTON-HOOK(brand-name): Dalton serves these pages as Everflow.
+        link_text = "前往 Everflow"
     else:
         lang = "en"
         heading = "This shared report isn’t available"
@@ -61,7 +62,7 @@ def unavailable_page(status_code: int, *, chinese: bool) -> str:
             if status_code == 403
             else "The link may have been turned off by its owner, or the report no longer exists."
         )
-        link_text = "Go to LangAlpha"
+        link_text = "Go to Everflow"
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
 <head>
@@ -110,7 +111,7 @@ def unavailable_page(status_code: int, *, chinese: bool) -> str:
 </head>
 <body>
   <div class="card">
-    <div class="badge">LangAlpha</div>
+    <div class="badge">Everflow</div>  <!-- DALTON-HOOK(brand-name) -->
     <h1>{heading}</h1>
     <p>{detail}</p>
     <a href="/">{link_text}</a>
