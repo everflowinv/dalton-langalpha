@@ -329,7 +329,11 @@ function SectorRow({
         >
           {label}
         </span>
-        <span className="ml-auto shrink-0 text-[11px] tabular-nums" style={{ color: 'var(--color-text-tertiary)' }}>
+        {/* 行尾展开按钮浮层出现时，数字淡出让位，避免两者重叠（样式见 coverageTree.css）。 */}
+        <span
+          className="coverage-row-count ml-auto shrink-0 text-[11px] tabular-nums"
+          style={{ color: 'var(--color-text-tertiary)' }}
+        >
           {members.length}
         </span>
         {members.length > 0 && (
