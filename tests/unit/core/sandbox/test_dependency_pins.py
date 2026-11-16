@@ -105,6 +105,19 @@ def test_sandbox_yfinance_is_the_version_the_server_locks():
     assert f"yfinance=={locked}" in DEFAULT_DEPENDENCIES
 
 
+# DALTON-HOOK(sandbox-edgartools): the 13F skill's EDGAR client follows uv.lock too.
+def test_sandbox_edgartools_is_the_version_the_server_locks():
+    """Dockerfile.sandbox and DEFAULT_DEPENDENCIES must pin edgartools to the
+    exact version uv.lock locks for the server."""
+    locked = next(
+        package["version"]
+        for package in tomllib.loads(_UV_LOCK.read_text())["package"]
+        if package["name"] == "edgartools"
+    )
+    assert f"edgartools=={locked}" in DEFAULT_DEPENDENCIES
+    assert f"edgartools=={locked}" in _dockerfile_install_packages()
+
+
 @pytest.mark.parametrize("path", [_DOCKERFILE, _MCP_SETUP, _IMAGE_RECIPE, _SSH_BOOTSTRAP])
 def test_no_install_path_overrides_curl_cffi(path: Path):
     """yfinance requires curl_cffi>=0.17 and scrapling needs less, so nothing

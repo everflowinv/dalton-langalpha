@@ -143,8 +143,8 @@ unavailable_sources:
     title: 期货与大宗商品实时(非延迟)行情
     note: "yfinance期货延迟约15分钟，注明延迟。"
   - id: institutional_13f_flow
-    title: 13F持仓与暗池/期权异动流
-    note: "未接通(静态期权链用get_options_chain)。"
+    title: 暗池/期权异动流
+    note: "未接通(13F见dalton-13f-tracker;期权链用get_options_chain)。"
   - id: alt_data
     title: 高频另类数据(信用卡/SensorTower/卫星/海关)
     note: "未接直连，仅从alphaengine/funda-ai/guidepoint查二手引述。"

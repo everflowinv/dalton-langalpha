@@ -401,6 +401,12 @@ tests/unit/dalton/test_researchdata_bridge_gcal.py
 plugins/dalton/skills/dalton-richard-coverage-weekly/
 tests/unit/dalton/test_richard_coverage_weekly.py
 
+# OpenClaw migration: 13F tracker and option put skew (on-demand skills).
+plugins/dalton/skills/dalton-13f-tracker/
+plugins/dalton/skills/dalton-option-put-skew/
+tests/unit/dalton/test_13f_tracker_skill.py
+tests/unit/dalton/test_option_put_skew_skill.py
+
 # OC-1 Discord wiki auto-ingest (host discord-history route).
 plugins/dalton/skills/dalton-wiki-auto-ingest/
 tests/unit/dalton/test_agentturn_wiki_ingest.py
