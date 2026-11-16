@@ -1576,7 +1576,7 @@ def build_researchdata_plugin_instruction() -> str:
         "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
         'AlphaEngine 支持文档与机构/个人会议浏览与筛选（params.meeting_scope="institution"|"personal"，无关键词默认 sort="newest"，按公司检索请用关键词 query（公司名 + ticker）及必要时 search_in="title"）、'
         "录制任务与状态查询（list_recording_tasks/get_recording_status/get_recording_task）、文档基础信息与附件列表（get_document_info/list_attachments）、"
-        "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；检索可以放开，全文阅读（get_document）计配额，读最相关的几篇。"
+        "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；每次检索（search_library）都扣一次额度，参数完全相同也扣；同一篇文档读过一次全文后再读不扣。检索前先合并关键词：同一公司或同一主题的相关词放进一次检索，不要拆成多次相近的检索。"
         "Guidepoint 仅返回问答摘录（无全文接口、无 cursor 翻页；limit 省略默认 3，最大 30，不能由 30 条摘录推断已扫完全部访谈；"
         "params.keywords 为 1–10 个非空字符串，多项 OR、词组内 AND，先筛访谈再排片段，不筛选时省略或传 null；"
         "params.recency_bias 为 1–100 整数，偏好近期一般从 30 起，只调排序非日期窗口；start/end 按 UTC 日期硬过滤）。"
