@@ -55,14 +55,91 @@ class MonitorDataJobBinding:
     rel_dir: str
     entry_file: str = "index.html"
     data_keys: tuple[str, ...] = ()
+    sort_order: int = 0
+    shared_rel_dir: str | None = None
     # Required when visibility == "public": the approving administrator whose current
     # admin tier is re-verified on every public data-job republish.
     approved_by_admin_user_id: str | None = None
 
 
+SENTIMENT_DASHBOARD_JOB_KEY = "sentiment-dashboard-refresh"
+SENTIMENT_SHARED_REL_DIR = "research-outputs/sentiment-dashboard/panels/_shared"
+
+SENTIMENT_DASHBOARD_PANELS: tuple[MonitorDataJobBinding, ...] = (
+    MonitorDataJobBinding(
+        job_key=SENTIMENT_DASHBOARD_JOB_KEY,
+        slug="market-overview",
+        title="市场情绪总览",
+        category="overview",
+        visibility="company",
+        rel_dir="research-outputs/sentiment-dashboard/panels/market-overview",
+        entry_file="index.html",
+        sort_order=10,
+        shared_rel_dir=SENTIMENT_SHARED_REL_DIR,
+    ),
+    MonitorDataJobBinding(
+        job_key=SENTIMENT_DASHBOARD_JOB_KEY,
+        slug="us-market",
+        title="美股市场情绪与监控",
+        category="us",
+        visibility="company",
+        rel_dir="research-outputs/sentiment-dashboard/panels/us-market",
+        entry_file="index.html",
+        sort_order=20,
+        shared_rel_dir=SENTIMENT_SHARED_REL_DIR,
+    ),
+    MonitorDataJobBinding(
+        job_key=SENTIMENT_DASHBOARD_JOB_KEY,
+        slug="cn-market",
+        title="A股情绪、资金流与拥挤度",
+        category="cn",
+        visibility="company",
+        rel_dir="research-outputs/sentiment-dashboard/panels/cn-market",
+        entry_file="index.html",
+        sort_order=30,
+        shared_rel_dir=SENTIMENT_SHARED_REL_DIR,
+    ),
+    MonitorDataJobBinding(
+        job_key=SENTIMENT_DASHBOARD_JOB_KEY,
+        slug="hk-market",
+        title="港股AH溢价与板块强弱",
+        category="hk",
+        visibility="company",
+        rel_dir="research-outputs/sentiment-dashboard/panels/hk-market",
+        entry_file="index.html",
+        sort_order=40,
+        shared_rel_dir=SENTIMENT_SHARED_REL_DIR,
+    ),
+    MonitorDataJobBinding(
+        job_key=SENTIMENT_DASHBOARD_JOB_KEY,
+        slug="asia-leverage",
+        title="日韩台融资杠杆",
+        category="asia",
+        visibility="company",
+        rel_dir="research-outputs/sentiment-dashboard/panels/asia-leverage",
+        entry_file="index.html",
+        sort_order=50,
+        shared_rel_dir=SENTIMENT_SHARED_REL_DIR,
+    ),
+    MonitorDataJobBinding(
+        job_key=SENTIMENT_DASHBOARD_JOB_KEY,
+        slug="stocks",
+        title="美股与中国个股监控",
+        category="stocks",
+        visibility="company",
+        rel_dir="research-outputs/sentiment-dashboard/panels/stocks",
+        entry_file="index.html",
+        sort_order=60,
+        shared_rel_dir=SENTIMENT_SHARED_REL_DIR,
+    ),
+)
+
+
 # Only pre-registered job_keys and their fixed relative output folders under
 # ``data_root`` may be published by data tasks. Arbitrary caller paths are rejected.
-MONITOR_DATA_JOB_REGISTRY: dict[str, MonitorDataJobBinding] = {
+MONITOR_DATA_JOB_REGISTRY: dict[
+    str, MonitorDataJobBinding | tuple[MonitorDataJobBinding, ...]
+] = {
     "monitor-live-demo": MonitorDataJobBinding(
         job_key="monitor-live-demo",
         slug="live-demo",
@@ -73,11 +150,32 @@ MONITOR_DATA_JOB_REGISTRY: dict[str, MonitorDataJobBinding] = {
         entry_file="index.html",
         data_keys=("metrics",),
     ),
+    SENTIMENT_DASHBOARD_JOB_KEY: SENTIMENT_DASHBOARD_PANELS,
 }
 
 
+def get_registered_monitor_bindings(job_key: str) -> tuple[MonitorDataJobBinding, ...]:
+    entry = MONITOR_DATA_JOB_REGISTRY.get(str(job_key or "").strip())
+    if entry is None:
+        return ()
+    if isinstance(entry, MonitorDataJobBinding):
+        return (entry,)
+    return tuple(entry)
+
+
 def get_registered_monitor_job(job_key: str) -> MonitorDataJobBinding | None:
-    return MONITOR_DATA_JOB_REGISTRY.get(str(job_key or "").strip())
+    bindings = get_registered_monitor_bindings(job_key)
+    return bindings[0] if bindings else None
+
+
+def get_registered_monitor_binding_by_slug(
+    job_key: str, slug: str
+) -> MonitorDataJobBinding | None:
+    clean_slug = str(slug or "").strip()
+    for binding in get_registered_monitor_bindings(job_key):
+        if binding.slug == clean_slug:
+            return binding
+    return None
 
 
 def _split_clean_rel_parts(raw_rel: str, *, allow_leading_slash: bool = False) -> list[str] | None:
@@ -171,22 +269,29 @@ class HostDirFileSource:
             self._root_fd = os.open(root_dir, _DIR_OPEN_FLAGS)
 
     @classmethod
-    def open_registered(
-        cls, data_root: Path, binding: MonitorDataJobBinding
+    def open_registered_dir(
+        cls, data_root: Path, rel_dir: str
     ) -> HostDirFileSource:
-        """Validate ``binding.rel_dir`` from trusted ``data_root`` and keep the opened leaf ``dir_fd``."""
-        parts = _split_clean_rel_parts(binding.rel_dir, allow_leading_slash=False)
+        """Validate ``rel_dir`` from trusted ``data_root`` and keep the opened leaf ``dir_fd``."""
+        parts = _split_clean_rel_parts(rel_dir, allow_leading_slash=False)
         if not parts:
-            raise ValueError(f"Invalid registered monitor relative dir: {binding.rel_dir}")
+            raise ValueError(f"Invalid registered monitor relative dir: {rel_dir}")
         try:
             fd = _open_dir_chain_fd(data_root, parts)
         except ValueError:
             raise
         except OSError as exc:
             raise ValueError(
-                f"Registered monitor dir unavailable or contains symlink ({exc}): {binding.rel_dir}"
+                f"Registered monitor dir unavailable or contains symlink ({exc}): {rel_dir}"
             ) from exc
         return cls(data_root.joinpath(*parts), _root_fd=fd)
+
+    @classmethod
+    def open_registered(
+        cls, data_root: Path, binding: MonitorDataJobBinding
+    ) -> HostDirFileSource:
+        """Validate ``binding.rel_dir`` from trusted ``data_root`` and keep the opened leaf ``dir_fd``."""
+        return cls.open_registered_dir(data_root, binding.rel_dir)
 
     def close(self) -> None:
         if self._root_fd is not None:
@@ -309,6 +414,66 @@ class HostDirFileSource:
                 except OSError:
                     pass
                 return None
+
+
+class ScopedMountFileSource:
+    """Virtual ``FileSource`` mapping fixed mount prefixes (panel dir + optional ``_shared``) to open ``HostDirFileSource`` instances."""
+
+    def __init__(self, mounts: dict[str, HostDirFileSource], *, primary_mount: str) -> None:
+        self._mounts = mounts
+        self._primary_mount = primary_mount
+
+    def close(self) -> None:
+        for src in self._mounts.values():
+            src.close()
+
+    def __enter__(self) -> ScopedMountFileSource:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _split_mount(self, rel_path: str) -> tuple[str, HostDirFileSource, str] | None:
+        parts = _split_clean_rel_parts(rel_path, allow_leading_slash=False)
+        if not parts or len(parts) < 2:
+            return None
+        mount, rest = parts[0], "/".join(parts[1:])
+        src = self._mounts.get(mount)
+        if src is None:
+            return None
+        return mount, src, rest
+
+    def list_primary_artifact_files(self) -> tuple[str, ...]:
+        primary = self._mounts.get(self._primary_mount)
+        if primary is None:
+            return ()
+        return tuple(f"{self._primary_mount}/{p}" for p in primary.list_artifact_files())
+
+    async def stat(self, paths: list[str]) -> dict[str, tuple[str, int]]:
+        grouped: dict[str, list[tuple[str, str]]] = {}
+        for req in paths:
+            resolved = self._split_mount(req)
+            if resolved is None:
+                continue
+            mount, _, rest = resolved
+            grouped.setdefault(mount, []).append((req, rest))
+        hits: dict[str, tuple[str, int]] = {}
+        for mount, pairs in grouped.items():
+            src = self._mounts[mount]
+            sub_hits = await src.stat([rest for _, rest in pairs])
+            for req, rest in pairs:
+                hit = sub_hits.get(rest)
+                if hit is not None:
+                    canonical_rest, size = hit
+                    hits[req] = (f"{mount}/{canonical_rest}", size)
+        return hits
+
+    async def read(self, path: str) -> bytes | None:
+        resolved = self._split_mount(path)
+        if resolved is None:
+            return None
+        _, src, rest = resolved
+        return await src.read(rest)
 
 
 def build_live_demo_html(*, data_key: str = "metrics", locale: str = "zh-CN") -> str:

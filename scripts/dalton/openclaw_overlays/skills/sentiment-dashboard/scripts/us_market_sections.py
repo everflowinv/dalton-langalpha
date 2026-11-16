@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import html
 import math
 from typing import Any, Callable
 
 import pandas as pd
 
+from dashboard_copy import UI_COPY, humanize_summary
 
-CYCLE_DEFENSIVE_LABEL = "周期股/防御股相对指数"
+
+CYCLE_DEFENSIVE_LABEL = "周期股/防御股相对指数（GSPUCYDE）"
 VVIX_WARNING = 160.0
 
 
@@ -153,16 +156,13 @@ def _obs_meta(
 ) -> str:
     if not obs_date:
         return f"{prefix}—"
-    suffix = (
-        "（盘中）"
-        if _is_intraday_obs(
-            obs_date,
-            formal_as_of,
-            scenario_as_of=scenario_as_of,
-            explicit_intraday=explicit_intraday,
-        )
-        else ""
+    is_intraday = _is_intraday_obs(
+        obs_date,
+        formal_as_of,
+        scenario_as_of=scenario_as_of,
+        explicit_intraday=explicit_intraday,
     )
+    suffix = "（美东时间，盘中）" if is_intraday else "（美东时间）"
     return f"{prefix}{obs_date}{suffix}"
 
 
@@ -181,8 +181,8 @@ def _obs_tag(
         scenario_as_of=scenario_as_of,
         explicit_intraday=explicit_intraday,
     ):
-        return f"（{obs_date} 盘中）"
-    return f"（{obs_date}）"
+        return f"（{obs_date} 美东时间，盘中）"
+    return f"（{obs_date} 美东时间）"
 
 
 def bottom_monitor_section(
@@ -204,6 +204,7 @@ def bottom_monitor_section(
     vix_price: pd.Series,
     vvix_price: pd.Series,
 ) -> str:
+    copy = UI_COPY["us_bottom"]
     metrics = bottom_framework.get("metrics") or {}
     formal_as_of = _obs_date_str(metrics.get("as_of"))
     env_as_of = _obs_date_str(bottom_environment.get("as_of")) or formal_as_of
@@ -233,7 +234,10 @@ def bottom_monitor_section(
     sector_expected = breadth.get("sector_expected") or 11
     sector_text = "暂无" if sector_above is None else f"{int(sector_above)}/{int(sector_expected)}"
     semi_pct = finite(breadth.get("semiconductor_above_200dma_pct"))
-    breadth_text = f"中期广度：行业{sector_text}；半导体{fmt(semi_pct,1,'%')}"
+    breadth_text = copy["breadth_tpl"].format(
+        sector_text=sector_text,
+        semi_pct=fmt(semi_pct, 1, "%"),
+    )
     environment_metrics = bottom_environment.get("metrics") or {}
 
     def signed_pct(value: Any) -> str:
@@ -241,15 +245,15 @@ def bottom_monitor_section(
         return "暂无" if number is None else f"{number:+.1f}%"
 
     below_days = environment_metrics.get("both_below_200dma_consecutive_td")
-    below_days_text = "暂无" if below_days is None else f"{int(below_days)}日"
-    dma_text = (
-        f"均线：SPX距200DMA {signed_pct(environment_metrics.get('spx_vs_200dma_pct'))}；"
-        f"QQQ距200DMA {signed_pct(environment_metrics.get('qqq_vs_200dma_pct'))}；"
-        f"SPX 50DMA较200DMA {signed_pct(environment_metrics.get('spx_ma50_vs_ma200_pct'))}；"
-        f"双指数连续低于200DMA {below_days_text}"
+    below_days_text = "暂无" if below_days is None else f"{int(below_days)}个交易日"
+    dma_text = copy["dma_tpl"].format(
+        spx_200=signed_pct(environment_metrics.get("spx_vs_200dma_pct")),
+        qqq_200=signed_pct(environment_metrics.get("qqq_vs_200dma_pct")),
+        ma50_200=signed_pct(environment_metrics.get("spx_ma50_vs_ma200_pct")),
+        below_days=below_days_text,
     )
     environment_meta = (
-        f"{dma_text}；{breadth_text}；正式状态截至 {env_as_of}"
+        f"{dma_text}；{breadth_text}；正式状态截至 {env_as_of}（美东时间）"
         if env_as_of
         else f"{dma_text}；{breadth_text}"
     )
@@ -267,21 +271,22 @@ def bottom_monitor_section(
     stage_tone = "cold" if stage in {"预警", "压力", "深度超卖"} else "warm" if stage == "确认" else "neutral"
     remaining = bottom_framework.get("window_remaining_td")
     stage_window = (
-        f"压力观察窗剩余：{remaining}个交易日"
+        copy["window_remaining_tpl"].format(n=remaining)
         if remaining is not None
-        else "等待5DMA确认，不受20日窗限制"
+        else copy["wait_confirm"]
         if stage in {"压力", "深度超卖"}
-        else "无活动压力观察窗"
+        else copy["no_window"]
     )
-    stage_meta = f"{stage_window}；正式状态截至 {formal_as_of}" if formal_as_of else stage_window
+    stage_meta = (
+        f"{stage_window}；正式状态截至 {formal_as_of}（美东时间）"
+        if formal_as_of
+        else stage_window
+    )
 
     cyc_meta = _obs_meta(cyc_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=cyc_intraday)
     qqq_dd_meta = _obs_meta(qqq_dd_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=qqq_dd_intraday)
-    vix_meta = f"进入压力条件；{_obs_meta(vix_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=vix_intraday)}"
-    vvix_meta = (
-        "历史样本中罕见，命中大底率100%；触发即提示抄底；"
-        f"{_obs_meta(vvix_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=vvix_intraday)}"
-    )
+    vix_meta = f"{copy['vix_meta_prefix']}{_obs_meta(vix_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=vix_intraday)}"
+    vvix_meta = f"{copy['vvix_meta_prefix']}{_obs_meta(vvix_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=vvix_intraday)}"
     spx_rsi_meta = _obs_meta(spx_rsi_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=spx_rsi_intraday)
     qqq_rsi_meta = _obs_meta(qqq_rsi_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=qqq_rsi_intraday)
 
@@ -290,38 +295,41 @@ def bottom_monitor_section(
     spx_rsi_tag = _obs_tag(spx_rsi_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=spx_rsi_intraday)
     qqq_rsi_tag = _obs_tag(qqq_rsi_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=qqq_rsi_intraday)
 
+    bottom_summary = humanize_summary(str(bottom_framework.get("summary") or ""))
+    env_summary = humanize_summary(str(bottom_environment.get("summary") or "环境数据暂不完整"))
+
     cards = "".join([
-        metric_card("当前阶段", stage, str(bottom_framework.get("summary") or ""), stage_tone, stage_meta),
-        metric_card("环境状态", str(bottom_environment.get("summary") or "环境数据不完整"), "", str(bottom_environment.get("tone") or "muted"), environment_meta),
-        metric_card(f"{CYCLE_DEFENSIVE_LABEL} RSI14", fmt(cyc_val, 1), f"预警线 ≤{bottom_cfg.gsp_alert_rsi:.0f}", "cold" if cyc_val is not None and cyc_val <= bottom_cfg.gsp_alert_rsi else "neutral", cyc_meta),
-        metric_card("QQQ 63日回撤", fmt(qqq_dd, 1, "%"), f"预警线 ≤{bottom_cfg.qqq_alert_drawdown * 100:.0f}%", "cold" if qqq_dd is not None and qqq_dd <= bottom_cfg.qqq_alert_drawdown * 100 else "neutral", qqq_dd_meta),
-        metric_card("VIX", fmt(vix, 1), f"压力线 ≥{bottom_cfg.pressure_vix:.0f}", "cool" if vix is not None and vix >= bottom_cfg.pressure_vix else "neutral", vix_meta),
-        metric_card("VVIX", fmt(vvix, 1), f"警戒线 ≥{VVIX_WARNING:.0f}", "cold" if vvix is not None and vvix >= VVIX_WARNING else "neutral", vvix_meta),
-        metric_card("SPX RSI14", fmt(spx_rsi, 1), f"压力区 ≤{bottom_cfg.pressure_index_rsi:.0f}；深度超卖 <{bottom_cfg.deep_index_rsi:.0f}", rsi_tone(spx_rsi), spx_rsi_meta),
-        metric_card("QQQ RSI14", fmt(qqq_rsi, 1), f"压力区 ≤{bottom_cfg.pressure_index_rsi:.0f}；深度超卖 <{bottom_cfg.deep_index_rsi:.0f}", rsi_tone(qqq_rsi), qqq_rsi_meta),
+        metric_card(copy["card_stage"], stage, bottom_summary, stage_tone, stage_meta),
+        metric_card(copy["card_env"], env_summary, copy["card_env_sub"], str(bottom_environment.get("tone") or "muted"), environment_meta),
+        metric_card(copy["card_cyc"], fmt(cyc_val, 1), f"底部预警线 ≤{bottom_cfg.gsp_alert_rsi:.0f}（越低越超跌）", "cold" if cyc_val is not None and cyc_val <= bottom_cfg.gsp_alert_rsi else "neutral", cyc_meta),
+        metric_card(copy["card_qqq_dd"], fmt(qqq_dd, 1, "%"), f"底部预警线 ≤{bottom_cfg.qqq_alert_drawdown * 100:.0f}%", "cold" if qqq_dd is not None and qqq_dd <= bottom_cfg.qqq_alert_drawdown * 100 else "neutral", qqq_dd_meta),
+        metric_card(copy["card_vix"], fmt(vix, 1), f"压力警戒线 ≥{bottom_cfg.pressure_vix:.0f}（越高越恐慌）", "cool" if vix is not None and vix >= bottom_cfg.pressure_vix else "neutral", vix_meta),
+        metric_card(copy["card_vvix"], fmt(vvix, 1), f"极端警戒线 ≥{VVIX_WARNING:.0f}", "cold" if vvix is not None and vvix >= VVIX_WARNING else "neutral", vvix_meta),
+        metric_card(copy["card_spx_rsi"], fmt(spx_rsi, 1), f"压力区 ≤{bottom_cfg.pressure_index_rsi:.0f}；深度超卖 <{bottom_cfg.deep_index_rsi:.0f}", rsi_tone(spx_rsi), spx_rsi_meta),
+        metric_card(copy["card_qqq_rsi"], fmt(qqq_rsi, 1), f"压力区 ≤{bottom_cfg.pressure_index_rsi:.0f}；深度超卖 <{bottom_cfg.deep_index_rsi:.0f}", rsi_tone(qqq_rsi), qqq_rsi_meta),
     ])
     charts = '<div class="monitor-chart-stack">' + "".join([
         chart(
-            f"预警：{CYCLE_DEFENSIVE_LABEL} RSI14",
-            [series_payload(_plot_series_since(cyc_rsi14, finite), f"{CYCLE_DEFENSIVE_LABEL} RSI14", "#ffbf3c", "left", True, 1000)],
-            f"预警线≤{bottom_cfg.gsp_alert_rsi:.0f}；当前{fmt(cyc_val,1)}{cyc_tag}。",
+            copy["chart_cyc_title"],
+            [series_payload(_plot_series_since(cyc_rsi14, finite), copy["card_cyc"], "#ffbf3c", "left", True, 1000)],
+            copy["chart_cyc_note_tpl"].format(thr=f"{bottom_cfg.gsp_alert_rsi:.0f}", val=fmt(cyc_val, 1), tag=cyc_tag),
             None, 300, [0, 100], False,
             [hline(bottom_cfg.gsp_alert_rsi, "left", f"预警{bottom_cfg.gsp_alert_rsi:.0f}", "cold")],
         ),
         chart(
-            "预警：QQQ 63日回撤",
-            [series_payload(_plot_series_since(qqq_drawdown_63, finite), "距63日高点", "#4da3ff", "left", True, 1000)],
-            f"预警线≤{bottom_cfg.qqq_alert_drawdown * 100:.0f}%；当前{fmt(qqq_dd,1,'%')}{qqq_dd_tag}。",
+            copy["chart_dd_title"],
+            [series_payload(_plot_series_since(qqq_drawdown_63, finite), "距近63日高点回撤(%)", "#4da3ff", "left", True, 1000)],
+            copy["chart_dd_note_tpl"].format(thr=f"{bottom_cfg.qqq_alert_drawdown * 100:.0f}", val=fmt(qqq_dd, 1, "%"), tag=qqq_dd_tag),
             None, 300, None, False,
             [hline(bottom_cfg.qqq_alert_drawdown * 100, "left", f"预警{bottom_cfg.qqq_alert_drawdown * 100:.0f}%", "cold"), hline(0, "left", "高点", "zero")],
         ),
         chart(
-            "压力参考：VIX 与 VVIX",
+            copy["chart_vol_title"],
             [
-                series_payload(_plot_series_since(vix_price, finite), "VIX", "#ff6b6b", "left", True, 1000),
+                series_payload(_plot_series_since(vix_price, finite), "VIX 恐慌指数", "#ff6b6b", "left", True, 1000),
                 series_payload(_plot_series_since(vvix_price, finite), "VVIX（右轴）", "#a377ff", "right", False, 1000),
             ],
-            f"VIX压力线≥{bottom_cfg.pressure_vix:.0f}；VVIX警戒线≥{VVIX_WARNING:.0f}。历史样本中VVIX触发罕见，命中大底率100%；触发即提示抄底，但不进入状态机。",
+            copy["chart_vol_note_tpl"].format(vix_thr=f"{bottom_cfg.pressure_vix:.0f}", vvix_thr=f"{VVIX_WARNING:.0f}"),
             None, 300, None, False,
             [
                 hline(bottom_cfg.pressure_vix, "left", f"压力{bottom_cfg.pressure_vix:.0f}", "cold"),
@@ -329,41 +337,48 @@ def bottom_monitor_section(
             ],
         ),
         chart(
-            "压力与深度超卖：SPX、QQQ RSI14",
+            copy["chart_idx_rsi_title"],
             [
-                series_payload(_plot_series_since(spx_rsi14, finite), "SPX RSI14", "#4da3ff", "left", False, 1000),
-                series_payload(_plot_series_since(qqq_rsi14, finite), "QQQ RSI14", "#ffbf3c", "left", False, 1000),
+                series_payload(_plot_series_since(spx_rsi14, finite), "SPX 14日RSI", "#4da3ff", "left", False, 1000),
+                series_payload(_plot_series_since(qqq_rsi14, finite), "QQQ 14日RSI", "#ffbf3c", "left", False, 1000),
             ],
-            f"SPX、QQQ RSI14；压力区 ≤{bottom_cfg.pressure_index_rsi:.0f}，深度超卖 <{bottom_cfg.deep_index_rsi:.0f}；当前{fmt(spx_rsi,1)}{spx_rsi_tag}、{fmt(qqq_rsi,1)}{qqq_rsi_tag}。",
+            copy["chart_idx_rsi_note_tpl"].format(
+                p_thr=f"{bottom_cfg.pressure_index_rsi:.0f}",
+                d_thr=f"{bottom_cfg.deep_index_rsi:.0f}",
+                spx_val=fmt(spx_rsi, 1),
+                spx_tag=spx_rsi_tag,
+                qqq_val=fmt(qqq_rsi, 1),
+                qqq_tag=qqq_rsi_tag,
+            ),
             None, 300, [0, 100], False,
             [hline(bottom_cfg.pressure_index_rsi, "left", f"压力{bottom_cfg.pressure_index_rsi:.0f}", "cold"), hline(bottom_cfg.deep_index_rsi, "left", f"深度超卖<{bottom_cfg.deep_index_rsi:.0f}", "hot")],
         ),
     ]) + "</div>"
     return (
-        '<section class="monitor-section monitor-bottom"><div class="monitor-head"><h2>底部监控</h2>'
-        '<p>先看环境状态，再看预警、压力、深度超卖和走出底部；环境标签与中期广度不改变状态机。</p></div>'
+        f'<section class="monitor-section monitor-bottom"><div class="monitor-head"><h2>{html.escape(copy["section_title"])}</h2>'
+        f'<p>{html.escape(copy["section_lead"])}</p></div>'
         f'<section class="cards bottom-cards">{cards}</section>{charts}</section>'
     )
 
 
 def _env_reasons(environment: dict[str, Any], top_cfg: Any, signed: Callable[..., str]) -> str:
-    """预警环境卡的小字：强弱都写两项原因（冷却期、趋势线），带当前读数。"""
+    """预警环境卡的小字：强弱都写两项原因（大跌后冷却期、长期趋势线），带当前读数。"""
     cooldown = environment.get("cooldown") or {}
     trough_date = cooldown.get("trough_date")
     trough_dd = cooldown.get("trough_drawdown_pct")
-    trough_text = f"{trough_date} 最低点跌{abs(float(trough_dd)):.1f}%" if trough_date and trough_dd is not None else ""
+    trough_text = f"{trough_date} 最低点回撤 {abs(float(trough_dd)):.1f}%" if trough_date and trough_dd is not None else ""
     if cooldown.get("active"):
-        cool_part = f"冷却期剩余{cooldown.get('remaining_td')}个交易日" + (f"（{trough_text}）" if trough_text else "")
+        cool_part = f"处于大跌后冷却期（剩余 {cooldown.get('remaining_td')} 个交易日" + (f"，{trough_text}" if trough_text else "") + "）"
     else:
-        cool_part = "不在冷却期" + (f"（{trough_text}，未到{abs(top_cfg.cool_drawdown_15_pct):.0f}%）" if trough_text else "")
+        cool_part = "未处于信号冷却期" + (f"（{trough_text}，未达 {abs(top_cfg.cool_drawdown_15_pct):.0f}% 屏蔽线）" if trough_text else "")
     trend = environment.get("trend_premium_pct")
     if trend is None:
-        trend_part = "SPX 趋势线读数暂无"
+        trend_part = "标普500（SPX）长期趋势线读数暂无"
     elif float(trend) < top_cfg.weak_trend_premium_pct:
-        trend_part = f"SPX 低于趋势线 {signed(trend)}"
+        trend_part = f"标普500（SPX）低于长期趋势线 {signed(trend)}"
     else:
-        trend_part = f"SPX 高于趋势线 {signed(trend)}"
-    return "＋".join([cool_part, trend_part])
+        trend_part = f"标普500（SPX）高于长期趋势线 {signed(trend)}"
+    return "；".join([cool_part, trend_part])
 
 
 def top_monitor_section(
@@ -392,6 +407,7 @@ def top_monitor_section(
     vol_crush: float,
     momentum_chart: str,
 ) -> str:
+    copy = UI_COPY["us_top"]
     metrics = top_framework.get("metrics") or {}
     formal_as_of = _obs_date_str(metrics.get("as_of"))
     proj_scenario = (top_framework.get("projection") or {}).get("scenario") or {}
@@ -404,15 +420,19 @@ def top_monitor_section(
     window_remaining = top_framework.get("window_remaining_td")
     timeout_remaining = top_framework.get("excess_timeout_remaining_td")
     stage_window = (
-        f"活动窗剩余：{window_remaining}个交易日（T+{top_cfg.window_td}，同时检查过激与确认）"
+        f"观察期剩余：{window_remaining} 个交易日（共 {top_cfg.window_td} 日，同步检查过热与转跌确认）"
         if window_remaining is not None
-        else f"过激超时剩余：{timeout_remaining}个交易日（{top_cfg.excess_timeout_td}日）"
+        else f"过激延长观察期剩余：{timeout_remaining} 个交易日（共 {top_cfg.excess_timeout_td} 日）"
         if timeout_remaining is not None
-        else "等待任一指数20日收盘新高失效"
+        else "若任一指数创近20日收盘新高则本轮信号作废"
         if stage == "确认"
-        else "无活动观察窗"
+        else copy["no_window"]
     )
-    stage_meta = f"{stage_window}；正式状态截至 {formal_as_of}" if formal_as_of else stage_window
+    stage_meta = (
+        f"{stage_window}；正式状态截至 {formal_as_of}（美东时间）"
+        if formal_as_of
+        else stage_window
+    )
     stage_value = f"{stage}（{strength}）" if strength and stage in {"预警", "过激", "确认"} else stage
 
     def signed(value: Any, digits: int = 1, suffix: str = "%") -> str:
@@ -422,7 +442,7 @@ def top_monitor_section(
     env_tone = "cool" if environment.get("weak_now") else "neutral"
     env_value = "弱" if environment.get("weak_now") else "强"
     env_sub = _env_reasons(environment, top_cfg, signed)
-    env_meta = f"正式状态截至 {formal_as_of}" if formal_as_of else ""
+    env_meta = f"正式状态截至 {formal_as_of}（美东时间）" if formal_as_of else ""
 
     gsp_now, gsp_date, gsp_intraday = _last_series_obs(cyc_rsi30, finite)
     if gsp_now is None:
@@ -477,12 +497,12 @@ def top_monitor_section(
         vol_intraday = False
 
     gsp_meta = _obs_meta(gsp_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=gsp_intraday)
-    q_meta = f"IONQ/RGTI/QBTS/QUBT 日等权再平衡；{_obs_meta(q_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=q_intraday)}"
+    q_meta = f"成分股：IONQ/RGTI/QBTS/QUBT 日频等权；{_obs_meta(q_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=q_intraday)}"
     qqq_rsi_meta = _obs_meta(qqq_rsi_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=qqq_rsi_intraday)
     qqq_200_meta = _obs_meta(qqq_200_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=qqq_200_intraday)
-    mom_meta = f"GSCBHMOM，{_obs_meta(mom_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=mom_intraday)}"
+    mom_meta = f"高盛高动量指数（GSCBHMOM）；{_obs_meta(mom_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=mom_intraday)}"
     vol_meta = (
-        "只作环境：比值塌陷时把在亮的预警或过激看得更重，不进状态机；"
+        f"{copy['vol_meta_prefix']}"
         f"{_obs_meta(vol_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=vol_intraday)}"
     )
 
@@ -499,111 +519,129 @@ def top_monitor_section(
     put_hedge = top_framework.get("put_hedge") or {}
     hedge_stats = put_hedge.get("stats") or {}
     hedge_on = bool(put_hedge.get("on"))
-    # The formal reminder, VIX, and put cost share put_hedge.as_of.
     hedge_as_of = _obs_date_str(put_hedge.get("as_of"))
-    official_note = f"正式提醒截至 {hedge_as_of or '—'}"
+    official_note = f"正式提醒截至 {f'{hedge_as_of}（美东时间）' if hedge_as_of else '—'}"
     hedge_sub = (
-        f"VVIX/VIX {fmt(vvix_ratio, 2)}{vvix_ratio_tag}（提醒线 ≥{top_cfg.put_hedge_vvix_vix:.1f}）；"
-        f"{official_note}：VIX {fmt(put_hedge.get('vix'), 1)}，1月平值put≈{fmt(put_hedge.get('put_cost_pct_1m_atm'), 1, '%')}名义"
+        f"恐慌波动率比值 VVIX/VIX {fmt(vvix_ratio, 2)}{vvix_ratio_tag}（≥{top_cfg.put_hedge_vvix_vix:.1f} 时提示对冲较便宜）；"
+        f"{official_note}：VIX {fmt(put_hedge.get('vix'), 1)}，1个月期平值看跌期权成本约 {fmt(put_hedge.get('put_cost_pct_1m_atm'), 1, '%')} 名义本金"
     )
     hedge_eval = hedge_stats.get("segments_evaluated") or 0
     hedge_rate10 = hedge_stats.get("control_dd_ge_10pct_rate")
     hedge_meta = (
-        f"{str(hedge_stats.get('start') or '')[:4]}年起{hedge_stats.get('segments')}段：起点后{hedge_stats.get('horizon_td')}日QQQ回撤≥10%的"
-        f"{hedge_stats.get('segments_dd_ge_10pct')}/{hedge_eval}段（VIX<{top_cfg.put_hedge_cheap_vix:.0f}对照日{fmt(None if hedge_rate10 is None else hedge_rate10 * 100, 0, '%')}）；"
-        f"买便宜尾部保险的窗口，不是顶部信号，不进状态机；{official_note}"
+        f"历史统计（{str(hedge_stats.get('start') or '')[:4]}年起共 {hedge_stats.get('segments')} 段）：高性价比窗口触发后 {hedge_stats.get('horizon_td')} 日内 QQQ 回撤≥10% 的有 "
+        f"{hedge_stats.get('segments_dd_ge_10pct')}/{hedge_eval} 段（低波动 VIX<{top_cfg.put_hedge_cheap_vix:.0f} 对照期为 {fmt(None if hedge_rate10 is None else hedge_rate10 * 100, 0, '%')}）；"
+        f"仅提示买尾部保险的性价比窗口，并非顶部做空信号，不计入触发规则；{official_note}"
         if hedge_eval
-        else f"历史样本不足；买便宜尾部保险的窗口，不是顶部信号，不进状态机；{official_note}"
+        else f"历史样本不足；仅提示买尾部保险的性价比窗口，并非顶部做空信号，不计入触发规则；{official_note}"
     )
-    confirm_value = signed(round_high_pct) if round_high_pct is not None else "无活动轮次"
+    confirm_value = signed(round_high_pct) if round_high_pct is not None else copy["no_active_round"]
     confirm_tone = "hot" if round_high_pct is not None and round_high_pct <= -top_cfg.confirm_drawdown_pct else "neutral"
     confirm_meta = (
-        f"SPX距20日线 {signed(spx_20)}{spx_20_tag}；"
-        f"QQQ距20日线 {signed(qqq_20)}{qqq_20_tag}；"
-        f"本轮最高收盘 {metrics.get('round_high_date') or '—'}"
-        + (f"；正式状态截至 {formal_as_of}" if formal_as_of else "")
+        f"SPX距20日均线 {signed(spx_20)}{spx_20_tag}；"
+        f"QQQ距20日均线 {signed(qqq_20)}{qqq_20_tag}；"
+        f"本轮最高收盘日 {metrics.get('round_high_date') or '—'}"
+        + (f"；正式状态截至 {formal_as_of}（美东时间）" if formal_as_of else "")
     )
 
     def hot_if(value: Any, threshold: float) -> str:
         number = finite(value)
         return "hot" if number is not None and number >= threshold else "neutral"
 
+    top_summary = humanize_summary(str(top_framework.get("summary") or ""))
+
     cards = "".join([
-        metric_card("顶部阶段", stage_value, str(top_framework.get("summary") or ""), stage_tone, stage_meta),
-        metric_card("预警环境", env_value, env_sub, env_tone, env_meta),
-        metric_card(f"{CYCLE_DEFENSIVE_LABEL} RSI30", fmt(gsp_now, 1), f"预警线 ≥{top_cfg.gsp_warn_rsi30:.0f}", hot_if(gsp_now, top_cfg.gsp_warn_rsi30), gsp_meta),
-        metric_card("量子等权较60日低点", fmt(quantum_gain, 0, "%"), f"预警线 ≥+{top_cfg.quantum_warn_gain_pct:.0f}%", hot_if(quantum_gain, top_cfg.quantum_warn_gain_pct), q_meta),
-        metric_card("QQQ RSI14", fmt(qqq_rsi, 1), f"过激线 ≥{top_cfg.excess_qqq_rsi14:.0f}", hot_if(qqq_rsi, top_cfg.excess_qqq_rsi14), qqq_rsi_meta),
-        metric_card("QQQ 距200DMA", signed(qqq_200), f"过激线 ≥+{top_cfg.excess_qqq_200dma_pct:.0f}%", hot_if(qqq_200, top_cfg.excess_qqq_200dma_pct), qqq_200_meta),
-        metric_card(f"Momentum RSI{momentum_period or ''}", fmt(mom_now, 1), f"过激线 ≥{top_cfg.excess_momentum_rsi:.0f}", hot_if(mom_now, top_cfg.excess_momentum_rsi), mom_meta),
-        metric_card("确认进度：QQQ较本轮最高收盘", confirm_value, f"确认需 ≤-{top_cfg.confirm_drawdown_pct:.0f}% 且双指数同日收在20日线下", confirm_tone, confirm_meta),
-        metric_card("QQQ 隐波 30D/60D", fmt(vol_val, 2), f"环境线 ≤{vol_crush:.2f}", "hot" if vol_val is not None and vol_val <= vol_crush else "neutral", vol_meta),
-        metric_card("指数 put 保护提醒（VVIX/VIX）", "提醒" if hedge_on else "无", hedge_sub, "warm" if hedge_on else "neutral", hedge_meta),
+        metric_card(copy["card_stage"], stage_value, top_summary, stage_tone, stage_meta),
+        metric_card(copy["card_env"], env_value, env_sub, env_tone, env_meta),
+        metric_card(copy["card_cyc"], fmt(gsp_now, 1), f"顶部预警线 ≥{top_cfg.gsp_warn_rsi30:.0f}（越高风险偏好越热）", hot_if(gsp_now, top_cfg.gsp_warn_rsi30), gsp_meta),
+        metric_card(copy["card_quantum"], fmt(quantum_gain, 0, "%"), f"投机过热预警线 ≥+{top_cfg.quantum_warn_gain_pct:.0f}%", hot_if(quantum_gain, top_cfg.quantum_warn_gain_pct), q_meta),
+        metric_card(copy["card_qqq_rsi"], fmt(qqq_rsi, 1), f"过激警戒线 ≥{top_cfg.excess_qqq_rsi14:.0f}", hot_if(qqq_rsi, top_cfg.excess_qqq_rsi14), qqq_rsi_meta),
+        metric_card(copy["card_qqq_200"], signed(qqq_200), f"过激警戒线 ≥+{top_cfg.excess_qqq_200dma_pct:.0f}%", hot_if(qqq_200, top_cfg.excess_qqq_200dma_pct), qqq_200_meta),
+        metric_card(copy["card_mom"].format(period=momentum_period or ""), fmt(mom_now, 1), f"过激警戒线 ≥{top_cfg.excess_momentum_rsi:.0f}", hot_if(mom_now, top_cfg.excess_momentum_rsi), mom_meta),
+        metric_card(copy["card_confirm"], confirm_value, f"转跌确认需回撤 ≤-{top_cfg.confirm_drawdown_pct:.0f}% 且双指数同日跌破20日均线", confirm_tone, confirm_meta),
+        metric_card(copy["card_vol_ratio"], fmt(vol_val, 2), f"环境参考线 ≤{vol_crush:.2f}（越低代表短期波动保护越松懈）", "hot" if vol_val is not None and vol_val <= vol_crush else "neutral", vol_meta),
+        metric_card(copy["card_put_hedge"], "提醒" if hedge_on else "无", hedge_sub, "warm" if hedge_on else "neutral", hedge_meta),
     ])
     doubling = 100.0 * math.log(1.0 + top_cfg.quantum_warn_gain_pct / 100.0)
     charts = '<div class="monitor-chart-stack">' + "".join([
         chart(
-            f"预警：{CYCLE_DEFENSIVE_LABEL} RSI30",
-            [series_payload(_plot_series_since(cyc_rsi30, finite), f"{CYCLE_DEFENSIVE_LABEL} RSI30", "#f6f7fb", "left", True, 1000)],
-            f"预警线≥{top_cfg.gsp_warn_rsi30:g}；当前{fmt(gsp_now,1)}{gsp_tag}。",
+            copy["chart_cyc_title_tpl"].format(label=CYCLE_DEFENSIVE_LABEL),
+            [series_payload(_plot_series_since(cyc_rsi30, finite), f"{CYCLE_DEFENSIVE_LABEL} 30日RSI", "#f6f7fb", "left", True, 1000)],
+            copy["chart_cyc_note_tpl"].format(thr=f"{top_cfg.gsp_warn_rsi30:g}", val=fmt(gsp_now, 1), tag=gsp_tag),
             None, 300, [0, 100], False,
             [hline(top_cfg.gsp_warn_rsi30, "left", f"预警{top_cfg.gsp_warn_rsi30:g}", "hot")],
         ),
         chart(
-            "预警：量子等权较60日低点涨幅（对数）",
-            [series_payload(_plot_series_since(quantum_from_low_log, finite), "ln(等权指数÷60日最低)×100", "#a377ff", "left", True, 1000)],
-            f"左轴ln(等权指数÷60个交易日最低)×100，翻倍线{doubling:.1f}；当前较60日低点{fmt(quantum_gain,0,'%')}{q_tag}。",
+            copy["chart_quantum_title"],
+            [series_payload(_plot_series_since(quantum_from_low_log, finite), "对数涨幅 ln(现价÷60日最低)×100", "#a377ff", "left", True, 1000)],
+            copy["chart_quantum_note_tpl"].format(val=fmt(quantum_gain, 0, "%"), tag=q_tag),
             None, 300, None, False,
             [hline(doubling, "left", f"翻倍+{top_cfg.quantum_warn_gain_pct:.0f}%", "hot"), hline(0, "left", "60日低点", "zero")],
         ),
         chart(
-            "过激：QQQ RSI14 与距200DMA",
+            copy["chart_excess_title"],
             [
-                series_payload(_plot_series_since(qqq_rsi14, finite), "QQQ RSI14", "#ffbf3c", "left", False, 1000),
-                series_payload(_plot_series_since(qqq_vs_200dma, finite), "QQQ 距200DMA %（右轴）", "#4da3ff", "right", False, 1000),
+                series_payload(_plot_series_since(qqq_rsi14, finite), "QQQ 14日RSI", "#ffbf3c", "left", False, 1000),
+                series_payload(_plot_series_since(qqq_vs_200dma, finite), "QQQ 距200日均线乖离%（右轴）", "#4da3ff", "right", False, 1000),
             ],
-            f"左轴RSI14（过激≥{top_cfg.excess_qqq_rsi14:.0f}），右轴距200DMA（过激≥+{top_cfg.excess_qqq_200dma_pct:.0f}%）；当前{fmt(qqq_rsi,1)}{qqq_rsi_tag}、{signed(qqq_200)}{qqq_200_tag}。",
+            copy["chart_excess_note_tpl"].format(
+                rsi_thr=f"{top_cfg.excess_qqq_rsi14:.0f}",
+                ma_thr=f"{top_cfg.excess_qqq_200dma_pct:.0f}",
+                rsi_val=fmt(qqq_rsi, 1),
+                rsi_tag=qqq_rsi_tag,
+                ma_val=signed(qqq_200),
+                ma_tag=qqq_200_tag,
+            ),
             [-25, 45], 320, [0, 100], False,
-            [hline(top_cfg.excess_qqq_rsi14, "left", f"RSI{top_cfg.excess_qqq_rsi14:.0f}", "hot"), hline(top_cfg.excess_qqq_200dma_pct, "right", f"200DMA+{top_cfg.excess_qqq_200dma_pct:.0f}%", "hot")],
+            [hline(top_cfg.excess_qqq_rsi14, "left", f"RSI{top_cfg.excess_qqq_rsi14:.0f}", "hot"), hline(top_cfg.excess_qqq_200dma_pct, "right", f"200日线+{top_cfg.excess_qqq_200dma_pct:.0f}%", "hot")],
         ),
-        momentum_chart,  # 过激：Momentum RSI 与 NDX/SPW RSI14，2026-09-04 从状态监控搬来（用户要求）
+        momentum_chart,
         chart(
-            "确认与失效：SPX、QQQ 距20日线",
+            copy["chart_confirm_title"],
             [
-                series_payload(_plot_series_since(spx_vs_20dma, finite), "SPX 距20DMA %", "#4da3ff", "left", False, 1000),
-                series_payload(_plot_series_since(qqq_vs_20dma, finite), "QQQ 距20DMA %", "#ffbf3c", "left", False, 1000),
+                series_payload(_plot_series_since(spx_vs_20dma, finite), "SPX 距20日均线 %", "#4da3ff", "left", False, 1000),
+                series_payload(_plot_series_since(qqq_vs_20dma, finite), "QQQ 距20日均线 %", "#ffbf3c", "left", False, 1000),
             ],
-            f"两条都收在0以下且QQQ较本轮最高跌≥{top_cfg.confirm_drawdown_pct:.0f}%才确认；当前SPX {signed(spx_20)}{spx_20_tag}、QQQ {signed(qqq_20)}{qqq_20_tag}。",
-            None, 300, None, False, [hline(0, "left", "20日线", "zero")],
+            copy["chart_confirm_note_tpl"].format(
+                dd_thr=f"{top_cfg.confirm_drawdown_pct:.0f}",
+                spx_val=signed(spx_20),
+                spx_tag=spx_20_tag,
+                qqq_val=signed(qqq_20),
+                qqq_tag=qqq_20_tag,
+            ),
+            None, 300, None, False, [hline(0, "left", "20日均线", "zero")],
         ),
         chart(
-            "QQQ 隐波 30D/60D（叠加QQQ）",
+            copy["chart_vol_title"],
             [
-                series_payload(_plot_series_since(vol_ratio_series, finite), "30D/60D 比值", "#a377ff", "left", True, 1000),
-                series_payload(_plot_series_since(qqq_price, finite), "QQQ 收盘价（右轴）", "#4da3ff", "right", False, 1000),
+                series_payload(_plot_series_since(vol_ratio_series, finite), "30日/60日隐波比值", "#a377ff", "left", True, 1000),
+                series_payload(_plot_series_since(qqq_price, finite), "QQQ 收盘价（右轴，美元）", "#4da3ff", "right", False, 1000),
             ],
-            f"左轴30D/60D比值，右轴QQQ收盘价；≤{vol_crush:.2f}为波动率塌陷（只作环境），当前{fmt(vol_val,2)}{vol_tag}。",
+            copy["chart_vol_note_tpl"].format(crush=f"{vol_crush:.2f}", val=fmt(vol_val, 2), tag=vol_tag),
             None, 340, None, False,
             [hline(vol_crush, "left", f"塌陷{vol_crush:.2f}", "hot"), hline(1.0, "left", "倒挂1.00", "zero")],
         ),
         chart(
-            "指数 put 保护提醒：VVIX/VIX（叠加QQQ）",
+            copy["chart_hedge_title"],
             [
-                series_payload(_plot_series_since(vvix_vix_series, finite), "VVIX/VIX", "#a377ff", "left", False, 1000),
-                series_payload(_plot_series_since(qqq_price, finite), "QQQ 收盘（右轴）", "#4da3ff", "right", False, 1000),
+                series_payload(_plot_series_since(vvix_vix_series, finite), "VVIX/VIX 比值", "#a377ff", "left", False, 1000),
+                series_payload(_plot_series_since(qqq_price, finite), "QQQ 收盘价（右轴，美元）", "#4da3ff", "right", False, 1000),
             ],
-            f"左轴VVIX/VIX（提醒线≥{top_cfg.put_hedge_vvix_vix:.1f}，过线每天提醒），右轴QQQ收盘；和状态机分离，当前{fmt(vvix_ratio,2)}{vvix_ratio_tag}。",
+            copy["chart_hedge_note_tpl"].format(thr=f"{top_cfg.put_hedge_vvix_vix:.1f}", val=fmt(vvix_ratio, 2), tag=vvix_ratio_tag),
             None, 340, [2, 11], False,
             [hline(top_cfg.put_hedge_vvix_vix, "left", f"提醒{top_cfg.put_hedge_vvix_vix:.1f}", "hot")],
         ),
     ]) + "</div>"
     stage_pill = f'<span class="monitor-env {"hot" if top_framework.get("active") else "muted"}">顶部阶段：{stage_value}</span>'
     env_pill = f'<span class="monitor-env {"hot" if environment.get("weak_now") else ""}">预警环境：{env_value}</span>'
-    hedge_pill = f'<span class="monitor-env {"hot" if hedge_on else "muted"}">指数put保护：{"提醒" if hedge_on else "无"}</span>'
+    hedge_pill = f'<span class="monitor-env {"hot" if hedge_on else "muted"}">看跌期权对冲提醒：{"提醒" if hedge_on else "无"}</span>'
+    lead_text = copy["section_lead"].format(
+        window_td=top_cfg.window_td,
+        timeout_td=top_cfg.excess_timeout_td,
+    )
     return (
         '<section class="monitor-section monitor-top"><div class="monitor-head">'
-        f'<div class="monitor-head-row"><h2>顶部监控</h2><span>{stage_pill} {env_pill} {hedge_pill}</span></div>'
-        '<p>预警开 T+40 活动窗，期间每天同时检查过激与转跌确认；过激三条（QQQ RSI14、距 200DMA、Momentum RSI）不是确认的前置条件，成立后把确认等待期延长到 60 个交易日。确认后等任一指数 20 日收盘新高失效；弱预警只挂标签，隐波比只作环境。VVIX/VIX 不进状态机，单独做指数 put 保护提醒，过线每天提醒。</p></div>'
+        f'<div class="monitor-head-row"><h2>{html.escape(copy["section_title"])}</h2><span>{stage_pill} {env_pill} {hedge_pill}</span></div>'
+        f'<p>{html.escape(lead_text)}</p></div>'
         f'<section class="cards bottom-cards">{cards}</section>{charts}</section>'
     )
 
@@ -619,14 +657,14 @@ def state_monitor_section(
     model_note: str,
     valuation_note: str,
 ) -> str:
-    # 风格走势图保持单列；S&P 一级行业 ETF 在 us_style_charts 内自带两列网格。
+    copy = UI_COPY["us_state"]
     style_charts = us_style_charts
     return (
-        '<section class="monitor-section monitor-state"><div class="monitor-head"><h2>状态监控</h2>'
-        '<p>趋势、高盛 Prime 对冲基金仓位、风格轮动、宏观和估值放在这里，用来判断市场所处环境；Momentum 图已并入顶部监控的过激段。</p></div>'
+        f'<section class="monitor-section monitor-state"><div class="monitor-head"><h2>{html.escape(copy["section_title"])}</h2>'
+        f'<p>{html.escape(copy["section_lead"])}</p></div>'
         + spx_trend_chart + gs_prime_html + style_charts
-        + '<h3 class="monitor-group-title">宏观与估值</h3><div class="grid two">' + macro_html
-        + '</div><div class="grid two"><article class="panel"><h3>SPX长期趋势模型输入</h3>'
-        + consensus_table + f'<p class="note">{model_note}</p></article>'
-        + f'<article class="panel"><h3>估值快照</h3>{valuation_table}<p class="note">{valuation_note}</p></article></div></section>'
+        + f'<h3 class="monitor-group-title">{html.escape(copy["macro_group_title"])}</h3><div class="grid two">' + macro_html
+        + f'</div><div class="grid two"><article class="panel"><h3>{html.escape(copy["spx_model_title"])}</h3>'
+        + consensus_table + f'<p class="note">{html.escape(model_note)}</p></article>'
+        + f'<article class="panel"><h3>{html.escape(copy["valuation_title"])}</h3>{valuation_table}<p class="note">{html.escape(valuation_note)}</p></article></div></section>'
     )

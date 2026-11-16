@@ -229,22 +229,22 @@ def test_intraday_cards_use_each_series_date() -> None:
         vvix=_span("2026-11-04", 92.0, "2026-10-15", 88.0),
         cyc=_span("2026-11-03", 28.0, "2026-10-15", 40.0),
     )
-    spx = _card(page, "SPX RSI14")
-    qqq = _card(page, "QQQ RSI14")
-    drawdown = _card(page, "QQQ 63日回撤")
+    spx = _card(page, "标普500指数（SPX）14日RSI")
+    qqq = _card(page, "纳指100 ETF（QQQ）14日RSI")
+    drawdown = _card(page, "纳指100 ETF（QQQ）近63日回撤")
     assert ">43.1</div>" in spx
-    assert "数据截至 2026-11-09（盘中）" in spx
+    assert "数据截至 2026-11-09（美东时间，盘中）" in spx
     assert "35.1" not in spx
     assert ">39.0</div>" in qqq
-    assert "数据截至 2026-11-09（盘中）" in qqq
+    assert "数据截至 2026-11-09（美东时间，盘中）" in qqq
     assert "31.4" not in qqq
     assert ">-11.4%</div>" in drawdown
-    assert "数据截至 2026-11-09（盘中）" in drawdown
+    assert "数据截至 2026-11-09（美东时间，盘中）" in drawdown
     assert "-13.6" not in drawdown
-    assert "正式状态截至 2026-11-06" in _card(page, "当前阶段")
-    vix = _card(page, "VIX")
-    vvix = _card(page, "VVIX")
-    cycle = _card(page, "周期股/防御股相对指数 RSI14")
+    assert "正式状态截至 2026-11-06" in _card(page, "当前底部阶段")
+    vix = _card(page, "标普500波动率指数（VIX）")
+    vvix = _card(page, "波动率的波动率指数（VVIX）")
+    cycle = _card(page, "周期/防御相对指数（GSPUCYDE）14日RSI")
     assert "数据截至 2026-11-05" in vix
     assert "盘中" not in vix
     assert "2026-11-09" not in vix
@@ -252,7 +252,7 @@ def test_intraday_cards_use_each_series_date() -> None:
     assert "盘中" not in vvix
     assert "数据截至 2026-11-03" in cycle
     assert "盘中" not in cycle
-    assert "（2026-11-09 盘中）" in page
+    assert "（2026-11-09 美东时间，盘中）" in page
 
 
 def test_after_close_same_date_is_not_intraday() -> None:
@@ -264,8 +264,8 @@ def test_after_close_same_date_is_not_intraday() -> None:
         dd=_span("2026-11-09", -11.4, "2026-11-06", -13.6),
     )
     assert "盘中" not in page
-    assert "数据截至 2026-11-09" in _card(page, "SPX RSI14")
-    assert "正式状态截至 2026-11-09" in _card(page, "当前阶段")
+    assert "数据截至 2026-11-09" in _card(page, "标普500指数（SPX）14日RSI")
+    assert "正式状态截至 2026-11-09" in _card(page, "当前底部阶段")
 
 
 def test_empty_series_does_not_borrow_a_date() -> None:
@@ -273,13 +273,19 @@ def test_empty_series_does_not_borrow_a_date() -> None:
         _bottom_framework("2026-11-06", "2026-11-09"),
         _bottom_environment("2026-11-06"),
     )
-    for title in ("SPX RSI14", "QQQ RSI14", "QQQ 63日回撤", "VIX", "VVIX"):
+    for title in (
+        "标普500指数（SPX）14日RSI",
+        "纳指100 ETF（QQQ）14日RSI",
+        "纳指100 ETF（QQQ）近63日回撤",
+        "标普500波动率指数（VIX）",
+        "波动率的波动率指数（VVIX）",
+    ):
         card = _card(page, title)
         assert ">暂无</div>" in card
         assert "数据截至 —" in card
         assert "2026-11-06" not in card
         assert "2026-11-09" not in card
-    assert "正式状态截至 2026-11-06" in _card(page, "当前阶段")
+    assert "正式状态截至 2026-11-06" in _card(page, "当前底部阶段")
 
 
 def test_missing_last_value_keeps_the_previous_observation_date() -> None:
@@ -292,7 +298,7 @@ def test_missing_last_value_keeps_the_previous_observation_date() -> None:
             ("2026-11-09", float("nan")),
         ]),
     )
-    card = _card(page, "SPX RSI14")
+    card = _card(page, "标普500指数（SPX）14日RSI")
     assert ">41.5</div>" in card
     assert "数据截至 2026-11-06" in card
     assert "盘中" not in card
@@ -312,10 +318,10 @@ def test_clocked_timestamp_converts_to_new_york_and_date_only_keeps_wall_date() 
             (pd.Timestamp("2026-11-06", tz="UTC"), 31.4),
         ]),
     )
-    vix = _card(page, "VIX")
-    qqq = _card(page, "QQQ RSI14")
+    vix = _card(page, "标普500波动率指数（VIX）")
+    qqq = _card(page, "纳指100 ETF（QQQ）14日RSI")
     assert ">18.2</div>" in vix
-    assert "数据截至 2026-11-06（盘中）" in vix
+    assert "数据截至 2026-11-06（美东时间，盘中）" in vix
     assert ">31.4</div>" in qqq
     assert "数据截至 2026-11-06" in qqq
     assert "盘中" not in qqq
@@ -337,18 +343,18 @@ def test_top_cards_keep_separate_dates_and_empty_series_use_official_dates() -> 
         spx_20=_span("2026-11-08", 1.2, "2026-10-15", 0.4),
         qqq_20=_span("2026-11-09", -0.5, "2026-10-15", 0.2),
     )
-    qqq = _card(trading, "QQQ RSI14")
-    momentum = _card(trading, "Momentum RSI14")
+    qqq = _card(trading, "纳指100 ETF（QQQ）14日RSI")
+    momentum = _card(trading, "高盛高动量指数（GSCBHMOM）14日RSI")
     assert ">39.0</div>" in qqq
-    assert "数据截至 2026-11-09（盘中）" in qqq
+    assert "数据截至 2026-11-09（美东时间，盘中）" in qqq
     assert "31.4" not in qqq
     assert ">62.0</div>" in momentum
     assert "数据截至 2026-11-04" in momentum
     assert "2026-11-09" not in momentum
     assert "盘中" not in momentum
-    assert "（2026-11-08 盘中）" in trading
-    assert "（2026-11-09 盘中）" in trading
-    assert "正式状态截至 2026-11-06" in _card(trading, "顶部阶段")
+    assert "（2026-11-08 美东时间，盘中）" in trading
+    assert "（2026-11-09 美东时间，盘中）" in trading
+    assert "正式状态截至 2026-11-06" in _card(trading, "顶部监测阶段")
 
     official = _top_page(
         {
@@ -372,17 +378,17 @@ def test_top_cards_keep_separate_dates_and_empty_series_use_official_dates() -> 
         vol_ratio=0.91,
     )
     assert "盘中" not in official
-    qqq = _card(official, "QQQ RSI14")
+    qqq = _card(official, "纳指100 ETF（QQQ）14日RSI")
     assert ">31.4</div>" in qqq
     assert "数据截至 2026-11-06" in qqq
-    momentum = _card(official, "Momentum RSI14")
+    momentum = _card(official, "高盛高动量指数（GSCBHMOM）14日RSI")
     assert ">60.0</div>" in momentum
     assert "数据截至 2026-11-04" in momentum
     assert "2026-11-06" not in momentum
-    assert "数据截至 2026-11-05" in _card(official, "周期股/防御股相对指数 RSI30")
-    assert ">12%</div>" in _card(official, "量子等权较60日低点")
-    assert "数据截至 2026-11-06" in _card(official, "量子等权较60日低点")
-    vol = _card(official, "QQQ 隐波 30D/60D")
+    assert "数据截至 2026-11-05" in _card(official, "周期/防御相对指数（GSPUCYDE）30日RSI")
+    assert ">12%</div>" in _card(official, "量子计算等权篮子较60日低点涨幅")
+    assert "数据截至 2026-11-06" in _card(official, "量子计算等权篮子较60日低点涨幅")
+    vol = _card(official, "QQQ 30日/60日隐含波动率比值")
     assert ">0.91</div>" in vol
     assert "数据截至 2026-11-06" in vol
 
@@ -481,7 +487,7 @@ def test_missing_volume_note_does_not_invent_a_zero_baseline() -> None:
 
 
 def test_freshness_detail_and_page_script_do_not_say_zero_days() -> None:
-    refresh = f"页面每{CLI.FLOW_REFRESH_MIN}分钟自刷新"
+    refresh = f"交易时段每{CLI.FLOW_REFRESH_MIN}分钟更新"
     assert CLI.turnover_freshness_detail({"ok": True, "days": ["2026-11-06"] * 20}) == (
         f"沪深两市累计成交额；基线取前20个完整交易日，{refresh}"
     )
@@ -535,22 +541,22 @@ def test_put_hedge_card_separates_ratio_date_from_official_as_of() -> None:
         },
         vvix_vix=_span("2026-11-09", 5.5, "2026-11-06", 4.2),
     )
-    card = _card(page, "指数 put 保护提醒（VVIX/VIX）")
+    card = _card(page, "指数看跌期权（Put）对冲窗口提醒")
     assert ">提醒</div>" in card
-    assert "VVIX/VIX 5.50（2026-11-09 盘中）" in card
+    assert "VVIX/VIX 5.50（2026-11-09 美东时间，盘中）" in card
     assert "VIX 16.4" in card
-    assert "1月平值put≈0.8%名义" in card
+    assert "1个月期平值看跌期权成本约 0.8% 名义本金" in card
     assert "4.20" not in card
     assert "数据截至" not in card
     official = _official_hedge_clause(card)
     assert official.startswith(" 2026-11-06")
     assert "2026-11-09" not in official
     assert "VIX 16.4" in official
-    assert "1月平值put≈0.8%名义" in official
-    assert "2018年起12段" in card
+    assert "1个月期平值看跌期权成本约 0.8% 名义本金" in official
+    assert "2018年起共 12 段" in card
     assert "正式提醒截至 2026-11-06" in card
-    assert "当前5.50（2026-11-09 盘中）" in page
-    assert "指数put保护：提醒" in page
+    assert "当前 5.50（2026-11-09 美东时间，盘中）" in page
+    assert "看跌期权对冲提醒：提醒" in page
 
     missing = _top_page(
         {
@@ -564,11 +570,11 @@ def test_put_hedge_card_separates_ratio_date_from_official_as_of() -> None:
         },
         vvix_vix=_span("2026-11-09", 5.5, "2026-11-06", 4.2),
     )
-    missing_card = _card(missing, "指数 put 保护提醒（VVIX/VIX）")
+    missing_card = _card(missing, "指数看跌期权（Put）对冲窗口提醒")
     assert ">无</div>" in missing_card
-    assert "VVIX/VIX 5.50（2026-11-09 盘中）" in missing_card
+    assert "VVIX/VIX 5.50（2026-11-09 美东时间，盘中）" in missing_card
     assert "VIX 16.4" in missing_card
-    assert "1月平值put≈0.8%名义" in missing_card
+    assert "1个月期平值看跌期权成本约 0.8% 名义本金" in missing_card
     assert "正式提醒截至 —" in missing_card
     assert "数据截至" not in missing_card
     assert "历史样本不足" in missing_card
