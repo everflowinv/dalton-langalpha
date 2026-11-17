@@ -289,7 +289,7 @@ if [[ "$BASELINE_ONLY" -eq 0 ]]; then
 
   run_and_record \
     "J1 Debug 6/9: Legacy Report Comparison Reproducing 5 Mismatched Rows & 5 G3 Mismatches (render_report_tables.py)" \
-    "uv run python -c 'import json, subprocess, sys; out = subprocess.check_output([sys.executable, \"scripts/dalton/realrun/render_report_tables.py\", \"--compare-legacy-report\", \"docs/dalton/dev-guide/P0I-round3-dev-report.md\", \"--evidence-dir\", \"var/dalton/trial-runs/realrun-20261019\"], text=True); print(out, end=\"\"); data = json.loads(out); assert data[\"mismatched_table_rows_count\"] == 5 and len(data[\"g3_evaluation_mismatches\"]) == 5'"
+    "uv run python -c 'import json, subprocess, sys; out = subprocess.check_output([sys.executable, \"scripts/dalton/realrun/render_report_tables.py\", \"--compare-legacy-report\", \"docs/dalton/archive/dev-guide/P0I-round3-dev-report.md\", \"--evidence-dir\", \"var/dalton/trial-runs/realrun-20261019\"], text=True); print(out, end=\"\"); data = json.loads(out); assert data[\"mismatched_table_rows_count\"] == 5 and len(data[\"g3_evaluation_mismatches\"]) == 5'"
 
   run_and_record \
     "J1 Debug 7/9: G2 Startup Fail-Fast Check (g2_providers.py --only-startup-check)" \

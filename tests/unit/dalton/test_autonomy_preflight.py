@@ -130,7 +130,7 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         "dalton-meta-move-up",
         "dalton-meta-move-down",
     ]
-    # A13: verify cron/threshold alignment with docs/dalton/dev-guide/automation-templates/
+    # A13: verify cron/threshold alignment with docs/dalton/archive/dev-guide/automation-templates/
     assert specs[0]["cron_expression"] == "*/30 6-20 * * 1-5"
     assert specs[0]["timezone"] == "America/New_York"
     assert specs[1]["cron_expression"] == "0 11 * * 2-6"

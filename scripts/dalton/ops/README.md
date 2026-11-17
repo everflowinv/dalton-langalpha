@@ -1,6 +1,8 @@
 # Dalton Offsite Backup (`scripts/dalton/ops/`)
 
-Dalton 配置的 GitHub 私有仓库备份（B2）、每日数据库流式加密上传（B3b）与每周数据包纯流式加密上传（B3：`<产生数据> | openssl | rclone rcat` 直传 Google Drive，临时与缓存目录均验证在外置盘上，不落内置盘）。
+Dalton 配置的 GitHub 私有仓库备份（B2）、每日数据库流式加密上传（B3b）与每周数据包纯流式加密上传（B3：`<产生数据> | openssl | rclone rcat` 直传 Google Drive，临时与缓存目录均验证在外置盘上，不落内置盘）。完整系统运维拓扑与故障处置另见 [OPERATIONS.md](../../../docs/dalton/OPERATIONS.md)。
+
+> 注：`var/dalton/openclaw-data` 当前是 Dalton 数据任务、市场情绪看板与工作区技能资产的活跃卷目录（OpenClaw 守护进程本身已退役，仅保留数据结构）；每周包会通过 `sqlite3` 在线备份 API 对其中 SQLite 库生成一致副本后再打包。
 
 ## 1. 重要安全提示：保存加密口令到密码管理器
 

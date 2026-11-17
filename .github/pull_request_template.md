@@ -8,7 +8,7 @@
 -->
 
 ## 本族范围
-（对应 `docs/dalton/dev-guide/P0J-round4-fixes.md` 第几节）
+（对应 `docs/dalton/archive/dev-guide/P0J-round4-fixes.md` 第几节）
 
 ## 改动清单
 - 文件:行号 —— 改了什么、为什么（每一条都要写明对应的文件和行号，并且能在 diff 里找到；把本 PR 描述保存成文件并用 `scripts/dalton/check_report_claims.py` 扫描）

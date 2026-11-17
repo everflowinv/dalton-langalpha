@@ -17,7 +17,7 @@ Responsibilities:
 4. Support `--record`: without `--record`, run in debug mode (`DEBUG RUN — NOT EVIDENCE` printed at start)
    and write zero files; with `--record`, write raw evidence JSON and runtime summary Markdown exclusively
    under `var/dalton/`, and provide `--render-docs` to render summaries (and G6 comparison doc) from
-   `var/dalton/` into `docs/dalton/dev-guide/trial-runs/` after all families complete (L42).
+   `var/dalton/` into `docs/dalton/archive/dev-guide/trial-runs/` after all families complete (L42).
 """
 
 from __future__ import annotations
@@ -1213,11 +1213,11 @@ def render_summaries_from_var_to_docs(
     date_str: str,
     repo_root: Path = REPO_ROOT,
 ) -> list[str]:
-    """Render `G<N>.md` (and G6 comparison doc when G6 is present) into `docs/dalton/dev-guide/trial-runs/` strictly from `var/dalton/trial-runs/realrun-<date>/*.json` (L42, Item 15)."""
+    """Render `G<N>.md` (and G6 comparison doc when G6 is present) into `docs/dalton/archive/dev-guide/trial-runs/` strictly from `var/dalton/trial-runs/realrun-<date>/*.json` (L42, Item 15)."""
     var_dir = repo_root / "var" / "dalton" / "trial-runs" / f"realrun-{date_str}"
     if not var_dir.is_dir():
         raise FileNotFoundError(f"Evidence directory not found: {var_dir}")
-    docs_dir = repo_root / "docs" / "dalton" / "dev-guide" / "trial-runs" / f"realrun-{date_str}"
+    docs_dir = repo_root / "docs" / "dalton" / "archive" / "dev-guide" / "trial-runs" / f"realrun-{date_str}"
     docs_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[str] = []
@@ -1264,6 +1264,7 @@ def render_summaries_from_var_to_docs(
                 repo_root
                 / "docs"
                 / "dalton"
+                / "archive"
                 / "dev-guide"
                 / "trial-runs"
                 / f"G6-financial-lenses-comparison-{date_str}.md"
@@ -1504,7 +1505,7 @@ class RealRunHttpClient:
 def main(argv: list[str] | None = None) -> int:
     load_repo_dotenv()
     parser = argparse.ArgumentParser(
-        description="Render trial-run Markdown summaries from var/dalton/trial-runs/realrun-<date>/ into docs/dalton/dev-guide/trial-runs/realrun-<date>/ (P0J §1.6, L42)."
+        description="Render trial-run Markdown summaries from var/dalton/trial-runs/realrun-<date>/ into docs/dalton/archive/dev-guide/trial-runs/realrun-<date>/ (P0J §1.6, L42)."
     )
     parser.add_argument("--render-docs", action="store_true", required=True, help="Render G<N>.md summaries into docs/")
     parser.add_argument("--date", default=default_shanghai_date(), help="Trial-run date string (YYYYMMDD)")

@@ -488,7 +488,7 @@ def test_common_synthetic_validation_and_artifact_writing(
         date_str="20261019", repo_root=tmp_path
     )
     assert len(rendered_files) == 1
-    expected_doc = tmp_path / "docs" / "dalton" / "dev-guide" / "trial-runs" / "realrun-20261019" / "G1.md"
+    expected_doc = tmp_path / "docs" / "dalton" / "archive" / "dev-guide" / "trial-runs" / "realrun-20261019" / "G1.md"
     assert expected_doc.is_file()
     assert sha256_hex in expected_doc.read_text(encoding="utf-8")
 
