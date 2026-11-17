@@ -1,0 +1,144 @@
+{
+  "l1_us": {
+    "benchmark": "SPY",
+    "components": [
+      {
+        "key": "vix_term",
+        "label": "恐慌波动率期限结构（VIX3M/VIX）",
+        "num": "^VIX3M",
+        "den": "^VIX",
+        "type": "ratio",
+        "sign": 1,
+        "note": "高于 1 代表远期高于近月（市场平静）；低于 1 倒挂代表短期恐慌"
+      },
+      {
+        "key": "credit",
+        "label": "信用风险偏好：高收益债/国债（HYG/IEF）",
+        "num": "HYG",
+        "den": "IEF",
+        "type": "ratio",
+        "sign": 1,
+        "note": "数值走高代表高收益债跑赢国债、市场风险偏好升温"
+      },
+      {
+        "key": "breadth",
+        "label": "市场宽度：标普500等权/市值加权（RSP/SPY）",
+        "num": "RSP",
+        "den": "SPY",
+        "type": "ratio",
+        "sign": 1,
+        "note": "数值走高代表等权指数跑赢、市场呈普涨格局"
+      },
+      {
+        "key": "style_gv",
+        "label": "风格倾向：罗素1000成长/价值（IWF/IWD）",
+        "num": "IWF",
+        "den": "IWD",
+        "type": "ratio",
+        "sign": 0,
+        "note": "仅作风格方向参考（走高偏成长、走低偏价值），不计入风险偏好总分"
+      },
+      {
+        "key": "size",
+        "label": "大小盘偏好：罗素2000/标普500（IWM/SPY）",
+        "num": "IWM",
+        "den": "SPY",
+        "type": "ratio",
+        "sign": 1,
+        "note": "数值走高代表小盘股跑赢大盘、风险偏好较高"
+      },
+      {
+        "key": "cyc_def",
+        "label": "周期与防御比价：工业/必选消费（XLI/XLP）",
+        "num": "XLI",
+        "den": "XLP",
+        "type": "ratio",
+        "sign": 1,
+        "note": "数值走高代表顺周期板块跑赢防御板块"
+      },
+      {
+        "key": "copper_gold",
+        "label": "铜金比（铜期货/黄金期货）",
+        "num": "HG=F",
+        "den": "GC=F",
+        "type": "ratio",
+        "sign": 1,
+        "note": "数值走高代表工业需求预期强于避险需求"
+      },
+      {
+        "key": "trend",
+        "label": "大盘趋势：标普500 ETF（SPY）距200日均线乖离",
+        "num": "SPY",
+        "den": null,
+        "type": "ma_dist",
+        "sign": 1,
+        "ma": 200,
+        "note": "正值越大代表指数处于长期上升趋势上方越强"
+      }
+    ]
+  },
+  "l2_us": {
+    "benchmark": "SPY",
+    "groups": {
+      "标普一级行业": {
+        "XLK": "信息技术",
+        "XLC": "通信服务",
+        "XLY": "可选消费",
+        "XLP": "必选消费",
+        "XLE": "能源",
+        "XLF": "金融",
+        "XLV": "医疗保健",
+        "XLI": "工业",
+        "XLB": "材料",
+        "XLRE": "房地产",
+        "XLU": "公用事业"
+      },
+      "细分主题赛道": {
+        "SMH": "半导体",
+        "IGV": "软件",
+        "ITA": "国防军工",
+        "XBI": "生物科技",
+        "XME": "金属矿业",
+        "KRE": "区域银行",
+        "IYT": "运输",
+        "XOP": "油气勘探",
+        "ITB": "住宅建筑",
+        "URA": "铀与核能",
+        "TAN": "光伏",
+        "IBB": "生物制药",
+        "PAVE": "基建",
+        "JETS": "航空",
+        "GDX": "金矿",
+        "ARKK": "高波成长"
+      }
+    }
+  },
+  "l2_cn": {
+    "benchmark_code": "000300",
+    "benchmark_label": "沪深300",
+    "source": "akshare_sw_index",
+    "levels": ["first", "second"],
+    "min_constituents": 5,
+    "rrg_max_points": 42,
+    "valuation_start": "2021-12-31"
+  },
+  "valuation": {
+    "min_obs": 104,
+    "score_cuts": [20, 40, 60, 80],
+    "weights": {"pe": 0.4, "pb": 0.4, "dy": 0.2},
+    "pe_blowout_mult": 4.0,
+    "pe_abs_cap": 300
+  },
+  "rrg": {
+    "rs_window": 60,
+    "mom_window": 10,
+    "tail_len": 8
+  },
+  "scoring": {
+    "zscore_lookback_days": 504,
+    "regime_bands": {
+      "offense": 65,
+      "defense": 35
+    }
+  }
+}

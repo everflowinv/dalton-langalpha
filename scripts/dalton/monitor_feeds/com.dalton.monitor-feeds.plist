@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for Dalton Realtime Monitor Feeds (CN A-share & HK Momentum).
+  INTERNAL_SERVICE_TOKEN is injected strictly via EnvironmentVariables at install time
+  from Dalton's existing .env file (never stored in git or read from external files at runtime).
+  Install to ~/Library/LaunchAgents/com.dalton.monitor-feeds.plist (chmod 600):
+    1. Replace __PROJECT_DIR__, __HOME__, __LOG_DIR__, and __INTERNAL_SERVICE_TOKEN__.
+    2. chmod 600 ~/Library/LaunchAgents/com.dalton.monitor-feeds.plist
+    3. Load with:
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.monitor-feeds.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dalton.monitor-feeds</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_DIR__/.venv/bin/python</string>
+    <string>__PROJECT_DIR__/scripts/dalton/monitor_feeds/run_feeds.py</string>
+    <string>--state-dir</string>
+    <string>__PROJECT_DIR__/var/dalton/monitor-feeds</string>
+    <string>--hk-daily-dir</string>
+    <string>__PROJECT_DIR__/var/dalton/openclaw-data/state/monitor-feeds/hk_momentum</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONPATH</key>
+    <string>__PROJECT_DIR__:__PROJECT_DIR__/src</string>
+    <key>DALTON_BACKEND_URL</key>
+    <string>http://127.0.0.1:8000</string>
+    <key>INTERNAL_SERVICE_TOKEN</key>
+    <string>__INTERNAL_SERVICE_TOKEN__</string>
+    <key>DALTON_MONITOR_FEEDS_STATE_DIR</key>
+    <string>__PROJECT_DIR__/var/dalton/monitor-feeds</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/dalton-monitor-feeds.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/dalton-monitor-feeds.err.log</string>
+</dict>
+</plist>

@@ -101,6 +101,9 @@ TASK_NOTIFY_PAYLOAD_SOURCES: dict[str, str] = {
     "richard-relative-dashboard-refresh": "none",  # T34
     "podcast-weekly-pipeline": "none",  # T60
     "weekly-token-usage": "outbox_file",  # T61
+    "pm-market-state": "none",  # T84
+    "cn-intraday": "none",  # T85
+    "hk-momentum": "none",  # T86
 }
 
 _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
@@ -134,6 +137,9 @@ _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
     "T34": "none",
     "T60": "none",
     "T61": "outbox_file",
+    "T84": "none",
+    "T85": "none",
+    "T86": "none",
 }
 
 

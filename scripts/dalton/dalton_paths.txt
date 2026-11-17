@@ -461,3 +461,7 @@ src/dalton/migrations/versions/d039_monitor_publish_runs.py
 tests/unit/dalton/test_monitors.py
 web/src/pages/Monitors/
 web/src/pages/ChatAgent/components/__tests__/PublishDialog.monitors.test.tsx
+# Monitors (Round 2: Migrated local dashboards — PM L1/L2, A-share intraday, HK momentum):
+scripts/dalton/monitor_feeds/
+tests/unit/dalton/test_monitor_feeds.py
+tests/unit/dalton/fixtures/monitor_feeds/
