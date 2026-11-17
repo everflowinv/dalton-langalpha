@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from psycopg.errors import UniqueViolation
+from psycopg.errors import UniqueViolation  # DALTON-HOOK(monitors): path-rename conflict detection
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
@@ -22,6 +22,7 @@ class ArtifactNotFound(LookupError):
     """No file record by that id belongs to this user."""
 
 
+# DALTON-HOOK(monitors): raised when a legacy data-job artifact path rename hits an occupied path.
 class ArtifactPathConflict(Exception):
     """Target workspace path is already occupied by another ``share_links`` record."""
 
