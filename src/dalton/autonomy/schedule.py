@@ -531,6 +531,7 @@ async def schedule_dalton_automation_helper(
     action: str | None = None,
     actor_user_id: str | None = None,
     conn: Any = None,
+    via_rest: bool = False,
 ) -> dict[str, Any]:
     """Idempotently create, update, pause, resume, or list Dalton (`dalton-*`) automations (G4.5).
 
@@ -719,6 +720,9 @@ async def schedule_dalton_automation_helper(
         else resolved_name
     )
 
+    pending_report_finalize: tuple[Any, dict[str, Any], str | None] | None = None
+    pending_result: dict[str, Any] | None = None
+
     async with user_automations_lock(user_id, conn=conn) as active_conn:
         conn_kw = {"conn": active_conn} if active_conn is not None else {}
         rows = await list_all_user_automations(
@@ -850,6 +854,38 @@ async def schedule_dalton_automation_helper(
                 if mv is None:
                     merged_meta.pop(mk, None)
 
+            old_rp = existing_meta.get("report_profile")
+            new_rp = merged_meta.get("report_profile")
+            rp_changed = (
+                "report_profile" in meta
+                or ("report_profile" in existing_meta and new_rp != old_rp)
+            ) and new_rp != old_rp
+            report_profile_change = None
+            if rp_changed:
+                from src.dalton.services.report_delivery import (
+                    ReportDeliveryError,
+                    validate_report_profile_change,
+                )
+
+                target_view = dict(existing)
+                if instruction is not None:
+                    target_view["instruction"] = instruction
+                try:
+                    report_profile_change = await validate_report_profile_change(
+                        effective_actor_id,
+                        target_view,
+                        new_rp,
+                        via_rest=via_rest,
+                        user_confirmed=False,
+                        action="update",
+                        after_metadata=merged_meta,
+                        conn=active_conn,
+                    )
+                except ReportDeliveryError as exc:
+                    if via_rest:
+                        raise
+                    return {"ok": False, "error": exc.code, "message": exc.message}
+
             existing_is_paused = str(existing.get("status") or "").strip().lower() == "paused"
             patch: dict[str, Any] = {}
             if instruction is not None:
@@ -866,7 +902,9 @@ async def schedule_dalton_automation_helper(
                 patch["next_run_at"] = None
             elif next_dt is not None and (not existing_is_paused or explicit_status == "active"):
                 patch["next_run_at"] = next_dt
-            if merged_meta:
+            if rp_changed and report_profile_change is not None:
+                merged_meta = dict(report_profile_change.after_metadata)
+            if merged_meta or rp_changed:
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
@@ -897,10 +935,16 @@ async def schedule_dalton_automation_helper(
                 if outer_hist_ctx is not None and outer_hist_ctx.has_explicit_action
                 else "update"
             )
+            report_audit_payload = (
+                report_profile_change.build_audit_entry()
+                if report_profile_change is not None
+                else None
+            )
             with automation_history_context(
                 actor_user_id=effective_actor_id,
                 action=effective_update_action,
                 skip_if_unchanged=True,
+                report_delivery_audit=report_audit_payload,
             ):
                 updated = await auto_db.update_automation(
                     str(existing["automation_id"]),
@@ -908,48 +952,185 @@ async def schedule_dalton_automation_helper(
                     **conn_kw,
                     **patch,
                 )
-            return {
+            updated_row = updated or existing
+            sync_failed_warning: str | None = None
+            if report_profile_change is not None:
+                sync_failed_warning = await _sync_report_profile_in_schedule_tx(
+                    active_conn,
+                    change=report_profile_change,
+                    saved_row=updated_row,
+                    default_owner_user_id=user_id,
+                )
+            result: dict[str, Any] = {
                 "ok": True,
                 "action": "updated",
-                "automation_id": str((updated or existing).get("automation_id")),
+                "automation_id": str(updated_row.get("automation_id")),
                 "name": resolved_name,
             }
+            from src.dalton.services.report_delivery import (
+                build_missing_report_profile_warning,
+            )
 
-        clean_meta = {k: v for k, v in meta.items() if v is not None}
-        resolved_scope = await resolve_automation_scope_for_write(
-            user_id,
-            name=resolved_name,
-            workspace_id=ws_id,
-            metadata=clean_meta,
-            conn=active_conn,
+            warning = build_missing_report_profile_warning(
+                updated_row.get("instruction"),
+                updated_row.get("metadata"),
+            )
+            if warning:
+                result["warning"] = warning
+            if report_profile_change is not None:
+                pending_report_finalize = (report_profile_change, updated_row, sync_failed_warning)
+                pending_result = result
+            else:
+                return result
+
+        if pending_result is None:
+            clean_meta = {k: v for k, v in meta.items() if v is not None}
+            create_report_change = None
+            if "report_profile" in clean_meta:
+                from src.dalton.services.report_delivery import (
+                    ReportDeliveryError,
+                    validate_report_profile_change,
+                )
+
+                try:
+                    create_report_change = await validate_report_profile_change(
+                        effective_actor_id,
+                        {
+                            "user_id": user_id,
+                            "name": resolved_name,
+                            "instruction": instruction or "",
+                            "metadata": {},
+                        },
+                        clean_meta.get("report_profile"),
+                        via_rest=via_rest,
+                        user_confirmed=False,
+                        action="create",
+                        after_metadata=clean_meta,
+                        conn=active_conn,
+                    )
+                except ReportDeliveryError as exc:
+                    if via_rest:
+                        raise
+                    return {"ok": False, "error": exc.code, "message": exc.message}
+            create_meta = (
+                dict(create_report_change.after_metadata)
+                if create_report_change is not None
+                else clean_meta
+            )
+            resolved_scope = await resolve_automation_scope_for_write(
+                user_id,
+                name=resolved_name,
+                workspace_id=ws_id,
+                metadata=create_meta,
+                conn=active_conn,
+            )
+            create_kw: dict[str, Any] = dict(conn_kw)
+            if explicit_status and explicit_status != "active":
+                create_kw["status"] = explicit_status
+            create_audit_payload = (
+                create_report_change.build_audit_entry()
+                if create_report_change is not None
+                else None
+            )
+            with automation_history_context(
+                actor_user_id=effective_actor_id,
+                action="create",
+                report_delivery_audit=create_audit_payload,
+            ):
+                created = await auto_db.create_automation(
+                    user_id=user_id,
+                    name=resolved_name,
+                    description=description,
+                    trigger_type=trigger_type,
+                    cron_expression=cron_expression,
+                    timezone=tz,
+                    trigger_config=trigger_config,
+                    next_run_at=None if explicit_status == "paused" else next_dt,
+                    instruction=instruction or "",
+                    workspace_id=ws_id,
+                    llm_model=merged_spec.get("llm_model"),
+                    additional_context=merged_spec.get("additional_context"),
+                    thread_strategy=str(merged_spec.get("thread_strategy") or "new"),
+                    conversation_thread_id=merged_spec.get("conversation_thread_id"),
+                    delivery_config=merged_spec.get("delivery_config"),
+                    metadata=create_meta,
+                    scope=resolved_scope,
+                    created_by=effective_actor_id,
+                    **create_kw,
+                )
+            create_sync_failed_warning: str | None = None
+            if create_report_change is not None and isinstance(created, dict):
+                create_sync_failed_warning = await _sync_report_profile_in_schedule_tx(
+                    active_conn,
+                    change=create_report_change,
+                    saved_row=created,
+                    default_owner_user_id=user_id,
+                )
+            created_result: dict[str, Any] = {
+                "ok": True,
+                "action": "created",
+                "automation_id": str(created.get("automation_id")),
+                "name": resolved_name,
+            }
+            from src.dalton.services.report_delivery import (
+                build_missing_report_profile_warning,
+            )
+
+            warning = build_missing_report_profile_warning(
+                created.get("instruction") if isinstance(created, dict) else (instruction or ""),
+                created.get("metadata") if isinstance(created, dict) else create_meta,
+            )
+            if warning:
+                created_result["warning"] = warning
+            if create_report_change is not None:
+                pending_report_finalize = (create_report_change, created, create_sync_failed_warning)
+                pending_result = created_result
+            else:
+                return created_result
+
+    if pending_report_finalize is not None:
+        change_obj, saved_row, sync_failed_warning = pending_report_finalize
+        from src.dalton.company_identity import is_company_system_user
+        from src.dalton.services.report_delivery import evaluate_route_warning_best_effort
+        from src.server.database.user import (
+            invalidate_user_prefs_cache,
+            invalidate_user_profile_cache,
         )
-        create_kw: dict[str, Any] = dict(conn_kw)
-        if explicit_status and explicit_status != "active":
-            create_kw["status"] = explicit_status
-        created = await auto_db.create_automation(
-            user_id=user_id,
-            name=resolved_name,
-            description=description,
-            trigger_type=trigger_type,
-            cron_expression=cron_expression,
-            timezone=tz,
-            trigger_config=trigger_config,
-            next_run_at=None if explicit_status == "paused" else next_dt,
-            instruction=instruction or "",
-            workspace_id=ws_id,
-            llm_model=merged_spec.get("llm_model"),
-            additional_context=merged_spec.get("additional_context"),
-            thread_strategy=str(merged_spec.get("thread_strategy") or "new"),
-            conversation_thread_id=merged_spec.get("conversation_thread_id"),
-            delivery_config=merged_spec.get("delivery_config"),
-            metadata=clean_meta,
-            scope=resolved_scope,
-            created_by=effective_actor_id,
-            **create_kw,
-        )
-        return {
-            "ok": True,
-            "action": "created",
-            "automation_id": str(created.get("automation_id")),
-            "name": resolved_name,
-        }
+
+        if not is_company_system_user(change_obj.owner_user_id):
+            try:
+                await invalidate_user_prefs_cache(change_obj.owner_user_id)
+                await invalidate_user_profile_cache(change_obj.owner_user_id)
+            except Exception:
+                pass
+        await change_obj.finalize(automation=saved_row)
+        if sync_failed_warning:
+            route_warning = sync_failed_warning
+        else:
+            route_warning = await evaluate_route_warning_best_effort(
+                change_obj.owner_user_id,
+                saved_row,
+                change_obj,
+            )
+        assert pending_result is not None
+        pending_result["route_warning"] = route_warning
+    assert pending_result is not None
+    return pending_result
+
+
+async def _sync_report_profile_in_schedule_tx(
+    active_conn: Any,
+    *,
+    change: Any,
+    saved_row: dict[str, Any],
+    default_owner_user_id: str,
+) -> str | None:
+    """Sync ``automation:<id>`` routes, refresh snapshot, and claim 10m admin notice slot inside schedule tx."""
+    from src.dalton.services.report_delivery import sync_report_profile_after_write_in_tx
+
+    return await sync_report_profile_after_write_in_tx(
+        active_conn,
+        change=change,
+        saved_row=saved_row,
+        default_owner_user_id=default_owner_user_id,
+    )

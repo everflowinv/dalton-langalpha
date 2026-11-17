@@ -682,7 +682,10 @@ async def submit_automation_report(
     else:
         return _error(action, "invalid_material", "material must be yes, no, no_change, or no-change.")
     content_supplied = _content_supplied(cards, failure_text, text)
-    try:
+    missing_profile_notify: dict[str, Any] | None = None
+
+    async def _run_submit_tx() -> dict[str, Any]:
+        nonlocal missing_profile_notify
         async with get_db_connection(conn) as owned:
             async with owned.transaction():
                 async with owned.cursor(row_factory=dict_row) as cur:
@@ -699,6 +702,23 @@ async def submit_automation_report(
                     assert row is not None
                     parsed, profile_err = parse_report_profile(row.get("metadata"))
                     if profile_err or parsed is None:
+                        from src.dalton.services.report_delivery import (
+                            claim_missing_report_profile_notice,
+                        )
+
+                        claimed_attempt = await claim_missing_report_profile_notice(cur, row)
+                        if claimed_attempt is not None:
+                            missing_profile_notify = {
+                                "owner_user_id": str(row.get("user_id") or "").strip(),
+                                "automation_id": str(row.get("automation_id") or "").strip(),
+                                "automation_name": row.get("name"),
+                                "execution_id": str(
+                                    row.get("automation_execution_id")
+                                    or identity.get("execution_id")
+                                    or ""
+                                ).strip(),
+                                "attempts": claimed_attempt,
+                            }
                         return _error(action, "profile_invalid", "Automation metadata has no valid report profile.")
                     if quiet:
                         if content_supplied:
@@ -802,12 +822,40 @@ async def submit_automation_report(
                         lock=True,
                     )
                     return _success_from_rows(stored, created=True)
+
+    try:
+        result = await _run_submit_tx()
     except UniqueViolation:
         return _error(
             action,
             "execution_batch_conflict",
             "This execution already has a delivery row for one of these recipients.",
         )
+
+    if missing_profile_notify is not None:
+        from src.dalton.services.report_delivery import (
+            finalize_missing_report_profile_notice,
+            notify_owner_missing_report_profile_once,
+        )
+
+        claimed_attempt = int(missing_profile_notify.pop("attempts"))
+        sent_ok = False
+        err_reason: str | None = None
+        try:
+            sent_ok, err_reason = await notify_owner_missing_report_profile_once(
+                **missing_profile_notify
+            )
+        except Exception as exc:
+            sent_ok = False
+            err_reason = type(exc).__name__
+        await finalize_missing_report_profile_notice(
+            automation_id=missing_profile_notify["automation_id"],
+            attempts=claimed_attempt,
+            sent_ok=sent_ok,
+            error=err_reason,
+            conn=conn,
+        )
+    return result
 
 
 async def read_automation_report_status(

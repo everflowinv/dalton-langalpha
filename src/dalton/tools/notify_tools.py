@@ -191,13 +191,23 @@ def _match_user_automation(
 def _automation_route_key(automation: Mapping[str, Any]) -> str | None:
     """Return the route/override storage key for ``automation``.
 
-    Inherent categories keep their display name; custom automations use
-    ``f"automation:{automation_id}"``.
+    Report automations (validated ``report_profile`` or report skill) and
+    custom automations always use ``f"automation:{automation_id}"``. Other
+    inherent categories keep their display name.
     """
+    auto_id = str(automation.get("automation_id") or "").strip()
+    from src.dalton.database.automation_reports import (
+        automation_has_validated_report_profile,
+    )
+    from src.dalton.services.report_delivery import instruction_uses_report_skill
+
+    if automation_has_validated_report_profile(automation) or instruction_uses_report_skill(
+        automation.get("instruction")
+    ):
+        return f"automation:{auto_id}" if auto_id else None
     if classify_automation_for_notify(automation) is not None:
         name = str(automation.get("name") or "").strip()
         return name or None
-    auto_id = str(automation.get("automation_id") or "").strip()
     return f"automation:{auto_id}" if auto_id else None
 
 
@@ -639,7 +649,7 @@ async def _handle_set_route(
         patch[DALTON_NOTIFY_OVERRIDES_KEY] = {route_key: True}
 
     try:
-        await apply_dalton_notify_preference_patch(user_id, patch)
+        await apply_dalton_notify_preference_patch(user_id, patch, user_confirmed=True)
     except TuningError as exc:
         return error_command(str(exc), tool_call_id)
     except HTTPException as exc:

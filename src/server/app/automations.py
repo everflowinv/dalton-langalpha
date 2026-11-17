@@ -130,6 +130,29 @@ def _script_expected_version(body: Any) -> int:
 # =============================================================================
 
 
+# DALTON-HOOK(report-delivery): map ReportDeliveryError to HTTP status codes for REST endpoints
+def _report_delivery_http_error(exc: Exception) -> HTTPException:
+    code = str(getattr(exc, "code", "") or "")
+    detail = str(getattr(exc, "message", None) or str(exc))
+    if code in {
+        "forbidden",
+        "rest_group_target_forbidden",
+        "unauthorized_group",
+        "not_group_member",
+        "admin_only_channel",
+        "workspace_forbidden",
+        "dm_not_bound",
+        "feishu_not_bound",
+        "owner_tier_forbidden",
+    }:
+        return HTTPException(status_code=403, detail=detail)
+    if code in {"not_found", "forbidden_or_not_found"}:
+        return HTTPException(status_code=404, detail=detail)
+    if code == "conflict":
+        return HTTPException(status_code=409, detail=detail)
+    return HTTPException(status_code=400, detail=detail)
+
+
 @router.post("/automations", response_model=AutomationResponse, status_code=201)
 @handle_api_exceptions("create automation", logger, conflict_on_value_error=True)
 async def create_automation(
@@ -145,8 +168,50 @@ async def create_automation(
         workspace_id=workspace_or_home(user_id, request.workspace_id),
         thread_id=request.conversation_thread_id,
     )
+    # DALTON-HOOK(report-delivery): enforce unified report_profile rules & atomic route sync on REST create when Dalton is enabled
+    from src.dalton.settings import is_dalton_enabled
+
+    dalton_enabled = is_dalton_enabled()
+    report_profile_change = None
+    if dalton_enabled and isinstance(request.metadata, dict) and "report_profile" in request.metadata:
+        from src.dalton.services.report_delivery import (
+            ReportDeliveryError,
+            execute_report_profile_rest_mutation,
+            validate_report_profile_change,
+        )
+
+        try:
+            report_profile_change = await validate_report_profile_change(
+                user_id,
+                {
+                    "user_id": user_id,
+                    "name": request.name,
+                    "instruction": request.instruction,
+                    "metadata": {},
+                },
+                request.metadata.get("report_profile"),
+                via_rest=True,
+                action="create",
+                after_metadata=request.metadata,
+            )
+        except ReportDeliveryError as exc:
+            raise _report_delivery_http_error(exc) from None
+    route_warning: str | None = None
     try:
-        automation = await handler.create_automation(user_id=user_id, data=request)
+        if report_profile_change is not None:
+            # DALTON-HOOK(report-delivery): persist normalized after_metadata on create, matching update
+            create_data = request.model_copy(
+                update={"metadata": report_profile_change.after_metadata}
+            )
+            automation, route_warning = await execute_report_profile_rest_mutation(
+                change=report_profile_change,
+                actor_user_id=user_id,
+                mutate_fn=lambda db_conn: handler.create_automation(
+                    user_id=user_id, data=create_data, conn=db_conn
+                ),
+            )
+        else:
+            automation = await handler.create_automation(user_id=user_id, data=request)
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
     resp = AutomationResponse.model_validate(automation)
@@ -154,6 +219,14 @@ async def create_automation(
     from src.dalton.notify.dispatch import populate_automation_notify_state
 
     await populate_automation_notify_state(user_id, [resp])
+    # DALTON-HOOK(report-delivery): warn when a newly created report-skill automation has no report_profile or unsynced route
+    if dalton_enabled:
+        from src.dalton.services.report_delivery import build_missing_report_profile_warning
+
+        resp.report_delivery_warning = build_missing_report_profile_warning(
+            resp.instruction, resp.metadata
+        )
+        resp.route_warning = route_warning
     return resp
 
 
@@ -439,6 +512,49 @@ async def update_automation(
         workspace_id=request.workspace_id,
         thread_id=request.conversation_thread_id,
     )
+    # DALTON-HOOK(report-delivery): validate REST metadata.report_profile changes via shared rule when Dalton is enabled
+    from src.dalton.settings import is_dalton_enabled
+
+    dalton_enabled = is_dalton_enabled()
+    report_profile_change = None
+    existing_is_company = False
+    if dalton_enabled and request.metadata is not None:
+        from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
+
+        existing_row = await auto_db.get_automation(agent_id, user_id)
+        if existing_row is None:
+            existing_row = await auto_db.get_automation(agent_id, COMPANY_SYSTEM_USER_ID)
+        if existing_row is not None:
+            existing_is_company = existing_row.get("scope") == "company" or is_company_system_user(
+                existing_row.get("user_id")
+            )
+            old_meta = existing_row.get("metadata") or {}
+            old_rp = old_meta.get("report_profile") if isinstance(old_meta, dict) else None
+            new_rp = request.metadata.get("report_profile")
+            has_rp = ("report_profile" in request.metadata) or (
+                isinstance(old_meta, dict) and "report_profile" in old_meta
+            )
+            if has_rp and new_rp != old_rp:
+                from src.dalton.services.report_delivery import (
+                    ReportDeliveryError,
+                    validate_report_profile_change,
+                )
+
+                target_view = dict(existing_row)
+                if request.instruction is not None:
+                    target_view["instruction"] = request.instruction
+                try:
+                    report_profile_change = await validate_report_profile_change(
+                        user_id,
+                        target_view,
+                        new_rp,
+                        via_rest=True,
+                        action="update",
+                        after_metadata=request.metadata,
+                    )
+                except ReportDeliveryError as exc:
+                    raise _report_delivery_http_error(exc) from None
+    route_warning: str | None = None
     try:
         # DALTON-HOOK(company-automations): validate optional expected_config_version and propagate via context
         expected_cv = extract_expected_config_version(request)
@@ -446,16 +562,62 @@ async def update_automation(
         # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
         if "llm_model" in request.model_fields_set and request.llm_model is None:
             fields["llm_model"] = None
-        with automation_history_context(
-            actor_user_id=user_id,
-            action="update",
-            expected_config_version=expected_cv,
-        ):
-            automation = await handler.update_automation(
-                automation_id=agent_id,
-                user_id=user_id,
-                fields=fields,
+        if report_profile_change is not None:
+            # DALTON-HOOK(report-delivery): keep profile, route sync, audit history, and notify slot in one transaction
+            from src.dalton.services.report_delivery import (
+                execute_report_profile_rest_mutation,
             )
+
+            fields["metadata"] = report_profile_change.after_metadata
+            if existing_is_company:
+                from src.dalton.services.company_agent_writes import update_company_agent
+
+                company_row, route_warning = await execute_report_profile_rest_mutation(
+                    change=report_profile_change,
+                    actor_user_id=user_id,
+                    expected_config_version=expected_cv,
+                    is_company=True,
+                    mutate_fn=lambda db_conn: update_company_agent(
+                        principal,
+                        agent_id,
+                        fields,
+                        request=request,
+                        expected_config_version=expected_cv,
+                        conn=db_conn,
+                    ),
+                )
+                if not company_row:
+                    raise_not_found("Automation")
+                company_resp = _company_write_response(company_row)
+                from src.dalton.services.report_delivery import build_missing_report_profile_warning
+
+                company_resp.report_delivery_warning = build_missing_report_profile_warning(
+                    company_resp.instruction, company_resp.metadata
+                )
+                company_resp.route_warning = route_warning
+                return company_resp
+            automation, route_warning = await execute_report_profile_rest_mutation(
+                change=report_profile_change,
+                actor_user_id=user_id,
+                expected_config_version=expected_cv,
+                mutate_fn=lambda db_conn: handler.update_automation(
+                    automation_id=agent_id,
+                    user_id=user_id,
+                    fields=fields,
+                    conn=db_conn,
+                ),
+            )
+        else:
+            with automation_history_context(
+                actor_user_id=user_id,
+                action="update",
+                expected_config_version=expected_cv,
+            ):
+                automation = await handler.update_automation(
+                    automation_id=agent_id,
+                    user_id=user_id,
+                    fields=fields,
+                )
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
     except ValidationError as e:
@@ -471,6 +633,14 @@ async def update_automation(
         from src.dalton.notify.dispatch import populate_automation_notify_state
 
         await populate_automation_notify_state(user_id, [resp])
+        # DALTON-HOOK(report-delivery): warn when an updated report-skill automation has no valid report_profile or unsynced route
+        if dalton_enabled:
+            from src.dalton.services.report_delivery import build_missing_report_profile_warning
+
+            resp.report_delivery_warning = build_missing_report_profile_warning(
+                resp.instruction, resp.metadata
+            )
+            resp.route_warning = route_warning
         return resp
     # DALTON-HOOK(company-automations): a miss on the caller may be an existing company row
     from src.dalton.services.company_agent_writes import update_company_agent
@@ -484,7 +654,15 @@ async def update_automation(
     )
     if not company_row:
         raise_not_found("Automation")
-    return _company_write_response(company_row)
+    company_resp = _company_write_response(company_row)
+    # DALTON-HOOK(report-delivery): warn when an updated company report-skill automation has no valid report_profile
+    if dalton_enabled:
+        from src.dalton.services.report_delivery import build_missing_report_profile_warning
+
+        company_resp.report_delivery_warning = build_missing_report_profile_warning(
+            company_resp.instruction, company_resp.metadata
+        )
+    return company_resp
 
 
 def _positive_recycle_version(value: Any, field_name: str) -> int:

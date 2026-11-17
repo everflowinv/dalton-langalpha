@@ -80,6 +80,7 @@ async def authorize_market_digest_execution(
         return _deny(early)
     if not _UUID_RE.fullmatch(identity["automation_id"]):
         return _deny("not_automation_run")
+    missing_profile_ctx: dict[str, Any] | None = None
     async with get_db_connection(conn) as owned:
         async with owned.transaction():
             async with owned.cursor(row_factory=dict_row) as cur:
@@ -94,16 +95,37 @@ async def authorize_market_digest_execution(
                 assert row is not None
                 parsed, profile_err = parse_report_profile(row.get("metadata"))
                 if profile_err or parsed is None:
-                    return _deny("profile_invalid")
-                expected = _PERIOD_PROFILE[period]
-                if parsed.get("profile") != expected:
-                    return _deny("profile_mismatch")
-                return {
-                    "ok": True,
-                    "code": "ok",
-                    "profile": expected,
-                    "period": period,
-                }
+                    missing_profile_ctx = {
+                        "owner_user_id": str(row.get("user_id") or "").strip(),
+                        "automation_id": str(row.get("automation_id") or "").strip(),
+                        "automation_name": row.get("name"),
+                        "execution_id": str(
+                            row.get("automation_execution_id")
+                            or identity.get("execution_id")
+                            or ""
+                        ).strip(),
+                    }
+                else:
+                    expected = _PERIOD_PROFILE[period]
+                    if parsed.get("profile") != expected:
+                        return _deny("profile_mismatch")
+                    return {
+                        "ok": True,
+                        "code": "ok",
+                        "profile": expected,
+                        "period": period,
+                    }
+
+    if missing_profile_ctx is not None:
+        try:
+            from src.dalton.services.report_delivery import (
+                handle_missing_report_profile_rejection,
+            )
+
+            await handle_missing_report_profile_rejection(**missing_profile_ctx, conn=conn)
+        except Exception:
+            pass
+    return _deny("profile_invalid")
 
 
 __all__ = ["authorize_market_digest_execution"]

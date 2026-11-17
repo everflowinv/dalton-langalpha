@@ -48,6 +48,7 @@ class AutomationHistoryContext:
         Callable[[Mapping[str, Any], dict[str, Any], Any], Awaitable[None]] | None
     ) = None
     prelocked_pref_row: dict[str, Any] | None = None
+    report_delivery_audit: dict[str, Any] | None = None
 
     @property
     def has_explicit_actor(self) -> bool:
@@ -101,6 +102,7 @@ def automation_history_context(
         Callable[[Mapping[str, Any], dict[str, Any], Any], Awaitable[None]] | None
     ) = None,
     prelocked_pref_row: dict[str, Any] | None = None,
+    report_delivery_audit: dict[str, Any] | None = None,
 ) -> Iterator[AutomationHistoryContext]:
     """Bind history recording parameters for the enclosed automation write call."""
     parent = _HISTORY_CTX_VAR.get()
@@ -129,6 +131,11 @@ def automation_history_context(
         if prelocked_pref_row is not None
         else (parent.prelocked_pref_row if parent is not None else None)
     )
+    eff_report_audit = (
+        report_delivery_audit
+        if report_delivery_audit is not None
+        else (parent.report_delivery_audit if parent is not None else None)
+    )
     ctx = AutomationHistoryContext(
         record_history=record_history,
         actor_user_id=eff_actor,
@@ -137,6 +144,7 @@ def automation_history_context(
         skip_if_unchanged=eff_skip_unchanged,
         locked_row_reconciler=locked_row_reconciler,
         prelocked_pref_row=eff_prelocked_pref,
+        report_delivery_audit=eff_report_audit,
     )
     token = _HISTORY_CTX_VAR.set(ctx)
     try:

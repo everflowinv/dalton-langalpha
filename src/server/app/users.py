@@ -710,7 +710,13 @@ async def update_preferences(
     # DALTON-HOOK(data-jobs): use the shared "outside-lock prefetch ->
     # in-lock validation -> at most one redo" helper when notify keys are touched.
     import copy as _copy
-    from src.dalton.llm.model_prefs import run_with_feishu_group_prefetch
+    # DALTON-HOOK(report-delivery): keep report-route tx audit helpers in common scope
+    from src.dalton.llm.model_prefs import (
+        has_pending_report_route_changes,
+        record_pending_report_route_changes_in_tx,
+        run_with_feishu_group_prefetch,
+    )
+    from src.dalton.settings import is_dalton_enabled
 
     base_model_pref = _copy.deepcopy(model_pref)
     base_profile = _copy.deepcopy(profile)
@@ -766,6 +772,7 @@ async def update_preferences(
             if attempt_model_pref and touches_dalton_notify:
                 from src.dalton.llm.model_prefs import (
                     collect_auto_pruned_data_task_routes,
+                    load_bound_dm_targets,
                     reject_direct_data_task_route_edits,
                     validate_dalton_model_preferences,
                     validate_dalton_notify_routes_for_user,
@@ -785,10 +792,13 @@ async def update_preferences(
                     submitted_routes,
                     locked_routes,
                 )
+                # DALTON-HOOK(report-delivery): allow bound task-scoped DM targets and enforce REST group rules across all route keys
+                bound_dm_targets = await load_bound_dm_targets(user_id, conn=conn)
                 validate_dalton_model_preferences(
                     attempt_model_pref,
                     effective_model_preference=locked_effective,
                     stored_model_preference=locked_model_pref,
+                    bound_dm_targets=bound_dm_targets,
                 )
                 pruned_data_task_routes = collect_auto_pruned_data_task_routes(
                     user_id,
@@ -801,6 +811,7 @@ async def update_preferences(
                     locked_routes,
                     discovered_groups=prefetched_feishu_groups,
                     expected_stored_routes=expected_stored_routes,
+                    via_rest=True,
                 )
             if sets_structured:
                 # Every value outside its vocabulary, in any column, in one
@@ -829,6 +840,15 @@ async def update_preferences(
                 conn=conn,
                 expect_other_preference=request.expect_other_preference,
             )
+            # DALTON-HOOK(report-delivery): record route_update DB audit & claim 10m admin-notify slot only when report routes changed and Dalton is enabled
+            if (
+                touches_dalton_notify
+                and is_dalton_enabled()
+                and has_pending_report_route_changes()
+            ):
+                await record_pending_report_route_changes_in_tx(
+                    conn, pref_row=prefs_row
+                )
             # DALTON-HOOK(data-jobs): write `action = "auto_prune_target"`
             # audit snapshot and increment version for any auto-pruned `data:*` routes
             # in the same transaction as the preference update.
@@ -855,11 +875,13 @@ async def update_preferences(
             return prefs_row, attempt_threads_reassigned
 
     try:
+        # DALTON-HOOK(report-delivery): REST preference writes have no dialogue confirmation
         preferences, threads_reassigned = await run_with_feishu_group_prefetch(
             user_id=user_id,
             submitted_routes=non_data_submitted_routes,
             read_unlocked_routes=_read_unlocked_routes,
             run_in_lock=_run_preferences_in_lock,
+            via_rest=True,
         )
     except TuningError as exc:
         raise _tuning_400(exc) from exc

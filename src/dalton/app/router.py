@@ -1285,13 +1285,20 @@ async def put_dalton_automation_endpoint(
     else:
         await _verify_workspace_access(ws_str, user_id)
         resolved_ws_id = ws_str
+    from src.dalton.services.report_delivery import ReportDeliveryError
+
     try:
         return await schedule_dalton_automation_helper(
             user_id=user_id,
             name=name,
             spec=spec,
             workspace_id=resolved_ws_id,
+            via_rest=True,
         )
+    except ReportDeliveryError as exc:
+        from src.server.app.automations import _report_delivery_http_error
+
+        raise _report_delivery_http_error(exc) from None
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
