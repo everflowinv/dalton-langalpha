@@ -1,0 +1,18 @@
+{
+  "embedding": {
+    "model": "gemini-embedding-001",
+    "model_preferred": "gemini-embedding-2-preview",
+    "dimensions": 3072,
+    "chunk_size": 1500,
+    "chunk_overlap": 200
+  },
+  "sectors": [
+    {"id": "us-semiconductor", "label": "US Semiconductor"},
+    {"id": "china-consumer", "label": "China Consumer"},
+    {"id": "china-internet", "label": "China Internet"},
+    {"id": "us-software", "label": "US Software"},
+    {"id": "us-financials", "label": "US Financials"},
+    {"id": "us-megtech", "label": "US Mega Tech & AI"},
+    {"id": "macro", "label": "Macro & Geopolitics"}
+  ]
+}

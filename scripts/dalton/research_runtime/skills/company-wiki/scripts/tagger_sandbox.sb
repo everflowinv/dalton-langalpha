@@ -1,0 +1,51 @@
+(version 1)
+; macOS sandbox-exec profile for the auto-tagger's agy call.
+; The document text is untrusted. The wikitagger agent has no tools (first layer);
+; this profile is the second layer in case the agent definition stops applying.
+; Params (sandbox-exec -D): HOME_DIR, PROXY_PORT, CALL_DIR (this call's empty cwd, a real path).
+; Later rules override earlier ones.
+(allow default)
+; network: only the local HTTP(S) proxy (agy gets HTTPS_PROXY) and DNS; no direct internet,
+; no LAN, no local services, no other unix sockets (Docker, ssh-agent, ...)
+(deny network-outbound)
+(allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT"))))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/syslog")))
+; only agy and its bundled helpers may run: no shell, curl, python, osascript, pbpaste,
+; security, ... (tested 2026-10-21: tagging still works with just these two). agy starts every
+; globally configured MCP server even for a tool-less agent (e.g. the OpenClaw MCP proxy on
+; node); those must not start here.
+(deny process-exec*)
+(allow process-exec*
+  (literal (string-append (param "HOME_DIR") "/.local/bin/agy"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/bin")))
+; home is unreadable (file contents; names/metadata stay visible) except what agy itself needs
+(deny file-read-data (subpath (param "HOME_DIR")))
+(allow file-read-data
+  (subpath (string-append (param "HOME_DIR") "/.gemini"))
+  (literal (string-append (param "HOME_DIR") "/.local/bin/agy"))
+  (subpath (param "CALL_DIR"))
+  (literal (string-append (param "HOME_DIR") "/.CFUserTextEncoding")))
+; writes: agy's runtime data (not its binaries, settings, MCP config or agents), the tagger's
+; cwd for this call only (not other calls' cwds or the quarantine), and temp dirs
+(deny file-write* (subpath "/"))
+(allow file-write*
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/conversations"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/brain"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/annotations"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/presence"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/log"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/cache"))
+  (subpath (string-append (param "HOME_DIR") "/.gemini/antigravity-cli/crashes"))
+  (regex (string-append "^" (regex-quote (param "HOME_DIR")) "/\\.gemini/antigravity-cli/conversation_summaries\\.db"))
+  (regex (string-append "^" (regex-quote (param "HOME_DIR")) "/\\.gemini/antigravity-cli/cli\\.log"))
+  (regex (string-append "^" (regex-quote (param "HOME_DIR")) "/\\.gemini/antigravity-cli/jetbox_summaries_proto\\.pb"))
+  (regex (string-append "^" (regex-quote (param "HOME_DIR")) "/\\.gemini/antigravity-cli/antigravity-oauth-token"))
+  (subpath (param "CALL_DIR"))
+  (subpath "/private/var/folders")
+  (subpath "/private/tmp")
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/tty")
+  (regex #"^/dev/fd/"))

@@ -88,8 +88,17 @@ def build_registered_allowlists() -> tuple[dict[str, set[str]], set[str], set[st
         "yfinance": {"Ticker", "download"},
     }
 
-    # 1. Load categories from ~/.openclaw/workspace/config/data_sources.json if available
-    ds_path = Path(os.path.expanduser("~/.openclaw/workspace/config/data_sources.json"))
+    # 1. Load categories from research_runtime/config/data_sources.json (or legacy ocw_root)
+    research_code_env = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
+    ocw_env = os.environ.get("DALTON_OCW_ROOT", "").strip()
+    ds_candidates = []
+    if research_code_env:
+        ds_candidates.append(Path(research_code_env).expanduser() / "config" / "data_sources.json")
+    ds_candidates.append(REPO_ROOT / "scripts" / "dalton" / "research_runtime" / "config" / "data_sources.json")
+    if ocw_env:
+        ds_candidates.append(Path(ocw_env).expanduser() / "config" / "data_sources.json")
+    ds_candidates.append(Path(os.path.expanduser("~/.openclaw/workspace/config/data_sources.json")))
+    ds_path = next((p for p in ds_candidates if p.is_file()), ds_candidates[0])
     if ds_path.is_file():
         try:
             ds_data = json.loads(ds_path.read_text(encoding="utf-8"))

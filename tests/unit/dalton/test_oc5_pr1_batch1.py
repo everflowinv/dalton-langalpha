@@ -68,6 +68,8 @@ INSTALL_SH = SCRIPTS_DALTON / "install_bridge.sh"
 ARCHIVE_DAILY_SH = SCRIPTS_DALTON / "launchd" / "archive_daily.sh"
 WIKI_RUN_SH = SCRIPTS_DALTON / "openclaw_overlays" / "skills" / "company-wiki" / "run.sh"
 DIGEST_RUN_SH = SCRIPTS_DALTON / "openclaw_overlays" / "skills" / "market-digest" / "run.sh"
+RUNTIME_WIKI_RUN_SH = SCRIPTS_DALTON / "research_runtime" / "skills" / "company-wiki" / "run.sh"
+RUNTIME_DIGEST_RUN_SH = SCRIPTS_DALTON / "research_runtime" / "skills" / "market-digest" / "run.sh"
 
 FORBIDDEN_NONARCHIVE_CHECK_KEYS: tuple[str, ...] = (
     "FEISHU_APP_ID",
@@ -963,16 +965,17 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
         )
 
     # Both skill `run.sh` launchers through Bridge's actual resolution + production argv
-    # even when legacy `ocw_root/skills/*/run.sh` exists on disk or is explicitly configured!
+    # resolve to the unified `research_runtime` launchers even when legacy `ocw_root/skills/*/run.sh`
+    # exists on disk or is explicitly configured!
     resolved_wiki_sh = bridge._resolve_wiki_run_sh()
     resolved_digest_sh = bridge._resolve_market_digest_run_sh()
-    assert resolved_wiki_sh == WIKI_RUN_SH
-    assert resolved_digest_sh == DIGEST_RUN_SH
+    assert resolved_wiki_sh == RUNTIME_WIKI_RUN_SH
+    assert resolved_digest_sh == RUNTIME_DIGEST_RUN_SH
 
     bridge.cfg.wiki_run_sh = legacy_wiki_run_sh
     bridge.cfg.market_digest_run_sh = legacy_digest_run_sh
-    assert bridge._resolve_wiki_run_sh() == WIKI_RUN_SH
-    assert bridge._resolve_market_digest_run_sh() == DIGEST_RUN_SH
+    assert bridge._resolve_wiki_run_sh() == RUNTIME_WIKI_RUN_SH
+    assert bridge._resolve_market_digest_run_sh() == RUNTIME_DIGEST_RUN_SH
     explicit_skill_env = bridge._build_wiki_subprocess_env()
     assert explicit_skill_env.get("DALTON_WIKI_SKILL_DIR") == str(legacy_wiki_run_sh.parent)
     assert explicit_skill_env.get("DALTON_MARKET_DIGEST_SKILL_DIR") == str(
@@ -980,6 +983,7 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
     )
     assert "DALTON_WIKI_EXPLICIT_RUN_SH" not in explicit_skill_env
     assert "DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH" not in explicit_skill_env
+    assert "DALTON_SKILL_SHELL_RC" not in explicit_skill_env
 
     assert legacy_wiki_run_sh.read_text(encoding="utf-8") == legacy_wiki_content
     assert legacy_digest_run_sh.read_text(encoding="utf-8") == legacy_digest_content
@@ -1034,7 +1038,7 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
         encoding="utf-8",
     )
     verified_wiki_sh = verified_wiki_dir / "run.sh"
-    verified_wiki_sh.write_bytes(WIKI_RUN_SH.read_bytes())
+    verified_wiki_sh.write_bytes(RUNTIME_WIKI_RUN_SH.read_bytes())
     verified_wiki_sh.chmod(0o755)
 
     verified_digest_dir = tmp_path / "verified_skills" / "market-digest"
@@ -1046,7 +1050,7 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
         encoding="utf-8",
     )
     verified_digest_sh = verified_digest_dir / "run.sh"
-    verified_digest_sh.write_bytes(DIGEST_RUN_SH.read_bytes())
+    verified_digest_sh.write_bytes(RUNTIME_DIGEST_RUN_SH.read_bytes())
     verified_digest_sh.chmod(0o755)
 
     bridge.cfg.wiki_run_sh = verified_wiki_sh

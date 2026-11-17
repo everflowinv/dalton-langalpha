@@ -10,15 +10,17 @@
         <string>__REPO_ROOT__/scripts/dalton/researchdata_bridge.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>__OCW_ROOT__</string>
+    <string>__RESEARCH_CODE__</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>__HOME__</string>
-        <key>DALTON_OCW_ROOT</key>
-        <string>__OCW_ROOT__</string>
+        <key>DALTON_RESEARCH_CODE</key>
+        <string>__RESEARCH_CODE__</string>
+        <key>DALTON_RESEARCH_HOME</key>
+        <string>__RESEARCH_HOME__</string>
         <key>DALTON_BRIDGE_ENV_FILE</key>
         <string>__HOME__/.config/dalton/researchdata-bridge.env</string>
     </dict>

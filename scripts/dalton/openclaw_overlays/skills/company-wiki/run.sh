@@ -32,6 +32,8 @@ elif [[ -n "${DALTON_SKILL_DIR:-}" ]]; then
         exit 1
     fi
     SKILL_DIR="${DALTON_SKILL_DIR}"
+elif [[ -n "${DALTON_RESEARCH_CODE:-}" ]] && _resolve_cli_in_dir "${DALTON_RESEARCH_CODE}/skills/company-wiki" >/dev/null; then
+    SKILL_DIR="${DALTON_RESEARCH_CODE}/skills/company-wiki"
 elif [[ -n "${DALTON_OCW_ROOT:-}" ]] && _resolve_cli_in_dir "${DALTON_OCW_ROOT}/skills/company-wiki" >/dev/null; then
     SKILL_DIR="${DALTON_OCW_ROOT}/skills/company-wiki"
 elif _resolve_cli_in_dir "${SCRIPT_DIR}" >/dev/null; then
@@ -86,8 +88,16 @@ while IFS='=' read -r _env_name _; do
 done < <(env)
 
 CLI_SCRIPT="$(_resolve_cli_in_dir "${SKILL_DIR}")"
+_EFF_RESEARCH_HOME=""
+if [[ -n "${DALTON_RESEARCH_HOME:-}" ]]; then
+    _EFF_RESEARCH_HOME="${DALTON_RESEARCH_HOME}"
+elif [[ ( -z "${DALTON_OCW_ROOT:-}" || -n "${DALTON_RESEARCH_CODE:-}" ) && -n "${HOME:-}" ]]; then
+    _EFF_RESEARCH_HOME="${HOME}/Library/Application Support/Everflow/research"
+fi
 if [[ -n "${DALTON_SKILL_PYTHON:-}" && -x "${DALTON_SKILL_PYTHON}" ]]; then
     PYTHON_BIN="${DALTON_SKILL_PYTHON}"
+elif [[ -n "${_EFF_RESEARCH_HOME}" && -x "${_EFF_RESEARCH_HOME}/venvs/company-wiki/bin/python" ]]; then
+    PYTHON_BIN="${_EFF_RESEARCH_HOME}/venvs/company-wiki/bin/python"
 elif [[ -x "${SKILL_DIR}/venv/bin/python" ]]; then
     PYTHON_BIN="${SKILL_DIR}/venv/bin/python"
 elif [[ -x "/opt/homebrew/bin/python3" ]]; then
@@ -95,6 +105,7 @@ elif [[ -x "/opt/homebrew/bin/python3" ]]; then
 else
     PYTHON_BIN="$(command -v python3)"
 fi
+unset _DEFAULT_RESEARCH_HOME _EFF_RESEARCH_HOME
 
 FILTER_PY="${DALTON_BRIDGE_ENV_FILTER_PY:-}"
 if [[ -z "${FILTER_PY}" || ! -f "${FILTER_PY}" ]]; then

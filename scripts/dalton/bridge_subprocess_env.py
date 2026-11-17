@@ -16,6 +16,7 @@ from collections.abc import Iterable, Mapping, MutableMapping
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import secrets
 import stat
@@ -23,6 +24,7 @@ import sys
 import tempfile
 from typing import Any
 from urllib.parse import urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 DEFAULT_SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 DEFAULT_HOST_EMBED_URL = "http://127.0.0.1:8960/embed"
@@ -155,6 +157,26 @@ CARD_SEND_EXPLICIT_FEISHU_KEYS: tuple[str, ...] = (
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "FEISHU_DEFAULT_GRANT_CHAT_ID",
+)
+
+# Explicit non-secret runtime environment keys passed through to research_runtime subprocesses.
+RESEARCH_RUNTIME_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "DALTON_RESEARCH_CODE",
+        "DALTON_RESEARCH_HOME",
+        "DALTON_OCW_ROOT",
+        "DALTON_EMBED_PYTHON",
+        "EDGAR_IDENTITY",
+    }
+)
+
+# Per-route secret keys explicitly allowed for research_runtime skills that require them
+# (instead of sourcing ~/.zshrc or ~/.bash_profile inside run.sh).
+RESEARCH_EXPLICIT_SECRET_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "GEMINI_API_KEY",
+        "FIRECRAWL_API_KEY",
+    }
 )
 
 ARCHIVE_BASE_REQUIRED_KEYS: tuple[str, ...] = ("PATH", "HOME", "LANG", "TZ")
@@ -430,6 +452,47 @@ def build_feishu_card_send_subprocess_env(
     if grant_chat_id:
         cleaned["FEISHU_DEFAULT_GRANT_CHAT_ID"] = grant_chat_id
     return cleaned
+
+
+def build_research_runtime_subprocess_env(
+    base_env: Mapping[str, str] | None = None,
+    *,
+    runtime_env: Mapping[str, str] | None = None,
+    extra_env: Mapping[str, str] | None = None,
+    allow_secret_keys: Iterable[str] = (),
+    drop_keys: Iterable[str] = (),
+    repo_root: Path | None = None,
+) -> dict[str, str]:
+    """Build filtered env for `research_runtime` children using explicit runtime/secret allowlists."""
+    allowed_secrets = tuple(
+        sorted(
+            {
+                str(k).strip()
+                for k in allow_secret_keys
+                if str(k).strip() in RESEARCH_EXPLICIT_SECRET_ALLOWLIST
+            }
+        )
+    )
+    merged_extra: dict[str, str] = {}
+    if extra_env:
+        for raw_k, raw_v in extra_env.items():
+            key = str(raw_k or "").strip()
+            if key and raw_v is not None:
+                merged_extra[key] = str(raw_v)
+    if runtime_env:
+        for raw_k, raw_v in runtime_env.items():
+            key = str(raw_k or "").strip()
+            if raw_v is None or not key:
+                continue
+            if key in RESEARCH_RUNTIME_ENV_KEYS or key in allowed_secrets:
+                merged_extra[key] = str(raw_v)
+    return build_nonarchive_subprocess_env(
+        base_env,
+        extra_env=merged_extra,
+        drop_keys=drop_keys,
+        allow_keys=allowed_secrets,
+        repo_root=repo_root,
+    )
 
 
 def parse_env_file_dict(path: Path) -> dict[str, str]:
@@ -2090,9 +2153,12 @@ def _apply_env_defaults(
     entries: list[tuple[str, str | None, str]],
     existing_values: Mapping[str, str],
     defaults: list[tuple[str, str]],
+    *,
+    remove_keys: Iterable[str] = (),
 ) -> tuple[str, dict[str, str]]:
     """Preserve all existing lines/comments and existing non-empty values; fill missing or empty default keys."""
-    effective = dict(existing_values)
+    remove_set = {str(k) for k in remove_keys if k}
+    effective = {k: v for k, v in existing_values.items() if k not in remove_set}
     default_map = dict(defaults)
     out_lines: list[str] = []
     seen_default_keys: set[str] = set()
@@ -2100,6 +2166,8 @@ def _apply_env_defaults(
     for kind, key, raw_line in entries:
         if kind != "kv" or key is None:
             out_lines.append(raw_line)
+            continue
+        if key in remove_set:
             continue
         if key in default_map:
             seen_default_keys.add(key)
@@ -2137,26 +2205,59 @@ def _validate_no_control_or_whitespace(
         )
 
 
+def _read_plist_env_vars(plist_path: Path | None) -> dict[str, str]:
+    """Safely read `EnvironmentVariables` from an existing launchd plist if present."""
+    if plist_path is None:
+        return {}
+    validate_safe_regular_file_target(plist_path, allow_missing=True)
+    if not plist_path.exists():
+        return {}
+    try:
+        parsed = plistlib.loads(plist_path.read_bytes())
+    except Exception:
+        return {}
+    if not isinstance(parsed, Mapping):
+        return {}
+    env_map = parsed.get("EnvironmentVariables")
+    if not isinstance(env_map, Mapping):
+        return {}
+    return {
+        str(k): str(v)
+        for k, v in env_map.items()
+        if isinstance(k, str) and v is not None
+    }
+
+
 def merge_bridge_and_repo_env_files(
     *,
     bridge_env_path: Path,
     repo_env_path: Path,
     default_port: str = "8960",
-    default_ocw_root: str,
+    default_ocw_root: str = "",
     default_python_bin: str,
+    default_research_code: str = "",
+    default_research_home: str = "",
+    existing_plist_path: Path | None = None,
+    research_runtime: str = "auto",
 ) -> dict[str, Any]:
     """Validate and atomically merge defaults into `researchdata-bridge.env` and `<repo>/.env`.
 
     - Existing comments, ordering, extra keys (`FEISHU_*`, `SEED_ASR_*`, etc.), and all
       existing non-empty values are preserved verbatim.
     - Existing tokens are never rotated; existing `FEISHU_*` values are never overwritten.
+    - If `research_runtime == "auto"` and existing `bridge_env` or `existing_plist_path`
+      (or `default_ocw_root`) sets `DALTON_OCW_ROOT` without `DALTON_RESEARCH_CODE` or
+      `DALTON_RESEARCH_HOME`, legacy mode is preserved and new runtime keys are NOT injected.
     - Duplicate keys, malformed lines, partial Feishu credentials (`FEISHU_APP_ID` without
       `FEISHU_APP_SECRET` or vice versa), and invalid required values fail closed before
       modifying either target file.
-    - Returns non-secret metadata only (`port`, `ocw_root`, `python_bin`).
+    - Returns non-secret metadata only (`port`, `research_code`, `research_home`, `ocw_root`, `python_bin`).
     """
+    if research_runtime not in ("auto", "legacy", "new"):
+        raise ValueError(f"unsupported research_runtime mode: {research_runtime!r}")
     bridge_entries, bridge_vals = parse_env_file_strict(bridge_env_path)
     repo_entries, repo_vals = parse_env_file_strict(repo_env_path)
+    plist_vals = _read_plist_env_vars(existing_plist_path)
 
     # Validate partial Feishu configuration in bridge env before generating or writing anything.
     feishu_id = str(bridge_vals.get("FEISHU_APP_ID") or "").strip()
@@ -2180,18 +2281,62 @@ def merge_bridge_and_repo_env_files(
         or secrets.token_hex(32)
     )
 
+    env_has_research = bool(
+        str(bridge_vals.get("DALTON_RESEARCH_CODE") or "").strip()
+        or str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
+    )
+    plist_has_research = bool(
+        str(plist_vals.get("DALTON_RESEARCH_CODE") or "").strip()
+        or str(plist_vals.get("DALTON_RESEARCH_HOME") or "").strip()
+    )
+    existing_ocw_root = (
+        str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip()
+        or str(plist_vals.get("DALTON_OCW_ROOT") or "").strip()
+        or str(default_ocw_root or "").strip()
+    )
+
+    if research_runtime == "legacy":
+        if not str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip():
+            raise EnvFileValidationError(
+                path=bridge_env_path,
+                key="DALTON_OCW_ROOT",
+                reason="DALTON_OCW_ROOT must be present in env file for research_runtime=legacy",
+            )
+        use_new_runtime = False
+    elif research_runtime == "new":
+        use_new_runtime = True
+    elif env_has_research or plist_has_research:
+        use_new_runtime = True
+    elif existing_ocw_root:
+        use_new_runtime = False
+    else:
+        use_new_runtime = bool(
+            str(default_research_code).strip() or str(default_research_home).strip()
+        )
+
     bridge_defaults: list[tuple[str, str]] = [
         ("DALTON_BRIDGE_HOST", "127.0.0.1"),
         ("DALTON_BRIDGE_PORT", str(default_port).strip() or "8960"),
         ("DALTON_BRIDGE_TOKEN", seed_token),
         ("DALTON_BRIDGE_ADMIN_TOKEN", seed_admin_token),
-        ("DALTON_OCW_ROOT", str(default_ocw_root).strip()),
         ("DALTON_OCW_PYTHON", str(default_python_bin).strip()),
         ("DALTON_BRIDGE_MAX_INFLIGHT", "2"),
         ("DALTON_BRIDGE_CALLER_BUDGET_S", "625"),
     ]
+    if use_new_runtime:
+        if str(default_research_code).strip():
+            bridge_defaults.append(("DALTON_RESEARCH_CODE", str(default_research_code).strip()))
+        if str(default_research_home).strip():
+            bridge_defaults.append(("DALTON_RESEARCH_HOME", str(default_research_home).strip()))
+    if existing_ocw_root and (not use_new_runtime or str(default_ocw_root).strip()):
+        bridge_defaults.append(("DALTON_OCW_ROOT", existing_ocw_root))
+    remove_keys: tuple[str, ...] = (
+        ("DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME")
+        if research_runtime == "legacy"
+        else ()
+    )
     bridge_rendered, bridge_eff = _apply_env_defaults(
-        bridge_entries, bridge_vals, bridge_defaults
+        bridge_entries, bridge_vals, bridge_defaults, remove_keys=remove_keys
     )
 
     # Validate all required bridge effective values before touching disk.
@@ -2227,13 +2372,32 @@ def merge_bridge_and_repo_env_files(
         value=str(bridge_eff.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip(),
     )
 
+    eff_research_code = str(bridge_eff.get("DALTON_RESEARCH_CODE") or "").strip()
+    if eff_research_code:
+        _validate_no_control_or_whitespace(
+            path=bridge_env_path,
+            key="DALTON_RESEARCH_CODE",
+            value=eff_research_code,
+            allow_spaces=True,
+        )
+
+    eff_research_home = str(bridge_eff.get("DALTON_RESEARCH_HOME") or "").strip()
+    if eff_research_home:
+        _validate_no_control_or_whitespace(
+            path=bridge_env_path,
+            key="DALTON_RESEARCH_HOME",
+            value=eff_research_home,
+            allow_spaces=True,
+        )
+
     eff_ocw_root = str(bridge_eff.get("DALTON_OCW_ROOT") or "").strip()
-    _validate_no_control_or_whitespace(
-        path=bridge_env_path,
-        key="DALTON_OCW_ROOT",
-        value=eff_ocw_root,
-        allow_spaces=True,
-    )
+    if eff_ocw_root:
+        _validate_no_control_or_whitespace(
+            path=bridge_env_path,
+            key="DALTON_OCW_ROOT",
+            value=eff_ocw_root,
+            allow_spaces=True,
+        )
 
     eff_python = str(bridge_eff.get("DALTON_OCW_PYTHON") or "").strip()
     _validate_no_control_or_whitespace(
@@ -2310,9 +2474,20 @@ def merge_bridge_and_repo_env_files(
 
     return {
         "port": port_int,
+        "research_code": eff_research_code,
+        "research_home": eff_research_home,
         "ocw_root": eff_ocw_root,
         "python_bin": str(py_path),
+        "research_runtime_mode": "new" if use_new_runtime else "legacy",
     }
+
+
+_PLIST_NEW_ENV_BLOCK = (
+    "        <key>DALTON_RESEARCH_CODE</key>\n"
+    "        <string>__RESEARCH_CODE__</string>\n"
+    "        <key>DALTON_RESEARCH_HOME</key>\n"
+    "        <string>__RESEARCH_HOME__</string>"
+)
 
 
 def render_plist_atomic(
@@ -2323,28 +2498,121 @@ def render_plist_atomic(
     repo_root: Path,
     home_dir: Path,
     logs_dir: Path | None = None,
+    research_runtime: str = "auto",
 ) -> int:
-    """Render launchd plist atomically (`0644`) using non-secret paths from `bridge_env_path`."""
+    """Render launchd plist atomically (`0644`) using non-secret paths from `bridge_env_path`.
+
+    When `research_runtime == "auto"`, preserves legacy mode (setting `DALTON_OCW_ROOT`
+    and omitting `DALTON_RESEARCH_CODE`/`DALTON_RESEARCH_HOME`) if `bridge_env_path` or
+    an existing plist at `dest_path` defines `DALTON_OCW_ROOT` without `DALTON_RESEARCH_*`.
+    """
+    if research_runtime not in ("auto", "legacy", "new"):
+        raise ValueError(f"unsupported research_runtime mode: {research_runtime!r}")
     validate_safe_regular_file_target(bridge_env_path, allow_missing=False)
     validate_safe_regular_file_target(template_path, allow_missing=False)
     validate_safe_regular_file_target(dest_path, allow_missing=True)
     _, bridge_vals = parse_env_file_strict(bridge_env_path)
+    existing_plist_vals = _read_plist_env_vars(dest_path)
+
     port_int = int(str(bridge_vals.get("DALTON_BRIDGE_PORT") or "8960").strip())
-    ocw_root = str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip()
+    env_ocw_root = str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip()
+    env_research_code = str(bridge_vals.get("DALTON_RESEARCH_CODE") or "").strip()
+    env_research_home = str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
+    plist_ocw_root = str(existing_plist_vals.get("DALTON_OCW_ROOT") or "").strip()
+    plist_research_code = str(existing_plist_vals.get("DALTON_RESEARCH_CODE") or "").strip()
+    plist_research_home = str(existing_plist_vals.get("DALTON_RESEARCH_HOME") or "").strip()
+
+    if research_runtime == "legacy":
+        legacy_mode = True
+    elif research_runtime == "new":
+        legacy_mode = False
+    elif env_research_code or env_research_home:
+        legacy_mode = False
+    elif env_ocw_root:
+        legacy_mode = True
+    elif plist_ocw_root and not (plist_research_code or plist_research_home):
+        legacy_mode = True
+    else:
+        legacy_mode = False
+
+    ocw_root = env_ocw_root or plist_ocw_root
+    if legacy_mode and not ocw_root:
+        raise EnvFileValidationError(
+            path=bridge_env_path,
+            key="DALTON_OCW_ROOT",
+            reason="DALTON_OCW_ROOT is required when rendering plist in legacy mode",
+        )
+
+    research_code = (
+        env_research_code
+        or str(repo_root / "scripts" / "dalton" / "research_runtime")
+    )
+    research_home = (
+        env_research_home
+        or str(home_dir / "Library" / "Application Support" / "Everflow" / "research")
+    )
     python_bin = str(bridge_vals.get("DALTON_OCW_PYTHON") or "").strip()
     tpl = template_path.read_text(encoding="utf-8")
     eff_logs = logs_dir if logs_dir is not None else (home_dir / "Library" / "Logs")
     validate_safe_directory_target(eff_logs)
     eff_logs.mkdir(parents=True, exist_ok=True)
     validate_safe_directory_target(eff_logs)
-    rendered = (
-        tpl.replace("__HOME__/.config/dalton/researchdata-bridge.env", str(bridge_env_path))
-        .replace("__HOME__/Library/Logs", str(eff_logs))
-        .replace("__PYTHON_BIN__", python_bin)
-        .replace("__REPO_ROOT__", str(repo_root))
-        .replace("__OCW_ROOT__", ocw_root)
-        .replace("__HOME__", str(home_dir))
-    )
+
+    if legacy_mode:
+        legacy_env_block = (
+            "        <key>DALTON_OCW_ROOT</key>\n"
+            f"        <string>{xml_escape(ocw_root)}</string>"
+        )
+        if _PLIST_NEW_ENV_BLOCK in tpl:
+            rendered = tpl.replace(_PLIST_NEW_ENV_BLOCK, legacy_env_block)
+            rendered = (
+                rendered.replace(
+                    "__HOME__/.config/dalton/researchdata-bridge.env",
+                    xml_escape(str(bridge_env_path)),
+                )
+                .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
+                .replace("__PYTHON_BIN__", xml_escape(python_bin))
+                .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
+                .replace("__RESEARCH_CODE__", xml_escape(ocw_root))
+                .replace("__RESEARCH_HOME__", xml_escape(ocw_root))
+                .replace("__HOME__", xml_escape(str(home_dir)))
+            )
+        else:
+            rendered = (
+                tpl.replace(
+                    "__HOME__/.config/dalton/researchdata-bridge.env",
+                    xml_escape(str(bridge_env_path)),
+                )
+                .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
+                .replace("__PYTHON_BIN__", xml_escape(python_bin))
+                .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
+                .replace("__RESEARCH_CODE__", xml_escape(ocw_root))
+                .replace("__RESEARCH_HOME__", xml_escape(ocw_root))
+                .replace("__HOME__", xml_escape(str(home_dir)))
+            )
+            parsed_plist = plistlib.loads(rendered.encode("utf-8"))
+            parsed_plist["WorkingDirectory"] = ocw_root
+            env_dict = parsed_plist.get("EnvironmentVariables")
+            if isinstance(env_dict, dict):
+                env_dict.pop("DALTON_RESEARCH_CODE", None)
+                env_dict.pop("DALTON_RESEARCH_HOME", None)
+                env_dict["DALTON_OCW_ROOT"] = ocw_root
+            rendered = plistlib.dumps(parsed_plist, sort_keys=False).decode("utf-8")
+    else:
+        rendered = (
+            tpl.replace(
+                "__HOME__/.config/dalton/researchdata-bridge.env",
+                xml_escape(str(bridge_env_path)),
+            )
+            .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
+            .replace("__PYTHON_BIN__", xml_escape(python_bin))
+            .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
+            .replace("__RESEARCH_CODE__", xml_escape(research_code))
+            .replace("__RESEARCH_HOME__", xml_escape(research_home))
+            .replace("__HOME__", xml_escape(str(home_dir)))
+        )
+
+    plistlib.loads(rendered.encode("utf-8"))
     atomic_write_text(dest_path, rendered, mode=0o644)
     return port_int
 
@@ -2443,6 +2711,10 @@ def _cmd_merge_bridge_env(args: argparse.Namespace) -> int:
             default_port=str(args.default_port),
             default_ocw_root=str(args.default_ocw_root),
             default_python_bin=str(args.default_python),
+            default_research_code=str(args.default_research_code),
+            default_research_home=str(args.default_research_home),
+            existing_plist_path=Path(args.existing_plist).expanduser() if args.existing_plist else None,
+            research_runtime=str(args.research_runtime),
         )
     except EnvFileValidationError as exc:
         print(f"[install_bridge] ERROR: {exc}", file=sys.stderr)
@@ -2469,6 +2741,7 @@ def _cmd_render_plist(args: argparse.Namespace) -> int:
             repo_root=Path(args.repo_root).expanduser(),
             home_dir=Path(args.home).expanduser(),
             logs_dir=Path(args.logs_dir).expanduser() if args.logs_dir else None,
+            research_runtime=str(args.research_runtime),
         )
     except EnvFileValidationError as exc:
         print(f"[install_bridge] ERROR: {exc}", file=sys.stderr)
@@ -2517,8 +2790,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_mg.add_argument("--bridge-env", required=True)
     p_mg.add_argument("--repo-env", required=True)
     p_mg.add_argument("--default-port", default="8960")
-    p_mg.add_argument("--default-ocw-root", required=True)
+    p_mg.add_argument("--default-ocw-root", default="")
+    p_mg.add_argument("--default-research-code", default="")
+    p_mg.add_argument("--default-research-home", default="")
     p_mg.add_argument("--default-python", required=True)
+    p_mg.add_argument("--existing-plist", default="")
+    p_mg.add_argument("--research-runtime", choices=("auto", "legacy", "new"), default="auto")
     p_mg.add_argument("--print-port-only", action="store_true")
 
     p_pl = sub.add_parser("render-plist", help="Atomically render launchd plist")
@@ -2528,6 +2805,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_pl.add_argument("--repo-root", required=True)
     p_pl.add_argument("--home", required=True)
     p_pl.add_argument("--logs-dir", default=None)
+    p_pl.add_argument("--research-runtime", choices=("auto", "legacy", "new"), default="auto")
 
     p_ck = sub.add_parser("check-env-keys", help="Output boolean presence map for named keys")
     p_ck.add_argument("keys", nargs="+")

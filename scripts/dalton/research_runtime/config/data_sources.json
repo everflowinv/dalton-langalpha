@@ -1,0 +1,471 @@
+{
+  "schema_version": 1,
+  "categories": {
+    "finance": "财务与行情",
+    "macro": "宏观与流动性",
+    "news": "新闻与公告",
+    "research": "研报、访谈与内部资料",
+    "community": "社区与另类数据"
+  },
+  "routes": [
+    {
+      "id": "sec",
+      "category": "finance",
+      "title": "美股及外国发行人财报",
+      "source": "SEC EDGAR",
+      "kind": "cli",
+      "skill": "skills/findata-analyst/SKILL.md",
+      "operations": [
+        "list-filings",
+        "financials",
+        "ratios",
+        "facts",
+        "smart-facts",
+        "search-concepts",
+        "search-text",
+        "read-item",
+        "attachments",
+        "eight-k",
+        "insider"
+      ],
+      "tool": null,
+      "rules": [
+        "先查最新10-Q；外国私人发行人先查6-K。",
+        "历史研究用 --as-of；按披露日而非财期筛选。",
+        "保留期间、单位、accession。历史查询不回退Yahoo。",
+        "attachments 用 params.accession 精确定位历史 filing，params.document_type 选附件类型（与 document 文件名互斥），params.max_chars 控制读取长度；financials 用 params.statement=all|income|balance|cash；search-text 用 params.window/max_matches；read-item 用 params.max_chars。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "estimates",
+      "category": "finance",
+      "title": "美股一致预期与修正轨迹",
+      "source": "Yahoo Finance（yfinance）",
+      "kind": "cli",
+      "skill": null,
+      "operations": [
+        "consensus"
+      ],
+      "tool": null,
+      "rules": [
+        "只给读取时的当前值：分期 EPS/收入、7/30/60/90 天轨迹、上下调家数、目标价分布、财报日与最近 4 次财报后次日涨跌；要看修正轨迹就定期存快照比较（scripts/stock_tracker.py）。",
+        "一致 EPS 可能混有计入与不计入一次性项目的分析师；当期 low-high 区间异常宽或 90 天陡降时先拆口径。",
+        "隐含总费用空间按股数和税率假设反推；默认税率取最近一季，财年与季度差 5 个百分点以上会提示改用公司指引。卖方原始预测仍以研报为准。",
+        "固定独立 yfinance 1.7.0 环境，保留每期 currency；不假设非美元数据为美元。params.shares_bn/tax 可覆盖模型假设；field_status 标记字段缺失或失败，核心预期均缺失返回 error。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "cn-hk",
+      "category": "finance",
+      "title": "中港财务、行情与资金流",
+      "source": "cninfo / AkShare / 各行情供应商",
+      "kind": "cli",
+      "skill": "skills/cn-hk-findata/SKILL.md",
+      "operations": [
+        "ask",
+        "filings",
+        "quote"
+      ],
+      "tool": null,
+      "rules": [
+        "公告与官方文件核实核心财务数；平台财务表属二手。",
+        "回报核对复权、分红、拆股和币种。",
+        "日期窗口不代表历史可见版本。",
+        "quote+ticker 用5位港股或6位A股代码取当前报价；ask 的公司/日期写进 query，不接受会被忽略的顶层 ticker/start/end；filings 继续接受结构化日期。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "fred",
+      "category": "macro",
+      "title": "经济、利率、信用与流动性序列",
+      "source": "FRED / ALFRED",
+      "kind": "cli",
+      "skill": "skills/findata-analyst/SKILL.md",
+      "operations": [
+        "macro"
+      ],
+      "tool": null,
+      "rules": [
+        "历史研究用 --vintage；普通日期窗口返回当前修订值。",
+        "CSV不含完整单位元数据；历史GDP基期回ALFRED说明核实。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "treasury",
+      "category": "macro",
+      "title": "TGA日度余额与联邦债务",
+      "source": "US Treasury FiscalData",
+      "kind": "cli",
+      "skill": "skills/findata-analyst/SKILL.md",
+      "operations": [
+        "treasury"
+      ],
+      "tool": null,
+      "rules": [
+        "TGA单位为百万美元；联邦债务单位为美元。",
+        "按Closing Balance账户行选TGA；保留原始维度。",
+        "record_date是数据日期，不是历史发布版本或精确发布时间。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "web-news",
+      "category": "news",
+      "title": "公开新闻检索",
+      "source": "Gemini grounded web_search",
+      "kind": "agent_tool",
+      "skill": null,
+      "operations": [],
+      "tool": null,
+      "disabled": true,
+      "hidden": true,
+      "rules": [
+        "已停用（原 openclaw__web_search 已无调用方）；LangAlpha 内部使用独立 web_search。",
+        "传date_after/date_before；严格24小时再按原文时间戳后过滤。",
+        "先找原始公告与报道；关键结果读全文，不把搜索摘要当原文。"
+      ],
+      "health": "disabled"
+    },
+    {
+      "id": "web-page",
+      "category": "news",
+      "title": "公开网页正文",
+      "source": "原始网站 / web_fetch",
+      "kind": "agent_tool",
+      "skill": null,
+      "operations": [],
+      "tool": null,
+      "disabled": true,
+      "hidden": true,
+      "rules": [
+        "已停用（原 openclaw__web_fetch 已无调用方）；LangAlpha 内部使用独立网页抓取。",
+        "正文缺失或403/429再用Firecrawl；私有URL、凭据不交给第三方。"
+      ],
+      "health": "disabled"
+    },
+    {
+      "id": "filings",
+      "category": "news",
+      "title": "公司公告与重大事件",
+      "source": "SEC / CNINFO / HKEX / 公司IR",
+      "kind": "skill",
+      "skill": "skills/company-filings-alert/SKILL.md",
+      "operations": [],
+      "tool": null,
+      "rules": [
+        "美股复用sec；A股复用cn-hk filings；港股按skill返回的官方检索请求执行。",
+        "本入口不创建监控、发消息或修改watchlist。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "alphaengine",
+      "category": "research",
+      "title": "卖方研报与会议纪要",
+      "source": "AlphaEngine",
+      "kind": "mcp_proxy",
+      "skill": null,
+      "operations": [
+        "search_library",
+        "get_document",
+        "get_document_info",
+        "list_attachments",
+        "list_recording_tasks",
+        "get_recording_status",
+        "get_recording_task",
+        "auth_status",
+        "list_filters"
+      ],
+      "tool": "mcp__alphaengine__search_library",
+      "rules": [
+        "关键词主题用 sort=relevance；无关键词列表可用 sort=newest。日期用 date_from/date_to，结果保留 publish_time 和 rank_date。",
+        "本机构录制用 params.meeting_scope=institution（或 document_categories=[institution_meetings]）；个人录制用 personal。来源券商 source_names 与录制归属不同。",
+        "search_library 按 cursor 翻页至 has_more=false；机构会议按 rank_date 排序，返回 document_code=summary，保留 institution_meeting_flag/type_show_name。",
+        "录制预约/失败/处理中用 list_recording_tasks(page/limit/states)，按 next_page 翻页；状态用 get_recording_status，任务详情用 get_recording_task(roadshow_id,wechat_group)。",
+        "list_filters 支持 categories/upstream_categories/sources/document_types/industries/companies/regions/watchlist_groups/watchlist_stocks；词典用 offset/next_offset，companies 须提供 query；watchlist_stocks 须提供 group_id，自选分组 id 可用于 search_library.stock_group_ids。",
+        "search_library 之后按需 get_document 读全文；get_document_info 仅基础类型/已读状态。保留机构、作者、日期、doc_id，专家库全文仍受原权限和额度约束。",
+        "统一入口仅调用已登记只读操作。下载附件继续使用 alphaengine.download_document。",
+        "get_document 可用 content_field=original_text/digest/main_point/question_answer 分页读取不同正文；附件清单用 list_attachments，再用 alphaengine.download_document(attachment_index) 下载。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "guidepoint",
+      "category": "research",
+      "title": "专家访谈与一线经营反馈",
+      "source": "Guidepoint",
+      "kind": "mcp_proxy",
+      "skill": "skills/guidepoint-transcript-search/SKILL.md",
+      "operations": [
+        "search_library"
+      ],
+      "tool": "mcp__guidepoint__search_library",
+      "rules": [
+        "采用、竞争、渠道与执行问题主动查；公开披露足够时不调用。",
+        "英文问题；保留source_attribution.markdown；逐字引用不超过20词。",
+        "统一入口直接调用既有本地 MCP；仅开放已登记只读操作，原始内容及引用保持原样。",
+        "search_library：query 必填且不超过1000字符；size 1–30，顶层 limit 超过30时按30请求；显式 params.size 超限会报错。",
+        "keywords 1–10个非空字符串，条目之间OR、单条词组内部AND；先筛访谈，再按query排Q&A；无关键词时省略或null。",
+        "recency_bias 为1–100整数，只影响排名；start_date/end_date 是UTC日期硬筛选。公开库只返回相关Q&A，无游标分页/全文读取，不可当作全量访谈。",
+        "以实时 tools/list 和实际校验为准；官网静态说明的 size=50、query可省略等口径已与当前服务不一致。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "sales-mail",
+      "category": "research",
+      "title": "已退役邮件搜索名称（仅兼容转发）",
+      "source": "market-digest 私有邮件库",
+      "kind": "cli",
+      "skill": "skills/market-digest/SKILL.md",
+      "operations": [
+        "search",
+        "read"
+      ],
+      "tool": null,
+      "rules": [
+        "不进入 catalog 或新 MCP schema；旧名称只转发新版 research_library，不保留第二套搜索实现。",
+        "search 默认 all + sources=[sales-notes,tmtb] + layer=all + media=text，保留原邮件、TMTB、摘要范围，返回新版 document_id/snippet。",
+        "read 保留 mail:/digest: 文档读取；新调用用 sales-notes/tmtb/all。旧分块 JSON 消费方须迁移。",
+        "不抓取、不索引、不修改 Gmail 标签；digest/index/backfill 与 TMTB 同步命令保留。"
+      ],
+      "health": "not_probed",
+      "hidden": true
+    },
+    {
+      "id": "transcript",
+      "category": "research",
+      "title": "业绩电话会转写稿",
+      "source": "AlphaEngine 业绩会 ASR 稿",
+      "kind": "cli",
+      "skill": null,
+      "operations": [
+        "transcript"
+      ],
+      "tool": null,
+      "rules": [
+        "返回电话会清单（doc_id、标题、日期、company_call 或 broker_callback），正文用 alphaengine get_document 读，只读需要的期次（全文有额度）。",
+        "只给 ticker 时先解析成公司名再检索；中文公司用 query 传中文名，可用 | 分隔多个名称（如 腾讯|Tencent）。默认近 400 天，旧季度用 start/end。",
+        "ASR 稿须标注转写误差、截掉末尾重复段；与业绩新闻稿分开。按 cursor 最多扫描10页；coverage.complete=false 时不得声称全量或最新。roic.ai 已停用，无自动兜底。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "company-wiki",
+      "category": "research",
+      "title": "已入库公司与行业资料",
+      "source": "本地company-wiki",
+      "kind": "cli",
+      "skill": "skills/company-wiki/SKILL.md",
+      "operations": [
+        "search",
+        "read",
+        "list",
+        "topic"
+      ],
+      "tool": null,
+      "rules": [
+        "真实只读执行；复用 wiki 混合检索和别名；params 可筛 company/sector/tag/no_decay；indexed_since 按入库时间筛（start/end 筛的是文档日期，补录旧稿会漏）。",
+        "params.media=all|text|images，默认含已入库图片；read image:<id> 读图，正文附关联图片；历史图片未全量回填。",
+        "read 使用搜索返回的 wiki:<id>；正文分页用 offset/max_chars，文件限定于 wiki 根目录。",
+        "只读本地已入库资料；保留内容日期、来源及路径，不自动入库或重建索引。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "last30days",
+      "category": "community",
+      "title": "跨平台社区、Polymarket和StockTwits",
+      "source": "last30days",
+      "kind": "skill",
+      "skill": null,
+      "operations": [],
+      "tool": null,
+      "disabled": true,
+      "hidden": true,
+      "rules": [
+        "已停用（原 skills/last30days-research 为空目录，当前不可用）。",
+        "保留FROM_BROWSER=off；X走xreach+x_search，雪球独立分流。",
+        "Reddit未覆盖，禁止重试RSS/代理/cookie。",
+        "主agent写plan，每条含search_query和ranking_query；不要用--search白名单关闭StockTwits自动激活。",
+        "社区与概率只作相应信号，不代替公司数字或客观事件概率。",
+        "本机固定3.27.2；上游3.31.0已发布。迁移须保留本机Gemini/X路由、FROM_BROWSER=off和Reddit排除；当前尚未迁移，版本差异见references/researchdata-full-audit-2026-10-28.md。"
+      ],
+      "health": "disabled",
+      "source_version": "3.27.2-openclaw-argon-20261013"
+    },
+    {
+      "id": "agent-reach",
+      "category": "community",
+      "title": "按需读取跨平台工具用法",
+      "source": "agent-reach / 已安装的各平台客户端",
+      "kind": "skill",
+      "skill": "skills/agent-reach/SKILL.md",
+      "operations": [],
+      "tool": null,
+      "rules": [
+        "这是按需交接入口，尚未封装平台执行器；读取 skill 后调用原客户端，executed=false 不代表已经取数。",
+        "YouTube/B站字幕、GitHub单页、公众号、RSS及其他平台按需查原说明；先用 agent-reach doctor 确认可用渠道。",
+        "本机 AGENTS 的来源规则优先：X走xreach+x_search；雪球走独立适配；Reddit未覆盖；Exa已退役。",
+        "公开网页仍按web_fetch、Firecrawl回退；保留现有认证，不自动读取浏览器cookie、配置新服务或发帖。",
+        "本机1.5.0；上游1.6.0重构CLI和浏览器/登录管理，尚未迁移。沿用本机已验证命令，不直接套用1.6命令或自动初始化浏览器。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "x-timeline",
+      "category": "community",
+      "title": "X固定账号、帖子与主题底表",
+      "source": "xreach",
+      "kind": "skill",
+      "skill": null,
+      "operations": [],
+      "tool": null,
+      "rules": [
+        "固定账号先xreach tweets；精确帖子走tweet/thread；主题用since/until。",
+        "与x_search按原帖URL去重；未搜到不能证明不存在。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "x-search",
+      "category": "community",
+      "title": "X跨账号观点与媒体补充",
+      "source": "xAI x_search",
+      "kind": "agent_tool",
+      "skill": null,
+      "operations": [],
+      "tool": null,
+      "disabled": true,
+      "hidden": true,
+      "rules": [
+        "已停用（原 openclaw__x_search 已无调用方）；LangAlpha 内部使用独立 x_search。",
+        "严格时间窗传from_date/to_date；主体事实回公告核验。"
+      ],
+      "health": "disabled"
+    },
+    {
+      "id": "xueqiu",
+      "category": "community",
+      "title": "雪球帖子、评论与用户动态",
+      "source": "api.xueqiu.com / 本地适配",
+      "kind": "skill",
+      "skill": null,
+      "operations": [],
+      "tool": null,
+      "rules": [
+        "python3 scripts/xueqiu_posts.py；不走主站WAF或last30days。",
+        "评论接口须独立验活；讨论流/全文可读不能推出评论也可读。返回未登录时保留该能力缺口，不自动提取浏览器Cookie。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "employee",
+      "category": "community",
+      "title": "员工评论与组织反馈",
+      "source": "Blind / Indeed / Glassdoor",
+      "kind": "skill",
+      "skill": "skills/employee-reviews/SKILL.md",
+      "operations": [],
+      "tool": null,
+      "rules": [
+        "先self-test；Blind第31条起占位正文不能当证据。",
+        "Indeed/Glassdoor公开页面抓取使用既有Firecrawl预算。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "sales-notes",
+      "category": "research",
+      "title": "卖方销售邮件与市场摘要",
+      "source": "本地 market-digest 私有库",
+      "kind": "cli",
+      "skill": "skills/market-digest/SKILL.md",
+      "operations": [
+        "search",
+        "read",
+        "list"
+      ],
+      "tool": null,
+      "rules": [
+        "文档级检索；默认 raw 仅销售邮件，不混入 TMTB；摘要用 params.layer=digest/all。",
+        "params.media=all|text|images，默认含已捕获邮件图片；read image:<id> 读图，不自动 OCR 全库。",
+        "start/end 为内容日期窗口；机构筛选用 params.sender；read 使用 document_id。",
+        "保留原始来源和摘要引用链；已存分块不承诺历史邮件未被截断。",
+        "手动入库的卖方研报/电话会纪要同库（manual: 开头，wiki 迁入为 manual:wiki-<id>）；date 是收到日期，报告日期看 doc_date；入库用 market-digest add-note。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "tmtb",
+      "category": "research",
+      "title": "TMT Breakout 本地原文缓存",
+      "source": "AlphaEngine TMTB 已入库副本",
+      "kind": "cli",
+      "skill": "skills/market-digest/SKILL.md",
+      "operations": [
+        "search",
+        "read",
+        "list"
+      ],
+      "tool": null,
+      "rules": [
+        "只读本地 TMTB，不自动同步、回填或消耗 AlphaEngine 全文额度。",
+        "params.media=all|text|images；已捕获原图单独建向量，read image:<id> 返回图片和原文 ID，未捕获图不算已覆盖。",
+        "以 alphaengine:<doc_id> 识别来源和去重；原日期含同步脚本旧时差口径。",
+        "需补新增时显式调用 alphaengine，source_names=[TMT Breakout]；本地与在线同 doc_id 算同一证据。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "funda-ai",
+      "category": "research",
+      "title": "FUNDA AI 原邮件与图表",
+      "source": "fundaai@substack.com，MBOX 历史及 Gmail 增量，独立本地库",
+      "kind": "cli",
+      "skill": "skills/market-digest/SKILL.md",
+      "operations": [
+        "search",
+        "read",
+        "list"
+      ],
+      "tool": null,
+      "rules": [
+        "独立库 state/funda-ai/index.sqlite；正文和原件保留，read 使用 funda:<id>。",
+        "params.media=all|text|images；原图独立向量，图中数字回原图核对；图片队列未完成须报告覆盖缺口。",
+        "start/end 按原邮件 Date（UTC）筛选；转发时间与原发表时间须回原件核对。",
+        "只读已存邮件；不代替实时 Gmail 同步，不承诺邮件包含网页付费全文。",
+        "FUNDA AI 是独立研究观点；不自动归为卖方或 buyside bogey；同源转述去重。",
+        "旧客户端无此 route 枚举时，用 all + params.sources=[funda-ai]；操作与数据相同。"
+      ],
+      "health": "not_probed"
+    },
+    {
+      "id": "all",
+      "category": "research",
+      "title": "内部研究资料跨库检索",
+      "source": "company-wiki + sales notes + TMTB + FUNDA AI",
+      "kind": "cli",
+      "skill": null,
+      "operations": [
+        "search",
+        "read",
+        "list"
+      ],
+      "tool": null,
+      "rules": [
+        "默认联搜四个本地来源，可用 params.sources 指定子集；不自动查询外部付费库。",
+        "params.media 默认 all，可选 text/images；图文按排名合并，不混用不同模型向量；read image:<id> 返回图。",
+        "按各源文档排名做 RRF；保留 source_status，部分失败不能当空结果。",
+        "read 按 document_id 分派，默认最多 10000 字，可用 offset/max_chars 分页；禁止任意文件/SQL。",
+        "私有正文不送公共搜索；入库、同步、写入和投递仍由原 skill/cron 负责。",
+        "params.layer=all 显式加入 sales-notes 摘要，其他库仍只查原文；默认 raw。摘要带 derived_from 与 independent_evidence=false。"
+      ],
+      "health": "not_probed"
+    }
+  ]
+}

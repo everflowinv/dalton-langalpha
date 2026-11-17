@@ -1,0 +1,73 @@
+{
+  "email_sources": {
+    "domains": [
+      "gs.com",
+      "mail.marquee.gs.com",
+      "jefferies.com",
+      "bofa.com",
+      "bofasecurities.com",
+      "ml.com",
+      "ct-mail.bofa.com",
+      "newsletter@example.invalid"
+    ],
+    "priority_senders": [
+      "Sender Name 1",
+      "Sender Name 2"
+    ]
+  },
+  "gmail": {
+    "label_name": "📊 Sales/Research",
+    "label_id": "",
+    "max_results": 50
+  },
+  "output": {
+    "discord_channel_id": "",
+    "daily_log_dir": "market-memory"
+  },
+  "embedding": {
+    "model": "gemini-embedding-2-preview",
+    "dimensions": 3072
+  },
+  "sections": [
+    {
+      "id": "us_megtech",
+      "label": "🇺🇸 美股 — Mega Tech & AI"
+    },
+    {
+      "id": "us_semi",
+      "label": "🇺🇸 美股 — 半导体"
+    },
+    {
+      "id": "us_software",
+      "label": "🇺🇸 美股 — 软件"
+    },
+    {
+      "id": "us_financials",
+      "label": "🇺🇸 美股 — 金融"
+    },
+    {
+      "id": "us_other",
+      "label": "🇺🇸 美股 — 其他行业"
+    },
+    {
+      "id": "china_hk",
+      "label": "🇨🇳 中国/港股"
+    },
+    {
+      "id": "korea",
+      "label": "🇰🇷 韩国"
+    },
+    {
+      "id": "macro",
+      "label": "📌 宏观 & 地缘政治"
+    },
+    {
+      "id": "events",
+      "label": "🎯 会议/活动"
+    },
+    {
+      "id": "other",
+      "label": "📎 其他"
+    }
+  ]
+}

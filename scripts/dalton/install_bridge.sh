@@ -5,6 +5,33 @@
 # tokens, overwriting Feishu credentials, or printing secrets.
 set -euo pipefail
 
+RESEARCH_RUNTIME_MODE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --research-runtime=*)
+            RESEARCH_RUNTIME_MODE="${1#--research-runtime=}"
+            shift
+            ;;
+        --research-runtime)
+            RESEARCH_RUNTIME_MODE="${2:?missing --research-runtime value}"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: install_bridge.sh [--research-runtime=auto|legacy|new]"
+            exit 0
+            ;;
+        *)
+            echo "[install_bridge] ERROR: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -n "${RESEARCH_RUNTIME_MODE}" && "${RESEARCH_RUNTIME_MODE}" != "auto" && "${RESEARCH_RUNTIME_MODE}" != "legacy" && "${RESEARCH_RUNTIME_MODE}" != "new" ]]; then
+    echo "[install_bridge] ERROR: invalid --research-runtime=${RESEARCH_RUNTIME_MODE} (expected auto|legacy|new)" >&2
+    exit 2
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${DALTON_BRIDGE_ENV_FILE:-${HOME}/.config/dalton/researchdata-bridge.env}"
 REPO_ENV="${DALTON_REPO_ENV_FILE:-${REPO_ROOT}/.env}"
@@ -12,7 +39,18 @@ PLIST_TEMPLATE="${DALTON_PLIST_TEMPLATE:-${REPO_ROOT}/scripts/dalton/launchd/com
 LAUNCH_AGENTS_DIR="${DALTON_LAUNCH_AGENTS_DIR:-${HOME}/Library/LaunchAgents}"
 PLIST_DEST="${LAUNCH_AGENTS_DIR}/com.dalton.researchdata-bridge.plist"
 LOGS_DIR="${DALTON_BRIDGE_LOGS_DIR:-${HOME}/Library/Logs}"
-OCW_ROOT="${DALTON_OCW_ROOT:-${HOME}/.openclaw/workspace}"
+EXPLICIT_RESEARCH_CODE="${DALTON_RESEARCH_CODE:-}"
+EXPLICIT_RESEARCH_HOME="${DALTON_RESEARCH_HOME:-}"
+if [[ -z "${RESEARCH_RUNTIME_MODE}" ]]; then
+    if [[ -n "${EXPLICIT_RESEARCH_CODE}" || -n "${EXPLICIT_RESEARCH_HOME}" ]]; then
+        RESEARCH_RUNTIME_MODE="new"
+    else
+        RESEARCH_RUNTIME_MODE="auto"
+    fi
+fi
+RESEARCH_CODE="${EXPLICIT_RESEARCH_CODE:-${REPO_ROOT}/scripts/dalton/research_runtime}"
+RESEARCH_HOME="${EXPLICIT_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+OCW_ROOT="${DALTON_OCW_ROOT:-}"
 DEFAULT_PYTHON_BIN="/opt/homebrew/bin/python3"
 if [[ ! -x "${DEFAULT_PYTHON_BIN}" ]]; then
     DEFAULT_PYTHON_BIN="$(command -v python3 || true)"
@@ -30,8 +68,12 @@ EFFECTIVE_PORT="$("${HELPER_PYTHON}" "${HELPER_PY}" merge-bridge-env \
     --bridge-env "${ENV_FILE}" \
     --repo-env "${REPO_ENV}" \
     --default-port "${PORT}" \
+    --default-research-code "${RESEARCH_CODE}" \
+    --default-research-home "${RESEARCH_HOME}" \
     --default-ocw-root "${OCW_ROOT}" \
     --default-python "${PYTHON_BIN}" \
+    --existing-plist "${PLIST_DEST}" \
+    --research-runtime "${RESEARCH_RUNTIME_MODE}" \
     --print-port-only)"
 
 "${HELPER_PYTHON}" "${HELPER_PY}" render-plist \
@@ -40,7 +82,8 @@ EFFECTIVE_PORT="$("${HELPER_PYTHON}" "${HELPER_PY}" merge-bridge-env \
     --bridge-env "${ENV_FILE}" \
     --repo-root "${REPO_ROOT}" \
     --home "${HOME}" \
-    --logs-dir "${LOGS_DIR}" >/dev/null
+    --logs-dir "${LOGS_DIR}" \
+    --research-runtime "${RESEARCH_RUNTIME_MODE}" >/dev/null
 
 UID_NUM="$(id -u)"
 "${LAUNCHCTL_CMD}" bootout "gui/${UID_NUM}/com.dalton.researchdata-bridge" 2>/dev/null || true

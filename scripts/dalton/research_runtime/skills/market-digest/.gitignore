@@ -1,0 +1,20 @@
+# Local config (copied to $DALTON_RESEARCH_HOME/config/config.json at migration)
+config.json
+
+# Vector DB (contains indexed email content)
+vectors.db
+
+# Python virtualenv
+venv/
+
+# Daily digest logs
+market-memory/
+
+# MBOX exports
+*.mbox
+
+# macOS
+.DS_Store
+
+# State file
+state.json

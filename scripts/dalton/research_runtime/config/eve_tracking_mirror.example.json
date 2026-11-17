@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "source_chat_id": "oc_YOUR_FEISHU_CHAT_ID",
+  "targets": [
+    {"channel": "discord", "target": "user:YOUR_DISCORD_USER_ID"}
+  ],
+  "note": "Copy to $DALTON_RESEARCH_HOME/config/eve_tracking_mirror.json and fill in your Feishu source_chat_id and Discord target. Set EVE_TRACKING_MIRROR=0 to skip once."
+}
