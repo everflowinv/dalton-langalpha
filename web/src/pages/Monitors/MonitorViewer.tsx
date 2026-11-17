@@ -124,10 +124,14 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
   const effectiveSeq = publicMode
     ? (monitor?.published_seq || 1)
     : (selectedSeq ?? (monitor?.published_seq || detail?.versions[0]?.seq || 1));
+  const selectedVersion = !publicMode
+    ? detail?.versions.find((v) => v.seq === effectiveSeq)
+    : undefined;
+  const effectiveEntryPath = selectedVersion?.entry_path || monitor?.entry_path;
   const frameSource = useMemo<FrameSource | null>(() => {
     if (!monitor || !activeGrant) return null;
     const prefix = versionPrefix(activeGrant.frameBase, effectiveSeq);
-    if (!monitor.entry_path) {
+    if (!effectiveEntryPath) {
       if (!publicMode) return null;
       return {
         key: `${monitor.monitor_id}:v${effectiveSeq}`,
@@ -137,10 +141,10 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     }
     return {
       key: `${monitor.monitor_id}:v${effectiveSeq}`,
-      src: buildServeUrl(prefix, monitor.entry_path),
+      src: buildServeUrl(prefix, effectiveEntryPath),
       sandbox: SERVED_HTML_SANDBOX,
     };
-  }, [monitor, activeGrant, effectiveSeq, publicMode]);
+  }, [monitor, activeGrant, effectiveSeq, effectiveEntryPath, publicMode]);
 
   const permalink = monitor
     ? monitorShareUrl(monitor.slug, monitor.visibility)

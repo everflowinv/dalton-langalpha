@@ -10,7 +10,7 @@ UI_COPY: dict[str, Any] = {
         "title": "市场情绪追踪看板",
         "subtitle": "每行代表一项情绪或拥挤度指标，依次标出1个月前、1周前与最新位置；点距越大说明近期变化越剧烈，同一市场内各行越分散说明内部分化越明显。",
         "top_link_label": "中概互联网相对强弱看板 →",
-        "top_link_href": "https://eve.lumos.space/kweb.html",
+        "top_link_href": "/monitors/relative-strength",
         "color_legend_aria": "颜色图例",
         "color_legend_dir": [
             ("lg-up", "涨 / 净流入：红"),

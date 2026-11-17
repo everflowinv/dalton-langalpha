@@ -15,7 +15,7 @@ from fastapi import HTTPException
 
 from src.config.env import PREVIEW_PROXY_FRAME_ANCESTORS
 from src.dalton.access_tiers import get_user_tier
-from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
 from src.dalton.monitors import db as monitor_db
 from src.dalton.monitors.data_job_registry import (
     HostDirFileSource,
@@ -232,7 +232,9 @@ async def _build_monitor_detail_payload(
     viewer_id: str,
 ) -> dict[str, Any]:
     versions = await monitor_db.list_monitor_versions(
-        monitor.monitor_id, monitor.artifact_id
+        monitor.monitor_id,
+        monitor.artifact_id,
+        fallback_entry_path=monitor.entry_path,
     )
     grant = await mint_monitor_grant(
         monitor.monitor_id, viewer_id, monitor.acl_revision
@@ -243,7 +245,7 @@ async def _build_monitor_detail_payload(
         "versions": [
             {
                 "seq": v.seq,
-                "entry_path": v.entry_path,
+                "entry_path": v.entry_path or monitor.entry_path,
                 "origin": v.origin,
                 "title": v.title,
                 "label": v.label,
@@ -747,21 +749,17 @@ async def _verify_data_job_public_approver(
         raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
 
 
-def _binding_entry_path(binding: MonitorDataJobBinding, *, is_multi: bool) -> str:
-    if is_multi or binding.shared_rel_dir:
-        return f"{binding.slug}/{binding.entry_file}"
-    return binding.entry_file
+def _binding_entry_path(binding: MonitorDataJobBinding, *, is_multi: bool = False) -> str:
+    """Return the workspace-unique artifact path for ``binding`` (always ``<slug>/<entry_file>``)."""
+    _ = is_multi
+    return f"{binding.slug}/{binding.entry_file}"
 
 
 def _open_binding_reader_source(
-    data_root: Path, binding: MonitorDataJobBinding, *, is_multi: bool
+    data_root: Path, binding: MonitorDataJobBinding, *, is_multi: bool = False
 ) -> tuple[Any, str, tuple[str, ...]]:
-    """Open contained FileSource(s) for ``binding``, mounting ``_shared`` alongside ``<slug>/`` when configured."""
-    if not is_multi and not binding.shared_rel_dir:
-        source = HostDirFileSource.open_registered(data_root, binding)
-        work_dir = str(data_root / binding.rel_dir)
-        return source, work_dir, source.list_artifact_files()
-
+    """Open contained FileSource(s) for ``binding`` under ``<slug>/`` (plus ``_shared/`` when configured)."""
+    _ = is_multi
     panel_source = HostDirFileSource.open_registered(data_root, binding)
     mounts: dict[str, HostDirFileSource] = {binding.slug: panel_source}
     try:
@@ -776,7 +774,27 @@ def _open_binding_reader_source(
         raise
     scoped = ScopedMountFileSource(mounts, primary_mount=binding.slug)
     work_dir = str(data_root / Path(binding.rel_dir).parent)
-    return scoped, work_dir, scoped.list_primary_artifact_files()
+    extra_files = () if binding.dependencies_only else scoped.list_primary_artifact_files()
+    return scoped, work_dir, extra_files
+
+
+def _is_migratable_legacy_data_job_monitor(
+    monitor: MonitorRecord,
+    binding: MonitorDataJobBinding,
+    *,
+    is_multi: bool = False,
+) -> bool:
+    """Return True if ``monitor`` is a legacy shared-``index.html`` single-binding data-job row for ``binding``."""
+    if is_multi:
+        return False
+    expected_entry = _binding_entry_path(binding, is_multi=is_multi)
+    return (
+        monitor.source_kind == "data_job"
+        and is_company_system_user(monitor.owner_user_id)
+        and monitor.slug == binding.slug
+        and monitor.entry_path == binding.entry_file
+        and monitor.entry_path != expected_entry
+    )
 
 
 async def _republish_single_binding(
@@ -834,19 +852,43 @@ async def _republish_single_binding(
             )
         conflict = await monitor_db.get_monitor_by_slug(binding.slug)
         if conflict is not None:
-            logger.error(
-                "Data-job monitor slug collision: job_key=%s slug=%s occupied_by=%s",
-                binding.job_key,
-                binding.slug,
-                conflict.monitor_id,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"固定 slug '{binding.slug}' 已被已有监控面板占用"
-                    f"（monitor_id={conflict.monitor_id}），禁止自动改名"
-                ),
-            )
+            if _is_migratable_legacy_data_job_monitor(conflict, binding, is_multi=is_multi):
+                existing = conflict
+                if await monitor_db.has_processed_monitor_run(
+                    existing.monitor_id, clean_run_id
+                ):
+                    return {
+                        "monitor_id": existing.monitor_id,
+                        "slug": existing.slug,
+                        "published_seq": existing.published_seq,
+                        "cut": False,
+                        "deduplicated": True,
+                    }
+                if existing.visibility == "public":
+                    try:
+                        await _verify_data_job_public_approver(
+                            binding,
+                            is_existing_public=True,
+                        )
+                    except PublicAuthorityLostError as exc:
+                        await monitor_db.record_monitor_publish_failure(
+                            existing.monitor_id, error_message=str(exc)
+                        )
+                        raise HTTPException(status_code=403, detail=str(exc)) from None
+            else:
+                logger.error(
+                    "Data-job monitor slug collision: job_key=%s slug=%s occupied_by=%s",
+                    binding.job_key,
+                    binding.slug,
+                    conflict.monitor_id,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"固定 slug '{binding.slug}' 已被已有监控面板占用"
+                        f"（monitor_id={conflict.monitor_id}），禁止自动改名"
+                    ),
+                )
 
     async def _verify_job_public_in_tx(_owner_id: str) -> None:
         await _verify_data_job_public_approver(binding, is_existing_public=True)
@@ -869,37 +911,81 @@ async def _republish_single_binding(
                 extra_paths=extra_files,
             )
         workspace_id = await monitor_db.ensure_company_monitor_workspace()
-        artifact = await artifacts_db.ensure_artifact(workspace_id, entry_path)
-        if monitor is None:
-            monitor = await monitor_db.upsert_monitor(
-                slug=binding.slug,
-                artifact_id=artifact.artifact_id,
-                owner_user_id=COMPANY_SYSTEM_USER_ID,
-                title=binding.title,
-                category=binding.category,
-                sort_order=binding.sort_order,
-                visibility=binding.visibility,
-                keep_updated=True,
-                source_kind="data_job",
-                source_ref=binding.job_key,
-                member_user_ids=(),
+        if monitor is not None and _is_migratable_legacy_data_job_monitor(
+            monitor, binding, is_multi=is_multi
+        ):
+            logger.info(
+                "Auto-migrating legacy data-job monitor: job_key=%s slug=%s monitor_id=%s from=%s to=%s",
+                binding.job_key,
+                binding.slug,
+                monitor.monitor_id,
+                monitor.entry_path,
+                entry_path,
             )
-        await _abort_if_absent_dependencies(
-            monitor.artifact_id,
-            monitor.published_seq or artifact.latest_seq,
-            snap,
-        )
-        updated, result, deduped = await cut_monitor_version(
-            monitor=monitor,
-            owner_user_id=COMPANY_SYSTEM_USER_ID,
-            files=snap.files,
-            title=monitor.title,
-            read_basis=ReadBasis.of(artifact),
-            origin="owner",
-            run_id=clean_run_id,
-            artifact=artifact,
-            verify_public_authority=_verify_job_public_in_tx,
-        )
+            updated, result, deduped = await monitor_db.migrate_data_job_monitor_and_cut_tx(
+                monitor_id=monitor.monitor_id,
+                artifact_id=monitor.artifact_id,
+                workspace_id=workspace_id,
+                workspace_owner_id=COMPANY_SYSTEM_USER_ID,
+                target_entry_path=entry_path,
+                legacy_entry_path=binding.entry_file,
+                expected_slug=binding.slug,
+                target_source_ref=binding.job_key,
+                files=snap.files,
+                title=monitor.title,
+                origin="owner",
+                run_id=clean_run_id,
+                verify_public_authority=_verify_job_public_in_tx,
+            )
+        else:
+            artifact = await artifacts_db.ensure_artifact(workspace_id, entry_path)
+            if monitor is not None and monitor.artifact_id != artifact.artifact_id:
+                logger.error(
+                    "Data-job monitor artifact mismatch: job_key=%s slug=%s monitor_id=%s monitor_artifact=%s expected_entry=%s expected_artifact=%s",
+                    binding.job_key,
+                    binding.slug,
+                    monitor.monitor_id,
+                    monitor.artifact_id,
+                    entry_path,
+                    artifact.artifact_id,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"监控面板 '{binding.slug}' 仍绑定旧资源路径 '{monitor.entry_path}'，"
+                        f"无法自动迁移到 '{entry_path}'"
+                    ),
+                )
+            if monitor is None:
+                monitor = await monitor_db.upsert_monitor(
+                    slug=binding.slug,
+                    artifact_id=artifact.artifact_id,
+                    owner_user_id=COMPANY_SYSTEM_USER_ID,
+                    title=binding.title,
+                    category=binding.category,
+                    sort_order=binding.sort_order,
+                    visibility=binding.visibility,
+                    keep_updated=True,
+                    source_kind="data_job",
+                    source_ref=binding.job_key,
+                    member_user_ids=(),
+                )
+            await _abort_if_absent_dependencies(
+                monitor.artifact_id,
+                monitor.published_seq or artifact.latest_seq,
+                snap,
+            )
+            updated, result, deduped = await cut_monitor_version(
+                monitor=monitor,
+                owner_user_id=COMPANY_SYSTEM_USER_ID,
+                files=snap.files,
+                title=monitor.title,
+                read_basis=ReadBasis.of(artifact),
+                origin="owner",
+                run_id=clean_run_id,
+                artifact=artifact,
+                verify_public_authority=_verify_job_public_in_tx,
+            )
     except Exception as exc:
         if monitor is not None:
             await monitor_db.record_monitor_publish_failure(
@@ -944,6 +1030,15 @@ async def republish_data_job_monitor(
     if len(bindings) == 1:
         binding = bindings[0]
         existing = await monitor_db.get_monitor_by_data_job(binding.job_key)
+        if existing is not None and existing.slug != binding.slug:
+            logger.error(
+                "Data-job monitor slug/source_ref mismatch: job_key=%s expected_slug=%s actual_slug=%s monitor_id=%s",
+                binding.job_key,
+                binding.slug,
+                existing.slug,
+                existing.monitor_id,
+            )
+            existing = None
         return await _republish_single_binding(
             binding,
             clean_run_id=clean_run_id,
@@ -1013,9 +1108,17 @@ async def maybe_publish_data_job_monitor(
         return
     if len(bindings) == 1:
         existing = await monitor_db.get_monitor_by_data_job(bindings[0].job_key)
-        existing_rows = [existing] if existing is not None else []
+        existing_rows = (
+            [existing]
+            if existing is not None and existing.slug == bindings[0].slug
+            else []
+        )
     else:
-        existing_rows = await monitor_db.list_monitors_by_data_job(job_key)
+        existing_rows = [
+            row
+            for row in await monitor_db.list_monitors_by_data_job(job_key)
+            if any(row.slug == b.slug for b in bindings)
+        ]
     for existing in existing_rows:
         await monitor_db.record_monitor_publish_failure(
             existing.monitor_id,

@@ -268,7 +268,19 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
         assert entry.timeout_seconds == base["timeout_seconds"]
         assert entry.no_output_timeout_seconds == base["no_output_timeout_seconds"]
         assert entry.cwd == base["cwd"]
-        assert entry.command == base["command"]
+        if code == "T25":
+            # COS upload retired: T25 keeps self-test + build only.
+            assert (
+                entry.command
+                == "bash skills/sentiment-dashboard/scripts/run.sh self-test --json "
+                "&& bash skills/sentiment-dashboard/scripts/run.sh build --no-cache --json"
+            )
+            assert (
+                list(entry.command_argv)
+                == ["sh", "-c", entry.command]
+            )
+        else:
+            assert entry.command == base["command"]
         assert "-lc" not in entry.command_argv, f"{code} must not use login shell (-lc)"
 
         # Runner check: T1 and T29 actively refresh on the host, all others are container
@@ -294,33 +306,68 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
             assert entry.cron == base["cron"], f"Cron mismatch on {code}"
             assert entry.timezone == base["timezone"], f"Timezone mismatch on {code}"
 
-    # Verify secret_names declarations per Design §4.4.2
+    # Verify secret_names declarations per Design §4.4.2 (COS secrets retired)
     assert list(by_code["T13"].secret_names) == [
-        "TENCENT_COS_SECRET_ID",
-        "TENCENT_COS_SECRET_KEY",
         "FEISHU_APP_ID",
         "FEISHU_APP_SECRET",
     ]
-    assert list(by_code["T25"].secret_names) == [
-        "TENCENT_COS_SECRET_ID",
-        "TENCENT_COS_SECRET_KEY",
-    ]
+    assert list(by_code["T25"].secret_names) == []
     assert list(by_code["T52"].secret_names) == ["FEISHU_APP_ID", "FEISHU_APP_SECRET"]
     assert list(by_code["T54"].secret_names) == ["FEISHU_APP_ID", "FEISHU_APP_SECRET"]
 
 
-@pytest.mark.asyncio
-async def test_sync_manifest_to_db_restores_t25_redacted_python() -> None:
+def test_manifest_excludes_cos_upload_and_cos_secrets() -> None:
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
+
+    for entry in manifest.tasks:
+        assert "sentiment_dashboard_cos_upload.py" not in entry.command, entry.task_code
+        assert all(
+            "sentiment_dashboard_cos_upload.py" not in arg for arg in entry.command_argv
+        ), entry.task_code
+        assert "TENCENT_COS_SECRET_ID" not in entry.secret_names, entry.task_code
+        assert "TENCENT_COS_SECRET_KEY" not in entry.secret_names, entry.task_code
+
     t25 = by_code["T25"]
-    assert "[REDACTED]" in t25.command
-    resolved_argv = t25.resolved_command_argv()
+    assert t25.command == (
+        "bash skills/sentiment-dashboard/scripts/run.sh self-test --json "
+        "&& bash skills/sentiment-dashboard/scripts/run.sh build --no-cache --json"
+    )
+    assert list(t25.command_argv) == ["sh", "-c", t25.command]
+    assert list(t25.secret_names) == []
+
+    t34 = by_code["T34"]
+    assert t34.command == "bash skills/kweb-dashboard/scripts/run.sh deploy --no-upload --json"
+    assert list(t34.command_argv) == [
+        "bash",
+        "skills/kweb-dashboard/scripts/run.sh",
+        "deploy",
+        "--no-upload",
+        "--json",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_manifest_to_db_restores_redacted_python() -> None:
+    from src.dalton.data_jobs.manifest import DataTaskManifestEntry
+
+    synthetic = DataTaskManifestEntry(
+        task_code="T99",
+        job_key="synthetic-redacted",
+        title="synthetic",
+        batch_no=3,
+        cron="0 0 * * 1-5",
+        timezone="Asia/Hong_Kong",
+        command="echo ok && [REDACTED] scripts/example.py",
+        command_argv=["sh", "-c", "echo ok && [REDACTED] scripts/example.py"],
+    )
+    resolved_argv = synthetic.resolved_command_argv()
     assert resolved_argv[0] == "sh"
     assert resolved_argv[1] == "-c"
     assert "[REDACTED]" not in resolved_argv[2]
-    assert "/app/.venv/bin/python scripts/sentiment_dashboard_cos_upload.py" in resolved_argv[2]
+    assert "/app/.venv/bin/python scripts/example.py" in resolved_argv[2]
 
+    manifest = load_data_task_manifest()
     conn, state = _make_autospec_db()
     count = await sync_manifest_to_db(conn, manifest)
     assert count == 41
@@ -8151,10 +8198,29 @@ def test_sentiment_dashboard_cos_upload_overlay_prod_sdk_and_credential_rules(
     expected_sha = hashlib.sha256(html_bytes).hexdigest()
     expected_gzip = gzip.compress(html_bytes, compresslevel=6, mtime=0)
 
-    # 1. Prod upload with paired environment credentials configures website on NoSuchWebsiteConfiguration,
+    # 0. COS upload is retired by default: standalone unset mode and 'prod' mode both reject unless DALTON_ALLOW_COS_UPLOAD=1.
+    for var in overlay_mod.DALTON_RUNNER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("DALTON_ALLOW_COS_UPLOAD", raising=False)
+    monkeypatch.delenv("DALTON_COS_UPLOAD_MODE", raising=False)
+    monkeypatch.setattr(sys, "argv", [str(overlay_script), "--file", str(html_file)])
+    assert overlay_mod.main() == 1
+    err_default = json.loads(capsys.readouterr().err.strip())
+    assert err_default["ok"] is False
+    assert "已停用" in err_default["error"]
+
+    monkeypatch.setenv("DALTON_COS_UPLOAD_MODE", "prod")
+    assert overlay_mod.main() == 1
+    err_prod_blocked = json.loads(capsys.readouterr().err.strip())
+    assert err_prod_blocked["ok"] is False
+    assert "已停用" in err_prod_blocked["error"]
+    keychain_spy.assert_not_called()
+
+    # 1. With DALTON_ALLOW_COS_UPLOAD=1, prod upload with paired environment credentials configures website on NoSuchWebsiteConfiguration,
     #    uploads gzipped HTML with expected metadata, and verifies remote gzipped body sha256.
     for var in overlay_mod.DALTON_RUNNER_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DALTON_ALLOW_COS_UPLOAD", "1")
     monkeypatch.setenv("DALTON_RUN_ID", "run-prod-1")
     monkeypatch.setenv("DALTON_COS_UPLOAD_MODE", "prod")
     monkeypatch.setenv("TENCENT_COS_SECRET_ID", "SecretId-Prod-111")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -393,8 +394,42 @@ async def _record_monitor_version_in_cur(cur, monitor_id: str, seq: int) -> None
     )
 
 
+def _derive_version_entry_path(
+    paths: Sequence[str],
+    *,
+    fallback_entry_path: str | None = None,
+) -> str:
+    """Derive a version's entry path from its stored file paths when ``artifact_versions.entry_path`` is missing."""
+    fallback = str(fallback_entry_path or "").strip()
+    clean_paths = [str(p).strip() for p in paths if str(p or "").strip()]
+    if not clean_paths:
+        return fallback
+    if fallback and fallback in clean_paths:
+        return fallback
+    if fallback:
+        fallback_name = posixpath.basename(fallback)
+        if fallback_name in clean_paths:
+            return fallback_name
+        suffix = f"/{fallback_name}"
+        matching = [p for p in clean_paths if p.endswith(suffix)]
+        if matching:
+            return min(matching, key=lambda p: (p.count("/"), p))
+    if "index.html" in clean_paths:
+        return "index.html"
+    index_children = [p for p in clean_paths if p.endswith("/index.html")]
+    if index_children:
+        return min(index_children, key=lambda p: (p.count("/"), p))
+    html_files = [p for p in clean_paths if p.lower().endswith((".html", ".htm"))]
+    if html_files:
+        return min(html_files, key=lambda p: (p.count("/"), len(p), p))
+    return min(clean_paths)
+
+
 async def list_monitor_versions(
-    monitor_id: str, artifact_id: str
+    monitor_id: str,
+    artifact_id: str,
+    *,
+    fallback_entry_path: str | None = None,
 ) -> list[artifacts_versions_db.Version]:
     """Return only versions explicitly published to ``monitor_id`` (excluding private kept cuts)."""
     async with get_db_connection() as conn:
@@ -410,7 +445,48 @@ async def list_monitor_versions(
                 """,
                 (monitor_id, artifact_id),
             )
-            return [artifacts_versions_db.Version(**row) for row in await cur.fetchall()]
+            rows = await cur.fetchall()
+            missing_seqs = [
+                int(row["seq"])
+                for row in rows
+                if not str(row.get("entry_path") or "").strip()
+            ]
+            files_by_seq: dict[int, list[str]] = {}
+            if missing_seqs:
+                await cur.execute(
+                    """
+                    SELECT seq, path
+                      FROM artifact_version_files
+                     WHERE artifact_id = %s::uuid
+                       AND seq = ANY(%s)
+                     ORDER BY seq ASC, path ASC
+                    """,
+                    (artifact_id, missing_seqs),
+                )
+                for file_row in await cur.fetchall():
+                    files_by_seq.setdefault(int(file_row["seq"]), []).append(
+                        str(file_row["path"])
+                    )
+    versions: list[artifacts_versions_db.Version] = []
+    for row in rows:
+        entry_path = str(row.get("entry_path") or "").strip()
+        if not entry_path:
+            entry_path = _derive_version_entry_path(
+                files_by_seq.get(int(row["seq"]), ()),
+                fallback_entry_path=fallback_entry_path,
+            )
+        versions.append(
+            artifacts_versions_db.Version(
+                seq=int(row["seq"]),
+                entry_path=entry_path,
+                origin=row["origin"],
+                title=row.get("title"),
+                label=row.get("label"),
+                byte_len=int(row["byte_len"]),
+                published_at=row["published_at"],
+            )
+        )
+    return versions
 
 
 async def is_monitor_version_published(monitor_id: str, seq: int) -> bool:
@@ -788,6 +864,113 @@ async def commit_monitor_publish_tx(
     return loaded, result
 
 
+async def _reserve_monitor_publish_run_in_cur(
+    cur, *, monitor_id: str, run_id: str | None
+) -> MonitorRecord | None:
+    """Reserve ``(monitor_id, run_id)`` or return the existing monitor on duplicate run."""
+    if run_id is None:
+        return None
+    await cur.execute(
+        """
+        INSERT INTO dalton_monitor_publish_runs (
+            monitor_id, run_id, published_seq
+        )
+        VALUES (%s::uuid, %s, 0)
+        ON CONFLICT (monitor_id, run_id) DO NOTHING
+        RETURNING monitor_id::text AS monitor_id
+        """,
+        (monitor_id, run_id),
+    )
+    if await cur.fetchone() is None:
+        existing_mon = await _select_monitor_in_cur(cur, monitor_id)
+        if existing_mon is None:
+            raise LookupError(f"Monitor {monitor_id} not found")
+        return existing_mon
+    return None
+
+
+async def _cut_and_finalize_monitor_in_cur(
+    cur,
+    *,
+    monitor_id: str,
+    locked: Any,
+    row: dict[str, Any],
+    workspace_owner_id: str,
+    files: list[VersionFile],
+    title: str | None,
+    label: str | None = None,
+    read_basis: ReadBasis | None = None,
+    origin: Origin = "owner",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+    run_id: str | None = None,
+    new_owner_user_id: str | None = None,
+    verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[MonitorRecord, PublishResult]:
+    """Verify authority, unshare if downgraded, cut artifact version, and update monitor state."""
+    artifact_id = locked.artifact_id
+    live_visibility = str(row["visibility"])
+    effective_owner = new_owner_user_id or str(row["owner_user_id"])
+    share_public = live_visibility == "public"
+
+    if share_public and verify_public_authority is not None:
+        await verify_public_authority(effective_owner)
+
+    if read_basis is not None:
+        read_basis.check(locked)
+
+    if not share_public and locked.shared:
+        locked = await artifacts_records_db.unshare_in_cur(
+            cur, user_id=workspace_owner_id, artifact_id=artifact_id
+        )
+
+    result = await artifacts_versions_db.cut_monitor_in_cur(
+        cur,
+        locked,
+        user_id=workspace_owner_id,
+        files=files,
+        title=title or str(row["title"]),
+        label=label,
+        share_public=share_public,
+        origin=origin,
+        loaded_files=loaded_files,
+        left_out_files=left_out_files,
+    )
+    await _record_monitor_version_in_cur(cur, monitor_id, result.seq)
+    await _prune_monitor_versions_in_cur(
+        cur,
+        artifact_id,
+        published_seq=result.seq,
+        keep_count=MAX_MONITOR_VERSIONS,
+    )
+    if run_id is not None:
+        await cur.execute(
+            """
+            UPDATE dalton_monitor_publish_runs
+               SET published_seq = %s
+             WHERE monitor_id = %s::uuid AND run_id = %s
+            """,
+            (result.seq, monitor_id, run_id),
+        )
+    await cur.execute(
+        """
+        UPDATE dalton_monitors
+           SET published_seq = %s,
+               owner_user_id = %s,
+               last_publish_run_id = COALESCE(%s, last_publish_run_id),
+               last_publish_error = NULL,
+               last_publish_failed_at = NULL,
+               updated_at = NOW()
+         WHERE monitor_id = %s::uuid
+        """,
+        (result.seq, effective_owner, run_id, monitor_id),
+    )
+    loaded = await _select_monitor_in_cur(cur, monitor_id)
+    if loaded is None:
+        raise LookupError(f"Monitor {monitor_id} not found")
+    return loaded, result
+
+
 async def commit_monitor_version_tx(
     *,
     monitor_id: str,
@@ -828,83 +1011,158 @@ async def commit_monitor_version_tx(
                 if row is None:
                     raise LookupError(f"Monitor {monitor_id} not found")
 
-                if run_id is not None:
-                    await cur.execute(
-                        """
-                        INSERT INTO dalton_monitor_publish_runs (
-                            monitor_id, run_id, published_seq
-                        )
-                        VALUES (%s::uuid, %s, 0)
-                        ON CONFLICT (monitor_id, run_id) DO NOTHING
-                        RETURNING monitor_id::text AS monitor_id
-                        """,
-                        (monitor_id, run_id),
-                    )
-                    if await cur.fetchone() is None:
-                        existing_mon = await _select_monitor_in_cur(cur, monitor_id)
-                        if existing_mon is None:
-                            raise LookupError(f"Monitor {monitor_id} not found")
-                        return existing_mon, None, True
+                dedup_mon = await _reserve_monitor_publish_run_in_cur(
+                    cur, monitor_id=monitor_id, run_id=run_id
+                )
+                if dedup_mon is not None:
+                    return dedup_mon, None, True
 
-                live_visibility = str(row["visibility"])
-                effective_owner = new_owner_user_id or str(row["owner_user_id"])
-                share_public = live_visibility == "public"
-
-                if share_public and verify_public_authority is not None:
-                    await verify_public_authority(effective_owner)
-
-                if read_basis is not None:
-                    read_basis.check(locked)
-
-                if not share_public and locked.shared:
-                    locked = await artifacts_records_db.unshare_in_cur(
-                        cur, user_id=workspace_owner_id, artifact_id=artifact_id
-                    )
-
-                result = await artifacts_versions_db.cut_monitor_in_cur(
+                loaded, result = await _cut_and_finalize_monitor_in_cur(
                     cur,
-                    locked,
-                    user_id=workspace_owner_id,
+                    monitor_id=monitor_id,
+                    locked=locked,
+                    row=row,
+                    workspace_owner_id=workspace_owner_id,
                     files=files,
-                    title=title or str(row["title"]),
+                    title=title,
                     label=label,
-                    share_public=share_public,
+                    read_basis=read_basis,
                     origin=origin,
                     loaded_files=loaded_files,
                     left_out_files=left_out_files,
+                    run_id=run_id,
+                    new_owner_user_id=new_owner_user_id,
+                    verify_public_authority=verify_public_authority,
                 )
-                await _record_monitor_version_in_cur(cur, monitor_id, result.seq)
-                await _prune_monitor_versions_in_cur(
+    return loaded, result, False
+
+
+async def migrate_data_job_monitor_and_cut_tx(
+    *,
+    monitor_id: str,
+    artifact_id: str,
+    workspace_id: str,
+    workspace_owner_id: str,
+    target_entry_path: str,
+    legacy_entry_path: str,
+    expected_slug: str,
+    target_source_ref: str,
+    files: list[VersionFile],
+    title: str | None,
+    label: str | None = None,
+    origin: Origin = "owner",
+    loaded_files: list[str] | None = None,
+    left_out_files: list[str] | None = None,
+    run_id: str | None = None,
+    verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[MonitorRecord, PublishResult | None, bool]:
+    """Atomically rename a legacy ``data_job`` artifact path to ``<slug>/<entry_file>`` and cut."""
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                locked = await artifacts_records_db.lock_owned(
                     cur,
-                    artifact_id,
-                    published_seq=result.seq,
-                    keep_count=MAX_MONITOR_VERSIONS,
+                    user_id=workspace_owner_id,
+                    artifact_id=artifact_id,
                 )
-                if run_id is not None:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_monitor_publish_runs
-                           SET published_seq = %s
-                         WHERE monitor_id = %s::uuid AND run_id = %s
-                        """,
-                        (result.seq, monitor_id, run_id),
-                    )
                 await cur.execute(
                     """
-                    UPDATE dalton_monitors
-                       SET published_seq = %s,
-                           owner_user_id = %s,
-                           last_publish_run_id = COALESCE(%s, last_publish_run_id),
-                           last_publish_error = NULL,
-                           last_publish_failed_at = NULL,
-                           updated_at = NOW()
+                    SELECT monitor_id::text AS monitor_id,
+                           slug,
+                           artifact_id::text AS artifact_id,
+                           source_kind,
+                           source_ref,
+                           visibility,
+                           owner_user_id,
+                           title,
+                           published_seq
+                      FROM dalton_monitors
                      WHERE monitor_id = %s::uuid
+                       FOR UPDATE
                     """,
-                    (result.seq, effective_owner, run_id, monitor_id),
+                    (monitor_id,),
                 )
-                loaded = await _select_monitor_in_cur(cur, monitor_id)
-    if loaded is None:
-        raise LookupError(f"Monitor {monitor_id} not found")
+                row = await cur.fetchone()
+                if row is None:
+                    raise LookupError(f"Monitor {monitor_id} not found")
+
+                if (
+                    row["source_kind"] != "data_job"
+                    or not is_company_system_user(str(row["owner_user_id"]))
+                    or row["slug"] != expected_slug
+                    or str(row["artifact_id"]) != locked.artifact_id
+                    or locked.workspace_id != workspace_id
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"监控面板 '{expected_slug}' 不符合遗留数据任务面板自动迁移条件",
+                    )
+
+                dedup_mon = await _reserve_monitor_publish_run_in_cur(
+                    cur, monitor_id=monitor_id, run_id=run_id
+                )
+                if dedup_mon is not None:
+                    return dedup_mon, None, True
+
+                current_entry_path = locked.path
+                if current_entry_path != target_entry_path:
+                    if current_entry_path != legacy_entry_path:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"监控面板 '{expected_slug}' 仍绑定路径 '{current_entry_path}'，"
+                                f"无法自动迁移到 '{target_entry_path}'"
+                            ),
+                        )
+                    try:
+                        locked = await artifacts_records_db.rename_artifact_path_in_cur(
+                            cur,
+                            user_id=workspace_owner_id,
+                            artifact_id=locked.artifact_id,
+                            workspace_id=locked.workspace_id,
+                            new_path=target_entry_path,
+                        )
+                    except artifacts_records_db.ArtifactPathConflict as exc:
+                        occupant_hint = (
+                            f"（artifact_id={exc.occupant_artifact_id}）"
+                            if exc.occupant_artifact_id
+                            else ""
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"目标资源路径 '{target_entry_path}' 已被另一资源占用"
+                                f"{occupant_hint}，无法自动迁移"
+                            ),
+                        ) from None
+
+                if row.get("source_ref") != target_source_ref:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_monitors
+                           SET source_ref = %s,
+                               updated_at = NOW()
+                         WHERE monitor_id = %s::uuid
+                        """,
+                        (target_source_ref, monitor_id),
+                    )
+
+                loaded, result = await _cut_and_finalize_monitor_in_cur(
+                    cur,
+                    monitor_id=monitor_id,
+                    locked=locked,
+                    row=row,
+                    workspace_owner_id=workspace_owner_id,
+                    files=files,
+                    title=title,
+                    label=label,
+                    read_basis=None,
+                    origin=origin,
+                    loaded_files=loaded_files,
+                    left_out_files=left_out_files,
+                    run_id=run_id,
+                    verify_public_authority=verify_public_authority,
+                )
     return loaded, result, False
 
 
@@ -1027,21 +1285,22 @@ async def _prune_monitor_versions_in_cur(
         },
     )
     deleted_versions = int(cur.rowcount or 0)
-    await cur.execute(
-        """
-        DELETE FROM dalton_monitor_versions dmv
-         USING dalton_monitors dm
-         WHERE dmv.monitor_id = dm.monitor_id
-           AND dm.artifact_id = %s::uuid
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM artifact_versions av
-                WHERE av.artifact_id = dm.artifact_id
-                  AND av.seq = dmv.seq
-           )
-        """,
-        (artifact_id,),
-    )
+    if deleted_versions > 0:
+        await cur.execute(
+            """
+            DELETE FROM dalton_monitor_versions dmv
+             USING dalton_monitors dm
+             WHERE dmv.monitor_id = dm.monitor_id
+               AND dm.artifact_id = %s::uuid
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM artifact_versions av
+                    WHERE av.artifact_id = dm.artifact_id
+                      AND av.seq = dmv.seq
+               )
+            """,
+            (artifact_id,),
+        )
     return deleted_versions
 
 

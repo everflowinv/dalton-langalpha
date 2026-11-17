@@ -60,6 +60,9 @@ class MonitorDataJobBinding:
     # Required when visibility == "public": the approving administrator whose current
     # admin tier is re-verified on every public data-job republish.
     approved_by_admin_user_id: str | None = None
+    # When True, snapshot only the entry file and static references found by
+    # walk_manifest (skip unreferenced sibling files in rel_dir, e.g. portfolio/*.md).
+    dependencies_only: bool = False
 
 
 SENTIMENT_DASHBOARD_JOB_KEY = "sentiment-dashboard-refresh"
@@ -151,6 +154,19 @@ MONITOR_DATA_JOB_REGISTRY: dict[
         data_keys=("metrics",),
     ),
     SENTIMENT_DASHBOARD_JOB_KEY: SENTIMENT_DASHBOARD_PANELS,
+    "richard-relative-dashboard-refresh": (
+        MonitorDataJobBinding(
+            job_key="richard-relative-dashboard-refresh",
+            slug="relative-strength",
+            title="相对强弱看板（中概 / 美股金融 / ETF）",
+            category="stocks",
+            visibility="company",
+            rel_dir="research-outputs/kweb-dashboard",
+            entry_file="index.html",
+            sort_order=65,
+            dependencies_only=True,
+        ),
+    ),
     "pm-market-state": (
         MonitorDataJobBinding(
             job_key="pm-market-state",
@@ -220,6 +236,35 @@ def get_registered_monitor_binding_by_slug(
         if binding.slug == clean_slug:
             return binding
     return None
+
+
+def validate_monitor_data_job_registry() -> None:
+    """Ensure every registered data-job binding has a globally unique slug and entry path."""
+    seen_slugs: dict[str, str] = {}
+    seen_entry_paths: dict[str, str] = {}
+    for reg_key, entry in MONITOR_DATA_JOB_REGISTRY.items():
+        bindings = (entry,) if isinstance(entry, MonitorDataJobBinding) else tuple(entry)
+        if not bindings:
+            raise ValueError(f"Empty binding list for data job {reg_key!r}")
+        for binding in bindings:
+            if binding.job_key != reg_key:
+                raise ValueError(
+                    f"Binding job_key mismatch: registry={reg_key!r}, binding={binding.job_key!r}"
+                )
+            if binding.slug in seen_slugs:
+                raise ValueError(
+                    f"Duplicate monitor slug {binding.slug!r} in {reg_key!r} and {seen_slugs[binding.slug]!r}"
+                )
+            seen_slugs[binding.slug] = reg_key
+            entry_path = f"{binding.slug}/{binding.entry_file}"
+            if entry_path in seen_entry_paths:
+                raise ValueError(
+                    f"Duplicate monitor entry path {entry_path!r} in {reg_key!r} and {seen_entry_paths[entry_path]!r}"
+                )
+            seen_entry_paths[entry_path] = reg_key
+
+
+validate_monitor_data_job_registry()
 
 
 def _split_clean_rel_parts(raw_rel: str, *, allow_leading_slash: bool = False) -> list[str] | None:

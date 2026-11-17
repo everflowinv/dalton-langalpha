@@ -167,3 +167,60 @@ class SeedOpenClawDataTests(unittest.TestCase):
             self.assertFalse((target / "skills/market-digest/secrets.json").exists())
             self.assertFalse((target / "skills/company-filings-alert/state/last_check.json").exists())
             self.assertTrue((target / "state/a-share-volume-watch").is_dir())
+
+    def test_applies_digest_and_kweb_overlays_over_host_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            target = root / "target"
+            (source / "scripts").mkdir(parents=True)
+            (source / "skills/kweb-dashboard/scripts").mkdir(parents=True)
+            (source / "scripts/sentiment_dashboard_digest.sh").write_text(
+                "#!/usr/bin/env bash\necho host upload COS\n", encoding="utf-8"
+            )
+            (source / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").write_text(
+                "# host kweb cli without --no-upload\n", encoding="utf-8"
+            )
+            (source / "skills/kweb-dashboard/SKILL.md").write_text(
+                "# host skill recommending deploy and eve.lumos.space\n", encoding="utf-8"
+            )
+
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "--apply", "--source", str(source), "--target", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            overlays_dir = SCRIPT.parent / "openclaw_overlays"
+            self.assertEqual(
+                (target / "scripts/sentiment_dashboard_digest.sh").read_text(encoding="utf-8"),
+                (overlays_dir / "scripts/sentiment_dashboard_digest.sh").read_text(encoding="utf-8"),
+            )
+            self.assertNotIn(
+                "cos_upload",
+                (target / "scripts/sentiment_dashboard_digest.sh").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (target / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").read_text(
+                    encoding="utf-8"
+                ),
+                (overlays_dir / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "--no-upload",
+                (target / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertEqual(
+                (target / "skills/kweb-dashboard/SKILL.md").read_text(encoding="utf-8"),
+                (overlays_dir / "skills/kweb-dashboard/SKILL.md").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "deploy --no-upload",
+                (target / "skills/kweb-dashboard/SKILL.md").read_text(encoding="utf-8"),
+            )

@@ -2,7 +2,8 @@
 
 Expected schedule is hardcoded from the OpenClaw cron export. This file does
 not read ``.agy/``. Podcast jobs stay on OpenClaw and have no manifest here.
-T34 has no overlay entry; the host command is the skill script itself.
+T34 uses the ``kweb_dashboard_cli.py`` overlay so ``deploy --no-upload --json``
+updates the virtual portfolio without uploading to Tencent COS.
 """
 
 from __future__ import annotations
@@ -50,9 +51,10 @@ KWEB_ARGV = [
     "bash",
     "skills/kweb-dashboard/scripts/run.sh",
     "deploy",
+    "--no-upload",
     "--json",
 ]
-KWEB_COMMAND = "bash skills/kweb-dashboard/scripts/run.sh deploy --json"
+KWEB_COMMAND = "bash skills/kweb-dashboard/scripts/run.sh deploy --no-upload --json"
 FREEZE_PATHS = [
     "research-outputs/kweb-dashboard/index.html",
 ]
@@ -688,3 +690,432 @@ def test_none_payload_source_ignores_stdout_trigger_fields(tmp_path: Path) -> No
         )
         assert saved is not None, job_key
         assert outbox_path.is_file()
+
+
+def test_kweb_deploy_no_upload_updates_portfolio_without_uploading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import importlib.util
+    import types
+
+    cli_path = (
+        REPO_ROOT
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "skills"
+        / "kweb-dashboard"
+        / "scripts"
+        / "kweb_dashboard_cli.py"
+    )
+    assert cli_path.is_file()
+
+    def _fake_workspace_root(_file: str | Path) -> Path:
+        return tmp_path
+
+    ws_mod = types.ModuleType("openclaw_workspace")
+    ws_mod.workspace_root = create_autospec(_fake_workspace_root, return_value=tmp_path)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openclaw_workspace", ws_mod)
+
+    spec = importlib.util.spec_from_file_location("kweb_dashboard_cli_overlay_test", cli_path)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = cli
+    try:
+        spec.loader.exec_module(cli)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    out_html = tmp_path / "research-outputs" / "kweb-dashboard" / "index.html"
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        create_autospec(cli.load_config, return_value={"site_title": "Richard 相对看板"}),
+    )
+    build_spy = create_autospec(
+        cli.build,
+        return_value={
+            "ok": True,
+            "output": str(out_html),
+            "bytes": 1234,
+            "title": "Richard 相对看板",
+            "warnings": [],
+            "overlong_notes": [],
+            "portfolio": {"ok": True},
+            "etf_board": {"ok": True, "rows": 10, "errors": []},
+        },
+    )
+    monkeypatch.setattr(cli, "build", build_spy)
+    upload_spy = create_autospec(
+        cli.upload_html,
+        side_effect=AssertionError("upload_html must not be called with --no-upload"),
+    )
+    monkeypatch.setattr(cli, "upload_html", upload_spy)
+
+    rc = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is True
+    assert payload["uploaded"] is False
+    assert payload["upload_skipped"] is True
+    assert payload["upload"] is None
+    assert payload["title"] == "Richard 相对看板"
+    build_spy.assert_called_once_with(
+        out_html,
+        {"site_title": "Richard 相对看板"},
+        update_portfolio=True,
+    )
+    upload_spy.assert_not_called()
+
+    # Warnings still fail deploy without calling upload_html.
+    build_spy.return_value = {
+        "ok": True,
+        "output": str(out_html),
+        "bytes": 1234,
+        "title": "Richard 相对看板",
+        "warnings": ["missing series"],
+        "overlong_notes": [],
+    }
+    warn_result = cli.deploy(out_html, no_upload=True)
+    assert warn_result["ok"] is False
+    assert warn_result["uploaded"] is False
+    assert warn_result["upload_skipped"] is True
+    upload_spy.assert_not_called()
+
+
+def _load_kweb_cli_for_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    import importlib.util
+    import types
+
+    cli_path = (
+        REPO_ROOT
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "skills"
+        / "kweb-dashboard"
+        / "scripts"
+        / "kweb_dashboard_cli.py"
+    )
+    ws_mod = types.ModuleType("openclaw_workspace")
+    ws_mod.workspace_root = create_autospec(lambda _f: tmp_path, return_value=tmp_path)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openclaw_workspace", ws_mod)
+
+    spec = importlib.util.spec_from_file_location("kweb_dashboard_cli_overlay_test", cli_path)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = cli
+    try:
+        spec.loader.exec_module(cli)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return cli
+
+
+def test_kweb_etf_failure_renders_stale_banner_on_page_without_outbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import types
+
+    cli = _load_kweb_cli_for_test(tmp_path, monkeypatch)
+    out_html = tmp_path / "research-outputs" / "kweb-dashboard" / "index.html"
+    outbox_file = tmp_path / "staging" / "outbox.json"
+    monkeypatch.setenv("DALTON_OUTBOX_FILE", str(outbox_file))
+
+    def _fake_analyse(section: dict[str, object]) -> dict[str, object]:
+        return {
+            "id": str(section["id"]),
+            "label": str(section["label"]),
+            "heading": str(section["heading"]),
+            "results": [],
+            "warnings": [],
+            "horizon": 63,
+            "horizon_label": "3个月",
+            "rsi_period": 30,
+            "window_start": "2023-01-01",
+            "snapshot": None,
+            "basket": None,
+            "excluded_groups": [],
+        }
+
+    monkeypatch.setattr(cli, "analyse", create_autospec(cli.analyse, side_effect=_fake_analyse))
+    monkeypatch.setattr(
+        cli,
+        "pair_section",
+        create_autospec(cli.pair_section, return_value="<p>ok</p>"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        create_autospec(
+            cli.load_config,
+            return_value={
+                "site_title": "Richard 相对看板",
+                "site_subtitle": "",
+                "sections": [
+                    {
+                        "id": "kweb",
+                        "label": "KWEB",
+                        "heading": "KWEB",
+                        "horizon_days": 63,
+                        "rsi_period": 30,
+                    }
+                ],
+                "etf_board": {
+                    "enabled": True,
+                    "id": "etf",
+                    "label": "ETF",
+                    "heading": "ETF 看板",
+                },
+            },
+        ),
+    )
+
+    fake_etf_board = types.ModuleType("kweb_etf_board")
+    fake_etf_board.load_etf_config = create_autospec(  # type: ignore[attr-defined]
+        lambda: {"etf": True},
+        return_value={"etf": True},
+    )
+    fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
+        lambda _cfg, _ws, _rsi: {},
+        return_value={"board_last": "2026-11-16", "errors": []},
+    )
+    fake_etf_board.render_board = create_autospec(  # type: ignore[attr-defined]
+        lambda _cfg, _data: "",
+        return_value='<div class="stats"><div><b>40</b></div></div>',
+    )
+    fake_etf_board.summary = create_autospec(  # type: ignore[attr-defined]
+        lambda data: data,
+        side_effect=lambda data: {
+            "ok": not data["errors"],
+            "rows": 40,
+            "board_last": data["board_last"],
+            "errors": data["errors"],
+        },
+    )
+    fake_etf_board.error_body = create_autospec(  # type: ignore[attr-defined]
+        lambda msg: msg,
+        side_effect=lambda msg: (
+            f'<article class="panel"><h3>ETF 看板这次没生成</h3><p>{msg}</p></article>'
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "kweb_etf_board", fake_etf_board)
+
+    # 1) First run succeeds: records last successful ETF date, no stale banner in page.
+    rc_ok = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
+    assert rc_ok == 0
+    ok_payload = json.loads(capsys.readouterr().out)
+    assert ok_payload["ok"] is True
+    assert not outbox_file.exists()
+    html_ok = out_html.read_text(encoding="utf-8")
+    assert ".stale-banner{" in html_ok
+    assert '<p class="stale-banner">' not in html_ok
+    last_ok_file = tmp_path / "state" / "kweb-dashboard" / "etf_last_success.json"
+    assert json.loads(last_ok_file.read_text(encoding="utf-8"))["as_of"] == "2026-11-16"
+
+    # 2) Partial ETF fetch failure: page builds & deploy succeeds, ETF section top shows stale banner.
+    fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
+        lambda _cfg, _ws, _rsi: {},
+        return_value={
+            "board_last": "2026-11-17",
+            "errors": ["SOXX 没取到行情", "周期/防御缺失"],
+        },
+    )
+    rc_partial = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
+    assert rc_partial == 0
+    partial_payload = json.loads(capsys.readouterr().out)
+    assert partial_payload["ok"] is True
+    assert partial_payload["upload_skipped"] is True
+    assert not outbox_file.exists()
+    html_partial = out_html.read_text(encoding="utf-8")
+    etf_block = html_partial.split('<main id="tab-etf"', 1)[1]
+    assert '<p class="stale-banner">' in etf_block
+    assert "ETF 数据未更新（上次成功：2026-11-16，原因：SOXX 没取到行情；周期/防御缺失）" in etf_block
+    assert etf_block.index("stale-banner") < etf_block.index('class="stats"')
+
+    # 3) Full ETF failure (exception) without prior state: falls back to "未知", still succeeds.
+    last_ok_file.unlink()
+    fake_etf_board.analyse_board = create_autospec(  # type: ignore[attr-defined]
+        lambda _cfg, _ws, _rsi: {},
+        side_effect=RuntimeError("yfinance timeout"),
+    )
+    rc_exc = cli.main(["deploy", "--no-upload", "--output", str(out_html), "--json"])
+    assert rc_exc == 0
+    exc_payload = json.loads(capsys.readouterr().out)
+    assert exc_payload["ok"] is True
+    assert not outbox_file.exists()
+    html_exc = out_html.read_text(encoding="utf-8")
+    etf_exc_block = html_exc.split('<main id="tab-etf"', 1)[1]
+    assert "ETF 数据未更新（上次成功：未知，原因：RuntimeError: yfinance timeout）" in etf_exc_block
+    assert etf_exc_block.index("stale-banner") < etf_exc_block.index("ETF 看板这次没生成")
+
+
+def test_kweb_cos_upload_and_default_deploy_disabled_unless_opted_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_kweb_cli_for_test(tmp_path, monkeypatch)
+    out_html = tmp_path / "research-outputs" / "kweb-dashboard" / "index.html"
+    monkeypatch.delenv("DALTON_ALLOW_COS_UPLOAD", raising=False)
+
+    real_build = cli.build
+    build_spy = create_autospec(
+        real_build,
+        side_effect=AssertionError("build must not run when default deploy is disabled"),
+    )
+    monkeypatch.setattr(cli, "build", build_spy)
+
+    # 1) upload subcommand rejected immediately
+    rc_upload = cli.main(["upload", "--file", str(out_html), "--json"])
+    assert rc_upload == 1
+    err_upload = json.loads(capsys.readouterr().out)
+    assert err_upload["ok"] is False
+    assert "已停用" in err_upload["error"]
+
+    # 2) deploy without --no-upload rejected immediately before build
+    rc_deploy = cli.main(["deploy", "--output", str(out_html), "--json"])
+    assert rc_deploy == 1
+    err_deploy = json.loads(capsys.readouterr().out)
+    assert err_deploy["ok"] is False
+    assert "已停用" in err_deploy["error"]
+    build_spy.assert_not_called()
+
+    # 3) Explicit DALTON_ALLOW_COS_UPLOAD=1 unlocks legacy upload path (tested with mock upload)
+    monkeypatch.setenv("DALTON_ALLOW_COS_UPLOAD", "1")
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        create_autospec(cli.load_config, return_value={"site_title": "Richard 相对看板"}),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build",
+        create_autospec(
+            real_build,
+            return_value={
+                "ok": True,
+                "output": str(out_html),
+                "bytes": 100,
+                "warnings": [],
+                "overlong_notes": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "upload_html",
+        create_autospec(cli.upload_html, return_value={"ok": True, "key": "kweb.html"}),
+    )
+    rc_opt_in = cli.main(["deploy", "--output", str(out_html), "--json"])
+    assert rc_opt_in == 0
+    assert json.loads(capsys.readouterr().out)["uploaded"] is True
+
+
+@pytest.mark.asyncio
+async def test_scheduler_host_run_does_not_inject_etf_outbox_when_notify_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.data_jobs.scheduler as scheduler_mod
+    from src.dalton.data_jobs.host_runner import HostRunOutcome
+    from tests.unit.dalton.test_data_jobs import _make_autospec_db
+
+    host_client = create_autospec(DataTaskHostBridgeClient, instance=True)
+    host_client.run_host_task.return_value = HostRunOutcome(
+        ok=True,
+        status_code=200,
+        exit_code=0,
+        exit_confirmed=True,
+        log_tail=json.dumps(
+            {"ok": True, "etf_error": "ETF 看板有取数问题：SOXX 缺失"},
+            ensure_ascii=False,
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_mod,
+        "start_claimed_host_run",
+        create_autospec(scheduler_mod.start_claimed_host_run, return_value=True),
+    )
+    monkeypatch.setattr(
+        scheduler_mod,
+        "check_scheduler_lock",
+        create_autospec(scheduler_mod.check_scheduler_lock, return_value=None),
+    )
+    monkeypatch.setattr(
+        scheduler_mod,
+        "freeze_task_run_artifacts",
+        create_autospec(scheduler_mod.freeze_task_run_artifacts, return_value=None),
+    )
+
+    import src.dalton.monitors.service as monitor_service_mod
+
+    monkeypatch.setattr(
+        monitor_service_mod,
+        "maybe_publish_data_job_monitor",
+        create_autospec(monitor_service_mod.maybe_publish_data_job_monitor, return_value=None),
+    )
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn, state = _make_autospec_db(
+        [
+            {"rowcount": 1},  # finalize UPDATE dalton_data_task_runs
+            {"rowcount": 1, "fetchone": {"consecutive_failures": 0}},  # UPDATE defs
+            {"rowcount": 1},  # UPDATE slot idle
+        ]
+    )
+    now = datetime(2026, 11, 17, 23, 20, tzinfo=timezone.utc)
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    claimed = ClaimedTaskRun(
+        run_id=str(uuid4()),
+        job_key=JOB_KEY,
+        generation=1,
+        runner="host",
+        command_argv=list(KWEB_ARGV),
+        workdir=DATA_COPY_CWD,
+        timeout_seconds=900,
+        no_output_timeout_seconds=600,
+        required_secrets=[],
+        cos_mode="skip",
+        notify_enabled=False,
+        scheduled_slot_utc=now,
+        deadline_utc=now + timedelta(minutes=15),
+        timezone="America/New_York",
+        host_mode="run",
+    )
+
+    committed, cf = await execute_claimed_host_run(
+        conn,
+        lock_conn=lock_conn,
+        host_client=host_client,
+        claimed=claimed,
+        path_map=path_map,
+    )
+    assert committed is True
+    assert cf == 0
+    finalize_params = state["executed"][0][1]
+    assert finalize_params["terminal_status"] == "succeeded"
+    assert finalize_params["outbox_payload"] is None
+
+
+def test_kweb_overlay_skill_md_recommends_deploy_no_upload() -> None:
+    skill_md = (
+        REPO_ROOT
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "skills"
+        / "kweb-dashboard"
+        / "SKILL.md"
+    )
+    assert skill_md.is_file()
+    text = skill_md.read_text(encoding="utf-8")
+    assert "deploy --no-upload" in text
+    assert "已停用" in text
+    assert "relative-strength" in text
+    assert "ETF 数据未更新" in text

@@ -309,4 +309,63 @@ describe('Monitors page (Checklist 8)', () => {
       `${window.location.origin}/m/public-market-pulse`,
     );
   });
+
+  it('uses each version entry_path when switching to legacy v1 on a migrated monitor', async () => {
+    const migratedDetail = makeDetail({
+      monitor: makeSummary({
+        slug: 'hk-momentum',
+        title: 'HK Momentum',
+        entry_path: 'hk-momentum/index.html',
+        published_seq: 5,
+      }),
+      versions: [
+        {
+          seq: 5,
+          entry_path: 'hk-momentum/index.html',
+          origin: 'owner',
+          title: 'HK Momentum',
+          label: 'Migrated',
+          byte_len: 1200,
+          published_at: '2026-11-17T10:00:00Z',
+        },
+        {
+          seq: 1,
+          entry_path: 'index.html',
+          origin: 'owner',
+          title: 'HK Momentum',
+          label: 'Legacy',
+          byte_len: 800,
+          published_at: '2026-11-16T10:00:00Z',
+        },
+      ],
+    });
+    const detailFetcher = vi.fn<typeof getMonitorDetail>(async () => migratedDetail);
+    mockGetMonitorDetail.mockImplementation(detailFetcher);
+
+    renderWithProviders(
+      <Routes>
+        <Route path="/monitors/:slug" element={<Monitors />} />
+      </Routes>,
+      { route: '/monitors/hk-momentum' },
+    );
+
+    const frame = await screen.findByTestId('bridged-frame');
+    expect(frame.getAttribute('data-src')).toBe(
+      '/api/v1/dalton/monitors/g/m1.secret-grant-token/v/5/hk-momentum/index.html',
+    );
+    expect(detailFetcher).toHaveBeenCalledWith('hk-momentum');
+
+    const versionSelect = screen.getByRole('combobox', { name: /Version|切换版本/i });
+    await userEvent.selectOptions(versionSelect, '1');
+
+    expect(screen.getByTestId('bridged-frame').getAttribute('data-src')).toBe(
+      '/api/v1/dalton/monitors/g/m1.secret-grant-token/v/1/index.html',
+    );
+
+    await userEvent.selectOptions(versionSelect, '5');
+
+    expect(screen.getByTestId('bridged-frame').getAttribute('data-src')).toBe(
+      '/api/v1/dalton/monitors/g/m1.secret-grant-token/v/5/hk-momentum/index.html',
+    );
+  });
 });
