@@ -6,3 +6,7 @@ The preference named below is the user's output_format ranking. This preference 
 - Dalton deliverables are Markdown. Whenever a skill or workflow names a Markdown file (`drafts/*.md`, `research/**/*.md`), write that file as specified and do not make an HTML copy of drafts or notes; number audit (`check_draft`), completion contracts (`dalton_check_done`) and `publish_report` all read the Markdown.
 - The HTML version of a Dalton report is made only at formal publication: once `publish_report` has accepted the final draft (published, or waiting for PM approval), render that same checked Markdown into one HTML copy with the same content and figures, saved beside the draft with the extension swapped (`drafts/foo.md` → `drafts/foo.html`). Do not pass it to `publish_report`, and do not edit the Markdown afterwards to match the HTML.
 - Ad-hoc Q&A, where no skill or workflow names an output file, may still use a visual answer (`ShowWidget` or a styled HTML report) when the user profile ranks one; this narrowing applies only to skill and workflow deliverables.
+{% if dalton_monitors_enabled | default(false) %}
+{# DALTON-HOOK(monitors): proactively suggest mounting recurring HTML dashboards/trackers to Dalton Monitors, defaulting to own and asking before widening visibility. #}
+- 当你为用户做好供反复查看的 HTML 网页或交互看板（如组合 beta（贝塔）监控、行情/持仓追踪等；技能或工作流规定的交付物与正式研报除外）时，主动提议用 `dalton_monitor` 将其发布为监控面板（`/monitors/<slug>`，slug 为短标识），方便集中查看和持续更新。默认仅自己可见（`visibility="own"`）；扩大可见范围前必须先询问用户并在本次对话中获得明确同意，切勿擅自设为指定成员（`members`）或全公司（`company`）可见。
+{% endif %}

@@ -221,6 +221,8 @@ class PTCAgent:
         conversation_search_enabled: bool = False,
         # DALTON-HOOK(research-writing): gate permanent Chinese research judgment and writing rules
         research_writing_enabled: bool = False,
+        # DALTON-HOOK(monitors): gate monitor prompt hint on whether dalton_monitor is mounted
+        dalton_monitors_enabled: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -267,6 +269,8 @@ class PTCAgent:
             conversation_search_enabled=conversation_search_enabled,
             # DALTON-HOOK(research-writing): gate permanent Chinese research judgment and writing rules
             research_writing_enabled=research_writing_enabled,
+            # DALTON-HOOK(monitors): gate monitor prompt hint on whether dalton_monitor is mounted
+            dalton_monitors_enabled=dalton_monitors_enabled,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -920,6 +924,10 @@ class PTCAgent:
         conversation_search_enabled = any(
             getattr(t, "name", None) == "conversation_search" for t in dalton_tools
         )
+        # DALTON-HOOK(monitors): render monitor prompt hint only when dalton_monitor is mounted
+        dalton_monitors_enabled = any(
+            getattr(t, "name", None) == "dalton_monitor" for t in dalton_tools
+        )
 
         render_prompt = partial(
             self._build_system_prompt,
@@ -940,6 +948,7 @@ class PTCAgent:
             claude_code=claude_code,
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
             research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
+            dalton_monitors_enabled=dalton_monitors_enabled,  # DALTON-HOOK(monitors)
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
