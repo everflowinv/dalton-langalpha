@@ -2710,6 +2710,107 @@ def experts_cmd(args):
             "experts": rows, "message": "\n".join(lines)}
 
 
+def company_history_cmd(args):
+    """只读读取单家公司各分片（fundamentals / metrics / quotes / experts）的全部历史记录。
+
+    某类分片文件不存在时，表示该类记录为空，返回空列表；分片里有坏行时返回 ok: False。
+    期间筛选故意不提供：港股 H1/FY 与季度混排时按期间序号比较会筛错。
+    """
+    ticker = (args.ticker or "").strip()
+    if not ticker:
+        return {"ok": False, "error": "ticker 不能为空", "hint": "传入 --ticker，例如 NET 或 1357.HK。"}
+    if ticker in (".", "..") or db.ticker_slug(ticker) != ticker:
+        return {"ok": False, "error": f"ticker 含非法字符: {ticker}",
+                "hint": "只用字母、数字、点、短横线、下划线，例如 NET 或 1357.HK。"}
+
+    try:
+        shards = {}
+        missing_shards = []
+        for kind, filename in db.SHARDS.items():
+            path = db.shard_path(ticker, kind)
+            if not path.exists():
+                missing_shards.append(filename)
+            rows = db.read_company(ticker, kind)
+            if not db.is_migrated() and kind in ("metrics", "fundamentals"):
+                legacy = store_path() if kind == "metrics" else fundamentals_path()
+                legacy_rows = db.read_jsonl(legacy)
+                for i, r in enumerate(legacy_rows, 1):
+                    if not isinstance(r, dict):
+                        raise ValueError(f"{legacy} 第 {i} 条记录不是 JSON 对象")
+                rows = rows + [r for r in legacy_rows if r.get("ticker") == ticker]
+            for i, r in enumerate(rows, 1):
+                if not isinstance(r, dict):
+                    raise ValueError(f"{path} 第 {i} 条记录不是 JSON 对象")
+            shards[kind] = rows
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc),
+                "hint": f"检查 {db.company_dir(ticker)} 分片文件里的坏行并修正后重跑。"}
+
+    def _s(v):
+        return "" if v is None else str(v)
+
+    shards["fundamentals"].sort(key=lambda r: (_s(r.get("period")), _s(r.get("recorded_at"))))
+    shards["metrics"].sort(key=lambda r: (_s(r.get("period")), _s(r.get("metric")), _s(r.get("recorded_at"))))
+    shards["quotes"].sort(key=lambda r: (
+        _s(r.get("period")),
+        _s(r.get("venue")),
+        r.get("paragraph_index") if isinstance(r.get("paragraph_index"), int) else 0,
+    ))
+    shards["experts"].sort(key=lambda r: (_s(r.get("period")), _s(r.get("expert_role"))))
+
+    uni = {c["ticker"]: c for c in load_universe()["universe"]}
+    info = uni.get(ticker, {})
+    company_name = info.get("name") or next(
+        (r.get("company") for kind in ("fundamentals", "metrics", "quotes", "experts")
+         for r in shards[kind] if r.get("company")),
+        ticker,
+    )
+    counts = {k: len(shards[k]) for k in ("fundamentals", "metrics", "quotes", "experts")}
+
+    lines = [f"{company_name}（{ticker}）分片历史："
+             + "，".join(f"{k} {counts[k]} 条" for k in ("fundamentals", "metrics", "quotes", "experts"))]
+    if ticker not in uni:
+        lines.append(f"{ticker} 不在覆盖池里，先核对代码大小写与写法。")
+    if missing_shards:
+        lines.append("未建分片（按空处理）：" + "、".join(missing_shards))
+    for r in shards["fundamentals"]:
+        if r.get("kind") == "attribution":
+            lines.append(f"  [fundamentals/attribution] {r.get('period') or '未标期'} {r.get('attribution_type') or ''}")
+        else:
+            lines.append(f"  [fundamentals] {r.get('period') or '未标期'} "
+                         f"总收入 {r.get('total_revenue_usd_mn')}mn USD "
+                         f"同比 {r.get('revenue_yoy_pct')}% ({r.get('source_date') or ''})")
+    for r in shards["metrics"]:
+        lines.append(f"  [metrics] {r.get('period') or '未标期'} {r.get('metric')} "
+                     f"{r.get('value')}{r.get('unit') or ''} ({r.get('source_date') or ''})")
+    for r in shards["quotes"]:
+        lines.append(f"  [quotes] {r.get('period') or '未标期'} {r.get('venue')} {r.get('speaker') or ''}")
+    for r in shards["experts"]:
+        lines.append(f"  [experts] {r.get('period') or '未标期'} {r.get('expert_role')} {r.get('alignment')}")
+
+    if getattr(args, "full", False):
+        records = {k: shards[k] for k in ("fundamentals", "metrics", "quotes", "experts")}
+    else:
+        # 默认只回索引：补库只需判断某期是否已入库，整段原话会撑满上下文。
+        index_fields = ("kind", "period", "source_date", "metric", "venue", "expert_role", "recorded_at")
+        records = {
+            k: [{f: r.get(f) for f in index_fields if r.get(f) is not None} for r in shards[k]]
+            for k in ("fundamentals", "metrics", "quotes", "experts")
+        }
+    return {
+        "ok": True,
+        "version": VERSION,
+        "ticker": ticker,
+        "company": company_name,
+        "full": bool(getattr(args, "full", False)),
+        **records,
+        "counts": counts,
+        "in_universe": ticker in uni,
+        "missing_shards": missing_shards,
+        "message": "\n".join(lines),
+    }
+
+
 def contradictions_cmd(args):
     """管理层说法与专家说法对不上的地方。这是专家层最值钱的产出。
 
@@ -4270,6 +4371,10 @@ def main(argv=None):
     p_exps.add_argument("--until")
     p_exps.add_argument("--alignment", action="append", choices=sorted(db.EXPERT_ALIGNMENT))
 
+    p_hist = sub.add_parser("company-history", help="读取单家公司各分片的历史记录，缺失分片返回空列表")
+    p_hist.add_argument("--ticker", required=True)
+    p_hist.add_argument("--full", action="store_true", help="返回完整记录；默认只返回期间、来源日期等索引字段")
+
     p_con = sub.add_parser("contradictions", help="管理层与专家说法对不上的地方，并排贴出来")
     p_con.add_argument("--tickers")
     p_con.add_argument("--track")
@@ -4379,6 +4484,8 @@ def main(argv=None):
             result = add_expert(args)
         elif args.command == "experts":
             result = experts_cmd(args)
+        elif args.command == "company-history":
+            result = company_history_cmd(args)
         elif args.command == "contradictions":
             result = contradictions_cmd(args)
         elif args.command == "reconcile":

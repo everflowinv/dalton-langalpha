@@ -17,7 +17,7 @@ description: "AI 应用周度监控：补库与变化周报，四表筛选、原
 
 ## 模式
 
-- **补库**（每周二 16:00 Asia/Hong_Kong，模型 `gpt-6.1-sol-oauth`）：只入库，不写周报。绑定的报告配置 `ai-app-weekly` 只用于失败告警。成功时不调用 `automation_report`，最终回复只写 `NO_REPLY`。`self-test` 失败或流程中断时，调用 `automation_report(failure_text=...)`，`report_run_id` 为 `ai-app-db-refresh-<tuesday>`（`<tuesday>` 为 Asia/Hong_Kong 当周周二日期，格式 `YYYY-MM-DD`）。
+- **补库**（每周二 16:00 Asia/Hong_Kong，模型 `gpt-6.1-sol-oauth`）：只入库，不写周报。绑定的报告配置 `ai-app-weekly` 只用于失败告警。成功时不调用 `automation_report`，最终回复只写 `NO_REPLY`。只有 `self-test` 失败、CLI 本身报错无法继续、工作区不可写、同一原因连续影响 3 家及以上公司这类全局问题才整轮停止并调用 `automation_report(failure_text=...)`，`report_run_id` 为 `ai-app-db-refresh-<tuesday>`（`<tuesday>` 为 Asia/Hong_Kong 当周周二日期，格式 `YYYY-MM-DD`）。
 - **周报**（每周五 15:00 Asia/Hong_Kong，模型 `gpt-6-astra-oauth`）：按下面的周报步骤生成变化周报。`report_run_id` 为 `ai-app-weekly-<friday>`（`<friday>` 为 Asia/Hong_Kong 当周周五日期，格式 `YYYY-MM-DD`）。
 
 时区 Asia/Hong_Kong。周报窗口是上周五 15:00 至本周五 15:00。周四美股盘后（等于周五 04:00）在窗口内。周五美股盘前与盘后滚入下一周。补库窗口是上周五 15:00 至本周二运行时刻。周二 16:00 已经入库的公司，周五只补周二 16:00 之后新出业绩的公司。
@@ -39,6 +39,8 @@ description: "AI 应用周度监控：补库与变化周报，四表筛选、原
 - 快照：`state/ai_app_db/snapshots/2026-11-13.json`
 
 已有记录只追加。发现口径归类错误、重复记录或来源不是一手件时，先把原文件备份到 `state/ai-app-weekly/temp/ai-app-backfill/`，再在新记录的 note 里写明修正理由。不要改技能目录里的文件。不要调用 `retier --apply`。
+
+某家公司的分片文件（`metrics.jsonl`、`fundamentals.jsonl`、`quotes.jsonl`、`experts.jsonl`）不存在，表示该公司这一类记录为空，按空处理继续。读取历史记录优先用 CLI 子命令（如 `company-history --ticker <TICKER>`、`quotes`、`experts`、`export`），不要直接用 shell 读分片文件。
 
 ## 研究口径
 
@@ -75,11 +77,11 @@ description: "AI 应用周度监控：补库与变化周报，四表筛选、原
 
 ### 引擎 B 筛选层
 
-输入是 `state/ai_app_db/companies/<TICKER>/metrics.jsonl`。脚本不联网取基本面，不推算未披露数字。先 `add-metric` 入库，再 `screen`。事实库跨周累积，第 N 周可以算出第 N-1 周还算不出的环比和增速变化。
+输入是 `state/ai_app_db/companies/<TICKER>/metrics.jsonl`（文件不存在时按空处理）。脚本不联网取基本面，不推算未披露数字。先 `add-metric` 入库，再 `screen`。事实库跨周累积，第 N 周可以算出第 N-1 周还算不出的环比和增速变化。
 
 ### 引擎 C 内嵌层
 
-输入是 `state/ai_app_db/companies/<TICKER>/fundamentals.jsonl`。
+输入是 `state/ai_app_db/companies/<TICKER>/fundamentals.jsonl`（文件不存在时按空处理）。
 
 - `kind: fundamental`（公司基本面）：公司级总收入、公司披露的总收入同比、cRPO（当前剩余履约义务）/ RPO（剩余履约义务）同比、净留存率（NRR）、大客户数。
 - `kind: attribution`（归因原话）：管理层把增长或下滑明确归到 AI / 智能体上的原话，带证据等级和一手链接。
@@ -241,21 +243,29 @@ research(
 
 ## 补库步骤
 
-0. 先读本文件的研究口径和命令，再跑 `self-test`。`self-test` 失败或流程中途中断时立即停止，调用 `automation_report` 提交 `failure_text`（不超过 2000 字），最终回复只写 `NO_REPLY`。成功时不调用 `automation_report`。
+0. 先读本文件的研究口径和命令，再跑 `self-test`。只有 `self-test` 失败、CLI 本身报错无法继续、工作区不可写、同一原因连续影响 3 家及以上公司（例如 `web_search` 整体不可用、额度用完）这类全局问题才整轮立即停止，调用 `automation_report` 提交 `failure_text`（不超过 2000 字），最终回复只写 `NO_REPLY`。单家公司取数或读取失败时，用 `mark-gap` 登记该公司缺口并继续处理其余公司，并在补库日志里列出这些公司。成功时不调用 `automation_report`。
 
 ```bash
 python3 .agents/skills/dalton-ai-app-weekly-monitor/scripts/ai_application_weekly_monitor_cli.py \
   --json self-test --workspace-dir <workspace>
 ```
 
-1. 窗口：上周五 15:00 Asia/Hong_Kong 至现在。读覆盖池，对照每家最新 `fundamentals.jsonl` 的 `period` 与 `source_date`，列出窗口内已发布业绩、库里还没有该期记录的公司。发布证据用 `web_search`，港股看披露易，A 股看巨潮，美股看公司 IR（投资者关系网站）或 SEC 8-K。找不到发布证据的公司不入库、不 `mark-gap`，日志写「未出业绩」。不要使用 firecrawl。
+第 1 步核对单家公司历史记录：
+
+```bash
+python3 .agents/skills/dalton-ai-app-weekly-monitor/scripts/ai_application_weekly_monitor_cli.py \
+  --json company-history --workspace-dir <workspace> \
+  --ticker NET
+```
+
+1. 窗口：上周五 15:00 Asia/Hong_Kong 至现在。读覆盖池，用 `web_search` 查发布证据（港股看披露易，A 股看巨潮，美股看公司 IR（投资者关系网站）或 SEC 8-K），筛出窗口内已发布业绩的候选公司；再对每家候选公司用 `company-history --ticker <TICKER>` 核对库里是否已有该期记录（文件不存在时按空处理），列出库里还没有该期记录的公司。检索成功但找不到发布证据的公司不入库、不 `mark-gap`，补库日志写「未出业绩」；`web_search` 调用本身报错（如额度用完、服务不可用）时，这家公司记为单家公司取数失败（补库日志里与「未出业绩」分开列），按第 0 步规则处理。不要使用 firecrawl。
 2. 期间标签：美股按财季截止日所在的日历季度，7 月至 9 月截止写 `2026Q3`，4 月至 6 月截止写 `2026Q2`。港股中期写 `2026H1`，全年写 `2026FY`。A 股半年报先看该公司 2025 年记录用的是 `2025Q2` 那种 Q2 还是 H1，保持一致。
-3. 每家至少一条 `add-fundamental`：非美元列报同时给 `--currency`、`--total-revenue-orig-mn`、`--total-revenue-usd-mn`。同比抄公告。有则加 cRPO（当前剩余履约义务）、RPO（剩余履约义务）、净留存率（NRR）、大客户数。`--quote` 抄含该数字的原句。并表打 `--includes-ma` 与 `--ma-note`。公告里单列的 AI 收入、ARR（年化经常性收入）、用户或调用量，每个数字一条 `add-metric`，财务与比率指标必填 `--ai-basis`。管理层把增长或下滑归到 AI 上的原话用 `add-attribution`。没有原话不推定。
+3. 每家至少一条 `add-fundamental`：非美元列报同时给 `--currency`、`--total-revenue-orig-mn`、`--total-revenue-usd-mn`。同比抄公告。有则加 cRPO（当前剩余履约义务）、RPO（剩余履约义务）、净留存率（NRR）、大客户数。`--quote` 抄含该数字的原句。并表打 `--includes-ma` 与 `--ma-note`。公告里单列的 AI 收入、ARR（年化经常性收入）、用户或调用量，每个数字一条 `add-metric`，财务与比率指标必填 `--ai-basis`。管理层把增长或下滑归到 AI 上的原话用 `add-attribution`。没有原话不推定。单家公司取数或读取失败时，用 `mark-gap` 登记该公司缺口（`--reason` 选 `source_unavailable`，具体原因写进 `--note`，并填 `--checked-source`），继续处理其余公司。
 4. 每处理完 10 家，把股票代码（ticker）和记录数追加写入 `state/ai-app-weekly/temp/ai-app-db-refresh/log-2026-11-10.md`。
-5. `reconcile --expected` 使用本次应更新的股票代码（ticker）。未交代的要么补数据，要么 `mark-gap`，reason 用真实原因，并写 `--checked-source`。然后 `coverage-ledger --write`。结果只写日志：窗口、应更新家数、入库家数与记录数、mark-gap 名单、未出业绩家数。
+5. `reconcile --expected` 使用本次应更新的股票代码（ticker）。未交代的要么补数据，要么 `mark-gap`，reason 用真实原因，并写 `--checked-source`。然后 `coverage-ledger --write`。结果只写日志：窗口、应更新家数、入库家数与记录数、`mark-gap` 公司名单及原因（含单家公司取数或读取失败与确认缺失）、未出业绩家数。
 6. 不派子任务，不写周报，不改技能文件，不改已有记录。成功则最终回复只写 `NO_REPLY`。
 
-自检失败或流程中断时，用报告配置 `ai-app-weekly` 提交失败告警：
+只有发生第 0 步所列全局问题才整轮停止，用报告配置 `ai-app-weekly` 提交失败告警；单家公司取数或读取失败用 `mark-gap` 登记并继续处理其余公司：
 
 ```python
 automation_report(
@@ -266,7 +276,7 @@ automation_report(
 )
 ```
 
-流程中断时把 `failure_text` 换成具体中断原因，例如 `AI 应用补库失败：流程中断`。返回确认发出后，最终回复只写 `NO_REPLY`。
+发生全局问题整轮停止时，把 `failure_text` 换成具体原因，例如 `AI 应用补库失败：CLI 本身报错无法继续`。返回确认发出后，最终回复只写 `NO_REPLY`。
 
 ## 周报步骤
 

@@ -619,3 +619,114 @@ def test_archive_and_snapshot_follow_doc_status(tmp_path: Path, monkeypatch: pyt
     assert quiet["written"] is True and quiet["date"] == quiet_day
     assert quiet_snap.is_file()
     assert prior_snapshot.read_bytes() == prior_bytes
+
+
+def test_company_history_missing_normal_and_bad_line(tmp_path: Path) -> None:
+    module = _load()
+    workspace = tmp_path / "ws"
+    _seed(workspace)
+
+    # 1. Missing shards: API has only fundamentals.jsonl & quotes.jsonl; metrics.jsonl & experts.jsonl are absent.
+    api_dir = workspace / "state/ai_app_db/companies/API"
+    api_dir.mkdir(parents=True)
+    (api_dir / "fundamentals.jsonl").write_text(
+        json.dumps({"kind": "fundamental", "ticker": "API", "period": "2026Q2", "total_revenue_usd_mn": 35.0},
+                   ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (api_dir / "quotes.jsonl").write_text(
+        json.dumps({"kind": "quote", "ticker": "API", "period": "2026Q2", "venue": "call_qa",
+                    "quote": "Conversational AI usage continued to grow."}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    partial = _ok(*_run(module, _ws(workspace, "company-history", "--ticker", "API")), "company-history-partial")
+    assert partial["ticker"] == "API"
+    assert len(partial["fundamentals"]) == 1
+    assert len(partial["quotes"]) == 1
+    assert partial["metrics"] == []
+    assert partial["experts"] == []
+    assert partial["counts"] == {"fundamentals": 1, "metrics": 0, "quotes": 1, "experts": 0}
+    assert set(partial["missing_shards"]) == {"metrics.jsonl", "experts.jsonl"}
+
+    # Company with no shard directory at all still returns empty lists for every shard.
+    empty = _ok(*_run(module, _ws(workspace, "company-history", "--ticker", "NO_SHARDS")), "company-history-empty")
+    assert empty["fundamentals"] == []
+    assert empty["metrics"] == []
+    assert empty["quotes"] == []
+    assert empty["experts"] == []
+    assert set(empty["missing_shards"]) == {"fundamentals.jsonl", "metrics.jsonl", "quotes.jsonl", "experts.jsonl"}
+
+    # 2. Normal shards: all four shards present, sorted by period.
+    net_dir = workspace / "state/ai_app_db/companies/NET"
+    (net_dir / "metrics.jsonl").write_text(
+        "\n".join([
+            json.dumps({"ticker": "NET", "metric": "ai_revenue", "period": "2026Q2", "value": 80},
+                       ensure_ascii=False),
+            json.dumps({"ticker": "NET", "metric": "ai_revenue", "period": "2026Q1", "value": 60},
+                       ensure_ascii=False),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (net_dir / "quotes.jsonl").write_text(
+        json.dumps({"kind": "quote", "ticker": "NET", "period": "2026Q2", "venue": "call_qa",
+                    "quote": "Workers AI requests expanded in Q2."}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (net_dir / "experts.jsonl").write_text(
+        json.dumps({"kind": "expert", "ticker": "NET", "period": "2026Q2",
+                    "expert_role": "channel_partner", "alignment": "confirms",
+                    "claim": "AI gateway deals closed faster in Q2."}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    full = _ok(*_run(module, _ws(workspace, "company-history", "--ticker", "NET")), "company-history-full")
+    assert full["missing_shards"] == []
+    assert [r["period"] for r in full["metrics"]] == ["2026Q1", "2026Q2"]
+    assert full["counts"] == {"fundamentals": 1, "metrics": 2, "quotes": 1, "experts": 1}
+    assert "quote" not in full["quotes"][0]  # 默认只回索引字段
+    detailed = _ok(*_run(module, _ws(workspace, "company-history", "--ticker", "NET", "--full")), "company-history-detail")
+    assert detailed["quotes"][0]["quote"] == "Workers AI requests expanded in Q2."
+
+    for bad_ticker in ("..", "A/B"):
+        code, rejected = _run(module, _ws(workspace, "company-history", "--ticker", bad_ticker))
+        assert code == 1 and rejected["ok"] is False and "非法字符" in rejected["error"]
+
+    # Mixed field types (int period, int metric) sort without crashing.
+    (net_dir / "metrics.jsonl").write_text(
+        json.dumps({"ticker": "NET", "metric": 7, "period": 2026, "value": 1}) + "\n"
+        + json.dumps({"ticker": "NET", "metric": "ai_revenue", "period": "2026Q1", "value": 60}) + "\n",
+        encoding="utf-8",
+    )
+    mixed = _ok(*_run(module, _ws(workspace, "company-history", "--ticker", "NET")), "company-history-mixed")
+    assert mixed["counts"]["metrics"] == 2
+
+    # A JSON line that is not an object is a bad line.
+    (net_dir / "metrics.jsonl").write_text("null\n", encoding="utf-8")
+    code, not_obj = _run(module, _ws(workspace, "company-history", "--ticker", "NET"))
+    assert code == 1 and not_obj["ok"] is False and "不是 JSON 对象" in not_obj["error"]
+
+    # 3. Malformed line in a shard returns ok=False with error and hint.
+    (net_dir / "metrics.jsonl").write_text("{not-valid-json\n", encoding="utf-8")
+    code, bad = _run(module, _ws(workspace, "company-history", "--ticker", "NET"))
+    assert code == 1
+    assert bad["ok"] is False
+    assert "不是合法 JSON" in bad["error"]
+    assert bad["hint"]
+
+
+def test_company_history_reads_legacy_files_before_migration(tmp_path: Path) -> None:
+    module = _load()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "state/ai_app_db").mkdir(parents=True)
+    (workspace / "state/ai_app_metrics.jsonl").write_text(
+        json.dumps({"ticker": "NET", "metric": "ai_revenue", "period": "2026Q1", "value": 60}) + "\n"
+        + json.dumps({"ticker": "PLTR", "metric": "ai_revenue", "period": "2026Q1", "value": 9}) + "\n",
+        encoding="utf-8",
+    )
+    legacy = _ok(*_run(module, _ws(workspace, "company-history", "--ticker", "NET")), "company-history-legacy")
+    assert [r["period"] for r in legacy["metrics"]] == ["2026Q1"]
+    assert legacy["counts"]["metrics"] == 1
+
+    (workspace / "state/ai_app_metrics.jsonl").write_text("null\n", encoding="utf-8")
+    code, bad = _run(module, _ws(workspace, "company-history", "--ticker", "NET"))
+    assert code == 1 and bad["ok"] is False and "不是 JSON 对象" in bad["error"]
