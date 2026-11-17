@@ -45,7 +45,26 @@ bash scripts/dalton/build_frontend_prod.sh --require-supabase
 
 ### 1.4 生产部署
 
-部署脚本后续会迁入 `scripts/dalton/ops/`，迁入后补全本节。
+生产发布通过 `scripts/dalton/ops/prod/deploy_main.sh` 执行：
+
+```bash
+bash scripts/dalton/ops/prod/deploy_main.sh
+# 变更了 docker-compose*.yml 容器配置（如 mem_limit、环境变量注入或挂载）时：
+bash scripts/dalton/ops/prod/deploy_main.sh --recreate
+# 同步改动了 researchdata_bridge.py 或其依赖时：
+bash scripts/dalton/ops/prod/deploy_main.sh --bridge
+# 包含 Dalton Alembic 迁移时校对目标版本号：
+bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d039
+```
+
+- **发布流程**：脚本先调用 `wait_backend_idle.sh` 连续两次确认没有进行中的会话或子代理任务，随后触发 `com.dalton.pg-backup` 完成一次新的 Postgres 备份并核对备份日志；备份完成后记录 `PRE_FF` 提交并快进合并 `origin/dalton/main`，接着同步宿主机 `.venv`（`uv sync --frozen`）与前端依赖（`pnpm install --frozen-lockfile`）并执行 `scripts/dalton/build_frontend_prod.sh --require-supabase`；重启前再次确认后端空闲，然后重建或重启 `backend` 与 `crawler`（以及有配置变更时的 `edge`），最后依次检查 `/health`、Dalton 迁移版本、`crawler:8100/health` 与 `scripts/dalton/check_public_edge.sh`。
+- **常用参数**：
+  - `--recreate`：在 `docker-compose.yml` 或 `docker-compose.dalton.yml` 中调整了容器编排字段（如资源上限、环境变量、挂载路径）时传入，使用 `docker compose up -d --no-deps` 重建 `backend` 与 `crawler` 使配置生效；日常纯代码发布保持默认 `docker restart` 即可。
+  - `--bridge`：本次发布包含 `scripts/dalton/researchdata_bridge.py` 或宿主机桥接逻辑改动时传入，在健康检查后重启 `com.dalton.researchdata-bridge` 并输出服务状态。
+  - `--expect-migration dNNN`：本次发布附带 Dalton 数据库迁移时传入，用于核对 `alembic -c src/dalton/alembic.ini current` 输出的迁移版本前缀。
+- **失败回滚**：脚本在快进合并前记录 `PRE_FF`。若 `pnpm install`、前端生产构建、重启前二次空闲等待失败，或容器重启/重建（`backend`、`crawler`、`edge`）、后端 `/health`、Dalton `crawler:8100/health`、`edge` 就绪探测及 `check_public_edge.sh` 任一步失败，都会调用 `revert_deploy` 将代码复位到 `PRE_FF`、重新同步 `.venv` 与 `web/node_modules` 并重打旧版前端静态包；若已触动容器，还会按需重建/重启 `backend`、`crawler` 与 `edge`，并重跑健康检查报告回滚后状态，最终以非零状态码退出。
+- **边缘代理（`edge`）重载**：快进合并后通过 `deploy/dalton/Caddyfile` 差异及 `docker compose config` 解析后的 `edge` 服务配置对比，检测到任一变化时会在健康检查前执行 `docker compose up -d --no-deps --force-recreate edge`，随后以 60 秒统一截止时间循环探测 `http://127.0.0.1:8088/`（端口由 `DALTON_EDGE_PORT` 控制，要求 `curl` 成功且返回 `200`）；超时直接触发回滚并以非零退出，就绪后再运行 `check_public_edge.sh`。
+- **配套宿主机脚本与 `launchd` 模板**：`scripts/dalton/ops/prod/` 下同时收拢了 `wait_backend_idle.sh`、`backup.sh`、`watchdog.sh`、`colima_launch.sh` 以及 `launchd/` 下的三份模板（`com.dalton.backend-watchdog.plist.template`、`com.dalton.colima.plist.template`、`com.dalton.pg-backup.plist.template`）。
 
 ## 2. `.env` 与叠加配置文件改动生效规则
 
@@ -72,6 +91,9 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
 | `com.dalton.config-git-backup` | `scripts/dalton/ops/launchd/com.dalton.config-git-backup.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.config-git-backup` | `~/Library/Logs/dalton-offsite-backup.log` |
 | `com.dalton.db-offsite` | `scripts/dalton/ops/launchd/com.dalton.db-offsite.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.db-offsite` | `~/Library/Logs/dalton-offsite-backup.log` & `*-alerts.log` |
 | `com.dalton.data-backup` | `scripts/dalton/ops/launchd/com.dalton.data-backup.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.data-backup` | `~/Library/Logs/dalton-offsite-backup.log` & `*-alerts.log` |
+| `com.dalton.backend-watchdog` | `scripts/dalton/ops/prod/launchd/com.dalton.backend-watchdog.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.backend-watchdog` | `~/Backups/dalton/watchdog.log` |
+| `com.dalton.colima` | `scripts/dalton/ops/prod/launchd/com.dalton.colima.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.colima` | `~/Library/Logs/dalton-colima.log` |
+| `com.dalton.pg-backup` | `scripts/dalton/ops/prod/launchd/com.dalton.pg-backup.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.pg-backup` | `~/Library/Logs/dalton-pg-backup.log` |
 
 查看某项服务实时状态：
 

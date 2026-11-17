@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for Colima foreground runtime under launchd.
+  Install to ~/Library/LaunchAgents/com.dalton.colima.plist:
+    1. Replace __REPO__, __HOME__, and __LOG_DIR__ with the host paths.
+    2. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.colima.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.colima</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/scripts/dalton/ops/prod/colima_launch.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-colima.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-colima.log</string>
+</dict>
+</plist>
