@@ -1,5 +1,9 @@
 # Dalton LangAlpha Model Broker v2 (`dalton-langalpha-broker`)
 
+> **已停用（2026-11-12；替代方案：直连 OAuth / 原生模型提供商 + `src/dalton/web_search/gemini_grounding.py` + `src/dalton/web_search/x_search_direct.py`）**
+>
+> `ocb-*` 模型目录及经 OpenClaw Broker 转发聊天、联网检索（`#304`）与 X 检索（`#295`、`#299`）的调用链均已正式停用并下线（详见 [OpenClaw 退役现状](../../../docs/dalton/features/openclaw-retirement.md)）。当前保留本目录源码与单元测试仅因为 [`scripts/dalton/pr_baseline.sh`](../../../scripts/dalton/pr_baseline.sh) 仍包含其合约测试，不再用于生产部署或主干路由。
+
 Loopback-only OpenAI-compatible HTTP broker plugin for OpenClaw (`>=2026.10.4`), mounted on the gateway HTTP server under `/dalton-broker/v1/`.
 
 ## Endpoints

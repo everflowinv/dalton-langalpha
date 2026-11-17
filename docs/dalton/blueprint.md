@@ -2,6 +2,18 @@
 
 版本 0.1，2026-10-18。基座：LangAlpha main `8e0dce94`（2026-10-18），分支 `dalton/main`。
 
+## 现状对照（2026-11 现状，详见现行文档）
+
+本蓝图写于 2026-10-18 立项阶段；现行系统结构与运维方式请以 [总目录](./README.md)、[ARCHITECTURE.md](./ARCHITECTURE.md) 与 [OPERATIONS.md](./OPERATIONS.md) 为准。下表对照立项设想的落地情况：
+
+| 蓝图设想 | 当前状态 | 现状说明与代码/文档入口 |
+|---|---|---|
+| **四块核心补齐**（公司知识层、自主研究议程、发布治理、本地每日预算） | **已实现** | 分别对应 `src/dalton/knowledge/`、`src/dalton/autonomy/`、`src/dalton/publish/` 与 `src/dalton/budget/`（`LocalBudgetPort`） |
+| **方法论与研究技能从旧 Dalton/OpenClaw 迁入** | **已实现（大幅扩充）** | 从方法论骨架扩展到 50 个 `plugins/dalton/skills/dalton-*` 分析与周期报告技能，并引入统一工具 `automation_report` 与报告投递体系（[automations.md](./features/automations.md)） |
+| **团队协作与外部渠道接入**（超越初版范围） | **已扩展实现** | 新增 Supabase 三层权限、`dalton-channel-gateway`（飞书/Discord/微信）、多面板监控平台（[monitors.md](./features/monitors.md)）、确定性数据任务层（[data-jobs.md](./features/data-jobs.md)）与 Everflow 对外品牌体系（[brand.md](./features/brand.md)） |
+| **OpenClaw `ocb-*` 模型代理过渡方案** | **已调整并退役** | `ocb-*` 与 OpenClaw 模型调用已全部下线，改为直连 OAuth / 原生提供商及直连 Gemini Grounding / xAI 搜索（[openclaw-retirement.md](./features/openclaw-retirement.md)） |
+| **阶段性过程文档**（P0*/PK/PS 与各轮审查记录） | **已归档** | 已全部移至 [`archive/`](./archive/README.md)，不再作为现行开发依据 |
+
 ## 0. 一页结论
 
 Dalton 要成为基金的一名"新分析师"：先学基金方法论，再做初次覆盖、完整覆盖，之后长期跟踪，回答 PM，在周会上复盘并主动 call 高 conviction 机会。它的认知随时间沉淀、修正，自己安排工作。

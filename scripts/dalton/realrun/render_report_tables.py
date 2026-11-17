@@ -5,9 +5,9 @@ Usage:
   1. Render generated block to stdout:
      `uv run python scripts/dalton/realrun/render_report_tables.py [--evidence-dir DIR]`
   2. Update `<!-- generated:evidence-table --> ... <!-- /generated -->` in a Markdown file:
-     `uv run python scripts/dalton/realrun/render_report_tables.py --update docs/dalton/dev-guide/P0J-round4-dev-report.md`
+     `uv run python scripts/dalton/realrun/render_report_tables.py --update docs/dalton/archive/dev-guide/P0J-round4-dev-report.md`
   3. Reproduce the R4 5-row discrepancy on the legacy P0I report:
-     `uv run python scripts/dalton/realrun/render_report_tables.py --compare-legacy-report docs/dalton/dev-guide/P0I-round3-dev-report.md`
+     `uv run python scripts/dalton/realrun/render_report_tables.py --compare-legacy-report docs/dalton/archive/dev-guide/P0I-round3-dev-report.md`
 """
 
 from __future__ import annotations

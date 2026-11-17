@@ -52,7 +52,7 @@ pnpm test        # 运行 Vitest 单元测试
 
 ## 平台原生命令菜单注册（`dalton-native-commands`）
 
-> **部署顺序说明**：当前仅提供共享固定命令清单、飞书/Discord 平台菜单注册库与独立 CLI。原生命令入站事件解析与会话接入尚未合并部署，真实应用的菜单注册尚未执行；须待入站原生命令处理器合并并部署就绪后，再由主助手在目标环境执行菜单预览与 `--apply` 注册，并进行真实平台联调验证。
+> **当前状态说明**：入站原生命令交互处理器（`Orchestrator.handleNativeCommandInteraction` 与 Discord 交互分发 `src/channels/discord/interactions.ts`）与固定命令清单均已合并；生产环境新增或调整命令描述后，使用下面的 `dalton-native-commands` CLI 先只读预览、再显式传入 `--apply` 增量同步即可（飞书服务端更新后客户端菜单约有 5 分钟本地缓存）。更多自动化报告投递逻辑见 [automations.md](../../docs/dalton/features/automations.md)。
 
 ### 固定原生命令清单
 

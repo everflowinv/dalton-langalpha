@@ -670,11 +670,11 @@ def main(argv: list[str] | None = None) -> int:
 
     target_files: list[str | Path] = list(args.files)
     if not target_files:
-        default_candidates: list[str] = ["docs/dalton/dev-guide/PROGRESS.md"]
-        p0j_rel = "docs/dalton/dev-guide/P0J-round4-dev-report.md"
+        default_candidates: list[str] = ["docs/dalton/archive/dev-guide/PROGRESS.md"]
+        p0j_rel = "docs/dalton/archive/dev-guide/P0J-round4-dev-report.md"
         if (REPO_ROOT / p0j_rel).exists():
             default_candidates.append(p0j_rel)
-        for g_md in sorted((REPO_ROOT / "docs/dalton/dev-guide/trial-runs").glob("realrun-*/G*.md")):
+        for g_md in sorted((REPO_ROOT / "docs/dalton/archive/dev-guide/trial-runs").glob("realrun-*/G*.md")):
             default_candidates.append(g_md.relative_to(REPO_ROOT).as_posix())
         target_files = [c for c in default_candidates if (REPO_ROOT / c).exists()]
 

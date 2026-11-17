@@ -1,11 +1,11 @@
 # Dalton Data Plugin (`dalton_data`)
 
-Provides Dalton investment research MCP servers for LangAlpha:
+Provides Dalton investment research MCP servers for LangAlpha (configured in `plugins/dalton_data/mcp.json` and `plugins/dalton_data/plugin.json`, with Dalton runtime overrides in `agent_config.dalton.yaml`):
 
-1. **`researchdata`** (`transport: "http"`, `call_timeout_s: 300`):
-   Connects to the host-side `researchdata_bridge.py` (`127.0.0.1:8960`), which wraps `~/.openclaw/workspace/scripts/researchdata_mcp.py` over Streamable HTTP JSON-RPC (`POST /mcp/<DALTON_BRIDGE_TOKEN>`).
-   - Filters out OpenClaw-only `agent_tool` / `skill` handoff routes (`web-news`, `web-page`, `filings`, `last30days`, `agent-reach`, `x-timeline`, `x-search`, `xueqiu`, `employee`).
-   - Appends `_declared_sources` to every `tools/call` payload so LangAlpha's Provenance middleware emits structured `sec_filing`, `research_doc`, and `data_api` source cards.
+1. **`researchdata`** (`type: "streamable-http"`, `agent_config.dalton.yaml` `call_timeout_s: 625`):
+   Connects to the host-side `scripts/dalton/researchdata_bridge.py` (`127.0.0.1:8960`, URL configured via `${DALTON_RESEARCHDATA_URL}`) over Streamable HTTP JSON-RPC (`POST /mcp`, authenticated via `Authorization: Bearer ${DALTON_BRIDGE_TOKEN}` or `X-Dalton-Bridge-Token`; legacy `POST /mcp/<token>` kept only for backwards compatibility).
+   - Exposes routed financial/alternative data and community tools (`xueqiu`, `employee`, `last30days`, `x-timeline` via `community(route=...)`), plus AlphaEngine search with team SQLite WAL caching and singleflight coalescing (see [alphaengine-cache.md](../../docs/dalton/features/alphaengine-cache.md)).
+   - Appends `_declared_sources` to `tools/call` payloads so Dalton Provenance middleware emits structured `sec_filing`, `research_doc`, and `data_api` source cards.
 
-2. **`dalton_sec`** (`stdio` via `dalton_sec_mcp_server.py`):
-   Self-contained SEC EDGAR XBRL facts server with deterministic period normalization (`get_company_facts` and `list_filings`), supporting calendar/fiscal quarters, annual, YTD (`H1`/`9M`), derived Q4 (`FY - 9M` for flow concepts), trailing series, and restatement selection (`as_reported` vs `latest`).
+2. **`dalton_sec`** (`type: "stdio"` via `uv run python plugins/dalton_data/dalton_sec_mcp_server.py`):
+   Self-contained SEC EDGAR XBRL facts server (`SEC_USER_AGENT`) with deterministic period normalization (`get_company_facts` and `list_filings`), supporting calendar/fiscal quarters, annual, YTD (`H1`/`9M`), derived Q4 (`FY - 9M` for flow concepts), trailing series, and restatement selection (`as_reported` vs `latest`).
