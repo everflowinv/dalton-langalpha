@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for daily Dalton Postgres pg_dump backup (03:00 local time).
+  Install to ~/Library/LaunchAgents/com.dalton.pg-backup.plist:
+    1. Replace __REPO__, __HOME__, and __LOG_DIR__ with the host paths.
+    2. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.pg-backup.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.pg-backup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/scripts/dalton/ops/prod/backup.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-pg-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-pg-backup.log</string>
+</dict>
+</plist>

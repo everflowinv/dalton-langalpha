@@ -82,3 +82,20 @@ bash scripts/dalton/ops/dalton_data_backup.sh
 
 1. **本地告警日志**：`DALTON_OPS_ALERTS_FILE` 在 `dalton-channel-gateway` 中指向严格 JSON 配置（`ops-alerts.json`），脚本不会向 `.json` 文件追加文本行，而是写入 `DALTON_BACKUP_ALERTS_FILE`（默认 `~/Library/Logs/dalton-offsite-backup-alerts.log`）。
 2. **Gateway 飞书告警（`backup_failed`）**：`dalton-channel-gateway` 的 `POST /internal/ops-alerts` 支持 `{"code":"backup_failed","detail":"<一行说明>"}`，复用 `ops-alerts.json` 中的 `targets`，默认模板为 `Dalton 备份失败：{detail}`（老配置缺少 `messages.backup_failed` 时自动使用该缺省模板）。在 `~/.config/dalton/offsite-backup.env`（`0600`）中配置 `DALTON_CHANNEL_GATEWAY_URL` 与 `INTERNAL_SERVICE_TOKEN` 后，任何显式失败或未捕获的非零退出（`trap ERR/EXIT`）都会**先发送告警**再写日志（令牌通过标准输入传给 `curl -K -`，不打印、不进命令行参数；日志写入失败不会阻断告警，且原退出码保持不变）。
+
+## 6. 生产部署与宿主机运维脚本（`prod/`）
+
+`scripts/dalton/ops/prod/` 集中管理生产宿主机部署、空闲等待、每日数据库备份、看门狗与 Colima 启动脚本，所有路径均从脚本所在仓库根目录自动推导，支持通过环境变量覆盖默认值（完整部署流程与参数说明见 [OPERATIONS.md](../../../docs/dalton/OPERATIONS.md#14-生产部署)）：
+
+| 文件 | 用途 | 关键环境变量（默认值） |
+|---|---|---|
+| `prod/deploy_main.sh` | 生产发布主脚本：空闲检查、触发备份、快进 `origin/dalton/main`、构建前端、重启/重建 `backend`/`crawler`、按变更重建 `edge`、健康与公开入口检查 | `DALTON_REPO_ROOT`（脚本推导）、`DALTON_PG_BACKUP_LOG`（`~/Library/Logs/dalton-pg-backup.log`）、`DALTON_EDGE_PORT`（`8088`） |
+| `prod/wait_backend_idle.sh` | 轮询 Postgres `conversation_threads` 与 `subagent_runs`，连续两次间隔 60 秒均无进行中任务后返回 `0` | — |
+| `prod/backup.sh` | 每日全量 `pg_dump -Fc` 并调用 `prune_backups.py --apply` 按策略修剪旧备份 | `DALTON_REPO_ROOT`（脚本推导）、`DALTON_BACKUP_DIR`（`~/Backups/dalton`）、`DALTON_PRUNE_SCRIPT`（`${DALTON_BACKUP_DIR}/prune_backups.py`） |
+| `prod/watchdog.sh` | 每分钟探测 `127.0.0.1:8000/health`，连续失败 3 次重启后端容器，中断满 5 分钟及恢复时通过 Gateway `/internal/ops-alerts`（回退桥接 `/notify` 与 macOS 通知）发送告警 | `DALTON_REPO_ROOT`、`DALTON_BACKUP_DIR`、`DALTON_OPS_STATE_DIR`（`~/.dalton-ops`）、`DALTON_ENV_FILE`（`${REPO_ROOT}/.env`）、`DALTON_CHANNEL_GATEWAY_ENV_FILE`（`~/.config/dalton/channel-gateway.env`） |
+| `prod/colima_launch.sh` | 等待外置盘 Colima 目录就绪后在前台启动 `colima start -f`，供 `launchd` 托管 | `DALTON_COLIMA_WAIT_DIR`（`/Volumes/EveSSD/Dalton/colima/_lima`） |
+
+`scripts/dalton/ops/prod/launchd/` 提供对应的三份 `LaunchAgent` 模板（安装到 `~/Library/LaunchAgents/` 时替换 `__REPO__`、`__HOME__`、`__LOG_DIR__` 占位符）：
+- `com.dalton.backend-watchdog.plist.template`：每 60 秒执行 `prod/watchdog.sh`。
+- `com.dalton.colima.plist.template`：登录后前台保活运行 `prod/colima_launch.sh`。
+- `com.dalton.pg-backup.plist.template`：每天 03:00 执行 `prod/backup.sh`。

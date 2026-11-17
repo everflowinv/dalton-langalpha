@@ -431,6 +431,7 @@ web/src/components/Sidebar/__tests__/ReportGating.test.tsx
 
 # Offsite backup: config git backup & weekly external SSD + rclone Google Drive backup.
 scripts/dalton/ops/
+scripts/dalton/ops/prod/
 tests/unit/dalton/test_offsite_backup.py
 integrations/dalton-channel-gateway/test/ops-alerts.test.ts
 

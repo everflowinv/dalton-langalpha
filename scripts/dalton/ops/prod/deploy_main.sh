@@ -1,0 +1,642 @@
+#!/bin/bash
+# Deploy origin/dalton/main: wait idle, backup (waits for a fresh dump), ff, frontend build,
+# backend restart (runs Dalton migrations), optional bridge/edge recreate, checks.
+# Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN]
+# --recreate: recreate the backend container (compose changes such as mem_limit);
+#             plain `docker restart` does not re-read docker-compose files.
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
+WAIT_IDLE_SCRIPT="${SCRIPT_DIR}/wait_backend_idle.sh"
+EDGE_PORT="${DALTON_EDGE_PORT:-8088}"
+EDGE_WAIT_TIMEOUT=60
+BRIDGE=0; RECREATE=0; EXPECT=""
+while [ $# -gt 0 ]; do case "$1" in --bridge) BRIDGE=1;; --recreate) RECREATE=1;; --expect-migration) EXPECT="$2"; shift;; esac; shift; done
+
+health() { curl -sf -m3 --noproxy '*' http://127.0.0.1:8000/health >/dev/null; }
+edge_ready() {
+  local max_time="${1:-2}" code
+  code=$(curl -s --max-time "$max_time" --noproxy '*' -o /dev/null -w '%{http_code}' "http://127.0.0.1:${EDGE_PORT}/") || return 1
+  [ "$code" = "200" ]
+}
+
+extract_edge_config() {
+  awk '
+    function lindent(s) {
+      match(s, /^[ ]*/)
+      return RLENGTH
+    }
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function strip_comment(s) {
+      sub(/[[:space:]]+#.*$/, "", s)
+      sub(/^#.*$/, "", s)
+      return s
+    }
+    function unquote(s, q) {
+      s = trim(strip_comment(s))
+      q = sprintf("%c", 39)
+      if (length(s) >= 2) {
+        if ((substr(s, 1, 1) == "\"" && substr(s, length(s), 1) == "\"") ||
+            (substr(s, 1, 1) == q && substr(s, length(s), 1) == q)) {
+          s = substr(s, 2, length(s) - 2)
+        }
+      }
+      return s
+    }
+    function flush_vol() {
+      if (vol_source != "") {
+        if (vol_type == "volume" || (vol_type == "" && vol_source !~ /^[.\/~]/)) {
+          ref_vol[vol_source] = 1
+        }
+      }
+      vol_type = ""
+      vol_source = ""
+      vol_item_indent = -1
+    }
+    function extract_section(sec,    k, line, ind, in_sec, entry_indent, capture, printed_hdr, key, entry_name) {
+      in_sec = 0; entry_indent = -1; capture = 0; printed_hdr = 0
+      for (k = 1; k <= total_lines; k++) {
+        line = lines[k]
+        if (!in_sec) {
+          if (lindent(line) == 0 && line ~ ("^" sec ":[[:space:]]*(#.*)?$")) {
+            in_sec = 1
+          }
+          continue
+        }
+        if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) {
+          if (capture) print line
+          continue
+        }
+        ind = lindent(line)
+        if (ind == 0) {
+          in_sec = 0
+          capture = 0
+          continue
+        }
+        if (entry_indent == -1) entry_indent = ind
+        if (ind <= entry_indent) {
+          key = line
+          sub(/:.*/, "", key)
+          entry_name = unquote(key)
+          if ((sec == "networks" && (entry_name in ref_net)) ||
+              (sec == "configs" && (entry_name in ref_cfg)) ||
+              (sec == "secrets" && (entry_name in ref_sec)) ||
+              (sec == "volumes" && (entry_name in ref_vol))) {
+            capture = 1
+            if (!printed_hdr) {
+              print sec ":"
+              printed_hdr = 1
+            }
+            print line
+          } else {
+            capture = 0
+          }
+        } else if (capture) {
+          print line
+        }
+      }
+    }
+    { lines[++total_lines] = $0 }
+    END {
+      in_services = 0; svc_indent = -1; in_edge = 0; edge_indent = -1; svc_prop_indent = -1
+      in_sub = ""; sub_indent = -1
+      vol_type = ""; vol_source = ""; vol_item_indent = -1
+      cfg_item_indent = -1
+      edge_count = 0
+
+      for (i = 1; i <= total_lines; i++) {
+        line = lines[i]
+        if (!in_services) {
+          if (lindent(line) == 0 && line ~ /^services:[[:space:]]*(#.*)?$/) {
+            in_services = 1
+            svc_indent = -1
+          }
+          continue
+        }
+        if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) {
+          if (in_edge) edge_lines[++edge_count] = line
+          continue
+        }
+        ind = lindent(line)
+        if (ind == 0) {
+          flush_vol()
+          in_services = 0; svc_indent = -1; in_edge = 0; in_sub = ""
+          continue
+        }
+        if (svc_indent == -1) svc_indent = ind
+        if (!in_edge) {
+          if (ind == svc_indent && line ~ /^[[:space:]]+edge:[[:space:]]*(#.*)?$/) {
+            edge_indent = ind
+            in_edge = 1
+            edge_lines[++edge_count] = line
+          }
+          continue
+        }
+        if (ind <= edge_indent) {
+          flush_vol()
+          in_edge = 0; in_sub = ""
+          continue
+        }
+        edge_lines[++edge_count] = line
+        if (svc_prop_indent == -1) svc_prop_indent = ind
+        if (ind == svc_prop_indent) {
+          flush_vol()
+          in_sub = ""; sub_indent = -1; cfg_item_indent = -1
+          if (line ~ /^[[:space:]]*networks:[[:space:]]*(#.*)?$/) in_sub = "networks"
+          else if (line ~ /^[[:space:]]*configs:[[:space:]]*(#.*)?$/) in_sub = "configs"
+          else if (line ~ /^[[:space:]]*secrets:[[:space:]]*(#.*)?$/) in_sub = "secrets"
+          else if (line ~ /^[[:space:]]*volumes:[[:space:]]*(#.*)?$/) in_sub = "volumes"
+          continue
+        }
+        if (in_sub == "") continue
+        if (sub_indent == -1) sub_indent = ind
+
+        if (in_sub == "networks" && ind == sub_indent) {
+          if (line ~ /^[[:space:]]*-[[:space:]]+/) {
+            rest = line
+            sub(/^[[:space:]]*-[[:space:]]+/, "", rest)
+            name = unquote(rest)
+            if (name != "") ref_net[name] = 1
+          } else if (index(line, ":") > 0) {
+            key = line
+            sub(/:.*/, "", key)
+            name = unquote(key)
+            if (name != "") ref_net[name] = 1
+          }
+        } else if (in_sub == "configs" || in_sub == "secrets") {
+          if (ind == sub_indent && line ~ /^[[:space:]]*-[[:space:]]+/) {
+            cfg_item_indent = -1
+            rest = line
+            sub(/^[[:space:]]*-[[:space:]]+/, "", rest)
+            if (rest ~ /^source:[[:space:]]*/) {
+              sub(/^source:[[:space:]]*/, "", rest)
+              name = unquote(rest)
+              if (name != "") { if (in_sub == "secrets") ref_sec[name] = 1; else ref_cfg[name] = 1 }
+            } else if (rest !~ /^[a-zA-Z0-9_.-]+:[[:space:]]+/ && index(rest, ":") == 0) {
+              name = unquote(rest)
+              if (name != "") { if (in_sub == "secrets") ref_sec[name] = 1; else ref_cfg[name] = 1 }
+            }
+          } else if (ind > sub_indent) {
+            if (cfg_item_indent == -1) cfg_item_indent = ind
+            if (ind == cfg_item_indent && line ~ /^[[:space:]]*source:[[:space:]]*/) {
+              rest = line
+              sub(/^[[:space:]]*source:[[:space:]]*/, "", rest)
+              name = unquote(rest)
+              if (name != "") { if (in_sub == "secrets") ref_sec[name] = 1; else ref_cfg[name] = 1 }
+            }
+          }
+        } else if (in_sub == "volumes") {
+          if (ind == sub_indent && line ~ /^[[:space:]]*-([[:space:]]|$)/) {
+            flush_vol()
+            rest = line
+            sub(/^[[:space:]]*-[[:space:]]*/, "", rest)
+            if (rest ~ /^type:[[:space:]]*/) {
+              sub(/^type:[[:space:]]*/, "", rest)
+              vol_type = unquote(rest)
+            } else if (rest ~ /^source:[[:space:]]*/) {
+              sub(/^source:[[:space:]]*/, "", rest)
+              vol_source = unquote(rest)
+            } else if (rest != "" && rest !~ /^[a-zA-Z0-9_.-]+:[[:space:]]+/) {
+              split(rest, parts, ":")
+              vol_source = unquote(parts[1])
+            }
+          } else if (ind > sub_indent) {
+            if (vol_item_indent == -1) vol_item_indent = ind
+            if (ind == vol_item_indent) {
+              if (line ~ /^[[:space:]]*type:[[:space:]]*/) {
+                rest = line
+                sub(/^[[:space:]]*type:[[:space:]]*/, "", rest)
+                vol_type = unquote(rest)
+              } else if (line ~ /^[[:space:]]*source:[[:space:]]*/) {
+                rest = line
+                sub(/^[[:space:]]*source:[[:space:]]*/, "", rest)
+                vol_source = unquote(rest)
+              }
+            }
+          }
+        }
+      }
+      flush_vol()
+      if (edge_count == 0) exit 0
+      for (i = 1; i <= edge_count; i++) print edge_lines[i]
+      extract_section("networks")
+      extract_section("configs")
+      extract_section("secrets")
+      extract_section("volumes")
+    }
+  '
+}
+
+compose_files_list() {
+  local cf="${COMPOSE_FILE:-}" sep="${COMPOSE_PATH_SEPARATOR:-:}" f ovr
+  if [ -z "$cf" ] && [ -f "${REPO_ROOT}/.env" ]; then
+    cf=$(awk '
+      /^[[:space:]]*(export[[:space:]]+)?COMPOSE_FILE=/ {
+        line = $0
+        sub(/^[[:space:]]*(export[[:space:]]+)?COMPOSE_FILE=[[:space:]]*/, "", line)
+        if (line ~ /^"/) {
+          sub(/^"/, "", line); sub(/".*$/, "", line)
+        } else if (line ~ /^'\''/) {
+          sub(/^'\''/, "", line); sub(/'\''.*$/, "", line)
+        } else {
+          sub(/[[:space:]]*#.*$/, "", line)
+          sub(/[[:space:]]+$/, "", line)
+        }
+        val = line
+      }
+      END { print val }
+    ' "${REPO_ROOT}/.env")
+  fi
+  if [ -n "$cf" ]; then
+    while [ -n "$cf" ]; do
+      case "$cf" in
+        *"$sep"*)
+          f=${cf%%"$sep"*}
+          cf=${cf#*"$sep"}
+          ;;
+        *)
+          f=$cf
+          cf=""
+          ;;
+      esac
+      [ -n "$f" ] && printf '%s\n' "$f"
+    done
+    return 0
+  fi
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    if [ -f "${REPO_ROOT}/${f}" ] || git cat-file -e "${PRE_FF}:${f}" 2>/dev/null; then
+      printf '%s\n' "$f"
+      for ovr in compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml; do
+        if [ -f "${REPO_ROOT}/${ovr}" ] || git cat-file -e "${PRE_FF}:${ovr}" 2>/dev/null; then
+          printf '%s\n' "$ovr"
+          break
+        fi
+      done
+      return 0
+    fi
+  done
+}
+
+edge_compose_changed() {
+  [ "$PRE_FF" = "$(git rev-parse HEAD 2>/dev/null)" ] && return 1
+  local tmp_dir f old_cfg new_cfg old_edge new_edge old_rc new_rc
+  local -a old_f_args=() env_args=()
+  tmp_dir=$(mktemp -d) || return 0
+  if [ -f "${REPO_ROOT}/.env" ]; then
+    ln -s "${REPO_ROOT}/.env" "${tmp_dir}/.env"
+    env_args=(--env-file "${REPO_ROOT}/.env")
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if git cat-file -e "${PRE_FF}:${f}" 2>/dev/null; then
+      mkdir -p "$(dirname "${tmp_dir}/${f}")"
+      git show "${PRE_FF}:${f}" > "${tmp_dir}/${f}" 2>/dev/null || { rm -rf "$tmp_dir"; return 0; }
+      old_f_args+=(-f "${tmp_dir}/${f}")
+    fi
+  done <<EOF
+$(compose_files_list)
+EOF
+  new_cfg=$(docker compose config 2>/dev/null)
+  new_rc=$?
+  if [ "$new_rc" -ne 0 ]; then
+    rm -rf "$tmp_dir"
+    return 0
+  fi
+  if [ "${#old_f_args[@]}" -eq 0 ]; then
+    old_cfg=""
+    old_rc=0
+  else
+    old_cfg=$(docker compose --project-directory "$REPO_ROOT" "${env_args[@]}" "${old_f_args[@]}" config 2>/dev/null)
+    old_rc=$?
+  fi
+  rm -rf "$tmp_dir"
+  if [ "$old_rc" -ne 0 ]; then
+    return 0
+  fi
+  old_cfg=${old_cfg//"${tmp_dir}/"/"${REPO_ROOT}/"}
+  old_edge=$(printf '%s\n' "$old_cfg" | extract_edge_config)
+  new_edge=$(printf '%s\n' "$new_cfg" | extract_edge_config)
+  [ "$old_edge" != "$new_edge" ]
+}
+
+apply_backend() {
+  local out rc
+  if [ "$RECREATE" = "1" ]; then
+    out=$(docker compose up -d --no-deps backend 2>&1)
+    rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out" | tail -2
+    return "$rc"
+  fi
+  docker restart dalton-langalpha-backend-1 >/dev/null
+}
+
+apply_crawler() {
+  local out rc
+  if [ "$RECREATE" = "1" ]; then
+    out=$(docker compose up -d --no-deps --no-build crawler 2>&1)
+    rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out" | tail -1
+    return "$rc"
+  elif docker ps -q --filter name=dalton-langalpha-crawler-1 | grep -q .; then
+    docker restart dalton-langalpha-crawler-1 >/dev/null
+  else
+    out=$(docker compose up -d --no-deps --no-build crawler 2>&1)
+    rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out" | tail -1
+    return "$rc"
+  fi
+}
+
+recreate_edge() {
+  local out rc
+  out=$(docker compose up -d --no-deps --force-recreate edge 2>&1)
+  rc=$?
+  [ -n "$out" ] && printf '%s\n' "$out" | tail -2
+  return "$rc"
+}
+
+wait_backend_health() {
+  local ok=0 code rc i
+  for i in $(seq 1 80); do
+    if health; then
+      ok=1
+      break
+    fi
+    [ "$i" -lt 80 ] && sleep 3
+  done
+  code=$(curl -s -m3 --noproxy '*' -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health)
+  rc=$?
+  echo "backend health ${code:-000}"
+  [ "$ok" = "1" ] && [ "$rc" -eq 0 ] && [ "$code" = "200" ]
+}
+
+wait_crawler_health() {
+  local ok=0 out rc i
+  # the crawler takes ~15s to start serving; retry up to 45s before calling it unreachable
+  for i in $(seq 1 15); do
+    if docker exec dalton-langalpha-backend-1 sh -c 'curl -sf -m3 -o /dev/null http://crawler:8100/health' 2>/dev/null; then
+      ok=1
+      break
+    fi
+    [ "$i" -lt 15 ] && sleep 3
+  done
+  out=$(docker exec dalton-langalpha-backend-1 sh -c 'curl -sf -m5 -o /dev/null -w "crawler health %{http_code}\n" http://crawler:8100/health' 2>/dev/null)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+  else
+    echo "crawler health: unreachable"
+  fi
+  [ "$ok" = "1" ] && [ "$rc" -eq 0 ]
+}
+
+wait_edge_ready() {
+  local ok=0 deadline now remaining max_time i
+  deadline=$(( $(date +%s) + EDGE_WAIT_TIMEOUT ))
+  for i in $(seq 1 "$EDGE_WAIT_TIMEOUT"); do
+    now=$(date +%s)
+    remaining=$(( deadline - now ))
+    [ "$remaining" -le 0 ] && break
+    max_time=2
+    [ "$remaining" -lt "$max_time" ] && max_time="$remaining"
+    if edge_ready "$max_time"; then
+      if [ "$(date +%s)" -le "$deadline" ]; then
+        ok=1
+      fi
+      break
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    [ "$i" -lt "$EDGE_WAIT_TIMEOUT" ] && sleep 1
+  done
+  [ "$ok" = "1" ]
+}
+
+run_public_edge_check() {
+  local out rc
+  out=$(bash scripts/dalton/check_public_edge.sh 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    [ -n "$out" ] && printf '%s\n' "$out" | tail -1
+  else
+    [ -n "$out" ] && printf '%s\n' "$out"
+  fi
+  return "$rc"
+}
+
+cd "$REPO_ROOT" || exit 1
+bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
+LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
+launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
+for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
+after=$(tail -1 "$LOG"); echo "backup: $after"
+case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; exit 1; };; *) echo "backup failed, abort"; exit 1;; esac
+# ff and frontend build only after the idle wait and backup, right before the restart, so the new
+# frontend never goes live against the old backend and running code is not swapped under a busy backend.
+PRE_FF=$(git rev-parse HEAD)
+BACKEND_TOUCHED=0
+CRAWLER_TOUCHED=0
+EDGE_TOUCHED=0
+BRIDGE_TOUCHED=0
+# Put code, web dependencies and the served bundle back together, so a failed step never leaves
+# a new frontend (or new code waiting for the next restart) in front of the running backend.
+revert_deploy() {
+  local need_post_health=0 build_out build_rc post_ok=1 cur_head
+  local -a failed_steps=()
+  if [ "$BACKEND_TOUCHED" = "1" ] || [ "$CRAWLER_TOUCHED" = "1" ] || [ "$EDGE_TOUCHED" = "1" ]; then
+    need_post_health=1
+  fi
+  git update-index -q --refresh
+  if ! git reset -q --keep "$PRE_FF"; then
+    cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    echo "CODE REVERT FAILED — 代码未能恢复，需人工处理 (HEAD=${cur_head}, PRE_FF=${PRE_FF}; manual: git update-index --refresh && git reset --keep $PRE_FF)"
+    return 1
+  fi
+  cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+  if [ "$cur_head" != "$PRE_FF" ]; then
+    echo "CODE REVERT FAILED — 代码未能恢复，需人工处理 (HEAD=${cur_head}, PRE_FF=${PRE_FF})"
+    return 1
+  fi
+  if ! uv sync --frozen -q >/dev/null 2>&1; then
+    echo "WARN: host venv re-sync failed"
+    post_ok=0
+    failed_steps+=("uv_sync")
+  fi
+  if ! (cd web && pnpm install --frozen-lockfile) >/dev/null 2>&1; then
+    echo "WARN: pnpm install on revert failed"
+    post_ok=0
+    failed_steps+=("pnpm_install")
+  fi
+  build_out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
+  build_rc=$?
+  if [ "$build_rc" -eq 0 ] && printf '%s\n' "$build_out" | grep -q "OK: Production bundle"; then
+    echo "reverted to $(git rev-parse --short=9 HEAD), old frontend rebuilt"
+  else
+    echo "OLD FRONTEND REBUILD FAILED"
+    post_ok=0
+    failed_steps+=("frontend_build")
+  fi
+  if [ "$BACKEND_TOUCHED" = "1" ]; then
+    echo "$(date '+%T') reverting backend"
+    if ! apply_backend; then
+      echo "WARN: backend revert failed"
+      post_ok=0
+      failed_steps+=("backend_revert")
+    fi
+  fi
+  if [ "$CRAWLER_TOUCHED" = "1" ]; then
+    echo "$(date '+%T') reverting crawler"
+    if ! apply_crawler; then
+      echo "WARN: crawler revert failed"
+      post_ok=0
+      failed_steps+=("crawler_revert")
+    fi
+  fi
+  if [ "$EDGE_TOUCHED" = "1" ]; then
+    echo "$(date '+%T') reverting edge"
+    if ! recreate_edge; then
+      echo "WARN: edge revert failed"
+      post_ok=0
+      failed_steps+=("edge_revert")
+    fi
+  fi
+  if [ "$BRIDGE_TOUCHED" = "1" ]; then
+    if ! launchctl kickstart -k "gui/$(id -u)/com.dalton.researchdata-bridge" >/dev/null 2>&1; then
+      echo "WARN: bridge revert kickstart failed"
+      post_ok=0
+      failed_steps+=("bridge_revert")
+    fi
+  fi
+  if [ "$need_post_health" = "1" ]; then
+    echo "$(date '+%T') running post-revert health checks"
+    if wait_backend_health; then
+      echo "POST-REVERT CHECK: backend health OK"
+    else
+      echo "POST-REVERT CHECK: backend health FAILED"
+      post_ok=0
+      failed_steps+=("backend_health")
+    fi
+    if wait_crawler_health; then
+      echo "POST-REVERT CHECK: crawler health OK"
+    else
+      echo "POST-REVERT CHECK: crawler health FAILED"
+      post_ok=0
+      failed_steps+=("crawler_health")
+    fi
+    if [ "$EDGE_TOUCHED" = "1" ]; then
+      if wait_edge_ready; then
+        echo "POST-REVERT CHECK: edge ready OK"
+      else
+        echo "POST-REVERT CHECK: edge ready FAILED"
+        post_ok=0
+        failed_steps+=("edge_ready")
+      fi
+    fi
+    if run_public_edge_check; then
+      echo "POST-REVERT CHECK: public edge check OK"
+    else
+      echo "POST-REVERT CHECK: public edge check FAILED"
+      post_ok=0
+      failed_steps+=("public_edge_check")
+    fi
+  fi
+  if [ "$post_ok" = "1" ]; then
+    if [ "$need_post_health" = "1" ]; then
+      echo "POST-REVERT HEALTH REPORT: all revert steps and post-revert checks passed"
+    else
+      echo "POST-REVERT REPORT: all revert steps passed"
+    fi
+    return 0
+  else
+    echo "POST-REVERT REPORT: FAILED (failed steps: ${failed_steps[*]})"
+    return 1
+  fi
+}
+git fetch -q origin && git merge -q --ff-only origin/dalton/main || { echo "ff failed, abort"; exit 1; }
+echo "$(date '+%T') ff to $(git log --oneline -1)"
+RECREATE_EDGE=0
+if ! git diff --quiet "$PRE_FF" HEAD -- deploy/dalton/Caddyfile 2>/dev/null || edge_compose_changed; then
+  RECREATE_EDGE=1
+fi
+# Host jobs (conversation archive) run on this checkout's .venv, not the container: keep it on the
+# lockfile, or a new dependency breaks them silently (2026-10-28..11-01 archive failures).
+uv sync --frozen -q 2>&1 | tail -2 || echo "WARN: host venv sync failed (host jobs may break)"
+# The build does not install: keep web/node_modules on the lockfile (sync5 changed it).
+(cd web && pnpm install --frozen-lockfile) >/dev/null 2>&1 || { echo "pnpm install failed: reverting"; revert_deploy; exit 1; }
+out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
+build_rc=$?
+printf '%s\n' "$out" | grep -E "VITE_DALTON_AUTH=|OK:|ERROR|OVER BUDGET" || true
+if [ "$build_rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q "OK: Production bundle"; then
+  echo "frontend build failed: reverting (backend not restarted)"
+  revert_deploy
+  exit 1
+fi
+# Re-check right before the restart: the backup and build take minutes, and a turn
+# started in that gap would be cut off (2026-10-28: a new EDU turn died this way).
+busy() { [ "$(docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc "select (select count(*) from conversation_threads where current_status='in_progress')+(select count(*) from subagent_runs where status='in_progress')")" != "0" ]; }
+while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; exit 1; }; done
+
+BACKEND_TOUCHED=1
+if ! apply_backend; then
+  echo "ERROR: backend restart/recreate failed: reverting"
+  revert_deploy
+  exit 1
+fi
+# P6b crawler service: same image as the backend, code from bind mounts, so a restart picks up the ff.
+# --recreate also re-reads its compose definition; --no-build because it never has its own build.
+if docker compose config --services 2>/dev/null | grep -qx crawler; then
+  CRAWLER_TOUCHED=1
+  if ! apply_crawler; then
+    echo "ERROR: crawler restart/recreate failed: reverting"
+    revert_deploy
+    exit 1
+  fi
+fi
+if [ "$RECREATE_EDGE" = "1" ]; then
+  echo "$(date '+%T') edge config changed; recreating edge"
+  EDGE_TOUCHED=1
+  if ! recreate_edge; then
+    echo "ERROR: edge recreate failed: reverting"
+    revert_deploy
+    exit 1
+  fi
+fi
+
+if ! wait_backend_health; then
+  echo "ERROR: backend health check failed: reverting"
+  revert_deploy
+  exit 1
+fi
+cur=$(docker exec dalton-langalpha-backend-1 sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini current 2>/dev/null" | tail -1 || true); echo "dalton migration: $cur"
+[ -n "$EXPECT" ] && { case "$cur" in "$EXPECT"*) echo "migration ok";; *) echo "MIGRATION MISMATCH (expected $EXPECT)";; esac; }
+if [ "$BRIDGE" = "1" ]; then
+  BRIDGE_TOUCHED=1
+  launchctl kickstart -k "gui/$(id -u)/com.dalton.researchdata-bridge" || {
+    echo "ERROR: researchdata-bridge kickstart failed: reverting"
+    revert_deploy
+    exit 1
+  }
+  sleep 5
+  launchctl list | grep researchdata-bridge || true
+fi
+docker inspect dalton-langalpha-backend-1 -f 'backend mem_limit={{.HostConfig.Memory}}'
+if ! wait_crawler_health; then
+  echo "ERROR: crawler health check failed: reverting"
+  revert_deploy
+  exit 1
+fi
+if [ "$RECREATE_EDGE" = "1" ]; then
+  if ! wait_edge_ready; then
+    echo "ERROR: edge not responding with HTTP 200 on 127.0.0.1:${EDGE_PORT} within ${EDGE_WAIT_TIMEOUT}s: reverting"
+    revert_deploy
+    exit 1
+  fi
+fi
+if ! run_public_edge_check; then
+  echo "ERROR: public edge check failed: reverting"
+  revert_deploy
+  exit 1
+fi
