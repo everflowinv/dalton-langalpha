@@ -27,6 +27,7 @@ from scripts.dalton.monitor_feeds.common import (  # noqa: E402
     load_json_safe,
     make_source_result,
     now_hk,
+    resolve_market_trade_date,
     resolve_state_dir,
 )
 from scripts.dalton.monitor_feeds.hk_momentum.compute import (  # noqa: E402
@@ -245,9 +246,9 @@ def run_daily_job(
     """Run HK momentum daily pipeline in container (writes state/HTML only; host daemon pushes)."""
     st_dir = resolve_state_dir("hk_momentum", state_dir)
     status_store = SourceStatusStore(st_dir)
-    ref_day = as_of_date or now_hk().date()
-    ref_str = ref_day.isoformat()
     now_local = now_hk()
+    ref_day = resolve_market_trade_date("hk", now=now_local, as_of_date=as_of_date)
+    ref_str = ref_day.isoformat()
     now_str = f"{now_local.strftime('%Y-%m-%d %H:%M:%S')} 北京时间"
     prev_index_meta = load_json_safe(st_dir / "index_meta.json", {}) or {}
     is_month_end_rebal = (
@@ -272,10 +273,12 @@ def run_daily_job(
 
     all_results: list[SourceStatus] = []
     codes: list[str] = []
+    fetched_uni: Any = None
 
     if not skip_fetch:
         try:
             uni, uni_meta = build_universe(state_dir=st_dir, proxy=proxy, as_of_date=ref_day)
+            fetched_uni = uni
             all_results.extend(_extract_universe_statuses(uni_meta))
             codes = list(uni.loc[uni["price"].notna(), "code"]) if "price" in uni else list(uni["code"])
         except Exception as exc:
@@ -291,7 +294,7 @@ def run_daily_job(
 
         if codes:
             try:
-                hist_prog = download_history(codes, state_dir=st_dir)
+                hist_prog = download_history(codes, state_dir=st_dir, target_date=ref_str)
                 all_results.append(_extract_history_status(hist_prog))
             except Exception as exc:
                 logger.exception("HK momentum download_history raised: %s", exc)
@@ -322,13 +325,19 @@ def run_daily_job(
 
     # Separate calculation from persistence: compute_all runs with persist=False & freeze_on_stale=True,
     # and run_daily_job commits series/frozen/constituents ONLY after all checks and render pass.
+    uni_override = (
+        fetched_uni
+        if (not (st_dir / "universe.csv").is_file() and fetched_uni is not None)
+        else None
+    )
     try:
         computed = compute_all(
             state_dir=st_dir,
-            as_of_date=as_of_date,
+            as_of_date=ref_day,
             freeze_on_stale=True,
             update_last_success=False,
             persist=False,
+            universe_df=uni_override,
         )
     except Exception as exc:
         logger.exception("HK momentum compute_all raised: %s", exc)

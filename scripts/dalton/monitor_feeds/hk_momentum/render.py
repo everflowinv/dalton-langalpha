@@ -30,7 +30,35 @@ HKMOM_EXTRA_CSS = r"""
 .showmore{color:var(--blue);cursor:pointer;font-size:12px;margin-top:8px;display:inline-block}
 .showmore:hover{text-decoration:underline}
 .partial-note{font-size:11px;color:var(--temp-warm);margin-top:4px}
+.info-banner{background:#12253e;border:1px solid #355a8a;color:#cfe2ff;border-radius:10px;padding:9px 13px;font-size:12.5px;margin:8px 0 0;display:none}
+.info-banner.show{display:block}
 """
+
+
+def _collect_source_notes(
+    meta: dict[str, Any] | None,
+    intraday: dict[str, Any] | None,
+) -> str:
+    merged: dict[str, Any] = {}
+    if isinstance(meta, dict) and isinstance(meta.get("sources"), dict):
+        merged.update(meta["sources"])
+    if isinstance(intraday, dict) and isinstance(intraday.get("sources"), dict):
+        merged.update(intraday["sources"])
+    parts: list[str] = []
+    for k, ent in merged.items():
+        if not isinstance(ent, dict):
+            continue
+        if ent.get("ok") and not ent.get("stale") and ent.get("note"):
+            label = ent.get("label") or k
+            parts.append(f"{label}：{ent['note']}")
+    if not parts and isinstance(meta, dict) and meta.get("ggt_skipped_note"):
+        parts.append(f"深交所港股通名单：{meta['ggt_skipped_note']}")
+    if isinstance(meta, dict) and (meta.get("excluded_codes") or []):
+        excl_n = len(meta["excluded_codes"])
+        suffix = f"已从所有指数候选池排除身份未确认代码 {excl_n} 只"
+        if suffix not in "；".join(parts):
+            parts.append(suffix)
+    return "；".join(parts)
 
 
 def render_hkmom_html(
@@ -60,11 +88,29 @@ def render_hkmom_html(
     cp["methodology"]["bullets_tpl"] = resolved_bullets
     cp["methodology"]["bullets_resolved"] = resolved_bullets
 
+    intraday_dict = intraday or {}
+    initial_notes = _collect_source_notes(meta_dict, intraday_dict)
+    initial_note_cls = "info-banner show" if initial_notes else "info-banner"
+    initial_note_text = f"ℹ️ 来源提示：{initial_notes}" if initial_notes else ""
+    init_close_date = (
+        intraday_dict.get("daily_close_date")
+        or intraday_dict.get("target_trade_date")
+        or meta_dict.get("last_date")
+        or ""
+    )
+    if intraday_dict and intraday_dict.get("is_trading_day") is False and init_close_date:
+        initial_pill_text = (
+            f"{intraday_dict.get('market_status_label') or '休市（非交易日）'} · "
+            f"{cp['cards']['recent_close_tpl'].format(date=init_close_date)}"
+        )
+    else:
+        initial_pill_text = "等待数据刷新…"
+
     payload = {
         "series": series or {},
         "meta": meta_dict,
         "constituents": constituents or {},
-        "intraday": intraday or {},
+        "intraday": intraday_dict,
         "copy": cp,
     }
     seed_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
@@ -109,13 +155,60 @@ function formatSourcesStale(sources) {
   return parts.join('；');
 }
 
+function formatSourceNotes(sources, metaObj) {
+  const parts = [];
+  if (sources && typeof sources === 'object') {
+    for (const [k, s] of Object.entries(sources)) {
+      if (s && s.ok && !s.stale && s.note) {
+        parts.push(`${s.label || k}：${s.note}`);
+      }
+    }
+  }
+  if (!parts.length && metaObj && metaObj.ggt_skipped_note) {
+    parts.push(`深交所港股通名单：${metaObj.ggt_skipped_note}`);
+  }
+  if (metaObj && Array.isArray(metaObj.excluded_codes) && metaObj.excluded_codes.length) {
+    parts.push(`已从所有指数候选池排除身份未确认代码 ${metaObj.excluded_codes.length} 只`);
+  }
+  return parts.join('；');
+}
+
+function formatCloseTag(entry, liveObj, metaObj) {
+  if (liveObj && liveObj.trading) {
+    return (entry && entry.source === 'daily_close') ? '今日收盘' : '今日(盘中实时)';
+  }
+  const closeDate = (entry && entry.close_date)
+    || (liveObj && (liveObj.daily_close_date || liveObj.target_trade_date))
+    || (metaObj && metaObj.last_date)
+    || '';
+  const isHolidayOrPrior = (liveObj && liveObj.is_trading_day === false)
+    || (closeDate && liveObj && liveObj.trade_date && closeDate !== liveObj.trade_date);
+  if (isHolidayOrPrior) {
+    return closeDate
+      ? COPY.cards.recent_close_tpl.replace('{date}', closeDate)
+      : '最近交易日收盘';
+  }
+  return '今日收盘';
+}
+
 function updateStatus() {
   const b = document.getElementById('status-pill');
   const banner = document.getElementById('stale-banner');
+  const noteBanner = document.getElementById('note-banner');
   const d = live || {};
   const label = d.market_status_label || (d.trading ? '港股交易中' : '已收盘');
   const asOf = d.as_of || (meta ? meta.last_date : '未知');
   const schedNote = d.session_note ? ` · ${d.session_note}` : '';
+  const noteText = formatSourceNotes(d.sources || (meta && meta.sources), meta);
+  if (noteBanner) {
+    if (noteText) {
+      noteBanner.className = 'info-banner show';
+      noteBanner.textContent = `ℹ️ 来源提示：${noteText}`;
+    } else {
+      noteBanner.className = 'info-banner';
+      noteBanner.textContent = '';
+    }
+  }
   if (pollErr) {
     b.className = 'flow-status stale';
     b.textContent = `数据未更新（上次成功：${d.last_success_at || asOf}）`;
@@ -147,8 +240,9 @@ function updateStatus() {
       .replace('{reason}', reasons.join('；') || '部分报价暂未返回');
     return;
   }
+  const closeSuffix = (d.is_trading_day === false) ? ` · ${formatCloseTag(null, d, meta)}` : '';
   b.className = 'flow-status' + (d.trading ? ' live' : '');
-  b.textContent = `${label} · 数据时间：${asOf} 北京时间${schedNote}`;
+  b.textContent = `${label}${closeSuffix} · 数据时间：${asOf} 北京时间${schedNote}`;
   banner.className = 'stale-banner';
   banner.textContent = '';
 }
@@ -165,8 +259,8 @@ function renderCards() {
     if (k === 'hsi') {
       if (live && live.hsi && live.hsi.value != null) {
         lvl = Number(live.hsi.value).toLocaleString();
-        const tag = (live.trading ? '今日(盘中)' : '今日收盘');
-        chg = `<span class="${cls(live.hsi.pct)}">${fmtPct(live.hsi.pct)}</span> ${tag}`;
+        const tag = live.trading ? '今日(盘中)' : formatCloseTag(live.hsi, live, meta);
+        chg = `<span class="${cls(live.hsi.pct)}">${fmtPct(live.hsi.pct)}</span> ${esc(tag)}`;
       } else if (seriesData && seriesData.hsi) {
         lvl = String(seriesData.hsi[seriesData.hsi.length - 1]);
       }
@@ -178,8 +272,8 @@ function renderCards() {
       const lv = live && live[k];
       if (lv && lv.level != null) {
         lvl = Number(lv.level).toLocaleString();
-        const tag = lv.source === 'daily_close' ? '今日收盘' : (live.trading ? '今日(盘中实时)' : '今日收盘');
-        chg = `<span class="${cls(lv.pct)}">${fmtPct(lv.pct)}</span> ${tag}`;
+        const tag = formatCloseTag(lv, live, meta);
+        chg = `<span class="${cls(lv.pct)}">${fmtPct(lv.pct)}</span> ${esc(tag)}`;
         if (lv.partial_quotes && lv.n_expected) {
           partial = `<div class="partial-note">${esc(COPY.cards.partial_tpl
             .replace('{quoted}', String(lv.n_quoted))
@@ -284,7 +378,10 @@ function drawChart(hoverIdx) {
 function renderTables() {
   const rebal = (meta && meta.last_rebalance_date) || '上月末';
   document.getElementById('sub-smallcap').textContent = COPY.tables.smallcap_sub_tpl.replace('{rebal_date}', rebal);
-  document.getElementById('sub-nonggt').textContent = COPY.tables.nonggt_sub_tpl.replace('{rebal_date}', rebal);
+  const exclCnt = (meta && Array.isArray(meta.excluded_codes)) ? meta.excluded_codes.length : 0;
+  const nonggtSub = COPY.tables.nonggt_sub_tpl.replace('{rebal_date}', rebal)
+    + (exclCnt > 0 ? `（已排除身份未确认 ${exclCnt} 只）` : '');
+  document.getElementById('sub-nonggt').textContent = nonggtSub;
   for (const k of ['smallcap', 'nonggt']) {
     const rows = cons[k] || [];
     const lim = S.expanded[k] ? rows.length : 10;
@@ -396,10 +493,11 @@ window.addEventListener('resize', () => drawChart(null));
         '<div class="top-head">'
         f'<div><h1>{html.escape(cp["title"])}</h1>'
         f'<p id="subline">{html.escape(resolved_subline)}</p></div>'
-        '<div class="top-meta"><span class="flow-status" id="status-pill">等待数据刷新…</span></div>'
+        f'<div class="top-meta"><span class="flow-status" id="status-pill">{html.escape(initial_pill_text)}</span></div>'
         '</div>'
         f'{legend_html}'
         '<div class="stale-banner" id="stale-banner"></div>'
+        f'<div class="{initial_note_cls}" id="note-banner">{html.escape(initial_note_text)}</div>'
         '</header>'
         '<main class="wrap">'
         '<div class="cards" id="cards"></div>'

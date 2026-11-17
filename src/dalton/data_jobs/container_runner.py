@@ -73,6 +73,20 @@ class DataTaskPathMap:
             return Path(override)
         return self.host_var_dir.parent.parent / "src"
 
+    @property
+    def host_scripts_dir(self) -> Path:
+        """Host ``scripts/dalton/`` mounted read-only at ``/app/scripts/dalton``.
+
+        Same reason as ``host_src_dir``: data jobs that run repo scripts (for
+        example the monitor feeds) must run the checked-out version, not the copy
+        baked into the image at its last build. ``DALTON_HOST_SCRIPTS_DIR``
+        overrides the default ``<repo>/scripts/dalton``.
+        """
+        override = os.getenv("DALTON_HOST_SCRIPTS_DIR", "").strip()
+        if override:
+            return Path(override)
+        return self.host_var_dir.parent.parent / "scripts" / "dalton"
+
     def host_run_secrets_dir(self, run_id: str | UUID) -> Path:
         return self.host_var_dir / "run-secrets" / str(run_id)
 
@@ -95,6 +109,7 @@ class DataTaskPathMap:
             f"{self.host_data_root}:{self.container_workspace_dir}:rw",
             f"{self.host_run_secrets_dir(run_id)}:{self.container_secrets_dir}:ro",
             f"{self.host_src_dir}:/app/src:ro",
+            f"{self.host_scripts_dir}:/app/scripts/dalton:ro",
         ]
 
     def docker_tmpfs(self) -> dict[str, str]:

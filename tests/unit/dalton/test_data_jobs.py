@@ -7842,6 +7842,17 @@ def test_task_container_mounts_host_src_read_only(monkeypatch: pytest.MonkeyPatc
     assert "/elsewhere/src:/app/src:ro" in paths.docker_binds("run-1")
 
 
+def test_task_container_mounts_host_scripts_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.dalton.data_jobs.container_runner import build_path_map
+
+    monkeypatch.delenv("DALTON_HOST_SCRIPTS_DIR", raising=False)
+    paths = build_path_map(host_var_dir="/repo/var/dalton", backend_var_dir="/app/var/dalton")
+    assert "/repo/scripts/dalton:/app/scripts/dalton:ro" in paths.docker_binds("run-1")
+
+    monkeypatch.setenv("DALTON_HOST_SCRIPTS_DIR", "/elsewhere/scripts/dalton")
+    assert "/elsewhere/scripts/dalton:/app/scripts/dalton:ro" in paths.docker_binds("run-1")
+
+
 def test_wrapper_prewarms_yfinance_caches_before_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
     import yfinance.cache as yf_cache
 

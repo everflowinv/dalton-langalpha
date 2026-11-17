@@ -33,11 +33,13 @@ from scripts.dalton.monitor_feeds.common import (
     CalendarLookupError,
     SourceStatusStore,
     atomic_write_json,
+    is_trading_day,
     load_json_safe,
     make_source_result,
     market_session_state,
     now_cn,
     previous_trading_day,
+    resolve_market_trade_date,
     resolve_state_dir,
 )
 
@@ -1022,6 +1024,48 @@ class AShareCollector:
             "coverage_pct": round(covered_turnover / total_turnover * 100.0, 1) if total_turnover else None,
         }, stock_err
 
+    def _target_cn_trade_date(self, cur: datetime | None = None) -> date:
+        dt = (cur or self._now()).astimezone(CN_TZ)
+        try:
+            return resolve_market_trade_date("cn", now=dt)
+        except CalendarLookupError:
+            return dt.date()
+
+    def _expected_min_history_date(self, cur: datetime) -> date:
+        dt = cur.astimezone(CN_TZ)
+        sess = market_session_state("cn", dt)
+        if sess.get("calendar_error"):
+            return self._prev_cn_trading_day(dt.date())
+        target_day = resolve_market_trade_date("cn", now=dt)
+        if not sess.get("is_trading_day"):
+            return target_day
+        hm = dt.hour * 60 + dt.minute
+        am_start = int(sess["am_start"]) if sess.get("am_start") is not None else (9 * 60 + 30)
+        close_hm = int(sess["close_hm"]) if sess.get("close_hm") is not None else (15 * 60)
+        # Before market open (e.g. 00:25 BJT) or after post-close daily history settlement (>= close + 60m),
+        # target_day itself has already closed and must appear in daily_history.
+        if hm < am_start or hm >= close_hm + 60:
+            return target_day
+        return self._prev_cn_trading_day(target_day)
+
+    def _validate_history_rows_freshness(
+        self, rows: list[dict[str, Any]], cur: datetime
+    ) -> str | None:
+        if not rows:
+            return "30日历史行情解析结果为空"
+        latest_str = str(rows[-1].get("day") or "").strip()
+        try:
+            latest_day = datetime.strptime(latest_str, "%Y-%m-%d").date()
+        except ValueError:
+            return f"30日历史行情日期格式无效: {latest_str!r}"
+        cur_day = cur.astimezone(CN_TZ).date()
+        if latest_day > cur_day:
+            return f"30日历史行情出现未来日期: {latest_str} > {cur_day.isoformat()}"
+        expected_min = self._expected_min_history_date(cur)
+        if latest_day < expected_min:
+            return f"30日历史行情最新日期过期: {latest_str} < {expected_min.isoformat()}"
+        return None
+
     def _full_date(self, mmdd: str) -> str:
         month, day = map(int, mmdd.split("/"))
         today = self._now().astimezone(CN_TZ).date()
@@ -1030,9 +1074,16 @@ class AShareCollector:
 
     def fetch_daily_history(self) -> tuple[list[dict[str, Any]], str | None]:
         now = time.time()
+        cur = self._now().astimezone(CN_TZ)
         eff_ttl = min(HISTORY_TTL, 55.0) if self._history_cache.get("error") else HISTORY_TTL
         if self._history_cache["rows"] and now - self._history_cache["ts"] < eff_ttl:
-            return self._history_cache["rows"], self._history_cache.get("error")
+            cached_err = self._history_cache.get("error")
+            if cached_err is None:
+                freshness_err = self._validate_history_rows_freshness(self._history_cache["rows"], cur)
+                if freshness_err is None:
+                    return self._history_cache["rows"], None
+            else:
+                return self._history_cache["rows"], cached_err
         if self._history_cache.get("error") and now - self._history_cache["ts"] < eff_ttl:
             return [], self._history_cache["error"]
         try:
@@ -1064,15 +1115,33 @@ class AShareCollector:
                     continue
             rows.sort(key=lambda r: r["day"])
             rows = rows[-30:]
-            if rows:
+            if not rows:
+                raise RuntimeError("30日历史行情解析结果为空")
+            date_err = self._validate_history_rows_freshness(rows, cur)
+            if date_err is not None:
+                if "未来日期" in date_err:
+                    raise RuntimeError(date_err)
+                stored = self._load_daily_history()
+                if stored and str(stored[-1].get("day") or "") > str(rows[-1].get("day") or ""):
+                    kept = stored
+                else:
+                    kept = rows
+                    self._store_daily_history(rows)
+                prev_ok = self._prior_source_success("daily_history")
+                err = f"{date_err}（上次成功：{prev_ok or '无'}）"
                 self._history_cache = {
                     "ts": now,
-                    "rows": rows,
-                    "error": None,
+                    "rows": kept,
+                    "error": err,
                 }
-                self._store_daily_history(rows)
-                return rows, None
-            raise RuntimeError("30日历史行情解析结果为空")
+                return kept, err
+            self._history_cache = {
+                "ts": now,
+                "rows": rows,
+                "error": None,
+            }
+            self._store_daily_history(rows)
+            return rows, None
         except Exception as exc:
             stored = self._load_daily_history() or self._history_cache.get("rows") or []
             prev_ok = self._prior_source_success("daily_history")
@@ -1211,7 +1280,7 @@ class AShareCollector:
                 conn.close()
 
     def volume_series(self) -> dict[str, list[Any]]:
-        day = self._now().astimezone(CN_TZ).date().isoformat()
+        day = self._target_cn_trade_date().isoformat()
         with self._lock:
             conn = self._connect()
             try:
@@ -1237,7 +1306,7 @@ class AShareCollector:
         return {"labels": labels, "cum": cum, "rate": rate}
 
     def breadth_series(self) -> dict[str, list[Any]]:
-        day = self._now().astimezone(CN_TZ).date().isoformat()
+        day = self._target_cn_trade_date().isoformat()
         with self._lock:
             conn = self._connect()
             try:
@@ -1374,6 +1443,22 @@ class AShareCollector:
         except ValueError as exc:
             raise RuntimeError(f"{label}日期格式无效: {raw_date!r}") from exc
 
+    def _expected_official_min_date(self, cur: datetime | None = None) -> date:
+        """SSE/SZSE publish day T official ETF shares on the next trading day morning (~09:00 BJT)."""
+        dt = (cur or self._now()).astimezone(CN_TZ)
+        d = dt.date()
+        try:
+            trading_today = is_trading_day("cn", d)
+        except CalendarLookupError:
+            trading_today = d.weekday() < 5
+        if trading_today:
+            prev1 = self._prev_cn_trading_day(d)
+            if (dt.hour * 60 + dt.minute) >= 9 * 60:
+                return prev1
+            return self._prev_cn_trading_day(prev1)
+        target_cn = self._target_cn_trade_date(dt)
+        return self._prev_cn_trading_day(target_cn)
+
     def _fetch_sse_pairs(self, codes: list[str]) -> dict[str, tuple[Any, Any]]:
         wanted = set(codes)
         if not wanted:
@@ -1381,8 +1466,9 @@ class AShareCollector:
         latest_rows = self._sse_share_day("")
         if not latest_rows:
             raise RuntimeError("上交所官方份额接口返回空列表")
-        today_cn = self._now().astimezone(CN_TZ).date()
-        expected_prev_today = self._prev_cn_trading_day(today_cn)
+        cur_cn = self._now().astimezone(CN_TZ)
+        today_cn = cur_cn.date()
+        expected_prev_today = self._expected_official_min_date(cur_cn)
         latest_day = str(latest_rows[0].get("STAT_DATE") or "").strip()
         base = self._parse_cn_trade_date(latest_day, "上交所官方份额")
         if base > today_cn:
@@ -1462,8 +1548,9 @@ class AShareCollector:
         return {code: (latest[code], previous[code]) for code in wanted}
 
     def _fetch_szse_pair(self, code: str) -> tuple[Any, Any]:
-        end = self._now().astimezone(CN_TZ).date()
-        expected_prev_today = self._prev_cn_trading_day(end)
+        cur_cn = self._now().astimezone(CN_TZ)
+        end = cur_cn.date()
+        expected_prev_today = self._expected_official_min_date(cur_cn)
         start = end - timedelta(days=14)
         params = {
             "SHOWTYPE": "JSON",
@@ -1559,8 +1646,17 @@ class AShareCollector:
         unique = {r["code"]: r for r in representatives}
         codes = set(unique)
         now = time.time()
+        cur_cn = self._now().astimezone(CN_TZ)
+        expected_min_day = self._expected_official_min_date(cur_cn).isoformat()
         eff_ttl = min(OFFICIAL_SHARE_TTL, 55.0) if self._official_cache.get("error") else OFFICIAL_SHARE_TTL
-        fresh = now - self._official_cache["ts"] < eff_ttl
+        cached_fresh = now - self._official_cache["ts"] < eff_ttl
+        if cached_fresh and self._official_cache.get("error") is None:
+            for c in codes:
+                pair = self._official_cache["data"].get(c)
+                if not pair or not pair[0] or str(pair[0][0]) < expected_min_day:
+                    cached_fresh = False
+                    break
+        fresh = cached_fresh
         if not fresh or not codes.issubset(self._official_cache["codes"]):
             pairs: dict[str, tuple[Any, Any]] = {}
             sse_codes = [c for c in codes if c.startswith(("5", "6"))]
@@ -1587,10 +1683,17 @@ class AShareCollector:
                 if szse_errs:
                     errs.append(f"深交所官方份额拉取失败 ({len(szse_errs)} 只，如 {szse_errs[0]})")
 
+            stale_codes = sorted(
+                c
+                for c, p in pairs.items()
+                if p and p[0] and str(p[0][0]) < expected_min_day
+            )
+            if stale_codes:
+                errs.append(f"官方份额最新日期过期(< {expected_min_day}): {', '.join(stale_codes[:5])}")
             complete_pairs = {
                 c: p
                 for c, p in pairs.items()
-                if p and p[0] and p[1] and str(p[0][0]) != str(p[1][0])
+                if p and p[0] and p[1] and str(p[0][0]) != str(p[1][0]) and str(p[0][0]) >= expected_min_day
             }
             missing_codes = sorted(c for c in codes if c not in complete_pairs)
             if missing_codes and not errs:
@@ -1758,7 +1861,7 @@ class AShareCollector:
             self.official_share_changes(all_reps + leaders) if (all_reps or leaders) else ({}, None)
         )
         official_dates: list[str] = []
-        current_day = self._now().astimezone(CN_TZ).date().isoformat()
+        current_day = self._target_cn_trade_date().isoformat()
         for row in directions:
             confirmations = []
             for rep in row["representatives"]:
@@ -2031,11 +2134,16 @@ class AShareCollector:
             for k in ASHARE_REQUIRED_PUBLISH_SOURCES
         )
 
+        target_trade_date = (
+            session["trade_date"]
+            if session.get("calendar_error")
+            else resolve_market_trade_date("cn", now=cur).isoformat()
+        )
         snapshot = {
             "as_of": now_full,
             "as_of_iso": cur.isoformat(timespec="seconds"),
             "tz": "北京时间",
-            "trade_date": session["trade_date"],
+            "trade_date": target_trade_date,
             "is_trading_day": session["is_trading_day"],
             "windows": session.get("windows") or [],
             "trading": session["in_trading_window"],

@@ -26,7 +26,7 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Iterable
 import warnings
 
 import pandas as pd
@@ -37,13 +37,13 @@ from scripts.dalton.monitor_feeds.common import (
     SourceStatusStore,
     atomic_write_json,
     format_source_statuses,
-    is_trading_day,
     last_trading_day_of_month,
     load_json_safe,
     make_source_result,
     market_session_state,
     now_hk,
     previous_trading_day,
+    resolve_market_trade_date,
     resolve_state_dir,
 )
 from scripts.dalton.monitor_feeds.hk_momentum.fetch_data import (
@@ -66,9 +66,22 @@ def load_panel(
     state_dir: Path,
     *,
     required_codes: set[str] | None = None,
+    universe_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    uni_all = pd.read_csv(state_dir / "universe.csv", dtype={"code": str})
-    uni = uni_all[uni_all["price"].notna()].set_index("code")
+    uni_csv = state_dir / "universe.csv"
+    if universe_df is not None:
+        uni_all = universe_df.copy()
+    elif uni_csv.is_file():
+        uni_all = pd.read_csv(uni_csv, dtype={"code": str})
+    else:
+        raise RuntimeError("缺少成分文件 universe.csv（首跑尚未生成成分名单），无法加载行情面板")
+    if "code" not in uni_all.columns or uni_all.empty:
+        raise RuntimeError("港股成分名单为空，无法加载行情面板")
+    uni_all["code"] = uni_all["code"].astype(str).str.strip()
+    if "price" in uni_all.columns:
+        uni = uni_all[uni_all["price"].notna()].set_index("code")
+    else:
+        uni = uni_all.iloc[0:0].set_index("code")
     hist_dir = state_dir / "hist"
     load_codes = list(uni.index)
     if required_codes:
@@ -131,6 +144,8 @@ def momentum_scores(
     uni: pd.DataFrame,
     t_idx: int,
     ggt_codes: set[str],
+    *,
+    excluded_codes: set[str] | None = None,
 ) -> pd.DataFrame | None:
     if t_idx < 273:
         return None
@@ -149,6 +164,14 @@ def momentum_scores(
     last10 = raw_win.iloc[-10:].notna().sum()
     tv_3m = tv.iloc[: t_idx + 1].iloc[-63:].median()
     listed = raw_win.notna().sum() >= 274
+    uni_excl: set[str] = set()
+    if "excluded" in uni.columns:
+        uni_excl = {
+            str(c).strip().zfill(5)
+            for c in uni.index[uni["excluded"].fillna(False).astype(bool)]
+            if str(c).strip()
+        }
+    all_excl = {str(c).strip().zfill(5) for c in (excluded_codes or ()) if str(c).strip()} | uni_excl
     elig = (
         listed
         & (bars_12m >= 151)
@@ -160,6 +183,8 @@ def momentum_scores(
         & ret6.notna()
         & ret12.notna()
     )
+    if all_excl:
+        elig = elig & (~px_ff.columns.astype(str).str.strip().str.zfill(5).isin(all_excl))
     df = pd.DataFrame(
         {
             "price": p_t,
@@ -174,6 +199,8 @@ def momentum_scores(
     df["mktcap_e8"] = shares_e8.reindex(df.index) * df["price"]
     df["is_ggt"] = df.index.isin(ggt_codes)
     df = df[df["elig"] & df["mktcap_e8"].notna()]
+    if all_excl:
+        df = df[~df.index.astype(str).str.strip().str.zfill(5).isin(all_excl)]
     if len(df) < 20:
         return None
 
@@ -273,6 +300,8 @@ def compute_all(
     freeze_on_stale: bool = True,
     update_last_success: bool = True,
     persist: bool = True,
+    universe_df: pd.DataFrame | None = None,
+    excluded_codes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     st_dir = resolve_state_dir("hk_momentum", state_dir)
     frozen_path = st_dir / "frozen_history.json"
@@ -287,6 +316,7 @@ def compute_all(
         frozen = {}
 
     frozen_rebals: dict[str, dict[str, list[str]]] = frozen.get("rebalance_snapshots") or {}
+    frozen_exclusions: dict[str, Any] = dict(frozen.get("rebalance_exclusions") or {})
     frozen_series_raw: dict[str, Any] = frozen.get("frozen_series") or {}
     held_frozen_codes: set[str] = {
         str(c)
@@ -298,21 +328,71 @@ def compute_all(
         if c
     }
 
-    uni, px, tv = load_panel(st_dir, required_codes=held_frozen_codes)
-    uni_all_df = pd.read_csv(st_dir / "universe.csv", dtype={"code": str})
+    uni_csv = st_dir / "universe.csv"
+    if universe_df is not None:
+        uni_all_df = universe_df.copy()
+        if uni_all_df.empty:
+            raise RuntimeError("首次运行缺少历史 universe.csv 且本次未能获取港交所证券名单，无法计算动量指数")
+    elif uni_csv.is_file():
+        uni_all_df = pd.read_csv(uni_csv, dtype={"code": str})
+        if uni_all_df.empty:
+            raise RuntimeError("成分文件 universe.csv 为空，无法计算动量指数")
+    else:
+        raise RuntimeError("缺少成分文件 universe.csv 且未获取到本次证券名单，无法计算动量指数")
+
+    uni, px, tv = load_panel(
+        st_dir,
+        required_codes=held_frozen_codes,
+        universe_df=uni_all_df,
+    )
     uni_spot_prices: dict[str, Any] = {
-        str(r["code"]): r["price"]
+        str(r["code"]): r.get("price")
         for _, r in uni_all_df.iterrows()
         if pd.notna(r.get("code"))
     }
-    ggt_raw = load_json_safe(st_dir / "ggt_list.json", {}) or {}
-    ggt_codes = set(ggt_raw.keys())
+    ggt_json_path = st_dir / "ggt_list.json"
+    ggt_raw = load_json_safe(ggt_json_path, {}) or {}
+    if ggt_raw:
+        ggt_codes = set(ggt_raw.keys())
+    elif "is_ggt" in uni_all_df.columns:
+        ggt_codes = set(
+            uni_all_df.loc[uni_all_df["is_ggt"].fillna(False).astype(bool), "code"].astype(str)
+        )
+    else:
+        ggt_codes = set()
+    uni_meta = load_json_safe(st_dir / "universe_meta.json", {}) or {}
+    excl_set: set[str] = {
+        str(c).strip().zfill(5) for c in (excluded_codes or ()) if str(c).strip()
+    }
+    if "excluded" in uni_all_df.columns:
+        excl_set.update(
+            str(c).strip().zfill(5)
+            for c in uni_all_df.loc[uni_all_df["excluded"].fillna(False).astype(bool), "code"]
+            if pd.notna(c) and str(c).strip()
+        )
+    if isinstance(uni_meta, dict):
+        for k_excl in ("excluded_codes", "ggt_skipped_codes"):
+            raw_excl = uni_meta.get(k_excl)
+            if isinstance(raw_excl, list):
+                excl_set.update(str(c).strip().zfill(5) for c in raw_excl if str(c).strip())
+    excluded_sorted = sorted(excl_set)
+    excluded_reason = (
+        (uni_meta.get("ggt_skipped_note") if isinstance(uni_meta, dict) else None)
+        or (f"身份未确认排除 {len(excluded_sorted)} 只" if excluded_sorted else None)
+    )
     px_ff = px.ffill()
     dates = list(px.index)
     if not dates:
+        if uni.empty and not held_frozen_codes:
+            raise RuntimeError("港股有效现货报价成分为空（可能非交易时段或现货行情失败），无法计算动量指数")
         raise RuntimeError("港股日线面板为空，无法计算动量指数")
 
-    ref_date = as_of_date or now_hk().astimezone(HK_TZ).date()
+    target_day = resolve_market_trade_date(
+        "hk",
+        now=now_hk() if as_of_date is None else None,
+        as_of_date=as_of_date,
+    )
+    ref_date = target_day
     mes = [d for d in month_ends(dates, as_of_date=ref_date) if dates.index(d) >= 273]
     if not mes:
         raise RuntimeError("有效历史交易日不足（需满 274 个交易日及至少 1 个完整月末调仓日）")
@@ -342,27 +422,43 @@ def compute_all(
                 rebal_info[key].append({"date": d, "pool": None, "n": len(codes), "frozen": True})
             continue
 
-        scores = momentum_scores(px_ff, px, tv, uni, t_idx, ggt_codes)
+        scores = momentum_scores(
+            px_ff, px, tv, uni, t_idx, ggt_codes, excluded_codes=excl_set
+        )
         if scores is None:
             rebal_incomplete = True
             continue
         rebal_pos.append(t_idx)
         frozen_rebals[d] = {}
+        if excluded_sorted:
+            frozen_exclusions[d] = {
+                "codes": excluded_sorted,
+                "reason": excluded_reason,
+            }
         for key, filt in idx_defs.items():
             pool = filt(scores)
             top = pool.nlargest(min(TOP_N, len(pool)), "score")
-            codes = list(top.index)
+            codes = [c for c in list(top.index) if str(c).strip().zfill(5) not in excl_set]
             if not codes:
                 rebal_incomplete = True
             selections[key].append(codes)
             frozen_rebals[d][key] = codes
-            rebal_info[key].append({"date": d, "pool": int(len(pool)), "n": int(len(top)), "frozen": False})
+            rebal_entry: dict[str, Any] = {
+                "date": d,
+                "pool": int(len(pool)),
+                "n": int(len(codes)),
+                "frozen": False,
+            }
+            if excluded_sorted:
+                rebal_entry["excluded_count"] = len(excluded_sorted)
+                rebal_entry["excluded_codes"] = excluded_sorted
+                rebal_entry["excluded_reason"] = excluded_reason
+            rebal_info[key].append(rebal_entry)
 
     if not rebal_pos:
         raise RuntimeError("没有满足动量选股条件的调仓日（候选池为空或样本不足）")
 
     # Determine expected target trading day & verify raw un-ffilled coverage before freezing.
-    target_day = ref_date if is_trading_day("hk", ref_date) else previous_trading_day("hk", ref_date)
     target_str = target_day.isoformat()
     raw_px_dates = set(str(d) for d in px.index)
     px_latest_date = str(px.index[-1])
@@ -522,7 +618,9 @@ def compute_all(
     history_stale_reasons: list[str] = comp_reasons + hsi_reasons
     history_stale = bool(history_stale_reasons)
 
-    last_scores = momentum_scores(px_ff, px, tv, uni, len(dates) - 1, ggt_codes)
+    last_scores = momentum_scores(
+        px_ff, px, tv, uni, len(dates) - 1, ggt_codes, excluded_codes=excl_set
+    )
     cons: dict[str, list[dict[str, Any]]] = {}
     for key in idx_defs:
         codes = selections[key][-1]
@@ -608,6 +706,10 @@ def compute_all(
         "froze": bool(persist and should_persist),
         "ok": completeness_ok,
         "last_success_at": resolved_last_success,
+        "excluded_codes": excluded_sorted,
+        "excluded_reason": excluded_reason,
+        "ggt_skipped_invalid": int(uni_meta.get("ggt_skipped_invalid") or 0) if isinstance(uni_meta, dict) else 0,
+        "ggt_skipped_note": uni_meta.get("ggt_skipped_note") if isinstance(uni_meta, dict) else None,
         "source_statuses": compute_statuses,
         "params": {
             "top_n": TOP_N,
@@ -617,11 +719,13 @@ def compute_all(
             "min_price": MIN_PRICE,
         },
     }
-    frozen_payload = {
+    frozen_payload: dict[str, Any] = {
         "launch_date": launch_date,
         "rebalance_snapshots": frozen_rebals,
         "frozen_series": out,
     }
+    if frozen_exclusions:
+        frozen_payload["rebalance_exclusions"] = frozen_exclusions
     result: dict[str, Any] = {
         "series": out,
         "constituents": cons,
@@ -857,12 +961,11 @@ def compute_intraday_snapshot(
             make_source_result("hsi_spot", ok=False, stale=True, reason=pre_msg, label="恒指实时报价"),
         )
 
-    today_hkt = cur.date().isoformat()
-    series_last = str(series["dates"][-1])
-    series_has_today = series_last == today_hkt
-    expected_prev_td = previous_trading_day("hk", cur.date()).isoformat()
-    daily_series_lagging = (not series_has_today) and (series_last < expected_prev_td)
     expected_q_date = _expected_hk_trade_date(cur, sess_state)
+    series_last = str(series["dates"][-1])
+    series_has_target = series_last == expected_q_date
+    expected_prev_td = previous_trading_day("hk", cur.date()).isoformat()
+    daily_series_lagging = (not series_has_target) and (series_last < expected_prev_td)
 
     codes = sorted({c["code"] for k in ("smallcap", "nonggt") for c in (cons.get(k) or [])})
     spot, spot_errs = fetch_spot_batch(codes, session=session)
@@ -878,7 +981,11 @@ def compute_intraday_snapshot(
         stale_reasons.append(lag_msg)
         spot_reasons.append(lag_msg)
 
-    out: dict[str, Any] = {**base_meta, "daily_close_date": series_last}
+    out: dict[str, Any] = {
+        **base_meta,
+        "target_trade_date": expected_q_date,
+        "daily_close_date": series_last,
+    }
 
     any_index_stale = daily_series_lagging
     for key in ("smallcap", "nonggt"):
@@ -892,18 +999,21 @@ def compute_intraday_snapshot(
         missing_codes = [c for c in members if c not in fresh_quotes]
         coverage = (len(fresh_quotes) / n_expected) if n_expected else 0.0
 
-        if series_has_today and len(series[key]) >= 2:
+        if series_has_target and len(series[key]) >= 1:
             key_spot_bad = n_expected > 0 and coverage < 0.5
             if key_spot_bad:
                 any_index_stale = True
                 cov_msg = f"{key} 有效当日报价不足 ({len(fresh_quotes)}/{n_expected}，期望日期 {expected_q_date})"
                 stale_reasons.append(cov_msg)
                 spot_reasons.append(cov_msg)
-            lvl, prev_lvl = series[key][-1], series[key][-2]
+            lvl = series[key][-1]
+            prev_lvl = series[key][-2] if len(series[key]) >= 2 else None
+            pct_val = round((lvl / prev_lvl - 1.0) * 100.0, 2) if prev_lvl else None
             out[key] = {
                 "level": lvl,
-                "pct": round((lvl / prev_lvl - 1.0) * 100.0, 2) if prev_lvl else 0.0,
-                "prev_close_level": prev_lvl,
+                "pct": pct_val,
+                "prev_close_level": prev_lvl if prev_lvl is not None else lvl,
+                "close_date": series_last,
                 "n_quoted": len(fresh_quotes),
                 "n_expected": n_expected,
                 "missing_codes": missing_codes,
@@ -935,6 +1045,7 @@ def compute_intraday_snapshot(
             "level": round(last_close * (1.0 + chg), 2),
             "pct": round(chg * 100.0, 2),
             "prev_close_level": last_close,
+            "close_date": expected_q_date,
             "n_quoted": len(fresh_quotes),
             "n_expected": n_expected,
             "missing_codes": missing_codes,
@@ -946,7 +1057,12 @@ def compute_intraday_snapshot(
     hsi_q_date = _extract_quote_date((hsi_spot or {}).get("ts"))
     hsi_reason: str | None = None
     if hsi_spot and hsi_q_date == expected_q_date:
-        out["hsi"] = {"value": hsi_spot["value"], "pct": hsi_spot["pct"], "stale": False}
+        out["hsi"] = {
+            "value": hsi_spot["value"],
+            "pct": hsi_spot["pct"],
+            "close_date": hsi_q_date,
+            "stale": False,
+        }
     else:
         any_index_stale = True
         hsi_reason = (
