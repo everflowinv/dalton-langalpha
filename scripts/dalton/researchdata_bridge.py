@@ -44,6 +44,8 @@ import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from collections import deque
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1252,8 +1254,29 @@ class BridgeConfig:
                 / "quant_unwind_signals.csv"
             )
         )
+        # Global concurrency ceiling across both interactive and automation calls
+        # (default raised 2 -> 6 so 4 interactive + 2 automation fit concurrently).
+        # Note: `automation_reserved` (default 2) is carved out of `max_inflight`
+        # (`interactive_cap = max_inflight - min(automation_reserved, max_inflight - 1)`),
+        # so deployments pinning DALTON_BRIDGE_MAX_INFLIGHT=2 drop interactive cap to 1.
         self.max_inflight: int = max(
-            1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "2"))
+            1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT", "6"))
+        )
+        self.max_inflight_per_caller: int = max(
+            1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT_PER_CALLER", "2"))
+        )
+        # During the transition period after caller-token signing rolls out, all
+        # unsigned/legacy clients share one `unsigned` bucket capped here so
+        # they cannot bypass per-caller limits via peer IP or starve signed
+        # workspaces; automation-reserved slots remain unaffected.
+        self.max_inflight_unsigned: int = max(
+            1, int(os.environ.get("DALTON_BRIDGE_MAX_INFLIGHT_UNSIGNED", "1"))
+        )
+        self.automation_reserved: int = max(
+            0, int(os.environ.get("DALTON_BRIDGE_AUTOMATION_RESERVED", "2"))
+        )
+        self.fanout_grace_s: float = max(
+            0.0, float(os.environ.get("DALTON_BRIDGE_FANOUT_GRACE_S", "20"))
         )
         self.embed_max_inflight: int = max(
             1, int(os.environ.get("DALTON_BRIDGE_EMBED_MAX_INFLIGHT", "2"))
@@ -7335,6 +7358,465 @@ class _CachedSearchTimeoutError(asyncio.TimeoutError):
         self.date_to = date_to
 
 
+class _CallerBucket:
+    __slots__ = (
+        "caller_key",
+        "display_key",
+        "inflight_slots",
+        "active",
+        "waiting",
+        "auto_waiters",
+        "inter_waiters",
+    )
+
+    def __init__(self, caller_key: str, display_key: str) -> None:
+        self.caller_key = caller_key
+        self.display_key = display_key
+        self.inflight_slots: int = 0
+        self.active: int = 0
+        self.waiting: int = 0
+        self.auto_waiters: deque[asyncio.Future[None]] = deque()
+        self.inter_waiters: deque[asyncio.Future[None]] = deque()
+
+
+_CALLER_TOKEN_HKDF_INFO = b"dalton-bridge-caller-v1"
+
+
+def _derive_caller_hmac_key(admin_token: str) -> bytes | None:
+    secret = str(admin_token or "").strip()
+    if not secret:
+        return None
+    # RFC 5869 HKDF-SHA256 with HashLen zero-byte salt and domain-separated info.
+    prk = hmac.new(b"\x00" * 32, secret.encode("utf-8"), hashlib.sha256).digest()
+    return hmac.new(prk, _CALLER_TOKEN_HKDF_INFO + b"\x01", hashlib.sha256).digest()
+
+
+def _b64url_decode_strict(segment: str) -> bytes:
+    padded = segment + ("=" * (-len(segment) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _clean_caller_claim(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if any(ch in text for ch in "\r\n\t "):
+        return ""
+    return text
+
+
+def verify_caller_token(
+    token: str,
+    admin_token: str,
+    *,
+    now_ts: float | None = None,
+) -> dict[str, str] | None:
+    """Verify HMAC-SHA256 signature and ``exp`` on an opaque caller token.
+
+    Returns ``{user, workspace, thread, run_origin}`` on success, else ``None``.
+    Any encoding, decoding, or format error degrades cleanly to ``None``.
+    """
+    try:
+        hmac_key = _derive_caller_hmac_key(admin_token)
+        if hmac_key is None:
+            return None
+        raw = str(token or "").strip()
+        parts = raw.split(".")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        payload_b64, sig_b64 = parts[0], parts[1]
+        payload_ascii = payload_b64.encode("ascii")
+        supplied_sig = _b64url_decode_strict(sig_b64)
+        expected_sig = hmac.new(
+            hmac_key, payload_ascii, hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(supplied_sig, expected_sig):
+            return None
+        claims = json.loads(_b64url_decode_strict(payload_b64).decode("utf-8"))
+        if not isinstance(claims, dict):
+            return None
+        exp = claims.get("exp")
+        if (
+            not isinstance(exp, (int, float))
+            or isinstance(exp, bool)
+            or not math.isfinite(exp)
+        ):
+            return None
+        now = float(now_ts) if now_ts is not None else time.time()
+        if now > float(exp):
+            return None
+        raw_origin = _clean_caller_claim(claims.get("run_origin")).lower()
+        return {
+            "user": _clean_caller_claim(claims.get("user")),
+            "workspace": _clean_caller_claim(claims.get("workspace")),
+            "thread": _clean_caller_claim(claims.get("thread")),
+            "run_origin": "automation" if raw_origin == "automation" else "",
+        }
+    except Exception:
+        return None
+
+
+def _resolve_caller_routing(
+    caller_identity: Mapping[str, Any] | None,
+    *,
+    conn_id: str = "",
+    fallback_conn_id: str = "",
+) -> tuple[str, str, bool]:
+    """Return ``(caller_key, redacted_display_key, is_automation)``.
+
+    During the transition period after caller-token signing rolls out, all
+    unsigned calls (legacy clients without a valid token or anonymous calls)
+    share the single ``unsigned`` bucket and are always treated as interactive,
+    leaving automation-reserved slots unaffected.
+    """
+    ci = caller_identity if isinstance(caller_identity, Mapping) else {}
+    verified = ci.get("_caller_verified")
+    unverified_http = verified is False
+    workspace = "" if unverified_http else str(ci.get("workspace") or "").strip()
+    user = "" if unverified_http else str(ci.get("user") or "").strip()
+
+    if workspace:
+        caller_key = f"ws:{workspace}"
+        prefix = _log_redaction.clean_log_field(workspace[:8], max_len=8) or "-"
+        display_key = f"ws:{prefix}"
+    elif user:
+        caller_key = f"user:{user}"
+        prefix = _log_redaction.clean_log_field(user[:8], max_len=8) or "-"
+        display_key = f"user:{prefix}"
+    else:
+        return "unsigned", "unsigned", False
+
+    if unverified_http:
+        return "unsigned", "unsigned", False
+    run_origin = str(ci.get("run_origin") or "").strip().lower()
+    is_automation = run_origin == "automation"
+    return caller_key, display_key, is_automation
+
+
+class _FairConcurrencyLimiter:
+    """Two-tier fair concurrency limiter: per-caller queues feeding a priority-reserved global pool."""
+
+    def __init__(
+        self,
+        *,
+        max_inflight: int,
+        max_inflight_per_caller: int,
+        automation_reserved: int,
+        max_inflight_unsigned: int = 1,
+    ) -> None:
+        self.max_inflight = max(1, int(max_inflight))
+        self.max_inflight_per_caller = max(1, int(max_inflight_per_caller))
+        self.max_inflight_unsigned = max(1, int(max_inflight_unsigned))
+        self.automation_reserved = max(0, int(automation_reserved))
+        self._global_inflight: int = 0
+        self._interactive_inflight: int = 0
+        self._global_waiting: int = 0
+        self._global_auto_waiters: deque[asyncio.Future[None]] = deque()
+        self._global_inter_waiters: deque[asyncio.Future[None]] = deque()
+        self._callers: dict[str, _CallerBucket] = {}
+
+    @property
+    def effective_reserved(self) -> int:
+        # Leave at least 1 slot for interactive calls when max_inflight is small (e.g. 1 or 2).
+        return min(self.automation_reserved, max(0, self.max_inflight - 1))
+
+    @property
+    def interactive_cap(self) -> int:
+        return self.max_inflight - self.effective_reserved
+
+    def _get_or_create_bucket(self, caller_key: str, display_key: str) -> _CallerBucket:
+        bucket = self._callers.get(caller_key)
+        if bucket is None:
+            bucket = _CallerBucket(caller_key=caller_key, display_key=display_key)
+            self._callers[caller_key] = bucket
+        return bucket
+
+    def _maybe_gc_bucket(self, caller_key: str) -> None:
+        bucket = self._callers.get(caller_key)
+        if (
+            bucket is not None
+            and bucket.inflight_slots == 0
+            and bucket.active == 0
+            and bucket.waiting == 0
+            and not bucket.auto_waiters
+            and not bucket.inter_waiters
+        ):
+            self._callers.pop(caller_key, None)
+
+    @staticmethod
+    def _pop_live_waiter(queue: deque[asyncio.Future[None]]) -> asyncio.Future[None] | None:
+        while queue:
+            fut = queue.popleft()
+            if not fut.done():
+                return fut
+        return None
+
+    def _caller_limit(self, caller_key: str) -> int:
+        if caller_key == "unsigned":
+            return self.max_inflight_unsigned
+        return self.max_inflight_per_caller
+
+    async def _acquire_caller_slot(
+        self,
+        caller_key: str,
+        display_key: str,
+        *,
+        is_automation: bool,
+        timeout_s: float | None = None,
+    ) -> _CallerBucket:
+        bucket = self._get_or_create_bucket(caller_key, display_key)
+        if (
+            bucket.inflight_slots < self._caller_limit(caller_key)
+            and not bucket.auto_waiters
+            and not bucket.inter_waiters
+        ):
+            bucket.inflight_slots += 1
+            return bucket
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        wait_q = bucket.auto_waiters if is_automation else bucket.inter_waiters
+        wait_q.append(fut)
+        bucket.waiting += 1
+        acquired = False
+        try:
+            if timeout_s is not None:
+                await asyncio.wait_for(fut, timeout=max(0.0, timeout_s))
+            else:
+                await fut
+            acquired = True
+            return bucket
+        finally:
+            bucket.waiting -= 1
+            if not acquired:
+                try:
+                    wait_q.remove(fut)
+                except ValueError:
+                    pass
+                if fut.done() and not fut.cancelled():
+                    self._release_caller_slot(caller_key)
+                else:
+                    self._maybe_gc_bucket(caller_key)
+
+    def _release_caller_slot(self, caller_key: str) -> None:
+        bucket = self._callers.get(caller_key)
+        if bucket is None:
+            return
+        nxt = self._pop_live_waiter(bucket.auto_waiters) or self._pop_live_waiter(
+            bucket.inter_waiters
+        )
+        if nxt is not None:
+            nxt.set_result(None)
+            return
+        bucket.inflight_slots = max(0, bucket.inflight_slots - 1)
+        self._maybe_gc_bucket(caller_key)
+
+    async def _acquire_global_slot(
+        self,
+        *,
+        is_automation: bool,
+        bucket: _CallerBucket | None = None,
+        timeout_s: float | None = None,
+    ) -> None:
+        if is_automation:
+            can_enter = (
+                self._global_inflight < self.max_inflight
+                and not self._global_auto_waiters
+            )
+        else:
+            can_enter = (
+                self._interactive_inflight < self.interactive_cap
+                and self._global_inflight < self.max_inflight
+                and not self._global_auto_waiters
+                and not self._global_inter_waiters
+            )
+        if can_enter:
+            self._global_inflight += 1
+            if not is_automation:
+                self._interactive_inflight += 1
+            return
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        wait_q = self._global_auto_waiters if is_automation else self._global_inter_waiters
+        wait_q.append(fut)
+        self._global_waiting += 1
+        if bucket is not None:
+            bucket.waiting += 1
+        acquired = False
+        try:
+            if timeout_s is not None:
+                await asyncio.wait_for(fut, timeout=max(0.0, timeout_s))
+            else:
+                await fut
+            acquired = True
+        finally:
+            self._global_waiting -= 1
+            if bucket is not None:
+                bucket.waiting -= 1
+                self._maybe_gc_bucket(bucket.caller_key)
+            if not acquired:
+                try:
+                    wait_q.remove(fut)
+                except ValueError:
+                    pass
+                if fut.done() and not fut.cancelled():
+                    self._release_global_slot(is_automation=is_automation)
+
+    def _release_global_slot(self, *, is_automation: bool = False) -> None:
+        new_global = max(0, self._global_inflight - 1)
+        new_inter = (
+            self._interactive_inflight
+            if is_automation
+            else max(0, self._interactive_inflight - 1)
+        )
+        if new_global < self.max_inflight:
+            nxt_auto = self._pop_live_waiter(self._global_auto_waiters)
+            if nxt_auto is not None:
+                self._global_inflight = new_global + 1
+                self._interactive_inflight = new_inter
+                nxt_auto.set_result(None)
+                return
+        if new_global < self.max_inflight and new_inter < self.interactive_cap:
+            nxt_inter = self._pop_live_waiter(self._global_inter_waiters)
+            if nxt_inter is not None:
+                self._global_inflight = new_global + 1
+                self._interactive_inflight = new_inter + 1
+                nxt_inter.set_result(None)
+                return
+        self._global_inflight = new_global
+        self._interactive_inflight = new_inter
+
+    @asynccontextmanager
+    async def acquire_call(
+        self,
+        caller_key: str,
+        display_key: str,
+        *,
+        is_automation: bool,
+        timeout_s: float | None = None,
+        stats: dict[str, int] | None = None,
+    ):
+        t_q0 = time.monotonic()
+        caller_acquired = False
+        global_acquired = False
+        active_marked = False
+        bucket: _CallerBucket | None = None
+        try:
+            bucket = await self._acquire_caller_slot(
+                caller_key,
+                display_key,
+                is_automation=is_automation,
+                timeout_s=timeout_s,
+            )
+            caller_acquired = True
+            rem_timeout = (
+                max(0.0, timeout_s - (time.monotonic() - t_q0))
+                if timeout_s is not None
+                else None
+            )
+            await self._acquire_global_slot(
+                is_automation=is_automation,
+                bucket=bucket,
+                timeout_s=rem_timeout,
+            )
+            global_acquired = True
+            bucket.active += 1
+            active_marked = True
+            if stats is not None:
+                stats["queued_ms"] = int((time.monotonic() - t_q0) * 1000)
+            yield bucket
+        finally:
+            if stats is not None and "queued_ms" not in stats:
+                stats["queued_ms"] = int((time.monotonic() - t_q0) * 1000)
+            if active_marked and bucket is not None:
+                bucket.active = max(0, bucket.active - 1)
+            if global_acquired:
+                self._release_global_slot(is_automation=is_automation)
+            if caller_acquired:
+                self._release_caller_slot(caller_key)
+
+    @asynccontextmanager
+    async def acquire_caller(
+        self,
+        caller_key: str,
+        display_key: str,
+        *,
+        is_automation: bool,
+        timeout_s: float | None = None,
+        stats: dict[str, int] | None = None,
+    ):
+        t_q0 = time.monotonic()
+        caller_acquired = False
+        active_marked = False
+        bucket: _CallerBucket | None = None
+        try:
+            bucket = await self._acquire_caller_slot(
+                caller_key,
+                display_key,
+                is_automation=is_automation,
+                timeout_s=timeout_s,
+            )
+            caller_acquired = True
+            bucket.active += 1
+            active_marked = True
+            if stats is not None:
+                stats["queued_ms"] = int((time.monotonic() - t_q0) * 1000)
+            yield bucket
+        finally:
+            if stats is not None and "queued_ms" not in stats:
+                stats["queued_ms"] = int((time.monotonic() - t_q0) * 1000)
+            if active_marked and bucket is not None:
+                bucket.active = max(0, bucket.active - 1)
+            if caller_acquired:
+                self._release_caller_slot(caller_key)
+
+    @asynccontextmanager
+    async def acquire_global(
+        self,
+        *,
+        is_automation: bool,
+        bucket: _CallerBucket | None = None,
+        timeout_s: float | None = None,
+        stats: dict[str, int] | None = None,
+    ):
+        t_q0 = time.monotonic()
+        global_acquired = False
+        try:
+            await self._acquire_global_slot(
+                is_automation=is_automation,
+                bucket=bucket,
+                timeout_s=timeout_s,
+            )
+            global_acquired = True
+            if stats is not None:
+                stats["queued_ms"] = int((time.monotonic() - t_q0) * 1000)
+            yield
+        finally:
+            if stats is not None and "queued_ms" not in stats:
+                stats["queued_ms"] = int((time.monotonic() - t_q0) * 1000)
+            if global_acquired:
+                self._release_global_slot(is_automation=is_automation)
+
+    def status_snapshot(self) -> dict[str, Any]:
+        callers: dict[str, dict[str, int]] = {}
+        total_queued = 0
+        for bucket in self._callers.values():
+            if bucket.active <= 0 and bucket.waiting <= 0:
+                continue
+            entry = callers.setdefault(bucket.display_key, {"inflight": 0, "queued": 0})
+            entry["inflight"] += bucket.active
+            entry["queued"] += bucket.waiting
+            total_queued += bucket.waiting
+        return {
+            "global_inflight": self._global_inflight,
+            "global_queued": self._global_waiting,
+            "total_queued": total_queued,
+            "effective_automation_reserved": self.effective_reserved,
+            "callers": callers,
+        }
+
+
 class ResearchDataBridge:
     """HTTP-to-stdio MCP bridge for OpenClaw `researchdata`.
 
@@ -7356,10 +7838,16 @@ class ResearchDataBridge:
 
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
-        self.sem = asyncio.Semaphore(cfg.max_inflight)
+        self._concurrency = _FairConcurrencyLimiter(
+            max_inflight=cfg.max_inflight,
+            max_inflight_per_caller=getattr(cfg, "max_inflight_per_caller", 2),
+            automation_reserved=getattr(cfg, "automation_reserved", 2),
+            max_inflight_unsigned=getattr(cfg, "max_inflight_unsigned", 1),
+        )
         # Serializes formal company-wiki writes (see `handle_wiki_ingest`).
         self._wiki_write_lock = asyncio.Lock()
         self.embed_sem = asyncio.Semaphore(cfg.embed_max_inflight)
+        # Community routes use dedicated per-route semaphores below instead of `_concurrency`.
         self.community_sems: dict[str, asyncio.Semaphore] = {
             r: asyncio.Semaphore(limit)
             for r, limit in COMMUNITY_ROUTE_CONCURRENCY.items()
@@ -7392,11 +7880,19 @@ class ResearchDataBridge:
         self._discord_sleep: Any = asyncio.sleep
         self._alphaengine_cache: _ae_cache.AlphaEngineSearchCache | None = None
         self._inflight_searches: dict[str, dict[str, Any]] = {}
+        self._singleflight_runners: dict[int, dict[str, Any]] = {}
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
                 "all admin endpoints (/embed, /jobs/*) will reject requests (fail closed)"
             )
+        logger.info(
+            "Concurrency policy: unsigned callers share bucket 'unsigned' "
+            "(max_inflight_unsigned=%d, interactive-only during legacy-client transition "
+            "after caller-token signing; automation_reserved=%d unaffected)",
+            self._concurrency.max_inflight_unsigned,
+            self._concurrency.automation_reserved,
+        )
 
     def handoff_routes(self) -> set[str]:
         """Return route IDs whose `kind` is `agent_tool` or `skill` in `data_sources.json`, excluding bridge-executed community routes."""
@@ -8102,20 +8598,75 @@ class ResearchDataBridge:
             self._inflight_searches = inflight
         return inflight
 
+    def _get_singleflight_runners(self) -> dict[int, dict[str, Any]]:
+        runners = getattr(self, "_singleflight_runners", None)
+        if runners is None:
+            runners = {}
+            self._singleflight_runners = runners
+        return runners
+
+    def _count_orphan_upstream(self) -> int:
+        runners = getattr(self, "_singleflight_runners", None)
+        if not isinstance(runners, dict):
+            return 0
+        count = 0
+        for entry in list(runners.values()):
+            if not isinstance(entry, dict):
+                continue
+            runner = entry.get("runner_task")
+            waiters = entry.get("waiters")
+            if (
+                isinstance(runner, asyncio.Task)
+                and not runner.done()
+                and not waiters
+            ):
+                count += 1
+        return count
+
+    def verify_caller_token(
+        self, token: str, *, now_ts: float | None = None
+    ) -> dict[str, str] | None:
+        cfg = getattr(self, "cfg", None)
+        admin_token = str(getattr(cfg, "admin_token", "") or "").strip()
+        return verify_caller_token(token, admin_token, now_ts=now_ts)
+
+    def _get_concurrency(self) -> _FairConcurrencyLimiter:
+        limiter = getattr(self, "_concurrency", None)
+        if limiter is None:
+            cfg = getattr(self, "cfg", None)
+            limiter = _FairConcurrencyLimiter(
+                max_inflight=int(getattr(cfg, "max_inflight", 6) or 6),
+                max_inflight_per_caller=int(
+                    getattr(cfg, "max_inflight_per_caller", 2) or 2
+                ),
+                automation_reserved=int(
+                    getattr(cfg, "automation_reserved", 2)
+                    if getattr(cfg, "automation_reserved", None) is not None
+                    else 2
+                ),
+                max_inflight_unsigned=int(
+                    getattr(cfg, "max_inflight_unsigned", 1) or 1
+                ),
+            )
+            self._concurrency = limiter
+        return limiter
+
     async def close(self) -> None:
         """Cancel and await any pending shared AlphaEngine search tasks on shutdown."""
         inflight = getattr(self, "_inflight_searches", None)
-        tasks: list[asyncio.Task[Any]] = []
-        if isinstance(inflight, dict):
-            for entry in list(inflight.values()):
-                if isinstance(entry, dict):
-                    t = entry.get("runner_task")
-                    if isinstance(t, asyncio.Task) and not t.done():
-                        t.cancel()
-                        tasks.append(t)
-            inflight.clear()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        runners = getattr(self, "_singleflight_runners", None)
+        tasks_by_id: dict[int, asyncio.Task[Any]] = {}
+        for store in (inflight, runners):
+            if isinstance(store, dict):
+                for entry in list(store.values()):
+                    if isinstance(entry, dict):
+                        t = entry.get("runner_task")
+                        if isinstance(t, asyncio.Task) and not t.done():
+                            t.cancel()
+                            tasks_by_id[id(t)] = t
+                store.clear()
+        if tasks_by_id:
+            await asyncio.gather(*tasks_by_id.values(), return_exceptions=True)
 
     @staticmethod
     def _parse_alphaengine_or_transcript_response(
@@ -8241,6 +8792,12 @@ class ResearchDataBridge:
         upstream_arguments: dict[str, Any],
         timeout_s: float,
         on_upstream_start: Callable[[], None] | None = None,
+        caller_key: str = "conn:anon",
+        caller_display: str = "conn:anon",
+        is_automation: bool = False,
+        acquire_caller_slot: bool = True,
+        caller_bucket: _CallerBucket | None = None,
+        queue_stats: dict[str, int] | None = None,
     ) -> list[dict[str, Any]]:
         rpc_req = {
             "jsonrpc": "2.0",
@@ -8250,12 +8807,30 @@ class ResearchDataBridge:
         }
         resolve_delay = getattr(self.cfg, "resolve_test_delay_s", None)
         test_delay_s = float(resolve_delay()) if callable(resolve_delay) else 0.0
-        async with self.sem:
-            t0 = time.monotonic()
+        limiter = self._get_concurrency()
+        slot_cm = (
+            limiter.acquire_call(
+                caller_key,
+                caller_display,
+                is_automation=is_automation,
+                timeout_s=float(timeout_s),
+                stats=queue_stats,
+            )
+            if acquire_caller_slot
+            else limiter.acquire_global(
+                is_automation=is_automation,
+                bucket=caller_bucket,
+                timeout_s=float(timeout_s),
+                stats=queue_stats,
+            )
+        )
+        t0 = time.monotonic()
+        async with slot_cm:
             if test_delay_s > 0.0:
+                rem_delay = max(0.1, float(timeout_s) - (time.monotonic() - t0))
                 await asyncio.wait_for(
                     asyncio.sleep(test_delay_s),
-                    timeout=float(timeout_s),
+                    timeout=rem_delay,
                 )
             remaining_s = max(5.0, float(timeout_s) - (time.monotonic() - t0))
             if on_upstream_start is not None:
@@ -8273,9 +8848,27 @@ class ResearchDataBridge:
         shared_timeout_s: float,
         fanout: bool = False,
         cancel_ctx: dict[str, Any] | None = None,
+        caller_key: str | None = None,
+        caller_display: str | None = None,
+        is_automation: bool | None = None,
+        acquire_caller_slot: bool = True,
+        caller_bucket: _CallerBucket | None = None,
+        queue_stats: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Shared exact-cache + singleflight + quota-fallback executor for direct `alphaengine.search_library`, `route='all'` fan-out, and `route='transcript'`."""
-        caller_user = str((caller_identity or {}).get("user") or "").strip()
+        ci = caller_identity if isinstance(caller_identity, Mapping) else {}
+        caller_user = (
+            ""
+            if ci.get("_caller_verified") is False
+            else str(ci.get("user") or "").strip()
+        )
+        resolved_key, resolved_display, resolved_auto = _resolve_caller_routing(
+            caller_identity,
+            fallback_conn_id=f"req-{req_id}" if req_id is not None else "anon",
+        )
+        eff_caller_key = caller_key if caller_key is not None else resolved_key
+        eff_caller_display = caller_display if caller_display is not None else resolved_display
+        eff_is_automation = is_automation if is_automation is not None else resolved_auto
         plan = _ae_cache.prepare_alphaengine_search_request(
             arguments,
             op=op,
@@ -8311,6 +8904,12 @@ class ResearchDataBridge:
                     upstream_arguments=plan.upstream_arguments,
                     timeout_s=timeout_s,
                     on_upstream_start=_mark_started,
+                    caller_key=eff_caller_key,
+                    caller_display=eff_caller_display,
+                    is_automation=eff_is_automation,
+                    acquire_caller_slot=acquire_caller_slot,
+                    caller_bucket=caller_bucket,
+                    queue_stats=queue_stats,
                 )
                 parsed = self._parse_alphaengine_or_transcript_response(resps, op=plan.op)
             except asyncio.TimeoutError:
@@ -8553,7 +9152,24 @@ class ResearchDataBridge:
         # 2. All cacheable requests (including `fresh` and degraded DB) join/register
         #    inside `inflight` BEFORE reading cache so read -> upstream -> write is atomic per key.
         inflight = self._get_inflight_searches()
+        runners = self._get_singleflight_runners()
         inflight_key = f"{plan.cache_key}#fresh" if plan.fresh else plan.cache_key
+
+        async def _cancel_runner_if_unawaited(target_entry: dict[str, Any]) -> None:
+            if target_entry.get("waiters"):
+                return
+            if inflight.get(inflight_key) is target_entry:
+                inflight.pop(inflight_key, None)
+            runner = target_entry.get("runner_task")
+            if isinstance(runner, asyncio.Task) and not runner.done():
+                runner.cancel()
+                while not runner.done():
+                    try:
+                        await asyncio.shield(runner)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        break
 
         async def _await_existing_flight(existing_entry: dict[str, Any]) -> dict[str, Any]:
             wait_bc = {
@@ -8562,11 +9178,14 @@ class ResearchDataBridge:
                 "age_seconds": None,
                 "expires_at": None,
             }
+            waiter_id = object()
+            existing_entry.setdefault("waiters", set()).add(waiter_id)
             try:
                 shared_res = await asyncio.wait_for(
                     asyncio.shield(existing_entry["result_future"]), timeout=caller_timeout_s
                 )
             except asyncio.CancelledError:
+                existing_entry["waiters"].discard(waiter_id)
                 if cancel_ctx is not None:
                     fut = existing_entry["result_future"]
                     c_status = "coalesced"
@@ -8588,14 +9207,18 @@ class ResearchDataBridge:
                             "date_to": plan.date_to,
                         }
                     )
+                await _cancel_runner_if_unawaited(existing_entry)
                 raise
             except asyncio.TimeoutError as exc:
+                existing_entry["waiters"].discard(waiter_id)
                 raise _CachedSearchTimeoutError(
                     bridge_cache=wait_bc,
                     upstream_called=False,
                     date_from=plan.date_from,
                     date_to=plan.date_to,
                 ) from exc
+            finally:
+                existing_entry["waiters"].discard(waiter_id)
             bc = dict(shared_res["bridge_cache"])
             if shared_res.get("from_cache"):
                 bc["status"] = "hit"
@@ -8710,12 +9333,16 @@ class ResearchDataBridge:
             finally:
                 if inflight.get(inflight_key) is entry:
                     inflight.pop(inflight_key, None)
+                runners.pop(id(entry), None)
 
+        leader_waiter_id = object()
         runner_task = asyncio.create_task(_leader_runner())
         entry: dict[str, Any] = {
             "result_future": result_future,
             "runner_task": runner_task,
+            "waiters": {leader_waiter_id},
         }
+        runners[id(entry)] = entry
         inflight[inflight_key] = entry
 
         leader_timeout_bc = {
@@ -8729,6 +9356,7 @@ class ResearchDataBridge:
                 asyncio.shield(result_future), timeout=caller_timeout_s
             )
         except asyncio.CancelledError:
+            entry["waiters"].discard(leader_waiter_id)
             if cancel_ctx is not None:
                 cancel_ctx.update(
                     {
@@ -8742,14 +9370,18 @@ class ResearchDataBridge:
                         "date_to": plan.date_to,
                     }
                 )
+            await _cancel_runner_if_unawaited(entry)
             raise
         except asyncio.TimeoutError as exc:
+            entry["waiters"].discard(leader_waiter_id)
             raise _CachedSearchTimeoutError(
                 bridge_cache=leader_timeout_bc,
                 upstream_called=bool(call_state["upstream_started"]),
                 date_from=plan.date_from,
                 date_to=plan.date_to,
             ) from exc
+        finally:
+            entry["waiters"].discard(leader_waiter_id)
         if shared_res["error_kind"] == "timeout" and not fanout:
             raise _CachedSearchTimeoutError(
                 bridge_cache=dict(shared_res["bridge_cache"]),
@@ -8777,6 +9409,11 @@ class ResearchDataBridge:
         caller_identity: dict[str, str] | None = None,
         limit_clamped: list[int] | None = None,
         cancel_ctx: dict[str, Any] | None = None,
+        caller_key: str | None = None,
+        caller_display: str | None = None,
+        is_automation: bool | None = None,
+        caller_bucket: _CallerBucket | None = None,
+        queue_stats: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Run the parallel `route='alphaengine'` search via the shared cache layer and normalize its result or failure state."""
         ae_timeout = int(ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S)
@@ -8791,6 +9428,12 @@ class ResearchDataBridge:
                 shared_timeout_s=shared_budget_s,
                 fanout=True,
                 cancel_ctx=cancel_ctx,
+                caller_key=caller_key,
+                caller_display=caller_display,
+                is_automation=is_automation,
+                acquire_caller_slot=True,
+                caller_bucket=caller_bucket,
+                queue_stats=queue_stats,
             )
         except _CachedSearchTimeoutError as exc:
             reason = f"alphaengine timed out after {ae_timeout}s"
@@ -8953,7 +9596,16 @@ class ResearchDataBridge:
         return out_outcome
 
     async def _run_guidepoint_fanout(
-        self, req_id: Any, gp_args: dict[str, Any], gp_budget_s: float
+        self,
+        req_id: Any,
+        gp_args: dict[str, Any],
+        gp_budget_s: float,
+        *,
+        caller_key: str = "unsigned",
+        caller_display: str = "unsigned",
+        is_automation: bool = False,
+        caller_bucket: _CallerBucket | None = None,
+        queue_stats: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Run the parallel `route='guidepoint'` search and normalize its result or failure state."""
         gp_query_str = str(gp_args.get("query") or "")
@@ -8976,7 +9628,13 @@ class ResearchDataBridge:
         }
         gp_t0 = time.monotonic()
         try:
-            async with self.sem:
+            async with self._get_concurrency().acquire_call(
+                caller_key,
+                caller_display,
+                is_automation=is_automation,
+                timeout_s=float(gp_budget_s),
+                stats=queue_stats,
+            ):
                 remaining_s = max(5.0, float(gp_budget_s) - (time.monotonic() - gp_t0))
                 gp_resps = await self._run_stdio_rpc(
                     [gp_rpc_req], timeout_s=remaining_s
@@ -11119,6 +11777,8 @@ class ResearchDataBridge:
         route: str,
         arguments: dict[str, Any],
         eff_timeout: int,
+        *,
+        caller_display: str = "conn:anon",
     ) -> dict[str, Any]:
         """Execute a bridge community route (`xueqiu`/`employee`/`last30days`/`x-timeline`) directly via subprocess without shell."""
         operation = str(arguments.get("operation") or "").strip()
@@ -11268,17 +11928,22 @@ class ResearchDataBridge:
                 }
                 return _finish_comm(missing_payload, is_error=True)
 
-            route_sem = self.community_sems.get(route) or self.sem
+            route_sem = self.community_sems[route]
             t0 = time.monotonic()
             deadline = t0 + float(eff_timeout)
             test_delay_s = self.cfg.resolve_test_delay_s()
             subproc_env = self._build_community_subprocess_env()
+            queued_ms = 0
 
             try:
                 wait_for_sem_s = deadline - time.monotonic()
                 if wait_for_sem_s <= 0:
                     raise asyncio.TimeoutError()
-                await asyncio.wait_for(route_sem.acquire(), timeout=wait_for_sem_s)
+                t_q0 = time.monotonic()
+                try:
+                    await asyncio.wait_for(route_sem.acquire(), timeout=wait_for_sem_s)
+                finally:
+                    queued_ms = int((time.monotonic() - t_q0) * 1000)
                 try:
                     if test_delay_s > 0.0:
                         rem_before_delay = deadline - time.monotonic()
@@ -11315,11 +11980,13 @@ class ResearchDataBridge:
             except asyncio.TimeoutError:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 logger.warning(
-                    "community tools/call timeout route=%s op=%s timeout_s=%d elapsed_ms=%d",
+                    "community tools/call timeout route=%s op=%s timeout_s=%d elapsed_ms=%d queued_ms=%d caller=%s",
                     route,
                     operation,
                     eff_timeout,
                     elapsed_ms,
+                    queued_ms,
+                    caller_display,
                 )
                 timeout_msg = f"researchdata_bridge timed out after {eff_timeout}s on community/{route}"
                 timeout_payload = {
@@ -11623,11 +12290,13 @@ class ResearchDataBridge:
             ):
                 enriched["warnings"] = list(parsed["warnings"])
             logger.info(
-                "tools/call tool=community route=%s op=%s status=ok declared_sources=%d elapsed_ms=%d",
+                "tools/call tool=community route=%s op=%s status=ok declared_sources=%d elapsed_ms=%d queued_ms=%d caller=%s",
                 route,
                 operation or "-",
                 len(declared),
                 elapsed_ms,
+                queued_ms,
+                caller_display,
             )
             return self._make_tool_result_response(req_id, enriched, is_error=False)
         finally:
@@ -12069,6 +12738,7 @@ class ResearchDataBridge:
         params: dict[str, Any],
         *,
         caller_identity: dict[str, str] | None = None,
+        conn_id: str | None = None,
     ) -> dict[str, Any]:
         """Serve one JSON-RPC ``tools/call``.
 
@@ -12092,6 +12762,26 @@ class ResearchDataBridge:
         corr_id = uuid.uuid4().hex[:12]
         _current_corr_id.set(corr_id)
         stdio_attempts = 0
+        if isinstance(caller_identity, Mapping) and "token" in caller_identity:
+            verified_direct = self.verify_caller_token(
+                str(caller_identity.get("token") or "")
+            )
+            caller_identity = (
+                {**verified_direct, "_caller_verified": True}
+                if verified_direct is not None
+                else {
+                    "user": "",
+                    "workspace": "",
+                    "thread": "",
+                    "run_origin": "",
+                    "_caller_verified": False,
+                }
+            )
+        caller_key, caller_display, is_automation = _resolve_caller_routing(
+            caller_identity,
+            conn_id=conn_id or "",
+            fallback_conn_id=f"direct-{corr_id}",
+        )
 
         handoff = self.handoff_routes()
         if validation_err is not None:
@@ -12209,7 +12899,11 @@ class ResearchDataBridge:
                 )
                 return self._make_tool_result_response(req_id, err_payload, is_error=True)
             return await self._handle_community_call(
-                req_id, route, arguments, eff_timeout
+                req_id,
+                route,
+                arguments,
+                eff_timeout,
+                caller_display=caller_display,
             )
         if tool_name == "research" and route == "tmeet":
             return await self._handle_tmeet_call(req_id, arguments, eff_timeout)
@@ -12435,6 +13129,7 @@ class ResearchDataBridge:
         direct_cancel_ctx: dict[str, Any] = {}
         fanout_ae_cancel_ctx: dict[str, Any] = {}
         ae_task: asyncio.Task[dict[str, Any]] | None = None
+        call_queue_stats: dict[str, int] = {}
         try:
             if is_cached_direct:
                 cached_op = (
@@ -12459,6 +13154,11 @@ class ResearchDataBridge:
                     shared_timeout_s=shared_budget_s,
                     fanout=False,
                     cancel_ctx=direct_cancel_ctx,
+                    caller_key=caller_key,
+                    caller_display=caller_display,
+                    is_automation=is_automation,
+                    acquire_caller_slot=True,
+                    queue_stats=call_queue_stats,
                 )
                 direct_cache_meta = dict(cached_res.get("bridge_cache") or {})
                 direct_upstream_called = bool(cached_res.get("upstream_called"))
@@ -12524,8 +13224,13 @@ class ResearchDataBridge:
                         }
                     ]
             elif ae_args is not None and gp_args is not None:
-                # Cache lookup, singleflight waiting, and fanout coordination run
-                # outside `self.sem` so waiting callers never hold semaphore slots.
+                # Each fan-out leg that reaches an upstream acquires a caller-attributed
+                # global slot via `acquire_call` so excess legs queue in their caller's
+                # own queue without occupying global slots or global wait positions.
+                limiter = self._get_concurrency()
+                local_q_stats: dict[str, int] = {}
+                ae_q_stats: dict[str, int] = {}
+                gp_q_stats: dict[str, int] = {}
                 ae_timeout = int(
                     ae_args.get("timeout") or FANOUT_ALPHAENGINE_TIMEOUT_S
                 )
@@ -12534,6 +13239,43 @@ class ResearchDataBridge:
                     gp_args.get("timeout") or FANOUT_GUIDEPOINT_TIMEOUT_S
                 )
                 gp_budget_s = max(5.0, float(gp_timeout) + 5.0)
+                grace_s = float(getattr(self.cfg, "fanout_grace_s", 20.0))
+                grace_label = (
+                    str(int(grace_s))
+                    if grace_s == int(grace_s)
+                    else f"{grace_s:.1f}"
+                )
+
+                async def _run_local_all() -> list[dict[str, Any]]:
+                    nonlocal stdio_attempts
+                    async with limiter.acquire_call(
+                        caller_key,
+                        caller_display,
+                        is_automation=is_automation,
+                        timeout_s=float(eff_timeout),
+                        stats=local_q_stats,
+                    ):
+                        if test_delay_s > 0.0:
+                            await asyncio.wait_for(
+                                asyncio.sleep(test_delay_s),
+                                timeout=float(eff_timeout),
+                            )
+                        elapsed_so_far = time.monotonic() - t0
+                        remaining_budget_s = max(
+                            5.0, float(eff_timeout) - elapsed_so_far + 5.0
+                        )
+                        rpc_req = {
+                            "jsonrpc": "2.0",
+                            "id": req_id if req_id is not None else 1,
+                            "method": "tools/call",
+                            "params": {"name": tool_name, "arguments": call_args},
+                        }
+                        stdio_attempts += 1
+                        return await self._run_stdio_rpc(
+                            [rpc_req], timeout_s=remaining_budget_s
+                        )
+
+                local_task = asyncio.create_task(_run_local_all())
                 ae_task = asyncio.create_task(
                     self._run_alphaengine_fanout(
                         req_id,
@@ -12542,98 +13284,110 @@ class ResearchDataBridge:
                         caller_identity=caller_identity,
                         limit_clamped=ae_limit_clamped,
                         cancel_ctx=fanout_ae_cancel_ctx,
+                        caller_key=caller_key,
+                        caller_display=caller_display,
+                        is_automation=is_automation,
+                        queue_stats=ae_q_stats,
                     )
                 )
                 gp_task = asyncio.create_task(
-                    self._run_guidepoint_fanout(req_id, gp_args, gp_budget_s)
+                    self._run_guidepoint_fanout(
+                        req_id,
+                        gp_args,
+                        gp_budget_s,
+                        caller_key=caller_key,
+                        caller_display=caller_display,
+                        is_automation=is_automation,
+                        queue_stats=gp_q_stats,
+                    )
                 )
                 try:
-                    try:
-                        async with self.sem:
-                            if test_delay_s > 0.0:
-                                await asyncio.wait_for(
-                                    asyncio.sleep(test_delay_s),
-                                    timeout=float(eff_timeout),
-                                )
-                            elapsed_so_far = time.monotonic() - t0
-                            remaining_budget_s = max(
-                                5.0, float(eff_timeout) - elapsed_so_far + 5.0
+                    grace_deadline: float | None = None
+                    grace_timed_out: set[asyncio.Task[Any]] = set()
+                    pending_all: set[asyncio.Task[Any]] = {
+                        local_task,
+                        ae_task,
+                        gp_task,
+                    }
+                    local_failed_early: BaseException | None = None
+
+                    while pending_all:
+                        if (
+                            local_task.done()
+                            and not local_task.cancelled()
+                            and local_task.exception() is not None
+                            and grace_deadline is None
+                        ):
+                            local_failed_early = local_task.exception()
+                            break
+
+                        # Check whether enough non-skipped sources have returned
+                        # to start the grace countdown for any straggling leg.
+                        if grace_deadline is None:
+                            local_ok_done = (
+                                local_task.done()
+                                and not local_task.cancelled()
+                                and local_task.exception() is None
                             )
-                            rpc_req = {
-                                "jsonrpc": "2.0",
-                                "id": req_id if req_id is not None else 1,
-                                "method": "tools/call",
-                                "params": {"name": tool_name, "arguments": call_args},
-                            }
-                            stdio_attempts += 1
-                            resps = await self._run_stdio_rpc(
-                                [rpc_req], timeout_s=remaining_budget_s
+                            ae_ok_done = (
+                                ae_task.done()
+                                and not ae_task.cancelled()
+                                and ae_task.exception() is None
                             )
-                    except (asyncio.TimeoutError, Exception) as local_exc:
-                        is_local_timeout = isinstance(local_exc, asyncio.TimeoutError)
-                        # Let online calls that are already completing (including SQLite thread hops)
-                        # settle before cancelling genuinely hung legs.
-                        for _ in range(8):
-                            if ae_task.done() and gp_task.done():
-                                break
-                            await asyncio.sleep(0)
-                        pending_legs = [t for t in (ae_task, gp_task) if not t.done()]
-                        if pending_legs:
-                            await asyncio.wait(pending_legs, timeout=0.05)
-                        if not ae_task.done():
-                            ae_task.cancel()
-                        if not gp_task.done():
-                            gp_task.cancel()
-                        raw_ae, raw_gp = await asyncio.gather(
-                            ae_task, gp_task, return_exceptions=True
+                            gp_non_skipped_done = (
+                                gp_task.done()
+                                and not gp_task.cancelled()
+                                and gp_task.exception() is None
+                                and (gp_task.result() or {}).get("status")
+                                != "skipped"
+                            )
+                            ready_count = (
+                                int(local_ok_done)
+                                + int(ae_ok_done)
+                                + int(gp_non_skipped_done)
+                            )
+                            if ready_count >= 2:
+                                grace_deadline = time.monotonic() + grace_s
+
+                        wait_timeout: float | None = (
+                            max(0.0, grace_deadline - time.monotonic())
+                            if grace_deadline is not None
+                            else None
                         )
-                        local_st = "timeout" if is_local_timeout else "failed"
+                        done_now, pending_all = await asyncio.wait(
+                            pending_all,
+                            return_when=asyncio.FIRST_COMPLETED,
+                            timeout=wait_timeout,
+                        )
+                        if not done_now and pending_all and grace_deadline is not None:
+                            grace_timed_out = set(pending_all)
+                            break
+
+                    if local_failed_early is not None:
+                        raise local_failed_early
+
+                    if grace_timed_out:
+                        await _cancel_and_reap(tuple(grace_timed_out))
+
+                    if local_task in grace_timed_out:
                         local_reason = (
-                            f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}"
-                            if is_local_timeout
-                            else (
-                                f"SubprocessExitError(exit_code={local_exc.exit_code})"
-                                if isinstance(local_exc, SubprocessExitError)
-                                else type(local_exc).__name__
-                            )
+                            f"local_all timed out after fanout grace {grace_label}s"
                         )
-                        ae_outcome = (
-                            raw_ae
-                            if isinstance(raw_ae, dict)
-                            else {
-                                "ok": False,
-                                "status": "canceled",
-                                "route": "alphaengine",
-                                "reason": f"canceled after local all {local_st}",
-                                "count": 0,
-                                "results": [],
-                                "raw_payload": None,
-                                "upstream_called": False,
-                            }
+                        logger.warning(
+                            "local_all fanout grace timeout grace_s=%.1f corr=%s",
+                            grace_s,
+                            corr_id,
                         )
-                        gp_outcome = (
-                            raw_gp
-                            if isinstance(raw_gp, dict)
-                            else {
-                                "ok": False,
-                                "status": "canceled",
-                                "route": "guidepoint",
-                                "reason": f"canceled after local all {local_st}",
-                                "count": 0,
-                                "results": [],
-                                "raw_payload": None,
-                            }
-                        )
-                        fallback_payload: dict[str, Any] = {
+                        fallback_local_payload: dict[str, Any] = {
                             "ok": False,
-                            "status": local_st,
+                            "status": "timeout",
                             "error": local_reason,
                             "results": [],
                             "result_count": 0,
                             "source_status": {
                                 "local_all": {
                                     "ok": False,
-                                    "status": local_st,
+                                    "status": "timeout",
                                     "reason": local_reason,
                                     "error": local_reason,
                                     "count": 0,
@@ -12649,29 +13403,195 @@ class ResearchDataBridge:
                                         {
                                             "type": "text",
                                             "text": json.dumps(
-                                                fallback_payload,
+                                                fallback_local_payload,
                                                 ensure_ascii=False,
                                             ),
                                         }
                                     ],
-                                    "structuredContent": dict(fallback_payload),
+                                    "structuredContent": dict(
+                                        fallback_local_payload
+                                    ),
                                     "isError": True,
                                 },
                             }
                         ]
-                    except BaseException:
-                        ae_task.cancel()
-                        gp_task.cancel()
-                        await asyncio.gather(
-                            ae_task, gp_task, return_exceptions=True
-                        )
-                        raise
                     else:
-                        ae_outcome, gp_outcome = await asyncio.gather(ae_task, gp_task)
+                        resps = local_task.result()
+
+                    if ae_task in grace_timed_out:
+                        logger.warning(
+                            "alphaengine fanout grace timeout grace_s=%.1f corr=%s",
+                            grace_s,
+                            corr_id,
+                        )
+                        ae_outcome = {
+                            "ok": False,
+                            "status": "timeout",
+                            "route": "alphaengine",
+                            "reason": f"alphaengine timed out after fanout grace {grace_label}s",
+                            "count": 0,
+                            "results": [],
+                            "raw_payload": None,
+                            "upstream_called": bool(
+                                fanout_ae_cancel_ctx.get("upstream", True)
+                            ),
+                            "_bridge_cache": {
+                                "status": str(
+                                    fanout_ae_cancel_ctx.get("cache") or "miss"
+                                ),
+                                "fetched_at": None,
+                                "age_seconds": None,
+                                "expires_at": None,
+                            },
+                        }
+                    else:
+                        ae_outcome = ae_task.result()
+
+                    if gp_task in grace_timed_out:
+                        logger.warning(
+                            "guidepoint fanout grace timeout grace_s=%.1f corr=%s",
+                            grace_s,
+                            corr_id,
+                        )
+                        gp_outcome = {
+                            "ok": False,
+                            "status": "timeout",
+                            "route": "guidepoint",
+                            "reason": f"guidepoint timed out after fanout grace {grace_label}s",
+                            "count": 0,
+                            "results": [],
+                            "raw_payload": None,
+                        }
+                    else:
+                        gp_outcome = gp_task.result()
+                except (asyncio.TimeoutError, Exception) as local_exc:
+                    is_local_timeout = isinstance(local_exc, asyncio.TimeoutError)
+
+                    async def _settle_legs(legs: tuple[asyncio.Task[Any], ...]) -> None:
+                        for _ in range(8):
+                            if all(leg.done() for leg in legs):
+                                return
+                            await asyncio.sleep(0)
+                        pending_legs = [leg for leg in legs if not leg.done()]
+                        if pending_legs:
+                            await asyncio.wait(pending_legs, timeout=0.05)
+
+                    # Let online calls that are already completing (including SQLite thread hops)
+                    # settle before cancelling genuinely hung legs.
+                    await _settle_legs((ae_task, gp_task))
+                    # Under tight per-caller caps (e.g. max_inflight_unsigned=1), a hung
+                    # slot-holding leg starves a queued sibling that could still complete
+                    # promptly; reap the hung slot holder first and give the queued leg a
+                    # brief settle window before cancelling it too.
+                    hung_slot_legs = tuple(
+                        leg
+                        for leg, q_stats in (
+                            (ae_task, ae_q_stats),
+                            (gp_task, gp_q_stats),
+                        )
+                        if not leg.done() and "queued_ms" in q_stats
+                    )
+                    queued_legs = tuple(
+                        leg
+                        for leg, q_stats in (
+                            (ae_task, ae_q_stats),
+                            (gp_task, gp_q_stats),
+                        )
+                        if not leg.done() and "queued_ms" not in q_stats
+                    )
+                    if hung_slot_legs and queued_legs:
+                        await _cancel_and_reap(hung_slot_legs)
+                        await _settle_legs(queued_legs)
+                    if not ae_task.done():
+                        ae_task.cancel()
+                    if not gp_task.done():
+                        gp_task.cancel()
+                    raw_ae, raw_gp = await asyncio.gather(
+                        ae_task, gp_task, return_exceptions=True
+                    )
+                    local_st = "timeout" if is_local_timeout else "failed"
+                    local_reason = (
+                        f"researchdata_bridge timed out after {eff_timeout}s on {tool_name}/{route}"
+                        if is_local_timeout
+                        else (
+                            f"SubprocessExitError(exit_code={local_exc.exit_code})"
+                            if isinstance(local_exc, SubprocessExitError)
+                            else type(local_exc).__name__
+                        )
+                    )
+                    ae_outcome = (
+                        raw_ae
+                        if isinstance(raw_ae, dict)
+                        else {
+                            "ok": False,
+                            "status": "canceled",
+                            "route": "alphaengine",
+                            "reason": f"canceled after local all {local_st}",
+                            "count": 0,
+                            "results": [],
+                            "raw_payload": None,
+                            "upstream_called": False,
+                        }
+                    )
+                    gp_outcome = (
+                        raw_gp
+                        if isinstance(raw_gp, dict)
+                        else {
+                            "ok": False,
+                            "status": "canceled",
+                            "route": "guidepoint",
+                            "reason": f"canceled after local all {local_st}",
+                            "count": 0,
+                            "results": [],
+                            "raw_payload": None,
+                        }
+                    )
+                    fallback_payload: dict[str, Any] = {
+                        "ok": False,
+                        "status": local_st,
+                        "error": local_reason,
+                        "results": [],
+                        "result_count": 0,
+                        "source_status": {
+                            "local_all": {
+                                "ok": False,
+                                "status": local_st,
+                                "reason": local_reason,
+                                "error": local_reason,
+                                "count": 0,
+                            }
+                        },
+                    }
+                    resps = [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id if req_id is not None else 1,
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": json.dumps(
+                                            fallback_payload,
+                                            ensure_ascii=False,
+                                        ),
+                                    }
+                                ],
+                                "structuredContent": dict(fallback_payload),
+                                "isError": True,
+                            },
+                        }
+                    ]
                 finally:
                     # Whatever ends the fan-out (an error, a cancel mid-handler), no online
                     # subprocess outlives the call: cancel what is still running and reap it.
-                    await _cancel_and_reap((ae_task, gp_task))
+                    try:
+                        await _cancel_and_reap((local_task, ae_task, gp_task))
+                    finally:
+                        call_queue_stats["queued_ms"] = max(
+                            int(local_q_stats.get("queued_ms") or 0),
+                            int(ae_q_stats.get("queued_ms") or 0),
+                            int(gp_q_stats.get("queued_ms") or 0),
+                        )
                 if isinstance(ae_outcome, dict):
                     pw = ae_outcome.pop("_persist_wait", None)
                     if isinstance(pw, asyncio.Task) and not pw.done():
@@ -12684,11 +13604,20 @@ class ResearchDataBridge:
                         ae_outcome["_bridge_cache"]["status"] = "bypass"
                         ae_outcome["_bridge_cache"]["expires_at"] = None
             else:
-                async with self.sem:
+                async with self._get_concurrency().acquire_call(
+                    caller_key,
+                    caller_display,
+                    is_automation=is_automation,
+                    timeout_s=float(eff_timeout),
+                    stats=call_queue_stats,
+                ):
                     if test_delay_s > 0.0:
+                        rem_delay = max(
+                            0.1, float(eff_timeout) - (time.monotonic() - t0)
+                        )
                         await asyncio.wait_for(
                             asyncio.sleep(test_delay_s),
-                            timeout=float(eff_timeout),
+                            timeout=rem_delay,
                         )
                     elapsed_so_far = time.monotonic() - t0
                     remaining_budget_s = max(
@@ -12852,8 +13781,9 @@ class ResearchDataBridge:
                 )
                 if timeout_ctx:
                     timeout_sec_suffix, timeout_sec_args = _sec_ctx_log_suffix(timeout_ctx)
+            queued_ms = int(call_queue_stats.get("queued_ms") or 0)
             logger.warning(
-                "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d"
+                "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d queued_ms=%d caller=%s"
                 + timeout_sec_suffix,
                 corr_id,
                 tool_name,
@@ -12861,6 +13791,8 @@ class ResearchDataBridge:
                 operation,
                 eff_timeout,
                 elapsed_ms,
+                queued_ms,
+                caller_display,
                 *timeout_sec_args,
             )
             timeout_payload: dict[str, Any] = {
@@ -13372,8 +14304,9 @@ class ResearchDataBridge:
         sec_ctx_args: tuple[str, ...] = ()
         if sec_ctx and route == "sec":
             sec_ctx_suffix, sec_ctx_args = _sec_ctx_log_suffix(sec_ctx)
+        queued_ms = int(call_queue_stats.get("queued_ms") or 0)
         logger.info(
-            "tools/call corr=%s tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d"
+            "tools/call corr=%s tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d queued_ms=%d caller=%s"
             + sec_ctx_suffix
             + error_log_suffix,
             corr_id,
@@ -13384,6 +14317,8 @@ class ResearchDataBridge:
             _log_redaction.clean_log_field(status_str, max_len=32),
             declared_count,
             elapsed_ms,
+            queued_ms,
+            caller_display,
             *sec_ctx_args,
             *error_log_args,
         )
@@ -24286,11 +25221,21 @@ async def _handle_client(
                         type(exc).__name__,
                         getattr(exc, "exit_code", None),
                     )
+            conc_snap = bridge._get_concurrency().status_snapshot()
             health_payload = {
                 "ok": True,
                 "status": "ok",
                 "server_version": bridge.server_version,
                 "max_inflight": bridge.cfg.max_inflight,
+                "max_inflight_per_caller": getattr(bridge.cfg, "max_inflight_per_caller", 2),
+                "max_inflight_unsigned": getattr(bridge.cfg, "max_inflight_unsigned", 1),
+                "automation_reserved": getattr(bridge.cfg, "automation_reserved", 2),
+                "fanout_grace_s": getattr(bridge.cfg, "fanout_grace_s", 20.0),
+                "inflight": conc_snap["global_inflight"],
+                "queued": conc_snap["total_queued"],
+                "global_queued": conc_snap["global_queued"],
+                "orphan_upstream": bridge._count_orphan_upstream(),
+                "callers": conc_snap["callers"],
                 "embed_max_inflight": bridge.cfg.embed_max_inflight,
                 "embed_max_bytes": bridge.cfg.embed_max_bytes,
                 "caller_budget_s": bridge.cfg.caller_budget_s,
@@ -24402,26 +25347,54 @@ async def _handle_client(
                 return
 
             if rpc_method == "tools/call":
-                # Only trust X-Dalton-User/-Workspace/-Thread headers when
-                # stamped per-request (`X-Dalton-Caller-Scope: per-request`),
-                # so legacy daemons/clients that read starter-process
-                # `DALTON_CALLER_*` env record empty identity rather than
-                # misattributing subsequent callers.
+                # Only trust caller identity from a verified HMAC-SHA256 signed
+                # `X-Dalton-Caller-Token` (scoped per-request); unsigned headers
+                # or failed/expired tokens never grant workspace/user buckets
+                # or automation priority.
                 has_per_request_scope = (
                     headers.get("x-dalton-caller-scope", "").strip().lower()
                     == "per-request"
                 )
-                caller_identity = (
-                    {
-                        "user": headers.get("x-dalton-user", "").strip(),
-                        "workspace": headers.get("x-dalton-workspace", "").strip(),
-                        "thread": headers.get("x-dalton-thread", "").strip(),
-                    }
+                supplied_caller_token = (
+                    headers.get("x-dalton-caller-token", "").strip()
                     if has_per_request_scope
-                    else {"user": "", "workspace": "", "thread": ""}
+                    else ""
+                )
+                if supplied_caller_token:
+                    verified_claims = bridge.verify_caller_token(supplied_caller_token)
+                    caller_identity = (
+                        {**verified_claims, "_caller_verified": True}
+                        if verified_claims is not None
+                        else {
+                            "user": "",
+                            "workspace": "",
+                            "thread": "",
+                            "run_origin": "",
+                            "_caller_verified": False,
+                        }
+                    )
+                else:
+                    caller_identity = {
+                        "user": "",
+                        "workspace": "",
+                        "thread": "",
+                        "run_origin": "",
+                        "_caller_verified": False,
+                    }
+                peer = writer.get_extra_info("peername")
+                conn_id = (
+                    str(peer[0])
+                    if isinstance(peer, (tuple, list))
+                    and peer
+                    and isinstance(peer[0], str)
+                    and peer[0].strip()
+                    else f"sock-{id(writer)}"
                 )
                 reply = await bridge.handle_tools_call(
-                    req_id, rpc_params, caller_identity=caller_identity
+                    req_id,
+                    rpc_params,
+                    caller_identity=caller_identity,
+                    conn_id=conn_id,
                 )
                 await _send_http(writer, 200, "OK", reply)
                 return

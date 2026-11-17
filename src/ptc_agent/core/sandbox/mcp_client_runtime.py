@@ -2103,10 +2103,11 @@ def _negotiate_http_server(server_name: str, discovery: bool) -> dict:
 
 # DALTON-HOOK(alphaengine-cache): read per-execution DALTON_CALLER_* from the
 # caller's env (never in supervisor daemon) and apply as X-Dalton-* headers on
-# builtin non-relay HTTP calls (accounting only).
+# builtin non-relay HTTP calls (accounting + signed bridge caller routing).
 def _caller_identity_from_env() -> dict[str, str]:
     out: dict[str, str] = {}
     for _env_name, _key in (
+        ("DALTON_CALLER_TOKEN", "token"),
         ("DALTON_CALLER_USER", "user"),
         ("DALTON_CALLER_WORKSPACE", "workspace"),
         ("DALTON_CALLER_THREAD", "thread"),
@@ -2125,6 +2126,7 @@ def _apply_caller_headers(
     out = dict(headers)
     added = False
     for _key, _header in (
+        ("token", "X-Dalton-Caller-Token"),
         ("user", "X-Dalton-User"),
         ("workspace", "X-Dalton-Workspace"),
         ("thread", "X-Dalton-Thread"),
@@ -2545,9 +2547,11 @@ def _start_supervisor(path: str) -> bool:
             "PTC_TURN_CWD",
             "PTC_WORKSPACE_CONFIG",
             "PTC_ALLOWED_SERVERS",
+            "DALTON_CALLER_TOKEN",
             "DALTON_CALLER_USER",
             "DALTON_CALLER_WORKSPACE",
             "DALTON_CALLER_THREAD",
+            "DALTON_CALLER_RUN_ORIGIN",
         )
         env = {k: v for k, v in os.environ.items() if k not in _CALLER_ONLY_ENV}
         existing = env.get("PYTHONPATH") or ""
@@ -2586,7 +2590,7 @@ def _start_supervisor(path: str) -> bool:
 # by `(path, socket stat stamp)` so retries/calls probe at most once per daemon.
 _supervisor_cap_lock = threading.Lock()
 _supervisor_caller_cap_cache: dict[
-    str, tuple[tuple[int, int, int], int | None, bool]
+    str, tuple[tuple[int, int, int], int | None, int]
 ] = {}
 
 
@@ -2598,10 +2602,10 @@ def _supervisor_socket_stamp(path: str) -> tuple[int, int, int] | None:
         return None
 
 
-def _probe_supervisor_caller_capability(
+def _probe_supervisor_caller_level(
     path: str, *, force: bool = False
-) -> bool:
-    """Return True if the live supervisor instance advertises `caller_identity`."""
+) -> int:
+    """Return 2 if supervisor advertises `caller_identity_v2`, 1 for legacy `caller_identity`, else 0."""
     # DALTON-HOOK(alphaengine-cache): probe supervisor health once per daemon
     # instance (keyed by socket inode/mtime); never cache transient probe errors.
     stamp = _supervisor_socket_stamp(path)
@@ -2609,7 +2613,7 @@ def _probe_supervisor_caller_capability(
         with _supervisor_cap_lock:
             cached = _supervisor_caller_cap_cache.get(path)
             if cached is not None and cached[0] == stamp:
-                return cached[2]
+                return int(cached[2])
     try:
         kind, frame = _supervisor_exchange(
             path,
@@ -2618,17 +2622,22 @@ def _probe_supervisor_caller_capability(
     except _SupervisorBroke:
         with _supervisor_cap_lock:
             _supervisor_caller_cap_cache.pop(path, None)
-        return False
+        return 0
     if kind != "result":
         with _supervisor_cap_lock:
             _supervisor_caller_cap_cache.pop(path, None)
-        return False
+        return 0
     data = frame.get("data")
     if not isinstance(data, dict):
         with _supervisor_cap_lock:
             _supervisor_caller_cap_cache.pop(path, None)
-        return False
-    supported = data.get("caller_identity") is True
+        return 0
+    if data.get("caller_identity_v2") is True:
+        level = 2
+    elif data.get("caller_identity") is True:
+        level = 1
+    else:
+        level = 0
     daemon_pid = data.get("pid") if isinstance(data.get("pid"), int) else None
     # Store only when the socket is the same instance before and after the
     # probe; a restart mid-probe would file the old daemon's answer under the
@@ -2636,8 +2645,15 @@ def _probe_supervisor_caller_capability(
     new_stamp = _supervisor_socket_stamp(path)
     if stamp is not None and new_stamp == stamp:
         with _supervisor_cap_lock:
-            _supervisor_caller_cap_cache[path] = (new_stamp, daemon_pid, supported)
-    return supported
+            _supervisor_caller_cap_cache[path] = (new_stamp, daemon_pid, level)
+    return level
+
+
+def _probe_supervisor_caller_capability(
+    path: str, *, force: bool = False
+) -> bool:
+    """Return True if the live supervisor instance advertises `caller_identity`."""
+    return _probe_supervisor_caller_level(path, force=force) >= 1
 
 
 def _socket_alive(path: str) -> bool:
@@ -2723,6 +2739,7 @@ def _supervisor_reply(
         and not cfg.relay_bound
         and not cfg.untrusted
     )
+    need_v2 = is_trusted_http or ("token" in caller_id)
     need_caller_probe = is_trusted_http or (cfg is None and bool(caller_id))
     request = {
         "v": _SUPERVISOR_PROTOCOL_VERSION,
@@ -2738,7 +2755,7 @@ def _supervisor_reply(
     transport_failures = 0
     probed_this_call = False
     probed_stamp: tuple[int, int, int] | None = None
-    supports_caller = False
+    cap_level = 0
     for attempt in range(_SUPERVISOR_RETRY_ATTEMPTS):
         started_here = False
         if not _socket_alive(path):
@@ -2747,8 +2764,9 @@ def _supervisor_reply(
                 return None
             started_here = True
         # DALTON-HOOK(alphaengine-cache): probe capability at most once per
-        # supervisor instance (never repeating on pre-ack retries); bypass legacy
-        # supervisors for trusted HTTP servers so starter-env never leaks.
+        # supervisor instance (never repeating on pre-ack retries); bypass old
+        # supervisors for trusted HTTP servers or signed caller tokens so v2
+        # signed identity falls back to direct HTTP instead of being dropped.
         if need_caller_probe:
             cur_stamp = _supervisor_socket_stamp(path)
             stamp_changed = (
@@ -2757,13 +2775,14 @@ def _supervisor_reply(
                 and cur_stamp != probed_stamp
             )
             if started_here or stamp_changed or not probed_this_call:
-                supports_caller = _probe_supervisor_caller_capability(
+                cap_level = _probe_supervisor_caller_level(
                     path, force=started_here
                 )
                 probed_this_call = True
                 probed_stamp = _supervisor_socket_stamp(path) or cur_stamp
-            if not supports_caller:
-                if is_trusted_http:
+            required_level = 2 if need_v2 else 1
+            if cap_level < required_level:
+                if need_v2:
                     return None
                 request.pop("caller", None)
             elif caller_id:

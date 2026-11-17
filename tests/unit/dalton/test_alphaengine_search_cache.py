@@ -573,6 +573,7 @@ async def test_singleflight_coalescing_no_deadlock_cancel_and_failure(
                         "limit": 5,
                     },
                 },
+                caller_identity={"workspace": f"ws-all-sf-{i}"},
             )
         )
         for i in range(5)
@@ -2447,7 +2448,12 @@ async def test_r4_2_legacy_supervisor_http_bypasses_daemon_env_and_bridge_clears
     assert legacy_calls == []
     assert inproc_callers == [{}]
 
-    # Part B: bridge HTTP handler treats unscoped X-Dalton-User headers as empty identity
+    # Part B: bridge HTTP handler treats unsigned/unscoped X-Dalton-User headers as empty identity
+    # (even when X-Dalton-Caller-Scope: per-request is sent without a signed token), and only
+    # accepts identity from a verified X-Dalton-Caller-Token.
+    from src.dalton.sandbox_caller_identity import sign_caller_token
+    import time as _time
+
     bridge = _make_bridge(tmp_path / "b", monkeypatch)
 
     async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
@@ -2456,10 +2462,20 @@ async def test_r4_2_legacy_supervisor_http_bypasses_daemon_env_and_bridge_clears
 
     monkeypatch.setattr(bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc))
 
+    signed_tok = sign_caller_token(
+        {"user": "alice", "workspace": "ws-a", "thread": "th-a"},
+        exp=int(_time.time()) + 1800,
+        admin_token="r4-2-admin-secret",
+    )
+    assert signed_tok
+
     for idx, extra_hdr in enumerate((
         {},  # legacy daemon/client sending X-Dalton-User without X-Dalton-Caller-Scope
-        {"X-Dalton-Caller-Scope": "per-request"},
+        {"X-Dalton-Caller-Scope": "per-request"},  # unsigned per-request headers also stripped
+        {"X-Dalton-Caller-Scope": "per-request", "X-Dalton-Caller-Token": signed_tok},
     )):
+        if idx == 2:
+            bridge.cfg.admin_token = "r4-2-admin-secret"
         body_bytes = json.dumps({
             "jsonrpc": "2.0",
             "id": f"http-{idx}",
@@ -2486,9 +2502,10 @@ async def test_r4_2_legacy_supervisor_http_bypasses_daemon_env_and_bridge_clears
         await asyncio.wait_for(rb._handle_client(bridge, reader, writer), timeout=5.0)
 
     entries = [json.loads(line) for line in bridge.cfg.alphaengine_usage_file.read_text("utf-8").splitlines() if line.strip()]
-    assert len(entries) == 2
+    assert len(entries) == 3
     assert (entries[0]["user"], entries[0]["workspace"], entries[0]["thread"]) == ("", "", "")
-    assert (entries[1]["user"], entries[1]["workspace"], entries[1]["thread"]) == ("alice", "ws-a", "th-a")
+    assert (entries[1]["user"], entries[1]["workspace"], entries[1]["thread"]) == ("", "", "")
+    assert (entries[2]["user"], entries[2]["workspace"], entries[2]["thread"]) == ("alice", "ws-a", "th-a")
 
 
 def test_r4_3_query_normalization_preserves_case_in_key_and_upstream() -> None:
