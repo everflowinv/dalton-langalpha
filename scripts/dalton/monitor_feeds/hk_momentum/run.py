@@ -198,6 +198,7 @@ def _commit_failure_artifacts(
     return {
         "ok": False,
         "publish_ok": False,
+        "froze": False,
         "output": out_path_str,
         "last_date": fail_meta.get("last_date"),
         "launch_date": fail_meta.get("launch_date"),
@@ -274,7 +275,7 @@ def run_daily_job(
 
     if not skip_fetch:
         try:
-            uni, uni_meta = build_universe(state_dir=st_dir, proxy=proxy)
+            uni, uni_meta = build_universe(state_dir=st_dir, proxy=proxy, as_of_date=ref_day)
             all_results.extend(_extract_universe_statuses(uni_meta))
             codes = list(uni.loc[uni["price"].notna(), "code"]) if "price" in uni else list(uni["code"])
         except Exception as exc:
@@ -391,8 +392,23 @@ def run_daily_job(
                 ]
             )
 
-    # Preview prospective overall status IN MEMORY without touching status.json before HTML renders!
+    # Separate daily status (saved to index_meta.json) from combined daily+intraday status (status.json / HTML).
     render_ok = make_source_result("html_render", ok=True, stale=False, as_of=now_str, label="页面渲染")
+    daily_source_names = (
+        ["hsi_history", "index_compute"]
+        if skip_fetch
+        else ["hkex_universe", "ggt_list", "hk_spot", "hk_history", "hsi_history", "index_compute"]
+    )
+    daily_results = [s for s in all_results if s.name in daily_source_names]
+    daily_doc = status_store.preview_sources(
+        daily_results + [render_ok],
+        required=daily_source_names + ["html_render"],
+        now_str=now_str,
+        extra_overall={"month_end_failed": False},
+    )
+    daily_overall = daily_doc["overall"]
+    daily_clean = bool(daily_overall.get("ok")) and bool(meta.get("completeness_ok", True))
+
     provisional_doc = status_store.preview_sources(
         all_results + [render_ok],
         required=required_names,
@@ -402,10 +418,11 @@ def run_daily_job(
     prov_overall = provisional_doc["overall"]
     meta["month_end_failed"] = False
     meta["last_success_at"] = prov_overall.get("last_success_at")
-    meta["stale"] = bool(prov_overall.get("stale"))
-    meta["stale_reason"] = prov_overall.get("reason")
-    meta["sources"] = provisional_doc["sources"]
-    meta["source_statuses"] = provisional_doc["sources"]
+    meta["daily_last_success_at"] = daily_overall.get("last_success_at")
+    meta["stale"] = not daily_clean
+    meta["stale_reason"] = daily_overall.get("reason")
+    meta["sources"] = daily_doc["sources"]
+    meta["source_statuses"] = daily_doc["sources"]
 
     merged_snap: dict[str, Any] | None = None
     if snap is not None:
@@ -416,9 +433,10 @@ def run_daily_job(
         merged_snap["stale_reason"] = prov_overall.get("reason")
         merged_snap["sources"] = provisional_doc["sources"]
 
-    # Freeze/persist series ONLY when all required sources & render succeed cleanly
+    # Freeze/persist daily series, constituents & frozen_history whenever daily calculation
+    # passed cleanly — independent of realtime snapshot spot status.
     will_freeze = (
-        bool(prov_overall.get("ok"))
+        daily_clean
         and bool(computed.get("can_freeze", bool(meta.get("completeness_ok", True))))
         and (computed.get("frozen_payload") is not None)
     )
@@ -451,12 +469,15 @@ def run_daily_job(
         meta["last_success_at"] = final_overall.get("last_success_at")
         meta["stale"] = True
         meta["stale_reason"] = final_overall.get("reason")
-        meta["sources"] = final_doc["sources"]
-        meta["source_statuses"] = final_doc["sources"]
+        meta["sources"] = {
+            k: v for k, v in final_doc["sources"].items() if k in (daily_source_names + ["html_render"])
+        }
+        meta["source_statuses"] = meta["sources"]
         atomic_write_json(st_dir / "index_meta.json", meta)
         return {
             "ok": False,
             "publish_ok": False,
+            "froze": False,
             "output": str(Path(output_dir) / "index.html"),
             "last_date": meta.get("last_date"),
             "launch_date": meta.get("launch_date"),
@@ -467,10 +488,15 @@ def run_daily_job(
             "sources": final_doc["sources"],
         }
 
-    # Step B: After render succeeds, persist series/frozen (when clean) OR metadata-only,
-    # then write live.json and perform the single final status.json commit.
+    # Step B: After render succeeds, persist series/constituents/frozen when daily is clean,
+    # write live.json with intraday state, and perform the single final status.json commit.
     if will_freeze:
         persist_compute_result(st_dir, computed, meta_override=meta)
+    elif daily_clean:
+        # Mocked/synthetic test path with no frozen_payload: still update series/constituents if present
+        atomic_write_json(st_dir / "index_series.json", computed["series"])
+        atomic_write_json(st_dir / "constituents.json", computed["constituents"])
+        atomic_write_json(st_dir / "index_meta.json", meta)
     else:
         atomic_write_json(st_dir / "index_meta.json", meta)
     if merged_snap is not None:

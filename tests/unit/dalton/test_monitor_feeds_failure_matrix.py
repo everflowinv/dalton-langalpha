@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta
 import json
 import math
 from pathlib import Path
+import signal
+import threading
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
@@ -18,6 +20,7 @@ import requests
 import yfinance as yf
 
 from scripts.dalton.monitor_feeds import common as feeds_common
+from scripts.dalton.monitor_feeds import run_feeds
 from scripts.dalton.monitor_feeds.ashare_monitor import collect as ashare_collect
 from scripts.dalton.monitor_feeds.ashare_monitor import render as ashare_render
 from scripts.dalton.monitor_feeds.ashare_monitor import run as ashare_run
@@ -30,6 +33,25 @@ from scripts.dalton.monitor_feeds.pm_cockpit import render as pm_render
 from scripts.dalton.monitor_feeds.pm_cockpit import run as pm_run
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "monitor_feeds"
+
+
+@pytest.fixture(autouse=True)
+def _per_test_timeout():
+    """Enforce an explicit 20s timeout on every matrix/E2E test."""
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _on_alarm(_signum, _frame):
+        raise TimeoutError("monitor_feeds test exceeded 20s timeout")
+
+    prev_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, 20.0)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, prev_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -133,20 +155,20 @@ def _make_ashare_handlers():
         if "q.stock.sohu.com" in url:
             return sohu_html
         if "query.sse.com.cn" in url:
-            if "STAT_DATE=2026-11-" in url and "STAT_DATE=2026-11-15" not in url:
+            if "STAT_DATE=2026-11-" in url and "STAT_DATE=2026-11-13" not in url:
                 return 'jsonpCallback(' + json.dumps(
                     {
                         "result": [
-                            {"SEC_CODE": "512480", "STAT_DATE": "2026-11-14", "TOT_VOL": "95000"},
-                            {"SEC_CODE": "510300", "STAT_DATE": "2026-11-14", "TOT_VOL": "490000"},
+                            {"SEC_CODE": "512480", "STAT_DATE": "2026-11-12", "TOT_VOL": "95000"},
+                            {"SEC_CODE": "510300", "STAT_DATE": "2026-11-12", "TOT_VOL": "490000"},
                         ]
                     }
                 ) + ')'
             return 'jsonpCallback(' + json.dumps(
                 {
                     "result": [
-                        {"SEC_CODE": "512480", "STAT_DATE": "2026-11-15", "TOT_VOL": "100000"},
-                        {"SEC_CODE": "510300", "STAT_DATE": "2026-11-15", "TOT_VOL": "500000"},
+                        {"SEC_CODE": "512480", "STAT_DATE": "2026-11-13", "TOT_VOL": "100000"},
+                        {"SEC_CODE": "510300", "STAT_DATE": "2026-11-13", "TOT_VOL": "500000"},
                     ]
                 }
             ) + ')'
@@ -252,14 +274,14 @@ def _build_hk_substitute_session(
                 if mode_inject == "exception":
                     raise RuntimeError("SZSE GGT 502")
                 if mode_inject == "empty":
-                    return _resp(json_data=[{"metadata": {"pagecount": 2}, "data": p1_items if not is_p2 else []}])
+                    return _resp(json_data=[{"metadata": {"pagecount": 2, "recordcount": len(ggt_sorted)}, "data": p1_items if not is_p2 else []}])
                 if mode_inject == "partial":
                     bad_p2 = [{"zqdm": "", "zqjc": "坏"}]
-                    return _resp(json_data=[{"metadata": {"pagecount": 2}, "data": p1_items if not is_p2 else bad_p2}])
+                    return _resp(json_data=[{"metadata": {"pagecount": 2, "recordcount": len(ggt_sorted)}, "data": p1_items if not is_p2 else bad_p2}])
                 if mode_inject == "duplicate_or_meta":
                     if not is_p2:
-                        return _resp(json_data=[{"metadata": {}, "data": p1_items}])
-            meta = {"pagecount": 2 if p2_items else 1}
+                        return _resp(json_data=[{"metadata": {"pagecount": 2, "recordcount": len(ggt_sorted) + 5}, "data": p1_items}])
+            meta = {"pagecount": 2 if p2_items else 1, "recordcount": len(ggt_sorted)}
             if is_p2:
                 return _resp(json_data=[{"metadata": meta, "data": p2_items}])
             return _resp(json_data=[{"metadata": meta, "data": p1_items}])
@@ -272,8 +294,8 @@ def _build_hk_substitute_session(
                     raise RuntimeError("QQ hist timeout")
                 if mode_inject == "empty":
                     return _resp(json_data={"data": {f"hk{code}": {"qfqday": []}}})
-                if mode_inject == "partial":
-                    return _resp(json_data={"data": {f"hk{code}": {"qfqday": bar_cache[code][:-1]}}})
+                if mode_inject == "partial" and code == codes[0]:
+                    return _resp(json_data={"data": {f"hk{code}": {"qfqday": [[sessions[-1], "bad"]]}}})
                 if mode_inject == "duplicate_or_meta":
                     dup = bar_cache[code][:-1] + [bar_cache[code][-2]]
                     return _resp(json_data={"data": {f"hk{code}": {"qfqday": dup}}})
@@ -288,6 +310,8 @@ def _build_hk_substitute_session(
                     return _resp(json_data={"data": {"hkHSI": {"day": []}}})
                 if mode_inject == "partial":
                     return _resp(json_data={"data": {"hkHSI": {"day": hsi_rows[:-1]}}})
+                if mode_inject == "duplicate_or_meta":
+                    return _resp(json_data={"data": {"hkHSI": {"day": hsi_rows[:-1] + [hsi_rows[-2]]}}})
             return _resp(json_data={"data": {"hkHSI": {"day": hsi_rows}}})
 
         # 5. GTImg HSI spot
@@ -297,6 +321,8 @@ def _build_hk_substitute_session(
                     raise RuntimeError("HSI spot timeout")
                 if mode_inject == "empty":
                     return _resp(text="")
+                if mode_inject == "partial":
+                    return _resp(text='v_r_hkHSI="bad~fields";')
                 if mode_inject == "duplicate_or_meta":
                     bad_fields = ["0"] * 47
                     bad_fields[1], bad_fields[3], bad_fields[4], bad_fields[30], bad_fields[32] = (
@@ -323,11 +349,12 @@ def _build_hk_substitute_session(
             ts_str = f"{quote_date} 16:08:00"
             if src_inject in ("hk_spot", "hk_intraday_spot") and mode_inject == "duplicate_or_meta":
                 ts_str = "2026/10/01 16:08:00"
+            px_str = "-1.0" if (src_inject == "hk_spot" and mode_inject == "duplicate_or_meta") else "15.0"
             for c in req_codes:
                 idx = int(c) - 1
                 mktcap = 20.0 if idx < 55 else 150.0  # first 55 stay smallcap < 50e8 HKD after drift
                 fields = ["0"] * 47
-                fields[1], fields[3], fields[4] = f"HK{c}", "15.0", "14.8"
+                fields[1], fields[3], fields[4] = f"HK{c}", px_str, "14.8"
                 fields[30], fields[32], fields[37], fields[45] = ts_str, "1.35", "2000", f"{mktcap}"
                 lines.append(f'v_r_hk{c}="{"~".join(fields)}"')
             return _resp(text=";".join(lines))
@@ -622,23 +649,44 @@ def test_pm_cockpit_parametrized_failure_matrix(
     [
         ("indices", "exception", 1, False),
         ("indices", "empty", 1, False),
+        ("indices", "partial", 1, False),
+        ("indices", "duplicate_or_meta", 1, False),
         ("indices", "success", 0, True),
         ("breadth", "exception", 1, False),
         ("breadth", "empty", 1, False),
+        ("breadth", "partial", 1, False),
+        ("breadth", "duplicate_or_meta", 1, False),
+        ("breadth", "success", 0, True),
+        ("turnover", "exception", 1, False),
+        ("turnover", "empty", 1, False),
         ("turnover", "partial", 1, False),
+        ("turnover", "duplicate_or_meta", 1, False),
+        ("turnover", "success", 0, True),
         ("etf_radar", "exception", 0, False),
         ("etf_radar", "empty", 0, False),
+        ("etf_radar", "partial", 0, False),
         ("etf_radar", "duplicate_or_meta", 0, False),
+        ("etf_radar", "success", 0, True),
         ("etf_vratio", "exception", 0, False),
         ("etf_vratio", "empty", 0, False),
+        ("etf_vratio", "partial", 0, False),
+        ("etf_vratio", "duplicate_or_meta", 0, False),
+        ("etf_vratio", "success", 0, True),
         ("industry", "exception", 0, False),
+        ("industry", "empty", 0, False),
         ("industry", "partial", 0, False),
+        ("industry", "duplicate_or_meta", 0, False),
+        ("industry", "success", 0, True),
         ("daily_history", "exception", 0, False),
         ("daily_history", "empty", 0, False),
+        ("daily_history", "partial", 0, False),
+        ("daily_history", "duplicate_or_meta", 0, False),
+        ("daily_history", "success", 0, True),
         ("etf_official_shares", "exception", 0, False),
         ("etf_official_shares", "empty", 0, False),
         ("etf_official_shares", "partial", 0, False),
         ("etf_official_shares", "duplicate_or_meta", 0, False),
+        ("etf_official_shares", "success", 0, True),
         ("html_render", "exception", 1, False),
     ],
 )
@@ -670,23 +718,50 @@ def test_ashare_parametrized_failure_matrix(
 
     prior_ok = "2026-11-16 14:30:00"
     assert json.loads((st_dir / "status.json").read_text(encoding="utf-8"))["overall"]["last_success_at"] == prior_ok
+    prior_snap = json.loads((st_dir / "last_snapshot.json").read_text(encoding="utf-8"))
 
     # 2. Advance clock +1 min and inject fault cleanly
     now_holder["dt"] = t0 + timedelta(minutes=1)
 
     def _fault_get(url: str, **kw) -> str:
+        if mode == "success":
+            return base_get(url, **kw)
         if source == "indices" and "hq.sinajs.cn" in url:
             if mode == "exception":
                 raise RuntimeError("Sina 502")
             if mode == "empty":
                 return ""
-        if source == "turnover" and "hq.sinajs.cn" in url and mode == "partial":
-            return "\n".join(base_get(url, **kw).splitlines()[:-1])  # drop s_sz399106
+            if mode == "partial":
+                # Omit ONLY s_sh000688 (keeps s_sh000001 & s_sz399106!) -> 7/8 incomplete!
+                return "\n".join(line for line in base_get(url, **kw).splitlines() if "s_sh000688" not in line)
+            if mode == "duplicate_or_meta":
+                # Zero/invalid price for s_sh000300
+                return base_get(url, **kw).replace('hq_str_s_sh000300="', 'hq_str_s_sh000300="沪深300,0,0,0,0,0"; // ')
+        if source == "turnover" and "hq.sinajs.cn" in url:
+            if mode == "exception":
+                raise RuntimeError("Sina turnover timeout")
+            if mode == "empty":
+                return "\n".join(
+                    'var hq_str_s_sz399106="";' if "s_sz399106" in line else line
+                    for line in base_get(url, **kw).splitlines()
+                )
+            if mode == "partial":
+                return "\n".join(line for line in base_get(url, **kw).splitlines() if "s_sz399106" not in line)
+            if mode == "duplicate_or_meta":
+                return "\n".join(
+                    'var hq_str_s_sz399106="深证综指,2100.0,10.0,0.48,1000,-1";' if "s_sz399106" in line else line
+                    for line in base_get(url, **kw).splitlines()
+                )
         if source == "daily_history" and "q.stock.sohu.com" in url:
             if mode == "exception":
                 raise RuntimeError("Sohu timeout")
             if mode == "empty":
                 return "<html><body></body></html>"
+            if mode == "partial":
+                # Only header/non-data rows (fewer/missing numeric cells)
+                return "<html><body><table><tr><td>日期</td><td>涨停</td></tr></table></body></html>"
+            if mode == "duplicate_or_meta":
+                return "<html><body><table><tr><td>invalid-date</td><td>bad</td></tr></table></body></html>"
         if source == "etf_official_shares" and "query.sse.com.cn" in url:
             if mode == "exception":
                 raise RuntimeError("SSE 503")
@@ -694,45 +769,72 @@ def test_ashare_parametrized_failure_matrix(
                 return 'jsonpCallback({"result":[]})'
             if mode == "partial":
                 # Omit 510300 while 512480 present -> incomplete representative set!
-                return 'jsonpCallback({"result":[{"SEC_CODE":"512480","STAT_DATE":"2026-11-15","TOT_VOL":"100000"}]})'
+                return 'jsonpCallback({"result":[{"SEC_CODE":"512480","STAT_DATE":"2026-11-13","TOT_VOL":"100000"}]})'
             if mode == "duplicate_or_meta":
-                # Only 2026-11-15 returned even for prior date queries -> lacks previous trading day!
-                return 'jsonpCallback(' + json.dumps({"result": [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-15", "TOT_VOL": "100000"}, {"SEC_CODE": "510300", "STAT_DATE": "2026-11-15", "TOT_VOL": "500000"}]}) + ')'
+                # Only 2026-11-13 returned even for prior date queries -> lacks previous trading day!
+                return 'jsonpCallback(' + json.dumps({"result": [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-13", "TOT_VOL": "100000"}, {"SEC_CODE": "510300", "STAT_DATE": "2026-11-13", "TOT_VOL": "500000"}]}) + ')'
         return base_get(url, **kw)
 
     def _fault_json(url: str, **kw) -> Any:
+        if mode == "success":
+            return base_json(url, **kw)
         if source == "breadth" and "ulist.np/get" in url:
+            base_b = base_json(url, **kw)
             if mode == "exception":
                 raise RuntimeError("Breadth 502")
             if mode == "empty":
                 return {"data": {"diff": []}}
+            if mode == "partial":
+                # Only 2/3 markets returned!
+                return {"data": {"diff": base_b["data"]["diff"][:2]}}
+            if mode == "duplicate_or_meta":
+                # 3 items with duplicate f12 market code!
+                return {"data": {"diff": [{**d, "f12": "000001"} for d in base_b["data"]["diff"]]}}
         if source == "etf_radar" and "MK0021" in url:
+            base_e = base_json(url, **kw)
             if mode == "exception":
                 raise RuntimeError("ETF 502")
             if mode == "empty":
                 return {"data": {"total": 2, "diff": []}}
+            if mode == "partial":
+                return {"data": {"total": 100, "diff": [base_e["data"]["diff"][0]]}}
             if mode == "duplicate_or_meta":
-                return {"data": {"total": None, "diff": [{"f12": "512480", "f13": 1, "f14": "半导体ETF", "f2": 1.05, "f3": 2.4, "f6": 2.5e9, "f20": 3.0e10, "f62": 1.8e8}]}}
+                # len(diff) == total == 2, but duplicate 512480 code!
+                dup_item = base_e["data"]["diff"][0]
+                return {"data": {"total": 2, "diff": [dup_item, dup_item]}}
         if source == "etf_vratio" and "qt/stock/get" in url:
             if mode == "exception":
                 raise RuntimeError("vratio timeout")
             if mode == "empty":
                 return {"data": {"f50": None}}
+            if mode == "partial" and "510300" in url:
+                return {"data": {"f50": None}}
+            if mode == "duplicate_or_meta":
+                return {"data": {"f50": -1.5}}
         if source == "industry" and ("m%3A0" in url or "m:0" in url):
+            base_s = base_json(url, **kw)
             if mode == "exception":
                 raise RuntimeError("Stock scan 502")
+            if mode == "empty":
+                return {"data": {"total": 3, "diff": []}}
             if mode == "partial":
                 if "pn=2" in url:
                     return {"data": {"diff": []}}
                 return {"data": {"total": 150, "diff": [{"f12": "000001", "f14": "平安银行", "f3": 1.1, "f6": 1.5e9, "f62": 0.8e8}]}}
+            if mode == "duplicate_or_meta":
+                # len(diff) == total == 3, but duplicate 000001 code!
+                d0, _, d2 = base_s["data"]["diff"]
+                return {"data": {"total": 3, "diff": [d0, d0, d2]}}
         return base_json(url, **kw)
 
     orig_write = ashare_render.write_ashare_panel
+    rendered_snapshots: list[dict[str, Any]] = []
 
     def _wrapped_write(**kw):
         # status.json MUST NOT have been updated yet before render runs (Req #8)!
         on_disk = json.loads((st_dir / "status.json").read_text(encoding="utf-8"))
         assert on_disk["overall"]["last_success_at"] == prior_ok
+        rendered_snapshots.append(kw["snapshot"])
         if source == "html_render":
             raise RuntimeError("disk full")
         return orig_write(**kw)
@@ -761,6 +863,20 @@ def test_ashare_parametrized_failure_matrix(
         assert sdoc["overall"]["last_success_at"] == prior_ok
         assert sdoc["sources"][source]["last_success_at"] == prior_ok
         if source != "html_render":
+            assert json.loads((st_dir / "last_snapshot.json").read_text(encoding="utf-8")) == prior_snap
+            snap_out = rendered_snapshots[-1]
+            if source == "indices":
+                assert snap_out["indices"] == prior_snap["indices"]
+            elif source == "breadth":
+                assert snap_out["breadth"] == prior_snap["breadth"]
+            elif source == "turnover":
+                assert snap_out["two_market_yi"] == prior_snap["two_market_yi"]
+            elif source == "etf_radar":
+                assert snap_out["etf_radar"] == prior_snap["etf_radar"]
+            elif source == "industry":
+                assert snap_out["industry"] == prior_snap["industry"]
+            elif source == "daily_history":
+                assert snap_out["daily_history"] == prior_snap["daily_history"]
             html_txt = (out_dir / "index.html").read_text(encoding="utf-8")
             assert prior_ok in html_txt
 
@@ -775,14 +891,32 @@ def test_ashare_parametrized_failure_matrix(
     [
         ("hkex_universe", "exception", True, 1, False),
         ("hkex_universe", "empty", True, 1, False),
+        ("hkex_universe", "partial", True, 1, False),
+        ("hkex_universe", "duplicate_or_meta", True, 1, False),
+        ("ggt_list", "exception", True, 1, False),
         ("ggt_list", "empty", True, 1, False),
+        ("ggt_list", "partial", True, 1, False),
         ("ggt_list", "duplicate_or_meta", True, 1, False),
+        ("hk_spot", "exception", False, 1, False),
+        ("hk_spot", "empty", False, 1, False),
+        ("hk_spot", "partial", False, 1, False),
+        ("hk_spot", "duplicate_or_meta", False, 1, False),
+        ("hk_history", "exception", True, 1, False),
+        ("hk_history", "empty", True, 1, False),
         ("hk_history", "partial", True, 1, False),
         ("hk_history", "duplicate_or_meta", True, 1, False),
-        ("hsi_history", "empty", True, 1, False),
         ("hsi_history", "exception", False, 1, False),
-        ("hk_intraday_spot", "exception", False, 0, False),
-        ("hsi_spot", "duplicate_or_meta", False, 0, False),
+        ("hsi_history", "empty", True, 1, False),
+        ("hsi_history", "partial", True, 1, False),
+        ("hsi_history", "duplicate_or_meta", False, 1, False),
+        ("hk_intraday_spot", "exception", False, 0, True),
+        ("hk_intraday_spot", "empty", False, 0, True),
+        ("hk_intraday_spot", "partial", False, 0, True),
+        ("hk_intraday_spot", "duplicate_or_meta", False, 0, True),
+        ("hsi_spot", "exception", False, 0, True),
+        ("hsi_spot", "empty", False, 0, True),
+        ("hsi_spot", "partial", False, 0, True),
+        ("hsi_spot", "duplicate_or_meta", False, 0, True),
         ("html_render", "exception", False, 1, False),
         ("all", "success", False, 0, True),
     ],
@@ -861,6 +995,8 @@ def test_hkmom_parametrized_failure_matrix(
                 return pd.DataFrame(columns=["code", "name", "subcat", "ccy"])
             if mode == "partial":
                 return pd.DataFrame({"code": ["00001"], "name": ["HK1"], "subcat": ["Other"], "ccy": ["HKD"]})
+            if mode == "duplicate_or_meta":
+                return pd.DataFrame({"bad_col": ["00001"]})
         return pd.DataFrame(
             {
                 "code": codes,
@@ -909,14 +1045,25 @@ def test_hkmom_parametrized_failure_matrix(
 
     sdoc = json.loads((st_dir / "status.json").read_text(encoding="utf-8"))
     saved_frozen = json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8"))
-    if expect_freeze:
+    if source == "all":
         assert sdoc["overall"]["ok"] is True
         assert sdoc["overall"]["last_success_at"] != prior_ok
         assert saved_frozen["frozen_series"]["dates"][-1] == target_str
+    elif source in ("hk_intraday_spot", "hsi_spot"):
+        assert expect_freeze is True
+        assert sdoc["overall"]["ok"] is False
+        assert sdoc["overall"]["last_success_at"] == prior_ok
+        assert sdoc["sources"][source]["last_success_at"] == prior_ok
+        assert saved_frozen["frozen_series"]["dates"][-1] == target_str
+        meta_doc = json.loads((st_dir / "index_meta.json").read_text(encoding="utf-8"))
+        assert meta_doc["last_date"] == target_str
+        assert prior_ok in (out_dir / "index.html").read_text(encoding="utf-8")
     else:
         assert sdoc["overall"]["ok"] is False
         assert sdoc["overall"]["last_success_at"] == prior_ok
-        assert saved_frozen == seed_frozen, "Frozen history must NOT be overwritten when any source failed!"
+        if source in sdoc["sources"]:
+            assert sdoc["sources"][source]["last_success_at"] == prior_ok
+        assert saved_frozen == seed_frozen, "Frozen history must NOT be overwritten when any daily source failed!"
         if source != "html_render" and (out_dir / "index.html").is_file():
             assert prior_ok in (out_dir / "index.html").read_text(encoding="utf-8")
 
@@ -1108,3 +1255,701 @@ def test_hkmom_held_constituent_missing_spot_or_history_blocks_append_and_freeze
     assert res_ok["last_success_at"] == "2026-11-02 16:35:00 北京时间"
     assert json.loads((st_dir / "index_series.json").read_text(encoding="utf-8"))["dates"][-1] == "2026-11-02"
     assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8"))["frozen_series"]["dates"][-1] == "2026-11-02"
+
+
+# ---------------------------------------------------------------------------
+# 5. Pre-Enable Hardening Tests (Items 1, 2, 5, 6)
+# ---------------------------------------------------------------------------
+
+
+def test_hkmom_daily_ok_intraday_fail_then_feed_daemon_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hardening #1: clean HK daily persists & freezes even when live spots fail; FeedDaemon recovery clears stale and completes close sync."""
+    daily_dir = tmp_path / "hk_daily_state"
+    out_dir = tmp_path / "hk_daily_out"
+    daemon_root = tmp_path / "daemon_state"
+    (daily_dir / "hist").mkdir(parents=True)
+
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-11-02")]
+    codes = [f"{i:05d}" for i in range(1, 121)]
+    ggt_codes = set(codes[55:])
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+
+    prior_ok = "2026-10-30 16:35:00 北京时间"
+    seed_frozen = {
+        "launch_date": "2026-09-30",
+        "rebalance_snapshots": {"2026-09-30": {"smallcap": codes[:50], "nonggt": codes[:50]}},
+        "frozen_series": {
+            "dates": sessions[:-1],
+            "smallcap": [1000.0 + i for i in range(len(sessions) - 1)],
+            "nonggt": [1000.0 + i for i in range(len(sessions) - 1)],
+            "hsi": [1000.0 + i for i in range(len(sessions) - 1)],
+        },
+    }
+    (daily_dir / "frozen_history.json").write_text(json.dumps(seed_frozen), encoding="utf-8")
+    (daily_dir / "index_series.json").write_text(json.dumps(seed_frozen["frozen_series"]), encoding="utf-8")
+    (daily_dir / "constituents.json").write_text(
+        json.dumps({"smallcap": [{"code": c, "name": c} for c in codes[:50]], "nonggt": [{"code": c, "name": c} for c in codes[:50]]}),
+        encoding="utf-8",
+    )
+    (daily_dir / "index_meta.json").write_text(
+        json.dumps({"last_date": sessions[-2], "launch_date": "2026-09-30", "last_success_at": prior_ok}),
+        encoding="utf-8",
+    )
+
+    daily_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/11/02"
+    )
+    failing_intra_sess = _build_hk_substitute_session(
+        sessions=sessions,
+        codes=codes,
+        ggt_codes=ggt_codes,
+        quote_date="2026/11/02",
+        inject=("hk_intraday_spot", "exception"),
+    )
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    orig_uni = hkmom_fetch.build_universe
+    orig_dl = hkmom_fetch.download_history
+    orig_comp = hkmom_compute.compute_all
+    orig_intra = hkmom_compute.compute_intraday_snapshot
+    dt_close = datetime(2026, 11, 2, 16, 35, 0, tzinfo=feeds_common.HK_TZ)
+
+    monkeypatch.setattr(hkmom_run, "build_universe", lambda **kw: orig_uni(**{**kw, "session": daily_sess}))
+    monkeypatch.setattr(hkmom_run, "download_history", lambda cl, **kw: orig_dl(cl, **{**kw, "session": daily_sess}))
+    monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "as_of_date": date(2026, 11, 2), "hsi_session": daily_sess}))
+    monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_close, "session": failing_intra_sess}))
+    monkeypatch.setattr(hkmom_run, "now_hk", lambda: dt_close)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_close)
+
+    # 1) Daily job runs cleanly on daily sources, while intraday spot fails -> daily results MUST persist!
+    res = hkmom_run.run_daily_job(state_dir=daily_dir, output_dir=out_dir, as_of_date=date(2026, 11, 2))
+    assert res["ok"] is False
+    assert res["publish_ok"] is True
+    assert res["froze"] is True
+    assert res["last_date"] == "2026-11-02"
+    assert json.loads((daily_dir / "index_series.json").read_text(encoding="utf-8"))["dates"][-1] == "2026-11-02"
+    assert json.loads((daily_dir / "frozen_history.json").read_text(encoding="utf-8"))["frozen_series"]["dates"][-1] == "2026-11-02"
+    daily_meta = json.loads((daily_dir / "index_meta.json").read_text(encoding="utf-8"))
+    assert daily_meta["last_date"] == "2026-11-02"
+    assert daily_meta["stale"] is False
+    assert "hk_intraday_spot" not in daily_meta.get("sources", {})
+    assert json.loads((daily_dir / "status.json").read_text(encoding="utf-8"))["sources"]["hk_intraday_spot"]["ok"] is False
+
+    # 2) Host FeedDaemon picks up daily results with recovered intraday spots -> clears stale & completes close sync!
+    recovered_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/11/02"
+    )
+    pushed: list[dict[str, Any]] = []
+    dt_live = datetime(2026, 11, 2, 16, 40, 0, tzinfo=feeds_common.HK_TZ)
+    daemon = run_feeds.FeedDaemon(
+        state_dir=daemon_root,
+        hk_daily_dir=daily_dir,
+        feeds=("hk",),
+        hk_collect_fn=lambda cur: orig_intra(
+            state_dir=daemon_root / "hk_momentum",
+            daily_state_dir=daily_dir,
+            now=cur,
+            session=recovered_sess,
+            persist_status=True,
+        ),
+        push_fn=lambda slug, data_key, payload, **_kw: pushed.append(
+            {"slug": slug, "data_key": data_key, "payload": payload}
+        ),
+        now_fn=lambda: dt_live,
+    )
+    results = daemon.run_tick(now=dt_live)
+    assert len(results) == 1 and results[0]["action"] == "post_close"
+    assert len(pushed) == 1
+    live_payload = pushed[0]["payload"]
+    assert live_payload["stale"] is False
+    assert live_payload["daily_close_date"] == "2026-11-02"
+    assert live_payload["smallcap"]["source"] == "daily_close"
+    assert live_payload["nonggt"]["source"] == "daily_close"
+    assert live_payload["last_success_at"] == "2026-11-02 16:40:00"
+    assert daemon.state["hk"]["post_close_daily_synced_date"] == "2026-11-02"
+
+
+def test_pm_sw_code_date_level_completeness_hardening(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hardening #2: PM checks completeness across industry code x date x level without advancing or sealing partial state."""
+    monkeypatch.setattr(pm_collect.time, "sleep", lambda _s: None)
+    cfg = pm_collect.load_config()
+    raw_dir = tmp_path / "pm_raw"
+    raw_dir.mkdir(parents=True)
+
+    # Seed clean baseline CN meta & valuation first
+    _, fake_ak_ok = _make_pm_sdks(cfg)
+    cn_ok = pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak_ok)
+    assert cn_ok["source_status"]["ok"] is True
+    seed_meta = json.loads((raw_dir / "cn_sw_meta.json").read_text(encoding="utf-8"))
+    val_ok = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_ok)
+    assert val_ok["source_status"]["ok"] is True
+
+    # 1) fetch_cn: omit an expected L1 code present in prior cn_sw_meta.json -> MUST fail & preserve cn_sw_meta.json
+    _, fake_ak_missing_l1 = _make_pm_sdks(cfg)
+    orig_l1 = fake_ak_missing_l1.sw_index_first_info()
+    dropped_l1 = orig_l1.iloc[1:].copy()
+    fake_ak_missing_l1.sw_index_first_info = lambda: dropped_l1
+    cn_bad = pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak_missing_l1)
+    assert cn_bad["source_status"]["ok"] is False
+    assert "缺失" in (cn_bad["source_status"]["reason"] or "")
+    assert json.loads((raw_dir / "cn_sw_meta.json").read_text(encoding="utf-8")) == seed_meta
+
+    # 2) fetch_cn_val_latest: omit one expected L2 code in daily valuation -> MUST fail val_latest
+    _, fake_ak_missing_val = _make_pm_sdks(cfg)
+    orig_daily_sw = fake_ak_missing_val.index_analysis_daily_sw.side_effect
+    l1_codes = sorted(k for k, v in seed_meta["industries"].items() if v.get("level") == 1)
+    l2_codes = sorted(k for k, v in seed_meta["industries"].items() if v.get("level") == 2)
+    assert l1_codes and l2_codes
+
+    def _drop_l2_daily(symbol: str, start_date: str, end_date: str):
+        df = orig_daily_sw(symbol, start_date, end_date)
+        if symbol == "二级行业":
+            return df[df["指数代码"].astype(str).str.split(".").str[0] != l2_codes[0]].copy()
+        return df
+
+    fake_ak_missing_val.index_analysis_daily_sw.side_effect = _drop_l2_daily
+    with pytest.raises(RuntimeError, match="二级行业"):
+        pm_collect.fetch_cn_val_latest(raw_dir=raw_dir, ak_module=fake_ak_missing_val)
+
+    # 3) fetch_cn_valuation: weekly valuation missing an expected L1 code retroactively un-marks done_map and keeps (date, level) pending
+    prog_path = raw_dir / "cn_sw_val_progress.json"
+    prog = json.loads(prog_path.read_text(encoding="utf-8"))
+    assert "一级行业" in prog["done"].get("2025-12-26", [])
+    val_hist_path = raw_dir / "cn_sw_val_weekly.csv"
+    drop_target_code = l1_codes[0]
+    vh_df = pd.read_csv(val_hist_path, dtype={"code": str})
+    vh_df = vh_df[~((vh_df["date"].astype(str) == "2025-12-26") & (vh_df["code"].astype(str) == drop_target_code))].copy()
+    vh_df.to_csv(val_hist_path, index=False)
+
+    _, fake_ak_bad_week = _make_pm_sdks(cfg)
+    orig_weekly = fake_ak_bad_week.index_analysis_weekly_sw.side_effect
+
+    def _drop_one_code_week(symbol: str, date: str):
+        df = orig_weekly(symbol, date)
+        if date == "20251226" and symbol == "一级行业":
+            return df[df["指数代码"].astype(str).str.split(".").str[0] != drop_target_code].copy()
+        return df
+
+    fake_ak_bad_week.index_analysis_weekly_sw.side_effect = _drop_one_code_week
+    fake_ak_bad_week.index_analysis_week_month_sw.side_effect = None
+    fake_ak_bad_week.index_analysis_week_month_sw.return_value = pd.DataFrame(
+        {"date": ["2025-12-19", "2025-12-26", "2026-01-02"]}
+    )
+
+    val_partial = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_bad_week)
+    assert val_partial["source_status"]["ok"] is False
+    prog_after = json.loads(prog_path.read_text(encoding="utf-8"))
+    assert "一级行业" not in prog_after["done"].get("2025-12-26", [])
+    assert "二级行业" in prog_after["done"].get("2025-12-26", [])
+
+    # When missing code recovers, re-run completes cleanly!
+    _, fake_ak_recovered = _make_pm_sdks(cfg)
+    fake_ak_recovered.index_analysis_week_month_sw.side_effect = None
+    fake_ak_recovered.index_analysis_week_month_sw.return_value = pd.DataFrame(
+        {"date": ["2025-12-19", "2025-12-26", "2026-01-02"]}
+    )
+    val_recovered = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_recovered)
+    assert val_recovered["source_status"]["ok"] is True
+    prog_recovered = json.loads(prog_path.read_text(encoding="utf-8"))
+    assert set(prog_recovered["done"].get("2025-12-26", [])) == {"一级行业", "二级行业"}
+    assert set(prog_recovered["done"].get("2026-01-02", [])) == {"一级行业", "二级行业"}
+
+
+def test_ashare_official_shares_date_and_szse_hardening(tmp_path: Path) -> None:
+    """Hardening #5: SSE and SZSE official ETF share pairs reject future, stale, and non-consecutive trading dates."""
+    now_dt = datetime(2026, 11, 16, 14, 30, 0, tzinfo=feeds_common.CN_TZ)
+
+    def _run_sse(rows_latest: list[dict[str, Any]], rows_prev: list[dict[str, Any]]) -> dict[str, Any]:
+        def _fake_get(url: str, **_kw) -> str:
+            if "STAT_DATE=2026-" in url:
+                return "jsonpCallback(" + json.dumps({"result": rows_prev}) + ")"
+            return "jsonpCallback(" + json.dumps({"result": rows_latest}) + ")"
+
+        col = ashare_collect.AShareCollector(
+            state_dir=tmp_path / "sse",
+            http_get=_fake_get,
+            http_get_json=lambda *_a, **_kw: {},
+            now_fn=lambda: now_dt,
+        )
+        return col._fetch_sse_pairs(["512480"])
+
+    # Valid consecutive trading days (Fri 2026-11-13 & Thu 2026-11-12 for Mon 2026-11-16) -> succeeds
+    ok_pairs = _run_sse(
+        [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-13", "TOT_VOL": "100000"}],
+        [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-12", "TOT_VOL": "95000"}],
+    )
+    assert ok_pairs["512480"] == (("2026-11-13", 100000.0), ("2026-11-12", 95000.0))
+
+    # Future date rejected
+    with pytest.raises(RuntimeError, match="未来日期"):
+        _run_sse(
+            [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-20", "TOT_VOL": "100000"}],
+            [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-13", "TOT_VOL": "95000"}],
+        )
+
+    # Stale latest date rejected (2026-11-12 < expected previous trading day 2026-11-13)
+    with pytest.raises(RuntimeError, match="最新日期过期"):
+        _run_sse(
+            [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-12", "TOT_VOL": "100000"}],
+            [{"SEC_CODE": "512480", "STAT_DATE": "2026-11-11", "TOT_VOL": "95000"}],
+        )
+
+    # SZSE non-adjacent / future date checks
+    def _run_szse(data_rows: list[dict[str, Any]]) -> Any:
+        col = ashare_collect.AShareCollector(
+            state_dir=tmp_path / "szse",
+            http_get=lambda _u, **_kw: json.dumps([{"data": data_rows}]),
+            http_get_json=lambda *_a, **_kw: {},
+            now_fn=lambda: now_dt,
+        )
+        return col._fetch_szse_pair("159915")
+
+    assert _run_szse(
+        [
+            {"fund_code": "159915", "size_date": "2026-11-13", "current_size": "200000"},
+            {"fund_code": "159915", "size_date": "2026-11-12", "current_size": "195000"},
+        ]
+    ) == (("2026-11-13", 200000.0), ("2026-11-12", 195000.0))
+
+    with pytest.raises(RuntimeError, match="未来日期"):
+        _run_szse(
+            [
+                {"fund_code": "159915", "size_date": "2026-11-18", "current_size": "200000"},
+                {"fund_code": "159915", "size_date": "2026-11-13", "current_size": "195000"},
+            ]
+        )
+
+    with pytest.raises(RuntimeError, match="非相邻交易日"):
+        _run_szse(
+            [
+                {"fund_code": "159915", "size_date": "2026-11-13", "current_size": "200000"},
+                {"fund_code": "159915", "size_date": "2026-11-11", "current_size": "195000"},
+            ]
+        )
+
+
+def test_hkmom_ggt_recordcount_and_duplicate_codes_hardening() -> None:
+    """Hardening #6: fetch_ggt_list strictly checks metadata.recordcount presence, consistency, total match, and uniqueness."""
+
+    def _run(pages: dict[int, dict[str, Any]]) -> dict[str, str]:
+        sess = create_autospec(requests.Session, instance=True)
+
+        def _get(url: str, **_kw):
+            pg = 2 if "PAGENO=2" in url else 1
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: [pages[pg]])
+
+        sess.get.side_effect = _get
+        return hkmom_fetch.fetch_ggt_list(session=sess)
+
+    assert _run(
+        {
+            1: {"metadata": {"pagecount": 2, "recordcount": 2}, "data": [{"zqdm": "00001", "zqjc": "长和"}]},
+            2: {"metadata": {"pagecount": 2, "recordcount": 2}, "data": [{"zqdm": "00002", "zqjc": "中电控股"}]},
+        }
+    ) == {"00001": "长和", "00002": "中电控股"}
+
+    with pytest.raises(RuntimeError, match="recordcount"):
+        _run({1: {"metadata": {"pagecount": 1}, "data": [{"zqdm": "00001", "zqjc": "长和"}]}})
+
+    with pytest.raises(RuntimeError, match="recordcount.*不符"):
+        _run({1: {"metadata": {"pagecount": 1, "recordcount": 3}, "data": [{"zqdm": "00001", "zqjc": "长和"}]}})
+
+    with pytest.raises(RuntimeError, match="不一致"):
+        _run(
+            {
+                1: {"metadata": {"pagecount": 2, "recordcount": 2}, "data": [{"zqdm": "00001", "zqjc": "长和"}]},
+                2: {"metadata": {"pagecount": 2, "recordcount": 5}, "data": [{"zqdm": "00002", "zqjc": "中电控股"}]},
+            }
+        )
+
+    with pytest.raises(RuntimeError, match="重复"):
+        _run(
+            {
+                1: {"metadata": {"pagecount": 2, "recordcount": 2}, "data": [{"zqdm": "00001", "zqjc": "长和"}]},
+                2: {"metadata": {"pagecount": 2, "recordcount": 2}, "data": [{"zqdm": "00001", "zqjc": "长和"}]},
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. Final Pre-Enable Fixes (HK Spot Date/Dup/Coverage, HSI Raw Gap, Daemon Timestamps, PM CSV Missing)
+# ---------------------------------------------------------------------------
+
+
+def test_hkmom_spot_date_duplicate_and_candidate_coverage_blocks_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final #1: hk_spot validates target trade date, code uniqueness, 50% candidate coverage, and held coverage, blocking month-end freeze."""
+    st_dir = tmp_path / "hk_spot_guard"
+    out_dir = tmp_path / "hk_spot_out"
+    (st_dir / "hist").mkdir(parents=True)
+
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-10-30")]
+    codes = [f"{i:05d}" for i in range(1, 121)]
+    ggt_codes = set(codes[55:])
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+
+    prior_ok = "2026-10-29 16:35:00 北京时间"
+    seed_frozen = {
+        "launch_date": "2026-09-30",
+        "rebalance_snapshots": {"2026-09-30": {"smallcap": codes[:50], "nonggt": codes[:50]}},
+        "frozen_series": {
+            "dates": sessions[:-1],
+            "smallcap": [1000.0 + i for i in range(len(sessions) - 1)],
+            "nonggt": [1000.0 + i for i in range(len(sessions) - 1)],
+            "hsi": [1000.0 + i for i in range(len(sessions) - 1)],
+        },
+    }
+    (st_dir / "frozen_history.json").write_text(json.dumps(seed_frozen), encoding="utf-8")
+    (st_dir / "index_series.json").write_text(json.dumps(seed_frozen["frozen_series"]), encoding="utf-8")
+    (st_dir / "constituents.json").write_text(
+        json.dumps({"smallcap": [{"code": c, "name": c} for c in codes[:50]], "nonggt": [{"code": c, "name": c} for c in codes[:50]]}),
+        encoding="utf-8",
+    )
+    (st_dir / "index_meta.json").write_text(
+        json.dumps({"last_date": sessions[-2], "launch_date": "2026-09-30", "last_success_at": prior_ok}),
+        encoding="utf-8",
+    )
+    feeds_common.SourceStatusStore(st_dir).update_sources(
+        [
+            feeds_common.make_source_result(n, ok=True, stale=False, label=n)
+            for n in (
+                "hkex_universe", "ggt_list", "hk_spot", "hk_history",
+                "hsi_history", "index_compute", "hk_intraday_spot", "hsi_spot", "html_render",
+            )
+        ],
+        now_str=prior_ok,
+    )
+
+    base_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/10/30"
+    )
+    orig_base_get = base_sess.get.side_effect
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    orig_uni = hkmom_fetch.build_universe
+    orig_dl = hkmom_fetch.download_history
+    orig_comp = hkmom_compute.compute_all
+    orig_intra = hkmom_compute.compute_intraday_snapshot
+    dt_me = datetime(2026, 10, 30, 16, 35, 0, tzinfo=feeds_common.HK_TZ)
+    monkeypatch.setattr(hkmom_run, "now_hk", lambda: dt_me)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_me)
+
+    def _run_with_spot_mutator(mutator) -> dict[str, Any]:
+        sess = create_autospec(requests.Session, instance=True)
+
+        def _get(url: str, **kw):
+            resp = orig_base_get(url, **kw)
+            if "qt.gtimg.cn" in url and "r_hkHSI" not in url:
+                resp.text = mutator(url, resp.text)
+            return resp
+
+        sess.get.side_effect = _get
+        monkeypatch.setattr(hkmom_run, "build_universe", lambda **kw: orig_uni(**{**kw, "session": sess}))
+        monkeypatch.setattr(hkmom_run, "download_history", lambda cl, **kw: orig_dl(cl, **{**kw, "session": sess}))
+        monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "as_of_date": date(2026, 10, 30), "hsi_session": sess}))
+        monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_me, "session": sess}))
+        return hkmom_run.run_daily_job(state_dir=st_dir, output_dir=out_dir, as_of_date=date(2026, 10, 30))
+
+    # (a) Duplicate code in batch spot response -> hk_spot fails, month-end freeze blocked
+    def _dup_spot(_url: str, txt: str) -> str:
+        segs = [s for s in txt.split(";") if s.strip()]
+        dup_target = next((s for s in segs if "r_hk00056=" in s), None)
+        return ";".join(segs + ([dup_target] if dup_target else []))
+
+    res_dup = _run_with_spot_mutator(_dup_spot)
+    assert res_dup["ok"] is False and res_dup["month_end_failed"] is True
+    assert res_dup["sources"]["hk_spot"]["ok"] is False
+    assert res_dup["last_success_at"] == prior_ok
+    assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8")) == seed_frozen
+
+    # (b) Stale date on ONE candidate non-held stock (2026/10/29 vs target 2026-10-30) -> hk_spot fails, freeze blocked
+    def _stale_one(_url: str, txt: str) -> str:
+        segs = []
+        for s in txt.split(";"):
+            if s.startswith("v_r_hk00060="):
+                s = s.replace("2026/10/30", "2026/10/29")
+            segs.append(s)
+        return ";".join(segs)
+
+    res_stale = _run_with_spot_mutator(_stale_one)
+    assert res_stale["ok"] is False and res_stale["month_end_failed"] is True
+    assert res_stale["sources"]["hk_spot"]["ok"] is False
+    assert res_stale["last_success_at"] == prior_ok
+    assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8")) == seed_frozen
+
+    # (c) Missing >50% candidate quotes (even with ALL 50 held stocks present: 50/120 < 50%) -> hk_spot fails, freeze blocked
+    held_set = set(codes[:50])
+
+    def _drop_candidates(_url: str, txt: str) -> str:
+        kept = []
+        for s in txt.split(";"):
+            if not s.strip():
+                continue
+            code = s.split("_hk")[-1].split("=")[0]
+            if code in held_set:
+                kept.append(s)
+        return ";".join(kept)
+
+    res_cov = _run_with_spot_mutator(_drop_candidates)
+    assert res_cov["ok"] is False and res_cov["month_end_failed"] is True
+    assert res_cov["sources"]["hk_spot"]["ok"] is False
+    assert res_cov["last_success_at"] == prior_ok
+    assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8")) == seed_frozen
+
+    # (d) Clean quotes on all 120 stocks dated 2026/10/30 -> freezes cleanly
+    res_ok = _run_with_spot_mutator(lambda _u, txt: txt)
+    assert res_ok["ok"] is True
+    assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8"))["frozen_series"]["dates"][-1] == "2026-10-30"
+
+
+def test_hkmom_hsi_intermediate_gap_not_ffilled_blocks_freeze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final #2: missing an intermediate trading day in HSI raw data (tail_dates) cannot be ffill'd and blocks freeze."""
+    st_dir = tmp_path / "hk_hsi_gap"
+    out_dir = tmp_path / "hk_hsi_out"
+    (st_dir / "hist").mkdir(parents=True)
+
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-10-30")]
+    assert sessions[-3:] == ["2026-10-28", "2026-10-29", "2026-10-30"]
+    codes = [f"{i:05d}" for i in range(1, 121)]
+    ggt_codes = set(codes[55:])
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+
+    # Seed frozen history ending 2026-10-28 so tail_dates = ["2026-10-29", "2026-10-30"]
+    prior_ok = "2026-10-28 16:35:00 北京时间"
+    seed_frozen = {
+        "launch_date": "2026-09-30",
+        "rebalance_snapshots": {"2026-09-30": {"smallcap": codes[:50], "nonggt": codes[:50]}},
+        "frozen_series": {
+            "dates": sessions[:-2],
+            "smallcap": [1000.0 + i for i in range(len(sessions) - 2)],
+            "nonggt": [1000.0 + i for i in range(len(sessions) - 2)],
+            "hsi": [1000.0 + i for i in range(len(sessions) - 2)],
+        },
+    }
+    (st_dir / "frozen_history.json").write_text(json.dumps(seed_frozen), encoding="utf-8")
+    (st_dir / "index_series.json").write_text(json.dumps(seed_frozen["frozen_series"]), encoding="utf-8")
+    (st_dir / "constituents.json").write_text(
+        json.dumps({"smallcap": [{"code": c, "name": c} for c in codes[:50]], "nonggt": [{"code": c, "name": c} for c in codes[:50]]}),
+        encoding="utf-8",
+    )
+    (st_dir / "index_meta.json").write_text(
+        json.dumps({"last_date": "2026-10-28", "launch_date": "2026-09-30", "last_success_at": prior_ok}),
+        encoding="utf-8",
+    )
+
+    full_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/10/30"
+    )
+    orig_get = full_sess.get.side_effect
+
+    def _gap_hsi_get(url: str, **kw):
+        resp = orig_get(url, **kw)
+        if "kline/kline" in url and "hkHSI" in url:
+            payload = resp.json()
+            day_rows = payload["data"]["hkHSI"]["day"]
+            # Drop intermediate 2026-10-29 while KEEPING 2026-10-28 and target 2026-10-30!
+            filtered = [r for r in day_rows if str(r[0]) != "2026-10-29"]
+            return SimpleNamespace(
+                status_code=200,
+                text="",
+                content=b"",
+                encoding="utf-8",
+                raise_for_status=lambda: None,
+                json=lambda: {"data": {"hkHSI": {"day": filtered}}},
+            )
+        return resp
+
+    gap_sess = create_autospec(requests.Session, instance=True)
+    gap_sess.get.side_effect = _gap_hsi_get
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    dt_me = datetime(2026, 10, 30, 16, 35, 0, tzinfo=feeds_common.HK_TZ)
+    orig_uni = hkmom_fetch.build_universe
+    orig_dl = hkmom_fetch.download_history
+    orig_comp = hkmom_compute.compute_all
+    orig_intra = hkmom_compute.compute_intraday_snapshot
+    monkeypatch.setattr(hkmom_run, "now_hk", lambda: dt_me)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_me)
+    monkeypatch.setattr(hkmom_run, "build_universe", lambda **kw: orig_uni(**{**kw, "session": gap_sess}))
+    monkeypatch.setattr(hkmom_run, "download_history", lambda cl, **kw: orig_dl(cl, **{**kw, "session": gap_sess}))
+    monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "as_of_date": date(2026, 10, 30), "hsi_session": gap_sess}))
+    monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_me, "session": gap_sess}))
+
+    res_gap = hkmom_run.run_daily_job(state_dir=st_dir, output_dir=out_dir, as_of_date=date(2026, 10, 30))
+    assert res_gap["ok"] is False
+    assert res_gap["froze"] is False
+    assert res_gap["month_end_failed"] is True
+    assert res_gap["sources"]["hsi_history"]["ok"] is False
+    assert "2026-10-29" in (res_gap["sources"]["hsi_history"]["reason"] or "")
+    assert json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8")) == seed_frozen
+
+    # When 2026-10-29 recovers -> appends ["2026-10-29", "2026-10-30"] and freezes!
+    monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "as_of_date": date(2026, 10, 30), "hsi_session": full_sess}))
+    res_rec = hkmom_run.run_daily_job(state_dir=st_dir, output_dir=out_dir, as_of_date=date(2026, 10, 30))
+    assert res_rec["ok"] is True and res_rec["froze"] is True
+    saved_frozen = json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8"))
+    assert saved_frozen["frozen_series"]["dates"][-2:] == ["2026-10-29", "2026-10-30"]
+
+
+def test_hkmom_daemon_preserves_daily_timestamps_and_prefers_meta_daily_ok(
+    tmp_path: Path,
+) -> None:
+    """Final #3 + GLM low #1: FeedDaemon preserves original daily last_success_at untouched and overlay prefers meta.daily_last_success_at."""
+    daily_dir = tmp_path / "daily_hk"
+    daemon_dir = tmp_path / "daemon_state"
+    daily_hk_dir = daemon_dir / "hk_momentum"
+    daily_dir.mkdir(parents=True)
+
+    prior_combined_ok = "2026-10-30 16:35:00 北京时间"
+    daily_clean_ok = "2026-11-02 16:35:00 北京时间"
+
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2026-10-20", "2026-11-02")]
+    (daily_dir / "index_series.json").write_text(
+        json.dumps(
+            {
+                "dates": sessions,
+                "smallcap": [1000.0 + i for i in range(len(sessions))],
+                "nonggt": [1000.0 + i for i in range(len(sessions))],
+                "hsi": [1000.0 + i for i in range(len(sessions))],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (daily_dir / "constituents.json").write_text(
+        json.dumps({"smallcap": [{"code": "00001", "name": "CKH"}], "nonggt": [{"code": "00001", "name": "CKH"}]}),
+        encoding="utf-8",
+    )
+    (daily_dir / "index_meta.json").write_text(
+        json.dumps(
+            {
+                "last_date": "2026-11-02",
+                "launch_date": "2026-09-30",
+                "stale": False,
+                "last_success_at": prior_combined_ok,
+                "daily_last_success_at": daily_clean_ok,
+                "sources": {
+                    "hsi_history": {
+                        "name": "hsi_history",
+                        "label": "恒生指数历史",
+                        "ok": True,
+                        "stale": False,
+                        "reason": None,
+                        "last_success_at": daily_clean_ok,
+                        "as_of": "2026-11-02",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    feeds_common.SourceStatusStore(daily_dir).update_sources(
+        [
+            feeds_common.make_source_result(n, ok=True, stale=False, as_of="2026-11-02", label=n)
+            for n in ("hkex_universe", "ggt_list", "hk_spot", "hk_history", "hsi_history", "index_compute", "html_render")
+        ]
+        + [feeds_common.make_source_result("hk_intraday_spot", ok=False, stale=True, reason="spot down", label="港股成分实时报价")],
+        now_str=daily_clean_ok,
+    )
+    # Force status.json overall.last_success_at to yesterday's combined ok (simulating daily clean + intraday fail)
+    sdoc = json.loads((daily_dir / "status.json").read_text(encoding="utf-8"))
+    sdoc["overall"]["last_success_at"] = prior_combined_ok
+    (daily_dir / "status.json").write_text(json.dumps(sdoc, ensure_ascii=False), encoding="utf-8")
+
+    # 1) FeedDaemon overlay prefers meta.daily_last_success_at over stale status.json overall.last_success_at
+    daemon = run_feeds.FeedDaemon(
+        state_dir=daemon_dir,
+        hk_daily_dir=daily_dir,
+        feeds=("hk",),
+        push_fn=lambda *_a, **_kw: None,
+    )
+    overlay = daemon._hk_daily_status_overlay()
+    assert overlay["daily_last_success_at"] == daily_clean_ok
+
+    # 2) compute_intraday_snapshot at 16:45 MUST NOT overwrite daily source timestamps in daemon status.json!
+    sess_live = _build_hk_substitute_session(
+        sessions=sessions, codes=["00001"], ggt_codes=set(), quote_date="2026/11/02"
+    )
+    dt_live = datetime(2026, 11, 2, 16, 45, 0, tzinfo=feeds_common.HK_TZ)
+    snap = hkmom_compute.compute_intraday_snapshot(
+        state_dir=daily_hk_dir,
+        daily_state_dir=daily_dir,
+        now=dt_live,
+        session=sess_live,
+        persist_status=True,
+    )
+    assert snap["stale"] is False
+    daemon_status = json.loads((daily_hk_dir / "status.json").read_text(encoding="utf-8"))
+    for daily_key in ("hkex_universe", "ggt_list", "hk_spot", "hk_history", "hsi_history", "index_compute", "html_render"):
+        assert daemon_status["sources"][daily_key]["last_success_at"] == daily_clean_ok
+        assert snap["sources"][daily_key]["last_success_at"] == daily_clean_ok
+    assert daemon_status["sources"]["hk_intraday_spot"]["last_success_at"] == "2026-11-02 16:45:00"
+    assert daemon_status["sources"]["hsi_spot"]["last_success_at"] == "2026-11-02 16:45:00"
+    assert snap["sources"] == daemon_status["sources"]
+
+
+def test_pm_weekly_valuation_missing_csv_recollects_even_with_done_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final #4: missing or empty cn_sw_val_weekly.csv invalidates done_map and forces re-collection."""
+    monkeypatch.setattr(pm_collect.time, "sleep", lambda _s: None)
+    cfg = pm_collect.load_config()
+    raw_dir = tmp_path / "pm_missing_csv"
+    raw_dir.mkdir(parents=True)
+
+    _, fake_ak = _make_pm_sdks(cfg)
+    assert pm_collect.fetch_cn(cfg, raw_dir=raw_dir, ak_module=fake_ak)["source_status"]["ok"] is True
+    seed_val = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak)
+    assert seed_val["source_status"]["ok"] is True
+    csv_path = raw_dir / "cn_sw_val_weekly.csv"
+    prog_path = raw_dir / "cn_sw_val_progress.json"
+    assert csv_path.is_file()
+    assert json.loads(prog_path.read_text(encoding="utf-8"))["done"]
+
+    # Delete CSV while leaving done_map intact on disk!
+    csv_path.unlink()
+
+    # 1) When weekly endpoint fails after CSV loss: MUST clear done_map, keep ok=False, n_rows=0
+    _, fake_ak_fail = _make_pm_sdks(cfg)
+    fake_ak_fail.index_analysis_weekly_sw.side_effect = RuntimeError("weekly down")
+    res_fail = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_fail)
+    assert res_fail["ok"] is False and res_fail["stale"] is True
+    assert res_fail["n_rows"] == 0
+    assert json.loads(prog_path.read_text(encoding="utf-8"))["done"] == {}
+
+    # 2) When weekly endpoint recovers: MUST actually re-fetch & rebuild cn_sw_val_weekly.csv!
+    _, fake_ak_rec = _make_pm_sdks(cfg)
+    res_rec = pm_collect.fetch_cn_valuation(cfg, raw_dir=raw_dir, ak_module=fake_ak_rec)
+    assert res_rec["ok"] is True
+    assert res_rec["weeks_fetched_pairs"] > 0
+    assert res_rec["n_rows"] > 0
+    assert csv_path.is_file()

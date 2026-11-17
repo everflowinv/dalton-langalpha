@@ -229,9 +229,21 @@ def _fetch_hsi_history(
             timeout=15,
         )
         rows = r.json()["data"]["hkHSI"]["day"]
-        raw_map = {str(x[0]): float(x[2]) for x in rows if x and x[0]}
+        if not isinstance(rows, list) or not rows:
+            return None, set()
+        raw_map: dict[str, float] = {}
+        for x in rows:
+            if not isinstance(x, (list, tuple)) or len(x) < 3 or not x[0]:
+                return None, set()
+            d_str = str(x[0]).strip()
+            if d_str in raw_map:
+                return None, set()
+            px = float(x[2])
+            if not math.isfinite(px) or px <= 0:
+                return None, set()
+            raw_map[d_str] = px
         raw_dates = set(raw_map.keys())
-        hsi = pd.Series(raw_map).reindex(common_dates).ffill()
+        hsi = pd.Series(raw_map, dtype=float).reindex(common_dates)
         valid = hsi.dropna()
         if valid.empty:
             return None, set()
@@ -455,13 +467,10 @@ def compute_all(
         out[key] = [round(float(v), 2) if pd.notna(v) else None for v in s]
         series[key] = s
 
-    # HSI benchmark: always preserve frozen history up to last valid frozen date; backfill gaps when recovered.
-    # Require target_str in un-ffilled raw_hsi_dates before considering series complete/freezable.
-    hsi_fetched, raw_hsi_dates = _fetch_hsi_history(common, session=hsi_session)
-    if hsi_fetched is None:
-        hsi_reasons.append("恒生指数历史行情拉取失败")
-    elif target_str not in raw_hsi_dates:
-        hsi_reasons.append(f"恒生指数原始记录缺少目标日期 {target_str}")
+    # HSI benchmark: always preserve frozen history up to last valid frozen date; require raw (un-ffilled)
+    # HSI records for EVERY date in the newly appended range before allowing completeness/freeze.
+    f_hsi_valid = pd.Series(dtype=float)
+    last_f_date: str | None = None
     if frozen_series_raw.get("dates") and frozen_series_raw.get("hsi"):
         f_hsi = pd.Series(
             frozen_series_raw["hsi"],
@@ -471,27 +480,42 @@ def compute_all(
         f_hsi_valid = f_hsi.dropna()
         if not f_hsi_valid.empty:
             last_f_date = str(f_hsi_valid.index[-1])
-            tail_dates = [d for d in common if d > last_f_date]
-            if not tail_dates:
-                out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in f_hsi_valid.reindex(common)]
-            elif (
-                hsi_fetched is not None
-                and last_f_date in hsi_fetched.index
-                and pd.notna(hsi_fetched.loc[last_f_date])
-                and float(hsi_fetched.loc[last_f_date]) > 0
-            ):
-                scale = float(f_hsi_valid.iloc[-1]) / float(hsi_fetched.loc[last_f_date])
-                combined_hsi = pd.concat([f_hsi_valid, hsi_fetched.loc[tail_dates] * scale]).reindex(common)
-                out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in combined_hsi]
-            else:
-                # Never overwrite frozen HSI with None; keep frozen values for recorded dates.
-                out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in f_hsi_valid.reindex(common)]
-                if hsi_fetched is not None:
-                    hsi_reasons.append(
-                        f"恒生指数历史行情缺少基准日 {last_f_date}，已保留冻结历史"
-                    )
+
+    check_hsi_dates = [str(d) for d in common if last_f_date is None or str(d) > last_f_date]
+    hsi_fetched, raw_hsi_dates = _fetch_hsi_history(common, session=hsi_session)
+    if hsi_fetched is None:
+        hsi_reasons.append("恒生指数历史行情拉取失败")
+    else:
+        missing_hsi = [d for d in check_hsi_dates if d not in raw_hsi_dates]
+        if target_str not in raw_hsi_dates:
+            hsi_reasons.append(f"恒生指数原始记录缺少目标日期 {target_str}")
+        missing_other = [d for d in missing_hsi if d != target_str]
+        if missing_other:
+            hsi_reasons.append(
+                f"恒生指数新增区间原始记录缺失 {len(missing_other)} 天 (如 {', '.join(missing_other[:5])})"
+            )
+
+    if not f_hsi_valid.empty and last_f_date is not None:
+        tail_dates = [d for d in common if d > last_f_date]
+        if not tail_dates:
+            out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in f_hsi_valid.reindex(common)]
+        elif (
+            not hsi_reasons
+            and hsi_fetched is not None
+            and last_f_date in hsi_fetched.index
+            and pd.notna(hsi_fetched.loc[last_f_date])
+            and float(hsi_fetched.loc[last_f_date]) > 0
+        ):
+            scale = float(f_hsi_valid.iloc[-1]) / float(hsi_fetched.loc[last_f_date])
+            combined_hsi = pd.concat([f_hsi_valid, hsi_fetched.loc[tail_dates] * scale]).reindex(common)
+            out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in combined_hsi]
         else:
-            out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in hsi_fetched] if hsi_fetched is not None else None
+            # Never overwrite frozen HSI or freeze ffill values; preserve frozen values only.
+            out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in f_hsi_valid.reindex(common)]
+            if hsi_fetched is not None and not hsi_reasons:
+                hsi_reasons.append(
+                    f"恒生指数历史行情缺少基准日 {last_f_date}，已保留冻结历史"
+                )
     else:
         out["hsi"] = [round(float(v), 2) if pd.notna(v) else None for v in hsi_fetched] if hsi_fetched is not None else None
 
@@ -742,13 +766,14 @@ def compute_intraday_snapshot(
                 store.load().get("overall", {}).get("last_success_at")
                 or prev_live.get("last_success_at")
             )
-            daily_objs = [
-                SourceStatus.from_dict(v)
+            extra_items: list[SourceStatus] = []
+            has_unclean_daily = any(
+                not (bool(v.get("ok")) and (not bool(v.get("stale"))))
                 for v in daily_sources.values()
-                if isinstance(v, dict) and v.get("name")
-            ]
-            if month_end_failed_reason and not any(not d.is_clean for d in daily_objs):
-                daily_objs.append(
+                if isinstance(v, dict)
+            )
+            if month_end_failed_reason and not has_unclean_daily:
+                extra_items.append(
                     make_source_result(
                         "month_end_rebalance",
                         ok=False,
@@ -757,19 +782,20 @@ def compute_intraday_snapshot(
                         label="月末调仓",
                     )
                 )
-            elif out_dict["stale"] and not spot_st.is_clean and hsi_spot_st.is_clean and not daily_objs:
-                pass
-            all_req = list(dict.fromkeys([d.name for d in daily_objs] + ["hk_intraday_spot", "hsi_spot"]))
+            all_req = list(
+                dict.fromkeys(
+                    list(daily_sources.keys())
+                    + [x.name for x in extra_items]
+                    + ["hk_intraday_spot", "hsi_spot"]
+                )
+            )
             sdoc = store.update_sources(
-                daily_objs + [spot_st, hsi_spot_st],
+                extra_items + [spot_st, hsi_spot_st],
                 required=all_req,
                 now_str=now_str,
+                preserved_sources=daily_sources,
             )
-            merged_sources = dict(daily_sources)
-            for k in ("hk_intraday_spot", "hsi_spot"):
-                if k in sdoc["sources"]:
-                    merged_sources[k] = sdoc["sources"][k]
-            out_dict["sources"] = merged_sources
+            out_dict["sources"] = dict(sdoc["sources"])
             out_dict["overall"] = sdoc["overall"]
             if (not out_dict["stale"]) and bool(sdoc["overall"].get("ok")):
                 out_dict["last_success_at"] = sdoc["overall"]["last_success_at"]
@@ -856,25 +882,6 @@ def compute_intraday_snapshot(
 
     any_index_stale = daily_series_lagging
     for key in ("smallcap", "nonggt"):
-        if series_has_today and len(series[key]) >= 2:
-            lvl, prev_lvl = series[key][-1], series[key][-2]
-            out[key] = {
-                "level": lvl,
-                "pct": round((lvl / prev_lvl - 1.0) * 100.0, 2) if prev_lvl else 0.0,
-                "prev_close_level": prev_lvl,
-                "n_quoted": len(cons.get(key) or []),
-                "n_expected": len(cons.get(key) or []),
-                "missing_codes": [],
-                "partial_quotes": False,
-                "stale": False,
-                "source": "daily_close",
-            }
-            continue
-
-        if daily_series_lagging:
-            out[key] = _stale_entry(key, series[key][-1] if series.get(key) else None)
-            continue
-
         members = [c["code"] for c in (cons.get(key) or [])]
         n_expected = len(members)
         fresh_quotes = {
@@ -884,6 +891,32 @@ def compute_intraday_snapshot(
         }
         missing_codes = [c for c in members if c not in fresh_quotes]
         coverage = (len(fresh_quotes) / n_expected) if n_expected else 0.0
+
+        if series_has_today and len(series[key]) >= 2:
+            key_spot_bad = n_expected > 0 and coverage < 0.5
+            if key_spot_bad:
+                any_index_stale = True
+                cov_msg = f"{key} 有效当日报价不足 ({len(fresh_quotes)}/{n_expected}，期望日期 {expected_q_date})"
+                stale_reasons.append(cov_msg)
+                spot_reasons.append(cov_msg)
+            lvl, prev_lvl = series[key][-1], series[key][-2]
+            out[key] = {
+                "level": lvl,
+                "pct": round((lvl / prev_lvl - 1.0) * 100.0, 2) if prev_lvl else 0.0,
+                "prev_close_level": prev_lvl,
+                "n_quoted": len(fresh_quotes),
+                "n_expected": n_expected,
+                "missing_codes": missing_codes,
+                "partial_quotes": bool(missing_codes),
+                "stale": key_spot_bad,
+                "source": "daily_close",
+            }
+            continue
+
+        if daily_series_lagging:
+            out[key] = _stale_entry(key, series[key][-1] if series.get(key) else None)
+            continue
+
         if coverage < 0.5:
             any_index_stale = True
             cov_msg = f"{key} 有效当日报价不足 ({len(fresh_quotes)}/{n_expected}，期望日期 {expected_q_date})"

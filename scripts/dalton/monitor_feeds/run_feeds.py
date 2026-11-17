@@ -167,34 +167,47 @@ class FeedDaemon:
         return json.dumps(parts, ensure_ascii=False, sort_keys=True) if parts else ""
 
     def _hk_daily_status_overlay(self) -> dict[str, Any]:
-        """Read latest daily status/meta from disk so month-end or daily failures always propagate to host pushes."""
+        """Read daily-only status/meta from disk (never overlay container intraday errors onto live recovery)."""
+        intraday_only = {"hk_intraday_spot", "hsi_spot"}
         sources: dict[str, Any] = {}
         reasons: list[str] = []
         month_end_failed = False
         daily_last_ok: str | None = None
         for p in reversed(self._hk_daily_dirs()):
             st_doc = load_json_safe(p / "status.json")
+            st_overall_ok: str | None = None
             if isinstance(st_doc, dict):
                 if isinstance(st_doc.get("sources"), dict):
-                    sources.update(st_doc["sources"])
+                    for sk, sv in st_doc["sources"].items():
+                        if sk not in intraday_only:
+                            sources[sk] = sv
                 overall = st_doc.get("overall") or {}
                 if isinstance(overall, dict):
                     if overall.get("month_end_failed"):
                         month_end_failed = True
                     if overall.get("last_success_at"):
-                        daily_last_ok = str(overall["last_success_at"])
+                        st_overall_ok = str(overall["last_success_at"])
             meta = load_json_safe(p / "index_meta.json")
+            meta_daily_ok: str | None = None
+            meta_fallback_ok: str | None = None
             if isinstance(meta, dict):
                 if isinstance(meta.get("source_statuses"), dict):
-                    sources.update(meta["source_statuses"])
+                    for sk, sv in meta["source_statuses"].items():
+                        if sk not in intraday_only:
+                            sources[sk] = sv
                 if meta.get("month_end_failed"):
                     month_end_failed = True
                 if (meta.get("month_end_failed") or meta.get("stale")) and meta.get("stale_reason"):
                     r = str(meta["stale_reason"])
                     if r not in reasons:
                         reasons.append(r)
-                if not daily_last_ok and meta.get("last_success_at"):
-                    daily_last_ok = str(meta["last_success_at"])
+                if meta.get("daily_last_success_at"):
+                    meta_daily_ok = str(meta["daily_last_success_at"])
+                if meta.get("last_success_at"):
+                    meta_fallback_ok = str(meta["last_success_at"])
+            picked_ok = meta_daily_ok or st_overall_ok or meta_fallback_ok
+            if picked_ok:
+                daily_last_ok = picked_ok
         return {
             "sources": sources,
             "reasons": reasons,

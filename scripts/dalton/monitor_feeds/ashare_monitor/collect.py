@@ -33,11 +33,11 @@ from scripts.dalton.monitor_feeds.common import (
     CalendarLookupError,
     SourceStatusStore,
     atomic_write_json,
-    is_trading_day,
     load_json_safe,
     make_source_result,
     market_session_state,
     now_cn,
+    previous_trading_day,
     resolve_state_dir,
 )
 
@@ -524,24 +524,31 @@ class AShareCollector:
                     continue
                 p = payload.split(",")
                 try:
-                    by_code[code] = {
-                        "price": float(p[1]),
-                        "change": float(p[2]),
-                        "pct": float(p[3]),
-                        "amount_wan": float(p[5]),
-                    }
+                    price = float(p[1])
+                    change = float(p[2])
+                    pct = float(p[3])
+                    amount_wan = float(p[5])
                 except (ValueError, IndexError):
                     continue
+                if (
+                    any(not math.isfinite(v) for v in (price, change, pct, amount_wan))
+                    or price <= 0
+                    or amount_wan < 0
+                ):
+                    continue
+                by_code[code] = {
+                    "price": price,
+                    "change": change,
+                    "pct": pct,
+                    "amount_wan": amount_wan,
+                }
+            missing = [c for c, _ in ALL_FETCH_INDICES if c not in by_code]
+            if missing:
+                return [], by_code, f"指数行情返回不完整（缺少: {', '.join(missing)}）"
             out = [
                 {"name": name, **by_code[code]}
                 for code, name in DISPLAY_INDICES
-                if code in by_code
             ]
-            if not out or "s_sh000001" not in by_code or "s_sz399106" not in by_code:
-                missing = [
-                    c for c, _ in ALL_FETCH_INDICES if c not in by_code
-                ]
-                return out, by_code, f"指数行情返回不完整（缺少: {', '.join(missing)}）"
             return out, by_code, None
         except Exception as exc:
             return [], {}, f"指数行情拉取失败: {exc}"
@@ -553,12 +560,41 @@ class AShareCollector:
                 "?fields=f104,f105,f106&secids=1.000001,0.399001,0.899050",
                 timeout=10,
             )
-            diff = j["data"]["diff"]
-            if not diff:
+            data = j.get("data") if isinstance(j, dict) else None
+            diff = data.get("diff") if isinstance(data, dict) else None
+            if not isinstance(diff, list) or not diff:
                 return None, "涨跌家数接口返回空"
-            up = sum(int(d["f104"]) for d in diff)
-            down = sum(int(d["f105"]) for d in diff)
-            flat = sum(int(d["f106"]) for d in diff)
+            if len(diff) != 3:
+                return None, f"涨跌家数返回市场数不足（仅 {len(diff)}/3 个市场）"
+            up = 0
+            down = 0
+            flat = 0
+            seen_markets: set[str] = set()
+            for item in diff:
+                if not isinstance(item, dict):
+                    return None, "涨跌家数记录格式无效"
+                mkt = item.get("f12")
+                if mkt is not None:
+                    mkt_key = str(mkt).strip()
+                    if not mkt_key or mkt_key in seen_markets:
+                        return None, f"涨跌家数存在重复或无效市场代码: {mkt!r}"
+                    seen_markets.add(mkt_key)
+                vals: list[int] = []
+                for field in ("f104", "f105", "f106"):
+                    raw_val = item.get(field)
+                    if raw_val is None or isinstance(raw_val, bool):
+                        return None, f"涨跌家数缺少字段 {field}"
+                    if isinstance(raw_val, float) and (not math.isfinite(raw_val) or not raw_val.is_integer()):
+                        return None, f"涨跌家数数值无效 {field}={raw_val!r}"
+                    val = int(raw_val)
+                    if val < 0:
+                        return None, f"涨跌家数出现负值 {field}={val}"
+                    vals.append(val)
+                up += vals[0]
+                down += vals[1]
+                flat += vals[2]
+            if up + down + flat <= 0:
+                return None, "涨跌家数合计为 0"
             ratio = round(up / down, 2) if down else 0.0
             return {"up": up, "down": down, "flat": flat, "ratio": ratio}, None
         except Exception as exc:
@@ -655,18 +691,31 @@ class AShareCollector:
 
             rows: list[dict[str, Any]] = []
             seen: set[str] = set()
+            bad_rows = 0
+            dups = 0
             for d in raw:
-                code = str(d.get("f12") or "")
+                if not isinstance(d, dict):
+                    bad_rows += 1
+                    continue
+                code = str(d.get("f12") or "").strip()
                 market = d.get("f13")
-                name = d.get("f14") or ""
-                if not code or market not in (0, 1) or code in seen:
+                turnover = d.get("f6")
+                if not code or market not in (0, 1) or (
+                    isinstance(turnover, (int, float))
+                    and not isinstance(turnover, bool)
+                    and not math.isfinite(turnover)
+                ):
+                    bad_rows += 1
+                    continue
+                if code in seen:
+                    dups += 1
                     continue
                 seen.add(code)
+                name = d.get("f14") or ""
                 classified = classify_etf(name)
                 if not classified:
                     continue
                 category, direction = classified
-                turnover = d.get("f6")
                 flow = d.get("f62")
                 price = d.get("f2")
                 pct = d.get("f3")
@@ -679,14 +728,23 @@ class AShareCollector:
                         "category": category,
                         "direction": direction,
                         "track_key": etf_track_key(name, direction),
-                        "price": price if isinstance(price, (int, float)) and not isinstance(price, bool) else None,
-                        "pct": pct if isinstance(pct, (int, float)) and not isinstance(pct, bool) else None,
+                        "price": price if isinstance(price, (int, float)) and not isinstance(price, bool) and math.isfinite(price) else None,
+                        "pct": pct if isinstance(pct, (int, float)) and not isinstance(pct, bool) and math.isfinite(pct) else None,
                         "turnover_yi": round(turnover / 1e8, 3) if isinstance(turnover, (int, float)) and not isinstance(turnover, bool) else 0.0,
-                        "inflow_yi": round(flow / 1e8, 3) if isinstance(flow, (int, float)) and not isinstance(flow, bool) else 0.0,
-                        "share": d.get("f184") if isinstance(d.get("f184"), (int, float)) and not isinstance(d.get("f184"), bool) else None,
-                        "market_cap_yi": round(mcap / 1e8, 2) if isinstance(mcap, (int, float)) and not isinstance(mcap, bool) else None,
+                        "inflow_yi": round(flow / 1e8, 3) if isinstance(flow, (int, float)) and not isinstance(flow, bool) and math.isfinite(flow) else 0.0,
+                        "share": d.get("f184") if isinstance(d.get("f184"), (int, float)) and not isinstance(d.get("f184"), bool) and math.isfinite(d.get("f184")) else None,
+                        "market_cap_yi": round(mcap / 1e8, 2) if isinstance(mcap, (int, float)) and not isinstance(mcap, bool) and math.isfinite(mcap) else None,
                     }
                 )
+            if bad_rows > 0 or dups > 0 or len(seen) != total:
+                prev_ok = self._prior_source_success("etf_radar")
+                err = (
+                    f"ETF 分页完整性异常 (唯一代码 {len(seen)}/{total}，重复 {dups}，无效 {bad_rows}"
+                    f"；上次成功：{prev_ok or '无'})"
+                )
+                self._etf_scan_cache["ts"] = now
+                self._etf_scan_cache["error"] = err
+                return self._etf_scan_cache["rows"], self._etf_scan_cache["total"], err
             if not rows:
                 raise RuntimeError("场内 ETF 扫描返回空列表")
             self._etf_scan_cache = {
@@ -825,20 +883,57 @@ class AShareCollector:
                 return self._stock_scan_cache["rows"], err
 
             rows: list[dict[str, Any]] = []
+            seen_codes: set[str] = set()
+            bad_rows = 0
+            dups = 0
             for item in raw:
-                code = str(item.get("f12") or "").zfill(6)
-                turnover, flow, pct = item.get("f6"), item.get("f62"), item.get("f3")
-                if not code.isdigit() or not isinstance(turnover, (int, float)):
+                if not isinstance(item, dict):
+                    bad_rows += 1
                     continue
+                raw_code = str(item.get("f12") or "").strip()
+                code = raw_code.zfill(6) if raw_code else ""
+                turnover, flow, pct = item.get("f6"), item.get("f62"), item.get("f3")
+                if (
+                    not code.isdigit()
+                    or not isinstance(turnover, (int, float))
+                    or isinstance(turnover, bool)
+                    or not math.isfinite(turnover)
+                ):
+                    bad_rows += 1
+                    continue
+                if code in seen_codes:
+                    dups += 1
+                    continue
+                seen_codes.add(code)
+                inflow_val = (
+                    flow / 1e8
+                    if isinstance(flow, (int, float)) and not isinstance(flow, bool) and math.isfinite(flow)
+                    else 0.0
+                )
+                pct_val = (
+                    pct
+                    if isinstance(pct, (int, float)) and not isinstance(pct, bool) and math.isfinite(pct)
+                    else 0.0
+                )
                 rows.append(
                     {
                         "code": code,
                         "name": item.get("f14") or "",
-                        "pct": pct if isinstance(pct, (int, float)) else 0.0,
+                        "pct": pct_val,
                         "turnover_yi": turnover / 1e8,
-                        "inflow_yi": flow / 1e8 if isinstance(flow, (int, float)) else 0.0,
+                        "inflow_yi": inflow_val,
                     }
                 )
+            if bad_rows > 0 or dups > 0 or len(seen_codes) != total:
+                prev_ok = self._prior_source_success("industry")
+                err = (
+                    f"个股资金分页完整性异常 (唯一代码 {len(seen_codes)}/{total}，重复 {dups}，无效 {bad_rows}"
+                    f"；上次成功：{prev_ok or '无'})"
+                )
+                # Preserve last complete rows; do not cache incomplete rows
+                self._stock_scan_cache["ts"] = now
+                self._stock_scan_cache["error"] = err
+                return self._stock_scan_cache["rows"], err
             if not rows:
                 raise RuntimeError("全市场个股资金扫描返回空")
             self._stock_scan_cache = {
@@ -1261,6 +1356,24 @@ class AShareCollector:
         )
         return _strip_jsonp(text).get("result") or []
 
+    @staticmethod
+    def _prev_cn_trading_day(day: date) -> date:
+        try:
+            return previous_trading_day("cn", day)
+        except CalendarLookupError:
+            cursor = day - timedelta(days=1)
+            while cursor.weekday() >= 5:
+                cursor -= timedelta(days=1)
+            return cursor
+
+    @staticmethod
+    def _parse_cn_trade_date(raw_date: Any, label: str) -> date:
+        text = str(raw_date or "").strip()
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise RuntimeError(f"{label}日期格式无效: {raw_date!r}") from exc
+
     def _fetch_sse_pairs(self, codes: list[str]) -> dict[str, tuple[Any, Any]]:
         wanted = set(codes)
         if not wanted:
@@ -1268,23 +1381,39 @@ class AShareCollector:
         latest_rows = self._sse_share_day("")
         if not latest_rows:
             raise RuntimeError("上交所官方份额接口返回空列表")
+        today_cn = self._now().astimezone(CN_TZ).date()
+        expected_prev_today = self._prev_cn_trading_day(today_cn)
         latest_day = str(latest_rows[0].get("STAT_DATE") or "").strip()
-        try:
-            base = datetime.strptime(latest_day, "%Y-%m-%d").date()
-        except ValueError as exc:
-            raise RuntimeError(f"上交所官方份额缺少有效 STAT_DATE: {latest_day!r}") from exc
+        base = self._parse_cn_trade_date(latest_day, "上交所官方份额")
+        if base > today_cn:
+            raise RuntimeError(
+                f"上交所官方份额出现未来日期: {base.isoformat()} > {today_cn.isoformat()}"
+            )
+        if base < expected_prev_today:
+            raise RuntimeError(
+                f"上交所官方份额最新日期过期: {base.isoformat()} < {expected_prev_today.isoformat()}"
+            )
 
         latest: dict[str, tuple[str, float]] = {}
         for r in latest_rows:
             sec = str(r.get("SEC_CODE") or "").strip()
             if sec not in wanted:
                 continue
+            stat_d = str(r.get("STAT_DATE") or latest_day).strip()
+            row_d = self._parse_cn_trade_date(stat_d, f"上交所官方份额({sec})")
+            if row_d > today_cn:
+                raise RuntimeError(
+                    f"上交所官方份额({sec})出现未来日期: {row_d.isoformat()} > {today_cn.isoformat()}"
+                )
+            if row_d != base:
+                continue
             try:
                 val = float(str(r.get("TOT_VOL", "")).replace(",", ""))
-                stat_d = str(r.get("STAT_DATE") or latest_day).strip()
-                if not stat_d or math.isnan(val) or math.isinf(val):
+                if not math.isfinite(val):
                     continue
-                latest[sec] = (stat_d, val)
+                if sec in latest:
+                    raise RuntimeError(f"上交所官方份额({sec})最新日重复记录: {stat_d}")
+                latest[sec] = (row_d.isoformat(), val)
             except (TypeError, ValueError):
                 continue
 
@@ -1294,44 +1423,47 @@ class AShareCollector:
                 f"上交所官方份额缺少代表 ETF 最新记录: {', '.join(missing_latest[:5])}"
             )
 
+        expected_prev_base = self._prev_cn_trading_day(base)
+        prev_rows = self._sse_share_day(expected_prev_base.isoformat())
         previous: dict[str, tuple[str, float]] = {}
-        for gap in range(1, 10):
-            d = base - timedelta(days=gap)
-            try:
-                if not is_trading_day("cn", d):
-                    continue
-            except CalendarLookupError:
-                if d.weekday() >= 5:
-                    continue
-            prev_rows = self._sse_share_day(d.isoformat())
-            if not prev_rows:
+        for r in prev_rows:
+            sec = str(r.get("SEC_CODE") or "").strip()
+            if sec not in wanted:
                 continue
-            for r in prev_rows:
-                sec = str(r.get("SEC_CODE") or "").strip()
-                if sec not in wanted or sec in previous:
+            stat_d = str(r.get("STAT_DATE") or "").strip()
+            if not stat_d:
+                continue
+            prev_d = self._parse_cn_trade_date(stat_d, f"上交所官方份额前一期({sec})")
+            if prev_d > today_cn:
+                raise RuntimeError(
+                    f"上交所官方份额({sec})前一期出现未来日期: {prev_d.isoformat()} > {today_cn.isoformat()}"
+                )
+            if prev_d >= base:
+                raise RuntimeError(
+                    f"上交所官方份额({sec})日期非严格递增: {prev_d.isoformat()} >= {base.isoformat()}"
+                )
+            if prev_d != expected_prev_base:
+                continue
+            try:
+                val = float(str(r.get("TOT_VOL", "")).replace(",", ""))
+                if not math.isfinite(val):
                     continue
-                stat_d = str(r.get("STAT_DATE") or "").strip()
-                if not stat_d or stat_d == latest[sec][0]:
-                    continue
-                try:
-                    val = float(str(r.get("TOT_VOL", "")).replace(",", ""))
-                    if math.isnan(val) or math.isinf(val):
-                        continue
-                    previous[sec] = (stat_d, val)
-                except (TypeError, ValueError):
-                    continue
-            if wanted.issubset(previous.keys()):
-                break
+                if sec in previous:
+                    raise RuntimeError(f"上交所官方份额({sec})前一期重复记录: {stat_d}")
+                previous[sec] = (prev_d.isoformat(), val)
+            except (TypeError, ValueError):
+                continue
 
         missing_prev = sorted(wanted - set(previous.keys()))
         if missing_prev:
             raise RuntimeError(
-                f"上交所官方份额缺少前一期有效记录: {', '.join(missing_prev[:5])}"
+                f"上交所官方份额缺少前一期有效交易日({expected_prev_base.isoformat()})记录: {', '.join(missing_prev[:5])}"
             )
         return {code: (latest[code], previous[code]) for code in wanted}
 
     def _fetch_szse_pair(self, code: str) -> tuple[Any, Any]:
         end = self._now().astimezone(CN_TZ).date()
+        expected_prev_today = self._prev_cn_trading_day(end)
         start = end - timedelta(days=14)
         params = {
             "SHOWTYPE": "JSON",
@@ -1353,25 +1485,41 @@ class AShareCollector:
         rows = (payload[0].get("data") if isinstance(payload, list) and payload else None) or []
         if not rows:
             raise RuntimeError(f"深交所官方份额({code})返回空记录")
-        by_date: dict[str, float] = {}
+        by_date: dict[date, float] = {}
         for r in rows:
             if str(r.get("fund_code")) != code:
                 continue
             sdate = str(r.get("size_date") or "").strip()
-            if not sdate:
-                continue
+            parsed_d = self._parse_cn_trade_date(sdate, f"深交所官方份额({code})")
+            if parsed_d > end:
+                raise RuntimeError(
+                    f"深交所官方份额({code})出现未来日期: {parsed_d.isoformat()} > {end.isoformat()}"
+                )
+            if parsed_d in by_date:
+                raise RuntimeError(f"深交所官方份额({code})存在重复日期: {parsed_d.isoformat()}")
             try:
                 val = float(str(r.get("current_size", "")).replace(",", ""))
             except (TypeError, ValueError):
                 continue
-            if not (math.isnan(val) or math.isinf(val)):
-                by_date[sdate] = val
-        points = sorted(by_date.items(), reverse=True)
+            if math.isfinite(val):
+                by_date[parsed_d] = val
+        points = sorted(by_date.items(), key=lambda kv: kv[0], reverse=True)
         if not points:
             raise RuntimeError(f"深交所官方份额({code})未解析到有效日期")
         if len(points) < 2:
             raise RuntimeError(f"深交所官方份额({code})缺少前一期记录")
-        return (points[0], points[1])
+        latest_d, latest_val = points[0]
+        prev_d, prev_val = points[1]
+        if latest_d < expected_prev_today:
+            raise RuntimeError(
+                f"深交所官方份额({code})最新日期过期: {latest_d.isoformat()} < {expected_prev_today.isoformat()}"
+            )
+        expected_prev_d = self._prev_cn_trading_day(latest_d)
+        if not (prev_d < latest_d) or prev_d != expected_prev_d:
+            raise RuntimeError(
+                f"深交所官方份额({code})前一期日期非相邻交易日: {prev_d.isoformat()} (期望 {expected_prev_d.isoformat()})"
+            )
+        return ((latest_d.isoformat(), latest_val), (prev_d.isoformat(), prev_val))
 
     def _store_unit_pairs(self, pairs: dict[str, tuple[Any, Any]]) -> None:
         values = []
@@ -1735,7 +1883,7 @@ class AShareCollector:
             )
 
         idx_fail_reason = idx_err or ("指数行情缺失" if not indices else None)
-        if not indices and prev.get("indices"):
+        if (idx_fail_reason or not indices) and prev.get("indices"):
             indices = prev["indices"]
         source_results.append(
             make_source_result(
@@ -1769,7 +1917,7 @@ class AShareCollector:
         )
 
         brd_reason = brd_err or ("涨跌家数缺失" if breadth is None else None)
-        if breadth is None and prev.get("breadth"):
+        if (brd_reason or breadth is None) and prev.get("breadth"):
             breadth = prev["breadth"]
         source_results.append(
             make_source_result(

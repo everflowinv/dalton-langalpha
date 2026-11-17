@@ -298,20 +298,20 @@ def _fixture_http_handlers(
         if "q.stock.sohu.com" in url:
             return sohu_html
         if "query.sse.com.cn" in url:
-            if "STAT_DATE=2026-11-" in url and "STAT_DATE=2026-11-15" not in url:
+            if "STAT_DATE=2026-11-" in url and "STAT_DATE=2026-11-13" not in url:
                 return 'jsonpCallback(' + json.dumps(
                     {
                         "result": [
-                            {"SEC_CODE": "512480", "STAT_DATE": "2026-11-14", "TOT_VOL": "95000"},
-                            {"SEC_CODE": "510300", "STAT_DATE": "2026-11-14", "TOT_VOL": "490000"},
+                            {"SEC_CODE": "512480", "STAT_DATE": "2026-11-12", "TOT_VOL": "95000"},
+                            {"SEC_CODE": "510300", "STAT_DATE": "2026-11-12", "TOT_VOL": "490000"},
                         ]
                     }
                 ) + ')'
             return 'jsonpCallback(' + json.dumps(
                 {
                     "result": [
-                        {"SEC_CODE": "512480", "STAT_DATE": "2026-11-15", "TOT_VOL": "100000"},
-                        {"SEC_CODE": "510300", "STAT_DATE": "2026-11-15", "TOT_VOL": "500000"},
+                        {"SEC_CODE": "512480", "STAT_DATE": "2026-11-13", "TOT_VOL": "100000"},
+                        {"SEC_CODE": "510300", "STAT_DATE": "2026-11-13", "TOT_VOL": "500000"},
                     ]
                 }
             ) + ')'
@@ -1913,11 +1913,11 @@ def test_hkmom_ggt_empty_page_intraday_stale_and_unhandled_exception_matrix(
         if "PAGENO=2" in url:
             return SimpleNamespace(
                 raise_for_status=lambda: None,
-                json=lambda: [{"metadata": {"pagecount": 2}, "data": []}],
+                json=lambda: [{"metadata": {"pagecount": 2, "recordcount": 2}, "data": []}],
             )
         return SimpleNamespace(
             raise_for_status=lambda: None,
-            json=lambda: [{"metadata": {"pagecount": 2}, "data": [{"zqdm": "00001", "zqjc": "长和"}]}],
+            json=lambda: [{"metadata": {"pagecount": 2, "recordcount": 2}, "data": [{"zqdm": "00001", "zqjc": "长和"}]}],
         )
 
     bad_ggt_sess = create_autospec(requests.Session, instance=True)
