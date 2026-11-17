@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""Host daemon pushing 1-minute realtime monitor data to Dalton backend.
+
+- Runs every 60 seconds during CN (09:30-11:30, 13:00-15:00) and HK
+  (09:30-12:00, 13:00-16:15) exchange trading sessions (skipping lunch breaks
+  and exchange holidays via ``exchange_calendars``).
+- Outside trading windows: writes one post-close final value per trading day,
+  then sleeps until the next trading session opens.
+- On any collection failure: retains last good value with ``stale=True``,
+  ``stale_reason``, and ``last_success_at``.
+- Reads ``INTERNAL_SERVICE_TOKEN`` from env; never embeds or logs the token.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import signal
+import sys
+import threading
+from typing import Any, Callable
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.dalton.monitor_feeds.ashare_monitor.collect import AShareCollector  # noqa: E402
+from scripts.dalton.monitor_feeds.common import (  # noqa: E402
+    CN_TZ,
+    HK_TZ,
+    MarketKind,
+    SourceStatusStore,
+    atomic_write_json,
+    load_json_safe,
+    make_source_result,
+    market_session_state,
+    next_session_open,
+    now_cn,
+    push_monitor_data,
+    resolve_state_dir,
+)
+from scripts.dalton.monitor_feeds.hk_momentum.compute import (  # noqa: E402
+    compute_intraday_snapshot,
+)
+
+logger = logging.getLogger("dalton.monitor_feeds")
+
+
+class FeedDaemon:
+    """Orchestrates 60s CN/HK realtime feeds with post-close final write & sleep."""
+
+    def __init__(
+        self,
+        *,
+        state_dir: str | Path | None = None,
+        hk_daily_dir: str | Path | None = None,
+        backend_url: str | None = None,
+        interval_seconds: float = 60.0,
+        max_idle_sleep_seconds: float = 300.0,
+        feeds: tuple[MarketKind, ...] = ("cn", "hk"),
+        cn_collect_fn: Callable[[], dict[str, Any]] | None = None,
+        hk_collect_fn: Callable[[datetime], dict[str, Any]] | None = None,
+        push_fn: Callable[..., dict[str, Any]] | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.daemon_state_dir = resolve_state_dir("_daemon", state_dir)
+        self.state_file = self.daemon_state_dir / "feed_state.json"
+        self.backend_url = (
+            backend_url
+            or os.environ.get("DALTON_BACKEND_URL")
+            or "http://127.0.0.1:8000"
+        ).rstrip("/")
+        self.interval_seconds = float(interval_seconds)
+        self.max_idle_sleep_seconds = float(max_idle_sleep_seconds)
+        self.feeds = feeds
+        self._now = now_fn or now_cn
+        self._push = push_fn or push_monitor_data
+
+        cn_state_dir = (
+            Path(state_dir) / "ashare_monitor"
+            if state_dir is not None
+            else None
+        )
+        hk_state_dir = (
+            Path(state_dir) / "hk_momentum"
+            if state_dir is not None
+            else None
+        )
+        self._hk_local_state_dir = hk_state_dir
+        default_hk_daily = (
+            hk_daily_dir
+            or os.environ.get("DALTON_HK_DAILY_STATE_DIR", "").strip()
+            or (REPO_ROOT / "var" / "dalton" / "openclaw-data" / "state" / "monitor-feeds" / "hk_momentum")
+        )
+        self.hk_daily_dir = Path(default_hk_daily)
+
+        if cn_collect_fn is not None:
+            self._cn_collect = cn_collect_fn
+        else:
+            collector = AShareCollector(state_dir=cn_state_dir, now_fn=self._now)
+            self._cn_collect = collector.collect_snapshot
+
+        if hk_collect_fn is not None:
+            self._hk_collect = hk_collect_fn
+        else:
+            self._hk_collect = lambda cur: compute_intraday_snapshot(
+                state_dir=hk_state_dir,
+                daily_state_dir=self.hk_daily_dir,
+                now=cur,
+            )
+
+        loaded = load_json_safe(self.state_file, {}) or {}
+        self._state_lock = threading.Lock()
+        self.state: dict[str, dict[str, Any]] = {
+            "cn": dict(loaded.get("cn") or {}),
+            "hk": dict(loaded.get("hk") or {}),
+        }
+
+    def _save_state(self) -> None:
+        with self._state_lock:
+            atomic_write_json(self.state_file, json.loads(json.dumps(self.state)))
+
+    def _hk_daily_dirs(self) -> list[Path]:
+        dirs: list[Path] = []
+        for candidate in (self.hk_daily_dir, self._hk_local_state_dir):
+            if candidate is not None:
+                p = Path(candidate)
+                if p not in dirs:
+                    dirs.append(p)
+        return dirs
+
+    def _hk_daily_has_trade_date(self, trade_date: str) -> bool:
+        for p in self._hk_daily_dirs():
+            series = load_json_safe(p / "index_series.json")
+            if isinstance(series, dict) and series.get("dates") and str(series["dates"][-1]) >= trade_date:
+                return True
+        return False
+
+    def _hk_daily_state_signature(self) -> str:
+        """Return compact signature of daily status/meta/series so any container update triggers a host push."""
+        parts: list[dict[str, Any]] = []
+        for p in self._hk_daily_dirs():
+            st_doc = load_json_safe(p / "status.json")
+            meta = load_json_safe(p / "index_meta.json")
+            series = load_json_safe(p / "index_series.json")
+            if not (st_doc or meta or series):
+                continue
+            overall = (st_doc or {}).get("overall") if isinstance(st_doc, dict) else {}
+            parts.append(
+                {
+                    "status_updated": (st_doc or {}).get("updated") if isinstance(st_doc, dict) else None,
+                    "overall_ok": overall.get("ok") if isinstance(overall, dict) else None,
+                    "overall_month_end_failed": overall.get("month_end_failed") if isinstance(overall, dict) else None,
+                    "overall_reason": overall.get("reason") if isinstance(overall, dict) else None,
+                    "meta_updated": (meta or {}).get("updated") if isinstance(meta, dict) else None,
+                    "meta_month_end_failed": (meta or {}).get("month_end_failed") if isinstance(meta, dict) else None,
+                    "meta_stale_reason": (meta or {}).get("stale_reason") if isinstance(meta, dict) else None,
+                    "series_last": str(series["dates"][-1]) if isinstance(series, dict) and series.get("dates") else None,
+                }
+            )
+        return json.dumps(parts, ensure_ascii=False, sort_keys=True) if parts else ""
+
+    def _hk_daily_status_overlay(self) -> dict[str, Any]:
+        """Read latest daily status/meta from disk so month-end or daily failures always propagate to host pushes."""
+        sources: dict[str, Any] = {}
+        reasons: list[str] = []
+        month_end_failed = False
+        daily_last_ok: str | None = None
+        for p in reversed(self._hk_daily_dirs()):
+            st_doc = load_json_safe(p / "status.json")
+            if isinstance(st_doc, dict):
+                if isinstance(st_doc.get("sources"), dict):
+                    sources.update(st_doc["sources"])
+                overall = st_doc.get("overall") or {}
+                if isinstance(overall, dict):
+                    if overall.get("month_end_failed"):
+                        month_end_failed = True
+                    if overall.get("last_success_at"):
+                        daily_last_ok = str(overall["last_success_at"])
+            meta = load_json_safe(p / "index_meta.json")
+            if isinstance(meta, dict):
+                if isinstance(meta.get("source_statuses"), dict):
+                    sources.update(meta["source_statuses"])
+                if meta.get("month_end_failed"):
+                    month_end_failed = True
+                if (meta.get("month_end_failed") or meta.get("stale")) and meta.get("stale_reason"):
+                    r = str(meta["stale_reason"])
+                    if r not in reasons:
+                        reasons.append(r)
+                if not daily_last_ok and meta.get("last_success_at"):
+                    daily_last_ok = str(meta["last_success_at"])
+        return {
+            "sources": sources,
+            "reasons": reasons,
+            "month_end_failed": month_end_failed,
+            "daily_last_success_at": daily_last_ok,
+        }
+
+    def _hk_daily_is_stale_or_failed(self) -> bool:
+        ov = self._hk_daily_status_overlay()
+        if ov["month_end_failed"] or ov["reasons"]:
+            return True
+        for entry in ov["sources"].values():
+            if isinstance(entry, dict) and (entry.get("stale") or not entry.get("ok", True)):
+                return True
+        return False
+
+    def _collect_and_push_one(
+        self,
+        market: MarketKind,
+        cur: datetime,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        sess = market_session_state(market, cur)
+        slug, data_key = (
+            ("cn-intraday", "snapshot") if market == "cn" else ("hk-momentum", "intraday")
+        )
+        tz = CN_TZ if market == "cn" else HK_TZ
+        cur_local = cur.astimezone(tz)
+        cur_str = cur_local.strftime("%Y-%m-%d %H:%M:%S")
+        cur_iso = cur_local.isoformat(timespec="seconds")
+        trade_date = str(sess["trade_date"])
+
+        with self._state_lock:
+            fstate_snap = dict(self.state[market])
+
+        # Calendar error must be reported & pushed BEFORE skipping collection.
+        if sess.get("calendar_error"):
+            cal_st = make_source_result(
+                "calendar",
+                ok=False,
+                stale=True,
+                reason=f"交易日历不可用: {sess['calendar_error']}",
+                label="交易日历",
+            )
+            daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
+            status_doc = daemon_store.update_sources([cal_st], required=["calendar"], now_str=f"{cur_str} 北京时间")
+            payload = dict(fstate_snap.get("last_good_payload") or {})
+            merged_sources = dict(payload.get("sources") or {})
+            merged_sources.update(status_doc["sources"])
+            payload.update(
+                {
+                    "as_of": cur_str,
+                    "as_of_iso": cur_iso,
+                    "tz": "北京时间",
+                    "trade_date": trade_date,
+                    "trading": False,
+                    "market_status": "calendar_error",
+                    "market_status_label": "交易日历不可用",
+                    "stale": True,
+                    "stale_reason": f"交易日历不可用: {sess['calendar_error']}",
+                    "last_success_at": fstate_snap.get("last_success_at"),
+                    "sources": merged_sources,
+                }
+            )
+            try:
+                self._push(
+                    slug,
+                    data_key,
+                    payload,
+                    as_of=cur_iso,
+                    backend_url=self.backend_url,
+                )
+            except Exception as exc:
+                logger.warning("Calendar error push failed for %s/%s: %s", slug, data_key, exc)
+                return {
+                    "market": market,
+                    "action": "push_failed",
+                    "stale": True,
+                    "error": str(exc),
+                }
+            return {
+                "market": market,
+                "action": "calendar_error",
+                "stale": True,
+                "as_of": payload.get("as_of"),
+            }
+
+        in_window = bool(sess["in_trading_window"])
+        is_closed_td = bool(sess["is_trading_day"]) and sess["status"] == "closed"
+        needs_post_close = is_closed_td and fstate_snap.get("post_close_written_date") != trade_date
+        needs_hk_daily_sync = (
+            market == "hk"
+            and is_closed_td
+            and fstate_snap.get("post_close_daily_synced_date") != trade_date
+            and self._hk_daily_has_trade_date(trade_date)
+        )
+        current_daily_sig = self._hk_daily_state_signature() if market == "hk" else ""
+        daily_state_changed = (
+            market == "hk"
+            and bool(current_daily_sig)
+            and current_daily_sig != fstate_snap.get("last_hk_daily_sig")
+        )
+        if (
+            not force
+            and not in_window
+            and not needs_post_close
+            and not needs_hk_daily_sync
+            and not daily_state_changed
+        ):
+            return {"market": market, "action": "skip", "status": sess["status"]}
+
+        daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
+        try:
+            payload = (
+                self._cn_collect()
+                if market == "cn"
+                else self._hk_collect(cur_local)
+            )
+            if not isinstance(payload, dict):
+                raise RuntimeError("采集结果格式无效")
+        except Exception as exc:
+            with self._state_lock:
+                fstate_cur = dict(self.state[market])
+            daemon_err_st = make_source_result(
+                f"{market}_collector",
+                ok=False,
+                stale=True,
+                reason=f"采集异常: {exc}",
+                label="实时采集",
+            )
+            status_doc = daemon_store.update_sources(
+                [daemon_err_st], required=[f"{market}_collector"], now_str=f"{cur_str} 北京时间"
+            )
+            payload = dict(fstate_cur.get("last_good_payload") or {})
+            merged_sources = dict(payload.get("sources") or {})
+            merged_sources.update(status_doc["sources"])
+            payload.update(
+                {
+                    "as_of": cur_str,
+                    "as_of_iso": cur_iso,
+                    "tz": "北京时间",
+                    "trade_date": trade_date,
+                    "trading": in_window,
+                    "market_status": sess["status"],
+                    "market_status_label": sess["label"],
+                    "stale": True,
+                    "stale_reason": f"采集异常: {exc}",
+                    "last_success_at": fstate_cur.get("last_success_at"),
+                    "sources": merged_sources,
+                }
+            )
+        else:
+            if market == "hk":
+                # Ensure daily container state (especially month-end failure without host token) surfaces cleanly.
+                ov = self._hk_daily_status_overlay()
+                if ov["sources"]:
+                    merged_sources = dict(ov["sources"])
+                    if isinstance(payload.get("sources"), dict):
+                        merged_sources.update(payload["sources"])
+                    payload["sources"] = merged_sources
+                if ov["month_end_failed"] or ov["reasons"]:
+                    payload["stale"] = True
+                    if ov["month_end_failed"]:
+                        payload["month_end_failed"] = True
+                    existing_parts = [p for p in str(payload.get("stale_reason") or "").split("；") if p]
+                    for r in ov["reasons"]:
+                        if r not in existing_parts:
+                            existing_parts.append(r)
+                    payload["stale_reason"] = "；".join(existing_parts) if existing_parts else None
+            with self._state_lock:
+                if not payload.get("stale"):
+                    self.state[market]["last_good_payload"] = payload
+                    self.state[market]["last_success_at"] = payload.get("last_success_at") or cur_str
+                elif not payload.get("last_success_at") and self.state[market].get("last_success_at"):
+                    payload["last_success_at"] = self.state[market]["last_success_at"]
+
+        try:
+            self._push(
+                slug,
+                data_key,
+                payload,
+                as_of=payload.get("as_of_iso") or cur_iso,
+                backend_url=self.backend_url,
+            )
+        except Exception as exc:
+            logger.warning("Push failed for %s/%s: %s", slug, data_key, exc)
+            self._save_state()
+            return {
+                "market": market,
+                "action": "push_failed",
+                "stale": bool(payload.get("stale")),
+                "error": str(exc),
+            }
+
+        is_stale = bool(payload.get("stale"))
+        with self._state_lock:
+            if market == "hk" and current_daily_sig:
+                self.state[market]["last_hk_daily_sig"] = current_daily_sig
+            if is_closed_td and not in_window and not is_stale:
+                sc = payload.get("smallcap") or {}
+                ng = payload.get("nonggt") or {}
+                pushed_daily_date = payload.get("daily_close_date") or payload.get("trade_date") or trade_date
+                both_daily_close = (
+                    market == "hk"
+                    and isinstance(sc, dict)
+                    and isinstance(ng, dict)
+                    and sc.get("source") == "daily_close"
+                    and ng.get("source") == "daily_close"
+                    and pushed_daily_date == trade_date
+                    and not self._hk_daily_is_stale_or_failed()
+                )
+                if needs_post_close:
+                    self.state[market]["post_close_written_date"] = trade_date
+                if both_daily_close:
+                    self.state[market]["post_close_daily_synced_date"] = trade_date
+        self._save_state()
+        if (needs_hk_daily_sync or daily_state_changed) and not needs_post_close and not in_window:
+            action = "post_close_daily_sync"
+        elif needs_post_close and not in_window:
+            action = "post_close"
+        else:
+            action = "pushed"
+        return {
+            "market": market,
+            "action": action,
+            "stale": is_stale,
+            "as_of": payload.get("as_of"),
+        }
+
+    def run_tick(self, *, now: datetime | None = None, force: bool = False) -> list[dict[str, Any]]:
+        cur = now or self._now()
+        if len(self.feeds) <= 1:
+            return [self._collect_and_push_one(m, cur, force=force) for m in self.feeds]
+        with ThreadPoolExecutor(max_workers=len(self.feeds)) as ex:
+            futures = [ex.submit(self._collect_and_push_one, m, cur, force=force) for m in self.feeds]
+            return [f.result() for f in futures]
+
+    def _aligned_interval_wait(self, cur: datetime) -> float:
+        ts = cur.timestamp()
+        interval = max(1.0, self.interval_seconds)
+        next_boundary = (math.floor(ts / interval) + 1.0) * interval
+        return max(0.05, next_boundary - ts)
+
+    def compute_sleep_seconds_for(self, market: MarketKind, *, now: datetime | None = None) -> float:
+        cur = now or self._now()
+        sess = market_session_state(market, cur)
+        if sess.get("calendar_error") or sess["in_trading_window"]:
+            return self._aligned_interval_wait(cur)
+        trade_date = str(sess["trade_date"])
+        with self._state_lock:
+            fstate = dict(self.state[market])
+        if sess["is_trading_day"] and sess["status"] == "closed":
+            if fstate.get("post_close_written_date") != trade_date:
+                return self._aligned_interval_wait(cur)
+            close_hm = int(sess.get("close_hm") or 960)
+            if (
+                market == "hk"
+                and (
+                    fstate.get("post_close_daily_synced_date") != trade_date
+                    or self._hk_daily_is_stale_or_failed()
+                )
+                and sess["hm"] <= close_hm + 90
+            ):
+                return self._aligned_interval_wait(cur)
+        nxt = next_session_open(market, cur)
+        delta = max(1.0, nxt.timestamp() - cur.timestamp())
+        return min(delta, self.max_idle_sleep_seconds)
+
+    def compute_sleep_seconds(self, *, now: datetime | None = None) -> float:
+        cur = now or self._now()
+        if not self.feeds:
+            return self._aligned_interval_wait(cur)
+        return min(self.compute_sleep_seconds_for(m, now=cur) for m in self.feeds)
+
+    def run_market_loop(
+        self,
+        market: MarketKind,
+        *,
+        stop_event: threading.Event | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        stop = stop_event or threading.Event()
+        iters = 0
+        while not stop.is_set():
+            self._collect_and_push_one(market, self._now())
+            iters += 1
+            if max_iterations is not None and iters >= max_iterations:
+                break
+            wait_sec = self.compute_sleep_seconds_for(market)
+            if stop.wait(timeout=wait_sec):
+                break
+
+    def run_loop(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        stop = stop_event or threading.Event()
+        if len(self.feeds) <= 1:
+            for market in self.feeds:
+                self.run_market_loop(market, stop_event=stop, max_iterations=max_iterations)
+            return
+        threads = [
+            threading.Thread(
+                target=self.run_market_loop,
+                args=(market,),
+                kwargs={"stop_event": stop, "max_iterations": max_iterations},
+                name=f"feed-{market}",
+                daemon=True,
+            )
+            for market in self.feeds
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="Run Dalton monitor realtime feeds daemon.")
+    parser.add_argument("--state-dir", default=None)
+    parser.add_argument("--hk-daily-dir", default=None)
+    parser.add_argument("--backend-url", default=None)
+    parser.add_argument("--interval", type=float, default=60.0)
+    parser.add_argument("--feeds", default="cn,hk", help="Comma-separated feeds: cn,hk")
+    parser.add_argument("--once", action="store_true", help="Force one immediate collect+push cycle and exit")
+    args = parser.parse_args()
+
+    selected = tuple(
+        f.strip() for f in args.feeds.split(",") if f.strip() in ("cn", "hk")
+    )
+    if not selected:
+        raise SystemExit("No valid feeds selected (expected cn,hk)")
+
+    daemon = FeedDaemon(
+        state_dir=args.state_dir,
+        hk_daily_dir=args.hk_daily_dir,
+        backend_url=args.backend_url,
+        interval_seconds=args.interval,
+        feeds=selected,  # type: ignore[arg-type]
+    )
+    if args.once:
+        res = daemon.run_tick(force=True)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+
+    stop = threading.Event()
+
+    def _handle_sig(_signum, _frame) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _handle_sig)
+    signal.signal(signal.SIGINT, _handle_sig)
+    logger.info("Starting monitor feeds daemon (feeds=%s, interval=%.0fs)", selected, args.interval)
+    daemon.run_loop(stop_event=stop)
+    logger.info("Monitor feeds daemon stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

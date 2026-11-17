@@ -965,3 +965,82 @@ tasks:
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
+
+  # Monitors (Round 2: Migrated local dashboards — PM L1/L2, A-share intraday shell, HK momentum)
+  - task_code: "T84"
+    job_key: "pm-market-state"
+    title: "市场状态与板块强弱（美股L1/L2与A股申万一二级行业轮动/估值）每日构建"
+    batch_no: 3
+    runner: "container"
+    cron: "15 17 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 2400
+    no_output_timeout_seconds: 1800
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "/app/.venv/bin/python /app/scripts/dalton/monitor_feeds/pm_cockpit/run.py --state-dir state/monitor-feeds/pm_cockpit --output-dir research-outputs/pm-market-state --json"
+    command_argv:
+      - "/app/.venv/bin/python"
+      - "/app/scripts/dalton/monitor_feeds/pm_cockpit/run.py"
+      - "--state-dir"
+      - "state/monitor-feeds/pm_cockpit"
+      - "--output-dir"
+      - "research-outputs/pm-market-state"
+      - "--json"
+    secret_names: []
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T85"
+    job_key: "cn-intraday"
+    title: "A股盘中监测静态面板与30日历史每日收盘重建"
+    batch_no: 3
+    runner: "container"
+    cron: "20 15 * * 1-5"
+    timezone: "Asia/Shanghai"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 300
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "/app/.venv/bin/python /app/scripts/dalton/monitor_feeds/ashare_monitor/run.py --state-dir state/monitor-feeds/ashare_monitor --output-dir research-outputs/cn-intraday --json"
+    command_argv:
+      - "/app/.venv/bin/python"
+      - "/app/scripts/dalton/monitor_feeds/ashare_monitor/run.py"
+      - "--state-dir"
+      - "state/monitor-feeds/ashare_monitor"
+      - "--output-dir"
+      - "research-outputs/cn-intraday"
+      - "--json"
+    secret_names: []
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T86"
+    job_key: "hk-momentum"
+    title: "港股动量指数每日收盘重算与面板构建"
+    batch_no: 3
+    runner: "container"
+    cron: "35 16 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 1800
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "/app/.venv/bin/python /app/scripts/dalton/monitor_feeds/hk_momentum/run.py --state-dir state/monitor-feeds/hk_momentum --output-dir research-outputs/hk-momentum --json"
+    command_argv:
+      - "/app/.venv/bin/python"
+      - "/app/scripts/dalton/monitor_feeds/hk_momentum/run.py"
+      - "--state-dir"
+      - "state/monitor-feeds/hk_momentum"
+      - "--output-dir"
+      - "research-outputs/hk-momentum"
+      - "--json"
+    secret_names: []
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
