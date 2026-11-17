@@ -83,7 +83,7 @@ add-expert --company Cloudflare --ticker NET --track tob_software --period 2026Q
   # alignment: confirms | contradicts | extends | unrelated | no_management_claim
   # 判 contradicts 必须带 --management-ref，否则拒收：无法复核的矛盾没有价值
 experts --ticker NET [--since 2025Q1] [--alignment contradicts]
-company-history --ticker NET [--full] # 单家公司各分片历史；默认只回期间、来源日期等索引，--full 回完整记录；缺失分片返回空列表
+company-history --ticker NET [--full] # 单家公司各分片历史；默认只返回期间、来源日期等索引，--full 返回完整记录；缺失分片返回空列表
 contradictions [--tickers NET,PLTR | --track ... | --all] [--since 2025Q1]
 coverage-ledger [--since 2025Q1] [--until 2026Q2] [--track ...] [--write]
 backfill-plan [--layer profile|company|expert] [--batch-size 12]
