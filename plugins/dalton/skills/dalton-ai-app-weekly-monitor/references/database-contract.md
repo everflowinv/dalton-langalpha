@@ -21,6 +21,8 @@ state/ai_app_db/
 
 按公司分片不是为了好看，是三个实际问题：并行回填时几十个批次同时往一个 jsonl 追加会写坏行；某家抽漏了删掉目录重跑就行，不用在两万行文件里做外科手术；深度报告只读点名的那几家，不必整库扫一遍。
 
+某家公司的分片文件（`fundamentals.jsonl`、`metrics.jsonl`、`quotes.jsonl`、`experts.jsonl`）按需生成：某家还没有录入过该类记录时，对应分片文件不存在，表示该公司这一类记录为空，按空处理继续（`read_jsonl` 对缺失文件返回空列表）。读取单家公司历史记录优先用 CLI 子命令（`company-history --ticker <TICKER>`、`quotes`、`experts`、`export`），不要直接用 shell 读分片文件。
+
 旧的 `state/ai_app_metrics.jsonl` 与 `state/ai_app_fundamentals.jsonl` 用 `migrate-db --apply` 一次性导入，之后只读留作备份。迁移可重复跑，按记录指纹去重。迁移会把已有的 attribution 原话镜像进 `quotes.jsonl`，否则深度报告读语料库会漏掉它们。
 
 **留原始转写是为了以后不必重拉**：只存这一轮抽出来的句子，将来换一套抽取标准就得把全部转写重新拉一遍 AlphaEngine。`quotes.jsonl` 每条带 `transcript_file` 与段落序号，能一路回指原文。
