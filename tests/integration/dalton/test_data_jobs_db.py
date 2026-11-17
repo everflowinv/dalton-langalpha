@@ -194,10 +194,7 @@ async def test_real_postgres_data_jobs_end_to_end(
         assert by_key["tw-leverage-daily"]["timezone"] == "America/New_York"
         assert by_key["bbg-data-pull-asia"]["runner"] == "host"
         assert by_key["bbg-data-pull-us"]["runner"] == "host"
-        assert by_key["sentiment-dashboard-refresh"]["required_secrets"] == [
-            "TENCENT_COS_SECRET_ID",
-            "TENCENT_COS_SECRET_KEY",
-        ]
+        assert by_key["sentiment-dashboard-refresh"]["required_secrets"] == []
 
         # 3. Enable T29 (host) and T18 (container)
         async with conn.transaction():

@@ -1781,7 +1781,7 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
                         "updated_at": NOW,
                         "artifact_code": "demo1234",
                         "workspace_id": WS_ID,
-                        "entry_path": "index.html",
+                        "entry_path": "live-demo/index.html",
                         "owner_name": "Company",
                         "owner_email": None,
                         "data_as_of": None,
@@ -1820,7 +1820,7 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
         "ensure_artifact",
         create_autospec(
             artifacts_db.ensure_artifact,
-            return_value=_make_artifact(path="index.html", latest_seq=0),
+            return_value=_make_artifact(path="live-demo/index.html", latest_seq=0),
         ),
     )
     monkeypatch.setattr(
@@ -1841,7 +1841,7 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
         "lock_owned",
         create_autospec(
             artifacts_records_db.lock_owned,
-            return_value=_make_artifact(path="index.html", latest_seq=0),
+            return_value=_make_artifact(path="live-demo/index.html", latest_seq=0),
         ),
     )
 
@@ -1849,7 +1849,7 @@ async def test_r2_5_run_id_db_dedup_persists_across_later_runs_and_skips_failure
         seq_counter["seq"] += 1
         s = seq_counter["seq"]
         return PublishResult(
-            artifact=_make_artifact(path="index.html", latest_seq=s),
+            artifact=_make_artifact(path="live-demo/index.html", latest_seq=s),
             seq=s,
             cut=True,
             shared_now=False,
@@ -4117,6 +4117,1332 @@ async def test_write_monitor_data_internal_requires_exact_slug_match(
     assert exc_info.value.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_all_registered_data_job_monitors_coexist_without_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.dalton.monitors import data_job_registry
+    from src.server.database import artifacts as artifacts_db
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+
+    # Populate disk outputs for every registered data-job monitor binding.
+    all_jobs = (
+        "monitor-live-demo",
+        "hk-momentum",
+        "cn-intraday",
+        "pm-market-state",
+        "richard-relative-dashboard-refresh",
+        data_job_registry.SENTIMENT_DASHBOARD_JOB_KEY,
+    )
+    shared_dir = data_root / data_job_registry.SENTIMENT_SHARED_REL_DIR
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "panel.css").write_text(":root{}", encoding="utf-8")
+
+    expected_bindings: list[MonitorDataJobBinding] = []
+    for jk in all_jobs:
+        for b in data_job_registry.get_registered_monitor_bindings(jk):
+            expected_bindings.append(b)
+            pdir = data_root / b.rel_dir
+            pdir.mkdir(parents=True, exist_ok=True)
+            link_tag = '<link rel="stylesheet" href="../_shared/panel.css">' if b.shared_rel_dir else ""
+            (pdir / b.entry_file).write_text(
+                f"<!doctype html><html><head><title>{b.title}</title>{link_tag}</head><body>{b.slug}</body></html>",
+                encoding="utf-8",
+            )
+
+    # In-memory DB double enforcing unique (workspace_id, path) on share_links
+    # and unique artifact_id / slug on dalton_monitors (mirrors real Postgres constraints).
+    artifacts_by_key: dict[tuple[str, str], Artifact] = {}
+    monitors_by_id: dict[str, MonitorRecord] = {}
+    monitors_by_artifact: dict[str, MonitorRecord] = {}
+    monitors_by_slug: dict[str, MonitorRecord] = {}
+    processed_runs: set[tuple[str, str]] = set()
+    cut_files: dict[str, set[str]] = {}
+
+    monkeypatch.setattr(
+        monitor_db,
+        "ensure_company_monitor_workspace",
+        create_autospec(monitor_db.ensure_company_monitor_workspace, return_value=WS_ID),
+    )
+
+    def _ensure_artifact(ws_id: str, path: str) -> Artifact:
+        key = (ws_id, path)
+        if key not in artifacts_by_key:
+            artifacts_by_key[key] = _make_artifact(
+                artifact_id=f"art-{len(artifacts_by_key) + 1}",
+                workspace_id=ws_id,
+                path=path,
+                latest_seq=0,
+            )
+        return artifacts_by_key[key]
+
+    monkeypatch.setattr(
+        artifacts_db,
+        "ensure_artifact",
+        create_autospec(artifacts_db.ensure_artifact, side_effect=_ensure_artifact),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_data_job",
+        create_autospec(
+            monitor_db.get_monitor_by_data_job,
+            side_effect=lambda jk: next(
+                (m for m in monitors_by_id.values() if m.source_kind == "data_job" and m.source_ref == jk),
+                None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "list_monitors_by_data_job",
+        create_autospec(
+            monitor_db.list_monitors_by_data_job,
+            side_effect=lambda jk: [
+                m for m in monitors_by_id.values() if m.source_kind == "data_job" and m.source_ref == jk
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(
+            monitor_db.get_monitor_by_slug,
+            side_effect=lambda slug: monitors_by_slug.get(slug),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "has_processed_monitor_run",
+        create_autospec(
+            monitor_db.has_processed_monitor_run,
+            side_effect=lambda mid, rid: (mid, rid) in processed_runs,
+        ),
+    )
+
+    def _upsert_monitor(
+        *,
+        slug: str,
+        artifact_id: str,
+        owner_user_id: str,
+        title: str,
+        category: str,
+        sort_order: int,
+        visibility: str,
+        keep_updated: bool,
+        source_kind: str,
+        source_ref: str | None,
+        member_user_ids: Any,
+        bump_acl_revision: bool = False,
+    ) -> MonitorRecord:
+        del member_user_ids, bump_acl_revision
+        existing = monitors_by_artifact.get(artifact_id)
+        if existing is not None:
+            raise AssertionError(
+                f"Artifact {artifact_id} collided: existing={existing.slug}/{existing.source_ref}, new={slug}/{source_ref}"
+            )
+        entry_path = next(a.path for a in artifacts_by_key.values() if a.artifact_id == artifact_id)
+        rec = _make_monitor(
+            monitor_id=f"mon-{slug}",
+            slug=slug,
+            artifact_id=artifact_id,
+            owner_user_id=owner_user_id,
+            title=title,
+            category=category,
+            sort_order=sort_order,
+            visibility=visibility,
+            keep_updated=keep_updated,
+            source_kind=source_kind,
+            source_ref=source_ref,
+            entry_path=entry_path,
+            published_seq=0,
+        )
+        monitors_by_id[rec.monitor_id] = rec
+        monitors_by_artifact[artifact_id] = rec
+        monitors_by_slug[slug] = rec
+        return rec
+
+    monkeypatch.setattr(
+        monitor_db,
+        "upsert_monitor",
+        create_autospec(monitor_db.upsert_monitor, side_effect=_upsert_monitor),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "get_vault_secrets_for_redaction",
+        create_autospec(
+            monitor_service.artifact_snapshot.get_vault_secrets_for_redaction,
+            return_value={},
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "store_unregistered_blobs",
+        create_autospec(monitor_service.artifact_snapshot.store_unregistered_blobs),
+    )
+
+    async def _cut_version(
+        *,
+        monitor: MonitorRecord,
+        owner_user_id: str,
+        files: Any,
+        title: str | None,
+        read_basis: Any,
+        origin: str,
+        loaded_files: list[str] | None = None,
+        artifact: Artifact | None = None,
+        verify_public_authority: Any = None,
+        run_id: str | None = None,
+    ) -> tuple[MonitorRecord, PublishResult, bool]:
+        del owner_user_id, title, read_basis, origin, loaded_files, verify_public_authority
+        assert artifact is not None
+        assert monitor.artifact_id == artifact.artifact_id
+        if run_id:
+            processed_runs.add((monitor.monitor_id, run_id))
+        cut_files[monitor.slug] = {f.path for f in files}
+        next_seq = monitor.published_seq + 1
+        updated = _make_monitor(
+            **{
+                **monitor.__dict__,
+                "published_seq": next_seq,
+            }
+        )
+        monitors_by_id[updated.monitor_id] = updated
+        monitors_by_artifact[updated.artifact_id] = updated
+        monitors_by_slug[updated.slug] = updated
+        return (
+            updated,
+            PublishResult(
+                artifact=_make_artifact(
+                    artifact_id=updated.artifact_id,
+                    path=artifact.path,
+                    latest_seq=next_seq,
+                ),
+                seq=next_seq,
+                cut=True,
+                shared_now=False,
+                changed=True,
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(
+        monitor_service,
+        "cut_monitor_version",
+        create_autospec(monitor_service.cut_monitor_version, side_effect=_cut_version),
+    )
+
+    for jk in all_jobs:
+        await monitor_service.republish_data_job_monitor(
+            job_key=jk, run_id=f"run-1-{jk}", data_root=data_root
+        )
+
+    assert len(monitors_by_slug) == len(expected_bindings) == 12
+    assert len(artifacts_by_key) == 12
+    for b in expected_bindings:
+        rec = monitors_by_slug[b.slug]
+        assert rec.source_ref == b.job_key
+        assert rec.entry_path == f"{b.slug}/{b.entry_file}"
+        assert rec.published_seq == 1
+        assert f"{b.slug}/{b.entry_file}" in cut_files[b.slug]
+
+    # Re-running single-binding jobs updates each monitor independently with zero cross-overwrite.
+    for jk in ("hk-momentum", "cn-intraday", "richard-relative-dashboard-refresh"):
+        await monitor_service.republish_data_job_monitor(
+            job_key=jk, run_id=f"run-2-{jk}", data_root=data_root
+        )
+    assert monitors_by_slug["hk-momentum"].published_seq == 2
+    assert monitors_by_slug["cn-intraday"].published_seq == 2
+    assert monitors_by_slug["relative-strength"].published_seq == 2
+    assert monitors_by_slug["live-demo"].published_seq == 1
+    assert monitors_by_slug["pm-market-state"].published_seq == 1
+    assert monitors_by_slug["cn-sector-rotation"].published_seq == 1
 
 
+@pytest.mark.asyncio
+async def test_relative_strength_publishes_only_page_and_dependencies_with_220_portfolio_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.server.database import artifacts as artifacts_db
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    kweb_dir = data_root / "research-outputs" / "kweb-dashboard"
+    assets_dir = kweb_dir / "assets"
+    portfolio_dir = kweb_dir / "portfolio"
+    assets_dir.mkdir(parents=True)
+    portfolio_dir.mkdir(parents=True)
+
+    (assets_dir / "theme.css").write_text("body{color:#fff}", encoding="utf-8")
+    (kweb_dir / "index.html").write_text(
+        '<!doctype html><html><head><link rel="stylesheet" href="assets/theme.css"></head>'
+        "<body><h1>Relative Strength</h1></body></html>",
+        encoding="utf-8",
+    )
+    # Create 220 daily markdown reports (> MAX_FILES=200) inside portfolio/
+    for idx in range(220):
+        (portfolio_dir / f"2026-01-{idx:03d}.md").write_text(
+            f"# Portfolio Report {idx}\n", encoding="utf-8"
+        )
+
+    captured_paths: list[str] = []
+    artifact = _make_artifact(
+        artifact_id="art-rel",
+        path="relative-strength/index.html",
+        latest_seq=0,
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "ensure_company_monitor_workspace",
+        create_autospec(monitor_db.ensure_company_monitor_workspace, return_value=WS_ID),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_data_job",
+        create_autospec(monitor_db.get_monitor_by_data_job, return_value=None),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(monitor_db.get_monitor_by_slug, return_value=None),
+    )
+    monkeypatch.setattr(
+        artifacts_db,
+        "ensure_artifact",
+        create_autospec(artifacts_db.ensure_artifact, return_value=artifact),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "upsert_monitor",
+        create_autospec(
+            monitor_db.upsert_monitor,
+            return_value=_make_monitor(
+                monitor_id="mon-rel",
+                slug="relative-strength",
+                artifact_id="art-rel",
+                source_kind="data_job",
+                source_ref="richard-relative-dashboard-refresh",
+                entry_path="relative-strength/index.html",
+                published_seq=0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "get_vault_secrets_for_redaction",
+        create_autospec(
+            monitor_service.artifact_snapshot.get_vault_secrets_for_redaction,
+            return_value={},
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "store_unregistered_blobs",
+        create_autospec(monitor_service.artifact_snapshot.store_unregistered_blobs),
+    )
+
+    async def _cut_version(**kwargs: Any) -> tuple[MonitorRecord, PublishResult, bool]:
+        captured_paths.extend(f.path for f in kwargs["files"])
+        mon = kwargs["monitor"]
+        updated = _make_monitor(**{**mon.__dict__, "published_seq": 1})
+        return (
+            updated,
+            PublishResult(
+                artifact=_make_artifact(
+                    artifact_id="art-rel",
+                    path="relative-strength/index.html",
+                    latest_seq=1,
+                ),
+                seq=1,
+                cut=True,
+                shared_now=False,
+                changed=True,
+            ),
+            False,
+        )
+
+    monkeypatch.setattr(
+        monitor_service,
+        "cut_monitor_version",
+        create_autospec(monitor_service.cut_monitor_version, side_effect=_cut_version),
+    )
+
+    res = await monitor_service.republish_data_job_monitor(
+        job_key="richard-relative-dashboard-refresh",
+        run_id="run-kweb-220",
+        data_root=data_root,
+    )
+    assert res["slug"] == "relative-strength"
+    assert res["published_seq"] == 1
+    assert set(captured_paths) == {
+        "relative-strength/index.html",
+        "relative-strength/assets/theme.css",
+    }
+    assert len(list(portfolio_dir.glob("*.md"))) == 220
+
+
+@pytest.mark.asyncio
+async def test_check_monitor_conflicts_read_only_inspector() -> None:
+    from scripts.dalton import check_monitor_conflicts as cmc
+    from src.dalton.monitors import data_job_registry
+
+    executed_sql: list[str] = []
+
+    def _make_fake_conn(
+        monitor_rows: list[dict[str, Any]],
+        workspace_links: list[dict[str, Any]],
+    ) -> Any:
+        executed_sql.clear()
+        cur = create_autospec(AsyncCursor, instance=True)
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+        state = {"rows": []}
+
+        async def _exec(sql: str, params: Any = None) -> None:
+            del params
+            executed_sql.append(sql.strip())
+            if "FROM dalton_monitors m" in sql:
+                state["rows"] = list(monitor_rows)
+            elif "FROM share_links l" in sql:
+                state["rows"] = list(workspace_links)
+            else:
+                state["rows"] = []
+
+        cur.execute.side_effect = _exec
+        cur.fetchall.side_effect = lambda: list(state["rows"])
+        conn = create_autospec(AsyncConnection, instance=True)
+        conn.cursor.return_value = cur
+
+        @asynccontextmanager
+        async def _tx():
+            yield
+
+        conn.transaction.side_effect = _tx
+        return conn
+
+    # 1) Clean state: every registered binding has matching source_ref & <slug>/<entry_file>
+    clean_monitors = []
+    clean_links = []
+    for idx, jk in enumerate(data_job_registry.MONITOR_DATA_JOB_REGISTRY):
+        for b in data_job_registry.get_registered_monitor_bindings(jk):
+            aid = f"art-{idx}-{b.slug}"
+            clean_monitors.append(
+                {
+                    "monitor_id": f"mon-{b.slug}",
+                    "slug": b.slug,
+                    "source_kind": "data_job",
+                    "source_ref": b.job_key,
+                    "title": b.title,
+                    "category": b.category,
+                    "published_seq": 1,
+                    "artifact_id": aid,
+                    "entry_path": f"{b.slug}/{b.entry_file}",
+                }
+            )
+            clean_links.append(
+                {"artifact_id": aid, "path": f"{b.slug}/{b.entry_file}", "latest_seq": 1}
+            )
+
+    clean_report = await cmc.inspect_monitor_conflicts(
+        conn=_make_fake_conn(clean_monitors, clean_links)
+    )
+    assert clean_report["has_conflicts"] is False
+    assert clean_report["ok"] is True
+    assert executed_sql[0] == "SET TRANSACTION READ ONLY"
+    assert all(
+        not s.upper().startswith(("INSERT", "UPDATE", "DELETE")) for s in executed_sql
+    )
+
+    # 2) Polluted legacy state: hk-momentum overwritten by cn-intraday on index.html
+    dirty_report = await cmc.inspect_monitor_conflicts(
+        conn=_make_fake_conn(
+            [
+                {
+                    "monitor_id": "mon-hk",
+                    "slug": "hk-momentum",
+                    "source_kind": "data_job",
+                    "source_ref": "cn-intraday",
+                    "title": "A股盘中监测",
+                    "category": "cn",
+                    "published_seq": 4,
+                    "artifact_id": "art-shared",
+                    "entry_path": "index.html",
+                }
+            ],
+            [
+                {
+                    "artifact_id": "art-shared",
+                    "path": "index.html",
+                    "latest_seq": 4,
+                    "is_referenced": True,
+                }
+            ],
+        )
+    )
+    assert dirty_report["has_conflicts"] is True
+    assert len(dirty_report["source_ref_mismatches"]) == 1
+    assert dirty_report["source_ref_mismatches"][0]["expected_source_ref"] == "hk-momentum"
+    assert len(dirty_report["legacy_entry_paths"]) == 1
+    assert len(dirty_report["legacy_shared_links"]) == 1
+    assert dirty_report["historical_shared_links"] == []
+    assert any("UPDATE dalton_monitors" in s for s in dirty_report["remediation_sql"])
+    assert any("重跑该数据任务即可自动迁移" in s for s in dirty_report["remediation_sql"])
+    assert all("DELETE FROM" not in s for s in dirty_report["remediation_sql"])
+
+    # 3) Migrated state: all monitors point to <slug>/index.html; unreferenced index.html is info-only
+    migrated_links = list(clean_links) + [
+        {
+            "artifact_id": "art-legacy-unreferenced",
+            "path": "index.html",
+            "latest_seq": 4,
+            "is_referenced": False,
+        }
+    ]
+    migrated_report = await cmc.inspect_monitor_conflicts(
+        conn=_make_fake_conn(clean_monitors, migrated_links)
+    )
+    assert migrated_report["has_conflicts"] is False
+    assert migrated_report["ok"] is True
+    assert migrated_report["legacy_shared_links"] == []
+    assert len(migrated_report["historical_shared_links"]) == 1
+    assert migrated_report["historical_shared_links"][0]["artifact_id"] == "art-legacy-unreferenced"
+    assert migrated_report["remediation_sql"] == []
+
+
+def _setup_legacy_migration_db(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    share_links: dict[str, dict[str, Any]],
+    artifact_versions: dict[tuple[str, int], dict[str, Any]],
+    artifact_version_files: dict[tuple[str, int, str], dict[str, Any]],
+    monitors_table: dict[str, dict[str, Any]],
+    monitor_members: dict[str, set[str]],
+    monitor_versions: dict[str, set[int]],
+    monitor_data: dict[tuple[str, str], dict[str, Any]],
+    publish_runs: set[tuple[str, str]],
+) -> list[str]:
+    import copy
+    from psycopg.errors import UniqueViolation
+    from src.server.database.artifacts import records as artifacts_records_db
+    from src.server.database.artifacts import versions as artifacts_versions_db
+
+    executed_sql: list[str] = []
+
+    def _artifact_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "artifact_id": row["artifact_id"],
+            "code": row["code"],
+            "workspace_id": row["workspace_id"],
+            "path": row["path"],
+            "created_thread_id": None,
+            "bound_thread_id": None,
+            "keep_updated": False,
+            "latest_seq": row["latest_seq"],
+            "shared_at": row["shared_at"],
+            "files": row["files"],
+            "revision": row["revision"],
+            "created_at": NOW,
+            "legacy_refused": None,
+            "loaded_files": [],
+            "left_out_files": [],
+            "kept_at": None,
+            "shared_seq": row.get("shared_seq", 0),
+        }
+
+    def _monitor_join_row(row: dict[str, Any]) -> dict[str, Any]:
+        link = share_links[row["artifact_id"]]
+        data_as_of = max(
+            (v["as_of"] for (mid, _k), v in monitor_data.items() if mid == row["monitor_id"] and "as_of" in v),
+            default=None,
+        )
+        return {
+            **row,
+            "artifact_code": link["code"],
+            "workspace_id": link["workspace_id"],
+            "entry_path": link["path"],
+            "owner_name": None,
+            "owner_email": None,
+            "data_as_of": data_as_of,
+            "member_user_ids": sorted(monitor_members.get(row["monitor_id"], set())),
+        }
+
+    def _find_link_by_path(ws_id: str, path: str) -> dict[str, Any] | None:
+        return next(
+            (
+                r
+                for r in share_links.values()
+                if r["workspace_id"] == ws_id and r["path"] == path
+            ),
+            None,
+        )
+
+    @asynccontextmanager
+    async def _fake_db_conn():
+        cur = create_autospec(AsyncCursor, instance=True)
+        cur.__aenter__.return_value = cur
+        cur.__aexit__.return_value = False
+        cur._rows = []
+
+        async def _exec(sql: str, params: Any = None) -> None:
+            executed_sql.append(" ".join(sql.split()))
+            upper = " ".join(sql.upper().split())
+            cur.rowcount = 0
+
+            if upper.startswith("DELETE FROM ARTIFACT_VERSIONS"):
+                cur._rows = []
+                return
+            if upper.startswith("DELETE FROM DALTON_MONITOR_MEMBERS"):
+                monitor_members.pop(params[0], None)
+                cur._rows = []
+                return
+            if upper.startswith("DELETE "):
+                raise AssertionError(f"Unexpected DELETE during migration: {sql}")
+
+            # 1) _MONITOR_SELECT queries
+            if "FROM DALTON_MONITORS M JOIN SHARE_LINKS L" in upper:
+                if "WHERE M.SLUG = %S" in upper:
+                    row = next((r for r in monitors_table.values() if r["slug"] == params[0]), None)
+                elif "WHERE M.MONITOR_ID = %S::UUID" in upper:
+                    row = monitors_table.get(params[0])
+                elif "WHERE M.SOURCE_KIND = 'DATA_JOB' AND M.SOURCE_REF = %S" in upper:
+                    row = next(
+                        (
+                            r
+                            for r in monitors_table.values()
+                            if r["source_kind"] == "data_job" and r["source_ref"] == params[0]
+                        ),
+                        None,
+                    )
+                else:
+                    row = None
+                cur._rows = [_monitor_join_row(row)] if row else []
+                return
+
+            # 2) share_links operations
+            if "FROM SHARE_LINKS L" in upper and "FOR UPDATE OF L" in upper:
+                aid = params["artifact_id"]
+                link = share_links.get(aid)
+                cur._rows = [_artifact_row(link)] if link else []
+                return
+            if "FROM SHARE_LINKS L WHERE L.WORKSPACE_ID = %S AND L.KIND = 'FILE' AND L.PATH = %S" in upper:
+                link = _find_link_by_path(params[0], params[1])
+                cur._rows = [_artifact_row(link)] if link else []
+                return
+            if "INSERT INTO SHARE_LINKS AS L (CODE, WORKSPACE_ID, KIND, PATH)" in upper:
+                code, ws_id, path = params
+                existing = _find_link_by_path(ws_id, path)
+                if existing is not None:
+                    cur._rows = []
+                else:
+                    new_aid = f"61000000-0000-4000-8000-{len(share_links) + 1:012d}"
+                    share_links[new_aid] = {
+                        "artifact_id": new_aid,
+                        "code": code,
+                        "workspace_id": ws_id,
+                        "path": path,
+                        "latest_seq": 0,
+                        "shared_at": None,
+                        "files": None,
+                        "revision": 1,
+                        "shared_seq": 0,
+                    }
+                    cur._rows = [_artifact_row(share_links[new_aid])]
+                return
+            if "UPDATE SHARE_LINKS L SET PATH = %(NEW_PATH)S" in upper:
+                aid = params["artifact_id"]
+                new_path = params["new_path"]
+                link = share_links.get(aid)
+                if link is None:
+                    cur._rows = []
+                    return
+                conflict = _find_link_by_path(link["workspace_id"], new_path)
+                if conflict is not None and conflict["artifact_id"] != aid:
+                    raise UniqueViolation("duplicate key value violates unique constraint")
+                link["path"] = new_path
+                cur._rows = [_artifact_row(link)]
+                return
+            if "UPDATE SHARE_LINKS L SET LATEST_SEQ = %(SEQ)S" in upper:
+                aid = params["artifact_id"]
+                link = share_links[aid]
+                link["latest_seq"] = params["seq"]
+                link["shared_seq"] = params["shared_seq"]
+                if "FILES = %(FILES)S::TEXT[]" in upper:
+                    link["files"] = list(params["files"])
+                if "SHARED_AT = COALESCE(L.SHARED_AT, NOW())" in upper and link["shared_at"] is None:
+                    link["shared_at"] = NOW
+                    link["revision"] += 1
+                cur._rows = [_artifact_row(link)]
+                return
+
+            # 3) dalton_monitors locks & mutations
+            if "FROM DALTON_MONITORS WHERE MONITOR_ID = %S::UUID FOR UPDATE" in upper:
+                row = monitors_table.get(params[0])
+                cur._rows = [dict(row)] if row else []
+                return
+            if "FROM DALTON_MONITORS WHERE ARTIFACT_ID = %S::UUID FOR UPDATE" in upper:
+                row = next((r for r in monitors_table.values() if r["artifact_id"] == params[0]), None)
+                cur._rows = [dict(row)] if row else []
+                return
+            if "INSERT INTO DALTON_MONITORS (" in upper:
+                slug, aid, owner_uid, title, cat, sort_order, vis, keep_upd, src_kind, src_ref = params
+                mid = f"60000000-0000-4000-8000-{len(monitors_table) + 1:012d}"
+                monitors_table[mid] = {
+                    "monitor_id": mid,
+                    "slug": slug,
+                    "artifact_id": aid,
+                    "owner_user_id": owner_uid,
+                    "title": title,
+                    "category": cat,
+                    "sort_order": sort_order,
+                    "visibility": vis,
+                    "published_seq": 0,
+                    "keep_updated": keep_upd,
+                    "source_kind": src_kind,
+                    "source_ref": src_ref,
+                    "acl_revision": 1,
+                    "last_publish_run_id": None,
+                    "last_publish_error": None,
+                    "last_publish_failed_at": None,
+                    "created_at": NOW,
+                    "updated_at": NOW,
+                }
+                cur._rows = [{"monitor_id": mid}]
+                return
+            if "UPDATE DALTON_MONITORS SET SOURCE_REF = %S" in upper:
+                src_ref, mid = params
+                monitors_table[mid]["source_ref"] = src_ref
+                cur._rows = []
+                return
+            if "UPDATE DALTON_MONITORS SET PUBLISHED_SEQ = %S" in upper:
+                seq, owner_uid, run_id, mid = params
+                monitors_table[mid]["published_seq"] = seq
+                monitors_table[mid]["owner_user_id"] = owner_uid
+                if run_id is not None:
+                    monitors_table[mid]["last_publish_run_id"] = run_id
+                monitors_table[mid]["last_publish_error"] = None
+                monitors_table[mid]["last_publish_failed_at"] = None
+                cur._rows = []
+                return
+            if "UPDATE DALTON_MONITORS SET LAST_PUBLISH_ERROR = %S" in upper:
+                err_msg, mid = params
+                monitors_table[mid]["last_publish_error"] = err_msg
+                monitors_table[mid]["last_publish_failed_at"] = NOW
+                cur._rows = []
+                return
+
+            # 4) publish runs & versions
+            if "INSERT INTO DALTON_MONITOR_PUBLISH_RUNS" in upper:
+                key = (params[0], params[1])
+                if key in publish_runs:
+                    cur._rows = []
+                else:
+                    publish_runs.add(key)
+                    cur._rows = [{"monitor_id": params[0]}]
+                return
+            if "SELECT 1 FROM DALTON_MONITOR_PUBLISH_RUNS" in upper:
+                cur._rows = [(1,)] if (params[0], params[1]) in publish_runs else []
+                return
+            if "UPDATE DALTON_MONITOR_PUBLISH_RUNS" in upper:
+                cur._rows = []
+                return
+            if "SELECT PATH, SHA256 FROM ARTIFACT_VERSION_FILES" in upper:
+                aid, seq = params
+                cur._rows = [
+                    {"path": fpath, "sha256": frow["sha256"]}
+                    for (faid, fseq, fpath), frow in artifact_version_files.items()
+                    if faid == aid and fseq == seq
+                ]
+                return
+            if "INSERT INTO ARTIFACT_VERSIONS" in upper:
+                aid, seq, entry_path, origin, title, label, byte_len = params
+                artifact_versions[(aid, seq)] = {
+                    "seq": seq,
+                    "entry_path": entry_path,
+                    "origin": origin,
+                    "title": title,
+                    "label": label,
+                    "byte_len": byte_len,
+                    "published_at": NOW,
+                }
+                cur._rows = []
+                return
+            if "INSERT INTO DALTON_MONITOR_VERSIONS" in upper:
+                monitor_versions.setdefault(params[0], set()).add(int(params[1]))
+                cur._rows = []
+                return
+            if "JOIN DALTON_MONITOR_VERSIONS MV" in upper:
+                mid, aid = params
+                seqs = monitor_versions.get(mid, set())
+                rows = [
+                    dict(artifact_versions[(aid, s)])
+                    for s in sorted(seqs, reverse=True)
+                    if (aid, s) in artifact_versions
+                ]
+                cur._rows = rows
+                return
+            if "SELECT 1 FROM DALTON_MONITOR_VERSIONS" in upper:
+                mid, req_seq = params
+                cur._rows = [(1,)] if req_seq in monitor_versions.get(mid, set()) else []
+                return
+            if "SELECT SEQ, PATH FROM ARTIFACT_VERSION_FILES" in upper:
+                aid, missing_seqs = params
+                seq_set = set(missing_seqs)
+                cur._rows = sorted(
+                    [
+                        {"seq": fseq, "path": fpath}
+                        for (faid, fseq, fpath) in artifact_version_files
+                        if faid == aid and fseq in seq_set
+                    ],
+                    key=lambda r: (r["seq"], r["path"]),
+                )
+                return
+            if "FROM ARTIFACT_VERSION_FILES F JOIN SHARE_LINKS L" in upper:
+                aid, seq, path = params
+                frow = artifact_version_files.get((aid, seq, path))
+                cur._rows = [dict(frow)] if frow and aid in share_links else []
+                return
+
+            cur._rows = []
+
+        async def _exec_many(sql: str, seq_params: list[tuple[Any, ...]]) -> None:
+            upper = " ".join(sql.upper().split())
+            if "INSERT INTO ARTIFACT_VERSION_FILES" in upper:
+                for aid, seq, path, uid, sha, byte_len, ctype, content in seq_params:
+                    artifact_version_files[(aid, seq, path)] = {
+                        "user_id": uid,
+                        "sha256": sha,
+                        "byte_len": byte_len,
+                        "content_type": ctype,
+                        "content": content,
+                    }
+            elif "INSERT INTO DALTON_MONITOR_MEMBERS" in upper:
+                for mid, uid in seq_params:
+                    monitor_members.setdefault(mid, set()).add(uid)
+
+        cur.execute.side_effect = _exec
+        cur.executemany.side_effect = _exec_many
+        cur.fetchone.side_effect = lambda: cur._rows[0] if cur._rows else None
+        cur.fetchall.side_effect = lambda: list(cur._rows)
+        conn = create_autospec(AsyncConnection, instance=True)
+        conn.cursor.return_value = cur
+
+        @asynccontextmanager
+        async def _tx():
+            snap = (
+                copy.deepcopy(share_links),
+                copy.deepcopy(artifact_versions),
+                copy.deepcopy(artifact_version_files),
+                copy.deepcopy(monitors_table),
+                copy.deepcopy(monitor_members),
+                copy.deepcopy(monitor_versions),
+                copy.deepcopy(publish_runs),
+            )
+            try:
+                yield
+            except BaseException:
+                for target, saved in zip(
+                    (
+                        share_links,
+                        artifact_versions,
+                        artifact_version_files,
+                        monitors_table,
+                        monitor_members,
+                        monitor_versions,
+                        publish_runs,
+                    ),
+                    snap,
+                    strict=True,
+                ):
+                    target.clear()
+                    if isinstance(target, dict):
+                        target.update(saved)
+                    else:
+                        target.update(saved)
+                raise
+
+        conn.transaction.side_effect = _tx
+        yield conn
+
+    monkeypatch.setattr(monitor_db, "get_db_connection", _fake_db_conn)
+    monkeypatch.setattr(artifacts_records_db, "get_db_connection", _fake_db_conn)
+    monkeypatch.setattr(artifacts_versions_db, "get_db_connection", _fake_db_conn)
+    monkeypatch.setattr(
+        monitor_db,
+        "ensure_company_monitor_workspace",
+        create_autospec(monitor_db.ensure_company_monitor_workspace, return_value=WS_ID),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "get_vault_secrets_for_redaction",
+        create_autospec(
+            monitor_service.artifact_snapshot.get_vault_secrets_for_redaction,
+            return_value={},
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifact_snapshot,
+        "store_unregistered_blobs",
+        create_autospec(monitor_service.artifact_snapshot.store_unregistered_blobs),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "get_user_tier",
+        create_autospec(monitor_service.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        monitor_perms,
+        "get_user_tier",
+        create_autospec(monitor_perms.get_user_tier, return_value="internal"),
+    )
+    return executed_sql
+
+
+@pytest.mark.asyncio
+async def test_legacy_data_job_monitor_auto_migrates_in_single_tx_preserving_history_and_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.dalton import check_monitor_conflicts as cmc
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    hk_dir = data_root / "research-outputs" / "hk-momentum"
+    cn_dir = data_root / "research-outputs" / "cn-intraday"
+    hk_dir.mkdir(parents=True)
+    cn_dir.mkdir(parents=True)
+    (hk_dir / "index.html").write_text("<html><body>HK v5</body></html>", encoding="utf-8")
+    (cn_dir / "index.html").write_text("<html><body>CN v1</body></html>", encoding="utf-8")
+
+    # Pre-upgrade legacy DB state: hk-momentum has 4 published versions on shared index.html,
+    # and its source_ref was overwritten by cn-intraday in the old collision.
+    legacy_aid = "61000000-0000-4000-8000-000000009999"
+    hk_mid = "60000000-0000-4000-8000-000000000101"
+    share_links: dict[str, dict[str, Any]] = {
+        legacy_aid: {
+            "artifact_id": legacy_aid,
+            "code": "legacycode",
+            "workspace_id": WS_ID,
+            "path": "index.html",
+            "latest_seq": 4,
+            "shared_at": None,
+            "files": None,
+            "revision": 1,
+            "shared_seq": 0,
+        }
+    }
+    artifact_versions: dict[tuple[str, int], dict[str, Any]] = {}
+    artifact_version_files: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for seq in range(1, 5):
+        body = f"<html><body>HK v{seq}</body></html>".encode("utf-8")
+        artifact_versions[(legacy_aid, seq)] = {
+            "seq": seq,
+            "entry_path": "index.html",
+            "origin": "owner",
+            "title": "港股动量指数",
+            "label": None,
+            "byte_len": len(body),
+            "published_at": NOW,
+        }
+        artifact_version_files[(legacy_aid, seq, "index.html")] = {
+            "user_id": COMPANY_SYSTEM_USER_ID,
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "byte_len": len(body),
+            "content_type": "text/html",
+            "content": body,
+        }
+
+    monitors_table: dict[str, dict[str, Any]] = {
+        hk_mid: {
+            "monitor_id": hk_mid,
+            "slug": "hk-momentum",
+            "artifact_id": legacy_aid,
+            "owner_user_id": COMPANY_SYSTEM_USER_ID,
+            "title": "港股动量指数",
+            "category": "hk",
+            "sort_order": 45,
+            "visibility": "members",
+            "published_seq": 4,
+            "keep_updated": True,
+            "source_kind": "data_job",
+            "source_ref": "cn-intraday",  # overwritten by old shared-artifact collision
+            "acl_revision": 2,
+            "last_publish_run_id": "old-run-4",
+            "last_publish_error": None,
+            "last_publish_failed_at": None,
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+    }
+    monitor_members: dict[str, set[str]] = {hk_mid: {"alice", "bob"}}
+    monitor_versions: dict[str, set[int]] = {hk_mid: {1, 2, 3, 4}}
+    monitor_data: dict[tuple[str, str], dict[str, Any]] = {
+        (hk_mid, "intraday"): {"score": 88.5, "as_of": NOW}
+    }
+    publish_runs: set[tuple[str, str]] = {(hk_mid, "old-run-4")}
+
+    executed_sql = _setup_legacy_migration_db(
+        monkeypatch,
+        share_links=share_links,
+        artifact_versions=artifact_versions,
+        artifact_version_files=artifact_version_files,
+        monitors_table=monitors_table,
+        monitor_members=monitor_members,
+        monitor_versions=monitor_versions,
+        monitor_data=monitor_data,
+        publish_runs=publish_runs,
+    )
+
+    # 0) Pre-migration: detail lists versions 1-4 and version 1 is readable at index.html
+    pre_detail = await monitor_service.get_monitor_detail("hk-momentum", viewer_id="alice")
+    assert [v["seq"] for v in pre_detail["versions"]] == [4, 3, 2, 1]
+    pre_v1 = await monitor_service.serve_monitor_file(
+        pre_detail["monitor_grant"], "1", pre_detail["versions"][-1]["entry_path"]
+    )
+    assert b"HK v1" in pre_v1.body
+
+    # 1) cn-intraday runs first: leaves mon-hk-legacy untouched and creates its own cn-intraday/index.html panel
+    cn_res = await monitor_service.republish_data_job_monitor(
+        job_key="cn-intraday", run_id="run-cn-1", data_root=data_root
+    )
+    assert cn_res["slug"] == "cn-intraday"
+    assert cn_res["monitor_id"] != hk_mid
+    assert cn_res["published_seq"] == 1
+    assert monitors_table[hk_mid]["artifact_id"] == legacy_aid
+    assert share_links[legacy_aid]["path"] == "index.html"
+
+    # 2) hk-momentum runs: renames share_links.path in place (keeps legacy_aid!) and cuts v5
+    hk_res = await monitor_service.republish_data_job_monitor(
+        job_key="hk-momentum", run_id="run-hk-1", data_root=data_root
+    )
+    assert hk_res["monitor_id"] == hk_mid
+    assert hk_res["slug"] == "hk-momentum"
+    assert hk_res["published_seq"] == 5
+    assert monitors_table[hk_mid]["artifact_id"] == legacy_aid
+    assert monitors_table[hk_mid]["source_ref"] == "hk-momentum"
+    assert share_links[legacy_aid]["path"] == "hk-momentum/index.html"
+    assert share_links[legacy_aid]["latest_seq"] == 5
+    # Preserved: monitor_id, artifact_id, members, historical versions 1-4 + new 5, and realtime data
+    assert monitor_members[hk_mid] == {"alice", "bob"}
+    assert monitor_versions[hk_mid] == {1, 2, 3, 4, 5}
+    assert monitor_data[(hk_mid, "intraday")]["score"] == 88.5
+    assert all(row["path"] != "index.html" for row in share_links.values())
+    assert all(
+        not sql.upper().startswith("DELETE ")
+        or sql.upper().startswith(("DELETE FROM ARTIFACT_VERSIONS ", "DELETE FROM DALTON_MONITOR_MEMBERS "))
+        for sql in executed_sql
+    )
+
+    # 2b) Post-migration: detail lists 1-5 and reading version 1 AND version 5 returns actual file bytes
+    post_detail = await monitor_service.get_monitor_detail("hk-momentum", viewer_id="alice")
+    assert post_detail["monitor"]["monitor_id"] == hk_mid
+    assert post_detail["monitor"]["artifact_id"] == legacy_aid
+    assert post_detail["monitor"]["entry_path"] == "hk-momentum/index.html"
+    assert [v["seq"] for v in post_detail["versions"]] == [5, 4, 3, 2, 1]
+    assert post_detail["versions"][0]["entry_path"] == "hk-momentum/index.html"
+    assert post_detail["versions"][-1]["entry_path"] == "index.html"
+
+    served_v1 = await monitor_service.serve_monitor_file(
+        post_detail["monitor_grant"], "1", post_detail["versions"][-1]["entry_path"]
+    )
+    assert b"HK v1" in served_v1.body
+    served_v5 = await monitor_service.serve_monitor_file(
+        post_detail["monitor_grant"], "5", post_detail["versions"][0]["entry_path"]
+    )
+    assert b"HK v5" in served_v5.body
+
+    # 3) Subsequent runs on both tasks update their own artifacts independently without overwriting
+    (hk_dir / "index.html").write_text("<html><body>HK v6</body></html>", encoding="utf-8")
+    (cn_dir / "index.html").write_text("<html><body>CN v2</body></html>", encoding="utf-8")
+    hk_res2 = await monitor_service.republish_data_job_monitor(
+        job_key="hk-momentum", run_id="run-hk-2", data_root=data_root
+    )
+    cn_res2 = await monitor_service.republish_data_job_monitor(
+        job_key="cn-intraday", run_id="run-cn-2", data_root=data_root
+    )
+    assert hk_res2["monitor_id"] == hk_mid and hk_res2["published_seq"] == 6
+    assert cn_res2["monitor_id"] == cn_res["monitor_id"] and cn_res2["published_seq"] == 2
+    assert monitors_table[hk_mid]["artifact_id"] == legacy_aid
+    assert monitors_table[hk_mid]["artifact_id"] != monitors_table[cn_res["monitor_id"]]["artifact_id"]
+
+    # 4) Conflict checker sees no conflicts and no leftover index.html
+    report = cmc.analyze_monitor_conflicts(
+        monitor_rows=[
+            {
+                "monitor_id": row["monitor_id"],
+                "slug": row["slug"],
+                "source_kind": row["source_kind"],
+                "source_ref": row["source_ref"],
+                "artifact_id": row["artifact_id"],
+                "entry_path": share_links[row["artifact_id"]]["path"],
+                "published_seq": row["published_seq"],
+            }
+            for row in monitors_table.values()
+        ],
+        workspace_links=[
+            {
+                "artifact_id": aid,
+                "path": row["path"],
+                "latest_seq": row["latest_seq"],
+                "is_referenced": any(m["artifact_id"] == aid for m in monitors_table.values()),
+            }
+            for aid, row in share_links.items()
+        ],
+    )
+    assert report["has_conflicts"] is False
+    assert report["legacy_shared_links"] == []
+    assert report["historical_shared_links"] == []
+    assert report["remediation_sql"] == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_data_job_monitor_migration_aborts_when_target_path_occupied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    hk_dir = data_root / "research-outputs" / "hk-momentum"
+    hk_dir.mkdir(parents=True)
+    (hk_dir / "index.html").write_text("<html><body>HK v5</body></html>", encoding="utf-8")
+
+    legacy_aid = "61000000-0000-4000-8000-000000009999"
+    occupant_aid = "61000000-0000-4000-8000-000000008888"
+    hk_mid = "60000000-0000-4000-8000-000000000101"
+    share_links: dict[str, dict[str, Any]] = {
+        legacy_aid: {
+            "artifact_id": legacy_aid,
+            "code": "legacycode",
+            "workspace_id": WS_ID,
+            "path": "index.html",
+            "latest_seq": 4,
+            "shared_at": None,
+            "files": None,
+            "revision": 1,
+            "shared_seq": 0,
+        },
+        occupant_aid: {
+            "artifact_id": occupant_aid,
+            "code": "occupantcode",
+            "workspace_id": WS_ID,
+            "path": "hk-momentum/index.html",
+            "latest_seq": 1,
+            "shared_at": None,
+            "files": None,
+            "revision": 1,
+            "shared_seq": 0,
+        },
+    }
+    monitors_table: dict[str, dict[str, Any]] = {
+        hk_mid: {
+            "monitor_id": hk_mid,
+            "slug": "hk-momentum",
+            "artifact_id": legacy_aid,
+            "owner_user_id": COMPANY_SYSTEM_USER_ID,
+            "title": "港股动量指数",
+            "category": "hk",
+            "sort_order": 45,
+            "visibility": "company",
+            "published_seq": 4,
+            "keep_updated": True,
+            "source_kind": "data_job",
+            "source_ref": "hk-momentum",
+            "acl_revision": 1,
+            "last_publish_run_id": "old-run-4",
+            "last_publish_error": None,
+            "last_publish_failed_at": None,
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+    }
+    monitor_versions: dict[str, set[int]] = {hk_mid: {1, 2, 3, 4}}
+    publish_runs: set[tuple[str, str]] = {(hk_mid, "old-run-4")}
+
+    _setup_legacy_migration_db(
+        monkeypatch,
+        share_links=share_links,
+        artifact_versions={},
+        artifact_version_files={},
+        monitors_table=monitors_table,
+        monitor_members={},
+        monitor_versions=monitor_versions,
+        monitor_data={},
+        publish_runs=publish_runs,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await monitor_service.republish_data_job_monitor(
+            job_key="hk-momentum", run_id="run-hk-occupied", data_root=data_root
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "已被另一资源占用" in exc_info.value.detail
+    assert occupant_aid in exc_info.value.detail
+    # Migration rolled back cleanly: path, artifact_id, published_seq, versions, occupant all unchanged
+    assert share_links[legacy_aid]["path"] == "index.html"
+    assert share_links[legacy_aid]["latest_seq"] == 4
+    assert share_links[occupant_aid]["path"] == "hk-momentum/index.html"
+    assert monitors_table[hk_mid]["artifact_id"] == legacy_aid
+    assert monitors_table[hk_mid]["published_seq"] == 4
+    assert monitor_versions[hk_mid] == {1, 2, 3, 4}
+    assert (hk_mid, "run-hk-occupied") not in publish_runs
+    assert monitors_table[hk_mid]["last_publish_error"] is not None
+
+
+@pytest.mark.asyncio
+async def test_non_legacy_or_workspace_slug_collision_still_raises_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+    data_root = tmp_path / "openclaw-data"
+    hk_dir = data_root / "research-outputs" / "hk-momentum"
+    hk_dir.mkdir(parents=True)
+    (hk_dir / "index.html").write_text("<html><body>HK</body></html>", encoding="utf-8")
+
+    # A workspace monitor owned by a human user occupying slug="hk-momentum" must NOT be auto-migrated.
+    workspace_conflict = _make_monitor(
+        monitor_id="60000000-0000-4000-8000-000000000202",
+        slug="hk-momentum",
+        source_kind="workspace",
+        owner_user_id="human-analyst-1",
+        entry_path="index.html",
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_data_job",
+        create_autospec(monitor_db.get_monitor_by_data_job, return_value=None),
+    )
+    monkeypatch.setattr(
+        monitor_db,
+        "get_monitor_by_slug",
+        create_autospec(monitor_db.get_monitor_by_slug, return_value=workspace_conflict),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await monitor_service.republish_data_job_monitor(
+            job_key="hk-momentum", run_id="run-hk-conflict", data_root=data_root
+        )
+    assert exc_info.value.status_code == 409
+    assert "禁止自动改名" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_monitor_detail_derives_version_entry_path_from_files_and_loads_migrated_v1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_aid = "61000000-0000-4000-8000-000000009998"
+    hk_mid = "60000000-0000-4000-8000-000000000203"
+    v1_body = b"<html><body>HK v1 legacy</body></html>"
+    v2_body = b"<html><body>HK v2 migrated</body></html>"
+
+    share_links: dict[str, dict[str, Any]] = {
+        legacy_aid: {
+            "artifact_id": legacy_aid,
+            "code": "migratedcode",
+            "workspace_id": WS_ID,
+            "path": "hk-momentum/index.html",
+            "latest_seq": 2,
+            "shared_at": None,
+            "files": None,
+            "revision": 1,
+            "shared_seq": 0,
+        }
+    }
+    artifact_versions: dict[tuple[str, int], dict[str, Any]] = {
+        (legacy_aid, 1): {
+            "seq": 1,
+            "entry_path": None,
+            "origin": "owner",
+            "title": "港股动量指数",
+            "label": None,
+            "byte_len": len(v1_body),
+            "published_at": NOW,
+        },
+        (legacy_aid, 2): {
+            "seq": 2,
+            "entry_path": "",
+            "origin": "owner",
+            "title": "港股动量指数",
+            "label": None,
+            "byte_len": len(v2_body),
+            "published_at": NOW,
+        },
+    }
+    artifact_version_files: dict[tuple[str, int, str], dict[str, Any]] = {
+        (legacy_aid, 1, "assets/app.js"): {
+            "user_id": COMPANY_SYSTEM_USER_ID,
+            "sha256": hashlib.sha256(b"console.log(1);").hexdigest(),
+            "byte_len": 15,
+            "content_type": "application/javascript",
+            "content": b"console.log(1);",
+        },
+        (legacy_aid, 1, "index.html"): {
+            "user_id": COMPANY_SYSTEM_USER_ID,
+            "sha256": hashlib.sha256(v1_body).hexdigest(),
+            "byte_len": len(v1_body),
+            "content_type": "text/html",
+            "content": v1_body,
+        },
+        (legacy_aid, 2, "hk-momentum/assets/app.js"): {
+            "user_id": COMPANY_SYSTEM_USER_ID,
+            "sha256": hashlib.sha256(b"console.log(2);").hexdigest(),
+            "byte_len": 15,
+            "content_type": "application/javascript",
+            "content": b"console.log(2);",
+        },
+        (legacy_aid, 2, "hk-momentum/index.html"): {
+            "user_id": COMPANY_SYSTEM_USER_ID,
+            "sha256": hashlib.sha256(v2_body).hexdigest(),
+            "byte_len": len(v2_body),
+            "content_type": "text/html",
+            "content": v2_body,
+        },
+    }
+    monitors_table: dict[str, dict[str, Any]] = {
+        hk_mid: {
+            "monitor_id": hk_mid,
+            "slug": "hk-momentum",
+            "artifact_id": legacy_aid,
+            "owner_user_id": COMPANY_SYSTEM_USER_ID,
+            "title": "港股动量指数",
+            "category": "hk",
+            "sort_order": 45,
+            "visibility": "company",
+            "published_seq": 2,
+            "keep_updated": True,
+            "source_kind": "data_job",
+            "source_ref": "hk-momentum",
+            "acl_revision": 1,
+            "last_publish_run_id": "run-hk-2",
+            "last_publish_error": None,
+            "last_publish_failed_at": None,
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+    }
+
+    _setup_legacy_migration_db(
+        monkeypatch,
+        share_links=share_links,
+        artifact_versions=artifact_versions,
+        artifact_version_files=artifact_version_files,
+        monitors_table=monitors_table,
+        monitor_members={},
+        monitor_versions={hk_mid: {1, 2}},
+        monitor_data={},
+        publish_runs=set(),
+    )
+
+    detail = await monitor_service.get_monitor_detail("hk-momentum", viewer_id="alice")
+    assert detail["monitor"]["entry_path"] == "hk-momentum/index.html"
+    assert [v["seq"] for v in detail["versions"]] == [2, 1]
+    assert detail["versions"][0]["entry_path"] == "hk-momentum/index.html"
+    assert detail["versions"][1]["entry_path"] == "index.html"
+
+    served_v1 = await monitor_service.serve_monitor_file(
+        detail["monitor_grant"], "1", detail["versions"][1]["entry_path"]
+    )
+    assert b"HK v1 legacy" in served_v1.body
+    served_v2 = await monitor_service.serve_monitor_file(
+        detail["monitor_grant"], "2", detail["versions"][0]["entry_path"]
+    )
+    assert b"HK v2 migrated" in served_v2.body
 

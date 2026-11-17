@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
@@ -19,6 +20,15 @@ _TITLE_CHARS = 300
 
 class ArtifactNotFound(LookupError):
     """No file record by that id belongs to this user."""
+
+
+class ArtifactPathConflict(Exception):
+    """Target workspace path is already occupied by another ``share_links`` record."""
+
+    def __init__(self, path: str, occupant_artifact_id: str | None = None) -> None:
+        self.path = path
+        self.occupant_artifact_id = occupant_artifact_id
+        super().__init__(path)
 
 
 def one_line(value: str | None) -> str:
@@ -306,6 +316,32 @@ async def unshare_in_cur(cur, *, user_id: str, artifact_id: str) -> Artifact:
         ),
         params={},
     )
+
+
+# DALTON-HOOK(monitors): rename a legacy data-job artifact's share_links.path in place
+# inside an open transaction so its artifact_id and historical versions stay intact.
+async def rename_artifact_path_in_cur(
+    cur,
+    *,
+    user_id: str,
+    artifact_id: str,
+    workspace_id: str,
+    new_path: str,
+) -> Artifact:
+    """Update ``share_links.path`` in place, raising ``ArtifactPathConflict`` if occupied."""
+    occupant = await _select_by_path(cur, workspace_id, new_path)
+    if occupant is not None and occupant.artifact_id != artifact_id:
+        raise ArtifactPathConflict(new_path, occupant.artifact_id)
+    try:
+        return await set_record_in_cur(
+            cur,
+            user_id=user_id,
+            artifact_id=artifact_id,
+            assignments="path = %(new_path)s",
+            params={"new_path": new_path},
+        )
+    except UniqueViolation:
+        raise ArtifactPathConflict(new_path, None) from None
 
 
 async def set_keep_updated(

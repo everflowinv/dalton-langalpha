@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Upload the generated sentiment dashboard to Tencent COS.
+"""[已停用] Upload the generated sentiment dashboard to Tencent COS.
+
+已停用：看板统一在 Everflow 监控面板里看，不再上传腾讯云 COS（eve.lumos.space）。
+本文件仅为保留历史覆盖层与单测兼容而留存。
 
 Supports DALTON_COS_UPLOAD_MODE:
 - 'skip': validate local HTML and emit sha256/bytes without importing the COS SDK,
@@ -33,12 +36,13 @@ BUCKET = "everflow-1320643462"
 REGION = "ap-hongkong"
 KEY = "index.html"
 ORIGIN_WEBSITE_URL = f"https://{BUCKET}.cos-website.{REGION}.myqcloud.com/"
-PUBLIC_URL = "https://eve.lumos.space/"
+PUBLIC_URL = "https://eve.lumos.space/"  # 已停用：看板统一在 Everflow 监控面板查看
 KEYCHAIN_ACCOUNT = "everflow"
 KEYCHAIN_SECRET_ID = "com.openclaw.tencent-cos.sentiment-dashboard.secret-id"
 KEYCHAIN_SECRET_KEY = "com.openclaw.tencent-cos.sentiment-dashboard.secret-key"
 
 ENV_UPLOAD_MODE = "DALTON_COS_UPLOAD_MODE"
+ENV_ALLOW_COS_UPLOAD = "DALTON_ALLOW_COS_UPLOAD"
 ENV_COS_SECRET_ID = "TENCENT_COS_SECRET_ID"
 ENV_COS_SECRET_KEY = "TENCENT_COS_SECRET_KEY"
 DALTON_RUNNER_ENV_VARS = (
@@ -56,23 +60,32 @@ def is_dalton_runner_env() -> bool:
     return any(bool(os.environ.get(name, "").strip()) for name in DALTON_RUNNER_ENV_VARS)
 
 
+def _require_cos_upload_allowed() -> None:
+    if os.environ.get(ENV_ALLOW_COS_UPLOAD, "").strip() != "1":
+        raise RuntimeError(
+            "COS 上传已停用（看板统一在 Everflow 监控面板查看，不再上传 eve.lumos.space）；"
+            "如需临时恢复上传请设置 DALTON_ALLOW_COS_UPLOAD=1。"
+        )
+
+
 def resolve_upload_mode() -> str:
     """Resolve and validate the COS upload mode ('skip' or 'prod').
 
     Rules:
-    - Explicit 'skip' or 'prod' in DALTON_COS_UPLOAD_MODE is used directly.
+    - Explicit 'skip' in DALTON_COS_UPLOAD_MODE returns 'skip' without requiring upload opt-in.
+    - Explicit 'prod' or standalone default is rejected unless DALTON_ALLOW_COS_UPLOAD=1.
     - Any other non-empty DALTON_COS_UPLOAD_MODE value is rejected.
-    - When DALTON_COS_UPLOAD_MODE is unset or empty:
-      * In the Dalton runner environment (or when the variable is defined as empty),
-        raise ValueError so a task container never uploads by accident.
-      * On a standalone non-Dalton host with DALTON_COS_UPLOAD_MODE unset,
-        default to 'prod' to preserve host upload behavior.
+    - When DALTON_COS_UPLOAD_MODE is unset or empty inside the Dalton runner environment
+      (or when defined as empty), raise ValueError so a task container never uploads by accident.
     """
     raw = os.environ.get(ENV_UPLOAD_MODE)
     if raw is not None and raw.strip():
         mode = raw.strip().lower()
-        if mode in ("skip", "prod"):
-            return mode
+        if mode == "skip":
+            return "skip"
+        if mode == "prod":
+            _require_cos_upload_allowed()
+            return "prod"
         raise ValueError(
             f"Unsupported {ENV_UPLOAD_MODE}={raw.strip()!r}; expected 'skip' or 'prod'."
         )
@@ -80,6 +93,7 @@ def resolve_upload_mode() -> str:
         raise ValueError(
             f"{ENV_UPLOAD_MODE} must be explicitly set to 'skip' or 'prod' in the Dalton runner environment."
         )
+    _require_cos_upload_allowed()
     return "prod"
 
 
@@ -281,7 +295,7 @@ def main() -> int:
                 {
                     "ok": False,
                     "error": _redact_secrets(str(exc)),
-                    "hint": "Check DALTON_COS_UPLOAD_MODE, COS environment/Keychain credentials, bucket website setting, and public-read access for index.html.",
+                    "hint": "COS upload to eve.lumos.space is disabled by default; use Everflow Monitors, DALTON_COS_UPLOAD_MODE=skip for preview, or set DALTON_ALLOW_COS_UPLOAD=1.",
                 },
                 ensure_ascii=False,
             ),

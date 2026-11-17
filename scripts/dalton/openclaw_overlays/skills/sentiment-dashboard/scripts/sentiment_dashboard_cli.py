@@ -3317,7 +3317,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             f"美股与个股读数截至 {us_as_of}（Yahoo 复权收盘）；"
             f"周期/防御、Momentum、AH 来自 Bloomberg CSV，截至 {bbg.get('as_of', '未知')}。",
             f"A股拥挤度截至 {crowding.get('trade_date', '未知')}，两融截至 {cn['as_of']}；日韩台杠杆综合分来自各地监控当日卡片。",
-            "阈值与页面上画的参考线同源；「接近」是卡片自己的一档，页面上没有画。完整口径见 eve.lumos.space。",
+            "阈值与页面上画的参考线同源；「接近」是卡片自己的一档，页面上没有画。完整口径见市场情绪总览的「口径与限制」。",
         ],
         "warnings": [],
     }
@@ -3670,7 +3670,8 @@ def render_panel_html(
         f'</head><body>'
         f'{nav_html}'
         f'<header class="top"><h1>{html.escape(panel_meta["title"])}</h1>'
-        f'<a class="top-link" href="{html.escape(site["top_link_href"])}">{html.escape(site["top_link_label"])}</a>'
+        # The relative-strength dashboard is its own monitor panel; panels link
+        # to each other through the panel nav, not to the public COS page.
         f'<p>{html.escape(panel_meta["subtitle"])}</p>'
         f'{legend_html}</header>'
         f'<main class="panel-main">{body_html}</main>'

@@ -662,10 +662,14 @@ def test_build_dashboard_writes_six_standalone_clean_panels(
         for target_slug in expected_slugs:
             assert f'href="/monitors/{target_slug}"' in doc
 
-        # Top color legend & non-personal header link present everywhere
+        # Top color legend present everywhere; panels must not link out to eve.lumos.space
         assert "涨 / 净流入：红" in doc
         assert "冷清 / 低位：蓝" in doc
-        assert "中概互联网相对强弱看板 →" in doc
+        assert "中概互联网相对强弱看板 →" not in doc
+        assert "lumos" not in doc.lower()
+
+    assert "lumos" not in single_html.lower()
+    assert 'href="/monitors/relative-strength"' in single_html
 
     # Visible text check across single-page HTML & all 6 panels
     for label, doc in docs_to_audit:

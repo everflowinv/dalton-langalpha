@@ -223,6 +223,10 @@ web/src/pages/Settings/panels/dalton/__tests__/DaltonWeixinChannelCard.test.tsx
 
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
 scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
+scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_digest.sh
+scripts/dalton/openclaw_overlays/skills/kweb-dashboard/SKILL.md
+scripts/dalton/openclaw_overlays/skills/kweb-dashboard/scripts/kweb_dashboard_cli.py
+scripts/dalton/check_monitor_conflicts.py
 scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh
 # Chat composer large-file multipart uploads (<=200 MiB) and sandbox materialization.
 src/dalton/migrations/versions/d033_chat_file_uploads.py
