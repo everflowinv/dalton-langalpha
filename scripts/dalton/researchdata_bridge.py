@@ -13466,17 +13466,42 @@ class ResearchDataBridge:
                         gp_outcome = gp_task.result()
                 except (asyncio.TimeoutError, Exception) as local_exc:
                     is_local_timeout = isinstance(local_exc, asyncio.TimeoutError)
+
+                    async def _settle_legs(legs: tuple[asyncio.Task[Any], ...]) -> None:
+                        for _ in range(8):
+                            if all(leg.done() for leg in legs):
+                                return
+                            await asyncio.sleep(0)
+                        pending_legs = [leg for leg in legs if not leg.done()]
+                        if pending_legs:
+                            await asyncio.wait(pending_legs, timeout=0.05)
+
                     # Let online calls that are already completing (including SQLite thread hops)
                     # settle before cancelling genuinely hung legs.
-                    for _ in range(8):
-                        if ae_task.done() and gp_task.done():
-                            break
-                        await asyncio.sleep(0)
-                    pending_legs = [
-                        t for t in (ae_task, gp_task) if not t.done()
-                    ]
-                    if pending_legs:
-                        await asyncio.wait(pending_legs, timeout=0.05)
+                    await _settle_legs((ae_task, gp_task))
+                    # Under tight per-caller caps (e.g. max_inflight_unsigned=1), a hung
+                    # slot-holding leg starves a queued sibling that could still complete
+                    # promptly; reap the hung slot holder first and give the queued leg a
+                    # brief settle window before cancelling it too.
+                    hung_slot_legs = tuple(
+                        leg
+                        for leg, q_stats in (
+                            (ae_task, ae_q_stats),
+                            (gp_task, gp_q_stats),
+                        )
+                        if not leg.done() and "queued_ms" in q_stats
+                    )
+                    queued_legs = tuple(
+                        leg
+                        for leg, q_stats in (
+                            (ae_task, ae_q_stats),
+                            (gp_task, gp_q_stats),
+                        )
+                        if not leg.done() and "queued_ms" not in q_stats
+                    )
+                    if hung_slot_legs and queued_legs:
+                        await _cancel_and_reap(hung_slot_legs)
+                        await _settle_legs(queued_legs)
                     if not ae_task.done():
                         ae_task.cancel()
                     if not gp_task.done():
