@@ -103,7 +103,46 @@
 		respond 404
 	}
 
-	# 5. SPA static files & index.html fallback (GET/HEAD only; index.html is never cached).
+	# 5. Everflow static documentation site (/help, /help/*):
+	#    hashed assets under /help/_astro/* are long-cached; HTML is never cached;
+	#    missing paths return HTTP 404 with /help/404.html instead of the app SPA.
+	@help_assets {
+		method GET HEAD
+		path /help/_astro/*
+	}
+	handle @help_assets {
+		@help_asset_exists file
+		header @help_asset_exists Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	@help_docs {
+		method GET HEAD
+		path /help /help/*
+	}
+	handle @help_docs {
+		route {
+			try_files {path}/index.html {path} {path}.html
+			@help_html path *.html
+			header @help_html Cache-Control "no-cache, no-store, must-revalidate"
+			file_server
+		}
+	}
+
+	handle_errors {
+		@help_404 {
+			expression {err.status_code} == 404
+			path /help /help/*
+			not path /help/_astro/*
+		}
+		handle @help_404 {
+			header Cache-Control "no-cache, no-store, must-revalidate"
+			rewrite * /help/404.html
+			file_server
+		}
+	}
+
+	# 6. SPA static files & index.html fallback (GET/HEAD only; index.html is never cached).
 	@spa_read {
 		method GET HEAD
 	}
@@ -117,7 +156,7 @@
 		}
 	}
 
-	# 6. All other paths / methods outside /api/*, /ws/*, and static GET/HEAD return 404.
+	# 7. All other paths / methods outside /api/*, /ws/*, and static GET/HEAD return 404.
 	handle {
 		respond 404
 	}

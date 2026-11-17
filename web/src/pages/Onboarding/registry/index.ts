@@ -18,6 +18,8 @@ export const DEPLOYED_TASKS: GettingStartedTaskDef[] = GETTING_STARTED_TASKS.fil
     // DALTON-HOOK(onboarding-tasks): Dalton does not ship the desktop app, so
     // its download task is hidden; the count and progress ring follow.
     t.id !== 'desktopApp' &&
+    // DALTON-HOOK(help): omit tasks whose target URL is null in this build
+    t.to !== null &&
     (!t.platformOnly || isPlatformMode) &&
     (t.offeredOn !== 'browser' || !isDesktopShell()) &&
     (t.offeredOn !== 'thisMac' || isDesktopShell())

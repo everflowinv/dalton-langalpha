@@ -122,13 +122,14 @@ export function GettingStartedSection({
   const [open, setOpen] = useState(() => defaultOpen ?? readOpen());
   const listId = useId();
   const nextRef = useRef<HTMLButtonElement>(null);
-  const next = tasks.findIndex((task) => !task.done);
+  const visibleTasks = tasks.filter(({ def }) => def.to !== null); // DALTON-HOOK(help)
+  const next = visibleTasks.findIndex((task) => !task.done);
   // Only the browser takes a cross-app task to a tab of its own.
   const newTab = !isDesktopShell();
   const title = t('onboarding.gettingStarted.title');
   const progress = t('onboarding.gettingStarted.progress', {
     done: doneCount,
-    total: tasks.length,
+    total: visibleTasks.length,
   });
 
   useEffect(() => {
@@ -152,10 +153,11 @@ export function GettingStartedSection({
         aria-label={`${title}, ${progress}`}
         onClick={toggle}
       >
-        <ProgressRing done={doneCount} total={tasks.length} className="sidebar-panel-item-icon" />
+        {/* DALTON-HOOK(help): visibleTasks excludes null-destination tasks */}
+        <ProgressRing done={doneCount} total={visibleTasks.length} className="sidebar-panel-item-icon" />
         <span className="min-w-0 flex-1 truncate text-left">{title}</span>
         <span className="sidebar-guide-count">
-          {doneCount}/{tasks.length}
+          {doneCount}/{visibleTasks.length}
         </span>
         <ChevronDown className="sidebar-guide-chevron" aria-hidden />
       </button>
@@ -169,7 +171,7 @@ export function GettingStartedSection({
       >
         <div className="sidebar-guide-scroll">
           <ul className="flex flex-col gap-px">
-            {tasks.map(({ def, done }, i) => {
+            {visibleTasks.map(({ def, done }, i) => {
               const isNext = i === next;
               return (
                 <li key={def.id}>
@@ -279,9 +281,12 @@ export function GettingStartedLauncher(props: GettingStartedLauncherProps) {
   }
 
   const select = (def: GettingStartedTaskDef) => {
+    // DALTON-HOOK(help): guard null destination when a task is disabled in this build
+    const targetUrl = def.to;
+    if (!targetUrl) return;
     if (!def.external) {
       def.open?.();
-      navigate(def.to);
+      navigate(targetUrl);
       return;
     }
     // A task with its own signal is done by that, not by the visit.
@@ -291,7 +296,7 @@ export function GettingStartedLauncher(props: GettingStartedLauncherProps) {
       // does, and the shell answers a window.open with a window of its own or
       // the browser. Leaving unloads the page, so the stamp goes first.
       const waited = new Promise<void>((resolve) => setTimeout(resolve, STAMP_WAIT_MS));
-      void Promise.race([stamps ? completeTask(def.id) : undefined, waited]).then(() => window.location.assign(def.to));
+      void Promise.race([stamps ? completeTask(def.id) : undefined, waited]).then(() => window.location.assign(targetUrl));
       return;
     }
     // Cross-app page — no route of ours to observe, so a successful open is
@@ -300,7 +305,7 @@ export function GettingStartedLauncher(props: GettingStartedLauncherProps) {
     // return null even on success, which would read as "blocked" and leave the
     // task permanently pending. Sever the opener on the returned handle
     // instead.
-    const win = window.open(def.to, '_blank');
+    const win = window.open(targetUrl, '_blank');
     if (win) {
       win.opener = null;
       if (stamps) completeTask(def.id);

@@ -85,8 +85,9 @@ export interface GettingStartedTaskDef {
   id: string;
   titleKey: string;
   descKey: string;
-  /** Where clicking the task navigates (router path, or a full URL when external). */
-  to: string;
+  /** Where clicking the task navigates (router path, or a full URL when external; null when hidden in this build). */
+  // DALTON-HOOK(help): allow null destination for tasks disabled in Dalton builds
+  to: string | null;
   /**
    * Cross-app destination, stamped done on click: a new tab in the browser,
    * this window in the desktop app.

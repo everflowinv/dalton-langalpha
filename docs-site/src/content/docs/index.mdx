@@ -1,0 +1,100 @@
+---
+title: Everflow 文档
+description: 面向投研分析师的 Everflow 平台与 Dalton 研究助手中文使用指南。
+template: splash
+lastUpdated: 2026-11-17
+hero:
+  title: |
+    研究市场。
+    沉淀判断。
+    让 Dalton 替你盯盘。
+  tagline: 面向投研团队的 AI 研究工作台。在工作区中调用代码沙箱、内部研报与专家库、SEC 财报与实时行情，产出研究结论、监控面板与定时报告。
+  actions:
+    - text: 快速入门
+      link: /help/get-started/what-is-everflow/
+      icon: right-arrow
+      variant: primary
+    - text: 查看新功能
+      link: /help/whats-new/
+      variant: secondary
+---
+
+import { CardGrid, Icon, LinkCard } from '@astrojs/starlight/components';
+import HeroImageSlot from '../../components/HeroImageSlot.astro';
+
+<HeroImageSlot />
+
+## <Icon name="rocket" size="1.1rem" class="ef-group-icon" />从这里开始
+
+<CardGrid>
+  <LinkCard
+    title="Everflow 是什么"
+    description="了解研究总监与工作区分析师的分工，以及代码沙箱如何支撑深度投研。"
+    href="/help/get-started/what-is-everflow/"
+  />
+  <LinkCard
+    title="第一次使用"
+    description="从账号登录、创建第一个工作区到发起提问并查看生成的研究文件。"
+    href="/help/get-started/first-use/"
+  />
+  <LinkCard
+    title="界面导览"
+    description="熟悉左侧导航、右侧文件与图表预览区，以及全局搜索快捷键。"
+    href="/help/get-started/interface-tour/"
+  />
+  <LinkCard
+    title="常见问题"
+    description="预算上限、监控面板打不开、报告未收到、数据提示未更新时的排查路径。"
+    href="/help/faq/"
+  />
+</CardGrid>
+
+## <Icon name="star" size="1.1rem" class="ef-group-icon" />Everflow 核心与专有能力
+
+<CardGrid>
+  <LinkCard
+    title="监控面板"
+    description="四档可见范围、将工作区 HTML 网页挂成团队面板、数据更新频率与“数据未更新”含义。"
+    href="/help/everflow/monitors/"
+  />
+  <LinkCard
+    title="研究数据源"
+    description="AlphaEngine 额度计费与系统缓存机制、Guidepoint 摘录规则，以及各内部库路由选择。"
+    href="/help/everflow/research-data-sources/"
+  />
+  <LinkCard
+    title="定时报告与投递"
+    description="绑定个人飞书、Discord 与微信，配置自动化推送路线与投递失败告警。"
+    href="/help/everflow/scheduled-reports-and-delivery/"
+  />
+  <LinkCard
+    title="设置页逐组说明"
+    description="完整对照「个人设置」与「团队管理」每一栏的作用与权限门槛。"
+    href="/help/everflow/settings-guide/"
+  />
+</CardGrid>
+
+## <Icon name="open-book" size="1.1rem" class="ef-group-icon" />场景实战与方案对比
+
+<CardGrid>
+  <LinkCard
+    title="写首次覆盖与财报跟踪"
+    description="使用深度覆盖、财报前瞻、速评与长篇复盘技能产出经过核验的研究报告。"
+    href="/help/explore/initiation-report/"
+  />
+  <LinkCard
+    title="搭估值模型与做监控看板"
+    description="在沙箱里用 Python 与 SEC XBRL 构建模型，并用图表库生成可发布网页面板。"
+    href="/help/explore/valuation-models/"
+  />
+  <LinkCard
+    title="怎么选：对比指南"
+    description="分清研究总监与分析师、定时任务与唤醒、记忆与资料、技能与数据源的适用边界。"
+    href="/help/compare/chief-of-staff-or-analyst/"
+  />
+  <LinkCard
+    title="更新日志与版本动态"
+    description="按日期查看平台最新能力上线记录与团队用户可见的功能改进。"
+    href="/help/changelog/"
+  />
+</CardGrid>

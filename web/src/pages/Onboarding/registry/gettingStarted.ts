@@ -60,6 +60,7 @@ export const GETTING_STARTED_TASKS: GettingStartedTaskDef[] = [
     id: 'desktopApp',
     titleKey: 'onboarding.gettingStarted.tasks.desktopApp.title',
     descKey: 'onboarding.gettingStarted.tasks.desktopApp.desc',
+    // DALTON-HOOK(help): null in Dalton builds; filtered out in DEPLOYED_TASKS and GettingStarted
     to: DESKTOP_DOWNLOAD_URL,
     external: true,
     offeredOn: 'browser',

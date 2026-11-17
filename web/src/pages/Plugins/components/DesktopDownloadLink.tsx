@@ -20,6 +20,8 @@ export function DesktopDownloadLink({
   children?: React.ReactNode;
 }) {
   const { t } = useTranslation();
+  // DALTON-HOOK(help): render nothing when DESKTOP_DOWNLOAD_URL is null in Dalton builds
+  if (!DESKTOP_DOWNLOAD_URL) return null;
   const full = t('plugins.oauth.desktopDownloadFull');
   return (
     <a
@@ -49,7 +51,8 @@ export function NativeOnlyNote({ id }: { id?: string }) {
   const { t } = useTranslation();
   // The link only where this window cannot finish the flow: inside a shell
   // that can, the user already has what it would download.
-  const download = !canBeginMcpOAuth();
+  // DALTON-HOOK(help): omit desktop download link when DESKTOP_DOWNLOAD_URL is null
+  const download = !canBeginMcpOAuth() && Boolean(DESKTOP_DOWNLOAD_URL);
   return (
     <span className="inline-flex items-center gap-1.5 text-[0.6875rem]">
       <RowNote icon={Monitor} id={id}>

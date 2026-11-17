@@ -1,0 +1,96 @@
+---
+import { Image } from 'astro:assets';
+import type { ImageMetadata } from 'astro';
+
+interface Props {
+	src?: ImageMetadata | string;
+	darkSrc?: ImageMetadata | string;
+	lightSrc?: ImageMetadata | string;
+	alt?: string;
+	caption?: string;
+}
+
+const { src, darkSrc, lightSrc, alt = 'Everflow 产品界面预览', caption } = Astro.props;
+
+const slotHtml = Astro.slots.has('default') ? (await Astro.slots.render('default')).trim() : '';
+const resolvedDark = darkSrc ?? src;
+const resolvedLight = lightSrc ?? (darkSrc ? undefined : src);
+const hasDualThemeImages = Boolean(resolvedDark && resolvedLight && resolvedDark !== resolvedLight);
+const hasMedia = Boolean(resolvedDark || resolvedLight || slotHtml);
+---
+
+{
+	hasMedia && (
+		<figure class="ef-hero-slot">
+			<div class="ef-hero-slot__frame">
+				{resolvedDark &&
+					(typeof resolvedDark === 'string' ? (
+						<img
+							src={resolvedDark}
+							alt={alt}
+							loading="eager"
+							decoding="async"
+							class:list={[{ 'light:sl-hidden': hasDualThemeImages }]}
+						/>
+					) : (
+						<Image
+							src={resolvedDark}
+							alt={alt}
+							loading="eager"
+							decoding="async"
+							fetchpriority={hasDualThemeImages ? undefined : 'high'}
+							class:list={[{ 'light:sl-hidden': hasDualThemeImages }]}
+						/>
+					))}
+				{resolvedLight &&
+					hasDualThemeImages &&
+					(typeof resolvedLight === 'string' ? (
+						<img
+							src={resolvedLight}
+							alt={alt}
+							loading="eager"
+							decoding="async"
+							class="dark:sl-hidden"
+						/>
+					) : (
+						<Image
+							src={resolvedLight}
+							alt={alt}
+							loading="eager"
+							decoding="async"
+							class="dark:sl-hidden"
+						/>
+					))}
+				{slotHtml && <Fragment set:html={slotHtml} />}
+			</div>
+			{caption && <figcaption class="ef-hero-slot__caption">{caption}</figcaption>}
+		</figure>
+	)
+}
+
+<style>
+	.ef-hero-slot {
+		margin: clamp(2rem, 4vw, 3rem) 0 0 0;
+	}
+
+	.ef-hero-slot__frame {
+		border: 1px solid var(--ef-border);
+		border-radius: var(--ef-radius);
+		background: var(--ef-bg-card);
+		box-shadow: var(--ef-shadow);
+		overflow: hidden;
+	}
+
+	.ef-hero-slot__frame :global(img) {
+		display: block;
+		width: 100%;
+		height: auto;
+	}
+
+	.ef-hero-slot__caption {
+		margin-top: 0.75rem;
+		font-size: 0.8125rem;
+		color: var(--ef-text-secondary);
+		text-align: center;
+	}
+</style>

@@ -1,0 +1,33 @@
+---
+title: 技能、插件还是数据源？
+description: 区分 Everflow 中技能（Skills）、插件（Plugins）与研究数据源（Research Data）的定位与调用方式。
+lastUpdated: 2026-11-17
+---
+
+区分 Everflow 中**技能（Skill）**、**插件（Plugin）** 和 **研究数据源（Research Data）** 各自扮演的角色与调用方式。
+
+**数据源**提供原材料（研报、财报、专家摘录、行情），**插件**是把数据源或外部工具封装接入系统的扩展载体，而**技能**则是教助手“按什么步骤、什么标准格式、走哪几步核验去把原材料加工成成品报告”的操作手册。
+
+## 三层关系对照
+
+| 概念 | 在投研流程中的角色 | 类比理解 | 典型例子 |
+| :--- | :--- | :--- | :--- |
+| **研究数据源** | 原材料仓库 | 彭博终端、Wind、SEC EDGAR、内部研报库 | AlphaEngine、Guidepoint、SEC XBRL（`dalton_sec`）、`estimates`、雪球 |
+| **插件（Plugin）** | 连接仓库与工具箱的适配器 | 装进工作台的接口模块包 | `dalton-data`（内置 `researchdata` 与 `dalton_sec` 服务）、`price_data` 行情服务 |
+| **技能（Skill）** | 标准化投研 SOP 与质量模板 | 团队内部《首次覆盖写作指南与核验清单》 | `/initial-coverage`、`/dalton-earnings-preview`、`/dalton-stock-move`、`/dalton-publish` |
+
+## 实操中怎么搭配使用
+
+1. **只需查单点事实 → 直接点名数据源**
+   - 例：*“帮我查一下 `alphaengine` 里最近两周关于台积电 CoWoS 产能的卖方纪要，并对比 `dalton_sec` 里的资本开支数字。”*
+   - 这时助手只需要短小的一段沙箱代码直连对应数据源即可，不用拉起耗时半小时的全套覆盖流程。
+2. **要出整套研究交付物 → 触发对应技能**
+   - 例：*“运行 `/dalton-earnings-preview` 准备这家公司的三季报前瞻。”* 或 *“帮我用首次覆盖流程跑一份完整初稿。”*
+   - 技能会自动编排子代理并发去扫 `alphaengine`、`guidepoint`、`transcript`、`sec` 与 `estimates`，最终按团队约定结构落盘并运行数字核验。
+3. **希望改变报告模版或增加专用检查 → 写/改技能，不用动数据源**
+   - 数据源与插件负责把数据准确取回来；如果你有一套偏好的对比口径或固定排版格式，应该把规则写进自定义技能或工作区指南中。
+
+## 相关页面
+
+- 浏览所有内置投研技能列表：[技能与插件](/help/concepts/skills-and-plugins/)
+- 查看全部数据源路由与缓存规则：[研究数据源](/help/everflow/research-data-sources/)
