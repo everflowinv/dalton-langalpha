@@ -472,7 +472,7 @@ revert_deploy() {
   fi
   build_out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
   build_rc=$?
-  if [ "$build_rc" -eq 0 ] && printf '%s\n' "$build_out" | grep -q "OK: Production bundle"; then
+  if [ "$build_rc" -eq 0 ] && grep -q "OK: Production bundle" <<<"$build_out"; then
     echo "reverted to $(git rev-parse --short=9 HEAD), old frontend rebuilt"
   else
     echo "OLD FRONTEND REBUILD FAILED"
@@ -569,7 +569,9 @@ uv sync --frozen -q 2>&1 | tail -2 || echo "WARN: host venv sync failed (host jo
 out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
 build_rc=$?
 printf '%s\n' "$out" | grep -E "VITE_DALTON_AUTH=|OK:|ERROR|OVER BUDGET" || true
-if [ "$build_rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q "OK: Production bundle"; then
+# Here-string, not a pipe: under pipefail, grep -q stopping early on a long build log
+# SIGPIPEs printf and reads as a failed build (2026-11-17, #380 deploy).
+if [ "$build_rc" -ne 0 ] || ! grep -q "OK: Production bundle" <<<"$out"; then
   echo "frontend build failed: reverting (backend not restarted)"
   revert_deploy
   exit 1
