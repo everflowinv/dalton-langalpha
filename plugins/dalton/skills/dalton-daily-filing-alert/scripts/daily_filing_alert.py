@@ -5,11 +5,16 @@ filings are normalized from the finance cn-hk JSON the agent already wrote.
 A-share notice text in that JSON is parsed into body_excerpt, ndr, and digest.
 last_check is written after filings.json and the scan output both succeed.
 scan-cn-hk does not write last_check.
+
+Threat model: defends against model payload errors/hallucinations/amount mixing
+(payload JSON is untrusted), NOT against an attacker forging the script-written
+scan output file itself.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import re
@@ -82,7 +87,7 @@ def _locals() -> dict[str, Any]:
         return _MODS
     here = Path(__file__).resolve().parent
     modules: dict[str, Any] = {}
-    for name in ("netio", "card_io", "filing_card", "edgar_client", "cn_ndr"):
+    for name in ("netio", "card_io", "filing_card", "edgar_client", "cn_ndr", "buyback_parse"):
         qualified = f"dalton_daily_filing_{name}"
         existing = sys.modules.get(qualified)
         expected = str(here / f"{name}.py")
@@ -146,11 +151,15 @@ def _bundled_text(path: Path) -> str:
 
 
 def _symbol_lines(text: str) -> list[str]:
-    symbols = []
+    symbols: list[str] = []
+    seen: set[str] = set()
     for line in text.splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
-            symbols.append(stripped.upper())
+            sym = stripped.upper()
+            if sym not in seen:
+                seen.add(sym)
+                symbols.append(sym)
     return symbols
 
 
@@ -162,12 +171,21 @@ def parse_tickers(workspace: Path, raw: str) -> list[str]:
         if not path.is_file():
             raise RuntimeError("watchlist file not found")
         return _symbol_lines(path.read_text(encoding="utf-8"))
-    return [item.strip().upper() for item in raw.split(",") if item.strip()]
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        sym = item.strip().upper()
+        if sym and sym not in seen:
+            seen.add(sym)
+            symbols.append(sym)
+    return symbols
 
 
 def parse_cn_hk_text(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     cn_stocks: list[tuple[str, str]] = []
     hk_stocks: list[tuple[str, str]] = []
+    seen_cn: set[str] = set()
+    seen_hk: set[str] = set()
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -175,11 +193,16 @@ def parse_cn_hk_text(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, 
         parts = stripped.split(None, 1)
         if len(parts) < 2:
             continue
-        code, name = parts
+        code, name = parts[0].strip(), parts[1].strip()
         if ".HK" in code.upper() or (code.startswith("0") and len(code) == 5):
-            hk_stocks.append((code.replace(".HK", "").replace(".hk", ""), name))
+            clean = re.sub(r"\.hk$", "", code, flags=re.IGNORECASE)
+            if clean not in seen_hk:
+                seen_hk.add(clean)
+                hk_stocks.append((clean, name))
         else:
-            cn_stocks.append((code, name))
+            if code not in seen_cn:
+                seen_cn.add(code)
+                cn_stocks.append((code, name))
     return cn_stocks, hk_stocks
 
 
@@ -295,13 +318,16 @@ def check_filings(ticker: str, days: int, as_of: datetime, enrich: bool = True) 
                 cik=listed.get("cik") or None,
             )
             _apply_enrichment(filing, extra)
-    return {
+    out: dict[str, Any] = {
         "ticker": ticker,
         "new_filings": filings,
         "errors": list(listed.get("errors") or []),
         "count": len(filings),
         "cutoff": cutoff,
     }
+    if listed.get("ambiguous_ciks"):
+        out["ambiguous_ciks"] = list(listed["ambiguous_ciks"])
+    return out
 
 
 def _dump_filings(results: list[dict[str, Any]], scan_time: str) -> dict[str, Any]:
@@ -543,15 +569,23 @@ def _call_error(call: dict[str, Any]) -> str:
 
 
 def _report_end(raw: Any, as_of: datetime) -> str:
-    fallback = as_of.astimezone(HK).strftime("%Y-%m-%d")
+    """Anchor CN/HK filtering strictly on the HK report date from ``as_of``."""
+    return as_of.astimezone(HK).strftime("%Y-%m-%d")
+
+
+def _report_end_gap_note(raw: Any, report_end: str) -> str:
     if not isinstance(raw, dict):
-        return fallback
-    file_end = str(raw.get("end") or "")[:10]
-    try:
-        datetime.strptime(file_end, "%Y-%m-%d")
-    except ValueError:
-        return fallback
-    return file_end
+        return ""
+    raw_end = str(raw.get("end") or "").strip()
+    if not raw_end:
+        return ""
+    if raw_end[:10] == report_end:
+        try:
+            datetime.strptime(raw_end[:10], "%Y-%m-%d")
+            return ""
+        except ValueError:
+            pass
+    return f"raw JSON 顶层 end（{raw_end[:40]}）与香港报告日（{report_end}）不一致，已按 {report_end} 筛选"
 
 
 def _file_limit(raw: Any) -> int:
@@ -568,6 +602,78 @@ def _notice_text(value: Any) -> str:
     return value
 
 
+_BUYBACK_ANN_RE = re.compile(
+    r"(?:翌日披露|next\s+day\s+disclosure|股份[購购]回|股份回[購购]|[購购]回|回[購购]|[買买]回|"
+    r"(?:购入|購入)[^\n。；;]*?(?:股份|股票|H股|A股|普通股)|"
+    r"\b(?:share[- ]?)?repurchas\w*|\bbuy[- ]?backs?\b)",
+    re.IGNORECASE,
+)
+_AMENDMENT_TITLE_RE = re.compile(r"(?:更正|修訂|修订|補充|补充)")
+_STATUS_LINE_RE = re.compile(r"[狀状]\s*[態态][：:]\s*([^\n]+)")
+
+
+def _is_buyback_announcement(
+    item: dict[str, Any],
+    row: dict[str, Any] | None = None,
+    *,
+    allow_notice_text: bool = True,
+) -> bool:
+    title = str(item.get("title") or "")
+    ann_type = str(item.get("type") or "")
+    if _BUYBACK_ANN_RE.search(title) or _BUYBACK_ANN_RE.search(ann_type):
+        return True
+    if row is not None and allow_notice_text:
+        text = _notice_text(row.get("notice_text"))
+        if "翌日披露報表" in text[:400]:
+            return True
+    return False
+
+
+def _is_amendment_row(
+    item: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    allow_notice_text: bool = True,
+) -> bool:
+    if _AMENDMENT_TITLE_RE.search(str(item.get("title") or "")):
+        return True
+    if not allow_notice_text:
+        return False
+    text = _notice_text(row.get("notice_text"))
+    if not text:
+        return False
+    status_m = _STATUS_LINE_RE.search(text[:800])
+    if status_m and _AMENDMENT_TITLE_RE.search(status_m.group(1)):
+        return True
+    first_lines = "\n".join(line.strip() for line in text.splitlines()[:3] if line.strip())
+    return bool(_AMENDMENT_TITLE_RE.search(first_lines))
+
+
+def _filter_buyback_amendments(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    allow_notice_text: bool = True,
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], list[tuple[dict[str, Any], dict[str, Any]]]]:
+    has_amendment = any(
+        _is_buyback_announcement(item, row, allow_notice_text=allow_notice_text)
+        and _is_amendment_row(item, row, allow_notice_text=allow_notice_text)
+        for item, row in pairs
+    )
+    if not has_amendment:
+        return pairs, []
+    kept: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    dropped: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for item, row in pairs:
+        if (
+            not _is_buyback_announcement(item, row, allow_notice_text=allow_notice_text)
+            or _is_amendment_row(item, row, allow_notice_text=allow_notice_text)
+        ):
+            kept.append((item, row))
+        else:
+            dropped.append((item, row))
+    return kept, dropped
+
+
 def _apply_a_share_body(item: dict[str, Any], row: dict[str, Any]) -> None:
     """Fill the old enrich fields from agent-supplied notice text. A shares only."""
     url = item.get("url") or ""
@@ -579,17 +685,36 @@ def _apply_a_share_body(item: dict[str, Any], row: dict[str, Any]) -> None:
         item["enrich_error"] = agent_error or "正文为空（可能只有 PDF）"
         return
     parser = _locals()["cn_ndr"]
-    item["body_excerpt"] = parser.body_excerpt(text)
     title = item.get("title") or ""
-    if "翌日披露" not in title and "翌日披露報表" not in text[:400]:
+    is_ndr = "翌日披露" in title or "翌日披露報表" in text[:400]
+    if is_ndr:
+        try:
+            parsed = parser.parse_ndr(text)
+        except Exception as exc:  # noqa: BLE001 - one next-day form failure is recorded on that notice
+            item["enrich_error"] = f"翌日披露报表解析失败: {exc}"
+            return
+        _raw_sc, conflict_err = _locals()["buyback_parse"].stock_code_conflict(str(item.get("code") or ""), parsed)
+        if conflict_err:
+            item["enrich_error"] = f"翌日披露报表身份冲突: {conflict_err}"
+            return
+        item["body_excerpt"] = parser.body_excerpt(text)
+        item["ndr"] = parsed
+        item["digest"] = parsed["digest"]
         return
-    try:
-        parsed = parser.parse_ndr(text)
-    except Exception as exc:  # noqa: BLE001 - one next-day form failure is recorded on that notice
-        item["enrich_error"] = f"翌日披露报表解析失败: {exc}"
+    if ("第二章節" in text or "第二章节" in text) and ("購回報告" in text or "购回报告" in text):
+        validated = _locals()["buyback_parse"].parse(text)
+        if "error" in validated:
+            item["enrich_error"] = f"回购报表解析失败: {validated['error']}"
+            return
+        _raw_sc, conflict_err = _locals()["buyback_parse"].stock_code_conflict(str(item.get("code") or ""), validated)
+        if conflict_err:
+            item["enrich_error"] = f"回购报表身份冲突: {conflict_err}"
+            return
+        item["body_excerpt"] = parser.body_excerpt(text)
+        item["buyback"] = validated
+        item["digest"] = validated["line"]
         return
-    item["ndr"] = parsed
-    item["digest"] = parsed["digest"]
+    item["body_excerpt"] = parser.body_excerpt(text)
 
 
 def _announcement(row: dict[str, Any], code: str, name: str) -> dict[str, Any] | None:
@@ -598,14 +723,106 @@ def _announcement(row: dict[str, Any], code: str, name: str) -> dict[str, Any] |
     url = _safe_url(row.get("pdf_link") or row.get("url"))
     if not title and not url:
         return None
+    day = _row_date(row)
+    explicit_id = _public_text(row.get("id") or row.get("announcement_id") or row.get("notice_id"), limit=200)
+    if explicit_id:
+        ann_id = explicit_id
+    elif url:
+        ann_id = url
+    else:
+        digest = hashlib.sha1(f"{code}|{day}|{title}".encode("utf-8")).hexdigest()[:12]
+        ann_id = f"{code}:{day}:{digest}"
     return {
+        "id": ann_id,
         "code": code,
         "name": name,
         "title": title,
         "type": category,
-        "date": _row_date(row),
+        "date": day,
         "url": url,
     }
+
+
+def _validate_buyback_scan_entry(
+    item: dict[str, Any],
+    row: dict[str, Any],
+    market: str,
+) -> dict[str, Any] | None:
+    # M2: HK rows must never trust model-supplied notice_text; only A-share rows use notice_text.
+    text = _notice_text(row.get("notice_text")) if market == "A" else ""
+    is_bb = _is_buyback_announcement(item) or (market == "A" and "翌日披露報表" in text[:400])
+    if market == "A":
+        is_bb = is_bb or "ndr" in item or "buyback" in item
+    if not is_bb:
+        return None
+    bp = _locals()["buyback_parse"]
+    common = {
+        "ann_id": str(item.get("id") or ""),
+        "url": str(item.get("url") or ""),
+        "code": str(item.get("code") or ""),
+        "date": str(item.get("date") or ""),
+        "title": str(item.get("title") or ""),
+    }
+    if market == "A":
+        if item.get("enrich_error"):
+            err_text = str(item["enrich_error"])
+            err_payload: dict[str, Any] = {"error": err_text}
+            sc_match = re.search(r"证券代号（([^）]+)）", err_text)
+            if sc_match:
+                err_payload["stock_code"] = sc_match.group(1).strip()
+            return bp.scan_record_from_parsed(err_payload, **common)
+        if isinstance(item.get("ndr"), dict):
+            _parsed, rec = bp.validate_for_scan(text, ndr_data=item["ndr"], **common)
+            return rec
+        if isinstance(item.get("buyback"), dict):
+            return bp.scan_record_from_parsed(item["buyback"], **common)
+        return bp.scan_record_from_parsed({"error": "未解析到第二章節购回明细"}, **common)
+
+    agent_error = _public_text(row.get("enrich_error"), limit=300)
+    return bp.scan_record_from_parsed({"error": agent_error or "未解析回购PDF"}, **common)
+
+
+def _merge_preserved_buybacks(
+    buyback_results: dict[str, dict[str, Any]],
+    existing_buyback_results: dict[str, dict[str, Any]],
+    dropped_keys: set[str],
+) -> None:
+    """Preserve prior validated buyback entries across scan-cn-hk reruns."""
+    if not existing_buyback_results:
+        return
+    token_to_current_key: dict[str, str] = {}
+    for cur_key, cur_rec in buyback_results.items():
+        if cur_key:
+            token_to_current_key[cur_key] = cur_key
+        if isinstance(cur_rec, dict):
+            for field in ("id", "url", "pdf_url"):
+                tok = str(cur_rec.get(field) or "").strip()
+                if tok:
+                    token_to_current_key.setdefault(tok, cur_key)
+
+    for prev_key, prev_rec in existing_buyback_results.items():
+        if not isinstance(prev_rec, dict) or prev_rec.get("validated") is not True:
+            continue
+        prev_tokens = [
+            tok
+            for tok in (
+                prev_key,
+                str(prev_rec.get("id") or "").strip(),
+                str(prev_rec.get("url") or "").strip(),
+                str(prev_rec.get("pdf_url") or "").strip(),
+            )
+            if tok
+        ]
+        if any(tok in dropped_keys for tok in prev_tokens):
+            continue
+        matched_cur_key = next(
+            (token_to_current_key[tok] for tok in prev_tokens if tok in token_to_current_key),
+            None,
+        )
+        if matched_cur_key is None:
+            buyback_results[prev_key] = prev_rec
+        elif buyback_results[matched_cur_key].get("validated") is not True:
+            buyback_results[matched_cur_key] = prev_rec
 
 
 def _cn_hk_result(
@@ -616,6 +833,9 @@ def _cn_hk_result(
     start: str,
     end: str,
     limit: int,
+    *,
+    buyback_results: dict[str, dict[str, Any]] | None = None,
+    dropped_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "ticker": code,
@@ -648,7 +868,7 @@ def _cn_hk_result(
         return result
     result["errors"] = errors
     seen: set[str] = set()
-    announcements = []
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for row in rows:
         day = _row_date(row)
         if len(day) != 10 or day < start or day > end:
@@ -660,8 +880,33 @@ def _cn_hk_result(
         if key in seen:
             continue
         seen.add(key)
+        pairs.append((item, row))
+    pairs, dropped = _filter_buyback_amendments(pairs, allow_notice_text=(market == "A"))
+    for item, _row in dropped:
+        title = str(item.get("title") or "").strip() or "未命名公告"
+        day = str(item.get("date") or "").strip()
+        desc = f"{day} {title}".strip()
+        result["errors"].append(f"存在更正回购公告，已过滤: {desc}")
+        if dropped_keys is not None:
+            for token_field in ("id", "url", "pdf_url"):
+                tok = str(item.get(token_field) or "").strip()
+                if tok:
+                    dropped_keys.add(tok)
+    announcements = []
+    for item, row in pairs:
         if market == "A":
             _apply_a_share_body(item, row)
+        rec = _validate_buyback_scan_entry(item, row, market)
+        if rec is not None:
+            if rec.get("validated") is False and "证券代号" in str(rec.get("error") or ""):
+                title = str(item.get("title") or "").strip() or "未命名公告"
+                day = str(item.get("date") or "").strip()
+                desc = f"{day} {title}".strip()
+                result["errors"].append(f"回购公告证券代号与公司不一致: {desc}（{rec['error']}）")
+            if buyback_results is not None:
+                key = str(rec.get("id") or rec.get("url") or "").strip()
+                if key:
+                    buyback_results[key] = rec
         announcements.append(item)
     result["announcements"] = announcements
     result["count"] = len(announcements)
@@ -676,12 +921,32 @@ def cmd_scan_cn_hk(args: argparse.Namespace) -> dict[str, Any]:
     if not cn_stocks and not hk_stocks:
         return {"ok": False, "error": "No CN/HK stocks in watchlist"}
     raw = read_json(workspace, args.input)
-    _locals()["card_io"].workspace_file(workspace, args.output)
+    out_path = _locals()["card_io"].workspace_file(workspace, args.output)
+    existing_buyback_results: dict[str, dict[str, Any]] = {}
+    if out_path.exists():
+        if out_path.is_symlink():
+            raise RuntimeError("refusing symlink")
+        if out_path.is_file():
+            try:
+                existing_doc = json.loads(out_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_doc = None
+            if isinstance(existing_doc, dict) and isinstance(existing_doc.get("buyback_results"), dict):
+                existing_buyback_results = {
+                    str(k): v
+                    for k, v in existing_doc["buyback_results"].items()
+                    if isinstance(v, dict)
+                }
     report_end = _report_end(raw, as_of)
     limit = _file_limit(raw)
     grouped = _group_calls(raw)
     results = []
+    buyback_results: dict[str, dict[str, Any]] = {}
+    dropped_keys: set[str] = set()
     day_errors: list[str] = []
+    end_gap = _report_end_gap_note(raw, report_end)
+    if end_gap:
+        day_errors.append(end_gap)
     truncated: list[str] = []
     alert_count = 0
     for market, stocks in (("A", cn_stocks), ("HK", hk_stocks)):
@@ -695,6 +960,8 @@ def cmd_scan_cn_hk(args: argparse.Namespace) -> dict[str, Any]:
                 start,
                 end,
                 limit,
+                buyback_results=buyback_results,
+                dropped_keys=dropped_keys,
             )
             if result["count"]:
                 alert_count += 1
@@ -703,6 +970,7 @@ def cmd_scan_cn_hk(args: argparse.Namespace) -> dict[str, Any]:
             for message in result["errors"]:
                 day_errors.append(f"{code}: {message}")
             results.append(result)
+    _merge_preserved_buybacks(buyback_results, existing_buyback_results, dropped_keys)
     document = {
         "ok": True,
         "scan_time": as_of.isoformat(),
@@ -714,6 +982,7 @@ def cmd_scan_cn_hk(args: argparse.Namespace) -> dict[str, Any]:
         "stocks_with_alerts": alert_count,
         "day_errors": day_errors,
         "truncated": truncated,
+        "buyback_results": buyback_results,
         "results": results,
     }
     write_json(workspace, args.output, document)
@@ -742,6 +1011,24 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, **result}
 
 
+def _load_render_scan_data(workspace: Path, payload: dict[str, Any], cn_hk_arg: str) -> dict[str, Any] | None:
+    card_io = _locals()["card_io"]
+    if cn_hk_arg:
+        loaded = read_json(workspace, cn_hk_arg)
+        if not isinstance(loaded, dict):
+            raise RuntimeError("cn-hk scan file must be a JSON object")
+        return loaded
+    payload_date = str(payload.get("date") or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", payload_date):
+        default_rel = f"temp/daily-filing-alert/{payload_date}-cn-hk.json"
+        candidate = card_io.workspace_file(workspace, default_rel)
+        if candidate.is_file():
+            loaded = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+    return None
+
+
 def cmd_render(args: argparse.Namespace) -> dict[str, Any]:
     workspace = require_workspace(args.workspace_dir)
     if args.payload == args.output:
@@ -749,8 +1036,9 @@ def cmd_render(args: argparse.Namespace) -> dict[str, Any]:
     payload = read_json(workspace, args.payload)
     if not isinstance(payload, dict):
         return {"ok": False, "error": "payload must be an object"}
+    scan_data = _load_render_scan_data(workspace, payload, getattr(args, "cn_hk", "") or "")
     card_io = _locals()["card_io"]
-    card = _locals()["filing_card"].build_card(payload)
+    card, day_errors = _locals()["filing_card"].build_card_with_notes(payload, scan_data=scan_data)
     card_io._scan(card)
     renderer = card_io.load_renderer_module()
     if hasattr(renderer, "dump_card"):
@@ -769,9 +1057,9 @@ def cmd_render(args: argparse.Namespace) -> dict[str, Any]:
                 "hint": "existing card differs; left the file unchanged",
                 "path": args.output,
             }
-        return {"ok": True, "reused": True, "path": args.output, "card": card}
+        return {"ok": True, "reused": True, "path": args.output, "card": card, "day_errors": day_errors}
     card_io.write_bytes_exclusive(output, encoded)
-    return {"ok": True, "reused": False, "path": args.output, "card": card}
+    return {"ok": True, "reused": False, "path": args.output, "card": card, "day_errors": day_errors}
 
 
 def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
@@ -780,6 +1068,7 @@ def cmd_self_test(args: argparse.Namespace) -> dict[str, Any]:
     modules["edgar_client"].headline_self_check()
     modules["filing_card"].self_check()
     modules["cn_ndr"].self_check()
+    modules["buyback_parse"].self_check()
     _bundled_text(_skill_dir() / "watchlist.txt")
     _bundled_text(_skill_dir() / "watchlist_cn_hk.txt")
     return {"ok": True, "message": "All checks passed"}
@@ -822,6 +1111,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     render = sub.add_parser("render-card", parents=[shared])
     render.add_argument("--payload", required=True)
+    render.add_argument("--cn-hk", default="")
     render.add_argument("--output", required=True)
     render.set_defaults(func=cmd_render)
 
