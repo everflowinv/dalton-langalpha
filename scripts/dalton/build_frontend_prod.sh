@@ -87,6 +87,13 @@ load_vite_vars_from_file() {
         SUPABASE_PUBLISHABLE_KEY)
           _ENV_SUPABASE_PUBLISHABLE_KEY="$(strip_env_value "$raw_val")" || exit 1
           ;;
+        DOCS_SITE_ORIGIN|DALTON_FRONTEND_URL|PUBLIC_APP_URL|FRONTEND_URL)
+          local url_val
+          url_val="$(strip_env_value "$raw_val")" || exit 1
+          if [[ "$override_existing" == "1" || -z "${!key:-}" ]]; then
+            export "$key=$url_val"
+          fi
+          ;;
       esac
     fi
   done < "$file"
@@ -113,6 +120,7 @@ export VITE_BRAND_MARK="${VITE_BRAND_MARK:-everflow}"
 export VITE_DALTON_AUTH="${VITE_DALTON_AUTH:-${_ENV_DALTON_AUTH_MODE}}"
 export VITE_SUPABASE_URL="${VITE_SUPABASE_URL:-${_ENV_SUPABASE_URL}}"
 export VITE_SUPABASE_PUBLISHABLE_KEY="${VITE_SUPABASE_PUBLISHABLE_KEY:-${_ENV_SUPABASE_PUBLISHABLE_KEY}}"
+export DOCS_SITE_ORIGIN="${DOCS_SITE_ORIGIN:-${DALTON_FRONTEND_URL:-${PUBLIC_APP_URL:-${FRONTEND_URL:-}}}}"
 
 # 3. Validate auth env consistency (docs/dalton/dev-guide/AUTH-DEPLOY.md)
 if [[ "$VITE_DALTON_AUTH" == "supabase" ]]; then
@@ -162,3 +170,19 @@ fi
 
 echo "[build_frontend_prod] OK: Production bundle written to ${DIST_DIR}"
 echo "[build_frontend_prod] version.json: $(tr -d '\n' < "${DIST_DIR}/version.json")"
+
+# 6. Build Everflow static docs site (docs-site/) and copy output to web/dist/help/
+DOCS_DIR="${REPO_ROOT}/docs-site"
+HELP_DIST_DIR="${DIST_DIR}/help"
+echo "[build_frontend_prod] Building documentation site in ${DOCS_DIR}"
+cd "$DOCS_DIR"
+pnpm install --frozen-lockfile
+pnpm build
+if [[ ! -s "${DOCS_DIR}/dist/index.html" ]]; then
+  echo "ERROR: ${DOCS_DIR}/dist/index.html missing or empty after docs build" >&2
+  exit 1
+fi
+rm -rf "$HELP_DIST_DIR"
+mkdir -p "$HELP_DIST_DIR"
+cp -R "${DOCS_DIR}/dist/." "$HELP_DIST_DIR/"
+echo "[build_frontend_prod] OK: Documentation bundle copied to ${HELP_DIST_DIR}"

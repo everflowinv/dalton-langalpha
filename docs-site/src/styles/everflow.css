@@ -1,0 +1,635 @@
+/* ==========================================================================
+   Everflow 文档站视觉系统
+   颜色、字体、圆角与动效变量取自 web/src/styles/tokens.css 并映射到 Starlight
+   --sl-* 变量，确保与 Everflow 主应用在深色与浅色模式下完全一致。
+   ========================================================================== */
+
+:root {
+  /* Everflow 深色基准（与 web/src/styles/tokens.css 保持一致） */
+  --ef-bg: #191919;
+  --ef-bg-card: #202020;
+  --ef-bg-elevated: #2a2b2e;
+  --ef-bg-code: #252629;
+  --ef-bg-subtle: rgba(255, 255, 255, 0.03);
+  --ef-bg-hover: rgba(255, 255, 255, 0.05);
+  --ef-border: #2e3033;
+  --ef-border-subtle: #26282b;
+  --ef-border-strong: rgba(230, 230, 228, 0.32);
+
+  --ef-text: #e6e6e4;
+  --ef-text-body: #cfd0ce;
+  --ef-text-secondary: #9b9fa6;
+  --ef-text-tertiary: rgba(230, 230, 228, 0.62);
+
+  /* Burnished amber（高光琥珀色） */
+  --ef-accent: #e9954a;
+  --ef-accent-soft: rgba(233, 149, 74, 0.14);
+  --ef-accent-light: #f2b67c;
+  --ef-warning: #d8b04c;
+  --ef-danger: #f85149;
+  --ef-success: #3fb950;
+  --ef-info: #6e9ef7;
+
+  --ef-btn-bg: #ececea;
+  --ef-btn-text: #1a1b1d;
+  --ef-ring: #e6e6e4;
+  --ef-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 4px 16px rgba(0, 0, 0, 0.25);
+  --ef-overlay: rgba(0, 0, 0, 0.6);
+
+  --ef-radius: 0.75rem;
+  --ef-radius-sm: 0.5rem;
+  --ef-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ef-motion-quick: 160ms;
+
+  --ef-font-ui: 'Sora', 'Geist', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', -apple-system, system-ui, sans-serif;
+  --ef-font-content: 'Geist', 'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', -apple-system, system-ui, sans-serif;
+  --ef-font-mono: 'JetBrains Mono', 'Menlo', 'Noto Sans SC', ui-monospace, SFMono-Regular, monospace;
+
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  /* Everflow 浅色基准 */
+  --ef-bg: #ffffff;
+  --ef-bg-card: #ffffff;
+  --ef-bg-elevated: #f7f7f6;
+  --ef-bg-code: #f1f0ec;
+  --ef-bg-subtle: #faf9f7;
+  --ef-bg-hover: rgba(31, 31, 30, 0.04);
+  --ef-border: #e8e8e6;
+  --ef-border-subtle: #efefee;
+  --ef-border-strong: rgba(31, 31, 30, 0.22);
+
+  --ef-text: #1f1f1e;
+  --ef-text-body: #3a3a37;
+  --ef-text-secondary: #73726e;
+  --ef-text-tertiary: #8f8e89;
+
+  --ef-accent: #d07d33;
+  --ef-accent-soft: rgba(208, 125, 51, 0.12);
+  --ef-accent-light: #b6651f;
+  --ef-warning: #b45309;
+  --ef-danger: #cf222e;
+  --ef-success: #1a7f37;
+  --ef-info: #2563eb;
+
+  --ef-btn-bg: #1f1d1a;
+  --ef-btn-text: #faf9f7;
+  --ef-ring: #1f1f1e;
+  --ef-shadow: 0 1px 2px rgba(31, 29, 26, 0.04), 0 2px 8px rgba(31, 29, 26, 0.06);
+  --ef-overlay: rgba(0, 0, 0, 0.28);
+
+  color-scheme: light;
+}
+
+/* 映射到 Starlight 的 --sl-* 语义变量 */
+:root,
+::backdrop {
+  --sl-color-accent-low: var(--ef-accent-soft);
+  --sl-color-accent: var(--ef-accent);
+  --sl-color-accent-high: var(--ef-text);
+
+  --sl-color-white: var(--ef-text);
+  --sl-color-gray-1: var(--ef-text);
+  --sl-color-gray-2: var(--ef-text-body);
+  --sl-color-gray-3: var(--ef-text-secondary);
+  --sl-color-gray-4: var(--ef-text-tertiary);
+  --sl-color-gray-5: var(--ef-border);
+  --sl-color-gray-6: var(--ef-bg-card);
+  --sl-color-gray-7: var(--ef-bg-subtle);
+  --sl-color-black: var(--ef-bg);
+
+  --sl-color-text: var(--ef-text-body);
+  --sl-color-text-accent: var(--ef-accent);
+  --sl-color-text-invert: var(--ef-bg);
+  --sl-color-bg: var(--ef-bg);
+  --sl-color-bg-nav: var(--ef-bg);
+  --sl-color-bg-sidebar: var(--ef-bg);
+  --sl-color-bg-inline-code: var(--ef-bg-code);
+  --sl-color-hairline: var(--ef-border-subtle);
+  --sl-color-hairline-light: var(--ef-border);
+  --sl-color-hairline-shade: var(--ef-border);
+  --sl-color-backdrop-overlay: var(--ef-overlay);
+
+  --sl-font: var(--ef-font-content);
+  --sl-font-mono: var(--ef-font-mono);
+
+  --sl-text-h1: clamp(1.875rem, 1.5rem + 1.2vw, 2.375rem);
+  --sl-text-h2: 1.4375rem;
+  --sl-text-h3: 1.15rem;
+  --sl-text-h4: 1.025rem;
+  --sl-line-height: 1.76;
+  --sl-line-height-headings: 1.28;
+  --sl-nav-height: 3.75rem;
+  --sl-sidebar-width: 17.5rem;
+  --sl-content-width: 47rem;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--ef-accent-soft);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ef-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.sl-markdown-content span[id],
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6)[id] {
+  scroll-margin-top: calc(var(--sl-nav-height) + 1.5rem);
+}
+
+/* ---------- 顶栏与站点标识 ---------- */
+.header {
+  border-bottom-color: var(--ef-border);
+  backdrop-filter: blur(8px);
+}
+
+.site-title {
+  font-family: var(--ef-font-ui);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ef-text);
+  gap: 0.55rem;
+}
+
+.site-title img {
+  height: 1.45rem;
+  width: auto;
+}
+
+.header .social-icons:empty {
+  display: none;
+}
+
+/* 搜索触发胶囊 */
+@media (min-width: 50rem) {
+  button[data-open-modal] {
+    border-color: var(--ef-border);
+    background-color: var(--ef-bg-subtle);
+    color: var(--ef-text-secondary);
+    border-radius: 999px;
+    height: 2.25rem;
+    max-width: 20rem;
+    padding-inline: 0.875rem 0.5rem;
+    transition: border-color var(--ef-motion-quick) var(--ef-ease-out),
+      color var(--ef-motion-quick) var(--ef-ease-out),
+      background-color var(--ef-motion-quick) var(--ef-ease-out);
+  }
+
+  button[data-open-modal]:hover {
+    border-color: var(--ef-border-strong);
+    color: var(--ef-text);
+    background-color: var(--ef-bg-hover);
+  }
+}
+
+button[data-open-modal] > kbd {
+  border: 1px solid var(--ef-border);
+  background: var(--ef-bg);
+  color: var(--ef-text-secondary);
+  font-family: var(--ef-font-mono);
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  padding: 0.1rem 0.45rem;
+}
+
+site-search dialog {
+  background-color: var(--ef-bg-elevated);
+  border-color: var(--ef-border);
+  box-shadow: var(--ef-shadow);
+  border-radius: var(--ef-radius);
+}
+
+#starlight__search {
+  --pagefind-ui-background: var(--ef-bg);
+  --pagefind-ui-border: var(--ef-border);
+  --pagefind-ui-tag: var(--ef-bg-card);
+  --pagefind-ui-border-radius: var(--ef-radius-sm);
+}
+
+#starlight__search mark {
+  background: var(--ef-accent-soft);
+  color: var(--ef-text);
+  border-radius: 2px;
+}
+
+/* ---------- 左侧边栏 ---------- */
+.sidebar-content {
+  padding-top: 1.25rem;
+  gap: 1rem;
+}
+
+nav.sidebar .top-level > li + li {
+  margin-top: 0.5rem;
+}
+
+nav.sidebar details > summary {
+  border-radius: var(--ef-radius-sm);
+  padding-block: 0.3rem;
+  padding-inline: 0.625rem 0.375rem;
+}
+
+nav.sidebar .group-label .large {
+  font-family: var(--ef-font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--ef-text-secondary);
+}
+
+nav.sidebar details > summary:hover .group-label .large {
+  color: var(--ef-text);
+}
+
+nav.sidebar ul ul {
+  margin-inline-start: 0;
+  border-inline-start: 0;
+  padding-inline-start: 0;
+  margin-top: 0.25rem;
+}
+
+nav.sidebar ul ul li {
+  border-inline-start: 0;
+  margin-inline-start: 0;
+  padding-inline-start: 0;
+}
+
+nav.sidebar a.large,
+nav.sidebar ul ul a {
+  color: var(--ef-text-secondary);
+  border-radius: var(--ef-radius-sm);
+  padding-block: 0.35rem;
+  padding-inline: 0.75rem 1.25rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  position: relative;
+  transition: color var(--ef-motion-quick) var(--ef-ease-out),
+    background-color var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+nav.sidebar a:hover {
+  color: var(--ef-text);
+  background-color: var(--ef-bg-hover);
+}
+
+nav.sidebar a[aria-current='page'],
+nav.sidebar a[aria-current='page']:hover,
+nav.sidebar a[aria-current='page']:focus {
+  color: var(--ef-text);
+  background-color: var(--ef-bg-elevated);
+  font-weight: 500;
+}
+
+:root[data-theme='light'] nav.sidebar a[aria-current='page'],
+:root[data-theme='light'] nav.sidebar a[aria-current='page']:hover {
+  background-color: #f2f1ee;
+}
+
+nav.sidebar a[aria-current='page']::after {
+  content: '';
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-end: 0.6rem;
+  translate: 0 -50%;
+  width: 0.3125rem;
+  height: 0.3125rem;
+  border-radius: 999px;
+  background: var(--ef-accent);
+}
+
+/* ---------- 右侧目录（On this page） ---------- */
+.right-sidebar {
+  border-inline-start-color: transparent;
+}
+
+#starlight__on-this-page,
+#starlight__on-this-page--mobile .toggle {
+  font-family: var(--ef-font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--ef-text-secondary);
+}
+
+starlight-toc a {
+  color: var(--ef-text-secondary);
+  font-size: 0.8125rem;
+  transition: color var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+starlight-toc a:hover,
+starlight-toc a[aria-current='true'] {
+  color: var(--ef-text);
+}
+
+starlight-toc a[aria-current='true'] {
+  font-weight: 500;
+}
+
+/* ---------- 正文排版与组件 ---------- */
+.content-panel + .content-panel {
+  border-top: 0;
+}
+
+.content-panel:has(> .sl-container > h1),
+.content-panel:has(> .sl-container > .ef-page-title) {
+  padding-bottom: 0;
+}
+
+.sl-markdown-content {
+  color: var(--ef-text-body);
+}
+
+.sl-markdown-content :is(h1, h2, h3, h4) {
+  font-family: var(--ef-font-ui);
+  color: var(--ef-text);
+  letter-spacing: -0.015em;
+}
+
+.sl-markdown-content h2 {
+  margin-top: 2.5rem;
+  font-weight: 600;
+}
+
+.sl-markdown-content .sl-heading-wrapper.level-h2 {
+  margin-top: 2.5rem;
+  padding-bottom: 0.45rem;
+  border-bottom: 1px solid var(--ef-border-subtle);
+}
+
+.sl-markdown-content .sl-heading-wrapper.level-h2 > h2 {
+  margin-top: 0;
+}
+
+.sl-markdown-content h3 {
+  margin-top: 1.85rem;
+  font-weight: 600;
+}
+
+.sl-markdown-content strong {
+  color: var(--ef-text);
+  font-weight: 600;
+}
+
+.sl-markdown-content a:not(:where(.not-content *, .sl-link-card *)) {
+  color: var(--ef-text);
+  text-decoration-line: underline;
+  text-decoration-color: color-mix(in srgb, var(--ef-accent) 78%, transparent);
+  text-underline-offset: 0.22em;
+  text-decoration-thickness: 1px;
+  transition: text-decoration-color var(--ef-motion-quick) var(--ef-ease-out),
+    text-decoration-thickness var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+.sl-markdown-content a:not(:where(.not-content *, .sl-link-card *)):hover {
+  text-decoration-color: var(--ef-accent);
+  text-decoration-thickness: 2px;
+}
+
+.starlight-aside__content a {
+  color: var(--ef-text);
+}
+
+.sl-markdown-content :not(pre) > code {
+  border: 1px solid var(--ef-border);
+  background: var(--ef-bg-code);
+  color: var(--ef-text);
+  border-radius: 4px;
+  padding: 0.125rem 0.375rem;
+  font-size: 0.85em;
+}
+
+.sl-markdown-content blockquote {
+  border: 1px solid var(--ef-border);
+  border-inline-start: 3px solid var(--ef-accent);
+  background: var(--ef-bg-subtle);
+  color: var(--ef-text-body);
+  border-radius: var(--ef-radius-sm);
+  padding: 0.75rem 1rem;
+}
+
+.sl-markdown-content table {
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--ef-border);
+  border-radius: var(--ef-radius-sm);
+  width: 100%;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.sl-markdown-content :is(th, td) {
+  border: 0;
+  border-bottom: 1px solid var(--ef-border-subtle);
+  padding: 0.625rem 0.875rem;
+  vertical-align: top;
+}
+
+.sl-markdown-content tr:last-child > td {
+  border-bottom: 0;
+}
+
+.sl-markdown-content th {
+  background: var(--ef-bg-subtle);
+  border-bottom: 1px solid var(--ef-border);
+  color: var(--ef-text);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.sl-markdown-content tbody tr:hover {
+  background: var(--ef-bg-subtle);
+}
+
+/* 提示框 :::note / :::tip / :::caution / :::danger */
+.starlight-aside {
+  border: 1px solid var(--ef-border);
+  border-radius: var(--ef-radius-sm);
+  background: var(--ef-bg-card);
+  color: var(--ef-text-body);
+  padding: 0.875rem 1rem;
+}
+
+:root[data-theme='light'] .starlight-aside {
+  background: var(--ef-bg-subtle);
+}
+
+.starlight-aside__title {
+  font-family: var(--ef-font-ui);
+  color: var(--ef-text);
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
+.starlight-aside--note {
+  border-color: color-mix(in srgb, var(--ef-info) 40%, var(--ef-border));
+}
+
+.starlight-aside--note .starlight-aside__icon {
+  color: var(--ef-info);
+}
+
+.starlight-aside--tip {
+  border-color: color-mix(in srgb, var(--ef-accent) 40%, var(--ef-border));
+}
+
+.starlight-aside--tip .starlight-aside__icon {
+  color: var(--ef-accent);
+}
+
+.starlight-aside--caution {
+  border-color: color-mix(in srgb, var(--ef-warning) 45%, var(--ef-border));
+}
+
+.starlight-aside--caution .starlight-aside__icon {
+  color: var(--ef-warning);
+}
+
+.starlight-aside--danger {
+  border-color: color-mix(in srgb, var(--ef-danger) 45%, var(--ef-border));
+}
+
+.starlight-aside--danger .starlight-aside__icon {
+  color: var(--ef-danger);
+}
+
+/* 代码块 */
+.expressive-code .frame {
+  border-radius: var(--ef-radius-sm);
+  border-color: var(--ef-border);
+}
+
+/* 首页布局与卡片 */
+:root[data-has-hero] .sl-container {
+  max-width: 62rem;
+}
+
+:root[data-has-hero] .sl-markdown-content .sl-heading-wrapper.level-h2 {
+  margin-top: 3.75rem;
+  margin-bottom: 1.25rem;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+:root[data-has-hero] .sl-markdown-content > .sl-heading-wrapper.level-h2:first-child,
+:root[data-has-hero] .sl-markdown-content > .ef-hero-slot + .sl-heading-wrapper.level-h2 {
+  margin-top: 2.25rem;
+}
+
+:root[data-has-hero] .sl-markdown-content .sl-heading-wrapper.level-h2 h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 1.25rem;
+  letter-spacing: -0.015em;
+}
+
+:root[data-has-hero] .sl-markdown-content .ef-group-icon {
+  color: var(--ef-accent);
+  flex-shrink: 0;
+}
+
+.sl-link-button {
+  border-radius: 999px;
+  font-weight: 500;
+  transition: background-color var(--ef-motion-quick) var(--ef-ease-out),
+    border-color var(--ef-motion-quick) var(--ef-ease-out),
+    color var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+.sl-link-button.primary {
+  background: var(--ef-btn-bg);
+  border-color: var(--ef-btn-bg);
+  color: var(--ef-btn-text);
+}
+
+.sl-link-button.primary:hover {
+  background: color-mix(in srgb, var(--ef-btn-bg) 88%, var(--ef-bg));
+  color: var(--ef-btn-text);
+}
+
+.sl-link-button.secondary,
+.sl-link-button.minimal {
+  border: 1px solid var(--ef-border-strong);
+  color: var(--ef-text);
+}
+
+.sl-link-button.secondary:hover,
+.sl-link-button.minimal:hover {
+  border-color: var(--ef-text-secondary);
+  background: var(--ef-bg-hover);
+}
+
+.card {
+  border-radius: var(--ef-radius);
+  border-color: var(--ef-border);
+  background: var(--ef-bg-card);
+  transition: border-color var(--ef-motion-quick) var(--ef-ease-out),
+    background-color var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+.sl-link-card {
+  border-radius: var(--ef-radius);
+  border-color: var(--ef-border);
+  background: var(--ef-bg-card);
+  box-shadow: none;
+  transition: border-color var(--ef-motion-quick) var(--ef-ease-out),
+    background-color var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+.sl-link-card:hover {
+  border-color: var(--ef-border-strong);
+  background: var(--ef-bg-hover);
+}
+
+.sl-link-card a,
+.sl-link-card a:hover {
+  text-decoration: none;
+}
+
+.sl-link-card .title {
+  font-family: var(--ef-font-ui);
+  color: var(--ef-text);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.sl-link-card .description {
+  color: var(--ef-text-secondary);
+}
+
+/* 上一页 / 下一页卡片 */
+.pagination-links {
+  gap: 0.75rem;
+}
+
+.pagination-links a {
+  border: 1px solid var(--ef-border);
+  border-radius: var(--ef-radius);
+  box-shadow: none;
+  color: var(--ef-text-secondary);
+  padding: 0.875rem 1.125rem;
+  transition: border-color var(--ef-motion-quick) var(--ef-ease-out),
+    background-color var(--ef-motion-quick) var(--ef-ease-out);
+}
+
+.pagination-links a:hover {
+  border-color: var(--ef-border-strong);
+  background: var(--ef-bg-subtle);
+}
+
+.pagination-links .link-title {
+  font-family: var(--ef-font-ui);
+  color: var(--ef-text);
+  font-size: 1rem;
+  font-weight: 600;
+}

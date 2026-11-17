@@ -413,6 +413,8 @@ ALLOWED_HOOKS=(
   # analyst-friendly copy, and Quiet Workspace primitives/tokens across ChatAgent,
   # Automations, Dashboard, CommandPalette, and Dalton components.
   "ui-unify"
+  # Self-hosted Everflow documentation site (/help) and desktop download hiding.
+  "help"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

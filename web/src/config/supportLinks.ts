@@ -4,6 +4,7 @@
  * policy. All are deployment configuration, so each is null when the build
  * sets none, and the plan page only exists in platform mode.
  */
+import { isDaltonBuild } from './brand'; // DALTON-HOOK(help)
 import { isPlatformMode } from './hostMode';
 
 /**
@@ -31,12 +32,12 @@ export const SUPPORT_EMAIL: string | null =
     .map((email) => email.trim())
     .find(Boolean) ?? null;
 
-/** Where to get the desktop app. The page offers both editions, the hosted one
- *  and the one that connects to a self-hosted server, so one link serves every build. */
-export const DESKTOP_DOWNLOAD_URL = 'https://langalpha.ai/download';
+// DALTON-HOOK(help): Dalton builds omit the desktop download and point docs to self-hosted /help
+/** Where to get the desktop app. Null in Dalton builds where no desktop client is offered. */
+export const DESKTOP_DOWNLOAD_URL: string | null = isDaltonBuild ? null : 'https://langalpha.ai/download';
 
 /** The documentation site: getting started, self-hosting, the CLI and the concepts behind the app. */
-export const DOCS_URL = 'https://docs.langalpha.ai';
+export const DOCS_URL: string = isDaltonBuild ? '/help' : 'https://docs.langalpha.ai';
 
 /** The portal's support page, where the contact channels live behind sign-in. Null unless the build sets
  *  `VITE_SUPPORT_CONTACT_ENABLED=true` in platform mode, so the Help menu offers it only where a channel is open. */

@@ -465,3 +465,9 @@ web/src/pages/ChatAgent/components/__tests__/PublishDialog.monitors.test.tsx
 scripts/dalton/monitor_feeds/
 tests/unit/dalton/test_monitor_feeds.py
 tests/unit/dalton/fixtures/monitor_feeds/
+# Self-hosted Everflow documentation site & Dalton link/download hiding tests:
+docs-site/
+web/src/config/__tests__/supportLinks.dalton.test.ts
+web/src/components/Sidebar/__tests__/AccountMenu.dalton.test.tsx
+web/src/pages/Settings/panels/modelAccess/__tests__/ClaudeCodeSheet.dalton.test.tsx
+web/src/pages/Plugins/__tests__/DesktopDownloadLink.dalton.test.tsx

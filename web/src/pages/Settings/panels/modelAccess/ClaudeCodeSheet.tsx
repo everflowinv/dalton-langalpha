@@ -513,27 +513,30 @@ export function ClaudeCodeSheet({ setup, tokenRows, onRemoveToken, onCover, onLe
         <div className={ROWS}>
           <Group subgrid title={t(S + '.waysTitle')} empty="">
             {[
-              <SetupRow
-                key="mac"
-                icon={iconOf('helper')}
-                name={t(S + '.mac.name')}
-                detail={t(remoteControl ? S + '.mac.noteDesktop' : S + '.mac.noteBrowser')}
-                action={remoteControl ? (
-                  <Button type="button" variant="outline" size="sm" className={ROW_BUTTON} onClick={() => onComputers({ view: 'create', pick: 'thisMac' })}>
-                    {t(S + '.mac.turnOn')}
-                  </Button>
-                ) : (
-                  <a
-                    href={DESKTOP_DOWNLOAD_URL}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className={buttonClass({ variant: 'outline', size: 'sm', className: cn('gap-1.5', ROW_BUTTON) })}
-                  >
-                    {t(S + '.mac.getApp')}
-                    <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
-                  </a>
-                )}
-              />,
+              // DALTON-HOOK(help): omit Mac app download row when DESKTOP_DOWNLOAD_URL is null
+              (remoteControl || DESKTOP_DOWNLOAD_URL) && (
+                <SetupRow
+                  key="mac"
+                  icon={iconOf('helper')}
+                  name={t(S + '.mac.name')}
+                  detail={t(remoteControl ? S + '.mac.noteDesktop' : S + '.mac.noteBrowser')}
+                  action={remoteControl ? (
+                    <Button type="button" variant="outline" size="sm" className={ROW_BUTTON} onClick={() => onComputers({ view: 'create', pick: 'thisMac' })}>
+                      {t(S + '.mac.turnOn')}
+                    </Button>
+                  ) : DESKTOP_DOWNLOAD_URL ? (
+                    <a
+                      href={DESKTOP_DOWNLOAD_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={buttonClass({ variant: 'outline', size: 'sm', className: cn('gap-1.5', ROW_BUTTON) })}
+                    >
+                      {t(S + '.mac.getApp')}
+                      <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
+                    </a>
+                  ) : null}
+                />
+              ),
               <SetupRow
                 key="ssh"
                 icon={iconOf('ssh')}
