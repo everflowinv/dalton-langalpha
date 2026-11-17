@@ -1953,3 +1953,744 @@ def test_pm_weekly_valuation_missing_csv_recollects_even_with_done_map(
     assert res_rec["weeks_fetched_pairs"] > 0
     assert res_rec["n_rows"] > 0
     assert csv_path.is_file()
+
+
+# ---------------------------------------------------------------------------
+# 7. HK Momentum First-Run Prod Fixes (Empty CN Name, Pre-Open Target Date, Missing universe.csv)
+# ---------------------------------------------------------------------------
+
+
+def test_hkmom_ggt_list_empty_cn_name_and_skip_invalid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty zqjc falls back to zqywjc with count; invalid code/both-empty rows skip; all-invalid raises."""
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    recorded_pages = {
+        1: {
+            "metadata": {"pagecount": 2, "recordcount": 4},
+            "data": [
+                {"zqdm": "00700", "zqjc": "腾讯控股", "zqywjc": "TENCENT"},
+                {"zqdm": "00068", "zqjc": "", "zqywjc": "MANYCORE TECH"},
+            ],
+        },
+        2: {
+            "metadata": {"pagecount": 2, "recordcount": 4},
+            "data": [
+                {"zqdm": "BAD", "zqjc": "坏代码", "zqywjc": "BADCODE"},
+                {"zqdm": "00069", "zqjc": None, "zqywjc": ""},
+            ],
+        },
+    }
+
+    def _get(url: str, **_kw):
+        pg = 2 if "PAGENO=2" in url else 1
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: [recorded_pages[pg]])
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.side_effect = _get
+
+    ggt = hkmom_fetch.fetch_ggt_list(session=sess)
+    assert ggt == {"00700": "腾讯控股", "00068": "MANYCORE TECH"}
+    assert ggt.missing_cn_name == 1
+    assert ggt.skipped_invalid == 2
+
+    # All-invalid payload must fail
+    all_bad_sess = create_autospec(requests.Session, instance=True)
+    all_bad_sess.get.return_value = SimpleNamespace(
+        raise_for_status=lambda: None,
+        json=lambda: [
+            {
+                "metadata": {"pagecount": 1, "recordcount": 2},
+                "data": [
+                    {"zqdm": "", "zqjc": "无代码", "zqywjc": "NOCODE"},
+                    {"zqdm": "00068", "zqjc": "", "zqywjc": ""},
+                ],
+            }
+        ],
+    )
+    with pytest.raises(RuntimeError, match="全部记录无效"):
+        hkmom_fetch.fetch_ggt_list(session=all_bad_sess)
+
+    # build_universe records count in ggt_list source_status & universe_meta
+    st_dir = tmp_path / "hk_ggt_fallback"
+    hkex_df = pd.DataFrame(
+        {
+            "code": ["00700", "00068"],
+            "name": ["TENCENT", "MANYCORE TECH"],
+            "subcat": ["Equity Securities (Main Board)", "Equity Securities (Main Board)"],
+            "ccy": ["HKD", "HKD"],
+        }
+    )
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    monkeypatch.setattr(
+        hkmom_fetch,
+        "now_hk",
+        lambda: datetime(2026, 11, 17, 16, 30, 0, tzinfo=feeds_common.HK_TZ),
+    )
+
+    def _spot_get(url: str, **_kw):
+        if "szse.cn" in url:
+            return _get(url)
+        lines = []
+        for c in ("00700", "00068"):
+            f = ["0"] * 47
+            f[1], f[3], f[4], f[30], f[32], f[37], f[45] = f"HK{c}", "15.0", "14.8", "2026/11/17 16:08:00", "1.0", "1000", "40.0"
+            lines.append(f'v_r_hk{c}="{"~".join(f)}"')
+        return SimpleNamespace(raise_for_status=lambda: None, text=";".join(lines), encoding="gbk")
+
+    uni_sess = create_autospec(requests.Session, instance=True)
+    uni_sess.get.side_effect = _spot_get
+
+    uni, uni_meta = hkmom_fetch.build_universe(state_dir=st_dir, session=uni_sess)
+    assert uni_meta["stale"] is False
+    assert uni_meta["ggt_missing_cn_name"] == 1
+    assert uni_meta["ggt_skipped_invalid"] == 2
+    ggt_st = uni_meta["source_statuses"]["ggt_list"]
+    assert ggt_st["ok"] is True
+    assert "缺中文简称 1 只" in (ggt_st.get("note") or "")
+    assert ggt_st["counts"] == {"valid": 2, "missing_cn_name": 1, "skipped_invalid": 2}
+    assert set(uni.loc[uni["is_ggt"], "code"]) == {"00700", "00068"}
+
+
+def test_hkmom_preopen_early_morning_target_date(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Running at 00:25 Beijing time (16:25 UTC) targets previous closed HK trading day; intraday targets today."""
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+
+    # 2026-11-18 00:25 BJT (Wed before 09:30 open) -> 2026-11-17
+    dt_0025 = datetime(2026, 11, 18, 0, 25, 0, tzinfo=feeds_common.HK_TZ)
+    assert hkmom_fetch._target_hk_trade_date(now=dt_0025) == "2026-11-17"
+    # 2026-11-18 09:29 BJT -> 2026-11-17; 10:30 intraday -> 2026-11-18; 16:25 post-close -> 2026-11-18
+    assert hkmom_fetch._target_hk_trade_date(now=datetime(2026, 11, 18, 9, 29, 0, tzinfo=feeds_common.HK_TZ)) == "2026-11-17"
+    assert hkmom_fetch._target_hk_trade_date(now=datetime(2026, 11, 18, 10, 30, 0, tzinfo=feeds_common.HK_TZ)) == "2026-11-18"
+    assert hkmom_fetch._target_hk_trade_date(now=datetime(2026, 11, 18, 16, 25, 0, tzinfo=feeds_common.HK_TZ)) == "2026-11-18"
+    # Weekend / Monday 00:25 -> previous Friday 2026-11-13 / 2026-11-20
+    assert hkmom_fetch._target_hk_trade_date(now=datetime(2026, 11, 21, 14, 0, 0, tzinfo=feeds_common.HK_TZ)) == "2026-11-20"
+    assert hkmom_fetch._target_hk_trade_date(now=datetime(2026, 11, 16, 0, 25, 0, tzinfo=feeds_common.HK_TZ)) == "2026-11-13"
+
+    # Full first-run E2E at 2026-11-18 00:25 BJT without universe.csv and with empty-CN-name GGT entry
+    st_dir = tmp_path / "hk_first_0025"
+    out_dir = tmp_path / "hk_first_0025_out"
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-11-17")]
+    assert sessions[-1] == "2026-11-17"
+    codes = ["00068"] + [f"{i:05d}" for i in range(1, 121) if i != 68]
+    ggt_codes = set(codes[55:]) | {"00068"}
+
+    sub_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/11/17"
+    )
+    orig_get = sub_sess.get.side_effect
+
+    def _patched_get(url: str, **kw):
+        if "szse.cn" in url:
+            resp = orig_get(url, **kw)
+            payload = resp.json()
+            for item in payload[0]["data"]:
+                if item.get("zqdm") == "00068":
+                    item["zqjc"] = ""
+                    item["zqywjc"] = "MANYCORE TECH"
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        return orig_get(url, **kw)
+
+    sub_sess.get.side_effect = _patched_get
+    monkeypatch.setattr(hkmom_fetch, "_sess", lambda proxy=None: sub_sess)
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    monkeypatch.setattr(hkmom_run, "now_hk", lambda: dt_0025)
+    monkeypatch.setattr(hkmom_fetch, "now_hk", lambda: dt_0025)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_0025)
+    orig_uni = hkmom_fetch.build_universe
+    monkeypatch.setattr(hkmom_run, "build_universe", lambda **kw: orig_uni(**{**kw, "session": sub_sess}))
+    orig_dl = hkmom_fetch.download_history
+    monkeypatch.setattr(hkmom_run, "download_history", lambda cl, **kw: orig_dl(cl, **{**kw, "session": sub_sess}))
+    orig_comp = hkmom_compute.compute_all
+    monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "hsi_session": sub_sess}))
+    orig_intra = hkmom_compute.compute_intraday_snapshot
+    monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_0025, "session": sub_sess}))
+
+    res = hkmom_run.run_daily_job(state_dir=st_dir, output_dir=out_dir)
+    assert res["publish_ok"] is True
+    assert res["froze"] is True
+    assert res["last_date"] == "2026-11-17"
+    assert (st_dir / "universe.csv").is_file()
+    status_doc = json.loads((st_dir / "status.json").read_text(encoding="utf-8"))
+    assert status_doc["sources"]["hk_spot"]["ok"] is True
+    assert status_doc["sources"]["ggt_list"]["ok"] is True
+    assert "缺中文简称 1 只" in (status_doc["sources"]["ggt_list"].get("note") or "")
+
+
+def test_hkmom_first_run_without_universe_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """First run without universe.csv uses in-memory list if available; gives clear stale reason if unavailable."""
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    dt_close = datetime(2026, 11, 17, 16, 35, 0, tzinfo=feeds_common.HK_TZ)
+
+    # Case A: No universe.csv on disk, GGT list fails (so universe.csv isn't written), HKEX + spot succeed ->
+    # run_daily_job computes constituents from in-memory fetched list without FileNotFoundError!
+    st_mem = tmp_path / "hk_first_mem"
+    out_mem = tmp_path / "hk_first_mem_out"
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-11-17")]
+    codes = [f"{i:05d}" for i in range(1, 121)]
+    sub_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=set(), quote_date="2026/11/17", inject=("ggt_list", "exception")
+    )
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+    monkeypatch.setattr(hkmom_fetch, "_sess", lambda proxy=None: sub_sess)
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    monkeypatch.setattr(hkmom_run, "now_hk", lambda: dt_close)
+    monkeypatch.setattr(hkmom_fetch, "now_hk", lambda: dt_close)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_close)
+    orig_uni = hkmom_fetch.build_universe
+    monkeypatch.setattr(hkmom_run, "build_universe", lambda **kw: orig_uni(**{**kw, "session": sub_sess}))
+    orig_dl = hkmom_fetch.download_history
+    monkeypatch.setattr(hkmom_run, "download_history", lambda cl, **kw: orig_dl(cl, **{**kw, "session": sub_sess}))
+    orig_comp = hkmom_compute.compute_all
+    monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "hsi_session": sub_sess}))
+    orig_intra = hkmom_compute.compute_intraday_snapshot
+    monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_close, "session": sub_sess}))
+
+    res_mem = hkmom_run.run_daily_job(state_dir=st_mem, output_dir=out_mem)
+    assert res_mem["publish_ok"] is True
+    assert res_mem["froze"] is False
+    assert not (st_mem / "universe.csv").is_file()
+    assert not (st_mem / "frozen_history.json").is_file()
+    assert res_mem["sources"]["index_compute"]["ok"] is True
+    assert res_mem["sources"]["ggt_list"]["stale"] is True
+    assert "No such file" not in (res_mem.get("stale_reason") or "")
+
+    # Case B: No universe.csv and HKEX universe fails -> clear stale reason, NO FileNotFoundError
+    st_fail = tmp_path / "hk_first_fail"
+    out_fail = tmp_path / "hk_first_fail_out"
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", create_autospec(hkmom_fetch.fetch_hkex_universe, side_effect=RuntimeError("HKEX 503")))
+    res_fail = hkmom_run.run_daily_job(state_dir=st_fail, output_dir=out_fail)
+    assert res_fail["ok"] is False
+    assert res_fail["publish_ok"] is False
+    assert res_fail["stale"] is True
+    comp_reason = res_fail["sources"]["index_compute"]["reason"] or ""
+    assert "No such file" not in comp_reason
+    assert "universe.csv" in comp_reason
+    assert res_fail["sources"]["hkex_universe"]["stale"] is True
+
+    # Case C: Direct compute_all without universe.csv raises clear RuntimeError (not FileNotFoundError)
+    empty_dir = tmp_path / "hk_empty_direct"
+    empty_dir.mkdir()
+    with pytest.raises(RuntimeError, match="缺少成分文件 universe.csv"):
+        hkmom_compute.compute_all(state_dir=empty_dir)
+
+
+# ---------------------------------------------------------------------------
+# 8. Round 2 Review Fixes (GGT Skipped Exclusion, HK Holiday Snapshot, A-share Target/Date Checks)
+# ---------------------------------------------------------------------------
+
+
+def test_hkmom_ggt_skipped_rows_excluded_and_displayed_at_month_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skipped GGT rows report '跳过 N 只（原因）' on page, stay out of ALL candidate pools, and record at month-end."""
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    st_dir = tmp_path / "hk_skip_excl"
+    out_dir = tmp_path / "hk_skip_excl_out"
+
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-10-30")]
+    assert sessions[-1] == "2026-10-30"
+
+    # Put 00069 in HKEX universe with smallcap (<50e8) and highest momentum return so it WOULD rank #1
+    # in BOTH smallcap and nonggt if not excluded when SZSE skips it for empty CN+EN names!
+    skipped_target = "00069"
+    codes = [skipped_target] + [f"{i:05d}" for i in range(1, 130) if i != 69]
+    ggt_codes = set(codes[65:])  # first 65 have is_ggt=False (including 00069), rest are GGT
+
+    sub_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/10/30"
+    )
+    orig_get = sub_sess.get.side_effect
+
+    def _patched_get(url: str, **kw):
+        if "szse.cn" in url:
+            resp = orig_get(url, **kw)
+            payload = resp.json()
+            meta = payload[0]["metadata"]
+            # Append 00069 (valid code, empty CN+EN names) on page 1 and BAD (invalid code) on page 2
+            if "PAGENO=2" in url:
+                payload[0]["data"].append({"zqdm": "BAD", "zqjc": "坏代码", "zqywjc": "BAD"})
+            else:
+                payload[0]["data"].append({"zqdm": skipped_target, "zqjc": "", "zqywjc": ""})
+            meta["recordcount"] = int(meta["recordcount"]) + 2
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        if "hkfqkline" in url and f"param=hk{skipped_target}," in url:
+            # Give 00069 huge upward momentum so it would dominate both pools if ever eligible
+            bars = [
+                [ds, f"{10.0 * (1.01 ** t):.3f}", f"{10.0 * (1.01 ** t):.3f}", f"{10.0 * (1.01 ** t) * 1.01:.3f}", f"{10.0 * (1.01 ** t) * 0.99:.3f}", "500000", {}, "0", "0", "500.0"]
+                for t, ds in enumerate(sessions)
+            ]
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"data": {f"hk{skipped_target}": {"qfqday": bars}}},
+            )
+        return orig_get(url, **kw)
+
+    sub_sess.get.side_effect = _patched_get
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+    dt_me = datetime(2026, 10, 30, 16, 35, 0, tzinfo=feeds_common.HK_TZ)
+    monkeypatch.setattr(hkmom_fetch, "_sess", lambda proxy=None: sub_sess)
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    monkeypatch.setattr(hkmom_run, "now_hk", lambda: dt_me)
+    monkeypatch.setattr(hkmom_fetch, "now_hk", lambda: dt_me)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_me)
+    orig_uni = hkmom_fetch.build_universe
+    monkeypatch.setattr(hkmom_run, "build_universe", lambda **kw: orig_uni(**{**kw, "session": sub_sess}))
+    orig_dl = hkmom_fetch.download_history
+    monkeypatch.setattr(hkmom_run, "download_history", lambda cl, **kw: orig_dl(cl, **{**kw, "session": sub_sess}))
+    orig_comp = hkmom_compute.compute_all
+    monkeypatch.setattr(hkmom_run, "compute_all", lambda **kw: orig_comp(**{**kw, "hsi_session": sub_sess}))
+    orig_intra = hkmom_compute.compute_intraday_snapshot
+    monkeypatch.setattr(hkmom_run, "compute_intraday_snapshot", lambda **kw: orig_intra(**{**kw, "now": dt_me, "session": sub_sess}))
+
+    res = hkmom_run.run_daily_job(state_dir=st_dir, output_dir=out_dir, as_of_date=date(2026, 10, 30))
+    assert res["publish_ok"] is True
+    assert res["froze"] is True
+
+    ggt_st = res["sources"]["ggt_list"]
+    assert ggt_st["ok"] is True
+    assert ggt_st["stale"] is False
+    assert "跳过 2 只（" in (ggt_st.get("note") or "")
+    assert "代码无效" in (ggt_st.get("note") or "")
+    assert "中英文名称均为空" in (ggt_st.get("note") or "")
+
+    uni_df = pd.read_csv(st_dir / "universe.csv", dtype={"code": str})
+    row_skip = uni_df[uni_df["code"] == skipped_target].iloc[0]
+    assert bool(row_skip["excluded"]) is True
+
+    # 00069 must NOT appear in EITHER smallcap or nonggt month-end selection or constituents!
+    frozen_doc = json.loads((st_dir / "frozen_history.json").read_text(encoding="utf-8"))
+    rebal_snap = frozen_doc["rebalance_snapshots"]["2026-10-30"]
+    assert skipped_target not in rebal_snap["smallcap"]
+    assert skipped_target not in rebal_snap["nonggt"]
+    assert skipped_target in frozen_doc["rebalance_exclusions"]["2026-10-30"]["codes"]
+    assert "跳过 2 只（" in (frozen_doc["rebalance_exclusions"]["2026-10-30"]["reason"] or "")
+
+    cons_doc = json.loads((st_dir / "constituents.json").read_text(encoding="utf-8"))
+    assert all(item["code"] != skipped_target for item in cons_doc["smallcap"])
+    assert all(item["code"] != skipped_target for item in cons_doc["nonggt"])
+
+    meta_doc = json.loads((st_dir / "index_meta.json").read_text(encoding="utf-8"))
+    assert skipped_target in meta_doc["excluded_codes"]
+    assert "跳过 2 只（" in (meta_doc.get("ggt_skipped_note") or "")
+
+    html_txt = (out_dir / "index.html").read_text(encoding="utf-8")
+    assert "跳过 2 只（" in html_txt
+    assert "info-banner show" in html_txt
+
+
+def test_hkmom_preserved_previous_universe_merges_new_excluded_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When universe.csv is preserved (degraded run), newly identified unconfirmed codes in universe_meta.json are STILL excluded."""
+    monkeypatch.setattr(hkmom_fetch.time, "sleep", lambda _s: None)
+    st_dir = tmp_path / "hk_preserved_excl"
+
+    xhkg = xcals.get_calendar("XHKG")
+    sessions = [d.strftime("%Y-%m-%d") for d in xhkg.sessions_in_range("2025-07-01", "2026-10-30")]
+    assert sessions[-1] == "2026-10-30"
+
+    old_excl = "00001"
+    new_skipped = "00069"
+    codes = [old_excl, new_skipped] + [f"{i:05d}" for i in range(2, 130) if i != 69]
+    ggt_codes = set(codes[65:])  # new_skipped is non-GGT so it affects BOTH smallcap & nonggt
+
+    sub_sess = _build_hk_substitute_session(
+        sessions=sessions, codes=codes, ggt_codes=ggt_codes, quote_date="2026/10/30"
+    )
+    orig_get = sub_sess.get.side_effect
+    inject_skip = {"on": False}
+
+    def _patched_get(url: str, **kw):
+        if "szse.cn" in url and inject_skip["on"]:
+            resp = orig_get(url, **kw)
+            payload = resp.json()
+            meta = payload[0]["metadata"]
+            if "PAGENO=2" not in url:
+                payload[0]["data"].append({"zqdm": new_skipped, "zqjc": "", "zqywjc": ""})
+            meta["recordcount"] = int(meta["recordcount"]) + 1
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: payload)
+        if "hkfqkline" in url and f"param=hk{new_skipped}," in url:
+            bars = [
+                [
+                    ds,
+                    f"{10.0 * (1.01 ** t):.3f}",
+                    f"{10.0 * (1.01 ** t):.3f}",
+                    f"{10.0 * (1.01 ** t) * 1.01:.3f}",
+                    f"{10.0 * (1.01 ** t) * 0.99:.3f}",
+                    "500000",
+                    {},
+                    "0",
+                    "0",
+                    "500.0",
+                ]
+                for t, ds in enumerate(sessions)
+            ]
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"data": {f"hk{new_skipped}": {"qfqday": bars}}},
+            )
+        return orig_get(url, **kw)
+
+    sub_sess.get.side_effect = _patched_get
+    hkex_df = pd.DataFrame(
+        {
+            "code": codes,
+            "name": [f"HK Co {i}" for i in range(len(codes))],
+            "subcat": ["Equity Securities (Main Board)"] * len(codes),
+            "ccy": ["HKD"] * len(codes),
+        }
+    )
+    dt_me = datetime(2026, 10, 30, 16, 35, 0, tzinfo=feeds_common.HK_TZ)
+    monkeypatch.setattr(hkmom_fetch, "_sess", lambda proxy=None: sub_sess)
+    monkeypatch.setattr(hkmom_fetch, "now_hk", lambda: dt_me)
+    monkeypatch.setattr(hkmom_compute, "now_hk", lambda: dt_me)
+
+    # 1) Initial clean run: universe.csv has new_skipped with excluded=False (and seed old_excl=True).
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: hkex_df.copy())
+    uni_clean, meta_clean = hkmom_fetch.build_universe(
+        state_dir=st_dir, session=sub_sess, as_of_date=date(2026, 10, 30)
+    )
+    assert meta_clean["preserved_previous_universe"] is False
+    uni_clean.loc[uni_clean["code"] == old_excl, "excluded"] = True
+    uni_clean.to_csv(st_dir / "universe.csv", index=False)
+    hkmom_fetch.download_history(list(uni_clean["code"]), state_dir=st_dir, session=sub_sess, target_date="2026-10-30")
+
+    # 2) Degraded run: hkex_universe fails so old universe.csv is preserved (preserved_previous_universe=True),
+    #    while ggt_list succeeds and newly identifies 00069 as unconfirmed identity.
+    inject_skip["on"] = True
+    monkeypatch.setattr(hkmom_fetch, "fetch_hkex_universe", lambda **_kw: (_ for _ in ()).throw(RuntimeError("HKEX down")))
+    _uni_deg, meta_deg = hkmom_fetch.build_universe(
+        state_dir=st_dir, session=sub_sess, as_of_date=date(2026, 10, 30)
+    )
+    assert meta_deg["preserved_previous_universe"] is True
+    assert new_skipped in meta_deg["excluded_codes"]
+
+    # Confirm old universe.csv on disk still marks 00069 as excluded=False
+    disk_uni = pd.read_csv(st_dir / "universe.csv", dtype={"code": str})
+    assert bool(disk_uni.loc[disk_uni["code"] == new_skipped, "excluded"].iloc[0]) is False
+
+    # 3) compute_all MUST merge new_skipped from universe_meta.json (alongside old_excl from universe.csv) and exclude both!
+    computed = hkmom_compute.compute_all(
+        state_dir=st_dir,
+        as_of_date=date(2026, 10, 30),
+        hsi_session=sub_sess,
+        persist=False,
+    )
+    assert old_excl in computed["meta"]["excluded_codes"]
+    assert new_skipped in computed["meta"]["excluded_codes"]
+    rebal_snap = computed["frozen_payload"]["rebalance_snapshots"]["2026-10-30"]
+    assert new_skipped not in rebal_snap["smallcap"]
+    assert new_skipped not in rebal_snap["nonggt"]
+    assert all(item["code"] != new_skipped for item in computed["constituents"]["smallcap"])
+    assert all(item["code"] != new_skipped for item in computed["constituents"]["nonggt"])
+
+
+def test_hkmom_weekend_holiday_snapshot_uses_target_trade_date_close(tmp_path: Path) -> None:
+    """Friday close (1100, +10%) evaluated on Saturday MUST stay 1100 (NOT 1210) and display '最近交易日（日期）收盘'."""
+    st_dir = tmp_path / "hk_weekend"
+    st_dir.mkdir(parents=True)
+    (st_dir / "constituents.json").write_text(
+        json.dumps(
+            {
+                "smallcap": [{"code": "00001", "name": "长江和记"}],
+                "nonggt": [{"code": "00002", "name": "中电控股"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Thursday 2026-11-12 = 1000.0; Friday 2026-11-13 = 1100.0 (+10.0%)
+    (st_dir / "index_series.json").write_text(
+        json.dumps(
+            {
+                "dates": ["2026-11-12", "2026-11-13"],
+                "smallcap": [1000.0, 1100.0],
+                "nonggt": [1000.0, 1100.0],
+                "hsi": [1000.0, 1015.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    meta_doc = {
+        "base_date": "2026-11-12",
+        "last_date": "2026-11-13",
+        "launch_date": "2026-11-12",
+        "last_rebalance_date": "2026-10-30",
+        "params": {},
+    }
+    (st_dir / "index_meta.json").write_text(json.dumps(meta_doc), encoding="utf-8")
+
+    # Tencent still serves Friday 2026/11/13 quotes (+10.0% on Friday) over the weekend!
+    def _weekend_quote(url: str, **_kw):
+        if "r_hkHSI" in url:
+            f = ["0"] * 47
+            f[1], f[3], f[4], f[30], f[32] = "恒生指数", "20500.0", "20200.0", "2026/11/13 16:08:00", "1.49"
+            return SimpleNamespace(text=f'v_r_hkHSI="{"~".join(f)}";', encoding="gbk")
+        lines = []
+        for c in ("00001", "00002"):
+            f = ["0"] * 47
+            f[1], f[3], f[4], f[30], f[32], f[37], f[45] = f"HK{c}", "11.0", "10.0", "2026/11/13 16:08:00", "10.0", "1000", "20.0"
+            lines.append(f'v_r_hk{c}="{"~".join(f)}"')
+        return SimpleNamespace(text=";".join(lines), encoding="gbk")
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.side_effect = _weekend_quote
+
+    # 1) Friday post-close (2026-11-13 16:35) -> daily_close=1100.0, +10.0%, is_trading_day=True
+    snap_fri = hkmom_compute.compute_intraday_snapshot(
+        state_dir=st_dir,
+        now=datetime(2026, 11, 13, 16, 35, 0, tzinfo=feeds_common.HK_TZ),
+        session=sess,
+    )
+    assert snap_fri["stale"] is False
+    assert snap_fri["is_trading_day"] is True
+    assert snap_fri["smallcap"]["level"] == 1100.0
+    assert snap_fri["smallcap"]["pct"] == 10.0
+    assert snap_fri["smallcap"]["source"] == "daily_close"
+    assert snap_fri["smallcap"]["close_date"] == "2026-11-13"
+
+    # 2) Saturday run (2026-11-14 10:00) -> MUST NOT compound +10% into 1210.0!
+    snap_sat = hkmom_compute.compute_intraday_snapshot(
+        state_dir=st_dir,
+        now=datetime(2026, 11, 14, 10, 0, 0, tzinfo=feeds_common.HK_TZ),
+        session=sess,
+    )
+    assert snap_sat["stale"] is False
+    assert snap_sat["is_trading_day"] is False
+    assert snap_sat["target_trade_date"] == "2026-11-13"
+    assert snap_sat["daily_close_date"] == "2026-11-13"
+    assert snap_sat["smallcap"]["level"] == 1100.0
+    assert snap_sat["smallcap"]["pct"] == 10.0
+    assert snap_sat["smallcap"]["source"] == "daily_close"
+    assert snap_sat["smallcap"]["close_date"] == "2026-11-13"
+    assert snap_sat["nonggt"]["level"] == 1100.0
+    assert snap_sat["nonggt"]["source"] == "daily_close"
+    assert snap_sat["nonggt"]["close_date"] == "2026-11-13"
+
+    html_sat = hkmom_render.render_hkmom_html(
+        series=json.loads((st_dir / "index_series.json").read_text(encoding="utf-8")),
+        meta=meta_doc,
+        constituents=json.loads((st_dir / "constituents.json").read_text(encoding="utf-8")),
+        intraday=snap_sat,
+    )
+    assert "最近交易日（2026-11-13）收盘" in html_sat
+    assert "formatCloseTag" in html_sat
+
+
+def test_ashare_target_trade_date_0025_and_history_staleness(tmp_path: Path) -> None:
+    """At 00:25 BJT, A-share trade_date is previous trading day (2026-11-17) and stale history blocks last_success_at."""
+    base_get, base_json = _make_ashare_handlers()
+    tick = [datetime(2026, 11, 17, 14, 30, 0, tzinfo=feeds_common.CN_TZ)]
+    sohu_mode = {"dates": [("11/16", "2026-11-16")]}
+    sse_mode = {"latest": "2026-11-16", "prev": "2026-11-13"}
+
+    def _sohu_html(items: list[tuple[str, str]]) -> str:
+        rows_html = "".join(
+            f"<tr><td>{mmdd}</td><td>50</td><td>5</td><td>6</td><td>18000.0</td>"
+            "<td>1200</td><td>90</td><td>900</td><td>1400</td><td>100</td><td>1100</td><td>120</td><td>15</td><td>90</td></tr>"
+            for mmdd, _ in items
+        )
+        return (
+            "<html><body><table>"
+            "<tr><th>日期</th><th>涨停</th><th>跌停</th><th>停牌</th><th>成交额</th>"
+            '<th colspan="3">沪</th><th colspan="3">深</th><th colspan="3">京</th></tr>'
+            f"{rows_html}</table></body></html>"
+        )
+
+    def _custom_get(url: str, **kw) -> str:
+        if "q.stock.sohu.com" in url:
+            return _sohu_html(sohu_mode["dates"])
+        if "query.sse.com.cn" in url:
+            if "STAT_DATE=2026-" in url:
+                return "jsonpCallback(" + json.dumps(
+                    {
+                        "result": [
+                            {"SEC_CODE": "512480", "STAT_DATE": sse_mode["prev"], "TOT_VOL": "95000"},
+                            {"SEC_CODE": "510300", "STAT_DATE": sse_mode["prev"], "TOT_VOL": "490000"},
+                        ]
+                    }
+                ) + ")"
+            return "jsonpCallback(" + json.dumps(
+                {
+                    "result": [
+                        {"SEC_CODE": "512480", "STAT_DATE": sse_mode["latest"], "TOT_VOL": "100000"},
+                        {"SEC_CODE": "510300", "STAT_DATE": sse_mode["latest"], "TOT_VOL": "500000"},
+                    ]
+                }
+            ) + ")"
+        return base_get(url, **kw)
+
+    collector = ashare_collect.AShareCollector(
+        state_dir=tmp_path / "ashare_0025",
+        http_get=create_autospec(ashare_collect.default_http_get, side_effect=_custom_get),
+        http_get_json=create_autospec(ashare_collect.default_http_get_json, side_effect=base_json),
+        now_fn=lambda: tick[0],
+    )
+
+    # 1) Clean intraday baseline at 2026-11-17 14:30 BJT -> trade_date=2026-11-17, last_success_at=2026-11-17 14:30:00
+    snap_base = collector.collect_snapshot()
+    assert snap_base["stale"] is False
+    assert snap_base["trade_date"] == "2026-11-17"
+    prior_ok = "2026-11-17 14:30:00"
+    assert snap_base["last_success_at"] == prior_ok
+
+    # 2) Run at 2026-11-18 00:25 BJT with history stuck at earlier date 2026-11-13 ->
+    #    trade_date MUST be 2026-11-17 (NOT 2026-11-18!), daily_history MUST be stale=True, last_success_at unchanged!
+    tick[0] = datetime(2026, 11, 18, 0, 25, 0, tzinfo=feeds_common.CN_TZ)
+    sohu_mode["dates"] = [("11/12", "2026-11-12"), ("11/13", "2026-11-13")]
+    collector._history_cache["ts"] = 0.0
+    collector._official_cache["ts"] = 0.0
+    snap_stale_hist = collector.collect_snapshot()
+    assert snap_stale_hist["trade_date"] == "2026-11-17"
+    assert snap_stale_hist["stale"] is True
+    assert "daily_history" in snap_stale_hist["stale_sources"]
+    assert snap_stale_hist["sources"]["daily_history"]["ok"] is False
+    assert snap_stale_hist["sources"]["daily_history"]["stale"] is True
+    assert snap_stale_hist["last_success_at"] == prior_ok
+    assert snap_stale_hist["sources"]["daily_history"]["last_success_at"] == prior_ok
+
+    # 3) History updated to 2026-11-17 (with SSE official shares at 2026-11-16 before morning release) -> clean!
+    sohu_mode["dates"] = [("11/13", "2026-11-13"), ("11/17", "2026-11-17")]
+    collector._history_cache["ts"] = 0.0
+    collector._official_cache["ts"] = 0.0
+    snap_ok_0025 = collector.collect_snapshot()
+    assert snap_ok_0025["trade_date"] == "2026-11-17"
+    assert snap_ok_0025["stale"] is False
+    assert snap_ok_0025["last_success_at"] == "2026-11-18 00:25:00"
+
+    # 4) At 2026-11-18 00:25 BJT, if SSE official shares lag back at 2026-11-13 (< 2026-11-16) -> stale!
+    sse_mode["latest"] = "2026-11-13"
+    sse_mode["prev"] = "2026-11-12"
+    collector._official_cache["ts"] = 0.0
+    snap_stale_sse = collector.collect_snapshot()
+    assert snap_stale_sse["stale"] is True
+    assert "etf_official_shares" in snap_stale_sse["stale_sources"]
+    assert snap_stale_sse["last_success_at"] == "2026-11-18 00:25:00"
+
+
+def test_ashare_official_shares_0900_cutoff_and_cache_staleness(tmp_path: Path) -> None:
+    """Official ETF shares expected date switches at 09:00 BJT; at 09:25 data only through 11-16 (live or cached) is stale."""
+    base_get, base_json = _make_ashare_handlers()
+    tick = [datetime(2026, 11, 18, 8, 55, 0, tzinfo=feeds_common.CN_TZ)]
+    sse_mode = {"latest": "2026-11-16", "prev": "2026-11-13"}
+    szse_mode = {"latest": "2026-11-16", "prev": "2026-11-13"}
+
+    def _sohu_1117() -> str:
+        return (
+            "<html><body><table>"
+            "<tr><th>日期</th><th>涨停</th><th>跌停</th><th>停牌</th><th>成交额</th>"
+            '<th colspan="3">沪</th><th colspan="3">深</th><th colspan="3">京</th></tr>'
+            "<tr><td>11/17</td><td>50</td><td>5</td><td>6</td><td>18000.0</td>"
+            "<td>1200</td><td>90</td><td>900</td><td>1400</td><td>100</td><td>1100</td><td>120</td><td>15</td><td>90</td></tr>"
+            "</table></body></html>"
+        )
+
+    def _custom_get(url: str, **kw) -> str:
+        if "q.stock.sohu.com" in url:
+            return _sohu_1117()
+        if "query.sse.com.cn" in url:
+            if "STAT_DATE=2026-" in url:
+                return "jsonpCallback(" + json.dumps(
+                    {
+                        "result": [
+                            {"SEC_CODE": "512480", "STAT_DATE": sse_mode["prev"], "TOT_VOL": "95000"},
+                            {"SEC_CODE": "510300", "STAT_DATE": sse_mode["prev"], "TOT_VOL": "490000"},
+                        ]
+                    }
+                ) + ")"
+            return "jsonpCallback(" + json.dumps(
+                {
+                    "result": [
+                        {"SEC_CODE": "512480", "STAT_DATE": sse_mode["latest"], "TOT_VOL": "100000"},
+                        {"SEC_CODE": "510300", "STAT_DATE": sse_mode["latest"], "TOT_VOL": "500000"},
+                    ]
+                }
+            ) + ")"
+        if "szse.cn" in url:
+            return json.dumps(
+                [
+                    {
+                        "data": [
+                            {"fund_code": "159915", "size_date": szse_mode["latest"], "current_size": "200000"},
+                            {"fund_code": "159915", "size_date": szse_mode["prev"], "current_size": "195000"},
+                        ]
+                    }
+                ]
+            )
+        return base_get(url, **kw)
+
+    collector = ashare_collect.AShareCollector(
+        state_dir=tmp_path / "ashare_0900",
+        http_get=create_autospec(ashare_collect.default_http_get, side_effect=_custom_get),
+        http_get_json=create_autospec(ashare_collect.default_http_get_json, side_effect=base_json),
+        now_fn=lambda: tick[0],
+    )
+
+    # Boundary checks for _expected_official_min_date
+    assert collector._expected_official_min_date(
+        datetime(2026, 11, 18, 8, 59, 0, tzinfo=feeds_common.CN_TZ)
+    ) == date(2026, 11, 16)
+    assert collector._expected_official_min_date(
+        datetime(2026, 11, 18, 9, 0, 0, tzinfo=feeds_common.CN_TZ)
+    ) == date(2026, 11, 17)
+    assert collector._expected_official_min_date(
+        datetime(2026, 11, 18, 9, 25, 0, tzinfo=feeds_common.CN_TZ)
+    ) == date(2026, 11, 17)
+    assert collector._expected_official_min_date(
+        datetime(2026, 11, 16, 8, 55, 0, tzinfo=feeds_common.CN_TZ)
+    ) == date(2026, 11, 12)
+    assert collector._expected_official_min_date(
+        datetime(2026, 11, 16, 9, 25, 0, tzinfo=feeds_common.CN_TZ)
+    ) == date(2026, 11, 13)
+    assert collector._expected_official_min_date(
+        datetime(2026, 11, 14, 10, 0, 0, tzinfo=feeds_common.CN_TZ)
+    ) == date(2026, 11, 12)
+
+    # 1) At 2026-11-18 08:55 BJT (< 09:00), 11-16 data is valid and populates _official_cache cleanly.
+    snap_0855 = collector.collect_snapshot()
+    assert snap_0855["stale"] is False
+    assert snap_0855["last_success_at"] == "2026-11-18 08:55:00"
+    assert collector._official_cache["error"] is None
+
+    # 2) Advance to 2026-11-18 09:25 BJT WITHOUT clearing _official_cache["ts"] (still within 30m TTL):
+    #    cached 11-16 data MUST be invalidated against 11-17 expectation; upstream still at 11-16 -> stale!
+    tick[0] = datetime(2026, 11, 18, 9, 25, 0, tzinfo=feeds_common.CN_TZ)
+    snap_0925_stale = collector.collect_snapshot()
+    assert snap_0925_stale["stale"] is True
+    assert "etf_official_shares" in snap_0925_stale["stale_sources"]
+    assert snap_0925_stale["last_success_at"] == "2026-11-18 08:55:00"
+    with pytest.raises(RuntimeError, match="最新日期过期"):
+        collector._fetch_szse_pair("159915")
+
+    # 3) Upstream updates to 2026-11-17 -> recovers cleanly at 09:25 BJT.
+    sse_mode["latest"], sse_mode["prev"] = "2026-11-17", "2026-11-16"
+    szse_mode["latest"], szse_mode["prev"] = "2026-11-17", "2026-11-16"
+    collector._official_cache["ts"] = 0.0
+    snap_0925_ok = collector.collect_snapshot()
+    assert snap_0925_ok["stale"] is False
+    assert snap_0925_ok["last_success_at"] == "2026-11-18 09:25:00"
+
+

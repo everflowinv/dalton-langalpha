@@ -30,6 +30,7 @@ UI_COPY: dict[str, Any] = {
         "stats_tpl": "基期至今累计 {total} · 年化收益 {cagr} · 年化波动 {vol} · 最大回撤 {mdd}",
         "hsi_norm_tpl": "自基期起归一化点位（基点 1000）：{norm}（用于下方走势图同起点对比）",
         "partial_tpl": "报价覆盖 {quoted}/{expected} 只（缺 {missing} 只暂按平盘计入）",
+        "recent_close_tpl": "最近交易日（{date}）收盘",
     },
     "ranges": [
         (63, "近3个月"),

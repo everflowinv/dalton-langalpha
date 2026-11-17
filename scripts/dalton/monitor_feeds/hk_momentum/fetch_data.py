@@ -15,7 +15,7 @@ from pathlib import Path
 import random
 import re
 import time
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 
@@ -24,12 +24,10 @@ from scripts.dalton.monitor_feeds.common import (
     SourceStatus,
     atomic_write_json,
     atomic_write_text,
-    is_trading_day,
     load_json_safe,
     make_source_result,
-    market_session_state,
     now_hk,
-    previous_trading_day,
+    resolve_market_trade_date,
     resolve_state_dir,
 )
 
@@ -84,14 +82,50 @@ def fetch_hkex_universe(*, state_dir: Path, proxy: str = "", session: Any = None
     )
 
 
-def fetch_ggt_list(*, session: Any = None) -> dict[str, str]:
-    """Fetch complete SZSE Southbound list across all pages; validate pagecount, count, and uniqueness."""
+class GGTListResult(dict[str, str]):
+    """Code-to-name mapping returned by ``fetch_ggt_list`` with validation counters."""
+
+    def __init__(
+        self,
+        *args: Any,
+        missing_cn_name: int = 0,
+        skipped_invalid: int = 0,
+        skipped_codes: Iterable[str] = (),
+        skipped_reasons: dict[str, int] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.missing_cn_name = int(missing_cn_name)
+        self.skipped_invalid = int(skipped_invalid)
+        self.skipped_codes = tuple(sorted({str(c).strip().zfill(5) for c in skipped_codes if str(c).strip()}))
+        self.skipped_reasons = {str(k): int(v) for k, v in (skipped_reasons or {}).items() if int(v) > 0}
+
+
+def _format_ggt_skip_note(skipped_invalid: int, skipped_reasons: dict[str, int] | None) -> str:
+    if skipped_reasons:
+        items = [(k, v) for k, v in skipped_reasons.items() if v > 0]
+        if len(items) == 1:
+            detail = items[0][0]
+        else:
+            detail = "、".join(f"{k} {v} 只" for k, v in items)
+    else:
+        detail = "记录字段无效"
+    return f"跳过 {skipped_invalid} 只（{detail}）"
+
+
+def fetch_ggt_list(*, session: Any = None) -> GGTListResult:
+    """Fetch complete SZSE Southbound list across all pages; allow English fallback and skip invalid rows."""
     s = session or _sess()
     codes: dict[str, str] = {}
     page = 1
     expected_pages: int | None = None
     expected_records: int | None = None
     total_rows = 0
+    missing_cn_name = 0
+    skipped_invalid = 0
+    skipped_codes: list[str] = []
+    skipped_codes_set: set[str] = set()
+    skipped_reasons: dict[str, int] = {}
     while True:
         url = (
             "https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON"
@@ -136,23 +170,53 @@ def fetch_ggt_list(*, session: Any = None) -> dict[str, str]:
         for row in data:
             if not isinstance(row, dict):
                 raise RuntimeError(f"港股通名单第 {page} 页包含无效记录: {row!r}")
-            code = str(row.get("zqdm", "")).strip()
-            name = str(row.get("zqjc", "")).strip()
-            if not code.isdigit() or not name:
-                raise RuntimeError(f"港股通名单第 {page} 页含无效代码或名称: {row!r}")
+            raw_code = row.get("zqdm")
+            raw_cn = row.get("zqjc")
+            raw_en = row.get("zqywjc")
+            code = str(raw_code if raw_code is not None else "").strip()
+            name_cn = str(raw_cn if raw_cn is not None else "").strip()
+            name_en = str(raw_en if raw_en is not None else "").strip()
+            if not code.isdigit() or len(code) > 5 or int(code) <= 0:
+                skipped_invalid += 1
+                skipped_reasons["代码无效"] = skipped_reasons.get("代码无效", 0) + 1
+                continue
             padded = code.zfill(5)
-            if padded in codes:
+            if not name_cn and not name_en:
+                skipped_invalid += 1
+                skipped_reasons["中英文名称均为空"] = skipped_reasons.get("中英文名称均为空", 0) + 1
+                if padded not in skipped_codes_set:
+                    skipped_codes_set.add(padded)
+                    skipped_codes.append(padded)
+                # Ensure ambiguous code cannot stay confirmed if an earlier row appeared valid
+                codes.pop(padded, None)
+                continue
+            if name_cn:
+                name = name_cn
+            else:
+                name = name_en
+                missing_cn_name += 1
+            if padded in codes or padded in skipped_codes_set:
                 raise RuntimeError(f"港股通名单第 {page} 页出现重复代码: {padded}")
             codes[padded] = name
         if page >= expected_pages:
             break
         page += 1
         time.sleep(0.15)
-    if not codes or len(codes) != total_rows:
-        raise RuntimeError(f"港股通名单唯一代码数({len(codes)})与总记录数({total_rows})不符")
-    if expected_records is not None and len(codes) != expected_records:
-        raise RuntimeError(f"港股通名单唯一代码数({len(codes)})与 recordcount({expected_records})不符")
-    return codes
+    if not codes:
+        raise RuntimeError(f"港股通名单全部记录无效（总 {total_rows} 条，跳过 {skipped_invalid} 条）")
+    if len(codes) + skipped_invalid != total_rows:
+        raise RuntimeError(
+            f"港股通名单有效与跳过记录数({len(codes)}+{skipped_invalid})与总记录数({total_rows})不符"
+        )
+    if expected_records is not None and total_rows != expected_records:
+        raise RuntimeError(f"港股通名单总记录数({total_rows})与 recordcount({expected_records})不符")
+    return GGTListResult(
+        codes,
+        missing_cn_name=missing_cn_name,
+        skipped_invalid=skipped_invalid,
+        skipped_codes=skipped_codes,
+        skipped_reasons=skipped_reasons,
+    )
 
 
 _QUOTE_DATE_RE = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})")
@@ -167,18 +231,13 @@ def _extract_quote_date(ts_raw: Any) -> str | None:
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
 
-def _target_hk_trade_date(as_of_date: date | str | None = None) -> str:
-    if as_of_date is not None:
-        d = date.fromisoformat(as_of_date) if isinstance(as_of_date, str) else as_of_date
-        if is_trading_day("hk", d):
-            return d.isoformat()
-        return previous_trading_day("hk", d).isoformat()
-    cur = now_hk()
-    sess = market_session_state("hk", cur)
-    am_start = int(sess["am_start"]) if sess.get("am_start") is not None else (9 * 60 + 30)
-    if sess.get("is_trading_day") and (cur.hour * 60 + cur.minute) >= am_start:
-        return cur.date().isoformat()
-    return previous_trading_day("hk", cur.date()).isoformat()
+def _target_hk_trade_date(
+    as_of_date: date | str | None = None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    cur = (now or now_hk()) if as_of_date is None else None
+    return resolve_market_trade_date("hk", now=cur, as_of_date=as_of_date).isoformat()
 
 
 def fetch_spot_batch(
@@ -347,10 +406,35 @@ def build_universe(
         )
 
     ggt: dict[str, str] | None = None
+    ggt_missing_cn = 0
+    ggt_skipped_invalid = 0
+    ggt_skipped_codes: list[str] = []
+    ggt_skipped_reasons: dict[str, int] = {}
+    ggt_skip_note: str | None = None
     try:
         ggt = fetch_ggt_list(session=session)
+        ggt_missing_cn = int(getattr(ggt, "missing_cn_name", 0) or 0)
+        ggt_skipped_invalid = int(getattr(ggt, "skipped_invalid", 0) or 0)
+        ggt_skipped_codes = sorted(set(getattr(ggt, "skipped_codes", ()) or ()))
+        ggt_skipped_reasons = dict(getattr(ggt, "skipped_reasons", {}) or {})
+        ggt_notes: list[str] = []
+        if ggt_missing_cn > 0:
+            ggt_notes.append(f"缺中文简称 {ggt_missing_cn} 只")
+        if ggt_skipped_invalid > 0:
+            ggt_skip_note = _format_ggt_skip_note(ggt_skipped_invalid, ggt_skipped_reasons)
+            ggt_notes.append(ggt_skip_note)
         source_statuses["ggt_list"] = make_source_result(
-            "ggt_list", ok=True, stale=False, as_of=now_str, label="深交所港股通名单"
+            "ggt_list",
+            ok=True,
+            stale=False,
+            as_of=now_str,
+            label="深交所港股通名单",
+            note="，".join(ggt_notes) if ggt_notes else None,
+            counts={
+                "valid": len(ggt),
+                "missing_cn_name": ggt_missing_cn,
+                "skipped_invalid": ggt_skipped_invalid,
+            },
         )
     except Exception as exc:
         err = f"港股通名单拉取失败: {exc}"
@@ -361,13 +445,14 @@ def build_universe(
 
     if uni is None:
         uni = pd.read_csv(uni_csv, dtype={"code": str}) if uni_csv.is_file() else pd.DataFrame(
-            columns=["code", "name", "subcat", "ccy", "is_ggt", "price", "mktcap_e8", "name_cn"]
+            columns=["code", "name", "subcat", "ccy", "is_ggt", "excluded", "price", "mktcap_e8", "name_cn"]
         )
     if ggt is None:
         old_ggt = load_json_safe(ggt_json, {}) or {}
         ggt = old_ggt if isinstance(old_ggt, dict) else {}
 
     uni["is_ggt"] = uni["code"].isin(ggt.keys())
+    uni["excluded"] = uni["code"].isin(ggt_skipped_codes)
     codes_to_spot = sorted(set(uni["code"]) | held_codes)
     spot: dict[str, dict[str, Any]] = {}
     spot_errs: list[str] = []
@@ -442,8 +527,15 @@ def build_universe(
         uni = pd.read_csv(uni_csv, dtype={"code": str})
     meta = {
         "updated": now_hk().isoformat(timespec="seconds"),
+        "target_trade_date": target_trade_date,
         "n_equity": n_equity,
         "n_ggt": int(uni["is_ggt"].sum()) if "is_ggt" in uni else 0,
+        "ggt_missing_cn_name": ggt_missing_cn,
+        "ggt_skipped_invalid": ggt_skipped_invalid,
+        "ggt_skipped_codes": ggt_skipped_codes,
+        "ggt_skipped_reasons": ggt_skipped_reasons,
+        "ggt_skipped_note": ggt_skip_note,
+        "excluded_codes": ggt_skipped_codes,
         "n_quoted": n_quoted,
         "errors": errors,
         "stale": degraded,
@@ -537,11 +629,12 @@ def download_history(
     full: bool = False,
     workers: int = 8,
     session: Any = None,
+    target_date: str | None = None,
 ) -> dict[str, Any]:
     st_dir = resolve_state_dir("hk_momentum", state_dir)
     hist_dir = st_dir / "hist"
     hist_dir.mkdir(parents=True, exist_ok=True)
-    today = now_hk().date().isoformat()
+    today = target_date or _target_hk_trade_date()
 
     todo: list[str] = []
     for c in codes:
@@ -643,7 +736,10 @@ def main() -> int:
     if args.cmd in ("universe", "all"):
         uni, _ = build_universe(state_dir=st_dir, proxy=args.proxy)
     else:
-        uni = pd.read_csv(st_dir / "universe.csv", dtype={"code": str})
+        uni_path = st_dir / "universe.csv"
+        if not uni_path.is_file():
+            raise RuntimeError(f"缺少成分文件 {uni_path}，请先运行 universe 抓取生成成分名单")
+        uni = pd.read_csv(uni_path, dtype={"code": str})
     if args.cmd in ("history", "all"):
         codes = list(uni.loc[uni["price"].notna(), "code"]) if "price" in uni else list(uni["code"])
         res = download_history(codes, state_dir=st_dir, full=args.full)

@@ -119,13 +119,15 @@ class SourceStatus:
     last_success_at: str | None = None
     as_of: str | None = None
     label: str | None = None
+    note: str | None = None
+    counts: dict[str, int] | None = None
 
     @property
     def is_clean(self) -> bool:
         return bool(self.ok) and (not bool(self.stale))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "name": self.name,
             "label": self.label or self.name,
             "ok": bool(self.ok),
@@ -134,9 +136,20 @@ class SourceStatus:
             "last_success_at": self.last_success_at,
             "as_of": self.as_of,
         }
+        if self.note is not None:
+            out["note"] = self.note
+        if self.counts is not None:
+            out["counts"] = dict(self.counts)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SourceStatus:
+        raw_counts = data.get("counts")
+        counts = (
+            {str(k): int(v) for k, v in raw_counts.items()}
+            if isinstance(raw_counts, dict)
+            else None
+        )
         return cls(
             name=str(data.get("name") or ""),
             ok=bool(data.get("ok")),
@@ -145,6 +158,8 @@ class SourceStatus:
             last_success_at=data.get("last_success_at"),
             as_of=data.get("as_of"),
             label=data.get("label"),
+            note=data.get("note"),
+            counts=counts,
         )
 
 
@@ -156,6 +171,8 @@ def make_source_result(
     reason: str | None = None,
     as_of: str | None = None,
     label: str | None = None,
+    note: str | None = None,
+    counts: dict[str, int] | None = None,
 ) -> SourceStatus:
     """Create a collector status result; callers never advance ``last_success_at`` here."""
     eff_stale = (not ok) if stale is None else bool(stale)
@@ -167,6 +184,8 @@ def make_source_result(
         last_success_at=None,
         as_of=as_of,
         label=label or name,
+        note=note,
+        counts=dict(counts) if counts is not None else None,
     )
 
 
@@ -248,7 +267,7 @@ class SourceStatusStore:
                 last_ok = prev.get("last_success_at") or res.last_success_at
                 reason = res.reason or "数据采集或校验失败"
                 as_of = prev.get("as_of") or res.as_of
-            sources[res.name] = {
+            ent: dict[str, Any] = {
                 "name": res.name,
                 "label": res.label or prev.get("label") or res.name,
                 "ok": clean,
@@ -257,6 +276,11 @@ class SourceStatusStore:
                 "last_success_at": last_ok,
                 "as_of": as_of,
             }
+            if res.note is not None:
+                ent["note"] = res.note
+            if res.counts is not None:
+                ent["counts"] = dict(res.counts)
+            sources[res.name] = ent
 
         req_keys = list(required) if required is not None else list(sources.keys())
         stale_sources: list[str] = []
@@ -598,6 +622,33 @@ def market_session_state(market: MarketKind, now: datetime | None = None) -> dic
         "session_note": sched["session_note"],
         "calendar_error": None,
     }
+
+
+def resolve_market_trade_date(
+    market: MarketKind,
+    *,
+    now: datetime | None = None,
+    as_of_date: date | str | None = None,
+) -> date:
+    """Return latest closed or currently active trading day for ``market``.
+
+    When ``as_of_date`` is omitted, uses ``now`` in market timezone: returns today if
+    today is a trading day and current time is at or after ``am_start``; otherwise
+    (pre-open before ``am_start`` or non-trading day) returns ``previous_trading_day``.
+    """
+    if as_of_date is not None:
+        d = date.fromisoformat(as_of_date) if isinstance(as_of_date, str) else as_of_date
+        return d if is_trading_day(market, d) else previous_trading_day(market, d)
+    tz = _market_tz(market)
+    raw_now = now or datetime.now(tz)
+    cur = raw_now.replace(tzinfo=tz) if raw_now.tzinfo is None else raw_now.astimezone(tz)
+    sess = market_session_state(market, cur)
+    if sess.get("calendar_error"):
+        raise CalendarLookupError(str(sess["calendar_error"]))
+    am_start = int(sess["am_start"]) if sess.get("am_start") is not None else _default_windows(market)[0]
+    if sess.get("is_trading_day") and (cur.hour * 60 + cur.minute) >= am_start:
+        return cur.date()
+    return previous_trading_day(market, cur.date())
 
 
 def next_session_open(market: MarketKind, now: datetime | None = None) -> datetime:
