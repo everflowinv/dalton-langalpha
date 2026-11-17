@@ -258,14 +258,35 @@ def _bound_caller_identity(config: Any, fallback_thread_id: str) -> Any:
     """
     try:
         import contextlib
+        import math
+        import time
 
         from src.dalton.sandbox_caller_identity import bound_caller
 
         cfg = dict((config or {}).get("configurable") or {})
+        run_origin = "automation" if cfg.get("turn_origin_automation_id") else None
+        raw_deadline = cfg.get("turn_deadline")
+        raw_limit = cfg.get("turn_time_limit")
+        exp: int | None = None
+        if (
+            isinstance(raw_deadline, (int, float))
+            and not isinstance(raw_deadline, bool)
+            and math.isfinite(raw_deadline)
+        ):
+            exp = int(math.ceil(float(raw_deadline)))
+        elif (
+            isinstance(raw_limit, (int, float))
+            and not isinstance(raw_limit, bool)
+            and math.isfinite(raw_limit)
+            and float(raw_limit) > 0
+        ):
+            exp = int(math.ceil(time.time() + float(raw_limit)))
         return bound_caller(
             cfg.get("user_id"),
             cfg.get("workspace_id"),
             cfg.get("thread_id") or fallback_thread_id,
+            run_origin=run_origin,
+            exp=exp,
         )
     except Exception:
         return contextlib.nullcontext()

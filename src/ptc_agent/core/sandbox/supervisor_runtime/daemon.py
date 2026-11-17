@@ -486,11 +486,11 @@ class Supervisor:
             # Claimed before the call, not after it: a reply is what records a
             # call, and a tool that takes longer than the idle window would
             # otherwise be reaped out from under itself.
-            # DALTON-HOOK(alphaengine-cache): extract per-request caller identity (accounting only)
+            # DALTON-HOOK(alphaengine-cache): extract per-request caller identity (signed token + legacy fields)
             raw_caller = request.get("caller")
             req_caller: dict[str, str] = {}
             if isinstance(raw_caller, dict):
-                for c_key in ("user", "workspace", "thread"):
+                for c_key in ("user", "workspace", "thread", "run_origin", "token"):
                     c_val = str(raw_caller.get(c_key) or "").strip()
                     if c_val and not any(ch in c_val for ch in "\r\n\t "):
                         req_caller[c_key] = c_val
@@ -920,8 +920,9 @@ class Supervisor:
             "idle_window_s": self.idle_window_s,
             "known_servers": sorted(self.backend.names()),
             "servers": servers,
-            # DALTON-HOOK(alphaengine-cache): advertise per-request caller forwarding support
+            # DALTON-HOOK(alphaengine-cache): advertise per-request caller forwarding support (v2 forwards signed token)
             "caller_identity": True,
+            "caller_identity_v2": True,
         }
 
 
