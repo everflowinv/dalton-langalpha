@@ -1,58 +1,58 @@
 ---
 title: 技能与插件
-description: 了解 Everflow 内置的投研技能（Skills）、Slash 快捷指令、插件与 MCP 工具调用模式（PTC）。
+description: 这页介绍 Everflow 内置的投研技能、Slash 指令、插件和程序化工具调用（PTC）。
 lastUpdated: 2026-11-17
 ---
 
-了解内置投研**技能（Skills）**、Slash 快捷指令、**插件（Plugins）** 与底层程序化工具调用（PTC）如何配合。
+这页讲清内置投研**技能（Skills）**、Slash 快捷指令、**插件（Plugins）**和程序化工具调用（PTC）怎么配合工作。
 
-**技能（Skill）**是固化的投研方法论与标准流程（例如首次覆盖、财报前瞻、估值校验、数据核验），**插件（Plugin）**是封装数据源和工具的扩展包；你在对话里描述任务或输入 `/` 指令即可自动加载对应技能。
+**技能**是做好的投研方法论和标准流程，比如首次覆盖、财报前瞻、估值校验和数字核验。**插件**是打包好数据源和工具的扩展。你在对话里直接提需求，或者敲 `/` 指令，助手就能加载对应的技能。
 
 ## 内置投研技能体系
 
-Everflow（Dalton）在标准上游能力之上，替换并内建了一整套符合中文投研习惯的技能体系，覆盖从背景调研、财报跟踪到交付核验的完整链路：
+Everflow（Dalton）在上游能力的基础上，建了一整套贴合中文投研习惯的技能，覆盖从背景调研、财报跟踪到核验发布的完整流程：
 
 ### 核心研究与跟踪技能
 
-- **公司初始化与档案管理**：`dalton-init-company`（`/dalton-init-company`）建立公司知识档案；`dalton-company-background`（`/dalton-company-background`）梳理公司背景；`dalton-knowledge` 与 `dalton-agenda` 维护核心论点与待验证议程。
+- **公司初始化与档案管理**：`dalton-init-company`（`/dalton-init-company`）用来建公司知识档案；`dalton-company-background`（`/dalton-company-background`）梳理公司背景；`dalton-knowledge` 和 `dalton-agenda` 维护核心论点和待验证议程。
 - **覆盖与深度报告**：
-  - `/initial-coverage`（首次覆盖）：自动化多轮编排，并发检索研报、专家与财报，产出结构化首次覆盖报告。
-  - `/full-coverage`（完整覆盖）：更深度的全面覆盖流程。
-  - `/topic-research`（主题研究）：跨公司主题研究。
-  - `/weekly-review`（周度复盘）：周度复盘总结。
+  - `/initial-coverage`（首次覆盖）：多轮编排，并发拉取研报、专家纪要和财报，写出结构化的首次覆盖报告。
+  - `/full-coverage`（完整覆盖）：更深入、覆盖面更全的完整流程。
+  - `/topic-research`（主题研究）：做跨公司的专题研究。
+  - `/weekly-review`（周度复盘）：做周度复盘总结。
 - **财报全周期**：
-  - `/dalton-earnings-calendar`：跟踪财报日历与近期事件。
-  - `/dalton-earnings-preview`：财报前瞻（梳理一致预期、核心关注点与情景假设）。
-  - `/dalton-earnings-flash`：财报速评（财报发布后第一时间给出 Beat/Miss 与关键指引变化）。
-  - `/dalton-earnings-deep`：财报深度复盘（结合业绩会转写 `transcript` 与指引更新核心论点）。
+  - `/dalton-earnings-calendar`：跟踪财报日历和近期事件。
+  - `/dalton-earnings-preview`：财报前瞻，梳理一致预期、核心看点和情景假设。
+  - `/dalton-earnings-flash`：财报速评，财报一出来马上给出 Beat/Miss 和关键指引变化。
+  - `/dalton-earnings-deep`：财报深度复盘，结合业绩会转写（`transcript`）和指引更新核心论点。
 - **异动、观点与问答**：
   - `/dalton-stock-move`：个股异动归因分析。
-  - `/dalton-thesis-delta`：结合新信息对比核心论点变化，输出五词标准判断结论（**论点不变、论点加强、论点削弱、论点失效、新论点**）并更新赔率评估（`payoff_assessment`）。
+  - `/dalton-thesis-delta`：拿新信息对比核心论点变化，给出五词标准结论（**论点不变、论点加强、论点削弱、论点失效、新论点**）并更新赔率评估（`payoff_assessment`）。
   - `/bullbear`：多空推演分析。
-  - `/dalton-call`：投资观点输出（包含年化收益与赔率门槛校验）。
-  - `/pm-qa`：面向 PM 提问的精准核查回答。
+  - `/dalton-call`：输出投资观点，带年化收益和赔率门槛校验。
+  - `/pm-qa`：回答 PM 提问，给出经过核查的精准答复。
   - `/dalton-filing-review`：重点公告深度拆解。
   - `/dalton-financial-lenses`：多维度财务透视分析。
-- **专题筛选与策略技能**：包括 `dalton-13f-tracker`（机构 13F 持仓追踪）、`dalton-option-put-skew`（期权偏度分析）、`dalton-short-screen`（做空筛选）与 `dalton-bdc-analyst`（BDC 分析）等。
-- **质量护栏与发布**：`dalton-conventions`（研究规范）、`dalton-language`（语言审校）与 `dalton-publish`（`/dalton-publish` 数字核验、审校与正式发布流程）。
+- **专题筛选与策略技能**：包括 `dalton-13f-tracker`（机构 13F 持仓追踪）、`dalton-option-put-skew`（期权偏度分析）、`dalton-short-screen`（做空筛选）和 `dalton-bdc-analyst`（BDC 分析）等。
+- **质量护栏与发布**：`dalton-conventions`（研究规范）、`dalton-language`（语言审校）和 `dalton-publish`（`/dalton-publish` 数字核验、审校和正式发布流程）。
 
-:::tip[不需要死记指令名]
-除了在输入框键入 `/` 选择指令外，直接用自然语言说“帮我写一份这家公司的财报前瞻”或“核一下刚刚那份草稿的数字”，研究助手会自动匹配并加载对应技能。
+:::tip[不用死记指令名]
+除了在输入框敲 `/` 挑指令，你也可以直接用大白话说“帮我写一份这家公司的财报前瞻”或“核一下刚那份草稿的数字”，助手会自动匹配并加载对应技能。
 :::
 
 ## 插件与程序化工具调用（PTC）
 
-点击左侧主导航的 **插件（`/plugins`）** 可以查看当前可用的数据源插件与扩展：
+点左侧主导航的 **插件（`/plugins`）**，可以看到现在有哪些可用数据源和扩展：
 
-- **内置核心数据插件（`dalton-data`）**：包含 **`researchdata`**（聚合内部研报、专家库、业绩会转写、公司 Wiki、销售纪要、TMTB、FUNDA AI、SEC 公告、一致预期、港 A 股、宏观 FRED 等路由）和 **`dalton_sec`**（美股 SEC EDGAR XBRL 归一化财务事实与重述核对）。
-- **实时行情服务（`price_data`）**：提供美股、港股、A 股、指数与期权/宏观报价。
-- **PTC 执行模式**：像 `researchdata` 这类高密度研究数据源采用程序化调用——助手不是每次一问一答调一次接口，而是直接在工作区沙箱里通过 `execute_code` 编写 Python 脚本批量查询、对齐口径、剔除重复来源，再把精确结果汇总给你。
+- **内置核心数据插件（`dalton-data`）**：包含 **`researchdata`** 和 **`dalton_sec`**。`researchdata` 聚合了内部研报、专家库、业绩会转写、公司 Wiki、销售纪要、TMTB、FUNDA AI、SEC 公告、一致预期、港 A 股、宏观 FRED 等路由；`dalton_sec` 负责美股 SEC EDGAR XBRL 归一化财务事实和重述核对。
+- **实时行情服务（`price_data`）**：提供美股、港股、A 股、指数，以及期权和宏观报价。
+- **PTC 执行模式**：像 `researchdata` 这种高密度数据源采用程序化调用。助手会在沙箱里用 `execute_code` 写 Python 脚本，一次批量查数、对齐口径、去掉重复来源，再把精确结果汇总给你。
 
 ## 自定义技能
 
-如果你或团队有固定的分析框架、表格模板或专有检查清单，也可以在工作区或引导对话中把流程沉淀为自定义技能（`SKILL.md`），方便后续重复复用。
+如果你或团队有固定的分析框架、表格模板或检查清单，可以在工作区或引导对话里把流程沉淀成自定义技能（`SKILL.md`），以后直接复用。
 
 ## 下一步
 
-- 分清什么时候用技能、什么时候接插件或查数据源：阅读 [技能、插件还是数据源？](/help/compare/skill-plugin-or-mcp/)
-- 查看所有研究数据源的详细用法与额度规则：阅读 [研究数据源](/help/everflow/research-data-sources/)
+- 分清什么时候用技能、什么时候看插件或数据源：阅读 [技能、插件还是数据源？](/help/compare/skill-plugin-or-mcp/)
+- 查看各数据源的详细用法和额度规则：阅读 [研究数据源](/help/everflow/research-data-sources/)
