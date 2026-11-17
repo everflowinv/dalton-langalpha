@@ -35,7 +35,20 @@ _FEISHU_USER_RE = re.compile(r"^feishu:user:(ou_[A-Za-z0-9_-]+)$")
 _FEISHU_CHAT_RE = re.compile(r"^feishu:chat:(oc_[A-Za-z0-9_-]+)$")
 _DISCORD_USER_RE = re.compile(r"^discord:user:([0-9]+)$")
 _DISCORD_CHANNEL_RE = re.compile(r"^discord:channel:([0-9]{5,32})$")
-_GATEWAY_NOTIFY_SOURCES = frozenset({"automation_completion", "notify_test"})
+_GATEWAY_NOTIFY_SOURCES = frozenset(
+    {
+        "automation_completion",
+        "notify_test",
+        "report_delivery_admin_notice",
+        "report_delivery_missing_profile_notice",
+    }
+)
+_NOTICE_SOURCES = frozenset(
+    {
+        "report_delivery_admin_notice",
+        "report_delivery_missing_profile_notice",
+    }
+)
 _RETRYABLE_CHANNEL_FAILURE = "target_failed"
 
 
@@ -236,11 +249,31 @@ def _gateway_notification_block(
     return None
 
 
+async def _dm_identity_matches(
+    cur: Any,
+    user_id: str,
+    target: str,
+) -> bool:
+    parsed = _parse_target(target)
+    if not parsed or parsed.get("target_kind") != "dm":
+        return False
+    await cur.execute(
+        """
+        SELECT 1 FROM dalton_channel_identities
+        WHERE user_id = %s AND platform = %s AND platform_user_id = %s
+        LIMIT 1
+        """,
+        (user_id, parsed["platform"], parsed["recipient_id"]),
+    )
+    return (await cur.fetchone()) is not None
+
+
 async def _eligibility(
     row: Mapping[str, Any],
     payload: Mapping[str, Any],
     target: str,
     *,
+    cur: Any = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]],
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]],
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]],
@@ -249,6 +282,47 @@ async def _eligibility(
 ) -> tuple[bool, str | None]:
     user_id = str(row.get("user_id") or "").strip()
     source = str(payload.get("source") or "")
+    if source == "report_delivery_missing_profile_notice":
+        if not user_id:
+            return False, "missing_user_id"
+        if not (target.startswith("feishu:user:") or target.startswith("discord:user:")):
+            return False, "invalid_notice_target"
+        configured = [
+            _split_target_channel(item)[1]
+            for item in await resolve_targets_fn(user_id)
+            if str(item).strip()
+        ]
+        if target in configured:
+            return True, None
+        if cur is not None and await _dm_identity_matches(cur, user_id, target):
+            return True, None
+        return False, "target_removed"
+
+    if source == "report_delivery_admin_notice":
+        if not user_id:
+            return False, "missing_user_id"
+        from src.dalton.access_tiers import get_user_tier
+        from src.dalton.settings import get_configured_pm_user_ids
+
+        pm_ids = set(get_configured_pm_user_ids())
+        is_admin = user_id in pm_ids
+        if not is_admin and is_admin_fn is not None:
+            is_admin = bool(await is_admin_fn(user_id))
+        if not is_admin:
+            is_admin = (await get_user_tier(user_id)) == "admin"
+        if not is_admin:
+            return False, "not_admin"
+        configured = [
+            _split_target_channel(item)[1]
+            for item in await resolve_targets_fn(user_id)
+            if str(item).strip()
+        ]
+        if target in configured:
+            return True, None
+        if cur is not None and await _dm_identity_matches(cur, user_id, target):
+            return True, None
+        return False, "target_removed"
+
     if source == "notify_test":
         if not user_id or not await resolve_enabled_fn(user_id):
             return False, "toggle_off"
@@ -348,8 +422,9 @@ async def decide_automation_notification_plan(
                 requested_target=target,
             )
 
+    source = str(payload.get("source") or "")
     auto_id = str(row.get("automation_id") or "").strip()
-    if auto_id and await _parent_is_deleted(auto_id):
+    if auto_id and source not in _NOTICE_SOURCES and await _parent_is_deleted(auto_id):
         return _deny(
             "skipped",
             "task_deleted",
@@ -361,6 +436,7 @@ async def decide_automation_notification_plan(
         row,
         payload,
         target,
+        cur=cur,
         resolve_enabled_fn=resolve_enabled_fn,
         resolve_overrides_fn=resolve_overrides_fn,
         resolve_targets_fn=resolve_targets_fn,
@@ -738,7 +814,8 @@ async def reconcile_uncertain_automation_notify_deliveries(
                       AND COALESCE(n.payload_json ->> 'transport', '') = 'gateway'
                       AND COALESCE(n.payload_json ->> 'source', '') IN (
                           'automation_completion',
-                          'notify_test'
+                          'notify_test',
+                          'report_delivery_missing_profile_notice'
                       )
                       AND COALESCE(n.automation_id, '') NOT LIKE 'data:%%'
                       AND COALESCE(n.payload_json ->> 'route_key', '') NOT LIKE 'data:%%'

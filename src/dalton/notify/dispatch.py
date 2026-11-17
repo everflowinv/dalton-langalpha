@@ -265,6 +265,20 @@ def _custom_automation_key(automation: Mapping[str, Any] | None) -> str | None:
     return f"automation:{auto_id}" if auto_id else None
 
 
+def _has_validated_report_profile(automation: Mapping[str, Any] | None) -> bool:
+    """Return True when ``automation`` carries a valid ``metadata.report_profile``."""
+    if not isinstance(automation, Mapping):
+        return False
+    meta = automation.get("metadata")
+    if not isinstance(meta, Mapping) or "report_profile" not in meta:
+        return False
+    from src.dalton.database.automation_reports import (
+        automation_has_validated_report_profile,
+    )
+
+    return automation_has_validated_report_profile(automation)
+
+
 def resolve_automation_notify_state(
     automation: Mapping[str, Any] | None,
     overrides: Mapping[str, bool] | None = None,
@@ -289,6 +303,17 @@ def resolve_automation_notify_state(
     ):
         return (None, False, None)
     classification = classify_automation_for_notify(automation)
+    if _has_validated_report_profile(automation):
+        custom_key = _custom_automation_key(automation)
+        if custom_key and isinstance(routes, Mapping) and custom_key in routes:
+            routed = routes.get(custom_key)
+            if isinstance(routed, Sequence) and not isinstance(routed, (str, bytes)):
+                cat = classification.category if classification is not None else "custom"
+                if isinstance(overrides, Mapping) and custom_key in overrides:
+                    val = overrides[custom_key]
+                    if isinstance(val, bool):
+                        return (cat, val, "task")
+                return (cat, True, "default")
     if classification is None:
         custom_key = _custom_automation_key(automation)
         if (
@@ -372,13 +397,21 @@ async def populate_automation_notify_state(
     except Exception:
         overrides = {}
     needs_routes = resolve_routes_fn is not resolve_dalton_notify_routes or any(
-        classify_automation_for_notify(
-            {
-                "name": getattr(r, "name", None),
-                "metadata": getattr(r, "metadata", None),
-            }
+        (
+            classify_automation_for_notify(
+                {
+                    "name": getattr(r, "name", None),
+                    "metadata": getattr(r, "metadata", None),
+                }
+            )
+            is None
+            or _has_validated_report_profile(
+                {
+                    "name": getattr(r, "name", None),
+                    "metadata": getattr(r, "metadata", None),
+                }
+            )
         )
-        is None
         and not is_excluded_automation_for_notify(
             {
                 "name": getattr(r, "name", None),
@@ -411,7 +444,8 @@ async def populate_automation_notify_state(
         setattr(resp, "dalton_notify_category", cat)
         setattr(resp, "dalton_notify_effective", eff if cat is not None else None)
         setattr(resp, "dalton_notify_source", src)
-        if cat == "custom":
+        has_report_profile = _has_validated_report_profile(auto_dict)
+        if cat == "custom" or has_report_profile:
             custom_key = _custom_automation_key(auto_dict)
             raw_routed = (
                 routes.get(custom_key)
@@ -427,7 +461,7 @@ async def populate_automation_notify_state(
                     if isinstance(t, str) and str(t).strip()
                 ]
             else:
-                route_targets = []
+                route_targets = [] if cat == "custom" else None
             setattr(resp, "dalton_notify_route_targets", route_targets)
         else:
             setattr(resp, "dalton_notify_route_targets", None)
@@ -1018,22 +1052,26 @@ def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
     ):
         return []
     classification = classify_automation_for_notify(automation)
+    custom_key = _custom_automation_key(automation)
     if classification is None:
-        custom_key = _custom_automation_key(automation)
         return [custom_key] if custom_key else []
+    report_prefix = [custom_key] if (custom_key and _has_validated_report_profile(automation)) else []
     # DALTON-HOOK(data-jobs): OC-1 3-level route fallback keys (§5.1 item 2)
     if classification.category == "data_task":
-        return [f"data:{classification.scope}", "data_task", "default"]
+        return [*report_prefix, f"data:{classification.scope}", "data_task", "default"]
     name = str(automation.get("name") or "").strip()
     return [
-        key
-        for key in (
-            name,
-            name.lower(),
-            f"category:{classification.category}",
-            classification.category,
-        )
-        if key
+        *report_prefix,
+        *(
+            key
+            for key in (
+                name,
+                name.lower(),
+                f"category:{classification.category}",
+                classification.category,
+            )
+            if key
+        ),
     ]
 
 
@@ -1049,23 +1087,29 @@ def resolve_notify_route_targets(
     ``configured_targets`` holds personal targets only, so with no route (or
     ``include_chat_targets`` false) a group is never delivered. A route's
     personal side is its intersection with the configured list (a deleted
-    personal target drops out on its own, order preserved); its group entries
-    ride along only when the task's owner is an internal/admin member.
+    personal target drops out on its own, order preserved); for tasks carrying
+    a validated ``report_profile`` under ``automation:<id>``, task-scoped DM
+    targets in the route are preserved without requiring global
+    ``dalton_notify_targets`` membership (delivery re-verifies channel
+    identity bindings).
     """
     if not isinstance(routes, Mapping):
         return None
+    is_report_profile_task = _has_validated_report_profile(automation)
     for key in _notify_route_keys(automation):
         routed = routes.get(key)
         if isinstance(routed, Sequence) and not isinstance(routed, (str, bytes)):
             configured = list(configured_targets)
-            routed_set = {str(t).strip() for t in routed if isinstance(t, str) and t.strip()}
-            personal = [t for t in configured if t in routed_set]
+            routed_list = [
+                str(t).strip() for t in routed if isinstance(t, str) and t.strip()
+            ]
+            routed_set = set(routed_list)
+            if is_report_profile_task and key.startswith("automation:"):
+                personal = [t for t in routed_list if not _is_chat_target(t)]
+            else:
+                personal = [t for t in configured if t in routed_set]
             chat_targets = (
-                [
-                    str(t).strip()
-                    for t in routed
-                    if isinstance(t, str) and _is_chat_target(str(t).strip())
-                ]
+                [t for t in routed_list if _is_chat_target(t)]
                 if include_chat_targets
                 else []
             )
@@ -1130,9 +1174,10 @@ async def evaluate_user_notify_eligibility(
         else None
     )
     overrides = await resolve_overrides_fn(cleaned_uid)
+    routes = await resolve_routes_fn(cleaned_uid)
     if isinstance(automation, Mapping):
         if classification is not None and not is_automation_notify_enabled(
-            automation, overrides
+            automation, overrides, routes
         ):
             return (False, "toggle_off", [])
         if classification is None:
@@ -1147,7 +1192,6 @@ async def evaluate_user_notify_eligibility(
         _split_target_channel(t)[1] for t in targets if str(t).strip()
     ]
 
-    routes = await resolve_routes_fn(cleaned_uid)
     admin_check = is_admin_fn if is_admin_fn is not None else _default_notify_admin
     include_chats = await admin_check(cleaned_uid)
     routed = resolve_notify_route_targets(
@@ -2045,6 +2089,278 @@ async def _send_claimed_notify_test(
     }
 
 
+async def _gateway_notice_already_sent(
+    execution_id: str,
+    channel: str,
+    target: str,
+) -> bool:
+    """Return True if a previous attempt for ``(execution_id, channel, target)`` was already sent."""
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT d.status, c.status AS channel_status
+                    FROM dalton_notify_deliveries d
+                    LEFT JOIN dalton_channel_deliveries c
+                      ON c.delivery_key = 'automation_notify:' || d.delivery_id::text || ':item:0'
+                    WHERE d.execution_id = %s
+                      AND d.channel = %s
+                      AND d.target = %s
+                    LIMIT 1
+                    """,
+                    (execution_id, channel, target),
+                )
+                row = await cur.fetchone()
+    except Exception:
+        return False
+    if not isinstance(row, Mapping):
+        return False
+    return (
+        str(row.get("status") or "").strip().lower() == "sent"
+        or str(row.get("channel_status") or "").strip().lower() in ("sent", "partial")
+    )
+
+
+async def send_dalton_gateway_notice(
+    *,
+    source: str,
+    user_id: str,
+    targets: Sequence[str],
+    title: str,
+    text: str,
+    automation_id: str | None = None,
+    execution_id: str | None = None,
+    notice_id: str | None = None,
+    stale_pending_minutes: int = 10,
+    template: str = "blue",
+    extra_payload: Mapping[str, Any] | None = None,
+    claim_fn: Callable[..., Awaitable[ClaimAttempt]] | None = None,
+    gateway_post_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+    mark_fn: Callable[..., Awaitable[Any]] | None = None,
+) -> dict[str, Any]:
+    """Claim and send a system/report-delivery notice solely through the Dalton channel gateway."""
+    cleaned_uid = str(user_id or "").strip()
+    cleaned_targets = [str(t or "").strip() for t in targets if str(t or "").strip()]
+    if not cleaned_uid or not cleaned_targets:
+        return {
+            "ok": False,
+            "all_ok": False,
+            "sent_targets": [],
+            "failed_targets": cleaned_targets,
+            "errors": {"_all": "no_targets" if not cleaned_targets else "missing_user_id"},
+            "results": [],
+        }
+
+    card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": str(title or "Dalton 通知")[:100]},
+            "template": template,
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": text,
+                }
+            ]
+        },
+    }
+
+    eff_claim = claim_fn or claim_target_delivery_with_attempt
+    eff_post = gateway_post_fn or post_automation_gateway_notify
+    eff_mark = mark_fn or mark_target_delivery
+
+    sent_targets: list[str] = []
+    failed_targets: list[str] = []
+    errors: dict[str, str] = {}
+    results: list[dict[str, Any]] = []
+
+    stable_notice_id = (
+        str(notice_id).strip() if isinstance(notice_id, str) and notice_id.strip() else None
+    )
+    claim_supports_stale = _callable_accepts_kwarg(eff_claim, "stale_pending_minutes")
+
+    for tgt in cleaned_targets:
+        channel, cleaned = _split_target_channel(tgt)
+        notice_exec_id = stable_notice_id or f"notice:{uuid.uuid4()}"
+        payload: dict[str, Any] = {
+            "text": text,
+            "card": card,
+            "source": source,
+            "transport": "gateway",
+            "automation_name": "",
+            "category": "custom",
+        }
+        if stable_notice_id:
+            payload["notice_identity"] = stable_notice_id
+        if execution_id:
+            payload["origin_execution_id"] = str(execution_id).strip()
+        if extra_payload:
+            for k, v in extra_payload.items():
+                if k not in payload:
+                    payload[k] = v
+
+        try:
+            claim_kwargs: dict[str, Any] = {
+                "user_id": cleaned_uid,
+                "automation_id": str(automation_id).strip() if automation_id else None,
+                "payload": payload,
+            }
+            if claim_supports_stale:
+                claim_kwargs["stale_pending_minutes"] = stale_pending_minutes
+            claim = await eff_claim(
+                notice_exec_id,
+                channel,
+                cleaned,
+                **claim_kwargs,
+            )
+        except Exception as exc:
+            err_code = f"claim_error:{type(exc).__name__}"
+            failed_targets.append(cleaned)
+            errors[cleaned] = err_code
+            results.append({"target": cleaned, "ok": False, "error_code": err_code})
+            continue
+
+        delivery_id = getattr(claim, "delivery_id", None) if claim else None
+        claimed_ok = bool(claim and claim[0] and delivery_id)
+        if not claimed_ok:
+            if stable_notice_id and await _gateway_notice_already_sent(
+                notice_exec_id, channel, cleaned
+            ):
+                sent_targets.append(cleaned)
+                results.append(
+                    {"target": cleaned, "ok": True, "status": "sent", "already_sent": True}
+                )
+                continue
+            failed_targets.append(cleaned)
+            errors[cleaned] = "claim_failed"
+            results.append({"target": cleaned, "ok": False, "error_code": "claim_failed"})
+            continue
+
+        try:
+            res = await eff_post(str(delivery_id), target=cleaned)
+        except asyncio.CancelledError:
+            await _shielded_mark_uncertain(
+                eff_mark,
+                notice_exec_id,
+                channel,
+                cleaned,
+                error_code="delivery_uncertain",
+                expected_status="pending",
+            )
+            raise
+        except Exception as exc:
+            err_code = type(exc).__name__
+            try:
+                await eff_mark(
+                    notice_exec_id,
+                    channel,
+                    cleaned,
+                    status="failed",
+                    error_code=err_code,
+                    expected_status="pending",
+                )
+            except Exception:
+                pass
+            failed_targets.append(cleaned)
+            errors[cleaned] = err_code
+            results.append({"target": cleaned, "ok": False, "error_code": err_code})
+            continue
+
+        skip_code = _notify_result_skip_code(cleaned, res)
+        if skip_code is not None:
+            try:
+                await eff_mark(
+                    notice_exec_id,
+                    channel,
+                    cleaned,
+                    status="skipped",
+                    error_code=skip_code,
+                    expected_status="pending",
+                )
+            except Exception:
+                pass
+            failed_targets.append(cleaned)
+            errors[cleaned] = skip_code
+            results.append({"target": cleaned, "ok": False, "skipped": True, "error_code": skip_code})
+            continue
+
+        uncertain_code = extract_target_uncertain_code(cleaned, res)
+        if uncertain_code is not None:
+            await _shielded_mark_uncertain(
+                eff_mark,
+                notice_exec_id,
+                channel,
+                cleaned,
+                error_code=uncertain_code,
+                expected_status="pending",
+            )
+            failed_targets.append(cleaned)
+            errors[cleaned] = uncertain_code
+            results.append({"target": cleaned, "ok": False, "uncertain": True, "error_code": uncertain_code})
+            continue
+
+        res_items = res.get("results") if isinstance(res, Mapping) else None
+        item = (
+            next(
+                (
+                    entry
+                    for entry in res_items
+                    if isinstance(entry, Mapping) and str(entry.get("target") or "") == cleaned
+                ),
+                None,
+            )
+            if isinstance(res_items, list)
+            else None
+        )
+        if isinstance(item, Mapping) and item.get("ok") is True:
+            try:
+                await eff_mark(
+                    notice_exec_id,
+                    channel,
+                    cleaned,
+                    status="sent",
+                    error_code=None,
+                    expected_status="pending",
+                )
+            except Exception:
+                pass
+            sent_targets.append(cleaned)
+            results.append({"target": cleaned, "ok": True, "status": "sent"})
+            continue
+
+        err_code = "send_failed"
+        if isinstance(item, Mapping):
+            err_code = str(item.get("error") or item.get("error_code") or err_code)
+        elif isinstance(res, Mapping):
+            err_code = str(res.get("error_code") or res.get("code") or err_code)
+        try:
+            await eff_mark(
+                notice_exec_id,
+                channel,
+                cleaned,
+                status="failed",
+                error_code=err_code,
+                expected_status="pending",
+            )
+        except Exception:
+            pass
+        failed_targets.append(cleaned)
+        errors[cleaned] = err_code
+        results.append({"target": cleaned, "ok": False, "error_code": err_code})
+
+    return {
+        "ok": bool(sent_targets),
+        "all_ok": bool(sent_targets) and not failed_targets,
+        "sent_targets": sent_targets,
+        "failed_targets": failed_targets,
+        "errors": errors,
+        "results": results,
+    }
+
+
 def extract_feishu_cards_from_payload(
     payload: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
@@ -2739,6 +3055,10 @@ async def retry_failed_notify_deliveries(
                         )
                     )
                       AND COALESCE(d.payload_json ->> 'source', '') <> 'notify_test'
+                      AND COALESCE(d.payload_json ->> 'source', '') NOT IN (
+                          'report_delivery_admin_notice',
+                          'report_delivery_missing_profile_notice'
+                      )
                       AND d.created_at >= NOW() - make_interval(hours => %s)
                       AND (
                           COALESCE(d.payload_json ->> 'source', '') NOT IN (

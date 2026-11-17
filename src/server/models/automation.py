@@ -568,6 +568,8 @@ class AutomationCreate(_ScheduleFields):
         if getattr(self, field) is None:
             raise ValueError(f"{field} is required for trigger_type='{self.trigger_type}'")
         self._refuse_other_kinds(self.trigger_type)
+        # DALTON-HOOK(report-delivery): reject malformed report_profile shape on REST/model validation
+        _validate_metadata_report_profile(self.metadata)
         return self
 
 
@@ -630,6 +632,8 @@ class AutomationUpdate(_ScheduleFields):
 
     @model_validator(mode="after")
     def _keeps_the_stored_kind(self, info: ValidationInfo) -> "AutomationUpdate":
+        # DALTON-HOOK(report-delivery): reject malformed report_profile shape on REST/model validation
+        _validate_metadata_report_profile(self.metadata)
         kind = (info.context or {}).get("trigger_type")
         if kind is None:
             return self
@@ -640,6 +644,23 @@ class AutomationUpdate(_ScheduleFields):
             )
         self._refuse_other_kinds(kind)
         return self
+
+
+# DALTON-HOOK(report-delivery): validate metadata.report_profile structure when Dalton is enabled
+def _validate_metadata_report_profile(metadata: Any) -> None:
+    if not isinstance(metadata, dict) or "report_profile" not in metadata:
+        return
+    from src.dalton.settings import is_dalton_enabled
+
+    if not is_dalton_enabled():
+        return
+    from src.dalton.database.automation_reports import parse_report_profile
+
+    parsed, err = parse_report_profile(metadata)
+    if err or parsed is None:
+        raise ValueError(
+            "Invalid metadata.report_profile: must provide a valid profile and delivery targets"
+        )
 
 
 # DALTON-HOOK(company-automations): optional version body for pause/resume endpoints
@@ -831,6 +852,9 @@ class AutomationResponse(BaseModel):
     dalton_notify_effective: Optional[bool] = None
     dalton_notify_source: Optional[str] = None
     dalton_notify_route_targets: Optional[List[str]] = None
+    # DALTON-HOOK(report-delivery): expose missing report_profile warning and route sync warning on create/update
+    report_delivery_warning: Optional[str] = None
+    route_warning: Optional[str] = None
 
     @model_validator(mode="after")
     def _populate_dalton_notify_category(self) -> "AutomationResponse":

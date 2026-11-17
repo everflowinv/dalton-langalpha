@@ -81,6 +81,8 @@ defaults:
   research_writing_enabled: false
   # DALTON-HOOK(monitors): gate monitor prompt hint on dalton_monitor tool mount.
   dalton_monitors_enabled: false
+  # DALTON-HOOK(report-delivery): gate report-delivery prompt hint on dalton_report_delivery tool mount.
+  dalton_report_delivery_enabled: false
 
 # System prompt template metadata (for documentation)
 system:

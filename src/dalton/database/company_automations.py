@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -634,6 +635,7 @@ async def build_create_history_columns(
     """Build initial ``config_version=1``, ``active_version=1``, and ``v1`` ``audit_history``."""
     from src.dalton.services.company_automations import (
         build_automation_config_snapshot,
+        get_current_history_context,
     )
 
     once_run_at = (
@@ -651,7 +653,7 @@ async def build_create_history_columns(
         notify_enabled=notify_enabled,
         notify_routes=notify_routes,
     )
-    v1_entry = {
+    v1_entry: dict[str, Any] = {
         "version": 1,
         "prev_version": None,
         "restored_from_version": None,
@@ -661,6 +663,18 @@ async def build_create_history_columns(
         "changes": {},
         "snapshot": snapshot,
     }
+    hist_ctx = get_current_history_context()
+    if hist_ctx is not None and hist_ctx.report_delivery_audit is not None:
+        audit_copy = copy.deepcopy(dict(hist_ctx.report_delivery_audit))
+        audit_copy.setdefault("actor_user_id", actor_user_id)
+        audit_copy.setdefault("recorded_at", changed_at_iso)
+        audit_copy.setdefault("metadata_before", {})
+        if not audit_copy.get("metadata_unchanged"):
+            audit_copy.setdefault(
+                "metadata_after",
+                copy.deepcopy(dict(row_data.get("metadata") or {})),
+            )
+        v1_entry["report_delivery_audit"] = audit_copy
     return {
         "created_by": actor_user_id,
         "updated_by": actor_user_id,
@@ -692,6 +706,7 @@ async def prepare_update_history_columns(
         AutomationVersionConflictError,
         build_automation_config_snapshot,
         compute_snapshot_changes,
+        get_current_history_context,
         resolve_desired_status_for_snapshot,
         validate_existing_history_state,
     )
@@ -796,7 +811,22 @@ async def prepare_update_history_columns(
     )
 
     changes = compute_snapshot_changes(pre_snapshot, post_snapshot)
-    if skip_if_unchanged and not changes:
+    hist_ctx = get_current_history_context()
+    pre_meta = (
+        dict(pre_row.get("metadata") or {})
+        if isinstance(pre_row.get("metadata"), Mapping)
+        else {}
+    )
+    post_meta = (
+        dict(post_row.get("metadata") or {})
+        if isinstance(post_row.get("metadata"), Mapping)
+        else {}
+    )
+    has_report_audit = hist_ctx is not None and hist_ctx.report_delivery_audit is not None
+    report_meta_changed = (pre_meta != post_meta) and (
+        "report_profile" in pre_meta or "report_profile" in post_meta
+    )
+    if skip_if_unchanged and not changes and not has_report_audit and not report_meta_changed:
         return {}, True
 
     raw_history = list(pre_row.get("audit_history") or [])
@@ -829,18 +859,38 @@ async def prepare_update_history_columns(
         old_active_version = int(pre_row["active_version"])
 
     new_version = old_config_version + 1
-    raw_history.append(
-        {
-            "version": new_version,
-            "prev_version": old_active_version,
-            "restored_from_version": None,
-            "actor_user_id": actor_user_id,
-            "changed_at": changed_at_iso,
+    new_entry: dict[str, Any] = {
+        "version": new_version,
+        "prev_version": old_active_version,
+        "restored_from_version": None,
+        "actor_user_id": actor_user_id,
+        "changed_at": changed_at_iso,
+        "action": action,
+        "changes": changes,
+        "snapshot": post_snapshot,
+    }
+    if has_report_audit:
+        assert hist_ctx is not None and hist_ctx.report_delivery_audit is not None
+        audit_copy = copy.deepcopy(dict(hist_ctx.report_delivery_audit))
+        audit_copy.setdefault("action", action)
+        audit_copy.setdefault("actor_user_id", actor_user_id)
+        audit_copy.setdefault("owner_user_id", owner_id)
+        audit_copy.setdefault("recorded_at", changed_at_iso)
+        audit_copy.setdefault("metadata_before", copy.deepcopy(pre_meta))
+        if not audit_copy.get("metadata_unchanged"):
+            audit_copy.setdefault("metadata_after", copy.deepcopy(post_meta))
+        new_entry["report_delivery_audit"] = audit_copy
+    elif report_meta_changed:
+        new_entry["report_delivery_audit"] = {
             "action": action,
-            "changes": changes,
-            "snapshot": post_snapshot,
+            "actor_user_id": actor_user_id,
+            "owner_user_id": owner_id,
+            "recorded_at": changed_at_iso,
+            "metadata_before": copy.deepcopy(pre_meta),
+            "metadata_after": copy.deepcopy(post_meta),
+            "metadata_unchanged": False,
         }
-    )
+    raw_history.append(new_entry)
 
     return (
         {

@@ -415,6 +415,9 @@ ALLOWED_HOOKS=(
   "ui-unify"
   # Self-hosted Everflow documentation site (/help) and desktop download hiding.
   "help"
+  # Self-service automation report_profile configuration (dalton_report_delivery)
+  # and missing-config warnings / prompt guidance.
+  "report-delivery"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

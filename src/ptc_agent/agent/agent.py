@@ -223,6 +223,8 @@ class PTCAgent:
         research_writing_enabled: bool = False,
         # DALTON-HOOK(monitors): gate monitor prompt hint on whether dalton_monitor is mounted
         dalton_monitors_enabled: bool = False,
+        # DALTON-HOOK(report-delivery): gate report-delivery prompt hint on whether dalton_report_delivery is mounted
+        dalton_report_delivery_enabled: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -271,6 +273,8 @@ class PTCAgent:
             research_writing_enabled=research_writing_enabled,
             # DALTON-HOOK(monitors): gate monitor prompt hint on whether dalton_monitor is mounted
             dalton_monitors_enabled=dalton_monitors_enabled,
+            # DALTON-HOOK(report-delivery): gate report-delivery prompt hint on whether dalton_report_delivery is mounted
+            dalton_report_delivery_enabled=dalton_report_delivery_enabled,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -928,6 +932,10 @@ class PTCAgent:
         dalton_monitors_enabled = any(
             getattr(t, "name", None) == "dalton_monitor" for t in dalton_tools
         )
+        # DALTON-HOOK(report-delivery): render report-delivery prompt hint only when dalton_report_delivery is mounted
+        dalton_report_delivery_enabled = any(
+            getattr(t, "name", None) == "dalton_report_delivery" for t in dalton_tools
+        )
 
         render_prompt = partial(
             self._build_system_prompt,
@@ -949,6 +957,7 @@ class PTCAgent:
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
             research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
             dalton_monitors_enabled=dalton_monitors_enabled,  # DALTON-HOOK(monitors)
+            dalton_report_delivery_enabled=dalton_report_delivery_enabled,  # DALTON-HOOK(report-delivery)
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).

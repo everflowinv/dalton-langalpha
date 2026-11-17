@@ -96,6 +96,7 @@ async def authorize_ai_finance_execution(
         return _deny(early)
     if not _UUID_RE.fullmatch(identity["automation_id"]):
         return _deny("not_automation_run")
+    missing_profile_ctx: dict[str, Any] | None = None
     async with get_db_connection(conn) as owned:
         async with owned.transaction():
             async with owned.cursor(row_factory=dict_row) as cur:
@@ -110,32 +111,53 @@ async def authorize_ai_finance_execution(
                 assert row is not None
                 parsed, profile_err = parse_report_profile(row.get("metadata"))
                 if profile_err or parsed is None:
-                    return _deny("profile_invalid")
-                if parsed.get("profile") != PROFILE:
-                    return _deny("profile_mismatch")
-                automation_id_text = str(row.get("automation_id") or "").strip()
-                if not _UUID_RE.fullmatch(automation_id_text):
-                    return _deny("invalid_execution")
-                await cur.execute(
-                    _EXECUTION_CLOCK_SQL,
-                    (identity["execution_id"], automation_id_text),
-                )
-                clock = await cur.fetchone()
-                if not isinstance(clock, dict):
-                    return _deny("execution_clock_invalid")
-                scheduled_at = _aware(clock.get("scheduled_at"))
-                started_at = _aware(clock.get("started_at"))
-                if scheduled_at is None:
-                    return _deny("execution_clock_invalid")
-                if started_at is None:
-                    return _deny("execution_not_started")
-                return {
-                    "ok": True,
-                    "code": "ok",
-                    "profile": PROFILE,
-                    "scheduled_at": scheduled_at.isoformat(),
-                    "started_at": started_at.isoformat(),
-                }
+                    missing_profile_ctx = {
+                        "owner_user_id": str(row.get("user_id") or "").strip(),
+                        "automation_id": str(row.get("automation_id") or "").strip(),
+                        "automation_name": row.get("name"),
+                        "execution_id": str(
+                            row.get("automation_execution_id")
+                            or identity.get("execution_id")
+                            or ""
+                        ).strip(),
+                    }
+                else:
+                    if parsed.get("profile") != PROFILE:
+                        return _deny("profile_mismatch")
+                    automation_id_text = str(row.get("automation_id") or "").strip()
+                    if not _UUID_RE.fullmatch(automation_id_text):
+                        return _deny("invalid_execution")
+                    await cur.execute(
+                        _EXECUTION_CLOCK_SQL,
+                        (identity["execution_id"], automation_id_text),
+                    )
+                    clock = await cur.fetchone()
+                    if not isinstance(clock, dict):
+                        return _deny("execution_clock_invalid")
+                    scheduled_at = _aware(clock.get("scheduled_at"))
+                    started_at = _aware(clock.get("started_at"))
+                    if scheduled_at is None:
+                        return _deny("execution_clock_invalid")
+                    if started_at is None:
+                        return _deny("execution_not_started")
+                    return {
+                        "ok": True,
+                        "code": "ok",
+                        "profile": PROFILE,
+                        "scheduled_at": scheduled_at.isoformat(),
+                        "started_at": started_at.isoformat(),
+                    }
+
+    if missing_profile_ctx is not None:
+        try:
+            from src.dalton.services.report_delivery import (
+                handle_missing_report_profile_rejection,
+            )
+
+            await handle_missing_report_profile_rejection(**missing_profile_ctx, conn=conn)
+        except Exception:
+            pass
+    return _deny("profile_invalid")
 
 
 __all__ = ["PROFILE", "authorize_ai_finance_execution"]
