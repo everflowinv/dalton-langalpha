@@ -235,6 +235,12 @@ export PATH="${PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin}"
 export HOME="${HOME:-$(cd ~ && pwd)}"
 export LANG="${LANG:-en_US.UTF-8}"
 export TZ="${TZ:-America/New_York}"
+# The archive runs on the host and reaches Postgres through the port the compose
+# stack publishes on loopback: the repo .env leaves DB_HOST to compose (`postgres`
+# inside the network). The backend reads Dalton mode from dalton.yaml, but the
+# archive's env check requires DALTON_ENABLED explicitly.
+export DB_HOST="${DB_HOST:-127.0.0.1}"
+export DALTON_ENABLED="${DALTON_ENABLED:-true}"
 
 REPO_ENV="${DALTON_REPO_ENV_FILE:-${REPO_ROOT}/.env}"
 BRIDGE_ENV="${DALTON_BRIDGE_ENV_FILE:-${HOME}/.config/dalton/researchdata-bridge.env}"
