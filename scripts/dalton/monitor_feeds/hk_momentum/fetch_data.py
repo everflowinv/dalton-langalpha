@@ -6,13 +6,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import csv
-from datetime import datetime
+from datetime import date, datetime
 import io
 import json
 import math
 import os
 from pathlib import Path
 import random
+import re
 import time
 from typing import Any
 
@@ -23,9 +24,12 @@ from scripts.dalton.monitor_feeds.common import (
     SourceStatus,
     atomic_write_json,
     atomic_write_text,
+    is_trading_day,
     load_json_safe,
     make_source_result,
+    market_session_state,
     now_hk,
+    previous_trading_day,
     resolve_state_dir,
 )
 
@@ -112,17 +116,18 @@ def fetch_ggt_list(*, session: Any = None) -> dict[str, str]:
             raise RuntimeError(f"港股通名单第 {page} 页总页数不一致: {pc} != {expected_pages}")
 
         rc_raw = meta.get("recordcount")
-        if rc_raw is not None and not isinstance(rc_raw, bool):
-            try:
-                rc = int(rc_raw)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError(f"港股通名单第 {page} 页 recordcount 无效: {rc_raw!r}") from exc
-            if rc <= 0:
-                raise RuntimeError(f"港股通名单总条数无效: {rc_raw!r}")
-            if expected_records is None:
-                expected_records = rc
-            elif rc != expected_records:
-                raise RuntimeError(f"港股通名单第 {page} 页总条数不一致: {rc} != {expected_records}")
+        if rc_raw is None or isinstance(rc_raw, bool):
+            raise RuntimeError(f"港股通名单第 {page} 页缺少 recordcount 元数据")
+        try:
+            rc = int(rc_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"港股通名单第 {page} 页 recordcount 无效: {rc_raw!r}") from exc
+        if rc <= 0:
+            raise RuntimeError(f"港股通名单总条数无效: {rc_raw!r}")
+        if expected_records is None:
+            expected_records = rc
+        elif rc != expected_records:
+            raise RuntimeError(f"港股通名单第 {page} 页总条数不一致: {rc} != {expected_records}")
 
         data = block.get("data")
         if not isinstance(data, list) or not data:
@@ -150,16 +155,46 @@ def fetch_ggt_list(*, session: Any = None) -> dict[str, str]:
     return codes
 
 
+_QUOTE_DATE_RE = re.compile(r"(\d{4})[-/](\d{2})[-/](\d{2})")
+
+
+def _extract_quote_date(ts_raw: Any) -> str | None:
+    if not ts_raw:
+        return None
+    m = _QUOTE_DATE_RE.search(str(ts_raw))
+    if not m:
+        return None
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+def _target_hk_trade_date(as_of_date: date | str | None = None) -> str:
+    if as_of_date is not None:
+        d = date.fromisoformat(as_of_date) if isinstance(as_of_date, str) else as_of_date
+        if is_trading_day("hk", d):
+            return d.isoformat()
+        return previous_trading_day("hk", d).isoformat()
+    cur = now_hk()
+    sess = market_session_state("hk", cur)
+    am_start = int(sess["am_start"]) if sess.get("am_start") is not None else (9 * 60 + 30)
+    if sess.get("is_trading_day") and (cur.hour * 60 + cur.minute) >= am_start:
+        return cur.date().isoformat()
+    return previous_trading_day("hk", cur.date()).isoformat()
+
+
 def fetch_spot_batch(
     codes: list[str],
     *,
     session: Any = None,
     batch_size: int = 60,
+    expected_date: str | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Tencent batch quotes. Returns ({code: quote_dict}, errors)."""
     s = session or _sess()
     out: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
+    seen_codes: set[str] = set()
+    dup_codes: list[str] = []
+    bad_date_codes: list[str] = []
     for i in range(0, len(codes), batch_size):
         chunk = codes[i : i + batch_size]
         q = ",".join(f"r_hk{c}" for c in chunk)
@@ -171,18 +206,38 @@ def fetch_spot_batch(
                 if not line or "=" not in line:
                     continue
                 var, payload = line.split("=", 1)
-                code = var.split("_hk")[-1]
+                code = var.split("_hk")[-1].strip()
+                if code in seen_codes:
+                    dup_codes.append(code)
+                    out.pop(code, None)
+                    continue
+                seen_codes.add(code)
                 f = payload.strip('"').split("~")
                 if len(f) < 46 or f[3] in ("", "0.000"):
                     continue
                 try:
+                    px = float(f[3])
+                    if not math.isfinite(px) or px <= 0:
+                        continue
+                    prev_close = float(f[4]) if f[4] else None
+                    if prev_close is not None and not math.isfinite(prev_close):
+                        continue
+                    turnover = float(f[37]) if f[37] else 0.0
+                    mktcap = float(f[45]) if f[45] else None
+                    pct = float(f[32]) if f[32] else 0.0
+                    if not (math.isfinite(turnover) and math.isfinite(pct)) or (mktcap is not None and not math.isfinite(mktcap)):
+                        continue
+                    q_date = _extract_quote_date(f[30])
+                    if expected_date is not None and q_date != expected_date:
+                        bad_date_codes.append(code)
+                        continue
                     out[code] = {
                         "name_cn": f[1],
-                        "price": float(f[3]),
-                        "prev_close": float(f[4]) if f[4] else None,
-                        "turnover": float(f[37]) if f[37] else 0.0,
-                        "mktcap_e8": float(f[45]) if f[45] else None,
-                        "pct": float(f[32]) if f[32] else 0.0,
+                        "price": px,
+                        "prev_close": prev_close,
+                        "turnover": turnover,
+                        "mktcap_e8": mktcap,
+                        "pct": pct,
                         "ts": f[30],
                     }
                 except (ValueError, IndexError):
@@ -191,6 +246,16 @@ def fetch_spot_batch(
             errors.append(f"batch_{i}: {exc}")
         if i + batch_size < len(codes):
             time.sleep(0.12)
+    if dup_codes:
+        uniq_dups = sorted(set(dup_codes))
+        errors.append(
+            f"港股现货响应包含重复代码 ({len(uniq_dups)} 只，如 {', '.join(uniq_dups[:5])})"
+        )
+    if bad_date_codes:
+        uniq_bad = sorted(set(bad_date_codes))
+        errors.append(
+            f"港股现货报价日期非目标交易日 {expected_date} ({len(uniq_bad)} 只，如 {', '.join(uniq_bad[:5])})"
+        )
     return out, errors
 
 
@@ -237,6 +302,7 @@ def build_universe(
     state_dir: str | Path | None = None,
     proxy: str | None = None,
     session: Any = None,
+    as_of_date: date | str | None = None,
 ):
     """Build HK universe + GGT list + spot prices; never overwrites prior files on any failure."""
     import pandas as pd
@@ -248,7 +314,9 @@ def build_universe(
     errors: list[str] = []
     source_statuses: dict[str, SourceStatus] = {}
     now_str = now_hk().strftime("%Y-%m-%d %H:%M:%S") + " 北京时间"
+    target_trade_date = _target_hk_trade_date(as_of_date)
 
+    held_codes = _load_held_codes(st_dir)
     uni: pd.DataFrame | None = None
     try:
         uni = fetch_hkex_universe(
@@ -256,10 +324,22 @@ def build_universe(
         )
         if uni is None or len(uni) == 0:
             raise RuntimeError("港交所证券列表为空")
+        if "code" not in uni.columns or "name" not in uni.columns:
+            raise RuntimeError("港交所证券列表缺少必要列")
+        code_series = uni["code"].astype(str).str.strip()
+        if (code_series == "").any() or code_series.duplicated().any():
+            raise RuntimeError("港交所证券列表包含空代码或重复代码")
+        if "subcat" in uni.columns and not uni["subcat"].astype(str).str.contains("Main Board", na=False).any():
+            raise RuntimeError("港交所证券列表缺少主板股票记录")
+        if len(held_codes) >= 10 and len(set(code_series) & held_codes) < int(0.8 * len(held_codes)):
+            raise RuntimeError(
+                f"港交所证券列表不完整（仅命中 {len(set(code_series) & held_codes)}/{len(held_codes)} 只持有成分）"
+            )
         source_statuses["hkex_universe"] = make_source_result(
             "hkex_universe", ok=True, stale=False, as_of=now_str, label="港交所证券列表"
         )
     except Exception as exc:
+        uni = None
         err = f"港交所证券列表拉取失败: {exc}"
         errors.append(err)
         source_statuses["hkex_universe"] = make_source_result(
@@ -288,24 +368,42 @@ def build_universe(
         ggt = old_ggt if isinstance(old_ggt, dict) else {}
 
     uni["is_ggt"] = uni["code"].isin(ggt.keys())
-    held_codes = _load_held_codes(st_dir)
     codes_to_spot = sorted(set(uni["code"]) | held_codes)
     spot: dict[str, dict[str, Any]] = {}
+    spot_errs: list[str] = []
     if codes_to_spot:
-        spot, spot_errs = fetch_spot_batch(codes_to_spot, session=session)
+        spot, spot_errs = fetch_spot_batch(
+            codes_to_spot, session=session, expected_date=target_trade_date
+        )
         if spot_errs:
             errors.extend(spot_errs[:5])
-        uni["price"] = uni["code"].map(lambda c: spot.get(c, {}).get("price"))
-        uni["mktcap_e8"] = uni["code"].map(lambda c: spot.get(c, {}).get("mktcap_e8"))
-        uni["name_cn"] = uni["code"].map(lambda c: spot.get(c, {}).get("name_cn"))
     else:
         spot_errs = ["标的列表为空，无法拉取现货报价"]
         errors.extend(spot_errs)
 
+    wrong_date_codes = sorted(
+        c for c, entry in spot.items() if _extract_quote_date(entry.get("ts")) != target_trade_date
+    )
+    fresh_spot = {
+        c: entry
+        for c, entry in spot.items()
+        if _extract_quote_date(entry.get("ts")) == target_trade_date
+    }
+    uni["price"] = uni["code"].map(lambda c: fresh_spot.get(c, {}).get("price"))
+    uni["mktcap_e8"] = uni["code"].map(lambda c: fresh_spot.get(c, {}).get("mktcap_e8"))
+    uni["name_cn"] = uni["code"].map(lambda c: fresh_spot.get(c, {}).get("name_cn"))
+
     n_equity = int(len(uni))
     n_quoted = int(uni["price"].notna().sum()) if "price" in uni and len(uni) else 0
     spot_reasons = list(spot_errs[:5]) if spot_errs else []
-    if n_equity == 0 or n_quoted == 0 or (n_equity >= 20 and n_quoted < int(0.5 * n_equity)):
+    if wrong_date_codes and not any("日期非目标交易日" in msg for msg in spot_reasons):
+        date_err = (
+            f"港股现货报价日期非目标交易日 {target_trade_date} "
+            f"({len(wrong_date_codes)} 只，如 {', '.join(wrong_date_codes[:5])})"
+        )
+        errors.append(date_err)
+        spot_reasons.append(date_err)
+    if n_equity == 0 or n_quoted == 0 or (n_quoted * 2 < n_equity):
         cov_err = f"港股现货报价覆盖不足 ({n_quoted}/{n_equity})"
         errors.append(cov_err)
         spot_reasons.append(cov_err)
@@ -314,10 +412,10 @@ def build_universe(
         c
         for c in held_codes
         if not (
-            isinstance(spot.get(c, {}).get("price"), (int, float))
-            and not isinstance(spot.get(c, {}).get("price"), bool)
-            and math.isfinite(float(spot[c]["price"]))
-            and float(spot[c]["price"]) > 0
+            isinstance(fresh_spot.get(c, {}).get("price"), (int, float))
+            and not isinstance(fresh_spot.get(c, {}).get("price"), bool)
+            and math.isfinite(float(fresh_spot[c]["price"]))
+            and float(fresh_spot[c]["price"]) > 0
         )
     )
     if missing_held_spot:

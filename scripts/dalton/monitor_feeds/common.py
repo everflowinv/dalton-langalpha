@@ -226,10 +226,15 @@ class SourceStatusStore:
         required: Iterable[str] | None,
         stamp: str,
         extra_overall: dict[str, Any] | None,
+        preserved_sources: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         sources: dict[str, dict[str, Any]] = {
             k: dict(v) for k, v in (raw.get("sources") or {}).items() if isinstance(v, dict)
         }
+        if preserved_sources:
+            for k, v in preserved_sources.items():
+                if isinstance(v, dict):
+                    sources[k] = dict(v)
         prev_overall = dict(raw.get("overall") or {})
 
         for res in items:
@@ -287,6 +292,7 @@ class SourceStatusStore:
         required: Iterable[str] | None = None,
         now_str: str | None = None,
         extra_overall: dict[str, Any] | None = None,
+        preserved_sources: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Compute merged status document in memory without touching status.json."""
         items: list[SourceStatus] = (
@@ -303,6 +309,7 @@ class SourceStatusStore:
                 required=required,
                 stamp=stamp,
                 extra_overall=extra_overall,
+                preserved_sources=preserved_sources,
             )
 
     def update_sources(
@@ -312,6 +319,7 @@ class SourceStatusStore:
         required: Iterable[str] | None = None,
         now_str: str | None = None,
         extra_overall: dict[str, Any] | None = None,
+        preserved_sources: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         items: list[SourceStatus] = (
             list(results.values()) if isinstance(results, dict) else list(results)
@@ -327,6 +335,7 @@ class SourceStatusStore:
                 required=required,
                 stamp=stamp,
                 extra_overall=extra_overall,
+                preserved_sources=preserved_sources,
             )
             atomic_write_json(self.path, doc, indent=1)
             return doc

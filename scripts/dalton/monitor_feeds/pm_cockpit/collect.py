@@ -183,15 +183,34 @@ def fetch_cn(
             bench_source = tag
             break
 
+    prev_meta_ind = (load_json_safe(raw_dir / "cn_sw_meta.json", {}) or {}).get("industries") or {}
+    prev_l1_codes = {
+        str(k) for k, v in prev_meta_ind.items() if isinstance(v, dict) and v.get("level") == 1
+    }
+    prev_l2_codes = {
+        str(k) for k, v in prev_meta_ind.items() if isinstance(v, dict) and v.get("level") == 2
+    }
+
     info: dict[str, dict[str, Any]] = {}
+    l1_seen: set[str] = set()
+    l2_seen: set[str] = set()
     if "first" in levels:
         f = _retry(lambda: ak_module.sw_index_first_info(), "first_info", errors)
-        l1_added = 0
+        l1_bad = 0
+        l1_dups = 0
         if f is not None and len(f):
             for _, r in f.iterrows():
-                code_l1 = str(r["行业代码"]).split(".")[0]
+                code_l1 = str(r.get("行业代码", "")).split(".")[0].strip()
+                name_l1 = str(r.get("行业名称", "")).strip()
+                if not code_l1 or not code_l1.isdigit() or not name_l1:
+                    l1_bad += 1
+                    continue
+                if code_l1 in l1_seen:
+                    l1_dups += 1
+                    continue
+                l1_seen.add(code_l1)
                 info[code_l1] = {
-                    "name": str(r["行业名称"]),
+                    "name": name_l1,
                     "level": 1,
                     "parent": None,
                     "n_cons": int(r["成份个数"]),
@@ -199,18 +218,34 @@ def fetch_cn(
                     "pb": r["市净率"],
                     "div_yield": r["静态股息率"],
                 }
-                l1_added += 1
-        if l1_added == 0 and not any(e.startswith("first_info:") for e in errors):
+        if l1_bad or l1_dups:
+            errors.append(f"申万一级行业列表异常 (无效 {l1_bad}, 重复 {l1_dups})")
+        if not l1_seen and not any(e.startswith("first_info:") for e in errors):
             errors.append("申万一级行业列表为空")
+        if prev_l1_codes and l1_seen:
+            missing_l1 = sorted(prev_l1_codes - l1_seen)
+            if missing_l1:
+                errors.append(f"申万一级行业列表缺失代码 {len(missing_l1)} 个: {', '.join(missing_l1[:5])}")
     if "second" in levels:
         s = _retry(lambda: ak_module.sw_index_second_info(), "second_info", errors)
         l2_raw = len(s) if s is not None else 0
+        l2_bad = 0
+        l2_dups = 0
         if s is not None and len(s):
             for _, r in s.iterrows():
+                code_l2 = str(r.get("行业代码", "")).split(".")[0].strip()
+                name_l2 = str(r.get("行业名称", "")).strip()
+                if not code_l2 or not code_l2.isdigit() or not name_l2:
+                    l2_bad += 1
+                    continue
+                if code_l2 in l2_seen:
+                    l2_dups += 1
+                    continue
+                l2_seen.add(code_l2)
                 if int(r["成份个数"]) < min_cons:
                     continue
-                info[str(r["行业代码"]).split(".")[0]] = {
-                    "name": str(r["行业名称"]),
+                info[code_l2] = {
+                    "name": name_l2,
                     "level": 2,
                     "parent": str(r["上级行业"]),
                     "n_cons": int(r["成份个数"]),
@@ -218,8 +253,15 @@ def fetch_cn(
                     "pb": r["市净率"],
                     "div_yield": r["静态股息率"],
                 }
+        if l2_bad or l2_dups:
+            errors.append(f"申万二级行业列表异常 (无效 {l2_bad}, 重复 {l2_dups})")
         if l2_raw == 0 and not any(e.startswith("second_info:") for e in errors):
             errors.append("申万二级行业列表为空")
+        if prev_l2_codes and l2_seen:
+            l2_active = {k for k, v in info.items() if v.get("level") == 2}
+            missing_l2 = sorted(prev_l2_codes - l2_active)
+            if missing_l2:
+                errors.append(f"申万二级行业列表缺失代码 {len(missing_l2)} 个: {', '.join(missing_l2[:5])}")
 
     hist_new: dict[str, dict[str, float]] = {}
     amount_new: dict[str, dict[str, float]] = {}
@@ -256,7 +298,7 @@ def fetch_cn(
             "akshare 申万行业或沪深300基准拉取失败: " + "; ".join(errors[:5])
         )
     missing_hist = sorted(set(info.keys()) - set(hist_new.keys()))
-    if missing_hist and not any(e.startswith("hist ") for e in errors):
+    if missing_hist:
         errors.append(f"申万行业历史缺失 {len(missing_hist)} 个: {', '.join(missing_hist[:5])}")
 
     filtered_meta = {k: v for k, v in info.items() if k in hist_new}
@@ -266,11 +308,12 @@ def fetch_cn(
         "parent": None,
         "n_cons": 300,
     }
-    atomic_write_json(
-        raw_dir / "cn_sw_meta.json",
-        {"as_of": datetime.now(CN_TZ).strftime("%Y-%m-%d"), "industries": filtered_meta},
-        indent=1,
-    )
+    if not errors or not (raw_dir / "cn_sw_meta.json").is_file():
+        atomic_write_json(
+            raw_dir / "cn_sw_meta.json",
+            {"as_of": datetime.now(CN_TZ).strftime("%Y-%m-%d"), "industries": filtered_meta},
+            indent=1,
+        )
 
     hist_new[cn_cfg["benchmark_label"]] = bench_map
     h_df = _merge_csv(raw_dir / "cn_sw_hist.csv", hist_new)
@@ -300,6 +343,18 @@ def fetch_cn(
     }
 
 
+def _expected_sw_codes_by_level(raw_dir: Path) -> dict[str, set[str]]:
+    meta_ind = (load_json_safe(raw_dir / "cn_sw_meta.json", {}) or {}).get("industries") or {}
+    return {
+        "一级行业": {
+            str(k) for k, v in meta_ind.items() if isinstance(v, dict) and v.get("level") == 1
+        },
+        "二级行业": {
+            str(k) for k, v in meta_ind.items() if isinstance(v, dict) and v.get("level") == 2
+        },
+    }
+
+
 def fetch_cn_val_latest(
     *,
     raw_dir: Path,
@@ -312,6 +367,7 @@ def fetch_cn_val_latest(
 
         ak_module = ak
 
+    expected_by_sym = _expected_sw_codes_by_level(raw_dir)
     end = datetime.now(CN_TZ)
     start = end - timedelta(days=lookback_days)
     frames: list[pd.DataFrame] = []
@@ -323,9 +379,23 @@ def fetch_cn_val_latest(
         )
         if d is None or not len(d):
             raise RuntimeError(f"申万行业估值日报({sym})返回空数据")
-        valid_codes = d["指数代码"].astype(str).str.strip()
-        if valid_codes.eq("").all():
-            raise RuntimeError(f"申万行业估值日报({sym})缺少有效指数代码")
+        sym_codes: set[str] = set()
+        for _, r in d.iterrows():
+            c_str = str(r.get("指数代码", "")).split(".")[0].strip()
+            dt_str = str(r.get("发布日期", "")).strip()[:10]
+            if not c_str or c_str == "nan" or not dt_str:
+                continue
+            if pd.isna(r.get("市盈率")) and pd.isna(r.get("市净率")) and pd.isna(r.get("股息率")):
+                continue
+            sym_codes.add(c_str)
+        if not sym_codes:
+            raise RuntimeError(f"申万行业估值日报({sym})缺少有效代码或指标")
+        exp_sym = expected_by_sym.get(sym) or set()
+        if exp_sym and not exp_sym.issubset(sym_codes):
+            missing = sorted(exp_sym - sym_codes)
+            raise RuntimeError(
+                f"申万行业估值日报({sym})缺失行业代码 {len(missing)} 个: {', '.join(missing[:5])}"
+            )
         frames.append(d)
     df = pd.concat(frames, ignore_index=True)
     df["code"] = df["指数代码"].astype(str).str.split(".").str[0]
@@ -364,12 +434,41 @@ def fetch_cn_valuation(
     prog_path = raw_dir / "cn_sw_val_progress.json"
     cols = ["date", "code", "pe", "pb", "dy"]
     levels = ("一级行业", "二级行业")
+    expected_by_sym = _expected_sw_codes_by_level(raw_dir)
 
     old = pd.read_csv(out_path, dtype={"code": str}) if out_path.exists() else pd.DataFrame(columns=cols)
     prog_raw = load_json_safe(prog_path, {}) or {}
     done_map: dict[str, list[str]] = {
         str(k): list(v) for k, v in (prog_raw.get("done") or {}).items() if isinstance(v, list)
     }
+
+    # Reconcile done_map strictly against actual saved rows on disk; if CSV is missing/empty,
+    # reset done_map so every week/level is re-collected rather than trusting stale progress JSON.
+    old_valid = pd.DataFrame(columns=cols)
+    if out_path.exists() and len(old) and {"date", "code"}.issubset(old.columns):
+        has_val = pd.Series(False, index=old.index)
+        for col in ("pe", "pb", "dy"):
+            if col in old.columns:
+                has_val = has_val | pd.to_numeric(old[col], errors="coerce").notna()
+        code_ok = old["code"].astype(str).str.strip().ne("") & old["code"].astype(str).str.strip().ne("nan")
+        old_valid = old[has_val & code_ok].copy()
+
+    if out_path.exists() and len(old_valid):
+        old_codes_by_date: dict[str, set[str]] = {
+            str(day): set(grp["code"].astype(str)) for day, grp in old_valid.groupby("date")
+        }
+        for day_str, lvls in list(done_map.items()):
+            have_codes = old_codes_by_date.get(day_str, set())
+            done_map[day_str] = [
+                sym
+                for sym in lvls
+                if bool(have_codes)
+                and not (expected_by_sym.get(sym) and not expected_by_sym[sym].issubset(have_codes))
+            ]
+    else:
+        done_map = {}
+    if done_map != (prog_raw.get("done") or {}):
+        atomic_write_json(prog_path, {"done": done_map}, indent=1)
 
     def _pair_finished(day_str: str, lvl: str) -> bool:
         return lvl in done_map.get(day_str, [])
@@ -419,13 +518,18 @@ def fetch_cn_valuation(
                 continue
 
             pair_rows: list[dict[str, Any]] = []
+            sym_codes: set[str] = set()
+            bad_rows = 0
             for _, r in df.iterrows():
                 code_str = str(r.get("指数代码", "")).split(".")[0].strip()
                 if not code_str or code_str == "nan":
+                    bad_rows += 1
                     continue
                 pe_v, pb_v, dy_v = r.get("市盈率"), r.get("市净率"), r.get("股息率")
                 if pd.isna(pe_v) and pd.isna(pb_v) and pd.isna(dy_v):
+                    bad_rows += 1
                     continue
+                sym_codes.add(code_str)
                 pair_rows.append(
                     {
                         "date": d,
@@ -438,6 +542,18 @@ def fetch_cn_valuation(
             if not pair_rows:
                 empty_pairs += 1
                 errs.append(f"{d} {sym}: 周频估值无有效数值行")
+                continue
+            exp_sym = expected_by_sym.get(sym) or set()
+            missing_sym = sorted(exp_sym - sym_codes) if exp_sym else []
+            if bad_rows > 0 or missing_sym:
+                # Save partial valid rows for observability if useful, yet NEVER mark (d, sym) finished!
+                rows.extend(pair_rows)
+                detail = (
+                    f"缺失代码 {len(missing_sym)} 个 ({', '.join(missing_sym[:5])})"
+                    if missing_sym
+                    else f"含无效估值行 {bad_rows} 条"
+                )
+                errs.append(f"{d} {sym}: {detail}")
                 continue
 
             rows.extend(pair_rows)

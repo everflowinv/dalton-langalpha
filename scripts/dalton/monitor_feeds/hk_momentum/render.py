@@ -449,11 +449,16 @@ def write_hkmom_panel(
     resolved_meta = dict(meta) if meta is not None else (load_json_safe(st_dir / "index_meta.json", {}) or {})
     resolved_status = status_doc if status_doc is not None else SourceStatusStore(st_dir).load()
     if resolved_status.get("sources"):
-        resolved_meta.setdefault("sources", resolved_status["sources"])
-        banner_src = format_source_statuses(resolved_status["sources"])
-        if banner_src and not resolved_meta.get("stale_reason"):
+        combined_src = dict(resolved_meta.get("sources") or {})
+        combined_src.update(resolved_status["sources"])
+        resolved_meta["sources"] = combined_src
+        banner_src = format_source_statuses(combined_src)
+        if banner_src:
             resolved_meta["stale"] = True
-            resolved_meta["stale_reason"] = banner_src
+            if not resolved_meta.get("stale_reason"):
+                resolved_meta["stale_reason"] = banner_src
+            elif banner_src not in str(resolved_meta["stale_reason"]):
+                resolved_meta["stale_reason"] = f"{resolved_meta['stale_reason']}；{banner_src}"
     resolved_cons = constituents if constituents is not None else (load_json_safe(st_dir / "constituents.json", {}) or {})
     resolved_intraday = intraday if intraday is not None else (load_json_safe(st_dir / "live.json", {}) or {})
     out_path = Path(output_dir) / "index.html"
