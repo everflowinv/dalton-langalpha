@@ -1068,6 +1068,9 @@ def _read_env_file_dict(path: Path) -> dict[str, str]:
     return out
 
 
+_ENV_FILE_NO_OS_EXPORT_KEYS = frozenset({"DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME"})
+
+
 def _load_env_file(path: Path) -> None:
     """Load simple KEY=VALUE lines into `os.environ`.
 
@@ -1080,10 +1083,55 @@ def _load_env_file(path: Path) -> None:
     else:
         os.environ.pop("GEMINI_API_KEY", None)
     for k, v in parsed.items():
-        if k == "GEMINI_API_KEY":
+        if k == "GEMINI_API_KEY" or k in _ENV_FILE_NO_OS_EXPORT_KEYS:
             continue
         if k not in os.environ:
             os.environ[k] = v
+
+
+def _resolve_research_runtime_roots(
+    env: Mapping[str, str] | None = None,
+) -> tuple[Path, Path, bool]:
+    """Resolve `(research_code, research_home, legacy_ocw_mode)` from env.
+
+    Legacy compat: when neither `DALTON_RESEARCH_CODE` nor `DALTON_RESEARCH_HOME` is
+    set and `DALTON_OCW_ROOT` is set, both code and home resolve to `DALTON_OCW_ROOT`.
+    """
+    src = os.environ if env is None else env
+    raw_code = str(src.get("DALTON_RESEARCH_CODE") or "").strip()
+    raw_home = str(src.get("DALTON_RESEARCH_HOME") or "").strip()
+    raw_ocw = str(src.get("DALTON_OCW_ROOT") or "").strip()
+    if raw_ocw and not raw_code and not raw_home:
+        ocw = Path(raw_ocw).expanduser().resolve()
+        return ocw, ocw, True
+    default_code = (_SCRIPT_DIR / "research_runtime").resolve()
+    default_home = Path.home() / "Library" / "Application Support" / "Everflow" / "research"
+    code_root = Path(raw_code).expanduser().resolve() if raw_code else default_code
+    home_root = Path(raw_home).expanduser().resolve() if raw_home else default_home
+    return code_root, home_root, False
+
+
+def _default_node_tool_bin(
+    tool_name: str,
+    *,
+    research_home: Path,
+    legacy_ocw_mode: bool,
+) -> Path:
+    """Resolve default path for Node CLI tools (`xreach`, `tmeet`, `gws`)."""
+    legacy_cand = Path(f"~/.openclaw/tools/node/bin/{tool_name}").expanduser().resolve()
+    if legacy_ocw_mode:
+        return legacy_cand
+    candidates = [
+        research_home / "tools" / "node" / "bin" / tool_name,
+        Path("/opt/homebrew/bin") / tool_name,
+    ]
+    which_hit = shutil.which(tool_name)
+    if which_hit:
+        candidates.append(Path(which_hit))
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand.expanduser().resolve()
+    return legacy_cand
 
 
 class BridgeConfig:
@@ -1096,17 +1144,24 @@ class BridgeConfig:
         )
         self.env_path: Path = env_path
         _load_env_file(env_path)
+        env_file_vals = _read_env_file_dict(env_path)
+        resolved_env = {**env_file_vals, **os.environ}
 
         self.host: str = os.environ.get("DALTON_BRIDGE_HOST", "127.0.0.1")
         self.port: int = int(os.environ.get("DALTON_BRIDGE_PORT", "8960"))
         self.token: str = os.environ.get("DALTON_BRIDGE_TOKEN", "").strip()
         self.admin_token: str = os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
-        self.ocw_root: Path = Path(
-            os.environ.get(
-                "DALTON_OCW_ROOT",
-                os.path.expanduser("~/.openclaw/workspace"),
-            )
-        ).resolve()
+        research_code, research_home, legacy_ocw_mode = _resolve_research_runtime_roots(
+            env=resolved_env
+        )
+        self.research_code: Path = research_code
+        self.research_home: Path = research_home
+        self.legacy_ocw_mode: bool = legacy_ocw_mode
+        raw_ocw_env = os.environ.get("DALTON_OCW_ROOT", "").strip()
+        self.ocw_root: Path = (
+            Path(raw_ocw_env).expanduser().resolve() if raw_ocw_env else self.research_home
+        )
+        self._initial_ocw_root: Path = self.ocw_root
         self.python_bin: str = os.environ.get(
             "DALTON_OCW_PYTHON", "/opt/homebrew/bin/python3"
         )
@@ -1116,46 +1171,56 @@ class BridgeConfig:
         self.mcp_script: Path = Path(
             os.environ.get(
                 "DALTON_MCP_SCRIPT",
-                str(self.ocw_root / "scripts" / "researchdata_mcp.py"),
+                str(self.research_code / "scripts" / "researchdata_mcp.py"),
             )
         ).resolve()
         self.xueqiu_script: Path = Path(
             os.environ.get(
                 "DALTON_XUEQIU_SCRIPT",
-                str(self.ocw_root / "scripts" / "xueqiu_posts.py"),
+                str(self.research_code / "scripts" / "xueqiu_posts.py"),
             )
         ).expanduser().resolve()
         self.xreach_bin: Path = Path(
-            os.environ.get(
-                "DALTON_XREACH_BIN",
-                "~/.openclaw/tools/node/bin/xreach",
+            os.environ.get("DALTON_XREACH_BIN")
+            or str(
+                _default_node_tool_bin(
+                    "xreach",
+                    research_home=self.research_home,
+                    legacy_ocw_mode=self.legacy_ocw_mode,
+                )
             )
         ).expanduser().resolve()
         self.tmeet_bin: Path = Path(
-            os.environ.get(
-                "DALTON_TMEET_BIN",
-                "~/.openclaw/tools/node/bin/tmeet",
+            os.environ.get("DALTON_TMEET_BIN")
+            or str(
+                _default_node_tool_bin(
+                    "tmeet",
+                    research_home=self.research_home,
+                    legacy_ocw_mode=self.legacy_ocw_mode,
+                )
             )
         ).expanduser().resolve()
         self.gws_bin: Path = Path(
-            os.environ.get(
-                "DALTON_GWS_BIN",
-                "~/.openclaw/tools/node/bin/gws",
+            os.environ.get("DALTON_GWS_BIN")
+            or str(
+                _default_node_tool_bin(
+                    "gws",
+                    research_home=self.research_home,
+                    legacy_ocw_mode=self.legacy_ocw_mode,
+                )
             )
         ).expanduser().resolve()
+        default_employee_python = (
+            self.research_home / "skills" / "employee-reviews" / "venv" / "bin" / "python"
+            if self.legacy_ocw_mode
+            else self.research_home / "venvs" / "employee-reviews" / "bin" / "python"
+        )
         self.employee_python: Path = Path(
             os.path.abspath(
                 os.path.expanduser(
                     os.environ.get(
                         "DALTON_EMPLOYEE_PYTHON",
-                        str(
-                            self.ocw_root
-                            / "skills"
-                            / "employee-reviews"
-                            / "venv"
-                            / "bin"
-                            / "python"
-                        ),
+                        str(default_employee_python),
                     )
                 )
             )
@@ -1166,7 +1231,7 @@ class BridgeConfig:
                 os.environ.get(
                     "DALTON_EMPLOYEE_SCRIPT",
                     str(
-                        self.ocw_root
+                        self.research_code
                         / "skills"
                         / "employee-reviews"
                         / "scripts"
@@ -1176,6 +1241,12 @@ class BridgeConfig:
             )
         ).expanduser().resolve()
         self.employee_script: Path = self.employee_cli_script
+        raw_embed_python = os.environ.get("DALTON_EMBED_PYTHON", "").strip()
+        self.embed_python: Path | None = (
+            Path(os.path.abspath(os.path.expanduser(raw_embed_python)))
+            if raw_embed_python
+            else None
+        )
         default_l30_engine: Path = Path(
             os.environ.get(
                 "DALTON_LAST30DAYS_ENGINE_DIR",
@@ -1212,13 +1283,15 @@ class BridgeConfig:
             )
         ).expanduser().resolve()
         self.data_sources_json: Path = (
-            self.ocw_root / "config" / "data_sources.json"
+            Path(os.environ["DALTON_DATA_SOURCES_JSON"]).expanduser().resolve()
+            if os.environ.get("DALTON_DATA_SOURCES_JSON", "").strip()
+            else (self.research_code / "config" / "data_sources.json")
         )
         self.sentiment_signals_json: Path = Path(
             os.environ.get("DALTON_SENTIMENT_SIGNALS_JSON")
             or os.environ.get("DALTON_MARKET_REGIME_SIGNALS_JSON")
             or str(
-                self.ocw_root
+                self.research_home
                 / "research-outputs"
                 / "sentiment-dashboard"
                 / "signals.json"
@@ -1228,7 +1301,7 @@ class BridgeConfig:
             os.environ.get("DALTON_INDEX_CROWDING_JSON")
             or os.environ.get("DALTON_MARKET_REGIME_CROWDING_JSON")
             or str(
-                self.ocw_root
+                self.research_home
                 / "research-outputs"
                 / "index-crowding"
                 / "official-all.json"
@@ -1238,7 +1311,7 @@ class BridgeConfig:
             os.environ.get("DALTON_CN_LEVERAGE_STATUS_JSON")
             or os.environ.get("DALTON_MARKET_REGIME_LEVERAGE_STATUS_JSON")
             or str(
-                self.ocw_root
+                self.research_home
                 / "state"
                 / "cn-leverage"
                 / "pipeline_status.json"
@@ -1248,7 +1321,7 @@ class BridgeConfig:
             os.environ.get("DALTON_CN_LEVERAGE_UNWIND_CSV")
             or os.environ.get("DALTON_MARKET_REGIME_UNWIND_CSV")
             or str(
-                self.ocw_root
+                self.research_home
                 / "state"
                 / "cn-leverage"
                 / "quant_unwind_signals.csv"
@@ -1404,10 +1477,9 @@ class BridgeConfig:
             "OPENCLAW_GATEWAY_TOKEN", ""
         ).strip()
         self.feishu_send_card_script: Path = Path(
-            os.environ.get(
-                "FEISHU_SEND_CARD_SCRIPT",
-                os.path.expanduser("~/.openclaw/workspace/scripts/feishu_send_card.py"),
-            )
+            os.environ.get("DALTON_FEISHU_SEND_CARD_SCRIPT")
+            or os.environ.get("FEISHU_SEND_CARD_SCRIPT")
+            or str(self.research_code / "scripts" / "feishu_send_card.py")
         ).expanduser()
         try:
             self.feishu_send_card_timeout_s: float = max(
@@ -7949,15 +8021,99 @@ class ResearchDataBridge:
             chosen = default_s
         return max(5, min(chosen, max_s, ceiling))
 
+    def _is_legacy_ocw_mode(self) -> bool:
+        """Return True when running in legacy single-root `DALTON_OCW_ROOT` mode (or test `cfg.ocw_root` override)."""
+        ocw_root = getattr(self.cfg, "ocw_root", None)
+        init_ocw = getattr(self.cfg, "_initial_ocw_root", None)
+        if isinstance(ocw_root, Path) and isinstance(init_ocw, Path) and ocw_root != init_ocw:
+            return True
+        legacy_flag = getattr(self.cfg, "legacy_ocw_mode", None)
+        if not isinstance(legacy_flag, bool):
+            return True
+        return legacy_flag
+
+    def _research_code_root(self) -> Path:
+        """Resolve active research_runtime code directory, honoring test `cfg.ocw_root` overrides."""
+        ocw_root = getattr(self.cfg, "ocw_root", None)
+        init_ocw = getattr(self.cfg, "_initial_ocw_root", None)
+        research_code = getattr(self.cfg, "research_code", None)
+        if isinstance(ocw_root, Path) and (
+            not isinstance(research_code, Path)
+            or (isinstance(init_ocw, Path) and ocw_root != init_ocw)
+        ):
+            return ocw_root
+        if isinstance(research_code, Path):
+            return research_code
+        return (_SCRIPT_DIR / "research_runtime").resolve()
+
+    def _research_home_root(self) -> Path:
+        """Resolve active research_runtime home/data directory, honoring test `cfg.ocw_root` overrides."""
+        ocw_root = getattr(self.cfg, "ocw_root", None)
+        init_ocw = getattr(self.cfg, "_initial_ocw_root", None)
+        research_home = getattr(self.cfg, "research_home", None)
+        if isinstance(ocw_root, Path) and (
+            not isinstance(research_home, Path)
+            or (isinstance(init_ocw, Path) and ocw_root != init_ocw)
+        ):
+            return ocw_root
+        if isinstance(research_home, Path):
+            return research_home
+        return Path.home() / "Library" / "Application Support" / "Everflow" / "research"
+
     async def _run_stdio_rpc(
         self, requests: list[dict[str, Any]], timeout_s: float
     ) -> list[dict[str, Any]]:
         """Spawn a single `researchdata_mcp.py` subprocess, send JSON-RPC lines, and read responses."""
-        subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(os.environ)
+        code_root = self._research_code_root()
+        home_root = self._research_home_root()
+        extra_env: dict[str, str] = {}
+        if self._is_legacy_ocw_mode():
+            extra_env["DALTON_OCW_ROOT"] = str(home_root)
+        else:
+            extra_env["DALTON_RESEARCH_CODE"] = str(code_root)
+            extra_env["DALTON_RESEARCH_HOME"] = str(home_root)
+
+        env_path = getattr(self.cfg, "env_path", None)
+        env_file_vars = _read_env_file_dict(env_path) if isinstance(env_path, Path) else {}
+        edgar_identity = (
+            os.environ.get("EDGAR_IDENTITY", "").strip()
+            or env_file_vars.get("EDGAR_IDENTITY", "").strip()
+        )
+        if edgar_identity:
+            extra_env["EDGAR_IDENTITY"] = edgar_identity
+
+        _GEMINI_MCP_RESEARCH_ROUTES = frozenset(
+            {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all", "sales-mail"}
+        )
+        needs_gemini = any(
+            isinstance(req, Mapping)
+            and req.get("method") == "tools/call"
+            and isinstance(req.get("params"), Mapping)
+            and req["params"].get("name") == "research"
+            and isinstance(req["params"].get("arguments"), Mapping)
+            and str(req["params"]["arguments"].get("route") or "").strip()
+            in _GEMINI_MCP_RESEARCH_ROUTES
+            for req in requests
+        )
+        allow_keys: tuple[str, ...] = ()
+        if needs_gemini:
+            gemini_key = (
+                env_file_vars.get("GEMINI_API_KEY", "").strip()
+                or os.environ.get("GEMINI_API_KEY", "").strip()
+            )
+            if gemini_key:
+                extra_env["GEMINI_API_KEY"] = gemini_key
+            allow_keys = ("GEMINI_API_KEY",)
+
+        subproc_env = bridge_subprocess_env.build_research_runtime_subprocess_env(
+            os.environ,
+            runtime_env=extra_env,
+            allow_secret_keys=allow_keys,
+        )
         proc = await asyncio.create_subprocess_exec(
             self.cfg.python_bin,
             str(self.cfg.mcp_script),
-            cwd=str(self.cfg.ocw_root),
+            cwd=str(code_root),
             env=subproc_env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -10403,12 +10559,26 @@ class ResearchDataBridge:
             },
         }
 
-    def _build_community_subprocess_env(self) -> dict[str, str]:
+    def _build_community_subprocess_env(self, *, allow_firecrawl: bool = False) -> dict[str, str]:
         """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_*, bridge tokens, Feishu/gateway, and ASR/TOS credentials stripped and optional proxy applied."""
+        extra_env: dict[str, str] = {}
+        allow_keys: tuple[str, ...] = ()
+        if allow_firecrawl:
+            env_path = getattr(self.cfg, "env_path", None)
+            env_file_vars = _read_env_file_dict(env_path) if isinstance(env_path, Path) else {}
+            fc_key = (
+                env_file_vars.get("FIRECRAWL_API_KEY", "").strip()
+                or os.environ.get("FIRECRAWL_API_KEY", "").strip()
+            )
+            if fc_key:
+                extra_env["FIRECRAWL_API_KEY"] = fc_key
+            allow_keys = ("FIRECRAWL_API_KEY",)
         env: dict[str, str] = {
             k: v
             for k, v in bridge_subprocess_env.build_nonarchive_subprocess_env(
-                os.environ
+                os.environ,
+                extra_env=extra_env,
+                allow_keys=allow_keys,
             ).items()
             if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
         }
@@ -11932,7 +12102,9 @@ class ResearchDataBridge:
             t0 = time.monotonic()
             deadline = t0 + float(eff_timeout)
             test_delay_s = self.cfg.resolve_test_delay_s()
-            subproc_env = self._build_community_subprocess_env()
+            subproc_env = self._build_community_subprocess_env(
+                allow_firecrawl=(route == "employee")
+            )
             queued_ms = 0
 
             try:
@@ -11958,7 +12130,7 @@ class ResearchDataBridge:
                         raise asyncio.TimeoutError()
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
-                        cwd=str(self.cfg.ocw_root),
+                        cwd=str(self._research_code_root()),
                         env=subproc_env,
                         stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
@@ -14325,13 +14497,23 @@ class ResearchDataBridge:
         return resp
 
     def _resolve_company_wiki_python_and_cli(self) -> tuple[str, Path]:
-        """Locate the OpenClaw company-wiki skill Python binary and CLI script without modifying them."""
-        skill_dir = self.cfg.ocw_root / "skills" / "company-wiki"
+        """Locate the company-wiki skill Python binary and CLI script without modifying them."""
+        code_root = self._research_code_root()
+        home_root = self._research_home_root()
+        skill_dir = code_root / "skills" / "company-wiki"
         cli_script = skill_dir / "scripts" / "company_wiki_cli.py"
-        for candidate in (
+        embed_override = getattr(self.cfg, "embed_python", None)
+        if isinstance(embed_override, Path) and embed_override.is_file() and os.access(embed_override, os.X_OK):
+            return str(embed_override), cli_script
+        candidates = (
+            home_root / "venvs" / "company-wiki" / "bin" / "python",
+            home_root / "venvs" / "market-digest" / "bin" / "python",
+            home_root / "skills" / "company-wiki" / "venv" / "bin" / "python",
+            home_root / "skills" / "market-digest" / "venv" / "bin" / "python",
             skill_dir / "venv" / "bin" / "python",
-            self.cfg.ocw_root / "skills" / "market-digest" / "venv" / "bin" / "python",
-        ):
+            code_root / "skills" / "market-digest" / "venv" / "bin" / "python",
+        )
+        for candidate in candidates:
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return str(candidate), cli_script
         return self.cfg.python_bin, cli_script
@@ -14348,7 +14530,8 @@ class ResearchDataBridge:
         Reads `GEMINI_API_KEY` strictly from `self.cfg.env_path` so process environment variables
         can never override or supply the `/embed` key.
         """
-        env_file_vars = _read_env_file_dict(self.cfg.env_path)
+        env_path = getattr(self.cfg, "env_path", None)
+        env_file_vars = _read_env_file_dict(env_path) if isinstance(env_path, Path) else {}
         gemini_api_key = env_file_vars.get("GEMINI_API_KEY", "").strip()
         if not gemini_api_key:
             return {
@@ -14362,7 +14545,7 @@ class ResearchDataBridge:
             return {
                 "ok": False,
                 "status": "error",
-                "error": "company_wiki_cli.py not found under OpenClaw workspace",
+                "error": "company_wiki_cli.py not found under research code directory",
             }
 
         driver_code = (
@@ -14401,18 +14584,26 @@ class ResearchDataBridge:
         )
 
         cmd = [py_bin, "-B", "-W", "ignore", "-c", driver_code]
+        code_root = self._research_code_root()
+        home_root = self._research_home_root()
+        embed_extra: dict[str, str] = {
+            "GEMINI_API_KEY": gemini_api_key,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        if self._is_legacy_ocw_mode():
+            embed_extra["DALTON_OCW_ROOT"] = str(home_root)
+        else:
+            embed_extra["DALTON_RESEARCH_CODE"] = str(code_root)
+            embed_extra["DALTON_RESEARCH_HOME"] = str(home_root)
         subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
             os.environ,
-            extra_env={
-                "GEMINI_API_KEY": gemini_api_key,
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
+            extra_env=embed_extra,
             allow_keys=("GEMINI_API_KEY",),
         )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=str(self.cfg.ocw_root),
+            cwd=str(home_root),
             env=subproc_env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -15828,31 +16019,36 @@ class ResearchDataBridge:
         return False
 
     def _resolve_wiki_run_sh(self) -> Path:
-        """Locate the company-wiki `run.sh` entrypoint, using the maintained repo overlay launcher for supported skill directories and refusing unsupported explicit launchers."""
-        overlay = (
-            _SCRIPT_DIR / "openclaw_overlays" / "skills" / "company-wiki" / "run.sh"
+        """Locate the unified company-wiki `run.sh` entrypoint under `research_runtime`, refusing unsupported explicit launchers."""
+        runtime_launcher = (
+            _SCRIPT_DIR / "research_runtime" / "skills" / "company-wiki" / "run.sh"
         )
         cli_names = ("company_wiki_cli.py", "wiki_cli.py")
         explicit = getattr(self.cfg, "wiki_run_sh", None)
         if isinstance(explicit, Path):
+            if self._is_verified_skill_launcher_file(explicit, cli_names, runtime_launcher):
+                return explicit.expanduser()
             if self._should_use_overlay_for_skill_run_sh(
                 explicit,
-                overlay,
+                runtime_launcher,
                 cli_names,
             ):
-                return overlay
-            if self._is_verified_skill_launcher_file(explicit, cli_names, overlay):
-                return explicit.expanduser()
+                return runtime_launcher
             raise UnsupportedSkillLauncherError(
                 f"Unsupported company-wiki launcher {explicit}: target skill directory must contain scripts/company_wiki_cli.py or scripts/wiki_cli.py"
             )
-        if overlay.is_file():
-            return overlay
-        return self.cfg.ocw_root / "skills" / "company-wiki" / "run.sh"
+        code_launcher = self._research_code_root() / "skills" / "company-wiki" / "run.sh"
+        if not self._is_legacy_ocw_mode() and code_launcher.is_file():
+            return code_launcher
+        if runtime_launcher.is_file():
+            return runtime_launcher
+        return code_launcher
 
     def _load_company_wiki_config(self) -> dict[str, Any]:
         """Read `skills/company-wiki/config.json` in read-only mode."""
-        cfg_path = self.cfg.ocw_root / "skills" / "company-wiki" / "config.json"
+        code_cfg = self._research_code_root() / "skills" / "company-wiki" / "config.json"
+        home_cfg = self._research_home_root() / "skills" / "company-wiki" / "config.json"
+        cfg_path = code_cfg if code_cfg.is_file() else home_cfg
         if not cfg_path.is_file():
             return {}
         try:
@@ -15863,11 +16059,11 @@ class ResearchDataBridge:
             return {}
 
     def _resolve_wiki_base_dir(self, target_type: str, wiki_cfg: dict[str, Any]) -> Path:
-        """Resolve `wiki/companies` or `wiki/sectors` directory under OpenClaw workspace."""
+        """Resolve `wiki/companies` or `wiki/sectors` directory under research_home."""
         raw_wiki_dir = str(wiki_cfg.get("wiki_dir") or "wiki").strip() or "wiki"
         wiki_dir = Path(raw_wiki_dir)
         if not wiki_dir.is_absolute():
-            wiki_dir = self.cfg.ocw_root / wiki_dir
+            wiki_dir = self._research_home_root() / wiki_dir
         subdir = "companies" if target_type == "company" else "sectors"
         return wiki_dir / subdir
 
@@ -16565,9 +16761,10 @@ class ResearchDataBridge:
         """
         if not target_file.is_file():
             return None
+        home_root = self._research_home_root()
         rel_disk_path = (
-            str(target_file.relative_to(self.cfg.ocw_root))
-            if target_file.is_relative_to(self.cfg.ocw_root)
+            str(target_file.relative_to(home_root))
+            if target_file.is_relative_to(home_root)
             else str(target_file)
         )
         try:
@@ -16666,7 +16863,7 @@ class ResearchDataBridge:
                     if rel_fp:
                         fp_candidate = Path(rel_fp)
                         if not fp_candidate.is_absolute():
-                            fp_candidate = self.cfg.ocw_root / fp_candidate
+                            fp_candidate = self._research_home_root() / fp_candidate
                         if fp_candidate.is_file():
                             try:
                                 raw_text = await asyncio.to_thread(
@@ -16700,22 +16897,25 @@ class ResearchDataBridge:
 
     def _build_wiki_subprocess_env(self) -> dict[str, str]:
         """Construct minimal environment for `company-wiki/run.sh` and `market-digest/run.sh` without leaking bridge, Feishu, gateway, ASR, or unrelated provider credentials."""
-        env_file_vars = _read_env_file_dict(self.cfg.env_path)
+        env_path = getattr(self.cfg, "env_path", None)
+        env_file_vars = _read_env_file_dict(env_path) if isinstance(env_path, Path) else {}
         gemini_api_key = (
             os.environ.get("GEMINI_API_KEY", "").strip()
             or env_file_vars.get("GEMINI_API_KEY", "").strip()
         )
+        code_root = self._research_code_root()
+        home_root = self._research_home_root()
         explicit_wiki_run_sh = getattr(self.cfg, "wiki_run_sh", None)
         wiki_skill_dir = (
             explicit_wiki_run_sh.expanduser().parent
             if isinstance(explicit_wiki_run_sh, Path)
-            else self.cfg.ocw_root / "skills" / "company-wiki"
+            else code_root / "skills" / "company-wiki"
         )
         explicit_md_run_sh = getattr(self.cfg, "market_digest_run_sh", None)
         md_skill_dir = (
             explicit_md_run_sh.expanduser().parent
             if isinstance(explicit_md_run_sh, Path)
-            else self.cfg.ocw_root / "skills" / "market-digest"
+            else code_root / "skills" / "market-digest"
         )
         base_env: dict[str, str] = {
             "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
@@ -16725,23 +16925,30 @@ class ResearchDataBridge:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
             "SKILL_WARNINGS": "ignore",
-            "DALTON_OCW_ROOT": str(self.cfg.ocw_root),
             "DALTON_WIKI_SKILL_DIR": str(wiki_skill_dir),
             "DALTON_MARKET_DIGEST_SKILL_DIR": str(md_skill_dir),
             "DALTON_BRIDGE_ENV_FILTER_PY": str(_SCRIPT_DIR / "bridge_subprocess_env.py"),
         }
-        for opt_key in ("DALTON_SKILL_PYTHON", "DALTON_SKILL_SHELL_RC"):
+        if self._is_legacy_ocw_mode():
+            base_env["DALTON_OCW_ROOT"] = str(home_root)
+        else:
+            base_env["DALTON_RESEARCH_CODE"] = str(code_root)
+            base_env["DALTON_RESEARCH_HOME"] = str(home_root)
+        for opt_key in ("DALTON_SKILL_PYTHON",):
             opt_val = os.environ.get(opt_key, "").strip()
             if opt_val:
                 base_env[opt_key] = opt_val
+        allow_secrets: tuple[str, ...] = ()
         if gemini_api_key:
             base_env["GEMINI_API_KEY"] = gemini_api_key
+            allow_secrets = ("GEMINI_API_KEY",)
         if self.cfg.subprocess_proxy:
             base_env["HTTP_PROXY"] = self.cfg.subprocess_proxy
             base_env["HTTPS_PROXY"] = self.cfg.subprocess_proxy
-        return bridge_subprocess_env.build_nonarchive_subprocess_env(
+        return bridge_subprocess_env.build_research_runtime_subprocess_env(
             base_env,
-            allow_keys=("GEMINI_API_KEY",),
+            runtime_env=base_env,
+            allow_secret_keys=allow_secrets,
         )
 
     @staticmethod
@@ -16762,7 +16969,7 @@ class ResearchDataBridge:
         exec_cmd = self._build_skill_exec_argv(cmd)
         proc = await asyncio.create_subprocess_exec(
             *exec_cmd,
-            cwd=str(self.cfg.ocw_root),
+            cwd=str(self._research_home_root()),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -17787,30 +17994,33 @@ class ResearchDataBridge:
         return raw_doc_key, document_id
 
     def _resolve_market_digest_run_sh(self) -> Path:
-        """Locate the market-digest `run.sh` entrypoint, using the maintained repo overlay launcher for supported skill directories and refusing unsupported explicit launchers."""
-        overlay = (
-            _SCRIPT_DIR / "openclaw_overlays" / "skills" / "market-digest" / "run.sh"
+        """Locate the unified market-digest `run.sh` entrypoint under `research_runtime`, refusing unsupported explicit launchers."""
+        runtime_launcher = (
+            _SCRIPT_DIR / "research_runtime" / "skills" / "market-digest" / "run.sh"
         )
         cli_names = ("market_digest_cli.py", "digest_cli.py")
         explicit = getattr(self.cfg, "market_digest_run_sh", None)
         if isinstance(explicit, Path):
+            if self._is_verified_skill_launcher_file(explicit, cli_names, runtime_launcher):
+                return explicit.expanduser()
             if self._should_use_overlay_for_skill_run_sh(
                 explicit,
-                overlay,
+                runtime_launcher,
                 cli_names,
             ):
-                return overlay
-            if self._is_verified_skill_launcher_file(explicit, cli_names, overlay):
-                return explicit.expanduser()
+                return runtime_launcher
             raise UnsupportedSkillLauncherError(
                 f"Unsupported market-digest launcher {explicit}: target skill directory must contain scripts/market_digest_cli.py or scripts/digest_cli.py"
             )
-        if overlay.is_file():
-            return overlay
-        return self.cfg.ocw_root / "skills" / "market-digest" / "run.sh"
+        code_launcher = self._research_code_root() / "skills" / "market-digest" / "run.sh"
+        if not self._is_legacy_ocw_mode() and code_launcher.is_file():
+            return code_launcher
+        if runtime_launcher.is_file():
+            return runtime_launcher
+        return code_launcher
 
     def _sales_notes_audit_path(self) -> Path:
-        return self.cfg.ocw_root / self._SALES_NOTES_AUDIT_REL
+        return self._research_home_root() / self._SALES_NOTES_AUDIT_REL
 
     def _append_sales_notes_audit_entry(self, entry: dict[str, Any]) -> None:
         path = self._sales_notes_audit_path()
@@ -18114,7 +18324,7 @@ class ResearchDataBridge:
             exec_cmd = self._build_skill_exec_argv(cmd)
             proc = await asyncio.create_subprocess_exec(
                 *exec_cmd,
-                cwd=str(self.cfg.ocw_root),
+                cwd=str(self._research_home_root()),
                 env=env,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
@@ -21280,10 +21490,16 @@ def _resolve_and_validate_notify_image_path(
         ):
             raise ValueError("invalid_image_path: invalid run_id")
 
-    ocw_prefix = "/Users/everflow/.openclaw/workspace/"
+    container_prefixes: list[str] = []
+    custom_prefix = os.environ.get("DALTON_CONTAINER_WORKSPACE_PREFIX", "").strip()
+    if custom_prefix:
+        container_prefixes.append(custom_prefix.rstrip("/") + "/")
+    # Container data-tasks still mount var/dalton/openclaw-data at this path inside Docker.
+    container_prefixes.append("/Users/everflow/.openclaw/workspace/")
+    matched_prefix = next((pref for pref in container_prefixes if cleaned.startswith(pref)), "")
     if p.is_absolute():
-        if cleaned.startswith(ocw_prefix):
-            rel_str = cleaned[len(ocw_prefix) :].lstrip("/")
+        if matched_prefix:
+            rel_str = cleaned[len(matched_prefix) :].lstrip("/")
             if not rel_str or ".." in Path(rel_str).parts:
                 raise ValueError(
                     "invalid_image_path: invalid workspace-relative image path"
@@ -21459,23 +21675,52 @@ def _run_feishu_send_card(
             timeout=timeout_s,
             check=False,
         )
+        parsed_out: dict[str, Any] | None = None
+        if not dry_run and proc.stdout and proc.stdout.strip():
+            try:
+                candidate = json.loads(proc.stdout)
+                if isinstance(candidate, dict):
+                    parsed_out = candidate
+            except ValueError:
+                parsed_out = None
+        discord_mirror = (
+            parsed_out.get("discord_mirror")
+            if isinstance(parsed_out, dict)
+            else None
+        )
+        mirror_import_failed = (
+            isinstance(discord_mirror, dict)
+            and discord_mirror.get("status") == "import_error"
+        ) or (
+            isinstance(parsed_out, dict)
+            and parsed_out.get("error") == "eve_tracking_mirror_import_failed"
+        )
         if proc.returncode != 0:
+            if mirror_import_failed:
+                return {
+                    "ok": False,
+                    "exit_code": proc.returncode,
+                    "feishu_sent": bool(parsed_out and parsed_out.get("feishu_sent")),
+                    "error": "discord_mirror_import_failed",
+                }
             return {
                 "ok": False,
                 "exit_code": proc.returncode,
                 "error": f"exit_code={proc.returncode}",
             }
-        if not dry_run and proc.stdout and proc.stdout.strip():
-            try:
-                parsed = json.loads(proc.stdout)
-                if isinstance(parsed, dict) and parsed.get("status") == "error":
-                    return {
-                        "ok": False,
-                        "exit_code": proc.returncode,
-                        "error": "feishu_api_error",
-                    }
-            except ValueError:
-                pass
+        if mirror_import_failed:
+            return {
+                "ok": False,
+                "exit_code": proc.returncode,
+                "feishu_sent": bool(parsed_out and parsed_out.get("feishu_sent")),
+                "error": "discord_mirror_import_failed",
+            }
+        if isinstance(parsed_out, dict) and parsed_out.get("status") == "error":
+            return {
+                "ok": False,
+                "exit_code": proc.returncode,
+                "error": "feishu_api_error",
+            }
         return {"ok": True, "exit_code": proc.returncode}
     except subprocess.TimeoutExpired:
         return {"ok": False, "exit_code": -1, "error": "timeout"}
@@ -26066,9 +26311,306 @@ async def main() -> None:
         await bridge.close()
 
 
+def _read_pyvenv_major_minor(cfg_path: Path) -> str | None:
+    if not cfg_path.is_file():
+        return None
+    try:
+        for line in cfg_path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line:
+                continue
+            k, v = (part.strip() for part in line.split("=", 1))
+            if k in ("version", "version_info") and v:
+                parts = v.split(".")
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    return f"{parts[0]}.{parts[1]}"
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_consensus_expected_mm(home_root: Path, ocw_root: Path) -> str | None:
+    ver_file = home_root / "state" / "venvs" / "consensus-estimates.python_version"
+    if ver_file.is_file():
+        try:
+            raw = ver_file.read_text(encoding="utf-8").strip()
+            if re.fullmatch(r"\d+\.\d+", raw):
+                return raw
+        except OSError:
+            pass
+    for cfg_cand in (
+        ocw_root / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg",
+        home_root / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg",
+        Path.home() / ".openclaw" / "workspace" / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg",  # 兼容读取旧 venv 版本
+    ):
+        mm = _read_pyvenv_major_minor(cfg_cand)
+        if mm:
+            return mm
+    return None
+
+
+def _inspect_venv_python_version(
+    venv_dir: Path,
+    py_path: Path,
+    expected_mm: str | None,
+) -> tuple[bool, str | None, str | None]:
+    """Read a venv's Python version offline without spawning a subprocess."""
+    detected: str | None = None
+    cfg_path = venv_dir / "pyvenv.cfg"
+    if cfg_path.is_file():
+        try:
+            for line in cfg_path.read_text(encoding="utf-8").splitlines():
+                if "=" not in line:
+                    continue
+                k, v = (part.strip() for part in line.split("=", 1))
+                if k in ("version", "version_info") and v:
+                    detected = v
+                    break
+        except OSError:
+            pass
+    if not detected and (venv_dir / "lib").is_dir():
+        for cand in sorted((venv_dir / "lib").iterdir()):
+            if cand.is_dir() and cand.name.startswith("python3."):
+                detected = cand.name.removeprefix("python")
+                break
+    if not detected:
+        resolved_name = py_path.resolve().name
+        m = re.search(r"python(\d+\.\d+(?:\.\d+)?)", resolved_name)
+        if m:
+            detected = m.group(1)
+    mm = ".".join(detected.split(".")[:2]) if detected else ""
+    if expected_mm is None:
+        if detected and not detected.startswith("3."):
+            return False, detected, f"version_mismatch_{detected}"
+        return True, detected, None
+    if mm == expected_mm:
+        return True, detected, None
+    err = f"version_mismatch_{detected}" if detected else "version_unknown"
+    return False, detected, err
+
+
+def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
+    """Read-only offline check of research runtime code, config, venvs, and local stores."""
+    cfg = cfg or BridgeConfig()
+    code_root = cfg.research_code
+    home_root = cfg.research_home
+    legacy_mode = cfg.legacy_ocw_mode
+
+    required_code_rel = (
+        "config/data_sources.json",
+        "config/eve_tracking_mirror.example.json",
+        "scripts/researchdata_mcp.py",
+        "scripts/data_gateway.py",
+        "scripts/research_library.py",
+        "scripts/research_library.sh",
+        "scripts/research_images.py",
+        "scripts/research_images.sh",
+        "scripts/research_image_ingest.py",
+        "scripts/alphaengine-mcp/export-image-source.mjs",
+        "scripts/alphaengine-mcp/server.mjs",
+        "scripts/funda_ai.py",
+        "scripts/funda_ai.sh",
+        "scripts/sales_notes_store.py",
+        "scripts/tmtb_alphaengine_sync.py",
+        "scripts/tmtb_alphaengine_sync.sh",
+        "scripts/consensus_estimates.py",
+        "scripts/consensus_estimates.sh",
+        "scripts/consensus_estimates_requirements.txt",
+        "scripts/xueqiu_posts.py",
+        "scripts/feishu_send_card.py",
+        "scripts/eve_tracking_mirror.py",
+        "skills/agent-reach/SKILL.md",
+        "skills/13f-tracker/scripts/name_to_ticker.json",
+        "skills/findata-analyst/run.sh",
+        "skills/findata-analyst/scripts/findata_cli.py",
+        "skills/cn-hk-findata/run.sh",
+        "skills/cn-hk-findata/scripts/financemcp_adapter.py",
+        "skills/company-wiki/run.sh",
+        "skills/company-wiki/scripts/company_wiki_cli.py",
+        "skills/market-digest/run.sh",
+        "skills/market-digest/config.example.json",
+        "skills/market-digest/scripts/market_digest_cli.py",
+        "skills/employee-reviews/run.sh",
+        "skills/employee-reviews/scripts/run.sh",
+        "skills/employee-reviews/scripts/employee_reviews_cli.py",
+        "skills/company-filings-alert/SKILL.md",
+        "skills/company-filings-alert/run.sh",
+        "skills/company-filings-alert/scripts/company_filings_alert_cli.py",
+        "skills/company-filings-alert/scripts/edgar_enrich.py",
+        "skills/guidepoint-transcript-search/SKILL.md",
+        "skills/guidepoint-transcript-search/run.sh",
+        "skills/guidepoint-transcript-search/scripts/gp_search.py",
+    )
+    # Example files exist only in the repo copy; the legacy workspace never had them.
+    missing_code = [
+        rel
+        for rel in required_code_rel
+        if not (legacy_mode and rel.endswith(".example.json"))
+        and not (code_root / rel).is_file()
+    ]
+    code_ok = code_root.is_dir() and not missing_code
+
+    config_checks: dict[str, Any] = {}
+    config_targets: tuple[tuple[str, Path], ...] = (
+        ("data_sources", code_root / "config" / "data_sources.json"),
+        ("company_wiki_config", code_root / "skills" / "company-wiki" / "config.json"),
+        ("eve_tracking_mirror_config", home_root / "config" / "eve_tracking_mirror.json"),
+        (
+            "market_digest_config",
+            (home_root / "skills" / "market-digest" / "config.json")
+            if legacy_mode
+            else (home_root / "config" / "config.json"),
+        ),
+    )
+    for label, p in config_targets:
+        if not p.is_file():
+            config_checks[label] = {"ok": False, "path": str(p), "error": "missing"}
+        else:
+            try:
+                parsed = json.loads(p.read_text(encoding="utf-8"))
+                entry: dict[str, Any] = {"ok": isinstance(parsed, dict), "path": str(p)}
+                if label == "data_sources" and isinstance(parsed, dict):
+                    entry["routes"] = len(parsed.get("routes") or [])
+                config_checks[label] = entry
+            except Exception as exc:
+                config_checks[label] = {"ok": False, "path": str(p), "error": type(exc).__name__}
+
+    env_vars = _read_env_file_dict(cfg.env_path) if isinstance(cfg.env_path, Path) else {}
+    config_checks["bridge_env_file"] = {
+        "ok": cfg.env_path.is_file(),
+        "path": str(cfg.env_path),
+        "present_keys": {
+            k: bool((env_vars.get(k) or os.environ.get(k) or "").strip())
+            for k in (
+                "DALTON_BRIDGE_TOKEN",
+                "DALTON_BRIDGE_ADMIN_TOKEN",
+                "GEMINI_API_KEY",
+                "EDGAR_IDENTITY",
+                "FEISHU_APP_ID",
+                "FEISHU_APP_SECRET",
+            )
+        },
+    }
+    configs_ok = all(
+        bool(config_checks[k].get("ok"))
+        for k in (
+            "data_sources",
+            "eve_tracking_mirror_config",
+            "company_wiki_config",
+            "market_digest_config",
+        )
+    )
+
+    consensus_expected_mm = _resolve_consensus_expected_mm(home_root, cfg.ocw_root)
+    specs: tuple[tuple[str, str | None, Path], ...] = (
+        ("findata-analyst", "3.12", home_root / "skills" / "findata-analyst" / "venv"),
+        ("cn-hk-findata", "3.12", home_root / "skills" / "cn-hk-findata" / "venv"),
+        ("company-wiki", "3.14", home_root / "skills" / "company-wiki" / "venv"),
+        ("market-digest", "3.13", home_root / "skills" / "market-digest" / "venv"),
+        ("employee-reviews", "3.14", home_root / "skills" / "employee-reviews" / "venv"),
+        ("consensus-estimates", consensus_expected_mm, home_root / "state" / "venvs" / "consensus-estimates"),
+    )
+    venv_checks: dict[str, Any] = {}
+    for skill_name, expected_mm, legacy_dir in specs:
+        venv_dir = legacy_dir if legacy_mode else (home_root / "venvs" / skill_name)
+        py_path = venv_dir / "bin" / "python"
+        if not (py_path.is_file() and os.access(py_path, os.X_OK)):
+            venv_checks[skill_name] = {
+                "ok": False,
+                "python": str(py_path),
+                "expected_version": expected_mm,
+                "error": "missing_or_not_executable",
+            }
+            continue
+        ver_ok, ver, ver_err = _inspect_venv_python_version(venv_dir, py_path, expected_mm)
+        venv_checks[skill_name] = {
+            "ok": ver_ok,
+            "python": str(py_path),
+            "expected_version": expected_mm,
+            "actual_version": ver,
+            **({"error": ver_err} if ver_err else {}),
+        }
+
+    embed_py: Path | None = cfg.embed_python
+    if embed_py is None:
+        for cand in (
+            home_root / "venvs" / "company-wiki" / "bin" / "python",
+            home_root / "venvs" / "market-digest" / "bin" / "python",
+            home_root / "skills" / "company-wiki" / "venv" / "bin" / "python",
+            home_root / "skills" / "market-digest" / "venv" / "bin" / "python",
+        ):
+            if cand.is_file() and os.access(cand, os.X_OK):
+                embed_py = cand
+                break
+    embed_ok = embed_py is not None and embed_py.is_file() and os.access(embed_py, os.X_OK)
+    venv_checks["embed_python"] = {
+        "ok": embed_ok,
+        "python": str(embed_py) if embed_py else None,
+        "override_set": cfg.embed_python is not None,
+    }
+    venvs_ok = all(bool(v.get("ok")) for v in venv_checks.values())
+
+    store_specs = (
+        ("wiki_vectors_db", "file", home_root / "wiki" / "vectors.db"),
+        ("wiki_companies_dir", "dir", home_root / "wiki" / "companies"),
+        ("wiki_sectors_dir", "dir", home_root / "wiki" / "sectors"),
+        ("market_digest_vectors_db", "file", home_root / "skills" / "market-digest" / "vectors.db"),
+        ("market_digest_output_dir", "dir", home_root / "skills" / "market-digest" / "output"),
+        ("sales_notes_manifest", "file", home_root / "state" / "sales-notes" / "manifest.jsonl"),
+        ("funda_ai_db", "file", home_root / "state" / "funda-ai" / "index.sqlite"),
+        ("research_images_db", "file", home_root / "state" / "research-images" / "index.sqlite"),
+        ("tmtb_state_dir", "dir", home_root / "state" / "tmtb-alphaengine"),
+        ("market_memory_dir", "dir", home_root / "market-memory"),
+    )
+    store_checks: dict[str, Any] = {}
+    for name, kind, path in store_specs:
+        if kind == "file":
+            exists = path.is_file()
+            info: dict[str, Any] = {"ok": exists, "kind": kind, "path": str(path)}
+            if exists:
+                try:
+                    info["size_bytes"] = path.stat().st_size
+                except OSError:
+                    pass
+            store_checks[name] = info
+        else:
+            exists = path.is_dir()
+            store_checks[name] = {"ok": exists, "kind": kind, "path": str(path)}
+    stores_ok = all(bool(v.get("ok")) for v in store_checks.values())
+
+    overall_ok = code_ok and configs_ok and venvs_ok and stores_ok
+    return {
+        "ok": overall_ok,
+        "mode": "legacy_ocw" if legacy_mode else "dalton_research",
+        "code_ok": code_ok,
+        "configs_ok": configs_ok,
+        "venvs_ok": venvs_ok,
+        "stores_ok": stores_ok,
+        "paths": {
+            "research_code": str(code_root),
+            "research_home": str(home_root),
+            "ocw_root": str(cfg.ocw_root),
+        },
+        "code": {
+            "ok": code_ok,
+            "missing_files": missing_code,
+        },
+        "configs": config_checks,
+        "venvs": venv_checks,
+        "stores": store_checks,
+    }
+
+
+def _run_check_runtime_cli() -> int:
+    report = check_runtime_status()
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("ok") else 1
+
+
 if __name__ == "__main__":
     if HOST_TASK_GATE_FLAG in sys.argv:
         sys.exit(_run_host_task_gate_cli(sys.argv))
+    if "--check-runtime" in sys.argv:
+        sys.exit(_run_check_runtime_cli())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

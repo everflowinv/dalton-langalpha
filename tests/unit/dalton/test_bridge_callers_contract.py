@@ -65,6 +65,22 @@ DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
     "scripts/dalton/realrun/g4_autonomy.py": (
         "Historical G4 real-run evidence script (_check_live_internal_literature_today), not production runtime."
     ),
+    "scripts/dalton/research_runtime/scripts/data_gateway.py": (
+        "Migrated OpenClaw downstream MCP gateway inside research_runtime: invokes upstream MCP servers "
+        "(per data_sources.json) rather than calling Dalton's HTTP bridge route contract."
+    ),
+    "scripts/dalton/research_runtime/scripts/tmtb_alphaengine_sync.py": (
+        "Migrated OpenClaw TMTB AlphaEngine sync helper inside research_runtime: calls upstream AlphaEngine "
+        "MCP tools directly over local HTTP/stdio rather than Dalton's HTTP bridge route contract."
+    ),
+    "scripts/dalton/research_runtime/skills/employee-reviews/scripts/employee_reviews_cli.py": (
+        "Migrated OpenClaw employee-reviews skill CLI inside research_runtime: forwards downstream MCP "
+        "tools/call to upstream skill backends rather than calling Dalton's HTTP bridge route contract."
+    ),
+    "scripts/dalton/research_runtime/skills/guidepoint-transcript-search/scripts/gp_search.py": (
+        "Migrated OpenClaw guidepoint-transcript-search skill CLI inside research_runtime: forwards downstream "
+        "MCP tools/call to the local Guidepoint proxy service rather than calling Dalton's HTTP bridge route contract."
+    ),
 }
 
 

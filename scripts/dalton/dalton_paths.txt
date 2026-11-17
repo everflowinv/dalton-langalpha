@@ -476,3 +476,8 @@ web/src/config/__tests__/supportLinks.dalton.test.ts
 web/src/components/Sidebar/__tests__/AccountMenu.dalton.test.tsx
 web/src/pages/Settings/panels/modelAccess/__tests__/ClaudeCodeSheet.dalton.test.tsx
 web/src/pages/Plugins/__tests__/DesktopDownloadLink.dalton.test.tsx
+
+# OpenClaw decoupling batch 2a: host research_runtime code, bridge runtime checks, and data migration script.
+scripts/dalton/research_runtime/
+scripts/dalton/ops/research_runtime_migrate.sh
+tests/unit/dalton/test_research_runtime_decoupling.py

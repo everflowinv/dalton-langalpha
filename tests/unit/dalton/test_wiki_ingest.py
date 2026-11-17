@@ -51,9 +51,9 @@ def _make_test_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     (skill_dir / "scripts").mkdir(parents=True, exist_ok=True)
     cli_py = skill_dir / "scripts" / "company_wiki_cli.py"
     cli_py.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-    overlay_run_sh = BRIDGE_DIR / "openclaw_overlays" / "skills" / "company-wiki" / "run.sh"
+    runtime_run_sh = BRIDGE_DIR / "research_runtime" / "skills" / "company-wiki" / "run.sh"
     run_sh = skill_dir / "run.sh"
-    run_sh.write_text(overlay_run_sh.read_text(encoding="utf-8"), encoding="utf-8")
+    run_sh.write_text(runtime_run_sh.read_text(encoding="utf-8"), encoding="utf-8")
     run_sh.chmod(0o755)
 
     config_json = skill_dir / "config.json"
@@ -107,18 +107,18 @@ def test_supported_skill_launcher_uses_maintained_content(
     (skill_dir / "scripts").mkdir(parents=True)
     (skill_dir / "scripts" / cli_name).write_text("", encoding="utf-8")
     launcher = skill_dir / "run.sh"
-    overlay = BRIDGE_DIR / "openclaw_overlays" / "skills" / skill_name / "run.sh"
+    runtime_launcher = BRIDGE_DIR / "research_runtime" / "skills" / skill_name / "run.sh"
     setattr(bridge.cfg, config_name, launcher)
     resolve = getattr(bridge, resolver_name)
 
-    launcher.write_bytes(overlay.read_bytes())
+    launcher.write_bytes(runtime_launcher.read_bytes())
     assert resolve() == launcher
 
     launcher.write_text(
         f"#!/bin/sh\n# exec-nonarchive {cli_name}\nexec python3 scripts/{cli_name}\n",
         encoding="utf-8",
     )
-    assert resolve() == overlay
+    assert resolve() == runtime_launcher
 
 
 async def _send_raw_http_request(

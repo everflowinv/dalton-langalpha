@@ -1,0 +1,905 @@
+# cn-hk-findata Intent Registry
+# Each entry defines a mapping from NL keywords -> AkShare function
+# Placeholders in args: {ticker}, {ticker6}, {ticker5}, {start_date}, {end_date},
+#   {today}, {market_sh_sz}, {board_name}, {indicator_annual_quarterly}
+
+# ============== Existing Intents (migrated from if-else) ==============
+
+- id: fund_flow_individual
+  keywords: [资金流, 资金流向, 主力资金, 净流入, 净流出, 大单, 散户资金, 主力在买吗, 谁在买, 主力动向, 资金进出, 主力净额]
+  function: stock_individual_fund_flow
+  needs_ticker: true
+  args:
+    stock: "{ticker6}"
+    market: "{market_sh_sz}"
+  description: 个股资金流向(主力/散户/大单净流入)
+  fallbacks:
+    - function: stock_fund_flow_individual
+      source: ths
+      args:
+        symbol: "即时"
+      post:
+        filter_eq:
+          股票代码: "{ticker6}"
+      note: 同花顺即时口径，只有当日净额，没有东财的多日主力/散户拆分
+
+- id: fund_flow_market
+  keywords: [大盘资金流, 市场资金流, 全市场资金]
+  function: stock_market_fund_flow
+  needs_ticker: false
+  args: {}
+  description: 市场整体资金流向
+
+- id: hsgt_hold
+  keywords: [北向持股, 沪股通持股, 深股通持股, 港股通持股, 北向排行, 北向排名]
+  function: stock_hsgt_hold_stock_em
+  needs_ticker: false
+  args:
+    market: "{hsgt_market}"
+    indicator: "5日排行"
+  description: 沪深港通持股排行
+
+- id: hsgt_fund_flow
+  keywords: [北向资金, 沪深港通, 沪深港通资金, 北向净流入]
+  function: stock_hsgt_fund_flow_summary_em
+  needs_ticker: false
+  args: {}
+  description: 沪深港通资金流汇总
+
+- id: margin_sse
+  keywords: [两融, 融资融券, 融资余额, 融券余额, 沪市两融]
+  function: stock_margin_sse
+  needs_ticker: false
+  args:
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+  description: 沪市融资融券数据
+
+- id: margin_szse
+  keywords: [深市两融, 深市融资, 深圳两融]
+  function: stock_margin_szse
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 深市融资融券数据
+
+- id: lhb
+  keywords: [龙虎榜, 龙虎榜明细, 龙虎榜详情, 今日龙虎榜]
+  function: stock_lhb_detail_em
+  needs_ticker: false
+  args:
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+  description: 龙虎榜明细
+
+- id: dzjy
+  keywords: [大宗交易, 大宗, 折价, 溢价]
+  function: stock_dzjy_sctj
+  needs_ticker: false
+  args: {}
+  description: 大宗交易市场统计
+
+- id: valuation_hk
+  keywords: [港股估值, 港股市值, 港股PE, 港股PB]
+  function: stock_hk_valuation_baidu
+  needs_ticker: true
+  ticker_format: hk5
+  args:
+    symbol: "{ticker5}"
+    indicator: "总市值"
+    period: "近一年"
+  description: 港股估值序列(百度)
+
+- id: valuation_a
+  keywords: [估值, 市值, PE, PB, pe, pb, 市盈率, 市净率]
+  function: stock_zh_valuation_baidu
+  needs_ticker: true
+  ticker_format: cn6
+  args:
+    symbol: "{ticker6}"
+    indicator: "总市值"
+    period: "近一年"
+  description: A股估值序列(百度)
+
+- id: restricted_release
+  keywords: [解禁, 限售, 限售解禁, 解禁日]
+  function: stock_restricted_release_summary_em
+  needs_ticker: false
+  args:
+    symbol: "全部股票"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+  description: 限售解禁汇总
+
+- id: ggcg
+  keywords: [增减持, 高管持股, 董监高, 减持, 增持公告]
+  function: stock_ggcg_em
+  needs_ticker: false
+  args:
+    symbol: "全部"
+  description: 高管持股变动
+
+- id: repurchase
+  keywords: [回购, 股票回购, 回购计划]
+  function: stock_repurchase_em
+  needs_ticker: false
+  args: {}
+  description: 回购数据
+
+- id: notice
+  keywords: [公告, 公告列表, 公告摘要, 上市公司公告]
+  function: stock_notice_report
+  needs_ticker: false
+  args:
+    symbol: "全部"
+    date: "{today}"
+  description: 公告快照
+
+- id: board_concept
+  keywords: [概念板块行情, 概念板块走势, 概念行情, 题材行情, 概念板块涨跌]
+  function: stock_board_concept_hist_em
+  needs_ticker: false
+  args:
+    symbol: "{board_name}"
+    period: "daily"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+    adjust: ""
+  description: 概念板块历史行情
+  fallbacks:
+    - function: stock_board_concept_index_ths
+      source: ths
+      args:
+        symbol: "{board_name_ths_concept}"
+        start_date: "{start_date}"
+        end_date: "{end_date}"
+      post:
+        rename: {开盘价: 开盘, 收盘价: 收盘, 最高价: 最高, 最低价: 最低}
+      note: 同花顺概念指数，板块划分与东财不完全一致
+
+- id: board_industry
+  keywords: [行业板块, 行业, 行业行情, 行业走势]
+  function: stock_board_industry_hist_em
+  needs_ticker: false
+  args:
+    symbol: "{board_name}"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+    period: "日k"
+    adjust: ""
+  description: 行业板块历史行情
+  fallbacks:
+    - function: stock_board_industry_index_ths
+      source: ths
+      args:
+        symbol: "{board_name_ths_industry}"
+        start_date: "{start_date}"
+        end_date: "{end_date}"
+      post:
+        rename: {开盘价: 开盘, 收盘价: 收盘, 最高价: 最高, 最低价: 最低}
+      note: 同花顺行业指数，行业划分与东财不完全一致
+
+- id: hot_rank
+  keywords: [热榜, 人气榜, 热门股, 热度排行, 人气排名, 最火的股票, 关注度最高, 大家都在看什么]
+  function: stock_hot_rank_em
+  needs_ticker: false
+  args: {}
+  description: 东方财富热股榜
+
+- id: research_report
+  keywords: [研报, 评级, 目标价, 券商研报, 分析师评级]
+  function: stock_research_report_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股研报列表
+
+- id: financial_hk_indicator
+  keywords: [港股财务指标, 财务指标, ROE, roe, ROA, roa, 杜邦分析, 净资产收益率, 总资产收益率, 毛利率趋势, 财务摘要, 快速财务, 财务概要, 财务一览]
+  function: stock_financial_hk_analysis_indicator_em
+  needs_ticker: true
+  ticker_format: hk5
+  markets: [hk]
+  args:
+    symbol: "{ticker5}"
+    indicator: "{indicator_annual_quarterly}"
+  description: 港股财务指标与摘要(东方财富，保留报告币种)
+
+- id: financial_hk_income
+  keywords: [港股利润表, 港股财务, 港股收入, 港股净利润, 利润表, 营收, 净利润, 财报]
+  function: stock_financial_hk_report_em
+  needs_ticker: true
+  ticker_format: hk5
+  args:
+    stock: "{ticker5}"
+    symbol: "利润表"
+    indicator: "{indicator_annual_quarterly}"
+  description: 港股利润表(东方财富)
+
+- id: financial_hk_balance
+  keywords: [港股资产负债, 港股资产, 港股负债, 资产负债表, 总资产, 总负债]
+  function: stock_financial_hk_report_em
+  needs_ticker: true
+  ticker_format: hk5
+  args:
+    stock: "{ticker5}"
+    symbol: "资产负债表"
+    indicator: "{indicator_annual_quarterly}"
+  description: 港股资产负债表(东方财富)
+
+- id: financial_hk_cashflow
+  keywords: [港股现金流, 港股经营现金, 现金流, 现金流量表]
+  function: stock_financial_hk_report_em
+  needs_ticker: true
+  ticker_format: hk5
+  args:
+    stock: "{ticker5}"
+    symbol: "现金流量表"
+    indicator: "{indicator_annual_quarterly}"
+  description: 港股现金流量表(东方财富)
+
+# ============== NEW P0 Intents ==============
+
+- id: financial_a_balance
+  keywords: [资产负债表, 资产负债, 总资产, 总负债, 负债率, 资产负债率]
+  function: stock_balance_sheet_by_report_em
+  needs_ticker: true
+  ticker_format: cn_prefix
+  args:
+    symbol: "{ticker_cn_prefix}"
+  description: A股资产负债表(东方财富)
+
+- id: financial_a_income
+  keywords: [利润表, 营业收入, 净利润, 营收, 毛利, 毛利率, 归母净利润, 赚了多少钱, 收入多少, 利润多少]
+  function: stock_profit_sheet_by_report_em
+  needs_ticker: true
+  ticker_format: cn_prefix
+  args:
+    symbol: "{ticker_cn_prefix}"
+  description: A股利润表(东方财富)
+
+- id: financial_a_cashflow
+  keywords: [现金流, 现金流量表, 经营现金流, 自由现金流]
+  function: stock_cash_flow_sheet_by_report_em
+  needs_ticker: true
+  ticker_format: cn_prefix
+  args:
+    symbol: "{ticker_cn_prefix}"
+  description: A股现金流量表(东方财富)
+
+- id: yjyg
+  keywords: [业绩预告, 预告, 预增, 预减, 预亏, 略增, 略减, 业绩怎么样, 赚了多少, 亏了吗]
+  function: stock_yjyg_em
+  needs_ticker: false
+  args:
+    date: "{latest_quarter}"
+  description: 业绩预告汇总
+
+- id: yjkb
+  keywords: [业绩快报, 快报]
+  function: stock_yjkb_em
+  needs_ticker: false
+  args:
+    date: "{latest_quarter}"
+  description: 业绩快报汇总
+
+- id: yjbb
+  keywords: [业绩报表, 业绩, 季报, 年报汇总]
+  function: stock_yjbb_em
+  needs_ticker: false
+  args:
+    date: "{latest_quarter}"
+  description: 业绩报表汇总
+
+- id: zt_pool
+  keywords: [涨停, 涨停池, 涨停板, 涨停股, 今日涨停, 哪些涨停了, 涨停了几个]
+  function: stock_zt_pool_em
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 涨停池(东方财富)
+
+- id: zt_pool_strong
+  keywords: [强势涨停, 强势股, 连板, 连续涨停]
+  function: stock_zt_pool_strong_em
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 强势涨停池
+
+- id: dt_pool
+  keywords: [跌停, 跌停池, 跌停板, 跌停股, 今日跌停, 炸板池, 炸板]
+  function: stock_zt_pool_dtgc_em
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 跌停池(东方财富)
+
+- id: stock_changes
+  keywords: [异动, 盘中异动, 急涨, 急跌, 大笔买入, 大笔卖出, 股票异动]
+  function: stock_changes_em
+  needs_ticker: false
+  args: {}
+  description: 盘中异动(东方财富)
+
+- id: top10_holders
+  keywords: [前十大流通股东, 十大股东, 流通股东, 机构持仓, 基金持仓, 谁在持仓, 机构在买什么, 大股东是谁]
+  function: stock_gdfx_free_top_10_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker_sh_sz_prefix}"
+  description: 前十大流通股东
+
+- id: shareholder_count
+  keywords: [股东户数, 股东人数, 散户集中度, 筹码集中, 筹码分布, 散户多不多, 股东变化]
+  function: stock_zh_a_gdhs_detail_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股股东户数变化(东方财富)
+
+- id: individual_info
+  keywords: [个股信息, 公司信息, 公司简介, 公司资料, 公司概况, 是做什么的, 什么公司, 主营业务, 这家公司干嘛的, 市值多少, 基本面]
+  function: stock_individual_info_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股基本信息(东方财富)
+  fallbacks:
+    - function: stock_individual_spot_xq
+      source: xueqiu
+      args:
+        symbol: "{ticker_cn_prefix}"
+      note: 雪球实时快照，含市值/估值字段，但没有东财的行业与上市日期
+
+- id: pledge_ratio
+  keywords: [股权质押, 质押比例, 质押率, 质押风险, 爆仓风险, 质押了多少]
+  function: stock_gpzy_pledge_ratio_em
+  needs_ticker: false
+  args: {}
+  description: 股权质押比例一览
+
+- id: jgdy
+  keywords: [机构调研, 调研, 机构来访, 投资者关系]
+  function: stock_jgdy_detail_em
+  needs_ticker: false
+  args: {}
+  description: 机构调研明细
+
+- id: fhps
+  keywords: [分红, 分红配送, 派息, 送股, 转增, 高送转]
+  function: stock_fhps_em
+  needs_ticker: false
+  args:
+    date: ""
+  description: 分红配送汇总
+
+# ============== P1 Intents ==============
+
+- id: financial_indicator
+  keywords: [财务指标, ROE, roe, ROA, roa, 杜邦分析, 净资产收益率, 总资产收益率, 毛利率趋势]
+  function: stock_financial_analysis_indicator
+  needs_ticker: true
+  ticker_format: cn6
+  args:
+    symbol: "{ticker6}"
+  description: 个股财务分析指标(巨潮)
+
+- id: us_hist
+  keywords: [美股行情, 美股走势, 美股历史, 纳斯达克, 纽约]
+  function: stock_us_hist
+  needs_ticker: true
+  args:
+    symbol: "{ticker}"
+    period: "daily"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+    adjust: ""
+  description: 美股历史行情
+  fallbacks:
+    - function: stock_us_daily
+      source: sina
+      args:
+        symbol: "{ticker}"
+        adjust: "qfq"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, volume: 成交量}
+        tail: 250
+
+- id: ipo_dxsyl
+  keywords: [打新, 打新收益, 新股收益, 打新收益率]
+  function: stock_dxsyl_em
+  needs_ticker: false
+  args: {}
+  description: 打新收益率(东方财富)
+
+- id: ipo_xgsglb
+  keywords: [新股, 新股申购, 新股列表, IPO, ipo]
+  function: stock_xgsglb_em
+  needs_ticker: false
+  args:
+    symbol: "全部股票"
+  description: 新股申购列表
+
+- id: esg
+  keywords: [ESG, esg, 社会责任, 环境评级, 治理评级]
+  function: stock_esg_hz_sina
+  needs_ticker: false
+  args: {}
+  description: ESG评级汇总(新浪)
+
+- id: analyst_rank
+  keywords: [分析师排名, 分析师, 金牌分析师, 分析师评级排名]
+  function: stock_analyst_rank_em
+  needs_ticker: false
+  args: {}
+  description: 分析师排名(东方财富)
+
+- id: hist_a
+  keywords: [A股行情, A股走势, 走势, 日K, 日k, 周K, 月K, K线, k线, 历史行情, 股价走势, 最近行情]
+  function: stock_zh_a_hist
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+    period: "daily"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+    adjust: "qfq"
+  description: A股历史行情(东方财富)
+  fallbacks:
+    - function: stock_zh_a_hist_tx
+      source: tencent
+      args:
+        symbol: "{ticker_sh_sz_prefix}"
+        start_date: "{start_date}"
+        end_date: "{end_date}"
+        adjust: "qfq"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, volume: 成交量, amount: 成交额, turnover: 换手率}
+        tail: 250
+    - function: stock_zh_a_daily
+      source: sina
+      args:
+        symbol: "{ticker_sh_sz_prefix}"
+        start_date: "{start_date_dash}"
+        end_date: "{end_date_dash}"
+        adjust: "qfq"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, volume: 成交量, amount: 成交额, turnover: 换手率}
+        tail: 250
+
+- id: hist_hk
+  keywords: [港股行情, 港股走势, 港股日K, 港股历史]
+  function: stock_hk_hist
+  needs_ticker: true
+  ticker_format: hk5
+  args:
+    symbol: "{ticker5}"
+    period: "daily"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+    adjust: ""
+  description: 港股历史行情(东方财富)
+  fallbacks:
+    - function: stock_hk_daily
+      source: sina
+      args:
+        symbol: "{ticker5}"
+        adjust: "qfq"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, volume: 成交量, amount: 成交额}
+        tail: 250
+
+- id: circulate_holder
+  keywords: [流通股东, 流通股股东, 十大流通股]
+  function: stock_circulate_stock_holder
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 流通股东明细(巨潮)
+
+- id: fund_holder
+  keywords: [基金重仓, 基金持仓明细, 基金股东]
+  function: stock_fund_stock_holder
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 基金持仓明细(巨潮)
+
+- id: main_holder
+  keywords: [主要股东, 大股东, 控股股东, 实控人]
+  function: stock_main_stock_holder
+  needs_ticker: true
+  args:
+    stock: "{ticker6}"
+  description: 主要股东明细(巨潮)
+
+# ============== P0 — 板块成分 ==============
+
+- id: board_concept_cons
+  keywords: [概念成分股, 概念板块成分, 板块有哪些股票, 概念股有哪些, 板块包含, 概念有哪些股, 成分股列表]
+  function: stock_board_concept_cons_em
+  needs_ticker: false
+  args:
+    symbol: "{board_name}"
+  description: 概念板块成分股列表
+
+- id: board_industry_cons
+  keywords: [行业成分股, 行业板块成分, 行业有哪些股票, 行业包含哪些]
+  function: stock_board_industry_cons_em
+  needs_ticker: false
+  args:
+    symbol: "{board_name}"
+  description: 行业板块成分股列表
+
+# ============== P0 — 指数行情 ==============
+
+- id: index_spot_a
+  keywords: [上证指数, 深证成指, 创业板指, 沪深300, 中证500, 中证1000, 指数实时, 大盘指数, 指数行情]
+  function: stock_zh_index_spot_em
+  needs_ticker: false
+  args:
+    symbol: "上证系列指数"
+  description: A股指数实时行情
+  fallbacks:
+    - function: stock_zh_index_spot_sina
+      source: sina
+      args: {}
+      note: 新浪全量指数快照，无东财的分系列筛选
+
+- id: index_spot_hk
+  keywords: [恒生指数, 恒指, 港股指数, 国企指数, 恒生科技]
+  function: stock_hk_index_spot_em
+  needs_ticker: false
+  args: {}
+  description: 港股指数实时行情
+  fallbacks:
+    - function: stock_hk_index_spot_sina
+      source: sina
+      args: {}
+      post:
+        sort_first:
+          代码: "{hk_index_symbol}"
+
+- id: index_hist_a
+  keywords: [指数走势, 指数历史, 大盘走势, 指数K线]
+  function: stock_zh_index_daily_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker}"
+    start_date: "{start_date}"
+    end_date: "{end_date}"
+  description: A股指数历史K线
+  fallbacks:
+    - function: stock_zh_index_daily_tx
+      source: tencent
+      args:
+        symbol: "{index_sh_sz_prefix}"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, amount: 成交额}
+        tail: 250
+    - function: stock_zh_index_daily
+      source: sina
+      args:
+        symbol: "{index_sh_sz_prefix}"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, volume: 成交量}
+        tail: 250
+
+- id: index_hist_hk
+  keywords: [恒生指数走势, 港股指数历史, 恒指走势]
+  function: stock_hk_index_daily_em
+  # 新浪回退用问题里的指数名判定 symbol，缺 ticker 不应整条 intent 被跳过
+  needs_ticker: false
+  args:
+    symbol: "{ticker}"
+  description: 港股指数历史K线
+  fallbacks:
+    - function: stock_hk_index_daily_sina
+      source: sina
+      args:
+        symbol: "{hk_index_symbol}"
+      post:
+        date_column: date
+        rename: {date: 日期, open: 开盘, close: 收盘, high: 最高, low: 最低, volume: 成交量, amount: 成交额}
+        tail: 250
+      note: 指数由问题中的关键词判定(恒生指数/国企指数/恒生科技)，不走 ticker
+
+# ============== P0 — 行业/概念资金流 ==============
+
+- id: sector_fund_flow_rank
+  keywords: [行业资金流, 行业资金排名, 板块资金流向, 哪个行业资金流入, 行业净流入排名]
+  function: stock_sector_fund_flow_rank
+  needs_ticker: false
+  args:
+    indicator: "今日"
+    sector_type: "行业资金流"
+  description: 行业资金流排名
+  fallbacks:
+    - function: stock_fund_flow_industry
+      source: ths
+      args:
+        symbol: "即时"
+      note: 同花顺行业资金流即时排名，口径与东财"今日"不同
+
+- id: sector_fund_flow_summary
+  keywords: [板块资金汇总, 行业资金汇总, 板块资金明细]
+  function: stock_sector_fund_flow_summary
+  needs_ticker: false
+  args:
+    symbol: "{board_name}"
+    indicator: "今日"
+  description: 单个板块资金流汇总
+
+- id: sector_fund_flow_hist
+  keywords: [板块资金历史, 行业资金历史, 板块资金走势]
+  function: stock_sector_fund_flow_hist
+  needs_ticker: false
+  args:
+    symbol: "{board_name}"
+  description: 单个板块资金流历史
+
+- id: concept_fund_flow
+  keywords: [概念资金流, 概念板块资金流, 题材资金流向, 概念资金流向]
+  function: stock_fund_flow_concept
+  needs_ticker: false
+  args:
+    symbol: "即时"
+  description: 概念板块资金流(即时)
+
+- id: industry_fund_flow
+  keywords: [行业资金流向即时, 行业板块资金即时]
+  function: stock_fund_flow_industry
+  needs_ticker: false
+  args:
+    symbol: "即时"
+  description: 行业板块资金流(即时)
+
+# ============== P1 — 涨跌停扩展 ==============
+
+- id: zt_pool_zbgc
+  keywords: [炸板股, 炸板详情, 封板失败, 开板]
+  function: stock_zt_pool_zbgc_em
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 炸板池详情(东方财富)
+
+- id: zt_pool_previous
+  keywords: [昨日涨停, 昨天涨停, 涨停次日表现, 昨日连板]
+  function: stock_zt_pool_previous_em
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 昨日涨停今日表现
+
+- id: zt_pool_sub_new
+  keywords: [次新涨停, 次新股涨停, 新股涨停]
+  function: stock_zt_pool_sub_new_em
+  needs_ticker: false
+  args:
+    date: "{today}"
+  description: 次新股涨停池
+
+# ============== P1 — AH股 ==============
+
+- id: ah_spot
+  keywords: [AH溢价, AH股, AH比价, AH溢价率, A+H]
+  function: stock_zh_ah_spot
+  needs_ticker: false
+  args: {}
+  description: AH股实时比价/溢价率
+
+- id: ah_hist
+  keywords: [AH历史溢价, AH股走势, AH比价历史]
+  function: stock_zh_ah_daily
+  needs_ticker: true
+  ticker_format: hk5
+  args:
+    symbol: "{ticker5}"
+  description: AH股历史比价走势
+
+# ============== P1 — 财务摘要 ==============
+
+- id: financial_abstract
+  keywords: [财务摘要, 快速财务, 财务概要, 财务一览]
+  function: stock_financial_abstract
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 财务摘要(巨潮)
+
+# ============== P1 — 管理层持股 ==============
+
+- id: hold_management
+  keywords: [高管持股明细, 管理层持股, 董事持股, 高管买了多少]
+  function: stock_hold_management_detail_em
+  needs_ticker: false
+  args: {}
+  description: 管理层持股明细(东方财富)
+
+# ============== P1 — 盈利预测 ==============
+
+- id: profit_forecast
+  keywords: [盈利预测, 利润预测, 预测利润, 分析师预测, 一致预期, 明年利润]
+  function: stock_profit_forecast_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 盈利预测(东方财富)
+
+# ============== P2 — 科创板 ==============
+
+- id: kcb_spot
+  keywords: [科创板, 科创板行情, 科创板实时, "688"]
+  function: stock_zh_kcb_spot
+  needs_ticker: false
+  args: {}
+  description: 科创板实时行情
+
+# ============== P2 — 全球快讯 ==============
+
+- id: global_news_em
+  keywords: [股市新闻, 全球快讯, 市场新闻, 财经快讯, 今天新闻]
+  function: stock_info_global_em
+  needs_ticker: false
+  args: {}
+  description: 全球财经快讯(东方财富)
+
+- id: global_news_cls
+  keywords: [财联社快讯, 电报, 7x24快讯]
+  function: stock_info_global_cls
+  needs_ticker: false
+  args:
+    symbol: "全部"
+  description: 全球财经快讯(财联社)
+
+- id: global_news_futu
+  keywords: [富途快讯, 富途新闻]
+  function: stock_info_global_futu
+  needs_ticker: false
+  args: {}
+  description: 全球财经快讯(富途)
+
+- id: global_news_sina
+  keywords: [新浪快讯, 新浪财经新闻]
+  function: stock_info_global_sina
+  needs_ticker: false
+  args: {}
+  description: 全球财经快讯(新浪)
+
+- id: global_news_ths
+  keywords: [同花顺快讯, 同花顺新闻]
+  function: stock_info_global_ths
+  needs_ticker: false
+  args: {}
+  description: 全球财经快讯(同花顺)
+
+- id: stock_news
+  keywords: [个股新闻, 公司新闻, 个股资讯, 相关新闻]
+  function: stock_news_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股新闻资讯(东方财富)
+
+- id: stock_news_main
+  keywords: [主要新闻, 要闻, 头条新闻, 财经头条]
+  function: stock_news_main_cx
+  needs_ticker: false
+  args: {}
+  description: 财经要闻(财新)
+
+# ============== P2 — 市场情绪 ==============
+
+- id: comment_jgcyd
+  keywords: [机构参与度, 机构活跃度, 机构情绪]
+  function: stock_comment_detail_zlkp_jgcyd_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股机构参与度(东方财富)
+
+- id: comment_focus
+  keywords: [市场关注度, 个股关注度, 市场情绪, 关注热度]
+  function: stock_comment_detail_scrd_focus_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股市场关注度(东方财富)
+
+- id: comment_desire
+  keywords: [买入意愿, 散户意愿, 看涨看跌, 多空意愿, 买卖意愿]
+  function: stock_comment_detail_scrd_desire_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股散户买卖意愿(东方财富)
+
+- id: comment_score
+  keywords: [综合评分, 个股评分, 历史评分, 市场评价]
+  function: stock_comment_detail_zhpj_lspf_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股综合评分历史(东方财富)
+
+- id: comment_overview
+  keywords: [千股千评, 个股点评, 市场点评, 诊股]
+  function: stock_comment_em
+  needs_ticker: false
+  args: {}
+  description: 千股千评(东方财富)
+
+# ============== P2 — 分钟线 ==============
+
+- id: minute_a
+  keywords: [分钟线, 分时图, 分钟K线, 1分钟, 5分钟, 15分钟, 30分钟, 60分钟, 分时]
+  function: stock_zh_a_minute
+  needs_ticker: true
+  args:
+    symbol: "{ticker_sh_sz_prefix}"
+    period: "1"
+    adjust: ""
+  description: A股分钟线数据
+
+# ============== P2 — 龙虎榜细化 ==============
+
+- id: lhb_stock_stat
+  keywords: [龙虎榜统计, 龙虎榜排名, 上榜次数, 龙虎榜频率, 龙虎榜次数最多, 龙虎榜统计排名]
+  function: stock_lhb_stock_statistic_em
+  needs_ticker: false
+  args:
+    symbol: "近一月"
+  description: 龙虎榜个股统计(近一月)
+
+- id: lhb_yyb
+  keywords: [营业部排名, 知名游资排名, 顶级游资排名, 营业部龙虎榜, 游资排行]
+  function: stock_lh_yyb_most
+  needs_ticker: false
+  args: {}
+  description: 营业部上榜排名
+
+# ============== P2 — 热度细化 ==============
+
+- id: hot_rank_latest
+  keywords: [个股热度趋势, 热度变化, 人气趋势]
+  function: stock_hot_rank_latest_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker_cn_prefix}"
+  description: 个股热度最新趋势(东方财富)
+
+- id: hot_rank_detail
+  keywords: [热度历史, 人气历史, 热度排名历史]
+  function: stock_hot_rank_detail_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker_cn_prefix}"
+  description: 个股热度排名历史(东方财富)
+
+# ============== P2 — 分红明细 ==============
+
+- id: fhps_detail
+  keywords: [分红明细, 历史分红, 分红记录, 每股分红]
+  function: stock_fhps_detail_em
+  needs_ticker: true
+  args:
+    symbol: "{ticker6}"
+  description: 个股历史分红明细(东方财富)
+
+# ============== P2 — 全市场股东户数 ==============
+
+- id: hold_num_all
+  keywords: [全市场股东户数, 股东户数排名, 股东户数统计, 全部股东户数, 全市场户数]
+  function: stock_hold_num_cninfo
+  needs_ticker: false
+  args:
+    date: "{latest_quarter}"
+  description: 全市场股东户数统计(巨潮)

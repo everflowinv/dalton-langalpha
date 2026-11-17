@@ -1,0 +1,1 @@
+# 只用标准库；Firecrawl 走公开 MCP 端点，无需 SDK
