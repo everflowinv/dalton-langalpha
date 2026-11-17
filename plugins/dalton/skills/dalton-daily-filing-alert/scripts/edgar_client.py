@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 HK = ZoneInfo("Asia/Hong_Kong")
 CIK_MAP_MAX_AGE = timedelta(days=7)
+CIK_MAP_CACHE_VERSION = 2
 ENRICH_CACHE_MAX = 4000
 
 ITEM_8K = {
@@ -94,6 +95,7 @@ _cik_lock = threading.Lock()
 _submissions_lock = threading.Lock()
 _enrich_lock = threading.Lock()
 _cik_map_cache: dict[str, str] | None = None
+_cik_ambiguous_cache: dict[str, list[str]] | None = None
 _submissions_cache: dict[str, dict[str, dict[str, str]]] = {}
 _enrich_cache: dict[str, Any] | None = None
 _read_text: Callable[[str], str | None] | None = None
@@ -113,10 +115,11 @@ def bind_state(
     write_text: Callable[[str, str], None],
 ) -> None:
     """Attach workspace state readers and clear in-process caches."""
-    global _read_text, _write_text, _cik_map_cache, _enrich_cache
+    global _read_text, _write_text, _cik_map_cache, _cik_ambiguous_cache, _enrich_cache
     _read_text = read_text
     _write_text = write_text
     _cik_map_cache = None
+    _cik_ambiguous_cache = None
     _enrich_cache = None
     _submissions_cache.clear()
 
@@ -202,41 +205,101 @@ def headline_self_check() -> None:
         raise AssertionError("EDGAR headline parser self-test failed")
 
 
+def _parse_cik_rows(data: Any) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Exact ticker -> CIK map; tickers with >1 distinct CIK are marked ambiguous."""
+    buckets: dict[str, set[str]] = {}
+    rows = data.values() if isinstance(data, dict) else []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("cik_str") is None:
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        cik_raw = str(row.get("cik_str")).strip()
+        if not ticker or not cik_raw or not cik_raw.isdigit():
+            continue
+        buckets.setdefault(ticker, set()).add(cik_raw.zfill(10))
+    mapping: dict[str, str] = {}
+    ambiguous: dict[str, list[str]] = {}
+    for ticker, ciks in buckets.items():
+        if len(ciks) == 1:
+            mapping[ticker] = next(iter(ciks))
+        else:
+            ambiguous[ticker] = sorted(ciks)
+    return mapping, ambiguous
+
+
+def _normalize_loaded_cik_cache(
+    raw_map: Any,
+    raw_ambiguous: Any = None,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    ambiguous: dict[str, list[str]] = {}
+    if isinstance(raw_ambiguous, dict):
+        for key, value in raw_ambiguous.items():
+            ticker = str(key).strip().upper()
+            if ticker and isinstance(value, list):
+                ciks = sorted({str(c).strip().zfill(10) for c in value if str(c).strip()})
+                if len(ciks) > 1:
+                    ambiguous[ticker] = ciks
+    mapping: dict[str, str] = {}
+    if isinstance(raw_map, dict):
+        for key, value in raw_map.items():
+            ticker = str(key).strip().upper()
+            cik = str(value).strip().zfill(10) if str(value).strip().isdigit() else str(value).strip()
+            if ticker and cik and ticker not in ambiguous:
+                mapping[ticker] = cik
+    return mapping, ambiguous
+
+
 def load_cik_map(force: bool = False) -> dict[str, str]:
     """Ticker to zero-padded CIK. Disk cache lasts 7 days."""
-    global _cik_map_cache
+    global _cik_map_cache, _cik_ambiguous_cache
     with _cik_lock:
         if _cik_map_cache is not None and not force:
             return _cik_map_cache
         if not force and _read_text is not None:
             cached = _read_cached_cik_map()
             if cached is not None:
-                _cik_map_cache = cached
+                _cik_map_cache, _cik_ambiguous_cache = cached
                 return _cik_map_cache
         mapping: dict[str, str] = {}
+        ambiguous: dict[str, list[str]] = {}
         fetched_ok = False
         try:
             data = _fetch_json("https://www.sec.gov/files/company_tickers.json", timeout=30)
-            rows = data.values() if isinstance(data, dict) else []
-            for row in rows:
-                if not isinstance(row, dict) or not row.get("ticker") or row.get("cik_str") is None:
-                    continue
-                mapping[str(row["ticker"]).upper()] = str(row["cik_str"]).zfill(10)
+            mapping, ambiguous = _parse_cik_rows(data)
             fetched_ok = True
         except Exception as exc:  # noqa: BLE001 - a ticker-map fetch failure falls back to the stale cache
-            mapping = _stale_cik_map()
-            if not mapping:
+            mapping, ambiguous = _stale_cik_map()
+            if not mapping and not ambiguous:
                 raise RuntimeError("SEC ticker map unavailable") from exc
-        if fetched_ok and mapping and _write_text is not None:
+        if fetched_ok and (mapping or ambiguous) and _write_text is not None:
             _write_text(
                 "cik_map.json",
-                json.dumps({"fetched_at": _now().isoformat(), "map": mapping}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "fetched_at": _now().isoformat(),
+                        "version": CIK_MAP_CACHE_VERSION,
+                        "map": mapping,
+                        "ambiguous": ambiguous,
+                    },
+                    ensure_ascii=False,
+                ),
             )
         _cik_map_cache = mapping
+        _cik_ambiguous_cache = ambiguous
         return _cik_map_cache
 
 
-def _read_cached_cik_map() -> dict[str, str] | None:
+def resolve_cik(ticker: str) -> tuple[str, list[str]]:
+    """Return ``(unique_cik, ambiguous_ciks)`` using exact ticker matching."""
+    symbol = ticker.strip().upper()
+    mapping = load_cik_map()
+    ambiguous = (_cik_ambiguous_cache or {}).get(symbol, [])
+    if ambiguous:
+        return "", list(ambiguous)
+    return mapping.get(symbol, ""), []
+
+
+def _read_cached_cik_map() -> tuple[dict[str, str], dict[str, list[str]]] | None:
     if _read_text is None:
         return None
     raw = _read_text("cik_map.json")
@@ -244,30 +307,35 @@ def _read_cached_cik_map() -> dict[str, str] | None:
         return None
     try:
         blob = json.loads(raw)
+        if not isinstance(blob, dict) or blob.get("version") != CIK_MAP_CACHE_VERSION:
+            return None
+        if not isinstance(blob.get("map"), dict) or not isinstance(blob.get("ambiguous"), dict):
+            return None
         fetched = datetime.fromisoformat(str(blob.get("fetched_at", "")))
         if fetched.tzinfo is None:
             fetched = fetched.replace(tzinfo=HK)
-        if _now() - fetched < CIK_MAP_MAX_AGE and isinstance(blob.get("map"), dict):
-            return {str(key).upper(): str(value) for key, value in blob["map"].items()}
+        if _now() - fetched < CIK_MAP_MAX_AGE:
+            return _normalize_loaded_cik_cache(blob["map"], blob["ambiguous"])
     except (ValueError, json.JSONDecodeError, OSError, TypeError):
         return None
     return None
 
 
-def _stale_cik_map() -> dict[str, str]:
+def _stale_cik_map() -> tuple[dict[str, str], dict[str, list[str]]]:
     if _read_text is None:
-        return {}
+        return {}, {}
     raw = _read_text("cik_map.json")
     if not raw:
-        return {}
+        return {}, {}
     try:
         blob = json.loads(raw)
     except (json.JSONDecodeError, OSError):
-        return {}
-    mapping = blob.get("map", {})
-    if not isinstance(mapping, dict):
-        return {}
-    return {str(key).upper(): str(value) for key, value in mapping.items()}
+        return {}, {}
+    if not isinstance(blob, dict) or blob.get("version") != CIK_MAP_CACHE_VERSION:
+        return {}, {}
+    if not isinstance(blob.get("map"), dict) or not isinstance(blob.get("ambiguous"), dict):
+        return {}, {}
+    return _normalize_loaded_cik_cache(blob["map"], blob["ambiguous"])
 
 
 def _at(values: list, index: int) -> str:
@@ -336,8 +404,15 @@ def form_matches(form: str, requested: str) -> bool:
 
 def list_recent_filings(ticker: str, forms: list[str], limit_per_form: int = 5) -> dict[str, Any]:
     """Up to ``limit_per_form`` newest filings per watched form, before the date cutoff."""
-    symbol = ticker.upper()
-    cik = load_cik_map().get(symbol, "")
+    symbol = ticker.strip().upper()
+    cik, ambiguous_ciks = resolve_cik(symbol)
+    if ambiguous_ciks:
+        return {
+            "cik": "",
+            "filings": [],
+            "errors": [f"ambiguous CIK for {symbol}: {', '.join(ambiguous_ciks)}"],
+            "ambiguous_ciks": ambiguous_ciks,
+        }
     if not cik:
         return {"cik": "", "filings": [], "errors": [f"no CIK for {symbol}"]}
     try:
@@ -872,7 +947,12 @@ def enrich_filing(
         cached.pop("_ts", None)
         if cached.get("headline") or cached.get("body_excerpt") or (cached.get("parsed") or {}).get("summary"):
             return cached
-    resolved = cik or load_cik_map().get(ticker.upper(), "")
+    if cik:
+        resolved = cik
+    else:
+        resolved, ambiguous_ciks = resolve_cik(ticker)
+        if ambiguous_ciks:
+            return {"enrich_error": f"ambiguous CIK for {ticker.strip().upper()}: {', '.join(ambiguous_ciks)}"}
     if not resolved:
         return {"enrich_error": f"no CIK for {ticker}"}
     try:

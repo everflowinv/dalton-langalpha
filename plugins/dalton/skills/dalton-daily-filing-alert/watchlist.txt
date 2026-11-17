@@ -1,11 +1,11 @@
 # Company Filings Alert - SEC Watchlist
-# Updated: 2026-03-16
+# Updated: 2026-11-17
 
 # Fintech
 AFRM
 
 # Media/Telecom
-SATS
+ECHO
 
 # China ADR
 BABA
@@ -52,3 +52,33 @@ RBLX
 
 # Insurance
 PGR
+
+# 讨论过 / 覆盖中
+CRWV
+IBKR
+HOOD
+UBER
+CART
+BKNG
+RDDT
+TSLA
+KSPI
+
+# 优质生意筛选第一档（标普）
+V
+MA
+COST
+ISRG
+IDXX
+CDNS
+MNST
+MSCI
+GE
+
+# 优质生意筛选 v3 新进第二档（非标普）
+SHOP
+TW
+SAP
+HEI
+WSE
+BAM
