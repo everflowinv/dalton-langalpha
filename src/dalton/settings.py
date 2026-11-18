@@ -718,6 +718,16 @@ def get_xai_oauth_client_id() -> str:
 # cli-chat-proxy rejects clients below its minimum with HTTP 426 (1.0.4 was refused on
 # 2026-10-23, minimum 1.0.13). Track the installed Grok CLI; override with the env var.
 DEFAULT_XAI_GROK_CLIENT_VERSION = "1.0.67"
+# The Codex backend hides models newer than the client it believes it serves:
+# at 0.164.0 a ChatGPT subscription lists no GPT-6.2 model, at 0.170.0 it lists
+# both (2026-11-18). One value for the request path and the model list.
+DEFAULT_CODEX_CLIENT_VERSION = "0.170.0"
+
+
+def get_codex_client_version() -> str:
+    """Return the Codex CLI version Dalton presents to the codex backend."""
+    raw = os.getenv("DALTON_CODEX_CLIENT_VERSION", "").strip()
+    return raw or DEFAULT_CODEX_CLIENT_VERSION
 
 
 def get_xai_grok_client_version() -> str:

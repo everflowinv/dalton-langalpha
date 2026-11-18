@@ -299,7 +299,9 @@ class TestListUrl:
             info, api_key="tok",
             token_headers=SUBSCRIPTIONS["codex-oauth"].request_headers(token),
         )
-        version = info["client_version"]
+        # DALTON-HOOK(codex-client-version): the version comes from Dalton's setting, not the manifest
+        from src.llms.extension.codex import codex_client_version
+        version = codex_client_version()
         assert req.url.endswith(f"/models?client_version={version}")
         assert req.headers["User-Agent"] == f"codex_cli_rs/{version}"
         assert req.headers["originator"] == "codex_cli_rs"

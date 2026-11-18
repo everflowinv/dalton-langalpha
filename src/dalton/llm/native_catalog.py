@@ -106,7 +106,9 @@ FETCH_TIMEOUT_S = 15.0
 # The codex backend filters newer models out of /models unless client_version
 # >= 0.155.0 (wire-verified by lead); pin a recent codex_cli_rs release so the
 # full list comes back, and send the same version in the User-Agent.
-CODEX_LIST_CLIENT_VERSION = "0.164.0"
+# Same version as the request path (src.dalton.settings.get_codex_client_version).
+from src.dalton.settings import DEFAULT_CODEX_CLIENT_VERSION as CODEX_LIST_CLIENT_VERSION  # noqa: E402,F401
+from src.dalton.settings import get_codex_client_version  # noqa: E402
 
 # Display names for the settings card; order fixes the card's row order.
 NATIVE_LISTING_PROVIDERS: dict[str, str] = {
@@ -227,7 +229,7 @@ async def fetch_codex_models(
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
         "originator": "codex_cli_rs",
-        "User-Agent": f"codex_cli_rs/{CODEX_LIST_CLIENT_VERSION}",
+        "User-Agent": f"codex_cli_rs/{get_codex_client_version()}",
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
@@ -236,7 +238,7 @@ async def fetch_codex_models(
         resp = await c.get(
             f"{base_url.rstrip('/')}/models",
             headers=headers,
-            params={"client_version": CODEX_LIST_CLIENT_VERSION},
+            params={"client_version": get_codex_client_version()},
         )
         resp.raise_for_status()
         payload = resp.json()
