@@ -558,9 +558,9 @@ tasks:
     no_output_timeout_seconds: 300
     output_max_bytes: 50000
     cwd: "var/dalton/openclaw-data"
-    command: "/Users/everflow/.openclaw/workspace/skills/company-wiki/venv/bin/python -I scripts/gs_pb_weekly.py run --json"
+    command: "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python -I scripts/gs_pb_weekly.py run --json"
     command_argv:
-      - "/Users/everflow/.openclaw/workspace/skills/company-wiki/venv/bin/python"
+      - "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python"
       - "-I"
       - "scripts/gs_pb_weekly.py"
       - "run"

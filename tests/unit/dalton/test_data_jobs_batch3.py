@@ -145,9 +145,9 @@ BATCH3_EXPECTATIONS: dict[str, dict[str, object]] = {
         "output_max_bytes": 50000,
         "runner": "host",
         "host_mode": "run",
-        "command": f"{WS}/skills/company-wiki/venv/bin/python -I scripts/gs_pb_weekly.py run --json",
+        "command": "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python -I scripts/gs_pb_weekly.py run --json",
         "command_argv": [
-            f"{WS}/skills/company-wiki/venv/bin/python",
+            "/Users/everflow/.local/share/everflow-tools/venvs/gs-pb/bin/python",
             "-I",
             "scripts/gs_pb_weekly.py",
             "run",
