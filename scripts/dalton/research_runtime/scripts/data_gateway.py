@@ -332,6 +332,31 @@ def _ticker_company_name(ticker):
         return None
 
 
+def _page_error_text(raw):
+    """Flatten a JSON error body into plain text so the bridge sees `status_code=429` and decoded Chinese."""
+    if isinstance(raw, dict):
+        obj = raw
+    else:
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) and raw.strip().startswith("{") else None
+        except ValueError:
+            obj = None
+    if not isinstance(obj, dict):
+        return raw
+    inner = obj.get("error") if isinstance(obj.get("error"), dict) else {}
+    parts = []
+    for src in (obj, inner):
+        for key in ("status_code", "status", "error_code", "code"):
+            val = src.get(key)
+            if isinstance(val, (str, int)) and not isinstance(val, bool) and str(val):
+                parts.append(f"{key}={val}")
+        for key in ("error", "message", "detail"):
+            val = src.get(key)
+            if isinstance(val, str) and val:
+                parts.append(val)
+    return " ".join(parts)[:300] or json.dumps(obj, ensure_ascii=False)[:300]
+
+
 def fetch_transcripts(reg, args, fallback_cmd):
     """只用 AlphaEngine 业绩会稿（roic.ai 已停用）；只返回清单，正文按 doc_id 另行读取。"""
     ae_route = next(r for r in reg["routes"] if r["id"] == "alphaengine")
@@ -348,10 +373,29 @@ def fetch_transcripts(reg, args, fallback_cmd):
     ae_args = argparse.Namespace(operation="search_library", query=" ".join(query_names) or names[-1],
                                  start=start, end=end, limit=50, timeout=args.timeout,
                                  params_json=json.dumps({"type_ids": [TRANSCRIPT_TYPE_ID], "include_snippets": False}))
-    items, cursors, warnings = [], set(), []
+    items, cursors, warnings, page_errors = [], set(), [], []
     for page in range(10):
         primary = native_request(ae_route, ae_args, True)
         if not primary.get("ok"):
+            page_err = primary.get("error") or "".join(
+                c.get("text", "") for c in (primary.get("data") or {}).get("content", [])
+            )
+            if not page_err and isinstance(primary.get("data"), dict):
+                sc_err = primary["data"].get("structuredContent")
+                if isinstance(sc_err, dict):
+                    page_err = str(
+                        sc_err.get("error") or sc_err.get("message") or sc_err.get("status") or ""
+                    )[:300]
+            # Parse the full body first; truncating before json.loads breaks long escaped errors.
+            page_err = _page_error_text(page_err)
+            if isinstance(page_err, str):
+                page_err = page_err[:300]
+            page_errors.append(
+                {
+                    "page": page + 1,
+                    "error": str(page_err or primary.get("status") or "alphaengine_error"),
+                }
+            )
             if items:
                 warnings.append("后续检索页失败，当前结果不完整")
             break
@@ -369,6 +413,8 @@ def fetch_transcripts(reg, args, fallback_cmd):
         ae_args.params_json = json.dumps(params)
     coverage = {"pages_scanned": page + 1, "records_scanned": len(items),
                 "complete": not warnings and bool(primary.get("ok")), "warnings": warnings}
+    if page_errors:
+        coverage["page_errors"] = page_errors
     if warnings:
         continuation = json.loads(ae_args.params_json)
         if primary.get("ok") and payload.get("cursor"):
@@ -398,12 +444,22 @@ def fetch_transcripts(reg, args, fallback_cmd):
         del c["_tight"]
     candidates.sort(key=lambda x: x.get("publish_time") or "", reverse=True)
     if candidates:
-        return {"ok": True, "status": "partial" if warnings else "ok", "data": {
-            "ok": True, "source": "alphaengine", "type_id": TRANSCRIPT_TYPE_ID, "names_matched": names,
+        data_out = {
+            "ok": True,
+            "source": "alphaengine",
+            "type_id": TRANSCRIPT_TYPE_ID,
+            "names_matched": names,
             "coverage": coverage,
             "transcripts": candidates[:args.limit],
             "read_with": 'research(route="alphaengine", operation="get_document", params={"doc_id": "<doc_id>"})',
-            "note": "ASR 稿，引用时标注转写误差，截掉末尾重复段；broker_callback 是券商回访，不是公司电话会。全文额度有限，只读需要的期次。"}}
+            "note": "ASR 稿，引用时标注转写误差，截掉末尾重复段；broker_callback 是券商回访，不是公司电话会。全文额度有限，只读需要的期次。",
+        }
+        if page_errors:
+            data_out["page_errors"] = page_errors
+        out = {"ok": True, "status": "partial" if warnings else "ok", "data": data_out}
+        if page_errors:
+            out["page_errors"] = page_errors
+        return out
     error_text = None if primary.get("ok") else primary.get("error") or "".join(
         c.get("text", "") for c in (primary.get("data") or {}).get("content", []))[:300] or None
     # roic.ai 自 2026-08 整站 403，已停用兜底：AlphaEngine 无结果就如实返回。
