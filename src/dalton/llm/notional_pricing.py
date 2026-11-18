@@ -22,6 +22,8 @@ _FALLBACK_OAUTH_CARDS: dict[str, dict[str, float]] = {
     "claude-opus-5-5-high-oauth": {"input": 5.0, "output": 25.0, "cached_input": 0.5},
     "gpt-6-astra-oauth": {"input": 10.0, "output": 50.0, "cached_input": 1.0},
     "gpt-6.1-sol-oauth": {"input": 2.0, "output": 10.0, "cached_input": 0.1},
+    "gpt-6.2-astra-oauth": {"input": 8.0, "output": 40.0, "cached_input": 0.4},
+    "gpt-6.2-sol-oauth": {"input": 2.0, "output": 10.0, "cached_input": 0.1},
     "gemini-4-argon-high-oauth": {"input": 2.0, "output": 10.0, "cached_input": 0.1},
     "gemini-3.8-flash-medium-oauth": {"input": 0.75, "output": 3.75, "cached_input": 0.075},
     "gemini-3.8-flash-low-oauth": {"input": 0.75, "output": 3.75, "cached_input": 0.075},

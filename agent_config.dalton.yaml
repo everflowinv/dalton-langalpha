@@ -16,7 +16,7 @@ llm:
   fallback:
     - "gemini-4-argon-high-oauth"
     - "muse-wonder-1.0-oauth"
-    - "gpt-6.1-sol-oauth"
+    - "gpt-6.2-sol-oauth"
 
 sandbox:
   provider: "docker"

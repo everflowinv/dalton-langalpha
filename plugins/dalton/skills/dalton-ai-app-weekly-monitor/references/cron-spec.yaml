@@ -3,7 +3,7 @@ automations:
   - name: ai-app-db-refresh
     schedule: "0 16 * * 2"
     tz: Asia/Hong_Kong
-    model: gpt-6.1-sol-oauth
+    model: gpt-6.2-sol-oauth
     report_profile: ai-app-weekly
     report_run_id: ai-app-db-refresh-<tuesday>
     success: NO_REPLY
@@ -16,7 +16,7 @@ automations:
   - name: ai-app-weekly
     schedule: "0 15 * * 5"
     tz: Asia/Hong_Kong
-    model: gpt-6-astra-oauth
+    model: gpt-6.2-astra-oauth
     report_profile: ai-app-weekly
     report_run_id: ai-app-weekly-<friday>
     success: NO_REPLY

@@ -1,6 +1,6 @@
 ---
 description: Independent reviewer for a Dalton draft. Judges argument, evidence and implications; read-only; verdict pass or revise with reasons.
-model: gpt-6.1-sol-oauth
+model: gpt-6.2-sol-oauth
 effort: high
 tools: [web]
 preferred_skills: [dalton-conventions, dalton-knowledge]

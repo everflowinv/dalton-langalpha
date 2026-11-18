@@ -193,7 +193,7 @@ def test_frontmatter_registry_profile_and_hard_rule() -> None:
     ):
         assert sentence in rules
     assert rules.strip().endswith("沿用原有子任务权限与限制。")
-    assert "gpt-6.1-sol-oauth" in body
+    assert "gpt-6.2-sol-oauth" in body
 
 
 def test_skill_tree_has_no_recipient_and_config_has_three_keys() -> None:
