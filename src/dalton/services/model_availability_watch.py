@@ -20,7 +20,9 @@ import httpx
 
 from src.dalton.credentials import credential_user_id, get_configured_pm_user_ids
 from src.dalton.database.provider_events import sanitize_error_text
+from src.dalton.llm import native_catalog
 from src.dalton.llm.native_catalog import NATIVE_LISTING_PROVIDERS
+from src.dalton.llm.overlay import load_dalton_meta
 from src.dalton.settings import get_codex_client_version
 from src.llms.llm import LLM
 from src.server.services.llm import egress
@@ -37,13 +39,15 @@ CORE_SUBSCRIPTION_PROVIDERS: tuple[str, ...] = (
     "xai-oauth",
 )
 
-# Providers whose upstream listing protocol is implemented in ``provider_models.wire``.
-# Antigravity (v1internal:fetchAvailableModels), xAI (CLI proxy headers), and UNSUPPORTED_PROVIDERS
-# are excluded until wire listing supports them rather than treated as healthy.
+# Providers whose upstream listing protocol is supported by availability watch.
+# Codex and Claude use ``provider_models.service.available_models`` (``provider_models.wire``);
+# Antigravity uses ``native_catalog.fetch_antigravity_models`` (``v1internal:fetchAvailableModels``).
+# xAI (CLI proxy headers) and UNSUPPORTED_PROVIDERS stay excluded until supported.
 SUPPORTED_AVAILABILITY_PROVIDERS: frozenset[str] = frozenset(
     {
         "codex-oauth",
         "claude-oauth",
+        "antigravity-oauth",
     }
 )
 
@@ -99,6 +103,137 @@ def _is_visible_provider_model(mc: Any, model_key: str, provider: str) -> bool:
         isinstance(entry, dict)
         and entry.get("visible")
         and entry.get("provider") == provider
+    )
+
+
+def _is_awaiting_release(dalton_meta: dict[str, dict[str, Any]], model_key: str) -> bool:
+    return bool((dalton_meta.get(model_key) or {}).get("awaiting_release"))
+
+
+def _awaiting_release_prefix(model_id: str) -> str:
+    """Strip the trailing ``-<tier>`` segment from an ``awaiting_release`` model_id."""
+    raw = str(model_id or "").strip()
+    if not raw or "-" not in raw:
+        return raw
+    base, suffix = raw.rsplit("-", 1)
+    if base and suffix and not suffix[:1].isdigit():
+        return base
+    return raw
+
+
+def _provider_awaiting_prefixes(
+    mc: Any,
+    dalton_meta: dict[str, dict[str, Any]],
+    provider: str,
+) -> list[str]:
+    prefixes: set[str] = set()
+    for key, entry in (getattr(mc, "llm_config", None) or {}).items():
+        if not isinstance(entry, dict) or entry.get("provider") != provider:
+            continue
+        # Awaiting-release models stay hidden (visible: false) until the subscription
+        # serves them, so the prefix watch covers them regardless of visibility.
+        if not _is_awaiting_release(dalton_meta, str(key)):
+            continue
+        prefix = _awaiting_release_prefix(str(entry.get("model_id") or key))
+        if prefix:
+            prefixes.add(prefix)
+    return sorted(prefixes)
+
+
+def _provider_configured_model_ids(mc: Any, provider: str) -> set[str]:
+    ids: set[str] = set()
+    for key, entry in (getattr(mc, "llm_config", None) or {}).items():
+        if not isinstance(entry, dict) or entry.get("provider") != provider:
+            continue
+        mid = str(entry.get("model_id") or key).strip()
+        if mid:
+            ids.add(mid)
+    return ids
+
+
+async def _fetch_antigravity_available_models(
+    user_id: str,
+    mc: Any,
+) -> pm_matching.ModelsResult:
+    """Fetch ``antigravity-oauth`` models via ``native_catalog.fetch_antigravity_models``."""
+    info = mc.get_provider_info("antigravity-oauth") or {}
+    try:
+        cred = await pm_service._resolve_credential(user_id, "antigravity-oauth", mc)
+    except pm_service._OAuthUnavailable as exc:
+        return pm_matching.build_result(
+            "antigravity-oauth",
+            "antigravity",
+            None,
+            mc,
+            reason=exc.reason,
+        )
+
+    base_url = cred.base_url or str(info.get("base_url") or "https://daily-cloudcode-pa.googleapis.com")
+    try:
+        upstream = await native_catalog.fetch_antigravity_models(
+            str(cred.api_key or ""),
+            base_url=base_url,
+        )
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        reason = pm_wire.UNAUTHORIZED if code in (401, 403) else pm_wire.BAD_RESPONSE
+        return pm_matching.build_result(
+            "antigravity-oauth",
+            "antigravity",
+            None,
+            mc,
+            holder=cred.holder,
+            base_url_saved=bool(cred.base_url),
+            reason=reason,
+        )
+    except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
+        return pm_matching.build_result(
+            "antigravity-oauth",
+            "antigravity",
+            None,
+            mc,
+            holder=cred.holder,
+            base_url_saved=bool(cred.base_url),
+            reason=pm_wire.UNREACHABLE,
+        )
+
+    served = pm_matching.served_models(
+        "antigravity-oauth",
+        mc,
+        holder=cred.holder,
+        base_url_saved=bool(cred.base_url),
+    )
+    configured_ids = _provider_configured_model_ids(mc, "antigravity-oauth")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for um in upstream:
+        if not um.id or um.id in seen:
+            continue
+        # Keep exact matches for every configured model_id (hidden awaiting-release
+        # models are not "served"); only unconfigured internal/non-chat ids are dropped.
+        if (
+            um.id not in served
+            and um.id not in configured_ids
+            and (um.internal or not pm_wire.is_chat_model(um.id))
+        ):
+            continue
+        seen.add(um.id)
+        item: dict[str, Any] = {
+            "id": um.id,
+            "display_name": um.display_name or um.id,
+        }
+        if um.context_window:
+            item["context_window"] = um.context_window
+        normalized.append(item)
+
+    return pm_matching.build_result(
+        "antigravity-oauth",
+        "antigravity",
+        normalized,
+        mc,
+        holder=cred.holder,
+        base_url_saved=bool(cred.base_url),
+        fetched_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -187,10 +322,12 @@ async def run_model_availability_check(
     """Check all connected subscription providers and run the Codex upgrade probe."""
     resolved_user_id = credential_user_id(user_id) if user_id else resolve_credential_holder_user_id()
     mc = LLM.get_model_config()
+    dalton_meta = load_dalton_meta() or {}
     checked_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     providers_report: dict[str, dict[str, Any]] = {}
     missing_by_provider: dict[str, list[str]] = {}
+    released_by_provider: dict[str, list[str]] = {}
     error_by_provider: dict[str, str] = {}
 
     for provider in iter_subscription_providers():
@@ -203,11 +340,17 @@ async def run_model_availability_check(
                 "ready": [],
                 "missing": [],
                 "missing_visible": [],
+                "missing_awaiting_release": [],
+                "released_configured": [],
+                "released_unconfigured": [],
             }
             continue
 
         try:
-            result = await pm_service.available_models(resolved_user_id, provider, refresh=True)
+            if provider == "antigravity-oauth":
+                result = await _fetch_antigravity_available_models(resolved_user_id, mc)
+            else:
+                result = await pm_service.available_models(resolved_user_id, provider, refresh=True)
         except pm_service.NotConnected:
             providers_report[provider] = {
                 "connected": False,
@@ -216,6 +359,9 @@ async def run_model_availability_check(
                 "ready": [],
                 "missing": [],
                 "missing_visible": [],
+                "missing_awaiting_release": [],
+                "released_configured": [],
+                "released_unconfigured": [],
             }
             continue
         except (pm_service.UnsupportedProvider, pm_service.UnknownProvider) as exc:
@@ -229,6 +375,9 @@ async def run_model_availability_check(
                 "ready": [],
                 "missing": [],
                 "missing_visible": [],
+                "missing_awaiting_release": [],
+                "released_configured": [],
+                "released_unconfigured": [],
             }
             error_by_provider[provider] = err_msg
             continue
@@ -242,6 +391,9 @@ async def run_model_availability_check(
                 "ready": [],
                 "missing": [],
                 "missing_visible": [],
+                "missing_awaiting_release": [],
+                "released_configured": [],
+                "released_unconfigured": [],
             }
             error_by_provider[provider] = err_msg
             continue
@@ -264,13 +416,71 @@ async def run_model_availability_check(
                 "ready": ready,
                 "missing": missing_raw,
                 "missing_visible": [],
+                "missing_awaiting_release": [],
+                "released_configured": [],
+                "released_unconfigured": [],
             }
             error_by_provider[provider] = err_msg
             continue
 
         missing_visible = sorted(
-            k for k in missing_raw if _is_visible_provider_model(mc, k, provider)
+            k
+            for k in missing_raw
+            if _is_visible_provider_model(mc, k, provider)
+            and not _is_awaiting_release(dalton_meta, k)
         )
+        missing_awaiting_release = sorted(
+            k
+            for k in missing_raw
+            if _is_visible_provider_model(mc, k, provider)
+            and _is_awaiting_release(dalton_meta, k)
+        )
+        released_configured = sorted(
+            k
+            for k in ready
+            if _is_visible_provider_model(mc, k, provider)
+            and _is_awaiting_release(dalton_meta, k)
+        )
+
+        awaiting_prefixes = _provider_awaiting_prefixes(mc, dalton_meta, provider)
+        configured_ids = _provider_configured_model_ids(mc, provider)
+        raw_other_ids = {
+            str(item.get("id") or "").strip()
+            for item in (result.get("others") or [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        # Hidden awaiting-release models are not "served", so the upstream lists them
+        # under `others` with the exact model_id we configured.
+        llm_cfg = getattr(mc, "llm_config", None) or {}
+        ready_ids = {
+            str((llm_cfg.get(k) or {}).get("model_id") or k) for k in ready
+        }
+        upstream_ids = raw_other_ids | ready_ids
+        hidden_missing: set[str] = set()
+        for key, entry in llm_cfg.items():
+            if (
+                not isinstance(entry, dict)
+                or entry.get("provider") != provider
+                or not _is_awaiting_release(dalton_meta, str(key))
+            ):
+                continue
+            if str(entry.get("model_id") or key) in upstream_ids:
+                released_configured = sorted(set(released_configured) | {str(key)})
+            elif not entry.get("visible"):
+                hidden_missing.add(str(key))
+        missing_awaiting_release = sorted(set(missing_awaiting_release) | hidden_missing)
+        others_ids = sorted(raw_other_ids - configured_ids)
+        released_unconfigured = (
+            sorted(
+                mid
+                for mid in others_ids
+                if any(mid.startswith(prefix) for prefix in awaiting_prefixes)
+            )
+            if awaiting_prefixes
+            else []
+        )
+        released_items = sorted(set(released_configured) | set(released_unconfigured))
+
         providers_report[provider] = {
             "connected": True,
             "supported": True,
@@ -281,9 +491,14 @@ async def run_model_availability_check(
             "ready": ready,
             "missing": missing_raw,
             "missing_visible": missing_visible,
+            "missing_awaiting_release": missing_awaiting_release,
+            "released_configured": released_configured,
+            "released_unconfigured": released_unconfigured,
         }
         if missing_visible:
             missing_by_provider[provider] = missing_visible
+        if released_items:
+            released_by_provider[provider] = released_items
 
     codex_report = providers_report.get("codex-oauth") or {}
     codex_upstream_status = codex_report.get("upstream_status") or codex_report.get("status")
@@ -376,6 +591,7 @@ async def run_model_availability_check(
         "supported_providers": sorted(SUPPORTED_AVAILABILITY_PROVIDERS),
         "providers": providers_report,
         "missing_by_provider": missing_by_provider,
+        "released_by_provider": released_by_provider,
         "error_by_provider": error_by_provider,
         "codex_version_probe": codex_probe,
     }

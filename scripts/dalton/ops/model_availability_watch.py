@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
 DEFAULT_GATEWAY_URL = "http://127.0.0.1:8962"
 OPS_ALERT_CODE = "model_unavailable"
+RELEASED_ALERT_CODE = "model_released"
 DEDUP_WINDOW_SECONDS = 24 * 3600
 STATE_RETENTION_SECONDS = 7 * 24 * 3600
 
@@ -205,19 +207,22 @@ def build_alert_detail(
 
 
 def load_alert_state(state_file: Path) -> dict[str, Any]:
-    """Load persisted 24-hour alert deduplication state from ``state_file``."""
+    """Load persisted alert deduplication state from ``state_file``."""
     if not state_file.is_file():
-        return {"alerts_by_signature": {}}
+        return {"alerts_by_signature": {}, "released_alerts": {}}
     try:
         raw = json.loads(state_file.read_text(encoding="utf-8"))
     except Exception:
-        return {"alerts_by_signature": {}}
+        return {"alerts_by_signature": {}, "released_alerts": {}}
     if not isinstance(raw, dict):
-        return {"alerts_by_signature": {}}
+        return {"alerts_by_signature": {}, "released_alerts": {}}
     by_sig = raw.get("alerts_by_signature")
     if not isinstance(by_sig, dict):
         by_sig = {}
-    return {"alerts_by_signature": dict(by_sig)}
+    released = raw.get("released_alerts")
+    if not isinstance(released, dict):
+        released = {}
+    return {"alerts_by_signature": dict(by_sig), "released_alerts": dict(released)}
 
 
 def should_send_alert(
@@ -259,7 +264,42 @@ def record_sent_alert(
         "alerted_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "detail": detail,
     }
-    return {"alerts_by_signature": pruned}
+    return {
+        "alerts_by_signature": pruned,
+        "released_alerts": dict(state.get("released_alerts") or {}),
+    }
+
+
+def record_released_alert(
+    state: dict[str, Any],
+    *,
+    provider: str,
+    models: list[str],
+    now_epoch: float,
+) -> dict[str, Any]:
+    """Record one-time ``model_released`` alerts per ``provider:model`` in ``state``."""
+    released = dict(state.get("released_alerts") or {})
+    alerted_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for model in models:
+        released[f"{provider}:{model}"] = {
+            "epoch": float(now_epoch),
+            "alerted_at": alerted_at,
+            "provider": provider,
+            "model": model,
+        }
+    return {
+        "alerts_by_signature": dict(state.get("alerts_by_signature") or {}),
+        "released_alerts": released,
+    }
+
+
+def _released_alert_key(provider: str, model: str) -> str:
+    return f"{provider}:{model}"
+
+
+def build_released_detail(provider: str, models: list[str]) -> str:
+    models_str = ", ".join(models)
+    return f"订阅已开放 {provider} 的 {models_str}，核对档位后将其设为可见并去掉 awaiting_release 标记"
 
 
 def fetch_backend_check(
@@ -302,13 +342,17 @@ def send_ops_alert(
     gateway_url: str,
     service_token: str,
     code: str = OPS_ALERT_CODE,
+    extra_fields: dict[str, str] | None = None,
     timeout_s: float = 15.0,
 ) -> tuple[bool, int | None, str | None]:
     """Send a loopback ops alert via ``POST {gateway_url}/internal/ops-alerts``."""
     if not service_token:
         return False, None, "INTERNAL_SERVICE_TOKEN is not configured"
     url = f"{gateway_url.rstrip('/')}/internal/ops-alerts"
-    body = json.dumps({"code": code, "detail": detail}, ensure_ascii=False).encode("utf-8")
+    payload: dict[str, Any] = {"code": code, "detail": detail}
+    if extra_fields:
+        payload.update(extra_fields)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
@@ -329,6 +373,39 @@ def send_ops_alert(
         return False, None, f"URLError: {exc.reason}"
 
 
+def _dispatch_alert(
+    alert_sender: Callable[..., tuple[bool, int | None, str | None]] | None,
+    detail: str,
+    *,
+    gateway_url: str,
+    service_token: str,
+    code: str,
+    extra_fields: dict[str, str] | None = None,
+) -> tuple[bool, int | None, str | None]:
+    if alert_sender is None:
+        return send_ops_alert(
+            detail,
+            gateway_url=gateway_url,
+            service_token=service_token,
+            code=code,
+            extra_fields=extra_fields,
+        )
+    try:
+        sig = inspect.signature(alert_sender)
+        params = sig.parameters
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        call_kwargs: dict[str, Any] = {}
+        if accepts_kwargs or "code" in params:
+            call_kwargs["code"] = code
+        if extra_fields and (accepts_kwargs or "extra_fields" in params):
+            call_kwargs["extra_fields"] = extra_fields
+        return alert_sender(detail, **call_kwargs)
+    except (TypeError, ValueError):
+        return alert_sender(detail)
+
+
 def run_watch(
     *,
     state_dir: str | Path | None = None,
@@ -337,7 +414,7 @@ def run_watch(
     service_token: str | None = None,
     check_report: dict[str, Any] | None = None,
     check_fn: Callable[[], dict[str, Any]] | None = None,
-    alert_sender: Callable[[str], tuple[bool, int | None, str | None]] | None = None,
+    alert_sender: Callable[..., tuple[bool, int | None, str | None]] | None = None,
     now_epoch: float | None = None,
     dedup_window_s: float = DEDUP_WINDOW_SECONDS,
 ) -> tuple[dict[str, Any], int]:
@@ -384,6 +461,7 @@ def run_watch(
         return summary, 1
 
     missing_by_provider = report.get("missing_by_provider") or {}
+    released_by_provider = _normalize_missing_map(report.get("released_by_provider") or {})
     providers_report = report.get("providers") or {}
     error_by_provider = _normalize_error_map(report.get("error_by_provider"), providers_report)
     codex_probe = report.get("codex_version_probe") or {}
@@ -431,38 +509,78 @@ def run_watch(
 
     exit_code = 0
     if due_detail_parts:
-        sender = alert_sender or (
-            lambda msg: send_ops_alert(
-                msg,
-                gateway_url=eff_gateway_url,
-                service_token=eff_token,
-            )
+        sent_ok, status_code, err = _dispatch_alert(
+            alert_sender,
+            outbound_detail,
+            gateway_url=eff_gateway_url,
+            service_token=eff_token,
+            code=OPS_ALERT_CODE,
         )
-        sent_ok, status_code, err = sender(outbound_detail)
         alert_info["status_code"] = status_code
         if sent_ok:
             alert_info["sent"] = True
             alert_info["missing_sent"] = bool(missing_due)
             alert_info["upgrade_sent"] = bool(upgrade_due)
-            updated_state = state
             if missing_due and missing_sig:
-                updated_state = record_sent_alert(
-                    updated_state,
+                state = record_sent_alert(
+                    state,
                     missing_sig,
                     now_epoch=eff_now,
                     detail=missing_detail,
                 )
             if upgrade_due and upgrade_sig:
-                updated_state = record_sent_alert(
-                    updated_state,
+                state = record_sent_alert(
+                    state,
                     upgrade_sig,
                     now_epoch=eff_now,
                     detail=upgrade_detail,
                 )
-            _atomic_write_json_0600(alert_state_path, updated_state)
+            _atomic_write_json_0600(alert_state_path, state)
         else:
             alert_info["error"] = err or "ops_alert_send_failed"
             exit_code = 1
+
+    released_already = state.get("released_alerts") or {}
+    released_due_by_provider: dict[str, list[str]] = {}
+    for provider, models in sorted(released_by_provider.items()):
+        pending = [m for m in models if _released_alert_key(provider, m) not in released_already]
+        if pending:
+            released_due_by_provider[provider] = pending
+
+    released_sent_by_provider: dict[str, list[str]] = {}
+    released_errors: list[str] = []
+    for provider, pending_models in sorted(released_due_by_provider.items()):
+        models_str = ", ".join(pending_models)
+        released_detail = build_released_detail(provider, pending_models)
+        sent_ok, _rel_status, rel_err = _dispatch_alert(
+            alert_sender,
+            released_detail,
+            gateway_url=eff_gateway_url,
+            service_token=eff_token,
+            code=RELEASED_ALERT_CODE,
+            extra_fields={"provider": provider, "models": models_str},
+        )
+        if sent_ok:
+            released_sent_by_provider[provider] = pending_models
+            state = record_released_alert(
+                state,
+                provider=provider,
+                models=pending_models,
+                now_epoch=eff_now,
+            )
+            _atomic_write_json_0600(alert_state_path, state)
+        else:
+            released_errors.append(f"{provider}: {rel_err or 'ops_alert_send_failed'}")
+            exit_code = 1
+
+    released_alert_info: dict[str, Any] = {
+        "needed": bool(released_by_provider),
+        "sent": bool(released_sent_by_provider),
+        "suppressed_already_alerted": bool(released_by_provider) and not bool(released_due_by_provider),
+        "code": RELEASED_ALERT_CODE,
+        "by_provider": released_sent_by_provider or released_due_by_provider or released_by_provider,
+        "error": "；".join(released_errors) if released_errors else None,
+    }
 
     has_provider_errors = bool(error_by_provider)
     report_ok = bool(report.get("ok", True)) and not has_provider_errors
@@ -477,9 +595,11 @@ def run_watch(
         "user_id": report.get("user_id"),
         "providers": providers_report,
         "missing_by_provider": missing_by_provider,
+        "released_by_provider": released_by_provider,
         "error_by_provider": error_by_provider,
         "codex_version_probe": codex_probe,
         "alert": alert_info,
+        "released_alert": released_alert_info,
         "state_dir": str(resolved_state_dir),
     }
     _atomic_write_json_0600(summary_path, summary)
