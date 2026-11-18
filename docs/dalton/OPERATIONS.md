@@ -217,6 +217,73 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 - **范围边界**：用户自定义模型（`model_preference.custom_models`）**不在切换范围内**，脚本不会改动；`automations.instruction` 文本中的旧模型名只列出原文片段与建议改法，**不会自动改写**。
 - **并发与中断恢复**：线程只更新计划内的 `thread_id`（事务内核对行数不符即回滚）；用户偏好在事务内加锁重读并通过 CAS 保护，冲突时跳过该用户并报告；任一阶段失败会打印已完成与未完成进度摘要并以非零退出码退出，修复后可直接重跑（幂等，已切换行不会再次进入计划）。
 
+### 3.6 加入或切换模型的检查清单
+
+每次上线新模型或切换默认模型时，按以下六步逐项核验（命令中的 `<新模型key>`、`<旧模型key>`、`<提供方>`、`<管理员user_id>` 与 `<抽查用户user_id>` 按实际目标替换）：
+
+1. **新模型配置写入 Dalton overlay，上游 manifest 保持原样**：
+   模型定义放在 `src/dalton/llm/native_overlay.json`（或运行时同步文件 `var/dalton/catalog/native_sync_overlay.json`），上游 `src/llms/manifest/models.json` 与 `src/llms/manifest/providers.json` 保持只读原样。核对新模型已进入叠加配置并顺利通过钩子校验：
+
+   ```bash
+   .venv/bin/python -c 'import json; d=json.load(open("src/dalton/llm/native_overlay.json", encoding="utf-8")); print("<新模型key> in overlay:", "<新模型key>" in d.get("models", {}))'
+   bash scripts/dalton/check_hooks.sh --strict --audit
+   ```
+
+2. **部署后对每个订阅调用 `available-models`（`refresh=true`），确认新模型在 `ready` 中**：
+   部署并重建后端后，用管理员凭据逐个刷新已连接订阅的实时列表，确认新模型落在 `ready` 列表中（当 `codex-oauth` 将新模型归入 `missing` 时，在 `.env` 中调高 `DALTON_CODEX_CLIENT_VERSION` 并用 `--force-recreate` 重建 `backend`）：
+
+   ```bash
+   for p in codex-oauth claude-oauth antigravity-oauth xai-oauth; do
+     echo "=== ${p} ==="
+     curl -fsS -H "X-Service-Token: ${INTERNAL_SERVICE_TOKEN}" -H "X-User-Id: <管理员user_id>" \
+       "http://127.0.0.1:8000/api/v1/providers/${p}/available-models?refresh=true" \
+       | python3 -c 'import json,sys; d=json.load(sys.stdin); print("status=", d.get("status"), "ready_has_target=", "<新模型key>" in (d.get("ready") or []), "missing=", d.get("missing"))'
+   done
+   ```
+
+3. **确认 `/api/v1/models` 返回该模型**：
+   检查公开目录接口已返回新模型元数据与可见状态：
+
+   ```bash
+   curl -fsS http://127.0.0.1:8000/api/v1/models \
+     | python3 -c 'import json,sys; d=json.load(sys.stdin); k="<新模型key>"; meta=d.get("model_metadata", {}).get(k); print("in_metadata=", bool(meta), "visible=", (meta or {}).get("visible"), "provider=", (meta or {}).get("provider"))'
+   ```
+
+4. **发起一次真实模型请求**：
+   通过后端探针接口向新模型发送真实 `PONG` 请求，确认返回 `"ok": true`：
+
+   ```bash
+   curl -fsS -X POST \
+     -H "Content-Type: application/json" \
+     -H "X-Service-Token: ${INTERNAL_SERVICE_TOKEN}" \
+     -H "X-User-Id: <管理员user_id>" \
+     -d '{"model_key": "<新模型key>"}' \
+     "http://127.0.0.1:8000/api/v1/dalton/providers/<提供方>/probe" \
+     | python3 -m json.tool
+   ```
+
+5. **需要迁移旧模型引用时，先运行计划模式，确认后再执行 `--apply`**：
+   先用只读计划模式预览待更新的自动化、线程与用户偏好（含收藏和隐藏列表），确认输出后加上 `--apply`（涉及公司自动化时附带 `--actor-user-id`）：
+
+   ```bash
+   .venv/bin/python scripts/dalton/ops/switch_model_refs.py \
+     --from <旧模型key> --to <新模型key>
+
+   .venv/bin/python scripts/dalton/ops/switch_model_refs.py \
+     --from <旧模型key> --to <新模型key> \
+     --actor-user-id <管理员user_id> \
+     --apply
+   ```
+
+6. **抽查一位用户的模型选择器可见状态**：
+   用普通成员的 `user_id` 查询其可用模型接口（确认新模型落在 `ready` 中），再登录前端页面打开模型选择器确认新模型展示正常：
+
+   ```bash
+   curl -fsS -H "X-Service-Token: ${INTERNAL_SERVICE_TOKEN}" -H "X-User-Id: <抽查用户user_id>" \
+     "http://127.0.0.1:8000/api/v1/providers/<提供方>/available-models" \
+     | python3 -c 'import json,sys; d=json.load(sys.stdin); print("user_ready_has_target=", "<新模型key>" in (d.get("ready") or []), "status=", d.get("status"))'
+   ```
+
 ## 4. 备份与恢复
 
 完整备份配置和首次 `rclone` 授权步骤见 [scripts/dalton/ops/README.md](../../scripts/dalton/ops/README.md)。生产关键规则如下：

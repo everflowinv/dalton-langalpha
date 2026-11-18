@@ -13,15 +13,18 @@ const ALERT_CODES = new Set([
   "backend_down",
   "backend_recovered",
   "backup_failed",
+  "model_unavailable",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
 ]);
+const DETAIL_ALERT_CODES = new Set(["backup_failed", "model_unavailable"]);
 const ALLOWED_BODY_KEYS = new Set(["code", "detail"]);
 const ALLOWED_CONFIG_KEYS = new Set(["targets", "messages"]);
 const ALLOWED_MESSAGE_KEYS = new Set([
   "backend_down",
   "backend_recovered",
   "backup_failed",
+  "model_unavailable",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
 ]);
@@ -30,8 +33,12 @@ const OPTIONAL_MESSAGE_KEYS = new Set([
   "alphaengine_login_required",
   "alphaengine_module_page_required",
 ]);
-const DEFAULT_BACKUP_FAILED_TEMPLATE = "Dalton 备份失败：{detail}";
+const DEFAULT_DETAIL_TEMPLATES: Record<string, string> = {
+  backup_failed: "Dalton 备份失败：{detail}",
+  model_unavailable: "Dalton 模型可用性告警：{detail}",
+};
 const MAX_BACKUP_DETAIL_CHARS = 300;
+const MAX_MODEL_UNAVAILABLE_DETAIL_CHARS = 600;
 
 export interface OpsAlertSender {
   (targetAddress: string, text: string): Promise<{ messageId: string }>;
@@ -114,14 +121,16 @@ async function loadOpsAlertConfig(configPath: string | undefined): Promise<
     }
     messages[code] = text;
   }
-  const rawBackupFailed = parsed.messages.backup_failed;
-  if (rawBackupFailed !== undefined) {
-    if (typeof rawBackupFailed !== "string" || rawBackupFailed.trim().length === 0) {
-      return { ok: false };
+  for (const [code, defaultTemplate] of Object.entries(DEFAULT_DETAIL_TEMPLATES)) {
+    const rawDetailTemplate = parsed.messages[code];
+    if (rawDetailTemplate !== undefined) {
+      if (typeof rawDetailTemplate !== "string" || rawDetailTemplate.trim().length === 0) {
+        return { ok: false };
+      }
+      messages[code] = rawDetailTemplate;
+    } else {
+      messages[code] = defaultTemplate;
     }
-    messages.backup_failed = rawBackupFailed;
-  } else {
-    messages.backup_failed = DEFAULT_BACKUP_FAILED_TEMPLATE;
   }
   for (const code of OPTIONAL_MESSAGE_KEYS) {
     const raw = parsed.messages[code];
@@ -135,18 +144,22 @@ async function loadOpsAlertConfig(configPath: string | undefined): Promise<
   return { ok: true, targets, messages };
 }
 
-export function sanitizeBackupAlertDetail(raw: string): string {
+export function sanitizeAlertDetail(raw: string, maxChars: number): string {
   // Replace line breaks/tabs with spaces and strip remaining ASCII control characters.
   const withoutControls = raw
     .replace(/[\r\n\t]+/g, " ")
     // eslint-disable-next-line no-control-regex
     .replace(/[\x00-\x1f\x7f]/g, "")
     .trim();
-  return Array.from(withoutControls).slice(0, MAX_BACKUP_DETAIL_CHARS).join("");
+  return Array.from(withoutControls).slice(0, maxChars).join("");
 }
 
-function renderBackupFailedMessage(template: string, rawDetail: string): string {
-  const detail = sanitizeBackupAlertDetail(rawDetail) || "未知原因";
+export function sanitizeBackupAlertDetail(raw: string): string {
+  return sanitizeAlertDetail(raw, MAX_BACKUP_DETAIL_CHARS);
+}
+
+function renderDetailAlertMessage(template: string, rawDetail: string, maxChars: number): string {
+  const detail = sanitizeAlertDetail(rawDetail, maxChars) || "未知原因";
   if (template.includes("{detail}")) {
     return template.replaceAll("{detail}", () => detail);
   }
@@ -188,22 +201,22 @@ export async function handleOpsAlert(options: {
         ok: false,
         code: "invalid_request",
         message:
-          "code must be backend_down, backend_recovered, backup_failed, alphaengine_login_required, or alphaengine_module_page_required.",
+          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, alphaengine_login_required, or alphaengine_module_page_required.",
       },
     };
   }
-  if (code !== "backup_failed" && options.body.detail !== undefined) {
+  if (!DETAIL_ALERT_CODES.has(code) && options.body.detail !== undefined) {
     return {
       status: 400,
       data: {
         ok: false,
         code: "invalid_request",
-        message: "detail is only supported for backup_failed.",
+        message: "detail is only supported for backup_failed or model_unavailable.",
       },
     };
   }
   if (
-    code === "backup_failed" &&
+    DETAIL_ALERT_CODES.has(code) &&
     options.body.detail !== undefined &&
     typeof options.body.detail !== "string"
   ) {
@@ -224,10 +237,13 @@ export async function handleOpsAlert(options: {
     return invalidConfig();
   }
   let text: string;
-  if (code === "backup_failed") {
-    text = renderBackupFailedMessage(
-      config.messages.backup_failed ?? DEFAULT_BACKUP_FAILED_TEMPLATE,
+  if (DETAIL_ALERT_CODES.has(code)) {
+    const maxChars =
+      code === "model_unavailable" ? MAX_MODEL_UNAVAILABLE_DETAIL_CHARS : MAX_BACKUP_DETAIL_CHARS;
+    text = renderDetailAlertMessage(
+      config.messages[code] ?? DEFAULT_DETAIL_TEMPLATES[code],
       typeof options.body.detail === "string" ? options.body.detail : "",
+      maxChars,
     );
   } else {
     const configured = config.messages[code];

@@ -104,6 +104,7 @@ TASK_NOTIFY_PAYLOAD_SOURCES: dict[str, str] = {
     "pm-market-state": "none",  # T84
     "cn-intraday": "none",  # T85
     "hk-momentum": "none",  # T86
+    "model-availability-watch": "none",  # T87
 }
 
 _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
@@ -140,6 +141,7 @@ _TASK_ID_PAYLOAD_SOURCE_ALIASES: dict[str, str] = {
     "T84": "none",
     "T85": "none",
     "T86": "none",
+    "T87": "none",
 }
 
 
