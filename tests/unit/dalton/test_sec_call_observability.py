@@ -511,7 +511,11 @@ async def test_failed_request_shares_same_corr_across_all_log_lines(
     with caplog.at_level(logging.WARNING, logger="researchdata_bridge"):
         await rb._handle_client(bridge, reader, writer)
 
-    messages = [r.getMessage() for r in caplog.records]
+    # The bridge logs its concurrency policy once per process on the first request; whichever
+    # test runs first in a worker captures it, and it belongs to no request.
+    messages = [
+        r.getMessage() for r in caplog.records if not r.getMessage().startswith("Concurrency policy:")
+    ]
     assert len(messages) >= 3, messages
     assert any("subprocess returned no JSON response" in m for m in messages), messages
     assert any(m.startswith("sec_call_failed ") for m in messages), messages
