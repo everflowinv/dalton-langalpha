@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.guidepoint-mcp-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy_run.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__/scripts/dalton/research_runtime</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>GUIDEPOINT_PROXY_PORT</key>
+        <string>8943</string>
+        <key>GUIDEPOINT_PYTHON</key>
+        <string>__PYTHON_BIN__</string>
+        <key>__RUNTIME_ENV_KEY__</key>
+        <string>__RUNTIME_ENV_VAL__</string>
+        <key>GUIDEPOINT_ENV_FILE</key>
+        <string>__GUIDEPOINT_ENV_FILE__</string>
+        <key>GUIDEPOINT_TOKENS_FILE</key>
+        <string>__GUIDEPOINT_TOKENS_FILE__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-guidepoint-mcp-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-guidepoint-mcp-proxy.err.log</string>
+</dict>
+</plist>

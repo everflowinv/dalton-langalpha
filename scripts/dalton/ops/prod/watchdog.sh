@@ -17,16 +17,25 @@ ENV_FILE="${DALTON_ENV_FILE:-${REPO_ROOT}/.env}"
 ALERT_AFTER_S="${DALTON_WATCHDOG_ALERT_AFTER_S:-300}"
 
 GATEWAY_ENV="${DALTON_CHANNEL_GATEWAY_ENV_FILE:-$HOME/.config/dalton/channel-gateway.env}"
+CURL_CMD="${CURL_BIN:-curl}"
+CURRENT_HDR_FILE=""
+trap 'rm -f "$CURRENT_HDR_FILE" 2>/dev/null || true' EXIT
 
 notify() {  # $1 = text, $2 = ops alert code (backend_down | backend_recovered)
-  local token payload code
+  local token payload code hdr_file
   # Preferred path: the Dalton channel gateway's loopback ops alert (fixed text and
   # targets from ~/.config/dalton/ops-alerts.json); no OpenClaw involved.
   token=$(grep -E '^INTERNAL_SERVICE_TOKEN=' "$GATEWAY_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'")
   code=000
   if [ -n "$token" ] && [ -n "$2" ]; then
-    code=$(curl -s -m 20 --noproxy '*' -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8962/internal/ops-alerts \
-      -H "Content-Type: application/json" -H "X-Service-Token: $token" --data "{\"code\":\"$2\"}")
+    hdr_file=$(umask 077 && mktemp)
+    CURRENT_HDR_FILE="$hdr_file"
+    printf 'X-Service-Token: %s\n' "$token" > "$hdr_file"
+    chmod 600 "$hdr_file" 2>/dev/null || true
+    code=$("$CURL_CMD" -s -m 20 --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "${DALTON_OPS_ALERTS_URL:-http://127.0.0.1:8962/internal/ops-alerts}" \
+      -H "Content-Type: application/json" -H "@${hdr_file}" --data "{\"code\":\"$2\"}" 2>/dev/null || echo 000)
+    rm -f "$hdr_file"
+    CURRENT_HDR_FILE=""
   fi
   echo "$(date '+%F %T') ops-alert http=$code: $1" >> "$LOG"
   [ "$code" = "200" ] && return 0
@@ -35,9 +44,15 @@ notify() {  # $1 = text, $2 = ops alert code (backend_down | backend_recovered)
   payload=$(python3 -I -c 'import json,sys; t=json.load(open(sys.argv[1])).get("targets",[]); print(json.dumps({"targets":t,"text":sys.argv[2]}))' "$TARGETS" "$1" 2>/dev/null)
   code=000
   if [ -n "$token" ] && [ -n "$payload" ]; then
-    code=$(curl -s -m 15 --noproxy '*' -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8960/notify \
-      -H "Content-Type: application/json" -H "Authorization: Bearer $token" -H "X-Dalton-Bridge-Token: $token" \
-      --data "$payload")
+    hdr_file=$(umask 077 && mktemp)
+    CURRENT_HDR_FILE="$hdr_file"
+    printf 'Authorization: Bearer %s\nX-Dalton-Bridge-Token: %s\n' "$token" "$token" > "$hdr_file"
+    chmod 600 "$hdr_file" 2>/dev/null || true
+    code=$("$CURL_CMD" -s -m 15 --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "${DALTON_BRIDGE_NOTIFY_URL:-http://127.0.0.1:8960/notify}" \
+      -H "Content-Type: application/json" -H "@${hdr_file}" \
+      --data "$payload" 2>/dev/null || echo 000)
+    rm -f "$hdr_file"
+    CURRENT_HDR_FILE=""
   fi
   echo "$(date '+%F %T') notify http=$code: $1" >> "$LOG"
   if [ "$code" != "200" ]; then
@@ -45,7 +60,7 @@ notify() {  # $1 = text, $2 = ops alert code (backend_down | backend_recovered)
   fi
 }
 
-if curl -s -m 15 -o /dev/null -w '%{http_code}' --noproxy '*' http://127.0.0.1:8000/health | grep -q '^200$'; then
+if "$CURL_CMD" -s -m 15 -o /dev/null -w '%{http_code}' --noproxy '*' http://127.0.0.1:8000/health | grep -q '^200$'; then
   echo 0 > "$STATE"
   if [ -f "$ALERTED" ]; then
     since=$(cat "$DOWN_SINCE" 2>/dev/null || date +%s); mins=$(( ($(date +%s) - since) / 60 ))

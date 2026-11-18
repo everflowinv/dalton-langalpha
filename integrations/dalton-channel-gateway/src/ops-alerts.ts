@@ -9,11 +9,27 @@
 import { readFile } from "node:fs/promises";
 
 const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
-const ALERT_CODES = new Set(["backend_down", "backend_recovered", "backup_failed"]);
+const ALERT_CODES = new Set([
+  "backend_down",
+  "backend_recovered",
+  "backup_failed",
+  "alphaengine_login_required",
+  "alphaengine_module_page_required",
+]);
 const ALLOWED_BODY_KEYS = new Set(["code", "detail"]);
 const ALLOWED_CONFIG_KEYS = new Set(["targets", "messages"]);
-const ALLOWED_MESSAGE_KEYS = new Set(["backend_down", "backend_recovered", "backup_failed"]);
+const ALLOWED_MESSAGE_KEYS = new Set([
+  "backend_down",
+  "backend_recovered",
+  "backup_failed",
+  "alphaengine_login_required",
+  "alphaengine_module_page_required",
+]);
 const REQUIRED_MESSAGE_KEYS = new Set(["backend_down", "backend_recovered"]);
+const OPTIONAL_MESSAGE_KEYS = new Set([
+  "alphaengine_login_required",
+  "alphaengine_module_page_required",
+]);
 const DEFAULT_BACKUP_FAILED_TEMPLATE = "Dalton 备份失败：{detail}";
 const MAX_BACKUP_DETAIL_CHARS = 300;
 
@@ -107,6 +123,15 @@ async function loadOpsAlertConfig(configPath: string | undefined): Promise<
   } else {
     messages.backup_failed = DEFAULT_BACKUP_FAILED_TEMPLATE;
   }
+  for (const code of OPTIONAL_MESSAGE_KEYS) {
+    const raw = parsed.messages[code];
+    if (raw !== undefined) {
+      if (typeof raw !== "string" || raw.trim().length === 0) {
+        return { ok: false };
+      }
+      messages[code] = raw;
+    }
+  }
   return { ok: true, targets, messages };
 }
 
@@ -162,7 +187,8 @@ export async function handleOpsAlert(options: {
       data: {
         ok: false,
         code: "invalid_request",
-        message: "code must be backend_down, backend_recovered, or backup_failed.",
+        message:
+          "code must be backend_down, backend_recovered, backup_failed, alphaengine_login_required, or alphaengine_module_page_required.",
       },
     };
   }
@@ -197,13 +223,19 @@ export async function handleOpsAlert(options: {
   if (!config.ok) {
     return invalidConfig();
   }
-  const text =
-    code === "backup_failed"
-      ? renderBackupFailedMessage(
-          config.messages.backup_failed ?? DEFAULT_BACKUP_FAILED_TEMPLATE,
-          typeof options.body.detail === "string" ? options.body.detail : "",
-        )
-      : (config.messages[code] ?? "");
+  let text: string;
+  if (code === "backup_failed") {
+    text = renderBackupFailedMessage(
+      config.messages.backup_failed ?? DEFAULT_BACKUP_FAILED_TEMPLATE,
+      typeof options.body.detail === "string" ? options.body.detail : "",
+    );
+  } else {
+    const configured = config.messages[code];
+    if (typeof configured !== "string" || configured.trim().length === 0) {
+      return invalidConfig();
+    }
+    text = configured;
+  }
   const results: Array<Record<string, unknown>> = [];
   let anyFailed = false;
   for (const target of config.targets) {

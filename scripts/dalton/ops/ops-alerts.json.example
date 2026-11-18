@@ -1,0 +1,12 @@
+{
+  "targets": [
+    "feishu:user:ou_replace_with_ops_user"
+  ],
+  "messages": {
+    "backend_down": "Dalton 后端服务不可用，请检查宿主机状态",
+    "backend_recovered": "Dalton 后端服务已恢复",
+    "backup_failed": "Dalton 备份失败：{detail}",
+    "alphaengine_login_required": "AlphaEngine 登录态失效，请在宿主机打开 AlphaEngine Desktop 完成登录",
+    "alphaengine_module_page_required": "AlphaEngine 登录态正常，但需要打开任意模块页以便 MCP 获取令牌"
+  }
+}

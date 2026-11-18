@@ -481,3 +481,18 @@ web/src/pages/Plugins/__tests__/DesktopDownloadLink.dalton.test.tsx
 scripts/dalton/research_runtime/
 scripts/dalton/ops/research_runtime_migrate.sh
 tests/unit/dalton/test_research_runtime_decoupling.py
+
+# OpenClaw decoupling batch 3: AlphaEngine & Guidepoint host launchd services, watchdog ops alerts, switch script, and tests.
+scripts/dalton/research_runtime/scripts/alphaengine-mcp/desktop-watchdog.sh
+scripts/dalton/research_runtime/scripts/alphaengine-mcp/self-test.sh
+scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.test.mjs
+scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py
+scripts/dalton/research_runtime/scripts/guidepoint_mcp_oauth.py
+scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy_run.sh
+scripts/dalton/launchd/com.dalton.alphaengine-mcp.plist.template
+scripts/dalton/launchd/com.dalton.alphaengine-desktop-watchdog.plist.template
+scripts/dalton/launchd/com.dalton.guidepoint-mcp-proxy.plist.template
+scripts/dalton/ops/host_services_switch.sh
+scripts/dalton/ops/ops-alerts.json.example
+tests/unit/dalton/test_guidepoint_cli.py
+tests/unit/dalton/test_host_services_switch.py

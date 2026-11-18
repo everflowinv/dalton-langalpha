@@ -15444,13 +15444,19 @@ class ResearchDataBridge:
                         raise cleanup_cancelled
 
     @staticmethod
-    def _probe_launchd_label_status(label: str) -> str:
+    def _probe_launchd_label_status(
+        label: str,
+        *,
+        uid: int | None = None,
+        launchctl_bin: str | None = None,
+    ) -> str:
         """Return ``'on'`` if ``launchctl print gui/<uid>/<label>`` succeeds, ``'off'`` on non-zero exit, else ``'unknown'``."""
         try:
-            uid = os.getuid()
+            uid_val = os.getuid() if uid is None else uid
+            bin_path = launchctl_bin or os.environ.get("LAUNCHCTL_BIN", "").strip() or "launchctl"
             subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(os.environ)
             res = subprocess.run(
-                ["launchctl", "print", f"gui/{uid}/{label}"],
+                [bin_path, "print", f"gui/{uid_val}/{label}"],
                 env=subproc_env,
                 capture_output=True,
                 text=True,
@@ -26388,6 +26394,89 @@ def _inspect_venv_python_version(
     return False, detected, err
 
 
+def _probe_tcp_port(host: str, port: int, timeout_s: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+
+def _probe_launchd_label_loaded(
+    label: str,
+    *,
+    uid: int | None = None,
+    launchctl_bin: str | None = None,
+) -> bool | None:
+    """Return True if `launchctl print gui/<uid>/<label>` exits 0, False if non-zero, None on error."""
+    status = ResearchDataBridge._probe_launchd_label_status(
+        label,
+        uid=uid,
+        launchctl_bin=launchctl_bin,
+    )
+    if status == "on":
+        return True
+    if status == "off":
+        return False
+    return None
+
+
+def _check_host_services_status() -> dict[str, Any]:
+    """Check host research services (8950/8943 TCP reachability and new vs old launchd labels)."""
+    ae_port = int(os.environ.get("ALPHAENGINE_MCP_PORT", "8950"))
+    gp_port = int(os.environ.get("GUIDEPOINT_PROXY_PORT", "8943"))
+
+    specs: tuple[tuple[str, int | None, str, str], ...] = (
+        (
+            "alphaengine_mcp",
+            ae_port,
+            "com.dalton.alphaengine-mcp",
+            "ai.openclaw.alphaengine-mcp",
+        ),
+        (
+            "alphaengine_desktop_watchdog",
+            None,
+            "com.dalton.alphaengine-desktop-watchdog",
+            "ai.openclaw.alphaengine-desktop-watchdog",
+        ),
+        (
+            "guidepoint_mcp_proxy",
+            gp_port,
+            "com.dalton.guidepoint-mcp-proxy",
+            "ai.openclaw.guidepoint-mcp-proxy",
+        ),
+    )
+
+    out: dict[str, Any] = {}
+    for key, port, new_label, old_label in specs:
+        new_loaded = _probe_launchd_label_loaded(new_label)
+        old_loaded = _probe_launchd_label_loaded(old_label)
+        if new_loaded and old_loaded:
+            active_label = new_label
+            label_kind = "both"
+        elif new_loaded:
+            active_label = new_label
+            label_kind = "new"
+        elif old_loaded:
+            active_label = old_label
+            label_kind = "old"
+        else:
+            active_label = "unknown"
+            label_kind = "unknown"
+
+        entry: dict[str, Any] = {
+            "new_label": new_label,
+            "old_label": old_label,
+            "active_label": active_label,
+            "label_kind": label_kind,
+        }
+        if port is not None:
+            entry["port"] = port
+            entry["reachable"] = _probe_tcp_port("127.0.0.1", port)
+        out[key] = entry
+    return out
+
+
 def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
     """Read-only offline check of research runtime code, config, venvs, and local stores."""
     cfg = cfg or BridgeConfig()
@@ -26440,10 +26529,21 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         "skills/guidepoint-transcript-search/run.sh",
         "skills/guidepoint-transcript-search/scripts/gp_search.py",
     )
+    dalton_host_service_code_rel = (
+        "scripts/alphaengine-mcp/desktop-watchdog.sh",
+        "scripts/alphaengine-mcp/self-test.sh",
+        "scripts/alphaengine-mcp/server.test.mjs",
+        "scripts/guidepoint_mcp_proxy.py",
+        "scripts/guidepoint_mcp_oauth.py",
+        "scripts/guidepoint_mcp_proxy_run.sh",
+    )
     # Example files exist only in the repo copy; the legacy workspace never had them.
     missing_code = [
         rel
-        for rel in required_code_rel
+        for rel in (
+            *required_code_rel,
+            *(dalton_host_service_code_rel if not legacy_mode else ()),
+        )
         if not (legacy_mode and rel.endswith(".example.json"))
         and not (code_root / rel).is_file()
     ]
@@ -26577,6 +26677,7 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
             store_checks[name] = {"ok": exists, "kind": kind, "path": str(path)}
     stores_ok = all(bool(v.get("ok")) for v in store_checks.values())
 
+    host_services = _check_host_services_status()
     overall_ok = code_ok and configs_ok and venvs_ok and stores_ok
     return {
         "ok": overall_ok,
@@ -26597,6 +26698,7 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         "configs": config_checks,
         "venvs": venv_checks,
         "stores": store_checks,
+        "host_services": host_services,
     }
 
 

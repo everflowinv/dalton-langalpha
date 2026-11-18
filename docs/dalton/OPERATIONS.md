@@ -94,6 +94,9 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
 | `com.dalton.backend-watchdog` | `scripts/dalton/ops/prod/launchd/com.dalton.backend-watchdog.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.backend-watchdog` | `~/Backups/dalton/watchdog.log` |
 | `com.dalton.colima` | `scripts/dalton/ops/prod/launchd/com.dalton.colima.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.colima` | `~/Library/Logs/dalton-colima.log` |
 | `com.dalton.pg-backup` | `scripts/dalton/ops/prod/launchd/com.dalton.pg-backup.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.pg-backup` | `~/Library/Logs/dalton-pg-backup.log` |
+| `com.dalton.alphaengine-mcp` | `scripts/dalton/launchd/com.dalton.alphaengine-mcp.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.alphaengine-mcp` | `~/Library/Logs/dalton-alphaengine-mcp.{log,err.log}` |
+| `com.dalton.alphaengine-desktop-watchdog` | `scripts/dalton/launchd/com.dalton.alphaengine-desktop-watchdog.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.alphaengine-desktop-watchdog` | `~/Library/Logs/dalton-alphaengine-desktop-watchdog.{log,err.log}` |
+| `com.dalton.guidepoint-mcp-proxy` | `scripts/dalton/launchd/com.dalton.guidepoint-mcp-proxy.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` | `~/Library/Logs/dalton-guidepoint-mcp-proxy.{log,err.log}` |
 
 查看某项服务实时状态：
 
@@ -123,6 +126,39 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 - **并发与限流保护**：用 `asyncio.Semaphore` 限并发，`HourlyTokenBudgetLimiter` 先按估算 token 预占预算，跑完再按实际用量校准。遇到瞬时 `429` 会共享退避窗口；遇到不可恢复配额错误（`PermanentQuotaError`）则取消在途任务，把已完成的连续前缀落盘后退出。
 - **逐会话有序落盘**：按 `(agent, session_id)` 维度的已完成连续前缀调 embedding，并在同一个事务里写 `dalton_conversation_cards` 和 `dalton_conversation_processed`，同时实时更新 `dalton_conversation_runs` 进度（`segments_processed`、`cards_extracted`、`cards_inserted`、`total_tokens`）。单个会话某一段失败只挡住它自己的后续段，不拖累其他会话。
 - **运行锁（Advisory Lock）与中断续跑**：每次非 `--dry-run` 启动时抢 Postgres 会话锁 `pg_try_advisory_lock(hashtext('dalton_conversation_archive'))`。已经有进程在跑就打印 `"已有归档在运行"` 并以退出码 `2` 退出；抢锁成功后把上次残留的 `status='running'` 行标成 `status='abandoned'`。进程中断后直接重跑同一条 `backfill` 命令就能跳过已入库片段；宿主机导出的 `.jsonl` 如果还在 `var/dalton/conversations/inbox/`，可以加上 `--skip-host-export` 省掉重复导出。
+
+### 3.3 研究数据常驻服务
+
+宿主机上有三项研究数据常驻服务由 Dalton 的 `launchd` 模板托管，端口继续保持本机回环地址，供 `researchdata_bridge.py` 与研究运行时脚本直连：
+
+| 服务与作用 | launchd 标签 | 端口 / 周期 | 日志与状态位置 |
+|---|---|---|---|
+| **AlphaEngine MCP**：运行 `server.mjs`（`/opt/homebrew/bin/node`），复用宿主机 AlphaEngine Desktop 登录态提供研报与会议纪要查询 | `com.dalton.alphaengine-mcp` | `127.0.0.1:8950`（KeepAlive） | `~/Library/Logs/dalton-alphaengine-mcp.log`、`~/Library/Logs/dalton-alphaengine-mcp.err.log` |
+| **AlphaEngine 桌面端看门狗**：运行 `desktop-watchdog.sh`，检测桌面端存活与 MCP 鉴权状态；应用未启动时拉起，登录失效或模块页未打开时通过频道网关 `/internal/ops-alerts`（失败时退回 macOS 通知）提醒 | `com.dalton.alphaengine-desktop-watchdog` | 每 `120` 秒（StartInterval） | `~/Library/Logs/dalton-alphaengine-desktop-watchdog.log`、`~/Library/Logs/dalton-alphaengine-desktop-watchdog.err.log`；状态位于 `$DALTON_RESEARCH_HOME/state/alphaengine-desktop-watchdog.json` |
+| **Guidepoint MCP 代理**：运行 `guidepoint_mcp_proxy.py`（`/opt/homebrew/bin/python3.12`），自动刷新短期 OAuth 访问令牌并转发 MCP 请求 | `com.dalton.guidepoint-mcp-proxy` | `127.0.0.1:8943`（KeepAlive） | `~/Library/Logs/dalton-guidepoint-mcp-proxy.log`、`~/Library/Logs/dalton-guidepoint-mcp-proxy.err.log` |
+
+- **切换与回滚（支持与研究运行时迁移任意顺序执行）**：
+  `host_services_switch.sh` 会自动读取 `~/.config/dalton/researchdata-bridge.env` 判断当前桥接模式并沿用对应数据目录（旧模式下 plist 只注入 `DALTON_OCW_ROOT` 并共用旧目录文件；新模式下注入 `DALTON_RESEARCH_HOME`），因此**常驻服务切换与研究运行时数据迁移（`research_runtime_migrate.sh`）可按任意顺序执行**。若先切换常驻服务、后执行 `research_runtime_migrate.sh --switch`，迁移脚本会在桥接切换成功后自动对已加载的 `com.dalton.*` 服务执行 `host_services_switch.sh --apply --rerender-only`，把它们同步切到新数据目录。
+  ```bash
+  # 1. 只读查看检测到的模式、服务数据路径与新旧标签当前状态
+  bash scripts/dalton/ops/host_services_switch.sh --plan
+
+  # 2. 按顺序逐个切换（停旧标签 → 确认卸载与端口释放 → disable 旧标签 → enable/bootstrap 新标签 → 健康与 PID 校验）
+  bash scripts/dalton/ops/host_services_switch.sh --apply
+
+  # 3. 仅重新渲染并重启已加载的 com.dalton.* 服务（适合桥接切换模式后同步路径）
+  bash scripts/dalton/ops/host_services_switch.sh --apply --rerender-only
+
+  # 4. 切回原有的 ai.openclaw.* 标签（旧 plist 在切换时已保留）
+  bash scripts/dalton/ops/host_services_switch.sh --rollback
+  ```
+  也可执行 `.venv/bin/python scripts/dalton/researchdata_bridge.py --check-runtime`，在输出 JSON 的 `host_services` 字段中查看 `8950`、`8943` 端口连通性与当前生效标签。
+
+- **Guidepoint 令牌失效后重新授权**：
+  ```bash
+  /opt/homebrew/bin/python3.12 scripts/dalton/research_runtime/scripts/guidepoint_mcp_oauth.py
+  ```
+  脚本会启动 `http://localhost:8942/callback` 并打开浏览器完成 OAuth 授权，默认从环境变量或 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp.env`（可用 `GUIDEPOINT_ENV_FILE` 覆盖）读取客户端凭据，授权完成后把新令牌以 `0600` 权限原子写入 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp_tokens.json`（默认对应 `~/Library/Application Support/Everflow/research/config/guidepoint_mcp_tokens.json`，可用 `GUIDEPOINT_TOKENS_FILE` 覆盖；仅设置 `DALTON_OCW_ROOT` 时写入 `$DALTON_OCW_ROOT/config/guidepoint_mcp_tokens.json`）。更新令牌后执行 `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` 让代理立即生效。
 
 ## 4. 备份与恢复
 

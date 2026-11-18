@@ -373,6 +373,9 @@ print_plan() {
         "state/venvs/consensus-estimates" \
         "[$(human_size "${CONSENSUS_VENV_DIR}")]" \
         "${consensus_mm:-python3 fallback}"
+    printf '   - %-34s %-8s    (下载临时目录，不复制)\n' \
+        "temp/alphaengine-mcp-downloads" \
+        "[$(human_size "${SRC_ROOT}/temp/alphaengine-mcp-downloads")]"
     local total_mb=$((total_kb / 1024))
     echo "   * 合计目录估算体积: ~${total_mb} MiB (含 SQLite 文件大小; --apply 前会校验磁盘剩余空间)"
     echo ""
@@ -391,9 +394,13 @@ print_plan() {
         IFS='|' read -r rel_src rel_dst desc <<< "${entry}"
         echo "   rsync -a --exclude='*.db' --exclude='*.sqlite' --exclude='*-wal' --exclude='*-shm' --exclude='*-journal' --exclude='*.lock' --exclude='venv/' \"${SRC_ROOT}/${rel_src}/\" \"<stage>/${rel_dst}/\""
     done
-    echo "   # 复制个人配置文件到 \$DALTON_RESEARCH_HOME/config/ (0600):"
+    echo "   # 复制个人配置文件与凭据/状态到 \$DALTON_RESEARCH_HOME/ (0600, 不读取内容):"
     echo "   #   skills/market-digest/config.json -> <stage>/config/config.json"
     echo "   #   config/eve_tracking_mirror.json -> <stage>/config/eve_tracking_mirror.json"
+    echo "   #   config/guidepoint_mcp.env -> <stage>/config/guidepoint_mcp.env"
+    echo "   #   config/guidepoint_mcp_tokens.json -> <stage>/config/guidepoint_mcp_tokens.json"
+    echo "   #   state/alphaengine-desktop-watchdog.json -> <stage>/state/alphaengine-desktop-watchdog.json (存在才复制)"
+    echo "   #   state/alphaengine-desktop-watchdog.last-notified -> <stage>/state/alphaengine-desktop-watchdog.last-notified (存在才复制)"
     echo "   # 改写 state/research-images/queue/*.json 中指向 ${SRC_ROOT} 的绝对路径为 ${DST_ROOT} 并校验引用文件存在"
     echo ""
 
@@ -403,7 +410,7 @@ print_plan() {
     echo "   # Step B: 重建 6 个 skill venv 到 \$DALTON_RESEARCH_HOME/venvs/<skill>"
     echo "   bash \"${SCRIPT_DIR}/research_runtime_migrate.sh\" --rebuild-venvs"
     echo "   # Step C: 切换前先确认 ${BRIDGE_ENV_FILE} 已配置 EDGAR_IDENTITY（及 GEMINI_API_KEY）"
-    echo "   # Step D: 执行切换（校验 EDGAR_IDENTITY 与 --check-runtime，备份并改写 market-digest-prepare.json / market-digest-output.json，再执行 install_bridge.sh --research-runtime=new）"
+    echo "   # Step D: 执行切换（校验 EDGAR_IDENTITY 与 --check-runtime，备份并改写 market-digest-prepare.json / market-digest-output.json，执行 install_bridge.sh --research-runtime=new；若 com.dalton.* 常驻服务已加载，同步执行 host_services_switch.sh --apply --rerender-only）"
     echo "   bash \"${SCRIPT_DIR}/research_runtime_migrate.sh\" --switch"
     echo "================================================================================"
 }
@@ -604,11 +611,13 @@ PY
 
     rewrite_queue_json_paths "${STAGE_DIR}" "${SRC_ROOT}" "${DST_ROOT}"
 
-    mkdir -p "${STAGE_DIR}/config"
+    mkdir -p "${STAGE_DIR}/config" "${STAGE_DIR}/state"
     local cfg_pair src_cfg_rel dst_cfg_rel src_cfg_path dst_cfg_path
     for cfg_pair in \
         "skills/market-digest/config.json|config/config.json" \
-        "config/eve_tracking_mirror.json|config/eve_tracking_mirror.json"; do
+        "config/eve_tracking_mirror.json|config/eve_tracking_mirror.json" \
+        "config/guidepoint_mcp.env|config/guidepoint_mcp.env" \
+        "config/guidepoint_mcp_tokens.json|config/guidepoint_mcp_tokens.json"; do
         IFS='|' read -r src_cfg_rel dst_cfg_rel <<< "${cfg_pair}"
         src_cfg_path="${SRC_ROOT}/${src_cfg_rel}"
         dst_cfg_path="${STAGE_DIR}/${dst_cfg_rel}"
@@ -622,6 +631,23 @@ PY
             echo "[copy] ${src_cfg_path} -> ${dst_cfg_path} (0600)"
         else
             echo "[skip] missing personal config: ${src_cfg_path}"
+        fi
+    done
+
+    local watchdog_rel src_watchdog_path dst_watchdog_path
+    for watchdog_rel in \
+        "state/alphaengine-desktop-watchdog.json" \
+        "state/alphaengine-desktop-watchdog.last-notified"; do
+        src_watchdog_path="${SRC_ROOT}/${watchdog_rel}"
+        dst_watchdog_path="${STAGE_DIR}/${watchdog_rel}"
+        if [[ -L "${src_watchdog_path}" ]]; then
+            echo "ERROR: refusing to copy symlink state file: ${src_watchdog_path}" >&2
+            exit 1
+        fi
+        if [[ -f "${src_watchdog_path}" ]]; then
+            cp -p "${src_watchdog_path}" "${dst_watchdog_path}"
+            chmod 600 "${dst_watchdog_path}"
+            echo "[copy] ${src_watchdog_path} -> ${dst_watchdog_path}"
         fi
     done
 
@@ -915,13 +941,7 @@ PY
         plist_snapshot="$(mktemp)"; TMP_ARTIFACTS+=("${plist_snapshot}")
         cp -p "${bridge_plist}" "${plist_snapshot}"; chmod 600 "${plist_snapshot}"
     fi
-    if ! (
-        DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
-        DALTON_RESEARCH_CODE="${CODE_ROOT}" \
-        DALTON_RESEARCH_HOME="${DST_ROOT}" \
-            bash "${REPO_ROOT}/scripts/dalton/install_bridge.sh" --research-runtime=new
-    ); then
-        echo "ERROR: install_bridge.sh --research-runtime=new failed; rolling back configs and bridge to legacy" >&2
+    _rollback_switch() {
         local restored_summary=""
         restored_summary="$("${helper_py}" - "${rollback_manifest}" <<'PY'
 import os
@@ -970,7 +990,46 @@ PY
         else
             echo "ERROR: legacy bridge rollback (install_bridge.sh --research-runtime=legacy) also failed" >&2
         fi
+    }
+
+    if ! (
+        DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
+        DALTON_RESEARCH_CODE="${CODE_ROOT}" \
+        DALTON_RESEARCH_HOME="${DST_ROOT}" \
+            bash "${REPO_ROOT}/scripts/dalton/install_bridge.sh" --research-runtime=new
+    ); then
+        echo "ERROR: install_bridge.sh --research-runtime=new failed; rolling back configs and bridge to legacy" >&2
+        _rollback_switch
         exit 1
+    fi
+
+    # 5. If any com.dalton.* host research service is already loaded, rerender and restart it onto the new data root.
+    local launchctl_cmd="${LAUNCHCTL_BIN:-launchctl}"
+    local uid_num
+    uid_num="$(id -u)"
+    local need_host_rerender=0
+    local svc_lbl
+    for svc_lbl in \
+        "com.dalton.alphaengine-mcp" \
+        "com.dalton.alphaengine-desktop-watchdog" \
+        "com.dalton.guidepoint-mcp-proxy"; do
+        if "${launchctl_cmd}" print "gui/${uid_num}/${svc_lbl}" >/dev/null 2>&1; then
+            need_host_rerender=1
+            break
+        fi
+    done
+    if [[ "${need_host_rerender}" -eq 1 ]]; then
+        echo "[switch] detected loaded com.dalton.* host service(s); running host_services_switch.sh --apply --rerender-only"
+        if ! (
+            DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
+            DALTON_RESEARCH_CODE="${CODE_ROOT}" \
+            DALTON_RESEARCH_HOME="${DST_ROOT}" \
+                bash "${SCRIPT_DIR}/host_services_switch.sh" --apply --rerender-only
+        ); then
+            echo "ERROR: host_services_switch.sh --apply --rerender-only failed; rolling back configs and bridge" >&2
+            _rollback_switch
+            exit 1
+        fi
     fi
 }
 

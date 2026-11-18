@@ -191,3 +191,182 @@ describe("ops-alerts backup_failed", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("ops-alerts alphaengine watchdog codes", () => {
+  it("returns ops_alerts_unconfigured (503) when alphaengine message keys are omitted without breaking required keys", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-ae-missing-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_1" }));
+    const backendRes = await handleOpsAlert({
+      body: { code: "backend_down" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(backendRes.status).toBe(200);
+    expect(sender).toHaveBeenCalledTimes(1);
+
+    for (const code of ["alphaengine_login_required", "alphaengine_module_page_required"]) {
+      const res = await handleOpsAlert({
+        body: { code },
+        remoteAddress: "127.0.0.1",
+        configPath,
+        sendPlainText: sender,
+      });
+      expect(res.status).toBe(503);
+      expect(res.data.code).toBe("ops_alerts_unconfigured");
+    }
+    expect(sender).toHaveBeenCalledTimes(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("handles configured alphaengine watchdog codes via handleOpsAlert and rejects blank text or detail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-ae-direct-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+          alphaengine_login_required: "AlphaEngine 登录失效",
+          alphaengine_module_page_required: "AlphaEngine 需要打开模块页",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_ae_1" }));
+    const r1 = await handleOpsAlert({
+      body: { code: "alphaengine_login_required" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(r1.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith("feishu:user:ou_ops_a", "AlphaEngine 登录失效");
+
+    const r2 = await handleOpsAlert({
+      body: { code: "alphaengine_module_page_required" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(r2.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith("feishu:user:ou_ops_a", "AlphaEngine 需要打开模块页");
+
+    const rDetail = await handleOpsAlert({
+      body: { code: "alphaengine_module_page_required", detail: "no" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(rDetail.status).toBe(400);
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+          alphaengine_login_required: "   ",
+        },
+      }),
+    );
+    const rBlank = await handleOpsAlert({
+      body: { code: "alphaengine_login_required" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(rBlank.status).toBe(503);
+    expect(rBlank.data.code).toBe("ops_alerts_unconfigured");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("sends configured alphaengine_login_required and alphaengine_module_page_required alerts and rejects detail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-ae-ok-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a", "feishu:chat:oc_ops_room"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+          alphaengine_login_required: "AlphaEngine 登录失效，请在宿主机重新登录",
+          alphaengine_module_page_required: "AlphaEngine 需要打开任意模块页",
+        },
+      }),
+    );
+
+    const sent: Array<{ targetAddress: string; text: string }> = [];
+    const feishu = Object.assign(new FakeChannelAdapter("feishu"), {
+      sendPlainText: async (options: { targetAddress: string; text: string }) => {
+        sent.push(options);
+        return { messageId: `om_${sent.length}` };
+      },
+    });
+    const app = appFor(
+      createMockBackend(),
+      new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      { DALTON_OPS_ALERTS_FILE: configPath },
+    );
+    const { host, port } = await app.start();
+
+    try {
+      const loginRes = await fetch(`http://${host}:${port}/internal/ops-alerts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Service-Token": TEST_SERVICE_TOKEN,
+        },
+        body: JSON.stringify({ code: "alphaengine_login_required" }),
+      });
+      expect(loginRes.status).toBe(200);
+
+      const pageRes = await fetch(`http://${host}:${port}/internal/ops-alerts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Service-Token": TEST_SERVICE_TOKEN,
+        },
+        body: JSON.stringify({ code: "alphaengine_module_page_required" }),
+      });
+      expect(pageRes.status).toBe(200);
+
+      const withDetail = await fetch(`http://${host}:${port}/internal/ops-alerts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Service-Token": TEST_SERVICE_TOKEN,
+        },
+        body: JSON.stringify({ code: "alphaengine_login_required", detail: "unexpected" }),
+      });
+      expect(withDetail.status).toBe(400);
+
+      expect(sent).toEqual([
+        { targetAddress: "feishu:user:ou_ops_a", text: "AlphaEngine 登录失效，请在宿主机重新登录" },
+        { targetAddress: "feishu:chat:oc_ops_room", text: "AlphaEngine 登录失效，请在宿主机重新登录" },
+        { targetAddress: "feishu:user:ou_ops_a", text: "AlphaEngine 需要打开任意模块页" },
+        { targetAddress: "feishu:chat:oc_ops_room", text: "AlphaEngine 需要打开任意模块页" },
+      ]);
+    } finally {
+      await app.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

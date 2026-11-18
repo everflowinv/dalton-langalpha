@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.alphaengine-desktop-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/scripts/dalton/research_runtime/scripts/alphaengine-mcp/desktop-watchdog.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__/scripts/dalton/research_runtime</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ALPHAENGINE_MCP_URL</key>
+        <string>http://127.0.0.1:8950</string>
+        <key>__RUNTIME_ENV_KEY__</key>
+        <string>__RUNTIME_ENV_VAL__</string>
+        <key>DALTON_CHANNEL_GATEWAY_ENV_FILE</key>
+        <string>__HOME__/.config/dalton/channel-gateway.env</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-alphaengine-desktop-watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-alphaengine-desktop-watchdog.err.log</string>
+</dict>
+</plist>
