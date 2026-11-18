@@ -69,7 +69,7 @@ models:
     - "deepseek-flash"
   probe_models:
     claude-oauth: "claude-sonnet-5-5-oauth"
-    codex-oauth: "gpt-6.1-sol-oauth"
+    codex-oauth: "gpt-6.2-sol-oauth"
     antigravity-oauth: "gemini-3.8-flash-low-oauth"
     muse-oauth: "muse-spark-1.3-oauth"
     xai-oauth: "grok-4.7-oauth"
@@ -105,7 +105,7 @@ mandate:
 
 publish:
   reviewer_models:
-    - "gpt-6.1-sol-oauth"
+    - "gpt-6.2-sol-oauth"
     - "gemini-4-argon-high-oauth"
     - "grok-4.7-oauth"
     - "claude-opus-5-5-oauth"
@@ -117,7 +117,7 @@ publish:
   # the effective default stays argon-medium without repeating the key here.
   language_model: ""
   audit_fallback_models:
-    - "gpt-6.1-sol-oauth"
+    - "gpt-6.2-sol-oauth"
     - "claude-opus-5-5-oauth"
   audit_timeout_s: 300
   audit_concurrency: 4
@@ -174,4 +174,4 @@ internal_llm:
   allowed_models:
     - "gemini-4-hydrogen-high-oauth"
     - "gemini-4-argon-medium-oauth"
-    - "gpt-6.1-sol-oauth"
+    - "gpt-6.2-sol-oauth"

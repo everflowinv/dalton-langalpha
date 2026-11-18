@@ -449,9 +449,9 @@ def test_native_catalog_build_entries_inherit_protocol_fields_only(monkeypatch):
     added = [
         {
             "provider": "codex-oauth",
-            "upstream_id": "gpt-6.2-sol",
-            "display_name": "GPT-6.2 Sol",
-            "suggested_key": "gpt-6.2-sol-oauth",
+            "upstream_id": "gpt-6.9-sol",
+            "display_name": "GPT-6.9 Sol",
+            "suggested_key": "gpt-6.9-sol-oauth",
             "conflict": False,
             "context": 1050000,
             "max_output": None,
@@ -463,10 +463,10 @@ def test_native_catalog_build_entries_inherit_protocol_fields_only(monkeypatch):
     ]
     models_out, meta_out = build_overlay_entries(added, llm_config, meta_map)
 
-    entry = models_out["gpt-6.2-sol-oauth"]
-    assert entry["model_id"] == "gpt-6.2-sol"
+    entry = models_out["gpt-6.9-sol-oauth"]
+    assert entry["model_id"] == "gpt-6.9-sol"
     assert entry["provider"] == "codex-oauth"
-    assert entry["display_name"] == "GPT-6.2 Sol"
+    assert entry["display_name"] == "GPT-6.9 Sol"
     assert entry["visible"] is True
     assert entry["context"] == 1050000
     # Provider-uniform parameters ride along; model-specific ones don't.
@@ -480,10 +480,10 @@ def test_native_catalog_build_entries_inherit_protocol_fields_only(monkeypatch):
         "write": "parameters.reasoning.effort",
     }
 
-    meta = meta_out["gpt-6.2-sol-oauth"]
+    meta = meta_out["gpt-6.9-sol-oauth"]
     assert meta["family"] == "openai-gpt"
     assert meta["billing"] == "subscription"
-    assert "notional_ref" not in meta  # gpt-6.2-sol has no cash card
+    assert "notional_ref" not in meta  # gpt-6.9-sol has no cash card
 
 
 def test_native_catalog_build_entries_antigravity_family_templates(monkeypatch):

@@ -388,7 +388,7 @@ def test_internal_llm_complete_auth_whitelist_forward_and_failure(
         {
             "gemini-4-hydrogen-high-oauth",
             "gemini-4-argon-medium-oauth",
-            "gpt-6.1-sol-oauth",
+            "gpt-6.2-sol-oauth",
         }
     )
 
@@ -438,13 +438,13 @@ def test_internal_llm_complete_auth_whitelist_forward_and_failure(
             status="budget_exhausted",
             error_kind="budget_exhausted",
             error="monthly quota reached",
-            model="gpt-6.1-sol-oauth",
+            model="gpt-6.2-sol-oauth",
         ),
     )
     monkeypatch.setattr("src.dalton.app.internal_llm_router.dalton_complete", mock_fail)
     resp_fail = client.post(
         "/api/v1/dalton/internal/llm/complete",
-        json={**valid_body, "model": "gpt-6.1-sol-oauth", "response_schema": None},
+        json={**valid_body, "model": "gpt-6.2-sol-oauth", "response_schema": None},
         headers={"X-Service-Token": valid_token},
     )
     assert resp_fail.status_code == 200

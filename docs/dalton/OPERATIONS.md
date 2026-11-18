@@ -194,6 +194,29 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
     DALTON_USAGE_STATE_DIR="$(mktemp -d)" bash scripts/dalton/ops/usage_collector_run.sh
     ```
 
+### 3.5 生产模型切换脚本（`switch_model_refs.py`）
+
+升级默认模型后，用 `scripts/dalton/ops/switch_model_refs.py` 批量迁移 `automations.llm_model`（仅 `deleted_at IS NULL`）、`conversation_threads.llm_model` 及 `user_preferences.model_preference` 中的系统模型引用：
+
+```bash
+# 1. 必须先执行计划模式（只读，不写库；列出受影响行、指令原文片段及建议改法）
+.venv/bin/python scripts/dalton/ops/switch_model_refs.py \
+  --from gpt-6.1-sol-oauth --to gpt-6.2-sol-oauth \
+  --from gpt-6-astra-oauth --to gpt-6.2-astra-oauth
+
+# 2. 确认计划后加 --apply 执行；计划里含公司自动化（scope='company'）时必须传 --actor-user-id
+.venv/bin/python scripts/dalton/ops/switch_model_refs.py \
+  --from gpt-6.1-sol-oauth --to gpt-6.2-sol-oauth \
+  --from gpt-6-astra-oauth --to gpt-6.2-astra-oauth \
+  --actor-user-id <内部成员或管理员 user_id> \
+  --apply
+```
+
+- **先计划后写入**：默认不加 `--apply` 为只读计划模式；写入前会校验 `scope='company'` 是否提供了合法的 `--actor-user-id`（经 `is_internal_or_admin` 校验为内部成员或管理员），缺失或无权限会在写入任何数据前报错退出。
+- **归档文件位置**：执行 `--apply` 前把原始值以 `0600` 权限写入 `var/dalton/operator-records/model-switch-<UTC时间戳>.json`，并在偏好 CAS 写入完成后同步记录实际被替换的原值与跳过的冲突用户。
+- **范围边界**：用户自定义模型（`model_preference.custom_models`）**不在切换范围内**，脚本不会改动；`automations.instruction` 文本中的旧模型名只列出原文片段与建议改法，**不会自动改写**。
+- **并发与中断恢复**：线程只更新计划内的 `thread_id`（事务内核对行数不符即回滚）；用户偏好在事务内加锁重读并通过 CAS 保护，冲突时跳过该用户并报告；任一阶段失败会打印已完成与未完成进度摘要并以非零退出码退出，修复后可直接重跑（幂等，已切换行不会再次进入计划）。
+
 ## 4. 备份与恢复
 
 完整备份配置和首次 `rclone` 授权步骤见 [scripts/dalton/ops/README.md](../../scripts/dalton/ops/README.md)。生产关键规则如下：

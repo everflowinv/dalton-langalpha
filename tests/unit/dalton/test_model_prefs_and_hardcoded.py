@@ -168,6 +168,8 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/notional_pricing.py", "gemini-4-argon-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gpt-6-astra-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gpt-6.1-sol-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gpt-6.2-astra-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gpt-6.2-sol-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     # Default model field on ChatAntigravity LangChain wrapper
     ("llm/providers/antigravity/client.py", "gemini-4-argon-medium"): "Default model attribute on ChatAntigravity LangChain wrapper",
     ("settings.py", "gemini-4-argon-medium-oauth"): "Default extractor_fallback_model on DaltonConversationsConfig",
@@ -224,7 +226,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert "ocb-deepseek-deepseek-flash" not in settings_mod.get_assist_fallback_models()
     assert real_settings.publish.audit_model == "gemini-4-argon-medium-oauth"
     assert real_settings.publish.audit_fallback_models == [
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
     ]
     assert real_settings.publish.audit_timeout_s == 300.0
@@ -233,7 +235,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     assert real_settings.internal_llm.allowed_models == [
         "gemini-4-hydrogen-high-oauth",
         "gemini-4-argon-medium-oauth",
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
     ]
     assert real_settings.conversations.extractor_model == "deepseek-flash"
     assert not hasattr(real_settings.publish, "extract_model")
@@ -241,7 +243,7 @@ def test_settings_defaults_empty_when_dalton_yaml_missing_and_single_assist_sour
     sys_defaults = mp_mod.get_dalton_system_defaults()
     assert sys_defaults["dalton_audit_model"] == "gemini-4-argon-medium-oauth"
     assert sys_defaults["dalton_audit_fallback_models"] == [
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
     ]
     assert sys_defaults["dalton_audit_timeout_s"] == 300
@@ -536,9 +538,9 @@ async def test_restore_probe_models_budget_fallback_and_complete_empty_model_gua
     )
     assert (
         ps_mod._pick_probe_model(
-            "codex-oauth", ["gpt-6-astra-oauth", "gpt-6.1-sol-oauth"], {}
+            "codex-oauth", ["gpt-6.2-astra-oauth", "gpt-6.2-sol-oauth"], {}
         )
-        == "gpt-6.1-sol-oauth"
+        == "gpt-6.2-sol-oauth"
     )
 
     # 2. _notional_price_index retains fallback nominal rates when price card is empty/missing
@@ -587,7 +589,7 @@ def test_apply_role_models_script_dry_run_and_normal_mode(
     orig_md = apply_mod.REVIEWER_MD_PATH.read_text(encoding="utf-8")
     temp_md = tmp_path / "dalton-reviewer.md"
     temp_md.write_text(
-        orig_md.replace("model: gpt-6.1-sol-oauth", "model: placeholder-model"),
+        orig_md.replace("model: gpt-6.2-sol-oauth", "model: placeholder-model"),
         encoding="utf-8",
     )
 
@@ -753,7 +755,7 @@ async def test_dalton_pref_shadowed_by_later_custom_model_is_ignored(
     assert await mp_mod.dalton_model_pref("user-member", "dalton_audit_model") is None
     assert await mp_mod.resolve_dalton_audit_model("user-member") == ""
     assert await mp_mod.resolve_dalton_audit_fallback_models("user-member") == [
-        "gpt-6.1-sol-oauth"
+        "gpt-6.2-sol-oauth"
     ]
     mock_complete = create_autospec(assist_mod.dalton_complete)
     monkeypatch.setattr(assist_mod, "dalton_complete", mock_complete)

@@ -873,6 +873,8 @@ exit 7
 
     migrate_env = {
         **ctx["env"],
+        # ctx["env"] is built without os.environ; carry the autouse ps stub over.
+        "DALTON_MIGRATE_PS_BIN": os.environ["DALTON_MIGRATE_PS_BIN"],
         "DALTON_BRIDGE_ENV_FILE": str(bridge_env),
         "DALTON_REPO_ENV_FILE": str(tmp_path / ".env"),
         "DALTON_BRIDGE_LOGS_DIR": str(tmp_path / "Logs"),

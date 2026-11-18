@@ -17,8 +17,8 @@ description: "AI 应用周度监控：补库与变化周报，四表筛选、原
 
 ## 模式
 
-- **补库**（每周二 16:00 Asia/Hong_Kong，模型 `gpt-6.1-sol-oauth`）：只入库，不写周报。绑定的报告配置 `ai-app-weekly` 只用于失败告警。成功时不调用 `automation_report`，最终回复只写 `NO_REPLY`。只有 `self-test` 失败、CLI 本身报错无法继续、工作区不可写、同一原因连续影响 3 家及以上公司这类全局问题才整轮停止并调用 `automation_report(failure_text=...)`，`report_run_id` 为 `ai-app-db-refresh-<tuesday>`（`<tuesday>` 为 Asia/Hong_Kong 当周周二日期，格式 `YYYY-MM-DD`）。
-- **周报**（每周五 15:00 Asia/Hong_Kong，模型 `gpt-6-astra-oauth`）：按下面的周报步骤生成变化周报。`report_run_id` 为 `ai-app-weekly-<friday>`（`<friday>` 为 Asia/Hong_Kong 当周周五日期，格式 `YYYY-MM-DD`）。
+- **补库**（每周二 16:00 Asia/Hong_Kong，模型 `gpt-6.2-sol-oauth`）：只入库，不写周报。绑定的报告配置 `ai-app-weekly` 只用于失败告警。成功时不调用 `automation_report`，最终回复只写 `NO_REPLY`。只有 `self-test` 失败、CLI 本身报错无法继续、工作区不可写、同一原因连续影响 3 家及以上公司这类全局问题才整轮停止并调用 `automation_report(failure_text=...)`，`report_run_id` 为 `ai-app-db-refresh-<tuesday>`（`<tuesday>` 为 Asia/Hong_Kong 当周周二日期，格式 `YYYY-MM-DD`）。
+- **周报**（每周五 15:00 Asia/Hong_Kong，模型 `gpt-6.2-astra-oauth`）：按下面的周报步骤生成变化周报。`report_run_id` 为 `ai-app-weekly-<friday>`（`<friday>` 为 Asia/Hong_Kong 当周周五日期，格式 `YYYY-MM-DD`）。
 
 时区 Asia/Hong_Kong。周报窗口是上周五 15:00 至本周五 15:00。周四美股盘后（等于周五 04:00）在窗口内。周五美股盘前与盘后滚入下一周。补库窗口是上周五 15:00 至本周二运行时刻。周二 16:00 已经入库的公司，周五只补周二 16:00 之后新出业绩的公司。
 

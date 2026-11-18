@@ -7,7 +7,7 @@ description: "无人值守的腾讯会议周会纪要：只读拉取录制与转
 
 无人值守。不提问，不创建子任务。不调用 `message`。本轮只做这一份周会纪要。
 
-模型用 `gpt-6.1-sol-oauth`。主任务是每周一 15:00（Asia/Shanghai），时限 60 分钟。兜底是每周一 21:00（Asia/Shanghai）。两种模式由自动化指令写明，技能不自行选择。两条自动化共用一个 `report_run_id`：`tmeet-weekly-minutes-<会议日期>`。有会议时 `<会议日期>` 是 `fetch` 返回的 `meeting_date`，格式 `YYYY-MM-DD`。未登录、无录制等拿不到会议日期时，用 `tmeet-weekly-minutes-<上海当天日期>`，直接采用脚本返回的 `report_run_id`。失败文案只用文末「失败文案」清单里的原句。
+模型用 `gpt-6.2-sol-oauth`。主任务是每周一 15:00（Asia/Shanghai），时限 60 分钟。兜底是每周一 21:00（Asia/Shanghai）。两种模式由自动化指令写明，技能不自行选择。两条自动化共用一个 `report_run_id`：`tmeet-weekly-minutes-<会议日期>`。有会议时 `<会议日期>` 是 `fetch` 返回的 `meeting_date`，格式 `YYYY-MM-DD`。未登录、无录制等拿不到会议日期时，用 `tmeet-weekly-minutes-<上海当天日期>`，直接采用脚本返回的 `report_run_id`。失败文案只用文末「失败文案」清单里的原句。
 
 接收方在自动化配置的 `metadata.report_profile`（`tmeet-weekly-minutes`）中定义：成功摘要投递到 `text_targets`，失败通知投递到 `failure_targets`。技能正文、`config.json` 和 `automation_report` 参数都不写接收方。
 
