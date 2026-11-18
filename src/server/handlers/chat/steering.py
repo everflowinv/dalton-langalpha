@@ -93,6 +93,7 @@ def steer_payload(
     request_key: str | None = None,
     origin: dict | None = None,
     artifact_comments: ShownSend | None = None,
+    checked_computer_id: str | None = None,
     # DALTON-HOOK(chat-large-upload): carry lightweight chat_upload references and verified attachment metadata
     chat_uploads: list[dict[str, Any]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
@@ -100,7 +101,9 @@ def steer_payload(
     """A main-thread steer job's payload, before any lifecycle key.
 
     ``artifact_comments`` is what a reader is shown for a send carrying file
-    comments, kept with it whichever turn reads it.
+    comments, kept with it whichever turn reads it. ``checked_computer_id``
+    goes with it too, so a steer no turn read starts its own turn held to the
+    computer its send was checked on.
     """
     # Half a surrogate pair gets through the request's JSON parser but cannot
     # be stored as JSONB or encoded for the wire.
@@ -124,6 +127,8 @@ def steer_payload(
         payload["chat_uploads"] = chat_uploads
     if attachments:
         payload["attachments"] = attachments
+    if checked_computer_id is not None:
+        payload["checked_computer_id"] = checked_computer_id
     return payload
 
 

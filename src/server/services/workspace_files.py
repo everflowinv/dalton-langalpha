@@ -18,6 +18,8 @@ from src.server.database.workspace_folders import (
     is_top_level,
     workspace_folder_in_use,
 )
+from src.server.services.computer_usage.causes import computer_cause
+from src.server.models.computer_cause import StartCause
 from src.server.services.workspace_file_containment import (
     contained_absolute_path,
     contained_sandbox_path,
@@ -89,7 +91,7 @@ def not_running_for_upload(workspace: dict[str, Any]) -> HTTPException:
 
 
 async def acquire_sandbox(
-    workspace_id: str, user_id: str
+    workspace_id: str, user_id: str, cause: StartCause = "files"
 ) -> tuple[Any, dict[str, Any]]:
     """A ready sandbox and the workspace row as the acquisition left it, or the
     failure's answer: 503, or 422 when an owner's SSH machine refused.
@@ -102,7 +104,8 @@ async def acquire_sandbox(
     """
     manager = WorkspaceManager.get_instance()
     try:
-        session = await manager.get_session_for_workspace(workspace_id, user_id=user_id)
+        with computer_cause(cause):
+            session = await manager.get_session_for_workspace(workspace_id, user_id=user_id)
     except Exception as e:
         # The app-level handler's answer, status and wording: the file panel
         # categorizes on the 503's detail, whose "starting" sub-case has to
@@ -126,7 +129,7 @@ async def acquire_sandbox(
 
 @asynccontextmanager
 async def acquire_sandbox_to_change(
-    workspace_id: str, user_id: str
+    workspace_id: str, user_id: str, cause: StartCause = "files"
 ) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
     """``acquire_sandbox`` for a route that touches files by path: the folder
     stays put until the block ends, and the row is read under that hold.
@@ -135,7 +138,7 @@ async def acquire_sandbox_to_change(
     the sandbox read is gone, or is a sibling's that landed on the old name,
     whose files would answer as this workspace's.
     """
-    sandbox, _ = await acquire_sandbox(workspace_id, user_id)
+    sandbox, _ = await acquire_sandbox(workspace_id, user_id, cause)
     async with held_workspace_row(workspace_id) as workspace:
         yield sandbox, workspace
 

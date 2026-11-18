@@ -439,7 +439,7 @@ async def test_routes_keep_uuid_on_agent_and_data_on_script() -> None:
                 return_value=_detail(),
             ) as script_update,
             patch(
-                "src.server.app.automations.assert_automation_target",
+                "src.server.app.automations.cli_approval.automation_runs",
                 new_callable=AsyncMock,
             ) as target,
         ):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar
@@ -19,6 +20,17 @@ DEFAULT_SANDBOX_ROOT: str = "/home/workspace"
 LEGACY_SANDBOX_ROOTS: tuple[str, ...] = ("/home/daytona",)
 
 SANDBOX_ROOTS: tuple[str, ...] = (DEFAULT_SANDBOX_ROOT, *LEGACY_SANDBOX_ROOTS)
+
+
+def name_fold(path: str) -> str:
+    """*path* as a Mac's disk compares names, ignoring letter case and Unicode
+    normalization, so two spellings of one folder compare equal.
+
+    A Linux disk tells them apart, but a computer never holds two folders of
+    its own that differ only so (``workspace_layout``), so a check folded this
+    way refuses no folder it would otherwise allow there.
+    """
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", path).casefold())
 
 
 def computer_roots(own: str | None) -> tuple[str, ...]:
@@ -558,7 +570,9 @@ THREAD_INDEX: str = f"{SandboxLayout.AGENTS_DIR}/threads.jsonl"
 
 # What the file mount links in at the computer root, besides the thread index;
 # the per-workspace subtrees join them only where an unsplit workspace owns
-# the root.
+# the root. Every workspace folder links these to the root's too, so a
+# folder's spelling of one names the computer's: the mount's points read that
+# off this list, and so does the path fold (``_folder_link_to_root``).
 ROOT_MOUNTED_AGENT_SUBDIRS: tuple[str, ...] = (
     SandboxLayout.USER_DIR,
     SandboxLayout.WORKFLOWS_DIR,
@@ -734,16 +748,18 @@ COMPUTER_ROOT_ENTRIES: frozenset[str] = frozenset({
 
 # Fold shared, store-backed user mounts onto the computer root or writes
 # bypass the store. Workspace skills, memory, tools and thread scratch are
-# excluded because they belong to the project folder.
+# excluded because they belong to the project folder. ``.agents/tmp`` is the
+# computer's only from a relative spelling: no link puts it in a folder, so a
+# folder's is a real directory of its own.
 COMPUTER_AGENT_SUBTREES: tuple[str, ...] = (
-    SandboxLayout.USER_DIR,
-    SandboxLayout.WORKFLOWS_DIR,
+    *ROOT_MOUNTED_AGENT_SUBDIRS,
     SandboxLayout.TMP_DIR,
 )
 
 
 def computer_tier_relative_path(path: str | None) -> str | None:
-    """Accept mount-relative spellings; absolute sandbox paths already identify their tier."""
+    """Accept mount-relative spellings; an absolute path in a workspace folder
+    is folded by :func:`_folder_link_to_root`."""
     candidate = (path or "").strip()
     if candidate.startswith("/"):
         candidate = candidate.lstrip("/")
@@ -789,6 +805,36 @@ def strip_previous_dir_name(
     if first and any(folded == name.casefold() for name in previous_dir_names):
         return rest
     return None
+
+
+def _folder_link_to_root(
+    path: str,
+    *,
+    workspace: str,
+    root: str,
+    siblings: Sequence[str] | None,
+    previous: Sequence[str] = (),
+) -> str | None:
+    """A folder's link into the computer tier, spelled at the root it names.
+
+    The store-backed routes are keyed on the root-anchored prefix. Left as
+    written, ``/home/workspace/Home/.agents/user/profile/portfolio.json``
+    misses them and reaches the sandbox, where the link leads into the file
+    mount and the mount refuses the write's temporary file beside the target.
+    Only a folder the turn knows is linked: its own, a sibling's, or the one it
+    was renamed out of.
+    """
+    root = root.rstrip("/")
+    if workspace == root or not path.startswith(f"{root}/"):
+        return None
+    relative = path[len(root) + 1 :]
+    first, _, rest = relative.partition("/")
+    known = (
+        first == posixpath.basename(workspace)
+        or first in (siblings or ())
+        or strip_previous_dir_name(relative, previous) is not None
+    )
+    return f"{root}/{rest}" if known and _under_any(rest, ROOT_MOUNTED_AGENT_SUBDIRS) else None
 
 
 def _root_entry_in_folder(
@@ -857,7 +903,14 @@ def resolve_agent_path(
         if path == allowed_dir or path.startswith(allowed_dir.rstrip("/") + "/"):
             collapsed = lexical_path(path)
             return (
-                _root_entry_in_folder(
+                _folder_link_to_root(
+                    collapsed,
+                    workspace=workspace,
+                    root=root,
+                    siblings=sibling_dir_names,
+                    previous=previous_dir_names,
+                )
+                or _root_entry_in_folder(
                     collapsed,
                     workspace=workspace,
                     root=root,

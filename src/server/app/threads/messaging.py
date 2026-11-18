@@ -34,14 +34,12 @@ from src.server.contracts.status import to_public
 from src.server.contracts.turn_kinds import ANNOUNCED_KEYS
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
+from src.server.dependencies import cli_approval
 from src.server.dependencies.principal import (
     Principal,
     ReadUserId,
     RunPrincipal,
     RunUserId,
-    assert_reaches,
-    check_turn_body,
-    refuse_rewrite,
     stamp_origin,
 )
 from src.server.dependencies.usage_limits import (
@@ -199,10 +197,11 @@ async def _consume_background_gen(
 class AdmittedTurn:
     """A turn's body as its caller may send it, with the admission it holds.
 
-    Built in one order: the caller's scope and path reach, the body cleared of
-    the server-only fields, what the body itself asks, the origin the server
-    states, and last the admission, so a refused body never holds a burst
-    slot.
+    Built in one order: the caller's scope and path checks, the body cleared
+    of the server-only fields, what the body itself asks, the user's OK for a
+    computer's turn on another computer, the origin the server states, and
+    last the admission, so a refused or declined body never holds a burst
+    slot or leaves a run.
     """
 
     thread_id: str
@@ -220,7 +219,11 @@ async def _admit(
     from_path: bool = False,
 ) -> AdmittedTurn:
     body = _client_body(body, raw_request)
-    await check_turn_body(principal, raw_request, body, thread_id, from_path=from_path)
+    checked = await cli_approval.admit_turn(
+        raw_request, principal, body, thread_id, from_path=from_path
+    )
+    if checked is not None:
+        body = body.model_copy(update={"checked_computer_id": checked})
     body = stamp_origin(principal, raw_request, body)
     return AdmittedTurn(
         thread_id=thread_id or str(uuid4()),
@@ -313,6 +316,7 @@ _SERVER_ONLY_FIELDS = (
     "surface_rules",
     "steer_job_id",
     "artifact_comments",
+    "checked_computer_id",
 )
 
 
@@ -430,7 +434,11 @@ async def _handle_send_message(
     from src.server.handlers.chat.image_intake import inline_image_urls
     from src.server.handlers.chat.error_handling import end_after_failure_frame
     from src.server.handlers.chat.setup_keepalive import SetupKeepaliveResponse
-    from src.server.services.turn_runtime import requested_workspace, turn_route
+    from src.server.services.turn_runtime import (
+        named_workspace_id,
+        requested_workspace,
+        turn_route,
+    )
 
     # Canonical run_id generation site. Each POST gets a fresh UUID that
     # flows through every downstream key: BTM ``(tid, rid)``, persistence
@@ -590,6 +598,8 @@ async def _handle_send_message(
             logger.debug(
                 f"[CHAT] Resolved workspace_id={workspace_id} from thread_id={thread_id}"
             )
+        else:
+            workspace_id = named_workspace_id(workspace_id, thread_meta)
 
         # Validate that agent_config is initialized
         if not hasattr(setup, "agent_config") or setup.agent_config is None:
@@ -659,17 +669,7 @@ async def _handle_send_message(
         )
         is_colleague_turn = ws_owner_id != str(user_id)
 
-        # Extract user input
-        user_input = ""
-        if request.messages:
-            last_msg = request.messages[-1]
-            if isinstance(last_msg.content, str):
-                user_input = last_msg.content
-            elif isinstance(last_msg.content, list):
-                for item in last_msg.content:
-                    if hasattr(item, "text") and item.text:
-                        user_input = item.text
-                        break
+        user_input = request.message_text()
 
         logger.info(
             f"[PTC_CHAT] New request: "
@@ -1797,9 +1797,10 @@ async def retry_thread(
     (``pending_input``). Returns an SSE stream, or for the server's own
     dispatched retry the run id as JSON, as a dispatched send does.
 
-    The path holds a computer's token to its thread as a send's does, and the
-    workspace the body names is held here, before the admission. Its origin
-    is not stamped: the retry runs the stored turn again, whoever sent that.
+    The path holds a computer's token to the send guard as a send's does,
+    and a retry on another computer waits for the user's OK here, before the
+    admission. Its origin is not stamped: the retry runs the stored turn
+    again, whoever sent that.
     """
     from src.server.database.runs import lifecycle as tl_db
     from src.server.handlers.chat.admission_gate import admission_conflict_detail
@@ -1812,8 +1813,7 @@ async def retry_thread(
         retried_wake_fields,
     )
 
-    await assert_reaches(principal, workspace_id=body.workspace_id if body else None)
-    refuse_rewrite(principal, body.checkpoint_id if body else None)
+    checked = await cli_approval.admit_retry(raw_request, principal, thread_id, body)
     auth = await limit(principal.user_id)
     scope = RunScope(user_id=auth.user_id, burst_slot_id=auth.burst_slot_id)
 
@@ -1912,6 +1912,8 @@ async def retry_thread(
         await scope.release_slot()
         raise
 
+    if checked is not None:
+        request = request.model_copy(update={"checked_computer_id": checked})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
     return await _handle_send_message(

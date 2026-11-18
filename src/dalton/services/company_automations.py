@@ -16,8 +16,7 @@ from src.dalton.access_tiers import is_internal_or_admin
 from src.dalton.autonomy.classification import AUTOMATION_SCOPES, AutomationScope
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.database import company_automations as company_auto_db
-from src.server.database.principal_reach import workspace_or_home
-from src.server.dependencies.principal import Principal, assert_reaches
+from src.server.dependencies.principal import Principal
 
 
 class AutomationVersionConflictError(ValueError):
@@ -836,13 +835,6 @@ async def get_automation_modification_history(
     else:
         if owner_id != principal.user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
-        if principal.computer_id is not None:
-            await assert_reaches(
-                principal,
-                workspace_id=workspace_or_home(
-                    principal.user_id, row.get("workspace_id")
-                ),
-            )
 
     raw_history = row.get("audit_history")
     parsed_entries: list[AutomationHistoryEntryResponse] = []

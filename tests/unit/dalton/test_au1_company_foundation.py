@@ -50,7 +50,6 @@ from src.dalton.settings import DaltonBudgetDefaults
 from src.server.app import automations as automations_app
 from src.server.auth import jwt_bearer, oauth_resource, pats, ws_auth
 from src.server.database import automation as auto_db
-from src.server.database import principal_reach
 from src.server.database import user as user_db
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.dependencies import principal as principal_mod
@@ -953,8 +952,8 @@ async def test_creation_entrypoints_refuse_company_smuggling_and_compute_scope(
     )
     monkeypatch.setattr(
         lifecycle_mod,
-        "_check_claude_code_hosted",
-        create_autospec(lifecycle_mod._check_claude_code_hosted, return_value=None),
+        "check_claude_code_hosted",
+        create_autospec(lifecycle_mod.check_claude_code_hosted, return_value=None),
     )
     mock_db_create = create_autospec(
         auto_db.create_automation,
@@ -1160,7 +1159,6 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
             status=None,
             limit=50,
             offset=0,
-            computer_id=None,
             include_deleted=False,
         )
 
@@ -1419,23 +1417,8 @@ async def test_automation_history_endpoint_sanitization_pagination_and_permissio
         )
         assert ext_comp_resp.status_code == 403
 
-    # 6. Computer token reach checks: allowed on own computer, 403 on company / Home / other computer
-    async def _fake_computer_of(kind: str, user_id: str, resource_id: str) -> Any:
-        mapping = {
-            ("automation", AUTO_PERSONAL_ID): COMPUTER_A,
-            ("workspace", WS_ON_COMP_A): COMPUTER_A,
-            ("automation", AUTO_TRACKING_ID): COMPUTER_B,
-            ("workspace", WS_ON_COMP_B): COMPUTER_B,
-            ("workspace", get_home_workspace_id(INTERNAL_UID)): principal_reach.HOME,
-        }
-        return mapping.get((kind, resource_id), principal_reach.MISSING)
-
-    monkeypatch.setattr(
-        principal_reach,
-        "computer_of",
-        create_autospec(principal_reach.computer_of, side_effect=_fake_computer_of),
-    )
-
+    # 6. Computer token access: personal history across user's computers is allowed (#792),
+    # company scope remains 403 for computer tokens.
     comp_app = _build_automations_test_app(
         Principal(
             user_id=INTERNAL_UID,
@@ -1452,10 +1435,10 @@ async def test_automation_history_endpoint_sanitization_pagination_and_permissio
         )
         assert ok_on_comp.status_code == 200
 
-        refused_other_comp = await comp_client.get(
+        ok_other_comp = await comp_client.get(
             f"/api/v1/automations/{AUTO_TRACKING_ID}/history"
         )
-        assert refused_other_comp.status_code == 403
+        assert ok_other_comp.status_code == 200
 
         refused_company = await comp_client.get(
             f"/api/v1/automations/{AUTO_COMPANY_ID}/history"

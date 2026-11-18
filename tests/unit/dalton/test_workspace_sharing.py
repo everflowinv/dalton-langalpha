@@ -11,7 +11,7 @@ from unittest.mock import create_autospec
 import alembic.op as alembic_op
 import psycopg
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, Request, UploadFile
 
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.config import settings as app_settings
@@ -816,7 +816,7 @@ class TestWebChannelEndpoints:
         fake_sandbox.execute_bash_command.return_value = {"success": True}
 
         @asynccontextmanager
-        async def _fake_acquire(workspace_id: str, user_id: str):
+        async def _fake_acquire(workspace_id: str, user_id: str, _cause: str = "files"):
             acquired_for_users.append(user_id)
             yield fake_sandbox, ws
 
@@ -1256,7 +1256,7 @@ class TestWebChannelEndpoints:
         acquired_users: list[str] = []
 
         @asynccontextmanager
-        async def _fake_pull_acquire(workspace_id: str, user_id: str):
+        async def _fake_pull_acquire(workspace_id: str, user_id: str, _cause: str = "files"):
             acquired_users.append(user_id)
             yield fake_sandbox, ws
 
@@ -1347,7 +1347,11 @@ class TestWebChannelEndpoints:
 
         # Delete workspace -> 403
         with pytest.raises(HTTPException) as exc_del:
-            await workspaces_app.delete_workspace(ws["workspace_id"], x_user_id="u-chao")
+            await workspaces_app.delete_workspace(
+                ws["workspace_id"],
+                Principal(user_id="u-chao", auth="session"),
+                Request({"type": "http", "headers": []}),
+            )
         assert exc_del.value.status_code == 403
 
         # Start / Stop workspace -> 403

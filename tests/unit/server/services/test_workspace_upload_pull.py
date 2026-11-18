@@ -1079,9 +1079,9 @@ async def test_write_access_revoked_on_staged_retry_refuses_and_removes_staged_c
         orig_acquire = upload_pull.acquire_sandbox_to_change
 
         @asynccontextmanager
-        async def acquire_recording(ws_id: str, owner_id: str):
+        async def acquire_recording(ws_id: str, owner_id: str, _cause: str = "upload"):
             acquired_for.append((ws_id, owner_id))
-            async with orig_acquire(ws_id, owner_id) as (sb, ws):
+            async with orig_acquire(ws_id, owner_id, _cause) as (sb, ws):
                 yield sb, ws
 
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire_recording))
@@ -1139,7 +1139,7 @@ async def test_already_placed_file_recovery_succeeds_even_if_write_access_later_
     acquired_for: list[tuple[str, str]] = []
 
     @asynccontextmanager
-    async def acquire(ws_id: str, owner_id: str):
+    async def acquire(ws_id: str, owner_id: str, _cause: str = "upload"):
         acquired_for.append((ws_id, owner_id))
         yield sandbox, ws_row
 
@@ -1264,7 +1264,7 @@ async def test_revoked_access_deferred_while_stopped_confirms_done_by_inode_when
     acquired_for: list[tuple[str, str]] = []
 
     @asynccontextmanager
-    async def acquire(ws_id: str, owner_id: str):
+    async def acquire(ws_id: str, owner_id: str, _cause: str = "upload"):
         acquired_for.append((ws_id, owner_id))
         yield sandbox, running_ws
 
@@ -1353,7 +1353,7 @@ async def test_revoked_access_deferred_while_stopped_cleans_staging_and_refuses_
     acquired_for: list[tuple[str, str]] = []
 
     @asynccontextmanager
-    async def acquire(ws_id: str, owner_id: str):
+    async def acquire(ws_id: str, owner_id: str, _cause: str = "upload"):
         acquired_for.append((ws_id, owner_id))
         yield sandbox, running_ws
 

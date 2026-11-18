@@ -1512,7 +1512,7 @@ async def upload_workspace_file(
     if served_from_mirror(workspace.get("status")):
         raise not_running_for_upload(workspace)
 
-    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id) as (sandbox, workspace):
+    async with acquire_sandbox_to_change(workspace_id, sandbox_owner_id, "upload") as (sandbox, workspace):
         work_dir = owner_work_dir(workspace)
         previous_dirs = previous_dir_names_of(workspace)
 
@@ -1679,6 +1679,11 @@ async def get_backup_status(
         get_file_metadata_for_sync,
         get_workspace_total_size,
     )
+
+    # With the computer's backup off nothing is saved, so no file has a state
+    # to show, and the walk would only cross the owner's link for it.
+    if not choice["files_backup"]:
+        return {**empty, "total_backed_up_size": await get_workspace_total_size(workspace_id)}
 
     # The sync metadata carries directory and symlink rows too; this status
     # is about files, and the running branch below only ever sees files.

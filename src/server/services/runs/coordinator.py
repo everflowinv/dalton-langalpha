@@ -125,6 +125,8 @@ class RunHandle:
     pending_input: Dict[str, Any] = field(default_factory=dict)
     # DALTON-HOOK(colleague-dispatch): whether START admitted the run as a post-revocation tail turn
     tail_turn_no_new_work: bool = False
+    # Where the run came from (``turn_kinds.RunOrigin``), as START classified it.
+    origin: Optional[str] = None
 
     @property
     def checkpointer(self) -> Optional[Any]:
@@ -292,6 +294,7 @@ class RunCoordinator:
                 guard=guard,
                 pending_input=pending_input or {},
                 tail_turn_no_new_work=_tail_turn_no_new_work,
+                origin=origin,
             )
             if guard is not None:
                 guard.bind_owner(handle)
@@ -783,6 +786,7 @@ class RunCoordinator:
         self._schedule_search_index(thread_id)
         self._schedule_transcript_export(thread_id, run)
         self._schedule_keep_updated(run)
+        self._schedule_activity_stamp(run)
         self._schedule_archive_prune(thread_id)
         self._nudge_hook_drainer()
 
@@ -854,6 +858,26 @@ class RunCoordinator:
         except Exception:
             logger.warning(
                 f"[RunCoordinator] keep-updated scheduling failed for "
+                f"workspace {workspace_id}",
+                exc_info=True,
+            )
+
+    def _schedule_activity_stamp(self, run: Optional[Dict[str, Any]]) -> None:
+        # Only a turn's start stamps the idle clock otherwise, so a turn longer
+        # than the idle timeout ends on a machine the next sweep stops.
+        workspace_id = ((run or {}).get("metadata") or {}).get("workspace_id")
+        if not workspace_id:
+            return
+        try:
+            from src.server.database.workspace import update_workspace_activity
+
+            spawn_protected(
+                update_workspace_activity(str(workspace_id)),
+                f"turn-end-activity-{workspace_id}",
+            )
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] activity stamp scheduling failed for "
                 f"workspace {workspace_id}",
                 exc_info=True,
             )
