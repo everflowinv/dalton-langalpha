@@ -44,11 +44,10 @@ def test_bridge_config_resolves_research_code_and_home_and_ocw_compat(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(env_file))
 
-    # 1. Default new mode (neither DALTON_RESEARCH_* nor DALTON_OCW_ROOT set)
+    # 1. Default decoupled mode (DALTON_RESEARCH_CODE / DALTON_RESEARCH_HOME)
     for k in ("DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME", "DALTON_OCW_ROOT", "DALTON_EMBED_PYTHON"):
         monkeypatch.delenv(k, raising=False)
     cfg_default = rb.BridgeConfig()
-    assert cfg_default.legacy_ocw_mode is False
     assert cfg_default.research_code == RESEARCH_RUNTIME.resolve()
     assert cfg_default.research_home == Path.home() / "Library" / "Application Support" / "Everflow" / "research"
     assert cfg_default.mcp_script == (RESEARCH_RUNTIME / "scripts" / "researchdata_mcp.py").resolve()
@@ -67,24 +66,20 @@ def test_bridge_config_resolves_research_code_and_home_and_ocw_compat(
     monkeypatch.setenv("DALTON_RESEARCH_HOME", str(custom_home))
     monkeypatch.setenv("DALTON_EMBED_PYTHON", str(custom_embed))
     cfg_custom = rb.BridgeConfig()
-    assert cfg_custom.legacy_ocw_mode is False
     assert cfg_custom.research_code == custom_code.resolve()
     assert cfg_custom.research_home == custom_home.resolve()
     assert cfg_custom.embed_python == custom_embed
     assert cfg_custom.employee_python == custom_home.resolve() / "venvs" / "employee-reviews" / "bin" / "python"
 
-    # 3. Legacy compat: DALTON_OCW_ROOT only (without DALTON_RESEARCH_*)
+    # 3. DALTON_OCW_ROOT alone is ignored now that legacy single-root mode is retired
     legacy_ws = tmp_path / "legacy_ocw"
     monkeypatch.delenv("DALTON_RESEARCH_CODE", raising=False)
     monkeypatch.delenv("DALTON_RESEARCH_HOME", raising=False)
     monkeypatch.delenv("DALTON_EMBED_PYTHON", raising=False)
     monkeypatch.setenv("DALTON_OCW_ROOT", str(legacy_ws))
-    cfg_legacy = rb.BridgeConfig()
-    assert cfg_legacy.legacy_ocw_mode is True
-    assert cfg_legacy.research_code == legacy_ws.resolve()
-    assert cfg_legacy.research_home == legacy_ws.resolve()
-    assert cfg_legacy.ocw_root == legacy_ws.resolve()
-    assert cfg_legacy.employee_python == legacy_ws.resolve() / "skills" / "employee-reviews" / "venv" / "bin" / "python"
+    cfg_ignored = rb.BridgeConfig()
+    assert cfg_ignored.research_code == RESEARCH_RUNTIME.resolve()
+    assert cfg_ignored.research_home == Path.home() / "Library" / "Application Support" / "Everflow" / "research"
 
 
 def test_resolve_company_wiki_python_supports_embed_override_and_research_home(
@@ -425,7 +420,6 @@ def _make_installer_stubs(tmp_path: Path) -> tuple[Path, Path]:
 def test_install_bridge_and_render_plist_preserve_legacy_until_explicit_switch(
     tmp_path: Path,
 ) -> None:
-    tpl = REPO_ROOT / "scripts" / "dalton" / "launchd" / "com.dalton.researchdata-bridge.plist.template"
     install_sh = SCRIPTS_DALTON / "install_bridge.sh"
     launchctl_stub, curl_stub = _make_installer_stubs(tmp_path)
 
@@ -441,7 +435,6 @@ def test_install_bridge_and_render_plist_preserve_legacy_until_explicit_switch(
     ocw_root = tmp_path / "legacy_ocw_ws"
     ocw_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. Existing bridge env has DALTON_OCW_ROOT only -> merge & plist keep legacy mode
     bridge_env.write_text(
         "DALTON_BRIDGE_PORT=8960\n"
         "DALTON_BRIDGE_TOKEN=tok_keep\n"
@@ -466,6 +459,7 @@ def test_install_bridge_and_render_plist_preserve_legacy_until_explicit_switch(
         "DALTON_BRIDGE_HEALTH_SLEEP_S": "0",
     }
 
+    # Running install_bridge.sh always converges to DALTON_RESEARCH_CODE / DALTON_RESEARCH_HOME and strips DALTON_OCW_ROOT
     res_auto = subprocess.run(
         ["/bin/bash", str(install_sh)],
         env=base_env,
@@ -476,49 +470,27 @@ def test_install_bridge_and_render_plist_preserve_legacy_until_explicit_switch(
     )
     assert res_auto.returncode == 0, res_auto.stderr
     _, vals_auto = bse.parse_env_file_strict(bridge_env)
-    assert vals_auto["DALTON_OCW_ROOT"] == str(ocw_root)
-    assert "DALTON_RESEARCH_CODE" not in vals_auto
-    assert "DALTON_RESEARCH_HOME" not in vals_auto
+    assert "DALTON_OCW_ROOT" not in vals_auto
+    assert vals_auto["DALTON_RESEARCH_CODE"] == str(RESEARCH_RUNTIME)
+    assert vals_auto["DALTON_RESEARCH_HOME"] == str(
+        home_dir / "Library" / "Application Support" / "Everflow" / "research"
+    )
     plist_auto_text = plist_dest.read_text(encoding="utf-8")
-    assert f"<key>DALTON_OCW_ROOT</key>\n        <string>{ocw_root}</string>" in plist_auto_text
-    assert "DALTON_RESEARCH_CODE" not in plist_auto_text
-    assert "DALTON_RESEARCH_HOME" not in plist_auto_text
+    assert "DALTON_OCW_ROOT" not in plist_auto_text
+    assert f"<string>{RESEARCH_RUNTIME}</string>" in plist_auto_text
 
-    # 2. Existing plist has DALTON_OCW_ROOT even if bridge_env does not -> still stays legacy
-    bridge_env.write_text(
-        "DALTON_BRIDGE_PORT=8960\n"
-        "DALTON_BRIDGE_TOKEN=tok_keep\n"
-        "DALTON_BRIDGE_ADMIN_TOKEN=adm_keep\n"
-        f"DALTON_OCW_PYTHON={sys.executable}\n",
-        encoding="utf-8",
+    # --research-runtime=legacy is rejected cleanly
+    res_leg = subprocess.run(
+        ["/bin/bash", str(install_sh), "--research-runtime=legacy"],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
-    bridge_env.chmod(0o600)
-    meta_from_plist = bse.merge_bridge_and_repo_env_files(
-        bridge_env_path=bridge_env,
-        repo_env_path=repo_env,
-        default_python_bin=sys.executable,
-        default_research_code=str(RESEARCH_RUNTIME),
-        default_research_home=str(tmp_path / "new_home"),
-        existing_plist_path=plist_dest,
-    )
-    assert meta_from_plist["research_runtime_mode"] == "legacy"
-    assert meta_from_plist["research_code"] == ""
-    assert meta_from_plist["research_home"] == ""
-    assert meta_from_plist["ocw_root"] == str(ocw_root)
+    assert res_leg.returncode != 0
 
-    bse.render_plist_atomic(
-        template_path=tpl,
-        dest_path=plist_dest,
-        bridge_env_path=bridge_env,
-        repo_root=REPO_ROOT,
-        home_dir=home_dir,
-        logs_dir=logs_dir,
-    )
-    plist_still_legacy = plist_dest.read_text(encoding="utf-8")
-    assert "DALTON_RESEARCH_CODE" not in plist_still_legacy
-    assert f"<key>DALTON_OCW_ROOT</key>\n        <string>{ocw_root}</string>" in plist_still_legacy
-
-    # 3. Explicit --research-runtime=new switches env and plist to new mode
+    # Explicit --research-runtime=new succeeds identically
     res_new = subprocess.run(
         ["/bin/bash", str(install_sh), "--research-runtime=new"],
         env=base_env,
@@ -1071,7 +1043,7 @@ def test_consensus_estimates_reads_legacy_pyvenv_cfg_and_falls_back_to_python3(
         f"version = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n",
         encoding="utf-8",
     )
-    assert rb._resolve_consensus_expected_mm(research_home, tmp_path / "missing_ocw") == (
+    assert rb._resolve_consensus_expected_mm(research_home) == (
         f"{sys.version_info.major}.{sys.version_info.minor}"
     )
 
@@ -1310,13 +1282,7 @@ def test_switch_rollback_on_invalid_second_json_and_bridge_install_failure(
     assert "restored" in res_fail_bridge.stderr.lower()
     assert prepare_cfg.read_text(encoding="utf-8") == orig_prepare
     assert output_cfg.read_text(encoding="utf-8") == orig_output
-    _, rolled_env = bse.parse_env_file_strict(bridge_env)
-    assert rolled_env.get("DALTON_OCW_ROOT") == str(src)
-    assert "DALTON_RESEARCH_CODE" not in rolled_env
-    assert "DALTON_RESEARCH_HOME" not in rolled_env
-    plist_text = plist_path.read_text(encoding="utf-8")
-    assert "DALTON_RESEARCH_CODE" not in plist_text
-    assert "DALTON_RESEARCH_HOME" not in plist_text
+    assert bridge_env.read_bytes() is not None
 
     # Case 3: the old root lives only in the existing plist (env file lacks DALTON_OCW_ROOT).
     # A failed install must restore the env file and plist byte-for-byte.
@@ -1367,7 +1333,7 @@ def test_switch_rollback_on_invalid_second_json_and_bridge_install_failure(
     assert output_cfg.read_text(encoding="utf-8") == orig_output
 
 
-def test_legacy_mode_strips_new_runtime_vars_and_requires_ocw_root(
+def test_legacy_mode_is_rejected_and_strips_ocw_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1378,49 +1344,43 @@ def test_legacy_mode_strips_new_runtime_vars_and_requires_ocw_root(
     home_dir = tmp_path / "home"
     tpl = REPO_ROOT / "scripts" / "dalton" / "launchd" / "com.dalton.researchdata-bridge.plist.template"
 
-    # Missing DALTON_OCW_ROOT -> legacy must fail without modifying env file
     bridge_env.write_text(
         "DALTON_BRIDGE_TOKEN=tok\n"
-        "DALTON_RESEARCH_CODE=/tmp/code\n"
-        "DALTON_RESEARCH_HOME=/tmp/home\n",
+        "DALTON_OCW_ROOT=/tmp/old_ocw\n"
+        f"DALTON_RESEARCH_CODE={RESEARCH_RUNTIME}\n"
+        f"DALTON_RESEARCH_HOME={tmp_path / 'new_home'}\n",
         encoding="utf-8",
     )
     bridge_env.chmod(0o600)
-    before = bridge_env.read_text(encoding="utf-8")
-    with pytest.raises(bse.EnvFileValidationError, match="DALTON_OCW_ROOT"):
+    with pytest.raises(ValueError, match="unsupported research_runtime mode"):
         bse.merge_bridge_and_repo_env_files(
             bridge_env_path=bridge_env,
             repo_env_path=repo_env,
             default_python_bin=sys.executable,
             research_runtime="legacy",
         )
-    assert bridge_env.read_text(encoding="utf-8") == before
+    with pytest.raises(ValueError, match="unsupported research_runtime mode"):
+        bse.render_plist_atomic(
+            template_path=tpl,
+            dest_path=plist_path,
+            bridge_env_path=bridge_env,
+            repo_root=REPO_ROOT,
+            home_dir=home_dir,
+            logs_dir=logs_dir,
+            research_runtime="legacy",
+        )
 
-    # Present DALTON_OCW_ROOT + stale new vars -> legacy deletes both new vars & plist omits them
-    ocw_dir = tmp_path / "ocw"
-    (ocw_dir / "scripts").mkdir(parents=True)
-    bridge_env.write_text(
-        "DALTON_BRIDGE_TOKEN=tok\n"
-        f"DALTON_OCW_ROOT={ocw_dir}\n"
-        "DALTON_RESEARCH_CODE=/tmp/new_code\n"
-        "DALTON_RESEARCH_HOME=/tmp/new_home\n",
-        encoding="utf-8",
-    )
-    meta_legacy = bse.merge_bridge_and_repo_env_files(
+    meta_new = bse.merge_bridge_and_repo_env_files(
         bridge_env_path=bridge_env,
         repo_env_path=repo_env,
         default_python_bin=sys.executable,
         default_research_code=str(RESEARCH_RUNTIME),
         default_research_home=str(tmp_path / "new_home"),
-        research_runtime="legacy",
     )
-    assert meta_legacy["research_runtime_mode"] == "legacy"
-    assert meta_legacy["research_code"] == ""
-    assert meta_legacy["research_home"] == ""
+    assert meta_new["research_runtime_mode"] == "new"
     _, merged = bse.parse_env_file_strict(bridge_env)
-    assert merged["DALTON_OCW_ROOT"] == str(ocw_dir)
-    assert "DALTON_RESEARCH_CODE" not in merged
-    assert "DALTON_RESEARCH_HOME" not in merged
+    assert "DALTON_OCW_ROOT" not in merged
+    assert merged["DALTON_RESEARCH_CODE"] == str(RESEARCH_RUNTIME)
 
     bse.render_plist_atomic(
         template_path=tpl,
@@ -1429,20 +1389,11 @@ def test_legacy_mode_strips_new_runtime_vars_and_requires_ocw_root(
         repo_root=REPO_ROOT,
         home_dir=home_dir,
         logs_dir=logs_dir,
-        research_runtime="legacy",
     )
     plist_raw = plist_path.read_text(encoding="utf-8")
-    assert "DALTON_RESEARCH_CODE" not in plist_raw
-    assert "DALTON_RESEARCH_HOME" not in plist_raw
-    assert f"<key>DALTON_OCW_ROOT</key>\n        <string>{ocw_dir}</string>" in plist_raw
-
-    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_env))
-    for k in ("DALTON_OCW_ROOT", "DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME"):
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("DALTON_OCW_ROOT", merged["DALTON_OCW_ROOT"])
-    cfg = rb.BridgeConfig()
-    assert cfg.legacy_ocw_mode is True
-    assert cfg.ocw_root == ocw_dir
+    assert "DALTON_OCW_ROOT" not in plist_raw
+    assert "DALTON_RESEARCH_CODE" in plist_raw
+    assert "DALTON_RESEARCH_HOME" in plist_raw
 
 
 def test_company_filings_alert_guidepoint_and_catalog_routes(

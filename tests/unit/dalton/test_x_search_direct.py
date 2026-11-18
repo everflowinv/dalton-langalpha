@@ -14,7 +14,7 @@ import pytest
 from src.dalton.llm.overlay import NATIVE_OVERLAY_PATH, load_overlay_data
 from src.dalton.llm.providers.xai_grok.client import ChatGrokOpenAI
 from src.dalton.web_search.cache import search_cache_key
-from src.dalton.web_search.x_search import map_x_search_response
+from src.dalton.web_search.formatting import map_x_search_response
 from src.dalton.web_search.x_search_direct import (
     DEFAULT_TIMEOUT_SECONDS,
     DirectXSearchClient,

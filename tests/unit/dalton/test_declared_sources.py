@@ -1849,7 +1849,7 @@ class TestCommunityExecutors:
                 observed_plan_path.append(p_path)
                 assert p_path.is_file()
                 assert p_path.parent == cache_dir.resolve()
-                assert bridge.cfg.ocw_root.resolve() not in p_path.parents
+                assert bridge.cfg.research_home.resolve() not in p_path.parents
 
             def _kill() -> None:
                 killed[0] = True
@@ -2276,7 +2276,7 @@ class TestCommunityExecutors:
         fake_workspace = fake_ocw_tree / "workspace"
         fake_workspace.mkdir(parents=True)
         outside_workspace_in_ocw = fake_ocw_tree / "other-subdir" / "cache"
-        monkeypatch.setenv("DALTON_OCW_ROOT", str(fake_workspace))
+        monkeypatch.setenv("DALTON_RESEARCH_HOME", str(fake_workspace))
         monkeypatch.setenv("DALTON_BRIDGE_CACHE_DIR", str(outside_workspace_in_ocw))
         bridge = _make_bridge(tmp_path, monkeypatch)
 

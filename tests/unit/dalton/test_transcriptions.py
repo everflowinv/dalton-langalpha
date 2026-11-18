@@ -62,7 +62,8 @@ def _make_test_bridge(
     cfg.env_path = env_file
     cfg.token = "mcp-secret-token"
     cfg.admin_token = "admin-secret-token"
-    cfg.ocw_root = ocw_root
+    cfg.research_code = ocw_root
+    cfg.research_home = ocw_root
     cfg.wiki_ingest_audit_file = tmp_path / "var" / "dalton" / "wiki_ingest_audit.jsonl"
     cfg.wiki_ingest_temp_dir = tmp_path / "var" / "dalton" / "tmp" / "wiki_ingest"
     cfg.asr_jobs_dir = tmp_path / "var" / "dalton" / "asr_jobs"

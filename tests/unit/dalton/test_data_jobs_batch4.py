@@ -58,7 +58,7 @@ OVERLAY_SCRIPT = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "scripts"
     / "cron_command_tasks.py"
 )

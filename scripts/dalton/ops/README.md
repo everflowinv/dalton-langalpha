@@ -92,7 +92,7 @@ bash scripts/dalton/ops/dalton_data_backup.sh
 | `prod/deploy_main.sh` | 生产发布主脚本：空闲检查、触发备份、快进 `origin/dalton/main`、构建前端、重启/重建 `backend`/`crawler`、按变更重建 `edge`、健康与公开入口检查 | `DALTON_REPO_ROOT`（脚本推导）、`DALTON_PG_BACKUP_LOG`（`~/Library/Logs/dalton-pg-backup.log`）、`DALTON_EDGE_PORT`（`8088`） |
 | `prod/wait_backend_idle.sh` | 轮询 Postgres `conversation_threads` 与 `subagent_runs`，连续两次间隔 60 秒均无进行中任务后返回 `0` | — |
 | `prod/backup.sh` | 每日全量 `pg_dump -Fc` 并调用 `prune_backups.py --apply` 按策略修剪旧备份 | `DALTON_REPO_ROOT`（脚本推导）、`DALTON_BACKUP_DIR`（`~/Backups/dalton`）、`DALTON_PRUNE_SCRIPT`（`${DALTON_BACKUP_DIR}/prune_backups.py`） |
-| `prod/watchdog.sh` | 每分钟探测 `127.0.0.1:8000/health`，连续失败 3 次重启后端容器，中断满 5 分钟及恢复时通过 Gateway `/internal/ops-alerts`（回退桥接 `/notify` 与 macOS 通知）发送告警 | `DALTON_REPO_ROOT`、`DALTON_BACKUP_DIR`、`DALTON_OPS_STATE_DIR`（`~/.dalton-ops`）、`DALTON_ENV_FILE`（`${REPO_ROOT}/.env`）、`DALTON_CHANNEL_GATEWAY_ENV_FILE`（`~/.config/dalton/channel-gateway.env`） |
+| `prod/watchdog.sh` | 每分钟探测 `127.0.0.1:8000/health`，连续失败 3 次重启后端容器，中断满 5 分钟及恢复时通过 Gateway `/internal/ops-alerts` 发送告警（网关不可用时改发 macOS 通知） | `DALTON_REPO_ROOT`、`DALTON_BACKUP_DIR`、`DALTON_OPS_STATE_DIR`（`~/.dalton-ops`）、`DALTON_CHANNEL_GATEWAY_ENV_FILE`（`~/.config/dalton/channel-gateway.env`） |
 | `prod/colima_launch.sh` | 等待外置盘 Colima 目录就绪后在前台启动 `colima start -f`，供 `launchd` 托管 | `DALTON_COLIMA_WAIT_DIR`（`/Volumes/EveSSD/Dalton/colima/_lima`） |
 
 `scripts/dalton/ops/prod/launchd/` 提供对应的三份 `LaunchAgent` 模板（安装到 `~/Library/LaunchAgents/` 时替换 `__REPO__`、`__HOME__`、`__LOG_DIR__` 占位符）：

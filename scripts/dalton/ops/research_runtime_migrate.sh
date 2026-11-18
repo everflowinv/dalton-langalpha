@@ -984,11 +984,8 @@ PY
             else
                 echo "ERROR: restored bridge env file and plist, but reloading launchd failed; run: launchctl bootstrap gui/$(id -u) ${bridge_plist}" >&2
             fi
-        elif DALTON_BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE}" \
-            bash "${REPO_ROOT}/scripts/dalton/install_bridge.sh" --research-runtime=legacy; then
-            echo "[rollback] restored bridge install via install_bridge.sh --research-runtime=legacy" >&2
         else
-            echo "ERROR: legacy bridge rollback (install_bridge.sh --research-runtime=legacy) also failed" >&2
+            echo "ERROR: no pre-switch bridge snapshot found; legacy rollback removed" >&2
         fi
     }
 
@@ -998,7 +995,7 @@ PY
         DALTON_RESEARCH_HOME="${DST_ROOT}" \
             bash "${REPO_ROOT}/scripts/dalton/install_bridge.sh" --research-runtime=new
     ); then
-        echo "ERROR: install_bridge.sh --research-runtime=new failed; rolling back configs and bridge to legacy" >&2
+        echo "ERROR: install_bridge.sh --research-runtime=new failed; rolling back configs and bridge snapshot" >&2
         _rollback_switch
         exit 1
     fi

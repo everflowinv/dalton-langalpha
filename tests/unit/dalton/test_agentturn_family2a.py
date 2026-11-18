@@ -287,8 +287,6 @@ def test_skill_text_locks_research_and_delivery() -> None:
     assert "America/New_York" in daily_text
     assert "ct-semi-sentiment-<summary_date>" in daily_text
     assert "state/ct-semi-sentiment/sentiment.log" in daily_text
-    assert "scripts/dalton/import_openclaw_skill_state.py" in daily_text
-    assert "本轮不要运行导入脚本" in daily_text
     assert all("import_openclaw" not in " ".join(command) for command in _bash_commands(daily_text))
     assert "1700" in daily_text and "1900" in daily_text
     assert "不要并行" in daily_text

@@ -97,7 +97,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 ### 第 2 步：新闻、同业与卖方研报 / 销售台点评（sales color）
 
 1. **最新新闻检索（`web_search`，限定事件窗口 `[NEWS_START, NEWS_END]`）**：
-   调用直连工具 `web_search`（定义见 `src/dalton/web_search/provider.py:546-553` 与 `src/tools/web/providers/tavily.py:445-452`）：
+   调用直连工具 `web_search`（定义见 `src/dalton/web_search/gemini_grounding.py`）：
    ```python
    web_search(
        query=f"{TICKER} {COMPANY_NAME} stock move news",
@@ -156,7 +156,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 ### 第 3 步：社媒与社区讨论（最后辅助）
 
 1. **X（推特）讨论检索（`x_search` 及 PTC `x-timeline`，限定事件窗口 `[NEWS_START, NEWS_END]`）**：
-   调用直连工具 `x_search`（定义见 `src/dalton/web_search/x_search.py:615-621`）：
+   调用直连工具 `x_search`（定义见 `src/dalton/web_search/x_search_direct.py`）：
    ```python
    x_search(
        query=f"{TICKER} OR {COMPANY_NAME}",
@@ -165,7 +165,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
        handles=HANDLES,
    )
    ```
-   或在 PTC 沙箱中调用 `researchdata.community` 的 `x-timeline` 路由（定义见 `scripts/dalton/researchdata_bridge.py:2181-2216`）：
+   或在 PTC 沙箱中调用 `researchdata.community` 的 `x-timeline` 路由（定义见 `scripts/dalton/researchdata_bridge.py`）：
    ```python
    community(
        route="x-timeline",

@@ -14,8 +14,8 @@ from unittest.mock import create_autospec
 import pytest
 
 from src.dalton.tools import build_dalton_tools
-from src.dalton.web_search.provider import build_web_search_tool
-from src.dalton.web_search.x_search import build_x_search_tool
+from src.dalton.web_search.gemini_grounding import build_web_search_tool
+from src.dalton.web_search.x_search_direct import build_direct_x_search_tool
 from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -125,7 +125,7 @@ def build_tool_signature_registry() -> dict[str, set[str]]:
     # 4. Direct web tools (`web_search`, `x_search`, `WebFetch`)
     from src.tools.web.fetch import web_fetch_tool
 
-    for t in (build_web_search_tool(), build_x_search_tool(), web_fetch_tool):
+    for t in (build_web_search_tool(), build_direct_x_search_tool(), web_fetch_tool):
         fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
         registry[t.name] = fields
 

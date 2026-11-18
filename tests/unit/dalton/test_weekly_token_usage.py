@@ -28,8 +28,8 @@ from src.dalton.data_jobs.notification_payloads import build_data_task_delivery_
 from src.dalton.data_jobs.runner_wrapper import resolve_task_payload_source
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SKILL_SCRIPTS_DIR = REPO_ROOT / "scripts" / "dalton" / "openclaw_overlays" / "skills" / "model-usage-cost" / "scripts"
-TRACKER_PATH = REPO_ROOT / "scripts" / "dalton" / "openclaw_overlays" / "scripts" / "token_weekly_usage_tracker.py"
+SKILL_SCRIPTS_DIR = REPO_ROOT / "scripts" / "dalton" / "data_assets" / "skills" / "model-usage-cost" / "scripts"
+TRACKER_PATH = REPO_ROOT / "scripts" / "dalton" / "data_assets" / "scripts" / "token_weekly_usage_tracker.py"
 
 
 def _load_tracker():
@@ -783,7 +783,7 @@ def test_default_state_dir_follows_pointer_file(tmp_path, monkeypatch) -> None:
     """State dir priority: DALTON_USAGE_STATE_DIR env -> ~/.config/dalton/usage-state-dir -> ~/.openclaw/usage-accounting."""
     import importlib
 
-    scripts = Path(__file__).resolve().parents[3] / "scripts/dalton/openclaw_overlays/skills/model-usage-cost/scripts"
+    scripts = Path(__file__).resolve().parents[3] / "scripts/dalton/data_assets/skills/model-usage-cost/scripts"
     monkeypatch.syspath_prepend(str(scripts))
     cli = importlib.import_module("model_usage_cost_cli")
     usage_state = importlib.import_module("usage_state")

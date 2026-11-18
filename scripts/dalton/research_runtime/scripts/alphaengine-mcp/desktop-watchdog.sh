@@ -7,8 +7,6 @@ SERVICE_URL="${ALPHAENGINE_MCP_URL:-http://127.0.0.1:8950}"
 
 if [[ -n "${DALTON_RESEARCH_HOME:-}" ]]; then
   RESEARCH_HOME="$DALTON_RESEARCH_HOME"
-elif [[ -n "${DALTON_OCW_ROOT:-}" ]]; then
-  RESEARCH_HOME="$DALTON_OCW_ROOT"
 else
   RESEARCH_HOME="$HOME/Library/Application Support/Everflow/research"
 fi

@@ -23,9 +23,9 @@ COLLECTOR_PATH = REPO_ROOT / "scripts" / "dalton" / "ops" / "usage_collector.py"
 COLLECTOR_RUN_SH_PATH = REPO_ROOT / "scripts" / "dalton" / "ops" / "usage_collector_run.sh"
 SWITCH_SH_PATH = REPO_ROOT / "scripts" / "dalton" / "ops" / "usage_collector_switch.sh"
 PLIST_TEMPLATE_PATH = REPO_ROOT / "scripts" / "dalton" / "launchd" / "com.dalton.usage-collector.plist.template"
-SKILL_DIR = REPO_ROOT / "scripts" / "dalton" / "openclaw_overlays" / "skills" / "model-usage-cost"
+SKILL_DIR = REPO_ROOT / "scripts" / "dalton" / "data_assets" / "skills" / "model-usage-cost"
 SKILL_SCRIPTS_DIR = SKILL_DIR / "scripts"
-TRACKER_PATH = REPO_ROOT / "scripts" / "dalton" / "openclaw_overlays" / "scripts" / "token_weekly_usage_tracker.py"
+TRACKER_PATH = REPO_ROOT / "scripts" / "dalton" / "data_assets" / "scripts" / "token_weekly_usage_tracker.py"
 
 
 def _load_module(name: str, path: Path):

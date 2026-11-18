@@ -71,7 +71,6 @@ VALID_REALRUN_SCRIPTS = frozenset(
         "g2_providers.py",
         "g3_publish.py",
         "g4_autonomy.py",
-        "g5_broker_and_antigravity.py",
         "g6_lenses.py",
         "g7_bridge.py",
     }

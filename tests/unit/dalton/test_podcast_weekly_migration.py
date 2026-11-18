@@ -41,7 +41,7 @@ OVERLAY_CLI_PATH = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "skills"
     / "podcast-weekly-digest"
     / "scripts"

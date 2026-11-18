@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 import json
 import logging
@@ -220,56 +219,6 @@ async def _call_host_bridge(
         except Exception:
             payload = None
         return resp.status_code, (payload if isinstance(payload, dict) else None)
-
-
-async def _fetch_host_conversation_archive_job() -> dict[str, Any]:
-    """Build the ``host`` scope system job entry for ``conversation-archive``."""
-    conv_cfg = _conversations_readonly_config()
-    base_item: dict[str, Any] = {
-        "key": "conversation-archive",
-        "kind": "conversation_archive",
-        "scope": "host",
-        "title": "团队对话归档",
-        "description": "每日在宿主机增量抽取 OpenClaw 团队对话并写入投研记忆库",
-        "schedule": None,
-        "status": "unknown",
-        "last_run_at": None,
-        "last_result": None,
-        "next_run_at": None,
-        "can_toggle": True,
-        "can_run_now": True,
-        "config": conv_cfg,
-        "exit_code": None,
-        "log_tail": "",
-        "running": False,
-    }
-    try:
-        status_code, data = await _call_host_bridge("GET", "/jobs/conversation-archive")
-        if status_code == 200 and isinstance(data, dict):
-            raw_status = str(data.get("status") or "").strip().lower()
-            if raw_status not in ("on", "off", "partial", "unknown"):
-                raw_status = "on" if data.get("enabled", True) else "off"
-            exit_code = data.get("exit_code")
-            last_result = data.get("last_result")
-            if not last_result and exit_code is not None:
-                last_result = "成功 (exit 0)" if exit_code == 0 else f"失败 (exit {exit_code})"
-            if data.get("running"):
-                last_result = "运行中"
-            base_item.update(
-                {
-                    "status": raw_status,
-                    "enabled": bool(data.get("enabled", raw_status == "on")),
-                    "last_run_at": data.get("last_run_at"),
-                    "last_result": last_result,
-                    "next_run_at": data.get("next_run_at"),
-                    "exit_code": exit_code,
-                    "log_tail": str(data.get("log_tail") or ""),
-                    "running": bool(data.get("running", False)),
-                }
-            )
-    except Exception as exc:
-        logger.debug("[DALTON_SYSTEM_JOBS] Host bridge conversation-archive unreachable: %s", exc)
-    return base_item
 
 
 async def _fetch_ops_jobs() -> list[dict[str, Any]]:
@@ -1568,7 +1517,6 @@ def classify_system_job_key(key: str) -> tuple[str, str]:
 
     Returns:
         - ``("home", "<automation_name>")`` for individual Home global tasks
-        - ``("host", "conversation-archive")`` for conversation archive
         - ``("ops", "<ops_key>")`` for read-only ops jobs
         - ``("data", "<job_key>")`` for company-wide data tasks
         - ``("company", "<ticker_or_workspace_id>")`` for company tracking jobs
@@ -1592,14 +1540,6 @@ def classify_system_job_key(key: str) -> tuple[str, str]:
         if sub in home_names:
             return "home", sub
         raise ValueError(f"未找到全局任务: {key}")
-
-    if lower in (
-        "conversation-archive",
-        "dalton-conversation-archive",
-        "host:conversation-archive",
-        "conversations",
-    ):
-        return "host", "conversation-archive"
 
     ops_keys = {item["key"] for item in DEFAULT_OPS_JOBS}
     if lower in ops_keys or lower.startswith(("ops-", "ops:")):
@@ -1689,21 +1629,17 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
             continue
         sector_jobs.append(_build_sector_job_entry(uid, s_unit, rows, s_tracking))
 
-    host_job, ops_jobs = await asyncio.gather(
-        _fetch_host_conversation_archive_job(),
-        _fetch_ops_jobs(),
-    )
-    host_jobs = [_apply_caller_visibility(host_job, is_pm=pm)]
+    ops_jobs = await _fetch_ops_jobs()
 
     data_jobs: list[dict[str, Any]] = []
     if is_internal:
         data_jobs = await _fetch_data_system_jobs()
 
-    all_jobs = [*company_jobs, *sector_jobs, *home_jobs, *host_jobs, *ops_jobs, *data_jobs]
+    all_jobs = [*company_jobs, *sector_jobs, *home_jobs, *ops_jobs, *data_jobs]
     groups: dict[str, list[dict[str, Any]]] = {
         "company": company_jobs,
         "home": home_jobs,
-        "host": host_jobs,
+        "host": [],
         "ops": ops_jobs,
     }
     if sector_units:
@@ -1741,10 +1677,6 @@ async def get_system_job_status(user_id: str, key: str) -> dict[str, Any]:
         if await get_user_tier(uid) not in ("admin", "internal"):
             raise PermissionError("仅内部成员可查看公司公共数据任务")
         job = await _fetch_single_data_system_job(target)
-        return {"ok": True, "job": job}
-
-    if scope == "host":
-        job = _apply_caller_visibility(await _fetch_host_conversation_archive_job(), is_pm=pm)
         return {"ok": True, "job": job}
 
     if scope == "ops":
@@ -2248,19 +2180,8 @@ async def toggle_system_job(
     if enabled is None:
         raise ValueError("enabled 不能为空")
 
-    if scope == "host" or (scope == "home" and target != "dalton-earnings-calendar"):
+    if scope == "home" and target != "dalton-earnings-calendar":
         require_pm_user(uid)
-
-    if scope == "host":
-        action_segment = "enable" if enabled else "disable"
-        status_code, data = await _call_host_bridge(
-            "POST", f"/jobs/conversation-archive/{action_segment}"
-        )
-        if status_code != 200 or not isinstance(data, dict) or data.get("ok") is not True:
-            detail = (data or {}).get("error") or f"宿主机桥接返回 HTTP {status_code}"
-            raise RuntimeError(f"切换团队对话归档状态失败: {detail}")
-        job = await _fetch_host_conversation_archive_job()
-        return {"ok": True, "job": job}
 
     outer_ctx = get_current_history_context()
     actor_uid = (
@@ -2503,34 +2424,8 @@ async def run_system_job_now(
             "message": f"已将「{title}」加入执行队列（run_id={run_id}），将由后台调度器异步执行，可在「{where_hint}」查看结果。",
         }
 
-    if scope == "host" or (scope == "home" and target != "dalton-earnings-calendar"):
+    if scope == "home" and target != "dalton-earnings-calendar":
         require_pm_user(uid)
-
-    if scope == "host":
-        status_code, data = await _call_host_bridge(
-            "POST", "/jobs/conversation-archive/run", timeout_s=10.0
-        )
-        if status_code in (200, 202) and isinstance(data, dict) and data.get("ok") is True:
-            run_status = str(data.get("status") or "started")
-            already_running = run_status == "already_running" or bool(data.get("already_running"))
-            msg = (
-                "团队对话归档任务已在后台运行中（跳过重复启动），可在「设置 → 自动任务」面板查看运行状态与日志尾部。"
-                if already_running
-                else "已异步启动宿主机团队对话归档任务，可在「设置 → 自动任务」面板查看最新运行结果与日志尾部。"
-            )
-            return {
-                "ok": True,
-                "key": "conversation-archive",
-                "scope": "host",
-                "async": True,
-                "status": run_status,
-                "already_running": already_running,
-                "pid": data.get("pid"),
-                "where_to_check": "设置 → 自动任务 → 宿主机（团队对话归档）",
-                "message": msg,
-            }
-        detail = (data or {}).get("error") or f"宿主机桥接返回 HTTP {status_code}"
-        raise RuntimeError(f"启动团队对话归档失败: {detail}")
 
     if scope == "home":
         specs = build_global_director_specs()

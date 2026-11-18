@@ -9,13 +9,13 @@ from unittest.mock import create_autospec
 import httpx
 import pytest
 
-from src.dalton.web_search.provider import (
+from src.dalton.web_search.formatting import (
     EMPTY_GENERATION_MESSAGE,
-    BRIDGE_UNAVAILABLE_MESSAGE,
-    OpenClawSearchBridgeUnavailableError,
     OpenClawSearchEmptyGenerationError,
-    OpenClawSearchWrapper,
-    _raise_for_bridge_error_payload,
+)
+from src.dalton.web_search.gemini_grounding import (
+    GeminiGroundingClient,
+    UNAVAILABLE_MESSAGE,
     build_web_search_tool,
 )
 from src.dalton.web_search.redirects import (
@@ -53,75 +53,36 @@ def _ok_raw() -> dict:
 
 
 class TestEmptyGenerationClassification:
-    def test_no_final_answer_is_not_bridge_unavailable(self):
-        """The observed PROVIDER_ERROR payload must classify as empty generation."""
-        with pytest.raises(OpenClawSearchEmptyGenerationError) as exc_info:
-            _raise_for_bridge_error_payload(
-                {
-                    "error": {
-                        "code": "PROVIDER_ERROR",
-                        "message": "Gemini search returned no final answer (STOP).",
-                    }
-                }
-            )
-        assert BRIDGE_UNAVAILABLE_MESSAGE not in str(exc_info.value)
-
-    def test_other_provider_errors_stay_bridge_unavailable(self):
-        with pytest.raises(OpenClawSearchBridgeUnavailableError):
-            _raise_for_bridge_error_payload(
-                {
-                    "error": {
-                        "code": "PROVIDER_ERROR",
-                        "message": "upstream 500 while signing request",
-                    }
-                }
-            )
-
-    def test_generic_empty_response_wording_is_not_empty_generation(self):
-        """Only the known "no final answer" wording (or an explicit code)
-        classifies; a broader "empty response" message stays a bridge error."""
-        with pytest.raises(OpenClawSearchBridgeUnavailableError):
-            _raise_for_bridge_error_payload(
-                {
-                    "error": {
-                        "code": "PROVIDER_ERROR",
-                        "message": "provider returned an empty response",
-                    }
-                }
-            )
-
-    def test_explicit_empty_generation_code_classifies(self):
-        with pytest.raises(OpenClawSearchEmptyGenerationError):
-            _raise_for_bridge_error_payload(
-                {"error": {"code": "no_final_answer", "message": ""}}
-            )
-
     @pytest.mark.asyncio
-    async def test_tool_retries_once_then_succeeds(self):
-        wrapper = create_autospec(OpenClawSearchWrapper, instance=True)
-        wrapper.raw_results.side_effect = [
+    async def test_tool_retries_once_then_succeeds(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("src.dalton.web_search.cache.get_cache_client", lambda: None)
+        client = create_autospec(GeminiGroundingClient, instance=True)
+        client.model = "gemini-2.5-flash"
+        client.raw_results.side_effect = [
             OpenClawSearchEmptyGenerationError(),
             _ok_raw(),
         ]
-        tool = build_web_search_tool(max_results=5, wrapper=wrapper)
+        tool = build_web_search_tool(max_results=5, client=client)
         content, artifact = await tool.coroutine(query="NVDA quarter")
         assert artifact.get("answer")
-        assert wrapper.raw_results.await_count == 2
+        assert client.raw_results.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_tool_returns_rephrase_hint_after_failed_retry(self):
-        wrapper = create_autospec(OpenClawSearchWrapper, instance=True)
-        wrapper.raw_results.side_effect = [
+    async def test_tool_returns_rephrase_hint_after_failed_retry(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("src.dalton.web_search.cache.get_cache_client", lambda: None)
+        client = create_autospec(GeminiGroundingClient, instance=True)
+        client.model = "gemini-2.5-flash"
+        client.raw_results.side_effect = [
             OpenClawSearchEmptyGenerationError(),
             OpenClawSearchEmptyGenerationError(),
         ]
-        tool = build_web_search_tool(max_results=5, wrapper=wrapper)
+        tool = build_web_search_tool(max_results=5, client=client)
         content, artifact = await tool.coroutine(query="NVDA quarter")
         assert content == EMPTY_GENERATION_MESSAGE
         assert "换个说法" in content
-        assert BRIDGE_UNAVAILABLE_MESSAGE not in content
+        assert UNAVAILABLE_MESSAGE not in content
         assert artifact["code"] == "empty_generation"
-        assert wrapper.raw_results.await_count == 2
+        assert client.raw_results.await_count == 2
 
 
 def _error_response(message: str) -> dict:

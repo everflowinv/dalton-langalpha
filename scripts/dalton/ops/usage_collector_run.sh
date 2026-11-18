@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
-SKILL_DIR="${DALTON_USAGE_SKILL_DIR:-${REPO_ROOT}/scripts/dalton/openclaw_overlays/skills/model-usage-cost}"
+SKILL_DIR="${DALTON_USAGE_SKILL_DIR:-${REPO_ROOT}/scripts/dalton/data_assets/skills/model-usage-cost}"
 COLLECTOR_PY="${SCRIPT_DIR}/usage_collector.py"
 HOMEBREW_PY312="${DALTON_HOMEBREW_PYTHON_312:-/opt/homebrew/bin/python3.12}"
 SYSTEM_PY="/usr/bin/python3"

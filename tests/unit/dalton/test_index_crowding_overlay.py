@@ -12,7 +12,7 @@ import pytest
 
 SCRIPT = (
     Path(__file__).resolve().parents[3]
-    / "scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/fetch_history.py"
+    / "scripts/dalton/data_assets/skills/index-crowding-research/scripts/fetch_history.py"
 )
 
 

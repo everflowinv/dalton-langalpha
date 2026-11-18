@@ -143,7 +143,7 @@ printf '503'
     assert "AlphaEngine 登录失效" in osa_log.read_text(encoding="utf-8")
 
 
-def test_prod_watchdog_passes_both_tokens_via_header_files_not_argv(tmp_path: Path) -> None:
+def test_prod_watchdog_gateway_token_via_header_file_and_macos_fallback(tmp_path: Path) -> None:
     backup_dir = tmp_path / "backups"
     ops_state_dir = tmp_path / "ops_state"
     backup_dir.mkdir(parents=True)
@@ -177,7 +177,8 @@ done
 printf '503'
 """,
     )
-    osascript_stub = _make_stub(tmp_path / "osascript", "exit 0\n")
+    osascript_log = tmp_path / "osascript.log"
+    osascript_stub = _make_stub(tmp_path / "osascript", f'printf "%s\\n" "$*" >> "{osascript_log}"\nexit 0\n')
     colima_stub = _make_stub(tmp_path / "colima", "echo Running\n")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -200,8 +201,10 @@ printf '503'
     assert "bridge_tok_never_in_argv" not in argv_text
     hdr_text = curl_hdr_log.read_text(encoding="utf-8")
     assert "X-Service-Token: gw_tok_never_in_argv" in hdr_text
-    assert "Authorization: Bearer bridge_tok_never_in_argv" in hdr_text
-    assert "X-Dalton-Bridge-Token: bridge_tok_never_in_argv" in hdr_text
+    # The gateway failed (503): the alert falls back to a macOS notification; the
+    # bridge /notify is no longer used (it only sends Feishu cards).
+    assert ":8960/notify" not in argv_text
+    assert "display notification" in osascript_log.read_text(encoding="utf-8")
 
 
 def _setup_switch_env(
@@ -239,18 +242,12 @@ def _setup_switch_env(
     )
 
     bridge_env = tmp_path / "researchdata-bridge.env"
-    if mode == "legacy":
-        bridge_env.write_text(
-            f"DALTON_BRIDGE_TOKEN=bridge_tok_never_print\nDALTON_OCW_ROOT={ocw_root}\n",
-            encoding="utf-8",
-        )
-        data_root = ocw_root
-    else:
-        bridge_env.write_text(
-            f"DALTON_BRIDGE_TOKEN=bridge_tok_never_print\nDALTON_RESEARCH_CODE={REPO_ROOT / 'scripts' / 'dalton' / 'research_runtime'}\nDALTON_RESEARCH_HOME={research_home}\n",
-            encoding="utf-8",
-        )
-        data_root = research_home
+    del mode
+    bridge_env.write_text(
+        f"DALTON_BRIDGE_TOKEN=bridge_tok_never_print\nDALTON_RESEARCH_CODE={REPO_ROOT / 'scripts' / 'dalton' / 'research_runtime'}\nDALTON_RESEARCH_HOME={research_home}\n",
+        encoding="utf-8",
+    )
+    data_root = research_home
 
     for old_label in (
         "ai.openclaw.alphaengine-mcp",
@@ -441,50 +438,7 @@ exit 7
     }
 
 
-def test_legacy_mode_renders_only_dalton_ocw_root_and_does_not_copy_files(
-    tmp_path: Path,
-) -> None:
-    ctx = _setup_switch_env(tmp_path, mode="legacy")
-    env = ctx["env"]
-    ocw_root: Path = ctx["ocw_root"]
-    research_home: Path = ctx["research_home"]
-    launch_agents: Path = ctx["launch_agents"]
-
-    # Remove new-home copies to verify --apply in legacy mode never copies into research_home
-    (research_home / "config" / "guidepoint_mcp.env").unlink()
-    (research_home / "config" / "guidepoint_mcp_tokens.json").unlink()
-
-    plan_res = subprocess.run(["/bin/bash", str(SWITCH_SH), "--plan"], env=env, capture_output=True, text=True)
-    assert plan_res.returncode == 0, plan_res.stderr
-    assert "DETECTED_MODE:     legacy" in plan_res.stdout
-    assert "PLIST_RUNTIME_ENV: DALTON_OCW_ROOT=" in plan_res.stdout
-    assert "bridge_tok_never_print" not in plan_res.stdout
-    assert "secret_val_never_print" not in plan_res.stdout
-
-    apply_res = subprocess.run(["/bin/bash", str(SWITCH_SH), "--apply"], env=env, capture_output=True, text=True)
-    assert apply_res.returncode == 0, apply_res.stderr + apply_res.stdout
-
-    assert not (research_home / "config" / "guidepoint_mcp.env").exists()
-    assert not (research_home / "config" / "guidepoint_mcp_tokens.json").exists()
-
-    for label in (
-        "com.dalton.alphaengine-mcp",
-        "com.dalton.alphaengine-desktop-watchdog",
-        "com.dalton.guidepoint-mcp-proxy",
-    ):
-        plist_data = plistlib.loads((launch_agents / f"{label}.plist").read_bytes())
-        env_vars = plist_data["EnvironmentVariables"]
-        assert env_vars["DALTON_OCW_ROOT"] == str(ocw_root.resolve())
-        assert "DALTON_RESEARCH_HOME" not in env_vars
-
-    gp_env_vars = plistlib.loads((launch_agents / "com.dalton.guidepoint-mcp-proxy.plist").read_bytes())[
-        "EnvironmentVariables"
-    ]
-    assert gp_env_vars["GUIDEPOINT_ENV_FILE"] == str(ocw_root.resolve() / "config" / "guidepoint_mcp.env")
-    assert gp_env_vars["GUIDEPOINT_TOKENS_FILE"] == str(ocw_root.resolve() / "config" / "guidepoint_mcp_tokens.json")
-
-
-def test_new_mode_injects_dalton_research_home_and_runs_disable_on_switch_and_rollback(
+def test_new_mode_injects_dalton_research_home_and_runs_disable_on_switch(
     tmp_path: Path,
 ) -> None:
     ctx = _setup_switch_env(tmp_path, mode="new")
@@ -521,20 +475,10 @@ def test_new_mode_injects_dalton_research_home_and_runs_disable_on_switch_and_ro
     ):
         assert f"disable gui/" in apply_log and old_label in apply_log
 
-    # Rollback disables new labels and enables+bootstraps old labels
-    launchctl_log.unlink()
+    # --rollback back to legacy ~/.openclaw launchd labels has been removed
     rb_res = subprocess.run(["/bin/bash", str(SWITCH_SH), "--rollback"], env=env, capture_output=True, text=True)
-    assert rb_res.returncode == 0, rb_res.stderr + rb_res.stdout
-    assert "已恢复的服务 (restored):" in rb_res.stdout
-    assert "恢复失败的服务 (failed): [none]" in rb_res.stdout
-
-    rb_log = launchctl_log.read_text(encoding="utf-8")
-    for new_label in (
-        "com.dalton.alphaengine-mcp",
-        "com.dalton.alphaengine-desktop-watchdog",
-        "com.dalton.guidepoint-mcp-proxy",
-    ):
-        assert f"disable " in rb_log and new_label in rb_log
+    assert rb_res.returncode == 2
+    assert "--rollback is removed" in rb_res.stderr
 
 
 def test_aborts_without_starting_new_service_when_port_not_released(tmp_path: Path) -> None:
@@ -606,20 +550,6 @@ PY
     assert "guidepoint-mcp-proxy:ai.openclaw.guidepoint-mcp-proxy" in combined
     assert "ai.openclaw.guidepoint-mcp-proxy" in loaded_file.read_text(encoding="utf-8")
     assert "com.dalton.guidepoint-mcp-proxy" not in loaded_file.read_text(encoding="utf-8")
-
-
-def test_rollback_failure_reports_failed_services_and_exits_nonzero(tmp_path: Path) -> None:
-    ctx = _setup_switch_env(tmp_path, mode="new", preloaded_new=True)
-    env = ctx["env"]
-    launch_agents: Path = ctx["launch_agents"]
-
-    # Delete one legacy plist to force rollback failure on guidepoint-mcp-proxy
-    (launch_agents / "ai.openclaw.guidepoint-mcp-proxy.plist").unlink()
-
-    res = subprocess.run(["/bin/bash", str(SWITCH_SH), "--rollback"], env=env, capture_output=True, text=True)
-    assert res.returncode != 0
-    assert "已恢复的服务 (restored): [alphaengine-mcp:ai.openclaw.alphaengine-mcp alphaengine-desktop-watchdog:ai.openclaw.alphaengine-desktop-watchdog]" in res.stdout
-    assert "恢复失败的服务 (failed): [guidepoint-mcp-proxy:ai.openclaw.guidepoint-mcp-proxy]" in res.stdout
 
 
 def test_rerender_only_updates_loaded_services_and_restores_plist_on_failure(
@@ -834,7 +764,7 @@ def test_research_runtime_migrate_switch_rerenders_loaded_host_services(
 
     bridge_env = cfg_dir / "researchdata-bridge.env"
     bridge_env.write_text(
-        f"DALTON_BRIDGE_TOKEN=tok_s\nDALTON_BRIDGE_ADMIN_TOKEN=adm_s\nEDGAR_IDENTITY=Test <t@example.com>\nDALTON_OCW_ROOT={src}\n",
+        f"DALTON_BRIDGE_TOKEN=tok_s\nDALTON_BRIDGE_ADMIN_TOKEN=adm_s\nEDGAR_IDENTITY=Test <t@example.com>\nDALTON_RESEARCH_HOME={src}\n",
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text("DALTON_BRIDGE_TOKEN=tok_s\n", encoding="utf-8")
@@ -1023,33 +953,6 @@ def test_desktop_watchdog_cleans_stale_lock_and_respects_live_lock(tmp_path: Pat
         sleeper.wait(timeout=5)
 
 
-def test_rollback_resolves_watchdog_state_file_from_plist_env_vars(tmp_path: Path) -> None:
-    ctx = _setup_switch_env(tmp_path, mode="new", preloaded_new=True)
-    env = ctx["env"]
-    launch_agents: Path = ctx["launch_agents"]
-    research_home: Path = ctx["research_home"]
-
-    # Legacy watchdog plist points OPENCLAW_WORKSPACE to a distinct directory (not research_home).
-    legacy_ws = tmp_path / "distinct_openclaw_ws"
-    (legacy_ws / "state").mkdir(parents=True)
-    (launch_agents / "ai.openclaw.alphaengine-desktop-watchdog.plist").write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<plist version="1.0"><dict>'
-        "<key>Label</key><string>ai.openclaw.alphaengine-desktop-watchdog</string>"
-        "<key>EnvironmentVariables</key><dict>"
-        f"<key>OPENCLAW_WORKSPACE</key><string>{legacy_ws}</string>"
-        "</dict></dict></plist>\n",
-        encoding="utf-8",
-    )
-
-    # Ensure ALPHAENGINE_WATCHDOG_STATE_FILE is NOT set; host_services_switch.sh must inspect plist.
-    env.pop("ALPHAENGINE_WATCHDOG_STATE_FILE", None)
-    res = subprocess.run(["/bin/bash", str(SWITCH_SH), "--rollback"], env=env, capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr + res.stdout
-    assert (legacy_ws / "state" / "alphaengine-desktop-watchdog.json").is_file()
-    assert not (research_home / "state" / "alphaengine-desktop-watchdog.json").exists()
-
-
 def test_old_watchdog_state_write_during_bootout_does_not_pass_new_watchdog_health_check(
     tmp_path: Path,
 ) -> None:
@@ -1191,31 +1094,6 @@ def test_rerender_only_restores_earlier_services_when_a_later_template_fails_to_
     for label, text in sentinels.items():
         assert (launch_agents / f"{label}.plist").read_text(encoding="utf-8") == text
     assert not list(launch_agents.glob("*.tmp.*"))
-
-
-def test_watchdog_state_path_honours_state_dir_from_plist(tmp_path: Path) -> None:
-    ctx = _setup_switch_env(tmp_path, mode="new", preloaded_new=True)
-    env = ctx["env"]
-    launch_agents: Path = ctx["launch_agents"]
-    research_home: Path = ctx["research_home"]
-
-    custom_state = tmp_path / "custom_watchdog_state"
-    custom_state.mkdir()
-    (launch_agents / "ai.openclaw.alphaengine-desktop-watchdog.plist").write_text(
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<plist version="1.0"><dict>'
-        "<key>Label</key><string>ai.openclaw.alphaengine-desktop-watchdog</string>"
-        "<key>EnvironmentVariables</key><dict>"
-        f"<key>OPENCLAW_WORKSPACE</key><string>{tmp_path / 'unused_ws'}</string>"
-        f"<key>ALPHAENGINE_WATCHDOG_STATE_DIR</key><string>{custom_state}</string>"
-        "</dict></dict></plist>\n",
-        encoding="utf-8",
-    )
-    env.pop("ALPHAENGINE_WATCHDOG_STATE_FILE", None)
-    res = subprocess.run(["/bin/bash", str(SWITCH_SH), "--rollback"], env=env, capture_output=True, text=True, timeout=180)
-    assert res.returncode == 0, res.stderr + res.stdout
-    assert (custom_state / "alphaengine-desktop-watchdog.json").is_file()
-    assert not (research_home / "state" / "alphaengine-desktop-watchdog.json").exists()
 
 
 @pytest.fixture(autouse=True)

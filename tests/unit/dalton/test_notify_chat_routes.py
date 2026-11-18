@@ -770,31 +770,14 @@ async def test_handle_notify_chat_card_via_script_and_text_via_openclaw(
     run_spy = create_autospec(subprocess.run, side_effect=_fake_subprocess_run)
     monkeypatch.setattr(rb.subprocess, "run", run_spy)
 
-    invoke_payloads: list[dict[str, Any]] = []
-
-    def _fake_openclaw_post(
-        *,
-        gateway_url: str,
-        gateway_token: str,
-        payload: dict,
-        timeout_s: float = 15.0,
-    ) -> dict:
-        _ = (gateway_url, gateway_token, timeout_s)
-        invoke_payloads.append(payload)
-        return {"ok": True, "result": {"via": "direct"}}
-
-    monkeypatch.setattr(
-        rb, "_post_openclaw_tools_invoke", _fake_openclaw_post
-    )
-
     card = {
         "schema": "2.0",
         "header": {"title": {"tag": "plain_text", "content": "GOOGL · 财报 T0 快讯"}},
         "body": {"elements": [{"tag": "markdown", "content": "**结论**\n超预期。"}]},
     }
     with caplog.at_level(logging.INFO, logger="researchdata_bridge"):
-        # Card push: user + chat both through the script; text-only chat push
-        # rides the OpenClaw message tool with the chat:… target spelling.
+        # Card push: user + chat both through the script; text-only push is rejected
+        # since the OpenClaw gateway fallback has been removed.
         code, resp = await bridge.handle_notify(
             {
                 "targets": [
@@ -827,11 +810,10 @@ async def test_handle_notify_chat_card_via_script_and_text_via_openclaw(
     assert user_cmd[user_cmd.index("--receive-id-type") + 1] == "open_id"
     assert user_cmd[user_cmd.index("--chat-id") + 1] == "ou_script_path"
 
-    # Text-only chat push went through the OpenClaw message tool.
+    # Text-only Feishu push returns explicit card-required error without calling gateway.
     assert code_text == 200
-    assert resp_text["results"][0]["ok"] is True
-    assert invoke_payloads[0]["args"]["target"] == "chat:oc_text_group"
-    assert invoke_payloads[0]["args"]["message"] == "纯文本"
+    assert resp_text["results"][0]["ok"] is False
+    assert resp_text["results"][0]["error"] == "feishu_card_required"
 
     # No Feishu id reaches a log line in raw form — user or chat.
     assert "oc_ok_group" not in caplog.text

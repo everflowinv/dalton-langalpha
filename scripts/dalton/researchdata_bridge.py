@@ -1091,38 +1091,27 @@ def _load_env_file(path: Path) -> None:
 
 def _resolve_research_runtime_roots(
     env: Mapping[str, str] | None = None,
-) -> tuple[Path, Path, bool]:
-    """Resolve `(research_code, research_home, legacy_ocw_mode)` from env.
-
-    Legacy compat: when neither `DALTON_RESEARCH_CODE` nor `DALTON_RESEARCH_HOME` is
-    set and `DALTON_OCW_ROOT` is set, both code and home resolve to `DALTON_OCW_ROOT`.
-    """
+) -> tuple[Path, Path]:
+    """Resolve ``(research_code, research_home)`` from ``DALTON_RESEARCH_CODE`` / ``DALTON_RESEARCH_HOME``."""
     src = os.environ if env is None else env
     raw_code = str(src.get("DALTON_RESEARCH_CODE") or "").strip()
     raw_home = str(src.get("DALTON_RESEARCH_HOME") or "").strip()
-    raw_ocw = str(src.get("DALTON_OCW_ROOT") or "").strip()
-    if raw_ocw and not raw_code and not raw_home:
-        ocw = Path(raw_ocw).expanduser().resolve()
-        return ocw, ocw, True
     default_code = (_SCRIPT_DIR / "research_runtime").resolve()
     default_home = Path.home() / "Library" / "Application Support" / "Everflow" / "research"
     code_root = Path(raw_code).expanduser().resolve() if raw_code else default_code
     home_root = Path(raw_home).expanduser().resolve() if raw_home else default_home
-    return code_root, home_root, False
+    return code_root, home_root
 
 
 def _default_node_tool_bin(
     tool_name: str,
     *,
     research_home: Path,
-    legacy_ocw_mode: bool,
 ) -> Path:
     """Resolve default path for Node CLI tools (`xreach`, `tmeet`, `gws`)."""
-    legacy_cand = Path(f"~/.openclaw/tools/node/bin/{tool_name}").expanduser().resolve()
-    if legacy_ocw_mode:
-        return legacy_cand
+    default_cand = (research_home / "tools" / "node" / "bin" / tool_name).expanduser()
     candidates = [
-        research_home / "tools" / "node" / "bin" / tool_name,
+        default_cand,
         Path("/opt/homebrew/bin") / tool_name,
     ]
     which_hit = shutil.which(tool_name)
@@ -1131,7 +1120,7 @@ def _default_node_tool_bin(
     for cand in candidates:
         if cand.is_file() and os.access(cand, os.X_OK):
             return cand.expanduser().resolve()
-    return legacy_cand
+    return default_cand
 
 
 class BridgeConfig:
@@ -1151,17 +1140,11 @@ class BridgeConfig:
         self.port: int = int(os.environ.get("DALTON_BRIDGE_PORT", "8960"))
         self.token: str = os.environ.get("DALTON_BRIDGE_TOKEN", "").strip()
         self.admin_token: str = os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
-        research_code, research_home, legacy_ocw_mode = _resolve_research_runtime_roots(
+        research_code, research_home = _resolve_research_runtime_roots(
             env=resolved_env
         )
         self.research_code: Path = research_code
         self.research_home: Path = research_home
-        self.legacy_ocw_mode: bool = legacy_ocw_mode
-        raw_ocw_env = os.environ.get("DALTON_OCW_ROOT", "").strip()
-        self.ocw_root: Path = (
-            Path(raw_ocw_env).expanduser().resolve() if raw_ocw_env else self.research_home
-        )
-        self._initial_ocw_root: Path = self.ocw_root
         self.python_bin: str = os.environ.get(
             "DALTON_OCW_PYTHON", "/opt/homebrew/bin/python3"
         )
@@ -1186,7 +1169,6 @@ class BridgeConfig:
                 _default_node_tool_bin(
                     "xreach",
                     research_home=self.research_home,
-                    legacy_ocw_mode=self.legacy_ocw_mode,
                 )
             )
         ).expanduser().resolve()
@@ -1196,7 +1178,6 @@ class BridgeConfig:
                 _default_node_tool_bin(
                     "tmeet",
                     research_home=self.research_home,
-                    legacy_ocw_mode=self.legacy_ocw_mode,
                 )
             )
         ).expanduser().resolve()
@@ -1206,14 +1187,11 @@ class BridgeConfig:
                 _default_node_tool_bin(
                     "gws",
                     research_home=self.research_home,
-                    legacy_ocw_mode=self.legacy_ocw_mode,
                 )
             )
         ).expanduser().resolve()
         default_employee_python = (
-            self.research_home / "skills" / "employee-reviews" / "venv" / "bin" / "python"
-            if self.legacy_ocw_mode
-            else self.research_home / "venvs" / "employee-reviews" / "bin" / "python"
+            self.research_home / "venvs" / "employee-reviews" / "bin" / "python"
         )
         self.employee_python: Path = Path(
             os.path.abspath(
@@ -1388,66 +1366,16 @@ class BridgeConfig:
                 str(self.alphaengine_usage_file.parent / "alphaengine_search_queries"),
             )
         ).expanduser()
-        self.archive_state_file: Path = Path(
-            os.environ.get(
-                "DALTON_ARCHIVE_STATE_FILE",
-                os.path.expanduser("~/.config/dalton/conversation-archive-state.json"),
-            )
-        ).expanduser()
-        self.archive_status_file: Path = Path(
-            os.environ.get(
-                "DALTON_ARCHIVE_STATUS_FILE",
-                os.path.expanduser("~/.cache/dalton/conversation-archive-status.json"),
-            )
-        ).expanduser()
-        self.archive_log_file: Path = Path(
-            os.environ.get(
-                "DALTON_ARCHIVE_LOG_FILE",
-                os.path.expanduser("~/Library/Logs/dalton-conversation-archive.log"),
-            )
-        ).expanduser()
-        self.archive_err_log_file: Path = Path(
-            os.environ.get(
-                "DALTON_ARCHIVE_ERR_LOG_FILE",
-                os.path.expanduser("~/Library/Logs/dalton-conversation-archive.err.log"),
-            )
-        ).expanduser()
-        self.conversation_archive_py: Path = Path(
-            os.environ.get(
-                "DALTON_CONVERSATION_ARCHIVE_PY",
-                str(_SCRIPT_DIR / "conversation_archive.py"),
-            )
-        ).expanduser().resolve()
         self.repo_python: Path = Path(
             os.environ.get(
                 "DALTON_REPO_PYTHON",
                 str(_SCRIPT_DIR.parents[1] / ".venv" / "bin" / "python"),
             )
         ).expanduser()
-        try:
-            self.archive_startup_probe_s: float = max(
-                0.05,
-                float(os.environ.get("DALTON_ARCHIVE_STARTUP_PROBE_S", "0.5") or 0.5),
-            )
-        except ValueError:
-            self.archive_startup_probe_s = 0.5
-        try:
-            self.archive_run_timeout_s: float = max(
-                1.0,
-                float(os.environ.get("DALTON_ARCHIVE_RUN_TIMEOUT_S", "10800") or 10800.0),
-            )
-        except ValueError:
-            self.archive_run_timeout_s = 10800.0
         self.launch_agents_dir: Path = Path(
             os.environ.get(
                 "DALTON_LAUNCH_AGENTS_DIR",
                 os.path.expanduser("~/Library/LaunchAgents"),
-            )
-        ).expanduser()
-        self.archive_plist_file: Path = Path(
-            os.environ.get(
-                "DALTON_ARCHIVE_PLIST_FILE",
-                str(self.launch_agents_dir / "com.dalton.conversation-archive.plist"),
             )
         ).expanduser()
         self.pg_backup_plist_file: Path = Path(
@@ -1474,14 +1402,6 @@ class BridgeConfig:
                 os.path.expanduser("~/Backups/dalton/.watchdog_failures"),
             )
         ).expanduser()
-        self.openclaw_gateway_url: str = (
-            os.environ.get("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
-            .strip()
-            .rstrip("/")
-        )
-        self.openclaw_gateway_token: str = os.environ.get(
-            "OPENCLAW_GATEWAY_TOKEN", ""
-        ).strip()
         self.feishu_send_card_script: Path = Path(
             os.environ.get("DALTON_FEISHU_SEND_CARD_SCRIPT")
             or os.environ.get("FEISHU_SEND_CARD_SCRIPT")
@@ -8069,10 +7989,6 @@ class ResearchDataBridge:
         self._file_cache: dict[str, tuple[int, int, Any]] = {}
         self._xreach_version_cache: tuple[float, dict[str, Any]] | None = None
         self._tmeet_version_cache: tuple[float, dict[str, Any]] | None = None
-        self._archive_run_lock = asyncio.Lock()
-        self._archive_proc: Any = None
-        self._archive_watch_task: asyncio.Task[Any] | None = None
-        self._archive_last_status: dict[str, Any] = {}
         self._last_ae_fanout_limit_clamped: list[int] | None = None
         # DALTON-HOOK(data-jobs): host data-task runner state & lock (§2.3 item 3)
         self._host_runner_lock = asyncio.Lock()
@@ -8157,41 +8073,16 @@ class ResearchDataBridge:
             chosen = default_s
         return max(5, min(chosen, max_s, ceiling))
 
-    def _is_legacy_ocw_mode(self) -> bool:
-        """Return True when running in legacy single-root `DALTON_OCW_ROOT` mode (or test `cfg.ocw_root` override)."""
-        ocw_root = getattr(self.cfg, "ocw_root", None)
-        init_ocw = getattr(self.cfg, "_initial_ocw_root", None)
-        if isinstance(ocw_root, Path) and isinstance(init_ocw, Path) and ocw_root != init_ocw:
-            return True
-        legacy_flag = getattr(self.cfg, "legacy_ocw_mode", None)
-        if not isinstance(legacy_flag, bool):
-            return True
-        return legacy_flag
-
     def _research_code_root(self) -> Path:
-        """Resolve active research_runtime code directory, honoring test `cfg.ocw_root` overrides."""
-        ocw_root = getattr(self.cfg, "ocw_root", None)
-        init_ocw = getattr(self.cfg, "_initial_ocw_root", None)
+        """Resolve active research_runtime code directory."""
         research_code = getattr(self.cfg, "research_code", None)
-        if isinstance(ocw_root, Path) and (
-            not isinstance(research_code, Path)
-            or (isinstance(init_ocw, Path) and ocw_root != init_ocw)
-        ):
-            return ocw_root
         if isinstance(research_code, Path):
             return research_code
         return (_SCRIPT_DIR / "research_runtime").resolve()
 
     def _research_home_root(self) -> Path:
-        """Resolve active research_runtime home/data directory, honoring test `cfg.ocw_root` overrides."""
-        ocw_root = getattr(self.cfg, "ocw_root", None)
-        init_ocw = getattr(self.cfg, "_initial_ocw_root", None)
+        """Resolve active research_runtime home/data directory."""
         research_home = getattr(self.cfg, "research_home", None)
-        if isinstance(ocw_root, Path) and (
-            not isinstance(research_home, Path)
-            or (isinstance(init_ocw, Path) and ocw_root != init_ocw)
-        ):
-            return ocw_root
         if isinstance(research_home, Path):
             return research_home
         return Path.home() / "Library" / "Application Support" / "Everflow" / "research"
@@ -8202,12 +8093,10 @@ class ResearchDataBridge:
         """Spawn a single `researchdata_mcp.py` subprocess, send JSON-RPC lines, and read responses."""
         code_root = self._research_code_root()
         home_root = self._research_home_root()
-        extra_env: dict[str, str] = {}
-        if self._is_legacy_ocw_mode():
-            extra_env["DALTON_OCW_ROOT"] = str(home_root)
-        else:
-            extra_env["DALTON_RESEARCH_CODE"] = str(code_root)
-            extra_env["DALTON_RESEARCH_HOME"] = str(home_root)
+        extra_env: dict[str, str] = {
+            "DALTON_RESEARCH_CODE": str(code_root),
+            "DALTON_RESEARCH_HOME": str(home_root),
+        }
 
         env_path = getattr(self.cfg, "env_path", None)
         env_file_vars = _read_env_file_dict(env_path) if isinstance(env_path, Path) else {}
@@ -12562,7 +12451,7 @@ class ResearchDataBridge:
         try:
             if plan_obj is not None:
                 cache_root = self.cfg.cache_dir.expanduser().resolve()
-                if _is_within_openclaw_tree(cache_root, self.cfg.ocw_root):
+                if _is_within_openclaw_tree(cache_root, self.cfg.research_home):
                     err_msg = "Bridge cache_dir must not be inside ~/.openclaw"
                     err_payload = {
                         "_declared_sources": [],
@@ -15225,12 +15114,9 @@ class ResearchDataBridge:
         embed_extra: dict[str, str] = {
             "GEMINI_API_KEY": gemini_api_key,
             "PYTHONDONTWRITEBYTECODE": "1",
+            "DALTON_RESEARCH_CODE": str(code_root),
+            "DALTON_RESEARCH_HOME": str(home_root),
         }
-        if self._is_legacy_ocw_mode():
-            embed_extra["DALTON_OCW_ROOT"] = str(home_root)
-        else:
-            embed_extra["DALTON_RESEARCH_CODE"] = str(code_root)
-            embed_extra["DALTON_RESEARCH_HOME"] = str(home_root)
         subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
             os.environ,
             extra_env=embed_extra,
@@ -15356,203 +15242,6 @@ class ResearchDataBridge:
             "error": err_msg,
         }
 
-    def read_archive_enabled(self) -> bool:
-        """Read whether daily conversation-archive schedule is enabled from bridge state file (default True)."""
-        path = self.cfg.archive_state_file
-        if not path.is_file():
-            return True
-        try:
-            raw = path.read_text(encoding="utf-8").strip()
-            if not raw:
-                return True
-            if raw.lower() in ("false", "0", "off", "disabled"):
-                return False
-            if raw.lower() in ("true", "1", "on", "enabled"):
-                return True
-            data = json.loads(raw)
-            if isinstance(data, dict) and "enabled" in data:
-                return bool(data["enabled"])
-        except Exception as exc:
-            logger.warning("Failed reading archive state file: %s", type(exc).__name__)
-        return True
-
-    def write_archive_enabled(self, enabled: bool) -> dict[str, Any]:
-        """Atomically persist conversation-archive schedule state file."""
-        path = self.cfg.archive_state_file
-        payload = {
-            "enabled": bool(enabled),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if not _atomic_write_json_locked(path, payload, label="archive_state"):
-            raise OSError("写入宿主机归档开关状态文件失败")
-        return payload
-
-    def _compute_next_archive_run_at(
-        self,
-        *,
-        enabled: bool,
-        now: datetime | None = None,
-    ) -> str | None:
-        """Compute next run timestamp from the conversation-archive launchd plist when enabled, else None."""
-        if not enabled:
-            return None
-        plist_data = self._load_plist_dict(self.cfg.archive_plist_file)
-        return self._compute_next_calendar_interval_iso(plist_data, now=now)
-
-    def _archive_pid_files(self) -> list[Path]:
-        """Return PID file path(s) in the same directory as the archive status/state files."""
-        explicit = os.environ.get("DALTON_ARCHIVE_PID_FILE", "").strip()
-        if explicit:
-            return [Path(explicit).expanduser()]
-        paths: list[Path] = []
-        for parent in (self.cfg.archive_status_file.parent, self.cfg.archive_state_file.parent):
-            cand = parent / "conversation-archive.pid"
-            if cand not in paths:
-                paths.append(cand)
-        return paths
-
-    def _archive_lock_file(self) -> Path:
-        """Return the shared flock lock file in the same directory as the archive status file."""
-        status_path = self.cfg.archive_status_file
-        return status_path.with_name(f"{status_path.name}.lock")
-
-    @staticmethod
-    def _pid_is_alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-
-    def _write_archive_pid_file(self, pid: int | None) -> str:
-        """Atomically check for an active PID and write ``pid`` under the shared status-dir ``flock``.
-
-        Returns:
-            ``"written"`` when ``pid`` was persisted, ``"already_running"`` when a live process
-            holds the PID file, or ``"error"`` when locking or writing the PID file fails.
-        """
-        import fcntl
-
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-            return "error"
-        lock_path = self._archive_lock_file()
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("a+", encoding="utf-8") as lock_fh:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-                try:
-                    for p in self._archive_pid_files():
-                        if not p.is_file():
-                            continue
-                        try:
-                            raw = p.read_text(encoding="utf-8").strip()
-                            existing_pid = int(raw)
-                            if existing_pid != pid and self._pid_is_alive(existing_pid):
-                                return "already_running"
-                        except Exception:
-                            pass
-                    for p in self._archive_pid_files():
-                        p.parent.mkdir(parents=True, exist_ok=True)
-                        tmp_p = p.with_name(f".{p.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-                        tmp_p.write_text(f"{pid}\n", encoding="utf-8")
-                        os.replace(tmp_p, p)
-                    return "written"
-                finally:
-                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except Exception as exc:
-            logger.warning("Failed writing archive pid file: %s", type(exc).__name__)
-            return "error"
-
-    def _remove_archive_pid_file(self, *, expected_pid: int | None = None) -> None:
-        """Remove PID file(s) under the shared ``flock`` only when owned by ``expected_pid`` (or dead)."""
-        import fcntl
-
-        lock_path = self._archive_lock_file()
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("a+", encoding="utf-8") as lock_fh:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-                try:
-                    for p in self._archive_pid_files():
-                        if not p.is_file():
-                            continue
-                        try:
-                            raw = p.read_text(encoding="utf-8").strip()
-                            if expected_pid is not None:
-                                if raw.isdigit() and int(raw) != int(expected_pid):
-                                    continue
-                            elif raw.isdigit() and self._pid_is_alive(int(raw)):
-                                continue
-                            p.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                finally:
-                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-
-    def _is_archive_proc_running(self) -> bool:
-        """Check whether an archive process is alive under the shared status-dir ``flock``."""
-        import fcntl
-
-        proc = self._archive_proc
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            return True
-        lock_path = self._archive_lock_file()
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("a+", encoding="utf-8") as lock_fh:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-                try:
-                    for p in self._archive_pid_files():
-                        if not p.is_file():
-                            continue
-                        try:
-                            raw = p.read_text(encoding="utf-8").strip()
-                            pid = int(raw)
-                            if self._pid_is_alive(pid):
-                                return True
-                            p.unlink(missing_ok=True)
-                        except Exception:
-                            try:
-                                p.unlink(missing_ok=True)
-                            except Exception:
-                                pass
-                finally:
-                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        return False
-
-    def _read_archive_status_file(self) -> dict[str, Any]:
-        path = self.cfg.archive_status_file
-        if not path.is_file():
-            return dict(self._archive_last_status)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                merged = {**data, **self._archive_last_status}
-                if data.get("last_run_at") and (
-                    not merged.get("last_run_at")
-                    or str(data["last_run_at"]) >= str(merged.get("last_run_at") or "")
-                ):
-                    merged.update(data)
-                return merged
-        except Exception as exc:
-            logger.warning("Failed reading archive status file: %s", type(exc).__name__)
-        return dict(self._archive_last_status)
-
-    def _write_archive_status_file(self, payload: dict[str, Any]) -> None:
-        self._archive_last_status = dict(payload)
-        path = self.cfg.archive_status_file
-        _atomic_write_json_locked(path, payload, label="archive_status")
-
     @staticmethod
     def _read_complete_tail_lines(
         path: Path,
@@ -15590,494 +15279,12 @@ class ResearchDataBridge:
                 return []
             return decoded.splitlines()[-max_lines:]
 
-    @staticmethod
-    def _slice_last_archive_run_lines(
-        lines: list[str],
-        *,
-        max_lines: int = 25,
-    ) -> list[str]:
-        """Slice ``lines`` from the last run header (``=== ...``, excluding ``=== exit...``) and keep its tail."""
-        start_idx = 0
-        for idx, line in enumerate(lines):
-            if line.startswith("=== ") and not line.startswith("=== exit"):
-                start_idx = idx
-        run_lines = lines[start_idx:]
-        if max_lines > 0 and len(run_lines) > max_lines:
-            return run_lines[-max_lines:]
-        return run_lines
-
-    def _read_sanitized_archive_log_tail(self, *, max_len: int = 8192) -> str:
-        """Return the sanitized tail (max 8 KiB) of the last conversation-archive run.
-
-        The launchd script and the bridge's manual run both write the whole run, stderr
-        included, to the stdout log under one ``=== <time>`` header, so the run is sliced
-        from there. The separate stderr log is read only when the stdout log is missing or
-        empty (an install that predates the merged log); a run header that scrolled out of
-        the scan window must not pull in another file's older lines.
-        """
-        chunks: list[str] = []
-        stdout_has_content = False
-        if self.cfg.archive_log_file.is_file():
-            try:
-                raw_stdout = self._read_complete_tail_lines(
-                    self.cfg.archive_log_file, max_lines=2000
-                )
-                stdout_has_content = any(line.strip() for line in raw_stdout)
-                stdout_lines = self._slice_last_archive_run_lines(
-                    raw_stdout, max_lines=25
-                )
-                if stdout_lines:
-                    chunks.append("\n".join(stdout_lines))
-            except Exception:
-                pass
-        if not stdout_has_content and self.cfg.archive_err_log_file.is_file():
-            try:
-                raw_stderr = self._read_complete_tail_lines(
-                    self.cfg.archive_err_log_file, max_lines=200
-                )
-                stderr_lines = self._slice_last_archive_run_lines(
-                    raw_stderr, max_lines=25
-                )
-                if stderr_lines:
-                    chunks.append("\n".join(stderr_lines))
-            except Exception:
-                pass
-        if not chunks:
-            mem_tail = self._archive_last_status.get("log_tail")
-            if isinstance(mem_tail, str) and mem_tail.strip():
-                mem_lines = self._slice_last_archive_run_lines(
-                    mem_tail.strip().splitlines(),
-                    max_lines=25,
-                )
-                if mem_lines:
-                    chunks.append("\n".join(mem_lines))
-        combined = "\n".join(chunks).strip()
-        if not combined:
-            return ""
-        path_scrubbed = _scrub_local_paths(combined)
-        sanitized = sanitize_stderr_text(
-            path_scrubbed,
-            max_len=max(len(path_scrubbed) + 1024, max_len, 8192),
-        )
-        cleaned = _scrub_local_paths(sanitized)
-        byte_cap = min(max(1, int(max_len)), 8192)
-        encoded = cleaned.encode("utf-8")
-        if len(encoded) > byte_cap:
-            cleaned = encoded[-byte_cap:].decode("utf-8", errors="ignore").strip()
-        if len(cleaned) > max_len:
-            cleaned = cleaned[-max_len:].strip()
-        return _scrub_local_paths(cleaned)
-
-    @staticmethod
-    def _format_archive_result_label(
-        *,
-        running: bool,
-        exit_code: int | None,
-    ) -> str | None:
-        if running:
-            return "运行中"
-        if exit_code is None:
-            return None
-        if exit_code == 0:
-            return "成功 (exit_code=0)"
-        if exit_code == 2:
-            return "已在运行，跳过"
-        if exit_code == 3:
-            return "部分未完成 (exit_code=3)"
-        return f"失败 (exit_code={exit_code})"
-
-    async def handle_get_conversation_archive(self) -> tuple[int, dict[str, Any]]:
-        """Handle `GET /jobs/conversation-archive`."""
-        enabled = self.read_archive_enabled()
-        running = self._is_archive_proc_running()
-        status_data = self._read_archive_status_file()
-        last_run_at = status_data.get("last_run_at")
-        raw_exit = status_data.get("exit_code")
-        exit_code: int | None = (
-            int(raw_exit)
-            if isinstance(raw_exit, int) and not isinstance(raw_exit, bool)
-            else None
-        )
-        if not last_run_at and self.cfg.archive_log_file.is_file():
-            try:
-                mtime = self.cfg.archive_log_file.stat().st_mtime
-                last_run_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-            except Exception:
-                pass
-        saved_last_result = status_data.get("last_result")
-        if running:
-            last_result: str | None = "运行中"
-        elif isinstance(saved_last_result, str) and saved_last_result.strip():
-            last_result = _scrub_local_paths(
-                sanitize_stderr_text(saved_last_result.strip(), max_len=200)
-            )
-        else:
-            last_result = self._format_archive_result_label(
-                running=running,
-                exit_code=exit_code,
-            )
-        log_tail = self._read_sanitized_archive_log_tail()
-        next_run_at = self._compute_next_archive_run_at(enabled=enabled)
-        return 200, {
-            "ok": True,
-            "key": "conversation-archive",
-            "enabled": enabled,
-            "status": "on" if enabled else "off",
-            "running": running,
-            "last_run_at": last_run_at,
-            "exit_code": exit_code,
-            "last_result": last_result,
-            "log_tail": log_tail,
-            "next_run_at": next_run_at,
-        }
-
-    async def handle_toggle_conversation_archive(
-        self, enabled: bool
-    ) -> tuple[int, dict[str, Any]]:
-        """Handle `POST /jobs/conversation-archive/{enable|disable}`."""
-        try:
-            state = self.write_archive_enabled(bool(enabled))
-        except Exception as exc:
-            logger.warning("Failed toggling conversation archive state: %s", type(exc).__name__)
-            return 500, {
-                "ok": False,
-                "key": "conversation-archive",
-                "status": "error",
-                "error": "写入宿主机归档开关状态文件失败",
-            }
-        next_run_at = self._compute_next_archive_run_at(enabled=bool(enabled))
-        return 200, {
-            "ok": True,
-            "key": "conversation-archive",
-            "enabled": bool(enabled),
-            "status": "on" if enabled else "off",
-            "updated_at": state["updated_at"],
-            "next_run_at": next_run_at,
-        }
-
-    def _resolve_archive_python_bin(self) -> str:
+    def _resolve_repo_python_bin(self) -> str:
         if self.cfg.repo_python.is_file() and os.access(self.cfg.repo_python, os.X_OK):
             return str(self.cfg.repo_python)
         if os.path.exists(self.cfg.python_bin):
             return self.cfg.python_bin
         return sys.executable
-
-    async def _terminate_and_cleanup_archive_proc(
-        self,
-        proc: Any,
-        *,
-        log_fh: Any = None,
-        remove_pid: bool = True,
-        terminate_timeout_s: float = 10.0,
-        kill_timeout_s: float = 5.0,
-        initial_wait_rc: int | None = None,
-        initial_cancelled: asyncio.CancelledError | None = None,
-    ) -> tuple[bool, int | None, asyncio.CancelledError | None]:
-        """Terminate/kill ``proc`` if still running, wait with timeouts, and only clean up PID/log/ref once exited."""
-        cancelled_exc = initial_cancelled
-        wait_rc = initial_wait_rc
-
-        rc = getattr(proc, "returncode", None) if proc is not None else None
-        if not isinstance(rc, int) or isinstance(rc, bool):
-            rc = wait_rc
-
-        if proc is not None and rc is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                w = await asyncio.wait_for(proc.wait(), timeout=terminate_timeout_s)
-                if isinstance(w, int) and not isinstance(w, bool):
-                    wait_rc = w
-            except BaseException as exc:
-                if isinstance(exc, asyncio.CancelledError) and cancelled_exc is None:
-                    cancelled_exc = exc
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                try:
-                    w = await asyncio.wait_for(proc.wait(), timeout=kill_timeout_s)
-                    if isinstance(w, int) and not isinstance(w, bool):
-                        wait_rc = w
-                except BaseException as exc2:
-                    if isinstance(exc2, asyncio.CancelledError) and cancelled_exc is None:
-                        cancelled_exc = exc2
-
-        rc = getattr(proc, "returncode", None) if proc is not None else None
-        if not isinstance(rc, int) or isinstance(rc, bool):
-            rc = wait_rc
-        proc_exited = proc is None or (isinstance(rc, int) and not isinstance(rc, bool))
-
-        if proc_exited:
-            if log_fh is not None:
-                try:
-                    if isinstance(rc, int) and not isinstance(rc, bool):
-                        log_fh.write(f"=== exit {int(rc)}\n".encode("utf-8"))
-                    log_fh.flush()
-                except Exception:
-                    pass
-                try:
-                    log_fh.close()
-                except Exception:
-                    pass
-            if proc is not None:
-                if self._archive_proc is proc:
-                    self._archive_proc = None
-                if remove_pid:
-                    self._remove_archive_pid_file(expected_pid=getattr(proc, "pid", None))
-
-        return (
-            proc_exited,
-            (int(rc) if isinstance(rc, int) and not isinstance(rc, bool) else None),
-            cancelled_exc,
-        )
-
-    async def _watch_archive_proc(
-        self,
-        proc: Any,
-        started_at: str,
-        log_fh: Any = None,
-    ) -> None:
-        """Wait for an asynchronous `conversation_archive.py run` subprocess and record its outcome."""
-        timed_out = False
-        cancelled_exc: asyncio.CancelledError | None = None
-        watcher_error: str | None = None
-        wait_rc: int | None = None
-        try:
-            w = await asyncio.wait_for(proc.wait(), timeout=self.cfg.archive_run_timeout_s)
-            if isinstance(w, int) and not isinstance(w, bool):
-                wait_rc = w
-        except asyncio.TimeoutError:
-            timed_out = True
-            logger.warning(
-                "Archive subprocess (pid=%s) timed out after %.1fs",
-                getattr(proc, "pid", None),
-                self.cfg.archive_run_timeout_s,
-            )
-        except asyncio.CancelledError as exc:
-            cancelled_exc = exc
-            watcher_error = "CancelledError"
-            logger.warning("Archive watcher cancelled (pid=%s)", getattr(proc, "pid", None))
-        except BaseException as exc:
-            watcher_error = type(exc).__name__
-            logger.warning("Archive watcher error: %s", watcher_error)
-        finally:
-            proc_exited, rc_val, cancelled_exc = await self._terminate_and_cleanup_archive_proc(
-                proc,
-                log_fh=log_fh,
-                remove_pid=True,
-                terminate_timeout_s=10.0,
-                kill_timeout_s=5.0,
-                initial_wait_rc=wait_rc,
-                initial_cancelled=cancelled_exc,
-            )
-            tail = self._read_sanitized_archive_log_tail(max_len=8192)
-            exit_code_val = int(rc_val) if proc_exited and rc_val is not None else 1
-            if timed_out:
-                last_result = "运行超时"
-            elif exit_code_val == 2:
-                last_result = "已在运行，跳过"
-            elif watcher_error and exit_code_val != 0:
-                last_result = f"失败 ({watcher_error})"
-            else:
-                last_result = self._format_archive_result_label(
-                    running=False,
-                    exit_code=exit_code_val,
-                )
-            self._write_archive_status_file(
-                {
-                    "last_run_at": started_at,
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                    "exit_code": exit_code_val,
-                    "last_result": last_result,
-                    "log_tail": tail,
-                }
-            )
-        if cancelled_exc is not None:
-            raise cancelled_exc
-
-    async def handle_run_conversation_archive(self) -> tuple[int, dict[str, Any]]:
-        """Handle `POST /jobs/conversation-archive/run`.
-
-        Prevents duplicate launches via PID file + advisory lock (exit code 2 -> `already_running`).
-        """
-        async with self._archive_run_lock:
-            if self._is_archive_proc_running():
-                return 200, {
-                    "ok": False,
-                    "key": "conversation-archive",
-                    "status": "already_running",
-                    "already_running": True,
-                    "error": "已有归档在运行",
-                }
-
-            py_bin = self._resolve_archive_python_bin()
-            script_path = self.cfg.conversation_archive_py
-            repo_root = script_path.parents[2] if len(script_path.parents) >= 3 else _SCRIPT_DIR.parent
-            repo_env = Path(
-                os.environ.get("DALTON_REPO_ENV_FILE") or (repo_root / ".env")
-            ).expanduser()
-            base_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-            caller_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
-                base_env,
-                repo_root=repo_root,
-                repo_env_path=repo_env,
-                hydrate_from_dotenv=True,
-            )
-            env_vars = bridge_subprocess_env.build_archive_subprocess_env(
-                repo_env_path=repo_env,
-                bridge_env_path=self.cfg.env_path,
-                base_env=base_env,
-                host_embed_url="http://127.0.0.1:8960/embed",
-                repo_root=repo_root,
-                validate_required=False,
-                defer_primary_model_validation=True,
-            )
-            try:
-                candidates_rfd = bridge_subprocess_env.finalize_and_attach_archive_candidates(
-                    caller_candidates,
-                    env_vars,
-                    repo_root=repo_root,
-                )
-            except bridge_subprocess_env.ArchiveEnvValidationError as exc:
-                return 500, {
-                    "ok": False,
-                    "key": "conversation-archive",
-                    "status": "error",
-                    "error": str(exc),
-                }
-
-            started_at = datetime.now(timezone.utc).isoformat()
-            log_fh: Any = None
-            try:
-                self.cfg.archive_log_file.parent.mkdir(parents=True, exist_ok=True)
-                log_fh = self.cfg.archive_log_file.open("ab")
-                ts_str = (
-                    datetime.now()
-                    .astimezone()
-                    .strftime("%Y-%m-%d %H:%M:%S %Z")
-                    .strip()
-                )
-                log_fh.write(f"=== {ts_str} attempt 1\n".encode("utf-8"))
-                log_fh.flush()
-            except Exception as exc:
-                logger.warning("Failed opening archive log file: %s", type(exc).__name__)
-                log_fh = None
-
-            proc: Any = None
-            pid_written = False
-            watcher_registered = False
-            startup_cancelled: asyncio.CancelledError | None = None
-            try:
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        py_bin,
-                        str(script_path),
-                        "run",
-                        cwd=str(repo_root),
-                        env=env_vars,
-                        stdout=log_fh if log_fh is not None else asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.STDOUT if log_fh is not None else asyncio.subprocess.DEVNULL,
-                        pass_fds=(candidates_rfd,) if candidates_rfd is not None else (),
-                    )
-                finally:
-                    if candidates_rfd is not None:
-                        try:
-                            os.close(candidates_rfd)
-                        except OSError:
-                            pass
-                        candidates_rfd = None
-                self._archive_proc = proc
-                proc_pid = getattr(proc, "pid", None)
-                pid_status = self._write_archive_pid_file(proc_pid)
-                if pid_status == "already_running":
-                    return 200, {
-                        "ok": False,
-                        "key": "conversation-archive",
-                        "status": "already_running",
-                        "already_running": True,
-                        "error": "已有归档在运行",
-                    }
-                if pid_status != "written":
-                    return 500, {
-                        "ok": False,
-                        "key": "conversation-archive",
-                        "status": "error",
-                        "error": "写入团队对话归档 PID 文件失败",
-                    }
-                pid_written = True
-
-                # Wait briefly to catch immediate exit code 2 when another process holds the Postgres advisory lock
-                probe_s = self.cfg.archive_startup_probe_s
-                try:
-                    await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=probe_s)
-                except asyncio.TimeoutError:
-                    pass
-
-                rc = getattr(proc, "returncode", None)
-                if rc == 2:
-                    if log_fh is not None:
-                        try:
-                            log_fh.write(b"=== exit 2\n")
-                            log_fh.flush()
-                            log_fh.close()
-                        except Exception:
-                            pass
-                        log_fh = None
-                    self._write_archive_status_file(
-                        {
-                            "last_run_at": started_at,
-                            "finished_at": datetime.now(timezone.utc).isoformat(),
-                            "exit_code": 2,
-                            "last_result": "已在运行，跳过",
-                            "log_tail": self._read_sanitized_archive_log_tail(max_len=8192),
-                        }
-                    )
-                    return 200, {
-                        "ok": False,
-                        "key": "conversation-archive",
-                        "status": "already_running",
-                        "already_running": True,
-                        "exit_code": 2,
-                        "last_result": "已在运行，跳过",
-                        "error": "已有归档在运行",
-                    }
-
-                self._archive_watch_task = asyncio.create_task(
-                    self._watch_archive_proc(proc, started_at, log_fh)
-                )
-                watcher_registered = True
-                return 200, {
-                    "ok": True,
-                    "key": "conversation-archive",
-                    "status": "started",
-                    "async": True,
-                    "pid": proc_pid,
-                    "started_at": started_at,
-                }
-            except asyncio.CancelledError as exc:
-                startup_cancelled = exc
-                raise
-            finally:
-                if candidates_rfd is not None:
-                    try:
-                        os.close(candidates_rfd)
-                    except OSError:
-                        pass
-                    candidates_rfd = None
-                if not watcher_registered:
-                    _, _, cleanup_cancelled = await self._terminate_and_cleanup_archive_proc(
-                        proc,
-                        log_fh=log_fh,
-                        remove_pid=pid_written,
-                        terminate_timeout_s=2.0,
-                        kill_timeout_s=2.0,
-                        initial_cancelled=startup_cancelled,
-                    )
-                    if cleanup_cancelled is not None and startup_cancelled is None:
-                        raise cleanup_cancelled
 
     @staticmethod
     def _probe_launchd_label_status(
@@ -16341,17 +15548,8 @@ class ResearchDataBridge:
                 ],
             }
 
-    def _invoke_openclaw_gateway(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """POST ``payload`` to OpenClaw ``/tools/invoke`` bypassing proxies and never logging tokens."""
-        return _post_openclaw_tools_invoke(
-            gateway_url=self.cfg.openclaw_gateway_url,
-            gateway_token=self.cfg.openclaw_gateway_token,
-            payload=payload,
-            timeout_s=self.cfg.feishu_send_card_timeout_s,
-        )
-
     async def handle_notify(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        """Handle ``POST /notify`` by sending Feishu Card 2.0 via ``feishu_send_card.py`` or Discord DM via OpenClaw."""
+        """Handle ``POST /notify`` by sending Feishu Card 2.0 via ``feishu_send_card.py``."""
         raw_targets = body.get("targets")
         raw_text = body.get("text")
         raw_card = body.get("card")
@@ -16420,8 +15618,6 @@ class ResearchDataBridge:
         except ValueError as img_exc:
             return 400, {"ok": False, "error": str(img_exc)}
 
-        text = str(raw_text or "").strip()
-        token = self.cfg.openclaw_gateway_token
         results: list[dict[str, Any]] = []
 
         for raw_target in raw_targets:
@@ -16521,100 +15717,21 @@ class ResearchDataBridge:
                     )
                 continue
 
-            if not token:
-                logger.warning(
-                    "notify target=%s channel=%s status=error error_code=missing_openclaw_gateway_token",
-                    display_target,
-                    channel,
-                )
-                results.append(
-                    {
-                        "target": target_str,
-                        "channel": channel,
-                        "ok": False,
-                        "error": "missing_openclaw_gateway_token",
-                    }
-                )
-                continue
-
-            invoke_payload = build_openclaw_message_invoke_body(
-                channel=channel,
-                target=target_arg,
-                text=text,
+            err_code = "feishu_card_required" if channel == "feishu" else "unsupported_notify_channel"
+            logger.warning(
+                "notify target=%s channel=%s status=error error_code=%s",
+                display_target,
+                channel,
+                err_code,
             )
-            try:
-                resp_data = await asyncio.to_thread(
-                    self._invoke_openclaw_gateway, invoke_payload
-                )
-                is_err = bool(
-                    resp_data.get("ok") is False
-                    or resp_data.get("isError")
-                    or (
-                        isinstance(resp_data.get("result"), Mapping)
-                        and resp_data["result"].get("isError")
-                    )
-                )
-                if is_err:
-                    status_code = (
-                        resp_data.get("status_code")
-                        if isinstance(resp_data.get("status_code"), int)
-                        else None
-                    )
-                    err_code = (
-                        f"http_{status_code}"
-                        if status_code is not None
-                        else "openclaw_invoke_error"
-                    )
-                    logger.warning(
-                        "notify target=%s channel=%s status=error error_code=%s status_code=%s",
-                        display_target,
-                        channel,
-                        err_code,
-                        status_code,
-                    )
-                    results.append(
-                        {
-                            "target": target_str,
-                            "channel": channel,
-                            "ok": False,
-                            "error": err_code,
-                        }
-                    )
-                else:
-                    logger.info(
-                        "notify target=%s channel=%s status=ok",
-                        display_target,
-                        channel,
-                    )
-                    results.append(
-                        {"target": target_str, "channel": channel, "ok": True}
-                    )
-            except Exception as exc:
-                status_code = getattr(exc, "code", None) or getattr(
-                    getattr(exc, "response", None), "status_code", None
-                )
-                if not isinstance(status_code, int):
-                    status_code = None
-                err_code = (
-                    f"http_{status_code}"
-                    if status_code is not None
-                    else type(exc).__name__
-                )
-                logger.warning(
-                    "notify target=%s channel=%s status=error error_type=%s status_code=%s",
-                    display_target,
-                    channel,
-                    type(exc).__name__,
-                    status_code,
-                )
-                results.append(
-                    {
-                        "target": target_str,
-                        "channel": channel,
-                        "ok": False,
-                        "error": err_code,
-                    }
-                )
+            results.append(
+                {
+                    "target": target_str,
+                    "channel": channel,
+                    "ok": False,
+                    "error": err_code,
+                }
+            )
 
         all_ok = bool(results) and all(bool(item.get("ok")) for item in results)
         return 200, {"ok": all_ok, "results": results}
@@ -16680,7 +15797,7 @@ class ResearchDataBridge:
                 f"Unsupported company-wiki launcher {explicit}: target skill directory must contain scripts/company_wiki_cli.py or scripts/wiki_cli.py"
             )
         code_launcher = self._research_code_root() / "skills" / "company-wiki" / "run.sh"
-        if not self._is_legacy_ocw_mode() and code_launcher.is_file():
+        if code_launcher.is_file():
             return code_launcher
         if runtime_launcher.is_file():
             return runtime_launcher
@@ -17570,12 +16687,9 @@ class ResearchDataBridge:
             "DALTON_WIKI_SKILL_DIR": str(wiki_skill_dir),
             "DALTON_MARKET_DIGEST_SKILL_DIR": str(md_skill_dir),
             "DALTON_BRIDGE_ENV_FILTER_PY": str(_SCRIPT_DIR / "bridge_subprocess_env.py"),
+            "DALTON_RESEARCH_CODE": str(code_root),
+            "DALTON_RESEARCH_HOME": str(home_root),
         }
-        if self._is_legacy_ocw_mode():
-            base_env["DALTON_OCW_ROOT"] = str(home_root)
-        else:
-            base_env["DALTON_RESEARCH_CODE"] = str(code_root)
-            base_env["DALTON_RESEARCH_HOME"] = str(home_root)
         for opt_key in ("DALTON_SKILL_PYTHON",):
             opt_val = os.environ.get(opt_key, "").strip()
             if opt_val:
@@ -18655,7 +17769,7 @@ class ResearchDataBridge:
                 f"Unsupported market-digest launcher {explicit}: target skill directory must contain scripts/market_digest_cli.py or scripts/digest_cli.py"
             )
         code_launcher = self._research_code_root() / "skills" / "market-digest" / "run.sh"
-        if not self._is_legacy_ocw_mode() and code_launcher.is_file():
+        if code_launcher.is_file():
             return code_launcher
         if runtime_launcher.is_file():
             return runtime_launcher
@@ -20659,8 +19773,8 @@ class ResearchDataBridge:
             return 400, {"ok": False, "error": "no_output_timeout must be a positive number or null"}
 
         data_root = Path(self.cfg.data_tasks_data_root).resolve()
-        ocw_root = Path(self.cfg.ocw_root).expanduser().resolve()
-        py_bin = self._resolve_archive_python_bin()
+        ocw_root = Path(self.cfg.research_home).expanduser().resolve()
+        py_bin = self._resolve_repo_python_bin()
 
         async with self._host_runner_lock:
             marker_exists = await asyncio.to_thread(self._has_fence_lost_marker_file_sync)
@@ -22061,21 +21175,6 @@ def parse_notify_target(raw: str) -> tuple[str, str]:
     raise ValueError(f"Unsupported notify target format: {cleaned!r}")
 
 
-def build_openclaw_message_invoke_body(
-    channel: str, target: str, text: str
-) -> dict[str, Any]:
-    """Build the OpenClaw ``/tools/invoke`` payload for sending a direct message."""
-    return {
-        "tool": "message",
-        "args": {
-            "action": "send",
-            "channel": channel,
-            "target": target,
-            "message": text,
-        },
-    }
-
-
 def build_feishu_send_card_cmd(
     *,
     script_path: Path | str,
@@ -22372,33 +21471,6 @@ def _run_feishu_send_card(
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-
-
-def _post_openclaw_tools_invoke(
-    *,
-    gateway_url: str,
-    gateway_token: str,
-    payload: dict[str, Any],
-    timeout_s: float = FEISHU_SEND_CARD_TIMEOUT_S,
-) -> dict[str, Any]:
-    """Send ``POST {gateway_url}/tools/invoke`` bypassing HTTP proxies (``NO_PROXY``)."""
-    url = f"{gateway_url.rstrip('/')}/tools/invoke"
-    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data_bytes,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {gateway_token}",
-        },
-    )
-    # Bypass all proxies explicitly (NO_PROXY for local OpenClaw gateway)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout_s) as resp:
-        raw_resp = resp.read().decode("utf-8", errors="replace")
-        parsed = json.loads(raw_resp) if raw_resp.strip() else {"ok": True}
-        return parsed if isinstance(parsed, dict) else {"ok": True, "result": parsed}
 
 
 # ---------------------------------------------------------------------------
@@ -26323,40 +25395,14 @@ async def _handle_client(
             await _send_http(writer, code, status_label, payload)
             return
 
-        # Route 4: /jobs/conversation-archive* and /jobs/ops (admin token required)
-        if path == "/jobs/ops" or path.startswith("/jobs/conversation-archive"):
-            if path == "/jobs/conversation-archive":
-                if method != "GET":
-                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
-                    return
-                code, payload = await bridge.handle_get_conversation_archive()
-                await _send_http(writer, code, "OK", payload)
+        # Route 4: /jobs/ops (admin token required)
+        if path == "/jobs/ops":
+            if method != "GET":
+                await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
                 return
-
-            if path == "/jobs/conversation-archive/run":
-                if method != "POST":
-                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
-                    return
-                code, payload = await bridge.handle_run_conversation_archive()
-                await _send_http(writer, code, "OK", payload)
-                return
-
-            if path in ("/jobs/conversation-archive/enable", "/jobs/conversation-archive/disable"):
-                if method != "POST":
-                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
-                    return
-                enable_flag = path.endswith("/enable")
-                code, payload = await bridge.handle_toggle_conversation_archive(enable_flag)
-                await _send_http(writer, code, "OK", payload)
-                return
-
-            if path == "/jobs/ops":
-                if method != "GET":
-                    await _send_http(writer, 405, "Method Not Allowed", {"error": "Method Not Allowed"})
-                    return
-                code, payload = await bridge.handle_get_ops_jobs()
-                await _send_http(writer, code, "OK", payload)
-                return
+            code, payload = await bridge.handle_get_ops_jobs()
+            await _send_http(writer, code, "OK", payload)
+            return
 
             await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
             return
@@ -26971,7 +26017,7 @@ def _read_pyvenv_major_minor(cfg_path: Path) -> str | None:
     return None
 
 
-def _resolve_consensus_expected_mm(home_root: Path, ocw_root: Path) -> str | None:
+def _resolve_consensus_expected_mm(home_root: Path) -> str | None:
     ver_file = home_root / "state" / "venvs" / "consensus-estimates.python_version"
     if ver_file.is_file():
         try:
@@ -26981,9 +26027,8 @@ def _resolve_consensus_expected_mm(home_root: Path, ocw_root: Path) -> str | Non
         except OSError:
             pass
     for cfg_cand in (
-        ocw_root / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg",
+        home_root / "venvs" / "consensus-estimates" / "pyvenv.cfg",
         home_root / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg",
-        Path.home() / ".openclaw" / "workspace" / "state" / "venvs" / "consensus-estimates" / "pyvenv.cfg",  # 兼容读取旧 venv 版本
     ):
         mm = _read_pyvenv_major_minor(cfg_cand)
         if mm:
@@ -27119,7 +26164,6 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
     cfg = cfg or BridgeConfig()
     code_root = cfg.research_code
     home_root = cfg.research_home
-    legacy_mode = cfg.legacy_ocw_mode
 
     required_code_rel = (
         "config/data_sources.json",
@@ -27174,15 +26218,13 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         "scripts/guidepoint_mcp_oauth.py",
         "scripts/guidepoint_mcp_proxy_run.sh",
     )
-    # Example files exist only in the repo copy; the legacy workspace never had them.
     missing_code = [
         rel
         for rel in (
             *required_code_rel,
-            *(dalton_host_service_code_rel if not legacy_mode else ()),
+            *dalton_host_service_code_rel,
         )
-        if not (legacy_mode and rel.endswith(".example.json"))
-        and not (code_root / rel).is_file()
+        if not (code_root / rel).is_file()
     ]
     code_ok = code_root.is_dir() and not missing_code
 
@@ -27191,12 +26233,7 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         ("data_sources", code_root / "config" / "data_sources.json"),
         ("company_wiki_config", code_root / "skills" / "company-wiki" / "config.json"),
         ("eve_tracking_mirror_config", home_root / "config" / "eve_tracking_mirror.json"),
-        (
-            "market_digest_config",
-            (home_root / "skills" / "market-digest" / "config.json")
-            if legacy_mode
-            else (home_root / "config" / "config.json"),
-        ),
+        ("market_digest_config", home_root / "config" / "config.json"),
     )
     for label, p in config_targets:
         if not p.is_file():
@@ -27237,18 +26274,18 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         )
     )
 
-    consensus_expected_mm = _resolve_consensus_expected_mm(home_root, cfg.ocw_root)
-    specs: tuple[tuple[str, str | None, Path], ...] = (
-        ("findata-analyst", "3.12", home_root / "skills" / "findata-analyst" / "venv"),
-        ("cn-hk-findata", "3.12", home_root / "skills" / "cn-hk-findata" / "venv"),
-        ("company-wiki", "3.14", home_root / "skills" / "company-wiki" / "venv"),
-        ("market-digest", "3.13", home_root / "skills" / "market-digest" / "venv"),
-        ("employee-reviews", "3.14", home_root / "skills" / "employee-reviews" / "venv"),
-        ("consensus-estimates", consensus_expected_mm, home_root / "state" / "venvs" / "consensus-estimates"),
+    consensus_expected_mm = _resolve_consensus_expected_mm(home_root)
+    specs: tuple[tuple[str, str | None], ...] = (
+        ("findata-analyst", "3.12"),
+        ("cn-hk-findata", "3.12"),
+        ("company-wiki", "3.14"),
+        ("market-digest", "3.13"),
+        ("employee-reviews", "3.14"),
+        ("consensus-estimates", consensus_expected_mm),
     )
     venv_checks: dict[str, Any] = {}
-    for skill_name, expected_mm, legacy_dir in specs:
-        venv_dir = legacy_dir if legacy_mode else (home_root / "venvs" / skill_name)
+    for skill_name, expected_mm in specs:
+        venv_dir = home_root / "venvs" / skill_name
         py_path = venv_dir / "bin" / "python"
         if not (py_path.is_file() and os.access(py_path, os.X_OK)):
             venv_checks[skill_name] = {
@@ -27272,8 +26309,6 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         for cand in (
             home_root / "venvs" / "company-wiki" / "bin" / "python",
             home_root / "venvs" / "market-digest" / "bin" / "python",
-            home_root / "skills" / "company-wiki" / "venv" / "bin" / "python",
-            home_root / "skills" / "market-digest" / "venv" / "bin" / "python",
         ):
             if cand.is_file() and os.access(cand, os.X_OK):
                 embed_py = cand
@@ -27318,7 +26353,7 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
     overall_ok = code_ok and configs_ok and venvs_ok and stores_ok
     return {
         "ok": overall_ok,
-        "mode": "legacy_ocw" if legacy_mode else "dalton_research",
+        "mode": "dalton_research",
         "code_ok": code_ok,
         "configs_ok": configs_ok,
         "venvs_ok": venvs_ok,
@@ -27326,7 +26361,6 @@ def check_runtime_status(cfg: BridgeConfig | None = None) -> dict[str, Any]:
         "paths": {
             "research_code": str(code_root),
             "research_home": str(home_root),
-            "ocw_root": str(cfg.ocw_root),
         },
         "code": {
             "ok": code_ok,

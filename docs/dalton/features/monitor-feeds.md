@@ -1,6 +1,6 @@
 # 本机看板采集与推送（Monitor Feeds）
 
-这页讲清已经迁入 Dalton 监控面板的三个本机看板采集源、宿主机实时推送守护进程 `FeedDaemon`、交易所日历与交易时段控制、东方财富限流策略，以及上线前怎么校验。
+`pm-market-state`、`cn-intraday` 与 `hk-momentum` 三个本机看板由宿主机实时推送守护进程 `FeedDaemon` 与容器数据任务共同驱动，通过 `exchange_calendars` 交易时段控制与分页限流参数维持稳定采集。
 
 ## 1. 三个已迁入的看板与数据源
 
@@ -24,11 +24,11 @@
 
 ## 3. 东方财富限流原因与采集节流配置
 
-早期用 30s/120s 高频全市场扫描加 6 并发（还和原 OpenClaw 本地端共用一个出口 IP），每次 A 股全 ETF 和全股票列表扫描都要打大约 70 个东方财富分页请求，结果把出口 IP 打进了 502 限流。现在 `scripts/dalton/monitor_feeds/ashare_monitor/collect.py` 已经收紧成下面这套节流参数：
+早期高频全市场扫描加 6 并发（曾与历史本地脚本共用同一出口 IP）每次要发出约 70 个东方财富分页请求，容易触发 502 限流。当前 `scripts/dalton/monitor_feeds/ashare_monitor/collect.py` 采用下面这套节流参数：
 
 - **分模块差异刷新缓存**：指数和涨跌广度保持 1 分钟粒度实时刷新；重扫描改成按档 TTL 缓存——ETF 扫描 `ETF_SCAN_TTL_TRADING = 120`（交易时段 120s）/ `ETF_SCAN_TTL_CLOSED = 300`，全市场股票扫描 `STOCK_SCAN_TTL_TRADING = 300` / `STOCK_SCAN_TTL_CLOSED = 600`，历史序列 `HISTORY_TTL = 900`（15 分钟）。
-- **并发与域名降级**：分页并发从 6 降到 **`EASTMONEY_PAGE_WORKERS = 2`**；每页最多试 **`EASTMONEY_PAGE_ATTEMPTS = 3`** 次，前两次打 `push2delay.eastmoney.com`，最后一次才切去主域 `push2.eastmoney.com`（定义在 `EASTMONEY_HOSTS`）。
-- 启动 Dalton 的 `com.dalton.monitor-feeds` 前，一定要先确认宿主机已经停掉旧的 OpenClaw 和本地同类抓包定时脚本，免得同一出口 IP 被双份流量打封。
+- **并发与域名降级**：分页并发降至 **`EASTMONEY_PAGE_WORKERS = 2`**；每页最多尝试 **`EASTMONEY_PAGE_ATTEMPTS = 3`** 次，前两次走 `push2delay.eastmoney.com`，最后一次回退主域 `push2.eastmoney.com`（定义在 `EASTMONEY_HOSTS`）。
+- 启动 Dalton 的 `com.dalton.monitor-feeds` 前，先核对宿主机仅运行单一抓取进程，避免同一出口 IP 发出重复并发请求。
 
 ## 4. 上线切换步骤
 

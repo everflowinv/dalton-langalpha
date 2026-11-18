@@ -1649,10 +1649,8 @@ async def test_bridge_feishu_card_and_discord_log_hygiene_never_logs_body_or_exc
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     bridge = _make_bridge(tmp_path, monkeypatch)
-    secret_token = bridge.cfg.openclaw_gateway_token
     subprocess_secret = "feishu-app-secret-never-log-me-999"
     sensitive_message_body = "机密研报正文：GOOGL 核心客户未公开谈判细节绝不写进日志。"
-    sensitive_exception_text = "openclaw-internal-exception-detail-secret-555"
 
     c_earn = classify_automation_for_notify({"name": "dalton-googl-earn-2026q1-t0"})
     assert c_earn is not None
@@ -1693,27 +1691,6 @@ async def test_bridge_feishu_card_and_discord_log_hygiene_never_logs_body_or_exc
     run_spy = create_autospec(subprocess.run, side_effect=_fake_subprocess_run)
     monkeypatch.setattr(rb.subprocess, "run", run_spy)
 
-    def _fake_openclaw_post(
-        *,
-        gateway_url: str,
-        gateway_token: str,
-        payload: dict,
-        timeout_s: float = 15.0,
-    ) -> dict:
-        _ = (gateway_url, gateway_token, timeout_s)
-        target_val = payload["args"]["target"]
-        if target_val == "user:999999":
-            raise RuntimeError(f"gateway crash: {sensitive_exception_text}")
-        if target_val == "user:888888":
-            return {
-                "ok": False,
-                "error": f"gateway error payload: {sensitive_exception_text}",
-            }
-        return {"ok": True, "result": {"via": "direct"}}
-
-    post_spy = create_autospec(rb._post_openclaw_tools_invoke, side_effect=_fake_openclaw_post)
-    monkeypatch.setattr(rb, "_post_openclaw_tools_invoke", post_spy)
-
     with caplog.at_level(logging.INFO):
         code, resp = await bridge.handle_notify(
             {
@@ -1721,8 +1698,6 @@ async def test_bridge_feishu_card_and_discord_log_hygiene_never_logs_body_or_exc
                     "feishu:user:ou_ok_card",
                     "feishu:user:ou_fail_card",
                     "discord:user:11223344",
-                    "discord:user:888888",
-                    "discord:user:999999",
                 ],
                 "text": sensitive_message_body,
                 "card": card,
@@ -1739,27 +1714,17 @@ async def test_bridge_feishu_card_and_discord_log_hygiene_never_logs_body_or_exc
             "ok": False,
             "error": "exit_code=1",
         },
-        {"target": "discord:user:11223344", "channel": "discord", "ok": True},
         {
-            "target": "discord:user:888888",
+            "target": "discord:user:11223344",
             "channel": "discord",
             "ok": False,
-            "error": "openclaw_invoke_error",
-        },
-        {
-            "target": "discord:user:999999",
-            "channel": "discord",
-            "ok": False,
-            "error": "RuntimeError",
+            "error": "unsupported_notify_channel",
         },
     ]
 
-    # Assert message body, subprocess stdout/stderr, gateway token, and raw exception strings NEVER appear in logs
+    # Assert message body and subprocess stdout/stderr secrets NEVER appear in logs
     assert sensitive_message_body not in caplog.text
-    assert sensitive_exception_text not in caplog.text
     assert subprocess_secret not in caplog.text
-    assert secret_token not in caplog.text
-    assert sensitive_exception_text not in str(resp)
 
 
 def test_notify_preview_loads_real_result_excerpt_and_fails_without_sample(

@@ -84,7 +84,8 @@ def _make_test_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     cfg.env_path = env_file
     cfg.token = "mcp-secret-token"
     cfg.admin_token = "admin-secret-token"
-    cfg.ocw_root = ocw_root
+    cfg.research_code = ocw_root
+    cfg.research_home = ocw_root
     cfg.wiki_run_sh = run_sh
     cfg.wiki_ingest_audit_file = tmp_path / "var" / "dalton" / "wiki_ingest_audit.jsonl"
     cfg.wiki_ingest_temp_dir = tmp_path / "var" / "dalton" / "tmp" / "wiki_ingest"
@@ -256,7 +257,7 @@ async def test_bridge_wiki_ingest_slug_and_alias_validations(tmp_path: Path) -> 
 
     # Unmapped Chinese / A-share / HK name -> returns needs_alias without modifying config.json
     cfg_before = (
-        bridge.cfg.ocw_root / "skills" / "company-wiki" / "config.json"
+        bridge.cfg.research_home / "skills" / "company-wiki" / "config.json"
     ).read_text(encoding="utf-8")
     companies_dir = bridge._resolve_wiki_base_dir("company", bridge._load_company_wiki_config())
     (companies_dir / "YUHONG").mkdir(parents=True, exist_ok=True)
@@ -277,7 +278,7 @@ async def test_bridge_wiki_ingest_slug_and_alias_validations(tmp_path: Path) -> 
     assert res["target"] == "YUHONG"
     assert res["is_existing_slug"] is True
     cfg_after = (
-        bridge.cfg.ocw_root / "skills" / "company-wiki" / "config.json"
+        bridge.cfg.research_home / "skills" / "company-wiki" / "config.json"
     ).read_text(encoding="utf-8")
     assert cfg_before == cfg_after
 
@@ -1794,7 +1795,7 @@ async def test_bridge_idempotency_persisted_before_audit_and_binary_pdf_dedup(
 ) -> None:
     """Round 3 Fix 3 & Round 4 Fix 3: CLI success + audit failure persists idempotency result so same-`request_id` retry does not re-run CLI; binary PDF deduplicates via idempotency/audit sha256 without scanning the slug directory."""
     bridge = _make_test_bridge(tmp_path)
-    ocw_root = bridge.cfg.ocw_root
+    ocw_root = bridge.cfg.research_home
     cli_calls = 0
 
     async def _fake_cli(cmd: list[str], *, env: dict[str, str], timeout_s: float) -> dict[str, Any]:

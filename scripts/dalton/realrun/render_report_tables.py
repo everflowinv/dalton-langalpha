@@ -30,8 +30,6 @@ FAMILY_SPECS: list[tuple[str, str, str]] = [
     ("G2 接口与探测", "scripts/dalton/realrun/g2_providers.py", "g2_providers.json"),
     ("G3 发布核验", "scripts/dalton/realrun/g3_publish.py", "g3_publish.json"),
     ("G4 自主议程", "scripts/dalton/realrun/g4_autonomy.py", "g4_autonomy.json"),
-    ("G5.1 Broker", "scripts/dalton/realrun/g5_broker_and_antigravity.py", "g5_1_broker.json"),
-    ("G5.2 Antigravity", "scripts/dalton/realrun/g5_broker_and_antigravity.py", "g5_2_antigravity.json"),
     ("G6 财务镜头", "scripts/dalton/realrun/g6_lenses.py", "g6_lenses.json"),
     ("G7 宿主机桥", "scripts/dalton/realrun/g7_bridge.py", "g7_bridge.json"),
 ]
