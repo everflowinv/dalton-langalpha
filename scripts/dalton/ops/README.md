@@ -99,3 +99,4 @@ bash scripts/dalton/ops/dalton_data_backup.sh
 - `com.dalton.backend-watchdog.plist.template`：每 60 秒执行 `prod/watchdog.sh`。
 - `com.dalton.colima.plist.template`：登录后前台保活运行 `prod/colima_launch.sh`。
 - `com.dalton.pg-backup.plist.template`：每天 03:00 执行 `prod/backup.sh`。
+- `com.dalton.portwatch.plist.template`：每 300 秒执行 `prod/portwatch.sh`，记录临时端口（49152–65535）占用和占用最多的进程，写入 `~/Library/Logs/dalton-portwatch/portwatch.jsonl`；占用超过 60% 时另存一份完整快照，便于事后找出泄漏连接的进程（起因是 2026-09-07 端口耗尽事故）。
