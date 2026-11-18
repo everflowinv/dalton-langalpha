@@ -104,7 +104,7 @@ def test_t34_manifest_matches_openclaw_schedule() -> None:
     manifest = load_data_task_manifest()
     by_code = manifest.by_task_code()
     by_key = manifest.by_job_key()
-    assert len(manifest.tasks) == 41
+    assert len(manifest.tasks) == 42
     assert "T34" in by_code
     entry = by_code["T34"]
     assert entry is by_key[JOB_KEY]
@@ -624,11 +624,12 @@ def test_none_payload_source_ignores_stdout_trigger_fields(tmp_path: Path) -> No
         "pm-market-state",  # T84
         "cn-intraday",  # T85
         "hk-momentum",  # T86
+        "model-availability-watch",  # T87
     }
     assert {key for key, source in TASK_NOTIFY_PAYLOAD_SOURCES.items() if source == "none"} == none_jobs
     assert {
         key for key, source in _TASK_ID_PAYLOAD_SOURCE_ALIASES.items() if source == "none"
-    } == {"T42", "T58", "T9", "T34", "T60", "T84", "T85", "T86"}
+    } == {"T42", "T58", "T9", "T34", "T60", "T84", "T85", "T86", "T87"}
     batch4_jobs = {
         "e-watch-daily",
         "e-watch-intraday",

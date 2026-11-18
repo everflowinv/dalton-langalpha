@@ -370,3 +370,69 @@ describe("ops-alerts alphaengine watchdog codes", () => {
     }
   });
 });
+
+describe("ops-alerts model_unavailable", () => {
+  it("uses default template on legacy configs and supports configured template with detail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-model-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_m1" }));
+    const resDefault = await handleOpsAlert({
+      body: {
+        code: "model_unavailable",
+        detail: "codex-oauth: gpt-6.2-sol-oauth；需要提高 DALTON_CODEX_CLIENT_VERSION 到 0.175.0",
+      },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resDefault.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith(
+      "feishu:user:ou_ops_a",
+      "Dalton 模型可用性告警：codex-oauth: gpt-6.2-sol-oauth；需要提高 DALTON_CODEX_CLIENT_VERSION 到 0.175.0",
+    );
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+          model_unavailable: "[模型告警] {detail}",
+        },
+      }),
+    );
+    const resCustom = await handleOpsAlert({
+      body: { code: "model_unavailable", detail: "claude-oauth: claude-opus-5-5-oauth\n\t\x00" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resCustom.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith(
+      "feishu:user:ou_ops_a",
+      "[模型告警] claude-oauth: claude-opus-5-5-oauth",
+    );
+
+    const badDetail = await handleOpsAlert({
+      body: { code: "model_unavailable", detail: 42 },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(badDetail.status).toBe(400);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

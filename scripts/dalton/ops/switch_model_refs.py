@@ -72,6 +72,13 @@ LIST_PREF_KEYS: tuple[str, ...] = (
     "dalton_reviewer_models",
 )
 
+OTHER_LIST_PREF_KEYS: tuple[str, ...] = (
+    "starred_models",
+    "hidden_quick_access_models",
+)
+
+OTHER_PREF_KEY_PREFIX = "other_preference."
+
 RECOMMENDED_INSTRUCTION_REWRITE = (
     "建议改法：把「必须是 6.1 Sol，否则停止」改为"
     "「必须是本自动化指定的模型（以运行时服务端确认的为准），否则停止」，"
@@ -109,6 +116,7 @@ class PreferencePlan:
     changed_keys: list[str]
     original_model_preference: dict[str, Any]
     original_other_preference: dict[str, Any]
+    other_patch: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -189,6 +197,27 @@ def validate_target_models(mappings: dict[str, str]) -> None:
         raise ValueError(f"Target model(s) missing from merged catalog: {', '.join(missing)}")
 
 
+def _replace_list_items(val: list[Any], mappings: dict[str, str]) -> tuple[list[Any], bool]:
+    """Replace mapped model strings in-place and deduplicate, preserving non-string entries."""
+    updated: list[Any] = []
+    changed = False
+    seen_strs: set[str] = set()
+    for item in val:
+        if isinstance(item, str) and item in mappings:
+            mapped = mappings[item]
+            changed = True
+            if mapped not in seen_strs:
+                updated.append(mapped)
+                seen_strs.add(mapped)
+        elif isinstance(item, str):
+            if item not in seen_strs:
+                updated.append(item)
+                seen_strs.add(item)
+        else:
+            updated.append(item)
+    return updated, changed
+
+
 def build_preference_patch(
     model_preference: dict[str, Any] | None,
     other_preference: dict[str, Any] | None,
@@ -216,22 +245,7 @@ def build_preference_patch(
         val = effective.get(key)
         if not isinstance(val, list):
             continue
-        updated: list[Any] = []
-        changed = False
-        seen_strs: set[str] = set()
-        for item in val:
-            if isinstance(item, str) and item in mappings:
-                mapped = mappings[item]
-                changed = True
-                if mapped not in seen_strs:
-                    updated.append(mapped)
-                    seen_strs.add(mapped)
-            elif isinstance(item, str):
-                if item not in seen_strs:
-                    updated.append(item)
-                    seen_strs.add(item)
-            else:
-                updated.append(item)
+        updated, changed = _replace_list_items(val, mappings)
         if changed:
             patch[key] = updated
             changed_keys.append(key)
@@ -256,6 +270,25 @@ def build_preference_patch(
             patch["profiles"] = profile_patch
             changed_keys.append("profiles")
 
+    return patch, changed_keys
+
+
+def build_other_preference_patch(
+    other_preference: dict[str, Any] | None,
+    mappings: dict[str, str],
+) -> tuple[dict[str, Any], list[str]]:
+    """Compute a minimal ``other_preference`` patch for starred and hidden quick-access lists."""
+    raw = other_preference or {}
+    patch: dict[str, Any] = {}
+    changed_keys: list[str] = []
+    for key in OTHER_LIST_PREF_KEYS:
+        val = raw.get(key)
+        if not isinstance(val, list):
+            continue
+        updated, changed = _replace_list_items(val, mappings)
+        if changed:
+            patch[key] = updated
+            changed_keys.append(f"{OTHER_PREF_KEY_PREFIX}{key}")
     return patch, changed_keys
 
 
@@ -353,6 +386,7 @@ def _build_archive_payload(
                     "user_id": p.user_id,
                     "changed_keys": p.changed_keys,
                     "patch": p.patch,
+                    "other_patch": p.other_patch,
                     "original_model_preference": p.original_model_preference,
                     "original_other_preference": p.original_other_preference,
                 }
@@ -489,12 +523,14 @@ async def collect_plan(conn: Any, mappings: dict[str, str]) -> SwitchPlan:
             mp = row.get("model_preference") or {}
             op = row.get("other_preference") or {}
             patch, changed_keys = build_preference_patch(mp, op, mappings)
-            if patch:
+            other_patch, other_changed_keys = build_other_preference_patch(op, mappings)
+            if patch or other_patch:
                 plan.preferences.append(
                     PreferencePlan(
                         user_id=str(row["user_id"]),
                         patch=patch,
-                        changed_keys=changed_keys,
+                        other_patch=other_patch,
+                        changed_keys=[*changed_keys, *other_changed_keys],
                         original_model_preference=copy.deepcopy(mp),
                         original_other_preference=copy.deepcopy(op),
                     )
@@ -536,7 +572,11 @@ def _conflicting_pref_keys(
     live_eff = model_preference_of({"model_preference": live_mp, "other_preference": live_op})
     conflicts: list[str] = []
     for key in keys:
-        if key == "profiles":
+        if key.startswith(OTHER_PREF_KEY_PREFIX):
+            sub_key = key[len(OTHER_PREF_KEY_PREFIX) :]
+            if (plan_op or {}).get(sub_key) != (live_op or {}).get(sub_key):
+                conflicts.append(key)
+        elif key == "profiles":
             plan_profiles = plan_eff.get("profiles") or {}
             live_profiles = live_eff.get("profiles") or {}
             for old_key, new_key in mappings.items():
@@ -555,6 +595,7 @@ def _expect_other_for_moved_keys(
     live_mp: dict[str, Any],
     live_op: dict[str, Any],
     changed_keys: list[str],
+    other_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     from src.llms.preferences import MOVED_MODEL_KEYS
 
@@ -563,6 +604,8 @@ def _expect_other_for_moved_keys(
         for key in changed_keys
         if key in MOVED_MODEL_KEYS and key not in live_mp and key in live_op
     }
+    for key in other_patch or {}:
+        expected[key] = live_op.get(key)
     return expected or None
 
 
@@ -742,21 +785,34 @@ async def apply_plan(
                     continue
 
                 actual_patch, actual_changed = build_preference_patch(live_mp, live_op, plan.mappings)
-                if not actual_patch:
+                actual_other_patch, actual_other_changed = build_other_preference_patch(
+                    live_op, plan.mappings
+                )
+                all_actual_changed = [*actual_changed, *actual_other_changed]
+                if not actual_patch and not actual_other_patch:
                     progress.skipped_preferences.append(
                         {"user_id": pref.user_id, "reason": "no matching old-model slots at apply time"}
                     )
                     progress.pending_preferences = [p.user_id for p in plan.preferences[idx + 1 :]]
                     continue
 
-                expect_other = _expect_other_for_moved_keys(live_mp, live_op, actual_changed)
+                expect_other = _expect_other_for_moved_keys(
+                    live_mp,
+                    live_op,
+                    actual_changed,
+                    other_patch=actual_other_patch,
+                )
+                upsert_kwargs: dict[str, Any] = {
+                    "user_id": pref.user_id,
+                    "conn": tx_conn,
+                    "expect_other_preference": expect_other,
+                }
+                if actual_patch:
+                    upsert_kwargs["model_preference"] = actual_patch
+                if actual_other_patch:
+                    upsert_kwargs["other_preference"] = actual_other_patch
                 try:
-                    row = await user_db.upsert_user_preferences(
-                        user_id=pref.user_id,
-                        model_preference=actual_patch,
-                        conn=tx_conn,
-                        expect_other_preference=expect_other,
-                    )
+                    row = await user_db.upsert_user_preferences(**upsert_kwargs)
                 except user_db.PreferenceChanged as exc:
                     progress.skipped_preferences.append(
                         {"user_id": pref.user_id, "reason": f"CAS conflict ({exc})"}
@@ -780,8 +836,9 @@ async def apply_plan(
         replaced_pref_records.append(
             {
                 "user_id": pref.user_id,
-                "changed_keys": actual_changed,
+                "changed_keys": all_actual_changed,
                 "patch": actual_patch,
+                "other_patch": actual_other_patch,
                 "original_model_preference": live_mp,
                 "original_other_preference": live_op,
             }
@@ -843,8 +900,14 @@ def format_plan_report(plan: SwitchPlan, *, apply_mode: bool) -> str:
 
     lines.append(f"\n3. user_preferences.model_preference: {len(plan.preferences)} user(s)")
     for pref in plan.preferences:
+        other_part = (
+            f" other_patch={json.dumps(pref.other_patch, ensure_ascii=False)}"
+            if pref.other_patch
+            else ""
+        )
         lines.append(
-            f"  - user={pref.user_id} keys={pref.changed_keys} patch={json.dumps(pref.patch, ensure_ascii=False)}"
+            f"  - user={pref.user_id} keys={pref.changed_keys} "
+            f"patch={json.dumps(pref.patch, ensure_ascii=False)}{other_part}"
         )
 
     lines.append(

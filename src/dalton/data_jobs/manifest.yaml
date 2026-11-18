@@ -1041,3 +1041,30 @@ tasks:
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
+
+  - task_code: "T87"
+    job_key: "model-availability-watch"
+    title: "每日模型可用性检查（订阅模型 missing 监测与 Codex 客户端版本探测）"
+    batch_no: 1
+    runner: "host"
+    host_mode: "run"
+    cron: "15 9 * * *"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 300
+    no_output_timeout_seconds: 240
+    output_max_bytes: 50000
+    cwd: "var/dalton/openclaw-data"
+    command: "python3 ../../../scripts/dalton/ops/model_availability_watch.py --json"
+    command_argv:
+      - "python3"
+      - "../../../scripts/dalton/ops/model_availability_watch.py"
+      - "--json"
+    env:
+      DALTON_BACKEND_URL: "http://127.0.0.1:8000"
+      DALTON_CHANNEL_GATEWAY_URL: "http://127.0.0.1:8962"
+    secret_names:
+      - "INTERNAL_SERVICE_TOKEN"
+    freeze_paths: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false

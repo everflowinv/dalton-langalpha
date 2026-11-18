@@ -936,3 +936,167 @@ async def test_lifecycle_recheck_runs_real_code_after_pr384(
         locked_conn=None,
     )
     hosted_spy.assert_awaited_once_with("u-1", "gpt-6.2-sol-oauth", ws_uuid, None, {})
+
+
+@pytest.mark.asyncio
+async def test_switch_model_refs_updates_starred_and_hidden_lists_and_skips_on_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.dalton.database import model_switch as model_switch_db
+    from src.server.database import pool as pool_mod
+    from src.server.database import user as user_db
+
+    fake_conn = _make_fake_conn(
+        automations=[],
+        threads=[],
+        preferences=[
+            {
+                "user_id": "u-lists-ok",
+                "model_preference": {},
+                "other_preference": {
+                    "starred_models": ["gpt-6.1-sol-oauth", "claude-opus-5-5-oauth", "gpt-6.2-sol-oauth"],
+                    "hidden_quick_access_models": ["gpt-6-astra-oauth", "gpt-6.1-sol-oauth", "gpt-6.2-astra-oauth"],
+                },
+            },
+            {
+                "user_id": "u-starred-conflict",
+                "model_preference": {},
+                "other_preference": {
+                    "starred_models": ["gpt-6.1-sol-oauth"],
+                },
+            },
+            {
+                "user_id": "u-hidden-cas-race",
+                "model_preference": {},
+                "other_preference": {
+                    "hidden_quick_access_models": ["gpt-6.1-sol-oauth"],
+                },
+            },
+        ],
+        sql_log=[],
+    )
+
+    @asynccontextmanager
+    async def _fake_get_db_connection(*args: Any, **kwargs: Any):
+        yield fake_conn
+
+    async def _fake_lock(uid: str, *, conn: Any = None) -> dict[str, Any]:
+        if uid == "u-starred-conflict":
+            return {
+                "user_id": uid,
+                "model_preference": {},
+                "other_preference": {
+                    # Changed after plan read -> must skip!
+                    "starred_models": ["gpt-6.1-sol-oauth", "grok-4.7-oauth"],
+                },
+            }
+        if uid == "u-hidden-cas-race":
+            return {
+                "user_id": uid,
+                "model_preference": {},
+                "other_preference": {
+                    "hidden_quick_access_models": ["gpt-6.1-sol-oauth"],
+                },
+            }
+        return {
+            "user_id": uid,
+            "model_preference": {},
+            "other_preference": {
+                "starred_models": ["gpt-6.1-sol-oauth", "claude-opus-5-5-oauth", "gpt-6.2-sol-oauth"],
+                "hidden_quick_access_models": ["gpt-6-astra-oauth", "gpt-6.1-sol-oauth", "gpt-6.2-astra-oauth"],
+            },
+        }
+
+    upserted_calls: list[dict[str, Any]] = []
+
+    async def _fake_upsert(
+        user_id: str,
+        *,
+        model_preference: dict[str, Any] | None = None,
+        other_preference: dict[str, Any] | None = None,
+        expect_other_preference: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if user_id == "u-hidden-cas-race":
+            assert expect_other_preference == {
+                "hidden_quick_access_models": ["gpt-6.1-sol-oauth"]
+            }
+            raise user_db.PreferenceChanged(["hidden_quick_access_models"])
+        upserted_calls.append(
+            {
+                "user_id": user_id,
+                "model_preference": model_preference,
+                "other_preference": other_preference,
+                "expect_other_preference": expect_other_preference,
+            }
+        )
+        return {"user_id": user_id}
+
+    monkeypatch.setattr(pool_mod, "get_db_connection", _fake_get_db_connection)
+    monkeypatch.setattr(
+        model_switch_db,
+        "reassign_planned_thread_llm_models",
+        create_autospec(model_switch_db.reassign_planned_thread_llm_models, return_value=0),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "lock_user_preferences",
+        create_autospec(user_db.lock_user_preferences, side_effect=_fake_lock),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "upsert_user_preferences",
+        create_autospec(user_db.upsert_user_preferences, side_effect=_fake_upsert),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "invalidate_user_prefs_cache",
+        create_autospec(user_db.invalidate_user_prefs_cache, return_value=None),
+    )
+
+    rc = await sw._run(
+        sw.build_parser().parse_args(
+            [
+                "--from",
+                "gpt-6.1-sol-oauth",
+                "--to",
+                "gpt-6.2-sol-oauth",
+                "--from",
+                "gpt-6-astra-oauth",
+                "--to",
+                "gpt-6.2-astra-oauth",
+                "--apply",
+                "--archive-dir",
+                str(tmp_path),
+            ]
+        )
+    )
+    assert rc == 0
+    assert upserted_calls == [
+        {
+            "user_id": "u-lists-ok",
+            "model_preference": None,
+            "other_preference": {
+                "starred_models": ["gpt-6.2-sol-oauth", "claude-opus-5-5-oauth"],
+                "hidden_quick_access_models": ["gpt-6.2-astra-oauth", "gpt-6.2-sol-oauth"],
+            },
+            "expect_other_preference": {
+                "starred_models": ["gpt-6.1-sol-oauth", "claude-opus-5-5-oauth", "gpt-6.2-sol-oauth"],
+                "hidden_quick_access_models": ["gpt-6-astra-oauth", "gpt-6.1-sol-oauth", "gpt-6.2-astra-oauth"],
+            },
+        }
+    ]
+
+    archives = list(tmp_path.glob("model-switch-*.json"))
+    assert len(archives) == 1
+    saved = json.loads(archives[0].read_text(encoding="utf-8"))
+    assert [row["user_id"] for row in saved["user_preferences"]] == ["u-lists-ok"]
+    assert saved["user_preferences"][0]["original_other_preference"] == {
+        "starred_models": ["gpt-6.1-sol-oauth", "claude-opus-5-5-oauth", "gpt-6.2-sol-oauth"],
+        "hidden_quick_access_models": ["gpt-6-astra-oauth", "gpt-6.1-sol-oauth", "gpt-6.2-astra-oauth"],
+    }
+    assert [row["user_id"] for row in saved["skipped_user_preferences"]] == [
+        "u-starred-conflict",
+        "u-hidden-cas-race",
+    ]
