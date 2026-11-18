@@ -30,9 +30,10 @@ def codex_client_version() -> str:
     sees on it (0.99.0 listed one model where 0.164.0 listed nine), so the two
     must never disagree.
     """
-    from src.llms.llm import LLM
+    # DALTON-HOOK(codex-client-version): Dalton pins a newer client than the manifest so new models list
+    from src.dalton.settings import get_codex_client_version
 
-    return LLM.get_model_config().get_provider_info(CODEX_PROVIDER)["client_version"]
+    return get_codex_client_version()
 
 
 def codex_identity_headers() -> dict[str, str]:
