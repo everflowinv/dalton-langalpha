@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.alphaengine-mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE_BIN__</string>
+        <string>__REPO__/scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.mjs</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__/scripts/dalton/research_runtime</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ALPHAENGINE_MCP_HOST</key>
+        <string>127.0.0.1</string>
+        <key>ALPHAENGINE_MCP_PORT</key>
+        <string>8950</string>
+        <key>__RUNTIME_ENV_KEY__</key>
+        <string>__RUNTIME_ENV_VAL__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-alphaengine-mcp.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-alphaengine-mcp.err.log</string>
+</dict>
+</plist>
