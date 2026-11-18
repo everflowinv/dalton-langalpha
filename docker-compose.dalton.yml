@@ -4,6 +4,9 @@ services:
       context: .
       dockerfile: scripts/dalton/Dockerfile.postgres
     image: dalton-postgres:18-pgvector
+    # Under VM memory pressure the kernel OOM killer should pick a sandbox or
+    # helper container before the database or the backend.
+    oom_score_adj: -500
 
   backend:
     # default for everything it already talks to; crawl for the crawler service.
@@ -26,14 +29,15 @@ services:
     # the backend and cancels every running turn. Code changes are applied by an explicit
     # `docker restart dalton-langalpha-backend-1` once no turn is in progress.
     command: ["uv", "run", "python", "server.py", "--host", "0.0.0.0", "--port", "8000"]
-    # 4g: raised from 3g for concurrent background subagents (up to 8 per thread /
-    # 24 globally); the VM has 6 GB total and other containers use ~0.6 GB combined,
-    # plus scrapling's Chromium runs inside this container next to the server.
-    mem_limit: 4g
+    # 6g: the Colima VM grew to 10 GB plus 4 GB swap after OpenClaw was retired
+    # (11-18 a global OOM killed a backend worker at 6 GB). Concurrent background
+    # subagents (up to 8 per thread / 24 globally) and scrapling's Chromium run here.
+    mem_limit: 6g
+    oom_score_adj: -500
     # Chromium (scrapling's browser tier) crashes pages ("Page crashed", then a dead
     # driver pipe) with Docker's default 64 MB /dev/shm, which hung the whole backend.
     shm_size: "1gb"
-    memswap_limit: 4g
+    memswap_limit: 6g
     # Replace upstream 0.0.0.0:8000 port binding with loopback-only (requires Docker Compose v2.24.4+).
     ports: !override
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
