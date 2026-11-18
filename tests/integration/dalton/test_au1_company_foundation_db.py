@@ -151,7 +151,6 @@ async def au1_live_pool(
         automation_executions as server_exec_db,
         computer as server_computer_db,
         pool as pool_mod,
-        principal_reach as server_reach_db,
         user as server_user_db,
         workspace as server_workspace_db,
     )
@@ -203,7 +202,6 @@ async def au1_live_pool(
         server_auto_db,
         server_exec_db,
         server_computer_db,
-        server_reach_db,
         server_user_db,
         server_workspace_db,
     )

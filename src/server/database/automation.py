@@ -17,6 +17,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+# DALTON-HOOK(company-automations): computer reach helper uses get_home_workspace_id
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 from src.server.utils.db import UpdateQueryBuilder
@@ -484,6 +485,7 @@ async def list_automations(
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    # DALTON-HOOK(company-automations): optional computer_id reach and soft-delete recycle filter
     computer_id: Optional[str] = None,
     include_deleted: bool = False,
 ) -> tuple[List[Dict[str, Any]], int]:
@@ -505,6 +507,7 @@ async def list_automations(
     if status:
         where_parts.append("status = %s")
         params.append(status)
+    # DALTON-HOOK(company-automations): scope personal list to workspaces on computer_id when supplied
     if computer_id is not None:
         # One with no workspace runs in Home, and the inequality drops it too.
         where_parts.append(

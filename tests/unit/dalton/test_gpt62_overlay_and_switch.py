@@ -907,8 +907,8 @@ async def test_lifecycle_recheck_runs_real_code_after_pr384(
     from src.server.models.automation import AutomationUpdate
     from src.server.services.automations import lifecycle
 
-    hosted_spy = create_autospec(lifecycle._check_claude_code_hosted, return_value=None)
-    monkeypatch.setattr(lifecycle, "_check_claude_code_hosted", hosted_spy)
+    hosted_spy = create_autospec(lifecycle.check_claude_code_hosted, return_value=None)
+    monkeypatch.setattr(lifecycle, "check_claude_code_hosted", hosted_spy)
 
     ws_uuid = "11111111-1111-1111-1111-111111111111"
     update = AutomationUpdate.model_validate(

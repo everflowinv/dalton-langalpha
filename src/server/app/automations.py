@@ -43,7 +43,6 @@ from src.dalton.services.company_automations import (  # DALTON-HOOK(company-aut
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.home_workspace import is_home_row
-from src.server.database.principal_reach import workspace_or_home
 from src.server.database.workspace import get_workspace
 from src.server.services.automations import lifecycle as handler
 from src.server.services.automations import delivery
@@ -61,14 +60,16 @@ from src.server.models.automation import (
     DeliveryDefaultUpdate,
     RecycleVersionRequest,
 )
+from src.server.dependencies import cli_approval
 from src.server.dependencies.principal import (
     ReadPrincipal,
     ReadUserId,
-    RunUserId,
+    RunPrincipal,
+    WorkspaceDeletePrincipal,
     WorkspaceSendPrincipal,
     WorkspaceWritePrincipal,
     WorkspaceWriteUserId,
-    assert_automation_target,
+    uuid_or_none,
 )
 from src.server.utils.api import (
     CurrentUserId,
@@ -157,17 +158,12 @@ def _report_delivery_http_error(exc: Exception) -> HTTPException:
 @handle_api_exceptions("create automation", logger, conflict_on_value_error=True)
 async def create_automation(
     request: AutomationCreate,
-    principal: WorkspaceWritePrincipal,
+    principal: WorkspaceSendPrincipal,
     http_request: Request,
 ):
     """Create a new scheduled automation."""
     user_id = principal.user_id
-    await assert_automation_target(
-        principal,
-        http_request,
-        workspace_id=workspace_or_home(user_id, request.workspace_id),
-        thread_id=request.conversation_thread_id,
-    )
+    await cli_approval.automation_runs(http_request, principal, "create", body=request)
     # DALTON-HOOK(report-delivery): enforce unified report_profile rules & atomic route sync on REST create when Dalton is enabled
     from src.dalton.settings import is_dalton_enabled
 
@@ -274,7 +270,6 @@ async def list_automations(
         status=status,
         limit=limit,
         offset=offset,
-        computer_id=principal.computer_id,
         include_deleted=include_deleted,
     )
     items = [AutomationResponse.model_validate(a) for a in automations]
@@ -506,11 +501,8 @@ async def update_automation(
     user_id = principal.user_id
     # DALTON-HOOK(company-automations): company system identity cannot write through this route
     _refuse_company_service_actor(user_id)
-    await assert_automation_target(
-        principal,
-        http_request,
-        workspace_id=request.workspace_id,
-        thread_id=request.conversation_thread_id,
+    await cli_approval.automation_runs(
+        http_request, principal, "edit", automation_id=agent_id, body=request
     )
     # DALTON-HOOK(report-delivery): validate REST metadata.report_profile changes via shared rule when Dalton is enabled
     from src.dalton.settings import is_dalton_enabled
@@ -683,14 +675,17 @@ def _positive_recycle_version(value: Any, field_name: str) -> int:
 @handle_api_exceptions("delete automation", logger, conflict_on_value_error=True)
 async def delete_automation(
     automation_id: str,
-    principal: WorkspaceWritePrincipal,
+    principal: WorkspaceDeletePrincipal,
     body: RecycleVersionRequest,
+    http_request: Request,
 ):
     """Soft-delete an automation or a ``data:<job_key>`` into the recycle bin."""
     version = _positive_recycle_version(
         body.expected_config_version,
         "expected_config_version",
     )
+    if uuid_or_none(automation_id) is not None:
+        await cli_approval.automation_delete(http_request, principal, automation_id)
     from src.dalton.services.automation_recycle import delete_task
 
     return await delete_task(principal, automation_id, version)
@@ -745,10 +740,16 @@ async def rollback_automation(
 @handle_api_exceptions("trigger automation", logger, conflict_on_value_error=True)
 async def trigger_automation(
     automation_id: UUID,
-    user_id: RunUserId,
+    principal: RunPrincipal,
+    http_request: Request,
 ):
     """Manually trigger an automation immediately (doesn't affect next_run_at)."""
-    result = await handler.trigger_automation(str(automation_id), user_id)
+    checked = await cli_approval.automation_runs(
+        http_request, principal, "trigger", automation_id=str(automation_id)
+    )
+    result = await handler.trigger_automation(
+        str(automation_id), principal.user_id, checked_computer_id=checked
+    )
     return result
 
 
@@ -811,6 +812,7 @@ async def resume_automation(
     automation_id: str,
     # Re-arms runs into the automation's thread, so not the call's own.
     principal: WorkspaceSendPrincipal,
+    http_request: Request,
     body: Any = Body(default=None),
 ):
     """Resume a paused or disabled automation."""
@@ -829,6 +831,10 @@ async def resume_automation(
     user_id = principal.user_id
     # DALTON-HOOK(company-automations): company system identity cannot resume through this route
     _refuse_company_service_actor(user_id)
+    # Its runs start again where it runs, so off the token's computer it asks.
+    await cli_approval.automation_runs(
+        http_request, principal, "resume", automation_id=agent_id
+    )
     # DALTON-HOOK(company-automations): validate optional expected_config_version on resume
     expected_cv = extract_expected_config_version(body)
     with automation_history_context(

@@ -562,7 +562,13 @@ async def begin_run(
                     workspace_id=workspace_id,
                     then=in_start,
                 )
-                if request.request_key or request.steer_job_id or has_chat_uploads or in_start
+                if (
+                    request.request_key
+                    or request.steer_job_id
+                    or request.checked_computer_id
+                    or has_chat_uploads
+                    or in_start
+                )
                 else None
             ),
         ),
@@ -608,6 +614,10 @@ async def _start_checks(
         )
     if request.steer_job_id:
         await claim_steer_or_refuse(conn, request.steer_job_id, run_id)
+    if request.checked_computer_id:
+        from src.server.database.workspace import refuse_moved_off
+
+        await refuse_moved_off(conn, thread_id, request.checked_computer_id)
     # DALTON-HOOK(chat-large-upload): stamp used_at and clear expires_at atomically with START
     if not request.hitl_response and request.additional_context:
         from src.dalton.services.chat_uploads import (

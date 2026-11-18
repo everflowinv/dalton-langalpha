@@ -411,7 +411,7 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
     async with AsyncExitStack() as acquire_stack:
         try:
             sandbox, workspace = await acquire_stack.enter_async_context(
-                acquire_sandbox_to_change(workspace_id, sandbox_owner_id)
+                acquire_sandbox_to_change(workspace_id, sandbox_owner_id, "upload")
             )
         except HTTPException as e:
             if e.status_code in (400, 403, 404):

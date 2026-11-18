@@ -1261,7 +1261,9 @@ class TestWriteEndpointsRejectColleagues:
         # Delete workspace -> 403
         with pytest.raises(HTTPException) as exc_del:
             await workspaces_app.delete_workspace(
-                ws["workspace_id"], x_user_id="u-chao"
+                ws["workspace_id"],
+                Principal(user_id="u-chao", auth="session"),
+                Request({"type": "http", "headers": []}),
             )
         assert exc_del.value.status_code == 403
 
@@ -1311,7 +1313,11 @@ class TestWriteEndpointsRejectColleagues:
         )
 
         with pytest.raises(HTTPException) as exc_del:
-            await threads_crud.delete_thread_endpoint(thread_id, x_user_id="u-chao")
+            await threads_crud.delete_thread_endpoint(
+                thread_id,
+                Principal(user_id="u-chao", auth="session"),
+                Request({"type": "http", "headers": []}),
+            )
         assert exc_del.value.status_code == 403
 
         with pytest.raises(HTTPException) as exc_upd:

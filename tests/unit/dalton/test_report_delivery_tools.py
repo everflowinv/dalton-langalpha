@@ -602,9 +602,9 @@ async def test_schedule_helper_and_upstream_create_warn_on_missing_report_profil
         "scope": "personal",
     }
     monkeypatch.setattr(
-        automations_app,
-        "assert_automation_target",
-        create_autospec(automations_app.assert_automation_target, return_value=None),
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
     )
     monkeypatch.setattr(
         automations_app.handler,
@@ -907,9 +907,9 @@ async def test_unified_validation_blocks_rest_groups_and_prefs_routes(
         "scope": "personal",
     }
     monkeypatch.setattr(
-        automations_app,
-        "assert_automation_target",
-        create_autospec(automations_app.assert_automation_target, return_value=None),
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
     )
     mocks["get_auto"].side_effect = None
     mocks["get_auto"].return_value = dict(existing_row)
@@ -2055,7 +2055,7 @@ async def test_r3_6_dalton_disabled_preserves_upstream_metadata_and_rest(
         "last_execution": None,
         "scope": "personal",
     }
-    monkeypatch.setattr(automations_app, "assert_automation_target", create_autospec(automations_app.assert_automation_target, return_value=None))
+    monkeypatch.setattr(automations_app.cli_approval, "automation_runs", create_autospec(automations_app.cli_approval.automation_runs, return_value=None))
     monkeypatch.setattr(automations_app.handler, "create_automation", create_autospec(automations_app.handler.create_automation, return_value=api_row))
     monkeypatch.setattr(automations_app.handler, "update_automation", create_autospec(automations_app.handler.update_automation, return_value=api_row))
     from src.dalton.notify import dispatch as notify_dispatch
@@ -2175,7 +2175,7 @@ async def test_r3_7_8_populate_notify_state_classified_report_task_rest_route_sy
         "last_execution": None,
         "scope": "personal",
     }
-    monkeypatch.setattr(automations_app, "assert_automation_target", create_autospec(automations_app.assert_automation_target, return_value=None))
+    monkeypatch.setattr(automations_app.cli_approval, "automation_runs", create_autospec(automations_app.cli_approval.automation_runs, return_value=None))
     monkeypatch.setattr(automations_app.handler, "create_automation", create_autospec(automations_app.handler.create_automation, return_value=api_row))
     monkeypatch.setattr(dispatch_mod, "populate_automation_notify_state", create_autospec(dispatch_mod.populate_automation_notify_state, return_value=None))
 
@@ -2986,9 +2986,9 @@ async def test_r4_5_rest_create_persists_normalized_after_metadata(
         }
 
     monkeypatch.setattr(
-        automations_app,
-        "assert_automation_target",
-        create_autospec(automations_app.assert_automation_target, return_value=None),
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
     )
     monkeypatch.setattr(
         automations_app.handler,

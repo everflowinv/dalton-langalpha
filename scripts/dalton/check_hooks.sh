@@ -76,7 +76,6 @@ ALLOWED_HOOKS=(
   "dalton-auth"
   "home-workspace-alias"
   "team-sharing"
-  "sandbox-inline-write-limit"
   "team-credentials"
   "yfinance-prev-close"
   "data-map"

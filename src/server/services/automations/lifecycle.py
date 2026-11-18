@@ -14,7 +14,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass  # DALTON-HOOK(company-automations): shared prepared-update value for personal and company tasks
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Final, Optional
 from uuid import UUID
 
 import httpx
@@ -190,7 +190,7 @@ async def _require_pin_in(
 _MAY_RUN_LATER = frozenset({"no_own_computer", "cli_computer_offline"})
 
 
-async def _check_claude_code_hosted(
+async def check_claude_code_hosted(
     user_id: str, name: str | None, workspace_id: str | None, conn=None, pref: dict[str, Any] | None = None,
 ) -> None:
     """Refuse a Claude Code row in a workspace on a cloud computer whose turns
@@ -231,7 +231,7 @@ async def _claude_code_default_for(user_id: str, workspace_id: str, pref: dict[s
     return name if name and is_claude_code_model(name) else None
 
 
-async def _check_model(user_id: str, name: str, pref: dict[str, Any] | None) -> None:
+async def check_model(user_id: str, name: str, pref: dict[str, Any] | None) -> None:
     """Refuse a model the run would reject: an unknown name fails every
     firing until the automation is disabled."""
     if pref is None:
@@ -390,9 +390,9 @@ async def create_automation(
         await _require_pin_in(
             user_id, str(data.conversation_thread_id), workspace_id, conn
         )
-    await _check_claude_code_hosted(user_id, data.llm_model, workspace_id, conn, model_pref)
+    await check_claude_code_hosted(user_id, data.llm_model, workspace_id, conn, model_pref)
     if data.llm_model:
-        await _check_model(user_id, data.llm_model, model_pref)
+        await check_model(user_id, data.llm_model, model_pref)
     if data.delivery_config and not delivery_checked:
         methods = await check_delivery(user_id, data.delivery_config.methods)
         delivery = DeliveryConfig(methods=methods)
@@ -552,12 +552,12 @@ async def prepare_owned_automation_update(
     # Only a new name is checked: a stored one the user can no longer run
     # must not block an edit to anything else.
     if update.llm_model and update.llm_model != current.get("llm_model"):
-        await _check_model(user_id, update.llm_model, model_pref)
+        await check_model(user_id, update.llm_model, model_pref)
     # A model and a place are judged together, so a move into Home is too.
     moved_to = normalize_uuid(update_kwargs.get("workspace_id")) or stored_in
     runs_on = update_kwargs.get("llm_model", current.get("llm_model"))
     if runs_on != current.get("llm_model") or moved_to != stored_in:
-        await _check_claude_code_hosted(user_id, runs_on, moved_to, conn, model_pref)
+        await check_claude_code_hosted(user_id, runs_on, moved_to, conn, model_pref)
     # Likewise only a chat not already saved.
     delivery = update_kwargs.get("delivery_config")
     if isinstance(delivery, dict) and delivery.get("methods") and not delivery_checked:
@@ -594,6 +594,7 @@ async def prepare_owned_automation_update(
     )
 
 
+# DALTON-HOOK(company-automations): prepared update & locked row recheck helpers
 async def recheck_locked_automation_update(
     *,
     user_id: str,
@@ -645,6 +646,7 @@ async def recheck_locked_automation_update(
                 or locked_stored_pin != stored_pin
                 or locked_row.get("thread_strategy") != current.get("thread_strategy")
             ):
+                # DALTON-HOOK(company-automations): recheck moved placement under lock
                 await _require_pin_in(user_id, pin_locked, runs_in_locked, locked_conn)
 
     moved_to_locked = normalize_uuid(effective_kwargs.get("workspace_id")) or locked_stored_in
@@ -657,7 +659,7 @@ async def recheck_locked_automation_update(
             locked_stored_in != stored_in
             or locked_row.get("llm_model") != current.get("llm_model")
         ):
-            await _check_claude_code_hosted(
+            await check_claude_code_hosted(
                 user_id, runs_on_locked, moved_to_locked, locked_conn, pref_for_lock
             )
 
@@ -690,6 +692,7 @@ def pause_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
     return update_kwargs
 
 
+# DALTON-HOOK(company-automations): locked pause & resume schedule helpers
 def apply_locked_pause_schedule(
     locked_row: Any, effective_kwargs: Dict[str, Any]
 ) -> None:
@@ -706,14 +709,41 @@ def apply_locked_pause_schedule(
         effective_kwargs.pop("next_run_at", None)
 
 
-def resume_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
-    """Resume fields for a paused or disabled row, including its schedule rule."""
+def resume_refusal(current: Dict[str, Any]) -> AutomationRefusal | None:
+    """Why ``current`` cannot be resumed, or None: only a paused or disabled
+    row, and a paused one-time row only while its time is still ahead."""
     if current["status"] not in ("paused", "disabled"):
-        raise AutomationRefusal(
+        return AutomationRefusal(
             f"Cannot resume automation in '{current['status']}' status "
             f"(must be 'paused' or 'disabled')",
             field="status",
         )
+    when = current.get("next_run_at")
+    if (
+        current["trigger_type"] == "once"
+        and current["status"] == "paused"
+        and not (when and when > datetime.now(timezone.utc))
+    ):
+        passed = f" ({on_clock(when, current.get('timezone'))})" if when else ""
+        return AutomationRefusal(
+            f"Cannot resume a one-time automation whose scheduled time has passed{passed}; "
+            "set next_run_at to a future time first",
+            field="status",
+        )
+    return None
+
+
+#: The statuses Run now takes.
+TRIGGERABLE: Final = ("active", "paused", "completed")
+
+
+# DALTON-HOOK(company-automations): shared resume field derivation
+def resume_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
+    """Resume fields for a paused or disabled row, including its schedule rule."""
+    if (refusal := resume_refusal(current)) is not None:
+        raise refusal
+
+    # The reason goes with the status it explained, in the same write.
     update_kwargs: Dict[str, Any] = {
         "status": "active",
         "failure_count": 0,
@@ -726,19 +756,10 @@ def resume_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
         )
     elif current["trigger_type"] == "once":
         when = current.get("next_run_at")
-        if when and when > datetime.now(timezone.utc):
-            update_kwargs["next_run_at"] = when
-        elif current["status"] == "disabled":
-            # Switched off by the run it already had: back on, it waits for
-            # Run now, as a one-time automation whose run failed does.
-            update_kwargs["next_run_at"] = None
-        else:
-            passed = f" ({on_clock(when, current.get('timezone'))})" if when else ""
-            raise AutomationRefusal(
-                f"Cannot resume a one-time automation whose scheduled time has passed{passed}; "
-                "set next_run_at to a future time first",
-                field="status",
-            )
+        # Disabled by the run it already had: back on, it waits for Run now,
+        # as a one-time automation whose run failed does.
+        update_kwargs["next_run_at"] = when if when and when > datetime.now(timezone.utc) else None
+    # A price trigger has no next_run_at: it is only re-activated.
     return update_kwargs
 
 
@@ -1145,13 +1166,18 @@ async def resume_automation(
 async def trigger_automation(
     automation_id: str,
     user_id: str,
+    *,
+    checked_computer_id: str | None = None,
 ) -> Dict[str, Any]:
     """Manually trigger an automation immediately (doesn't affect next_run_at).
+
+    ``checked_computer_id`` is the computer a computer token's call was
+    checked to run it on; its turn does not start anywhere else.
 
     Returns:
         Dict with execution_id and status.
     """
-    # Lock the parent and insert in one transaction, so a delete cannot leave
+    # DALTON-HOOK(company-automations): lock the parent and insert in one transaction, so a delete cannot leave
     # a pending execution behind.
     scheduler = AutomationScheduler.get_instance()
     execution_id, current = await exec_db.create_execution_for_live_parent(
@@ -1161,7 +1187,12 @@ async def trigger_automation(
         scheduler.server_id,
     )
 
-    scheduler.dispatch(current, execution_id, name=f"manual_exec_{automation_id[:8]}")
+    scheduler.dispatch(
+        current,
+        execution_id,
+        name=f"manual_exec_{automation_id[:8]}",
+        checked_computer_id=checked_computer_id,
+    )
 
     logger.info(
         f"[AUTOMATION] Manual trigger: automation_id={automation_id} "
