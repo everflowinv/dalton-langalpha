@@ -58,12 +58,14 @@ export function usePanelFiles({
           // DALTON-HOOK(workspace-sharing-settings): teamReadOnly follows isColleague; readOnly is file write lock; canShare is owner-only
           readOnly: true, teamReadOnly: isColleague, singleFileMode: true, canShare: false, isHome: false,
           onReturnHome: () => setOverride(null), returnLabel: isHome ? null : workspaceName,
+          filesAway: shown.away,
         }
       : {
           // DALTON-HOOK(workspace-sharing-settings): teamReadOnly follows isColleague; readOnly is file write lock
           // DALTON-HOOK(external-share-guard): external members get no publish entry; canShare is owner-only
           readOnly, teamReadOnly: isColleague, singleFileMode: false, canShare: !isColleague && !readOnly && callerTier !== 'external', callerTier, isHome,
           onReturnHome: null, returnLabel: null,
+          filesAway: shown.away,
         },
   };
 }

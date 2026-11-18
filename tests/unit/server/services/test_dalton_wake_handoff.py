@@ -42,6 +42,9 @@ def _dalton_automation() -> dict[str, Any]:
 
 async def _run_handed_off_execution(
     stored_wake_context: str | None,
+    *,
+    handed_thread: str | None = "thread-handed-1",
+    parked_for_computer: bool = False,
 ) -> tuple[Any, Any, list[Any]]:
     captured_firings: list[Any] = []
     decide_mock = create_autospec(dalton_preflight.decide)
@@ -52,7 +55,7 @@ async def _run_handed_off_execution(
     begin_mock = create_autospec(
         exec_db.begin_execution_if_not_deleted,
         return_value={
-            "conversation_thread_id": "thread-handed-1",
+            "conversation_thread_id": handed_thread,
             "conversation_response_id": None,
         },
     )
@@ -71,7 +74,11 @@ async def _run_handed_off_execution(
     credit_mock = create_autospec(executor_mod.enforce_credit_limit, return_value=None)
     turn_place_mock = create_autospec(
         executor_mod._turn_place,
-        return_value=SimpleNamespace(workspace={"workspace_id": "ws-nvda-1"}),
+        return_value=SimpleNamespace(workspace={"workspace_id": "ws-nvda-1"}, thread_id=None),
+    )
+    park_computer_mock = create_autospec(
+        executor_mod.park_for_computer,
+        return_value=parked_for_computer,
     )
 
     async def _capture_run_turn(self: AutomationExecutor, execution_id: str, firing: Any, **kwargs: Any) -> bool:
@@ -97,6 +104,7 @@ async def _run_handed_off_execution(
         stack.enter_context(patch.object(executor_mod, "_credentials", credentials_mock))
         stack.enter_context(patch.object(executor_mod, "enforce_credit_limit", credit_mock))
         stack.enter_context(patch.object(executor_mod, "_turn_place", turn_place_mock))
+        stack.enter_context(patch.object(executor_mod, "park_for_computer", park_computer_mock))
         stack.enter_context(patch.object(executor_mod, "_keep_alive", keep_alive_mock))
         stack.enter_context(patch.object(executor_mod, "_thread_busy", create_autospec(executor_mod._thread_busy, return_value=False)))
         stack.enter_context(patch.object(AutomationExecutor, "_start_delivery", start_delivery_mock))
@@ -117,6 +125,32 @@ async def test_handed_off_execution_skips_preflight_and_restores_wake_context() 
     get_ctx_mock.assert_awaited_once_with(_EXEC_ID)
     assert len(captured_firings) == 1
     assert captured_firings[0].wake_context == expected_ctx
+
+
+@pytest.mark.asyncio
+async def test_prethread_execution_restores_wake_context_by_execution_id() -> None:
+    """在创建 thread 前挂起过等待的执行恢复时，即使 handed_thread 为空也能按 execution_id 找回 wake_context。"""
+    expected_ctx = "<dalton_wake>\nSignal before park\n</dalton_wake>"
+    decide_mock, get_ctx_mock, captured_firings = await _run_handed_off_execution(
+        expected_ctx, handed_thread=None
+    )
+
+    decide_mock.assert_not_awaited()
+    get_ctx_mock.assert_awaited_once_with(_EXEC_ID)
+    assert len(captured_firings) == 1
+    assert captured_firings[0].wake_context == expected_ctx
+
+
+@pytest.mark.asyncio
+async def test_parked_for_computer_skips_preflight_until_computer_returns() -> None:
+    """需要等待电脑上线时先挂起，不调用会认领信号的 dalton_preflight.decide。"""
+    decide_mock, get_ctx_mock, captured_firings = await _run_handed_off_execution(
+        None, handed_thread=None, parked_for_computer=True
+    )
+
+    get_ctx_mock.assert_not_awaited()
+    decide_mock.assert_not_awaited()
+    assert captured_firings == []
 
 
 @pytest.mark.asyncio

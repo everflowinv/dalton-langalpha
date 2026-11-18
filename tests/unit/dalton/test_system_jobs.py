@@ -869,7 +869,10 @@ async def test_preflight_400s_heartbeat_keeps_execution_alive_beyond_300s_stale_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R3 Item 3: Heartbeat task starts before `dalton_preflight.decide` so a 400s preflight (simulated clock) never exceeds the 300s stale threshold."""
+    from types import SimpleNamespace
+    import src.dalton.database.watch as watch_db_mod
     import src.server.services.automation_executor as exec_mod
+    from src.server.services.turn_runtime import TurnRoute
 
     sim_clock = {"now": 1000.0, "last_heartbeat": 1000.0}
     heartbeat_timestamps: list[float] = []
@@ -937,6 +940,30 @@ async def test_preflight_400s_heartbeat_keeps_execution_alive_beyond_300s_stale_
             signals=[],
         )
 
+    monkeypatch.setattr(
+        exec_mod,
+        "_turn_place",
+        create_autospec(
+            exec_mod._turn_place,
+            return_value=SimpleNamespace(workspace={"workspace_id": WS_HOME}),
+        ),
+    )
+    monkeypatch.setattr(
+        exec_mod,
+        "turn_route",
+        create_autospec(exec_mod.turn_route, return_value=TurnRoute(WS_HOME, "analyst")),
+    )
+    monkeypatch.setattr(TurnRoute, "bind", create_autospec(TurnRoute.bind, return_value=None))
+    monkeypatch.setattr(
+        exec_mod,
+        "park_for_computer",
+        create_autospec(exec_mod.park_for_computer, return_value=False),
+    )
+    monkeypatch.setattr(
+        watch_db_mod,
+        "get_preflight_wake_context",
+        create_autospec(watch_db_mod.get_preflight_wake_context, return_value=None),
+    )
     monkeypatch.setattr(
         preflight_mod,
         "decide",

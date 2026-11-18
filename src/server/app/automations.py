@@ -307,8 +307,13 @@ async def list_automation_runs(
             "agent thread."
         ),
     ),
+    wait_reason: Literal["thread_busy", "computer_unreachable"] | None = Query(None),
 ):
-    """List executions. Omitted scope stays the caller's own agent runs."""
+    """List executions. Omitted scope stays the caller's own agent runs.
+
+    ``wait_reason`` narrows on the server, before the page is cut, so runs
+    waiting for one reason cannot push those waiting for the other off it.
+    """
     # DALTON-HOOK(company-automations): company feed merges agent runs and script runs
     thread_filter = str(thread_id) if thread_id else None
     if scope == "company":
@@ -325,6 +330,7 @@ async def list_automation_runs(
         filters: dict[str, Any] = {
             "thread_id": thread_filter,
             "status": status,
+            "wait_reason": wait_reason,
             "limit": limit,
             "offset": offset,
             "scope": scope,
@@ -337,6 +343,7 @@ async def list_automation_runs(
             principal.user_id,
             thread_id=thread_filter,
             status=status,
+            wait_reason=wait_reason,
             limit=limit,
             offset=offset,
             computer_id=principal.computer_id,
@@ -346,6 +353,7 @@ async def list_automation_runs(
         principal.user_id,
         thread_id=thread_filter,
         status=status,
+        wait_reason=wait_reason,
         limit=limit,
         offset=offset,
     )

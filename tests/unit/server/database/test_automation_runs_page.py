@@ -53,3 +53,18 @@ async def test_computer_token_filters_the_run_workspace_before_the_page(db):
     assert "execution_workspace.computer_id = %s::uuid" in sql
     assert sql.index("execution_workspace") < sql.index("LIMIT")
     assert params == ("user-1", home_id, "comp-b", home_id, "comp-b", 3, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_wait_reason_narrows_before_the_page_is_cut(db):
+    """Runs waiting for a computer must not push a thread's waiting runs off
+    the page, so the reason is a condition of the query, not a filter after."""
+    db.fetchall.return_value = []
+
+    await exec_db.list_executions(
+        "user-1", thread_id="t-1", status="waiting", wait_reason="thread_busy", limit=10
+    )
+
+    sql, params = db.execute.await_args.args
+    assert "COALESCE(e.wait_reason, CASE WHEN e.status = 'waiting' THEN 'thread_busy' END) = %s" in sql
+    assert "thread_busy" in params

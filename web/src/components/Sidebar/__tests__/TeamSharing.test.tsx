@@ -948,7 +948,7 @@ describe('Dalton Team Sharing', () => {
     renderWithProviders(
       <div>
         <PreviewCrumbs
-          entry={{ port: 8080, title: 'App', url: '', loading: false, error: false, reloadToken: 0 }}
+          entry={{ port: 8080, title: 'App', url: '', loading: false, reloadToken: 0 }}
           onRefresh={refreshPreviewApi}
           refreshDisabled={true}
           workspaceId={null}

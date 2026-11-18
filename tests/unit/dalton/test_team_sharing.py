@@ -33,7 +33,10 @@ from src.server.app.threads import crud as threads_crud
 from src.server.app.threads import messaging as threads_messaging
 from src.server.app.threads import provenance as threads_provenance
 from src.server.app.threads import tasks as threads_tasks
-from src.server.app.workspace_files import crud as ws_files_crud
+from src.server.app.workspace_files import (
+    backup_reads as ws_files_backup,
+    crud as ws_files_crud,
+)
 from src.server.app.workspace_files.file_refs import ResolveFileRefRequest
 from src.server.dependencies.principal import Principal
 from src.server.database import conversation as conv_db
@@ -53,6 +56,7 @@ from src.server.services.workspace_file_containment import (
     FileTooLargeToServe,
 )
 from src.ptc_agent.core.sandbox import PTCSandbox
+from ptc_agent.core.sandbox.file_version import FileStamp
 
 TEAM_EMAILS = (
     "richard.lu@dalton.test,chao.yu@dalton.test,"
@@ -851,24 +855,24 @@ class TestReadEndpointsAllowColleagues:
             get_file_content_mock,
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "get_vault_secrets_for_redaction",
             create_autospec(
-                ws_files_crud.get_vault_secrets_for_redaction, return_value=[]
+                ws_files_backup.get_vault_secrets_for_redaction, return_value=[]
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_text",
             create_autospec(
-                ws_files_crud.http_file_text, return_value="# Thesis\nStrong buy"
+                ws_files_backup.http_file_text, return_value="# Thesis\nStrong buy"
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_bytes",
             create_autospec(
-                ws_files_crud.http_file_bytes, return_value=b"# Thesis\nStrong buy"
+                ws_files_backup.http_file_bytes, return_value=b"# Thesis\nStrong buy"
             ),
         )
 
@@ -1382,21 +1386,21 @@ class TestWriteEndpointsRejectColleagues:
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "get_vault_secrets_for_redaction",
             create_autospec(
-                ws_files_crud.get_vault_secrets_for_redaction, return_value=[]
+                ws_files_backup.get_vault_secrets_for_redaction, return_value=[]
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_text",
-            create_autospec(ws_files_crud.http_file_text, return_value="FOO=bar"),
+            create_autospec(ws_files_backup.http_file_text, return_value="FOO=bar"),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_bytes",
-            create_autospec(ws_files_crud.http_file_bytes, return_value=b"FOO=bar"),
+            create_autospec(ws_files_backup.http_file_bytes, return_value=b"FOO=bar"),
         )
 
         resolved = await ws_files_crud.resolve_workspace_file(
@@ -1469,16 +1473,16 @@ class TestRangeDownloadPermissionMatrix:
             create_autospec(FilePersistenceService.get_file_content, return_value=row),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "get_vault_secrets_for_redaction",
             create_autospec(
-                ws_files_crud.get_vault_secrets_for_redaction, return_value=[]
+                ws_files_backup.get_vault_secrets_for_redaction, return_value=[]
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_bytes",
-            create_autospec(ws_files_crud.http_file_bytes, return_value=file_bytes),
+            create_autospec(ws_files_backup.http_file_bytes, return_value=file_bytes),
         )
 
     @pytest.mark.asyncio
@@ -1497,10 +1501,10 @@ class TestRangeDownloadPermissionMatrix:
         }
         self._mirror_patches(monkeypatch, row=row)
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_byte_range",
             create_autospec(
-                ws_files_crud.http_file_byte_range,
+                ws_files_backup.http_file_byte_range,
                 side_effect=lambda _row, start, n, **_: (
                     pdf[start : start + n],
                     len(pdf),
@@ -1528,8 +1532,8 @@ class TestRangeDownloadPermissionMatrix:
             "is_binary": True,
         }
         self._mirror_patches(monkeypatch, row=row)
-        ranged_spy = create_autospec(ws_files_crud._stored_range_response)
-        monkeypatch.setattr(ws_files_crud, "_stored_range_response", ranged_spy)
+        ranged_spy = create_autospec(ws_files_backup._stored_range_response)
+        monkeypatch.setattr(ws_files_backup, "_stored_range_response", ranged_spy)
         with pytest.raises(HTTPException) as exc:
             await ws_files_crud.download_workspace_file(
                 "11111111-1111-4111-8111-111111111111",
@@ -1554,8 +1558,8 @@ class TestRangeDownloadPermissionMatrix:
         self._mirror_patches(
             monkeypatch, row=row, file_bytes=b"# Thesis\nStrong buy"
         )
-        ranged_spy = create_autospec(ws_files_crud._stored_range_response)
-        monkeypatch.setattr(ws_files_crud, "_stored_range_response", ranged_spy)
+        ranged_spy = create_autospec(ws_files_backup._stored_range_response)
+        monkeypatch.setattr(ws_files_backup, "_stored_range_response", ranged_spy)
         response = await ws_files_crud.download_workspace_file(
             "11111111-1111-4111-8111-111111111111",
             x_user_id="u-chao",
@@ -1678,7 +1682,8 @@ class TestRangeDownloadPermissionMatrix:
         read_mock.return_value = ContainedFile(
             canonical="/home/workspace/NVDA_Deep_Dive/report.pdf",
             size=len(b"%PDF-1.7 binary"),
-            version="9000000 1 2 3",
+            stamp=FileStamp.from_line("9000000 1 2 3"),
+            settled=True,
             content=b"%PDF-1.7 binary",
         )
         monkeypatch.setattr(
@@ -1749,16 +1754,16 @@ class TestRwColleagueFileDownloads:
             create_autospec(FilePersistenceService.get_file_content, return_value=row),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "get_vault_secrets_for_redaction",
             create_autospec(
-                ws_files_crud.get_vault_secrets_for_redaction, return_value=[]
+                ws_files_backup.get_vault_secrets_for_redaction, return_value=[]
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_bytes",
-            create_autospec(ws_files_crud.http_file_bytes, return_value=file_bytes),
+            create_autospec(ws_files_backup.http_file_bytes, return_value=file_bytes),
         )
 
     @pytest.mark.asyncio
@@ -1792,8 +1797,8 @@ class TestRwColleagueFileDownloads:
         assert response.body == xlsx
         # The mirror's bytes are the owner's stored object, fetched with the
         # owner's storage identity — the colleague never needs their own.
-        ws_files_crud.http_file_bytes.assert_awaited_once()
-        assert ws_files_crud.http_file_bytes.await_args.kwargs["user_id"] == "u-richard"
+        ws_files_backup.http_file_bytes.assert_awaited_once()
+        assert ws_files_backup.http_file_bytes.await_args.kwargs["user_id"] == "u-richard"
 
     @pytest.mark.asyncio
     async def test_rw_colleague_range_of_mirror_binary_is_206(
@@ -1814,10 +1819,10 @@ class TestRwColleagueFileDownloads:
             file_bytes=pdf,
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_backup,
             "http_file_byte_range",
             create_autospec(
-                ws_files_crud.http_file_byte_range,
+                ws_files_backup.http_file_byte_range,
                 side_effect=lambda _row, start, n, **_: (
                     pdf[start : start + n],
                     len(pdf),
@@ -1968,7 +1973,8 @@ class TestRwColleagueFileDownloads:
                 return_value=ContainedFile(
                     canonical=canonical,
                     size=len(returns),
-                    version="9000000 1 2 3",
+                    stamp=FileStamp.from_line("9000000 1 2 3"),
+            settled=True,
                     content=returns,
                 ),
             ),
