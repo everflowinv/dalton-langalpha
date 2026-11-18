@@ -22,6 +22,14 @@ UTC = dt.timezone.utc
 FIELDS = ('fresh', 'cw', 'cr', 'out')
 DALTON_PROD_CHANNEL = 'Dalton 生产（订阅）'
 DEFAULT_AGY_ENUM_NAMES_FILE = Path(__file__).resolve().parent.parent / 'references' / 'agy_enum_names.json'
+OPENCLAW_SOURCE_KINDS = frozenset({
+    'rollout-openclaw',
+    'trajectory-db',
+    'trajectory-file',
+    'claude-gateway',
+    'agy-gateway',
+    'muse-gateway',
+})
 ROOTS = {
  'rollout-openclaw': ['~/.openclaw/agents/*/agent/codex-home/sessions/**/rollout-*.jsonl', '~/.openclaw/acpx/codex-home/sessions/**/rollout-*.jsonl', '~/.openclaw/agents/*/agent/codex-home/archived_sessions/**/rollout-*.jsonl'],
  'rollout-manual': ['~/.codex/sessions/**/rollout-*.jsonl', '~/.codex/archived_sessions/**/rollout-*.jsonl'],
@@ -88,6 +96,26 @@ def dbopen(path):
         return c
 
 
+def _pattern_base_dir(pat):
+    expanded = os.path.expanduser(pat)
+    cut = len(expanded)
+    for ch in ('*', '?', '['):
+        idx = expanded.find(ch)
+        if idx != -1 and idx < cut:
+            cut = idx
+    prefix = expanded[:cut]
+    if cut < len(expanded):
+        return os.path.dirname(prefix)
+    return os.path.dirname(expanded)
+
+
+def _any_source_dir_exists(kind):
+    pats = ROOTS.get(kind) or []
+    if not pats:
+        return True
+    return any(os.path.isdir(_pattern_base_dir(pat)) for pat in pats)
+
+
 def files(kind):
     return sorted({str(Path(p).resolve()) for pat in ROOTS[kind] for p in glob.glob(os.path.expanduser(pat), recursive=True) if os.path.isfile(p)})
 
@@ -100,6 +128,7 @@ class Evidence:
         self.issues = collections.Counter()
         self.examples = {}
         self.inventory = {}
+        self.missing_sources = {}
         self.dalton_prod = None
 
     def issue(self, code, detail=''):
@@ -110,6 +139,10 @@ class Evidence:
     def paths(self, kind):
         out = files(kind)
         self.inventory[kind] = len(out)
+        if not out and kind in OPENCLAW_SOURCE_KINDS and not _any_source_dir_exists(kind):
+            self.missing_sources[kind] = '来源目录不存在'
+        else:
+            self.missing_sources.pop(kind, None)
         return out
 
     def lines(self, path):
@@ -792,7 +825,7 @@ def cached_scan(e, fn, kinds, cache_path=None):
             data=json.loads(gzip.decompress(row[2]));e.stats['source_cache_hits']+=1
         else:
             fresh=Evidence(e.since,float('inf'));fn(fresh)
-            data=dict(records=list(fresh.records.values()),stats=dict(fresh.stats),issues=dict(fresh.issues),examples=fresh.examples,inventory=fresh.inventory)
+            data=dict(records=list(fresh.records.values()),stats=dict(fresh.stats),issues=dict(fresh.issues),examples=fresh.examples,inventory=fresh.inventory,missing_sources=fresh.missing_sources)
             with c:c.execute('INSERT INTO scan_cache VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET fingerprint=excluded.fingerprint,since=excluded.since,payload=excluded.payload',
                              (key,fingerprint,e.since,gzip.compress(json.dumps(data,separators=(',',':')).encode())))
         for r in data['records']:
@@ -800,5 +833,12 @@ def cached_scan(e, fn, kinds, cache_path=None):
                 # Source identity can also occur in the SQLite/import archive pair.
                 e.put(r['kind'],r['id'].split(':',1)[1],r['ts'],r['provider'],r['model'],r['source'],r['v'],**r['meta'])
         e.stats.update(data['stats']);e.issues.update(data['issues']);e.inventory.update(data['inventory'])
+        for kind in kinds:
+            if e.inventory.get(kind, 0) == 0 and kind in OPENCLAW_SOURCE_KINDS and not _any_source_dir_exists(kind):
+                e.missing_sources[kind] = '来源目录不存在'
+            elif kind in (data.get('missing_sources') or {}):
+                e.missing_sources[kind] = data['missing_sources'][kind]
+            else:
+                e.missing_sources.pop(kind, None)
         for k,v in data['examples'].items():e.examples.setdefault(k,[]).extend(v[:max(0,3-len(e.examples.get(k,[])))])
     finally:c.close()

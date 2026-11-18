@@ -14,6 +14,7 @@ import unittest
 import usage_sources as sources
 from codex_devloop_usage import scan_codex_devloop
 from grok_usage import scan_grok
+from usage_state import resolve_usage_state_dir
 from usage_v3 import scan_compactions, scan_muse
 from zcode_usage import scan_zcode
 
@@ -38,8 +39,7 @@ NOTES = [
 
 
 def default_state_dir():
-    raw = (os.environ.get('DALTON_USAGE_STATE_DIR') or '').strip()
-    return Path(raw or '~/.openclaw/usage-accounting').expanduser()
+    return resolve_usage_state_dir()
 
 
 def default_ledger_path():
@@ -461,6 +461,18 @@ def gather(args):
     # Adjacent evidence resolves requests crossing a reporting boundary; final
     # output uses [cut, now), independently of scan time or ledger retention.
     e = sources.Evidence(cut - 86400, now + 86400 if args.as_of else now)
+    sorted_windows = sorted(set(windows))
+
+    if args.cmd == 'collect-broker':
+        sources.scan_agy(e)
+        scan_muse(e)
+        sources.scan_gateway(e, 'claude-gateway', split)
+        sources.scan_gateway(e, 'agy-gateway', split)
+        scan_grok(e)
+        if not args.no_ledger:
+            sources.persist(e, args.ledger, hydrate=False)
+        e.since, e.until = cut, now
+        return e, sorted_windows
 
     cache = None if args.no_ledger or args.no_cache else args.ledger + '.scan-cache.sqlite'
     for kind, src in [('rollout-openclaw', 'openclaw'), ('rollout-manual', 'codex-cli(手动)')]:
@@ -480,7 +492,6 @@ def gather(args):
         sources.persist(e, args.ledger, hydrate=True)
     e.since, e.until = cut, now
 
-    sorted_windows = sorted(set(windows))
     for w in sorted_windows:
         sources.scan_dalton_prod(
             e,
@@ -509,6 +520,8 @@ def render(out):
     if not dp.get('ok'):
         lines.append('Dalton 生产用量读取失败：%s' % (dp.get('error') or '未知错误'))
     lines.append('Coverage: %s; %d unresolved aggregate observations excluded (may overlap counted records).' % (out['coverage']['status'], out['coverage']['unresolved_aggregate_records']))
+    for k, v in out['coverage'].get('missing_sources', {}).items():
+        lines.append('~ %s: %s' % (k, v))
     for k, v in out['coverage']['issues'].items():
         lines.append('! %s: %s' % (k, v))
     lines.extend(NOTES)
@@ -539,34 +552,45 @@ def command(args):
         }
     else:
         e, windows = gather(args)
-        prices, catalog_meta = load_price_catalog(args.prices)
-        records, held = sources.reconcile(e)
-        records = [r for r in records if e.since <= r['ts'] < e.until]
-        held = [r for r in held if e.since <= r['ts'] < e.until]
-        out = {
-            'ok': True,
-            'version': VERSION,
-            'generated_at': dt.datetime.fromtimestamp(e.until, sources.UTC).isoformat(),
-            'price_catalog': catalog_meta,
-            'dalton_prod': e.dalton_prod or {'ok': False, 'error': 'not queried', 'models': 0, 'runs': 0, 'calls': 0},
-            'windows': [window_result(records, e.until, w, prices, args.top, args.by_model) for w in windows],
-            'coverage': {
-                'status': 'partial' if e.issues or held or any(v == 0 for v in e.inventory.values()) else 'local-observations-only',
-                'complete': False,
+        if args.cmd == 'collect-broker':
+            out = {
+                'ok': True,
+                'version': VERSION,
+                'observations': len(e.records),
+                'issues': dict(e.issues),
                 'inventory': e.inventory,
-                'issues': dict(sorted(e.issues.items())),
-                'examples': e.examples,
-                'stats': dict(e.stats),
-                'unresolved_aggregate_records': len(held),
-                'unresolved_aggregate_tokens_not_additive': sum(sum(r['v']) for r in held),
-            },
-            'notes': NOTES,
-        }
-        if args.audit_records:
-            target = Path(args.audit_records).expanduser()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps({'included': records, 'unresolved': held}, ensure_ascii=False, separators=(',', ':')))
-            os.chmod(target, 0o600)
+                'missing_sources': dict(sorted(e.missing_sources.items())),
+            }
+        else:
+            prices, catalog_meta = load_price_catalog(args.prices)
+            records, held = sources.reconcile(e)
+            records = [r for r in records if e.since <= r['ts'] < e.until]
+            held = [r for r in held if e.since <= r['ts'] < e.until]
+            out = {
+                'ok': True,
+                'version': VERSION,
+                'generated_at': dt.datetime.fromtimestamp(e.until, sources.UTC).isoformat(),
+                'price_catalog': catalog_meta,
+                'dalton_prod': e.dalton_prod or {'ok': False, 'error': 'not queried', 'models': 0, 'runs': 0, 'calls': 0},
+                'windows': [window_result(records, e.until, w, prices, args.top, args.by_model) for w in windows],
+                'coverage': {
+                    'status': 'partial' if e.issues or held or any(v == 0 for v in e.inventory.values()) else 'local-observations-only',
+                    'complete': False,
+                    'inventory': e.inventory,
+                    'issues': dict(sorted(e.issues.items())),
+                    'examples': e.examples,
+                    'stats': dict(e.stats),
+                    'missing_sources': dict(sorted(e.missing_sources.items())),
+                    'unresolved_aggregate_records': len(held),
+                    'unresolved_aggregate_tokens_not_additive': sum(sum(r['v']) for r in held),
+                },
+                'notes': NOTES,
+            }
+            if args.audit_records:
+                target = Path(args.audit_records).expanduser()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps({'included': records, 'unresolved': held}, ensure_ascii=False, separators=(',', ':')))
+                os.chmod(target, 0o600)
     print(json.dumps(out, ensure_ascii=False, indent=1) if args.json or args.cmd != 'summary' else render(out))
     return 0 if out['ok'] else 1
 
@@ -576,22 +600,23 @@ def main():
     p.add_argument('--version', action='version', version=VERSION)
     p.add_argument('--prices', default=None)
     sub = p.add_subparsers(dest='cmd')
-    s = sub.add_parser('summary')
-    s.add_argument('--windows', default='1,7,30')
-    s.add_argument('--days')
-    s.add_argument('--as-of')
-    s.add_argument('--split', default=','.join(map(str, DEFAULT_SPLIT)))
-    s.add_argument('--ledger', default=default_ledger_path())
-    s.add_argument('--no-ledger', action='store_true')
-    s.add_argument('--no-cache', action='store_true')
-    s.add_argument('--top', type=int, default=0)
-    s.add_argument('--by-model', action='store_true')
-    s.add_argument('--audit-records')
+    for name in ('summary', 'collect-broker'):
+        s = sub.add_parser(name)
+        s.add_argument('--windows', default='1,7,30')
+        s.add_argument('--days')
+        s.add_argument('--as-of')
+        s.add_argument('--split', default=','.join(map(str, DEFAULT_SPLIT)))
+        s.add_argument('--ledger', default=default_ledger_path())
+        s.add_argument('--no-ledger', action='store_true')
+        s.add_argument('--no-cache', action='store_true')
+        s.add_argument('--top', type=int, default=0)
+        s.add_argument('--by-model', action='store_true')
+        s.add_argument('--audit-records')
     sub.add_parser('prices')
     sub.add_parser('self-test')
     argv = [a for a in sys.argv[1:] if a != '--json']
     use_json = '--json' in sys.argv
-    if not argv or (not any(a in argv for a in ('summary', 'prices', 'self-test', '--help', '-h', '--version'))):
+    if not argv or (not any(a in argv for a in ('summary', 'prices', 'self-test', 'collect-broker', '--help', '-h', '--version'))):
         argv += ['summary']
     args = p.parse_args(argv)
     args.json = use_json

@@ -48,12 +48,15 @@ bash scripts/run.sh self-test --json
 
 ## 4. 保护易淘汰证据并复算
 
-默认状态目录由 `DALTON_USAGE_STATE_DIR` 控制（默认 `~/.openclaw/usage-accounting`），账本 `<state_dir>/evidence.sqlite` 权限 0600，只存本机技术计量字段；`dalton-prod` 实时聚合不落本地账本。观察先入账再对账，补采权威来源可替代 fallback；重新扫描不累加历史总数。
+状态目录按 `DALTON_USAGE_STATE_DIR` 环境变量 → 指针文件 `~/.config/dalton/usage-state-dir` → 旧目录 `~/.openclaw/usage-accounting` 的顺序解析；账本 `<state_dir>/evidence.sqlite` 权限 0600，只存本机技术计量字段；`dalton-prod` 实时聚合不落本地账本。观察先入账再对账，补采权威来源可替代 fallback；重新扫描不累加历史总数。
 
 ```bash
+bash scripts/run.sh collect-broker --days 2 --json
 bash scripts/run.sh summary --days 7 --no-cache --ledger /absolute/private/staging.sqlite --json
 bash scripts/run.sh summary --days 7 --no-ledger --json
 ```
+
+`collect-broker` 采集 Antigravity 会话及网关、Claude gateway、Muse 原生与网关、Grok CLI 结果与调用日志等易轮转本地证据；由 Dalton `launchd` 服务 `com.dalton.usage-collector` 每分钟调用一次，用 `collector-status.json` 验证周期采集成功。
 
 `--no-cache` 重扫但保留账本；`--no-ledger` 不读写账本/扫描缓存。源数据已轮转时两者可不同，不把差额直接当作重复或漏记。用隔离账本固定时间复算，确认 totals、模型行和证据关联幂等。
 

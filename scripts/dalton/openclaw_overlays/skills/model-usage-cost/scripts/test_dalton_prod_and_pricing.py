@@ -218,6 +218,29 @@ class TestDaltonProdAndPricing(unittest.TestCase):
             payload = json.loads(out_buf.getvalue())
             self.assertTrue(payload["ok"])
             self.assertFalse(payload["dalton_prod"]["ok"])
+            self.assertEqual(payload["coverage"]["missing_sources"].get("rollout-openclaw"), "来源目录不存在")
+            self.assertEqual(payload["coverage"]["missing_sources"].get("claude-gateway"), "来源目录不存在")
+
+    def test_collect_broker_subcommand_collects_volatile_sources_into_ledger(self):
+        fake_home = self.tmp / "broker-home"
+        fake_home.mkdir()
+        custom_state = self.tmp / "broker-state"
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(fake_home),
+                "DALTON_USAGE_STATE_DIR": str(custom_state),
+            },
+        ):
+            out_buf = io.StringIO()
+            with patch("sys.argv", ["model_usage_cost_cli.py", "collect-broker", "--days", "2", "--json"]), \
+                 patch("sys.stdout", out_buf):
+                rc = cli.main()
+            self.assertEqual(rc, 0)
+            payload = json.loads(out_buf.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["missing_sources"].get("claude-gateway"), "来源目录不存在")
+            self.assertTrue((custom_state / "evidence.sqlite").is_file())
 
     def test_dalton_prod_daily_buckets_split_across_price_effective_date(self):
         # Weekly cron at Saturday 12:00 HKT = 04:00 UTC crosses 2026-12-01.
