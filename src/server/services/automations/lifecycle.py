@@ -653,7 +653,6 @@ async def recheck_locked_automation_update(
         runs_on_locked != locked_row.get("llm_model")
         or moved_to_locked != locked_stored_in
     ):
-        _check_home_model(user_id, runs_on_locked, moved_to_locked)
         if (
             locked_stored_in != stored_in
             or locked_row.get("llm_model") != current.get("llm_model")
@@ -661,24 +660,6 @@ async def recheck_locked_automation_update(
             await _check_claude_code_hosted(
                 user_id, runs_on_locked, moved_to_locked, locked_conn, pref_for_lock
             )
-
-    pinned_locked = effective_kwargs.get("conversation_thread_id", locked_stored_pin)
-    strategy_locked = update.thread_strategy or locked_row.get("thread_strategy")
-    if (
-        strategy_locked == "continue"
-        and (runs_on_locked, pinned_locked, strategy_locked)
-        != (
-            locked_row.get("llm_model"),
-            locked_stored_pin,
-            locked_row.get("thread_strategy"),
-        )
-        and (
-            locked_row.get("llm_model") != current.get("llm_model")
-            or locked_stored_pin != stored_pin
-            or locked_row.get("thread_strategy") != current.get("thread_strategy")
-        )
-    ):
-        await _check_claude_code_continues(runs_on_locked, pinned_locked)
 
     if new_cron or new_tz:
         locked_cron = new_cron or locked_row.get("cron_expression")
