@@ -719,12 +719,24 @@ async def _handle_send_message(
             if is_dalton_supabase_auth_enabled()
             else service_token_matches(_req_token, _svc_token)
         ) or is_dispatch
-        config = await thread_model.resolve_turn_config(
-            user_id,
-            thread_id,
-            named=requested_model,
-            held=held_model,
-            fall_back=from_service,
+        # DALTON-HOOK(automation-thread-model): inherit automation execution's model for server notification turns with unservable fallback
+        from src.dalton.services.automation_thread_model import (
+            resolve_turn_config_with_automation_inheritance,
+        )
+
+        config = await resolve_turn_config_with_automation_inheritance(
+            user_id=user_id,
+            thread_id=thread_id,
+            request=request,
+            requested_model=requested_model,
+            held_model=held_model,
+            from_service=from_service,
+            is_server_retry=(
+                is_internal
+                if is_dalton_supabase_auth_enabled()
+                else (service_token_matches(_req_token, _svc_token) or is_dispatch)
+            ),
+            retry_of_run_id=retry_of_run_id,
             resolve=resolve,
         )
 

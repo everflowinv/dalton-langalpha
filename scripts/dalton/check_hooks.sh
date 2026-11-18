@@ -418,6 +418,9 @@ ALLOWED_HOOKS=(
   # Self-service automation report_profile configuration (dalton_report_delivery)
   # and missing-config warnings / prompt guidance.
   "report-delivery"
+  # Notification turns without an explicit model inherit the running automation
+  # execution's model in messaging.py without writing conversation_threads.llm_model.
+  "automation-thread-model"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
