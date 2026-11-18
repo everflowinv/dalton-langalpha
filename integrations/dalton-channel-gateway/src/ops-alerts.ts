@@ -14,17 +14,19 @@ const ALERT_CODES = new Set([
   "backend_recovered",
   "backup_failed",
   "model_unavailable",
+  "model_released",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
 ]);
-const DETAIL_ALERT_CODES = new Set(["backup_failed", "model_unavailable"]);
-const ALLOWED_BODY_KEYS = new Set(["code", "detail"]);
+const DETAIL_ALERT_CODES = new Set(["backup_failed", "model_unavailable", "model_released"]);
+const ALLOWED_BODY_KEYS = new Set(["code", "detail", "provider", "models"]);
 const ALLOWED_CONFIG_KEYS = new Set(["targets", "messages"]);
 const ALLOWED_MESSAGE_KEYS = new Set([
   "backend_down",
   "backend_recovered",
   "backup_failed",
   "model_unavailable",
+  "model_released",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
 ]);
@@ -36,6 +38,7 @@ const OPTIONAL_MESSAGE_KEYS = new Set([
 const DEFAULT_DETAIL_TEMPLATES: Record<string, string> = {
   backup_failed: "Dalton 备份失败：{detail}",
   model_unavailable: "Dalton 模型可用性告警：{detail}",
+  model_released: "订阅已开放 {provider} 的 {models}，核对档位后将其设为可见并去掉 awaiting_release 标记",
 };
 const MAX_BACKUP_DETAIL_CHARS = 300;
 const MAX_MODEL_UNAVAILABLE_DETAIL_CHARS = 600;
@@ -166,6 +169,32 @@ function renderDetailAlertMessage(template: string, rawDetail: string, maxChars:
   return `${template}：${detail}`;
 }
 
+function renderModelReleasedMessage(
+  template: string,
+  rawProvider: unknown,
+  rawModels: unknown,
+  rawDetail: unknown,
+  maxChars: number,
+): string {
+  const detailStr = typeof rawDetail === "string" ? rawDetail : "";
+  const colonIdx = detailStr.indexOf(":");
+  const fallbackProvider = colonIdx > 0 ? detailStr.slice(0, colonIdx) : "";
+  const fallbackModels = colonIdx > 0 ? detailStr.slice(colonIdx + 1) : detailStr;
+  const provider =
+    sanitizeAlertDetail(typeof rawProvider === "string" ? rawProvider : fallbackProvider, 120) ||
+    "未知订阅";
+  const models =
+    sanitizeAlertDetail(typeof rawModels === "string" ? rawModels : fallbackModels, maxChars) ||
+    "未知模型";
+  if (template.includes("{provider}") || template.includes("{models}")) {
+    return template
+      .replaceAll("{provider}", () => provider)
+      .replaceAll("{models}", () => models);
+  }
+  const combined = detailStr || `${provider}: ${models}`;
+  return renderDetailAlertMessage(template, combined, maxChars);
+}
+
 export async function handleOpsAlert(options: {
   body: unknown;
   remoteAddress: string | undefined;
@@ -201,7 +230,7 @@ export async function handleOpsAlert(options: {
         ok: false,
         code: "invalid_request",
         message:
-          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, alphaengine_login_required, or alphaengine_module_page_required.",
+          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, model_released, alphaengine_login_required, or alphaengine_module_page_required.",
       },
     };
   }
@@ -211,7 +240,20 @@ export async function handleOpsAlert(options: {
       data: {
         ok: false,
         code: "invalid_request",
-        message: "detail is only supported for backup_failed or model_unavailable.",
+        message: "detail is only supported for backup_failed, model_unavailable, or model_released.",
+      },
+    };
+  }
+  if (
+    code !== "model_released" &&
+    (options.body.provider !== undefined || options.body.models !== undefined)
+  ) {
+    return {
+      status: 400,
+      data: {
+        ok: false,
+        code: "invalid_request",
+        message: "provider and models are only supported for model_released.",
       },
     };
   }
@@ -229,6 +271,20 @@ export async function handleOpsAlert(options: {
       },
     };
   }
+  if (
+    code === "model_released" &&
+    ((options.body.provider !== undefined && typeof options.body.provider !== "string") ||
+      (options.body.models !== undefined && typeof options.body.models !== "string"))
+  ) {
+    return {
+      status: 400,
+      data: {
+        ok: false,
+        code: "invalid_request",
+        message: "provider and models must be strings.",
+      },
+    };
+  }
   if (typeof options.sendPlainText !== "function") {
     return invalidConfig();
   }
@@ -237,7 +293,15 @@ export async function handleOpsAlert(options: {
     return invalidConfig();
   }
   let text: string;
-  if (DETAIL_ALERT_CODES.has(code)) {
+  if (code === "model_released") {
+    text = renderModelReleasedMessage(
+      config.messages[code] ?? DEFAULT_DETAIL_TEMPLATES[code],
+      options.body.provider,
+      options.body.models,
+      options.body.detail,
+      MAX_MODEL_UNAVAILABLE_DETAIL_CHARS,
+    );
+  } else if (DETAIL_ALERT_CODES.has(code)) {
     const maxChars =
       code === "model_unavailable" ? MAX_MODEL_UNAVAILABLE_DETAIL_CHARS : MAX_BACKUP_DETAIL_CHARS;
     text = renderDetailAlertMessage(

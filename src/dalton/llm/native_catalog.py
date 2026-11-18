@@ -522,6 +522,7 @@ def build_native_diff(
     listings: dict[str, ProviderListing],
     llm_config: dict[str, dict[str, Any]],
     retired_keys: set[str] | None = None,
+    awaiting_release_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Classify each provider's catalog entries into added / deprecated / unchanged.
 
@@ -530,6 +531,9 @@ def build_native_diff(
     of offering it as a plain addition — restoring is an explicit PM action.
     """
     retired_keys = retired_keys or set()
+    # Models configured ahead of their launch are absent upstream by design; listing
+    # them as deprecated would invite a PM to retire them.
+    awaiting_release_keys = awaiting_release_keys or set()
     added: list[dict[str, Any]] = []
     deprecated: list[dict[str, Any]] = []
     unchanged = 0
@@ -590,7 +594,7 @@ def build_native_diff(
                 }
             )
         for key, entry in sorted(current.items()):
-            if key in matched_keys:
+            if key in matched_keys or key in awaiting_release_keys:
                 continue
             deprecated.append(
                 {

@@ -223,7 +223,7 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 每次上线新模型或切换默认模型时，按以下六步逐项核验（命令中的 `<新模型key>`、`<旧模型key>`、`<提供方>`、`<管理员user_id>` 与 `<抽查用户user_id>` 按实际目标替换）：
 
 1. **新模型配置写入 Dalton overlay，上游 manifest 保持原样**：
-   模型定义放在 `src/dalton/llm/native_overlay.json`（或运行时同步文件 `var/dalton/catalog/native_sync_overlay.json`），上游 `src/llms/manifest/models.json` 与 `src/llms/manifest/providers.json` 保持只读原样。核对新模型已进入叠加配置并顺利通过钩子校验：
+   对于待正式发布或待订阅开放的新模型，先在 `dalton_meta` 中添加 `"awaiting_release": true`，并把模型设为 `"visible": false`（订阅开放前选择器不显示它）；收到 T87 的 `model_released` 告警后核对实际档位，再设为可见并去掉该标记。模型定义放在 `src/dalton/llm/native_overlay.json`（或运行时同步文件 `var/dalton/catalog/native_sync_overlay.json`），上游 `src/llms/manifest/models.json` 与 `src/llms/manifest/providers.json` 保持只读原样。核对新模型已进入叠加配置并顺利通过钩子校验：
 
    ```bash
    .venv/bin/python -c 'import json; d=json.load(open("src/dalton/llm/native_overlay.json", encoding="utf-8")); print("<新模型key> in overlay:", "<新模型key>" in d.get("models", {}))'

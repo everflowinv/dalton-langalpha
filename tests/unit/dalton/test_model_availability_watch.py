@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import stat
 from pathlib import Path
 from typing import Any
@@ -110,6 +109,14 @@ async def test_check_flags_missing_visible_model_and_dedups_24h(
 
     avail_spy = create_autospec(pm_service.available_models, side_effect=_fake_available_models)
     monkeypatch.setattr(pm_service, "available_models", avail_spy)
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            side_effect=pm_service.NotConnected("antigravity-oauth"),
+        ),
+    )
     monkeypatch.setattr(LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=mc))
     npm_spy = create_autospec(watch_svc.fetch_npm_codex_latest_version, return_value=None)
 
@@ -118,8 +125,8 @@ async def test_check_flags_missing_visible_model_and_dedups_24h(
     assert report["user_id"] == "pm-holder-1"
     assert report["missing_by_provider"] == {"codex-oauth": ["gpt-6.2-sol-oauth"]}
     assert {c.args[1] for c in avail_spy.await_args_list} == {"codex-oauth", "claude-oauth"}
-    assert report["providers"]["antigravity-oauth"]["status"] == "unsupported"
-    assert report["providers"]["antigravity-oauth"]["supported"] is False
+    assert report["providers"]["antigravity-oauth"]["status"] == "not_connected"
+    assert report["providers"]["antigravity-oauth"]["supported"] is True
     assert report["providers"]["xai-oauth"]["status"] == "unsupported"
     assert report["providers"]["muse-oauth"]["status"] == "unsupported"
     assert report["codex_version_probe"]["status"] == "skipped"
@@ -234,6 +241,8 @@ async def test_codex_higher_version_probe_unlocks_configured_model_and_hints_upg
     seen_requests: list[pm_wire.ListRequest] = []
 
     async def _fake_resolve_cred(user_id: str, provider: str, _mc: Any) -> pm_service.Credential:
+        if provider != "codex-oauth":
+            raise pm_service.NotConnected(provider)
         return pm_service.Credential(
             api_key="oauth-tok",
             holder="codex-oauth",
@@ -347,6 +356,14 @@ async def test_npm_version_unavailable_skips_probe_without_error(
         "available_models",
         create_autospec(pm_service.available_models, side_effect=_fake_available),
     )
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            side_effect=pm_service.NotConnected("antigravity-oauth"),
+        ),
+    )
     monkeypatch.setattr(LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=mc))
 
     prober_spy = create_autospec(watch_svc.probe_codex_with_client_version)
@@ -430,6 +447,14 @@ async def test_fallback_or_error_on_supported_provider_reports_error_and_alerts_
         "available_models",
         create_autospec(pm_service.available_models, side_effect=_fake_available),
     )
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            side_effect=pm_service.NotConnected("antigravity-oauth"),
+        ),
+    )
     monkeypatch.setattr(LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=mc))
 
     # Main Codex check fell back with no_match, while higher-version probe succeeds and unlocks models.
@@ -457,7 +482,7 @@ async def test_fallback_or_error_on_supported_provider_reports_error_and_alerts_
     assert report["providers"]["claude-oauth"]["status"] == "error"
     assert report["error_by_provider"]["codex-oauth"] == "fallback:no_match"
     assert "claude upstream timeout" in report["error_by_provider"]["claude-oauth"]
-    assert report["providers"]["antigravity-oauth"]["status"] == "unsupported"
+    assert report["providers"]["antigravity-oauth"]["status"] == "not_connected"
     assert report["providers"]["xai-oauth"]["status"] == "unsupported"
     assert report["codex_version_probe"]["status"] == "ok"
     assert report["codex_version_probe"]["reason"] == "main_check_fallback_probe_unlocked"
@@ -524,6 +549,14 @@ async def test_codex_main_fallback_bad_response_probe_ok_reason(
         pm_service,
         "available_models",
         create_autospec(pm_service.available_models, side_effect=_fake_available),
+    )
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            side_effect=pm_service.NotConnected("antigravity-oauth"),
+        ),
     )
     monkeypatch.setattr(LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=mc))
 
@@ -624,3 +657,299 @@ def test_separate_24h_dedup_when_missing_same_and_npm_fails_later(tmp_path: Path
     assert len(sent) == 2
     assert "0.176.0" in sent[1]
     assert sent[1].startswith("需要提高 DALTON_CODEX_CLIENT_VERSION 到 0.176.0")
+
+
+@pytest.mark.asyncio
+async def test_awaiting_release_missing_suppressed_then_released_alerts_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.dalton.llm import native_catalog
+
+    LLM._model_config = None
+    mc = ModelConfig()
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-holder-1")
+
+    async def _fake_available(
+        user_id: str,
+        provider: str,
+        *,
+        refresh: bool = False,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        raise pm_service.NotConnected(provider)
+
+    monkeypatch.setattr(
+        pm_service,
+        "available_models",
+        create_autospec(pm_service.available_models, side_effect=_fake_available),
+    )
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            return_value=pm_service.Credential(api_key="ag-tok", holder="antigravity-oauth"),
+        ),
+    )
+    monkeypatch.setattr(LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=mc))
+
+    # Build a baseline Antigravity upstream list matching all configured non-Neon models
+    # so only Neon is missing in Phase 1.
+    non_neon_models = [
+        native_catalog.UpstreamModel(id=str(entry["model_id"]), display_name=str(entry["model_id"]))
+        for key, entry in mc.llm_config.items()
+        if isinstance(entry, dict)
+        and entry.get("provider") == "antigravity-oauth"
+        and entry.get("visible")
+        and not key.startswith("gemini-4-neon-")
+    ]
+
+    fetch_ag_spy = create_autospec(
+        native_catalog.fetch_antigravity_models,
+        return_value=list(non_neon_models),
+    )
+    monkeypatch.setattr(native_catalog, "fetch_antigravity_models", fetch_ag_spy)
+    npm_spy = create_autospec(watch_svc.fetch_npm_codex_latest_version, return_value=None)
+
+    # Phase 1: Neon is missing, awaiting_release=True -> no model_unavailable alert, no model_released alert.
+    report_missing = await watch_svc.run_model_availability_check(npm_version_fetcher=npm_spy)
+    assert report_missing["ok"] is True
+    assert report_missing["missing_by_provider"] == {}
+    assert report_missing["released_by_provider"] == {}
+    ag_report = report_missing["providers"]["antigravity-oauth"]
+    assert ag_report["status"] == "ok"
+    assert ag_report["missing_visible"] == []
+    assert ag_report["missing_awaiting_release"] == [
+        "gemini-4-neon-high-oauth",
+        "gemini-4-neon-low-oauth",
+        "gemini-4-neon-medium-oauth",
+    ]
+
+    sent_alerts: list[tuple[str, str]] = []
+
+    def _fake_sender(detail: str, *, code: str = "model_unavailable", **kwargs: Any):
+        sent_alerts.append((code, detail))
+        return True, 200, None
+
+    sender_spy = create_autospec(_fake_sender, side_effect=_fake_sender)
+    state_dir = tmp_path / "state"
+    t0 = 1_763_500_000.0
+
+    s1, rc1 = watch_cli.run_watch(
+        state_dir=state_dir,
+        check_report=report_missing,
+        alert_sender=sender_spy,
+        now_epoch=t0,
+    )
+    assert rc1 == 0
+    assert s1["alert"]["sent"] is False
+    assert s1["released_alert"]["sent"] is False
+    assert sent_alerts == []
+
+    # Phase 2: Neon becomes available -> emits one model_released alert.
+    released_models = list(non_neon_models) + [
+        native_catalog.UpstreamModel(id="gemini-4-neon-low", display_name="Gemini 4 Neon Low"),
+        native_catalog.UpstreamModel(id="gemini-4-neon-medium", display_name="Gemini 4 Neon Medium"),
+        native_catalog.UpstreamModel(id="gemini-4-neon-high", display_name="Gemini 4 Neon High"),
+    ]
+    fetch_ag_spy.return_value = released_models
+    report_released = await watch_svc.run_model_availability_check(npm_version_fetcher=npm_spy)
+    assert report_released["ok"] is True
+    assert report_released["missing_by_provider"] == {}
+    assert report_released["released_by_provider"] == {
+        "antigravity-oauth": [
+            "gemini-4-neon-high-oauth",
+            "gemini-4-neon-low-oauth",
+            "gemini-4-neon-medium-oauth",
+        ]
+    }
+
+    s2, rc2 = watch_cli.run_watch(
+        state_dir=state_dir,
+        check_report=report_released,
+        alert_sender=sender_spy,
+        now_epoch=t0 + 3600,
+    )
+    assert rc2 == 0
+    assert s2["released_alert"]["sent"] is True
+    assert len(sent_alerts) == 1
+    assert sent_alerts[0][0] == "model_released"
+    assert "antigravity-oauth" in sent_alerts[0][1]
+    assert "gemini-4-neon-low-oauth" in sent_alerts[0][1]
+    assert "gemini-4-neon-medium-oauth" in sent_alerts[0][1]
+    assert "gemini-4-neon-high-oauth" in sent_alerts[0][1]
+
+    # Phase 3: Subsequent run (even >10 days later) does NOT alert again.
+    s3, rc3 = watch_cli.run_watch(
+        state_dir=state_dir,
+        check_report=report_released,
+        alert_sender=sender_spy,
+        now_epoch=t0 + 10 * 24 * 3600,
+    )
+    assert rc3 == 0
+    assert s3["released_alert"]["sent"] is False
+    assert s3["released_alert"]["suppressed_already_alerted"] is True
+    assert len(sent_alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_awaiting_release_unconfigured_prefix_id_triggers_model_released(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.dalton.llm import native_catalog
+
+    LLM._model_config = None
+    mc = ModelConfig()
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-holder-1")
+
+    async def _fake_available(
+        user_id: str,
+        provider: str,
+        *,
+        refresh: bool = False,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        raise pm_service.NotConnected(provider)
+
+    monkeypatch.setattr(
+        pm_service,
+        "available_models",
+        create_autospec(pm_service.available_models, side_effect=_fake_available),
+    )
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            return_value=pm_service.Credential(api_key="ag-tok", holder="antigravity-oauth"),
+        ),
+    )
+    monkeypatch.setattr(LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=mc))
+
+    non_neon_models = [
+        native_catalog.UpstreamModel(id=str(entry["model_id"]), display_name=str(entry["model_id"]))
+        for key, entry in mc.llm_config.items()
+        if isinstance(entry, dict)
+        and entry.get("provider") == "antigravity-oauth"
+        and entry.get("visible")
+        and not key.startswith("gemini-4-neon-")
+    ]
+    # Subscription exposes gemini-4-neon-xhigh (not configured in overlay).
+    upstream_with_xhigh = list(non_neon_models) + [
+        native_catalog.UpstreamModel(id="gemini-4-neon-xhigh", display_name="Gemini 4 Neon XHigh"),
+        # Internal entry without displayName must not pollute unconfigured release alerts.
+        native_catalog.UpstreamModel(id="gemini-4-neon-tiered", display_name=None, internal=True),
+    ]
+    monkeypatch.setattr(
+        native_catalog,
+        "fetch_antigravity_models",
+        create_autospec(native_catalog.fetch_antigravity_models, return_value=upstream_with_xhigh),
+    )
+
+    report = await watch_svc.run_model_availability_check(
+        npm_version_fetcher=create_autospec(watch_svc.fetch_npm_codex_latest_version, return_value=None),
+    )
+    assert report["ok"] is True
+    assert report["missing_by_provider"] == {}
+    assert report["released_by_provider"] == {"antigravity-oauth": ["gemini-4-neon-xhigh"]}
+    assert report["providers"]["antigravity-oauth"]["released_unconfigured"] == ["gemini-4-neon-xhigh"]
+
+    sent_alerts: list[tuple[str, str]] = []
+
+    def _fake_sender(detail: str, *, code: str = "model_unavailable", **kwargs: Any):
+        sent_alerts.append((code, detail))
+        return True, 200, None
+
+    sender_spy = create_autospec(_fake_sender, side_effect=_fake_sender)
+    state_dir = tmp_path / "state"
+
+    s1, rc1 = watch_cli.run_watch(
+        state_dir=state_dir,
+        check_report=report,
+        alert_sender=sender_spy,
+        now_epoch=1_763_500_000.0,
+    )
+    assert rc1 == 0
+    assert s1["released_alert"]["sent"] is True
+    assert sent_alerts == [
+        (
+            "model_released",
+            "订阅已开放 antigravity-oauth 的 gemini-4-neon-xhigh，核对档位后将其设为可见并去掉 awaiting_release 标记",
+        )
+    ]
+
+    # Second run does not repeat.
+    s2, rc2 = watch_cli.run_watch(
+        state_dir=state_dir,
+        check_report=report,
+        alert_sender=sender_spy,
+        now_epoch=1_763_503_600.0,
+    )
+    assert rc2 == 0
+    assert s2["released_alert"]["sent"] is False
+    assert len(sent_alerts) == 1
+
+    # Generic prefix derivation check.
+    assert watch_svc._awaiting_release_prefix("gemini-4-neon-low") == "gemini-4-neon"
+    assert watch_svc._awaiting_release_prefix("claude-opus-6-0-high") == "claude-opus-6-0"
+    assert watch_svc._awaiting_release_prefix("gpt-6.3") == "gpt-6.3"
+
+
+@pytest.mark.asyncio
+async def test_hidden_awaiting_model_without_display_name_still_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.llm import native_catalog
+
+    LLM._model_config = None
+    mc = ModelConfig()
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-holder-1")
+    monkeypatch.setattr(
+        pm_service,
+        "_resolve_credential",
+        create_autospec(
+            pm_service._resolve_credential,
+            return_value=pm_service.Credential(api_key="ag-tok", holder="antigravity-oauth"),
+        ),
+    )
+    upstream = [
+        native_catalog.UpstreamModel(id=str(entry["model_id"]), display_name=str(entry["model_id"]))
+        for key, entry in mc.llm_config.items()
+        if isinstance(entry, dict)
+        and entry.get("provider") == "antigravity-oauth"
+        and entry.get("visible")
+    ]
+    upstream.append(native_catalog.UpstreamModel(id="gemini-4-neon-low", display_name=None, internal=True))
+    monkeypatch.setattr(
+        native_catalog,
+        "fetch_antigravity_models",
+        create_autospec(native_catalog.fetch_antigravity_models, return_value=upstream),
+    )
+    result = await watch_svc._fetch_antigravity_available_models("pm-holder-1", mc)
+    other_ids = {item["id"] for item in (result.get("others") or [])}
+    ready = set(result.get("ready") or [])
+    assert "gemini-4-neon-low" in other_ids or "gemini-4-neon-low-oauth" in ready
+
+
+def test_native_diff_does_not_mark_awaiting_release_as_deprecated() -> None:
+    from src.dalton.llm import native_catalog
+
+    llm_config = {
+        "gemini-4-neon-low-oauth": {"provider": "antigravity-oauth", "model_id": "gemini-4-neon-low"},
+        "gemini-old-oauth": {"provider": "antigravity-oauth", "model_id": "gemini-old"},
+    }
+    listing = native_catalog.ProviderListing(
+        provider="antigravity-oauth",
+        display_name="Antigravity",
+        status="ok",
+        models=[native_catalog.UpstreamModel(id="gemini-4-hydrogen-low", display_name="H")],
+    )
+    listings = {p: listing for p in native_catalog.NATIVE_LISTING_PROVIDERS if p == "antigravity-oauth"}
+    diff = native_catalog.build_native_diff(
+        listings, llm_config, set(), awaiting_release_keys={"gemini-4-neon-low-oauth"}
+    )
+    keys = {d["key"] for d in diff["deprecated"]}
+    assert "gemini-4-neon-low-oauth" not in keys
+    assert "gemini-old-oauth" in keys

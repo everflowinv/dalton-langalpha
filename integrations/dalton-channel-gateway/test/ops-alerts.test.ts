@@ -436,3 +436,47 @@ describe("ops-alerts model_unavailable", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("ops-alerts model_released", () => {
+  it("renders provider and models into default and configured templates", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-released-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_r1" }));
+    const resDefault = await handleOpsAlert({
+      body: {
+        code: "model_released",
+        provider: "antigravity-oauth",
+        models: "gemini-4-neon-low-oauth, gemini-4-neon-xhigh",
+      },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resDefault.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith(
+      "feishu:user:ou_ops_a",
+      "订阅已开放 antigravity-oauth 的 gemini-4-neon-low-oauth, gemini-4-neon-xhigh，核对档位后将其设为可见并去掉 awaiting_release 标记",
+    );
+
+    const badProvider = await handleOpsAlert({
+      body: { code: "model_unavailable", provider: "antigravity-oauth", detail: "x" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(badProvider.status).toBe(400);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
