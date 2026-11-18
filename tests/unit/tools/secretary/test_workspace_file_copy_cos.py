@@ -17,12 +17,11 @@ from unittest.mock import create_autospec
 
 import pytest
 
-from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 import src.server.database.workspace as ws_db
+from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+from src.server.services.workspace_file_containment import ContainedFile
 from src.server.utils.secret_redactor import SecretRedactor
 from src.tools.secretary import tools as secretary_tools
-
-
 from src.tools.secretary.tools import (
     workspace_file_copy_cos,
     workspace_file_read_cos,
@@ -163,7 +162,7 @@ def _install(
     )
 
     async def _read_contained_target(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", XLSX_BYTES
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(XLSX_BYTES), XLSX_BYTES)
 
     monkeypatch.setattr(
         files_crud,
@@ -205,8 +204,8 @@ def _install_mirror_source(
     *,
     file_size: int = len(XLSX_BYTES),
 ):
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
 
     record = {
         "path": "ant_sheet_update/Anthropic_sheet.xlsx",
@@ -313,8 +312,8 @@ async def test_oversize_file_is_refused_with_the_limit(
     bytes are never fetched."""
     _install(monkeypatch, source_row=COLLEAGUE_ROW)
 
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
 
     record = {"path": "big.xlsx", "is_binary": True, "file_size": 60 * 1024 * 1024}
     monkeypatch.setattr(
@@ -352,8 +351,8 @@ async def test_mirror_text_file_copy_is_refused_nothing_written(
     bytes are not even fetched."""
     sandbox = _install(monkeypatch, source_row=COLLEAGUE_ROW)
 
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
 
     record = {
         "path": "logs/ANT_run.log",
@@ -418,6 +417,7 @@ async def test_live_read_413_names_the_channel_limit_not_missing(
     sandbox = _install(monkeypatch, source_row={**COLLEAGUE_ROW, "status": "running"})
 
     from fastapi import HTTPException
+
     from src.server.app.workspace_files import crud as files_crud
 
     async def _too_large(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
@@ -455,6 +455,7 @@ async def test_live_read_413_on_ssh_names_the_lower_channel_limit(
     sandbox.runtime = runtime
 
     from fastapi import HTTPException
+
     from src.server.app.workspace_files import crud as files_crud
 
     async def _too_large(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
@@ -530,8 +531,8 @@ async def test_text_file_still_reads_through_read_file(
     redacted content, with no copy involved."""
     _install(monkeypatch, source_row=COLLEAGUE_ROW)
 
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
     from src.server.utils import secret_redactor
 
     record = {
@@ -592,8 +593,9 @@ async def test_gbk_csv_is_refused_on_mirror_and_live_nothing_written(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
 
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "exports/holdings_gbk.csv",
@@ -614,7 +616,7 @@ async def test_gbk_csv_is_refused_on_mirror_and_live_nothing_written(
     monkeypatch.setattr(_shared, "http_file_bytes", http_bytes)
 
     async def _read_gbk(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", gbk_csv
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(gbk_csv), gbk_csv)
 
     files_crud._read_contained_target.side_effect = _read_gbk
 
@@ -647,8 +649,9 @@ async def test_pdf_with_owner_vault_secret_is_refused_on_mirror_and_live(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "memo/secret_deck.pdf",
@@ -672,7 +675,7 @@ async def test_pdf_with_owner_vault_secret_is_refused_on_mirror_and_live(
     )
 
     async def _read_pdf(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", pdf_bytes
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(pdf_bytes), pdf_bytes)
 
     files_crud._read_contained_target.side_effect = _read_pdf
 
@@ -707,8 +710,9 @@ async def test_xlsx_with_owner_vault_secret_in_zip_member_is_refused_on_mirror_a
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "ant_sheet_update/Anthropic_sheet.xlsx",
@@ -732,7 +736,7 @@ async def test_xlsx_with_owner_vault_secret_in_zip_member_is_refused_on_mirror_a
     )
 
     async def _read_secret_xlsx(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", secret_xlsx
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(secret_xlsx), secret_xlsx)
 
     files_crud._read_contained_target.side_effect = _read_secret_xlsx
 
@@ -771,8 +775,8 @@ async def test_disallowed_archive_and_pickle_extensions_are_refused_on_mirror_an
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
 
     record = {"path": bad_path, "is_binary": True, "file_size": 256}
     monkeypatch.setattr(
@@ -824,8 +828,9 @@ async def test_xlsx_with_xml_escaped_secret_is_refused_on_mirror_and_live(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
     from src.server.utils import secret_redactor
 
     secret_redactor.get_vault_secrets_for_redaction.return_value = {
@@ -853,7 +858,7 @@ async def test_xlsx_with_xml_escaped_secret_is_refused_on_mirror_and_live(
     )
 
     async def _read_escaped_xlsx(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", escaped_xlsx
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(escaped_xlsx), escaped_xlsx)
 
     files_crud._read_contained_target.side_effect = _read_escaped_xlsx
 
@@ -928,8 +933,9 @@ async def test_flate_compressed_pdf_with_secret_is_refused_and_clean_pdf_copies(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     current_bytes = {"data": secret_pdf}
 
@@ -961,7 +967,7 @@ async def test_flate_compressed_pdf_with_secret_is_refused_and_clean_pdf_copies(
     )
 
     async def _read_pdf(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", current_bytes["data"]
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(current_bytes["data"]), current_bytes["data"])
 
     files_crud._read_contained_target.side_effect = _read_pdf
 
@@ -1001,8 +1007,8 @@ async def test_short_vault_values_under_8_chars_do_not_false_positive_on_pdf_png
     are below MIN_REDACT_SECRET_LEN (8) and do not cause normal PDF, PNG, or
     xlsx files containing those substrings to be rejected."""
     sandbox = _install(monkeypatch, source_row=COLLEAGUE_ROW)
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
     from src.server.utils import secret_redactor
 
     secret_redactor.get_vault_secrets_for_redaction.return_value = {
@@ -1083,8 +1089,9 @@ async def test_docx_with_nested_zip_member_is_refused_on_mirror_and_live(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "memo/briefing.docx",
@@ -1108,7 +1115,7 @@ async def test_docx_with_nested_zip_member_is_refused_on_mirror_and_live(
     )
 
     async def _read_docx(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", docx_bytes
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(docx_bytes), docx_bytes)
 
     files_crud._read_contained_target.side_effect = _read_docx
 
@@ -1139,8 +1146,9 @@ async def test_gzip_with_secret_renamed_to_png_is_refused_on_mirror_and_live(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "charts/a.png",
@@ -1164,7 +1172,7 @@ async def test_gzip_with_secret_renamed_to_png_is_refused_on_mirror_and_live(
     )
 
     async def _read_disguised(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", disguised_gz
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(disguised_gz), disguised_gz)
 
     files_crud._read_contained_target.side_effect = _read_disguised
 
@@ -1188,8 +1196,8 @@ async def test_normal_png_jpeg_xlsx_and_pdf_copy_successfully(
     """Round 5 item 3: normal PNG, JPEG, xlsx, and PDF files with matching
     headers and no secrets copy cleanly."""
     sandbox = _install(monkeypatch, source_row=COLLEAGUE_ROW)
-    from src.server.services.persistence import file as persistence_file
     from src.server.app.workspace_files import _shared
+    from src.server.services.persistence import file as persistence_file
 
     samples = {
         "charts/plot.png": b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
@@ -1271,8 +1279,9 @@ async def test_pdf_with_ascii85_flate_filter_or_escaped_parens_secret_is_refused
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
     from src.server.utils import secret_redactor
 
     secret_redactor.get_vault_secrets_for_redaction.return_value = {
@@ -1310,7 +1319,7 @@ async def test_pdf_with_ascii85_flate_filter_or_escaped_parens_secret_is_refused
     )
 
     async def _read_pdf(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", current_bytes["data"]
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(current_bytes["data"]), current_bytes["data"])
 
     files_crud._read_contained_target.side_effect = _read_pdf
 
@@ -1344,8 +1353,9 @@ async def test_corrupt_pdf_is_refused_with_unreadable_error(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "memo/corrupt.pdf",
@@ -1369,7 +1379,7 @@ async def test_corrupt_pdf_is_refused_with_unreadable_error(
     )
 
     async def _read_corrupt(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", corrupt_pdf
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(corrupt_pdf), corrupt_pdf)
 
     files_crud._read_contained_target.side_effect = _read_corrupt
 
@@ -1429,8 +1439,9 @@ async def test_pptx_and_docx_with_clean_embedded_xlsx_chart_copy_successfully(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     samples = {
         "decks/q4_review.pptx": pptx_bytes,
@@ -1462,7 +1473,7 @@ async def test_pptx_and_docx_with_clean_embedded_xlsx_chart_copy_successfully(
     )
 
     async def _read_sample(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", samples[path]
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(samples[path]), samples[path])
 
     files_crud._read_contained_target.side_effect = _read_sample
 
@@ -1501,8 +1512,9 @@ async def test_pptx_or_docx_with_secret_in_embedded_xlsx_is_refused(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "decks/secret_chart.pptx",
@@ -1526,7 +1538,7 @@ async def test_pptx_or_docx_with_secret_in_embedded_xlsx_is_refused(
     )
 
     async def _read_pptx(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", pptx_bytes
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(pptx_bytes), pptx_bytes)
 
     files_crud._read_contained_target.side_effect = _read_pptx
 
@@ -1563,8 +1575,9 @@ async def test_docx_with_embedded_ole_object_is_refused(
     sandbox = _install(
         monkeypatch, source_row={**COLLEAGUE_ROW, "status": source_status}
     )
+    from src.server.app.workspace_files import _shared
+    from src.server.app.workspace_files import crud as files_crud
     from src.server.services.persistence import file as persistence_file
-    from src.server.app.workspace_files import _shared, crud as files_crud
 
     record = {
         "path": "memo/with_ole.docx",
@@ -1588,7 +1601,7 @@ async def test_docx_with_embedded_ole_object_is_refused(
     )
 
     async def _read_docx(sandbox_: Any, path: str, work_dir: str, previous_dirs=()):
-        return f"{work_dir.rstrip('/')}/{path.lstrip('/')}", docx_bytes
+        return ContainedFile(f"{work_dir.rstrip('/')}/{path.lstrip('/')}", len(docx_bytes), docx_bytes)
 
     files_crud._read_contained_target.side_effect = _read_docx
 
