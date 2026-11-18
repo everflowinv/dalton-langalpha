@@ -755,7 +755,9 @@ def test_t4_manifest_and_payload_source(tmp_path: Path) -> None:
     assert entry.enabled is False
     assert entry.notify_enabled is False
     assert entry.secret_names == ["INTERNAL_SERVICE_TOKEN"]
-    assert entry.env == {"DALTON_BACKEND_URL": "http://127.0.0.1:8000"}
+    assert entry.env == {
+        "DALTON_BACKEND_URL": "http://127.0.0.1:8000",
+    }
     assert entry.timeout_seconds == 900
     assert entry.command_argv == [
         "bash",
@@ -775,3 +777,29 @@ def test_t4_manifest_and_payload_source(tmp_path: Path) -> None:
     )
     assert spec["command_argv"] == entry.command_argv
     assert spec["cwd"] == str(tmp_path)
+
+
+def test_default_state_dir_follows_pointer_file(tmp_path, monkeypatch) -> None:
+    """State dir priority: DALTON_USAGE_STATE_DIR env -> ~/.config/dalton/usage-state-dir -> ~/.openclaw/usage-accounting."""
+    import importlib
+
+    scripts = Path(__file__).resolve().parents[3] / "scripts/dalton/openclaw_overlays/skills/model-usage-cost/scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    cli = importlib.import_module("model_usage_cost_cli")
+    usage_state = importlib.import_module("usage_state")
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("DALTON_USAGE_STATE_DIR", raising=False)
+    monkeypatch.delenv("DALTON_USAGE_STATE_POINTER_FILE", raising=False)
+
+    legacy = fake_home / ".openclaw" / "usage-accounting"
+    assert cli.default_state_dir() == legacy  # no pointer -> legacy dir
+
+    new_dir = tmp_path / "new"
+    usage_state.write_usage_state_pointer(new_dir)
+    assert cli.default_state_dir() == new_dir.resolve()  # pointer -> pointed dir
+
+    monkeypatch.setenv("DALTON_USAGE_STATE_DIR", str(tmp_path / "x"))
+    assert cli.default_state_dir() == tmp_path / "x"  # env overrides pointer
