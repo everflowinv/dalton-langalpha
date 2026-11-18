@@ -3970,6 +3970,7 @@ class TestBridgeResearchParamsAndTranscriptGuards:
         # 3. Real data_gateway.py:268 business no-match shape (status="no_match", data.reason="alphaengine_no_match",
         # data.alphaengine_error=None, names_tried=[...], without transcripts)
         # must return ok=True and empty_reason="no_matching_transcripts", NOT be treated as an error.
+        bridge._get_ae_search_breaker().record_success()
         nomatch_upstream = {
             "ok": False,
             "status": "no_match",

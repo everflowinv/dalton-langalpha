@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import create_autospec
 
 import httpx
@@ -49,6 +50,10 @@ def _make_bridge(
     monkeypatch.setenv(
         "DALTON_ALPHAENGINE_USAGE_FILE",
         str(tmp_path / "alphaengine_usage.jsonl"),
+    )
+    monkeypatch.setenv(
+        "DALTON_BRIDGE_USAGE_FILE",
+        str(tmp_path / "bridge-usage.json"),
     )
     monkeypatch.setenv("DALTON_BRIDGE_MAX_INFLIGHT", str(max_inflight))
     cfg = rb.BridgeConfig()
@@ -164,7 +169,7 @@ def test_key_normalization_case_nfkc_whitespace_order_filters_fresh_timeout() ->
     # `fresh` is stripped from upstream arguments
     assert "fresh" not in (p1.upstream_arguments.get("params") or {})
 
-    # Query case IS preserved -> lowercase differs from mixed case
+    # v4 lowercases query in cache_key while preserving caller case in upstream_arguments and v3 legacy key
     p_lower = ae_cache.prepare_alphaengine_search_request(
         {
             "route": "alphaengine",
@@ -177,7 +182,8 @@ def test_key_normalization_case_nfkc_whitespace_order_filters_fresh_timeout() ->
         },
         op=ae_cache.OP_SEARCH_LIBRARY,
     )
-    assert p_lower.cache_key != p1.cache_key
+    assert p_lower.cache_key == p1.cache_key
+    assert p_lower.legacy_cache_key != p1.legacy_cache_key
     assert p1.upstream_arguments["query"] == "NVDA Q4 CapEx"
     assert p_lower.upstream_arguments["query"] == "nvda q4 capex"
 
@@ -196,7 +202,7 @@ def test_key_normalization_case_nfkc_whitespace_order_filters_fresh_timeout() ->
     )
     assert p_reordered.cache_key != p1.cache_key
 
-    # Filter params differ -> different key; non-code arrays preserve order
+    # Filter params differ -> different key; v4 sorts & dedups keyword/name filter arrays too
     p_filter_diff = ae_cache.prepare_alphaengine_search_request(
         {
             "route": "alphaengine",
@@ -227,7 +233,8 @@ def test_key_normalization_case_nfkc_whitespace_order_filters_fresh_timeout() ->
         },
         op=ae_cache.OP_SEARCH_LIBRARY,
     )
-    assert p_order_a.cache_key != p_order_b.cache_key
+    assert p_order_a.cache_key == p_order_b.cache_key
+    assert p_order_a.legacy_cache_key != p_order_b.legacy_cache_key
 
 
 # ------------------------------------------------------------------ 2. Cross-hit & limit slicing
@@ -1940,12 +1947,12 @@ async def test_r3_1_read_and_register_atomic_inside_shared_task(
     get_count = 0
 
     async def _get_race(
-        cache_key: str, base_key: str, req_limit: int | None, *, op: str
+        cache_key: str, base_key: str, req_limit: int | None, *, op: str, **kwargs: Any
     ) -> tuple[ae_cache.CacheHit | None, bool]:
         nonlocal get_count
         get_count += 1
         call_no = get_count
-        res = await orig_get(cache_key, base_key, req_limit, op=op)
+        res = await orig_get(cache_key, base_key, req_limit, op=op, **kwargs)
         if call_no == 1:
             first_get_paused.set()
             await release_first_get.wait()
@@ -2508,7 +2515,7 @@ async def test_r4_2_legacy_supervisor_http_bypasses_daemon_env_and_bridge_clears
     assert (entries[2]["user"], entries[2]["workspace"], entries[2]["thread"]) == ("alice", "ws-a", "th-a")
 
 
-def test_r4_3_query_normalization_preserves_case_in_key_and_upstream() -> None:
+def test_r4_3_query_normalization_preserves_case_in_upstream_and_v3_lowercases_v4() -> None:
     p_full = ae_cache.prepare_alphaengine_search_request(
         {"route": "alphaengine", "operation": "search_library", "query": "  ＮＶＤＡ\tＡＩ  "},
         op=ae_cache.OP_SEARCH_LIBRARY,
@@ -2523,7 +2530,8 @@ def test_r4_3_query_normalization_preserves_case_in_key_and_upstream() -> None:
     )
     assert p_full.upstream_arguments["query"] == "NVDA AI"
     assert p_full.cache_key == p_ascii.cache_key
-    assert p_lower.cache_key != p_ascii.cache_key
+    assert p_lower.cache_key == p_ascii.cache_key
+    assert p_lower.legacy_cache_key != p_ascii.legacy_cache_key
     assert p_lower.upstream_arguments["query"] == "nvda ai"
 
 
@@ -2754,3 +2762,1979 @@ def test_r4c_array_cursor_is_forwarded_unchanged() -> None:
     )
     assert plan.cacheable is False
     assert plan.upstream_arguments["params"]["cursor"] == cursor
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 tests: circuit breaker, upstream_unavailable stale, v4 + v3 migration, report
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p2_circuit_breaker_stale_fallback_fast_fail_backoff_reset_read_and_healthz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    wall_box = [10_000.0]
+    mono_box = [1_000.0]
+    cache._now_fn = lambda: wall_box[0]
+    cache._today_fn = lambda: "2026-11-18"
+    breaker = ae_cache.AlphaEngineSearchCircuitBreaker(now_fn=lambda: mono_box[0])
+    bridge._ae_search_breaker = breaker
+
+    upstream_calls: list[dict[str, Any]] = []
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        args = req["params"]["arguments"]
+        upstream_calls.append(dict(args))
+        op = args.get("operation")
+        if op == "get_document":
+            return [
+                _mcp_reply(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "data": {
+                            "structuredContent": {
+                                "metadata": {"doc_id": args["params"]["doc_id"]},
+                                "content_field": "auto",
+                                "returned_chars": 10,
+                                "text": "doc body",
+                                "complete": True,
+                            }
+                        },
+                    },
+                )
+            ]
+        return [_mcp_reply(req["id"], _ae_results_payload(2, has_more=False))]
+
+    rpc_double = create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    monkeypatch.setattr(bridge, "_run_stdio_rpc", rpc_double)
+
+    # 1. Populate cache for query "NVDA"
+    r_seed = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-seed",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA"}},
+        ),
+        timeout=5.0,
+    )
+    assert json.loads(r_seed["result"]["content"][0]["text"])["ok"] is True
+    assert len(upstream_calls) == 1
+
+    # Advance wall clock past 2h TTL (still within 7d retention)
+    wall_box[0] += 3 * 3600
+
+    # 2. Upstream returns quota/rate-limit error on uncached query "AAPL" -> trips breaker (60s)
+    async def _quota_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        args = req["params"]["arguments"]
+        upstream_calls.append(dict(args))
+        if args.get("operation") == "get_document":
+            return [
+                _mcp_reply(
+                    req["id"],
+                    {
+                        "ok": True,
+                        "status": "ok",
+                        "data": {
+                            "structuredContent": {
+                                "metadata": {"doc_id": args["params"]["doc_id"]},
+                                "content_field": "auto",
+                                "returned_chars": 8,
+                                "text": "ok read!",
+                                "complete": True,
+                            }
+                        },
+                    },
+                )
+            ]
+        return [
+            _mcp_reply(
+                req["id"],
+                {"ok": False, "status": "error", "error": "E_UPSTREAM_API: 无查看权限或额度已达上限"},
+                is_error=True,
+            )
+        ]
+
+    rpc_double.side_effect = _quota_rpc
+    r_trip1 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-trip-1",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "AAPL"}},
+        ),
+        timeout=5.0,
+    )
+    b_trip1 = json.loads(r_trip1["result"]["content"][0]["text"])
+    assert b_trip1["ok"] is False
+    assert b_trip1["error_category"] == "权限或额度"
+    assert breaker.is_open() is True
+    assert breaker.remaining_seconds() == pytest.approx(60.0)
+    assert breaker.snapshot()["trip_count"] == 1
+    assert len(upstream_calls) == 2
+
+    # 3. During open breaker:
+    #    (a) "NVDA" (expired cache exists) -> returns stale cache WITHOUT calling upstream!
+    r_stale = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-stale",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA"}},
+        ),
+        timeout=5.0,
+    )
+    b_stale = json.loads(r_stale["result"]["content"][0]["text"])
+    assert b_stale["ok"] is True
+    assert b_stale["stale"] is True
+    assert b_stale["stale_reason"] == "circuit_open"
+    assert b_stale["cached_at"] == ae_cache.iso_utc(10_000.0)
+    assert b_stale["_bridge_cache"]["status"] == "stale"
+    assert len(upstream_calls) == 2
+
+    #    (b) "MSFT" (no cache) -> fast-fails immediately WITHOUT calling upstream!
+    mono_box[0] += 15.0  # 45s remaining
+    r_fast = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-fast",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "MSFT"}},
+        ),
+        timeout=5.0,
+    )
+    b_fast = json.loads(r_fast["result"]["content"][0]["text"])
+    assert b_fast["ok"] is False
+    assert b_fast["error_category"] == "权限或额度"
+    assert "AlphaEngine 检索暂停约 45 秒（上次错误：权限或额度：" in b_fast["error"]
+    assert "无查看权限或额度已达上限" in b_fast["error"]
+    assert len(upstream_calls) == 2
+
+    #    (c) get_document (read) is UNAFFECTED by search breaker and calls upstream normally!
+    r_read = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-read",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "get_document", "params": {"doc_id": "99001122"}}},
+        ),
+        timeout=5.0,
+    )
+    b_read = json.loads(r_read["result"]["content"][0]["text"])
+    assert b_read["ok"] is True
+    assert len(upstream_calls) == 3
+
+    #    (d) /healthz outputs remaining_seconds and trip_count
+    ens_init = create_autospec(bridge.ensure_initialized, return_value={"protocolVersion": "2024-11-05"})
+    monkeypatch.setattr(bridge, "ensure_initialized", ens_init)
+    monkeypatch.setattr(bridge, "probe_xreach_version", create_autospec(bridge.probe_xreach_version, return_value={"ok": True}))
+    monkeypatch.setattr(bridge, "probe_tmeet_version", create_autospec(bridge.probe_tmeet_version, return_value={"ok": True}))
+    bridge.server_version = "1.5.0"
+
+    raw_healthz = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:8960\r\n\r\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(raw_healthz)
+    reader.feed_eof()
+    written_chunks: list[bytes] = []
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.write.side_effect = lambda data: written_chunks.append(data)
+
+    async def _noop_drain() -> None:
+        return None
+
+    writer.drain.side_effect = _noop_drain
+    await asyncio.wait_for(rb._handle_client(bridge, reader, writer), timeout=5.0)
+    http_body = b"".join(written_chunks).split(b"\r\n\r\n", 1)[1]
+    health_json = json.loads(http_body.decode("utf-8"))
+    cb_snap = health_json["alphaengine_search_circuit_breaker"]
+    assert cb_snap["open"] is True
+    assert cb_snap["remaining_seconds"] == pytest.approx(45.0)
+    assert cb_snap["trip_count"] == 1
+
+    # 4. Consecutive trips double duration (60 -> 120 -> 240 -> 480 -> 600 cap)
+    expected_durations = [120.0, 240.0, 480.0, 600.0, 600.0]
+    for idx, exp_dur in enumerate(expected_durations, start=2):
+        mono_box[0] += breaker.remaining_seconds() + 1.0
+        assert breaker.is_open() is False
+        await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"cb-trip-{idx}",
+                {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": f"Q{idx}"}},
+            ),
+            timeout=5.0,
+        )
+        assert breaker.remaining_seconds() == pytest.approx(exp_dur)
+        assert breaker.snapshot()["trip_count"] == idx
+
+    # 5. One upstream search success resets consecutive backoff back to 60s
+    mono_box[0] += breaker.remaining_seconds() + 1.0
+    rpc_double.side_effect = _fake_rpc
+    r_ok = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-recover",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "RECOVER"}},
+        ),
+        timeout=5.0,
+    )
+    assert json.loads(r_ok["result"]["content"][0]["text"])["ok"] is True
+    assert breaker.is_open() is False
+    assert breaker.snapshot()["consecutive_trips"] == 0
+
+    # Next quota failure starts at 60s again
+    rpc_double.side_effect = _quota_rpc
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cb-re-trip",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "RETRIP"}},
+        ),
+        timeout=5.0,
+    )
+    assert breaker.remaining_seconds() == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_p2_stale_fallback_on_upstream_unavailable_and_personal_scope_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    wall_box = [20_000.0]
+    cache._now_fn = lambda: wall_box[0]
+    cache._today_fn = lambda: "2026-11-18"
+
+    calls = 0
+
+    async def _ok_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return [_mcp_reply(requests[0]["id"], _ae_results_payload(3, has_more=False))]
+
+    rpc_double = create_autospec(bridge._run_stdio_rpc, side_effect=_ok_rpc)
+    monkeypatch.setattr(bridge, "_run_stdio_rpc", rpc_double)
+
+    # Seed normal query + personal meeting query
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "s-norm",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "TSM"}},
+        ),
+        timeout=5.0,
+    )
+    r_pers_1 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "s-pers-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "My 1on1",
+                    "params": {"meeting_scope": "personal"},
+                },
+            },
+        ),
+        timeout=5.0,
+    )
+    assert json.loads(r_pers_1["result"]["content"][0]["text"])["_bridge_cache"]["status"] == "bypass"
+    assert calls == 2
+
+    # Advance past 2h TTL (within 7d retention); upstream fails with 上游不可用
+    wall_box[0] += 4 * 3600
+
+    async def _unavail_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return [
+            _mcp_reply(
+                requests[0]["id"],
+                {"ok": False, "status": "error", "error": "E_UPSTREAM_RESPONSE: upstream HTTP 503"},
+                is_error=True,
+            )
+        ]
+
+    rpc_double.side_effect = _unavail_rpc
+    r_stale = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "s-stale-unavail",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "TSM"}},
+        ),
+        timeout=5.0,
+    )
+    b_stale = json.loads(r_stale["result"]["content"][0]["text"])
+    assert b_stale["ok"] is True
+    assert b_stale["stale"] is True
+    assert b_stale["stale_reason"] == "upstream_unavailable"
+    assert b_stale["cached_at"] == ae_cache.iso_utc(20_000.0)
+    assert b_stale["_bridge_cache"]["status"] == "stale"
+    assert len(b_stale["data"]["structuredContent"]["results"]) == 3
+    # 上游不可用 does NOT open the quota circuit breaker
+    assert bridge._get_ae_search_breaker().is_open() is False
+
+    # Personal meeting never cached -> fails upstream (never returns stale!)
+    r_pers_2 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "s-pers-2",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "My 1on1",
+                    "params": {"meeting_scope": "personal"},
+                },
+            },
+        ),
+        timeout=5.0,
+    )
+    b_pers_2 = json.loads(r_pers_2["result"]["content"][0]["text"])
+    assert b_pers_2["ok"] is False
+    assert b_pers_2["_bridge_cache"]["status"] == "bypass"
+
+
+@pytest.mark.asyncio
+async def test_p2_v4_key_normalization_and_v3_dual_read_write_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1. Case, fullwidth, whitespace, keyword list order/dups, and pure-date normalization
+    p_a = ae_cache.prepare_alphaengine_search_request(
+        {
+            "route": "alphaengine",
+            "operation": "search_library",
+            "query": "  ＮＶＤＡ\tＢｌａｃｋｗｅｌｌ   CapEx  ",
+            "start": "2026-11-01",
+            "end": "2026-11-17",
+            "limit": 10,
+            "params": {
+                "keywords": ["CoWoS", "  ＡＩ ", "cowos"],
+                "company_names": ["Beta", "Alpha", "Beta"],
+                "type_ids": [2, 1, 2],
+            },
+        },
+        op=ae_cache.OP_SEARCH_LIBRARY,
+    )
+    p_b = ae_cache.prepare_alphaengine_search_request(
+        {
+            "route": "alphaengine",
+            "operation": "search_library",
+            "query": "nvda blackwell capex",
+            "start": "2026/11/01",
+            "end": "20261117",
+            "limit": 10,
+            "params": {
+                "keywords": ["ai", "CoWoS"],
+                "company_names": ["Alpha", "Beta"],
+                "type_ids": [1, 2],
+            },
+        },
+        op=ae_cache.OP_SEARCH_LIBRARY,
+    )
+    assert p_a.cache_key == p_b.cache_key
+    assert p_a.base_key == p_b.base_key
+    assert p_a.date_from == "2026-11-01"
+    assert p_a.date_to == "2026-11-17"
+
+    # 2. v3 fallback read + automatic v4 write-back preserving original timestamps
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    wall_box = [50_000.0]
+    cache._now_fn = lambda: wall_box[0]
+    cache._today_fn = lambda: "2026-11-18"
+    await cache.initialize()
+
+    v3_args = {
+        "route": "alphaengine",
+        "operation": "search_library",
+        "query": "TSMC CoWoS",
+        "start": "2026-10-01",
+        "end": "2026-11-10",
+        "limit": 5,
+    }
+    plan = ae_cache.prepare_alphaengine_search_request(v3_args, op=ae_cache.OP_SEARCH_LIBRARY)
+    assert plan.cache_key != plan.legacy_cache_key
+
+    # Seed ONLY the v3 entry in SQLite
+    put_res = await cache.put(
+        cache_key=plan.legacy_cache_key,
+        base_key=plan.legacy_base_key,
+        op=plan.op,
+        user_scope="team",
+        req_limit=plan.req_limit,
+        result_count=2,
+        has_more=False,
+        payload=_ae_results_payload(2, has_more=False, prefix="v3_"),
+        date_to=plan.date_to,
+    )
+    assert put_res is not None
+    orig_fetched_at, orig_expires_at = put_res
+
+    upstream_mock = create_autospec(bridge._run_stdio_rpc)
+    monkeypatch.setattr(bridge, "_run_stdio_rpc", upstream_mock)
+
+    # Query with original v3 query ("TSMC CoWoS") under v4:
+    # v4 key misses, falls back to v3 key, hits without calling upstream, and writes v4 copy;
+    # subsequent lowercase query ("tsmc cowos") then hits the migrated v4 entry directly!
+    wall_box[0] += 100.0
+    r_hit = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "v3-mig",
+            {
+                "name": "research",
+                "arguments": dict(v3_args),
+            },
+        ),
+        timeout=5.0,
+    )
+    assert upstream_mock.call_count == 0
+    b_hit = json.loads(r_hit["result"]["content"][0]["text"])
+    assert b_hit["ok"] is True
+    assert b_hit["_bridge_cache"]["status"] == "hit"
+    assert b_hit["data"]["structuredContent"]["results"][0]["doc_id"].startswith("v3_")
+
+    # Verify a v4 row was written into SQLite with the original fetched_at / expires_at
+    import sqlite3
+
+    with sqlite3.connect(str(cache.db_path)) as conn:
+        v4_row = conn.execute(
+            "SELECT fetched_at, expires_at FROM ae_search_cache WHERE cache_key = ?",
+            (plan.cache_key,),
+        ).fetchone()
+    assert v4_row is not None
+    assert v4_row[0] == pytest.approx(orig_fetched_at)
+    assert v4_row[1] == pytest.approx(orig_expires_at)
+
+    # Now lowercase query hits the migrated v4 entry directly without touching v3 or upstream
+    r_hit_lower = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "v4-after-mig",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "tsmc cowos",
+                    "start": "2026-10-01",
+                    "end": "2026-11-10",
+                    "limit": 5,
+                },
+            },
+        ),
+        timeout=5.0,
+    )
+    assert upstream_mock.call_count == 0
+    assert json.loads(r_hit_lower["result"]["content"][0]["text"])["_bridge_cache"]["status"] == "hit"
+
+
+def test_p2_usage_report_failures_by_day_caller_ranking_hit_rate_and_breaker_trips(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        # 2026-11-17 (BJT): ws-heavy has 2 fails (1 quota + breaker trip, 1 upstream), 1 miss ok
+        {
+            "ts": "2026-11-17T06:00:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": False,
+            "error_category": "权限或额度",
+            "cache": "miss",
+            "upstream": True,
+            "workspace": "ws-heavy",
+            "user": "u1",
+            "breaker_tripped": True,
+        },
+        {
+            "ts": "2026-11-17T06:01:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": False,
+            "error_category": "上游不可用",
+            "cache": "miss",
+            "upstream": True,
+            "workspace": "ws-heavy",
+            "user": "u1",
+        },
+        {
+            "ts": "2026-11-17T06:02:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": True,
+            "error_category": "",
+            "cache": "hit",
+            "upstream": False,
+            "workspace": "ws-heavy",
+            "user": "u1",
+        },
+        # ws-light has 1 coalesced ok + 1 bypass (excluded from cacheable hit rate) + 1 personal_scope
+        {
+            "ts": "2026-11-17T07:00:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": True,
+            "error_category": "",
+            "cache": "coalesced",
+            "upstream": False,
+            "workspace": "",
+            "user": "u2",
+        },
+        {
+            "ts": "2026-11-17T07:05:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": True,
+            "error_category": "",
+            "cache": "bypass",
+            "upstream": True,
+            "workspace": "",
+            "user": "u2",
+        },
+        {
+            "ts": "2026-11-17T07:06:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": True,
+            "error_category": "",
+            "cache": "stale",
+            "upstream": False,
+            "workspace": "",
+            "user": "u2",
+            "personal_scope": True,
+        },
+    ]
+    summary = usage_report.summarize(entries)
+    assert summary["breaker_trips"] == 1
+    assert summary["failures_by_day"]["2026-11-17"] == {"权限或额度": 1, "上游不可用": 1}
+    # Cacheable searches: ws-heavy (miss, miss, hit) + u2 (coalesced) = 4; hits = hit + coalesced = 2 -> 0.5
+    assert summary["cacheable_search_stats"]["total"] == 4
+    assert summary["cacheable_search_stats"]["hits"] == 2
+    assert summary["cacheable_search_hit_rate"] == pytest.approx(0.5)
+
+    ranking = summary["caller_search_ranking"]
+    assert ranking[0]["caller"] == "ws-heavy"
+    assert ranking[0]["searches"] == 3
+    assert ranking[0]["failures"] == 2
+    assert ranking[0]["fail_rate"] == pytest.approx(round(2 / 3, 4))
+    assert ranking[1]["caller"] == "u2"
+    assert ranking[1]["searches"] == 3
+    assert ranking[1]["failures"] == 0
+
+    usage_report._print_report(summary)
+    out = capsys.readouterr().out
+    assert "可缓存检索命中率 50.0%" in out
+    assert "熔断触发 1 次" in out
+    assert "失败分布：上游不可用=1，权限或额度=1" in out
+    assert "ws-heavy [workspace]: 检索=3 失败=2 失败率=66.7%" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Round 2 tests: soft advice, first-open vs repeat read, query logs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p2_r2_company_search_soft_advice_and_non_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box = [1000.0]
+    bridge._ae_company_tracker = ae_cache.AlphaEngineCompanySearchTracker(
+        now_fn=lambda: mono_box[0]
+    )
+
+    upstream_calls = 0
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return [_mcp_reply(requests[0]["id"], _ae_results_payload(2, has_more=False))]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    )
+
+    caller = {"user": "u1", "workspace": "ws1", "thread": "th-adv"}
+
+    # 1 & 2 for NVDA -> no advice yet
+    r1 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "adv-1",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA"}},
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    assert "advice" not in json.loads(r1["result"]["content"][0]["text"])
+
+    r2 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "adv-2",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "英伟达 算力"}},
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    assert "advice" not in json.loads(r2["result"]["content"][0]["text"])
+
+    # Exact repeat of #2 (same keyword) -> hits cache, no advice because keyword is NOT different
+    r2_repeat = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "adv-2-rep",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "英伟达 算力"}},
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    assert "advice" not in json.loads(r2_repeat["result"]["content"][0]["text"])
+
+    # 3rd distinct keyword for NVDA within 30m -> executes normally AND returns advice!
+    r3 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "adv-3",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "Nvidia Blackwell"}},
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    b3 = json.loads(r3["result"]["content"][0]["text"])
+    assert b3["ok"] is True
+    assert len(b3["data"]["structuredContent"]["results"]) == 2
+    assert "请先从现有结果中挑选（本会话已检索这家公司 3 次）；需要新主题时再检索" == b3["advice"]
+
+    # Different company (TSM / 台积电) -> independent counter, no advice!
+    r_tsm = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "adv-tsm",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "台积电 CoWoS"}},
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    assert "advice" not in json.loads(r_tsm["result"]["content"][0]["text"])
+
+    # Unrecognized topic queries (e.g., AI Agent / 光模块) -> never counted, never trigger advice!
+    for idx, topic_q in enumerate(("AI Agent 商业化", "光模块 800G 需求", "算力网络 CAPEX", "液冷机柜方案")):
+        r_topic = await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"topic-{idx}",
+                {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": topic_q}},
+                caller_identity=caller,
+            ),
+            timeout=5.0,
+        )
+        assert "advice" not in json.loads(r_topic["result"]["content"][0]["text"])
+
+    # Workspace fallback when thread is empty, and 30m TTL expiration resets count
+    ws_caller = {"user": "u1", "workspace": "ws-only", "thread": ""}
+    for idx, q in enumerate(("宁德时代", "300750 电池", "CATL 储能")):
+        r_ws = await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"ws-{idx}",
+                {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": q}},
+                caller_identity=ws_caller,
+            ),
+            timeout=5.0,
+        )
+        body_ws = json.loads(r_ws["result"]["content"][0]["text"])
+        if idx < 2:
+            assert "advice" not in body_ws
+        else:
+            assert "已检索这家公司 3 次" in body_ws["advice"]
+
+    # Advance past 30m TTL -> expired entries pruned, next distinct NVDA search starts fresh (count 1)
+    mono_box[0] += 31 * 60
+    r_after_ttl = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "adv-expired",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "NVDA Rubin"}},
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    assert "advice" not in json.loads(r_after_ttl["result"]["content"][0]["text"])
+    assert upstream_calls >= 10
+
+
+@pytest.mark.asyncio
+async def test_p2_r2_get_document_first_open_vs_repeat_open_counting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+
+    async def _doc_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        args = req["params"]["arguments"]
+        doc_id = args["params"]["doc_id"]
+        offset = int(args["params"].get("offset") or 0)
+        return [
+            _mcp_reply(
+                req["id"],
+                {
+                    "ok": True,
+                    "status": "ok",
+                    "data": {
+                        "structuredContent": {
+                            "metadata": {"doc_id": doc_id},
+                            "content_field": "auto",
+                            "offset": offset,
+                            "returned_chars": 100,
+                            "text": "x" * 100,
+                            "complete": offset > 0,
+                        }
+                    },
+                },
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_doc_rpc)
+    )
+
+    # 1. First open of doc A (offset=0) -> first_open=True (counts toward quota)
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "doc-a-0",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "get_document", "params": {"doc_id": "doc_A", "offset": 0}}},
+        ),
+        timeout=5.0,
+    )
+    # 2. Pagination read of doc A (offset=30000) -> repeat (does NOT count toward quota)
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "doc-a-1",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "get_document", "params": {"doc_id": "doc_A", "offset": 30000}}},
+        ),
+        timeout=5.0,
+    )
+    # 3. Another open of doc A -> repeat (does NOT count toward quota)
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "doc-a-2",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "get_document", "params": {"doc_id": "alphaengine:doc_A"}}},
+        ),
+        timeout=5.0,
+    )
+    # 4. First open of doc B -> counts toward quota (calls=2)
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "doc-b-0",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "get_document", "params": {"doc_id": "doc_B"}}},
+        ),
+        timeout=5.0,
+    )
+
+    today_stats = bridge._read_usage_today()
+    assert today_stats["calls"] == 2
+    assert today_stats["first_open_calls"] == 2
+    assert today_stats["repeat_calls"] == 2
+    assert today_stats["total_calls"] == 4
+    assert today_stats["chars"] == 400
+
+    ledger_entries = usage_report.load_entries([bridge.cfg.alphaengine_usage_file])
+    assert [e["first_open"] for e in ledger_entries] == [True, False, False, True]
+    summary = usage_report.summarize(ledger_entries)
+    assert summary["read_first_open"] == 2
+    assert summary["read_repeat"] == 2
+
+
+@pytest.mark.asyncio
+async def test_p2_r2_team_query_log_excludes_personal_rotates_7d_0600_and_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    q_dir = tmp_path / "alphaengine_search_queries"
+    today_box = ["2026-11-18"]
+    bridge._ae_query_logger = ae_cache.AlphaEngineTeamQueryLogger(
+        q_dir, today_fn=lambda: today_box[0]
+    )
+
+    # Seed an 8-day-old file and a 5-day-old file to verify automatic 7-day cleanup
+    q_dir.mkdir(parents=True, exist_ok=True)
+    old_file = q_dir / "2026-11-10.jsonl"
+    recent_file = q_dir / "2026-11-13.jsonl"
+    old_file.write_text('{"query": "ancient"}\n', encoding="utf-8")
+    recent_file.write_text('{"query": "recent keep"}\n', encoding="utf-8")
+
+    async def _fake_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        return [_mcp_reply(requests[0]["id"], _ae_results_payload(2, has_more=False))]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fake_rpc)
+    )
+
+    # 1. Personal-scope queries MUST NOT be written to query log
+    for idx, p_params in enumerate((
+        {"meeting_scope": "personal"},
+        {"own_reservations_only": True},
+        {"document_categories": ["personal_meetings"]},
+    )):
+        await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"pers-q-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": f"SECRET_PERSONAL_QUERY_{idx}",
+                        "params": p_params,
+                    },
+                },
+                caller_identity={"user": "alice", "workspace": "ws1", "thread": "th-p"},
+            ),
+            timeout=5.0,
+        )
+
+    # 2. Team-scope queries ARE logged with 0600 permissions, and 8-day-old file is cleaned up
+    caller_1 = {"user": "alice", "workspace": "ws1", "thread": "th-team-1"}
+    for idx, q in enumerate(("NVDA Blackwell", "英伟达 CoWoS", "NVDA Blackwell")):
+        await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"team-q-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": q,
+                        "params": {"fresh": True} if idx == 2 else {},
+                    },
+                },
+                caller_identity=caller_1,
+            ),
+            timeout=5.0,
+        )
+
+    today_file = q_dir / "2026-11-18.jsonl"
+    assert today_file.is_file()
+    assert stat_mod.S_IMODE(today_file.stat().st_mode) == 0o600
+    assert stat_mod.S_IMODE(q_dir.stat().st_mode) == 0o700
+    assert not old_file.exists()
+    assert recent_file.exists()
+
+    written_text = today_file.read_text(encoding="utf-8")
+    assert "SECRET_PERSONAL_QUERY" not in written_text
+    assert "NVDA Blackwell" in written_text
+    assert "英伟达 CoWoS" in written_text
+
+    # 3. Usage report summarizes multi-search by session+company, repeated queries, and quota breakdown
+    ledger_entries = usage_report.load_entries([bridge.cfg.alphaengine_usage_file])
+    q_entries = usage_report.load_query_entries(q_dir)
+    summary = usage_report.summarize(ledger_entries, query_entries=q_entries)
+
+    assert summary["search_upstream_calls"] == 6
+    assert summary["multi_search_by_session_company"]
+    top_mc = summary["multi_search_by_session_company"][0]
+    assert top_mc["session"] == "th-team-1"
+    assert top_mc["company"] == "NVDA"
+    assert top_mc["count"] == 3
+    assert "NVDA Blackwell" in top_mc["queries"]
+    assert "英伟达 CoWoS" in top_mc["queries"]
+    assert summary["top_repeated_queries"][0] == {"query": "NVDA Blackwell", "count": 2}
+
+    usage_report._print_report(summary)
+    out = capsys.readouterr().out
+    assert "同一公司的多次检索排行（按会话和公司，前 15）：" in out
+    assert "th-team-1 / NVDA: 3 次" in out
+    assert "重复最多的查询文本（>1 次，前 15）：" in out
+    assert "2 次: NVDA Blackwell" in out
+
+
+@pytest.mark.asyncio
+async def test_p2_r2_single_company_search_rule_in_docs_plugin_and_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    ds_json = json.loads(
+        (repo_root / "scripts/dalton/research_runtime/config/data_sources.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    ae_entry = next(r for r in ds_json["routes"] if r["id"] == "alphaengine")
+    assert rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE in ae_entry["rules"]
+
+    plugin_json = json.loads((repo_root / "plugins/dalton_data/plugin.json").read_text(encoding="utf-8"))
+    srv_inst = plugin_json["extensions"]["ai.langalpha"]["servers"]["researchdata"]["instruction"]
+    assert srv_inst == rb.build_researchdata_plugin_instruction()
+    assert rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE in srv_inst
+
+    # Verify catalog() response carries the rule on alphaengine route too
+    bridge = _make_bridge(tmp_path, monkeypatch)
+
+    async def _cat_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        return [
+            _mcp_reply(
+                requests[0]["id"],
+                {"ok": True, "routes": [{"id": "alphaengine", "rules": []}]},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_cat_rpc)
+    )
+    resp = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "cat-ae", {"name": "catalog", "arguments": {"route": "alphaengine"}}
+        ),
+        timeout=5.0,
+    )
+    cat_body = json.loads(resp["result"]["content"][0]["text"])
+    assert rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE in cat_body["routes"][0]["rules"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Round 3 tests: review fixes (breaker signals, post-slot check,
+# caller-deadline stale fallback, pipe rule, pages_scanned, strict company,
+# date precision, per-route forwarded query logs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p2_r3_breaker_trigger_signals_reason_and_uncacheable_exemption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box = [1000.0]
+    breaker = ae_cache.AlphaEngineSearchCircuitBreaker(now_fn=lambda: mono_box[0])
+    bridge._ae_search_breaker = breaker
+
+    responses: list[dict[str, Any]] = []
+    upstream_calls: list[dict[str, Any]] = []
+
+    async def _rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        upstream_calls.append(dict(req["params"]["arguments"]))
+        reply_payload = responses.pop(0)
+        return [_mcp_reply(req["id"], reply_payload, is_error=not bool(reply_payload.get("ok")))]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_rpc)
+    )
+
+    # 1. Parameter errors (even containing "403") & non-quota auth errors NEVER trip breaker
+    non_tripping = [
+        {"ok": False, "status": "error", "error": "E_BAD_DATE: invalid id 403"},
+        {"ok": False, "status": "auth_expired", "error": "auth_expired: please re-login"},
+        {"ok": False, "status": "paid_source_not_allowed", "error": "paid source restricted"},
+        {"ok": False, "status": "forbidden", "error": "HTTP 403 Forbidden"},
+        {"ok": False, "status": "unauthorized", "error": "HTTP 401 Unauthorized"},
+    ]
+    for idx, err_payload in enumerate(non_tripping):
+        responses.append(err_payload)
+        resp = await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"nontrip-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": f"NT{idx}",
+                    },
+                },
+            ),
+            timeout=5.0,
+        )
+        body = json.loads(resp["result"]["content"][0]["text"])
+        assert body["ok"] is False
+        assert breaker.is_open() is False
+        if "E_BAD_DATE" in err_payload["error"]:
+            assert body["error_category"] == "参数错误"
+
+    # 2. Uncacheable requests (`mode=plan`, `cursor`, `meeting_scope=personal`) NEVER trip breaker on 429
+    for idx, extra_args in enumerate(
+        (
+            {"mode": "plan"},
+            {"params": {"cursor": "ae1:tok123"}},
+            {"params": {"meeting_scope": "personal"}},
+        )
+    ):
+        responses.append({"ok": False, "status": "error", "error": "HTTP 429 Too Many Requests"})
+        await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"uncacheable-429-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": f"UC{idx}",
+                        **extra_args,
+                    },
+                },
+            ),
+            timeout=5.0,
+        )
+        assert breaker.is_open() is False
+
+    # 3. Quota / rate-limit signals trip breaker AND fast-fail carries error category + excerpt
+    tripping_errors = [
+        {"ok": False, "status": "error", "error": "E_UPSTREAM_API: 无查看权限或额度已达上限"},
+        {"ok": False, "status": "error", "error": "HTTP 429 Too Many Requests"},
+        {"ok": False, "status": "quota_exceeded", "error": "quota_exceeded on backend"},
+        {"ok": False, "status": "rate_limited", "error": "rate_limited"},
+        {"ok": False, "status": "error", "error": "触发频率限制，请稍后再试"},
+    ]
+    for idx, err_payload in enumerate(tripping_errors):
+        responses.append(err_payload)
+        await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"trip-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": f"TR{idx}",
+                    },
+                },
+            ),
+            timeout=5.0,
+        )
+        assert breaker.is_open() is True
+
+        # Fast-fail on uncached cacheable query carries category + original error excerpt
+        r_ff = await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"ff-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": f"FF{idx}",
+                    },
+                },
+            ),
+            timeout=5.0,
+        )
+        b_ff = json.loads(r_ff["result"]["content"][0]["text"])
+        assert b_ff["ok"] is False
+        assert "AlphaEngine 检索暂停约" in b_ff["error"]
+        assert "上次错误：权限或额度：" in b_ff["error"]
+
+        # Uncacheable requests STILL reach upstream normally even while breaker is open!
+        before_cnt = len(upstream_calls)
+        responses.append(_ae_results_payload(1, has_more=False))
+        r_pers = await asyncio.wait_for(
+            bridge.handle_tools_call(
+                f"pers-open-{idx}",
+                {
+                    "name": "research",
+                    "arguments": {
+                        "route": "alphaengine",
+                        "operation": "search_library",
+                        "query": f"PERS{idx}",
+                        "params": {"meeting_scope": "personal"},
+                    },
+                },
+            ),
+            timeout=5.0,
+        )
+        assert json.loads(r_pers["result"]["content"][0]["text"])["ok"] is True
+        assert len(upstream_calls) == before_cnt + 1
+        assert breaker.is_open() is True  # personal success did not reset breaker either
+
+        # Expire current breaker window cleanly before testing next signal
+        mono_box[0] += breaker.remaining_seconds() + 1.0
+        breaker.record_success()
+
+
+@pytest.mark.asyncio
+async def test_p2_r3_breaker_rechecked_after_slot_and_releases_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch, max_inflight=1)
+    mono_box = [2000.0]
+    breaker = ae_cache.AlphaEngineSearchCircuitBreaker(now_fn=lambda: mono_box[0])
+    bridge._ae_search_breaker = breaker
+
+    rpc_calls: list[str] = []
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def _slot_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        q = requests[0]["params"]["arguments"]["query"]
+        rpc_calls.append(q)
+        if q == "Q1":
+            first_entered.set()
+            await asyncio.wait_for(release_first.wait(), timeout=2.0)
+            return [
+                _mcp_reply(
+                    requests[0]["id"],
+                    {"ok": False, "status": "error", "error": "E_UPSTREAM_API: 无查看权限或额度已达上限"},
+                    is_error=True,
+                )
+            ]
+        return [_mcp_reply(requests[0]["id"], _ae_results_payload(1, has_more=False))]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_slot_rpc)
+    )
+
+    # Start Q1 (holds the single concurrency slot)
+    t1 = asyncio.create_task(
+        bridge.handle_tools_call(
+            "slot-1",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "Q1"}},
+        )
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=2.0)
+
+    # Start Q2 while breaker is STILL closed -> passes outer check and waits on slot!
+    t2 = asyncio.create_task(
+        bridge.handle_tools_call(
+            "slot-2",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "Q2"}},
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    # Release Q1 -> fails with quota limit, trips breaker, releases slot
+    release_first.set()
+    r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=3.0)
+    b1 = json.loads(r1["result"]["content"][0]["text"])
+    b2 = json.loads(r2["result"]["content"][0]["text"])
+    assert b1["ok"] is False
+    assert b2["ok"] is False
+    assert "AlphaEngine 检索暂停约" in b2["error"]
+    # Post-slot check stopped Q2 from hitting upstream!
+    assert rpc_calls == ["Q1"]
+
+    # Confirm concurrency slot was cleanly released (uncacheable call acquires slot immediately)
+    r3 = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "slot-3",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "alphaengine",
+                    "operation": "search_library",
+                    "query": "Q3",
+                    "params": {"meeting_scope": "personal"},
+                },
+            },
+        ),
+        timeout=2.0,
+    )
+    assert json.loads(r3["result"]["content"][0]["text"])["ok"] is True
+    assert rpc_calls == ["Q1", "Q3"]
+
+
+@pytest.mark.asyncio
+async def test_p2_r3_caller_deadline_returns_stale_while_upstream_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    wall_box = [30_000.0]
+    cache._now_fn = lambda: wall_box[0]
+    cache._today_fn = lambda: "2026-11-18"
+    await cache.initialize()
+
+    args = {"route": "alphaengine", "operation": "search_library", "query": "SlowCoCapex"}
+    plan = ae_cache.prepare_alphaengine_search_request(args, op=ae_cache.OP_SEARCH_LIBRARY)
+    await cache.put(
+        cache_key=plan.cache_key,
+        base_key=plan.base_key,
+        op=plan.op,
+        user_scope="team",
+        req_limit=plan.req_limit,
+        result_count=1,
+        has_more=False,
+        payload={"ok": True, "status": "ok", "results": [{"doc_id": "stale-doc-1"}]},
+        date_to=plan.date_to,
+    )
+    # Expire TTL (remain inside 7d retention window)
+    wall_box[0] += 3 * 3600
+
+    upstream_started = asyncio.Event()
+    allow_upstream_finish = asyncio.Event()
+    upstream_finished = asyncio.Event()
+
+    async def _slow_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        upstream_started.set()
+        await asyncio.wait_for(allow_upstream_finish.wait(), timeout=3.0)
+        upstream_finished.set()
+        return [
+            _mcp_reply(
+                requests[0]["id"],
+                {"ok": True, "status": "ok", "results": [{"doc_id": "fresh-doc-99"}]},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_slow_rpc)
+    )
+
+    loop = asyncio.get_running_loop()
+    t_start = loop.time()
+    early_res = await asyncio.wait_for(
+        bridge._execute_alphaengine_cached_search(
+            req_id="dl-1",
+            op=ae_cache.OP_SEARCH_LIBRARY,
+            arguments=args,
+            caller_identity=None,
+            caller_timeout_s=0.32,
+            shared_timeout_s=5.0,
+            fanout=False,
+        ),
+        timeout=1.5,
+    )
+    elapsed = loop.time() - t_start
+    assert upstream_started.is_set()
+    assert elapsed < 0.45
+    assert early_res["ok"] is True
+    assert early_res["stale"] is True
+    assert early_res["stale_reason"] == "upstream_timeout"
+    assert early_res["cached_at"] == ae_cache.iso_utc(30_000.0)
+    assert early_res["payload"]["results"][0]["doc_id"] == "stale-doc-1"
+
+    # Background shared upstream task is still alive and finishes writing fresh cache
+    runners = list(bridge._get_singleflight_runners().values())
+    assert len(runners) == 1
+    allow_upstream_finish.set()
+    await asyncio.wait_for(upstream_finished.wait(), timeout=2.0)
+    await asyncio.wait_for(runners[0]["runner_task"], timeout=2.0)
+
+    # Next call immediately hits the fresh cache written by the background upstream task
+    hit_res = await asyncio.wait_for(
+        bridge._execute_alphaengine_cached_search(
+            req_id="dl-2",
+            op=ae_cache.OP_SEARCH_LIBRARY,
+            arguments=args,
+            caller_identity=None,
+            caller_timeout_s=5.0,
+            shared_timeout_s=5.0,
+            fanout=False,
+        ),
+        timeout=2.0,
+    )
+    assert hit_res["ok"] is True
+    assert hit_res["stale"] is False
+    assert hit_res["bridge_cache"]["status"] == "hit"
+    assert hit_res["payload"]["results"][0]["doc_id"] == "fresh-doc-99"
+
+    # Without a stale cache entry, deadline still raises _CachedSearchTimeoutError
+    allow_upstream_finish.clear()
+    with pytest.raises(rb._CachedSearchTimeoutError):
+        await asyncio.wait_for(
+            bridge._execute_alphaengine_cached_search(
+                req_id="dl-miss",
+                op=ae_cache.OP_SEARCH_LIBRARY,
+                arguments={"route": "alphaengine", "operation": "search_library", "query": "NoStaleKey"},
+                caller_identity=None,
+                caller_timeout_s=0.2,
+                shared_timeout_s=5.0,
+                fanout=False,
+            ),
+            timeout=1.5,
+        )
+    allow_upstream_finish.set()
+    for r in list(bridge._get_singleflight_runners().values()):
+        await asyncio.wait_for(r["runner_task"], timeout=2.0)
+
+
+def test_p2_r3_space_rule_no_keywords_and_description_length() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    assert "用空格隔开写在同一个查询里" in rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE
+    assert "keywords" not in rb.ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE
+
+    ds_json = json.loads(
+        (repo_root / "scripts/dalton/research_runtime/config/data_sources.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    ae_entry = next(r for r in ds_json["routes"] if r["id"] == "alphaengine")
+    ae_rules_text = "\n".join(ae_entry["rules"])
+    assert "用空格隔开写在同一个查询里" in ae_rules_text
+    assert "keywords" not in ae_rules_text
+
+    plugin_json = json.loads((repo_root / "plugins/dalton_data/plugin.json").read_text(encoding="utf-8"))
+    srv_inst = plugin_json["extensions"]["ai.langalpha"]["servers"]["researchdata"]["instruction"]
+    assert srv_inst == rb.build_researchdata_plugin_instruction()
+    # Guidepoint section mentions params.keywords, but AlphaEngine section before Guidepoint does not
+    ae_segment = srv_inst.split("Guidepoint 仅返回问答摘录")[0]
+    assert "keywords" not in ae_segment
+
+
+def test_p2_r3_usage_report_pages_scanned_and_definitions(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        # Transcript multi-page scan: counts as 5 search quota units
+        {
+            "ts": "2026-11-18T02:00:00+00:00",
+            "op": "search",
+            "operation": "transcript",
+            "ok": True,
+            "cache": "miss",
+            "upstream": True,
+            "pages_scanned": 5,
+            "workspace": "ws1",
+        },
+        # Regular upstream search without pages_scanned: counts as 1
+        {
+            "ts": "2026-11-18T02:01:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": True,
+            "cache": "miss",
+            "upstream": True,
+            "workspace": "ws1",
+        },
+        # Cached hit: 0 quota units consumed, 1 saved
+        {
+            "ts": "2026-11-18T02:02:00+00:00",
+            "op": "search",
+            "operation": "search_library",
+            "ok": True,
+            "cache": "hit",
+            "upstream": False,
+            "pages_scanned": 5,
+            "workspace": "ws1",
+        },
+    ]
+    summary = usage_report.summarize(entries)
+    assert summary["search_calls"] == 3
+    assert summary["search_upstream_calls"] == 6
+    assert summary["search_cache_saved"] == 1
+    assert summary["by_day"]["2026-11-18"]["search.upstream"] == 6
+
+    usage_report._print_report(summary)
+    out = capsys.readouterr().out
+    assert "检索次数=3" in out
+    assert "检索消耗额度=6" in out
+    assert "pages_scanned" in out
+
+
+def test_p2_r3_strict_company_recognition() -> None:
+    # Lowercase pure-ASCII ticker must NOT match; ambiguous bare words must NOT match
+    assert ae_cache.extract_companies_from_search("AI APP 商业化") == []
+    assert ae_cache.extract_companies_from_search("nvda Blackwell capex") == []
+    assert ae_cache.extract_companies_from_search("meta-analysis on ad spend") == []
+    assert ae_cache.extract_companies_from_search("META NOW UBER SNOW PATH") == []
+    assert ae_cache.extract_companies_from_search("ON ALL CAN CARS FAST REAL LOVE") == []
+    assert ae_cache.extract_companies_from_search("OPEN PLAY TEAM BOX LIFE ARM FUN") == []
+
+    # Uppercase non-ambiguous tickers and explicit ticker forms MUST match
+    assert ae_cache.extract_companies_from_search("NVDA Blackwell capex") == ["NVDA"]
+    assert ae_cache.extract_companies_from_search("$APP 财报") == ["APP"]
+    assert ae_cache.extract_companies_from_search("APP US 营收") == ["APP"]
+    assert ae_cache.extract_companies_from_search("APP.O 指引") == ["APP"]
+    assert ae_cache.extract_companies_from_search("AppLovin APP 业绩") == ["APP"]
+    assert ae_cache.extract_companies_from_search("Meta Platforms META") == ["META"]
+    assert ae_cache.extract_companies_from_search("$META 业绩") == ["META"]
+    assert ae_cache.extract_companies_from_search("Uber Technologies 业绩") == ["UBER"]
+    assert ae_cache.extract_companies_from_search("$NOW Q3") == ["NOW"]
+    assert ae_cache.extract_companies_from_search("APP", ticker="APP") == ["APP"]
+
+
+def test_p2_r3_date_precision_day_vs_utc_iso() -> None:
+    # Pure dates -> day precision
+    assert ae_cache.normalize_date_param("2026-11-01") == "2026-11-01"
+    assert ae_cache.normalize_date_param("2026/11/1") == "2026-11-01"
+    assert ae_cache.normalize_date_param("20261101") == "2026-11-01"
+
+    # Datetimes with time/tz -> canonical UTC ISO
+    assert ae_cache.normalize_date_param("2026-11-01T00:00:00Z") == "2026-11-01T00:00:00Z"
+    assert ae_cache.normalize_date_param("2026-11-01T08:00:00+08:00") == "2026-11-01T00:00:00Z"
+    assert ae_cache.normalize_date_param("2026-11-01 23:59:59") == "2026-11-01T23:59:59Z"
+
+    p_utc = ae_cache.prepare_alphaengine_search_request(
+        {"query": "TSMC", "start": "2026-11-01T00:00:00Z", "end": "2026-11-10T00:00:00Z"},
+        op=ae_cache.OP_SEARCH_LIBRARY,
+    )
+    p_bjt_equiv = ae_cache.prepare_alphaengine_search_request(
+        {"query": "TSMC", "start": "2026-11-01T08:00:00+08:00", "end": "2026-11-10T08:00:00+08:00"},
+        op=ae_cache.OP_SEARCH_LIBRARY,
+    )
+    p_different_time = ae_cache.prepare_alphaengine_search_request(
+        {"query": "TSMC", "start": "2026-11-01T23:59:59Z", "end": "2026-11-10T00:00:00Z"},
+        op=ae_cache.OP_SEARCH_LIBRARY,
+    )
+    p_day_only = ae_cache.prepare_alphaengine_search_request(
+        {"query": "TSMC", "start": "2026-11-01", "end": "2026-11-10"},
+        op=ae_cache.OP_SEARCH_LIBRARY,
+    )
+    assert p_utc.cache_key == p_bjt_equiv.cache_key
+    assert p_utc.cache_key != p_different_time.cache_key
+    assert p_utc.cache_key != p_day_only.cache_key
+
+
+@pytest.mark.asyncio
+async def test_p2_r3_query_log_records_actual_forwarded_route_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    q_dir = bridge.cfg.alphaengine_query_log_dir
+    bridge._ae_query_logger = ae_cache.AlphaEngineTeamQueryLogger(
+        q_dir, today_fn=lambda: "2026-11-18"
+    )
+    monkeypatch.setattr(rb, "_bridge_today", lambda: "2026-11-18")
+
+    async def _fanout_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        route = req["params"]["arguments"].get("route")
+        if route == "alphaengine":
+            return [_mcp_reply(req["id"], _ae_results_payload(1, has_more=False))]
+        if route == "guidepoint":
+            return [_mcp_reply(req["id"], {"ok": True, "status": "ok", "results": []})]
+        return [
+            _mcp_reply(
+                req["id"],
+                {"ok": True, "status": "ok", "results": [], "source_status": {"sales-notes": {"ok": True, "count": 0}}},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_fanout_rpc)
+    )
+
+    caller = {"user": "alice", "workspace": "ws1", "thread": "th-fan"}
+    resp = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "fanout-qlog",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "all",
+                    "operation": "search",
+                    "ticker": "NVDA",
+                    "query": "HBM",
+                    "limit": 80,
+                    "params": {"keywords": ["CoWoS", "Blackwell"], "recency_bias": 40},
+                },
+            },
+            caller_identity=caller,
+        ),
+        timeout=5.0,
+    )
+    assert json.loads(resp["result"]["content"][0]["text"])["ok"] is True
+
+    log_file = q_dir / "2026-11-18.jsonl"
+    assert log_file.is_file()
+    entries = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["query"] == "NVDA HBM"
+    assert entry["keywords"] == []
+    assert entry["params"]["limit"] == 50
+    assert "recency_bias" not in entry["params"]
+    assert entry["companies"] == ["NVDA"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Round 4 tests: transcript partial breaker, no-cancel after upstream,
+# bounded get_stale, fresh deadline behavior, upstream_pages_fetched, strict 429/text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p2_r4_transcript_partial_page_quota_error_trips_breaker_and_skips_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+    import importlib.util
+
+    gw_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "dalton"
+        / "research_runtime"
+        / "scripts"
+        / "data_gateway.py"
+    )
+    spec = importlib.util.spec_from_file_location("test_dg_r4", gw_path)
+    assert spec is not None and spec.loader is not None
+    dg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dg)
+
+    # 1. data_gateway.fetch_transcripts preserves page_errors when page 2 fails
+    page_calls = 0
+
+    def _fake_native(_route: dict[str, Any], _args: Any, _unwrap: bool) -> dict[str, Any]:
+        nonlocal page_calls
+        page_calls += 1
+        if page_calls == 1:
+            return {
+                "ok": True,
+                "data": {
+                    "structuredContent": {
+                        "results": [
+                            {
+                                "doc_id": "tr_1",
+                                "title": "NVIDIA Q3 2026 Earnings Call",
+                                "publish_time": "2026-11-18 10:00:00",
+                            }
+                        ],
+                        "has_more": True,
+                        "cursor": "cur-p2",
+                    }
+                },
+            }
+        return {
+            "ok": False,
+            "status": "error",
+            "error": "E_UPSTREAM_API: 无查看权限或额度已达上限",
+        }
+
+    monkeypatch.setattr(dg, "native_request", _fake_native)
+    monkeypatch.setattr(dg, "_ticker_company_name", lambda _t: "NVIDIA")
+    reg = {"routes": [{"id": "alphaengine"}]}
+    ns = argparse.Namespace(ticker="NVDA", query="", start="2026-01-01", end="2026-11-18", limit=10, timeout=30)
+    gw_out = dg.fetch_transcripts(reg, ns, "python3 data_gateway.py")
+    assert gw_out["ok"] is True
+    assert gw_out["status"] == "partial"
+    assert gw_out["page_errors"] == [{"page": 2, "error": "E_UPSTREAM_API: 无查看权限或额度已达上限"}]
+    assert gw_out["data"]["coverage"]["page_errors"] == gw_out["page_errors"]
+
+    # 2. Bridge receives this partial response: opens closed breaker, returns partial, does NOT write cache
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    mono_box = [1000.0]
+    breaker = ae_cache.AlphaEngineSearchCircuitBreaker(now_fn=lambda: mono_box[0])
+    bridge._ae_search_breaker = breaker
+
+    async def _tr_partial_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        return [_mcp_reply(requests[0]["id"], gw_out)]
+
+    monkeypatch.setattr(
+        bridge,
+        "_run_stdio_rpc",
+        create_autospec(bridge._run_stdio_rpc, side_effect=_tr_partial_rpc),
+    )
+
+    resp = await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "tr-partial-1",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "transcript",
+                    "ticker": "NVDA",
+                    "start": "2026-01-01",
+                    "end": "2026-11-18",
+                },
+            },
+        ),
+        timeout=5.0,
+    )
+    body = json.loads(resp["result"]["content"][0]["text"])
+    assert body["ok"] is True
+    assert body["status"] == "partial"
+    assert len(body["data"]["transcripts"]) == 1
+    assert breaker.is_open() is True
+
+    # Nothing written to cache for this key
+    plan = ae_cache.prepare_alphaengine_search_request(
+        {"route": "transcript", "ticker": "NVDA", "start": "2026-01-01", "end": "2026-11-18"},
+        op=ae_cache.OP_TRANSCRIPT,
+    )
+    hit, _ = await bridge._get_alphaengine_search_cache().get(
+        plan.cache_key, plan.base_key, plan.req_limit, op=plan.op
+    )
+    assert hit is None
+
+    # 3. An already-open breaker (consecutive_trips=2) is NOT reset by an arriving partial result
+    bridge2 = _make_bridge(tmp_path / "b2", monkeypatch)
+    mono2 = [5000.0]
+    breaker2 = ae_cache.AlphaEngineSearchCircuitBreaker(now_fn=lambda: mono2[0])
+    breaker2.record_quota_failure("权限或额度：init-1")
+    mono2[0] += 61.0
+    breaker2.record_quota_failure("权限或额度：init-2")
+    assert breaker2.is_open() is True
+    assert breaker2.snapshot()["consecutive_trips"] == 2
+    bridge2._ae_search_breaker = breaker2
+
+    async def _tr_partial_while_open(
+        requests: list[dict[str, Any]], timeout_s: float
+    ) -> list[dict[str, Any]]:
+        return [_mcp_reply(requests[0]["id"], gw_out)]
+
+    # Simulate breaker opening between enqueue and upstream completion (via post-slot race bypass)
+    monkeypatch.setattr(
+        bridge2,
+        "_run_stdio_rpc",
+        create_autospec(bridge2._run_stdio_rpc, side_effect=_tr_partial_while_open),
+    )
+    orig_is_open = breaker2.is_open
+    calls_open = [0]
+
+    def _open_after_dispatch() -> bool:
+        calls_open[0] += 1
+        if calls_open[0] <= 2:
+            return False
+        return orig_is_open()
+
+    monkeypatch.setattr(breaker2, "is_open", _open_after_dispatch)
+    resp2 = await asyncio.wait_for(
+        bridge2.handle_tools_call(
+            "tr-partial-open",
+            {
+                "name": "research",
+                "arguments": {
+                    "route": "transcript",
+                    "ticker": "NVDA",
+                    "start": "2026-01-01",
+                    "end": "2026-11-18",
+                },
+            },
+        ),
+        timeout=5.0,
+    )
+    assert json.loads(resp2["result"]["content"][0]["text"])["status"] == "partial"
+    assert orig_is_open() is True
+    assert breaker2.snapshot()["consecutive_trips"] == 2
+
+
+@pytest.mark.asyncio
+async def test_p2_r4_shared_task_not_cancelled_after_upstream_started_when_a_gets_stale_and_b_cancels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    wall_box = [40_000.0]
+    cache._now_fn = lambda: wall_box[0]
+    cache._today_fn = lambda: "2026-11-18"
+    await cache.initialize()
+
+    args = {"route": "alphaengine", "operation": "search_library", "query": "CancelKeepAlive"}
+    plan = ae_cache.prepare_alphaengine_search_request(args, op=ae_cache.OP_SEARCH_LIBRARY)
+    await cache.put(
+        cache_key=plan.cache_key,
+        base_key=plan.base_key,
+        op=plan.op,
+        user_scope="team",
+        req_limit=plan.req_limit,
+        result_count=1,
+        has_more=False,
+        payload={"ok": True, "status": "ok", "results": [{"doc_id": "stale-ab"}]},
+        date_to=plan.date_to,
+    )
+    wall_box[0] += 3 * 3600
+
+    upstream_started = asyncio.Event()
+    allow_finish = asyncio.Event()
+    upstream_cancelled = False
+
+    async def _rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        nonlocal upstream_cancelled
+        upstream_started.set()
+        try:
+            await asyncio.wait_for(allow_finish.wait(), timeout=3.0)
+        except asyncio.CancelledError:
+            upstream_cancelled = True
+            raise
+        return [
+            _mcp_reply(
+                requests[0]["id"],
+                {"ok": True, "status": "ok", "results": [{"doc_id": "fresh-ab"}]},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_rpc)
+    )
+
+    task_a = asyncio.create_task(
+        bridge._execute_alphaengine_cached_search(
+            req_id="ab-a",
+            op=ae_cache.OP_SEARCH_LIBRARY,
+            arguments=args,
+            caller_identity=None,
+            caller_timeout_s=0.3,
+            shared_timeout_s=5.0,
+            fanout=False,
+        )
+    )
+    await asyncio.wait_for(upstream_started.wait(), timeout=2.0)
+
+    task_b = asyncio.create_task(
+        bridge._execute_alphaengine_cached_search(
+            req_id="ab-b",
+            op=ae_cache.OP_SEARCH_LIBRARY,
+            arguments=args,
+            caller_identity=None,
+            caller_timeout_s=5.0,
+            shared_timeout_s=5.0,
+            fanout=False,
+        )
+    )
+    await asyncio.sleep(0.02)
+
+    # A gets stale cache before its tight deadline
+    res_a = await asyncio.wait_for(task_a, timeout=1.5)
+    assert res_a["ok"] is True
+    assert res_a["stale"] is True
+    assert res_a["payload"]["results"][0]["doc_id"] == "stale-ab"
+
+    # Now B (the last remaining waiter) cancels: runner must NOT be cancelled because upstream already started
+    task_b.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task_b, timeout=1.5)
+    assert upstream_cancelled is False
+
+    runners = list(bridge._get_singleflight_runners().values())
+    assert len(runners) == 1
+    assert not runners[0]["runner_task"].done()
+
+    # Let shared upstream complete and persist fresh result into cache
+    allow_finish.set()
+    await asyncio.wait_for(runners[0]["runner_task"], timeout=2.0)
+    assert upstream_cancelled is False
+
+    hit_after = await asyncio.wait_for(
+        bridge._execute_alphaengine_cached_search(
+            req_id="ab-c",
+            op=ae_cache.OP_SEARCH_LIBRARY,
+            arguments=args,
+            caller_identity=None,
+            caller_timeout_s=5.0,
+            shared_timeout_s=5.0,
+            fanout=False,
+        ),
+        timeout=2.0,
+    )
+    assert hit_after["bridge_cache"]["status"] == "hit"
+    assert hit_after["payload"]["results"][0]["doc_id"] == "fresh-ab"
+
+
+@pytest.mark.asyncio
+async def test_p2_r4_get_stale_bounded_by_caller_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    await cache.initialize()
+
+    allow_finish = asyncio.Event()
+
+    async def _slow_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        await asyncio.wait_for(allow_finish.wait(), timeout=3.0)
+        return [_mcp_reply(requests[0]["id"], _ae_results_payload(1, has_more=False))]
+
+    async def _blocked_get_stale(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(5.0)
+        return None
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_slow_rpc)
+    )
+    monkeypatch.setattr(cache, "get_stale", _blocked_get_stale)
+
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    with pytest.raises(rb._CachedSearchTimeoutError):
+        await asyncio.wait_for(
+            bridge._execute_alphaengine_cached_search(
+                req_id="stale-hang",
+                op=ae_cache.OP_SEARCH_LIBRARY,
+                arguments={"route": "alphaengine", "operation": "search_library", "query": "HangStale"},
+                caller_identity=None,
+                caller_timeout_s=0.3,
+                shared_timeout_s=5.0,
+                fanout=False,
+            ),
+            timeout=1.2,
+        )
+    elapsed = loop.time() - t0
+    assert elapsed < 0.8
+
+    allow_finish.set()
+    for r in list(bridge._get_singleflight_runners().values()):
+        await asyncio.wait_for(r["runner_task"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_p2_r4_fresh_true_skips_pre_deadline_stale_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+    cache = bridge._get_alphaengine_search_cache()
+    wall_box = [50_000.0]
+    cache._now_fn = lambda: wall_box[0]
+    cache._today_fn = lambda: "2026-11-18"
+    await cache.initialize()
+
+    args_fresh = {
+        "route": "alphaengine",
+        "operation": "search_library",
+        "query": "FreshSkipsDeadlineStale",
+        "params": {"fresh": True},
+    }
+    plan = ae_cache.prepare_alphaengine_search_request(args_fresh, op=ae_cache.OP_SEARCH_LIBRARY)
+    await cache.put(
+        cache_key=plan.cache_key,
+        base_key=plan.base_key,
+        op=plan.op,
+        user_scope="team",
+        req_limit=plan.req_limit,
+        result_count=1,
+        has_more=False,
+        payload={"ok": True, "status": "ok", "results": [{"doc_id": "old-doc"}]},
+        date_to=plan.date_to,
+    )
+    wall_box[0] += 3 * 3600
+
+    allow_finish = asyncio.Event()
+
+    async def _slow_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        await asyncio.wait_for(allow_finish.wait(), timeout=3.0)
+        return [_mcp_reply(requests[0]["id"], _ae_results_payload(1, has_more=False))]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_slow_rpc)
+    )
+
+    with pytest.raises(rb._CachedSearchTimeoutError):
+        await asyncio.wait_for(
+            bridge._execute_alphaengine_cached_search(
+                req_id="fresh-deadline",
+                op=ae_cache.OP_SEARCH_LIBRARY,
+                arguments=args_fresh,
+                caller_identity=None,
+                caller_timeout_s=0.25,
+                shared_timeout_s=5.0,
+                fanout=False,
+            ),
+            timeout=1.2,
+        )
+
+    allow_finish.set()
+    for r in list(bridge._get_singleflight_runners().values()):
+        await asyncio.wait_for(r["runner_task"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_p2_r4_upstream_pages_fetched_recorded_and_reported_for_direct_and_fanout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _make_bridge(tmp_path, monkeypatch)
+
+    async def _paged_rpc(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        req = requests[0]
+        route = req["params"]["arguments"].get("route")
+        if route in ("alphaengine",):
+            payload = _ae_results_payload(2, has_more=False)
+            payload["data"]["structuredContent"]["upstream_pages_fetched"] = 3
+            return [_mcp_reply(req["id"], payload)]
+        if route == "guidepoint":
+            return [_mcp_reply(req["id"], {"ok": True, "status": "ok", "results": []})]
+        return [
+            _mcp_reply(
+                req["id"],
+                {"ok": True, "status": "ok", "results": [], "source_status": {"sales-notes": {"ok": True, "count": 0}}},
+            )
+        ]
+
+    monkeypatch.setattr(
+        bridge, "_run_stdio_rpc", create_autospec(bridge._run_stdio_rpc, side_effect=_paged_rpc)
+    )
+
+    # 1. Direct search_library
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "pages-direct",
+            {"name": "research", "arguments": {"route": "alphaengine", "operation": "search_library", "query": "DirectPages"}},
+        ),
+        timeout=5.0,
+    )
+    # 2. route="all" fanout
+    await asyncio.wait_for(
+        bridge.handle_tools_call(
+            "pages-fanout",
+            {"name": "research", "arguments": {"route": "all", "operation": "search", "query": "FanoutPages"}},
+        ),
+        timeout=5.0,
+    )
+
+    entries = usage_report.load_entries([bridge.cfg.alphaengine_usage_file])
+    assert len(entries) == 2
+    assert all(e.get("pages_scanned") == 3 for e in entries)
+    summary = usage_report.summarize(entries)
+    assert summary["search_upstream_calls"] == 6
+
+
+def test_p2_r4_strict_breaker_text_signals() -> None:
+    # Ambiguous or unrelated mentions of 429 / 额度 MUST NOT trigger breaker
+    for err_text in ("doc 429 not valid", "套餐额度不含此源", "HTTP 403 Forbidden", "auth_expired"):
+        cat, _ = rb._classify_error_category_and_hint(
+            "research", "alphaengine", "search_library", {"error": err_text}
+        )
+        should_trip, _ = rb._classify_ae_search_breaker_signal(
+            cat, {"error": err_text}, {"error_message": err_text}
+        )
+        assert should_trip is False, f"Unexpected trip on {err_text!r}"
+
+    # Explicit HTTP 429 / quota exhaustion / rate-limit signals MUST trigger breaker
+    trigger_cases: list[dict[str, Any]] = [
+        {"error": "HTTP 429 Too Many Requests"},
+        {"error": "status 429"},
+        {"error": "status_code=429"},
+        {"status_code": 429, "error": "upstream throttled"},
+        {"error": "E_UPSTREAM_API: 无查看权限或额度已达上限"},
+        {"error": "当月检索额度已达上限"},
+        {"error": "触发频率限制，请稍后重试"},
+        {"status": "quota_exceeded", "error": "quota_exceeded"},
+        {"status": "rate_limited", "error": "rate_limited"},
+    ]
+    for probe in trigger_cases:
+        cat, _ = rb._classify_error_category_and_hint(
+            "research", "alphaengine", "search_library", dict(probe)
+        )
+        should_trip, reason = rb._classify_ae_search_breaker_signal(
+            cat, probe, {"error_message": str(probe.get("error") or "")}
+        )
+        assert should_trip is True, f"Expected trip on {probe!r}"
+        assert reason
+
+
+
+
+def test_p2_r4_gateway_page_error_json_is_flattened_for_breaker() -> None:
+    import importlib.util
+
+    gw_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "dalton"
+        / "research_runtime"
+        / "scripts"
+        / "data_gateway.py"
+    )
+    spec = importlib.util.spec_from_file_location("test_dg_r4_flatten", gw_path)
+    assert spec is not None and spec.loader is not None
+    dg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dg)
+
+    cases = [
+        json.dumps({"ok": False, "status_code": 429, "error": "upstream busy"}),
+        json.dumps({"ok": False, "error": "E_UPSTREAM_API: 无查看权限或额度已达上限"}),
+    ]
+    for raw in cases:
+        flat = dg._page_error_text(raw)
+        cat, _ = rb._classify_error_category_and_hint(
+            "research", "alphaengine", "search_library", {"error": flat}
+        )
+        should_trip, _ = rb._classify_ae_search_breaker_signal(
+            cat, {"error": flat}, {"error_message": flat}
+        )
+        assert should_trip is True, f"expected trip for {raw!r} -> {flat!r}"
+    assert dg._page_error_text("plain text error") == "plain text error"
+
+
+def test_p2_r5_gateway_long_escaped_json_error_parsed_before_truncation() -> None:
+    import importlib.util
+
+    gw_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "dalton"
+        / "research_runtime"
+        / "scripts"
+        / "data_gateway.py"
+    )
+    spec = importlib.util.spec_from_file_location("test_dg_r5_long", gw_path)
+    assert spec is not None and spec.loader is not None
+    dg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dg)
+
+    raw = json.dumps(
+        {"ok": False, "error": "E_UPSTREAM_API: 无查看权限或额度已达上限", "detail": "x" * 400}
+    )
+    assert len(raw) > 300
+    flat = dg._page_error_text(raw)
+    assert "无查看权限或额度已达上限" in flat

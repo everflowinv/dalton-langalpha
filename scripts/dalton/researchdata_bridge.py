@@ -1382,6 +1382,12 @@ class BridgeConfig:
                 str(self.cache_dir / "alphaengine_search_cache.sqlite3"),
             )
         ).expanduser()
+        self.alphaengine_query_log_dir: Path = Path(
+            os.environ.get(
+                "DALTON_ALPHAENGINE_QUERY_LOG_DIR",
+                str(self.alphaengine_usage_file.parent / "alphaengine_search_queries"),
+            )
+        ).expanduser()
         self.archive_state_file: Path = Path(
             os.environ.get(
                 "DALTON_ARCHIVE_STATE_FILE",
@@ -1661,6 +1667,12 @@ ERROR_HANDLING_CONTRACT_NOTE: str = (
 )
 
 
+ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE: str = (
+    "单家公司检索一次完成：检索一家公司时，把中英文公司名和股票代码用空格隔开写在同一个查询里，"
+    "从返回列表挑选文档；已有结果时从现有列表筛选，报错时切换备用数据源；不同公司或新主题照常各自检索。"
+)
+
+
 def build_researchdata_plugin_instruction() -> str:
     """Build the canonical `researchdata` server instruction for `plugins/dalton_data/plugin.json`.
 
@@ -1680,6 +1692,7 @@ def build_researchdata_plugin_instruction() -> str:
         'AlphaEngine 支持文档与机构/个人会议浏览与筛选（params.meeting_scope="institution"|"personal"，无关键词默认 sort="newest"，按公司检索请用关键词 query（公司名 + ticker）及必要时 search_in="title"）、'
         "录制任务与状态查询（list_recording_tasks/get_recording_status/get_recording_task）、文档基础信息与附件列表（get_document_info/list_attachments）、"
         "按字段读取正文（get_document 的 params.content_field）及词典查询（list_filters）；每次检索（search_library）都扣一次额度，参数完全相同也扣；同一篇文档读过一次全文后再读不扣。检索前先合并关键词：同一公司或同一主题的相关词放进一次检索，不要拆成多次相近的检索。"
+        f"{ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE}"
         "相同检索短时间内会直接返回缓存结果（看 `_bridge_cache`），只有确实需要最新结果时（例如财报刚发、用户明确要最新进展）才传 `params.fresh=true`。"
         "Guidepoint 仅返回问答摘录（无全文接口、无 cursor 翻页；limit 省略默认 3，最大 30，不能由 30 条摘录推断已扫完全部访谈；"
         "params.keywords 为 1–10 个非空字符串，多项 OR、词组内 AND，先筛访谈再排片段，不筛选时省略或传 null；"
@@ -5524,6 +5537,8 @@ def _classify_error_category_and_hint(
                 "额度不足",
                 "配额已达上限",
                 "配额已用完",
+                "频率上限",
+                "频率限制",
                 "登录已过期",
                 "登录失效",
                 "未登录",
@@ -5561,12 +5576,12 @@ def _classify_error_category_and_hint(
         category = "没有匹配"
     elif ae_doc_not_found:
         category = "没有匹配"
-    elif status != "invalid_arguments" and auth_or_quota_signal:
-        category = "权限或额度"
-    elif other_param_signal or e_bad_signal or source_name_unresolved:
+    elif e_bad_signal or status == "invalid_arguments" or source_name_unresolved:
         category = "参数错误"
     elif auth_or_quota_signal:
         category = "权限或额度"
+    elif other_param_signal:
+        category = "参数错误"
     elif ae_upstream_pagination or ae_upstream_response or ae_desktop_no_module_page or ae_desktop_not_running:
         category = "上游不可用"
     elif status in ("empty", "no_match") and not payload.get("error"):
@@ -5688,6 +5703,93 @@ def _classify_error_category_and_hint(
     return category, hint
 
 
+class _SearchBreakerOpenAfterSlotError(Exception):
+    """Internal control-flow signal raised when the breaker opens while waiting for a concurrency slot."""
+
+
+def _classify_ae_search_breaker_signal(
+    err_cat: str,
+    err_probe: Mapping[str, Any],
+    parsed: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Return `(should_trip, reason_summary)` strictly for AlphaEngine quota/rate-limit errors."""
+    probe_dict = dict(err_probe) if isinstance(err_probe, Mapping) else {}
+    unwrapped = _unwrap_upstream_error_info(probe_dict)
+    status = str(unwrapped.get("status") or probe_dict.get("status") or "").strip().lower()
+    err_code = str(
+        unwrapped.get("error_code") or probe_dict.get("error_code") or ""
+    ).strip().lower()
+    raw_err = str(
+        unwrapped.get("error")
+        or probe_dict.get("error")
+        or probe_dict.get("reason")
+        or parsed.get("error_message")
+        or ""
+    ).strip()
+    combined_text = str(unwrapped.get("combined_text") or raw_err).strip()
+    combined_lower = combined_text.lower()
+
+    # Explicit parameter errors (including E_BAD_* even when numeric tokens like 403 appear) never trip.
+    if (
+        err_cat == "参数错误"
+        or status == "invalid_arguments"
+        or err_code.startswith("e_bad_")
+        or "e_bad_" in combined_lower
+    ):
+        return False, ""
+
+    data_dict = probe_dict.get("data") if isinstance(probe_dict.get("data"), Mapping) else {}
+    sc_dict = (
+        data_dict.get("structuredContent")
+        if isinstance(data_dict.get("structuredContent"), Mapping)
+        else {}
+    )
+    structured_429 = any(
+        d.get("status_code") == 429
+        for d in (probe_dict, unwrapped, data_dict, sc_dict)
+        if isinstance(d, Mapping) and not isinstance(d.get("status_code"), bool)
+    )
+    is_http_429_text = bool(
+        re.search(
+            r"(?:\bhttp(?:/[0-9.]+)?\s+429\b|\bstatus(?:_code)?(?:\s*[:=]\s*|\s+)429\b|too many requests)",
+            combined_lower,
+        )
+    )
+    is_quota_text = any(
+        tok in combined_text
+        for tok in (
+            "无查看权限或额度已达上限",
+            "额度已达上限",
+            "额度不足",
+            "超出额度",
+            "额度已用完",
+            "额度用尽",
+        )
+    )
+    is_rate_text = any(
+        tok in combined_text
+        for tok in ("频率限制", "频率上限", "频率过高", "请求过于频繁", "超出频率")
+    )
+    is_quota_or_rate = (
+        structured_429
+        or is_http_429_text
+        or status in ("quota_exceeded", "rate_limited")
+        or err_code in ("quota_exceeded", "rate_limited")
+        or "quota_exceeded" in combined_lower
+        or "rate_limited" in combined_lower
+        or is_quota_text
+        or is_rate_text
+    )
+    if not is_quota_or_rate:
+        return False, ""
+
+    excerpt_src = re.sub(r"^[A-Z][A-Z0-9_]*:\s*", "", raw_err or combined_text).strip()
+    excerpt = _sanitize_failure_log_excerpt(excerpt_src or raw_err or status)[:80]
+    cat_label = str(err_cat or "权限或额度").strip()
+    reason = f"{cat_label}：{excerpt}" if excerpt else cat_label
+    return True, reason
+
+
 _FAILURE_SOURCE_STATES: frozenset[str] = _FAILURE_STATUSES
 
 
@@ -5761,6 +5863,40 @@ def _extract_transcript_coverage(payload: dict[str, Any]) -> dict[str, Any] | No
         sc_val = data_val.get("structuredContent")
         if isinstance(sc_val, dict) and isinstance(sc_val.get("coverage"), dict):
             return sc_val["coverage"]
+    return None
+
+
+def _extract_transcript_page_errors(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Extract per-page failure entries from partial `transcript` payloads."""
+    candidates: list[Any] = []
+    if isinstance(payload.get("page_errors"), list):
+        candidates = payload["page_errors"]
+    else:
+        data_val = payload.get("data")
+        if isinstance(data_val, Mapping) and isinstance(data_val.get("page_errors"), list):
+            candidates = data_val["page_errors"]
+        else:
+            cov = _extract_transcript_coverage(dict(payload))
+            if isinstance(cov, Mapping) and isinstance(cov.get("page_errors"), list):
+                candidates = cov["page_errors"]
+    return [dict(item) for item in candidates if isinstance(item, Mapping)]
+
+
+def _extract_alphaengine_pages_fetched(payload: Mapping[str, Any] | None) -> int | None:
+    """Extract `upstream_pages_fetched` from an AlphaEngine `search_library` payload."""
+    if not isinstance(payload, Mapping):
+        return None
+    inner = payload.get("data") if isinstance(payload.get("data"), Mapping) else payload
+    sc = (
+        source_identity._unwrap_mcp_proxy_payload(dict(inner))
+        if isinstance(inner, Mapping)
+        else source_identity._unwrap_mcp_proxy_payload(dict(payload))
+    )
+    for container in (sc, payload.get("structuredContent"), payload.get("data"), payload):
+        if isinstance(container, Mapping):
+            val = container.get("upstream_pages_fetched")
+            if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                return val
     return None
 
 
@@ -8747,6 +8883,103 @@ class ResearchDataBridge:
             self._alphaengine_cache = cache
         return cache
 
+    def _get_ae_search_breaker(self) -> _ae_cache.AlphaEngineSearchCircuitBreaker:
+        """Return the in-process AlphaEngine search circuit breaker.
+
+        researchdata_bridge runs as a single process (one asyncio event loop), so
+        process-local breaker state has no multi-worker divergence. `get_document`
+        uses a separate upstream quota and is unaffected by search trips.
+        """
+        breaker = getattr(self, "_ae_search_breaker", None)
+        if breaker is None:
+            breaker = _ae_cache.AlphaEngineSearchCircuitBreaker()
+            self._ae_search_breaker = breaker
+        return breaker
+
+    def _get_ae_company_tracker(self) -> _ae_cache.AlphaEngineCompanySearchTracker:
+        tracker = getattr(self, "_ae_company_tracker", None)
+        if tracker is None:
+            tracker = _ae_cache.AlphaEngineCompanySearchTracker()
+            self._ae_company_tracker = tracker
+        return tracker
+
+    def _get_ae_query_logger(self) -> _ae_cache.AlphaEngineTeamQueryLogger:
+        q_logger = getattr(self, "_ae_query_logger", None)
+        if q_logger is None:
+            raw_dir = getattr(getattr(self, "cfg", None), "alphaengine_query_log_dir", None)
+            if isinstance(raw_dir, (Path, str)) and str(raw_dir):
+                log_dir = Path(raw_dir)
+            else:
+                usage_path = getattr(getattr(self, "cfg", None), "alphaengine_usage_file", None)
+                parent = (
+                    Path(usage_path).expanduser().parent
+                    if isinstance(usage_path, (Path, str)) and str(usage_path)
+                    else Path(os.path.expanduser("~/Library/Logs"))
+                )
+                log_dir = parent / "alphaengine_search_queries"
+            q_logger = _ae_cache.AlphaEngineTeamQueryLogger(
+                log_dir, today_fn=lambda: _bridge_today()
+            )
+            self._ae_query_logger = q_logger
+        return q_logger
+
+    async def _track_company_search_and_log_query(
+        self,
+        *,
+        operation: str,
+        arguments: dict[str, Any] | None,
+        caller_identity: dict[str, str] | None,
+        ok: bool,
+        cache_status: str,
+    ) -> str | None:
+        args = arguments if isinstance(arguments, dict) else {}
+        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        query_val = args.get("query") if args.get("query") not in (None, "") else params.get("query")
+        keywords_val = params.get("keywords") if "keywords" in params else args.get("keywords")
+        ticker_val = args.get("ticker") or ""
+        is_personal = _ae_cache._is_personal_scope_request(params)
+
+        companies, advice = self._get_ae_company_tracker().record_and_check(
+            caller_identity=caller_identity if isinstance(caller_identity, dict) else None,
+            query=query_val,
+            keywords=keywords_val,
+            ticker=ticker_val,
+        )
+
+        if not is_personal:
+            ci = caller_identity if isinstance(caller_identity, Mapping) else {}
+            user_val = str(ci.get("user") or "").strip()
+            ws_val = str(ci.get("workspace") or "").strip()
+            th_val = str(ci.get("thread") or "").strip()
+            sanitized_params = {
+                k: v for k, v in params.items() if k != "fresh" and v is not None
+            }
+            if args.get("start"):
+                sanitized_params.setdefault("start", str(args.get("start")))
+            if args.get("end"):
+                sanitized_params.setdefault("end", str(args.get("end")))
+            if args.get("limit") is not None:
+                sanitized_params.setdefault("limit", args.get("limit"))
+            if ticker_val:
+                sanitized_params.setdefault("ticker", str(ticker_val))
+            await self._get_ae_query_logger().log(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "op": str(operation or "search_library"),
+                    "query": _ae_cache.normalize_search_query(query_val),
+                    "keywords": keywords_val if isinstance(keywords_val, list) else [],
+                    "params": sanitized_params,
+                    "companies": companies,
+                    "user": user_val,
+                    "workspace": ws_val,
+                    "thread": th_val,
+                    "session": th_val or ws_val,
+                    "cache": str(cache_status or ""),
+                    "ok": bool(ok),
+                }
+            )
+        return advice
+
     def _get_inflight_searches(self) -> dict[str, dict[str, Any]]:
         inflight = getattr(self, "_inflight_searches", None)
         if inflight is None:
@@ -8948,6 +9181,7 @@ class ResearchDataBridge:
         upstream_arguments: dict[str, Any],
         timeout_s: float,
         on_upstream_start: Callable[[], None] | None = None,
+        is_breaker_open: Callable[[], bool] | None = None,
         caller_key: str = "conn:anon",
         caller_display: str = "conn:anon",
         is_automation: bool = False,
@@ -8988,6 +9222,8 @@ class ResearchDataBridge:
                     asyncio.sleep(test_delay_s),
                     timeout=rem_delay,
                 )
+            if is_breaker_open is not None and is_breaker_open():
+                raise _SearchBreakerOpenAfterSlotError()
             remaining_s = max(5.0, float(timeout_s) - (time.monotonic() - t0))
             if on_upstream_start is not None:
                 on_upstream_start()
@@ -9032,6 +9268,81 @@ class ResearchDataBridge:
             fanout=fanout,
         )
         cache = self._get_alphaengine_search_cache()
+        breaker = self._get_ae_search_breaker()
+
+        def _build_stale_result(
+            stale_hit: _ae_cache.CacheHit,
+            stale_reason: str,
+            *,
+            upstream_called: bool,
+            breaker_open: bool,
+            breaker_tripped: bool,
+        ) -> dict[str, Any]:
+            now = cache._now_fn()
+            cached_at_str = _ae_cache.iso_utc(stale_hit.fetched_at)
+            bc = {
+                "status": "stale",
+                "fetched_at": cached_at_str,
+                "cached_at": cached_at_str,
+                "age_seconds": round(max(0.0, now - stale_hit.fetched_at), 3),
+                "expires_at": _ae_cache.iso_utc(stale_hit.expires_at),
+                "stale": True,
+                "stale_reason": stale_reason,
+            }
+            return {
+                "ok": True,
+                "payload": stale_hit.payload,
+                "rpc_error": None,
+                "is_error": False,
+                "raw_text": "",
+                "error_kind": "",
+                "error_message": "",
+                "bridge_cache": bc,
+                "upstream_called": upstream_called,
+                "stale": True,
+                "stale_reason": stale_reason,
+                "cached_at": cached_at_str,
+                "breaker_open": breaker_open,
+                "breaker_tripped": breaker_tripped,
+                "date_from": plan.date_from,
+                "date_to": plan.date_to,
+                "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
+            }
+
+        def _build_circuit_open_error() -> dict[str, Any]:
+            rem_s = max(1, math.ceil(breaker.remaining_seconds()))
+            reason_text = breaker.last_reason or "权限或额度受限"
+            err_msg = f"AlphaEngine 检索暂停约 {rem_s} 秒（上次错误：{reason_text}）"
+            return {
+                "ok": False,
+                "payload": {
+                    "ok": False,
+                    "status": "rate_limited",
+                    "error_code": "rate_limited",
+                    "error": err_msg,
+                    "retry_after_seconds": rem_s,
+                },
+                "rpc_error": None,
+                "is_error": True,
+                "raw_text": "",
+                "error_kind": "rate_limited",
+                "error_message": err_msg,
+                "bridge_cache": {
+                    "status": "circuit_open",
+                    "fetched_at": None,
+                    "age_seconds": None,
+                    "expires_at": None,
+                },
+                "upstream_called": False,
+                "stale": False,
+                "stale_reason": "",
+                "cached_at": "",
+                "breaker_open": True,
+                "breaker_tripped": False,
+                "date_from": plan.date_from,
+                "date_to": plan.date_to,
+                "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
+            }
 
         async def _invoke_and_build(
             *,
@@ -9040,6 +9351,8 @@ class ResearchDataBridge:
             is_fresh: bool,
             allow_stale_fallback: bool,
             allow_cache_write: bool,
+            allow_trip_breaker: bool = True,
+            check_breaker_after_slot: bool = True,
             status_override: str | None = None,
             result_future: asyncio.Future[dict[str, Any]] | None = None,
             on_upstream_start: Callable[[], None] | None = None,
@@ -9060,6 +9373,7 @@ class ResearchDataBridge:
                     upstream_arguments=plan.upstream_arguments,
                     timeout_s=timeout_s,
                     on_upstream_start=_mark_started,
+                    is_breaker_open=(breaker.is_open if check_breaker_after_slot else None),
                     caller_key=eff_caller_key,
                     caller_display=eff_caller_display,
                     is_automation=eff_is_automation,
@@ -9068,6 +9382,28 @@ class ResearchDataBridge:
                     queue_stats=queue_stats,
                 )
                 parsed = self._parse_alphaengine_or_transcript_response(resps, op=plan.op)
+            except _SearchBreakerOpenAfterSlotError:
+                if allow_stale_fallback and plan.cacheable and not cache._degraded_warned:
+                    stale_hit = await cache.get_stale(
+                        plan.cache_key,
+                        legacy_cache_key=plan.legacy_cache_key,
+                        stale_reason="circuit_open",
+                    )
+                    if stale_hit is not None:
+                        stale_obj = _build_stale_result(
+                            stale_hit,
+                            "circuit_open",
+                            upstream_called=False,
+                            breaker_open=True,
+                            breaker_tripped=False,
+                        )
+                        if result_future is not None and not result_future.done():
+                            result_future.set_result(stale_obj)
+                        return stale_obj
+                fast_err = _build_circuit_open_error()
+                if result_future is not None and not result_future.done():
+                    result_future.set_result(fast_err)
+                return fast_err
             except asyncio.TimeoutError:
                 parsed = {
                     "ok": False,
@@ -9103,7 +9439,33 @@ class ResearchDataBridge:
 
             if parsed["ok"] and isinstance(parsed["payload"], dict):
                 payload = parsed["payload"]
-                if allow_cache_write:
+                partial_page_errors = (
+                    _extract_transcript_page_errors(payload)
+                    if plan.op == _ae_cache.OP_TRANSCRIPT
+                    else []
+                )
+                partial_quota_tripped = False
+                partial_breaker_tripped = False
+                for pe in partial_page_errors:
+                    pe_probe: dict[str, Any] = {"error": str(pe.get("error") or "")}
+                    if pe.get("status"):
+                        pe_probe["status"] = pe["status"]
+                    if pe.get("status_code") is not None:
+                        pe_probe["status_code"] = pe["status_code"]
+                    pe_cat, _ = _classify_error_category_and_hint(
+                        "research", "transcript", "transcript", pe_probe
+                    )
+                    pe_is_quota, pe_reason = _classify_ae_search_breaker_signal(
+                        pe_cat, pe_probe, {"error_message": pe_probe["error"]}
+                    )
+                    if pe_is_quota:
+                        partial_quota_tripped = True
+                        if allow_trip_breaker:
+                            pe_tripped, _ = breaker.record_quota_failure(pe_reason)
+                            partial_breaker_tripped = partial_breaker_tripped or pe_tripped
+                if upstream_started and allow_trip_breaker and not partial_page_errors:
+                    breaker.record_success()
+                if allow_cache_write and not partial_quota_tripped:
                     result_count, has_more = _ae_cache.extract_result_metrics(
                         payload, op=plan.op
                     )
@@ -9145,8 +9507,12 @@ class ResearchDataBridge:
                         "upstream_called": upstream_started,
                         "stale": False,
                         "stale_reason": "",
+                        "cached_at": "",
+                        "breaker_open": False,
+                        "breaker_tripped": partial_breaker_tripped,
                         "date_from": plan.date_from,
                         "date_to": plan.date_to,
+                        "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
                     }
                     if result_future is not None and not result_future.done():
                         result_future.set_result(res_obj)
@@ -9171,55 +9537,55 @@ class ResearchDataBridge:
                     "upstream_called": upstream_started,
                     "stale": False,
                     "stale_reason": "",
+                    "cached_at": "",
+                    "breaker_open": False,
+                    "breaker_tripped": partial_breaker_tripped,
                     "date_from": plan.date_from,
                     "date_to": plan.date_to,
+                    "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
                 }
                 if result_future is not None and not result_future.done():
                     result_future.set_result(res_obj)
                 return res_obj
 
-            # Upstream failure: check quota/auth fallback if cacheable
-            if allow_stale_fallback and plan.cacheable:
-                err_probe = (
-                    copy.deepcopy(parsed["payload"])
-                    if isinstance(parsed.get("payload"), dict)
-                    else {"error": parsed.get("error_message") or "error"}
+            # Upstream failure: classify error, trip search breaker strictly on
+            # quota/rate-limit signals, and fall back to retained stale cache.
+            err_probe = (
+                copy.deepcopy(parsed["payload"])
+                if isinstance(parsed.get("payload"), dict)
+                else {"error": parsed.get("error_message") or "error"}
+            )
+            err_route = "transcript" if plan.op == _ae_cache.OP_TRANSCRIPT else "alphaengine"
+            err_op = "transcript" if plan.op == _ae_cache.OP_TRANSCRIPT else "search_library"
+            err_cat, _ = _classify_error_category_and_hint(
+                "research", err_route, err_op, err_probe
+            )
+            tripped = False
+            if allow_trip_breaker:
+                should_trip, trip_reason = _classify_ae_search_breaker_signal(
+                    err_cat, err_probe, parsed
                 )
-                err_route = "transcript" if plan.op == _ae_cache.OP_TRANSCRIPT else "alphaengine"
-                err_op = "transcript" if plan.op == _ae_cache.OP_TRANSCRIPT else "search_library"
-                err_cat, _ = _classify_error_category_and_hint(
-                    "research", err_route, err_op, err_probe
+                if should_trip:
+                    tripped, _ = breaker.record_quota_failure(trip_reason)
+
+            if allow_stale_fallback and plan.cacheable and err_cat in ("权限或额度", "上游不可用"):
+                stale_reason = "quota" if err_cat == "权限或额度" else "upstream_unavailable"
+                stale_hit = await cache.get_stale(
+                    plan.cache_key,
+                    legacy_cache_key=plan.legacy_cache_key,
+                    stale_reason=stale_reason,
                 )
-                if err_cat == "权限或额度":
-                    stale_hit = await cache.get_stale(plan.cache_key)
-                    if stale_hit is not None:
-                        now = cache._now_fn()
-                        bc = {
-                            "status": "stale",
-                            "fetched_at": _ae_cache.iso_utc(stale_hit.fetched_at),
-                            "age_seconds": round(max(0.0, now - stale_hit.fetched_at), 3),
-                            "expires_at": _ae_cache.iso_utc(stale_hit.expires_at),
-                            "stale": True,
-                            "stale_reason": "quota",
-                        }
-                        stale_obj = {
-                            "ok": True,
-                            "payload": stale_hit.payload,
-                            "rpc_error": None,
-                            "is_error": False,
-                            "raw_text": "",
-                            "error_kind": "",
-                            "error_message": "",
-                            "bridge_cache": bc,
-                            "upstream_called": upstream_started,
-                            "stale": True,
-                            "stale_reason": "quota",
-                            "date_from": plan.date_from,
-                            "date_to": plan.date_to,
-                        }
-                        if result_future is not None and not result_future.done():
-                            result_future.set_result(stale_obj)
-                        return stale_obj
+                if stale_hit is not None:
+                    stale_obj = _build_stale_result(
+                        stale_hit,
+                        stale_reason,
+                        upstream_called=upstream_started,
+                        breaker_open=False,
+                        breaker_tripped=tripped,
+                    )
+                    if result_future is not None and not result_future.done():
+                        result_future.set_result(stale_obj)
+                    return stale_obj
 
             bc = {
                 "status": status_override or ("fresh" if is_fresh else "miss"),
@@ -9233,14 +9599,19 @@ class ResearchDataBridge:
                 "upstream_called": upstream_started,
                 "stale": False,
                 "stale_reason": "",
+                "cached_at": "",
+                "breaker_open": False,
+                "breaker_tripped": tripped,
                 "date_from": plan.date_from,
                 "date_to": plan.date_to,
+                "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
             }
             if result_future is not None and not result_future.done():
                 result_future.set_result(fail_obj)
             return fail_obj
 
         # 1. Uncacheable requests (`mode="plan"`, `cursor`, or personal-scope meetings)
+        #    never trip and are never blocked by the search circuit breaker.
         if not plan.cacheable:
             bypass_state = {"upstream_started": False}
             bypass_timeout_bc = {
@@ -9257,6 +9628,8 @@ class ResearchDataBridge:
                         is_fresh=False,
                         allow_stale_fallback=False,
                         allow_cache_write=False,
+                        allow_trip_breaker=False,
+                        check_breaker_after_slot=False,
                         status_override="bypass",
                         on_upstream_start=lambda: bypass_state.__setitem__("upstream_started", True),
                     ),
@@ -9314,6 +9687,13 @@ class ResearchDataBridge:
         async def _cancel_runner_if_unawaited(target_entry: dict[str, Any]) -> None:
             if target_entry.get("waiters"):
                 return
+            if target_entry.get("stale_served") and (
+                target_entry.get("call_state") or {}
+            ).get("upstream_started"):
+                # A caller already took the stale entry and the search quota is spent:
+                # let the refresh finish and write the cache. Other cancellations (fan-out
+                # grace, branch cancel) still stop the runner so its slot frees promptly.
+                return
             if inflight.get(inflight_key) is target_entry:
                 inflight.pop(inflight_key, None)
             runner = target_entry.get("runner_task")
@@ -9327,6 +9707,55 @@ class ResearchDataBridge:
                     except Exception:
                         break
 
+        async def _await_future_with_stale_deadline(
+            fut: asyncio.Future[dict[str, Any]],
+            entry_obj: dict[str, Any],
+            waiter_id: Any,
+            *,
+            is_leader: bool,
+        ) -> dict[str, Any]:
+            """Wait for `fut` up to `caller_timeout_s` minus headroom; return stale cache if present."""
+            deadline_mono = time.monotonic() + float(caller_timeout_s)
+            headroom_s = (
+                2.0
+                if float(caller_timeout_s) > 2.5
+                else max(0.05, min(2.0, float(caller_timeout_s) * 0.25))
+            )
+            first_wait_s = max(0.01, float(caller_timeout_s) - headroom_s)
+            try:
+                return await asyncio.wait_for(asyncio.shield(fut), timeout=first_wait_s)
+            except asyncio.TimeoutError:
+                pass
+            if plan.cacheable and not plan.fresh and not cache._degraded_warned:
+                rem_for_stale = max(0.05, deadline_mono - time.monotonic() - 0.2)
+                try:
+                    stale_hit = await asyncio.wait_for(
+                        cache.get_stale(
+                            plan.cache_key,
+                            legacy_cache_key=plan.legacy_cache_key,
+                            stale_reason="upstream_timeout",
+                        ),
+                        timeout=rem_for_stale,
+                    )
+                except asyncio.TimeoutError:
+                    stale_hit = None
+                if fut.done() and not fut.cancelled():
+                    return fut.result()
+                if stale_hit is not None:
+                    entry_obj["stale_served"] = True
+                    entry_obj["waiters"].discard(waiter_id)
+                    return _build_stale_result(
+                        stale_hit,
+                        "upstream_timeout",
+                        upstream_called=(
+                            bool(call_state["upstream_started"]) if is_leader else False
+                        ),
+                        breaker_open=False,
+                        breaker_tripped=False,
+                    )
+            remaining_s = max(0.0, deadline_mono - time.monotonic())
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=remaining_s)
+
         async def _await_existing_flight(existing_entry: dict[str, Any]) -> dict[str, Any]:
             wait_bc = {
                 "status": "coalesced",
@@ -9337,8 +9766,11 @@ class ResearchDataBridge:
             waiter_id = object()
             existing_entry.setdefault("waiters", set()).add(waiter_id)
             try:
-                shared_res = await asyncio.wait_for(
-                    asyncio.shield(existing_entry["result_future"]), timeout=caller_timeout_s
+                shared_res = await _await_future_with_stale_deadline(
+                    existing_entry["result_future"],
+                    existing_entry,
+                    waiter_id,
+                    is_leader=False,
                 )
             except asyncio.CancelledError:
                 existing_entry["waiters"].discard(waiter_id)
@@ -9380,6 +9812,8 @@ class ResearchDataBridge:
                 bc["status"] = "hit"
             elif shared_res["stale"]:
                 bc["status"] = "stale"
+            elif shared_res.get("breaker_open") and bc.get("status") == "circuit_open":
+                bc["status"] = "circuit_open"
             else:
                 bc["status"] = "coalesced"
             if shared_res["error_kind"] == "timeout" and not fanout:
@@ -9398,6 +9832,7 @@ class ResearchDataBridge:
                 ),
                 "bridge_cache": bc,
                 "upstream_called": False,
+                "breaker_tripped": False,
                 "_persist_wait": None,
             }
 
@@ -9414,7 +9849,12 @@ class ResearchDataBridge:
                 degraded = False
                 if not plan.fresh:
                     hit, degraded = await cache.get(
-                        plan.cache_key, plan.base_key, plan.req_limit, op=plan.op
+                        plan.cache_key,
+                        plan.base_key,
+                        plan.req_limit,
+                        op=plan.op,
+                        legacy_cache_key=plan.legacy_cache_key,
+                        legacy_base_key=plan.legacy_base_key,
                     )
                     if hit is not None:
                         now = cache._now_fn()
@@ -9441,12 +9881,39 @@ class ResearchDataBridge:
                             "from_cache": True,
                             "stale": False,
                             "stale_reason": "",
+                            "cached_at": "",
+                            "breaker_open": False,
+                            "breaker_tripped": False,
                             "date_from": plan.date_from,
                             "date_to": plan.date_to,
+                            "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
                         }
                         if not result_future.done():
                             result_future.set_result(hit_obj)
                         return hit_obj
+
+                if breaker.is_open():
+                    if not degraded:
+                        stale_hit = await cache.get_stale(
+                            plan.cache_key,
+                            legacy_cache_key=plan.legacy_cache_key,
+                            stale_reason="circuit_open",
+                        )
+                        if stale_hit is not None:
+                            stale_obj = _build_stale_result(
+                                stale_hit,
+                                "circuit_open",
+                                upstream_called=False,
+                                breaker_open=True,
+                                breaker_tripped=False,
+                            )
+                            if not result_future.done():
+                                result_future.set_result(stale_obj)
+                            return stale_obj
+                    fast_err = _build_circuit_open_error()
+                    if not result_future.done():
+                        result_future.set_result(fast_err)
+                    return fast_err
 
                 return await _invoke_and_build(
                     rpc_id=f"{req_id}:alphaengine" if (fanout and req_id is not None) else req_id,
@@ -9482,6 +9949,7 @@ class ResearchDataBridge:
                     "stale_reason": "",
                     "date_from": plan.date_from,
                     "date_to": plan.date_to,
+                    "upstream_arguments": copy.deepcopy(plan.upstream_arguments),
                 }
                 if not result_future.done():
                     result_future.set_result(err_obj)
@@ -9497,6 +9965,7 @@ class ResearchDataBridge:
             "result_future": result_future,
             "runner_task": runner_task,
             "waiters": {leader_waiter_id},
+            "call_state": call_state,
         }
         runners[id(entry)] = entry
         inflight[inflight_key] = entry
@@ -9508,8 +9977,11 @@ class ResearchDataBridge:
             "expires_at": None,
         }
         try:
-            shared_res = await asyncio.wait_for(
-                asyncio.shield(result_future), timeout=caller_timeout_s
+            shared_res = await _await_future_with_stale_deadline(
+                result_future,
+                entry,
+                leader_waiter_id,
+                is_leader=True,
             )
         except asyncio.CancelledError:
             entry["waiters"].discard(leader_waiter_id)
@@ -9553,7 +10025,14 @@ class ResearchDataBridge:
                 else None
             ),
             "upstream_called": bool(shared_res.get("upstream_called")),
-            "_persist_wait": runner_task if fanout else None,
+            "upstream_arguments": copy.deepcopy(
+                shared_res.get("upstream_arguments") or plan.upstream_arguments
+            ),
+            "_persist_wait": (
+                None
+                if shared_res.get("stale_reason") == "upstream_timeout"
+                else (runner_task if fanout else None)
+            ),
         }
 
     async def _run_alphaengine_fanout(
@@ -9639,6 +10118,14 @@ class ResearchDataBridge:
             )
         )
 
+        # A stale fallback carries the page count of the old fetch, not this request's.
+        ae_pages_fetched = (
+            None
+            if cached_res.get("stale")
+            else _extract_alphaengine_pages_fetched(
+                ae_payload if isinstance(ae_payload, Mapping) else None
+            )
+        )
         if not cached_res.get("ok"):
             err_kind = str(cached_res.get("error_kind") or "")
             err_msg = str(cached_res.get("error_message") or "alphaengine call returned error")[:200]
@@ -9670,6 +10157,12 @@ class ResearchDataBridge:
                 "raw_payload": ae_payload if isinstance(ae_payload, dict) else None,
                 "upstream_called": upstream_called,
                 "_bridge_cache": bc,
+                "breaker_open": bool(cached_res.get("breaker_open")),
+                "breaker_tripped": bool(cached_res.get("breaker_tripped")),
+                "pages_scanned": ae_pages_fetched,
+                "upstream_arguments": copy.deepcopy(
+                    cached_res.get("upstream_arguments") or ae_args
+                ),
                 "_persist_wait": persist_wait,
             }
             if eff_clamped:
@@ -9745,6 +10238,13 @@ class ResearchDataBridge:
             "_bridge_cache": bc,
             "stale": bool(cached_res.get("stale")),
             "stale_reason": str(cached_res.get("stale_reason") or ""),
+            "cached_at": str(cached_res.get("cached_at") or ""),
+            "breaker_open": bool(cached_res.get("breaker_open")),
+            "breaker_tripped": bool(cached_res.get("breaker_tripped")),
+            "pages_scanned": ae_pages_fetched,
+            "upstream_arguments": copy.deepcopy(
+                cached_res.get("upstream_arguments") or ae_args
+            ),
             "_persist_wait": persist_wait,
         }
         if eff_clamped:
@@ -10048,6 +10548,8 @@ class ResearchDataBridge:
             if ae_outcome.get("stale"):
                 ae_section["stale"] = True
                 ae_section["stale_reason"] = str(ae_outcome.get("stale_reason") or "quota")
+                if ae_outcome.get("cached_at"):
+                    ae_section["cached_at"] = str(ae_outcome["cached_at"])
             if clamped_pair:
                 ae_section["limit_clamped"] = list(clamped_pair)
                 ae_section["note"] = (
@@ -10306,15 +10808,29 @@ class ResearchDataBridge:
                 data = json.loads(self.cfg.usage_file.read_text(encoding="utf-8"))
                 day_entry = data.get(today) if isinstance(data, dict) else None
                 if isinstance(day_entry, dict):
+                    calls = int(day_entry.get("calls", 0))
+                    repeat_calls = int(day_entry.get("repeat_calls", 0))
+                    total_calls = int(day_entry.get("total_calls", calls + repeat_calls))
                     return {
-                        "calls": int(day_entry.get("calls", 0)),
+                        "calls": calls,
+                        "first_open_calls": int(day_entry.get("first_open_calls", calls)),
+                        "repeat_calls": repeat_calls,
+                        "total_calls": total_calls,
                         "chars": int(day_entry.get("chars", 0)),
                     }
         except Exception:
             pass
-        return {"calls": 0, "chars": 0}
+        return {
+            "calls": 0,
+            "first_open_calls": 0,
+            "repeat_calls": 0,
+            "total_calls": 0,
+            "chars": 0,
+        }
 
-    async def _record_alphaengine_get_doc(self, chars: int) -> None:
+    async def _record_alphaengine_get_doc(
+        self, chars: int, *, first_open: bool = True
+    ) -> None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         async with self._usage_lock:
             try:
@@ -10331,8 +10847,24 @@ class ResearchDataBridge:
                         data = {}
                 day_entry = data.get(today)
                 if not isinstance(day_entry, dict):
-                    day_entry = {"calls": 0, "chars": 0}
-                day_entry["calls"] = int(day_entry.get("calls", 0)) + 1
+                    day_entry = {
+                        "calls": 0,
+                        "first_open_calls": 0,
+                        "repeat_calls": 0,
+                        "total_calls": 0,
+                        "chars": 0,
+                    }
+                if first_open:
+                    day_entry["calls"] = int(day_entry.get("calls", 0)) + 1
+                    day_entry["first_open_calls"] = int(
+                        day_entry.get("first_open_calls", day_entry["calls"] - 1)
+                    ) + 1
+                else:
+                    day_entry["repeat_calls"] = int(day_entry.get("repeat_calls", 0)) + 1
+                day_entry["total_calls"] = (
+                    int(day_entry.get("calls", 0))
+                    + int(day_entry.get("repeat_calls", 0))
+                )
                 day_entry["chars"] = int(day_entry.get("chars", 0)) + max(0, int(chars))
                 data[today] = day_entry
                 tmp_path = self.cfg.usage_file.with_suffix(".tmp")
@@ -10450,6 +10982,9 @@ class ResearchDataBridge:
         date_from: str | None = None,
         date_to: str | None = None,
         pages_scanned: int | None = None,
+        breaker_tripped: bool = False,
+        breaker_open: bool = False,
+        first_open: bool | None = None,
     ) -> None:
         args = arguments if isinstance(arguments, dict) else {}
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
@@ -10508,6 +11043,12 @@ class ResearchDataBridge:
         }
         if pages_scanned is not None and isinstance(pages_scanned, int) and not isinstance(pages_scanned, bool):
             entry["pages_scanned"] = pages_scanned
+        if breaker_tripped:
+            entry["breaker_tripped"] = True
+        if breaker_open:
+            entry["breaker_open"] = True
+        if first_open is not None:
+            entry["first_open"] = bool(first_open)
         if op_code == "read" or op_raw == "get_document":
             entry["content_field"] = str(params.get("content_field") or "auto").strip()
             off_parsed = _parse_int_param(params.get("offset"))
@@ -13285,8 +13826,12 @@ class ResearchDataBridge:
         direct_upstream_called: bool = True
         direct_stale: bool = False
         direct_stale_reason: str = ""
+        direct_cached_at: str = ""
+        direct_breaker_open: bool = False
+        direct_breaker_tripped: bool = False
         direct_date_from: str = ""
         direct_date_to: str = ""
+        direct_upstream_arguments: dict[str, Any] | None = None
         eff_ae_op = operation or "search_library"
         is_cached_direct = (
             tool_name == "research"
@@ -13336,8 +13881,14 @@ class ResearchDataBridge:
                 direct_upstream_called = bool(cached_res.get("upstream_called"))
                 direct_stale = bool(cached_res.get("stale"))
                 direct_stale_reason = str(cached_res.get("stale_reason") or "")
+                direct_cached_at = str(cached_res.get("cached_at") or "")
+                direct_breaker_open = bool(cached_res.get("breaker_open"))
+                direct_breaker_tripped = bool(cached_res.get("breaker_tripped"))
                 direct_date_from = str(cached_res.get("date_from") or "")
                 direct_date_to = str(cached_res.get("date_to") or "")
+                raw_direct_up = cached_res.get("upstream_arguments")
+                if isinstance(raw_direct_up, dict):
+                    direct_upstream_arguments = raw_direct_up
                 if direct_upstream_called:
                     stdio_attempts += 1
                 if cached_res.get("rpc_error") is not None:
@@ -14106,7 +14657,11 @@ class ResearchDataBridge:
                             else:
                                 r_copy = dict(r)
                                 rules_list = list(r_copy.get("rules") or [])
-                                if rid == "transcript":
+                                if rid == "alphaengine":
+                                    if ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE not in rules_list:
+                                        rules_list.insert(0, ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE)
+                                    r_copy["rules"] = rules_list
+                                elif rid == "transcript":
                                     if TRANSCRIPT_CATALOG_RULE not in rules_list:
                                         rules_list.append(TRANSCRIPT_CATALOG_RULE)
                                     r_copy["rules"] = rules_list
@@ -14155,7 +14710,9 @@ class ResearchDataBridge:
                                     "category": spec_entry["category"],
                                     "operations": list(spec_entry["operations"]),
                                 }
-                                if req_route == "transcript":
+                                if req_route == "alphaengine":
+                                    synth["rules"] = [ALPHAENGINE_SINGLE_COMPANY_SEARCH_RULE]
+                                elif req_route == "transcript":
                                     synth["rules"] = [TRANSCRIPT_CATALOG_RULE]
                                 elif req_route in INTERNAL_LIBRARY_ROUTES:
                                     synth["rules"] = [INTERNAL_LIBRARY_PAGINATION_RULE]
@@ -14257,8 +14814,11 @@ class ResearchDataBridge:
                         if direct_stale:
                             payload["stale"] = True
                             payload["stale_reason"] = direct_stale_reason or "quota"
+                            if direct_cached_at:
+                                payload["cached_at"] = direct_cached_at
 
                     # Track AlphaEngine get_document quota usage (only after unwrapping/status classification)
+                    doc_first_open: bool | None = None
                     if (
                         route == "alphaengine"
                         and operation == "get_document"
@@ -14269,9 +14829,43 @@ class ResearchDataBridge:
                         if not isinstance(sc, dict):
                             sc = source_identity._unwrap_mcp_proxy_payload(payload)
                         chars = 0
+                        doc_id_read = ""
                         if isinstance(sc, dict):
                             chars = int(sc.get("returned_chars") or len(str(sc.get("text") or "")))
-                        await self._record_alphaengine_get_doc(chars)
+                            meta_obj = sc.get("metadata")
+                            if isinstance(meta_obj, dict) and meta_obj.get("doc_id"):
+                                doc_id_read = str(meta_obj["doc_id"]).strip()
+                        if not doc_id_read:
+                            raw_p_doc = (
+                                (arguments.get("params") or {}).get("doc_id")
+                                if isinstance(arguments.get("params"), dict)
+                                else None
+                            ) or arguments.get("document")
+                            if raw_p_doc:
+                                doc_id_read = _normalize_alphaengine_doc_id(raw_p_doc).strip()
+                        doc_first_open = await self._get_alphaengine_search_cache().record_doc_read(
+                            doc_id_read
+                        )
+                        await self._record_alphaengine_get_doc(
+                            chars, first_open=doc_first_open
+                        )
+
+                    # Soft company-search reminder & team-scope query text log
+                    if is_cached_direct:
+                        direct_log_args = (
+                            direct_upstream_arguments
+                            if isinstance(direct_upstream_arguments, dict)
+                            else call_args
+                        )
+                        direct_advice = await self._track_company_search_and_log_query(
+                            operation=eff_ae_op if route == "alphaengine" else "transcript",
+                            arguments=direct_log_args,
+                            caller_identity=caller_identity,
+                            ok=bool(payload.get("ok")),
+                            cache_status=str((direct_cache_meta or {}).get("status") or ""),
+                        )
+                        if direct_advice:
+                            payload["advice"] = direct_advice
 
                     # B5: one ledger line per served AlphaEngine call — the
                     # direct route, transcript, and the route='all' fan-out leg each.
@@ -14279,6 +14873,11 @@ class ResearchDataBridge:
                     # error_category, and structuredContent count are accurate.
                     if route == "alphaengine":
                         eff_op_for_usage = operation or "search_library"
+                        ae_search_pages = (
+                            _extract_alphaengine_pages_fetched(payload)
+                            if eff_op_for_usage == "search_library" and not direct_stale
+                            else None
+                        )
                         await self._record_alphaengine_usage(
                             operation=eff_op_for_usage,
                             arguments=arguments,
@@ -14296,6 +14895,10 @@ class ResearchDataBridge:
                             upstream=direct_upstream_called if is_cached_direct else True,
                             date_from=direct_date_from if is_cached_direct else None,
                             date_to=direct_date_to if is_cached_direct else None,
+                            pages_scanned=ae_search_pages,
+                            breaker_tripped=direct_breaker_tripped if is_cached_direct else False,
+                            breaker_open=direct_breaker_open if is_cached_direct else False,
+                            first_open=doc_first_open if eff_op_for_usage == "get_document" else None,
                         )
                     elif tool_name == "research" and route == "transcript":
                         tr_cov = _extract_transcript_coverage(payload)
@@ -14324,18 +14927,46 @@ class ResearchDataBridge:
                             date_from=direct_date_from,
                             date_to=direct_date_to,
                             pages_scanned=tr_pages,
+                            breaker_tripped=direct_breaker_tripped,
+                            breaker_open=direct_breaker_open,
                         )
                     if ae_outcome is not None and ae_args is not None:
                         ae_ok = bool(ae_outcome.get("ok"))
                         ae_reason = str(ae_outcome.get("reason") or "")
                         ae_bc = ae_outcome.get("_bridge_cache")
+                        fanout_log_args = (
+                            ae_outcome.get("upstream_arguments")
+                            if isinstance(ae_outcome.get("upstream_arguments"), dict)
+                            else ae_args
+                        )
+                        fanout_advice = await self._track_company_search_and_log_query(
+                            operation=str(ae_args.get("operation") or "search_library"),
+                            arguments=fanout_log_args,
+                            caller_identity=caller_identity,
+                            ok=ae_ok,
+                            cache_status=(
+                                str(ae_bc.get("status") or "")
+                                if isinstance(ae_bc, dict)
+                                else ""
+                            ),
+                        )
+                        if fanout_advice:
+                            payload["advice"] = fanout_advice
+                            if isinstance(payload.get("alphaengine"), dict):
+                                payload["alphaengine"]["advice"] = fanout_advice
                         await self._record_alphaengine_usage(
                             operation=str(ae_args.get("operation") or "search_library"),
                             arguments=ae_args,
                             ok=ae_ok,
                             error_category=(
                                 "" if ae_ok else _classify_error_category_and_hint(
-                                    "research", "alphaengine", "search_library", {"error": ae_reason}
+                                    "research",
+                                    "alphaengine",
+                                    "search_library",
+                                    {
+                                        "status": ae_outcome.get("status"),
+                                        "error": ae_reason,
+                                    },
                                 )[0]
                             ),
                             count=int(ae_outcome.get("count") or 0),
@@ -14348,6 +14979,9 @@ class ResearchDataBridge:
                             upstream=bool(ae_outcome.get("upstream_called", True)),
                             date_from=str(ae_args.get("start") or ""),
                             date_to=str(ae_args.get("end") or ""),
+                            pages_scanned=ae_outcome.get("pages_scanned"),
+                            breaker_tripped=bool(ae_outcome.get("breaker_tripped")),
+                            breaker_open=bool(ae_outcome.get("breaker_open")),
                         )
                     if params_mapped_hint:
                         cur_hint = str(payload.get("hint") or "").strip()
@@ -14420,6 +15054,8 @@ class ResearchDataBridge:
                 upstream=direct_upstream_called,
                 date_from=direct_date_from,
                 date_to=direct_date_to,
+                breaker_tripped=direct_breaker_tripped,
+                breaker_open=direct_breaker_open,
             )
         if (
             route == "sec"
@@ -25491,6 +26127,7 @@ async def _handle_client(
                 "embed_max_bytes": bridge.cfg.embed_max_bytes,
                 "caller_budget_s": bridge.cfg.caller_budget_s,
                 "alphaengine_get_document_today": bridge._read_usage_today(),
+                "alphaengine_search_circuit_breaker": bridge._get_ae_search_breaker().snapshot(),
                 "xreach": await bridge.probe_xreach_version(),
                 "tmeet": await bridge.probe_tmeet_version(),
             }
