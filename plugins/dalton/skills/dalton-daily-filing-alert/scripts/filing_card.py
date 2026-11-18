@@ -2033,9 +2033,13 @@ def _resolve_lead(
     buybacks.sort(key=lambda row: -row[0])
     purchases.sort(key=lambda row: -row[0])
 
+    def _who(company: dict[str, Any]) -> str:
+        # Readers scan the lead for who acted; the trusted name says it, the code is the fallback.
+        return str(company.get("name", "")).strip() or str(company.get("code", "")).strip()
+
     priority_snippets: list[str] = []
     for _score, label, share_class, trade_days, company in buybacks:
-        code = str(company.get("code", "")).strip()
+        code = _who(company)
         if label:
             action = "单日回购" if trade_days <= 1 else f"{trade_days} 个交易日回购"
             prefix = f"{share_class} " if share_class else ""
@@ -2043,7 +2047,7 @@ def _resolve_lead(
         else:
             priority_snippets.append(f"{code} 回购股份")
     for _score, label, event_kind, company in purchases:
-        code = str(company.get("code", "")).strip()
+        code = _who(company)
         if event_kind == "form4_buy":
             priority_snippets.append(f"{code} 内部人买入 {label}" if label else f"{code} 内部人买入")
         else:
