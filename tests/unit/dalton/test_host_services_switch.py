@@ -1214,3 +1214,13 @@ def test_watchdog_state_path_honours_state_dir_from_plist(tmp_path: Path) -> Non
     assert res.returncode == 0, res.stderr + res.stdout
     assert (custom_state / "alphaengine-desktop-watchdog.json").is_file()
     assert not (research_home / "state" / "alphaengine-desktop-watchdog.json").exists()
+
+
+@pytest.fixture(autouse=True)
+def _no_host_writer_processes(tmp_path_factory, monkeypatch):
+    """research_runtime_migrate.sh refuses --apply while a real writer runs on this
+    machine; tests must not depend on what the host happens to be running."""
+    stub = tmp_path_factory.mktemp("psstub") / "ps"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    monkeypatch.setenv("DALTON_MIGRATE_PS_BIN", str(stub))

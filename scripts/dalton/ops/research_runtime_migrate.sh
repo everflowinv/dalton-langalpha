@@ -262,7 +262,7 @@ check_active_writers() {
     fi
 
     local ps_out=""
-    ps_out="$(ps -axo pid=,command= 2>/dev/null || true)"
+    ps_out="$("${DALTON_MIGRATE_PS_BIN:-ps}" -axo pid=,command= 2>/dev/null || true)"
     if [[ -n "${ps_out}" ]]; then
         local writer_hits=""
         writer_hits="$(printf '%s\n' "${ps_out}" | awk '
