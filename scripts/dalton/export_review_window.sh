@@ -38,8 +38,6 @@ BACKEND_CONTAINER="${DALTON_BACKEND_CONTAINER:-dalton-langalpha-backend-1}"
 LOG_DIR="${DALTON_LOG_DIR:-$HOME/Library/Logs}"
 RESEARCH_ERR_LOG="$LOG_DIR/dalton-researchdata-bridge.err.log"
 RESEARCH_OUT_LOG="$LOG_DIR/dalton-researchdata-bridge.log"
-WEBSEARCH_ERR_LOG="$LOG_DIR/dalton-web-search-bridge.err.log"
-WEBSEARCH_OUT_LOG="$LOG_DIR/dalton-web-search-bridge.log"
 
 SINCE=""
 UNTIL=""
@@ -184,7 +182,6 @@ redacted_version() {
   printf '%s' "${out:-unknown}"
 }
 research_version="$(redacted_version "$RESEARCH_ERR_LOG" "$RESEARCH_OUT_LOG")"
-websearch_version="$(redacted_version "$WEBSEARCH_ERR_LOG" "$WEBSEARCH_OUT_LOG")"
 
 backend_coverage="$(
   "$PYTHON_BIN" - "$(dirname "$REDACTOR")" "$container_started" "$docker_since" <<'PY' 2>/dev/null
@@ -223,7 +220,6 @@ timezone="$(date +%Z%z) ($(readlink /etc/localtime 2>/dev/null || echo '?'))"
   echo "backend_container_started: $container_started"
   echo "backend_log_coverage: $backend_coverage"
   echo "researchdata_bridge_server_version: $research_version"
-  echo "websearch_bridge_server_version: $websearch_version"
   echo "timezone: $timezone"
   echo "host: $(hostname)"
   echo "generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -236,11 +232,6 @@ if [[ -f "$RESEARCH_ERR_LOG" ]]; then
   emit_redacted_file "researchdata bridge ($RESEARCH_ERR_LOG)" "$RESEARCH_ERR_LOG"
 else
   emit_redacted_file "researchdata bridge ($RESEARCH_OUT_LOG, stderr log absent)" "$RESEARCH_OUT_LOG"
-fi
-if [[ -f "$WEBSEARCH_ERR_LOG" ]]; then
-  emit_redacted_file "web search bridge ($WEBSEARCH_ERR_LOG)" "$WEBSEARCH_ERR_LOG"
-else
-  emit_redacted_file "web search bridge ($WEBSEARCH_OUT_LOG, stderr log absent)" "$WEBSEARCH_OUT_LOG"
 fi
 
 echo "wrote $OUTFILE ($(wc -l <"$OUTFILE" | tr -d ' ') lines)" >&2

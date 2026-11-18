@@ -254,15 +254,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 run_and_record \
-  "Baseline 2/4: Python Unit Tests" \
+  "Baseline 2/3: Python Unit Tests" \
   "$unit_cmd"
 
 run_and_record \
-  "Baseline 3/4: OpenClaw Broker Node Tests" \
-  "node --test integrations/openclaw/dalton-langalpha-broker/test/*.test.mjs"
-
-run_and_record \
-  "Baseline 4/4: Web Typecheck & Vitest" \
+  "Baseline 3/3: Web Typecheck & Vitest" \
   "pnpm --dir web typecheck && pnpm --dir web test -- --run"
 
 # J1 acceptance & debug runs (when not --baseline-only)

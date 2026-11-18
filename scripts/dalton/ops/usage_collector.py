@@ -22,7 +22,7 @@ _REPO_SKILL_SCRIPTS_DIR = (
     Path(__file__).resolve().parents[3]
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "skills"
     / "model-usage-cost"
     / "scripts"
@@ -44,7 +44,7 @@ def resolve_skill_dir(repo_root: Path | None = None) -> Path:
     if raw:
         return Path(raw).expanduser().resolve()
     root = repo_root if repo_root is not None else resolve_repo_root()
-    return root / "scripts" / "dalton" / "openclaw_overlays" / "skills" / "model-usage-cost"
+    return root / "scripts" / "dalton" / "data_assets" / "skills" / "model-usage-cost"
 
 
 def resolve_state_dir() -> Path:

@@ -63,7 +63,7 @@ _COMMON_KEYS = frozenset({
 })
 _THREAD_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
-_OVERLAY_CARD = Path(__file__).resolve().parent / "openclaw_overlays" / "scripts" / "feishu_send_card.py"
+_OVERLAY_CARD = Path(__file__).resolve().parent / "data_assets" / "scripts" / "feishu_send_card.py"
 _CARD_RENDERER: Any = None
 _MESSAGES = {
     "not_configured": "AI-finance reports are not configured.",

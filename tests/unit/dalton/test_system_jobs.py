@@ -309,18 +309,6 @@ async def test_manifest_includes_four_scopes_and_derives_statuses(
     async def _fake_bridge(
         method: str, path: str, *, timeout_s: float = 8.0
     ) -> tuple[int, dict[str, Any] | None]:
-        if path == "/jobs/conversation-archive":
-            return 200, {
-                "ok": True,
-                "enabled": True,
-                "status": "on",
-                "last_run_at": "2026-10-22T13:15:00+00:00",
-                "exit_code": 0,
-                "last_result": "成功 (exit 0)",
-                "log_tail": "[archive_daily] done",
-                "next_run_at": "2026-10-23T21:15:00+08:00",
-                "running": False,
-            }
         if path == "/jobs/ops":
             return 200, {
                 "ok": True,
@@ -348,9 +336,10 @@ async def test_manifest_includes_four_scopes_and_derives_statuses(
 
     manifest = await system_jobs_mod.list_system_jobs(USER_ID)
     assert manifest["ok"] is True
+    assert manifest["groups"]["host"] == []
     jobs = manifest["jobs"]
     scopes_present = {j["scope"] for j in jobs}
-    assert scopes_present == {"company", "home", "host", "ops", "data"}
+    assert scopes_present == {"company", "home", "ops", "data"}
 
     required_fields = {
         "key",
@@ -386,12 +375,6 @@ async def test_manifest_includes_four_scopes_and_derives_statuses(
     cal_job = next(j for j in jobs if j["key"] == "dalton-earnings-calendar")
     assert cal_job["scope"] == "home"
     assert cal_job["status"] == "off"
-
-    host_job = next(j for j in jobs if j["key"] == "conversation-archive")
-    assert host_job["scope"] == "host"
-    assert host_job["status"] == "on"
-    assert host_job["config"]["prompt_version"] == system_jobs_mod.get_dalton_config().conversations.prompt_version
-    assert host_job["config"]["extractor_model"]
 
     ops_backup = next(j for j in jobs if j["key"] == "ops-db-backup")
     assert ops_backup["scope"] == "ops"
@@ -450,141 +433,6 @@ async def test_home_global_jobs_enable_pause_resume_and_paused_by_user(
     assert "paused_by_user" not in resumed_row["metadata"]
 
 
-@pytest.mark.asyncio
-async def test_bridge_conversation_archive_auth_lock_sanitization_and_shell_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """3. Bridge `/jobs/conversation-archive*` enforces token auth, returns already_running on lock conflict, sanitizes logs, and archive_daily.sh exits 0 when disabled."""
-    state_file = tmp_path / "conversation-archive-state.json"
-    status_file = tmp_path / "conversation-archive-status.json"
-    log_file = tmp_path / "conversation-archive.log"
-    env_file = tmp_path / "bridge.env"
-    env_file.write_text(
-        "DALTON_BRIDGE_TOKEN=bridge-secret-token\nDALTON_BRIDGE_ADMIN_TOKEN=bridge-admin-secret-token\n",
-        encoding="utf-8",
-    )
-    log_file.write_text(
-        "Running archive with Bearer secret-token-1234567890 and /Users/alice/secret/path\n"
-        "Cookie: a=1; b=2; sid=super-secret-cookie\n"
-        "Set-Cookie: session_id=xyz987654321; Path=/private/tmp/work\n"
-        "leaked_hex=0123456789abcdef0123456789abcdef01234567\n"
-        "leaked_b64=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkw==\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(env_file))
-    monkeypatch.delenv("DALTON_BRIDGE_TOKEN", raising=False)
-    monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
-    cfg = bridge_mod.BridgeConfig()
-    cfg.token = "bridge-secret-token"
-    cfg.admin_token = "bridge-admin-secret-token"
-    cfg.archive_state_file = state_file
-    cfg.archive_status_file = status_file
-    cfg.archive_log_file = log_file
-    cfg.repo_root = Path(__file__).resolve().parents[3]
-    bridge = bridge_mod.ResearchDataBridge(cfg)
-
-    async def _send_raw_http(method: str, path: str, headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
-        reader = asyncio.StreamReader()
-        hdr_lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1"]
-        for hk, hv in (headers or {}).items():
-            hdr_lines.append(f"{hk}: {hv}")
-        raw_req = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("utf-8")
-        reader.feed_data(raw_req)
-        reader.feed_eof()
-        buf = bytearray()
-        writer = create_autospec(asyncio.StreamWriter, instance=True)
-        writer.write.side_effect = buf.extend
-        writer.drain.return_value = None
-        writer.close.return_value = None
-        writer.wait_closed.return_value = None
-        await bridge_mod._handle_client(bridge, reader, writer)
-        resp_text = buf.decode("utf-8", errors="replace")
-        head, body_str = resp_text.split("\r\n\r\n", 1)
-        status_code = int(head.splitlines()[0].split(" ")[1])
-        return status_code, (json.loads(body_str) if body_str.strip() else {})
-
-    # Unauthorized request -> 401
-    code_unauth, _ = await _send_raw_http("GET", "/jobs/conversation-archive")
-    assert code_unauth == 401
-
-    # MCP token is rejected on admin endpoints -> 403
-    code_mcp_tok, _ = await _send_raw_http(
-        "GET",
-        "/jobs/conversation-archive",
-        {"Authorization": "Bearer bridge-secret-token"},
-    )
-    assert code_mcp_tok in (401, 403)
-
-    auth_headers = {"Authorization": "Bearer bridge-admin-secret-token"}
-
-    # Authorized GET -> returns sanitized log_tail (multi-cookie, Bearer, paths, 40+ char hex/b64 all redacted)
-    code_get, data = await _send_raw_http("GET", "/jobs/conversation-archive", auth_headers)
-    assert code_get == 200
-    assert data["status"] == "on"
-    assert "secret-token-1234567890" not in data["log_tail"]
-    assert "super-secret-cookie" not in data["log_tail"]
-    assert "b=2" not in data["log_tail"]
-    assert "xyz987654321" not in data["log_tail"]
-    assert "0123456789abcdef0123456789abcdef01234567" not in data["log_tail"]
-    assert "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkw" not in data["log_tail"]
-    assert "/Users/alice" not in data["log_tail"]
-    assert "/private/tmp" not in data["log_tail"]
-    assert "[REDACTED]" in data["log_tail"]
-    assert "<local>" in data["log_tail"]
-
-    # Disable via POST /jobs/conversation-archive/disable
-    code_dis, dis_body = await _send_raw_http("POST", "/jobs/conversation-archive/disable", auth_headers)
-    assert code_dis == 200
-    assert dis_body["enabled"] is False
-    assert json.loads(state_file.read_text(encoding="utf-8"))["enabled"] is False
-
-    # Run archive_daily.sh when disabled -> exits 0 and records "已关闭"
-    script_path = (
-        Path(__file__).resolve().parents[3]
-        / "scripts"
-        / "dalton"
-        / "launchd"
-        / "archive_daily.sh"
-    )
-    env = {
-        **os.environ,
-        "DALTON_ARCHIVE_STATE_FILE": str(state_file),
-        "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
-    }
-    proc_res = await asyncio.to_thread(
-        subprocess.run,
-        ["/bin/bash", str(script_path)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert proc_res.returncode == 0
-    assert "已关闭" in proc_res.stdout
-    status_saved = json.loads(status_file.read_text(encoding="utf-8"))
-    assert status_saved["exit_code"] == 0
-    assert status_saved["last_result"] == "已关闭"
-
-    # GET /jobs/conversation-archive preserves saved last_result ("已关闭") instead of overwriting with "成功 (exit_code=0)"
-    code_get_after_dis, data_after_dis = await _send_raw_http("GET", "/jobs/conversation-archive", auth_headers)
-    assert code_get_after_dis == 200
-    assert data_after_dis["last_result"] == "已关闭"
-
-    # Simulate in-flight process lock conflict via create_autospec -> returns already_running
-    running_proc = create_autospec(asyncio.subprocess.Process, instance=True)
-    running_proc.pid = 42424
-    running_proc.returncode = None
-
-    bridge._archive_proc = running_proc
-    code_conflict, conflict_body = await _send_raw_http(
-        "POST", "/jobs/conversation-archive/run", auth_headers
-    )
-    assert code_conflict == 200
-    assert conflict_body["status"] == "already_running"
-    assert conflict_body["already_running"] is True
 
 
 @pytest.mark.asyncio
@@ -692,16 +540,6 @@ async def test_permission_boundaries_for_analyst_ops_and_non_pm(
     assert out_home["ok"] is False
     assert out_home["error"] == "forbidden_scope"
 
-    # Analyst refused on Host job
-    out_host = json.loads(
-        await analyst_sys_tool.ainvoke(
-            {"action": "run_now", "key": "conversation-archive"},
-            config=analyst_cfg,
-        )
-    )
-    assert out_host["ok"] is False
-    assert out_host["error"] == "forbidden_scope"
-
     # Analyst refused on another company's job
     out_other_co = json.loads(
         await analyst_sys_tool.ainvoke(
@@ -745,11 +583,6 @@ async def test_permission_boundaries_for_analyst_ops_and_non_pm(
     )
     assert r_home_non_pm.status_code == 403
 
-    r_host_non_pm = http_client.post(
-        "/api/v1/dalton/system-jobs/conversation-archive/run",
-    )
-    assert r_host_non_pm.status_code == 403
-
     current_uid["uid"] = USER_ID  # PM user
     r_ops_pm = http_client.post(
         "/api/v1/dalton/system-jobs/ops-db-backup",
@@ -782,20 +615,9 @@ async def test_permission_boundaries_for_analyst_ops_and_non_pm(
     assert out_run_now["where_to_check"]
     assert out_run_now["where_to_check"] in out_run_now["message"]
 
-    # Non-PM Chief of Staff rejected when calling `enable` on host archive via tool (Item 1)
-    non_pm_cos_cfg = {"configurable": {"user_id": "non-pm-member", "workspace_id": "home"}}
-    out_non_pm_tool = json.loads(
-        await cos_sys_tool.ainvoke(
-            {"action": "enable", "key": "conversation-archive"},
-            config=non_pm_cos_cfg,
-        )
-    )
-    assert out_non_pm_tool["ok"] is False
-    assert out_non_pm_tool["error"] == "forbidden_pm"
-
-    # Non-PM rejected at service layer for both Home and Host toggle/run_now
+    # Non-PM rejected at service layer for Home toggle/run_now
     with pytest.raises(PermissionError):
-        await system_jobs_mod.toggle_system_job("non-pm-member", "conversation-archive", enabled=True)
+        await system_jobs_mod.toggle_system_job("non-pm-member", "dalton-data-health", enabled=True)
     with pytest.raises(PermissionError):
         await system_jobs_mod.run_system_job_now("non-pm-member", "dalton-data-health")
 
@@ -976,108 +798,17 @@ async def test_data_health_ignores_autonomy_disabled_and_timeout_reason(
     )
 
 
-@pytest.mark.asyncio
-async def test_bridge_delayed_exit_code_2_and_timeout_cleanup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Item 7: Delayed exit code 2 (>0.5s) records `已在运行，跳过`; subprocess timeout terminates, kills, closes log, clears `_archive_proc`, and removes PID file."""
-    cfg = bridge_mod.BridgeConfig()
-    cfg.archive_state_file = tmp_path / "state.json"
-    cfg.archive_status_file = tmp_path / "status.json"
-    cfg.archive_log_file = tmp_path / "archive.log"
-    cfg.archive_run_timeout_s = 0.05
-    monkeypatch.setenv("DALTON_ARCHIVE_PID_FILE", str(tmp_path / "conversation-archive.pid"))
-    bridge = bridge_mod.ResearchDataBridge(cfg)
-
-    # 1) Delayed exit code 2 (exits after startup probe in _watch_archive_proc)
-    proc_conflict = create_autospec(asyncio.subprocess.Process, instance=True)
-    proc_conflict.pid = 54321
-    proc_conflict.returncode = 2
-
-    async def _wait_exit_2() -> int:
-        await asyncio.sleep(0.01)
-        return 2
-
-    proc_conflict.wait.side_effect = _wait_exit_2
-    bridge._write_archive_pid_file(54321)
-    bridge._archive_proc = proc_conflict
-    await bridge._watch_archive_proc(proc_conflict, "2026-10-23T00:00:00+00:00")
-    saved_2 = json.loads(cfg.archive_status_file.read_text(encoding="utf-8"))
-    assert saved_2["exit_code"] == 2
-    assert saved_2["last_result"] == "已在运行，跳过"
-    assert bridge._archive_proc is None
-    assert not (tmp_path / "conversation-archive.pid").exists()
-
-    # 2) Subprocess timeout -> terminate -> kill -> wait -> "运行超时"
-    proc_hung = create_autospec(asyncio.subprocess.Process, instance=True)
-    proc_hung.pid = 54322
-    proc_hung.returncode = None
-
-    wait_calls = {"n": 0}
-
-    async def _hung_wait() -> int:
-        wait_calls["n"] += 1
-        if wait_calls["n"] == 1:
-            await asyncio.sleep(1.0)
-        proc_hung.returncode = -9
-        return -9
-
-    proc_hung.wait.side_effect = _hung_wait
-    bridge._write_archive_pid_file(54322)
-    bridge._archive_proc = proc_hung
-    log_fh = cfg.archive_log_file.open("ab")
-    await bridge._watch_archive_proc(proc_hung, "2026-10-23T01:00:00+00:00", log_fh)
-    assert log_fh.closed
-    proc_hung.terminate.assert_called_once()
-    assert bridge._archive_proc is None
-    assert not (tmp_path / "conversation-archive.pid").exists()
-    saved_timeout = json.loads(cfg.archive_status_file.read_text(encoding="utf-8"))
-    assert saved_timeout["last_result"] == "运行超时"
 
 
 @pytest.mark.asyncio
-async def test_non_pm_strips_log_tail_and_company_run_now_requires_enabled_and_aliases_rejected(
+async def test_company_run_now_requires_enabled_and_aliases_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Items 8, 10, 11, 12, 15: Non-PM responses strip `log_tail`; company `run_now` without watch row refuses; batch aliases rejected; bridge URL parsed via `urllib.parse`; `_trigger_automation_row_async` only falls back on not-found."""
+    """Items 10, 11, 12, 15: company `run_now` without watch row refuses; batch aliases rejected; bridge URL parsed via `urllib.parse`; `_trigger_automation_row_async` only falls back on not-found."""
     import src.dalton.settings as settings_mod
 
     store = _InMemoryAutomationsStore()
     _wire_store(monkeypatch, store)
-
-    async def _fake_bridge(
-        method: str, path: str, *, timeout_s: float = 8.0
-    ) -> tuple[int, dict[str, Any] | None]:
-        if path == "/jobs/conversation-archive":
-            return 200, {
-                "ok": True,
-                "enabled": True,
-                "status": "on",
-                "last_run_at": "2026-10-22T13:15:00+00:00",
-                "exit_code": 0,
-                "last_result": "成功 (exit_code=0)",
-                "log_tail": "some sanitized log tail",
-                "next_run_at": "2026-10-23T21:15:00+08:00",
-                "running": False,
-            }
-        return 200, {"ok": True, "jobs": []}
-
-    monkeypatch.setattr(
-        system_jobs_mod,
-        "_call_host_bridge",
-        create_autospec(system_jobs_mod._call_host_bridge, side_effect=_fake_bridge),
-    )
-
-    # Item 8: Non-PM gets log_tail=None, PM gets log_tail
-    pm_list = await system_jobs_mod.list_system_jobs(USER_ID)
-    pm_host = next(j for j in pm_list["jobs"] if j["key"] == "conversation-archive")
-    assert pm_host["log_tail"] == "some sanitized log tail"
-
-    non_pm_list = await system_jobs_mod.list_system_jobs("non-pm-user")
-    non_pm_host = next(j for j in non_pm_list["jobs"] if j["key"] == "conversation-archive")
-    assert non_pm_host.get("log_tail") is None
-    assert "log_tail" not in non_pm_host
 
     # Item 10: Company `run_now` when `dalton-nvda-watch` is missing raises ValueError and does not enable tracking
     mock_enable = create_autospec(tracking_mod.enable_tracking)
@@ -1131,53 +862,6 @@ async def test_non_pm_strips_log_tail_and_company_run_now_requires_enabled_and_a
     assert mock_create_exec.await_count == 0
 
 
-def test_install_conversation_archive_refuses_overwrite_without_force(
-    tmp_path: Path,
-) -> None:
-    """Item 14: `install_conversation_archive.sh` refuses to overwrite existing plist and prints `diff -u` unless `--force` is given."""
-    script_path = (
-        Path(__file__).resolve().parents[3]
-        / "scripts"
-        / "dalton"
-        / "install_conversation_archive.sh"
-    )
-    fake_home = tmp_path / "home"
-    plist_dest = fake_home / "Library" / "LaunchAgents" / "com.dalton.conversation-archive.plist"
-    plist_dest.parent.mkdir(parents=True, exist_ok=True)
-    plist_dest.write_text("<plist>old-custom-content</plist>\n", encoding="utf-8")
-
-    env = {
-        **os.environ,
-        "HOME": str(fake_home),
-        "DALTON_ARCHIVE_PLIST_DEST": str(plist_dest),
-        "DALTON_SKIP_LAUNCHCTL": "1",
-    }
-
-    # Without --force: exits non-zero, prints unified diff, and leaves existing file untouched
-    res_refuse = subprocess.run(
-        ["/bin/bash", str(script_path)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert res_refuse.returncode != 0
-    combined_out = res_refuse.stdout + res_refuse.stderr
-    assert "---" in combined_out and "+++" in combined_out
-    assert plist_dest.read_text(encoding="utf-8") == "<plist>old-custom-content</plist>\n"
-
-    # With --force: overwrites plist and exits 0
-    res_force = subprocess.run(
-        ["/bin/bash", str(script_path), "--force"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert res_force.returncode == 0
-    assert "com.dalton.conversation-archive" in plist_dest.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -1279,357 +963,6 @@ async def test_preflight_400s_heartbeat_keeps_execution_alive_beyond_300s_stale_
     mock_settle.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_bridge_state_write_oserror_returns_500_and_ok_false_and_cookie_over_8kib_redacted(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """R3 Items 5, 6, 7, 8, 9, 10:
-    - Item 5: State file write OSError returns HTTP 500 with Chinese reason and `ok=False` in both bridge and `system_jobs.toggle_system_job`.
-    - Item 6: `Cookie:` line > 8 KiB is read in full, sanitized first, and truncated to 8 KiB without leaking its tail.
-    - Item 7: `_summarize_last_execution` returns raw `reason` / `excerpt` when `data_health` reason matches neither timeout, failure, nor completion.
-    - Item 8: `archive_daily.sh` logs error and exits non-zero when `STATE_FILE` is corrupted or unreadable.
-    - Item 9: `handle_run_conversation_archive` cleans up on pre-watcher error; `_watch_archive_proc` re-raises `CancelledError` and keeps `_archive_proc`/PID/`log_fh` if process is still alive after final `wait()`.
-    - Item 10: Bridge and `archive_daily.sh` share status-dir `flock` for atomic PID check-and-write; losing side never overwrites or deletes live PID.
-    """
-    store = _InMemoryAutomationsStore()
-    _wire_store(monkeypatch, store)
-
-    cfg = bridge_mod.BridgeConfig()
-    cfg.archive_state_file = tmp_path / "state.json"
-    cfg.archive_status_file = tmp_path / "status.json"
-    cfg.archive_log_file = tmp_path / "archive.log"
-    cfg.archive_err_log_file = tmp_path / "archive.err.log"
-    pid_file = tmp_path / "conversation-archive.pid"
-    monkeypatch.setenv("DALTON_ARCHIVE_PID_FILE", str(pid_file))
-    bridge = bridge_mod.ResearchDataBridge(cfg)
-
-    # --- Item 5 & R4 Item 1: Writing archive state file raises OSError -> bridge returns 500 + ok=False, toggle_system_job raises RuntimeError, router returns HTTP 500 with Chinese reason ---
-    def _boom_replace(src: Any, dst: Any) -> None:
-        raise OSError("disk full")
-
-    with monkeypatch.context() as mp:
-        mp.setattr(bridge_mod.os, "replace", create_autospec(bridge_mod.os.replace, side_effect=_boom_replace))
-        code_500, body_500 = await bridge.handle_toggle_conversation_archive(False)
-        assert code_500 == 500
-        assert body_500["ok"] is False
-        assert "失败" in body_500["error"]
-
-        async def _bridge_500(
-            method: str, path: str, *, timeout_s: float = 8.0
-        ) -> tuple[int, dict[str, Any] | None]:
-            return code_500, body_500
-
-        mp.setattr(
-            system_jobs_mod,
-            "_call_host_bridge",
-            create_autospec(system_jobs_mod._call_host_bridge, side_effect=_bridge_500),
-        )
-        with pytest.raises(RuntimeError, match="切换团队对话归档状态失败"):
-            await system_jobs_mod.toggle_system_job(
-                USER_ID,
-                "conversation-archive",
-                enabled=False,
-            )
-
-        app = FastAPI()
-        app.dependency_overrides[get_current_user_id] = lambda: USER_ID
-        app.include_router(dalton_router)
-        http_client = TestClient(app, raise_server_exceptions=False)
-        resp_toggle_500 = http_client.post(
-            "/api/v1/dalton/system-jobs/conversation-archive",
-            json={"enabled": False},
-        )
-        assert resp_toggle_500.status_code == 500
-        assert "切换团队对话归档状态失败" in resp_toggle_500.json().get("detail", "")
-
-    # --- Item 6: Cookie line > 8 KiB is read as a complete line, sanitized before 8 KiB truncation, and never leaks tail ---
-    long_cookie_line = "Cookie: session=head_secret;" + (" padding_key=padding_val;" * 450) + " tail_secret=LEAKED_COOKIE_TAIL_999"
-    assert len(long_cookie_line.encode("utf-8")) > 10000
-    cfg.archive_log_file.write_text(
-        "2026-10-23T21:15:00Z [INFO] starting archive\n" + long_cookie_line + "\n",
-        encoding="utf-8",
-    )
-    sanitized_tail = bridge._read_sanitized_archive_log_tail()
-    assert "LEAKED_COOKIE_TAIL_999" not in sanitized_tail
-    assert "head_secret" not in sanitized_tail
-    assert "Cookie: [REDACTED]" in sanitized_tail
-    assert len(sanitized_tail.encode("utf-8")) <= 8192
-
-    # --- Item 7: `_summarize_last_execution` returns raw reason/excerpt instead of hardcoded "体检完成" on custom reason ---
-    _, custom_summary = system_jobs_mod._summarize_last_execution(
-        {"status": "skipped", "skip_reason": "precheck", "excerpt": "数据源配置未变更，跳过本轮探测"},
-        kind="data_health",
-    )
-    assert custom_summary == "数据源配置未变更，跳过本轮探测"
-    assert custom_summary != "体检完成"
-
-    # --- Item 8: `archive_daily.sh` logs error and exits non-zero when state file is corrupted ---
-    script_path = (
-        Path(__file__).resolve().parents[3]
-        / "scripts"
-        / "dalton"
-        / "launchd"
-        / "archive_daily.sh"
-    )
-    cfg.archive_state_file.write_text("{corrupted-json-not-valid", encoding="utf-8")
-    marker_file = tmp_path / "should_not_run.marker"
-    fake_archive_py = tmp_path / "fake_archive.py"
-    fake_archive_py.write_text(
-        f"from pathlib import Path\nPath({str(marker_file)!r}).write_text('ran', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    corrupt_res = await asyncio.to_thread(
-        subprocess.run,
-        ["/bin/bash", str(script_path)],
-        env={
-            **os.environ,
-            "DALTON_ARCHIVE_STATE_FILE": str(cfg.archive_state_file),
-            "DALTON_ARCHIVE_STATUS_FILE": str(cfg.archive_status_file),
-            "DALTON_ARCHIVE_PID_FILE": str(pid_file),
-            "DALTON_CONVERSATION_ARCHIVE_PY": str(fake_archive_py),
-        },
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert corrupt_res.returncode != 0
-    assert "ERROR" in (corrupt_res.stderr + corrupt_res.stdout)
-    assert not marker_file.exists()
-
-    # Restore valid state file for Item 10
-    cfg.archive_state_file.write_text('{"enabled": true}\n', encoding="utf-8")
-
-    # --- Item 10 & R4 Item 2: Atomic PID check-and-write under shared status-dir flock; distinguishes already_running vs error ---
-    live_winner_pid = os.getpid()
-    assert bridge._write_archive_pid_file(live_winner_pid) == "written"
-    assert pid_file.read_text(encoding="utf-8").strip() == str(live_winner_pid)
-    assert (cfg.archive_status_file.with_name(f"{cfg.archive_status_file.name}.lock")).exists()
-
-    # Losing bridge side attempting to write a different PID sees live winner PID -> returns "already_running"
-    assert bridge._write_archive_pid_file(live_winner_pid + 99999) == "already_running"
-    assert pid_file.read_text(encoding="utf-8").strip() == str(live_winner_pid)
-
-    # Losing bridge side attempting to remove with a different expected_pid does not delete live winner PID
-    bridge._remove_archive_pid_file(expected_pid=live_winner_pid + 99999)
-    assert pid_file.read_text(encoding="utf-8").strip() == str(live_winner_pid)
-
-    # Losing `archive_daily.sh` side sees live winner PID under flock, exits without overwriting or deleting winner PID
-    busy_res = await asyncio.to_thread(
-        subprocess.run,
-        ["/bin/bash", str(script_path)],
-        env={
-            **os.environ,
-            "DALTON_ARCHIVE_STATE_FILE": str(cfg.archive_state_file),
-            "DALTON_ARCHIVE_STATUS_FILE": str(cfg.archive_status_file),
-            "DALTON_ARCHIVE_PID_FILE": str(pid_file),
-            "DALTON_CONVERSATION_ARCHIVE_PY": str(fake_archive_py),
-        },
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    assert busy_res.returncode == 0
-    assert "已在运行" in busy_res.stdout
-    assert pid_file.exists()
-    assert pid_file.read_text(encoding="utf-8").strip() == str(live_winner_pid)
-    bridge._remove_archive_pid_file(expected_pid=live_winner_pid)
-    assert not pid_file.exists()
-
-    # --- R4 Item 2: PID write failure returns "error" (not "already_running"), bridge returns 500 + Chinese error and reaps spawned proc; run_system_job_now rejects 200 + ok:false ---
-    proc_pid_err = create_autospec(asyncio.subprocess.Process, instance=True)
-    proc_pid_err.pid = 76543
-    proc_pid_err.returncode = None
-
-    async def _reap_wait() -> int:
-        proc_pid_err.returncode = -15
-        return -15
-
-    proc_pid_err.wait.side_effect = _reap_wait
-    with monkeypatch.context() as mp:
-        mp.setattr(
-            bridge_mod.asyncio,
-            "create_subprocess_exec",
-            create_autospec(bridge_mod.asyncio.create_subprocess_exec, return_value=proc_pid_err),
-        )
-        mp.setattr(bridge_mod.os, "replace", create_autospec(bridge_mod.os.replace, side_effect=_boom_replace))
-        assert bridge._write_archive_pid_file(76543) == "error"
-        code_pid_500, body_pid_500 = await bridge.handle_run_conversation_archive()
-        assert code_pid_500 == 500
-        assert body_pid_500["ok"] is False
-        assert body_pid_500["status"] == "error"
-        assert "写入团队对话归档 PID 文件失败" in body_pid_500["error"]
-        proc_pid_err.terminate.assert_called_once()
-        assert bridge._archive_proc is None
-
-        # run_system_job_now must NOT treat 200 with ok:false as success
-        async def _bridge_200_ok_false(
-            method: str, path: str, *, timeout_s: float = 8.0
-        ) -> tuple[int, dict[str, Any] | None]:
-            return 200, {
-                "ok": False,
-                "key": "conversation-archive",
-                "status": "already_running",
-                "already_running": True,
-                "error": "已有归档在运行",
-            }
-
-        mp.setattr(
-            system_jobs_mod,
-            "_call_host_bridge",
-            create_autospec(system_jobs_mod._call_host_bridge, side_effect=_bridge_200_ok_false),
-        )
-        with pytest.raises(RuntimeError, match="已有归档在运行"):
-            await system_jobs_mod.run_system_job_now(USER_ID, "conversation-archive")
-
-    # --- Item 9a: `handle_run_conversation_archive` cleans up `log_fh`, terminates `proc`, and removes PID file if an error occurs before watcher registration ---
-    cfg.archive_startup_probe_s = 0.01
-    proc_spawned = create_autospec(asyncio.subprocess.Process, instance=True)
-    proc_spawned.pid = 65432
-    proc_spawned.returncode = None
-    spawn_wait_calls = {"n": 0}
-
-    async def _wait_after_term() -> int:
-        spawn_wait_calls["n"] += 1
-        if spawn_wait_calls["n"] == 1:
-            await asyncio.sleep(1.0)
-        proc_spawned.returncode = -15
-        return -15
-
-    proc_spawned.wait.side_effect = _wait_after_term
-
-    def _boom_create_task(coro: Any, *args: Any, **kwargs: Any) -> Any:
-        coro.close()
-        raise RuntimeError("event loop create_task failed")
-
-    with monkeypatch.context() as mp:
-        mp.setattr(
-            bridge_mod.asyncio,
-            "create_subprocess_exec",
-            create_autospec(bridge_mod.asyncio.create_subprocess_exec, return_value=proc_spawned),
-        )
-        mp.setattr(
-            bridge_mod.asyncio,
-            "create_task",
-            create_autospec(bridge_mod.asyncio.create_task, side_effect=_boom_create_task),
-        )
-        with pytest.raises(RuntimeError, match="event loop create_task failed"):
-            await bridge.handle_run_conversation_archive()
-
-    proc_spawned.terminate.assert_called_once()
-    assert bridge._archive_proc is None
-    assert not pid_file.exists()
-
-    # --- R4 Item 3: Startup stage final `wait` failure keeps `_archive_proc`, PID file, and open `log_fh`, and re-raises `CancelledError` ---
-    proc_startup_immortal = create_autospec(asyncio.subprocess.Process, instance=True)
-    proc_startup_immortal.pid = live_winner_pid
-    proc_startup_immortal.returncode = None
-    startup_wait_step = {"n": 0}
-
-    async def _startup_immortal_wait() -> int:
-        startup_wait_step["n"] += 1
-        if startup_wait_step["n"] == 1:
-            await asyncio.sleep(1.0)
-        if startup_wait_step["n"] == 2:
-            raise asyncio.CancelledError()
-        raise RuntimeError("final wait after kill failed")
-
-    proc_startup_immortal.wait.side_effect = _startup_immortal_wait
-    opened_log_handles: list[Any] = []
-    real_log_open = Path.open
-
-    def _track_log_open(self_path: Path, *args: Any, **kwargs: Any) -> Any:
-        fh = real_log_open(self_path, *args, **kwargs)
-        if self_path == cfg.archive_log_file:
-            opened_log_handles.append(fh)
-        return fh
-
-    with monkeypatch.context() as mp:
-        mp.setattr(Path, "open", _track_log_open)
-        mp.setattr(
-            bridge_mod.asyncio,
-            "create_subprocess_exec",
-            create_autospec(bridge_mod.asyncio.create_subprocess_exec, return_value=proc_startup_immortal),
-        )
-        mp.setattr(
-            bridge_mod.asyncio,
-            "create_task",
-            create_autospec(bridge_mod.asyncio.create_task, side_effect=_boom_create_task),
-        )
-        try:
-            with pytest.raises(asyncio.CancelledError):
-                await bridge.handle_run_conversation_archive()
-            proc_startup_immortal.terminate.assert_called_once()
-            proc_startup_immortal.kill.assert_called_once()
-            assert bridge._archive_proc is proc_startup_immortal
-            assert pid_file.exists()
-            assert opened_log_handles and not opened_log_handles[-1].closed
-        finally:
-            for fh in opened_log_handles:
-                if not fh.closed:
-                    fh.close()
-            bridge._archive_proc = None
-            bridge._remove_archive_pid_file(expected_pid=live_winner_pid)
-
-    # --- Item 9b: `_watch_archive_proc` re-raises `CancelledError` and keeps `_archive_proc`, PID file, and `log_fh` when process is still alive after final `wait()` ---
-    proc_immortal = create_autospec(asyncio.subprocess.Process, instance=True)
-    proc_immortal.pid = live_winner_pid
-    proc_immortal.returncode = None
-
-    wait_step = {"n": 0}
-
-    async def _immortal_wait() -> int:
-        wait_step["n"] += 1
-        if wait_step["n"] == 1:
-            raise asyncio.CancelledError()
-        raise RuntimeError("wait failed, process still alive")
-
-    proc_immortal.wait.side_effect = _immortal_wait
-    bridge._write_archive_pid_file(live_winner_pid)
-    bridge._archive_proc = proc_immortal
-    immortal_log_fh = cfg.archive_log_file.open("ab")
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await bridge._watch_archive_proc(
-                proc_immortal,
-                "2026-10-23T02:00:00+00:00",
-                immortal_log_fh,
-            )
-        # Process still has returncode=None -> _archive_proc, PID file, and log_fh must NOT be cleared/closed
-        assert bridge._archive_proc is proc_immortal
-        assert pid_file.exists()
-        assert not immortal_log_fh.closed
-    finally:
-        immortal_log_fh.close()
-        bridge._archive_proc = None
-        bridge._remove_archive_pid_file(expected_pid=live_winner_pid)
-
-    # The settings card is read-only. It no longer handles a switch result or
-    # calls the toggle and run-now endpoints. WorkspaceTrackingToggle still
-    # imports its hooks from the Dalton-local `./useWorkspaceTracking`.
-    repo_root = Path(__file__).resolve().parents[3]
-    card_src = (
-        repo_root / "web/src/pages/Settings/panels/dalton/DaltonSystemJobsCard.tsx"
-    ).read_text(encoding="utf-8")
-    assert "res?.ok === true" not in card_src
-    assert "toggleDaltonSystemJob" not in card_src
-    assert "runDaltonSystemJobNow" not in card_src
-    assert "立即运行" not in card_src
-    # The read-only promise now lives in the card's translated description.
-    zh = json.loads((repo_root / "web/src/locales/zh-CN.json").read_text(encoding="utf-8"))
-    assert zh["dalton"]["systemJobs"]["description"].startswith("只读查看")
-    assert "useRunDaltonSystemJobNow" not in card_src
-    assert "useToggleDaltonSystemJob" not in card_src
-    assert 'testId="dalton-system-jobs-automations-link"' in card_src
-
-    toggle_src = (
-        repo_root / "web/src/pages/ChatAgent/components/dalton/WorkspaceTrackingToggle.tsx"
-    ).read_text(encoding="utf-8")
-    assert "from './useWorkspaceTracking'" in toggle_src
-    assert "export function useWorkspaceTracking" not in toggle_src
-    assert "export function useUpdateWorkspaceTracking" not in toggle_src
 
 
 @pytest.mark.asyncio
@@ -1646,9 +979,6 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     import src.dalton.conversations.embedder as embedder_mod
     import src.dalton.settings as settings_mod
 
-    state_file = tmp_path / "archive-state.json"
-    status_file = tmp_path / "archive-status.json"
-    log_file = tmp_path / "archive.log"
     env_file = tmp_path / "researchdata-bridge.env"
     env_file.write_text(
         "DALTON_BRIDGE_TOKEN=mcp-sandbox-token-111\n"
@@ -1663,9 +993,6 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     cfg = bridge_mod.BridgeConfig()
     assert cfg.token == "mcp-sandbox-token-111"
     assert cfg.admin_token == "admin-host-token-222"
-    cfg.archive_state_file = state_file
-    cfg.archive_status_file = status_file
-    cfg.archive_log_file = log_file
     cfg.repo_root = Path(__file__).resolve().parents[3]
     bridge = bridge_mod.ResearchDataBridge(cfg)
 
@@ -1719,16 +1046,11 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     mcp_headers = {"Authorization": "Bearer mcp-sandbox-token-111"}
     admin_headers = {"Authorization": "Bearer admin-host-token-222"}
 
-    # 1. Calling /embed, /jobs/conversation-archive/disable, /jobs/ops with MCP token returns 401/403
+    # 1. Calling /embed, /jobs/ops with MCP token returns 401/403
     code_embed_mcp, _ = await _send_http_req(
         bridge, "POST", "/embed", headers=mcp_headers, body_obj={"texts": ["hello"]}
     )
     assert code_embed_mcp in (401, 403)
-
-    code_disable_mcp, _ = await _send_http_req(
-        bridge, "POST", "/jobs/conversation-archive/disable", headers=mcp_headers
-    )
-    assert code_disable_mcp in (401, 403)
 
     code_ops_mcp, _ = await _send_http_req(
         bridge, "GET", "/jobs/ops", headers=mcp_headers
@@ -1741,19 +1063,12 @@ async def test_bridge_admin_token_separation_and_backend_callers(
     )
     assert code_future_mcp in (401, 403)
 
-    # 2. Calling /embed, /jobs/conversation-archive/disable, /jobs/ops with admin token succeeds (200)
+    # 2. Calling /embed, /jobs/ops with admin token succeeds (200)
     code_embed_admin, body_embed_admin = await _send_http_req(
         bridge, "POST", "/embed", headers=admin_headers, body_obj={"texts": ["hello"]}
     )
     assert code_embed_admin == 200
     assert body_embed_admin["ok"] is True
-
-    code_disable_admin, body_disable_admin = await _send_http_req(
-        bridge, "POST", "/jobs/conversation-archive/disable", headers=admin_headers
-    )
-    assert code_disable_admin == 200
-    assert body_disable_admin["ok"] is True
-    assert body_disable_admin["enabled"] is False
 
     code_ops_admin, body_ops_admin = await _send_http_req(
         bridge, "GET", "/jobs/ops", headers=admin_headers
@@ -1791,7 +1106,6 @@ async def test_bridge_admin_token_separation_and_backend_callers(
 
     for method, path, body in (
         ("POST", "/embed", {"texts": ["hello"]}),
-        ("POST", "/jobs/conversation-archive/disable", None),
         ("GET", "/jobs/ops", None),
     ):
         code_fail_closed, _ = await _send_http_req(
@@ -2245,12 +1559,12 @@ def test_transformed_command_log_redacts_management_tokens(
 
 
 @pytest.mark.asyncio
-async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
+async def test_realtime_ops_jobs_and_calendar_interval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify real-time ops jobs inspection (pg-backup + backend-watchdog, no ops-log-rotate),
-    archive log tail slicing from the last `=== ` run header, and host schedule metadata.
+    """Verify real-time ops jobs inspection (pg-backup + backend-watchdog, no ops-log-rotate)
+    and DST-safe host schedule metadata calculation.
     """
     import plistlib
     from datetime import datetime, timedelta
@@ -2259,7 +1573,6 @@ async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
     pg_plist = tmp_path / "com.dalton.pg-backup.plist"
     wd_plist = tmp_path / "com.dalton.backend-watchdog.plist"
     wd_failures = tmp_path / ".watchdog_failures"
-    archive_log = tmp_path / "dalton-conversation-archive.log"
 
     pg_log.write_text(
         "2026-10-25 04:00:01 ok 750M /Users/alice/Backups/dalton-pg-20261025-040000.dump\n"
@@ -2288,7 +1601,6 @@ async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
     monkeypatch.setenv("DALTON_PG_BACKUP_PLIST_FILE", str(pg_plist))
     monkeypatch.setenv("DALTON_BACKEND_WATCHDOG_PLIST_FILE", str(wd_plist))
     monkeypatch.setenv("DALTON_WATCHDOG_FAILURES_FILE", str(wd_failures))
-    monkeypatch.setenv("DALTON_ARCHIVE_LOG_FILE", str(archive_log))
 
     cfg = bridge_mod.BridgeConfig()
     bridge = bridge_mod.ResearchDataBridge(cfg)
@@ -2392,33 +1704,6 @@ async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
         _, payload_invalid = await bridge.handle_get_ops_jobs()
         assert payload_invalid["jobs"][1]["last_result"] is None
 
-    # Verify _read_sanitized_archive_log_tail slices from the last `=== ` run header (not `=== exit`)
-    # and ignores stderr file when stdout has a `=== ` boundary
-    archive_err_log = tmp_path / "dalton-conversation-archive.err.log"
-    cfg.archive_err_log_file = archive_err_log
-    archive_err_log.write_text("STALE_STDERR_FROM_OTHER_RUN\n", encoding="utf-8")
-    archive_log.write_text(
-        "=== 2026-10-25 21:15:00 EDT attempt 1\n"
-        "OLD_RUN_ERROR_LINE_SHOULD_NOT_APPEAR\n"
-        "=== exit 1\n"
-        "=== 2026-10-26 21:15:00 EDT attempt 1\n"
-        "latest run line 1\n"
-        "=== exit 0\n",
-        encoding="utf-8",
-    )
-    tail = bridge._read_sanitized_archive_log_tail()
-    assert "OLD_RUN_ERROR_LINE_SHOULD_NOT_APPEAR" not in tail
-    assert "STALE_STDERR_FROM_OTHER_RUN" not in tail
-    assert "=== 2026-10-25 21:15:00 EDT attempt 1" not in tail
-    assert "=== 2026-10-26 21:15:00 EDT attempt 1" in tail
-    assert "latest run line 1" in tail
-    assert "=== exit 0" in tail
-
-    # When stdout has no `=== ` boundary (e.g. empty), stderr is used as fallback
-    archive_log.write_text("", encoding="utf-8")
-    fallback_tail = bridge._read_sanitized_archive_log_tail()
-    assert "STALE_STDERR_FROM_OTHER_RUN" in fallback_tail
-
     # Verify _compute_next_calendar_interval_iso across DST boundary (2026-10-31 -> 2026-11-01 04:30 in America/New_York is -05:00)
     from zoneinfo import ZoneInfo
 
@@ -2444,197 +1729,17 @@ async def test_realtime_ops_jobs_and_archive_last_run_log_slice(
             is None
         )
 
-    # Verify _compute_next_archive_run_at reads archive plist (and returns None when disabled)
-    archive_plist = tmp_path / "com.dalton.conversation-archive.plist"
-    archive_plist.write_bytes(
-        plistlib.dumps(
-            {
-                "Label": "com.dalton.conversation-archive",
-                "StartCalendarInterval": {"Hour": 21, "Minute": 15},
-            }
-        )
+
+def test_summarize_last_execution_custom_reason() -> None:
+    """`_summarize_last_execution` returns raw reason/excerpt instead of hardcoded fallback."""
+    _, custom_summary = system_jobs_mod._summarize_last_execution(
+        {"status": "skipped", "skip_reason": "precheck", "excerpt": "数据源配置未变更，跳过本轮探测"},
+        kind="data_health",
     )
-    cfg.archive_plist_file = archive_plist
-    assert bridge._compute_next_archive_run_at(enabled=False, now=now_before_dst_end) is None
-    archive_next_iso = bridge._compute_next_archive_run_at(enabled=True, now=now_before_dst_end)
-    assert archive_next_iso is not None
-    parsed_archive_next = datetime.fromisoformat(archive_next_iso)
-    assert (parsed_archive_next.hour, parsed_archive_next.minute) == (21, 15)
-
-    # Verify _fetch_host_conversation_archive_job has schedule=None and no hardcoded 21:15 in description
-    monkeypatch.setattr(
-        system_jobs_mod,
-        "_call_host_bridge",
-        create_autospec(
-            system_jobs_mod._call_host_bridge,
-            return_value=(
-                200,
-                {
-                    "ok": True,
-                    "enabled": True,
-                    "status": "on",
-                    "last_run_at": "2026-10-26T01:15:00+00:00",
-                    "exit_code": 0,
-                    "last_result": "成功 (exit_code=0)",
-                    "log_tail": tail,
-                    "next_run_at": "2026-10-27T01:15:00+00:00",
-                    "running": False,
-                },
-            ),
-        ),
-    )
-    host_item = await system_jobs_mod._fetch_host_conversation_archive_job()
-    assert host_item["schedule"] is None
-    assert "21:15" not in host_item["description"]
+    assert custom_summary == "数据源配置未变更，跳过本轮探测"
+    assert custom_summary != "体检完成"
 
 
-@pytest.mark.asyncio
-async def test_archive_disconnects_only_owned_builtin_mcp_registry_and_archive_daily_retry(
-    tmp_path: Path,
-) -> None:
-    """Verify `_disconnect_workspace_manager_mcp` only disconnects owned `_builtin_mcp_registry`
-    (never borrowed `_builtin_mcp_registry` or composite `mcp_registry`), and `archive_daily.sh`
-    retries once on exit code 3 with `=== <time> attempt N` / `=== exit <rc>` boundaries.
-    """
-    from types import SimpleNamespace
-
-    import scripts.dalton.conversation_archive as archive_mod
-    from src.ptc_agent.core.mcp_registry import MCPRegistry
-    from src.ptc_agent.core.session import Session
-
-    sess_owned = create_autospec(Session, instance=True)
-    sess_owned._builtin_mcp_registry = create_autospec(MCPRegistry, instance=True)
-    sess_owned._owns_mcp_registry = True
-    sess_owned.mcp_registry = create_autospec(MCPRegistry, instance=True)
-
-    sess_borrowed = create_autospec(Session, instance=True)
-    sess_borrowed._builtin_mcp_registry = create_autospec(MCPRegistry, instance=True)
-    sess_borrowed._owns_mcp_registry = False
-    sess_borrowed.mcp_registry = create_autospec(MCPRegistry, instance=True)
-
-    wm_stub = SimpleNamespace(
-        _machines={
-            "ws-owned": SimpleNamespace(session=sess_owned),
-            "ws-borrowed": SimpleNamespace(session=sess_borrowed),
-        }
-    )
-
-    await archive_mod._disconnect_workspace_manager_mcp(wm_stub, timeout_s=5.0)
-
-    sess_owned._builtin_mcp_registry.disconnect_all.assert_awaited_once()
-    sess_borrowed._builtin_mcp_registry.disconnect_all.assert_not_called()
-    sess_owned.mcp_registry.disconnect_all.assert_not_called()
-    sess_borrowed.mcp_registry.disconnect_all.assert_not_called()
-    sess_owned.cleanup.assert_not_called()
-    sess_owned.stop.assert_not_called()
-    sess_borrowed.cleanup.assert_not_called()
-    sess_borrowed.stop.assert_not_called()
-
-    # Verify archive_daily.sh retries on rc=3 (attempt 1 -> rc 3, attempt 2 -> rc 0) and writes final status
-    script_path = (
-        Path(__file__).resolve().parents[3]
-        / "scripts"
-        / "dalton"
-        / "launchd"
-        / "archive_daily.sh"
-    )
-    state_file = tmp_path / "state.json"
-    status_file = tmp_path / "status.json"
-    pid_file = tmp_path / "archive.pid"
-    count_file = tmp_path / "attempts.txt"
-    fake_py_script = tmp_path / "fake_archive_retry.py"
-    synth_repo_env = tmp_path / "repo.env"
-    synth_bridge_env = tmp_path / "bridge.env"
-    synth_repo_env.write_text(
-        "DB_HOST=127.0.0.1\n"
-        "DB_PORT=5432\n"
-        "DB_NAME=dalton_test\n"
-        "DB_USER=postgres\n"
-        "DB_PASSWORD=synth_db_pw\n"
-        "BYOK_ENCRYPTION_KEY=c3ludGgtYnlvay1rZXktMzItYnl0ZXMtbG9uZy0wMDA=\n"
-        "AUTH_USER_ID=11111111-1111-4111-8111-111111111111\n"
-        "DALTON_PM_USER_IDS=11111111-1111-4111-8111-111111111111\n"
-        "DALTON_ENABLED=true\n",
-        encoding="utf-8",
-    )
-    synth_bridge_env.write_text(
-        "DALTON_BRIDGE_ADMIN_TOKEN=synth_bridge_admin_tok_123\n",
-        encoding="utf-8",
-    )
-    state_file.write_text('{"enabled": true}\n', encoding="utf-8")
-    fake_py_script.write_text(
-        "import os, sys\n"
-        "from pathlib import Path\n"
-        f"p = Path({str(count_file)!r})\n"
-        "n = int(p.read_text()) + 1 if p.is_file() else 1\n"
-        "p.write_text(str(n))\n"
-        "print(f'embed={os.environ.get(\"DALTON_BRIDGE_EMBED_URL\")} no_proxy={os.environ.get(\"no_proxy\")}')\n"
-        "sys.exit(3 if n == 1 else 0)\n",
-        encoding="utf-8",
-    )
-    res = await asyncio.to_thread(
-        subprocess.run,
-        ["/bin/bash", str(script_path)],
-        env={
-            **os.environ,
-            "DALTON_REPO_ENV_FILE": str(synth_repo_env),
-            "DALTON_BRIDGE_ENV_FILE": str(synth_bridge_env),
-            "DALTON_ARCHIVE_STATE_FILE": str(state_file),
-            "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
-            "DALTON_ARCHIVE_PID_FILE": str(pid_file),
-            "DALTON_CONVERSATION_ARCHIVE_PY": str(fake_py_script),
-            "DALTON_ARCHIVE_RETRY_SLEEP_S": "0",
-        },
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res.returncode == 0
-    assert res.stdout.count("=== ") == 2  # one run header and one final exit line
-    assert "--- attempt 1 exit 3" in res.stdout
-    assert "--- attempt 2 exit 0" in res.stdout
-    assert res.stdout.rstrip().endswith("=== exit 0")
-    assert "embed=http://127.0.0.1:8960/embed" in res.stdout
-    assert "host.docker.internal" in res.stdout
-    saved_status = json.loads(status_file.read_text(encoding="utf-8"))
-    assert saved_status["exit_code"] == 0
-
-    # Switched off while waiting to retry: attempt 2 does not run, final rc stays 3.
-    count_file.unlink()
-    fake_py_script.write_text(
-        "import sys\n"
-        "from pathlib import Path\n"
-        f"p = Path({str(count_file)!r})\n"
-        "n = int(p.read_text()) + 1 if p.is_file() else 1\n"
-        "p.write_text(str(n))\n"
-        f"Path({str(state_file)!r}).write_text('{{\"enabled\": false}}')\n"
-        "sys.exit(3)\n",
-        encoding="utf-8",
-    )
-    state_file.write_text('{"enabled": true}\n', encoding="utf-8")
-    res_off = await asyncio.to_thread(
-        subprocess.run,
-        ["/bin/bash", str(script_path)],
-        env={
-            **os.environ,
-            "DALTON_REPO_ENV_FILE": str(synth_repo_env),
-            "DALTON_BRIDGE_ENV_FILE": str(synth_bridge_env),
-            "DALTON_ARCHIVE_STATE_FILE": str(state_file),
-            "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
-            "DALTON_ARCHIVE_PID_FILE": str(pid_file),
-            "DALTON_CONVERSATION_ARCHIVE_PY": str(fake_py_script),
-            "DALTON_ARCHIVE_RETRY_SLEEP_S": "0",
-        },
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert res_off.returncode == 3
-    assert count_file.read_text() == "1"
-    assert "retry skipped: archive was switched off" in res_off.stdout
-    assert json.loads(status_file.read_text(encoding="utf-8"))["exit_code"] == 3
 
 
 class _InMemoryDataTaskStore:

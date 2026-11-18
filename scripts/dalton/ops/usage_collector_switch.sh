@@ -18,7 +18,7 @@ POINTER_FILE="${DALTON_USAGE_STATE_POINTER_FILE:-${HOME}/.config/dalton/usage-st
 LAUNCH_AGENTS_DIR="${DALTON_LAUNCH_AGENTS_DIR:-${HOME}/Library/LaunchAgents}"
 LOGS_DIR="${DALTON_LOGS_DIR:-${HOME}/Library/Logs}"
 
-SKILL_DIR="${DALTON_USAGE_SKILL_DIR:-${REPO_ROOT}/scripts/dalton/openclaw_overlays/skills/model-usage-cost}"
+SKILL_DIR="${DALTON_USAGE_SKILL_DIR:-${REPO_ROOT}/scripts/dalton/data_assets/skills/model-usage-cost}"
 SKILL_SCRIPTS_DIR="${SKILL_DIR}/scripts"
 HOMEBREW_PY312="${DALTON_HOMEBREW_PYTHON_312:-/opt/homebrew/bin/python3.12}"
 

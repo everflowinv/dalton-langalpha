@@ -13,7 +13,7 @@ import pytest
 
 ENTRY = (
     Path(__file__).resolve().parents[3]
-    / "scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh"
+    / "scripts/dalton/data_assets/scripts/bbg_remote_refresh.sh"
 )
 
 

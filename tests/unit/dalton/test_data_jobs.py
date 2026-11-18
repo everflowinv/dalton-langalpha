@@ -3182,11 +3182,11 @@ async def test_bridge_mirror_mode_production_path_refreshes_no_output_timeout(
     cfg = bridge_mod.BridgeConfig()
     cfg.admin_token = "test-bridge-admin-token"
     cfg.data_tasks_data_root = tmp_path / "openclaw-data"
-    cfg.ocw_root = tmp_path / "openclaw-ws"
+    cfg.research_home = tmp_path / "openclaw-ws"
     cfg.host_task_mirror_poll_interval_s = 0.12
     cfg.host_task_sigterm_grace_s = 0.2
 
-    ocw_temp = cfg.ocw_root / "temp"
+    ocw_temp = cfg.research_home / "temp"
     ocw_temp.mkdir(parents=True, exist_ok=True)
     src_csv = ocw_temp / "bbg_data_latest.csv"
     src_xlsx = ocw_temp / "bbg_data_remote.xlsx"
@@ -5635,187 +5635,6 @@ async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_termina
     )
 
 
-def test_pr04_data_tasks_parity_consistent_inconsistent_and_missing_one_side(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from scripts.dalton.data_tasks_parity import compare_data_tasks_parity, main
-    from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
-
-    dalton_root = tmp_path / "dalton_data"
-    openclaw_root = tmp_path / "openclaw_data"
-
-    def _populate_t18_file(root: Path, payload: dict[str, Any]) -> None:
-        p = root / "temp" / "megacap-relative-signal-monitor" / "latest.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-
-    def _populate_csv_file(root: Path, content: str) -> None:
-        p = root / "state" / "cn-leverage" / "quant_unwind_signals.csv"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-
-    # Slot 1 (2026-11-05T13:30:00Z): Consistent on both sides
-    slot_1 = "2026-11-05T13:30:00Z"
-    payload_same = {
-        "date": "2026-11-05",
-        "rows": [{"ticker": "AAPL", "rsi30": 54.2, "stage2": True}],
-    }
-    _populate_t18_file(dalton_root, payload_same)
-    _populate_t18_file(openclaw_root, payload_same)
-    freeze_task_run_artifacts(
-        data_root=dalton_root,
-        job_key=T18_JOB_KEY,
-        scheduled_slot_utc=slot_1,
-        exit_code=0,
-    )
-    freeze_task_run_artifacts(
-        data_root=openclaw_root,
-        job_key=T18_JOB_KEY,
-        scheduled_slot_utc=slot_1,
-        exit_code=0,
-    )
-
-    # Slot 2 (2026-11-06T13:30:00Z): Inconsistent (different CSV row_count/latest_date, sha256, and core_metrics)
-    slot_2 = "2026-11-06T13:30:00Z"
-    _populate_t18_file(
-        dalton_root,
-        {
-            "date": "2026-11-06",
-            "rows": [{"ticker": "AAPL", "rsi30": 55.0, "stage2": True}],
-        },
-    )
-    _populate_t18_file(
-        openclaw_root,
-        {
-            "date": "2026-11-05",
-            "rows": [{"ticker": "AAPL", "rsi30": 49.0, "stage2": False}],
-        },
-    )
-    _populate_csv_file(
-        dalton_root,
-        "date,val\n2026-11-05,1\n2026-11-06,2\n",
-    )
-    _populate_csv_file(
-        openclaw_root,
-        "date,val\n2026-11-05,1\n",
-    )
-    freeze_task_run_artifacts(
-        data_root=dalton_root,
-        job_key=T18_JOB_KEY,
-        scheduled_slot_utc=slot_2,
-        exit_code=0,
-        freeze_paths=[
-            "temp/megacap-relative-signal-monitor/latest.json",
-            "state/cn-leverage/quant_unwind_signals.csv",
-        ],
-    )
-    freeze_task_run_artifacts(
-        data_root=openclaw_root,
-        job_key=T18_JOB_KEY,
-        scheduled_slot_utc=slot_2,
-        exit_code=0,
-        freeze_paths=[
-            "temp/megacap-relative-signal-monitor/latest.json",
-            "state/cn-leverage/quant_unwind_signals.csv",
-        ],
-    )
-
-    # Slot 3 (2026-11-07T13:30:00Z): Missing one side (only Dalton has done.json; OpenClaw has an unfinished dir without done.json)
-    slot_3 = "2026-11-07T13:30:00Z"
-    freeze_task_run_artifacts(
-        data_root=dalton_root,
-        job_key=T18_JOB_KEY,
-        scheduled_slot_utc=slot_3,
-        exit_code=0,
-    )
-    (openclaw_root / ".dalton-freeze" / T18_JOB_KEY / slot_3).mkdir(
-        parents=True, exist_ok=True
-    )
-
-    # Snapshot directory trees before running parity check to verify read-only behavior
-    before_dalton_files = sorted(
-        p.relative_to(dalton_root).as_posix() for p in dalton_root.rglob("*")
-    )
-    before_openclaw_files = sorted(
-        p.relative_to(openclaw_root).as_posix() for p in openclaw_root.rglob("*")
-    )
-
-    report = compare_data_tasks_parity(
-        dalton_root,
-        openclaw_root,
-        job_key=T18_JOB_KEY,
-    )
-
-    after_dalton_files = sorted(
-        p.relative_to(dalton_root).as_posix() for p in dalton_root.rglob("*")
-    )
-    after_openclaw_files = sorted(
-        p.relative_to(openclaw_root).as_posix() for p in openclaw_root.rglob("*")
-    )
-    assert before_dalton_files == after_dalton_files
-    assert before_openclaw_files == after_openclaw_files
-
-    assert report["summary"] == {
-        "total_slots": 3,
-        "consistent_count": 1,
-        "inconsistent_count": 1,
-        "missing_one_side_count": 1,
-        "all_consistent": False,
-    }
-    slots_by_utc = report["jobs"][T18_JOB_KEY]["slots"]
-
-    assert slots_by_utc[slot_1]["status"] == "consistent"
-    assert slots_by_utc[slot_1]["consistent"] is True
-    assert slots_by_utc[slot_1]["differences"] == []
-
-    assert slots_by_utc[slot_2]["status"] == "inconsistent"
-    assert slots_by_utc[slot_2]["consistent"] is False
-    diff_categories = {d["category"] for d in slots_by_utc[slot_2]["differences"]}
-    assert "sha256" in diff_categories
-    assert "csv_row_count" in diff_categories
-    assert "csv_latest_date" in diff_categories
-    assert "core_metrics" in diff_categories
-
-    assert slots_by_utc[slot_3]["status"] == "missing_one_side"
-    assert slots_by_utc[slot_3]["compared"] is False
-    assert slots_by_utc[slot_3]["missing_side"] == "openclaw"
-
-    # CLI exit code is 1 when differences/missing slots exist, and prints valid JSON
-    rc = main([str(dalton_root), str(openclaw_root), "--job-key", T18_JOB_KEY])
-    assert rc == 1
-    cli_out = json.loads(capsys.readouterr().out)
-    assert cli_out["summary"]["consistent_count"] == 1
-
-    # Item 5: Zero comparable slots (no done.json on both sides, unmatched --job-key, or nonexistent directories)
-    # must set all_consistent=False, include reason, and return non-zero CLI exit code (2)
-    rc_unmatched = main(
-        [str(dalton_root), str(openclaw_root), "--job-key", "nonexistent-job-key"]
-    )
-    assert rc_unmatched != 0
-    out_unmatched = json.loads(capsys.readouterr().out)
-    assert out_unmatched["summary"]["all_consistent"] is False
-    assert out_unmatched["summary"]["reason"] == "job_key_not_matched"
-
-    empty_d = tmp_path / "empty_dalton"
-    empty_o = tmp_path / "empty_openclaw"
-    empty_d.mkdir()
-    empty_o.mkdir()
-    rc_zero_slots = main([str(empty_d), str(empty_o)])
-    assert rc_zero_slots != 0
-    out_zero_slots = json.loads(capsys.readouterr().out)
-    assert out_zero_slots["summary"]["all_consistent"] is False
-    assert out_zero_slots["summary"]["reason"] == "no_completed_slots"
-
-    rc_no_dir = main(
-        [str(tmp_path / "does_not_exist_1"), str(tmp_path / "does_not_exist_2")]
-    )
-    assert rc_no_dir != 0
-    out_no_dir = json.loads(capsys.readouterr().out)
-    assert out_no_dir["summary"]["all_consistent"] is False
-    assert out_no_dir["summary"]["reason"] == "directory_not_found"
-
-
 @pytest.mark.asyncio
 async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_notify_status(
     tmp_path: Path,
@@ -6758,96 +6577,40 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     tmp_path: Path,
 ) -> None:
     """Verify `scripts/dalton/seed_openclaw_data.sh` with temporary directories:
-    - Default (`--dry-run`) prints total size and does not write to target;
-    - `--apply` syncs ONLY paths listed in the seed allowlist (phase 1 plus batch 3, batch 4,
-      and batch 5 scripts, skills, config, and state);
-    - Does NOT sync unlisted directories/files (`memory/`, `media/`, `wiki/`, `backups/`, `markx/`,
-      unlisted scripts, or unlisted skills);
-    - Excludes `venv/`, `.venv/`, `cos-venv/`, `pending.json`, `*inflight*`, `.git/`, and `.dalton-freeze/`,
-      and creates a Python launcher that executes `/app/.venv/bin/python`.
+    - Default (`--dry-run`) does not write to target and prints asset preview;
+    - `--apply` installs Dalton data assets into target, preserves extra files already
+      present in target, ensures `state/a-share-volume-watch`, and creates the Python
+      launcher executing `/app/.venv/bin/python`.
     """
     import subprocess
 
     repo_root = Path(__file__).resolve().parents[3]
     script_path = repo_root / "scripts" / "dalton" / "seed_openclaw_data.sh"
-
-    src_dir = tmp_path / "fake_openclaw_workspace"
     dst_dir = tmp_path / "fake_dalton_data"
-    src_dir.mkdir(parents=True)
 
-    # Wanted listed files from §6.2
-    (src_dir / "scripts").mkdir(parents=True)
-    (src_dir / "scripts" / "megacap_relative_signal_monitor.py").write_text(
-        "print('ok')\n", encoding="utf-8"
-    )
-    (src_dir / "skills" / "ah-premium-monitor" / "scripts").mkdir(parents=True)
-    (src_dir / "skills" / "ah-premium-monitor" / "scripts" / "ah_premium_monitor_cli.py").write_text(
-        "print('ah')\n", encoding="utf-8"
-    )
-    (src_dir / "skills" / "ah-premium-monitor" / "venv").mkdir(parents=True)
-    (src_dir / "skills" / "ah-premium-monitor" / "venv" / "ignored.py").write_text(
-        "ignored\n", encoding="utf-8"
-    )
-    (src_dir / "state" / "cn-leverage").mkdir(parents=True)
-    (src_dir / "state" / "cn-leverage" / "pipeline_status.json").write_text(
-        '{"ok": true}\n', encoding="utf-8"
-    )
-    (src_dir / "state" / "cn-leverage" / "margin_core.csv").write_text(
-        "date,val\n2026-11-08,1\n", encoding="utf-8"
-    )
-    (src_dir / "research-outputs" / "sentiment-dashboard").mkdir(parents=True)
-    (src_dir / "research-outputs" / "sentiment-dashboard" / "signals.json").write_text(
-        '{"date": "2026-11-08"}\n', encoding="utf-8"
-    )
-    (src_dir / "state" / "cron-command" / "softbank-nav-monitor").mkdir(parents=True)
-    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "last-run.json").write_text(
-        '{"next": 1}\n', encoding="utf-8"
-    )
-    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "pending.json").write_text(
-        '{"inflight": 0}\n', encoding="utf-8"
-    )
-    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "receipts").mkdir(parents=True)
-    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "receipts" / "r1.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
-
-    # Unlisted directories and files that must NOT be synced
-    for unlisted_dir in ("memory", "media", "wiki", "backups", "markx"):
-        d = src_dir / unlisted_dir
-        d.mkdir(parents=True)
-        (d / "secret.txt").write_text("do_not_sync", encoding="utf-8")
-    (src_dir / "scripts" / "e_watch_monitor.py").write_text("listed_batch4\n", encoding="utf-8")
-    (src_dir / "scripts" / "not_seeded.py").write_text("unlisted_script", encoding="utf-8")
-    (src_dir / "skills" / "quantum-ew-bottom-monitor").mkdir(parents=True)
-    (src_dir / "skills" / "quantum-ew-bottom-monitor" / "unused.txt").write_text(
-        "unlisted_skill", encoding="utf-8"
-    )
-
-    # 1. Default mode (dry-run) must NOT create or populate dst_dir and must print total size
+    # 1. Default mode (dry-run) must NOT create or populate dst_dir
     dry_res = subprocess.run(
-        ["bash", str(script_path), "--source", str(src_dir), "--target", str(dst_dir)],
+        ["bash", str(script_path), "--target", str(dst_dir)],
         capture_output=True,
         text=True,
         check=False,
     )
     assert dry_res.returncode == 0, dry_res.stderr
     assert "Mode: DRY-RUN" in dry_res.stdout
-    assert "DRY-RUN total size" in dry_res.stdout
+    assert "DRY-RUN asset:" in dry_res.stdout
     assert not dst_dir.exists()
 
-    # Pre-populate dst_dir with an existing file to verify incremental sync preserves extra target files
+    # Pre-populate dst_dir with an existing file to verify --apply preserves extra target files
     (dst_dir / "existing_only_in_target").mkdir(parents=True)
     extra_target_file = dst_dir / "existing_only_in_target" / "keep_me.txt"
     extra_target_file.write_text("preserved", encoding="utf-8")
 
-    # 2. --apply syncs allowed paths, excludes forbidden paths, and installs the launcher.
+    # 2. --apply installs data assets and the launcher while preserving existing files.
     apply_res = subprocess.run(
         [
             "bash",
             str(script_path),
             "--apply",
-            "--source",
-            str(src_dir),
             "--target",
             str(dst_dir),
         ],
@@ -6856,31 +6619,8 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
         check=False,
     )
     assert apply_res.returncode == 0, apply_res.stderr
-    assert (dst_dir / "scripts" / "megacap_relative_signal_monitor.py").is_file()
-    assert (
-        dst_dir / "skills" / "ah-premium-monitor" / "scripts" / "ah_premium_monitor_cli.py"
-    ).is_file()
-    assert (dst_dir / "state" / "cn-leverage" / "pipeline_status.json").is_file()
-    assert (dst_dir / "state" / "cn-leverage" / "margin_core.csv").is_file()
-    assert (dst_dir / "research-outputs" / "sentiment-dashboard" / "signals.json").is_file()
-    assert (
-        dst_dir / "state" / "cron-command" / "softbank-nav-monitor" / "last-run.json"
-    ).is_file()
     assert extra_target_file.read_text(encoding="utf-8") == "preserved"
-
-    # Excluded & unlisted items must NOT exist in dst_dir
-    assert not (dst_dir / "skills" / "ah-premium-monitor" / "venv").exists()
-    assert not (
-        dst_dir / "state" / "cron-command" / "softbank-nav-monitor" / "pending.json"
-    ).exists()
-    assert not (
-        dst_dir / "state" / "cron-command" / "softbank-nav-monitor" / "receipts"
-    ).exists()
-    for unlisted_name in ("memory", "media", "wiki", "backups", "markx"):
-        assert not (dst_dir / unlisted_name).exists()
-    assert (dst_dir / "scripts" / "e_watch_monitor.py").read_text(encoding="utf-8") == "listed_batch4\n"
-    assert not (dst_dir / "scripts" / "not_seeded.py").exists()
-    assert not (dst_dir / "skills" / "quantum-ew-bottom-monitor").exists()
+    assert (dst_dir / "state" / "a-share-volume-watch").is_dir()
 
     launcher_path = (
         dst_dir / "state" / "sentiment-dashboard" / "cos-venv" / "bin" / "python"
@@ -6889,20 +6629,19 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     assert launcher_path.stat().st_mode & 0o777 == 0o755
     assert launcher_path.read_text() == '#!/bin/sh\nexec /app/.venv/bin/python "$@"\n'
 
-    # Overlay script scripts/feishu_send_card.py must be printed in --dry-run and overlaid in --apply
-    assert "DRY-RUN overlay:" in dry_res.stdout
+    # Asset script scripts/feishu_send_card.py must be printed in --dry-run and copied in --apply
     assert "scripts/feishu_send_card.py" in dry_res.stdout
-    overlay_src = (
+    asset_src = (
         repo_root
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "feishu_send_card.py"
     )
     overlaid_dst = dst_dir / "scripts" / "feishu_send_card.py"
     assert overlaid_dst.is_file()
-    assert overlaid_dst.read_bytes() == overlay_src.read_bytes()
+    assert overlaid_dst.read_bytes() == asset_src.read_bytes()
 
 
 def test_pr12_feishu_send_card_overlay_no_direct_send_and_dry_run_parity(
@@ -6917,7 +6656,7 @@ def test_pr12_feishu_send_card_overlay_no_direct_send_and_dry_run_parity(
         repo_root
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "feishu_send_card.py"
     )
@@ -7789,7 +7528,7 @@ async def test_pr12_round2_overlay_redaction_and_manifest_sync_preserves_schedul
         Path(__file__).resolve().parents[3]
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "feishu_send_card.py"
     )
@@ -7927,7 +7666,7 @@ def test_sentiment_dashboard_cos_upload_overlay_skip_subprocess_without_sdk_cred
         repo_root
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "sentiment_dashboard_cos_upload.py"
     )
@@ -8074,7 +7813,7 @@ def test_sentiment_dashboard_cos_upload_overlay_prod_sdk_and_credential_rules(
         repo_root
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "sentiment_dashboard_cos_upload.py"
     )
@@ -8412,7 +8151,7 @@ def test_seed_openclaw_data_applies_cos_upload_overlay_and_preserves_send_protec
         repo_root
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "sentiment_dashboard_cos_upload.py"
     )
@@ -8420,23 +8159,15 @@ def test_seed_openclaw_data_applies_cos_upload_overlay_and_preserves_send_protec
         repo_root
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "scripts"
         / "feishu_send_card.py"
     )
 
-    src_dir = tmp_path / "openclaw_host_ws"
     dst_dir = tmp_path / "dalton_data_vol"
-    (src_dir / "scripts").mkdir(parents=True)
-
-    # Populate the source workspace with host scripts.
-    host_cos_bytes = b"#!/usr/bin/env python3\nfrom qcloud_cos import CosS3Client\n"
-    host_feishu_bytes = orig_feishu_script.read_bytes()
-    (src_dir / "scripts" / "sentiment_dashboard_cos_upload.py").write_bytes(host_cos_bytes)
-    (src_dir / "scripts" / "feishu_send_card.py").write_bytes(host_feishu_bytes)
 
     dry_res = subprocess.run(
-        ["bash", str(seed_script), "--dry-run", "--source", str(src_dir), "--target", str(dst_dir)],
+        ["bash", str(seed_script), "--dry-run", "--target", str(dst_dir)],
         capture_output=True,
         text=True,
         check=False,
@@ -8446,22 +8177,21 @@ def test_seed_openclaw_data_applies_cos_upload_overlay_and_preserves_send_protec
     assert "scripts/feishu_send_card.py" in dry_res.stdout
 
     apply_res = subprocess.run(
-        ["bash", str(seed_script), "--apply", "--source", str(src_dir), "--target", str(dst_dir)],
+        ["bash", str(seed_script), "--apply", "--target", str(dst_dir)],
         capture_output=True,
         text=True,
         check=False,
     )
     assert apply_res.returncode == 0, apply_res.stderr
 
-    # Both overlays are installed into the target data volume and the source workspace is untouched.
+    # Both data assets are installed into the target data volume.
     assert (
         dst_dir / "scripts" / "sentiment_dashboard_cos_upload.py"
     ).read_bytes() == overlay_cos_script.read_bytes()
     assert (
         dst_dir / "scripts" / "feishu_send_card.py"
     ).read_bytes() == overlay_feishu_script.read_bytes()
-    assert (src_dir / "scripts" / "sentiment_dashboard_cos_upload.py").read_bytes() == host_cos_bytes
-    assert (src_dir / "scripts" / "feishu_send_card.py").read_bytes() == host_feishu_bytes
+    assert (dst_dir / "scripts" / "feishu_send_card.py").read_bytes() != orig_feishu_script.read_bytes()
     assert b"DALTON_NO_DIRECT_SEND" in (dst_dir / "scripts" / "feishu_send_card.py").read_bytes()
     assert b"DALTON_COS_UPLOAD_MODE" in (
         dst_dir / "scripts" / "sentiment_dashboard_cos_upload.py"
@@ -8472,7 +8202,7 @@ def test_sentiment_dashboard_cos_upload_skip_never_reads_credentials(tmp_path, m
     import importlib.util
     from collections.abc import MutableMapping
 
-    path = Path(__file__).resolve().parents[3] / "scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py"
+    path = Path(__file__).resolve().parents[3] / "scripts/dalton/data_assets/scripts/sentiment_dashboard_cos_upload.py"
     spec = importlib.util.spec_from_file_location("cos_skip_credential_reads", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

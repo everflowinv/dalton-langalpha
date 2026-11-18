@@ -124,7 +124,7 @@
       "disabled": true,
       "hidden": true,
       "rules": [
-        "已停用（原 openclaw__web_search 已无调用方）；LangAlpha 内部使用独立 web_search。",
+        "已停用；LangAlpha 内部使用独立 web_search。",
         "传date_after/date_before；严格24小时再按原文时间戳后过滤。",
         "先找原始公告与报道；关键结果读全文，不把搜索摘要当原文。"
       ],
@@ -142,7 +142,7 @@
       "disabled": true,
       "hidden": true,
       "rules": [
-        "已停用（原 openclaw__web_fetch 已无调用方）；LangAlpha 内部使用独立网页抓取。",
+        "已停用；LangAlpha 内部使用独立网页抓取。",
         "正文缺失或403/429再用Firecrawl；私有URL、凭据不交给第三方。"
       ],
       "health": "disabled"
@@ -297,7 +297,7 @@
         "本机固定3.27.2；上游3.31.0已发布。迁移须保留本机Gemini/X路由、FROM_BROWSER=off和Reddit排除；当前尚未迁移，版本差异见references/researchdata-full-audit-2026-10-28.md。"
       ],
       "health": "disabled",
-      "source_version": "3.27.2-openclaw-argon-20261013"
+      "source_version": "3.27.2-argon-20261013"
     },
     {
       "id": "agent-reach",
@@ -344,7 +344,7 @@
       "disabled": true,
       "hidden": true,
       "rules": [
-        "已停用（原 openclaw__x_search 已无调用方）；LangAlpha 内部使用独立 x_search。",
+        "已停用；LangAlpha 内部使用独立 x_search。",
         "严格时间窗传from_date/to_date；主体事实回公告核验。"
       ],
       "health": "disabled"

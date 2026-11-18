@@ -141,7 +141,8 @@ def _wiki_bridge_with_similar_entry(tmp_path: Path) -> rb.ResearchDataBridge:
     bridge = rb.ResearchDataBridge.__new__(rb.ResearchDataBridge)
     bridge.cfg = create_autospec(rb.BridgeConfig, instance=True)
     bridge.cfg.wiki_ingest_audit_file = tmp_path / "wiki_ingest_audit.jsonl"
-    bridge.cfg.ocw_root = tmp_path / "ocw"
+    bridge.cfg.research_code = tmp_path / "ocw"
+    bridge.cfg.research_home = tmp_path / "ocw"
     (tmp_path / "wiki_ingest_idempotency.json").write_text(
         json.dumps(
             {
@@ -399,7 +400,8 @@ def _sn_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     bridge.cfg.wiki_ingest_timeout_s = 10.0
     bridge.cfg.wiki_ingest_temp_dir = Path("/tmp/unused-sn-r3")
     bridge.cfg.env_path = Path("/nonexistent-bridge.env")
-    bridge.cfg.ocw_root = Path("/tmp/unused-ocw-r3")
+    bridge.cfg.research_code = Path(rb.__file__).resolve().parent / "research_runtime"
+    bridge.cfg.research_home = Path("/tmp/unused-ocw-r3")
     bridge.cfg.subprocess_proxy = ""
     return bridge
 

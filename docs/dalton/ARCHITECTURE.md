@@ -1,6 +1,6 @@
 # Dalton 系统架构
 
-这页讲清 Dalton 叠在上游 LangAlpha 之上的整体架构、所有 `src/dalton/*` 子模块职责、请求与数据流、自有数据库表与 `d001`–`d039` 迁移链路、宿主机常驻服务和外部依赖。
+Dalton 叠在上游 LangAlpha 之上运行，由自有应用包 `src/dalton/*`、双链路 Alembic 迁移（`d001`–`d039`）与宿主机 `launchd` 服务组成；运行时模块职责、数据流、自有数据库表与常驻服务清单如下。
 
 Dalton 用配置覆盖（overlay）和 `DALTON-HOOK` 挂在上游前后端之上，核心研究编排复用 LangAlpha 的沙箱智能体引擎。团队认证、预算控制、知识治理、监控面板、自动化报告和外部数据源全部收在独立目录和独立 Alembic 迁移链里。
 
@@ -45,6 +45,7 @@ Dalton 靠**配置叠加 + 目录隔离 + Hook 标记守卫**三层边界，保�
 - `src/dalton/monitors/`：团队监控面板平台（[monitors.md](./features/monitors.md)），包含四档权限控制（`permissions.py`）、数据任务注册表（`MONITOR_DATA_JOB_REGISTRY`）、静态文件边界 Containment 与实时数据写入、HMAC 短时访问授权（`grants.py`）和版本历史。
 - `src/dalton/notify/`：通知与外部渠道投递核心（`dispatch.py`），把自动化报告、失败告警、飞书文档授权和系统告警路由到本地渠道网关。
 - `src/dalton/services/` & `src/dalton/workflows/` & `src/dalton/conversations/` & `src/dalton/database/`：`services/` 管自动化配置生命周期与乐观锁（`company_automations.py`）、原生模型与部署健康态查询（`openclaw_admin.py`、`native_admin.py`）；`conversations/` 负责对话归档抽卡；`database/` 统一管 Dalton 的原始 `psycopg3` 异步 SQL 查询和事务锁。
+- **历史命名沿用（运行时完全解耦）**：`src/dalton/services/openclaw_admin.py`（提供 `GET /api/v1/dalton/openclaw/health` 构建指纹检查）、`src/dalton/database/openclaw_sync.py`、`dalton_openclaw_sync_runs` 表、数据任务环境变量 `OPENCLAW_WORKSPACE` 与容器内挂载路径 `/Users/everflow/.openclaw/workspace`（宿主机对应目录 `var/dalton/openclaw-data`）均沿用早期迁移阶段的历史命名，运行时完全由 Dalton 自有进程与受管存储执行；`plugins/dalton/skills/dalton-bullbear-tracker` 与 `scripts/dalton/ai_finance*` 中的路径检查则用于校验执行目录限定在受管目录之内（详见 [openclaw-retirement.md](./features/openclaw-retirement.md)）。
 
 ## 3. 请求与数据流
 
@@ -94,8 +95,6 @@ macOS 宿主机靠 `launchd` 跑脱离容器网络的本地桥接、采集、归
 | `com.dalton.researchdata-bridge` | `scripts/dalton/launchd/com.dalton.researchdata-bridge.plist.template` | `127.0.0.1:8960` | 宿主机 MCP 桥接服务、AlphaEngine 搜索缓存、`podcast_weekly`、宿主机 `data_job` 受控执行、`system_jobs` 宿主机探测 |
 | `com.dalton.channel-gateway` | `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template` | `127.0.0.1:8962` | 多渠道接入网关（飞书 WebSocket + 卡片/文档授权、Discord、微信 iLink 出入站）与运维告警推送 |
 | `com.dalton.monitor-feeds` | `scripts/dalton/monitor_feeds/com.dalton.monitor-feeds.plist` | 交易时段 60s 轮询 / 非交易时段最长 300s 休眠 | A 股盘中监测（`cn-intraday`）与港股动量（`hk-momentum`）实时抓取并推送监控面板数据 |
-| `com.dalton.conversation-archive` | `scripts/dalton/launchd/com.dalton.conversation-archive.plist.template` | 每日 21:15（宿主机本地时区） | 运行 `scripts/dalton/conversation_archive.py run` 抽取历史会话认知卡片 |
-| `com.dalton.web-search-bridge` | `scripts/dalton/launchd/com.dalton.web-search-bridge.plist.template` | 本地桥接端口（可选兼容） | 给旧式 `search_api: openclaw` 路径提供主机检索代理 |
 | `com.dalton.config-git-backup` | `scripts/dalton/ops/launchd/com.dalton.config-git-backup.plist.template` | 每 6 小时（宿主机本地时区 00:15/06:15/12:15/18:15） | 加密备份配置和轻量状态到 GitHub 私有仓库 |
 | `com.dalton.db-offsite` | `scripts/dalton/ops/launchd/com.dalton.db-offsite.plist.template` | 每日 03:40（宿主机本地时区） | 流式加密上传最新 `dalton-pg-*.dump` 到 Google Drive |
 | `com.dalton.data-backup` | `scripts/dalton/ops/launchd/com.dalton.data-backup.plist.template` | 每周日 05:00（宿主机本地时区） | 流式加密上传 MinIO、沙箱工作区、Redis 快照与 `var/dalton`（含 SQLite 一致副本） |

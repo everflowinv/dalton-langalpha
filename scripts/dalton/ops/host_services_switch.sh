@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Plan, apply, rerender, and rollback migration of host research services
+# Manage launchd switch/rerender for host research services
 # (alphaengine-mcp, alphaengine-desktop-watchdog, guidepoint-mcp-proxy)
-# from OpenClaw launchd labels to Dalton launchd labels.
-# Follows the active mode (legacy DALTON_OCW_ROOT vs new DALTON_RESEARCH_HOME)
-# configured in the bridge env file. Default mode is --plan (read-only).
-# Compatible with macOS Bash 3.2.
+# using the unified DALTON_RESEARCH_HOME mode configured in the bridge env file.
+# Default mode is --plan (read-only). Compatible with macOS Bash 3.2.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,13 +44,12 @@ trap cleanup EXIT INT TERM
 
 usage() {
   cat <<'EOF'
-Usage: host_services_switch.sh [--plan | --apply [--rerender-only] | --rollback]
+Usage: host_services_switch.sh [--plan | --apply [--rerender-only]]
 
 Options:
   --plan           Print detected mode, service paths, switch steps, and launchd status (default).
   --apply          Render/lint plists and switch services sequentially (stop old, verify port release, disable old, enable/bootstrap new, health+PID check).
   --rerender-only  With --apply (or standalone): rerender and restart only already-loaded com.dalton.* services; restore pre-switch plists on failure.
-  --rollback       Switch all three services back to ai.openclaw.* labels with full return-code and health checks.
   -h, --help       Show this help message.
 EOF
 }
@@ -72,8 +69,8 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --rollback)
-      MODE="rollback"
-      shift
+      echo "ERROR: --rollback is removed; legacy ~/.openclaw directory mode no longer exists" >&2
+      exit 2
       ;;
     -h|--help)
       usage
@@ -89,9 +86,6 @@ done
 
 if [[ "${RERENDER_ONLY}" -eq 1 && "${MODE}" == "plan" ]]; then
   MODE="apply"
-elif [[ "${RERENDER_ONLY}" -eq 1 && "${MODE}" == "rollback" ]]; then
-  echo "ERROR: --rerender-only cannot be combined with --rollback" >&2
-  exit 2
 fi
 
 SERVICES=(
@@ -110,9 +104,8 @@ resolve_helper_python() {
   fi
 }
 
-# Resolve mode and data root using the exact same rule as researchdata_bridge.py:
-# read ONLY DALTON_RESEARCH_HOME, DALTON_RESEARCH_CODE, DALTON_OCW_ROOT from BRIDGE_ENV_FILE
-# (plus process environment overrides for those 3 keys). Never read or print any other key.
+# Resolve runtime root using DALTON_RESEARCH_HOME from BRIDGE_ENV_FILE
+# (plus process environment override). Never read or print any other key.
 RUNTIME_MODE=""
 DATA_ROOT=""
 RUNTIME_ENV_KEY=""
@@ -130,7 +123,7 @@ from pathlib import Path
 
 env_path = Path(sys.argv[1]).expanduser()
 home_dir = sys.argv[2]
-allowed_keys = ("DALTON_RESEARCH_HOME", "DALTON_RESEARCH_CODE", "DALTON_OCW_ROOT")
+allowed_keys = ("DALTON_RESEARCH_HOME",)
 vals: dict[str, str] = {}
 env_status = "missing"
 
@@ -157,24 +150,14 @@ for k in allowed_keys:
         vals[k] = env_v
 
 raw_home = vals.get("DALTON_RESEARCH_HOME", "")
-raw_code = vals.get("DALTON_RESEARCH_CODE", "")
-raw_ocw = vals.get("DALTON_OCW_ROOT", "")
-
-if raw_ocw and not raw_home and not raw_code:
-    data_root = os.path.abspath(os.path.expanduser(raw_ocw))
-    print("legacy")
-    print(data_root)
-    print("DALTON_OCW_ROOT")
-    print(data_root)
+if raw_home:
+    data_root = os.path.abspath(os.path.expanduser(raw_home))
 else:
-    if raw_home:
-        data_root = os.path.abspath(os.path.expanduser(raw_home))
-    else:
-        data_root = os.path.abspath(os.path.join(home_dir, "Library", "Application Support", "Everflow", "research"))
-    print("new")
-    print(data_root)
-    print("DALTON_RESEARCH_HOME")
-    print(data_root)
+    data_root = os.path.abspath(os.path.join(home_dir, "Library", "Application Support", "Everflow", "research"))
+print("new")
+print(data_root)
+print("DALTON_RESEARCH_HOME")
+print(data_root)
 print(env_status)
 PY
 )"
@@ -359,7 +342,7 @@ if state_dir:
     sys.exit(0)
 
 root = ""
-for key in ("DALTON_RESEARCH_HOME", "DALTON_OCW_ROOT", "OPENCLAW_WORKSPACE"):
+for key in ("DALTON_RESEARCH_HOME", "OPENCLAW_WORKSPACE"):
     val = str(env_vars.get(key) or "").strip()
     if val:
         root = val
@@ -740,15 +723,11 @@ run_plan() {
     echo "      old: ${old_label} ($(launchd_label_status "${old_label}"), plist=$(if [[ -f "${old_plist}" ]]; then echo present; else echo missing; fi))"
     echo "      new: ${new_label} ($(launchd_label_status "${new_label}"), plist=$(if [[ -f "${dst_plist}" ]]; then echo present; else echo missing; fi))"
   done
-  echo ""
-  echo "Rollback command (old plists are preserved):"
-  echo "  bash scripts/dalton/ops/host_services_switch.sh --rollback"
 }
 
 run_apply() {
-  # The bridge env file decides legacy vs new data paths; without it we cannot tell, so stop.
   if [[ "${BRIDGE_ENV_STATUS}" != "ok" ]]; then
-    echo "ERROR: bridge env file ${BRIDGE_ENV_FILE} is ${BRIDGE_ENV_STATUS}; cannot tell legacy from new mode" >&2
+    echo "ERROR: bridge env file ${BRIDGE_ENV_FILE} is ${BRIDGE_ENV_STATUS}; cannot resolve runtime environment" >&2
     exit 1
   fi
   echo "=== Dalton Host Services Switch (--apply, mode=${RUNTIME_MODE}) ==="
@@ -871,9 +850,8 @@ run_apply() {
 }
 
 run_rerender_only() {
-  # The bridge env file decides legacy vs new data paths; without it we cannot tell, so stop.
   if [[ "${BRIDGE_ENV_STATUS}" != "ok" ]]; then
-    echo "ERROR: bridge env file ${BRIDGE_ENV_FILE} is ${BRIDGE_ENV_STATUS}; cannot tell legacy from new mode" >&2
+    echo "ERROR: bridge env file ${BRIDGE_ENV_FILE} is ${BRIDGE_ENV_STATUS}; cannot resolve runtime environment" >&2
     exit 1
   fi
   echo "=== Dalton Host Services Rerender (--apply --rerender-only, mode=${RUNTIME_MODE}) ==="
@@ -1036,31 +1014,6 @@ run_rerender_only() {
   echo "Rerender completed: [${updated[*]:-none}]"
 }
 
-run_rollback() {
-  echo "=== Dalton Host Services Rollback (--rollback) ==="
-  local entry name old_label new_label port
-  local restored=()
-  local failed=()
-
-  for entry in "${SERVICES[@]}"; do
-    IFS='|' read -r name old_label new_label port <<< "${entry}"
-    if rollback_one_service "${name}" "${old_label}" "${new_label}" "${port}"; then
-      echo "[ok] ${name} rolled back to ${old_label}"
-      restored+=("${name}:${old_label}")
-    else
-      echo "[error] ${name} rollback failed" >&2
-      failed+=("${name}:${old_label}")
-    fi
-  done
-
-  echo "已恢复的服务 (restored): [${restored[*]:-none}]"
-  echo "恢复失败的服务 (failed): [${failed[*]:-none}]"
-  if [[ "${#failed[@]}" -gt 0 ]]; then
-    exit 1
-  fi
-  exit 0
-}
-
 case "${MODE}" in
   plan)
     run_plan
@@ -1071,8 +1024,5 @@ case "${MODE}" in
     else
       run_apply
     fi
-    ;;
-  rollback)
-    run_rollback
     ;;
 esac

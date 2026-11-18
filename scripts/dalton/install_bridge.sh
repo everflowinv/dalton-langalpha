@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            echo "Usage: install_bridge.sh [--research-runtime=auto|legacy|new]"
+            echo "Usage: install_bridge.sh [--research-runtime=auto|new]"
             exit 0
             ;;
         *)
@@ -27,8 +27,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -n "${RESEARCH_RUNTIME_MODE}" && "${RESEARCH_RUNTIME_MODE}" != "auto" && "${RESEARCH_RUNTIME_MODE}" != "legacy" && "${RESEARCH_RUNTIME_MODE}" != "new" ]]; then
-    echo "[install_bridge] ERROR: invalid --research-runtime=${RESEARCH_RUNTIME_MODE} (expected auto|legacy|new)" >&2
+if [[ -n "${RESEARCH_RUNTIME_MODE}" && "${RESEARCH_RUNTIME_MODE}" != "auto" && "${RESEARCH_RUNTIME_MODE}" != "new" ]]; then
+    echo "[install_bridge] ERROR: invalid --research-runtime=${RESEARCH_RUNTIME_MODE} (expected auto|new)" >&2
     exit 2
 fi
 
@@ -39,18 +39,9 @@ PLIST_TEMPLATE="${DALTON_PLIST_TEMPLATE:-${REPO_ROOT}/scripts/dalton/launchd/com
 LAUNCH_AGENTS_DIR="${DALTON_LAUNCH_AGENTS_DIR:-${HOME}/Library/LaunchAgents}"
 PLIST_DEST="${LAUNCH_AGENTS_DIR}/com.dalton.researchdata-bridge.plist"
 LOGS_DIR="${DALTON_BRIDGE_LOGS_DIR:-${HOME}/Library/Logs}"
-EXPLICIT_RESEARCH_CODE="${DALTON_RESEARCH_CODE:-}"
-EXPLICIT_RESEARCH_HOME="${DALTON_RESEARCH_HOME:-}"
-if [[ -z "${RESEARCH_RUNTIME_MODE}" ]]; then
-    if [[ -n "${EXPLICIT_RESEARCH_CODE}" || -n "${EXPLICIT_RESEARCH_HOME}" ]]; then
-        RESEARCH_RUNTIME_MODE="new"
-    else
-        RESEARCH_RUNTIME_MODE="auto"
-    fi
-fi
-RESEARCH_CODE="${EXPLICIT_RESEARCH_CODE:-${REPO_ROOT}/scripts/dalton/research_runtime}"
-RESEARCH_HOME="${EXPLICIT_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
-OCW_ROOT="${DALTON_OCW_ROOT:-}"
+RESEARCH_CODE="${DALTON_RESEARCH_CODE:-${REPO_ROOT}/scripts/dalton/research_runtime}"
+RESEARCH_HOME="${DALTON_RESEARCH_HOME:-${HOME}/Library/Application Support/Everflow/research}"
+RESEARCH_RUNTIME_MODE="${RESEARCH_RUNTIME_MODE:-new}"
 DEFAULT_PYTHON_BIN="/opt/homebrew/bin/python3"
 if [[ ! -x "${DEFAULT_PYTHON_BIN}" ]]; then
     DEFAULT_PYTHON_BIN="$(command -v python3 || true)"
@@ -70,7 +61,6 @@ EFFECTIVE_PORT="$("${HELPER_PYTHON}" "${HELPER_PY}" merge-bridge-env \
     --default-port "${PORT}" \
     --default-research-code "${RESEARCH_CODE}" \
     --default-research-home "${RESEARCH_HOME}" \
-    --default-ocw-root "${OCW_ROOT}" \
     --default-python "${PYTHON_BIN}" \
     --existing-plist "${PLIST_DEST}" \
     --research-runtime "${RESEARCH_RUNTIME_MODE}" \

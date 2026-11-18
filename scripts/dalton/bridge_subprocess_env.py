@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Subprocess environment filtering, archive allowlist enforcement, and atomic env-file merge.
+"""Subprocess environment filtering and atomic env-file/plist merge.
 
 Used by `researchdata_bridge.py`, `seed_asr_client.py`, `install_bridge.sh`,
-`launchd/archive_daily.sh`, `conversation_archive.py`, `reextract_conversations.py`,
 and the `company-wiki` / `market-digest` skill `run.sh` launchers.
 
 Pure Python 3 standard library only so host launchd and skill virtualenvs can invoke
@@ -164,7 +163,6 @@ RESEARCH_RUNTIME_ENV_KEYS: frozenset[str] = frozenset(
     {
         "DALTON_RESEARCH_CODE",
         "DALTON_RESEARCH_HOME",
-        "DALTON_OCW_ROOT",
         "DALTON_EMBED_PYTHON",
         "EDGAR_IDENTITY",
     }
@@ -2233,31 +2231,29 @@ def merge_bridge_and_repo_env_files(
     bridge_env_path: Path,
     repo_env_path: Path,
     default_port: str = "8960",
-    default_ocw_root: str = "",
     default_python_bin: str,
     default_research_code: str = "",
     default_research_home: str = "",
     existing_plist_path: Path | None = None,
-    research_runtime: str = "auto",
+    research_runtime: str = "new",
 ) -> dict[str, Any]:
     """Validate and atomically merge defaults into `researchdata-bridge.env` and `<repo>/.env`.
 
     - Existing comments, ordering, extra keys (`FEISHU_*`, `SEED_ASR_*`, etc.), and all
       existing non-empty values are preserved verbatim.
     - Existing tokens are never rotated; existing `FEISHU_*` values are never overwritten.
-    - If `research_runtime == "auto"` and existing `bridge_env` or `existing_plist_path`
-      (or `default_ocw_root`) sets `DALTON_OCW_ROOT` without `DALTON_RESEARCH_CODE` or
-      `DALTON_RESEARCH_HOME`, legacy mode is preserved and new runtime keys are NOT injected.
+    - Only the decoupled `DALTON_RESEARCH_CODE` / `DALTON_RESEARCH_HOME` mode is supported;
+      any legacy `DALTON_OCW_ROOT` entry is removed.
     - Duplicate keys, malformed lines, partial Feishu credentials (`FEISHU_APP_ID` without
       `FEISHU_APP_SECRET` or vice versa), and invalid required values fail closed before
       modifying either target file.
-    - Returns non-secret metadata only (`port`, `research_code`, `research_home`, `ocw_root`, `python_bin`).
+    - Returns non-secret metadata only (`port`, `research_code`, `research_home`, `python_bin`).
     """
-    if research_runtime not in ("auto", "legacy", "new"):
+    if research_runtime not in ("auto", "new"):
         raise ValueError(f"unsupported research_runtime mode: {research_runtime!r}")
+    _ = existing_plist_path
     bridge_entries, bridge_vals = parse_env_file_strict(bridge_env_path)
     repo_entries, repo_vals = parse_env_file_strict(repo_env_path)
-    plist_vals = _read_plist_env_vars(existing_plist_path)
 
     # Validate partial Feishu configuration in bridge env before generating or writing anything.
     feishu_id = str(bridge_vals.get("FEISHU_APP_ID") or "").strip()
@@ -2281,39 +2277,6 @@ def merge_bridge_and_repo_env_files(
         or secrets.token_hex(32)
     )
 
-    env_has_research = bool(
-        str(bridge_vals.get("DALTON_RESEARCH_CODE") or "").strip()
-        or str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-    )
-    plist_has_research = bool(
-        str(plist_vals.get("DALTON_RESEARCH_CODE") or "").strip()
-        or str(plist_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-    )
-    existing_ocw_root = (
-        str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip()
-        or str(plist_vals.get("DALTON_OCW_ROOT") or "").strip()
-        or str(default_ocw_root or "").strip()
-    )
-
-    if research_runtime == "legacy":
-        if not str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip():
-            raise EnvFileValidationError(
-                path=bridge_env_path,
-                key="DALTON_OCW_ROOT",
-                reason="DALTON_OCW_ROOT must be present in env file for research_runtime=legacy",
-            )
-        use_new_runtime = False
-    elif research_runtime == "new":
-        use_new_runtime = True
-    elif env_has_research or plist_has_research:
-        use_new_runtime = True
-    elif existing_ocw_root:
-        use_new_runtime = False
-    else:
-        use_new_runtime = bool(
-            str(default_research_code).strip() or str(default_research_home).strip()
-        )
-
     bridge_defaults: list[tuple[str, str]] = [
         ("DALTON_BRIDGE_HOST", "127.0.0.1"),
         ("DALTON_BRIDGE_PORT", str(default_port).strip() or "8960"),
@@ -2323,20 +2286,12 @@ def merge_bridge_and_repo_env_files(
         ("DALTON_BRIDGE_MAX_INFLIGHT", "2"),
         ("DALTON_BRIDGE_CALLER_BUDGET_S", "625"),
     ]
-    if use_new_runtime:
-        if str(default_research_code).strip():
-            bridge_defaults.append(("DALTON_RESEARCH_CODE", str(default_research_code).strip()))
-        if str(default_research_home).strip():
-            bridge_defaults.append(("DALTON_RESEARCH_HOME", str(default_research_home).strip()))
-    if existing_ocw_root and (not use_new_runtime or str(default_ocw_root).strip()):
-        bridge_defaults.append(("DALTON_OCW_ROOT", existing_ocw_root))
-    remove_keys: tuple[str, ...] = (
-        ("DALTON_RESEARCH_CODE", "DALTON_RESEARCH_HOME")
-        if research_runtime == "legacy"
-        else ()
-    )
+    if str(default_research_code).strip():
+        bridge_defaults.append(("DALTON_RESEARCH_CODE", str(default_research_code).strip()))
+    if str(default_research_home).strip():
+        bridge_defaults.append(("DALTON_RESEARCH_HOME", str(default_research_home).strip()))
     bridge_rendered, bridge_eff = _apply_env_defaults(
-        bridge_entries, bridge_vals, bridge_defaults, remove_keys=remove_keys
+        bridge_entries, bridge_vals, bridge_defaults, remove_keys=("DALTON_OCW_ROOT",)
     )
 
     # Validate all required bridge effective values before touching disk.
@@ -2387,15 +2342,6 @@ def merge_bridge_and_repo_env_files(
             path=bridge_env_path,
             key="DALTON_RESEARCH_HOME",
             value=eff_research_home,
-            allow_spaces=True,
-        )
-
-    eff_ocw_root = str(bridge_eff.get("DALTON_OCW_ROOT") or "").strip()
-    if eff_ocw_root:
-        _validate_no_control_or_whitespace(
-            path=bridge_env_path,
-            key="DALTON_OCW_ROOT",
-            value=eff_ocw_root,
             allow_spaces=True,
         )
 
@@ -2476,18 +2422,9 @@ def merge_bridge_and_repo_env_files(
         "port": port_int,
         "research_code": eff_research_code,
         "research_home": eff_research_home,
-        "ocw_root": eff_ocw_root,
         "python_bin": str(py_path),
-        "research_runtime_mode": "new" if use_new_runtime else "legacy",
+        "research_runtime_mode": "new",
     }
-
-
-_PLIST_NEW_ENV_BLOCK = (
-    "        <key>DALTON_RESEARCH_CODE</key>\n"
-    "        <string>__RESEARCH_CODE__</string>\n"
-    "        <key>DALTON_RESEARCH_HOME</key>\n"
-    "        <string>__RESEARCH_HOME__</string>"
-)
 
 
 def render_plist_atomic(
@@ -2498,50 +2435,19 @@ def render_plist_atomic(
     repo_root: Path,
     home_dir: Path,
     logs_dir: Path | None = None,
-    research_runtime: str = "auto",
+    research_runtime: str = "new",
 ) -> int:
-    """Render launchd plist atomically (`0644`) using non-secret paths from `bridge_env_path`.
-
-    When `research_runtime == "auto"`, preserves legacy mode (setting `DALTON_OCW_ROOT`
-    and omitting `DALTON_RESEARCH_CODE`/`DALTON_RESEARCH_HOME`) if `bridge_env_path` or
-    an existing plist at `dest_path` defines `DALTON_OCW_ROOT` without `DALTON_RESEARCH_*`.
-    """
-    if research_runtime not in ("auto", "legacy", "new"):
+    """Render launchd plist atomically (`0644`) using non-secret paths from `bridge_env_path`."""
+    if research_runtime not in ("auto", "new"):
         raise ValueError(f"unsupported research_runtime mode: {research_runtime!r}")
     validate_safe_regular_file_target(bridge_env_path, allow_missing=False)
     validate_safe_regular_file_target(template_path, allow_missing=False)
     validate_safe_regular_file_target(dest_path, allow_missing=True)
     _, bridge_vals = parse_env_file_strict(bridge_env_path)
-    existing_plist_vals = _read_plist_env_vars(dest_path)
 
     port_int = int(str(bridge_vals.get("DALTON_BRIDGE_PORT") or "8960").strip())
-    env_ocw_root = str(bridge_vals.get("DALTON_OCW_ROOT") or "").strip()
     env_research_code = str(bridge_vals.get("DALTON_RESEARCH_CODE") or "").strip()
     env_research_home = str(bridge_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-    plist_ocw_root = str(existing_plist_vals.get("DALTON_OCW_ROOT") or "").strip()
-    plist_research_code = str(existing_plist_vals.get("DALTON_RESEARCH_CODE") or "").strip()
-    plist_research_home = str(existing_plist_vals.get("DALTON_RESEARCH_HOME") or "").strip()
-
-    if research_runtime == "legacy":
-        legacy_mode = True
-    elif research_runtime == "new":
-        legacy_mode = False
-    elif env_research_code or env_research_home:
-        legacy_mode = False
-    elif env_ocw_root:
-        legacy_mode = True
-    elif plist_ocw_root and not (plist_research_code or plist_research_home):
-        legacy_mode = True
-    else:
-        legacy_mode = False
-
-    ocw_root = env_ocw_root or plist_ocw_root
-    if legacy_mode and not ocw_root:
-        raise EnvFileValidationError(
-            path=bridge_env_path,
-            key="DALTON_OCW_ROOT",
-            reason="DALTON_OCW_ROOT is required when rendering plist in legacy mode",
-        )
 
     research_code = (
         env_research_code
@@ -2558,59 +2464,18 @@ def render_plist_atomic(
     eff_logs.mkdir(parents=True, exist_ok=True)
     validate_safe_directory_target(eff_logs)
 
-    if legacy_mode:
-        legacy_env_block = (
-            "        <key>DALTON_OCW_ROOT</key>\n"
-            f"        <string>{xml_escape(ocw_root)}</string>"
+    rendered = (
+        tpl.replace(
+            "__HOME__/.config/dalton/researchdata-bridge.env",
+            xml_escape(str(bridge_env_path)),
         )
-        if _PLIST_NEW_ENV_BLOCK in tpl:
-            rendered = tpl.replace(_PLIST_NEW_ENV_BLOCK, legacy_env_block)
-            rendered = (
-                rendered.replace(
-                    "__HOME__/.config/dalton/researchdata-bridge.env",
-                    xml_escape(str(bridge_env_path)),
-                )
-                .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
-                .replace("__PYTHON_BIN__", xml_escape(python_bin))
-                .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
-                .replace("__RESEARCH_CODE__", xml_escape(ocw_root))
-                .replace("__RESEARCH_HOME__", xml_escape(ocw_root))
-                .replace("__HOME__", xml_escape(str(home_dir)))
-            )
-        else:
-            rendered = (
-                tpl.replace(
-                    "__HOME__/.config/dalton/researchdata-bridge.env",
-                    xml_escape(str(bridge_env_path)),
-                )
-                .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
-                .replace("__PYTHON_BIN__", xml_escape(python_bin))
-                .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
-                .replace("__RESEARCH_CODE__", xml_escape(ocw_root))
-                .replace("__RESEARCH_HOME__", xml_escape(ocw_root))
-                .replace("__HOME__", xml_escape(str(home_dir)))
-            )
-            parsed_plist = plistlib.loads(rendered.encode("utf-8"))
-            parsed_plist["WorkingDirectory"] = ocw_root
-            env_dict = parsed_plist.get("EnvironmentVariables")
-            if isinstance(env_dict, dict):
-                env_dict.pop("DALTON_RESEARCH_CODE", None)
-                env_dict.pop("DALTON_RESEARCH_HOME", None)
-                env_dict["DALTON_OCW_ROOT"] = ocw_root
-            rendered = plistlib.dumps(parsed_plist, sort_keys=False).decode("utf-8")
-    else:
-        rendered = (
-            tpl.replace(
-                "__HOME__/.config/dalton/researchdata-bridge.env",
-                xml_escape(str(bridge_env_path)),
-            )
-            .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
-            .replace("__PYTHON_BIN__", xml_escape(python_bin))
-            .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
-            .replace("__RESEARCH_CODE__", xml_escape(research_code))
-            .replace("__RESEARCH_HOME__", xml_escape(research_home))
-            .replace("__HOME__", xml_escape(str(home_dir)))
-        )
+        .replace("__HOME__/Library/Logs", xml_escape(str(eff_logs)))
+        .replace("__PYTHON_BIN__", xml_escape(python_bin))
+        .replace("__REPO_ROOT__", xml_escape(str(repo_root)))
+        .replace("__RESEARCH_CODE__", xml_escape(research_code))
+        .replace("__RESEARCH_HOME__", xml_escape(research_home))
+        .replace("__HOME__", xml_escape(str(home_dir)))
+    )
 
     plistlib.loads(rendered.encode("utf-8"))
     atomic_write_text(dest_path, rendered, mode=0o644)
@@ -2618,7 +2483,7 @@ def render_plist_atomic(
 
 
 # ---------------------------------------------------------------------------
-# CLI entrypoints (`exec-nonarchive`, `exec-archive`, `merge-bridge-env`, etc.)
+# CLI entrypoints (`exec-nonarchive`, `merge-bridge-env`, etc.)
 # ---------------------------------------------------------------------------
 
 
@@ -2648,68 +2513,12 @@ def _cmd_exec_nonarchive(args: argparse.Namespace) -> int:
     return 127
 
 
-def _cmd_exec_archive(args: argparse.Namespace) -> int:
-    cmd = list(args.command)
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    if not cmd:
-        print("bridge_subprocess_env exec-archive: missing command", file=sys.stderr)
-        return 2
-
-    repo_root = Path(args.repo_root).resolve() if args.repo_root else _repo_root_default()
-    repo_env = Path(args.repo_env).expanduser() if args.repo_env else (repo_root / ".env")
-    bridge_env = (
-        Path(args.bridge_env).expanduser()
-        if args.bridge_env
-        else Path(os.path.expanduser("~/.config/dalton/researchdata-bridge.env"))
-    )
-    explicit_model = args.model or _extract_model_arg_from_argv(cmd)
-    defer_primary = not bool(explicit_model)
-    caller_candidates = capture_archive_provider_candidates(
-        os.environ,
-        repo_root=repo_root,
-        repo_env_path=repo_env,
-        hydrate_from_dotenv=True,
-    )
-    try:
-        env = build_archive_subprocess_env(
-            repo_env_path=repo_env,
-            bridge_env_path=bridge_env,
-            base_env=os.environ,
-            explicit_model=explicit_model,
-            host_embed_url=args.embed_url or DEFAULT_HOST_EMBED_URL,
-            repo_root=repo_root,
-            validate_required=True,
-            defer_primary_model_validation=defer_primary,
-        )
-        candidates_rfd = finalize_and_attach_archive_candidates(
-            caller_candidates,
-            env,
-            repo_root=repo_root,
-        )
-    except ArchiveEnvValidationError as exc:
-        print(f"[archive_env] ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        os.execvpe(cmd[0], cmd, env)
-    except BaseException:
-        if candidates_rfd is not None:
-            try:
-                os.close(candidates_rfd)
-            except OSError:
-                pass
-        raise
-    return 127
-
-
 def _cmd_merge_bridge_env(args: argparse.Namespace) -> int:
     try:
         meta = merge_bridge_and_repo_env_files(
             bridge_env_path=Path(args.bridge_env).expanduser(),
             repo_env_path=Path(args.repo_env).expanduser(),
             default_port=str(args.default_port),
-            default_ocw_root=str(args.default_ocw_root),
             default_python_bin=str(args.default_python),
             default_research_code=str(args.default_research_code),
             default_research_home=str(args.default_research_home),
@@ -2778,24 +2587,15 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     p_na.add_argument("command", nargs=argparse.REMAINDER)
 
-    p_ar = sub.add_parser("exec-archive", help="Build archive allowlist env, validate, and exec")
-    p_ar.add_argument("--repo-env", default=None)
-    p_ar.add_argument("--bridge-env", default=None)
-    p_ar.add_argument("--repo-root", default=None)
-    p_ar.add_argument("--model", default=None)
-    p_ar.add_argument("--embed-url", default=DEFAULT_HOST_EMBED_URL)
-    p_ar.add_argument("command", nargs=argparse.REMAINDER)
-
     p_mg = sub.add_parser("merge-bridge-env", help="Atomically merge defaults into bridge and repo env files")
     p_mg.add_argument("--bridge-env", required=True)
     p_mg.add_argument("--repo-env", required=True)
     p_mg.add_argument("--default-port", default="8960")
-    p_mg.add_argument("--default-ocw-root", default="")
     p_mg.add_argument("--default-research-code", default="")
     p_mg.add_argument("--default-research-home", default="")
     p_mg.add_argument("--default-python", required=True)
     p_mg.add_argument("--existing-plist", default="")
-    p_mg.add_argument("--research-runtime", choices=("auto", "legacy", "new"), default="auto")
+    p_mg.add_argument("--research-runtime", choices=("auto", "new"), default="new")
     p_mg.add_argument("--print-port-only", action="store_true")
 
     p_pl = sub.add_parser("render-plist", help="Atomically render launchd plist")
@@ -2805,7 +2605,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_pl.add_argument("--repo-root", required=True)
     p_pl.add_argument("--home", required=True)
     p_pl.add_argument("--logs-dir", default=None)
-    p_pl.add_argument("--research-runtime", choices=("auto", "legacy", "new"), default="auto")
+    p_pl.add_argument("--research-runtime", choices=("auto", "new"), default="new")
 
     p_ck = sub.add_parser("check-env-keys", help="Output boolean presence map for named keys")
     p_ck.add_argument("keys", nargs="+")
@@ -2816,8 +2616,6 @@ def main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
     if args.subcommand == "exec-nonarchive":
         return _cmd_exec_nonarchive(args)
-    if args.subcommand == "exec-archive":
-        return _cmd_exec_archive(args)
     if args.subcommand == "merge-bridge-env":
         return _cmd_merge_bridge_env(args)
     if args.subcommand == "render-plist":

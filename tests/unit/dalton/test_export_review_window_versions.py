@@ -87,9 +87,8 @@ def _run_export(
 
 def test_header_names_each_running_version_and_the_lost_coverage(tmp_path):
     """A container started inside the window says so: the missing early
-    backend logs are a rebuild loss, not an empty system. The bridges' lines
-    name their versions — the newest startup line wins, and a bridge that
-    never logs one reads as unknown."""
+    backend logs are a rebuild loss, not an empty system. The bridge line
+    names its version — the newest startup line wins."""
     exported = _run_export(
         tmp_path,
         started_at="2026-10-28T03:30:00.123456789Z",  # 23:30 EDT, after --since
@@ -102,16 +101,12 @@ def test_header_names_each_running_version_and_the_lost_coverage(tmp_path):
                 "2026-10-28T03:35:00,000 [INFO] Listening on http://127.0.0.1:8787 "
                 "(server_version=2026.10.28-3f2a1b4, max_inflight=8, caller_budget_s=120)\n"
             ),
-            "dalton-web-search-bridge.err.log": (
-                "2026-10-28T03:31:00,000 [INFO] Listening on http://127.0.0.1:8788 "
-                "(socket_ready=True, key_ready=True, max_inflight=4)\n"
-            ),
         },
     )
 
     assert "researchdata_bridge_server_version: 2026.10.28-3f2a1b4" in exported
     assert "old-2026.10.26" not in exported.split("=====")[0]
-    assert "websearch_bridge_server_version: unknown" in exported
+    assert "websearch_bridge_server_version" not in exported
     assert "backend_image_id: sha256:fakeimage" in exported
     assert "backend_image_created: 2026-10-01T08:00:00Z" in exported
     assert "backend_container_started: 2026-10-28T03:30:00.123456789Z" in exported

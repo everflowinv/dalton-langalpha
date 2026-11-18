@@ -126,12 +126,6 @@ def test_registry_frontmatter_and_skill_refs() -> None:
     )
     from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
 
-    sys.path.insert(0, str(REPO_ROOT / "scripts" / "dalton"))
-    try:
-        import check_skill_refs
-    finally:
-        sys.path.pop(0)
-
     assert (SKILL_NAME, None, ()) in _DALTON_SKILL_SPECS
     assert SKILL_NAME in DALTON_SKILL_DEFINITIONS
     assert SKILL_NAME in SKILL_REGISTRY
@@ -156,12 +150,6 @@ def test_registry_frontmatter_and_skill_refs() -> None:
     for cfg in JSON_CONFIG_FILES:
         assert (SCRIPTS_DIR / cfg).is_file()
     assert not (SKILL_DIR / "run.sh").exists()
-
-    findings = check_skill_refs.scan_skills()
-    for hit in findings["ghost_hits"]:
-        assert SKILL_NAME not in hit["file"], f"Unexpected ghost tool ref: {hit}"
-    for br in findings["broken_refs"]:
-        assert SKILL_NAME not in br["file"], f"Unexpected broken ref: {br}"
 
 
 # ---------------------------------------------------------------------------

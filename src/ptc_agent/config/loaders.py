@@ -351,6 +351,11 @@ def load_from_dict(
 
     # Search API provider + default depth level
     search_api = config_data.get("search_api", "tavily")
+    if str(search_api or "").strip().lower() == "openclaw":  # DALTON-HOOK(web-search-gemini)
+        raise ValueError(
+            "search_api: 'openclaw' is no longer supported after OpenClaw retirement; "
+            "configure 'gemini_grounding' or another supported provider."
+        )
     search_depth = config_data.get("search_depth", "standard")
     # DALTON-HOOK(x-search-direct): only a real boolean counts. A missing
     # section leaves the tool off; the Dalton overlay sets enabled: true.

@@ -43,8 +43,8 @@ def test_native_overlay_does_not_collide_with_upstream():
 
     native_models = native.get("models") or {}
     # DALTON-HOOK(llm-overlay): claude-fable-5-2 and claude-fable-5-2-oauth graduated into upstream #751;
-    # gpt-6.2-{astra,sol}{,-oauth} added in native_overlay.json (34 + 4 = 38).
-    assert len(native_models) == 38
+    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high}-oauth added (38 + 3 = 41).
+    assert len(native_models) == 41
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -1841,3 +1841,101 @@ def test_antigravity_xhigh_is_a_thinking_level_and_derives_from_the_model_id():
     assert _derive_thinking_level("gemini-4-hydrogen-xhigh") == "XHIGH"
     assert _derive_thinking_level("gemini-4-argon-high") == "HIGH"
     assert _normalize_thinking_level("max") is None
+
+
+_NEON_EFFORTS = ("low", "medium", "high")
+_NEON_SOURCE = "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/"
+
+
+def test_gemini_4_neon_overlay_awaiting_release_and_notional_pricing(monkeypatch):
+    """Neon is configured in native_overlay.json like Hydrogen with awaiting_release=True
+    and estimated Google Cloud billing catalogue notional pricing ($3/$15/$0.15)."""
+    from unittest.mock import create_autospec
+
+    from src.dalton.llm import overlay as overlay_mod
+    from src.dalton.llm.notional_pricing import (
+        build_notional_price_index,
+        resolve_notional_card,
+    )
+    from src.dalton.llm.role_policy import family_of, is_text_only
+    from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    meta = load_dalton_meta()
+    listed = dict(mc.listed_models())
+
+    for effort in _NEON_EFFORTS:
+        key = f"gemini-4-neon-{effort}-oauth"
+        model_id = f"gemini-4-neon-{effort}"
+        # Hidden until the subscription serves it (awaiting_release), so not listed.
+        assert key not in listed
+        entry = mc.get_model_config(key)
+        assert entry is not None
+        assert entry["provider"] == "antigravity-oauth"
+        assert entry["model_id"] == model_id
+        assert entry["visible"] is False
+        assert entry["prompt_guidance"] == "lean"
+        assert entry["context"] == 1_048_576
+        assert entry["parameters"] == {"include_thoughts": True, "max_output_tokens": 65536}
+        assert entry["reasoning"] == {
+            "efforts": [effort],
+            "default": effort,
+            "write": "parameters.thinking_level",
+        }
+        assert mc.get_input_modalities(key) == ["text", "image", "pdf", "video"]
+        assert family_of(key) == "google-gemini"
+        assert is_text_only(key) is False
+
+        neon_meta = meta[key]
+        assert neon_meta["billing"] == "subscription"
+        assert neon_meta["tool_calling"] is True
+        assert neon_meta["awaiting_release"] is True
+        stored = neon_meta["notional_pricing"]
+        assert stored["estimated"] is True
+        assert stored["source"] == _NEON_SOURCE
+        assert stored["verified_at"] == "2026-11-19"
+        assert resolve_notional_card(key) == {
+            "input": 3.0,
+            "output": 15.0,
+            "cached_input": 0.15,
+        }
+
+        client = LLM(key, api_key="fake-ag-token").get_llm()
+        assert isinstance(client, ChatAntigravity)
+        assert client.model == model_id
+        assert client.thinking_level == effort
+
+        billed = calculate_cost_from_per_call_records(
+            [
+                {
+                    "model_name": key,
+                    "pricing_model_id": client.metadata["pricing_model_id"],
+                    "pricing_provider": client.metadata["pricing_provider"],
+                    "billing_type": client.metadata["billing_type"],
+                    "usage": {
+                        "input_tokens": 2_000_000,
+                        "output_tokens": 1_000_000,
+                        "cached_tokens": 1_000_000,
+                    },
+                }
+            ]
+        )
+        assert billed["total_cost"] == 0.0
+        assert billed["platform_cost"] == 0.0
+        # 1M fresh input $3.0 + 1M cached $0.15 + 1M output $15.0 = $18.15.
+        assert billed["notional_cost"] == pytest.approx(18.15)
+
+    # Fallback table also provides the same rates when dalton_meta is unavailable.
+    monkeypatch.setattr(
+        overlay_mod,
+        "load_dalton_meta",
+        create_autospec(overlay_mod.load_dalton_meta, return_value={}),
+    )
+    fallback_idx = build_notional_price_index()
+    for effort in _NEON_EFFORTS:
+        assert fallback_idx[f"gemini-4-neon-{effort}-oauth"] == {
+            "input": 3.0,
+            "output": 15.0,
+            "cached_input": 0.15,
+        }

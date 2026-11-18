@@ -247,6 +247,78 @@
         "write": "parameters.thinking_level"
       }
     },
+    "gemini-4-neon-low-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-neon-low",
+      "provider": "antigravity-oauth",
+      "visible": false,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "low"
+        ],
+        "default": "low",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-neon-medium-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-neon-medium",
+      "provider": "antigravity-oauth",
+      "visible": false,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "medium"
+        ],
+        "default": "medium",
+        "write": "parameters.thinking_level"
+      }
+    },
+    "gemini-4-neon-high-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-neon-high",
+      "provider": "antigravity-oauth",
+      "visible": false,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "high"
+        ],
+        "default": "high",
+        "write": "parameters.thinking_level"
+      }
+    },
     "gemini-3.8-flash-low-oauth": {
       "prompt_guidance": "lean",
       "model_id": "gemini-3.8-flash-low",
@@ -329,7 +401,7 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-2.5-pro",
       "provider": "antigravity-oauth",
-      "visible": true,
+      "visible": false,
       "speed": 2,
       "intelligence": 4,
       "context": 1048576,
@@ -355,7 +427,7 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-3-flash",
       "provider": "antigravity-oauth",
-      "visible": true,
+      "visible": false,
       "speed": 4,
       "intelligence": 4,
       "context": 1048576,
@@ -1368,6 +1440,51 @@
       "tool_calling": true,
       "comment": "Subscription cash cost is 0. Gemini 4 Hydrogen is not officially announced; nominal rates $0.75 input / $3.75 output / $0.0375 cached input per million tokens, chosen by the user 2026-11-12 from a Google Cloud billing catalogue report (another report gives $1.50 / $7.50). Context and output limits are unpublished; Flash-tier values are used until Google publishes them."
     },
+    "gemini-4-neon-low-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "awaiting_release": true,
+      "notional_pricing": {
+        "input": 3.0,
+        "output": 15.0,
+        "cached_input": 0.15,
+        "estimated": true,
+        "source": "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/",
+        "verified_at": "2026-11-19"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon is not officially announced; nominal rates $3 input / $15 output / $0.15 cached input per million tokens come from a Google Cloud billing catalogue report. Context and output limits are unpublished; Hydrogen values (1048576 / 65536) are used until Google publishes official limits."
+    },
+    "gemini-4-neon-medium-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "awaiting_release": true,
+      "notional_pricing": {
+        "input": 3.0,
+        "output": 15.0,
+        "cached_input": 0.15,
+        "estimated": true,
+        "source": "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/",
+        "verified_at": "2026-11-19"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon is not officially announced; nominal rates $3 input / $15 output / $0.15 cached input per million tokens come from a Google Cloud billing catalogue report. Context and output limits are unpublished; Hydrogen values (1048576 / 65536) are used until Google publishes official limits."
+    },
+    "gemini-4-neon-high-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "awaiting_release": true,
+      "notional_pricing": {
+        "input": 3.0,
+        "output": 15.0,
+        "cached_input": 0.15,
+        "estimated": true,
+        "source": "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/",
+        "verified_at": "2026-11-19"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon is not officially announced; nominal rates $3 input / $15 output / $0.15 cached input per million tokens come from a Google Cloud billing catalogue report. Context and output limits are unpublished; Hydrogen values (1048576 / 65536) are used until Google publishes official limits."
+    },
     "gemini-3.8-flash-low-oauth": {
       "family": "google-gemini",
       "billing": "subscription",
@@ -1390,13 +1507,15 @@
       "family": "google-gemini",
       "billing": "subscription",
       "notional_ref": "gemini-3.1-pro-preview",
-      "tool_calling": true
+      "tool_calling": true,
+      "comment": "Hidden 2026-11-19: the Antigravity subscription no longer lists this model (agy models); kept for old thread references."
     },
     "gemini-3-flash-oauth": {
       "family": "google-gemini",
       "billing": "subscription",
       "notional_ref": "gemini-3.8-flash",
-      "tool_calling": true
+      "tool_calling": true,
+      "comment": "Hidden 2026-11-19: the Antigravity subscription no longer lists this model (agy models); kept for old thread references."
     },
     "claude-opus-5-5-low-oauth": {
       "family": "anthropic-claude",

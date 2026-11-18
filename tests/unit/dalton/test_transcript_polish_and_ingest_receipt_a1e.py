@@ -304,7 +304,8 @@ class TestIngestReceiptIdentifiers:
         bridge.cfg.wiki_ingest_timeout_s = 10.0
         bridge.cfg.wiki_ingest_temp_dir = tmp_path / "tmp"
         bridge.cfg.env_path = tmp_path / ".nonexistent.env"
-        bridge.cfg.ocw_root = tmp_path / "ocw"
+        bridge.cfg.research_code = tmp_path / "ocw"
+        bridge.cfg.research_home = tmp_path / "ocw"
         bridge.cfg.subprocess_proxy = ""
 
         multiline_cli_stdout = json.dumps(
@@ -376,7 +377,8 @@ class TestIngestReceiptIdentifiers:
         bridge.cfg.wiki_ingest_timeout_s = 10.0
         bridge.cfg.wiki_ingest_temp_dir = tmp_path / "tmp"
         bridge.cfg.env_path = tmp_path / ".nonexistent.env"
-        bridge.cfg.ocw_root = tmp_path / "ocw"
+        bridge.cfg.research_code = tmp_path / "ocw"
+        bridge.cfg.research_home = tmp_path / "ocw"
         bridge.cfg.subprocess_proxy = ""
 
         multiline_cli_stdout = json.dumps(

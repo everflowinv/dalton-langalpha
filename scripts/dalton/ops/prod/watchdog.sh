@@ -1,8 +1,8 @@
 #!/bin/bash
 # Dalton backend watchdog: restart the backend container after 3 consecutive failed /health checks,
-# and alert the PM on Feishu (through the host bridge's /notify) after 5 minutes down, plus once
-# more when it recovers. The bridge runs on the host, so the alert still goes out when Docker is down;
-# if the bridge is down too, fall back to a macOS notification.
+# and alert the PM after 5 minutes down, plus once more when it recovers. The alert goes through the
+# host channel gateway's /internal/ops-alerts, which runs outside Docker; if the gateway does not
+# accept it, fall back to a macOS notification.
 export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
@@ -11,9 +11,7 @@ OPS_STATE_DIR="${DALTON_OPS_STATE_DIR:-$HOME/.dalton-ops}"
 STATE="${DALTON_WATCHDOG_STATE_FILE:-${BACKUP_DIR}/.watchdog_failures}"
 DOWN_SINCE="${OPS_STATE_DIR}/.down_since"      # epoch of the first failed check in this outage
 ALERTED="${OPS_STATE_DIR}/.down_alerted"       # present once the outage alert went out
-TARGETS="${DALTON_ALERT_TARGETS_FILE:-${OPS_STATE_DIR}/alert_targets.json}"
 LOG="${DALTON_WATCHDOG_LOG_FILE:-${BACKUP_DIR}/watchdog.log}"
-ENV_FILE="${DALTON_ENV_FILE:-${REPO_ROOT}/.env}"
 ALERT_AFTER_S="${DALTON_WATCHDOG_ALERT_AFTER_S:-300}"
 
 GATEWAY_ENV="${DALTON_CHANNEL_GATEWAY_ENV_FILE:-$HOME/.config/dalton/channel-gateway.env}"
@@ -22,7 +20,7 @@ CURRENT_HDR_FILE=""
 trap 'rm -f "$CURRENT_HDR_FILE" 2>/dev/null || true' EXIT
 
 notify() {  # $1 = text, $2 = ops alert code (backend_down | backend_recovered)
-  local token payload code hdr_file
+  local token code hdr_file
   # Preferred path: the Dalton channel gateway's loopback ops alert (fixed text and
   # targets from ~/.config/dalton/ops-alerts.json); no OpenClaw involved.
   token=$(grep -E '^INTERNAL_SERVICE_TOKEN=' "$GATEWAY_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'")
@@ -39,25 +37,10 @@ notify() {  # $1 = text, $2 = ops alert code (backend_down | backend_recovered)
   fi
   echo "$(date '+%F %T') ops-alert http=$code: $1" >> "$LOG"
   [ "$code" = "200" ] && return 0
-  # Fallback: the host bridge /notify, then a macOS notification.
-  token=$(grep -E '^DALTON_BRIDGE_ADMIN_TOKEN=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'")
-  payload=$(python3 -I -c 'import json,sys; t=json.load(open(sys.argv[1])).get("targets",[]); print(json.dumps({"targets":t,"text":sys.argv[2]}))' "$TARGETS" "$1" 2>/dev/null)
-  code=000
-  if [ -n "$token" ] && [ -n "$payload" ]; then
-    hdr_file=$(umask 077 && mktemp)
-    CURRENT_HDR_FILE="$hdr_file"
-    printf 'Authorization: Bearer %s\nX-Dalton-Bridge-Token: %s\n' "$token" "$token" > "$hdr_file"
-    chmod 600 "$hdr_file" 2>/dev/null || true
-    code=$("$CURL_CMD" -s -m 15 --noproxy '*' -o /dev/null -w '%{http_code}' -X POST "${DALTON_BRIDGE_NOTIFY_URL:-http://127.0.0.1:8960/notify}" \
-      -H "Content-Type: application/json" -H "@${hdr_file}" \
-      --data "$payload" 2>/dev/null || echo 000)
-    rm -f "$hdr_file"
-    CURRENT_HDR_FILE=""
-  fi
-  echo "$(date '+%F %T') notify http=$code: $1" >> "$LOG"
-  if [ "$code" != "200" ]; then
-    osascript -e "display notification \"$1\" with title \"Dalton\"" >/dev/null 2>&1 || true
-  fi
+  # Fallback: a macOS notification. The bridge /notify only sends Feishu cards
+  # now (plain text went through the retired OpenClaw gateway), so it cannot carry
+  # this alert.
+  osascript -e "display notification \"$1\" with title \"Dalton\"" >/dev/null 2>&1 || true
 }
 
 if "$CURL_CMD" -s -m 15 -o /dev/null -w '%{http_code}' --noproxy '*' http://127.0.0.1:8000/health | grep -q '^200$'; then

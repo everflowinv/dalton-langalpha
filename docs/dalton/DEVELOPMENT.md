@@ -45,12 +45,11 @@ bash scripts/dalton/pr_baseline.sh --pr <PR_NUMBER> --baseline-only
 uv run python scripts/dalton/check_report_claims.py --strict <path/to/report.md>
 ```
 
-`scripts/dalton/pr_baseline.sh` 按顺序强制跑这四步（不传 `--baseline-only` 时还会串行跑 9 项 J1 验收和调试探测，其中 J1 Debug 6/9 对照归档报告 `docs/dalton/archive/dev-guide/P0I-round3-dev-report.md`）：
+`scripts/dalton/pr_baseline.sh` 按顺序强制跑这三步（不传 `--baseline-only` 时还会串行跑 9 项 J1 验收和调试探测，其中 J1 Debug 6/9 对照归档报告 `docs/dalton/archive/dev-guide/P0I-round3-dev-report.md`）：
 
 1. `./scripts/dalton/check_hooks.sh --strict --audit`（叠加层与受保护文件守卫）。
 2. `uv run --with pytest-xdist ... pytest tests/unit -q -n ${DALTON_BASELINE_WORKERS:-4} --dist loadgroup --durations=25`（macOS 下按约定跳过少数 Linux 专用的 `xattr`/`lchown`/`setuid` 用例）。
-3. `node --test integrations/openclaw/dalton-langalpha-broker/test/*.test.mjs`（历史接口兼容性合约测试，保住现有测试基线）。
-4. `pnpm --dir web typecheck && pnpm --dir web test -- --run`（前端 TypeScript 类型检查和 Vitest 单测）。
+3. `pnpm --dir web typecheck && pnpm --dir web test -- --run`（前端 TypeScript 类型检查和 Vitest 单测）。
 
 传入 `--pr <PR_NUMBER>` 时，脚本还会核对远端 `headRefOid` 和本地 `HEAD` 是否一致，拉取 PR 描述跑 `scripts/dalton/check_report_claims.py --strict` 核验报告里引的标识符、路径和口径；不加 `--no-comment` 时，结果会自动评论到对应 PR。
 

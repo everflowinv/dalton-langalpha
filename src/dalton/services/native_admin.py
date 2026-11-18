@@ -44,6 +44,7 @@ from src.dalton.llm.native_catalog import (
     restore_native_models,
     write_native_sync_overlay,
 )
+from src.dalton.llm.overlay import load_dalton_meta
 from src.dalton.services import model_references
 from src.dalton.services.model_references import ReferenceSourceUnavailable
 from src.dalton.services.openclaw_admin import _invalidate_local_worker_model_caches
@@ -128,7 +129,14 @@ async def run_native_check(*, user_id: str) -> dict[str, Any]:
                 from src.llms.llm import LLM
 
                 llm_config = LLM.get_model_config().llm_config or {}
-                diff = build_native_diff(listings, llm_config, retired_key_set())
+                awaiting_keys = {
+                    key
+                    for key, meta in load_dalton_meta().items()
+                    if isinstance(meta, dict) and meta.get("awaiting_release")
+                }
+                diff = build_native_diff(
+                    listings, llm_config, retired_key_set(), awaiting_release_keys=awaiting_keys
+                )
 
                 provider_rows = [
                     {

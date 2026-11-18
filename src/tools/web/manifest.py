@@ -143,7 +143,7 @@ def _parse_capability(provider: str, verb: str, entry: Dict[str, Any]) -> Capabi
 
 
 @lru_cache(maxsize=1)
-def _load_base_web_providers() -> Mapping[str, WebProviderSpec]:  # DALTON-HOOK(web-search-openclaw)
+def _load_base_web_providers() -> Mapping[str, WebProviderSpec]:  # DALTON-HOOK(web-search-gemini)
     manifest = _load_manifest()
     providers: Dict[str, WebProviderSpec] = {}
 
@@ -171,14 +171,10 @@ def get_web_providers() -> Mapping[str, WebProviderSpec]:
 
     Read-only mapping: the lru_cache shares one object across all callers.
     """
-    from src.config.tool_settings import get_search_api  # DALTON-HOOK(web-search-openclaw)
+    from src.config.tool_settings import get_search_api  # DALTON-HOOK(web-search-gemini)
 
     search_api = get_search_api()
     base = _load_base_web_providers()
-    if search_api == "openclaw":  # DALTON-HOOK(web-search-openclaw)
-        from src.dalton.web_search_spec import register_openclaw_web_provider  # DALTON-HOOK(web-search-openclaw)
-
-        return register_openclaw_web_provider(base)  # DALTON-HOOK(web-search-openclaw)
     if search_api == "gemini_grounding":  # DALTON-HOOK(web-search-gemini)
         from src.dalton.web_search_spec import (  # DALTON-HOOK(web-search-gemini)
             register_gemini_grounding_web_provider,
@@ -188,7 +184,7 @@ def get_web_providers() -> Mapping[str, WebProviderSpec]:
     return base
 
 
-get_web_providers.cache_clear = _load_base_web_providers.cache_clear  # type: ignore[attr-defined]  # DALTON-HOOK(web-search-openclaw)
+get_web_providers.cache_clear = _load_base_web_providers.cache_clear  # type: ignore[attr-defined]  # DALTON-HOOK(web-search-gemini)
 get_web_providers.cache_info = _load_base_web_providers.cache_info  # type: ignore[attr-defined]
 
 

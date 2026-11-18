@@ -6,7 +6,6 @@ scripts/dalton/
 config/dalton/
 deploy/dalton/
 docs/dalton/
-integrations/openclaw/
 tests/unit/dalton/
 tests/integration/dalton/
 tests/fixtures/dalton/
@@ -170,10 +169,9 @@ src/dalton/data_jobs/runner_wrapper.py
 src/dalton/data_jobs/child_site/sitecustomize.py
 src/dalton/data_jobs/evaluators.py
 src/dalton/data_jobs/freeze.py
-scripts/dalton/data_tasks_parity.py
 scripts/dalton/data_task_run_now.py
 scripts/dalton/seed_openclaw_data.sh
-scripts/dalton/openclaw_overlays/scripts/feishu_send_card.py
+scripts/dalton/data_assets/scripts/feishu_send_card.py
 tests/unit/dalton/fixtures/oc1_task_baseline.md
 tests/unit/dalton/fixtures/openclaw_feishu_send_card.py
 tests/unit/dalton/test_data_jobs.py
@@ -193,7 +191,7 @@ integrations/dalton-channel-gateway/src/commands.ts
 scripts/dalton/launchd/com.dalton.channel-gateway.plist.template
 scripts/dalton/gen_channel_gateway_fixtures.py
 # JPX market-wide and Kioxia daily margin monitor CLI overlay and offline regression tests.
-scripts/dalton/openclaw_overlays/skills/jp-leverage-monitor/scripts/jp_leverage_monitor_cli.py
+scripts/dalton/data_assets/skills/jp-leverage-monitor/scripts/jp_leverage_monitor_cli.py
 tests/unit/dalton/test_jp_leverage_monitor.py
 # CH-1 Phase 3 (PR 1): shared channel helpers, Feishu adapter, third-party notices, and Vitest suite.
 integrations/dalton-channel-gateway/THIRD_PARTY_NOTICES.md
@@ -221,13 +219,13 @@ tests/integration/dalton/test_weixin_full_stack.py
 web/src/pages/Settings/panels/dalton/DaltonWeixinChannelCard.tsx
 web/src/pages/Settings/panels/dalton/__tests__/DaltonWeixinChannelCard.test.tsx
 
-scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
-scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
-scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_digest.sh
-scripts/dalton/openclaw_overlays/skills/kweb-dashboard/SKILL.md
-scripts/dalton/openclaw_overlays/skills/kweb-dashboard/scripts/kweb_dashboard_cli.py
+scripts/dalton/data_assets/skills/sentiment-dashboard/scripts/run.sh
+scripts/dalton/data_assets/scripts/sentiment_dashboard_cos_upload.py
+scripts/dalton/data_assets/scripts/sentiment_dashboard_digest.sh
+scripts/dalton/data_assets/skills/kweb-dashboard/SKILL.md
+scripts/dalton/data_assets/skills/kweb-dashboard/scripts/kweb_dashboard_cli.py
 scripts/dalton/check_monitor_conflicts.py
-scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh
+scripts/dalton/data_assets/scripts/bbg_remote_refresh.sh
 # Chat composer large-file multipart uploads (<=200 MiB) and sandbox materialization.
 src/dalton/migrations/versions/d033_chat_file_uploads.py
 src/dalton/chat_upload_storage.py
@@ -238,16 +236,14 @@ web/src/lib/dalton/chatUploadClient.ts
 web/src/components/ui/__tests__/chat-input.largeUpload.test.tsx
 tests/unit/dalton/test_chat_uploads.py
 tests/integration/dalton/test_chat_large_upload_e2e.py
-scripts/dalton/openclaw_overlays/scripts/cron_command_tasks.py
+scripts/dalton/data_assets/scripts/cron_command_tasks.py
 tests/unit/dalton/test_t26_task_preview.py
 # Sentiment dashboard: per-series observation dates and the missing-volume note.
-scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_sections.py
-scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
+scripts/dalton/data_assets/skills/sentiment-dashboard/scripts/us_market_sections.py
+scripts/dalton/data_assets/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
 tests/unit/dalton/test_sentiment_observation_dates.py
 # OC5 PR1 Batch 1: dedicated Bridge Feishu config, atomic installer merge, subprocess env filtering, and archive allowlist.
 scripts/dalton/bridge_subprocess_env.py
-scripts/dalton/openclaw_overlays/skills/company-wiki/run.sh
-scripts/dalton/openclaw_overlays/skills/market-digest/run.sh
 tests/unit/dalton/test_oc5_pr1_batch1.py
 # Dalton data-task report delivery via dedicated channel gateway:
 src/dalton/data_jobs/safe_fs.py
@@ -361,7 +357,6 @@ plugins/dalton/skills/dalton-x-accounts-daily/
 plugins/dalton/skills/dalton-humanoid-robot-weekly/
 plugins/dalton/skills/dalton-china-consumer-weekly/
 plugins/dalton/skills/dalton-global-consumer-weekly/
-scripts/dalton/import_openclaw_skill_state.py
 tests/unit/dalton/test_agentturn_family2b.py
 src/dalton/database/automation_reports.py
 src/ptc_agent/agent/middleware/skills/dalton_registry.py
@@ -444,21 +439,21 @@ tests/unit/server/services/test_dalton_wake_handoff.py
 tests/unit/server/handlers/test_ptc_run_firing_identity.py
 # S6 r5: staged-attachment steer storage failures reach the composer as retryable.
 web/src/pages/ChatAgent/hooks/__tests__/useChatMessages.steerRetryableError.test.tsx
-# OC-1 podcast weekly migration (host pipeline overlay + internal LLM router + agentTurn skill).
+# OC-1 podcast weekly migration (host pipeline assets + internal LLM router + agentTurn skill).
 src/dalton/app/internal_llm_router.py
-scripts/dalton/openclaw_overlays/skills/podcast-weekly-digest/
+scripts/dalton/data_assets/skills/podcast-weekly-digest/
 plugins/dalton/skills/dalton-podcast-weekly/
 tests/unit/dalton/test_podcast_weekly_migration.py
 
-# Weekly token usage report migration (internal usage router + overlay skill/tracker).
+# Weekly token usage report migration (internal usage router + asset skill/tracker).
 src/dalton/app/internal_usage_router.py
-scripts/dalton/openclaw_overlays/skills/model-usage-cost/
-scripts/dalton/openclaw_overlays/scripts/token_weekly_usage_tracker.py
+scripts/dalton/data_assets/skills/model-usage-cost/
+scripts/dalton/data_assets/scripts/token_weekly_usage_tracker.py
 tests/unit/dalton/test_weekly_token_usage.py
-# 11-13 production fixes (vendor nested data, known-crowding carry-over, empty series) kept in the overlay so a reseed does not drop them.
-scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/fetch_history.py
-scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/official_mirror.py
-scripts/dalton/openclaw_overlays/skills/index-crowding-research/scripts/backtest.py
+# 11-13 production fixes (vendor nested data, known-crowding carry-over, empty series) kept in data_assets so a reseed preserves them.
+scripts/dalton/data_assets/skills/index-crowding-research/scripts/fetch_history.py
+scripts/dalton/data_assets/skills/index-crowding-research/scripts/official_mirror.py
+scripts/dalton/data_assets/skills/index-crowding-research/scripts/backtest.py
 # Monitors (Round 1: Platform): Dalton monitor module, migration, and frontend pages/API/tests.
 src/dalton/monitors/
 src/dalton/migrations/versions/d038_monitors.py

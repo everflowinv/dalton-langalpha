@@ -15,7 +15,7 @@ SCRIPTS = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "skills"
     / "sentiment-dashboard"
     / "scripts"

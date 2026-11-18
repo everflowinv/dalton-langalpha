@@ -25,7 +25,7 @@ SCRIPTS = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "skills"
     / "sentiment-dashboard"
     / "scripts"
@@ -74,9 +74,9 @@ def _visible_text(html_doc: str) -> str:
 
 def _find_upstream_scripts() -> Path:
     candidates = [
+        REPO_ROOT / "tests/fixtures/dalton/sentiment_dashboard_upstream",
         REPO_ROOT.parent.parent / "dalton-agy/design/dashboards/sentiment-dashboard/scripts",
         Path("/Users/everflow/Projects/dalton-agy/design/dashboards/sentiment-dashboard/scripts"),
-        Path.home() / ".openclaw/workspace/skills/sentiment-dashboard/scripts",
     ]
     for candidate in candidates:
         if (
@@ -86,7 +86,7 @@ def _find_upstream_scripts() -> Path:
         ):
             return candidate
     raise FileNotFoundError(
-        "Real upstream sentiment-dashboard scripts directory not found in dalton-agy/design or ~/.openclaw"
+        "Upstream sentiment-dashboard fixture scripts directory not found in tests/fixtures/dalton or dalton-agy/design"
     )
 
 

@@ -187,10 +187,10 @@ class TestSkillAndAgentConventions:
             text=True,
         )
         assert proc.returncode != 0
-        assert "先同步覆盖名单" in proc.stdout or "先同步覆盖名单" in proc.stderr
+        assert "请先同步用户覆盖名单" in proc.stdout or "请先同步用户覆盖名单" in proc.stderr
         payload = json.loads(proc.stdout)
         assert payload["ok"] is False
-        assert "先同步覆盖名单" in payload["message"]
+        assert "请先同步用户覆盖名单" in payload["message"]
 
     def test_company_background_nine_sections(self) -> None:
         text = (DALTON_PLUGIN_DIR / "skills" / "dalton-company-background" / "SKILL.md").read_text(

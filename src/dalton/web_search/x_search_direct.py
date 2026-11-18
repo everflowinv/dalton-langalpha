@@ -27,11 +27,9 @@ import httpx
 from langchain_core.tools import tool
 
 from src.dalton.web_search.cache import get_cached_search, search_cache_key, store_cached_search
-from src.dalton.web_search.provider import (
+from src.dalton.web_search.formatting import (
     OpenClawSearchEmptyResultError,
     OpenClawSearchRequestError,
-)
-from src.dalton.web_search.x_search import (
     X_RATE_LIMITED_MESSAGE,
     X_UNTRUSTED_NOTICE,
     _normalize_handles_param,

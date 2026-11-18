@@ -146,7 +146,8 @@ def _sn_bridge() -> rb.ResearchDataBridge:
     bridge.cfg.wiki_ingest_timeout_s = 10.0
     bridge.cfg.wiki_ingest_temp_dir = Path("/tmp/unused-sn")
     bridge.cfg.env_path = Path("/nonexistent-bridge.env")
-    bridge.cfg.ocw_root = Path("/tmp/unused-ocw")
+    bridge.cfg.research_code = Path(rb.__file__).resolve().parent / "research_runtime"
+    bridge.cfg.research_home = Path("/tmp/unused-ocw")
     bridge.cfg.subprocess_proxy = ""
     return bridge
 

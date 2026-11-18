@@ -13,7 +13,7 @@ description: "无人值守的 CT 半导体情绪日报：汇总十个固定账�
 
 窗口、标题日期和 `report_run_id` 用美洲/纽约时间（America/New_York），即使自动化时区不是纽约。原任务没有写时区，按纽约处理。`report_run_id` 是 `ct-semi-sentiment-<summary_date>`。日期、24 小时窗口、账号名单和补充检索的 query 都用第 1 步的返回，不要自己另算，也不要增减账号。
 
-状态文件是 `state/ct-semi-sentiment/sentiment.log`。草稿放在 `temp/ct-semi-sentiment/<summary_date>/`。发送失败也保留草稿，不要追加日志。历史日志由主助手导入一次：源文件是原来的 `state/ct-semi-sentiment.log`，导入脚本是 `scripts/dalton/import_openclaw_skill_state.py`，目标目录是 `state/ct-semi-sentiment`，文件改名为 `sentiment.log`。本轮不要运行导入脚本。
+状态文件是 `state/ct-semi-sentiment/sentiment.log`。草稿放在 `temp/ct-semi-sentiment/<summary_date>/`。发送失败也保留草稿，不要追加日志。
 
 正文先给判断。自己写的句子不用这些防御性否定：不代表、并非、而不是、不能、不构成、不应。同一意思的防御性否定句也不用。需要说明边界时，写清证据范围、置信度和会改判的条件。逐字引文、原始报错和固定栏目名保持原样。
 

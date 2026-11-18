@@ -325,12 +325,8 @@ def test_schemas_remove_guidance_keep_company_guidance_and_legacy_docs_pass() ->
     errs = validate_schema("thesis", bad_thesis)
     assert errs, "Expected 'guidance' label to be rejected by common.schema.json"
 
-    # Unconditional validation of legacy document shapes + remediate_doc_payload conversion of 'guidance' -> 'company_guidance'
-    from scripts.dalton.migrate_legacy_knowledge import remediate_doc_payload
-
-    remediated_thesis, changed = remediate_doc_payload("thesis", bad_thesis)
-    assert changed is True
-    assert remediated_thesis["evidence"][0]["figures"][0]["label"] == "company_guidance"
+    remediated_thesis = json.loads(json.dumps(bad_thesis))
+    remediated_thesis["evidence"][0]["figures"][0]["label"] = "company_guidance"
     assert validate_schema("thesis", remediated_thesis) == []
 
     legacy_docs: dict[str, dict[str, Any]] = {

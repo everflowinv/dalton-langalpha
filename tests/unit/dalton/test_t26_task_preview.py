@@ -35,7 +35,7 @@ OVERLAY_SCRIPT = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "scripts"
     / "cron_command_tasks.py"
 )
@@ -284,20 +284,14 @@ def test_t26_manifest_and_seed_overlay_contract(tmp_path: Path) -> None:
     assert TASK_NOTIFY_PAYLOAD_SOURCES[T26_JOB_KEY] == "outbox_file"
     assert OVERLAY_SCRIPT.is_file()
 
-    # Verify seed_openclaw_data.sh installs the cron_command_tasks.py overlay without mutating host source.
-    src_ws = tmp_path / "host_openclaw_ws"
+    # Verify seed_openclaw_data.sh installs the cron_command_tasks.py asset into target data dir.
     dst_data = tmp_path / "dalton_openclaw_data"
-    (src_ws / "scripts").mkdir(parents=True)
-    legacy_bytes = b"#!/usr/bin/env python3\n# host script placeholder\n"
-    (src_ws / "scripts" / "cron_command_tasks.py").write_bytes(legacy_bytes)
 
     apply_res = subprocess.run(
         [
             "bash",
             str(SEED_SCRIPT),
             "--apply",
-            "--source",
-            str(src_ws),
             "--target",
             str(dst_data),
         ],
@@ -309,7 +303,6 @@ def test_t26_manifest_and_seed_overlay_contract(tmp_path: Path) -> None:
     assert (
         dst_data / "scripts" / "cron_command_tasks.py"
     ).read_bytes() == OVERLAY_SCRIPT.read_bytes()
-    assert (src_ws / "scripts" / "cron_command_tasks.py").read_bytes() == legacy_bytes
 
 
 @pytest.mark.asyncio
