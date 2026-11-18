@@ -1,14 +1,12 @@
 import json
 import sqlite3
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 from compression import zstd
 import usage_sources as s
 import usage_v3 as v3
 import model_usage_cost_cli as cli
 import test_usage_accounting as fixtures
-from test_usage_accounting import NOW, ev, token, counter, write, pb, iso
+from test_usage_accounting import NOW, ev, counter, write, pb
 
 
 class NewSources(unittest.TestCase):

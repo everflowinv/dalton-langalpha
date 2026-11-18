@@ -42,16 +42,29 @@ _ISSUE_LABELS: dict[str, str] = {
 }
 
 
-def resolve_state_dir() -> Path:
-    raw = (os.environ.get("DALTON_USAGE_STATE_DIR") or "").strip()
-    return Path(raw or "~/.openclaw/usage-accounting").expanduser()
-
-
 def resolve_workspace_dir() -> Path:
     raw = (os.environ.get("OPENCLAW_WORKSPACE") or os.environ.get("DALTON_DATA_ROOT") or "").strip()
     if raw:
         return Path(raw).expanduser()
     return Path(__file__).resolve().parent.parent
+
+
+def _skill_scripts_dir() -> Path:
+    workspace_dir = resolve_workspace_dir()
+    candidate = workspace_dir / "skills" / "model-usage-cost" / "scripts"
+    if (candidate / "usage_state.py").is_file():
+        return candidate
+    return Path(__file__).resolve().parent.parent / "skills" / "model-usage-cost" / "scripts"
+
+
+_SKILL_SCRIPTS_DIR = _skill_scripts_dir()
+if str(_SKILL_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SKILL_SCRIPTS_DIR))
+from usage_state import resolve_usage_state_dir  # noqa: E402
+
+
+def resolve_state_dir() -> Path:
+    return resolve_usage_state_dir()
 
 
 def format_tokens(n: int) -> str:
@@ -195,7 +208,10 @@ def fetch_usage_data(days: int = 7, as_of: str | None = None) -> dict[str, Any]:
 
     if as_of:
         cmd += ["--as-of", as_of]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    state_dir = resolve_state_dir()
+    child_env = dict(os.environ)
+    child_env["DALTON_USAGE_STATE_DIR"] = str(state_dir)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=child_env)
     try:
         data = json.loads(res.stdout)
     except json.JSONDecodeError as exc:

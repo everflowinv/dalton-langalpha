@@ -97,6 +97,7 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
 | `com.dalton.alphaengine-mcp` | `scripts/dalton/launchd/com.dalton.alphaengine-mcp.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.alphaengine-mcp` | `~/Library/Logs/dalton-alphaengine-mcp.{log,err.log}` |
 | `com.dalton.alphaengine-desktop-watchdog` | `scripts/dalton/launchd/com.dalton.alphaengine-desktop-watchdog.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.alphaengine-desktop-watchdog` | `~/Library/Logs/dalton-alphaengine-desktop-watchdog.{log,err.log}` |
 | `com.dalton.guidepoint-mcp-proxy` | `scripts/dalton/launchd/com.dalton.guidepoint-mcp-proxy.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` | `~/Library/Logs/dalton-guidepoint-mcp-proxy.{log,err.log}` |
+| `com.dalton.usage-collector` | `scripts/dalton/launchd/com.dalton.usage-collector.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.usage-collector` | `~/Library/Logs/dalton-usage-collector.{log,err.log}` 与 `~/Library/Application Support/Everflow/usage-accounting/collector-status.json` |
 
 查看某项服务实时状态：
 
@@ -160,7 +161,40 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
   ```
   脚本会启动 `http://localhost:8942/callback` 并打开浏览器完成 OAuth 授权，默认从环境变量或 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp.env`（可用 `GUIDEPOINT_ENV_FILE` 覆盖）读取客户端凭据，授权完成后把新令牌以 `0600` 权限原子写入 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp_tokens.json`（默认对应 `~/Library/Application Support/Everflow/research/config/guidepoint_mcp_tokens.json`，可用 `GUIDEPOINT_TOKENS_FILE` 覆盖；仅设置 `DALTON_OCW_ROOT` 时写入 `$DALTON_OCW_ROOT/config/guidepoint_mcp_tokens.json`）。更新令牌后执行 `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` 让代理立即生效。
 
-### 3.4 生产模型切换脚本（`switch_model_refs.py`）
+### 3.4 token 用量采集
+
+- **作用**：`scripts/dalton/ops/usage_collector_run.sh` 选用技能自带 venv 或 `/opt/homebrew/bin/python3.12` 启动 `scripts/dalton/ops/usage_collector.py`，每 60 秒调用 Dalton 技能 `scripts/dalton/openclaw_overlays/skills/model-usage-cost` 的 `collect-broker --days 2 --json` 子命令（超时 120 秒，通过 `collector.lock` 互斥锁跳过重叠调度），把 Grok CLI 等易轮转的本地日志及时写入账本，供每周六 12:00 HKT 的宿主机数据任务 `T61`（`weekly-token-usage`）汇总。
+- **标签**：`com.dalton.usage-collector`（模板位于 `scripts/dalton/launchd/com.dalton.usage-collector.plist.template`，调度参数为 `StartInterval = 60`、`Nice = 10`）。
+- **指针文件与账本位置**：
+  - 活跃账本指针文件位于 `~/.config/dalton/usage-state-dir`（权限 `0600`，内容为当前活跃账本目录的绝对路径）。采集器、技能 CLI 与周报脚本统一按 `DALTON_USAGE_STATE_DIR` 环境变量 → 指针文件 → 旧目录 `~/.openclaw/usage-accounting` 的顺序解析目录。
+  - 切换后的新账本默认位于 `~/Library/Application Support/Everflow/usage-accounting`（由切换脚本写入 plist 的 `DALTON_USAGE_STATE_DIR` 与指针文件），目录下包含：
+    - `evidence.sqlite`（权限 `0600`，本地技术计量账本）
+    - `collector-status.json`（权限 `0600`，原子写入 `ok`、`collected_at`、`last_ok_at`、`consecutive_failures` 等状态）
+    - `collector.lock`（采集互斥锁文件）
+- **切换与回滚命令**：
+  ```bash
+  # 1. 校验采集器 Python，预览指针、账本大小与新旧标签状态
+  bash scripts/dalton/ops/usage_collector_switch.sh --plan
+
+  # 2. 停用旧采集器、sqlite3 backup() 复制账本并校验 integrity_check、写入指针、加载新采集器并等待首次 ok:true（最多 300 秒）
+  bash scripts/dalton/ops/usage_collector_switch.sh --apply
+  # 若目标目录已存在 evidence.sqlite 且确认需要以旧账本覆盖（原文件将重命名为 evidence.sqlite.pre-apply.<时间戳> 保留）：
+  bash scripts/dalton/ops/usage_collector_switch.sh --apply --force
+
+  # 3. 回滚到原有的 ai.openclaw.model-usage-collector 标签（将新账本 backup() 回旧目录并保留 pre-rollback 备份，同时复原指针）
+  bash scripts/dalton/ops/usage_collector_switch.sh --rollback
+  ```
+- **排查位置**：
+  - `launchd` 服务状态：`launchctl print gui/$(id -u)/com.dalton.usage-collector`
+  - 当前指针指向：`cat ~/.config/dalton/usage-state-dir`
+  - 采集状态文件：当前活跃账本目录下的 `collector-status.json`（查看 `ok`、`last_ok_at`、`consecutive_failures` 与 `error`）
+  - 采集日志：`~/Library/Logs/dalton-usage-collector.log` 与 `~/Library/Logs/dalton-usage-collector.err.log`
+  - 手动单次执行验证（显式指向临时目录，保持生产账本目录干净）：
+    ```bash
+    DALTON_USAGE_STATE_DIR="$(mktemp -d)" bash scripts/dalton/ops/usage_collector_run.sh
+    ```
+
+### 3.5 生产模型切换脚本（`switch_model_refs.py`）
 
 升级默认模型后，用 `scripts/dalton/ops/switch_model_refs.py` 批量迁移 `automations.llm_model`（仅 `deleted_at IS NULL`）、`conversation_threads.llm_model` 及 `user_preferences.model_preference` 中的系统模型引用：
 

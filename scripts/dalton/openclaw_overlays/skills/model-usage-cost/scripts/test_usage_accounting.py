@@ -1,8 +1,6 @@
 """Accounting contracts with synthetic metadata only; never call a model."""
-import copy
 import gzip
 import json
-import os
 from pathlib import Path
 import sqlite3
 import tempfile
