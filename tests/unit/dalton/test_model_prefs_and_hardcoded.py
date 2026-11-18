@@ -843,11 +843,10 @@ async def test_yaml_audit_timeout_s_preserves_positive_float_without_user_range_
 
 
 @pytest.mark.asyncio
-async def test_extract_segment_cards_and_archive_pipeline_use_resolved_extract_model(
+async def test_extract_segment_cards_uses_resolved_extract_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify conversation archive extraction resolves model via resolve_dalton_extract_model (explicit -> user -> PM -> yaml)."""
-    import scripts.dalton.conversation_archive as archive_cli
+    """Verify conversation card extraction resolves model via resolve_dalton_extract_model (explicit -> user -> PM -> yaml)."""
     from src.dalton.conversations import extractor as extractor_mod
 
     prefs_by_user: dict[str, dict[str, Any]] = {
@@ -869,11 +868,6 @@ async def test_extract_segment_cards_and_archive_pipeline_use_resolved_extract_m
         mp_mod,
         "get_team_credential_holder_id",
         create_autospec(mp_mod.get_team_credential_holder_id, return_value="user-owner"),
-    )
-    monkeypatch.setattr(
-        archive_cli,
-        "archive_billing_user_id",
-        create_autospec(archive_cli.archive_billing_user_id, return_value="user-owner"),
     )
 
     seen_models: list[str | None] = []
@@ -907,19 +901,11 @@ async def test_extract_segment_cards_and_archive_pipeline_use_resolved_extract_m
         }
     ]
 
-    # 1. User set dalton_extract_model -> extract_segment_cards and run_archive_pipeline use user's model
+    # 1. User set dalton_extract_model -> extract_segment_cards uses user's model
     out_user = await extractor_mod.extract_segment_cards(seg, user_id="user-owner")
     assert out_user.ok is True
     assert out_user.model_used == "gpt-6.1-sol-oauth"
     assert seen_models[-1] == "gpt-6.1-sol-oauth"
-
-    summary_user = await archive_cli.run_archive_pipeline(
-        mode="run",
-        dry_run=True,
-        skip_host_export=True,
-        inbox_dir=REPO_ROOT / "var" / "nonexistent_inbox_for_test",
-    )
-    assert summary_user["extractor_model"] == "gpt-6.1-sol-oauth"
 
     # 2. Explicit extractor_model has highest priority over user setting
     out_explicit = await extractor_mod.extract_segment_cards(
@@ -928,28 +914,11 @@ async def test_extract_segment_cards_and_archive_pipeline_use_resolved_extract_m
     assert out_explicit.model_used == "claude-sonnet-5-5-oauth"
     assert seen_models[-1] == "claude-sonnet-5-5-oauth"
 
-    summary_explicit = await archive_cli.run_archive_pipeline(
-        mode="run",
-        dry_run=True,
-        skip_host_export=True,
-        extractor_model="claude-sonnet-5-5-oauth",
-        inbox_dir=REPO_ROOT / "var" / "nonexistent_inbox_for_test",
-    )
-    assert summary_explicit["extractor_model"] == "claude-sonnet-5-5-oauth"
-
     # 3. When user and PM have no setting -> falls back to yaml default ('deepseek-flash')
     prefs_by_user.clear()
     out_default = await extractor_mod.extract_segment_cards(seg, user_id="user-owner")
     assert out_default.model_used == "deepseek-flash"
     assert seen_models[-1] == "deepseek-flash"
-
-    summary_default = await archive_cli.run_archive_pipeline(
-        mode="run",
-        dry_run=True,
-        skip_host_export=True,
-        inbox_dir=REPO_ROOT / "var" / "nonexistent_inbox_for_test",
-    )
-    assert summary_default["extractor_model"] == "deepseek-flash"
 
 
 @pytest.mark.asyncio

@@ -681,102 +681,6 @@ def test_humanoid_plan_validate_render_and_state(tmp_path: Path) -> None:
     assert state_path.read_text(encoding="utf-8") == body
 
 
-def test_import_is_dry_run_safe_and_repeatable(tmp_path: Path) -> None:
-    importer = _load(
-        "openclaw_skill_state_import_family1",
-        REPO_ROOT / "scripts" / "dalton" / "import_openclaw_skill_state.py",
-    )
-    source = tmp_path / "source"
-    workspace = tmp_path / "workspace"
-    source.mkdir()
-    workspace.mkdir()
-    (source / "humanoid-state.json").write_text(
-        json.dumps(
-            {
-                "reports": {
-                    "2026-09-06": {
-                        "chat_id": "oc_abcdef",
-                        "message_id": "om_example",
-                        "note": "see oc_abcdef",
-                        "archive": "/Users/someone/workspace/research-outputs/humanoid-robot-weekly/2026-09-06.md",
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (source / "token.txt").write_text("hidden", encoding="utf-8")
-    (source / ".env").write_text("hidden", encoding="utf-8")
-    (source / "keep.txt").write_text("NEW", encoding="utf-8")
-    link_target = source / "real.txt"
-    link_target.write_text("linked", encoding="utf-8")
-    os.symlink(link_target, source / "linked.txt")
-    dest = workspace / "state" / "humanoid-robot-weekly"
-    dest.mkdir(parents=True)
-    (dest / "keep.txt").write_text("OLD", encoding="utf-8")
-    dry_code, dry = _run(
-        importer,
-        [
-            "--source",
-            str(source),
-            "--workspace",
-            str(workspace),
-            "--dest",
-            "state/humanoid-robot-weekly",
-            "--rename",
-            "humanoid-state.json=state.json",
-        ],
-    )
-    assert dry_code == 0 and dry["ok"] is True and dry["written"] == []
-    assert not (dest / "state.json").exists()
-    assert not (dest / "import-manifest.json").exists()
-    assert (dest / "keep.txt").read_text(encoding="utf-8") == "OLD"
-    apply_code, apply_payload = _run(
-        importer,
-        [
-            "--source",
-            str(source),
-            "--workspace",
-            str(workspace),
-            "--dest",
-            "state/humanoid-robot-weekly",
-            "--rename",
-            "humanoid-state.json=state.json",
-            "--apply",
-        ],
-    )
-    assert apply_code == 0 and apply_payload["ok"] is True
-    imported = (dest / "state.json").read_text(encoding="utf-8")
-    assert "chat_id" not in imported and "oc_" not in imported
-    assert "om_example" in imported
-    assert "research-outputs/humanoid-robot-weekly/2026-09-06.md" in imported
-    assert "/Users/" not in imported
-    assert (dest / "keep.txt").read_text(encoding="utf-8") == "OLD"
-    assert not (dest / "token.txt").exists()
-    assert not (dest / "linked.txt").exists()
-    manifest = (dest / "import-manifest.json").read_bytes()
-    state_bytes = (dest / "state.json").read_bytes()
-    second_code, second = _run(
-        importer,
-        [
-            "--source",
-            str(source),
-            "--workspace",
-            str(workspace),
-            "--dest",
-            "state/humanoid-robot-weekly",
-            "--rename",
-            "humanoid-state.json=state.json",
-            "--apply",
-        ],
-    )
-    assert second_code == 0
-    assert second["written"] == ["state/humanoid-robot-weekly/import-manifest.json"]
-    assert (dest / "import-manifest.json").read_bytes() == manifest
-    assert (dest / "state.json").read_bytes() == state_bytes
-    assert (dest / "keep.txt").read_text(encoding="utf-8") == "OLD"
-
-
 def test_skill_commands_use_documented_argument_order(tmp_path: Path) -> None:
     us = _load(
         "us_weekly_argv_family1",
@@ -996,18 +900,7 @@ def test_x_daily_handle_match_keeps_original_spelling(tmp_path: Path) -> None:
 def test_temp_symlink_is_not_followed(tmp_path: Path) -> None:
     outside = tmp_path / "outside.txt"
     outside.write_text("sentinel", encoding="utf-8")
-    importer = _load(
-        "openclaw_import_symlink_family1",
-        REPO_ROOT / "scripts" / "dalton" / "import_openclaw_skill_state.py",
-    )
     workspace = tmp_path / "ws"
-    folder = workspace / "state" / "humanoid-robot-weekly"
-    folder.mkdir(parents=True)
-    os.symlink(outside, folder / ".state.json.import-tmp")
-    importer._atomic_write(workspace, "state/humanoid-robot-weekly/state.json", b'{"ok":true}\n')
-    assert outside.read_text(encoding="utf-8") == "sentinel"
-    assert (folder / "state.json").read_bytes() == b'{"ok":true}\n'
-    assert (folder / ".state.json.import-tmp").is_symlink()
     for skill in SKILL_NAMES:
         card_io = _load(
             "card_io_symlink_" + skill.replace("-", "_"),

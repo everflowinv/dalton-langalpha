@@ -932,7 +932,6 @@ async def test_list_system_jobs_sector_group_flag_gated(monkeypatch: pytest.Monk
         yield type("Conn", (), {"cursor": lambda self, *a, **k: _Cur()})()
 
     monkeypatch.setattr(sj, "get_db_connection", create_autospec(sj.get_db_connection, side_effect=_conn))
-    monkeypatch.setattr(sj, "_fetch_host_conversation_archive_job", create_autospec(sj._fetch_host_conversation_archive_job, return_value={"key": "conversation-archive"}))
     monkeypatch.setattr(sj, "_fetch_ops_jobs", create_autospec(sj._fetch_ops_jobs, return_value=[]))
 
     sector_status = {

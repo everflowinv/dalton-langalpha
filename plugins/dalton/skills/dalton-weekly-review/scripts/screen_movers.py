@@ -180,7 +180,7 @@ def load_universe_from_coverage(coverage_path: str | None) -> tuple[list[dict[st
     if cov_file is None:
         searched = ", ".join(str(p) for p in candidates)
         raise FileNotFoundError(
-            f"未找到覆盖名单 coverage.yaml（已查找：{searched}），请先同步覆盖名单（运行 scripts/dalton/build_coverage.py --sync）。"
+            f"未找到覆盖名单 coverage.yaml（已查找：{searched}），请先同步用户覆盖名单。"
         )
 
     entries: list[dict[str, Any]] = []
@@ -235,7 +235,7 @@ def load_universe_from_coverage(coverage_path: str | None) -> tuple[list[dict[st
 
     if not entries:
         raise ValueError(
-            f"覆盖名单 {cov_file} 为空或格式无效，请先同步覆盖名单（运行 scripts/dalton/build_coverage.py --sync）。"
+            f"覆盖名单 {cov_file} 为空或格式无效，请先同步用户覆盖名单。"
         )
 
     for g, extra in EXTRA_PEERS.items():

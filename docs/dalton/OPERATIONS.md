@@ -1,6 +1,6 @@
 # Dalton 运维手册
 
-这页提供 Dalton 生产与准生产环境的构建部署、环境变量生效规则、宿主机 `launchd` 服务运维、会话归档与续跑、异地备份恢复、Tailscale Funnel 对外入口管理及常见故障处置。正文只写环境变量名，不写密钥值或私有 URL 查询参数；所有容器端口都绑在 `127.0.0.1`。
+本文提供 Dalton 生产与准生产环境的构建部署、环境变量生效规则、宿主机 `launchd` 服务运维、异地备份恢复、Tailscale Funnel 对外入口管理及常见故障处置；正文仅列环境变量名，所有容器端口统一绑定在 `127.0.0.1`。
 
 ## 1. 部署与构建（仓库现有脚本）
 
@@ -68,7 +68,7 @@ bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d039
 
 ## 2. `.env` 与叠加配置文件改动生效规则
 
-- **改完 `.env` 必须重建容器**：Docker Compose 只在创建容器时读 `.env`，跑 `docker compose restart backend` 不会重新注入新变量！只要改了 `INTERNAL_SERVICE_TOKEN`、`DALTON_ALLOWED_EMAILS`、`DALTON_PM_USER_IDS`、`DALTON_ARTIFACT_PUBLISHING_ENABLED`、`GEMINI_API_KEY`、`XAI_API_KEY`、`DALTON_WEB_SEARCH_BRIDGE_TOKEN` 等 `.env` 变量，就必须跑：
+- **改完 `.env` 必须重建容器**：Docker Compose 只在创建容器时读 `.env`，跑 `docker compose restart backend` 不会重新注入新变量！只要改了 `INTERNAL_SERVICE_TOKEN`、`DALTON_ALLOWED_EMAILS`、`DALTON_PM_USER_IDS`、`DALTON_ARTIFACT_PUBLISHING_ENABLED`、`GEMINI_API_KEY`、`XAI_API_KEY` 等 `.env` 变量，就必须跑：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-recreate backend
@@ -86,8 +86,6 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --force-
 | `com.dalton.researchdata-bridge` | `bash scripts/dalton/install_bridge.sh` | `launchctl kickstart -k gui/$(id -u)/com.dalton.researchdata-bridge` | 模板内指定宿主机 Logs（见 `install_bridge.sh`） |
 | `com.dalton.channel-gateway` | `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.channel-gateway` | `~/.config/dalton/channel-gateway.env` (`0600`) 与 gateway 日志 |
 | `com.dalton.monitor-feeds` | `scripts/dalton/monitor_feeds/com.dalton.monitor-feeds.plist` | `launchctl kickstart -k gui/$(id -u)/com.dalton.monitor-feeds` | `var/dalton/monitor-feeds/` 状态文件与标准日志 |
-| `com.dalton.conversation-archive` | `bash scripts/dalton/install_conversation_archive.sh` | `launchctl kickstart -k gui/$(id -u)/com.dalton.conversation-archive` | 归档脚本日志与 `var/dalton/conversations/inbox/` |
-| `com.dalton.web-search-bridge` | `bash scripts/dalton/install_web_search_bridge.sh` | `launchctl kickstart -k gui/$(id -u)/com.dalton.web-search-bridge` | `~/.config/dalton/web-search-bridge.env` |
 | `com.dalton.config-git-backup` | `scripts/dalton/ops/launchd/com.dalton.config-git-backup.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.config-git-backup` | `~/Library/Logs/dalton-offsite-backup.log` |
 | `com.dalton.db-offsite` | `scripts/dalton/ops/launchd/com.dalton.db-offsite.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.db-offsite` | `~/Library/Logs/dalton-offsite-backup.log` & `*-alerts.log` |
 | `com.dalton.data-backup` | `scripts/dalton/ops/launchd/com.dalton.data-backup.plist.template` | `launchctl kickstart -k gui/$(id -u)/com.dalton.data-backup` | `~/Library/Logs/dalton-offsite-backup.log` & `*-alerts.log` |
@@ -108,28 +106,7 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 
 > 安全提醒：改了 Vault 里的飞书应用凭据（`DALTON_FEISHU_APP_ID` / `DALTON_FEISHU_APP_SECRET`）后，网关不会热替换内存凭据。确认没有正在发的重要推送后，用 `launchctl kickstart -k gui/$(id -u)/com.dalton.channel-gateway` 重启刷新内存。
 
-### 3.2 会话归档日常运行、回填与续跑（原 `CONVERSATION-ARCHIVE.md` 合并内容）
-
-`com.dalton.conversation-archive` 的 `StartCalendarInterval` 设在每天 `21:15`（按宿主机本地日历时区触发，宿主机系统时区为 `Asia/Shanghai` 时就是北京时间 `21:15`），跑的时候用 `src/dalton/dalton.yaml` 下 `conversations` 默认值（单并发 `extract_concurrency: 1`、每小时额度 `hourly_token_budget: 5000000`）：
-
-```bash
-.venv/bin/python scripts/dalton/conversation_archive.py run
-```
-
-历史大批量回填（比如从某个日期起补跑，不改 `dalton.yaml` 每日默认值）：
-
-```bash
-.venv/bin/python scripts/dalton/conversation_archive.py backfill \
-  --since 2026-04-30 \
-  --concurrency 4 \
-  --hourly-token-budget 1500000
-```
-
-- **并发与限流保护**：用 `asyncio.Semaphore` 限并发，`HourlyTokenBudgetLimiter` 先按估算 token 预占预算，跑完再按实际用量校准。遇到瞬时 `429` 会共享退避窗口；遇到不可恢复配额错误（`PermanentQuotaError`）则取消在途任务，把已完成的连续前缀落盘后退出。
-- **逐会话有序落盘**：按 `(agent, session_id)` 维度的已完成连续前缀调 embedding，并在同一个事务里写 `dalton_conversation_cards` 和 `dalton_conversation_processed`，同时实时更新 `dalton_conversation_runs` 进度（`segments_processed`、`cards_extracted`、`cards_inserted`、`total_tokens`）。单个会话某一段失败只挡住它自己的后续段，不拖累其他会话。
-- **运行锁（Advisory Lock）与中断续跑**：每次非 `--dry-run` 启动时抢 Postgres 会话锁 `pg_try_advisory_lock(hashtext('dalton_conversation_archive'))`。已经有进程在跑就打印 `"已有归档在运行"` 并以退出码 `2` 退出；抢锁成功后把上次残留的 `status='running'` 行标成 `status='abandoned'`。进程中断后直接重跑同一条 `backfill` 命令就能跳过已入库片段；宿主机导出的 `.jsonl` 如果还在 `var/dalton/conversations/inbox/`，可以加上 `--skip-host-export` 省掉重复导出。
-
-### 3.3 研究数据常驻服务
+### 3.2 研究数据常驻服务
 
 宿主机上有三项研究数据常驻服务由 Dalton 的 `launchd` 模板托管，端口继续保持本机回环地址，供 `researchdata_bridge.py` 与研究运行时脚本直连：
 
@@ -139,20 +116,16 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
 | **AlphaEngine 桌面端看门狗**：运行 `desktop-watchdog.sh`，检测桌面端存活与 MCP 鉴权状态；应用未启动时拉起，登录失效或模块页未打开时通过频道网关 `/internal/ops-alerts`（失败时退回 macOS 通知）提醒 | `com.dalton.alphaengine-desktop-watchdog` | 每 `120` 秒（StartInterval） | `~/Library/Logs/dalton-alphaengine-desktop-watchdog.log`、`~/Library/Logs/dalton-alphaengine-desktop-watchdog.err.log`；状态位于 `$DALTON_RESEARCH_HOME/state/alphaengine-desktop-watchdog.json` |
 | **Guidepoint MCP 代理**：运行 `guidepoint_mcp_proxy.py`（`/opt/homebrew/bin/python3.12`），自动刷新短期 OAuth 访问令牌并转发 MCP 请求 | `com.dalton.guidepoint-mcp-proxy` | `127.0.0.1:8943`（KeepAlive） | `~/Library/Logs/dalton-guidepoint-mcp-proxy.log`、`~/Library/Logs/dalton-guidepoint-mcp-proxy.err.log` |
 
-- **切换与回滚（支持与研究运行时迁移任意顺序执行）**：
-  `host_services_switch.sh` 会自动读取 `~/.config/dalton/researchdata-bridge.env` 判断当前桥接模式并沿用对应数据目录（旧模式下 plist 只注入 `DALTON_OCW_ROOT` 并共用旧目录文件；新模式下注入 `DALTON_RESEARCH_HOME`），因此**常驻服务切换与研究运行时数据迁移（`research_runtime_migrate.sh`）可按任意顺序执行**。若先切换常驻服务、后执行 `research_runtime_migrate.sh --switch`，迁移脚本会在桥接切换成功后自动对已加载的 `com.dalton.*` 服务执行 `host_services_switch.sh --apply --rerender-only`，把它们同步切到新数据目录。
+- **唯一运行模式与配置同步**：`researchdata_bridge.py`、`install_bridge.sh` 与三项宿主机常驻服务统一采用 `DALTON_RESEARCH_CODE`（代码与虚拟环境目录）+ `DALTON_RESEARCH_HOME`（运行时数据与配置目录）双目录模式；`host_services_switch.sh` 渲染 plist 时统一注入 `DALTON_RESEARCH_CODE` 与 `DALTON_RESEARCH_HOME`：
   ```bash
-  # 1. 只读查看检测到的模式、服务数据路径与新旧标签当前状态
+  # 1. 只读查看模式、服务数据路径与标签当前状态
   bash scripts/dalton/ops/host_services_switch.sh --plan
 
-  # 2. 按顺序逐个切换（停旧标签 → 确认卸载与端口释放 → disable 旧标签 → enable/bootstrap 新标签 → 健康与 PID 校验）
+  # 2. 按顺序加载并切换到 com.dalton.* 服务并完成健康与 PID 校验
   bash scripts/dalton/ops/host_services_switch.sh --apply
 
-  # 3. 仅重新渲染并重启已加载的 com.dalton.* 服务（适合桥接切换模式后同步路径）
+  # 3. 仅重新渲染并重启已加载的 com.dalton.* 服务（适合切换目录后同步路径）
   bash scripts/dalton/ops/host_services_switch.sh --apply --rerender-only
-
-  # 4. 切回原有的 ai.openclaw.* 标签（旧 plist 在切换时已保留）
-  bash scripts/dalton/ops/host_services_switch.sh --rollback
   ```
   也可执行 `.venv/bin/python scripts/dalton/researchdata_bridge.py --check-runtime`，在输出 JSON 的 `host_services` 字段中查看 `8950`、`8943` 端口连通性与当前生效标签。
 
@@ -160,30 +133,27 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
   ```bash
   /opt/homebrew/bin/python3.12 scripts/dalton/research_runtime/scripts/guidepoint_mcp_oauth.py
   ```
-  脚本会启动 `http://localhost:8942/callback` 并打开浏览器完成 OAuth 授权，默认从环境变量或 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp.env`（可用 `GUIDEPOINT_ENV_FILE` 覆盖）读取客户端凭据，授权完成后把新令牌以 `0600` 权限原子写入 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp_tokens.json`（默认对应 `~/Library/Application Support/Everflow/research/config/guidepoint_mcp_tokens.json`，可用 `GUIDEPOINT_TOKENS_FILE` 覆盖；仅设置 `DALTON_OCW_ROOT` 时写入 `$DALTON_OCW_ROOT/config/guidepoint_mcp_tokens.json`）。更新令牌后执行 `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` 让代理立即生效。
+  脚本会启动 `http://localhost:8942/callback` 并打开浏览器完成 OAuth 授权，默认从环境变量或 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp.env`（可用 `GUIDEPOINT_ENV_FILE` 覆盖）读取客户端凭据，授权完成后把新令牌以 `0600` 权限原子写入 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp_tokens.json`（默认对应 `~/Library/Application Support/Everflow/research/config/guidepoint_mcp_tokens.json`，可用 `GUIDEPOINT_TOKENS_FILE` 覆盖）。更新令牌后执行 `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` 让代理立即生效。
 
-### 3.4 token 用量采集
+### 3.3 token 用量采集
 
-- **作用**：`scripts/dalton/ops/usage_collector_run.sh` 选用技能自带 venv 或 `/opt/homebrew/bin/python3.12` 启动 `scripts/dalton/ops/usage_collector.py`，每 60 秒调用 Dalton 技能 `scripts/dalton/openclaw_overlays/skills/model-usage-cost` 的 `collect-broker --days 2 --json` 子命令（超时 120 秒，通过 `collector.lock` 互斥锁跳过重叠调度），把 Grok CLI 等易轮转的本地日志及时写入账本，供每周六 12:00 HKT 的宿主机数据任务 `T61`（`weekly-token-usage`）汇总。
+- **作用**：`scripts/dalton/ops/usage_collector_run.sh` 选用技能自带 venv 或 `/opt/homebrew/bin/python3.12` 启动 `scripts/dalton/ops/usage_collector.py`，每 60 秒调用 Dalton 技能 `scripts/dalton/data_assets/skills/model-usage-cost` 的 `collect-broker --days 2 --json` 子命令（超时 120 秒，通过 `collector.lock` 互斥锁跳过重叠调度），把 Grok CLI 等易轮转的本地日志及时写入账本，供每周六 12:00 HKT 的宿主机数据任务 `T61`（`weekly-token-usage`）汇总。
 - **标签**：`com.dalton.usage-collector`（模板位于 `scripts/dalton/launchd/com.dalton.usage-collector.plist.template`，调度参数为 `StartInterval = 60`、`Nice = 10`）。
 - **指针文件与账本位置**：
-  - 活跃账本指针文件位于 `~/.config/dalton/usage-state-dir`（权限 `0600`，内容为当前活跃账本目录的绝对路径）。采集器、技能 CLI 与周报脚本统一按 `DALTON_USAGE_STATE_DIR` 环境变量 → 指针文件 → 旧目录 `~/.openclaw/usage-accounting` 的顺序解析目录。
-  - 切换后的新账本默认位于 `~/Library/Application Support/Everflow/usage-accounting`（由切换脚本写入 plist 的 `DALTON_USAGE_STATE_DIR` 与指针文件），目录下包含：
+  - 活跃账本指针文件位于 `~/.config/dalton/usage-state-dir`（权限 `0600`，内容为当前活跃账本目录的绝对路径）。采集器、技能 CLI 与周报脚本优先读取 `DALTON_USAGE_STATE_DIR` 环境变量或 `~/.config/dalton/usage-state-dir` 指针。
+  - 当前账本默认位于 `~/Library/Application Support/Everflow/usage-accounting`（写入 plist 的 `DALTON_USAGE_STATE_DIR` 与指针文件），目录下包含：
     - `evidence.sqlite`（权限 `0600`，本地技术计量账本）
     - `collector-status.json`（权限 `0600`，原子写入 `ok`、`collected_at`、`last_ok_at`、`consecutive_failures` 等状态）
     - `collector.lock`（采集互斥锁文件）
-- **切换与回滚命令**：
+- **部署与刷新命令**：
   ```bash
-  # 1. 校验采集器 Python，预览指针、账本大小与新旧标签状态
+  # 1. 校验采集器 Python，预览指针、账本大小与标签状态
   bash scripts/dalton/ops/usage_collector_switch.sh --plan
 
-  # 2. 停用旧采集器、sqlite3 backup() 复制账本并校验 integrity_check、写入指针、加载新采集器并等待首次 ok:true（最多 300 秒）
+  # 2. 写入指针、加载 com.dalton.usage-collector 并等待首次 ok:true（最多 300 秒）
   bash scripts/dalton/ops/usage_collector_switch.sh --apply
-  # 若目标目录已存在 evidence.sqlite 且确认需要以旧账本覆盖（原文件将重命名为 evidence.sqlite.pre-apply.<时间戳> 保留）：
+  # 若目标目录已存在 evidence.sqlite 且需以指定源覆盖（原文件将重命名为 evidence.sqlite.pre-apply.<时间戳> 保留）：
   bash scripts/dalton/ops/usage_collector_switch.sh --apply --force
-
-  # 3. 回滚到原有的 ai.openclaw.model-usage-collector 标签（将新账本 backup() 回旧目录并保留 pre-rollback 备份，同时复原指针）
-  bash scripts/dalton/ops/usage_collector_switch.sh --rollback
   ```
 - **排查位置**：
   - `launchd` 服务状态：`launchctl print gui/$(id -u)/com.dalton.usage-collector`
@@ -195,7 +165,7 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
     DALTON_USAGE_STATE_DIR="$(mktemp -d)" bash scripts/dalton/ops/usage_collector_run.sh
     ```
 
-### 3.5 生产模型切换脚本（`switch_model_refs.py`）
+### 3.4 生产模型切换脚本（`switch_model_refs.py`）
 
 升级默认模型后，用 `scripts/dalton/ops/switch_model_refs.py` 批量迁移 `automations.llm_model`（仅 `deleted_at IS NULL`）、`conversation_threads.llm_model` 及 `user_preferences.model_preference` 中的系统模型引用：
 
@@ -301,7 +271,7 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
      ```
      也可以把远端流直接管道喂给 `openssl enc -d -aes-256-cbc -pbkdf2 -salt -pass "file:${DALTON_BACKUP_KEY_FILE}"` 解包。用 `rclone` 拉取时，建议带上 `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY` 绕开本地代理。
    - **恢复前先停所有写入**：
-     1. 停掉或摘掉宿主机上会写 `var/dalton`、MinIO、Redis 和 Postgres 的 `launchd` 服务：`com.dalton.monitor-feeds`、`com.dalton.conversation-archive`、`com.dalton.researchdata-bridge`、`com.dalton.channel-gateway`，以及会冲突的备份 `launchd` 任务。
+     1. 停掉或摘掉宿主机上会写 `var/dalton`、MinIO、Redis 和 Postgres 的 `launchd` 服务：`com.dalton.monitor-feeds`、`com.dalton.researchdata-bridge`、`com.dalton.channel-gateway`，以及会冲突的备份 `launchd` 任务。
      2. 停掉应用和边缘容器：`docker compose -f docker-compose.yml -f docker-compose.dalton.yml stop backend crawler edge frontend`。宿主机如果还有跑着的沙箱容器（`${DALTON_SANDBOX_CONTAINER_PREFIX}`，默认 `langalpha-sandbox-`），先停掉里面的写入进程或容器。
      3. 停掉数据任务容器：调度器跟着后端退出只会取消协程，已经拉起的 `dalton-dt-*` 容器还会继续写 `var/dalton/openclaw-data`。执行 `docker ps --filter name=dalton-dt- -q | xargs -r docker stop` 停掉，再跑一次 `docker ps --filter name=dalton-dt-` 确认清干净，然后再动手恢复数据。
    - **按顺序恢复各备份项**：
@@ -347,10 +317,7 @@ bash scripts/dalton/check_bridge.sh
 # 3. 公网入口与 Caddy 静态托管校验
 bash scripts/dalton/check_public_edge.sh
 
-# 4. 可选：Web Search 桥接健康检查（未启用可略过）
-bash scripts/dalton/check_web_search_bridge.sh
-
-# 5. AlphaEngine 搜索缓存命中与额度日报
+# 4. AlphaEngine 搜索缓存命中与额度日报
 python3 scripts/dalton/alphaengine_usage_report.py
 ```
 

@@ -20,7 +20,7 @@ CLI_PATH = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "skills"
     / "jp-leverage-monitor"
     / "scripts"

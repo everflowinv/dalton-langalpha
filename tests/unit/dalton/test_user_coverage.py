@@ -1072,7 +1072,6 @@ async def test_seed_pool_lifecycle_row_assertion_and_build_coverage_exit_code(
         ),
     )
 
-    from scripts.dalton import build_coverage as build_cov_mod
     from scripts.dalton import seed_user_coverage as seed_mod
     import src.server.database.pool as pool_mod
 
@@ -1098,30 +1097,6 @@ async def test_seed_pool_lifecycle_row_assertion_and_build_coverage_exit_code(
     fake_pool = pool_mod.get_or_create_pool.return_value
     assert fake_pool.open.await_count >= 1
     assert fake_pool.close.await_count >= 1
-
-    # build_coverage.sync_to_user_coverage_db returns integer exit code 0 on success and 1 on error
-    import asyncio
-
-    orig_run_seed = seed_mod.run_seed
-    run_seed_mock = create_autospec(
-        orig_run_seed,
-        return_value={"ok": True, "mode": "applied", "written_count": 105},
-    )
-    monkeypatch.setattr(seed_mod, "run_seed", run_seed_mock)
-    rc_ok = await asyncio.to_thread(
-        build_cov_mod.sync_to_user_coverage_db,
-        user_id=USER_ALICE,
-        yaml_path=COVERAGE_YAML_PATH,
-    )
-    assert rc_ok == 0 and isinstance(rc_ok, int)
-
-    run_seed_mock.return_value = {"ok": False, "error": "boom"}
-    rc_err = await asyncio.to_thread(
-        build_cov_mod.sync_to_user_coverage_db,
-        user_id=USER_ALICE,
-        yaml_path=COVERAGE_YAML_PATH,
-    )
-    assert rc_err == 1 and isinstance(rc_err, int)
 
 
 @pytest.mark.asyncio

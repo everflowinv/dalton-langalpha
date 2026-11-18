@@ -69,7 +69,7 @@ OVERLAY_SCRIPT = (
     REPO_ROOT
     / "scripts"
     / "dalton"
-    / "openclaw_overlays"
+    / "data_assets"
     / "scripts"
     / "cron_command_tasks.py"
 )
@@ -613,7 +613,7 @@ def test_semi_rescue_card_script_loads_from_data_copy_only(
     workspace = tmp_path / "data"
     _write_marker_card_script(workspace / "scripts" / "feishu_send_card.py", "data-copy")
     missing_overlay = tmp_path / "missing-overlay" / "feishu_send_card.py"
-    monkeypatch.setattr(batch3_messages, "_REPO_OVERLAY_FEISHU_SEND_CARD", missing_overlay)
+    monkeypatch.setattr(batch3_messages, "_REPO_ASSET_FEISHU_SEND_CARD", missing_overlay)
     loaded = batch3_messages._load_markdown_to_card_elements(workspace)
     assert loaded("正文", "标题") == "data-copy"
 
@@ -625,7 +625,7 @@ def test_semi_rescue_card_script_loads_from_repo_overlay_only(
     workspace.mkdir()
     overlay = tmp_path / "repo" / "feishu_send_card.py"
     _write_marker_card_script(overlay, "repo-overlay")
-    monkeypatch.setattr(batch3_messages, "_REPO_OVERLAY_FEISHU_SEND_CARD", overlay)
+    monkeypatch.setattr(batch3_messages, "_REPO_ASSET_FEISHU_SEND_CARD", overlay)
     loaded = batch3_messages._load_markdown_to_card_elements(workspace)
     assert loaded("正文", "标题") == "repo-overlay"
 
@@ -637,7 +637,7 @@ def test_semi_rescue_card_script_prefers_data_copy_when_both_exist(
     _write_marker_card_script(workspace / "scripts" / "feishu_send_card.py", "data-copy")
     overlay = tmp_path / "repo" / "feishu_send_card.py"
     _write_marker_card_script(overlay, "repo-overlay")
-    monkeypatch.setattr(batch3_messages, "_REPO_OVERLAY_FEISHU_SEND_CARD", overlay)
+    monkeypatch.setattr(batch3_messages, "_REPO_ASSET_FEISHU_SEND_CARD", overlay)
     loaded = batch3_messages._load_markdown_to_card_elements(workspace)
     assert loaded("正文", "标题") == "data-copy"
 
@@ -648,7 +648,7 @@ def test_semi_rescue_card_script_missing_raises_clear_error(
     workspace = tmp_path / "data"
     workspace.mkdir()
     overlay = tmp_path / "repo" / "feishu_send_card.py"
-    monkeypatch.setattr(batch3_messages, "_REPO_OVERLAY_FEISHU_SEND_CARD", overlay)
+    monkeypatch.setattr(batch3_messages, "_REPO_ASSET_FEISHU_SEND_CARD", overlay)
     with pytest.raises(DataTaskNotificationPrepError, match="飞书卡片脚本不存在") as exc_info:
         batch3_messages._load_markdown_to_card_elements(workspace)
     message = str(exc_info.value)

@@ -168,7 +168,8 @@ def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.Research
     sources = tmp_path / "config" / "data_sources.json"
     sources.parent.mkdir(exist_ok=True)
     sources.write_text(json.dumps({"routes": []}), encoding="utf-8")
-    monkeypatch.setenv("DALTON_OCW_ROOT", str(tmp_path))
+    monkeypatch.setenv("DALTON_RESEARCH_CODE", str(tmp_path))
+    monkeypatch.setenv("DALTON_RESEARCH_HOME", str(tmp_path))
     monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
     monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "0")
     empty_env = tmp_path / "bridge.env"

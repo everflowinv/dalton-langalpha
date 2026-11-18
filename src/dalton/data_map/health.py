@@ -467,27 +467,23 @@ def build_route_probe_spec(
 
 
 async def default_web_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -> dict[str, Any]:
-    """Minimal real probe for `web_search`, validating non-empty results via `map_broker_response`.
-
-    ``gemini_grounding`` uses the Gemini client. ``openclaw`` (and any other
-    deployment default) keeps the original bridge client.
-    """
+    """Minimal real probe for `web_search` using ``gemini_grounding``."""
     from src.config.tool_settings import get_search_api
-    from src.dalton.web_search.provider import (
+    from src.dalton.web_search.formatting import (
         OpenClawSearchEmptyResultError,
-        OpenClawSearchWrapper,
         map_broker_response,
     )
+    from src.dalton.web_search.gemini_grounding import GeminiGroundingClient
+
+    search_api = str(get_search_api() or "").strip().lower()
+    if search_api != "gemini_grounding":
+        raise ValueError(
+            f"Unsupported search_api for Dalton web_search probe: {search_api or '<unset>'}"
+        )
 
     query = "NVDA stock"
-    if str(get_search_api() or "").strip().lower() == "gemini_grounding":
-        from src.dalton.web_search.gemini_grounding import GeminiGroundingClient
-
-        client = GeminiGroundingClient(timeout_seconds=clamp_timeout_s(timeout_s))
-        raw = await client.raw_results(query=query, max_results=1)
-    else:
-        wrapper = OpenClawSearchWrapper(timeout_seconds=clamp_timeout_s(timeout_s))
-        raw = await wrapper.raw_results(query=query, max_results=1)
+    client = GeminiGroundingClient(timeout_seconds=clamp_timeout_s(timeout_s))
+    raw = await client.raw_results(query=query, max_results=1)
     try:
         cleaned, _artifact = map_broker_response(raw, query=query, include_favicon=False)
     except OpenClawSearchEmptyResultError as exc:
@@ -498,7 +494,7 @@ async def default_web_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S)
 
 async def default_x_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -> dict[str, Any]:
     """Minimal real probe for `x_search`."""
-    from src.dalton.web_search.x_search import map_x_search_response
+    from src.dalton.web_search.formatting import map_x_search_response
     from src.dalton.web_search.x_search_direct import DirectXSearchClient
 
     today = _probe_today()

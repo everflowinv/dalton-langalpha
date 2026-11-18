@@ -130,18 +130,6 @@ def test_registry_frontmatter_layout_and_refs() -> None:
     assert f"plugins/dalton/skills/{SKILL_NAME}/" in dalton_paths
     assert "tests/unit/dalton/test_bdc_analyst_skill.py" in dalton_paths
 
-    sys.path.insert(0, str(REPO_ROOT / "scripts" / "dalton"))
-    try:
-        import check_skill_refs
-    finally:
-        sys.path.pop(0)
-
-    findings = check_skill_refs.scan_skills()
-    for hit in findings["ghost_hits"]:
-        assert SKILL_NAME not in hit["file"], f"Unexpected ghost tool ref: {hit}"
-    for br in findings["broken_refs"]:
-        assert SKILL_NAME not in br["file"], f"Unexpected broken ref: {br}"
-
     sys.path.insert(0, str(TESTS_DIR))
     try:
         import test_skill_tool_calls as stc

@@ -17,8 +17,8 @@ from src.dalton.data_map import builder as map_builder
 from src.dalton.data_map import health as health_mod
 from src.dalton.database import data_map as db_data_map
 from src.dalton.tools import build_dalton_tools
+from src.dalton.web_search import formatting as web_formatting
 from src.dalton.web_search import gemini_grounding as grounding_mod
-from src.dalton.web_search import provider as web_provider
 from src.ptc_agent.agent.prompts.loader import PromptLoader
 import src.tools.market_data.implementations as market_impl
 
@@ -145,13 +145,13 @@ def test_merge_catalog_routes_filters_handoff_and_marks_undocumented() -> None:
 
 
 def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> None:
-    """Rendered Data Map has date-free title, accurate cn-hk/HKEX notes, no `get_market_movers`, and respects `search_api`."""
+    """Rendered Data Map has date-free title, accurate cn-hk/HKEX notes, no `get_market_movers`, and respects `x_search_enabled`."""
     md = map_builder.render_data_map_markdown(
         catalog_routes=_sample_catalog_routes(),
         handoff_routes=FIXED_HANDOFF_ROUTES,
         health_map=_sample_health_map(),
         conversation_stats=_sample_conversation_stats(),
-        search_api="openclaw",
+        x_search_enabled=True,
     )
 
     # 1. Title is date-free
@@ -170,7 +170,7 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     assert "雪球(xueqiu):handoff过滤" not in md
     assert "员工评论(employee/Glassdoor/Blind):handoff过滤" not in md
 
-    # 3. Direct tools: no get_market_movers; x_search present when search_api=="openclaw"
+    # 3. Direct tools: no get_market_movers; x_search present when x_search_enabled=True
     assert "get_market_movers" not in md
     assert "- `x_search`" in md
 
@@ -189,7 +189,7 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
     tokens = map_builder.estimate_data_map_tokens(md)
     assert tokens < map_builder.MAX_DATA_MAP_TOKENS
 
-    # 6. When search_api != "openclaw", x_search is excluded
+    # 6. When x_search_enabled is omitted or False, x_search is excluded
     md_no_x = map_builder.render_data_map_markdown(
         catalog_routes=_sample_catalog_routes(),
         handoff_routes=FIXED_HANDOFF_ROUTES,
@@ -214,7 +214,7 @@ def test_render_data_map_markdown_contents_date_free_title_and_search_api() -> N
         handoff_routes=FIXED_HANDOFF_ROUTES,
         health_map=_sample_health_map(),
         conversation_stats=_sample_conversation_stats(),
-        search_api="openclaw",
+        search_api="gemini_grounding",
         x_search_enabled=False,
     )
     assert "- `x_search`" not in md_switch_off
@@ -233,7 +233,7 @@ def test_static_prompt_fallback_follows_x_search_switch(monkeypatch: pytest.Monk
         return _get
 
     try:
-        monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda default="tavily": "openclaw")
+        monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda default="tavily": "gemini_grounding")
         monkeypatch.setattr("src.config.tool_settings._get_tool_config", _config(False))
         assert "- `x_search`" not in map_builder.resolve_prompt_data_map()
 
@@ -306,7 +306,7 @@ async def test_turn_cache_miss_timeout_and_cancelled_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Turn cache read:
-    1) Cache hit filters `x_search` when `search_api != 'openclaw'`;
+    1) Cache hit filters `x_search` when `x_search_enabled` is not True;
     2) Cache miss returns static `未体检` map and does NOT write DB or query stats;
     3) Read timeout falls back to static `未体检` map;
     4) `asyncio.CancelledError` propagates upwards.
@@ -316,7 +316,7 @@ async def test_turn_cache_miss_timeout_and_cancelled_error(
         handoff_routes=FIXED_HANDOFF_ROUTES,
         health_map=_sample_health_map(),
         conversation_stats=_sample_conversation_stats(),
-        search_api="openclaw",
+        x_search_enabled=True,
     )
     mock_get_cached = create_autospec(
         db_data_map.get_cached_data_map,
@@ -350,7 +350,7 @@ async def test_turn_cache_miss_timeout_and_cancelled_error(
     mock_get_cached.return_value = None
     miss_md = await map_builder.get_or_build_data_map_markdown(
         cache_date=date(2026, 10, 22),
-        search_api="openclaw",
+        x_search_enabled=True,
     )
     assert "未体检" in miss_md
     assert mock_fetch_health.await_count == 0
@@ -553,7 +553,7 @@ async def test_bridge_inner_proxy_error_and_web_search_empty_result(
     )
     monkeypatch.setattr(grounding_mod, "GeminiGroundingClient", mock_wrapper_cls)
 
-    with pytest.raises(web_provider.OpenClawSearchEmptyResultError, match="空结果"):
+    with pytest.raises(web_formatting.OpenClawSearchEmptyResultError, match="空结果"):
         await health_mod.default_web_search_probe(timeout_s=5.0)
 
     sem = asyncio.Semaphore(2)
@@ -593,7 +593,9 @@ async def test_bridge_inner_proxy_error_and_web_search_empty_result(
 async def test_web_search_probe_follows_the_configured_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``gemini_grounding`` uses the Gemini client. ``openclaw`` uses the bridge."""
+    """``gemini_grounding`` uses the Gemini client; ``openclaw`` is rejected."""
+    from src.config.tool_settings import get_search_api
+
     payload = {
         "ok": True,
         "result": {
@@ -615,28 +617,19 @@ async def test_web_search_probe_follows_the_configured_provider(
     )
     monkeypatch.setattr(grounding_mod, "GeminiGroundingClient", gemini_cls)
 
-    bridge_instance = create_autospec(web_provider.OpenClawSearchWrapper, instance=True)
-    bridge_instance.raw_results.return_value = payload
-    bridge_cls = create_autospec(
-        web_provider.OpenClawSearchWrapper,
-        return_value=bridge_instance,
-    )
-    monkeypatch.setattr(web_provider, "OpenClawSearchWrapper", bridge_cls)
-
     monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda: "gemini_grounding")
     gemini_probe = await health_mod.default_web_search_probe(timeout_s=5.0)
     assert gemini_probe["latest_date"] == "2026-10-20"
     assert gemini_probe["count"] == 1
     gemini_cls.assert_called_once()
-    bridge_cls.assert_not_called()
 
-    gemini_cls.reset_mock()
-    monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda: "openclaw")
-    bridge_probe = await health_mod.default_web_search_probe(timeout_s=5.0)
-    assert bridge_probe["latest_date"] == "2026-10-20"
-    assert bridge_probe["count"] == 1
-    bridge_cls.assert_called_once()
-    gemini_cls.assert_not_called()
+    monkeypatch.setattr("src.config.tool_settings.get_search_api", lambda: "tavily")
+    with pytest.raises(ValueError, match="Unsupported search_api"):
+        await health_mod.default_web_search_probe(timeout_s=5.0)
+
+    monkeypatch.setattr("src.config.tool_settings._get_tool_config", lambda key, default=None: "openclaw" if key == "search_api" else default)
+    with pytest.raises(ValueError, match="no longer supported"):
+        get_search_api()
 
 
 @pytest.mark.asyncio

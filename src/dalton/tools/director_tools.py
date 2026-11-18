@@ -1606,11 +1606,11 @@ def build_director_tools(
         notify_routes: list[str] | None = None,
         config: RunnableConfig = None,
     ) -> str:
-        """Inspect, toggle, update, rollback, or immediately trigger Dalton system jobs across company, Home, host, data, and ops scopes.
+        """Inspect, toggle, update, rollback, or immediately trigger Dalton system jobs across company, Home, data, and ops scopes.
 
         Use when the user asks to view all scheduled jobs, enable/disable global Home tasks
         (`dalton-earnings-calendar`, `dalton-director-daily`, `dalton-director-weekly`, `dalton-data-health`),
-        toggle or trigger host `conversation-archive`, manage company auto-tracking (`company:<TICKER>`),
+        manage company auto-tracking (`company:<TICKER>`),
         or manage company-wide data tasks (`data:<job_key>`). For `data:<job_key>` (Chief of Staff + internal/admin only),
         `update`/`enable`/`disable` also support modifying schedule (`cron_expr`, `timezone`) and `notify_routes`, and `rollback` restores the previous version.
         Ops jobs (`ops-*`) are strictly read-only. When `action="run_now"` succeeds, always inform the user
@@ -1618,7 +1618,7 @@ def build_director_tools(
 
         Args:
             action: `"list"` (all jobs), `"status"` (single job by `key`), `"enable"`, `"disable"`, `"update"`, `"rollback"`, or `"run_now"`.
-            key: Job key (e.g. `"dalton-data-health"`, `"conversation-archive"`, `"company:NVDA"`, `"data:softbank-nav-monitor"`, `"ops-db-backup"`). Required except for `"list"`.
+            key: Job key (e.g. `"dalton-data-health"`, `"company:NVDA"`, `"data:softbank-nav-monitor"`, `"ops-db-backup"`). Required except for `"list"`.
             cron_expr: Optional 5-field cron expression when updating a `data:<job_key>` task.
             timezone: Optional IANA timezone name (e.g. `"Asia/Shanghai"`, `"America/New_York"`) when updating a `data:<job_key>` task.
             notify_routes: Optional list of notification target strings when updating a `data:<job_key>` task.
@@ -1862,7 +1862,7 @@ def build_director_tools(
                 {
                     "ok": False,
                     "error": "missing_key",
-                    "message": f"执行 {act} 时必须提供任务 key（如 dalton-data-health、conversation-archive、company:NVDA）。",
+                    "message": f"执行 {act} 时必须提供任务 key（如 dalton-data-health、company:NVDA）。",
                 },
                 ensure_ascii=False,
             )

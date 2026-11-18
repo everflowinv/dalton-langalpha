@@ -63,18 +63,14 @@ def estimate_data_map_tokens(markdown: str) -> int:
 
 
 def _is_x_search_enabled(
-    search_api: str | None,
+    search_api: str | None = None,
     x_search_enabled: bool | None = None,
 ) -> bool:
-    """Whether this turn mounts ``x_search``.
-
-    An explicit ``x_search_enabled`` matches ``PTCAgent.create_agent``. When
-    the caller omits it, the previous rule stays: only
-    ``search_api == "openclaw"`` includes the line.
-    """
+    """Whether this turn mounts ``x_search``."""
+    _ = search_api
     if x_search_enabled is not None:
         return bool(x_search_enabled)
-    return str(search_api or "").strip().lower() == "openclaw"
+    return False
 
 
 def _apply_search_api_filter(
@@ -368,7 +364,7 @@ def render_data_map_markdown(
     conversation_stats: Mapping[str, Any] | None = None,
     spec: Mapping[str, Any] | None = None,
     as_of_date: date | str | None = None,
-    search_api: str | None = "openclaw",
+    search_api: str | None = None,
     x_search_enabled: bool | None = None,
     max_tokens: int = MAX_DATA_MAP_TOKENS,
 ) -> str:
@@ -473,7 +469,7 @@ def render_data_map_markdown(
 def render_static_data_map_markdown(
     *,
     spec: Mapping[str, Any] | None = None,
-    search_api: str | None = "openclaw",
+    search_api: str | None = None,
     x_search_enabled: bool | None = None,
     team_memory_enabled: bool = False,
 ) -> str:
@@ -514,7 +510,7 @@ async def refresh_daily_data_map(
         handoff_routes=handoff_routes,
         health_map=health_map,
         conversation_stats=conv_stats,
-        search_api="openclaw",
+        x_search_enabled=True,
     )
     token_est = estimate_data_map_tokens(rendered)
     payload: dict[str, Any] = {
@@ -546,7 +542,7 @@ async def get_or_build_data_map_markdown(
     *,
     cache_date: date | None = None,
     conn: Any = None,
-    search_api: str | None = "openclaw",
+    search_api: str | None = None,
     x_search_enabled: bool | None = None,
     timeout_s: float = CACHE_READ_TIMEOUT_S,
     team_memory_enabled: bool = False,
@@ -594,7 +590,7 @@ def set_turn_data_map(markdown: str | None) -> None:
 
 async def warm_turn_data_map(
     *,
-    search_api: str | None = "openclaw",
+    search_api: str | None = None,
     x_search_enabled: bool | None = None,
     cache_date: date | None = None,
     conn: Any = None,

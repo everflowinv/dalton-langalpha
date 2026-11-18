@@ -759,7 +759,7 @@ def test_all_realrun_scripts_import_cleanly() -> None:
     """Every `g*.py` (and supporting script) in `scripts/dalton/realrun/` must import cleanly."""
     realrun_dir = Path(__file__).resolve().parents[3] / "scripts" / "dalton" / "realrun"
     g_scripts = sorted(realrun_dir.glob("g*.py"))
-    assert len(g_scripts) >= 7
+    assert len(g_scripts) >= 6
     for script_path in g_scripts:
         mod_name = f"scripts.dalton.realrun.{script_path.stem}"
         mod = importlib.import_module(mod_name)
@@ -1121,13 +1121,11 @@ def test_check_env_oauth_provenance_budget_restore_and_g6_markdown(monkeypatch: 
 def test_j5a_realrun_script_fixes_g5_callback_ordering_and_g2_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from unittest.mock import create_autospec
     from scripts.dalton.realrun import (
         g1_budget,
         g2_providers,
         g3_publish,
         g4_autonomy,
-        g5_broker_and_antigravity,
     )
 
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
@@ -1138,218 +1136,8 @@ def test_j5a_realrun_script_fixes_g5_callback_ordering_and_g2_schema(
     assert scan_res["violations"] == []
 
     # 2. All budget-modifying realrun scripts import _restore_budget_state
-    for mod in (g1_budget, g2_providers, g3_publish, g4_autonomy, g5_broker_and_antigravity):
+    for mod in (g1_budget, g2_providers, g3_publish, g4_autonomy):
         assert callable(getattr(mod, "_restore_budget_state", None))
-
-    # 3. G5 pre-callback gate rejects dirty working tree, mismatched backend SHA, or pre-callback check_env failure before touching callback URL
-    mock_dirty = create_autospec(g5_broker_and_antigravity.is_git_dirty, return_value=True)
-    mock_merged_true = create_autospec(g5_broker_and_antigravity.is_head_merged_into_main, return_value=True)
-    mock_anc_true = create_autospec(g5_broker_and_antigravity.is_main_ancestor_of_head, return_value=True)
-    mock_sha = create_autospec(g5_broker_and_antigravity.get_git_sha, return_value="deadbeef")
-    mock_health = create_autospec(
-        g5_broker_and_antigravity._probe_backend_health_sync,
-        return_value={"git_sha": "cafebabe", "git_dirty": False, "deployment": "docker"},
-    )
-    monkeypatch.setattr(g5_broker_and_antigravity, "is_git_dirty", mock_dirty)
-    with pytest.raises(SystemExit, match="Working tree is dirty"):
-        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
-            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=True
-        )
-
-    mock_dirty.return_value = False
-    monkeypatch.setattr(g5_broker_and_antigravity, "is_head_merged_into_main", mock_merged_true)
-    monkeypatch.setattr(g5_broker_and_antigravity, "is_main_ancestor_of_head", mock_anc_true)
-    monkeypatch.setattr(g5_broker_and_antigravity, "get_git_sha", mock_sha)
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "_probe_backend_health_sync",
-        mock_health,
-    )
-    with pytest.raises(SystemExit, match="Backend git_sha"):
-        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
-            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=True
-        )
-
-    # Pre-callback check_env (skip_oauth_and_transport=True) runs before consuming callback URL (Requirement 7)
-    mock_health.return_value = {"git_sha": "deadbeef", "git_dirty": False, "deployment": "docker"}
-    mock_pre_checks_fail = create_autospec(
-        g5_broker_and_antigravity.run_all_checks,
-        return_value={
-            "all_passed": False,
-            "checks": {
-                "migrated_workspace_ownership": {"status": "FAIL"},
-                "oauth_token_provenance": {"status": "SKIPPED"},
-                "conversation_transport": {"status": "SKIPPED"},
-            },
-        },
-    )
-    monkeypatch.setattr(g5_broker_and_antigravity, "run_all_checks", mock_pre_checks_fail)
-    with pytest.raises(SystemExit, match="Pre-callback check_env failed before consuming single-use OAuth callback URL"):
-        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate(
-            base_url="http://127.0.0.1:8000", user_id="realrun-pm-a", record=False
-        )
-    mock_pre_checks_fail.assert_called_once_with(
-        backend_url="http://127.0.0.1:8000",
-        skip_oauth_and_transport=True,
-    )
-
-    # 4. G5 --mode g5.2 exchanges callback URL BEFORE preflight_realrun_script runs
-    call_order: list[str] = []
-
-    def _rec_pre_gate(*, base_url: str, user_id: str, record: bool | None = None) -> dict[str, object]:
-        call_order.append("pre_gate")
-        return {"deployment": "docker"}
-
-    def _rec_exchange(
-        base_url: str,
-        user_a: str,
-        callback_url: str | None,
-        *,
-        record: bool = False,
-    ) -> dict[str, object]:
-        call_order.append("exchange_callback")
-        return {"deployment": "docker"}
-
-    def _rec_preflight(
-        family_code: str,
-        *,
-        record: bool | None = None,
-        backend: str = "http://127.0.0.1:8000",
-        user_id: str = "realrun-pm-a",
-    ) -> dict[str, object]:
-        call_order.append("preflight")
-        return {}
-
-    def _rec_run_g5_2(
-        base_url: str,
-        user_a: str,
-        user_b: str,
-        callback_url: str | None = None,
-        *,
-        record: bool = False,
-        pre_exchanged_callback_flow: dict[str, object] | None = None,
-    ) -> tuple[dict[str, object], list[dict[str, object]]]:
-        call_order.append("run_g5_2")
-        return (
-            {
-                "deployment": "docker",
-                "oauth_status_and_isolation": {
-                    "user_a": {"status_body": {"connected": True}},
-                    "user_b_isolation": {"status_body": {"connected": False}},
-                },
-                "gemini_4_round_tool_calling": {
-                    "tool_calls_count": 4,
-                    "tool_call_results_count": 4,
-                    "gemini_model_invocations_count": 5,
-                },
-                "docker_callback_paste_flow": {
-                    "callback_missing_state": {"http_status": 400},
-                    "callback_wrong_state": {"http_status": 400},
-                    "callback_real_paste_exchange": {"http_status": 200},
-                },
-            },
-            [{"passed": True}],
-        )
-
-    def _rec_post_checks(*, backend_url: str = "http://127.0.0.1:8000", dsn: str | None = None, skip_oauth_and_transport: bool = False) -> dict[str, object]:
-        call_order.append(f"post_callback_check_env:skip={skip_oauth_and_transport}")
-        return {"all_passed": True, "checks": {}}
-
-    mock_dotenv = create_autospec(g5_broker_and_antigravity.load_repo_dotenv, return_value=False)
-    mock_pre_gate = create_autospec(
-        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate,
-        side_effect=_rec_pre_gate,
-    )
-    mock_exchange = create_autospec(
-        g5_broker_and_antigravity._exchange_g5_2_docker_callback,
-        side_effect=_rec_exchange,
-    )
-    from scripts.dalton.realrun import check_env as _check_env_mod
-
-    mock_post_checks = create_autospec(
-        _check_env_mod.run_all_checks,
-        side_effect=_rec_post_checks,
-    )
-    mock_preflight = create_autospec(
-        g5_broker_and_antigravity.preflight_realrun_script,
-        side_effect=_rec_preflight,
-    )
-    mock_run_g5_2 = create_autospec(
-        g5_broker_and_antigravity._run_g5_2_antigravity,
-        side_effect=_rec_run_g5_2,
-    )
-    mock_build_env = create_autospec(
-        g5_broker_and_antigravity.build_evidence_envelope,
-        return_value={"deployment": "docker", "assertions": [{"passed": True}]},
-    )
-    mock_write_ev = create_autospec(
-        g5_broker_and_antigravity.write_evidence_and_summary,
-        return_value=(Path("/tmp/g5.json"), Path("/tmp/G5.md"), "abc123"),
-    )
-    monkeypatch.setattr(g5_broker_and_antigravity, "load_repo_dotenv", mock_dotenv)
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "_assert_pre_callback_git_and_backend_gate",
-        mock_pre_gate,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "_exchange_g5_2_docker_callback",
-        mock_exchange,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "run_all_checks",
-        mock_post_checks,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "preflight_realrun_script",
-        mock_preflight,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "_run_g5_2_antigravity",
-        mock_run_g5_2,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "build_evidence_envelope",
-        mock_build_env,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "write_evidence_and_summary",
-        mock_write_ev,
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "g5_broker_and_antigravity.py",
-            "--mode",
-            "g5.2",
-            "--callback-url",
-            "http://localhost:51121/oauth-callback?code=c1&state=s1",
-        ],
-    )
-    rc = g5_broker_and_antigravity.main()
-    assert rc == 0
-    assert call_order == [
-        "pre_gate",
-        "exchange_callback",
-        "post_callback_check_env:skip=False",
-        "preflight",
-        "run_g5_2",
-    ]
-
-    # Post-callback check_env failure aborts even without --record
-    mock_post_checks.side_effect = None
-    mock_post_checks.return_value = {
-        "all_passed": False,
-        "checks": {"oauth_token_provenance": {"status": "FAIL", "reason": "missing_prior_oauth_login_start_event"}},
-    }
-    with pytest.raises(SystemExit, match="Post-callback check_env failed after exchanging OAuth callback URL"):
-        g5_broker_and_antigravity.main()
 
     # 5. G2 thesis payloads conform to src/dalton/knowledge/schemas/thesis.schema.json
     from src.dalton.knowledge.validate import validate_schema
@@ -1407,7 +1195,6 @@ def test_r2_g3_owner_read_g4_idle_user_check_env_and_g5_initiate(
         check_env,
         g3_publish,
         g4_autonomy,
-        g5_broker_and_antigravity,
     )
 
     monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
@@ -1783,42 +1570,6 @@ def test_r2_g3_owner_read_g4_idle_user_check_env_and_g5_initiate(
         "/api/v1/subagents/general-purpose",
         json_body={"version": "v1", "fields": {"model": None}},
     )
-
-    # 4. G5 --mode g5.2-initiate: rejects --record (non-zero exit) and raises RuntimeError if any file is written under var/dalton/trial-runs/
-    mock_dotenv_init = create_autospec(g5_broker_and_antigravity.load_repo_dotenv, return_value=False)
-    monkeypatch.setattr(g5_broker_and_antigravity, "load_repo_dotenv", mock_dotenv_init)
-
-    with pytest.raises(SystemExit, match="cannot be combined with --record"):
-        g5_broker_and_antigravity.main(["--mode", "g5.2-initiate", "--record"])
-
-    mock_health = create_autospec(g5_broker_and_antigravity._probe_backend_health_sync)
-    mock_health.return_value = {"status": "ok", "deployment": "docker"}
-    mock_init = create_autospec(g5_broker_and_antigravity._initiate_g5_2_for_user)
-    mock_init.return_value = {
-        "user_id": "realrun-pm-a",
-        "initiate_http_status": 200,
-        "port": 51121,
-        "state_prefix": "abc1234567",
-        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?state=abc1234567",
-    }
-    monkeypatch.setattr(g5_broker_and_antigravity, "_probe_backend_health_sync", mock_health)
-    monkeypatch.setattr(g5_broker_and_antigravity, "_initiate_g5_2_for_user", mock_init)
-    monkeypatch.setattr(g5_broker_and_antigravity, "REPO_ROOT", tmp_path)
-
-    rc_init = g5_broker_and_antigravity.main(["--mode", "g5.2-initiate", "--date", "20261020"])
-    assert rc_init == 0
-    assert not (tmp_path / "var" / "dalton" / "trial-runs").exists()
-
-    # Recursive check across entire var/dalton/trial-runs/ tree raises RuntimeError (not assert)
-    def _dirty_init(base_url: str, user_id: str, *, record: bool = False) -> dict[str, object]:
-        out_dir = tmp_path / "var" / "dalton" / "trial-runs" / "realrun-19990101"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "other_artifact.txt").write_text("{}", encoding="utf-8")
-        return {"user_id": user_id}
-
-    mock_init.side_effect = _dirty_init
-    with pytest.raises(RuntimeError, match="must not write or modify any evidence files"):
-        g5_broker_and_antigravity.main(["--mode", "g5.2-initiate", "--date", "20261020"])
 
 
 def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2377,181 +2128,6 @@ def test_r2_round2_cleanup_autospec_d5_d6_d7(monkeypatch: pytest.MonkeyPatch) ->
     assert sse_fail_res["error"] == "RuntimeError: conversation_transport stream_sse failed"
     assert "sse_stream_broken" not in str(sse_fail_res)
     cleanup_probe_sse.delete.assert_called_once_with("/api/v1/workspaces/ws-probe-sse")
-
-
-def test_g5_2_record_mode_uses_record_false_client_for_callback_exchange_and_record_true_preflight_after(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from unittest.mock import create_autospec
-
-    import httpx
-
-    from scripts.dalton.realrun import (
-        _common,
-        check_env as _check_env_mod,
-        g5_broker_and_antigravity,
-    )
-
-    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "test-service-token-value")
-
-    client_record_args: list[tuple[str, bool | None]] = []
-    preflight_record_args: list[tuple[str | None, bool | None]] = []
-
-    def _make_g5_autospec_client(
-        base_url: str = "http://127.0.0.1:8000",
-        *,
-        user_id: str,
-        timeout_s: float = 120.0,
-        extra_headers: dict[str, str] | None = None,
-        record: bool | None = None,
-    ) -> _common.RealRunHttpClient:
-        client_record_args.append((user_id, record))
-        inst = create_autospec(_common.RealRunHttpClient, instance=True)
-        inst.__enter__.return_value = inst
-        inst.__exit__.return_value = None
-        inst.get.return_value = (200, {"deployment": "docker"})
-
-        def _post(
-            path: str,
-            *,
-            json_body: object = None,
-            headers: dict[str, str] | None = None,
-        ) -> tuple[int, dict[str, object]]:
-            if path == "/api/v1/oauth/antigravity/initiate":
-                return (
-                    200,
-                    {
-                        "authorize_url": "https://accounts.google.com/o/oauth2/v2/auth?state=s1234567890",
-                        "port": 51121,
-                    },
-                )
-            if path == "/api/v1/oauth/antigravity/poll":
-                return 200, {"pending": True}
-            if path == "/api/v1/oauth/antigravity/callback":
-                cb_in = str((json_body or {}).get("callback_input", "")) if isinstance(json_body, dict) else ""
-                if "state=s1" in cb_in:
-                    return 200, {"success": True, "connected": True, "email": "u@example.com"}
-                return 400, {"detail": "invalid state"}
-            raise AssertionError(f"Unexpected POST path: {path}")
-
-        inst.post.side_effect = _post
-        return inst
-
-    mock_client_cls = create_autospec(_common.RealRunHttpClient, side_effect=_make_g5_autospec_client)
-    mock_httpx_get = create_autospec(
-        httpx.get,
-        side_effect=httpx.ConnectError("Connection refused"),
-    )
-    mock_dotenv = create_autospec(g5_broker_and_antigravity.load_repo_dotenv, return_value=False)
-    mock_pre_gate = create_autospec(
-        g5_broker_and_antigravity._assert_pre_callback_git_and_backend_gate,
-        return_value={"deployment": "docker"},
-    )
-    mock_post_checks = create_autospec(
-        _check_env_mod.run_all_checks,
-        return_value={"all_passed": True, "checks": {}},
-    )
-
-    def _rec_preflight(
-        family: str | None = None,
-        *,
-        record: bool | None = None,
-        base_url: str = "http://127.0.0.1:8000",
-        backend: str | None = None,
-        user_id: str = "realrun-pm-a",
-    ) -> dict[str, object]:
-        preflight_record_args.append((family, record))
-        return {"deployment": "docker"}
-
-    mock_preflight = create_autospec(
-        g5_broker_and_antigravity.preflight_realrun_script,
-        side_effect=_rec_preflight,
-    )
-    mock_run_g5_2 = create_autospec(
-        g5_broker_and_antigravity._run_g5_2_antigravity,
-        return_value=(
-            {
-                "deployment": "docker",
-                "oauth_status_and_isolation": {
-                    "user_a": {"status_body": {"connected": True}},
-                    "user_b_isolation": {"status_body": {"connected": False}},
-                },
-                "gemini_4_round_tool_calling": {
-                    "tool_calls_count": 4,
-                    "tool_call_results_count": 4,
-                    "gemini_model_invocations_count": 5,
-                },
-                "docker_callback_paste_flow": {
-                    "callback_missing_state": {"http_status": 400},
-                    "callback_wrong_state": {"http_status": 400},
-                    "callback_real_paste_exchange": {"http_status": 200},
-                },
-            },
-            [{"passed": True}],
-        ),
-    )
-    mock_build_env = create_autospec(
-        g5_broker_and_antigravity.build_evidence_envelope,
-        return_value={"deployment": "docker", "assertions": [{"passed": True}]},
-    )
-    mock_write_ev = create_autospec(
-        g5_broker_and_antigravity.write_evidence_and_summary,
-        return_value=(Path("/tmp/g5.json"), Path("/tmp/G5.md"), "abc123"),
-    )
-    mock_sleep = create_autospec(g5_broker_and_antigravity.time.sleep, return_value=None)
-
-    monkeypatch.setattr(g5_broker_and_antigravity, "RealRunHttpClient", mock_client_cls)
-    monkeypatch.setattr(g5_broker_and_antigravity.httpx, "get", mock_httpx_get)
-    monkeypatch.setattr(g5_broker_and_antigravity, "load_repo_dotenv", mock_dotenv)
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "_assert_pre_callback_git_and_backend_gate",
-        mock_pre_gate,
-    )
-    monkeypatch.setattr(g5_broker_and_antigravity, "run_all_checks", mock_post_checks)
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "preflight_realrun_script",
-        mock_preflight,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "_run_g5_2_antigravity",
-        mock_run_g5_2,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "build_evidence_envelope",
-        mock_build_env,
-    )
-    monkeypatch.setattr(
-        g5_broker_and_antigravity,
-        "write_evidence_and_summary",
-        mock_write_ev,
-    )
-    monkeypatch.setattr(g5_broker_and_antigravity.time, "sleep", mock_sleep)
-
-    # Pre-exchange _initiate_g5_2_for_user always creates its client with record=False
-    g5_broker_and_antigravity._initiate_g5_2_for_user(
-        "http://127.0.0.1:8000", "realrun-pm-a", record=True
-    )
-    assert client_record_args == [("realrun-pm-a", False)]
-    client_record_args.clear()
-
-    rc = g5_broker_and_antigravity.main(
-        [
-            "--mode",
-            "g5.2",
-            "--record",
-            "--callback-url",
-            "http://localhost:51121/oauth-callback?code=c1&state=s1",
-        ]
-    )
-    assert rc == 0
-    # Callback exchange client is created with record=False, while post-exchange preflight runs with record=True
-    assert client_record_args == [("realrun-pm-a", False)]
-    assert preflight_record_args == [("G5", True)]
-
 
 
 @pytest.mark.parametrize(

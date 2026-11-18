@@ -15,7 +15,6 @@ from src.dalton.knowledge.paths import (
     AGENT_SUMMARY_END,
     AGENT_SUMMARY_START,
     DOC_KEYS,
-    RENDERED,
     data_path,
     history_edited_md_path,
     history_path,
@@ -467,44 +466,6 @@ def test_rendering_and_agent_block_cap() -> None:
     assert "Keep this top paragraph." in merged
     assert "Keep this bottom paragraph." in merged
     assert "v3" in merged
-
-
-def test_migrated_4_companies_pass_all_schemas_and_debate_coverage() -> None:
-    migration_root = Path(__file__).resolve().parents[3] / "var" / "dalton" / "migration"
-    report_path = migration_root / "migration_report.json"
-    assert report_path.exists(), "Run scripts/dalton/migrate_legacy_knowledge.py first"
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-
-    assert report["all_schemas_passed"] is True
-    assert report["source_integrity"]["zero_source_mutations"] is True
-    assert report["openclaw_debates_expected"] == 27
-    assert report["openclaw_debates_migrated"] == 27
-
-    expected_counts = {"META": 6, "AMZN": 7, "GOOGL": 7, "MSFT": 7}
-    for ticker, exp_d in expected_counts.items():
-        c_dir = migration_root / "Home" / "dalton" / "companies" / ticker
-        for doc_key in DOC_KEYS:
-            doc_file = c_dir / data_path(doc_key)
-            assert doc_file.exists(), f"Missing {doc_file}"
-            payload = json.loads(doc_file.read_text(encoding="utf-8"))
-            val = validate_update(doc_key, None, payload, reason="Verify migrated doc")
-            assert val.ok, f"{ticker} {doc_key} failed validation: {val.format_problems()}"
-
-        debate_payload = json.loads((c_dir / "data" / "debate.json").read_text(encoding="utf-8"))
-        d_ids = [d["id"] for d in debate_payload["debates"]]
-        assert d_ids == [f"D{i}" for i in range(1, exp_d + 1)]
-
-        # 公司工作区只渲染公司 profile 的文档（RENDERED 另含行业 profile 的
-        # sector.md，公司工作区没有 sector 文档，自然不渲染它）。
-        for doc_key in DOC_KEYS:
-            md_rel = RENDERED.get(doc_key)
-            if md_rel is None:
-                continue
-            assert (c_dir / md_rel).exists(), f"Missing rendered {ticker}/{md_rel}"
-        assert (c_dir / "agent.md").exists()
-        assert (c_dir / "verdicts.md").exists()
-        assert (c_dir / "published" / "INDEX.md").exists()
-        assert (c_dir / "sources" / "legacy" / "provenance.json").exists()
 
 
 @pytest.mark.asyncio
@@ -985,52 +946,6 @@ async def test_field_and_path_repair_with_warnings_and_assist_fallback(
     saved_questions = store["agenda"][-1]["content"]["open_questions"]
     assert len(saved_questions) == 1
     assert saved_questions[0]["question"] == "Will AWS capacity double by 2027?"
-
-
-
-def test_g34_migrated_docs_have_no_fabricated_numbers_and_remediation() -> None:
-    from scripts.dalton.migrate_legacy_knowledge import remediate_doc_payload
-
-    migration_root = Path(__file__).resolve().parents[3] / "var" / "dalton" / "migration"
-    for ticker in ("META", "AMZN", "GOOGL", "MSFT"):
-        c_dir = migration_root / "Home" / "dalton" / "companies" / ticker / "data"
-        drivers = json.loads((c_dir / "drivers.json").read_text(encoding="utf-8"))
-        hvd = drivers["historical_valuation_driver"]
-        assert hvd["eps_share_pct"] is None
-        assert hvd["multiple_share_pct"] is None
-        assert hvd.get("note") == "迁移时未计算，待首次研究补充"
-
-        mgmt = json.loads((c_dir / "management.json").read_text(encoding="utf-8"))
-        for g in mgmt["guidance_history"]:
-            assert g["issued_at"] is None
-            assert g.get("note") == "迁移时未计算，待首次研究补充"
-
-        comp = json.loads((c_dir / "company.json").read_text(encoding="utf-8"))
-        assert comp["autonomy"]["max_usd_per_day"] is None
-        assert comp["autonomy"].get("note") == "迁移时未计算，待首次研究补充"
-
-        agenda = json.loads((c_dir / "agenda.json").read_text(encoding="utf-8"))
-        for ev in agenda["watch"]["events"]:
-            assert ev["date"] != "2026-11-15"
-        for val in agenda["next_validations"]:
-            assert val["due"] != "2026-11-15"
-
-    # Also verify remediate_doc_payload cleans up legacy fabricated payloads
-    legacy_drivers = {
-        "schema_version": 1,
-        "as_of": "2026-10-18T12:00:00Z",
-        "historical_valuation_driver": {
-            "summary": "Test",
-            "window": "2025-2026",
-            "eps_share_pct": 65.0,
-            "multiple_share_pct": 35.0,
-        },
-        "drivers": [],
-    }
-    cleaned_drv, changed = remediate_doc_payload("drivers", legacy_drivers)
-    assert changed is True
-    assert cleaned_drv["historical_valuation_driver"]["eps_share_pct"] is None
-    assert cleaned_drv["historical_valuation_driver"]["multiple_share_pct"] is None
 
 
 @pytest.mark.asyncio

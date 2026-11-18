@@ -51,23 +51,11 @@ def test_registry_frontmatter_paths_and_layout() -> None:
 
 
 def test_skill_tool_calls_and_refs_valid() -> None:
-    sys.path.insert(0, str(REPO_ROOT / "scripts" / "dalton"))
-    try:
-        import check_skill_refs
-    finally:
-        sys.path.pop(0)
-
     sys.path.insert(0, str(TESTS_DIR))
     try:
         import test_skill_tool_calls as stc
     finally:
         sys.path.pop(0)
-
-    findings = check_skill_refs.scan_skills()
-    for hit in findings["ghost_hits"]:
-        assert SKILL_NAME not in hit["file"], f"Unexpected ghost tool ref: {hit}"
-    for br in findings["broken_refs"]:
-        assert SKILL_NAME not in br["file"], f"Unexpected broken ref: {br}"
 
     registry = stc.build_tool_signature_registry()
     all_calls: list[dict] = []

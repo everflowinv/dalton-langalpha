@@ -20,7 +20,7 @@ import httpx
 from langchain_core.tools import tool
 
 from src.dalton.web_search.cache import get_cached_search, search_cache_key, store_cached_search
-from src.dalton.web_search.provider import (
+from src.dalton.web_search.formatting import (
     EMPTY_GENERATION_MESSAGE,
     OpenClawSearchEmptyGenerationError,
     OpenClawSearchEmptyResultError,

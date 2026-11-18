@@ -438,171 +438,33 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def test_seed_copies_kweb_code_and_fills_missing_state_only(tmp_path: Path) -> None:
+def test_seed_deploys_kweb_data_assets_without_legacy_source_sync(tmp_path: Path) -> None:
     script_path = REPO_ROOT / "scripts" / "dalton" / "seed_openclaw_data.sh"
     script_text = script_path.read_text(encoding="utf-8")
-    assert "skills/kweb-dashboard" in script_text
-    assert "state/kweb-dashboard/portfolio_state.json" in script_text
-    assert "state/kweb-dashboard/portfolio_ledger.jsonl" in script_text
-    assert "state/kweb-dashboard/etf_aum.json" in script_text
-    assert "research-outputs/kweb-dashboard/portfolio/*.md" in script_text
-    assert "podcast-weekly" not in script_text
+    assert "data_assets" in script_text
+    assert "--source" in script_text
 
-    src = tmp_path / "workspace"
     dst = tmp_path / "openclaw-data"
-    # rsync treats a file as unchanged when the size and the whole-second
-    # mtime both match. "echo old" and "echo new" are the same length, so a
-    # second --apply in the same second would leave the first copy in place.
-    _write(src / "skills/kweb-dashboard/scripts/run.sh", "echo old-kweb\n")
-    _write(
-        src / "skills/kweb-dashboard/references/kweb_config.json",
-        '{"site_title":"Richard 相对看板"}\n',
-    )
-    _write(src / "skills/kweb-dashboard/.venv/pyvenv.cfg", "home = /hidden\n")
-    _write(src / "state/kweb-dashboard/portfolio_state.json", '{"cash": 1}\n')
-    _write(src / "state/kweb-dashboard/portfolio_ledger.jsonl", '{"signal_date":"2026-11-11"}\n')
-    _write(src / "state/kweb-dashboard/etf_aum.json", '{"as_of":"2026-11-01"}\n')
-    _write(src / "state/kweb-dashboard/cos_secret.json", "secret-id\n")
-    _write(src / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md", "old report\n")
-    _write(src / "research-outputs/kweb-dashboard/index.html", "<html>generated</html>\n")
-    _write(src / "config/kweb_cos_secret.json", '{"secret":"no"}\n')
-    _write(src / "skills/podcast-weekly-digest/scripts/run.sh", "echo podcast\n")
-
     dry = subprocess.run(
-        ["bash", str(script_path), "--source", str(src), "--target", str(dst)],
+        ["bash", str(script_path), "--target", str(dst)],
         capture_output=True,
         text=True,
         check=False,
     )
     assert dry.returncode == 0, dry.stderr
     assert "Mode: DRY-RUN" in dry.stdout
-    assert "DRY-RUN total size" in dry.stdout
+    assert "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py" in dry.stdout
     assert not dst.exists()
 
     apply = subprocess.run(
-        ["bash", str(script_path), "--apply", "--source", str(src), "--target", str(dst)],
+        ["bash", str(script_path), "--apply", "--target", str(dst)],
         capture_output=True,
         text=True,
         check=False,
     )
     assert apply.returncode == 0, apply.stderr
-    assert (dst / "skills/kweb-dashboard/scripts/run.sh").read_text(encoding="utf-8") == "echo old-kweb\n"
-    assert "Richard 相对看板" in (
-        dst / "skills/kweb-dashboard/references/kweb_config.json"
-    ).read_text(encoding="utf-8")
-    assert (dst / "state/kweb-dashboard/portfolio_state.json").read_text(encoding="utf-8") == '{"cash": 1}\n'
-    assert (dst / "state/kweb-dashboard/portfolio_ledger.jsonl").is_file()
-    assert (dst / "state/kweb-dashboard/etf_aum.json").is_file()
-    assert (dst / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md").read_text(
-        encoding="utf-8"
-    ) == "old report\n"
-    assert not (dst / "skills/kweb-dashboard/.venv").exists()
-    assert not (dst / "state/kweb-dashboard/cos_secret.json").exists()
-    assert not (dst / "research-outputs/kweb-dashboard/index.html").exists()
-    assert not (dst / "config/kweb_cos_secret.json").exists()
-    assert "echo podcast" not in (dst / "skills/podcast-weekly-digest/scripts/run.sh").read_text(encoding="utf-8")
-
-    (dst / "state/kweb-dashboard/portfolio_state.json").write_text("KEEP-STATE\n", encoding="utf-8")
-    (dst / "state/kweb-dashboard/etf_aum.json").write_text("KEEP-AUM\n", encoding="utf-8")
-    (dst / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md").write_text(
-        "KEEP-MD\n", encoding="utf-8"
-    )
-    (dst / "state/kweb-dashboard/portfolio_ledger.jsonl").unlink()
-    _write(src / "skills/kweb-dashboard/scripts/run.sh", "echo new-kweb-v2\n")
-    _write(src / "skills/kweb-dashboard/references/kweb_config.json", '{"site_title":"updated"}\n')
-    _write(src / "state/kweb-dashboard/portfolio_state.json", "NEW-STATE\n")
-    _write(src / "state/kweb-dashboard/etf_aum.json", "NEW-AUM\n")
-    _write(src / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md", "NEW-MD\n")
-    _write(src / "state/kweb-dashboard/portfolio_ledger.jsonl", '{"signal_date":"2026-11-12"}\n')
-
-    again = subprocess.run(
-        ["bash", str(script_path), "--apply", "--source", str(src), "--target", str(dst)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert again.returncode == 0, again.stderr
-    assert (dst / "skills/kweb-dashboard/scripts/run.sh").read_text(encoding="utf-8") == "echo new-kweb-v2\n"
-    assert (
-        dst / "skills/kweb-dashboard/references/kweb_config.json"
-    ).read_text(encoding="utf-8") == '{"site_title":"updated"}\n'
-    assert (dst / "state/kweb-dashboard/portfolio_state.json").read_text(encoding="utf-8") == "KEEP-STATE\n"
-    assert (dst / "state/kweb-dashboard/etf_aum.json").read_text(encoding="utf-8") == "KEEP-AUM\n"
-    assert (dst / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md").read_text(
-        encoding="utf-8"
-    ) == "KEEP-MD\n"
-    assert (dst / "state/kweb-dashboard/portfolio_ledger.jsonl").read_text(
-        encoding="utf-8"
-    ) == '{"signal_date":"2026-11-12"}\n'
-    assert not (dst / "skills/kweb-dashboard/.venv").exists()
-    assert not (dst / "config/kweb_cos_secret.json").exists()
-    assert not (dst / "research-outputs/kweb-dashboard/index.html").exists()
-
-
-_CREDENTIAL_NAMES = (
-    ".env",
-    "prod.env",
-    ".env.local",
-    "kweb_cos_secret.json",
-    "cos_secret.json",
-    "api_credential.json",
-    "server.pem",
-    "private.key",
-    "client.p12",
-    "id_rsa",
-    "id_rsa.pub",
-    "session_token.json",
-    "token.json",
-)
-
-
-def test_seed_apply_skips_credential_files_and_keeps_code(tmp_path: Path) -> None:
-    """Credential names stay out of every seed channel. Code and config still copy."""
-    script_path = REPO_ROOT / "scripts" / "dalton" / "seed_openclaw_data.sh"
-    src = tmp_path / "workspace"
-    dst = tmp_path / "openclaw-data"
-    _write(src / "skills/kweb-dashboard/scripts/run.sh", "echo keep-code\n")
-    _write(src / "skills/kweb-dashboard/references/kweb_config.json", '{"site_title":"ok"}\n')
-    _write(src / "skills/ai-chain/scripts/daily_run.py", "print('chain')\n")
-    _write(src / "config/etf_characteristics.json", '{"ok": true}\n')
-    _write(src / "scripts/megacap_relative_signal_monitor.py", "print('ok')\n")
-    _write(src / "state/cn-leverage/margin_core.csv", "date,val\n")
-    _write(src / "state/cn-leverage/my_secret.csv", "blocked\n")
-    _write(src / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md", "report\n")
-    _write(src / "research-outputs/kweb-dashboard/portfolio/secret-note.md", "blocked\n")
-    _write(src / "state/a-share-volume-watch/stderr.log", "log\n")
-    _write(src / "skills/ai-chain/state/ingest_health.json", '{"ok": 1}\n')
-    for name in _CREDENTIAL_NAMES:
-        _write(src / "skills/kweb-dashboard" / name, "blocked\n")
-        _write(src / "skills/kweb-dashboard/scripts" / name, "blocked\n")
-        _write(src / "state/a-share-volume-watch" / name, "blocked\n")
-        _write(src / "skills/ai-chain/state" / name, "blocked\n")
-
-    apply = subprocess.run(
-        ["bash", str(script_path), "--apply", "--source", str(src), "--target", str(dst)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert apply.returncode == 0, apply.stderr
-    assert (dst / "skills/kweb-dashboard/scripts/run.sh").read_text(encoding="utf-8") == "echo keep-code\n"
-    assert (dst / "skills/kweb-dashboard/references/kweb_config.json").is_file()
-    assert (dst / "skills/ai-chain/scripts/daily_run.py").read_text(encoding="utf-8") == "print('chain')\n"
-    assert (dst / "config/etf_characteristics.json").read_text(encoding="utf-8") == '{"ok": true}\n'
-    assert (dst / "scripts/megacap_relative_signal_monitor.py").is_file()
-    assert (dst / "state/cn-leverage/margin_core.csv").read_text(encoding="utf-8") == "date,val\n"
-    assert (dst / "research-outputs/kweb-dashboard/portfolio/2026-11-11.md").read_text(
-        encoding="utf-8"
-    ) == "report\n"
-    assert (dst / "state/a-share-volume-watch/stderr.log").read_text(encoding="utf-8") == "log\n"
-    assert (dst / "skills/ai-chain/state/ingest_health.json").read_text(encoding="utf-8") == '{"ok": 1}\n'
-    assert not (dst / "state/cn-leverage/my_secret.csv").exists()
-    assert not (dst / "research-outputs/kweb-dashboard/portfolio/secret-note.md").exists()
-    for name in _CREDENTIAL_NAMES:
-        assert not (dst / "skills/kweb-dashboard" / name).exists()
-        assert not (dst / "skills/kweb-dashboard/scripts" / name).exists()
-        assert not (dst / "state/a-share-volume-watch" / name).exists()
-        assert not (dst / "skills/ai-chain/state" / name).exists()
+    assert (dst / "skills/kweb-dashboard/scripts/kweb_dashboard_cli.py").is_file()
+    assert (dst / "skills/kweb-dashboard/SKILL.md").is_file()
 
 
 def test_none_payload_source_ignores_stdout_trigger_fields(tmp_path: Path) -> None:
@@ -705,7 +567,7 @@ def test_kweb_deploy_no_upload_updates_portfolio_without_uploading(
         REPO_ROOT
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "skills"
         / "kweb-dashboard"
         / "scripts"
@@ -795,7 +657,7 @@ def _load_kweb_cli_for_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         REPO_ROOT
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "skills"
         / "kweb-dashboard"
         / "scripts"
@@ -1109,7 +971,7 @@ def test_kweb_overlay_skill_md_recommends_deploy_no_upload() -> None:
         REPO_ROOT
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "skills"
         / "kweb-dashboard"
         / "SKILL.md"

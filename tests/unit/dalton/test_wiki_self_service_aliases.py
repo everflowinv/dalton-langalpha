@@ -69,7 +69,7 @@ def _req(target: str, *, dry_run: bool, aliases: list[str] | None = None, n: int
 
 
 def _config_text(bridge: rb.ResearchDataBridge) -> str:
-    return (bridge.cfg.ocw_root / "skills" / "company-wiki" / "config.json").read_text(
+    return (bridge.cfg.research_home / "skills" / "company-wiki" / "config.json").read_text(
         encoding="utf-8"
     )
 
@@ -79,7 +79,7 @@ async def test_aliases_registered_on_write_then_resolve_directly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge = _make_test_bridge(tmp_path)
-    (bridge.cfg.ocw_root / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
+    (bridge.cfg.research_home / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
     cfg_before = _config_text(bridge)
     _fake_cli(monkeypatch, "YUHONG", 501)
 
@@ -124,7 +124,7 @@ async def test_alias_pointing_elsewhere_is_refused_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge = _make_test_bridge(tmp_path)
-    (bridge.cfg.ocw_root / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
+    (bridge.cfg.research_home / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
     cli = _fake_cli(monkeypatch, "YUHONG", 502)
 
     # "腾讯" is a config.json alias of TENCENT; "NVDA" is another directory.
@@ -144,7 +144,7 @@ async def test_failed_write_registers_no_alias(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge = _make_test_bridge(tmp_path)
-    (bridge.cfg.ocw_root / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
+    (bridge.cfg.research_home / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
     fake_proc = create_autospec(asyncio.subprocess.Process, instance=True)
     fake_proc.returncode = 1
     fake_proc.communicate.return_value = (b"", b"boom")
@@ -193,7 +193,7 @@ async def test_corrupted_store_fails_closed_and_is_not_overwritten(tmp_path: Pat
 def test_save_skips_alias_that_became_a_directory(tmp_path: Path) -> None:
     bridge = _make_test_bridge(tmp_path)
     # Another write created company ACME after this request's alias check.
-    (bridge.cfg.ocw_root / "wiki" / "companies" / "ACME").mkdir(parents=True)
+    (bridge.cfg.research_home / "wiki" / "companies" / "ACME").mkdir(parents=True)
     written = bridge._save_wiki_aliases(
         "company", "YUHONG", ["ACME", "东方雨虹"], {"user_id": "u-1"}
     )
@@ -207,7 +207,7 @@ async def test_concurrent_writes_cannot_both_claim_one_alias(
 ) -> None:
     bridge = _make_test_bridge(tmp_path)
     for slug in ("YUHONG", "KEDA"):
-        (bridge.cfg.ocw_root / "wiki" / "companies" / slug).mkdir(parents=True)
+        (bridge.cfg.research_home / "wiki" / "companies" / slug).mkdir(parents=True)
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -324,7 +324,7 @@ async def test_retry_with_aliases_registers_them_on_idempotent_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge = _make_test_bridge(tmp_path)
-    (bridge.cfg.ocw_root / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
+    (bridge.cfg.research_home / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
     _fake_cli(monkeypatch, "YUHONG", 503)
 
     code, res = await bridge.handle_wiki_ingest(_req("YUHONG", dry_run=False))
@@ -344,7 +344,7 @@ async def test_write_queued_past_the_wait_bound_answers_busy_and_writes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge = _make_test_bridge(tmp_path)
-    (bridge.cfg.ocw_root / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
+    (bridge.cfg.research_home / "wiki" / "companies" / "YUHONG").mkdir(parents=True)
     cli = _fake_cli(monkeypatch, "YUHONG", 504)
     monkeypatch.setattr(rb, "WIKI_WRITE_QUEUE_WAIT_S", 0.05)
 

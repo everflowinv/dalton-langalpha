@@ -5,7 +5,6 @@ from typing import Optional
 from src.config.tool_settings import get_search_api
 from src.dalton.web_search_spec import (  # DALTON-HOOK(web-search-gemini)
     register_gemini_grounding_search_builder,
-    register_openclaw_search_builder,  # DALTON-HOOK(web-search-openclaw)
 )
 from src.observability import TOOL_PROVIDER
 from src.tools.decorators import create_logged_tool
@@ -31,12 +30,10 @@ def _lazy_builder(provider: str):
 # Provider name -> tool builder. Adding a provider = one entry here, one
 # provider module with build_web_search_tool, one manifest entry.
 _PROVIDER_BUILDERS = register_gemini_grounding_search_builder(  # DALTON-HOOK(web-search-gemini)
-    register_openclaw_search_builder(  # DALTON-HOOK(web-search-openclaw)
-        {
-            name: _lazy_builder(name)
-            for name in ("tavily", "serper", "bocha", "exa", "parallel", "deepseek")
-        },
-    )
+    {
+        name: _lazy_builder(name)
+        for name in ("tavily", "serper", "bocha", "exa", "parallel", "deepseek")
+    },
 )
 
 

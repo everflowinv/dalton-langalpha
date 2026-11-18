@@ -133,7 +133,7 @@ def test_usage_report_prices_json_includes_gpt62_with_effective_from() -> None:
         REPO_ROOT
         / "scripts"
         / "dalton"
-        / "openclaw_overlays"
+        / "data_assets"
         / "skills"
         / "model-usage-cost"
         / "references"

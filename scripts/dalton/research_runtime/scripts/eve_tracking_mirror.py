@@ -283,7 +283,7 @@ def _import_cron_command_tasks():
         for cand in (
             CODE_ROOT / 'scripts',
             DATA_ROOT / 'scripts',
-            Path(__file__).resolve().parents[2] / 'openclaw_overlays' / 'scripts',
+            Path(__file__).resolve().parents[2] / 'data_assets' / 'scripts',
         ):
             if (cand / 'cron_command_tasks.py').is_file() and str(cand) not in sys.path:
                 sys.path.insert(0, str(cand))

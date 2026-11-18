@@ -84,7 +84,13 @@ def _get_tool_config(key_path: str, default: Any = None) -> Any:
 
 def get_search_api(default: str = "tavily") -> str:
     """The deployment's default search engine; a per-user preference overrides it."""
-    return str(_get_tool_config('search_api', default))
+    value = str(_get_tool_config('search_api', default))
+    if value.strip().lower() == "openclaw":  # DALTON-HOOK(web-search-gemini)
+        raise ValueError(
+            "search_api: 'openclaw' is no longer supported after OpenClaw retirement; "
+            "configure 'gemini_grounding' or another supported provider."
+        )
+    return value
 
 
 # =============================================================================

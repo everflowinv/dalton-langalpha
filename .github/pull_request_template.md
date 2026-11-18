@@ -20,7 +20,6 @@
 ```text
 ./scripts/dalton/check_hooks.sh --strict --audit
 uv run pytest tests/unit/dalton tests/unit/llms tests/unit/middleware/skills tests/unit/mcp_servers -q
-node --test integrations/openclaw/dalton-langalpha-broker/test/*.test.mjs
 pnpm --dir web typecheck && pnpm --dir web test -- --run
 uv run python scripts/dalton/check_report_claims.py --strict <本 PR 描述保存的文件> <改动的文档>
 ```

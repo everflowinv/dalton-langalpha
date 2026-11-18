@@ -48,7 +48,6 @@ ALLOWED_HOOKS=(
   "tool-guide-research"
   "provenance-declared"
   "provenance-type"
-  "web-search-openclaw"
   "web-search-gemini"
   "x-search-openclaw"
   "x-search-direct"
