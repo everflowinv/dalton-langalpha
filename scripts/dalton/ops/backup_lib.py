@@ -19,10 +19,9 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable
 
 # Secret filename suffixes/patterns (B2).
 _SECRET_EXACT_NAMES = frozenset({".env", ".netrc"})
@@ -434,104 +433,6 @@ def build_tar_exclude_args(
         tar_pat = f"^./{clean}" if "/" in clean else clean
         args.extend(["--exclude", tar_pat])
     return args
-
-
-def normalize_storage_key_prefix(raw: str | None) -> str:
-    """Normalize ``STORAGE_KEY_PREFIX`` matching ``src/utils/storage/key_prefix.py``."""
-    cleaned = (raw or "").strip()
-    if not cleaned:
-        return ""
-    if cleaned.startswith("/") or ".." in cleaned.split("/"):
-        raise ValueError(
-            f"STORAGE_KEY_PREFIX {raw!r} must be a relative path such as 'staging/'"
-        )
-    return cleaned.strip("/")
-
-
-def build_minio_edgar_excludes(
-    bucket: str | None,
-    key_prefix: str | None = None,
-) -> tuple[str, ...]:
-    """Return exact MinIO ``/data`` tar exclude patterns for SEC EDGAR cache.
-
-    Only excludes ``<bucket>/edgar`` (or ``<bucket>/<STORAGE_KEY_PREFIX>/edgar``),
-    never arbitrary ``*/edgar`` directories inside user workspaces or prefixes.
-    """
-    clean_bucket = (bucket or "").strip().strip("/")
-    if not clean_bucket:
-        return ()
-    if "/" in clean_bucket:
-        raise ValueError(f"Storage bucket name must not contain '/': {bucket!r}")
-    clean_prefix = normalize_storage_key_prefix(key_prefix)
-    rel_target = f"{clean_bucket}/{clean_prefix}/edgar" if clean_prefix else f"{clean_bucket}/edgar"
-    return (
-        rel_target,
-        f"{rel_target}/*",
-        f"./{rel_target}",
-        f"./{rel_target}/*",
-    )
-
-
-def resolve_minio_edgar_excludes(
-    prod_env_file: Path | None = None,
-    *,
-    env: Mapping[str, str] | None = None,
-) -> tuple[str, ...]:
-    """Resolve exact MinIO ``edgar/`` exclude patterns from ``.env`` and process env."""
-    env_map = os.environ if env is None else env
-    bucket: str | None = None
-    key_prefix: str | None = None
-    if prod_env_file is not None:
-        bucket = _read_env_var_from_file(prod_env_file, "STORAGE_BUCKET_NAME") or _read_env_var_from_file(
-            prod_env_file, "S3_BUCKET_NAME"
-        )
-        key_prefix = _read_env_var_from_file(prod_env_file, "STORAGE_KEY_PREFIX")
-    if not bucket:
-        bucket = env_map.get("STORAGE_BUCKET_NAME") or env_map.get("S3_BUCKET_NAME")
-    if key_prefix is None:
-        key_prefix = env_map.get("STORAGE_KEY_PREFIX")
-    return build_minio_edgar_excludes(bucket, key_prefix)
-
-
-def build_minio_tar_exclude_args(
-    excludes: str | Iterable[str] | None = None,
-    *,
-    prod_env_file: Path | None = None,
-) -> list[str]:
-    """Build ``--exclude <pattern>`` flags for BusyBox ``tar`` on MinIO ``/data``."""
-    patterns = (
-        parse_pattern_list(excludes)
-        if excludes is not None and (not isinstance(excludes, str) or excludes.strip())
-        else ()
-    )
-    if not patterns and excludes in (None, ""):
-        patterns = resolve_minio_edgar_excludes(prod_env_file)
-    args: list[str] = []
-    for raw_pat in patterns:
-        clean = raw_pat.strip().rstrip("/")
-        if not clean:
-            continue
-        args.extend(["--exclude", clean])
-    return args
-
-
-def build_minio_tar_cmd(
-    data_dir: str = "/data",
-    excludes: str | Iterable[str] | None = None,
-    *,
-    prod_env_file: Path | None = None,
-) -> list[str]:
-    """Build the streaming ``tar`` command for MinIO ``/data`` inside the helper container."""
-    exclude_args = build_minio_tar_exclude_args(excludes, prod_env_file=prod_env_file)
-    return [
-        "tar",
-        *exclude_args,
-        "-czf",
-        "-",
-        "-C",
-        data_dir,
-        ".",
-    ]
 
 
 def _escape_posix_bre(text: str) -> str:
@@ -1283,76 +1184,6 @@ def stream_cap_stdout(
     return True, total
 
 
-class _TarCapExceeded(Exception):
-    pass
-
-
-class _CountingTarDst:
-    def __init__(self, inner: Any, max_bytes: int) -> None:
-        self._inner = inner
-        self._max_bytes = max_bytes
-        self.total = 0
-
-    def write(self, data: bytes) -> int:
-        n = len(data)
-        if self._max_bytes > 0 and self.total + n > self._max_bytes:
-            self.total += n
-            raise _TarCapExceeded()
-        self.total += n
-        return self._inner.write(data)
-
-    def flush(self) -> None:
-        self._inner.flush()
-
-
-def is_excluded_sandbox_tar_member(member_name: str) -> bool:
-    """Return True iff ``member_name`` is a workspace's rebuildable ``data/sec/`` cache.
-
-    ``docker cp <container>:/home/workspace -`` roots every entry at ``workspace/``.
-    Matches ``workspace/<ws>/data/sec(/...)`` (split workspaces) and
-    ``workspace/data/sec(/...)`` (unsplit computer root), never nested ``data/sec``
-    or other ``sec`` directories.
-    """
-    clean = member_name.replace("\\", "/").strip("/")
-    while clean.startswith("./"):
-        clean = clean[2:].lstrip("/")
-    parts = [p for p in clean.split("/") if p]
-    if len(parts) >= 3 and parts[0] == "workspace" and parts[1] == "data" and parts[2] == "sec":
-        return True
-    if len(parts) >= 4 and parts[0] == "workspace" and parts[2] == "data" and parts[3] == "sec":
-        return True
-    return False
-
-
-def sandbox_tar_cap_stdout(
-    src_stream: Any,
-    dst_stream: Any,
-    *,
-    max_bytes: int,
-) -> tuple[bool, int]:
-    """Filter per-workspace ``data/sec/`` from a ``docker cp`` tar stream and cap output bytes."""
-    counting = _CountingTarDst(dst_stream, max_bytes)
-    t_out = tarfile.open(fileobj=counting, mode="w|", format=tarfile.PAX_FORMAT)
-    try:
-        with tarfile.open(fileobj=src_stream, mode="r|") as t_in:
-            for member in t_in:
-                if is_excluded_sandbox_tar_member(member.name):
-                    continue
-                if member.islnk() and is_excluded_sandbox_tar_member(member.linkname):
-                    continue
-                fobj = t_in.extractfile(member) if member.isfile() else None
-                try:
-                    t_out.addfile(member, fobj)
-                finally:
-                    if fobj is not None:
-                        fobj.close()
-        t_out.close()
-    except _TarCapExceeded:
-        return False, counting.total
-    counting.flush()
-    return True, counting.total
-
-
 def stream_hash_and_forward(
     src_stream: Any,
     dst_stream: Any,
@@ -1892,40 +1723,6 @@ def _cmd_var_dalton_tar_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_minio_tar_cmd(args: argparse.Namespace) -> int:
-    excludes: str | None = None if args.excludes is None else args.excludes
-    prod_env_file = Path(args.prod_env_file) if args.prod_env_file else None
-    cmd = build_minio_tar_cmd(
-        data_dir=args.data_dir,
-        excludes=excludes,
-        prod_env_file=prod_env_file,
-    )
-    sys.stdout.buffer.write(b"\0".join(tok.encode("utf-8") for tok in cmd) + b"\0")
-    sys.stdout.buffer.flush()
-    return 0
-
-
-def _cmd_sandbox_tar_cap_stdout(args: argparse.Namespace) -> int:
-    try:
-        ok, total = sandbox_tar_cap_stdout(
-            sys.stdin.buffer,
-            sys.stdout.buffer,
-            max_bytes=int(args.max_bytes),
-        )
-    except (tarfile.TarError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    except BrokenPipeError:
-        return 1
-    if not ok:
-        print(
-            f"Stream exceeded limit ({total} > {args.max_bytes} bytes)",
-            file=sys.stderr,
-        )
-        return STREAM_CAP_EXIT_CODE
-    return 0
-
-
 def _cmd_should_retry_tar(args: argparse.Namespace) -> int:
     try:
         ok = should_retry_tar_failure(
@@ -1995,10 +1792,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_cap_out.add_argument("--require-prefix", default="")
     p_cap_out.set_defaults(func=_cmd_stream_cap_stdout)
 
-    p_sb_cap = sub.add_parser("sandbox-tar-cap-stdout")
-    p_sb_cap.add_argument("--max-bytes", type=int, required=True)
-    p_sb_cap.set_defaults(func=_cmd_sandbox_tar_cap_stdout)
-
     p_shm = sub.add_parser("stream-hash-meta")
     p_shm.add_argument("--meta-out", required=True)
     p_shm.set_defaults(func=_cmd_stream_hash_meta)
@@ -2067,12 +1860,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_vt.add_argument("--sqlite-path", action="append", default=[])
     p_vt.add_argument("--staging-dir", default="")
     p_vt.set_defaults(func=_cmd_var_dalton_tar_cmd)
-
-    p_mt = sub.add_parser("minio-tar-cmd")
-    p_mt.add_argument("--data-dir", default="/data")
-    p_mt.add_argument("--prod-env-file", default="")
-    p_mt.add_argument("--excludes", default=None)
-    p_mt.set_defaults(func=_cmd_minio_tar_cmd)
 
     p_rt = sub.add_parser("should-retry-tar")
     p_rt.add_argument("--attempt", type=int, required=True)

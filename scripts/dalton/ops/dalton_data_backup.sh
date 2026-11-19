@@ -56,7 +56,6 @@ WEEKLY_ROOT="${DALTON_WEEKLY_BACKUP_ROOT:-${EXT_MOUNT_ROOT}/Dalton/backups/weekl
 EXT_TMP_ROOT="${DALTON_EXTERNAL_TMP_ROOT:-${EXT_MOUNT_ROOT}/Dalton/backups/.tmp}"
 
 MINIO_VOLUME="${DALTON_MINIO_VOLUME:-dalton-langalpha_dalton-minio-data}"
-MINIO_EXCLUDES="${DALTON_MINIO_EXCLUDES:-}"
 DOCKER_HELPER_IMAGE="${DALTON_DOCKER_HELPER_IMAGE:-alpine:3.20}"
 SANDBOX_PREFIX="${DALTON_SANDBOX_CONTAINER_PREFIX:-langalpha-sandbox-}"
 SANDBOX_MAX_GB="${DALTON_SANDBOX_MAX_SIZE_GB:-5}"
@@ -197,24 +196,13 @@ MINIO_PARTIAL_OBJ="${MINIO_FINAL_OBJ}.partial-${RAND_MINIO}"
 MINIO_META="${RUN_TMP_DIR}/minio.meta.json"
 CURRENT_PARTIAL_OBJ="${MINIO_PARTIAL_OBJ}"
 
-MINIO_TAR_CMD=()
-while IFS= read -r -d '' tok; do
-    MINIO_TAR_CMD+=("${tok}")
-done < <("${PY_BIN}" "${BACKUP_LIB}" minio-tar-cmd \
-    --data-dir "/data" \
-    --prod-env-file "${PROD_ENV_FILE}" \
-    --excludes "${MINIO_EXCLUDES}")
-if [[ "${#MINIO_TAR_CMD[@]}" -lt 5 ]] || [[ "${MINIO_TAR_CMD[0]}" != "tar" ]]; then
-    fail_with_alert "MINIO_BACKUP_FAILED" "Failed to construct MinIO tar command"
-fi
-
 log_msg "INFO" "Streaming MinIO volume ${MINIO_VOLUME} -> ${MINIO_PARTIAL_OBJ}"
 suspend_err_trap
 set +e
 docker run --rm \
     -v "${MINIO_VOLUME}:/data:ro" \
     "${DOCKER_HELPER_IMAGE}" \
-    "${MINIO_TAR_CMD[@]}" 2>"${RUN_TMP_DIR}/minio.err" \
+    tar czf - -C /data . 2>"${RUN_TMP_DIR}/minio.err" \
     | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${DALTON_BACKUP_KEY_FILE}" 2>"${RUN_TMP_DIR}/minio-enc.err" \
     | "${PY_BIN}" "${BACKUP_LIB}" stream-hash-meta --meta-out "${MINIO_META}" 2>"${RUN_TMP_DIR}/minio-hash.err" \
     | rclone_noproxy rcat "${MINIO_PARTIAL_OBJ}" \
@@ -259,7 +247,7 @@ if [[ -n "${SANDBOX_CONTAINERS}" ]]; then
         suspend_err_trap
         set +e
         docker cp "${cname}:/home/workspace" - 2>"${CP_ERR_FILE}" \
-            | "${PY_BIN}" "${BACKUP_LIB}" sandbox-tar-cap-stdout --max-bytes "${MAX_SANDBOX_BYTES}" 2>"${RUN_TMP_DIR}/cap-${SAFE_NAME}.err" \
+            | "${PY_BIN}" "${BACKUP_LIB}" stream-cap-stdout --max-bytes "${MAX_SANDBOX_BYTES}" 2>"${RUN_TMP_DIR}/cap-${SAFE_NAME}.err" \
             | gzip -c 2>"${RUN_TMP_DIR}/gzip-${SAFE_NAME}.err" \
             | openssl enc -aes-256-cbc -pbkdf2 -salt -pass "file:${DALTON_BACKUP_KEY_FILE}" 2>"${RUN_TMP_DIR}/enc-${SAFE_NAME}.err" \
             | "${PY_BIN}" "${BACKUP_LIB}" stream-hash-meta --meta-out "${SB_META}" 2>"${RUN_TMP_DIR}/hash-${SAFE_NAME}.err" \
