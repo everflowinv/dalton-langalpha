@@ -2077,3 +2077,21 @@ def test_hk_history_keeps_the_stored_file_when_only_unadjusted_bars_exist(tmp_pa
     res = hkf.download_history(["09986"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
     assert res["n_errors"] == 0
     assert (hist / "09986.csv").read_text(encoding="utf-8") == original
+
+
+def test_hk_history_ignores_bad_bars_before_hist_start():
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk00700": {"qfqday": [
+                ["2022-01-05", "-1", "-1", "-1", "-1", "1"],  # before HIST_START, negative
+                ["2026-11-18", "2", "2", "2", "2", "1"],
+                ["2026-11-19", "2", "2", "2", "2", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    rows = hkf.fetch_hist_one(sess, "00700")
+    assert [r[0] for r in rows] == ["2026-11-18", "2026-11-19"]
+    assert rows.raw_count == 3

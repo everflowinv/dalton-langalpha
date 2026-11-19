@@ -552,6 +552,12 @@ def build_universe(
     return uni, meta
 
 
+class HistBars(list):
+    """Validated bars plus how many the upstream response held."""
+
+    raw_count: int = 0
+
+
 class NoAdjustedHistory(RuntimeError):
     """Tencent has only unadjusted bars for the code (typically delisted)."""
 
@@ -583,7 +589,8 @@ def fetch_hist_one(
         if d.get("day"):
             raise NoAdjustedHistory(code)
         raise RuntimeError(f"历史行情返回空列表 ({code})")
-    out: list[list[Any]] = []
+    out = HistBars()
+    out.raw_count = len(rows)
     seen_dates: set[str] = set()
     bad_rows = 0
     for row in rows:
@@ -603,6 +610,10 @@ def fetch_hist_one(
                 or not math.isfinite(lo)
                 or not math.isfinite(vol)
             ):
+                if d_str < HIST_START:
+                    # Bars before HIST_START are never written; a bad one there
+                    # must not sink the bars that are kept.
+                    continue
                 bad_rows += 1
                 continue
             rec: list[Any] = [d_str, o, c, h, lo, vol]
@@ -703,13 +714,15 @@ def download_history(
                     window_start = min(new_dates)
                     if window_start > max(prev_dates):
                         raise RuntimeError(f"历史响应与已有记录不重叠 ({code})")
-                    owed = prev_dates if len(rows) < HIST_BARS else {d for d in prev_dates if d >= window_start}
+                    raw_count = getattr(rows, "raw_count", len(rows))
+                    kept = {d for d in prev_dates if d >= HIST_START}
+                    owed = kept if raw_count < HIST_BARS else {d for d in kept if d >= window_start}
                     missing_old = owed - new_date_set
                     if missing_old:
                         raise RuntimeError(
                             f"历史响应丢失原有日期 ({code}: 缺失 {len(missing_old)} 天)"
                         )
-                if new_dates and len(rows) >= HIST_BARS and min(new_dates) > HIST_START:
+                if new_dates and getattr(rows, "raw_count", len(rows)) >= HIST_BARS and min(new_dates) > HIST_START:
                     # Only a full window that no longer reaches HIST_START needs
                     # attention; a short history is just a later listing.
                     logger.warning(
