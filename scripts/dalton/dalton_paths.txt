@@ -493,3 +493,5 @@ scripts/dalton/ops/host_services_switch.sh
 scripts/dalton/ops/ops-alerts.json.example
 tests/unit/dalton/test_guidepoint_cli.py
 tests/unit/dalton/test_host_services_switch.py
+web/src/pages/ChatAgent/components/__tests__/ChatView.attachmentCount.test.tsx
+web/src/pages/MarketView/__tests__/MarketView.screenshotCap.test.tsx

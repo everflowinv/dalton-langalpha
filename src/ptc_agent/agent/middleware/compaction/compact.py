@@ -87,6 +87,7 @@ from ptc_agent.agent.middleware.compaction.offloading import (
     tool_call_ids,
 )
 from ptc_agent.agent.middleware.thinking_binding import (
+    shrink_block_ids,  # DALTON-HOOK(attachment-native-cap)
     shrink_ids,  # DALTON-HOOK(attachment-native-cap)
     thinking_after,
     without_thinking,
@@ -187,7 +188,7 @@ class Compaction:
         live = tool_call_ids(self.preserved)
         args, reads = recorded_offloads(state)
         kept = {msg.id for msg in self.preserved}
-        return {
+        update: dict[str, Any] = {
             "_summarization_event": self.event,
             "_offloaded_tool_call_ids": args & live,
             "_offloaded_read_result_ids": reads & live,
@@ -201,6 +202,9 @@ class Compaction:
             "_cached_input_tokens": 0,
             "_cached_output_tokens": 0,
         }
+        if left_out := state.get("_left_out_image_blocks"):
+            update["_left_out_image_blocks"] = shrink_block_ids(left_out, kept)
+        return update
 
 
 @dataclass(frozen=True)

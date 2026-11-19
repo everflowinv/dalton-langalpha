@@ -75,7 +75,9 @@ export const MAX_TOTAL_ATTACHMENTS_BYTES = 60 * 1024 * 1024;
 // DALTON-HOOK(chat-large-upload): per-file (200 MiB) and per-message (600 MiB) caps for stored uploads;
 // MAX_FILE_SIZE (30 MiB) and MAX_TOTAL_ATTACHMENTS_BYTES (60 MiB) remain the small-file budget.
 export { MAX_CHAT_UPLOAD_FILE_SIZE, MAX_TOTAL_CHAT_UPLOAD_BYTES };
-export const MAX_FILES = 5;
+// DALTON-HOOK(chat-attachment-count): 10 files per message (upstream 5), matching the
+// server cap MAX_UPLOADED_PER_TURN and Dalton MAX_MESSAGE_ATTACHMENTS.
+export const MAX_FILES = 10;
 export const PASTE_PILL_MIN_CHARS = 1500;
 export const PASTE_PILL_MIN_LINES = 15;
 

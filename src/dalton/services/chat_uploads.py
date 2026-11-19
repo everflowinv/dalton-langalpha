@@ -60,13 +60,16 @@ _MIB = 1024 * 1024
 
 MAX_CHAT_UPLOAD_BYTES = 200 * _MIB
 MAX_TOTAL_MESSAGE_UPLOAD_BYTES = 600 * _MIB
-MAX_MESSAGE_ATTACHMENTS = 5
+# Same as the composer (web MAX_FILES) and upstream MAX_UPLOADED_PER_TURN.
+MAX_MESSAGE_ATTACHMENTS = 10
 
 MAX_INLINE_FILE_BYTES = 30 * _MIB
 MAX_INLINE_TOTAL_BYTES = 60 * _MIB
 
 CHAT_UPLOAD_PART_SIZE = 8 * _MIB
-MAX_ACTIVE_USER_UPLOADS = 10
+# Leave headroom for one workspace switch before prior cancellations settle;
+# total unaccepted byte quota below stays unchanged.
+MAX_ACTIVE_USER_UPLOADS = 2 * MAX_MESSAGE_ATTACHMENTS
 MAX_ACTIVE_USER_UPLOAD_BYTES = 1000 * _MIB
 
 UPLOADING_TTL = timedelta(hours=6)
