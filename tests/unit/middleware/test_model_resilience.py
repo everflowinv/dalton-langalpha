@@ -1624,7 +1624,7 @@ class TestDroppedThinkingReport:
 # --- DALTON-HOOK(model-fallback-identity): begin ---
 class TestFallbackIdentity:
     """A single-call non-Claude fallback tells the fallback model which model
-    it is and which server-designated model in ``<model>`` it stands in for,
+    it is and which server-designated model it stands in for,
     on both main-agent and subagent paths; Claude fallbacks stay untouched so
     ``SystemPinMiddleware`` preserves the pinned system prompt for bound thinking."""
 
@@ -1707,8 +1707,8 @@ class TestFallbackIdentity:
         assert "[Fallback call]" not in seen_texts[0]
         assert (
             "[Fallback call] This individual call was moved to fallback model "
-            "GPT Fallback (gpt-fallback) (the server-designated model in "
-            "<model> is Claude Primary (claude-primary), reasoning effort high)."
+            "GPT Fallback (gpt-fallback); the model the server designated for this run "
+            "is Claude Primary (claude-primary), reasoning effort high."
         ) in seen_texts[1]
         assert "You run on Claude Primary (claude-primary)" in seen_texts[1]
 
@@ -1865,8 +1865,8 @@ class TestFallbackIdentity:
         assert "[Fallback call]" not in seen_texts[0]
         assert (
             "[Fallback call] This individual call was moved to fallback model "
-            "Spare Model (spare-model) (the server-designated model in "
-            "<model> is Sub Model (sub-model), reasoning effort low)."
+            "Spare Model (spare-model); the model the server designated for this run "
+            "is Sub Model (sub-model), reasoning effort low."
         ) in seen_texts[1]
         assert "Main Model" not in seen_texts[1]
 
@@ -1901,5 +1901,5 @@ class TestFallbackIdentity:
         assert len(seen_texts) == 2
         assert "[Fallback call]" not in seen_texts[0]
         assert "fallback model fallback-sync" in seen_texts[1]
-        assert "is primary-sync)." in seen_texts[1]
+        assert "is primary-sync." in seen_texts[1]
 # --- DALTON-HOOK(model-fallback-identity): end ---

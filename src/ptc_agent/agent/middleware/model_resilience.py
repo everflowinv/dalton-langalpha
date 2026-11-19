@@ -388,8 +388,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
         fallback_client: Any,
     ) -> ModelRequest:
         """Attach a request-only note on non-Claude fallback calls so the model
-        knows its own identity and which designated model in ``<model>`` it
-        stands in for; Claude fallbacks stay untouched so ``SystemPinMiddleware``
+        knows its own identity and which designated model it stands in for (named
+        directly, since not every graph renders a ``<model>`` block); Claude fallbacks stay untouched so ``SystemPinMiddleware``
         keeps the pinned system message intact for bound thinking."""
         from ptc_agent.agent.middleware.compaction.measure import is_claude
 
@@ -407,7 +407,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
         )
         note = (
             f"[Fallback call] This individual call was moved to fallback model "
-            f"{fallback_label} (the server-designated model in <model> is {primary_label})."
+            f"{fallback_label}; the model the server designated for this run is {primary_label}."
         )
         try:
             return req.override(
