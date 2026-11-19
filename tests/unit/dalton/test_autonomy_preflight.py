@@ -5048,7 +5048,8 @@ def _attach_stateful_release(
 
     async def _stateful_release(
         execution_id: str,
-        workspace_id: str | None = None,
+        *,
+        conn: Any = None,
     ) -> int:
         exec_uuid = watch_db._signal_exec_uuid(execution_id)
         released = 0
@@ -5057,7 +5058,6 @@ def _attach_stateful_release(
                 row.get("woken_execution_id") == exec_uuid
                 and row.get("resolved_at") is None
                 and row.get("expired_at") is None
-                and (not workspace_id or str(row.get("workspace_id")) == str(workspace_id))
             ):
                 row["woken_execution_id"] = None
                 row["woken_at"] = None
@@ -5177,12 +5177,11 @@ async def test_release_signals_claimed_by_sql_and_relist_unwoken(
             assert "woken_execution_id = %s" in normalized
             assert "resolved_at IS NULL" in normalized
             assert "expired_at IS NULL" in normalized
-            assert "workspace_id = %s" in normalized
-            q_exec, q_ws = params
+            assert "workspace_id" not in normalized.split("WHERE", 1)[1]
+            (q_exec,) = params
             for row in rows.values():
                 if (
                     str(row["woken_execution_id"]) == str(q_exec)
-                    and str(row["workspace_id"]) == str(q_ws)
                     and row["resolved_at"] is None
                     and row["expired_at"] is None
                 ):
@@ -5221,15 +5220,17 @@ async def test_release_signals_claimed_by_sql_and_relist_unwoken(
         create_autospec(watch_db.get_db_connection, side_effect=_conn_ctx),
     )
 
-    released = await watch_db.release_signals_claimed_by(exec_1, workspace_id=ws_1)
-    assert released == 1
+    # The execution id alone identifies the claim (the automation may have moved
+    # workspace since it claimed), so the row in the other workspace goes too.
+    released = await watch_db.release_signals_claimed_by(exec_1)
+    assert released == 2
     assert rows["active_exec1"]["woken_execution_id"] is None
     assert rows["active_exec1"]["woken_at"] is None
     assert rows["active_exec1"]["payload"]["status"] == "pending"
     assert rows["resolved_exec1"]["woken_execution_id"] == uuid.UUID(exec_1)
     assert rows["expired_exec1"]["woken_execution_id"] == uuid.UUID(exec_1)
     assert rows["active_exec2"]["woken_execution_id"] == uuid.UUID(exec_2)
-    assert rows["active_other_ws"]["woken_execution_id"] == uuid.UUID(exec_1)
+    assert rows["active_other_ws"]["woken_execution_id"] is None
 
     unwoken = await _REAL_LIST_UNWOKEN_SIGNALS(ws_1)
     assert [r["signal_key"] for r in unwoken] == ["sec:form4:release-me"]
@@ -5240,7 +5241,7 @@ async def test_release_signals_claimed_by_sql_and_relist_unwoken(
 async def test_release_claimed_signals_on_non_completed_settle_guards_and_error_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """非 Dalton 自动化直接跳过；释放异常仅记日志并返回 0，不破坏结算。"""
+    """非 Dalton 自动化直接跳过；释放异常向上抛出，让结算事务回滚（不吞掉）。"""
     from src.dalton.autonomy import preflight as preflight_mod
 
     release_mock = create_autospec(
@@ -5250,20 +5251,21 @@ async def test_release_claimed_signals_on_non_completed_settle_guards_and_error_
     monkeypatch.setattr(watch_db, "release_signals_claimed_by", release_mock)
 
     non_dalton = {"automation_id": "auto-plain", "name": "user-cron", "workspace_id": _PREFLIGHT_WS}
+    conn = object()
     assert await preflight_mod.release_claimed_signals_on_non_completed_settle(
+        conn,
         automation=non_dalton,
         execution_id="exec-plain-1",
-        workspace_id=_PREFLIGHT_WS,
     ) == 0
     release_mock.assert_not_awaited()
 
-    err_count = await preflight_mod.release_claimed_signals_on_non_completed_settle(
-        automation=_company_watch_automation(),
-        execution_id="exec-dalton-err-1",
-        workspace_id=_PREFLIGHT_WS,
-    )
-    assert err_count == 0
-    release_mock.assert_awaited_once_with("exec-dalton-err-1", workspace_id=_PREFLIGHT_WS)
+    with pytest.raises(RuntimeError, match="db temporary down"):
+        await preflight_mod.release_claimed_signals_on_non_completed_settle(
+            conn,
+            automation=_company_watch_automation(),
+            execution_id="exec-dalton-err-1",
+        )
+    release_mock.assert_awaited_once_with("exec-dalton-err-1", conn=conn)
 
 
 @pytest.mark.asyncio
@@ -5319,7 +5321,7 @@ async def test_executor_recovery_lookup_fails_three_times_releases_signal_for_ne
     assert failing_list_claimed.await_count == 3
     assert len(settlement_state["settled_calls"]) == 1
     assert settlement_state["settled_calls"][0]["to"] == "failed"
-    release_spy.assert_awaited_once_with(exec_1, workspace_id=_PREFLIGHT_WS)
+    assert release_spy.await_count == 1 and release_spy.await_args.args[0] == exec_1
     stored = next(iter(store["rows"].values()))
     assert stored["woken_execution_id"] is None
     assert stored["payload"]["status"] == "pending"
@@ -5389,7 +5391,7 @@ async def test_executor_ownership_timeout_skips_and_releases_claimed_signal_for_
     assert len(settlement_state["settled_calls"]) == 1
     assert settlement_state["settled_calls"][0]["to"] == "skipped"
     assert settlement_state["settled_calls"][0]["skip_reason"] == "precheck"
-    release_spy.assert_awaited_once_with(exec_1, workspace_id=_PREFLIGHT_WS)
+    assert release_spy.await_count == 1 and release_spy.await_args.args[0] == exec_1
     stored = next(iter(store["rows"].values()))
     assert stored["woken_execution_id"] is None
     assert stored["payload"]["status"] == "pending"

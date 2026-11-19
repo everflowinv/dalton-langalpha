@@ -1653,7 +1653,8 @@ async def test_dalton_non_completed_settlement_releases_claimed_signals(
         await drain_tails()
 
     assert settled is True
-    release_mock.assert_awaited_once_with(_EID, workspace_id="ws-meta-1")
+    # Released inside the settlement transaction, on its connection.
+    release_mock.assert_awaited_once_with(_EID, conn=_CONN)
 
 
 @pytest.mark.asyncio
