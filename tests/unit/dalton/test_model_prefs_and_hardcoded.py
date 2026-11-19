@@ -36,10 +36,9 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/notional_pricing.py", "-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{candidate}-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{identity}-oauth"): "Nominal pricing model reference normalization",
-    # The two Grok keys Dalton pins to its own xai-oauth line
-    # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entries on grok-oauth).
+    # The Grok key Dalton pins to its own xai-oauth line
+    # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entry on grok-oauth).
     ("llm/overlay.py", "grok-4.7-oauth"): "Pinned overlay route key",
-    ("llm/overlay.py", "grok-4.3-oauth"): "Pinned overlay route key",
     # Vendor-family prefixes moved out of the removed broker catalog (OC-5).
     ("llm/model_family.py", "-oauth"): "Strip -oauth before the family prefix match",
     ("llm/model_family.py", "claude-"): "Claude family prefix",
@@ -167,8 +166,6 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     # Fallback nominal rate table in budget/service.py when models.json price card is unavailable
     ("llm/notional_pricing.py", "claude-opus-5-5-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "claude-opus-5-5-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("llm/notional_pricing.py", "gemini-3.8-flash-low-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("llm/notional_pricing.py", "gemini-3.8-flash-medium-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gemini-4-argon-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gemini-4-neon-low-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gemini-4-neon-medium-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
@@ -550,6 +547,12 @@ async def test_restore_probe_models_budget_fallback_and_complete_empty_model_gua
         )
         == "gpt-6.2-sol-oauth"
     )
+    assert (
+        ps_mod._pick_probe_model(
+            "gemini", ["gemini-3.1-flash-lite", "gemini-4-argon"], {}
+        )
+        == "gemini-4-argon"
+    )
 
     # 2. _notional_price_index retains fallback nominal rates when price card is empty/missing
     monkeypatch.setattr(
@@ -644,7 +647,7 @@ async def test_provider_status_uses_dalton_model_pref_for_assist_and_reviewer_ro
     prefs_by_user: dict[str, dict[str, Any]] = {
         "user-status": {
             "model_preference": {
-                "dalton_assist_model": "gemini-3.8-flash-low-oauth",
+                "dalton_assist_model": "gemini-4-hydrogen-low-oauth",
                 "dalton_assist_fallback_models": ["grok-4.7-oauth"],
                 "dalton_reviewer_models": ["deepseek-flash", "gpt-6.1-sol-oauth"],
             }
@@ -669,7 +672,7 @@ async def test_provider_status_uses_dalton_model_pref_for_assist_and_reviewer_ro
             ps_mod.explain_model_availability,
             return_value={
                 "claude-opus-5-5-oauth": {"available": True},
-                "gemini-3.8-flash-low-oauth": {"available": True},
+                "gemini-4-hydrogen-low-oauth": {"available": True},
                 "grok-4.7-oauth": {"available": True},
                 "deepseek-flash": {"available": True},
                 "gpt-6.1-sol-oauth": {"available": True},

@@ -1,8 +1,8 @@
-"""X search through the xAI Responses API, the same route as grok-4.3-oauth.
+"""通过 xai-oauth CLI 代理调用 xAI Responses API 执行 X 搜索。
 
 The base URL is the ``xai-oauth`` provider in ``native_overlay.json``. Request
 headers come from ``ChatGrokOpenAI`` (the chat client), not a second copy of
-those constants. The body asks for the ``x_search`` tool on ``grok-4.3`` with
+those constants. The body asks for the ``x_search`` tool on ``X_SEARCH_MODEL`` with
 ``store: false``. ``stream: true`` matches ``ChatGrokOpenAI._get_request_payload``,
 which forces it; the CLI proxy rejects a non-streaming body. The HTTP client
 still reads the whole response. ``max_turns`` is the assumed name for

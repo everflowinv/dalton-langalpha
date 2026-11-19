@@ -497,7 +497,7 @@ def main() -> int:
             # 4. Probe configured providers (cash DeepSeek via user BYOK key + Antigravity OAuth subscription models) + 1 unconfigured provider under pm_user
             configured_probes: list[tuple[str, dict[str, Any]]] = [
                 ("deepseek", {"model_key": "deepseek-flash"}),
-                ("antigravity-oauth", {"model_key": "gemini-3.8-flash-low-oauth"}),
+                ("antigravity-oauth", {"model_key": "gemini-4-hydrogen-low-oauth"}),
                 ("antigravity-oauth", {"model_key": "claude-sonnet-5-5-low-oauth"}),
             ]
             probe_results: list[dict[str, Any]] = []

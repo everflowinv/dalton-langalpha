@@ -11,7 +11,7 @@ Checks in order:
    - Local working tree is clean (`git_dirty == False`).
    - Backend `git_sha` equals local `HEAD` (`git_sha`), and `backend_git_dirty == False`.
 3. `conversation_transport`:
-   - Sends a minimal `POST /api/v1/threads/messages` turn as `realrun-pm-a` using a subscription model (`gemini-3.8-flash-low-oauth`),
+   - Sends a minimal `POST /api/v1/threads/messages` turn as `realrun-pm-a` using a subscription model (`gemini-4-hydrogen-low-oauth`),
      verifying HTTP 200 (covering the Redis wake listener pool) and a `conversation_usages` row recorded under `user_id == "realrun-pm-a"` with `cash_usd == 0.0`.
 4. `bridge`:
    - `http://127.0.0.1:8960/healthz` returns 200 and one real MCP `tools/call` read succeeds.
@@ -634,7 +634,7 @@ def _restore_subagent_state(
 
 def check_conversation_transport(
     base_url: str,
-    model: str = "gemini-3.8-flash-low-oauth",
+    model: str = "gemini-4-hydrogen-low-oauth",
     *,
     oauth_provenance: dict[str, Any] | None = None,
     dsn: str | None = None,
@@ -874,7 +874,7 @@ def run_all_checks(
     *,
     backend_url: str = "http://127.0.0.1:8000",
     bridge_url: str = "http://127.0.0.1:8960",
-    transport_model: str = "gemini-3.8-flash-low-oauth",
+    transport_model: str = "gemini-4-hydrogen-low-oauth",
     strict_static_scan: bool = False,
     skip_oauth_and_transport: bool = False,
 ) -> dict[str, Any]:
@@ -935,7 +935,7 @@ def main() -> int:
     parser.add_argument("--bridge", default="http://127.0.0.1:8960", help="ResearchData bridge base URL")
     parser.add_argument(
         "--model",
-        default="gemini-3.8-flash-low-oauth",
+        default="gemini-4-hydrogen-low-oauth",
         help="Subscription model for transport probe (cash_usd == 0)",
     )
     parser.add_argument("--strict-static-scan", action="store_true", help="Fail on pre-J3 legacy script items")

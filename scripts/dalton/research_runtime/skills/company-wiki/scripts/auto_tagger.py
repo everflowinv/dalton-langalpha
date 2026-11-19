@@ -394,7 +394,7 @@ def auto_tag(content: str, config: dict, get_client_fn=None, verbose: bool = Fal
         return empty_result
 
     max_chars = tagger_config.get("max_input_chars", 30000)
-    model = tagger_config.get("model", "gemini-3.8-flash")
+    model = tagger_config.get("model", "gemini-4-hydrogen")
     if model.startswith("google/"):
         model = model[len("google/"):]
 
@@ -410,7 +410,7 @@ def auto_tag(content: str, config: dict, get_client_fn=None, verbose: bool = Fal
     limiter = _get_rate_limiter(config)
 
     if tagger_config.get("provider", "agy") == "agy":
-        agy_model = tagger_config.get("agy_model", "gemini-3.8-flash-low")
+        agy_model = tagger_config.get("agy_model", "gemini-4-hydrogen-low")
         try:
             limiter.wait()
             raw_text = _call_agy(prompt, agy_model,

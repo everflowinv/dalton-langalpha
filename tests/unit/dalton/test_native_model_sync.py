@@ -955,7 +955,7 @@ async def test_native_model_check_ok_records_run_and_in_use_refs(monkeypatch):
         "_collect_reference_map",
         create_autospec(
             na._collect_reference_map,
-            return_value={"grok-4.3-oauth": ["agent_config.llm.name", "user:u1:preferred_model"]},
+            return_value={"grok-4.7-build-fast-oauth": ["agent_config.llm.name", "user:u1:preferred_model"]},
         ),
     )
 
@@ -964,7 +964,7 @@ async def test_native_model_check_ok_records_run_and_in_use_refs(monkeypatch):
     assert result["counts"]["providers_ok"] == 1
     assert [i["suggested_key"] for i in result["diff"]["added"]] == ["grok-4.9-oauth"]
     deprecated_by_key = {d["key"]: d for d in result["diff"]["deprecated"]}
-    assert deprecated_by_key["grok-4.3-oauth"]["in_use_by"] == [
+    assert deprecated_by_key["grok-4.7-build-fast-oauth"]["in_use_by"] == [
         "agent_config.llm.name",
         "user:u1:preferred_model",
     ]
