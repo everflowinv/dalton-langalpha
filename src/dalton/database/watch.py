@@ -6,12 +6,12 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
+import psycopg
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from src.server.database.pool import get_db_connection
-
 
 HOME_WORKSPACE_SENTINEL = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
@@ -564,7 +564,17 @@ async def release_signals_claimed_by(
             return len(rows or [])
 
     if conn is not None:
-        return await _run(conn)
+        # Inside the settlement transaction: run in a savepoint and retry once on a
+        # transient error, so a single cancelled statement does not roll back (and
+        # re-settle as FAILED) an execution that was merely skipped.
+        for attempt in range(2):
+            try:
+                async with conn.transaction():
+                    return await _run(conn)
+            except (psycopg.errors.QueryCanceled, psycopg.OperationalError):
+                if attempt == 1:
+                    raise
+        return 0
     async with get_db_connection() as own:
         return await _run(own)
 

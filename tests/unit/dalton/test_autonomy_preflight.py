@@ -5407,3 +5407,38 @@ async def test_executor_ownership_timeout_skips_and_releases_claimed_signal_for_
     assert next_res.should_wake is True
     assert [s["signal_key"] for s in next_res.signals] == ["sec:8k:codex-case-2"]
     assert stored["woken_execution_id"] == watch_db._signal_exec_uuid(exec_2)
+
+
+@pytest.mark.asyncio
+async def test_release_in_settlement_transaction_retries_a_cancelled_statement_once() -> None:
+    import psycopg
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncConnection, AsyncCursor
+
+    calls = {"n": 0}
+    cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    cur.execute.side_effect = _exec
+    cur.fetchall.return_value = [{"signal_id": "s1"}]
+
+    @asynccontextmanager
+    async def _cursor(**_kw: Any):
+        yield cur
+
+    @asynccontextmanager
+    async def _savepoint():
+        yield None
+
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.cursor.side_effect = _cursor
+    conn.transaction.side_effect = _savepoint
+
+    released = await watch_db.release_signals_claimed_by("exec-retry-1", conn=conn)
+    assert released == 1
+    assert calls["n"] == 2
+    assert conn.transaction.call_count == 2
