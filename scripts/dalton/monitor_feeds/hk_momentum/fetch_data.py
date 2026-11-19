@@ -552,6 +552,14 @@ def build_universe(
     return uni, meta
 
 
+class NoAdjustedHistory(RuntimeError):
+    """Tencent has only unadjusted bars for the code (typically delisted)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"历史行情无前复权数据 ({code})")
+        self.code = code
+
+
 def fetch_hist_one(
     sess: Any,
     code: str,
@@ -568,8 +576,12 @@ def fetch_hist_one(
     r = sess.get(url, timeout=20)
     j = r.json()
     d = j.get("data", {}).get(f"hk{code}", {})
-    rows = d.get("qfqday") or d.get("day") or []
+    # Forward-adjusted bars only: falling back to the plain "day" series would
+    # mix an unadjusted basis into a file that is rewritten whole.
+    rows = d.get("qfqday") or []
     if not rows:
+        if d.get("day"):
+            raise NoAdjustedHistory(code)
         raise RuntimeError(f"历史行情返回空列表 ({code})")
     out: list[list[Any]] = []
     seen_dates: set[str] = set()
@@ -668,7 +680,15 @@ def download_history(
         prev_dates = _existing_csv_dates(p)
         for attempt in range(3):
             try:
-                rows = fetch_hist_one(s, code)
+                try:
+                    rows = fetch_hist_one(s, code)
+                except NoAdjustedHistory:
+                    if prev_dates:
+                        # No adjusted series any more (delisted): the stored
+                        # adjusted file stays as it is rather than mixing in
+                        # unadjusted bars.
+                        return True
+                    raise
                 new_dates = [r[0] for r in rows]
                 new_date_set = set(new_dates)
                 if len(new_date_set) != len(rows):
@@ -677,8 +697,9 @@ def download_history(
                     # Tencent returns the latest HIST_BARS bars. Only a full
                     # window can roll older stored dates off; a short response
                     # owes every stored date. Either way the response must
-                    # overlap what is stored, and the file is rewritten from
-                    # this one response so all prices share one adjustment basis.
+                    # overlap what is stored. Sessions after the last stored bar
+                    # are not checked per stock: a suspended stock has none, so
+                    # target-date coverage is judged on the whole panel instead.
                     window_start = min(new_dates)
                     if window_start > max(prev_dates):
                         raise RuntimeError(f"历史响应与已有记录不重叠 ({code})")
@@ -696,7 +717,9 @@ def download_history(
                 buf = io.StringIO()
                 w = csv.writer(buf)
                 w.writerow(["date", "open", "close", "high", "low", "volume", "turnover_wan"])
-                w.writerows(rows)
+                # Keep the panel's start at HIST_START: earlier bars would move
+                # the first rebalance before the HSI history the index needs.
+                w.writerows([r for r in rows if r[0] >= HIST_START])
                 atomic_write_text(p, buf.getvalue())
                 return True
             except Exception:
