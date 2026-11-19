@@ -2127,3 +2127,23 @@ def test_hk_history_full_window_with_bad_pre_start_bars_still_owes_kept_dates(tm
     res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2023-06-05", session=sess)
     assert res["n_errors"] == 1
     assert "2023-06-01" in (hist / "00700.csv").read_text(encoding="utf-8")
+
+
+def test_hk_history_listing_entirely_before_hist_start_is_not_an_error(tmp_path):
+    """A code whose valid bars all predate HIST_START has nothing in range: the
+    download succeeds with an empty panel file, as before the window change."""
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk08888": {"qfqday": [
+                ["2023-05-30", "2", "2", "2", "2", "1"],
+                ["2023-05-31", "2", "2", "2", "2", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    res = hkf.download_history(["08888"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
+    assert res["n_errors"] == 0
+    lines = (tmp_path / "hist" / "08888.csv").read_text(encoding="utf-8").splitlines()
+    assert lines == ["date,open,close,high,low,volume,turnover_wan"]

@@ -637,7 +637,9 @@ def fetch_hist_one(
         except (ValueError, IndexError, TypeError):
             bad_rows += 1
             continue
-    if not out or bad_rows > 0:
+    # A listing whose valid bars all predate HIST_START is not an error: it
+    # simply has nothing in the panel's range.
+    if bad_rows > 0 or (not out and out.first_date is None):
         raise RuntimeError(
             f"历史行情记录不完整或含重复/无效日期 ({code}: total={len(rows)}, valid={len(out)}, bad={bad_rows})"
         )
@@ -712,14 +714,15 @@ def download_history(
                 new_date_set = set(new_dates)
                 if len(new_date_set) != len(rows):
                     raise RuntimeError(f"历史响应含重复日期 ({code})")
-                if prev_dates and new_dates:
+                first = getattr(rows, "first_date", None) or (min(new_dates) if new_dates else None)
+                if prev_dates and first:
                     # Tencent returns the latest HIST_BARS bars. Only a full
                     # window can roll older stored dates off; a short response
                     # owes every stored date. Either way the response must
                     # overlap what is stored. Sessions after the last stored bar
                     # are not checked per stock: a suspended stock has none, so
                     # target-date coverage is judged on the whole panel instead.
-                    window_start = getattr(rows, "first_date", None) or min(new_dates)
+                    window_start = first
                     if window_start > max(prev_dates):
                         raise RuntimeError(f"历史响应与已有记录不重叠 ({code})")
                     raw_count = getattr(rows, "raw_count", len(rows))
@@ -730,7 +733,6 @@ def download_history(
                         raise RuntimeError(
                             f"历史响应丢失原有日期 ({code}: 缺失 {len(missing_old)} 天)"
                         )
-                first = getattr(rows, "first_date", None) or (min(new_dates) if new_dates else None)
                 if first and getattr(rows, "raw_count", len(rows)) >= HIST_BARS and first > HIST_START:
                     # Only a full window that no longer reaches HIST_START needs
                     # attention; a short history is just a later listing.
