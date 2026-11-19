@@ -9,6 +9,7 @@ import csv
 from datetime import date, datetime
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -37,7 +38,12 @@ HKEX_XLSX_URL = (
 UA = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 }
+logger = logging.getLogger(__name__)
+
 HIST_START = "2023-06-01"
+# Tencent returns the latest N bars and ignores the start date; up to ~1500 come
+# back whole (above ~1600 it falls back to 640). 1200 covers HIST_START with room.
+HIST_BARS = 1200
 
 
 def _sess(proxy: str = "") -> requests.Session:
@@ -552,7 +558,7 @@ def fetch_hist_one(
     *,
     start: str = HIST_START,
     end: str | None = None,
-    count: int = 900,
+    count: int = HIST_BARS,
 ) -> list[list[Any]]:
     end = end or now_hk().date().isoformat()
     url = (
@@ -667,14 +673,26 @@ def download_history(
                 new_date_set = set(new_dates)
                 if len(new_date_set) != len(rows):
                     raise RuntimeError(f"历史响应含重复日期 ({code})")
-                if prev_dates:
-                    if len(rows) < len(prev_dates):
-                        raise RuntimeError(f"历史记录不完整 ({code}: {len(rows)} < {len(prev_dates)})")
-                    missing_old = prev_dates - new_date_set
+                if prev_dates and new_dates:
+                    # Tencent returns the latest HIST_BARS bars. Only a full
+                    # window can roll older stored dates off; a short response
+                    # owes every stored date. Either way the response must
+                    # overlap what is stored, and the file is rewritten from
+                    # this one response so all prices share one adjustment basis.
+                    window_start = min(new_dates)
+                    if window_start > max(prev_dates):
+                        raise RuntimeError(f"历史响应与已有记录不重叠 ({code})")
+                    owed = prev_dates if len(rows) < HIST_BARS else {d for d in prev_dates if d >= window_start}
+                    missing_old = owed - new_date_set
                     if missing_old:
                         raise RuntimeError(
                             f"历史响应丢失原有日期 ({code}: 缺失 {len(missing_old)} 天)"
                         )
+                if new_dates and min(new_dates) > HIST_START:
+                    logger.warning(
+                        "hk_momentum history window starts %s, after HIST_START %s (%s)",
+                        min(new_dates), HIST_START, code,
+                    )
                 buf = io.StringIO()
                 w = csv.writer(buf)
                 w.writerow(["date", "open", "close", "high", "low", "volume", "turnover_wan"])

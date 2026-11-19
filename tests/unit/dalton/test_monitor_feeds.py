@@ -1997,3 +1997,51 @@ def test_hkmom_ggt_empty_page_intraday_stale_and_unhandled_exception_matrix(
     (corrupt_dir / "universe.csv").write_text("code,name,is_ggt,mktcap_e8,price\n00001,HK1,False,20.0,10.0\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="frozen_history.json 文件损坏"):
         hkmom_compute.compute_all(state_dir=corrupt_dir)
+
+
+def test_hk_history_accepts_a_rolled_window_and_rewrites_from_one_response(tmp_path, monkeypatch):
+    """Tencent returns the latest N bars: when two new sessions arrive, the two
+    oldest stored dates roll off. That is not data loss; the update must succeed
+    and the file must hold exactly the new response (one adjustment basis)."""
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    dates = [f"2026-01-{d:02d}" for d in range(1, 31)]
+    stored, fresh = dates[:28], dates[2:]
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    header = "date,open,close,high,low,volume,turnover_wan\n"
+    (hist / "00700.csv").write_text(
+        header + "".join(f"{d},1,1,1,1,1,0\n" for d in stored), encoding="utf-8"
+    )
+
+    def fake_fetch(sess, code, **kw):
+        return [[d, 2.0, 2.0, 2.0, 2.0, 1.0, 0.0] for d in fresh]
+
+    monkeypatch.setattr(hkf, "fetch_hist_one", create_autospec(hkf.fetch_hist_one, side_effect=fake_fetch))
+    monkeypatch.setattr(hkf, "HIST_BARS", len(fresh))  # a full window may roll dates off
+    res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2026-01-30", session=object())
+    assert res["n_errors"] == 0
+    lines = (hist / "00700.csv").read_text(encoding="utf-8").splitlines()
+    assert [ln.split(",")[0] for ln in lines[1:]] == fresh
+
+
+def test_hk_history_still_rejects_a_gap_inside_the_window(tmp_path, monkeypatch):
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    dates = [f"2026-01-{d:02d}" for d in range(1, 31)]
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    (hist / "00700.csv").write_text(
+        "date,open,close,high,low,volume,turnover_wan\n" + "".join(f"{d},1,1,1,1,1,0\n" for d in dates[:28]),
+        encoding="utf-8",
+    )
+    gapped = [d for d in dates if d != "2026-01-15"]
+
+    monkeypatch.setattr(
+        hkf,
+        "fetch_hist_one",
+        create_autospec(hkf.fetch_hist_one, side_effect=lambda s, c, **kw: [[d, 2.0, 2.0, 2.0, 2.0, 1.0, 0.0] for d in gapped]),
+    )
+    monkeypatch.setattr(hkf.time, "sleep", lambda *_: None)
+    res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2026-01-30", session=object())
+    assert res["n_errors"] == 1
