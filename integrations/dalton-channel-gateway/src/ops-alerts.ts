@@ -17,8 +17,14 @@ const ALERT_CODES = new Set([
   "model_released",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
+  "alphaengine_token_expiring",
 ]);
-const DETAIL_ALERT_CODES = new Set(["backup_failed", "model_unavailable", "model_released"]);
+const DETAIL_ALERT_CODES = new Set([
+  "backup_failed",
+  "model_unavailable",
+  "model_released",
+  "alphaengine_token_expiring",
+]);
 const ALLOWED_BODY_KEYS = new Set(["code", "detail", "provider", "models"]);
 const ALLOWED_CONFIG_KEYS = new Set(["targets", "messages"]);
 const ALLOWED_MESSAGE_KEYS = new Set([
@@ -29,6 +35,7 @@ const ALLOWED_MESSAGE_KEYS = new Set([
   "model_released",
   "alphaengine_login_required",
   "alphaengine_module_page_required",
+  "alphaengine_token_expiring",
 ]);
 const REQUIRED_MESSAGE_KEYS = new Set(["backend_down", "backend_recovered"]);
 const OPTIONAL_MESSAGE_KEYS = new Set([
@@ -39,6 +46,7 @@ const DEFAULT_DETAIL_TEMPLATES: Record<string, string> = {
   backup_failed: "Dalton 备份失败：{detail}",
   model_unavailable: "Dalton 模型可用性告警：{detail}",
   model_released: "订阅已开放 {provider} 的 {models}，核对档位后将其设为可见并去掉 awaiting_release 标记",
+  alphaengine_token_expiring: "请在 AlphaEngine App 里登录账号 {detail}",
 };
 const MAX_BACKUP_DETAIL_CHARS = 300;
 const MAX_MODEL_UNAVAILABLE_DETAIL_CHARS = 600;
@@ -230,7 +238,7 @@ export async function handleOpsAlert(options: {
         ok: false,
         code: "invalid_request",
         message:
-          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, model_released, alphaengine_login_required, or alphaengine_module_page_required.",
+          "code must be backend_down, backend_recovered, backup_failed, model_unavailable, model_released, alphaengine_login_required, alphaengine_module_page_required, or alphaengine_token_expiring.",
       },
     };
   }
@@ -240,7 +248,8 @@ export async function handleOpsAlert(options: {
       data: {
         ok: false,
         code: "invalid_request",
-        message: "detail is only supported for backup_failed, model_unavailable, or model_released.",
+        message:
+          "detail is only supported for backup_failed, model_unavailable, model_released, or alphaengine_token_expiring.",
       },
     };
   }
@@ -318,9 +327,11 @@ export async function handleOpsAlert(options: {
   }
   const results: Array<Record<string, unknown>> = [];
   let anyFailed = false;
+  let anySucceeded = false;
   for (const target of config.targets) {
     try {
       const sent = await options.sendPlainText(target, text);
+      anySucceeded = true;
       results.push({
         target,
         ok: true,
@@ -340,6 +351,7 @@ export async function handleOpsAlert(options: {
       status: 502,
       data: {
         ok: false,
+        any_succeeded: anySucceeded,
         code,
         message: "One or more ops alert sends failed.",
         results,
@@ -350,6 +362,7 @@ export async function handleOpsAlert(options: {
     status: 200,
     data: {
       ok: true,
+      any_succeeded: anySucceeded,
       code,
       results,
     },

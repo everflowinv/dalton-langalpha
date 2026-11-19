@@ -135,6 +135,15 @@ launchctl print gui/$(id -u)/com.dalton.researchdata-bridge | head -n 40
   ```
   脚本会启动 `http://localhost:8942/callback` 并打开浏览器完成 OAuth 授权，默认从环境变量或 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp.env`（可用 `GUIDEPOINT_ENV_FILE` 覆盖）读取客户端凭据，授权完成后把新令牌以 `0600` 权限原子写入 `$DALTON_RESEARCH_HOME/config/guidepoint_mcp_tokens.json`（默认对应 `~/Library/Application Support/Everflow/research/config/guidepoint_mcp_tokens.json`，可用 `GUIDEPOINT_TOKENS_FILE` 覆盖）。更新令牌后执行 `launchctl kickstart -k gui/$(id -u)/com.dalton.guidepoint-mcp-proxy` 让代理立即生效。
 
+- **AlphaEngine 删除废弃账号**：
+  AlphaEngine MCP 会把在 Desktop App 中登录过的账号按 `user_id` 保存在 macOS 钥匙串（service 为 `dalton-alphaengine`），并在 `~/Library/Caches/dalton-researchdata-bridge/alphaengine_accounts_state.json`（`0600`，不含令牌）记录额度与状态元数据；过期超过 7 天后会自动停止每日登录提醒。如需彻底移除已弃用的账号：先在桌面 App 中退出该账号（否则 MCP 重启后会从 App 重新读到它的令牌），再停止 AlphaEngine MCP（运行中的进程会把内存中的账号记录写回状态文件），然后删除钥匙串条目、从状态文件 `accounts` 中移除对应 `user_id`，最后重新启动（安装时用 `DALTON_LAUNCH_AGENTS_DIR` 指定过 plist 目录的，把下面的路径换成该目录）：
+  ```bash
+  launchctl bootout gui/$(id -u)/com.dalton.alphaengine-mcp
+  security delete-generic-password -s dalton-alphaengine -a <user_id>
+  # 编辑 ~/Library/Caches/dalton-researchdata-bridge/alphaengine_accounts_state.json，删除 accounts 中的 <user_id>
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.alphaengine-mcp.plist
+  ```
+
 ### 3.3 token 用量采集
 
 - **作用**：`scripts/dalton/ops/usage_collector_run.sh` 选用技能自带 venv 或 `/opt/homebrew/bin/python3.12` 启动 `scripts/dalton/ops/usage_collector.py`，每 60 秒调用 Dalton 技能 `scripts/dalton/data_assets/skills/model-usage-cost` 的 `collect-broker --days 2 --json` 子命令（超时 120 秒，通过 `collector.lock` 互斥锁跳过重叠调度），把 Grok CLI 等易轮转的本地日志及时写入账本，供每周六 12:00 HKT 的宿主机数据任务 `T61`（`weekly-token-usage`）汇总。

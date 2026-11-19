@@ -480,3 +480,102 @@ describe("ops-alerts model_released", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe("ops-alerts alphaengine_token_expiring", () => {
+  it("renders default and configured templates with sanitized account label detail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-ae-expiring-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const sender = vi.fn(async () => ({ messageId: "om_exp_1" }));
+    const resDefault = await handleOpsAlert({
+      body: { code: "alphaengine_token_expiring", detail: "尾号6789" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resDefault.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith(
+      "feishu:user:ou_ops_a",
+      "请在 AlphaEngine App 里登录账号 尾号6789",
+    );
+
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+          alphaengine_token_expiring: "[即将过期] 请在 AlphaEngine App 里登录账号 {detail}",
+        },
+      }),
+    );
+    const resCustom = await handleOpsAlert({
+      body: { code: "alphaengine_token_expiring", detail: "张三\n\t\x00" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: sender,
+    });
+    expect(resCustom.status).toBe(200);
+    expect(sender).toHaveBeenLastCalledWith(
+      "feishu:user:ou_ops_a",
+      "[即将过期] 请在 AlphaEngine App 里登录账号 张三",
+    );
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports any_succeeded=true on 502 partial delivery and any_succeeded=false when all targets fail", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dalton-ops-ae-partial-"));
+    const configPath = join(dir, "ops-alerts.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        targets: ["feishu:user:ou_ops_a", "feishu:user:ou_ops_b"],
+        messages: {
+          backend_down: "Dalton 后端不可用",
+          backend_recovered: "Dalton 后端已恢复",
+        },
+      }),
+    );
+
+    const partialSender = vi.fn(async (target: string) => {
+      if (target === "feishu:user:ou_ops_b") throw new Error("send failed");
+      return { messageId: "om_ok_1" };
+    });
+    const partialRes = await handleOpsAlert({
+      body: { code: "alphaengine_token_expiring", detail: "尾号6789" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: partialSender,
+    });
+    expect(partialRes.status).toBe(502);
+    expect(partialRes.data.ok).toBe(false);
+    expect(partialRes.data.any_succeeded).toBe(true);
+
+    const allFailSender = vi.fn(async () => {
+      throw new Error("network down");
+    });
+    const allFailRes = await handleOpsAlert({
+      body: { code: "alphaengine_token_expiring", detail: "尾号6789" },
+      remoteAddress: "127.0.0.1",
+      configPath,
+      sendPlainText: allFailSender,
+    });
+    expect(allFailRes.status).toBe(502);
+    expect(allFailRes.data.ok).toBe(false);
+    expect(allFailRes.data.any_succeeded).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
