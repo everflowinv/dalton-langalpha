@@ -53,6 +53,118 @@ _DEFAULT_MAX_AGE_SECONDS = 900
 _STATUS_OVERRIDES = {408: WebErrorType.TIMEOUT}
 
 
+# DALTON-HOOK(firecrawl-budget): extract reset timestamp and remaining credits for 402 insufficient_credits.
+def _extract_resets_at(body: Any) -> Optional[str]:
+    if not isinstance(body, dict):
+        return None
+    for container in (
+        body,
+        body.get("data"),
+        body.get("details"),
+        body.get("meta"),
+        body.get("error") if isinstance(body.get("error"), dict) else None,
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key in ("resets_at", "resetsAt", "reset_at", "resetAt"):
+            val = container.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _extract_remaining_credits(body: Any) -> Optional[float]:
+    if not isinstance(body, dict):
+        return None
+    for container in (
+        body,
+        body.get("data"),
+        body.get("details"),
+        body.get("meta"),
+        body.get("error") if isinstance(body.get("error"), dict) else None,
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key in ("remaining_credits", "remainingCredits"):
+            val = container.get(key)
+            if isinstance(val, bool) or val is None:
+                continue
+            if isinstance(val, (int, float)):
+                return float(val)
+            if isinstance(val, str) and val.strip():
+                try:
+                    return float(val.strip())
+                except ValueError:
+                    continue
+    return None
+
+
+def _firecrawl_402_error(e: httpx.HTTPStatusError) -> Optional[WebError]:
+    from src.dalton.settings import is_dalton_enabled
+
+    if e.response.status_code != 402 or not is_dalton_enabled():
+        return None
+    try:
+        body = e.response.json()
+    except ValueError:
+        body = None
+    code = ""
+    if isinstance(body, dict):
+        raw_code = body.get("code")
+        if not raw_code and isinstance(body.get("error"), dict):
+            raw_code = body["error"].get("code")
+        code = str(raw_code or "").strip().lower()
+    raw_text = (e.response.text or "").lower()
+    resets_at = _extract_resets_at(body)
+    if code:
+        is_insufficient = code == "insufficient_credits"
+    else:
+        is_insufficient = (
+            "platform_managed_credits" not in raw_text
+            and (
+                "insufficient_credits" in raw_text
+                or "insufficient credits" in raw_text
+                or resets_at is not None
+            )
+        )
+    if not is_insufficient:
+        return None
+    remaining = _extract_remaining_credits(body)
+    if remaining is not None and remaining > 0:
+        return WebError(
+            type=WebErrorType.BUDGET_EXCEEDED,
+            message="本次请求所需额度超过 Firecrawl 余额",
+            http_status=402,
+            retryable=True,
+            provider_fault=True,
+            native_kind="insufficient_credits_for_request",
+        )
+    if remaining is not None and remaining <= 0:
+        reset_display = resets_at or "下个计费周期"
+        return WebError(
+            type=WebErrorType.BUDGET_EXCEEDED,
+            message=f"Firecrawl 本月额度已用完，将于 {reset_display} 重置，请改用浏览器抓取",
+            http_status=402,
+            retryable=True,
+            provider_fault=True,
+            native_kind="insufficient_credits",
+        )
+    orig_err = body.get("error") if isinstance(body, dict) else None
+    raw_msg = (
+        orig_err.strip()
+        if isinstance(orig_err, str) and orig_err.strip()
+        else (e.response.text or "").strip() or "Insufficient credits"
+    )
+    return WebError(
+        type=WebErrorType.BUDGET_EXCEEDED,
+        message=f"Firecrawl 返回额度不足（402）：{clip_error(raw_msg)}",
+        http_status=402,
+        retryable=True,
+        provider_fault=True,
+        native_kind="insufficient_credits_unknown",
+    )
+
+
 def _scrape_error(e: httpx.HTTPError) -> WebError:
     """Map a failed /scrape call, which carries one URL.
 
@@ -61,6 +173,10 @@ def _scrape_error(e: httpx.HTTPError) -> WebError:
     must not open the breaker every URL shares. Still retryable, as every
     provider-API failure is, since another provider's rules may differ.
     """
+    if isinstance(e, httpx.HTTPStatusError):  # DALTON-HOOK(firecrawl-budget)
+        credit_err = _firecrawl_402_error(e)
+        if credit_err is not None:
+            return credit_err
     if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
         try:
             body = e.response.json()
@@ -229,6 +345,10 @@ class FirecrawlFetchAdapter:
 
 def _crawl_call_error(e: httpx.HTTPError) -> WebToolError:
     """Wrap an httpx failure as a call-level WebToolError (crawl status overrides)."""
+    if isinstance(e, httpx.HTTPStatusError):  # DALTON-HOOK(firecrawl-budget)
+        credit_err = _firecrawl_402_error(e)
+        if credit_err is not None:
+            return WebToolError(credit_err)
     return WebToolError(error_from_httpx(e, status_overrides=_STATUS_OVERRIDES))
 
 
