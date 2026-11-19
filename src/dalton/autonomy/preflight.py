@@ -2481,3 +2481,40 @@ async def decide(
             reason="preflight_error",
             signals=[],
         )
+
+
+async def release_claimed_signals_on_non_completed_settle(
+    *,
+    automation: dict[str, Any],
+    execution_id: str,
+    workspace_id: Optional[str] = None,
+) -> int:
+    """Release active signals claimed by ``execution_id`` when a Dalton execution terminates without completing.
+
+    Called from ``automation_settlement._after_settling`` only after the terminal
+    state update commits (so stale workers fenced by ``expected_run_id`` or
+    status checks never release signals of a taken-over execution). Failures are
+    logged at error level and swallowed so settlement never breaks.
+    """
+    if not isinstance(automation, dict) or not is_dalton_automation(automation):
+        return 0
+    try:
+        released = await watch_db.release_signals_claimed_by(
+            execution_id,
+            workspace_id=workspace_id,
+        )
+        if released:
+            logger.info(
+                "[DALTON_PREFLIGHT] Released %d claimed signal(s) on non-completed settle for execution_id=%s",
+                released,
+                execution_id,
+            )
+        return released
+    except Exception as e:
+        logger.error(
+            "[DALTON_PREFLIGHT] Failed to release claimed signals for execution_id=%s: %s",
+            execution_id,
+            e,
+            exc_info=True,
+        )
+        return 0

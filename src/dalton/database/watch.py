@@ -531,6 +531,42 @@ async def mark_signals_woken(
     return len(claimed)
 
 
+async def release_signals_claimed_by(
+    execution_id: str,
+    workspace_id: Optional[str] = None,
+) -> int:
+    """Release unresolved, unexpired signals still claimed by ``execution_id`` back to pending."""
+    if not execution_id or not str(execution_id).strip():
+        return 0
+    exec_uuid = _signal_exec_uuid(execution_id)
+    clauses = [
+        "woken_execution_id = %s",
+        "resolved_at IS NULL",
+        "expired_at IS NULL",
+    ]
+    params: list[Any] = [exec_uuid]
+    cleaned_ws = str(workspace_id or "").strip()
+    if cleaned_ws and cleaned_ws.lower() != "home":
+        clauses.append("workspace_id = %s")
+        params.append(_resolve_ws_uuid(cleaned_ws))
+    where_sql = " AND ".join(clauses)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE dalton_signals
+                SET woken_execution_id = NULL,
+                    woken_at = NULL,
+                    payload = COALESCE(payload, '{{}}'::jsonb) || '{{"status": "pending"}}'::jsonb
+                WHERE {where_sql}
+                RETURNING signal_id
+                """,
+                tuple(params),
+            )
+            rows = await cur.fetchall()
+            return len(rows or [])
+
+
 async def verify_signal_refs_in_workspace(
     signal_refs: Optional[list[str]],
     workspace_id: Optional[str],

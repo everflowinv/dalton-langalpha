@@ -688,6 +688,23 @@ async def _after_settling(
             workspace_id=workspace_id,
             final_text=final_text or (row.get("result_excerpt") if isinstance(row, dict) else None),
         )
+    # DALTON-HOOK(preflight): release active signals claimed by a Dalton execution
+    # whenever it ends in any terminal state other than COMPLETED (e.g. FAILED,
+    # PRECHECK_SKIPPED, TIMEOUT, INTERRUPTED, FAILED_OURS, LIMITED, PLAN_LIMITED,
+    # SUBSCRIPTION_LIMITED, KEY_REJECTED, STOPPED, UNREACHABLE, SKIPPED).
+    # Outcome.COMPLETED keeps claims as handled; non-terminal states that resume
+    # under the same execution_id (hand_off, _wait_for_thread, park_execution)
+    # never call settle() and therefore never enter _after_settling.
+    if outcome is not Outcome.COMPLETED:
+        from src.dalton.autonomy.preflight import (
+            release_claimed_signals_on_non_completed_settle,
+        )
+
+        await release_claimed_signals_on_non_completed_settle(
+            automation=automation,
+            execution_id=execution_id,
+            workspace_id=workspace_id or str(automation.get("workspace_id") or "") or None,
+        )
     if row["settled_from"] == "waiting" and thread_id:
         await publish_automation_wait(
             user_id=automation["user_id"],

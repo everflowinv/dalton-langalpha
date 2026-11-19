@@ -4870,3 +4870,538 @@ async def test_decide_recovery_falls_through_when_no_self_claimed_signals_and_ex
     assert res.decision == "skip"
     assert res.reason == "no_new_signals"
     assert res.signals == []
+
+
+def _install_real_settlement_and_executor_doubles(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    settled_row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Wire ``AutomationExecutor.execute()`` to run real ``settlement_mod.settle()``."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from psycopg import AsyncConnection
+    from src.dalton.database.automation_recycle import automation_is_soft_deleted
+    from src.server.services import automation_executor as executor_mod
+    from src.server.services import automation_settlement as settlement_mod
+    from src.server.services.automation_delivery import Finish
+    from src.server.services.hook_outbox import HookOutboxDrainer
+    from src.server.services.turn_runtime import TurnRoute
+    from src.server.services.webhook_client import WebhookClient
+
+    settled_calls: list[dict[str, Any]] = []
+    row_template = settled_row or {
+        "conversation_thread_id": "thread-dalton-1",
+        "conversation_response_id": None,
+        "settled_from": "running",
+        "previous_failure_reason": None,
+        "previous_delivery_result": None,
+    }
+
+    class _AsyncTx:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_exc: Any) -> bool:
+            return False
+
+    async def _settle_execution(
+        execution_id: str,
+        *,
+        in_transaction: Any = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        settled_calls.append({"execution_id": execution_id, **fields})
+        mock_tx_conn = create_autospec(AsyncConnection, instance=True)
+        if in_transaction is not None:
+            await in_transaction(mock_tx_conn, row_template)
+        return dict(row_template)
+
+    mock_conn = create_autospec(AsyncConnection, instance=True)
+    mock_conn.transaction.side_effect = lambda: _AsyncTx()
+
+    @asynccontextmanager
+    async def _conn_ctx(conn: Any = None):
+        yield conn or mock_conn
+
+    monkeypatch.setattr(
+        executor_mod.exec_db,
+        "begin_execution_if_not_deleted",
+        create_autospec(
+            executor_mod.exec_db.begin_execution_if_not_deleted,
+            return_value={"conversation_thread_id": None, "conversation_response_id": None},
+        ),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "_keep_alive",
+        create_autospec(executor_mod._keep_alive, return_value=None),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "_thread_busy",
+        create_autospec(executor_mod._thread_busy, return_value=False),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "_turn_place",
+        create_autospec(
+            executor_mod._turn_place,
+            return_value=SimpleNamespace(
+                workspace={"workspace_id": _PREFLIGHT_WS}, thread_id=None
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "turn_route",
+        create_autospec(
+            executor_mod.turn_route,
+            return_value=TurnRoute(_PREFLIGHT_WS, "analyst"),
+        ),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "park_for_computer",
+        create_autospec(executor_mod.park_for_computer, return_value=False),
+    )
+    monkeypatch.setattr(
+        executor_mod,
+        "late_note",
+        create_autospec(executor_mod.late_note, return_value=None),
+    )
+
+    monkeypatch.setattr(
+        settlement_mod.exec_db,
+        "settle_execution",
+        create_autospec(settlement_mod.exec_db.settle_execution, side_effect=_settle_execution),
+    )
+    monkeypatch.setattr(
+        settlement_mod.exec_db,
+        "get_execution_for_settlement",
+        create_autospec(settlement_mod.exec_db.get_execution_for_settlement, return_value=None),
+    )
+    monkeypatch.setattr(
+        settlement_mod.exec_db,
+        "has_pending_background_work",
+        create_autospec(settlement_mod.exec_db.has_pending_background_work, return_value=False),
+    )
+    monkeypatch.setattr(
+        settlement_mod.exec_db,
+        "record_delivery",
+        create_autospec(settlement_mod.exec_db.record_delivery, return_value=None),
+    )
+    monkeypatch.setattr(
+        settlement_mod.outbox_db,
+        "enqueue_compensation_job",
+        create_autospec(settlement_mod.outbox_db.enqueue_compensation_job, return_value=None),
+    )
+    monkeypatch.setattr(
+        settlement_mod.outbox_db,
+        "merge_job_payload",
+        create_autospec(settlement_mod.outbox_db.merge_job_payload, return_value=True),
+    )
+    monkeypatch.setattr(settlement_mod, "get_db_connection", _conn_ctx)
+    monkeypatch.setattr(
+        "src.dalton.database.automation_recycle.automation_is_soft_deleted",
+        create_autospec(automation_is_soft_deleted, return_value=False),
+    )
+    webhook_client = create_autospec(WebhookClient, instance=True)
+    webhook_client.fire_event.return_value = []
+    monkeypatch.setattr(
+        settlement_mod,
+        "WebhookClient",
+        create_autospec(WebhookClient, return_value=webhook_client),
+    )
+    monkeypatch.setattr(
+        settlement_mod.automation_delivery,
+        "finish_run",
+        create_autospec(
+            settlement_mod.automation_delivery.finish_run,
+            return_value=Finish([]),
+        ),
+    )
+    monkeypatch.setattr(
+        settlement_mod,
+        "publish_automation_wait",
+        create_autospec(settlement_mod.publish_automation_wait, return_value=None),
+    )
+    monkeypatch.setattr(
+        settlement_mod,
+        "safe_add",
+        create_autospec(settlement_mod.safe_add, return_value=None),
+    )
+    drainer = create_autospec(HookOutboxDrainer, instance=True)
+    monkeypatch.setattr(
+        HookOutboxDrainer,
+        "get_instance",
+        create_autospec(HookOutboxDrainer.get_instance, return_value=drainer),
+    )
+    return {"settled_calls": settled_calls}
+
+
+def _attach_stateful_release(
+    monkeypatch: pytest.MonkeyPatch,
+    store: dict[str, Any],
+) -> Any:
+    """Install a ``create_autospec`` release handler backed by ``_install_stateful_signal_store``."""
+
+    async def _stateful_release(
+        execution_id: str,
+        workspace_id: str | None = None,
+    ) -> int:
+        exec_uuid = watch_db._signal_exec_uuid(execution_id)
+        released = 0
+        for row in store["rows"].values():
+            if (
+                row.get("woken_execution_id") == exec_uuid
+                and row.get("resolved_at") is None
+                and row.get("expired_at") is None
+                and (not workspace_id or str(row.get("workspace_id")) == str(workspace_id))
+            ):
+                row["woken_execution_id"] = None
+                row["woken_at"] = None
+                row["payload"] = {**(row.get("payload") or {}), "status": "pending"}
+                released += 1
+        return released
+
+    release_spy = create_autospec(
+        watch_db.release_signals_claimed_by,
+        side_effect=_stateful_release,
+    )
+    monkeypatch.setattr(watch_db, "release_signals_claimed_by", release_spy)
+    return release_spy
+
+
+@pytest.mark.asyncio
+async def test_release_signals_claimed_by_sql_and_relist_unwoken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """release_signals_claimed_by 仅释放匹配 execution_id 且未 resolved/expired 的信号并恢复 pending，随后 list_unwoken_signals 可重新检出。"""
+    import uuid
+    from contextlib import asynccontextmanager
+    from psycopg import AsyncConnection
+
+    ws_1 = "11111111-1111-1111-1111-111111111111"
+    ws_other = "99999999-9999-9999-9999-999999999999"
+    exec_1 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeee1"
+    exec_2 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeee2"
+    ts = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+
+    rows: dict[str, dict[str, Any]] = {
+        "active_exec1": {
+            "signal_id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa1"),
+            "workspace_id": uuid.UUID(ws_1),
+            "ticker": "META",
+            "probe": "sec",
+            "signal_key": "sec:form4:release-me",
+            "priority": "P2",
+            "summary": "Form 4 active",
+            "payload": {"form": "4", "status": "woken"},
+            "detected_at": ts,
+            "woken_execution_id": uuid.UUID(exec_1),
+            "woken_at": ts,
+            "resolved_at": None,
+            "expired_at": None,
+        },
+        "resolved_exec1": {
+            "signal_id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa2"),
+            "workspace_id": uuid.UUID(ws_1),
+            "ticker": "META",
+            "probe": "sec",
+            "signal_key": "sec:form4:resolved",
+            "priority": "P2",
+            "summary": "Already resolved",
+            "payload": {"form": "4", "status": "resolved"},
+            "detected_at": ts,
+            "woken_execution_id": uuid.UUID(exec_1),
+            "woken_at": ts,
+            "resolved_at": ts,
+            "expired_at": None,
+        },
+        "expired_exec1": {
+            "signal_id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa3"),
+            "workspace_id": uuid.UUID(ws_1),
+            "ticker": "META",
+            "probe": "sec",
+            "signal_key": "sec:form4:expired",
+            "priority": "P2",
+            "summary": "Already expired",
+            "payload": {"form": "4", "status": "expired"},
+            "detected_at": ts,
+            "woken_execution_id": uuid.UUID(exec_1),
+            "woken_at": ts,
+            "resolved_at": None,
+            "expired_at": ts,
+        },
+        "active_exec2": {
+            "signal_id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa4"),
+            "workspace_id": uuid.UUID(ws_1),
+            "ticker": "META",
+            "probe": "sec",
+            "signal_key": "sec:form4:other-exec",
+            "priority": "P2",
+            "summary": "Claimed by exec 2",
+            "payload": {"form": "4", "status": "woken"},
+            "detected_at": ts,
+            "woken_execution_id": uuid.UUID(exec_2),
+            "woken_at": ts,
+            "resolved_at": None,
+            "expired_at": None,
+        },
+        "active_other_ws": {
+            "signal_id": uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaa5"),
+            "workspace_id": uuid.UUID(ws_other),
+            "ticker": "AAPL",
+            "probe": "sec",
+            "signal_key": "sec:form4:other-ws",
+            "priority": "P2",
+            "summary": "Other workspace",
+            "payload": {"form": "4", "status": "woken"},
+            "detected_at": ts,
+            "woken_execution_id": uuid.UUID(exec_1),
+            "woken_at": ts,
+            "resolved_at": None,
+            "expired_at": None,
+        },
+    }
+    queries: list[tuple[str, Any]] = []
+    last_rows: list[dict[str, Any]] = []
+    mock_cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        normalized = " ".join(sql.split())
+        queries.append((normalized, params))
+        last_rows.clear()
+        if normalized.startswith("UPDATE dalton_signals SET woken_execution_id = NULL"):
+            assert "woken_execution_id = %s" in normalized
+            assert "resolved_at IS NULL" in normalized
+            assert "expired_at IS NULL" in normalized
+            assert "workspace_id = %s" in normalized
+            q_exec, q_ws = params
+            for row in rows.values():
+                if (
+                    str(row["woken_execution_id"]) == str(q_exec)
+                    and str(row["workspace_id"]) == str(q_ws)
+                    and row["resolved_at"] is None
+                    and row["expired_at"] is None
+                ):
+                    row["woken_execution_id"] = None
+                    row["woken_at"] = None
+                    row["payload"] = {**(row.get("payload") or {}), "status": "pending"}
+                    last_rows.append({"signal_id": row["signal_id"]})
+        elif normalized.startswith("SELECT signal_id"):
+            q_ws = params[0]
+            for row in rows.values():
+                if (
+                    str(row["workspace_id"]) == str(q_ws)
+                    and row["woken_execution_id"] is None
+                    and row["resolved_at"] is None
+                    and row["expired_at"] is None
+                ):
+                    last_rows.append(dict(row))
+
+    mock_cur.execute.side_effect = _exec
+    mock_cur.fetchall.side_effect = lambda: list(last_rows)
+
+    @asynccontextmanager
+    async def _cursor_ctx(*_args: object, **_kwargs: object):
+        yield mock_cur
+
+    mock_conn = create_autospec(AsyncConnection, instance=True)
+    mock_conn.cursor.side_effect = _cursor_ctx
+
+    @asynccontextmanager
+    async def _conn_ctx():
+        yield mock_conn
+
+    monkeypatch.setattr(
+        watch_db,
+        "get_db_connection",
+        create_autospec(watch_db.get_db_connection, side_effect=_conn_ctx),
+    )
+
+    released = await watch_db.release_signals_claimed_by(exec_1, workspace_id=ws_1)
+    assert released == 1
+    assert rows["active_exec1"]["woken_execution_id"] is None
+    assert rows["active_exec1"]["woken_at"] is None
+    assert rows["active_exec1"]["payload"]["status"] == "pending"
+    assert rows["resolved_exec1"]["woken_execution_id"] == uuid.UUID(exec_1)
+    assert rows["expired_exec1"]["woken_execution_id"] == uuid.UUID(exec_1)
+    assert rows["active_exec2"]["woken_execution_id"] == uuid.UUID(exec_2)
+    assert rows["active_other_ws"]["woken_execution_id"] == uuid.UUID(exec_1)
+
+    unwoken = await _REAL_LIST_UNWOKEN_SIGNALS(ws_1)
+    assert [r["signal_key"] for r in unwoken] == ["sec:form4:release-me"]
+    assert unwoken[0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_release_claimed_signals_on_non_completed_settle_guards_and_error_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 Dalton 自动化直接跳过；释放异常仅记日志并返回 0，不破坏结算。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    release_mock = create_autospec(
+        watch_db.release_signals_claimed_by,
+        side_effect=RuntimeError("db temporary down"),
+    )
+    monkeypatch.setattr(watch_db, "release_signals_claimed_by", release_mock)
+
+    non_dalton = {"automation_id": "auto-plain", "name": "user-cron", "workspace_id": _PREFLIGHT_WS}
+    assert await preflight_mod.release_claimed_signals_on_non_completed_settle(
+        automation=non_dalton,
+        execution_id="exec-plain-1",
+        workspace_id=_PREFLIGHT_WS,
+    ) == 0
+    release_mock.assert_not_awaited()
+
+    err_count = await preflight_mod.release_claimed_signals_on_non_completed_settle(
+        automation=_company_watch_automation(),
+        execution_id="exec-dalton-err-1",
+        workspace_id=_PREFLIGHT_WS,
+    )
+    assert err_count == 0
+    release_mock.assert_awaited_once_with("exec-dalton-err-1", workspace_id=_PREFLIGHT_WS)
+
+
+@pytest.mark.asyncio
+async def test_executor_recovery_lookup_fails_three_times_releases_signal_for_next_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex 场景 1：恢复查询连续失败 3 次使执行以 FAILED 结算并释放已认领信号，下一次执行可重新拿回该信号并唤醒。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.server.services import automation_settlement as settlement_mod
+    from src.server.services.automation_executor import AutomationExecutor
+
+    exec_1 = "exec-codex1-fail"
+    exec_2 = "exec-codex1-next"
+    exec_1_uuid = watch_db._signal_exec_uuid(exec_1)
+
+    _install_company_preflight_doubles(monkeypatch)
+    initial_row = {
+        "signal_id": "44444444-4444-4444-4444-444444444444",
+        "workspace_id": _PREFLIGHT_WS,
+        "ticker": "META",
+        "probe": "sec",
+        "signal_key": "sec:8k:codex-case-1",
+        "priority": "P0",
+        "summary": "8-K Item 2.02 filed",
+        "payload": {"form": "8-K", "status": "woken"},
+        "detected_at": datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc),
+        "woken_execution_id": exec_1_uuid,
+        "woken_at": datetime(2026, 11, 18, 12, 1, tzinfo=timezone.utc),
+        "resolved_at": None,
+        "expired_at": None,
+    }
+    store = _install_stateful_signal_store(monkeypatch, initial_rows=[initial_row])
+
+    release_spy = _attach_stateful_release(monkeypatch, store)
+    settlement_state = _install_real_settlement_and_executor_doubles(monkeypatch)
+
+    saved_list_claimed = watch_db.list_signals_claimed_by
+    failing_list_claimed = create_autospec(
+        _REAL_LIST_SIGNALS_CLAIMED_BY,
+        side_effect=RuntimeError("db lookup transient failure"),
+    )
+    monkeypatch.setattr(watch_db, "list_signals_claimed_by", failing_list_claimed)
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_quiet)
+    monkeypatch.setattr(preflight_mod, "_RECOVERY_LOOKUP_BACKOFF_S", 0.0)
+
+    await AutomationExecutor().execute(_company_watch_automation(), exec_1)
+    await settlement_mod.drain_tails()
+
+    assert failing_list_claimed.await_count == 3
+    assert len(settlement_state["settled_calls"]) == 1
+    assert settlement_state["settled_calls"][0]["to"] == "failed"
+    release_spy.assert_awaited_once_with(exec_1, workspace_id=_PREFLIGHT_WS)
+    stored = next(iter(store["rows"].values()))
+    assert stored["woken_execution_id"] is None
+    assert stored["payload"]["status"] == "pending"
+
+    # Restore healthy DB lookup for the subsequent execution with a new execution_id.
+    monkeypatch.setattr(watch_db, "list_signals_claimed_by", saved_list_claimed)
+    next_res = await preflight_mod.decide(_company_watch_automation(), exec_2)
+    assert next_res is not None
+    assert next_res.should_wake is True
+    assert [s["signal_key"] for s in next_res.signals] == ["sec:8k:codex-case-1"]
+    assert stored["woken_execution_id"] == watch_db._signal_exec_uuid(exec_2)
+
+
+@pytest.mark.asyncio
+async def test_executor_ownership_timeout_skips_and_releases_claimed_signal_for_next_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex 场景 2：归属校验暂时失败触发 PRECHECK_SKIPPED 时，终态结算释放本执行已认领信号，下一次执行可重新拿回。"""
+    from fastapi import HTTPException
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.server.services import automation_settlement as settlement_mod
+    from src.server.services.automation_executor import AutomationExecutor
+
+    exec_1 = "exec-codex2-authskip"
+    exec_2 = "exec-codex2-next"
+    exec_1_uuid = watch_db._signal_exec_uuid(exec_1)
+
+    _install_company_preflight_doubles(monkeypatch)
+    initial_row = {
+        "signal_id": "55555555-5555-5555-5555-555555555555",
+        "workspace_id": _PREFLIGHT_WS,
+        "ticker": "META",
+        "probe": "sec",
+        "signal_key": "sec:8k:codex-case-2",
+        "priority": "P0",
+        "summary": "8-K Item 5.02 filed",
+        "payload": {"form": "8-K", "status": "woken"},
+        "detected_at": datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc),
+        "woken_execution_id": exec_1_uuid,
+        "woken_at": datetime(2026, 11, 18, 12, 1, tzinfo=timezone.utc),
+        "resolved_at": None,
+        "expired_at": None,
+    }
+    store = _install_stateful_signal_store(monkeypatch, initial_rows=[initial_row])
+
+    release_spy = _attach_stateful_release(monkeypatch, store)
+    settlement_state = _install_real_settlement_and_executor_doubles(monkeypatch)
+
+    orig_verify = preflight_mod.verify_workspace_access
+    monkeypatch.setattr(
+        preflight_mod,
+        "verify_workspace_access",
+        create_autospec(
+            orig_verify,
+            side_effect=HTTPException(status_code=503, detail="auth db unavailable"),
+        ),
+    )
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_quiet)
+
+    await AutomationExecutor().execute(_company_watch_automation(), exec_1)
+    await settlement_mod.drain_tails()
+
+    assert len(settlement_state["settled_calls"]) == 1
+    assert settlement_state["settled_calls"][0]["to"] == "skipped"
+    assert settlement_state["settled_calls"][0]["skip_reason"] == "precheck"
+    release_spy.assert_awaited_once_with(exec_1, workspace_id=_PREFLIGHT_WS)
+    stored = next(iter(store["rows"].values()))
+    assert stored["woken_execution_id"] is None
+    assert stored["payload"]["status"] == "pending"
+
+    # Ownership check succeeds cleanly on the subsequent execution.
+    monkeypatch.setattr(
+        preflight_mod,
+        "verify_workspace_access",
+        create_autospec(orig_verify, return_value={"workspace_id": _PREFLIGHT_WS}),
+    )
+    next_res = await preflight_mod.decide(_company_watch_automation(), exec_2)
+    assert next_res is not None
+    assert next_res.should_wake is True
+    assert [s["signal_key"] for s in next_res.signals] == ["sec:8k:codex-case-2"]
+    assert stored["woken_execution_id"] == watch_db._signal_exec_uuid(exec_2)
