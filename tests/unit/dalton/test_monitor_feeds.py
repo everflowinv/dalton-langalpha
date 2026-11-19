@@ -1997,3 +1997,171 @@ def test_hkmom_ggt_empty_page_intraday_stale_and_unhandled_exception_matrix(
     (corrupt_dir / "universe.csv").write_text("code,name,is_ggt,mktcap_e8,price\n00001,HK1,False,20.0,10.0\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="frozen_history.json 文件损坏"):
         hkmom_compute.compute_all(state_dir=corrupt_dir)
+
+
+def test_hk_history_accepts_a_rolled_window_and_rewrites_from_one_response(tmp_path, monkeypatch):
+    """Tencent returns the latest N bars: when two new sessions arrive, the two
+    oldest stored dates roll off. That is not data loss; the update must succeed
+    and the file must hold exactly the new response (one adjustment basis)."""
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    dates = [f"2026-01-{d:02d}" for d in range(1, 31)]
+    stored, fresh = dates[:28], dates[2:]
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    header = "date,open,close,high,low,volume,turnover_wan\n"
+    (hist / "00700.csv").write_text(
+        header + "".join(f"{d},1,1,1,1,1,0\n" for d in stored), encoding="utf-8"
+    )
+
+    def fake_fetch(sess, code, **kw):
+        return [[d, 2.0, 2.0, 2.0, 2.0, 1.0, 0.0] for d in fresh]
+
+    monkeypatch.setattr(hkf, "fetch_hist_one", create_autospec(hkf.fetch_hist_one, side_effect=fake_fetch))
+    monkeypatch.setattr(hkf, "HIST_BARS", len(fresh))  # a full window may roll dates off
+    res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2026-01-30", session=object())
+    assert res["n_errors"] == 0
+    lines = (hist / "00700.csv").read_text(encoding="utf-8").splitlines()
+    assert [ln.split(",")[0] for ln in lines[1:]] == fresh
+
+
+def test_hk_history_still_rejects_a_gap_inside_the_window(tmp_path, monkeypatch):
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    dates = [f"2026-01-{d:02d}" for d in range(1, 31)]
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    (hist / "00700.csv").write_text(
+        "date,open,close,high,low,volume,turnover_wan\n" + "".join(f"{d},1,1,1,1,1,0\n" for d in dates[:28]),
+        encoding="utf-8",
+    )
+    gapped = [d for d in dates if d != "2026-01-15"]
+
+    monkeypatch.setattr(
+        hkf,
+        "fetch_hist_one",
+        create_autospec(hkf.fetch_hist_one, side_effect=lambda s, c, **kw: [[d, 2.0, 2.0, 2.0, 2.0, 1.0, 0.0] for d in gapped]),
+    )
+    monkeypatch.setattr(hkf.time, "sleep", lambda *_: None)
+    res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2026-01-30", session=object())
+    assert res["n_errors"] == 1
+
+
+def test_hk_history_never_falls_back_to_unadjusted_bars():
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk00700": {"day": [["2026-11-19", "1", "1", "1", "1", "1"]]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    with pytest.raises(RuntimeError):
+        hkf.fetch_hist_one(sess, "00700")
+
+
+def test_hk_history_keeps_the_stored_file_when_only_unadjusted_bars_exist(tmp_path):
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    original = "date,open,close,high,low,volume,turnover_wan\n2025-11-27,1,1,1,1,1,0\n2025-11-28,1,1,1,1,1,0\n"
+    (hist / "09986.csv").write_text(original, encoding="utf-8")
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk09986": {"day": [["2025-11-28", "1", "1", "1", "1", "1"]]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    res = hkf.download_history(["09986"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
+    assert res["n_errors"] == 0
+    assert (hist / "09986.csv").read_text(encoding="utf-8") == original
+
+
+def test_hk_history_ignores_bad_bars_before_hist_start():
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk00700": {"qfqday": [
+                ["2022-01-04", "", None, "", "", "1"],  # before HIST_START, not numeric
+                ["2022-01-05", "-1", "-1", "-1", "-1", "1"],  # before HIST_START, negative
+                ["2026-11-18", "2", "2", "2", "2", "1"],
+                ["2026-11-19", "2", "2", "2", "2", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    rows = hkf.fetch_hist_one(sess, "00700")
+    assert [r[0] for r in rows] == ["2026-11-18", "2026-11-19"]
+    assert rows.raw_count == 4
+    assert rows.first_date == "2022-01-04"
+
+
+def test_hk_history_full_window_with_bad_pre_start_bars_still_owes_kept_dates(tmp_path, monkeypatch):
+    """The window start comes from the whole response, so dropping bad bars
+    before HIST_START cannot hide a stored date missing at the window's edge."""
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    (hist / "00700.csv").write_text(
+        "date,open,close,high,low,volume,turnover_wan\n2023-06-01,1,1,1,1,1,0\n2023-06-02,1,1,1,1,1,0\n",
+        encoding="utf-8",
+    )
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk00700": {"qfqday": [
+                ["2023-05-30", "-1", "-1", "-1", "-1", "1"],
+                ["2023-05-31", "-1", "-1", "-1", "-1", "1"],
+                ["2023-06-02", "2", "2", "2", "2", "1"],
+                ["2023-06-05", "2", "2", "2", "2", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    monkeypatch.setattr(hkf, "HIST_BARS", 4)  # the response is a full window
+    monkeypatch.setattr(hkf.time, "sleep", lambda *_: None)
+    res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2023-06-05", session=sess)
+    assert res["n_errors"] == 1
+    assert "2023-06-01" in (hist / "00700.csv").read_text(encoding="utf-8")
+
+
+def test_hk_history_listing_entirely_before_hist_start_is_not_an_error(tmp_path):
+    """A code whose valid bars all predate HIST_START has nothing in range: the
+    download succeeds with an empty panel file, as before the window change."""
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk08888": {"qfqday": [
+                ["2023-05-30", "2", "2", "2", "2", "1"],
+                ["2023-05-31", "2", "2", "2", "2", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    res = hkf.download_history(["08888"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
+    assert res["n_errors"] == 0
+    lines = (tmp_path / "hist" / "08888.csv").read_text(encoding="utf-8").splitlines()
+    assert lines == ["date,open,close,high,low,volume,turnover_wan"]
+
+
+def test_hk_history_rejects_a_response_with_only_bad_bars_before_hist_start(tmp_path, monkeypatch):
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk08888": {"qfqday": [
+                ["2023-05-30", "", "", "", "", "1"],
+                ["2023-05-31", "-1", "-1", "-1", "-1", "1"],
+                ["2023-05-29", "inf", "inf", "inf", "inf", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    monkeypatch.setattr(hkf.time, "sleep", lambda *_: None)
+    res = hkf.download_history(["08888"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
+    assert res["n_errors"] == 1
