@@ -2157,6 +2157,7 @@ def test_hk_history_rejects_a_response_with_only_bad_bars_before_hist_start(tmp_
             return {"data": {"hk08888": {"qfqday": [
                 ["2023-05-30", "", "", "", "", "1"],
                 ["2023-05-31", "-1", "-1", "-1", "-1", "1"],
+                ["2023-05-29", "inf", "inf", "inf", "inf", "1"],
             ]}}}
 
     sess = create_autospec(requests.Session, instance=True)

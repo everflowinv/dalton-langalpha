@@ -615,7 +615,8 @@ def fetch_hist_one(
                 # must not sink the bars that are kept.
                 if not valid_before_start:
                     try:
-                        valid_before_start = float(row[2]) > 0
+                        close = float(row[2])
+                        valid_before_start = math.isfinite(close) and close > 0
                     except (ValueError, IndexError, TypeError):
                         pass
                 continue
