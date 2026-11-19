@@ -1,0 +1,2166 @@
+{
+  "AAOI": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Applied Optoelectronics",
+    "sample_issuer": "APPLIED OPTOELECTRONICS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "03823U102"
+  },
+  "AAPL": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Apple",
+    "sample_issuer": "APPLE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "037833100"
+  },
+  "ABNB": {
+    "category": "Other US Book",
+    "canonical_name": "Airbnb",
+    "sample_issuer": "AIRBNB INC",
+    "verified_quarter": "26Q3",
+    "cusip": "009066101"
+  },
+  "ABR": {
+    "category": "Other US Book",
+    "canonical_name": "Arbor Realty Trust",
+    "sample_issuer": "ARBOR REALTY TRUST INC",
+    "verified_quarter": "26Q3",
+    "cusip": "038923108"
+  },
+  "ADI": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Analog Devices",
+    "sample_issuer": "ANALOG DEVICES INC",
+    "verified_quarter": "26Q3",
+    "cusip": "032654105"
+  },
+  "AEHR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Aehr Test Systems",
+    "sample_issuer": "AEHR TEST SYS",
+    "verified_quarter": "26Q3",
+    "cusip": "00760J108"
+  },
+  "AFRM": {
+    "category": "Other US Book",
+    "canonical_name": "Affirm",
+    "sample_issuer": "AFFIRM HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "00827B106"
+  },
+  "AGL": {
+    "category": "Other US Book",
+    "canonical_name": "Agilon Health",
+    "sample_issuer": "AGILON HEALTH INC",
+    "verified_quarter": "26Q3"
+  },
+  "AGX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Argan",
+    "sample_issuer": "ARGAN INC",
+    "verified_quarter": "26Q3",
+    "cusip": "04010E109"
+  },
+  "AIT": {
+    "category": "Other US Book",
+    "canonical_name": "Applied Industrial Technologies",
+    "sample_issuer": "APPLIED INDL TECHNOLOGIES IN",
+    "verified_quarter": "26Q3",
+    "cusip": "03820C105"
+  },
+  "ALAB": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Astera Labs",
+    "sample_issuer": "ASTERA LABS INC",
+    "verified_quarter": "26Q3"
+  },
+  "ALLY": {
+    "category": "Other US Book",
+    "canonical_name": "Ally Financial",
+    "sample_issuer": "ALLY FINL INC",
+    "verified_quarter": "26Q3",
+    "cusip": "02005N100"
+  },
+  "AMAT": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Applied Materials",
+    "sample_issuer": "APPLIED MATLS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "038222105"
+  },
+  "AMBQ": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Ambiq Micro",
+    "sample_issuer": "AMBIQ MICRO INC",
+    "verified_quarter": "26Q3",
+    "cusip": "023193105"
+  },
+  "AMC": {
+    "category": "Other US Book",
+    "canonical_name": "AMC Entertainment",
+    "sample_issuer": "AMC ENTMT HLDGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "AMD": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "AMD",
+    "sample_issuer": "ADVANCED MICRO DEVICES INC",
+    "verified_quarter": "26Q3",
+    "cusip": "007903107"
+  },
+  "AMPL": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Amplitude",
+    "sample_issuer": "AMPLITUDE INC",
+    "verified_quarter": "26Q3"
+  },
+  "AMRZ": {
+    "category": "Other US Book",
+    "canonical_name": "Amrize",
+    "sample_issuer": "AMRIZE LTD",
+    "verified_quarter": "26Q3"
+  },
+  "AMZN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Amazon",
+    "sample_issuer": "AMAZON COM INC",
+    "verified_quarter": "26Q3",
+    "cusip": "023135106"
+  },
+  "ANDG": {
+    "category": "Other US Book",
+    "canonical_name": "Andersen Group",
+    "sample_issuer": "ANDERSEN GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "033853102"
+  },
+  "APG": {
+    "category": "Other US Book",
+    "canonical_name": "APi Group",
+    "sample_issuer": "API GROUP CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "00187Y100"
+  },
+  "API": {
+    "category": "China Book",
+    "canonical_name": "Agora",
+    "sample_issuer": "AGORA INC",
+    "verified_quarter": "26Q3"
+  },
+  "APLD": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Applied Digital",
+    "sample_issuer": "APPLIED DIGITAL CORP",
+    "verified_quarter": "26Q3"
+  },
+  "APO": {
+    "category": "Other US Book",
+    "canonical_name": "Apollo Global Management",
+    "sample_issuer": "APOLLO GLOBAL MGMT INC",
+    "verified_quarter": "26Q3"
+  },
+  "APP": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "AppLovin",
+    "sample_issuer": "APPLOVIN CORP",
+    "verified_quarter": "26Q3"
+  },
+  "ARM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Arm",
+    "sample_issuer": "ARM HOLDINGS PLC",
+    "verified_quarter": "26Q3"
+  },
+  "ARX": {
+    "category": "Other US Book",
+    "canonical_name": "Accelerant",
+    "sample_issuer": "ACCELERANT HOLDINGS",
+    "verified_quarter": "26Q3"
+  },
+  "AS": {
+    "category": "Other US Book",
+    "canonical_name": "Amer Sports",
+    "sample_issuer": "AMER SPORTS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "G0260P102"
+  },
+  "ASML": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "ASML",
+    "sample_issuer": "ASML HLDG NV",
+    "verified_quarter": "26Q3"
+  },
+  "ATAT": {
+    "category": "China Book",
+    "canonical_name": "Atour Lifestyle",
+    "sample_issuer": "ATOUR LIFESTYLE HLDGS LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "04965M106"
+  },
+  "AUR": {
+    "category": "Other US Book",
+    "canonical_name": "Aurora Innovation",
+    "sample_issuer": "AURORA INNOVATION INC",
+    "verified_quarter": "26Q3",
+    "cusip": "051774107"
+  },
+  "AVGO": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Broadcom",
+    "sample_issuer": "BROADCOM INC",
+    "verified_quarter": "26Q3"
+  },
+  "AXP": {
+    "category": "Other US Book",
+    "canonical_name": "American Express",
+    "sample_issuer": "AMERICAN EXPRESS CO",
+    "verified_quarter": "26Q3",
+    "cusip": "025816109"
+  },
+  "AYI": {
+    "category": "Other US Book",
+    "canonical_name": "Acuity",
+    "sample_issuer": "ACUITY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "00508Y102"
+  },
+  "B": {
+    "category": "Other US Book",
+    "canonical_name": "Barrick Mining",
+    "sample_issuer": "BARRICK MNG CORP",
+    "verified_quarter": "26Q3"
+  },
+  "BABA": {
+    "category": "China Book",
+    "canonical_name": "Alibaba",
+    "sample_issuer": "ALIBABA GROUP HLDG LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "01609W102"
+  },
+  "BAC": {
+    "category": "Other US Book",
+    "canonical_name": "Bank of America",
+    "sample_issuer": "BANK OF AMER CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "060505104"
+  },
+  "BAH": {
+    "category": "Other US Book",
+    "canonical_name": "Booz Allen Hamilton",
+    "sample_issuer": "BOOZ ALLEN HAMILTON HLDG COR",
+    "verified_quarter": "26Q3",
+    "cusip": "099502106"
+  },
+  "BE": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Bloom Energy",
+    "sample_issuer": "BLOOM ENERGY CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "093712107"
+  },
+  "BEKE": {
+    "category": "China Book",
+    "canonical_name": "BEKE",
+    "sample_issuer": "KE HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "482497104"
+  },
+  "BILI": {
+    "category": "China Book",
+    "canonical_name": "Bilibili",
+    "sample_issuer": "BILIBILI INC",
+    "verified_quarter": "26Q3",
+    "cusip": "090040106"
+  },
+  "BILL": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "BILL Holdings",
+    "sample_issuer": "BILL HOLDINGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "090043100"
+  },
+  "BLDR": {
+    "category": "Other US Book",
+    "canonical_name": "Builders FirstSource",
+    "sample_issuer": "BUILDERS FIRSTSOURCE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "12008R107"
+  },
+  "BN": {
+    "category": "Other US Book",
+    "canonical_name": "Brookfield Corp",
+    "sample_issuer": "BROOKFIELD CORP",
+    "verified_quarter": "26Q3"
+  },
+  "BSP": {
+    "category": "Other US Book",
+    "canonical_name": "Bending Spoons",
+    "sample_issuer": "BENDING SPOONS SPA",
+    "verified_quarter": "26Q3"
+  },
+  "BTDR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Bitdeer Technologies",
+    "sample_issuer": "BITDEER TECHNOLOGIES GROUP",
+    "verified_quarter": "26Q3",
+    "cusip": "G11448100"
+  },
+  "BULL": {
+    "category": "Other US Book",
+    "canonical_name": "Webull",
+    "sample_issuer": "WEBULL CORP",
+    "verified_quarter": "26Q3"
+  },
+  "BYND": {
+    "category": "Other US Book",
+    "canonical_name": "Beyond Meat",
+    "sample_issuer": "BEYOND MEAT INC",
+    "verified_quarter": "26Q3",
+    "cusip": "08862E109"
+  },
+  "BZ": {
+    "category": "China Book",
+    "canonical_name": "Kanzhun",
+    "sample_issuer": "KANZHUN LIMITED",
+    "verified_quarter": "26Q3"
+  },
+  "BZUN": {
+    "category": "China Book",
+    "canonical_name": "Baozun",
+    "sample_issuer": "BAOZUN INC",
+    "verified_quarter": "26Q3",
+    "cusip": "06684L103"
+  },
+  "CART": {
+    "category": "Other US Book",
+    "canonical_name": "Instacart",
+    "sample_issuer": "MAPLEBEAR INC",
+    "verified_quarter": "26Q3"
+  },
+  "CB": {
+    "category": "Other US Book",
+    "canonical_name": "Chubb",
+    "sample_issuer": "CHUBB LIMITED",
+    "verified_quarter": "26Q3"
+  },
+  "CBRS": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Cerebras Systems",
+    "sample_issuer": "CEREBRAS SYSTEMS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "15675D103"
+  },
+  "CCC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "CCC Intelligent Solutions",
+    "sample_issuer": "CCC INTELLIGENT SOLUTIONS HL",
+    "verified_quarter": "26Q3"
+  },
+  "CEG": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Constellation Energy",
+    "sample_issuer": "CONSTELLATION ENERGY CORP",
+    "verified_quarter": "26Q3"
+  },
+  "CHPT": {
+    "category": "Other US Book",
+    "canonical_name": "ChargePoint",
+    "sample_issuer": "CHARGEPOINT HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "CHYM": {
+    "category": "Other US Book",
+    "canonical_name": "Chime",
+    "sample_issuer": "CHIME FINL INC",
+    "verified_quarter": "26Q3",
+    "cusip": "16935C109"
+  },
+  "CIFR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Cipher Digital",
+    "sample_issuer": "CIPHER DIGITAL INC",
+    "verified_quarter": "26Q3",
+    "cusip": "17253J106"
+  },
+  "CLH": {
+    "category": "Other US Book",
+    "canonical_name": "Clean Harbors",
+    "sample_issuer": "CLEAN HARBORS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "184496107"
+  },
+  "CLS": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Celestica",
+    "sample_issuer": "CELESTICA INC",
+    "verified_quarter": "26Q3"
+  },
+  "COF": {
+    "category": "Other US Book",
+    "canonical_name": "Capital One",
+    "sample_issuer": "CAPITAL ONE FINL CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "14040H105"
+  },
+  "COHR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Coherent",
+    "sample_issuer": "COHERENT CORP",
+    "verified_quarter": "26Q3"
+  },
+  "COMP": {
+    "category": "Other US Book",
+    "canonical_name": "Compass",
+    "sample_issuer": "COMPASS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "20464U100"
+  },
+  "CORZ": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Core Scientific",
+    "sample_issuer": "CORE SCIENTIFIC INC NEW",
+    "verified_quarter": "26Q3",
+    "cusip": "21874A106"
+  },
+  "CP": {
+    "category": "Other US Book",
+    "canonical_name": "Canadian Pacific Kansas City",
+    "sample_issuer": "CANADIAN PACIFIC KANSAS CITY",
+    "verified_quarter": "26Q3"
+  },
+  "CPAY": {
+    "category": "Other US Book",
+    "canonical_name": "Corpay",
+    "sample_issuer": "CORPAY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "219948106"
+  },
+  "CPNG": {
+    "category": "Other US Book",
+    "canonical_name": "Coupang",
+    "sample_issuer": "COUPANG INC",
+    "verified_quarter": "26Q3",
+    "cusip": "22266T109"
+  },
+  "CRH": {
+    "category": "Other US Book",
+    "canonical_name": "CRH",
+    "sample_issuer": "CRH PLC",
+    "verified_quarter": "26Q3"
+  },
+  "CRM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Salesforce",
+    "sample_issuer": "SALESFORCE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "79466L302"
+  },
+  "CRS": {
+    "category": "Other US Book",
+    "canonical_name": "Carpenter Technology",
+    "sample_issuer": "CARPENTER TECHNOLOGY CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "144285103"
+  },
+  "CRWV": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "CoreWeave",
+    "sample_issuer": "COREWEAVE INC",
+    "verified_quarter": "26Q3"
+  },
+  "CSX": {
+    "category": "Other US Book",
+    "canonical_name": "CSX",
+    "sample_issuer": "CSX CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "126408103"
+  },
+  "CVNA": {
+    "category": "Other US Book",
+    "canonical_name": "Carvana",
+    "sample_issuer": "CARVANA CO",
+    "verified_quarter": "26Q3",
+    "cusip": "146869102"
+  },
+  "CVX": {
+    "category": "Other US Book",
+    "canonical_name": "Chevron",
+    "sample_issuer": "CHEVRON CORPORATION",
+    "verified_quarter": "26Q3",
+    "cusip": "166764100"
+  },
+  "DAL": {
+    "category": "Other US Book",
+    "canonical_name": "Delta Air Lines",
+    "sample_issuer": "DELTA AIR LINES INC",
+    "verified_quarter": "26Q3",
+    "cusip": "247361702"
+  },
+  "DASH": {
+    "category": "Other US Book",
+    "canonical_name": "DoorDash",
+    "sample_issuer": "DOORDASH INC",
+    "verified_quarter": "26Q3",
+    "cusip": "25809K105"
+  },
+  "DBMF": {
+    "category": "Other US Book",
+    "canonical_name": "iMGP DBi Managed Futures ETF (DBMF)",
+    "sample_issuer": "IMGP DBI MANAGED FUTURES STRAT",
+    "verified_quarter": "26Q3"
+  },
+  "DBVT": {
+    "category": "Other US Book",
+    "canonical_name": "DBV Technologies",
+    "sample_issuer": "DBV TECHNOLOGIES S A",
+    "verified_quarter": "26Q3"
+  },
+  "DDL": {
+    "category": "China Book",
+    "canonical_name": "Dingdong",
+    "sample_issuer": "DINGDONG CAYMAN LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "25445D101"
+  },
+  "DHI": {
+    "category": "Other US Book",
+    "canonical_name": "D.R. Horton",
+    "sample_issuer": "D R HORTON INC",
+    "verified_quarter": "26Q3",
+    "cusip": "23331A109"
+  },
+  "DHR": {
+    "category": "Other US Book",
+    "canonical_name": "Danaher",
+    "sample_issuer": "DANAHER CORP DEL",
+    "verified_quarter": "26Q3",
+    "cusip": "235851102"
+  },
+  "DIS": {
+    "category": "Other US Book",
+    "canonical_name": "Walt Disney",
+    "sample_issuer": "DISNEY WALT CO",
+    "verified_quarter": "26Q3",
+    "cusip": "254687106"
+  },
+  "DPC": {
+    "category": "Other US Book",
+    "canonical_name": "DPC Holdings",
+    "sample_issuer": "DPC HOLDINGS PLC",
+    "verified_quarter": "26Q3"
+  },
+  "DUOL": {
+    "category": "Other US Book",
+    "canonical_name": "Duolingo",
+    "sample_issuer": "DUOLINGO INC",
+    "verified_quarter": "26Q3",
+    "cusip": "26603R106"
+  },
+  "DVA": {
+    "category": "Other US Book",
+    "canonical_name": "DaVita",
+    "sample_issuer": "DAVITA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "23918K108"
+  },
+  "EDU": {
+    "category": "China Book",
+    "canonical_name": "New Oriental",
+    "sample_issuer": "NEW ORIENTAL ED & TECHNOLOGY",
+    "verified_quarter": "26Q3"
+  },
+  "EMR": {
+    "category": "Other US Book",
+    "canonical_name": "Emerson Electric",
+    "sample_issuer": "EMERSON ELEC CO",
+    "verified_quarter": "26Q3",
+    "cusip": "291011104"
+  },
+  "ENPH": {
+    "category": "Other US Book",
+    "canonical_name": "Enphase Energy",
+    "sample_issuer": "ENPHASE ENERGY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "29355A107"
+  },
+  "ENTG": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Entegris",
+    "sample_issuer": "ENTEGRIS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "29362U104"
+  },
+  "EPAM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "EPAM Systems",
+    "sample_issuer": "EPAM SYS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "29414B104"
+  },
+  "EQIX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Equinix",
+    "sample_issuer": "EQUINIX INC",
+    "verified_quarter": "26Q3"
+  },
+  "EQPT": {
+    "category": "Other US Book",
+    "canonical_name": "EquipmentShare",
+    "sample_issuer": "EQUIPMENTSHARE COM INC",
+    "verified_quarter": "26Q3",
+    "cusip": "29445S100"
+  },
+  "EQX": {
+    "category": "Other US Book",
+    "canonical_name": "Equinox Gold",
+    "sample_issuer": "EQUINOX GOLD CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "29446Y502"
+  },
+  "ERAS": {
+    "category": "Other US Book",
+    "canonical_name": "Erasca",
+    "sample_issuer": "ERASCA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "29479A108"
+  },
+  "ETN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Eaton",
+    "sample_issuer": "EATON CORP PLC",
+    "verified_quarter": "26Q3"
+  },
+  "F": {
+    "category": "Other US Book",
+    "canonical_name": "Ford Motor",
+    "sample_issuer": "FORD MTR CO",
+    "verified_quarter": "26Q3",
+    "cusip": "345370860"
+  },
+  "FCNCA": {
+    "category": "Other US Book",
+    "canonical_name": "First Citizens BancShares",
+    "sample_issuer": "FIRST CTZNS BANCSHARES INC D",
+    "verified_quarter": "26Q3",
+    "cusip": "31946M103"
+  },
+  "FERG": {
+    "category": "Other US Book",
+    "canonical_name": "Ferguson Enterprises",
+    "sample_issuer": "FERGUSON ENTERPRISES INC",
+    "verified_quarter": "26Q3"
+  },
+  "FIG": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Figma",
+    "sample_issuer": "FIGMA INC",
+    "verified_quarter": "26Q3"
+  },
+  "FIX": {
+    "category": "Other US Book",
+    "canonical_name": "Comfort Systems USA",
+    "sample_issuer": "COMFORT SYS USA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "199908104"
+  },
+  "FLEX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Flex",
+    "sample_issuer": "FLEX LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "Y2573F102"
+  },
+  "FLS": {
+    "category": "Other US Book",
+    "canonical_name": "Flowserve",
+    "sample_issuer": "FLOWSERVE CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "34354P105"
+  },
+  "FN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Fabrinet",
+    "sample_issuer": "FABRINET",
+    "verified_quarter": "26Q3",
+    "cusip": "G3323L100"
+  },
+  "FORM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "FormFactor",
+    "sample_issuer": "FORMFACTOR INC",
+    "verified_quarter": "26Q3",
+    "cusip": "346375108"
+  },
+  "FOUR": {
+    "category": "Other US Book",
+    "canonical_name": "Shift4 Payments",
+    "sample_issuer": "SHIFT4 PMTS INC",
+    "verified_quarter": "26Q3"
+  },
+  "FPS": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Forgent Power Solutions",
+    "sample_issuer": "FORGENT POWER SOLUTIONS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "34631F102"
+  },
+  "FRO": {
+    "category": "Other US Book",
+    "canonical_name": "Frontline",
+    "sample_issuer": "FRONTLINE PLC",
+    "verified_quarter": "26Q3"
+  },
+  "FROG": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "JFrog",
+    "sample_issuer": "JFROG LTD",
+    "verified_quarter": "26Q3"
+  },
+  "FUTU": {
+    "category": "China Book",
+    "canonical_name": "FUTU",
+    "sample_issuer": "FUTU HLDGS LTD",
+    "verified_quarter": "26Q3"
+  },
+  "FWONK": {
+    "category": "Other US Book",
+    "canonical_name": "Liberty Media",
+    "sample_issuer": "LIBERTY MEDIA CORP DEL",
+    "verified_quarter": "26Q3"
+  },
+  "GE": {
+    "category": "Other US Book",
+    "canonical_name": "GE Aerospace",
+    "sample_issuer": "GE AEROSPACE",
+    "verified_quarter": "26Q3"
+  },
+  "GEMI": {
+    "category": "Other US Book",
+    "canonical_name": "Gemini",
+    "sample_issuer": "GEMINI SPACE STA INC",
+    "verified_quarter": "26Q3"
+  },
+  "GEV": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "GE Vernova",
+    "sample_issuer": "GE VERNOVA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "36828A101"
+  },
+  "GLBE": {
+    "category": "Other US Book",
+    "canonical_name": "Global-e Online",
+    "sample_issuer": "GLOBAL E ONLINE LTD",
+    "verified_quarter": "26Q3"
+  },
+  "GLD": {
+    "category": "Other US Book",
+    "canonical_name": "SPDR Gold Trust (GLD)",
+    "sample_issuer": "SPDR GOLD TR",
+    "verified_quarter": "26Q3"
+  },
+  "GLDM": {
+    "category": "Other US Book",
+    "canonical_name": "SPDR Gold MiniShares (GLDM)",
+    "sample_issuer": "WORLD GOLD TR",
+    "verified_quarter": "26Q3"
+  },
+  "GLW": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Corning",
+    "sample_issuer": "CORNING INC",
+    "verified_quarter": "26Q3",
+    "cusip": "219350105"
+  },
+  "GNRC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Generac",
+    "sample_issuer": "GENERAC HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "368736104"
+  },
+  "GOOG": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Alphabet",
+    "sample_issuer": "ALPHABET INC",
+    "verified_quarter": "26Q3"
+  },
+  "GOOGL": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Alphabet",
+    "sample_issuer": "ALPHABET INC",
+    "verified_quarter": "26Q3"
+  },
+  "GRAB": {
+    "category": "Other US Book",
+    "canonical_name": "Grab",
+    "sample_issuer": "GRAB HOLDINGS LIMITED",
+    "verified_quarter": "26Q3",
+    "cusip": "G4124C109"
+  },
+  "GRABW": {
+    "category": "Other US Book",
+    "canonical_name": "Grab Warrants",
+    "sample_issuer": "GRAB HOLDINGS LIMITED",
+    "verified_quarter": "26Q3",
+    "cusip": "G4124C117"
+  },
+  "GSHD": {
+    "category": "Other US Book",
+    "canonical_name": "Goosehead Insurance",
+    "sample_issuer": "GOOSEHEAD INS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "38267D109"
+  },
+  "HD": {
+    "category": "Other US Book",
+    "canonical_name": "Home Depot",
+    "sample_issuer": "HOME DEPOT INC",
+    "verified_quarter": "26Q3",
+    "cusip": "437076102"
+  },
+  "HDL": {
+    "category": "China Book",
+    "canonical_name": "Super Hi International",
+    "sample_issuer": "SUPER HI INTL HLDG LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "86803S106"
+  },
+  "HNGE": {
+    "category": "Other US Book",
+    "canonical_name": "Hinge Health",
+    "sample_issuer": "HINGE HEALTH INC",
+    "verified_quarter": "26Q3",
+    "cusip": "433313103"
+  },
+  "HON": {
+    "category": "Other US Book",
+    "canonical_name": "Honeywell",
+    "sample_issuer": "HONEYWELL INTL INC",
+    "verified_quarter": "26Q3"
+  },
+  "HONA": {
+    "category": "Other US Book",
+    "canonical_name": "Honeywell Aerospace",
+    "sample_issuer": "HONEYWELL AEROSPACE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "43849R105"
+  },
+  "HOOD": {
+    "category": "Other US Book",
+    "canonical_name": "Robinhood",
+    "sample_issuer": "ROBINHOOD MKTS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "770700102"
+  },
+  "HPE": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Hewlett Packard Enterprise",
+    "sample_issuer": "HEWLETT PACKARD ENTERPRISE C",
+    "verified_quarter": "26Q3",
+    "cusip": "42824C109"
+  },
+  "HTHT": {
+    "category": "China Book",
+    "canonical_name": "H World",
+    "sample_issuer": "H WORLD GROUP LTD",
+    "verified_quarter": "26Q3"
+  },
+  "HTZ": {
+    "category": "Other US Book",
+    "canonical_name": "Hertz Global",
+    "sample_issuer": "HERTZ GLOBAL HLDGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "HTZWW": {
+    "category": "Other US Book",
+    "canonical_name": "Hertz Global Warrants",
+    "sample_issuer": "HERTZ GLOBAL HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "42806J148"
+  },
+  "HUT": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Hut 8",
+    "sample_issuer": "HUT 8 CORP",
+    "verified_quarter": "26Q3"
+  },
+  "IBKR": {
+    "category": "Other US Book",
+    "canonical_name": "Interactive Brokers",
+    "sample_issuer": "INTERACTIVE BROKERS GROUP IN",
+    "verified_quarter": "26Q3",
+    "cusip": "45841N107"
+  },
+  "ICE": {
+    "category": "Other US Book",
+    "canonical_name": "Intercontinental Exchange",
+    "sample_issuer": "INTERCONTINENTAL EXCHANGE IN",
+    "verified_quarter": "26Q3"
+  },
+  "ICHR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Ichor Holdings",
+    "sample_issuer": "ICHOR HOLDINGS",
+    "verified_quarter": "26Q3",
+    "cusip": "G4740B105"
+  },
+  "INIO": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "INNIO",
+    "sample_issuer": "INNIO NV",
+    "verified_quarter": "26Q3",
+    "cusip": "N52A8C105"
+  },
+  "INTC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Intel",
+    "sample_issuer": "INTEL CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "458140100"
+  },
+  "ISRG": {
+    "category": "Other US Book",
+    "canonical_name": "Intuitive Surgical",
+    "sample_issuer": "INTUITIVE SURGICAL INC",
+    "verified_quarter": "26Q3",
+    "cusip": "46120E602"
+  },
+  "JCI": {
+    "category": "Other US Book",
+    "canonical_name": "Johnson Controls",
+    "sample_issuer": "JOHNSON CONTROLS INTERNATION",
+    "verified_quarter": "26Q3"
+  },
+  "JD": {
+    "category": "China Book",
+    "canonical_name": "JD",
+    "sample_issuer": "JD.COM INC",
+    "verified_quarter": "26Q3",
+    "cusip": "47215P106"
+  },
+  "JEF": {
+    "category": "Other US Book",
+    "canonical_name": "Jefferies Financial",
+    "sample_issuer": "JEFFERIES FINANCIAL GROUP IN",
+    "verified_quarter": "26Q3"
+  },
+  "JHX": {
+    "category": "Other US Book",
+    "canonical_name": "James Hardie",
+    "sample_issuer": "JAMES HARDIE INDS PLC",
+    "verified_quarter": "26Q3"
+  },
+  "JOYY": {
+    "category": "China Book",
+    "canonical_name": "JOYY",
+    "sample_issuer": "JOYY INC",
+    "verified_quarter": "26Q3"
+  },
+  "KGS": {
+    "category": "Other US Book",
+    "canonical_name": "Kodiak Gas Services",
+    "sample_issuer": "KODIAK GAS SVCS INC",
+    "verified_quarter": "26Q3"
+  },
+  "KHC": {
+    "category": "Other US Book",
+    "canonical_name": "Kraft Heinz",
+    "sample_issuer": "KRAFT HEINZ CO",
+    "verified_quarter": "26Q3",
+    "cusip": "500754106"
+  },
+  "KKR": {
+    "category": "Other US Book",
+    "canonical_name": "KKR",
+    "sample_issuer": "KKR & CO INC",
+    "verified_quarter": "26Q3"
+  },
+  "KLAC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "KLA",
+    "sample_issuer": "KLA CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "482480100"
+  },
+  "KLAR": {
+    "category": "Other US Book",
+    "canonical_name": "Klarna",
+    "sample_issuer": "KLARNA GROUP PLC",
+    "verified_quarter": "26Q3",
+    "cusip": "G5279N105"
+  },
+  "KLIC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Kulicke & Soffa",
+    "sample_issuer": "KULICKE & SOFFA INDS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "501242101"
+  },
+  "KO": {
+    "category": "Other US Book",
+    "canonical_name": "Coca-Cola",
+    "sample_issuer": "COCA COLA CO",
+    "verified_quarter": "26Q3",
+    "cusip": "191216100"
+  },
+  "KR": {
+    "category": "Other US Book",
+    "canonical_name": "Kroger",
+    "sample_issuer": "KROGER CO",
+    "verified_quarter": "26Q3",
+    "cusip": "501044101"
+  },
+  "KRC": {
+    "category": "Other US Book",
+    "canonical_name": "Kilroy Realty",
+    "sample_issuer": "KILROY REALTY CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "49427F108"
+  },
+  "KSPI": {
+    "category": "Other US Book",
+    "canonical_name": "Kaspi.kz",
+    "sample_issuer": "KASPI KZ JSC",
+    "verified_quarter": "26Q3",
+    "cusip": "48581R205"
+  },
+  "KVYO": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Klaviyo",
+    "sample_issuer": "KLAVIYO INC",
+    "verified_quarter": "26Q3",
+    "cusip": "49845K101"
+  },
+  "LANV": {
+    "category": "China Book",
+    "canonical_name": "Lanvin Group",
+    "sample_issuer": "LANVIN GROUP HOLDINGS LIMITE",
+    "verified_quarter": "26Q3"
+  },
+  "LCID": {
+    "category": "Other US Book",
+    "canonical_name": "Lucid",
+    "sample_issuer": "LUCID GROUP INC",
+    "verified_quarter": "26Q3"
+  },
+  "LEN": {
+    "category": "Other US Book",
+    "canonical_name": "Lennar",
+    "sample_issuer": "LENNAR CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "526057104"
+  },
+  "LENB": {
+    "category": "Other US Book",
+    "canonical_name": "Lennar",
+    "sample_issuer": "LENNAR CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "526057302"
+  },
+  "LFUS": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Littelfuse",
+    "sample_issuer": "LITTELFUSE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "537008104"
+  },
+  "LIME": {
+    "category": "Other US Book",
+    "canonical_name": "Lime (Neutron Holdings)",
+    "sample_issuer": "NEUTRON HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "LIN": {
+    "category": "Other US Book",
+    "canonical_name": "Linde",
+    "sample_issuer": "LINDE PLC",
+    "verified_quarter": "26Q3"
+  },
+  "LINE": {
+    "category": "Other US Book",
+    "canonical_name": "Lineage",
+    "sample_issuer": "LINEAGE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "53566V106"
+  },
+  "LITE": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Lumentum",
+    "sample_issuer": "LUMENTUM HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "55024U109"
+  },
+  "LLYVA": {
+    "category": "Other US Book",
+    "canonical_name": "Liberty Live",
+    "sample_issuer": "LIBERTY LIVE HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "LLYVK": {
+    "category": "Other US Book",
+    "canonical_name": "Liberty Live",
+    "sample_issuer": "LIBERTY LIVE HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "LPLA": {
+    "category": "Other US Book",
+    "canonical_name": "LPL Financial",
+    "sample_issuer": "LPL FINL HLDGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "LPX": {
+    "category": "Other US Book",
+    "canonical_name": "Louisiana-Pacific",
+    "sample_issuer": "LOUISIANA PAC CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "546347105"
+  },
+  "LRCX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Lam Research",
+    "sample_issuer": "LAM RESEARCH CORP",
+    "verified_quarter": "26Q3"
+  },
+  "LSCC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Lattice Semiconductor",
+    "sample_issuer": "LATTICE SEMICONDUCTOR CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "518415104"
+  },
+  "LX": {
+    "category": "China Book",
+    "canonical_name": "LexinFintech",
+    "sample_issuer": "LEXINFINTECH HLDGS LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "528877103"
+  },
+  "M": {
+    "category": "Other US Book",
+    "canonical_name": "Macy's",
+    "sample_issuer": "MACYS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "55616P104"
+  },
+  "MA": {
+    "category": "Other US Book",
+    "canonical_name": "Mastercard",
+    "sample_issuer": "MASTERCARD INCORPORATED",
+    "verified_quarter": "26Q3",
+    "cusip": "57636Q104"
+  },
+  "MAIR": {
+    "category": "Other US Book",
+    "canonical_name": "Madison Air Solutions",
+    "sample_issuer": "MADISON AIR SOLUTIONS CORP",
+    "verified_quarter": "26Q3"
+  },
+  "MCK": {
+    "category": "Other US Book",
+    "canonical_name": "McKesson",
+    "sample_issuer": "MCKESSON CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "58155Q103"
+  },
+  "MCO": {
+    "category": "Other US Book",
+    "canonical_name": "Moody's",
+    "sample_issuer": "MOODYS CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "615369105"
+  },
+  "MDB": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "MongoDB",
+    "sample_issuer": "MONGODB INC",
+    "verified_quarter": "26Q3",
+    "cusip": "60937P106"
+  },
+  "MDLN": {
+    "category": "Other US Book",
+    "canonical_name": "Medline",
+    "sample_issuer": "MEDLINE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "58507V107"
+  },
+  "MELI": {
+    "category": "Other US Book",
+    "canonical_name": "MercadoLibre",
+    "sample_issuer": "MERCADOLIBRE  INC",
+    "verified_quarter": "26Q3",
+    "cusip": "58733R102"
+  },
+  "META": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Meta",
+    "sample_issuer": "META PLATFORMS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "30303M102"
+  },
+  "MKSI": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "MKS Instruments",
+    "sample_issuer": "MKS INC.",
+    "verified_quarter": "26Q3",
+    "cusip": "55306N104"
+  },
+  "MLM": {
+    "category": "Other US Book",
+    "canonical_name": "Martin Marietta",
+    "sample_issuer": "MARTIN MARIETTA MATLS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "573284106"
+  },
+  "MMYT": {
+    "category": "Other US Book",
+    "canonical_name": "MakeMyTrip",
+    "sample_issuer": "MAKEMYTRIP LIMITED MAURITIUS",
+    "verified_quarter": "26Q3",
+    "cusip": "V5633W109"
+  },
+  "MNSO": {
+    "category": "China Book",
+    "canonical_name": "MINISO",
+    "sample_issuer": "MINISO GROUP HLDG LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "66981J102"
+  },
+  "MNTN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "MNTN",
+    "sample_issuer": "MNTN INC",
+    "verified_quarter": "26Q3",
+    "cusip": "55318A108"
+  },
+  "MOGU": {
+    "category": "China Book",
+    "canonical_name": "MOGU",
+    "sample_issuer": "MOGU INC",
+    "verified_quarter": "26Q3"
+  },
+  "MPT": {
+    "category": "Other US Book",
+    "canonical_name": "Medical Properties Trust",
+    "sample_issuer": "MEDICAL PROPERTIES TRUST INC",
+    "verified_quarter": "26Q3"
+  },
+  "MPWR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Monolithic Power Systems",
+    "sample_issuer": "MONOLITHIC PWR SYS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "609839105"
+  },
+  "MRVL": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Marvell Technology",
+    "sample_issuer": "MARVELL TECHNOLOGY INC",
+    "verified_quarter": "26Q3"
+  },
+  "MSCI": {
+    "category": "Other US Book",
+    "canonical_name": "MSCI",
+    "sample_issuer": "MSCI INC",
+    "verified_quarter": "26Q3",
+    "cusip": "55354G100"
+  },
+  "MSFT": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Microsoft",
+    "sample_issuer": "MICROSOFT CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "594918104"
+  },
+  "MT": {
+    "category": "Other US Book",
+    "canonical_name": "ArcelorMittal",
+    "sample_issuer": "ARCELORMITTAL SA LUXEMBOURG",
+    "verified_quarter": "26Q3"
+  },
+  "MTSI": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "MACOM Technology",
+    "sample_issuer": "MACOM TECH SOLUTIONS HLDGS I",
+    "verified_quarter": "26Q3"
+  },
+  "MTZ": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "MasTec",
+    "sample_issuer": "MASTEC INC",
+    "verified_quarter": "26Q3",
+    "cusip": "576323109"
+  },
+  "MU": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Micron Technology",
+    "sample_issuer": "MICRON TECHNOLOGY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "595112103"
+  },
+  "NBIS": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Nebius Group",
+    "sample_issuer": "NEBIUS GROUP N.V.",
+    "verified_quarter": "26Q3",
+    "cusip": "N97284108"
+  },
+  "NFLX": {
+    "category": "Other US Book",
+    "canonical_name": "Netflix",
+    "sample_issuer": "NETFLIX INC.",
+    "verified_quarter": "26Q3",
+    "cusip": "64110L106"
+  },
+  "NIO": {
+    "category": "China Book",
+    "canonical_name": "NIO",
+    "sample_issuer": "NIO INC",
+    "verified_quarter": "26Q3"
+  },
+  "NOAH": {
+    "category": "China Book",
+    "canonical_name": "Noah Holdings",
+    "sample_issuer": "NOAH HLDGS LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "65487X102"
+  },
+  "NOW": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "ServiceNow",
+    "sample_issuer": "SERVICENOW INC",
+    "verified_quarter": "26Q3"
+  },
+  "NTES": {
+    "category": "China Book",
+    "canonical_name": "NetEase",
+    "sample_issuer": "NETEASE COM INC",
+    "verified_quarter": "26Q3",
+    "cusip": "64110W102"
+  },
+  "NTRA": {
+    "category": "Other US Book",
+    "canonical_name": "Natera",
+    "sample_issuer": "NATERA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "632307104"
+  },
+  "NU": {
+    "category": "Other US Book",
+    "canonical_name": "Nu Holdings",
+    "sample_issuer": "NU HLDGS LTD",
+    "verified_quarter": "26Q3"
+  },
+  "NUE": {
+    "category": "Other US Book",
+    "canonical_name": "Nucor",
+    "sample_issuer": "NUCOR CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "670346105"
+  },
+  "NVAX": {
+    "category": "Other US Book",
+    "canonical_name": "Novavax",
+    "sample_issuer": "NOVAVAX INC",
+    "verified_quarter": "26Q3"
+  },
+  "NVDA": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "NVIDIA",
+    "sample_issuer": "NVIDIA CORPORATION",
+    "verified_quarter": "26Q3",
+    "cusip": "67066G104"
+  },
+  "NVR": {
+    "category": "Other US Book",
+    "canonical_name": "NVR",
+    "sample_issuer": "NVR INC",
+    "verified_quarter": "26Q3",
+    "cusip": "62944T105"
+  },
+  "NYT": {
+    "category": "Other US Book",
+    "canonical_name": "New York Times",
+    "sample_issuer": "NEW YORK TIMES CO MTN BE",
+    "verified_quarter": "26Q3",
+    "cusip": "650111107"
+  },
+  "OKTA": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Okta",
+    "sample_issuer": "OKTA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "679295105"
+  },
+  "OLPX": {
+    "category": "Other US Book",
+    "canonical_name": "Olaplex",
+    "sample_issuer": "OLAPLEX HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "679369108"
+  },
+  "ONON": {
+    "category": "Other US Book",
+    "canonical_name": "On Holding",
+    "sample_issuer": "ON HLDG AG",
+    "verified_quarter": "26Q3",
+    "cusip": "H5919C104"
+  },
+  "ONTO": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Onto Innovation",
+    "sample_issuer": "ONTO INNOVATION INC",
+    "verified_quarter": "26Q3",
+    "cusip": "683344105"
+  },
+  "OPCH": {
+    "category": "Other US Book",
+    "canonical_name": "Option Care Health",
+    "sample_issuer": "OPTION CARE HEALTH INC",
+    "verified_quarter": "26Q3",
+    "cusip": "68404L201"
+  },
+  "OXY": {
+    "category": "Other US Book",
+    "canonical_name": "Occidental Petroleum",
+    "sample_issuer": "OCCIDENTAL PETE CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "674599105"
+  },
+  "PATH": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "UiPath",
+    "sample_issuer": "UIPATH INC",
+    "verified_quarter": "26Q3"
+  },
+  "PAYP": {
+    "category": "Other US Book",
+    "canonical_name": "PayPay",
+    "sample_issuer": "PAYPAY CORP",
+    "verified_quarter": "26Q3"
+  },
+  "PCAR": {
+    "category": "Other US Book",
+    "canonical_name": "PACCAR",
+    "sample_issuer": "PACCAR INC",
+    "verified_quarter": "26Q3",
+    "cusip": "693718108"
+  },
+  "PDD": {
+    "category": "China Book",
+    "canonical_name": "PDD",
+    "sample_issuer": "PDD HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "PFGC": {
+    "category": "Other US Book",
+    "canonical_name": "Performance Food Group",
+    "sample_issuer": "PERFORMANCE FOOD GROUP CO",
+    "verified_quarter": "26Q3"
+  },
+  "PI": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Impinj",
+    "sample_issuer": "IMPINJ INC",
+    "verified_quarter": "26Q3",
+    "cusip": "453204109"
+  },
+  "PINS": {
+    "category": "Other US Book",
+    "canonical_name": "Pinterest",
+    "sample_issuer": "PINTEREST INC",
+    "verified_quarter": "26Q3"
+  },
+  "PLUG": {
+    "category": "Other US Book",
+    "canonical_name": "Plug Power",
+    "sample_issuer": "PLUG PWR INC",
+    "verified_quarter": "26Q3"
+  },
+  "PONY": {
+    "category": "China Book",
+    "canonical_name": "Pony.ai",
+    "sample_issuer": "PONY AI INC",
+    "verified_quarter": "26Q3",
+    "cusip": "732908108"
+  },
+  "PRENW": {
+    "category": "Other US Book",
+    "canonical_name": "Prenetics Global Warrants",
+    "sample_issuer": "PRENETICS GLOBAL LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "G72245114"
+  },
+  "PRVA": {
+    "category": "Other US Book",
+    "canonical_name": "Privia Health",
+    "sample_issuer": "PRIVIA HEALTH GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "74276R102"
+  },
+  "PSIX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Power Solutions International",
+    "sample_issuer": "POWER SOLUTIONS INTL INC",
+    "verified_quarter": "26Q3"
+  },
+  "PTON": {
+    "category": "Other US Book",
+    "canonical_name": "Peloton Interactive",
+    "sample_issuer": "PELOTON INTERACTIVE INC",
+    "verified_quarter": "26Q3"
+  },
+  "PURR": {
+    "category": "Other US Book",
+    "canonical_name": "Hyperliquid Strategies",
+    "sample_issuer": "HYPERLIQUID STRATEGIES INC",
+    "verified_quarter": "26Q3",
+    "cusip": "44916Y106"
+  },
+  "PWR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Quanta Services",
+    "sample_issuer": "QUANTA SVCS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "74762E102"
+  },
+  "PYPL": {
+    "category": "Other US Book",
+    "canonical_name": "PayPal",
+    "sample_issuer": "PAYPAL HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "70450Y103"
+  },
+  "Q": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Qnity Electronics",
+    "sample_issuer": "QNITY ELECTRONICS INC",
+    "verified_quarter": "26Q3"
+  },
+  "QCOM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Qualcomm",
+    "sample_issuer": "QUALCOMM INC",
+    "verified_quarter": "26Q3",
+    "cusip": "747525103"
+  },
+  "QFIN": {
+    "category": "China Book",
+    "canonical_name": "Qfin Holdings",
+    "sample_issuer": "QFIN HOLDINGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "88557W101"
+  },
+  "QNT": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Quantinuum",
+    "sample_issuer": "QUANTINUUM INC",
+    "verified_quarter": "26Q3",
+    "cusip": "74768A104"
+  },
+  "QS": {
+    "category": "Other US Book",
+    "canonical_name": "QuantumScape",
+    "sample_issuer": "QUANTUMSCAPE CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "74767V109"
+  },
+  "RACE": {
+    "category": "Other US Book",
+    "canonical_name": "Ferrari",
+    "sample_issuer": "FERRARI N V",
+    "verified_quarter": "26Q3"
+  },
+  "RBC": {
+    "category": "Other US Book",
+    "canonical_name": "RBC Bearings",
+    "sample_issuer": "RBC BEARINGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "75524B104"
+  },
+  "RBLX": {
+    "category": "Other US Book",
+    "canonical_name": "Roblox",
+    "sample_issuer": "ROBLOX CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "771049103"
+  },
+  "RDDT": {
+    "category": "Other US Book",
+    "canonical_name": "Reddit",
+    "sample_issuer": "REDDIT INC",
+    "verified_quarter": "26Q3",
+    "cusip": "75734B100"
+  },
+  "RDGT": {
+    "category": "China Book",
+    "canonical_name": "Ridgetech",
+    "sample_issuer": "RIDGETECH INC",
+    "verified_quarter": "26Q3"
+  },
+  "RERE": {
+    "category": "China Book",
+    "canonical_name": "ATRenew",
+    "sample_issuer": "ATRENEW INC",
+    "verified_quarter": "26Q3",
+    "cusip": "00138L108"
+  },
+  "RKT": {
+    "category": "Other US Book",
+    "canonical_name": "Rocket Companies",
+    "sample_issuer": "ROCKET COS INC",
+    "verified_quarter": "26Q3"
+  },
+  "RLX": {
+    "category": "China Book",
+    "canonical_name": "RLX Technology",
+    "sample_issuer": "RLX TECHNOLOGY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "74969N103"
+  },
+  "RNG": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "RingCentral",
+    "sample_issuer": "RINGCENTRAL INC",
+    "verified_quarter": "26Q3",
+    "cusip": "76680R206"
+  },
+  "ROL": {
+    "category": "Other US Book",
+    "canonical_name": "Rollins",
+    "sample_issuer": "ROLLINS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "775711104"
+  },
+  "ROOT": {
+    "category": "Other US Book",
+    "canonical_name": "Root",
+    "sample_issuer": "ROOT INC",
+    "verified_quarter": "26Q3"
+  },
+  "RVTY": {
+    "category": "Other US Book",
+    "canonical_name": "Revvity",
+    "sample_issuer": "REVVITY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "714046109"
+  },
+  "SCHW": {
+    "category": "Other US Book",
+    "canonical_name": "Charles Schwab",
+    "sample_issuer": "CHARLES SCHWAB CORP (THE)",
+    "verified_quarter": "26Q3",
+    "cusip": "808513105"
+  },
+  "SE": {
+    "category": "Other US Book",
+    "canonical_name": "Sea",
+    "sample_issuer": "SEA LTD",
+    "verified_quarter": "26Q3"
+  },
+  "SFIX": {
+    "category": "Other US Book",
+    "canonical_name": "Stitch Fix",
+    "sample_issuer": "STITCH FIX INC",
+    "verified_quarter": "26Q3",
+    "cusip": "860897107"
+  },
+  "SFM": {
+    "category": "Other US Book",
+    "canonical_name": "Sprouts Farmers Market",
+    "sample_issuer": "SPROUTS FMRS MKT INC",
+    "verified_quarter": "26Q3"
+  },
+  "SGI": {
+    "category": "Other US Book",
+    "canonical_name": "Somnigroup International",
+    "sample_issuer": "SOMNIGROUP INTERNATIONAL INC",
+    "verified_quarter": "26Q3"
+  },
+  "SHAZ": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "SharonAI",
+    "sample_issuer": "SHARONAI HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "SHOP": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Shopify",
+    "sample_issuer": "SHOPIFY INC",
+    "verified_quarter": "26Q3"
+  },
+  "SHW": {
+    "category": "Other US Book",
+    "canonical_name": "Sherwin-Williams",
+    "sample_issuer": "SHERWIN WILLIAMS CO",
+    "verified_quarter": "26Q3",
+    "cusip": "824348106"
+  },
+  "SIRI": {
+    "category": "Other US Book",
+    "canonical_name": "SiriusXM",
+    "sample_issuer": "SIRIUSXM HOLDINGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "SITM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "SiTime",
+    "sample_issuer": "SITIME CORP",
+    "verified_quarter": "26Q3"
+  },
+  "SKHY": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "SK hynix",
+    "sample_issuer": "SK HYNIX INC",
+    "verified_quarter": "26Q3",
+    "cusip": "78392B206"
+  },
+  "SMH": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "VanEck Semiconductor ETF (SMH)",
+    "sample_issuer": "VANECK ETF TRUST",
+    "verified_quarter": "26Q3"
+  },
+  "SMTC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Semtech",
+    "sample_issuer": "SEMTECH CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "816850101"
+  },
+  "SNDK": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "SanDisk",
+    "sample_issuer": "SANDISK CORP",
+    "verified_quarter": "26Q3"
+  },
+  "SNOW": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Snowflake",
+    "sample_issuer": "SNOWFLAKE INC",
+    "verified_quarter": "26Q3"
+  },
+  "SNPS": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Synopsys",
+    "sample_issuer": "SYNOPSYS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "871607107"
+  },
+  "SPCX": {
+    "category": "Other US Book",
+    "canonical_name": "SpaceX",
+    "sample_issuer": "SPACE EXPLORATION TECHN CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "84615Q103"
+  },
+  "SPGI": {
+    "category": "Other US Book",
+    "canonical_name": "S&P Global",
+    "sample_issuer": "S&P GLOBAL INC",
+    "verified_quarter": "26Q3",
+    "cusip": "78409V104"
+  },
+  "SPOT": {
+    "category": "Other US Book",
+    "canonical_name": "Spotify",
+    "sample_issuer": "SPOTIFY TECHNOLOGY S A",
+    "verified_quarter": "26Q3"
+  },
+  "SPWH": {
+    "category": "Other US Book",
+    "canonical_name": "Sportsman's Warehouse",
+    "sample_issuer": "SPORTSMANS WHSE HLDGS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "84920Y106"
+  },
+  "STRL": {
+    "category": "Other US Book",
+    "canonical_name": "Sterling Infrastructure",
+    "sample_issuer": "STERLING INFRASTRUCTURE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "859241101"
+  },
+  "STX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Seagate Technology",
+    "sample_issuer": "SEAGATE TECHNOLOGY HLDNGS PL",
+    "verified_quarter": "26Q3"
+  },
+  "SVCO": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Silvaco",
+    "sample_issuer": "SILVACO GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "82728C102"
+  },
+  "TAL": {
+    "category": "China Book",
+    "canonical_name": "TAL Education",
+    "sample_issuer": "TAL ED GROUP",
+    "verified_quarter": "26Q3"
+  },
+  "TCOM": {
+    "category": "China Book",
+    "canonical_name": "Trip.com",
+    "sample_issuer": "TRIP COM GROUP LTD",
+    "verified_quarter": "26Q3"
+  },
+  "TDG": {
+    "category": "Other US Book",
+    "canonical_name": "TransDigm",
+    "sample_issuer": "TRANSDIGM GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "893641100"
+  },
+  "TER": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Teradyne",
+    "sample_issuer": "TERADYNE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "880770102"
+  },
+  "TMO": {
+    "category": "Other US Book",
+    "canonical_name": "Thermo Fisher Scientific",
+    "sample_issuer": "THERMO FISHER SCIENTIFIC INC",
+    "verified_quarter": "26Q3",
+    "cusip": "883556102"
+  },
+  "TOST": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Toast",
+    "sample_issuer": "TOAST INC",
+    "verified_quarter": "26Q3",
+    "cusip": "888787108"
+  },
+  "TOUR": {
+    "category": "China Book",
+    "canonical_name": "Tuniu",
+    "sample_issuer": "TUNIU CORP",
+    "verified_quarter": "26Q3"
+  },
+  "TSLA": {
+    "category": "Other US Book",
+    "canonical_name": "Tesla",
+    "sample_issuer": "TESLA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "88160R101"
+  },
+  "TSM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "TSMC",
+    "sample_issuer": "TAIWAN SEMICONDUCTOR MANUFAC",
+    "verified_quarter": "26Q3",
+    "cusip": "874039100"
+  },
+  "TTAN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "ServiceTitan",
+    "sample_issuer": "SERVICETITAN INC",
+    "verified_quarter": "26Q3",
+    "cusip": "81764X103"
+  },
+  "TTD": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "The Trade Desk",
+    "sample_issuer": "THE TRADE DESK INC",
+    "verified_quarter": "26Q3",
+    "cusip": "88339J105"
+  },
+  "TTMI": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "TTM Technologies",
+    "sample_issuer": "TTM TECHNOLOGIES INC",
+    "verified_quarter": "26Q3",
+    "cusip": "87305R109"
+  },
+  "TTWO": {
+    "category": "Other US Book",
+    "canonical_name": "Take-Two Interactive",
+    "sample_issuer": "TAKE-TWO INTERACTIVE SOFTWAR",
+    "verified_quarter": "26Q3",
+    "cusip": "874054109"
+  },
+  "TUYA": {
+    "category": "China Book",
+    "canonical_name": "Tuya",
+    "sample_issuer": "TUYA INC",
+    "verified_quarter": "26Q3",
+    "cusip": "90114C107"
+  },
+  "TWLO": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Twilio",
+    "sample_issuer": "TWILIO INC",
+    "verified_quarter": "26Q3"
+  },
+  "TXN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Texas Instruments",
+    "sample_issuer": "TEXAS INSTRS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "882508104"
+  },
+  "U": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Unity Software",
+    "sample_issuer": "UNITY SOFTWARE INC",
+    "verified_quarter": "26Q3",
+    "cusip": "91332U101"
+  },
+  "UBER": {
+    "category": "Other US Book",
+    "canonical_name": "Uber",
+    "sample_issuer": "UBER TECHNOLOGIES INC",
+    "verified_quarter": "26Q3",
+    "cusip": "90353T100"
+  },
+  "ULS": {
+    "category": "Other US Book",
+    "canonical_name": "UL Solutions",
+    "sample_issuer": "UL SOLUTIONS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "903731107"
+  },
+  "UMC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "United Microelectronics",
+    "sample_issuer": "UNITED MICROELECTRONICS CORP",
+    "verified_quarter": "26Q3"
+  },
+  "UNH": {
+    "category": "Other US Book",
+    "canonical_name": "UnitedHealth",
+    "sample_issuer": "UNITEDHEALTH GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "91324P102"
+  },
+  "UPST": {
+    "category": "Other US Book",
+    "canonical_name": "Upstart",
+    "sample_issuer": "UPSTART HLDGS INC",
+    "verified_quarter": "26Q3"
+  },
+  "URI": {
+    "category": "Other US Book",
+    "canonical_name": "United Rentals",
+    "sample_issuer": "UNITED RENTALS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "911363109"
+  },
+  "USFD": {
+    "category": "Other US Book",
+    "canonical_name": "US Foods",
+    "sample_issuer": "US FOODS HLDG CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "912008109"
+  },
+  "UVXY": {
+    "category": "Other US Book",
+    "canonical_name": "ProShares Ultra VIX (UVXY)",
+    "sample_issuer": "PROSHARES TR II",
+    "verified_quarter": "26Q3"
+  },
+  "V": {
+    "category": "Other US Book",
+    "canonical_name": "Visa",
+    "sample_issuer": "VISA INC",
+    "verified_quarter": "26Q3"
+  },
+  "VIA": {
+    "category": "Other US Book",
+    "canonical_name": "Via Transportation",
+    "sample_issuer": "VIA TRANSN INC",
+    "verified_quarter": "26Q3"
+  },
+  "VIAV": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Viavi Solutions",
+    "sample_issuer": "VIAVI SOLUTIONS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "925550105"
+  },
+  "VICR": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Vicor",
+    "sample_issuer": "VICOR CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "925815102"
+  },
+  "VIK": {
+    "category": "Other US Book",
+    "canonical_name": "Viking Holdings",
+    "sample_issuer": "VIKING HOLDINGS LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "G93A5A101"
+  },
+  "VIPS": {
+    "category": "China Book",
+    "canonical_name": "Vipshop",
+    "sample_issuer": "VIPSHOP HLDGS LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "92763W103"
+  },
+  "VNET": {
+    "category": "China Book",
+    "canonical_name": "VNET",
+    "sample_issuer": "VNET GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "90138A103"
+  },
+  "VRSN": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "VeriSign",
+    "sample_issuer": "VERISIGN INC",
+    "verified_quarter": "26Q3",
+    "cusip": "92343E102"
+  },
+  "VRT": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Vertiv",
+    "sample_issuer": "VERTIV HOLDINGS CO",
+    "verified_quarter": "26Q3",
+    "cusip": "92537N108"
+  },
+  "VSEC": {
+    "category": "Other US Book",
+    "canonical_name": "VSE Corp",
+    "sample_issuer": "VSE CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "918284100"
+  },
+  "WAB": {
+    "category": "Other US Book",
+    "canonical_name": "Wabtec",
+    "sample_issuer": "WABTEC",
+    "verified_quarter": "26Q3",
+    "cusip": "929740108"
+  },
+  "WDC": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Western Digital",
+    "sample_issuer": "WESTERN DIGITAL CORP",
+    "verified_quarter": "26Q3",
+    "cusip": "958102105"
+  },
+  "WIX": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Wix.com",
+    "sample_issuer": "WIX COM LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "M98068105"
+  },
+  "WLTH": {
+    "category": "Other US Book",
+    "canonical_name": "Wealthfront",
+    "sample_issuer": "WEALTHFRONT CORP",
+    "verified_quarter": "26Q3"
+  },
+  "WRBY": {
+    "category": "Other US Book",
+    "canonical_name": "Warby Parker",
+    "sample_issuer": "WARBY PARKER INC",
+    "verified_quarter": "26Q3",
+    "cusip": "93403J106"
+  },
+  "WRD": {
+    "category": "China Book",
+    "canonical_name": "WeRide",
+    "sample_issuer": "WERIDE INC",
+    "verified_quarter": "26Q3"
+  },
+  "WULF": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "TeraWulf",
+    "sample_issuer": "TERAWULF INC",
+    "verified_quarter": "26Q3",
+    "cusip": "88080T104"
+  },
+  "WWD": {
+    "category": "Other US Book",
+    "canonical_name": "Woodward",
+    "sample_issuer": "WOODWARD INC",
+    "verified_quarter": "26Q3",
+    "cusip": "980745103"
+  },
+  "XMTR": {
+    "category": "Other US Book",
+    "canonical_name": "Xometry",
+    "sample_issuer": "XOMETRY INC",
+    "verified_quarter": "26Q3",
+    "cusip": "98423F109"
+  },
+  "XNDU": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Xanadu Quantum",
+    "sample_issuer": "XANADU QUANTUM TECHNOLO LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "98390R102"
+  },
+  "XPO": {
+    "category": "Other US Book",
+    "canonical_name": "XPO",
+    "sample_issuer": "XPO INC",
+    "verified_quarter": "26Q3"
+  },
+  "XYZ": {
+    "category": "Other US Book",
+    "canonical_name": "Block",
+    "sample_issuer": "BLOCK INC",
+    "verified_quarter": "26Q3",
+    "cusip": "852234103"
+  },
+  "YMM": {
+    "category": "China Book",
+    "canonical_name": "YMM",
+    "sample_issuer": "FULL TRUCK ALLIANCE CO LTD",
+    "verified_quarter": "26Q3",
+    "cusip": "35969L108"
+  },
+  "YSG": {
+    "category": "China Book",
+    "canonical_name": "Yatsen",
+    "sample_issuer": "YATSEN HLDG LTD",
+    "verified_quarter": "26Q3"
+  },
+  "Z": {
+    "category": "Other US Book",
+    "canonical_name": "Zillow",
+    "sample_issuer": "ZILLOW GROUP INC",
+    "verified_quarter": "26Q3"
+  },
+  "ZEPP": {
+    "category": "China Book",
+    "canonical_name": "Zepp Health",
+    "sample_issuer": "ZEPP HEALTH CORPORATION",
+    "verified_quarter": "26Q3"
+  },
+  "ZG": {
+    "category": "Other US Book",
+    "canonical_name": "Zillow",
+    "sample_issuer": "ZILLOW GROUP INC",
+    "verified_quarter": "26Q3",
+    "cusip": "98954M101"
+  },
+  "ZH": {
+    "category": "China Book",
+    "canonical_name": "Zhihu",
+    "sample_issuer": "ZHIHU INC",
+    "verified_quarter": "26Q3"
+  },
+  "ZM": {
+    "category": "AI/Semi/US SaaS",
+    "canonical_name": "Zoom Communications",
+    "sample_issuer": "ZOOM COMMUNICATIONS INC",
+    "verified_quarter": "26Q3",
+    "cusip": "98980L101"
+  },
+  "ZTO": {
+    "category": "China Book",
+    "canonical_name": "ZTO Express",
+    "sample_issuer": "ZTO EXPRESS CAYMAN IN",
+    "verified_quarter": "26Q3",
+    "cusip": "98980A105"
+  }
+}

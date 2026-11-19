@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import copy
 import fcntl
+import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -18,7 +20,26 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from edgar import Company, set_identity
+
+# Lazy-loaded so offline callers (e.g. audit_13f_run.py) never trigger edgartools cache init.
+Company: Any = None
+set_identity: Any = None
+
+
+def _ensure_set_identity() -> None:
+    global set_identity
+    if set_identity is None:
+        from edgar import set_identity as _set_identity
+
+        set_identity = _set_identity
+
+
+def _ensure_company() -> None:
+    global Company
+    if Company is None:
+        from edgar import Company as _Company
+
+        Company = _Company
 
 pd.set_option("display.max_rows", None)
 pd.set_option("display.max_columns", None)
@@ -53,10 +74,14 @@ _MERGE_RULES: dict[str, Any] = {}
 _INSTITUTION_MAP: dict[str, Any] = {}
 _NAME_TO_TICKER: dict[str, Any] = {}
 _TICKER_ALIASES: dict[str, Any] = {}
+_VERIFIED_TICKERS: dict[str, Any] = {}
 
 _CHINA_TICKERS: set[str] = set()
 _AI_SEMI_TICKERS: set[str] = set()
 _OTHER_US_TICKERS: set[str] = set()
+_AMBIGUOUS_NAME_TICKERS: set[str] = set()
+_AMBIGUOUS_NAME_KEYS: set[str] = set()
+_SPONSOR_FUND_TICKERS: dict[str, set[str]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +100,7 @@ def resolve_sec_identity() -> tuple[str, str]:
 
 def configure_identity(*, warn_default: bool = False) -> tuple[str, str]:
     """Configure edgartools User-Agent identity from environment or built-in default."""
+    _ensure_set_identity()
     identity, source = resolve_sec_identity()
     if warn_default and source == "default":
         print(
@@ -173,7 +199,7 @@ def _init_state(workspace_dir: str | Path | None = None) -> None:
     global _WORKSPACE_DIR, _STATE_DIR, _WRITES_ENABLED
     global _BUILTIN_CLASSIFICATION, _BUILTIN_DICTS
     global _BOOT_CLASSIFICATION_MAP, _BOOT_DICTS, _BOOT_PATCHES
-    global _CLASSIFICATION, _MERGE_RULES, _INSTITUTION_MAP, _NAME_TO_TICKER, _TICKER_ALIASES
+    global _CLASSIFICATION, _MERGE_RULES, _INSTITUTION_MAP, _NAME_TO_TICKER, _TICKER_ALIASES, _VERIFIED_TICKERS
 
     _WORKSPACE_DIR = Path(workspace_dir).resolve() if workspace_dir else None
     if _WORKSPACE_DIR is not None:
@@ -224,7 +250,19 @@ def _init_state(workspace_dir: str | Path | None = None) -> None:
     _MERGE_RULES = merged_dicts["merge_rules.json"]
     _INSTITUTION_MAP = merged_dicts["institution_map.json"]
     _NAME_TO_TICKER = merged_dicts["name_to_ticker.json"]
-    _TICKER_ALIASES = merged_dicts["ticker_aliases.json"]
+    raw_aliases = merged_dicts["ticker_aliases.json"]
+    _TICKER_ALIASES = {
+        k: v
+        for k, v in raw_aliases.items()
+        if k == "_comment"
+        or not (_derivative_ticker_kind(str(k)) and not _derivative_ticker_kind(str(v)))
+    }
+    verified = _read_json_file(SCRIPT_DIR / "verified_tickers.json")
+    if _STATE_DIR is not None:
+        ws_verified = _read_json_file(_STATE_DIR / "verified_tickers.json")
+        if isinstance(ws_verified, dict):
+            verified.update(ws_verified)
+    _VERIFIED_TICKERS = verified
 
     _CHINA_TICKERS.clear()
     _CHINA_TICKERS.update(_CLASSIFICATION.get("china_book", []))
@@ -232,6 +270,8 @@ def _init_state(workspace_dir: str | Path | None = None) -> None:
     _AI_SEMI_TICKERS.update(_CLASSIFICATION.get("ai_semi_saas", []))
     _OTHER_US_TICKERS.clear()
     _OTHER_US_TICKERS.update(_CLASSIFICATION.get("other_us_book", []))
+    _AMBIGUOUS_NAME_KEYS.clear()
+    _rebuild_name_lookup_index()
 
 
 def _save_json(name: str, payload: dict[str, Any]) -> None:
@@ -514,10 +554,179 @@ _CHINA_HINTS = [
     "tuya", "uxin", "mogu", "vnet", "agora", "china", "hong kong", "hldg ltd",
 ]
 _AI_HINTS = [
-    "semiconductor", "nvidia", "microsoft", "alphabet", "meta", "amazon", "tesla",
+    "semiconductor", "nvidia", "microsoft", "alphabet", "meta", "amazon",
     "software", "cloud", "analytics", "saas", "tsm", "broadcom", "adobe",
-    "artificial intelligence", "machine learning",
+    "artificial intelligence", "machine learning", "hynix", "cerebras",
+    "seagate technology", "western digital", "sandisk", "micron technology", "optoelectronics",
+    "quantum computing", "neocloud", "gas turbine", "fuel cell", "fuelcell",
+    "power grid", "grid infrastructure", "switchgear", "data center power",
 ]
+
+_UMBRELLA_TRUST_RE = re.compile(
+    r"^(?:"
+    r"ISHARES(?:\s+(?:TR|TRUST|INC))?|"
+    r"VANECK\s+ETF(?:\s+(?:TR|TRUST))?|"
+    r"(?:SELECT\s+SECTOR\s+)?SPDR\s+(?:SER|SERIES)\s+(?:TR|TRUST)|"
+    r"SPDR\s+(?:SERIES|INDEX(?:\s+SHS\s+FDS)?)|"
+    r"SELECT\s+SECTOR(?:\s+SPDR\s+TR)?|"
+    r"VANGUARD\s+(?:ADMIRAL|BD\s+INDEX\s+FDS|INDEX(?:\s+FDS)?|SCOTTSDALE(?:\s+FDS)?|"
+    r"SPECIALIZED(?:\s+FUNDS)?|STAR(?:\s+FDS)?|TAX-MANAGED(?:\s+FDS)?|WHITEHALL\s+FDS|WORLD(?:\s+FD)?)|"
+    r"PROSHARES(?:\s+(?:TR|TRUST)(?:\s+II)?)?|"
+    r"FIDELITY\s+COVINGTON(?:\s+TRUST)?|"
+    r"KRANESHARES\s+TRUST|"
+    r"GLOBAL\s+X(?:\s+FDS)?|"
+    r"WISDOMTREE(?:\s+(?:TR|TRUST))?|"
+    r"ARK\s+ETF(?:\s+(?:TR|TRUST))?|"
+    r"ALPS\s+ETF(?:\s+(?:TR|TRUST))?|"
+    r"DBX\s+ETF(?:\s+(?:TR|TRUST))?|"
+    r"AMERICAN\s+CENTY(?:\s+ETF\s+TR)?|"
+    r"AMPLIFY\s+(?:ETF(?:\s+TR)?|COMMODITY(?:\s+TRUST)?)|"
+    r"BONDBLOXX\s+ETF(?:\s+TRUST)?|"
+    r"ETF\s+SER(?:IES)?(?:\s+SOLUTIONS)?|"
+    r"FIRST\s+TR(?:UST)?|"
+    r"GOLDMAN\s+SACHS\s+ETF\s+TR|"
+    r"INVESCO\s+(?:EXCHANGE\s+TRADED\s+FD\s+T|ACTVELY|TR)|"
+    r"J\s*P\s*MORGAN\s+EXCHANGE\s+TRADED\s+F|"
+    r"LISTED\s+FDS(?:\s+TR)?|"
+    r"SCHWAB\s+STRATEGIC(?:\s+TR)?|"
+    r"SSGA\s+ACTIVE(?:\s+ETF\s+TR)?|"
+    r"TIDAL\s+(?:ETF\s+)?TR|"
+    r"ELEVATION\s+SERIES|"
+    r"IPATH\s+SERIES"
+    r")$"
+)
+
+_ISSUER_STOPWORDS = frozenset({
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "LTD", "LIMITED", "PLC",
+    "CO", "COMPANY", "LLC", "LP", "GROUP", "GRP", "HOLDING", "HOLDINGS",
+    "HLDG", "HLDGS", "HLDNGS", "SA", "NV", "SPA", "AG", "DEL", "NEW",
+    "TR", "TRUST", "ETF", "FD", "FDS", "FUNDS", "SER", "SERIES",
+    "THE", "OF", "AND", "FOR", "&",
+})
+
+
+def _issuer_stem_tokens(name: str) -> set[str]:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", " ", (name or "").upper()).strip()
+    return {
+        w[:4]
+        for w in cleaned.split()
+        if w not in _ISSUER_STOPWORDS and len(w) >= 2
+    }
+
+
+_FUND_TYPE_WORDS = frozenset({"FDS", "FUNDS", "TRUST", "TR", "ETF"})
+_UMBRELLA_SERIES_WORDS = frozenset({
+    "FDS", "FUNDS", "SER", "SERIES", "ADMIRAL", "SCOTTSDALE", "SPECIALIZED",
+    "TAX-MANAGED", "WHITEHALL", "COVINGTON", "STRATEGIC", "EXCHANGE", "TRADED",
+    "LISTED", "ACTIVE", "ACTVELY", "SELECT", "SECTOR", "WORLD", "STAR",
+    "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "LTD", "LP", "LLC",
+    "I", "II", "III", "IV", "T", "F", "FD", "FUND",
+})
+
+
+def _is_umbrella_issuer(issuer_upper: str) -> bool:
+    norm = re.sub(r"[\.,]+", " ", (issuer_upper or "").upper())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm:
+        return False
+    if _UMBRELLA_TRUST_RE.match(norm):
+        return True
+    toks = norm.split()
+    if not (set(toks) & _FUND_TYPE_WORDS):
+        return False
+    rem = [t for t in toks if t not in (_FUND_TYPE_WORDS | _UMBRELLA_SERIES_WORDS)]
+    is_plural_series = bool(set(toks) & {"FDS", "FUNDS", "SER", "SERIES"})
+    if not rem:
+        return True
+    if len(rem) == 1 and len(_SPONSOR_FUND_TICKERS.get(rem[0], ())) >= 3:
+        return True
+    if is_plural_series and len(rem) <= 2 and len(_SPONSOR_FUND_TICKERS.get(toks[0], ())) >= 3:
+        return True
+    return False
+
+
+_DERIV_PARENT_TICKERS: set[str] = set()
+
+
+def _rebuild_name_lookup_index() -> None:
+    """Index sponsor fund counts, derivative parents, and multi-issuer tickers."""
+    _AMBIGUOUS_NAME_TICKERS.clear()
+    _SPONSOR_FUND_TICKERS.clear()
+    _DERIV_PARENT_TICKERS.clear()
+    for tk in _CHINA_TICKERS | _AI_SEMI_TICKERS | _OTHER_US_TICKERS | set(_MERGE_RULES):
+        t = _clean_ticker(tk)
+        if not t or t.startswith("_"):
+            continue
+        m = (
+            re.match(r"^([A-Z]{1,5})[.\-/](?:W|WS|WW|WT|R|RT|RTS)$", t)
+            or re.match(r"^([A-Z]{3,})(?:WS|WW|WT|RT|RTS)$", t)
+            or re.match(r"^([A-Z]{4,})(?:W|R)$", t)
+        )
+        if m:
+            _DERIV_PARENT_TICKERS.add(m.group(1))
+    for name, tk in _NAME_TO_TICKER.items():
+        if not name or name.startswith("_"):
+            continue
+        t = _clean_ticker(tk)
+        if not t:
+            continue
+        toks = re.sub(r"[\.,]+", " ", name.upper()).split()
+        if toks and (set(toks) & _FUND_TYPE_WORDS):
+            _SPONSOR_FUND_TICKERS.setdefault(toks[0], set()).add(t)
+
+    by_ticker: dict[str, list[set[str]]] = {}
+    for name, tk in _NAME_TO_TICKER.items():
+        if not name or name.startswith("_") or _is_umbrella_issuer(name):
+            continue
+        t = _clean_ticker(tk)
+        if not t:
+            continue
+        stems = _issuer_stem_tokens(name)
+        if stems:
+            by_ticker.setdefault(t, []).append(stems)
+    for t, stem_groups in by_ticker.items():
+        if len(stem_groups) < 2:
+            continue
+        base = stem_groups[0]
+        if any(not (g & base) for g in stem_groups[1:]):
+            _AMBIGUOUS_NAME_TICKERS.add(t)
+
+
+def _lookup_ticker_by_issuer(issuer_upper: str) -> str:
+    """Reverse-lookup equity ticker by issuer only when non-umbrella and uniquely mapped."""
+    key = (issuer_upper or "").upper().strip()
+    if not key or key in _AMBIGUOUS_NAME_KEYS or _is_umbrella_issuer(key):
+        return ""
+    cand = _clean_ticker(_NAME_TO_TICKER.get(key, ""))
+    if not cand:
+        return ""
+    if _detect_security_kind(cand, key, "") != "equity":
+        return ""
+    if cand in _AMBIGUOUS_NAME_TICKERS:
+        # Allow only when candidate's canonical name explicitly matches the queried issuer
+        canon = _MERGE_RULES.get(cand, "")
+        canon_stems = _issuer_stem_tokens(canon)
+        iss_stems = _issuer_stem_tokens(key)
+        if not canon_stems or not (canon_stems & iss_stems):
+            return ""
+    return cand
+
+
+def _clean_ticker(raw) -> str:
+    """Normalize SEC ticker; treat missing values (None/NaN/pd.NA/blank) as '', preserving real ticker 'NAN'."""
+    if raw is None:
+        return ""
+    if isinstance(raw, float) and math.isnan(raw):
+        return ""
+    try:
+        if pd.isna(raw):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(raw).strip()
+    if not s or s == "<NA>":
+        return ""
+    return s.upper()
 
 
 def _category_key(category: str) -> str:
@@ -546,19 +755,28 @@ def _infer_category_fallback(ticker: str, issuer: str) -> str:
 
 def _learn_name_to_ticker(ticker: str, issuer: str, short_name: str = ""):
     """Record name->ticker mappings from SEC data for reverse lookup."""
-    t = (ticker or "").upper().strip()
-    if not t or len(t) > 6 or t == "NAN":
+    t = _clean_ticker(ticker)
+    if not t or len(t) > 6 or not _is_valid_ticker(t):
         return
-    if not _is_valid_ticker(t):
+    if _is_umbrella_issuer((issuer or "").upper().strip()):
+        return
+    if _detect_security_kind(t, issuer, "") != "equity":
+        return
+    if len(t) >= 5 and re.search(r"PR[A-Z]$", t):
         return
     changed = False
     for name in (issuer, short_name):
         key = (name or "").upper().strip()
-        if key and key != t and len(key) > 1:
-            if _NAME_TO_TICKER.get(key) != t:
-                _NAME_TO_TICKER[key] = t
-                changed = True
+        if not key or key == t or len(key) <= 1 or _is_umbrella_issuer(key):
+            continue
+        existing = _NAME_TO_TICKER.get(key)
+        if existing is None:
+            _NAME_TO_TICKER[key] = t
+            changed = True
+        elif existing != t and name == issuer:
+            _AMBIGUOUS_NAME_KEYS.add(key)
     if changed:
+        _rebuild_name_lookup_index()
         _save_json("name_to_ticker.json", _NAME_TO_TICKER)
 
 
@@ -587,6 +805,8 @@ def _learn_ticker_alias(sec_ticker: str, classification_ticker: str, source: str
     s = (sec_ticker or "").upper().strip()
     c = (classification_ticker or "").upper().strip()
     if not s or not c or s == c or s.startswith("_"):
+        return
+    if _derivative_ticker_kind(s) and not _derivative_ticker_kind(c):
         return
     if not _is_valid_ticker(s) or not _is_valid_ticker(c):
         return
@@ -648,6 +868,8 @@ def _learn_classification(ticker: str, category: str, source: str = "fallback"):
     _AI_SEMI_TICKERS.update(_CLASSIFICATION.get("ai_semi_saas", []))
     _OTHER_US_TICKERS.clear()
     _OTHER_US_TICKERS.update(_CLASSIFICATION.get("other_us_book", []))
+    _AMBIGUOUS_NAME_KEYS.clear()
+    _rebuild_name_lookup_index()
     _append_auto_learn_log("classification", t, category, source)
 
 
@@ -666,7 +888,7 @@ def _learn_institution_alias(alias: str, cik_value: str, source: str = "lookup")
 def _learn_merge_rule(ticker: str, canonical: str, source: str = "inferred"):
     t = (ticker or "").upper().strip()
     c = (canonical or "").strip()
-    if not t or not c:
+    if not t or not c or _derivative_ticker_kind(t):
         return
     if _MERGE_RULES.get(t) == c:
         return
@@ -736,6 +958,7 @@ def _resolve_institution(identifier: str, auto_learn: bool = True):
         raise RuntimeError(f"Invalid institution: {identifier}")
 
     try:
+        _ensure_company()
         if str(identifier).isdigit() or (str(identifier).startswith("0") and str(identifier).replace("0", "").isdigit()):
             company = Company(int(identifier))
         else:
@@ -814,11 +1037,59 @@ def _is_biotech(ticker: str, issuer: str) -> bool:
 # ---------------------------------------------------------------------------
 # Classification (#3)
 # ---------------------------------------------------------------------------
-def _classify(ticker: str, issuer: str = "", auto_learn: bool = True) -> str:
-    t = (ticker or "").upper()
+def _ledger_entry_matches(ticker: str, cusip_norm: str = "", issuer: str = "") -> bool:
+    """Verify row (CUSIP, issuer) matches verified_tickers entry for ticker (prevents ticker reuse mixups)."""
+    t = _clean_ticker(ticker)
+    if not t:
+        return True
+    vt = _VERIFIED_TICKERS.get(t)
+    if not isinstance(vt, dict):
+        return True
 
-    # 1) Resolve ticker alias from ticker_aliases.json (SEC ticker -> common ticker)
-    resolved = _TICKER_ALIASES.get(t, t)
+    row_cusip = (cusip_norm or "").strip().upper()
+    raw_vt_cusip = vt.get("cusip")
+    if raw_vt_cusip and row_cusip:
+        if isinstance(raw_vt_cusip, (list, tuple, set)):
+            allowed_cusips = {str(c or "").strip().upper() for c in raw_vt_cusip if str(c or "").strip()}
+        else:
+            allowed_cusips = {str(raw_vt_cusip).strip().upper()}
+        if allowed_cusips and row_cusip not in allowed_cusips:
+            return False
+        if allowed_cusips:
+            # Same CUSIP is the same security; issuers rename (QIFU TECHNOLOGY ->
+            # QFIN HOLDINGS), so the name is consulted only when no CUSIP decides.
+            return True
+
+    row_issuer = (issuer or "").strip()
+    sample_issuer = str(vt.get("sample_issuer") or "").strip()
+    if row_issuer and sample_issuer:
+        row_stems = _issuer_stem_tokens(row_issuer)
+        sample_stems = _issuer_stem_tokens(sample_issuer)
+        canon_stems = _issuer_stem_tokens(str(vt.get("canonical_name") or ""))
+        if row_stems and sample_stems and not (row_stems & (sample_stems | canon_stems)):
+            return False
+    return True
+
+
+def _classify(
+    ticker: str,
+    issuer: str = "",
+    auto_learn: bool = True,
+    allow_issuer_lookup: bool = True,
+    cusip: str = "",
+) -> str:
+    t = _clean_ticker(ticker)
+    if not t and issuer and allow_issuer_lookup:
+        t = _lookup_ticker_by_issuer(issuer)
+
+    cusip_norm = (cusip or "").strip().upper()
+    if t and not _ledger_entry_matches(t, cusip_norm, issuer):
+        return _infer_category_fallback("", issuer)
+
+    raw_deriv_kind = _derivative_ticker_kind(t)
+    # 1) Resolve ticker alias from ticker_aliases.json BEFORE common fallback, but never map derivative -> common
+    alias_val = _clean_ticker(_TICKER_ALIASES.get(t, t)) or t
+    resolved = t if (raw_deriv_kind and not _derivative_ticker_kind(alias_val)) else alias_val
 
     # 2) Check merge rules first — find any sibling in a classification bucket
     canonical = _MERGE_RULES.get(resolved, _MERGE_RULES.get(t, ""))
@@ -839,19 +1110,22 @@ def _classify(ticker: str, issuer: str = "", auto_learn: bool = True) -> str:
         if check_t in _OTHER_US_TICKERS:
             return "Other US Book"
 
-    # 4) Auto-detect alias: if SEC ticker not classified, but issuer name maps to a
-    #    known classified ticker via name_to_ticker.json, auto-learn the alias
-    if auto_learn and t and t not in all_classified:
-        issuer_upper = (issuer or "").upper().strip()
-        candidate = _NAME_TO_TICKER.get(issuer_upper, "")
+    # 4) Auto-detect bucket/alias from issuer name; NEVER learn derivative -> common ticker aliases
+    if t and t not in all_classified:
+        candidate = _lookup_ticker_by_issuer(issuer) if (auto_learn or raw_deriv_kind) else ""
         if candidate and candidate != t and candidate in all_classified:
-            _learn_ticker_alias(t, candidate, source="auto-issuer-match")
-            if candidate in _CHINA_TICKERS:
-                return "China Book"
-            if candidate in _AI_SEMI_TICKERS:
-                return "AI/Semi/US SaaS"
-            if candidate in _OTHER_US_TICKERS:
-                return "Other US Book"
+            cat = (
+                "China Book" if candidate in _CHINA_TICKERS
+                else "AI/Semi/US SaaS" if candidate in _AI_SEMI_TICKERS
+                else "Other US Book"
+            )
+            if raw_deriv_kind:
+                if auto_learn:
+                    _learn_classification(t, cat, source="auto-deriv-issuer")
+                return cat
+            if auto_learn:
+                _learn_ticker_alias(t, candidate, source="auto-issuer-match")
+                return cat
 
     # 5) Fallback classifier + auto-learn
     category = _infer_category_fallback(t, issuer)
@@ -877,44 +1151,123 @@ _SHORT_NAMES = {
     "KE HOLDINGS INC": "BEKE", "KE HLDGS INC": "BEKE",
     "FULL TRUCK ALLIANCE CO LTD": "YMM",
     "ISHARES BITCOIN TRUST ETF": "IBIT",
+    "BANK OF AMER": "Bank of America",
+    "BANK OF AMER CORP": "Bank of America",
 }
 
 
-def _short_name(issuer: str, ticker: str) -> str:
-    """Get short display name."""
-    # Check canonical merge name
-    canonical = _MERGE_RULES.get((ticker or "").upper())
-    if canonical and not canonical.startswith("_"):
+_SEC_ABBREV_MAP = {
+    "MATLS": "Materials", "INSTRS": "Instruments",
+    "PWR": "Power", "FINL": "Financial", "SVCS": "Services",
+    "MKTS": "Markets", "MKT": "Market", "PMTS": "Payments",
+    "PETE": "Petroleum", "INDL": "Industrial", "CTZNS": "Citizens",
+    "FMRS": "Farmers", "ENTMT": "Entertainment", "MNG": "Mining",
+    "MTR": "Motor", "PAC": "Pacific", "TRANSN": "Transportation",
+    "INS": "Insurance", "SYS": "Systems", "INTL": "International",
+    "HLDNGS": "Holdings", "HLDGS": "Holdings", "HLDG": "Holding",
+}
+
+# SEC 28-char Issuer field truncations that are strict prefixes of corporate/tech suffixes
+# and never standalone English words (kept separate from real words like 'tech' or 'limit').
+_TRUNCATED_SUFFIX_PREFIXES = frozenset({
+    "pl", "limite", "holdin", "hldng", "hldngs",
+    "incorp", "incorpo", "incorpor", "incorpora", "incorporat", "incorporate",
+    "corpor", "corpora", "corporat", "corporati", "corporatio", "compan",
+    "techn", "techno", "technol", "technolo", "technolog", "technologi", "technologie",
+    "internation", "softwar",
+})
+
+
+def _canonical_name_for_ticker(ticker: str, cusip_norm: str = "", issuer: str = "") -> str:
+    """Return canonical display name from merge_rules.json or verified_tickers.json when identity matches."""
+    t = _clean_ticker(ticker)
+    if not t or not _ledger_entry_matches(t, cusip_norm, issuer):
+        return ""
+    mr_val = str(_MERGE_RULES.get(t) or "").strip()
+    if mr_val and not mr_val.startswith("_"):
+        return mr_val
+    vt_entry = _VERIFIED_TICKERS.get(t)
+    if isinstance(vt_entry, dict):
+        vt_name = str(vt_entry.get("canonical_name") or "").strip()
+        if vt_name and not vt_name.startswith("_"):
+            return vt_name
+    return ""
+
+
+def _short_name(issuer: str, ticker: str, allow_issuer_lookup: bool = True, cusip: str = "") -> str:
+    """Get clean, non-truncated display name."""
+    t = _clean_ticker(ticker)
+    issuer_upper = (issuer or "").upper().strip()
+    if not t and issuer_upper and allow_issuer_lookup:
+        t = _lookup_ticker_by_issuer(issuer_upper)
+
+    cusip_norm = (cusip or "").strip().upper()
+    ledger_match = _ledger_entry_matches(t, cusip_norm, issuer) if t else True
+
+    canonical = _canonical_name_for_ticker(t, cusip_norm, issuer) if ledger_match else ""
+    if canonical:
         return canonical
 
-    # Check short name map
-    issuer_upper = (issuer or "").upper().strip()
-    if issuer_upper in _SHORT_NAMES:
+    if ledger_match and issuer_upper in _SHORT_NAMES:
         return _SHORT_NAMES[issuer_upper]
 
-    # Fallback: strip common corporate suffixes and noise words
     raw = (issuer or "").strip()
     if raw:
-        # Normalize dots and spacing
+        raw = re.sub(r"\s*\(THE\)\s*$", "", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"\bEXCHANGE TRADED FUN$", "EXCHANGE TRADED FUNDS", raw, flags=re.IGNORECASE).strip()
+        raw = re.sub(r"\bN\.V\.?(?=\s|$)", "NV", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\bS\.A\.?(?=\s|$)", "SA", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\bS\.P\.A\.?(?=\s|$)", "SPA", raw, flags=re.IGNORECASE)
         cleaned = re.sub(r"[\.,]", " ", raw)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         tokens = cleaned.split(" ")
 
-        # Remove trailing legal/company suffixes repeatedly
         strip_set = {
-            "inc", "corp", "corporation", "ltd", "limited", "plc", "co", "company", "llc",
-            "group", "holding", "holdings", "hldg", "hldgs", "sa", "nv", "ag",
+            "inc", "incorporated", "corp", "corporation", "ltd", "limited", "limite",
+            "plc", "pl", "co", "company", "llc", "lp", "group", "holding", "holdings",
+            "hldg", "hldgs", "hldngs", "sa", "nv", "spa", "ag", "del", "new",
+            "cayman", "mauritius", "luxembourg",
         }
-        while tokens and tokens[-1].lower() in strip_set:
+        connectors = {"of", "&", "and", "the", "for", "de", "la"}
+        while tokens:
+            low = tokens[-1].lower()
+            if (
+                low in strip_set
+                or (low == "in" and len(tokens) >= 3)
+                or (len(tokens) >= 2 and low in _TRUNCATED_SUFFIX_PREFIXES)
+            ):
+                tokens.pop()
+            else:
+                break
+        while len(tokens) > 1 and tokens[-1].lower() in connectors:
             tokens.pop()
 
-        # Keep first 2 tokens after cleanup for concise name
-        if tokens:
-            short_tokens = tokens[:2]
-            name = " ".join(short_tokens).title()
-            return name
+        if [tok.upper() for tok in tokens] == ["BANK", "OF", "AMER"]:
+            return "Bank of America"
 
-    return ticker or issuer or "Unknown"
+        expanded = [_SEC_ABBREV_MAP.get(tok.upper(), tok) for tok in tokens]
+        if expanded:
+            # Keep full cleaned corporate name up to 4 tokens; never cut after connectors/initials
+            keep = min(len(expanded), 4)
+            while keep < len(expanded) and (
+                expanded[keep - 1].lower() in connectors or len(expanded[keep - 1]) == 1
+            ):
+                keep += 1
+            short_tokens = expanded[:keep]
+            out_words = []
+            for idx_w, w in enumerate(short_tokens):
+                if idx_w > 0 and w.lower() in {"of", "and", "the", "for"}:
+                    out_words.append(w.lower())
+                elif w == "&":
+                    out_words.append("&")
+                else:
+                    out_words.append(w.title())
+            res_name = " ".join(out_words)
+            if t and (not ledger_match or _is_umbrella_issuer(issuer_upper)):
+                return f"{res_name} ({t})"
+            return res_name
+
+    return t or issuer or "Unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -989,28 +1342,248 @@ def _detect_action(prev_shares: int, chg_shares: int) -> str:
     return "不变"
 
 
-def _extract_actions(comparison_rows: list, exclude_biotech: bool = True) -> dict:
-    """Extract per-company action from comparison rows. Returns {merge_key: action_str}."""
+def _derivative_ticker_kind(ticker: str) -> str:
+    """Return 'warrant'/'right'/'unit' when SEC ticker has a derivative suffix, else ''."""
+    t = _clean_ticker(ticker)
+    if not t:
+        return ""
+    if (
+        re.match(r"^[A-Z]{1,5}[.\-/](?:W|WS|WW|WT)$", t)
+        or re.match(r"^[A-Z]{3,}(?:WS|WW|WT)$", t)
+        or (len(t) >= 5 and t.endswith("W"))
+    ):
+        return "warrant"
+    if (
+        re.match(r"^[A-Z]{1,5}[.\-/](?:R|RT|RTS)$", t)
+        or re.match(r"^[A-Z]{3,}(?:RT|RTS)$", t)
+        or (len(t) >= 5 and t.endswith("R"))
+    ):
+        return "right"
+    if re.match(r"^[A-Z]{1,5}[.\-/]U$", t) or (len(t) >= 5 and t.endswith("U")):
+        return "unit"
+    return ""
+
+
+def _detect_security_kind(ticker: str, issuer: str, cusip: str, title_of_class: str = "") -> str:
+    """Classify 13F row instrument kind so equity never merges with CB/warrant/right/unit."""
+    c = (cusip or "").strip()
+    if len(c) >= 8 and any(ch.isalpha() for ch in c[6:8]):
+        return "cb"
+
+    t_kind = _derivative_ticker_kind(ticker)
+    if t_kind:
+        return t_kind
+
+    text = f"{title_of_class or ''} {issuer or ''}".upper()
+    if re.search(r"(?:\*W\s+EXP|\bWARRANTS?\b|\bWTS?\b)", text):
+        return "warrant"
+    if re.search(r"(?:\bRIGHTS?\b|\bRTS?\b)", text):
+        return "right"
+    if re.search(r"\bUNITS?\b", text):
+        return "unit"
+    return "equity"
+
+
+def _apply_security_kind_to_merge_key(merge_key: str, sec_kind: str) -> str:
+    if sec_kind == "cb":
+        return merge_key if merge_key.endswith(" CB") else f"{merge_key} CB"
+    if sec_kind == "warrant":
+        return merge_key if "warrant" in merge_key.lower() else f"{merge_key} Warrants"
+    if sec_kind == "right":
+        return merge_key if "right" in merge_key.lower() else f"{merge_key} Rights"
+    if sec_kind == "unit":
+        return merge_key if "unit" in merge_key.lower() else f"{merge_key} Units"
+    return merge_key
+
+
+def _format_unresolved_cusip_name(name: str, cusip_norm: str) -> str:
+    if not cusip_norm:
+        return name
+    marker = f"（CUSIP {cusip_norm}）"
+    return name if marker in name else f"{name}{marker}"
+
+
+_CUSIP_TICKER_DB: dict[str, str] | None = None
+
+
+def _lookup_ticker_by_cusip(cusip_norm: str) -> str:
+    """Lookup uppercase CUSIP in edgartools bundled ct.pq without triggering edgar cache init."""
+    global _CUSIP_TICKER_DB
+    c = (cusip_norm or "").strip().upper()
+    if not c:
+        return ""
+    if _CUSIP_TICKER_DB is None:
+        db: dict[str, str] = {}
+        try:
+            spec = importlib.util.find_spec("edgar")
+            if spec and spec.origin:
+                ct_path = Path(spec.origin).parent / "reference" / "data" / "ct.pq"
+                if ct_path.is_file():
+                    df = pd.read_parquet(ct_path)
+                    dedup = df[~df["Cusip"].duplicated(keep="first")]
+                    for raw_c, raw_t in zip(dedup["Cusip"], dedup["Ticker"]):
+                        cn = str(raw_c or "").strip().upper()
+                        tk = _clean_ticker(raw_t)
+                        if cn and tk and cn not in db:
+                            db[cn] = tk
+        except Exception:
+            db = {}
+        _CUSIP_TICKER_DB = db
+    return _CUSIP_TICKER_DB.get(c, "")
+
+
+def _resolve_alias_safely(ticker: str) -> str:
+    """Resolve ticker alias while refusing derivative -> common stock replacements."""
+    t = _clean_ticker(ticker)
+    if not t:
+        return ""
+    if _derivative_ticker_kind(t):
+        return t
+    return _clean_ticker(_TICKER_ALIASES.get(t, t)) or t
+
+
+def _resolve_cusip_tickers(*row_sets) -> dict[str, str]:
+    """Resolve one canonical ticker per normalized uppercase CUSIP across all supplied row sets."""
+    cusip_to_ticker: dict[str, str] = {}
+    explicit_ticker_cusips: dict[str, set[str]] = {}
+    issuer_cusips: dict[str, set[str]] = {}
+    pending_cusips: dict[str, tuple[str, str]] = {}
+
+    for rows in row_sets:
+        if not rows:
+            continue
+        for row in rows:
+            cusip_norm = str(row.get("Cusip") or row.get("cusip") or "").strip().upper()
+            if not cusip_norm:
+                continue
+            issuer = str(row.get("Issuer") or row.get("issuer") or "").strip()
+            title = str(row.get("TitleOfClass") or row.get("Class") or row.get("title_of_class") or "").strip()
+            issuer_up = issuer.upper()
+            if issuer_up:
+                issuer_cusips.setdefault(issuer_up, set()).add(cusip_norm)
+
+            raw_t = _clean_ticker(row.get("Ticker") if row.get("Ticker") is not None else row.get("ticker"))
+            if raw_t:
+                resolved_t = _resolve_alias_safely(raw_t)
+                cusip_to_ticker.setdefault(cusip_norm, resolved_t)
+                explicit_ticker_cusips.setdefault(resolved_t, set()).add(cusip_norm)
+            elif cusip_norm not in pending_cusips:
+                pending_cusips[cusip_norm] = (issuer, title)
+
+    # Uppercase CUSIP lookup (recovers tickers missed when filings use lowercase CUSIPs like 92189f676)
+    for cusip_norm in list(pending_cusips):
+        if cusip_norm in cusip_to_ticker:
+            continue
+        cusip_t = _lookup_ticker_by_cusip(cusip_norm)
+        if cusip_t:
+            resolved_t = _resolve_alias_safely(cusip_t)
+            cusip_to_ticker[cusip_norm] = resolved_t
+            explicit_ticker_cusips.setdefault(resolved_t, set()).add(cusip_norm)
+
+    for cusip_norm, (issuer, title) in pending_cusips.items():
+        if cusip_norm in cusip_to_ticker or not issuer:
+            continue
+        issuer_up = issuer.upper().strip()
+        if len(issuer_cusips.get(issuer_up, set())) > 1:
+            continue
+        if _detect_security_kind("", issuer, cusip_norm, title) != "equity":
+            continue
+        cand = _lookup_ticker_by_issuer(issuer_up)
+        if not cand or cand in _DERIV_PARENT_TICKERS:
+            continue
+        if explicit_ticker_cusips.get(cand, set()) - {cusip_norm}:
+            continue
+        cusip_to_ticker[cusip_norm] = cand
+
+    return cusip_to_ticker
+
+
+def _row_identity_keys(row: dict, cusip_map: dict[str, str]) -> dict[str, Any]:
+    """Compute unified CUSIP-first identity, merge key, action key, and display name for one row."""
+    cusip_norm = str(row.get("Cusip") or row.get("cusip") or "").strip().upper()
+    issuer = str(row.get("Issuer") or row.get("issuer") or "")
+    title = str(row.get("TitleOfClass") or row.get("Class") or row.get("title_of_class") or "")
+    explicit_t = _clean_ticker(row.get("Ticker") if row.get("Ticker") is not None else row.get("ticker"))
+    raw_deriv_kind = _derivative_ticker_kind(explicit_t)
+    explicit_resolved = explicit_t if raw_deriv_kind else _resolve_alias_safely(explicit_t)
+    resolved_t = (cusip_map.get(cusip_norm, "") if cusip_norm else "") or explicit_resolved
+    if raw_deriv_kind:
+        resolved_t = explicit_t
+
+    if resolved_t:
+        sec_kind = _detect_security_kind(explicit_t or resolved_t, issuer, cusip_norm, title)
+        ledger_match = _ledger_entry_matches(resolved_t, cusip_norm, issuer)
+        short = _short_name(issuer, resolved_t, cusip=cusip_norm)
+        if ledger_match:
+            canon_group = str(_MERGE_RULES.get(resolved_t) or (_MERGE_RULES.get(explicit_t) if explicit_t else "") or "").strip()
+            if canon_group.startswith("_"):
+                canon_group = ""
+            canonical_display = _canonical_name_for_ticker(resolved_t, cusip_norm, issuer) or (
+                _canonical_name_for_ticker(explicit_t, cusip_norm, issuer) if explicit_t else ""
+            )
+            base_display = canonical_display or short
+            bucket_key: tuple[str, ...] = (
+                ("canon", canon_group, sec_kind) if canon_group else ("ticker", resolved_t, sec_kind)
+            )
+            action_key: Any = ("canon", canon_group, sec_kind) if canon_group else ("ticker", resolved_t, sec_kind)
+        else:
+            base_display = short
+            bucket_key = (
+                ("cusip", cusip_norm, sec_kind)
+                if cusip_norm
+                else ("ticker_issuer", resolved_t, issuer.upper().strip(), sec_kind)
+            )
+            action_key = ("cusip", cusip_norm) if cusip_norm else bucket_key
+        display_name = _apply_security_kind_to_merge_key(base_display, sec_kind)
+        return {
+            "cusip": cusip_norm,
+            "issuer": issuer,
+            "explicit_t": explicit_t,
+            "resolved_t": resolved_t,
+            "ledger_match": ledger_match,
+            "sec_kind": sec_kind,
+            "short": short,
+            "display_name": display_name,
+            "bucket_key": bucket_key,
+            "action_key": action_key,
+        }
+
+    sec_kind = _detect_security_kind("", issuer, cusip_norm, title)
+    short = _short_name(issuer, "", allow_issuer_lookup=False)
+    kind_name = _apply_security_kind_to_merge_key(short, sec_kind)
+    display_name = _format_unresolved_cusip_name(kind_name, cusip_norm)
+    bucket_key = ("cusip", cusip_norm, sec_kind) if cusip_norm else ("raw", issuer, sec_kind)
+    action_key = ("cusip", cusip_norm) if cusip_norm else ("raw", issuer, sec_kind)
+    return {
+        "cusip": cusip_norm,
+        "issuer": issuer,
+        "explicit_t": explicit_t,
+        "resolved_t": "",
+        "ledger_match": True,
+        "sec_kind": sec_kind,
+        "short": short,
+        "display_name": display_name,
+        "bucket_key": bucket_key,
+        "action_key": action_key,
+    }
+
+
+def _extract_actions(
+    comparison_rows: list,
+    exclude_biotech: bool = True,
+    cusip_ticker_map: dict[str, str] | None = None,
+) -> dict:
+    """Extract per-company action from comparison rows. Returns {key: action_str}."""
+    cusip_map = cusip_ticker_map if cusip_ticker_map is not None else _resolve_cusip_tickers(comparison_rows)
     merged = {}
     for row in comparison_rows:
-        ticker = str(row.get("Ticker") or row.get("ticker") or "").upper().strip()
-        issuer = str(row.get("Issuer") or row.get("issuer") or "")
-        if exclude_biotech and _is_biotech(ticker, issuer):
+        ident = _row_identity_keys(row, cusip_map)
+        if exclude_biotech and _is_biotech(ident["resolved_t"] or ident["explicit_t"], ident["issuer"]):
             continue
-        # CB detection (must mirror _build_report logic)
-        cusip = str(row.get("Cusip") or row.get("cusip") or "").strip()
-        instrument = "equity"
-        if len(cusip) >= 8:
-            issue_chars = cusip[6:8]
-            if any(c.isalpha() for c in issue_chars):
-                instrument = "cb"
-        canonical = _MERGE_RULES.get(ticker)
-        merge_key = canonical or _short_name(issuer, ticker)
-        if instrument == "cb":
-            merge_key = merge_key + " CB"
-        if merge_key not in merged:
-            merged[merge_key] = {"shares": 0, "prev_shares": 0, "chg_shares": 0}
-        entry = merged[merge_key]
+        bucket_key = ident["bucket_key"]
+        if bucket_key not in merged:
+            merged[bucket_key] = {"action_key": ident["action_key"], "shares": 0, "prev_shares": 0, "chg_shares": 0}
+        entry = merged[bucket_key]
         shares = _safe_int(row.get("SharesPrnAmount") or row.get("Shares") or row.get("shares") or 0)
         chg = _safe_int(row.get("ShareChange") or row.get("Chg") or row.get("chg") or row.get("Change") or 0)
         entry["shares"] += shares
@@ -1026,9 +1599,9 @@ def _extract_actions(comparison_rows: list, exclude_biotech: bool = True) -> dic
                 entry["prev_shares"] += max(0, shares - chg)
 
     result = {}
-    for key, e in merged.items():
+    for e in merged.values():
         e["chg_shares"] = e["shares"] - e["prev_shares"]
-        result[key] = _detect_action(e["prev_shares"], e["chg_shares"])
+        result[e["action_key"]] = _detect_action(e["prev_shares"], e["chg_shares"])
     return result
 
 
@@ -1036,23 +1609,29 @@ def _extract_actions(comparison_rows: list, exclude_biotech: bool = True) -> dic
 # Core: build formatted report (#1)
 # ---------------------------------------------------------------------------
 def _build_report(comparison_rows: list, exclude_biotech: bool = True, auto_learn: bool = True,
-                  prior_actions=None, prev_quarter_label: str = "") -> dict:
+                  prior_actions=None, prev_quarter_label: str = "",
+                  cusip_ticker_map: dict[str, str] | None = None) -> dict:
     """Process comparison rows into categorized, formatted report."""
 
     # edgartools >= 5.62 normalizes Value / PrevValue units to USD via value_unit_resolution.
+    cusip_map = cusip_ticker_map if cusip_ticker_map is not None else _resolve_cusip_tickers(comparison_rows)
 
-    # Auto-learn merge rules from class share names (safe heuristic)
+    # Auto-learn merge rules from class share names (safe heuristic, equity only)
     if auto_learn:
         issuer_groups = {}
         for row in comparison_rows:
-            ticker = str(row.get("Ticker") or row.get("ticker") or "").upper().strip()
-            issuer = str(row.get("Issuer") or row.get("issuer") or "")
-            if not ticker or not issuer:
+            ident = _row_identity_keys(row, cusip_map)
+            if (
+                not ident["resolved_t"]
+                or not ident["issuer"]
+                or ident["sec_kind"] != "equity"
+                or _is_umbrella_issuer(ident["issuer"].upper().strip())
+            ):
                 continue
-            if "class" in issuer.lower():
-                base = re.sub(r"\bclass\s+[a-z0-9]+\b", "", issuer, flags=re.IGNORECASE)
+            if "class" in ident["issuer"].lower():
+                base = re.sub(r"\bclass\s+[a-z0-9]+\b", "", ident["issuer"], flags=re.IGNORECASE)
                 base = re.sub(r"\s+", " ", base).strip()
-                issuer_groups.setdefault(base, set()).add(ticker)
+                issuer_groups.setdefault(base, set()).add(ident["resolved_t"])
 
         for base, tickers in issuer_groups.items():
             if len(tickers) >= 2:
@@ -1060,46 +1639,43 @@ def _build_report(comparison_rows: list, exclude_biotech: bool = True, auto_lear
                 for t in tickers:
                     _learn_merge_rule(t, canonical, source="auto-class-share")
 
-    # Step 1: Filter biotech + merge share classes
+    # Step 1: Filter biotech + merge by CUSIP-resolved ticker (or CUSIP when unresolvable)
     merged = {}
     for row in comparison_rows:
-        ticker = str(row.get("Ticker") or row.get("ticker") or "").upper().strip()
-        issuer = str(row.get("Issuer") or row.get("issuer") or "")
+        ident = _row_identity_keys(row, cusip_map)
+        ticker = ident["resolved_t"]
+        issuer = ident["issuer"]
 
-        if exclude_biotech and _is_biotech(ticker, issuer):
+        if exclude_biotech and _is_biotech(ticker or ident["explicit_t"], issuer):
             continue
 
-        # Detect instrument type from CUSIP (issue number = chars 7-8)
-        cusip = str(row.get("Cusip") or row.get("cusip") or "").strip()
-        instrument = "equity"
-        if len(cusip) >= 8:
-            issue_chars = cusip[6:8]
-            if any(c.isalpha() for c in issue_chars):
-                instrument = "cb"  # convertible bond / note
+        bucket_key = ident["bucket_key"]
 
-        # Determine merge key — keep CB separate from equity
-        canonical = _MERGE_RULES.get(ticker)
-        short = _short_name(issuer, ticker)
-        merge_key = canonical or short
-        if instrument == "cb":
-            merge_key = merge_key + " CB"
+        # Learn name->ticker reverse mapping from explicit SEC equity rows matching ledger
+        if ident["explicit_t"] and ident["ledger_match"] and auto_learn and ident["sec_kind"] == "equity":
+            _learn_name_to_ticker(ident["explicit_t"], issuer, ident["short"])
 
-        # Learn name->ticker reverse mapping from SEC data
-        if ticker and auto_learn:
-            _learn_name_to_ticker(ticker, issuer, short)
-
-        if merge_key not in merged:
-            merged[merge_key] = {
-                "name": merge_key,
+        if bucket_key not in merged:
+            merged[bucket_key] = {
+                "name": ident["display_name"],
+                "action_key": ident["action_key"],
                 "ticker": ticker,
+                "cusip": ident["cusip"],
                 "issuer": issuer,
+                "sec_kind": ident["sec_kind"],
                 "shares": 0, "value": 0,
                 "prev_shares": 0, "prev_value": 0,
                 "chg_shares": 0,
-                "category": _classify(ticker, issuer, auto_learn=auto_learn),
+                "category": _classify(
+                    ticker,
+                    issuer,
+                    auto_learn=auto_learn,
+                    allow_issuer_lookup=(bool(ticker) or ident["sec_kind"] == "cb"),
+                    cusip=("" if (not ticker and ident["sec_kind"] == "cb") else ident["cusip"]),
+                ),
             }
 
-        entry = merged[merge_key]
+        entry = merged[bucket_key]
         # Accumulate
         shares = _safe_int(row.get("SharesPrnAmount") or row.get("Shares") or row.get("shares") or 0)
         value = _safe_float(row.get("Value") or row.get("value") or 0)
@@ -1128,7 +1704,18 @@ def _build_report(comparison_rows: list, exclude_biotech: bool = True, auto_lear
             ratio = entry["prev_shares"] / max(entry["shares"], 1)
             entry["prev_value"] = entry["value"] * ratio
 
-    # Step 2-5: Categorize, format, sort
+    # Step 2-5: Disambiguate any identical display names across distinct tickers, then categorize, format, sort
+    tickers_by_display: dict[str, set[str]] = {}
+    for entry in merged.values():
+        if entry["ticker"]:
+            tickers_by_display.setdefault(entry["name"], set()).add(entry["ticker"])
+    for entry in merged.values():
+        tk = entry["ticker"]
+        if tk and len(tickers_by_display.get(entry["name"], set())) > 1:
+            suffix = f" ({tk})"
+            if not entry["name"].endswith(suffix):
+                entry["name"] = f"{entry['name']}{suffix}"
+
     categories = {"China Book": [], "AI/Semi/US SaaS": [], "Other US Book": []}
 
     for entry in merged.values():
@@ -1147,7 +1734,7 @@ def _build_report(comparison_rows: list, exclude_biotech: bool = True, auto_lear
         # Prepend prior-quarter trend context if available
         if prior_actions and prev_quarter_label:
             cur_action = _detect_action(entry["prev_shares"], entry["chg_shares"])
-            prior_act = prior_actions.get(entry["name"], "")
+            prior_act = prior_actions.get(entry["action_key"], "")
             if cur_action in ("加仓", "大幅加仓") and prior_act in ("建仓", "加仓", "大幅加仓"):
                 prior_label = "建仓" if prior_act == "建仓" else "加仓"
                 text = f"继{prev_quarter_label}{prior_label}后，继续" + text
@@ -1294,16 +1881,52 @@ def _num(v) -> float:
 
 
 def _merge_rows_by_cusip(*row_sets) -> list:
-    """按 CUSIP 加总 Shares/Value/PrevShares/PrevValue，再重算变动、百分比和 Status。"""
+    """按大写 CUSIP 加总 Shares/Value/PrevShares/PrevValue，合并大小写分裂行与同体系多主体。"""
     merged: dict = {}
     for rows in row_sets:
+        if not rows:
+            continue
         for r in rows:
-            key = str(r.get("Cusip") or r.get("cusip") or "").strip() or f"{r.get('Ticker')}|{r.get('Issuer')}"
-            m = merged.setdefault(key, {**r, "Shares": 0.0, "Value": 0.0, "PrevShares": 0.0, "PrevValue": 0.0})
-            for f in ("Shares", "Value", "PrevShares", "PrevValue"):
-                m[f] += _num(r.get(f))
-            if not m.get("Ticker") and r.get("Ticker"):
-                m["Ticker"] = r.get("Ticker")
+            cusip_norm = str(r.get("Cusip") or r.get("cusip") or "").strip().upper()
+            r_clean_t = _clean_ticker(r.get("Ticker") if r.get("Ticker") is not None else r.get("ticker"))
+            key = cusip_norm or f"{r_clean_t}|{r.get('Issuer') or r.get('issuer') or ''}"
+            if key not in merged:
+                merged[key] = {
+                    **r,
+                    "Cusip": cusip_norm or str(r.get("Cusip") or r.get("cusip") or "").strip(),
+                    "Ticker": r_clean_t,
+                    "Shares": 0.0,
+                    "Value": 0.0,
+                    "PrevShares": 0.0,
+                    "PrevValue": 0.0,
+                }
+            m = merged[key]
+            if not _clean_ticker(m.get("Ticker")) and r_clean_t:
+                m["Ticker"] = r_clean_t
+            status = str(r.get("Status") or "").upper().strip()
+            cur_s = _num(r.get("Shares") if r.get("Shares") is not None else r.get("SharesPrnAmount"))
+            chg_s = _num(
+                r.get("ShareChange")
+                if r.get("ShareChange") is not None
+                else (r.get("Chg") if r.get("Chg") is not None else r.get("Change"))
+            )
+            prev_explicit = _num(
+                r.get("PrevShares") if r.get("PrevShares") is not None else r.get("Prev Shares")
+            )
+            if status == "NEW":
+                prev_s = 0.0
+            elif prev_explicit > 0:
+                prev_s = prev_explicit
+            elif cur_s > 0 or chg_s != 0:
+                prev_s = max(0.0, cur_s - chg_s)
+            else:
+                prev_s = 0.0
+            m["Shares"] += cur_s
+            m["PrevShares"] += prev_s
+            m["Value"] += _num(r.get("Value"))
+            m["PrevValue"] += _num(
+                r.get("PrevValue") if r.get("PrevValue") is not None else r.get("Prev Value")
+            )
     nan = float("nan")
     out = []
     for m in merged.values():
@@ -1349,6 +1972,7 @@ def cmd_compare(args):
 
     merge_targets = _merge_targets(args, company)
     merged_with = []
+    row_sets = [rows]
     for other in merge_targets:
         other_rows, other_name = _compare_rows_for_period(other, str(thirteenf.report_period), auto_learn)
         merged_with.append({
@@ -1358,11 +1982,18 @@ def cmd_compare(args):
             "note": None if other_rows else "该主体没有同一报告期的 13F，未合并",
         })
         if other_rows:
-            rows = _merge_rows_by_cusip(rows, other_rows)
+            row_sets.append(other_rows)
+    if any(row_sets):
+        rows = _merge_rows_by_cusip(*row_sets)
+
+    raw_cik = str(getattr(company, "cik", "") or "").strip()
+    digits_cik = "".join(ch for ch in raw_cik if ch.isdigit())
+    norm_cik = (digits_cik.lstrip("0") or digits_cik).zfill(10) if digits_cik else ""
 
     result = {
         "ok": True,
         "institution": args.institution,
+        "cik": norm_cik,
         "offset": offset,
         "merged_with": merged_with,
         "manager": thirteenf.management_company_name,
@@ -1373,6 +2004,7 @@ def cmd_compare(args):
     }
 
     # Fetch prior quarter comparison for trend context.
+    prev_rows: list = []
     prior_actions = {}
     prev_quarter_label = ""
     try:
@@ -1400,16 +2032,29 @@ def cmd_compare(args):
                 prev_offset += 1
                 continue
             prev_quarter_label = _quarter_label(cand_period)
-            prev_rows = _rows_from_comparison(prev_comparison)
+            prev_row_sets = [_rows_from_comparison(prev_comparison)]
             for other in merge_targets:
                 other_prev, _ = _compare_rows_for_period(other, cand_period, auto_learn)
                 if other_prev:
-                    prev_rows = _merge_rows_by_cusip(prev_rows, other_prev)
-            if prev_rows:
-                prior_actions = _extract_actions(prev_rows, exclude_biotech=not args.include_biotech)
+                    prev_row_sets.append(other_prev)
+            if any(prev_row_sets):
+                prev_rows = _merge_rows_by_cusip(*prev_row_sets)
             break
     except Exception:
         pass
+
+    cusip_ticker_map = _resolve_cusip_tickers(rows, prev_rows)
+    for r in rows:
+        if not _clean_ticker(r.get("Ticker") if r.get("Ticker") is not None else r.get("ticker")):
+            cn = str(r.get("Cusip") or r.get("cusip") or "").strip().upper()
+            if cn and cusip_ticker_map.get(cn):
+                r["Ticker"] = cusip_ticker_map[cn]
+    if prev_rows:
+        prior_actions = _extract_actions(
+            prev_rows,
+            exclude_biotech=not args.include_biotech,
+            cusip_ticker_map=cusip_ticker_map,
+        )
 
     # Build report (also triggers auto-learn), only expose formatted text in cn mode
     if rows and (args.format == "cn" or auto_learn):
@@ -1419,6 +2064,7 @@ def cmd_compare(args):
             auto_learn=auto_learn,
             prior_actions=prior_actions,
             prev_quarter_label=prev_quarter_label,
+            cusip_ticker_map=cusip_ticker_map,
         )
         if args.format == "cn":
             result["formatted_report"] = report["report_text"]
