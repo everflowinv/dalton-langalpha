@@ -124,6 +124,7 @@ class InMemoryChannelStore:
         self.weixin_state: dict[str, Any] | None = None
         self.weixin_context_tokens: dict[tuple[str, int, str], dict[str, Any]] = {}
         self.workspaces: dict[str, dict[str, Any]] = {}
+        self.automations: dict[str, dict[str, Any]] = {}
         self.conversation_threads: dict[str, dict[str, Any]] = {}
         self.hook_outbox: dict[str, dict[str, Any]] = {}
         self.conversation_responses: dict[str, dict[str, Any]] = {}
@@ -144,12 +145,56 @@ class InMemoryChannelStore:
             return [{"pg_advisory_xact_lock": None}]
 
         # Workspaces lookup
+        if "FROM workspaces WHERE workspace_id = ANY(%s::uuid[])" in norm:
+            wanted = {str(w) for w in (params[0] or [])}
+            rows = []
+            for wid, ws in self.workspaces.items():
+                if wid in wanted and ws.get("status") != "deleted":
+                    rows.append({"workspace_id": wid, "name": ws.get("name")})
+            return rows
+
         if "FROM workspaces WHERE workspace_id = %s" in norm:
             ws_id = str(params[0])
             ws = self.workspaces.get(ws_id)
             if ws and ws.get("status") != "deleted":
                 return [dict(ws)]
             return []
+
+        if "FROM automations WHERE deleted_at IS NULL AND metadata ? 'report_profile'" in norm:
+            rows = []
+            for aid, row in sorted(self.automations.items(), key=lambda kv: (str(kv[1].get("name") or ""), kv[0])):
+                if row.get("deleted_at") is not None:
+                    continue
+                meta = row.get("metadata")
+                if not isinstance(meta, dict) or "report_profile" not in meta:
+                    continue
+                rows.append(
+                    {
+                        "automation_id": aid,
+                        "name": row.get("name"),
+                        "metadata": meta,
+                    }
+                )
+            return rows
+
+        if "FROM automations WHERE deleted_at IS NULL AND delivery_config ? 'methods'" in norm:
+            rows = []
+            for aid, row in sorted(self.automations.items(), key=lambda kv: (str(kv[1].get("name") or ""), kv[0])):
+                if row.get("deleted_at") is not None:
+                    continue
+                dc = row.get("delivery_config")
+                if not isinstance(dc, dict) or "methods" not in dc:
+                    continue
+                rows.append(
+                    {
+                        "automation_id": aid,
+                        "user_id": row.get("user_id"),
+                        "workspace_id": row.get("workspace_id"),
+                        "name": row.get("name"),
+                        "delivery_config": dc,
+                    }
+                )
+            return rows
 
         if "FROM conversation_threads WHERE conversation_thread_id = %s" in norm:
             tid = str(params[0])
@@ -1113,6 +1158,22 @@ class InMemoryChannelStore:
             return []
 
         # Chat bindings
+        if "FROM dalton_channel_user_settings WHERE user_id <> %s" in norm:
+            excl_uid = str(params[0])
+            plat = str(params[1])
+            target_addr = str(params[3])
+            found = False
+            for uid_k, row in self.user_settings.items():
+                if uid_k == excl_uid:
+                    continue
+                apps_obj = row.get("apps") or {}
+                plat_obj = apps_obj.get(plat) if isinstance(apps_obj, dict) else None
+                chats_obj = plat_obj.get("chats") if isinstance(plat_obj, dict) else None
+                if isinstance(chats_obj, dict) and target_addr in chats_obj:
+                    found = True
+                    break
+            return [{"has_other_ref": found}]
+
         if "DELETE FROM dalton_channel_chat_bindings WHERE platform = %s AND chat_address = %s" in norm:
             self.chat_bindings.pop((str(params[0]), str(params[1])), None)
             return []
@@ -9450,6 +9511,677 @@ def test_discord_native_interactions_session_command_and_recovery_unit(channel_t
         "command_name": "workspace",
     }
     assert store.inbound_events[("discord", dual_mid)]["command_result"]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_user_channel_settings_discord_channel_deliverable(
+    channel_test_env,
+) -> None:
+    """Adding `discord:<channel_id>` via `update_user_channel_settings` makes `discord:channel:<channel_id>` deliverable."""
+    from src.dalton.database.data_task_notifications import _parse_requested_notify_target
+
+    channel_id = "1481256083589697566"
+    chat_addr = f"discord:{channel_id}"
+    notify_target = f"discord:channel:{channel_id}"
+
+    parsed = _parse_requested_notify_target(notify_target)
+    assert parsed == ("discord", "group", channel_id)
+    platform, kind, ident = parsed
+    assert kind == "group"
+    assert f"{platform}:{ident}" == chat_addr
+
+    saved = await cg_db.update_user_channel_settings(
+        user_id="u-admin",
+        version="v1",
+        settings={
+            "discord": {
+                "preferred": "discord:@me",
+                "chats": {
+                    chat_addr: {"workspace_id": None, "name": "投研报告频道"},
+                },
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+            }
+        },
+    )
+    assert saved["version"] == "v2"
+    assert chat_addr in saved["settings"]["discord"]["chats"]
+
+    async with cg_db.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            ok, err, chat_name = await cg_db._verify_group_target_deliverable(
+                cur,
+                user_id="u-admin",
+                user_tier="admin",
+                platform=platform,
+                chat_address=f"{platform}:{ident}",
+                conn=conn,
+            )
+    assert ok is True
+    assert err is None
+    assert chat_name == "投研报告频道"
+
+    # Removing the channel via CAS update makes it undeliverable again
+    removed = await cg_db.update_user_channel_settings(
+        user_id="u-admin",
+        version="v2",
+        settings={
+            "discord": {
+                "preferred": "discord:@me",
+                "chats": {},
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+            }
+        },
+    )
+    assert removed["version"] == "v3"
+
+    async with cg_db.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            ok_after, err_after, _ = await cg_db._verify_group_target_deliverable(
+                cur,
+                user_id="u-admin",
+                user_tier="admin",
+                platform=platform,
+                chat_address=f"{platform}:{ident}",
+                conn=conn,
+            )
+    assert ok_after is False
+    assert err_after == "Group chat is not bound in channel settings."
+
+
+@pytest.mark.asyncio
+async def test_shared_group_binding_preserves_workspace_on_add_and_keeps_row_on_partial_remove(
+    channel_test_env,
+) -> None:
+    """Shared `dalton_channel_chat_bindings` rows across users (Discord & Feishu):
+
+    1. User A adding an already-bound channel with `workspace_id=None` preserves the existing `workspace_id`.
+    2. Renaming syncs `dalton_channel_chat_bindings.chat_name` without clearing `workspace_id`.
+    3. User A removing a shared channel keeps `dalton_channel_chat_bindings` while User B still references it
+       so User B remains deliverable; once User B also removes it, the shared row is deleted.
+    4. User A adding with an explicit non-null writable workspace updates `workspace_id` as allowed.
+    """
+    store: InMemoryChannelStore = channel_test_env["store"]
+    tiers = channel_test_env["tiers"]
+    writable_by_user = channel_test_env["writable_by_user"]
+    tiers["u-admin-2"] = "admin"
+
+    ws_shared = str(uuid4())
+    ws_other = str(uuid4())
+    for wid, wname in ((ws_shared, "Shared WS"), (ws_other, "Other WS")):
+        store.workspaces[wid] = {
+            "workspace_id": UUID(wid),
+            "user_id": "u-admin",
+            "name": wname,
+            "status": "running",
+            "is_home": False,
+        }
+    writable_by_user["u-admin"] = {ws_shared: "Shared WS", ws_other: "Other WS"}
+    writable_by_user["u-admin-2"] = {ws_shared: "Shared WS", ws_other: "Other WS"}
+
+    for platform, chat_addr in (
+        ("discord", "discord:1481256083589697566"),
+        ("feishu", "feishu:oc_shared_group_1"),
+    ):
+        # 1. u-admin registers chat with ws_shared
+        s_a1 = await cg_db.get_channel_internal_state(user_id="u-admin")
+        v_a1 = s_a1["settings"]["version"]
+        apps_a1 = dict(s_a1["settings"]["apps"])
+        apps_a1[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {chat_addr: {"workspace_id": ws_shared, "name": "Original Name"}},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_a1 = await cg_db.update_user_channel_settings(
+            user_id="u-admin", version=v_a1, settings=apps_a1
+        )
+        assert str(store.chat_bindings[(platform, chat_addr)]["workspace_id"]) == ws_shared
+        assert store.chat_bindings[(platform, chat_addr)]["chat_name"] == "Original Name"
+
+        # 2. u-admin-2 adds the SAME chat with workspace_id=None -> MUST NOT clear ws_shared!
+        s_b1 = await cg_db.get_channel_internal_state(user_id="u-admin-2")
+        v_b1 = s_b1["settings"]["version"]
+        apps_b1 = dict(s_b1["settings"]["apps"])
+        apps_b1[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {chat_addr: {"workspace_id": None, "name": "Original Name"}},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_b1 = await cg_db.update_user_channel_settings(
+            user_id="u-admin-2", version=v_b1, settings=apps_b1
+        )
+        assert str(store.chat_bindings[(platform, chat_addr)]["workspace_id"]) == ws_shared
+
+        # 3. u-admin-2 renames the chat (while workspace_id stays None in u-admin-2's settings) ->
+        # chat_name updates to "Renamed Desk" while shared workspace_id stays ws_shared!
+        apps_b2 = dict(upd_b1["settings"])
+        apps_b2[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {chat_addr: {"workspace_id": None, "name": "Renamed Desk"}},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_b2 = await cg_db.update_user_channel_settings(
+            user_id="u-admin-2", version=upd_b1["version"], settings=apps_b2
+        )
+        assert store.chat_bindings[(platform, chat_addr)]["chat_name"] == "Renamed Desk"
+        assert str(store.chat_bindings[(platform, chat_addr)]["workspace_id"]) == ws_shared
+
+        # 4. u-admin removes the chat -> u-admin-2 still has it in settings, so shared row stays and u-admin-2 stays deliverable!
+        apps_a2 = dict(upd_a1["settings"])
+        apps_a2[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_a2 = await cg_db.update_user_channel_settings(
+            user_id="u-admin", version=upd_a1["version"], settings=apps_a2
+        )
+        assert (platform, chat_addr) in store.chat_bindings
+        assert str(store.chat_bindings[(platform, chat_addr)]["workspace_id"]) == ws_shared
+
+        async with cg_db.get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                ok_b, err_b, cname_b = await cg_db._verify_group_target_deliverable(
+                    cur,
+                    user_id="u-admin-2",
+                    user_tier="admin",
+                    platform=platform,
+                    chat_address=chat_addr,
+                    conn=conn,
+                )
+        assert ok_b is True
+        assert err_b is None
+        assert cname_b == "Renamed Desk"
+
+        # 5. u-admin re-adds with explicit non-null writable ws_other -> updates shared workspace_id to ws_other
+        apps_a3 = dict(upd_a2["settings"])
+        apps_a3[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {chat_addr: {"workspace_id": ws_other, "name": "Renamed Desk"}},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_a3 = await cg_db.update_user_channel_settings(
+            user_id="u-admin", version=upd_a2["version"], settings=apps_a3
+        )
+        assert str(store.chat_bindings[(platform, chat_addr)]["workspace_id"]) == ws_other
+
+        # 6. u-admin-2 removes, then u-admin removes (last owner) -> shared row is deleted
+        apps_b3 = dict(upd_b2["settings"])
+        apps_b3[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_b3 = await cg_db.update_user_channel_settings(
+            user_id="u-admin-2", version=upd_b2["version"], settings=apps_b3
+        )
+        assert (platform, chat_addr) in store.chat_bindings
+
+        apps_a4 = dict(upd_a3["settings"])
+        apps_a4[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_a4 = await cg_db.update_user_channel_settings(
+            user_id="u-admin", version=upd_a3["version"], settings=apps_a4
+        )
+        assert (platform, chat_addr) not in store.chat_bindings
+
+        # 7. Codex #3 order: A registers with ws_shared, B registers with workspace_id=None;
+        # A removes first -> shared row stays (ws_shared); B (with null workspace) removes second -> shared row IS deleted!
+        apps_a5 = dict(upd_a4["settings"])
+        apps_a5[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {chat_addr: {"workspace_id": ws_shared, "name": "Shared Room"}},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_a5 = await cg_db.update_user_channel_settings(
+            user_id="u-admin", version=upd_a4["version"], settings=apps_a5
+        )
+        apps_b4 = dict(upd_b3["settings"])
+        apps_b4[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {chat_addr: {"workspace_id": None, "name": "Shared Room"}},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        upd_b4 = await cg_db.update_user_channel_settings(
+            user_id="u-admin-2", version=upd_b3["version"], settings=apps_b4
+        )
+        assert str(store.chat_bindings[(platform, chat_addr)]["workspace_id"]) == ws_shared
+
+        # A removes first -> B still references it, so shared row remains
+        apps_a6 = dict(upd_a5["settings"])
+        apps_a6[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        await cg_db.update_user_channel_settings(
+            user_id="u-admin", version=upd_a5["version"], settings=apps_a6
+        )
+        assert (platform, chat_addr) in store.chat_bindings
+
+        # B (whose entry has workspace_id=None != ws_shared) removes last -> shared row MUST be deleted!
+        apps_b5 = dict(upd_b4["settings"])
+        apps_b5[platform] = {
+            "preferred": f"{platform}:@me",
+            "chats": {},
+            "automation_output": {},
+            "agent_messages": {"enabled": True, "allowed": [f"{platform}:@me"]},
+        }
+        await cg_db.update_user_channel_settings(
+            user_id="u-admin-2", version=upd_b4["version"], settings=apps_b5
+        )
+        assert (platform, chat_addr) not in store.chat_bindings
+
+
+@pytest.mark.asyncio
+async def test_discord_channel_entry_endpoint_isolation_and_reference_guard(
+    channel_test_env,
+) -> None:
+    """Covers POST /api/v1/dalton/channels/discord-channels & PUT /settings reference guard:
+
+    1. Non-admin (internal/external) is rejected with 403 on POST /discord-channels.
+    2. Missing/null/empty `version`, invalid snowflake, and >255-char display name return 422.
+    3. `action="remove"` on POST /discord-channels returns 400 (unsupported in this version).
+    4. Adding/renaming succeeds even when Feishu has a deleted/unwritable workspace reference.
+    5. Removing via legacy PUT /settings while referenced returns 409 `channel_in_use`:
+       - admin gets detailed `references` (automation name/ID/field);
+       - non-admin (internal) gets only aggregate `reference_count` with NO names/IDs/fields (Codex #1).
+    """
+    client: TestClient = channel_test_env["client"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable_by_user = channel_test_env["writable_by_user"]
+
+    ws_live = str(uuid4())
+    ws_stale = str(uuid4())
+    store.workspaces[ws_live] = {
+        "workspace_id": UUID(ws_live),
+        "user_id": "u-admin",
+        "name": "Semi Research WS",
+        "status": "running",
+        "is_home": False,
+    }
+    writable_by_user["u-admin"] = {ws_live: "Semi Research WS"}
+
+    channel_id = "1481256083589697566"
+    chat_addr = f"discord:{channel_id}"
+    store.user_settings["u-admin"] = {
+        "user_id": "u-admin",
+        "version": "v5",
+        "apps": {
+            "feishu": {
+                "preferred": "feishu:@me",
+                "chats": {"feishu:oc_stale": {"workspace_id": ws_stale, "name": "Stale Feishu"}},
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["feishu:@me"]},
+            },
+            "discord": {
+                "preferred": "discord:@me",
+                "chats": {},
+                "automation_output": {ws_live: chat_addr},
+                "agent_messages": {"enabled": True, "allowed": ["discord:@me", chat_addr]},
+            },
+        },
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    # 1. Non-admin -> 403
+    for uid in ("u-alice", "u-ext"):
+        channel_test_env["current_web_user"]["user_id"] = uid
+        r_403 = client.post(
+            "/api/v1/dalton/channels/discord-channels",
+            json={"action": "add", "channel_id": channel_id, "version": "v1"},
+        )
+        assert r_403.status_code == 403
+
+    # 2a. Missing / null / empty version -> 422
+    channel_test_env["current_web_user"]["user_id"] = "u-admin"
+    for bad_ver_payload in (
+        {"action": "add", "channel_id": channel_id},
+        {"action": "add", "channel_id": channel_id, "version": None},
+        {"action": "add", "channel_id": channel_id, "version": ""},
+    ):
+        r_ver_422 = client.post(
+            "/api/v1/dalton/channels/discord-channels",
+            json=bad_ver_payload,
+        )
+        assert r_ver_422.status_code == 422
+
+    # 2b. action="remove" -> 400
+    r_remove_400 = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "remove", "channel_id": channel_id, "version": "v5"},
+    )
+    assert r_remove_400.status_code == 400
+    assert r_remove_400.json()["code"] == "unsupported_action"
+    assert "本版不支持在此移除" in r_remove_400.json()["message"]
+
+    # 2c. Snowflake bounds -> 422
+    for bad_id in ("12345", "1234567890123456", "9" * 32, "18446744073709551616"):
+        r_bad = client.post(
+            "/api/v1/dalton/channels/discord-channels",
+            json={"action": "add", "channel_id": bad_id, "version": "v5"},
+        )
+        assert r_bad.status_code == 422
+
+    # 2d. Name > 255 chars -> 422 on add
+    r_long_add = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "add", "channel_id": channel_id, "version": "v5", "name": "a" * 256},
+    )
+    assert r_long_add.status_code == 422
+
+    # 3. Adding Discord channel succeeds despite Feishu pointing to deleted ws_stale (255 chars allowed)
+    r_add = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "add", "channel_id": channel_id, "version": "v5", "name": "R" * 255},
+    )
+    assert r_add.status_code == 200
+    assert r_add.json()["version"] == "v6"
+    assert chat_addr in r_add.json()["settings"]["discord"]["chats"]
+    assert (
+        r_add.json()["settings"]["feishu"]["chats"]["feishu:oc_stale"]["workspace_id"]
+        == ws_stale
+    )
+
+    # Max valid 64-bit snowflake (2^64 - 1) also succeeds
+    r_max = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "add", "channel_id": "18446744073709551615", "version": "v6", "name": "Max"},
+    )
+    assert r_max.status_code == 200
+    assert r_max.json()["version"] == "v7"
+
+    # Name > 255 chars -> 422 on rename
+    r_long_ren = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "rename", "channel_id": channel_id, "version": "v7", "name": "b" * 256},
+    )
+    assert r_long_ren.status_code == 422
+
+    # Rename succeeds and syncs chat_bindings.chat_name
+    r_ren = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "rename", "channel_id": channel_id, "version": "v7", "name": "Renamed Reports"},
+    )
+    assert r_ren.status_code == 200
+    assert r_ren.json()["version"] == "v8"
+    assert store.chat_bindings[("discord", chat_addr)]["chat_name"] == "Renamed Reports"
+
+    # 4. Seed automation owned by u-admin referencing discord:channel:<id>
+    auto_id = str(uuid4())
+    store.automations[auto_id] = {
+        "automation_id": auto_id,
+        "user_id": "u-admin",
+        "name": "AI Daily Digest",
+        "deleted_at": None,
+        "metadata": {
+            "report_profile": {
+                "profile": "ai-finance-daily",
+                "report_targets": [f"discord:channel:{channel_id}"],
+                "text_targets": [f"discord:channel:{channel_id}"],
+                "failure_targets": [],
+            }
+        },
+    }
+
+    # 5a. Non-admin (internal u-alice) who spoke in the channel & added it to personal settings
+    # removes it via PUT /settings -> 409 contains ONLY count, NEVER other user's automation name/ID/field!
+    store.identities[("u-alice", "discord")] = {
+        "id": str(uuid4()),
+        "user_id": "u-alice",
+        "platform": "discord",
+        "platform_user_id": "999888777666555444",
+    }
+    store.inbound_events[("discord", "msg_alice_dc_1")] = {
+        "platform": "discord",
+        "message_id": "msg_alice_dc_1",
+        "chat_address": chat_addr,
+        "raw_payload": {"platform_user_id": "999888777666555444"},
+    }
+    store.user_settings["u-alice"] = {
+        "user_id": "u-alice",
+        "version": "v1",
+        "apps": {
+            "discord": {
+                "preferred": "discord:@me",
+                "chats": {chat_addr: {"workspace_id": None, "name": "Reports"}},
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+            }
+        },
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    r_internal_blocked = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": "v1",
+            "settings": {
+                "discord": {
+                    "preferred": "discord:@me",
+                    "chats": {},
+                    "automation_output": {},
+                    "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+                }
+            },
+        },
+    )
+    assert r_internal_blocked.status_code == 409
+    internal_body = r_internal_blocked.json()
+    assert internal_body["code"] == "channel_in_use"
+    assert internal_body["reference_count"] == 1
+    assert "references" not in internal_body
+    raw_internal_text = r_internal_blocked.text
+    assert "AI Daily Digest" not in raw_internal_text
+    assert auto_id not in raw_internal_text
+    assert "report_profile" not in raw_internal_text
+
+    # 5b. Admin removing via PUT /settings gets full references list (automation name/ID/field + workspace/allowlist)
+    channel_test_env["current_web_user"]["user_id"] = "u-admin"
+    r_admin_blocked = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": "v8",
+            "settings": {
+                "discord": {
+                    "preferred": "discord:@me",
+                    "chats": {"discord:18446744073709551615": {"workspace_id": None, "name": "Max"}},
+                    "automation_output": {ws_live: chat_addr},
+                    "agent_messages": {"enabled": True, "allowed": ["discord:@me", chat_addr]},
+                }
+            },
+        },
+    )
+    assert r_admin_blocked.status_code == 409
+    admin_body = r_admin_blocked.json()
+    assert admin_body["code"] == "channel_in_use"
+    refs = admin_body["references"]
+    assert {"kind": "automation_report_profile", "name": "AI Daily Digest", "field": "report_profile.report_targets", "automation_id": auto_id} in refs
+    assert {"kind": "automation_report_profile", "name": "AI Daily Digest", "field": "report_profile.text_targets", "automation_id": auto_id} in refs
+    assert {"kind": "automation_output", "name": "Semi Research WS", "field": "automation_output", "workspace_id": ws_live} in refs
+    assert {"kind": "agent_messages_allowed", "name": "Discord", "field": "agent_messages.allowed"} in refs
+    assert ("discord", chat_addr) in store.chat_bindings
+
+    # 5c. Clear report_profile ref, but leave delivery_config.methods ref -> still blocked
+    store.automations[auto_id]["deleted_at"] = datetime.now(timezone.utc)
+    dc_auto_id = str(uuid4())
+    store.automations[dc_auto_id] = {
+        "automation_id": dc_auto_id,
+        "user_id": "u-admin",
+        "workspace_id": None,
+        "name": "Macro Brief Delivery",
+        "deleted_at": None,
+        "delivery_config": {"methods": [chat_addr]},
+    }
+    r_dc_direct = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": "v8",
+            "settings": {
+                "discord": {
+                    "preferred": "discord:@me",
+                    "chats": {"discord:18446744073709551615": {"workspace_id": None, "name": "Max"}},
+                    "automation_output": {},
+                    "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+                }
+            },
+        },
+    )
+    assert r_dc_direct.status_code == 409
+    assert {
+        "kind": "automation_delivery_config",
+        "name": "Macro Brief Delivery",
+        "field": "delivery_config.methods",
+        "automation_id": dc_auto_id,
+    } in r_dc_direct.json()["references"]
+
+    # Switch automation to bare "discord" method while u-admin's preferred == chat_addr -> still blocked
+    store.automations[dc_auto_id]["delivery_config"] = {"methods": ["discord"]}
+    r_dc_pref = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": "v8",
+            "settings": {
+                "discord": {
+                    "preferred": chat_addr,
+                    "chats": {"discord:18446744073709551615": {"workspace_id": None, "name": "Max"}},
+                    "automation_output": {},
+                    "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+                }
+            },
+        },
+    )
+    assert r_dc_pref.status_code == 409
+    assert {
+        "kind": "automation_delivery_config",
+        "name": "Macro Brief Delivery",
+        "field": "delivery_config.methods",
+        "automation_id": dc_auto_id,
+    } in r_dc_pref.json()["references"]
+
+    # Home automation ignores automation_output[home_ws_id] and uses preferred -> still blocked
+    from src.server.database.home_workspace import get_home_workspace_id
+
+    home_ws_id = get_home_workspace_id("u-admin")
+    store.workspaces[home_ws_id] = {
+        "workspace_id": UUID(home_ws_id),
+        "user_id": "u-admin",
+        "name": "Home",
+        "status": "unbound",
+        "is_home": True,
+    }
+    writable_by_user["u-admin"][home_ws_id] = "Home"
+    store.automations[dc_auto_id]["workspace_id"] = home_ws_id
+    r_dc_home_pref = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": "v8",
+            "settings": {
+                "discord": {
+                    "preferred": chat_addr,
+                    "chats": {"discord:18446744073709551615": {"workspace_id": None, "name": "Max"}},
+                    "automation_output": {home_ws_id: "discord:18446744073709551615"},
+                    "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+                }
+            },
+        },
+    )
+    assert r_dc_home_pref.status_code == 409
+    assert {
+        "kind": "automation_delivery_config",
+        "name": "Macro Brief Delivery",
+        "field": "delivery_config.methods",
+        "automation_id": dc_auto_id,
+    } in r_dc_home_pref.json()["references"]
+
+    # Clearing preferred to discord:@me in the same PUT unblocks removal
+    r_rem = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": "v8",
+            "settings": {
+                "discord": {
+                    "preferred": "discord:@me",
+                    "chats": {"discord:18446744073709551615": {"workspace_id": None, "name": "Max"}},
+                    "automation_output": {},
+                    "agent_messages": {"enabled": True, "allowed": ["discord:@me"]},
+                }
+            },
+        },
+    )
+    assert r_rem.status_code == 200
+    assert r_rem.json()["version"] == "v9"
+
+    # 6. Shared binding missing while channel still exists in user's apps.discord.chats:
+    # - re-add without name preserves existing custom display name
+    # - stale/deleted workspace_id on the old entry is cleared to None instead of restoring a broken binding
+    max_addr = "discord:18446744073709551615"
+    dead_ws_id = str(uuid4())
+    store.user_settings["u-admin"]["apps"]["discord"]["chats"][max_addr] = {
+        "workspace_id": dead_ws_id,
+        "name": "Custom Max Name",
+    }
+    store.chat_bindings.pop(("discord", max_addr), None)
+    assert max_addr in store.user_settings["u-admin"]["apps"]["discord"]["chats"]
+    r_readd = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "add", "channel_id": "18446744073709551615", "version": "v9"},
+    )
+    assert r_readd.status_code == 200
+    assert r_readd.json()["version"] == "v10"
+    restored_cfg = r_readd.json()["settings"]["discord"]["chats"][max_addr]
+    assert restored_cfg["workspace_id"] is None
+    assert restored_cfg["name"] == "Custom Max Name"
+    assert ("discord", max_addr) in store.chat_bindings
+    assert store.chat_bindings[("discord", max_addr)]["workspace_id"] is None
+    assert store.chat_bindings[("discord", max_addr)]["chat_name"] == "Custom Max Name"
+
+    # Once shared binding exists again, adding the same channel returns 400
+    r_dup_after_restore = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "add", "channel_id": "18446744073709551615", "version": "v10", "name": "Max Dup"},
+    )
+    assert r_dup_after_restore.status_code == 400
+
+    # 7. Shared binding missing and the old entry names a live workspace the caller cannot
+    # write: the re-add is refused and nothing changes, rather than dropping that binding
+    # (which would lift the workspace's write check on delivery).
+    locked_addr = "discord:123456789012345678"
+    locked_ws = str(uuid4())
+    store.workspaces[locked_ws] = {
+        "workspace_id": UUID(locked_ws),
+        "user_id": "u-someone-else",
+        "name": "Locked Desk",
+        "status": "running",
+        "is_home": False,
+    }
+    store.user_settings["u-admin"]["apps"]["discord"]["chats"][locked_addr] = {
+        "workspace_id": locked_ws,
+        "name": "Locked Channel",
+    }
+    store.chat_bindings.pop(("discord", locked_addr), None)
+    r_locked = client.post(
+        "/api/v1/dalton/channels/discord-channels",
+        json={"action": "add", "channel_id": "123456789012345678", "version": "v10"},
+    )
+    assert r_locked.status_code == 403
+    assert ("discord", locked_addr) not in store.chat_bindings
+    assert store.user_settings["u-admin"]["apps"]["discord"]["chats"][locked_addr]["workspace_id"] == locked_ws
 
 
 @pytest.mark.integration

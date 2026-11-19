@@ -1102,8 +1102,9 @@ async def test_group_binding_permissions_generations_and_i1_lock(
             gr_a = await cur.fetchone()
             assert gr_a["generation"] == 3
 
-    # (b) Deleting chat_addr from user_a's settings when global binding is ws_a2 (!= user_a's old setting ws_a1)
-    # removes it from user_a's settings ONLY, leaving global binding ws_a2 and generation 3 untouched!
+    # (b) Deleting chat_addr from user_a's settings when NO other user still references chat_addr
+    # cleans up the global binding row (even if global binding workspace_id had diverged to ws_a2)
+    # without touching personal generations!
     upd_del_mismatch = await cg_db.update_user_channel_settings(
         user_id=user_a,
         version=upd_no_name["version"],
@@ -1119,8 +1120,7 @@ async def test_group_binding_permissions_generations_and_i1_lock(
                 (chat_addr,),
             )
             cb_still = await cur.fetchone()
-            assert cb_still is not None
-            assert str(cb_still["workspace_id"]) == ws_a2
+            assert cb_still is None
 
     # (c) Adding chat_addr -> ws_a2 (matching current global binding ws_a2) in user_a's settings does NOT advance generations (still 3)!
     upd_same_global = await cg_db.update_user_channel_settings(

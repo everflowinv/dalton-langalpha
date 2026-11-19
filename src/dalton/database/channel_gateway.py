@@ -5283,12 +5283,193 @@ def _is_dm_address(platform: str, address: str) -> bool:
     return cleaned == f"{platform}:@me" or cleaned.endswith(":@me")
 
 
+_DISCORD_CHANNEL_ID_ENTRY_RE = re.compile(r"^[0-9]{17,20}$")
+_DISCORD_MAX_SNOWFLAKE_INT = (1 << 64) - 1
+_DISCORD_CANONICAL_CHAT_ADDR_RE = re.compile(r"^discord:([0-9]+)$")
+
+
+def _is_valid_discord_channel_id(raw: str | None) -> bool:
+    cleaned = str(raw or "").strip()
+    if not _DISCORD_CHANNEL_ID_ENTRY_RE.fullmatch(cleaned):
+        return False
+    return int(cleaned) <= _DISCORD_MAX_SNOWFLAKE_INT
+
+
+async def _find_discord_channel_references(
+    cur: Any,
+    *,
+    channel_id: str,
+    discord_cfg: dict[str, Any] | None,
+    user_id: str | None = None,
+) -> list[dict[str, str]]:
+    """Return active report/routing references to Discord ``channel_id`` (excluding data tasks)."""
+    cleaned_id = str(channel_id or "").strip()
+    chat_addr = f"discord:{cleaned_id}"
+    channel_target = f"discord:channel:{cleaned_id}"
+    match_targets = {chat_addr, channel_target}
+    refs: list[dict[str, str]] = []
+
+    await cur.execute(
+        """
+        SELECT automation_id::text AS automation_id, name, metadata
+        FROM automations
+        WHERE deleted_at IS NULL
+          AND metadata ? 'report_profile'
+        ORDER BY name ASC, automation_id ASC
+        """
+    )
+    for auto_row in await cur.fetchall():
+        meta = auto_row.get("metadata")
+        rp = meta.get("report_profile") if isinstance(meta, dict) else None
+        if not isinstance(rp, dict):
+            continue
+        auto_id = str(auto_row.get("automation_id") or "")
+        auto_name = str(auto_row.get("name") or auto_id).strip() or auto_id
+        for rp_key, rp_val in rp.items():
+            if not isinstance(rp_val, list):
+                continue
+            if any(str(item or "").strip() in match_targets for item in rp_val):
+                refs.append(
+                    {
+                        "kind": "automation_report_profile",
+                        "name": auto_name,
+                        "field": f"report_profile.{rp_key}",
+                        "automation_id": auto_id,
+                    }
+                )
+
+    auto_out = (
+        discord_cfg.get("automation_output")
+        if isinstance(discord_cfg, dict)
+        else None
+    )
+    preferred_addr = (
+        str(discord_cfg.get("preferred") or "").strip()
+        if isinstance(discord_cfg, dict)
+        else ""
+    )
+    preferred_matches = preferred_addr in match_targets
+
+    await cur.execute(
+        """
+        SELECT automation_id::text AS automation_id, user_id, workspace_id::text AS workspace_id, name, delivery_config
+        FROM automations
+        WHERE deleted_at IS NULL
+          AND delivery_config ? 'methods'
+        ORDER BY name ASC, automation_id ASC
+        """
+    )
+    for auto_row in await cur.fetchall():
+        raw_dc = auto_row.get("delivery_config")
+        methods = raw_dc.get("methods") if isinstance(raw_dc, dict) else None
+        if not isinstance(methods, list):
+            continue
+        cleaned_methods = [
+            str(item or "").strip() for item in methods if str(item or "").strip()
+        ]
+        if not cleaned_methods:
+            continue
+        auto_id = str(auto_row.get("automation_id") or "")
+        auto_name = str(auto_row.get("name") or auto_id).strip() or auto_id
+        if any(item in match_targets for item in cleaned_methods):
+            refs.append(
+                {
+                    "kind": "automation_delivery_config",
+                    "name": auto_name,
+                    "field": "delivery_config.methods",
+                    "automation_id": auto_id,
+                }
+            )
+        elif (
+            preferred_matches
+            and user_id is not None
+            and str(auto_row.get("user_id") or "").strip() == str(user_id).strip()
+            and any(item.lower() == "discord" for item in cleaned_methods)
+        ):
+            from src.server.database.home_workspace import is_home_id
+
+            auto_ws = (
+                normalize_uuid(auto_row.get("workspace_id"))
+                or str(auto_row.get("workspace_id") or "").strip()
+            )
+            is_home_auto = not auto_ws or is_home_id(user_id, auto_ws)
+            ws_override = (
+                str(auto_out.get(auto_ws) or "").strip()
+                if not is_home_auto and isinstance(auto_out, dict)
+                else ""
+            )
+            if not ws_override or ws_override in match_targets:
+                refs.append(
+                    {
+                        "kind": "automation_delivery_config",
+                        "name": auto_name,
+                        "field": "delivery_config.methods",
+                        "automation_id": auto_id,
+                    }
+                )
+    if isinstance(auto_out, dict):
+        matched_ws_keys = [
+            str(ws_key).strip()
+            for ws_key, target_val in auto_out.items()
+            if str(target_val or "").strip() in match_targets
+        ]
+        if matched_ws_keys:
+            ws_name_by_id: dict[str, str] = {}
+            valid_uuids = [
+                norm for k in matched_ws_keys if (norm := normalize_uuid(k))
+            ]
+            if valid_uuids:
+                await cur.execute(
+                    """
+                    SELECT workspace_id::text AS workspace_id, name
+                    FROM workspaces
+                    WHERE workspace_id = ANY(%s::uuid[])
+                    """,
+                    (valid_uuids,),
+                )
+                for ws_row in await cur.fetchall():
+                    wid = normalize_uuid(ws_row.get("workspace_id")) or str(
+                        ws_row.get("workspace_id") or ""
+                    )
+                    wname = str(ws_row.get("name") or "").strip()
+                    if wid and wname:
+                        ws_name_by_id[wid] = wname
+            for ws_key in matched_ws_keys:
+                norm_ws = normalize_uuid(ws_key) or ws_key
+                refs.append(
+                    {
+                        "kind": "automation_output",
+                        "name": ws_name_by_id.get(norm_ws, norm_ws),
+                        "field": "automation_output",
+                        "workspace_id": norm_ws,
+                    }
+                )
+
+    agent_msgs = (
+        discord_cfg.get("agent_messages") if isinstance(discord_cfg, dict) else None
+    )
+    allowed_list = agent_msgs.get("allowed") if isinstance(agent_msgs, dict) else None
+    if isinstance(allowed_list, list) and any(
+        str(item or "").strip() in match_targets for item in allowed_list
+    ):
+        refs.append(
+            {
+                "kind": "agent_messages_allowed",
+                "name": "Discord",
+                "field": "agent_messages.allowed",
+            }
+        )
+
+    return refs
+
+
 async def update_user_channel_settings(
     *,
     user_id: str,
     version: str | None = None,
     settings: dict[str, Any] | None = None,
     automation_output_update: dict[str, Any] | None = None,
+    discord_channel_entry: dict[str, Any] | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-5: Validate and save `dalton_channel_user_settings`, syncing `dalton_channel_chat_bindings` and group generations."""
@@ -5300,6 +5481,7 @@ async def update_user_channel_settings(
             version=version,
             settings=settings,
             automation_output_update=automation_output_update,
+            discord_channel_entry=discord_channel_entry,
             conn=attempt_conn,
         ),
     )
@@ -5311,6 +5493,7 @@ async def _update_user_channel_settings_once(
     version: str | None = None,
     settings: dict[str, Any] | None = None,
     automation_output_update: dict[str, Any] | None = None,
+    discord_channel_entry: dict[str, Any] | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     cleaned_uid = str(user_id or "").strip()
@@ -5352,8 +5535,180 @@ async def _update_user_channel_settings_once(
                         p: default_app_settings(p) for p in sorted(linked)
                     }
 
+                skip_full_app_validation = False
+                force_sync_discord_addrs: set[str] = set()
+                validated_apps: dict[str, Any] = {}
+
+                if discord_channel_entry is not None and settings is None:
+                    entry_action = (
+                        str(discord_channel_entry.get("action") or "").strip().lower()
+                    )
+                    if entry_action == "remove":
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "code": "unsupported_action",
+                                "message": "本版不支持在此移除 Discord 频道",
+                            },
+                        )
+                    if entry_action not in ("add", "rename"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "code": "invalid",
+                                "message": f"Unsupported Discord channel action: {entry_action!r}",
+                            },
+                        )
+                    if not isinstance(version, str) or not version.strip():
+                        raise HTTPException(
+                            status_code=422,
+                            detail="version is required.",
+                        )
+                    entry_channel_id = str(
+                        discord_channel_entry.get("channel_id") or ""
+                    ).strip()
+                    if not _is_valid_discord_channel_id(entry_channel_id):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Discord channel ID must be a 17-20 digit snowflake below 2^64.",
+                        )
+                    raw_name = discord_channel_entry.get("name")
+                    cleaned_name = (
+                        str(raw_name).strip() if isinstance(raw_name, str) else ""
+                    )
+                    if len(cleaned_name) > 255:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Channel display name must be 255 characters or fewer.",
+                        )
+                    if str(version) != current_version:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "version_conflict",
+                                "message": f"Channel settings version conflict: expected {current_version}, got {version}.",
+                            },
+                        )
+                    candidate_apps = json.loads(json.dumps(current_apps))
+                    discord_cfg = candidate_apps.get("discord")
+                    if not isinstance(discord_cfg, dict):
+                        discord_cfg = default_app_settings("discord")
+                        candidate_apps["discord"] = discord_cfg
+                    chats_map = discord_cfg.get("chats")
+                    if not isinstance(chats_map, dict):
+                        chats_map = {}
+                        discord_cfg["chats"] = chats_map
+                    chat_addr = f"discord:{entry_channel_id}"
+                    if entry_action == "add":
+                        if chat_addr in chats_map:
+                            await cur.execute(
+                                """
+                                SELECT 1 FROM dalton_channel_chat_bindings
+                                WHERE platform = %s AND chat_address = %s
+                                """,
+                                ("discord", chat_addr),
+                            )
+                            has_shared_binding = (await cur.fetchone()) is not None
+                            if has_shared_binding:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail={
+                                        "code": "invalid",
+                                        "message": "This Discord channel is already registered.",
+                                        "problems": [
+                                            {
+                                                "field": _field("discord", "chats", chat_addr),
+                                                "message": "This Discord channel is already registered.",
+                                            }
+                                        ],
+                                    },
+                                )
+                            existing_entry = chats_map.get(chat_addr)
+                            restored_entry = (
+                                dict(existing_entry)
+                                if isinstance(existing_entry, dict)
+                                else {}
+                            )
+                            raw_existing_ws = restored_entry.get("workspace_id")
+                            existing_ws = (
+                                (
+                                    normalize_uuid(raw_existing_ws)
+                                    or str(raw_existing_ws).strip()
+                                )
+                                if raw_existing_ws is not None
+                                and str(raw_existing_ws).strip()
+                                else None
+                            )
+                            if existing_ws is not None:
+                                ws_ok, ws_err, ws_row = await _verify_workspace_write_permission(
+                                    cur,
+                                    existing_ws,
+                                    cleaned_uid,
+                                    conn=owned_conn,
+                                )
+                                if ws_row is None:
+                                    # The workspace is gone: the restored entry binds nothing.
+                                    existing_ws = None
+                                elif not ws_ok:
+                                    # Refuse rather than drop a live workspace binding: clearing
+                                    # it would lift that workspace's write check on delivery, and
+                                    # a transient permission-lookup failure must not do that.
+                                    raise HTTPException(
+                                        status_code=403,
+                                        detail={
+                                            "code": ws_err or "workspace_write_denied",
+                                            "message": "This channel is bound to a workspace you cannot write to.",
+                                        },
+                                    )
+                            restored_entry["workspace_id"] = existing_ws
+                            if cleaned_name:
+                                restored_entry["name"] = cleaned_name
+                            chats_map[chat_addr] = restored_entry
+                            force_sync_discord_addrs.add(chat_addr)
+                        else:
+                            new_entry: dict[str, Any] = {"workspace_id": None}
+                            if cleaned_name:
+                                new_entry["name"] = cleaned_name
+                            chats_map[chat_addr] = new_entry
+                    else:  # rename
+                        if chat_addr not in chats_map:
+                            raise HTTPException(
+                                status_code=404,
+                                detail={
+                                    "code": "not_found",
+                                    "message": "Discord channel is not registered.",
+                                },
+                            )
+                        if not cleaned_name:
+                            raise HTTPException(
+                                status_code=400,
+                                detail={
+                                    "code": "invalid",
+                                    "message": "Channel name is required.",
+                                    "problems": [
+                                        {
+                                            "field": _field(
+                                                "discord", "chats", chat_addr, "name"
+                                            ),
+                                            "message": "Channel name is required.",
+                                        }
+                                    ],
+                                },
+                            )
+                        existing_entry = chats_map.get(chat_addr)
+                        existing_dict = (
+                            dict(existing_entry)
+                            if isinstance(existing_entry, dict)
+                            else {}
+                        )
+                        if "workspace_id" not in existing_dict:
+                            existing_dict["workspace_id"] = None
+                        existing_dict["name"] = cleaned_name
+                        chats_map[chat_addr] = existing_dict
+                    validated_apps = candidate_apps
+                    skip_full_app_validation = True
                 # Handle single-workspace automation_output update (`PUT /agent/automation-output`)
-                if automation_output_update is not None and settings is None:
+                elif automation_output_update is not None and settings is None:
                     upd_ws = str(
                         automation_output_update.get("workspace_id") or ""
                     ).strip()
@@ -5399,40 +5754,52 @@ async def _update_user_channel_settings_once(
                     target_settings = settings
                     expected_version = version
 
-                if (
-                    expected_version is not None
-                    and str(expected_version) != current_version
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "version_conflict",
-                            "message": f"Channel settings version conflict: expected {current_version}, got {expected_version}.",
-                        },
-                    )
+                if not skip_full_app_validation:
+                    if (
+                        expected_version is not None
+                        and str(expected_version) != current_version
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "version_conflict",
+                                "message": f"Channel settings version conflict: expected {current_version}, got {expected_version}.",
+                            },
+                        )
 
-                # Validate schema and collect all problems with {"field": ..., "message": ...}
-                problems: list[dict[str, str]] = []
-                validated_apps: dict[str, Any] = {}
-                referenced_ws_ids: list[tuple[str, str]] = []
+                    # Validate schema and collect all problems with {"field": ..., "message": ...}
+                    problems: list[dict[str, str]] = []
+                    referenced_ws_ids: list[tuple[str, str]] = []
 
-                for key, raw_app in target_settings.items():
-                    if key == "default":
+                    for key, raw_app in target_settings.items():
+                        if key == "default":
+                            try:
+                                b_model = _Binding.model_validate(raw_app)
+                                validated_apps[key] = {
+                                    "workspace_id": (
+                                        normalize_uuid(b_model.workspace_id)
+                                        or b_model.workspace_id
+                                        if b_model.workspace_id is not None
+                                        else None
+                                    ),
+                                    **(b_model.model_extra or {}),
+                                }
+                                if b_model.workspace_id is not None:
+                                    referenced_ws_ids.append(
+                                        (_field(key, "workspace_id"), b_model.workspace_id)
+                                    )
+                            except ValidationError as exc:
+                                for err in exc.errors():
+                                    problems.append(
+                                        {
+                                            "field": _field(key, *err["loc"]),
+                                            "message": _problem_message(err),
+                                        }
+                                    )
+                            continue
+
                         try:
-                            b_model = _Binding.model_validate(raw_app)
-                            validated_apps[key] = {
-                                "workspace_id": (
-                                    normalize_uuid(b_model.workspace_id)
-                                    or b_model.workspace_id
-                                    if b_model.workspace_id is not None
-                                    else None
-                                ),
-                                **(b_model.model_extra or {}),
-                            }
-                            if b_model.workspace_id is not None:
-                                referenced_ws_ids.append(
-                                    (_field(key, "workspace_id"), b_model.workspace_id)
-                                )
+                            app_model = _App.model_validate(raw_app)
                         except ValidationError as exc:
                             for err in exc.errors():
                                 problems.append(
@@ -5441,161 +5808,149 @@ async def _update_user_channel_settings_once(
                                         "message": _problem_message(err),
                                     }
                                 )
-                        continue
+                            continue
 
-                    try:
-                        app_model = _App.model_validate(raw_app)
-                    except ValidationError as exc:
-                        for err in exc.errors():
-                            problems.append(
-                                {
-                                    "field": _field(key, *err["loc"]),
-                                    "message": _problem_message(err),
-                                }
-                            )
-                        continue
-
-                    # Rule ① (external tier group chat prohibition) & Rule ② (weixin group chat prohibition)
-                    if app_model.preferred is not None and not _is_dm_address(
-                        key, app_model.preferred
-                    ):
-                        if key == "weixin":
-                            problems.append(
-                                {
-                                    "field": _field(key, "preferred"),
-                                    "message": "Weixin only supports direct messages (weixin:@me).",
-                                }
-                            )
-                        elif user_tier == "external":
-                            problems.append(
-                                {
-                                    "field": _field(key, "preferred"),
-                                    "message": "External members cannot configure group chats.",
-                                }
-                            )
-
-                    chats_dict: dict[str, Any] = {}
-                    for addr, b_model in app_model.chats.items():
-                        if not _is_dm_address(key, addr):
+                        # Rule ① (external tier group chat prohibition) & Rule ② (weixin group chat prohibition)
+                        if app_model.preferred is not None and not _is_dm_address(
+                            key, app_model.preferred
+                        ):
                             if key == "weixin":
                                 problems.append(
                                     {
-                                        "field": _field(key, "chats", addr),
+                                        "field": _field(key, "preferred"),
                                         "message": "Weixin only supports direct messages (weixin:@me).",
                                     }
                                 )
                             elif user_tier == "external":
                                 problems.append(
                                     {
-                                        "field": _field(key, "chats", addr),
+                                        "field": _field(key, "preferred"),
                                         "message": "External members cannot configure group chats.",
                                     }
                                 )
-                        ws_val = (
-                            normalize_uuid(b_model.workspace_id) or b_model.workspace_id
-                            if b_model.workspace_id is not None
-                            else None
-                        )
-                        if ws_val is not None:
-                            referenced_ws_ids.append(
-                                (_field(key, "chats", addr, "workspace_id"), ws_val)
+
+                        chats_dict: dict[str, Any] = {}
+                        for addr, b_model in app_model.chats.items():
+                            if not _is_dm_address(key, addr):
+                                if key == "weixin":
+                                    problems.append(
+                                        {
+                                            "field": _field(key, "chats", addr),
+                                            "message": "Weixin only supports direct messages (weixin:@me).",
+                                        }
+                                    )
+                                elif user_tier == "external":
+                                    problems.append(
+                                        {
+                                            "field": _field(key, "chats", addr),
+                                            "message": "External members cannot configure group chats.",
+                                        }
+                                    )
+                            ws_val = (
+                                normalize_uuid(b_model.workspace_id) or b_model.workspace_id
+                                if b_model.workspace_id is not None
+                                else None
                             )
-                        chats_dict[addr] = {
-                            "workspace_id": ws_val,
-                            **(
-                                {"name": b_model.name}
-                                if b_model.name is not None
-                                else {}
-                            ),
-                            **(b_model.model_extra or {}),
+                            if ws_val is not None:
+                                referenced_ws_ids.append(
+                                    (_field(key, "chats", addr, "workspace_id"), ws_val)
+                                )
+                            chats_dict[addr] = {
+                                "workspace_id": ws_val,
+                                **(
+                                    {"name": b_model.name}
+                                    if b_model.name is not None
+                                    else {}
+                                ),
+                                **(b_model.model_extra or {}),
+                            }
+
+                        auto_dict: dict[str, str] = {}
+                        for ws_key, addr in app_model.automation_output.items():
+                            norm_ws_key = normalize_uuid(ws_key) or ws_key
+                            referenced_ws_ids.append(
+                                (_field(key, "automation_output", ws_key), norm_ws_key)
+                            )
+                            if not _is_dm_address(key, addr):
+                                if key == "weixin":
+                                    problems.append(
+                                        {
+                                            "field": _field(
+                                                key, "automation_output", ws_key
+                                            ),
+                                            "message": "Weixin only supports direct messages (weixin:@me).",
+                                        }
+                                    )
+                                elif user_tier == "external":
+                                    problems.append(
+                                        {
+                                            "field": _field(
+                                                key, "automation_output", ws_key
+                                            ),
+                                            "message": "External members cannot configure group chats.",
+                                        }
+                                    )
+                            auto_dict[norm_ws_key] = addr
+
+                        for idx, allowed_addr in enumerate(
+                            app_model.agent_messages.allowed
+                        ):
+                            if not _is_dm_address(key, allowed_addr):
+                                if key == "weixin":
+                                    problems.append(
+                                        {
+                                            "field": _field(
+                                                key, "agent_messages", "allowed", idx
+                                            ),
+                                            "message": "Weixin only supports direct messages (weixin:@me).",
+                                        }
+                                    )
+                                elif user_tier == "external":
+                                    problems.append(
+                                        {
+                                            "field": _field(
+                                                key, "agent_messages", "allowed", idx
+                                            ),
+                                            "message": "External members cannot configure group chats.",
+                                        }
+                                    )
+
+                        validated_apps[key] = {
+                            "preferred": app_model.preferred,
+                            "chats": chats_dict,
+                            "automation_output": auto_dict,
+                            "agent_messages": {
+                                "enabled": app_model.agent_messages.enabled,
+                                "allowed": list(app_model.agent_messages.allowed),
+                                **(app_model.agent_messages.model_extra or {}),
+                            },
+                            **(app_model.model_extra or {}),
                         }
 
-                    auto_dict: dict[str, str] = {}
-                    for ws_key, addr in app_model.automation_output.items():
-                        norm_ws_key = normalize_uuid(ws_key) or ws_key
-                        referenced_ws_ids.append(
-                            (_field(key, "automation_output", ws_key), norm_ws_key)
+                    # Rule ③: Check workspace write permissions for all referenced workspace_ids
+                    if referenced_ws_ids:
+                        writable_names = await _get_writable_workspace_names(
+                            cleaned_uid, [ws for _, ws in referenced_ws_ids]
                         )
-                        if not _is_dm_address(key, addr):
-                            if key == "weixin":
+                        for field_path, ws_val in referenced_ws_ids:
+                            norm_ws = normalize_uuid(ws_val)
+                            if not norm_ws or norm_ws not in writable_names:
                                 problems.append(
                                     {
-                                        "field": _field(
-                                            key, "automation_output", ws_key
-                                        ),
-                                        "message": "Weixin only supports direct messages (weixin:@me).",
-                                    }
-                                )
-                            elif user_tier == "external":
-                                problems.append(
-                                    {
-                                        "field": _field(
-                                            key, "automation_output", ws_key
-                                        ),
-                                        "message": "External members cannot configure group chats.",
-                                    }
-                                )
-                        auto_dict[norm_ws_key] = addr
-
-                    for idx, allowed_addr in enumerate(
-                        app_model.agent_messages.allowed
-                    ):
-                        if not _is_dm_address(key, allowed_addr):
-                            if key == "weixin":
-                                problems.append(
-                                    {
-                                        "field": _field(
-                                            key, "agent_messages", "allowed", idx
-                                        ),
-                                        "message": "Weixin only supports direct messages (weixin:@me).",
-                                    }
-                                )
-                            elif user_tier == "external":
-                                problems.append(
-                                    {
-                                        "field": _field(
-                                            key, "agent_messages", "allowed", idx
-                                        ),
-                                        "message": "External members cannot configure group chats.",
+                                        "field": field_path,
+                                        "message": f"{ws_val!r} is not a writable workspace for your account.",
                                     }
                                 )
 
-                    validated_apps[key] = {
-                        "preferred": app_model.preferred,
-                        "chats": chats_dict,
-                        "automation_output": auto_dict,
-                        "agent_messages": {
-                            "enabled": app_model.agent_messages.enabled,
-                            "allowed": list(app_model.agent_messages.allowed),
-                            **(app_model.agent_messages.model_extra or {}),
-                        },
-                        **(app_model.model_extra or {}),
-                    }
-
-                # Rule ③: Check workspace write permissions for all referenced workspace_ids
-                if referenced_ws_ids:
-                    writable_names = await _get_writable_workspace_names(
-                        cleaned_uid, [ws for _, ws in referenced_ws_ids]
-                    )
-                    for field_path, ws_val in referenced_ws_ids:
-                        norm_ws = normalize_uuid(ws_val)
-                        if not norm_ws or norm_ws not in writable_names:
-                            problems.append(
-                                {
-                                    "field": field_path,
-                                    "message": f"{ws_val!r} is not a writable workspace for your account.",
-                                }
-                            )
-
-                if problems:
-                    raise HTTPException(
-                        status_code=400,
-                        detail={
-                            "code": "invalid",
-                            "message": problems[0]["message"],
-                            "problems": problems,
-                        },
-                    )
+                    if problems:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "code": "invalid",
+                                "message": problems[0]["message"],
+                                "problems": problems,
+                            },
+                        )
 
                 # Compute changes
                 changes: list[str] = []
@@ -5606,6 +5961,9 @@ async def _update_user_channel_settings_once(
                             changes.append(f"Updated {app_key} channel settings")
                     if not changes:
                         changes.append("Updated channels.json")
+                    new_version = bump_version_str(current_version)
+                elif force_sync_discord_addrs:
+                    changes.append("Restored discord shared binding")
                     new_version = bump_version_str(current_version)
                 else:
                     new_version = current_version
@@ -5625,6 +5983,15 @@ async def _update_user_channel_settings_once(
                         else None
                     )
                     return {"workspace_id": ws_val}
+
+                def _group_chat_name(cfg: Any) -> str | None:
+                    if not isinstance(cfg, dict):
+                        return None
+                    raw_name = cfg.get("name")
+                    if raw_name is None:
+                        return None
+                    cleaned = str(raw_name).strip()
+                    return cleaned or None
 
                 # Sync dalton_channel_chat_bindings for group notification settings (independent of personal session generations)
                 for app_key in GROUP_PLATFORMS:
@@ -5657,16 +6024,34 @@ async def _update_user_channel_settings_once(
                         addr: _group_chat_routing_cfg(cfg)
                         for addr, cfg in new_raw_chats.items()
                     }
+                    old_names = {
+                        addr: _group_chat_name(cfg)
+                        for addr, cfg in old_raw_chats.items()
+                    }
+                    new_names = {
+                        addr: _group_chat_name(cfg)
+                        for addr, cfg in new_raw_chats.items()
+                    }
                     deleted_group_set = {
                         addr for addr in old_routing if addr not in new_routing
                     }
-                    added_or_modified_group_set = {
+                    routing_changed_set = {
                         addr
                         for addr, r_cfg in new_routing.items()
                         if addr not in old_routing or r_cfg != old_routing[addr]
                     }
+                    name_changed_set = {
+                        addr
+                        for addr, n_name in new_names.items()
+                        if addr in old_names
+                        and n_name is not None
+                        and n_name != old_names[addr]
+                    }
                     changed_group_addrs = sorted(
-                        deleted_group_set | added_or_modified_group_set
+                        deleted_group_set
+                        | routing_changed_set
+                        | name_changed_set
+                        | (force_sync_discord_addrs if app_key == "discord" else set())
                     )
 
                     # 1. Verify permission and acquire per-group advisory locks in unified sorted order
@@ -5688,7 +6073,7 @@ async def _update_user_channel_settings_once(
                     for chat_addr in changed_group_addrs:
                         await cur.execute(
                             """
-                            SELECT workspace_id FROM dalton_channel_chat_bindings
+                            SELECT workspace_id, chat_name FROM dalton_channel_chat_bindings
                             WHERE platform = %s AND chat_address = %s
                             FOR UPDATE
                             """,
@@ -5700,25 +6085,119 @@ async def _update_user_channel_settings_once(
                             if existing_binding and existing_binding.get("workspace_id")
                             else None
                         )
+                        prev_chat_name = (
+                            str(existing_binding.get("chat_name") or "").strip() or None
+                            if existing_binding
+                            else None
+                        )
                         if chat_addr in deleted_group_set:
-                            old_cfg_ws_id = old_routing[chat_addr].get("workspace_id")
                             if (
-                                existing_binding is not None
-                                and prev_ws_id == old_cfg_ws_id
+                                app_key == "discord"
+                                and not skip_full_app_validation
+                                and (m := _DISCORD_CANONICAL_CHAT_ADDR_RE.fullmatch(chat_addr))
                             ):
+                                refs = await _find_discord_channel_references(
+                                    cur,
+                                    channel_id=m.group(1),
+                                    discord_cfg=app_cfg if isinstance(app_cfg, dict) else None,
+                                    user_id=cleaned_uid,
+                                )
+                                if refs:
+                                    if user_tier == "admin":
+                                        raise HTTPException(
+                                            status_code=409,
+                                            detail={
+                                                "code": "channel_in_use",
+                                                "message": "Cannot remove Discord channel while it is still referenced.",
+                                                "references": refs,
+                                            },
+                                        )
+                                    auto_count = len(
+                                        {
+                                            r["automation_id"]
+                                            for r in refs
+                                            if r.get("kind")
+                                            in (
+                                                "automation_report_profile",
+                                                "automation_delivery_config",
+                                            )
+                                            and r.get("automation_id")
+                                        }
+                                    )
+                                    ws_count = len(
+                                        {
+                                            r["workspace_id"]
+                                            for r in refs
+                                            if r.get("kind") == "automation_output"
+                                            and r.get("workspace_id")
+                                        }
+                                    )
+                                    other_count = sum(
+                                        1
+                                        for r in refs
+                                        if r.get("kind")
+                                        not in (
+                                            "automation_report_profile",
+                                            "automation_output",
+                                        )
+                                    )
+                                    ref_count = auto_count + ws_count + other_count
+                                    raise HTTPException(
+                                        status_code=409,
+                                        detail={
+                                            "code": "channel_in_use",
+                                            "message": f"该频道仍被 {ref_count} 个自动化或工作区引用，无法移除。",
+                                            "reference_count": ref_count,
+                                        },
+                                    )
+                            if existing_binding is not None:
                                 await cur.execute(
                                     """
-                                    DELETE FROM dalton_channel_chat_bindings
-                                    WHERE platform = %s AND chat_address = %s
+                                    SELECT EXISTS (
+                                        SELECT 1 FROM dalton_channel_user_settings
+                                        WHERE user_id <> %s
+                                          AND jsonb_typeof(apps -> %s -> 'chats') = 'object'
+                                          AND jsonb_exists(apps -> %s -> 'chats', %s)
+                                    ) AS has_other_ref
                                     """,
-                                    (app_key, chat_addr),
+                                    (cleaned_uid, app_key, app_key, chat_addr),
                                 )
+                                other_ref_row = await cur.fetchone()
+                                if not (other_ref_row and other_ref_row.get("has_other_ref")):
+                                    await cur.execute(
+                                        """
+                                        DELETE FROM dalton_channel_chat_bindings
+                                        WHERE platform = %s AND chat_address = %s
+                                        """,
+                                        (app_key, chat_addr),
+                                    )
                         else:
                             binding_cfg = new_raw_chats[chat_addr]
+                            is_added = chat_addr not in old_routing
+                            routing_changed = chat_addr in routing_changed_set
                             new_ws_id = new_routing[chat_addr].get("workspace_id")
-                            chat_name_val = binding_cfg.get("name")
-                            if existing_binding is not None and prev_ws_id == new_ws_id:
+                            chat_name_val = _group_chat_name(binding_cfg)
+
+                            if existing_binding is None:
+                                effective_ws_id = new_ws_id
+                            elif (is_added and new_ws_id is None) or not routing_changed:
+                                # Preserve existing shared workspace_id when adding with null
+                                # workspace or when only renaming the chat.
+                                effective_ws_id = prev_ws_id
+                            else:
+                                effective_ws_id = new_ws_id
+
+                            ws_unchanged = (
+                                existing_binding is not None
+                                and effective_ws_id == prev_ws_id
+                            )
+                            name_unchanged = (
+                                existing_binding is not None
+                                and (chat_name_val is None or chat_name_val == prev_chat_name)
+                            )
+                            if ws_unchanged and name_unchanged:
                                 continue
+
                             await cur.execute(
                                 """
                                 INSERT INTO dalton_channel_chat_bindings (
@@ -5729,14 +6208,18 @@ async def _update_user_channel_settings_once(
                                 ON CONFLICT (platform, chat_address) DO UPDATE SET
                                     workspace_id = EXCLUDED.workspace_id,
                                     chat_name = COALESCE(EXCLUDED.chat_name, dalton_channel_chat_bindings.chat_name),
-                                    bound_by_user_id = EXCLUDED.bound_by_user_id,
+                                    bound_by_user_id = CASE
+                                        WHEN dalton_channel_chat_bindings.workspace_id IS DISTINCT FROM EXCLUDED.workspace_id
+                                        THEN EXCLUDED.bound_by_user_id
+                                        ELSE dalton_channel_chat_bindings.bound_by_user_id
+                                    END,
                                     updated_at = NOW()
                                 """,
                                 (
                                     app_key,
                                     chat_addr,
                                     chat_name_val,
-                                    new_ws_id,
+                                    effective_ws_id,
                                     cleaned_uid,
                                 ),
                             )

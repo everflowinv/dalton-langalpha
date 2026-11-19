@@ -56,7 +56,17 @@ logger = logging.getLogger(__name__)
 FEISHU_CHAT_ID_RE = re.compile(r"^oc_[A-Za-z0-9_-]{3,128}$")
 FEISHU_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]{3,128}$")
 DISCORD_SNOWFLAKE_RE = re.compile(r"^[0-9]{5,32}$")
+DISCORD_CHANNEL_SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
+DISCORD_MAX_SNOWFLAKE_INT = (1 << 64) - 1
 SUPPORTED_NOTIFY_PLATFORMS: frozenset[str] = frozenset({"feishu", "discord"})
+
+
+def is_valid_discord_channel_snowflake(raw: str | None) -> bool:
+    """True when ``raw`` is a 17-20 digit Discord snowflake strictly below 2^64."""
+    cleaned = str(raw or "").strip()
+    if not DISCORD_CHANNEL_SNOWFLAKE_RE.fullmatch(cleaned):
+        return False
+    return int(cleaned) <= DISCORD_MAX_SNOWFLAKE_INT
 
 
 @dataclass(frozen=True)
@@ -126,26 +136,36 @@ def _fetch_discord_channel_sync(channel_id: str, token: str) -> dict[str, Any]:
     return payload
 
 
-async def verify_discord_channel_is_guild_text(channel_id: str) -> tuple[bool, str | None]:
-    """Check a ``discord:channel:`` id when this process has the bot token.
+async def lookup_discord_guild_text_channel(
+    channel_id: str,
+) -> tuple[bool, str | None, str | None]:
+    """Check a ``discord:channel:`` id and return ``(ok, err, channel_name)`` in one lookup.
 
     The gateway holds ``DALTON_DISCORD_BOT_TOKEN`` and checks the same rule in
     ``checkTargetLive`` before every send. When the backend has no token, this
-    returns success so authorization is not failed closed ahead of that check.
+    returns ``(True, None, None)`` so authorization is not failed closed ahead of that check.
     """
     token = os.environ.get("DALTON_DISCORD_BOT_TOKEN", "").strip()
     if not token:
-        return True, None
-    if not DISCORD_SNOWFLAKE_RE.match(str(channel_id or "").strip()):
-        return False, "Discord channel id is not a snowflake."
+        return True, None, None
+    cleaned_id = str(channel_id or "").strip()
+    if not DISCORD_SNOWFLAKE_RE.match(cleaned_id):
+        return False, "Discord channel id is not a snowflake.", None
     try:
-        payload = await asyncio.to_thread(_fetch_discord_channel_sync, channel_id, token)
+        payload = await asyncio.to_thread(_fetch_discord_channel_sync, cleaned_id, token)
     except Exception as exc:
-        logger.warning("Discord channel lookup failed for %s: %s", channel_id, exc)
-        return False, "Discord channel lookup failed."
+        logger.warning("Discord channel lookup failed for %s: %s", cleaned_id, exc)
+        return False, "Discord channel lookup failed.", None
     if discord_channel_is_guild_text(payload):
-        return True, None
-    return False, "Discord channel target must be a guild text channel."
+        raw_name = str(payload.get("name") or "").strip()
+        return True, None, raw_name or None
+    return False, "Discord channel target must be a guild text channel.", None
+
+
+async def verify_discord_channel_is_guild_text(channel_id: str) -> tuple[bool, str | None]:
+    """Check a ``discord:channel:`` id when this process has the bot token."""
+    ok, err, _name = await lookup_discord_guild_text_channel(channel_id)
+    return ok, err
 
 
 def _requested_target_is_snapshotted_etf_mirror(run_row: Mapping[str, Any], cleaned_target: str) -> bool:
