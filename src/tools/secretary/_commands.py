@@ -1,13 +1,13 @@
-"""What a secretary tool answers with, and the checks it runs before acting.
+"""What the hand-off tool answers with, and the checks it runs before acting.
 
-Every answer is a ``Command`` carrying one ``ToolMessage``, and an action that
-changes the user's workspaces or threads pauses on ``interrupt()`` for the
-user's approval, the same pattern the onboarding tools use.
+Every answer is a ``Command`` carrying one ``ToolMessage``, and a hand-off
+pauses on ``interrupt()`` for the user's approval, the same pattern the
+onboarding tools use.
 """
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping  # DALTON-HOOK(computer-cli-tokens-off)
 from typing import Any
 
 from langchain_core.messages import ToolMessage
@@ -20,9 +20,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# DALTON-HOOK(computer-cli-tokens-off): retain server-side CoS command helpers.
 __all__ = [
+    "HANDOFF_TOOL_NAME",
     "InjectedToolCallId",
     "decline_command",
+    "decline_handoff_command",
     "decline_routing_command",
     "error_command",
     "hitl_confirm",
@@ -31,6 +34,9 @@ __all__ = [
     "verify_thread_owner",
     "verify_workspace_owner",
 ]
+
+#: The one Chief of Staff tool left, and the one that puts a card to the user.
+HANDOFF_TOOL_NAME = "delegate_to_analyst"
 
 
 def hitl_confirm(
@@ -58,6 +64,7 @@ def hitl_confirm(
     return approved, response if isinstance(response, dict) else {}
 
 
+# --- DALTON-HOOK(computer-cli-tokens-off): begin ---
 #: The tools that put a card to the user through ``hitl_confirm``, by the
 #: actions that do (None for every action).
 _CARDS: dict[str, frozenset[str] | None] = {
@@ -104,6 +111,27 @@ def decline_routing_command(
         "here, do not do it yourself instead: ask them where they want it.",
         tool_call_id,
     )
+# --- DALTON-HOOK(computer-cli-tokens-off): end ---
+
+
+def decline_handoff_command(response: dict, tool_call_id: str) -> Command:
+    """Decline a hand-off without freeing the work.
+
+    A bare decline read to the model as leave to do the work itself, though
+    the user declined where it would go, not that it should be done here.
+    """
+    from src.server.models.chat import rejection_feedback
+
+    decisions = response.get("decisions") or [{}]
+    feedback = rejection_feedback(decisions[0].get("message"))
+    said = f', saying: "{feedback}"' if feedback else ""
+    message = (
+        f"User declined the hand-off{said}. Unless they said to do the work "
+        "here, do not do it yourself instead: ask them where they want it."
+    )
+    return Command(
+        update={"messages": [ToolMessage(content=message, tool_call_id=tool_call_id)]}
+    )
 
 
 def success_command(
@@ -138,6 +166,7 @@ def error_command(error: str, tool_call_id: str, **fields: Any) -> Command:
     )
 
 
+# DALTON-HOOK(computer-cli-tokens-off): retained for manage_workspaces / manage_threads.
 async def verify_workspace_owner(
     workspace_id: str,
     user_id: str,

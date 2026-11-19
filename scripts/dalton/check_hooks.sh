@@ -262,10 +262,9 @@ ALLOWED_HOOKS=(
   # workflow_timeout) instead of discarding the pinned session under live
   # deep workflows at a flat 30 minutes (runs/executor.py).
   "tail-drain-outlives-workflows"
-  # R1-3: the turn anchor row states the server-resolved model of the turn as
-  # a fact (turn_context.py, turn.py, context_stack.py, turn.md.j2,
-  # request_prep.py, ptc_run.py).
-  "turn-row-model-line"
+  # <model> baseline block states the server-designated model and distinguishes
+  # a resilience fallback on an individual call (envelope/baseline_model.md.j2).
+  "model-designated-note"
   # R3a-1: 402 / balance-exhausted refusals and quota 429s whose reset
   # outlasts the backoff budget are not retried and bench the candidate for
   # the rest of the run (error_classification.py, model_resilience.py;

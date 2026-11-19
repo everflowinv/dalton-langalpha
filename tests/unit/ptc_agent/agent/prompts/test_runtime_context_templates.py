@@ -81,6 +81,9 @@ ENVELOPE_CASES: dict[str, dict] = {
         "preferred_market": "US",
     },
     "envelope/baseline_files.md.j2": {},
+    "envelope/baseline_model.md.j2": {
+        "content": "Claude Opus 5.5, reasoning effort high",
+    },
     "envelope/baseline_mcp_servers.md.j2": {
         "content": "### market_data\n- get_quote: the last trade",
     },
@@ -107,6 +110,7 @@ BASELINE_TEMPLATES = [
     "envelope/baseline_memory.md.j2",
     "envelope/baseline_identity.md.j2",
     "envelope/baseline_files.md.j2",
+    "envelope/baseline_model.md.j2",
     "envelope/baseline_mcp_servers.md.j2",
     "envelope/baseline_skills.md.j2",
     "envelope/baseline_activity.md.j2",
@@ -261,9 +265,50 @@ class TestBaselineDeterminism:
         assert "<activity>" in activity and "</activity>" in activity
         assert "NVDA earnings" in activity
 
+    def test_the_model_block_says_who_picks_the_model_only_to_the_main_agent(self):
+        """A subagent cannot pick its model or run `la`, so it gets the fact alone.
+        DALTON-HOOK(computer-cli-tokens-off): `la models list` only appears when cli_tokens=True.
+        DALTON-HOOK(model-designated-note): both state server-designated vs fallback."""
+        main_cli_off = _render("envelope/baseline_model.md.j2", "detailed")
+        assert main_cli_off.strip() == (
+            "<model>\n"
+            "You run on Claude Opus 5.5, reasoning effort high. "
+            "This is the server-designated model for the thread; an individual call "
+            "moved to a fallback uses that fallback model instead. "
+            "The user picks the model.\n"
+            "</model>"
+        )
+        main_cli_on = init_loader().render(
+            "envelope/baseline_model.md.j2",
+            content="Claude Opus 5.5, reasoning effort high",
+            cli_tokens=True,
+        )
+        assert main_cli_on.strip() == (
+            "<model>\n"
+            "You run on Claude Opus 5.5, reasoning effort high. "
+            "This is the server-designated model for the thread; an individual call "
+            "moved to a fallback uses that fallback model instead. "
+            "The user picks the model; `la models list` shows the models they can "
+            "run and who each one bills to.\n"
+            "</model>"
+        )
+        subagent = init_loader().render(
+            "envelope/baseline_model.md.j2",
+            content="GPT-6 Astra",
+            subagent=True,
+        )
+        # DALTON-HOOK(model-designated-note): expect server-designated fallback note in subagent `<model>` block.
+        assert subagent.strip() == (
+            "<model>\n"
+            "You run on GPT-6 Astra. This is the server-designated model; an "
+            "individual call moved to a fallback uses that fallback model instead.\n"
+            "</model>"
+        )
+
     @pytest.mark.parametrize(
         "template",
         [
+            "envelope/baseline_model.md.j2",
             "envelope/baseline_mcp_servers.md.j2",
             "envelope/baseline_skills.md.j2",
             "envelope/baseline_activity.md.j2",
@@ -381,7 +426,10 @@ class TestHarnessRows:
         assert rendered.splitlines()[0] == (
             f"The {block.subject} changed after the copy in {block.label} was frozen"
         )
-        assert f"compares it with the frozen copy in {block.label}" in rendered
+        # A value block's row states the value; there is no diff to compare.
+        assert (
+            f"compares it with the frozen copy in {block.label}" in rendered
+        ) is (block.value_intro is None)
         assert "+a new server" in rendered
         # No writer to credit, and no file to send the model off to read.
         assert "last edit by" not in rendered

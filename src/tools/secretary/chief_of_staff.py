@@ -1,13 +1,12 @@
 """The Chief of Staff's tools: how Home's agent runs the user's workspaces.
 
+# DALTON-HOOK(computer-cli-tokens-off): retain server-side workspace/thread tools.
 Each workspace has its own agent, its analyst, and the Chief of Staff in Home
 hands work to them rather than doing it in their folders. A hand-off always
-names its workspace: a new one is created first, under its own approval or
-one the user gave in advance, so the user agrees to the workspace before any
-work is handed to it. It lists, creates and deletes workspaces but does not
-stop them: Home runs on the computer a stop would take down. A delete is the
-user's to confirm on its own card, never approved in advance. ``agent_output``
-is how it reads a thread, so its ``manage_threads`` has no second way to.
+names its workspace: a new one is created first with ``manage_workspaces``,
+under its own approval or one the user gave in advance, so the user agrees to
+the workspace before any work is handed to it. ``agent_output`` is how it
+reads a thread, so ``manage_threads`` has no second way to.
 """
 
 import logging
@@ -20,6 +19,7 @@ from langgraph.types import Command
 
 from ptc_agent.agent.limits import pending_read
 from src.tools.secretary._commands import (
+    HANDOFF_TOOL_NAME,
     InjectedToolCallId,
     error_command,
     success_command,
@@ -27,6 +27,7 @@ from src.tools.secretary._commands import (
 )
 from src.tools.secretary.approvals import preapproved
 from src.tools.secretary.dispatch import dispatch
+# DALTON-HOOK(computer-cli-tokens-off): retain server-side CoS tools when la CLI is off.
 from src.tools.secretary.tools import (
     _workspaces_delete,
     threads_delete,
@@ -139,7 +140,7 @@ async def chief_of_staff_workspaces(
     )
 
 
-@tool("delegate_to_analyst")
+@tool(HANDOFF_TOOL_NAME)
 async def delegate_to_analyst(
     question: str,
     config: RunnableConfig,
@@ -147,12 +148,13 @@ async def delegate_to_analyst(
     workspace_id: str | None = None,
     thread_id: str | None = None,
     report_back: bool = True,
+    model: str | None = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """Hand work to a workspace's analyst, who does it there in the background unless the user declines.
 
     Needs workspace_id or thread_id: a workspace that does not exist yet is
-    created with manage_workspaces first.
+    created with manage_workspaces(action="create") first.
 
     Args:
         question: The task, written for the analyst, who does not see this conversation.
@@ -161,10 +163,16 @@ async def delegate_to_analyst(
         report_back: Leave True to be told when the analyst finishes, is stopped or fails.
             False only when the user asks for no report, or will follow the work in that
             workspace themselves.
+        model: Optional model key to run the analyst on. Pass one only when the user asks
+            for a model or a skill's procedure names one; it stays the thread's model for
+            later turns. Omitted, the turn runs the thread's own model, or the user's
+            default on a new thread. A thread mid-turn takes it only into a turn already
+            running that model, and otherwise refuses it until that turn ends.
 
     Returns:
         The analyst's thread, still running; its report_back field says whether a report-back is coming.
     """
+    # DALTON-HOOK(computer-cli-tokens-off): direct user-facing error to manage_workspaces when la CLI is off.
     if not workspace_id and not thread_id:
         return error_command(
             "No workspace named. Pass workspace_id, or thread_id to continue "
@@ -174,10 +182,11 @@ async def delegate_to_analyst(
         )
     return await dispatch(
         question, config, workspace_id, thread_id, report_back, tool_call_id,
-        preapproved=preapproved(state, tool_call_id),
+        preapproved=preapproved(state, tool_call_id), model=model,
     )
 
 
+# DALTON-HOOK(computer-cli-tokens-off): retain agent_output and manage_threads alongside delegate_to_analyst.
 @tool("agent_output")
 async def agent_output(
     thread_id: str,
@@ -206,7 +215,7 @@ async def agent_output(
     if err := await verify_thread_owner(thread_id, user_id, tool_call_id):
         return err
 
-    from src.tools.secretary.utils import extract_text_from_thread
+    from src.server.services.thread_output import extract_text_from_thread
 
     try:
         result = await extract_text_from_thread(

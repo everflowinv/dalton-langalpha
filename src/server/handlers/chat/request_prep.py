@@ -13,8 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-# DALTON-HOOK(turn-row-model-line): replace() stamps the resolved model
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
@@ -649,9 +648,10 @@ async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> No
     """Keep the model a client named on its thread, once the turn is admitted.
 
     Called after START commits and the run is attached, so a send refused
-    before admission, or a steer that never ran on the model it carried,
-    leaves the thread as it was, and the committed run always has an owner
-    when this waits on the database.
+    before admission leaves the thread as it was, and the committed run
+    always has an owner when this waits on the database. A hand-off steered
+    into a running turn calls it too: it steers only a turn on the model it
+    named (``wait_or_steer``'s ``on_model``).
     """
     if named_model:
         await remember_thread_llm_model(
@@ -717,22 +717,6 @@ def build_turn_context(
         tool_timezone=zone
         or get_locale_config(request.locale or "en-US", "en").get("timezone", "UTC"),
     )
-
-
-# DALTON-HOOK(turn-row-model-line): stamp the server-resolved model onto the
-# turn context after resolve_llm_config has answered; nothing the client or
-# the user typed can reach the line.
-def with_resolved_model(
-    turn_context: TurnContext, effective_model: str | None
-) -> TurnContext:
-    """The turn context with the model the server resolved for this turn.
-
-    ``effective_model`` is ``config.llm.name`` off ``resolve_llm_config`` —
-    the automation's designated ``llm_model``, a client-named model, or the
-    account default — so the anchor row states what actually runs, which is
-    what the model-line exists to make a settled fact.
-    """
-    return replace(turn_context, model_key=effective_model)
 
 
 def is_notification_turn(request: ChatRequest) -> bool:
