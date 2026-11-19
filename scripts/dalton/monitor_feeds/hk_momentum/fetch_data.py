@@ -709,7 +709,9 @@ def download_history(
                         raise RuntimeError(
                             f"历史响应丢失原有日期 ({code}: 缺失 {len(missing_old)} 天)"
                         )
-                if new_dates and min(new_dates) > HIST_START:
+                if new_dates and len(rows) >= HIST_BARS and min(new_dates) > HIST_START:
+                    # Only a full window that no longer reaches HIST_START needs
+                    # attention; a short history is just a later listing.
                     logger.warning(
                         "hk_momentum history window starts %s, after HIST_START %s (%s)",
                         min(new_dates), HIST_START, code,
