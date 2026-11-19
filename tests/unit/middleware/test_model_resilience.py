@@ -1623,9 +1623,10 @@ class TestDroppedThinkingReport:
 
 # --- DALTON-HOOK(model-fallback-identity): begin ---
 class TestFallbackIdentity:
-    """A single-call fallback tells the fallback model which model it is and
-    which server-designated model in ``<model>`` it stands in for, on both the
-    main agent and subagent paths."""
+    """A single-call non-Claude fallback tells the fallback model which model
+    it is and which server-designated model in ``<model>`` it stands in for,
+    on both main-agent and subagent paths; Claude fallbacks stay untouched so
+    ``SystemPinMiddleware`` preserves the pinned system prompt for bound thinking."""
 
     @staticmethod
     def _system_text(req) -> str:
@@ -1639,7 +1640,7 @@ class TestFallbackIdentity:
         )
 
     @pytest.mark.asyncio
-    async def test_main_agent_fallback_request_names_fallback_and_primary_model(
+    async def test_main_agent_non_claude_fallback_names_fallback_and_primary_model(
         self, events, monkeypatch
     ):
         from types import SimpleNamespace
@@ -1647,41 +1648,34 @@ class TestFallbackIdentity:
         from langchain.agents.middleware.types import ModelRequest
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
-            STATE_SYSTEM_PIN,
-            SystemPinMiddleware,
-        )
-
         manifest = {
             "claude-primary": {"display_name": "Claude Primary"},
-            "claude-fallback": {"display_name": "Claude Fallback"},
+            "gpt-fallback": {"display_name": "GPT Fallback"},
         }
         monkeypatch.setattr(
             "src.llms.llm.LLM.get_model_config",
-            lambda: SimpleNamespace(get_model_config=manifest.get),
-        )
-        monkeypatch.setattr(
-            "ptc_agent.agent.middleware.compaction.measure.is_claude",
-            lambda model: True,
+            lambda: SimpleNamespace(
+                get_model_config=manifest.get,
+                get_provider_info=lambda route: {"sdk": "anthropic"} if route == "anthropic" else {},
+            ),
         )
 
         primary = _FakeModel("claude-primary")
         primary.metadata = {"manifest_model": "claude-primary", "reasoning_effort": "high"}
-        fallback = _FakeModel("claude-fallback")
-        fallback.metadata = {"manifest_model": "claude-fallback"}
+        fallback = _FakeModel("gpt-fallback")
+        fallback.metadata = {"manifest_model": "gpt-fallback"}
 
         mw = ModelResilienceMiddleware(
             primary_name="claude-primary",
             primary_client=primary,
-            fallbacks=[("claude-fallback", fallback)],
+            fallbacks=[("gpt-fallback", fallback)],
             max_retries=0,
             initial_delay=0.0,
             jitter=False,
         )
-        pin_mw = SystemPinMiddleware()
         seen_texts: list[str] = []
 
-        async def terminal(req: ModelRequest) -> ModelResponse:
+        async def handler(req: ModelRequest) -> ModelResponse:
             # Simulate BaselineContextMiddleware appending the frozen <model> block.
             baseline_system = SystemMessage(
                 content=[
@@ -1701,32 +1695,120 @@ class TestFallbackIdentity:
                 raise _status_error("overloaded", status=503)
             return ModelResponse(result=[AIMessage("ok", id="a-fb")])
 
-        async def through_pin(req: ModelRequest):
-            return await pin_mw.awrap_model_call(req, terminal)
-
         request = ModelRequest(
             model=primary,
             messages=[HumanMessage("what model are you?")],
             system_message=SystemMessage(content="Base system prompt."),
-            state={
-                "messages": [],
-                STATE_SYSTEM_PIN: {
-                    "model": "claude-fallback",
-                    "content": "Stale pinned prompt without fallback note",
-                },
-            },
         )
-        result = await mw.awrap_model_call(request, through_pin)
+        result = await mw.awrap_model_call(request, handler)
 
         assert isinstance(result, ModelResponse)
         assert len(seen_texts) == 2
         assert "[Fallback call]" not in seen_texts[0]
         assert (
             "[Fallback call] This individual call was moved to fallback model "
-            "Claude Fallback (claude-fallback) (the server-designated model in "
+            "GPT Fallback (gpt-fallback) (the server-designated model in "
             "<model> is Claude Primary (claude-primary), reasoning effort high)."
         ) in seen_texts[1]
         assert "You run on Claude Primary (claude-primary)" in seen_texts[1]
+
+    @pytest.mark.asyncio
+    async def test_claude_fallback_keeps_system_pin_intact_with_bound_thinking(
+        self, events, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from langchain.agents.middleware.types import ExtendedModelResponse, ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
+            STATE_SYSTEM_PIN,
+            SystemPinMiddleware,
+        )
+
+        manifest = {
+            "gpt-primary": {"display_name": "GPT Primary"},
+            "claude-fallback": {"display_name": "Claude Fallback"},
+        }
+        monkeypatch.setattr(
+            "src.llms.llm.LLM.get_model_config",
+            lambda: SimpleNamespace(
+                get_model_config=manifest.get,
+                get_provider_info=lambda route: {"sdk": "anthropic"} if route == "anthropic" else {},
+            ),
+        )
+
+        primary = _FakeModel("gpt-primary")
+        primary.metadata = {"manifest_model": "gpt-primary"}
+        fallback = _FakeModel("claude-fallback")
+        fallback.metadata = {"manifest_model": "claude-fallback"}
+
+        mw = ModelResilienceMiddleware(
+            primary_name="gpt-primary",
+            primary_client=primary,
+            fallbacks=[("claude-fallback", fallback)],
+            max_retries=0,
+            initial_delay=0.0,
+            jitter=False,
+        )
+        pin_mw = SystemPinMiddleware()
+        seen_texts: list[str] = []
+
+        async def terminal(req: ModelRequest) -> ModelResponse:
+            seen_texts.append(self._system_text(req))
+            if req.model is primary:
+                raise _status_error("forbidden", status=403)
+            return ModelResponse(result=[AIMessage("claude ok", id="a-claude")])
+
+        async def through_pin(req: ModelRequest):
+            return await pin_mw.awrap_model_call(req, terminal)
+
+        bound_thinking = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "t", "signature": "sig"},
+                {"type": "text", "text": "prev"},
+            ],
+            response_metadata={"reasoning_origin": "anthropic"},
+            id="a-prev",
+        )
+        pinned_content = "Pinned system prompt."
+        request = ModelRequest(
+            model=primary,
+            messages=[HumanMessage("q1"), bound_thinking, HumanMessage("q2")],
+            system_message=SystemMessage(content="Updated build system prompt."),
+            state={
+                "messages": [],
+                STATE_SYSTEM_PIN: {
+                    "model": "claude-fallback",
+                    "content": pinned_content,
+                },
+            },
+        )
+        result = await mw.awrap_model_call(request, through_pin)
+
+        assert len(seen_texts) == 2
+        assert "[Fallback call]" not in seen_texts[1]
+        assert seen_texts[1] == pinned_content
+        if isinstance(result, ExtendedModelResponse):
+            pin_update = (result.command.update or {}).get(STATE_SYSTEM_PIN)
+            if pin_update is not None:
+                assert "[Fallback call]" not in str(pin_update.get("content", ""))
+
+        # When STATE_SYSTEM_PIN is empty, storing the pin for a Claude fallback
+        # must also never persist a [Fallback call] note into STATE_SYSTEM_PIN.
+        seen_texts.clear()
+        fresh_request = ModelRequest(
+            model=primary,
+            messages=[HumanMessage("q1")],
+            system_message=SystemMessage(content="Clean system prompt."),
+            state={"messages": []},
+        )
+        fresh_result = await mw.awrap_model_call(fresh_request, through_pin)
+        assert isinstance(fresh_result, ExtendedModelResponse)
+        stored_pin = (fresh_result.command.update or {})[STATE_SYSTEM_PIN]
+        assert stored_pin["model"] == "claude-fallback"
+        assert stored_pin["content"] == "Clean system prompt."
+        assert "[Fallback call]" not in str(stored_pin["content"])
 
     @pytest.mark.asyncio
     async def test_subagent_on_own_model_names_its_own_designated_model(
@@ -1744,7 +1826,10 @@ class TestFallbackIdentity:
         }
         monkeypatch.setattr(
             "src.llms.llm.LLM.get_model_config",
-            lambda: SimpleNamespace(get_model_config=manifest.get),
+            lambda: SimpleNamespace(
+                get_model_config=manifest.get,
+                get_provider_info=lambda route: {"sdk": "anthropic"} if route == "anthropic" else {},
+            ),
         )
 
         main_client = _FakeModel("main-model")

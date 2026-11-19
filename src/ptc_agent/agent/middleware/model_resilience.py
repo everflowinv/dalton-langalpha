@@ -86,13 +86,6 @@ _ERROR_SUMMARY_MAX_CHARS = 300
 FALLBACK_KEY = "model_fallback"
 
 _as_sent: ContextVar[bool] = ContextVar("model_resilience_as_sent", default=False)
-# DALTON-HOOK(model-fallback-identity): tracks whether the active call is on a fallback candidate.
-_in_fallback: ContextVar[bool] = ContextVar("model_resilience_in_fallback", default=False)
-
-
-def is_fallback_call() -> bool:
-    """Whether the active model call is running on a fallback candidate."""
-    return _in_fallback.get()
 
 #: Drop reasons that follow the thread rather than an edit of ours: a model
 #: switch, or a thread moved between accounts.
@@ -394,10 +387,13 @@ class ModelResilienceMiddleware(AgentMiddleware):
         fallback_name: str,
         fallback_client: Any,
     ) -> ModelRequest:
-        """Attach a request-only note on fallback calls so the model knows its
-        own identity and which designated model in the frozen ``<model>``
-        baseline it stands in for."""
-        if not hasattr(req, "system_message"):
+        """Attach a request-only note on non-Claude fallback calls so the model
+        knows its own identity and which designated model in ``<model>`` it
+        stands in for; Claude fallbacks stay untouched so ``SystemPinMiddleware``
+        keeps the pinned system message intact for bound thinking."""
+        from ptc_agent.agent.middleware.compaction.measure import is_claude
+
+        if not hasattr(req, "system_message") or is_claude(fallback_client):
             return req
         primary_label = (
             client_label(original_request.model, self._catalog_name(original_request))
@@ -973,12 +969,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    # DALTON-HOOK(model-fallback-identity)
-                    fb_token = _in_fallback.set(index > 0)
-                    try:
-                        response = handler(req)
-                    finally:
-                        _in_fallback.reset(fb_token)
+                    response = handler(req)
                     _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
@@ -1072,12 +1063,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    # DALTON-HOOK(model-fallback-identity)
-                    fb_token = _in_fallback.set(index > 0)
-                    try:
-                        response = await handler(req)
-                    finally:
-                        _in_fallback.reset(fb_token)
+                    response = await handler(req)
                     _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
