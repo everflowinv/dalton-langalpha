@@ -423,6 +423,8 @@ ALLOWED_HOOKS=(
   # Codex client version comes from src/dalton/settings.py (newer than the manifest's)
   # so the ChatGPT subscription lists new models (GPT-6.2 needs >= 0.170.0).
   "codex-client-version"
+  # Firecrawl budget: skip stealth re-escalation after auto and keep 402 credit-exhaustion notice.
+  "firecrawl-budget"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

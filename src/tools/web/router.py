@@ -220,6 +220,8 @@ class FetchRouter:
         if self._inhouse_entry is None:
             extra = build_chain([_INHOUSE])
             self._inhouse_entry = extra[0] if extra else None
+        # DALTON-HOOK(firecrawl-budget): remember 402 insufficient_credits while breaker is open.
+        self._budget_errors: Dict[str, WebError] = {}
 
     @property
     def provider_names(self) -> List[str]:
@@ -304,6 +306,16 @@ class FetchRouter:
                     tracker.record_usage(
                         entry.capability.tracking_key(level), count=ok_count
                     )
+            # DALTON-HOOK(firecrawl-budget): Firecrawl's auto proxy already escalates to enhanced;
+            # skip a second stealth request when auto returns anti_bot in Dalton mode.
+            # Known limitation: non-default fetch_chain configs with duplicate "firecrawl" entries are not deduplicated.
+            from src.dalton.settings import is_dalton_enabled
+
+            skip_auto_to_stealth = (
+                entry.adapter.name == "firecrawl"
+                and level.native_params.get("proxy") == "auto"
+                and is_dalton_enabled()
+            )
             escalate: List[str] = []
             for result in batch:
                 hit_anti_bot = (
@@ -313,7 +325,12 @@ class FetchRouter:
                 )
                 if hit_anti_bot:
                     anti_bot.add(result.url)
-                if hit_anti_bot and stealth is not None and level is not stealth:
+                if (
+                    hit_anti_bot
+                    and stealth is not None
+                    and level is not stealth
+                    and not skip_auto_to_stealth  # DALTON-HOOK(firecrawl-budget)
+                ):
                     escalate.append(result.url)
                 else:
                     results.append(result)
@@ -357,6 +374,8 @@ class FetchRouter:
         if forced and all(entry is not self._inhouse_entry for entry, _ in stages):
             stages.append((self._inhouse_entry, "forced"))
 
+        skipped_budget_error: Optional[WebError] = None  # DALTON-HOOK(firecrawl-budget)
+        skipped_budget_urls: set[str] = set()  # DALTON-HOOK(firecrawl-budget)
         for entry, scope in stages:
             if scope == "ordinary":
                 urls_now = [u for u in pending if u not in forced]
@@ -372,6 +391,12 @@ class FetchRouter:
             await entry.breaker.check_state()
             if entry.breaker.is_open():
                 logger.debug("fetch: skipping %s (breaker open)", entry.adapter.name)
+                # DALTON-HOOK(firecrawl-budget): preserve 402 reset notice for URLs skipped by Firecrawl's open breaker.
+                from src.dalton.settings import is_dalton_enabled
+
+                if is_dalton_enabled() and entry.adapter.name in self._budget_errors:
+                    skipped_budget_error = self._budget_errors[entry.adapter.name]
+                    skipped_budget_urls.update(urls_now)
                 _trace_attempt(
                     entry.adapter.name,
                     urls_now,
@@ -401,6 +426,12 @@ class FetchRouter:
             failure_class: Optional[str] = None
             if any_ok:
                 await entry.breaker.record_success()
+                # DALTON-HOOK(firecrawl-budget): a success after the breaker has
+                # let traffic through again (half-open or closed) proves credits
+                # are back; one that lands while it is still open was sent before
+                # it opened and says nothing about the 402.
+                if not entry.breaker.is_open():
+                    self._budget_errors.pop(entry.adapter.name, None)
             elif results and all(r.error and r.error.provider_side for r in results):
                 # Whole attempt failed at the provider level, so the attempt
                 # is an errored run. Per-URL failures (timeouts, anti_bot, and
@@ -409,6 +440,33 @@ class FetchRouter:
                 provider_failure = "; ".join(str(r.error) for r in results if r.error)
                 failure_class = dominant.type.value
                 if all(r.error and r.error.provider_fault for r in results):
+                    # DALTON-HOOK(firecrawl-budget): track 402 insufficient_credits on non-open breaker;
+                    # notice lifetime follows the open-breaker state rather than a single batch's errors.
+                    # Known limitation: assumes Dalton default order ["inhouse", "firecrawl"] (if Firecrawl
+                    # precedes inhouse, a later inhouse failure may overwrite last_error).
+                    from src.dalton.settings import is_dalton_enabled
+
+                    if (
+                        is_dalton_enabled()
+                        and entry.adapter.name == "firecrawl"
+                        and not entry.breaker.is_open()
+                    ):
+                        budget_402s = [
+                            r.error
+                            for r in results
+                            if r.error
+                            and r.error.type == WebErrorType.BUDGET_EXCEEDED
+                            and r.error.http_status == 402
+                        ]
+                        # The monthly-exhaustion notice (with its reset date)
+                        # speaks for the whole account; prefer it over a
+                        # per-request 402 from the same batch.
+                        exhausted_err = next(
+                            (e for e in budget_402s if e.native_kind == "insufficient_credits"),
+                            budget_402s[0] if budget_402s else None,
+                        )
+                        if exhausted_err is not None:
+                            self._budget_errors[entry.adapter.name] = exhausted_err
                     await entry.breaker.record_failure(reason=provider_failure)
             _trace_attempt(
                 entry.adapter.name,
@@ -424,18 +482,36 @@ class FetchRouter:
                 break
 
         for url in pending:
-            final[url] = last_error.get(
-                url,
-                FetchResult(
+            if skipped_budget_error is not None and url in skipped_budget_urls:  # DALTON-HOOK(firecrawl-budget)
+                prev = last_error.get(url)
+                prev_err = prev.error if prev is not None else None
+                msg = skipped_budget_error.message
+                if prev_err is not None and prev_err.message:
+                    msg = f"{skipped_budget_error.message}（前置抓取失败: {prev_err.type.value}: {prev_err.message}）"
+                final[url] = FetchResult(
                     url=url,
                     error=WebError(
-                        type=WebErrorType.CIRCUIT_OPEN,
-                        message="No fetch provider available (keys unset or breakers open)",
-                        # Ours, not the page's: no provider could take it.
-                        provider_fault=True,
+                        type=WebErrorType.BUDGET_EXCEEDED,
+                        message=msg,
+                        http_status=skipped_budget_error.http_status,
+                        retryable=skipped_budget_error.retryable,
+                        provider_fault=skipped_budget_error.provider_fault,
+                        native_kind=skipped_budget_error.native_kind,
                     ),
-                ),
-            )
+                )
+            else:
+                final[url] = last_error.get(
+                    url,
+                    FetchResult(
+                        url=url,
+                        error=WebError(
+                            type=WebErrorType.CIRCUIT_OPEN,
+                            message="No fetch provider available (keys unset or breakers open)",
+                            # Ours, not the page's: no provider could take it.
+                            provider_fault=True,
+                        ),
+                    ),
+                )
 
         return FetchResponse(
             results=[final[u] for u in req.urls if u in final],
