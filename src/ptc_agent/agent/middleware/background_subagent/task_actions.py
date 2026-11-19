@@ -695,6 +695,7 @@ async def _handle_resume(
         locally_live = (
             task.asyncio_task is not None and not task.asyncio_task.done()
         )
+        prior_run: dict[str, Any] | None = None
         if locally_live:
             # DALTON-HOOK(subagent-resume): the ledger arbitrates before the
             # local handle refuses. An in-progress latest run (or no ledger
@@ -703,6 +704,7 @@ async def _handle_resume(
             # which the namespace lock below arbitrates the resume as for any
             # other task.
             run = await _latest_ledger_run(mw, task)
+            prior_run = run
             if run is None or str(run["status"]) == "in_progress":
                 return ToolMessage(
                     content=f"Error: Task-{target_task_id} is still running. Use action='update' to send instructions to a running task.",
@@ -743,7 +745,14 @@ async def _handle_resume(
         # Before the fence, so a refused model holds nothing once the claim
         # drops on the way out.
         try:
-            named = model or await _last_model(mw, task)
+            # DALTON-HOOK(subagent-resume): reuse the latest row already read
+            # during orphan arbitration instead of hitting the ledger twice
+            # before acquiring the fence.
+            named = model or (
+                ((prior_run.get("replay_facts") or {}).get("model_override") or None)
+                if prior_run is not None
+                else await _last_model(mw, task)
+            )
         except Exception:
             logger.warning("latest run read failed", task_id=task.task_id, exc_info=True)
             return _refusal(
