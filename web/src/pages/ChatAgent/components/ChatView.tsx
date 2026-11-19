@@ -53,8 +53,9 @@ import {
 } from '../utils/compactionControl';
 import './FilePanel.css';
 import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-input';
+import { MAX_FILES } from '../../../components/ui/chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import type { ComposerSend, ContextPayload } from '../../../components/ui/chat-input.types';
-import { attachmentSendParts, widgetSnapshotsToContexts } from '../utils/fileUpload';
+import { attachmentSendParts, countContextAttachments, widgetSnapshotsToContexts } from '../utils/fileUpload';
 import MessageList, { LiveMessageList, normalizeSubagentText } from './MessageList';
 import { MessageActionsProvider } from './messageList/MessageActionsContext';
 import { UserBubble } from './messageList/UserBubble';
@@ -819,6 +820,22 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }, [isCompacting, isLoading, handleStop, stableStopCompaction]);
 
   const panelChart = usePanelChart(isActive, chatInputRef);
+  // DALTON-HOOK(chat-attachment-count): panel chart region screenshots count toward MAX_FILES
+  const panelChartImageCount = useMemo(
+    () => panelChart.chips.filter((s) => Boolean(s.croppedImage)).length,
+    [panelChart.chips],
+  );
+  const prevPanelChartImageCountRef = useRef(panelChartImageCount);
+  useEffect(() => {
+    const prev = prevPanelChartImageCountRef.current;
+    prevPanelChartImageCountRef.current = panelChartImageCount;
+    if (panelChartImageCount > prev && (chatInputRef.current?.getAttachmentCount() ?? panelChartImageCount) > MAX_FILES) {
+      toast({
+        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+        variant: 'destructive',
+      });
+    }
+  }, [panelChartImageCount, t]);
 
   // Wrapper: converts ChatInput's send into handleSendMessage(message,
   // additionalContext, attachmentMeta), the send itself the draft it gives back.
@@ -859,6 +876,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       contexts.push(...widgetSnapshotsToContexts(modelOptions.widgetSnapshots));
     }
 
+    // DALTON-HOOK(chat-attachment-count): guard total attachments (files + widget/chart screenshots)
+    // before panelChart.takeForSend clears chart selections or dispatches a doomed request.
+    if (countContextAttachments(contexts) + panelChartImageCount > MAX_FILES) {
+      toast({
+        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+        variant: 'destructive',
+      });
+      return false;
+    }
+
     // Regions and price levels picked on a panel chart tab, and what each chart shows.
     const { picked, chartViews } = panelChart.takeForSend(message);
     if (picked) {
@@ -888,7 +915,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         draft: send,
       }),
     );
-  }, [marketWatchEnabled, stableSendMessage, panelChart, takeQueuedComments, composerSendOptions]);
+  }, [marketWatchEnabled, stableSendMessage, panelChart, panelChartImageCount, takeQueuedComments, composerSendOptions, t]);
 
   const planReader = useLatestRef(usePlanReader());
 
@@ -2049,6 +2076,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onPickFastMode={threadTuning.setFastMode}
                         selectedWorkspaceId={workspaceId}
                         inHome={isHome}
+                        externalAttachmentCount={panelChartImageCount}
                         toolbarStatus={trayContents && (
                           <TrayDock ref={trayDockRef} phase={trayPhase} contents={trayContents} onOpen={peekTray} />
                         )}

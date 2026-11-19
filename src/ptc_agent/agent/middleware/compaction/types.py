@@ -140,6 +140,7 @@ class CompactionState(UnsentThinkingState):
     # (``state & kept``, ``state & in-view``), and a same-step addition names a
     # message in the view the shrink kept, so the union holds both semantics.
     _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
+    _left_out_image_blocks: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
     #: Notes rows a summary kept after the last answer in its tail, by message
     #: id. Past their summary they ask for what it paraphrased, so the call
     #: answering from it goes without them, and every later one does too

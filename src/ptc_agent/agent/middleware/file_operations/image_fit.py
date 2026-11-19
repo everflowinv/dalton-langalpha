@@ -26,7 +26,7 @@ import re
 import struct
 import threading
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Collection  # DALTON-HOOK(attachment-native-cap)
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -797,12 +797,25 @@ def _image_name_path(  # DALTON-HOOK(attachment-native-cap)
     return "image", None
 
 
+def _parse_left_out_blocks(entries: Collection[str]) -> set[tuple[str, int]]:
+    """Decode ``"<msg_id>:<block_index>"`` entries back into pairs."""
+    parsed: set[tuple[str, int]] = set()
+    for entry in entries:
+        if not isinstance(entry, str) or ":" not in entry:
+            continue
+        msg_id, raw_idx = entry.rsplit(":", 1)
+        if msg_id and raw_idx.isdigit():
+            parsed.add((msg_id, int(raw_idx)))
+    return parsed
+
+
 async def fit_images(
     messages: list,
     accepted: frozenset[str],
     max_side: Callable[[int], int | None],
     *,
     capability: str | None = None,
+    already_left_out: Collection[str] = (),
 ) -> tuple[list, frozenset[tuple[int, int]], frozenset[str]]:
     """Fit every image block in ``messages`` to the target's types and side limit.
 
@@ -822,34 +835,44 @@ async def fit_images(
     ladder cannot fit, or that the total cannot carry, is replaced by a text
     note naming its sandbox copy when there is one. History keeps the original
     in every case. Unlike every other outcome here the total's cut moves
-    between calls — what fits changes as images arrive — so the ids of the
-    messages whose images it left out are returned with the messages, for the
-    caller to record the way a context-window removal is (see the strip
-    middleware), which is what keeps the cut stable and the thinking after it
-    valid.
+    between calls — what fits changes as images arrive — so the block keys
+    (``"<message_id>:<block_index>"``) of the images it left out are returned
+    with the messages, for the caller to record so the cut stays stable and
+    the thinking after newly trimmed messages is invalidated without stripping
+    other images in the same message that still fit.
 
     Returns the messages, the original list when nothing changed, the
     positions (message, block) in them of the images the target can't be
-    given, and the ids of the messages whose images the total left out. The
+    given, and the block keys of the images the total left out. The
     positions are left in place for the caller to replace in its own pass,
     so that the guidance on the first placeholder lands on the first in the
     history whatever kind it is. Never mutates a message: these are checkpoint
     objects shared with the rest of the graph.
     """
+    already_blocks = _parse_left_out_blocks(already_left_out)
+    left_out: set[tuple[int, int]] = set()
     located: list[tuple[int, int, str, Any, Callable[[str, str], dict]]] = []
     total = 0
     for i, msg in enumerate(messages):
         content = getattr(msg, "content", None)
         if not isinstance(content, list):
             continue
+        msg_id = getattr(msg, "id", None)
         for j, block in enumerate(content):
             if not _is_image(block):
+                continue
+            # DALTON-HOOK(attachment-native-cap): blocks already left out on an
+            # earlier call (or earlier refit pass) are excluded from the image
+            # count and skipped before probing/scaling so surviving images keep
+            # a stable side limit and bound thinking signatures.
+            if isinstance(msg_id, str) and (msg_id, j) in already_blocks:
+                left_out.add((i, j))
                 continue
             total += 1
             payload = _inline(block)
             if payload is not None:
                 located.append((i, j, *payload))
-    if not located:
+    if not located and not left_out:
         # DALTON-HOOK(attachment-native-cap): third element — no left-out ids.
         return messages, frozenset(), frozenset()
 
@@ -942,8 +965,8 @@ async def fit_images(
     # DALTON-HOOK(attachment-native-cap): the request's inline images together.
     # Walked newest first — the newest are what the agent is working on — and
     # once one no longer fits, it and every older image is left out: a smaller
-    # older one never takes a newer image's place.
-    left_out: set[tuple[int, int]] = set()
+    # older one never takes a newer image's place. Blocks already recorded as
+    # left out were collected up front and stay left out without consuming budget.
     kept_total = 0
     exhausted = False
     for i, j, data, _, _ in reversed(located):
@@ -1007,14 +1030,15 @@ async def fit_images(
             new is not old for new, old in zip(blocks, msg.content)
         ):
             result[i] = msg.model_copy(update={"content": blocks})
-    # DALTON-HOOK(attachment-native-cap): the message ids behind the total's
-    # cut, for the caller to record — every attachment of each goes then, the
-    # context-window removal's granularity, not only the images the walk left
-    # out, so the cut this call made is the one every later call reads.
-    left_out_ids = {
-        messages[i].id for i, _ in left_out if getattr(messages[i], "id", None)
+    # DALTON-HOOK(attachment-native-cap): the block keys behind the total's
+    # cut, for the caller to record per-image rather than per-message so images
+    # in the same message that fit within the byte budget are still sent.
+    left_out_blocks = {
+        f"{msg_id}:{j}"
+        for i, j in left_out
+        if isinstance((msg_id := getattr(messages[i], "id", None)), str) and msg_id
     }
-    return result, frozenset(unreadable), frozenset(left_out_ids)
+    return result, frozenset(unreadable), frozenset(left_out_blocks)
 
 
 __all__ = [

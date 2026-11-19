@@ -8,6 +8,8 @@ import { ErrorBanner } from '@/components/ui/error-banner';
 import { Loader } from '@/components/ui/loader';
 import LogoLoading from '@/components/ui/logo-loading';
 import ChatInput, { type ChatInputHandle } from '@/components/ui/chat-input';
+import { MAX_FILES } from '@/components/ui/chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
+import { toast } from '@/components/ui/use-toast';
 import type { ComposerScope, ComposerSend } from '@/components/ui/chat-input.types';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
@@ -40,7 +42,7 @@ import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTran
 import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, previewFailure, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
-import { attachmentSendParts, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
+import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
 import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
@@ -321,6 +323,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     () => selections.filter((s) => isConfirmedFor(s, liveSym, liveTf)),
     [selections, liveSym, liveTf],
   );
+  // DALTON-HOOK(chat-attachment-count): confirmed chart region crops count toward MAX_FILES
+  const confirmedChartImageCount = useMemo(
+    () => chips.filter((s) => Boolean(s.croppedImage)).length,
+    [chips],
+  );
 
   // With no workspace to pick, the scope picker still offers the Chief of Staff
   // and says why the workspace list is empty.
@@ -529,6 +536,15 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       contexts.push(...send.contexts);
       metaItems.push(...send.attachments);
 
+      // DALTON-HOOK(chat-attachment-count): prevent sending files + chart screenshots past MAX_FILES
+      if (countContextAttachments(contexts) > MAX_FILES) {
+        toast({
+          title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+          variant: 'destructive',
+        });
+        return false;
+      }
+
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
@@ -557,8 +573,20 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t],
   );
+
+  // DALTON-HOOK(chat-attachment-count): reject capturing a new chart screenshot when already at MAX_FILES
+  const handleCaptureChart = useCallback(() => {
+    if (!chartImage && (chatInputRef.current?.getAttachmentCount() ?? confirmedChartImageCount) >= MAX_FILES) {
+      toast({
+        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+        variant: 'destructive',
+      });
+      return;
+    }
+    onCaptureChart();
+  }, [chartImage, confirmedChartImageCount, onCaptureChart, t]);
 
   // Stop the running turn (the input's Stop button). Mirrors ChatView: the hook's
   // stopWorkflow aborts the stream reader, finalizes the open message with a
@@ -968,12 +996,14 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         workspaces={workspaces}
         selectedWorkspaceId={selectedWorkspaceId}
         onWorkspaceChange={onWorkspaceChange}
-        onCaptureChart={onCaptureChart}
+        onCaptureChart={handleCaptureChart}
         chartImage={chartImage}
         onRemoveChartImage={onClearChartImage}
         prefillMessage={prefillMessage}
         onClearPrefill={onClearPrefill}
         hasExternalContext={chips.length > 0}
+        // DALTON-HOOK(chat-attachment-count): reserve slots for confirmed chart crops
+        externalAttachmentCount={confirmedChartImageCount}
         placeholder={
           wasStopped && !isLoading && !pendingInterrupt
             ? t('chat.placeholderStopped')

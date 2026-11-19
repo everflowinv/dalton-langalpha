@@ -33,7 +33,10 @@ export function ContextOverflowPill() {
           return [...prev, event.snapshot];
         });
       } else if (event.type === 'detach') {
-        setSnapshots((prev) => prev.filter((s) => s.widget_id !== event.widgetId));
+        // DALTON-HOOK(chat-attachment-count): a rollback (`only`) removes just that snapshot object
+        setSnapshots((prev) =>
+          prev.filter((s) => (event.only ? s !== event.only : s.widget_id !== event.widgetId)),
+        );
       } else if (event.type === 'clear') {
         setSnapshots([]);
       }

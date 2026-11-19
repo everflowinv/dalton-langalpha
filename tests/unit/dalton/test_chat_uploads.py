@@ -110,7 +110,7 @@ class InMemoryChatUploadLedger:
         store_upload_id: str,
         expected_sha256: str | None,
         ttl: timedelta,
-        max_active_uploads: int = 10,
+        max_active_uploads: int = 20,
         max_active_bytes: int = 1000 * 1024 * 1024,
     ) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
@@ -2836,8 +2836,9 @@ async def test_part_upload_idle_and_total_deadlines_release_slots_and_recheck_ex
 async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_accepted(
     upload_env,
 ) -> None:
-    """Completed-but-unused ready uploads count toward the 10-file / 1000 MiB per-user cap;
+    """Completed-but-unused ready uploads count toward the 20-file (2x message cap) / 1000 MiB per-user cap;
     cancelling, sweeping, or durably accepting an upload releases temporary quota."""
+    assert svc.MAX_ACTIVE_USER_UPLOADS == 2 * svc.MAX_MESSAGE_ATTACHMENTS
     user_id = "user-ready-quota"
     ws_id = str(uuid.uuid4())
     upload_env["workspaces"][ws_id] = {
@@ -2846,7 +2847,7 @@ async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_
         "status": "running",
     }
 
-    # Complete 10 small uploads to 'ready' without sending -> 11th initiate must hit 429
+    # Complete 20 small uploads to 'ready' without sending -> 21st initiate must hit 429
     ready_ids: list[str] = []
     for i in range(svc.MAX_ACTIVE_USER_UPLOADS):
         created = await svc.initiate_chat_upload(
@@ -2867,17 +2868,17 @@ async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_
         await svc.initiate_chat_upload(
             user_id=user_id,
             workspace_id=ws_id,
-            filename="u10.bin",
+            filename="u20.bin",
             size_bytes=512,
         )
     assert cap_count_exc.value.status_code == 429
 
     # Cancelling one ready unused upload releases a slot
     await svc.cancel_chat_upload(upload_id=ready_ids[0], user_id=user_id)
-    eleventh = await svc.initiate_chat_upload(
-        user_id=user_id, workspace_id=ws_id, filename="u10_ok.bin", size_bytes=512
+    twenty_first = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="u20_ok.bin", size_bytes=512
     )
-    await svc.cancel_chat_upload(upload_id=eleventh["upload_id"], user_id=user_id)
+    await svc.cancel_chat_upload(upload_id=twenty_first["upload_id"], user_id=user_id)
 
     # Durably accepting ready_ids[1] into a message moves it out of temporary upload quota
     await svc.confirm_request_chat_uploads(
@@ -2889,6 +2890,70 @@ async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_
         user_id=user_id, workspace_id=ws_id, filename="after_accept.bin", size_bytes=512
     )
     assert after_accept["state"] == "uploading"
+
+
+@pytest.mark.asyncio
+async def test_workspace_switch_reupload_does_not_hit_429_while_total_byte_cap_holds(
+    upload_env,
+) -> None:
+    """10 unsent uploads in workspace A plus 10 immediate re-uploads in workspace B
+    stay within 2 * MAX_MESSAGE_ATTACHMENTS (20) without 429, while the 21st and
+    the 1000 MiB total byte ceiling still return 429."""
+    user_id = "user-switch-quota"
+    ws_a = str(uuid.uuid4())
+    ws_b = str(uuid.uuid4())
+    upload_env["workspaces"][ws_a] = {"workspace_id": ws_a, "user_id": user_id, "status": "running"}
+    upload_env["workspaces"][ws_b] = {"workspace_id": ws_b, "user_id": user_id, "status": "running"}
+
+    for i in range(svc.MAX_MESSAGE_ATTACHMENTS):
+        created = await svc.initiate_chat_upload(
+            user_id=user_id,
+            workspace_id=ws_a,
+            filename=f"a{i}.bin",
+            size_bytes=1024,
+        )
+        assert created["state"] == "uploading"
+
+    # Switch to ws_b and immediately re-upload 10 files before ws_a cancellations land
+    for i in range(svc.MAX_MESSAGE_ATTACHMENTS):
+        created = await svc.initiate_chat_upload(
+            user_id=user_id,
+            workspace_id=ws_b,
+            filename=f"b{i}.bin",
+            size_bytes=1024,
+        )
+        assert created["state"] == "uploading"
+
+    with pytest.raises(HTTPException) as over_count:
+        await svc.initiate_chat_upload(
+            user_id=user_id,
+            workspace_id=ws_b,
+            filename="b10.bin",
+            size_bytes=1024,
+        )
+    assert over_count.value.status_code == 429
+
+    # Total byte cap (1000 MiB) still returns 429 even when active count < 20
+    byte_user = "user-byte-cap-under-20"
+    ws_c = str(uuid.uuid4())
+    upload_env["workspaces"][ws_c] = {"workspace_id": ws_c, "user_id": byte_user, "status": "running"}
+    chunk = 200 * 1024 * 1024  # MAX_CHAT_UPLOAD_BYTES
+    for i in range(5):
+        created = await svc.initiate_chat_upload(
+            user_id=byte_user,
+            workspace_id=ws_c,
+            filename=f"big{i}.bin",
+            size_bytes=chunk,
+        )
+        assert created["state"] == "uploading"
+    with pytest.raises(HTTPException) as over_bytes:
+        await svc.initiate_chat_upload(
+            user_id=byte_user,
+            workspace_id=ws_c,
+            filename="big5.bin",
+            size_bytes=1024,
+        )
+    assert over_bytes.value.status_code == 429
 
 
 # ---------------------------------------------------------------------------
@@ -6784,13 +6849,29 @@ async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_a
             )
         assert total_cap_exc.value.status_code == 413
 
-        # Exceeds MAX_MESSAGE_ATTACHMENTS (5): 3 staged + 3 chunked = 6 -> 400
+        # Exactly MAX_MESSAGE_ATTACHMENTS (10): 7 staged + 3 chunked = 10 -> accepted
+        exact_10 = [
+            *[MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)) for _ in range(7)],
+            ChatUploadContext(upload_id=uid_large_a, name="big_a.parquet", size=64),
+            ChatUploadContext(upload_id=uid_large_b, name="big_b.parquet", size=64),
+            ChatUploadContext(upload_id=uid_large_c, name="big_c.parquet", size=64),
+        ]
+        claimed_10 = await svc.validate_and_claim_request_attachments(
+            exact_10,
+            user_id=owner,
+            workspace_id=ws_id,
+            claim_key="req:count-exact-10",
+        )
+        assert [r["upload_id"] for r in claimed_10] == [uid_large_a, uid_large_b, uid_large_c]
+        await svc.release_request_chat_uploads(
+            user_id=owner, claim_key="req:count-exact-10", additional_context=exact_10
+        )
+
+        # Exceeds MAX_MESSAGE_ATTACHMENTS (10): 8 staged + 3 chunked = 11 -> 400
         with pytest.raises(HTTPException) as count_cap_exc:
             await svc.validate_and_claim_request_attachments(
                 [
-                    MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)),
-                    MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)),
-                    MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)),
+                    *[MultimodalContext(type="image", attachment_id=uuid.UUID(att_img_id)) for _ in range(8)],
                     ChatUploadContext(upload_id=uid_large_a, name="big_a.parquet", size=64),
                     ChatUploadContext(upload_id=uid_large_b, name="big_b.parquet", size=64),
                     ChatUploadContext(upload_id=uid_large_c, name="big_c.parquet", size=64),
@@ -6800,7 +6881,7 @@ async def test_staged_upstream_attachments_pass_validation_mix_enforce_budgets_a
                 claim_key="req:count-cap",
             )
         assert count_cap_exc.value.status_code == 400
-        assert "At most 5" in str(count_cap_exc.value.detail)
+        assert "At most 10" in str(count_cap_exc.value.detail)
 
         # 3. Missing, foreign-owned, expired, or still-uploading staged attachment -> upstream errors
         for bad_id in (att_missing_id, att_foreign_id):

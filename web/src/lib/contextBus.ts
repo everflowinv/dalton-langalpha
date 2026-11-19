@@ -13,24 +13,29 @@ import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/
 
 export type ContextBusEvent =
   | { type: 'attach'; snapshot: WidgetContextSnapshot }
-  | { type: 'detach'; widgetId: string }
+  // DALTON-HOOK(chat-attachment-count): `only` rolls back one rejected attach — a subscriber
+  // drops the entry only when it holds that very snapshot object, not an earlier copy.
+  | { type: 'detach'; widgetId: string; only?: WidgetContextSnapshot }
   | { type: 'clear' };
 
-export type ContextBusHandler = (event: ContextBusEvent) => void;
+export type ContextBusHandler = (event: ContextBusEvent) => unknown;
 
 const handlers = new Set<ContextBusHandler>();
 
-function publish(event: ContextBusEvent): void {
+function publish(event: ContextBusEvent): boolean {
   // Snapshot the set so a handler that unsubscribes during dispatch doesn't
   // mutate the iterator. Errors in one handler must not silence the others —
   // log and continue.
+  let accepted = true;
   for (const h of [...handlers]) {
     try {
-      h(event);
+      // DALTON-HOOK(chat-attachment-count): allow a mounted ChatInput to reject an over-limit image snapshot
+      if (h(event) === false) accepted = false;
     } catch (err) {
       console.error('[contextBus] subscriber threw', err);
     }
   }
+  return accepted;
 }
 
 export const ContextBus = {
@@ -40,8 +45,12 @@ export const ContextBus = {
       handlers.delete(handler);
     };
   },
-  attach(snapshot: WidgetContextSnapshot): void {
-    publish({ type: 'attach', snapshot });
+  attach(snapshot: WidgetContextSnapshot): boolean {
+    // DALTON-HOOK(chat-attachment-count): when a ChatInput rejects it, roll back only this
+    // snapshot object (an earlier copy of the same widget stays) and tell the caller.
+    const accepted = publish({ type: 'attach', snapshot });
+    if (!accepted) publish({ type: 'detach', widgetId: snapshot.widget_id, only: snapshot });
+    return accepted;
   },
   detach(widgetId: string): void {
     publish({ type: 'detach', widgetId });

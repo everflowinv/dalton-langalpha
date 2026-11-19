@@ -195,14 +195,16 @@ describe('useFileAttachments', () => {
   it('discards the given-back files past the cap rather than dropping them unseen', async () => {
     const sends = heldRelay();
     const { result } = renderHook(() => useFileAttachments());
-    act(() => result.current.handleFiles([csv('a.csv'), csv('b.csv'), csv('c.csv')]));
+    // DALTON-HOOK(chat-attachment-count): fill to two short of MAX_FILES (10 in Dalton, 5 upstream)
+    const first = Array.from({ length: MAX_FILES - 2 }, (_, i) => csv(`f${i}.csv`));
+    act(() => result.current.handleFiles(first));
     await flush();
-    expect(sends).toHaveLength(3);
+    expect(sends).toHaveLength(MAX_FILES - 2);
 
     const back = ['x', 'y', 'z'].map((n) => ({ file: csv(`${n}.csv`), type: 'text/csv', attachmentId: `att-${n}` }));
     act(() => result.current.restoreFiles(back));
     expect(result.current.attachedFiles).toHaveLength(MAX_FILES);
-    expect(result.current.attachedFiles.slice(3).map((f) => f.upload)).toEqual([
+    expect(result.current.attachedFiles.slice(MAX_FILES - 2).map((f) => f.upload)).toEqual([
       { status: 'ready', attachmentId: 'att-x' },
       { status: 'ready', attachmentId: 'att-y' },
     ]);

@@ -503,3 +503,5 @@ tests/unit/tools/secretary/test_list_owner_id.py
 tests/unit/tools/secretary/test_threads_delete_fence.py
 tests/unit/tools/secretary/test_threads_stop.py
 tests/unit/tools/secretary/test_workspaces_create_conflict.py
+web/src/pages/ChatAgent/components/__tests__/ChatView.attachmentCount.test.tsx
+web/src/pages/MarketView/__tests__/MarketView.screenshotCap.test.tsx

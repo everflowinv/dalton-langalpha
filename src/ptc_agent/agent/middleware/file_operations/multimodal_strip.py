@@ -614,6 +614,7 @@ def remove_attachments(
 #: image count allows, or ``"count"``, to the side the request's image count
 #: allows, as before the fixed side shipped.
 IMAGE_SIDE_KEY = "image_side_rule"
+LEFT_OUT_IMAGE_BLOCKS_KEY = "_left_out_image_blocks"
 
 # TODO(2026-11-25): delete 30 days after this ships, once the threads written before it have aged out. "count" goes with it.
 ImageSideRule = Literal["fixed", "count"]
@@ -625,6 +626,7 @@ class ImageSideState(UnsentThinkingState):
     # schema too so a graph built with ``compaction.enabled=false`` (no
     # ``CompactionMiddleware``) still checkpoints and unions the removal record.
     _removed_attachment_ids: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
+    _left_out_image_blocks: Annotated[NotRequired[set[str]], PrivateStateAttr, _union]
 
 
 def _image_side_rule(request: Any, route: str) -> tuple[ImageSideRule, ImageSideRule | None]:
@@ -774,6 +776,7 @@ class MultimodalStripMiddleware(AgentMiddleware):
             state = getattr(request, "state", None) or {}
             already = set(state.get("_removed_attachment_ids") or ())
             already_unsent = unsent_thinking(state)
+            already_left_out = set(state.get(LEFT_OUT_IMAGE_BLOCKS_KEY) or ())
             # DALTON-HOOK(attachment-native-cap): the recorded removal and its
             # unsent thinking are replayed here whatever else applies them: the
             # offload view runs only while compaction is on, and with it off
@@ -787,41 +790,51 @@ class MultimodalStripMiddleware(AgentMiddleware):
                     remove_attachments(messages, already, pages=pdf_pages), already_unsent
                 )
             messages, unreadable, left_out = await fit_images(
-                messages, get_image_types(route), fit, capability=capability
+                messages,
+                get_image_types(route),
+                fit,
+                capability=capability,
+                already_left_out=already_left_out,
             )
             # DALTON-HOOK(attachment-native-cap): the byte total's cut moves
-            # between calls — what fits changes as images arrive — so it is
-            # joined to the removal the context window uses rather than left a
-            # per-request rewrite: the message goes into
-            # ``_removed_attachment_ids`` and every answer after it into
-            # ``_unsent_thinking_ids``, and this request already sends the
-            # bytes every later one reads. Before, the first trimming request
-            # replaced the images with notes but kept sending the thinking
-            # behind them, whose prefix had just changed — the API dropped or
-            # refused exactly that thinking on every later call. The removal
-            # is applied to the pre-fit messages and they are fitted again, so
-            # this call's placeholders are the ones the record replays, not
-            # the byte note they would otherwise become.
-            recorded = already.copy()
+            # between calls — what fits changes as images arrive — so each
+            # left-out block is recorded in ``_left_out_image_blocks`` (keeping
+            # images in the same message that fit within the byte budget) and
+            # every bound answer after a newly trimmed message goes into
+            # ``_unsent_thinking_ids`` and is stripped on this call too.
+            recorded_blocks = already_left_out.copy()
             unsent_all: set[str] = set()
-            # The refit finds nothing new to leave out — removal only frees
-            # budget — so the second pass exits at once; the bound keeps a
-            # surprise from looping.
-            for _ in range(2):
-                newly = left_out - recorded
+            # Refit from the unscaled pre-fit messages until no block is newly
+            # left out, so thinking invalidation and the post-omission image
+            # count take effect on the very first outgoing request (matching
+            # every later replay). A model whose side cap relaxes as the count
+            # falls (2000 -> 4096 -> 6000) can leave out more on a later pass,
+            # so two passes are not always enough; recorded blocks only grow
+            # and are bounded by the image count, so this ends.
+            for _ in range(16):
+                newly = left_out - recorded_blocks
                 if not newly:
                     break
-                unsent_all |= thinking_after(ordered, newly)
-                recorded |= newly
+                newly_msgs = {
+                    entry.rsplit(":", 1)[0]
+                    for entry in newly
+                    if ":" in entry
+                }
+                unsent_all |= thinking_after(ordered, newly_msgs)
+                recorded_blocks |= newly
                 messages = without_thinking(
-                    remove_attachments(ordered, recorded, pages=pdf_pages),
+                    remove_attachments(ordered, already, pages=pdf_pages),
                     already_unsent | unsent_all,
                 )
                 messages, unreadable, left_out = await fit_images(
-                    messages, get_image_types(route), fit, capability=capability
+                    messages,
+                    get_image_types(route),
+                    fit,
+                    capability=capability,
+                    already_left_out=recorded_blocks,
                 )
-            if recorded != already:
-                updates["_removed_attachment_ids"] = recorded
+            if recorded_blocks != already_left_out:
+                updates[LEFT_OUT_IMAGE_BLOCKS_KEY] = recorded_blocks
             if unsent_all:
                 updates[UNSENT_THINKING_KEY] = already_unsent | unsent_all
         # Decided on the call where the target is known: a tool-time note judged

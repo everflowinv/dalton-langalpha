@@ -123,6 +123,19 @@ export function namesStagedFiles(contexts: readonly Record<string, unknown>[] | 
   return !!contexts?.some((c) => typeof c.attachment_id === 'string');
 }
 
+// DALTON-HOOK(chat-attachment-count): match server MAX_MESSAGE_ATTACHMENTS counting
+// across files, staged attachments, and screenshot/widget image context items.
+export function countContextAttachments(contexts: readonly Record<string, unknown>[] | null | undefined): number {
+  if (!contexts) return 0;
+  let count = 0;
+  for (const c of contexts) {
+    if (c.type === 'image' || c.type === 'pdf' || c.type === 'file' || c.type === 'chat_upload') {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 /**
  * Convert attachments to additional_context format with accurate type tags.
  * Stored uploads → "chat_upload" reference (no inline bytes);

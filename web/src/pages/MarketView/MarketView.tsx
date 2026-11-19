@@ -9,7 +9,8 @@ import StockHeader from './components/StockHeader';
 import MarketChart from './components/MarketChart';
 import { ChartToolButton } from './components/ChartToolButton';
 import type { MarketChartHandle } from './components/MarketChart';
-import ChatInput from '../../components/ui/chat-input';
+import ChatInput, { type ChatInputHandle } from '../../components/ui/chat-input';
+import { MAX_FILES } from '../../components/ui/chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
 import type { ComposerScope, ComposerSend, ReadyAttachment } from '../../components/ui/chat-input.types';
 import MarketChatPanel from './components/MarketChatPanel';
 import { QuoteList } from './components/quoteList/QuoteList';
@@ -21,7 +22,7 @@ import { homeWorkspaceQuery, resolveChatWorkspace } from '@/hooks/useHomeWorkspa
 import type { Workspace } from '@/types/api';
 import type { StockSearchHit } from '@/lib/marketUtils';
 import type { Freshness } from '@/types/market';
-import { attachmentSendParts, type AttachmentMeta } from '../ChatAgent/utils/fileUpload';
+import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../ChatAgent/utils/fileUpload';
 import { useThreadModel } from '../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../ChatAgent/hooks/useThreadSubagents';
 import { useThreadTuning } from '../ChatAgent/hooks/useThreadTuning';
@@ -387,6 +388,13 @@ function MarketViewInner() {
     const tf = normalizeTimeframe(selectedInterval);
     return chartSelections.some((s) => isConfirmedFor(s, sym, tf));
   }, [chartSelections, selectedStock, selectedInterval]);
+  // DALTON-HOOK(chat-attachment-count): confirmed chart region crops count toward MAX_FILES
+  const confirmedChartImageCount = useMemo(() => {
+    const sym = (selectedStock || '').toUpperCase();
+    const tf = normalizeTimeframe(selectedInterval);
+    return chartSelections.filter((s) => isConfirmedFor(s, sym, tf) && Boolean(s.croppedImage)).length;
+  }, [chartSelections, selectedStock, selectedInterval]);
+  const mobileChatInputRef = useRef<ChatInputHandle>(null);
 
   const handleCaptureChart = useCallback(async () => {
     if (!chartRef.current) return;
@@ -408,6 +416,14 @@ function MarketViewInner() {
   }, [selectedStock]);
 
   const handleCaptureChartForContext = useCallback(async () => {
+    // DALTON-HOOK(chat-attachment-count): reject capturing a new screenshot when already at MAX_FILES
+    if (!chartImage && (mobileChatInputRef.current?.getAttachmentCount() ?? confirmedChartImageCount) >= MAX_FILES) {
+      toast({
+        variant: 'destructive',
+        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+      });
+      return;
+    }
     if (!chartRef.current) return;
     const dataUrl = await chartRef.current.captureChartAsDataUrl();
     if (!dataUrl) return;
@@ -455,7 +471,7 @@ function MarketViewInner() {
     }
 
     setChartImageDesc(parts.join('\n'));
-  }, [selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency, quote.places]);
+  }, [chartImage, confirmedChartImageCount, selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency, quote.places, t, toast]);
 
   const handleSendMessage = useCallback(async (message: string, attachments: ReadyAttachment[] = [], _slashCommands: string[] = [], { model, reasoningEffort, fastMode }: { model?: string | null; reasoningEffort?: string | null; fastMode?: boolean | null } = {}) => {
     const send = buildMarketSendContexts(selectedStock || '', selectedInterval, message, collectViews());
@@ -467,6 +483,14 @@ function MarketViewInner() {
     contexts.push(...attached.contexts);
     // The confirmed selections on the chart on screen.
     contexts.push(...send.contexts);
+    // DALTON-HOOK(chat-attachment-count): refuse before navigating if files + screenshots exceed MAX_FILES
+    if (countContextAttachments(contexts as Record<string, unknown>[]) > MAX_FILES) {
+      toast({
+        variant: 'destructive',
+        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+      });
+      return false;
+    }
     const imageContext = contexts.length > 0 ? contexts : null;
 
     // Build attachment metadata for display in user message bubble
@@ -655,6 +679,7 @@ function MarketViewInner() {
               </div>
             )}
             <ChatInput
+              ref={mobileChatInputRef}
               // DALTON-HOOK(composer-drafts): persist draft for main market view mobile
               // composer and keep it open while the send's outcome is unknown —
               // upstream closes unconditionally, a refused send restores the text.
@@ -688,6 +713,8 @@ function MarketViewInner() {
               prefillMessage={prefillMessage}
               onClearPrefill={() => setPrefillMessage('')}
               hasExternalContext={hasChartSelectionForChart}
+              // DALTON-HOOK(chat-attachment-count): reserve slots for confirmed chart crops
+              externalAttachmentCount={confirmedChartImageCount}
               placeholder={t('marketView.chatPanel.askStockPlaceholder')}
               // The desktop panel waits out the same check: until it confirms
               // the restored workspace there is none to send to, and

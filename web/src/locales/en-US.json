@@ -2366,6 +2366,7 @@
     "attachmentEmpty": "{{name}} is empty and was not attached.",
     "attachmentTooLarge": "{{name}} exceeds the {{max}} MB limit and was not attached.",
     "attachmentsTotalTooLarge": "{{name}} was not attached: attachments in one message cannot exceed {{max}} MB in total.",
+    "attachmentsTooMany": "Not attached: attachments in one message cannot exceed {{max}} in total (including screenshots).",
     "contextPanel": {
       "trigger": "Context window, {{percent}} used",
       "title": "Context",

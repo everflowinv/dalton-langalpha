@@ -178,3 +178,88 @@ class TestRequestTotal:
         # The checkpoint keeps all five.
         for n, message in enumerate(history):
             assert message.content[1] == originals[n]
+
+    @pytest.mark.asyncio
+    async def test_ten_3mib_images_in_one_message_keep_newest_inside_budget(self):
+        # 10 images of ~3.0 MiB each in a single HumanMessage (~30 MiB total > 20 MiB):
+        # the newest 6 (~18 MiB) stay as image_url blocks and only the oldest 4
+        # become left-out notes naming their workspace paths. An older tiny image
+        # before the overflow still cannot displace a newer image.
+        per_image = _noise_png(1050, 1000)
+        assert 3 * 1024 * 1024 <= len(per_image) < _MAX_IMAGE_BYTES
+        blocks: list[dict] = [
+            {"type": "text", "text": "[Attached image: tiny0.png (saved to work/uploads/tiny0.png)]"},
+            _image_block(_noise_png(40, 40)),
+        ]
+        originals: list[dict] = [blocks[1]]
+        for n in range(1, 10):
+            img_block = _image_block(_noise_png(1050, 1000))
+            originals.append(img_block)
+            blocks.append({
+                "type": "text",
+                "text": f"[Attached image: chart{n}.png (saved to work/uploads/chart{n}.png)]",
+            })
+            blocks.append(img_block)
+
+        history = [HumanMessage(content=blocks, id="msg-10")]
+        result, unreadable, left_out = await fit_images(
+            history, COMMON_IMAGE_TYPES, lambda count: 8000
+        )
+
+        assert unreadable == frozenset()
+        out_blocks = result[0].content
+        assert len(out_blocks) == 20
+        # Oldest 4 images (tiny0 + chart1..chart3) became left-out notes; tiny0 did not jump the queue.
+        expected_left_out = ["tiny0.png", "chart1.png", "chart2.png", "chart3.png"]
+        for idx, name in enumerate(expected_left_out):
+            note = out_blocks[2 * idx + 1]
+            assert note["type"] == "text"
+            assert name in note["text"]
+            assert f"work/uploads/{name}" in note["text"]
+            assert "can be viewed with Read" in note["text"]
+        # Newest 6 images (chart4..chart9) stay byte-identical.
+        for idx in range(4, 10):
+            kept = out_blocks[2 * idx + 1]
+            assert kept["type"] == "image_url"
+            assert kept == originals[idx]
+        assert left_out == frozenset({"msg-10:1", "msg-10:3", "msg-10:5", "msg-10:7"})
+
+    @pytest.mark.asyncio
+    async def test_already_left_out_blocks_excluded_from_count_and_rescaling(self):
+        # Blocks in already_left_out are excluded up front from total and located,
+        # so replay count only reflects surviving images and skipped blocks are never re-scaled.
+        small = _noise_png(20, 20)
+        wide_img = Image.new("RGB", (2500, 100), color=(10, 20, 30))
+        wide_buf = io.BytesIO()
+        wide_img.save(wide_buf, "PNG")
+        wide_block = _image_block(wide_buf.getvalue())
+
+        m1_blocks: list[dict] = []
+        for k in range(5):
+            m1_blocks.append({"type": "text", "text": f"[Attached image: old{k}.png (saved to work/uploads/old{k}.png)]"})
+            m1_blocks.append(_image_block(small))
+        m2_blocks: list[dict] = [wide_block] + [_image_block(small) for _ in range(15)]
+        history = [
+            HumanMessage(content=m1_blocks, id="m1"),
+            HumanMessage(content=m2_blocks, id="m2"),
+        ]
+        seen_counts: list[int] = []
+
+        def max_side(count: int) -> int:
+            seen_counts.append(count)
+            return 2000 if count >= 21 else 8000
+
+        # Pre-seed m1:1 as already left out -> only 20 surviving images count (keeps 2500px wide image).
+        first_res, _, first_left = await fit_images(
+            history, COMMON_IMAGE_TYPES, max_side, already_left_out={"m1:1"}
+        )
+        # Replaying without new images yields the exact same count (20) and byte-identical wide block.
+        second_res, unreadable, second_left = await fit_images(
+            history, COMMON_IMAGE_TYPES, max_side, already_left_out=first_left
+        )
+
+        assert unreadable == frozenset()
+        assert seen_counts == [20, 20]
+        assert first_res[0].content[1]["type"] == "text"
+        assert second_res[1].content[0] == first_res[1].content[0] == wide_block
+        assert second_left == first_left == frozenset({"m1:1"})
