@@ -943,9 +943,43 @@ def _note_timeout_reminder_settled(
 _TIMEOUT_REMINDER_RETRY_LIMIT = 5
 
 
-def _signal_was_claimed(row: Any) -> bool:
-    """True when an execution has already claimed this signal row."""
+def _row_matches_execution(row: Any, execution_id: Optional[str]) -> bool:
+    """True when ``row`` carries ``woken_execution_id`` matching ``execution_id``."""
+    if not isinstance(row, dict) or not execution_id:
+        return False
+    claimed_exec = row.get("woken_execution_id")
+    if claimed_exec in (None, ""):
+        return False
+    raw_row = str(claimed_exec).strip()
+    raw_exec = str(execution_id).strip()
+    if raw_row == raw_exec:
+        return True
+    try:
+        return watch_db._signal_exec_uuid(raw_row) == watch_db._signal_exec_uuid(raw_exec)
+    except Exception:
+        return False
+
+
+def _signal_reusable_for_execution(row: Any, execution_id: Optional[str]) -> bool:
+    """True when ``row`` was previously claimed by ``execution_id`` and stays active."""
+    if not _row_matches_execution(row, execution_id) or _signal_resolved(row):
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    if status == "expired" or row.get("expired_at") is not None:
+        return False
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return payload.get("status") != "expired"
+
+
+def _signal_was_claimed(
+    row: Any,
+    *,
+    for_execution_id: Optional[str] = None,
+) -> bool:
+    """True when an execution other than ``for_execution_id`` has claimed this signal."""
     if not isinstance(row, dict):
+        return False
+    if _row_matches_execution(row, for_execution_id):
         return False
     if str(row.get("status") or "").strip().lower() == "woken":
         return True
@@ -954,13 +988,21 @@ def _signal_was_claimed(row: Any) -> bool:
     return row.get("woken_at") is not None
 
 
-def _signal_closed_unclaimed(row: Any) -> bool:
+def _signal_closed_unclaimed(
+    row: Any,
+    *,
+    for_execution_id: Optional[str] = None,
+) -> bool:
     """True when the row expired and nobody claimed it.
 
     A row someone resolved was seen and dismissed, so it settles the cycle
     rather than starting a retry.
     """
-    if not isinstance(row, dict) or _signal_was_claimed(row):
+    if not isinstance(row, dict) or _signal_was_claimed(
+        row, for_execution_id=for_execution_id
+    ):
+        return False
+    if _row_matches_execution(row, for_execution_id):
         return False
     status = str(row.get("status") or "").strip().lower()
     if status == "expired":
@@ -985,6 +1027,7 @@ async def _save_timeout_reminder_retry(
     persist: bool,
     workspace_id: Optional[str],
     ticker: Optional[str],
+    execution_id: Optional[str],
     probe_progress: Optional[dict[str, Any]],
     pending_reminder_cycles: dict[str, str],
     candidate_signals: list[dict[str, Any]],
@@ -1018,7 +1061,7 @@ async def _save_timeout_reminder_retry(
         except Exception as retry_err:
             logger.warning("[DALTON_PREFLIGHT] 连续超时提醒重试保存失败: %s", retry_err)
             return
-        if retry_unwoken:
+        if retry_unwoken or _signal_reusable_for_execution(retry_row, execution_id):
             signal_id = str((retry_row or {}).get("signal_id") or "").strip()
             if not signal_id:
                 logger.warning("[DALTON_PREFLIGHT] 连续超时提醒重试没有信号编号，本周期下次再试")
@@ -1035,10 +1078,13 @@ async def _save_timeout_reminder_retry(
                 }
             )
             return
-        if _signal_was_claimed(retry_row) or _signal_resolved(retry_row):
+        if (
+            _signal_was_claimed(retry_row, for_execution_id=execution_id)
+            or _signal_resolved(retry_row)
+        ):
             _note_timeout_reminder_settled(probe_progress, cycle, persist=persist)
             return
-        if not _signal_closed_unclaimed(retry_row):
+        if not _signal_closed_unclaimed(retry_row, for_execution_id=execution_id):
             return
     logger.warning("[DALTON_PREFLIGHT] 连续超时提醒仍未领取，本周期下次再试")
 
@@ -1085,33 +1131,42 @@ async def _conclude_preflight(
                     summary=sig.summary,
                     payload=sig.payload,
                 )
+                reusable_for_self = (not is_unwoken) and _signal_reusable_for_execution(
+                    row, execution_id
+                )
                 cycle = _reminder_cycle(sig)
-                if cycle and is_unwoken:
+                if cycle and (is_unwoken or reusable_for_self):
                     pending_reminder_cycles[str(row.get("signal_id") or "")] = cycle
                 elif cycle:
-                    # should_wake is false for a claimed row and also for an
-                    # expired or resolved row. A claimed row, or one a person
-                    # resolved, counts as reminded. An expired row that was
-                    # never claimed is saved again under a new key; this run's
-                    # claim marks the cycle.
-                    if _signal_was_claimed(row) or _signal_resolved(row):
+                    # should_wake is false for a claimed row (owned by another
+                    # execution) and also for an expired or resolved row. A
+                    # claimed row, or one a person resolved, counts as reminded.
+                    # An expired row that was never claimed is saved again under
+                    # a new key; this run's claim marks the cycle.
+                    if (
+                        _signal_was_claimed(row, for_execution_id=execution_id)
+                        or _signal_resolved(row)
+                    ):
                         _note_timeout_reminder_settled(
                             probe_progress,
                             cycle,
                             persist=persist,
                         )
-                    elif _signal_closed_unclaimed(row):
+                    elif _signal_closed_unclaimed(
+                        row, for_execution_id=execution_id
+                    ):
                         await _save_timeout_reminder_retry(
                             sig,
                             cycle=cycle,
                             persist=persist,
                             workspace_id=workspace_id,
                             ticker=ticker,
+                            execution_id=execution_id,
                             probe_progress=probe_progress,
                             pending_reminder_cycles=pending_reminder_cycles,
                             candidate_signals=candidate_signals,
                         )
-                if is_unwoken:
+                if is_unwoken or reusable_for_self:
                     candidate_signals.append(
                         {
                             "signal_id": str(row.get("signal_id") or ""),
@@ -1148,7 +1203,9 @@ async def _conclude_preflight(
 
     if persist and load_saved_signals and workspace_id:
         try:
-            saved_rows = await watch_db.list_unwoken_signals(workspace_id, ticker)
+            saved_rows = await watch_db.list_unwoken_signals(
+                workspace_id, ticker, for_execution_id=execution_id
+            )
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] list unwoken signals failed: %s", e)
             saved_rows = []

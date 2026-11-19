@@ -264,16 +264,21 @@ async def mark_preflight_timeout_reminded(
 async def list_unwoken_signals(
     workspace_id: Optional[str],
     ticker: Optional[str] = None,
+    for_execution_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Return unresolved signals that no execution has claimed yet."""
+    """Return unresolved, unexpired signals not claimed by another execution."""
     ws_uuid = _resolve_ws_uuid(workspace_id)
     clauses = [
         "workspace_id = %s",
-        "woken_execution_id IS NULL",
         "resolved_at IS NULL",
         "expired_at IS NULL",
     ]
     params: list[Any] = [ws_uuid]
+    if for_execution_id:
+        clauses.append("(woken_execution_id IS NULL OR woken_execution_id = %s)")
+        params.append(_signal_exec_uuid(for_execution_id))
+    else:
+        clauses.append("woken_execution_id IS NULL")
     if ticker:
         clauses.append("ticker = %s")
         params.append(ticker.upper())
@@ -317,6 +322,10 @@ def _try_uuid(val: Any) -> Optional[uuid.UUID]:
         return uuid.UUID(str(val))
     except (ValueError, TypeError):
         return None
+
+
+def _signal_exec_uuid(execution_id: str) -> uuid.UUID:
+    return _try_uuid(execution_id) or uuid.uuid5(uuid.NAMESPACE_DNS, str(execution_id))
 
 
 async def upsert_signal(
@@ -456,11 +465,11 @@ async def claim_signals_woken(
     *,
     workspace_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Atomically claim unwoken signals for ``execution_id`` using ``UPDATE ... WHERE woken_execution_id IS NULL RETURNING *`` (R5-12)."""
+    """Atomically claim unwoken signals (or re-claim signals already owned by ``execution_id``)."""
     ws_uuid = _require_scoped_ws_uuid(workspace_id)
     if not signal_ids:
         return []
-    exec_uuid = _try_uuid(execution_id) or uuid.uuid5(uuid.NAMESPACE_DNS, str(execution_id))
+    exec_uuid = _signal_exec_uuid(execution_id)
     sig_uuids = [u for s in signal_ids if (u := _try_uuid(s)) is not None]
     if not sig_uuids:
         return []
@@ -470,18 +479,18 @@ async def claim_signals_woken(
                 """
                 UPDATE dalton_signals
                 SET woken_execution_id = %s,
-                    woken_at = NOW(),
+                    woken_at = COALESCE(woken_at, NOW()),
                     payload = COALESCE(payload, '{}'::jsonb) || '{"status": "woken"}'::jsonb
                 WHERE signal_id = ANY(%s)
                   AND workspace_id = %s
-                  AND woken_execution_id IS NULL
+                  AND (woken_execution_id IS NULL OR woken_execution_id = %s)
                   AND resolved_at IS NULL
                   AND expired_at IS NULL
                 RETURNING signal_id, workspace_id, ticker, probe, signal_key, priority,
                           summary, payload, detected_at, woken_execution_id, woken_at,
                           resolved_at, expired_at
                 """,
-                (exec_uuid, sig_uuids, ws_uuid),
+                (exec_uuid, sig_uuids, ws_uuid, exec_uuid),
             )
             rows = await cur.fetchall()
             return [_with_signal_status(dict(r)) for r in (rows or [])]
