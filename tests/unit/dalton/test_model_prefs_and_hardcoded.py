@@ -173,6 +173,7 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/notional_pricing.py", "gemini-4-neon-low-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gemini-4-neon-medium-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gemini-4-neon-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gemini-4-neon-xhigh-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gpt-6-astra-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gpt-6.1-sol-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     ("llm/notional_pricing.py", "gpt-6.2-astra-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",

@@ -659,6 +659,20 @@ def test_separate_24h_dedup_when_missing_same_and_npm_fails_later(tmp_path: Path
     assert sent[1].startswith("需要提高 DALTON_CODEX_CLIENT_VERSION 到 0.176.0")
 
 
+
+def _mark_neon_awaiting_release(monkeypatch: pytest.MonkeyPatch, mc: Any) -> None:
+    from src.dalton.llm import overlay as overlay_mod
+
+    real_meta = overlay_mod.load_dalton_meta() or {}
+    meta = {k: dict(v) for k, v in real_meta.items()}
+    # Before launch only low/medium/high were configured; xhigh came with GA.
+    mc.llm_config.pop("gemini-4-neon-xhigh-oauth", None)
+    for key, entry in mc.llm_config.items():
+        if isinstance(entry, dict) and key.startswith("gemini-4-neon-"):
+            entry["visible"] = False
+            meta.setdefault(key, {})["awaiting_release"] = True
+    monkeypatch.setattr(watch_svc, "load_dalton_meta", lambda: meta)
+
 @pytest.mark.asyncio
 async def test_awaiting_release_missing_suppressed_then_released_alerts_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -668,6 +682,8 @@ async def test_awaiting_release_missing_suppressed_then_released_alerts_once(
 
     LLM._model_config = None
     mc = ModelConfig()
+    # Neon is GA now; recreate the pre-launch state these tests exercise.
+    _mark_neon_awaiting_release(monkeypatch, mc)
     monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-holder-1")
 
     async def _fake_available(
@@ -802,6 +818,8 @@ async def test_awaiting_release_unconfigured_prefix_id_triggers_model_released(
 
     LLM._model_config = None
     mc = ModelConfig()
+    # Neon is GA now; recreate the pre-launch state these tests exercise.
+    _mark_neon_awaiting_release(monkeypatch, mc)
     monkeypatch.setenv("DALTON_PM_USER_IDS", "pm-holder-1")
 
     async def _fake_available(

@@ -251,7 +251,7 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-4-neon-low",
       "provider": "antigravity-oauth",
-      "visible": false,
+      "visible": true,
       "context": 1048576,
       "input_modalities": [
         "text",
@@ -275,7 +275,7 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-4-neon-medium",
       "provider": "antigravity-oauth",
-      "visible": false,
+      "visible": true,
       "context": 1048576,
       "input_modalities": [
         "text",
@@ -299,7 +299,7 @@
       "prompt_guidance": "lean",
       "model_id": "gemini-4-neon-high",
       "provider": "antigravity-oauth",
-      "visible": false,
+      "visible": true,
       "context": 1048576,
       "input_modalities": [
         "text",
@@ -1107,6 +1107,30 @@
         "default": "medium",
         "write": "parameters.reasoning.effort"
       }
+    },
+    "gemini-4-neon-xhigh-oauth": {
+      "prompt_guidance": "lean",
+      "model_id": "gemini-4-neon-xhigh",
+      "provider": "antigravity-oauth",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image",
+        "pdf",
+        "video"
+      ],
+      "parameters": {
+        "include_thoughts": true,
+        "max_output_tokens": 65536
+      },
+      "reasoning": {
+        "efforts": [
+          "xhigh"
+        ],
+        "default": "xhigh",
+        "write": "parameters.thinking_level"
+      }
     }
   },
   "model_overrides": {
@@ -1443,47 +1467,44 @@
     "gemini-4-neon-low-oauth": {
       "family": "google-gemini",
       "billing": "subscription",
-      "awaiting_release": true,
       "notional_pricing": {
         "input": 3.0,
         "output": 15.0,
         "cached_input": 0.15,
-        "estimated": true,
-        "source": "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/",
+        "estimated": false,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
         "verified_at": "2026-11-19"
       },
       "tool_calling": true,
-      "comment": "Subscription cash cost is 0. Gemini 4 Neon is not officially announced; nominal rates $3 input / $15 output / $0.15 cached input per million tokens come from a Google Cloud billing catalogue report. Context and output limits are unpublished; Hydrogen values (1048576 / 65536) are used until Google publishes official limits."
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon became generally available on 2026-11-18 (Gemini API release notes); list price $3 input / $0.15 cached input / $15 output per million tokens, flat across the 1,048,576-token context window; output defaults to 65,536 tokens. Four thinking levels (low, medium, high, xhigh), all listed by the Antigravity subscription on 2026-11-19."
     },
     "gemini-4-neon-medium-oauth": {
       "family": "google-gemini",
       "billing": "subscription",
-      "awaiting_release": true,
       "notional_pricing": {
         "input": 3.0,
         "output": 15.0,
         "cached_input": 0.15,
-        "estimated": true,
-        "source": "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/",
+        "estimated": false,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
         "verified_at": "2026-11-19"
       },
       "tool_calling": true,
-      "comment": "Subscription cash cost is 0. Gemini 4 Neon is not officially announced; nominal rates $3 input / $15 output / $0.15 cached input per million tokens come from a Google Cloud billing catalogue report. Context and output limits are unpublished; Hydrogen values (1048576 / 65536) are used until Google publishes official limits."
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon became generally available on 2026-11-18 (Gemini API release notes); list price $3 input / $0.15 cached input / $15 output per million tokens, flat across the 1,048,576-token context window; output defaults to 65,536 tokens. Four thinking levels (low, medium, high, xhigh), all listed by the Antigravity subscription on 2026-11-19."
     },
     "gemini-4-neon-high-oauth": {
       "family": "google-gemini",
       "billing": "subscription",
-      "awaiting_release": true,
       "notional_pricing": {
         "input": 3.0,
         "output": 15.0,
         "cached_input": 0.15,
-        "estimated": true,
-        "source": "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/",
+        "estimated": false,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
         "verified_at": "2026-11-19"
       },
       "tool_calling": true,
-      "comment": "Subscription cash cost is 0. Gemini 4 Neon is not officially announced; nominal rates $3 input / $15 output / $0.15 cached input per million tokens come from a Google Cloud billing catalogue report. Context and output limits are unpublished; Hydrogen values (1048576 / 65536) are used until Google publishes official limits."
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon became generally available on 2026-11-18 (Gemini API release notes); list price $3 input / $0.15 cached input / $15 output per million tokens, flat across the 1,048,576-token context window; output defaults to 65,536 tokens. Four thinking levels (low, medium, high, xhigh), all listed by the Antigravity subscription on 2026-11-19."
     },
     "gemini-3.8-flash-low-oauth": {
       "family": "google-gemini",
@@ -1959,6 +1980,20 @@
       "billing": "subscription",
       "notional_ref": "glm-5.3-flash-cn",
       "tool_calling": true
+    },
+    "gemini-4-neon-xhigh-oauth": {
+      "family": "google-gemini",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input": 3.0,
+        "output": 15.0,
+        "cached_input": 0.15,
+        "estimated": false,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing",
+        "verified_at": "2026-11-19"
+      },
+      "tool_calling": true,
+      "comment": "Subscription cash cost is 0. Gemini 4 Neon became generally available on 2026-11-18 (Gemini API release notes); list price $3 input / $0.15 cached input / $15 output per million tokens, flat across the 1,048,576-token context window; output defaults to 65,536 tokens. Four thinking levels (low, medium, high, xhigh), all listed by the Antigravity subscription on 2026-11-19."
     }
   },
   "retired": [
