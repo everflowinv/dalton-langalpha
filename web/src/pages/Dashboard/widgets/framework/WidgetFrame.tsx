@@ -95,11 +95,13 @@ export function WidgetFrame({
       });
       return;
     }
-    ContextBus.attach(snapshot);
-    toast({
-      title: t('dashboard.widgets.frame.contextAttached', { defaultValue: 'Added to context' }),
-      description: snapshot.label,
-    });
+    // DALTON-HOOK(chat-attachment-count): only confirm attachment when no ChatInput rejected it for MAX_FILES
+    if (ContextBus.attach(snapshot)) {
+      toast({
+        title: t('dashboard.widgets.frame.contextAttached', { defaultValue: 'Added to context' }),
+        description: snapshot.label,
+      });
+    }
   };
 
   // Read the latest onFitHeight through an effect event so the ResizeObserver

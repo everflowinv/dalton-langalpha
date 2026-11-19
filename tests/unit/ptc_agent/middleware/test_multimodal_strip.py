@@ -1140,16 +1140,15 @@ def _image_data_url(raw: bytes) -> str:
 class TestByteTotalRecordsTheRemoval:
     """The request's image byte total is the one fit outcome that moves between
     calls — what fits changes as images arrive. DALTON-HOOK(attachment-native-cap):
-    the cut is joined to the context-window removal (``_removed_attachment_ids``
-    plus ``_unsent_thinking_ids``), so the first trimming request already sends
-    the bytes every later one reads, and no thinking stays sent behind a prefix
-    that changed."""
+    left-out blocks are recorded per block in ``_left_out_image_blocks`` so
+    fitting images in the same message are still sent, while every bound
+    answer after a newly trimmed message goes into ``_unsent_thinking_ids``."""
 
     #: ~4.4 MB each, under the per-image ceiling and every pixel limit.
     PER_IMAGE = 1240 * 1240 * 3
 
     @staticmethod
-    def _images(n: int, prefix: str) -> list:
+    def _images(n: int, prefix: str, width: int = 1240, height: int = 1240) -> list:
         blocks = []
         for k in range(n):
             blocks.append({
@@ -1158,7 +1157,7 @@ class TestByteTotalRecordsTheRemoval:
             })
             blocks.append({
                 "type": "image_url",
-                "image_url": {"url": _image_data_url(_noise_png(1240, 1240))},
+                "image_url": {"url": _image_data_url(_noise_png(width, height))},
             })
         return blocks
 
@@ -1197,6 +1196,52 @@ class TestByteTotalRecordsTheRemoval:
         assert response.command.update == {"image_side_rule": "count"}
 
     @pytest.mark.asyncio
+    async def test_ten_3mib_images_in_one_message_keeps_budget_images_and_subsequent_thinking(self):
+        """DALTON-HOOK(attachment-native-cap): 10 ~3 MiB images in one message
+        keep the newest 6 within the 20 MiB budget, replace only the oldest 4
+        with Read-path notes, and keep a later bound answer's thinking intact
+        when no further blocks are left out."""
+        seen: list = []
+
+        async def handler(request):
+            seen.append(request)
+            return "ok"
+
+        m1 = HumanMessage(content=self._images(10, "img", width=1050, height=1000), id="m1")
+        strip = MultimodalStripMiddleware()
+        first = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", [m1], state={}), handler
+        )
+
+        sent_m1 = seen[0].messages[0]
+        kept_imgs = [b for b in sent_m1.content if b.get("type") == "image_url"]
+        assert len(kept_imgs) == 6
+        for k in range(6):
+            assert kept_imgs[k] == m1.content[2 * (k + 4) + 1]
+        for k in range(4):
+            note = sent_m1.content[2 * k + 1]
+            assert note["type"] == "text"
+            assert f"img{k}.png" in note["text"]
+            assert f"work/uploads/img{k}.png" in note["text"]
+            assert "can be viewed with Read" in note["text"]
+
+        state = dict(first.command.update)
+        assert state["_left_out_image_blocks"] == {"m1:1", "m1:3", "m1:5", "m1:7"}
+        assert "_removed_attachment_ids" not in state
+        assert "_unsent_thinking_ids" not in state
+
+        # Next turn: bound answer a1 was produced against sent_m1; a text-only
+        # follow-up keeps m1 byte-identical and preserves a1's thinking.
+        a1 = self._bound_answer("a1")
+        m2 = HumanMessage(content=[{"type": "text", "text": "follow up"}], id="m2")
+        second = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", [m1, a1, m2], state=state), handler
+        )
+        assert seen[1].messages[0].content == sent_m1.content
+        assert seen[1].messages[1] is a1
+        assert second == "ok"
+
+    @pytest.mark.asyncio
     async def test_the_second_rounds_overflow_records_the_removal_and_drops_the_thinking(self):
         seen = {}
 
@@ -1213,33 +1258,37 @@ class TestByteTotalRecordsTheRemoval:
         response = await MultimodalStripMiddleware().awrap_model_call(request, handler)
 
         sent = seen["request"].messages
-        # The first round's message lost every attachment, to the context-window
-        # placeholder — the bytes the record replays on every later call — not
-        # to a byte-budget note only this request would carry.
-        m1_texts = [b for b in sent[0].content if b.get("type") == "text"]
-        assert not any(b.get("type") == "image_url" for b in sent[0].content)
-        assert any("was removed from the conversation" in b["text"] for b in m1_texts)
-        assert len(sent[0].content) == len(history[0].content)
-        # The answer after it went without its thinking: sending it behind the
-        # changed prefix would have the API drop or refuse exactly that
-        # thinking on every later call.
+        # m2 (13.2 MB) + m1's newest image chart2.png (4.4 MB) fit within 20 MB;
+        # only chart0.png and chart1.png in m1 become left-out notes with their
+        # workspace paths, while chart2.png stays as an image_url.
+        assert [b.get("type") for b in sent[0].content] == [
+            "text", "text", "text", "text", "text", "image_url"
+        ]
+        assert "chart0.png" in sent[0].content[1]["text"]
+        assert "work/uploads/chart0.png" in sent[0].content[1]["text"]
+        assert "can be viewed with Read" in sent[0].content[1]["text"]
+        assert "chart1.png" in sent[0].content[3]["text"]
+        assert "work/uploads/chart1.png" in sent[0].content[3]["text"]
+        assert sent[0].content[5] == history[0].content[5]
+        # The answer after m1 went without its thinking: sending it behind the
+        # changed prefix would have the API drop or refuse that thinking.
         assert sent[1].content == [{"type": "text", "text": "Here is what the images show."}]
         # The newest round rides untouched.
         assert sent[2] is history[2]
 
         update = response.command.update
-        assert update["_removed_attachment_ids"] == {"m1"}
+        assert update["_left_out_image_blocks"] == {"m1:1", "m1:3"}
+        assert "_removed_attachment_ids" not in update
         assert update["_unsent_thinking_ids"] == {"a1"}
 
     @pytest.mark.asyncio
     async def test_a_later_call_reads_the_same_bytes_and_records_nothing_new(self):
-        """Once recorded, the offload view replays the removal before this
-        middleware runs; the same history must then render identically and
-        record nothing further."""
-        seen = {}
+        """Once recorded, replaying ``_left_out_image_blocks`` and
+        ``_unsent_thinking_ids`` renders identically and records nothing further."""
+        seen: list = []
 
         async def handler(request):
-            seen["request"] = request
+            seen.append(request)
             return "ok"
 
         history = [
@@ -1247,34 +1296,33 @@ class TestByteTotalRecordsTheRemoval:
             self._bound_answer("a1"),
             HumanMessage(content=self._images(3, "fresh"), id="m2"),
         ]
-        # What the offload view (offload_view, compaction) hands this middleware
-        # once the record exists.
-        replayed = without_thinking(
-            remove_attachments(history, {"m1"}), {"a1"}
+        strip = MultimodalStripMiddleware()
+        first = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", history, state={}), handler
         )
+        replayed = without_thinking(history, {"a1"})
         state = {
-            "_removed_attachment_ids": {"m1"},
+            "_left_out_image_blocks": {"m1:1", "m1:3"},
             "_unsent_thinking_ids": {"a1"},
             "image_side_rule": "count",
         }
-        response = await MultimodalStripMiddleware().awrap_model_call(
+        response = await strip.awrap_model_call(
             _ModelCallRequest("claude-sonnet-5-5", replayed, state=state), handler
         )
 
-        sent = seen["request"].messages
-        assert sent[0] is replayed[0]
-        assert sent[1] is replayed[1]
-        assert sent[2] is replayed[2]
+        assert seen[1].messages[0].content == seen[0].messages[0].content
+        assert seen[1].messages[1] is replayed[1]
+        assert seen[1].messages[2] is replayed[2]
         assert response == "ok"
+        assert first.command.update["_left_out_image_blocks"] == {"m1:1", "m1:3"}
 
     @pytest.mark.asyncio
     async def test_with_compaction_off_the_record_still_holds_the_second_round(self):
-        """``compaction.enabled=false`` runs no offload view, so nothing else
-        replays the record; the strip replays both ``_removed_attachment_ids``
-        and ``_unsent_thinking_ids`` itself. Across two calls off the raw
-        checkpoint, the second call renders the first call's placeholders and
-        stripped thinking — not the byte note the walk would leave over images
-        still in history — and records nothing new."""
+        """``compaction.enabled=false`` runs no offload view, so the strip
+        replays ``_left_out_image_blocks`` and ``_unsent_thinking_ids`` itself.
+        Across two calls off the raw checkpoint, the second call renders the
+        first call's notes, kept images, and stripped thinking identically, and
+        preserves thinking on answers written after the cut."""
         seen: list = []
 
         async def handler(request):
@@ -1291,33 +1339,30 @@ class TestByteTotalRecordsTheRemoval:
             _ModelCallRequest("claude-sonnet-5-5", history, state={}), handler
         )
         state = dict(first.command.update)
-        assert state["_removed_attachment_ids"] == {"m1"}
+        assert state["_left_out_image_blocks"] == {"m1:1", "m1:3"}
         assert state["_unsent_thinking_ids"] == {"a1"}
 
+        a2 = self._bound_answer("a2")
+        m3 = HumanMessage(content=[{"type": "text", "text": "next"}], id="m3")
         second = await strip.awrap_model_call(
-            _ModelCallRequest("claude-sonnet-5-5", history, state=state), handler
+            _ModelCallRequest("claude-sonnet-5-5", [*history, a2, m3], state=state), handler
         )
 
         round_one, round_two = seen[0].messages, seen[1].messages
-        recorded_bytes = remove_attachments(history, {"m1"})[0].content
-        assert round_two[0].content == recorded_bytes
         assert round_two[0].content == round_one[0].content
-        assert not any(b.get("type") == "image_url" for b in round_two[0].content)
-        assert not any(
-            "left out of this request" in b.get("text", "") for b in round_two[0].content
-        )
         assert round_two[1].content == [{"type": "text", "text": "Here is what the images show."}]
         assert round_two[1].content == round_one[1].content
         assert round_two[2] is history[2]
+        assert round_two[3] is a2
         assert second == "ok"
 
     @pytest.mark.asyncio
     async def test_same_step_writes_from_compaction_and_the_strip_union_without_refusal(self):
         """DALTON-HOOK(attachment-native-cap): compaction's ``Fitted.update``
-        and the strip's image byte total can each return a ``Command`` writing
-        ``_removed_attachment_ids`` in the same model call; the key uses the
-        same ``_union`` reducer as ``_unsent_thinking_ids`` so the two writes
-        merge into their union instead of raising ``InvalidUpdateError``."""
+        and the strip's image byte total can both write in the same model call;
+        ``_removed_attachment_ids``, ``_left_out_image_blocks``, and
+        ``_unsent_thinking_ids`` all use ``_union`` instead of raising
+        ``InvalidUpdateError``."""
         from typing import get_type_hints
 
         from langchain.agents.middleware.types import ModelResponse
@@ -1330,9 +1375,10 @@ class TestByteTotalRecordsTheRemoval:
         from ptc_agent.agent.middleware.thinking_binding import UnsentThinkingState, _union
 
         for schema in (CompactionState, ImageSideState):
-            hint = get_type_hints(schema, include_extras=True)["_removed_attachment_ids"]
-            callables = [m for m in getattr(hint, "__metadata__", ()) if callable(m)]
-            assert callables[-1] is _union
+            for field in ("_removed_attachment_ids", "_left_out_image_blocks"):
+                hint = get_type_hints(schema, include_extras=True)[field]
+                callables = [m for m in getattr(hint, "__metadata__", ()) if callable(m)]
+                assert callables[-1] is _union
         thinking_hint = get_type_hints(UnsentThinkingState, include_extras=True)[
             "_unsent_thinking_ids"
         ]
@@ -1361,16 +1407,18 @@ class TestByteTotalRecordsTheRemoval:
         app = graph.compile()
 
         out = await app.ainvoke({"messages": [], "_removed_attachment_ids": {"held"}})
-        assert out["_removed_attachment_ids"] == {"held", "m1", "fit-pdf"}
+        assert out["_removed_attachment_ids"] == {"held", "fit-pdf"}
+        assert out["_left_out_image_blocks"] == {"m1:1", "m1:3"}
+        assert out["_unsent_thinking_ids"] == {"a1"}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("strip_first", [True, False])
     async def test_compaction_cleanup_shrinks_the_set_under_the_union_reducer(self, strip_first):
         """DALTON-HOOK(attachment-native-cap): when ``Compaction.update`` (with
         or without ``Fitted.update``) or ``window.trim`` shrinks
-        ``_removed_attachment_ids`` to the kept messages, the union reducer
-        drops the retired ids as upstream requires, while still unioning any
-        same-step addition from the strip in either command order."""
+        ``_removed_attachment_ids`` and ``_left_out_image_blocks`` to the kept
+        messages, the union reducer drops the retired ids as upstream requires,
+        while still unioning any same-step addition in either command order."""
         from langchain.agents.middleware.types import ModelResponse
         from langgraph.graph import END, START, StateGraph
         from langgraph.types import Command
@@ -1398,20 +1446,25 @@ class TestByteTotalRecordsTheRemoval:
             original_count=len(summarized) + len(kept),
             preserved=kept,
         )
-        prior_state = {"_removed_attachment_ids": {"old-removed", "kept-old"}}
+        prior_state = {
+            "_removed_attachment_ids": {"old-removed", "kept-old"},
+            "_left_out_image_blocks": {"old-removed:1", "kept-old:1"},
+        }
 
-        # Alone, Compaction.update drops the summarized id through the graph reducer.
+        # Alone, Compaction.update drops the summarized ids through the graph reducer.
         compact_only = compaction.update(prior_state)
         assert compact_only["_removed_attachment_ids"] == {"kept-old"}
+        assert compact_only["_left_out_image_blocks"] == {"kept-old:1"}
         solo_graph = StateGraph(CompactionState)
         solo_graph.add_node("compact", lambda _s: Command(update=compact_only))
         solo_graph.add_edge(START, "compact")
         solo_graph.add_edge("compact", END)
         solo_out = await solo_graph.compile().ainvoke({"messages": [], **prior_state})
         assert solo_out["_removed_attachment_ids"] == {"kept-old"}
+        assert solo_out["_left_out_image_blocks"] == {"kept-old:1"}
 
         # In the same step as the strip (and with Fitted.update also adding an id),
-        # the summarized id stays dropped while kept + fit + strip ids union.
+        # the summarized ids stay dropped while kept + fit + strip ids union.
         async def handler(_request):
             return ModelResponse(result=[AIMessage("ok", id="a2")])
 
@@ -1436,5 +1489,106 @@ class TestByteTotalRecordsTheRemoval:
         graph.add_edge(START, "model")
         graph.add_edge("model", END)
         out = await graph.compile().ainvoke({"messages": [], **prior_state})
-        assert out["_removed_attachment_ids"] == {"kept-old", "fit-new", "m1"}
+        assert out["_removed_attachment_ids"] == {"kept-old", "fit-new"}
+        assert out["_left_out_image_blocks"] == {"kept-old:1", "m1:1", "m1:3"}
         assert "old-removed" not in out["_removed_attachment_ids"]
+        assert "old-removed:1" not in out["_left_out_image_blocks"]
+
+    @pytest.mark.asyncio
+    async def test_thinking_only_message_removed_by_without_thinking_keeps_unreadable_placeholder_aligned(self):
+        """DALTON-HOOK(attachment-native-cap): when ``without_thinking`` removes
+        a thinking-only AIMessage after a newly trimmed message, ``unreadable``
+        positions are remapped to the surviving messages so the unreadable image
+        gets its placeholder on this very call, not one turn later."""
+        seen: list = []
+
+        async def handler(request):
+            seen.append(request)
+            return "ok"
+
+        bad_block = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"not-a-png").decode("ascii")},
+        }
+        thinking_only = AIMessage(
+            content=[{"type": "thinking", "thinking": "reasoned", "signature": "sig"}],
+            id="a-only",
+            response_metadata={"reasoning_origin": "anthropic"},
+        )
+        history = [
+            HumanMessage(content=self._images(3, "chart"), id="m1"),
+            thinking_only,
+            HumanMessage(content=[*self._images(3, "fresh"), bad_block], id="m2"),
+        ]
+        response = await MultimodalStripMiddleware().awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", history, state={}), handler
+        )
+
+        sent = seen[0].messages
+        assert len(sent) == 2
+        assert sent[0].id == "m1"
+        assert sent[1].id == "m2"
+        # The unreadable image in m2 (moved from index 2 to 1) is replaced immediately.
+        assert not any(b.get("type") == "image_url" and "not-a-png" in str(b) for b in sent[1].content)
+        assert sent[1].content[-1]["type"] == "text"
+        assert "not visible to the current model" in sent[1].content[-1]["text"]
+        assert response.command.update["_unsent_thinking_ids"] == {"a-only"}
+
+    @pytest.mark.asyncio
+    async def test_count_side_rule_excludes_left_out_images_on_refit_replay_and_new_small_image(self):
+        """DALTON-HOOK(attachment-native-cap): left-out blocks are excluded on
+        the second pass of the initial call so the first omitting request is
+        byte-identical to a subsequent call with no new images, and appending a
+        new small image keeps historic wide images unscaled when surviving
+        images stay within the 20-image threshold."""
+        seen: list = []
+
+        async def handler(request):
+            seen.append(request)
+            return "ok"
+
+        small_buf = io.BytesIO()
+        Image.new("RGB", (20, 20), color=(1, 2, 3)).save(small_buf, "PNG")
+        small_url = _image_data_url(small_buf.getvalue())
+
+        wide_buf = io.BytesIO()
+        Image.new("RGB", (2500, 100), color=(4, 5, 6)).save(wide_buf, "PNG")
+        wide_block = {"type": "image_url", "image_url": {"url": _image_data_url(wide_buf.getvalue())}}
+
+        # 6 ~4.4 MB images (> 20 MB total -> oldest 2 left out: m1:1, m1:3)
+        # + 1 wide (2500px) + 14 small = 21 total initially, 19 surviving after omission.
+        m1 = HumanMessage(content=self._images(6, "old"), id="m1")
+        m2 = HumanMessage(
+            content=[wide_block, *({"type": "image_url", "image_url": {"url": small_url}} for _ in range(14))],
+            id="m2",
+        )
+        strip = MultimodalStripMiddleware()
+        first = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", [m1, m2], state={"image_side_rule": "count"}),
+            handler,
+        )
+        state = {"image_side_rule": "count", **dict(first.command.update)}
+        assert state["_left_out_image_blocks"] == {"m1:1", "m1:3"}
+        assert seen[0].messages[1].content[0] == wide_block
+
+        # Call 2 with NO new images: every image block is byte-identical to Call 1.
+        a1 = self._bound_answer("a1")
+        m3_text = HumanMessage(content=[{"type": "text", "text": "follow up"}], id="m3")
+        await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", [m1, m2, a1, m3_text], state=state),
+            handler,
+        )
+        assert seen[1].messages[0].content == seen[0].messages[0].content
+        assert seen[1].messages[1].content == seen[0].messages[1].content
+        assert seen[1].messages[2] is a1
+
+        # Call 3 (codex scenario): appending 1 small image makes 20 surviving
+        # (22 total incl. 2 left-out, <= 20 surviving) -> wide image stays 2500px and a1 keeps thinking.
+        m4_img = HumanMessage(content=[{"type": "image_url", "image_url": {"url": small_url}}], id="m4")
+        third = await strip.awrap_model_call(
+            _ModelCallRequest("claude-sonnet-5-5", [m1, m2, a1, m3_text, m4_img], state=state),
+            handler,
+        )
+        assert seen[2].messages[1].content[0] == wide_block
+        assert seen[2].messages[2] is a1
+        assert third == "ok"

@@ -34,6 +34,7 @@ from ptc_agent.agent.middleware.compaction.offloading import (
 from ptc_agent.agent.middleware.compaction.utils import resolve_cutoff_index
 from ptc_agent.agent.middleware.thinking_binding import (
     UNSENT_THINKING_KEY,
+    shrink_block_ids,  # DALTON-HOOK(attachment-native-cap)
     shrink_ids,  # DALTON-HOOK(attachment-native-cap)
     unsent_thinking,
 )
@@ -114,6 +115,10 @@ def trim(
             update[key] = (
                 shrink_ids(recorded, ids) if key == "_removed_attachment_ids" else recorded & ids
             )
+    if left_out := set(state.get("_left_out_image_blocks") or ()):
+        shrunk_left_out = shrink_block_ids(left_out, ids)
+        if getattr(shrunk_left_out, "dropped", None):
+            update["_left_out_image_blocks"] = shrunk_left_out
     summary = (state.get("_summarization_event") or {}).get("summary_message")
     in_view = ids | {getattr(summary, "id", None)}
     unsent = unsent_thinking(state)

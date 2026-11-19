@@ -49,6 +49,15 @@ def shrink_ids(recorded: Iterable[str], kept: Collection[str]) -> set[str]:
     return _Shrunk(remaining, dropped=dropped) if dropped else remaining
 
 
+def shrink_block_ids(recorded: Iterable[str], kept: Collection[str]) -> set[str]:
+    """DALTON-HOOK(attachment-native-cap): like ``shrink_ids`` for ``"<msg_id>:<idx>"`` entries."""
+    held = set(recorded)
+    allowed = set(kept)
+    remaining = {entry for entry in held if entry.rsplit(":", 1)[0] in allowed}
+    dropped = held - remaining
+    return _Shrunk(remaining, dropped=dropped) if dropped else remaining
+
+
 def _union(held: Iterable[str] | None, new: Iterable[str] | None) -> set[str]:
     # DALTON-HOOK(attachment-native-cap): honors ``_Shrunk.dropped`` across
     # same-step writes so summary/window cleanup survives the union.

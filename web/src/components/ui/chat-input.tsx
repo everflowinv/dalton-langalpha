@@ -27,7 +27,8 @@ import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/
 import './chat-input.css';
 // DALTON-HOOK(composer-drafts): QuoteMention and sameMention restore a draft's quotes beside the given-back text
 import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, QuoteMention, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
-import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.helpers';
+import { isLargePaste, getModelDisplayName, MAX_FILES, sameMention } from './chat-input.helpers'; // DALTON-HOOK(chat-attachment-count)
+import { useToast } from './use-toast';
 import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
@@ -89,7 +90,7 @@ export interface ChatInputHandle {
    * Use `ContextBus.attach` when the user clicks "+" on a widget so every
    * mounted chat input sees it.
    */
-  addWidgetSnapshot: (snapshot: WidgetContextSnapshot) => void;
+  addWidgetSnapshot: (snapshot: WidgetContextSnapshot) => boolean;
   /** Replaces the text: pills it no longer names drop, and `commands` are picked beside it. */
   setValue: (text: string, commands?: SlashCommand[]) => void;
   /**
@@ -110,6 +111,8 @@ export interface ChatInputHandle {
   /** Whether files still uploading, or failed, hold the send. The hint
    *  beside Send says which; the draft waits in the box. */
   holdsSend: () => boolean;
+  // DALTON-HOOK(chat-attachment-count): total attached files + screenshots counted toward MAX_FILES
+  getAttachmentCount: () => number;
   focus: () => void;
 }
 
@@ -166,6 +169,8 @@ export interface ChatInputProps {
    * sendable — the selection carries its own instruction.
    */
   hasExternalContext?: boolean;
+  // DALTON-HOOK(chat-attachment-count): image-bearing host context items (e.g. panel chart crops) counted toward MAX_FILES
+  externalAttachmentCount?: number;
   tokenUsage?: TokenUsage | null;
   /** The thread the context panel breaks down; absent for a chat with no
    *  thread yet. */
@@ -254,6 +259,7 @@ function ChatInput({
   onClearPrefill = null,
   // Host-attached context (e.g. a chart selection pill) that makes an empty box sendable
   hasExternalContext = false,
+  externalAttachmentCount = 0,
   // Token usage (context window progress)
   tokenUsage = null,
   threadId,
@@ -280,6 +286,7 @@ function ChatInput({
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
   const { t } = useTranslation();
+  const { toast } = useToast();
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const { preferences, isLoaded: preferencesRead } = usePreferences();
@@ -323,6 +330,19 @@ function ChatInput({
   const targetWorkspaceRef = useRef<string | null>(null);
   // DALTON-HOOK(chat-large-upload): scope multipart uploads to Home or the active workspace
   const uploadWorkspaceKey = inHome || scope === 'all' ? 'home' : (selectedWorkspaceId || 'home');
+  // DALTON-HOOK(chat-attachment-count): track image-bearing widget snapshots and host screenshots toward MAX_FILES
+  const [widgetSnapshots, setWidgetSnapshots] = useState<WidgetContextSnapshot[]>([]);
+  const widgetSnapshotsRef = useRef<WidgetContextSnapshot[]>([]);
+  const commitWidgetSnapshots = useCallback((updater: (prev: WidgetContextSnapshot[]) => WidgetContextSnapshot[]) => {
+    const next = updater(widgetSnapshotsRef.current);
+    widgetSnapshotsRef.current = next;
+    setWidgetSnapshots(next);
+  }, []);
+  const widgetImageCount = widgetSnapshots.filter((s) => Boolean(s.image_jpeg_data_url)).length;
+  const externalAttachmentSlots = (chartImage ? 1 : 0) + externalAttachmentCount;
+  const reservedAttachmentSlots = widgetImageCount + externalAttachmentSlots;
+  const externalSlotsRef = useRef(externalAttachmentSlots);
+  externalSlotsRef.current = externalAttachmentSlots;
   const {
     attachedFiles, uploadingCount, failedCount, isDragging,
     handleFiles, retryFile, restoreFiles, removeFile, discardFiles, takeFiles, holdsStale, consumeSentFiles,
@@ -333,6 +353,26 @@ function ChatInput({
     workspaceId: slashWorkspaceId ?? null,
     largeUploadWorkspaceId: uploadWorkspaceKey,
   });
+  const attachedCountRef = useRef(attachedFiles.length);
+  attachedCountRef.current = attachedFiles.length;
+  // DALTON-HOOK(chat-attachment-count): guard widget snapshot attachments against MAX_FILES
+  const tryAttachWidgetSnapshot = useCallback((snapshot: WidgetContextSnapshot): boolean => {
+    if (widgetSnapshotsRef.current.some((s) => s.widget_id === snapshot.widget_id)) return true;
+    if (snapshot.image_jpeg_data_url) {
+      const currentWidgetImages = widgetSnapshotsRef.current.filter((s) => Boolean(s.image_jpeg_data_url)).length;
+      if (attachedCountRef.current + currentWidgetImages + externalSlotsRef.current >= MAX_FILES) {
+        toast({
+          title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+          variant: 'destructive',
+        });
+        return false;
+      }
+    }
+    commitWidgetSnapshots((prev) => (
+      prev.some((s) => s.widget_id === snapshot.widget_id) ? prev : [...prev, snapshot]
+    ));
+    return true;
+  }, [commitWidgetSnapshots, t, toast]);
   const [watchMode, setWatchMode] = useState(false);
   // The toggle state survives the feature going off (the pill just hides), so
   // every payload derives from this gated value.
@@ -424,12 +464,9 @@ function ChatInput({
 
   const isCodexModel = pillModel ? modelMetadata[pillModel]?.sdk === 'codex' : false;
 
-  // Widget context deck state. Snapshots arrive via ContextBus.attach (when
-  // the user clicks "+" on any widget on the page) or via addWidgetSnapshot
-  // (when re-seeding from location.state after a navigate). Each input
-  // mirrors the same global ContextBus state so two visible inputs always
-  // show the same deck.
-  const [widgetSnapshots, setWidgetSnapshots] = useState<WidgetContextSnapshot[]>([]);
+  // Widget context deck state lives above useFileAttachments so image-bearing
+  // snapshots reserve slots against MAX_FILES. Each input mirrors the same
+  // global ContextBus state so two visible inputs always show the same deck.
   // DALTON-HOOK(composer-drafts): the offered unresolved-send copies fold past
   // three — everything stays stored and reachable; the banner just doesn't
   // grow without bound on screen.
@@ -611,10 +648,8 @@ function ChatInput({
       setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
     addWidgetSnapshot(snapshot) {
-      setWidgetSnapshots((prev) => {
-        if (prev.some((s) => s.widget_id === snapshot.widget_id)) return prev;
-        return [...prev, snapshot];
-      });
+      // DALTON-HOOK(chat-attachment-count): reject image-bearing snapshots past MAX_FILES with toast
+      return tryAttachWidgetSnapshot(snapshot);
     },
     setValue(text, commands = []) {
       // Dictation rewrites the draft from what it held when it started.
@@ -667,11 +702,15 @@ function ChatInput({
     holdsSend() {
       return holdsRef.current || holdsStale();
     },
+    getAttachmentCount() {
+      const currentWidgetImages = widgetSnapshotsRef.current.filter((s) => Boolean(s.image_jpeg_data_url)).length;
+      return attachedCountRef.current + currentWidgetImages + externalSlotsRef.current;
+    },
     // DALTON-HOOK(composer-drafts): include setMessage and giveBackDraft from useComposerDraft
     focus() {
       textareaRef.current?.focus();
     },
-  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft]);
+  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening, setMessage, giveBackDraft, tryAttachWidgetSnapshot]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -681,18 +720,18 @@ function ChatInput({
   useEffect(() => {
     const off = ContextBus.subscribe((event) => {
       if (event.type === 'attach') {
-        setWidgetSnapshots((prev) => {
-          if (prev.some((s) => s.widget_id === event.snapshot.widget_id)) return prev;
-          return [...prev, event.snapshot];
-        });
+        return tryAttachWidgetSnapshot(event.snapshot);
       } else if (event.type === 'detach') {
-        setWidgetSnapshots((prev) => prev.filter((s) => s.widget_id !== event.widgetId));
+        // DALTON-HOOK(chat-attachment-count): a rollback (`only`) removes just that snapshot object
+        commitWidgetSnapshots((prev) =>
+          prev.filter((s) => (event.only ? s !== event.only : s.widget_id !== event.widgetId)),
+        );
       } else if (event.type === 'clear') {
-        setWidgetSnapshots([]);
+        commitWidgetSnapshots(() => []);
       }
     });
     return off;
-  }, []);
+  }, [tryAttachWidgetSnapshot, commitWidgetSnapshots]);
 
   // Register this chat input's root element so the global ContextOverflowPill
   // can probe visibility via IntersectionObserver and only show when zero
@@ -894,6 +933,15 @@ function ChatInput({
       return true;
     }
 
+    // DALTON-HOOK(chat-attachment-count): refuse before taking/clearing files if screenshots + files exceed MAX_FILES
+    if (attachedFiles.length + reservedAttachmentSlots > MAX_FILES) {
+      toast({
+        title: t('chat.attachmentsTooMany', { max: MAX_FILES }),
+        variant: 'destructive',
+      });
+      return false;
+    }
+
     const totalBeforeTake = attachedFiles.length;
     const readyAttachments = takeFiles();
     // A file too old to name uploads again, and the send waits for it as for
@@ -955,9 +1003,9 @@ function ChatInput({
     settleAfterSend(textareaRef.current);
     return true;
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
-  }, [hasContent, disabled, filesHold, message, effectiveMarketWatch, draftSubagents, attachedFiles.length, discardFiles, takeFiles, consumeSentFiles, onSend, onAction,
+  }, [hasContent, disabled, filesHold, message, effectiveMarketWatch, draftSubagents, attachedFiles.length, reservedAttachmentSlots, discardFiles, takeFiles, consumeSentFiles, onSend, onAction,
     heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
-    sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
+    sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, toast, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
     holdsRef.current = filesHold;
     sendRef.current = () => {
@@ -1170,7 +1218,7 @@ function ChatInput({
               onRemove={(widgetId) => {
                 // Local + bus: remove from this input AND publish detach so
                 // every other mounted input drops the same card.
-                setWidgetSnapshots((prev) => prev.filter((s) => s.widget_id !== widgetId));
+                commitWidgetSnapshots((prev) => prev.filter((s) => s.widget_id !== widgetId));
                 ContextBus.detach(widgetId);
               }}
               onClear={() => {

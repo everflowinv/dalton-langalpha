@@ -87,6 +87,18 @@ describe('ContextBus', () => {
     expect(a).toHaveBeenCalledTimes(1);
     expect(b).toHaveBeenCalledTimes(1);
   });
+
+  // DALTON-HOOK(chat-attachment-count): attach returns whether subscribers accepted the snapshot
+  it('attach returns false when any subscriber rejects, and rolls back only that snapshot object', () => {
+    const events: { type: string; only?: unknown }[] = [];
+    ContextBus.subscribe((e) => {
+      events.push(e.type === 'detach' ? { type: e.type, only: e.only } : { type: e.type });
+    });
+    ContextBus.subscribe((e) => (e.type === 'attach' ? false : undefined));
+
+    expect(ContextBus.attach(SNAP)).toBe(false);
+    expect(events).toEqual([{ type: 'attach' }, { type: 'detach', only: SNAP }]);
+  });
 });
 
 describe('ChatInputRegistry', () => {
