@@ -9,6 +9,7 @@
       "speed": 3,
       "intelligence": 5,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -35,6 +36,7 @@
       "speed": 3,
       "intelligence": 5,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -61,6 +63,7 @@
       "speed": 2,
       "intelligence": 5,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -85,6 +88,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -109,6 +113,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -133,6 +138,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -157,6 +163,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -181,6 +188,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -205,6 +213,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -229,6 +238,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -253,6 +263,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -277,6 +288,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -301,84 +313,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf",
-        "video"
-      ],
-      "parameters": {
-        "include_thoughts": true,
-        "max_output_tokens": 65536
-      },
-      "reasoning": {
-        "efforts": [
-          "high"
-        ],
-        "default": "high",
-        "write": "parameters.thinking_level"
-      }
-    },
-    "gemini-3.8-flash-low-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "gemini-3.8-flash-low",
-      "provider": "antigravity-oauth",
-      "visible": true,
-      "speed": 5,
-      "intelligence": 3,
-      "context": 1048576,
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf",
-        "video"
-      ],
-      "parameters": {
-        "include_thoughts": true,
-        "max_output_tokens": 65536
-      },
-      "reasoning": {
-        "efforts": [
-          "low"
-        ],
-        "default": "low",
-        "write": "parameters.thinking_level"
-      }
-    },
-    "gemini-3.8-flash-medium-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "gemini-3.8-flash-medium",
-      "provider": "antigravity-oauth",
-      "visible": true,
-      "speed": 5,
-      "intelligence": 3,
-      "context": 1048576,
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf",
-        "video"
-      ],
-      "parameters": {
-        "include_thoughts": true,
-        "max_output_tokens": 65536
-      },
-      "reasoning": {
-        "efforts": [
-          "medium"
-        ],
-        "default": "medium",
-        "write": "parameters.thinking_level"
-      }
-    },
-    "gemini-3.8-flash-high-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "gemini-3.8-flash-high",
-      "provider": "antigravity-oauth",
-      "visible": true,
-      "speed": 4,
-      "intelligence": 4,
-      "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -403,32 +338,6 @@
       "provider": "antigravity-oauth",
       "visible": false,
       "speed": 2,
-      "intelligence": 4,
-      "context": 1048576,
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf",
-        "video"
-      ],
-      "parameters": {
-        "include_thoughts": true,
-        "max_output_tokens": 65536
-      },
-      "reasoning": {
-        "efforts": [
-          "medium"
-        ],
-        "default": "medium",
-        "write": "parameters.thinking_level"
-      }
-    },
-    "gemini-3-flash-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "gemini-3-flash",
-      "provider": "antigravity-oauth",
-      "visible": false,
-      "speed": 4,
       "intelligence": 4,
       "context": 1048576,
       "input_modalities": [
@@ -853,39 +762,6 @@
         "write": "parameters.reasoning.effort"
       }
     },
-    "grok-4.3-oauth": {
-      "model_id": "grok-4.3",
-      "provider": "xai-oauth",
-      "display_name": "Grok 4.3",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 4,
-      "context": 1000000,
-      "supports_reasoning_effort": true,
-      "input_modalities": [
-        "text",
-        "image"
-      ],
-      "parameters": {
-        "max_tokens": 64000,
-        "reasoning": {
-          "summary": "auto"
-        },
-        "include": [
-          "reasoning.encrypted_content"
-        ],
-        "store": false
-      },
-      "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high"
-        ],
-        "default": "high",
-        "write": "parameters.reasoning.effort"
-      }
-    },
     "grok-4.7-build-fast-oauth": {
       "model_id": "grok-4.7-build-fast",
       "provider": "xai-oauth",
@@ -1114,6 +990,7 @@
       "provider": "antigravity-oauth",
       "visible": true,
       "context": 1048576,
+      "compaction_profile": "expansive",
       "input_modalities": [
         "text",
         "image",
@@ -1134,6 +1011,9 @@
     }
   },
   "model_overrides": {
+    "gemini-4-argon": {
+      "compaction_profile": "expansive"
+    },
     "claude-fable-5-2": {
       "reasoning": {
         "default": "high"
@@ -1506,35 +1386,10 @@
       "tool_calling": true,
       "comment": "Subscription cash cost is 0. Gemini 4 Neon became generally available on 2026-11-18 (Gemini API release notes); list price $3 input / $0.15 cached input / $15 output per million tokens, flat across the 1,048,576-token context window; output defaults to 65,536 tokens. Four thinking levels (low, medium, high, xhigh), all listed by the Antigravity subscription on 2026-11-19."
     },
-    "gemini-3.8-flash-low-oauth": {
-      "family": "google-gemini",
-      "billing": "subscription",
-      "notional_ref": "gemini-3.8-flash",
-      "tool_calling": true
-    },
-    "gemini-3.8-flash-medium-oauth": {
-      "family": "google-gemini",
-      "billing": "subscription",
-      "notional_ref": "gemini-3.8-flash",
-      "tool_calling": true
-    },
-    "gemini-3.8-flash-high-oauth": {
-      "family": "google-gemini",
-      "billing": "subscription",
-      "notional_ref": "gemini-3.8-flash",
-      "tool_calling": true
-    },
     "gemini-2.5-pro-oauth": {
       "family": "google-gemini",
       "billing": "subscription",
       "notional_ref": "gemini-3.1-pro-preview",
-      "tool_calling": true,
-      "comment": "Hidden 2026-11-19: the Antigravity subscription no longer lists this model (agy models); kept for old thread references."
-    },
-    "gemini-3-flash-oauth": {
-      "family": "google-gemini",
-      "billing": "subscription",
-      "notional_ref": "gemini-3.8-flash",
       "tool_calling": true,
       "comment": "Hidden 2026-11-19: the Antigravity subscription no longer lists this model (agy models); kept for old thread references."
     },
@@ -1698,13 +1553,6 @@
       "supports_reasoning_effort": true,
       "tool_calling": true
     },
-    "grok-4.3-oauth": {
-      "family": "xai-grok",
-      "billing": "subscription",
-      "notional_ref": "grok-4.3",
-      "supports_reasoning_effort": true,
-      "tool_calling": true
-    },
     "grok-4.7-build-fast-oauth": {
       "family": "xai-grok",
       "billing": "subscription",
@@ -1743,11 +1591,6 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "claude-fable-5-1": {
-      "family": "anthropic-claude",
-      "billing": "cash",
-      "tool_calling": true
-    },
     "claude-fable-5-2": {
       "family": "anthropic-claude",
       "billing": "cash",
@@ -1769,11 +1612,6 @@
       "tool_calling": true
     },
     "gemini-4-argon": {
-      "family": "google-gemini",
-      "billing": "cash",
-      "tool_calling": true
-    },
-    "gemini-3.8-flash": {
       "family": "google-gemini",
       "billing": "cash",
       "tool_calling": true
@@ -1939,12 +1777,6 @@
       "tool_calling": true,
       "notional_ref": "gpt-6-luna"
     },
-    "claude-fable-5-1-oauth": {
-      "family": "anthropic-claude",
-      "billing": "subscription",
-      "tool_calling": true,
-      "notional_ref": "claude-fable-5-1"
-    },
     "claude-fable-5-2-oauth": {
       "family": "anthropic-claude",
       "billing": "subscription",
@@ -1997,6 +1829,10 @@
     }
   },
   "retired": [
+    {
+      "key": "grok-4.3-oauth",
+      "reason": "upstream grok-oauth (api.x.ai) inference not offered; grok-4.3-oauth removed from Dalton catalog"
+    },
     {
       "key": "grok-4.5-oauth",
       "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"

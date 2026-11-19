@@ -22,8 +22,8 @@ NATIVE_OVERLAY_PATH = Path(__file__).resolve().parent / "native_overlay.json"
 # `xai-oauth` provider and the CLI proxy, so for exactly these keys the
 # Dalton overlay's definition replaces the manifest's. Any other name
 # collision remains an error, and the checked-in overlay has the last word:
-# a runtime-sync overlay cannot repoint or drop these two routes.
-PINNED_OVERLAY_MODEL_KEYS = frozenset({"grok-4.7-oauth", "grok-4.3-oauth"})
+# a runtime-sync overlay cannot repoint or drop this route.
+PINNED_OVERLAY_MODEL_KEYS = frozenset({"grok-4.7-oauth"})
 
 # Merge order: checked-in native overlay → runtime native-sync overlay
 # (var/dalton/catalog, written by the settings-page card).
@@ -317,7 +317,7 @@ def _enforce_pinned_overlay_routes(llm_config: dict[str, Any]) -> None:
 
     Runs after every overlay source has merged, so neither an upstream
     same-named manifest entry nor a runtime-sync overlay can leave
-    ``grok-4.7-oauth`` / ``grok-4.3-oauth`` pointing anywhere but Dalton's
+    ``grok-4.7-oauth`` pointing anywhere but Dalton's
     ``xai-oauth`` line (DALTON-HOOK(llm-overlay)).
     """
     native = load_overlay_data(NATIVE_OVERLAY_PATH) or {}

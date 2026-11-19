@@ -43,8 +43,9 @@ def test_native_overlay_does_not_collide_with_upstream():
 
     native_models = native.get("models") or {}
     # DALTON-HOOK(llm-overlay): claude-fable-5-2 and claude-fable-5-2-oauth graduated into upstream #751;
-    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high,xhigh}-oauth added (38 + 4 = 42).
-    assert len(native_models) == 42
+    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high,xhigh}-oauth added (42),
+    # gemini-3.8-flash-{low,medium,high}-oauth, gemini-3-flash-oauth, and grok-4.3-oauth removed (42 - 5 = 37).
+    assert len(native_models) == 37
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -57,10 +58,10 @@ def test_native_overlay_does_not_collide_with_upstream():
 
 
 def test_grok_oauth_keys_pinned_to_dalton_xai_line():
-    """grok-4.7-oauth / grok-4.3-oauth resolve to Dalton's xai-oauth + CLI
+    """grok-4.7-oauth resolves to Dalton's xai-oauth + CLI
     proxy with subscription billing, never to upstream's grok-oauth line."""
     mc = ModelConfig()
-    for key in ("grok-4.7-oauth", "grok-4.3-oauth"):
+    for key in ("grok-4.7-oauth",):
         entry = mc.get_model_config(key)
         assert entry is not None, f"{key} missing from merged config"
         assert entry.get("provider") == "xai-oauth", f"{key} provider={entry.get('provider')!r}"
@@ -74,13 +75,13 @@ def test_grok_oauth_keys_pinned_to_dalton_xai_line():
 
 def test_upstream_grok_oauth_models_hidden_in_dalton():
     """Upstream's grok-oauth (api.x.ai) models are retired for Dalton via the
-    checked-in overlay: the three keys the manifest grew resolve to nothing,
-    while the two pinned keys keep riding the xai-oauth line."""
+    checked-in overlay: the four keys the manifest grew resolve to nothing,
+    while the pinned key keeps riding the xai-oauth line."""
     mc = ModelConfig()
-    for key in ("grok-4.5-oauth", "grok-4.6-oauth", "grok-build-oauth"):
+    for key in ("grok-4.3-oauth", "grok-4.5-oauth", "grok-4.6-oauth", "grok-build-oauth"):
         assert mc.get_model_config(key) is None, f"{key} should be retired for Dalton"
-    # The pinned keys are untouched by the retirement.
-    for key in ("grok-4.7-oauth", "grok-4.3-oauth"):
+    # The pinned key is untouched by the retirement.
+    for key in ("grok-4.7-oauth",):
         entry = mc.get_model_config(key)
         assert entry is not None and entry.get("provider") == "xai-oauth", key
     # The cash xAI models upstream also carries stay (same provider, BYOK).
@@ -90,7 +91,7 @@ def test_upstream_grok_oauth_models_hidden_in_dalton():
 def test_grok_pin_enforced_over_hostile_entries():
     """Whatever else pre-seeds the merged config (an upstream same-named entry
     or a hostile runtime overlay), the checked-in native overlay has the last
-    word on the pinned keys."""
+    word on the pinned keys and drops retired grok-oauth entries."""
     llm_config: dict[str, Any] = {
         "grok-4.7-oauth": {"provider": "grok-oauth", "model_id": "grok-4.7"},
         "grok-4.3-oauth": {"provider": "grok-oauth", "model_id": "grok-4.3"},
@@ -98,6 +99,7 @@ def test_grok_pin_enforced_over_hostile_entries():
     apply_model_overlay(llm_config, {})
     for key in PINNED_OVERLAY_MODEL_KEYS:
         assert llm_config[key].get("provider") == "xai-oauth", f"{key} was repointed"
+    assert "grok-4.3-oauth" not in llm_config
 
 
 def test_every_native_overlay_model_resolves_provider_and_pricing_or_notional():
@@ -151,10 +153,10 @@ def test_collision_is_logged_and_ignored(caplog):
 
 
 def test_build_antigravity_and_muse_clients_with_session_headers():
-    ag_llm = LLM("gemini-3.8-flash-low-oauth", api_key="fake-ag-token")
+    ag_llm = LLM("gemini-4-hydrogen-low-oauth", api_key="fake-ag-token")
     ag_client = build_dalton_client(ag_llm, cache_key="thread-123")
     assert isinstance(ag_client, ChatAntigravity)
-    assert ag_client.model == "gemini-3.8-flash-low"
+    assert ag_client.model == "gemini-4-hydrogen-low"
 
     muse_llm = LLM("muse-spark-1.3-oauth", api_key="fake-muse-token")
     muse_client = build_dalton_client(muse_llm, cache_key="thread-123")
@@ -192,7 +194,7 @@ def test_provider_kill_switch(monkeypatch):
 
 
 def test_antigravity_signatures_cleared_per_turn_and_reasoning_not_doubled():
-    client = ChatAntigravity(model="gemini-3.8-flash-low", api_key="fake")
+    client = ChatAntigravity(model="gemini-4-hydrogen-low", api_key="fake")
     frame = {
         "response": {
             "candidates": [
@@ -1938,3 +1940,150 @@ def test_gemini_4_neon_overlay_generally_available_and_notional_pricing(monkeypa
             "output": 15.0,
             "cached_input": 0.15,
         }
+
+
+@pytest.mark.asyncio
+async def test_removed_models_absent_and_visible_subscriptions_have_notional_prices(monkeypatch):
+    """The Gemini 3.8 Flash / Grok 4.3 / Claude Fable 5.1 keys Dalton defined are
+    absent from the merged catalog, available-models, and preference validation
+    (the upstream API entries leave with the upstream sync);
+    every visible subscription model resolves a notional price except the two
+    documented upstream pricing gaps."""
+    # The operator kill switch must not decide what this test sees.
+    monkeypatch.setenv("DALTON_DISABLED_PROVIDERS", "")
+
+    from unittest.mock import create_autospec
+
+    from src.dalton.llm.model_prefs import validate_dalton_model_preferences
+    from src.dalton.llm.notional_pricing import (
+        build_notional_price_index,
+        is_subscription_model,
+    )
+    from src.dalton.services.provider_status import get_available_models_report
+    from src.llms.preferences import TuningError
+    from src.server.database import api_keys as api_keys_db
+    from src.server.database import oauth_tokens as oauth_tokens_db
+
+    removed_overlay_keys = {
+        "gemini-3.8-flash-low-oauth",
+        "gemini-3.8-flash-medium-oauth",
+        "gemini-3.8-flash-high-oauth",
+        "gemini-3-flash-oauth",
+        "gemini-3.8-flash",
+        "grok-4.3-oauth",
+        "claude-fable-5-1-oauth",
+        "claude-fable-5-1",
+    }
+
+    native = load_overlay_data(NATIVE_OVERLAY_PATH) or {}
+    native_models = native.get("models") or {}
+    native_overrides = native.get("model_overrides") or {}
+    meta = load_dalton_meta()
+
+    for key in removed_overlay_keys:
+        assert key not in native_models, f"{key} still in native_overlay.json models"
+        assert key not in native_overrides, f"{key} still in native_overlay.json model_overrides"
+        assert key not in meta, f"{key} still in load_dalton_meta()"
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    # The API-key entries gemini-3.8-flash and grok-4.3 belong to the upstream
+    # manifest, which retires them itself in the next sync (sync 6 batches 3
+    # and 4); retiring them here would break upstream's own manifest checks.
+    removed_merged_prefixes = ("gemini-3.8-flash-", "claude-fable-5-1")
+    for key in mc.llm_config:
+        assert not key.startswith(removed_merged_prefixes), f"{key} still in merged catalog"
+        assert key not in ("gemini-3-flash-oauth", "grok-4.3-oauth")
+
+    removed_keys = (
+        "gemini-3.8-flash-low-oauth",
+        "gemini-3.8-flash-medium-oauth",
+        "gemini-3.8-flash-high-oauth",
+        "gemini-3-flash-oauth",
+        "grok-4.3-oauth",
+        "claude-fable-5-1",
+        "claude-fable-5-1-oauth",
+    )
+    for key in removed_keys:
+        assert mc.get_model_config(key) is None, f"{key} still resolves in ModelConfig"
+        with pytest.raises(TuningError, match="不在系统模型目录中"):
+            validate_dalton_model_preferences({"dalton_assist_model": key})
+
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gemini-key")
+    monkeypatch.setenv("XAI_API_KEY", "fake-xai-key")
+    monkeypatch.setattr(
+        oauth_tokens_db,
+        "get_oauth_connection",
+        create_autospec(
+            oauth_tokens_db.get_oauth_connection,
+            return_value={"status": "connected"},
+        ),
+    )
+    monkeypatch.setattr(
+        api_keys_db,
+        "get_user_api_keys",
+        create_autospec(
+            api_keys_db.get_user_api_keys,
+            return_value={
+                "byok_enabled": True,
+                "keys": {"gemini": "k-gem", "xai": "k-xai", "anthropic": "k-ant"},
+                "base_urls": {},
+            },
+        ),
+    )
+    avail = await get_available_models_report(user_id="test-user")
+    assert "gemini-4-argon" in avail["available_keys"]
+    for key in removed_keys:
+        assert key not in avail["available_keys"], f"{key} in available_keys"
+        assert key not in avail["models"], f"{key} in available models report"
+    for key in avail["models"]:
+        assert not key.startswith(removed_merged_prefixes), f"{key} in available models report"
+        assert key not in ("gemini-3-flash-oauth", "grok-4.3-oauth"), f"{key} in available models report"
+
+    # Known gaps: neither has an upstream cash pricing card in providers.json or an inline
+    # notional_pricing / fallback card yet.
+    known_notional_gaps = {
+        # codex-oauth has no cash pricing card for gpt-5.3-codex-spark in providers.json.
+        "gpt-5.3-codex-spark-oauth",
+        # notional_ref points to gpt-oss-120b-groq, which has no entry in providers.json.
+        "gpt-oss-120b-medium-oauth",
+    }
+
+    idx = build_notional_price_index()
+    missing: set[str] = set()
+    for key, entry in mc.listed_models():
+        provider = str(entry.get("provider") or "")
+        pinfo = mc.get_provider_info(provider)
+        billing_type = "oauth" if pinfo.get("access_type") == "oauth" else ""
+        if is_subscription_model(
+            key,
+            billing_type,
+            pricing_model_id=entry.get("model_id"),
+            pricing_provider=provider,
+        ):
+            if key not in idx:
+                missing.add(key)
+
+    assert missing == known_notional_gaps
+
+
+def test_gemini_4_overlay_models_default_to_expansive_compaction_and_user_pref_overrides(monkeypatch):
+    """Every gemini-4-* entry in the merged catalog (upstream API + overlay OAuth)
+    defaults to `expansive` compaction, while account-level user tuning still overrides it."""
+    from src.llms.preferences import compaction_profile_for, resolve_tuning
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    gemini4_keys = [k for k in mc.llm_config if k.startswith("gemini-4-")]
+    # No fixed count: an upstream sync that adds gemini-4-* API entries must
+    # give them the same default (overlay model_overrides), and fails here if not.
+    assert "gemini-4-argon" in gemini4_keys
+
+    for key in gemini4_keys:
+        entry = mc.get_model_config(key)
+        assert entry is not None, key
+        assert compaction_profile_for(entry) == "expansive", key
+        assert mc.get_compaction_profile(key) == "expansive", key
+        assert resolve_tuning({"compaction_profile": "moderate"}, key).compaction_profile == "moderate"
+
+

@@ -1401,7 +1401,7 @@ async def test_b12_saved_empty_fallback_list_never_falls_back_to_system_defaults
 
 
 def test_b12_grok_oauth_display_name_unified_and_pinned_routing_by_key() -> None:
-    """grok-4.7-oauth and grok-4.3-oauth drop (OAuth) suffix in display_name while staying pinned to xai-oauth."""
+    """grok-4.7-oauth drops (OAuth) suffix in display_name while staying pinned to xai-oauth."""
     from src.dalton.llm.overlay import PINNED_OVERLAY_MODEL_KEYS, load_dalton_meta
     from src.llms.llm import LLM
 
@@ -1409,10 +1409,9 @@ def test_b12_grok_oauth_display_name_unified_and_pinned_routing_by_key() -> None
     all_meta = load_dalton_meta()
     for key, expected_display in (
         ("grok-4.7-oauth", "Grok 4.7"),
-        ("grok-4.3-oauth", "Grok 4.3"),
         ("grok-4.7-build-fast-oauth", "Grok 4.7 Build Fast"),
     ):
-        if key in ("grok-4.7-oauth", "grok-4.3-oauth"):
+        if key == "grok-4.7-oauth":
             assert key in PINNED_OVERLAY_MODEL_KEYS
         cfg = mc.get_model_config(key)
         assert cfg is not None

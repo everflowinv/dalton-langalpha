@@ -63,22 +63,22 @@ models:
   disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
   # Single source of truth for Dalton auxiliary task (assist) model defaults
   # (agent_config.dalton.yaml no longer defines llm.assist).
-  assist_model: "gemini-3.8-flash-low-oauth"
+  assist_model: "gemini-4-hydrogen-low-oauth"
   # Must sit outside every reviewer family (role_policy L20), hence not Gemini/GPT/Grok/Claude.
   assist_fallback_model:
     - "deepseek-flash"
   probe_models:
     claude-oauth: "claude-sonnet-5-5-oauth"
     codex-oauth: "gpt-6.2-sol-oauth"
-    antigravity-oauth: "gemini-3.8-flash-low-oauth"
+    antigravity-oauth: "gemini-4-hydrogen-low-oauth"
     muse-oauth: "muse-spark-1.3-oauth"
     xai-oauth: "grok-4.7-oauth"
     z-ai-cn-coding: "glm-5.3-flash-plan"
-    xai: "grok-4.3"
+    xai: "grok-4.7"
     deepseek: "deepseek-flash"
     z-ai: "glm-5.3-flash"
     openai: "gpt-6-luna"
-    gemini: "gemini-3-flash"
+    gemini: "gemini-4-argon"
 
 budget:
   # Default daily cap USD when user has not saved a DB row yet (null = fail-closed,
