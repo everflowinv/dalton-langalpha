@@ -2,6 +2,17 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { homedir } from "node:os";
@@ -99,6 +110,167 @@ function jwtPayload(token) {
 // Token 只随 webview 子进程的 additionalArguments 下发，主窗口 renderer 上没有。
 // App 里没有打开任何模块页时，ps 里一个 --alphaclaw-token= 都不会有，此时登录态其实是好的。
 const APP_EXECUTABLE = "/Applications/AlphaEngine.app/Contents/MacOS/AlphaEngine";
+const KEYCHAIN_SERVICE = process.env.ALPHAENGINE_KEYCHAIN_SERVICE || "dalton-alphaengine";
+const KEYCHAIN_ACCOUNT_RE = /^[A-Za-z0-9._:@-]{1,128}$/;
+const SECURITY_CLI_TIMEOUT_MS = 5000;
+const MAX_SECURITY_INTERACTIVE_BYTES = 4000;
+const DEFAULT_QUOTA_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const EXPIRY_ALERT_WINDOW_SECONDS = 3 * 24 * 60 * 60;
+const EXPIRY_ALERT_GRACE_SECONDS = 7 * 24 * 60 * 60;
+const GATEWAY_ENV_FILE = process.env.DALTON_CHANNEL_GATEWAY_ENV_FILE || path.join(homedir(), ".config", "dalton", "channel-gateway.env");
+const GATEWAY_OPS_ALERTS_URL = process.env.DALTON_OPS_ALERTS_URL || "http://127.0.0.1:8962/internal/ops-alerts";
+const SENSITIVE_KEY_RE = /(?:token|authorization|cookie|password|passcode|secret)/i;
+
+const ENDPOINT_QUOTA_RULES = [
+  { match: "prefix", pattern: "/summary/detail/", quotaType: "read" },
+  { match: "prefix", pattern: "/summary/private/detail/", quotaType: "read" },
+  { match: "prefix", pattern: "/summary/attachment/list/", quotaType: "read" },
+  { match: "exact", pattern: "/summary/doc/base", quotaType: "read" },
+  { match: "exact", pattern: "/summary/search/list/new", quotaType: "search" },
+  { match: "exact", pattern: "/summary/search/category", quotaType: "search" },
+  { match: "exact", pattern: "/summary/search/booked/list", quotaType: "search" },
+  { match: "exact", pattern: "/summary/search/booked/count/list", quotaType: "search" },
+  { match: "exact", pattern: "/summary/search/booked/preview", quotaType: "search" },
+  { match: "prefix", pattern: "/summary/search/reservation/info/", quotaType: "search" },
+  { match: "exact", pattern: "/summary/institution/list", quotaType: "search" },
+  { match: "prefix", pattern: "/summary/type/list/", quotaType: "search" },
+  { match: "exact", pattern: "/summary/industry/list", quotaType: "search" },
+  { match: "exact", pattern: "/api/v1/kmpadmin/dic/company/list", quotaType: "search" },
+  { match: "exact", pattern: "/api/v1/kmpstock/stock/self/group/list", quotaType: "search" },
+  { match: "prefix", pattern: "/api/v1/kmpstock/stock/self/stock/list/all", quotaType: "search" },
+  { match: "exact", pattern: "/region/list", quotaType: "search" },
+];
+
+function defaultLogWarning(message) {
+  process.stderr.write(`${redactSecrets(String(message || ""))}\n`);
+}
+
+function resolveEndpointQuotaType(apiPath, logWarning = defaultLogWarning) {
+  const pathname = String(apiPath || "").split("?")[0];
+  for (const rule of ENDPOINT_QUOTA_RULES) {
+    if (rule.match === "exact" && pathname === rule.pattern) return rule.quotaType;
+    if (rule.match === "prefix" && pathname.startsWith(rule.pattern)) return rule.quotaType;
+  }
+  logWarning(`[alphaengine-mcp] unmapped endpoint "${pathname}", defaulting quotaType to "search"`);
+  return "search";
+}
+
+function defaultAccountsStateFile() {
+  if (process.env.ALPHAENGINE_ACCOUNTS_STATE_FILE) {
+    return path.resolve(process.env.ALPHAENGINE_ACCOUNTS_STATE_FILE);
+  }
+  const cacheDir = process.env.DALTON_BRIDGE_CACHE_DIR
+    ? path.resolve(process.env.DALTON_BRIDGE_CACHE_DIR)
+    : process.env.DALTON_ALPHAENGINE_CACHE_DB
+      ? path.dirname(path.resolve(process.env.DALTON_ALPHAENGINE_CACHE_DB))
+      : path.join(homedir(), "Library", "Caches", "dalton-researchdata-bridge");
+  return path.join(cacheDir, "alphaengine_accounts_state.json");
+}
+
+function resolveQuotaCooldownMs(overrideMs) {
+  if (Number.isFinite(overrideMs) && overrideMs >= 0) return overrideMs;
+  const rawSeconds = process.env.ALPHAENGINE_QUOTA_COOLDOWN_SECONDS;
+  if (rawSeconds !== undefined && rawSeconds !== "") {
+    const parsed = Number(rawSeconds);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed * 1000;
+  }
+  return DEFAULT_QUOTA_COOLDOWN_MS;
+}
+
+function extractPhoneLast4(bundle, payload) {
+  const rawPhone =
+    payload?.mobile ??
+    payload?.phone ??
+    payload?.phone_number ??
+    payload?.telephone ??
+    bundle?.mobile ??
+    bundle?.phone ??
+    null;
+  if (rawPhone === null || rawPhone === undefined) return null;
+  const digits = String(rawPhone).replace(/\D/g, "");
+  return digits.length >= 4 ? digits.slice(-4) : null;
+}
+
+function extractNickname(bundle, payload) {
+  for (const candidate of [
+    payload?.nickname,
+    payload?.name,
+    payload?.nick_name,
+    payload?.nickName,
+    bundle?.nickname,
+    bundle?.name,
+  ]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return null;
+}
+
+function extractAccountProfile(bundle, payload = jwtPayload(bundle?.token || "")) {
+  const rawUserId = bundle?.user_id ?? bundle?.userId ?? payload?.user_id ?? payload?.sub ?? payload?.id ?? "";
+  const userId = String(rawUserId).trim();
+  return {
+    token: bundle?.token || "",
+    refreshToken: bundle?.refresh_token ?? bundle?.refreshToken ?? null,
+    exp: Number(payload?.exp || bundle?.exp || 0),
+    userId,
+    nickname: extractNickname(bundle, payload),
+    phoneLast4: extractPhoneLast4(bundle, payload),
+  };
+}
+
+function accountDisplayLabel(account) {
+  if (account?.nickname) return account.nickname;
+  if (account?.phoneLast4) return `尾号${account.phoneLast4}`;
+  return `账号${account?.userId || "unknown"}`;
+}
+
+function redactSecrets(text, secrets = []) {
+  let out = String(text || "");
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret.length >= 8) {
+      out = out.split(secret).join("[REDACTED]");
+    }
+  }
+  out = out.replace(/Bearer\s+[^\s"',}]+/gi, "Bearer [REDACTED]");
+  out = out.replace(/--alphaclaw-token=[^\s"',}]+/gi, "--alphaclaw-token=[REDACTED]");
+  out = out.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g, "[REDACTED]");
+  out = out.replace(
+    /("(?:refresh_?token|access_?token|token|authorization|cookie|password|passcode|secret)"\s*:\s*)"[^"]*"/gi,
+    '$1"[REDACTED]"',
+  );
+  return out;
+}
+
+function sanitizeErrorValue(value, secrets = [], seen = new WeakSet()) {
+  if (typeof value === "string") return redactSecrets(value, secrets);
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return "[Circular]";
+    seen.add(value);
+    return value.map((item) => sanitizeErrorValue(item, secrets, seen));
+  }
+  if (value && typeof value === "object") {
+    if (seen.has(value)) return "[Circular]";
+    seen.add(value);
+    const out = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (SENSITIVE_KEY_RE.test(key)) {
+        out[key] = "[REDACTED]";
+      } else {
+        out[key] = sanitizeErrorValue(child, secrets, seen);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function formatSanitizedErrorSnippet(parsed, secrets = [], maxChars = 600) {
+  const sanitized = sanitizeErrorValue(parsed, secrets);
+  const serialized = typeof sanitized === "string" ? sanitized : JSON.stringify(sanitized);
+  return redactSecrets(serialized, secrets).slice(0, maxChars);
+}
 
 function desktopProcessSnapshot() {
   const commands = execFileSync("ps", ["-axo", "command="], { encoding: "utf8" });
@@ -112,8 +284,8 @@ function desktopProcessSnapshot() {
     try {
       const bundle = decodeJsonBase64Url(match[1]);
       if (!bundle.token) continue;
-      const payload = jwtPayload(bundle.token);
-      candidates.push({ token: bundle.token, exp: Number(payload.exp || 0), userId: bundle.user_id });
+      const profile = extractAccountProfile(bundle);
+      candidates.push(profile);
     } catch {
       // Ignore stale or malformed renderer processes.
     }
@@ -122,8 +294,323 @@ function desktopProcessSnapshot() {
   return { appRunning, candidates };
 }
 
-function desktopTokenCandidates() {
-  return desktopProcessSnapshot().candidates;
+function isValidKeychainAccount(userId) {
+  return typeof userId === "string" && KEYCHAIN_ACCOUNT_RE.test(userId);
+}
+
+function quoteSecurityInteractiveArg(value) {
+  const str = String(value ?? "");
+  if (/[\r\n\0]/.test(str)) {
+    throw new Error("E_KEYCHAIN_INVALID_ARG: invalid control character");
+  }
+  if (/^[A-Za-z0-9._:@-]+$/.test(str)) return str;
+  return `"${str.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function defaultRunSecurity(args, input, timeoutMs = SECURITY_CLI_TIMEOUT_MS) {
+  return execFileSync("security", args, {
+    ...(input !== undefined ? { input } : {}),
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: timeoutMs,
+  });
+}
+
+function isSecurityTimeoutError(err) {
+  return err?.code === "ETIMEDOUT" || Boolean(err?.killed && err?.signal === "SIGTERM");
+}
+
+function createMacOsKeychain({
+  service = KEYCHAIN_SERVICE,
+  timeoutMs = SECURITY_CLI_TIMEOUT_MS,
+  runSecurity = defaultRunSecurity,
+  logWarning = defaultLogWarning,
+} = {}) {
+  return {
+    save(userId, bundle) {
+      const account = String(userId || "").trim();
+      if (!bundle?.token) return false;
+      if (!isValidKeychainAccount(account)) {
+        logWarning("[alphaengine-mcp] skipped saving keychain item: invalid user_id format");
+        return false;
+      }
+      const payload = JSON.stringify({
+        token: bundle.token,
+        user_id: account,
+        exp: Number(bundle.exp || 0),
+      });
+      const encoded = Buffer.from(payload, "utf8").toString("base64");
+      // Pass command via stdin to `security -i` so tokens never appear in process argv.
+      const command = `add-generic-password -U -a ${quoteSecurityInteractiveArg(account)} -s ${quoteSecurityInteractiveArg(service)} -w ${encoded}\n`;
+      const commandBytes = Buffer.byteLength(command, "utf8");
+      if (commandBytes > MAX_SECURITY_INTERACTIVE_BYTES) {
+        logWarning(
+          `[alphaengine-mcp] skipped saving keychain item for user ${account}: security -i command (${commandBytes} bytes) exceeds ${MAX_SECURITY_INTERACTIVE_BYTES}-byte limit`,
+        );
+        return false;
+      }
+      try {
+        runSecurity(["-i"], command, timeoutMs);
+        return true;
+      } catch (err) {
+        const reason = isSecurityTimeoutError(err) ? "timeout" : err?.code || "error";
+        logWarning(`[alphaengine-mcp] keychain save failed (${reason}) for user ${account}`);
+        return false;
+      }
+    },
+    load(userId) {
+      const account = String(userId || "").trim();
+      if (!isValidKeychainAccount(account)) return null;
+      try {
+        const raw = String(
+          runSecurity(["find-generic-password", "-s", service, "-a", account, "-w"], undefined, timeoutMs) || "",
+        ).trim();
+        if (!raw) return null;
+        let jsonText = raw;
+        if (!raw.startsWith("{")) {
+          const base64Decoded = Buffer.from(raw, "base64").toString("utf8");
+          if (base64Decoded.trim().startsWith("{")) {
+            jsonText = base64Decoded;
+          } else if (/^[0-9a-fA-F]+$/.test(raw) && raw.length % 2 === 0) {
+            jsonText = Buffer.from(raw, "hex").toString("utf8");
+          }
+        }
+        const parsed = JSON.parse(jsonText);
+        if (!parsed?.token) return null;
+        return extractAccountProfile({
+          token: parsed.token,
+          user_id: parsed.user_id ?? account,
+          exp: parsed.exp,
+        });
+      } catch (err) {
+        if (isSecurityTimeoutError(err)) {
+          logWarning(`[alphaengine-mcp] keychain load timed out for user ${account}`);
+        }
+        return null;
+      }
+    },
+  };
+}
+
+function readGatewayServiceToken(envFile = GATEWAY_ENV_FILE) {
+  try {
+    const raw = readFileSync(envFile, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      if (!trimmed.startsWith("INTERNAL_SERVICE_TOKEN=")) continue;
+      return trimmed.slice("INTERNAL_SERVICE_TOKEN=".length).trim().replace(/^["']|["']$/g, "");
+    }
+  } catch {
+    // Missing or unreadable env file degrades gracefully.
+  }
+  return "";
+}
+
+async function sendDefaultOpsAlert({ code, detail, gatewayUrl = GATEWAY_OPS_ALERTS_URL, envFile = GATEWAY_ENV_FILE, timeoutMs = 3000 }) {
+  const serviceToken = readGatewayServiceToken(envFile);
+  if (!serviceToken) return { ok: false, outcome: "failed" };
+  try {
+    const response = await fetch(gatewayUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Service-Token": serviceToken,
+      },
+      body: JSON.stringify({ code, detail }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (response.ok) return { ok: true, outcome: "sent" };
+    // Partial delivery (HTTP 502 with at least one ok: true target) must NOT be retried globally.
+    try {
+      const payload = await response.json();
+      if (payload?.any_succeeded === true) return { ok: true, outcome: "sent" };
+      if (Array.isArray(payload?.results) && payload.results.some((r) => r?.ok === true)) {
+        return { ok: true, outcome: "sent" };
+      }
+    } catch {
+      // Non-JSON error response counts as failed delivery.
+    }
+    return { ok: false, outcome: "failed" };
+  } catch (err) {
+    if (err?.name === "TimeoutError" || err?.name === "AbortError" || err?.code === "ETIMEDOUT") {
+      return { ok: false, outcome: "uncertain" };
+    }
+    return { ok: false, outcome: "failed" };
+  }
+}
+
+function shanghaiDateKey(nowMs) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(nowMs));
+}
+
+function sanitizeQuotaBucket(raw) {
+  return {
+    exhausted_at: typeof raw?.exhausted_at === "string" && raw.exhausted_at ? raw.exhausted_at : null,
+  };
+}
+
+function sanitizeAccountRecord(userId, raw) {
+  return {
+    user_id: String(userId),
+    nickname: typeof raw?.nickname === "string" && raw.nickname.trim() ? raw.nickname.trim() : null,
+    phone_last4: typeof raw?.phone_last4 === "string" && /^\d{4}$/.test(raw.phone_last4) ? raw.phone_last4 : null,
+    exp: Number.isFinite(Number(raw?.exp)) ? Number(raw.exp) : 0,
+    updated_at: typeof raw?.updated_at === "string" && raw.updated_at ? raw.updated_at : null,
+    quota: {
+      search: sanitizeQuotaBucket(raw?.quota?.search),
+      read: sanitizeQuotaBucket(raw?.quota?.read),
+    },
+    last_expiry_alert_date:
+      typeof raw?.last_expiry_alert_date === "string" && raw.last_expiry_alert_date
+        ? raw.last_expiry_alert_date
+        : null,
+  };
+}
+
+const UNAMBIGUOUS_QUOTA_PHRASES = [
+  "额度已达上限",
+  "额度不足",
+  "超出额度",
+  "额度已用完",
+  "额度用尽",
+  "配额已达上限",
+  "配额已用完",
+  "频率限制",
+  "频率上限",
+  "频率过高",
+  "请求过于频繁",
+  "超出频率",
+];
+
+// Upstream fields are read as numbers only when they are primitives: an object
+// field in a malformed body must not throw and hide the rest of the body.
+function primitiveNumber(v) {
+  return typeof v === "number" || typeof v === "string" ? Number(v) || 0 : 0;
+}
+
+// The first present status code wins, as `a || b` did before (a "0" string
+// counts as present), skipping only non-primitive fields.
+function firstStatusCode(...values) {
+  const v = values.find((x) => (typeof x === "number" || typeof x === "string") && x);
+  return primitiveNumber(v);
+}
+
+// Never throws: a malformed upstream body must not replace the original error
+// with a TypeError, so anything unexpected classifies as "none".
+function classifyUpstreamError(errorOrInfo) {
+  try {
+    return classifyUpstreamErrorUnsafe(errorOrInfo);
+  } catch {
+    return "none";
+  }
+}
+
+function classifyUpstreamErrorUnsafe(errorOrInfo) {
+  if (!errorOrInfo) return "none";
+  const httpStatus =
+    typeof errorOrInfo.httpStatus === "number" || typeof errorOrInfo.httpStatus === "string"
+      ? Number(errorOrInfo.httpStatus) || 0
+      : 0;
+  const body =
+    errorOrInfo.upstreamBody && typeof errorOrInfo.upstreamBody === "object"
+      ? errorOrInfo.upstreamBody
+      : null;
+
+  if (body) {
+    const nestedErr = body.error && typeof body.error === "object" ? body.error : null;
+    const statusCode = firstStatusCode(body.status_code, nestedErr?.status_code);
+    const codeTokens = [
+      body.status,
+      body.error_code,
+      body.code,
+      nestedErr?.status,
+      nestedErr?.error_code,
+      nestedErr?.code,
+    ]
+      // Primitives only: an object field (malformed body) is skipped, not
+      // converted, so it cannot hide the rest of the body's signals.
+      .filter((v) => typeof v === "string" || typeof v === "number")
+      .map((v) => String(v).trim().toLowerCase())
+      .filter(Boolean);
+
+    const msgFields = [
+      body.message,
+      body.msg,
+      typeof body.error === "string" ? body.error : null,
+      nestedErr?.message,
+      nestedErr?.msg,
+    ]
+      .filter((v) => typeof v === "string" && v.trim())
+      .map((v) => v.trim());
+    const msgText = msgFields.join(" ");
+    const msgLower = msgText.toLowerCase();
+
+    if (
+      codeTokens.some((c) => c === "invalid_arguments" || c.startsWith("e_bad_")) ||
+      /^(?:e_bad_[a-z0-9_]*|e_query_sort|e_scope_conflict|e_cursor_[a-z0-9_]*|e_source_not_resolved)\b/i.test(
+        msgText,
+      ) ||
+      msgText.includes("参数错误")
+    ) {
+      return "none";
+    }
+
+    if (
+      httpStatus === 429 ||
+      statusCode === 429 ||
+      codeTokens.some((c) => c === "quota_exceeded" || c === "rate_limited")
+    ) {
+      return "quota";
+    }
+
+    if (msgText.includes("无查看权限或额度已达上限")) {
+      return "ambiguous_retry";
+    }
+
+    if (
+      /\btoo many requests\b/i.test(msgLower) ||
+      UNAMBIGUOUS_QUOTA_PHRASES.some((phrase) => msgText.includes(phrase))
+    ) {
+      return "quota";
+    }
+
+    return "none";
+  }
+
+  // Fallback for synthetic Error/string without structured upstreamBody.
+  const text = String(typeof errorOrInfo === "string" ? errorOrInfo : errorOrInfo.message || "").trim();
+  const lower = text.toLowerCase();
+  if (
+    /^(?:e_bad_[a-z0-9_]*|e_query_sort|e_scope_conflict|e_cursor_[a-z0-9_]*|e_source_not_resolved)\b/i.test(
+      text,
+    ) ||
+    text.includes("参数错误")
+  ) {
+    return "none";
+  }
+  if (httpStatus === 429 || /^E_UPSTREAM_HTTP:\s*HTTP\s+429\b/i.test(text)) {
+    return "quota";
+  }
+  if (text.includes("无查看权限或额度已达上限")) {
+    return "ambiguous_retry";
+  }
+  if (
+    /\b(?:quota_exceeded|rate_limited|too many requests)\b/i.test(lower) ||
+    UNAMBIGUOUS_QUOTA_PHRASES.some((phrase) => text.includes(phrase))
+  ) {
+    return "quota";
+  }
+  return "none";
+}
+
+function isQuotaOrRateLimitError(errorOrInfo) {
+  return classifyUpstreamError(errorOrInfo) === "quota";
 }
 
 const DESKTOP_STATUS = {
@@ -148,27 +635,635 @@ const DESKTOP_STATUS = {
   },
 };
 
-function desktopStatus() {
-  const { appRunning, candidates } = desktopProcessSnapshot();
-  const now = Math.floor(Date.now() / 1000);
-  const valid = candidates.find((candidate) => candidate.exp > now + 30);
-  if (valid) return { ...DESKTOP_STATUS.ready, appRunning, candidates, valid, now };
-  const key = !appRunning ? "app_not_running" : candidates.length === 0 ? "no_module_page" : "token_expired";
-  return { ...DESKTOP_STATUS[key], appRunning, candidates, valid: null, now };
+function createAccountManager({
+  stateFile = defaultAccountsStateFile(),
+  cooldownMs,
+  nowMs = () => Date.now(),
+  readDesktopSnapshot = desktopProcessSnapshot,
+  keychain,
+  sendOpsAlert = sendDefaultOpsAlert,
+  logWarning = defaultLogWarning,
+} = {}) {
+  const effectiveCooldownMs = resolveQuotaCooldownMs(cooldownMs);
+  const effectiveKeychain = keychain || createMacOsKeychain({ logWarning });
+  const inFlightAlerts = new Set();
+  const ephemeralSecrets = new Set();
+  let memoryState = { version: 1, last_used_user_id: null, accounts: {} };
+  const memoryClearMap = {};
+  let warnedStateWriteFailure = false;
+  let warnedMarkerDirFailure = false;
+
+  function parseIsoMs(value) {
+    if (typeof value !== "string" || !value) return null;
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  function mergeQuotaBucket(diskBucket, incBucket, clearCutoffMs) {
+    let diskMs = parseIsoMs(diskBucket?.exhausted_at);
+    let incMs = parseIsoMs(incBucket?.exhausted_at);
+    // A success that started after a mark proves it stale, whichever copy
+    // (disk, or a state loaded before the clear) still carries it.
+    if (Number.isFinite(clearCutoffMs)) {
+      if (diskMs !== null && diskMs < clearCutoffMs) diskMs = null;
+      if (incMs !== null && incMs < clearCutoffMs) incMs = null;
+    }
+    if (diskMs === null && incMs === null) return { exhausted_at: null };
+    if (diskMs === null) return { exhausted_at: new Date(incMs).toISOString() };
+    if (incMs === null) return { exhausted_at: new Date(diskMs).toISOString() };
+    return { exhausted_at: new Date(Math.max(diskMs, incMs)).toISOString() };
+  }
+
+  function mergeAccountRecords(diskRec, incRec, clearBucketsForUser) {
+    if (!diskRec) return sanitizeAccountRecord(incRec.user_id, incRec);
+    if (!incRec) return sanitizeAccountRecord(diskRec.user_id, diskRec);
+    const diskUpdatedMs = parseIsoMs(diskRec.updated_at) ?? 0;
+    const incUpdatedMs = parseIsoMs(incRec.updated_at) ?? 0;
+    const preferInc = incUpdatedMs >= diskUpdatedMs;
+    const newer = preferInc ? incRec : diskRec;
+    const older = preferInc ? diskRec : incRec;
+
+    const diskAlert = diskRec.last_expiry_alert_date || "";
+    const incAlert = incRec.last_expiry_alert_date || "";
+    const mergedAlert = (diskAlert >= incAlert ? diskAlert : incAlert) || null;
+    const laterUpdatedMs = Math.max(diskUpdatedMs, incUpdatedMs);
+
+    return sanitizeAccountRecord(incRec.user_id || diskRec.user_id, {
+      user_id: incRec.user_id || diskRec.user_id,
+      nickname: newer.nickname || older.nickname || null,
+      phone_last4: newer.phone_last4 || older.phone_last4 || null,
+      exp: Math.max(Number(diskRec.exp || 0), Number(incRec.exp || 0)),
+      updated_at: laterUpdatedMs > 0 ? new Date(laterUpdatedMs).toISOString() : null,
+      quota: {
+        search: mergeQuotaBucket(diskRec.quota?.search, incRec.quota?.search, clearBucketsForUser?.search),
+        read: mergeQuotaBucket(diskRec.quota?.read, incRec.quota?.read, clearBucketsForUser?.read),
+      },
+      last_expiry_alert_date: mergedAlert,
+    });
+  }
+
+  function mergeStates(baseState, incState, clearMap) {
+    const accounts = {};
+    const userIds = new Set([
+      ...Object.keys(baseState?.accounts || {}),
+      ...Object.keys(incState?.accounts || {}),
+    ]);
+    for (const uid of userIds) {
+      accounts[uid] = mergeAccountRecords(
+        baseState?.accounts?.[uid],
+        incState?.accounts?.[uid],
+        clearMap?.[uid],
+      );
+    }
+    return {
+      version: 1,
+      last_used_user_id: incState?.last_used_user_id || baseState?.last_used_user_id || null,
+      accounts,
+    };
+  }
+
+  function cloneCleanState(state) {
+    const cleanAccounts = {};
+    for (const [uid, record] of Object.entries(state?.accounts || {})) {
+      if (uid) cleanAccounts[uid] = sanitizeAccountRecord(uid, record);
+    }
+    return {
+      version: 1,
+      last_used_user_id: typeof state?.last_used_user_id === "string" ? state.last_used_user_id : null,
+      accounts: cleanAccounts,
+    };
+  }
+
+  function readDiskState() {
+    try {
+      const raw = readFileSync(stateFile, "utf8");
+      const parsed = JSON.parse(raw);
+      return cloneCleanState(parsed);
+    } catch {
+      return null;
+    }
+  }
+
+  function loadState() {
+    const disk = readDiskState();
+    if (!disk) return cloneCleanState(memoryState);
+    const merged = mergeStates(disk, memoryState, memoryClearMap);
+    memoryState = merged;
+    return cloneCleanState(merged);
+  }
+
+  let unsavedState = false;
+
+  function saveState(state, clearMap) {
+    if (clearMap) {
+      for (const [uid, buckets] of Object.entries(clearMap)) {
+        memoryClearMap[uid] = { ...(memoryClearMap[uid] || {}) };
+        for (const [bucket, cutoffMs] of Object.entries(buckets || {})) {
+          if (Number.isFinite(cutoffMs)) {
+            memoryClearMap[uid][bucket] = Math.max(memoryClearMap[uid][bucket] || 0, cutoffMs);
+          }
+        }
+      }
+    }
+    const cleanIncoming = cloneCleanState(state);
+    const disk = readDiskState();
+    // Every write carries all clears this process has made, not only this
+    // call's: a clear whose own write failed must not be undone by a later
+    // write that merges the stale timestamp back from disk. A clear only drops
+    // marks older than its cutoff, so newer marks survive.
+    const merged = disk ? mergeStates(disk, cleanIncoming, memoryClearMap) : cleanIncoming;
+    memoryState = cloneCleanState(merged);
+    // Set until a write succeeds, so a record kept only in memory after a
+    // failed write is written once the file is writable again.
+    unsavedState = true;
+    try {
+      const dir = path.dirname(stateFile);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const tmpFile = `${stateFile}.tmp.${process.pid}.${randomUUID()}`;
+      writeFileSync(tmpFile, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+      chmodSync(tmpFile, 0o600);
+      renameSync(tmpFile, stateFile);
+      chmodSync(stateFile, 0o600);
+      unsavedState = false;
+      return true;
+    } catch (err) {
+      if (!warnedStateWriteFailure) {
+        warnedStateWriteFailure = true;
+        logWarning(
+          `[alphaengine-mcp] failed to persist account state (${err?.code || "write_error"}), continuing with in-memory state`,
+        );
+      }
+      return false;
+    }
+  }
+
+  function syncAccounts() {
+    const currentNowMs = nowMs();
+    const nowIso = new Date(currentNowMs).toISOString();
+    const { appRunning, candidates } = readDesktopSnapshot();
+    const state = loadState();
+    let stateDirty = false;
+
+    const appByUser = new Map();
+    const anonymousAppCandidates = [];
+    for (const candidate of candidates) {
+      if (candidate.token) ephemeralSecrets.add(candidate.token);
+      if (candidate.refreshToken) ephemeralSecrets.add(candidate.refreshToken);
+      const uid = String(candidate.userId || "").trim();
+      if (!uid) {
+        anonymousAppCandidates.push(candidate);
+        continue;
+      }
+      const prev = appByUser.get(uid);
+      if (!prev || candidate.exp > prev.exp) {
+        appByUser.set(uid, candidate);
+      }
+    }
+
+    const keychainUsers = new Set();
+    const resolvedAppEntries = [];
+    for (const [uid, appCandidate] of appByUser.entries()) {
+      const existingKc = effectiveKeychain.load(uid);
+      if (existingKc?.token) {
+        ephemeralSecrets.add(existingKc.token);
+        keychainUsers.add(uid);
+      }
+
+      // Never let a stale renderer process overwrite a newer valid token in Keychain.
+      let chosen = appCandidate;
+      if (existingKc?.token && existingKc.exp > appCandidate.exp) {
+        chosen = {
+          ...existingKc,
+          nickname: existingKc.nickname || appCandidate.nickname,
+          phoneLast4: existingKc.phoneLast4 || appCandidate.phoneLast4,
+        };
+      } else if (!existingKc?.token || appCandidate.exp > existingKc.exp) {
+        if (effectiveKeychain.save(uid, appCandidate)) {
+          keychainUsers.add(uid);
+        }
+      }
+
+      resolvedAppEntries.push({
+        ...chosen,
+        inDesktopApp: true,
+        inKeychain: keychainUsers.has(uid),
+      });
+
+      const existing = state.accounts[uid] || sanitizeAccountRecord(uid, {});
+      const candidate = sanitizeAccountRecord(uid, {
+        ...existing,
+        nickname: chosen.nickname || existing.nickname,
+        phone_last4: chosen.phoneLast4 || existing.phone_last4,
+        exp: Math.max(existing.exp || 0, chosen.exp || 0),
+      });
+      // Only a real change rewrites the record: stamping updated_at on every
+      // request would rewrite the shared state file each call and widen the
+      // window in which another process's fresh quota mark can be lost.
+      if (!state.accounts[uid] || JSON.stringify(existing) !== JSON.stringify(candidate)) {
+        state.accounts[uid] = sanitizeAccountRecord(uid, { ...candidate, updated_at: nowIso });
+        stateDirty = true;
+      }
+    }
+
+    const keychainOnly = [];
+    for (const uid of Object.keys(state.accounts)) {
+      if (appByUser.has(uid)) continue;
+      const loaded = effectiveKeychain.load(uid);
+      if (loaded?.token) {
+        ephemeralSecrets.add(loaded.token);
+        keychainUsers.add(uid);
+        const existing = state.accounts[uid];
+        const refreshed = sanitizeAccountRecord(uid, {
+          ...existing,
+          nickname: loaded.nickname || existing.nickname,
+          phone_last4: loaded.phoneLast4 || existing.phone_last4,
+          exp: Math.max(existing.exp || 0, loaded.exp || 0),
+        });
+        if (JSON.stringify(existing) !== JSON.stringify(refreshed)) {
+          state.accounts[uid] = refreshed;
+          stateDirty = true;
+        }
+        keychainOnly.push({
+          ...loaded,
+          nickname: refreshed.nickname,
+          phoneLast4: refreshed.phone_last4,
+          exp: loaded.exp || refreshed.exp,
+          updatedAtMs: Date.parse(refreshed.updated_at || "") || 0,
+          inDesktopApp: false,
+          inKeychain: true,
+        });
+      }
+    }
+
+    // A retry after a failed write carries this process's pending clears too,
+    // so a cleared exhausted_at is not merged back from the stale file.
+    if (stateDirty || unsavedState) saveState(state);
+
+    const appOrdered = [
+      ...resolvedAppEntries,
+      ...anonymousAppCandidates.map((entry) => ({
+        ...entry,
+        inDesktopApp: true,
+        inKeychain: false,
+      })),
+    ].sort((a, b) => b.exp - a.exp);
+
+    keychainOnly.sort((a, b) => b.exp - a.exp || b.updatedAtMs - a.updatedAtMs);
+
+    const orderedAccounts = [...appOrdered, ...keychainOnly];
+    return {
+      nowMs: currentNowMs,
+      nowSec: Math.floor(currentNowMs / 1000),
+      appRunning,
+      desktopCandidates: candidates,
+      orderedAccounts,
+      state,
+    };
+  }
+
+  function isInCooldown(state, userId, quotaType, currentNowMs) {
+    if (!userId) return false;
+    const exhaustedAt = state.accounts[userId]?.quota?.[quotaType]?.exhausted_at;
+    if (!exhaustedAt) return false;
+    const exhaustedMs = Date.parse(exhaustedAt);
+    if (!Number.isFinite(exhaustedMs)) return false;
+    return currentNowMs - exhaustedMs < effectiveCooldownMs;
+  }
+
+  function markQuotaExhausted(userId, quotaType, currentNowMs) {
+    if (!userId) return;
+    if (memoryClearMap[userId]) {
+      delete memoryClearMap[userId][quotaType];
+    }
+    const state = loadState();
+    const record = state.accounts[userId] || sanitizeAccountRecord(userId, {});
+    record.quota[quotaType] = { exhausted_at: new Date(currentNowMs).toISOString() };
+    state.accounts[userId] = record;
+    saveState(state);
+  }
+
+  function clearQuotaExhausted(userId, quotaType, requestStartMs) {
+    if (!userId) return;
+    const state = loadState();
+    const record = state.accounts[userId];
+    let dirty = false;
+    let clearMap;
+    const exhaustedAt = record?.quota?.[quotaType]?.exhausted_at;
+    if (exhaustedAt) {
+      const exhaustedMs = Date.parse(exhaustedAt);
+      // Clear only marks recorded strictly BEFORE this request started.
+      if (!Number.isFinite(exhaustedMs) || exhaustedMs < requestStartMs) {
+        record.quota[quotaType] = { exhausted_at: null };
+        clearMap = { [userId]: { [quotaType]: requestStartMs } };
+        dirty = true;
+      }
+    }
+    if (state.last_used_user_id !== userId) {
+      state.last_used_user_id = userId;
+      dirty = true;
+    }
+    if (dirty) saveState(state, clearMap);
+  }
+
+  function selectCandidates(snapshot, quotaType) {
+    const validAccounts = snapshot.orderedAccounts.filter((acc) => acc.exp > snapshot.nowSec + 30);
+    const available = validAccounts.filter(
+      (acc) => !isInCooldown(snapshot.state, acc.userId, quotaType, snapshot.nowMs),
+    );
+    return { validAccounts, available };
+  }
+
+  function collectAllSecrets(snapshot) {
+    for (const acc of snapshot?.orderedAccounts || []) {
+      if (acc.token) ephemeralSecrets.add(acc.token);
+      if (acc.refreshToken) ephemeralSecrets.add(acc.refreshToken);
+    }
+    return [...ephemeralSecrets];
+  }
+
+  function statusSummary() {
+    const snapshot = syncAccounts();
+    const { nowMs: currentNowMs, nowSec, appRunning, desktopCandidates, orderedAccounts, state } = snapshot;
+    const { validAccounts, available: availableSearch } = selectCandidates(snapshot, "search");
+    const { available: availableRead } = selectCandidates(snapshot, "read");
+    const primaryValid = validAccounts[0] || null;
+    const activeSearchUserId = availableSearch[0]?.userId || null;
+    const activeReadUserId = availableRead[0]?.userId || null;
+    const desktopUserId = orderedAccounts.find((acc) => acc.inDesktopApp)?.userId || null;
+    const currentUserId =
+      activeSearchUserId ||
+      activeReadUserId ||
+      (state.last_used_user_id && validAccounts.some((acc) => acc.userId === state.last_used_user_id)
+        ? state.last_used_user_id
+        : null) ||
+      primaryValid?.userId ||
+      null;
+
+    let statusKey;
+    let customHint = null;
+    if (primaryValid) {
+      statusKey = "ready";
+      if (!primaryValid.inDesktopApp) {
+        customHint = appRunning
+          ? "AlphaEngine Desktop 未打开模块页，当前使用钥匙串中已保存的账号令牌。"
+          : "AlphaEngine Desktop 未运行，当前使用钥匙串中已保存的账号令牌。";
+      }
+    } else if (orderedAccounts.length > 0) {
+      statusKey = "token_expired";
+    } else {
+      statusKey = !appRunning ? "app_not_running" : desktopCandidates.length === 0 ? "no_module_page" : "token_expired";
+    }
+
+    const baseStatus = DESKTOP_STATUS[statusKey];
+    const accounts = orderedAccounts.map((acc) => {
+      const record = state.accounts[acc.userId] || sanitizeAccountRecord(acc.userId, {});
+      const searchExhaustedAt = record.quota.search.exhausted_at;
+      const readExhaustedAt = record.quota.read.exhausted_at;
+      const searchExhaustedMs = searchExhaustedAt ? Date.parse(searchExhaustedAt) : NaN;
+      const readExhaustedMs = readExhaustedAt ? Date.parse(readExhaustedAt) : NaN;
+      const searchInCooldown =
+        Number.isFinite(searchExhaustedMs) && currentNowMs - searchExhaustedMs < effectiveCooldownMs;
+      const readInCooldown =
+        Number.isFinite(readExhaustedMs) && currentNowMs - readExhaustedMs < effectiveCooldownMs;
+      return {
+        user_id: acc.userId || null,
+        nickname: acc.nickname || null,
+        phone_last4: acc.phoneLast4 || null,
+        token_expires_at: acc.exp ? new Date(acc.exp * 1000).toISOString() : null,
+        token_seconds_remaining: acc.exp ? Math.max(0, acc.exp - nowSec) : 0,
+        token_expired: !(acc.exp > nowSec + 30),
+        is_current: Boolean(currentUserId && acc.userId === currentUserId),
+        in_desktop_app: acc.inDesktopApp,
+        in_keychain: acc.inKeychain,
+        search_quota: {
+          status: searchInCooldown ? "exhausted" : "available",
+          label: searchInCooldown ? "已用完" : "可用",
+          exhausted_at: searchExhaustedAt || null,
+          cooldown_until: searchInCooldown ? new Date(searchExhaustedMs + effectiveCooldownMs).toISOString() : null,
+        },
+        read_quota: {
+          status: readInCooldown ? "exhausted" : "available",
+          label: readInCooldown ? "已用完" : "可用",
+          exhausted_at: readExhaustedAt || null,
+          cooldown_until: readInCooldown ? new Date(readExhaustedMs + effectiveCooldownMs).toISOString() : null,
+        },
+      };
+    });
+
+    return {
+      ...baseStatus,
+      ...(customHint ? { hint: customHint } : {}),
+      app_running: appRunning,
+      desktop_renderer_processes: desktopCandidates.length,
+      authenticated: Boolean(primaryValid),
+      current_user_id: currentUserId,
+      desktop_user_id: desktopUserId,
+      active_search_user_id: activeSearchUserId,
+      active_read_user_id: activeReadUserId,
+      token_expires_at: primaryValid ? new Date(primaryValid.exp * 1000).toISOString() : null,
+      token_seconds_remaining: primaryValid ? Math.max(0, primaryValid.exp - nowSec) : 0,
+      accounts,
+      _snapshot: snapshot,
+    };
+  }
+
+  function alertMarkerDir() {
+    return path.join(path.dirname(stateFile), "alphaengine_alert_markers");
+  }
+
+  function alertMarkerPath(userId, todayStr) {
+    const safeUser = encodeURIComponent(String(userId)).replace(/[^A-Za-z0-9._-]/g, "_");
+    return path.join(alertMarkerDir(), `${safeUser}_${todayStr}.lock`);
+  }
+
+  function pruneOldAlertMarkers(todayStr) {
+    try {
+      const dir = alertMarkerDir();
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith(".lock")) continue;
+        if (!name.endsWith(`_${todayStr}.lock`)) {
+          try {
+            unlinkSync(path.join(dir, name));
+          } catch {
+            // Best-effort cleanup.
+          }
+        }
+      }
+    } catch {
+      // Ignore missing/unreadable marker dir.
+    }
+  }
+
+  async function checkExpiringAccountsAndAlert(snapshotInput) {
+    const snapshot = snapshotInput || syncAccounts();
+    const { nowMs: currentNowMs, nowSec, orderedAccounts } = snapshot;
+    const todayStr = shanghaiDateKey(currentNowMs);
+    const alerted = [];
+
+    for (const acc of orderedAccounts) {
+      if (!acc.userId || !(acc.exp > 0)) continue;
+      const remainingSeconds = acc.exp - nowSec;
+      if (remainingSeconds >= EXPIRY_ALERT_WINDOW_SECONDS) continue;
+      // Stop daily reminders once an account has been expired for more than 7 days.
+      if (remainingSeconds < -EXPIRY_ALERT_GRACE_SECONDS) continue;
+
+      const latestState = loadState();
+      if (latestState.accounts[acc.userId]?.last_expiry_alert_date === todayStr) continue;
+
+      const dedupKey = `${acc.userId}:${todayStr}`;
+      if (inFlightAlerts.has(dedupKey)) continue;
+      inFlightAlerts.add(dedupKey);
+
+      let markerClaimed = false;
+      const markerPath = alertMarkerPath(acc.userId, todayStr);
+      try {
+        try {
+          mkdirSync(alertMarkerDir(), { recursive: true, mode: 0o700 });
+          const fd = openSync(markerPath, "wx", 0o600);
+          closeSync(fd);
+          markerClaimed = true;
+        } catch (err) {
+          if (err?.code === "EEXIST") {
+            continue;
+          }
+          if (!warnedMarkerDirFailure) {
+            warnedMarkerDirFailure = true;
+            logWarning(
+              `[alphaengine-mcp] unable to create daily alert marker (${err?.code || "fs_error"}), falling back to in-memory dedup`,
+            );
+          }
+        }
+
+        const label = accountDisplayLabel(acc);
+        const message = `请在 AlphaEngine App 里登录账号 ${label}`;
+        let deliveryOutcome = "failed";
+        try {
+          const result = await sendOpsAlert({
+            code: "alphaengine_token_expiring",
+            detail: label,
+            message,
+            userId: acc.userId,
+          });
+          if (result === true || result?.ok === true || result?.outcome === "sent") {
+            deliveryOutcome = "sent";
+          } else if (result?.outcome === "uncertain") {
+            deliveryOutcome = "uncertain";
+          }
+        } catch (err) {
+          if (err?.name === "TimeoutError" || err?.name === "AbortError" || err?.code === "ETIMEDOUT") {
+            deliveryOutcome = "uncertain";
+          }
+        }
+
+        if (deliveryOutcome === "sent") {
+          const freshState = loadState();
+          const record = freshState.accounts[acc.userId] || sanitizeAccountRecord(acc.userId, acc);
+          record.last_expiry_alert_date = todayStr;
+          freshState.accounts[acc.userId] = record;
+          saveState(freshState);
+          if (markerClaimed) pruneOldAlertMarkers(todayStr);
+          alerted.push({ user_id: acc.userId, label, date: todayStr });
+        } else if (deliveryOutcome === "uncertain") {
+          // Gateway timed out (delivery result unknown): keep today's marker to prevent duplicate alerts.
+          if (markerClaimed) pruneOldAlertMarkers(todayStr);
+        } else if (markerClaimed) {
+          try {
+            unlinkSync(markerPath);
+          } catch {
+            // Best-effort cleanup only on definitive complete failure.
+          }
+        }
+      } finally {
+        inFlightAlerts.delete(dedupKey);
+      }
+    }
+    return alerted;
+  }
+
+  async function executeWithFailover(quotaType, invokeWithToken) {
+    const requestStartMs = nowMs();
+    const statusInfo = statusSummary();
+    const snapshot = statusInfo._snapshot;
+    const secrets = collectAllSecrets(snapshot);
+
+    void checkExpiringAccountsAndAlert(snapshot).catch(() => {});
+
+    const { validAccounts, available } = selectCandidates(snapshot, quotaType);
+    if (!validAccounts.length) {
+      throw new Error(`${statusInfo.error}。${statusInfo.hint}`);
+    }
+    if (!available.length) {
+      const quotaLabel = quotaType === "read" ? "阅读额度" : "检索额度";
+      throw new Error(`E_UPSTREAM_API: 额度已达上限（所有已保存 AlphaEngine 账号当前${quotaLabel}均处于冷却期，quota_exceeded）`);
+    }
+
+    const primary = available[0];
+    try {
+      const result = await invokeWithToken(primary.token, primary, secrets);
+      clearQuotaExhausted(primary.userId, quotaType, requestStartMs);
+      return result;
+    } catch (primaryErr) {
+      const safePrimaryErr = primaryErr instanceof Error ? primaryErr : new Error(String(primaryErr));
+      safePrimaryErr.message = redactSecrets(safePrimaryErr.message, secrets);
+
+      const errKind = classifyUpstreamError(safePrimaryErr);
+      if (errKind === "none") {
+        throw safePrimaryErr;
+      }
+
+      if (errKind === "quota") {
+        markQuotaExhausted(primary.userId, quotaType, nowMs());
+      }
+
+      // Re-evaluate retry candidates against current marks and 30s expiry buffer.
+      const retrySnapshot = syncAccounts();
+      const retrySecrets = collectAllSecrets(retrySnapshot);
+      const { available: retryAvailable } = selectCandidates(retrySnapshot, quotaType);
+      const fallback = retryAvailable.find((acc) => acc.userId && acc.userId !== primary.userId);
+      if (!fallback) {
+        throw safePrimaryErr;
+      }
+
+      try {
+        const retryResult = await invokeWithToken(fallback.token, fallback, retrySecrets);
+        clearQuotaExhausted(fallback.userId, quotaType, requestStartMs);
+        return retryResult;
+      } catch (fallbackErr) {
+        const safeFallbackErr = fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr));
+        safeFallbackErr.message = redactSecrets(safeFallbackErr.message, retrySecrets);
+        const fallbackKind = classifyUpstreamError(safeFallbackErr);
+        if (fallbackKind === "quota") {
+          markQuotaExhausted(fallback.userId, quotaType, nowMs());
+          // Return the original error when both accounts fail.
+          throw safePrimaryErr;
+        }
+        if (errKind === "ambiguous_retry") {
+          throw safePrimaryErr;
+        }
+        throw safeFallbackErr;
+      }
+    }
+  }
+
+  return {
+    syncAccounts,
+    statusSummary,
+    checkExpiringAccountsAndAlert,
+    executeWithFailover,
+    loadState,
+    getKnownSecrets: () => [...ephemeralSecrets],
+  };
 }
 
-function resolveDesktopToken() {
-  const state = desktopStatus();
-  if (!state.valid) throw new Error(`${state.error}。${state.hint}`);
-  return state.valid;
-}
+const defaultAccountManager = createAccountManager();
 
-async function apiRequest(apiPath, options = {}) {
-  const { token } = resolveDesktopToken();
+async function fetchWithToken(apiPath, options = {}, token, knownSecrets = []) {
+  const { quotaType: _quotaType, ...fetchOptions } = options;
+  const secrets = [token, ...knownSecrets].filter(Boolean);
   // Additional fixed, read-only dictionary endpoints live under kmpadmin/kmpstock.
   const url = apiPath.startsWith("/api/v1/") ? `https://www.alphaengine.top${apiPath}` : `${API_BASE}${apiPath}`;
   const response = await fetch(url, {
-    ...options,
+    ...fetchOptions,
     headers: {
       Accept: "application/json, text/plain, */*",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -176,27 +1271,58 @@ async function apiRequest(apiPath, options = {}) {
       Origin: "https://www.alphaengine.top",
       Referer: "https://www.alphaengine.top/",
       "User-Agent": `AlphaEngine-MCP/${VERSION}`,
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...(options.headers || {}),
+      ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
+      ...(fetchOptions.headers || {}),
     },
-    signal: options.signal || AbortSignal.timeout(120000),
+    signal: fetchOptions.signal || AbortSignal.timeout(120000),
   });
   const responseText = await response.text();
   let parsed;
   try {
     parsed = JSON.parse(responseText);
   } catch {
-    throw new Error(`E_UPSTREAM_RESPONSE: HTTP ${response.status}, non-JSON response`);
+    const err = new Error(redactSecrets(`E_UPSTREAM_RESPONSE: HTTP ${response.status}, non-JSON response`, secrets));
+    err.httpStatus = response.status;
+    throw err;
   }
-  if (!response.ok) {
-    throw new Error(`E_UPSTREAM_HTTP: HTTP ${response.status}: ${JSON.stringify(parsed).slice(0, 600)}`);
+  const bodyStatusCode = firstStatusCode(parsed?.status_code, parsed?.error?.status_code);
+  if (!response.ok || bodyStatusCode >= 400) {
+    const effectiveStatus = bodyStatusCode >= 400 ? bodyStatusCode : response.status;
+    const snippet = formatSanitizedErrorSnippet(parsed, secrets, 600);
+    const err = new Error(`E_UPSTREAM_HTTP: HTTP ${effectiveStatus}: ${snippet}`);
+    err.httpStatus = effectiveStatus;
+    err.upstreamBody = sanitizeErrorValue(parsed, secrets);
+    throw err;
   }
   if (parsed?.success === false || (parsed?.code && ![0, 200, "0", "200"].includes(parsed.code))) {
-    throw new Error(
-      `E_UPSTREAM_API: ${parsed.message || parsed.msg || JSON.stringify(parsed).slice(0, 600)}`,
-    );
+    const rawMsg = parsed.message || parsed.msg;
+    const snippet =
+      typeof rawMsg === "string" && rawMsg
+        ? redactSecrets(rawMsg, secrets).slice(0, 600)
+        : formatSanitizedErrorSnippet(parsed, secrets, 600);
+    const err = new Error(`E_UPSTREAM_API: ${snippet}`);
+    err.httpStatus = response.status;
+    err.upstreamBody = sanitizeErrorValue(parsed, secrets);
+    throw err;
+  }
+  if (parsed && typeof parsed === "object") {
+    const structuredKind = classifyUpstreamError({ httpStatus: response.status, upstreamBody: parsed });
+    if (structuredKind !== "none") {
+      const snippet = formatSanitizedErrorSnippet(parsed, secrets, 600);
+      const err = new Error(`E_UPSTREAM_API: ${snippet}`);
+      err.httpStatus = response.status;
+      err.upstreamBody = sanitizeErrorValue(parsed, secrets);
+      throw err;
+    }
   }
   return parsed?.data ?? parsed?.body ?? parsed;
+}
+
+async function apiRequest(apiPath, options = {}, manager = defaultAccountManager) {
+  const quotaType = options.quotaType || resolveEndpointQuotaType(apiPath);
+  return manager.executeWithFailover(quotaType, (token, _acc, secrets) =>
+    fetchWithToken(apiPath, options, token, secrets),
+  );
 }
 
 function requireDatePair(dateFrom, dateTo) {
@@ -645,31 +1771,31 @@ function selectDocumentText(detail, field = "auto") {
   return candidates.find((value) => typeof value === "string" && value.length) || "";
 }
 
-async function fetchDocumentDetail(docId, mode = "auto") {
+async function fetchDocumentDetail(docId, mode = "auto", request = apiRequest) {
   const encoded = encodeURIComponent(docId);
   const cacheKey = `document:${mode}:${docId}`;
   const previous = cached(cacheKey);
   if (previous) return previous;
   if (mode === "private") {
-    return setCached(cacheKey, await apiRequest(`/summary/private/detail/${encoded}`));
+    return setCached(cacheKey, await request(`/summary/private/detail/${encoded}`, { quotaType: "read" }));
   }
   if (mode === "public") {
     return setCached(
       cacheKey,
-      await apiRequest(`/summary/detail/${encoded}/true?system=false`),
+      await request(`/summary/detail/${encoded}/true?system=false`, { quotaType: "read" }),
     );
   }
   try {
     return setCached(
       cacheKey,
-      await apiRequest(`/summary/detail/${encoded}/true?system=false`),
+      await request(`/summary/detail/${encoded}/true?system=false`, { quotaType: "read" }),
     );
   } catch (publicError) {
     // A quota/permission/authentication refusal is not a reason to retry through
     // a different document route, and may charge another read.
     if (/额度|权限|登录|token|HTTP (?:401|403|429)/i.test(String(publicError.message))) throw publicError;
     try {
-      return setCached(cacheKey, await apiRequest(`/summary/private/detail/${encoded}`));
+      return setCached(cacheKey, await request(`/summary/private/detail/${encoded}`, { quotaType: "read" }));
     } catch {
       throw publicError;
     }
@@ -787,12 +1913,12 @@ async function listAttachments(args, request = apiRequest) {
   })), next_step: "下载选定文档附件用 download_document(doc_id, attachment_index)；不返回签名地址。" };
 }
 
-async function downloadDocument(args) {
+async function downloadDocument(args, request = apiRequest) {
   if (!args.doc_id) throw new Error("E_BAD_ARGS: doc_id 必填");
   if (args.attachment_index !== undefined && (!Number.isInteger(args.attachment_index) || args.attachment_index < 0)) throw new Error("E_BAD_ATTACHMENT: attachment_index 须为非负整数");
   const isAttachment = args.attachment_index !== undefined;
-  const detail = isAttachment ? (await attachmentRows(String(args.doc_id)))[args.attachment_index]
-    : await fetchDocumentDetail(String(args.doc_id), args.mode || "auto");
+  const detail = isAttachment ? (await attachmentRows(String(args.doc_id), request))[args.attachment_index]
+    : await fetchDocumentDetail(String(args.doc_id), args.mode || "auto", request);
   if (!detail) throw new Error("E_BAD_ATTACHMENT: 附件索引不存在，请重新 list_attachments");
   const candidates = documentFileCandidates(detail);
   const candidate =
@@ -947,12 +2073,39 @@ async function listRecordingTasks(args, request = apiRequest) {
     note: "录制预约任务（含未开始/失败/处理中），与已入库会议文档数量不同；正文用 search_library 的机构/个人会议范围查找。" };
 }
 
-async function getRecordingStatus(args, request = apiRequest) {
+async function getRecordingStatus(args, request = apiRequest, manager = defaultAccountManager) {
   const type = recordingType(args);
-  const [counts, preview] = await Promise.all([
-    request(`/summary/search/booked/count/list?type=${type}`),
-    request("/summary/search/booked/preview", { method: "POST", body: JSON.stringify({ type }) }),
-  ]);
+  // A quota error ends the pair at once (whatever the other request is
+  // doing) so the failover marks this account and switches; otherwise both
+  // settle and the error reported is quota, then ambiguous, then the first.
+  const kindOf = classifyUpstreamError;
+  const runPair = (invoke) =>
+    new Promise((resolve, reject) => {
+      const calls = [
+        invoke(`/summary/search/booked/count/list?type=${type}`),
+        invoke("/summary/search/booked/preview", { method: "POST", body: JSON.stringify({ type }) }),
+      ];
+      for (const call of calls) {
+        call.catch((err) => {
+          if (kindOf(err) === "quota") reject(err);
+        });
+      }
+      Promise.allSettled(calls).then((settled) => {
+        const failures = settled.filter((r) => r.status === "rejected").map((r) => r.reason);
+        if (!failures.length) return resolve(settled.map((r) => r.value));
+        reject(
+          failures.find((err) => kindOf(err) === "quota") ||
+            failures.find((err) => kindOf(err) !== "none") ||
+            failures[0],
+        );
+      });
+    });
+  const [counts, preview] =
+    request === apiRequest
+      ? await manager.executeWithFailover("search", (token, _acc, secrets) =>
+          runPair((apiPath, opts = {}) => fetchWithToken(apiPath, opts, token, secrets)),
+        )
+      : await runPair(request);
   return { meeting_scope: args.meeting_scope || "institution", counts, preview: safeMetadata(preview),
     state_definitions: RECORDING_STATES, note: "counts 保留上游原字段；完整任务用 list_recording_tasks 分页查询。" };
 }
@@ -971,18 +2124,13 @@ async function getDocumentInfo(args, request = apiRequest) {
     note: "仅基础类型/已读状态，不读取全文；完整文本使用 get_document。" };
 }
 
-async function authStatus() {
-  const { appRunning, candidates, valid, now, status, hint } = desktopStatus();
+async function authStatus(_args = {}, manager = defaultAccountManager) {
+  const { _snapshot, ...publicStatus } = manager.statusSummary();
+  void manager.checkExpiringAccountsAndAlert(_snapshot).catch(() => {});
   return {
-    status,
-    hint,
-    app_running: appRunning,
-    desktop_renderer_processes: candidates.length,
-    authenticated: Boolean(valid),
-    token_expires_at: valid ? new Date(valid.exp * 1000).toISOString() : null,
-    token_seconds_remaining: valid ? valid.exp - now : 0,
+    ...publicStatus,
     api_base: API_BASE,
-    note: "Token 仅从运行中的 AlphaEngine Desktop 模块页子进程读取，不落盘、不返回。",
+    note: "Token 优先从运行中的 AlphaEngine Desktop 读取并按账号保存在 macOS 钥匙串；不写入明文状态文件、不写日志、不返回。",
   };
 }
 
@@ -1137,7 +2285,7 @@ const TOOLS = {
   },
   auth_status: {
     description:
-      "检查 AlphaEngine Desktop 是否可用；不会返回 token。status 区分 ready / app_not_running / no_module_page / token_expired，no_module_page 表示登录正常但 App 里没开模块页。",
+      "检查 AlphaEngine Desktop 与已保存多账号状态（含昵称、手机号后四位、过期时间、检索/阅读额度与当前账号）；不会返回 token。status 区分 ready / app_not_running / no_module_page / token_expired。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     call: authStatus,
   },
@@ -1184,7 +2332,12 @@ async function handleRpc(message) {
       });
     } catch (error) {
       return rpcSuccess(id, {
-        content: [{ type: "text", text: String(error.message || error) }],
+        content: [
+          {
+            type: "text",
+            text: redactSecrets(String(error.message || error), defaultAccountManager.getKnownSecrets()),
+          },
+        ],
         isError: true,
       });
     }
@@ -1264,7 +2417,11 @@ function isValidDocumentId(id) { return typeof id === "string" && /^[A-Za-z0-9][
 // Local ingestion reuses the authenticated reader; importing must not start a server.
 export { isValidDocumentId, fetchDocumentDetail, searchLibrary, listFilters, listRecordingTasks, getRecordingStatus, getRecordingTask,
   getDocumentInfo, listAttachments, selectDocumentText, documentFileCandidates, extensionFor, compactSearchResult,
-  documentMetadata, resultMatches, requireDatePair, TOOLS, handleRpc };
+  documentMetadata, resultMatches, requireDatePair, TOOLS, handleRpc,
+  createAccountManager, createMacOsKeychain, isValidKeychainAccount, quoteSecurityInteractiveArg,
+  classifyUpstreamError, isQuotaOrRateLimitError, resolveEndpointQuotaType, ENDPOINT_QUOTA_RULES,
+  formatSanitizedErrorSnippet, sanitizeErrorValue, fetchWithToken, apiRequest, downloadDocument,
+  authStatus, redactSecrets, sendDefaultOpsAlert };
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.includes("--stdio")) startStdio();
   else startHttp();
