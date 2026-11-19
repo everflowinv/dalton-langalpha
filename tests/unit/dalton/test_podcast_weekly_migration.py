@@ -737,7 +737,7 @@ def test_manifest_podcast_weekly_pipeline_entry() -> None:
         "--since-days",
         "7",
         "--video-model",
-        "gemini-4-argon",
+        "gemini-4-neon",
         "--text-backend",
         "dalton",
         "--text-model",
