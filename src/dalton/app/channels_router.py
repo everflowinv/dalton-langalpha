@@ -199,6 +199,13 @@ class ChannelSettingsPutRequest(BaseModel):
     address: str | None = None
 
 
+class DiscordChannelEntryRequest(BaseModel):
+    action: str
+    channel_id: str = Field(min_length=1, max_length=64)
+    version: str = Field(min_length=1, max_length=64)
+    name: str | None = None
+
+
 class AuthorizeAndClaimDeliveryRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -941,6 +948,43 @@ async def web_put_channel_settings_endpoint(
             version=body.version,
             settings=body.settings,
             automation_output_update=auto_upd,
+        )
+    except HTTPException as exc:
+        if isinstance(exc.detail, dict) and "code" in exc.detail:
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
+        raise
+
+
+@channels_router.post("/discord-channels")
+async def web_mutate_discord_channel_endpoint(
+    body: DiscordChannelEntryRequest,
+    user_id: CurrentUserId,
+) -> Any:
+    """Admin-only single-entry mutation (add/rename) for `apps.discord.chats`."""
+    tier = await get_user_tier(user_id)
+    if tier != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only admin users can manage Discord channels.",
+        )
+    cleaned_action = str(body.action or "").strip().lower()
+    if cleaned_action == "remove":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "unsupported_action",
+                "message": "本版不支持在此移除 Discord 频道",
+            },
+        )
+    try:
+        return await update_user_channel_settings(
+            user_id=user_id,
+            version=body.version,
+            discord_channel_entry={
+                "action": cleaned_action,
+                "channel_id": body.channel_id,
+                "name": body.name,
+            },
         )
     except HTTPException as exc:
         if isinstance(exc.detail, dict) and "code" in exc.detail:

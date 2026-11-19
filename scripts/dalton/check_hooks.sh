@@ -425,6 +425,8 @@ ALLOWED_HOOKS=(
   # fallback model knows which model this call runs on and which designated model
   # in the frozen <model> baseline it stands in for (main agent and subagent).
   "model-fallback-identity"
+  # Firecrawl budget: skip stealth re-escalation after auto and keep 402 credit-exhaustion notice.
+  "firecrawl-budget"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

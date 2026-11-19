@@ -22,6 +22,7 @@ export interface DaltonSettingVisibilityContext {
   cosSharingLoaded?: boolean;
   coverageUnitsEnabled?: boolean;
   coverageUnitsPending?: boolean;
+  discordChannelsAdmin?: boolean;
 }
 
 export interface UserSharingSettingsResponse {

@@ -9,6 +9,7 @@ import csv
 from datetime import date, datetime
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -37,7 +38,12 @@ HKEX_XLSX_URL = (
 UA = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 }
+logger = logging.getLogger(__name__)
+
 HIST_START = "2023-06-01"
+# Tencent returns the latest N bars and ignores the start date; up to ~1500 come
+# back whole (above ~1600 it falls back to 640). 1200 covers HIST_START with room.
+HIST_BARS = 1200
 
 
 def _sess(proxy: str = "") -> requests.Session:
@@ -546,13 +552,33 @@ def build_universe(
     return uni, meta
 
 
+class HistBars(list):
+    """Validated bars from HIST_START on, plus the upstream window they came from.
+
+    ``raw_count`` is how many bars the response held and ``first_date`` the
+    earliest valid date in it, before HIST_START included: whether the window
+    rolled stored dates off is judged on the response, not on the kept bars.
+    """
+
+    raw_count: int = 0
+    first_date: str | None = None
+
+
+class NoAdjustedHistory(RuntimeError):
+    """Tencent has only unadjusted bars for the code (typically delisted)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"历史行情无前复权数据 ({code})")
+        self.code = code
+
+
 def fetch_hist_one(
     sess: Any,
     code: str,
     *,
     start: str = HIST_START,
     end: str | None = None,
-    count: int = 900,
+    count: int = HIST_BARS,
 ) -> list[list[Any]]:
     end = end or now_hk().date().isoformat()
     url = (
@@ -562,12 +588,18 @@ def fetch_hist_one(
     r = sess.get(url, timeout=20)
     j = r.json()
     d = j.get("data", {}).get(f"hk{code}", {})
-    rows = d.get("qfqday") or d.get("day") or []
+    # Forward-adjusted bars only: falling back to the plain "day" series would
+    # mix an unadjusted basis into a file that is rewritten whole.
+    rows = d.get("qfqday") or []
     if not rows:
+        if d.get("day"):
+            raise NoAdjustedHistory(code)
         raise RuntimeError(f"历史行情返回空列表 ({code})")
-    out: list[list[Any]] = []
+    out = HistBars()
+    out.raw_count = len(rows)
     seen_dates: set[str] = set()
     bad_rows = 0
+    valid_before_start = False
     for row in rows:
         try:
             d_str = str(row[0]).strip()
@@ -576,6 +608,18 @@ def fetch_hist_one(
                 bad_rows += 1
                 continue
             seen_dates.add(d_str)
+            if out.first_date is None or d_str < out.first_date:
+                out.first_date = d_str
+            if d_str < HIST_START:
+                # Bars before HIST_START are never written; a bad one there
+                # must not sink the bars that are kept.
+                if not valid_before_start:
+                    try:
+                        close = float(row[2])
+                        valid_before_start = math.isfinite(close) and close > 0
+                    except (ValueError, IndexError, TypeError):
+                        pass
+                continue
             o, c, h, lo, vol = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
             if (
                 not math.isfinite(o)
@@ -600,7 +644,9 @@ def fetch_hist_one(
         except (ValueError, IndexError, TypeError):
             bad_rows += 1
             continue
-    if not out or bad_rows > 0:
+    # A listing whose valid bars all predate HIST_START is not an error: it
+    # simply has nothing in the panel's range.
+    if bad_rows > 0 or (not out and not valid_before_start):
         raise RuntimeError(
             f"历史行情记录不完整或含重复/无效日期 ({code}: total={len(rows)}, valid={len(out)}, bad={bad_rows})"
         )
@@ -662,23 +708,51 @@ def download_history(
         prev_dates = _existing_csv_dates(p)
         for attempt in range(3):
             try:
-                rows = fetch_hist_one(s, code)
+                try:
+                    rows = fetch_hist_one(s, code)
+                except NoAdjustedHistory:
+                    if prev_dates:
+                        # No adjusted series any more (delisted): the stored
+                        # adjusted file stays as it is rather than mixing in
+                        # unadjusted bars.
+                        return True
+                    raise
                 new_dates = [r[0] for r in rows]
                 new_date_set = set(new_dates)
                 if len(new_date_set) != len(rows):
                     raise RuntimeError(f"历史响应含重复日期 ({code})")
-                if prev_dates:
-                    if len(rows) < len(prev_dates):
-                        raise RuntimeError(f"历史记录不完整 ({code}: {len(rows)} < {len(prev_dates)})")
-                    missing_old = prev_dates - new_date_set
+                first = getattr(rows, "first_date", None) or (min(new_dates) if new_dates else None)
+                if prev_dates and first:
+                    # Tencent returns the latest HIST_BARS bars. Only a full
+                    # window can roll older stored dates off; a short response
+                    # owes every stored date. Either way the response must
+                    # overlap what is stored. Sessions after the last stored bar
+                    # are not checked per stock: a suspended stock has none, so
+                    # target-date coverage is judged on the whole panel instead.
+                    window_start = first
+                    if window_start > max(prev_dates):
+                        raise RuntimeError(f"历史响应与已有记录不重叠 ({code})")
+                    raw_count = getattr(rows, "raw_count", len(rows))
+                    kept = {d for d in prev_dates if d >= HIST_START}
+                    owed = kept if raw_count < HIST_BARS else {d for d in kept if d >= window_start}
+                    missing_old = owed - new_date_set
                     if missing_old:
                         raise RuntimeError(
                             f"历史响应丢失原有日期 ({code}: 缺失 {len(missing_old)} 天)"
                         )
+                if first and getattr(rows, "raw_count", len(rows)) >= HIST_BARS and first > HIST_START:
+                    # Only a full window that no longer reaches HIST_START needs
+                    # attention; a short history is just a later listing.
+                    logger.warning(
+                        "hk_momentum history window starts %s, after HIST_START %s (%s)",
+                        first, HIST_START, code,
+                    )
                 buf = io.StringIO()
                 w = csv.writer(buf)
                 w.writerow(["date", "open", "close", "high", "low", "volume", "turnover_wan"])
-                w.writerows(rows)
+                # Keep the panel's start at HIST_START: earlier bars would move
+                # the first rebalance before the HSI history the index needs.
+                w.writerows([r for r in rows if r[0] >= HIST_START])
                 atomic_write_text(p, buf.getvalue())
                 return True
             except Exception:

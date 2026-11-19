@@ -2063,6 +2063,7 @@ async def test_discord_channel_target_must_be_guild_text(
     unchecked, unchecked_message = await dtn_db.verify_discord_channel_is_guild_text("1481256083589697566")
     assert unchecked is True
     assert unchecked_message is None
+    assert await dtn_db.lookup_discord_guild_text_channel("1481256083589697566") == (True, None, None)
 
     monkeypatch.setattr(dtn_db, "_authorize_saved_report_in_tx", create_autospec(dtn_db._authorize_saved_report_in_tx, return_value=None))
     group_verify = create_autospec(dtn_db._verify_group_target_deliverable, return_value=(False, "not bound", None))

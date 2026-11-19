@@ -1,11 +1,15 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
+import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-section)
+import { useAuth } from '@/contexts/AuthContext'; // DALTON-HOOK(settings-section)
 import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(settings-section)
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(settings-reorg)
+import { queryKeys } from '@/lib/queryKeys'; // DALTON-HOOK(settings-section)
+import { fetchDaltonChannelBindings } from '../utils/daltonApi'; // DALTON-HOOK(settings-section)
 import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
 import { matchesAllWords, queryWords } from '@/lib/textMatch';
@@ -19,22 +23,43 @@ import { GROUPS, SECTIONS, searchableSettings, sectionShown, settingSearchText, 
 // DALTON-HOOK(settings-section): the command palette filters settings with the same card visibility
 // DALTON-HOOK(settings-reorg): fail closed on callerTierError without cos-sharing fallback; keep OSS admin & coverage parity
 export function useDaltonSettingsVisibility(): DaltonSettingVisibilityContext {
+  const { userId } = useAuth();
   const { canInvite, isPm, callerTier, callerTierPending, callerTierError } = useTeamCredentials();
   const { data } = useUserCosSharingQuery(isDaltonAuth);
   const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(true);
+  const { data: bindingsData, isLoading: bindingsLoading } = useQuery({
+    queryKey: queryKeys.dalton.channelBindings(),
+    queryFn: fetchDaltonChannelBindings,
+    enabled: Boolean(userId),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const fallbackTier = bindingsData?.user_tier ?? null;
+  const daltonResolvedTier =
+    !callerTierError && callerTier ? callerTier : fallbackTier;
+  const waitingOnBindingsFallback =
+    isDaltonAuth &&
+    Boolean(userId) &&
+    bindingsLoading &&
+    (callerTierError || (!callerTierPending && !callerTier));
   const effectiveTier = isDaltonAuth
-    ? (callerTierError ? null : (callerTier ?? null))
+    ? daltonResolvedTier
     : (isPm ? 'admin' : null);
+  const discordChannelsAdmin = isDaltonAuth
+    ? daltonResolvedTier === 'admin' &&
+      (fallbackTier === null || fallbackTier === 'admin')
+    : fallbackTier === 'admin';
   return {
     canInvite,
     isPm,
     callerTier: effectiveTier,
-    callerTierPending: isDaltonAuth ? callerTierPending : false,
-    callerTierError: isDaltonAuth ? callerTierError : false,
+    callerTierPending: isDaltonAuth ? callerTierPending || waitingOnBindingsFallback : false,
+    callerTierError: isDaltonAuth ? callerTierError && fallbackTier === null : false,
     colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
     cosSharingLoaded: data !== undefined,
     coverageUnitsEnabled: coverageData?.enabled === true,
     coverageUnitsPending: coverageLoading,
+    discordChannelsAdmin,
   };
 }
 

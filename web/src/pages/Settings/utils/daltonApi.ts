@@ -636,6 +636,77 @@ export async function fetchDaltonFeishuGroups(): Promise<DaltonFeishuGroupsRespo
   return data;
 }
 
+export interface DaltonDiscordChannelVerifyResponse {
+  ok: boolean;
+  verified: boolean;
+  reason: string | null;
+  channel_id: string;
+  channel_name: string | null;
+  detail: string | null;
+}
+
+/** Verify that a Discord channel ID is visible to the bot and is a guild text channel. */
+export async function verifyDaltonDiscordChannel(
+  channelId: string,
+): Promise<DaltonDiscordChannelVerifyResponse> {
+  const { data } = await api.post<DaltonDiscordChannelVerifyResponse>(
+    '/api/v1/dalton/notify/discord-channels/verify',
+    { channel_id: channelId },
+  );
+  return data;
+}
+
+export interface DaltonChannelChatConfig {
+  workspace_id: string | null;
+  name?: string | null;
+  workspace?: string | null;
+  [extra: string]: unknown;
+}
+
+export interface DaltonChannelAppSettings {
+  preferred: string | null;
+  chats: Record<string, DaltonChannelChatConfig>;
+  automation_output: Record<string, string>;
+  agent_messages: {
+    enabled: boolean;
+    allowed: string[];
+    [extra: string]: unknown;
+  };
+  [extra: string]: unknown;
+}
+
+export interface DaltonChannelChatBindingEntry {
+  platform: string;
+  chat_address: string;
+  chat_name: string | null;
+  workspace_id: string | null;
+  bound_by_user_id: string;
+  last_used_at: number | string | null;
+}
+
+export interface DaltonDiscordChannelEntryRequest {
+  action: 'add' | 'rename';
+  channel_id: string;
+  version: string;
+  name?: string | null;
+}
+
+export async function mutateDaltonDiscordChannel(
+  payload: DaltonDiscordChannelEntryRequest,
+): Promise<DaltonChannelSettingsUpdateResponse> {
+  const { data } = await api.post<DaltonChannelSettingsUpdateResponse>(
+    '/api/v1/dalton/channels/discord-channels',
+    payload,
+  );
+  return data;
+}
+
+export interface DaltonChannelSettingsUpdateResponse {
+  version: string;
+  settings: Record<string, unknown>;
+  changes: string[];
+}
+
 /** Platforms supported by personal channel binding. */
 export type DaltonChannelPlatform = 'feishu' | 'discord' | 'weixin';
 
@@ -735,6 +806,17 @@ export interface DaltonWeixinQrPublicResponse {
 export async function fetchDaltonChannelBindings(): Promise<DaltonChannelBindingsResponse> {
   const { data } = await api.get<DaltonChannelBindingsResponse>(
     '/api/v1/dalton/channels/bindings',
+  );
+  return data;
+}
+
+export async function updateDaltonChannelSettings(payload: {
+  version: string;
+  settings: Record<string, unknown>;
+}): Promise<DaltonChannelSettingsUpdateResponse> {
+  const { data } = await api.put<DaltonChannelSettingsUpdateResponse>(
+    '/api/v1/dalton/channels/settings',
+    payload,
   );
   return data;
 }

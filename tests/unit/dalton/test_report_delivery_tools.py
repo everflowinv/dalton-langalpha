@@ -3759,5 +3759,58 @@ async def test_r5_4_compute_route_warning_failure_logs_and_audits_without_500(
     assert "route_warning evaluation failed" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_sync_owner_group_chat_settings_always_includes_workspace_id() -> None:
+    """Group chat entries written without a workspace must include ``workspace_id: None`` for PUT schema validation."""
+    import psycopg
+
+    from src.server.services.channel_settings import _App
+
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+    cursor.fetchone.return_value = None
+    executed: list[tuple[str, Any]] = []
+
+    async def _execute(sql: object, params: object = None) -> None:
+        executed.append((" ".join(str(sql).split()), params))
+
+    cursor.execute.side_effect = _execute
+
+    @asynccontextmanager
+    async def _cur_cm(*_args: Any, **_kwargs: Any):
+        yield cursor
+
+    @asynccontextmanager
+    async def _tx_cm():
+        yield
+
+    conn = MagicMock()
+    conn.cursor = _cur_cm
+    conn.transaction = _tx_cm
+
+    await rd_svc.sync_owner_group_chat_settings(
+        _OWNER,
+        [
+            {"platform": "discord", "chat_address": "discord:1481256083589697566", "chat_name": "Reports"},
+            {"platform": "feishu", "chat_address": "feishu:oc_g1", "chat_name": "Team", "workspace_id": _WS_UUID},
+        ],
+        conn=conn,
+    )
+
+    inserts = [p for sql, p in executed if "INSERT INTO dalton_channel_user_settings" in sql]
+    assert len(inserts) == 1
+    apps = json.loads(inserts[0][2])
+    assert apps["discord"]["chats"]["discord:1481256083589697566"] == {
+        "name": "Reports",
+        "workspace_id": None,
+    }
+    assert apps["feishu"]["chats"]["feishu:oc_g1"] == {
+        "name": "Team",
+        "workspace_id": _WS_UUID,
+    }
+    # Both entries validate cleanly against the PUT settings _App schema
+    _App.model_validate(apps["discord"])
+    _App.model_validate(apps["feishu"])
+
+
 async def _fake_async_return(val: Any) -> Any:
     return val

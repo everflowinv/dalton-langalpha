@@ -9,10 +9,12 @@ import { DaltonBudgetCard } from '../DaltonBudgetCard';
 
 const h = vi.hoisted(() => ({
   isDaltonAuth: true,
+  userId: undefined as string | undefined,
   callerTier: null as string | null,
   callerTierPending: false,
   callerTierError: false,
   isPm: false,
+  fetchBindings: vi.fn<() => Promise<{ user_tier: string; settings: { version: string; apps: Record<string, unknown> }; chat_bindings: unknown[] }>>(),
   dailyCapUsd: 25 as number,
   coverageEnabled: false,
   coveragePending: false,
@@ -49,6 +51,7 @@ vi.mock('@/hooks/useUser', () => ({
 
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({
+    userId: h.userId,
     user: { id: 'u-1', email: 'analyst@dalton.test' },
     signOut: vi.fn(async () => undefined),
   }),
@@ -163,6 +166,26 @@ vi.mock('../DaltonTeamModelsPanel', () => ({
   ),
 }));
 
+vi.mock('../DaltonWeixinBotCard', () => ({
+  DaltonWeixinBotCard: () => null,
+}));
+
+vi.mock('../DaltonFeishuGroupsCard', () => ({
+  DaltonFeishuGroupsCard: () => null,
+}));
+
+vi.mock('../DaltonNotifyTargetsCard', () => ({
+  DaltonNotifyTargetsCard: () => null,
+}));
+
+vi.mock('@/pages/Settings/utils/daltonApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/Settings/utils/daltonApi')>();
+  return {
+    ...actual,
+    fetchDaltonChannelBindings: () => h.fetchBindings(),
+  };
+});
+
 vi.mock('@/pages/ChatAgent/components/ComputersDialogHost', () => ({
   default: () => null,
 }));
@@ -200,10 +223,12 @@ function renderSettings(initialUrl: string, client?: QueryClient) {
 describe('Settings reorganization (groups, minTier guards, legacy links, dropdowns)', () => {
   beforeEach(() => {
     h.isDaltonAuth = true;
+    h.userId = undefined;
     h.callerTier = 'admin';
     h.callerTierPending = false;
     h.callerTierError = false;
     h.isPm = false;
+    h.fetchBindings.mockReset();
     h.dailyCapUsd = 25;
     h.coverageEnabled = false;
     h.coveragePending = false;
@@ -299,6 +324,24 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
     await waitFor(() => {
       expect(screen.getByTestId('location-spy')).toHaveTextContent('/settings?tab=account');
     });
+  });
+
+  it('keeps admin on ?tab=teamChannels without redirecting when /credentials/status fails or omits caller_tier while /channels/bindings returns admin', async () => {
+    h.isDaltonAuth = true;
+    h.userId = 'u-admin';
+    h.callerTier = null;
+    h.callerTierError = true;
+    h.fetchBindings.mockResolvedValue({
+      user_tier: 'admin',
+      settings: { version: 'v1', apps: {} },
+      chat_bindings: [],
+    });
+
+    renderSettings('/settings?tab=teamChannels#dalton-discord-channels');
+
+    expect(await screen.findByTestId('dalton-discord-channels-card')).toBeInTheDocument();
+    expect(screen.getByTestId('location-spy')).toHaveTextContent('/settings?tab=teamChannels');
+    expect(screen.queryByTestId('settings-permission-denied')).not.toBeInTheDocument();
   });
 
   it('preserves admin & coverage visibility in OSS mode while hiding daltonAuth-only Team Members', async () => {
