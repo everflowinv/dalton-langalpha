@@ -279,10 +279,6 @@ class TurnContextMiddleware(AgentMiddleware):
             the stand-in; stated after a row that said Home was away, and once
             more, naming the folder, after one that said the copy was not done.
         is_subagent: Whether this stack belongs to a subagent.
-        model_key: The model the server resolved this turn onto, stated as a
-            fact of the turn. None (a subagent stack, a context-free build)
-            states no line.
-            # DALTON-HOOK(turn-row-model-line)
     """
 
     def __init__(
@@ -302,7 +298,6 @@ class TurnContextMiddleware(AgentMiddleware):
         home_away: HomeAway | None = None,
         home_back: dict[str, Any] | None = None,
         is_subagent: bool = False,
-        model_key: str | None = None,
     ) -> None:
         super().__init__()
         self._now = now
@@ -319,8 +314,6 @@ class TurnContextMiddleware(AgentMiddleware):
         self._home_away = home_away
         self._home_back = home_back
         self._is_subagent = is_subagent
-        # DALTON-HOOK(turn-row-model-line): server-resolved model of this turn
-        self._model_key = model_key
         # Set once the turn-open hook has run on this instance; see
         # ``abefore_model``.
         self._opened = False
@@ -609,9 +602,6 @@ class TurnContextMiddleware(AgentMiddleware):
             "surface_rules": surface_rules,
             "disk_free_mb": self._disk_free_mb,
             "disk_recovered": disk_recovered,
-            # DALTON-HOOK(turn-row-model-line): stated once here, from the
-            # server's own resolution; nothing user-supplied reaches it.
-            "model_key": self._model_key,
             "home_away": None if self._is_subagent else self._home_away,
             "home_back": home_back,
         }

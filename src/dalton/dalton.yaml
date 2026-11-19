@@ -74,7 +74,7 @@ models:
     muse-oauth: "muse-spark-1.3-oauth"
     xai-oauth: "grok-4.7-oauth"
     z-ai-cn-coding: "glm-5.3-flash-plan"
-    xai: "grok-4.3"
+    xai: "grok-4.7"
     deepseek: "deepseek-flash"
     z-ai: "glm-5.3-flash"
     openai: "gpt-6-luna"

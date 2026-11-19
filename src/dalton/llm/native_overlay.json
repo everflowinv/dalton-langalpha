@@ -965,148 +965,6 @@
           "parameters.thinking.type": "enabled"
         }
       }
-    },
-    "gpt-6.2-astra": {
-      "prompt_guidance": "lean",
-      "model_id": "gpt-6.2-astra",
-      "provider": "openai",
-      "display_name": "GPT-6.2 Astra",
-      "visible": true,
-      "speed": 4,
-      "intelligence": 5,
-      "context": 1050000,
-      "compaction_profile": "expansive",
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf"
-      ],
-      "parameters": {
-        "reasoning": {
-          "summary": "auto"
-        },
-        "prompt_cache_options": {
-          "mode": "implicit"
-        }
-      },
-      "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default": "medium",
-        "write": "parameters.reasoning.effort"
-      }
-    },
-    "gpt-6.2-sol": {
-      "prompt_guidance": "lean",
-      "model_id": "gpt-6.2-sol",
-      "provider": "openai",
-      "display_name": "GPT-6.2 Sol",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 5,
-      "context": 1050000,
-      "compaction_profile": "expansive",
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf"
-      ],
-      "parameters": {
-        "reasoning": {
-          "summary": "auto"
-        },
-        "prompt_cache_options": {
-          "mode": "implicit"
-        }
-      },
-      "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default": "medium",
-        "write": "parameters.reasoning.effort"
-      }
-    },
-    "gpt-6.2-astra-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "gpt-6.2-astra",
-      "provider": "codex-oauth",
-      "display_name": "GPT-6.2 Astra",
-      "visible": true,
-      "speed": 4,
-      "intelligence": 5,
-      "context": 1050000,
-      "compaction_profile": "expansive",
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf"
-      ],
-      "parameters": {
-        "reasoning": {
-          "summary": "auto"
-        },
-        "include": [
-          "reasoning.encrypted_content"
-        ],
-        "store": false
-      },
-      "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default": "medium",
-        "write": "parameters.reasoning.effort"
-      }
-    },
-    "gpt-6.2-sol-oauth": {
-      "prompt_guidance": "lean",
-      "model_id": "gpt-6.2-sol",
-      "provider": "codex-oauth",
-      "display_name": "GPT-6.2 Sol",
-      "visible": true,
-      "speed": 3,
-      "intelligence": 5,
-      "context": 1050000,
-      "compaction_profile": "expansive",
-      "input_modalities": [
-        "text",
-        "image",
-        "pdf"
-      ],
-      "parameters": {
-        "reasoning": {
-          "summary": "auto"
-        },
-        "include": [
-          "reasoning.encrypted_content"
-        ],
-        "store": false
-      },
-      "reasoning": {
-        "efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default": "medium",
-        "write": "parameters.reasoning.effort"
-      }
     }
   },
   "model_overrides": {
@@ -1233,84 +1091,6 @@
           },
           "context_window": 131072,
           "max_output": 32768
-        }
-      ],
-      "openai": [
-        {
-          "id": "gpt-6.2-astra",
-          "name": "GPT-6.2 Astra",
-          "is_reasoning": true,
-          "description": "OpenAI's most capable GPT-6.2 reasoning model with tiered short/long-context pricing",
-          "pricing": {
-            "input_tiers": [
-              {
-                "max_tokens": 272000,
-                "rate": 8.0,
-                "cached_input": 0.4,
-                "cache_5m": 10.0
-              },
-              {
-                "max_tokens": null,
-                "rate": 16.0,
-                "cached_input": 0.8,
-                "cache_5m": 20.0
-              }
-            ],
-            "cache_5m": 10.0,
-            "output_tiers": [
-              {
-                "max_tokens": 272000,
-                "rate": 40.0
-              },
-              {
-                "max_tokens": null,
-                "rate": 60.0
-              }
-            ],
-            "output_pricing_mode": "input_dependent",
-            "input_pricing_mode": "input_dependent",
-            "unit": "per_1m_tokens"
-          },
-          "context_window": 1050000,
-          "max_output": 128000
-        },
-        {
-          "id": "gpt-6.2-sol",
-          "name": "GPT-6.2 Sol",
-          "is_reasoning": true,
-          "description": "OpenAI's GPT-6.2 model balancing intelligence and cost, with tiered short/long-context pricing",
-          "pricing": {
-            "input_tiers": [
-              {
-                "max_tokens": 272000,
-                "rate": 2.0,
-                "cached_input": 0.1,
-                "cache_5m": 2.5
-              },
-              {
-                "max_tokens": null,
-                "rate": 4.0,
-                "cached_input": 0.2,
-                "cache_5m": 5.0
-              }
-            ],
-            "cache_5m": 2.5,
-            "output_tiers": [
-              {
-                "max_tokens": 272000,
-                "rate": 10.0
-              },
-              {
-                "max_tokens": null,
-                "rate": 15.0
-              }
-            ],
-            "output_pricing_mode": "input_dependent",
-            "input_pricing_mode": "input_dependent",
-            "unit": "per_1m_tokens"
-          },
-          "context_window": 1050000,
-          "max_output": 128000
         }
       ]
     },
@@ -1665,11 +1445,6 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "grok-4.3": {
-      "family": "xai-grok",
-      "billing": "cash",
-      "tool_calling": true
-    },
     "grok-4.7-oauth": {
       "family": "xai-grok",
       "billing": "subscription",
@@ -1702,17 +1477,7 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "gpt-6-astra": {
-      "family": "openai-gpt",
-      "billing": "cash",
-      "tool_calling": true
-    },
     "gpt-6.2-sol": {
-      "family": "openai-gpt",
-      "billing": "cash",
-      "tool_calling": true
-    },
-    "gpt-6.1-sol": {
       "family": "openai-gpt",
       "billing": "cash",
       "tool_calling": true
@@ -1797,22 +1562,12 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "glm-5.2": {
-      "family": "zai-glm",
-      "billing": "cash",
-      "tool_calling": true
-    },
     "glm-5.3": {
       "family": "zai-glm",
       "billing": "cash",
       "tool_calling": true
     },
     "glm-5.3-flash": {
-      "family": "zai-glm",
-      "billing": "cash",
-      "tool_calling": true
-    },
-    "glm-5.2-cn": {
       "family": "zai-glm",
       "billing": "cash",
       "tool_calling": true
@@ -1872,16 +1627,6 @@
       "billing": "cash",
       "tool_calling": true
     },
-    "kimi-k3-coding": {
-      "family": "moonshot-kimi",
-      "billing": "cash",
-      "tool_calling": true
-    },
-    "gpt-5.3-codex-spark-oauth": {
-      "family": "openai-gpt",
-      "billing": "subscription",
-      "tool_calling": true
-    },
     "gpt-6.1-terra-oauth": {
       "family": "openai-gpt",
       "billing": "subscription",
@@ -1894,23 +1639,11 @@
       "tool_calling": true,
       "notional_ref": "gpt-6.2-astra"
     },
-    "gpt-6-astra-oauth": {
-      "family": "openai-gpt",
-      "billing": "subscription",
-      "tool_calling": true,
-      "notional_ref": "gpt-6-astra"
-    },
     "gpt-6.2-sol-oauth": {
       "family": "openai-gpt",
       "billing": "subscription",
       "tool_calling": true,
       "notional_ref": "gpt-6.2-sol"
-    },
-    "gpt-6.1-sol-oauth": {
-      "family": "openai-gpt",
-      "billing": "subscription",
-      "tool_calling": true,
-      "notional_ref": "gpt-6.1-sol"
     },
     "gpt-6-luna-oauth": {
       "family": "openai-gpt",
@@ -1962,10 +1695,6 @@
     }
   },
   "retired": [
-    {
-      "key": "grok-4.5-oauth",
-      "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"
-    },
     {
       "key": "grok-4.6-oauth",
       "reason": "upstream grok-oauth (api.x.ai) inference not offered; Grok rides the pinned xai-oauth line"

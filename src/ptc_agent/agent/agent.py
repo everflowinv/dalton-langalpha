@@ -59,6 +59,10 @@ from ptc_agent.agent.middleware.background_subagent import (
     SubagentEventCaptureMiddleware,
     SubagentToolResultCaptureMiddleware,
 )
+from ptc_agent.agent.middleware.background_subagent.subagent import (
+    ClaudeCodeSubagent,
+    run_on_by_type,
+)
 from ptc_agent.agent.transcript.classify import MARKET_ALERT_SENDER, WAKEUP_SENDER
 from ptc_agent.agent.middleware.compaction.notes import (
     NotesDueMiddleware,
@@ -126,7 +130,9 @@ from ptc_agent.agent.prompts import (
     guidance_template_vars,
     workspace_path_vars,
 )
-from ptc_agent.agent.subagents.assembly import compile_subagents, task_middleware
+from ptc_agent.agent.subagents import create_subagents
+from ptc_agent.agent.subagents.assembly import subagent_compiler, task_middleware
+from ptc_agent.agent.subagents.merge import turn_roster
 from ptc_agent.agent.tools import (
     create_execute_bash_tool,
     create_execute_code_tool,
@@ -164,6 +170,7 @@ from src.tools.messaging import build_messaging_tools, messaging_enabled
 from src.tools.wakeups.tool import build_schedule_wakeup_tool
 from src.tools.thread_status.tool import build_thread_status_tool
 from ptc_agent.config import AgentConfig
+from ptc_agent.config.agent import Admitted, TaskModel
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.sandbox import PTCSandbox
 from ptc_agent.core.sandbox.livefs_mount import CallContext
@@ -809,10 +816,11 @@ class PTCAgent:
         # prompt ("No sub-agents configured."), no Task tool below.
         # DALTON-HOOK(colleague-dispatch): tail turns after access revocation withhold Task/RunWorkflow while keeping TaskOutput
         subagents: list[dict[str, Any]] = []
+        compiler: Any = None
+        _attach_check_language: Any = None
         if not disable_subagents and not tail_turn_no_new_work:
-            subagents = compile_subagents(
+            compiler = subagent_compiler(
                 self.config,
-                role,
                 sandbox=sandbox,
                 mcp_registry=mcp_registry,
                 execute_code=sub_code_tool,
@@ -838,7 +846,9 @@ class PTCAgent:
                 skill_registry=subagent_skill_registry,
                 scratchpad=scratchpad.folder if scratchpad is not None else None,
                 research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
+                model=turn.label,
             )
+            subagents = create_subagents(turn_roster(self.config.subagents), compiler, role)
             # DALTON-HOOK(dalton-tools): Dalton workflows drive the two
             # language-review rounds through general-purpose dispatches, and
             # check_language is a server-side tool (LLMService + the configured
@@ -857,10 +867,13 @@ class PTCAgent:
                             for tool in create_publish_tools(filesystem_backend)
                             if getattr(tool, "name", "") == "check_language"
                         )
-                        for spec in subagents:
+
+                        def _attach_check_language(spec: dict[str, Any]) -> None:
                             if spec.get("name") == "general-purpose":
                                 spec.setdefault("tools", []).append(check_language)
-                                break
+
+                        for spec in subagents:
+                            _attach_check_language(spec)
                 except Exception as e:
                     logger.debug("[DALTON_TOOLS] check_language not bound to subagents: %s", e)
             subagents.extend(additional_subagents or [])
@@ -873,7 +886,11 @@ class PTCAgent:
             registry=_bg_registry,
             checkpointer=checkpointer,
             namespace_owner=namespace_owner,
-            subagent_models=self.config.subagent_models,
+            run_on=run_on_by_type(
+                subagents, default_model=turn.client, models=self.config.subagent_models,
+                claude_code=claude_code_cli,
+            ),
+            task_models=self.config.task_models,
         )
         main_only_middleware.append(background_middleware)
         if not disable_subagents:
@@ -1159,6 +1176,7 @@ class PTCAgent:
             files_mounted=files_mounted,
             switches=ProfileSwitches(channels=gates.channels, wakeups=wakeups_on),
             blocks={
+                "model": lambda _state, label=turn.label: label,
                 "mcp_servers": lambda _state: tool_summary,
                 "skills": lambda state: skill_loader_middleware.build_manifest(state)
                 or "",
@@ -1198,29 +1216,41 @@ class PTCAgent:
             else None
         )
 
-        def claude_code_subagent(compiled: Any, spec: Any, target: ClaudeCodeTarget) -> Any:
-            from ptc_agent.agent.claude_code.agent import claude_code_graph
-            from ptc_agent.agent.claude_code.compaction import CompactionRules
-            from ptc_agent.agent.claude_code.mid_turn import TaskSteering
-            from ptc_agent.agent.claude_code.ssh_launcher import SUBAGENT_CLI_SLOT_WAIT_S
+        def claude_code_subagent(admitted: Admitted) -> ClaudeCodeSubagent:
+            launcher_for = partial(claude_code_launcher, sandbox, admitted)
 
-            background_middleware.claude_code_types |= {spec["name"]}
-            background_middleware.claude_code_stored = bool(claude_code_cli.saved)
-            background_middleware.claude_code_models[spec["name"]] = target.model
-            background_middleware.cli_computer = claude_code_cli.cli_computer
-            own = list(spec.get("middleware") or [])
-            baseline = next((m for m in own if isinstance(m, BaselineContextMiddleware)), None)
-            return claude_code_graph(
-                compiled, system_prompt=spec["system_prompt"], target=target,
-                user_id=user_id, checkpointer=checkpointer,
-                launcher=partial(claude_code_launcher_for, slot_wait_s=SUBAGENT_CLI_SLOT_WAIT_S),
-                entry=(subagent_skill_middleware, subagent_turn_context, *own),
-                middleware=[*subagent_middleware, *own],
-                baseline=baseline.frozen_block if baseline is not None else None,
-                steering=TaskSteering(subagent_steering),
-                compaction=CompactionRules.of_subagent(self.config.compaction, backend=backend,
-                                                      workspace_id=folder_workspace_id),
+            def build(compiled: Any, spec: Any, target: ClaudeCodeTarget) -> Any:
+                from ptc_agent.agent.claude_code.agent import claude_code_graph
+                from ptc_agent.agent.claude_code.compaction import CompactionRules
+                from ptc_agent.agent.claude_code.mid_turn import TaskSteering
+                from ptc_agent.agent.claude_code.ssh_launcher import SUBAGENT_CLI_SLOT_WAIT_S
+
+                own = list(spec.get("middleware") or [])
+                baseline = next((m for m in own if isinstance(m, BaselineContextMiddleware)), None)
+                return claude_code_graph(
+                    compiled, system_prompt=spec["system_prompt"], target=target,
+                    user_id=user_id, checkpointer=checkpointer,
+                    launcher=partial(launcher_for, slot_wait_s=SUBAGENT_CLI_SLOT_WAIT_S),
+                    entry=(subagent_skill_middleware, subagent_turn_context, *own),
+                    middleware=[*subagent_middleware, *own],
+                    baseline=baseline.frozen_block if baseline is not None else None,
+                    steering=TaskSteering(subagent_steering),
+                    compaction=CompactionRules.of_subagent(self.config.compaction, backend=backend,
+                                                          workspace_id=folder_workspace_id),
+                )
+
+            return build
+
+        def compile_on(subagent_type: str, on: TaskModel) -> dict[str, Any]:
+            """A type's spec on the model a Task names, compiled from its
+            definition so its prompt is scaffolded for that model."""
+            spec = compiler.compile(
+                turn_roster(self.config.subagents).definitions[subagent_type],
+                client=on.client, guidance=on.guidance,
             )
+            if _attach_check_language is not None:
+                _attach_check_language(spec)
+            return spec
 
         # DALTON-HOOK(colleague-dispatch): withhold Task/RunWorkflow on tail turns while keeping TaskOutput
         subagent_task_middleware = (
@@ -1231,7 +1261,13 @@ class PTCAgent:
                 middleware=subagent_middleware,
                 registry=background_middleware.registry,
                 checkpointer=checkpointer,
-                claude_code=claude_code_subagent if claude_code_launcher_for is not None else None,
+                claude_code=(
+                    claude_code_subagent(claude_code_cli)
+                    if claude_code_launcher_for is not None
+                    else None
+                ),
+                compile_on=compile_on if self.config.task_models is not None else None,
+                claude_code_on=claude_code_subagent if claude_code_launcher is not None else None,
             )
             if not disable_subagents and not tail_turn_no_new_work
             else None

@@ -1,10 +1,12 @@
 """Hand-offs and new workspaces the user approved in advance.
 
-The setting lives in ``other_preference``, which the agent cannot write. It is
-read when the model proposes the call and recorded against that call in the
-thread state, never when the tool runs: a tool that paused re-runs from the top
-on resume, so a setting changed while its card was pending would otherwise
-skip an answer the user already gave, and a hand-off they declined would run.
+The settings live in ``other_preference``, which the agent cannot write. New
+workspaces are made with ``la``, whose approval reads its setting itself
+(``cli_approval``). The hand-off's is read when the model proposes the call
+and recorded against that call in the thread state, never when the tool runs:
+a tool that paused re-runs from the top on resume, so a setting changed while
+its card was pending would otherwise skip an answer the user already gave,
+and a hand-off they declined would run.
 """
 
 import logging
@@ -16,11 +18,16 @@ from langchain.agents.middleware.types import PrivateStateAttr
 from typing_extensions import NotRequired
 
 from ptc_agent.agent.pending_calls import pending_calls
+from src.tools.secretary._commands import HANDOFF_TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
 AUTO_APPROVE_HANDOFFS = "auto_approve_handoffs"
+#: Lets ``manage_workspaces(action="create")`` (or ``la workspaces create``)
+#: run without asking in the app; the web's Settings and the create dialog's
+#: "always" save it.
 AUTO_APPROVE_WORKSPACE_CREATION = "auto_approve_workspace_creation"
+# DALTON-HOOK(computer-cli-tokens-off): server-side manage_workspaces(create) uses standing approval.
 AUTO_APPROVE_KEYS = (AUTO_APPROVE_HANDOFFS, AUTO_APPROVE_WORKSPACE_CREATION)
 
 # DALTON-HOOK(workspace-duplicate-guard): a company workspace is named for its
@@ -96,14 +103,35 @@ async def _standing_create_withheld(user_id: str, call: dict[str, Any]) -> bool:
     return holder is not None or not confirmed
 
 
+async def standing_approval(user_id: str, key: str) -> bool:
+    """Whether the user turned on the ``other_preference`` setting ``key``."""
+    from src.server.database.user import get_user_preferences
+
+    try:
+        # Uncached: a read racing the write that turned it off could cache
+        # the old yes.
+        prefs = await get_user_preferences(user_id, cached=False)
+    except Exception:
+        # Asking is the default, so a setting that cannot be read asks
+        # instead of failing the call.
+        logger.warning(
+            f"Could not read approval settings for user {user_id}; asking",
+            exc_info=True,
+        )
+        return False
+    other = (prefs or {}).get("other_preference") or {}
+    return other.get(key) is True
+
+
 def _settings_for(call: dict[str, Any]) -> str | None:
     """The setting that, granted, lets ``call`` run without its card."""
     args = call.get("args")
     if not isinstance(args, dict):
         args = {}
     name = call.get("name")
-    if name == "delegate_to_analyst":
+    if name == HANDOFF_TOOL_NAME:
         return AUTO_APPROVE_HANDOFFS
+    # DALTON-HOOK(computer-cli-tokens-off): CoS workspace create tool uses standing approval.
     if name == "manage_workspaces" and args.get("action") == "create":
         return AUTO_APPROVE_WORKSPACE_CREATION
     return None
@@ -113,7 +141,9 @@ async def _granted(user_id: str) -> set[str]:
     from src.server.database.user import get_user_preferences
 
     try:
-        prefs = await get_user_preferences(user_id)
+        # Uncached: a read racing the write that turned it off could cache
+        # the old yes.
+        prefs = await get_user_preferences(user_id, cached=False)
     except Exception:
         # Asking is the default, so a setting that cannot be read shows the
         # card instead of failing the turn.

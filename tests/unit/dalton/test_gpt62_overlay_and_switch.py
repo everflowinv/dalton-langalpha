@@ -31,15 +31,27 @@ from src.llms.pricing_utils import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_gpt62_models_loaded_from_overlay_and_keep_61_intact() -> None:
+def test_gpt62_models_from_upstream_manifest_keep_notional_and_retire_61() -> None:
     LLM._model_config = None
     mc = ModelConfig()
+    upstream_models = json.loads(
+        (REPO_ROOT / "src/llms/manifest/models.json").read_text(encoding="utf-8")
+    )
+    overlay_data = overlay_mod.load_overlay_data(overlay_mod.NATIVE_OVERLAY_PATH) or {}
+    overlay_models = overlay_data.get("models") or {}
+    overlay_provider_models = (overlay_data.get("providers") or {}).get("models") or {}
+    dalton_meta = overlay_mod.load_dalton_meta()
+
     for key, expected_provider, expected_model_id, expected_speed in (
-        ("gpt-6.2-astra", "openai", "gpt-6.2-astra", 4),
+        ("gpt-6.2-astra", "openai", "gpt-6.2-astra", 3),
         ("gpt-6.2-sol", "openai", "gpt-6.2-sol", 3),
-        ("gpt-6.2-astra-oauth", "codex-oauth", "gpt-6.2-astra", 4),
+        ("gpt-6.2-astra-oauth", "codex-oauth", "gpt-6.2-astra", 3),
         ("gpt-6.2-sol-oauth", "codex-oauth", "gpt-6.2-sol", 3),
     ):
+        assert key in upstream_models, f"{key} should be provided by upstream manifest"
+        assert key not in overlay_models, f"{key} should not duplicate upstream in overlay"
+        assert key in dalton_meta, f"{key} missing from dalton_meta"
+
         entry = mc.get_model_config(key)
         assert entry is not None, f"{key} missing from merged ModelConfig"
         assert entry["provider"] == expected_provider
@@ -51,9 +63,12 @@ def test_gpt62_models_loaded_from_overlay_and_keep_61_intact() -> None:
         assert entry["reasoning"]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
         assert entry["reasoning"]["default"] == "medium"
 
-    # Legacy 6 Astra and 6.1 Sol cards stay available for historical threads/billing.
+    assert "openai" not in overlay_provider_models
+
+    # Upstream retired 6.0 Astra and 6.1 Sol keys are absent from catalog and dalton_meta.
     for old_key in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-astra-oauth", "gpt-6.1-sol-oauth"):
-        assert mc.get_model_config(old_key) is not None
+        assert mc.get_model_config(old_key) is None
+        assert old_key not in dalton_meta
 
 
 @pytest.mark.parametrize(

@@ -522,10 +522,11 @@ async def _send(
         try:
             files_workspace_id = str(uuid.UUID(files_workspace_id))
         except ValueError:
+            # DALTON-HOOK(computer-cli-tokens-off): direct to manage_workspaces(action="list") when la CLI is off.
             return _refusal(
                 "failed",
                 "invalid_request",
-                "workspace_id is not a workspace id; take it from manage_workspaces. "
+                f"workspace_id is not a workspace id; take it from {_workspace_list_source()}. "
                 "Nothing was sent.",
             )
 
@@ -646,10 +647,21 @@ _FILES_ANYWHERE = (
 )
 
 
+# DALTON-HOOK(computer-cli-tokens-off): direct to manage_workspaces(action="list") when la CLI is off.
+def _workspace_list_source() -> str:
+    from src.dalton.settings import is_computer_cli_tokens_enabled
+
+    if is_computer_cli_tokens_enabled():
+        return "`la workspaces list`"
+    return '`manage_workspaces(action="list")`'
+
+
 def _send_from_home(computers: ComputerReach | None) -> BaseTool:
     """The Chief of Staff's ``send_message``, which attaches from Home or the
     workspace it names, since it reads every workspace; and, given the user's
     other ``computers``, from any of them."""
+    # DALTON-HOOK(computer-cli-tokens-off): direct to manage_workspaces(action="list") when la CLI is off.
+    workspace_list_source = _workspace_list_source()
 
     async def send_message(
         text: _TEXT_ARG,
@@ -659,7 +671,7 @@ def _send_from_home(computers: ComputerReach | None) -> BaseTool:
         ] = None,
         workspace_id: Annotated[
             str | None,
-            "The id of the workspace the files are in, from manage_workspaces, when they "
+            f"The id of the workspace the files are in, from {workspace_list_source}, when they "
             "are not in Home. Omit it for Home's files.",
         ] = None,
         target: _TARGET_ARG = None,

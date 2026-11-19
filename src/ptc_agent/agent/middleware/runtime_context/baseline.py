@@ -67,6 +67,7 @@ from ptc_agent.agent.middleware.runtime_context.epoch import (
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     HARNESS_BLOCKS,
     MCP_SERVERS_BLOCK,
+    MODEL_BLOCK,  # DALTON-HOOK(computer-cli-tokens-off)
     SKILLS_BLOCK,
     harness_update_kind,
 )
@@ -638,11 +639,18 @@ class BaselineContextMiddleware(AgentMiddleware):
             entry = epoch.blocks.get(kind)
             if entry is None:
                 continue
+            extra: dict[str, Any] = {}
+            if kind == MODEL_BLOCK:
+                # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
+                from src.dalton.settings import is_computer_cli_tokens_enabled
+
+                extra["cli_tokens"] = is_computer_cli_tokens_enabled()
             parts[kind] = render_template(
                 HARNESS_BLOCKS[kind].template,
                 content=entry.text,
                 guidance=guidance,
                 subagent=self._subagent,
+                **extra,
             )
 
         if epoch.has_files:

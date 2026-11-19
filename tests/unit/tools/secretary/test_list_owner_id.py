@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 
+from src.dalton.settings import is_dalton_supabase_auth_enabled
+from src.server.database.computer import get_computer_roster
+from src.server.database.workspace import get_workspaces_for_user
 from src.tools.secretary import tools
 
 pytestmark = pytest.mark.asyncio
@@ -40,12 +43,16 @@ async def test_workspace_list_rows_carry_only_what_a_hand_off_reads():
     }
     with patch(
         "src.server.database.workspace.get_workspaces_for_user",
-        AsyncMock(return_value=([row], 1)),
+        create_autospec(get_workspaces_for_user, return_value=([row], 1)),
     ), patch(
         "src.server.database.computer.get_computer_roster",
-        AsyncMock(
-            return_value=[{"computer_id": "cmp-1", "name": "Cloud computer", "is_home": True}]
+        create_autospec(
+            get_computer_roster,
+            return_value=[{"computer_id": "cmp-1", "name": "Cloud computer", "is_home": True}],
         ),
+    ), patch(
+        "src.dalton.settings.is_dalton_supabase_auth_enabled",
+        create_autospec(is_dalton_supabase_auth_enabled, return_value=False),
     ):
         command = await tools.workspaces_list(OWNER, "call-1")
     content = command.update["messages"][0].content
@@ -74,7 +81,8 @@ async def test_each_row_names_its_folder_and_with_two_computers_its_computer():
         {"workspace_id": "ws-here", "computer_id": "cmp-home", "dir_name": "semis"},
         {"workspace_id": "ws-there", "computer_id": "cmp-other", "dir_name": "macro"},
     ]
-    read_computers = AsyncMock(
+    read_computers = create_autospec(
+        get_computer_roster,
         return_value=[
             {
                 "computer_id": "cmp-home",
@@ -90,12 +98,17 @@ async def test_each_row_names_its_folder_and_with_two_computers_its_computer():
                 "provider_config": {"os": "Linux"},
                 "root_dir": "/home/me/langalpha",
             },
-        ]
+        ],
     )
     with patch(
         "src.server.database.workspace.get_workspaces_for_user",
-        AsyncMock(return_value=(rows, 2)),
-    ), patch("src.server.database.computer.get_computer_roster", read_computers):
+        create_autospec(get_workspaces_for_user, return_value=(rows, 2)),
+    ), patch(
+        "src.server.database.computer.get_computer_roster", read_computers
+    ), patch(
+        "src.dalton.settings.is_dalton_supabase_auth_enabled",
+        create_autospec(is_dalton_supabase_auth_enabled, return_value=False),
+    ):
         command = await chief_of_staff_workspaces.ainvoke(
             {
                 "name": "manage_workspaces",

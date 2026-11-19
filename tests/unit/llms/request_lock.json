@@ -2608,328 +2608,6 @@
    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
   }
  },
- "glm-5.2": {
-  "client": "ChatZai",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "glm-5.2",
-   "pricing_model_id": "glm-5.2",
-   "pricing_provider": "z-ai",
-   "provider_route": "z-ai",
-   "reasoning_effort": "high"
-  },
-  "request": {
-   "body": {
-    "max_tokens": 128000,
-    "messages": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user"
-     }
-    ],
-    "model": "glm-5.2",
-    "reasoning_effort": "high",
-    "stream": false,
-    "thinking": {
-     "clear_thinking": false,
-     "type": "enabled"
-    },
-    "tools": [
-     {
-      "function": {
-       "description": "Look up a symbol.",
-       "name": "lock_probe",
-       "parameters": {
-        "properties": {
-         "symbol": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "symbol"
-        ],
-        "type": "object"
-       }
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.z.ai"
-   },
-   "method": "POST",
-   "url": "https://api.z.ai/api/paas/v4/chat/completions"
-  }
- },
- "glm-5.2-cn": {
-  "client": "ChatZai",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "glm-5.2-cn",
-   "pricing_model_id": "glm-5.2",
-   "pricing_provider": "z-ai-cn",
-   "provider_route": "z-ai-cn",
-   "reasoning_effort": "high"
-  },
-  "request": {
-   "body": {
-    "max_tokens": 128000,
-    "messages": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user"
-     }
-    ],
-    "model": "glm-5.2",
-    "reasoning_effort": "high",
-    "stream": false,
-    "thinking": {
-     "clear_thinking": false,
-     "type": "enabled"
-    },
-    "tools": [
-     {
-      "function": {
-       "description": "Look up a symbol.",
-       "name": "lock_probe",
-       "parameters": {
-        "properties": {
-         "symbol": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "symbol"
-        ],
-        "type": "object"
-       }
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "open.bigmodel.cn"
-   },
-   "method": "POST",
-   "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-  }
- },
  "glm-5.3": {
   "client": "ChatZai",
   "graph_build": {
@@ -3574,488 +3252,6 @@
    "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions"
   }
  },
- "gpt-5.3-codex-spark-oauth": {
-  "client": "ChatCodexOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "0424ded8fa854bd64500b0c686d9160e531cb6ae310fe7970fc27e7f09316bd4",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "oauth",
-   "manifest_model": "gpt-5.3-codex-spark-oauth",
-   "pricing_model_id": "gpt-5.3-codex-spark",
-   "pricing_provider": "codex-oauth",
-   "provider_route": "codex-oauth",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
-    "input": [
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-5.3-codex-spark",
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "store": false,
-    "stream": true,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "chatgpt.com",
-    "originator": "codex_cli_rs"
-   },
-   "method": "POST",
-   "url": "https://chatgpt.com/backend-api/codex/responses"
-  }
- },
- "gpt-6-astra": {
-  "client": "ChatOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "gpt-6-astra",
-   "pricing_model_id": "gpt-6-astra",
-   "pricing_provider": "openai",
-   "provider_route": "openai",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "input": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system",
-      "type": "message"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "model": "gpt-6-astra",
-    "prompt_cache_options": {
-     "mode": "implicit"
-    },
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "stream": false,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.openai.com"
-   },
-   "method": "POST",
-   "url": "https://api.openai.com/v1/responses"
-  }
- },
- "gpt-6-astra-oauth": {
-  "client": "ChatCodexOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "oauth",
-   "manifest_model": "gpt-6-astra-oauth",
-   "pricing_model_id": "gpt-6-astra",
-   "pricing_provider": "codex-oauth",
-   "provider_route": "codex-oauth",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
-    "input": [
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-6-astra",
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "store": false,
-    "stream": true,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "chatgpt.com",
-    "originator": "codex_cli_rs"
-   },
-   "method": "POST",
-   "url": "https://chatgpt.com/backend-api/codex/responses"
-  }
- },
  "gpt-6-luna": {
   "client": "ChatOpenAI",
   "graph_build": {
@@ -4342,328 +3538,6 @@
     ],
     "instructions": "You are a lock probe.",
     "model": "gpt-6-luna",
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "store": false,
-    "stream": true,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "chatgpt.com",
-    "originator": "codex_cli_rs"
-   },
-   "method": "POST",
-   "url": "https://chatgpt.com/backend-api/codex/responses"
-  }
- },
- "gpt-6.1-sol": {
-  "client": "ChatOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "gpt-6.1-sol",
-   "pricing_model_id": "gpt-6.1-sol",
-   "pricing_provider": "openai",
-   "provider_route": "openai",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "input": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system",
-      "type": "message"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "model": "gpt-6.1-sol",
-    "prompt_cache_options": {
-     "mode": "implicit"
-    },
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "stream": false,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.openai.com"
-   },
-   "method": "POST",
-   "url": "https://api.openai.com/v1/responses"
-  }
- },
- "gpt-6.1-sol-oauth": {
-  "client": "ChatCodexOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "oauth",
-   "manifest_model": "gpt-6.1-sol-oauth",
-   "pricing_model_id": "gpt-6.1-sol",
-   "pricing_provider": "codex-oauth",
-   "provider_route": "codex-oauth",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
-    "input": [
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-6.1-sol",
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
@@ -5022,7 +3896,7 @@
    "url": "https://chatgpt.com/backend-api/codex/responses"
   }
  },
- "grok-4.3": {
+ "gpt-6.2-astra": {
   "client": "ChatOpenAI",
   "graph_build": {
    "middleware": [
@@ -5066,7 +3940,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "0424ded8fa854bd64500b0c686d9160e531cb6ae310fe7970fc27e7f09316bd4",
+   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5126,17 +4000,14 @@
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "grok-4.3",
-   "pricing_model_id": "grok-4.3",
-   "pricing_provider": "xai",
-   "provider_route": "xai",
+   "manifest_model": "gpt-6.2-astra",
+   "pricing_model_id": "gpt-6.2-astra",
+   "pricing_provider": "openai",
+   "provider_route": "openai",
    "reasoning_effort": "medium"
   },
   "request": {
    "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
     "input": [
      {
       "content": "You are a lock probe.",
@@ -5149,12 +4020,14 @@
       "type": "message"
      }
     ],
-    "model": "grok-4.3",
+    "model": "gpt-6.2-astra",
+    "prompt_cache_options": {
+     "mode": "implicit"
+    },
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
     },
-    "store": false,
     "stream": false,
     "tools": [
      {
@@ -5179,14 +4052,14 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.x.ai"
+    "host": "api.openai.com"
    },
    "method": "POST",
-   "url": "https://api.x.ai/v1/responses"
+   "url": "https://api.openai.com/v1/responses"
   }
  },
- "grok-4.3-oauth": {
-  "client": "ChatGrokOpenAI",
+ "gpt-6.2-astra-oauth": {
+  "client": "ChatCodexOpenAI",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -5229,7 +4102,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "0424ded8fa854bd64500b0c686d9160e531cb6ae310fe7970fc27e7f09316bd4",
+   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5289,11 +4162,11 @@
   },
   "metadata": {
    "billing_type": "oauth",
-   "manifest_model": "grok-4.3-oauth",
-   "pricing_model_id": "grok-4.3",
-   "pricing_provider": "xai-oauth",
-   "provider_route": "xai-oauth",
-   "reasoning_effort": "high"
+   "manifest_model": "gpt-6.2-astra-oauth",
+   "pricing_model_id": "gpt-6.2-astra",
+   "pricing_provider": "codex-oauth",
+   "provider_route": "codex-oauth",
+   "reasoning_effort": "medium"
   },
   "request": {
    "body": {
@@ -5302,21 +4175,15 @@
     ],
     "input": [
      {
-      "content": "You are a lock probe.",
-      "role": "system",
-      "type": "message"
-     },
-     {
       "content": "Look up AAPL.",
       "role": "user",
       "type": "message"
      }
     ],
-    "max_output_tokens": 64000,
-    "model": "grok-4.3",
-    "prompt_cache_key": "<uuid>",
+    "instructions": "You are a lock probe.",
+    "model": "gpt-6.2-astra",
     "reasoning": {
-     "effort": "high",
+     "effort": "medium",
      "summary": "auto"
     },
     "store": false,
@@ -5344,17 +4211,14 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "cli-chat-proxy.grok.com",
-    "x-client-request-id": "<uuid>",
-    "x-grok-client-version": "1.0.67",
-    "x-grok-model-override": "grok-4.3",
-    "x-xai-token-auth": "xai-grok-cli"
+    "host": "chatgpt.com",
+    "originator": "codex_cli_rs"
    },
    "method": "POST",
-   "url": "https://cli-chat-proxy.grok.com/v1/responses"
+   "url": "https://chatgpt.com/backend-api/codex/responses"
   }
  },
- "grok-4.5": {
+ "gpt-6.2-sol": {
   "client": "ChatOpenAI",
   "graph_build": {
    "middleware": [
@@ -5398,7 +4262,7 @@
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "0424ded8fa854bd64500b0c686d9160e531cb6ae310fe7970fc27e7f09316bd4",
+   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5458,17 +4322,14 @@
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "grok-4.5",
-   "pricing_model_id": "grok-4.5",
-   "pricing_provider": "xai",
-   "provider_route": "xai",
+   "manifest_model": "gpt-6.2-sol",
+   "pricing_model_id": "gpt-6.2-sol",
+   "pricing_provider": "openai",
+   "provider_route": "openai",
    "reasoning_effort": "medium"
   },
   "request": {
    "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
     "input": [
      {
       "content": "You are a lock probe.",
@@ -5481,12 +4342,14 @@
       "type": "message"
      }
     ],
-    "model": "grok-4.5",
+    "model": "gpt-6.2-sol",
+    "prompt_cache_options": {
+     "mode": "implicit"
+    },
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
     },
-    "store": false,
     "stream": false,
     "tools": [
      {
@@ -5511,14 +4374,171 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.x.ai"
+    "host": "api.openai.com"
    },
    "method": "POST",
-   "url": "https://api.x.ai/v1/responses"
+   "url": "https://api.openai.com/v1/responses"
   }
  },
- "grok-4.5-oauth": {
-  "client_error": "ValueError"
+ "gpt-6.2-sol-oauth": {
+  "client": "ChatCodexOpenAI",
+  "graph_build": {
+   "middleware": [
+    "FrozenPromptMiddleware",
+    "TimeUpToolStopMiddleware",
+    "LargeResultEvictionMiddleware",
+    "SubAgentMiddleware",
+    "WakeupQuietGuardMiddleware",
+    "CreditGateMiddleware",
+    "RepeatCallGuardMiddleware",
+    "ToolArgumentParsingMiddleware",
+    "ComputerArgumentGuardMiddleware",
+    "ProtectedPathMiddleware",
+    "CodeValidationMiddleware",
+    "ToolErrorHandlingMiddleware",
+    "LeakDetectionMiddleware",
+    "ToolResultNormalizationMiddleware",
+    "FileOperationMiddleware",
+    "ProvenanceMiddleware",
+    "SkillsMiddleware",
+    "SteeringMiddleware",
+    "BackgroundSubagentMiddleware",
+    "AskUserMiddleware",
+    "StreamHeartbeatMiddleware",
+    "CompactionMiddleware",
+    "ModelResilienceMiddleware",
+    "MultimodalStripMiddleware",
+    "MultimodalMiddleware",
+    "AnthropicPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
+    "ToolSurfaceMiddleware",
+    "EmptyToolCallRetryMiddleware",
+    "DaltonPatchToolCallsMiddleware",
+    "TurnContextMiddleware",
+    "DaltonReconcileMiddleware",
+    "BaselineContextMiddleware",
+    "NotesDueMiddleware",
+    "RowCarrierMiddleware",
+    "SystemPinMiddleware",
+    "ReasoningCompatibilityMiddleware"
+   ],
+   "model_is_the_client": true,
+   "state_schema": "MainAgentState",
+   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
+   "tools": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "ai_finance_prepare",
+    "ai_finance_read",
+    "ai_finance_report",
+    "ai_finance_signals",
+    "automation_report",
+    "check_draft",
+    "check_language",
+    "dalton_check_done",
+    "dalton_coverage_tracking",
+    "dalton_notify_settings",
+    "dalton_report_delivery",
+    "dalton_schedule_automation",
+    "dalton_system_jobs",
+    "feishu_append",
+    "feishu_create_doc",
+    "feishu_grant_access",
+    "feishu_list_wiki",
+    "feishu_read",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "ingest_company_wiki",
+    "ingest_research",
+    "ingest_sales_note",
+    "knowledge_append_verdict",
+    "knowledge_read",
+    "knowledge_update",
+    "manage_chart_layers",
+    "market_digest_inputs",
+    "market_digest_output",
+    "podcast_weekly_read",
+    "podcast_weekly_write",
+    "publish_report",
+    "report_issue",
+    "schedule_wakeup",
+    "screen_stocks"
+   ]
+  },
+  "metadata": {
+   "billing_type": "oauth",
+   "manifest_model": "gpt-6.2-sol-oauth",
+   "pricing_model_id": "gpt-6.2-sol",
+   "pricing_provider": "codex-oauth",
+   "provider_route": "codex-oauth",
+   "reasoning_effort": "medium"
+  },
+  "request": {
+   "body": {
+    "include": [
+     "reasoning.encrypted_content"
+    ],
+    "input": [
+     {
+      "content": "Look up AAPL.",
+      "role": "user",
+      "type": "message"
+     }
+    ],
+    "instructions": "You are a lock probe.",
+    "model": "gpt-6.2-sol",
+    "reasoning": {
+     "effort": "medium",
+     "summary": "auto"
+    },
+    "store": false,
+    "stream": true,
+    "tools": [
+     {
+      "description": "Look up a symbol.",
+      "name": "lock_probe",
+      "parameters": {
+       "properties": {
+        "symbol": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "symbol"
+       ],
+       "type": "object"
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "headers": {
+    "accept": "application/json",
+    "connection": "keep-alive",
+    "content-type": "application/json",
+    "host": "chatgpt.com",
+    "originator": "codex_cli_rs"
+   },
+   "method": "POST",
+   "url": "https://chatgpt.com/backend-api/codex/responses"
+  }
  },
  "grok-4.6": {
   "client": "ChatOpenAI",
@@ -6181,165 +5201,6 @@
  },
  "grok-build-oauth": {
   "client_error": "ValueError"
- },
- "kimi-k3-coding": {
-  "client": "ChatOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "DaltonPatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "DaltonReconcileMiddleware",
-    "BaselineContextMiddleware",
-    "NotesDueMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "64e4ce143283bde4f77936a7fe1edd876260454f71d54bf5dc998122e533b9da",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "ai_finance_prepare",
-    "ai_finance_read",
-    "ai_finance_report",
-    "ai_finance_signals",
-    "automation_report",
-    "check_draft",
-    "check_language",
-    "dalton_check_done",
-    "dalton_coverage_tracking",
-    "dalton_notify_settings",
-    "dalton_report_delivery",
-    "dalton_schedule_automation",
-    "dalton_system_jobs",
-    "feishu_append",
-    "feishu_create_doc",
-    "feishu_grant_access",
-    "feishu_list_wiki",
-    "feishu_read",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "ingest_company_wiki",
-    "ingest_research",
-    "ingest_sales_note",
-    "knowledge_append_verdict",
-    "knowledge_read",
-    "knowledge_update",
-    "manage_chart_layers",
-    "market_digest_inputs",
-    "market_digest_output",
-    "podcast_weekly_read",
-    "podcast_weekly_write",
-    "publish_report",
-    "report_issue",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "kimi-k3-coding",
-   "pricing_model_id": "k3",
-   "pricing_provider": "moonshot-coding",
-   "provider_route": "moonshot-coding",
-   "reasoning_effort": "high"
-  },
-  "request": {
-   "body": {
-    "input": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system",
-      "type": "message"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "model": "k3",
-    "reasoning": {
-     "effort": "high",
-     "summary": "auto"
-    },
-    "stream": false,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.kimi.ai"
-   },
-   "method": "POST",
-   "url": "https://api.kimi.ai/coding/v1/responses"
-  }
  },
  "kimi-k3.1-pro": {
   "client": "ChatAnthropic",

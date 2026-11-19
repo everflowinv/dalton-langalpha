@@ -103,9 +103,10 @@ _SERVER_KEPT_ELSEWHERE = (
 # the same path would not reach: there it names a folder inside Home's own.
 _WORKSPACE_OWN = (WorkspaceLayout.MEMORY_DIR, WorkspaceLayout.TRANSCRIPTS_DIR)
 
+# DALTON-HOOK(computer-cli-tokens-off): direct to agent_output when la CLI is off.
 _WORKSPACE_KEPT_ELSEWHERE = (
     "A workspace's memory and past threads are kept by the server, not on its "
-    "computer: read its threads with `agent_output`, and hand a change to its "
+    "computer: read its threads with agent_output, and hand a change to its "
     "memory to its analyst."
 )
 

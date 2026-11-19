@@ -265,7 +265,7 @@ async def test_dalton_model_pref_precedence_user_then_holder_then_config(
     prefs_by_user: dict[str, dict[str, Any]] = {
         "user-member": {
             "model_preference": {
-                "dalton_assist_model": "gpt-6.1-sol-oauth",
+                "dalton_assist_model": "gpt-6.2-sol-oauth",
                 "dalton_audit_timeout_s": 420,
             }
         },
@@ -273,7 +273,7 @@ async def test_dalton_model_pref_precedence_user_then_holder_then_config(
             "model_preference": {
                 "dalton_assist_model": "claude-sonnet-5-5-oauth",
                 "dalton_audit_model": "claude-opus-5-5-oauth",
-                "dalton_reviewer_models": ["grok-4.7-oauth", "gpt-6.1-sol-oauth"],
+                "dalton_reviewer_models": ["grok-4.7-oauth", "gpt-6.2-sol-oauth"],
                 "dalton_audit_timeout_s": 600,
             }
         },
@@ -292,7 +292,7 @@ async def test_dalton_model_pref_precedence_user_then_holder_then_config(
     # 1. Member set dalton_assist_model and dalton_audit_timeout_s -> member's own setting wins over PM holder
     assert (
         await mp_mod.dalton_model_pref("user-member", "dalton_assist_model")
-        == "gpt-6.1-sol-oauth"
+        == "gpt-6.2-sol-oauth"
     )
     assert (
         await mp_mod.dalton_model_pref("user-member", "dalton_audit_timeout_s") == 420
@@ -305,7 +305,7 @@ async def test_dalton_model_pref_precedence_user_then_holder_then_config(
     )
     assert await mp_mod.dalton_model_pref("user-member", "dalton_reviewer_models") == [
         "grok-4.7-oauth",
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
     ]
 
     # 3. Neither member nor PM holder set dalton_extract_model -> uses conversations.extractor_model (not models.assist_model)
@@ -350,11 +350,11 @@ async def test_assist_and_reviewer_use_dalton_model_pref_and_fail_cleanly_when_u
     prefs_by_user: dict[str, dict[str, Any]] = {
         "user-custom": {
             "model_preference": {
-                "dalton_assist_model": "gpt-6.1-sol-oauth",
+                "dalton_assist_model": "gpt-6.2-sol-oauth",
                 "dalton_assist_fallback_models": ["grok-4.7-oauth"],
                 "dalton_extract_model": "claude-sonnet-5-5-oauth",
                 "dalton_audit_model": "claude-opus-5-5-oauth",
-                "dalton_audit_fallback_models": ["grok-4.7-oauth", "gpt-6.1-sol-oauth"],
+                "dalton_audit_fallback_models": ["grok-4.7-oauth", "gpt-6.2-sol-oauth"],
                 "dalton_reviewer_models": ["grok-4.7-oauth", "claude-opus-5-5-oauth"],
             }
         }
@@ -370,7 +370,7 @@ async def test_assist_and_reviewer_use_dalton_model_pref_and_fail_cleanly_when_u
 
     assert (
         await assist_mod.resolve_assist_model(user_id="user-custom")
-        == "gpt-6.1-sol-oauth"
+        == "gpt-6.2-sol-oauth"
     )
     assert (
         await assist_mod.resolve_assist_model(role="extract", user_id="user-custom")
@@ -387,7 +387,7 @@ async def test_assist_and_reviewer_use_dalton_model_pref_and_fail_cleanly_when_u
         role="audit_fallback", user_id="user-custom"
     ) == [
         "grok-4.7-oauth",
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
     ]
 
     # select_independent_reviewer reads user-custom's dalton_reviewer_models (picks grok-4.7-oauth for claude author)
@@ -696,9 +696,9 @@ async def test_dalton_pref_shadowed_by_later_custom_model_is_ignored(
     prefs_by_user: dict[str, Any] = {
         "user-member": {
             "model_preference": {
-                "dalton_audit_model": "gpt-6.1-sol-oauth",
-                "dalton_reviewer_models": ["gpt-6.1-sol-oauth", "grok-4.7-oauth"],
-                "custom_models": [{"name": "gpt-6.1-sol-oauth", "model_id": "x"}],
+                "dalton_audit_model": "gpt-6.2-sol-oauth",
+                "dalton_reviewer_models": ["gpt-6.2-sol-oauth", "grok-4.7-oauth"],
+                "custom_models": [{"name": "gpt-6.2-sol-oauth", "model_id": "x"}],
             }
         },
         "user-pm-holder": {"model_preference": {"dalton_audit_model": "claude-opus-5-5-oauth"}},
@@ -737,7 +737,7 @@ async def test_dalton_pref_shadowed_by_later_custom_model_is_ignored(
     }
     prefs_by_user["user-pm-holder"]["model_preference"] = {
         "dalton_audit_model": "claude-opus-5-5-oauth",
-        "dalton_audit_fallback_models": ["claude-opus-5-5-oauth", "gpt-6.1-sol-oauth"],
+        "dalton_audit_fallback_models": ["claude-opus-5-5-oauth", "gpt-6.2-sol-oauth"],
     }
     assert (
         await mp_mod.dalton_model_pref("user-member", "dalton_audit_model")
@@ -745,7 +745,7 @@ async def test_dalton_pref_shadowed_by_later_custom_model_is_ignored(
     )
     assert await mp_mod.dalton_model_pref(
         "user-member", "dalton_audit_fallback_models"
-    ) == ["gpt-6.1-sol-oauth"]
+    ) == ["gpt-6.2-sol-oauth"]
 
     # (b) Both PM holder's model and yaml default ('gemini-4-argon-medium-oauth') are shadowed by
     #     caller's custom_models -> returns None / "" and assist_json returns unconfigured_model;
@@ -852,7 +852,7 @@ async def test_extract_segment_cards_uses_resolved_extract_model(
     prefs_by_user: dict[str, dict[str, Any]] = {
         "user-owner": {
             "model_preference": {
-                "dalton_extract_model": "gpt-6.1-sol-oauth",
+                "dalton_extract_model": "gpt-6.2-sol-oauth",
             }
         }
     }
@@ -904,8 +904,8 @@ async def test_extract_segment_cards_uses_resolved_extract_model(
     # 1. User set dalton_extract_model -> extract_segment_cards uses user's model
     out_user = await extractor_mod.extract_segment_cards(seg, user_id="user-owner")
     assert out_user.ok is True
-    assert out_user.model_used == "gpt-6.1-sol-oauth"
-    assert seen_models[-1] == "gpt-6.1-sol-oauth"
+    assert out_user.model_used == "gpt-6.2-sol-oauth"
+    assert seen_models[-1] == "gpt-6.2-sol-oauth"
 
     # 2. Explicit extractor_model has highest priority over user setting
     out_explicit = await extractor_mod.extract_segment_cards(
@@ -1000,8 +1000,8 @@ async def test_pm_only_custom_model_does_not_shadow_a_members_inherited_value(
         "user-member": {"model_preference": {}},
         "user-pm-holder": {
             "model_preference": {
-                "dalton_audit_model": "gpt-6.1-sol-oauth",
-                "custom_models": [{"name": "gpt-6.1-sol-oauth", "model_id": "x"}],
+                "dalton_audit_model": "gpt-6.2-sol-oauth",
+                "custom_models": [{"name": "gpt-6.2-sol-oauth", "model_id": "x"}],
             }
         },
     }
@@ -1022,7 +1022,7 @@ async def test_pm_only_custom_model_does_not_shadow_a_members_inherited_value(
 
     assert (
         await mp_mod.dalton_model_pref("user-member", "dalton_audit_model")
-        == "gpt-6.1-sol-oauth"
+        == "gpt-6.2-sol-oauth"
     )
 
 
@@ -1068,7 +1068,7 @@ async def test_dalton_language_model_resolves_user_pref_then_fallback(
             }
         },
         "user-solo": {
-            "model_preference": {"dalton_language_model": "gpt-6.1-sol-oauth"}
+            "model_preference": {"dalton_language_model": "gpt-6.2-sol-oauth"}
         },
     }
 
@@ -1091,7 +1091,7 @@ async def test_dalton_language_model_resolves_user_pref_then_fallback(
         await mp_mod.resolve_dalton_language_model("user-member") == "grok-4.7-oauth"
     )
     # 2. The member's own saved key wins over the holder's.
-    assert await mp_mod.resolve_dalton_language_model("user-solo") == "gpt-6.1-sol-oauth"
+    assert await mp_mod.resolve_dalton_language_model("user-solo") == "gpt-6.2-sol-oauth"
     # 3. Nobody set the language key -> the YAML fallback (publish.audit_model)
     # answers; the holder's own audit-model preference does not extend to it.
     prefs_by_user["user-member"] = {"model_preference": {}}

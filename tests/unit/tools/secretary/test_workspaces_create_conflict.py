@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 
 from src.server.database.workspace_names import WorkspaceNameTaken
-from src.tools.secretary.tools import workspaces_create
+from src.server.services.workspace_manager import WorkspaceManager
+from src.tools.secretary.tools import hitl_confirm, workspaces_create
 
 
 async def _error_for(exc: WorkspaceNameTaken) -> str:
-    mgr = MagicMock()
-    mgr.create_workspace = AsyncMock(side_effect=exc)
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.side_effect = exc
     with patch(
-        "src.tools.secretary.tools.hitl_confirm", return_value=(True, {})
+        "src.tools.secretary.tools.hitl_confirm",
+        create_autospec(hitl_confirm, return_value=(True, {})),
     ), patch(
         "src.server.services.workspace_manager.WorkspaceManager.get_instance",
-        return_value=mgr,
+        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
     ):
         result = await workspaces_create("user-1", "Research", None, "call-1")
     return json.loads(result.update["messages"][0].content)["error"]

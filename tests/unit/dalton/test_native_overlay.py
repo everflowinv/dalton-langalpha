@@ -42,9 +42,8 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    # DALTON-HOOK(llm-overlay): claude-fable-5-2 and claude-fable-5-2-oauth graduated into upstream #751;
-    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high}-oauth added (38 + 3 = 41).
-    assert len(native_models) == 41
+    # DALTON-HOOK(llm-overlay): claude-fable-5-2{,-oauth} and gpt-6.2-{astra,sol}{,-oauth} graduated into upstream (37).
+    assert len(native_models) == 37
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the

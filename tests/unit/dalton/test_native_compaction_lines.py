@@ -20,8 +20,8 @@ def test_the_official_lines_stay_on_and_the_relays_off() -> None:
     on = {name for name, entry in meta.items() if entry.get("native_compaction")}
     # Official API lines (and the Codex subscription upstream proved) stay on.
     assert "claude-opus-5-5" in on
-    assert "gpt-6.1-sol" in on
-    assert "gpt-6.1-sol-oauth" in on  # codex-oauth: official OpenAI subscription
+    assert "gpt-6.2-sol" in on
+    assert "gpt-6.2-sol-oauth" in on  # codex-oauth: official OpenAI subscription
     # Every Dalton relay in the off-list is off, by exact name.
     for name, entry in meta.items():
         if entry.get("provider") in NATIVE_COMPACTION_OFF_PROVIDERS:
@@ -86,8 +86,8 @@ def test_handoff_on_switch_across_official_and_dalton_routes() -> None:
 
     official_anthropic = create_llm("claude-opus-5-5", api_key="dummy")
     claude_oauth = create_llm("claude-opus-5-5-oauth", api_key="dummy")
-    official_openai = create_llm("gpt-6.1-sol", api_key="dummy")
-    codex_oauth = create_llm("gpt-6.1-sol-oauth", api_key="dummy")
+    official_openai = create_llm("gpt-6.2-sol", api_key="dummy")
+    codex_oauth = create_llm("gpt-6.2-sol-oauth", api_key="dummy")
     antigravity = create_llm("gemini-4-argon-high-oauth", api_key="dummy")
     muse_oauth = create_llm("muse-wonder-1.0-oauth", api_key="dummy")
     xai = create_llm("grok-4.7-oauth", api_key="dummy")
