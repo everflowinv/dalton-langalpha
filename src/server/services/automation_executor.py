@@ -1068,8 +1068,9 @@ class AutomationExecutor:
 
             # DALTON-HOOK(preflight): zero-LLM wake/skip decision for dalton-* automations.
             # Runs only after thread-busy wait and computer-away park check so signals
-            # are never claimed before parking; restores wake_context by execution_id
-            # (even when recovery happens before conversation_thread_id is created).
+            # are never claimed before parking. Recovery checks persisted preflight
+            # records by execution_id instead of handed_thread (hand-off during
+            # _wait_for_thread sets conversation_thread_id before preflight runs).
             from src.dalton.autonomy import preflight as dalton_preflight
             from src.dalton.database import watch as watch_db
 
@@ -1080,13 +1081,9 @@ class AutomationExecutor:
                 else None
             )
             if persisted_wake_ctx is not None:
-                firing.wake_context = persisted_wake_ctx
-            elif handed_thread and is_dalton:
-                logger.warning(
-                    f"[AUTOMATION_EXEC] Missing persisted wake_context for handed-off/refired "
-                    f"Dalton execution_id={execution_id}"
-                )
-            elif not handed_thread:
+                if persisted_wake_ctx:
+                    firing.wake_context = persisted_wake_ctx
+            else:
                 decision = await dalton_preflight.decide(firing.automation, execution_id)
                 if decision is not None and decision.skip:
                     await settle(
@@ -1170,9 +1167,12 @@ class AutomationExecutor:
                 f"error={error_msg if error_msg is not None else type(e).__name__}"
             )
             await self._start_delivery_unstarted(execution_id, firing)
+            # DALTON-HOOK(preflight): firing.route is bound later at thread resolution, so
+            # pre-route failures/cancellations fall back to automation["workspace_id"].
             settled = await settle(
                 firing.automation, execution_id, outcome,
-                thread_id=firing.thread_id, workspace_id=firing.workspace_id,
+                thread_id=firing.thread_id,
+                workspace_id=firing.workspace_id or automation.get("workspace_id"),
                 error=error_msg, delivery=firing.delivery,
             )
             _exec_span.set_attribute(
@@ -1187,10 +1187,11 @@ class AutomationExecutor:
             # interrupted here.
             try:
                 if not await self._hand_to_run(execution_id, firing):
+                    # DALTON-HOOK(preflight): fall back to automation["workspace_id"] before route bind
                     await settle(
                         firing.automation, execution_id, Outcome.INTERRUPTED,
                         thread_id=firing.thread_id,
-                        workspace_id=firing.workspace_id,
+                        workspace_id=firing.workspace_id or automation.get("workspace_id"),
                         delivery=firing.delivery,
                     )
             except Exception as e:

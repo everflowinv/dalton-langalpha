@@ -523,6 +523,18 @@ async def settle(
             *_settled_as(settled, execution_id, thread_id, run_id, delivery),
             settled, final_text,
         )
+        # DALTON-HOOK(preflight): a Dalton execution that ends in any terminal
+        # state other than COMPLETED gives back the signals it claimed, in this
+        # transaction (a failed release rolls the settlement back). Hand-offs and
+        # waits resume under the same execution_id and never settle here.
+        if outcome is not Outcome.COMPLETED:
+            from src.dalton.autonomy.preflight import (
+                release_claimed_signals_on_non_completed_settle,
+            )
+
+            await release_claimed_signals_on_non_completed_settle(
+                conn, automation=automation, execution_id=execution_id
+            )
 
     extra_settle_kwargs: Dict[str, Any] = {}
     if expected_run_id is not exec_db.UNSET_RUN_ID:
