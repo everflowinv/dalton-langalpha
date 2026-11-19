@@ -1026,6 +1026,121 @@ async def test_feishu_groups_endpoint_pm_only(
     assert res == {"ok": True, "groups": [{"chat_id": "oc_g1", "name": "投研群"}]}
 
 
+@pytest.mark.asyncio
+async def test_discord_channel_verify_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+
+    from src.dalton.app.router import (
+        DaltonDiscordChannelVerifyRequest,
+        dalton_notify_discord_channel_verify_endpoint,
+    )
+    from src.dalton.database import data_task_notifications as dtn_db
+
+    orig_lookup = dtn_db.lookup_discord_guild_text_channel
+    orig_fetch = dtn_db._fetch_discord_channel_sync
+
+    # 1. External and internal users are both rejected with 403 (admin-only)
+    for tier, uid in (("external", "u-ext"), ("internal", "u-internal")):
+        monkeypatch.setattr(
+            access_tiers_mod,
+            "get_user_tier",
+            create_autospec(get_user_tier, return_value=tier),
+        )
+        with pytest.raises(HTTPException) as denied_exc:
+            await dalton_notify_discord_channel_verify_endpoint(
+                DaltonDiscordChannelVerifyRequest(channel_id="1481256083589697566"),
+                user_id=uid,
+            )
+        assert denied_exc.value.status_code == 403
+
+    # 2. Admin passes tier gate; non-snowflake, <17 digit, >20 digit, or >= 2^64 ID returns 422
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="admin"),
+    )
+    for bad_id in (
+        "not-a-snowflake",
+        "12345",
+        "1234567890123456",  # 16 digits
+        "9" * 32,
+        "18446744073709551616",  # 2^64
+    ):
+        with pytest.raises(HTTPException) as bad_id_exc:
+            await dalton_notify_discord_channel_verify_endpoint(
+                DaltonDiscordChannelVerifyRequest(channel_id=bad_id),
+                user_id="u-admin",
+            )
+        assert bad_id_exc.value.status_code == 422
+
+    # 3. Missing DALTON_DISCORD_BOT_TOKEN -> verified=False, reason="no_token"
+    monkeypatch.delenv("DALTON_DISCORD_BOT_TOKEN", raising=False)
+    lookup_no_tok = create_autospec(orig_lookup, return_value=(True, None, None))
+    monkeypatch.setattr(dtn_db, "lookup_discord_guild_text_channel", lookup_no_tok)
+    no_tok_res = await dalton_notify_discord_channel_verify_endpoint(
+        DaltonDiscordChannelVerifyRequest(channel_id="1481256083589697566"),
+        user_id="u-admin",
+    )
+    assert no_tok_res == {
+        "ok": True,
+        "verified": False,
+        "reason": "no_token",
+        "channel_id": "1481256083589697566",
+        "channel_name": None,
+        "detail": None,
+    }
+    lookup_no_tok.assert_awaited_once_with("1481256083589697566")
+
+    # 4. Verification failure -> ok=False, verified=False, detail surfaced
+    monkeypatch.setenv("DALTON_DISCORD_BOT_TOKEN", "bot-token")
+    fail_spy = create_autospec(
+        orig_lookup,
+        return_value=(False, "Discord channel target must be a guild text channel.", None),
+    )
+    monkeypatch.setattr(dtn_db, "lookup_discord_guild_text_channel", fail_spy)
+    fail_res = await dalton_notify_discord_channel_verify_endpoint(
+        DaltonDiscordChannelVerifyRequest(channel_id="1481256083589697566"),
+        user_id="u-admin",
+    )
+    assert fail_res == {
+        "ok": False,
+        "verified": False,
+        "reason": "verification_failed",
+        "channel_id": "1481256083589697566",
+        "channel_name": None,
+        "detail": "Discord channel target must be a guild text channel.",
+    }
+    fail_spy.assert_awaited_once_with("1481256083589697566")
+
+    # 5. Verification success with token -> single lookup returns verified=True and channel_name
+    monkeypatch.setattr(dtn_db, "lookup_discord_guild_text_channel", orig_lookup)
+    fetch_spy = create_autospec(
+        orig_fetch,
+        return_value={
+            "id": "1481256083589697566",
+            "type": 0,
+            "guild_id": "700000001",
+            "name": "research-reports",
+        },
+    )
+    monkeypatch.setattr(dtn_db, "_fetch_discord_channel_sync", fetch_spy)
+    ok_res = await dalton_notify_discord_channel_verify_endpoint(
+        DaltonDiscordChannelVerifyRequest(channel_id=" 1481256083589697566 "),
+        user_id="u-admin",
+    )
+    assert ok_res == {
+        "ok": True,
+        "verified": True,
+        "reason": None,
+        "channel_id": "1481256083589697566",
+        "channel_name": "research-reports",
+        "detail": None,
+    }
+    fetch_spy.assert_called_once_with("1481256083589697566", "bot-token")
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/dalton/notify/test
 # ---------------------------------------------------------------------------

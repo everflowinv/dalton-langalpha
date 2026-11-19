@@ -732,10 +732,11 @@ async def sync_owner_group_chat_settings(
                         plat_cfg["chats"] = chats
                         changed = True
                     if chat_addr not in chats:
-                        entry: dict[str, Any] = {"name": chat_name}
-                        if ws_id:
-                            entry["workspace_id"] = str(ws_id)
-                        chats[chat_addr] = entry
+                        norm_ws = str(ws_id).strip() if ws_id is not None else ""
+                        chats[chat_addr] = {
+                            "name": chat_name,
+                            "workspace_id": norm_ws or None,
+                        }
                         changed = True
 
                 if not changed:

@@ -7,6 +7,7 @@ all SQL lives in `src/dalton/database/`.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -2251,6 +2252,19 @@ async def _require_notify_admin(user_id: str | None) -> str:
     return uid
 
 
+async def _require_notify_tier_admin(user_id: str | None) -> str:
+    """Discord channel management is restricted to admin tier (`get_user_tier == 'admin'`)."""
+    _require_dalton_enabled()
+    from src.dalton.access_tiers import get_user_tier
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if await get_user_tier(uid) != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can verify Discord channels.")
+    return uid
+
+
 @router.get("/notify/feishu-groups")
 @handle_api_exceptions("get dalton notify feishu groups", logger)
 async def dalton_notify_feishu_groups_endpoint(
@@ -2264,6 +2278,58 @@ async def dalton_notify_feishu_groups_endpoint(
     except FeishuGroupsUnavailable as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"ok": True, "groups": groups}
+
+
+class DaltonDiscordChannelVerifyRequest(BaseModel):
+    channel_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/notify/discord-channels/verify")
+@handle_api_exceptions("verify dalton notify discord channel", logger)
+async def dalton_notify_discord_channel_verify_endpoint(
+    body: DaltonDiscordChannelVerifyRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_notify_tier_admin(user_id)
+    from src.dalton.database import data_task_notifications as dtn_db
+
+    cleaned_id = body.channel_id.strip()
+    if not dtn_db.is_valid_discord_channel_snowflake(cleaned_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Discord channel ID must be a 17-20 digit snowflake below 2^64.",
+        )
+
+    ok, err, channel_name = await dtn_db.lookup_discord_guild_text_channel(cleaned_id)
+    if not ok:
+        return {
+            "ok": False,
+            "verified": False,
+            "reason": "verification_failed",
+            "channel_id": cleaned_id,
+            "channel_name": None,
+            "detail": err or "Discord channel target must be a guild text channel.",
+        }
+
+    token = os.environ.get("DALTON_DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        return {
+            "ok": True,
+            "verified": False,
+            "reason": "no_token",
+            "channel_id": cleaned_id,
+            "channel_name": None,
+            "detail": None,
+        }
+
+    return {
+        "ok": True,
+        "verified": True,
+        "reason": None,
+        "channel_id": cleaned_id,
+        "channel_name": channel_name,
+        "detail": None,
+    }
 
 
 @router.post("/notify/test")

@@ -30,6 +30,17 @@ import { canShowDaltonHomeTeamMemoryCard } from './panels/dalton/DaltonHomeTeamM
 import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
 import { canShowDaltonFeishuScopesCard } from './panels/dalton/FeishuReadScopesCard';
 
+/** Discord channels card & search visibility: requires verified admin tier. */
+export function canShowDaltonDiscordChannelsCard(
+  ctx?: DaltonSettingVisibilityContext | null,
+): boolean {
+  if (!ctx) return false;
+  if (ctx.discordChannelsAdmin !== undefined) {
+    return ctx.discordChannelsAdmin;
+  }
+  return ctx.callerTier === 'admin';
+}
+
 export {
   canShowDaltonCosSharingCard,
   canShowDaltonHomeTeamMemoryCard,
@@ -227,6 +238,7 @@ export const SETTINGS = {
 
   daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings.dalton.weixinBotLabel', descKey: 'settings.dalton.weixinBotDesc', keywords: '团队微信机器人 微信扫码 wechat bot qr', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
   daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings.dalton.feishuGroupsLabel', descKey: 'settings.dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups' },
+  daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings.dalton.discordChannelsLabel', descKey: 'settings.dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', visibleWhen: canShowDaltonDiscordChannelsCard },
   daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron' },
 
   tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings.tradingPermission.title', descKey: 'settings.tradingPermission.desc' },
