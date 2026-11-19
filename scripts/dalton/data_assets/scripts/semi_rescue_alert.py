@@ -173,7 +173,13 @@ class Data:
         for sid in ("BAMLH0A0HYM2", "DFII10", "DFF", "DGS10"):
             for attempt in range(2):
                 try:
-                    b = http_get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd={start}", timeout=40)
+                    # FRED holds browser-like User-Agents (``Mozilla/5.0``) until they time
+                    # out; a plain client string is answered at once.
+                    b = http_get(
+                        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd={start}",
+                        timeout=40,
+                        headers={"User-Agent": "python-urllib/3"},
+                    )
                     df = pd.read_csv(io.BytesIO(b))
                     df.columns = ["date", "v"]
                     df["v"] = pd.to_numeric(df["v"], errors="coerce")
