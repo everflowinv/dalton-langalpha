@@ -39,7 +39,8 @@ export type SSEEventType =
   | 'steering_returned'
   | 'task_steering_accepted'
   | 'interrupt'
-  | 'finish';
+  | 'finish'
+  | 'turn_placement';
 
 /** Base interface for all SSE events */
 export interface BaseSSEEvent {
@@ -165,11 +166,20 @@ export interface ProvenanceEvent extends BaseSSEEvent {
   result_sha256?: string;
   result_size?: number;
   result_snippet?: string;
+  /** What reading this source cost the user, in credits. Absent or null on most. */
+  cost_credits?: number | null;
+  /** The data provider's website domain (e.g. "fiscal.ai"), set on `mcp_tool`
+   *  sources from a paid data catalog; its favicon stands in for the typed icon. */
+  site?: string | null;
   /** Replay envelope: added by GET /threads/{id}/messages/replay so the
    *  frontend can re-attach records to the right turn after reload. */
   turn_index?: number;
   response_id?: string;
+  thread_id?: string;
 }
+
+/** The keys a `provenance` event carries for its transport, not its record. */
+export type ProvenanceEnvelopeKey = 'event' | '_eventId' | 'turn_index' | 'response_id' | 'thread_id';
 
 export interface TodoUpdatePayload {
   todos: TodoItem[];
@@ -520,6 +530,34 @@ export interface FinishEvent extends BaseSSEEvent {
   finish_reason?: string;
 }
 
+/**
+ * Where a Home turn ran while the machine Home lives on could not be reached:
+ * on the user's cloud computer (`cloud_*`) standing in for it. `reason` is
+ * `command` for a report-back from a command that ran there. Carried by the
+ * `turn_placement` frame live and by the turn's query metadata on replay.
+ */
+export interface HomeFallback {
+  computer_id: string;
+  computer_name: string;
+  cloud_computer_id: string;
+  cloud_name: string;
+  /** When the turn was admitted (ISO): the first hand-back after it holds its files. */
+  at: string;
+  reason: 'unreachable' | 'command';
+}
+
+/**
+ * Sent once near the start of a Home turn that runs on the cloud stand-in,
+ * and of a retry of a Home turn, where null says this attempt runs on Home.
+ * A reconnect to a turn that ran there sends it again, with no id and no
+ * `workspace_id`, ahead of the run's own frames.
+ */
+export interface TurnPlacementEvent extends BaseSSEEvent {
+  event: 'turn_placement';
+  home_fallback: HomeFallback | null;
+  workspace_id?: string;
+}
+
 /** Discriminated union of all SSE events */
 export type SSEEvent =
   | MetadataEvent
@@ -542,4 +580,5 @@ export type SSEEvent =
   | TaskSteeringAcceptedEvent
   | UserMessageEvent
   | InterruptEvent
-  | FinishEvent;
+  | FinishEvent
+  | TurnPlacementEvent;

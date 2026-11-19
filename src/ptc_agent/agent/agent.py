@@ -430,8 +430,11 @@ class PTCAgent:
         # than falling back to a shared namespace that would cross-pollinate
         # unauthenticated sessions. The workspace comes from the project: the
         # session is per computer and several workspaces share it, so its own
-        # id names whichever one acquired it first.
-        workspace_id_for_memory = project.workspace_id if project else None
+        # id names whichever one acquired it first. It is the one the turn
+        # works for (Home, for a Home turn in its stand-in); the folder's own
+        # id is what commands and transcripts are found by on its computer.
+        workspace_id_for_memory = project.owner_id if project else None
+        folder_workspace_id = project.workspace_id if project else None
         gates = resolve_identity_gates(
             store=store,
             user_id=user_id,
@@ -482,16 +485,30 @@ class PTCAgent:
         # workspace to record it under; without them a call waits until its
         # command ends, as a subagent's does.
         # DALTON-HOOK(colleague-dispatch): tail turns after access revocation disable background command hand-off
+        away = turn_context.home_away if turn_context else None
         hand_off = (
             HandOff(
                 thread_id=thread_id,
                 user_id=str(user_id),
-                workspace_id=workspace_id_for_memory,
+                # A command runs, and is found again, on the computer the
+                # folder is on.
+                workspace_id=folder_workspace_id,
                 wakeups=wakeups_on,
+                # In Home's stand-in, the log stays on the stand-in's
+                # computer, which Home's later turns reach by name.
+                **(
+                    {
+                        "computer": away.cloud_name,
+                        "computer_id": away.cloud_computer_id,
+                        "whole": True,
+                    }
+                    if away
+                    else {}
+                ),
             )
             if thread_id
             and user_id
-            and workspace_id_for_memory
+            and folder_workspace_id
             and not tail_turn_no_new_work
             else None
         )
@@ -679,7 +696,9 @@ class PTCAgent:
         # never sees (provenance fingerprints the raw result/artifact).
         shared_middleware.append(
             ProvenanceMiddleware(
-                redactor=leak_detection.redact, sandbox_root=sandbox.working_dir
+                redactor=leak_detection.redact,
+                sandbox_root=sandbox.working_dir,
+                user_id=user_id,
             )
         )
         if todo_tools:
@@ -1010,7 +1029,9 @@ class PTCAgent:
         compaction = CompactionMiddleware.for_agent(
             self.config,
             backend=backend,
-            workspace_id=workspace_id_for_memory,
+            # The folder a transcript pointer is read from, which the mount
+            # serves: the stand-in's on a Home turn there.
+            workspace_id=folder_workspace_id,
             receives=multimodal_strip.receives,
             page_tokens=multimodal_strip.pdf_page_tokens,
             large_results_dir=eviction_dir,
@@ -1198,7 +1219,7 @@ class PTCAgent:
                 baseline=baseline.frozen_block if baseline is not None else None,
                 steering=TaskSteering(subagent_steering),
                 compaction=CompactionRules.of_subagent(self.config.compaction, backend=backend,
-                                                      workspace_id=workspace_id_for_memory),
+                                                      workspace_id=folder_workspace_id),
             )
 
         # DALTON-HOOK(colleague-dispatch): withhold Task/RunWorkflow on tail turns while keeping TaskOutput
@@ -1433,7 +1454,7 @@ class PTCAgent:
                 steering=steering,
                 alert_senders=alert_senders,
                 compaction=CompactionRules.of(self.config.compaction, turn_context, backend=backend,
-                                              workspace_id=workspace_id_for_memory),
+                                              workspace_id=folder_workspace_id),
             )
 
         return BackgroundSubagentOrchestrator(

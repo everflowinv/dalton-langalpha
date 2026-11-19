@@ -45,6 +45,10 @@ mcp:
       enabled: true
     - name: "researchdata"
       call_timeout_s: 625
+    # Keep upstream's Firecrawl MCP / Alexandria data catalog off on Dalton
+    # (only the shared FIRECRAWL_API_KEY web-fetch fallback stays enabled).
+    - name: "firecrawl"
+      enabled: false
 
 subagents:
   definitions:

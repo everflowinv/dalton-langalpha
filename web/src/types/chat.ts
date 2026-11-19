@@ -6,9 +6,10 @@ import type {
   ToolCallResultData,
   TodoItem,
   OrderProposal,
-  ProvenanceSourceType,
+  ProvenanceEnvelopeKey,
+  ProvenanceEvent,
 } from './sse';
-import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
+import type { PageLinkSpec, StructuredError } from '@/utils/rateLimitError';
 import type { PlanBilled } from '@/api/model';
 import type { DispatchingAgent, ReportOutcome } from './api';
 import type { CommandFailureReason, CommandTool } from './commands';
@@ -235,27 +236,12 @@ export interface ToolCallProcess {
   _createdAt?: number;
 }
 
-export interface ProvenanceRecord {
-  record_id: string;
-  /** Originating agent: "main" or "task:{id}". */
-  agent?: string;
-  timestamp: string;
-  source_type: ProvenanceSourceType;
-  identifier: string;
-  title?: string;
-  /** Data-kind slug within this source type (e.g. "company_overview"); the
-   *  Sources panel i18n-maps it to label each access in the hover breakdown. */
-  detail?: string;
-  provider?: string;
-  tool_call_id?: string;
-  args_fingerprint?: Record<string, unknown>;
-  /** Tool-call arguments with secrets already redacted server-side. Redacted
-   *  values are the literal string "[redacted]". May be absent/empty. */
-  args?: Record<string, unknown>;
-  result_sha256?: string;
-  result_size?: number;
-  result_snippet?: string;
-}
+/** A provenance event without its stream and replay envelope. */
+export type ProvenanceRecord = Omit<ProvenanceEvent, ProvenanceEnvelopeKey> & {
+  /** The events whose costs `cost_credits` sums, when several paid calls
+   *  are listed as one access. */
+  cost_record_ids?: string[];
+};
 
 /**
  * Per-access discriminator appended to a provenance dedup key — `mcp_tool` only.
@@ -475,7 +461,7 @@ export interface CreditPauseState {
   message?: string;
   /** Where the user resolves the denial, built by ``buildRateLimitError`` so a
    *  pause and a 429 banner offer the same destinations. */
-  links?: ErrorLinkSpec[];
+  links?: PageLinkSpec[];
   interruptId: string;
 }
 
@@ -570,6 +556,9 @@ export type UserMessage = {
   /** On a report-back's row only: the run it opened. History and a live
    *  attach can both draw that row, and know it by this. */
   runId?: string;
+  /** On a Home turn that ran on the cloud stand-in while Home's own machine
+   *  could not be reached: drawn as a quiet line under the message. */
+  homeFallback?: import('./sse').HomeFallback;
   steeringDelivered?: boolean;
   steering?: boolean;
   /** The request key this view sent the message under. A delivery that

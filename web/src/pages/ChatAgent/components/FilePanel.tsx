@@ -64,7 +64,7 @@ import { FileCrumbs } from './filePanel/FileCrumbs';
 import { PreviewCrumbs } from './filePanel/PreviewCrumbs';
 import { SiblingCrumbs } from './filePanel/SiblingCrumbs';
 import { PreviewPanes } from './filePanel/PreviewPanes';
-import { useHtmlArtifactTab } from './filePanel/useHtmlArtifactTab';
+import { commentViewer, useFileComments } from './filePanel/useFileComments';
 import { usePreviews } from './filePanel/usePreviews';
 import { usePanelTarget } from './filePanel/usePanelTarget';
 import { useCommentUi } from './viewers/html/comments/useCommentUi';
@@ -292,7 +292,6 @@ function FilePanel({
   // Publishing, comments, versions and a file's record are the owner's: a
   // read-only panel, or a share's, shows a file alone. Decided here once, and
   // what acts on it reads this rather than deciding again.
-  const commentUi = useCommentUi();
   const servePrefix = apiAdapter?.servePrefix;
   // DALTON-HOOK(team-sharing): a teammate's workspace is read-only for
   // artifact purposes whatever their web level — rw lifts file writes only,
@@ -312,10 +311,6 @@ function FilePanel({
           : { kind: 'owner' }),
     [servePrefix, readOnly, teamReadOnly, workspaceId, callerTier],
   );
-  // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
-  // entry beside a read-only thread (teamReadOnly covers a colleague's
-  // workspace; threadReadOnly a colleague's dispatched thread in it).
-  const comments = access.kind === 'owner' && !threadReadOnly ? commentUi : undefined;
   // DALTON-HOOK(monitors): external members cannot use comment/public-share UI,
   // but in their own editable workspace they can publish 'own' monitors.
   const canPublishMonitor =
@@ -326,6 +321,14 @@ function FilePanel({
   });
   const fileContent = body?.content ?? null;
   const fileMime = body?.mime ?? null;
+
+  const { selectionTooltip, selectionComposing, beginReply, dismissSelection, contentWrapperRef, contextMenu, setContextMenu, handleEditorTextSelect, handleAddSelectionContext, askAboutWords } =
+    useSelectionContext({ selectedFile, fileContent, onAddContext });
+  const commentUi = useCommentUi(onAddContext ? askAboutWords : null);
+  // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
+  // entry beside a read-only thread (teamReadOnly covers a colleague's
+  // workspace; threadReadOnly a colleague's dispatched thread in it).
+  const comments = access.kind === 'owner' && !threadReadOnly ? commentUi : undefined;
 
   const { markRead, forget: forgetChanged, hasChanged } = useChangedFiles(transcript);
   useEffect(() => {
@@ -385,10 +388,7 @@ function FilePanel({
   useEffect(() => { reportActiveKind(activeTab.kind); }, [activeTab.kind]);
   useEffect(() => () => reportActiveKind(null), []);
 
-  const { selectionTooltip, selectionComposing, beginReply, dismissSelection, contentWrapperRef, contextMenu, setContextMenu, handleEditorTextSelect, handleAddSelectionContext } =
-    useSelectionContext({ selectedFile, fileContent, onAddContext });
-
-  const viewer = selectedFile ? viewerFor(selectedFile, fileMime, edit.isEditing) : 'other';
+  const viewer = selectedFile && !edit.isEditing ? viewerFor(selectedFile, fileMime) : 'other';
   const focus = useFileFocus({
     selectedFile,
     viewer,
@@ -404,12 +404,14 @@ function FilePanel({
   const htmlView = useHtmlViewMode(focus.replayed ? null : focus.htmlAnchor, focus.seq);
   const { setSource: setHtmlSource } = htmlView;
 
-  // An HTML file the owner reads takes comments and has versions.
-  const artifactTab = useHtmlArtifactTab({
+  // The file the owner reads takes comments, and an HTML one has versions,
+  // unless its viewer failed: the fallback drew no comment layer.
+  const [documentFailed, setDocumentFailed] = useState(false);
+  const fileComments = useFileComments({
     workspaceId,
     tabId: activeTab.id,
     file: selectedFile,
-    html: viewer === 'html',
+    commentViewer: documentFailed ? null : commentViewer(viewer, !!body),
     source: htmlView.source,
     active: isActive,
     readAt: readAt ?? null,
@@ -417,8 +419,9 @@ function FilePanel({
     // DALTON-HOOK(monitors): decoupled monitor publishing permission
     canPublishMonitor,
     threadId,
+    dismissSelection,
   });
-  const htmlArtifactPath = artifactTab.path;
+  const htmlArtifactPath = fileComments.path;
   // The agent's edit to the HTML file in front is read at once, unlike other
   // files: the frame swaps it in over the old one with the place kept, and a
   // reader whose comments the agent is answering is waiting for exactly that.
@@ -770,13 +773,11 @@ function FilePanel({
 
   // Editing needs a text viewer under it: the pdf, excel and html readers are
   // not editors, and an image or a parked tool result is not text. A CSV reads
-  // in the grid (`other`) but edits as the text it is; a file already in the
-  // editor keeps its verdict rather than reading the editor as `other`.
-  const selectedExt = selectedFile ? getFileExtension(selectedFile) : '';
-  // An editor already open keeps its draft, and its Save says why it waits.
+  // in the grid but edits as the text it is; a file already in the editor
+  // keeps its verdict and its draft, and its Save says why it waits.
   const canEdit = !!(selectedFile && !readOnly && !fileError && (!away.blockedReason || edit.isEditing)
-    && EDITABLE_EXTENSIONS.has(selectedExt)
-    && (edit.isEditing || viewer === 'code' || viewer === 'markdown' || (viewer === 'other' && selectedExt === 'csv' && fileMime !== 'image')));
+    && EDITABLE_EXTENSIONS.has(getFileExtension(selectedFile))
+    && (edit.isEditing || viewer === 'code' || viewer === 'markdown' || viewer === 'csv'));
 
   const meta = useMemo(() => {
     if (!selectedFile || !body) return null;
@@ -876,13 +877,13 @@ function FilePanel({
           onOpenDir={revealInTree}
           // A page in front of the owner has its version and comments to say
           // there; its line count is the markup's, read under Source.
-          meta={artifactTab.hideMeta ? null : meta}
+          meta={fileComments.hideMeta ? null : meta}
           unsaved={edit.hasUnsavedChanges}
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
-          artifact={artifactTab.crumbs}
-          tools={artifactTab.tools}
+          artifact={fileComments.crumbs}
+          tools={fileComments.tools}
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -897,11 +898,11 @@ function FilePanel({
               canDownload={canDownload}
               readFileFullFn={readFileFullFn}
               access={access}
-              openPublish={artifactTab.openPublish}
+              openPublish={fileComments.openPublish}
               // DALTON-HOOK(external-share-guard): external members may stop a
               // public link but never start one.
               openUnshareOnly={callerTier === 'external' ? (path) => setUnshareTarget(path) : null}
-              artifactDoc={artifactTab.doc}
+              artifactDoc={fileComments.doc}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
               onToggleHtmlSource={viewer === 'html' && !fileLoading && !fileError ? () => setHtmlSource((v) => !v) : null}
@@ -988,7 +989,7 @@ function FilePanel({
                   composing={selectionComposing}
                   hidden={!onAddContext || isActive === false}
                   boundsRef={contentWrapperRef}
-                  label={t('context.quote.from', { name: selectionSourceName(selectedFile, selectionTooltip) })}
+                  label={t('context.quote.from', { name: selectionSourceName(selectionTooltip.path ?? selectedFile, selectionTooltip) })}
                   placeholder={agentName ? t('context.quote.reply', { name: agentName }) : t('context.quote.replyGeneric')}
                   addLabel={selectionTooltip.lineStart != null
                     ? (selectionTooltip.lineEnd !== selectionTooltip.lineStart
@@ -1001,6 +1002,8 @@ function FilePanel({
                   }}
                   onReply={() => beginReply(selectionTooltip)}
                   onDismiss={dismissSelection}
+                  asks
+                  onComment={fileComments.selectionComment(selectionTooltip)}
                 />
               )}
               {/* DALTON-HOOK(team-sharing): pass teamReadOnly so colleague mirror does not start preview sandbox */}
@@ -1031,6 +1034,7 @@ function FilePanel({
                   onDownload: handleDownloadSelected,
                   downloadState: selectedDownloadState,
                   onDownloadInFallback: handleDownloadInFallback,
+                  onDocumentFailed: setDocumentFailed,
                   focus,
                   isEditing: edit.isEditing,
                   editContent: edit.editContent,
@@ -1048,7 +1052,8 @@ function FilePanel({
                   // DALTON-HOOK(team-sharing): forward teamReadOnly to FileViewer / HtmlViewer
                   teamReadOnly,
                   htmlSource: htmlView.source,
-                  htmlArtifact: artifactTab.view,
+                  htmlArtifact: fileComments.view,
+                  comments: fileComments.target,
                 }}
                 onPageCount={onPageCount}
                 canUpload={!readOnly}
@@ -1137,7 +1142,7 @@ function FilePanel({
           />
         </Suspense>
       )}
-      {artifactTab.dialog}
+      {fileComments.dialog}
       {unshareTarget && (
         <Suspense fallback={null}>
           <PublishDialog

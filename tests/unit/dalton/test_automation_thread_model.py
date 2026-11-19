@@ -19,6 +19,7 @@ from src.dalton.services import automation_thread_model
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.conversation import threads_write
+from src.server.database.runs import command_runs as command_runs_db
 from src.server.handlers.chat import request_prep
 from src.server.models.chat import ChatMessage, ChatRequest, ThreadOrigin
 from src.server.services.llm import thread_model
@@ -216,6 +217,13 @@ def _send_route_stubs(
         patch(f"{_ATM_MOD}._get_execution_for_task", get_by_task_mock),
         patch(f"{_ATM_MOD}._get_execution_first_turn_llm_model", first_turn_mock),
         patch(f"{_ATM_MOD}.auto_db.get_automation_including_deleted", get_auto_mock),
+        patch(
+            "src.server.database.runs.command_runs.get_thread_command",
+            create_autospec(
+                command_runs_db.get_thread_command,
+                return_value={"workspace_id": _WS},
+            ),
+        ),
         patch.object(threads_write, "remember_thread_llm_model", remember_mock),
         patch.object(threads_write, "update_thread_fields", update_fields_mock),
         patch("src.server.dependencies.usage_limits.enforce_credit_limit", AsyncMock()),
