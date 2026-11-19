@@ -264,21 +264,16 @@ async def mark_preflight_timeout_reminded(
 async def list_unwoken_signals(
     workspace_id: Optional[str],
     ticker: Optional[str] = None,
-    for_execution_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Return unresolved, unexpired signals not claimed by another execution."""
+    """Return unresolved signals that no execution has claimed yet."""
     ws_uuid = _resolve_ws_uuid(workspace_id)
     clauses = [
         "workspace_id = %s",
+        "woken_execution_id IS NULL",
         "resolved_at IS NULL",
         "expired_at IS NULL",
     ]
     params: list[Any] = [ws_uuid]
-    if for_execution_id:
-        clauses.append("(woken_execution_id IS NULL OR woken_execution_id = %s)")
-        params.append(_signal_exec_uuid(for_execution_id))
-    else:
-        clauses.append("woken_execution_id IS NULL")
     if ticker:
         clauses.append("ticker = %s")
         params.append(ticker.upper())
@@ -295,6 +290,35 @@ async def list_unwoken_signals(
                 ORDER BY detected_at ASC
                 """,
                 tuple(params),
+            )
+            rows = await cur.fetchall()
+            return [_with_signal_status(dict(r)) for r in (rows or [])]
+
+
+async def list_signals_claimed_by(
+    execution_id: str,
+    workspace_id: Optional[str],
+) -> list[dict[str, Any]]:
+    """Return unresolved, unexpired signals already claimed by ``execution_id``."""
+    if not execution_id or not workspace_id:
+        return []
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    exec_uuid = _signal_exec_uuid(execution_id)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
+                       summary, payload, detected_at, woken_execution_id, woken_at,
+                       resolved_at, expired_at
+                FROM dalton_signals
+                WHERE woken_execution_id = %s
+                  AND workspace_id = %s
+                  AND resolved_at IS NULL
+                  AND expired_at IS NULL
+                ORDER BY detected_at ASC
+                """,
+                (exec_uuid, ws_uuid),
             )
             rows = await cur.fetchall()
             return [_with_signal_status(dict(r)) for r in (rows or [])]

@@ -71,6 +71,7 @@ _REAL_UPSERT_WATCH_STATE = watch_db.upsert_watch_state
 _REAL_GET_WATCH_STATE = watch_db.get_watch_state
 _REAL_EXPIRE_OLD_SIGNALS = watch_db.expire_old_signals
 _REAL_LIST_UNWOKEN_SIGNALS = watch_db.list_unwoken_signals
+_REAL_LIST_SIGNALS_CLAIMED_BY = watch_db.list_signals_claimed_by
 _REAL_BUMP_PREFLIGHT_TIMEOUT_STREAK = watch_db.bump_preflight_timeout_streak
 _REAL_RESET_PREFLIGHT_TIMEOUT_STREAK = watch_db.reset_preflight_timeout_streak
 _REAL_MARK_PREFLIGHT_TIMEOUT_REMINDED = watch_db.mark_preflight_timeout_reminded
@@ -3100,9 +3101,7 @@ async def test_saved_local_earnings_signal_is_claimed_on_the_next_run(
             saved_rows[pair] = row
         return dict(row), True
 
-    async def _list(
-        workspace_id: Any, ticker: Any = None, for_execution_id: Any = None
-    ) -> list[dict[str, Any]]:
+    async def _list(workspace_id: Any, ticker: Any = None) -> list[dict[str, Any]]:
         return [dict(row) for row in saved_rows.values()]
 
     listed = create_autospec(_REAL_LIST_UNWOKEN_SIGNALS, side_effect=_list)
@@ -4436,16 +4435,17 @@ async def test_get_preflight_wake_context_tells_woke_without_context_from_never_
 
 
 @pytest.mark.asyncio
-async def test_claim_signals_woken_and_list_unwoken_sql_reentrant_for_same_execution(
+async def test_claim_signals_woken_and_list_signals_claimed_by_sql(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """数据库层可重入 SQL 验证：claim_signals_woken 幂等返回本执行已认领行且保留首次 woken_at，list_unwoken_signals 支持按 for_execution_id 过滤。"""
+    """数据库层 SQL 验证：claim_signals_woken 幂等保留首次 woken_at；list_signals_claimed_by 仅返回本执行未解决/未过期的已认领信号；list_unwoken_signals 保持未认领语义。"""
     import uuid
     from contextlib import asynccontextmanager
     from psycopg import AsyncConnection
 
     ws_id = "11111111-1111-1111-1111-111111111111"
     sig_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    sig_resolved = "cccccccc-cccc-cccc-cccc-cccccccccccd"
     exec_1 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeee1"
     exec_2 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeee2"
     first_woken_at = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
@@ -4455,17 +4455,32 @@ async def test_claim_signals_woken_and_list_unwoken_sql_reentrant_for_same_execu
             "signal_id": uuid.UUID(sig_id),
             "workspace_id": uuid.UUID(ws_id),
             "ticker": "META",
-            "probe": "earnings",
-            "signal_key": "earnings:2026Q3:T-3",
-            "priority": "P0",
-            "summary": "Earnings upcoming",
-            "payload": {"window": "T-3"},
+            "probe": "sec",
+            "signal_key": "sec:form4:0001",
+            "priority": "P2",
+            "summary": "Form 4 insider filing",
+            "payload": {"form": "4"},
             "detected_at": first_woken_at - timedelta(minutes=5),
             "woken_execution_id": None,
             "woken_at": None,
             "resolved_at": None,
             "expired_at": None,
-        }
+        },
+        sig_resolved: {
+            "signal_id": uuid.UUID(sig_resolved),
+            "workspace_id": uuid.UUID(ws_id),
+            "ticker": "META",
+            "probe": "sec",
+            "signal_key": "sec:form4:resolved",
+            "priority": "P2",
+            "summary": "Already resolved",
+            "payload": {"form": "4", "status": "resolved"},
+            "detected_at": first_woken_at - timedelta(minutes=10),
+            "woken_execution_id": uuid.UUID(exec_1),
+            "woken_at": first_woken_at - timedelta(minutes=1),
+            "resolved_at": first_woken_at,
+            "expired_at": None,
+        },
     }
     queries: list[tuple[str, Any]] = []
     last_rows: list[dict[str, Any]] = []
@@ -4497,22 +4512,28 @@ async def test_claim_signals_woken_and_list_unwoken_sql_reentrant_for_same_execu
                     row["payload"] = {**(row.get("payload") or {}), "status": "woken"}
                     last_rows.append(dict(row))
         elif normalized.startswith("SELECT signal_id"):
-            q_ws = params[0]
-            allowed_exec = params[1] if len(params) >= 2 and "woken_execution_id = %s" in normalized else None
-            q_ticker = params[-1] if "ticker = %s" in normalized else None
-            for row in table.values():
-                if str(row["workspace_id"]) != str(q_ws):
-                    continue
-                if row["resolved_at"] is not None or row["expired_at"] is not None:
-                    continue
-                if q_ticker and row["ticker"] != q_ticker:
-                    continue
-                if allowed_exec is not None:
-                    if row["woken_execution_id"] is not None and str(row["woken_execution_id"]) != str(allowed_exec):
-                        continue
-                elif row["woken_execution_id"] is not None:
-                    continue
-                last_rows.append(dict(row))
+            if "WHERE woken_execution_id = %s" in normalized:
+                q_exec, q_ws = params
+                for row in table.values():
+                    if (
+                        str(row["woken_execution_id"]) == str(q_exec)
+                        and str(row["workspace_id"]) == str(q_ws)
+                        and row["resolved_at"] is None
+                        and row["expired_at"] is None
+                    ):
+                        last_rows.append(dict(row))
+            else:
+                q_ws = params[0]
+                q_ticker = params[1] if len(params) > 1 else None
+                for row in table.values():
+                    if (
+                        str(row["workspace_id"]) == str(q_ws)
+                        and row["woken_execution_id"] is None
+                        and row["resolved_at"] is None
+                        and row["expired_at"] is None
+                        and (not q_ticker or row["ticker"] == q_ticker)
+                    ):
+                        last_rows.append(dict(row))
 
     mock_cur.execute.side_effect = _exec
     mock_cur.fetchall.side_effect = lambda: list(last_rows)
@@ -4534,31 +4555,28 @@ async def test_claim_signals_woken_and_list_unwoken_sql_reentrant_for_same_execu
         create_autospec(watch_db.get_db_connection, side_effect=_conn_ctx),
     )
 
-    # 1. 首次认领：写入 woken_execution_id=exec_1 与 woken_at=first_woken_at
+    # 1. list_signals_claimed_by 认领前只过滤本执行且跳过 resolved 行，此时返回 []
+    assert await _REAL_LIST_SIGNALS_CLAIMED_BY(exec_1, ws_id) == []
+    assert "woken_execution_id = %s AND workspace_id = %s AND resolved_at IS NULL AND expired_at IS NULL" in queries[-1][0]
+
+    # 2. 首次认领 & 重复认领保留首次 woken_at
     claimed_first = await _REAL_CLAIM_SIGNALS_WOKEN([sig_id], exec_1, workspace_id=ws_id)
     assert len(claimed_first) == 1
     assert claimed_first[0]["woken_at"] == first_woken_at
     assert "woken_at = COALESCE(woken_at, NOW())" in queries[-1][0]
     assert "AND (woken_execution_id IS NULL OR woken_execution_id = %s)" in queries[-1][0]
 
-    # 2. 同一执行再次认领：仍返回该行且保留首次 woken_at
     claimed_repeat = await _REAL_CLAIM_SIGNALS_WOKEN([sig_id], exec_1, workspace_id=ws_id)
     assert len(claimed_repeat) == 1
-    assert str(claimed_repeat[0]["signal_id"]) == sig_id
     assert claimed_repeat[0]["woken_at"] == first_woken_at
+    assert await _REAL_CLAIM_SIGNALS_WOKEN([sig_id], exec_2, workspace_id=ws_id) == []
 
-    # 3. 其他执行无法认领该信号
-    claimed_other = await _REAL_CLAIM_SIGNALS_WOKEN([sig_id], exec_2, workspace_id=ws_id)
-    assert claimed_other == []
-
-    # 4. list_unwoken_signals 不传 for_execution_id 时排除，传 exec_1 时召回，传 exec_2 时仍排除
+    # 3. list_signals_claimed_by 仅返回 exec_1 的未解决有效行；exec_2 为 []；list_unwoken_signals 为 []
+    claimed_by_1 = await _REAL_LIST_SIGNALS_CLAIMED_BY(exec_1, ws_id)
+    assert [str(r["signal_id"]) for r in claimed_by_1] == [sig_id]
+    assert await _REAL_LIST_SIGNALS_CLAIMED_BY(exec_2, ws_id) == []
     assert await _REAL_LIST_UNWOKEN_SIGNALS(ws_id, "META") == []
     assert "woken_execution_id IS NULL" in queries[-1][0]
-    for_self = await _REAL_LIST_UNWOKEN_SIGNALS(ws_id, "META", for_execution_id=exec_1)
-    assert len(for_self) == 1
-    assert str(for_self[0]["signal_id"]) == sig_id
-    assert "(woken_execution_id IS NULL OR woken_execution_id = %s)" in queries[-1][0]
-    assert await _REAL_LIST_UNWOKEN_SIGNALS(ws_id, "META", for_execution_id=exec_2) == []
 
 
 def _install_stateful_signal_store(
@@ -4567,7 +4585,7 @@ def _install_stateful_signal_store(
     initial_rows: list[dict[str, Any]] | None = None,
     log_error: BaseException | None = None,
 ) -> dict[str, Any]:
-    """构建带真实认领/过滤语义的内存信号存储，供 decide() 重入测试使用。"""
+    """构建带真实认领与 list_signals_claimed_by 语义的内存信号存储。"""
     import uuid
     from src.dalton.autonomy import preflight as preflight_mod
 
@@ -4595,7 +4613,7 @@ def _install_stateful_signal_store(
             "ticker": str(kwargs.get("ticker") or "META").upper(),
             "probe": pair[0],
             "signal_key": pair[1],
-            "priority": kwargs.get("priority") or "P0",
+            "priority": kwargs.get("priority") or "P2",
             "summary": kwargs.get("summary") or "",
             "payload": dict(kwargs.get("payload") or {}),
             "detected_at": base_time,
@@ -4607,20 +4625,29 @@ def _install_stateful_signal_store(
         rows_by_pair[pair] = row
         return watch_db._with_signal_status(dict(row)), True
 
-    async def _list_unwoken(
-        workspace_id: Any, ticker: Any = None, for_execution_id: Any = None
-    ) -> list[dict[str, Any]]:
-        target_uuid = watch_db._signal_exec_uuid(for_execution_id) if for_execution_id else None
+    async def _list_unwoken(workspace_id: Any, ticker: Any = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for row in rows_by_pair.values():
             if row.get("resolved_at") is not None or row.get("expired_at") is not None:
                 continue
+            if row.get("woken_execution_id") is not None:
+                continue
+            out.append(watch_db._with_signal_status(dict(row)))
+        return out
+
+    async def _list_claimed_by(execution_id: str, workspace_id: Any) -> list[dict[str, Any]]:
+        if not execution_id or not workspace_id:
+            return []
+        target_uuid = watch_db._signal_exec_uuid(str(execution_id))
+        out: list[dict[str, Any]] = []
+        for row in rows_by_pair.values():
+            if str(row.get("workspace_id") or "") != str(workspace_id):
+                continue
+            if row.get("resolved_at") is not None or row.get("expired_at") is not None:
+                continue
             row_exec = row.get("woken_execution_id")
-            if row_exec is not None:
-                if target_uuid is None:
-                    continue
-                if watch_db._signal_exec_uuid(str(row_exec)) != target_uuid:
-                    continue
+            if row_exec is None or watch_db._signal_exec_uuid(str(row_exec)) != target_uuid:
+                continue
             out.append(watch_db._with_signal_status(dict(row)))
         return out
 
@@ -4651,6 +4678,7 @@ def _install_stateful_signal_store(
 
     monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(_REAL_UPSERT_SIGNAL, side_effect=_upsert))
     monkeypatch.setattr(watch_db, "list_unwoken_signals", create_autospec(_REAL_LIST_UNWOKEN_SIGNALS, side_effect=_list_unwoken))
+    monkeypatch.setattr(watch_db, "list_signals_claimed_by", create_autospec(_REAL_LIST_SIGNALS_CLAIMED_BY, side_effect=_list_claimed_by))
     monkeypatch.setattr(watch_db, "claim_signals_woken", create_autospec(_REAL_CLAIM_SIGNALS_WOKEN, side_effect=_claim))
     monkeypatch.setattr(watch_db, "insert_preflight_log", create_autospec(_REAL_INSERT_PREFLIGHT_LOG, side_effect=_log))
     monkeypatch.setattr(
@@ -4662,68 +4690,148 @@ def _install_stateful_signal_store(
 
 
 @pytest.mark.asyncio
-async def test_preflight_decide_reentry_reclaims_own_signals_after_wake_log_failure(
+async def test_decide_recovery_reuses_claimed_nondirect_sec_signal_without_triage_or_resolve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """首次预检认领信号后写入唤醒日志失败，同一执行重跑 decide() 时仍能找回该信号并唤醒，不会 PRECHECK_SKIPPED。"""
+    """codex 复现场景：首次认领一条非直接唤醒信号（SEC Form 4）且两次日志写入失败后，恢复调用 decide() 直接返回唤醒（含该信号 wake_context），不再调用探针、分诊与 resolve_signals；且恢复补记日志失败也不影响唤醒。"""
     from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.autonomy.probes import ProbeSignal
 
     _install_company_preflight_doubles(monkeypatch)
-    log_state = {"err": RuntimeError("wake log insert failed")}
     store = _install_stateful_signal_store(monkeypatch, log_error=None)
-    orig_insert = watch_db.insert_preflight_log
+
+    log_attempts: list[dict[str, Any]] = []
+    log_state = {"fail": True}
 
     async def _conditional_log(**kwargs: Any) -> dict[str, Any]:
-        if log_state["err"] is not None:
-            raise log_state["err"]
-        return await orig_insert(**kwargs)
+        log_attempts.append(dict(kwargs))
+        if log_state["fail"]:
+            raise RuntimeError("wake log insert failed")
+        return {}
 
     monkeypatch.setattr(
         watch_db,
         "insert_preflight_log",
         create_autospec(_REAL_INSERT_PREFLIGHT_LOG, side_effect=_conditional_log),
     )
+    resolve_mock = create_autospec(_REAL_RESOLVE_SIGNALS, return_value=None)
+    monkeypatch.setattr(watch_db, "resolve_signals", resolve_mock)
 
-    emitted_once = {"done": False}
+    non_direct_sec = ProbeSignal(
+        probe="sec",
+        signal_key="sec:form4:0001-26-000001",
+        priority="P2",
+        summary="Form 4 insider filing",
+        payload={"form": "4", "accession_no": "0001-26-000001"},
+    )
+    assert is_direct_wake_signal(non_direct_sec) is False
 
-    async def _earnings(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
-        state = dict(kwargs.get("watch_state") or {})
-        if not emitted_once["done"]:
-            emitted_once["done"] = True
-            return [_due_earnings_signal()], state
-        return [], state
+    phase = {"step": "first"}
+
+    async def _sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        assert phase["step"] == "first"
+        return [non_direct_sec], dict(kwargs.get("watch_state") or {})
 
     async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        assert phase["step"] == "first"
         return [], dict(kwargs.get("watch_state") or {})
 
-    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_earnings)
+    sec_mock = create_autospec(probe_sec, side_effect=_sec)
+    _patch_company_probes(monkeypatch, sec=sec_mock, cnhk=_quiet, earnings=_quiet)
 
-    exec_1 = "exec-reentry-1"
+    async def _triage(*, signals: list[dict[str, Any]], **_kw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        if phase["step"] == "first":
+            return list(signals), [], "llm_kept"
+        return [], list(signals), "llm_skipped_on_retry"
+
+    triage_mock = create_autospec(preflight_mod._triage_signals_with_llm, side_effect=_triage)
+    monkeypatch.setattr(preflight_mod, "_triage_signals_with_llm", triage_mock)
+
+    exec_1 = "exec-codex-repro-1"
     auto = _company_watch_automation()
 
-    # 第 1 次预检：认领成功但两次唤醒日志写入均失败
+    # 第 1 次预检：通过 LLM 分诊保留并认领该非直接 SEC 信号，但两次日志写入都失败
     first = await preflight_mod.decide(auto, exec_1)
     assert first is not None and first.should_wake is True
+    assert triage_mock.await_count == 1
+    assert sec_mock.await_count == 1
+    assert len(log_attempts) == 2
+    claim_mock = watch_db.claim_signals_woken
+    assert claim_mock.await_count == 1
     sig_row = next(iter(store["rows"].values()))
-    first_woken_at = sig_row["woken_at"]
-    assert first_woken_at is not None
+    assert sig_row["woken_at"] is not None
 
-    # 第 2 次预检（重启恢复查不到日志）：即便 probe 未再 emit 新信号，也从 DB 找回本执行信号并唤醒，woken_at 不变
-    log_state["err"] = None
-    second = await preflight_mod.decide(auto, exec_1)
-    assert second is not None
-    assert second.should_wake is True
-    assert second.decision == "wake"
-    assert len(second.signals) == 1
-    assert second.signals[0]["signal_key"] == "earnings:2026Q3:T-3"
-    assert sig_row["woken_at"] == first_woken_at
+    # 第 2 次（恢复执行，且即使补记日志依然失败）：直接返回唤醒，不调探针/分诊/resolve_signals/claim_signals_woken
+    phase["step"] = "recovery"
+    recovered = await preflight_mod.decide(auto, exec_1)
+    assert recovered is not None
+    assert recovered.should_wake is True
+    assert recovered.decision == "wake"
+    assert len(recovered.signals) == 1
+    assert recovered.signals[0]["signal_key"] == "sec:form4:0001-26-000001"
+    assert "sec:form4:0001-26-000001" in (recovered.wake_context or "")
+    assert "Form 4 insider filing" in (recovered.wake_context or "")
+    assert sec_mock.await_count == 1
+    assert triage_mock.await_count == 1
+    assert claim_mock.await_count == 1
+    resolve_mock.assert_not_awaited()
+    assert len(log_attempts) == 3  # 恢复时尝试补记唤醒日志（失败不影响唤醒决定）
 
 
 @pytest.mark.asyncio
-async def test_preflight_decide_reentry_still_excludes_other_executions_signals(
+async def test_decide_recovery_skips_probes_that_would_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """重跑预检时，被其他执行认领的信号无论通过 DB 查询还是 probe 重新 upsert 都必须被排除。"""
+    """恢复时若本执行已有有效已认领信号，即便探测阶段会超时也直接返回唤醒（恢复检查先于任何探测与超时）。"""
+    from src.dalton.autonomy import preflight as preflight_mod
+
+    exec_1 = "exec-timeout-recovery-1"
+    claimed_row = {
+        "signal_id": "33333333-3333-3333-3333-333333333333",
+        "workspace_id": _PREFLIGHT_WS,
+        "ticker": "META",
+        "probe": "sec",
+        "signal_key": "sec:8k:item202",
+        "priority": "P0",
+        "summary": "8-K Item 2.02 filed",
+        "payload": {"form": "8-K", "status": "woken"},
+        "woken_execution_id": watch_db._signal_exec_uuid(exec_1),
+        "woken_at": datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc),
+        "resolved_at": None,
+        "expired_at": None,
+    }
+    list_claimed_mock = create_autospec(_REAL_LIST_SIGNALS_CLAIMED_BY, return_value=[claimed_row])
+    monkeypatch.setattr(watch_db, "list_signals_claimed_by", list_claimed_mock)
+    monkeypatch.setattr(
+        watch_db,
+        "get_preflight_wake_context",
+        create_autospec(preflight_mod.watch_db.get_preflight_wake_context, return_value=None),
+    )
+    insert_mock = create_autospec(_REAL_INSERT_PREFLIGHT_LOG, return_value={})
+    monkeypatch.setattr(watch_db, "insert_preflight_log", insert_mock)
+    preflight_check_mock = create_autospec(
+        preflight_mod.preflight_check,
+        side_effect=asyncio.TimeoutError("probe phase timed out"),
+    )
+    monkeypatch.setattr(preflight_mod, "preflight_check", preflight_check_mock)
+
+    res = await preflight_mod.decide(_company_watch_automation(), exec_1)
+    assert res is not None
+    assert res.should_wake is True
+    assert res.decision == "wake"
+    assert [s["signal_key"] for s in res.signals] == ["sec:8k:item202"]
+    assert "sec:8k:item202" in (res.wake_context or "")
+    list_claimed_mock.assert_awaited_once_with(exec_1, _PREFLIGHT_WS)
+    preflight_check_mock.assert_not_awaited()
+    insert_mock.assert_awaited_once()
+    assert insert_mock.await_args.kwargs["decision"] == "wake"
+
+
+@pytest.mark.asyncio
+async def test_decide_recovery_falls_through_when_no_self_claimed_signals_and_excludes_other_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """本执行未认领任何信号时走原 preflight_check 流程；被其他执行认领的信号不进入本执行的恢复检查并仍被排除。"""
     from src.dalton.autonomy import preflight as preflight_mod
 
     _install_company_preflight_doubles(monkeypatch)
@@ -4753,7 +4861,7 @@ async def test_preflight_decide_reentry_still_excludes_other_executions_signals(
 
     _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet, earnings=_reemit_other)
 
-    res = await preflight_mod.decide(_company_watch_automation(), "exec-reentry-1")
+    res = await preflight_mod.decide(_company_watch_automation(), "exec-fresh-1")
     assert res is not None
     assert res.should_wake is False
     assert res.decision == "skip"

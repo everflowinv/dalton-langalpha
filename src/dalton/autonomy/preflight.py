@@ -943,43 +943,9 @@ def _note_timeout_reminder_settled(
 _TIMEOUT_REMINDER_RETRY_LIMIT = 5
 
 
-def _row_matches_execution(row: Any, execution_id: Optional[str]) -> bool:
-    """True when ``row`` carries ``woken_execution_id`` matching ``execution_id``."""
-    if not isinstance(row, dict) or not execution_id:
-        return False
-    claimed_exec = row.get("woken_execution_id")
-    if claimed_exec in (None, ""):
-        return False
-    raw_row = str(claimed_exec).strip()
-    raw_exec = str(execution_id).strip()
-    if raw_row == raw_exec:
-        return True
-    try:
-        return watch_db._signal_exec_uuid(raw_row) == watch_db._signal_exec_uuid(raw_exec)
-    except Exception:
-        return False
-
-
-def _signal_reusable_for_execution(row: Any, execution_id: Optional[str]) -> bool:
-    """True when ``row`` was previously claimed by ``execution_id`` and stays active."""
-    if not _row_matches_execution(row, execution_id) or _signal_resolved(row):
-        return False
-    status = str(row.get("status") or "").strip().lower()
-    if status == "expired" or row.get("expired_at") is not None:
-        return False
-    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-    return payload.get("status") != "expired"
-
-
-def _signal_was_claimed(
-    row: Any,
-    *,
-    for_execution_id: Optional[str] = None,
-) -> bool:
-    """True when an execution other than ``for_execution_id`` has claimed this signal."""
+def _signal_was_claimed(row: Any) -> bool:
+    """True when an execution has already claimed this signal row."""
     if not isinstance(row, dict):
-        return False
-    if _row_matches_execution(row, for_execution_id):
         return False
     if str(row.get("status") or "").strip().lower() == "woken":
         return True
@@ -988,21 +954,13 @@ def _signal_was_claimed(
     return row.get("woken_at") is not None
 
 
-def _signal_closed_unclaimed(
-    row: Any,
-    *,
-    for_execution_id: Optional[str] = None,
-) -> bool:
+def _signal_closed_unclaimed(row: Any) -> bool:
     """True when the row expired and nobody claimed it.
 
     A row someone resolved was seen and dismissed, so it settles the cycle
     rather than starting a retry.
     """
-    if not isinstance(row, dict) or _signal_was_claimed(
-        row, for_execution_id=for_execution_id
-    ):
-        return False
-    if _row_matches_execution(row, for_execution_id):
+    if not isinstance(row, dict) or _signal_was_claimed(row):
         return False
     status = str(row.get("status") or "").strip().lower()
     if status == "expired":
@@ -1020,6 +978,50 @@ def _signal_resolved(row: Any) -> bool:
     return status == "resolved" or row.get("resolved_at") is not None
 
 
+def _signal_row_to_candidate(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalize a ``dalton_signals`` DB row into the signal shape used in preflight."""
+    probe = str(row.get("probe") or "")
+    signal_key = str(row.get("signal_key") or "")
+    if not probe or not signal_key:
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return {
+        "signal_id": str(row.get("signal_id") or ""),
+        "probe": probe,
+        "signal_key": signal_key,
+        "priority": row.get("priority") or "P1",
+        "summary": row.get("summary") or "",
+        "payload": payload,
+    }
+
+
+def _build_wake_preflight_result(
+    *,
+    name: str,
+    ticker: Optional[str],
+    signals: list[dict[str, Any]],
+    group_refresh_summary: Optional[str] = None,
+) -> PreflightResult:
+    """Build a waking ``PreflightResult`` and its ``wake_context`` consistently."""
+    wake_ctx = format_wake_directive(
+        automation_name=name,
+        ticker=ticker,
+        signals=signals,
+    )
+    if group_refresh_summary:
+        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
+        wake_ctx = (
+            f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
+        )
+    return PreflightResult(
+        should_wake=True,
+        decision="wake",
+        reason=f"{len(signals)}_signals",
+        signals=signals,
+        wake_context=wake_ctx,
+    )
+
+
 async def _save_timeout_reminder_retry(
     sig: ProbeSignal,
     *,
@@ -1027,7 +1029,6 @@ async def _save_timeout_reminder_retry(
     persist: bool,
     workspace_id: Optional[str],
     ticker: Optional[str],
-    execution_id: Optional[str],
     probe_progress: Optional[dict[str, Any]],
     pending_reminder_cycles: dict[str, str],
     candidate_signals: list[dict[str, Any]],
@@ -1061,7 +1062,7 @@ async def _save_timeout_reminder_retry(
         except Exception as retry_err:
             logger.warning("[DALTON_PREFLIGHT] 连续超时提醒重试保存失败: %s", retry_err)
             return
-        if retry_unwoken or _signal_reusable_for_execution(retry_row, execution_id):
+        if retry_unwoken:
             signal_id = str((retry_row or {}).get("signal_id") or "").strip()
             if not signal_id:
                 logger.warning("[DALTON_PREFLIGHT] 连续超时提醒重试没有信号编号，本周期下次再试")
@@ -1078,13 +1079,10 @@ async def _save_timeout_reminder_retry(
                 }
             )
             return
-        if (
-            _signal_was_claimed(retry_row, for_execution_id=execution_id)
-            or _signal_resolved(retry_row)
-        ):
+        if _signal_was_claimed(retry_row) or _signal_resolved(retry_row):
             _note_timeout_reminder_settled(probe_progress, cycle, persist=persist)
             return
-        if not _signal_closed_unclaimed(retry_row, for_execution_id=execution_id):
+        if not _signal_closed_unclaimed(retry_row):
             return
     logger.warning("[DALTON_PREFLIGHT] 连续超时提醒仍未领取，本周期下次再试")
 
@@ -1131,42 +1129,33 @@ async def _conclude_preflight(
                     summary=sig.summary,
                     payload=sig.payload,
                 )
-                reusable_for_self = (not is_unwoken) and _signal_reusable_for_execution(
-                    row, execution_id
-                )
                 cycle = _reminder_cycle(sig)
-                if cycle and (is_unwoken or reusable_for_self):
+                if cycle and is_unwoken:
                     pending_reminder_cycles[str(row.get("signal_id") or "")] = cycle
                 elif cycle:
-                    # should_wake is false for a claimed row (owned by another
-                    # execution) and also for an expired or resolved row. A
-                    # claimed row, or one a person resolved, counts as reminded.
-                    # An expired row that was never claimed is saved again under
-                    # a new key; this run's claim marks the cycle.
-                    if (
-                        _signal_was_claimed(row, for_execution_id=execution_id)
-                        or _signal_resolved(row)
-                    ):
+                    # should_wake is false for a claimed row and also for an
+                    # expired or resolved row. A claimed row, or one a person
+                    # resolved, counts as reminded. An expired row that was
+                    # never claimed is saved again under a new key; this run's
+                    # claim marks the cycle.
+                    if _signal_was_claimed(row) or _signal_resolved(row):
                         _note_timeout_reminder_settled(
                             probe_progress,
                             cycle,
                             persist=persist,
                         )
-                    elif _signal_closed_unclaimed(
-                        row, for_execution_id=execution_id
-                    ):
+                    elif _signal_closed_unclaimed(row):
                         await _save_timeout_reminder_retry(
                             sig,
                             cycle=cycle,
                             persist=persist,
                             workspace_id=workspace_id,
                             ticker=ticker,
-                            execution_id=execution_id,
                             probe_progress=probe_progress,
                             pending_reminder_cycles=pending_reminder_cycles,
                             candidate_signals=candidate_signals,
                         )
-                if is_unwoken or reusable_for_self:
+                if is_unwoken:
                     candidate_signals.append(
                         {
                             "signal_id": str(row.get("signal_id") or ""),
@@ -1203,9 +1192,7 @@ async def _conclude_preflight(
 
     if persist and load_saved_signals and workspace_id:
         try:
-            saved_rows = await watch_db.list_unwoken_signals(
-                workspace_id, ticker, for_execution_id=execution_id
-            )
+            saved_rows = await watch_db.list_unwoken_signals(workspace_id, ticker)
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] list unwoken signals failed: %s", e)
             saved_rows = []
@@ -1214,21 +1201,14 @@ async def _conclude_preflight(
             for item in candidate_signals
         }
         for row in saved_rows:
-            pair = (str(row.get("probe") or ""), str(row.get("signal_key") or ""))
-            if not pair[0] or not pair[1] or pair in have:
+            cand = _signal_row_to_candidate(row)
+            if cand is None:
+                continue
+            pair = (cand["probe"], cand["signal_key"])
+            if pair in have:
                 continue
             have.add(pair)
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            candidate_signals.append(
-                {
-                    "signal_id": str(row.get("signal_id") or ""),
-                    "probe": pair[0],
-                    "signal_key": pair[1],
-                    "priority": row.get("priority") or "P1",
-                    "summary": row.get("summary") or "",
-                    "payload": payload,
-                }
-            )
+            candidate_signals.append(cand)
 
     # The stale-todo sweep-up never stands in the wake decision (round 4 #3):
     # it is kept out of the direct-wake split, the LLM triage and thereby the
@@ -1426,20 +1406,11 @@ async def _conclude_preflight(
                 watch_state_override.update(state)
         woke_signals = woke_signals + stale_signals
 
-    wake_ctx = format_wake_directive(
-        automation_name=name,
+    result = _build_wake_preflight_result(
+        name=name,
         ticker=ticker,
         signals=woke_signals,
-    )
-    if group_refresh_summary:
-        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
-        wake_ctx = f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
-    result = PreflightResult(
-        should_wake=True,
-        decision="wake",
-        reason=f"{len(woke_signals)}_signals",
-        signals=woke_signals,
-        wake_context=wake_ctx,
+        group_refresh_summary=group_refresh_summary,
     )
     _remember_wake(probe_progress, result, name=name, ticker=ticker)
     if persist and stale_signals:
@@ -2362,6 +2333,51 @@ PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 30.0
 PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = 26.0
 
 
+async def _recover_claimed_wake(
+    automation: dict[str, Any],
+    execution_id: str,
+) -> Optional[PreflightResult]:
+    """Reuse this execution's already-claimed signals before probes, triage, or timeouts run.
+
+    If a previous attempt claimed signals but restarted before logging the wake,
+    returning those active claimed signals here avoids re-running probes or
+    triage (and avoids ``resolve_signals``) on recovery.
+    """
+    raw_ws_id = str(automation.get("workspace_id") or "").strip()
+    if not raw_ws_id or not execution_id:
+        return None
+    try:
+        claimed_rows = await watch_db.list_signals_claimed_by(execution_id, raw_ws_id)
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] recovery lookup failed: %s", e)
+        return None
+    if not claimed_rows:
+        return None
+    recovered_signals: list[dict[str, Any]] = []
+    for row in claimed_rows:
+        cand = _signal_row_to_candidate(row)
+        if cand is not None:
+            recovered_signals.append(cand)
+    if not recovered_signals:
+        return None
+    res = _build_wake_preflight_result(
+        name=str(automation.get("name") or "dalton-task"),
+        ticker=_extract_ticker(automation),
+        signals=recovered_signals,
+    )
+    try:
+        if await watch_db.get_preflight_wake_context(execution_id) is None:
+            await _log_wake_result(
+                automation_id=str(automation.get("automation_id") or "") or None,
+                execution_id=execution_id,
+                workspace_id=raw_ws_id,
+                result=res,
+            )
+    except Exception as e:
+        logger.warning("[DALTON_PREFLIGHT] 恢复唤醒日志补记失败: %s", e)
+    return res
+
+
 async def decide(
     automation: dict[str, Any],
     execution_id: str,
@@ -2374,18 +2390,6 @@ async def decide(
     try:
         if not is_dalton_automation(automation):
             return None
-        try:
-            from src.dalton.notify.dispatch import retry_failed_notify_deliveries
-
-            await asyncio.wait_for(
-                retry_failed_notify_deliveries(
-                    limit=5,
-                    max_duration_s=PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
-                ),
-                timeout=PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S,
-            )
-        except Exception:
-            pass
         raw_user_id = automation.get("user_id")
         if not raw_user_id or not str(raw_user_id).strip():
             logger.warning(
@@ -2399,6 +2403,23 @@ async def decide(
                 reason="missing_user_id",
                 signals=[],
             )
+        # DALTON-HOOK(preflight): check before any probe, triage, or timeout whether
+        # this execution already claimed active signals whose wake log was lost.
+        recovered = await _recover_claimed_wake(automation, execution_id)
+        if recovered is not None:
+            return recovered
+        try:
+            from src.dalton.notify.dispatch import retry_failed_notify_deliveries
+
+            await asyncio.wait_for(
+                retry_failed_notify_deliveries(
+                    limit=5,
+                    max_duration_s=PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
+                ),
+                timeout=PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S,
+            )
+        except Exception:
+            pass
         try:
             res = await preflight_check(automation, execution_id)
         except (HTTPException, PermissionError, ValueError) as exc:
