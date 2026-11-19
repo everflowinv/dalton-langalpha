@@ -1559,14 +1559,14 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
             "/api/v1/users/me/preferences",
             json={
                 "model_preference": {
-                    "dalton_audit_model": "gemini-3.8-flash-low-oauth",
+                    "dalton_audit_model": "gemini-4-hydrogen-low-oauth",
                     "dalton_audit_fallback_models": [
                         "deepseek-flash",
                         "gpt-6.2-sol-oauth",
                         "deepseek-flash",
                     ],
                     "dalton_audit_timeout_s": 300,
-                    "dalton_assist_model": "gemini-3.8-flash-low-oauth",
+                    "dalton_assist_model": "gemini-4-hydrogen-low-oauth",
                     "dalton_assist_fallback_models": ["deepseek-flash"],
                     "dalton_reviewer_models": [
                         "gpt-6.2-sol-oauth",
@@ -1580,7 +1580,7 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
 
     assert resp.status_code == 200
     saved_mp = upsert.await_args.kwargs["model_preference"]
-    assert saved_mp["dalton_audit_model"] == "gemini-3.8-flash-low-oauth"
+    assert saved_mp["dalton_audit_model"] == "gemini-4-hydrogen-low-oauth"
     assert saved_mp["dalton_audit_fallback_models"] == [
         "deepseek-flash",
         "gpt-6.2-sol-oauth",

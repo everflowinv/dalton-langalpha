@@ -141,7 +141,7 @@ Custom sectors can be created on the fly.
 ## Auto-Tagging
 
 When `tagger.enabled` is `true` in config.json, new documents are automatically tagged:
-- **Model**: Gemini 3.8 Flash through the agy CLI (`provider: "agy"`, `agy_model: "gemini-3.8-flash-low"`), billed to the Antigravity subscription quota. Any agy failure falls back to the Gemini API (`model`, default `google/gemini-3.8-flash`) and logs `[auto-tagger] agy ... failed` to stderr. `provider: "gemini-api"` skips agy.
+- **Model**: Gemini 4 Hydrogen Low through the agy CLI (`provider: "agy"`, `agy_model: "gemini-4-hydrogen-low"`), billed to the Antigravity subscription quota. Any agy failure falls back to the Gemini API (`model`, default `google/gemini-4-hydrogen`) and logs `[auto-tagger] agy ... failed` to stderr. `provider: "gemini-api"` skips agy.
 - **agy safety**: document text is untrusted. agy runs as the tool-less agent `wikitagger` (source `scripts/agy_wikitagger_agent.md`, checked and re-synced to `~/.gemini/config/agents/` before each call) inside `scripts/tagger_sandbox.sb`, with a scrubbed env and a fresh empty cwd per call under `~/.local/state/wiki-tagger/agy/cwd/`. The sandbox lets only agy and its bundled helpers execute (no shell, curl, python), connect only to the local proxy plus the DNS and syslog sockets, read only `~/.gemini` and this call's cwd in home, and write only agy's runtime data, this call's cwd and temp dirs. The agent file may use only the keys name, description, tools, excludeDefaultComponents, mainAgent, subagent. The reply is discarded (→ API fallback) if the agent was not applied, any tool step or unknown output line appeared, agy exited non-zero, or files appeared in the cwd; such a cwd is moved to `~/.local/state/wiki-tagger/agy/quarantine/`. Do not add `--dangerously-skip-permissions`, `--json-schema`, or tools to that agent.
 - **Tags**: 3-8 Chinese topic tags (English only for proper nouns, tickers, standard abbreviations); the prompt carries no example tags and bans generic labels such as 行业分析
 - **Context**: the filing company/sector and content type are passed to the model; for a company, so are the sectors its other documents carry, so new tags follow the library convention
@@ -340,8 +340,8 @@ When user asks about a topic across companies:
 {
   "tagger": {
     "provider": "agy",
-    "agy_model": "gemini-3.8-flash-low",
-    "model": "google/gemini-3.8-flash",
+    "agy_model": "gemini-4-hydrogen-low",
+    "model": "google/gemini-4-hydrogen",
     "enabled": true,
     "rate_limit_rpm": 30,
     "max_input_chars": 30000,

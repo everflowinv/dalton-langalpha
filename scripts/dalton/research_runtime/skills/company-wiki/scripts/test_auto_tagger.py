@@ -15,7 +15,7 @@ import auto_tagger as at  # noqa: E402
 SECTORS = [{"id": "global-semiconductor", "label": "Global Semiconductor"},
            {"id": "us-datacenter-infra", "label": "US Data Center Infra"}]
 ALIASES = {"us semiconductor": "global-semiconductor", "美光": "MU"}
-CONFIG = {"tagger": {"enabled": True, "provider": "agy", "model": "google/gemini-3.8-flash",
+CONFIG = {"tagger": {"enabled": True, "provider": "agy", "model": "google/gemini-4-hydrogen",
                      "rate_limit_rpm": 6000},
           "aliases": ALIASES, "sectors": SECTORS}
 GOOD = '{"tags": ["数据中心", "数据中心"], "related_companies": ["MU"], "related_sectors": ["us-semiconductor"]}'
@@ -184,7 +184,7 @@ class CallAgyTest(unittest.TestCase):
         self._set(_stream())
         with mock.patch.dict(at.os.environ, {"GEMINI_API_KEY": "secret", "HOME": "/h",
                                              "HTTPS_PROXY": "http://evil:1"}):
-            self.assertEqual(at._call_agy("p", "gemini-3.8-flash-low", 60, 7897), GOOD)
+            self.assertEqual(at._call_agy("p", "gemini-4-hydrogen-low", 60, 7897), GOOD)
         self.assertEqual(self._call_cwd().parent, self.cwd.resolve())
         self.assertFalse(self._call_cwd().exists())  # per-call dir removed when empty
         args, kwargs = self.popen.call_args
@@ -341,7 +341,7 @@ class AutoTagTest(unittest.TestCase):
         with mock.patch.object(at, "_call_agy", autospec=True, side_effect=RuntimeError("boom")):
             r = at.auto_tag("doc", CONFIG, get_client_fn=lambda: client)
         client.models.generate_content.assert_called_once()
-        self.assertEqual(client.models.generate_content.call_args.kwargs["model"], "gemini-3.8-flash")
+        self.assertEqual(client.models.generate_content.call_args.kwargs["model"], "gemini-4-hydrogen")
         self.assertEqual(r, {"tags": ["API"], "related_companies": [], "related_sectors": []})
 
     def test_agy_empty_reply_falls_back(self):

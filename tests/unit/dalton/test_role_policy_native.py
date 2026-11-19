@@ -167,7 +167,7 @@ def test_default_role_config_has_zero_warnings():
         "llm": {
             "name": "claude-opus-5-5-oauth",
             "background": "deepseek-flash",
-            "assist": "gemini-3.8-flash-low-oauth",
+            "assist": "gemini-4-hydrogen-low-oauth",
         },
         "subagents": {
             "definitions": {
@@ -194,7 +194,7 @@ def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
             "llm": {
                 "name": "claude-opus-5-5-oauth",
                 "background": model_key,
-                "assist": "gemini-3.8-flash-low-oauth",
+                "assist": "gemini-4-hydrogen-low-oauth",
             },
             "conversations": {
                 "extractor_model": model_key,
@@ -209,7 +209,7 @@ def test_glm_coding_role_policy_extractor_and_main_roles() -> None:
             cfg,
             available_models={
                 "claude-opus-5-5-oauth",
-                "gemini-3.8-flash-low-oauth",
+                "gemini-4-hydrogen-low-oauth",
                 "gemini-4-argon-medium-oauth",  # publish.audit_model
                 "gpt-6.2-sol-oauth",
                 "deepseek-flash",

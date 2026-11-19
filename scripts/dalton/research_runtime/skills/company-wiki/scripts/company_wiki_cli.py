@@ -1819,7 +1819,7 @@ def cmd_self_test(args, config):
             missing = [str(p) for p in (AGY_BIN, AGY_AGENT_SRC, SANDBOX_PROFILE) if not p.exists()]
             if not missing:
                 _check_agent_frontmatter(AGY_AGENT_SRC.read_text(encoding="utf-8"))
-            results["tagger"] = (f"agy:{tagger.get('agy_model', 'gemini-3.8-flash-low')} "
+            results["tagger"] = (f"agy:{tagger.get('agy_model', 'gemini-4-hydrogen-low')} "
                                  + (f"MISSING {missing}, will fall back to API" if missing else "ok"))
         except Exception as e:
             results["tagger"] = f"FAIL: {e} (agy calls will fall back to the Gemini API)"

@@ -602,6 +602,26 @@
     "cacheRead": 0.2,
     "output": 20.0
    }
+  },
+  {
+   "provider": "google",
+   "model": "gemini-4-neon",
+   "effective_from": null,
+   "input": 3.0,
+   "cacheRead": 0.15,
+   "cacheWrite": 0.0,
+   "output": 15.0,
+   "note": "Google 正式价（2026-11-18 发布）"
+  },
+  {
+   "provider": "antigravity-cli-gateway",
+   "model": "gemini-4-neon",
+   "effective_from": null,
+   "input": 3.0,
+   "cacheRead": 0.15,
+   "cacheWrite": 0.0,
+   "output": 15.0,
+   "note": "Google 正式价（2026-11-18 发布）"
   }
  ]
 }
