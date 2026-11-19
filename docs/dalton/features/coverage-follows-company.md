@@ -1,6 +1,6 @@
 # 覆盖模型重构设计：一家公司一个工作区（首期主分析师负责，二期关注者扇出）
 
-> **状态**：设计提案（第 5 版，首期收窄为写权限登记绑定与主分析师单属主运行，关注者扇出移至第二期）  
+> **状态**：设计定稿（第 6 版，首期收窄为写权限登记绑定与主分析师单属主运行，关注者扇出移至第二期）  
 > **关联基线**：`d018_workspace_sharing`、`d020_colleague_dispatch_threads`、`d023_coverage_units`～`d028_workspace_settings`、`d035_company_automations`、`d040_report_delivery_admin_notices`（新迁移拟定 `d041`）  
 > **首期目标**：解决「同事已授予工作区写权限，但覆盖单元只能挂在自己名下工作区、导致多人重复建工作区」的核心痛点——允许对工作区有写权限的成员登记并绑定覆盖单元，全团队同一公司/行业仅保留一个活动覆盖单元，标准跟踪与财报日历维持主分析师单人执行与单人通知。
 
@@ -59,7 +59,7 @@ flowchart LR
 
 ### 1.2 单次原子迁移 `d041`（含存量 `ticker_key` 回填）与部署回退
 
-- **正常发布无新旧共存窗口**：生产为单容器部署（`dalton-langalpha-backend-1`），`scripts/dalton/ops/prod/deploy_main.sh:431,582` 等待无在途回合后重启单容器，`scripts/dalton/docker_entrypoint_dalton.sh:18-24` 先执行 `uv run alembic -c src/dalton/alembic.ini upgrade head` 再 `exec` 启动新后端，因此无需拆两步迁移，由单次迁移 `d041`（`down_revision = "d040"`）在同一事务内原子完成：
+- **正常发布无新旧共存窗口**：生产为单容器部署（`dalton-langalpha-backend-1`），`scripts/dalton/ops/prod/deploy_main.sh:431, 582` 等待无在途回合后于 `L584-585`（`apply_backend`，`L326-335`）重启单容器，`scripts/dalton/docker_entrypoint_dalton.sh:20-24` 先执行 `uv run alembic -c src/dalton/alembic.ini upgrade head` 再 `exec` 启动新后端，因此无需拆两步迁移，由单次迁移 `d041`（`down_revision = "d040"`）在同一事务内原子完成：
 
 ```python
 # d041.upgrade() 核心流程（Alembic 同一数据库事务）
@@ -121,9 +121,9 @@ conn.execute(sa.text("""
 ```
 
 - **部署回退行为与 `revert_deploy()` 数据库降级**：
-  - **回退窗口 fail-closed（不会写坏数据）**：当前 `scripts/dalton/ops/prod/deploy_main.sh:446-557` 的 `revert_deploy()` 只回退代码（`git reset -q --keep "$PRE_FF"`）不回退数据库。若出现「代码已回旧版、数据库仍在 `d041`」的回退窗口，旧版 `insert_coverage_unit`（`src/dalton/database/coverage_units.py:199-213`）因漏写 `lead_analyst_user_id`（`NOT NULL` 无默认值）与 `ticker_key`（`CHECK`）直接报错失败，**属 fail-closed，不会写入半截脏数据或绕过唯一索引的重复记录**。
-  - **为何回退流程必须补 `downgrade d040`**：`./src:/app/src` 为宿主机 bind mount（`docker-compose.yml:94`）；一旦 `BACKEND_TOUCHED=1` 已执行 `d041`，`revert_deploy()` 先 `git reset --keep "$PRE_FF"` 会删掉 `d041` 迁移文件，随后重启容器时 `docker_entrypoint_dalton.sh:20` 的 `alembic upgrade head` 会因找不到版本 `d041` 直接失败退出（且即使仅回退业务代码也会导致旧版登记持续报错）。因此回退流程须在 `git reset` 之前执行 `alembic -c src/dalton/alembic.ini downgrade d040`。
-  - **`d041.downgrade()` 冲突预检**：开头先锁表检查 `GROUP BY owner_user_id, kind, slug HAVING COUNT(*) > 1`（含 `archived` 行），命中即打印清单并抛错拒绝降级；通过后再恢复 `uq_dalton_coverage_units_owner_kind_slug` 并移除新索引、新约束与新增两列。
+  - **回退窗口 fail-closed（不会写坏数据）**：当前 `scripts/dalton/ops/prod/deploy_main.sh:446-557` 的 `revert_deploy()` 只回退代码（`git reset -q --keep "$PRE_FF"`）不回退数据库。若出现「代码已回旧版、数据库仍在 `d041`」的回退窗口，旧版 `insert_coverage_unit`（`src/dalton/database/coverage_units.py:163-222`，`INSERT` 在 `L198-211`）因漏写 `lead_analyst_user_id`（`NOT NULL` 无默认值）与 `ticker_key`（`CHECK`）直接报错失败，**属 fail-closed，不会写入半截脏数据或绕过唯一索引的重复记录**。
+  - **为何回退流程必须补 `downgrade d040`**：`./src:/app/src` 为宿主机 bind mount（`docker-compose.yml:94`）；一旦 `BACKEND_TOUCHED=1` 已执行 `d041`，`revert_deploy()` 先 `git reset --keep "$PRE_FF"` 会删掉 `d041` 迁移文件，随后重启容器时 `docker_entrypoint_dalton.sh:20` 的 `alembic upgrade head` 会因找不到版本 `d041` 直接失败退出（且即使仅回退业务代码也会导致旧版登记持续报错）。因此回退流程须在停写后、`git reset` 之前执行 `alembic -c src/dalton/alembic.ini downgrade d040`。
+  - **`d041.downgrade()` 冲突预检**：开头先锁表检查 `GROUP BY owner_user_id, kind, slug HAVING COUNT(*) > 1`（含 `archived` 行）以及是否存在 `d040` 后端无法管理的跨属主活动绑定或同事名下活动受管任务，命中即打印清单并抛错拒绝降级（`revert_deploy()` 据此中止 `git reset`，保持 `d041` 代码与库一致以维持服务可用）；通过后再恢复 `uq_dalton_coverage_units_owner_kind_slug` 并移除新索引、新约束与新增两列。
 
 ### 1.3 Anthropic 未登记重复工作区的一次性人工处理步骤
 
@@ -137,19 +137,19 @@ conn.execute(sa.text("""
 
 ### 2.1 工作区写权限口径与不自动扩权原则
 
-- **统一写权限谓词**：首期所有跨人绑定、转交、跟踪排期与自动化运行，统一以**工作区共享设置写权限** `require_workspace_access(ws, user_id, channel="web", need="write", conn=conn)`（`src/dalton/sharing.py:783-930`）为准——即「工作区属主 `workspaces.user_id` $\cup$ 被授予 `dalton_workspace_sharing.web_access = 'rw'` 的内部/PM 成员」（Home、历史副本、`deleted`/`unbound` 及 `external` 工作区一律拒绝）。不采用 `channel="cos"`，避免默认开启的用户级 `cos_rw_enabled` 绕过单工作区的 `hidden`/`ro` 设置。
-- **不自动扩大共享**：登记、绑定、改绑与转交**不改写** `dalton_workspace_sharing`（修改共享设置仍仅限工作区属主或 PM，`src/dalton/sharing.py:113-136`）及 `team_memory_enabled`。
+- **统一写权限谓词**：首期所有跨人绑定、转交、跟踪排期与自动化运行，统一以**工作区共享设置写权限** `require_workspace_access(ws, user_id, channel="web", need="write", conn=conn)`（`src/dalton/sharing.py:783-929`）为准——即「工作区属主 `workspaces.user_id` $\cup$ 被授予 `dalton_workspace_sharing.web_access = 'rw'` 的内部/PM 成员」（`Home`、`deleted`/`unbound` 及 `external` 工作区一律拒绝；带 `dalton_historical_duplicate_of` 标记的历史副本在登记/绑定锁内显式拒绑）。不采用 `channel="cos"`，避免默认开启的用户级 `cos_rw_enabled` 绕过单工作区的 `hidden`/`ro` 设置。
+- **不自动扩大共享**：登记、绑定、改绑与转交**不改写** `dalton_workspace_sharing`（修改共享设置仍仅限工作区属主或 PM，`src/dalton/sharing.py:113-135`）及 `team_memory_enabled`。
 
 ### 2.2 改绑、转交、解绑/归档与工作区软删的并发与锁序
 
 - **全局无死锁加锁顺序**：
-  - 覆盖单元写事务（`bind` / `unbind` / `archive` / `transfer_lead`）：① `SELECT ... FROM dalton_coverage_units WHERE unit_id = %s FOR UPDATE` → ② 对涉及的工作区集合（`{old_ws_id, target_ws_id}` 去空排序）执行 `SELECT ... FROM workspaces WHERE workspace_id = ANY(%s::uuid[]) ORDER BY workspace_id FOR UPDATE` → ③ 若为 `sector` 单元，按同样字典序取 `pg_advisory_xact_lock(hashtext('dalton:kv:' || ws_id || ':sector'))`。
-  - 工作区软删事务（`src/server/database/workspace.py:1813-1834`）：保持 `lock_user_egress_state` → `SELECT ... FROM workspaces WHERE workspace_id = %s FOR UPDATE`，在行锁内新增普通查询 `SELECT 1 FROM dalton_coverage_units WHERE workspace_id = %s::uuid AND status = 'active' LIMIT 1`（不加单元行锁），命中即拒绝软删。两边以同一把 `workspaces FOR UPDATE` 行锁串行化，取锁后重查状态，既无死锁循环，也杜绝绑入刚软删工作区的竞态。
+  - 覆盖单元写事务（带 `workspace_id` 的 `register` / `bind` / `unbind` / `archive` / `transfer_lead`）：① `SELECT ... FROM dalton_coverage_units WHERE unit_id = %s FOR UPDATE`（登记时在同一事务内先取目标工作区行锁再插入）→ ② 对涉及的工作区集合（`{old_ws_id, target_ws_id}` 去空排序）执行 `SELECT ... FROM workspaces WHERE workspace_id = ANY(%s::uuid[]) ORDER BY workspace_id FOR UPDATE` → ③ 若为 `sector` 单元，按同样字典序取 `pg_advisory_xact_lock(hashtext('dalton:kv:' || ws_id || ':sector'))`。
+  - 工作区软删（`src/server/services/workspace_manager.py:464-506` + `src/server/database/workspace.py:1813-1834`）：在终止后台命令前先预检活动覆盖单元绑定，并在软删事务 `lock_user_egress_state` → `SELECT ... FROM workspaces WHERE workspace_id = %s FOR UPDATE` 行锁内新增普通查询 `SELECT 1 FROM dalton_coverage_units WHERE workspace_id = %s::uuid AND status = 'active' LIMIT 1`（不加单元行锁），命中即拒绝软删。两边以同一把 `workspaces FOR UPDATE` 行锁串行化，取锁后重查状态，既无死锁循环，也杜绝绑入刚软删工作区的竞态。
 - **同一事务锁内重查规则**：
-  - **首次绑定（`old_ws_id IS NULL`）**：调用者须为单元当前 `lead_analyst_user_id`（或显式 PM），且锁后重查 `target_ws` 未删除并对 `target_ws` 有写权限（或显式 PM）；绑定成功后默认更新 `lead_analyst_user_id = target_ws.user_id`（同步 `owner_user_id`）。
-  - **改绑（`old_ws_id IS NOT NULL`）**：锁后重查调用者此刻对**当前绑定工作区 `old_ws_id` 与目标工作区 `target_ws_id` 都有写权限**（或显式 PM），且 `target_ws` 未删除；改绑后默认更新 `lead_analyst_user_id = target_ws.user_id`（同步 `owner_user_id`），同事务清理 `old_ws_id` 行业成员投影并暂停原主分析师在 `old_ws_id` 上的标准跟踪任务。
-  - **解绑（`unbind`）与归档（`archive`）**：已绑定工作区时，锁后重查调用者对该绑定工作区有写权限（工作区属主恒有写权限，故在主分析师权限撤回后属主仍可自行解绑释放工作区）或为 PM；未绑定时要求调用者为 `lead_analyst_user_id` 或 PM。
-  - **转交主分析师（`transfer_lead`）**：已绑定工作区时，锁后重查**发起人**（当前 `lead_analyst_user_id` 或工作区属主，且此刻对该工作区**有写权限**；或 PM）与**接收人**（`internal`/`admin` 且**此刻对该工作区有写权限**）双方权限——已失去写权限的原主分析师不得发起转交。
+  - **首次绑定（`old_ws_id IS NULL`）**：调用者须为单元当前 `lead_analyst_user_id`（或显式 PM），且锁后重查 `target_ws` 未删除、非 `Home`、无 `dalton_historical_duplicate_of` 标记并对 `target_ws` 有写权限（或显式 PM）；绑定成功后默认更新 `lead_analyst_user_id = target_ws.user_id`（同步 `owner_user_id`），带 `ticker` 公司单元按 §6 决定 2 幂等同步主分析师 `dalton_coverage`。
+  - **改绑（`old_ws_id IS NOT NULL`）**：锁后重查调用者此刻对**当前绑定工作区 `old_ws_id` 与目标工作区 `target_ws_id` 都有写权限**（或显式 PM），且 `target_ws` 未删除、非 `Home`、无 `dalton_historical_duplicate_of` 标记；改绑后默认更新 `lead_analyst_user_id = target_ws.user_id`（同步 `owner_user_id`），同事务清理 `old_ws_id` 行业成员投影，暂停原主分析师在 `old_ws_id` 上的标准跟踪与待跑 `earn-*` 任务，并按 §6 决定 2 同步新主分析师 `dalton_coverage`。
+  - **解绑（`unbind`）与归档（`archive`）**：已绑定工作区时，锁后重查调用者对该绑定工作区有写权限（工作区属主恒有写权限，故在主分析师权限撤回后属主仍可自行解绑释放工作区）或为 PM，解绑/归档后自动暂停该工作区上的标准跟踪与待跑 `earn-*` 任务；未绑定时要求调用者为 `lead_analyst_user_id` 或 PM。
+  - **转交主分析师（`transfer_lead`）**：已绑定工作区时，锁后重查**发起人**（当前 `lead_analyst_user_id` 或工作区属主，且此刻对该工作区**有写权限**；或 PM）与**接收人**（`internal`/`admin` 且**此刻对该工作区有写权限**）双方权限——已失去写权限的原主分析师不得发起转交；转交后按 §6 决定 1 与决定 2 完成任务交接与 `dalton_coverage` 同步。
   - **跨工作区 `gap` 重试保持不变**：首期不新增 `dalton_cross_unit_requests` 字段，不改动 `src/dalton/knowledge/cross_unit.py:843` 现有重试权限。
 
 ### 2.3 看板与详情读权限隔离
@@ -170,25 +170,25 @@ conn.execute(sa.text("""
 
 | 环节 | 文件与行号 | 现状检查 | 首期放宽与适配规则 |
 |---|---|---|---|
-| **执行器工作区校验** | `src/server/services/automation_executor.py:387-397`（`_stored_workspace`）、`L466-481`（`_resolve_thread`） | 硬校验 `ws_owner == auto_owner`，否则抛 `ValueError` | 当 `ws_owner != auto_owner` 时改为调用 `require_workspace_access(workspace, auto_owner, channel="web", need="write")` |
-| **执行器预建固定线程** | `src/server/services/automation_executor.py:444-457`（`_precreate_titled_thread`） | `create_thread(...)` 未传 `user_id`，导致 `threads_read.py:850` 回退取 `w.user_id`（同事），下次运行在 `L354-365` 误弃固定线程 | 显式传入 `user_id=automation["user_id"]`，确保同事工作区内的自动化线程归属任务创建者本人 |
-| **执行器入场与沙箱绑定** | `src/server/services/automation_executor.py:856-891`（`_run_turn`）→ `src/server/database/workspace.py:1682-1757`（`lock_run_workspace`） | 未传 `workspace_owner_id`，`ptc_run.py:257-261` 默认把 `user_id` 当工作区属主取沙箱会话 | 当 `ws_owner != user_id` 时在 `extra_configurable` 与 `run_metadata` 传入 `workspace_owner_id=ws_owner`、`origin_channel="web"`，复用 `colleague-dispatch` 沙箱会话与知识层归属，并由 `lock_run_workspace` 在 START 事务 `FOR SHARE OF w` 锁内原子重检写权限 |
+| **执行器工作区校验** | `src/server/services/automation_executor.py:387-396`（`_stored_workspace`）、`L461-496`（`_resolve_thread`，校验在 `L466-480`） | 硬校验 `ws_owner == auto_owner`，否则抛 `ValueError` | 当 `ws_owner != auto_owner` 时改为调用 `require_workspace_access(workspace, auto_owner, channel="web", need="write")`，并将 `HTTPException` 映射为 `ValueError` |
+| **执行器预建固定线程** | `src/server/services/automation_executor.py:422-459`（`_precreate_titled_thread`，调用在 `L444-457`） | `create_thread(...)` 未传 `user_id`，导致 `src/server/database/conversation/threads_read.py:850` 回退取 `w.user_id`（同事），下次运行在 `L354-364` 误弃固定线程 | 显式传入 `user_id=automation["user_id"]`，确保同事工作区内的自动化线程归属任务创建者本人 |
+| **执行器入场与沙箱绑定** | `src/server/services/automation_executor.py:796-923`（`_run_turn`，请求与流调用在 `L856-891`）→ `src/server/database/workspace.py:1636-1775`（`lock_run_workspace`，同事重检段 `L1679-1775`） | 未传 `workspace_owner_id`，`src/server/handlers/chat/ptc_run.py:256-261` 默认把 `user_id` 当工作区属主取沙箱会话 | 当 `ws_owner != user_id` 时在 `extra_configurable` 与 `run_metadata` 传入 `workspace_owner_id=ws_owner`、`origin_channel="web"`，复用 `colleague-dispatch` 沙箱会话与知识层归属，并由 `lock_run_workspace` 在 START 事务 `FOR SHARE OF w` 锁内原子重检写权限 |
 | **运行前预检（Preflight）** | `src/dalton/autonomy/preflight.py:496-512`（核心在 `L511` `_verify_automation_workspace_ownership`） | 调无参 `verify_workspace_access(workspace_id, user_id)`（`src/dalton/auth.py:447, 486-503` 严格属主校验） | 改为 `verify_workspace_access(workspace_id, user_id, need="write", channel="web")`；写权限被撤回时预检直接失败闭合，不唤醒沙箱 |
 | **Dalton 排期助手** | `src/dalton/autonomy/schedule.py:618-636`（核心在 `L620`、`L631` `schedule_dalton_automation_helper`） | 非 Home 分支调无参 `verify_workspace_access(ws_id_str, user_id)` 仅放行工作区属主 | `action == "list"` 改为 `need="read", channel="web"`；`upsert` / `pause` / `resume` 改为 `need="write", channel="web"`（打通 Home 财报日历跨同事共享工作区排期 `earn-*`） |
-| **通用自动化生命周期与文件同步** | `src/server/services/automations/lifecycle.py:89-117, 148-157`（`L107-109`）及 `src/server/app/automations.py:380-390`（`L388`） | `require_target_ownership` 与 `_delivery_workspace` 调 `require_workspace_owner` 拒绝非属主工作区 | 非 Home 工作区放宽为 `require_workspace_access(..., channel="web", need="write")`（支持在共享工作区内直接写自动化文件补建任务）；`lifecycle.py:114` `require_thread_owner` 保持不变 |
+| **通用自动化生命周期与文件同步** | `src/server/services/automations/lifecycle.py:89-116, 148-157`（`L107-109`、`L156`）及 `src/server/app/automations.py:380-390`（`L388`） | `require_target_ownership` 与 `_delivery_workspace` 调 `require_workspace_owner` 拒绝非属主工作区 | 非 Home 工作区放宽为 `require_workspace_access(..., channel="web", need="write")`；`lifecycle.py:114` `require_thread_owner` 保持不变 |
 | **跟踪与系统任务管理入口** | `src/dalton/app/router.py:1471-1589, 1634-1662`（核心在 `L1510-1515`）；`src/dalton/tools/director_tools.py:189-199, 201-261, 1567-1598, 1717-1751, 1820-1850, 1892-1938`；`src/dalton/autonomy/tracking.py:76-125, 491-496`；`src/dalton/autonomy/system_jobs.py:1595-1665, 1689-1715, 2254-2289` | 启停仅允许工作区属主（或 PM），状态查询按 `workspaces.user_id` 读取任务行 | 已绑活动单元工作区的标准任务归属统一取 `COALESCE(unit.lead_analyst_user_id, ws.user_id)`；写操作校验调用者对该工作区有 `web` 写权限且（已绑单元时）为主分析师或 PM；按 `ticker` 解析优先命中调用者任主分析师的活动单元 |
 | **任务分类（`scope`）** | `src/dalton/database/company_automations.py:73-86`；`src/dalton/autonomy/classification.py:141-155, 233, 252-259` | 单元匹配分支校验 `u.owner_user_id = user_id` | 改为 `COALESCE(u.lead_analyst_user_id, u.owner_user_id) = user_id`，确保主分析师在同事工作区内的标准跟踪任务仍归为 `research_tracking` |
 
 ---
 
-## 4. 首期实施清单
+## 4. 首期实施模块概览
 
 - [ ] **共享 `normalize_ticker_key` 与迁移 `d041`**（`src/dalton/coverage/identity.py`、`src/dalton/migrations/versions/d041_team_coverage_units.py`）：抽出统一代码规范化函数；`d041` 锁表加列（`lead_analyst_user_id`、`ticker_key`），用同一 `normalize_ticker_key` 回填存量公司行 `ticker_key` 与 `lead_analyst_user_id` 后执行冲突预检、收紧 `NOT NULL`/`CHECK` 并切换全局部分唯一索引，配套 `downgrade` 冲突预检。
-- [ ] **覆盖单元登记、绑定、转交与软删互斥**（`src/dalton/coverage/units.py`、`unit_errors.py`、`src/dalton/database/coverage_units.py`、`src/server/database/workspace.py`、`src/dalton/app/router.py`、`src/dalton/tools/director_tools.py`）：实现 `SAVEPOINT` + `409` 冲突响应、按工作区 `web` 写权限（或显式 PM）绑定/改绑/解绑、`transfer_lead`、默认主分析师指派规则（绑定 = 工作区属主，未绑 = 登记人，PM 代操作同规则）及 `workspaces FOR UPDATE` 软删互斥。
-- [ ] **看板、详情与路由读隔离**（`src/dalton/autonomy/units_view.py`、`board.py`、`src/dalton/database/sector_members.py`、`src/dalton/workflows/company_routing.py`）：严格按工作区实际读权限返回内容，过滤 `dalton_historical_duplicate_of` 历史副本。
-- [ ] **共享工作区标准跟踪与财报日历放宽**（按 §3.2 清单逐项修改执行器、预检、排期、生命周期与分类检查点）。
-- [ ] **部署回退流程补数据库降级**（`scripts/dalton/ops/prod/deploy_main.sh:446-557`）：在 `revert_deploy()` 中，当 `BACKEND_TOUCHED=1` 且 `alembic_version_dalton` 已升过回退目标（本次为 `d040`）时，在 `git reset -q --keep "$PRE_FF"` 删除新迁移脚本**之前**先执行 `uv run alembic -c src/dalton/alembic.ini downgrade d040`（通用化可取 `$PRE_FF` 对应的 Dalton 迁移 head），再回退代码与重启服务。
-- [ ] **上线归整**：验收通过后开启 `coverage_units.enabled`，并按 §1.3 完成 Anthropic 重复工作区一次性正本绑定与历史副本标记。
+- [ ] **覆盖单元登记、绑定、转交、前端选择器与软删互斥**（`src/dalton/coverage/units.py`、`unit_errors.py`、`src/dalton/database/coverage_units.py`、`src/server/services/workspace_manager.py`、`src/server/database/workspace.py`、`src/dalton/app/router.py`、`src/dalton/tools/director_tools.py`、`web/src/pages/Settings/panels/dalton/DaltonCoverageCard.tsx`）：实现全入口 `internal`/`admin` 门控、`SAVEPOINT` + `409` 冲突响应、按工作区 `web` 写权限（或显式 PM）绑定/改绑/解绑、`transfer_lead`、设置页可写工作区绑定选择器及软删互斥。
+- [ ] **看板、详情、工具列表与路由读隔离**（`src/dalton/autonomy/units_view.py`、`board.py`、`src/dalton/database/sector_members.py`、`src/dalton/workflows/company_routing.py`）：严格按工作区实际读权限返回内容并脱敏不可读 `workspace_id`，过滤 `dalton_historical_duplicate_of` 历史副本。
+- [ ] **共享工作区标准跟踪、财报日历与单人通知收口**（按 §3.2 与 §7 检查清单逐项修改执行器、预检、排期、议程写入与通知路由）。
+- [ ] **部署回退流程补数据库降级**（`scripts/dalton/ops/prod/deploy_main.sh:446-557`）：在 `revert_deploy()` 中，当 `BACKEND_TOUCHED=1` 且 `alembic_version_dalton` 已升过回退目标（`d040`）时，停写并在 `git reset -q --keep "$PRE_FF"` 删除新迁移脚本**之前**先执行 `uv run alembic -c src/dalton/alembic.ini downgrade d040`（降级预检失败则中止代码回退保持服务可用）。
+- [ ] **上线归整**：生产 `docker-compose.dalton.yml:49` 已默认开启 `DALTON_COVERAGE_UNITS_ENABLED=1`（`d041` 上线即全量生效），同步对齐 `src/dalton/dalton.yaml:37-38` 默认值，并按 §1.3 完成 Anthropic 重复工作区一次性正本绑定与历史副本标记。
 
 ---
 
@@ -206,14 +206,73 @@ conn.execute(sa.text("""
 
 ---
 
-## 6. 首期待用户决定的问题（2 项）
+## 6. 已定决定
 
-### 问题 1：主分析师转交（`transfer_lead`）时原标准跟踪任务的交接方式
-当覆盖单元主分析师从 A 转交给同样具备该工作区写权限的 B 时，原挂在 A 名下的标准跟踪任务如何处理？
-- **选项 A（推荐）**：直接转交（无确认流）；转交完成后自动**暂停** A 在该工作区名下的标准跟踪与未执行 `earn-*` 任务（立即停止向 A 计费与推送），且若此前标准跟踪处于开启状态，自动在 **B 名下幂等创建/启用**同档位标准跟踪。
-- **选项 B**：转交时仅自动暂停 A 在该工作区的任务，不自动在 B 名下启用，由 B 按需手动开启。
+1. **主分析师转交（`transfer_lead`）与解绑/改绑的任务交接（采用原推荐选项 A）**：直接转交（无确认流）；转交完成后自动**暂停**原主分析师在该工作区的标准跟踪与待跑 `earn-*` 任务，且若此前标准跟踪处于开启状态，自动在新主分析师名下**幂等创建/启用**同档位标准跟踪（改绑、解绑与归档自动暂停原工作区上的标准跟踪与待跑 `earn-*`）。
+2. **上市公司单元与个人 `dalton_coverage` 联动（采用原推荐选项 A）**：登记并绑定、首次绑定/改绑或转交接收带 `ticker` 的活动公司单元时，幂等写入当前 `lead_analyst_user_id` 的个人 `dalton_coverage`（已有行保留原 `tier`，新行默认 `'core'`），渲染主分析师 `Home/dalton/coverage.yaml` 时附带该正本 `workspace_id`（非当前主分析师即使保留个人观察行也不再附该正本 `workspace_id`）。
 
-### 问题 2：主分析师负责的上市公司单元与个人 `dalton_coverage` 名单联动
-带 `ticker` 的上市公司单元绑定工作区（默认主分析师 = 工作区属主）或转交主分析师后，如何与当前 `lead_analyst_user_id` 的 `Home/dalton/coverage.yaml`（供 `dalton-earnings-calendar` 扫描排期）衔接？
-- **选项 A（推荐）**：登记并绑定、首次绑定/改绑或转交接收带 `ticker` 的活动公司单元时，幂等确保该代码写入当前 `lead_analyst_user_id` 的 `dalton_coverage`（已有行保留原 `tier`，不存在则默认 `'core'`），并在渲染主分析师 `coverage.yaml` 时附带该正本 `workspace_id`，使现有财报日历无需改流程即可扫描并排期。
-- **选项 B**：`dalton_coverage_units` 与个人 `dalton_coverage` 保持独立，不自动写入，由主分析师手动维护个人覆盖名单。
+---
+
+## 7. 首期实施检查清单
+
+### 7.1 Codex 复审遗漏项（8 项）
+
+- [ ] **C1 · 回退停写、降级预检扩展与降级失败保活**
+  - **位置**：`scripts/dalton/ops/prod/deploy_main.sh:431, 446-557, 582-589`（重启在 `L584-585` → `apply_backend` `L326-335`）、`src/dalton/migrations/versions/d041_team_coverage_units.py`、`src/dalton/database/coverage_units.py:163-222, 354-366`
+  - **要求**：`revert_deploy()` 在 `BACKEND_TOUCHED=1` 时先停写/等待空闲并在 `git reset` 前执行 `downgrade d040`；`d041.downgrade()` 除检查同属主含归档重复外，一并预检跨属主活动绑定及同事名下活动受管任务，任一命中即打印清单抛错，且 `revert_deploy()` 在降级失败时中止代码回退、保持 `d041` 服务在线供人工解绑/暂停后重降。
+  - **测试**：`tests/unit/dalton/test_coverage_units.py`（验证同名归档行、跨人绑定或同事受管任务存在时 `downgrade` 拒绝且回退脚本不删 `d041` 迁移文件）。
+- [ ] **C2 · 覆盖变更与受管任务排期、入场、信号占用及立即运行协同**
+  - **位置**：`src/dalton/coverage/units.py:37-134`、`src/dalton/autonomy/schedule.py:618-636, 726-745`、`src/server/database/automation_executions.py:266-293`、`src/dalton/autonomy/preflight.py:496-512, 1285-1293`、`src/dalton/autonomy/system_jobs.py:2486-2545`
+  - **要求**：转交、改绑、解绑与归档按 §6 决定 1 暂停旧主分析师标准跟踪与待跑 `earn-*`（转交同步在新主分析师名下幂等启用）；排期助手、立即运行、执行入场（`begin_execution_if_not_deleted`）与预检占用信号前（早于 `claim_signals_woken`）统一校验绑定单元工作区的受管任务归属/操作者须为当前 `lead_analyst_user_id`（管理入口允许 PM），拦截已入队旧执行开跑、抢占信号及其他有写权限成员建立第二套同名任务（已在途运行按当前回合自然结算）。
+  - **测试**：`tests/unit/dalton/test_company_coverage.py`、`tests/unit/dalton/test_autonomy_preflight.py`（转交/解绑后已排队旧任务拒跑且不占信号，非主分析师写权限协作者排期同名受管任务被拒）。
+- [ ] **C3 · 恢复执行/重新等待后的线程工作区核验与自动化文件保存身份**
+  - **位置**：`src/server/services/automation_executor.py:88-115, 912-923, 1087-1096`、`src/server/database/workspace.py:1636-1675`、`src/ptc_agent/agent/filesystem_routes.py:215-216, 302-311`
+  - **要求**：`execute()` 走 `handed_thread` 恢复路径（`L1092-1096`）及 `_run_turn` 等待线程后重读 `fresh`（`L912-923`）后，重新核验实际 `thread_id` 的 `workspace_id`、`user_id` 与最新 `firing.automation` 一致并同步刷新 `firing.route`；工作区自动化文件路由（`AutomationsBackend`）改用当前回合主分析师身份保存，或跨人共享工作区禁走文件直写补建、统一经排期工具创建。
+  - **测试**：`tests/unit/server/services/test_restart_automation.py`、`tests/unit/server/services/test_automation_executor_route.py`（`handed_thread` 及等待期间迁工作区/撤权拒跑；协作者补建任务的 `automations.user_id` 归属主分析师）。
+- [ ] **C4 · 财报日历名单退出规则与 `dalton_watch_event` 同口径工作区授权**
+  - **位置**：`src/dalton/coverage/service.py:156-187`、`plugins/dalton/skills/dalton-earnings-calendar/SKILL.md:147-169`、`src/dalton/tools/director_tools.py:927-934, 1063-1073`、`src/dalton/knowledge/service.py:829-830`
+  - **要求**：`get_user_coverage` 生成 `coverage.yaml` 时，对有活动覆盖单元的 `ticker` 仅向当前 `lead_analyst_user_id` 输出正本 `workspace_id` 与 `active` 状态（原主分析师保留个人行时置未绑定以退出原工作区排期）；`dalton_watch_event` 至 `knowledge_service.apply_update` 支持同一 `channel="web", need="write"` 工作区授权，避免仅获 Web 写权限的主分析师同步财报议程被 `cos` 检查拦截。
+  - **测试**：`tests/unit/dalton/test_user_coverage.py`、`tests/unit/dalton/test_team_sharing.py`（转交后原主分析师 `coverage.yaml` 不带原正本 `workspace_id`；仅 `web_access='rw'` 调 `dalton_watch_event` 成功写入议程）。
+- [ ] **C5 · 首期通知（首次发送与重试）仅发当前主分析师私信并跳过转交前遗留记录**
+  - **位置**：`src/dalton/notify/dispatch.py:1078-1117, 1190-1225, 4705-4720`、`src/dalton/database/automation_notifications.py:330-354`、`src/server/services/automation_settlement.py:616-652`
+  - **要求**：已绑活动单元工作区的受管任务在首次发送与重试资格复核中强制 `include_chat_targets=False`（屏蔽飞书群/Discord 频道路由），结算通用投递入口亦不外发共享群；重试发送前核验 `unit.lead_analyst_user_id == row.user_id` 且工作区可读，对转交、改绑、解绑或归档前已生成但未发出的记录直接标记跳过。
+  - **测试**：`tests/unit/dalton/test_notify_chat_routes.py`、`tests/unit/dalton/test_automation_notify_gateway.py`（internal/admin 配置群路由时受管任务仅发本人私信，转交前待发记录重试自动跳过）。
+- [ ] **C6 · 软删许可检查前置至终止后台命令之前，带 `workspace_id` 登记接入同一行锁互斥**
+  - **位置**：`src/server/services/workspace_manager.py:464-506`（`end_workspace_commands` 在 `L487`）、`src/server/database/workspace.py:1813-1834`、`src/dalton/database/coverage_units.py:163-222`
+  - **要求**：`WorkspaceManager.delete_workspace` 在调 `end_workspace_commands` 前先检查活动覆盖单元绑定并提前拒绝（保留 `workspace.py` `FOR UPDATE` 锁内重查兜底）；登记直传 `workspace_id` 写入时须在同事务内先对目标 `workspaces` 行执行 `FOR UPDATE` 加锁校验后再 `INSERT`。
+  - **测试**：`tests/unit/server/services/test_workspace_manager.py`、`tests/unit/dalton/test_coverage_units.py`（删已绑工作区被拒时 `end_workspace_commands` 未触发；带 `workspace_id` 登记与并发软删互斥）。
+- [ ] **C7 · 设置页绑定选择器列出可写同事工作区并按操作权限展示入口**
+  - **位置**：`src/dalton/autonomy/units_view.py:204-303, 306-345`、`web/src/pages/Settings/panels/dalton/DaltonCoverageCard.tsx:133-162, 707-718, 735-739, 786-801`
+  - **要求**：后端下发调用者有 Web 写权限（属主 $\cup$ `web_access='rw'`，排除 `Home`、已删、已绑活动单元与历史副本）的可绑定工作区列表（附属主信息）及每单元操作权限标志；前端移除 `unit.owner_user_id === user.user_id` 门控，改为按权限标志渲染绑定下拉与管理动作（含 `transfer_lead`）。
+  - **测试**：`tests/unit/dalton/test_coverage_units_write_api.py`、`web/src/pages/Settings/panels/dalton/__tests__/DaltonCoverageCard.test.tsx`（同事 `rw` 工作区出现在绑定下拉框，工作区属主与主分析师按各自权限看到操作按钮）。
+- [ ] **C8 · 登记、读取、变更全入口统一校验 `internal`/`admin`，工具单元列表按工作区读权限筛选**
+  - **位置**：`src/dalton/app/router.py:1328-1457`、`src/dalton/access_tiers.py:47-95`（不用放行受邀外部成员的 `src/dalton/invites.py:114-141` `is_team_member`）、`src/dalton/tools/director_tools.py:735-814`、`src/dalton/database/coverage_units.py:134-161`
+  - **要求**：覆盖单元全部 REST 入口（含未绑定 `register`、`list`、`detail`、`bind`、`unbind`、`archive`、`transfer_lead`）与 `dalton_coverage_unit` 工具统一前置 `is_internal_or_admin(user_id)`；`dalton_coverage_unit(action="list")` 对已绑定单元按目标工作区实际 Web 读权限筛选或脱敏不可读 `workspace_id`。
+  - **测试**：`tests/unit/dalton/test_coverage_units_write_api.py`、`tests/unit/dalton/test_team_sharing.py`（受邀 `external` 调未绑定登记与工具均 `403`；撤回读权限后原主分析师调工具 `list` 不暴露绑定 `workspace_id`）。
+
+### 7.2 GLM 复审勘误与实施注意（6 项）
+
+- [ ] **G1 · `bind` 与带 `workspace_id` 登记锁内显式拒绑历史副本工作区**
+  - **位置**：`src/dalton/database/coverage_units.py:163-222, 340-380`、`src/dalton/sharing.py:783-929`
+  - **要求**：因 `require_workspace_access` 不检查 `dalton_historical_duplicate_of`，在 `bind` 与带 `workspace_id` 登记的 `workspaces FOR UPDATE` 锁内读取 `w.config` 并显式拒绑带该标记的工作区。
+  - **测试**：`tests/unit/dalton/test_coverage_units.py`（向带 `dalton_historical_duplicate_of` 的工作区发起 `register` / `bind` 均被拒绝）。
+- [ ] **G2 · 按勘误后精确行号核验固定线程落列与 START 锁内 `origin_channel="web"` 接线**
+  - **位置**：`src/server/services/automation_executor.py:422-459, 796-923`、`src/server/database/conversation/threads_read.py:850`、`src/server/handlers/chat/ptc_run.py:256-261`、`src/server/database/workspace.py:1636-1775`
+  - **要求**：确保 `_precreate_titled_thread` 显式落列 `user_id`（阻断 `threads_read.py:850` 回退至同事 ID）、`ptc_run.py:256-261` 接收 `workspace_owner_id` 路由沙箱，且 `lock_run_workspace`（`L1679-1775`）按 `origin_channel="web"` 完成 `FOR SHARE OF w` 锁内写权限重检。
+  - **测试**：`tests/unit/server/services/test_automation_executor_route.py`、`tests/unit/server/handlers/test_ptc_run_workspace_status.py`（二次运行复用固定线程不误弃，START 锁内走 `web` 通道重检通过/撤权即拒）。
+- [ ] **G3 · 在开启 Supabase 认证的运行栈上执行端到端验证**
+  - **位置**：`src/dalton/auth.py:490-498`、`src/server/services/automation_executor.py:390, 469`、`src/server/database/workspace.py:1682`
+  - **要求**：所有跨人写权限放宽分支均门控于 `is_dalton_supabase_auth_enabled()`；端到端实调验收须在开启 Dalton Supabase 认证的栈上完成，避免关认证环境下静默退化为仅属主模式产生假绿灯。
+  - **测试**：`tests/unit/dalton/test_workspace_sharing.py`（开启 `dalton_supabase_auth` 夹具跑通同事 `rw` 链路，关认证时断言非属主 fail-closed）及开启 Supabase 认证栈的端到端实调。
+- [ ] **G4 · `require_workspace_access` 抛出的 `HTTPException` 在执行器与预检映射为干净运行拒绝**
+  - **位置**：`src/server/services/automation_executor.py:387-396, 461-496, 1017-1047, 1140-1186`、`src/dalton/autonomy/preflight.py:496-512, 2079-2099, 2345-2363`、`src/dalton/sharing.py:783-929`
+  - **要求**：在执行器 `_stored_workspace`、`_resolve_thread` 与预检 `_verify_automation_workspace_ownership` 中捕获 `HTTPException(403/404)`（及 `ColleagueAccessRevokedError`），映射为既有运行拒绝语义（执行器转 `ValueError` 干净结算，预检返回 `workspace_access_denied` 跳过），不让未处理 `403` 冒出调度路径。
+  - **测试**：`tests/unit/server/services/test_automation_executor_lifecycle.py`、`tests/unit/dalton/test_autonomy_preflight.py`（撤回 `web_access='rw'` 后触发预检与执行器，断言干净拒绝结算且无未捕获异常）。
+- [ ] **G5 · 生产 `DALTON_COVERAGE_UNITS_ENABLED=1` 已默认生效的无灰度上线核验**
+  - **位置**：`docker-compose.dalton.yml:49`、`src/dalton/dalton.yaml:37-38`
+  - **要求**：生产 Compose 已默认注入 `DALTON_COVERAGE_UNITS_ENABLED=1`，`d041` 上线即全量生效无灰度窗口；须在上线前完成全量回归并同步对齐 `dalton.yaml` 默认值，容器重启后立即完成 §1.3 Anthropic 归整。
+  - **测试**：`tests/unit/dalton/test_coverage_units.py`（验证配置默认值与环境变量覆盖一致）及部署后生产只读核验。
+- [ ] **G6 · 登记、绑定与转交接收带 `ticker` 单元时幂等同步新主分析师个人 `dalton_coverage`**
+  - **位置**：`src/dalton/coverage/units.py:37-134`、`src/dalton/coverage/service.py:156-187`
+  - **要求**：按 §6 决定 2，在带 `ticker` 活动公司单元登记绑定、绑定/改绑或 `transfer_lead` 时，幂等写入当前 `lead_analyst_user_id` 的个人 `dalton_coverage`（已有行保留原 `tier`，缺行补 `'core'`），消除同事工作区因漏改个人 `coverage.yaml` 导致财报窗口静默不排期的风险。
+  - **测试**：`tests/unit/dalton/test_user_coverage.py`、`tests/unit/dalton/test_coverage_units.py`（无个人行时自动写入 `'core'` 并附正本 `workspace_id`，已有 `'watch'` 行时保留原 `tier`）。
