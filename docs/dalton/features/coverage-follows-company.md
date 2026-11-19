@@ -1,8 +1,8 @@
 # 覆盖模型重构设计：一家公司一个工作区，人去关注它
 
-> **状态**：设计提案（待评审）  
-> **关联迁移基线**：`d015_user_coverage`、`d018_workspace_sharing`、`d023_coverage_units`～`d028_workspace_settings`、`d035_company_automations`（新迁移拟定 `d041`）  
-> **核心目标**：将覆盖单元从「按人私有登记（`owner_user_id`）」改为「团队内同一主体唯一覆盖单元 + 唯一正本工作区 + 多人关注订阅 + 主分析师负责制 + 个人定时任务按创建者独立并存」。
+> **状态**：设计提案（第 2 版，已按评审收敛）  
+> **关联迁移基线**：`d005_publications`、`d014_notify_deliveries`、`d015_user_coverage`、`d018_workspace_sharing`、`d023_coverage_units`～`d028_workspace_settings`、`d035_company_automations`（新迁移拟定 `d041`）  
+> **核心目标**：将覆盖单元从「按人私有登记（`owner_user_id`）」改为「团队内同一主体唯一覆盖单元 + 唯一正本工作区 + 多人关注订阅 + 主分析师负责制 + 共享工作区内个人定时任务按创建者独立并存」。
 
 ---
 
@@ -11,29 +11,29 @@
 当前 Dalton 的覆盖体系是「跟着人走」的：
 
 1. **主体注册表按人隔离**：`dalton_coverage_units`（`d023`）唯一键为 `(owner_user_id, kind, slug)`，绑定工作区时强制校验 `workspaces.user_id == owner_user_id`（`src/dalton/database/coverage_units.py:365-366` 抛出 `workspace_not_owned` 403）。
-2. **早期覆盖表按人重复**：`d015_user_coverage.py` 建立的 `dalton_coverage` 主键为 `(user_id, ticker)`，每人各自维护一份股票池、各自在 Home 跑一份 `dalton-earnings-calendar`，并在各自工作区创建重复的 `watch` / `delta` / `move-up` / `move-down` / `earn-*` 任务。
-3. **协作割裂与重复开销**：当两位研究员同时覆盖同一家公司（例如未上市的 **Anthropic** 或上市的 **NVDA**）时，只能各建一个工作区、各登记一个覆盖单元——研究草稿与对话分处两地、知识层（`thesis` / `verdicts`）与行业成员引用（`dalton_sector_members`）出现重复节点、同一财报与异动事件触发多份重复 LLM 执行。
+2. **早期覆盖表按人重复**：`d015_user_coverage.py` 建立的 `dalton_coverage` 主键为 `(user_id, ticker)`，每人各自维护股票池、各自在 Home 跑一份 `dalton-earnings-calendar`，并在各自工作区创建重复的 `watch` / `delta` / `move-up` / `move-down` / `earn-*` 任务。
+3. **协作割裂与重复开销**：当两位研究员同时覆盖同一家公司（如未上市的 **Anthropic** 或上市的 **NVDA**）时，只能各建一个工作区、各登记一个覆盖单元——研究草稿与对话分处两地、知识层（`thesis` / `verdicts`）与行业成员引用出现重复节点、同一财报与异动事件触发多份重复 LLM 执行。
 
 本次重构确立以下 **5 条核心契约**：
 
-1. **覆盖单元归属工作区（团队唯一），不归属个人**：团队内同一主体（同一 `(kind, slug)` 及上市公司同一规范化 `ticker_key`）最多只有一个 `active` 覆盖单元，至多绑定一个正本工作区。对该工作区拥有写权限的团队成员（工作区属主、获得写共享权限的同事、PM）均可登记与绑定。
-2. **关注者（Followers）订阅机制**：每位成员独立关注自己关心的公司或行业覆盖单元；日常跟踪、财报日历提醒、异动与复盘推送按关注者及其个人通知偏好分发。
-3. **个人定时任务各自归属创建者**：同一共享工作区内，不同有写权限的成员可各自创建、修改、启停自己的个人定时任务（`scope='personal'`），互不覆盖、互不篡改，且额度计入创建者本人。
-4. **主分析师（Lead Analyst）责任制**：覆盖单元设 `lead_analyst_user_id` 字段，作为默认研究负责人与正式发布报告署名（`报告署名`），支持受控转交。
-5. **存量平滑合并与可回滚迁移**：将现有「每人一份」的同名公司/行业单元与工作区按明确评分规则（支持人工指定覆写）合并至唯一正本工作区，其余原属主自动转为关注者，非正本工作区归档保留历史对话与文件、绝不破坏性删除。
+1. **覆盖单元归属工作区（团队唯一），不归属个人**：团队内同一主体（同一 `(kind, slug)` 及上市公司同一规范化 `ticker_key`）最多只有一个 `active` 覆盖单元，至多绑定一个正本工作区。对该工作区拥有写权限的内部成员或 PM 可登记与绑定。
+2. **关注者（Followers）订阅机制**：每位成员独立关注关心的公司或行业覆盖单元；标准跟踪与财报窗口全局只跑一次，可推送事件按关注者通知偏好扇出，共享群目标合并去重。
+3. **受管跟踪与个人定时任务严格分界**：团队标准跟踪任务仅由内部受管编排入口创建并携带受管元数据；共享工作区内成员自建的个人定时任务（`scope='personal'`）一律归属创建者本人，互不篡改、不进团队扇出，额度计入创建者。
+4. **主分析师（Lead Analyst）责任制**：覆盖单元设 `lead_analyst_user_id` 作为默认研究负责人，首期支持向已具备该工作区写权限的内部成员直接转交（正式报告跨人审批与横幅署名放入后续独立阶段，不在首期扩大改动面）。
+5. **不中断切换与两段式可回滚迁移**：严格遵循 **「加兼容字段 → 停旧写入 → 回填与合并 → 建唯一索引 → 启用新写入」** 顺序；旧任务保留原行直至替代任务可运行后再原子切换，非正本工作区保留原名并加显式历史副本标记，绝不删除历史文件与执行记录。
 
 ```mermaid
 flowchart LR
     subgraph Team["团队唯一覆盖主体（internal / admin）"]
         CU["dalton_coverage_units<br/>UNIQUE(kind, slug) WHERE active<br/>lead_analyst_user_id"]
-        WS["正本 Workspace（1:1 绑定）<br/>知识层 thesis / debate / verdicts<br/>正式报告 dalton_publications"]
-        RT["标准研究跟踪任务（单实例）<br/>watch / delta / move / earn-*"]
+        WS["正本 Workspace（1:1 绑定）<br/>知识层 thesis / debate / verdicts"]
+        RT["受管标准跟踪任务（单实例）<br/>metadata.dalton_managed = true"]
         CU -->|workspace_id| WS
         RT -->|只跑一次| WS
     end
 
     subgraph Colleagues["团队成员协作与订阅"]
-        LA["主分析师 A<br/>默认负责人 & 报告署名"]
+        LA["主分析师 A<br/>默认研究负责人"]
         F1["关注者 B（有 rw 共享）"]
         F2["关注者 C（ro 只读关注）"]
         PA["A 的个人定时任务<br/>scope='personal', user_id=A"]
@@ -46,92 +46,87 @@ flowchart LR
     F2 -->|dalton_coverage_followers| CU
     PA -->|并存运行| WS
     PB -->|并存运行| WS
-    RT ==>|on_automation_settled<br/>按关注者偏好扇出推送| LA
-    RT ==>|去重群聊 / 独立私信| F1
-    RT ==>|去重群聊 / 独立私信| F2
+    RT ==>|结算同事务落投递计划<br/>按关注者偏好扇出| LA
+    RT ==>|群目标规范化合并 / 私信独立| F1
+    RT ==>|群目标规范化合并 / 私信独立| F2
 ```
 
 ---
 
 ## 1. 现状盘点（全量涉及模块、文件行号与改造对照）
 
-通过 `git grep -l "dalton_coverage_units\|dalton_user_coverage\|coverage_unit\|user_coverage" -- src/dalton` 共命中 **34 个文件**，另有 **5 个紧耦合上下游文件**（标准任务编排、通知投递扇出、发布横幅渲染、上游工作区/自动化权限钩子）必须同步调整。
+通过 `git grep -l "dalton_coverage_units\|dalton_user_coverage\|coverage_unit\|user_coverage" -- src/dalton` 共命中 **34 个文件**，另有紧耦合的任务调度、通知投递、技能提示面与上游权限钩子需同步调整。
 
-### 1.1 `d015_user_coverage` 与 `d023_coverage_units` 的关系及统一策略
+### 1.1 `d015_user_coverage` 与 `d023_coverage_units` 的关系及分层收敛策略
 
 > [!IMPORTANT]
-> 代码库中并无名为 `dalton_user_coverage` 的物理表——`user_coverage` 是迁移 `d015_user_coverage.py` 与上游钩子 `# DALTON-HOOK(user-coverage)` 的特性代号，底层实际包含三张表：`dalton_coverage`、`dalton_coverage_groups`、`dalton_earnings_calendar_mirror`。
+> 代码库中无名为 `dalton_user_coverage` 的物理表——`user_coverage` 是迁移 `d015_user_coverage.py` 与 `# DALTON-HOOK(user-coverage)` 的特性代号，底层包含三张表：`dalton_coverage`、`dalton_coverage_groups`、`dalton_earnings_calendar_mirror`。
 
-| 维度 | `d015_user_coverage.py`（`dalton_coverage` 等三表） | `d023_coverage_units.py`（`dalton_coverage_units`） | 重构后定位（一并治理、分层收敛） |
+| 维度 | `d015_user_coverage.py`（`dalton_coverage` 等三表） | `d023_coverage_units.py`（`dalton_coverage_units`） | 重构后定位（分层收敛） |
 |---|---|---|---|
-| **物理表与主键** | `dalton_coverage`：`PRIMARY KEY (user_id, ticker)`；<br>`dalton_coverage_groups`：按 `user_id` 存动态筛选规则；<br>`dalton_earnings_calendar_mirror`：`PRIMARY KEY (user_id)` | `dalton_coverage_units`：`unit_id UUID PK`，`UNIQUE (owner_user_id, kind, slug)`，部分唯一索引 `uq_dalton_coverage_units_active_workspace` | 1. **`dalton_coverage_units`**：升级为**团队级覆盖主体唯一真源**（去掉 `owner_user_id` 唯一键，新增 `lead_analyst_user_id`、`tier`、`ticker_key`）；<br>2. **新增 `dalton_coverage_followers`**：承载所有人对公司/行业单元的关注订阅与个人档位（`core`/`watch`）；<br>3. **`dalton_coverage`**：收敛为「个人轻量股票观察池 / 筛选规则组落盘表」（新增可空外键 `unit_id` 关联已登记公司单元），未建工作区的纯观察股无需污染团队正式工作区目录，一旦某股票存在团队覆盖单元则与 `dalton_coverage_followers` 自动双向同步；<br>4. **`dalton_earnings_calendar_mirror`**：新增团队级正本镜像（`user_id = 'system:dalton-company'`），读取时按用户关注的单元 + 观察池股票过滤。 |
-| **可表达主体** | **仅限有 `ticker` 的上市公司**（无法表达 Anthropic、OpenAI 等未上市公司，也无法表达行业 `sector`） | 支持 `company`（`ticker` 可空，天然支持 **Anthropic** 等未上市公司）与 `sector`（禁止带 `ticker`） | 统一由 `dalton_coverage_units` 表达所有正式研究主体（上市公司、未上市公司、行业），并放宽 `d027` 对 `ticker IS NULL` 公司的约束（见 §2.2.4）。 |
-| **工作区关系** | 无 `workspace_id` 列，靠名称/元数据启发式猜测（`service.py:1005`） | 显式 `workspace_id` 1:1 绑定，但要求 `ws.user_id == unit.owner_user_id` | 显式 `workspace_id` 1:1 绑定，写权限校验接入 `verify_workspace_access(..., need="write")`。 |
-| **当前开关状态** | 已全量启用 | `src/dalton/dalton.yaml:37-38` 默认 `coverage_units.enabled: false`（环境变量覆盖） | 迁移完成后将 `coverage_units.enabled` 默认切为 `true`，消除双轨分裂。 |
+| **物理表与主键** | `dalton_coverage`：`PRIMARY KEY (user_id, ticker)`；<br>`dalton_coverage_groups`：按 `user_id` 存动态筛选规则（支持一票多组与独立过期状态）；<br>`dalton_earnings_calendar_mirror`：`PRIMARY KEY (user_id)` | `dalton_coverage_units`：`unit_id UUID PK`，`UNIQUE (owner_user_id, kind, slug)`，部分唯一索引 `uq_dalton_coverage_units_active_workspace` | 1. **`dalton_coverage_units`**：升级为**团队级覆盖主体唯一真源**（`d041` 加 `lead_analyst_user_id`、`created_by_user_id`、`tier`、`ticker_key`，合并收尾建团队唯一索引）；<br>2. **新增 `dalton_coverage_followers`**：承载成员对公司/行业单元的关注订阅与个人通知档位；<br>3. **`dalton_coverage`**：保留为个人轻量股票观察池与动态筛选组落盘表（新增可空 `unit_id`），迁移时一次性导入关注表，日常仅保留「新加入已覆盖代码 ⇒ 自动关注单元」单向联动；<br>4. **`dalton_earnings_calendar_mirror`**：建立团队级正本镜像（`user_id = 'system:dalton-company'`），读取与周推送按个人关注单元 $\cup$ 观察池过滤。 |
+| **可表达主体** | **仅限有 `ticker` 的上市公司**（无法表达 Anthropic 等未上市公司或行业 `sector`） | 支持 `company`（`ticker` 可空，支持未上市公司）与 `sector`（无 `ticker`） | 统一由 `dalton_coverage_units` 表达正式研究主体（上市公司、未上市公司、行业），放宽 `d027` 对 `dalton_watch_state` 无 `ticker` 公司的约束（见 §2.2.4）。 |
+| **工作区关系** | 无 `workspace_id` 列，靠名称/元数据启发式猜测（`service.py:1005`） | 显式 `workspace_id` 1:1 绑定，硬校验 `ws.user_id == unit.owner_user_id` | 显式 `workspace_id` 1:1 绑定，写权限接入 `verify_workspace_access(..., need="write")` 并在必要管理入口保留显式 PM 旁路。 |
+| **当前开关状态** | 已全量启用 | `src/dalton/dalton.yaml:37-38` 默认 `coverage_units.enabled: false` | 切换验收通过后将 `coverage_units.enabled` 默认切为 `true`。 |
 
 ---
 
-### 1.2 全量模块盘点（34 个命中文件 + 5 个紧耦合上下游文件）
+### 1.2 全量模块盘点
 
 #### A. 覆盖领域层（`src/dalton/coverage/`，5 个文件）
 
-| 文件路径与行号 | 当前如何使用 `owner` / `user_id` | 改为「工作区 + 关注者 + 主分析师」后的变更 |
+| 文件路径与行号 | 现状行为与 `owner` / `user_id` 耦合点 | 重构后变更 |
 |---|---|---|
-| `src/dalton/coverage/__init__.py`<br>`L1-101` | 导出 `get_user_coverage`、`add_user_coverage_tickers` 等个人股票池接口，以及按 `owner_user_id` 签名的 `register_coverage_unit`、`bind_coverage_unit_workspace` 等函数（`L39-51`）。 | 导出新增的关注者与主分析师接口：`follow_coverage_unit`、`unfollow_coverage_unit`、`list_unit_followers`、`transfer_coverage_unit_lead`、`get_team_coverage_units`。 |
-| `src/dalton/coverage/units.py`<br>`L37-148` | `register_coverage_unit`（`L37-78`）、`archive_coverage_unit`（`L81-91`）、`bind_coverage_unit_workspace`（`L94-112`）、`unbind_coverage_unit_workspace`（`L115-127`）、`get_registered_units`（`L130-148`）全部接收 `owner_user_id: str` 并透传给 DB 做属主强匹配。 | 参数改为 `actor_user_id: str`：<br>1. **登记（`register`）**：校验调用者属于 `internal`/`admin` 层级；若同时传入 `workspace_id`，校验调用者对该工作区有写权限；默认设 `lead_analyst_user_id = actor_user_id`，并在同一事务内将 `actor_user_id` 插入 `dalton_coverage_followers`。<br>2. **绑定/解绑（`bind`/`unbind`）**：校验调用者对目标/已绑工作区拥有写权限（`verify_workspace_access(..., need="write")`）或为 PM。<br>3. **归档（`archive`）**：仅限主分析师、绑定工作区属主或 PM。<br>4. 新增 `transfer_lead`、`follow`、`unfollow`。 |
-| `src/dalton/coverage/unit_errors.py`<br>`L14-52` | `L26` 将唯一键冲突映射为 `"slug already registered for this owner"`（409）；`L30` 将 `"workspace belongs to another user"` 映射为 `("workspace_not_owned", 403)`；`L50` 映射 `"not found for this owner"`（404）。 | 调整错误码语义：<br>- `slug_conflict`（409）：团队内已存在同名 `active` 覆盖单元（返回已有 `unit_id`、`workspace_id` 与 `lead_analyst_user_id`，引导调用者直接 `follow`）；<br>- 新增 `ticker_conflict`（409）：同一规范化股票代码已存在团队覆盖单元；<br>- `workspace_not_owned` 改为 `workspace_write_forbidden`（403）；<br>- 新增 `external_tier_forbidden`（403）与 `lead_transfer_forbidden`（403）。 |
-| `src/dalton/coverage/identity.py`<br>`L1-330` | `resolve_workspace_coverage_identity`（`L248-330`）按 `workspace_id` 查 `get_active_unit_by_workspace`，本身不校验 `owner_user_id`；但回退兼容路径（`L167-214`）依赖单用户 `automations` 推断股票代码；且 `L291-319` 对 `kind='company'` 且 `unit.ticker is None`（如 Anthropic）返回 `KIND_COMPANY, ticker=None`。 | 保持按 `workspace_id` 解析；回退兼容路径在过渡期按工作区查询 `research_tracking` 任务；确保下游模块正确识别 `identity.is_company and identity.ticker is None` 的未上市公司身份。 |
-| `src/dalton/coverage/service.py`<br>`L156-2398` | - `get_user_coverage(user_id)`（`L156`）：读单人 `dalton_coverage`；<br>- `get_company_coverage()`（`L247`）：聚合全体 `admin`+`internal` 用户的 `dalton_coverage` 并集（Core 优先于 Watch）；<br>- `render_coverage_yaml` / `sync_user_coverage_to_home`（`L479-552`）：向个人 Home 渲染 `dalton/coverage.yaml`；<br>- `ensure_user_earnings_calendar_automation(user_id)`（`L555-635`）：**为每个用户各自创建一份 Home 级 `dalton-earnings-calendar` 周任务**；<br>- `_user_workspace_tickers(user_id)`（`L1005-1026`）：只查 `ws_db.list_workspaces(user_id=uid)` 判断 `has_workspace`；<br>- `add/remove/set_user_coverage_*`（`L1203-1410`）：仅改单人 `dalton_coverage`；<br>- `publish_user_earnings_calendar_mirror` / `query_user_earnings_calendar`（`L2144-2295`）：按 `user_id` 读写财报日历台账。 | 1. `_team_workspace_by_ticker()` 替代 `_user_workspace_tickers(user_id)`：直接从团队 `active` `dalton_coverage_units` 读取已绑工作区，任何关注者都能看到公司已有团队正本工作区；<br>2. `add_user_coverage_tickers` / `remove_user_coverage_tickers`：若目标 `ticker` 已有团队 `company` 覆盖单元，同步写入/移除 `dalton_coverage_followers`；<br>3. `ensure_user_earnings_calendar_automation` 改为**全队单实例** `ensure_team_earnings_calendar_automation()`（见 §3.2），停止为每位研究员创建重复的周六财报扫描任务；<br>4. `sync_user_coverage_to_home` 渲染的个人 `dalton/coverage.yaml` 合并该用户关注的全部 `dalton_coverage_units`（含未上市公司与行业区块）及轻量观察股。 |
+| `src/dalton/coverage/__init__.py`<br>`L1-101` | 导出个人股票池接口与按 `owner_user_id` 签名的覆盖单元接口（`L39-51`）。 | 导出 `follow_coverage_unit`、`unfollow_coverage_unit`、`list_unit_followers`、`transfer_coverage_unit_lead`、`get_team_coverage_units`。 |
+| `src/dalton/coverage/units.py`<br>`L37-148` | `register`、`archive`、`bind`、`unbind`、`get_registered_units` 全部接收 `owner_user_id` 做属主强匹配。 | 参数改为 `actor_user_id`：<br>1. **登记（`register`）**：校验 `internal`/`admin` 层级；将单元插入、可选工作区绑定与初始关注放入**同一事务**，唯一冲突回退保存点后查胜出记录并返回 409；<br>2. **绑定/解绑（`bind`/`unbind`）**：绑定需目标工作区写权限（或显式 PM 旁路）；解绑限主分析师、工作区属主或 PM；<br>3. **转交主分析师（`transfer_lead`）**：首期仅允许转交给已对该正本工作区具备写权限的内部成员；<br>4. 新增 `follow`、`unfollow`。 |
+| `src/dalton/coverage/unit_errors.py`<br>`L14-52` | `L26` 映射 `"slug already registered for this owner"`（409）；`L30` 映射 `("workspace_not_owned", 403)`；`L50` 映射 `"not found for this owner"`（404）。 | 调整错误码：<br>- `slug_conflict` / `ticker_conflict`（409）：附胜出 `unit_id`、`workspace_id`、`lead_analyst_user_id` 引导关注；<br>- `workspace_write_forbidden`（403）、`external_tier_forbidden`（403）、`lead_transfer_forbidden`（403）。 |
+| `src/dalton/coverage/identity.py`<br>`L57-75, L167-330` | `L57` 仅校验 ticker 格式并转大写，不含港 A 归一；`L167-232` 回退兼容路径要求非空 ticker 且可能把普通短工作区名误判为 ticker；`L248-330` 按 `workspace_id` 解析绑定单元。 | 1. 抽出共享 `normalize_ticker_key`（复用 `company_routing.py:72` 港 A 规则并统一多股本连接符）；<br>2. 过滤带历史副本标记的工作区；兼容回退在迁移中仅产候选名单，正式路由以 `dalton_coverage_units` 为准。 |
+| `src/dalton/coverage/service.py`<br>`L156-2398` | `ensure_user_earnings_calendar_automation`（`L555`）按人建周日历任务；`_user_workspace_tickers`（`L1005`）只查本人工作区；`add/remove_user_coverage_*`（`L1203`）只改个人表；`L2144` 按人读写日历台账。 | 1. `_team_workspace_by_ticker()` 从团队 `active` 单元读正本工作区；<br>2. `add_user_coverage_tickers` 命中已登记公司单元时单向幂等写入 `dalton_coverage_followers`（删除观察股不自动取关）；<br>3. 改为全队单实例 `ensure_team_earnings_calendar_automation()`；<br>4. `sync_user_coverage_to_home` 合并该用户关注的覆盖单元（含未上市公司与行业）及个人观察股。 |
 
-#### B. 数据库访问层（`src/dalton/database/`，4 个命中文件）
+#### B. 数据库访问层（`src/dalton/database/` 4 个命中文件 + `workspace.py` 软删守卫）
 
-| 文件路径与行号 | 当前如何使用 `owner` / `user_id` | 改为「工作区 + 关注者 + 主分析师」后的变更 |
+| 文件路径与行号 | 现状行为与耦合点 | 重构后变更 |
 |---|---|---|
-| `src/dalton/database/coverage_units.py`<br>`L1-477` | - `L35`：唯一约束常量 `uq_dalton_coverage_units_owner_kind_slug`；<br>- `CoverageUnit` 数据类（`L59-88`）含 `owner_user_id`；<br>- `list_coverage_units(owner_user_id)`（`L134-160`）、`insert_coverage_unit`（`L163-222`）、`set_coverage_unit_status`（`L225-281`）均以 `owner_user_id = %s` 过滤；<br>- `bind_coverage_unit_workspace`（`L312-427`）：`L345` 锁 `owner_user_id = %s`，**`L365-366` 硬编码 `if str(ws_row.get("user_id") or "") != str(owner_user_id): raise ValueError("workspace belongs to another user")`**；<br>- `unbind_coverage_unit_workspace`（`L429-477`）：同样限定 `owner_user_id = %s`。 | 1. `CoverageUnit` 替换为 `lead_analyst_user_id`、`created_by_user_id`、`tier`、`ticker_key`；<br>2. 唯一冲突检测改为 `uq_dalton_coverage_units_active_kind_slug` 与 `uq_dalton_coverage_units_active_ticker_key`；<br>3. `bind_coverage_unit_workspace` 移除 `ws_row.user_id == owner_user_id` 硬判断，改为在事务内锁 `workspaces` 行并校验：(a) 非 Home、未删除；(b) 工作区属主属于 `internal`/`admin`；(c) 调用者具备该工作区写权限；(d) 若工作区当前 `dalton_workspace_sharing` 为 `hidden`，按默认策略保底提升至团队可见（见 §2.4）；<br>4. 新增 `dalton_coverage_followers` CRUD（`upsert_follower`、`delete_follower`、`list_followers_by_unit`、`list_followed_units_by_user`）与 `update_coverage_unit_lead`。 |
-| `src/dalton/database/sector_members.py`<br>`L1-388` | `_active_sector_unit_on_cursor`（`L83-95`）按 `workspace_id` 查询 `unit_id, owner_user_id, slug`；`sync_sector_members_from_doc`（`L166-315`）将行业 `sector` 文档中的 `members[].unit_id` 投影至 `dalton_sector_members(sector_unit_id, member_id, company_unit_id)`。 | 移除 `owner_user_id` 列读取；校验 `members[].unit_id` 时直接查团队全局 `active` 且 `kind='company'` 的 `dalton_coverage_units`——由于每家公司在团队内只有唯一 `company_unit_id`，彻底消除此前「行业该引谁名下的同名公司单元」的歧义。 |
-| `src/dalton/database/company_automations.py`<br>`L41-239` | - `fetch_scope_classification_context`（`L41-125`）：**`L82` 查询 `FROM dalton_coverage_units u WHERE u.workspace_id = %s::uuid AND u.owner_user_id = %s`**，导致非单元原登记人在该工作区操作任务时查不到覆盖单元；<br>- `list_automations_for_scope_db`（`L190-205`）：非 `company` 作用域一律按 `automations.user_id = caller_user_id` 过滤。 | 1. `L82` 去掉 `AND u.owner_user_id = %s`，改为按 `u.workspace_id = %s::uuid AND u.status = 'active'` 查询工作区绑定的唯一单元；<br>2. `scope='personal'` 保持按 `automations.user_id = caller_user_id` 隔离（同事之间互不可改个人定时任务）；`scope='research_tracking'` 支持按可读工作区 / 关注单元向团队成员展示运行态。 |
-| `src/dalton/database/knowledge.py`<br>`L1-403` | `dalton_knowledge_versions` 与 `dalton_verdicts` 底层以 `workspace_id` 为核心键（`UNIQUE (workspace_id, doc_key, version_no)`），`user_id` 仅记录该版本提交人；但 `latest_by_user`（`L311-345`）硬过滤 `JOIN workspaces w ... WHERE w.user_id = %s`。 | 保留 `user_id` 作为版本作者审计字段；新增 `latest_by_workspaces(workspace_ids)`（取代仅查 `w.user_id = %s` 的 `latest_by_user`），供晨会看板与周报按「用户关注的覆盖单元工作区集合」批量拉取最新 `thesis` / `verdict`。 |
+| `src/dalton/database/coverage_units.py`<br>`L1-477` | `L35` `uq_dalton_coverage_units_owner_kind_slug`；`bind_coverage_unit_workspace`（`L365-366`）硬校验 `ws_row.user_id == owner_user_id`。 | 1. 数据类升级为 `lead_analyst_user_id`、`created_by_user_id`、`tier`、`ticker_key`；<br>2. `bind_coverage_unit_workspace` 锁 `workspaces` 行校验非 Home、未删除、非历史副本、属主为 `internal`/`admin`、调用者有写权限（或 PM），若 `web_access == 'hidden'` 保底升为 `'ro'`（保留原 `cos_access`）；<br>3. 新增 `dalton_coverage_followers` CRUD 与 `update_coverage_unit_lead`。 |
+| `src/dalton/database/sector_members.py`<br>`L50-95, L166-388` | `_active_sector_unit_on_cursor` 读 `owner_user_id`；`sync_sector_members_from_doc` 每次从 `sector` 知识文档全量重建 `dalton_sector_members`。 | 移除 `owner_user_id` 读取；校验 `members[].unit_id` 查全局 `active` 公司单元，并在投影与读取层支持将已归档历史 `unit_id` 解析映射到 `merged_into_unit_id`。 |
+| `src/dalton/database/company_automations.py`<br>`L41-239` | `fetch_scope_classification_context`（`L82`）带 `AND u.owner_user_id = %s`；`L190` 非 `company` 任务按 `user_id = caller_user_id` 过滤。 | 1. `L82` 去掉 `AND u.owner_user_id = %s`；<br>2. `scope='personal'` 保持按 `automations.user_id = caller_user_id` 隔离；`scope='research_tracking'` 按可读工作区向团队展示运行态。 |
+| `src/dalton/database/knowledge.py`<br>`L311-345` | `latest_by_user` 硬过滤 `JOIN workspaces w ... WHERE w.user_id = %s`。 | 新增 `latest_by_workspaces(workspace_ids)`，供看板与周报按关注工作区集合批量拉取最新 `thesis` / `verdict`。 |
+| *紧耦合*：`src/server/database/workspace.py`<br>`L1815-1834` | 软删除在 `SELECT ... FROM workspaces FOR UPDATE` 行锁内通过 `# DALTON-HOOK(workspace-delete-guard)` 检查 `has_published_reports`，但未检查覆盖单元绑定（且 `workspace_id` 无物理外键）。 | 在同一工作区 `FOR UPDATE` 行锁内增加检查：若存在 `status = 'active'` 的 `dalton_coverage_units` 绑定该工作区，拒绝软删除（须先解绑或迁移正本）。 |
 
-#### C. 自主运行与调度层（`src/dalton/autonomy/`，9 个命中文件 + `schedule.py`）
+#### C. 自主运行与调度层（`src/dalton/autonomy/` 9 个文件 + `schedule.py`、`price_trigger.py`、`services/company_automations.py`）
 
-| 文件路径与行号 | 当前如何使用 `owner` / `user_id` | 改为「工作区 + 关注者 + 主分析师」后的变更 |
+| 文件路径与行号 | 现状行为与耦合点 | 重构后变更 |
 |---|---|---|
-| `src/dalton/autonomy/classification.py`<br>`L141-289` | - `_matches_active_coverage_unit`（`L150`）要求 `unit.owner_user_id == automation.user_id`；<br>- `build_research_tracking_sql_predicate`（`L256-278`）要求 `u.owner_user_id = a.user_id` 且 `w.user_id = a.user_id`。 | 移除 `u.owner_user_id = a.user_id` 与 `w.user_id = a.user_id` 条件：只要任务的 `dalton_kind` 属于 `RESEARCH_TRACKING_KINDS`（或符合跟踪前缀且绑定在有效覆盖单元工作区上），即归类为 `research_tracking`；其余成员在共享工作区自建的任务一律归类为 `personal`。 |
-| `src/dalton/autonomy/tracking.py`<br>`L43-1503` | - `resolve_default_tier`（`L43-65`）只查当前调用者个人的 `get_user_tier(user_id, ticker)`；<br>- `resolve_workspace_id_by_ticker`（`L76-124`）只查 `user_id` 名下工作区；<br>- `_load_company_automations`（`L423-440`）与 `_load_sector_automations`（`L696-715`）按调用者 `user_id` 调 `list_all_user_automations`，若两位同事分别开启跟踪会生成两套重复任务；<br>- `_resolve_workspace_sector`（`L491`）读取 `unit.owner_user_id` 传给时区回退。 | 1. **规范档位（Canonical Tier）**：由单元自身档位与全体关注者档位取最高优先级（任一关注者或单元设为 `core` 即按 `core` 每日巡检，否则按 `watch` 每周巡检）；<br>2. **单实例跟踪**：`_load_company_automations` / `_load_sector_automations` 改为按 `workspace_id` + `scope='research_tracking'` 查询并加工作区级 advisory lock，确保同一覆盖单元全局只有 **1 套** `watch`/`delta`/`move`/`earn-*` 任务；<br>3. 未上市公司（`ticker IS NULL`）启用跟踪时仅创建 `watch`（议程/催化剂巡检）与 `delta`（内部与网页资料增量复盘），跳过 `move-up/down` 股价触发器；<br>4. 行业时区回退改为读 `unit.lead_analyst_user_id`。 |
-| `src/dalton/autonomy/board.py`<br>`L260-945` | `L370-378` 硬编码 `SELECT ... FROM workspaces WHERE status <> 'deleted' AND user_id = %s`！且 `L604` `if not identity.is_company or not identity.ticker: continue` 直接跳过无 `ticker` 公司。结果：同事关注了别人创建的工作区（哪怕被转交为主分析师），晨会看板 `dalton_coverage_board` 完全看不到该公司，也看不到 Anthropic 等未上市公司。 | 1. 工作区枚举改为查询「当前用户关注的 `active` 覆盖单元绑定工作区 $\cup$ 当前用户担任 `lead_analyst_user_id` 的工作区」（并经 `verify_workspace_access(..., need="read")` 过滤）；<br>2. 放宽 `L604`：支持 `identity.is_company` 且 `ticker is None` 的未上市公司（用 `unit.slug` / `display_name` 标识，跳过股价/财报探针分项，保留议程到期、辩题与新鲜度评分）。 |
-| `src/dalton/autonomy/units_view.py`<br>`L102-802` | - `member_workspace_visible`（`L118`）与 `build_units_view`（`L183-303`）按 `owner_user_id == user_id` 区分本人与同事单元，`auto_tracked`（`L265`）只检查调用者本人的自动化；<br>- `build_unit_detail`（`L594-802`）中 **`L682` 仅当 `is_own`（`unit.owner_user_id == user_id`）时才返回 `evidence_gaps`（跨单元待补证缺口）**。 | 1. 列表输出改为 `lead_analyst_user_id`、`lead_analyst_name`、`workspace_owner_user_id`、`is_following`、`follower_count`、`can_write`；<br>2. `auto_tracked` 按工作区级 `research_tracking` 任务状态判定；<br>3. `build_unit_detail` 对所有具备该行业工作区读权限的内部成员展示 `evidence_gaps`，具备写权限的成员均可协同补证。 |
-| `src/dalton/autonomy/sector.py`<br>`L78-182` | `check_sector_automation_binding`（`L78-135`）已按 `(unit_id, workspace_id)` 校验而不锁 `owner_user_id`；仅 `resolve_sector_due_timezone`（`L145-182`）回退链读取传入的单元属主时区。 | 回退链顺序改为：`sector.json.research_tz` → `unit.research_tz` → `lead_analyst_user_id` 用户时区 → 部署默认时区。 |
-| `src/dalton/autonomy/preflight.py`<br>`L515-710` | `_sync_home_coverage_for_preflight`（`L614-642`）按自动化 `user_id` 渲染 Home `coverage.yaml`；公司/行业预检按 `workspace_id` 写 `dalton_watch_state` 与 `dalton_signals`。 | 1. 团队级 `dalton-earnings-calendar` 预检读取全队覆盖并集；<br>2. 公司 `watch` 预检当 `unit.ticker IS NULL`（如 Anthropic）时只跑 `agenda` 到期探针（对齐行业预检模式），不调 SEC / 港 A 公告 / 财报 API，写入 `dalton_watch_state(workspace_id, unit_id=unit.unit_id, ticker=None)`。 |
-| `src/dalton/autonomy/probes/director.py`<br>`L191-390` | `dalton-director-daily` 零 token 预检在 `L191-208` 与 `L336-390` 只扫描 `workspaces WHERE user_id = %s` 的未决信号与陈旧度。 | 改为扫描该用户**关注或担任主分析师**的全部可读覆盖单元工作区，并增加「工作区已有运行中跟踪/派单任务则跳过重复唤醒」检查。 |
-| `src/dalton/autonomy/probes/sec.py`<br>`L60-93` | `_lookup_local_cik`（`L60-92`）回退读取 `ws["user_id"]` 个人的 `get_user_coverage` 查 `extra.cik`。 | 优先查团队覆盖单元元数据 / `get_company_coverage()` 聚合字典中的 `cik`，消除对单一工作区创建者个人 `dalton_coverage` 行的依赖。 |
-| `src/dalton/autonomy/system_jobs.py`<br>`L326-560` | `_discover_company_workspaces(user_id)`（`L326`）只查 `workspaces WHERE user_id = %s`；`_discover_sector_units(user_id)`（`L476`）调 `list_coverage_units(user_id)` 只查本人名下单元。 | 改为展示团队覆盖单元的唯一标准跟踪任务（支持「我关注的 / 全部团队覆盖」筛选），以及全队唯一的 `dalton-earnings-calendar` 状态。 |
-| *紧耦合*：`src/dalton/autonomy/schedule.py`<br>`L135-755` | `schedule_dalton_automation_helper`（`L550`）拒绝 `COMPANY_SYSTEM_USER_ID`；`L684-708` 在分析师工作区内强制要求解析出非空 `ws_ticker` 且任务名以 `dalton-<ticker>-` 开头（导致未上市公司工作区与行业工作区无法由分析师创建个人定时任务）。 | 1. 标准 `research_tracking` 任务走专用幂等编排入口（使用 `COMPANY_SYSTEM_USER_ID` 公共额度池 + 工作区级锁）；<br>2. 分析师工作区内的个人定时任务校验放宽为支持 `dalton-<unit_slug>-<custom>`（兼容未上市公司与行业工作区），且调用 `verify_workspace_access(..., need="write")` 允许有 `rw` 权限的同事创建归属自己的个人任务。 |
+| `src/dalton/autonomy/classification.py`<br>`L165-289` & `services/company_automations.py:831` | 1. `L167`、`L286` 与 `services/company_automations.py:831` 将 `COMPANY_SYSTEM_USER_ID` 一律判为 `'company'`；<br>2. `L177-215`、`L247-276` 用 `DALTON_TRACKING_NAME_RE` 前缀兜底匹配 `research_tracking`。 | 1. **去掉名称前缀兜底**：`research_tracking` 仅认受管元数据（`metadata.dalton_managed = true` 且 `dalton_kind ∈ RESEARCH_TRACKING_KINDS`）及 `dalton-earnings-calendar`；共享工作区内的 `dalton-<slug>-<custom>` 个人任务严格归为 `personal`；<br>2. 分类器与历史接口先判受管 `research_tracking`，再判系统 `company` 任务。 |
+| `src/dalton/autonomy/tracking.py`<br>`L43-1503` | 按调用者 `user_id` 查任务导致多人开启生成多套；`L1108` 检查 `paused_by_user`；`L1137-1148` 检查 `_replaced_by_tracker`。 | 1. 单元跟踪档位直接取 `unit.tier`（由主分析师或写权限成员显式设置）；<br>2. 按 `workspace_id` + 受管标记加 advisory lock 维护单套标准任务，完整保留 `paused_by_user` 与 `replaced_by_tracker` 语义；<br>3. 未上市公司仅建 `watch`（议程探针）与 `delta`，跳过股价触发器；时区回退读 `lead_analyst_user_id`。 |
+| `src/dalton/autonomy/board.py`<br>`L370-378, L604` | `L374` 只查 `workspaces WHERE user_id = %s`，`L604` 跳过无 `ticker` 公司。 | 枚举「当前用户关注的 `active` 单元工作区 $\cup$ 担任 `lead_analyst_user_id` 的工作区」（过滤历史副本与无读权限工作区）；支持无 `ticker` 公司进入看板。 |
+| `src/dalton/autonomy/units_view.py`<br>`L183-303, L594-802` | `L183-237` 已通过 `load_colleague_workspace_access` 按共享可见性合并同事单元，但按 `owner_user_id` 区分归属、`auto_tracked`（`L265`）只查本人任务，`L682` 仅对 `is_own` 返回 `evidence_gaps`。 | 输出 `lead_analyst_user_id`、`is_following`、`follower_count`、`can_write`；`auto_tracked` 查工作区级受管跟踪任务；`evidence_gaps` 对所有有工作区读权限的内部成员开放。 |
+| `src/dalton/autonomy/sector.py`<br>`L145-182` | `resolve_sector_due_timezone` 回退读单元 `owner_user_id` 时区。 | 回退链改为：`sector.json.research_tz` → `unit.research_tz` → `lead_analyst_user_id` 用户时区 → 部署默认时区。 |
+| `src/dalton/autonomy/preflight.py`<br>`L496-512, L614-645` | 1. `_verify_automation_workspace_ownership`（`L496`）调无参 `verify_workspace_access` 强制 `ws.user_id == auto.user_id`；<br>2. `L640` 在 `company_execution` 下跳过个人 `dalton_coverage_groups` 刷新。 | 1. 受管 `research_tracking`（含系统身份）改为校验 `workspace_id` 与 `metadata.unit_id` 活动绑定一致；`personal` 任务改为 `verify_workspace_access(ws_id, auto_owner, need="write")`；<br>2. 团队日历预检前先批量刷新内部成员到期的 `dalton_coverage_groups`；<br>3. 无 `ticker` 公司 `watch` 预检只跑 `agenda` 探针。 |
+| `src/dalton/autonomy/probes/director.py`<br>`L191-390` | 只扫描 `workspaces WHERE user_id = %s`。 | 改为扫描该用户关注或担任主分析师的可读正本工作区（过滤历史副本）。 |
+| `src/dalton/autonomy/probes/sec.py`（`L60-93`）& `system_jobs.py`（`L326-560`） | `sec.py` 只从工作区属主个人覆盖表查 `cik`；`system_jobs.py` 只扫本人工作区与本人单元。 | `sec.py` 优先读团队单元元数据 / `get_company_coverage()`；`system_jobs.py` 展示团队正本标准跟踪任务（过滤历史副本）与全队唯一财报日历。 |
+| *紧耦合*：`src/dalton/autonomy/price_trigger.py`<br>`L614-650` | `dalton_price_move_firings` 按 `(user_id, symbol, direction, trading_date)` 去重，切换任务执行身份后同日异动会重复触发。 | 去重唯一键改为按覆盖单元维度 `(unit_id, symbol, direction, trading_date)`（未绑单元旧行回退原键），切换当天回填当日已触发记录的 `unit_id`。 |
+| *紧耦合*：`src/dalton/autonomy/schedule.py`<br>`L545-555, L684-708` | `L550` 拒绝 `COMPANY_SYSTEM_USER_ID` 调用个人排期入口；`L686-708` 要求分析师工作区必有非空 `ws_ticker`。 | 1. 新增内部受管编排入口供 `tracking` 与团队 `dalton-earnings-calendar` 幂等排期标准任务（自动写入受管元数据）；<br>2. 分析师工作区个人任务校验放宽支持无 `ticker` 公司与行业工作区，使用 `verify_workspace_access(..., need="write")`。 |
 
 #### D. 知识层与正式发布层（`src/dalton/knowledge/*` 5 个文件 + `publish/` 2 个文件）
 
-| 文件路径与行号 | 当前如何使用 `owner` / `user_id` | 改为「工作区 + 关注者 + 主分析师」后的变更 |
+| 文件路径与行号 | 现状行为与耦合点 | 重构后变更 |
 |---|---|---|
-| `src/dalton/knowledge/cross_unit.py`<br>`L312-890` | `actor_can_write_workspace`（`L312-329`）已通过 `verify_workspace_access(..., need="write", channel="cos")` 判断跨工作区写权限；但联动失败写入 `dalton_cross_unit_requests` 时（`L721`、`L801`）绑定 `owner_user_id = actor_user_id`，导致同事 B 触发的补证缺口无法被主分析师 A 的重试任务（`L851` `retry_linkage_rows(user_id)`）拾取。 | 1. 联动写入保持单工作区单次落盘；<br>2. `dalton_cross_unit_requests` 改为按 `source_unit_id` / `target_unit_id` 归集，`owner_user_id` 仅保留为 `requested_by_user_id` 审计列；对该工作区有写权限的任一成员（或主分析师）均可查询与重试。 |
-| `src/dalton/knowledge/profiles.py`<br>`L1-95` | 按 `resolve_workspace_coverage_identity` 决定工作区使用 `company` 还是 `sector` 知识文档集合（`DOC_KEYS`），无个人属主耦合。 | 无需改语义；随着 `coverage_units` 成为唯一真源，工作区绑定的 `kind` 直接决定知识 profile。 |
-| `src/dalton/knowledge/reconcile.py`<br>`L1-800` | 按 `workspace_id` 对账沙箱文件与 `dalton_knowledge_versions`，写入新版本时记录当前执行者 `user_id`。 | 保持按 `workspace_id` 单份知识真源对账；同事通过共享写权限更新 `thesis.md` 时，`dalton_knowledge_versions.user_id` 如实记录本次修改人。 |
-| `src/dalton/knowledge/service.py`<br>`L1-500, L1180-1330` | 知识读写校验工作区写权限；当 `sector` 文档提交成功后触发 `sector_members` 投影与跨单元联动。 | 确保所有有工作区写权限的成员（含 `rw` 共享同事与新任主分析师）均可调 `knowledge_write_doc` / `knowledge_append_verdict`，且仅触发一次跨单元联动。 |
-| `src/dalton/knowledge/schemas/sector.schema.json`<br>`L1-43` | `members[].unit_id` 指向成员公司的覆盖单元 UUID。 | Schema 结构不变，业务约束升级为指向团队唯一的 `company` 覆盖单元 `unit_id`。 |
-| `src/dalton/publish/service.py`<br>`L1440-1550, L2286-2550` | **发现致命协作阻塞**：<br>1. **`L2289-2300`**：审批发布硬编码 `if user_id not in pm_users or user_id != ws_owner_id:`——若正本工作区由普通 `internal` 研究员创建（`ws_owner_id` 不是 PM），**没有任何人能批准发布该工作区的报告**！<br>2. `L1479` 与 `L2534` 将 `dalton_publish_requests.user_id` 和 `dalton_publications.user_id` 强行写成 `ws_owner_id`，无视实际撰稿人与主分析师；<br>3. `L1425` 若公司无 `ticker`（如 Anthropic）在旧分支会报错。 | 1. **修复 PM 审批门禁**：允许任何在 `DALTON_PM_USER_IDS` 中且对该工作区有读/写访问权的 PM 审批 `publish_report`（不再要求 `pm_user_id == ws_owner_id`）；<br>2. **落地主分析师署名**：`dalton_publish_requests` 与 `dalton_publications` 记录 `lead_analyst_user_id`（取自覆盖单元当前 `lead_analyst_user_id`，未绑单元时回退提交人）与 `author_user_id`（实际提交人）；<br>3. 支持已登记未上市公司（`subject_kind='company', ticker=None, unit_id=unit.unit_id`）正式发布深度报告。 |
-| *紧耦合*：`src/dalton/publish/files.py`<br>`L31-58` | `prepend_publication_banner` 仅渲染 `批准人` 与 `独立审稿`，没有分析师署名行。 | 在发布归档横幅中正式渲染 `> - **主分析师**：<lead_analyst_name>`（若实际提交人不同于主分析师，并列渲染 `**执笔/协办**：<author_name>`）。 |
+| `src/dalton/knowledge/cross_unit.py`<br>`L312-329, L800-890` | `L721` 调 `actor_can_write_workspace`；但联动失败落盘 `insert_request`（`L800-801`）写 `owner_user_id = actor_user_id`，导致同事触发的 `gap` 无法被他人的 `retry_linkage_rows(user_id)`（`L851`）拾取。 | `dalton_cross_unit_requests` 增加 `target_unit_id` 与 `requested_by_user_id`；重试查询改为按目标/源工作区写权限放行，任一有写权限成员或主分析师均可重试未决 `gap`。 |
+| `src/dalton/knowledge/service.py`（`L830`）、`profiles.py`、`reconcile.py`、`sector.schema.json` | `service.py:830` 写知识文档调普通共享权限检查（系统身份 `system:dalton-company` 不在共享表内会被拒）。 | 在知识写权限检查处为「当前工作区有效绑定单元的受管系统执行上下文」放行写权限；人类协作者沿用 `verify_workspace_access(..., need="write")`。 |
+| `src/dalton/publish/service.py`（`L1294, L1549, L2109, L2289`）、`database/publications.py`（`L235`）、`publish/files.py`（`L31`） | 跨人发布存在 **4 处耦合限制**：<br>1. `L2289` 要求 `user_id in pm_users and user_id == ws_owner_id`；<br>2. `L1294` 按 `request_id` 恢复仅限属主或发起人；<br>3. `L2109` 非属主到达待审批时重新交回属主；<br>4. 无 `ticker` 公司在 `L1549` 用 `slug.split("-")[0]` 伪造伪 ticker，且 `publications.py:235` 拒绝空 ticker。 | **首期不含正式发布流程改造**（维持工作区属主单通道现状，不在首期触碰审批流）。<br>放入**后续独立阶段（发布协同专项）**：届时一并打通恢复入口、审批交接、PM 跨人审批、无 ticker 正式归档写入，并在申请创建时快照记录 `lead_analyst_user_id` 与 `author_user_id` 渲染横幅署名。 |
 
-#### E. 工具层、路由层、配置与迁移（`tools/`、`workflows/`、`app/`、配置与紧耦合上游钩子）
+#### E. 工具、路由、通知、技能提示面与上游钩子
 
-| 文件路径与行号 | 当前如何使用 `owner` / `user_id` | 改为「工作区 + 关注者 + 主分析师」后的变更 |
+| 文件路径与行号 | 现状行为与耦合点 | 重构后变更 |
 |---|---|---|
-| `src/dalton/tools/__init__.py`<br>`L1-353` | 按角色（Chief of Staff vs Analyst）装配 `dalton_coverage`、`dalton_coverage_unit`、`dalton_coverage_tracking` 等工具。 | 工具集保持角色边界；更新工具注入上下文以传入调用者层级与工作区权限。 |
-| `src/dalton/tools/coverage_tools.py`<br>`L61-233` | `dalton_coverage` 工具读写调用者个人的 `dalton_coverage` 股票池与筛选组。 | 语义明确为「我的关注与观察池」：`add` 时若团队已有对应公司覆盖单元则自动关注该单元并返回正本 `workspace_id`；`list` 同时返回已关注的公司/行业单元与轻量观察股。 |
-| `src/dalton/tools/director_tools.py`<br>`L180-205, L688-814, L1397-2024` | - `dalton_coverage_unit`（`L688-814`）：文档与实现均声明“操作调用者本人的覆盖单元，工作区必须归本人所有”；<br>- `_verify_tracking_workspace_owner`（`L184-205`）与 `dalton_coverage_tracking`（`L1397-1599`）：仅允许工作区属主启停跟踪。 | 1. `dalton_coverage_unit` 扩展动作：`register`（支持一步传入 `workspace_id`）、`bind`、`unbind`、`archive`、`transfer_lead`（转交主分析师）、`follow`、`unfollow`、`list`（支持 `scope='followed'|'all'`）；<br>2. `dalton_coverage_tracking` 允许主分析师、工作区写权限成员或 PM 启停单元标准跟踪。 |
-| `src/dalton/workflows/company_routing.py`<br>`L217-285, L351-438` | `find_company_workspaces(user_id, ticker)` 在 `L245` 只查 `workspaces WHERE user_id = %s`（注释写明“别人的工作区一律不查”）。 | **优先查询团队 `active` `dalton_coverage_units`**（校验调用者可读权限）：当同事在行业工作区或其他工作区试图写某公司深度文件时，准确路由并引导至团队唯一的正本工作区，杜绝再次建出重复工作区。 |
-| `src/dalton/app/router.py`<br>`L1252-1662` | - `/coverage/units` 系列接口（`L1389-1457`）全部把 `current_user_id` 当 `owner_user_id`；<br>- `PUT /api/v1/dalton/automations/{name}`（`L1286`）调 `_verify_workspace_access`（仅允许 `ws.user_id == current_user_id`）；<br>- `/tracking/{workspace_id}`（`L1471-1594`）仅允许工作区属主或 PM 写入。 | 1. `/coverage/units` 改为团队共享目录接口，新增 `POST /coverage/units/{id}/follow`、`DELETE /coverage/units/{id}/follow`、`POST /coverage/units/{id}/lead-analyst`；<br>2. `PUT /dalton/automations/{name}` 改为校验 `verify_workspace_access(..., need="write", channel="web")`；<br>3. `/tracking/{workspace_id}` 允许工作区写权限成员与主分析师操作。 |
-| `src/dalton/dalton.yaml`（`L37-38`）& `src/dalton/settings.py`（`L269-279, L546-552`） | 定义 `coverage_units.enabled: false` 与 `DALTON_COVERAGE_UNITS_ENABLED` 开关。 | 保持配置项兼容；在 Phase 4 验收通过后将 `dalton.yaml` 默认值翻转为 `true`。 |
-| `d023_coverage_units.py` / `d025_sector_members.py` / `d035_company_automations.py` | 历史已执行迁移文件（定义原 `owner_user_id` 唯一键、外键与 `automations_company_owner_check`）。 | **不修改已发布历史迁移**；全部表结构演进通过新迁移 `d041_coverage_follows_company.py` 完成。 |
-| *紧耦合*：`src/dalton/notify/dispatch.py`<br>`L205-445, L4646-4835` | `on_automation_settled`（`L4646`）仅读取 `automation["user_id"]` 单一用户的通知偏好生成投递目标。 | 对覆盖单元关联的 `research_tracking` 执行，改为查询 `dalton_coverage_followers` 全量关注者，逐人校验偏好并写入 `dalton_notify_deliveries`（利用既有 `UNIQUE (execution_id, channel, target)` 自动完成群聊去重与私信扇出，详述见 §3.3）。 |
-| *紧耦合上游钩子*：<br>1. `src/server/services/automations/lifecycle.py`（`L89-117, L148-158`）<br>2. `src/server/services/automation_executor.py`（`L387-397, L439-481`）<br>3. `src/tools/secretary/approvals.py`（`L57-78`） | **发现个人定时任务共享并存的 3 处上游拦截点**：<br>1. `lifecycle.py` 调 `require_workspace_owner` 拒绝同事在共享工作区创建自动化（403）；<br>2. `automation_executor.py` 的 `# DALTON-HOOK(dalton-auth)` 在 `ws_owner != auto_owner` 时直接抛异常中止执行；<br>3. `approvals.py` 的 `# DALTON-HOOK(workspace-duplicate-guard)` 只防同一用户名下重名工作区，不防跨同事重复建同名公司工作区。 | 1. `lifecycle.py` 增加 `# DALTON-HOOK(dalton-sharing)`：允许对工作区拥有写权限（`verify_workspace_access(..., need="write")`）的成员创建归属本人的 `personal` 自动化；<br>2. `automation_executor.py` 在执行前校验 `auto_owner` 仍保有该工作区写权限（或为 `COMPANY_SYSTEM_USER_ID` 标准跟踪任务），并在 `_precreate_titled_thread` 时写入 `conversation_threads.user_id = auto_owner`；若写权限已被撤回则 fail-closed 跳过执行；<br>3. `approvals.py` 扩展重复守卫：若团队已有同名/同 ticker 的 `active` 覆盖单元，拦截新建工作区并提示直接复用正本工作区。 |
+| `src/dalton/tools/__init__.py`、`coverage_tools.py`（`L61-233`） | `dalton_coverage` 仅读写个人 `dalton_coverage` 表。 | `add` 已存在团队覆盖单元的股票时自动关注该单元并返回正本 `workspace_id`；`list` 同时返回已关注覆盖单元与个人轻量观察股。 |
+| `src/dalton/tools/director_tools.py`<br>`L184, L472-491, L688-814, L1397-1599` | 1. `dalton_cross_unit_request`（`L472-491`）`_verify_sector_unit` 区分 `owner_user_id != user_id` 且台账按 `owner_user_id` 隔离；<br>2. `dalton_coverage_unit`（`L688`）与 `dalton_coverage_tracking`（`L184, L1397`）仅限属主。 | 1. `dalton_cross_unit_request` 改为按覆盖单元绑定工作区的读写权限校验与共享台账访问；<br>2. `dalton_coverage_unit` 支持 `register`/`bind`/`unbind`/`archive`/`transfer_lead`/`follow`/`unfollow`/`list`；<br>3. `dalton_coverage_tracking` 允许主分析师、工作区写权限成员或 PM 操作。 |
+| `src/dalton/workflows/company_routing.py`<br>`L72-85, L217-285` | `_ticker_key`（`L72`）已有港 A 归一但未归一 `BRK-B`/`BRK.B`；`find_company_workspaces`（`L245`）只查本人工作区且不过滤历史副本。 | 扩展 `_ticker_key` 统一多股本连接符；路由优先查团队 `active` `dalton_coverage_units`，并在回退扫描中过滤带历史副本标记的工作区。 |
+| `src/dalton/app/router.py`<br>`L1286, L1328-1457, L1471-1594` | 只读接口 `GET /coverage/units`（`L1328-1363`）已通过 `units_view` 返回同事可见单元；但写接口（`L1389+`）把 `current_user_id` 当 `owner_user_id`，`L1286` 锁死工作区属主。 | 写接口切换为团队单元语义并新增 `follow`/`unfollow`/`lead-analyst` 端点；`PUT /automations/{name}` 与 `/tracking/{workspace_id}` 改为 `verify_workspace_access(..., need="write", channel="web")`（管理端点保留显式 PM 旁路）。 |
+| *紧耦合*：`src/server/services/automation_settlement.py`（`L520`）& `src/dalton/notify/dispatch.py`（`L58, L3353, L4693-4725`） | 1. `settlement.py:520` 状态提交后才调 `on_automation_settled`，进程退出会丢投递；<br>2. `dispatch.py:4693-4706` 对带 report profile 的任务直接早退；<br>3. `L3353` 重试共享群时只重检单个 `user_id` 开关。 | 1. 投递计划在结算同一事务落盘（或支持从结算记录幂等重建）；<br>2. 钉死 `research_tracking` 任务**不得携带 report profile**；<br>3. 群目标按规范化 `(channel, target)` 合并，重试时只要仍有至少 1 位合格关注者即发送。 |
+| *技能提示面*：`plugins/dalton/skills/*` | `dalton-earnings-calendar/SKILL.md`（`L15, L19, L146-150`）按个人 `coverage.yaml` 扫描并调个人排期入口；其余多处技能文案写明“按用户各自维护”。 | 同步更新以下提示面文件：<br>1. `plugins/dalton/skills/dalton-earnings-calendar/SKILL.md`（及 `contract.json`）：改为全队覆盖并集扫描、调用受管排期入口、保留有工作区 Watch 股 `T0`；<br>2. `dalton-research-director/SKILL.md`、`dalton-weekly-review/SKILL.md`、`dalton-conventions/SKILL.md`、`dalton-earnings-flash/SKILL.md`、`dalton-earnings-preview/SKILL.md`：对齐团队正本工作区与个人关注名单口径。 |
+| *上游权限钩子*：<br>1. `automations/lifecycle.py`（`L89-117`）<br>2. `automation_executor.py`（`L368, L444`）<br>3. `secretary/approvals.py`（`L57-78`） | 1. `lifecycle.py` 调 `require_workspace_owner` 拦截同事建任务；<br>2. `automation_executor.py` 有两处属主校验（`L368`、`L444`）；<br>3. `approvals.py` 只防同用户重名工作区。 | 1. `lifecycle.py` 按入口渠道调用 `verify_workspace_access(..., need="write")`；<br>2. `automation_executor.py` 两处校验统一支持受管系统任务与有写权限的 `personal` 创建者，固定线程强制保持 `conversation_threads.user_id == auto_owner`；<br>3. `approvals.py` 当新建工作区命中已有团队覆盖单元时提示复用正本工作区。 |
 
 ---
 
@@ -139,54 +134,59 @@ flowchart LR
 
 ### 2.1 「团队」边界定义（Team Scope）
 
-审计 `src/dalton/access_tiers.py`、`src/dalton/auth.py` 与 `d016_members_and_invites.py` 可知：**Dalton 当前没有多租户 `org_id` / `team_id` 表，一个 Dalton 部署实例即代表一个投研团队**，用户按以下四类身份分层：
+Dalton 一个部署实例对应一个投研团队（`src/dalton/access_tiers.py`、`src/dalton/sharing.py:866-901`）：
 
-- `admin`（`DALTON_PM_USER_IDS`，即 PM / 管理员）与 `internal`（匹配 `DALTON_ALLOWED_EMAILS` 白名单域名/邮箱的内部投研成员）：共同构成**同一投研团队**，共享团队工作区可见性、团队记忆与公司级报告。
-- `external`（仅凭邀请码注册的外部隔离访客）：按 `src/dalton/sharing.py:6-10, 866-901` 铁律严格与内部隔离，看不到任何内部工作区，其工作区也绝不向他人暴露。
-- `company`（`system:dalton-company`）：非人类系统执行身份，禁止外部 HTTP/WS 登录（`company_identity.py:55-66`）。
-
-因此，**覆盖单元的「团队唯一」边界定义如下**：
-
-1. **数据库唯一性范围**：部署实例内全局 `active` 唯一——即 `UNIQUE (kind, slug) WHERE status = 'active'` 与上市公司 `UNIQUE (ticker_key) WHERE status = 'active' AND kind = 'company' AND ticker_key IS NOT NULL`。
-2. **准入边界**：**仅 `internal` 与 `admin` 成员可登记、绑定、关注、查看团队覆盖单元**；`external` 用户调用覆盖单元接口或工具一律返回 `403 external_tier_forbidden`（防止外部访客抢占内部 slug 或窥探内部覆盖名单；`external` 用户仅可使用其个人隔离工作区）。
+- `admin`（`DALTON_PM_USER_IDS`）与 `internal`（匹配 `DALTON_ALLOWED_EMAILS` 的内部成员）：属于**同一投研团队**，可登记、绑定、关注、查看团队覆盖单元。
+- `external`（外部隔离访客）：与内部团队严格隔离，调用覆盖单元接口或工具一律返回 `403 external_tier_forbidden`。
+- `company`（`system:dalton-company`）：非人类系统执行身份，仅用于团队公共任务与受管标准跟踪执行，禁止外部登录。
 
 ---
 
-### 2.2 数据库表结构设计（迁移 `d041_coverage_follows_company.py`）
+### 2.2 数据库演进与五步切换顺序
 
-#### 2.2.1 改造 `dalton_coverage_units`（去个人属主、加主分析师与团队唯一索引）
+> [!IMPORTANT]
+> **全链路统一切换顺序（严禁在合并去重前建全局唯一索引）**：  
+> **① 加兼容字段、建关注表、放宽约束（`d041`） → ② 停旧写入 → ③ 回填与存量合并 → ④ 建唯一索引（合并脚本收尾） → ⑤ 启用新写入**。  
+> `d041` 只执行向后兼容的加列、建新表与放宽 CHECK，线上旧代码与现有任务在切换窗口前零中断运行；三个业务唯一索引（`uq_dalton_coverage_units_active_kind_slug`、`uq_dalton_coverage_units_active_ticker_key`、`uq_automations_workspace_tracking_name`）全部在步骤 ④ 存量冲突清零后创建。
 
-为避免 `0700.HK` 与 `700.HK`、`BRK-B` 与 `BRK.B` 因书写差异绕过 `slug` 唯一键建出两个覆盖单元，引入规范化 `ticker_key`（由 `src/dalton/coverage/identity.py` 同源规则归一化：港股去前导零如 `0700.HK` → `700.HK`，去空白转大写）。
+#### 2.2.1 `dalton_coverage_units` 演进、股票代码规范化与并发登记
+
+1. **股票代码规范化（`ticker_key`）**：复用 `src/dalton/workflows/company_routing.py:72-85` 的 `_ticker_key` 港股、A 股规则并补齐多股本代码归一：
+   - **A 股**：统一为 `DDDDDD.{SS|SZ|BJ}`（裸 6 位码按号段推断交易所，`.SH` 折算为 `.SS`）；
+   - **港股**：统一为 5 位零填充纯数字（如 `700`、`0700.HK`、`00700` 均归一为 `00700`）；
+   - **美股及其他市场类别股**：去空白转大写后，将类别股单字符后缀前的连字符 `-` 统一折算为 `.`（如 **`BRK-B` 与 `BRK.B` 统一归一为 `BRK.B`**，`BF-B` 与 `BF.B` 归一为 `BF.B`；展示字段 `ticker` 保留标准行情写法）。
+2. **并发登记事务语义**：`register_coverage_unit` 在**同一数据库事务**内开启 `SAVEPOINT`，依次执行：① 插入 `dalton_coverage_units`；② 若传入 `workspace_id` 则锁工作区行完成绑定；③ 将登记人插入 `dalton_coverage_followers`。若命中唯一索引触发 `UniqueViolation`，立即 `ROLLBACK TO SAVEPOINT`，在同一连接上读取胜出的 `active` 单元记录，返回 `409 slug_conflict` 或 `409 ticker_conflict`（携带胜出 `unit_id`、`workspace_id`、`lead_analyst_user_id`），引导调用者直接 `follow`。
 
 ```sql
--- 1. 新增团队协作与主分析师字段
+-- 【步骤 ①：d041 兼容结构迁移（不建全局唯一索引）】
 ALTER TABLE dalton_coverage_units
     ADD COLUMN IF NOT EXISTS lead_analyst_user_id TEXT,
     ADD COLUMN IF NOT EXISTS created_by_user_id   TEXT,
+    ADD COLUMN IF NOT EXISTS merged_into_unit_id  UUID,
     ADD COLUMN IF NOT EXISTS ticker_key           TEXT,
     ADD COLUMN IF NOT EXISTS tier                 TEXT NOT NULL DEFAULT 'core'
         CONSTRAINT ck_dalton_coverage_units_tier
         CHECK (tier IN ('core', 'watch'));
 
--- 2. 回填存量行（合并去重脚本先行处理同 slug/ticker_key 冲突，详见 §4）
 UPDATE dalton_coverage_units
 SET lead_analyst_user_id = COALESCE(lead_analyst_user_id, owner_user_id),
     created_by_user_id   = COALESCE(created_by_user_id, owner_user_id)
 WHERE lead_analyst_user_id IS NULL OR created_by_user_id IS NULL;
 
 ALTER TABLE dalton_coverage_units
-    ALTER COLUMN lead_analyst_user_id SET NOT NULL,
-    ALTER COLUMN created_by_user_id   SET NOT NULL;
-
--- 3. 移除「按人隔离」的旧唯一约束与旧索引，旧 owner_user_id 改为可空兼容列（Phase 4 清理）
-ALTER TABLE dalton_coverage_units
     DROP CONSTRAINT IF EXISTS uq_dalton_coverage_units_owner_kind_slug,
     ALTER COLUMN owner_user_id DROP NOT NULL;
 
-DROP INDEX IF EXISTS idx_dalton_coverage_units_owner_kind;
-DROP INDEX IF EXISTS idx_dalton_coverage_units_owner_ticker;
+CREATE INDEX IF NOT EXISTS idx_dalton_coverage_units_lead_analyst
+    ON dalton_coverage_units (lead_analyst_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_dalton_coverage_units_kind_status
+    ON dalton_coverage_units (kind, status, updated_at DESC);
 
--- 4. 建立团队级唯一约束（仅约束 status = 'active'，已归档历史行不占坑）
+-- 【步骤 ④：合并脚本完成去重后施加的唯一索引】
+ALTER TABLE dalton_coverage_units
+    ALTER COLUMN lead_analyst_user_id SET NOT NULL,
+    ALTER COLUMN created_by_user_id   SET NOT NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_dalton_coverage_units_active_kind_slug
     ON dalton_coverage_units (kind, slug)
     WHERE status = 'active';
@@ -194,18 +194,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_dalton_coverage_units_active_kind_slug
 CREATE UNIQUE INDEX IF NOT EXISTS uq_dalton_coverage_units_active_ticker_key
     ON dalton_coverage_units (ticker_key)
     WHERE status = 'active' AND kind = 'company' AND ticker_key IS NOT NULL;
-
--- 保留 d023 原有的工作区 1:1 排他索引：
--- uq_dalton_coverage_units_active_workspace ON (workspace_id) WHERE status = 'active'
-
-CREATE INDEX IF NOT EXISTS idx_dalton_coverage_units_lead_analyst
-    ON dalton_coverage_units (lead_analyst_user_id, status);
-
-CREATE INDEX IF NOT EXISTS idx_dalton_coverage_units_kind_status
-    ON dalton_coverage_units (kind, status, updated_at DESC);
 ```
 
-#### 2.2.2 新建关注关系表 `dalton_coverage_followers`
+#### 2.2.2 新建关注表 `dalton_coverage_followers` 与观察池单向衔接
 
 ```sql
 CREATE TABLE IF NOT EXISTS dalton_coverage_followers (
@@ -218,47 +209,48 @@ CREATE TABLE IF NOT EXISTS dalton_coverage_followers (
     notify_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     source         TEXT NOT NULL DEFAULT 'ui'
         CONSTRAINT ck_dalton_coverage_followers_source
-        CHECK (source IN ('seed', 'chat', 'ui', 'group', 'register', 'migration')),
-    group_id       UUID NULL
-        REFERENCES dalton_coverage_groups(group_id) ON DELETE SET NULL,
+        CHECK (source IN ('seed', 'chat', 'ui', 'register', 'migration')),
     followed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (unit_id, user_id)
 );
 
--- 支撑「我关注的覆盖单元」列表、晨会看板与动态筛选组刷新
 CREATE INDEX IF NOT EXISTS idx_dalton_coverage_followers_user
     ON dalton_coverage_followers (user_id, tier, followed_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_dalton_coverage_followers_group
-    ON dalton_coverage_followers (user_id, group_id)
-    WHERE group_id IS NOT NULL;
+ALTER TABLE dalton_coverage
+    ADD COLUMN IF NOT EXISTS unit_id UUID
+        REFERENCES dalton_coverage_units(unit_id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_dalton_coverage_unit_id
+    ON dalton_coverage (unit_id) WHERE unit_id IS NOT NULL;
 ```
 
-- **`dalton_coverage`（`d015`）衔接列**：为 `dalton_coverage` 增加可空列 `unit_id UUID REFERENCES dalton_coverage_units(unit_id) ON DELETE SET NULL`（加索引 `idx_dalton_coverage_unit_id`）。当某只观察股已登记为团队覆盖单元时，`dalton_coverage` 行自动关联 `unit_id` 并与 `dalton_coverage_followers` 保持幂等同步；尚未建工作区、也未登记正式覆盖单元的纯筛选股继续留在 `dalton_coverage` 供个人观察。
+- **单向衔接规则**：`dalton_coverage` 与 `dalton_coverage_groups` 继续承载个人观察股与多筛选组状态；迁移时一次性将存量记录导入 `dalton_coverage_followers`，首期日常仅在用户向 `dalton_coverage` **新加入已存在团队覆盖单元的代码时自动关注该单元**，手动取消关注不反删观察池，筛选组刷新也不重加已取消关注的单元。
 
-#### 2.2.3 扩展跨单元补证表 `dalton_cross_unit_requests`（去个人属主锁死）
+#### 2.2.3 扩展跨单元请求表 `dalton_cross_unit_requests`（对齐 `d026` 实际表结构）
+
+`d026_cross_unit_requests.py:38-56` 现有列为 `owner_user_id`、`sector_unit_id`、`sector_workspace_id`、`target_workspace_id`（原表无 `target_unit_id` 列）。`d041` 显式补齐兼容列与索引：
 
 ```sql
 ALTER TABLE dalton_cross_unit_requests
+    ADD COLUMN IF NOT EXISTS target_unit_id       UUID,
     ADD COLUMN IF NOT EXISTS requested_by_user_id TEXT;
 
 UPDATE dalton_cross_unit_requests
 SET requested_by_user_id = COALESCE(requested_by_user_id, owner_user_id)
 WHERE requested_by_user_id IS NULL;
 
-CREATE INDEX IF NOT EXISTS idx_dalton_cross_unit_req_target_open
-    ON dalton_cross_unit_requests (target_unit_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dalton_cur_target_unit_status
+    ON dalton_cross_unit_requests (target_unit_id, status, updated_at DESC)
+    WHERE target_unit_id IS NOT NULL;
 ```
 
-#### 2.2.4 放宽 `d027` 主体身份约束并增加正式发布主分析师署名列
+#### 2.2.4 放宽 `d027` 主体身份约束
 
-> [!WARNING]
-> 1. `d027_subject_identity.py` 在 `dalton_watch_state` 与 `dalton_publications` 上定义了 `CHECK ((subject_kind = 'company' AND ticker IS NOT NULL) OR (subject_kind = 'sector' AND ticker IS NULL AND unit_id IS NOT NULL))`。这会导致 **Anthropic** 等未上市公司（`subject_kind = 'company'`、`ticker IS NULL`、`unit_id IS NOT NULL`）无法写议程巡检状态、也无法正式发布报告！  
-> 2. `dalton_publications` 带有 `BEFORE UPDATE OR DELETE` 不可变触发器 `trg_dalton_pub_immutable`（`d005_publications.py:92-96`）。因此新增署名列**必须仅使用元数据级 `ADD COLUMN`（不触发行重写、不执行 `UPDATE`）**。
+`d027_subject_identity.py:34` 要求 `subject_kind = 'company'` 时 `ticker IS NOT NULL`，会阻断 **Anthropic** 等未上市公司写入 `dalton_watch_state` 议程巡检状态（以及后续阶段的正式报告归档；注意 `dalton_publications` 带 `trg_dalton_pub_immutable` 不可变触发器，仅做目录级约束调整与可空列预留，零行重写）：
 
 ```sql
--- 1. 允许未上市公司（ticker IS NULL 但 unit_id IS NOT NULL）写入 watch_state 与 publications
 ALTER TABLE dalton_watch_state DROP CONSTRAINT IF EXISTS ck_dalton_watch_state_subject;
 ALTER TABLE dalton_watch_state ADD CONSTRAINT ck_dalton_watch_state_subject CHECK (
     (subject_kind = 'company' AND (ticker IS NOT NULL OR unit_id IS NOT NULL))
@@ -270,257 +262,234 @@ ALTER TABLE dalton_publications ADD CONSTRAINT ck_dalton_publications_subject CH
     (subject_kind = 'company' AND (ticker IS NOT NULL OR unit_id IS NOT NULL))
     OR (subject_kind = 'sector' AND ticker IS NULL AND unit_id IS NOT NULL)
 );
-
--- 2. 发布申请与不可变归档表增加主分析师与执笔人列（纯目录级 DDL，零行重写）
-ALTER TABLE dalton_publish_requests
-    ADD COLUMN IF NOT EXISTS unit_id              UUID,
-    ADD COLUMN IF NOT EXISTS lead_analyst_user_id VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS author_user_id       VARCHAR(255);
-
-ALTER TABLE dalton_publications
-    ADD COLUMN IF NOT EXISTS lead_analyst_user_id VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS author_user_id       VARCHAR(255);
 ```
 
-#### 2.2.5 标准研究跟踪任务的数据库级单实例约束
+#### 2.2.5 标准跟踪任务约束与价格异动单元级去重
 
-在 `automations` 表上：
+```sql
+-- 1. d041：放宽 d035 系统身份约束，允许受管 research_tracking 使用 system:dalton-company
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_company_owner_check;
+ALTER TABLE automations ADD CONSTRAINT automations_company_owner_check CHECK (
+    (scope = 'company' AND user_id = 'system:dalton-company')
+    OR (scope = 'research_tracking')
+    OR (scope = 'personal' AND user_id <> 'system:dalton-company')
+);
 
-1. 增加部分唯一索引，从数据库层彻底杜绝同一工作区出现两套同名标准跟踪任务：
-   ```sql
-   CREATE UNIQUE INDEX IF NOT EXISTS uq_automations_workspace_tracking_name
-       ON automations (workspace_id, name)
-       WHERE scope = 'research_tracking'
-         AND deleted_at IS NULL
-         AND workspace_id IS NOT NULL;
-   ```
-2. 放宽 `d035` 的 `automations_company_owner_check`（`d035_company_automations.py:203-209`），允许 `scope = 'research_tracking'` 使用 `system:dalton-company` 公共预算身份执行（同时兼容迁移过渡期由人类用户持有的旧行）：
-   ```sql
-   ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_company_owner_check;
-   ALTER TABLE automations ADD CONSTRAINT automations_company_owner_check CHECK (
-       (scope = 'company' AND user_id = 'system:dalton-company')
-       OR (scope = 'research_tracking')
-       OR (scope = 'personal' AND user_id <> 'system:dalton-company')
-   );
-   ```
+-- 2. d041：价格异动去重表增加 unit_id，从「用户+代码」升级为「覆盖单元+代码」去重
+ALTER TABLE dalton_price_move_firings
+    ADD COLUMN IF NOT EXISTS unit_id UUID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dalton_price_move_firings_unit_day
+    ON dalton_price_move_firings (unit_id, symbol, direction, trading_date)
+    WHERE unit_id IS NOT NULL;
+
+-- 3. 【步骤 ④：合并脚本软归档重复跟踪任务后建立】
+CREATE UNIQUE INDEX IF NOT EXISTS uq_automations_workspace_tracking_name
+    ON automations (workspace_id, name)
+    WHERE scope = 'research_tracking'
+      AND deleted_at IS NULL
+      AND workspace_id IS NOT NULL;
+```
 
 ---
 
-### 2.3 权限矩阵
+### 2.3 权限矩阵与任务全链路一致性规则
 
-所有写权限检查统一复用 `src/dalton/auth.py` 与 `src/dalton/sharing.py` 的工作区权限语义（**工作区有写权限的人** = 工作区属主 `workspaces.user_id` $\cup$ 该工作区开启 `web_access='rw'` 或 `cos_access='rw'` 时的其他 `internal`/`admin` 成员 $\cup$ PM `admin`）：
+> [!NOTE]
+> **写权限判定边界说明**：`require_workspace_access` / `verify_workspace_access(..., need="write", channel="web"|"cos")`（`src/dalton/auth.py:439`、`sharing.py:866-932`）本身的写权限集合仅包含 **「工作区属主 `workspaces.user_id` $\cup$ 满足对应渠道 `rw` 共享条件的内部成员」**（开启同事派发时 CoS 实际读取属主级 `dalton_user_sharing` 与工作区级 `dalton_workspace_sharing`；`external` 属主工作区对包括 `admin` 在内的所有人只读/隔离）。下表中注明「或 PM（`admin`）」的管理动作均保留**调用点级显式旁路**（仅限属主为 `internal`/`admin` 的团队工作区），不当作 `verify_workspace_access` 的隐式属性。
 
-| 操作 | 允许执行的角色 / 条件 | 拒绝时的错误码与行为 |
+| 操作 | 允许执行的角色 / 条件 | 拒绝或边界行为 |
 |---|---|---|
-| **查看覆盖单元目录 / 关注 / 取消关注** | 任意 `internal` 或 `admin` 成员（对所绑工作区若为 `hidden` 则仅属主与 PM 可见详情） | `external` 用户返回 `403 external_tier_forbidden` |
-| **登记新覆盖单元（不绑工作区）** | 任意 `internal` 或 `admin` 成员；默认 `lead_analyst_user_id = 登记人` 并自动关注 | 若同 `(kind, slug)` 或同 `ticker_key` 已存在 `active` 单元，返回 `409 slug_conflict` / `ticker_conflict`（附已有单元信息） |
-| **登记并绑定 / 绑定已有工作区（`bind`）** | 对目标工作区拥有**写权限**的 `internal` / `admin` 成员（目标工作区属主必须为 `internal`/`admin`，禁止绑定 Home 或 `external` 工作区） | 无写权限返回 `403 workspace_write_forbidden`；该工作区已绑其他活动单元返回 `409 workspace_already_bound` |
-| **解绑工作区（`unbind`）** | 当前主分析师、绑定工作区属主或 PM（`admin`） | 解绑时自动暂停该工作区上的标准 `research_tracking` 任务，不删除知识层与文件 |
-| **转交主分析师（`transfer_lead`）** | 当前主分析师、绑定工作区属主或 PM（`admin`）；新主分析师必须为 `internal` 或 `admin` | 转交成功自动将新主分析师加入 `dalton_coverage_followers`（`tier='core'`）；若工作区尚未开启 `rw` 共享，提示或自动确保新主分析师可写（见 §6 问题 5） |
-| **启停/刷新标准跟踪任务（`tracking`）** | 当前主分析师、绑定工作区有写权限的成员或 PM（`admin`） | 只读关注者不可直接停掉全队跟踪任务（只读关注者只需取消关注或关闭个人通知即可停止接收推送） |
-| **创建/修改/删除个人定时任务（`personal`）** | 创建时需对目标工作区拥有写权限；创建后 `automations.user_id = 创建者`，**仅创建者本人（或管理员运维）可改删** | 同事 A 无法修改或删除同事 B 在同一工作区内的个人定时任务；若 B 日后被收回工作区写权限，下次触发在 `automation_executor` 处 fail-closed 停止 |
-| **提交报告发布（`publish_report`）** | 对正本工作区有写权限的任意 `internal` / `admin` 成员（报告署名取单元 `lead_analyst_user_id`，执笔人取提交者） | 未通过审计/审稿门禁按既有状态机流转 |
-| **批准正式发布（PM 审批）** | 任意位于 `DALTON_PM_USER_IDS`（`admin`）且可访问该工作区的 PM | 修复原 `service.py:2289` 要求 `pm == ws_owner_id` 的缺陷 |
-| **归档覆盖单元 / 删除工作区** | 归档单元：主分析师、工作区属主或 PM（且若仍有其他关注者需带 `confirm=true`）；删除工作区：仅工作区属主或 PM，**若工作区仍绑定 `active` 覆盖单元或含已发布报告（`dalton_publications`），拒绝直接删除工作区**（须先解绑/迁移正本） | 防止工作区原创建人误删全队共用的正本工作区 |
+| **查看覆盖单元目录 / 关注 / 取消关注** | 任意 `internal` 或 `admin` 成员（所绑工作区若为 `hidden` 则仅属主与 PM 可见详情） | `external` 用户返回 `403 external_tier_forbidden` |
+| **登记新覆盖单元（可同时绑工作区）** | `internal` 或 `admin` 成员；若同时传 `workspace_id`，需对该工作区有写权限（或 PM） | 同 `(kind, slug)` 或同 `ticker_key` 已存在 `active` 单元时，保存点回退并返回 `409` 附胜出单元信息 |
+| **绑定 / 解绑工作区（`bind` / `unbind`）** | `bind`：目标工作区写权限成员或 PM（禁绑 Home、历史副本或 `external` 工作区）；`unbind`：主分析师、工作区属主或 PM | 解绑时暂停该工作区上的受管 `research_tracking` 任务，保留知识层与文件 |
+| **转交主分析师（`transfer_lead`）** | 发起人：当前主分析师、工作区属主或 PM；**首期接收人必须是已对该正本工作区具备写权限的 `internal`/`admin` 成员** | 直接生效（无确认流），不自动改动工作区全局共享开关，关注档位由接收人自行决定 |
+| **启停/设置单元标准跟踪（`tracking`）** | 当前主分析师、绑定工作区写权限成员或 PM | 只读关注者不可修改全队跟踪频率或停掉任务（可自行取关或关个人通知） |
+| **创建/修改/删除个人定时任务（`personal`）** | 创建按渠道校验 `verify_workspace_access(..., need="write", channel=...)`；改删强制 `automation.user_id == caller_user_id` | 同事间互不可改删对方的个人任务；写权限被撤回后下次触发在预检与执行器处 fail-closed 跳过 |
+| **正式报告发布与审批** | **首期保持现状**（仅工作区属主单通道发起与同属主 PM 审批） | 跨人 PM 审批、无 `ticker` 正式发布与横幅署名纳入后续独立阶段 |
+| **归档覆盖单元 / 软删除工作区** | 归档单元：主分析师、工作区属主或 PM；软删工作区：在 `workspace.py:1827` 的 `FOR UPDATE` 工作区行锁内校验无 `active` 单元绑定且无已发布报告 | 仍绑定 `active` 单元时拒绝删除工作区，防止误删团队正本 |
+
+**任务分类与执行全链路一致性契约**：
+1. **分类无歧义**：仅由内部受管编排入口写入 `metadata.dalton_managed = true` 且 `dalton_kind ∈ RESEARCH_TRACKING_KINDS` 的任务（及系统级 `dalton-earnings-calendar`）归类为 `research_tracking`；移除名称前缀兜底，确保共享工作区内成员创建的任何自定义任务（含 `dalton-<slug>-*`）恒为 `personal`。
+2. **预检、执行器与工具写权限贯通**：
+   - 对受管 `research_tracking` 任务（`user_id = 'system:dalton-company'`）：`preflight.py:496`、`automation_executor.py:368/444` 与 `knowledge/service.py:830` 统一复核 `automation.workspace_id` 当前仍有效绑定在 `metadata.unit_id` 对应的 `active` 覆盖单元上，核验通过即放行执行与知识层落盘；绑定失效则只记日志跳过本次。
+   - 对 `personal` 任务：创建、修改、预检、执行器统一按创建者 `auto_owner` 校验当前工作区写权限；固定线程（`pinned` / `conversation_thread_id`）与新开线程强制校验 `conversation_threads.user_id == auto_owner`，严禁跨成员复用线程。
 
 ---
 
 ### 2.4 与现有工作区共享及设置体系的衔接（`d018` / `d020` / `d028`）
 
-代码库中存在两套互补的工作区设置表，职责需要严格区分：
-
-1. **`d018_workspace_sharing`（`dalton_workspace_sharing`）+ `d020_colleague_dispatch_threads`（`dalton_user_sharing`、`conversation_threads.user_id`）——控制读写访问与跨同事线程隔离**：
-   - `dalton_workspace_sharing` 默认值为 `cos_access='ro', web_access='hidden'`（`d018_workspace_sharing.py:23-26`）。
-   - **关键衔接规则**：如果一个工作区被绑定为团队唯一的覆盖单元正本，而 `web_access` 仍保持默认的 `'hidden'`，其他关注者在 Web 端将无法打开该工作区阅读报告与知识层，甚至在 `units_view` 中被隐藏（`units_view.py:216`）。因此，**当工作区绑定到 `dalton_coverage_units` 时，若其 `web_access == 'hidden'`，系统自动将其保底提升为 `web_access = 'ro'`、`cos_access = LEAST_RESTRICTIVE(cos_access, 'ro')`**（工作区属主或 PM 若需多人共同撰稿，可在共享设置中切为 `'rw'`，同事即可在同一工作区写代码、改知识文档、建个人定时任务）。
-   - **同一工作区内的对话与定时任务隔离**：`d020` 已为 `conversation_threads` 增加 `user_id` 列。同事 B 在共享工作区中发起的对话或 B 的个人定时任务触发的新线程（`automation_executor._precreate_titled_thread`），其 `conversation_threads.user_id` 均为 B；LiveFS 虚拟挂载 `.agents/user/automations/<file_name>` 按当前轮次 `CallContext.user_id` 解析（`src/server/services/automations/file.py:243-250`），唯一索引为 `(user_id, file_name) WHERE deleted_at IS NULL`（`d035`），因此 **A 与 B 的个人自动化在文件系统与数据库层天然隔离、互不覆盖**。
-2. **`d028_workspace_settings`（`dalton_workspace_settings.team_memory_enabled`）——控制历史对话归档检索**：
-   - `d028` 控制该工作区的**日常对话记录（Conversation Archive）**是否纳入全团队语义检索（默认 `FALSE`）。
-   - **衔接规则**：绑定覆盖单元**不强制篡改** `team_memory_enabled`（结构化知识层 `thesis`/`debate`/`verdicts` 与正式报告 `publications` 走 `d018` 读权限即可对团队关注者开放；草稿对话是否进团队记忆仍尊重工作区属主/主分析师在 `d028` 中的显式开关）。但正本工作区的共享与 `team_memory_enabled` 设置页除工作区属主外，**同步开放给当前主分析师与 PM 配置**。
+1. **`dalton_workspace_sharing`（`d018`）**：新建绑定或主动将工作区登记为覆盖单元正本时，若 `web_access == 'hidden'`，保底提升为 **`web_access = 'ro'`，同时原样保留该工作区已有的 `cos_access` 与属主级 `dalton_user_sharing` 设置**。工作区只读会同时开放工作区内的研究草稿与文件，因此存量迁移时将所有会从 `hidden` 扩大可见范围的私有工作区单列进预检清单供确认。
+2. **共享工作区内线程与自动化文件隔离（`d020` / `d035`）**：LiveFS `.agents/user/automations/<file_name>` 按当前轮次 `CallContext.user_id` 解析，唯一索引为 `(user_id, file_name) WHERE deleted_at IS NULL`，同事 A 与 B 在同一工作区内的对话线程与个人定时任务天然隔离。
+3. **`dalton_workspace_settings.team_memory_enabled`（`d028`）**：绑定覆盖单元不篡改 `team_memory_enabled` 默认值，日常对话是否进全队语义检索仍由工作区属主/主分析师/PM 显式控制。
 
 ---
 
-## 3. 按关注者分发与「单次执行」机制
+## 3. 单次执行、财报日历与可恢复通知扇出
 
-核心原则：**采集与研究计算跟着「覆盖单元 + 正本工作区」走（同一事件全局只跑一次），提醒、视图与消息投递跟着「关注者」走（按个人订阅与通知偏好扇出）**。
+核心原则：**采集与研究计算跟着「覆盖单元 + 正本工作区」走（同一事件全局只跑一次），视图与消息投递跟着「关注者」走**。
 
 ```mermaid
 sequenceDiagram
-    participant Cron as 触发器 / 探针 (Preflight)
-    participant Auto as 单实例跟踪任务 (Workspace W)
-    participant KB as 正本知识层 & 跨单元联动
-    participant Dispatch as notify/dispatch.py (on_automation_settled)
-    participant Followers as dalton_coverage_followers
+    participant Cron as 触发器 / 预检 (Preflight)
+    participant Auto as 受管跟踪任务 (Workspace W)
+    participant Settle as automation_settlement.py
+    participant Dispatch as notify/dispatch.py & 重试器
     participant Ledger as dalton_notify_deliveries
 
-    Cron->>Auto: SEC 新文件 / ±4% 异动 / 财报 T+0（零 token 预检通过）
-    Note over Cron,Auto: 同一单元仅存在 1 套 research_tracking 任务，研究只跑 1 次
-    Auto->>KB: 更新 thesis / agenda / verdicts（必要时写 1 次关联行业工作区）
-    Auto->>Dispatch: 执行结算 (execution_id)
-    Dispatch->>Followers: 查询 unit_id 的全部关注者 (notify_enabled=true)
-    loop 逐个关注者 u 评估个人通知偏好
-        Dispatch->>Dispatch: evaluate_user_notify_eligibility(u, dalton_kind)<br/>检查 u 的总开关、单类路由、个人私信目标与群目标
-        Dispatch->>Ledger: INSERT (execution_id, channel, target) ON CONFLICT DO NOTHING
-    end
-    Ledger-->>Followers: 私信按人各自送达；同一飞书群/Discord 频道严格只发 1 张卡
+    Cron->>Auto: 复核 active 单元绑定 + 单元级事件去重通过
+    Auto->>Settle: 执行完成 (execution_id)
+    Note over Settle,Ledger: 同一结算事务标记待投递（崩溃可由重试器按执行记录重建）
+    Settle->>Dispatch: 触发关注者扇出规划（禁带 report profile）
+    Dispatch->>Dispatch: 查 unit_id 关注者，逐人校验偏好<br/>共享群按规范化 (channel, target) 合并关联订阅者
+    Dispatch->>Ledger: 幂等写入投递行
+    Ledger-->>Dispatch: 重试时重检：私信验本人，共享群只要仍有 ≥1 合格关注者即发送
 ```
 
-### 3.1 每日跟踪（Watch / Delta / 股价异动）
+### 3.1 每日跟踪与事件「已执行」判定规则
 
-1. **单套任务编排**：
-   - 上市公司覆盖单元（`kind='company'`, `ticker IS NOT NULL`）在正本工作区维护唯一一套 4 个标准任务：`dalton-<t>-watch`、`dalton-<t>-delta`、`dalton-<t>-move-up`、`dalton-<t>-move-down`。
-   - 未上市公司覆盖单元（如 **Anthropic**，`kind='company'`, `ticker IS NULL`）在正本工作区维护唯一一套 2 个标准任务：`dalton-unit-<slug>-watch`（仅跑 `agenda` 验证项/催化剂到期探针）与 `dalton-unit-<slug>-delta`（网页/X/内部资料增量复盘），不创建证券行情触发器。
-   - 行业覆盖单元（`kind='sector'`）保持唯一一套 2 个标准任务：`dalton-sector-<slug>-agenda` 与 `dalton-sector-<slug>-delta`。
-2. **动态档位联动（Core / Watch 升降级）**：
-   - 定义单元有效跟踪档位：`effective_tier = 'core' IF (unit.tier == 'core' OR EXISTS(follower WHERE tier == 'core')) ELSE 'watch'`。
-   - 当首位关注者将某公司设为 `core` 时，自动将正本工作区的 `watch`（每 30 分钟盘中巡检）与 `delta`（周二至周六每日盘后复盘）调为 Core 频率；当所有关注者均降为 `watch`（或无人关注）时，自动降频至 Watch 节奏或暂停（无人关注时自动暂停 `research_tracking` 节省预算，有人重新关注时自动恢复）。
-3. **晨会总监（`dalton-director-daily`）去重协同**：
-   - 每个用户的个人晨会调用 `dalton_coverage_board(user_id)` 时，仅聚合**该用户关注的覆盖单元 + 担任主分析师的单元**，生成千人千面的晨会简报。
-   - 若晨会总监需要对某正本工作区 `delegate_to_analyst` 派发深挖任务，先检查该工作区当日是否已有活跃运行或刚完成的同类自动复盘轮次，避免两位同事的晨会同时对同一工作区重复派单。
+1. **单套受管任务编排**（档位直接读取 `unit.tier`，由主分析师或写权限成员设置）：
+   - **上市公司**（`ticker IS NOT NULL`）：维护单套 4 项受管任务 `dalton-<t>-watch`、`dalton-<t>-delta`、`dalton-<t>-move-up`、`dalton-<t>-move-down`。
+   - **未上市公司**（如 **Anthropic**，`ticker IS NULL`）：维护单套 2 项受管任务 `dalton-unit-<slug>-watch`（仅跑 `agenda` 探针）与 `dalton-unit-<slug>-delta`。
+   - **行业单元**（`kind='sector'`）：维护单套 2 项受管任务 `dalton-sector-<slug>-agenda` 与 `dalton-sector-<slug>-delta`。
+2. **切换与稳态下每类标准事件的「已执行」去重真源**：
+   - **价格异动（`move-up` / `move-down`）**：以 `dalton_price_move_firings(unit_id, symbol, direction, trading_date)` 唯一索引为准；切换当天将正本与副本工作区当日已触发的异动记录统一回填 `unit_id`，确保切换执行身份后同日异动绝不重跑。
+   - **日常巡检（`watch` / `sector_agenda`）**：以正本工作区 `dalton_watch_state` 与 `dalton_signals` 已消费信号指纹为准，直接继承水位。
+   - **财报窗口（`earn-<period>-tm3/t0/tp1`）**：以 `(unit_id, quarter, stage)` 对照台账 `reported` 及正本/副本已成功结算的 `automation_executions` 历史判定；已执行阶段绝不补跑，仅对未到期的待执行阶段在正本工作区保留或改期单实例 `once` 任务。
 
-### 3.2 财报日历与财报窗口（T-3 / T+0 / T+1）
+### 3.2 财报日历与财报窗口（保留筛选组刷新与 Watch 股 `T0`）
 
-1. **周度日历扫描只跑一次**：
-   - 将原每用户一份的 `dalton-earnings-calendar` 合并为**全队唯一系统级任务**（每周六 09:00 运行一次），扫描「全部 `active` 上市公司覆盖单元 $\cup$ 全体内部成员 `dalton_coverage` 观察股」未来 21 天的财报披露日。
-   - 扫描结果写入团队正本镜像 `dalton_earnings_calendar_mirror(user_id = 'system:dalton-company')`。
-2. **财报窗口单次排期**：
-   - 对未来披露期内有效档位为 `core` 且已绑定正本工作区的公司单元，在正本工作区幂等排期唯一一套一次性任务：`dalton-<t>-earn-<period>-tm3`、`t0`、`tp1`。
-3. **按关注者过滤视图与周历提醒**：
-   - Web 端 `GET /api/v1/dalton/earnings/calendar`：读取团队正本台账；「我的关注」视图按调用者的 `dalton_coverage_followers` $\cup$ 个人 `dalton_coverage` 过滤并标注每家公司的主分析师与个人关注档位；「全团队覆盖」视图展示完整日历。
-   - 周六日历刷新完成后的周度财报预告推送：按每位用户在未来 14 天内**实际命中关注标的**的子集生成个性化提醒（若某研究员关注的标的下周均无财报，则静默不打扰）。
+1. **周度日历全队单次扫描 + 保留个人筛选组刷新**：
+   - 停用各成员重复的个人日历任务前，在全队唯一 `dalton-earnings-calendar`（`user_id = 'system:dalton-company'`）的预检阶段先行刷新内部成员到期的 `dalton_coverage_groups`，随后汇总「全部 `active` 上市公司覆盖单元 $\cup$ 全体内部成员 `dalton_coverage` 观察股」渲染 `coverage.yaml`，扫描结果发布至团队镜像 `dalton_earnings_calendar_mirror(user_id = 'system:dalton-company')`。
+2. **专用受管排期入口与 Core / Watch 建链契约**：
+   - 新增内部受管排期入口供日历任务写入各公司正本工作区的财报 `once` 任务（绕开 `schedule.py:550` 对个人调度器的系统身份拦截，但强校验目标工作区绑定 `active` 公司单元且尊重 `paused_by_user`）。
+   - **保持现有分级建链能力（`SKILL.md:146-148`）**：已绑定 `active` 正本工作区的公司，`unit.tier == 'core'` 排 `["tm3", "t0", "tp1"]` 三条；**`unit.tier == 'watch'` 保留排 `["t0"]` 快讯一条**；未建工作区的观察股仅更新日历台账，不建任务链。
+3. **日历视图与周历推送按个人筛选**：
+   - `GET /api/v1/dalton/earnings/calendar` 支持「我的关注」（按 `dalton_coverage_followers` $\cup$ 个人 `dalton_coverage` 过滤）与「全团队覆盖」视图。
+   - 团队 Home 不绑定单一 `unit_id`，周六日历结算后的周度财报预告推送按每位内部成员的 **「已关注覆盖单元 $\cup$ 个人观察池股票」** 与未来披露窗口求交集独立筛选投递（交集为空则静默）。
+4. **同步修改的技能提示面清单**：
+   - `plugins/dalton/skills/dalton-earnings-calendar/SKILL.md` 及 `contract.json`（全队名单口径、受管排期调用、台账镜像说明）；
+   - `plugins/dalton/skills/dalton-research-director/SKILL.md`、`dalton-weekly-review/SKILL.md`、`dalton-conventions/SKILL.md`、`dalton-earnings-flash/SKILL.md`、`dalton-earnings-preview/SKILL.md`（更新 `coverage.yaml` 与财报任务引用说明）。
 
-### 3.3 推送通知扇出与天然幂等去重（`notify/dispatch.py`）
+### 3.3 可恢复的通知扇出与共享群合并（`notify/dispatch.py`）
 
-`d014_notify_deliveries` 表已有唯一约束 `UNIQUE (execution_id, channel, target)`，这为「单次执行、多人分发、群聊不重发」提供了极佳的底层保证：
+1. **可推送事件边界与 Report Profile 禁令**：
+   - 保持 `dispatch.py:58` 既有入口边界：日常 `watch` / `delta`（含未上市公司与行业的日常巡检/增量复盘）仅沉淀知识层与看板信号，**不直接发通知卡片**；仅 `earnings_tm3`、`earnings_t0`、`earnings_tp1`、`price_move` 等可推送分类进入关注者扇出。
+   - **硬约束**：`on_automation_settled` 在 `dispatch.py:4693-4706` 对携带 validated report profile 的任务会直接早退走单属主报告投递——因此钉死 **`research_tracking` 受管任务一律不得携带 report profile**。
+2. **结算与投递计划崩溃可恢复**：
+   - 在 `automation_settlement.py:520` 提交执行终态的**同一数据库事务**内写入 `notify_plan_status = 'pending'`（或通知 outbox 行）；`on_automation_settled` 完成后置为 `'planned'`。若进程在落盘 `dalton_notify_deliveries` 前退出，后台重试扫描器自动扫描 `notify_plan_status = 'pending'` 的已结算执行，从执行记录与 `dalton_coverage_followers` 幂等重建投递计划。
+3. **群目标规范化合并与重试资格重检**：
+   - 对单元关注者逐人评估通知资格（`watch` 关注者默认接收 `earnings_t0` 与 `price_move`，`core` 关注者接收全部可推送分类，均受个人总开关与路由覆盖控制）。
+   - 私信目标按人独立生成投递行；**共享群目标（飞书群、Discord 频道等）先经规范化 `(channel, normalized_target)` 合并**，全群只写一条投递记录并关联命中的关注者列表 `eligible_user_ids`；重试发送时（`dispatch.py:3353`）重检该列表，**只要仍有至少 1 位关注者保持合格订阅即正常发送**，避免单人关通知导致整群漏发。
 
-1. **路由判定分支**（在 `src/dalton/notify/dispatch.py:on_automation_settled` 中）：
-   - **`scope == 'personal'`（个人自建定时任务）**：保持现状，仅读取 `automation.user_id` 创建者一人的通知偏好与路由目标。
-   - **`scope == 'company'`（公司级固定简报，`REPORT_PROFILES`）**：保持现状，走任务行级 `notify_routes`。
-   - **`scope == 'research_tracking'`（覆盖单元标准跟踪 / 异动 / 财报窗口）**：
-     1. 由 `automation.workspace_id` 反查 `active` `dalton_coverage_units` 得到 `unit_id`；
-     2. 查询 `dalton_coverage_followers WHERE unit_id = %s AND notify_enabled = TRUE` 得到关注者列表 $\{u_1, u_2, \dots, u_k\}$；
-     3. 对每位关注者 $u_i$：
-        - **档位过滤**：若 $u_i$ 对该单元的关注档位为 `watch`，默认仅投递高优事件（`earnings_t0` 财报快评、`price_move` 异动归因、重大评级变更），跳过高频的 `earnings_tm3` 前瞻与日常 `weekly_delta`（除非用户在 `dalton_notify_routes` 显式开启）；`core` 关注者接收完整生命周期推送。
-        - **个人偏好校验**：调用 `evaluate_user_notify_eligibility(u_i, automation_classification)`，核对 $u_i$ 本人的 `dalton_notify_enabled` 总开关、`dalton_notify_overrides`、`dalton_notify_targets` 与分类路由（如飞书私信 `feishu:user:ou_xxx`、Discord 私信或内部群）。
-     4. 将所有通过校验的 `(execution_id, channel, target)` 批量 `INSERT ... ON CONFLICT (execution_id, channel, target) DO NOTHING` 写入 `dalton_notify_deliveries`：
-        - 研究员 A 与 B 各自的私信目标不同 → 各自收到一份私信卡片；
-        - A 与 B 都把路由配到了同一个内部投研飞书群 `feishu:chat:oc_semi` → 唯一约束自动去重，**群里严格只发 1 张卡片**！
+### 3.4 知识层单点沉淀与行业成员关系
 
-### 3.4 知识层更新与行业成员关系
-
-1. **知识层单点沉淀**：
-   - 无论是日常 `watch`/`delta` 自动更新，还是主分析师 A、共享写权限同事 B 手动修订，全部写入正本工作区的同一组 `dalton_knowledge_versions`（`thesis`、`debate`、`agenda`、`drivers`、`sector`）与 `dalton_verdicts` 时间线。
-   - 所有关注者在 Web 工作区详情、Chief of Staff 跨工作区问答以及晨会看板中读到的都是**同一份最新结论**，彻底消灭多处同步。
-2. **行业成员关系与跨单元联动**：
-   - 行业正本工作区的 `sector` 文档维护 `members: [{unit_id, role, note}]`，其中 `unit_id` 指向团队唯一的公司 `unit_id`。
-   - 当成员公司正本工作区的 `thesis` 或 `verdict` 更新时，`knowledge/cross_unit.py` 沿 `dalton_sector_members` 反向查出所有包含该公司的行业正本工作区，每个关联行业工作区**只写入一条跨单元候选证据**（不因关注人数倍增）。
+- 正本工作区承载唯一的 `dalton_knowledge_versions` 与 `dalton_verdicts`。
+- 行业工作区 `sector` 文档中的 `members[].unit_id` 指向团队唯一的公司正本 `unit_id`；成员公司知识更新触发 `cross_unit.py` 时，每个关联行业正本工作区仅写入一条跨单元候选证据。
 
 ---
 
-## 4. 存量数据规模推断与平滑迁移方案
+## 4. 存量平滑迁移、正本选择与两段式回滚
 
-### 4.1 生产环境存量数据规模推断（基于代码与迁移静态分析）
+### 4.1 存量规模与切换耗时由预检实测输出
 
-在不连接数据库的前提下，从迁移历史与配置文件可准确推断当前生产数据量级：
-
-1. **成员规模**：由 `DALTON_ALLOWED_EMAILS` 与 `DALTON_PM_USER_IDS`（`src/dalton/access_tiers.py`、`d016_members_and_invites.py`）管理的内部投研团队，规模属于精干买方/研究团队量级（约 **5～20 名 `internal`/`admin` 成员**，少量隔离 `external` 访客）。
-2. **覆盖标的基数**：`config/dalton/coverage.yaml` 预置种子共 **105 只股票**（**27 只 Core** 含美股科技/中概港股，**78 只 Watch**）；`seed_user_coverage_from_yaml`（`coverage/service.py:2300`）按用户播入 `dalton_coverage`，因此 `dalton_coverage` 总行数约为 **$O(10^2 \sim 2 \times 10^3)$ 行**。
-3. **覆盖单元与工作区基数**：
-   - `d023_coverage_units` 于近期（2026-11）引入，且 `src/dalton/dalton.yaml:37-38` 当前默认 `coverage_units.enabled: false`：即使部分环境已通过 `DALTON_COVERAGE_UNITS_ENABLED=true` 灰度开启，`dalton_coverage_units` 行数也在 **$O(0 \sim 2 \times 10^2)$ 行**量级。
-   - 全部用户创建的非 Home 公司/行业工作区总数约为 **$O(50 \sim 500)$ 个**；同一热点公司（如 NVDA、MSFT、700.HK、Anthropic）在团队内存在 2～4 个重复个人工作区/重复跟踪任务。
-4. **迁移性能结论**：全量数据均在千行以内，单事务/批处理脚本可在 **数秒内** 完成扫描、备份与合并，不存在大表锁表瓶颈（所有 DDL 仍遵循 `SET LOCAL lock_timeout = '5s'`）。
+不在文档中静态推断生产成员数、工作区数或锁等待耗时——全部存量指标（活跃内部成员数、现有覆盖单元数、候选重复工作区组数、将扩大可见范围的私有工作区列表、在途执行数、待切换跟踪任务数及实测干跑耗时）统一由迁移脚本 `scripts/dalton/migrate_coverage_follows_company.py --dry-run` 连接目标环境实测输出，作为开启切换窗口的准入依据。
 
 ---
 
-### 4.2 冲突合并：同一公司多个工作区时「正本工作区」选择规则
+### 4.2 正本工作区选择规则与未上市公司归组
 
-当迁移脚本发现同一主体（上市公司按规范化 `ticker_key` 归组，无 ticker 公司与行业按 `(kind, normalized_slug)` 归组）在团队 `internal`/`admin` 成员名下存在 **$\ge 2$ 个候选工作区或覆盖单元**时，采用 **「人工覆写优先 + 确定性五级评分自动兜底」** 选出唯一正本工作区（Canonical Workspace）：
+当同一主体在内部成员名下存在 $\ge 2$ 个候选工作区或覆盖单元时，采用 **「人工清单优先 + 精简二级规则」** 选出唯一正本工作区：
 
-| 优先级 | 判定维度 | 规则与工程理由 |
+| 优先级 | 判定维度 | 规则说明 |
 |---|---|---|
-| **P0（最高）** | **人工指定清单（`--manifest`）** | 迁移前先跑 `--dry-run` 输出冲突报告 JSON（列出每组冲突公司的所有候选工作区、属主、报告数、知识版本数、最近活跃时间），允许 Lead/PM 在 `canonical_overrides.yaml` 中直接指定某公司的正本 `workspace_id` 与 `lead_analyst_user_id`。 |
-| **P1** | **正式发布报告数（`dalton_publications`）** | 优先选拥有已发布正式报告数量最多的工作区。**硬性理由**：`dalton_publications` 受不可变触发器与工作区删除守卫保护，正式归档报告是团队最高等级的合规研究资产，必须留在正本工作区。 |
-| **P2** | **知识层完整度（`dalton_knowledge_versions` + `dalton_verdicts`）** | 若均无正式发布报告，比较有效知识文档数（尤其是否具备有效 `thesis`）及 `version_no + verdicts` 总沉淀深度，深者胜出。 |
-| **P3** | **近 30 天人类研究活跃度** | 比较近 30 天工作区内人工对话轮次与非空文件更新数（区分真正有人深耕的工作区 vs 仅由初始化脚本建出的空壳工作区）。 |
-| **P4（兜底）** | **已显式登记 `d023` 单元 > PM（`admin`）属主 > 最早 `created_at`** | 完全平分时，优先保留已绑定 `dalton_coverage_units` 的工作区，其次选 PM 持有的工作区，最后按 `workspaces.created_at ASC, workspace_id ASC` 确定性决出唯一胜者。 |
+| **P0（最高）** | **人工指定清单（`--manifest`）** | 支持在 `canonical_overrides.yaml` 中显式指定任意主体的正本 `workspace_id`、`lead_analyst_user_id` 及是否跳过合并。 |
+| **P1** | **已有正式发布报告或有效研究资料优先** | 拥有不可变正式发布报告（`dalton_publications`）的工作区优先；若均无正式报告，拥有有效知识层文档（`dalton_knowledge_versions` / `dalton_verdicts`）沉淀的工作区优先于空壳工作区。 |
+| **P2（稳定兜底）** | **已绑 `d023` 单元 > 创建时间稳定排序** | 同等条件下优先保留已显式绑定 `dalton_coverage_units` 的工作区，再按 `workspaces.created_at ASC, workspace_id ASC` 确定性选出唯一正本。 |
 
-> [!CAUTION]
-> **若同一公司的两个工作区都存在不可变正式发布报告（`dalton_publications > 0`）**：`--dry-run` 会将其标记为 `HIGH_PRIORITY_CONFLICT` 并在未显式传入 `--confirm-multi-pub` 或人工 manifest 时中止自动合并，确保 PM 知情确认（两个工作区均不会丢失报告，但需人工确认以哪个作为后续持续迭代的正本）。
+**两项安全硬守卫**：
+1. **多份正式报告冲突强制人工指定**：若同一主体的 **2 个及以上候选工作区均存在 `dalton_publications > 0`**，脚本拒绝自动择一，必须在人工 `--manifest` 中明确指定正本后方可执行切换。
+2. **未上市公司（如 Anthropic）与启发式识别仅作候选、人工确认**：`identity.py` 兼容回退规则只能产出有 `ticker` 的候选（且可能误判短字母名称工作区），无法识别未登记 `d023` 单元的未上市公司。因此 `--dry-run` 新增 **「跨内部成员规范化工作区名称相同的工作区」归组**（识别如两位成员各有一个 `Anthropic` 工作区）；所有未经 `d023` 显式登记、由兼容解析器或跨人同名规则扫出的归组**一律仅作为候选名单输出，须经人工 `--manifest` 确认后才执行合并**。
 
 ---
 
-### 4.3 迁移脚本执行步骤（`scripts/dalton/migrate_coverage_follows_company.py`）
+### 4.3 五步切换执行流程（不提前中断现有任务）
 
-迁移拆分为 **Alembic 结构迁移（`d041`）** 与 **幂等数据归并脚本** 两部分，分 6 步执行：
+切换拆分为 **前置兼容迁移（Phase 1）** 与 **替代链路就绪后的原子切换窗口（Phase 3）**：
 
-1. **Step 1 — 预检与冲突干跑（`--dry-run`）**：
-   - 扫描全部 `internal`/`admin` 用户的：(a) `dalton_coverage_units`（`status='active'`）；(b) 未绑单元但由 `resolve_workspace_coverage_identity` 识别为公司的工作区；(c) `dalton_coverage` 个人股票池。
-   - 输出冲突归并预览表（候选工作区得分、拟选正本、拟任主分析师、拟转关注者名单、拟暂停的重复跟踪任务列表）。
-2. **Step 2 — 写入完整回滚快照表（`dalton_coverage_merge_backups`）**：
-   - 在事务内创建批次记录 `batch_id`，将本次涉及的所有旧 `dalton_coverage_units` 行、`dalton_sector_members.company_unit_id` 原值、`dalton_workspace_sharing` 原值、拟暂停/改作用域的 `automations` 原状态完整写入备份表 `dalton_coverage_merge_backups`。
-3. **Step 3 — 确立唯一覆盖单元与正本工作区共享保底**：
-   - 对每个主体保留或新建唯一的 `active` `dalton_coverage_units` 行，绑定胜出的正本 `workspace_id`，设置 `lead_analyst_user_id`（人工指定优先，否则取正本工作区属主）与规范化 `ticker_key`。
-   - 检查正本工作区的 `dalton_workspace_sharing`：若 `web_access == 'hidden'`，保底更新为 `web_access = 'ro', cos_access = 'ro'`，确保被合并过来的关注者立即可读正本工作区。
-4. **Step 4 — 原属主与股票池订阅者全量转为关注者**：
-   - 将正本主分析师、所有非正本重复单元/重复工作区的原属主，以及 `dalton_coverage` 中持有该 `ticker` 的所有 `internal`/`admin` 用户幂等插入 `dalton_coverage_followers`（保留其原有的 `core`/`watch` 档位与 `group_id`，若同一人在多处有记录则取最高档位 `core > watch`），并回填 `dalton_coverage.unit_id`。
-   - 同步重写 `dalton_sector_members.company_unit_id` 与 `dalton_cross_unit_requests` 中指向被归并旧 `unit_id` 的引用为胜出的正本 `unit_id`，随后将旧重复 `dalton_coverage_units` 行置为 `status = 'archived', workspace_id = NULL`。
-5. **Step 5 — 去重标准跟踪任务并安全归档非正本工作区（零文件删除）**：
-   - **正本工作区**：收敛保留唯一一套 `scope='research_tracking'` 标准跟踪任务（按全体关注者最高档位对齐 Core/Watch 频率）。
-   - **非正本重复工作区**：
-     - 将其上的标准跟踪任务（`dalton-<t>-watch/delta/move-*/earn-*`）全部暂停并软归档（记录在备份表中，杜绝双跑）；
-     - 将其上的个人自定义任务（`scope='personal'`）保持原属主不变（或提示属主按需迁入正本工作区）；
-     - **绝不删除非正本工作区的文件、历史对话或发布记录**——仅将其工作区名称追加后缀 `（历史个人副本）`，使其不再参与覆盖路由与晨会看板扫描，原属主可随时打开查阅或手动搬运有价值的草稿到正本工作区。
-   - **Home 级 `dalton-earnings-calendar`**：暂停各用户 Home 下重复的个人 `dalton-earnings-calendar`，启用全队单实例任务。
-6. **Step 6 — 施加数据库唯一索引锁口**：
-   - 验证 `active` 行无 `(kind, slug)` 与 `(ticker_key)` 重复后，建立 `uq_dalton_coverage_units_active_kind_slug`、`uq_dalton_coverage_units_active_ticker_key` 与 `uq_automations_workspace_tracking_name`。
+1. **步骤 ① — 执行 `d041` 兼容 DDL + 运行 `--dry-run` 预检**：
+   - 执行 `alembic upgrade` 加兼容列、建关注表、放宽约束；**此时线上一切现有跟踪与个人财报日历任务照常运行，不做任何暂停**。
+   - 运行 `--dry-run` 输出四份核对清单：① 候选合并组与拟选正本；② 未上市/启发式同名候选组（待人工确认）；③ 多份正式报告冲突组（如有）；④ **当前 `web_access='hidden'`、绑定后将扩大为团队只读的工作区清单**。人工确认生成 `canonical_overrides.yaml`。
+2. **步骤 ② — 进入切换窗口，停旧写入并衔接在途执行**：
+   - 待 Phase 2 新执行/扇出代码上线验证就绪后，开启短暂维护门禁暂停覆盖单元与标准跟踪任务的变更写入；检查涉及切换的任务是否存在 `pending`/`waiting`/`running` 在途执行（等待排空或保留旧任务行可读直至在途执行自然结算，绝不强杀在途轮次）。
+3. **步骤 ③ — 写入完整备份快照并执行回填与归并**：
+   - **完整备份**：在事务内向 `dalton_coverage_merge_backups` 记录 `batch_id`，保存涉及的 `dalton_coverage_units`、`dalton_coverage_followers` 变更前状态、`dalton_coverage.unit_id` 原值、`sector` 文档原版本号与 `dalton_sector_members`、`dalton_cross_unit_requests` 原行（含 JSONB）、`dalton_workspace_sharing`、`workspaces.config` 及所有被改动 `automations` 行的完整快照。
+   - **单元与关注者归并**：确立唯一 `active` 覆盖单元与规范化 `ticker_key`；若正本工作区 `web_access == 'hidden'` 则升为 `'ro'`（保留原 `cos_access`）；将主分析师、重复单元/副本原属主及 `dalton_coverage` 持有者一次性幂等导入 `dalton_coverage_followers` 并回填 `dalton_coverage.unit_id`；被归并旧单元置 `status = 'archived', workspace_id = NULL, merged_into_unit_id = <canonical_unit_id>`。
+   - **有效引用重写**：
+     - **行业成员关系**：更新所有活动行业工作区当前有效 `sector` 知识文档中的 `members[].unit_id`（将旧 `unit_id` 替换为正本 `unit_id` 生成新版本）并重算 `dalton_sector_members` 投影，防止下次文档同步回退旧 ID；
+     - **跨单元请求**：一并重写 `dalton_cross_unit_requests` 的表列（`sector_unit_id`、`sector_workspace_id`、`target_workspace_id`、`target_unit_id`）及 `payload`（`source_ref`、`target_ref`）、`evidence_needed`、`result` JSONB 中的旧单元与副本工作区引用。
+   - **历史副本显式标记（保留原工作区名）**：非正本工作区**保留原名称、原文件与原对话不删改**，在 `workspaces.config` 写入 `"dalton_historical_duplicate_of": "<canonical_workspace_id>"`，路由、看板与跟踪发现统一过滤该标记。
+   - **任务无损切换与防物理清理软归档**：
+     - 正本工作区收敛为唯一一套受管 `research_tracking` 任务，**继承原任务的 `paused_by_user`、`replaced_by_tracker` 标记及已完成/待执行的财报 `once` 窗口状态**，并回填当日 `dalton_price_move_firings.unit_id`；共享工作区内的 `personal` 任务保持原创建者不动；
+     - 被淘汰的重复标准跟踪任务与旧个人 `dalton-earnings-calendar` 任务统一执行软归档：**置 `deleted_at = NOW()`、`status = 'paused'`、将原状态存入 `pre_delete_desired_status`，并写入 `metadata.archived_by_migration = true`**；同步修改 `src/dalton/database/automation_recycle.py:31` 的 `PURGE_AUTOMATIONS_SQL`，排除 `metadata->>'archived_by_migration' = 'true'` 的行，防止 30 天回收站物理删除级联清空历史 `automation_executions`（`001_initial_schema.py:458`）。
+4. **步骤 ④ — 建立唯一索引锁口**：
+   - 校验零冲突后，创建 `uq_dalton_coverage_units_active_kind_slug`、`uq_dalton_coverage_units_active_ticker_key` 与 `uq_automations_workspace_tracking_name`，并将 `lead_analyst_user_id`、`created_by_user_id` 设为 `NOT NULL`。
+5. **步骤 ⑤ — 启用新写入与团队日历调度**：
+   - 放开写门禁，启用全队单实例 `dalton-earnings-calendar` 与正本受管跟踪调度。
 
-### 4.4 可回滚性保障
+---
 
-- **数据层一键回滚（`--rollback --batch-id <id>`）**：依据 `dalton_coverage_merge_backups` 快照，在单个事务内：
-  1. 恢复被归档的旧 `dalton_coverage_units` 行状态与原 `workspace_id` 绑定；
-  2. 恢复 `dalton_sector_members` 外键引用与 `dalton_workspace_sharing` 原共享级别；
-  3. 去掉非正本工作区的 `（历史个人副本）` 后缀，恢复其原 `pre_merge_status = 'active'` 的跟踪自动化，并停用新建的团队单实例任务。
-- **Schema 层可降级（`alembic downgrade`）**：`d041` 保留可空的旧 `owner_user_id` 列（写入时镜像 `lead_analyst_user_id` 直至 Phase 4 稳定期结束）；若尚未产生跨人同 slug 冲突或回滚脚本已先行还原数据，`downgrade()` 可无损恢复旧索引结构。
+### 4.4 两段式回滚方案
+
+1. **阶段一：切换前或切换窗口内（尚未产生新不可变归档）的完整回滚**：
+   - 执行 `migrate_coverage_follows_company.py --rollback --batch-id <id>`，依据 `dalton_coverage_merge_backups` 在单事务内完整还原：
+     1. 删除本次迁移写入的 `dalton_coverage_followers` 行，恢复 `dalton_coverage.unit_id` 原值；
+     2. 恢复旧 `dalton_coverage_units` 行的 `status`、`workspace_id` 并清空 `merged_into_unit_id`；
+     3. 恢复行业 `sector` 文档版本、`dalton_sector_members` 投影以及 `dalton_cross_unit_requests` 表列与 JSONB 引用；
+     4. 恢复 `dalton_workspace_sharing` 原权限，清除副本工作区 `config.dalton_historical_duplicate_of` 标记；
+     5. 停用新建替代任务，将原任务的 `deleted_at` 置回 `NULL`、按 `pre_delete_desired_status` 恢复原状态并清除 `archived_by_migration`。
+   - 数据还原并移除步骤 ④ 的新唯一索引后，可无损执行 `alembic downgrade` 退回旧 schema。
+2. **阶段二：切换后已运行并产生新业务数据（或后续产生无 `ticker` 不可变发布归档）后的应用回退**：
+   - 由于 `dalton_publications` 受 `trg_dalton_pub_immutable` 保护不可删改，一旦未来写入无 `ticker` 归档行便不能恢复旧 `d027` 严格约束；此阶段回退采用 **「应用层回退 + 保留兼容 schema」**——不执行 `alembic downgrade`，保留 `d041` 兼容列（过渡期双写镜像 `owner_user_id = lead_analyst_user_id`）与放宽后的约束，仅通过回滚脚本切换任务启停状态与功能开关。
 
 ---
 
 ## 5. 分阶段实施计划
 
-遵循 `AGENTS.md`「先用真实端到端调用验证，稳定后再用单测锁死契约」与多 worker 并发安全（状态真源在 Postgres + 行锁/advisory lock，零进程内可变状态）原则，分 4 个阶段推进：
+遵循 `AGENTS.md`「先用真实端到端调用验证，稳定后再用单测锁死契约」与多 worker 并发安全原则推进：
 
-| 阶段 | 范围 | 核心验证与测试要点 | 主要风险与缓解措施 |
+| 阶段 | 范围 | 核心验证要点 | 主要风险与缓解措施 |
 |---|---|---|---|
-| **Phase 1：数据模型、权限底座与迁移脚本** | 1. 编写迁移 `d041`（`dalton_coverage_units` 改造、`dalton_coverage_followers` 新表、`d027` 未上市公司约束放宽、发布表署名列、跟踪任务唯一索引）；<br>2. 重构 `database/coverage_units.py`、`coverage/units.py`、`unit_errors.py`、`app/router.py` 与 `dalton_coverage_unit` 工具（支持关注/取关、主分析师转交、写权限绑定）；<br>3. 实现 `migrate_coverage_follows_company.py`（支持 `--dry-run` / `--apply` / `--rollback`）。 | - 在本地/预发栈跑通 `alembic upgrade` → `dry-run` → `apply` → `rollback` → `re-apply` 闭环；<br>- 真实 API 验证：内部同事 A 建 Anthropic（无 ticker）工作区并登记覆盖单元，同事 B 重复登记收到 409 并一键关注，外部用户 `external` 访问被 403 拦截；<br>- 跑通 `scripts/dalton/check_hooks.sh --strict --audit`。 | **风险**：存量同名港股（`0700.HK` vs `700.HK`）漏合并。<br>**缓解**：在迁移与写入入口统一走 `ticker_key` 规范化函数并由唯一索引兜底。 |
-| **Phase 2：单次执行跟踪、财报日历与关注者推送扇出** | 1. 改造 `autonomy/tracking.py`、`schedule.py`、`classification.py`、`preflight.py`、`probes/*` 实现工作区级单套跟踪任务与关注者最高档位（Core/Watch）动态联动，补齐未上市公司议程巡检；<br>2. 改造 `coverage/service.py` 将 `dalton-earnings-calendar` 收敛为团队单实例，日历查询接口按关注过滤；<br>3. 改造 `notify/dispatch.py:on_automation_settled` 按 `dalton_coverage_followers` 扇出推送；<br>4. 改造 `autonomy/board.py`、`units_view.py`、`system_jobs.py`、`workflows/company_routing.py`。 | - 端到端触发一次公司 `watch`/`move-up` 与财报 `earn-t0` 结算，验证：LLM 仅跑 1 次，关注者 A、B 各自收到飞书/Discord 私信，共同配置的飞书群严格只收到 1 张卡片，未关注的 C 与关闭通知开关的 D 不收到推送；<br>- 运行 `scripts/multiworker_gate/` 验证多 worker 并发启停跟踪与投递去重无竞态；<br>- 稳定后补齐分类器、档位聚合与扇出去重的契约单测。 | **风险**：取消关注导致最后一位 Core 用户离开时误停仍在运行中的轮次。<br>**缓解**：档位重算仅更新 `automations` 下次 cron/status，绝不中断正在执行的 `automation_executions`。 |
-| **Phase 3：共享工作区个人定时任务并存 & 报告署名/审批修复** | 1. 接入 3 处上游钩子（`lifecycle.py`、`automation_executor.py`、`approvals.py`），放行有 `rw` 写共享权限的同事在同一正本工作区创建、运行归属本人的 `personal` 定时任务，并在权限撤回时 fail-closed；<br>2. 改造 `publish/service.py` 与 `publish/files.py`：修复非 PM 工作区无法被 PM 审批发布的阻塞，落地报告横幅与归档表中的「主分析师」署名。 | - 真实调用验证：工作区属主 A 开启 `rw` 共享后，同事 B 在该工作区通过 Web / Agent 创建个人定时任务并成功触发（线程归属 B、扣费归 B、A 无法改删 B 的个人任务；A 将共享降回 `ro` 后 B 的任务下次触发自动阻断）；<br>- 研究员提交 Anthropic 与 NVDA 报告，PM 跨人审批通过，核验归档 Markdown 横幅正确渲染 `主分析师`。 | **风险**：放开共享工作区自动化后越权操作他人任务。<br>**缓解**：`automations` 写删仍强校验 `automation.user_id == caller_user_id`，仅工作区准入校验改为 `need="write"`。 |
-| **Phase 4：前端交互升级与默认开关切换** | 1. Web 前端覆盖面板、侧栏工作区树与设置页适配「我关注的 / 全部团队覆盖」双视图、关注按钮、主分析师标签与转交弹窗；<br>2. 将 `src/dalton/dalton.yaml` 中 `coverage_units.enabled` 默认切为 `true`，清理旧启发式兼容分支与废弃的 `owner_user_id` 镜像写入。 | - `cd web && pnpm typecheck && pnpm test` 及 Playwright 关键路径验证；<br>- `make lint` 全栈静态检查通过。 | **风险**：前后端发布窗口期的短暂字段兼容。<br>**缓解**：后端 API 在过渡期同时保留 `lead_analyst_user_id` 与兼容别名字段 `owner_user_id`（值等于 `lead_analyst_user_id`）。 |
+| **Phase 1：兼容 Schema、领域底座与预检干跑** | 1. 编写兼容迁移 `d041`（加兼容列、建 `dalton_coverage_followers`、放宽 `d027`/`d035` 约束、加异动 `unit_id` 去重索引，**不建覆盖单元与跟踪任务唯一索引，不暂停现有任务**）；<br>2. 实现 `coverage/units.py`（同事务保存点 + 409 引导、`ticker_key` 规范化、写权限转交）、`workspace.py` 行锁软删守卫、`automation_recycle.py` 迁移归档保护；<br>3. 实现 `migrate_coverage_follows_company.py --dry-run`。 | - 预发环境执行 `alembic upgrade` 与 `--dry-run`，输出实测规模、可见性扩大工作区清单与同名候选组；<br>- 真实调用验证并发登记保存点回退与 409 返回、工作区软删行锁拦截；<br>- 跑通 `scripts/dalton/check_hooks.sh --strict --audit`。 | **风险**：`BRK-B`/`BRK.B` 或港 A 代码异写漏归一。<br>**缓解**：读写入口与预检脚本共用单一 `normalize_ticker_key`。 |
+| **Phase 2：受管单次执行、财报日历、可恢复扇出与共享个人任务** | 1. 改造 `classification.py`（仅认受管元数据，去前缀兜底）、`tracking.py`、`schedule.py`（受管排期入口）、`preflight.py`（系统绑定校验 + 保留筛选组刷新 + 无 ticker 议程探针）、`price_trigger.py`；<br>2. 改造 `settlement.py` 与 `notify/dispatch.py`（同事务投递计划标记、禁带 report profile、群目标规范化合并与多订阅者重检、周历按人筛选）；<br>3. 接入 `lifecycle.py`、`automation_executor.py`、`knowledge/service.py` 共享写权限与固定线程归属校验；<br>4. 更新 `dalton-earnings-calendar` 等 6 个技能提示面文件及 `board.py`、`units_view.py`、`company_routing.py`。 | - 在测试正本工作区端到端跑通 `watch`/`move-up`/`earn-t0` 与团队 `dalton-earnings-calendar`（核验筛选组刷新、Watch 股 `T0` 排期、群合并发送及单人关通知后群仍正常送达）；<br>- 验证共享工作区内同事 B 创建 `dalton-<slug>-custom` 个人任务：归属 `personal`、不扇出给关注者、固定线程归 B、撤回 `rw` 后自动阻断；<br>- 运行 `scripts/multiworker_gate/`。 | **风险**：结算后进程崩溃丢通知或误走 report profile 早退。<br>**缓解**：结算同事务写待规划状态由重试器兜底；受管编排入口硬禁写入 report profile。 |
+| **Phase 3：生产切换窗口、建唯一索引与前端默认开启** | 1. 按 §4.3 执行切换窗口：停旧写入 → 备份与归并（单元、关注者、有效 `sector` 文档、`cross_unit_requests`、任务状态继承与软归档、历史副本标记）→ 建三个唯一索引 → 启用新写入；<br>2. Web 前端适配「我关注的 / 全部团队覆盖」视图、关注开关与主分析师转交；<br>3. `dalton.yaml` 将 `coverage_units.enabled` 默认切为 `true`。 | - 预发完整演练 `apply` → 阶段一回滚 → `re-apply` 闭环，核验 `paused_by_user`、`replaced_by_tracker` 与已完成财报窗口无误重跑；<br>- `cd web && pnpm typecheck && pnpm test` 与 `make lint` 全量通过，稳定后补齐核心契约单测。 | **风险**：切换窗口存在在途执行或未上市公司漏归组。<br>**缓解**：等待在途执行自然结算；未上市及启发式候选强制经 `--manifest` 人工确认。 |
+| **后续阶段（首期不含）：正式发布跨人审批与报告署名** | 打通 `publish/service.py` 跨人恢复（`L1294`）、非属主待审批交接（`L2109`）、PM 跨人审批（`L2289`）、无 `ticker` 公司归档写入（消除 `L1549` 伪 ticker 并放开 `publications.py:235`），在申请创建时快照记录 `lead_analyst_user_id` 并在 `publish/files.py` 渲染署名横幅。 | - 非 PM 研究员在正本工作区提交上市/未上市公司报告，PM 跨人审批归档，核验中途转交主分析师不篡改在途申请署名快照。 | 与首期覆盖重构解耦，控制首期变更面。 |
 
 ---
 
 ## 6. 待用户决定的问题（共 5 项）
 
-以下 5 个问题涉及团队协作策略与产品体验取舍，代码层面均已设计好支持路径，请确认最终产品口径：
-
 ### 问题 1：正本工作区在绑定覆盖单元后的「默认共享权限」
-当某成员将一个私有工作区（`dalton_workspace_sharing` 默认 `web_access='hidden', cos_access='ro'`）绑定为团队唯一的公司/行业覆盖单元时，其他关注者需要阅读其中的知识层与报告。默认共享级别应如何设置？
-- **选项 A（推荐）**：**自动保底升级为团队全员只读（`web_access='ro', cos_access='ro'`）**；若需要多位同事共同在工作区内改模型、写草稿或建个人定时任务，再由工作区属主/主分析师/PM 将共享切为可写（`rw`）。*理由：既保证任何关注者订阅后都能立即查看正本工作区成果，又防止其他成员误改核心估值模型与未定稿草稿。*
-- **选项 B**：绑定为团队覆盖单元后，默认对全体内部成员开放可写（`web_access='rw', cos_access='rw'`）。
+当私有工作区（默认 `web_access='hidden', cos_access='ro'`）被绑定为团队覆盖单元正本时，默认共享级别如何设置？
+- **选项 A（有条件推荐）**：**新建或主动登记为团队正本工作区时，若 `web_access == 'hidden'` 默认提升为 Web 只读（`web_access='ro'`），并保留已有的 CoS 共享权限不变**；但由于工作区只读会同时暴露其中的草稿与沙箱文件（范围大于仅订阅通知结论），**存量迁移时在 `--dry-run` 预检名单中明确列出所有将扩大可见范围的私有工作区，经确认后再执行**。多人共同改模型或建个人定时任务时再按需开启 `'rw'`。
+- **选项 B**：绑定后默认对全体内部成员开放可写（`web_access='rw', cos_access='rw'`）。
 
-### 问题 2：存量合并时「非正本」重复工作区的历史资料处置
-对于团队内目前已存在 2 个以上个人工作区的同一家公司（如两位同事各有一个 Anthropic 工作区），选出唯一正本工作区后，其余非正本工作区应如何处理？
-- **选项 A（推荐）**：**自动评分选正本（支持迁移前人工清单覆写）+ 非正本工作区原位归档保留**（自动停掉其重复跟踪任务、重命名为 `<原名>（个人历史副本）`、原属主自动转为正本关注者，由本人按需将有价值的草稿手动搬入正本工作区，**不自动拷贝合并文件与知识文档**）。*理由：两份独立撰写的 `thesis.md` 或同名估值脚本若机械合并极易产生语义冲突或互相覆盖，原位只读保留最安全、100% 可回滚。*
-- **选项 B**：在选项 A 基础上，迁移脚本自动把非正本工作区的文件复制到正本工作区的 `legacy_imports/<username>/` 子目录下，并将非正本工作区隐藏。
+### 问题 2：存量合并的正本选择与「非正本」重复工作区处置
+对于团队内已存在多个个人工作区的同一家公司（如两位同事各有一个 Anthropic 工作区），如何选正本及处置副本？
+- **选项 A（推荐）**：**精简规则选正本（人工清单 > 已有正式报告或研究资料 > 已绑单元与创建时间稳定排序；多份候选均有正式发布报告时强制人工指定；未上市及同名归组仅作候选经人工清单确认）+ 非正本工作区保留原名与原文件，写入显式历史副本标记（`config.dalton_historical_duplicate_of`）供路由、看板与跟踪发现过滤**，重复标准跟踪任务软归档（免除 30 天物理清理），原属主自动转为正本关注者。
+- **选项 B**：在选项 A 基础上，由脚本自动把非正本工作区文件复制到正本工作区的 `legacy_imports/<username>/` 子目录下。
 
 ### 问题 3：标准跟踪任务（Watch / Delta / 异动 / 财报窗口）的预算归属
-重构后同一覆盖单元的标准跟踪任务全队只跑一份、结果推给所有关注者，其 LLM Token 消耗应计入哪个预算池？
-- **选项 A（推荐）**：**计入公司公共预算池（`system:dalton-company`）**，而个人自建定时任务（`scope='personal'`）与个人对话仍计入创建者本人日额度。*理由：标准跟踪属于全队共享基础设施；若扣主分析师个人额度，一旦主分析师当天跑深度研究耗尽个人日限额，会导致全队订阅的晚间财报快评或异动归因被预算门禁熔断，且转交主分析师时无需迁移底层任务属主。*
-- **选项 B**：计入当前主分析师（`lead_analyst_user_id`）的个人日额度，转交主分析师时同步迁移底层跟踪任务的计费属主。
+重构后全队只跑一份的标准跟踪任务，其 LLM Token 消耗计入哪个预算池？
+- **选项 A（推荐）**：**计入公司公共预算池（`system:dalton-company`）**，个人定时任务（`scope='personal'`）与个人对话计入创建者本人额度。*前置条件：同步打通系统身份在预检、执行器、知识写工具与分类器中的受管白名单；若希望分步降低首次上线耦合，也可先保留既有执行身份跑通单实例与关注者扇出，随后平滑切换至 `system:dalton-company`。*
+- **选项 B**：长期计入当前主分析师个人日额度，转交主分析师时同步迁移底层任务属主。
 
 ### 问题 4：尚未建工作区的「轻量观察股 / 动态筛选组」与覆盖单元的边界
-目前 `d015` 的 `dalton_coverage` 包含动态筛选规则组（`dalton_coverage_groups`）与大量仅看财报日历、尚未建立独立研究工作区的 Watch 股票（如种子表中的 78 只 Watch 股）。它们是否也要全部建为 `dalton_coverage_units`？
-- **选项 A（推荐）**：**双层协同——正式覆盖进 `dalton_coverage_units`，纯观察股保留 `dalton_coverage`**。凡是团队立项研究的主体（无论上市公司、Anthropic 等未上市公司还是行业，支持先登记关注、后绑定工作区）统一进入 `dalton_coverage_units` + `dalton_coverage_followers`；动态筛选组筛出的纯观察股继续留在个人 `dalton_coverage` 中，一旦某只股票被登记为团队覆盖单元，两者通过 `unit_id` 自动双向同步关注状态。*理由：避免筛选器一次扫出的上百只边缘观察股淹没团队正式覆盖目录。*
-- **选项 B**：彻底废弃 `dalton_coverage` 表，所有观察股与筛选组命中标的均自动创建未绑定工作区的 `dalton_coverage_units` 行。
+`d015` 的 `dalton_coverage` 含有多筛选组命中股与大量尚未建工作区的纯观察股，是否全部迁入 `dalton_coverage_units`？
+- **选项 A（推荐）**：**采用双层模型，仅保留单向自动关注**。正式研究主体进入 `dalton_coverage_units` + `dalton_coverage_followers`；动态筛选组与纯观察股保留在个人 `dalton_coverage`（完整保留一票多筛选组及独立过期标记）。存量迁移时一次性导入已有关注关系；首期日常仅保留「往观察池新加入已覆盖代码 ⇒ 自动关注单元」单向联动，避免手动取关后被筛选组刷新重新加回。
+- **选项 B**：废弃 `dalton_coverage` 表，所有筛选组命中标的均自动创建未绑工作区的团队覆盖单元。
 
-### 问题 5：主分析师（Lead Analyst）转交权限与写权限联动
-谁有权发起主分析师转交，以及当新任主分析师此前对该正本工作区没有写权限时应如何处理？
-- **选项 A（推荐）**：**当前主分析师、正本工作区属主或 PM（`admin`）均可直接将主分析师转交给任意内部成员（`internal`/`admin`）**；转交生效时自动将新主分析师加入 `core` 关注者，且**主分析师身份自带对该正本工作区的写权限**（无需再把工作区对全员开成 `rw`）。*理由：既避免为了给新主分析师写权限而被迫向全员开放 `rw`，又确保主分析师交接后能立即更新知识层与提交署名报告。*
-- **选项 B**：必须由新主分析师先点击确认「接受转交」后才生效，且工作区写权限仍只能通过工作区全局 `rw` 共享开关授予。
+### 问题 5：主分析师（Lead Analyst）转交范围与写权限机制
+主分析师转交是否需要自动改写工作区权限或增加接受确认流？
+- **选项 A（推荐）**：**首期采用直接转交（无确认流），但仅允许转交给已对该正本工作区具备写权限的内部成员（`internal`/`admin`），关注档位由接收人自行决定**。*演进约束：若后续阶段希望「主分析师身份自带正本工作区写权限（无需先给其开 `rw`）」，必须在 `require_workspace_access`（`src/dalton/sharing.py` / `auth.py`）这一唯一权限咽喉点增加一条 `OR` 分支统一继承，切勿散落在各调用点修补，也不要在转交时把工作区全局共享强行改成全员 `rw`。*
+- **选项 B**：引入待接收人点击「接受转交」确认状态机，并在转交时自动将工作区全局共享切为全员 `rw`。
