@@ -2411,6 +2411,18 @@ async def decide(
     try:
         if not is_dalton_automation(automation):
             return None
+        try:
+            from src.dalton.notify.dispatch import retry_failed_notify_deliveries
+
+            await asyncio.wait_for(
+                retry_failed_notify_deliveries(
+                    limit=5,
+                    max_duration_s=PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
+                ),
+                timeout=PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S,
+            )
+        except Exception:
+            pass
         raw_user_id = automation.get("user_id")
         if not raw_user_id or not str(raw_user_id).strip():
             logger.warning(
@@ -2424,18 +2436,6 @@ async def decide(
                 reason="missing_user_id",
                 signals=[],
             )
-        try:
-            from src.dalton.notify.dispatch import retry_failed_notify_deliveries
-
-            await asyncio.wait_for(
-                retry_failed_notify_deliveries(
-                    limit=5,
-                    max_duration_s=PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
-                ),
-                timeout=PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S,
-            )
-        except Exception:
-            pass
         try:
             res = await preflight_check(automation, execution_id)
         except (HTTPException, PermissionError, ValueError) as exc:
