@@ -39,7 +39,12 @@ from typing import TYPE_CHECKING, Literal
 
 import structlog
 
-from ptc_agent.core.sandbox.providers._proc_sh import EXEC_MARK, PROC_SH, ps_start_sh
+from ptc_agent.core.sandbox.providers._proc_sh import (
+    EXEC_MARK,
+    HOLD_AWAKE_SH,
+    PROC_SH,
+    ps_start_sh,
+)
 from ptc_agent.core.sandbox.runtime import ExecResult
 
 if TYPE_CHECKING:
@@ -325,7 +330,8 @@ _PRUNE_SH = _LEFT_SH + (
 # own ``exit`` still reaches the exit write, with no arguments and none of the
 # wrapper's variables. Both records are written in place, one short write
 # each: a reader takes an empty pid record for a job still launching, and an
-# exit code still being written for one still running.
+# exit code still being written for one still running. On a Mac the job holds
+# the machine awake while it runs (``HOLD_AWAKE_SH``).
 _WRAPPER_SH = (
     "__la_j=$1 __la_l=$2 __la_c=$3; "
     'if { read -r __la_s < "/proc/$$/stat"; } 2>/dev/null; then '
@@ -333,7 +339,8 @@ _WRAPPER_SH = (
     "else __la_s=$(" + ps_start_sh("$$") + "); fi; "
     'echo "$$ $__la_s" > "$__la_j/pid" || exit 1; '
     '[ ! -e "$__la_j/stop" ] || exit 1; '
-    f'export {EXEC_MARK}="$$-$__la_s"; '
+    + HOLD_AWAKE_SH
+    + f'export {EXEC_MARK}="$$-$__la_s"; '
     '( exec >> "$__la_l" 2>&1; set --; unset __la_j __la_l __la_s; '
     'eval "unset __la_c; $__la_c" ); '
     'echo $? > "$__la_j/exit"'
@@ -468,7 +475,11 @@ def launch_script(
         f"{_PRUNE_SH}{_paths_sh(ref)}"
         f'[ -d "$JD" ] && {have}: || mkdir -p "$JD" {" ".join(dirs)}\n'
         f"{files}"
-        f'if mkdir "$J"; then echo {stamp} > "$J/at"; '
+        # The launch that creates ``at`` started the job: a uutils mkdir
+        # reports success for a folder another launch made at the same moment.
+        # Its stamp is written after, so a write that fails (a full disk)
+        # still starts the job, as it did before.
+        f'if mkdir "$J" && (set -C && : > "$J/at"); then echo {stamp} > "$J/at"; '
         'printf "%s\\n%s\\n" "$L" "$T" > "$J/files"; : > "$L"\n'
         "if command -v setsid >/dev/null 2>&1; then "
         f"{_start_sh(spec, 'setsid ')}\n"
@@ -512,10 +523,11 @@ def stop_script(
 
     The mark goes first, so a wrapper that has not recorded itself yet finds
     it and never starts the command, and a launch still in flight finds the
-    id taken. The group is signalled only while it is proven the job's
-    (``psig``). ``trace`` prints the trace once the group is ended, as
-    ``trace_script`` does, and before ``discard`` removes it; without
-    ``discard`` it leaves the file, so the script stays safe to run twice.
+    id taken or starts a wrapper that finds the mark. The group is signalled
+    only while it is proven the job's (``psig``). ``trace`` prints the trace
+    once the group is ended, as ``trace_script`` does, and before ``discard``
+    removes it; without ``discard`` it leaves the file, so the script stays
+    safe to run twice.
     ``outbox`` prints the job's outbox once the group is ended, as the end's
     report does.
     """

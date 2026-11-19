@@ -667,7 +667,6 @@ async def test_feed_accepts_raw_script_status_and_default_list_stays_owner_scope
             status=None,
             limit=50,
             offset=0,
-            computer_id=None,
             include_deleted=False,
         )
         company_list.assert_not_awaited()

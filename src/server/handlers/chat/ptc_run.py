@@ -30,10 +30,12 @@ from src.server.database.user import get_user_profile_for_prompt
 from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
+from src.server.services.computer_usage.causes import computer_cause, turn_cause
 from src.server.services.history.window import runs_held
 from src.server.services.llm.claude_code import run_stamp
 from src.server.services.runs.pending_input import needs_resend, pending_input_stamp
 from src.server.services.runs.sse_producer import RunSSEProducer
+from src.server.services.turn_awake import held_awake
 from src.server.models.chat import (
     ChatRequest,
     serialize_hitl_response_map,
@@ -74,6 +76,7 @@ from src.server.utils.multimodal_context import (
 )
 
 from ptc_agent.agent.graph import build_ptc_graph_with_session
+from src.server.services.home_placement import HomeTurnStart
 from ptc_agent.agent.middleware.compaction.brief import BRIEF_CONFIG_KEY
 from ptc_agent.agent.middleware.credit_gate import run_with_credit_gate
 
@@ -101,11 +104,11 @@ from .request_prep import (
     turn_skill_names,
     turn_surface,
     user_skill_commands,
-    with_resolved_model,  # DALTON-HOOK(turn-row-model-line)
 )
-from src.server.contracts.turn_kinds import announced
+from src.server.contracts.turn_kinds import UNWATCHED_RUN_META, announced
 from src.server.services import automation_delivery, automation_settlement
 from src.server.services.credit_gate_port import build_run_credit_gate
+from src.server.services.metered_charges import charge_owed
 from src.server.services.report_back.handoff import carry
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
 from src.server.services.runs.admission import (
@@ -253,6 +256,10 @@ async def astream_ptc_workflow(
     connection alive from there (``SetupKeepaliveResponse``).
     """
     workspace_id = route.workspace_id
+    # The workspace whose computer and folder the turn runs in: Home's
+    # stand-in while the machine Home lives on can't be reached, else the
+    # thread's own. The thread, its admission and its records stay Home's.
+    runs_in = route.runs_in
     # DALTON-HOOK(colleague-dispatch): resolve workspace owner B and tail-turn / origin-channel metadata
     workspace_owner_id = str(
         (extra_configurable or {}).get("workspace_owner_id")
@@ -379,13 +386,17 @@ async def astream_ptc_workflow(
                 # neither a run nor a turn (v4 identity model); its content is archived
                 # on the owning response's metadata at finalize.
                 workspace_manager = WorkspaceManager.get_instance()
-                needs_startup = not workspace_manager.has_ready_session(workspace_id)
-                # When the workspace was evicted/restarted, any in-BTM LocalRunExecution for
-                # this thread holds a stale sandbox reference — cancel it first so
-                # admission/steering routes against live state only (this run isn't
-                # registered anywhere yet; its row commits at START, below).
-                if needs_startup:
-                    await manager.cancel_stale_workflow(thread_id)
+                needs_startup = not workspace_manager.has_ready_session(runs_in)
+                # When the workspace a running LocalRunExecution for this thread
+                # works in was evicted/restarted, it holds a stale sandbox reference;
+                # cancel it first so admission/steering routes against live state
+                # only (this run isn't registered anywhere yet; its row commits at
+                # START, below). Judged where that run works, not where this turn
+                # would: a Home turn in the stand-in lives on when Home comes back.
+                await manager.cancel_stale_workflow(
+                    thread_id,
+                    is_stale=lambda ws: not workspace_manager.has_ready_session(ws),
+                )
                 from src.server.services.thread_mutation import ThreadMutationRunner
 
                 # A send held behind a thread mutation (a /compact, the hand-off at a
@@ -418,11 +429,13 @@ async def astream_ptc_workflow(
                         request, dispatched=dispatched, steerable=steerable
                     ),
                     artifact_comments=request.artifact_comments,
+                    checked_computer_id=request.checked_computer_id,
                     additional_context=(
                         None if request.hitl_response else request.additional_context
                     ),
                     is_existing_colleague_thread=(workspace_owner_id != str(user_id)),
                     upload_claim_key=upload_claims.claim_key,
+                    on_model=(request.llm_model or None) if dispatched else None,
                 )
                 if held_by is None:
                     ready, steering_event = await admit()
@@ -432,6 +445,11 @@ async def astream_ptc_workflow(
                     yield _turn_held({"status": "released"})
                 if not ready:
                     # Steered: the running turn, or the turn it becomes, has it.
+                    # A hand-off naming a model steers only a turn running on
+                    # it, so the thread keeps that model as a turn it started
+                    # would.
+                    if dispatched and steering_event:
+                        await keep_named_model(thread_id, named_model)
                     upload_claims.mark_admitted()
                     await comments.admitted()
                     await scope.release_slot()
@@ -470,7 +488,9 @@ async def astream_ptc_workflow(
                 # /retry builds its attempt with no surface: it runs where the
                 # attempt it retries did, under the same rules.
                 request, inherits_rules = await retried_on_its_surface(request)
-                disk_free_mb, disk_known = await read_disk_notice(workspace_id)
+                # The attempts this turn may continue, read once for all it carries.
+                prior = await carry.prior_attempt(request, thread_id)
+                disk_free_mb, disk_known = await read_disk_notice(runs_in)
                 user_profile = (
                     await get_user_profile_for_prompt(user_id) if user_id else None
                 )
@@ -478,6 +498,9 @@ async def astream_ptc_workflow(
                 from src.dalton.user_locale import with_default_locale
 
                 user_profile = with_default_locale(user_profile)
+                home = await HomeTurnStart.read(
+                    user_id, route, retry=bool(request.retry_of_run_id)
+                )
                 turn_context = build_turn_context(
                     request,
                     prior_thread,
@@ -486,6 +509,9 @@ async def astream_ptc_workflow(
                     disk_known=disk_known,
                     inherits_rules=inherits_rules,
                     sent_at=start_time,
+                    carried_unwatched=carry.carried_unwatched(request, prior),
+                    home_away=home.away,
+                    home_back=home.back,
                 )
 
                 query_type, fork = _resolve_fork(request=request, thread_id=thread_id)
@@ -517,10 +543,6 @@ async def astream_ptc_workflow(
                 feedback_action = None
                 query_content = user_input
                 effective_model = config.llm.name if config and config.llm else None
-                # DALTON-HOOK(turn-row-model-line): the anchor row states the model
-                # the server resolved for this turn (the automation's llm_model, a
-                # client-named model, or the account default) as a settled fact.
-                turn_context = with_resolved_model(turn_context, effective_model)
                 # Off the resolved credential, not off ``is_byok``: that flag answers
                 # which ladder to try, and an automation with only an OAuth token
                 # passes it false while still paying its own vendor bill.
@@ -528,6 +550,7 @@ async def astream_ptc_workflow(
                 query_metadata = {
                     # The resolved one: a request may name a former Home row.
                     "workspace_id": workspace_id,
+                    **home.query_metadata(),
                 }
                 if effective_model:
                     query_metadata["llm_model"] = effective_model
@@ -548,7 +571,7 @@ async def astream_ptc_workflow(
                     turn_attachments = await resolve_turn_attachments(
                         request.additional_context, user_id
                     )
-                    await refuse_too_large(turn_attachments, user_id, workspace_id)
+                    await refuse_too_large(turn_attachments, user_id, runs_in)
                     # DALTON-HOOK(chat-large-upload): record ordered history attachment metadata for inline + chat_upload items
                     from src.dalton.services.chat_uploads import (
                         build_ordered_turn_attachment_metadata,
@@ -626,12 +649,12 @@ async def astream_ptc_workflow(
                 if (run_metadata or {}).get("automation_execution_id") and restart_drain.draining():
                     raise restart_drain.Draining()
                 origin_meta = await _resolve_origin_meta(request, thread_id)
-                carried = await carry.carried_pair(request, thread_id)
-                firing = await carry.carried_firing(request, thread_id)
+                carried = carry.carried_pair(request, prior)
+                firing = carry.carried_firing(request, prior)
                 # A resume or a retry names no automation run of its own: it sends for
                 # the one the turn it continues sent for.
                 if automation_delivery.delivery_of_turn(extra_configurable or {}) is None:
-                    sends_for = await carry.carried_delivery(request, thread_id)
+                    sends_for = carry.carried_delivery(request, prior)
                     if sends_for:
                         extra_configurable = {**(extra_configurable or {}), **sends_for}
                 # DALTON-HOOK(dispatch-delivery): restore automation execution identity on resumed firing turns
@@ -650,6 +673,7 @@ async def astream_ptc_workflow(
                             firing["automation_id"]
                         )
                     extra_configurable = updated_configurable
+
                 # DALTON-HOOK(automation-continuation-identity): take over firing inside START txn after FOR UPDATE lock on execution
                 async def _on_start(conn) -> None:
                     if turn_attachments:
@@ -687,11 +711,24 @@ async def astream_ptc_workflow(
                             inherits_rules=turn_context.inherits_rules,
                         ),
                         **automation_delivery.turn_metadata(extra_configurable),
+                        # Recorded once, here, either way: a restart's resume
+                        # reads it off the run, to keep one of a watched turn
+                        # watched, and a run without it predates the stamp.
+                        UNWATCHED_RUN_META: turn_context.unwatched,
                         **run_stamp(config),
+                        # Per attempt, since a retry or an automation's turn may
+                        # run another model than the turn's query row recorded.
+                        **({"llm_model": effective_model} if effective_model else {}),
                         **firing,
+                        **home.run_metadata(),
                         **(run_metadata or {}),
                     },
-                    in_start=_on_start if (turn_attachments or firing) else None,
+                    in_start=home.in_start(
+                        user_id,
+                        run_id,
+                        _on_start if (turn_attachments or firing) else None,
+                    ),
+                    runs_in=home.moved_off,
                 )
                 # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
                 if getattr(run_handle, "tail_turn_no_new_work", False):
@@ -720,6 +757,10 @@ async def astream_ptc_workflow(
         # =====================================================================
 
         token_callback, tool_tracker = init_tracking(thread_id)
+        # Whatever servers are configured now, so calls left by one the
+        # operator since turned off or removed are still charged; one indexed
+        # probe when nothing is owed.
+        await charge_owed(user_id, thread_id, workspace_id)
 
         # Runtime credit gate (None when platform gating is inactive): the
         # run's spend meter, lease, and refresher. Admission above is its
@@ -766,13 +807,21 @@ async def astream_ptc_workflow(
         # on server-restart cold starts (workspace running in Daytona but no
         # session in memory). The extra "starting/ready" SSE pair is harmless.
         # DALTON-HOOK(colleague-dispatch): acquire workspace session under workspace owner B's identity
+        turn_cause_name, turn_client = turn_cause(
+            getattr(run_handle, "origin", None),
+            platform=request.platform,
+            delegated=bool(getattr(request, "origin_home_thread_id", None)),
+        )
+        if (placement := home.frame()) is not None:
+            yield placement
         if not needs_startup:
-            session = await workspace_manager.get_session_for_workspace(
-                workspace_id,
-                user_id=workspace_owner_id,
-                skills_signature=skills_signature,
-                run_id=run_id,
-            )
+            with computer_cause(turn_cause_name, client=turn_client):
+                session = await workspace_manager.get_session_for_workspace(
+                    runs_in,
+                    user_id=workspace_owner_id,
+                    skills_signature=skills_signature,
+                    run_id=run_id,
+                )
         else:
             yield f"id: 0\nevent: workspace_status\ndata: {json.dumps({'status': 'starting', 'workspace_id': workspace_id})}\n\n"
 
@@ -790,15 +839,17 @@ async def astream_ptc_workflow(
                 state_event.set()
 
             # DALTON-HOOK(colleague-dispatch): acquire workspace session under workspace owner B's identity
-            session_task = asyncio.create_task(
-                workspace_manager.get_session_for_workspace(
-                    workspace_id,
-                    user_id=workspace_owner_id,
-                    on_state_observed=_on_state,
-                    skills_signature=skills_signature,
-                    run_id=run_id,
+            # The task copies the cause in; no yield may sit inside the block.
+            with computer_cause(turn_cause_name, client=turn_client):
+                session_task = asyncio.create_task(
+                    workspace_manager.get_session_for_workspace(
+                        runs_in,
+                        user_id=workspace_owner_id,
+                        on_state_observed=_on_state,
+                        skills_signature=skills_signature,
+                        run_id=run_id,
+                    )
                 )
-            )
 
             try:
 
@@ -825,8 +876,10 @@ async def astream_ptc_workflow(
                 if pending:
                     await asyncio.gather(*pending, return_exceptions=True)
 
+                # In the message: the default log format drops extras.
                 logger.info(
-                    "[WS_STATUS] state observation",
+                    f"[WS_STATUS] state observation workspace={workspace_id} "
+                    f"sandbox_state={state_box['value']}",
                     extra={
                         "workspace_id": workspace_id,
                         "sandbox_state": state_box["value"],
@@ -857,12 +910,12 @@ async def astream_ptc_workflow(
         if route.role == "chief_of_staff":
             # Home is often the workspace whose turn recreated the sandbox,
             # and its agent reads and edits the other workspaces' folders.
-            await workspace_manager.restore_sibling_folders(session, workspace_id)
+            await workspace_manager.restore_sibling_folders(session, runs_in)
 
         # Fire-and-forget: update workspace activity (conditional SQL, skip if <60s)
         _fire_and_forget(
-            update_workspace_activity(workspace_id),
-            name=f"update_activity_{workspace_id[:8]}",
+            update_workspace_activity(runs_in),
+            name=f"update_activity_{runs_in[:8]}",
         )
 
         registry_store = BackgroundRegistryStore.get_instance()
@@ -889,11 +942,12 @@ async def astream_ptc_workflow(
         inputs = await AgentInputs.read(
             session,
             user_id=user_id,
-            workspace_id=workspace_id,
+            workspace_id=runs_in,
             thread_id=thread_id,
             role=route.role,
             user_profile=user_profile,
             workspace_owner_id=workspace_owner_id,
+            acting_for=workspace_id,
         )
         project = inputs.project
         # One relay session per directly bound server, held for the run.
@@ -1182,8 +1236,7 @@ async def astream_ptc_workflow(
 
         # ``manager`` was acquired at the top of this handler for the early
         # steering-routing check; reuse it here. ``cancel_stale_workflow``
-        # already ran there (gated on ``needs_startup``) so steering routed
-        # against live state.
+        # already ran there so steering routed against live state.
 
         # Runs inside _finalize_run, before the terminal txn that records
         # what it captured.
@@ -1210,13 +1263,13 @@ async def astream_ptc_workflow(
                 # pass reads it under the folder hold, not from the turn start.
                 # DALTON-HOOK(colleague-dispatch): reconcile skills under workspace owner B's identity
                 await ws_manager.reconcile_skills_if_running(
-                    workspace_id, workspace_owner_id, source="post_turn"
+                    runs_in, workspace_owner_id, source="post_turn"
                 )
             try:
                 # Any project on the machine may have changed, not only this
                 # one: the sweep finds which, and mirrors those.
                 await ws_manager.backup_changed_projects(
-                    workspace_id, session=session
+                    runs_in, session=session
                 )
                 # DALTON-HOOK(knowledge-reconcile): detect direct edits after mirror backup
                 # DALTON-HOOK(colleague-dispatch): pass storage_owner_id=workspace_owner_id and author user_id=user_id
@@ -1257,20 +1310,26 @@ async def astream_ptc_workflow(
                 project,
                 run_with_credit_gate(
                     credit_gate,
-                    # Relay sessions for direct tools open and close with the
-                    # run, in the run's task, not with this request's generator.
-                    direct_mcp.drive(
-                        handler.stream_workflow(
-                            graph=ptc_graph,
-                            input_state=input_state,
-                            config=graph_config,
-                            settled_results=cancelled_calls,
-                        )
+                    # A Mac the turn runs on stays out of idle sleep until the
+                    # turn ends, between its calls as well as in them.
+                    held_awake(
+                        lambda: getattr(getattr(session, "sandbox", None), "runtime", None),
+                        # Relay sessions for direct tools open and close with the
+                        # run, in the run's task, not with this request's generator.
+                        direct_mcp.drive(
+                            handler.stream_workflow(
+                                graph=ptc_graph,
+                                input_state=input_state,
+                                config=graph_config,
+                                settled_results=cancelled_calls,
+                            )
+                        ),
                     ),
                 ),
             ),
             metadata={
                 "workspace_id": workspace_id,
+                "runs_in": runs_in,
                 "user_id": user_id,
                 "sandbox_id": sandbox_id,
                 "sandbox": session.sandbox if session else None,

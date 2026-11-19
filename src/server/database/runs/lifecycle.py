@@ -44,6 +44,7 @@ from src.server.contracts.status import (
     is_restart_interrupted,
 )
 from src.server.database.claude_code_hosted import CLI_COMPUTER
+from src.server.database.home_workspace import STAND_IN_COMPUTER
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
 from src.server.database.runs.hook_jobs import is_unchanged_quiet
 from src.server.utils.pg_sanitize import SafeJson, normalize_uuid
@@ -176,7 +177,8 @@ class ProducerRecord:
     saved. ``reasoning_ms`` is None when nothing could time the main agent's
     thinking (a recovered run whose stream or checkpoint could not be read),
     so the row's facts stay unset. ``model_fallbacks`` are the main lane's
-    fallback ui records as streamed, kept only for a stopped or failed run,
+    notice ui records as streamed (model fallbacks, and Claude Code CLI
+    waits), kept only for a stopped or failed run,
     whose last step may never have committed its own. ``error_frame`` is the
     main lane's last error frame as streamed, kept only for a failed run.
     """
@@ -1215,7 +1217,8 @@ async def workspace_has_live_runs(cur, workspace_id: str) -> bool:
 
 async def computer_has_active_run(computer_id: str) -> bool:
     """Any live root run on any workspace bound to the computer, or whose
-    Claude Code CLI runs on it for a workspace on another (``CLI_COMPUTER``).
+    Claude Code CLI runs on it for a workspace on another (``CLI_COMPUTER``),
+    or that runs in Home's stand-in on it (``STAND_IN_COMPUTER``).
 
     The machine-scoped twin of ``workspace_has_active_run``, and a join rather
     than a counter column because a torn-down computer takes every project on it
@@ -1234,10 +1237,14 @@ async def computer_has_active_run(computer_id: str) -> bool:
                       ON t.conversation_thread_id = r.conversation_thread_id
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
                     WHERE r.status = 'in_progress'
-                      AND (w.computer_id = %s OR r.metadata @> %s)
+                      AND (w.computer_id = %s OR r.metadata @> %s OR r.metadata @> %s)
                 ) AS active
                 """,
-                (computer_id, Jsonb({CLI_COMPUTER: computer_id})),
+                (
+                    computer_id,
+                    Jsonb({CLI_COMPUTER: computer_id}),
+                    Jsonb({STAND_IN_COMPUTER: computer_id}),
+                ),
             )
             return (await cur.fetchone())["active"]
 

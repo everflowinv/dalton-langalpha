@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import { AlertCircle, ChevronRight, StopCircle, type LucideIcon } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { RollingText } from '@/components/ui/rolling-text';
 import { useNow } from '@/hooks/useNow';
 import { formatClock } from '@/lib/elapsed';
 import { cn } from '@/lib/utils';
@@ -38,6 +39,17 @@ export const RUN_HOVER = 'group/run cursor-pointer transition-colors hover:bg-(-
 export const RUN_FOCUS =
   'outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-(--color-focus-ring)';
 
+/**
+ * The control that opens a run, wrapped around its title. Its `::after`
+ * stretches over the nearest positioned box (the row), so the whole row is
+ * the way in while a second action there can still sit above it as a button
+ * of its own; a button wrapping that action could not. The ring is drawn on
+ * the row's rounded box, inside, since a group's rows sit in a fold that clips.
+ */
+export const RUN_OPEN_BUTTON =
+  'flex max-w-full min-w-0 cursor-pointer text-left outline-hidden after:absolute after:inset-0 after:rounded-lg after:content-[""] '
+  + 'focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-(--color-focus-ring)';
+
 /** The first line: what it was asked. */
 export const RUN_TITLE =
   'min-w-0 truncate text-[0.84375rem] font-medium leading-[1.3] text-(--color-text-primary)';
@@ -74,7 +86,7 @@ export const RUN_CLOCK = 'font-mono text-[0.71875rem] tabular-nums text-(--color
 export function ElapsedClock({ startedAt, className }: { startedAt?: number; className?: string }): React.ReactElement {
   const [seenAt] = useState(Date.now);
   const now = useNow(1000);
-  return <span aria-hidden className={cn(RUN_CLOCK, className)}>{formatClock(now - (startedAt ?? seenAt))}</span>;
+  return <RollingText aria-hidden className={cn(RUN_CLOCK, className)}>{formatClock(now - (startedAt ?? seenAt))}</RollingText>;
 }
 
 /** A group's one-line header: its icon in the avatars' column, how many, how

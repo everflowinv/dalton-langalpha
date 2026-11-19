@@ -8,12 +8,13 @@ that hand-off must find nothing to end rather than ending the user's turn.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
 
-from src.tools.secretary._commands import error_command
+from src.server.services.cancel_dispatch import cancel_workflow
+from src.tools.secretary._commands import error_command, verify_thread_owner
 from src.tools.secretary.chief_of_staff import chief_of_staff_threads
 from src.tools.secretary.tools import _STOPPING
 
@@ -29,11 +30,11 @@ _CANCELLED = {
 }
 
 
-async def _stop(cancel: AsyncMock, owner_err=None, **args) -> dict:
+async def _stop(cancel, owner_err=None, **args) -> dict:
     with (
         patch(
             "src.tools.secretary.tools.verify_thread_owner",
-            AsyncMock(return_value=owner_err),
+            create_autospec(verify_thread_owner, return_value=owner_err),
         ),
         patch("src.server.services.cancel_dispatch.cancel_workflow", cancel),
     ):
@@ -62,7 +63,9 @@ async def _stop(cancel: AsyncMock, owner_err=None, **args) -> dict:
 async def test_a_stop_it_cannot_aim_is_refused_before_anything_is_cancelled(
     args, error
 ):
-    cancel = AsyncMock(side_effect=AssertionError("nothing may be cancelled"))
+    cancel = create_autospec(
+        cancel_workflow, side_effect=AssertionError("nothing may be cancelled")
+    )
     payload = await _stop(cancel, **args)
 
     assert payload["success"] is False
@@ -71,7 +74,9 @@ async def test_a_stop_it_cannot_aim_is_refused_before_anything_is_cancelled(
 
 @pytest.mark.asyncio
 async def test_a_thread_the_user_does_not_own_is_not_stopped():
-    cancel = AsyncMock(side_effect=AssertionError("nothing may be cancelled"))
+    cancel = create_autospec(
+        cancel_workflow, side_effect=AssertionError("nothing may be cancelled")
+    )
     denied = error_command("thread not found or not owned by user", "call_1")
     payload = await _stop(cancel, owner_err=denied, thread_id=THREAD_ID)
 
@@ -83,7 +88,7 @@ async def test_a_thread_the_user_does_not_own_is_not_stopped():
 
 @pytest.mark.asyncio
 async def test_a_stop_names_its_run_and_tells_the_model_to_wait_for_the_report():
-    cancel = AsyncMock(return_value=_CANCELLED)
+    cancel = create_autospec(cancel_workflow, return_value=_CANCELLED)
     payload = await _stop(cancel, thread_id=THREAD_ID, run_id=RUN_ID.upper())
 
     cancel.assert_awaited_once_with(THREAD_ID, run_id=RUN_ID, by_user=False)
@@ -92,7 +97,7 @@ async def test_a_stop_names_its_run_and_tells_the_model_to_wait_for_the_report()
 
 @pytest.mark.asyncio
 async def test_without_a_run_id_the_stop_takes_whatever_the_thread_runs():
-    cancel = AsyncMock(return_value=_CANCELLED)
+    cancel = create_autospec(cancel_workflow, return_value=_CANCELLED)
     await _stop(cancel, thread_id=THREAD_ID, run_id="")
 
     cancel.assert_awaited_once_with(THREAD_ID, run_id=None, by_user=False)
@@ -100,13 +105,14 @@ async def test_without_a_run_id_the_stop_takes_whatever_the_thread_runs():
 
 @pytest.mark.asyncio
 async def test_a_run_that_already_finished_is_reported_not_stopped():
-    cancel = AsyncMock(
+    cancel = create_autospec(
+        cancel_workflow,
         return_value={
             "cancelled": False,
             "thread_id": THREAD_ID,
             "state": "already_finished",
             "message": "Run already finished; nothing to cancel.",
-        }
+        },
     )
     payload = await _stop(cancel, thread_id=THREAD_ID, run_id=RUN_ID)
 
@@ -120,8 +126,9 @@ async def test_a_run_that_already_finished_is_reported_not_stopped():
 
 @pytest.mark.asyncio
 async def test_a_cancel_failure_is_stop_failed():
-    cancel = AsyncMock(
-        side_effect=HTTPException(status_code=500, detail="Failed to cancel the turn.")
+    cancel = create_autospec(
+        cancel_workflow,
+        side_effect=HTTPException(status_code=500, detail="Failed to cancel the turn."),
     )
     payload = await _stop(cancel, thread_id=THREAD_ID)
 
@@ -132,14 +139,15 @@ async def test_a_cancel_failure_is_stop_failed():
 async def test_the_users_steers_never_reach_the_chief_of_staff():
     """They are the user's to resend; in a tool result the model would act on
     them or drop them."""
-    cancel = AsyncMock(
+    cancel = create_autospec(
+        cancel_workflow,
         return_value={
             "cancelled": False,
             "thread_id": THREAD_ID,
             "state": "already_finished",
             "message": "Run already finished; nothing to cancel.",
             "returned_steers": [{"content": "also cover bonds"}],
-        }
+        },
     )
     payload = await _stop(cancel, thread_id=THREAD_ID, run_id=RUN_ID)
 

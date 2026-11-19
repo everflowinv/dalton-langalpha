@@ -18,7 +18,7 @@ from src.server.database.computer import (
     set_computer_always_on as db_set_computer_always_on,
     set_computer_resource_tier as db_set_computer_resource_tier,
 )
-from src.server.database.home_workspace import is_home_row
+from src.server.database.home_workspace import is_reserved_row
 from src.server.database.workspace import (
     SANDBOX_STAMP_KEYS,
     duplicate_workspace_on_computer,
@@ -27,6 +27,7 @@ from src.server.database.workspace import (
 )
 from src.server.database.workspace_names import WorkspaceNameTaken, copy_name
 from src.server.models.computer import ComputerStatus
+from src.server.services.computer_usage.causes import computer_cause
 from src.server.services.computer_manager._types import ComputerBinding
 
 logger = logging.getLogger(__name__)
@@ -331,7 +332,7 @@ class WorkspaceEntitlementsMixin:
         source = await db_get_workspace(source_id)
         if not source or source.get("user_id") != user_id:
             raise ValueError(f"Workspace {source_id} not found")
-        if is_home_row(source):
+        if is_reserved_row(source):
             raise ValueError("Cannot duplicate Home")
 
         # Files only persist to the DB on stop/delete, so flush a running source
@@ -343,10 +344,11 @@ class WorkspaceEntitlementsMixin:
             # The request may land on a worker that has never served this
             # computer. Reconnect before taking the strict mirror so a copy
             # cannot silently fall back to stale persisted bytes.
-            await self.get_session_for_computer(
-                source_binding.computer_id,
-                user_id=user_id,
-            )
+            with computer_cause("duplicate"):
+                await self.get_session_for_computer(
+                    source_binding.computer_id,
+                    user_id=user_id,
+                )
             await self.backup_project_files(
                 source_id,
                 computer_id=source_binding.computer_id,

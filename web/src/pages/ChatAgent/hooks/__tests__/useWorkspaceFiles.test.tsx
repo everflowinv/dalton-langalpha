@@ -60,6 +60,44 @@ describe('useWorkspaceFiles', () => {
     expect(mockListFiles).toHaveBeenCalledWith('ws-1', '.', { autoStart: true, includeSystem: false });
   });
 
+  it('a background refresh never starts a stopped computer', async () => {
+    mockListFiles.mockResolvedValue({ files: [] });
+    const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    mockListFiles.mockClear();
+
+    await act(async () => {
+      await result.current.refreshInBackground();
+    });
+
+    expect(mockListFiles).toHaveBeenCalledTimes(1);
+    expect(mockListFiles).toHaveBeenCalledWith('ws-1', '.', { autoStart: false, includeSystem: false });
+  });
+
+  it("a user's refresh joining a background one still starts the computer", async () => {
+    mockListFiles.mockResolvedValue({ files: [] });
+    const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    mockListFiles.mockClear();
+
+    let release!: () => void;
+    mockListFiles.mockImplementationOnce(
+      () => new Promise((resolve) => { release = () => resolve({ files: [] }); }),
+    );
+    mockListFiles.mockResolvedValue({ files: ['a.md'] });
+
+    let both!: Promise<void[]>;
+    act(() => {
+      both = Promise.all([result.current.refreshInBackground(), result.current.refresh()]);
+    });
+    await act(async () => {
+      release();
+      await both;
+    });
+
+    expect(mockListFiles.mock.calls.map((c) => c[2].autoStart)).toEqual([false, true]);
+  });
+
   it('a burst of refreshes shares the fetch in flight plus one trailing fetch', async () => {
     mockListFiles.mockResolvedValue({ files: [] });
     const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'));
@@ -184,6 +222,78 @@ describe('useWorkspaceFiles', () => {
         await vi.advanceTimersByTimeAsync(7_000);
       });
       expect(result.current.error).toBe('Sandbox not available');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['the backup of a computer that did not answer', { kind: 'backup', unreachable: 'not_connected' }, { code: 'not_connected', backup: true }],
+    // A stopped workspace's listing is the backup too, and says so its own way.
+    ["a stopped workspace's backup", { kind: 'backup', unreachable: null }, null],
+    ['a live listing', { kind: 'live' }, null],
+  ])('says when it lists %s', async (_label, from, away) => {
+    mockListFiles.mockResolvedValue({ files: ['notes.md'], from });
+
+    const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.files).toEqual(['notes.md']);
+    expect(result.current.away).toEqual(away);
+  });
+
+  it('says the computer did not answer when no backup stood in, and asks again until it does', async () => {
+    vi.useFakeTimers();
+    try {
+      const error: Error & { response?: { status?: number; headers?: Record<string, string> } } = new Error('Service unavailable');
+      error.response = { status: 503, headers: { 'x-computer-unreachable': 'timeout' } };
+      mockListFiles.mockRejectedValue(error);
+
+      const queryClient = createFastRetryClient();
+      const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'), { queryClient });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(7_000);
+      });
+      expect(result.current.away).toEqual({ code: 'timeout', backup: false });
+
+      mockListFiles.mockResolvedValue({ files: ['back.md'] });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(result.current.files).toEqual(['back.md']);
+      expect(result.current.away).toBeNull();
+      // Never by starting the computer: that is a user's refresh.
+      expect(mockListFiles).not.toHaveBeenCalledWith('ws-1', '.', { autoStart: true, includeSystem: false });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('keeps asking for a backup listing past a poll the network dropped', async () => {
+    vi.useFakeTimers();
+    try {
+      const network = Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' });
+      mockListFiles
+        .mockResolvedValueOnce({ files: ['old.md'], from: { kind: 'backup', unreachable: 'not_connected' } })
+        .mockRejectedValueOnce(network)
+        .mockResolvedValue({ files: ['live.md'], from: { kind: 'live' } });
+
+      const queryClient = createFastRetryClient();
+      const { result } = renderHookWithProviders(() => useWorkspaceFiles('ws-1'), { queryClient });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(mockListFiles).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(mockListFiles).toHaveBeenCalledTimes(3);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(result.current.files).toEqual(['live.md']);
+      expect(result.current.away).toBeNull();
     } finally {
       vi.useRealTimers();
     }

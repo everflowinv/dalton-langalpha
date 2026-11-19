@@ -78,8 +78,12 @@ export type BoxAction =
   | { type: 'docChanged'; doc: string }
   | { type: 'listShown'; open: boolean; comments: readonly ArtifactComment[] }
   | { type: 'hover'; hover: PageHover | null }
-  /** A spot picked on the page at `path`, or words: a new draft's box opens on it. */
-  | { type: 'pick'; pick: PagePick; path: string; selected: boolean }
+  /**
+   * A spot picked on the page at `path`, or words: a new draft's box opens on
+   * it. The open draft's parts grown or shrunk by a modifier click (`extend`)
+   * keep its box and words instead, on the parts picked now.
+   */
+  | { type: 'pick'; pick: PagePick; path: string; selected: boolean; extend: boolean }
   /** A press on a pin opens its card. */
   | { type: 'pinPressed'; id: string }
   /** The chat brought a comment forward whose pin is in view. */
@@ -92,8 +96,13 @@ export type BoxAction =
   | { type: 'endDraft'; keepHover: boolean }
   /** A press on the page, as a click away does in a design tool. */
   | { type: 'pressAway' }
-  /** Esc in a draft, or its card's close in the list. */
+  /** A draft's close (its ×, its card's in the list): an empty one goes, words ask first. */
   | { type: 'leave' }
+  /**
+   * Esc in a draft: the top layer goes. The question over words written is
+   * the top one, so Esc keeps writing; else it closes as the draft's × does.
+   */
+  | { type: 'escape' }
   | { type: 'askDiscard' }
   | { type: 'keepWriting' }
   | { type: 'write'; text: string }
@@ -214,6 +223,11 @@ export function boxReducer(state: BoxState, action: BoxAction): BoxState {
     case 'hover':
       return { ...state, hover: action.hover };
     case 'pick': {
+      const open = state.open;
+      if (action.extend && open?.kind === 'draft' && open.draft.path === action.path) {
+        const grown: Draft = { anchor: action.pick.anchor, rect: action.pick.rect, path: open.draft.path, title: open.draft.title };
+        return { ...state, open: { ...open, draft: grown }, confirmDiscard: false };
+      }
       // Words already written move with the box to the new spot, and whether
       // they are for the agent and where with them; a new comment starts for
       // the agent, to the default.
@@ -255,8 +269,12 @@ export function boxReducer(state: BoxState, action: BoxAction): BoxState {
       if (state.open?.kind === 'card') return closeBox(state, state.open, true);
       return state;
     case 'leave':
-      // Words already written are not thrown away without asking.
-      return !state.text.trim() || state.confirmDiscard ? endDraft(state, false) : { ...state, confirmDiscard: true };
+      // Words already written go only by the question's own Discard: a second
+      // close does not answer it for the writer.
+      return !state.text.trim() ? endDraft(state, false) : { ...state, confirmDiscard: true };
+    case 'escape':
+      if (!state.text.trim()) return endDraft(state, false);
+      return { ...state, confirmDiscard: !state.confirmDiscard };
     case 'askDiscard':
       return { ...state, confirmDiscard: true };
     case 'keepWriting':

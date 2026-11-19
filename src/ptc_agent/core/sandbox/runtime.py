@@ -167,6 +167,18 @@ class PreviewInfo:
     process_local: bool = False
 
 
+class PreviewPortInUse(RuntimeError):
+    """The port asked for is held by something else on the computer. One
+    message for every place that finds it, since the agent reads it as the
+    preview tool's result and the routes answer it as their 409."""
+
+    def __init__(self, port: int) -> None:
+        super().__init__(
+            f"Port {port} is already in use on this computer. Choose another port."
+        )
+        self.port = port
+
+
 @dataclass
 class SessionCommandResult:
     """Result of a command executed in a background session."""
@@ -408,6 +420,14 @@ class SandboxRuntime(ABC):
         A no-op wherever the provider sees that use itself: Daytona counts
         traffic through its preview proxy, and Docker never stops on idle.
         """
+
+    async def hold_awake(self, seconds: int) -> bool:
+        """Keep the machine from idle sleep for ``seconds``, while work the
+        machine cannot see (a turn thinking between its calls) is under way.
+        False where the machine never sleeps on its own, so the caller stops
+        asking.
+        """
+        return False
 
     # -- Execution --
 

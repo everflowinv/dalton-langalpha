@@ -79,7 +79,6 @@ def _middleware(owner, ledger) -> BackgroundSubagentMiddleware:
         enabled=True,
         subagent_types={"general-purpose"},
         namespace_owner=owner,
-        subagent_models=None,
     )
 
 
@@ -334,7 +333,6 @@ async def test_a_torn_abort_with_nothing_to_recover_keeps_the_plain_contract():
         enabled=True,
         subagent_types={"general-purpose"},
         namespace_owner=FakeOwner(),
-        subagent_models=None,
     )
 
     async def _aborting_silent(_request):

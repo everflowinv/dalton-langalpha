@@ -454,6 +454,7 @@ async def begin_run(
     is_checkpoint_replay: bool,
     extra_run_metadata: Optional[dict] = None,
     in_start: Optional[Callable[[Any], Awaitable[None]]] = None,
+    runs_in: Optional[str] = None,
 ):
     """The one START-txn entrypoint: maps a ChatRequest onto the durable
     attempt chain — retries chain onto the failed run's turn, forked
@@ -473,7 +474,9 @@ async def begin_run(
     client leaving mid-START does not cancel: the run of a START whose
     request was cancelled is settled as stopped, message kept, once START
     is done. ``in_start`` runs inside that transaction too, on its
-    connection, for a write that must commit with the run or not at all."""
+    connection, for a write that must commit with the run or not at all.
+    ``runs_in`` is the workspace the turn runs in when not its thread's
+    (``refuse_moved_off``)."""
     from uuid import uuid4
 
     from src.server.services.runs.coordinator import (
@@ -561,8 +564,15 @@ async def begin_run(
                     user_id=user_id,
                     workspace_id=workspace_id,
                     then=in_start,
+                    runs_in=runs_in,
                 )
-                if request.request_key or request.steer_job_id or has_chat_uploads or in_start
+                if (
+                    request.request_key
+                    or request.steer_job_id
+                    or request.checked_computer_id
+                    or has_chat_uploads
+                    or in_start
+                )
                 else None
             ),
         ),
@@ -601,6 +611,7 @@ async def _start_checks(
     user_id: str | None = None,
     workspace_id: str | None = None,
     then: Optional[Callable[[Any], Awaitable[None]]] = None,
+    runs_in: Optional[str] = None,
 ) -> None:
     if request.request_key:
         await refuse_copy_read_as_steer(
@@ -608,6 +619,16 @@ async def _start_checks(
         )
     if request.steer_job_id:
         await claim_steer_or_refuse(conn, request.steer_job_id, run_id)
+    if then is not None:
+        await then(conn)
+    # After ``then``: a turn in Home's stand-in takes there the lock a
+    # removal of the stand-in's computer holds, which this read relies on.
+    if request.checked_computer_id:
+        from src.server.database.workspace import refuse_moved_off
+
+        await refuse_moved_off(
+            conn, thread_id, request.checked_computer_id, runs_in=runs_in
+        )
     # DALTON-HOOK(chat-large-upload): stamp used_at and clear expires_at atomically with START
     if not request.hitl_response and request.additional_context:
         from src.dalton.services.chat_uploads import (
@@ -626,8 +647,6 @@ async def _start_checks(
                 ),
                 conn=conn,
             )
-    if then is not None:
-        await then(conn)
 
 
 async def _settle_after_start(

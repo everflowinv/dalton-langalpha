@@ -384,7 +384,7 @@ async def _workspaces_delete(
             "workspace_id is required for delete action", tool_call_id
         )
 
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_reserved_row
     from src.server.database.workspace import get_workspace
 
     workspace = await get_workspace(workspace_id)
@@ -392,7 +392,7 @@ async def _workspaces_delete(
         return error_command("workspace not found", tool_call_id)
     # Refused before the card, so the user is never asked to approve a delete
     # that cannot happen.
-    if is_home_row(workspace):
+    if is_reserved_row(workspace):
         return error_command("Home cannot be deleted.", tool_call_id)
 
     # The card shows the name: an id alone cannot tell the user which
@@ -873,9 +873,11 @@ async def workspace_file_read_cos(
                 work_dir = owner_work_dir(live_ws)
                 previous_dirs = previous_dir_names_of(live_ws)
                 try:
-                    normalized, raw_bytes = await _read_contained_target(
+                    contained = await _read_contained_target(
                         sandbox, path, work_dir, previous_dirs
                     )
+                    # Upstream returns a ContainedFile (canonical path, bytes, stamp).
+                    normalized, raw_bytes = contained.canonical, contained.content
                 except HTTPException:
                     return error_command("file not found", tool_call_id)
 
@@ -1623,9 +1625,11 @@ async def workspace_file_copy_cos(
                 work_dir = owner_work_dir(live_ws)
                 previous_dirs = previous_dir_names_of(live_ws)
                 try:
-                    normalized, raw_bytes = await _read_contained_target(
+                    contained = await _read_contained_target(
                         sandbox, path, work_dir, previous_dirs
                     )
+                    # Upstream returns a ContainedFile (canonical path, bytes, stamp).
+                    normalized, raw_bytes = contained.canonical, contained.content
                 except HTTPException as e:
                     if e.status_code != 413:
                         return error_command("file not found", tool_call_id)

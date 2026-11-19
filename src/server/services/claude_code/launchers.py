@@ -17,9 +17,11 @@ from ptc_agent.agent.claude_code.machine_token import token_name
 from ptc_agent.agent.claude_code.sandbox_launcher import sandbox_launcher
 from ptc_agent.agent.claude_code.ssh_launcher import CLI_SLOT_WAIT_S, SSHLauncher
 from ptc_agent.config.agent import Admitted
+from ptc_agent.core.claude_code_clis import CliQueue
 from ptc_agent.core.sandbox.providers._ssh_transport import Link, Machine
 from ptc_agent.core.sandbox.providers.ssh import SSHProvider
 from src.llms.claude_code import ClaudeTurnFailed
+from src.server.services.computer_usage.causes import computer_cause
 
 from .cli_slots import computer_cli_slot
 from .hosted import OnOwn, Refused, cli_placement, cloud_runs_in
@@ -29,6 +31,12 @@ from .saved import refusal_stamp, refuse, stored_row
 
 if TYPE_CHECKING:
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
+
+#: How long a CLI started under ``attach_only`` (an idle compaction) waits
+#: for a slot on its computer: one taken by a turn or a subagent there is
+#: theirs, and a compaction that waited would send its summary request ever
+#: nearer the cache entry's expiry.
+BACKGROUND_CLI_SLOT_WAIT_S = 10.0
 
 
 class HostedCredential:
@@ -76,7 +84,7 @@ class HostedCredential:
 
 def turn_launcher(
     sandbox: PTCSandbox, *, computer_id: str | None, workspace_id: str | None, user_id: str, admitted: Admitted,
-    slot_wait_s: float | None = None,
+    slot_wait_s: float | None = None, queue: CliQueue | None = None,
 ) -> Launcher:
     """The launcher of a turn in ``sandbox``, in the workspace
     ``workspace_id`` on the computer ``computer_id``, by what admission let it
@@ -102,13 +110,18 @@ def turn_launcher(
     Either way the launcher keeps what the CLI reports of the Claude plan
     behind the credential it signed in with (``UserPlan``). ``slot_wait_s``
     is how long the CLI on a computer waits for a slot there, by default a
-    turn's.
+    turn's, or a background one's under ``attach_only``, and ``queue`` is
+    told while it waits.
     """
+    from src.server.services.computer_manager import attaching_only
+
+    if slot_wait_s is None:
+        slot_wait_s = BACKGROUND_CLI_SLOT_WAIT_S if attaching_only() else CLI_SLOT_WAIT_S
     if admitted.cli_computer is not None:
         picked = _PickedComputer(admitted.cli_computer, user_id, workspace_id)
         return _ssh_launcher(
             Machine(picked.link, picked.root), user_id=user_id, computer_id=admitted.cli_computer, saved=admitted.saved,
-            slot_wait_s=slot_wait_s,
+            slot_wait_s=slot_wait_s, queue=queue,
         )
     if not isinstance(sandbox.provider, SSHProvider):
         plan = UserPlan(user_id)
@@ -116,8 +129,8 @@ def turn_launcher(
         if cloud_runs_in() == "sandbox":
             return sandbox_launcher(
                 sandbox, identity=user_id, credential=credential, plan=plan,
-                cli_slot=partial(computer_cli_slot, computer_id) if computer_id is not None else None,
-                slot_wait_s=CLI_SLOT_WAIT_S if slot_wait_s is None else slot_wait_s,
+                cli_slot=partial(computer_cli_slot, computer_id, queue=queue) if computer_id is not None else None,
+                slot_wait_s=slot_wait_s,
             )
         return LocalLauncher(saved=credential, plan=plan)
     if computer_id is None:
@@ -129,23 +142,24 @@ def turn_launcher(
 
     return _ssh_launcher(
         Machine(link, lambda: sandbox.working_dir), user_id=user_id, computer_id=computer_id, saved=admitted.saved,
-        slot_wait_s=slot_wait_s,
+        slot_wait_s=slot_wait_s, queue=queue,
     )
 
 
 def _ssh_launcher(
-    machine: Machine[Link], *, user_id: str, computer_id: str, saved: str | None, slot_wait_s: float | None,
+    machine: Machine[Link], *, user_id: str, computer_id: str, saved: str | None, slot_wait_s: float,
+    queue: CliQueue | None,
 ) -> SSHLauncher:
     """The CLI on the own computer ``computer_id``'s ``machine``, signed in with
     the token kept there, or relayed the saved one where admission let it
     (``saved``), and telling the backend what it found of either."""
     token = ComputerToken(user_id, computer_id)
     return SSHLauncher(
-        machine, identity=user_id, token_file=token_name(computer_id), cli_slot=partial(computer_cli_slot, computer_id),
+        machine, identity=user_id, token_file=token_name(computer_id), cli_slot=partial(computer_cli_slot, computer_id, queue=queue),
         credential=token if saved else None, on_announced=token.announced, on_file_refused=token.file_refused,
         on_blocked=token.blocked, on_no_perl=token.no_perl, on_unsupported=token.unsupported,
         plan=UserPlan(user_id, computer_id),
-        slot_wait_s=CLI_SLOT_WAIT_S if slot_wait_s is None else slot_wait_s,
+        slot_wait_s=slot_wait_s,
     )
 
 
@@ -167,7 +181,9 @@ class _PickedComputer:
     computer, and one gone out of reach since admission, or since a link
     there, ends the turn saying so (``cli_computer_offline``). Each link
     counts as the computer's activity, so the idle sweep keeps one that runs
-    only other workspaces' CLIs."""
+    only other workspaces' CLIs. Under ``attach_only`` (an idle compaction)
+    the computer is used only while it runs: one not running raises
+    ``ComputerNotRunning``, and a link counts as no activity."""
 
     def __init__(self, computer_id: str, user_id: str, workspace_id: str | None) -> None:
         self.computer_id = computer_id
@@ -181,22 +197,25 @@ class _PickedComputer:
 
     async def link(self) -> Link:
         from src.server.database.computer import update_computer_activity
+        from src.server.services.computer_manager import ComputerNotRunning, attaching_only
 
         try:
             if self.machine is None:
                 self.machine = await self._dial()
             linked = await self.machine.link()
-        except ClaudeTurnFailed:
+        except (ClaudeTurnFailed, ComputerNotRunning):
             raise
         except Exception as e:  # noqa: BLE001
             raise ClaudeTurnFailed("cli_computer_offline", str(e) or type(e).__name__, name=self.name) from e
-        await update_computer_activity(self.computer_id)
+        if not attaching_only():
+            await update_computer_activity(self.computer_id)
         return linked
 
     async def _dial(self) -> Machine[Link]:
         from ptc_agent.core.project_context import context_without_project
         from src.server.database.computer import get_computer
         from src.server.models.computer import ComputerStatus as Lifecycle
+        from src.server.services.computer_manager._attach_only import refuse_start
         from src.server.services.workspace_manager import WorkspaceManager
 
         from .machine import machine_of
@@ -215,11 +234,14 @@ class _PickedComputer:
         if status not in RUNS_CLI:
             raise ClaudeTurnFailed("cli_computer_offline", f"the computer is {status}", name=self.name)
         if status != Lifecycle.RUNNING:
+            refuse_start(self.computer_id)
             # Out of the turn's workspace: a start lays out the bound one's
             # folder, which has no place on this computer.
-            await asyncio.get_running_loop().create_task(
-                WorkspaceManager.get_instance().wake_computer(self.computer_id, user_id=self.user_id),
-                context=context_without_project(),
-            )
+            with computer_cause("claude_code"):
+                wake_task = asyncio.get_running_loop().create_task(
+                    WorkspaceManager.get_instance().wake_computer(self.computer_id, user_id=self.user_id),
+                    context=context_without_project(),
+                )
+            await wake_task
             computer = await get_computer(self.computer_id) or computer
         return await machine_of(computer)

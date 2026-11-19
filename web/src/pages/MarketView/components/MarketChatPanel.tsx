@@ -24,6 +24,7 @@ import { MessageActionsProvider, type MessageActions } from '../../ChatAgent/com
 import { usePublishFile } from '../../ChatAgent/components/chatView/usePublishFile';
 import { useComposerGiveBack } from '../../ChatAgent/components/chatView/useComposerGiveBack';
 import { SubagentTelemetryContext, useHistoryTelemetry } from '../../ChatAgent/components/SubagentTelemetryContext';
+import { CliQueueLine } from '../../ChatAgent/components/CliQueueNotice';
 import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts/ChartSurfaceContext';
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { computerFolders } from '../../ChatAgent/utils/agentPaths';
@@ -40,7 +41,7 @@ import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTran
 // DALTON-HOOK(team-sharing): read-only access check for the seen cursor
 import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
-import { appendPathSuffix, getPreviewUrl, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
+import { appendPathSuffix, getPreviewUrl, previewFailure, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
 import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
 import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
@@ -367,11 +368,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         const url = appendPathSuffix(result.url, preview.path);
         setDialogPayload({ type: 'preview', preview: { ...preview, url, loading: false } });
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (previewPortRef.current !== preview.port) return;
         setDialogPayload({
           type: 'preview',
-          preview: { ...preview, url: '', loading: false, error: true },
+          preview: { ...preview, url: '', loading: false, error: previewFailure(err) },
         });
       });
   }, [activeWorkspaceId]);
@@ -434,7 +435,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     // interrupted / compaction status banners.
     pendingInterrupt,
     hasActiveSubagents,
-    workspaceStarting,
+    turnStatus: { workspaceStarting, cliQueue },
     isCompacting,
     setIsCompacting,
     compactionTokens,
@@ -925,6 +926,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
           compaction. Mirrors the indicators ChatView shows above its input. */}
       {((hasActiveSubagents && !isLoading)
         || workspaceStarting
+        || cliQueue
         || isCompacting
         || threadModel.retired
         || threadModel.lapsed
@@ -949,6 +951,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
               <span>{t(workspaceStarting === 'archived' ? 'chat.workspaceRestoring' : 'chat.workspaceStarting')}</span>
             </div>
           )}
+          {cliQueue && <CliQueueLine wait={cliQueue} />}
           {isCompacting && (
             <div style={bannerStyle('transparent')}>
               <span aria-hidden="true" style={{ flexShrink: 0 }}>

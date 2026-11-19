@@ -29,9 +29,10 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum, auto
 from functools import partial
 from itertools import pairwise
-from typing import Annotated, Any, TypeVar
+from typing import Annotated, Any, Literal, TypeVar
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -55,6 +56,7 @@ from langgraph.types import Command
 from typing_extensions import NotRequired
 
 from ptc_agent.agent.claude_code.cli import RuntimeSpec, connected, launch, received, turn_failure
+from ptc_agent.agent.claude_code.cli_waits import CliWaits
 from ptc_agent.agent.claude_code.compaction import (
     NO_RULES,
     CompactionRules,
@@ -68,7 +70,7 @@ from ptc_agent.agent.claude_code.compaction import (
 from ptc_agent.agent.claude_code.launcher import Launcher, Prepared
 from ptc_agent.agent.claude_code.mid_turn import AfterTool, BeforeTool, TaskSteering, TurnSteering, credit_stops
 from ptc_agent.agent.claude_code.plan import PlanWatch
-from ptc_agent.agent.claude_code.relay import ClaudeStreamRelay, anthropic_content
+from ptc_agent.agent.claude_code.relay import ClaudeStreamRelay, DeltaJoin, anthropic_content
 from ptc_agent.agent.claude_code.session import (
     ENDED,
     RULES_KEY,
@@ -114,6 +116,7 @@ from ptc_agent.agent.transcript.store import TranscriptTarget
 from ptc_agent.agent.prompts import release
 from src.llms.claude_code import MESSAGE_ID_KEY as CLAUDE_MESSAGE_ID
 from src.llms.claude_code import ClaudeTurnFailed, PlanStopped, another_model_replied_last, last_reply_index
+from src.llms.model_identity import CATALOG_MODEL_KEY
 from src.tools.secretary.approvals import StandingApprovalState
 
 TURN_KEY = "claude_turn"
@@ -198,7 +201,12 @@ class ClaudeCodeState(StandingApprovalState, MainAgentState):
     _claude_code_rules: NotRequired[dict[str, Any]]
 
 
-_END = object()
+class _End(Enum):
+    END = auto()
+
+
+#: The run's end, after its last event.
+_END = _End.END
 
 
 @dataclass(frozen=True)
@@ -208,6 +216,11 @@ class _Compacting:
 
     boundary: str | None = None
     error: str | None = None
+
+
+#: What the run's queue carries: the CLI's raw stream events, a compaction
+#: it makes, and the run's end.
+_Event = dict[str, Any] | _Compacting | Literal[_End.END]
 
 
 class _Message:
@@ -221,10 +234,12 @@ class _Message:
         self.restarted = False
         self._first = first
         self._run = run
+        self._join = DeltaJoin(run)
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
         item = self._first
         while True:
+            item = await self._join.grow(item)
             yield item
             if item.get("type") == "message_stop":
                 self.stopped = True
@@ -246,7 +261,8 @@ class _Run:
 
     def __init__(self, launcher: Launcher, prepared: Prepared, store: CheckpointSessionStore,
                  client: ClaudeSDKClient, results: ToolResults, spec: RuntimeSpec,
-                 before_tool: BeforeTool, after_tool: AfterTool, plan: PlanWatch, *, resumed: bool) -> None:
+                 before_tool: BeforeTool, after_tool: AfterTool, plan: PlanWatch, *, resumed: bool,
+                 sent_at: float | None = None) -> None:
         self.launcher = launcher
         self.prepared = prepared
         self.store = store
@@ -266,8 +282,18 @@ class _Run:
         #: The queries sent the CLI this run: the turn's own, then one for
         #: each time steers waited as the last ended.
         self.queries = 1
-        self._events: asyncio.Queue[Any] = asyncio.Queue()
-        self._held: dict[str, Any] | None = None
+        #: When the CLI was last handed something to send Claude (a query, or
+        #: the results of a batch) or reported itself started, on this
+        #: server's clock: the request it sends next starts after it.
+        self._input_at = time.time() if sent_at is None else sent_at
+        #: When the request behind the newest assistant message started, as
+        #: near as ``_input_at`` tells it: the input is stamped as this pump
+        #: reads it, so it errs late only by the read's delay, against
+        #: seconds to a minute of prompt processing that a stamp taken at the
+        #: response's start would err by.
+        self.last_request_at: float | None = None
+        self._events: asyncio.Queue[_Event] = asyncio.Queue()
+        self._held: _Event | None = None
         self._streamed: set[str] = set()
         self._assistant: dict[str, list[str]] = {}
         self._closing: asyncio.Future[None] | None = None
@@ -294,13 +320,14 @@ class _Run:
             results.resolve(answered)
         before_tool = BeforeTool(results, spec.waits)
         query = prompt if prompt is None or isinstance(prompt, str) else _user_message(prompt)
+        sent_at = time.time()
         prepared, client, after_tool = await launch(
             spec, pin, launcher, thread_key=thread_key, identity=identity, records=records, store=store,
             results=results, query=query, before_tool=before_tool, compact_at=compact_at, auto_compact=auto_compact,
             transcript_note=transcript_note, plan=plan,
         )
         return cls(launcher, prepared, store, client, results, spec, before_tool, after_tool, plan,
-                   resumed=bool((records or {}).get("session_id")))
+                   resumed=bool((records or {}).get("session_id")), sent_at=sent_at)
 
     @property
     def deferred(self) -> bool:
@@ -318,6 +345,7 @@ class _Run:
         self.plan.reopen()
         self.results.reopen()
         self.before_tool.reopen()
+        self._input_at = time.time()
         await self.client.query(prompt if isinstance(prompt, str) else _user_message(prompt))
         self._pump = asyncio.create_task(self._read())
 
@@ -339,6 +367,9 @@ class _Run:
             async for m in received(self.client, init_seen=self._init_seen):
                 if isinstance(m, SystemMessage) and m.subtype == "init":
                     self._init_seen = True
+                    # Its first request starts after this, not the launch's
+                    # wait for a CLI slot and the CLI's start.
+                    self._input_at = time.time()
                     if m.data.get("model") != self.model:
                         logger.warning("[ClaudeCode] the CLI would run %s in place of %s", m.data.get("model"), self.model)
                         raise ClaudeTurnFailed("model_unavailable", self.model)
@@ -354,6 +385,7 @@ class _Run:
                         if kind == "message_start":
                             self._streamed.add((m.event.get("message") or {}).get("id", ""))
                             self._stop_reason = None
+                            self.last_request_at = self._input_at
                         elif kind == "message_delta":
                             self._stop_reason = (m.event.get("delta") or {}).get("stop_reason")
                         await self._events.put(m.event)
@@ -370,6 +402,9 @@ class _Run:
                 elif isinstance(m, UserMessage):
                     blocks = [b for b in (m.content if isinstance(m.content, list) else []) if isinstance(b, ToolResultBlock)]
                     self.results.answered(blocks)
+                    if blocks and m.parent_tool_use_id is None:
+                        # The CLI records a batch's results as it sends them on.
+                        self._input_at = time.time()
                 elif isinstance(m, ResultMessage):
                     self.result = m
                     break
@@ -412,14 +447,27 @@ class _Run:
         finally:
             task.cancel()
 
-    async def next_event(self) -> Any:
+    async def next_event(self, *, within: float | None = None) -> _Event | None:
+        """The next event, waiting for it at most ``within`` seconds where
+        given, None where none came by then."""
         if self._held is not None:
             item, self._held = self._held, None
             return item
-        return await self._events.get()
+        if within is None:
+            return await self._events.get()
+        try:
+            return self._events.get_nowait()
+        except asyncio.QueueEmpty:
+            if within <= 0:
+                return None
+        try:
+            async with asyncio.timeout(within):
+                return await self._events.get()
+        except TimeoutError:
+            return None
 
-    def hold(self, item: dict[str, Any]) -> None:
-        """Keep an event read past the end of one message for the next."""
+    def hold(self, item: _Event) -> None:
+        """Keep an event read past the end of what it was read for, for the next read."""
         self._held = item
 
     async def next_message(self, compacting: Callable[[_Compacting], Awaitable[None]]) -> _Message | _Compacting | None:
@@ -578,13 +626,16 @@ class ClaudeTurn:
     when the session compacts and moves to this build's prompt and tools.
     ``steering`` takes in what is sent into the thread while the turn runs
     (``TurnSteering``), or into the task for a subagent's run (``TaskSteering``).
+    ``waits`` keeps the marks of its waits for one of its computer's CLIs,
+    which each step commits.
     """
 
     def __init__(self, spec: RuntimeSpec, launcher: Launcher, *, identity: str, thread_key: str,
                  checkpoint_ns: str = "", baseline: Baseline | None = None, compaction: CompactionRules = NO_RULES,
                  steering: SteeringMiddleware | TaskSteering | None = None,
-                 alert_senders: frozenset[str] = frozenset()) -> None:
+                 alert_senders: frozenset[str] = frozenset(), waits: CliWaits | None = None) -> None:
         self.spec = spec
+        self.waits = waits if waits is not None else CliWaits()
         self.launcher = launcher
         self.identity = identity
         self.thread_key = thread_key
@@ -751,13 +802,23 @@ class ClaudeTurn:
             update[BRIEF_KEY] = kept(brief)
             if "text" in brief:
                 self._brief_text = (brief["through"], brief["text"])
-        mark = handoff_mark(brief, to=self.spec.billing.get("manifest_model") or self.spec.model)
+        mark = handoff_mark(brief, to=self.spec.catalog_model)
         if all(record.get("id") != mark["id"] for record in state.get("ui") or []):
             update["ui"] = [mark]
             get_stream_writer()({"type": "context_window", "action": "brief", "signal": "complete", **mark["props"]})
         if (state.get("claude_session") or {}).get("session_id"):
             update["claude_session"] = ENDED
         return update
+
+    def reading(self, run: _Run) -> dict[str, Any]:
+        """The turn's rules as its end keeps them (``RULES_KEY``), with when
+        the request behind its last answer started (``requested_at``, epoch
+        seconds, None when the run streamed none), and the model and effort
+        it ran on: the session's newest cache entry lives from then, and only
+        a request on that model and effort reads it, which an idle compaction
+        does before it expires."""
+        return {**self.compaction.reading(), "requested_at": run.last_request_at, "model": self.spec.model,
+                "effort": self.spec.effort}
 
     async def ended(self, state: ClaudeCodeState, run: _Run) -> dict[str, Any]:
         """What the turn's end adds: the reply it ended on, under Stop,
@@ -943,7 +1004,8 @@ class ClaudeTurn:
 
     def commit(self, session: list[SessionWrite]) -> dict[str, Any]:
         """A step's session records, the first of its own carrying what the
-        session holds from then on that it did not before."""
+        session holds from then on that it did not before, and the marks of
+        the waits for a CLI ahead of it."""
         for write in session:
             if write["session_id"] != self._session:
                 self._session, self._owed = write["session_id"], self._fresh
@@ -951,7 +1013,9 @@ class ClaudeTurn:
                 write.update(self._owed)
                 self._owed = {}
         pin = self._fresh.get("pinned")
-        return {"claude_session": _pinned_after(session, pin, due=bool(pin) and not same_pin(pin, self.current_pin()))}
+        waited = self.waits.drain()
+        return {"claude_session": _pinned_after(session, pin, due=bool(pin) and not same_pin(pin, self.current_pin())),
+                **({"ui": waited} if waited else {})}
 
     def _baseline_due(self, state: ClaudeCodeState) -> tuple[str, str | None]:
         """The thread's baseline, unless Claude's session already holds its epoch."""
@@ -1118,13 +1182,16 @@ def build_claude_code_graph(
 
     async def model(state: ClaudeCodeState, config: RunnableConfig) -> Command:
         turn = _turn(config)
+        turn.waits.after = state["messages"][-1].id if state["messages"] else None
         opening = not turn.started
         if opening and (handed := await turn.hand_off(state, config)):
             return Command(update=handed, goto="model")
         if opening and (compacted := await turn._repin(state)):
             asked = state["messages"][-1].model_copy()
             turn.stamp(asked)
-            return Command(update={"claude_session": compacted, "messages": [asked]}, goto="model")
+            waited = turn.waits.drain()
+            return Command(update={"claude_session": compacted, "messages": [asked], **({"ui": waited} if waited else {})},
+                           goto="model")
         run = await turn.run(state)
         if opening:
             turn.steering.opened(state, config)
@@ -1150,7 +1217,7 @@ def build_claude_code_graph(
                 return Command(update={"messages": sent, **turn.commit(run.store.drain())},
                                goto="model" if turn.started else held[0])
             return Command(update={**turn.commit(run.store.drain()), **(await turn.ended(state, run)),
-                                   RULES_KEY: turn.compaction.reading()}, goto=END)
+                                   RULES_KEY: turn.reading(run)}, goto=END)
         relay = ClaudeStreamRelay(model_name=turn.spec.model, metadata=dict(turn.spec.billing), cache=False).feed(message.events())
         ai: AIMessage = await relay.ainvoke([], config)
         await run.complete(message)
@@ -1159,6 +1226,9 @@ def build_claude_code_graph(
         if ai.invalid_tool_calls:
             raise ClaudeTurnFailed("api_error", f"tool calls that did not parse: {[c.get('name') for c in ai.invalid_tool_calls]}")
         ai.response_metadata.setdefault("model_name", turn.spec.model)
+        # The resilience middleware stamps this on every other turn; a Claude
+        # Code turn never passes through it.
+        ai.response_metadata[CATALOG_MODEL_KEY] = turn.spec.catalog_model
         ai.response_metadata[CLAUDE_MESSAGE_ID] = message.id
         report_usage(ai, turn.compaction.threshold)
         uuids = run.assistant_records(message.id)
@@ -1219,7 +1289,7 @@ def build_claude_code_graph(
             steered.append(message)
         session = turn.commit(run.store.drain() if stop else run.store.drain(through=uuids))
         updates = [_given_instead(u, run.results, c) for c, t in zip(calls, tasks, strict=True) for u in t.result()]
-        rules = {RULES_KEY: turn.compaction.reading()} if stop else {}
+        rules = {RULES_KEY: turn.reading(run)} if stop else {}
         return _step(updates, {"messages": steered, **session, **rules}, stop or "model")
 
     async def resume(state: ClaudeCodeState, config: RunnableConfig) -> Command:

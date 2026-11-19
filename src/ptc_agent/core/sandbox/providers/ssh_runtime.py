@@ -42,6 +42,11 @@ from ptc_agent.core.sandbox.providers._ssh_authorized_key import (
 )
 from ptc_agent.core.sandbox.providers._exec_sessions import ExecSessionRuntime
 from ptc_agent.core.sandbox.providers._ssh_connect import SSHTarget
+from ptc_agent.core.sandbox.providers._ssh_root import (
+    folder_marked_message,
+    root_dir_error,
+    root_dir_script,
+)
 from ptc_agent.core.sandbox.providers._ssh_shell import (
     BOOT_KEY_SH,
     SUDO_CHECK,
@@ -50,13 +55,11 @@ from ptc_agent.core.sandbox.providers._ssh_shell import (
     computers_dir,
     delete_script,
     env_file,
-    folder_marked_message,
     framed_script,
+    hold_awake_script,
     layout_script,
     mark_running_script,
     read_state_script,
-    root_dir_error,
-    root_dir_script,
     stop_script,
 )
 from ptc_agent.core.sandbox.providers._ssh_pool import pool
@@ -366,6 +369,16 @@ class SSHRuntime(ExecSessionRuntime):
 
     async def get_state(self) -> RuntimeState:
         return await self._on_live_link(self._read_state)
+
+    async def hold_awake(self, seconds: int) -> bool:
+        """A Mac sleeps when left alone, and the turn's next call then finds it
+        gone. The hold is a timed ``caffeinate``, so one the server stops
+        renewing (a turn that ended, a server that died) lets go by itself."""
+        link = await self._link()
+        if link.facts is None or link.facts.os != "Darwin":
+            return False
+        await self._run(link, hold_awake_script(seconds))
+        return True
 
     async def _read_state(self, link: Link) -> RuntimeState:
         """Running only when marked so on the machine's current boot.
@@ -688,7 +701,7 @@ class SSHRuntime(ExecSessionRuntime):
                     link, script, computer_dir=d, timeout=timeout, root=root
                 )
             except ScriptLost as e:
-                pool().evict(link)
+                pool().evict(e.link)
                 raise SandboxTransientError(
                     f"Lost the connection to {self._target.host} while a command "
                     "ran; it may still be running there."

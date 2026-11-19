@@ -9,6 +9,7 @@ steps out of it until some later trigger.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -116,6 +117,21 @@ def test_a_run_end_asks_for_its_threads_archive_prune():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "error", "cancelled"])
+async def test_a_run_end_stamps_its_workspaces_activity(status):
+    """Only the start stamped the idle clock, so a turn longer than the idle
+    timeout ended on a machine the next sweep stopped."""
+    stamp = AsyncMock(return_value=True)
+    with patch(EXPORT), patch(
+        "src.server.database.workspace.update_workspace_activity", stamp
+    ):
+        _coordinator().post_finalize_tail("thread-1", _row(status))
+        await asyncio.sleep(0)
+
+    stamp.assert_awaited_once_with("ws-1")
+
+
+@pytest.mark.asyncio
 async def test_a_turns_usage_row_names_the_full_agent():
     """The turn's usage row lands as 'ptc' with no producer on the outcome."""
     handle = RunHandle(
@@ -185,3 +201,28 @@ async def test_a_detached_finalize_confirms_checkpointed_holds_before_its_cas():
         )
 
     assert order == [("confirm", "thread-1", "run-1"), "finalize"]
+
+
+@pytest.mark.parametrize(
+    "stamp, stamped",
+    [
+        ({}, "ws-1"),
+        # A Home turn in Home's stand-in ran there, on the stand-in's computer.
+        ({"user_id": "u-1", "stand_in_computer": "c-cloud"}, "stand-in"),
+    ],
+)
+def test_the_turn_end_stamps_activity_where_the_turn_ran(stamp, stamped):
+    from src.server.database.home_workspace import get_home_stand_in_id
+
+    row = _row("completed")
+    row["metadata"].update(stamp)
+    with (
+        patch(
+            "src.server.database.workspace.update_workspace_activity",
+            new=MagicMock(return_value="stamp"),
+        ) as stamp_activity,
+        patch("src.server.services.runs.coordinator.spawn_protected"),
+    ):
+        RunCoordinator()._schedule_activity_stamp(row)
+    expected = get_home_stand_in_id("u-1") if stamped == "stand-in" else stamped
+    stamp_activity.assert_called_once_with(expected)

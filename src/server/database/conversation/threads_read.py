@@ -15,7 +15,6 @@ from src.server.contracts.status import (
 )
 from src.server.database import pool
 from src.server.database.conversation import _sql
-from src.server.database.home_workspace import get_home_workspace_id
 from src.server.utils.pg_sanitize import like_escape, normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -123,7 +122,8 @@ _LATEST_ATTEMPT_LATERAL = """
                cr.cancel_requested_at AS latest_cancel_requested_at,
                cr.interrupt_reason AS latest_interrupt_reason,
                cr.run_seq AS latest_run_seq,
-               cr.created_at AS latest_run_started_at
+               cr.created_at AS latest_run_started_at,
+               cr.metadata->>'llm_model' AS latest_run_model
         FROM conversation_responses cr
         WHERE cr.conversation_thread_id = t.conversation_thread_id
         ORDER BY cr.run_seq DESC
@@ -133,7 +133,8 @@ _LATEST_ATTEMPT_LATERAL = """
 
 _LATEST_ATTEMPT_LATERAL_COLS = (
     "la.latest_run_id, la.latest_run_status, la.latest_cancel_requested_at, "
-    "la.latest_interrupt_reason, la.latest_run_seq, la.latest_run_started_at"
+    "la.latest_interrupt_reason, la.latest_run_seq, la.latest_run_started_at, "
+    "la.latest_run_model"
 )
 
 # Exact turn count for a paged row: conversation_queries is one-row-per-turn
@@ -249,13 +250,11 @@ async def get_threads_for_user(
     sort_by: str = "updated_at",
     sort_order: str = "desc",
     platform_prefix: Optional[str] = None,
-    computer_id: Optional[str] = None,
     # DALTON-HOOK(colleague-dispatch): accept channel for Chief of Staff foreign-workspace filtering.
     *,
     channel: str = "web",
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Get all threads for a user across all workspaces, or across those on
-    ``computer_id`` other than Home, which a computer's token never reaches.
+    """Get all threads for a user across all workspaces.
 
     Archived threads are always excluded — the cross-workspace recency view
     has no archived counterpart (the workspace listing serves that). Pinning
@@ -281,9 +280,6 @@ async def get_threads_for_user(
     if platform_prefix:
         where_extra = " AND t.platform LIKE %s ESCAPE '\\'"
         extra_params.append(f"{like_escape(platform_prefix)}%")
-    if computer_id is not None:
-        where_extra += " AND w.computer_id = %s::uuid AND w.workspace_id <> %s::uuid"
-        extra_params += [computer_id, get_home_workspace_id(user_id)]
 
     try:
         # DALTON-HOOK(colleague-dispatch): on Chief of Staff ('cos'), filter foreign workspaces in SQL before COUNT/LIMIT/OFFSET.
@@ -726,13 +722,17 @@ async def list_computer_threads(
     computer_id: str, *, rows: bool = True
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Threads of every live workspace on a computer, newest first, and
-    whether each has a stored transcript: the computer's thread index.
+    whether each has a stored transcript: the computer's thread index. With
+    Home's stand-in on the computer, Home's threads too, at the stand-in's
+    folder, where its transcript link serves Home's (``acting_for``).
 
     Also a digest of every one of those fields, from the same snapshot, which
     changes whenever any of them does; ``rows=False`` returns the digest
     alone, for the price of one row.
     """
-    digest = """
+    from src.server.database.home_workspace import home_id_sql, stand_in_id_sql
+
+    digest = f"""
         WITH threads AS (
             SELECT t.conversation_thread_id, t.title, t.created_at,
                    t.updated_at, w.workspace_id,
@@ -743,7 +743,22 @@ async def list_computer_threads(
                    ) AS has_transcript
             FROM conversation_threads t
             JOIN workspaces w ON w.workspace_id = t.workspace_id
-            WHERE w.computer_id = %s AND w.status <> 'deleted'
+            WHERE w.computer_id = %(computer)s AND w.status <> 'deleted'
+          UNION ALL
+            SELECT t.conversation_thread_id, t.title, t.created_at,
+                   t.updated_at, h.workspace_id,
+                   h.name AS workspace_name, si.dir_name,
+                   EXISTS (
+                       SELECT 1 FROM thread_transcripts s
+                       WHERE s.conversation_thread_id = t.conversation_thread_id
+                   ) AS has_transcript
+            FROM workspaces si
+            JOIN workspaces h ON h.workspace_id = {home_id_sql("si.user_id")}
+            JOIN conversation_threads t ON t.workspace_id = h.workspace_id
+            WHERE si.computer_id = %(computer)s AND si.status <> 'deleted'
+              AND si.workspace_id = {stand_in_id_sql("si.user_id")}
+              AND h.status <> 'deleted'
+              AND h.computer_id IS DISTINCT FROM si.computer_id
         ),
         digest AS (
             SELECT encode(sha256(convert_to(coalesce(string_agg(
@@ -767,7 +782,7 @@ async def list_computer_threads(
     )
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(query, (computer_id,))
+            await cur.execute(query, {"computer": computer_id})
             found = await cur.fetchall()
     threads = [
         {k: v for k, v in row.items() if k != "digest"}
@@ -829,7 +844,8 @@ async def get_thread_owner_id(thread_id: str, *, conn=None) -> Optional[str]:
 
 async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
     """Owner ``user_id`` + ``is_shared`` + ``msg_type`` + ``workspace_id`` +
-    ``llm_model`` + ``reasoning_effort`` + ``fast_mode`` in one query.
+    ``llm_model`` + ``reasoning_effort`` + ``fast_mode`` + ``title`` +
+    ``created_at`` in one query.
 
     Lets ``/status`` authorize the caller and read share state from a single
     round-trip, and lets a send authorize, find its workspace and read the
@@ -854,7 +870,8 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
                            w.status AS workspace_status,
                            t.metadata,
                            t.is_shared, t.msg_type, t.workspace_id,
-                           t.llm_model, t.reasoning_effort, t.fast_mode
+                           t.llm_model, t.reasoning_effort, t.fast_mode,
+                           t.title, t.created_at
                     FROM conversation_threads t
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
                     WHERE t.conversation_thread_id = %s

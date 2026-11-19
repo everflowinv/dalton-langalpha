@@ -24,7 +24,12 @@ from src.server.database.home_fold import fold_former_homes
 from src.server.database.livefs_links import drop_workspace_links
 from src.server.database.mcp_servers import start_new_workspace_selection
 from src.server.database.pool import get_db_connection
-from src.server.database.home_workspace import UNBOUND, get_home_workspace_id
+from src.server.database.home_stand_in import EXCLUDE_STAND_IN
+from src.server.database.home_workspace import (
+    HOME_STAND_IN_KEY,
+    UNBOUND,
+    get_home_workspace_id,
+)
 from src.server.database.runs.lifecycle import workspace_has_live_runs
 from src.server.database.sql_fences import (
     EXCLUDE_HOME,
@@ -283,6 +288,7 @@ async def get_workspace(
             await cur.execute(
                 f"""
                 SELECT {_ws_cols("w")}, c.root_dir AS computer_root_dir,
+                       c.name AS computer_name,
                        c.kind AS computer_kind,
                        c.provider_config AS computer_provider_config
                 FROM workspaces w
@@ -386,6 +392,22 @@ async def find_workspace_by_name_key(user_id: str, key: str) -> Optional[Dict[st
         )
         row = await cur.fetchone()
     return dict(row) if row else None
+
+
+async def free_workspace_name(user_id: str, name: str) -> str:
+    """``name`` as a new workspace stores it, once it is usable and no live
+    workspace of the user's holds it: the insert's refusals, read before
+    anyone is asked to approve a create that would meet them.
+
+    Raises:
+        WorkspaceNameInvalid: the name has no usable folder spelling.
+        WorkspaceNameTaken: a live workspace already holds it.
+    """
+    name = checked_workspace_name(name)
+    holder = await find_workspace_by_name_key(user_id, workspace_name_key(name))
+    if holder is not None:
+        raise WorkspaceNameTaken(holder["name"], str(holder["workspace_id"]))
+    return name
 
 
 async def _name_taken(user_id: str, name: str) -> WorkspaceNameTaken:
@@ -559,18 +581,23 @@ async def bind_workspace_to_computer(
 async def get_live_workspace_ids_for_computer(
     computer_id: str,
     *,
+    exclude_stand_in: bool = False,
     conn=None,
 ) -> List[str]:
+    """``exclude_stand_in`` leaves Home's stand-in out, for a caller asking
+    what the user keeps on the computer: the stand-in is placed again on the
+    next need, so it alone keeps no computer."""
     computer_id = normalize_uuid(computer_id)
     if computer_id is None:
         return []
+    stand_in = f"AND {EXCLUDE_STAND_IN}" if exclude_stand_in else ""
 
     async with _ws_cursor(conn) as cur:
         await cur.execute(
-            """
+            f"""
             SELECT workspace_id
             FROM workspaces
-            WHERE computer_id = %s AND status <> 'deleted'
+            WHERE computer_id = %s AND status <> 'deleted' {stand_in}
             ORDER BY created_at
             """,
             (computer_id,),
@@ -589,6 +616,7 @@ SERVER_OWNED_CONFIG_KEYS = (
     "folder_move_blocked",
     "folder_cleanup_pending",
     "folder_kept",
+    HOME_STAND_IN_KEY,
     *SANDBOX_STAMP_KEYS,
 )
 
@@ -680,7 +708,7 @@ async def get_live_workspace_folders_for_computer(
     async with _ws_cursor() as cur:
         await cur.execute(
             f"""
-            SELECT workspace_id, name, dir_name
+            SELECT workspace_id, user_id, name, dir_name
             FROM workspaces
             WHERE computer_id = %s AND {FENCE_LIVE_WORKSPACE}
             ORDER BY created_at
@@ -749,6 +777,7 @@ async def count_live_workspaces_by_computer(
     """How many live projects sit on each of these machines, in one query.
 
     A machine with none is absent from the result, so callers default to zero.
+    Home's stand-in is not one of the user's workspaces, so it is not counted.
     """
     ids = [i for i in (normalize_uuid(c) for c in computer_ids) if i is not None]
     if not ids:
@@ -756,10 +785,11 @@ async def count_live_workspaces_by_computer(
 
     async with _ws_cursor(conn) as cur:
         await cur.execute(
-            """
+            f"""
             SELECT computer_id, count(*) AS live
             FROM workspaces
             WHERE computer_id = ANY(%s::uuid[]) AND status <> 'deleted'
+              AND {EXCLUDE_STAND_IN}
             GROUP BY computer_id
             """,
             (ids,),
@@ -1065,7 +1095,7 @@ async def get_workspace_names(
             SELECT workspace_id, name
             FROM workspaces
             WHERE user_id = %(user_id)s {only}
-              AND {FENCE_NOT_DELETED} AND {EXCLUDE_HOME}
+              AND {FENCE_NOT_DELETED} AND {EXCLUDE_HOME} AND {EXCLUDE_STAND_IN}
             ORDER BY name, workspace_id
             """,
             params,
@@ -1082,23 +1112,17 @@ async def get_workspaces_for_user(
     sort_by: str = "custom",
     include_home: bool = False,
     conn=None,
-    computer_id: str | None = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """``computer_id`` keeps the page to what that computer's token reaches:
-    the workspaces on it other than Home, which is out of a computer's reach
-    wherever it sits."""
     try:
         status_filter = "" if include_deleted else "AND status != 'deleted'"
-        home_filter = "" if include_home else f"AND {EXCLUDE_HOME}"
-        computer_filter = (
-            ""
-            if computer_id is None
-            else f"AND computer_id = %(computer_id)s::uuid AND {EXCLUDE_HOME}"
-        )
+        # Home's stand-in is never one of the user's workspaces, Home
+        # included or not.
+        home_filter = f"AND {EXCLUDE_STAND_IN}"
+        if not include_home:
+            home_filter += f" AND {EXCLUDE_HOME}"
         params = {
             "user_id": user_id,
             "home_id": get_home_workspace_id(user_id),
-            "computer_id": computer_id,
         }
 
         # Every order ends on workspace_id, appended below: rows that tie would
@@ -1118,7 +1142,7 @@ async def get_workspaces_for_user(
                 f"""
                 SELECT COUNT(*) as total
                 FROM workspaces
-                WHERE user_id = %(user_id)s {status_filter} {home_filter} {computer_filter}
+                WHERE user_id = %(user_id)s {status_filter} {home_filter}
                 """,
                 params,
             )
@@ -1127,15 +1151,20 @@ async def get_workspaces_for_user(
 
             # The root rides on each row as on the detail read, so a page that
             # seeds a workspace from its list reads its paths without waiting on
-            # the computers. A subquery, since a join would make the bare
-            # columns the ordering names ambiguous.
+            # the computers, and the computer's name, which `la` and the
+            # agent's tools call it by. A lateral of aliased columns only, since
+            # a plain join would make the bare columns the ordering names
+            # ambiguous.
             await cur.execute(
                 f"""
-                SELECT {_WS_COLS},
-                       (SELECT c.root_dir FROM computers c
-                        WHERE c.computer_id = workspaces.computer_id) AS computer_root_dir
+                SELECT {_WS_COLS}, c.computer_root_dir, c.computer_name
                 FROM workspaces
-                WHERE user_id = %(user_id)s {status_filter} {home_filter} {computer_filter}
+                LEFT JOIN LATERAL (
+                    SELECT root_dir AS computer_root_dir, name AS computer_name
+                    FROM computers
+                    WHERE computers.computer_id = workspaces.computer_id
+                ) c ON TRUE
+                WHERE user_id = %(user_id)s {status_filter} {home_filter}
                 ORDER BY {order_clause}, workspace_id DESC
                 LIMIT %(limit)s OFFSET %(offset)s
                 """,
@@ -1334,12 +1363,14 @@ async def update_workspace_status(
             )
             if _mirrors_to_computer(status) and result.get("computer_id"):
                 from src.server.services.computer_usage.transitions import (
-                    note_computer_status,
+                    note_mirrored_status,
                 )
 
                 # The ledger guards on the computer's own status, so a mirror
                 # that never reached the machine changes no run.
-                await note_computer_status(result, status, conn=conn)
+                await note_mirrored_status(
+                    str(result["computer_id"]), status, conn=conn
+                )
             return dict(result)
         return None
 
@@ -1773,6 +1804,41 @@ async def lock_run_workspace(
                         return True
                     raise ColleagueAccessRevokedError()
     return False
+
+
+async def refuse_moved_off(
+    conn, thread_id: str, computer_id: str, *, runs_in: Optional[str] = None
+) -> None:
+    """Refuse a turn checked to run on ``computer_id`` once its workspace is
+    on another. Read on START's connection after ``lock_run_workspace``, so a
+    move cannot commit between the two: one committed before is seen here,
+    and one claimed after finds this run. A workspace on no computer yet
+    binds at its turn, so it is not held to one.
+
+    ``runs_in`` is the workspace the turn runs in when it is not its
+    thread's: Home's stand-in, where a Home turn runs while Home's computer
+    can't be reached, so the turn is held to the stand-in's computer. Its row
+    is held from here to the commit, read after the turn's mark took the lock
+    a removal of that computer holds (``home_away.mark_away``)."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        if runs_in is not None:
+            await cur.execute(
+                "SELECT workspace_id, computer_id FROM workspaces"
+                " WHERE workspace_id = %s FOR SHARE",
+                (runs_in,),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT w.workspace_id, w.computer_id FROM workspaces w
+                JOIN conversation_threads t ON t.workspace_id = w.workspace_id
+                WHERE t.conversation_thread_id = %s
+                """,
+                (thread_id,),
+            )
+        workspace = await cur.fetchone()
+    if workspace and workspace["computer_id"] and str(workspace["computer_id"]) != computer_id:
+        raise WorkspaceMovingError(str(workspace["workspace_id"]))
 
 
 async def delete_workspace(

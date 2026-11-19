@@ -133,6 +133,23 @@ async def _capture_graph_config(
         stack.enter_context(
             patch.object(
                 carry,
+                "prior_attempt",
+                create_autospec(
+                    carry.prior_attempt,
+                    return_value=carry.PriorAttempt(latest=None, retried=None),
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                carry,
+                "carried_unwatched",
+                create_autospec(carry.carried_unwatched, return_value=None),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                carry,
                 "carried_pair",
                 create_autospec(carry.carried_pair, return_value={}),
             )

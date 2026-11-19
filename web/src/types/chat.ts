@@ -6,10 +6,12 @@ import type {
   ToolCallResultData,
   TodoItem,
   OrderProposal,
-  ProvenanceSourceType,
+  ProvenanceEnvelopeKey,
+  ProvenanceEvent,
 } from './sse';
-import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
+import type { PageLinkSpec, StructuredError } from '@/utils/rateLimitError';
 import type { PlanBilled } from '@/api/model';
+import type { CliWait } from '@/lib/claudeCodeQueue';
 import type { DispatchingAgent, ReportOutcome } from './api';
 import type { CommandFailureReason, CommandTool } from './commands';
 import type { PublishedLayer } from '@/pages/MarketView/types/chartLayer';
@@ -119,22 +121,35 @@ export interface HandOffNotice {
 /** Which expander toggle label a notification's detail takes. */
 export type NotificationDetailKind = 'summary' | 'brief' | 'error';
 
+/**
+ * What a notification draws beyond a plain labelled divider, one kind each.
+ * `NOTICES` (`components/messageList/notices.tsx`) says how each kind is
+ * drawn and whether a folded turn keeps it.
+ */
+export type SegmentNotice =
+  /** A model switch, labelled when shown. */
+  | ({ kind: 'fallback' } & ModelFallbackNotice)
+  /** A hand-off to a model that keeps a session of its own, labelled when shown. */
+  | ({ kind: 'handoff' } & HandOffNotice)
+  /** A reply whose last request was billed to usage credits at a Claude
+   *  plan's limit: a quiet notice line under it, not a divider. */
+  | ({ kind: 'planBilled' } & PlanBilled)
+  /** A Claude Code turn that waited for one of its computer's CLIs: a notice
+   *  line where in the reply the wait happened. */
+  | ({ kind: 'cliWait' } & CliWait);
+
 export interface NotificationSegment {
   type: 'notification';
-  /** The label. A model switch has none: its label is written from
-   *  `fallback`, and a hand-off's from `handoff`. */
+  /** The label of a plain divider. A notice has none: its own is written
+   *  from it when shown. */
   content?: string;
-  fallback?: ModelFallbackNotice;
-  handoff?: HandOffNotice;
+  notice?: SegmentNotice;
   order: number;
   /** Optional longer text (e.g. the compaction summary) shown in an
    *  expandable panel beneath the notification label. */
   detail?: string;
   /** Picks the expander toggle label, 'summary' by default. */
   detailKind?: NotificationDetailKind;
-  /** A reply whose last request was billed to usage credits at a Claude
-   *  plan's limit: drawn as the quiet notice line under it, not a divider. */
-  planBilled?: PlanBilled;
 }
 
 export interface UserQuestionSegment {
@@ -235,27 +250,12 @@ export interface ToolCallProcess {
   _createdAt?: number;
 }
 
-export interface ProvenanceRecord {
-  record_id: string;
-  /** Originating agent: "main" or "task:{id}". */
-  agent?: string;
-  timestamp: string;
-  source_type: ProvenanceSourceType;
-  identifier: string;
-  title?: string;
-  /** Data-kind slug within this source type (e.g. "company_overview"); the
-   *  Sources panel i18n-maps it to label each access in the hover breakdown. */
-  detail?: string;
-  provider?: string;
-  tool_call_id?: string;
-  args_fingerprint?: Record<string, unknown>;
-  /** Tool-call arguments with secrets already redacted server-side. Redacted
-   *  values are the literal string "[redacted]". May be absent/empty. */
-  args?: Record<string, unknown>;
-  result_sha256?: string;
-  result_size?: number;
-  result_snippet?: string;
-}
+/** A provenance event without its stream and replay envelope. */
+export type ProvenanceRecord = Omit<ProvenanceEvent, ProvenanceEnvelopeKey> & {
+  /** The events whose costs `cost_credits` sums, when several paid calls
+   *  are listed as one access. */
+  cost_record_ids?: string[];
+};
 
 /**
  * Per-access discriminator appended to a provenance dedup key — `mcp_tool` only.
@@ -437,6 +437,9 @@ export interface PTCAgentProposalState {
   /** The call that made the hand-off, which names it in the transcript. */
   tool_call_id?: string;
   report_back?: boolean;
+  /** The model the hand-off names for its turn; absent when it runs the
+   *  thread's own or the user's default. */
+  model?: string | null;
   /** Approved, but the dispatch failed (`utils/dispatchResult.ts`). */
   dispatch_failed?: boolean;
   /** With `dispatch_failed`: the failure left it unknown whether the run
@@ -475,7 +478,7 @@ export interface CreditPauseState {
   message?: string;
   /** Where the user resolves the denial, built by ``buildRateLimitError`` so a
    *  pause and a 429 banner offer the same destinations. */
-  links?: ErrorLinkSpec[];
+  links?: PageLinkSpec[];
   interruptId: string;
 }
 
@@ -570,6 +573,9 @@ export type UserMessage = {
   /** On a report-back's row only: the run it opened. History and a live
    *  attach can both draw that row, and know it by this. */
   runId?: string;
+  /** On a Home turn that ran on the cloud stand-in while Home's own machine
+   *  could not be reached: drawn as a quiet line under the message. */
+  homeFallback?: import('./sse').HomeFallback;
   steeringDelivered?: boolean;
   steering?: boolean;
   /** The request key this view sent the message under. A delivery that

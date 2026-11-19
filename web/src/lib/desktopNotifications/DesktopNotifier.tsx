@@ -12,6 +12,8 @@
  * - A thread read anywhere takes its notification down.
  * - The dock badge and attention list follow the store, debounced.
  * - "Mark as read" on a notification stamps the thread seen.
+ * - A request the agent made from a command posts until it is answered
+ *   (`ApprovalNotifier`), and so do a vendor's terms (`VendorTermsNotifier`).
  */
 import { useEffect, type ReactElement } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
@@ -23,8 +25,7 @@ import {
   desktopSetAttention,
   onNotificationAction,
 } from '@/lib/desktop';
-import { queryKeys } from '@/lib/queryKeys';
-import { threadRowsOf } from '@/lib/threadListCache';
+import { cachedThreadTitle } from '@/lib/threadListCache';
 import { subscribeFeedNotifications } from '@/lib/threadLifecycle/feedClient';
 import { markThreadSeen } from '@/lib/threadLifecycle/seen';
 import {
@@ -35,7 +36,8 @@ import {
   TERMINAL_FAMILY,
 } from '@/lib/threadLifecycle/store';
 import { threadDetailQuery } from '@/pages/ChatAgent/utils/threadQueries';
-import type { Thread } from '@/types/api';
+import { ApprovalNotifier } from './ApprovalNotifier';
+import { VendorTermsNotifier } from './VendorTermsNotifier';
 import {
   ATTENTION_LIST_MAX,
   buildAttention,
@@ -65,17 +67,6 @@ function threadView(threadId: string): ThreadView {
   };
 }
 
-/** A thread's title from whatever the cache already holds: its detail, or a row in any list. */
-function cachedTitle(qc: QueryClient, threadId: string): string | undefined {
-  const detail = qc.getQueryData<Thread>(queryKeys.threads.detail(threadId));
-  if (detail?.title) return detail.title;
-  for (const [, data] of qc.getQueriesData<unknown>({ queryKey: queryKeys.threads.all })) {
-    const title = threadRowsOf(data).find((row) => row?.thread_id === threadId)?.title;
-    if (title) return title;
-  }
-  return undefined;
-}
-
 function startNotifier(qc: QueryClient): () => void {
   const posted = new Map<string, PostedNotification>();
   const titles = new Map<string, string>();
@@ -88,12 +79,12 @@ function startNotifier(qc: QueryClient): () => void {
   let lastAttention = '';
 
   const titleOf = (threadId: string): string =>
-    cachedTitle(qc, threadId) ?? titles.get(threadId) ?? i18n.t('desktopApp.untitledThread');
+    cachedThreadTitle(qc, threadId) ?? titles.get(threadId) ?? i18n.t('desktopApp.untitledThread');
 
   /** Read the titles the attention list is missing, once each, then list again. */
   const lookUpTitles = (ids: readonly string[]) => {
     for (const id of ids) {
-      if (lookedUp.has(id) || titles.has(id) || cachedTitle(qc, id)) continue;
+      if (lookedUp.has(id) || titles.has(id) || cachedThreadTitle(qc, id)) continue;
       lookedUp.add(id);
       qc.fetchQuery(threadDetailQuery(id)).then(
         () => {
@@ -225,5 +216,12 @@ function ActiveNotifier(): null {
 
 /** Renders nothing; does nothing where the shell cannot post notifications. */
 export function DesktopNotifier(): ReactElement | null {
-  return canNotify() ? <ActiveNotifier /> : null;
+  if (!canNotify()) return null;
+  return (
+    <>
+      <ActiveNotifier />
+      <ApprovalNotifier />
+      <VendorTermsNotifier />
+    </>
+  );
 }

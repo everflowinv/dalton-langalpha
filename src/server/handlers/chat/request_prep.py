@@ -13,8 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-# DALTON-HOOK(turn-row-model-line): replace() stamps the resolved model
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
@@ -22,7 +21,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
 from ptc_agent.agent.middleware.provenance.command_trace import REPORT_COMMAND_KEY
-from ptc_agent.agent.middleware.runtime_context import TurnContext, parse_surface
+from ptc_agent.agent.middleware.runtime_context import HomeAway, TurnContext, parse_surface
 from ptc_agent.agent.tools.command_handoff import JOB_ENV_KEY
 from src.config.settings import (
     get_langsmith_metadata,
@@ -649,9 +648,10 @@ async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> No
     """Keep the model a client named on its thread, once the turn is admitted.
 
     Called after START commits and the run is attached, so a send refused
-    before admission, or a steer that never ran on the model it carried,
-    leaves the thread as it was, and the committed run always has an owner
-    when this waits on the database.
+    before admission leaves the thread as it was, and the committed run
+    always has an owner when this waits on the database. A hand-off steered
+    into a running turn calls it too: it steers only a turn on the model it
+    named (``wait_or_steer``'s ``on_model``).
     """
     if named_model:
         await remember_thread_llm_model(
@@ -668,6 +668,9 @@ def build_turn_context(
     disk_known: bool = False,
     inherits_rules: bool = False,
     sent_at: float | None = None,
+    carried_unwatched: bool | None = None,
+    home_away: HomeAway | None = None,
+    home_back: dict[str, Any] | None = None,
 ) -> TurnContext:
     """What this turn knows about itself: the request's surface plus the prior row.
 
@@ -678,8 +681,13 @@ def build_turn_context(
     automation stamps the origin on every request it sends, so nothing is lost.
     ``disk_free_mb`` and ``disk_known`` come from :func:`read_disk_notice`.
     ``inherits_rules`` is set for a retry whose attempt ran under the last
-    rules stated (:func:`retried_on_its_surface`). ``sent_at`` is when the
-    server received the request, ahead of admission and the workspace's start.
+    rules stated (:func:`retried_on_its_surface`). ``unwatched`` is a turn
+    nobody is there to see run (:func:`is_unwatched_turn`), or as recorded on
+    the turn a restart stopped that this one resumes (``carried_unwatched``,
+    from ``carry.carried_unwatched``). ``sent_at`` is when the server
+    received the request, ahead of admission and the workspace's start.
+    ``home_away`` and ``home_back`` say where a Home turn runs
+    (``home_placement``).
 
     The zone is the profile's before the request's: a channel or an
     automation's own request names none, and the request alone would put
@@ -698,28 +706,17 @@ def build_turn_context(
         origin_agent=request.origin.agent if request.origin else None,
         surface_rules=request.surface_rules,
         inherits_rules=inherits_rules or is_notification_turn(request),
+        unwatched=(
+            is_unwatched_turn(request) if carried_unwatched is None else carried_unwatched
+        ),
         disk_free_mb=disk_free_mb,
         disk_known=disk_known,
+        home_away=home_away,
+        home_back=home_back,
         timezone=zone,
         tool_timezone=zone
         or get_locale_config(request.locale or "en-US", "en").get("timezone", "UTC"),
     )
-
-
-# DALTON-HOOK(turn-row-model-line): stamp the server-resolved model onto the
-# turn context after resolve_llm_config has answered; nothing the client or
-# the user typed can reach the line.
-def with_resolved_model(
-    turn_context: TurnContext, effective_model: str | None
-) -> TurnContext:
-    """The turn context with the model the server resolved for this turn.
-
-    ``effective_model`` is ``config.llm.name`` off ``resolve_llm_config`` —
-    the automation's designated ``llm_model``, a client-named model, or the
-    account default — so the anchor row states what actually runs, which is
-    what the model-line exists to make a settled fact.
-    """
-    return replace(turn_context, model_key=effective_model)
 
 
 def is_notification_turn(request: ChatRequest) -> bool:
@@ -733,6 +730,25 @@ def is_notification_turn(request: ChatRequest) -> bool:
     (``threads/messaging.py``), so a client cannot claim one.
     """
     return request.query_type in NOTIFICATION_QUERY_TYPES and not request.platform
+
+
+def is_unwatched_turn(request: ChatRequest) -> bool:
+    """Whether nobody is there to see the turn run, so nobody can wake a
+    machine of theirs that stops answering during it.
+
+    A turn this server posts (a report-back, a wake), whatever surface it
+    reports to, an automation's run, and work another agent sends (a Chief of
+    Staff hand-off, a computer's agent through the ``la`` CLI). ``query_type``
+    and the announced keys are stripped from a client's body
+    (``threads/messaging.py``), and only a session or the server states an
+    origin (``principal.stamp_origin``). A restart's resume takes it from
+    the turn it carries on instead (``carry.carried_unwatched``).
+    """
+    return (
+        request.query_type in NOTIFICATION_QUERY_TYPES
+        or bool(request.wakeup or request.market_target)
+        or (request.origin is not None and request.origin.type in ("automation", "agent"))
+    )
 
 
 def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:

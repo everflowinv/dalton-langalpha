@@ -42,10 +42,10 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    # DALTON-HOOK(llm-overlay): claude-fable-5-2 and claude-fable-5-2-oauth graduated into upstream #751;
-    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high,xhigh}-oauth added (42),
-    # gemini-3.8-flash-{low,medium,high}-oauth, gemini-3-flash-oauth, and grok-4.3-oauth removed (42 - 5 = 37).
-    assert len(native_models) == 37
+    # DALTON-HOOK(llm-overlay): claude-fable-5-2{,-oauth} and gpt-6.2-{astra,sol}{,-oauth} graduated into
+    # upstream; gemini-4-neon-{low,medium,high,xhigh}-oauth added; gemini-3.8-flash-{low,medium,high}-oauth,
+    # gemini-3-flash-oauth and grok-4.3-oauth removed (33).
+    assert len(native_models) == 33
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -1946,9 +1946,9 @@ def test_gemini_4_neon_overlay_generally_available_and_notional_pricing(monkeypa
 async def test_removed_models_absent_and_visible_subscriptions_have_notional_prices(monkeypatch):
     """The Gemini 3.8 Flash / Grok 4.3 / Claude Fable 5.1 keys Dalton defined are
     absent from the merged catalog, available-models, and preference validation
-    (the upstream API entries leave with the upstream sync);
-    every visible subscription model resolves a notional price except the two
-    documented upstream pricing gaps."""
+    and, after sync 6, the upstream API entries are gone too;
+    every visible subscription model resolves a notional price except the one
+    documented upstream pricing gap."""
     # The operator kill switch must not decide what this test sees.
     monkeypatch.setenv("DALTON_DISABLED_PROVIDERS", "")
 
@@ -2004,6 +2004,9 @@ async def test_removed_models_absent_and_visible_subscriptions_have_notional_pri
         "claude-fable-5-1",
         "claude-fable-5-1-oauth",
     )
+    # Sync 6 retired the upstream API entries as well.
+    for key in ("gemini-3.8-flash", "grok-4.3"):
+        assert mc.get_model_config(key) is None, f"{key} still resolves in ModelConfig"
     for key in removed_keys:
         assert mc.get_model_config(key) is None, f"{key} still resolves in ModelConfig"
         with pytest.raises(TuningError, match="不在系统模型目录中"):
@@ -2040,11 +2043,9 @@ async def test_removed_models_absent_and_visible_subscriptions_have_notional_pri
         assert not key.startswith(removed_merged_prefixes), f"{key} in available models report"
         assert key not in ("gemini-3-flash-oauth", "grok-4.3-oauth"), f"{key} in available models report"
 
-    # Known gaps: neither has an upstream cash pricing card in providers.json or an inline
+    # Known gap: no upstream cash pricing card in providers.json and no inline
     # notional_pricing / fallback card yet.
     known_notional_gaps = {
-        # codex-oauth has no cash pricing card for gpt-5.3-codex-spark in providers.json.
-        "gpt-5.3-codex-spark-oauth",
         # notional_ref points to gpt-oss-120b-groq, which has no entry in providers.json.
         "gpt-oss-120b-medium-oauth",
     }

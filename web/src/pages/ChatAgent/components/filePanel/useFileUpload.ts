@@ -6,6 +6,7 @@ import type { TFunction } from 'i18next';
 import { holdReload } from '@/lib/reloadHolds';
 import { classifyUploadError } from '../../utils/partUpload';
 import { uploadToWorkspace } from '../../utils/workspaceUpload';
+import type { ComputerAway } from './useComputerAway';
 
 function uploadErrorMessage(err: unknown, file: globalThis.File, t: TFunction): string {
   const failure = classifyUploadError(err);
@@ -34,10 +35,13 @@ export interface UploadBatchStatus {
 
 /** Upload + drag-and-drop state for FilePanel (authenticated mode only —
  * upload has no ApiAdapter override; readOnly panels hide the affordances). */
-export function useFileUpload({ workspaceId, onRefreshFiles }: {
+export function useFileUpload({ workspaceId, onRefreshFiles, away }: {
   workspaceId: string;
   onRefreshFiles?: () => void;
+  /** The workspace's computer, while it may be away. */
+  away: ComputerAway;
 }) {
+  const { blockedReason, describe: describeAway } = away;
   const { t } = useTranslation();
   // Upload state: batch status while a file is going up, then `uploadSaving`
   // while the workspace takes the file.
@@ -93,6 +97,10 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
     const isBatch = Array.isArray(input);
     const files = isBatch ? input : (input ? [input] : []);
     if (files.length === 0 || !workspaceId) return;
+    if (blockedReason) {
+      setUploadError(blockedReason);
+      return;
+    }
     const guard = runGuardRef.current;
     if (processingGenRef.current === guard) {
       if (!isBatch) return;
@@ -162,7 +170,7 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
           }
           console.error('[FilePanel] Upload failed:', err);
           if (runGuardRef.current === guard) {
-            failures.push({ name: file.name, reason: uploadErrorMessage(err, file, t) });
+            failures.push({ name: file.name, reason: describeAway(err) ?? uploadErrorMessage(err, file, t) });
           }
         } finally {
           if (uploadRef.current === ctrl) {
@@ -209,7 +217,7 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
         }
       }
     }
-  }, [workspaceId, onRefreshFiles, t]);
+  }, [workspaceId, onRefreshFiles, blockedReason, describeAway, t]);
 
   /** Ends an upload still sending; once the workspace is taking the file it runs to the end. */
   const cancelUpload = useCallback(() => {

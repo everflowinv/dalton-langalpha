@@ -342,14 +342,15 @@ async def test_clis_past_one_connections_slots_run_on_the_second_and_are_signall
     second = local_link(HOME=str(tmp_path))
     dials = []
 
-    async def spill():
-        dials.append(1)
+    async def spill(want):
+        dials.append(want)
         return second
 
     link.spill = spill
+    link.peers = lambda: [second] if dials else []
     running = [await _started(launcher(slot_wait_s=5)) for _ in range(2 * CLI_SLOTS)]
     assert (link.cli_slots._value, second.cli_slots._value) == (0, 0)
-    assert len(dials) == CLI_SLOTS and link.slots._value == 2
+    assert dials == ["cli"] and link.slots._value == 2
     with pytest.raises(CLIConnectionError, match=f"^{re.escape(ssh_launcher.cli_slots_full(2 * CLI_SLOTS))}$"):
         await _started(launcher(slot_wait_s=0.2))
     done = await link.run("echo free", timeout=10, slot=link.slots)
@@ -377,9 +378,11 @@ async def test_clis_past_one_connections_slots_run_on_the_second_and_are_signall
 
 
 @pytest.mark.asyncio
-async def test_a_cli_holds_one_of_the_computers_clis_from_start_to_close_within_its_one_wait(tmp_path, monkeypatch):
-    """Taken before the link's slot, and given the whole wait, the link the
-    rest; one none frees in time refuses the CLI naming the computer's count."""
+async def test_a_run_holds_one_of_the_computers_clis_from_its_layout_to_its_release(tmp_path, monkeypatch):
+    """Taken before anything runs on the machine, with the whole wait, so a
+    turn on a full computer waits where its queue is told, not behind the
+    running turns' commands; one none frees in time refuses the run naming
+    the computer's count, and a layout that fails gives it back."""
     cli = tmp_path / "claude"
     cli.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n")
     cli.chmod(0o755)
@@ -396,12 +399,31 @@ async def test_a_cli_holds_one_of_the_computers_clis_from_start_to_close_within_
         finally:
             held.clear()
 
-    transport = await _started(launcher(cli_slot=slot, slot_wait_s=7))
-    assert held == [7] and link.cli_slots._value == CLI_SLOTS - 1
+    async def written(self, link, prepared, files):
+        pass
+
+    # The stand-in connection has no SFTP; the layout's files are not what this is about.
+    monkeypatch.setattr(SSHLauncher, "_write", written)
+    one = launcher(cli_slot=slot, slot_wait_s=7)
+    prepared = await one.scratch()
+    assert held == [7] and link.cli_slots._value == CLI_SLOTS
+    transport = one.transport(ClaudeAgentOptions(cwd=prepared.cwd, env={"CLAUDE_CONFIG_DIR": prepared.config_dir}))
+    await transport.connect()
+    assert link.cli_slots._value == CLI_SLOTS - 1
     with pytest.raises(CLIConnectionError, match=f"^{re.escape(ssh_launcher.cli_slots_full(3))}$"):
-        await _started(launcher(cli_slot=slot))
+        await launcher(cli_slot=slot).scratch()
     await transport.close()
-    assert held == [] and link.cli_slots._value == CLI_SLOTS
+    assert held == [7] and link.cli_slots._value == CLI_SLOTS
+    await one.release(prepared)
+    assert held == []
+
+    async def unreachable(conn, at, *, install):
+        raise RuntimeError("no CLI")
+
+    monkeypatch.setattr(ssh_launcher.cli_install, "ensure_cli", unreachable)
+    with pytest.raises(RuntimeError, match="no CLI"):
+        await launcher(cli_slot=slot).scratch()
+    assert held == []
 
 
 @pytest.mark.parametrize(("n", "said"), [(1, "1 agent on this computer. Try again when it finishes."),
@@ -456,12 +478,32 @@ async def test_a_turn_waits_out_commands_holding_every_command_slot_past_its_sta
     await first.close()
 
 
-@pytest.mark.parametrize("named", ["cli", "other"])
-def test_the_cli_is_signalled_only_while_its_pid_still_runs_it(tmp_path, named):
+def _running_cli(tmp_path) -> tuple[Path, subprocess.Popen]:
+    """A process whose command line starts with a path named ``claude``.
+
+    A copy of ``sleep`` would not do: a multi-call coreutils (uutils) picks
+    its program from that name and exits, and macOS kills a copied system
+    binary as it starts. Nor would a link to a framework Python (Homebrew's),
+    which execs its app bundle and is listed by that name. A link to bash
+    runs under the link's name, and waits in a builtin ``read`` with no child
+    to exec into; the line it prints says it got that far."""
     cli = tmp_path / "bin dir" / "claude"
     cli.parent.mkdir()
-    shutil.copy(shutil.which("sleep"), cli)
-    proc = subprocess.Popen([str(cli), "30"])
+    cli.symlink_to(shutil.which("bash"))
+    proc = subprocess.Popen(
+        [str(cli), "-c", "echo; read -r x"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        # A startup file it names would run before the command.
+        env={k: v for k, v in os.environ.items() if k != "BASH_ENV"},
+    )
+    assert proc.stdout.readline() == b"\n"
+    return cli, proc
+
+
+@pytest.mark.parametrize("named", ["cli", "other"])
+def test_the_cli_is_signalled_only_while_its_pid_still_runs_it(tmp_path, named):
+    cli, proc = _running_cli(tmp_path)
     try:
         asked = str(cli) if named == "cli" else str(tmp_path / "claude")
         subprocess.run(["sh", "-c", kill_if_cli(proc.pid, asked, "KILL")], check=True, timeout=10)
@@ -472,7 +514,7 @@ def test_the_cli_is_signalled_only_while_its_pid_still_runs_it(tmp_path, named):
                 proc.wait(timeout=0.5)
     finally:
         proc.kill()
-        proc.wait()
+        proc.communicate()
 
 
 @on_linux
@@ -496,10 +538,7 @@ async def test_a_turns_layout_and_its_release_run_on_a_macs_userland(tmp_path, m
 @pytest.mark.parametrize("named", ["cli", "other"])
 def test_the_cli_is_signalled_by_ps_where_there_is_no_proc(tmp_path, named):
     """A Mac has no /proc, so the pid's command line comes from its ps."""
-    cli = tmp_path / "bin dir" / "claude"
-    cli.parent.mkdir()
-    shutil.copy(shutil.which("sleep"), cli)
-    proc = subprocess.Popen([str(cli), "30"])
+    cli, proc = _running_cli(tmp_path)
     try:
         asked = str(cli) if named == "cli" else str(tmp_path / "claude")
         script = kill_if_cli(proc.pid, asked, "KILL").replace("/proc/", "/no-such-proc/")
@@ -511,7 +550,7 @@ def test_the_cli_is_signalled_by_ps_where_there_is_no_proc(tmp_path, named):
                 proc.wait(timeout=0.5)
     finally:
         proc.kill()
-        proc.wait()
+        proc.communicate()
 
 
 @pytest.mark.asyncio

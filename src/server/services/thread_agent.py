@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ptc_agent.agent.claude_code.launcher import Launcher
     from ptc_agent.agent.roles import AgentRole
     from ptc_agent.config.agent import Admitted, AgentConfig
+    from ptc_agent.core.claude_code_clis import CliQueue
     from ptc_agent.core.project_context import ProjectContext
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
     from src.server.services.computer_manager._types import WorkspaceToolView
@@ -120,7 +121,13 @@ class AgentInputs:
         role: AgentRole,
         user_profile: dict[str, Any] | None,
         workspace_owner_id: str | None = None,
+        acting_for: str | None = None,
     ) -> AgentInputs:
+        """``workspace_id`` is the one whose folder the turn runs in;
+        ``acting_for`` the thread's, when that is another (Home's turn in its
+        stand-in)."""
+        from dataclasses import replace
+
         from src.server.services.egress.direct_tools import direct_tools_for_turn
         from src.server.services.trading_rule import with_trading_rule
         from src.server.services.workspace_layout import resolve_project_context
@@ -147,7 +154,13 @@ class AgentInputs:
             thread_id=thread_id,
             workspace_id=workspace_id,
             role=role,
-            project=await resolve_project_context(session, workspace_id),
+            project=(
+                replace(project, acting_for=acting_for)
+                if (project := await resolve_project_context(session, workspace_id))
+                and acting_for
+                and acting_for != workspace_id
+                else project
+            ),
             tool_view=tool_view,
             # Off the resolve, not the bind, so it moves only when a setting does.
             user_profile=with_trading_rule(user_profile, tool_view.trading_rule),
@@ -180,16 +193,17 @@ class AgentInputs:
         return kwargs
 
     def claude_code_launcher(
-        self, sandbox: PTCSandbox, admitted: Admitted, *, slot_wait_s: float | None = None,
+        self, sandbox: PTCSandbox, admitted: Admitted, queue: CliQueue | None = None, *,
+        slot_wait_s: float | None = None,
     ) -> Launcher:
         """Where a Claude Code CLI runs, a turn's or a subagent's, and the token
         it signs in with, by what admission let it run on (``admitted``).
         ``slot_wait_s`` is how long a CLI on an own computer waits for a slot
-        there, a subagent's shorter than a turn's. Imported here, never at the
-        top: the SDK loads only for such a CLI."""
+        there, a subagent's shorter than a turn's, and ``queue`` is told while
+        it waits. Imported here, never at the top: the SDK loads only for such a CLI."""
         from src.server.services.claude_code.launchers import turn_launcher
 
         return turn_launcher(
             sandbox, computer_id=self.computer_id, workspace_id=self.workspace_id, user_id=self.user_id,
-            admitted=admitted, slot_wait_s=slot_wait_s,
+            admitted=admitted, slot_wait_s=slot_wait_s, queue=queue,
         )

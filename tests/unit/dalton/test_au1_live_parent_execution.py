@@ -109,7 +109,7 @@ async def test_trigger_uses_the_locked_helper_and_a_deleted_parent_dispatches_no
     created = create_autospec(exec_db.create_execution, side_effect=AssertionError("orphan insert"))
     dispatched = MagicMock()
 
-    async def _locked(automation_id, user_id, scheduled_at, server_id):
+    async def _locked(automation_id, user_id, scheduled_at, server_id, *, checked_computer_id=None):
         return "exec-locked", {
             "automation_id": automation_id,
             "user_id": user_id,

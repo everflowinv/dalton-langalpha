@@ -39,7 +39,7 @@ from langchain.agents.middleware.types import (
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.types import Command
 
-from ptc_agent.agent.middleware._utils import run_ids
+from ptc_agent.agent.middleware._utils import append_to_system_message, run_ids  # DALTON-HOOK(model-fallback-identity)
 from ptc_agent.agent.middleware.thinking_binding import (
     UNSENT_THINKING_KEY,
     UnsentThinkingState,
@@ -59,6 +59,7 @@ from src.llms.error_classification import (
 )
 from src.llms.provider_errors import is_terminal_refusal
 from src.llms.input_transformations import INPUT_TRANSFORMATIONS, REPEATED, thinking_drops
+from src.llms.model_identity import CATALOG_MODEL_KEY, api_model_id, catalog_model, client_label  # DALTON-HOOK(model-fallback-identity)
 from src.llms.provider_compaction import is_compaction_request
 from src.llms.reasoning_payload import (
     is_unfinished_reply,
@@ -193,18 +194,10 @@ class _Recovery:
     request: ModelRequest | None = None
 
 
-def _model_display_name(model: Any) -> str:
-    for attr in ("model", "model_name", "model_id"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str) and value:
-            return value
-    return type(model).__name__
-
-
 def _stamped(model: Any, key: str) -> str | None:
-    """A fact ``LLM.get_llm()`` stamped in a client's metadata: its models.json
-    name (``manifest_model``), the namespace fallback names are in, or who
-    pays (``billing_type``). None for an unstamped client."""
+    """A fact ``LLM.get_llm()`` stamped in a client's metadata: the namespace
+    fallback names are in, or who pays (``billing_type``). None for an
+    unstamped client."""
     metadata = getattr(model, "metadata", None)
     value = metadata.get(key) if isinstance(metadata, dict) else None
     return value if isinstance(value, str) and value else None
@@ -217,11 +210,10 @@ def _window(model: Any) -> int | None:
     return window if isinstance(window, int) and window > 0 else None
 
 
-def _mark_fallback(response: ModelResponse, name: str) -> ModelResponse:
+def _mark(response: ModelResponse, marks: dict[str, str]) -> None:
     for msg in getattr(response, "result", None) or ():
         if isinstance(msg, AIMessage):
-            msg.response_metadata = {**(msg.response_metadata or {}), FALLBACK_KEY: name}
-    return response
+            msg.response_metadata = {**(msg.response_metadata or {}), **marks}
 
 
 def _distinct(fallbacks: list[tuple[str, Any]], primary: str | None) -> list[tuple[str, Any]]:
@@ -253,7 +245,7 @@ def build_fallback_pairs(config: Any) -> list[tuple[str, Any]]:
         names = getattr(config, "fallback_llm_names", None)
         if names and len(names) == len(clients):
             return list(zip(names, clients))
-        return [(_model_display_name(client), client) for client in clients]
+        return [(api_model_id(client) or type(client).__name__, client) for client in clients]
 
     fallback_names = getattr(config.llm, "fallback", None) or []
     if not fallback_names:
@@ -372,15 +364,57 @@ class ModelResilienceMiddleware(AgentMiddleware):
     # ------------------------------------------------------------------
     # Helpers
 
+    def _catalog_name(self, request: ModelRequest) -> str | None:
+        """The catalog name of the model ``request`` targets, None for an
+        unstamped client. The instance is shared into subagent stacks, so the
+        configured name is claimed only for a request on the primary client;
+        a subagent's own client names itself."""
+        if self.primary_client is None or request.model is self.primary_client:
+            return self.primary_name
+        return catalog_model(request.model)
+
     def _primary_display_name(self, request: ModelRequest) -> str:
-        # The instance is shared into subagent stacks where request.model is a
-        # subagent-specific client — only claim the configured name when the
-        # request actually targets the primary client.
-        if self.primary_client is not None and request.model is self.primary_client:
-            return self.primary_name
-        if self.primary_client is None:
-            return self.primary_name
-        return _model_display_name(request.model)
+        return (
+            self._catalog_name(request)
+            or api_model_id(request.model)
+            or type(request.model).__name__
+        )
+
+    def _with_fallback_identity(  # DALTON-HOOK(model-fallback-identity)
+        self,
+        req: ModelRequest,
+        original_request: ModelRequest,
+        fallback_name: str,
+        fallback_client: Any,
+    ) -> ModelRequest:
+        """Attach a request-only note on non-Claude fallback calls so the model
+        knows its own identity and which designated model it stands in for (named
+        directly, since not every graph renders a ``<model>`` block); Claude fallbacks stay untouched so ``SystemPinMiddleware``
+        keeps the pinned system message intact for bound thinking."""
+        from ptc_agent.agent.middleware.compaction.measure import is_claude
+
+        if not hasattr(req, "system_message") or is_claude(fallback_client):
+            return req
+        primary_label = (
+            client_label(original_request.model, self._catalog_name(original_request))
+            or self._primary_display_name(original_request)
+        )
+        fallback_label = (
+            client_label(fallback_client, fallback_name)
+            or fallback_name
+            or api_model_id(fallback_client)
+            or type(fallback_client).__name__
+        )
+        note = (
+            f"[Fallback call] This individual call was moved to fallback model "
+            f"{fallback_label}; the model the server designated for this run is {primary_label}."
+        )
+        try:
+            return req.override(
+                system_message=append_to_system_message(req.system_message, note)
+            )
+        except TypeError:
+            return req
 
     def _calculate_delay(self, retry_number: int) -> float:
         # Local copy of langchain.agents.middleware._retry.calculate_delay
@@ -733,11 +767,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             or self._credit_gate_exhausted()
         ):
             return [primary]
-        if self.primary_client is None or request.model is self.primary_client:
-            target = self.primary_name
-        else:
-            # A subagent on its own model, which may be one of the fallbacks.
-            target = _stamped(request.model, "manifest_model")
+        # A subagent on its own model may be one of the fallbacks.
+        target = self._catalog_name(request)
         return [primary, *self._on_its_payer(request.model, _distinct(self.fallbacks, target))]
 
     def _on_its_payer(
@@ -865,29 +896,33 @@ class ModelResilienceMiddleware(AgentMiddleware):
                 logger.warning(
                     "[ModelResilience] retrying without reasoning after a refused request",
                     status=status,
-                    model=_model_display_name(req.model),
+                    model=api_model_id(req.model) or type(req.model).__name__,
                     thread_id=run_ids()[0],
                     error=(str(exc) or type(exc).__name__)[:_STRIP_ERROR_MAX_CHARS],
                 )
                 return status, _Recovery(request=stripped)
         return status, None
 
-    @staticmethod
     def _answered(
+        self,
         response: ModelResponse,
         name: str,
         index: int,
         request: ModelRequest,
         stripped: list[str],
     ) -> ModelCallResult:
-        """The answer, with the strip it took kept for the thread's later
-        requests (``UnsentThinkingState``). Only the request's own model
-        keeps one: a fallback refusing another model's reasoning says nothing
-        about what the primary reads."""
+        """The answer, stamped with the model that wrote it, and with the
+        strip it took kept for the thread's later requests
+        (``UnsentThinkingState``). Only the request's own model keeps one: a
+        fallback refusing another model's reasoning says nothing about what
+        the primary reads."""
         _report_drops(response, name, request.messages)
-        if index:
-            return _mark_fallback(response, name)
-        if not stripped:
+        marks = {FALLBACK_KEY: name} if index else {}
+        catalog = name if index else self._catalog_name(request)
+        if catalog:
+            marks[CATALOG_MODEL_KEY] = catalog
+        _mark(response, marks)
+        if index or not stripped:
             return response
         return ExtendedModelResponse(
             model_response=response, command=Command(update={UNSENT_THINKING_KEY: set(stripped)})
@@ -926,6 +961,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             if not self._worth_trying(request, candidates[index], refused_at):
                 continue
             req = request if client is None else request.override(model=client)
+            if index > 0:  # DALTON-HOOK(model-fallback-identity)
+                req = self._with_fallback_identity(req, request, name, req.model)
             attempts = 0
             escalated = False
             stripped: list[str] = []
@@ -1017,6 +1054,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             current = self._current_client(base)
             if current is not base:
                 req = req.override(model=current)
+            if index > 0:  # DALTON-HOOK(model-fallback-identity)
+                req = self._with_fallback_identity(req, request, name, req.model)
             oauth_refreshed = False
             attempts = 0
             escalated = False

@@ -103,9 +103,10 @@ _SERVER_KEPT_ELSEWHERE = (
 # the same path would not reach: there it names a folder inside Home's own.
 _WORKSPACE_OWN = (WorkspaceLayout.MEMORY_DIR, WorkspaceLayout.TRANSCRIPTS_DIR)
 
+# DALTON-HOOK(computer-cli-tokens-off): direct to agent_output when la CLI is off.
 _WORKSPACE_KEPT_ELSEWHERE = (
     "A workspace's memory and past threads are kept by the server, not on its "
-    "computer: read its threads with `agent_output`, and hand a change to its "
+    "computer: read its threads with agent_output, and hand a change to its "
     "memory to its analyst."
 )
 
@@ -153,6 +154,15 @@ class ComputerUnreachable(Exception):
     """The named computer cannot take the call; the message is for the agent."""
 
 
+class ShipmentTooLarge(Exception):
+    """A shipment holds more than its ``max_bytes``. Not for the agent as it
+    is: the caller words it, naming the limit."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(f"{size} bytes")
+        self.size = size
+
+
 @dataclass(frozen=True)
 class ComputerTarget:
     """Another of the user's computers, as one call reaches it."""
@@ -188,6 +198,41 @@ class Attached:
     copied: int = 0
 
 
+@dataclass(frozen=True)
+class Shipment:
+    """One file or folder for the host to carry between two computers by way
+    of object storage, landing in a staging folder on the destination."""
+
+    #: Where the file or folder really is on the source, links followed.
+    path: str
+    folder: bool
+    #: A file's size as the source read it, held to ``max_bytes`` before it
+    #: is read whole; a folder's is found by walking it.
+    size: int
+    #: The folder on the destination the copy lands in: a file as
+    #: ``whole``, a folder as ``unpacked/<its name>``.
+    staging: str
+    #: The most it may hold, every file counted whole.
+    max_bytes: int
+    #: Left out of a folder: paths by how they end, read from the folder's
+    #: own name; names by pattern; and folders matched as the same one on
+    #: disk however they are spelled.
+    tails: tuple[str, ...] = ()
+    names: tuple[str, ...] = ()
+    same_as: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Shipped:
+    """What a shipment landed on the destination."""
+
+    #: Its files' bytes, every file counted whole.
+    size: int
+    files: int
+    #: Everything landed, folders and links among them, the folder included.
+    entries: int
+
+
 class ComputerReach(Protocol):
     """Resolves the ``computer`` a call names. The host implements it,
     since the user's computers and their sessions are its own."""
@@ -195,6 +240,11 @@ class ComputerReach(Protocol):
     async def reach(self, computer: str) -> ComputerTarget | None:
         """The computer ``computer`` names, awake and ready for a call, or
         None when it is the turn's own. Raises ``ComputerUnreachable``."""
+
+    async def target(self, computer: str | None) -> ComputerTarget:
+        """The computer ``computer`` names, the turn's own included, which
+        None names too. The turn's own reads paths as its tools do, from
+        Home's folder. Raises ``ComputerUnreachable``."""
 
     async def in_use(self, target: ComputerTarget) -> None:
         """Count a call still running on ``target`` as use of it: the idle
@@ -209,6 +259,16 @@ class ComputerReach(Protocol):
         as the messaging service fetches them, in order. All are found before
         any is copied, so a file that cannot go leaves no copy of the others.
         Raises ``ComputerUnreachable``."""
+
+    async def ship(
+        self, source: ComputerTarget, shipment: Shipment, destination: ComputerTarget
+    ) -> Shipped | None:
+        """Land ``shipment`` from ``source`` in its staging folder on
+        ``destination`` through object storage, uploading only what the store
+        does not hold yet. None when that route does not serve these two
+        computers, or failed to reach the store, which leaves the staging
+        folder for the caller to clear and carry the bytes itself. Raises
+        ``ComputerUnreachable`` with the agent's sentence."""
 
 
 ToolsOn = Callable[[ComputerTarget], Mapping[str, BaseTool]]
@@ -299,7 +359,7 @@ def _with_computer(tool: BaseTool, tools: ComputerTools, reach: ComputerReach) -
         stamp_tool_provider(target.sandbox.config.sandbox.provider)
         stamp_tool_channel(target.sandbox.channel)
         with project_bound(target.project):
-            return await _while_in_use(reach, target, _run(there, kwargs, config))
+            return await while_in_use(reach, (target,), _run(there, kwargs, config))
 
     return StructuredTool(
         name=tool.name,
@@ -367,17 +427,20 @@ async def _unsearched(reach: ComputerReach) -> str | None:
     )
 
 
-async def _while_in_use(reach: ComputerReach, target: ComputerTarget, work: Awaitable[T]) -> T:
-    """``work``, with ``target`` counted as in use until it ends, so the idle
-    sweep does not stop the computer under a call still running there."""
+async def while_in_use(
+    reach: ComputerReach, targets: Sequence[ComputerTarget], work: Awaitable[T]
+) -> T:
+    """``work``, with each of ``targets`` counted as in use until it ends, so
+    the idle sweep does not stop a computer under a call still running there."""
 
     async def beat() -> None:
         while True:
             await asyncio.sleep(_IN_USE_EVERY_S)
-            try:
-                await reach.in_use(target)
-            except Exception as e:  # noqa: BLE001 - the call goes on
-                logger.debug("could not count the computer as in use", error=str(e))
+            for target in targets:
+                try:
+                    await reach.in_use(target)
+                except Exception as e:  # noqa: BLE001 - the call goes on
+                    logger.debug("could not count the computer as in use", error=str(e))
 
     beating = asyncio.create_task(beat())
     try:

@@ -3,19 +3,25 @@
 A hand-off into Home starts a turn in Home, which is the Chief of Staff again
 rather than any workspace's analyst, so it is refused before the user is asked.
 A hand-off naming no workspace is refused too: the Chief of Staff creates a
-new workspace itself, under that workspace's own approval, before handing off.
-A delete of Home is refused before the user is asked too, and the card for any
-other delete names the workspace it would lose.
+new workspace itself with ``la``, under that workspace's own approval, before
+handing off.
 """
 
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
-from src.tools.secretary.chief_of_staff import chief_of_staff_workspaces, delegate_to_analyst
+from src.server.database.workspace import get_workspace
+from src.server.services.workspace_manager import WorkspaceManager
+from src.tools.secretary.chief_of_staff import (
+    CHIEF_OF_STAFF_TOOLS,
+    chief_of_staff_workspaces,  # DALTON-HOOK(computer-cli-tokens-off)
+    delegate_to_analyst,
+)
+from src.tools.secretary.tools import hitl_confirm
 
 USER_ID = "user-1"
 HOME_ID = "33333333-3333-3333-3333-333333333333"
@@ -61,6 +67,26 @@ async def test_a_hand_off_into_home_is_refused_before_the_user_is_asked(args):
 
 
 @pytest.mark.asyncio
+async def test_a_hand_off_into_the_home_stand_in_is_refused_before_the_user_is_asked():
+    from src.server.database.home_workspace import HOME_STAND_IN_KEY
+
+    stand_in_id = "44444444-4444-4444-4444-444444444444"
+    confirm = MagicMock(side_effect=AssertionError("the user must not be asked"))
+    with patch(
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(return_value={"user_id": USER_ID, "name": "stand-in", "config": {HOME_STAND_IN_KEY: True}}),
+    ), patch("src.tools.secretary.dispatch.hitl_confirm", confirm):
+        result = await delegate_to_analyst.ainvoke(
+            _call({"question": "Value NVDA", "workspace_id": stand_in_id}),
+            config={"configurable": {"user_id": USER_ID, "workspace_id": HOME_ID}},
+        )
+
+    payload = json.loads(result.update["messages"][0].content)
+    assert payload["success"] is False
+    assert "workspace you are working in" in payload["error"]
+
+
+@pytest.mark.asyncio
 async def test_a_hand_off_without_a_workspace_is_refused_before_anything_is_created():
     confirm = MagicMock(side_effect=AssertionError("the user must not be asked"))
     create = AsyncMock(side_effect=AssertionError("no workspace may be created"))
@@ -75,9 +101,11 @@ async def test_a_hand_off_without_a_workspace_is_refused_before_anything_is_crea
 
     payload = json.loads(result.update["messages"][0].content)
     assert payload["success"] is False
+    # DALTON-HOOK(computer-cli-tokens-off): `delegate_to_analyst` references `manage_workspaces` instead of `la`.
     assert 'manage_workspaces(action="create")' in payload["error"]
 
 
+# --- DALTON-HOOK(computer-cli-tokens-off): begin ---
 def _delete_call(workspace_id: str) -> dict:
     return {
         "name": "manage_workspaces",
@@ -88,14 +116,31 @@ def _delete_call(workspace_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_deleting_home_is_refused_before_the_user_is_asked():
-    confirm = MagicMock(side_effect=AssertionError("the user must not be asked"))
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"user_id": USER_ID, "workspace_id": HOME_ID, "status": "unbound", "name": "Home"},
+        # Home's stand-in, where a Home turn runs while Home's machine is away.
+        {
+            "user_id": USER_ID,
+            "workspace_id": "stand-in",
+            "status": "running",
+            "name": "Home",
+            "config": {"home_stand_in": True},
+        },
+    ],
+    ids=["home", "stand-in"],
+)
+async def test_deleting_home_is_refused_before_the_user_is_asked(row):
+    confirm = create_autospec(
+        hitl_confirm, side_effect=AssertionError("the user must not be asked")
+    )
     with patch(
         "src.server.database.workspace.get_workspace",
-        AsyncMock(return_value={"user_id": USER_ID, "workspace_id": HOME_ID, "status": "unbound", "name": "Home"}),
+        create_autospec(get_workspace, return_value=row),
     ), patch("src.tools.secretary.tools.hitl_confirm", confirm):
         result = await chief_of_staff_workspaces.ainvoke(
-            _delete_call(HOME_ID),
+            _delete_call(row["workspace_id"]),
             config={"configurable": {"user_id": USER_ID, "workspace_id": HOME_ID}},
         )
 
@@ -107,10 +152,18 @@ async def test_deleting_home_is_refused_before_the_user_is_asked():
 @pytest.mark.asyncio
 async def test_the_delete_card_names_the_workspace():
     workspace_id = "44444444-4444-4444-4444-444444444444"
-    confirm = MagicMock(return_value=(False, None))
+    confirm = create_autospec(hitl_confirm, return_value=(False, None))
     with patch(
         "src.server.database.workspace.get_workspace",
-        AsyncMock(return_value={"user_id": USER_ID, "workspace_id": workspace_id, "status": "running", "name": "Lithium"}),
+        create_autospec(
+            get_workspace,
+            return_value={
+                "user_id": USER_ID,
+                "workspace_id": workspace_id,
+                "status": "running",
+                "name": "Lithium",
+            },
+        ),
     ), patch("src.tools.secretary.tools.hitl_confirm", confirm):
         await chief_of_staff_workspaces.ainvoke(
             _delete_call(workspace_id),
@@ -118,7 +171,8 @@ async def test_the_delete_card_names_the_workspace():
         )
 
     confirm.assert_called_once_with(
-        "delete_workspace", {"workspace_id": workspace_id, "workspace_name": "Lithium"},
+        "delete_workspace",
+        {"workspace_id": workspace_id, "workspace_name": "Lithium"},
     )
 
 
@@ -127,12 +181,25 @@ async def test_an_approved_delete_leaves_files_on_the_owners_machine():
     """The card asks about the workspace, not the folder on the user's own
     machine, so the tool takes the manager's default, which keeps it."""
     workspace_id = "44444444-4444-4444-4444-444444444444"
-    manager = MagicMock(delete_workspace=AsyncMock(return_value=True))
+    manager = create_autospec(WorkspaceManager, instance=True)
+    manager.delete_workspace.return_value = True
     with patch(
         "src.server.database.workspace.get_workspace",
-        AsyncMock(return_value={"user_id": USER_ID, "workspace_id": workspace_id, "status": "running", "name": "Lithium"}),
-    ), patch("src.tools.secretary.tools.hitl_confirm", MagicMock(return_value=(True, None))), patch(
-        "src.server.services.workspace_manager.WorkspaceManager.get_instance", return_value=manager
+        create_autospec(
+            get_workspace,
+            return_value={
+                "user_id": USER_ID,
+                "workspace_id": workspace_id,
+                "status": "running",
+                "name": "Lithium",
+            },
+        ),
+    ), patch(
+        "src.tools.secretary.tools.hitl_confirm",
+        create_autospec(hitl_confirm, return_value=(True, None)),
+    ), patch(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=manager),
     ):
         result = await chief_of_staff_workspaces.ainvoke(
             _delete_call(workspace_id),
@@ -141,3 +208,37 @@ async def test_an_approved_delete_leaves_files_on_the_owners_machine():
 
     assert json.loads(result.update["messages"][0].content)["success"] is True
     manager.delete_workspace.assert_awaited_once_with(workspace_id)
+# --- DALTON-HOOK(computer-cli-tokens-off): end ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-6.1-terra", None])
+async def test_the_hand_off_card_names_the_model_the_call_named(model):
+    """The user approves the model along with the work; a declined card
+    stops before anything is sent."""
+    confirm = MagicMock(return_value=(False, {}))
+    args = {"question": "Value NVDA", "workspace_id": "ws-1"}
+    if model:
+        args["model"] = model
+    with patch(
+        "src.server.database.workspace.get_workspace",
+        AsyncMock(return_value={"user_id": USER_ID, "name": "Semis"}),
+    ), patch("src.tools.secretary.dispatch.hitl_confirm", confirm):
+        await delegate_to_analyst.ainvoke(
+            _call(args),
+            config={"configurable": {"user_id": USER_ID, "workspace_id": HOME_ID}},
+        )
+
+    kind, payload = confirm.call_args.args
+    assert kind == "ptc_agent"
+    assert payload["model"] == model
+
+
+def test_the_hand_off_is_the_chief_of_staffs_only_tool():
+    """DALTON-HOOK(computer-cli-tokens-off): server-side workspace/thread tools stay registered alongside delegate_to_analyst."""
+    assert [t.name for t in CHIEF_OF_STAFF_TOOLS] == [
+        "manage_workspaces",
+        "delegate_to_analyst",
+        "agent_output",
+        "manage_threads",
+    ]

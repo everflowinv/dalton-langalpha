@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional
 from uuid import uuid4
 
+from src.server.contracts.status import unreachable_facts
 from src.server.contracts.turn_kinds import RUN_ORIGIN_META, classify_origin
 from src.server.database.runs import lifecycle as tl_db
 from src.server.database.runs.lifecycle import (  # re-exported for callers
@@ -125,6 +126,8 @@ class RunHandle:
     pending_input: Dict[str, Any] = field(default_factory=dict)
     # DALTON-HOOK(colleague-dispatch): whether START admitted the run as a post-revocation tail turn
     tail_turn_no_new_work: bool = False
+    # Where the run came from (``turn_kinds.RunOrigin``), as START classified it.
+    origin: Optional[str] = None
 
     @property
     def checkpointer(self) -> Optional[Any]:
@@ -164,6 +167,10 @@ def _with_detached_failure_kind(outcome: RunOutcome) -> RunOutcome:
     kind = sent.get("error_kind") if sent else "internal"
     if kind:
         outcome.metadata = {**(outcome.metadata or {}), "error_kind": kind}
+        # An unreachable machine's code and name, which the row's own replay
+        # words it by.
+        if kind == "computer_unreachable" and sent:
+            outcome.metadata.update(unreachable_facts(sent))
     return outcome
 
 
@@ -292,6 +299,7 @@ class RunCoordinator:
                 guard=guard,
                 pending_input=pending_input or {},
                 tail_turn_no_new_work=_tail_turn_no_new_work,
+                origin=origin,
             )
             if guard is not None:
                 guard.bind_owner(handle)
@@ -783,6 +791,7 @@ class RunCoordinator:
         self._schedule_search_index(thread_id)
         self._schedule_transcript_export(thread_id, run)
         self._schedule_keep_updated(run)
+        self._schedule_activity_stamp(run)
         self._schedule_archive_prune(thread_id)
         self._nudge_hook_drainer()
 
@@ -854,6 +863,35 @@ class RunCoordinator:
         except Exception:
             logger.warning(
                 f"[RunCoordinator] keep-updated scheduling failed for "
+                f"workspace {workspace_id}",
+                exc_info=True,
+            )
+
+    def _schedule_activity_stamp(self, run: Optional[Dict[str, Any]]) -> None:
+        # Only a turn's start stamps the idle clock otherwise, so a turn longer
+        # than the idle timeout ends on a machine the next sweep stops. A Home
+        # turn in Home's stand-in ran in the stand-in, on its computer.
+        from src.server.database.home_workspace import (
+            STAND_IN_COMPUTER,
+            get_home_stand_in_id,
+        )
+
+        meta = (run or {}).get("metadata") or {}
+        workspace_id = meta.get("workspace_id")
+        if meta.get(STAND_IN_COMPUTER) and meta.get("user_id"):
+            workspace_id = get_home_stand_in_id(str(meta["user_id"]))
+        if not workspace_id:
+            return
+        try:
+            from src.server.database.workspace import update_workspace_activity
+
+            spawn_protected(
+                update_workspace_activity(str(workspace_id)),
+                f"turn-end-activity-{workspace_id}",
+            )
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] activity stamp scheduling failed for "
                 f"workspace {workspace_id}",
                 exc_info=True,
             )

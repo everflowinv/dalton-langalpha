@@ -9,6 +9,7 @@ from ptc_agent.config.core import (
     DockerConfig,
     E2BConfig,
     PlatformSecretDefinition,
+    SandboxConfig,
     SSHConfig,
 )
 from ptc_agent.core.sandbox.runtime import SandboxProvider
@@ -34,6 +35,15 @@ PROVIDER_KINDS = tuple(_PROVIDERS)
 METERED_KINDS: tuple[str, ...] = ("daytona", "docker", "e2b")
 METRIC_KINDS: tuple[str, ...] = ("daytona", "e2b")
 ALLOCATION_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# Kinds whose provider stops an idle sandbox on its own at ``auto_stop_interval``
+# (Daytona's auto-stop, E2B's pause deadline). The server's idle sweep runs
+# ahead of that only for these; for the rest the setting is the sweep's.
+SELF_STOPPING_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# Kinds whose computers the deployment builds and can build again: the cloud
+# computers, every kind but a machine of the user's own (``is_own_machine``).
+# Asked on a turn's admission (where Home's stand-in may run), so answering
+# imports no provider module either.
+RECREATABLE_KINDS: tuple[str, ...] = ("daytona", "docker", "e2b")
 
 
 def provider_class(kind: str) -> type[SandboxProvider]:
@@ -58,16 +68,22 @@ def provider_runs_remote(kind: str | None) -> bool:
         return False
 
 
-def may_be_primary(kind: str) -> bool:
-    """Whether a computer of ``kind`` may be the user's primary. Home lives on
-    the primary, which is never removed, so only a machine the deployment can
-    build again may hold it: one the user brought could be wiped or gone for
-    good with Home on it.
+def is_own_machine(kind: str) -> bool:
+    """Whether a computer of ``kind`` is a machine of the user's own, which the
+    deployment neither builds again nor can always reach (asleep, offline).
 
     Raises:
         ValueError: If ``kind`` names no known provider.
     """
-    return provider_class(kind).recreatable
+    return not provider_class(kind).recreatable
+
+
+def builds_computers(sandbox: SandboxConfig) -> bool:
+    """Whether the deployment can make a user a computer on its own: some kind
+    a new computer may be created on is one it can build again. Without one, a
+    user's computers are only the machines they bring.
+    """
+    return any(kind in RECREATABLE_KINDS for kind in sandbox.creatable_providers())
 
 
 def build_provider(

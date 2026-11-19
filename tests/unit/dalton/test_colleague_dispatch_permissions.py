@@ -11,7 +11,7 @@ from uuid import uuid4
 import aiohttp
 import psycopg
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
@@ -42,6 +42,7 @@ from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.sandbox import PTCSandbox
 from src.server.app.threads import messaging as threads_messaging
+from src.server.dependencies.principal import Principal
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
 from src.server.handlers.chat import error_handling as chat_error_handling
@@ -1348,6 +1349,11 @@ async def test_revoked_cos_wakeup_terminated_in_delivery_and_excluded_from_subse
         notify_turn,
         "park_while_thread_busy",
         create_autospec(notify_turn.park_while_thread_busy, return_value=False),
+    )
+    monkeypatch.setattr(
+        notify_turn,
+        "park_while_computer_away",
+        create_autospec(notify_turn.park_while_computer_away, return_value=False),
     )
     monkeypatch.setattr(
         riders_db,
@@ -2714,7 +2720,9 @@ async def test_context_menu_backend_guards_across_four_identities(
             x_user_id="u-internal-b",
         ),
         lambda: threads_crud.delete_thread_endpoint(
-            dispatched_thread_id, x_user_id="u-internal-b"
+            dispatched_thread_id,
+            Principal(user_id="u-internal-b", auth="session"),
+            Request({"type": "http", "headers": []}),
         ),
         lambda: threads_sharing.update_thread_share(
             dispatched_thread_id,
@@ -2760,7 +2768,11 @@ async def test_context_menu_backend_guards_across_four_identities(
         assert exc_bystander_upd.value.status_code == 403
 
         with pytest.raises(HTTPException) as exc_bystander_del:
-            await threads_crud.delete_thread_endpoint(tid, x_user_id="u-admin")
+            await threads_crud.delete_thread_endpoint(
+                tid,
+                Principal(user_id="u-admin", auth="session"),
+                Request({"type": "http", "headers": []}),
+            )
         assert exc_bystander_del.value.status_code == 403
 
         with pytest.raises(HTTPException) as exc_bystander_share:
@@ -2778,7 +2790,11 @@ async def test_context_menu_backend_guards_across_four_identities(
         assert exc_ext_upd.value.status_code == 404
 
         with pytest.raises(HTTPException) as exc_ext_del:
-            await threads_crud.delete_thread_endpoint(tid, x_user_id="u-external")
+            await threads_crud.delete_thread_endpoint(
+                tid,
+                Principal(user_id="u-external", auth="session"),
+                Request({"type": "http", "headers": []}),
+            )
         assert exc_ext_del.value.status_code == 404
 
         with pytest.raises(HTTPException) as exc_ext_share:
@@ -2808,6 +2824,10 @@ async def test_context_menu_backend_guards_across_four_identities(
         create_autospec(dalton_pubs.has_published_reports, return_value=True),
     )
     with pytest.raises(HTTPException) as exc_pub_guard:
-        await workspaces_app.delete_workspace("ws-b", x_user_id="u-internal-b")
+        await workspaces_app.delete_workspace(
+            "ws-b",
+            Principal(user_id="u-internal-b", auth="session"),
+            Request({"type": "http", "headers": []}),
+        )
     assert exc_pub_guard.value.status_code == 409
     assert "已发布研报" in str(exc_pub_guard.value.detail)

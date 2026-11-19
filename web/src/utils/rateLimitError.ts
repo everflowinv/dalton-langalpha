@@ -9,6 +9,7 @@
 
 import type { PlanRefusal } from '@/api/model';
 import type { PlanLimit, UpstreamErrorHint, UpstreamPayer } from '@/lib/upstreamFailure';
+import type { ErrorKind } from '@/types/sse';
 
 /** A 429's `detail`, as it comes off the wire. Only the two fields this module
  *  acts on are named: the counts the quota service also sends are already folded
@@ -22,13 +23,15 @@ export interface RateLimitErrorInfo {
 /** Where a subscription whose sign-in lapsed is renewed. The server's refusal
  *  of a turn carries the same link already worded; a failure mid-stream names
  *  only the hint, so the client supplies the destination. */
-export const RECONNECT_ACCOUNT_LINK: ErrorLinkSpec = {
+export const RECONNECT_ACCOUNT_LINK: PageLinkSpec = {
   url: '/settings?tab=model',
   label: 'Reconnect',
   labelKey: 'chat.errorLinkReconnect',
 };
 
-export interface ErrorLinkSpec {
+/** A link to a page: a route of this app, the account console, or another site. */
+export interface PageLinkSpec {
+  kind?: undefined;
   url: string;
   /** Literal text, for a label the producer authored (or the service did, on a
    *  link that arrives off the wire already worded). ``labelKey`` wins when
@@ -52,14 +55,36 @@ export interface ErrorLinkSpec {
   resize?: string;
 }
 
+/**
+ * Where an error sends the user. Most links go to a page; the way out of a
+ * refusal for want of a computer Home can live on opens the Computers dialog
+ * instead, worded for the device it is on (`ComputerRefusal`), so it has no
+ * URL: `needsComputer` adds one, `needsBackup` opens the computer whose
+ * backup is off, where backup is turned on.
+ */
+export type ErrorLinkSpec =
+  | PageLinkSpec
+  | { kind: 'needsComputer' }
+  | { kind: 'needsBackup'; computerId: string; name: string };
+
+/** A link's key among an error's links. */
+export function errorLinkKey(link: ErrorLinkSpec): string {
+  return link.kind === undefined ? `${link.url}|${link.label}` : link.kind;
+}
+
 export interface StructuredError {
   message: string;
   /** Rendered in order after the message; the first is the primary action. */
   links?: ErrorLinkSpec[];
   /** ``upstream`` = LLM provider's fault (their 5xx/401/429). ``internal`` =
    *  our pipeline. Undefined for rate-limit errors built on the client.
-   *  ``notice`` = nothing failed, so it reads as information, not an error. */
-  kind?: 'upstream' | 'internal' | 'notice';
+   *  ``notice`` = nothing failed, so it reads as information, not an error.
+   *  ``computer_unreachable`` = the turn's own machine did not answer. */
+  kind?: ErrorKind | 'notice';
+  /** On ``computer_unreachable``: the connect code, which words its card, and
+   *  the computer that did not answer with its name, when the server knows
+   *  which: a Chief of Staff reaches computers other than its page's. */
+  unreachable?: { code?: string; computerId?: string; computerName?: string };
   /** A turn a Claude plan's limit ended, worded where it is drawn, in the
    *  reader's zone and language, under its own headline. */
   planRefusal?: PlanRefusal;
@@ -101,7 +126,7 @@ const NOT_ABOUT_THE_ACCOUNT = new Set([OUR_OWN_LIMIT, 'service_unavailable']);
 export function buildRateLimitError(
   info: RateLimitErrorInfo,
   platformUrl?: string | null,
-): StructuredError {
+): Omit<StructuredError, 'links'> & { links?: PageLinkSpec[] } {
   // The message is the quota service's, verbatim. It knows the plan, the
   // counts, the user's language and their local day. Rebuilding it here from
   // `type` put billing wording in an open-source client, hard-coded one
@@ -126,7 +151,7 @@ export function buildRateLimitError(
   // the quota gate rejected before anything was persisted. Navigating in place
   // discards both, so the user returns from topping up to a thread that looks
   // like nothing happened.
-  const links: ErrorLinkSpec[] | undefined =
+  const links: PageLinkSpec[] | undefined =
     platformUrl && !NOT_ABOUT_THE_ACCOUNT.has(info.type as string)
       ? [
           {

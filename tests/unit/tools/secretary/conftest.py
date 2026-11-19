@@ -1,7 +1,7 @@
 """Fixtures and fakes shared by the secretary tool suite.
 
 The fakes below, imported via ``from .conftest import ...``, stand in for the
-workspace manager and for the background dispatch POST.
+background dispatch POST.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ def _no_live_workspaces():
 
 
 def workspace_manager(row: dict) -> MagicMock:
+    # DALTON-HOOK(computer-cli-tokens-off): shared fake for manage_workspaces create tests.
     """A ``WorkspaceManager`` whose create returns ``row``."""
     mgr = MagicMock()
     mgr.create_workspace = AsyncMock(return_value=row)

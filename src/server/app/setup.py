@@ -44,7 +44,9 @@ from starlette.middleware.gzip import GZipMiddleware
 from ptc_agent.core.sandbox.livefs_runtime.protocol import PREFIX as LIVEFS_PREFIX
 from ptc_agent.core.sandbox.platform_secrets import PlatformSecretError
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+from src.server.services.computer_errors import NeedsComputer
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from src.server.app.logos import LOGOS_PREFIX, router as logos_router
 from src.server.preview_proxy import install_preview_proxy
 from src.config.logging_config import configure_logging
 from src.config.settings import (
@@ -55,6 +57,7 @@ from src.observability import init_otel, init_otel_runtime, shutdown_otel_runtim
 from src.observability.private_query import drop_span_query
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.cli_calls import CliCallRecorder
+from src.server.utils.request_client import RequestClientMiddleware
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
 from src.server.services.preview_base import (
@@ -63,6 +66,7 @@ from src.server.services.preview_base import (
     preview_proxy_requirements,
 )
 from src.server.utils.error_sanitization import (
+    COMPUTER_UNREACHABLE_HEADER,
     sandbox_failure_http,
     single_line,
 )
@@ -162,6 +166,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Indexes for conversation search the turns their settle missed, and
     # backfills older ones; an advisory lock keeps it to one worker a pass.
     ("ThreadSearchSweeper", "src.server.services.search.sweep"),
+    # Copies what Home's stand-in wrote into Home once Home's computer is
+    # back; a per-user advisory lock and a guarded watermark dedup it.
+    ("HomeHandbackSweeper", "src.server.services.home_handback"),
 )
 
 
@@ -428,6 +435,16 @@ async def lifespan(app: FastAPI):
         )
 
         await reconcile_platform_secrets_at_boot(agent_config)
+
+        from src.server.services.firecrawl_accounts import warn_if_discovery_keyless
+
+        warn_if_discovery_keyless(agent_config)
+
+        from src.server.services.egress.platform_accounts import (
+            disable_unreachable_platform_servers,
+        )
+
+        disable_unreachable_platform_servers(agent_config)
         logger.info("PTC Agent configuration loaded successfully")
 
         # Connect once, freeze, install as the process-global registry so every
@@ -486,6 +503,14 @@ async def lifespan(app: FastAPI):
         )
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
+
+        # What each sandbox was in before a start, and the provider's own
+        # start time, reach the computer events from here.
+        from src.server.services.computer_usage.events import (
+            install_runtime_start_listener,
+        )
+
+        install_runtime_start_listener()
 
         # An ssh computer logs in with its owner's key, which the provider
         # reads through this loader; any worker may start one. A machine that
@@ -1004,6 +1029,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing egress relay client: {e}")
 
+    try:
+        from src.server.services.firecrawl_accounts import close_partner_client
+
+        await close_partner_client()
+    except Exception as e:
+        logger.warning(f"Error closing Firecrawl partner client: {e}")
+
     # 0.0b. Stop the turn-cancel nudge listener.
     try:
         from src.server.services.runs.cancel import TurnCancelListener
@@ -1270,6 +1302,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing APNs client: {e}")
 
+    try:
+        from src.data_client.ginlix_data.logos import close_logo_client
+
+        await close_logo_client()
+    except Exception as e:
+        logger.warning(f"Error closing logo HTTP client: {e}")
+
     # 9.1. Close the messaging gateway HTTP client
     try:
         from src.tools.messaging.tools import close_client
@@ -1410,8 +1449,15 @@ def _gzip_exempt(path: str) -> bool:
     next save is checked against. A CDN in front of the server (Cloudflare
     for one) asks for gzip whatever its client asked, and decompressing for
     the daemon, which asks for no encoding, weakens or drops that tag.
+
+    A ticker logo is an already compressed image whose ETag a browser sends
+    back to revalidate it, for the same reason.
     """
-    return path.endswith("/files/download") or path.startswith(f"{LIVEFS_PREFIX}/")
+    return (
+        path.endswith("/files/download")
+        or path.startswith(f"{LIVEFS_PREFIX}/")
+        or path.startswith(f"{LOGOS_PREFIX}/")
+    )
 
 
 class _SelectiveGZip(GZipMiddleware):
@@ -1438,6 +1484,10 @@ app.add_middleware(MalformedIdDiagnosticMiddleware)
 # Records every request a computer's `la` makes, with the thread whose command
 # made it (src/server/services/cli_calls.py).
 app.add_middleware(CliCallRecorder)
+
+# Which of our apps sent each request, for computer start telemetry
+# (src/server/utils/request_client.py).
+app.add_middleware(RequestClientMiddleware)
 
 # Register request ID middleware (will be executed after CORS)
 # Note: In FastAPI, middleware is executed in reverse order (last added = first executed)
@@ -1494,8 +1544,14 @@ app.add_middleware(
     ],  # Use the configured list of methods
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
     # A ranged file download is read by script, which sees only these past the
-    # safelisted few when the app is served from another origin.
-    expose_headers=["Content-Range", "Accept-Ranges", "ETag"],
+    # safelisted few when the app is served from another origin; the file panel
+    # words an unreachable computer's 503 from the last.
+    expose_headers=[
+        "Content-Range",
+        "Accept-Ranges",
+        "ETag",
+        COMPUTER_UNREACHABLE_HEADER,
+    ],
 )
 
 # Previews of private sandboxes, picked out by Host before any middleware
@@ -1525,7 +1581,11 @@ async def _sandbox_failure_handler(request: Request, exc: Exception) -> JSONResp
         f"Sandbox unreachable for {single_line(request.url.path)}: {single_line(str(exc))}"
     )
     answer = sandbox_failure_http(exc)
-    return JSONResponse(status_code=answer.status_code, content={"detail": answer.detail})
+    return JSONResponse(
+        status_code=answer.status_code,
+        content={"detail": answer.detail},
+        headers=answer.headers,
+    )
 
 
 app.add_exception_handler(SandboxGoneError, _sandbox_failure_handler)
@@ -1533,6 +1593,14 @@ app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
 # A refusal a caller let through unwrapped, which would otherwise answer 500.
 app.add_exception_handler(SSHConnectError, _sandbox_failure_handler)
 
+
+async def _needs_computer_handler(request: Request, exc: NeedsComputer) -> JSONResponse:
+    """The one answer to a user with no computer Home can live on: every
+    route lets the refusal through to here, and the client offers a way out."""
+    return JSONResponse(status_code=409, content={"detail": exc.detail})
+
+
+app.add_exception_handler(NeedsComputer, _needs_computer_handler)
 
 
 # ============================================================================
@@ -1545,6 +1613,7 @@ from src.server.app.utilities import health_router
 from src.server.app.computers import router as computers_router
 from src.server.app.computers_ssh import router as computers_ssh_router
 from src.server.app.workspaces import router as workspaces_router
+from src.server.app.home import router as home_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
 from src.server.app.attachments import router as attachments_router
@@ -1557,6 +1626,8 @@ from src.server.app.workspace_sandbox import preview_redirect_router
 from src.server.app.market_data import router as market_data_router
 from src.server.app.bars import router as bars_router
 from src.server.app.user_events import router as user_events_router
+from src.server.app.cli_approvals import router as cli_approvals_router
+from src.server.app.vendor_terms import router as vendor_terms_router
 from src.server.app.users import router as users_router
 from src.server.app.reports import router as reports_router
 from src.server.app.trading_permission import router as trading_permission_router
@@ -1622,6 +1693,7 @@ else:
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
 app.include_router(search_router)  # /api/v1/search - Conversation search (command palette)
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
+app.include_router(home_router)  # /api/v1/workspaces/home* - Home and its stand-in
 app.include_router(workspaces_router)  # /api/v1/workspaces/* - Workspace CRUD
 app.include_router(
     computers_ssh_router
@@ -1648,10 +1720,13 @@ app.include_router(
     artifacts_router
 )  # /api/v1/artifacts/{id}/* - Versions, publishing and comments (owner)
 app.include_router(market_data_router)  # /api/v1/market-data/* - Market data proxy
+app.include_router(logos_router)  # /api/v1/market-data/logos/{symbol} - Public logo relay
 app.include_router(
     bars_router
 )  # /api/v1/market-data/bars/* - Protocol-native progressive bars
 app.include_router(users_router)  # /api/v1/users/* - User management
+app.include_router(cli_approvals_router)  # /api/v1/cli/approvals - What la asks the user
+app.include_router(vendor_terms_router)  # /api/v1/vendor-terms - Terms the user accepts
 app.include_router(reports_router)  # /api/v1/reports - Reports forwarded to the platform
 app.include_router(
     trading_permission_router

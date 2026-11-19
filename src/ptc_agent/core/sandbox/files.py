@@ -7,6 +7,7 @@ semantics are unchanged.
 
 import asyncio
 import base64
+import errno
 import functools
 import hashlib
 import json
@@ -104,13 +105,8 @@ class _CappedGrep(list):
     def __init__(self, entries, notes):
         super().__init__(entries)
         self.notes = tuple(notes)
-
-# DALTON-HOOK(sandbox-inline-write-limit): the inline write ships the base64 payload inside one
-# `sh -c` argument, and Linux caps a single argv string at MAX_ARG_STRLEN (128 KiB), so on the
-# Docker runtime any text between ~96 and 256 KiB failed with exit 255 ("argument list too
-# long", empty stderr). 64 KiB raw is ~87 KiB encoded; larger files take the verified upload path.
-_INLINE_TEXT_WRITE_LIMIT = 64 * 1024
-_INLINE_TEXT_MARKER = "__LANGALPHA_TEXT_PAYLOAD__"
+# Outside sed's own exit codes (0, 1, 2, 4); EISDIR's number, for the reader.
+_IS_DIRECTORY_EXIT = errno.EISDIR
 # Grep output past this renders off the event loop. Rendering costs about
 # 9 ms per MB, so 128 KiB holds the loop near 1 ms, while smaller outputs, the
 # common case, skip the thread hop.
@@ -151,6 +147,21 @@ class SandboxWriteVerificationError(SandboxTransientError):
     edit path keeps re-raising it instead of answering the agent with "your edit
     was wrong" for a write that never landed.
     """
+
+
+# The text writes live in ``text_write``, which builds on this module; their
+# names stay importable here for the sandbox's delegators.
+_TEXT_WRITE_NAMES = frozenset(
+    {"WriteGuard", "WritePreconditionFailed", "awrite_file_text", "awrite_file_text_guarded"}
+)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _TEXT_WRITE_NAMES:
+        from ptc_agent.core.sandbox import text_write
+
+        return getattr(text_write, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _lock_scope(sandbox: "PTCSandbox") -> str:
@@ -530,134 +541,6 @@ async def _upload_once(
         return False
 
 
-async def _exec_text_write_once(
-    sandbox: "PTCSandbox", filepath: str, normalized_path: str, content: bytes
-) -> tuple[bool, int | None]:
-    payload = base64.b64encode(content).decode("ascii")
-    target = shlex.quote(normalized_path)
-    command = "\n".join(
-        [
-            "set -eu",
-            f"target={target}",
-            'mkdir -p -- "$(dirname -- "$target")"',
-            'tmp=$(mktemp "${target}.tmp.XXXXXX")',
-            "trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM",
-            f"base64 -d > \"$tmp\" <<'{_INLINE_TEXT_MARKER}'",
-            payload,
-            _INLINE_TEXT_MARKER,
-            'count=$(wc -c < "$tmp")',
-            # BSD mv (a macOS machine) has no -T. As -T does, refuse a
-            # directory, and replace a link to one rather than move into it.
-            'if [ "$(uname -s)" = Darwin ]; then',
-            '  if [ -d "$target" ]; then',
-            '    [ -L "$target" ] || { echo "mv: $target: Is a directory" >&2; exit 1; }',
-            '    rm -f -- "$target"',
-            "  fi",
-            '  mv -f -- "$tmp" "$target"',
-            "else",
-            '  mv -fT -- "$tmp" "$target"',
-            "fi",
-            "trap - EXIT HUP INT TERM",
-            "printf '%s\\n' \"$count\"",
-        ]
-    )
-    try:
-        assert sandbox.runtime is not None
-        result = await sandbox._runtime_call(
-            sandbox.runtime.exec,
-            command,
-            timeout=30,
-            retry_policy=RetryPolicy.SAFE,
-        )
-        exit_code = getattr(result, "exit_code", -1)
-        if exit_code < 0:
-            # The Docker runtime folds a timeout or an exec exception into
-            # exit -1 rather than raising, so this is a transport failure and
-            # belongs to the same classification as a raised one.
-            raise RuntimeError(
-                f"exec did not complete: {getattr(result, 'stderr', '') or exit_code}"
-            )
-    except Exception as e:
-        await _raise_normalized(sandbox, e, op="write_file", path=normalized_path)
-        logger.warning(
-            "Failed to write text file",
-            filepath=filepath,
-            normalized_path=normalized_path,
-            error=str(e),
-        )
-        return False, None
-
-    if exit_code != 0:
-        # The sandbox answered, so this is the script failing on the file (a
-        # permission, a full disk, a directory in the way), not the runtime
-        # failing to reach it. Routing it through the liveness classifier
-        # relabels every such error "Sandbox is not reachable".
-        logger.warning(
-            "Text write script failed",
-            filepath=filepath,
-            normalized_path=normalized_path,
-            exit_code=exit_code,
-            stderr=(getattr(result, "stderr", "") or "").strip()[:500],
-        )
-        return False, None
-    safe_record(workspace_fs_bytes, len(content), {"op": "write"})
-    try:
-        return True, int((getattr(result, "stdout", "") or "").strip())
-    except ValueError:
-        return True, None
-
-
-async def awrite_file_text(sandbox: "PTCSandbox", filepath: str, content: str) -> bool:
-    """Write UTF-8 text to a sandbox file (overwrites).
-
-    This path is safe to retry automatically. The write is serialised per
-    absolute path and its landed size is checked, so a lost or truncated
-    write surfaces instead of being reported as success.
-    """
-    try:
-        encoded = content.encode("utf-8")
-    except UnicodeEncodeError as e:
-        logger.debug("Failed to encode file as utf-8", filepath=filepath, error=str(e))
-        return False
-
-    if len(encoded) >= _INLINE_TEXT_WRITE_LIMIT:
-        return await sandbox.aupload_file_bytes(filepath, encoded, verify=True)
-
-    await sandbox._wait_ready()
-    normalized_path = sandbox.normalize_path(filepath)
-    if sandbox.config.filesystem.enable_path_validation and not sandbox.validate_path(
-        filepath
-    ):
-        logger.error(f"Access denied: {filepath} is not in allowed directories")
-        return False
-
-    async with path_write_lock(sandbox, normalized_path):
-        for attempt in (1, 2):
-            written, landed_size = await _exec_text_write_once(
-                sandbox, filepath, normalized_path, encoded
-            )
-            if not written:
-                return False
-            landed = (
-                landed_size == len(encoded)
-                if landed_size is not None
-                else await _write_landed(sandbox, normalized_path, encoded)
-            )
-            if landed:
-                return True
-            logger.warning(
-                "File did not read back as written",
-                normalized_path=normalized_path,
-                attempt=attempt,
-                size=len(encoded),
-            )
-
-    raise SandboxWriteVerificationError(
-        f"Write verification failed for {normalized_path}: the file does not match "
-        f"the {len(encoded)} bytes written, after one rewrite"
-    )
-
-
 async def aread_file_range(
     sandbox: "PTCSandbox", file_path: str, offset: int = 0, limit: int = 2000
 ) -> str | None:
@@ -676,7 +559,13 @@ async def aread_file_range(
     start = max(0, offset)
     start_line = start + 1  # sed is 1-indexed
     end_line = start + limit
-    cmd = f"sed -n '{start_line},{end_line}p' {shlex.quote(normalized)}"
+    target = shlex.quote(normalized)
+    # A directory is answered in the same round trip: sed fails on one, and the
+    # fallback's download then gets a 400 that reads as the sandbox failing.
+    cmd = (
+        f"if [ -d {target} ]; then exit {_IS_DIRECTORY_EXIT}; fi; "
+        f"sed -n '{start_line},{end_line}p' {target}"
+    )
 
     try:
         result = await sandbox._runtime_call(
@@ -685,9 +574,6 @@ async def aread_file_range(
             timeout=30,
             retry_policy=RetryPolicy.SAFE,
         )
-        if result.exit_code != 0:
-            return await sandbox._aread_file_range_fallback(file_path, offset, limit)
-        return result.stdout or ""
     except Exception as e:
         # The fallback re-reads through ``aread_file_text``, which now raises on
         # sandbox failures — so falling back is only meaningful when the sandbox
@@ -696,6 +582,11 @@ async def aread_file_range(
         await _raise_normalized(sandbox, e, op="read_file_range", path=normalized)
         logger.warning("Failed to read file range", filepath=file_path, error=str(e))
         return await sandbox._aread_file_range_fallback(file_path, offset, limit)
+    if result.exit_code == _IS_DIRECTORY_EXIT:
+        raise IsADirectoryError(errno.EISDIR, "Is a directory", normalized)
+    if result.exit_code != 0:
+        return await sandbox._aread_file_range_fallback(file_path, offset, limit)
+    return result.stdout or ""
 
 
 async def _aread_file_range_fallback(

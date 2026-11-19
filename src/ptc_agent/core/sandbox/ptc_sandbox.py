@@ -2,7 +2,7 @@
 
 import asyncio
 import shlex
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -43,6 +43,7 @@ from ptc_agent.core.sandbox.runtime import (
     HostUnavailablePolicy,
     PreviewInfo,
     RuntimeState,
+    SandboxFailureKind,
     SandboxGoneError,
     SandboxRuntime,
     SandboxTransientError,
@@ -71,6 +72,7 @@ from ptc_agent.core.sandbox import mcp_setup as _mcp_setup
 from ptc_agent.core.sandbox import reconnect as _reconnect
 from ptc_agent.core.sandbox import tool_overlay as _tool_overlay
 from ptc_agent.core.sandbox import sessions as _sessions
+from ptc_agent.core.sandbox import unreachable as _unreachable
 
 logger = structlog.get_logger(__name__)
 
@@ -105,6 +107,9 @@ class PTCSandbox:
         # Set by the host: files who each command's call runs for, which a
         # save through the mount and a call the ``la`` CLI makes both read.
         self.call_filer: CallFiler | None = None
+        # Set by the host while it meters paid relay calls: the line naming
+        # what a command's calls, under its call id, cost.
+        self.paid_calls: Callable[[str], Awaitable[str]] | None = None
         # Set by the host on a machine the mount never serves, whose past
         # threads the file tools then read in process.
         self.history: HistoryFiles | None = None
@@ -300,6 +305,7 @@ class PTCSandbox:
             )
 
         if self._init_error:
+            _unreachable.note_call(self, self._init_error)
             raise self._init_error
 
     def is_ready(self) -> bool:
@@ -775,12 +781,45 @@ class PTCSandbox:
             )
             logger.info("Sandbox stopped", sandbox_id=self.sandbox_id)
         except Exception as e:
-            # Log warning but don't raise - sandbox may already be stopped or unavailable
+            # A refused stop raises, or the caller records the computer stopped
+            # over a machine still running, which Docker and SSH never stop on
+            # their own. A sandbox already gone or down is what a stop wants.
+            if await self._stop_already_done(e):
+                logger.info(
+                    "Sandbox already down; nothing to stop",
+                    sandbox_id=self.sandbox_id,
+                    error=str(e),
+                )
+                return
             logger.warning(
                 "Failed to stop sandbox",
                 sandbox_id=self.sandbox_id,
                 error=str(e),
             )
+            raise
+
+    async def _stop_already_done(self, exc: Exception) -> bool:
+        if self._is_gone(exc):
+            return True
+        if self.runtime is None:
+            return False
+        try:
+            # Read fresh: Daytona and E2B cache the state, which still says
+            # running when the stop landed but its response was lost.
+            state = await asyncio.wait_for(self.runtime.refresh_state(), timeout=30)
+        except Exception as e:  # noqa: BLE001 - an unreadable state is not down
+            return self._is_gone(e)
+        return state in (
+            RuntimeState.STOPPED,
+            RuntimeState.ARCHIVED,
+            RuntimeState.ARCHIVING,
+        )
+
+    def _is_gone(self, exc: Exception) -> bool:
+        return (
+            isinstance(exc, SandboxGoneError)
+            or self.provider.classify_error(exc) is SandboxFailureKind.SANDBOX_GONE
+        )
 
     async def _setup_workspace(self, dir_name: str | None = None) -> None:
         """Create workspace directory structure."""
@@ -944,19 +983,27 @@ class PTCSandbox:
         **kwargs: Any,
     ) -> Any:
         on_transient = self._ensure_sandbox_connected if allow_reconnect else None
-        result = await async_retry_with_backoff(
-            func,
-            *args,
-            retry_policy=retry_policy,
-            is_transient=self.provider.is_transient_error,
-            on_transient=on_transient,
-            rebind=self._make_rebinder(self.runtime) if allow_reconnect else None,
-            retries=retries,
-            initial_delay_s=initial_delay_s,
-            total_timeout=total_timeout,
-            **kwargs,
-        )
+        try:
+            result = await async_retry_with_backoff(
+                func,
+                *args,
+                retry_policy=retry_policy,
+                is_transient=self.provider.is_transient_error,
+                on_transient=on_transient,
+                rebind=self._make_rebinder(self.runtime) if allow_reconnect else None,
+                retries=retries,
+                initial_delay_s=initial_delay_s,
+                total_timeout=total_timeout,
+                **kwargs,
+            )
+        except Exception as e:
+            # After every retry and the reconnect: the call's last word on
+            # whether the machine answers, which a tool would otherwise
+            # swallow into text.
+            _unreachable.note_call(self, e)
+            raise
         _reconnect.call_served(self)
+        _unreachable.note_call(self, None)
         return result
 
     def _make_rebinder(
@@ -1370,6 +1417,11 @@ class PTCSandbox:
 
     async def awrite_file_text(self, filepath: str, content: str) -> bool:
         return await _files.awrite_file_text(self, filepath, content)
+
+    async def awrite_file_text_guarded(
+        self, filepath: str, content: str, guard: "_files.WriteGuard"
+    ) -> str | None:
+        return await _files.awrite_file_text_guarded(self, filepath, content, guard)
 
     def path_write_lock(self, normalized_path: str):
         return _files.path_write_lock(self, normalized_path)

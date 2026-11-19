@@ -328,11 +328,9 @@ async def execute_report_back(job: dict) -> None:
     else:
         # A live turn on the thread takes the report in as a steer before its
         # next model call (``report_back.steer``), as a task's report-back
-        # does.
+        # does. The summary turn runs in Home, on Home's computer.
         from src.server.services.hook_outbox import MAX_ATTEMPTS
-        from src.server.services.report_back.notify_turn import (
-            park_while_thread_busy,
-        )
+        from src.server.services.report_back.notify_turn import park_unless_ready
 
         # DALTON-HOOK(handoff-keep-on-resumable): if parking at ceiling will
         # dead-letter this subsequent run, revoke awaiting_resume beforehand.
@@ -346,10 +344,11 @@ async def execute_report_back(job: dict) -> None:
                 cache, ptc_thread_id, expected_gen=dispatch_gen
             )
             origin.pop(pointer.AWAITING_RESUME_FIELD, None)
-        if await park_while_thread_busy(
+        if await park_unless_ready(
             job_id,
             attempts,
             dispatcher_thread_id,
+            workspace_id=origin.get(ORIGIN_WORKSPACE_FIELD),
             log_prefix="[HANDOFF_REPORT_BACK]",
             subject=f"PTC thread {ptc_thread_id}",
         ):
@@ -1283,7 +1282,7 @@ async def summary_started(
 async def overtaking_run(run_id, ptc_thread_id: str) -> str | None:
     """The newer run on the analyst's thread that took over ``run_id``'s
     report-back, if one started: the summary turn names only the thread, and
-    ``agent_output`` reads its latest turns, so a summary posted after a
+    ``la threads output`` reads its latest turns, so a summary posted after a
     newer run starts would describe that run's output as this one's. The
     newer run carries the same pair and reports back when it ends."""
     from src.server.database.runs import lifecycle as tl_db

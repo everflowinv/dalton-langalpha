@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Plus, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CheckboxChoice } from '@/components/ui/choice';
 import { InPlaceSwap, SwapCell } from '@/components/ui/crossfade';
@@ -29,6 +30,8 @@ interface NewComment {
   confirmDiscard: boolean;
   onKeepWriting: () => void;
   onDiscard: () => void;
+  /** The box's ×: an empty draft goes at once, words ask first (`confirmDiscard`). */
+  onClose: () => void;
 }
 
 /**
@@ -44,6 +47,17 @@ export type ComposerMode =
     quote: string | null;
     /** The quote whole, about four lines tall and scrolling past that, as selected words are shown; else two lines, cut. */
     fullQuote: boolean;
+    /**
+     * The parts the comment is on, by their labels, each with a way out of
+     * the selection, for an area that lists every part. Absent for one
+     * element, and for an area too large to list.
+     */
+    parts?: { labels: string[]; onDrop?: (index: number) => void };
+    /**
+     * "Add a part", on a touch screen, which has no modifier to hold: the next
+     * tap adds to the comment rather than starting a new one. `on` while it waits.
+     */
+    addPart?: { on: boolean; onToggle: () => void };
   } & NewComment)
   /** A new comment waiting in the list, whose card names the spot. */
   | ({ kind: 'list' } & NewComment)
@@ -72,6 +86,7 @@ export function CommentComposer({
   value, onChange, placeholder, canQueue, canSend, onSubmit, mode,
 }: CommentComposerProps): React.ReactElement {
   const { t } = useTranslation();
+  const rootRef = useRef<HTMLDivElement>(null);
   const fieldRef = useRef<HTMLTextAreaElement>(null);
   const [busy, setBusy] = useState<CommentIntent | null>(null);
   const [failed, setFailed] = useState(false);
@@ -100,6 +115,19 @@ export function CommentComposer({
     if (!autoFocus || !field || document.activeElement !== field) return;
     field.setSelectionRange(field.value.length, field.value.length);
   }, [autoFocus]);
+
+  // The question going (Esc, or writing on) takes its buttons with it: the
+  // focus they held, or the ×'s, comes back to the words rather than the page.
+  const asked = useRef(confirmDiscard);
+  useEffect(() => {
+    const was = asked.current;
+    asked.current = confirmDiscard;
+    if (!was || confirmDiscard) return;
+    const active = document.activeElement;
+    if (active === document.body || (active && active !== fieldRef.current && rootRef.current?.contains(active))) {
+      fieldRef.current?.focus({ preventScroll: true });
+    }
+  }, [confirmDiscard]);
 
   // The field grows with the words, up to a few lines, so the box never
   // hides what is being written behind a scrollbar it does not need yet.
@@ -138,6 +166,7 @@ export function CommentComposer({
 
   return (
     <div
+      ref={rootRef}
       className={cn(
         'flex min-w-0 flex-col',
         embedded
@@ -146,12 +175,37 @@ export function CommentComposer({
       )}
       style={embedded ? { backgroundColor: 'var(--color-bg-input)', borderColor: 'var(--color-border-input)' } : undefined}
     >
-      {head && (
-        <div className="truncate text-xs" style={{ color: 'var(--color-text-tertiary)' }} title={head}>
-          {head}
+      {over && (
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="min-w-0 flex-1 truncate text-xs" style={{ color: 'var(--color-text-tertiary)' }} title={over.head}>
+            {over.head}
+          </div>
+          {/* Its 28 px reach the box's padding, so the row stays the line's height. */}
+          <button
+            type="button"
+            className="page-comment-icon-btn page-comment-draft-close tap-target -my-1.5 -mr-1.5 shrink-0"
+            onClick={over.onClose}
+            aria-label={t('pageViewer.comments.cancelDraft')}
+            aria-keyshortcuts="Escape"
+            title={t('pageViewer.comments.cancelDraftTitle')}
+          >
+            <X className="h-[15px] w-[15px]" aria-hidden />
+          </button>
         </div>
       )}
+      {over?.parts && <PartChips labels={over.parts.labels} onDrop={over.parts.onDrop} />}
       {over?.quote && <p className={cn('page-comment-quote text-xs', over.fullQuote ? 'page-comment-quote-full' : 'line-clamp-2')}>{over.quote}</p>}
+      {over?.addPart && (
+        <button
+          type="button"
+          className="page-comment-add-part tap-target hidden pointer-coarse:inline-flex"
+          aria-pressed={over.addPart.on}
+          onClick={over.addPart.onToggle}
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden />
+          {t('pageViewer.comments.addPart')}
+        </button>
+      )}
       <textarea
         ref={fieldRef}
         value={value}
@@ -262,5 +316,46 @@ export function CommentComposer({
         )}
       </SwapCell>
     </div>
+  );
+}
+
+/**
+ * Labels shown without the leading segments they all share ("Revenue · "),
+ * which would only repeat across the chips.
+ */
+function shortLabels(labels: string[]): string[] {
+  const split = labels.map((l) => l.split(' · '));
+  let common = 0;
+  while (split.every((parts) => parts.length > common + 1 && parts[common] === split[0][common])) common += 1;
+  return split.map((parts) => parts.slice(common).join(' · '));
+}
+
+/**
+ * The parts a comment is on, one chip each, whose × takes that part out of
+ * the selection when it can be changed (`onDrop`). The last part has none:
+ * a comment is on something.
+ */
+function PartChips({ labels, onDrop }: { labels: string[]; onDrop?: (index: number) => void }) {
+  const { t } = useTranslation();
+  const shown = shortLabels(labels);
+  return (
+    <ul className="page-comment-parts" aria-label={t('pageViewer.comments.partsLabel')}>
+      {labels.map((label, i) => (
+        // A part is known by its place in the list, which is how the page drops it.
+        <li key={i} className="page-comment-part" title={label}>
+          <span className="min-w-0 truncate">{shown[i]}</span>
+          {onDrop && labels.length > 1 && (
+            <button
+              type="button"
+              className="page-comment-part-drop"
+              onClick={() => onDrop(i)}
+              aria-label={t('pageViewer.comments.dropPart', { label })}
+            >
+              <X className="h-3 w-3" aria-hidden />
+            </button>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }

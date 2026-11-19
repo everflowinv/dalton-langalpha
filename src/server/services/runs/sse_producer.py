@@ -33,12 +33,17 @@ from src.server.utils.content_normalizer import (
 # DALTON-HOOK(thinking-leak): live assistant text is filtered before it is framed.
 from src.server.utils.thinking_leak import ThinkingLeakGate
 from src.server.utils.pg_sanitize import finite_json_dumps
+from src.llms.claude_code import QUEUE_FIELDS, QUEUE_EVENT_TYPE, queue_record
 from src.server.contracts.status import classify_interrupts
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
 from src.server.database.runs.lifecycle import ProducerRecord
 from src.server.services.runs.credit_usage import build_credit_usage_data
 from src.server.services.runs.reasoning_facts import ReasoningDurations
-from src.server.services.runs.stream_errors import error_event_data
+from src.server.services.runs.stream_errors import (
+    COMPUTER_UNREACHABLE,
+    error_event_data,
+    unreachable_failure,
+)
 from src.tools.wakeups.models import WakeupArtifact
 from src.tools.wakeups.quiet import quiet_result
 from src.server.utils.text_phase import TextPhaseTracker
@@ -61,6 +66,12 @@ from src.server.utils.error_sanitization import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Claude Code's own custom events, by the fields each passes on.
+_CLAUDE_CODE_EVENTS: dict[str, tuple[str, ...]] = {
+    "claude_code_plan": ("reason", "window", "until"),
+    QUEUE_EVENT_TYPE: QUEUE_FIELDS,
+}
 
 # Dedicated logger for SSE events (can be configured independently)
 sse_logger = logging.getLogger("sse_events")
@@ -155,6 +166,23 @@ def _fallback_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "props": props,
         "metadata": {"after_message_id": after} if after else {},
     }
+
+
+def kept_notice(event_type: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ui record a notice frame names, as the producer keeps it for a
+    step that may never commit its own: a main-lane model fallback, or a
+    main-lane CLI wait long enough to note. Recovery reads a dead run's
+    notices back through it, in the order they streamed."""
+    if event_type == "model_fallback":
+        return fallback_from_frame(data)
+    if (
+        event_type == QUEUE_EVENT_TYPE
+        and data.get("agent") == "main"
+        and data.get("signal") == "admitted"
+        and data.get("wait_id")
+    ):
+        return queue_record(data)
+    return None
 
 
 def fallback_from_frame(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -256,9 +284,10 @@ class RunSSEProducer:
         # The main agent's provenance records as emitted, for the finalize to
         # write.
         self.provenance_events: List[Dict[str, Any]] = []
-        # The main agent's model_fallback ui records as emitted: a step that
-        # fails or is stopped after one never commits it.
-        self._model_fallbacks: List[Dict[str, Any]] = []
+        # The main lane's notice ui records as streamed (model fallbacks,
+        # Claude Code CLI waits), which a stopped or failed run's row keeps
+        # for those its last step never committed.
+        self._notices: List[Dict[str, Any]] = []
         # The last error frame the main agent's stream sent, for the finalize
         # of a failed run to keep.
         self._error_frame: Optional[Dict[str, Any]] = None
@@ -632,15 +661,24 @@ class RunSSEProducer:
                             yield self._build_sse_event("provenance", prov_data)
                             continue
 
-                        # A reply the Claude plan ran out during, billed to
-                        # usage credits: its notice, which replay shows from
-                        # the reply's stamp (``PLAN_NOTICE_KEY``).
-                        if event_type == "claude_code_plan":
-                            yield self._build_sse_event("claude_code_plan", {
+                        # Claude Code's own notices, passed on with the fields
+                        # each carries: a reply the Claude plan ran out during,
+                        # billed to usage credits (replay shows it from the
+                        # reply's stamp, ``PLAN_NOTICE_KEY``), and a turn's wait
+                        # for one of its computer's CLIs (replay shows it from
+                        # the turn's ``ui`` record, ``QUEUE_EVENT_TYPE``).
+                        if (passed := _CLAUDE_CODE_EVENTS.get(event_type)) is not None:
+                            if (
+                                event_type == QUEUE_EVENT_TYPE
+                                and event_data.get("signal") == "admitted"
+                                and not agent_from_stream
+                            ):
+                                self._notices.append(queue_record(event_data))
+                            yield self._build_sse_event(event_type, {
                                 "thread_id": self.thread_id,
                                 "agent": self._extract_agent_name(agent_from_stream, event_data)
                                 if agent_from_stream else "main",
-                                **{k: event_data[k] for k in ("reason", "window", "until") if k in event_data},
+                                **{k: event_data[k] for k in passed if k in event_data},
                             })
                             continue
 
@@ -689,7 +727,7 @@ class RunSSEProducer:
                         ):
                             if not agent_from_stream:
                                 kept = _fallback_record(event_data)
-                                self._model_fallbacks.append(kept)
+                                self._notices.append(kept)
                                 # Names the record, so recovery can keep a
                                 # notice whose step died with the worker.
                                 fallback_ref = {
@@ -893,7 +931,7 @@ class RunSSEProducer:
                         f"thread_id={self.thread_id} run_id={self.run_id} — "
                         f"suppressing interrupt SSE; turn will finalize failed"
                     )
-                    yield self._build_error_event(
+                    yield await self._build_error_event(
                         "The assistant paused for input but the pause could not be "
                         "saved. Please retry this message.",
                     )
@@ -964,7 +1002,7 @@ class RunSSEProducer:
             _stream_span.record_exception(e)
             _stream_span.set_status(Status(StatusCode.ERROR))
             if not isinstance(e, TurnTimeLimitError):
-                yield self._build_error_event(str(e), exc=e)
+                yield await self._build_error_event(str(e), exc=e)
             raise  # Re-raise so the run executor finalizes as failed
         finally:
             # Safety net: if the stream ends (timeout / error / CancelledError /
@@ -1891,7 +1929,7 @@ class RunSSEProducer:
                 if isinstance(e, dict) and e.get("event") == "provenance"
             ],
             reasoning_ms=self._reasoning.as_facts(),
-            model_fallbacks=list(self._model_fallbacks),
+            model_fallbacks=list(self._notices),
             error_frame=self._error_frame,
         )
 
@@ -1938,24 +1976,22 @@ class RunSSEProducer:
 
         return result
 
-    def _build_error_event(
-        self,
-        error_message: str,
-        *,
-        exc: Optional[BaseException] = None,
+    async def _build_error_event(
+        self, error_message: str, *, exc: Optional[BaseException] = None
     ) -> StreamFrame:
         """Build an error frame; ``exc`` enables the classification
-        ``error_event_data`` describes."""
-        frame = self._build_sse_event(
-            "error",
-            error_event_data(
-                self.thread_id,
-                error_message,
-                exc=exc,
-                model=getattr(getattr(self.agent_config, "llm", None), "name", None),
-                config=self.agent_config,
-            ),
+        ``error_event_data`` describes, and names a machine that did not
+        answer (``unreachable_failure``)."""
+        data = error_event_data(
+            self.thread_id,
+            error_message,
+            exc=exc,
+            model=getattr(getattr(self.agent_config, "llm", None), "name", None),
+            config=self.agent_config,
         )
+        if exc is not None and data.get("error_kind") == COMPUTER_UNREACHABLE:
+            data.update(await unreachable_failure(exc))
+        frame = self._build_sse_event("error", data)
         self._error_frame = kept_error_frame(frame.data)
         return frame
 

@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ValidationError
 
 from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.sandbox.providers.ssh_errors import (
@@ -23,22 +24,26 @@ from ptc_agent.core.sandbox.providers.ssh_errors import (
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.services.persistence.sync_result import BackupIncomplete
 from src.server.services.background_starts import schedule_start
+from src.server.services.computer_usage.causes import computer_cause
 from src.server.app.status_stream import (
     SSE_HEADERS,
     sse_status_event,
     status_event_stream,
 )
 from src.server.database.computer import (
+    MAKE_PRIMARY_INTENT,
+    REMOVAL_INTENT,
     computer_capacity_lock,
     get_computer,
     get_computers_for_user,
     observed_layout_version,
+    removal_held,
     rename_computer as db_rename_computer,
     set_computer_files_backup,
     update_computer_status,
 )
 from src.server.database.computer_names import ComputerNameTaken, name_taken
-from src.server.database.home_workspace import get_home_workspace_id
+from src.server.database.home_stand_in import read_stand_in, stand_in_needed
 from src.server.database.workspace import (
     count_live_workspaces_by_computer,
     get_live_workspace_folders_for_computer,
@@ -59,6 +64,8 @@ from src.server.models.computer import (
     ComputerCreate,
     ComputerFilesBackupRequest,
     ComputerListResponse,
+    ComputerMakePrimaryIntent,
+    ComputerRemovalIntent,
     ComputerProviderOption,
     ComputerProvidersResponse,
     ComputerReconnectRequest,
@@ -72,7 +79,11 @@ from src.server.models.computer import (
     ComputerSpecRequest,
     ComputerStorageResponse,
 )
-from src.server.models.workspace_move import MakePrimaryResponse, WorkspaceMoveOut
+from src.server.models.workspace_move import (
+    MakePrimaryRequest,
+    MakePrimaryResponse,
+    WorkspaceMoveOut,
+)
 from src.server.services.computer_disk import (
     STORAGE_BREAKDOWN_MAX_AGE_SECONDS,
     disk_from_row,
@@ -87,6 +98,7 @@ from src.server.services.computer_errors import (
     ComputerRemovalRefused,
     ComputerRepairRefused,
     MachineBusyError,
+    NeedsComputer,
     ProviderNotOffered,
     UnknownResourceTier,
 )
@@ -108,24 +120,24 @@ from src.server.services.ssh_computers import (
     tunnels_for,
 )
 from src.server.services.ssh_dial_budget import SSHDialBudgetExceeded
-from src.server.services.ssh_removal import leave_machine
 from src.server.services.ssh_tunnel_sweep import release_tunnel
 from src.server.services.ssh_tunnels import tunnels_enabled
 from src.server.services.workspace_move import (
     claim_workspace_move,
     move_error_detail,
     move_from_row,
-    set_primary_computer,
 )
 from src.server.services.workspace_status_pubsub import (
     publish_computer_status_change,
     subscribe_to_computer_status,
 )
+from src.server.dependencies import cli_approval
 from src.server.dependencies.principal import (
-    ComputerAddUserId,
+    ComputerAddPrincipal,
+    ComputerWritePrincipal,
     ComputerEndUserId,
+    ComputerRemovePrincipal,
     ComputerWriteUserId,
-    Principal,
     ReadPrincipal,
     ReadUserId,
 )
@@ -140,6 +152,11 @@ router = APIRouter(prefix="/api/v1/computers", tags=["Computers"])
 # rebuilds one, so only a machine its owner brought may go without.
 _FILES_BACKUP_REQUIRED = (
     "File backup can only be turned off on a computer you brought yourself."
+)
+_PRIMARY_IN_THE_APP = "Choosing your primary computer is done in the app."
+_PRIMARY_BACKUP_REQUIRED = (
+    "File backup stays on for your primary computer, since Home lives on it. "
+    "Make another computer primary first."
 )
 
 
@@ -185,7 +202,7 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
     """
     try:
         yield
-    except HTTPException:
+    except (HTTPException, NeedsComputer):
         raise
     except ComputerRuntimeUnavailable as e:
         logger.warning("Computer runtime unavailable for %s: %s", action, e)
@@ -315,6 +332,7 @@ def computer_to_response(
     owner: bool = True,
     workspace_count: int = 0,
     tunnels: Optional[Dict[str, Dict[str, Any]]] = None,
+    stand_in_host: Optional[str] = None,
 ) -> ComputerResponse:
     """Withhold provider_ref from non-owners because it addresses a real billed machine."""
     return ComputerResponse(
@@ -329,6 +347,7 @@ def computer_to_response(
         is_primary=bool(computer.get("is_primary")),
         root_dir=computer.get("root_dir") or "",
         workspace_count=workspace_count,
+        stands_in_for_home=str(computer["computer_id"]) == stand_in_host,
         layout_version=observed_layout_version(computer),
         provider_ref=computer.get("provider_ref") if owner else None,
         created_at=computer["created_at"],
@@ -339,8 +358,20 @@ def computer_to_response(
         disk=disk_from_row(computer),
         spec_change=spec_change_from_row(computer),
         ssh=ssh_info(computer, tunnels),
+        make_primary=_intent(computer, MAKE_PRIMARY_INTENT, ComputerMakePrimaryIntent),
+        removal=_intent(computer, REMOVAL_INTENT, ComputerRemovalIntent),
         start_failure=start_failure_from_row(computer),
     )
+
+
+def _intent(computer: Dict[str, Any], key: str, model: type[BaseModel]) -> Any:
+    """An intent the row's config keeps (``database.computer``), as its model."""
+    value = (computer.get("config") or {}).get(key)
+    try:
+        return model.model_validate(value) if value else None
+    except ValidationError:
+        logger.warning("Computer %s has an unreadable %s", computer.get("computer_id"), key)
+        return None
 
 
 async def _owned_computer(computer_id: str, user_id: str) -> Dict[str, Any]:
@@ -366,7 +397,7 @@ async def _report_start_failure(computer_id: str, exc: Exception) -> None:
                 computer_id, "stopped", expected="starting"
             )
             if settled is not None:
-                await record_start_failure(computer_id, exc, kind=settled["kind"])
+                await record_start_failure(computer_id, exc)
             row = await get_computer(computer_id)
         failure = start_failure_from_row(row) if row is not None else None
         if failure is not None:
@@ -437,7 +468,7 @@ async def _schedule_claimed_start(computer_id: str) -> str:
 @router.post("", response_model=ComputerResponse, status_code=201)
 async def create_computer(
     request: ComputerCreate,
-    x_user_id: ComputerAddUserId,
+    principal: ComputerAddPrincipal,
 ):
     """Create a computer and prepare its sandbox in the background.
 
@@ -446,7 +477,11 @@ async def create_computer(
     Preparing holds a running slot from the insert, so the limit is asked here.
     A ``name`` another of the user's live computers has, compared trimmed and
     case-folded, is a 409 ``name_taken``; an unnamed one is numbered past them.
+    ``make_primary`` is the app's alone, as Make primary is (403 otherwise).
     """
+    x_user_id = principal.user_id
+    if request.make_primary and not principal.unlimited:
+        raise HTTPException(status_code=403, detail=_PRIMARY_IN_THE_APP)
     async with _computer_action_errors("create", "new"):
         sandbox = _sandbox_config()
         kind = request.kind or sandbox.provider
@@ -490,6 +525,14 @@ async def create_computer(
                 await enforce_computer_count(x_user_id)
                 await assert_spec_allowed(x_user_id, request.resource_tier)
                 await enforce_computer_limit(x_user_id)
+            create_kwargs = plan.create_kwargs() if plan is not None else {}
+            if request.make_primary:
+                # Kept on the row until its first start completes, which
+                # applies it (ComputerManager.apply_make_primary_intent).
+                create_kwargs["config"] = {
+                    **(create_kwargs.get("config") or {}),
+                    MAKE_PRIMARY_INTENT: {"state": "pending"},
+                }
             computer = await _computer_manager().create_computer_for_user(
                 x_user_id,
                 kind=kind,
@@ -498,15 +541,17 @@ async def create_computer(
                 # The insert squashes this to FALSE when a live primary already
                 # exists, so it reads as "primary if they have none". Without it a
                 # user's first, named machine is not primary and their first project
-                # mints a second one. The manager declines it for a machine it
-                # cannot rebuild, such as an owner's SSH machine.
+                # mints a second one. A machine of the user's own is taken too,
+                # so one who works only on it gets no cloud computer; the insert
+                # declines it for a machine whose files are not backed up.
                 is_primary=True,
                 prepare=True,
                 files_backup=request.files_backup,
-                **(plan.create_kwargs() if plan is not None else {}),
+                **create_kwargs,
             )
         computer_id = str(computer["computer_id"])
-        status = await _schedule_claimed_start(computer_id)
+        with computer_cause("create"):
+            status = await _schedule_claimed_start(computer_id)
         logger.info(
             "Created computer %s for user %s, preparing it (%s)",
             computer_id, x_user_id, status,
@@ -544,30 +589,24 @@ def _ssh_create_refusals():
         raise HTTPException(status_code=503, detail=str(e)) from None
 
 
-async def _listed_computers(principal: Principal) -> List[Dict[str, Any]]:
-    """The computers a list shows the caller: a computer's token, only its own."""
-    if principal.computer_id is None:
-        return await get_computers_for_user(principal.user_id)
-    row = await get_computer(principal.computer_id)
-    return [row] if row is not None and row.get("user_id") == principal.user_id else []
-
-
 @router.get("", response_model=ComputerListResponse)
 async def list_computers(principal: ReadPrincipal):
     x_user_id = principal.user_id
-    rows = await _listed_computers(principal)
+    rows = await get_computers_for_user(x_user_id)
     # One query for the whole list: stopping a machine takes every project on it
     # down, so the count is what the card needs to say so before asking.
     counts = await count_live_workspaces_by_computer(
         [str(row["computer_id"]) for row in rows]
     )
     tunnels = await tunnels_for(x_user_id, rows)
+    stand_in_host = await _stand_in_host(x_user_id)
     return ComputerListResponse(
         computers=[
             computer_to_response(
                 row,
                 workspace_count=counts.get(str(row["computer_id"]), 0),
                 tunnels=tunnels,
+                stand_in_host=stand_in_host,
             )
             for row in rows
         ],
@@ -623,6 +662,15 @@ def _tier_specs(sandbox: Any, kind: str) -> list[ComputerTierSpec]:
     ]
 
 
+async def _stand_in_host(user_id: str) -> Optional[str]:
+    """The computer kept for Home's stand-in (``stand_in_needed``), which its
+    card says, as a retirement would keep it."""
+    stand_in = await read_stand_in(user_id)
+    if stand_in is None or not await stand_in_needed(user_id):
+        return None
+    return str(stand_in.computer["computer_id"])
+
+
 async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:
     """A single machine's response with its live project count.
 
@@ -637,6 +685,7 @@ async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:
         computer,
         workspace_count=counts.get(computer_id, 0),
         tunnels=await tunnels_for(computer["user_id"], [computer]),
+        stand_in_host=await _stand_in_host(str(computer["user_id"])),
     )
 
 
@@ -668,7 +717,16 @@ async def rename_computer(
 @router.delete("/{computer_id}", response_model=ComputerRemoveResponse)
 async def remove_computer(
     computer_id: str,
-    x_user_id: ComputerEndUserId,
+    principal: ComputerRemovePrincipal,
+    request: Request,
+    response: Response,
+    home_to: Optional[str] = Query(
+        None,
+        description=(
+            "For the primary: the computer Home moves to first, as Make primary "
+            "would move it; the removal follows once the move commits"
+        ),
+    ),
     remove_key: bool = Query(
         True,
         description=(
@@ -695,7 +753,12 @@ async def remove_computer(
 ):
     """Remove a computer and its sandbox for good.
 
-    Any but the primary, which is where new workspaces go. One with workspaces
+    Any but the primary, which is where new workspaces go, unless ``home_to``
+    names where Home goes: the owner's checks run first, then Home moves there
+    as Make primary moves it, refused with Make primary's codes. When Home has
+    to move, the answer is 202 with its ``move_id``, and the computer is
+    removed when the move commits, here or by a later sweep; a move that fails
+    leaves it, with its ``removal`` saying so. One with workspaces
     is refused unless ``delete_workspaces`` names every one of them, the ones
     the owner was shown, so a removal never takes a workspace they did not
     see (one created meanwhile, in another tab). The body carries them, as
@@ -711,31 +774,70 @@ async def remove_computer(
     on, or without one in the background, where a machine that does not
     answer holds up nobody.
     """
+    x_user_id = principal.user_id
+    if home_to and not principal.unlimited:
+        # Moving Home makes ``home_to`` primary, which only the app may ask.
+        raise HTTPException(status_code=403, detail=_PRIMARY_IN_THE_APP)
     named = list(dict.fromkeys([*delete_workspaces, *(body.delete_workspaces if body else ())]))
     async with _computer_action_errors("remove", computer_id):
         computer = await _owned_computer(computer_id, x_user_id)
-        deleted = await _computer_manager().remove_computer_with_workspaces(
-            computer_id, named, delete_files=delete_files
-        )
-        logger.info("Removed computer %s for user %s", computer_id, x_user_id)
-        if computer.get("kind") != SSH_KIND:
-            return ComputerRemoveResponse(workspaces_deleted=deleted)
-        settings = _sandbox_config().settings_for(SSH_KIND)
-        left = await leave_machine(
-            x_user_id,
+        manager = _computer_manager()
+        home_leaves = bool(home_to) and bool(computer.get("is_primary"))
+        # Read before anyone is asked, so the user never approves a removal
+        # the manager then refuses; the manager reads it again, decisively.
+        held = await manager.removal_refusal(computer, named, home_leaves=home_leaves)
+        if held is not None:
+            raise ComputerRemovalRefused(held)
+        await cli_approval.computer_remove(
+            request,
+            principal,
             computer,
-            settings=settings,
             remove_key=remove_key,
             delete_files=delete_files,
+            delete_workspaces=delete_workspaces,
+            body=body,
         )
-        if tunnel_of(computer) and not left.tunnel_released:
-            schedule_start(
-                f"tunnel-release:{computer_id}",
-                lambda: release_tunnel(x_user_id, computer, settings=settings),
-            )
-    return ComputerRemoveResponse(
-        key=left.key, files=left.files, token=left.token, workspaces_deleted=deleted
-    )
+        if home_leaves:
+            await _owned_computer(home_to, x_user_id)
+            with move_refusals():
+                move = await manager.move_home_then_remove(
+                    computer,
+                    home_to,
+                    named,
+                    delete_files=delete_files,
+                    remove_key=remove_key,
+                )
+            if move is not None:
+                response.status_code = 202
+                return ComputerRemoveResponse(move_id=str(move["move_id"]))
+        removed = await manager.remove_computer_for_owner(
+            computer, named, delete_files=delete_files, remove_key=remove_key
+        )
+    return removed.response()
+
+
+@router.get("/{computer_id}/removal", response_model=ComputerRemovalIntent)
+async def get_computer_removal(computer_id: str, x_user_id: ReadUserId):
+    """How a remove that waited on Home's move off the computer ended.
+
+    Read once that move has ended: a computer removed leaves the list, and
+    this is where what its removal left behind is told. One gone without
+    that recorded (removed by another request, or by a worker lost before
+    it recorded it) reads removed, with nothing said. One a worker is still
+    leaving the machine of reads waiting, so the owner is told what it left.
+    """
+    computer = await get_computer(computer_id, include_deleted=True)
+    require_computer_owner(computer, user_id=x_user_id)
+    removal = _intent(computer, REMOVAL_INTENT, ComputerRemovalIntent)
+    if removal is None:
+        raise HTTPException(status_code=404, detail="No removal waited on Home's move off this computer")
+    if (
+        computer["status"] == "deleted"
+        and removal.state != "removed"
+        and not removal_held(computer["config"][REMOVAL_INTENT])
+    ):
+        return ComputerRemovalIntent(state="removed", move_id=removal.move_id)
+    return removal
 
 
 @router.get("/{computer_id}/storage", response_model=ComputerStorageResponse)
@@ -881,8 +983,12 @@ async def start_computer(
                 detail=f"Cannot start computer in '{status}' state",
             )
 
+        with computer_cause("button"):
+            if lazy:
+                status = await _schedule_claimed_start(computer_id)
+            else:
+                updated = await manager.start_computer(computer_id)
         if lazy:
-            status = await _schedule_claimed_start(computer_id)
             payload = ComputerActionResponse(
                 computer_id=computer_id,
                 status=status,
@@ -893,8 +999,6 @@ async def start_computer(
                 content=payload.model_dump_json(),
                 media_type="application/json",
             )
-
-        updated = await manager.start_computer(computer_id)
         return ComputerActionResponse(
             computer_id=computer_id,
             status=(updated or {}).get("status") or "running",
@@ -906,7 +1010,8 @@ async def start_computer(
 async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
     async with _computer_action_errors("stop", computer_id):
         await _owned_computer(computer_id, x_user_id)
-        updated = await _computer_manager().stop_computer(computer_id)
+        with computer_cause("user"):
+            updated = await _computer_manager().stop_computer(computer_id)
         logger.info(f"Stopped computer {computer_id}")
         return ComputerActionResponse(
             computer_id=computer_id,
@@ -919,7 +1024,8 @@ async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
 async def archive_computer(computer_id: str, x_user_id: ComputerEndUserId):
     async with _computer_action_errors("archive", computer_id):
         await _owned_computer(computer_id, x_user_id)
-        updated = await _computer_manager().archive_computer(computer_id)
+        with computer_cause("archive"):
+            updated = await _computer_manager().archive_computer(computer_id)
         logger.info(f"Archived computer {computer_id}")
         return ComputerActionResponse(
             computer_id=computer_id,
@@ -975,12 +1081,13 @@ async def set_computer_spec(
         # Keyed by the claim, not the machine: the row already refuses a second
         # fresh change, and a stale takeover must get a runner of its own
         # rather than be deduplicated onto the one it replaced.
-        schedule_start(
-            f"computer-spec:{computer_id}:{claim_id}",
-            lambda: manager.run_accepted_spec_change(
-                computer_id, request.tier, user_id=x_user_id, claim_id=claim_id
-            ),
-        )
+        with computer_cause("spec_change"):
+            schedule_start(
+                f"computer-spec:{computer_id}:{claim_id}",
+                lambda: manager.run_accepted_spec_change(
+                    computer_id, request.tier, user_id=x_user_id, claim_id=claim_id
+                ),
+            )
         logger.info(
             "Accepted spec change of computer %s to %r for user %s",
             computer_id,
@@ -994,27 +1101,41 @@ async def set_computer_spec(
 async def make_primary_computer(
     computer_id: str,
     response: Response,
-    x_user_id: CurrentUserId,
+    principal: ComputerWritePrincipal,
+    request: Optional[MakePrimaryRequest] = None,
 ):
     """Make this the computer new workspaces and Home land on.
 
     Home lives on the primary. With Home on no computer yet, or already on
     this one, the flip lands now (200). Otherwise Home's files move first,
     which outlasts a request: the move is accepted (202), the flip lands
-    when it commits, and both are read back from Home's move.
+    when it commits, and both are read back from Home's move. ``from_backup``
+    lays Home from its last backup, for a machine of the user's own that
+    can't be reached. A computer whose files are not backed up is refused
+    (409 ``not_backed_up``): Home would live only on its disk, unless
+    ``turn_on_backup`` turns it on first, in this request. A machine whose
+    tunnel is down is refused (409 ``target_unreachable``).
     """
+    if not principal.unlimited:
+        raise HTTPException(status_code=403, detail=_PRIMARY_IN_THE_APP)
+    x_user_id = principal.user_id
+    request = request or MakePrimaryRequest()
     async with _computer_action_errors("make primary", computer_id):
-        await _owned_computer(computer_id, x_user_id)
+        computer = await _owned_computer(computer_id, x_user_id)
+        if request.turn_on_backup and not computer.get("files_backup", True):
+            if await set_computer_files_backup(computer_id, True) is None:
+                raise HTTPException(status_code=404, detail="Computer not found")
+            logger.info("Turned on file backup of computer %s to make it primary", computer_id)
         with move_refusals():
-            flipped = await set_primary_computer(x_user_id, computer_id)
-        if flipped:
-            logger.info("Made computer %s primary for user %s", computer_id, x_user_id)
+            move = await _computer_manager().make_primary(
+                x_user_id, computer_id, from_backup=request.from_backup
+            )
+        if move is None:
             return MakePrimaryResponse(computer_id=computer_id, is_primary=True)
-        move = await accept_workspace_move(
-            x_user_id, get_home_workspace_id(x_user_id), computer_id, make_primary=True
-        )
         response.status_code = 202
-        return MakePrimaryResponse(computer_id=computer_id, is_primary=False, move=move)
+        return MakePrimaryResponse(
+            computer_id=computer_id, is_primary=False, move=move_from_row(move)
+        )
 
 
 @router.post("/{computer_id}/files-backup", response_model=ComputerResponse)
@@ -1036,7 +1157,16 @@ async def set_computer_files_backup_route(
             raise HTTPException(status_code=409, detail=_FILES_BACKUP_REQUIRED)
         updated = await set_computer_files_backup(computer_id, request.enabled)
         if updated is None:
-            raise HTTPException(status_code=404, detail="Computer not found")
+            # The write refuses a primary; this read only words the refusal.
+            if await get_computer(computer_id) is None:
+                raise HTTPException(status_code=404, detail="Computer not found")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "primary_backup_required",
+                    "message": _PRIMARY_BACKUP_REQUIRED,
+                },
+            )
         logger.info(
             f"Set computer {computer_id} file backup to {request.enabled} "
             f"for user {x_user_id}"
@@ -1056,18 +1186,18 @@ async def set_computer_always_on(
     """
     async with _computer_action_errors("set always-on for", computer_id):
         await _owned_computer(computer_id, x_user_id)
-        updated = await _computer_manager().set_computer_always_on(
-            computer_id, request.enabled, user_id=x_user_id
-        )
-        if updated is None:
-            raise HTTPException(status_code=404, detail="Computer not found")
-
-        if request.enabled and updated.get("status") in CLAIMABLE_FOR_START:
-            status = await _schedule_claimed_start(computer_id)
-            logger.info(
-                f"Always-on enabled: scheduled start for computer {computer_id}"
+        with computer_cause("always_on"):
+            updated = await _computer_manager().set_computer_always_on(
+                computer_id, request.enabled, user_id=x_user_id
             )
-            updated = {**updated, "status": status}
+            if updated is None:
+                raise HTTPException(status_code=404, detail="Computer not found")
+            if request.enabled and updated.get("status") in CLAIMABLE_FOR_START:
+                status = await _schedule_claimed_start(computer_id)
+                logger.info(
+                    f"Always-on enabled: scheduled start for computer {computer_id}"
+                )
+                updated = {**updated, "status": status}
 
         logger.info(
             f"Set computer {computer_id} always-on to {request.enabled} "
@@ -1117,7 +1247,8 @@ def _repair_refusals():
 async def _accepted_repair_start(computer_id: str, message: str) -> ComputerActionResponse:
     """Start the repaired computer as a lazy start does, answering once its
     claim is on the row."""
-    status = await _schedule_claimed_start(computer_id)
+    with computer_cause("repair"):
+        status = await _schedule_claimed_start(computer_id)
     return ComputerActionResponse(computer_id=computer_id, status=status, message=message)
 
 
@@ -1150,13 +1281,14 @@ async def reinstall_computer(
         await _owned_computer(computer_id, x_user_id)
         settings = _sandbox_config().settings_for(SSH_KIND)
         with _repair_refusals():
-            await _computer_manager().reinstall_computer(
-                computer_id,
-                folder=request.folder,
-                root_dir=request.root_dir,
-                settings=settings,
-                take_over=request.take_over,
-            )
+            with computer_cause("repair"):
+                await _computer_manager().reinstall_computer(
+                    computer_id,
+                    folder=request.folder,
+                    root_dir=request.root_dir,
+                    settings=settings,
+                    take_over=request.take_over,
+                )
         logger.info(
             "Reinstalled computer %s (%s) for user %s",
             computer_id,
@@ -1195,9 +1327,10 @@ async def reconnect_computer(
         await _owned_computer(computer_id, x_user_id)
         settings = _sandbox_config().settings_for(SSH_KIND)
         with _repair_refusals():
-            updated, before = await _computer_manager().reconnect_computer(
-                computer_id, request.ssh, settings=settings
-            )
+            with computer_cause("repair"):
+                updated, before = await _computer_manager().reconnect_computer(
+                    computer_id, request.ssh, settings=settings
+                )
         left = tunnel_of(before)
         if left and left != tunnel_of(updated):
             schedule_start(

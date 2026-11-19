@@ -25,10 +25,10 @@ class TestImageRoute:
             ("deepseek-flash", "deepseek"),
             ("glm-5.3-flash", "z-ai"),
             ("glm-5.3-flash-cn", "z-ai"),
-            ("gpt-6.1-sol", "openai"),
-            ("gpt-6.1-sol-oauth", "openai"),
-            ("gemini-3.8-flash", "gemini"),
-            ("qwen3.8-max-intl", "dashscope"),
+            ("gpt-6.2-sol", "openai"),
+            ("gpt-6.2-sol-oauth", "openai"),
+            ("gemini-4-hydrogen", "gemini"),
+            ("qwen4-max-intl", "dashscope"),
         ],
     )
     def test_a_manifest_model_is_judged_as_its_vendor(self, model, route):

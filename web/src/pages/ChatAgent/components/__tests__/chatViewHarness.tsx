@@ -83,8 +83,7 @@ const baseChatState = () => ({
   hasActiveSubagents: false,
   awaitingReportBack: false,
   reportBackOwed: false,
-  workspaceStarting: false as const,
-  turnHeld: null,
+  turnStatus: { workspaceStarting: false as const, turnHeld: null, cliQueue: null },
   isCompacting: false as const,
   setIsCompacting: vi.fn(),
   queuedSend: null,
@@ -168,7 +167,7 @@ export function chatMessagesMock(original: unknown) {
 }
 
 export function workspaceFilesMock() {
-  return { useWorkspaceFiles: () => ({ files: [], loading: false, error: null, refresh: vi.fn() }) };
+  return { useWorkspaceFiles: () => ({ files: [], loading: false, error: null, refresh: vi.fn(), refreshInBackground: vi.fn() }) };
 }
 
 export function navigationDataMock(original: unknown) {

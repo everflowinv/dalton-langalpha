@@ -9,6 +9,10 @@ services:
   postgres:
     profiles: ["infra"]
     image: postgres:18
+    # Reap orphaned healthcheck processes. Without an init, a pg_isready the
+    # healthcheck abandons on timeout is reparented to the postmaster (PID 1);
+    # its exit code 2 reads as a crashed backend and restarts the database.
+    init: true
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PG_HOST_PORT:-5432}:5432"
@@ -94,6 +98,7 @@ services:
       - ./src:/app/src
       - ./libs/market-protocol:/app/libs/market-protocol
       - ./libs/chartkit:/app/libs/chartkit
+      - ./libs/edgar-engine:/app/libs/edgar-engine
       - ./server.py:/app/server.py
       - ./agent_config.yaml:/app/agent_config.yaml
       # The `langalpha` CLI each computer gets, built by the cli service.
@@ -168,6 +173,7 @@ services:
       - ./src:/app/src
       - ./libs/market-protocol:/app/libs/market-protocol
       - ./libs/chartkit:/app/libs/chartkit
+      - ./libs/edgar-engine:/app/libs/edgar-engine
       - ./alembic.ini:/app/alembic.ini
       - ./migrations:/app/migrations
     # Wait for the backend so its migrations have run before the gateway reads keys.

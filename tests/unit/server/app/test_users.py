@@ -215,6 +215,32 @@ async def test_update_current_user(client):
 
 
 @pytest.mark.asyncio
+async def test_where_the_user_works_is_a_field_of_the_user(client):
+    """The desktop first run's answer is written and read back with the
+    profile; only the two values are taken."""
+    updated = _user(computer_choice="own_machine")
+    with (
+        patch(f"{DB}.db_get_user", new_callable=AsyncMock, return_value=_user()),
+        patch(
+            f"{DB}.db_update_user", new_callable=AsyncMock, return_value=updated
+        ) as write,
+        patch(f"{DB}.db_get_user_preferences", new_callable=AsyncMock, return_value=None),
+    ):
+        resp = await client.put(
+            "/api/v1/users/me", json={"computer_choice": "own_machine"}
+        )
+        refused = await client.put(
+            "/api/v1/users/me", json={"computer_choice": "laptop"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["user"]["computer_choice"] == "own_machine"
+    assert write.await_args.kwargs["computer_choice"] == "own_machine"
+    assert refused.status_code == 422
+    assert write.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_update_current_user_not_found(client):
     with patch(
         f"{DB}.db_get_user",
@@ -1536,16 +1562,16 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
                     "dalton_audit_model": "gemini-4-hydrogen-low-oauth",
                     "dalton_audit_fallback_models": [
                         "deepseek-flash",
-                        "gpt-6.1-sol-oauth",
+                        "gpt-6.2-sol-oauth",
                         "deepseek-flash",
                     ],
                     "dalton_audit_timeout_s": 300,
                     "dalton_assist_model": "gemini-4-hydrogen-low-oauth",
                     "dalton_assist_fallback_models": ["deepseek-flash"],
                     "dalton_reviewer_models": [
-                        "gpt-6.1-sol-oauth",
+                        "gpt-6.2-sol-oauth",
                         "claude-opus-5-5-oauth",
-                        "gpt-6.1-sol-oauth",
+                        "gpt-6.2-sol-oauth",
                     ],
                     "dalton_extract_model": "",
                 }
@@ -1557,11 +1583,11 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
     assert saved_mp["dalton_audit_model"] == "gemini-4-hydrogen-low-oauth"
     assert saved_mp["dalton_audit_fallback_models"] == [
         "deepseek-flash",
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
     ]
     assert saved_mp["dalton_audit_timeout_s"] == 300
     assert saved_mp["dalton_reviewer_models"] == [
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
     ]
     assert saved_mp["dalton_extract_model"] is None
@@ -1577,7 +1603,7 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
             "dalton_assist_model",
         ),
         (
-            {"dalton_reviewer_models": ["gpt-6.1-sol-oauth", "unknown-model-999"]},
+            {"dalton_reviewer_models": ["gpt-6.2-sol-oauth", "unknown-model-999"]},
             "dalton_reviewer_models",
         ),
         ({"dalton_reviewer_models": "not-a-list"}, "dalton_reviewer_models"),

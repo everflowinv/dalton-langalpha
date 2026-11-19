@@ -30,7 +30,8 @@ from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
 
 from ptc_agent.agent.claude_code.cli import RuntimeSpec
-from ptc_agent.agent.claude_code.compaction import CompactionRules
+from ptc_agent.agent.claude_code.cli_waits import CliWaits
+from ptc_agent.agent.claude_code.compaction import NO_RULES, CompactionRules
 from ptc_agent.agent.claude_code.launcher import Launcher
 from ptc_agent.agent.claude_code.mid_turn import TaskSteering
 from ptc_agent.agent.claude_code.runtime import TURN_KEY, Baseline, ClaudeTurn, build_claude_code_graph
@@ -40,8 +41,9 @@ from ptc_agent.agent.middleware.credit_gate import CreditGateMiddleware
 from ptc_agent.agent.middleware.order_governance import OrderGovernanceMiddleware, places_order
 from ptc_agent.agent.middleware.steering import SteeringMiddleware
 from ptc_agent.agent.middleware.wakeups import WakeupCancelNoticeMiddleware
+from ptc_agent.core.claude_code_clis import CliQueue
 from src.llms.claude_code import ClaudeCodeTarget
-from src.tools.secretary._commands import puts_card
+from src.tools.secretary._commands import HANDOFF_TOOL_NAME
 from src.tools.secretary.approvals import StandingApprovalMiddleware
 from src.tools.wakeups import quiet
 
@@ -55,10 +57,10 @@ _OPENING_ROWS = (WakeupCancelNoticeMiddleware,)
 
 def waits_for_user(orders: frozenset[str]):
     """Which calls may wait for the user: a question, an order (``orders``
-    names the tools that place one) or a Chief of Staff card."""
+    names the tools that place one) or a hand-off's card."""
 
     def waits(name: str, args: Mapping[str, Any]) -> bool:
-        return name == ask_user.TOOL_NAME or name in orders or puts_card(name, args)
+        return name in (ask_user.TOOL_NAME, HANDOFF_TOOL_NAME) or name in orders
 
     return waits
 
@@ -87,10 +89,13 @@ class ClaudeCodeGraph:
     included, which are the parent's own.
     """
 
-    def __init__(self, graph: Any, turn: Callable[..., ClaudeTurn], takes: frozenset[str] | None = None) -> None:
+    def __init__(self, graph: Any, turn: Callable[..., ClaudeTurn], takes: frozenset[str] | None = None, *,
+                 compaction: CompactionRules = NO_RULES) -> None:
         self.graph = graph
         self._turn = turn
         self._takes = takes
+        #: The rules its turns compact by, the user's settings as built.
+        self.compaction = compaction
 
     def _input(self, input: Any) -> Any:
         if self._takes is None or not isinstance(input, Mapping):
@@ -132,7 +137,7 @@ class ClaudeCodeGraph:
 
 def claude_code_graph(
     agent: Any, *, system_prompt: str, target: ClaudeCodeTarget, user_id: str | None,
-    checkpointer: Any, launcher: Callable[[], Launcher], entry: Sequence[Any] = (),
+    checkpointer: Any, launcher: Callable[[CliQueue], Launcher], entry: Sequence[Any] = (),
     compaction: CompactionRules, middleware: Sequence[Any] = (), baseline: Baseline | None = None,
     steering: SteeringMiddleware | TaskSteering | None = None, alert_senders: frozenset[str] = frozenset(),
 ) -> ClaudeCodeGraph:
@@ -148,6 +153,7 @@ def claude_code_graph(
     refused, and each run's thread and namespace name its working
     directory (``ClaudeTurn.run_key``). ``launcher`` makes where a turn's
     CLI runs, one for each turn, since a launcher serves one run at a time,
+    told of the turn's waits for one of its computer's CLIs where it shows them,
     and ``compaction`` says when Claude's session compacts and moves to this
     build's prompt and tools.
     """
@@ -166,8 +172,9 @@ def claude_code_graph(
         ends_turn=_ends_turn,
     )
     def turn(**run: str) -> ClaudeTurn:
-        return ClaudeTurn(spec, launcher(), identity=user_id, baseline=baseline, compaction=compaction,
-                          steering=steering, alert_senders=alert_senders, **run)
+        waits = CliWaits()
+        return ClaudeTurn(spec, launcher(waits), identity=user_id, baseline=baseline, compaction=compaction,
+                          steering=steering, alert_senders=alert_senders, waits=waits, **run)
 
     def hooks(of: Sequence[Any], hook: str) -> list[tuple[str, Any]]:
         return [(name, nodes[name].runnable) for m in of if (name := f"{m.name}.{hook}") in nodes]
@@ -184,4 +191,4 @@ def claude_code_graph(
         on_reply=capture.capture if capture else None,
     ).with_config({"recursion_limit": agent.config["recursion_limit"]})
     builder = agent.builder
-    return ClaudeCodeGraph(graph, turn, frozenset(builder.schemas[builder.input_schema]))
+    return ClaudeCodeGraph(graph, turn, frozenset(builder.schemas[builder.input_schema]), compaction=compaction)

@@ -24,8 +24,11 @@ from src.server.contracts.status import (
     is_restart_interrupted,
     restart_resume_expired,
 )
+from src.server.database.home_stand_in import home_stand_in_could_run_sql
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
+from src.server.database.ssh_tunnels import awaited_computer_back_sql
+from src.server.models.automation import WaitReason
 from src.server.utils.db import UpdateQueryBuilder
 
 logger = logging.getLogger(__name__)
@@ -229,7 +232,10 @@ def _execution_update(
         table="automation_executions",
         where_clause=where_clause,
         where_params=where_params,
-        returning_columns=["conversation_thread_id", "conversation_response_id"],
+        returning_columns=[
+            "conversation_thread_id", "conversation_response_id",
+            "scheduled_at", "wait_reason", "awaits_computer", "checked_computer_id",
+        ],
         include_updated_at=False,  # no updated_at column on executions
     )
 
@@ -240,10 +246,12 @@ async def transition_execution(
     from_statuses: Sequence[str],
     to: str,
     automation_id: Optional[str] = None,
+    wait_reason: Optional[WaitReason] = None,
     **fields: Any,
 ) -> Optional[Dict[str, Any]]:
     """Move an execution to ``to`` only while its status is one of
-    ``from_statuses``; the row's thread and run, or None when it was not.
+    ``from_statuses``; the row's thread and run, when it was due and what it
+    last waited for, or None when it was not.
 
     The guarded write every move of a live firing makes, so the executor, a
     skip and the sweep can race and exactly one of them wins. Ending a firing
@@ -255,6 +263,8 @@ async def transition_execution(
     if automation_id is not None:
         where_clause += " AND automation_id = %s"
         where_params.append(automation_id)
+    if wait_reason is not None:
+        fields["wait_reason"] = wait_reason
     query, params = _execution_update(to, where_clause, where_params, fields)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -284,7 +294,8 @@ async def begin_execution_if_not_deleted(
                   AND e.status = 'pending'
                   AND a.automation_id = e.automation_id
                   AND a.deleted_at IS NULL
-                RETURNING e.conversation_thread_id, e.conversation_response_id
+                RETURNING e.conversation_thread_id, e.conversation_response_id,
+                          e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id
                 """,
                 (started_at, execution_id),
             )
@@ -389,6 +400,7 @@ async def settle_execution(
     # DALTON-HOOK(automation-continuation-identity): lock/CAS options for settlement
     expected_run_id: Any = UNSET_RUN_ID,
     check_run_state_in_lock: Optional[Literal["terminal", "completed_idle", "timeout"]] = None,
+    parked: bool = False,
     in_transaction: Optional[Callable[[Any, Dict[str, Any]], Awaitable[Any]]] = None,
     **fields: Any,
 ) -> Optional[Dict[str, Any]]:
@@ -398,7 +410,10 @@ async def settle_execution(
     One transaction, so a failure between the two can never leave a price
     alert 'executing' behind a settled firing. ``quiet_for`` settles only a
     firing whose heartbeat has been quiet that many seconds, which is what
-    keeps the sweep off a firing whose process came back. Returns the row's
+    keeps the sweep off a firing whose process came back; ``parked`` only one
+    still parked for its computer, which keeps the parked sweep's verdict,
+    read before the row was locked, off a firing released and waiting since
+    for something else. Returns the row's
     thread and run, ``settled_from``, the status it left, the ``delivery``
     its start kept (``stamp_delivery``), and the ``previous_failure_reason``
     and ``previous_delivery_result`` of the automation's newest firing
@@ -423,6 +438,8 @@ async def settle_execution(
                 if quiet_for is not None:
                     quiet = "AND heartbeat_at < NOW() - make_interval(secs => %s::double precision)"
                     params.append(quiet_for)
+                if parked:
+                    quiet += f" AND {_PARKED.format(e='automation_executions')}"
                 await cur.execute(f"""
                     SELECT status, created_at, delivery,
                            conversation_thread_id, conversation_response_id
@@ -609,13 +626,15 @@ async def list_executions(
     automation_id: Optional[str] = None,
     thread_id: Optional[str] = None,
     status: Optional[str] = None,
+    wait_reason: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
     scope: Optional[str] = None,
     computer_id: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], bool]:
     """A page of a user's executions newest first, narrowed to one
-    automation, thread or status when given, and whether more follow it.
+    automation, thread, status or wait reason when given, and whether more
+    follow it.
 
     Every row is scoped by its automation's owner, which is the ownership
     check: another user's automation lists nothing. ``workspace_id`` prefers
@@ -642,6 +661,9 @@ async def list_executions(
         ("e.automation_id", automation_id),
         ("e.conversation_thread_id", thread_id),
         ("e.status", status),
+        # A wait from before reasons were kept has none, and was for a thread.
+        ("COALESCE(e.wait_reason, CASE WHEN e.status = 'waiting'"
+         " THEN 'thread_busy' END)", wait_reason),
     ):
         if value:
             where_parts.append(f"{column} = %s")
@@ -728,19 +750,22 @@ async def has_earlier_waiting_execution(
     automation_id: str, execution_id: str
 ) -> bool:
     """Whether a firing of this automation that came before this one is
-    waiting too.
+    waiting for the thread too.
 
     Strictly earlier, by creation then id, so of two firings that start
-    waiting together exactly one gives way.
+    waiting together exactly one gives way. A firing parked for its computer
+    is not in this line: this one takes its wait over (``_SUPERSEDED``), so
+    giving way to it would skip both.
     """
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("""
+            await cur.execute(f"""
                 SELECT 1
                 FROM automation_executions w
                 JOIN automation_executions me
                   ON me.automation_execution_id = %s
                 WHERE w.automation_id = %s AND w.status = 'waiting'
+                  AND NOT {_PARKED.format(e="w")}
                   AND (w.created_at, w.automation_execution_id)
                       < (me.created_at, me.automation_execution_id)
                 LIMIT 1
@@ -779,12 +804,16 @@ async def get_execution_status(
 
 
 async def touch_execution(execution_id: str) -> None:
+    """Beat a firing's heartbeat, never a parked one's: a touch already queued
+    behind the park would otherwise commit after it and undo the heartbeat
+    the park dated to its deadline."""
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(f"""
                 UPDATE automation_executions SET heartbeat_at = NOW()
                 WHERE automation_execution_id = %s
                   AND status IN {UNSETTLED_STATUSES}
+                  AND NOT {_PARKED.format(e="automation_executions")}
             """, (execution_id,))
 
 
@@ -862,6 +891,7 @@ async def list_abandoned_executions(
                 LEFT JOIN conversation_threads t
                     ON t.conversation_thread_id = e.conversation_thread_id
                 WHERE e.status IN {UNSETTLED_STATUSES}
+                  AND NOT {_PARKED.format(e="e")}
                   AND NOT EXISTS (
                       SELECT 1 FROM conversation_responses r
                       WHERE (
@@ -1071,6 +1101,148 @@ async def take_over_execution_run(
 # --- DALTON-HOOK(automation-continuation-identity): end ---
 
 
+# =============================================================================
+# Waiting for a computer
+# =============================================================================
+#
+# A firing whose computer cannot be reached is parked as ``waiting`` naming
+# that computer (``awaits_computer``), and no process holds it: the
+# scheduler's sweep starts it again once the computer's tunnel is live, or
+# gives it up. Its heartbeat is quiet meanwhile, so the abandoned-firing sweep
+# passes it over.
+
+# Never NULL, so ``NOT`` of it holds for a row with no ``wait_reason``.
+_PARKED = (
+    "({e}.status = 'waiting'"
+    " AND {e}.wait_reason IS NOT DISTINCT FROM 'computer_unreachable')"
+)
+
+# A firing of the same automation came after ``e``, whatever became of it: it
+# takes the wait over, so a schedule's missed runs come back as one run.
+_SUPERSEDED = """EXISTS (
+    SELECT 1 FROM automation_executions w
+    WHERE w.automation_id = e.automation_id
+      AND (w.created_at, w.automation_execution_id)
+          > (e.created_at, e.automation_execution_id))"""
+
+# Its computer is back, or its automation's workspace is on another one now.
+_REACHABLE = awaited_computer_back_sql(
+    "e.awaits_computer::text",
+    "(SELECT m.workspace_id FROM automations m WHERE m.automation_id = e.automation_id)",
+)
+# A firing of the user's Home, which a turn in Home's stand-in can run now
+# though the machine Home lives on is still away.
+_STAND_IN = f"""EXISTS (
+    SELECT 1 FROM automations m
+    JOIN workspaces ws ON ws.workspace_id = m.workspace_id
+    WHERE m.automation_id = e.automation_id
+      AND {home_stand_in_could_run_sql("ws")})"""
+_EXPIRED = "e.awaits_until < NOW()"
+
+
+async def park_execution(
+    execution_id: str,
+    *,
+    awaits_computer: str,
+    parked_status: str,
+    wait_seconds: int,
+) -> bool:
+    """Park a pending or running firing as ``waiting`` for ``awaits_computer``;
+    False when it had moved on.
+
+    The wait's deadline is set by the first park and kept by every later
+    one, so a machine that comes back only to drop again does not start the
+    wait over. The heartbeat is dated to that deadline: nothing touches the
+    row while it waits, and a build that predates parking (the other color
+    through a cutover) must not take the quiet heartbeat for a dead process.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                UPDATE automation_executions
+                SET status = 'waiting', started_at = NOW(),
+                    wait_reason = 'computer_unreachable',
+                    awaits_computer = %(computer)s, parked_status = %(parked_status)s,
+                    awaits_until = COALESCE(
+                        awaits_until, NOW() + make_interval(secs => %(wait_s)s)),
+                    heartbeat_at = COALESCE(
+                        awaits_until, NOW() + make_interval(secs => %(wait_s)s))
+                WHERE automation_execution_id = %(execution_id)s
+                  AND status IN ('pending', 'running')
+            """, {
+                "execution_id": execution_id, "computer": awaits_computer,
+                "parked_status": parked_status, "wait_s": wait_seconds,
+            })
+            return cur.rowcount == 1
+
+
+async def list_parked_executions(limit: int = 50) -> List[Dict[str, Any]]:
+    """Firings parked for a computer that the sweep has something to do with,
+    soonest deadline first, with their owner, the automation's status when
+    each parked, and the sweep's verdict on each: ``superseded`` by a later firing,
+    ``reachable`` (its computer's tunnel is live, it names none, or its
+    workspace is on another computer now), ``stand_in`` (a firing of Home,
+    which Home's stand-in can run now) or ``expired`` (past its
+    ``awaits_until``).
+
+    Rows with none of those are left out before the limit: a page of
+    machines asleep for the night must not starve one that is back.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(f"""
+                SELECT e.automation_execution_id, e.automation_id, e.parked_status,
+                       a.user_id,
+                       {_SUPERSEDED} AS superseded,
+                       {_REACHABLE} AS reachable,
+                       {_STAND_IN} AS stand_in,
+                       {_EXPIRED} AS expired
+                FROM automation_executions e
+                JOIN automations a ON a.automation_id = e.automation_id
+                WHERE {_PARKED.format(e="e")}
+                  -- DALTON-HOOK(company-automations): skip parked firings of soft-deleted parents
+                  AND a.deleted_at IS NULL
+                  AND ({_SUPERSEDED} OR {_REACHABLE} OR {_STAND_IN} OR {_EXPIRED})
+                ORDER BY e.awaits_until NULLS LAST
+                LIMIT %(limit)s
+            """, {"limit": limit})
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def release_parked_execution(execution_id: str) -> bool:
+    """Put a parked firing back in line as ``pending`` for the ordinary start,
+    once its computer is reachable, its workspace is on another one now, or
+    it is Home's and Home's stand-in can run it; False when another worker
+    took it, it moved on, a later firing took its wait over, its deadline
+    passed since the sweep read it (the next sweep skips it), or none of
+    those holds any more.
+
+    One guarded statement, so of the workers whose sweeps reach the row
+    exactly one starts it. The heartbeat starts again with it, and the thread
+    is let go: the run takes the automation's thread as it stands after the
+    wait, as it would had it waited in process.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(f"""
+                UPDATE automation_executions e
+                SET status = 'pending', heartbeat_at = NOW(),
+                    conversation_thread_id = NULL
+                WHERE e.automation_execution_id = %(execution_id)s
+                  -- DALTON-HOOK(company-automations): refuse release if parent was soft-deleted
+                  AND EXISTS (
+                      SELECT 1 FROM automations a
+                      WHERE a.automation_id = e.automation_id
+                        AND a.deleted_at IS NULL
+                  )
+                  AND {_PARKED.format(e="e")}
+                  AND NOT {_SUPERSEDED}
+                  AND NOT COALESCE({_EXPIRED}, false)
+                  AND ({_REACHABLE} OR {_STAND_IN})
+            """, {"execution_id": execution_id})
+            return cur.rowcount == 1
+
+
 async def hand_off_execution(
     execution_id: str, *, from_statuses: Sequence[str], thread_id: str, job: Any
 ) -> bool:
@@ -1149,6 +1321,8 @@ async def create_execution_for_live_parent(
     user_id: str,
     scheduled_at: datetime,
     server_id: str,
+    *,
+    checked_computer_id: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any]]:
     """Lock the parent, refuse a deleted or non-triggerable row, then insert.
 
@@ -1182,11 +1356,11 @@ async def create_execution_for_live_parent(
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,
                         status, scheduled_at, server_id, created_at,
-                        heartbeat_at
+                        heartbeat_at, checked_computer_id
                     )
-                    VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW())
+                    VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s)
                     """,
-                    (execution_id, automation_id, scheduled_at, server_id),
+                    (execution_id, automation_id, scheduled_at, server_id, checked_computer_id),
                 )
     return execution_id, parent_row
 
@@ -1195,11 +1369,13 @@ async def create_execution(
     automation_id: str,
     scheduled_at: datetime,
     server_id: str,
+    *,
+    checked_computer_id: Optional[str] = None,
 ) -> str:
-    """Create a new execution record (for manual triggers).
+    """Create a new execution record (for manual triggers); its id.
 
-    Returns:
-        The new execution_id.
+    ``checked_computer_id`` is the computer a computer token's call was
+    checked to run it on, which every start of the firing reads off the row.
     """
     execution_id = str(uuid4())
     async with get_db_connection() as conn:
@@ -1208,8 +1384,8 @@ async def create_execution(
                 INSERT INTO automation_executions (
                     automation_execution_id, automation_id,
                     status, scheduled_at, server_id, created_at,
-                    heartbeat_at
+                    heartbeat_at, checked_computer_id
                 )
-                VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW())
-            """, (execution_id, automation_id, scheduled_at, server_id))
+                VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s)
+            """, (execution_id, automation_id, scheduled_at, server_id, checked_computer_id))
     return execution_id

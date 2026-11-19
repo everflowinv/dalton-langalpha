@@ -171,7 +171,7 @@ class DaytonaConfig(CredentialedSandboxConfig):
     TIER_CEILING: ClassVar[ResourceTier | None] = DAYTONA_TIER_CEILING
 
     base_url: str = "https://app.daytona.io/api"
-    auto_stop_interval: int = 3600  # 1 hour
+    auto_stop_interval: int = 1800  # Daytona stops it; the idle sweep runs 10 min ahead
     auto_archive_interval: int = 604800  # 7 days, keep stopped (fast restart) before cold storage
     auto_delete_interval: int = 7776000  # 90 days, total dormant lifetime
     # How long a computer's starts may be refused by a recovering host before
@@ -229,7 +229,7 @@ class E2BConfig(CredentialedSandboxConfig):
     sandbox_url: str = ""
     # Seconds without activity before a sandbox pauses. E2B keeps a paused
     # sandbox (memory included) indefinitely and bills nothing for it.
-    auto_stop_interval: int = Field(default=3600, ge=60)
+    auto_stop_interval: int = Field(default=1500, ge=60)
     # The plan's longest continuous run (3600 on Hobby, 86400 on Pro). It caps
     # every timeout we ask for.
     max_timeout: int = Field(default=3600, ge=300, le=86400)
@@ -308,6 +308,10 @@ class VaultBlueprint(BaseModel):
         return v
 
 
+#: What a built-in http server authenticates with (see ``MCPServerConfig.auth``).
+ServerAuth = Literal["data_token", "firecrawl_account"]
+
+
 class MCPServerConfig(BaseModel):
     """Configuration for a single MCP server."""
 
@@ -335,25 +339,34 @@ class MCPServerConfig(BaseModel):
     oauth_connection_id: str | None = None
     # DALTON-HOOK(mcp-call-timeout): per-server tools/call budget for slow direct HTTP servers
     call_timeout_s: float | None = Field(default=None, ge=10, le=900)
-    # The credential the sandbox client presents to a built-in http server.
-    # ``data_token`` is the computer's own data token, read from the token file
-    # the server keeps current, so the server holds no key of its own. The
-    # client resends such a server's requests on a refused token, a rate limit
-    # or a gateway error, so it must be one whose tools only read.
-    auth: Literal["data_token"] | None = None
+    # The credential a built-in http server is reached with. ``data_token`` is
+    # the computer's own data token, read from the token file the server keeps
+    # current, so the server holds no key of its own; the client resends such a
+    # server's requests on a refused token, a rate limit or a gateway error, so
+    # it must be one whose tools only read. Any other value names a key the
+    # host holds for the user (``firecrawl_account``: the Firecrawl account
+    # provisioned for them), which the egress relay attaches, so the sandbox
+    # dials the relay and no key reaches it.
+    auth: ServerAuth | None = None
+    # The tools this server exposes, when it lists more than the agent should
+    # see. None exposes every tool the server lists.
+    tools: list[str] | None = None
+
+    @property
+    def relay_bound(self) -> bool:
+        """Whether the sandbox reaches this server only through the egress relay."""
+        return self.oauth_connection_id is not None or self.auth not in (None, "data_token")
 
     @model_validator(mode="after")
     def _auth_is_builtin_http_only(self) -> Self:
-        # The token authorizes the whole computer's data access, so only a
-        # server the operator configured may receive it, and only over the
-        # one transport whose requests the client stamps.
+        # Either credential reaches the vendor on the user's behalf, so only a
+        # server the operator configured may name one, and only over the one
+        # transport whose requests the client stamps and the relay dials.
         if self.auth is None:
             return self
-        if self.source != "builtin":
-            raise ValueError(f"MCP server {self.name!r}: auth is for built-in servers only")
-        if self.transport != "http":
+        if self.source != "builtin" or self.transport != "http" or not self.url:
             raise ValueError(
-                f"MCP server {self.name!r}: auth {self.auth!r} requires transport 'http'"
+                f"MCP server {self.name!r}: auth {self.auth!r} needs a built-in http server with a url"
             )
         return self
 
@@ -502,10 +515,11 @@ class SSHConfig(ResourceTieredConfig):
     # only the server sets, from the probe. Nothing connects by it: it tells
     # the agent a Mac's command line tools are not GNU's.
     os: str = ""
-    # The machine never stops on idle, so the server's idle reaper stops a
-    # quiet one by this interval. Stopping only ends this computer's own
-    # processes there; the machine keeps running.
-    auto_stop_interval: int = Field(default=3600, ge=60)
+    # How long a quiet computer keeps each worker's session for it. The
+    # server never stops the computer for being quiet: the machine is its
+    # owner's, costs the deployment nothing running, and a stop would end the
+    # owner's own work there. Only the server's own state for it goes.
+    auto_stop_interval: int = Field(default=7200, ge=60)
     # The server dials each machine itself, so by default it connects only to
     # public addresses: a user's machine is never a way into the network the
     # server sits on. A deployment whose users' machines are on its own LAN or

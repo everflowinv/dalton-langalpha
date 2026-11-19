@@ -28,7 +28,8 @@ import { reportOwedForStatus, shouldArmForStatus } from '../utils/reportBackSign
 import { useReportBackWatch } from './useReportBackWatch';
 import { useChatFeedback } from './useChatFeedback';
 import { toast } from '@/components/ui/use-toast';
-import { buildRateLimitError, type ErrorLinkSpec, type StructuredError } from '@/utils/rateLimitError';
+import { buildRateLimitError, type PageLinkSpec, type StructuredError } from '@/utils/rateLimitError';
+import { isNeedsComputer, needsBackupError, needsBackupOf, needsComputerError } from '../utils/needsComputer';
 import { isClientError } from '@/api/errors';
 import { getStoredThreadId, setStoredThreadId } from './utils/threadStorage';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../utils/tokenUsage';
@@ -67,11 +68,12 @@ import type {
   TokenUsage, PendingInterrupt,
   SSEEvent, ModelOptions, SendOptions, OffloadBatch, TaskRefs,
   HistoryInterruptInfo, StreamProcessorRefs,
-  ModelStatus, FallbackSuggestion,
+  ModelStatus, FallbackSuggestion, TurnStatus,
 } from '../session/types';
+import { NO_TURN_STATUS } from '../session/types';
 import { createAnswerBoard, type AnswerBoard } from '../session/interrupts/answerBoard';
 import { useInterruptAnswers } from '../session/interrupts/useInterruptAnswers';
-export type { ModelStatus, FallbackSuggestion } from '../session/types';
+export type { ModelStatus, FallbackSuggestion, TurnStatus } from '../session/types';
 // DALTON-HOOK(composer-drafts): a plain send's settlement callbacks ride the
 // model options its scheduled resent attempts carry (settleRetry hands them to
 // streamFromCheckpoint verbatim): the acceptance settles the draft when the
@@ -241,12 +243,16 @@ export function useChatMessages(
   const [historyLoadFailed, setHistoryLoadFailed] = useState(false);
 
   const [hasActiveSubagents, setHasActiveSubagents] = useState(false);  // Subagent streams open after main agent finished
-  // false | 'starting' (generic cold start) | 'archived' (slow ~90s restore from cold storage).
-  // Widen this union when backend adds a new sandbox_state discriminator.
-  const [workspaceStarting, setWorkspaceStarting] = useState<false | 'starting' | 'archived'>(false);
-  // Why this send waits on a thread mutation (the `turn_held` reason: 'compact',
-  // 'offload', 'handoff', or another/empty), null when it is not held.
-  const [turnHeld, setTurnHeld] = useState<string | null>(null);
+  // What the turn waits on (TurnStatus). A patch that changes nothing keeps
+  // the object, so a frame repeating the status renders nothing.
+  const [turnStatus, setTurnStatusState] = useState<TurnStatus>(NO_TURN_STATUS);
+  const setTurnStatus = useCallback((patch: Partial<TurnStatus>) => {
+    setTurnStatusState((prev) => {
+      const changed = (Object.keys(patch) as (keyof TurnStatus)[]).some((k) => !Object.is(prev[k], patch[k]));
+      return changed ? { ...prev, ...patch } : prev;
+    });
+  }, []);
+  const clearTurnStatus = useCallback(() => setTurnStatusState(NO_TURN_STATUS), []);
   const [isCompacting, setIsCompactingState] = useState<string | false>(false);  // Context compaction in progress (summarize/offload)
   // About how many tokens the summary being written has written, null until
   // the server first says.
@@ -850,8 +856,8 @@ export function useChatMessages(
     setHasActiveSubagents,
     setPendingInterrupt,
     setThreadId,
-    setWorkspaceStarting,
-    setTurnHeld,
+    setTurnStatus,
+    clearTurnStatus,
     // ref containers (stable identity, ref-current reads)
     threadIdRef,
     isStreamingRef,
@@ -1036,8 +1042,9 @@ export function useChatMessages(
         notRunningGenRef.current += 1;
         dropParked();
         setIsCompacting(false);
-        // A send held on the thread we're leaving is no wait of B's.
-        setTurnHeld(null);
+        // A send held on the thread we're leaving is no wait of B's, nor
+        // is its CLI wait. A workspace starting is still the workspace's.
+        setTurnStatus({ turnHeld: null, cliQueue: null });
         // Reset refs
         contentOrderCounterRef.current = 0;
         currentReasoningIdRef.current = null;
@@ -2152,8 +2159,7 @@ export function useChatMessages(
     // cleanupAfterStreamEnd resets them, but the stop path skips that cleanup.
     // (isReconnecting is handled by the reconnect finally's ownership check: the
     // abort above unwinds the reader, whose finally still owns and clears it.)
-    setWorkspaceStarting(false);
-    setTurnHeld(null);
+    clearTurnStatus();
     setIsCompacting(false);
     clearModelStatus();
     releaseStreamOwnership();
@@ -2375,7 +2381,7 @@ export function useChatMessages(
       if (errorInfo.type === 'model_removed') {
         queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
       }
-      const link = errorInfo.link as ErrorLinkSpec;
+      const link = errorInfo.link as PageLinkSpec;
       return {
         banner: {
           message: (errorInfo.message as string) || (err as Error).message || 'An error occurred.',
@@ -2409,6 +2415,11 @@ export function useChatMessages(
     }
     // The transport words an upload too large for the server itself.
     if (errObj.status === 413) return { banner: (err as Error).message, answered: false };
+    // No computer to run on, and none will be built: the way out is adding one.
+    if (isNeedsComputer(err)) return { banner: needsComputerError(t), answered: true };
+    // A computer Home could live on, but with its backup off: the way out is turning it on.
+    const needsBackup = needsBackupOf(err);
+    if (needsBackup) return { banner: needsBackupError(t, needsBackup), answered: true };
     // A busy chat's refusal, in the view's words: the server's name the CLI's
     // commands.
     if (isBusyCode(errorInfo?.code)) {
@@ -3257,7 +3268,7 @@ export function useChatMessages(
       // resume. See DROPPED_BEFORE_RUN.
       if ((resumed || result?.disconnected) && !refs.retryNotice && admission.unstarted() && !admission.refused()) {
         refs.retryNotice = DROPPED_BEFORE_RUN;
-        setTurnHeld(null);
+        setTurnStatus({ turnHeld: null });
       }
 
       // Checked before the disconnect: the server drops the connection right
@@ -4100,7 +4111,7 @@ export function useChatMessages(
       // resume. See DROPPED_BEFORE_RUN.
       if ((resumed || result?.disconnected) && !refs.retryNotice && !runFrameSeen) {
         refs.retryNotice = DROPPED_BEFORE_RUN;
-        setTurnHeld(null);
+        setTurnStatus({ turnHeld: null });
       }
 
       // A resend that fails the same way counts against the same turn's
@@ -4535,8 +4546,7 @@ export function useChatMessages(
     reportBackOwed,
     reportBackOwedThreads,
     reportBackOwedKinds,
-    workspaceStarting,
-    turnHeld,
+    turnStatus,
     isCompacting,
     setIsCompacting,
     compactionTokens,

@@ -17,7 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
 from src.tools.secretary._commands import (
-    decline_routing_command,
+    decline_handoff_command,
     error_command,
     hitl_confirm,
     success_command,
@@ -34,6 +34,11 @@ _THREAD_BUSY = (
     "That thread is still working on an earlier message, so this was not "
     "sent. Tell the user it is busy: they can wait for that turn and ask "
     "again or stop it, or you can start a new thread with workspace_id."
+)
+_THREAD_BUSY_MODEL = (
+    "That thread is mid-turn, and a model applies only from the start of a "
+    "turn, so this was not sent. Wait for the turn to end and hand it off "
+    "again, or start a new thread with workspace_id."
 )
 _REFUSED = "The analyst's thread refused this hand-off: {message}"
 
@@ -86,8 +91,8 @@ def _unknown_dispatch_command(
     handed_to: dict | None = None,
 ) -> Command:
     """Ambiguous dispatch outcome: the reservation is retained and the run may
-    already be live on ``thread_id`` — surface that id so the model checks
-    agent_output before re-dispatching (a blind retry would occupy a second
+    already be live on ``thread_id`` — surface that id so the model reads the
+    thread before re-dispatching (a blind retry would occupy a second
     cap slot and can produce a duplicate report-back). ``handed_to`` is what
     a pre-approved hand-off's card is drawn from."""
     return Command(
@@ -103,10 +108,10 @@ def _unknown_dispatch_command(
                             "thread_id": thread_id,
                             "workspace_id": workspace_id,
                             "note": (
+                                # DALTON-HOOK(computer-cli-tokens-off): direct to agent_output when la CLI is off.
                                 "Dispatch outcome unknown — the analysis may "
-                                "already be running on this thread. Check "
-                                "agent_output with this thread_id before "
-                                "re-dispatching."
+                                "already be running on this thread. Read it "
+                                "with agent_output before handing it off again."
                             ),
                         }
                     ),
@@ -115,6 +120,23 @@ def _unknown_dispatch_command(
             ],
         }
     )
+
+
+async def _unreachable_computer(workspace_id: str) -> str | None:
+    """The workspace's computer, named for the agent, while it is a machine
+    of the user's own that can't be reached, else None. A read that fails is
+    None: the hand-off then fails, if at all, where it always did."""
+    from src.server.services.ssh_computers import computer_away
+
+    try:
+        computer = await computer_away(workspace_id)
+    except Exception as e:
+        logger.warning(f"Could not read the computer of workspace {workspace_id}: {e}")
+        return None
+    if computer is None:
+        return None
+    name = computer.get("name")
+    return f'computer "{name}"' if name else "a computer of the user's own"
 
 
 async def _owned_workspace(
@@ -169,6 +191,7 @@ async def dispatch(
     report_back: bool,
     tool_call_id: str,
     preapproved: bool = False,
+    model: str | None = None,
 ) -> Command:
     """Start ``question`` as a background turn of a workspace's own agent.
 
@@ -176,9 +199,12 @@ async def dispatch(
     the caller refuses a call naming neither. The dispatcher's own workspace is
     refused: a turn there is the dispatcher again, not the agent of the
     workspace it meant. A ``preapproved`` hand-off, one the user approved in
-    advance, starts without asking.
+    advance, starts without asking. A named ``model`` is the turn's and stays
+    the thread's; the server refuses one the user cannot run.
     """
     import aiohttp
+
+    model = (model or "").strip() or None
 
     configurable = config.get("configurable", {})
     user_id = configurable.get("user_id")
@@ -198,7 +224,7 @@ async def dispatch(
         )
         return error_command("internal_service_token_missing", tool_call_id)
 
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_reserved_row
     from src.server.utils.pg_sanitize import normalize_uuid
 
     is_continuation = thread_id is not None
@@ -236,11 +262,11 @@ async def dispatch(
     )
     workspace_name = workspace.get("name") if workspace else None
 
-    # Any Home row, not only the dispatcher's: a turn there is never a
-    # workspace's analyst.
+    # Any Home row or its stand-in, not only the dispatcher's: a turn there is
+    # never a workspace's analyst.
     if (
         workspace_id == normalize_uuid(configurable.get("workspace_id"))
-        or is_home_row(workspace)
+        or is_reserved_row(workspace)
     ):
         return error_command(
             "That is the workspace you are working in: do it here, or "
@@ -284,6 +310,17 @@ async def dispatch(
                 tool_call_id,
             )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
+    if workspace is not None and (away := await _unreachable_computer(workspace_id)):
+        # Its files are on that computer, so its analyst cannot run anywhere
+        # else; refused before the card, so nothing is approved and dropped.
+        return error_command(
+            "Nothing was handed off: "
+            + (f'workspace "{workspace_name}"' if workspace_name else "that workspace")
+            + f" is on {away}, which can't be reached right now (it may be asleep "
+            "or offline), and its analyst works only there. Tell the user; a "
+            "hand-off in a later turn goes through once it is back.",
+            tool_call_id,
+        )
 
     if not preapproved:
         approved, response = hitl_confirm(
@@ -294,12 +331,13 @@ async def dispatch(
                 "thread_id": thread_id,
                 "question": question,
                 "report_back": report_back,
+                "model": model,
                 "tool_call_id": tool_call_id,
             },
         )
 
         if not approved:
-            return decline_routing_command("the hand-off", response, tool_call_id)
+            return decline_handoff_command(response, tool_call_id)
 
         # The card's report-back switch, when the user moved it. A resume
         # that names no overrides keeps what the call asked for.
@@ -319,6 +357,8 @@ async def dispatch(
             "workspace_id": workspace_id,
             "workspace_name": workspace_name,
         }
+        if model:
+            handed_to["model"] = model
         if is_continuation:
             handed_to["thread_id"] = thread_id
 
@@ -445,6 +485,8 @@ async def dispatch(
                 "status": "steered" if steered else "dispatched",
                 "report_back": slot.wired,
             }
+            if model:
+                result["model"] = model
             if steered:
                 result["note"] = (
                     "The analyst is mid-turn: it takes this in before its next "
@@ -503,6 +545,9 @@ async def dispatch(
                         "origin_dispatch_gen": (
                             slot.dispatch_gen if slot.wired else None
                         ),
+                        # Only when named: an absent model keeps the
+                        # thread's own, or the user's default.
+                        **({"llm_model": model} if model else {}),
                     },
                     headers={
                         "X-Service-Token": service_token,
@@ -524,9 +569,12 @@ async def dispatch(
                             # a 409 means one it cannot ride: stopping,
                             # compacting, or reporting to another Home thread.
                             # Say so, or the model reports a failure and
-                            # retries into the same 409.
+                            # retries into the same 409. One naming a model
+                            # rides only a turn running on it.
                             return error_command(
-                                _THREAD_BUSY, tool_call_id, **handed_to
+                                _THREAD_BUSY_MODEL if model else _THREAD_BUSY,
+                                tool_call_id,
+                                **handed_to,
                             )
                         # A 5xx is the server failing, not the thread refusing.
                         # DALTON-HOOK(colleague-dispatch): propagate error detail (e.g. oauth_required) to Chief of Staff

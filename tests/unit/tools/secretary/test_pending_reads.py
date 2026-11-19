@@ -8,12 +8,19 @@ caller's own, which is always running while it lists.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+import json
+from unittest.mock import create_autospec, patch
 
 import pytest
 
 from ptc_agent.agent.limits import is_pending_read
-from src.tools.secretary.chief_of_staff import agent_output, chief_of_staff_threads
+from src.server.database.conversation.threads_read import get_threads_for_user
+from src.server.services.thread_output import ThreadOutput, extract_text_from_thread
+from src.tools.secretary.chief_of_staff import (
+    agent_output,
+    chief_of_staff_threads,
+    verify_thread_owner,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -26,13 +33,12 @@ def _result(command):
     return command.update["messages"][0]
 
 
-async def _read(tool, status: str, args: dict):
-    extract = AsyncMock(
-        return_value={"text": "so far", "status": status, "thread_id": OTHER, "workspace_id": ""}
-    )
+async def _read(tool, output: ThreadOutput | None, args: dict):
+    extract = create_autospec(extract_text_from_thread, return_value=output)
     with patch(
-        "src.tools.secretary.chief_of_staff.verify_thread_owner", AsyncMock(return_value=None)
-    ), patch("src.tools.secretary.utils.extract_text_from_thread", extract):
+        "src.tools.secretary.chief_of_staff.verify_thread_owner",
+        create_autospec(verify_thread_owner, return_value=None),
+    ), patch("src.server.services.thread_output.extract_text_from_thread", extract):
         return _result(
             await tool.ainvoke(
                 {"name": tool.name, "args": args, "id": "c1", "type": "tool_call"},
@@ -42,11 +48,22 @@ async def _read(tool, status: str, args: dict):
 
 
 async def test_a_read_of_a_running_thread_is_pending_and_a_settled_one_is_not():
-    running = await _read(agent_output, "running", {"thread_id": OTHER})
-    settled = await _read(agent_output, "completed", {"thread_id": OTHER})
+    running = await _read(
+        agent_output,
+        ThreadOutput(workspace_id=None, status="running", text="so far"),
+        {"thread_id": OTHER},
+    )
+    settled = await _read(
+        agent_output,
+        ThreadOutput(workspace_id=None, status="completed", text="so far"),
+        {"thread_id": OTHER},
+    )
+    deleted = await _read(agent_output, None, {"thread_id": OTHER})
 
     assert is_pending_read(running)
     assert not is_pending_read(settled)
+    assert not is_pending_read(deleted)
+    assert json.loads(deleted.content)["status"] == "not_found"
     # Only the artifact differs: what the model reads is the tool's own JSON.
     assert running.content.replace("running", "completed") == settled.content
 
@@ -54,7 +71,7 @@ async def test_a_read_of_a_running_thread_is_pending_and_a_settled_one_is_not():
 async def _list(tool, rows: list[dict]):
     with patch(
         "src.server.database.conversation.threads_read.get_threads_for_user",
-        AsyncMock(return_value=(rows, len(rows))),
+        create_autospec(get_threads_for_user, return_value=(rows, len(rows))),
     ):
         return _result(
             await tool.ainvoke(

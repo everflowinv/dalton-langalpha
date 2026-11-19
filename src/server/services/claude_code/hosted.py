@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Literal
 
-from ptc_agent.core.claude_code_clis import CLIS_DEFAULT, CLIS_MAX, agents
+from ptc_agent.core.claude_code_clis import CLIS_DEFAULT, CLIS_MAX, CliCount, agents, default_clis
 from src.config.settings import get_claude_code_config
 from src.llms.claude_code import backend_available, rows_available
 from src.server.database.claude_code_hosted import (
@@ -229,19 +229,34 @@ def tier_refusal(computer: Mapping[str, Any]) -> ComputerRefusal | None:
 
 def own_clis(computer: Mapping[str, Any]) -> int:
     """How many Claude Code CLIs the user's own ``computer`` runs at once:
-    the number they set for it (``CLIS_KEY``), else ``CLIS_DEFAULT``."""
+    the number they set for it (``CLIS_KEY``), else what its memory allows."""
+    chosen = chosen_clis(computer)
+    return automatic_clis(computer) if chosen is None else chosen
+
+
+def chosen_clis(computer: Mapping[str, Any]) -> int | None:
+    """The number of CLIs the owner set for ``computer``, None while it runs
+    what its memory allows."""
     clis = (computer.get("config") or {}).get(CLIS_KEY)
-    return clis if type(clis) is int and 1 <= clis <= CLIS_MAX else CLIS_DEFAULT
+    return clis if type(clis) is int and 1 <= clis <= CLIS_MAX else None
 
 
-async def computer_clis(computer_id: str) -> int:
+def automatic_clis(computer: Mapping[str, Any]) -> int:
+    """The CLIs ``computer`` runs while its owner sets none, by its memory."""
+    return default_clis(((computer.get("config") or {}).get("machine") or {}).get("memory_bytes"))
+
+
+async def computer_clis(computer_id: str) -> CliCount:
     """``cli_cap`` of the computer ``computer_id`` as it stands now, for a
     CLI starting there; one gone, or of a size not known, runs ``CLIS_DEFAULT``."""
     from src.server.database.computer import get_computer
+    from src.server.services.ssh_computers import is_own_computer
 
     computer = await get_computer(computer_id)
-    cap = cli_cap(computer) if computer is not None else None
-    return CLIS_DEFAULT if cap is None else cap
+    if computer is None:
+        return CliCount(CLIS_DEFAULT, False, None)
+    cap = cli_cap(computer)
+    return CliCount(CLIS_DEFAULT if cap is None else cap, is_own_computer(computer), computer.get("name") or None)
 
 
 def cli_cap_refusal(cap: int, *, alone: bool) -> str:
@@ -357,17 +372,6 @@ async def tier_refusals(user_id: str) -> dict[str, ComputerRefusal]:
     return refusals
 
 
-async def home_computer(user_id: str, *, conn=None) -> dict | None:
-    """Home's computer: the one it is bound to, else the primary computer it
-    binds to on its first start or turn."""
-    from src.server.database.computer import get_computer_for_workspace, get_primary_computer
-    from src.server.database.home_workspace import get_home_workspace_id
-
-    return await get_computer_for_workspace(get_home_workspace_id(user_id), conn=conn) or await get_primary_computer(
-        user_id, conn=conn,
-    )
-
-
 async def cli_placement(user_id: str, workspace_id: str | None, *, conn=None, token: bool = False) -> Placement:
     """Where the CLI of the user's Claude Code turn in ``workspace_id`` runs,
     the one rule for analysts and the Chief of Staff alike: on the
@@ -377,14 +381,21 @@ async def cli_placement(user_id: str, workspace_id: str | None, *, conn=None, to
     computer it binds to, and a refusal for a computer too small says whether
     it is Home's. ``conn`` reads on a caller's connection, as an automation
     file save that holds the user's locks passes it, so the check never
-    waits on a second pool slot."""
+    waits on a second pool slot. A Home turn is judged on the computer it
+    runs on (``home_placement.home_turn_computer``), as is the stand-in
+    named by its own id."""
     from src.server.database.computer import get_computer_for_workspace
-    from src.server.database.home_workspace import is_home_id
+    from src.server.database.home_workspace import is_home_id, is_home_stand_in_id
     from src.server.services.ssh_computers import is_own_computer
 
-    home = bool(workspace_id) and is_home_id(user_id, workspace_id)
-    if home:
-        computer = await home_computer(user_id, conn=conn)
+    stand_in = bool(workspace_id) and is_home_stand_in_id(user_id, workspace_id)
+    home = stand_in or (bool(workspace_id) and is_home_id(user_id, workspace_id))
+    if stand_in:
+        computer = await get_computer_for_workspace(workspace_id, conn=conn)
+    elif home:
+        from src.server.services.home_placement import home_turn_computer
+
+        computer, _ = await home_turn_computer(user_id, conn=conn)
     else:
         computer = await get_computer_for_workspace(workspace_id, conn=conn) if workspace_id else None
     if is_own_computer(computer):

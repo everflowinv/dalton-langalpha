@@ -9,8 +9,10 @@
  * glyph in the muted tone.
  */
 import { AlertCircle, Clock, Pause, type LucideIcon } from 'lucide-react';
-import type { Automation, AutomationExecution, ExecutionStatus, FailureReason, SkipReason } from '@/types/automation';
-import { buildRateLimitError, type ErrorLinkSpec } from '@/utils/rateLimitError';
+import type {
+  Automation, AutomationExecution, ExecutionStatus, FailureReason, SkipReason, WaitReason,
+} from '@/types/automation';
+import { buildRateLimitError, type PageLinkSpec } from '@/utils/rateLimitError';
 
 export function isRunLive(status: ExecutionStatus): boolean {
   return status === 'running' || status === 'pending';
@@ -237,14 +239,14 @@ const PLATFORM_URL = (import.meta.env.VITE_PLATFORM_URL as string | undefined) |
 /** Where a run a usage limit stopped sends the reader: the plan and usage
  *  pages every quota denial offers, from the builder that words them, so an
  *  automation never links somewhere a chat would not. */
-export function usageLimitLinks(run: AutomationExecution): ErrorLinkSpec[] {
+export function usageLimitLinks(run: AutomationExecution): PageLinkSpec[] {
   if (!isRunFailed(run.status) || run.failure_reason !== 'usage_limit') return [];
   return buildRateLimitError({ message: run.error_message ?? undefined }, PLATFORM_URL).links ?? [];
 }
 
 /** Where the chat sends a reader to manage their models and the keys behind
  *  them: a rejected key is fixed there before a resume. */
-const MODEL_SETTINGS_LINK: ErrorLinkSpec = {
+const MODEL_SETTINGS_LINK: PageLinkSpec = {
   url: '/settings?tab=model',
   label: 'Manage models',
   labelKey: 'chat.modelSelector.manageModels',
@@ -254,7 +256,7 @@ const MODEL_SETTINGS_LINK: ErrorLinkSpec = {
  *  settings for a rejected key, the plan pages for a usage limit, and none
  *  for the Claude plan's or another subscription's, which no page here lifts. Read from
  *  the automation, not its attention, so a dismissal keeps the way back. */
-export function attentionLinks(a: Automation): ErrorLinkSpec[] {
+export function attentionLinks(a: Automation): PageLinkSpec[] {
   if (isKeyRejected(a)) return [MODEL_SETTINGS_LINK];
   return a.last_execution ? usageLimitLinks(a.last_execution) : [];
 }
@@ -311,6 +313,14 @@ const SKIP_REASON_NOTE: Record<SkipReason, string | null> = {
   thread_busy: 'automation.skippedThreadBusy',
   interrupted: 'automation.skippedInterrupted',
   precheck: 'automation.skippedPrecheck', // DALTON-HOOK(precheck-label)
+  computer_unreachable: 'automation.skippedComputerUnreachable',
+};
+
+/** The line a waiting run carries, by what it waits for. A run from a server
+ *  that names no reason waits for its thread, the only wait there was. */
+const WAIT_REASON_NOTE: Record<WaitReason, string> = {
+  thread_busy: 'automation.waitingNote',
+  computer_unreachable: 'automation.waitingForComputerNote',
 };
 
 /** The line a failed run carries when the failure was not the automation's.
@@ -341,7 +351,7 @@ export function describeRun(run: AutomationExecution): RunView {
   const { status } = run;
   const waiting = status === 'waiting';
   let noteKey: string | null = null;
-  if (waiting) noteKey = 'automation.waitingNote';
+  if (waiting) noteKey = WAIT_REASON_NOTE[run.wait_reason ?? 'thread_busy'];
   else if (status === 'skipped' && run.skip_reason) noteKey = SKIP_REASON_NOTE[run.skip_reason] ?? null;
   else if (isRunFailed(status) && run.failure_reason) noteKey = FAILURE_REASON_NOTE[run.failure_reason] ?? null;
   const ended = status === 'completed' || isRunFailed(status);

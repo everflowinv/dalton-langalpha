@@ -83,6 +83,23 @@ _STUB_COMPUTER = {
 
 
 @pytest.fixture(autouse=True)
+def _no_stand_in():
+    """Home's stand-in is on no computer here; the cases it keeps a computer
+    for are pinned in test_home_handback and the removals below."""
+    with (
+        patch(
+            "src.server.services.computer_manager._retirement.stand_in_on",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.services.workspace_manager.stand_in_on",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _stub_computer_minting():
     """Creating a project resolves the user's machine and reads it back.
 
@@ -99,6 +116,8 @@ def _stub_computer_minting():
             f"{_MACHINES}.create_computer",
             new=AsyncMock(return_value=dict(_STUB_COMPUTER)),
         ),
+        patch(f"{_MACHINES}.promote_primary_computer", new=AsyncMock(return_value=None)),
+        patch(f"{_MACHINES}.get_user", new=AsyncMock(return_value=None)),
         patch(
             "src.server.services.computer_manager._sessions.get_computer_for_workspace",
             new=AsyncMock(return_value=dict(_STUB_COMPUTER)),
@@ -820,12 +839,15 @@ class TestStopWorkspace:
         async def detached(*_args, **_kwargs):
             yield runtime
         manager._detached_runtime = detached
-        with patch(f"{_LIFECYCLE}.update_computer_activity", AsyncMock()):
+        with patch(f"{_LIFECYCLE}.update_computer_activity", AsyncMock()), \
+                patch(f"{_LIFECYCLE}.note_stop_phases") as phases:
             with pytest.raises(RuntimeError, match="stop failed"):
                 await manager._finish_claimed_stop(
                     _binding("ws-1"), workspace_id="ws-1",
                     durable_sandbox_id="sandbox-abc",
                 )
+        # The refused stop is still timed: the failing stops are worth measuring.
+        phases.assert_called_once_with(_STUB_COMPUTER_ID, backup_ms=ANY, provider_ms=ANY)
         if state == "unreachable":
             manager._settle_machine_stop.assert_not_awaited()
         else:
@@ -2099,6 +2121,33 @@ class TestDeleteKeepsTheFolderOnTheOwnersMachine:
         return ws_id, db_delete, wm._remove_workspace_folder
 
     @pytest.mark.asyncio
+    async def test_homes_stand_in_goes_only_with_its_computer(self):
+        """An agent's tool and the routes delete through here too; the
+        stand-in goes only with its computer's teardown."""
+        computer = _make_computer(computer_id=_STUB_COMPUTER_ID, kind="daytona")
+        ws_id = str(uuid.uuid4())
+        wm = WorkspaceManager(_make_config())
+        with (
+            patch(
+                f"{_WORKSPACE_MANAGER}.db_delete_workspace", new_callable=AsyncMock
+            ) as db_delete,
+            cm_patch(
+                "db_get_workspace",
+                AsyncMock(
+                    return_value=_make_workspace(
+                        workspace_id=ws_id,
+                        computer_id=_STUB_COMPUTER_ID,
+                        config={"home_stand_in": True},
+                    )
+                ),
+            ),
+            _patch_resolve(computer),
+        ):
+            with pytest.raises(ValueError, match="Cannot delete Home"):
+                await wm.delete_workspace(ws_id)
+        db_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_delete_leaves_the_folder_by_default(self):
         """The default is what an agent's tool and any API caller without the
         flag get, so it is the one that must not lose files."""
@@ -2172,15 +2221,17 @@ class TestRemoveComputerWithWorkspaces:
         on=("ws-a", "ws-b"),
     ):
         computer = _make_computer(computer_id=_STUB_COMPUTER_ID, is_primary=primary)
+        other = _make_computer(computer_id="22222222-2222-2222-2222-222222222222")
         with (
             patch(
                 f"{_WORKSPACE_MANAGER}.get_computer",
                 AsyncMock(side_effect=lambda _id: None if self.retired else computer),
             ),
+            patch(f"{_RETIREMENT}.primary_candidate", AsyncMock(return_value=other)),
             patch(
                 f"{_WORKSPACE_MANAGER}.get_live_workspace_ids_for_computer",
                 AsyncMock(return_value=list(on)),
-            ),
+            ) as self.listed,
             patch(
                 f"{_WORKSPACE_MANAGER}.workspace_is_moving",
                 AsyncMock(side_effect=lambda ws_id: ws_id in moving),
@@ -2358,6 +2409,35 @@ class TestRemoveComputerWithWorkspaces:
         self.wm.delete_workspace.assert_not_awaited()
         self.wm.remove_computer.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("owed", "code"), [(False, None), (True, "handback_owed")])
+    async def test_homes_stand_in_goes_with_it_unless_home_is_owed_its_files(
+        self, owed, code
+    ):
+        """Never shown to the owner, so never named or deleted on its own: it
+        goes with its computer (pinned in test_home_handback). What it wrote
+        while their own computer was away is nowhere else until handed back,
+        so that refuses before anything is deleted."""
+        from src.server.database.home_stand_in import StandIn
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        stand_in = StandIn(
+            row={}, computer={}, kept=True, runs=True, owed=owed, left=False
+        )
+        with patch(f"{_WORKSPACE_MANAGER}.stand_in_on", AsyncMock(return_value=stand_in)):
+            if code:
+                with pytest.raises(ComputerRemovalRefused) as refused:
+                    await self._remove(["ws-a"], on=("ws-a",))
+                assert refused.value.code == code
+                self.wm.delete_workspace.assert_not_awaited()
+            else:
+                await self._remove(["ws-a"], on=("ws-a",))
+                assert [c.args for c in self.wm.delete_workspace.await_args_list] == [
+                    ("ws-a",)
+                ]
+                self.wm.remove_computer.assert_awaited_once()
+        assert self.listed.await_args.kwargs == {"exclude_stand_in": True}
+
 
 # ---------------------------------------------------------------------------
 # cleanup_idle_workspaces
@@ -2422,6 +2502,52 @@ class TestCleanupIdle:
             computer_id, unchanged_since=row["updated_at"], reason="idle"
         )
         mock_computers.assert_awaited_once_with("running", limit=1000, offset=0)
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.get_computers_by_status",
+        new_callable=AsyncMock,
+    )
+    @pytest.mark.parametrize(
+        ("active", "command", "retired"),
+        [(False, False, True), (False, True, False), (True, False, False)],
+        ids=["quiet", "command-running", "turn-running"],
+    )
+    async def test_an_idle_own_machine_is_never_stopped_only_its_session_goes(
+        self, mock_computers, active, command, retired
+    ):
+        """Stopping a machine of the user's own saves the deployment nothing
+        and ends the user's own work there; the sweep drops only this worker's
+        session, and keeps even that while a turn or a command runs."""
+        computer_id = str(uuid.uuid4())
+        row = _make_computer(
+            computer_id=computer_id,
+            kind="ssh",
+            last_activity_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        )
+        mock_computers.return_value = [row]
+        config = _make_config()
+        config.to_core_config.return_value.sandbox.ssh.auto_stop_interval = 7200
+        wm = WorkspaceManager(config)
+        wm._machine(computer_id).session = MagicMock()
+        with (
+            patch.object(wm, "_stop_machine", new_callable=AsyncMock) as mock_stop,
+            patch.object(
+                wm, "retire_computer_session_if_present", new_callable=AsyncMock
+            ) as retire,
+            patch.object(
+                wm, "_machine_has_active_tasks", new=AsyncMock(return_value=active)
+            ),
+            patch(
+                "src.server.database.runs.command_runs.computer_has_running_command",
+                new=AsyncMock(return_value=command),
+            ),
+        ):
+            assert await wm.cleanup_idle_workspaces() == 0
+
+        mock_stop.assert_not_awaited()
+        assert retire.await_count == (1 if retired else 0)
+        assert wm.idle_stop_window(row) is None
 
     @pytest.mark.asyncio
     @patch(
@@ -8592,3 +8718,27 @@ class TestSupersededResolve:
 def _local_lifecycle_capacity(monkeypatch):
     # Lifecycle fakes have no platform or database; admission is tested separately.
     monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: False)
+
+
+@pytest.mark.parametrize(
+    "kind, interval, stops_at",
+    [
+        # The provider stops these itself, so the sweep runs ten minutes ahead.
+        ("daytona", 1800, 1200),
+        ("e2b", 1500, 900),
+        # No provider stop to run ahead of: the setting is the sweep's.
+        ("ssh", 7200, 7200),
+        ("docker", 3600, 3600),
+        # Never under five minutes.
+        ("daytona", 600, 300),
+    ],
+)
+def test_the_idle_sweep_runs_ahead_only_of_a_provider_that_stops_itself(
+    kind, interval, stops_at
+):
+    manager = SimpleNamespace(
+        _provider_settings=lambda kind, overrides: SimpleNamespace(
+            auto_stop_interval=interval
+        )
+    )
+    assert WorkspaceManager._idle_timeout_for(manager, {"kind": kind}) == stops_at

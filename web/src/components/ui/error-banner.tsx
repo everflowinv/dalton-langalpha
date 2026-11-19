@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Info } from 'lucide-react';
-import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
+import { errorLinkKey, type ErrorLinkSpec, type PageLinkSpec, type StructuredError } from '@/utils/rateLimitError';
 import { parseErrorMessage } from '@/pages/ChatAgent/utils/parseErrorMessage';
 import { usePlanClock } from '@/hooks/useClaudeCodePlan';
 import { cn } from '@/lib/utils';
@@ -14,6 +14,7 @@ import {
 import { ReportDialog } from '@/components/report/ReportDialog';
 import { useReportsEnabled } from '@/hooks/useReportsEnabled';
 import { MediumActionLink } from '@/pages/ChatAgent/components/MediumActionLink';
+import { ComputerRefusal } from '@/pages/ChatAgent/components/ComputerRefusal';
 
 interface ErrorBannerProps {
   error: string | StructuredError | null | undefined;
@@ -24,7 +25,12 @@ interface ErrorBannerProps {
   reportThreadId?: string;
 }
 
-export function ErrorLink({ url, label, labelKey, external, console: consolePage, resize }: ErrorLinkSpec): React.ReactElement {
+export function ErrorLink(link: ErrorLinkSpec): React.ReactElement {
+  if (link.kind !== undefined) return <ComputerRefusal refusal={link} />;
+  return <PageLink {...link} />;
+}
+
+function PageLink({ url, label, labelKey, external, console: consolePage, resize }: PageLinkSpec): React.ReactElement {
   const navigate = useNavigate();
   const { t } = useTranslation();
   if (resize) return <MediumActionLink computerId={resize} />;
@@ -61,17 +67,24 @@ export function ErrorLink({ url, label, labelKey, external, console: consolePage
   );
 }
 
-/** The quiet line a notice reads as: nothing failed, so no error colors. */
-export function NoticeLine({ message, className, style }: { message: string; className?: string; style?: React.CSSProperties }): React.ReactElement {
+/** The quiet line a notice reads as: nothing failed, so no error colors.
+ *  An `action` follows the message in its flow, so a narrow line wraps it
+ *  with the words rather than squeezing them, and stays out of what is
+ *  announced: only the message is read out. */
+export function NoticeLine({ message, action, className, style }: {
+  message: string; action?: React.ReactNode; className?: string; style?: React.CSSProperties;
+}): React.ReactElement {
+  const live = { role: 'status', 'aria-live': 'polite' as const };
   return (
     <div
       className={`flex items-center gap-2 text-xs ${className ?? ''}`}
-      role="status"
-      aria-live="polite"
+      {...(action ? {} : live)}
       style={{ backgroundColor: 'var(--color-bg-page)', color: 'var(--color-text-tertiary)', ...style }}
     >
       <Info aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-      <span className="min-w-0 wrap-break-word">{message}</span>
+      <span className="min-w-0 wrap-break-word">
+        {action ? <><span {...live}>{message}</span> {action}</> : message}
+      </span>
     </div>
   );
 }
@@ -172,7 +185,7 @@ export function ErrorBanner({ error, className, style, reportThreadId }: ErrorBa
             <span className="wrap-break-word">
               {message}
               {err.links?.map((l, i) => (
-                <React.Fragment key={`${l.url}|${l.label}`}>
+                <React.Fragment key={errorLinkKey(l)}>
                   {i === 0 ? ' ' : <span aria-hidden="true"> · </span>}
                   <ErrorLink {...l} />
                 </React.Fragment>

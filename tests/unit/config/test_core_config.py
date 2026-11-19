@@ -87,7 +87,7 @@ class TestDaytonaConfig:
         assert cfg.base_url == "https://app.daytona.io/api"
         assert cfg.secret_namespace == ""
         assert cfg.python_version == "3.12"
-        assert cfg.auto_stop_interval == 3600
+        assert cfg.auto_stop_interval == 1800
         assert cfg.snapshot_enabled is True
 
 
@@ -124,7 +124,7 @@ class TestMCPServerConfig:
     def test_data_token_auth_refused_on_a_user_server(self):
         # The token spends the whole computer's data access; no server a user
         # defined may be configured to receive it.
-        with pytest.raises(ValueError, match="built-in servers only"):
+        with pytest.raises(ValueError, match="needs a built-in http server"):
             MCPServerConfig(
                 name="mine",
                 transport="http",
@@ -135,7 +135,7 @@ class TestMCPServerConfig:
 
     @pytest.mark.parametrize("transport", ["stdio", "sse"])
     def test_data_token_auth_refused_off_http(self, transport):
-        with pytest.raises(ValueError, match="requires transport 'http'"):
+        with pytest.raises(ValueError, match="needs a built-in http server"):
             MCPServerConfig(name="data", transport=transport, auth="data_token")
 
 

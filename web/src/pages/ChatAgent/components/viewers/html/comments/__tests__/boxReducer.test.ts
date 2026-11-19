@@ -39,7 +39,34 @@ function run(...actions: BoxAction[]): BoxState {
   return actions.reduce(boxReducer, initialBox({ doc: '1:a', listOpen: false }));
 }
 
-const picked: BoxAction = { type: 'pick', pick: pick(), path: 'report.html', selected: false };
+const picked: BoxAction = { type: 'pick', pick: pick(), path: 'report.html', selected: false, extend: false };
+
+describe('a pick that extends the draft: its parts grown or shrunk', () => {
+  const parts = (n: number): PagePick => ({
+    anchor: { kind: 'area', elements: Array.from({ length: n }, (_, i) => ({ path: `#p${i}` })), count: n },
+    rect: { ...RECT, width: 50 * n },
+    title: 'Report',
+  });
+  const element: BoxAction = { type: 'pick', pick: { anchor: { kind: 'element', path: '#p0' }, rect: RECT, title: 'Report' }, path: 'report.html', selected: false, extend: false };
+
+  it('keeps the box, its number and its words on the parts picked now', () => {
+    const state = run(element, { type: 'write', text: 'make these match' }, { type: 'pick', pick: parts(2), path: 'report.html', selected: false, extend: true });
+    expect(state.open).toMatchObject({ kind: 'draft', serial: 1, draft: { anchor: parts(2).anchor, rect: parts(2).rect } });
+    expect(state.text).toBe('make these match');
+    expect(state.serial).toBe(1);
+  });
+
+  it('answers a pending discard question by staying, since the writer is still picking', () => {
+    const state = run(element, { type: 'write', text: 'x' }, { type: 'askDiscard' }, { type: 'pick', pick: parts(2), path: 'report.html', selected: false, extend: true });
+    expect(state.confirmDiscard).toBe(false);
+  });
+
+  it('opens a draft as a pick does where none is over the page, or the draft is on another file', () => {
+    expect(run({ type: 'pick', pick: parts(2), path: 'report.html', selected: false, extend: true }).open).toMatchObject({ kind: 'draft', serial: 1 });
+    const other = run(element, { type: 'pick', pick: parts(2), path: 'other.html', selected: false, extend: true });
+    expect(other.open).toMatchObject({ kind: 'draft', serial: 2, draft: { path: 'other.html' } });
+  });
+});
 
 describe('a pick', () => {
   it('opens a numbered draft box on the spot, for the agent, to the default', () => {
@@ -58,7 +85,7 @@ describe('a pick', () => {
       { type: 'write', text: 'check this' },
       { type: 'forAgent', on: false },
       { type: 'to', target: { threadId: 't-2' } },
-      { type: 'pick', pick: pick('Q4'), path: 'report.html', selected: true },
+      { type: 'pick', pick: pick('Q4'), path: 'report.html', selected: true, extend: false },
     );
     expect(state.open).toMatchObject({ kind: 'draft', serial: 2, draft: { selected: true } });
     expect(state).toMatchObject({ text: 'check this', forAgent: false, to: { threadId: 't-2' } });
@@ -112,16 +139,28 @@ describe('leaving a draft', () => {
     expect(state.hover).toBeNull();
   });
 
-  it('asks first when there are words, and goes on the second', () => {
+  it('asks first when there are words, and a second close does not answer for the writer', () => {
     const asked = run(picked, { type: 'write', text: 'words' }, { type: 'leave' });
     expect(asked).toMatchObject({ confirmDiscard: true, text: 'words' });
-    const left = boxReducer(asked, { type: 'leave' });
-    expect(left).toMatchObject({ open: null, text: '', confirmDiscard: false });
+    expect(boxReducer(asked, { type: 'leave' })).toMatchObject({ confirmDiscard: true, text: 'words', open: { kind: 'draft' } });
+    expect(boxReducer(asked, { type: 'endDraft', keepHover: false })).toMatchObject({ open: null, text: '', confirmDiscard: false });
   });
 
   it('writing again takes the question back', () => {
     const state = run(picked, { type: 'write', text: 'a' }, { type: 'leave' }, { type: 'write', text: 'ab' });
     expect(state.confirmDiscard).toBe(false);
+  });
+});
+
+describe('Esc in a draft', () => {
+  it('closes an empty one at once', () => {
+    expect(run(picked, { type: 'escape' })).toMatchObject({ open: null, text: '' });
+  });
+
+  it('asks over words, and a second Esc takes the question back rather than the words', () => {
+    const asked = run(picked, { type: 'write', text: 'words' }, { type: 'escape' });
+    expect(asked).toMatchObject({ confirmDiscard: true, text: 'words' });
+    expect(boxReducer(asked, { type: 'escape' })).toMatchObject({ confirmDiscard: false, text: 'words', open: { kind: 'draft' } });
   });
 });
 

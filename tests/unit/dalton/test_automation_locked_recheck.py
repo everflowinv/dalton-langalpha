@@ -16,8 +16,8 @@ WS = "11111111-1111-1111-1111-111111111111"
 
 
 def _run(update: AutomationUpdate, locked_row: dict, current: dict, monkeypatch):
-    hosted = create_autospec(lifecycle._check_claude_code_hosted)
-    monkeypatch.setattr(lifecycle, "_check_claude_code_hosted", hosted)
+    hosted = create_autospec(lifecycle.check_claude_code_hosted)
+    monkeypatch.setattr(lifecycle, "check_claude_code_hosted", hosted)
     asyncio.run(
         lifecycle.recheck_locked_automation_update(
             user_id="u1",

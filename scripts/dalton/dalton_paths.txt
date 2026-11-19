@@ -493,5 +493,15 @@ scripts/dalton/ops/host_services_switch.sh
 scripts/dalton/ops/ops-alerts.json.example
 tests/unit/dalton/test_guidepoint_cli.py
 tests/unit/dalton/test_host_services_switch.py
+
+# Sync 6 Batch 4: computer_cli_tokens stays off in Dalton, so Chief of Staff
+# retains its server-side workspace/thread tools in tools.py.
+src/tools/secretary/tools.py
+tests/unit/tools/secretary/test_agent_output_turns.py
+tests/unit/tools/secretary/test_pending_reads.py
+tests/unit/tools/secretary/test_list_owner_id.py
+tests/unit/tools/secretary/test_threads_delete_fence.py
+tests/unit/tools/secretary/test_threads_stop.py
+tests/unit/tools/secretary/test_workspaces_create_conflict.py
 web/src/pages/ChatAgent/components/__tests__/ChatView.attachmentCount.test.tsx
 web/src/pages/MarketView/__tests__/MarketView.screenshotCap.test.tsx

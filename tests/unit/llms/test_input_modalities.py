@@ -34,7 +34,7 @@ class TestGetInputModalities:
         assert "image" in result
 
     def test_glm_text_only(self, model_config):
-        result = model_config.get_input_modalities("glm-5.2")
+        result = model_config.get_input_modalities("glm-5.3")
         assert result == ["text"]
 
     def test_minimax_m3_supports_image(self, model_config):
@@ -54,7 +54,7 @@ class TestGetInputModalities:
         assert "pdf" in result
 
     def test_codex_oauth_variant(self, model_config):
-        result = model_config.get_input_modalities("gpt-6.1-sol-oauth")
+        result = model_config.get_input_modalities("gpt-6.2-sol-oauth")
         assert "image" in result
         assert "pdf" in result
 

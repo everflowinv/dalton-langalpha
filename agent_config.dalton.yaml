@@ -30,6 +30,11 @@ sandbox:
   docker:
     memory_limit: "3g"
     cpu_count: 2.0
+    # Upstream #789 stopped subtracting the 600s lead from docker computers
+    # (only SELF_STOPPING_KINDS = daytona/e2b subtract 600s), which raised the
+    # effective docker idle threshold from 50 min (3600 - 600) to 60 min.
+    # Pin auto_stop_interval to 3000s so WorkspaceManager keeps the 50 min limit.
+    auto_stop_interval: 3000
   daytona:
     # Used by WorkspaceManager to derive idle auto-stop threshold (2400 - 600 = 1800s = 30 min)
     auto_stop_interval: 2400
@@ -40,6 +45,10 @@ mcp:
       enabled: true
     - name: "researchdata"
       call_timeout_s: 625
+    # Keep upstream's Firecrawl MCP / Alexandria data catalog off on Dalton
+    # (only the shared FIRECRAWL_API_KEY web-fetch fallback stays enabled).
+    - name: "firecrawl"
+      enabled: false
 
 subagents:
   definitions:

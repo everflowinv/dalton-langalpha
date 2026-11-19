@@ -37,6 +37,7 @@ from ptc_agent.agent.claude_code.runtime import (
     token_works,
 )
 from ptc_agent.agent.middleware.compaction.brief import BRIEF_CONFIG_KEY, BRIEF_KEY, BRIEF_PREFIX, HANDOFF_UI_NAME, THREAD_PREFIX
+from ptc_agent.agent.middleware.model_resilience import CATALOG_MODEL_KEY
 from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport, SteeringMiddleware, TaskResume, steers_ahead_message
 from ptc_agent.agent.middleware.runtime_context.durable import DurableUpdate, build_update_message, render_update_row
 from ptc_agent.agent.middleware.runtime_context.envelope import frame_reminder
@@ -72,6 +73,8 @@ async def test_a_tool_call_runs_through_the_tool_node_under_its_own_name():
     assert isinstance(result, ToolMessage) and result.tool_call_id == ai_call.tool_calls[0]["id"]
     assert result.content == "ran: echo spike-$((6*7))"
     assert isinstance(final, AIMessage) and "ran: echo spike-$((6*7))" in final.text
+    # Each answer names the catalog row it ran on, which a transcript records.
+    assert {m.response_metadata[CATALOG_MODEL_KEY] for m in (ai_call, final)} == {"claude-haiku-5-5-code"}
     sent = api.model_requests[0]
     assert [t["name"] for t in sent["tools"]] == ["Bash"]
     assert not any("Attribution for git" in str(m.get("content")) for m in sent["messages"])
@@ -1299,6 +1302,7 @@ async def test_a_turn_leaves_the_rules_it_ran_under_for_the_composers_reading_be
 
     from ptc_agent.agent.claude_code.session import RULES_KEY
     from src.server.services import thread_status
+    from src.server.utils import checkpoint_helpers
 
     rules = CompactionRules(0, threshold=100_000, cold_tokens=100)
     graph = new_graph()
@@ -1308,6 +1312,7 @@ async def test_a_turn_leaves_the_rules_it_ran_under_for_the_composers_reading_be
     assert {k: values[RULES_KEY][k] for k in ("threshold", "cold_tokens", "floor_tokens")} == {
         "threshold": 100_000, "cold_tokens": 100, "floor_tokens": 0}
     monkeypatch.setattr(thread_status, "get_checkpointer", lambda: graph.checkpointer)
+    monkeypatch.setattr(checkpoint_helpers, "get_checkpointer", lambda: graph.checkpointer)
     monkeypatch.setattr(thread_status, "turn_base_checkpoint_id", AsyncMock(return_value=None))
     told = await thread_status.read_next_summary("t-rules", latest={})
     assert told["reason"] == "cold" and told["at"] > told["now"]

@@ -85,8 +85,8 @@ class TestSurfaceResolution:
         the level goes."""
         client = _build(
             {
-                "name": "gpt-6.1-sol",
-                "model_id": "gpt-6.1-sol",
+                "name": "gpt-6.2-sol",
+                "model_id": "gpt-6.2-sol",
                 "provider": "openai",
                 "reasoning_efforts": ["low", "high"],
             },
@@ -107,8 +107,8 @@ class TestAShadowInheritsTheHalfItDidNotDeclare:
     #: Its own ladder is a strict subset of the built-in's, so a level only the
     #: built-in offers is what tells the two apart.
     SHADOW = {
-        "name": "gpt-6.1-sol",
-        "model_id": "gpt-6.1-sol",
+        "name": "gpt-6.2-sol",
+        "model_id": "gpt-6.2-sol",
         "provider": "openai",
         "reasoning_efforts": ["low", "high"],
     }
@@ -169,11 +169,11 @@ class TestASurfaceComesWholeFromOneSide:
     ``off`` with no off rung beside it failed validation on every turn."""
 
     def test_an_entry_naming_its_own_write_takes_none_of_the_built_ins_switches(self):
-        """The block the provider list writes for GLM-5.2 on OpenRouter."""
+        """The block the provider list writes for DeepSeek Flash on OpenRouter."""
         client = _build(
             {
-                "name": "glm-5.2",
-                "model_id": "z-ai/glm-5.2",
+                "name": "deepseek-flash",
+                "model_id": "deepseek/deepseek-flash",
                 "provider": "openrouter",
                 "reasoning": {"efforts": ["low", "medium", "high"], "write": "parameters.reasoning.effort"},
             },
@@ -186,11 +186,11 @@ class TestASurfaceComesWholeFromOneSide:
         """Borrowing the surface is still right for a flat ladder, which names
         none of its own; only the ``off`` none of its rungs can apply goes."""
         client = _build(
-            {"name": "glm-5.2", "model_id": "glm-5.2", "provider": "z-ai", "reasoning_efforts": ["high", "max"]},
+            {"name": "deepseek-flash", "model_id": "deepseek-flash", "provider": "deepseek", "reasoning_efforts": ["high", "max"]},
             reasoning_effort="max",
         )
-        assert client.extra_body["reasoning_effort"] == "max"
-        assert client.extra_body["thinking"]["type"] == "enabled"
+        assert client.output_config == {"effort": "max"}
+        assert client.thinking == {"type": "enabled"}
 
 
 class TestAnEmptyBlockDoesNotAnswerForTheEntry:
@@ -245,12 +245,12 @@ class TestAShadowOnAnotherApiKeepsOnlyItsOwnControl:
         assert not client.metadata.get("reasoning_effort")
 
     def test_gpt_over_chat_completions_stays_on_chat_completions(self):
-        client = _build(self._gateway("gpt-6.1-sol", _use_response_api=False), reasoning_effort="high", **self._URL)
+        client = _build(self._gateway("gpt-6.2-sol", _use_response_api=False), reasoning_effort="high", **self._URL)
         assert not client.use_responses_api
         assert client.reasoning is None
 
     def test_gpt_over_the_responses_api_keeps_its_control(self):
-        client = _build(self._gateway("gpt-6.1-sol", _use_response_api=True), reasoning_effort="high", **self._URL)
+        client = _build(self._gateway("gpt-6.2-sol", _use_response_api=True), reasoning_effort="high", **self._URL)
         assert client.reasoning == {"effort": "high"}
 
     def test_claude_over_the_messages_api_keeps_its_control(self):

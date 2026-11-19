@@ -62,17 +62,25 @@ class ServerBackend:
     def is_running(self, server: str) -> bool:
         raise NotImplementedError
 
-    def call(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Raw JSON-RPC reply. The caller settles it, so errors stay typed."""
+    def call(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        timeout: float,
+        call_id: str = "",
+    ) -> dict[str, Any]:
+        """Raw JSON-RPC reply. The caller settles it, so errors stay typed.
+
+        ``call_id`` names the tool call the request is made for, which this
+        daemon's own environment cannot, having been started by an earlier one.
+        """
         raise NotImplementedError
 
-    def call_with_timeout(
-        self, server: str, tool: str, args: dict[str, Any], timeout: float
-    ) -> dict[str, Any]:
-        return self.call(server, tool, args)
-
-    # DALTON-HOOK(alphaengine-cache): forward per-request caller identity without
-    # breaking ServerBackend subclasses that only implement call_with_timeout.
+    # DALTON-HOOK(alphaengine-cache): forward per-request caller identity and
+    # upstream call_id without breaking ServerBackend subclasses that only
+    # implement call().
     def call_with_caller(
         self,
         server: str,
@@ -80,8 +88,10 @@ class ServerBackend:
         args: dict[str, Any],
         timeout: float,
         caller: dict[str, str] | None = None,
+        *,
+        call_id: str = "",
     ) -> dict[str, Any]:
-        return self.call_with_timeout(server, tool, args, timeout)
+        return self.call(server, tool, args, timeout=timeout, call_id=call_id)
 
     def drop(self, server: str) -> None:
         raise NotImplementedError
@@ -130,15 +140,20 @@ class ClientBackend(ServerBackend):
     def running(self) -> list[str]:
         return list(self._c.running_servers())
 
-    def call(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
-        return self._c.raw_tool_reply(server, tool, args)
-
-    def call_with_timeout(
-        self, server: str, tool: str, args: dict[str, Any], timeout: float
+    def call(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        timeout: float,
+        call_id: str = "",
     ) -> dict[str, Any]:
-        return self._c.raw_tool_reply(server, tool, args, timeout=timeout)
+        return self._c.raw_tool_reply(
+            server, tool, args, timeout=timeout, call_id=call_id
+        )
 
-    # DALTON-HOOK(alphaengine-cache): pass per-request caller identity to raw_tool_reply
+    # DALTON-HOOK(alphaengine-cache): pass per-request caller identity and call_id to raw_tool_reply
     def call_with_caller(
         self,
         server: str,
@@ -146,9 +161,11 @@ class ClientBackend(ServerBackend):
         args: dict[str, Any],
         timeout: float,
         caller: dict[str, str] | None = None,
+        *,
+        call_id: str = "",
     ) -> dict[str, Any]:
         return self._c.raw_tool_reply(
-            server, tool, args, timeout=timeout, caller=caller
+            server, tool, args, timeout=timeout, caller=caller, call_id=call_id
         )
 
     def drop(self, server: str) -> None:
@@ -496,9 +513,20 @@ class Supervisor:
                         req_caller[c_key] = c_val
             self._claim(server)
             try:
-                reply = self.backend.call_with_caller(
-                    server, tool, args, remaining, caller=req_caller
-                )
+                req_call_id = str(request.get("call_id") or "")
+                if req_call_id:
+                    reply = self.backend.call_with_caller(
+                        server,
+                        tool,
+                        args,
+                        remaining,
+                        caller=req_caller,
+                        call_id=req_call_id,
+                    )
+                else:
+                    reply = self.backend.call_with_caller(
+                        server, tool, args, remaining, caller=req_caller
+                    )
             except Exception as exc:  # noqa: BLE001 - one bad server is not fatal
                 self._log(f"call failed {server}.{tool}: {exc}")
                 conn.send(
@@ -1069,8 +1097,15 @@ def main(argv: list[str] | None = None) -> int:
     if not root:
         _stderr_log("usage: python -m supervisor <computer_root> [--retire]")
         return 2
-    socket_path = os.path.join(root, p.SOCKET_REL_PATH)
-    os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+    socket_path = p.socket_path(root)
+    socket_dir = os.path.dirname(socket_path)
+    os.makedirs(socket_dir, mode=0o700, exist_ok=True)
+    # makedirs leaves a folder that already exists as it was, and an account
+    # that can write in it can take the socket's name first.
+    try:
+        os.chmod(socket_dir, 0o700)
+    except OSError:
+        pass
     lock_path = socket_path + ".lock"
     if retiring:
         return retire(socket_path, lock_path)

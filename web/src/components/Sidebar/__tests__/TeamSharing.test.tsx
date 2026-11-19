@@ -190,7 +190,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     messages: mockMessages.current,
     liveMessages: STABLE_CHAT_HELPERS.liveMessages,
     isLoading: false,
-    turnHeld: null,
+    turnStatus: { workspaceStarting: false, turnHeld: null, cliQueue: null },
     hasActiveSubagents: false,
     isLoadingHistory: false,
     historyLoadFailed: false,
@@ -233,7 +233,6 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     feedbackByTurn: STABLE_CHAT_HELPERS.feedbackByTurn,
     handleThumbUp: STABLE_CHAT_HELPERS.handleThumbUp,
     handleThumbDown: STABLE_CHAT_HELPERS.handleThumbDown,
-    workspaceStarting: false,
     fallbackSuggestion: null,
     clearFallbackSuggestion: STABLE_CHAT_HELPERS.clearFallbackSuggestion,
     modelStatus: null,
@@ -948,7 +947,7 @@ describe('Dalton Team Sharing', () => {
     renderWithProviders(
       <div>
         <PreviewCrumbs
-          entry={{ port: 8080, title: 'App', url: '', loading: false, error: false, reloadToken: 0 }}
+          entry={{ port: 8080, title: 'App', url: '', loading: false, reloadToken: 0 }}
           onRefresh={refreshPreviewApi}
           refreshDisabled={true}
           workspaceId={null}

@@ -486,6 +486,13 @@ _RELAY_ERROR_HINTS = {
     "policy_missing": "this connection's capability policy has not been computed yet; reconnect the server in Plugins",
     "execution_required": "an order runs only from an approval the user granted for that exact call, which this request does not carry",
     "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
+    "credential_unavailable": "this service's account for the user could not be set up; retry later, and tell the user if it keeps failing",
+    "terms_required": "the user has not accepted this service's terms yet; the app is asking them now, so tell the user to accept there, and call again only after they say they have",
+    "credits_exhausted": "the user is out of credits, so paid calls are refused; tell the user rather than retrying",
+    "credit_check_unavailable": "the user's credit balance could not be checked; retry shortly",
+    "cost_exceeds_balance": "this call would cost more credits than the user has left; make a smaller call, or tell the user",
+    "limit_required": "a crawl needs limit set to 100 pages or fewer; retry with a smaller limit",
+    "charges_pending": "the user's earlier paid calls are not charged yet, so new ones are paused until the command that made them returns or the next turn starts; stop calling paid tools in this run",
     "destination_blocked": "the relay refused to dial this server's address",
     "upstream_unreachable": "the relay could not reach the vendor's server",
     "vendor_redirect": "the vendor redirected this endpoint, so its URL has moved; update the server URL in Plugins",
@@ -519,7 +526,46 @@ def _relay_error(response, server_name: str):
     if not code:
         return None
     hint = _RELAY_ERROR_HINTS.get(code, code)
-    return f"MCP server {server_name}: relay rejected the call [{code}]: {hint}"
+    detail = _relay_detail(response, code)
+    suffix = f" ({detail})" if detail else ""
+    return f"MCP server {server_name}: relay rejected the call [{code}]: {hint}{suffix}"
+
+
+# A relay refusal's body is its detail, one short line (what the call would
+# cost, why the account refused); read only this much of it.
+_RELAY_DETAIL_MAX = 300
+
+
+def _relay_detail(response, code: str) -> str:
+    """The relay's own detail for a refusal, which says what the hint for its
+    code cannot; "" when it only repeats the code or cannot be read."""
+    raw = b""
+    try:
+        for chunk in response.iter_bytes():
+            raw += chunk
+            if len(raw) > _RELAY_DETAIL_MAX * 4:
+                break
+    except Exception:
+        return ""
+    text = " ".join(raw.decode("utf-8", "replace").split())
+    if not text or text == code:
+        return ""
+    return text if len(text) <= _RELAY_DETAIL_MAX else text[: _RELAY_DETAIL_MAX - 3] + "..."
+
+
+# The tool call a relay request is made for, so the relay can charge what a
+# metered server costs to the command that ran it. In process it is the job's
+# own environment; the supervisor daemon was started by some earlier job, so
+# its environment names that job, and each daemon call thread is told instead.
+_CALL_ENV = "LIVEFS_CALL_ID"
+_call_context = threading.local()
+
+
+def _current_call_id() -> str:
+    told = getattr(_call_context, "call_id", None)
+    if told is not None:
+        return told
+    return os.environ.get(_CALL_ENV, "")
 
 
 def _resolve_relay(cfg):
@@ -535,11 +581,16 @@ def _resolve_relay(cfg):
     token = creds.get("token") or ""
     if not (grant_id and base and token):
         raise RuntimeError(
-            f"MCP server {cfg.name} is OAuth-connected but this sandbox has "
-            "no relay credentials - the egress relay may be disabled, or the "
-            "binding failed at session start; check the connection in Plugins"
+            f"MCP server {cfg.name} is reached through the egress relay but "
+            "this sandbox has no relay credentials - the egress relay may be "
+            "disabled, or the binding failed at session start; check the "
+            "server in Plugins"
         )
-    return base + "/v1/egress/" + str(grant_id), {"Authorization": "Bearer " + token}
+    headers = {"Authorization": "Bearer " + token}
+    call_id = _current_call_id()
+    if call_id:
+        headers["X-Langalpha-Call"] = call_id
+    return base + "/v1/egress/" + str(grant_id), headers
 
 
 # ---------------------------------------------------------------------------
@@ -2289,6 +2340,9 @@ def _http_tools_call(
 # Relative to ``_INTERNAL_ROOT``. The daemon's own artifacts; nothing outside
 # the supervisor addresses them, so they are not layout ClassVars.
 _SUPERVISOR_SOCKET_REL = "system/mcp-supervisor.sock"
+# For a root too long for a socket's address (``supervisor.protocol``).
+_SUPERVISOR_SUN_PATH_MAX = 103
+_SUPERVISOR_SHORT_SOCKET_DIR = ".langalpha/s"
 _SUPERVISOR_LOG_REL = "system/mcp-supervisor.log"
 _SUPERVISOR_PACKAGE = "supervisor"
 _SUPERVISOR_PROTOCOL_VERSION = 1
@@ -2400,6 +2454,7 @@ def raw_tool_reply(
     *,
     timeout: float = _CALL_TIMEOUT,
     caller: dict[str, str] | None = None,
+    call_id: str | None = None,
 ) -> dict:
     """One tools/call, returning the JSON-RPC reply unsettled.
 
@@ -2408,6 +2463,7 @@ def raw_tool_reply(
     daemon-lifetime counter and ``MCP_TRACE_FILE`` keeps naming the execution
     that made the call.
     """
+    _call_context.call_id = call_id or ""
     cfg = _server_cfg(server_name)
     if cfg.transport == "sse":
         raise RuntimeError(_legacy_sse_refusal(server_name))
@@ -2509,7 +2565,17 @@ def server_secret_dependencies(server_name: str) -> list[str] | None:
 
 
 def _supervisor_socket_path() -> str:
-    return _internal_join(_SUPERVISOR_SOCKET_REL)
+    """``supervisor.protocol.socket_path`` for this computer: the daemon
+    binds where that says, and a wrapper never imports the daemon's package.
+    Built from the root as the daemon strips it: a configured root ending in
+    a slash would otherwise run one byte longer and pick the other path."""
+    root = _WORK_DIR.rstrip("/") or "/"
+    path = f"{root}/{_LAYOUT['INTERNAL_DIR']}/{_SUPERVISOR_SOCKET_REL}"
+    if len(os.fsencode(path)) <= _SUPERVISOR_SUN_PATH_MAX:
+        return path
+    digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:16]
+    home = os.path.expanduser("~").rstrip("/")
+    return f"{home}/{_SUPERVISOR_SHORT_SOCKET_DIR}/{digest}.sock"
 
 
 def _supervisor_connect(path: str):
@@ -2544,6 +2610,7 @@ def _start_supervisor(path: str) -> bool:
         # vars so the long-lived supervisor never inherits the starter's identity.
         _CALLER_ONLY_ENV = (
             "MCP_TRACE_FILE",
+            "LIVEFS_CALL_ID",
             "PTC_TURN_CWD",
             "PTC_WORKSPACE_CONFIG",
             "PTC_ALLOWED_SERVERS",
@@ -2748,6 +2815,7 @@ def _supervisor_reply(
         "server": server_name,
         "tool": tool_name,
         "args": arguments,
+        "call_id": _current_call_id(),
         "workspace_id": str(view.get("workspace_id") or ""),
         "config_path": str(view.get("path") or ""),
         "config_version": int(view.get("computer_config_version") or 0),

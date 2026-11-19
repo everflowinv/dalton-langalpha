@@ -14,7 +14,7 @@ from typing import Any, Literal
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
 from ptc_agent.agent.middleware.order_governance import RECEIPT_KEY
 from src.server.contracts.turn_kinds import NOTIFICATION_QUERY_TYPES
-from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
+from src.tools.secretary._commands import HANDOFF_TOOL_NAME
 from src.tools.wakeups.quiet import TOOL_NAME as WAKEUP_TOOL_NAME
 from src.utils.nested import without_keys
 
@@ -33,7 +33,10 @@ from src.utils.nested import without_keys
 # closing ``error`` event is nothing but that text, so it goes whole; a run's
 # lifecycle frame and a model fallback keep their status and lose the text.
 # No share renders either.
-_DROPPED_EVENTS = frozenset({"provenance", "tool_call_chunks", "interrupt", "error"})
+#
+# A wait for a Claude Code CLI names the owner's computer, how many agents
+# they ran on it and how to raise that; no share renders it.
+_DROPPED_EVENTS = frozenset({"provenance", "tool_call_chunks", "interrupt", "error", "claude_code_queue"})
 _ERROR_TEXT_EVENTS = frozenset({"workflow_lifecycle", "model_fallback"})
 _PRIVATE_ARTIFACT_KEYS = (RECEIPT_KEY, "provenance")
 # The owner's own turn, and the resume that answers an approval names every
@@ -47,8 +50,9 @@ _PRIVATE_QUERY_METADATA_KEYS = frozenset(
 # share keeps each notice's label and kind, which name what fired, and drops
 # the order wherever the notice sits: a wake turn's query metadata and the
 # entry a running turn took it in by. The agent's own ``schedule_wakeup``
-# calls name the order too, by its id in the arguments and in the answer's
-# listing, so those go as an order call's do.
+# calls name the order too, by its id in the arguments, in the answer's
+# listing and in the rows its artifact lists as set or cancelled, so those go
+# as an order call's do.
 _WAKEUP_ORDER_KEYS = frozenset({"order"})
 # Keys naming the owner's account wherever they sit in an event: no share
 # renders them, and none is the viewer's to read.
@@ -60,15 +64,17 @@ _DIRECT_TOOL_PREFIX = "mcp__"
 # owner's workspaces and threads. Their answers are the owner's own rows as
 # text, sandbox and user ids included, which no key strip reaches, and their
 # arguments name the same things. A share renders none of these calls, so each
-# travels as its name and id alone. The retired Flash agent's did the same
-# under these names, and threads it ran are still shared, so they stay spelled
-# out here.
+# travels as its name and id alone. Only the hand-off is still a tool; the
+# others, and the retired Flash agent's, went under these names, and threads
+# that called them are still shared, so they stay spelled out here.
 _EARLIER_SECRETARY_TOOL_NAMES = frozenset(
     {"manage_workspaces", "ptc_agent", "agent_output", "manage_threads"}
 )
-_SECRETARY_TOOL_NAMES = _EARLIER_SECRETARY_TOOL_NAMES | frozenset(
-    t.name for t in CHIEF_OF_STAFF_TOOLS
-)
+# A Bash or ExecuteCode call that may run the `la` CLI goes as one too: the
+# Chief of Staff manages the same rows through it now. No tool can be named
+# this, so the kind never meets a real call's name.
+_LA_RUN = "\x00la"
+_SECRETARY_TOOL_NAMES = _EARLIER_SECRETARY_TOOL_NAMES | {HANDOFF_TOOL_NAME, _LA_RUN}
 # The retired user data tools answered with raw rows until they dropped the
 # owner's user_id, and threads stored before then still spell it out in the
 # answer text, as a repr or JSON pair no key strip reaches. The tools are gone
@@ -82,13 +88,38 @@ _USER_ID_PAIR_FIRST = re.compile(_USER_ID_PAIR + r",\s*")
 # The comma is matched whole or not at all: ``,?\s*`` lets a run of spaces
 # start a match at each of its own positions, quadratic in a long note.
 _USER_ID_PAIR_LAST = re.compile(r"(?:,\s*)?" + _USER_ID_PAIR)
-# What a tool's own answer becomes on a share, by the name of the call it
+# What a tool's own answer becomes on a share, by the kind of the call it
 # answers.
 _ANSWER_RULES: dict[str, Literal["blank", "scrub_user_id"]] = {
     **dict.fromkeys(_SECRETARY_TOOL_NAMES, "blank"),
     **dict.fromkeys(_USER_DATA_TOOL_NAMES, "scrub_user_id"),
     WAKEUP_TOOL_NAME: "blank",
 }
+# A command or code run that calls `la` answers with the rows the retired
+# account tools did, and its own text names the same ids. The match is loose
+# on purpose: the word `la` or `langalpha`, bare, escaped past an alias
+# (`\la`) or ending a path, wherever a shell or a string literal could start a
+# program, and ending at a redirection (`la</dev/null`) or at an escaped quote,
+# as in arguments the stream could not parse (`[\"la\", ...]`). A command that
+# only mentions the word loses its text on a share; a real call left out would
+# publish another thread's output.
+_COMMAND_ARG = {"Bash": "command", "ExecuteCode": "code"}
+_RUNS_LA = re.compile(
+    r"""(?:^|[\s;&|(`$"'=])(?:[^\s;&|()`$"'=]*/)?\\?(?:la|langalpha)(?=$|[\s;&|()`"'<>\\])"""
+)
+
+
+def _runs_la(name: Any, args: Any) -> bool:
+    """Whether a Bash or ExecuteCode call may run the `la` CLI.
+
+    Arguments the stream could not parse arrive as text, which still says
+    what ran.
+    """
+    arg = _COMMAND_ARG.get(name) if isinstance(name, str) else None
+    if arg is None:
+        return False
+    text = args.get(arg) if isinstance(args, dict) else args
+    return isinstance(text, str) and _RUNS_LA.search(text) is not None
 
 
 def _is_order_result(data: dict[str, Any]) -> bool:
@@ -209,7 +240,7 @@ class ShareRedaction:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self._order_calls = _order_call_ids(events)
         self._cleared_calls = _cleared_call_ids(events)
-        # The latest name each call id was made under, None once a result has
+        # The latest kind each call id was made as, None once a result has
         # answered it. A result names only its call id, which a provider may
         # repeat later, so this follows the stream rather than reading the
         # thread up front.
@@ -277,8 +308,8 @@ class ShareRedaction:
         return data
 
     def _tool_calls(self, data: dict[str, Any]) -> None:
-        """Note each call's name, and empty the arguments of each possible
-        order call and each secretary call.
+        """Note each call's kind, and empty the arguments of each possible
+        order call and each secretary call, an `la` run among them.
 
         Emptied rather than dropped, as the stream does for arguments it cannot
         parse: the call keeps its card and its id, so its result still lands.
@@ -290,15 +321,16 @@ class ShareRedaction:
         for call in calls:
             if isinstance(call, dict):
                 name = call.get("name")
+                kind = _LA_RUN if _runs_la(name, call.get("args")) else name
                 if call.get("id"):
                     self._call_names[str(call["id"])] = (
-                        name if isinstance(name, str) else ""
+                        kind if isinstance(kind, str) else ""
                     )
-                if name in _SECRETARY_TOOL_NAMES or self._may_be_order(
+                if kind in _SECRETARY_TOOL_NAMES or self._may_be_order(
                     call, data.get("id")
                 ):
                     call = {**call, "args": {}}
-                elif name == WAKEUP_TOOL_NAME:
+                elif kind == WAKEUP_TOOL_NAME:
                     call = {**call, "args": _wakeup_args(call.get("args"))}
             shown.append(call)
         data["tool_calls"] = shown
@@ -344,6 +376,9 @@ class ShareRedaction:
             call_name = self._call_names.get(str(call_id))
             self._call_names[str(call_id)] = None
         rule = "blank" if call_name is None else _ANSWER_RULES.get(call_name)
+        # An answer no call can be named for may be a wakeup's too.
+        if call_name in (None, WAKEUP_TOOL_NAME) and isinstance(data.get("artifact"), dict):
+            data["artifact"] = without_keys(data["artifact"], _WAKEUP_ORDER_KEYS)
         content = data.get("content")
         if rule == "blank":
             data["content"] = ""

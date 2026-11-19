@@ -6,12 +6,12 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
+import psycopg
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from src.server.database.pool import get_db_connection
-
 
 HOME_WORKSPACE_SENTINEL = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
@@ -295,6 +295,35 @@ async def list_unwoken_signals(
             return [_with_signal_status(dict(r)) for r in (rows or [])]
 
 
+async def list_signals_claimed_by(
+    execution_id: str,
+    workspace_id: Optional[str],
+) -> list[dict[str, Any]]:
+    """Return unresolved, unexpired signals already claimed by ``execution_id``."""
+    if not execution_id or not workspace_id:
+        return []
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    exec_uuid = _signal_exec_uuid(execution_id)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
+                       summary, payload, detected_at, woken_execution_id, woken_at,
+                       resolved_at, expired_at
+                FROM dalton_signals
+                WHERE woken_execution_id = %s
+                  AND workspace_id = %s
+                  AND resolved_at IS NULL
+                  AND expired_at IS NULL
+                ORDER BY detected_at ASC
+                """,
+                (exec_uuid, ws_uuid),
+            )
+            rows = await cur.fetchall()
+            return [_with_signal_status(dict(r)) for r in (rows or [])]
+
+
 def _with_signal_status(row: dict[str, Any]) -> dict[str, Any]:
     """Attach canonical lifecycle ``status`` ('pending' | 'woken' | 'resolved' | 'expired') to a signal row."""
     out = dict(row)
@@ -317,6 +346,10 @@ def _try_uuid(val: Any) -> Optional[uuid.UUID]:
         return uuid.UUID(str(val))
     except (ValueError, TypeError):
         return None
+
+
+def _signal_exec_uuid(execution_id: str) -> uuid.UUID:
+    return _try_uuid(execution_id) or uuid.uuid5(uuid.NAMESPACE_DNS, str(execution_id))
 
 
 async def upsert_signal(
@@ -456,11 +489,11 @@ async def claim_signals_woken(
     *,
     workspace_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Atomically claim unwoken signals for ``execution_id`` using ``UPDATE ... WHERE woken_execution_id IS NULL RETURNING *`` (R5-12)."""
+    """Atomically claim unwoken signals (or re-claim signals already owned by ``execution_id``)."""
     ws_uuid = _require_scoped_ws_uuid(workspace_id)
     if not signal_ids:
         return []
-    exec_uuid = _try_uuid(execution_id) or uuid.uuid5(uuid.NAMESPACE_DNS, str(execution_id))
+    exec_uuid = _signal_exec_uuid(execution_id)
     sig_uuids = [u for s in signal_ids if (u := _try_uuid(s)) is not None]
     if not sig_uuids:
         return []
@@ -470,18 +503,18 @@ async def claim_signals_woken(
                 """
                 UPDATE dalton_signals
                 SET woken_execution_id = %s,
-                    woken_at = NOW(),
+                    woken_at = COALESCE(woken_at, NOW()),
                     payload = COALESCE(payload, '{}'::jsonb) || '{"status": "woken"}'::jsonb
                 WHERE signal_id = ANY(%s)
                   AND workspace_id = %s
-                  AND woken_execution_id IS NULL
+                  AND (woken_execution_id IS NULL OR woken_execution_id = %s)
                   AND resolved_at IS NULL
                   AND expired_at IS NULL
                 RETURNING signal_id, workspace_id, ticker, probe, signal_key, priority,
                           summary, payload, detected_at, woken_execution_id, woken_at,
                           resolved_at, expired_at
                 """,
-                (exec_uuid, sig_uuids, ws_uuid),
+                (exec_uuid, sig_uuids, ws_uuid, exec_uuid),
             )
             rows = await cur.fetchall()
             return [_with_signal_status(dict(r)) for r in (rows or [])]
@@ -496,6 +529,54 @@ async def mark_signals_woken(
     """Stamp woken_execution_id and woken_at on the given signals (atomic claim)."""
     claimed = await claim_signals_woken(signal_ids, execution_id, workspace_id=workspace_id)
     return len(claimed)
+
+
+async def release_signals_claimed_by(
+    execution_id: str,
+    *,
+    conn: Any = None,
+) -> int:
+    """Release unresolved, unexpired signals still claimed by ``execution_id`` back to pending.
+
+    ``conn`` runs the update inside the caller's transaction (settlement), so a
+    failed release rolls the settlement back instead of stranding the claim.
+    The execution id alone identifies the claim; the automation's current
+    workspace may have changed since it claimed.
+    """
+    if not execution_id or not str(execution_id).strip():
+        return 0
+    exec_uuid = _signal_exec_uuid(execution_id)
+    sql = """
+        UPDATE dalton_signals
+        SET woken_execution_id = NULL,
+            woken_at = NULL,
+            payload = COALESCE(payload, '{}'::jsonb) || '{"status": "pending"}'::jsonb
+        WHERE woken_execution_id = %s
+          AND resolved_at IS NULL
+          AND expired_at IS NULL
+        RETURNING signal_id
+    """
+
+    async def _run(c: Any) -> int:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (exec_uuid,))
+            rows = await cur.fetchall()
+            return len(rows or [])
+
+    if conn is not None:
+        # Inside the settlement transaction: run in a savepoint and retry once on a
+        # transient error, so a single cancelled statement does not roll back (and
+        # re-settle as FAILED) an execution that was merely skipped.
+        for attempt in range(2):
+            try:
+                async with conn.transaction():
+                    return await _run(conn)
+            except (psycopg.errors.QueryCanceled, psycopg.OperationalError):
+                if attempt == 1:
+                    raise
+        return 0
+    async with get_db_connection() as own:
+        return await _run(own)
 
 
 async def verify_signal_refs_in_workspace(
@@ -762,7 +843,13 @@ async def insert_preflight_log(
 async def get_preflight_wake_context(
     automation_execution_id: Optional[str],
 ) -> Optional[str]:
-    """Return the latest ``wake_context`` logged for a waking execution, if any."""
+    """Return the latest ``wake_context`` logged for a waking execution.
+
+    ``None`` means no wake was logged for this execution (preflight never ran
+    to a wake); ``""`` means it woke without context. A resumed execution uses
+    the difference to decide whether preflight still has to run, since running
+    it twice would claim one-shot signals a second time.
+    """
     if not automation_execution_id:
         return None
     try:
@@ -786,7 +873,7 @@ async def get_preflight_wake_context(
             if not row:
                 return None
             val = row.get("wake_context")
-            return str(val) if val is not None else None
+            return str(val) if val is not None else ""
 
 
 async def list_preflight_logs(

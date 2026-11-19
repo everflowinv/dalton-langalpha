@@ -15,7 +15,9 @@ import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { queryKeys } from '@/lib/queryKeys';
 import type { ComputersResponse, Workspace, WorkspacesResponse } from '@/types/api';
 
+import { cachedComputer } from '../hooks/useComputers';
 import { startWorkspace } from './api';
+import type { WarmReason } from './api/workspaces';
 import { cachedHomeRow, workspaceDetailQuery } from './workspaceQueries';
 
 const inFlight = new Map<string, Promise<void>>();
@@ -132,10 +134,8 @@ async function homeComputerId(queryClient: QueryClient, workspaceId: string): Pr
 /** What the caches believe a machine is doing: its own row, else a workspace
  * bound to it. */
 function cachedComputerStatus(queryClient: QueryClient, computerId: string): string | undefined {
-  for (const [, data] of queryClient.getQueriesData<ComputersResponse>({ queryKey: queryKeys.computers.lists() })) {
-    const computer = data?.computers?.find((c) => c.computer_id === computerId);
-    if (computer) return computer.status;
-  }
+  const computer = cachedComputer(queryClient, computerId);
+  if (computer) return computer.status;
   return cachedWorkspaceLists(queryClient)
     .find((w) => w.computer_id === computerId && w.status !== 'deleted')
     ?.status;
@@ -172,7 +172,11 @@ function isCachedHome(queryClient: QueryClient, workspaceId: string): boolean {
   );
 }
 
-export function warmWorkspace(workspaceId: string, queryClient: QueryClient): Promise<void> {
+export function warmWorkspace(
+  workspaceId: string,
+  queryClient: QueryClient,
+  reason?: WarmReason,
+): Promise<void> {
   if (!workspaceId) return Promise.resolve();
 
   const existing = inFlight.get(workspaceId);
@@ -184,7 +188,7 @@ export function warmWorkspace(workspaceId: string, queryClient: QueryClient): Pr
   if (isCachedHome(queryClient, workspaceId)) {
     // The start moves Home's computer, which the workspaces beside it on that
     // machine show too, so patch the machine.
-    const p = startWorkspace(workspaceId, { lazy: true })
+    const p = startWorkspace(workspaceId, { lazy: true, reason })
       .then(async (resp) => {
         const computerId = await homeComputerId(queryClient, workspaceId);
         if (computerId && cachedComputerStatus(queryClient, computerId) === 'stopped') {
@@ -206,12 +210,17 @@ export function warmWorkspace(workspaceId: string, queryClient: QueryClient): Pr
     return Promise.resolve();
   }
 
+  // Released from the promise, not the body: a cached detail can end the body
+  // before its first await, which is before the entry is set below.
   const p = (async () => {
     try {
       const detail = cached ?? (await queryClient.fetchQuery(workspaceDetailQuery(workspaceId)));
       if (!detail?.status || !['stopped', 'running'].includes(detail.status)) return;
+      // A warm now could only fail beside the card that says the machine is
+      // away: asleep or offline, it connects by itself once awake.
+      if (cachedComputer(queryClient, detail.computer_id)?.ssh?.tunnel_connected === false) return;
 
-      const resp = await startWorkspace(workspaceId, { lazy: true });
+      const resp = await startWorkspace(workspaceId, { lazy: true, reason });
       // Only reflect the 202 'starting' if nothing has advanced the cache past
       // 'stopped' meanwhile. The SSE stream (useWarmWorkspaceSandbox) can push
       // a fast 'running' (or 'error') before this slower patch lands; without
@@ -232,10 +241,8 @@ export function warmWorkspace(workspaceId: string, queryClient: QueryClient): Pr
       if (import.meta.env?.DEV) {
         console.warn('[warmWorkspace] failed', workspaceId, err);
       }
-    } finally {
-      inFlight.delete(workspaceId);
     }
-  })();
+  })().finally(() => inFlight.delete(workspaceId));
 
   inFlight.set(workspaceId, p);
   return p;

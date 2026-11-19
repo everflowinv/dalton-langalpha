@@ -7,7 +7,7 @@ import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import type { WorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
 import { RESIZE_PARAM } from '@/pages/ChatAgent/hooks/computerPanelStore';
 import type { ResourceTier } from '@/types/api';
-import type { ErrorLinkSpec } from '@/utils/rateLimitError';
+import type { ErrorLinkSpec, PageLinkSpec } from '@/utils/rateLimitError';
 
 /** The provider and sdk of the models a turn runs on Claude Code. */
 export const CLAUDE_CODE = 'claude-code';
@@ -145,7 +145,7 @@ const BIGGER_COMPUTER_KEYS = {
  * the computer is, so nothing links, and Home, which no move puts on a
  * computer of the user's own, has only that.
  */
-export function biggerComputer(home: boolean): { rowKey: string; messageKey: string; link: ErrorLinkSpec | null } {
+export function biggerComputer(home: boolean): { rowKey: string; messageKey: string; link: PageLinkSpec | null } {
   const keys = BIGGER_COMPUTER_KEYS[PLAN_URL ? 'plan' : 'spec'][home ? 'home' : 'workspace'];
   return PLAN_URL
     ? { ...keys, link: { url: PLAN_URL, label: 'Upgrade plan', labelKey: 'computer.spec.upgradePlan', console: true } }
@@ -155,7 +155,7 @@ export function biggerComputer(home: boolean): { rowKey: string; messageKey: str
 /** The fix for a computer too small for Claude Code, named by the refusal:
  *  its link reads and acts as `useMediumAction` decides where it is drawn,
  *  and its URL opens the change-spec dialog where nothing draws it. */
-const resizeLink = (computerId: string): ErrorLinkSpec => ({
+const resizeLink = (computerId: string): PageLinkSpec => ({
   url: `?${RESIZE_PARAM}=${encodeURIComponent(computerId)}`,
   label: 'Change spec',
   labelKey: 'workspace.changeSpec',
@@ -179,6 +179,18 @@ export const CLAUDE_CODE_MODE_LABELS: Readonly<Record<ClaudeCodeCustodyMode, str
 export const CLAUDE_CODE_CHOICE = 'claude-code-cloud';
 export const CLAUDE_CODE_CHOICE_URL = `${MODEL_ACCESS_URL}&${CLAUDE_CODE_TOKEN_PARAM}=${CLAUDE_CODE_CHOICE}`;
 
+/** With this too, Claude Code's sheet opens at that computer's row and
+ *  puts the reader on how many agents it runs at once. */
+export const CLAUDE_CODE_COMPUTER_PARAM = 'computer';
+
+/** To Claude Code's sheet at the computer a turn waited for a CLI on, where
+ *  the user sets how many agents it runs at once. */
+export const claudeCodeClisLink = (computerId: string): ErrorLinkSpec => ({
+  url: `${CLAUDE_CODE_CHOICE_URL}&${CLAUDE_CODE_COMPUTER_PARAM}=${encodeURIComponent(computerId)}`,
+  label: 'Run more at once',
+  labelKey: 'chat.cliQueue.runMore',
+});
+
 /** With this too, Settings opens the sheet for the token that workspace's
  *  turns run on, which it resolves when it opens: a link made before the
  *  workspace's computer was known still goes to that computer's sheet. */
@@ -186,7 +198,7 @@ export const CLAUDE_CODE_WORKSPACE_PARAM = 'workspace';
 export const claudeCodeTokenUrl = (workspaceId?: string | null) =>
   (workspaceId ? `${CLAUDE_CODE_TOKEN_URL}&${CLAUDE_CODE_WORKSPACE_PARAM}=${encodeURIComponent(workspaceId)}` : CLAUDE_CODE_TOKEN_URL);
 
-export const claudeCodeTokenLink = (workspaceId?: string | null): ErrorLinkSpec => ({
+export const claudeCodeTokenLink = (workspaceId?: string | null): PageLinkSpec => ({
   url: claudeCodeTokenUrl(workspaceId),
   label: 'Add setup token',
   labelKey: 'modelAccess.claudeCode.add',
@@ -210,14 +222,14 @@ const CLAUDE_CODE_OFF_KEYS: Readonly<Record<string, string>> = {
   needs_bigger_computer: 'chat.claudeCode.off.needs_bigger_computer',
 };
 
-const CLAUDE_CODE_CHOICE_LINK: ErrorLinkSpec = { url: CLAUDE_CODE_CHOICE_URL, label: 'Model access', labelKey: 'modelAccess.title' };
+const CLAUDE_CODE_CHOICE_LINK: PageLinkSpec = { url: CLAUDE_CODE_CHOICE_URL, label: 'Model access', labelKey: 'modelAccess.title' };
 
 /** Why a Claude Code model is no pick, as its picker row says, and the link
  *  that fixes it where the user can. */
 export interface ClaudeCodeHold {
   messageKey: string;
   messageValues?: Record<string, string>;
-  link: ErrorLinkSpec | null;
+  link: PageLinkSpec | null;
 }
 
 /** What holds a Claude Code model back where its turns stand in `state`;
@@ -254,7 +266,7 @@ export function claudeCodeHold(
 
 /** A held pin's fix: Model access itself, where each computer's own token
  *  sits beside the saved one. */
-const CLAUDE_CODE_PIN_TOKEN_LINK: ErrorLinkSpec = { ...claudeCodeTokenLink(), url: MODEL_ACCESS_URL };
+const CLAUDE_CODE_PIN_TOKEN_LINK: PageLinkSpec = { ...claudeCodeTokenLink(), url: MODEL_ACCESS_URL };
 
 /** What holds a subagent's Claude Code pin back. A pin applies in every
  *  workspace, so it reads the user's Claude Code as a whole, as a pin can
@@ -302,7 +314,7 @@ const CLAUDE_CODE_CHOICE_CHANGED: ReadonlySet<string> = new Set(['choice_changed
  */
 export function claudeCodeRefusal(frame: Record<string, unknown>, workspaceId: string | null | undefined): {
   reread: boolean;
-  link: ErrorLinkSpec | null;
+  link: PageLinkSpec | null;
   messageKey: string | null;
   messageValues?: Record<string, string | number>;
   planRefusal?: PlanRefusal;

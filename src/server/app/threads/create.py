@@ -30,7 +30,7 @@ from src.server.models.conversation import (
     ThreadCreateResponse,
 )
 from src.server.services.thread_title import schedule_title_generation
-from src.server.dependencies.principal import RunPrincipal, assert_reaches
+from src.server.dependencies.principal import RunPrincipal
 from src.server.utils.thread_stamp import stamped_title
 
 from ._deps import SSE_HEADERS, logger, router
@@ -120,8 +120,7 @@ async def create_thread_endpoint(
     # Decided where the message path decides it, so the thread is born in the
     # workspace its runs will actually use.
     route = turn_route(x_user_id, workspace)
-    await assert_reaches(principal, workspace_id=route.workspace_id)
-    await route.bind(x_user_id, workspace)
+    route = await route.bind(x_user_id, workspace, place=False)
     workspace_id = route.workspace_id
 
     # A title the caller named is the thread's own: nothing generates over it,
@@ -152,7 +151,6 @@ async def create_thread_endpoint(
             conversation_thread_id=thread_id,
             workspace_id=workspace_id,
             current_status="completed",
-            thread_index=None,
             title=title_stamp,
             platform=request.platform,
             metadata=thread_metadata,

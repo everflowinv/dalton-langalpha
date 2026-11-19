@@ -125,6 +125,7 @@ import { ThreadOffers } from './chatView/ThreadNotices';
 import { ClaudeCodePlanRow } from './chatView/ClaudeCodePlanRow';
 import { useNextSummary } from '../hooks/useNextSummaryHint';
 import { ChatDiskWarning } from './chatView/ChatDiskWarning';
+import { HomePlacementNotice } from './chatView/HomePlacementNotice';
 import { ChatRestoreOffer } from './chatView/ChatRestoreOffer';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
 import { MobileNavDrawer } from './chatView/MobileNavDrawer';
@@ -366,8 +367,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     reportBackOwed,
     reportBackOwedThreads,
     reportBackOwedKinds,
-    workspaceStarting,
-    turnHeld,
+    turnStatus,
     isCompacting,
     setIsCompacting,
     compactionTokens,
@@ -533,10 +533,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // warming signal (the /events stream, which sees the start even when a
   // background warm owns it). 'archived' from either source wins so the slow-
   // restore copy survives a plain 'starting' from the other.
-  const displayWorkspaceStarting = mergeWarmingDisplay(
-    workspaceStarting,
-    warmingState,
-  );
+  const displayTurnStatus = {
+    ...turnStatus,
+    workspaceStarting: mergeWarmingDisplay(turnStatus.workspaceStarting, warmingState),
+  };
 
   const chatPlaceholder = useMemo(() => {
     if (wasStopped && !isLoading && !pendingInterrupt)
@@ -1838,8 +1838,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           modelStatus={modelStatus}
                           isLoading={isLoading}
                           retired={threadModel.retired}
-                          workspaceStarting={displayWorkspaceStarting}
-                          turnHeld={turnHeld}
+                          turnStatus={displayTurnStatus}
                           model={threadModel.model}
                           isCompacting={isCompacting}
                           compactionTokens={compactionTokens}
@@ -2020,6 +2019,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         reportThreadId={currentThreadId && currentThreadId !== '__default__' ? currentThreadId : undefined}
                       />
                     )}
+                    {isHome && <HomePlacementNotice />}
                     {workspaceRecord?.computer_id && (
                       <ChatRestoreOffer
                         workspaceId={workspaceId}
