@@ -36,7 +36,8 @@ describe('a settled la step', () => {
 
   it('names Home as the app does, and a workspace id only from the app', () => {
     expect(getCompletedSummary('Bash', bash('la threads list -w home'), en, ok)).toBe('Chief of Staff');
-    expect(getCompletedSummary('Bash', bash('la threads list -w home'), zh, ok)).toBe('CoS Agent');
+    // DALTON-HOOK(brand-name): Dalton's zh locale names Home's agent 研究总监.
+    expect(getCompletedSummary('Bash', bash('la threads list -w home'), zh, ok)).toBe('研究总监');
     expect(getCompletedSummary('Bash', bash(`la workspaces delete ${WS} -y`), en, ok)).toBe('Semis');
     expect(getCompletedRowTitle('Bash', bash(`la workspaces delete ${WS} -y`), en, ok)).toBe('Deleted workspace');
   });

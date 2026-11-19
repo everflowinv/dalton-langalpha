@@ -144,6 +144,7 @@ from ptc_agent.agent.tools import (
     TodoWrite,
 )
 from ptc_agent.agent.tools.context_file_policy import agent_md_for
+from ptc_agent.agent.tools.copy_file import create_copy_file_tool
 from ptc_agent.agent.tools.computer_reach import (
     REACHABLE_TOOLS,
     ComputerReach,
@@ -155,7 +156,7 @@ from src.llms.claude_code import ClaudeCodeTarget
 from src.tools.web.search import get_web_search_tool
 from src.tools.web.fetch import web_fetch_tool
 from src.tools.web.crawl import create_crawl_tools
-from src.tools.sec.tool import get_sec_filing
+from src.tools.sec.tool import create_sec_filing_tool
 from src.tools.market_data.tool import (
     get_daily_prices,
     get_company_overview,
@@ -636,7 +637,7 @@ class PTCAgent:
             shared_tools.extend(crawl_tools)
 
         finance_tools = [
-            get_sec_filing,  # SEC filing extraction (10-K, 10-Q, 8-K)
+            create_sec_filing_tool(filesystem_backend),  # SEC filings; full text to data/sec/
             get_quote,  # Real-time quotes (cheap — price freshness)
             get_daily_prices,  # Stock OHLCV price data
             get_company_overview,  # Company investment analysis (includes real-time quote)
@@ -939,6 +940,7 @@ class PTCAgent:
                 computer_tools.wrap(tool) if tool.name in REACHABLE_TOOLS else tool
                 for tool in tools
             ]
+            tools.append(create_copy_file_tool(reach))
 
         if role == "chief_of_staff":
             from src.tools.secretary.approvals import StandingApprovalMiddleware
@@ -1230,7 +1232,9 @@ class PTCAgent:
                 return claude_code_graph(
                     compiled, system_prompt=spec["system_prompt"], target=target,
                     user_id=user_id, checkpointer=checkpointer,
-                    launcher=partial(launcher_for, slot_wait_s=SUBAGENT_CLI_SLOT_WAIT_S),
+                    # Not told of its waits: a subagent waits briefly, under the
+                    # count its launch was admitted by, and shows none.
+                    launcher=lambda _waits: launcher_for(slot_wait_s=SUBAGENT_CLI_SLOT_WAIT_S),
                     entry=(subagent_skill_middleware, subagent_turn_context, *own),
                     middleware=[*subagent_middleware, *own],
                     baseline=baseline.frozen_block if baseline is not None else None,

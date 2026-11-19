@@ -34,6 +34,7 @@ export type SSEEventType =
   | 'error'
   | 'model_retry'
   | 'model_fallback'
+  | 'claude_code_queue'
   | 'steering_delivered'
   // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
   | 'steering_returned'
@@ -276,6 +277,30 @@ export interface ModelFallbackEvent extends BaseSSEEvent {
   error?: string;
   status_code?: number | null;
   attempts_on_from?: number;
+}
+
+/**
+ * A Claude Code turn's wait for one of its computer's CLIs, which a computer
+ * runs at most `cap` of at once. `waiting` while it waits; `admitted` once it
+ * gets one after 5 s or more, which history replay sends again where the wait
+ * happened; `cleared` once it gets one sooner, too short to note. `wait_id`
+ * names the wait on every signal, since a turn that starts a second CLI can
+ * wait twice. Read through `readCliQueue` (`lib/claudeCodeQueue.ts`).
+ */
+export interface ClaudeCodeQueueEvent extends BaseSSEEvent {
+  event: 'claude_code_queue';
+  thread_id: string;
+  signal: 'waiting' | 'admitted' | 'cleared';
+  wait_id: string;
+  /** On `waiting` and `admitted`. */
+  computer_id?: string;
+  name?: string | null;
+  running?: number;
+  cap?: number;
+  settable?: boolean;
+  max?: number;
+  /** On `admitted` and `cleared`: whole seconds the turn waited. */
+  waited_s?: number;
 }
 
 /** A steer the run took in: the user's, or an agent's sent into the turn. */
@@ -576,6 +601,7 @@ export type SSEEvent =
   | ErrorEvent
   | ModelRetryEvent
   | ModelFallbackEvent
+  | ClaudeCodeQueueEvent
   | SteeringDeliveredEvent
   // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
   | SteeringReturnedEvent
