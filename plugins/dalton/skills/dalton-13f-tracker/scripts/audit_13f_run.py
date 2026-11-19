@@ -123,6 +123,7 @@ def main() -> int:
     parser.add_argument("--quarter", default="26Q3", help="Quarter tag suffix in filenames, e.g. 26Q3 -> 26q3")
     parser.add_argument("--workspace-dir", default=None, help="Optional workspace dir for overlay state")
     parser.add_argument("--lookup-new", action="store_true", help="Query Yahoo Finance for any unverified tickers")
+    parser.add_argument("--report-file", default=None, help="Optional assembled 5-section markdown report to validate")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -153,25 +154,50 @@ def main() -> int:
 
     explicit_canonical_names = {str(v) for k, v in mod._MERGE_RULES.items() if k != "_comment"}
 
+    inst_map_lower = {
+        str(k).lower(): str(v).strip()
+        for k, v in (getattr(mod, "_INSTITUTION_MAP", {}) or {}).items()
+        if isinstance(v, str)
+    }
+
     def _resolve_merge_cik(ref: str) -> str:
         raw = str(ref or "").strip()
         if not raw:
             return ""
-        inst_map = getattr(mod, "_INSTITUTION_MAP", {}) or {}
-        mapped = inst_map.get(raw.lower())
+        merge_fn = getattr(mod, "_resolve_merge_ref_cik", None)
+        if callable(merge_fn):
+            resolved = merge_fn(raw)
+            if resolved:
+                return resolved
+        mapped = inst_map_lower.get(raw.lower())
         if mapped:
-            raw = str(mapped).strip()
+            raw = mapped
         m = re.fullmatch(r"(?:CIK\s*)?0*(\d+)", raw, flags=re.IGNORECASE)
         if m:
-            return m.group(1).lstrip("0") or "0"
+            return (m.group(1).lstrip("0") or "0").zfill(10)
         return raw.lower()
 
-    inst_map = getattr(mod, "_INSTITUTION_MAP", {}) or {}
     hillhouse_cik = _resolve_merge_cik("hillhouse")
-    default_merges = getattr(mod, "_DEFAULT_MERGES", {}) or {}
-    expected_hillhouse_merges = {
-        _resolve_merge_cik(c) for c in default_merges.get(hillhouse_cik, []) if str(c).strip()
+    expected_cik_by_slug = {
+        str(g["slug"]): _resolve_merge_cik(g["cik"])
+        for g in mod._batch_groups()
+        if g.get("slug") and g.get("cik")
     }
+    group_by_slug = {
+        str(g["slug"]): g for g in mod._batch_groups() if g.get("slug")
+    }
+    default_merges = getattr(mod, "_DEFAULT_MERGES", {}) or {}
+    hillhouse_raw_merges = (
+        default_merges.get(hillhouse_cik.lstrip("0") or "0")
+        or default_merges.get(hillhouse_cik)
+        or []
+    )
+    expected_hillhouse_merges = [
+        _resolve_merge_cik(c) for c in hillhouse_raw_merges if str(c).strip()
+    ]
+    exp_short_q = exp_prev_short_q = ""
+    if expected_ym is not None:
+        exp_short_q, _exp_full_q, exp_prev_short_q, _ym = mod._parse_quarter_tag(args.quarter)
 
     periods_seen = set()
     for idx, slug in EXPECTED_GROUPS:
@@ -182,6 +208,13 @@ def main() -> int:
         d = json.loads(fpath.read_text(encoding="utf-8"))
         if not d.get("ok"):
             errors.append(f"[FAILED GROUP] {slug}: {d.get('error')}")
+            merged_with = d.get("merged_with")
+            if isinstance(merged_with, list):
+                for mw in merged_with:
+                    if isinstance(mw, dict) and int(mw.get("rows") or 0) <= 0:
+                        errors.append(
+                            f"[INCOMPLETE MERGE] {slug}: merged_with entry {mw.get('institution')} has rows={mw.get('rows')}"
+                        )
             continue
         base_period = str(d.get("base_period") or "").strip()
         periods_seen.add(base_period)
@@ -189,9 +222,21 @@ def main() -> int:
             errors.append(
                 f"[PERIOD MISMATCH] {slug}: base_period='{base_period}' does not match --quarter {args.quarter} (expected {expected_ym}-*)"
             )
+        prev_period = str(d.get("previous_period") or "").strip()
+        if not prev_period:
+            errors.append(
+                f"[PREVIOUS PERIOD MISMATCH] {slug}: missing required 'previous_period'"
+            )
+        elif exp_prev_short_q:
+            actual_prev_q = mod._quarter_label(prev_period)
+            if actual_prev_q != exp_prev_short_q:
+                errors.append(
+                    f"[PREVIOUS PERIOD MISMATCH] {slug}: previous_period='{prev_period}' ({actual_prev_q}) "
+                    f"!= expected '{exp_prev_short_q}'"
+                )
 
         merged_with = d.get("merged_with")
-        valid_merge_ciks: set[str] = set()
+        valid_merge_ciks: list[str] = []
         if isinstance(merged_with, list):
             for mw in merged_with:
                 if not isinstance(mw, dict) or int(mw.get("rows") or 0) <= 0:
@@ -202,29 +247,61 @@ def main() -> int:
                 else:
                     mcik = _resolve_merge_cik(mw.get("institution", ""))
                     if mcik:
-                        valid_merge_ciks.add(mcik)
+                        valid_merge_ciks.append(mcik)
+                    mw_base = str(mw.get("base_period") or "").strip()
+                    if not mw_base or mw_base != base_period:
+                        errors.append(
+                            f"[HILLHOUSE MERGE] {slug}: merged entity base_period='{mw_base}' != '{base_period}'"
+                        )
+                    mw_prev = str(mw.get("previous_period") or "").strip()
+                    if not mw_prev or (prev_period and mw_prev != prev_period):
+                        errors.append(
+                            f"[HILLHOUSE MERGE] {slug}: merged entity previous_period='{mw_prev}' != '{prev_period}'"
+                        )
+        raw_cik_str = str(d.get("cik") or "").strip()
+        raw_inst_str = str(d.get("institution") or "").strip()
+        cik_val = _resolve_merge_cik(raw_cik_str) if raw_cik_str else ""
+        inst_is_explicit = raw_inst_str.lower() in inst_map_lower or bool(
+            re.fullmatch(r"(?:CIK\s*)?0*\d+", raw_inst_str, flags=re.IGNORECASE)
+        )
+        inst_cik = _resolve_merge_cik(raw_inst_str) if inst_is_explicit else ""
+        primary_cik = cik_val or inst_cik
+        exp_cik = expected_cik_by_slug.get(slug, "")
+        grp_meta = group_by_slug.get(slug, {})
+        allowed_primary = {
+            slug.lower(),
+            slug.replace("_", " ").lower(),
+            *(str(n).strip().lower() for n in (grp_meta.get("primary_names") or []) if str(n).strip()),
+            *([] if grp_meta.get("merge_with") else [str(grp_meta.get("display_name") or "").strip().lower()]),
+        }
+        bad_primary_name = bool(raw_inst_str and not inst_is_explicit and raw_inst_str.lower() not in allowed_primary)
+
         if slug == "hillhouse":
-            raw_cik_str = str(d.get("cik") or "").strip()
-            raw_inst_str = str(d.get("institution") or "").strip()
-            cik_val = _resolve_merge_cik(raw_cik_str) if raw_cik_str else ""
-            inst_is_explicit = raw_inst_str.lower() in inst_map or bool(
-                re.fullmatch(r"(?:CIK\s*)?0*\d+", raw_inst_str, flags=re.IGNORECASE)
-            )
-            inst_cik = _resolve_merge_cik(raw_inst_str) if inst_is_explicit else ""
-            primary_cik = cik_val or inst_cik
-            if not hillhouse_cik or primary_cik != hillhouse_cik or (inst_cik and inst_cik != hillhouse_cik):
+            if not hillhouse_cik or primary_cik != hillhouse_cik or (inst_cik and inst_cik != hillhouse_cik) or bad_primary_name:
                 errors.append(
-                    f"[HILLHOUSE MERGE] Hillhouse primary CIK mismatch: expected '{hillhouse_cik}', "
+                    f"[HILLHOUSE MERGE] Hillhouse primary CIK/name mismatch: expected '{hillhouse_cik}', "
                     f"got cik='{d.get('cik')}' institution='{d.get('institution')}'"
                 )
             if not isinstance(merged_with, list) or not merged_with:
                 errors.append("[HILLHOUSE MERGE] Hillhouse missing Evergreen merged_with metadata")
-            elif expected_hillhouse_merges and (
-                len(merged_with) != len(expected_hillhouse_merges) or valid_merge_ciks != expected_hillhouse_merges
-            ):
+            elif len(valid_merge_ciks) != len(set(valid_merge_ciks)):
+                errors.append(
+                    f"[HILLHOUSE MERGE] Duplicate merged_with CIK entries in Hillhouse: {valid_merge_ciks}"
+                )
+            elif expected_hillhouse_merges and sorted(valid_merge_ciks) != sorted(expected_hillhouse_merges):
                 errors.append(
                     f"[HILLHOUSE MERGE] Hillhouse merged_with must be exactly {sorted(expected_hillhouse_merges)} "
-                    f"(got count={len(merged_with)}, valid_ciks={sorted(valid_merge_ciks)})"
+                    f"(got {valid_merge_ciks})"
+                )
+        else:
+            if (exp_cik and (primary_cik != exp_cik or (inst_cik and inst_cik != exp_cik))) or bad_primary_name:
+                errors.append(
+                    f"[INSTITUTION CIK MISMATCH] {slug}: expected CIK '{exp_cik}', "
+                    f"got cik='{d.get('cik')}' institution='{d.get('institution')}'"
+                )
+            if merged_with:
+                errors.append(
+                    f"[UNEXPECTED MERGE] {slug}: merged_with must be empty (got {merged_with})"
                 )
 
         # Check rendered category bullets for bad names & split NEW+CLOSED anomalies
@@ -422,6 +499,59 @@ def main() -> int:
                 f"  - {t}: issuer='{info['issuer']}' cur_cat='{info['current_cat']}' "
                 f"cur_name='{info['current_name']}' max=${info['max_val_m']:.1f}M funds={sorted(info['funds'])}{yf_str}"
             )
+
+    if args.report_file:
+        rpt_path = Path(args.report_file)
+        if not rpt_path.is_file():
+            errors.append(f"[MISSING REPORT FILE] {rpt_path}")
+        else:
+            rpt_text = rpt_path.read_text(encoding="utf-8")
+            required_headings = [
+                "# 13F Tracker_",
+                "## 核心结论与跨机构动向",
+                "## 持仓变化中的新线索",
+                "## China Book 机构（8 组 / 9 申报主体）",
+                "## US Growth 机构（9 组）",
+                "## Value 机构（1 组）",
+            ]
+            for h in required_headings:
+                if h not in rpt_text:
+                    errors.append(f"[REPORT STRUCTURE] Missing required heading '{h}'")
+            for idx, _slug in EXPECTED_GROUPS:
+                if f"### {idx}. " not in rpt_text:
+                    errors.append(f"[REPORT STRUCTURE] Missing group heading '### {idx}. '")
+            if re.search(r"\\[_.\+\-&()]", rpt_text):
+                errors.append("[MARKDOWN ESCAPE] Found escaped punctuation (\\_, \\., \\+, etc.) in report")
+            if "10000万美元" in rpt_text:
+                errors.append("[UNIT FORMAT] Found '10000万美元' instead of '1.0亿美元'")
+            if expected_ym is not None:
+                exp_short_q, exp_full_q, exp_prev_short_q, _ym = mod._parse_quarter_tag(args.quarter)
+                title_matches = re.findall(r"^#\s*13F\s+Tracker_(\d{2,4}[Qq][1-4])\b", rpt_text, flags=re.MULTILINE)
+                if not title_matches:
+                    errors.append(f"[REPORT QUARTER MISMATCH] Missing '# 13F Tracker_{exp_full_q}' title")
+                else:
+                    for tq in title_matches:
+                        _, t_full_q, _, _ = mod._parse_quarter_tag(tq)
+                        if t_full_q != exp_full_q:
+                            errors.append(
+                                f"[REPORT QUARTER MISMATCH] Title quarter '{tq}' ({t_full_q}) != expected '{exp_full_q}'"
+                            )
+                detail_pairs = re.findall(
+                    r"^###\s+\d+\.\s+.+?\s+(\d{2,4}[Qq][1-4])\s+vs\s+(\d{2,4}[Qq][1-4])\b",
+                    rpt_text,
+                    flags=re.MULTILINE,
+                )
+                if len(detail_pairs) != len(EXPECTED_GROUPS):
+                    errors.append(
+                        f"[REPORT QUARTER MISMATCH] Expected {len(EXPECTED_GROUPS)} group quarter headings "
+                        f"'{exp_short_q} vs {exp_prev_short_q}', found {len(detail_pairs)}"
+                    )
+                for cur_q, prev_q in detail_pairs:
+                    if cur_q.upper() != exp_short_q or prev_q.upper() != exp_prev_short_q:
+                        errors.append(
+                            f"[REPORT QUARTER MISMATCH] Detail heading '{cur_q} vs {prev_q}' "
+                            f"!= expected '{exp_short_q} vs {exp_prev_short_q}'"
+                        )
 
     print(f"=== 13F QUALITY GATE SUMMARY ({data_dir}) ===")
     print(f"Base period(s): {sorted(periods_seen)}")
