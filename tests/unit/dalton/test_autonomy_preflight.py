@@ -4800,6 +4800,7 @@ async def test_decide_recovery_skips_probes_that_would_timeout(
         "resolved_at": None,
         "expired_at": None,
     }
+    _install_company_preflight_doubles(monkeypatch)
     list_claimed_mock = create_autospec(_REAL_LIST_SIGNALS_CLAIMED_BY, return_value=[claimed_row])
     monkeypatch.setattr(watch_db, "list_signals_claimed_by", list_claimed_mock)
     monkeypatch.setattr(
@@ -4809,11 +4810,13 @@ async def test_decide_recovery_skips_probes_that_would_timeout(
     )
     insert_mock = create_autospec(_REAL_INSERT_PREFLIGHT_LOG, return_value={})
     monkeypatch.setattr(watch_db, "insert_preflight_log", insert_mock)
-    preflight_check_mock = create_autospec(
-        preflight_mod.preflight_check,
+    # Recovery runs inside preflight_check right after ownership is verified; the
+    # steps after it (coverage sync, probes) would time out here.
+    later_step_mock = create_autospec(
+        preflight_mod._sync_home_coverage_for_preflight,
         side_effect=asyncio.TimeoutError("probe phase timed out"),
     )
-    monkeypatch.setattr(preflight_mod, "preflight_check", preflight_check_mock)
+    monkeypatch.setattr(preflight_mod, "_sync_home_coverage_for_preflight", later_step_mock)
 
     res = await preflight_mod.decide(_company_watch_automation(), exec_1)
     assert res is not None
@@ -4822,7 +4825,7 @@ async def test_decide_recovery_skips_probes_that_would_timeout(
     assert [s["signal_key"] for s in res.signals] == ["sec:8k:item202"]
     assert "sec:8k:item202" in (res.wake_context or "")
     list_claimed_mock.assert_awaited_once_with(exec_1, _PREFLIGHT_WS)
-    preflight_check_mock.assert_not_awaited()
+    later_step_mock.assert_not_awaited()
     insert_mock.assert_awaited_once()
     assert insert_mock.await_args.kwargs["decision"] == "wake"
 

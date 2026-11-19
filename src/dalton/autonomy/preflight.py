@@ -2126,6 +2126,14 @@ async def preflight_check(
             wake_context=None,
         )
 
+    # DALTON-HOOK(preflight): once ownership is verified and before any probe,
+    # triage or timeout, reuse this execution's own claimed signals whose wake log
+    # was lost (a restart between claim and log), instead of re-triaging them.
+    if execution_id:
+        recovered = await _recover_claimed_wake(automation, execution_id)
+        if recovered is not None:
+            return recovered
+
     ticker = _extract_ticker(automation)
     precomputed_group_refresh_summary: Optional[str] = None
     home_synced_in_outer = False
@@ -2333,6 +2341,19 @@ PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 30.0
 PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = 26.0
 
 
+class RecoveryLookupFailed(RuntimeError):
+    """The lookup of this execution's own claimed signals kept failing.
+
+    Not swallowed by ``decide()``: a fail-closed skip would settle the execution
+    as skipped and strand the signals it already claimed, so the executor must
+    record a failure instead.
+    """
+
+
+_RECOVERY_LOOKUP_TRIES = 3
+_RECOVERY_LOOKUP_BACKOFF_S = 0.5
+
+
 async def _recover_claimed_wake(
     automation: dict[str, Any],
     execution_id: str,
@@ -2346,11 +2367,20 @@ async def _recover_claimed_wake(
     raw_ws_id = str(automation.get("workspace_id") or "").strip()
     if not raw_ws_id or not execution_id:
         return None
-    try:
-        claimed_rows = await watch_db.list_signals_claimed_by(execution_id, raw_ws_id)
-    except Exception as e:
-        logger.warning("[DALTON_PREFLIGHT] recovery lookup failed: %s", e)
-        return None
+    # A failed lookup is not an empty one: falling through to a normal preflight
+    # would exclude this execution's own claims and settle it as skipped. Retry a
+    # transient error, then raise so the execution fails visibly instead.
+    claimed_rows: list[dict[str, Any]] = []
+    for attempt in range(_RECOVERY_LOOKUP_TRIES):
+        try:
+            claimed_rows = await watch_db.list_signals_claimed_by(execution_id, raw_ws_id)
+            break
+        except Exception as e:
+            if attempt == _RECOVERY_LOOKUP_TRIES - 1:
+                logger.error("[DALTON_PREFLIGHT] recovery lookup failed after %d tries: %s", _RECOVERY_LOOKUP_TRIES, e)
+                raise RecoveryLookupFailed(str(e)) from e
+            logger.warning("[DALTON_PREFLIGHT] recovery lookup failed (try %d): %s", attempt + 1, e)
+            await asyncio.sleep(_RECOVERY_LOOKUP_BACKOFF_S * (attempt + 1))
     if not claimed_rows:
         return None
     recovered_signals: list[dict[str, Any]] = []
@@ -2365,16 +2395,7 @@ async def _recover_claimed_wake(
         ticker=_extract_ticker(automation),
         signals=recovered_signals,
     )
-    try:
-        if await watch_db.get_preflight_wake_context(execution_id) is None:
-            await _log_wake_result(
-                automation_id=str(automation.get("automation_id") or "") or None,
-                execution_id=execution_id,
-                workspace_id=raw_ws_id,
-                result=res,
-            )
-    except Exception as e:
-        logger.warning("[DALTON_PREFLIGHT] 恢复唤醒日志补记失败: %s", e)
+    # decide() backfills the wake log for every waking result on its way out.
     return res
 
 
@@ -2403,11 +2424,6 @@ async def decide(
                 reason="missing_user_id",
                 signals=[],
             )
-        # DALTON-HOOK(preflight): check before any probe, triage, or timeout whether
-        # this execution already claimed active signals whose wake log was lost.
-        recovered = await _recover_claimed_wake(automation, execution_id)
-        if recovered is not None:
-            return recovered
         try:
             from src.dalton.notify.dispatch import retry_failed_notify_deliveries
 
@@ -2455,6 +2471,8 @@ async def decide(
             except Exception as e:
                 logger.warning("[DALTON_PREFLIGHT] 唤醒上下文补记失败: %s", e)
         return res
+    except RecoveryLookupFailed:
+        raise
     except Exception as e:
         logger.warning("[DALTON_PREFLIGHT] decide() unexpected error (skipping fail-closed): %s", e)
         return PreflightResult(
