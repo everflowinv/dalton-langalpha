@@ -2932,6 +2932,55 @@ def test_config_and_data_var_excludes_match_env_example() -> None:
     assert m_data_sh.group(1) == m_data_ex.group(1)
     assert m_data_sh.group(1) == ",".join(backup_lib.DEFAULT_DATA_VAR_EXCLUDES)
 
+    m_minio_sh = re.search(
+        r'^MINIO_EXCLUDES="\$\{DALTON_MINIO_EXCLUDES:-([^"]+)\}"',
+        data_sh,
+        re.MULTILINE,
+    )
+    m_minio_ex = re.search(
+        r'^DALTON_MINIO_EXCLUDES="([^"]+)"',
+        env_ex,
+        re.MULTILINE,
+    )
+    assert m_minio_sh is not None
+    assert m_minio_ex is not None
+    assert m_minio_sh.group(1) == m_minio_ex.group(1)
+    assert m_minio_sh.group(1) == ",".join(backup_lib.DEFAULT_MINIO_EXCLUDES)
+
+
+def test_minio_excludes_drop_edgar_cache_prefix(tmp_path: Path) -> None:
+    """Weekly MinIO backup tar command excludes rebuildable edgar/ SEC cache objects."""
+    import tarfile
+
+    minio_root = tmp_path / "minio_data"
+    keep_paths = (
+        "langalpha/blobs/u1/abc123",
+        "langalpha/chat-uploads/u1/file.pdf",
+        "langalpha/edgar-notes/keep.txt",
+    )
+    drop_paths = (
+        "langalpha/edgar/sections/0001.gz",
+        "langalpha/prod/edgar/documents/0002.gz",
+        ".minio.sys/buckets/langalpha/edgar/xl.meta",
+    )
+    for rel in (*keep_paths, *drop_paths):
+        p = minio_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"data:{rel}\n", encoding="utf-8")
+
+    cmd = backup_lib.build_minio_tar_cmd(data_dir=str(minio_root))
+    assert cmd[:6] == ["tar", "--exclude", "*/edgar", "--exclude", "*/edgar/*", "-czf"]
+    proc = subprocess.run(
+        cmd,
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
+        capture_output=True,
+        check=True,
+    )
+    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:gz") as tf:
+        archived = {m.name.removeprefix("./") for m in tf.getmembers() if m.isfile()}
+    assert archived == set(keep_paths)
+    assert archived.isdisjoint(drop_paths)
+
 
 def test_ops_shell_scripts_bash_syntax() -> None:
     """All shell scripts in scripts/dalton/ops pass `bash -n` syntax validation."""

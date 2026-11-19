@@ -180,3 +180,67 @@ def test_single_computer_agent_has_no_copy_file_tool(role: str) -> None:
     assert "CopyFile" not in tool_names
     if role == "chief_of_staff":
         assert "manage_workspaces" in tool_names
+
+
+def test_single_computer_roster_gives_no_copy_file_via_turn_computers() -> None:
+    """turn_computers returns None for a 1-computer roster, so CoS has no CopyFile."""
+    from ptc_agent.core.session import Session
+    from src.server.services.computer_reach import turn_computers
+
+    session = create_autospec(Session, instance=True)
+    reach = turn_computers(
+        "u-1",
+        "c-1",
+        session,
+        [{"computer_id": "c-1", "name": "Docker", "kind": "docker"}],
+    )
+    assert reach is None
+
+    built: list[dict] = []
+
+    def _capture(model, **kw):
+        built.append(kw)
+        fake_graph = create_autospec(GenericFakeChatModel, instance=True)
+        fake_graph.with_config = lambda *_a, **_kw: fake_graph
+        return fake_graph
+
+    config = AgentConfig(
+        llm=LLMConfig(name="gpt-6.2-sol"),
+        security=SecurityConfig(),
+        logging=LoggingConfig(),
+        sandbox=SandboxConfig(daytona=DaytonaConfig(api_key="test")),
+        mcp=MCPConfig(),
+        filesystem=FilesystemConfig(),
+    )
+    client = GenericFakeChatModel(messages=iter([]))
+    compaction_llm = GenericFakeChatModel(messages=iter([]))
+    sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.config = config
+    sandbox.livefs = None
+    sandbox.workspace.return_value = SandboxLayout("/home/workspace").for_workspace("ws")
+    mcp_registry = create_autospec(MCPRegistry, instance=True)
+    mcp_registry.get_all_tools.return_value = {}
+    mcp_registry.server_configs = {}
+
+    with (
+        patch.object(AgentConfig, "get_llm_client", return_value=client),
+        patch(
+            "ptc_agent.agent.middleware.compaction.compact.create_llm",
+            return_value=compaction_llm,
+        ),
+        patch("ptc_agent.agent.agent.create_agent", side_effect=_capture),
+    ):
+        PTCAgent(config).create_agent(
+            llm=client,
+            thread_id="t-single-roster",
+            sandbox=sandbox,
+            mcp_registry=mcp_registry,
+            user_id="u-1",
+            tool_summary="",
+            role="chief_of_staff",
+            computers=reach,
+        )
+
+    tool_names = {t.name for t in built[0]["tools"]}
+    assert "CopyFile" not in tool_names
+    assert "manage_workspaces" in tool_names

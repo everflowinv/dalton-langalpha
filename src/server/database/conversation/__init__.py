@@ -38,7 +38,6 @@ from src.server.database.conversation.threads_read import (
     user_has_threads_in_workspace,
 )
 from src.server.database.conversation.threads_write import (
-    calculate_next_thread_index,
     create_thread,
     delete_thread,
     delete_unused_thread,
@@ -81,7 +80,6 @@ from src.server.database.conversation.replay_rows import (
 # Legacy façade: symbols extracted into submodules stay importable from the
 # package root. New code should import the owning submodule directly.
 __all__ = [
-    "calculate_next_thread_index",
     "create_query",
     "create_thread",
     "create_usage_record",

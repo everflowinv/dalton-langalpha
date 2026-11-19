@@ -38,6 +38,8 @@ COPY pyproject.toml uv.lock README.md ./
 COPY libs/market-protocol/ libs/market-protocol/
 # sync5: libs/chartkit is a path dependency in pyproject.toml, so uv sync needs it here.
 COPY libs/chartkit/ libs/chartkit/
+# sync6: libs/edgar-engine is a path dependency in pyproject.toml, so uv sync needs it here.
+COPY libs/edgar-engine/ libs/edgar-engine/
 
 ARG INSTALL_OBSERVABILITY=false
 ARG UV_CONCURRENT_DOWNLOADS=4
@@ -97,7 +99,7 @@ RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
     && printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha \
     && printf '%s\n' "$BUILD_GIT_DIRTY" > /app/.build_git_dirty \
     && find server.py config.yaml config.dalton.yaml agent_config.yaml agent_config.dalton.yaml alembic.ini \
-            config/dalton libs/market-protocol libs/chartkit src scripts migrations mcp_servers plugins workflows \
+            config/dalton libs/market-protocol libs/chartkit libs/edgar-engine src scripts migrations mcp_servers plugins workflows \
             -type f ! -path 'libs/chartkit/chartkit/render/*' ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -path '*/.ruff_cache/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print0 \
        | sort -z \
        | xargs -0 sha256sum > /app/.build_files.sha256

@@ -366,8 +366,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     reportBackOwed,
     reportBackOwedThreads,
     reportBackOwedKinds,
-    workspaceStarting,
-    turnHeld,
+    turnStatus,
     isCompacting,
     setIsCompacting,
     compactionTokens,
@@ -533,10 +532,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // warming signal (the /events stream, which sees the start even when a
   // background warm owns it). 'archived' from either source wins so the slow-
   // restore copy survives a plain 'starting' from the other.
-  const displayWorkspaceStarting = mergeWarmingDisplay(
-    workspaceStarting,
-    warmingState,
-  );
+  const displayTurnStatus = {
+    ...turnStatus,
+    workspaceStarting: mergeWarmingDisplay(turnStatus.workspaceStarting, warmingState),
+  };
 
   const chatPlaceholder = useMemo(() => {
     if (wasStopped && !isLoading && !pendingInterrupt)
@@ -1812,8 +1811,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           modelStatus={modelStatus}
                           isLoading={isLoading}
                           retired={threadModel.retired}
-                          workspaceStarting={displayWorkspaceStarting}
-                          turnHeld={turnHeld}
+                          turnStatus={displayTurnStatus}
                           model={threadModel.model}
                           isCompacting={isCompacting}
                           compactionTokens={compactionTokens}

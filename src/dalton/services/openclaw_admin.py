@@ -35,6 +35,7 @@ DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
     "config/dalton",
     "libs/market-protocol",
     "libs/chartkit",
+    "libs/edgar-engine",
     "src",
     "scripts",
     "migrations",

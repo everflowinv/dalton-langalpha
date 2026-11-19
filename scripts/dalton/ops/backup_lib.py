@@ -148,6 +148,14 @@ DEFAULT_DATA_VAR_EXCLUDES = (
     ".dalton-outbox-*",
 )
 
+# Reconstructible object-storage caches under MinIO /data (SEC EDGAR filings
+# under <bucket>/edgar/ or <bucket>/<STORAGE_KEY_PREFIX>/edgar/). Emitted as
+# plain fnmatch globs for Alpine BusyBox tar inside the helper container.
+DEFAULT_MINIO_EXCLUDES = (
+    "*/edgar",
+    "*/edgar/*",
+)
+
 SQLITE_FILE_HEADER = b"SQLite format 3\x00"
 
 
@@ -433,6 +441,37 @@ def build_tar_exclude_args(
         tar_pat = f"^./{clean}" if "/" in clean else clean
         args.extend(["--exclude", tar_pat])
     return args
+
+
+def build_minio_tar_exclude_args(
+    excludes: str | Iterable[str] | None = None,
+) -> list[str]:
+    """Build ``--exclude <pattern>`` flags for BusyBox ``tar`` on MinIO ``/data``."""
+    raw = DEFAULT_MINIO_EXCLUDES if excludes is None else excludes
+    args: list[str] = []
+    for raw_pat in parse_pattern_list(raw):
+        clean = _normalize_rel_path(raw_pat)
+        if not clean:
+            continue
+        args.extend(["--exclude", clean])
+    return args
+
+
+def build_minio_tar_cmd(
+    data_dir: str = "/data",
+    excludes: str | Iterable[str] | None = None,
+) -> list[str]:
+    """Build the streaming ``tar`` command for MinIO ``/data`` inside the helper container."""
+    exclude_args = build_minio_tar_exclude_args(excludes)
+    return [
+        "tar",
+        *exclude_args,
+        "-czf",
+        "-",
+        "-C",
+        data_dir,
+        ".",
+    ]
 
 
 def _escape_posix_bre(text: str) -> str:
@@ -1723,6 +1762,14 @@ def _cmd_var_dalton_tar_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_minio_tar_cmd(args: argparse.Namespace) -> int:
+    excludes: str | None = None if args.excludes is None else args.excludes
+    cmd = build_minio_tar_cmd(data_dir=args.data_dir, excludes=excludes)
+    sys.stdout.buffer.write(b"\0".join(tok.encode("utf-8") for tok in cmd) + b"\0")
+    sys.stdout.buffer.flush()
+    return 0
+
+
 def _cmd_should_retry_tar(args: argparse.Namespace) -> int:
     try:
         ok = should_retry_tar_failure(
@@ -1860,6 +1907,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_vt.add_argument("--sqlite-path", action="append", default=[])
     p_vt.add_argument("--staging-dir", default="")
     p_vt.set_defaults(func=_cmd_var_dalton_tar_cmd)
+
+    p_mt = sub.add_parser("minio-tar-cmd")
+    p_mt.add_argument("--data-dir", default="/data")
+    p_mt.add_argument("--excludes", default=None)
+    p_mt.set_defaults(func=_cmd_minio_tar_cmd)
 
     p_rt = sub.add_parser("should-retry-tar")
     p_rt.add_argument("--attempt", type=int, required=True)

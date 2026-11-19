@@ -23,4 +23,5 @@ def test_manifest_roots_match_watched_paths():
 def test_chartkit_is_watched_and_image_only_render_page_excluded():
     text = (ROOT / "scripts/dalton/Dockerfile.dalton").read_text(encoding="utf-8")
     assert "libs/chartkit" in DOCKER_MANIFEST_WATCHED_PATHS
+    assert "libs/edgar-engine" in DOCKER_MANIFEST_WATCHED_PATHS
     assert "! -path 'libs/chartkit/chartkit/render/*'" in text
