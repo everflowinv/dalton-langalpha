@@ -553,9 +553,15 @@ def build_universe(
 
 
 class HistBars(list):
-    """Validated bars plus how many the upstream response held."""
+    """Validated bars from HIST_START on, plus the upstream window they came from.
+
+    ``raw_count`` is how many bars the response held and ``first_date`` the
+    earliest valid date in it, before HIST_START included: whether the window
+    rolled stored dates off is judged on the response, not on the kept bars.
+    """
 
     raw_count: int = 0
+    first_date: str | None = None
 
 
 class NoAdjustedHistory(RuntimeError):
@@ -601,6 +607,12 @@ def fetch_hist_one(
                 bad_rows += 1
                 continue
             seen_dates.add(d_str)
+            if out.first_date is None or d_str < out.first_date:
+                out.first_date = d_str
+            if d_str < HIST_START:
+                # Bars before HIST_START are never written; a bad one there
+                # must not sink the bars that are kept.
+                continue
             o, c, h, lo, vol = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
             if (
                 not math.isfinite(o)
@@ -610,10 +622,6 @@ def fetch_hist_one(
                 or not math.isfinite(lo)
                 or not math.isfinite(vol)
             ):
-                if d_str < HIST_START:
-                    # Bars before HIST_START are never written; a bad one there
-                    # must not sink the bars that are kept.
-                    continue
                 bad_rows += 1
                 continue
             rec: list[Any] = [d_str, o, c, h, lo, vol]
@@ -711,7 +719,7 @@ def download_history(
                     # overlap what is stored. Sessions after the last stored bar
                     # are not checked per stock: a suspended stock has none, so
                     # target-date coverage is judged on the whole panel instead.
-                    window_start = min(new_dates)
+                    window_start = getattr(rows, "first_date", None) or min(new_dates)
                     if window_start > max(prev_dates):
                         raise RuntimeError(f"历史响应与已有记录不重叠 ({code})")
                     raw_count = getattr(rows, "raw_count", len(rows))
@@ -722,12 +730,13 @@ def download_history(
                         raise RuntimeError(
                             f"历史响应丢失原有日期 ({code}: 缺失 {len(missing_old)} 天)"
                         )
-                if new_dates and getattr(rows, "raw_count", len(rows)) >= HIST_BARS and min(new_dates) > HIST_START:
+                first = getattr(rows, "first_date", None) or (min(new_dates) if new_dates else None)
+                if first and getattr(rows, "raw_count", len(rows)) >= HIST_BARS and first > HIST_START:
                     # Only a full window that no longer reaches HIST_START needs
                     # attention; a short history is just a later listing.
                     logger.warning(
                         "hk_momentum history window starts %s, after HIST_START %s (%s)",
-                        min(new_dates), HIST_START, code,
+                        first, HIST_START, code,
                     )
                 buf = io.StringIO()
                 w = csv.writer(buf)

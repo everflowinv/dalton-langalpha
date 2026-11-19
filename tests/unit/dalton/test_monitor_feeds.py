@@ -2085,6 +2085,7 @@ def test_hk_history_ignores_bad_bars_before_hist_start():
     class _Resp:
         def json(self):
             return {"data": {"hk00700": {"qfqday": [
+                ["2022-01-04", "", None, "", "", "1"],  # before HIST_START, not numeric
                 ["2022-01-05", "-1", "-1", "-1", "-1", "1"],  # before HIST_START, negative
                 ["2026-11-18", "2", "2", "2", "2", "1"],
                 ["2026-11-19", "2", "2", "2", "2", "1"],
@@ -2094,4 +2095,35 @@ def test_hk_history_ignores_bad_bars_before_hist_start():
     sess.get.return_value = _Resp()
     rows = hkf.fetch_hist_one(sess, "00700")
     assert [r[0] for r in rows] == ["2026-11-18", "2026-11-19"]
-    assert rows.raw_count == 3
+    assert rows.raw_count == 4
+    assert rows.first_date == "2022-01-04"
+
+
+def test_hk_history_full_window_with_bad_pre_start_bars_still_owes_kept_dates(tmp_path, monkeypatch):
+    """The window start comes from the whole response, so dropping bad bars
+    before HIST_START cannot hide a stored date missing at the window's edge."""
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    hist = tmp_path / "hist"
+    hist.mkdir(parents=True)
+    (hist / "00700.csv").write_text(
+        "date,open,close,high,low,volume,turnover_wan\n2023-06-01,1,1,1,1,1,0\n2023-06-02,1,1,1,1,1,0\n",
+        encoding="utf-8",
+    )
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk00700": {"qfqday": [
+                ["2023-05-30", "-1", "-1", "-1", "-1", "1"],
+                ["2023-05-31", "-1", "-1", "-1", "-1", "1"],
+                ["2023-06-02", "2", "2", "2", "2", "1"],
+                ["2023-06-05", "2", "2", "2", "2", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    monkeypatch.setattr(hkf, "HIST_BARS", 4)  # the response is a full window
+    monkeypatch.setattr(hkf.time, "sleep", lambda *_: None)
+    res = hkf.download_history(["00700"], state_dir=tmp_path, target_date="2023-06-05", session=sess)
+    assert res["n_errors"] == 1
+    assert "2023-06-01" in (hist / "00700.csv").read_text(encoding="utf-8")
