@@ -163,12 +163,8 @@ def test_merged_catalogue_registers_both_routes_without_touching_upstream():
     assert find_model_pricing(MODEL_ID, provider="anthropic") == OFFICIAL_PRICING
     assert find_model_pricing(MODEL_ID, provider="claude-oauth") == OFFICIAL_PRICING
 
-    previous = find_model_pricing("claude-fable-5-1", provider="anthropic")
-    assert previous["input"] == 10.0
-    assert previous["cached_input"] == 0.25
-    assert previous["cache_5m"] == 12.5
-    assert previous["cache_1h"] == 20.0
-    assert previous["output"] == 50.0
+    # Upstream 37055a844 removed the previously retired claude-fable-5-1 card on the next retirement cycle.
+    assert find_model_pricing("claude-fable-5-1", provider="anthropic") is None
 
 
 def test_shipped_defaults_and_protected_files_do_not_name_fable_52():
