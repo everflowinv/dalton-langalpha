@@ -291,6 +291,13 @@ def _pin(
     a fallback answering for Claude, whose thinking is still bound to the pin.
     """
     from ptc_agent.agent.middleware.compaction.measure import is_claude
+    from ptc_agent.agent.middleware.model_resilience import is_fallback_call  # DALTON-HOOK(model-fallback-identity)
+
+    # DALTON-HOOK(model-fallback-identity): a single-call fallback carries its
+    # own fallback note in system_message; never restore an old pin over it or
+    # persist the fallback note into STATE_SYSTEM_PIN.
+    if is_fallback_call():
+        return None, None, None
 
     built =request.system_message
     if built is None or not is_claude(request.model):

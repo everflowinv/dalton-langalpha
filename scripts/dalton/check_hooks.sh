@@ -421,6 +421,10 @@ ALLOWED_HOOKS=(
   # Codex client version comes from src/dalton/settings.py (newer than the manifest's)
   # so the ChatGPT subscription lists new models (GPT-6.2 needs >= 0.170.0).
   "codex-client-version"
+  # Single-call resilience fallback attaches a request-only identity note so the
+  # fallback model knows which model this call runs on and which designated model
+  # in the frozen <model> baseline it stands in for (main agent and subagent).
+  "model-fallback-identity"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

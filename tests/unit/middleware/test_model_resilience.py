@@ -1619,3 +1619,202 @@ class TestDroppedThinkingReport:
             await mw.awrap_model_call(_FakeRequest(client), handler)
 
         assert not [e for e in logs if "dropped" in e["event"]]
+
+
+# --- DALTON-HOOK(model-fallback-identity): begin ---
+class TestFallbackIdentity:
+    """A single-call fallback tells the fallback model which model it is and
+    which server-designated model in ``<model>`` it stands in for, on both the
+    main agent and subagent paths."""
+
+    @staticmethod
+    def _system_text(req) -> str:
+        msg = req.system_message
+        if msg is None:
+            return ""
+        if isinstance(msg.content, str):
+            return msg.content
+        return "\n".join(
+            b["text"] if isinstance(b, dict) else str(b) for b in msg.content
+        )
+
+    @pytest.mark.asyncio
+    async def test_main_agent_fallback_request_names_fallback_and_primary_model(
+        self, events, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from langchain.agents.middleware.types import ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
+            STATE_SYSTEM_PIN,
+            SystemPinMiddleware,
+        )
+
+        manifest = {
+            "claude-primary": {"display_name": "Claude Primary"},
+            "claude-fallback": {"display_name": "Claude Fallback"},
+        }
+        monkeypatch.setattr(
+            "src.llms.llm.LLM.get_model_config",
+            lambda: SimpleNamespace(get_model_config=manifest.get),
+        )
+        monkeypatch.setattr(
+            "ptc_agent.agent.middleware.compaction.measure.is_claude",
+            lambda model: True,
+        )
+
+        primary = _FakeModel("claude-primary")
+        primary.metadata = {"manifest_model": "claude-primary", "reasoning_effort": "high"}
+        fallback = _FakeModel("claude-fallback")
+        fallback.metadata = {"manifest_model": "claude-fallback"}
+
+        mw = ModelResilienceMiddleware(
+            primary_name="claude-primary",
+            primary_client=primary,
+            fallbacks=[("claude-fallback", fallback)],
+            max_retries=0,
+            initial_delay=0.0,
+            jitter=False,
+        )
+        pin_mw = SystemPinMiddleware()
+        seen_texts: list[str] = []
+
+        async def terminal(req: ModelRequest) -> ModelResponse:
+            # Simulate BaselineContextMiddleware appending the frozen <model> block.
+            baseline_system = SystemMessage(
+                content=[
+                    *(req.system_message.content_blocks if req.system_message else []),
+                    {
+                        "type": "text",
+                        "text": (
+                            "\n\n<model>\nYou run on Claude Primary (claude-primary), "
+                            "reasoning effort high. This is the server-designated model "
+                            "for the thread.\n</model>"
+                        ),
+                    },
+                ]
+            )
+            seen_texts.append(self._system_text(req.override(system_message=baseline_system)))
+            if req.model is primary:
+                raise _status_error("overloaded", status=503)
+            return ModelResponse(result=[AIMessage("ok", id="a-fb")])
+
+        async def through_pin(req: ModelRequest):
+            return await pin_mw.awrap_model_call(req, terminal)
+
+        request = ModelRequest(
+            model=primary,
+            messages=[HumanMessage("what model are you?")],
+            system_message=SystemMessage(content="Base system prompt."),
+            state={
+                "messages": [],
+                STATE_SYSTEM_PIN: {
+                    "model": "claude-fallback",
+                    "content": "Stale pinned prompt without fallback note",
+                },
+            },
+        )
+        result = await mw.awrap_model_call(request, through_pin)
+
+        assert isinstance(result, ModelResponse)
+        assert len(seen_texts) == 2
+        assert "[Fallback call]" not in seen_texts[0]
+        assert (
+            "[Fallback call] This individual call was moved to fallback model "
+            "Claude Fallback (claude-fallback) (the server-designated model in "
+            "<model> is Claude Primary (claude-primary), reasoning effort high)."
+        ) in seen_texts[1]
+        assert "You run on Claude Primary (claude-primary)" in seen_texts[1]
+
+    @pytest.mark.asyncio
+    async def test_subagent_on_own_model_names_its_own_designated_model(
+        self, events, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from langchain.agents.middleware.types import ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        manifest = {
+            "main-model": {"display_name": "Main Model"},
+            "sub-model": {"display_name": "Sub Model"},
+            "spare-model": {"display_name": "Spare Model"},
+        }
+        monkeypatch.setattr(
+            "src.llms.llm.LLM.get_model_config",
+            lambda: SimpleNamespace(get_model_config=manifest.get),
+        )
+
+        main_client = _FakeModel("main-model")
+        sub_client = _FakeModel("sub-model")
+        sub_client.metadata = {"manifest_model": "sub-model", "reasoning_effort": "low"}
+        spare_client = _FakeModel("spare-model")
+        spare_client.metadata = {"manifest_model": "spare-model"}
+
+        mw = ModelResilienceMiddleware(
+            primary_name="main-model",
+            primary_client=main_client,
+            fallbacks=[("spare-model", spare_client)],
+            initial_delay=0.0,
+            jitter=False,
+        )
+        seen_texts: list[str] = []
+
+        async def handler(req: ModelRequest) -> ModelResponse:
+            seen_texts.append(self._system_text(req))
+            if req.model is sub_client:
+                raise _status_error("bad request", status=400)
+            return ModelResponse(result=[AIMessage("sub ok")])
+
+        request = ModelRequest(
+            model=sub_client,
+            messages=[HumanMessage("run subtask")],
+            system_message=SystemMessage(content="Subagent prompt."),
+        )
+        result = await mw.awrap_model_call(request, handler)
+
+        assert isinstance(result, ModelResponse)
+        assert len(seen_texts) == 2
+        assert "[Fallback call]" not in seen_texts[0]
+        assert (
+            "[Fallback call] This individual call was moved to fallback model "
+            "Spare Model (spare-model) (the server-designated model in "
+            "<model> is Sub Model (sub-model), reasoning effort low)."
+        ) in seen_texts[1]
+        assert "Main Model" not in seen_texts[1]
+
+    def test_sync_fallback_request_names_fallback_and_primary_model(self, events):
+        from langchain.agents.middleware.types import ModelRequest
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        primary = _FakeModel("primary-sync")
+        fallback = _FakeModel("fallback-sync")
+        mw = ModelResilienceMiddleware(
+            primary_name="primary-sync",
+            primary_client=primary,
+            fallbacks=[("fallback-sync", fallback)],
+            initial_delay=0.0,
+            jitter=False,
+        )
+        seen_texts: list[str] = []
+
+        def handler(req: ModelRequest) -> ModelResponse:
+            seen_texts.append(self._system_text(req))
+            if req.model is primary:
+                raise _status_error("bad request", status=400)
+            return ModelResponse(result=[AIMessage("ok")])
+
+        request = ModelRequest(
+            model=primary,
+            messages=[HumanMessage("hi")],
+            system_message=SystemMessage(content="Sync prompt."),
+        )
+        mw.wrap_model_call(request, handler)
+
+        assert len(seen_texts) == 2
+        assert "[Fallback call]" not in seen_texts[0]
+        assert "fallback model fallback-sync" in seen_texts[1]
+        assert "is primary-sync)." in seen_texts[1]
+# --- DALTON-HOOK(model-fallback-identity): end ---

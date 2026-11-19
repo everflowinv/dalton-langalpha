@@ -152,3 +152,10 @@ def test_the_proposal_names_the_question_tool_as_it_is_bound(shipped_skill_md):
     for arg in ("question", "options", "allow_multiple"):
         assert arg in tool.args, arg
         assert f"`{arg}`" in body, arg
+
+
+# DALTON-HOOK(computer-cli-tokens-off): onboarding directs to manage_workspaces instead of la CLI.
+def test_onboarding_uses_manage_workspaces_instead_of_la_cli(shipped_skill_md):
+    body = _body(shipped_skill_md)
+    assert 'manage_workspaces(action="create")' in body
+    assert "la workspaces create" not in body

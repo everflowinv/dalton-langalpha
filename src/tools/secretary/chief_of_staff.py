@@ -218,16 +218,24 @@ async def agent_output(
     from src.server.services.thread_output import extract_text_from_thread
 
     try:
-        result = await extract_text_from_thread(
+        output = await extract_text_from_thread(
             thread_id, turns, timezone=_timezone(configurable)
         )
     except Exception as e:
         logger.error(f"Failed to extract text from thread {thread_id}: {e}")
         return error_command("failed to retrieve thread output", tool_call_id)
 
+    # Upstream returns a ThreadOutput (None once the thread is deleted mid-read);
+    # the tool keeps its dict result: text, status, thread_id, workspace_id.
+    if output is None:
+        result = {"text": "", "status": "not_found", "thread_id": thread_id, "workspace_id": ""}
+    else:
+        result = {"thread_id": thread_id, **output._asdict()}
+        result["workspace_id"] = result["workspace_id"] or ""
+
     # A read of a thread mid-run is marked for the loop guard, which cannot
     # tell a poll from the text: a live run's text grows between reads.
-    running = result.get("status") == "running"
+    running = result["status"] == "running"
     return success_command(result, tool_call_id, pending_read() if running else None)
 
 

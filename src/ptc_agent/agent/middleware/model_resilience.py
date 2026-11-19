@@ -39,7 +39,7 @@ from langchain.agents.middleware.types import (
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.types import Command
 
-from ptc_agent.agent.middleware._utils import run_ids
+from ptc_agent.agent.middleware._utils import append_to_system_message, run_ids  # DALTON-HOOK(model-fallback-identity)
 from ptc_agent.agent.middleware.thinking_binding import (
     UNSENT_THINKING_KEY,
     UnsentThinkingState,
@@ -59,7 +59,7 @@ from src.llms.error_classification import (
 )
 from src.llms.provider_errors import is_terminal_refusal
 from src.llms.input_transformations import INPUT_TRANSFORMATIONS, REPEATED, thinking_drops
-from src.llms.model_identity import CATALOG_MODEL_KEY, api_model_id, catalog_model
+from src.llms.model_identity import CATALOG_MODEL_KEY, api_model_id, catalog_model, client_label  # DALTON-HOOK(model-fallback-identity)
 from src.llms.provider_compaction import is_compaction_request
 from src.llms.reasoning_payload import (
     is_unfinished_reply,
@@ -86,6 +86,13 @@ _ERROR_SUMMARY_MAX_CHARS = 300
 FALLBACK_KEY = "model_fallback"
 
 _as_sent: ContextVar[bool] = ContextVar("model_resilience_as_sent", default=False)
+# DALTON-HOOK(model-fallback-identity): tracks whether the active call is on a fallback candidate.
+_in_fallback: ContextVar[bool] = ContextVar("model_resilience_in_fallback", default=False)
+
+
+def is_fallback_call() -> bool:
+    """Whether the active model call is running on a fallback candidate."""
+    return _in_fallback.get()
 
 #: Drop reasons that follow the thread rather than an edit of ours: a model
 #: switch, or a thread moved between accounts.
@@ -379,6 +386,39 @@ class ModelResilienceMiddleware(AgentMiddleware):
             or api_model_id(request.model)
             or type(request.model).__name__
         )
+
+    def _with_fallback_identity(  # DALTON-HOOK(model-fallback-identity)
+        self,
+        req: ModelRequest,
+        original_request: ModelRequest,
+        fallback_name: str,
+        fallback_client: Any,
+    ) -> ModelRequest:
+        """Attach a request-only note on fallback calls so the model knows its
+        own identity and which designated model in the frozen ``<model>``
+        baseline it stands in for."""
+        if not hasattr(req, "system_message"):
+            return req
+        primary_label = (
+            client_label(original_request.model, self._catalog_name(original_request))
+            or self._primary_display_name(original_request)
+        )
+        fallback_label = (
+            client_label(fallback_client, fallback_name)
+            or fallback_name
+            or api_model_id(fallback_client)
+            or type(fallback_client).__name__
+        )
+        note = (
+            f"[Fallback call] This individual call was moved to fallback model "
+            f"{fallback_label} (the server-designated model in <model> is {primary_label})."
+        )
+        try:
+            return req.override(
+                system_message=append_to_system_message(req.system_message, note)
+            )
+        except TypeError:
+            return req
 
     def _calculate_delay(self, retry_number: int) -> float:
         # Local copy of langchain.agents.middleware._retry.calculate_delay
@@ -925,13 +965,20 @@ class ModelResilienceMiddleware(AgentMiddleware):
             if not self._worth_trying(request, candidates[index], refused_at):
                 continue
             req = request if client is None else request.override(model=client)
+            if index > 0:  # DALTON-HOOK(model-fallback-identity)
+                req = self._with_fallback_identity(req, request, name, req.model)
             attempts = 0
             escalated = False
             stripped: list[str] = []
             while True:
                 attempts += 1
                 try:
-                    response = handler(req)
+                    # DALTON-HOOK(model-fallback-identity)
+                    fb_token = _in_fallback.set(index > 0)
+                    try:
+                        response = handler(req)
+                    finally:
+                        _in_fallback.reset(fb_token)
                     _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
@@ -1016,6 +1063,8 @@ class ModelResilienceMiddleware(AgentMiddleware):
             current = self._current_client(base)
             if current is not base:
                 req = req.override(model=current)
+            if index > 0:  # DALTON-HOOK(model-fallback-identity)
+                req = self._with_fallback_identity(req, request, name, req.model)
             oauth_refreshed = False
             attempts = 0
             escalated = False
@@ -1023,7 +1072,12 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    response = await handler(req)
+                    # DALTON-HOOK(model-fallback-identity)
+                    fb_token = _in_fallback.set(index > 0)
+                    try:
+                        response = await handler(req)
+                    finally:
+                        _in_fallback.reset(fb_token)
                     _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
