@@ -906,7 +906,7 @@ tasks:
     no_output_timeout_seconds: 3600
     output_max_bytes: 100000
     cwd: "var/dalton/openclaw-data"
-    command: "bash skills/podcast-weekly-digest/scripts/run.sh --json pipeline --since-days 7 --video-model gemini-4-argon --text-backend dalton --text-model gemini-4-hydrogen-high-oauth"
+    command: "bash skills/podcast-weekly-digest/scripts/run.sh --json pipeline --since-days 7 --video-model gemini-4-neon --text-backend dalton --text-model gemini-4-hydrogen-high-oauth"
     command_argv:
       - "bash"
       - "skills/podcast-weekly-digest/scripts/run.sh"
@@ -915,7 +915,7 @@ tasks:
       - "--since-days"
       - "7"
       - "--video-model"
-      - "gemini-4-argon"
+      - "gemini-4-neon"
       - "--text-backend"
       - "dalton"
       - "--text-model"

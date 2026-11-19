@@ -1132,7 +1132,7 @@ def test_agent_config_refs_union_with_dalton_file_under_any_app_env(monkeypatch)
     refs = mr.agent_config_refs()
 
     # The dalton file's own background model arrived via the direct read …
-    assert "agent_config.llm.background" in refs.get("gemini-4-argon-low-oauth", [])
+    assert "agent_config.llm.background" in refs.get("gemini-4-neon-low-oauth", [])
     # … and the production-merged base config still contributes its llm.
     assert any("agent_config.llm.name" in labels for labels in refs.values())
 

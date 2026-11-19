@@ -8,13 +8,13 @@ llm:
   # chain included. Model credentials are team-shared (credentials.sharing: team, #66), so
   # the owner's *-oauth connections serve every member.
   name: "claude-opus-5-5-oauth"
-  background: "gemini-4-argon-low-oauth"
+  background: "gemini-4-neon-low-oauth"
   # Assist (auxiliary JSON task) model defaults live in src/dalton/dalton.yaml
   # under models.assist_model / models.assist_fallback_model (not here).
   compaction: ""
   fetch: ""
   fallback:
-    - "gemini-4-argon-high-oauth"
+    - "gemini-4-neon-high-oauth"
     - "muse-wonder-1.0-oauth"
     - "gpt-6.2-sol-oauth"
 
