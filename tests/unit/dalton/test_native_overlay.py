@@ -43,8 +43,8 @@ def test_native_overlay_does_not_collide_with_upstream():
 
     native_models = native.get("models") or {}
     # DALTON-HOOK(llm-overlay): claude-fable-5-2 and claude-fable-5-2-oauth graduated into upstream #751;
-    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high}-oauth added (38 + 3 = 41).
-    assert len(native_models) == 41
+    # gpt-6.2-{astra,sol}{,-oauth} added (38), gemini-4-neon-{low,medium,high,xhigh}-oauth added (38 + 4 = 42).
+    assert len(native_models) == 42
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -1843,13 +1843,13 @@ def test_antigravity_xhigh_is_a_thinking_level_and_derives_from_the_model_id():
     assert _normalize_thinking_level("max") is None
 
 
-_NEON_EFFORTS = ("low", "medium", "high")
-_NEON_SOURCE = "https://nokiapoweruser.com/gemini-4-neon-release-today-google-cloud-pricing/"
+_NEON_EFFORTS = ("low", "medium", "high", "xhigh")
+_NEON_SOURCE = "https://ai.google.dev/gemini-api/docs/pricing"
 
 
-def test_gemini_4_neon_overlay_awaiting_release_and_notional_pricing(monkeypatch):
-    """Neon is configured in native_overlay.json like Hydrogen with awaiting_release=True
-    and estimated Google Cloud billing catalogue notional pricing ($3/$15/$0.15)."""
+def test_gemini_4_neon_overlay_generally_available_and_notional_pricing(monkeypatch):
+    """Neon (GA 2026-11-18) is configured like Hydrogen with four thinking levels and
+    the published list price ($3/$15/$0.15) as its notional rate."""
     from unittest.mock import create_autospec
 
     from src.dalton.llm import overlay as overlay_mod
@@ -1868,13 +1868,12 @@ def test_gemini_4_neon_overlay_awaiting_release_and_notional_pricing(monkeypatch
     for effort in _NEON_EFFORTS:
         key = f"gemini-4-neon-{effort}-oauth"
         model_id = f"gemini-4-neon-{effort}"
-        # Hidden until the subscription serves it (awaiting_release), so not listed.
-        assert key not in listed
+        assert key in listed
         entry = mc.get_model_config(key)
         assert entry is not None
         assert entry["provider"] == "antigravity-oauth"
         assert entry["model_id"] == model_id
-        assert entry["visible"] is False
+        assert entry["visible"] is True
         assert entry["prompt_guidance"] == "lean"
         assert entry["context"] == 1_048_576
         assert entry["parameters"] == {"include_thoughts": True, "max_output_tokens": 65536}
@@ -1890,9 +1889,9 @@ def test_gemini_4_neon_overlay_awaiting_release_and_notional_pricing(monkeypatch
         neon_meta = meta[key]
         assert neon_meta["billing"] == "subscription"
         assert neon_meta["tool_calling"] is True
-        assert neon_meta["awaiting_release"] is True
+        assert "awaiting_release" not in neon_meta
         stored = neon_meta["notional_pricing"]
-        assert stored["estimated"] is True
+        assert stored["estimated"] is False
         assert stored["source"] == _NEON_SOURCE
         assert stored["verified_at"] == "2026-11-19"
         assert resolve_notional_card(key) == {
