@@ -801,7 +801,9 @@ async def _handle_send_message(
                 upload_claim_key = candidate_claim_key
 
         try:
-            await route.bind(user_id, workspace)
+            route = await route.bind(
+                user_id, workspace, follows=await _command_workspace(thread_id, request)
+            )
         except BaseException:
             if upload_claim_key:
                 from src.dalton.services.chat_uploads import (
@@ -1978,3 +1980,15 @@ async def thread_stream_mux_endpoint(
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+async def _command_workspace(thread_id: str, request: ChatRequest) -> Optional[str]:
+    """The workspace the background command a report-back turn reports on
+    ran in, which a Home turn follows (``place_home_turn``); else None."""
+    source = getattr(request, "report_source", None)
+    if getattr(source, "kind", None) != "command_report":
+        return None
+    from src.server.database.runs.command_runs import get_thread_command
+
+    row = await get_thread_command(thread_id, source.command_id)
+    return str(row["workspace_id"]) if row and row.get("workspace_id") else None

@@ -93,6 +93,8 @@ def build_context_middleware(
             # DALTON-HOOK(turn-row-model-line): the server-resolved model of
             # the turn, stated in its anchor row.
             model_key=turn.model_key,
+            home_away=turn.home_away,
+            home_back=turn.home_back,
         ),
         baseline=BaselineContextMiddleware(
             session=session,

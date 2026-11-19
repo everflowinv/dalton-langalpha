@@ -37,7 +37,9 @@ async def _install_dependencies(sandbox: "PTCSandbox") -> None:
 
     # DALTON-HOOK(sandbox-pip-system): pass --system to match Dockerfile.sandbox
     # when UV_SYSTEM_PYTHON / VIRTUAL_ENV is not set in the container.
-    install_cmd = f"uv pip install --system -q {' '.join(DEFAULT_DEPENDENCIES)}"
+    install_cmd = "uv pip install --system -q " + " ".join(
+        shlex.quote(d) for d in DEFAULT_DEPENDENCIES
+    )
 
     try:
         assert sandbox.runtime is not None

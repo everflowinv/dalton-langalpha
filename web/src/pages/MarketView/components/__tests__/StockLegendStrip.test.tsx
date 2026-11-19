@@ -1,28 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import React from 'react';
 
-// DALTON-HOOK(extended-hours-quotes): Mock sidebar hooks for MarketSidebarPanel extended-hours tests.
-const { mockWatchlistState, mockPortfolioState } = vi.hoisted(() => ({
-  mockWatchlistState: {
-    rows: [] as Array<Record<string, unknown>>,
-    loading: false,
-    modalOpen: false,
-    setModalOpen: () => {},
-    handleAdd: () => {},
-    handleDelete: () => {},
-    currentWatchlistId: 'default',
-  },
-  mockPortfolioState: {
-    rows: [] as Array<Record<string, unknown>>,
-    loading: false,
-    modalOpen: false,
-    setModalOpen: () => {},
-    handleAdd: () => {},
-    handleDelete: () => ({ open: false, title: '', message: '', onConfirm: null }),
-  },
-}));
 // DALTON-HOOK(extended-hours-quotes): the old PortfolioWatchlistCard's display
 // lives in PortfolioWatchlistWidget now; its data context is mocked here.
 const { mockDashboardCtx } = vi.hoisted(() => ({
@@ -37,27 +17,8 @@ const { mockDashboardCtx } = vi.hoisted(() => ({
 vi.mock('../../../Dashboard/widgets/framework/DashboardDataContext', () => ({
   useDashboardContext: () => mockDashboardCtx,
 }));
-vi.mock('../../../Dashboard/hooks/useWatchlistData', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../../Dashboard/hooks/useWatchlistData')>();
-  return {
-    ...actual,
-    useWatchlistData: () => mockWatchlistState,
-  };
-});
-vi.mock('../../../Dashboard/hooks/usePortfolioData', () => ({
-  usePortfolioData: () => mockPortfolioState,
-}));
-vi.mock('../../contexts/MarketDataWSContext', () => ({
-  useMarketDataWSContext: () => ({
-    prices: new Map(),
-    connectionStatus: 'disconnected',
-    subscribe: () => {},
-    unsubscribe: () => {},
-  }),
-}));
 
 import { LegendStats } from '../StockLegendStrip';
-import MarketSidebarPanel from '../MarketSidebarPanel'; // DALTON-HOOK(extended-hours-quotes)
 import PortfolioWatchlistWidget from '../../../Dashboard/widgets/definitions/PortfolioWatchlistWidget';
 import { WatchlistRowItem } from '../../../Dashboard/widgets/definitions/_holdingsPrimitives';
 import { serializeQuoteRowToMarkdown } from '../../../Dashboard/widgets/framework/snapshotSerializers';
@@ -142,74 +103,10 @@ describe('LegendStats volume cell', () => {
   });
 });
 
-// DALTON-HOOK(extended-hours-quotes): Lock MarketSidebarPanel after-hours and pre-market display for GOOG.
-describe('MarketSidebarPanel extended-hours rows', () => {
-  it('renders GOOG after-hours sidebar row with 317.28, -1.08%, and 318.10 +0.26%', () => {
-    const stockPrice = snapshotToStockPrice('GOOG', {
-      symbol: 'GOOG',
-      price: 317.28,
-      regular_close: 317.28,
-      previous_close: 320.76,
-      change: -2.66,
-      change_percent: -0.83,
-      regular_trading_change: -3.48,
-      regular_trading_change_percent: -1.0849,
-      late_trading_change_percent: 0.2584,
-      market_status: 'late_trading',
-      currency: 'USD',
-    });
-    mockWatchlistState.rows = [{ watchlist_item_id: 'w-goog', ...stockPrice }];
-    const afterHoursStatus = { market: 'extended-hours', afterHours: true, earlyHours: false };
-
-    const { container } = render(
-      <MemoryRouter>
-        <MarketSidebarPanel activeSymbol="GOOG" marketStatus={afterHoursStatus} />
-      </MemoryRouter>,
-    );
-    const expandBtn = container.querySelector('.market-sidebar-expand-btn');
-    if (expandBtn) fireEvent.click(expandBtn);
-
-    // DALTON-HOOK(extended-hours-quotes): Assert sidebar after-hours price, badge, and ext line.
-    expect(container.querySelector('.market-sidebar-row-price')?.textContent).toBe('317.28');
-    expect(container.querySelector('.market-sidebar-row-change')?.textContent).toContain('-1.08%');
-    expect(container.querySelector('.market-sidebar-row-ext')?.textContent).toContain('318.10 +0.26%');
-  });
-
-  // DALTON-HOOK(extended-hours-quotes): Lock MarketSidebarPanel pre-market display for GOOG.
-  it('renders GOOG pre-market sidebar row with 320.76, -1.07%, and 322.26 +0.47%', () => {
-    const stockPrice = snapshotToStockPrice('GOOG', {
-      symbol: 'GOOG',
-      price: 320.76,
-      previous_close: 320.76,
-      regular_close: 320.76,
-      change: 1.5,
-      change_percent: 0.4676,
-      regular_trading_change: -3.46,
-      regular_trading_change_percent: -1.0672,
-      early_trading_change: 1.5,
-      early_trading_change_percent: 0.4676,
-      market_status: 'early_trading',
-      currency: 'USD',
-    });
-    mockWatchlistState.rows = [{ watchlist_item_id: 'w-goog-pre', ...stockPrice }];
-    const preMarketStatus = { market: 'extended-hours', afterHours: false, earlyHours: true };
-
-    const { container } = render(
-      <MemoryRouter>
-        <MarketSidebarPanel activeSymbol="GOOG" marketStatus={preMarketStatus} />
-      </MemoryRouter>,
-    );
-    const expandBtn = container.querySelector('.market-sidebar-expand-btn');
-    if (expandBtn) fireEvent.click(expandBtn);
-
-    // DALTON-HOOK(extended-hours-quotes): Assert sidebar pre-market price, badge, and ext line.
-    expect(container.querySelector('.market-sidebar-row-price')?.textContent).toBe('320.76');
-    expect(container.querySelector('.market-sidebar-row-change')?.textContent).toContain('-1.07%');
-    expect(container.querySelector('.market-sidebar-row-ext')?.textContent).toContain('322.26 +0.47%');
-  });
-
-  // DALTON-HOOK(extended-hours-quotes): Verify all 4 surfaces (card, widget row, sidebar, exported row) agree after WS write-through and when live price returns to regularClose.
-  it('keeps extended-hours price and pct identical across card, widget row, sidebar, and exported row after WS write-through', () => {
+// DALTON-HOOK(extended-hours-quotes): Verify card, widget row, and exported row agree on extended-hours price and pct after WS write-through and when live price returns to regularClose.
+// (MarketSidebarPanel was replaced by QuoteList in upstream #801.)
+describe('Extended-hours quote consistency across surfaces', () => {
+  it('keeps extended-hours price and pct identical across card, widget row, and exported row after WS write-through', () => {
     const queryClient = new QueryClient();
     const initialSnap: RawQuoteRow = {
       symbol: 'GOOG',
@@ -283,17 +180,6 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     expect(primContainer.querySelector('.dash-ext')?.textContent).toBe('AH$319.50+0.70%');
     unmountPrim();
 
-    mockWatchlistState.rows = [wsRow as unknown as Record<string, unknown>];
-    const { container: sideContainer, unmount: unmountSide } = render(
-      <MemoryRouter>
-        <MarketSidebarPanel activeSymbol="GOOG" marketStatus={afterHoursStatus} />
-      </MemoryRouter>,
-    );
-    const expandBtn = sideContainer.querySelector('.market-sidebar-expand-btn');
-    if (expandBtn) fireEvent.click(expandBtn);
-    expect(sideContainer.querySelector('.market-sidebar-row-ext')?.textContent).toContain('319.50 +0.70%');
-    unmountSide();
-
     const exported = watchlistQuoteRow(wsRow, afterHoursStatus);
     expect(exported.postMarket).toBe(319.5);
     expect(exported.postMarketChange).toBe(2.22);
@@ -336,17 +222,6 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     expect(primBack.querySelector('.dash-ext')?.textContent).toBe('AH$317.28·0.00%');
     expect(primBack).not.toHaveTextContent('$318.10');
     unmountPrimBack();
-
-    mockWatchlistState.rows = [backToCloseRow as unknown as Record<string, unknown>];
-    const { container: sideBack, unmount: unmountSideBack } = render(
-      <MemoryRouter>
-        <MarketSidebarPanel activeSymbol="GOOG" marketStatus={afterHoursStatus} />
-      </MemoryRouter>,
-    );
-    const expandBtnBack = sideBack.querySelector('.market-sidebar-expand-btn');
-    if (expandBtnBack) fireEvent.click(expandBtnBack);
-    expect(sideBack.querySelector('.market-sidebar-row-ext')?.textContent).toContain('317.28 +0.00%');
-    unmountSideBack();
 
     const exportedBack = watchlistQuoteRow(backToCloseRow, afterHoursStatus);
     expect(exportedBack.postMarket).toBe(317.28);
@@ -415,18 +290,6 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     expect(regPrimEl).toHaveTextContent('-0.13%');
     unmountRegPrim();
 
-    // DALTON-HOOK(extended-hours-quotes): Check sidebar and exported markdown for regular-session -0.125 and -0.125%.
-    mockWatchlistState.rows = [halfRow as unknown as Record<string, unknown>];
-    const { container: regSideEl, unmount: unmountRegSide } = render(
-      <MemoryRouter>
-        <MarketSidebarPanel activeSymbol="GOOG" marketStatus={openStatus} />
-      </MemoryRouter>,
-    );
-    const regExpandBtn = regSideEl.querySelector('.market-sidebar-expand-btn');
-    if (regExpandBtn) fireEvent.click(regExpandBtn);
-    expect(regSideEl.querySelector('.market-sidebar-row-change')?.textContent).toBe('-0.13%');
-    unmountRegSide();
-
     const regExported = watchlistQuoteRow(halfRow, openStatus);
     expect(regExported.change).toBe(-0.13);
     expect(regExported.changePercent).toBe(-0.13);
@@ -467,21 +330,7 @@ describe('MarketSidebarPanel extended-hours rows', () => {
     expect(primEl.querySelector('.dash-ext')?.textContent).toBe('AH$99.75-0.13%');
     unmountPrim();
 
-    // 3. MarketSidebarPanel
-    mockWatchlistState.rows = [halfRow as unknown as Record<string, unknown>];
-    const { container: sideEl, unmount: unmountSide } = render(
-      <MemoryRouter>
-        <MarketSidebarPanel activeSymbol="GOOG" marketStatus={afterHoursStatus} />
-      </MemoryRouter>,
-    );
-    const expandBtn = sideEl.querySelector('.market-sidebar-expand-btn');
-    if (expandBtn) fireEvent.click(expandBtn);
-    expect(sideEl.querySelector('.market-sidebar-row-price')?.textContent).toBe('99.88');
-    expect(sideEl.querySelector('.market-sidebar-row-change')?.textContent).toContain('-0.13%');
-    expect(sideEl.querySelector('.market-sidebar-row-ext')?.textContent).toContain('99.75 -0.13%');
-    unmountSide();
-
-    // 4. Exported row & markdown
+    // 3. Exported row & markdown
     const exported = watchlistQuoteRow(halfRow, afterHoursStatus);
     expect(exported.price).toBe(99.88);
     expect(exported.change).toBe(-0.13);

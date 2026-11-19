@@ -4,6 +4,7 @@ import {
   artifactPathKey, useArtifactComments, useArtifactStatus, useMarkArtifactCommentsRead, useOwnedArtifact,
 } from '@/hooks/useArtifact';
 import { AnimatePresence, motion } from '@/lib/framer';
+import { useStableHandler } from '@/hooks/useStableHandler';
 import { TWEEN } from '@/lib/motion';
 import type { ArtifactComment } from '@/types/api';
 import { basename } from '../../../../utils/fileRefResolver';
@@ -19,18 +20,21 @@ import { CommentLayerContext } from './commentLayerContext';
 import { CommentList, DraftCard } from './CommentList';
 import { CommentPins } from './CommentPin';
 import { CommentPopover } from './CommentPopover';
-import { draftHeading } from '../../../artifactComments/commentModel';
+import { draftHeading, partEntries, partLabels } from '../../../artifactComments/anchorKinds';
+import { ADD_KEY_LABEL } from '../../comments/partModifier';
 import { PickOverlays } from './PickOverlays';
 import { DRAFT_ID, placePins } from './pinPlaces';
+import { spotOutlines } from './spotOutlines';
 import type { CommentIntent } from '../../../artifactComments/destinations';
 import { useBoxPlacement } from './useBoxPlacement';
 import type { CommentUi } from './useCommentUi';
 import { useContentSize } from './useContentSize';
+import { useHeldModifier } from './useHeldModifier';
 import { useLayerSending } from './useLayerSending';
 import { useEachKeptWhileFading } from './useKeptWhileFading';
 import { useListView } from './useListView';
 import { useModeKeys } from './useModeKeys';
-import { usePageReports } from './usePageReports';
+import { usePageReports, type PickHow } from './usePageReports';
 import { useReadWhileOpen } from './useReadWhileOpen';
 import { useReplyPulse } from './useReplyPulse';
 import './CommentLayer.css';
@@ -67,6 +71,16 @@ export interface CommentLayerProps {
   /** The tab is the one in front of an active panel: keys and asks are its. */
   active: boolean;
   ui: CommentUi;
+  /** What a click picks in this viewer, said while the mode is on; left out, a page's. */
+  modeHint?: string;
+  /**
+   * Words in a viewer drawn in the app as a pick, for the selection
+   * toolbar's Comment (`ui.commentOnWords`); left out where the viewer takes
+   * none. A framed page offers its own words, through the chip.
+   */
+  pickWords?: (range: Range) => PagePick | null;
+  /** Whether words are in the viewer, so the toolbar offers Comment only on them. */
+  holdsWords?: (range: Range) => boolean;
 }
 
 /**
@@ -85,7 +99,7 @@ export interface CommentLayerProps {
  * in the list moves through `boxReducer`.
  */
 export default function CommentLayer({
-  tabId, workspaceId, path, bridge, view, active, ui,
+  tabId, workspaceId, path, bridge, view, active, ui, modeHint, pickWords, holdsWords,
 }: CommentLayerProps): React.ReactElement {
   const { t } = useTranslation();
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
@@ -158,11 +172,15 @@ export default function CommentLayer({
   const draftHere = !!draft && draft.path === docPath;
   const anchors = useMemo(() => {
     const items: PageAnchorItem[] = comments.map((c) => ({ id: c.comment_id, anchor: c.anchor }));
-    if (draft && draftHere) items.push(draftMarked ? { id: DRAFT_ID, anchor: draft.anchor, mark: true } : { id: DRAFT_ID, anchor: draft.anchor });
+    if (draft && draftHere) {
+      items.push(draftMarked
+        ? { id: DRAFT_ID, anchor: draft.anchor, mark: true, draft: true }
+        : { id: DRAFT_ID, anchor: draft.anchor, draft: true });
+    }
     return items;
   }, [comments, draft, draftHere, draftMarked]);
 
-  const startDraft = (pick: PagePick, selected = false) => dispatch({ type: 'pick', pick, path: docPath, selected });
+  const startDraft = (pick: PagePick, how: PickHow) => dispatch({ type: 'pick', pick, path: docPath, ...how });
   const closeBox = (of: BoxOf) => dispatch({ type: 'closeBox', of, keepHover: false });
   const leaveDraft = () => dispatch({ type: 'leave' });
   const escapeDraft = () => dispatch({ type: 'escape' });
@@ -176,9 +194,11 @@ export default function CommentLayer({
     else if (open?.kind === 'card') closeBox(open);
     else if (mode) exitMode();
   };
+  const shownId = open?.kind === 'card' ? open.id : listOpen ? box.expandedId : null;
   const reports = usePageReports(bridge, view, mode, {
     anchors,
     draftSerial: box.serial,
+    outlined: shownId,
     onHover: (hover) => dispatch({ type: 'hover', hover }),
     onPress: () => {
       const closes = pressCloses(box);
@@ -194,6 +214,32 @@ export default function CommentLayer({
     },
   });
   const { positions, fresh, settled } = reports;
+
+  // The selection toolbar's Comment on words in this viewer opens their box
+  // as the chip's does, the words marked as words picked in the mode are.
+  const takeWords = useStableHandler((range: Range) => {
+    const pick = pickWords?.(range);
+    if (pick) startDraft(pick, { selected: true, extend: false });
+  });
+  const { registerWordsTaker, askInChat: toChat } = ui;
+  useEffect(
+    () => (holdsWords ? registerWordsTaker(tabId, { holds: holdsWords, take: takeWords }) : undefined),
+    [holdsWords, registerWordsTaker, tabId, takeWords],
+  );
+
+  const askInChat = toChat ? (selection: PagePick) => {
+    const box = root?.getBoundingClientRect();
+    if (!box || selection.anchor.kind !== 'text' || !selection.anchor.quote) return;
+    const { x, y, height } = selection.rect;
+    toChat({
+      text: selection.anchor.quote,
+      rect: { left: box.left + x, top: box.top + y, bottom: box.top + y + height },
+      ...(docPath !== opened ? { path: docPath } : {}),
+    });
+    // The reply box takes over from the chip; the words stay selected, as
+    // the only mark of what it quotes.
+    reports.clearSelection();
+  } : undefined;
   useModeKeys(active, mode, (on) => ui.setMode(tabId, on), escapeOneLayer);
 
   // Words picked in comment mode stay selected in a page that cannot mark
@@ -205,7 +251,6 @@ export default function CommentLayer({
     heldSelection.current = draftSelected;
   }, [bridge, draftSelected]);
 
-  const shownId = open?.kind === 'card' ? open.id : listOpen ? box.expandedId : null;
   const places = placePins({
     comments,
     positions,
@@ -283,11 +328,30 @@ export default function CommentLayer({
     />
   );
 
-  // An area's outline settles on the draft's area, or on that of the comment
-  // whose card is open, here or in the list; it goes out with the pins while
-  // the document under them is being replaced.
-  const shownArea = shownComment?.anchor.kind === 'area' ? (rectOf(shownComment) ?? null) : null;
-  const draftArea = draft?.anchor.kind === 'area' && draftPinned ? draftRect : null;
+  // The draft over the page takes more parts by a modifier click, or the
+  // box's "Add a part" on a touch screen, when it is a list of parts. The
+  // page owns both and reports them.
+  const parts = boxDraft ? partLabels(boxDraft.anchor) : null;
+  // A chip names its part by the entry it shows, so a press on a list the
+  // page has since changed takes nothing out.
+  const dropPart = (index: number) => {
+    const part = boxDraft && partEntries(boxDraft.anchor)?.[index];
+    if (part) bridge.post({ type: 'page:drop-part', part });
+  };
+  const takesParts = parts !== null;
+  const adding = takesParts && reports.adding.next;
+  const modifierHeld = useHeldModifier(mode && takesParts, reports.adding.held);
+  const outlines = spotOutlines({
+    draft: draft ? { anchor: draft.anchor, rect: draftRect, parts: reports.parts.get(DRAFT_ID) } : null,
+    draftPinned,
+    overPage: boxDraft !== null,
+    shown: shownComment
+      ? { anchor: shownComment.anchor, rect: rectOf(shownComment) ?? null, parts: reports.parts.get(shownComment.comment_id) }
+      : null,
+    hover: box.hover,
+    addingParts: mode && takesParts,
+    hidden: pinsHidden,
+  });
   const openComment = open?.kind === 'card' ? (byId.get(open.id) ?? null) : null;
   const heading = draft ? draftHeading(t, draft.anchor) : null;
   const current: Box | null = open?.kind === 'draft' && heading
@@ -327,7 +391,22 @@ export default function CommentLayer({
       onClose: leaveDraft,
     };
     const as: ComposerMode = !inList && heading
-      ? { kind: 'over', head: heading.label, quote: heading.quote, fullQuote: draft?.anchor.kind === 'text', ...writing }
+      ? {
+          kind: 'over',
+          head: heading.label,
+          // Parts listed one by one show as chips rather than a line of their names.
+          quote: parts && parts.length > 1 ? null : heading.quote,
+          fullQuote: draft?.anchor.kind === 'text',
+          // The parts change only in comment mode, where the page's answer
+          // is taken: outside it they are listed, with no way to add or drop.
+          ...(parts && parts.length > 1
+            ? { parts: { labels: parts, onDrop: mode ? dropPart : undefined } }
+            : {}),
+          ...(takesParts && mode
+            ? { addPart: { on: adding, onToggle: () => bridge.post({ type: 'page:extend-next', on: !adding }) } }
+            : {}),
+          ...writing,
+        }
       : { kind: 'list', ...writing };
     return (
       <CommentComposer
@@ -361,16 +440,18 @@ export default function CommentLayer({
 
         <PickOverlays
           mode={mode}
-          boxOpen={open !== null}
+          boxOpen={open !== null && !takesParts}
           hover={box.hover}
           areaDrag={reports.areaDrag}
-          picked={boxDraft?.anchor.kind === 'element' && draftRect ? draftRect : null}
-          area={pinsHidden ? null : (draftArea ?? shownArea)}
+          picked={outlines.picked}
+          area={outlines.area}
+          parts={outlines.parts}
           scrolling={reports.scrolling}
           selection={boxDraft ? null : reports.selection}
           size={size}
           drafting={draft !== null}
-          onComment={(selection) => startDraft(selection)}
+          onComment={(selection) => startDraft(selection, { selected: false, extend: false })}
+          onAsk={askInChat}
         />
 
         {/* Gone while the list is open: the drawer's title sits where the hint
@@ -379,7 +460,9 @@ export default function CommentLayer({
           {mode && !listOpen && (
             <motion.div key="hint" className="page-comments-hint-row" initial={HINT_HIDDEN} animate={HINT_SHOWN} exit={HINT_GONE}>
               <div className="page-comments-hint">
-                <span className="page-comments-hint-text" role="status">{t('pageViewer.comments.modeHint')}</span>
+                <span className="page-comments-hint-text" role="status">
+                  <ModeHint takesParts={takesParts} adding={adding} hint={modeHint} />
+                </span>
                 <button
                   type="button"
                   className="page-comments-hint-exit tap-target"
@@ -442,6 +525,7 @@ export default function CommentLayer({
               draft={isCurrent && boxDraft
                 ? { words: !!box.text.trim(), onAskDiscard: () => dispatch({ type: 'askDiscard' }) }
                 : null}
+              seeThrough={isCurrent && modifierHeld}
               onDismiss={() => closeBox(item.of)}
               onEscape={escapeOneLayer}
               onGone={() => gone(item.key)}
@@ -456,5 +540,25 @@ export default function CommentLayer({
         })}
       </div>
     </CommentLayerContext>
+  );
+}
+
+/**
+ * What a click in comment mode does. While a draft takes parts a modifier
+ * click adds one; a touch screen has no modifier, so its box offers "Add a
+ * part" instead, and says so once pressed.
+ */
+function ModeHint({ takesParts, adding, hint }: { takesParts: boolean; adding: boolean; hint?: string }): React.ReactElement {
+  const { t } = useTranslation();
+  const plain = hint ?? t('pageViewer.comments.modeHint');
+  if (!takesParts) return <>{plain}</>;
+  if (adding) return <>{t('pageViewer.comments.modeHintAdding')}</>;
+  return (
+    <>
+      <span className="pointer-coarse:hidden">
+        {t('pageViewer.comments.modeHintParts', { key: ADD_KEY_LABEL })}
+      </span>
+      <span className="hidden pointer-coarse:inline">{plain}</span>
+    </>
   );
 }

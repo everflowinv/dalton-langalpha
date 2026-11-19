@@ -1109,7 +1109,10 @@ async def sync_sandbox_assets(
                         servers=still_missing,
                     )
             try:
-                await sandbox._start_internal_mcp_servers()
+                # Replacing: a daemon already listening (a reconnect starts
+                # one before this sync) imported the client just rewritten,
+                # and would keep the old code until it stopped.
+                await sandbox._start_internal_mcp_servers(replace=True)
             except Exception as e:
                 logger.warning("Failed to refresh MCP servers", error=str(e))
             _mark_sync("mcp_start")

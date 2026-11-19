@@ -9,7 +9,7 @@ import { useNow } from '@/hooks/useNow';
 import { scrollMotion } from '@/lib/reducedMotion';
 import { cn } from '@/lib/utils';
 import type { Automation, AutomationExecution, DeliveryAttempt } from '@/types/automation';
-import type { ErrorLinkSpec } from '@/utils/rateLimitError';
+import type { PageLinkSpec } from '@/utils/rateLimitError';
 import { useModificationHistory } from '../hooks/useModificationHistory';
 import { useAutomationMutations } from '../hooks/useAutomationMutations';
 import { useAutomationPlace } from '../hooks/useAutomationPlace';
@@ -373,7 +373,7 @@ function RunCard({
   onSkip,
 }: {
   execution: AutomationExecution;
-  links: ErrorLinkSpec[];
+  links: PageLinkSpec[];
   busy: boolean;
   onOpen: () => void;
   onSkip?: () => void;

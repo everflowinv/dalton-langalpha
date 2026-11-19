@@ -82,6 +82,14 @@ export const queryKeys = {
     details: () => [...queryKeys.workspaces.all, 'detail'],
     detail: (id: string) => [...queryKeys.workspaces.details(), id],
     home:   () => [...queryKeys.workspaces.all, 'home'],
+    // Where Home lives, and the cloud computer its turns use while that
+    // machine can't be reached, with what came back from it.
+    homePlacement: () => [...queryKeys.workspaces.all, 'home', 'placement'],
+    // Where each hand-back put the files Home's cloud turns wrote, for their cards.
+    homeHandbacks: (since?: string) =>
+      since === undefined
+        ? [...queryKeys.workspaces.all, 'home', 'handbacks']
+        : [...queryKeys.workspaces.all, 'home', 'handbacks', since],
     quota:  () => [...queryKeys.workspaces.all, 'quota'],
     // DALTON-HOOK(team-sharing): team workspaces grouped by colleague
     team:   () => [...queryKeys.workspaces.all, 'team'],
@@ -420,6 +428,12 @@ export const queryKeys = {
   cliApprovals: {
     all:     ['cliApprovals'],
     pending: () => [...queryKeys.cliApprovals.all, 'pending'],
+  },
+  // Vendor Terms of Service waiting on the user. The user feed invalidates the
+  // pending list whenever it changes.
+  vendorTerms: {
+    all:     ['vendorTerms'],
+    pending: () => [...queryKeys.vendorTerms.all, 'pending'],
   },
   // Per-symbol quote cache — the unified snapshot layer (see lib/quotes/).
   // Key = uppercase legacy symbol spelling (indexes stripped of a leading '^').

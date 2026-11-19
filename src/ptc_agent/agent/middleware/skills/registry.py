@@ -542,7 +542,11 @@ def skills_outside_sandbox() -> frozenset[str]:
         name
         for name, skill in SKILL_REGISTRY.items()
         if skill.hidden or not _is_enabled(skill)
-    )
+    ) | {
+        # DALTON-HOOK(skills-registry): keep Firecrawl's catalog skill out of
+        # sandbox sync while Firecrawl's catalog MCP server stays off in Dalton.
+        "data-catalog",
+    }
 
 
 def get_skill(skill_name: str) -> SkillDefinition | None:

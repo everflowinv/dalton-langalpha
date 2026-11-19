@@ -460,9 +460,10 @@ export function handleProvenance({ assistantMessageId, event, setMessages }: {
     prev.map((msg: MessageRecord) => {
       if (msg.id !== assistantMessageId) return msg;
 
+      const existing = msg.provenanceRecords as Record<string, ProvenanceRecord> | undefined;
       const provenanceRecords = mergeProvenanceRecords(
-        msg.provenanceRecords as Record<string, ProvenanceRecord> | undefined,
-        { [key]: record },
+        existing,
+        { [key]: withPriorCost(existing?.[key], record) },
       );
 
       return { ...msg, provenanceRecords };
@@ -470,6 +471,23 @@ export function handleProvenance({ assistantMessageId, event, setMessages }: {
   );
 
   return true;
+}
+
+/**
+ * `record` over the one already listed under its key, carrying the costs of
+ * both: one code run can make the same paid call twice, each charged, and the
+ * list shows them as one access. A redelivered event is not another call.
+ */
+function withPriorCost(prior: ProvenanceRecord | undefined, record: ProvenanceRecord): ProvenanceRecord {
+  if (!prior) return { ...record, cost_record_ids: [record.record_id] };
+  const counted = prior.cost_record_ids ?? [prior.record_id];
+  if (counted.includes(record.record_id)) {
+    return { ...record, cost_credits: prior.cost_credits, cost_record_ids: counted };
+  }
+  const cost = record.cost_credits == null
+    ? prior.cost_credits
+    : (prior.cost_credits ?? 0) + record.cost_credits;
+  return { ...record, cost_credits: cost, cost_record_ids: [...counted, record.record_id] };
 }
 
 /**
