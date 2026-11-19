@@ -762,7 +762,13 @@ async def insert_preflight_log(
 async def get_preflight_wake_context(
     automation_execution_id: Optional[str],
 ) -> Optional[str]:
-    """Return the latest ``wake_context`` logged for a waking execution, if any."""
+    """Return the latest ``wake_context`` logged for a waking execution.
+
+    ``None`` means no wake was logged for this execution (preflight never ran
+    to a wake); ``""`` means it woke without context. A resumed execution uses
+    the difference to decide whether preflight still has to run, since running
+    it twice would claim one-shot signals a second time.
+    """
     if not automation_execution_id:
         return None
     try:
@@ -786,7 +792,7 @@ async def get_preflight_wake_context(
             if not row:
                 return None
             val = row.get("wake_context")
-            return str(val) if val is not None else None
+            return str(val) if val is not None else ""
 
 
 async def list_preflight_logs(

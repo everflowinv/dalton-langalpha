@@ -4399,3 +4399,35 @@ def test_dalton_migration_graph_has_a_single_head() -> None:
     parents = {down for down in revisions.values() if down}
     heads = sorted(rev for rev in revisions if rev not in parents)
     assert heads == ["d040"], heads
+
+
+@pytest.mark.asyncio
+async def test_get_preflight_wake_context_tells_woke_without_context_from_never_woke(monkeypatch) -> None:
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, MagicMock
+
+    from src.dalton.database import watch as watch_db_mod
+
+    rows: list = []
+    cur = MagicMock()
+    cur.execute = AsyncMock()
+    cur.fetchone = AsyncMock(side_effect=lambda: rows.pop(0) if rows else None)
+
+    @asynccontextmanager
+    async def _cursor(**_kw):
+        yield cur
+
+    conn = MagicMock()
+    conn.cursor = _cursor
+
+    @asynccontextmanager
+    async def _conn():
+        yield conn
+
+    monkeypatch.setattr(watch_db_mod, "get_db_connection", _conn)
+    exec_id = "11111111-1111-1111-1111-111111111111"
+    assert await watch_db_mod.get_preflight_wake_context(exec_id) is None
+    rows.append({"wake_context": None})
+    assert await watch_db_mod.get_preflight_wake_context(exec_id) == ""
+    rows.append({"wake_context": "<dalton_wake>x</dalton_wake>"})
+    assert await watch_db_mod.get_preflight_wake_context(exec_id) == "<dalton_wake>x</dalton_wake>"
