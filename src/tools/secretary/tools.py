@@ -873,9 +873,11 @@ async def workspace_file_read_cos(
                 work_dir = owner_work_dir(live_ws)
                 previous_dirs = previous_dir_names_of(live_ws)
                 try:
-                    normalized, raw_bytes = await _read_contained_target(
+                    contained = await _read_contained_target(
                         sandbox, path, work_dir, previous_dirs
                     )
+                    # Upstream returns a ContainedFile (canonical path, bytes, stamp).
+                    normalized, raw_bytes = contained.canonical, contained.content
                 except HTTPException:
                     return error_command("file not found", tool_call_id)
 
@@ -1623,9 +1625,11 @@ async def workspace_file_copy_cos(
                 work_dir = owner_work_dir(live_ws)
                 previous_dirs = previous_dir_names_of(live_ws)
                 try:
-                    normalized, raw_bytes = await _read_contained_target(
+                    contained = await _read_contained_target(
                         sandbox, path, work_dir, previous_dirs
                     )
+                    # Upstream returns a ContainedFile (canonical path, bytes, stamp).
+                    normalized, raw_bytes = contained.canonical, contained.content
                 except HTTPException as e:
                     if e.status_code != 413:
                         return error_command("file not found", tool_call_id)

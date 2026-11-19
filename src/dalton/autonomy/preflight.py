@@ -978,6 +978,50 @@ def _signal_resolved(row: Any) -> bool:
     return status == "resolved" or row.get("resolved_at") is not None
 
 
+def _signal_row_to_candidate(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalize a ``dalton_signals`` DB row into the signal shape used in preflight."""
+    probe = str(row.get("probe") or "")
+    signal_key = str(row.get("signal_key") or "")
+    if not probe or not signal_key:
+        return None
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    return {
+        "signal_id": str(row.get("signal_id") or ""),
+        "probe": probe,
+        "signal_key": signal_key,
+        "priority": row.get("priority") or "P1",
+        "summary": row.get("summary") or "",
+        "payload": payload,
+    }
+
+
+def _build_wake_preflight_result(
+    *,
+    name: str,
+    ticker: Optional[str],
+    signals: list[dict[str, Any]],
+    group_refresh_summary: Optional[str] = None,
+) -> PreflightResult:
+    """Build a waking ``PreflightResult`` and its ``wake_context`` consistently."""
+    wake_ctx = format_wake_directive(
+        automation_name=name,
+        ticker=ticker,
+        signals=signals,
+    )
+    if group_refresh_summary:
+        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
+        wake_ctx = (
+            f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
+        )
+    return PreflightResult(
+        should_wake=True,
+        decision="wake",
+        reason=f"{len(signals)}_signals",
+        signals=signals,
+        wake_context=wake_ctx,
+    )
+
+
 async def _save_timeout_reminder_retry(
     sig: ProbeSignal,
     *,
@@ -1157,21 +1201,14 @@ async def _conclude_preflight(
             for item in candidate_signals
         }
         for row in saved_rows:
-            pair = (str(row.get("probe") or ""), str(row.get("signal_key") or ""))
-            if not pair[0] or not pair[1] or pair in have:
+            cand = _signal_row_to_candidate(row)
+            if cand is None:
+                continue
+            pair = (cand["probe"], cand["signal_key"])
+            if pair in have:
                 continue
             have.add(pair)
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            candidate_signals.append(
-                {
-                    "signal_id": str(row.get("signal_id") or ""),
-                    "probe": pair[0],
-                    "signal_key": pair[1],
-                    "priority": row.get("priority") or "P1",
-                    "summary": row.get("summary") or "",
-                    "payload": payload,
-                }
-            )
+            candidate_signals.append(cand)
 
     # The stale-todo sweep-up never stands in the wake decision (round 4 #3):
     # it is kept out of the direct-wake split, the LLM triage and thereby the
@@ -1369,20 +1406,11 @@ async def _conclude_preflight(
                 watch_state_override.update(state)
         woke_signals = woke_signals + stale_signals
 
-    wake_ctx = format_wake_directive(
-        automation_name=name,
+    result = _build_wake_preflight_result(
+        name=name,
         ticker=ticker,
         signals=woke_signals,
-    )
-    if group_refresh_summary:
-        safe_refresh = _sanitize_untrusted_wake_field(group_refresh_summary, max_len=1500)
-        wake_ctx = f"{wake_ctx}\n<coverage_group_refresh>\n{safe_refresh}\n</coverage_group_refresh>"
-    result = PreflightResult(
-        should_wake=True,
-        decision="wake",
-        reason=f"{len(woke_signals)}_signals",
-        signals=woke_signals,
-        wake_context=wake_ctx,
+        group_refresh_summary=group_refresh_summary,
     )
     _remember_wake(probe_progress, result, name=name, ticker=ticker)
     if persist and stale_signals:
@@ -2098,6 +2126,14 @@ async def preflight_check(
             wake_context=None,
         )
 
+    # DALTON-HOOK(preflight): once ownership is verified and before any probe,
+    # triage or timeout, reuse this execution's own claimed signals whose wake log
+    # was lost (a restart between claim and log), instead of re-triaging them.
+    if execution_id:
+        recovered = await _recover_claimed_wake(automation, execution_id)
+        if recovered is not None:
+            return recovered
+
     ticker = _extract_ticker(automation)
     precomputed_group_refresh_summary: Optional[str] = None
     home_synced_in_outer = False
@@ -2305,6 +2341,64 @@ PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 30.0
 PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = 26.0
 
 
+class RecoveryLookupFailed(RuntimeError):
+    """The lookup of this execution's own claimed signals kept failing.
+
+    Not swallowed by ``decide()``: a fail-closed skip would settle the execution
+    as skipped and strand the signals it already claimed, so the executor must
+    record a failure instead.
+    """
+
+
+_RECOVERY_LOOKUP_TRIES = 3
+_RECOVERY_LOOKUP_BACKOFF_S = 0.5
+
+
+async def _recover_claimed_wake(
+    automation: dict[str, Any],
+    execution_id: str,
+) -> Optional[PreflightResult]:
+    """Reuse this execution's already-claimed signals before probes, triage, or timeouts run.
+
+    If a previous attempt claimed signals but restarted before logging the wake,
+    returning those active claimed signals here avoids re-running probes or
+    triage (and avoids ``resolve_signals``) on recovery.
+    """
+    raw_ws_id = str(automation.get("workspace_id") or "").strip()
+    if not raw_ws_id or not execution_id:
+        return None
+    # A failed lookup is not an empty one: falling through to a normal preflight
+    # would exclude this execution's own claims and settle it as skipped. Retry a
+    # transient error, then raise so the execution fails visibly instead.
+    claimed_rows: list[dict[str, Any]] = []
+    for attempt in range(_RECOVERY_LOOKUP_TRIES):
+        try:
+            claimed_rows = await watch_db.list_signals_claimed_by(execution_id, raw_ws_id)
+            break
+        except Exception as e:
+            if attempt == _RECOVERY_LOOKUP_TRIES - 1:
+                logger.error("[DALTON_PREFLIGHT] recovery lookup failed after %d tries: %s", _RECOVERY_LOOKUP_TRIES, e)
+                raise RecoveryLookupFailed(str(e)) from e
+            logger.warning("[DALTON_PREFLIGHT] recovery lookup failed (try %d): %s", attempt + 1, e)
+            await asyncio.sleep(_RECOVERY_LOOKUP_BACKOFF_S * (attempt + 1))
+    if not claimed_rows:
+        return None
+    recovered_signals: list[dict[str, Any]] = []
+    for row in claimed_rows:
+        cand = _signal_row_to_candidate(row)
+        if cand is not None:
+            recovered_signals.append(cand)
+    if not recovered_signals:
+        return None
+    res = _build_wake_preflight_result(
+        name=str(automation.get("name") or "dalton-task"),
+        ticker=_extract_ticker(automation),
+        signals=recovered_signals,
+    )
+    # decide() backfills the wake log for every waking result on its way out.
+    return res
+
+
 async def decide(
     automation: dict[str, Any],
     execution_id: str,
@@ -2377,6 +2471,8 @@ async def decide(
             except Exception as e:
                 logger.warning("[DALTON_PREFLIGHT] 唤醒上下文补记失败: %s", e)
         return res
+    except RecoveryLookupFailed:
+        raise
     except Exception as e:
         logger.warning("[DALTON_PREFLIGHT] decide() unexpected error (skipping fail-closed): %s", e)
         return PreflightResult(
@@ -2385,3 +2481,28 @@ async def decide(
             reason="preflight_error",
             signals=[],
         )
+
+
+async def release_claimed_signals_on_non_completed_settle(
+    conn: Any,
+    *,
+    automation: dict[str, Any],
+    execution_id: str,
+) -> int:
+    """Release the signals a Dalton execution claimed when it settles in any
+    terminal state other than COMPLETED, inside the settlement transaction.
+
+    Runs from settlement's ``in_transaction`` callback after the guarded state
+    update matched, so a stale worker fenced by ``expected_run_id`` or status
+    never gets here, and an error rolls the settlement back.
+    """
+    if not isinstance(automation, dict) or not is_dalton_automation(automation):
+        return 0
+    released = await watch_db.release_signals_claimed_by(execution_id, conn=conn)
+    if released:
+        logger.info(
+            "[DALTON_PREFLIGHT] Released %d claimed signal(s) on non-completed settle for execution_id=%s",
+            released,
+            execution_id,
+        )
+    return released

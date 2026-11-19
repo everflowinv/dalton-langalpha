@@ -29,23 +29,24 @@ from src.server.app.threads import crud as threads_crud
 from src.server.app.workspace_files import _shared as ws_files_shared
 from src.server.app.workspace_files import crud as ws_files_crud
 from src.server.app.workspace_files import uploads as ws_files_uploads
-from src.server.dependencies.principal import Principal
-from src.server.services import workspace_files as ws_files_service
-from src.server.services import workspace_upload_pull as ws_upload_pull
 from src.server.database import computer as computer_db
 from src.server.database import conversation as conv_db
 from src.server.database import home_workspace as home_ws_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
 from src.server.database.conversation import threads_read
+from src.server.dependencies.principal import Principal
 from src.server.models.workspace import WorkspaceUpdate
+from src.server.services import workspace_files as ws_files_service
+from src.server.services import workspace_upload_pull as ws_upload_pull
 from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.workspace_file_containment import ContainedFile
 from src.server.utils import secret_redactor
 from src.tools.secretary import activity as sec_activity
 from src.tools.secretary import dispatch as sec_dispatch
 from src.tools.secretary import tools as sec_tools
-from src.tools.secretary.utils import ComputerPlacement as _ComputerPlacement
 from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
+from src.tools.secretary.utils import ComputerPlacement as _ComputerPlacement
 
 TEAM_EMAILS = (
     "richard.lu@dalton.test,chao.yu@dalton.test,"
@@ -810,6 +811,12 @@ class TestWebChannelEndpoints:
             "/home/workspace/NVDA_Deep_Dive/", ""
         )
         fake_sandbox.awrite_file_text.side_effect = _fake_awrite_file_text
+        # Upstream web writes go through the guarded write, which returns a stat line.
+        async def _fake_awrite_file_text_guarded(filepath: str, content: str, guard=None) -> str:
+            await _fake_awrite_file_text(filepath, content)
+            return f"{len(content.encode('utf-8'))} 1700000000.000000000 1700000000.000000000 1"
+
+        fake_sandbox.awrite_file_text_guarded.side_effect = _fake_awrite_file_text_guarded
         fake_sandbox.aupload_file_bytes.side_effect = _fake_aupload_file_bytes
         fake_sandbox.aglob_files.side_effect = _fake_aglob_files
         fake_sandbox.path_write_lock.side_effect = _fake_path_write_lock
@@ -893,12 +900,20 @@ class TestWebChannelEndpoints:
                 return None
             return resolved, live_fs[resolved]
 
+        # Upstream reads through the versioned helper; wrap the plain fake.
+        async def _read_sandbox_file_versioned(sandbox, absolute_path, *, work_dir, unless=()):
+            got = await _read_sandbox_file(sandbox, absolute_path, work_dir=work_dir)
+            if got is None:
+                return None
+            canonical, content = got
+            return ContainedFile(canonical, len(content), content)
+
         monkeypatch.setattr(
             ws_files_crud,
-            "read_contained_sandbox_file",
+            "read_contained_sandbox_file_versioned",
             create_autospec(
-                ws_files_crud.read_contained_sandbox_file,
-                side_effect=_read_sandbox_file,
+                ws_files_crud.read_contained_sandbox_file_versioned,
+                side_effect=_read_sandbox_file_versioned,
             ),
         )
 
@@ -1644,6 +1659,12 @@ class TestChiefOfStaffChannel:
             lambda p, project=None: p.replace("/home/workspace/NVDA_Deep_Dive/", "")
         )
         fake_cos_sandbox.awrite_file_text.side_effect = _cos_awrite_file_text
+        # Upstream web writes go through the guarded write, which returns a stat line.
+        async def _cos_awrite_file_text_guarded(filepath: str, content: str, guard=None) -> str:
+            await _cos_awrite_file_text(filepath, content)
+            return f"{len(content.encode('utf-8'))} 1700000000.000000000 1700000000.000000000 1"
+
+        fake_cos_sandbox.awrite_file_text_guarded.side_effect = _cos_awrite_file_text_guarded
         fake_cos_sandbox.aglob_files.side_effect = _cos_aglob_files
 
         @asynccontextmanager
@@ -1698,12 +1719,20 @@ class TestChiefOfStaffChannel:
                 return None
             return resolved, cos_live_fs[resolved]
 
+        # Upstream reads through the versioned helper; wrap the plain fake.
+        async def _cos_read_file_versioned(sandbox, absolute_path, *, work_dir, unless=()):
+            got = await _cos_read_file(sandbox, absolute_path, work_dir=work_dir)
+            if got is None:
+                return None
+            canonical, content = got
+            return ContainedFile(canonical, len(content), content)
+
         monkeypatch.setattr(
             ws_files_crud,
-            "read_contained_sandbox_file",
+            "read_contained_sandbox_file_versioned",
             create_autospec(
-                ws_files_crud.read_contained_sandbox_file,
-                side_effect=_cos_read_file,
+                ws_files_crud.read_contained_sandbox_file_versioned,
+                side_effect=_cos_read_file_versioned,
             ),
         )
 

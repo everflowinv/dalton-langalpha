@@ -1351,6 +1351,11 @@ async def test_revoked_cos_wakeup_terminated_in_delivery_and_excluded_from_subse
         create_autospec(notify_turn.park_while_thread_busy, return_value=False),
     )
     monkeypatch.setattr(
+        notify_turn,
+        "park_while_computer_away",
+        create_autospec(notify_turn.park_while_computer_away, return_value=False),
+    )
+    monkeypatch.setattr(
         riders_db,
         "gather_wakeup_riders",
         create_autospec(riders_db.gather_wakeup_riders, return_value=[]),

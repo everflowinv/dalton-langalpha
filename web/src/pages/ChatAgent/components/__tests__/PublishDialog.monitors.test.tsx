@@ -46,6 +46,7 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
     content: '<html><body><h1>Monitor</h1></body></html>',
     mime: 'text/html',
     truncated: false,
+    from: { kind: 'live' },
   }));
   return {
     ...orig,

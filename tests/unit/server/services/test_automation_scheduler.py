@@ -17,6 +17,7 @@ from src.server.services.automation_scheduler import AutomationScheduler
 from src.server.services.automation_settlement import INTERRUPTED_ERROR, Outcome
 
 _MOD = "src.server.services.automation_scheduler"
+_WAIT = "src.server.services.automation_computer_wait"
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ def _quiet_sweep(mock_exec_db):
     mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
         return_value=0
     )
+    mock_exec_db.list_parked_executions = AsyncMock(return_value=[])
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +338,19 @@ def _abandoned_row(automation_id):
     }
 
 
+def _parked_row(automation_id, **verdict):
+    return {
+        "automation_execution_id": str(uuid.uuid4()),
+        "automation_id": automation_id,
+        "user_id": "user-1",
+        "parked_status": "active",
+        "superseded": False,
+        "reachable": False,
+        "expired": False,
+        **verdict,
+    }
+
+
 class TestSweep:
     """Settling firings whose process went away."""
 
@@ -419,6 +434,135 @@ class TestSweep:
         mock_settle.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @patch(f"{_WAIT}.exec_db")
+    @patch(f"{_WAIT}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_firing_parked_for_a_computer_that_is_back_starts_as_any_firing(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db
+    ):
+        """A deploy while the machine sleeps must not cost the run it waits for."""
+        executor = AsyncMock()
+        mock_executor_cls.get_instance.return_value = executor
+        parked = _parked_row("auto-1", reachable=True)
+        automation = _make_automation(automation_id="auto-1", status="active")
+        mock_exec_db.list_parked_executions = AsyncMock(return_value=[parked])
+        mock_exec_db.release_parked_execution = AsyncMock(return_value=True)
+        mock_auto_db.get_automation = AsyncMock(return_value=automation)
+
+        scheduler = AutomationScheduler()
+        await scheduler._sweep_parked_firings()
+        await asyncio.gather(*scheduler._running_tasks)
+
+        mock_exec_db.list_parked_executions.assert_awaited_once_with()
+        execution_id = parked["automation_execution_id"]
+        mock_exec_db.release_parked_execution.assert_awaited_once_with(execution_id)
+        executor.execute.assert_awaited_once_with(automation, execution_id)
+
+    @pytest.mark.asyncio
+    @patch(f"{_WAIT}.exec_db")
+    @patch(f"{_WAIT}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_parked_firing_another_worker_released_is_left_to_it(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db
+    ):
+        executor = AsyncMock()
+        mock_executor_cls.get_instance.return_value = executor
+        mock_exec_db.list_parked_executions = AsyncMock(
+            return_value=[_parked_row("auto-1", reachable=True)]
+        )
+        mock_exec_db.release_parked_execution = AsyncMock(return_value=False)
+        mock_auto_db.get_automation = AsyncMock(
+            return_value=_make_automation(status="active")
+        )
+
+        scheduler = AutomationScheduler()
+        await scheduler._sweep_parked_firings()
+
+        assert not scheduler._running_tasks
+        executor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("parked_status", "now", "skipped"),
+        [("active", "paused", True), ("paused", "paused", False)],
+        ids=["paused-meanwhile", "manual-run-of-a-paused-one"],
+    )
+    @patch(f"{_WAIT}.settle")
+    @patch(f"{_WAIT}.exec_db")
+    @patch(f"{_WAIT}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_parked_firing_of_an_automation_paused_meanwhile_is_skipped(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db, mock_settle,
+        parked_status, now, skipped,
+    ):
+        mock_executor_cls.get_instance.return_value = AsyncMock()
+        parked = _parked_row("auto-1", reachable=True, parked_status=parked_status)
+        automation = _make_automation(automation_id="auto-1", status=now)
+        mock_exec_db.list_parked_executions = AsyncMock(return_value=[parked])
+        mock_exec_db.release_parked_execution = AsyncMock(return_value=True)
+        mock_auto_db.get_automation = AsyncMock(return_value=automation)
+        mock_settle.side_effect = AsyncMock(return_value=True)
+
+        scheduler = AutomationScheduler()
+        await scheduler._sweep_parked_firings()
+        await asyncio.gather(*scheduler._running_tasks)
+
+        if skipped:
+            mock_settle.assert_awaited_once_with(
+                automation, parked["automation_execution_id"], Outcome.SKIPPED,
+                skip_reason="user", parked=True,
+            )
+            mock_exec_db.release_parked_execution.assert_not_awaited()
+        else:
+            mock_settle.assert_not_awaited()
+            mock_exec_db.release_parked_execution.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_WAIT}.settle")
+    @patch(f"{_WAIT}.exec_db")
+    @patch(f"{_WAIT}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_parked_firing_whose_computer_is_still_away_is_left_parked(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db, mock_settle
+    ):
+        mock_executor_cls.get_instance.return_value = AsyncMock()
+        mock_exec_db.list_parked_executions = AsyncMock(
+            return_value=[_parked_row("auto-1")]
+        )
+        mock_exec_db.release_parked_execution = AsyncMock()
+        mock_auto_db.get_automation = AsyncMock(return_value=_make_automation())
+
+        await AutomationScheduler()._sweep_parked_firings()
+
+        mock_settle.assert_not_awaited()
+        mock_exec_db.release_parked_execution.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch(f"{_WAIT}.settle")
+    @patch(f"{_WAIT}.exec_db")
+    @patch(f"{_WAIT}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_parked_firing_past_its_deadline_is_skipped_with_its_computer_back(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db, mock_settle
+    ):
+        """No sweep looked at the deadline itself (the scheduler was down),
+        and the computer came back since: the wait is over all the same."""
+        mock_executor_cls.get_instance.return_value = AsyncMock()
+        parked = _parked_row("auto-1", expired=True, reachable=True)
+        automation = _make_automation(automation_id="auto-1")
+        mock_exec_db.list_parked_executions = AsyncMock(return_value=[parked])
+        mock_exec_db.release_parked_execution = AsyncMock()
+        mock_auto_db.get_automation = AsyncMock(return_value=automation)
+
+        await AutomationScheduler()._sweep_parked_firings()
+
+        mock_settle.assert_awaited_once_with(
+            automation, parked["automation_execution_id"], Outcome.SKIPPED,
+            skip_reason="computer_unreachable", parked=True,
+        )
+        mock_exec_db.release_parked_execution.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @patch(f"{_MOD}.settle_abandoned")
     @patch(f"{_MOD}.exec_db")
     @patch(f"{_MOD}.auto_db")
@@ -426,7 +570,7 @@ class TestSweep:
     async def test_a_deleted_parents_pending_firing_is_skipped(
         self, mock_executor_cls, mock_auto_db, mock_exec_db, mock_settle
     ):
-        """The sweep skips unstarted rows in one call. A running row still settles."""
+        """DALTON-HOOK(company-automations): The sweep skips unstarted rows in one call. A running row still settles."""
         mock_executor_cls.get_instance.return_value = MagicMock()
         aid = "auto-deleted"
         pending = _abandoned_row(aid)
@@ -454,6 +598,30 @@ class TestSweep:
         mock_exec_db.list_deleted_parent_ids_with_unstarted.assert_not_called()
         mock_settle.assert_awaited_once()
         assert mock_settle.await_args.args[1]["status"] == "running"
+
+    @pytest.mark.asyncio
+    @patch(f"{_MOD}.settle_abandoned")
+    @patch(f"{_MOD}.exec_db")
+    @patch(f"{_MOD}.auto_db")
+    @patch(f"{_MOD}.AutomationExecutor")
+    async def test_a_wait_for_the_thread_left_by_a_stopped_process_is_settled(
+        self, mock_executor_cls, mock_auto_db, mock_exec_db, mock_settle
+    ):
+        mock_executor_cls.get_instance.return_value = AsyncMock()
+        waiting = {**_abandoned_row("auto-1"), "status": "waiting", "wait_reason": "thread_busy"}
+        automation = _make_automation(automation_id="auto-1")
+        mock_exec_db.settle_legacy_executions = AsyncMock(return_value=0)
+        # DALTON-HOOK(company-automations): scheduler sweep skips unstarted executions of soft-deleted parents
+        mock_exec_db.skip_unstarted_executions_of_deleted_parents = AsyncMock(
+            return_value=0
+        )
+        mock_exec_db.list_abandoned_executions = AsyncMock(return_value=[waiting])
+        mock_auto_db.get_automation_including_deleted = AsyncMock(return_value=automation)
+        mock_settle.side_effect = AsyncMock(return_value=Outcome.SKIPPED)
+
+        await AutomationScheduler()._sweep_abandoned_firings()
+
+        mock_settle.assert_awaited_once_with(automation, waiting, ABANDONED_AFTER_SECONDS)
 
     @pytest.mark.asyncio
     @patch(f"{_MOD}.AutomationExecutor")

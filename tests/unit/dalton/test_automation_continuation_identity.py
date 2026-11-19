@@ -17,6 +17,7 @@ from src.dalton.database import ai_finance as ai_finance_db
 from src.dalton.database import automation_reports as reports_db
 from src.dalton.tools import automation_report_tools as report_tools
 from src.server.database import automation_executions as exec_db
+from src.server.database.runs import lifecycle as tl_db
 from src.server.handlers.chat import ptc_run, request_prep
 from src.server.models.chat import ChatRequest, CommandReport, TaskReport
 from src.server.services import automation_delivery, automation_settlement, user_skills
@@ -39,6 +40,9 @@ from src.server.services.turn_runtime import TurnRoute
 from src.server.services.wakeups import cancel_notice
 from src.server.services.workspace_manager import WorkspaceManager
 from ptc_agent.core.session import Session
+
+_REAL_GET_LATEST_ATTEMPT = tl_db.get_latest_attempt
+_REAL_GET_RUN = tl_db.get_run
 
 _SETTLE_MOD = "src.server.services.automation_settlement"
 _PTC = "src.server.handlers.chat.ptc_run"
@@ -239,6 +243,16 @@ async def _run_ptc_through_graph_config(
         ),
         patch(f"{_PTC}.build_graph_config", create_autospec(ptc_run.build_graph_config, side_effect=_capture_build_graph_config)),
         patch(f"{_PTC}.open_with_steers_ahead", create_autospec(ptc_run.open_with_steers_ahead, side_effect=_CapturedConfig())),
+        *(
+            [patch("src.server.database.runs.lifecycle.get_latest_attempt", create_autospec(_REAL_GET_LATEST_ATTEMPT, return_value=None))]
+            if tl_db.get_latest_attempt is _REAL_GET_LATEST_ATTEMPT
+            else []
+        ),
+        *(
+            [patch("src.server.database.runs.lifecycle.get_run", create_autospec(_REAL_GET_RUN, return_value=None))]
+            if tl_db.get_run is _REAL_GET_RUN
+            else []
+        ),
         patch.object(carry, "carried_pair", create_autospec(carry.carried_pair, return_value={})),
         patch.object(carry, "carried_delivery", create_autospec(carry.carried_delivery, return_value=None)),
         patch.object(automation_settlement, "take_over_firing", take_over),
@@ -1075,6 +1089,16 @@ async def test_s1_start_locks_execution_and_takes_over_inside_same_transaction()
                 patch(f"{_PTC}._fire_and_forget", create_autospec(ptc_run._fire_and_forget, side_effect=lambda c, **_kw: c.close() if hasattr(c, "close") else None)),
                 patch(f"{_PTC}.build_graph_config", create_autospec(ptc_run.build_graph_config, side_effect=_capture_cfg)),
                 patch(f"{_PTC}.open_with_steers_ahead", create_autospec(ptc_run.open_with_steers_ahead, side_effect=_CapturedConfig())),
+                *(
+                    [patch("src.server.database.runs.lifecycle.get_latest_attempt", create_autospec(_REAL_GET_LATEST_ATTEMPT, return_value=None))]
+                    if tl_db.get_latest_attempt is _REAL_GET_LATEST_ATTEMPT
+                    else []
+                ),
+                *(
+                    [patch("src.server.database.runs.lifecycle.get_run", create_autospec(_REAL_GET_RUN, return_value=None))]
+                    if tl_db.get_run is _REAL_GET_RUN
+                    else []
+                ),
                 patch.object(carry, "carried_pair", create_autospec(carry.carried_pair, return_value={})),
                 patch.object(carry, "carried_delivery", create_autospec(carry.carried_delivery, return_value=None)),
                 patch.object(automation_delivery, "turn_metadata", create_autospec(automation_delivery.turn_metadata, return_value={})),

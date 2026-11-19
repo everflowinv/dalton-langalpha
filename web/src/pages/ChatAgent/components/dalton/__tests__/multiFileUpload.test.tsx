@@ -38,6 +38,7 @@ vi.mock('@/pages/ChatAgent/utils/workspaceUpload', async (importOriginal) => {
 });
 
 import { uploadToWorkspace } from '@/pages/ChatAgent/utils/workspaceUpload';
+import { NOT_AWAY } from '../../filePanel/useComputerAway';
 import { useFileUpload } from '../../filePanel/useFileUpload';
 
 const mockUpload = vi.mocked(uploadToWorkspace);
@@ -86,7 +87,7 @@ describe('useFileUpload — multi-file upload', () => {
     });
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles, away: NOT_AWAY }));
 
     await act(async () => {
       result.current.handleDrop(dropEvent([
@@ -117,7 +118,7 @@ describe('useFileUpload — multi-file upload', () => {
     });
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles, away: NOT_AWAY }));
 
     await act(async () => {
       result.current.handleDrop(dropEvent([
@@ -148,7 +149,7 @@ describe('useFileUpload — multi-file upload', () => {
     }));
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles, away: NOT_AWAY }));
 
     act(() => {
       result.current.handleDrop(dropEvent([
@@ -182,7 +183,7 @@ describe('useFileUpload — multi-file upload', () => {
     mockUpload.mockRejectedValue(new Error('nope'));
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles, away: NOT_AWAY }));
 
     await act(async () => {
       result.current.handleDrop(dropEvent([makeFile('a.txt'), makeFile('b.txt')]) as React.DragEvent);
@@ -197,7 +198,7 @@ describe('useFileUpload — multi-file upload', () => {
     mockUpload.mockResolvedValue({ path: 'uploaded' });
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles, away: NOT_AWAY }));
 
     await act(async () => {
       result.current.handleFileInputChange(changeEvent([
@@ -216,7 +217,7 @@ describe('useFileUpload — multi-file upload', () => {
       release = () => resolve({ path: 'uploaded' });
     }));
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1' }));
+      useFileUpload({ workspaceId: 'ws-1', away: NOT_AWAY }));
 
     let batch: Promise<void> = Promise.resolve();
     act(() => {
@@ -250,7 +251,7 @@ describe('useFileUpload — multi-file upload', () => {
     }));
     const onRefreshFiles = vi.fn();
     const { result } = renderHookWithProviders(() =>
-      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles }));
+      useFileUpload({ workspaceId: 'ws-1', onRefreshFiles, away: NOT_AWAY }));
 
     act(() => {
       result.current.handleDrop(dropEvent([
@@ -307,7 +308,7 @@ describe('useFileUpload — workspace switch / unmount guard', () => {
   function renderUploadHook(initial: { ws: string; refresh: () => void }) {
     return renderHook(
       (p: { ws: string; refresh: () => void }) =>
-        useFileUpload({ workspaceId: p.ws, onRefreshFiles: p.refresh }),
+        useFileUpload({ workspaceId: p.ws, onRefreshFiles: p.refresh, away: NOT_AWAY }),
       { initialProps: initial },
     );
   }
