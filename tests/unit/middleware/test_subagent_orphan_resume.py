@@ -27,6 +27,9 @@ from ptc_agent.agent.middleware.background_subagent import task_actions
 from ptc_agent.agent.middleware.background_subagent.middleware import (
     BackgroundSubagentMiddleware,
 )
+from ptc_agent.agent.middleware.background_subagent.subagent import (
+    run_on_by_type,
+)
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
     BackgroundTaskRegistry,
@@ -60,6 +63,7 @@ class FakeLedger:
         self.latest = latest
         self.rows: dict[str, dict] = {}
         self.admitted: list[str] = []
+        self.started_kwargs: list[dict] = []
         self.run_ids: list[str] = []
         self.finalized: list[tuple[str, str]] = []
         self.reads = 0
@@ -77,6 +81,7 @@ class FakeLedger:
         run_id = f"tr-{len(self.run_ids) + 2}"
         self.run_ids.append(run_id)
         self.admitted.append(str(kwargs.get("cause")))
+        self.started_kwargs.append(dict(kwargs))
         self.rows[run_id] = {"task_run_id": run_id, "status": "in_progress"}
         self.latest = self.rows[run_id]
         return run_id
@@ -693,10 +698,17 @@ async def test_a_failed_ledger_recheck_under_the_fence_refuses_and_releases():
     owner = FakeOwner()
     ledger = FakeLedger(_worker_lost_run())
 
-    async def _raise(task_id):
+    calls = 0
+
+    async def _raise_under_fence(task_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # Pre-fence _last_model read succeeds with no per-task override.
+            return ledger.latest
         raise RuntimeError("db")
 
-    ledger.get_latest_run = _raise
+    ledger.get_latest_run = _raise_under_fence
     mw = _middleware(owner, ledger)
     mw.registry.write_task_meta = AsyncMock()
     _seed_orphan(mw, None)  # prior round gone: no live writer to arbitrate
@@ -762,3 +774,67 @@ async def test_a_follow_up_on_a_worker_lost_task_wakes_the_thread_once():
     inbox.release_resumes.assert_not_awaited()
     inbox.confirm_resumes.assert_not_awaited()
     await task.asyncio_task
+
+
+@pytest.mark.asyncio
+async def test_configured_subagent_model_rides_spawn_and_resume():
+    """A model configured for a subagent type rides both background spawn
+    admission and resume admission via ``run_on_by_type`` -> ``run_on``."""
+    owner = FakeOwner()
+    ledger = FakeLedger()
+    configured_model = {"id": "claude-haiku-5-5", "provider": "anthropic"}
+    registry = BackgroundTaskRegistry(thread_id="thread-x")
+    registry.run_ledger = ledger
+    registry.write_task_meta = AsyncMock()
+
+    mw = BackgroundSubagentMiddleware(
+        registry=registry,
+        enabled=True,
+        subagent_types={"research"},
+        namespace_owner=owner,
+        run_on=run_on_by_type(
+            [{"name": "research"}],
+            default_model=SimpleNamespace(),
+            models={"research": configured_model},
+            claude_code=None,
+        ),
+    )
+
+    init_res = await mw.awrap_tool_call(
+        _request(
+            {
+                "action": "init",
+                "subagent_type": "research",
+                "description": "d",
+                "prompt": "p",
+            },
+            tool_call_id="tc-init",
+        ),
+        _ok_handler,
+    )
+    assert "Task-" in init_res.content
+    task = registry._tasks["tc-init"]
+    await task.asyncio_task
+
+    assert ledger.started_kwargs[0]["cause"] == "init"
+    assert ledger.started_kwargs[0]["model"] == configured_model
+    assert "model_override" not in ledger.started_kwargs[0]
+
+    resume_res = await mw.awrap_tool_call(
+        _request(
+            {
+                "action": "resume",
+                "task_id": task.task_id,
+                "description": "d",
+                "prompt": "more",
+            },
+            tool_call_id="tc-res",
+        ),
+        _ok_handler,
+    )
+    assert "Resumed" in resume_res.content
+    await task.asyncio_task
+
+    assert ledger.started_kwargs[1]["cause"] == "resume"
+    assert ledger.started_kwargs[1]["model"] == configured_model
+    assert "model_override" not in ledger.started_kwargs[1]

@@ -243,6 +243,34 @@ class TestBothRolesBindThem:
 
         assert "workspace_id" not in main["send_message"].args
 
+    # DALTON-HOOK(computer-cli-tokens-off): send_message points at manage_workspaces when CLI is off.
+    @pytest.mark.parametrize(
+        ("cli_enabled", "expected", "absent"),
+        [
+            (False, 'manage_workspaces(action="list")', "la workspaces list"),
+            (True, "la workspaces list", 'manage_workspaces(action="list")'),
+        ],
+    )
+    def test_send_message_workspace_id_description_follows_cli_switch(
+        self, configured, monkeypatch, cli_enabled, expected, absent
+    ):
+        from unittest.mock import create_autospec
+
+        import src.dalton.settings as dalton_settings
+
+        monkeypatch.setattr(
+            dalton_settings,
+            "is_computer_cli_tokens_enabled",
+            create_autospec(
+                dalton_settings.is_computer_cli_tokens_enabled,
+                return_value=cli_enabled,
+            ),
+        )
+        tool = _tool("send_message", "chief_of_staff")
+        desc = tool.args["workspace_id"]["description"]
+        assert expected in desc
+        assert absent not in desc
+
     @pytest.mark.parametrize("role", ["analyst", "chief_of_staff"])
     def test_the_prompt_says_how_to_talk_over_chat(self, configured, role):
         from ptc_agent.agent.middleware.runtime_context.frozen_prompt import (
@@ -440,6 +468,37 @@ class TestTheSendRequest:
         assert message.content.startswith("status: failed\ncode: invalid_request")
         assert "Nothing was sent." in message.content
         assert message.artifact["status"] == "failed"
+
+    # DALTON-HOOK(computer-cli-tokens-off): invalid workspace_id hint follows CLI switch.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("cli_enabled", "expected", "absent"),
+        [
+            (False, 'manage_workspaces(action="list")', "la workspaces list"),
+            (True, "la workspaces list", 'manage_workspaces(action="list")'),
+        ],
+    )
+    async def test_invalid_workspace_id_hint_follows_cli_switch(
+        self, gateway, monkeypatch, cli_enabled, expected, absent
+    ):
+        from unittest.mock import create_autospec
+
+        import src.dalton.settings as dalton_settings
+
+        monkeypatch.setattr(
+            dalton_settings,
+            "is_computer_cli_tokens_enabled",
+            create_autospec(
+                dalton_settings.is_computer_cli_tokens_enabled,
+                return_value=cli_enabled,
+            ),
+        )
+        message = await _message(
+            _tool("send_message", "chief_of_staff"),
+            {"text": "hi", "files": ["a.csv"], "workspace_id": "ws-nvda"},
+        )
+        assert expected in message.content
+        assert absent not in message.content
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

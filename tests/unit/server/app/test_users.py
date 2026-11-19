@@ -1562,16 +1562,16 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
                     "dalton_audit_model": "gemini-3.8-flash-low-oauth",
                     "dalton_audit_fallback_models": [
                         "deepseek-flash",
-                        "gpt-6.1-sol-oauth",
+                        "gpt-6.2-sol-oauth",
                         "deepseek-flash",
                     ],
                     "dalton_audit_timeout_s": 300,
                     "dalton_assist_model": "gemini-3.8-flash-low-oauth",
                     "dalton_assist_fallback_models": ["deepseek-flash"],
                     "dalton_reviewer_models": [
-                        "gpt-6.1-sol-oauth",
+                        "gpt-6.2-sol-oauth",
                         "claude-opus-5-5-oauth",
-                        "gpt-6.1-sol-oauth",
+                        "gpt-6.2-sol-oauth",
                     ],
                     "dalton_extract_model": "",
                 }
@@ -1583,11 +1583,11 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
     assert saved_mp["dalton_audit_model"] == "gemini-3.8-flash-low-oauth"
     assert saved_mp["dalton_audit_fallback_models"] == [
         "deepseek-flash",
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
     ]
     assert saved_mp["dalton_audit_timeout_s"] == 300
     assert saved_mp["dalton_reviewer_models"] == [
-        "gpt-6.1-sol-oauth",
+        "gpt-6.2-sol-oauth",
         "claude-opus-5-5-oauth",
     ]
     assert saved_mp["dalton_extract_model"] is None
@@ -1603,7 +1603,7 @@ async def test_dalton_model_preference_valid_dedup_and_clear_accepted(client):
             "dalton_assist_model",
         ),
         (
-            {"dalton_reviewer_models": ["gpt-6.1-sol-oauth", "unknown-model-999"]},
+            {"dalton_reviewer_models": ["gpt-6.2-sol-oauth", "unknown-model-999"]},
             "dalton_reviewer_models",
         ),
         ({"dalton_reviewer_models": "not-a-list"}, "dalton_reviewer_models"),
