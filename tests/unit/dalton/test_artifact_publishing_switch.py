@@ -650,7 +650,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             user_id="u-1",
             mcp_registry=MagicMock(),
             sandbox=MagicMock(),
-            claude_code_launcher=lambda sandbox, admitted: LocalLauncher(),
+            claude_code_launcher=lambda sandbox, admitted, *queue, **kw: LocalLauncher(),
         )
     # Upstream #729: a Claude Code graph's turn is the run named by config.
     # The tool list lives on the ClaudeTurn that call returns.
