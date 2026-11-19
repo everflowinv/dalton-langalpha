@@ -2147,3 +2147,20 @@ def test_hk_history_listing_entirely_before_hist_start_is_not_an_error(tmp_path)
     assert res["n_errors"] == 0
     lines = (tmp_path / "hist" / "08888.csv").read_text(encoding="utf-8").splitlines()
     assert lines == ["date,open,close,high,low,volume,turnover_wan"]
+
+
+def test_hk_history_rejects_a_response_with_only_bad_bars_before_hist_start(tmp_path, monkeypatch):
+    from scripts.dalton.monitor_feeds.hk_momentum import fetch_data as hkf
+
+    class _Resp:
+        def json(self):
+            return {"data": {"hk08888": {"qfqday": [
+                ["2023-05-30", "", "", "", "", "1"],
+                ["2023-05-31", "-1", "-1", "-1", "-1", "1"],
+            ]}}}
+
+    sess = create_autospec(requests.Session, instance=True)
+    sess.get.return_value = _Resp()
+    monkeypatch.setattr(hkf.time, "sleep", lambda *_: None)
+    res = hkf.download_history(["08888"], state_dir=tmp_path, target_date="2026-11-19", session=sess)
+    assert res["n_errors"] == 1

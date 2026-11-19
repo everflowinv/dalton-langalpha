@@ -599,6 +599,7 @@ def fetch_hist_one(
     out.raw_count = len(rows)
     seen_dates: set[str] = set()
     bad_rows = 0
+    valid_before_start = False
     for row in rows:
         try:
             d_str = str(row[0]).strip()
@@ -612,6 +613,11 @@ def fetch_hist_one(
             if d_str < HIST_START:
                 # Bars before HIST_START are never written; a bad one there
                 # must not sink the bars that are kept.
+                if not valid_before_start:
+                    try:
+                        valid_before_start = float(row[2]) > 0
+                    except (ValueError, IndexError, TypeError):
+                        pass
                 continue
             o, c, h, lo, vol = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
             if (
@@ -639,7 +645,7 @@ def fetch_hist_one(
             continue
     # A listing whose valid bars all predate HIST_START is not an error: it
     # simply has nothing in the panel's range.
-    if bad_rows > 0 or (not out and out.first_date is None):
+    if bad_rows > 0 or (not out and not valid_before_start):
         raise RuntimeError(
             f"历史行情记录不完整或含重复/无效日期 ({code}: total={len(rows)}, valid={len(out)}, bad={bad_rows})"
         )
