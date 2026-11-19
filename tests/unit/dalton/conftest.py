@@ -93,3 +93,18 @@ def _isolated_alphaengine_ledger_and_cache(
         "DALTON_BRIDGE_CACHE_DIR",
         str(tmp_path / "bridge_cache"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_claimed_signals_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preflight now looks up the execution's own claimed signals first (restart
+    recovery). Unit tests that drive preflight without a database get "none
+    claimed" unless they patch ``list_signals_claimed_by`` themselves; tests of
+    the real SQL call the saved function object directly."""
+    from src.dalton.database import watch as watch_db
+
+    monkeypatch.setattr(
+        watch_db,
+        "list_signals_claimed_by",
+        create_autospec(watch_db.list_signals_claimed_by, return_value=[]),
+    )

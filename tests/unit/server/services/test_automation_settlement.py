@@ -1620,3 +1620,68 @@ async def test_a_run_another_subscription_refused_at_its_limit_settles_as_that_p
     words = "Your ChatGPT Plus plan's 5-hour limit is used up. It resets at Thu Jan 3, 3:40 PM EST."
     assert (written["to"], written["strike"], written["failure_reason"]) == ("failed", None, "plan_limit")
     assert written["error_message"] == words
+
+
+# DALTON-HOOK(preflight): committed non-COMPLETED terminal settlement releases
+# active signals claimed by a Dalton execution; COMPLETED, non-Dalton, and
+# rejected stale-worker settlements never release them.
+def _dalton_automation(trigger: str = "cron") -> dict:
+    return {
+        **_automation(trigger),
+        "name": "dalton-company-meta",
+        "workspace_id": "ws-meta-1",
+        "metadata": {"dalton_managed": True},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [Outcome.FAILED, Outcome.PRECHECK_SKIPPED, Outcome.TIMEOUT, Outcome.INTERRUPTED],
+)
+async def test_dalton_non_completed_settlement_releases_claimed_signals(
+    outcome: Outcome,
+) -> None:
+    from src.dalton.database import watch as watch_db
+
+    release_mock = create_autospec(watch_db.release_signals_claimed_by, return_value=1)
+    with (
+        _settlement(_row()),
+        patch("src.dalton.database.watch.release_signals_claimed_by", new=release_mock),
+    ):
+        settled = await settle(_dalton_automation(), _EID, outcome, workspace_id="ws-meta-1")
+        await drain_tails()
+
+    assert settled is True
+    # Released inside the settlement transaction, on its connection.
+    release_mock.assert_awaited_once_with(_EID, conn=_CONN)
+
+
+@pytest.mark.asyncio
+async def test_dalton_completed_non_dalton_and_stale_settlement_do_not_release() -> None:
+    from src.dalton.database import watch as watch_db
+
+    release_mock = create_autospec(watch_db.release_signals_claimed_by, return_value=1)
+    with patch("src.dalton.database.watch.release_signals_claimed_by", new=release_mock):
+        with _settlement(_row()):
+            assert (
+                await settle(_dalton_automation(), _EID, Outcome.COMPLETED, workspace_id="ws-meta-1")
+            ) is True
+            assert (
+                await settle(_automation(), _EID, Outcome.FAILED, workspace_id="ws-meta-1")
+            ) is True
+            await drain_tails()
+
+        with _settlement(None):
+            assert (
+                await settle(
+                    _dalton_automation(),
+                    _EID,
+                    Outcome.FAILED,
+                    workspace_id="ws-meta-1",
+                    expected_run_id="run-stale",
+                )
+            ) is False
+            await drain_tails()
+
+    release_mock.assert_not_awaited()
