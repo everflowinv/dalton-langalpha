@@ -87,6 +87,8 @@ function MacHandoff() {
     }
   };
   const getApp = () => {
+    // DALTON-HOOK(help): no window or pending transition when desktop download URL is omitted
+    if (!DESKTOP_DOWNLOAD_URL) return;
     window.open(DESKTOP_DOWNLOAD_URL, '_blank', 'noopener,noreferrer');
     setWaiting(true);
     // A write refused leaves setup the browser's: the way to get the app stays.
@@ -119,10 +121,13 @@ function MacHandoff() {
       {state === 'get' && (
         <ProgressList>
           <ProgressStep n={1} state="active" title={t(`${T}.get.step1`)}>
-            <Button type="button" size="sm" onClick={getApp} disabled={isUpdating} className="gap-1.5 self-start">
-              {t(`${T}.get.download`)}
-              <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
-            </Button>
+            {/* DALTON-HOOK(help): omit desktop download button when DESKTOP_DOWNLOAD_URL is null */}
+            {DESKTOP_DOWNLOAD_URL && (
+              <Button type="button" size="sm" onClick={getApp} disabled={isUpdating} className="gap-1.5 self-start">
+                {t(`${T}.get.download`)}
+                <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
+              </Button>
+            )}
           </ProgressStep>
           <ProgressStep n={2} state="todo" title={user?.email ? t(`${T}.get.step2`, { email: user.email }) : t(`${T}.get.step2Unnamed`)} />
           <ProgressStep n={3} state="todo" title={t(`${T}.get.step3`)} />

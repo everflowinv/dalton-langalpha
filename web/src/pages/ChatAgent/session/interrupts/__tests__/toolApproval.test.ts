@@ -9,7 +9,6 @@ import { describe, it, expect, vi } from 'vitest';
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
 
 import { projectLiveInterrupt } from '../fromLiveEvent';
-import { createAnswerBoard } from '../answerBoard';
 import { createPauseSlot } from '../pauseSlot';
 import { projectHistoryInterrupt, type HistoryInterruptContext } from '../fromHistoryEvent';
 import { createApprovalEvidence } from '../claims';
@@ -83,14 +82,15 @@ describe('live projection', () => {
     }) as StreamRuntime['setMessages'];
     const ids = ref(new Set<string>());
     const show = vi.fn();
+    const board = createAnswerBoard({ pendingIds: ids, sessionEpoch: ref(0), setMessages });
     const rt = {
       setMessages,
-      pause: createPauseSlot(show, createAnswerBoard({ pendingIds: ids, sessionEpoch: ref(0), setMessages })),
+      pause: createPauseSlot(show, board),
       currentRunIdRef: ref<string | null>('run-1'),
       renderedInterruptIdsRef: ref(new Set<string>()),
     } as unknown as StreamRuntime;
     const refs = { contentOrderCounterRef: ref(0) } as unknown as StreamProcessorRefs;
-    return { rt, refs, ids, show, read: () => current };
+    return { rt, refs, ids, board, show, read: () => current };
   }
 
   it('renders a tool approval card with the exact arguments', () => {
@@ -225,12 +225,7 @@ describe('live projection', () => {
 
     for (const item of cases) {
       const intId = `int-${item.type}`;
-      const { rt, refs, read } = build([bubble('a-1')]);
-      const board = createAnswerBoard({
-        pendingIds: rt.pendingInterruptIdsRef,
-        sessionEpoch: ref(0),
-        setMessages: rt.setMessages,
-      });
+      const { rt, refs, ids, board, read } = build([bubble('a-1')]);
       projectLiveInterrupt(
         rt,
         {
@@ -262,7 +257,7 @@ describe('live projection', () => {
         args: item.args,
         confirmToken: item.confirm_token,
       });
-      expect(rt.pendingInterruptIdsRef.current.has(intId)).toBe(true);
+      expect(ids.current.has(intId)).toBe(true);
 
       const entry = board.decideToolCall(intId, intId, { index: 0, count: 1 }, item.click);
       expect(entry).toEqual({ decisions: [item.expectedDecision] });
@@ -417,7 +412,7 @@ describe('history projection', () => {
         sessionEpoch: ref(0),
         setMessages: rt.setMessages,
       });
-      board.arm(ctx.pendingHistoryInterrupts.map((info) => info.interruptId));
+      board.track(ctx.pendingHistoryInterrupts.map((info) => info.interruptId));
       const entry = board.decideToolCall(intId, intId, { index: 0, count: 1 }, { approved: true });
       expect(board.answer(intId, entry!)).toEqual({
         [intId]: { decisions: [{ type: 'approve' }] },

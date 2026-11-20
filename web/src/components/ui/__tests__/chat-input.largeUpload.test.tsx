@@ -1005,7 +1005,7 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       },
       flushMessages: () => {},
       setIsLoading: vi.fn(),
-      setPendingInterrupt: vi.fn(),
+      pause: { current: () => null, arm: vi.fn(), clear: vi.fn(), attach: vi.fn() },
       setTokenUsage: vi.fn(),
       setNextSummary: vi.fn(),
       setMessageError: (updater) => {
@@ -1030,7 +1030,6 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       pendingPTCBackfillRef: { current: new Map() },
       threadIdRef: { current: 'thread-1' },
       lastEventIdRef: { current: null },
-      pendingInterruptIdsRef: { current: new Set() },
       renderedInterruptIdsRef: { current: new Set() },
       unresolvedHistoryInterruptRef: { current: [] },
       terminalTaskOutcomesRef: { current: new Map() },

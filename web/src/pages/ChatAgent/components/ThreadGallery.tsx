@@ -1,6 +1,5 @@
 import { useSharedEntry, useWorkspaceCapabilities } from '@/hooks/useSharedWorkspaces';
 import { useThreadPrivacy } from './chatView/useThreadPrivacy';
-import { useUser } from '@/hooks/useUser';
 import { threadStanding } from '@/lib/sharedThreads';
 import { SharedPeopleButton, SharedWorkspaceKind } from '@/components/sharedWorkspaces/SharedWorkspaceHeader';
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';

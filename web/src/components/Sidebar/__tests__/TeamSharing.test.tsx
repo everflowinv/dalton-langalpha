@@ -1468,6 +1468,7 @@ describe('Dalton Team Sharing', () => {
     const { unmount: unmountCard } = renderWithProviders(
       <ThreadCard
         thread={{
+          workspace_id: 'ws-richard-1',
           thread_id: 'th-1',
           title: 'Dispatched NVDA Valuation',
           dispatched_by: { user_id: 'u-chao', name: 'Chao Yu', channel: 'cos' },
