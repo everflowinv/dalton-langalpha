@@ -6,17 +6,20 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
+SKILL_DIR = Path(__file__).resolve().parent.parent
 MAX_NEW_AUTHORS = 3
 THESIS_REL = "research/tracker/thesis.md"
 POOL_REL = "research/tracker/x_pool.json"
@@ -85,15 +88,44 @@ def ensure_relative(workspace: Path, raw: str) -> Path:
     return current
 
 
-SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
+def _load_tracker_config() -> Any:
+    path = Path(__file__).resolve().parent / "tracker_config.py"
+    name = "dalton_bullbear_tracker_config"
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, "__file__", None) == str(path):
+        return cached
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"找不到共享配置模块 {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def supported_tickers() -> tuple[str, ...]:
+    return _load_tracker_config().supported_tickers(skill_dir=SKILL_DIR)
+
+
+def resolve_rules_path(ticker: str, workspace: Path | str | None = None) -> tuple[Path, str]:
+    cfg_mod = _load_tracker_config()
+    try:
+        resolved, source = cfg_mod.resolve_rules_path(
+            ticker, workspace=workspace, skill_dir=SKILL_DIR, strict=True
+        )
+    except cfg_mod.RulesPathError as exc:
+        raise StateError(exc.status, exc.message) from exc
+    if resolved is None or source is None:
+        raise StateError("rules_missing", f"找不到 {ticker} 的公司规则文件")
+    return resolved, source
 
 
 def resolve_ticker(raw: str | None = None) -> str:
-    # 省略参数时仍默认 MSFT，兼容只传工作区的旧调用。显式空白不能再落成 MSFT。
+    # 省略参数时仍默认 MSFT。显式空白不能再落成 MSFT。
     if raw is None:
         return "MSFT"
     chosen = str(raw).strip().upper()
-    if chosen not in SUPPORTED_TICKERS:
+    if chosen not in supported_tickers():
         raise StateError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
     return chosen
 
@@ -593,9 +625,49 @@ def _review_matches_company(root: Path, run_id: str, review: dict[str, Any], com
     return _recorded_company(review) == company
 
 
+def _has_card_file(root: Path, item: dict[str, Any]) -> bool:
+    if item.get("research_pending"):
+        return False
+    card_rel = item.get("card_json")
+    if not isinstance(card_rel, str) or not card_rel.strip():
+        run_id = item.get("run_id")
+        if (
+            isinstance(run_id, str)
+            and run_id
+            and item.get("material") != "no"
+            and item.get("content_kind") != "failure_text"
+        ):
+            card_rel = f"research/tracker/{run_id}/card.json"
+        else:
+            return False
+    try:
+        resolved = ensure_relative(root, card_rel)
+    except StateError:
+        return False
+    raw_path = root / card_rel
+    return not raw_path.is_symlink() and not resolved.is_symlink() and resolved.is_file()
+
+
+_ACTION_PRIORITY: dict[str, int] = {
+    "commit_local": 3,
+    "check_status": 2,
+    "research": 1,
+}
+
+
+def _classify_run_action(root: Path, item: dict[str, Any]) -> str:
+    if item.get("research_pending") is True:
+        return "research"
+    if item.get("material") == "no":
+        return "commit_local"
+    if item.get("content_kind") == "failure_text" or _has_card_file(root, item):
+        return "check_status"
+    return "research"
+
+
 def unfinished_runs(workspace: Path | str, ticker: str = "MSFT") -> list[dict[str, Any]]:
-    ticker = resolve_ticker(ticker)
     root = open_workspace(workspace)
+    ticker = resolve_ticker(ticker)
     tracker = root / "research" / "tracker"
     if not tracker.is_dir():
         return []
@@ -626,7 +698,18 @@ def unfinished_runs(workspace: Path | str, ticker: str = "MSFT") -> list[dict[st
                 "packet_json": f"research/tracker/{run_id}/packet.json",
             }
         )
-    found.sort(key=lambda item: str(item.get("run_id") or ""), reverse=True)
+    found.sort(
+        key=lambda item: (
+            _ACTION_PRIORITY.get(_classify_run_action(root, item), 0),
+            str(item.get("run_id") or ""),
+        ),
+        reverse=True,
+    )
+    for entry in found:
+        action = _classify_run_action(root, entry)
+        entry["action"] = action
+        if action == "check_status":
+            entry["content_kind"] = entry.get("content_kind") or "cards"
     return found
 
 
@@ -775,6 +858,10 @@ def main(argv: list[str] | None = None) -> int:
     opened.add_argument("--ticker", required=True)
     opened.add_argument("--workspace-dir", required=True)
 
+    rules = sub.add_parser("rules-path")
+    rules.add_argument("--ticker", required=True)
+    rules.add_argument("--workspace-dir", required=True)
+
     pool = sub.add_parser("x-pool")
     pool_cmd = pool.add_subparsers(dest="pool_cmd", required=True)
     add = pool_cmd.add_parser("add")
@@ -804,7 +891,23 @@ def main(argv: list[str] | None = None) -> int:
                 ticker=args.ticker,
             )
         elif args.cmd == "open-runs":
-            result = {"ok": True, "runs": unfinished_runs(args.workspace_dir, args.ticker)}
+            ws_root = open_workspace(args.workspace_dir)
+            chosen_ticker = resolve_ticker(args.ticker)
+            runs = unfinished_runs(ws_root, chosen_ticker)
+            result = {
+                "ok": True,
+                "runs": runs,
+            }
+        elif args.cmd == "rules-path":
+            ws_root = open_workspace(args.workspace_dir)
+            chosen_ticker = resolve_ticker(args.ticker)
+            rules_file, rules_source = resolve_rules_path(chosen_ticker, workspace=ws_root)
+            result = {
+                "ok": True,
+                "ticker": chosen_ticker,
+                "rules_path": str(rules_file),
+                "rules_source": rules_source,
+            }
         elif args.pool_cmd == "add":
             result = add_author(
                 args.workspace_dir,

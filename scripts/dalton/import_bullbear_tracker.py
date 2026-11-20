@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -18,7 +19,27 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
+
+def _load_bullbear_tickers() -> Any:
+    try:
+        from src.dalton import bullbear_tickers  # type: ignore
+
+        return bullbear_tickers
+    except ImportError:
+        path = Path(__file__).resolve().parents[2] / "src" / "dalton" / "bullbear_tickers.py"
+        spec = importlib.util.spec_from_file_location("src.dalton.bullbear_tickers", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"找不到共享 ticker 读取模块 {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["src.dalton.bullbear_tickers"] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+def supported_tickers(skill_dir: Path | None = None) -> tuple[str, ...]:
+    return _load_bullbear_tickers().supported_bullbear_tickers(skill_dir=skill_dir)
+
+
 MANIFEST_SCHEMA = "bullbear-tracker-import/1"
 LEGACY_MANIFEST_SCHEMA = "msft-tracker-import/1"
 SEEN_REL = "research/tracker/seen.json"
@@ -82,7 +103,7 @@ def import_bullbear_tracker(
         "working_thesis_action": None,
     }
     chosen = str(ticker or "").strip().upper()
-    if chosen not in SUPPORTED_TICKERS:
+    if chosen not in supported_tickers():
         _conflict(plan, "ticker", "unsupported_ticker")
         return _result(plan, apply, written=[])
     plan["ticker"] = chosen

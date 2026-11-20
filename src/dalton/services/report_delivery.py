@@ -9,7 +9,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -19,6 +19,11 @@ import httpx
 from psycopg.rows import dict_row
 
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.bullbear_tickers import (
+    bullbear_report_profiles,
+    explain_unsupported_bullbear_ticker,
+    supported_bullbear_tickers,
+)
 from src.dalton.database.automation_reports import (
     REPORT_PROFILES,
     automation_has_validated_report_profile,
@@ -111,18 +116,30 @@ EXACT_SKILL_TO_PROFILE: dict[str, str] = {
     "dalton-podcast-weekly": "podcast-weekly",
 }
 
-MULTI_PROFILE_SKILLS: dict[str, tuple[str, ...]] = {
-    "dalton-bullbear-tracker": (
-        "msft-tracker",
-        "meta-tracker",
-        "amzn-tracker",
-        "googl-tracker",
-    ),
-    "dalton-market-digest": (
-        "market-digest-am",
-        "market-digest-pm",
-    ),
-}
+_MARKET_DIGEST_PROFILES: tuple[str, ...] = (
+    "market-digest-am",
+    "market-digest-pm",
+)
+
+
+class _MultiProfileSkills(Mapping[str, tuple[str, ...]]):
+    """Mapping from multi-profile skill name to its currently supported profiles."""
+
+    def __getitem__(self, key: str) -> tuple[str, ...]:
+        if key == "dalton-bullbear-tracker":
+            return bullbear_report_profiles()
+        if key == "dalton-market-digest":
+            return _MARKET_DIGEST_PROFILES
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("dalton-bullbear-tracker", "dalton-market-digest"))
+
+    def __len__(self) -> int:
+        return 2
+
+
+MULTI_PROFILE_SKILLS: Mapping[str, tuple[str, ...]] = _MultiProfileSkills()
 
 _ALL_REPORT_SKILLS = frozenset(EXACT_SKILL_TO_PROFILE) | frozenset(MULTI_PROFILE_SKILLS)
 _SKILL_TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
@@ -190,19 +207,30 @@ def allowed_profiles_for_instruction(instruction: str | None) -> list[str]:
     return sorted(profiles)
 
 
+def _explicit_metadata_ticker(metadata: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    raw = str(metadata.get("ticker") or "").strip().upper()
+    return raw or None
+
+
 def _infer_bullbear_profile(
     instruction: str,
     metadata: Mapping[str, Any] | None,
     name: str | None,
 ) -> str | None:
+    tickers = supported_bullbear_tickers()
+    ticker_set = set(tickers)
+    explicit = _explicit_metadata_ticker(metadata)
+    if explicit is not None:
+        if explicit in ticker_set:
+            return f"{explicit.lower()}-tracker"
+        return None
     ticker_candidates: set[str] = set()
-    if isinstance(metadata, Mapping):
-        raw_ticker = str(metadata.get("ticker") or "").strip().upper()
-        if raw_ticker in {"MSFT", "META", "AMZN", "GOOGL"}:
-            ticker_candidates.add(raw_ticker)
     combined = f"{name or ''}\n{instruction}"
-    for ticker in ("MSFT", "META", "AMZN", "GOOGL"):
-        if re.search(rf"(?<![A-Za-z0-9]){ticker}(?![A-Za-z0-9])", combined, re.IGNORECASE):
+    for ticker in tickers:
+        flags = 0 if len(ticker) <= 4 else re.IGNORECASE
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])", combined, flags):
             ticker_candidates.add(ticker)
     if len(ticker_candidates) == 1:
         return f"{next(iter(ticker_candidates)).lower()}-tracker"
@@ -235,6 +263,12 @@ def infer_report_profile(
     if not skills:
         return None, sorted(REPORT_PROFILES)
     candidates = allowed_profiles_for_instruction(instruction)
+    if "dalton-bullbear-tracker" in skills:
+        explicit = _explicit_metadata_ticker(metadata)
+        if explicit is not None:
+            if explicit in set(supported_bullbear_tickers()):
+                return f"{explicit.lower()}-tracker", candidates
+            return None, candidates
     if len(candidates) == 1:
         return candidates[0], candidates
     if len(skills) == 1:
@@ -270,6 +304,14 @@ def resolve_report_profile_id(
                 code="profile_skill_mismatch",
             )
         return cleaned
+
+    if "dalton-bullbear-tracker" in skills:
+        explicit = _explicit_metadata_ticker(metadata)
+        if explicit is not None and explicit not in set(supported_bullbear_tickers()):
+            raise ReportDeliveryError(
+                explain_unsupported_bullbear_ticker(explicit),
+                code="unsupported_ticker",
+            )
 
     inferred, candidates = infer_report_profile(instruction, metadata=metadata, name=name)
     if inferred:

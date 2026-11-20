@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """公司多空日跟踪的采集与提交。
 
-只服务 MSFT、META、AMZN、GOOGL。通用逻辑来自同级技能 dalton-thesis-delta 的 collect.py
+通用逻辑来自同级技能 dalton-thesis-delta 的 collect.py
 （仓库里是 plugins/dalton/skills，沙箱里是 .agents/skills，都按同级目录加载）。
 本脚本不读不写旧 OpenClaw 根目录，也不调用 gateway、xreach 或子进程。
 
@@ -15,13 +15,15 @@ import argparse
 import fcntl
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -29,7 +31,6 @@ UTC = ZoneInfo("UTC")
 SKILL_DIR = Path(__file__).resolve().parent.parent
 GENERIC_COLLECT_PATH = SKILL_DIR.parent / "dalton-thesis-delta" / "scripts" / "collect.py"
 
-SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
 # 直接调用采集函数时默认 MSFT，线上状态键和锁名由此推出。
 TICKER = "MSFT"
 EXCERPT_MAX = 6000
@@ -95,12 +96,505 @@ def _load_generic():
 _g = _load_generic()
 
 
+def _load_tracker_config() -> Any:
+    path = Path(__file__).resolve().parent / "tracker_config.py"
+    name = "dalton_bullbear_tracker_config"
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, "__file__", None) == str(path):
+        return cached
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise CollectError("tracker_config_missing", f"找不到共享配置模块 {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+LEGACY_VERBATIM_TICKERS = frozenset({"MSFT", "META", "AMZN", "GOOGL"})
+_NEW_MARKET_SOURCE_KEYS: tuple[str, ...] = ("price", "consensus", "earnings_calendar")
+_YFINANCE_NO_DATA_TYPES = frozenset({
+    "YFTickerMissingError",
+    "YFPricesMissingError",
+    "YFTzMissingError",
+    "YFEarningsDateMissing",
+})
+_YFINANCE_NO_DATA_MARKERS = (
+    "no data found",
+    "not found",
+    "http error 404",
+    "no fundamentals data",
+    "possibly delisted",
+    "symbol may be delisted",
+    "no timezone found",
+    "quote not found",
+    "no earnings dates",
+)
+
+
+def supported_tickers() -> tuple[str, ...]:
+    return _load_tracker_config().supported_tickers(skill_dir=SKILL_DIR)
+
+
+def resolve_rules_path(
+    ticker: str | None = None,
+    workspace: Path | str | None = None,
+    *,
+    strict: bool = False,
+) -> tuple[Path | None, str | None]:
+    cfg_mod = _load_tracker_config()
+    try:
+        return cfg_mod.resolve_rules_path(
+            ticker or TICKER,
+            workspace=workspace,
+            skill_dir=SKILL_DIR,
+            strict=strict,
+        )
+    except cfg_mod.RulesPathError as exc:
+        raise CollectError(exc.status, exc.message) from exc
+
+
 def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
     return _g.call_bridge_jsonrpc(tool_name, arguments, timeout=timeout)
 
 
+def _is_valid_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _has_explicit_new_market_switches(cfg: dict[str, Any]) -> bool:
+    sources = cfg.get("sources")
+    if isinstance(sources, dict):
+        return any(k in sources for k in _NEW_MARKET_SOURCE_KEYS)
+    return False
+
+
+# 显式配置键白名单：严格对应 origin/dalton/main:plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py
+# 实际读取过的配置键；旧四家（MSFT/META/AMZN/GOOGL）在加载配置与采集时过滤为此集合，忽略所有新增配置项。
+LEGACY_COLLECT_CONFIG_KEYS: frozenset[str] = frozenset({
+    "ae_company_names",
+    "ae_max_searches",
+    "ae_queries",
+    "alias_terms",
+    "aliases_regex",
+    "excluded_documents",
+    "extra_consensus_flags",
+    "internal_limit",
+    "internal_read_cap_per_route",
+    "internal_routes",
+    "model",
+    "news_queries",
+    "sec_forms",
+    "thresholds",
+    "wiki_min_alias_hits",
+    "x_enrich_max",
+    "x_keep_max",
+    "x_pool_max",
+    "x_queries",
+})
+# 仓库内旧四家配置将 internal_routes/sec_forms 放在 sources 下；旧四家只保留这两项列表并忽略 sources 下所有新开关。
+LEGACY_COLLECT_SOURCES_KEYS: frozenset[str] = frozenset({"internal_routes", "sec_forms"})
+
+
+def _filter_legacy_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    filtered = {k: v for k, v in cfg.items() if k in LEGACY_COLLECT_CONFIG_KEYS}
+    sources = cfg.get("sources")
+    narrowed: dict[str, Any] = {}
+    if isinstance(sources, dict):
+        narrowed = {k: v for k, v in sources.items() if k in LEGACY_COLLECT_SOURCES_KEYS}
+    # A config written for origin/dalton/main keeps these lists at the top level; carry
+    # them into `sources`, where the collectors read them, unless `sources` has its own.
+    for key in ("internal_routes", "sec_forms"):
+        if key not in narrowed and isinstance(cfg.get(key), list):
+            narrowed[key] = cfg[key]
+    if narrowed:
+        filtered["sources"] = narrowed
+    return filtered
+
+
+def _is_legacy_four_verbatim(ticker: str, cfg: dict[str, Any] | None = None) -> bool:
+    """旧四家（MSFT/META/AMZN/GOOGL）按 ticker 固定走逐字兼容主分支流程，忽略新市场开关。"""
+    _ = cfg
+    return str(ticker or "").strip().upper() in LEGACY_VERBATIM_TICKERS
+
+
+def _has_price(cons: dict[str, Any]) -> bool:
+    price = cons.get("price") if isinstance(cons, dict) else None
+    return isinstance(price, dict) and _is_valid_number(price.get("close")) and "error" not in price
+
+
+def _period_has_valid_estimate(
+    cons: dict[str, Any],
+    period: str,
+    table_keys: tuple[str, ...] = ("earnings_estimate", "revenue_estimate"),
+) -> bool:
+    """某一期间只有分析师人数 > 0 且存在非空预测数值（avg/low/high）时才算有效。"""
+    if not isinstance(cons, dict):
+        return False
+    for key in table_keys:
+        tbl = cons.get(key)
+        if not isinstance(tbl, dict) or "error" in tbl:
+            continue
+        row = tbl.get(period)
+        if not isinstance(row, dict):
+            continue
+        if not any(_is_valid_number(row.get(field)) for field in ("avg", "low", "high")):
+            continue
+        analysts = row.get("numberOfAnalysts")
+        if _is_valid_number(analysts) and float(analysts) > 0:
+            return True
+    return False
+
+
+def _valid_estimate_periods(
+    cons: dict[str, Any],
+    table_keys: tuple[str, ...] = ("earnings_estimate", "revenue_estimate"),
+) -> set[str]:
+    if not isinstance(cons, dict):
+        return set()
+    periods: set[str] = set()
+    for key in table_keys:
+        tbl = cons.get(key)
+        if not isinstance(tbl, dict) or "error" in tbl:
+            continue
+        for per in tbl:
+            per_s = str(per)
+            if _period_has_valid_estimate(cons, per_s, (key,)):
+                periods.add(per_s)
+    return periods
+
+
+def _has_estimates(cons: dict[str, Any]) -> bool:
+    """Return True only when at least one period has analysts > 0 and non-null forecasts."""
+    return bool(_valid_estimate_periods(cons))
+
+
+def _has_earnings_calendar(cons: dict[str, Any]) -> bool:
+    if not isinstance(cons, dict):
+        return False
+    cal = cons.get("earnings_dates")
+    if isinstance(cal, list):
+        return bool(cal)
+    if isinstance(cal, dict):
+        return bool(cal) and "error" not in cal
+    return False
+
+
+def _is_yfinance_no_data_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return False
+    exc_name = type(exc).__name__
+    if exc_name in {"YFDataException", "YFRateLimitError", "YFNotImplementedError", "YFInvalidPeriodError"}:
+        return False
+    if exc_name in _YFINANCE_NO_DATA_TYPES:
+        return True
+    msg = str(exc).lower()
+    if any(token in msg for token in ("timeout", "timed out", "rate limit", "too many requests", "429", "500", "502", "503", "504", "connection")):
+        return False
+    return any(marker in msg for marker in _YFINANCE_NO_DATA_MARKERS)
+
+
+def _error_text(exc: BaseException, limit: int = 200) -> str:
+    msg = str(exc).strip()
+    return (msg or type(exc).__name__)[:limit]
+
+
+def _safe_price_snapshot_with_status(
+    yf_mod: Any, ticker: str, benchmark: str
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Safely build 3-month price summary and per-symbol fetch outcomes."""
+    syms = list(dict.fromkeys([ticker, benchmark]))
+    raw = yf_mod.download(syms, period="3mo", auto_adjust=False, progress=False)
+    if raw is None or getattr(raw, "empty", True):
+        return {"error": f"空行情表：{ticker}"}, {sym: "empty" for sym in syms}
+    close = raw["Close"] if (isinstance(raw, dict) or (hasattr(raw, "__contains__") and "Close" in raw)) else raw
+    if close is None or getattr(close, "empty", True):
+        return {"error": f"空行情表：{ticker}"}, {sym: "empty" for sym in syms}
+    close = close.dropna(how="all")
+    if close is None or len(close) == 0:
+        return {"error": f"空行情表：{ticker}"}, {sym: "empty" for sym in syms}
+    sym_status: dict[str, str] = {}
+    if hasattr(close, "columns"):
+        if ticker not in close.columns:
+            sym_status[ticker] = "missing_column"
+            if benchmark != ticker:
+                if benchmark in close.columns:
+                    sym_status[benchmark] = "ok" if len(close[benchmark].dropna()) > 0 else "no_rows"
+                else:
+                    sym_status[benchmark] = "missing_column"
+            return {"error": f"行情缺少 {ticker} 列"}, sym_status
+        t_s = close[ticker].dropna()
+        sym_status[ticker] = "ok" if len(t_s) > 0 else "no_rows"
+        if benchmark in close.columns:
+            b_s = close[benchmark].dropna()
+            sym_status[benchmark] = "ok" if len(b_s) > 0 else "no_rows"
+        elif ticker == benchmark:
+            b_s = t_s
+        else:
+            b_s = None
+            sym_status[benchmark] = "missing_column"
+    else:
+        t_s = close.dropna()
+        b_s = t_s if ticker == benchmark else None
+        sym_status[ticker] = "ok" if len(t_s) > 0 else "no_rows"
+        if benchmark != ticker:
+            sym_status[benchmark] = "missing_column"
+    if len(t_s) == 0:
+        sym_status[ticker] = "no_rows"
+        return {"error": f"空行情：{ticker} 无有效收盘价"}, sym_status
+    last_idx = t_s.index[-1]
+    last_p = float(t_s.iloc[-1])
+    as_of = last_idx.date().isoformat() if hasattr(last_idx, "date") else str(last_idx)[:10]
+    if len(t_s) == 1:
+        return {
+            "as_of": as_of,
+            "close": round(last_p, 2),
+            "chg_1d_pct": None,
+            "chg_5d_pct": None,
+            "benchmark": benchmark,
+            "bench_chg_1d_pct": None,
+            "bench_chg_5d_pct": None,
+            "high_3m": round(last_p, 2),
+            "drawdown_from_3m_high_pct": 0.0,
+        }, sym_status
+    prev_idx = t_s.index[-2]
+    prev_p = float(t_s.iloc[-2])
+    chg_1d = round((last_p / prev_p - 1.0) * 100.0, 2) if prev_p else None
+    b_chg_1d = None
+    if b_s is not None and last_idx in b_s.index and prev_idx in b_s.index:
+        b_last = float(b_s.loc[last_idx])
+        b_prev = float(b_s.loc[prev_idx])
+        if b_prev:
+            b_chg_1d = round((b_last / b_prev - 1.0) * 100.0, 2)
+
+    chg_5d = None
+    b_chg_5d = None
+    if len(t_s) >= 6:
+        five_idx = t_s.index[-6]
+        five_p = float(t_s.iloc[-6])
+        if five_p:
+            chg_5d = round((last_p / five_p - 1.0) * 100.0, 2)
+        if b_s is not None and last_idx in b_s.index and five_idx in b_s.index:
+            b_last = float(b_s.loc[last_idx])
+            b_five = float(b_s.loc[five_idx])
+            if b_five:
+                b_chg_5d = round((b_last / b_five - 1.0) * 100.0, 2)
+
+    high_3m = float(t_s.max())
+    return {
+        "as_of": as_of,
+        "close": round(last_p, 2),
+        "chg_1d_pct": chg_1d,
+        "chg_5d_pct": chg_5d,
+        "benchmark": benchmark,
+        "bench_chg_1d_pct": b_chg_1d,
+        "bench_chg_5d_pct": b_chg_5d,
+        "high_3m": round(high_3m, 2),
+        "drawdown_from_3m_high_pct": round((last_p / high_3m - 1.0) * 100.0, 2) if high_3m else None,
+    }, sym_status
+
+
+def _safe_earnings_dates(ticker_obj: Any) -> list[dict[str, Any]]:
+    cal = getattr(ticker_obj, "earnings_dates", None)
+    if cal is None or not isinstance(getattr(cal, "empty", None), bool) or cal.empty:
+        return []
+    frame = cal.head(4)
+    if hasattr(frame, "reset_index"):
+        frame = frame.reset_index()
+    rows = _g.clean_val(frame.to_dict(orient="records"))
+    return rows if isinstance(rows, list) else []
+
+
+def _fetch_configured_market_data(
+    ticker: str,
+    benchmark: str = "QQQ",
+    *,
+    include_consensus: bool = True,
+    include_price: bool = True,
+    include_earnings_calendar: bool = False,
+) -> dict[str, Any]:
+    """Fetch only enabled market/consensus/calendar sources safely; empty/no-data is non-fatal."""
+    fetched_at = now_et().isoformat()
+    out: dict[str, Any] = {
+        "_meta": {
+            "route": "estimates",
+            "fetched_at": fetched_at,
+            "source": "Yahoo Finance via yfinance",
+        },
+        "ticker": ticker,
+        "fetched_at": fetched_at,
+        "source": "Yahoo Finance via yfinance",
+        "currency": None,
+        "earnings_estimate": {},
+        "revenue_estimate": {},
+        "eps_trend": {},
+        "eps_revisions": {},
+        "price_targets": {},
+        "price": {},
+    }
+    if not (include_consensus or include_price or include_earnings_calendar):
+        out["ok"] = True
+        out["status"] = "empty"
+        out["field_status"] = {
+            "earnings_estimate": "skipped",
+            "revenue_estimate": "skipped",
+            "eps_trend": "skipped",
+            "eps_revisions": "skipped",
+            "price_targets": "skipped",
+            "price": "skipped",
+            "earnings_dates": "skipped",
+        }
+        out["earnings_dates"] = []
+        out["_meta"]["field_status"] = dict(out["field_status"])
+        out["_meta"]["status"] = "empty"
+        return out
+
+    earnings_dates: list[dict[str, Any]] = []
+    cal_error: str | None = None
+    price_symbols: dict[str, str] = {}
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception as exc:
+        msg = _error_text(exc, 300)
+        err = _error_text(exc, 200)
+        if include_consensus:
+            out["error"] = msg
+        if include_price:
+            out["price"] = {"error": err}
+            price_symbols = {sym: f"error: {err}" for sym in list(dict.fromkeys([ticker, benchmark]))}
+        if include_earnings_calendar:
+            cal_error = err
+        yf = None
+
+    if yf is not None:
+        if include_price:
+            try:
+                out["price"], price_symbols = _safe_price_snapshot_with_status(yf, ticker, benchmark)
+            except Exception as exc:
+                err = _error_text(exc)
+                out["price"] = {"error": err}
+                price_symbols = {sym: f"error: {err}" for sym in list(dict.fromkeys([ticker, benchmark]))}
+
+        if include_consensus or include_earnings_calendar:
+            t = None
+            cons_init_error: str | None = None
+            cal_init_error: str | None = None
+            try:
+                t = yf.Ticker(ticker)
+            except Exception as exc:
+                if include_earnings_calendar:
+                    cal_init_error = _error_text(exc)
+                if include_consensus and not _is_yfinance_no_data_error(exc):
+                    cons_init_error = _error_text(exc, 300)
+
+            if cons_init_error is not None:
+                out["error"] = cons_init_error
+            if cal_init_error is not None:
+                cal_error = cal_init_error
+            if t is not None:
+                if include_consensus and cons_init_error is None:
+                    for field in ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions"):
+                        try:
+                            df = getattr(t, field, None)
+                            if df is not None and isinstance(getattr(df, "empty", None), bool) and not df.empty:
+                                out[field] = _g.clean_val(df.to_dict(orient="index"))
+                        except Exception as exc:
+                            if not _is_yfinance_no_data_error(exc):
+                                out[field] = {"error": _error_text(exc)}
+
+                    period_ends = _g._extract_period_end_dates(t)
+                    for field in ("earnings_estimate", "revenue_estimate"):
+                        table = out.get(field)
+                        if isinstance(table, dict) and period_ends:
+                            for per, row in table.items():
+                                if isinstance(row, dict) and period_ends.get(per):
+                                    row["period_end"] = period_ends[per]
+
+                    try:
+                        targets = getattr(t, "analyst_price_targets", None)
+                        if targets:
+                            out["price_targets"] = _g.clean_val(dict(targets))
+                    except Exception as exc:
+                        if not _is_yfinance_no_data_error(exc):
+                            out["price_targets"] = {"error": _error_text(exc)}
+
+                if include_earnings_calendar and cal_init_error is None:
+                    try:
+                        earnings_dates = _safe_earnings_dates(t)
+                    except Exception as exc:
+                        cal_error = _error_text(exc)
+
+    _g._compute_consensus_status(out)
+    out["earnings_dates"] = earnings_dates
+    fs = dict(out.get("field_status")) if isinstance(out.get("field_status"), dict) else {}
+    if not include_consensus:
+        for field in ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions", "price_targets"):
+            fs[field] = "skipped"
+    if not include_price:
+        fs["price"] = "skipped"
+    if not include_earnings_calendar:
+        fs["earnings_dates"] = "skipped"
+    elif cal_error:
+        fs["earnings_dates"] = "error"
+        out["earnings_dates_error"] = cal_error
+    elif earnings_dates:
+        fs["earnings_dates"] = "ok"
+    else:
+        fs["earnings_dates"] = "empty"
+
+    out["field_status"] = fs
+    cons_errors = any(
+        include_consensus and fs.get(k) == "error"
+        for k in ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions", "price_targets")
+    )
+    price_error = include_price and fs.get("price") == "error"
+    enabled_errors = cons_errors or price_error or bool(out.get("error")) or bool(cal_error)
+
+    if enabled_errors:
+        has_any_ok = (
+            (include_consensus and _has_estimates(out))
+            or (include_price and _has_price(out))
+            or (include_earnings_calendar and bool(earnings_dates))
+        )
+        out["ok"] = has_any_ok
+        out["status"] = "partial" if has_any_ok else "error"
+    else:
+        has_enabled_data = (
+            (include_consensus and _has_estimates(out))
+            or (include_price and _has_price(out))
+            or (include_earnings_calendar and bool(earnings_dates))
+        )
+        all_enabled_ok = (
+            (not include_consensus or _has_estimates(out))
+            and (not include_price or _has_price(out))
+            and (not include_earnings_calendar or bool(earnings_dates))
+        )
+        out["ok"] = True
+        if has_enabled_data and (all_enabled_ok or not include_consensus or _has_estimates(out)):
+            out["status"] = "ok"
+        else:
+            out["status"] = "empty"
+    if isinstance(out.get("_meta"), dict):
+        out["_meta"]["status"] = out["status"]
+        out["_meta"]["field_status"] = dict(fs)
+        if include_price:
+            out["_meta"]["price_symbols"] = price_symbols
+    return out
+
+
 def fetch_consensus_snapshot(ticker: str, benchmark: str = "QQQ") -> dict[str, Any]:
-    return _g.fetch_consensus_snapshot(ticker, benchmark)
+    return _fetch_configured_market_data(
+        ticker,
+        benchmark,
+        include_consensus=True,
+        include_price=True,
+        include_earnings_calendar=True,
+    )
+
+
+_DEFAULT_FETCH_CONSENSUS = fetch_consensus_snapshot
 
 
 def resolve_researchdata_transport() -> dict[str, Any]:
@@ -248,12 +742,12 @@ def workspace_lock(workspace: Path, tracker: Path) -> Iterator[None]:
 
 
 def load_research_config() -> dict[str, Any]:
-    try:
-        data = json.loads(research_config_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CollectError("research_config_unreadable", str(exc)[:200]) from exc
-    if not isinstance(data, dict) or str(data.get("ticker") or "").upper() != TICKER:
-        raise CollectError("company_mismatch", f"研究配置不是 {TICKER}")
+    cfg_mod = _load_tracker_config()
+    data = cfg_mod.load_validated_config(TICKER, skill_dir=SKILL_DIR)
+    if data is None:
+        raise CollectError("unsupported_ticker", f"不支持的 ticker：{TICKER or '空'}")
+    if _is_legacy_four_verbatim(TICKER):
+        return _filter_legacy_config(data)
     return data
 
 
@@ -306,14 +800,57 @@ def map_thresholds(raw: Any) -> dict[str, Any]:
     return mapped
 
 
+def _safe_load_research_config() -> dict[str, Any]:
+    try:
+        return load_research_config()
+    except CollectError:
+        return {}
+
+
+def _sanitize_consensus_by_valid_periods(cons: dict[str, Any]) -> dict[str, Any]:
+    """Keep only estimate/trend/revision periods with valid analyst count (> 0) and non-null forecasts."""
+    if not isinstance(cons, dict):
+        return {}
+    valid_eps = _valid_estimate_periods(cons, ("earnings_estimate",))
+    valid_rev = _valid_estimate_periods(cons, ("revenue_estimate",))
+    valid_any = valid_eps | valid_rev
+    cleaned = dict(cons)
+    ee = cons.get("earnings_estimate")
+    if isinstance(ee, dict) and "error" not in ee:
+        cleaned["earnings_estimate"] = {k: v for k, v in ee.items() if str(k) in valid_eps}
+    re_tbl = cons.get("revenue_estimate")
+    if isinstance(re_tbl, dict) and "error" not in re_tbl:
+        cleaned["revenue_estimate"] = {k: v for k, v in re_tbl.items() if str(k) in valid_rev}
+    trend = cons.get("eps_trend")
+    if isinstance(trend, dict) and "error" not in trend:
+        cleaned["eps_trend"] = {k: v for k, v in trend.items() if str(k) in valid_eps}
+    revs = cons.get("eps_revisions")
+    if isinstance(revs, dict) and "error" not in revs:
+        cleaned["eps_revisions"] = {k: v for k, v in revs.items() if str(k) in valid_eps}
+    if not valid_any:
+        cleaned["price_targets"] = {}
+    return cleaned
+
+
 def consensus_deltas(
     cur: dict[str, Any],
     prev: dict[str, Any] | None,
     thr: dict[str, Any],
     sec_new_count: int = 0,
     extra_flags: Any = None,
+    *,
+    legacy_verbatim: bool | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    deltas, flags = _g.compute_consensus_deltas(cur, prev, thr, sec_new_count=sec_new_count)
+    if legacy_verbatim is None:
+        is_legacy = _is_legacy_four_verbatim(TICKER, _safe_load_research_config())
+    else:
+        is_legacy = legacy_verbatim
+    if is_legacy:
+        safe_cur, safe_prev = cur, prev
+    else:
+        safe_cur = _sanitize_consensus_by_valid_periods(cur)
+        safe_prev = _sanitize_consensus_by_valid_periods(prev) if prev is not None else None
+    deltas, flags = _g.compute_consensus_deltas(safe_cur, safe_prev, thr, sec_new_count=sec_new_count)
     flags = list(flags)
     specs = _configured_extra_flags() if extra_flags is None else extra_flags
     _append_extra_flags(deltas, flags, thr, specs)
@@ -453,8 +990,39 @@ def _period_row(table: Any, key: str) -> dict[str, Any]:
     return row if isinstance(row, dict) else {}
 
 
-def build_implied_model(cons: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+def _valid_annual_period_pair(ee_valid: Any, re_valid: Any, per: str) -> bool:
+    eps_row = _period_row(ee_valid, per)
+    rev_row = _period_row(re_valid, per)
+    if not eps_row or not rev_row:
+        return False
+    eps_end = _g._period_end_of(eps_row)
+    rev_end = _g._period_end_of(rev_row)
+    return eps_end is not None and rev_end is not None and eps_end[:10] == rev_end[:10]
+
+
+def build_implied_model(
+    cons: dict[str, Any],
+    model: dict[str, Any],
+    *,
+    require_valid_periods: bool = False,
+) -> dict[str, Any]:
     """沿用旧公式。其他收入只用于来源写明的财年，不随 0y/+1y 标签滚到下一年。"""
+    if not isinstance(model, dict) or not model:
+        return {
+            "assumptions": {
+                "diluted_shares_bn": None,
+                "tax_rate": None,
+                "other_income_bn": {},
+                "source": "",
+                "applicable_years": [],
+                "note": "未配置隐含费用模型假设，标记为暂无",
+            },
+            "periods": {},
+            "status": "empty",
+            "summary": "暂无",
+        }
+    if require_valid_periods:
+        cons = _sanitize_consensus_by_valid_periods(cons)
     shares = model.get("diluted_shares_bn")
     tax = model.get("tax_rate")
     other = model.get("other_income_bn") if isinstance(model.get("other_income_bn"), dict) else {}
@@ -468,6 +1036,16 @@ def build_implied_model(cons: dict[str, Any], model: dict[str, Any]) -> dict[str
         "applicable_years": years,
         "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿美元。其他收入只用于来源写明的财年末。",
     }
+    if require_valid_periods:
+        ee_valid = cons.get("earnings_estimate") if isinstance(cons.get("earnings_estimate"), dict) else {}
+        re_valid = cons.get("revenue_estimate") if isinstance(cons.get("revenue_estimate"), dict) else {}
+        if not all(_valid_annual_period_pair(ee_valid, re_valid, per) for per in ("0y", "+1y")):
+            return {
+                "assumptions": assumptions,
+                "periods": {},
+                "status": "empty",
+                "summary": "暂无",
+            }
     out: dict[str, Any] = {"assumptions": assumptions, "periods": {}}
     try:
         shares_f = float(shares)
@@ -994,6 +1572,99 @@ def _fetch_pages(tool: str, build_args, page_cap: int) -> dict[str, Any]:
     }
 
 
+def _earnings_calendar_enabled(cfg: dict[str, Any]) -> bool:
+    sources = cfg.get("sources")
+    if isinstance(sources, dict):
+        return sources.get("earnings_calendar") is True
+    return False
+
+
+def _source_enabled(cfg: dict[str, Any], name: str) -> bool:
+    if name == "earnings_calendar":
+        return _earnings_calendar_enabled(cfg)
+    sources = cfg.get("sources")
+    if isinstance(sources, dict):
+        if name not in sources:
+            return True
+        return bool(sources.get(name))
+    return True
+
+
+def _effective_internal_routes(cfg: dict[str, Any]) -> list[str]:
+    sources = cfg.get("sources")
+    if isinstance(sources, dict) and isinstance(sources.get("internal_routes"), list):
+        return [str(r) for r in sources["internal_routes"]]
+    return []
+
+
+def _effective_sec_forms(cfg: dict[str, Any]) -> list[str]:
+    sources = cfg.get("sources")
+    if isinstance(sources, dict) and isinstance(sources.get("sec_forms"), list):
+        return [str(f) for f in sources["sec_forms"]]
+    return []
+
+
+def _research_query(cfg: dict[str, Any]) -> str:
+    raw = cfg.get("research_keywords")
+    if isinstance(raw, list):
+        terms = [str(term).strip() for term in raw if str(term).strip()]
+        if terms:
+            return " ".join(terms)
+    elif isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return " ".join(str(term) for term in cfg.get("alias_terms") or [])
+
+
+def _ticker_term_regex(ticker: str) -> str:
+    clean = ticker.strip()
+    upper_esc = re.escape(clean.upper())
+    prefix = r"(?<![A-Za-z0-9_])" if (clean and (clean[0].isalnum() or clean[0] == "_")) else ""
+    suffix = r"(?![A-Za-z0-9_])" if (clean and (clean[-1].isalnum() or clean[-1] == "_")) else ""
+    return rf"{prefix}(?:\$(?i:{upper_esc})|{upper_esc}){suffix}"
+
+
+def _alias_term_regex(term: str, actual_ticker: str = "") -> str:
+    clean = term.strip()
+    if actual_ticker and clean.upper() == actual_ticker.strip().upper():
+        return _ticker_term_regex(actual_ticker)
+    if clean.isascii() and any(ch.isalnum() for ch in clean):
+        letters = "".join(ch for ch in clean if ch.isalpha())
+        if clean.isalnum() and len(clean) <= 4 and letters:
+            if clean == clean.upper() or clean == clean.lower():
+                target = re.escape(clean.upper())
+                return rf"(?<![A-Za-z0-9_])(?:\$(?i:{target})|{target})(?![A-Za-z0-9_])"
+            return rf"(?<![A-Za-z0-9_])(?:\$(?i:{re.escape(clean)})|{re.escape(clean)})(?![A-Za-z0-9_])"
+        prefix = r"(?<![A-Za-z0-9_])" if (clean[0].isalnum() or clean[0] == "_") else ""
+        suffix = r"(?![A-Za-z0-9_])" if (clean[-1].isalnum() or clean[-1] == "_") else ""
+        return rf"(?i:{prefix}{re.escape(clean)}{suffix})"
+    return rf"(?i:{re.escape(clean)})"
+
+
+def _aliases_pattern(cfg: dict[str, Any]) -> re.Pattern[str]:
+    raw = cfg.get("aliases_regex")
+    if isinstance(raw, str) and raw.strip():
+        return re.compile(raw)
+    actual_ticker = str(cfg.get("ticker") or TICKER).strip()
+    patterns: list[str] = []
+    if actual_ticker:
+        patterns.append(_ticker_term_regex(actual_ticker))
+    terms: list[str] = []
+    for key in ("research_keywords", "alias_terms"):
+        val = cfg.get(key)
+        if isinstance(val, list):
+            terms.extend(str(item).strip() for item in val if str(item).strip())
+        elif isinstance(val, str) and val.strip():
+            terms.extend(val.strip().split())
+    # Only a term that is the ticker itself (any case) is folded into the strict ticker
+    # pattern above; other aliases dedupe by their exact spelling.
+    ticker_upper = actual_ticker.upper() if actual_ticker else ""
+    for term in dict.fromkeys(terms):
+        if ticker_upper and term.upper() == ticker_upper:
+            continue
+        patterns.append(_alias_term_regex(term, actual_ticker=actual_ticker))
+    return re.compile("|".join(patterns))
+
+
 def collect_internal(
     cfg: dict[str, Any],
     since: str,
@@ -1002,9 +1673,9 @@ def collect_internal(
     workspace: Path,
     run_dir: Path,
 ) -> dict[str, Any]:
-    pat = re.compile(str(cfg["aliases_regex"]))
+    pat = _aliases_pattern(cfg)
     excluded = {str(item) for item in cfg.get("excluded_documents") or []}
-    query = " ".join(str(term) for term in cfg.get("alias_terms") or [])
+    query = _research_query(cfg)
     limit = int(cfg.get("internal_limit") or 60)
     cap = int(cfg.get("internal_read_cap_per_route") or 12)
     min_hits = int(cfg.get("wiki_min_alias_hits") or 2)
@@ -1012,7 +1683,7 @@ def collect_internal(
     status: dict[str, Any] = {}
     stop_reads = False
 
-    for route in cfg.get("internal_routes") or []:
+    for route in _effective_internal_routes(cfg):
         route = str(route)
         if route == "company-wiki":
             fetched = _fetch_pages("research", lambda cursor: _wiki_args(since, cursor), MAX_INTERNAL_PAGES)
@@ -1205,7 +1876,7 @@ def collect_alphaengine(
     last_run: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """每条查询一轮只搜一次。未完成的查询下一轮重放原窗口和 cursor，不改用新的 until。"""
-    pat = re.compile(str(cfg["aliases_regex"]))
+    pat = _aliases_pattern(cfg)
     names = {str(name) for name in cfg.get("ae_company_names") or []}
     queries = [str(q) for q in (cfg.get("ae_queries") or [])][: int(cfg.get("ae_max_searches") or 2)]
     prev_map = _ae_prev_map(last_run) or _legacy_ae_map(last_run, queries)
@@ -1335,7 +2006,7 @@ def collect_sec(cfg: dict[str, Any], since: str, seen: set[str]) -> dict[str, An
     floor = (date.fromisoformat(since) - timedelta(days=SEC_LOOKBACK_DAYS)).isoformat()
     found: dict[str, Any] = {}
     statuses: list[dict[str, Any]] = []
-    for form in cfg.get("sec_forms") or []:
+    for form in _effective_sec_forms(cfg):
         tool_name, arguments = _g.build_sec_filing_request(TICKER, str(form), limit=SEC_LIMIT)
         res = call_bridge_jsonrpc(tool_name, arguments)
         data = res.get("data") if isinstance(res.get("data"), dict) else {}
@@ -1452,6 +2123,36 @@ def _load_pool(workspace: Path, cfg: dict[str, Any]) -> tuple[list[str], dict[st
     return eligible[: int(cfg.get("x_pool_max") or 25)], raw
 
 
+def _config_x_accounts(
+    cfg: dict[str, Any], pool_handles: list[str], pool_raw: dict[str, Any]
+) -> tuple[list[str], set[str]]:
+    """Return ``(extra_handles_to_fetch, normalized_config_accounts)`` after pool truncation."""
+    all_config_norm: set[str] = set()
+    fetched_norm = {
+        str(handle).strip().lstrip("@").lower()
+        for handle in pool_handles
+        if str(handle).strip().lstrip("@")
+    }
+    inactive_norm = {
+        str(handle).strip().lstrip("@").lower()
+        for handle, info in pool_raw.items()
+        if isinstance(info, dict) and info.get("active", True) is False and str(handle).strip().lstrip("@")
+    }
+    extra_handles: list[str] = []
+    seen_extra: set[str] = set()
+    for account in cfg.get("x_accounts") or []:
+        handle_str = str(account or "").strip().lstrip("@")
+        if not handle_str:
+            continue
+        low = handle_str.lower()
+        all_config_norm.add(low)
+        if low in fetched_norm or low in inactive_norm or low in seen_extra:
+            continue
+        seen_extra.add(low)
+        extra_handles.append(handle_str)
+    return extra_handles, all_config_norm
+
+
 def _load_authors(workspace: Path) -> dict[str, Any]:
     raw = _local_state(workspace, "x_authors.json", {})
     if not isinstance(raw, dict):
@@ -1477,6 +2178,8 @@ def collect_x(
     until: str,
     seen: set[str],
     workspace: Path,
+    *,
+    legacy_verbatim: bool | None = None,
 ) -> dict[str, Any]:
     timeline_until, search_until = _x_upstream_until(until)
     raw: dict[str, dict[str, Any]] = {}
@@ -1516,46 +2219,53 @@ def collect_x(
                 continue
             raw.setdefault(str(post_id), {"item": item, "via": "search", "pool_handle": None})
 
-    handles, pool = _load_pool(workspace, cfg)
+    pool_handles, pool = _load_pool(workspace, cfg)
+    config_handles, config_accounts_norm = _config_x_accounts(cfg, pool_handles, pool)
     pool_keys = {str(handle).lower() for handle in pool}
-    for handle in handles:
-        arguments = {
-            "route": "x-timeline",
-            "operation": "tweets",
-            "handle": handle,
-            "since": since,
-            "until": timeline_until,
-            "count": X_TIMELINE_COUNT,
-        }
-        res = call_bridge_jsonrpc("community", arguments)
-        data = res.get("data") if isinstance(res.get("data"), dict) else {}
-        if not res.get("ok"):
-            error = bridge_error(res, data)
-            statuses.append({"pool": handle, "operation": "tweets", "ok": False, "error": error, "request": arguments})
-            failures.append(f"tweets {handle}: {error}")
-            continue
-        items, page = _x_items(res)
-        if page.get("has_more"):
-            unprocessed = True
-        kept = 0
-        for item in items:
-            post_id = item.get("id")
-            if post_id is None:
+    for via_kind, status_key, handle_list in (
+        ("pool", "pool", pool_handles),
+        ("config", "config", config_handles),
+    ):
+        for handle in handle_list:
+            arguments = {
+                "route": "x-timeline",
+                "operation": "tweets",
+                "handle": handle,
+                "since": since,
+                "until": timeline_until,
+                "count": X_TIMELINE_COUNT,
+            }
+            res = call_bridge_jsonrpc("community", arguments)
+            data = res.get("data") if isinstance(res.get("data"), dict) else {}
+            if not res.get("ok"):
+                error = bridge_error(res, data)
+                statuses.append({status_key: handle, "operation": "tweets", "ok": False, "error": error, "request": arguments})
+                failures.append(f"tweets {handle}: {error}")
                 continue
-            if not _in_window(_parse_x_time(item.get("created_at") or item.get("createdAt")), since, until):
-                continue
-            kept += 1
-            raw[str(post_id)] = {"item": item, "via": "pool", "pool_handle": handle}
-        statuses.append({
-            "pool": handle,
-            "operation": "tweets",
-            "ok": True,
-            "count": len(items),
-            "kept": kept,
-            "has_more": bool(page.get("has_more")),
-            "request": arguments,
-        })
+            items, page = _x_items(res)
+            if page.get("has_more"):
+                unprocessed = True
+            kept = 0
+            for item in items:
+                post_id = item.get("id")
+                if post_id is None:
+                    continue
+                if not _in_window(_parse_x_time(item.get("created_at") or item.get("createdAt")), since, until):
+                    continue
+                kept += 1
+                raw[str(post_id)] = {"item": item, "via": via_kind, "pool_handle": handle}
+            statuses.append({
+                status_key: handle,
+                "operation": "tweets",
+                "ok": True,
+                "count": len(items),
+                "kept": kept,
+                "has_more": bool(page.get("has_more")),
+                "request": arguments,
+            })
 
+    is_legacy = legacy_verbatim if legacy_verbatim is not None else _is_legacy_four_verbatim(TICKER, cfg)
+    pat = _aliases_pattern(cfg)
     candidates = []
     outside = 0
     for post_id, packed in raw.items():
@@ -1572,13 +2282,25 @@ def collect_x(
         metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
         likes = _metric(metrics, "likes")
         reposts = _metric(metrics, "reposts")
+        author_raw = packed["pool_handle"] or item.get("author_handle") or item.get("username") or ""
+        author_norm = str(author_raw).strip().lstrip("@").lower()
+        is_config_author = author_norm in config_accounts_norm
+        company_hits = len(pat.findall(text))
+        fund_hits = len(FUND_TERMS.findall(text))
+        if is_legacy:
+            relevant = packed["via"] == "pool" or fund_hits > 0
+        else:
+            relevant = company_hits > 0 or fund_hits > 0
         candidates.append({
             "id": post_id,
             "via": packed["via"],
+            "is_config_author": is_config_author,
+            "relevant": relevant,
             "pool_handle": packed["pool_handle"],
             "item": item,
             "text": text,
-            "fund_hits": len(FUND_TERMS.findall(text)),
+            "company_hits": company_hits,
+            "fund_hits": fund_hits,
             "engagement": (likes or 0) + 3 * (reposts or 0),
             "likes": likes,
             "reposts": reposts,
@@ -1586,13 +2308,14 @@ def collect_x(
             "views": _metric(metrics, "views"),
         })
     substantive = sorted(
-        [row for row in candidates if row["via"] == "pool" or row["fund_hits"] > 0],
-        key=lambda row: (row["via"] == "pool", row["engagement"]),
+        [row for row in candidates if row["relevant"]],
+        key=lambda row: (row["via"] in ("pool", "config") or row["is_config_author"], row["engagement"]),
         reverse=True,
     )
     keep_max = int(cfg.get("x_keep_max") or 30)
     enrich_max = int(cfg.get("x_enrich_max") or 20)
-    noise_rows = [row for row in candidates if row not in substantive]
+    # 非旧四家时，三个来源的不相关帖子都不进入 noise_ids（也不写入 seen.json）。
+    noise_rows = [row for row in candidates if not row["relevant"]] if is_legacy else []
     overflow = substantive[keep_max:]
     # 超过保留上限的候选按旧程序进入 noise，不写入 failed_sources。
     noise_ids = [f"x:{row['id']}" for row in noise_rows + overflow]
@@ -1642,7 +2365,7 @@ def collect_x(
         "status": statuses,
         "new": new,
         "noise_ids": noise_ids,
-        "pool_size": len(handles),
+        "pool_size": len(pool_handles),
         "queries": list(cfg.get("x_queries") or []),
         "outside_window": outside,
         "unprocessed_upstream": unprocessed,
@@ -1662,6 +2385,8 @@ def failed_sources(
     sec: dict[str, Any],
     xdata: dict[str, Any],
     consensus: dict[str, Any],
+    *,
+    legacy_verbatim: bool = False,
 ) -> list[dict[str, str]]:
     failures: list[dict[str, str]] = []
     for route, row in (internal.get("status") or {}).items():
@@ -1684,8 +2409,42 @@ def failed_sources(
         failures.append({"source": "sec", "error": "; ".join(sec_bits)})
     if xdata.get("failures"):
         failures.append({"source": "x-timeline", "error": "; ".join(xdata["failures"])})
+    cal_error = consensus.get("earnings_dates_error")
+    fs = consensus.get("field_status") if isinstance(consensus.get("field_status"), dict) else {}
+    if legacy_verbatim:
+        if cal_error:
+            failures.append({"source": "earnings_calendar", "error": str(cal_error)})
+        non_cal_error = any(k != "earnings_dates" and v == "error" for k, v in fs.items()) or bool(
+            consensus.get("error")
+        )
+        status_l = str(consensus.get("status") or "").strip().lower()
+        if (not cal_error or non_cal_error) and (
+            consensus.get("ok") is False or status_l in ("error", "partial", "incomplete")
+        ):
+            detail = str(consensus.get("error") or consensus.get("status") or "incomplete")
+            if consensus.get("field_status") is not None:
+                detail = f"{detail}: field_status={json.dumps(consensus.get('field_status'), ensure_ascii=False)}"
+            failures.append({"source": "estimates", "error": detail})
+        return failures
+
+    if cal_error or fs.get("earnings_dates") == "error":
+        failures.append({"source": "earnings_calendar", "error": str(cal_error or "earnings_calendar failed")})
+    price_obj = consensus.get("price") if isinstance(consensus.get("price"), dict) else {}
+    price_err = price_obj.get("error") if fs.get("price") == "error" or "error" in price_obj else None
+    if price_err:
+        failures.append({"source": "price", "error": str(price_err)})
+    cons_fields = ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions", "price_targets")
+    cons_enabled = (not fs) or any(fs.get(k) not in (None, "skipped") for k in cons_fields)
+    cons_error = any(fs.get(k) == "error" for k in cons_fields) or bool(consensus.get("error"))
     status_l = str(consensus.get("status") or "").strip().lower()
-    if consensus.get("ok") is False or status_l in ("error", "partial", "incomplete"):
+    if cons_enabled and (
+        cons_error
+        or (
+            not cal_error
+            and not price_err
+            and (consensus.get("ok") is False or status_l in ("error", "partial", "incomplete"))
+        )
+    ):
         detail = str(consensus.get("error") or consensus.get("status") or "incomplete")
         if consensus.get("field_status") is not None:
             detail = f"{detail}: field_status={json.dumps(consensus.get('field_status'), ensure_ascii=False)}"
@@ -1712,6 +2471,7 @@ def _previous_snapshot(
 
 
 def render_packet_md(pk: dict[str, Any]) -> str:
+    has_data_status = isinstance(pk.get("data_status"), dict)
     lines = [
         f"# {pk['ticker']} 跟踪数据包 {pk['run_id']}",
         "",
@@ -1732,41 +2492,78 @@ def render_packet_md(pk: dict[str, Any]) -> str:
     cons = pk.get("consensus") or {}
     price = cons.get("price") if isinstance(cons.get("price"), dict) else {}
     lines.extend(["", "## 一致预期"])
-    if price:
-        lines.append(
-            f"- 收盘 {price.get('as_of')}：{price.get('close')}，1 日 {price.get('chg_1d_pct')}%，5 日 {price.get('chg_5d_pct')}%"
-        )
+    if has_data_status:
+        if _has_price(cons):
+            c1d = f"{price.get('chg_1d_pct')}%" if price.get("chg_1d_pct") is not None else "暂无"
+            c5d = f"{price.get('chg_5d_pct')}%" if price.get("chg_5d_pct") is not None else "暂无"
+            lines.append(
+                f"- 收盘 {price.get('as_of')}：{price.get('close')}，1 日 {c1d}，5 日 {c5d}"
+            )
+        else:
+            lines.append(f"- 历史行情：请求失败（{price['error']}）" if "error" in price else "- 历史行情：暂无")
+        if not _has_estimates(cons):
+            lines.append("- 一致预期：暂无")
+        fs_cal = (cons.get("field_status") or {}).get("earnings_dates") if isinstance(cons.get("field_status"), dict) else None
+        if cons.get("earnings_dates_error"):
+            lines.append(f"- 财报日历：请求失败（{cons['earnings_dates_error']}）")
+        elif fs_cal == "skipped":
+            lines.append("- 财报日历：已关闭")
+        elif _has_earnings_calendar(cons):
+            cal = cons.get("earnings_dates")
+            if isinstance(cal, list):
+                cal_items = [
+                    str(item.get("Earnings Date") or item.get("date") or item)
+                    if isinstance(item, dict)
+                    else str(item)
+                    for item in cal[:3]
+                ]
+                lines.append(f"- 财报日历：{'、'.join(cal_items)}")
+            else:
+                lines.append(f"- 财报日历：{json.dumps(cal, ensure_ascii=False)}")
+        else:
+            lines.append("- 财报日历：暂无")
+    elif price:
+        is_legacy_ticker = str(pk.get("ticker") or "").strip().upper() in LEGACY_VERBATIM_TICKERS
+        if not is_legacy_ticker and "error" in price:
+            lines.append(f"- 历史行情：请求失败（{price['error']}）")
+        else:
+            lines.append(
+                f"- 收盘 {price.get('as_of')}：{price.get('close')}，1 日 {price.get('chg_1d_pct')}%，5 日 {price.get('chg_5d_pct')}%"
+            )
     lines.append(f"- 修正差值：`{json.dumps(pk.get('deltas') or {}, ensure_ascii=False)}`")
     model = pk.get("implied_model") or {}
     lines.extend(["", "## 隐含费用"])
-    assumptions = model.get("assumptions") or {}
-    if assumptions.get("source"):
-        lines.append(f"- 来源：{assumptions['source']}")
-    for item in assumptions.get("applicable_years") or []:
-        income = item.get("other_income_bn")
-        reason = item.get("other_income_reason")
-        if reason:
-            shown = "未知" if income is None else income
-            lines.append(
-                f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {shown}（{reason}）"
-            )
-        else:
-            lines.append(
-                f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {income}"
-            )
-    for key in ("0y", "+1y"):
-        row = (model.get("periods") or {}).get(key) or {}
-        if row.get("status") == "ok":
-            lines.append(
-                f"- {row.get('label')}（{row.get('fiscal_year')}，period_end {row.get('period_end')}，其他收入取 {row.get('other_income_key')}）："
-                f"收入 {row.get('consensus_revenue_bn')}、EPS {row.get('consensus_eps')}、税前 {row.get('implied_pretax_bn')}、"
-                f"总费用 {row.get('implied_total_expenses_bn')}、经营利润率 {row.get('implied_op_margin_pct')}%、"
-                f"费用每多 100 亿 EPS {row.get('eps_per_10bn_expense')}、收入每多 1% EPS {row.get('eps_per_1pct_revenue_no_cost')}"
-            )
-        else:
-            lines.append(f"- {key}：{row.get('reason') or row.get('status') or '未计算'}")
-    if model.get("error"):
-        lines.append(f"- 模型状态：{model['error']}")
+    if model.get("status") == "empty" and not (model.get("periods") or {}) and (has_data_status or model.get("summary") == "暂无"):
+        lines.append("- 隐含费用：暂无")
+    else:
+        assumptions = model.get("assumptions") or {}
+        if assumptions.get("source"):
+            lines.append(f"- 来源：{assumptions['source']}")
+        for item in assumptions.get("applicable_years") or []:
+            income = item.get("other_income_bn")
+            reason = item.get("other_income_reason")
+            if reason:
+                shown = "未知" if income is None else income
+                lines.append(
+                    f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {shown}（{reason}）"
+                )
+            else:
+                lines.append(
+                    f"- 假设对应财年：{item.get('key')} = {item.get('fiscal_year')}，截至 {item.get('period_end_prefix')}，其他收入 {income}"
+                )
+        for key in ("0y", "+1y"):
+            row = (model.get("periods") or {}).get(key) or {}
+            if row.get("status") == "ok":
+                lines.append(
+                    f"- {row.get('label')}（{row.get('fiscal_year')}，period_end {row.get('period_end')}，其他收入取 {row.get('other_income_key')}）："
+                    f"收入 {row.get('consensus_revenue_bn')}、EPS {row.get('consensus_eps')}、税前 {row.get('implied_pretax_bn')}、"
+                    f"总费用 {row.get('implied_total_expenses_bn')}、经营利润率 {row.get('implied_op_margin_pct')}%、"
+                    f"费用每多 100 亿 EPS {row.get('eps_per_10bn_expense')}、收入每多 1% EPS {row.get('eps_per_1pct_revenue_no_cost')}"
+                )
+            else:
+                lines.append(f"- {key}：{row.get('reason') or row.get('status') or ('暂无' if has_data_status else '未计算')}")
+        if model.get("error"):
+            lines.append(f"- 模型状态：{model['error']}")
 
     internal = pk.get("internal") or {}
     lines.extend(["", "## 内部库"])
@@ -1866,11 +2663,16 @@ def _completed_packet(path: Path, run_id: str) -> dict[str, Any] | None:
     return data
 
 
-def _summary(workspace: Path, packet: dict[str, Any], recovered: bool) -> dict[str, Any]:
+def _summary(
+    workspace: Path,
+    packet: dict[str, Any],
+    recovered: bool,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     run_id = str(packet["run_id"])
     tracker = workspace / "research" / "tracker" / run_id
     internal = packet.get("internal") or {}
-    return {
+    out: dict[str, Any] = {
         # 完成的数据包保留来源告警，供后续研究披露。
         "ok": True,
         "recovered": recovered,
@@ -1894,6 +2696,9 @@ def _summary(workspace: Path, packet: dict[str, Any], recovered: bool) -> dict[s
         },
         "tracker_dir": str(tracker.relative_to(workspace)),
     }
+    if rules_path is not None:
+        out["rules_path"] = str(rules_path)
+    return out
 
 
 def _window(last_run: dict[str, Any], since_arg: str | None, today: str) -> tuple[str, str]:
@@ -1912,6 +2717,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
     workspace = open_workspace(args.workspace_dir)
     company = load_company(workspace)
     cfg = load_research_config()
+    rules_path, _rules_source = resolve_rules_path(TICKER, workspace, strict=True)
     run_id = validate_run_id(args.run_id or now_et().strftime("%Y%m%d-%H%M"))
     paths = _g.tracker_paths(workspace)
     assert_no_escaping_symlinks(workspace, paths["tracker"])
@@ -1923,7 +2729,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
             md_path = paths["tracker"] / run_id / "packet.md"
             if not md_path.exists():
                 atomic_write_text(workspace, md_path, render_packet_md(existing))
-            return emit(_summary(workspace, existing, True))
+            return emit(_summary(workspace, existing, True, rules_path=rules_path))
         transport = resolve_researchdata_transport()
         if transport.get("mode") is None:
             return fail(
@@ -1945,24 +2751,97 @@ def cmd_collect(args: argparse.Namespace) -> int:
         internal_since = _internal_since(last_run, since)
         run_dir = paths["tracker"] / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        consensus = fetch_consensus_snapshot(TICKER, benchmark=benchmark_of(company))
+        legacy_verbatim = _is_legacy_four_verbatim(TICKER, cfg)
+        if legacy_verbatim:
+            cfg = _filter_legacy_config(cfg)
+        has_explicit_switches = _has_explicit_new_market_switches(cfg)
+        benchmark = benchmark_of(company)
+        if legacy_verbatim:
+            if fetch_consensus_snapshot is _DEFAULT_FETCH_CONSENSUS:
+                consensus = _g.fetch_consensus_snapshot(TICKER, benchmark)
+            else:
+                consensus = fetch_consensus_snapshot(TICKER, benchmark=benchmark)
+        else:
+            inc_cons = _source_enabled(cfg, "consensus")
+            inc_price = _source_enabled(cfg, "price")
+            inc_cal = _earnings_calendar_enabled(cfg)
+            if fetch_consensus_snapshot is _DEFAULT_FETCH_CONSENSUS:
+                consensus = _fetch_configured_market_data(
+                    TICKER,
+                    benchmark,
+                    include_consensus=inc_cons,
+                    include_price=inc_price,
+                    include_earnings_calendar=inc_cal,
+                )
+            elif inc_cons or inc_price or inc_cal:
+                consensus = fetch_consensus_snapshot(TICKER, benchmark=benchmark)
+                if isinstance(consensus, dict):
+                    if not inc_cons:
+                        for field in ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions", "price_targets"):
+                            consensus[field] = {}
+                    if not inc_price:
+                        consensus["price"] = {}
+                    if not inc_cal:
+                        consensus["earnings_dates"] = []
+            else:
+                consensus = _fetch_configured_market_data(
+                    TICKER,
+                    benchmark,
+                    include_consensus=False,
+                    include_price=False,
+                    include_earnings_calendar=False,
+                )
         stamp = current.strftime("%Y-%m-%d_%H%M")
         snap_rel = Path("data") / "consensus" / f"{stamp}.json"
         snap_path = ensure_relative(workspace, snap_rel)
         previous = _previous_snapshot(workspace, paths["consensus"], snap_path, last_run.get("snapshot_file"))
-        internal = collect_internal(cfg, internal_since, until, seen, workspace, run_dir)
-        ae, ae_state = collect_alphaengine(cfg, since, until, seen, last_run)
-        sec = collect_sec(cfg, since, seen)
-        xdata = collect_x(cfg, since, until, seen, workspace)
+        if _source_enabled(cfg, "internal"):
+            internal = collect_internal(cfg, internal_since, until, seen, workspace, run_dir)
+        else:
+            internal = {"status": {}, "new": {}, "irrelevant": {}, "pending": {}, "withheld": {}}
+        if _source_enabled(cfg, "alphaengine"):
+            ae, ae_state = collect_alphaengine(cfg, since, until, seen, last_run)
+        else:
+            ae, ae_state = {"status": [], "new": {}}, {"queries": []}
+        if _source_enabled(cfg, "sec"):
+            sec = collect_sec(cfg, since, seen)
+        else:
+            sec = {"status": [], "new": {}}
+        if _source_enabled(cfg, "x"):
+            xdata = collect_x(cfg, since, until, seen, workspace, legacy_verbatim=legacy_verbatim)
+        else:
+            xdata = {
+                "status": [],
+                "new": {},
+                "noise_ids": [],
+                "pool_size": 0,
+                "queries": [],
+                "outside_window": 0,
+                "unprocessed_upstream": False,
+                "profile_followup": [],
+                "failures": [],
+                "metrics_note": "",
+                "note": "",
+            }
         thr = map_thresholds(cfg.get("thresholds"))
         raw_extra = cfg.get("extra_consensus_flags")
         extra_flags = raw_extra if isinstance(raw_extra, list) else []
         deltas, flags = consensus_deltas(
-            consensus, previous, thr, sec_new_count=len(sec["new"]), extra_flags=extra_flags
+            consensus,
+            previous,
+            thr,
+            sec_new_count=len(sec["new"]),
+            extra_flags=extra_flags,
+            legacy_verbatim=legacy_verbatim,
         )
-        model = build_implied_model(consensus, cfg.get("model") or {})
-        failures = failed_sources(internal, ae, sec, xdata, consensus)
-        packet = {
+        model = build_implied_model(
+            consensus,
+            cfg.get("model") or {},
+            require_valid_periods=not legacy_verbatim,
+        )
+        failures = failed_sources(internal, ae, sec, xdata, consensus, legacy_verbatim=legacy_verbatim)
+        news_enabled = _source_enabled(cfg, "news")
+        packet: dict[str, Any] = {
             "ticker": TICKER,
             "run_id": run_id,
             "since": since,
@@ -1978,11 +2857,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
             "sec": sec,
             "x": xdata,
             "news": {
-                "status": "pending_agent_search",
-                "queries": list(cfg.get("news_queries") or []),
+                "status": "pending_agent_search" if news_enabled else "skipped",
+                "queries": list(cfg.get("news_queries") or []) if news_enabled else [],
                 "since": since,
                 "until": until,
-                "requires_original_fetch": True,
+                "requires_original_fetch": news_enabled,
             },
             "failed_sources": failures,
             "short_circuit_eligible": False,
@@ -2007,6 +2886,24 @@ def cmd_collect(args: argparse.Namespace) -> int:
             },
             "collection_complete": True,
         }
+        if not legacy_verbatim and has_explicit_switches:
+            fs_cal = (consensus.get("field_status") or {}).get("earnings_dates") if isinstance(consensus.get("field_status"), dict) else None
+            if not inc_cal or fs_cal == "skipped":
+                cal_status = "已关闭"
+            elif consensus.get("earnings_dates_error"):
+                cal_status = "error"
+            elif _has_earnings_calendar(consensus):
+                cal_status = "ok"
+            else:
+                cal_status = "暂无"
+            price_failed = (isinstance(consensus.get("price"), dict) and "error" in consensus["price"]) or (
+                (consensus.get("field_status") or {}).get("price") == "error"
+            )
+            packet["data_status"] = {
+                "price": "error" if price_failed else ("ok" if _has_price(consensus) else "暂无"),
+                "consensus": "ok" if _has_estimates(consensus) else "暂无",
+                "earnings_calendar": cal_status,
+            }
         paths["consensus"].mkdir(parents=True, exist_ok=True)
         atomic_write_json(workspace, snap_path, consensus)
         atomic_write_text(workspace, run_dir / "packet.md", render_packet_md(packet))
@@ -2018,7 +2915,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         }
         if after != before:
             raise CollectError("state_mutated", "collect 写入了 seen、last_run 或 updates.log")
-        return emit(_summary(workspace, packet, False))
+        return emit(_summary(workspace, packet, False, rules_path=rules_path))
 
 
 def _internal_uncommitted(info: Any) -> bool:
@@ -2115,10 +3012,13 @@ def cmd_commit(args: argparse.Namespace) -> int:
     load_company(workspace)
     run_id = validate_run_id(args.run_id)
     paths = _g.tracker_paths(workspace)
-    assert_no_escaping_symlinks(workspace, paths["tracker"])
-    assert_no_escaping_symlinks(workspace, paths["consensus"])
+    packet_path = ensure_relative(workspace, Path("research") / "tracker" / run_id / "packet.json")
+    ensure_relative(workspace, Path("research") / "tracker" / "seen.json")
+    ensure_relative(workspace, Path("research") / "tracker" / "last_run.json")
+    log_path = ensure_relative(workspace, Path("research") / "tracker" / "updates.log")
+    if log_path.is_symlink():
+        raise CollectError("symlink_escape", f"拒绝透过符号链接读写：{log_path}")
     with workspace_lock(workspace, paths["tracker"]):
-        packet_path = paths["tracker"] / run_id / "packet.json"
         packet = _completed_packet(packet_path, run_id)
         if packet is None:
             return fail("packet_missing", f"找不到完成的数据包 {run_id}")
@@ -2192,7 +3092,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
 
 def _use_ticker(raw: str) -> str:
     chosen = str(raw or "").strip().upper()
-    if chosen not in SUPPORTED_TICKERS:
+    if chosen not in supported_tickers():
         raise CollectError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
     return chosen
 
