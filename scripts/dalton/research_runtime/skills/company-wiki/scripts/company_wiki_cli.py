@@ -50,6 +50,16 @@ if _SCRIPTS_DIR not in sys.path:
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
+
+# Google retired gemini-embedding-2-preview on 2026-11-19. The GA model returns the
+# same vectors for the same text (cosine 1.0, checked on the sales-notes and wiki
+# indexes), so stored labels and configs keep the old name and only the API call maps it.
+_API_MODEL_ALIASES = {"gemini-embedding-2-preview": "gemini-embedding-2"}
+
+
+def api_model(name):
+    return _API_MODEL_ALIASES.get(name, name)
+
 def _resolve_research_roots(default_code_root: Path) -> tuple[Path, Path]:
     raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
@@ -162,7 +172,7 @@ def resolve_embedding_model(config):
             client = get_genai_client()
             # Test with a tiny embed call
             result = client.models.embed_content(
-                model=preferred,
+                model=api_model(preferred),
                 contents=["test"],
                 config={"task_type": "RETRIEVAL_DOCUMENT"}
             )
@@ -170,13 +180,17 @@ def resolve_embedding_model(config):
                 log(f"Using preferred model: {preferred} (dims={len(result.embeddings[0].values)})")
                 return preferred, len(result.embeddings[0].values)
         except Exception as e:
+            if api_model(preferred) != api_model(default):
+                # A different model writes and queries in an unrelated vector space
+                # (gemini-embedding-001 vs the stored index: cosine ~0), so fail instead.
+                fail(f"Embedding model {preferred} failed and {default} is not compatible: {e}")
             log(f"Preferred model {preferred} not available: {e}")
 
     # Fall back to default
     try:
         client = get_genai_client()
         result = client.models.embed_content(
-            model=default,
+            model=api_model(default),
             contents=["test"],
             config={"task_type": "RETRIEVAL_DOCUMENT"}
         )
@@ -204,7 +218,7 @@ def embed_texts(texts, model_name):
                 # One Content per text: gemini-embedding-2 folds a list of plain
                 # strings into a single vector (seen 2026-11-19).
                 result = client.models.embed_content(
-                    model=model_name,
+                    model=api_model(model_name),
                     contents=[types.Content(parts=[types.Part(text=t)]) for t in batch],
                     config={"task_type": "RETRIEVAL_DOCUMENT"}
                 )
@@ -223,6 +237,8 @@ def embed_texts(texts, model_name):
                     time.sleep(wait)
                 else:
                     raise
+        else:
+            raise RuntimeError(f"embedding rate-limited 5 times for texts {i}..{i + len(batch) - 1}")
 
     return embeddings
 
@@ -231,7 +247,7 @@ def embed_query(text, model_name):
     """Embed a single query text."""
     client = get_genai_client()
     result = client.models.embed_content(
-        model=model_name,
+        model=api_model(model_name),
         contents=text,
         config={"task_type": "RETRIEVAL_QUERY"}
     )

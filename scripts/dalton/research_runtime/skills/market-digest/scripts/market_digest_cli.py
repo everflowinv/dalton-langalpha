@@ -38,6 +38,16 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
+
+# Google retired gemini-embedding-2-preview on 2026-11-19. The GA model returns the
+# same vectors for the same text (cosine 1.0, checked on the sales-notes and wiki
+# indexes), so stored labels and configs keep the old name and only the API call maps it.
+_API_MODEL_ALIASES = {"gemini-embedding-2-preview": "gemini-embedding-2"}
+
+
+def api_model(name):
+    return _API_MODEL_ALIASES.get(name, name)
+
 def _resolve_research_roots(default_code_root: Path) -> tuple[Path, Path]:
     raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
@@ -308,7 +318,7 @@ def embed_texts(texts, config):
                 # One Content per text: gemini-embedding-2 folds a list of plain
                 # strings into a single vector (seen 2026-11-19).
                 result = client.models.embed_content(
-                    model=model_name,
+                    model=api_model(model_name),
                     contents=[types.Content(parts=[types.Part(text=t)]) for t in batch],
                     config={"task_type": "RETRIEVAL_DOCUMENT"}
                 )
@@ -327,6 +337,8 @@ def embed_texts(texts, config):
                     time.sleep(wait)
                 else:
                     raise
+        else:
+            raise RuntimeError(f"embedding rate-limited 5 times for texts {i}..{i + len(batch) - 1}")
 
     return embeddings
 
@@ -337,7 +349,7 @@ def embed_query(text, config):
     model_name = config["embedding"]["model"]
 
     result = client.models.embed_content(
-        model=model_name,
+        model=api_model(model_name),
         contents=text,
         config={"task_type": "RETRIEVAL_QUERY"}
     )
@@ -1329,7 +1341,7 @@ def cmd_self_test(args, config):
             from google import genai
             client = genai.Client(api_key=api_key)
             r = client.models.embed_content(
-                model=config["embedding"]["model"],
+                model=api_model(config["embedding"]["model"]),
                 contents="test",
                 config={"task_type": "RETRIEVAL_QUERY"}
             )

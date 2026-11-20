@@ -159,6 +159,10 @@ async def embed_texts_via_bridge(
         if not resp.get("ok") or not isinstance(resp.get("embeddings"), list):
             err = str(resp.get("error") or "bridge_embed_failed")
             raise RuntimeError(f"Host bridge /embed failed: {err}")
+        if len(resp["embeddings"]) != len(batch):
+            raise RuntimeError(
+                f"Host bridge /embed returned {len(resp['embeddings'])} vectors for {len(batch)} texts"
+            )
         if resp.get("model"):
             model_used = str(resp["model"])
         for vec in resp["embeddings"]:
