@@ -22,6 +22,9 @@ from src.server.database import oauth_tokens as oauth_db
 from src.server.database import workspace as ws_db
 from src.server.database.runs import lifecycle as tl_db
 from src.server.dependencies import usage_limits
+from src.server.services.platform_client import quota_service_unavailable
+from src.server.services.shared_workspaces import turn as _turn_mod
+from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.handlers.chat import ptc_run, request_prep
 from src.server.models.chat import ChatMessage, ChatRequest, ThreadOrigin
 from src.server.services import automation_settlement
@@ -189,9 +192,9 @@ async def _drive_ptc_pre_start(
             create_autospec(ptc_run.read_disk_notice, return_value=(None, False)),
         ),
         patch.object(
-            ptc_run,
+            _turn_mod,
             "get_user_profile_for_prompt",
-            create_autospec(ptc_run.get_user_profile_for_prompt, return_value=None),
+            create_autospec(_turn_mod.get_user_profile_for_prompt, return_value=None),
         ),
         patch.object(
             ptc_run.HomeTurnStart,
@@ -278,6 +281,7 @@ async def _drive_ptc_pre_start(
             user_input="run check",
             user_id=_USER,
             route=TurnRoute(_WS, "analyst"),
+            identity=TurnIdentity(_USER, _USER, _USER),
             is_byok=False,
             from_server=True,
             steerable=False,
@@ -1748,7 +1752,7 @@ async def test_notification_fallback_exhaustion_raises_original_error_never_defa
     async def _resolve_quota(_cfg, _uid, model_name, *_args, **_kwargs):
         if model_name == "claude-opus-4-6-oauth":
             raise _reauth_exc("claude-oauth", str(model_name))
-        raise usage_limits.quota_service_unavailable()
+        raise quota_service_unavailable()
 
     with (
         _catalog_and_classify(
@@ -1792,7 +1796,7 @@ async def test_notification_fallback_exhaustion_raises_original_error_never_defa
             resolve=lambda named: _resolve_quota(None, _USER, named),
         )
 
-    expected_quota_exc = usage_limits.quota_service_unavailable()
+    expected_quota_exc = quota_service_unavailable()
     assert exc_quota.value.status_code == expected_quota_exc.status_code
     assert exc_quota.value.detail["type"] == expected_quota_exc.detail["type"]
 
@@ -1994,7 +1998,7 @@ async def test_lazy_candidate_client_build_succeeds_when_valid_and_retries_on_bu
     assert exc_none.value.detail["type"] == "oauth_reauth_required"
 
     quota_cfg = _make_agent_config("gemini-lazy", cred=CredentialSource.NONE, has_client=False)
-    quota_cfg.get_llm_client.side_effect = usage_limits.quota_service_unavailable()
+    quota_cfg.get_llm_client.side_effect = quota_service_unavailable()
 
     async def _resolve_quota_on_build(_cfg, _uid, model_name, *_args, **_kwargs):
         if model_name == "claude-opus-4-6-oauth":
@@ -2625,7 +2629,7 @@ async def test_quota_service_unavailable_503_always_propagates_even_with_other_c
         if model_name == "claude-opus-4-6-oauth":
             raise _reauth_exc("claude-oauth", str(model_name))
         if model_name == "gpt-5":
-            raise usage_limits.quota_service_unavailable()
+            raise quota_service_unavailable()
         return _make_agent_config(str(model_name))
 
     with (
@@ -2660,7 +2664,7 @@ async def test_quota_service_unavailable_503_always_propagates_even_with_other_c
             False,
         )
 
-    expected = usage_limits.quota_service_unavailable()
+    expected = quota_service_unavailable()
     assert exc_info.value.status_code == expected.status_code
     assert exc_info.value.detail == expected.detail
     assert attempted == ["claude-opus-4-6-oauth", "gpt-5"]
