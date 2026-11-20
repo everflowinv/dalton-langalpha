@@ -4911,8 +4911,19 @@ def _install_real_settlement_and_executor_doubles(
         in_transaction: Any = None,
         **fields: Any,
     ) -> dict[str, Any]:
+        from psycopg import AsyncCursor
+
         settled_calls.append({"execution_id": execution_id, **fields})
+        mock_tx_cur = create_autospec(AsyncCursor, instance=True)
+        mock_tx_cur.fetchone.return_value = None
+
+        @asynccontextmanager
+        async def _tx_cursor(*_args: Any, **_kwargs: Any):
+            yield mock_tx_cur
+
         mock_tx_conn = create_autospec(AsyncConnection, instance=True)
+        mock_tx_conn.cursor.side_effect = _tx_cursor
+        mock_tx_conn.transaction.side_effect = lambda: _AsyncTx()
         if in_transaction is not None:
             await in_transaction(mock_tx_conn, row_template)
         return dict(row_template)
@@ -5238,37 +5249,6 @@ async def test_release_signals_claimed_by_sql_and_relist_unwoken(
 
 
 @pytest.mark.asyncio
-async def test_release_claimed_signals_on_non_completed_settle_guards_and_error_isolation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """非 Dalton 自动化直接跳过；释放异常向上抛出，让结算事务回滚（不吞掉）。"""
-    from src.dalton.autonomy import preflight as preflight_mod
-
-    release_mock = create_autospec(
-        watch_db.release_signals_claimed_by,
-        side_effect=RuntimeError("db temporary down"),
-    )
-    monkeypatch.setattr(watch_db, "release_signals_claimed_by", release_mock)
-
-    non_dalton = {"automation_id": "auto-plain", "name": "user-cron", "workspace_id": _PREFLIGHT_WS}
-    conn = object()
-    assert await preflight_mod.release_claimed_signals_on_non_completed_settle(
-        conn,
-        automation=non_dalton,
-        execution_id="exec-plain-1",
-    ) == 0
-    release_mock.assert_not_awaited()
-
-    with pytest.raises(RuntimeError, match="db temporary down"):
-        await preflight_mod.release_claimed_signals_on_non_completed_settle(
-            conn,
-            automation=_company_watch_automation(),
-            execution_id="exec-dalton-err-1",
-        )
-    release_mock.assert_awaited_once_with("exec-dalton-err-1", conn=conn)
-
-
-@pytest.mark.asyncio
 async def test_executor_recovery_lookup_fails_three_times_releases_signal_for_next_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5336,10 +5316,10 @@ async def test_executor_recovery_lookup_fails_three_times_releases_signal_for_ne
 
 
 @pytest.mark.asyncio
-async def test_executor_ownership_timeout_skips_and_releases_claimed_signal_for_next_execution(
+async def test_executor_ownership_timeout_skips_without_releasing_claimed_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """codex 场景 2：归属校验暂时失败触发 PRECHECK_SKIPPED 时，终态结算释放本执行已认领信号，下一次执行可重新拿回。"""
+    """codex 场景 2：归属校验暂时失败触发 PRECHECK_SKIPPED 时，终态结算不释放已认领信号。"""
     from fastapi import HTTPException
     from src.dalton.autonomy import preflight as preflight_mod
     from src.server.services import automation_settlement as settlement_mod
@@ -5391,12 +5371,13 @@ async def test_executor_ownership_timeout_skips_and_releases_claimed_signal_for_
     assert len(settlement_state["settled_calls"]) == 1
     assert settlement_state["settled_calls"][0]["to"] == "skipped"
     assert settlement_state["settled_calls"][0]["skip_reason"] == "precheck"
-    assert release_spy.await_count == 1 and release_spy.await_args.args[0] == exec_1
+    # DALTON-HOOK(automation-subscription-fallback): skipped/generic settlements do not release signals
+    assert release_spy.await_count == 0
     stored = next(iter(store["rows"].values()))
-    assert stored["woken_execution_id"] is None
-    assert stored["payload"]["status"] == "pending"
+    assert stored["woken_execution_id"] == exec_1_uuid
+    assert stored["payload"]["status"] == "woken"
 
-    # Ownership check succeeds cleanly on the subsequent execution.
+    # Generic skipped settlement does NOT hand exec_1's claim to exec_2.
     monkeypatch.setattr(
         preflight_mod,
         "verify_workspace_access",
@@ -5404,9 +5385,9 @@ async def test_executor_ownership_timeout_skips_and_releases_claimed_signal_for_
     )
     next_res = await preflight_mod.decide(_company_watch_automation(), exec_2)
     assert next_res is not None
-    assert next_res.should_wake is True
-    assert [s["signal_key"] for s in next_res.signals] == ["sec:8k:codex-case-2"]
-    assert stored["woken_execution_id"] == watch_db._signal_exec_uuid(exec_2)
+    assert next_res.should_wake is False
+    assert next_res.reason == "no_new_signals"
+    assert stored["woken_execution_id"] == exec_1_uuid
 
 
 @pytest.mark.asyncio

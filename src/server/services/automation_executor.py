@@ -1168,11 +1168,30 @@ class AutomationExecutor:
             await self._start_delivery_unstarted(execution_id, firing)
             # DALTON-HOOK(preflight): firing.route is bound later at thread resolution, so
             # pre-route failures/cancellations fall back to automation["workspace_id"].
+            # DALTON-HOOK(automation-subscription-fallback): release pre-START claimed signals only on executor's synchronous failed settlement;
+            # a re-run of the same execution keeps notices from its earlier turns in the excerpt.
+            from src.dalton.services.automation_subscription_fallback import apply_execution_fallback_notice
+
+            try:
+                fb_row = await exec_db.get_execution_for_settlement(execution_id)
+                excerpt, _ = await apply_execution_fallback_notice(
+                    execution_id,
+                    # Before thread binding the firing has no thread yet; the row may.
+                    thread_id=firing.thread_id or (fb_row or {}).get("conversation_thread_id"),
+                    exec_row=fb_row,
+                )
+            except Exception:
+                logger.warning(
+                    f"[AUTOMATION_EXEC] fallback notice lookup failed: execution_id={execution_id}",
+                    exc_info=True,
+                )
+                excerpt = None
             settled = await settle(
                 firing.automation, execution_id, outcome,
                 thread_id=firing.thread_id,
                 workspace_id=firing.workspace_id or automation.get("workspace_id"),
-                error=error_msg, delivery=firing.delivery,
+                error=error_msg, delivery=firing.delivery, excerpt=excerpt,
+                release_pre_start_signals=True,
             )
             _exec_span.set_attribute(
                 "status",
