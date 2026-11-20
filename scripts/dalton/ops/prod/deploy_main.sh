@@ -11,7 +11,130 @@ WAIT_IDLE_SCRIPT="${SCRIPT_DIR}/wait_backend_idle.sh"
 EDGE_PORT="${DALTON_EDGE_PORT:-8088}"
 EDGE_WAIT_TIMEOUT=60
 BRIDGE=0; RECREATE=0; EXPECT=""
-while [ $# -gt 0 ]; do case "$1" in --bridge) BRIDGE=1;; --recreate) RECREATE=1;; --expect-migration) EXPECT="$2"; shift;; esac; shift; done
+
+usage() {
+  echo "Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN]"
+}
+
+parse_deploy_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bridge) BRIDGE=1;;
+      --recreate) RECREATE=1;;
+      --expect-migration)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ] || [[ "${2:-}" == -* ]]; then
+          echo "ERROR: --expect-migration requires a revision argument (e.g. dNNN)" >&2
+          usage >&2
+          return 2
+        fi
+        if ! _is_valid_dalton_rev "$2"; then
+          echo "ERROR: invalid --expect-migration revision '$2' (expected dNNN, e.g. d040)" >&2
+          usage >&2
+          return 2
+        fi
+        EXPECT="$2"
+        shift
+        ;;
+      *)
+        echo "ERROR: unknown argument: $1" >&2
+        usage >&2
+        return 2
+        ;;
+    esac
+    shift
+  done
+}
+
+_dalton_versions_dir() {
+  printf '%s/src/dalton/migrations/versions' "$REPO_ROOT"
+}
+
+_upstream_versions_dir() {
+  printf '%s/migrations/versions' "$REPO_ROOT"
+}
+
+_is_valid_dalton_rev() {
+  [[ "${1:-}" =~ ^d[0-9]{3,}$ ]]
+}
+
+_is_valid_upstream_rev() {
+  [[ "${1:-}" =~ ^([0-9]{1,6}|[0-9a-fA-F]{8,40})$ ]]
+}
+
+_revision_file_exists() {
+  local rev="${1:-}" versions_dir="${2:-}" f
+  [ -n "$rev" ] && [ -d "$versions_dir" ] || return 1
+  for f in "${versions_dir}/${rev}.py" "${versions_dir}/${rev}_"*.py; do
+    [ -f "$f" ] && return 0
+  done
+  return 1
+}
+
+parse_strict_migration_version() {
+  local raw="${1-}" chain="${2:-}" versions_dir="${3:-}"
+  local candidate=""
+  [ -n "$raw" ] || return 1
+  # Strip at most one trailing newline from psql -Atc output; any remaining newline
+  # indicates multiple rows or trailing blank lines.
+  candidate="${raw%$'\n'}"
+  case "$candidate" in
+    ""|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  # Reject any whitespace anywhere (leading/trailing spaces, tabs, trailing text).
+  case "$candidate" in
+    *[[:space:]]*) return 1 ;;
+  esac
+  case "$chain" in
+    dalton)
+      _is_valid_dalton_rev "$candidate" || return 1
+      ;;
+    upstream)
+      _is_valid_upstream_rev "$candidate" || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  _revision_file_exists "$candidate" "$versions_dir" || return 1
+  printf '%s' "$candidate"
+}
+
+_query_alembic_version_table() {
+  local table="$1" chain="$2" versions_dir="$3"
+  local raw="" psql_rc=0 rev="" attempt=0 max_attempts=3
+  local retry_delay="${DALTON_ALEMBIC_QUERY_RETRY_DELAY_S:-1}"
+  local query_timeout="${DALTON_ALEMBIC_QUERY_TIMEOUT_S:-10}"
+  local statement_timeout_ms=$((query_timeout * 1000))
+  while [ "$attempt" -lt "$max_attempts" ]; do
+    attempt=$((attempt + 1))
+    psql_rc=0
+    raw=$(
+      perl -e 'my $t = shift; alarm $t; exec @ARGV' "$query_timeout" \
+        docker exec -e "PGOPTIONS=-c statement_timeout=${statement_timeout_ms}" dalton-langalpha-postgres-1 \
+        psql -U postgres -d postgres -Atc "SELECT version_num FROM ${table}" 2>/dev/null
+      printf ':%d' "$?"
+    )
+    psql_rc="${raw##*:}"
+    raw="${raw%:*}"
+    if [ "$psql_rc" = "0" ]; then
+      break
+    fi
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      sleep "$retry_delay"
+    fi
+  done
+  [ "$psql_rc" = "0" ] || return 1
+  rev=$(parse_strict_migration_version "$raw" "$chain" "$versions_dir") || return 1
+  printf '%s' "$rev"
+}
+
+get_dalton_alembic_version() {
+  _query_alembic_version_table "alembic_version_dalton" "dalton" "$(_dalton_versions_dir)"
+}
+
+get_upstream_alembic_version() {
+  _query_alembic_version_table "alembic_version" "upstream" "$(_upstream_versions_dir)"
+}
 
 health() { curl -sf -m3 --noproxy '*' http://127.0.0.1:8000/health >/dev/null; }
 edge_ready() {
@@ -427,25 +550,83 @@ run_public_edge_check() {
   return "$rc"
 }
 
-cd "$REPO_ROOT" || exit 1
-bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
-LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
-launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
-for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
-after=$(tail -1 "$LOG"); echo "backup: $after"
-case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; exit 1; };; *) echo "backup failed, abort"; exit 1;; esac
-# ff and frontend build only after the idle wait and backup, right before the restart, so the new
-# frontend never goes live against the old backend and running code is not swapped under a busy backend.
-PRE_FF=$(git rev-parse HEAD)
-BACKEND_TOUCHED=0
-CRAWLER_TOUCHED=0
-EDGE_TOUCHED=0
-BRIDGE_TOUCHED=0
+PRE_FF="${PRE_FF:-}"
+PRE_FF_DALTON_REV="${PRE_FF_DALTON_REV:-}"
+PRE_FF_UPSTREAM_REV="${PRE_FF_UPSTREAM_REV:-}"
+MIGRATING_DEPLOY="${MIGRATING_DEPLOY:-0}"
+BACKEND_TOUCHED="${BACKEND_TOUCHED:-0}"
+CRAWLER_TOUCHED="${CRAWLER_TOUCHED:-0}"
+EDGE_TOUCHED="${EDGE_TOUCHED:-0}"
+BRIDGE_TOUCHED="${BRIDGE_TOUCHED:-0}"
+
+_print_manual_revert_instructions() {
+  local cur_head="$1" cur_dalton_rev="$2" cur_upstream_rev="$3"
+
+  echo "AUTO-REVERT ABORTED — 本次发布包含数据库迁移文件（或无法确认），已快进到新代码；后端可能已经或将会执行迁移。脚本不执行 git reset、不降级、不停服务，保持当前代码（HEAD=${cur_head}）与各服务现状。"
+  echo "部署记录: PRE_FF=${PRE_FF:-未知}, HEAD=${cur_head}, backend_touched=${BACKEND_TOUCHED}, crawler_touched=${CRAWLER_TOUCHED}, edge_touched=${EDGE_TOUCHED}, bridge_touched=${BRIDGE_TOUCHED}"
+  echo "  Dalton 链 (alembic_version_dalton): 部署前=${PRE_FF_DALTON_REV:-未能读取}, 刚才读到=${cur_dalton_rev:-未能读取}"
+  echo "  上游链   (alembic_version):        部署前=${PRE_FF_UPSTREAM_REV:-未能读取}, 刚才读到=${cur_upstream_rev:-未能读取}"
+  echo "  注意：后端仍可能在运行或被看门狗重启，上面“刚才读到”的值随时可能变化，只作参考。"
+  echo "以下命令都在部署检出根目录执行： cd ${REPO_ROOT}"
+  echo "1. 排查（只读）："
+  echo "     docker ps -a --filter name=dalton-langalpha-"
+  echo "     docker logs --tail 100 dalton-langalpha-backend-1"
+  echo "2. 选择方案。方案 A（推荐）：后端能正常运行时保持新版本，修复问题后重新部署。方案 B：确需回到旧版本时，严格按 3–8 步顺序执行，任何一步不满足就停下。"
+  echo "3. 【方案 B】先停所有写入并暂停看门狗（docs/dalton/OPERATIONS.md §4），再确认后端已停："
+  echo "     launchctl bootout gui/\$(id -u)/com.dalton.backend-watchdog"
+  echo "     launchctl bootout gui/\$(id -u)/com.dalton.monitor-feeds"
+  echo "     launchctl bootout gui/\$(id -u)/com.dalton.researchdata-bridge"
+  echo "     launchctl bootout gui/\$(id -u)/com.dalton.channel-gateway"
+  echo "     docker stop dalton-langalpha-edge-1 dalton-langalpha-crawler-1 dalton-langalpha-backend-1"
+  echo "     docker inspect -f '{{.State.Running}}' dalton-langalpha-backend-1   # 必须输出 false"
+  echo "     docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc \"SELECT count(*) FROM pg_stat_activity WHERE datname='postgres' AND state <> 'idle' AND pid <> pg_backend_pid()\"   # 应为 0（原后端的迁移会话已结束）；不为 0 就等待后再查"
+  echo "4. 【方案 B】核实数据库目标：生产后端使用 compose 内 postgres 服务的 postgres 库。下面输出的 DB_HOST 不是 postgres、或 DB_NAME 不是 postgres（或未显示）时，本说明的版本读取、备份与降级命令都不适用，停下来人工处理："
+  echo "     docker compose config backend | grep -E 'DB_(HOST|PORT|NAME)'"
+  echo "5. 【方案 B】备份并确认完成，然后在后端已停的状态下读取实际版本："
+  echo "     launchctl kickstart gui/\$(id -u)/com.dalton.pg-backup"
+  echo "     tail -n 3 ~/Library/Logs/dalton-pg-backup.log   # 等末行出现新的 ' ok ' 记录，且其时间晚于第 3 步停写之后才继续（早于停写开始的备份不算）"
+  echo "     docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc \"SELECT version_num FROM alembic_version_dalton\""
+  echo "     docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc \"SELECT version_num FROM alembic_version\""
+  if [ -z "$PRE_FF_DALTON_REV" ] || [ -z "$PRE_FF_UPSTREAM_REV" ]; then
+    echo "   部署前版本未能读取：用部署前的备份（本次部署开始时生成的那份 dump）核实两条链的版本后再决定降级目标；不要仅凭 git 文件推断。"
+  fi
+  echo "6. 【方案 B】仅对读数高于部署前版本的链执行降级（在维护容器里用当前新代码的迁移文件；后端已停，不用 docker exec）。"
+  echo "   降级会执行沿途每个迁移的 downgrade()，可能删除新版本已写入的表或列：先逐个阅读这些 downgrade()，需要保留的数据先导出，再执行："
+  echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c src/dalton/alembic.ini downgrade ${PRE_FF_DALTON_REV:-<部署前Dalton版本>}\""
+  echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c alembic.ini downgrade ${PRE_FF_UPSTREAM_REV:-<部署前上游版本>}\""
+  echo "   降级后再读一次两条链的版本，必须等于部署前版本；不等就停下，切勿复位代码。"
+  echo "7. 【方案 B】复位代码、重建前端，并强制重建容器（后端仍处于停止状态才执行）："
+  echo "     git reset --keep ${PRE_FF:-<pre_ff>} && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
+  echo "     docker compose up -d --no-deps --force-recreate backend crawler edge"
+  echo "8. 【方案 B】恢复宿主机服务与看门狗，并验证："
+  echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.monitor-feeds.plist"
+  echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.researchdata-bridge.plist"
+  echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist"
+  echo "     ok=0; for i in \$(seq 1 60); do curl -fsS -m3 http://127.0.0.1:8000/health >/dev/null && { ok=1; break; }; sleep 5; done; [ \$ok = 1 ] && echo backend ok || echo 'BACKEND NOT HEALTHY'"
+  echo "     ok=0; for i in \$(seq 1 20); do docker exec dalton-langalpha-backend-1 sh -c 'curl -fsS -m5 http://crawler:8100/health' >/dev/null 2>&1 && { ok=1; break; }; sleep 3; done; [ \$ok = 1 ] && echo crawler ok || echo 'CRAWLER NOT HEALTHY'"
+  echo "     for s in researchdata-bridge channel-gateway monitor-feeds; do launchctl list | grep -q \"com.dalton.\$s\" && echo \"\$s loaded\" || echo \"\$s NOT LOADED\"; done"
+  echo "     bash scripts/dalton/check_public_edge.sh"
+  echo "   以上全部通过后再恢复看门狗："
+  echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.backend-watchdog.plist"
+}
+
 # Put code, web dependencies and the served bundle back together, so a failed step never leaves
 # a new frontend (or new code waiting for the next restart) in front of the running backend.
+# Because migration directories are bind-mounted into containers, any fast-forward that changes
+# migration files (MIGRATING_DEPLOY=1) aborts automatic code reset and prints manual instructions.
 revert_deploy() {
   local need_post_health=0 build_out build_rc post_ok=1 cur_head
+  local cur_dalton_rev="" cur_upstream_rev=""
   local -a failed_steps=()
+
+  if [ "$MIGRATING_DEPLOY" = "1" ]; then
+    cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    cur_dalton_rev=$(get_dalton_alembic_version || true)
+    cur_upstream_rev=$(get_upstream_alembic_version || true)
+    _print_manual_revert_instructions "$cur_head" "$cur_dalton_rev" "$cur_upstream_rev"
+    return 1
+  fi
+
   if [ "$BACKEND_TOUCHED" = "1" ] || [ "$CRAWLER_TOUCHED" = "1" ] || [ "$EDGE_TOUCHED" = "1" ]; then
     need_post_health=1
   fi
@@ -555,90 +736,128 @@ revert_deploy() {
     return 1
   fi
 }
-git fetch -q origin && git merge -q --ff-only origin/dalton/main || { echo "ff failed, abort"; exit 1; }
-echo "$(date '+%T') ff to $(git log --oneline -1)"
-RECREATE_EDGE=0
-if ! git diff --quiet "$PRE_FF" HEAD -- deploy/dalton/Caddyfile 2>/dev/null || edge_compose_changed; then
-  RECREATE_EDGE=1
-fi
-# Host jobs (conversation archive) run on this checkout's .venv, not the container: keep it on the
-# lockfile, or a new dependency breaks them silently (2026-10-28..11-01 archive failures).
-uv sync --frozen -q 2>&1 | tail -2 || echo "WARN: host venv sync failed (host jobs may break)"
-# The build does not install: keep web/node_modules on the lockfile (sync5 changed it).
-(cd web && pnpm install --frozen-lockfile) >/dev/null 2>&1 || { echo "pnpm install failed: reverting"; revert_deploy; exit 1; }
-out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
-build_rc=$?
-printf '%s\n' "$out" | grep -E "VITE_DALTON_AUTH=|OK:|ERROR|OVER BUDGET" || true
-# Here-string, not a pipe: under pipefail, grep -q stopping early on a long build log
-# SIGPIPEs printf and reads as a failed build (2026-11-17, #380 deploy).
-if [ "$build_rc" -ne 0 ] || ! grep -q "OK: Production bundle" <<<"$out"; then
-  echo "frontend build failed: reverting (backend not restarted)"
-  revert_deploy
-  exit 1
-fi
-# Re-check right before the restart: the backup and build take minutes, and a turn
-# started in that gap would be cut off (2026-10-28: a new EDU turn died this way).
-busy() { [ "$(docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc "select (select count(*) from conversation_threads where current_status='in_progress')+(select count(*) from subagent_runs where status='in_progress')")" != "0" ]; }
-while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; exit 1; }; done
 
-BACKEND_TOUCHED=1
-if ! apply_backend; then
-  echo "ERROR: backend restart/recreate failed: reverting"
-  revert_deploy
-  exit 1
-fi
-# P6b crawler service: same image as the backend, code from bind mounts, so a restart picks up the ff.
-# --recreate also re-reads its compose definition; --no-build because it never has its own build.
-if docker compose config --services 2>/dev/null | grep -qx crawler; then
-  CRAWLER_TOUCHED=1
-  if ! apply_crawler; then
-    echo "ERROR: crawler restart/recreate failed: reverting"
-    revert_deploy
-    exit 1
+compute_migrating_deploy() {
+  local diff_out="" diff_rc=0
+  diff_out=$(git diff --name-only "$PRE_FF" HEAD -- migrations/versions src/dalton/migrations/versions 2>/dev/null) || diff_rc=$?
+  if [ "$diff_rc" -ne 0 ] || [ -n "$diff_out" ]; then
+    MIGRATING_DEPLOY=1
+  else
+    MIGRATING_DEPLOY=0
   fi
-fi
-if [ "$RECREATE_EDGE" = "1" ]; then
-  echo "$(date '+%T') edge config changed; recreating edge"
-  EDGE_TOUCHED=1
-  if ! recreate_edge; then
-    echo "ERROR: edge recreate failed: reverting"
-    revert_deploy
-    exit 1
-  fi
-fi
+}
 
-if ! wait_backend_health; then
-  echo "ERROR: backend health check failed: reverting"
-  revert_deploy
-  exit 1
-fi
-cur=$(docker exec dalton-langalpha-backend-1 sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini current 2>/dev/null" | tail -1 || true); echo "dalton migration: $cur"
-[ -n "$EXPECT" ] && { case "$cur" in "$EXPECT"*) echo "migration ok";; *) echo "MIGRATION MISMATCH (expected $EXPECT)";; esac; }
-if [ "$BRIDGE" = "1" ]; then
-  BRIDGE_TOUCHED=1
-  launchctl kickstart -k "gui/$(id -u)/com.dalton.researchdata-bridge" || {
-    echo "ERROR: researchdata-bridge kickstart failed: reverting"
-    revert_deploy
-    exit 1
-  }
-  sleep 5
-  launchctl list | grep researchdata-bridge || true
-fi
-docker inspect dalton-langalpha-backend-1 -f 'backend mem_limit={{.HostConfig.Memory}}'
-if ! wait_crawler_health; then
-  echo "ERROR: crawler health check failed: reverting"
-  revert_deploy
-  exit 1
-fi
-if [ "$RECREATE_EDGE" = "1" ]; then
-  if ! wait_edge_ready; then
-    echo "ERROR: edge not responding with HTTP 200 on 127.0.0.1:${EDGE_PORT} within ${EDGE_WAIT_TIMEOUT}s: reverting"
+run_deploy_main() {
+  local LOG before after out build_rc cur
+  parse_deploy_args "$@" || exit $?
+  cd "$REPO_ROOT" || exit 1
+  PRE_FF_DALTON_REV=$(get_dalton_alembic_version || true)
+  PRE_FF_UPSTREAM_REV=$(get_upstream_alembic_version || true)
+  echo "pre-deploy migrations: dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取}"
+  bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
+  LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
+  launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
+  for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
+  after=$(tail -1 "$LOG"); echo "backup: $after"
+  case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; exit 1; };; *) echo "backup failed, abort"; exit 1;; esac
+  # ff and frontend build only after the idle wait and backup, right before the restart, so the new
+  # frontend never goes live against the old backend and running code is not swapped under a busy backend.
+  PRE_FF=$(git rev-parse HEAD)
+  MIGRATING_DEPLOY=0
+  BACKEND_TOUCHED=0
+  CRAWLER_TOUCHED=0
+  EDGE_TOUCHED=0
+  BRIDGE_TOUCHED=0
+  git fetch -q origin && git merge -q --ff-only origin/dalton/main || { echo "ff failed, abort"; exit 1; }
+  compute_migrating_deploy
+  echo "$(date '+%T') ff to $(git log --oneline -1) (migrating_deploy=${MIGRATING_DEPLOY})"
+  RECREATE_EDGE=0
+  if ! git diff --quiet "$PRE_FF" HEAD -- deploy/dalton/Caddyfile 2>/dev/null || edge_compose_changed; then
+    RECREATE_EDGE=1
+  fi
+  # Host jobs (conversation archive) run on this checkout's .venv, not the container: keep it on the
+  # lockfile, or a new dependency breaks them silently (2026-10-28..11-01 archive failures).
+  uv sync --frozen -q 2>&1 | tail -2 || echo "WARN: host venv sync failed (host jobs may break)"
+  # The build does not install: keep web/node_modules on the lockfile (sync5 changed it).
+  (cd web && pnpm install --frozen-lockfile) >/dev/null 2>&1 || { echo "pnpm install failed: reverting"; revert_deploy; exit 1; }
+  out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
+  build_rc=$?
+  printf '%s\n' "$out" | grep -E "VITE_DALTON_AUTH=|OK:|ERROR|OVER BUDGET" || true
+  # Here-string, not a pipe: under pipefail, grep -q stopping early on a long build log
+  # SIGPIPEs printf and reads as a failed build (2026-11-17, #380 deploy).
+  if [ "$build_rc" -ne 0 ] || ! grep -q "OK: Production bundle" <<<"$out"; then
+    echo "frontend build failed: reverting (backend not restarted)"
     revert_deploy
     exit 1
   fi
-fi
-if ! run_public_edge_check; then
-  echo "ERROR: public edge check failed: reverting"
-  revert_deploy
-  exit 1
+  # Re-check right before the restart: the backup and build take minutes, and a turn
+  # started in that gap would be cut off (2026-10-28: a new EDU turn died this way).
+  busy() { [ "$(docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc "select (select count(*) from conversation_threads where current_status='in_progress')+(select count(*) from subagent_runs where status='in_progress')")" != "0" ]; }
+  while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; exit 1; }; done
+
+  BACKEND_TOUCHED=1
+  if ! apply_backend; then
+    echo "ERROR: backend restart/recreate failed: reverting"
+    revert_deploy
+    exit 1
+  fi
+  # P6b crawler service: same image as the backend, code from bind mounts, so a restart picks up the ff.
+  # --recreate also re-reads its compose definition; --no-build because it never has its own build.
+  if docker compose config --services 2>/dev/null | grep -qx crawler; then
+    CRAWLER_TOUCHED=1
+    if ! apply_crawler; then
+      echo "ERROR: crawler restart/recreate failed: reverting"
+      revert_deploy
+      exit 1
+    fi
+  fi
+  if [ "$RECREATE_EDGE" = "1" ]; then
+    echo "$(date '+%T') edge config changed; recreating edge"
+    EDGE_TOUCHED=1
+    if ! recreate_edge; then
+      echo "ERROR: edge recreate failed: reverting"
+      revert_deploy
+      exit 1
+    fi
+  fi
+
+  if ! wait_backend_health; then
+    echo "ERROR: backend health check failed: reverting"
+    revert_deploy
+    exit 1
+  fi
+  cur=$(docker exec dalton-langalpha-backend-1 sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini current 2>/dev/null" | tail -1 || true); echo "dalton migration: $cur"
+  [ -n "$EXPECT" ] && { case "$cur" in "$EXPECT"*) echo "migration ok";; *) echo "MIGRATION MISMATCH (expected $EXPECT)";; esac; }
+  if [ "$BRIDGE" = "1" ]; then
+    BRIDGE_TOUCHED=1
+    launchctl kickstart -k "gui/$(id -u)/com.dalton.researchdata-bridge" || {
+      echo "ERROR: researchdata-bridge kickstart failed: reverting"
+      revert_deploy
+      exit 1
+    }
+    sleep 5
+    launchctl list | grep researchdata-bridge || true
+  fi
+  docker inspect dalton-langalpha-backend-1 -f 'backend mem_limit={{.HostConfig.Memory}}'
+  if ! wait_crawler_health; then
+    echo "ERROR: crawler health check failed: reverting"
+    revert_deploy
+    exit 1
+  fi
+  if [ "$RECREATE_EDGE" = "1" ]; then
+    if ! wait_edge_ready; then
+      echo "ERROR: edge not responding with HTTP 200 on 127.0.0.1:${EDGE_PORT} within ${EDGE_WAIT_TIMEOUT}s: reverting"
+      revert_deploy
+      exit 1
+    fi
+  fi
+  if ! run_public_edge_check; then
+    echo "ERROR: public edge check failed: reverting"
+    revert_deploy
+    exit 1
+  fi
+}
+
+if [ "${DALTON_DEPLOY_LIB_ONLY:-0}" != "1" ]; then
+  run_deploy_main "$@"
 fi
