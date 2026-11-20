@@ -13,12 +13,6 @@
     "Garman",
     "Rufus"
   ],
-  "internal_routes": [
-    "tmtb",
-    "sales-notes",
-    "funda-ai",
-    "company-wiki"
-  ],
   "internal_limit": 60,
   "internal_read_cap_per_route": 12,
   "excluded_documents": [],
@@ -35,15 +29,23 @@
     "Amazon.com",
     "Amazon"
   ],
-  "sec_forms": [
-    "8-K",
-    "10-Q",
-    "10-K",
-    "S-3ASR",
-    "424B2",
-    "424B5",
-    "FWP"
-  ],
+  "sources": {
+    "internal_routes": [
+      "tmtb",
+      "sales-notes",
+      "funda-ai",
+      "company-wiki"
+    ],
+    "sec_forms": [
+      "8-K",
+      "10-Q",
+      "10-K",
+      "S-3ASR",
+      "424B2",
+      "424B5",
+      "FWP"
+    ]
+  },
   "news_queries": [
     "Amazon analyst estimates price target downgrade upgrade AWS",
     "Amazon AWS Trainium Anthropic capex Kuiper retail news"

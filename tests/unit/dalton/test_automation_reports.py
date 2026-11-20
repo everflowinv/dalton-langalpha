@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -72,6 +73,11 @@ def _profile(
 def test_profile_accepts_only_named_profiles() -> None:
     for profile_id in (
         "msft-tracker",
+        "meta-tracker",
+        "amzn-tracker",
+        "googl-tracker",
+        "ant-tracker",
+        "spcx-tracker",
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
@@ -104,6 +110,8 @@ def test_profile_accepts_only_named_profiles() -> None:
         "meta-tracker",
         "amzn-tracker",
         "googl-tracker",
+        "ant-tracker",
+        "spcx-tracker",
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
@@ -125,6 +133,83 @@ def test_profile_accepts_only_named_profiles() -> None:
         "wiki-auto-ingest",
         "podcast-weekly",
     }
+
+
+def test_report_profiles_accepts_dynamic_bullbear_config_without_code_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.dalton import bullbear_tickers
+
+    skill_dir = tmp_path / "dalton-bullbear-tracker"
+    (skill_dir / "config").mkdir(parents=True)
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "config" / "NEWCO.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NEWCO",
+                "card": {
+                    "title_prefix": "📈 NEWCO 跟踪｜",
+                    "subtitle": "NewCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "NEWCO",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "newco-rules.md").write_text("# NEWCO\n", encoding="utf-8")
+    # Missing card fields or missing rules -> excluded
+    (skill_dir / "config" / "NOCARD.json").write_text(
+        json.dumps({"ticker": "NOCARD"}),
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "nocard-rules.md").write_text("# NOCARD\n", encoding="utf-8")
+    (skill_dir / "config" / "PARTIAL.json").write_text(
+        json.dumps({"ticker": "PARTIAL", "card": {"tag": "PARTIAL"}}),
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "partial-rules.md").write_text("# PARTIAL\n", encoding="utf-8")
+    (skill_dir / "config" / "NORULES.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NORULES",
+                "card": {
+                    "title_prefix": "📈 NORULES 跟踪｜",
+                    "subtitle": "NoRules · 多空观点、盈利预测修正与催化剂",
+                    "tag": "NORULES",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bullbear_tickers, "BULLBEAR_SKILL_DIR", skill_dir)
+
+    assert "newco-tracker" in REPORT_PROFILES
+    assert "nocard-tracker" not in REPORT_PROFILES
+    assert "partial-tracker" not in REPORT_PROFILES
+    assert "norules-tracker" not in REPORT_PROFILES
+    parsed, err = parse_report_profile(_profile("newco-tracker"))
+    assert err is None and parsed is not None
+    assert parsed["profile"] == "newco-tracker"
+    assert parse_report_profile(_profile("nocard-tracker")) == (None, "profile_invalid")
+    assert parse_report_profile(_profile("partial-tracker")) == (None, "profile_invalid")
+    assert parse_report_profile(_profile("norules-tracker")) == (None, "profile_invalid")
+
+
+def test_parse_report_profile_logs_and_returns_invalid_when_tracker_config_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.dalton import bullbear_tickers
+
+    missing_cfg = tmp_path / "does_not_exist" / "tracker_config.py"
+    monkeypatch.setattr(bullbear_tickers, "_TRACKER_CONFIG_PATH", missing_cfg)
+    with caplog.at_level("WARNING"):
+        parsed, err = parse_report_profile(_profile("msft-tracker"))
+    assert parsed is None and err == "profile_invalid"
+    assert any("missing" in rec.message.lower() for rec in caplog.records)
 
 
 def test_profile_absent_is_not_invalid_and_malformed_is() -> None:

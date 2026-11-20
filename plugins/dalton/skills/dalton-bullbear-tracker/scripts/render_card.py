@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -15,8 +16,26 @@ from typing import Any, Optional, Tuple
 
 CARD_MARKDOWN_MAX_CHARS = 2000
 CARD_BODY_MAX_CHARS = 3000
-SUPPORTED_TICKERS = ("MSFT", "META", "AMZN", "GOOGL")
 SKILL_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_tracker_config() -> Any:
+    path = Path(__file__).resolve().parent / "tracker_config.py"
+    name = "dalton_bullbear_tracker_config"
+    cached = sys.modules.get(name)
+    if cached is not None and getattr(cached, "__file__", None) == str(path):
+        return cached
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"找不到共享配置模块 {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def supported_tickers() -> tuple[str, ...]:
+    return _load_tracker_config().supported_tickers(skill_dir=SKILL_DIR)
 
 _TABLE_LINE_RE = re.compile(r"^\s*\|.*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
@@ -402,27 +421,16 @@ def _forbidden_payload(obj: Any) -> bool:
     return False
 
 
-def load_card_style(ticker: str = "MSFT") -> dict[str, str]:
+def load_card_style(ticker: str = "MSFT", workspace: Path | str | None = None) -> dict[str, str]:
+    _ = workspace
     chosen = str(ticker or "").strip().upper()
-    if chosen not in SUPPORTED_TICKERS:
+    cfg_mod = _load_tracker_config()
+    if chosen not in cfg_mod.supported_tickers(skill_dir=SKILL_DIR):
         raise RenderError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
-    path = SKILL_DIR / "config" / f"{chosen}.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RenderError("research_config_unreadable", str(exc)[:200]) from exc
-    if not isinstance(data, dict) or str(data.get("ticker") or "").upper() != chosen:
-        raise RenderError("company_mismatch", f"研究配置不是 {chosen}")
-    card = data.get("card")
-    if not isinstance(card, dict):
-        raise RenderError("card_config_missing", "配置缺少 card")
-    style: dict[str, str] = {}
-    for key in ("title_prefix", "subtitle", "tag", "header_template", "tag_color"):
-        value = card.get(key)
-        if not isinstance(value, str) or not value:
-            raise RenderError("card_config_missing", f"card.{key} 缺失")
-        style[key] = value
-    return style
+    data = cfg_mod.load_validated_config(chosen, skill_dir=SKILL_DIR)
+    if data is None:
+        raise RenderError("unsupported_ticker", f"不支持的 ticker：{chosen or '空'}")
+    return {key: str(data["card"][key]) for key in cfg_mod.CARD_STYLE_KEYS}
 
 
 def dump_card(card: dict[str, Any]) -> str:
@@ -452,7 +460,7 @@ def render_card(
     ticker: str = "MSFT",
 ) -> dict[str, Any]:
     root = open_workspace(str(workspace))
-    style = load_card_style(ticker)
+    style = load_card_style(ticker, workspace=root)
     stamp = parse_run_stamp(run_id)
     source = ensure_relative(root, file_rel)
     output = ensure_relative(root, output_rel)

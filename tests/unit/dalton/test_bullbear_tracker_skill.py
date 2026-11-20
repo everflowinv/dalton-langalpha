@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from contextlib import redirect_stdout
 from datetime import datetime
 from io import StringIO
@@ -1101,3 +1102,868 @@ def test_corrupt_packet_keeps_review_visible_by_review_ticker(tmp_path: Path) ->
     assert meta_id in meta_runs and meta_id not in msft_runs
     assert legacy_id in msft_runs and legacy_id not in meta_runs
     assert foreign_id in msft_runs and foreign_id not in meta_runs
+
+
+def test_config_driven_supported_tickers_and_workspace_rules_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collect_mod = _load(
+        "bullbear_collect_under_skill_test",
+        "plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py",
+    )
+    for mod in (collect_mod, STATE, RENDER):
+        assert not hasattr(mod, "SUPPORTED_TICKERS")
+
+    expected_base = ("AMZN", "ANT", "GOOGL", "META", "MSFT", "SPCX")
+    for mod in (collect_mod, STATE, RENDER):
+        assert mod.supported_tickers() == expected_base
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+
+    # Valid config + skill reference rules -> supported
+    (fake_skill / "config" / "ACME.json").write_text(
+        json.dumps(
+            {
+                "ticker": "ACME",
+                "card": {
+                    "title_prefix": "📈 ACME 跟踪｜",
+                    "subtitle": "Acme · 多空观点、盈利预测修正与催化剂",
+                    "tag": "ACME",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (fake_skill / "references" / "acme-rules.md").write_text("# ACME 规则\n", encoding="utf-8")
+
+    # Missing card -> excluded
+    (fake_skill / "config" / "NOCARD.json").write_text(json.dumps({"ticker": "NOCARD"}), encoding="utf-8")
+    (fake_skill / "references" / "nocard-rules.md").write_text("# NOCARD\n", encoding="utf-8")
+
+    # Mismatched ticker -> excluded
+    (fake_skill / "config" / "BADT.json").write_text(
+        json.dumps({"ticker": "OTHER", "card": {"tag": "BADT"}}), encoding="utf-8"
+    )
+    (fake_skill / "references" / "badt-rules.md").write_text("# BADT\n", encoding="utf-8")
+
+    # Incomplete card (missing tag_color) -> excluded
+    (fake_skill / "config" / "PARTIAL.json").write_text(
+        json.dumps(
+            {
+                "ticker": "PARTIAL",
+                "card": {
+                    "title_prefix": "📈 PARTIAL 跟踪｜",
+                    "subtitle": "Partial · 多空观点、盈利预测修正与催化剂",
+                    "tag": "PARTIAL",
+                    "header_template": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (fake_skill / "references" / "partial-rules.md").write_text("# PARTIAL\n", encoding="utf-8")
+
+    # Config with card but no reference rules -> excluded without workspace rules, included with workspace rules
+    (fake_skill / "config" / "WSCO.json").write_text(
+        json.dumps(
+            {
+                "ticker": "WSCO",
+                "card": {
+                    "title_prefix": "📈 WSCO 跟踪｜",
+                    "subtitle": "Wsco · 多空观点、盈利预测修正与催化剂",
+                    "tag": "WSCO",
+                    "header_template": "indigo",
+                    "tag_color": "indigo",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+    monkeypatch.setattr(STATE, "SKILL_DIR", fake_skill)
+    monkeypatch.setattr(RENDER, "SKILL_DIR", fake_skill)
+
+    for mod in (collect_mod, STATE, RENDER):
+        assert mod.supported_tickers() == ("ACME",)
+
+    ws = tmp_path / "ws"
+    (ws / "research" / "tracker").mkdir(parents=True)
+    assert collect_mod.resolve_rules_path("ACME", workspace=ws) == (
+        fake_skill / "references" / "acme-rules.md",
+        "skill",
+    )
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["rules-path", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 0
+    assert json.loads(buf.getvalue())["rules_path"] == str(fake_skill / "references" / "acme-rules.md")
+    assert json.loads(buf.getvalue())["rules_source"] == "skill"
+
+    ws_rules = ws / "research" / "tracker" / "rules.md"
+    ws_rules.write_text("# 工作区专属规则\n", encoding="utf-8")
+    assert collect_mod.resolve_rules_path("ACME", workspace=ws) == (ws_rules, "workspace")
+    # 工作区有 rules.md、但缺 references 文件时技能与服务端都判不支持
+    for mod in (collect_mod, STATE, RENDER):
+        assert mod.supported_tickers() == ("ACME",)
+    with pytest.raises(STATE.StateError) as wsco_state_exc:
+        STATE.resolve_ticker("WSCO")
+    assert wsco_state_exc.value.status == "unsupported_ticker"
+    with pytest.raises(RENDER.RenderError) as wsco_render_exc:
+        RENDER.load_card_style("WSCO", workspace=ws)
+    assert wsco_render_exc.value.status == "unsupported_ticker"
+    with pytest.raises(collect_mod.CollectError) as wsco_collect_exc:
+        collect_mod._use_ticker("WSCO")
+    assert wsco_collect_exc.value.status == "unsupported_ticker"
+
+    from src.dalton import bullbear_tickers
+    from src.dalton.database.automation_reports import REPORT_PROFILES
+
+    monkeypatch.setattr(bullbear_tickers, "BULLBEAR_SKILL_DIR", fake_skill)
+    assert bullbear_tickers.supported_bullbear_tickers() == ("ACME",)
+    assert "wsco-tracker" not in REPORT_PROFILES
+
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["open-runs", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 0
+    open_payload = json.loads(buf.getvalue())
+    assert open_payload == {
+        "ok": True,
+        "runs": [],
+    }
+
+    # Symlink on rules.md pointing OUTSIDE workspace -> rejected by collect & rules-path
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_rules = outside / "rules.md"
+    outside_rules.write_text("# 外部规则\n", encoding="utf-8")
+    ws_rules.unlink()
+    ws_rules.symlink_to(outside_rules)
+    assert collect_mod.resolve_rules_path("ACME", workspace=ws) == (
+        fake_skill / "references" / "acme-rules.md",
+        "skill",
+    )
+    with pytest.raises(collect_mod.CollectError) as sym_collect:
+        collect_mod.resolve_rules_path("ACME", workspace=ws, strict=True)
+    assert sym_collect.value.status == "symlink_escape"
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["rules-path", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 2
+    assert json.loads(buf.getvalue())["status"] == "symlink_escape"
+
+    # open-runs lists ALL recoverable runs (latest card.json + older pending run) even if rules.md escapes
+    run_id = "20261110-2250"
+    run_dir = ws / "research" / "tracker" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "packet.json").write_text(json.dumps({"ticker": "ACME", "run_id": run_id}), encoding="utf-8")
+    (run_dir / "card.json").write_text(json.dumps({"schema": "2.0"}), encoding="utf-8")
+    (run_dir / "review.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "ticker": "ACME",
+                "material": "yes",
+                "summary": "s",
+                "report_run_id": "rep-1",
+                "card_json": f"research/tracker/{run_id}/card.json",
+                "send_status": "failed",
+                "content_kind": "cards",
+            }
+        ),
+        encoding="utf-8",
+    )
+    older_id = "20261109-2250"
+    older_dir = ws / "research" / "tracker" / older_id
+    older_dir.mkdir(parents=True)
+    (older_dir / "packet.json").write_text(
+        json.dumps({"ticker": "ACME", "run_id": older_id, "collection_complete": True}),
+        encoding="utf-8",
+    )
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["open-runs", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 0
+    card_open = json.loads(buf.getvalue())
+    assert [r["run_id"] for r in card_open["runs"]] == [run_id, older_id]
+    assert "rules_path" not in card_open
+    # Selecting the older run still fails when calling rules-path
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["rules-path", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 2
+    assert json.loads(buf.getvalue())["status"] == "symlink_escape"
+
+    (older_dir / "packet.json").unlink()
+    older_dir.rmdir()
+
+    # Symlink on rules.md pointing INSIDE workspace -> accepted with rules_source == "workspace"
+    shared_dir = ws / "shared"
+    shared_dir.mkdir()
+    internal_rules = shared_dir / "custom-rules.md"
+    internal_rules.write_text("# 工作区内软链规则\n", encoding="utf-8")
+    ws_rules.unlink()
+    ws_rules.symlink_to(internal_rules)
+    assert collect_mod.resolve_rules_path("ACME", workspace=ws, strict=True) == (
+        internal_rules.resolve(),
+        "workspace",
+    )
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["rules-path", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 0
+    in_sym = json.loads(buf.getvalue())
+    assert in_sym["rules_path"] == str(internal_rules.resolve())
+    assert in_sym["rules_source"] == "workspace"
+
+    # Symlink on parent directory research/tracker -> outside -> rejected
+    ws_rules.unlink()
+    (ws / "research" / "tracker" / run_id / "card.json").unlink()
+    (ws / "research" / "tracker" / run_id / "review.json").unlink()
+    (ws / "research" / "tracker" / run_id / "packet.json").unlink()
+    (ws / "research" / "tracker" / run_id).rmdir()
+    (ws / "research" / "tracker").rmdir()
+    (ws / "research" / "tracker").symlink_to(outside)
+    assert collect_mod.resolve_rules_path("ACME", workspace=ws) == (
+        fake_skill / "references" / "acme-rules.md",
+        "skill",
+    )
+    with pytest.raises(collect_mod.CollectError) as dir_sym_collect:
+        collect_mod.resolve_rules_path("ACME", workspace=ws, strict=True)
+    assert dir_sym_collect.value.status == "symlink_escape"
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["rules-path", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 2
+    assert json.loads(buf.getvalue())["status"] == "symlink_escape"
+
+    # Symlink on parent directory research/tracker -> inside workspace -> accepted with rules_source == "workspace"
+    alt_tracker = ws / "alt_tracker"
+    alt_tracker.mkdir()
+    alt_rules = alt_tracker / "rules.md"
+    alt_rules.write_text("# 区内目录软链规则\n", encoding="utf-8")
+    (ws / "research" / "tracker").unlink()
+    (ws / "research" / "tracker").symlink_to(alt_tracker)
+    assert collect_mod.resolve_rules_path("ACME", workspace=ws, strict=True) == (
+        alt_rules.resolve(),
+        "workspace",
+    )
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["rules-path", "--ticker", "ACME", "--workspace-dir", str(ws)])
+    assert code == 0
+    alt_payload = json.loads(buf.getvalue())
+    assert alt_payload["rules_path"] == str(alt_rules.resolve())
+    assert alt_payload["rules_source"] == "workspace"
+    (ws / "research" / "tracker").unlink()
+    (ws / "research" / "tracker").mkdir()
+
+    # Cache picks up newly added config + rules file on mtime change
+    late_cfg = fake_skill / "config" / "LATE.json"
+    late_text = json.dumps(
+        {
+            "ticker": "LATE",
+            "card": {
+                "title_prefix": "📈 LATE 跟踪｜",
+                "subtitle": "Late · 多空观点、盈利预测修正与催化剂",
+                "tag": "LATE",
+                "header_template": "blue",
+                "tag_color": "blue",
+            },
+        }
+    )
+    late_cfg.write_text(late_text, encoding="utf-8")
+    (fake_skill / "references" / "late-rules.md").write_text("# LATE\n", encoding="utf-8")
+    assert collect_mod.supported_tickers() == ("ACME", "LATE")
+
+    # Cache invalidates via st_ino / st_ctime_ns even if size and mtime stay identical
+    orig_st = late_cfg.stat()
+    same_len_bad = " " * len(late_text)
+    assert len(same_len_bad.encode("utf-8")) == orig_st.st_size
+    late_cfg.write_text(same_len_bad, encoding="utf-8")
+    os.utime(late_cfg, ns=(orig_st.st_atime_ns, orig_st.st_mtime_ns))
+    assert collect_mod.supported_tickers() == ("ACME",)
+
+    for bad in ("NOCARD", "BADT", "PARTIAL", "WSCO", "NVDA"):
+        with pytest.raises(STATE.StateError) as state_exc:
+            STATE.resolve_ticker(bad)
+        assert state_exc.value.status == "unsupported_ticker"
+        with pytest.raises(RENDER.RenderError) as render_exc:
+            RENDER.load_card_style(bad, workspace=ws)
+        assert render_exc.value.status == "unsupported_ticker"
+        with pytest.raises(collect_mod.CollectError) as collect_exc:
+            collect_mod._use_ticker(bad)
+        assert collect_exc.value.status == "unsupported_ticker"
+
+    skill_md = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    assert "common-rules.md" in skill_md
+    assert "state.py rules-path" in skill_md
+    assert "rules_path" in skill_md
+    assert "research/tracker/rules.md" in skill_md
+    assert "references/<ticker小写>-rules.md" in skill_md
+    assert 'action == "check_status"' in skill_md
+    assert "execution_batch_conflict" in skill_md
+    for fname in ("common-rules.md", "ant-rules.md", "spcx-rules.md"):
+        first_lines = "\n".join((SKILL / "references" / fname).read_text(encoding="utf-8").splitlines()[:5])
+        assert "rules_path" in first_lines
+        assert "open-runs" not in first_lines
+        assert "工作区若存在" not in first_lines
+        assert "若工作区存在" not in first_lines
+
+
+def test_single_config_validation_rejects_padded_ticker_and_non_dict_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    collect_mod = _load(
+        "bullbear_collect_validation_test",
+        "plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py",
+    )
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "msft-rules.md").write_text("# MSFT\n", encoding="utf-8")
+    (fake_skill / "config" / "MSFT.json").write_text(
+        json.dumps(
+            {
+                "ticker": " MSFT ",
+                "card": {
+                    "title_prefix": "📈 MSFT 跟踪｜",
+                    "subtitle": "Microsoft",
+                    "tag": "MSFT",
+                    "header_template": "indigo",
+                    "tag_color": "indigo",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (fake_skill / "references" / "listsrc-rules.md").write_text("# LISTSRC\n", encoding="utf-8")
+    (fake_skill / "config" / "LISTSRC.json").write_text(
+        json.dumps(
+            {
+                "ticker": "LISTSRC",
+                "sources": ["internal"],
+                "card": {
+                    "title_prefix": "📈 LISTSRC 跟踪｜",
+                    "subtitle": "ListSrc",
+                    "tag": "LISTSRC",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+    monkeypatch.setattr(STATE, "SKILL_DIR", fake_skill)
+    monkeypatch.setattr(RENDER, "SKILL_DIR", fake_skill)
+
+    # 1) "ticker": " MSFT " is rejected consistently across supported_tickers, collect, and render_card
+    for mod in (collect_mod, STATE, RENDER):
+        assert mod.supported_tickers() == ()
+    with pytest.raises(RENDER.RenderError) as render_exc:
+        RENDER.load_card_style("MSFT")
+    assert render_exc.value.status == "unsupported_ticker"
+    with pytest.raises(collect_mod.CollectError) as collect_exc:
+        collect_mod._use_ticker("MSFT")
+    assert collect_exc.value.status == "unsupported_ticker"
+
+    # 2) Non-dict sources (e.g. list) is rejected consistently as unsupported
+    with pytest.raises(STATE.StateError) as state_list_exc:
+        STATE.resolve_ticker("LISTSRC")
+    assert state_list_exc.value.status == "unsupported_ticker"
+    with pytest.raises(RENDER.RenderError) as render_list_exc:
+        RENDER.load_card_style("LISTSRC")
+    assert render_list_exc.value.status == "unsupported_ticker"
+    with pytest.raises(collect_mod.CollectError) as collect_list_exc:
+        collect_mod._use_ticker("LISTSRC")
+    assert collect_list_exc.value.status == "unsupported_ticker"
+
+
+@pytest.mark.parametrize(
+    ("ticker", "template", "subtitle"),
+    [
+        ("ANT", "purple", "Anthropic · 多空观点、盈利预测修正与催化剂"),
+        ("SPCX", "turquoise", "SpaceX · 多空观点、盈利预测修正与催化剂"),
+    ],
+)
+def test_ant_and_spcx_configs_rules_and_card_structure(
+    tmp_path: Path, ticker: str, template: str, subtitle: str
+) -> None:
+    cfg_path = SKILL / "config" / f"{ticker}.json"
+    raw = cfg_path.read_text(encoding="utf-8")
+    for banned in ("feishu", "chat", "token", "secret", "discord"):
+        assert banned not in raw.lower(), cfg_path.name
+    cfg = json.loads(raw)
+    assert cfg["ticker"] == ticker
+    assert "internal_routes" not in cfg
+    assert "sec_forms" not in cfg
+    assert isinstance(cfg.get("sources"), dict) and cfg["sources"]
+    assert isinstance(cfg["sources"].get("internal_routes"), list) and cfg["sources"]["internal_routes"]
+    assert isinstance(cfg["sources"].get("sec_forms"), list) and cfg["sources"]["sec_forms"]
+    assert isinstance(cfg.get("research_keywords"), list) and cfg["research_keywords"]
+    assert isinstance(cfg.get("x_accounts"), list) and cfg["x_accounts"]
+    if ticker == "SPCX":
+        assert '"Elon Musk" OR xAI' in cfg["x_queries"][1]
+    assert set(cfg["card"]) == {"title_prefix", "subtitle", "tag", "header_template", "tag_color"}
+
+    rules_path = SKILL / "references" / f"{ticker.lower()}-rules.md"
+    assert rules_path.is_file()
+    rules_text = rules_path.read_text(encoding="utf-8")
+    assert f"股票代码直接写 {ticker}" in rules_text
+    assert "## 每轮必读的材料" in rules_text
+    assert "## 新闻与 X" in rules_text
+    assert "## 是否重要" in rules_text
+    assert "## 盈利预测怎么拆" in rules_text
+    assert "## 卡片正文" in rules_text
+
+    root = tmp_path / ticker
+    run = root / "research" / "tracker" / RUN_ID
+    run.mkdir(parents=True)
+    (run / "packet.json").write_text(json.dumps({"ticker": ticker}) + "\n", encoding="utf-8")
+    (root / "research" / "tracker" / "thesis.md").write_text(
+        f"### D1 {ticker} 核心分歧\n", encoding="utf-8"
+    )
+    (run / "card.md").write_text(
+        "## 判断\n判断不变。\n\n## 新信息\n- D1 本轮新证据。\n\n## 盈利预测修正\n暂无。\n\n"
+        "## 例行披露 (折叠)\n- 暂无。\n\n## 来源\n- [公告](https://example.com/1)\n",
+        encoding="utf-8",
+    )
+    output = f"research/tracker/{RUN_ID}/card.json"
+    result = RENDER.render_card(root, RUN_ID, f"research/tracker/{RUN_ID}/card.md", output, ticker)
+    assert result["ok"] is True
+    assert result["glossed"] == ["D1"]
+    card = json.loads((root / output).read_text(encoding="utf-8"))
+    assert list(card) == ["schema", "config", "header", "body"]
+    assert card["schema"] == "2.0"
+    assert card["config"] == {"wide_screen_mode": True, "update_multi": True}
+    assert card["header"]["title"]["content"] == f"📈 {ticker} 跟踪｜11-09 22:50 ET"
+    assert card["header"]["subtitle"]["content"] == subtitle
+    assert card["header"]["template"] == template
+    assert card["header"]["text_tag_list"][0]["text"]["content"] == ticker
+    assert card["header"]["text_tag_list"][0]["color"] == template
+    tags = [el["tag"] for el in card["body"]["elements"]]
+    assert "markdown" in tags
+    assert "collapsible_panel" in tags
+    assert card["body"]["elements"][-1]["text_size"] == "notation"
+
+
+@pytest.mark.parametrize(
+    ("card_id", "pending_id"),
+    [
+        ("20261108-2250", "20261110-2250"),  # 较新待研究 + 较旧有卡片
+        ("20261110-2250", "20261108-2250"),  # 较旧待研究 + 较新有卡片
+    ],
+)
+def test_open_runs_prioritizes_existing_cards_and_commits_with_escaping_rules(
+    tmp_path: Path, card_id: str, pending_id: str
+) -> None:
+    collect_mod = _load(
+        "test_skill_collect",
+        "plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py",
+    )
+    ws = tmp_path / "ws"
+    tracker = ws / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    thesis = tracker / "thesis.md"
+    thesis.write_text("# Thesis\n", encoding="utf-8")
+    outside_rules = tmp_path / "outside-rules.md"
+    outside_rules.write_text("# 越界规则\n", encoding="utf-8")
+    (tracker / "rules.md").symlink_to(outside_rules)
+
+    snap = ws / "data" / "consensus" / "snap.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    snap.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+    card_dir = tracker / card_id
+    card_dir.mkdir(parents=True)
+    (card_dir / "packet.json").write_text(
+        json.dumps(
+            {
+                "ticker": "ANT",
+                "run_id": card_id,
+                "since": "2026-11-07",
+                "until": "2026-11-10",
+                "snapshot_file": "data/consensus/snap.json",
+                "ant_ae_state": {"queries": []},
+                "internal": {"new": {}, "pending": {}, "withheld": {}, "irrelevant": {}},
+                "alphaengine": {"new": {}},
+                "sec": {"new": {}},
+                "x": {"new": {}, "noise_ids": []},
+                "collection_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (card_dir / "card.json").write_text(json.dumps({"schema": "2.0"}), encoding="utf-8")
+    card_rel = f"research/tracker/{card_id}/card.json"
+    (card_dir / "review.json").write_text(
+        json.dumps(
+            {
+                "run_id": card_id,
+                "ticker": "ANT",
+                "material": "yes",
+                "summary": "resend card",
+                "report_run_id": f"rep-{card_id}",
+                "card_json": card_rel,
+                "send_status": "failed",
+                "content_kind": "cards",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pending_dir = tracker / pending_id
+    pending_dir.mkdir(parents=True)
+    (pending_dir / "packet.json").write_text(
+        json.dumps({"ticker": "ANT", "run_id": pending_id, "collection_complete": True}), encoding="utf-8"
+    )
+
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["open-runs", "--ticker", "ANT", "--workspace-dir", str(ws)])
+    assert code == 0
+    runs = json.loads(buf.getvalue())["runs"]
+    assert [r["run_id"] for r in runs] == [card_id, pending_id]
+    assert runs[0]["card_json"] == card_rel
+    assert runs[1]["research_pending"] is True
+
+    # 规则链接越界只影响进入研究的 rules-path，不阻断先补发/本地提交已有卡片
+    buf_rules = StringIO()
+    with redirect_stdout(buf_rules):
+        rules_code = STATE.main(["rules-path", "--ticker", "ANT", "--workspace-dir", str(ws)])
+    assert rules_code == 2
+    assert json.loads(buf_rules.getvalue())["status"] == "symlink_escape"
+
+    commit_buf = StringIO()
+    with redirect_stdout(commit_buf):
+        commit_code = collect_mod.main(
+            [
+                "commit",
+                "--ticker",
+                "ANT",
+                "--workspace-dir",
+                str(ws),
+                "--run-id",
+                card_id,
+                "--material",
+                "yes",
+                "--summary",
+                "card resent ok",
+            ]
+        )
+    assert commit_code == 0
+    assert json.loads(commit_buf.getvalue())["ok"] is True
+    assert [r["run_id"] for r in STATE.unfinished_runs(ws, "ANT")] == [pending_id]
+
+
+def test_open_runs_marks_check_status_allows_multiple_registered_and_limits_unregistered(
+    tmp_path: Path,
+) -> None:
+    collect_mod = _load(
+        "test_skill_collect_r8",
+        "plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py",
+    )
+    ws = tmp_path / "ws"
+    tracker = ws / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "thesis.md").write_text("# Thesis\n", encoding="utf-8")
+    snap = ws / "data" / "consensus" / "snap.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    snap.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+    # 两张本地仍为 pending 的旧卡片 + 一条 material=no + 一条较新待研究
+    runs_spec = [
+        ("20261105-2250", "no", "not_required", False, None),
+        ("20261107-2250", "yes", "pending", True, "cards"),
+        ("20261108-2250", "yes", "pending", True, "cards"),
+    ]
+    for rid, material, send_status, with_card, kind in runs_spec:
+        rdir = tracker / rid
+        rdir.mkdir(parents=True)
+        (rdir / "packet.json").write_text(
+            json.dumps(
+                {
+                    "ticker": "ANT",
+                    "run_id": rid,
+                    "since": "2026-11-07",
+                    "until": "2026-11-10",
+                    "snapshot_file": "data/consensus/snap.json",
+                    "ant_ae_state": {"queries": []},
+                    "internal": {"new": {}, "pending": {}, "withheld": {}, "irrelevant": {}},
+                    "alphaengine": {"new": {}},
+                    "sec": {"new": {}},
+                    "x": {"new": {}, "noise_ids": []},
+                    "collection_complete": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        card_rel = None
+        if with_card:
+            card_rel = f"research/tracker/{rid}/card.json"
+            (rdir / "card.json").write_text(json.dumps({"schema": "2.0"}), encoding="utf-8")
+        (rdir / "review.json").write_text(
+            json.dumps(
+                {
+                    "run_id": rid,
+                    "ticker": "ANT",
+                    "material": material,
+                    "summary": f"s-{rid}",
+                    "report_run_id": f"rep-{rid}",
+                    "card_json": card_rel,
+                    "send_status": send_status,
+                    "content_kind": kind,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    newer_pending = "20261110-2250"
+    pdir = tracker / newer_pending
+    pdir.mkdir(parents=True)
+    (pdir / "packet.json").write_text(
+        json.dumps({"ticker": "ANT", "run_id": newer_pending, "collection_complete": True}), encoding="utf-8"
+    )
+
+    buf = StringIO()
+    with redirect_stdout(buf):
+        code = STATE.main(["open-runs", "--ticker", "ANT", "--workspace-dir", str(ws)])
+    assert code == 0
+    payload = json.loads(buf.getvalue())
+    runs = payload["runs"]
+    assert [(r["run_id"], r["action"], r.get("content_kind")) for r in runs] == [
+        ("20261105-2250", "commit_local", None),
+        ("20261108-2250", "check_status", "cards"),
+        ("20261107-2250", "check_status", "cards"),
+        ("20261110-2250", "research", None),
+    ]
+    assert "first_submit_run" not in payload
+    assert all("run_now" not in r for r in runs)
+
+    # 场景 A：服务端查询两张卡片均已送达（found=True, status=sent）→ 两张都可本地提交（不受 1 份限制）
+    for card_item in [r for r in runs if r["action"] == "check_status"]:
+        decision = STATE.next_step(
+            card_item,
+            {
+                "found": True,
+                "ok": True,
+                "delivery_confirmed": True,
+                "status": "sent",
+                "content_kind": "cards",
+                "report_run_id": card_item["report_run_id"],
+            },
+            committed=False,
+            card_present=True,
+        )
+        assert decision["action"] == "commit_material_yes"
+        commit_buf = StringIO()
+        with redirect_stdout(commit_buf):
+            c_code = collect_mod.main(
+                [
+                    "commit",
+                    "--ticker",
+                    "ANT",
+                    "--workspace-dir",
+                    str(ws),
+                    "--run-id",
+                    card_item["run_id"],
+                    "--material",
+                    "yes",
+                    "--summary",
+                    card_item["summary"],
+                ]
+            )
+        assert c_code == 0
+    # 两张卡片均已提交进 updates.log，只剩 material=no 和待研究记录
+    remaining = [(r["run_id"], r["action"]) for r in STATE.unfinished_runs(ws, "ANT")]
+    assert remaining == [("20261105-2250", "commit_local"), ("20261110-2250", "research")]
+
+    # 场景 B：两张卡片均未登记（found=False）+ 一条待研究 → 按新到旧只首次提交最新一张（20261108-2250），不进入研究
+    check_runs = [r for r in runs if r["action"] == "check_status"]
+    first_submits = [
+        r["run_id"]
+        for r in check_runs
+        if STATE.next_step(
+            r,
+            {"found": False, "ok": True, "report_run_id": r["report_run_id"]},
+            committed=False,
+            card_present=True,
+        )["action"]
+        == "submit_cards"
+    ]
+    assert first_submits[:1] == ["20261108-2250"]
+
+
+def test_open_runs_sorts_check_status_by_run_id_with_failure_text_and_mixed_registration(
+    tmp_path: Path,
+) -> None:
+    collect_mod = _load(
+        "test_skill_collect_r9",
+        "plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py",
+    )
+    ws = tmp_path / "ws"
+    tracker = ws / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "thesis.md").write_text("# Thesis\n", encoding="utf-8")
+    snap = ws / "data" / "consensus" / "snap.json"
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    snap.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+    # 场景 1：较新的未登记 failure_text（20261109-2250）+ 较旧的未登记卡片（20261108-2250）
+    old_card_id = "20261108-2250"
+    old_dir = tracker / old_card_id
+    old_dir.mkdir(parents=True)
+    (old_dir / "packet.json").write_text(
+        json.dumps({"ticker": "ANT", "run_id": old_card_id, "collection_complete": True}), encoding="utf-8"
+    )
+    (old_dir / "card.json").write_text(json.dumps({"schema": "2.0"}), encoding="utf-8")
+    (old_dir / "review.json").write_text(
+        json.dumps(
+            {
+                "run_id": old_card_id,
+                "ticker": "ANT",
+                "material": "yes",
+                "summary": "old card",
+                "report_run_id": f"rep-{old_card_id}",
+                "card_json": f"research/tracker/{old_card_id}/card.json",
+                "send_status": "pending",
+                "content_kind": "cards",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fail_id = "20261109-2250"
+    fail_dir = tracker / fail_id
+    fail_dir.mkdir(parents=True)
+    (fail_dir / "review.json").write_text(
+        json.dumps(
+            {
+                "run_id": fail_id,
+                "ticker": "ANT",
+                "material": "yes",
+                "summary": "collect failed",
+                "report_run_id": f"rep-{fail_id}",
+                "card_json": None,
+                "send_status": "pending",
+                "content_kind": "failure_text",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    buf = StringIO()
+    with redirect_stdout(buf):
+        assert STATE.main(["open-runs", "--ticker", "ANT", "--workspace-dir", str(ws)]) == 0
+    runs = json.loads(buf.getvalue())["runs"]
+    assert [(r["run_id"], r["action"], r["content_kind"]) for r in runs] == [
+        ("20261109-2250", "check_status", "failure_text"),
+        ("20261108-2250", "check_status", "cards"),
+    ]
+    # 未登记时，最新一条 failure_text 优先触发 submit（失败文本），不读 card.json
+    d_fail = STATE.next_step(
+        runs[0],
+        {"found": False, "ok": True, "report_run_id": f"rep-{fail_id}"},
+        committed=False,
+    )
+    assert d_fail["action"] == "retry_failure_text"
+    assert d_fail["report_action"] == "submit"
+
+    # 场景 2：最新卡片未登记（20261110-2250）+ 较旧卡片已送达但本地 pending（20261108-2250）
+    (fail_dir / "review.json").unlink()
+    new_id = "20261110-2250"
+    new_dir = tracker / new_id
+    new_dir.mkdir(parents=True)
+    (new_dir / "packet.json").write_text(
+        json.dumps({"ticker": "ANT", "run_id": new_id, "collection_complete": True}), encoding="utf-8"
+    )
+    (new_dir / "card.json").write_text(json.dumps({"schema": "2.0"}), encoding="utf-8")
+    (new_dir / "review.json").write_text(
+        json.dumps(
+            {
+                "run_id": new_id,
+                "ticker": "ANT",
+                "material": "yes",
+                "summary": "new card",
+                "report_run_id": f"rep-{new_id}",
+                "card_json": f"research/tracker/{new_id}/card.json",
+                "send_status": "pending",
+                "content_kind": "cards",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (old_dir / "packet.json").write_text(
+        json.dumps(
+            {
+                "ticker": "ANT",
+                "run_id": old_card_id,
+                "since": "2026-11-07",
+                "until": "2026-11-08",
+                "snapshot_file": "data/consensus/snap.json",
+                "ant_ae_state": {"queries": []},
+                "internal": {"new": {}, "pending": {}, "withheld": {}, "irrelevant": {}},
+                "alphaengine": {"new": {}},
+                "sec": {"new": {}},
+                "x": {"new": {}, "noise_ids": []},
+                "collection_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runs2 = STATE.unfinished_runs(ws, "ANT")
+    assert [(r["run_id"], r["action"], r["content_kind"]) for r in runs2] == [
+        ("20261110-2250", "check_status", "cards"),
+        ("20261108-2250", "check_status", "cards"),
+    ]
+    # 全部查询 status：20261110 未登记(found=False)，20261108 已送达(found=True, sent)
+    d_new = STATE.next_step(
+        runs2[0],
+        {"found": False, "ok": True, "report_run_id": f"rep-{new_id}"},
+        committed=False,
+        card_present=True,
+    )
+    d_old = STATE.next_step(
+        runs2[1],
+        {
+            "found": True,
+            "ok": True,
+            "delivery_confirmed": True,
+            "status": "sent",
+            "content_kind": "cards",
+            "report_run_id": f"rep-{old_card_id}",
+        },
+        committed=False,
+        card_present=True,
+    )
+    assert d_old["action"] == "commit_material_yes"
+    assert d_new["action"] == "submit_cards"
+    # 先本地提交已送达的旧卡片，再首次提交新卡片（旧卡片不在待办里残留）
+    cbuf = StringIO()
+    with redirect_stdout(cbuf):
+        assert (
+            collect_mod.main(
+                [
+                    "commit",
+                    "--ticker",
+                    "ANT",
+                    "--workspace-dir",
+                    str(ws),
+                    "--run-id",
+                    old_card_id,
+                    "--material",
+                    "yes",
+                    "--summary",
+                    "old card sent",
+                ]
+            )
+            == 0
+        )
+    assert [r["run_id"] for r in STATE.unfinished_runs(ws, "ANT")] == [new_id]

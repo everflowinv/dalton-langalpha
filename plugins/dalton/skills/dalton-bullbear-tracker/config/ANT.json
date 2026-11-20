@@ -1,0 +1,84 @@
+{
+  "ticker": "ANT",
+  "name": "Anthropic",
+  "aliases_regex": "\\bANT\\b|\\$ANT|Anthropic|\\bClaude\\b|Opus|Sonnet|Haiku|Dario Amodei|Daniela Amodei|Mike Krieger|Claude Code|Constitutional AI",
+  "alias_terms": [
+    "Anthropic",
+    "ANT",
+    "Claude"
+  ],
+  "research_keywords": [
+    "Anthropic",
+    "ANT",
+    "Claude"
+  ],
+  "internal_limit": 60,
+  "internal_read_cap_per_route": 12,
+  "excluded_documents": [],
+  "wiki_min_alias_hits": 2,
+  "ae_queries": [
+    "Anthropic ANT Claude",
+    "Anthropic 算力 收入 定价 IPO"
+  ],
+  "ae_max_searches": 2,
+  "ae_company_names": [
+    "Anthropic, PBC",
+    "Anthropic PBC",
+    "Anthropic"
+  ],
+  "news_queries": [
+    "Anthropic ANT Claude ARR revenue compute contract pricing IPO lockup news",
+    "Anthropic Dario Amodei model release competition valuation analyst news"
+  ],
+  "x_queries": [
+    "($ANT OR Anthropic) (Claude OR ARR OR revenue OR compute OR IPO OR lockup OR pricing OR Opus OR Sonnet) min_faves:40 -filter:replies",
+    "(Anthropic OR \"Dario Amodei\") (valuation OR multiple OR TPU OR Trainium OR AWS OR Vertex OR revenue OR model) min_faves:60 -filter:replies"
+  ],
+  "x_accounts": [
+    "AnthropicAI",
+    "DarioAmodei"
+  ],
+  "x_pool_max": 25,
+  "x_keep_max": 30,
+  "x_enrich_max": 20,
+  "sources": {
+    "internal": true,
+    "internal_routes": [
+      "sales-notes",
+      "tmtb",
+      "funda-ai"
+    ],
+    "alphaengine": true,
+    "sec": true,
+    "sec_forms": [
+      "424B4",
+      "8-K",
+      "S-1",
+      "S-1/A",
+      "10-Q",
+      "4"
+    ],
+    "consensus": true,
+    "price": true,
+    "earnings_calendar": true,
+    "news": true,
+    "x": true
+  },
+  "model": {},
+  "thresholds": {
+    "fy1_eps_vs_last_run_pct": 1.0,
+    "fy1_eps_vs_7d_pct": 2.0,
+    "fy1_rev_vs_last_run_pct": 0.7,
+    "pt_mean_vs_last_run_pct": 2.0,
+    "fy1_down_revisions_7d": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0
+  },
+  "card": {
+    "title_prefix": "📈 ANT 跟踪｜",
+    "subtitle": "Anthropic · 多空观点、盈利预测修正与催化剂",
+    "tag": "ANT",
+    "header_template": "purple",
+    "tag_color": "purple"
+  }
+}

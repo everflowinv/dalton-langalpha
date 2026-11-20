@@ -1,11 +1,17 @@
 ---
 name: dalton-bullbear-tracker
-description: "无人值守的公司日常多空跟踪（MSFT、META、AMZN、GOOGL 共用）：读工作底稿和本轮材料，判断重要变化；有重要变化时生成卡片，并在接收方确认发送后本地提交（commit）；无重要变化时本地提交（commit）并静默。"
+description: "无人值守的公司日常多空跟踪（按 config/<TICKER>.json 支持任意已配置公司）：读工作底稿和本轮材料，判断重要变化；有重要变化时生成卡片，并在接收方确认发送后本地提交（commit）；无重要变化时本地提交并静默。"
 ---
 
 # 公司日常多空跟踪（`dalton-bullbear-tracker`）
 
-无人值守。不提问，不创建子任务，20 分钟内结束。股票代码（ticker）从任务指令取得，只接受 MSFT、META、AMZN、GOOGL。每轮先读 [共用规则](references/common-rules.md) 和本公司的 `references/<ticker小写>-rules.md`。研究判断、工作底稿章节和卡片写法以这两份规则为准。
+无人值守。不提问，不创建子任务，20 分钟内结束。股票代码（ticker）从任务指令取得；凡已在技能目录 `config/<TICKER>.json`（含 `ticker` 与 `card` 样式）配置并有对应规则文件的公司均受支持。每轮先执行第 1 节 `state.py open-runs`，优先处理可补发、核对状态或已完成发送可直接本地提交（commit）的已有运行（恢复步骤不需要读取规则文件）。仅当需要研究已有运行或开始新采集时，再先读 [共用规则](references/common-rules.md)（始终适用），并运行下方 `state.py rules-path`（或直接取 `collect` 返回的 `rules_path` 字段）取得校验后的公司规则路径并读取。脚本会校验工作区路径与符号链接，按「工作区 `research/tracker/rules.md` 优先、技能目录 `references/<ticker小写>-rules.md` 其次」解析，不要自行判断或直接打开未经脚本校验的 `rules.md`。研究判断、工作底稿章节和卡片写法以这两份规则为准。
+
+```bash
+python3 .agents/skills/dalton-bullbear-tracker/scripts/state.py rules-path \
+  --ticker <TICKER> \
+  --workspace-dir <workspace>
+```
 
 工作底稿只有 `research/tracker/thesis.md`。导入档案 `research/tracker/imported-<ticker小写>/thesis.md` 只读。工作区根目录的财报 `thesis.md` 和 `data/thesis.json` 保持原样。工作底稿不存在时，说明导入尚未完成，停止本轮；不要改用财报底稿继续研究。
 
@@ -23,9 +29,25 @@ python3 .agents/skills/dalton-bullbear-tracker/scripts/state.py open-runs \
   --workspace-dir <workspace>
 ```
 
-返回按 `run_id` 从新到旧排列，已写入 `updates.log` 的运行不在其中。选择时跳过已经确认发出的失败通知记录（`content_kind` 为 `failure_text`）。其余取最新一条，本轮不再采集第二个数据包。
+返回按执行优先级排序的未完成列表 `runs`（已写入 `updates.log` 的运行不在其中），每条都带有 `action`（`commit_local` / `check_status` / `research`）。由于 `open-runs` 不查询服务端，工作区内已有非符号链接 `card.json`（及未写入日志的 `failure_text`）一律标为 `check_status`，并附带 `content_kind`（`cards` 或 `failure_text`），组内按 `run_id` 从新到旧排序。**严格按以下第 1 至 5 步执行（本轮最多只能首次提交一份新报告，否则服务端会返回 `execution_batch_conflict` 并拒绝第二份）：**
 
-选中的一条 `research_pending`（待研究）为 true 时，采集已经完成，还没有评审恢复记录（`review.json`）。沿用该条的 `run_id` 和 `packet_json`，从第 3 节继续读这个数据包并做研究。不要编造 `material`（是否有重要变化），不要调用报告工具，也不要把它当成已经确认发送。
+1. 处理所有 `action == "commit_local"`（`material` 为 `no`）：逐条按「## 6. 提交」本地提交（`commit --material no`），可连续处理多条。
+2. 查询所有 `action == "check_status"` 的服务端状态：对列表中**每一条**都调用 `automation_report(action="status", report_run_id=...)` 查询服务端状态——**全部查完并分类后再进入第 3、4 步，不要边查边首次提交**。
+   - 只有返回 `ok` 为 `true` 时才算查到结果：`found` 为 `true` 记为**已登记**，`found` 为 `false` 记为**未登记**；返回错误（如 `report_unavailable` 或缺少 `found` 字段）时再查一次，仍查不到则记为**状态未知**。
+   - 若出现任意一条**状态未知**，本轮跳过第 4、5 步（不首次提交、不研究、不采集），仅完成第 3 步（若有已登记记录）后立即结束本轮，留给下一轮。
+3. 逐条处理所有**已登记**（`ok` 为 `true` 且 `found` 为 `true`）的 `check_status` 记录，数量不限，且不计入本轮首次提交次数：
+   - `content_kind` 为 `cards`（详见下方「卡片文件已经存在时」）：已确认送达的保留原卡片字节，按「## 6. 提交」本地提交（`commit --material yes`）；仍为 `pending`、`unknown` 或 `failed` 的用原 `report_run_id` 与原 `cards` 重新提交（`submit`）并用 `status` 核查，确认送达后再本地提交，仍未送达则保留原状。
+   - `content_kind` 为 `failure_text`（详见下方「`failure_text` 恢复说明」与「## 7. 采集失败」）：**绝不读取 `card.json`，绝不执行 `commit --material yes`**；已确认送达的只用 `state.py save-review --send-status sent --content-kind failure_text` 更新本地发送状态，未送达的用原 `report_run_id` 重新提交失败文本，`submit` 的返回（或随后 `status` 的返回）满足确认条件即为送达，再更新 `send_status`，仍未送达则保留原状。
+4. 处理**未登记**（`ok` 为 `true` 且 `found` 为 `false`）的 `check_status` 记录：只取 `run_id` **最新的一条**，按其 `content_kind` 首次提交，其余未登记记录留给下一轮：
+   - `cards`：读取其 `card_json`，用原 `report_run_id` 与原卡片提交（`submit`）并用 `status` 核查；确认送达后再按「## 6. 提交」本地提交（`commit --material yes`），仍未送达则保留原状。
+   - `failure_text`：绝不读取 `card.json`，按「## 7. 采集失败」用原 `report_run_id` 提交 `failure_text`，`submit` 的返回（或随后 `status` 的返回）满足确认条件即为送达；确认送达后只更新 `send_status` 为 `sent`，不执行 `commit --material yes`。
+   - **只要本步首次提交过一份新报告，立即结束本轮，不进入第 5 步（不研究、不采集）。**
+5. 仅当没有**状态未知**或**未登记**记录，且第 1、3 步的运行均已处理完成（没有仍未确认送达或核查异常的阻塞运行）时，才继续下一步：
+   - 若存在 `action == "research"` 记录，选 `run_id` 最新的一条进入研究；
+   - 若没有 `action == "research"` 记录（包括 `runs` 为空），进入「## 2. 采集」。
+   （若仍有阻塞运行未处理完成，直接结束本轮，留给下一轮。）
+
+选中的一条 `research_pending`（待研究）为 `true` 时，采集已经完成，还没有评审恢复记录（`review.json`）。先读 [共用规则](references/common-rules.md) 并按上方 `state.py rules-path` 读取公司规则，再沿用该条的 `run_id` 和 `packet_json`，从第 3 节继续读数据包并做研究。不要编造 `material`（是否有重要变化），不要调用报告工具，也不要把它当成已经确认发送。
 
 已有 `review.json` 时，沿用原来的 `run_id` 和 `report_run_id`。
 
@@ -33,16 +55,20 @@ python3 .agents/skills/dalton-bullbear-tracker/scripts/state.py open-runs \
 
 `material` 为 `no`：不调用报告工具，直接按第 6 节本地提交（`commit --material no`）。
 
-review 的 `content_kind` 为 `failure_text` 时，不要本地提交（`commit --material yes`）。这条记录可以没有 `packet.json`；没有数据包时不要补造。失败文本的确认同样要求返回里的 `report_run_id` 与 review 完全一致，并且 `content_kind` 明确为 `failure_text`，同时 `ok`、`delivery_confirmed` 和 `status` 为 `sent`。对上之后，`seen.json` 仍保持原状，这条记录不挡住新的采集，也不表示本轮研究已经处理完成。同一份报告还没确认时，用同一个 `report_run_id` 再提交一次失败文本。标识不一致或缺字段时保持原状，不把失败文本当成已结束。
+### `failure_text` 恢复说明
 
-卡片文件已经存在时，不重写已有卡片。调用 `automation_report` 的 `status` 读取这一份 `report_run_id`，再按 review 和返回只补投递：
+`review.json` 的 `content_kind` 为 `failure_text` 时，**绝不读取 `card.json`**，也不要本地提交（`commit --material yes`）。这条记录可以没有 `packet.json`；没有数据包时不要补造。确认送达的条件：返回里的 `report_run_id` 必须与 `review.json` 完全一致，`content_kind` 明确为 `failure_text`，且 `ok` 为 `true`、`delivery_confirmed` 为 `true`、`status` 为 `sent`。确认送达后，只把 `review.json` 的 `send_status` 更新为 `sent`（`seen.json` 保持原状）；此时该记录不再阻挡后续研究或采集，但也不表示原研究轮已完成。尚未确认送达时，用同一个 `report_run_id` 重新提交（`submit`）一次失败文本，`submit` 的返回满足上述条件即为送达，不必再查 `status`；标识不一致或缺字段时保持原状，不更新为 `sent`。
 
-- 卡片文件已在，但这一份报告的 `delivery_confirmed` 还不是 `true`，或 `status` 为 `pending`、`unknown`、`failed`：保留数据包、工作底稿和原卡片字节。用同一个 `report_run_id` 和完全相同的 `cards` 再提交报告（submit）一次，并用 `status` 核查。
-- 接受卡片确认前，返回里的 `report_run_id` 必须与 review 的 `report_run_id` 完全一致，并且 `content_kind` 明确为 `cards`。同时 `ok` 为 `true`、`delivery_confirmed` 为 `true`、`status` 为 `sent` 时，卡片保持原字节，只本地提交（`commit --material yes`）。缺 `report_run_id`、标识不一致，或 `content_kind` 不是 `cards` 时，保持原状，不本地提交（commit），`seen.json` 不变。
-- 本地把发送记成 `sent`，但还没有上述同一份报告的结果时，只调用 `status`，先不要本地提交（commit）。
-- 工具返回的 `code` 为 `not_automation_run`：这不是自动化运行。不要本地提交（commit），不要另找发送办法。最终回复说明本次不是自动化运行，不附卡片正文。
+### 卡片文件已经存在时
 
-已确认的 `failure_text` 不恢复成卡片，也不本地提交（commit）。跳过它之后若还有未完成运行，恢复其中最新的一条。一条都没有时，进入采集。
+卡片文件已经存在（`content_kind` 为 `cards`）时，不重写已有卡片。结合第 2 步 `automation_report` `status` 的查询结果，按 `review.json` 重新提交或本地提交：
+
+- 卡片文件已在，但这一份报告的 `delivery_confirmed` 不为 `true`，或 `status` 为 `pending`、`unknown`、`failed`：保留数据包、工作底稿和原卡片字节，用同一个 `report_run_id` 和完全相同的 `cards` 重新提交（`submit`）一次，并用 `status` 核查。
+- 接受卡片确认的条件：返回里的 `report_run_id` 必须与 `review.json` 完全一致，`content_kind` 明确为 `cards`，且 `ok` 为 `true`、`delivery_confirmed` 为 `true`、`status` 为 `sent`。满足后保留原卡片字节并本地提交（`commit --material yes`）；缺 `report_run_id`、标识不一致或 `content_kind` 不是 `cards` 时，保持原状，不本地提交，`seen.json` 不变。
+- 本地把 `send_status` 记为 `sent`，但尚未取得上述同一份报告的确认结果时，只调用 `status`，先不要本地提交。
+- 工具返回的 `code` 为 `not_automation_run`：这不是自动化运行。不要本地提交，不要另找发送办法，最终回复说明本次不是自动化运行并结束本轮，不附卡片正文。
+
+已确认送达的 `failure_text` 不恢复成卡片，也不本地提交。按上述第 1 至 5 步处理完毕后：若本轮首次提交过一份新报告、存在**状态未知**记录，或仍有未确认送达的阻塞运行，直接结束本轮；否则若还有 `action == "research"` 记录则研究其中最新的一条，一条都没有时进入「## 2. 采集」。
 
 ## 2. 采集
 
@@ -158,7 +184,7 @@ python3 .agents/skills/dalton-bullbear-tracker/scripts/collect.py commit \
 
 ## 7. 采集失败
 
-两次采集都失败，或采集还没有写出 `packet.json` 时，不要本地提交（commit），不要补造 `packet.json`。若本轮还没有保存过卡片，先写下失败恢复记录，再提交失败报告（submit）。`cards` 省略：
+两次采集都失败，或采集还没有写出 `packet.json` 时，不要本地提交，不要补造 `packet.json`。若本轮**没有**保存或首次提交过其他报告，先写下失败恢复记录，再提交（`submit`）失败报告，`cards` 省略：
 
 ```bash
 python3 .agents/skills/dalton-bullbear-tracker/scripts/state.py save-review \

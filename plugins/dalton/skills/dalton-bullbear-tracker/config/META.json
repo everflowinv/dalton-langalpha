@@ -12,12 +12,6 @@
     "Hyperion",
     "Prometheus"
   ],
-  "internal_routes": [
-    "tmtb",
-    "sales-notes",
-    "funda-ai",
-    "company-wiki"
-  ],
   "internal_limit": 60,
   "internal_read_cap_per_route": 12,
   "excluded_documents": [],
@@ -32,15 +26,23 @@
     "Meta Platforms Inc",
     "Meta Platforms"
   ],
-  "sec_forms": [
-    "8-K",
-    "10-Q",
-    "10-K",
-    "S-3ASR",
-    "424B2",
-    "424B5",
-    "FWP"
-  ],
+  "sources": {
+    "internal_routes": [
+      "tmtb",
+      "sales-notes",
+      "funda-ai",
+      "company-wiki"
+    ],
+    "sec_forms": [
+      "8-K",
+      "10-Q",
+      "10-K",
+      "S-3ASR",
+      "424B2",
+      "424B5",
+      "FWP"
+    ]
+  },
   "news_queries": [
     "Meta Platforms analyst estimates price target downgrade upgrade",
     "Meta Platforms Muse capex financing regulation news"

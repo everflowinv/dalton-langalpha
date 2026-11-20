@@ -1,0 +1,517 @@
+{
+  "ticker": "MSFT",
+  "run_id": "20261110-2250",
+  "since": "2026-11-07",
+  "until": "2026-11-10",
+  "snapshot_file": "data/consensus/2026-11-10_2250.json",
+  "consensus": {
+    "ok": true,
+    "status": "partial",
+    "fetched_at": "2026-11-10T22:50:00-05:00",
+    "currency": "USD",
+    "field_status": {
+      "earnings_estimate": "ok",
+      "revenue_estimate": "ok",
+      "eps_trend": "ok",
+      "eps_revisions": "ok",
+      "price_targets": "ok",
+      "price": "error"
+    },
+    "earnings_estimate": {
+      "0y": {
+        "avg": 10.0,
+        "period_end": "2026-12-31",
+        "currency": "USD",
+        "numberOfAnalysts": 30
+      }
+    },
+    "revenue_estimate": {
+      "0y": {
+        "avg": 100000000000.0,
+        "period_end": "2026-12-31",
+        "currency": "USD",
+        "numberOfAnalysts": 30
+      }
+    },
+    "eps_trend": {},
+    "eps_revisions": {},
+    "price_targets": {
+      "mean": 450.0
+    },
+    "price": {
+      "error": "download timeout"
+    }
+  },
+  "implied_model": {
+    "assumptions": {
+      "diluted_shares_bn": 7.45,
+      "tax_rate": 0.2,
+      "other_income_bn": {
+        "0y": -0.4,
+        "+1y": -0.4
+      },
+      "source": "FY26 Q4 8-K 附件 99.1（accession 0001193125-26-323632）：non-GAAP 净利润 353 亿/EPS 4.74 ≈ 74.5 亿股；FY27 Q1 指引税率约 20%、其他收入约 -1 亿/季（不含 OpenAI）。Yahoo 0y=FY27（2027-06 止），+1y=FY28；一致 EPS 为 non-GAAP（剔除 OpenAI 损益）",
+      "applicable_years": [
+        {
+          "key": "0y",
+          "fiscal_year": "FY27",
+          "period_end_prefix": "2027-06",
+          "other_income_bn": -0.4
+        },
+        {
+          "key": "+1y",
+          "fiscal_year": "FY28",
+          "period_end_prefix": "2028-06",
+          "other_income_bn": -0.4
+        }
+      ],
+      "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿美元。其他收入只用于来源写明的财年末。"
+    },
+    "periods": {
+      "0y": {
+        "label": "本财年",
+        "status": "period_incompatible",
+        "period_end": "2026-12-31",
+        "reason": "0y 的 period_end 2026-12-31 对不上来源里写明的财年（FY27 截至 2027-06、FY28 截至 2028-06），未把来源里另一个财年的其他收入套到这个财年"
+      },
+      "+1y": {
+        "label": "下一财年",
+        "status": "missing_period",
+        "reason": "+1y 缺少 period_end，无法确认财年，未计算隐含费用"
+      }
+    }
+  },
+  "deltas": {
+    "eps_0q_vs_7d_pct": null,
+    "eps_0q_vs_30d_pct": null,
+    "eps_+1q_vs_7d_pct": null,
+    "eps_+1q_vs_30d_pct": null,
+    "eps_0y_vs_7d_pct": null,
+    "eps_0y_vs_30d_pct": null,
+    "eps_+1y_vs_7d_pct": null,
+    "eps_+1y_vs_30d_pct": null,
+    "fy1_revisions_7d": {
+      "up": null,
+      "down": null
+    }
+  },
+  "auto_flags": [],
+  "thresholds": {
+    "eps_fy1_vs_last_pct": 1.0,
+    "eps_fy1_vs_7d_pct": 2.0,
+    "rev_fy1_or_q1_vs_last_pct": 0.7,
+    "target_price_vs_last_pct": 2.0,
+    "down_revisions_7d_min": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0,
+    "any_new_sec_filing": true
+  },
+  "internal": {
+    "status": {
+      "tmtb": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "tmtb",
+          "operation": "search",
+          "query": "Microsoft MSFT Azure Copilot Nadella M365 Fairwater Maia Xbox",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "sales-notes": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "sales-notes",
+          "operation": "search",
+          "query": "Microsoft MSFT Azure Copilot Nadella M365 Fairwater Maia Xbox",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "funda-ai": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "funda-ai",
+          "operation": "search",
+          "query": "Microsoft MSFT Azure Copilot Nadella M365 Fairwater Maia Xbox",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "company-wiki": {
+        "operation": "list",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 100,
+        "read_cap": 12,
+        "request": {
+          "route": "company-wiki",
+          "operation": "list",
+          "limit": 100,
+          "params": {
+            "indexed_since": "2026-11-07",
+            "media": "text"
+          }
+        },
+        "pending_reads": []
+      }
+    },
+    "new": {},
+    "irrelevant": {},
+    "pending": {},
+    "withheld": {}
+  },
+  "alphaengine": {
+    "status": [
+      {
+        "query": "Microsoft Azure Copilot",
+        "ok": true,
+        "returned": 0,
+        "has_more": false,
+        "incomplete": false,
+        "cursor": null,
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "error": null,
+        "request": {
+          "route": "alphaengine",
+          "operation": "search_library",
+          "query": "Microsoft Azure Copilot",
+          "start": "2026-11-04",
+          "end": "2026-11-10",
+          "limit": 20,
+          "params": {
+            "sort": "relevance"
+          }
+        }
+      },
+      {
+        "query": "微软 Azure 云 Copilot",
+        "ok": true,
+        "returned": 0,
+        "has_more": false,
+        "incomplete": false,
+        "cursor": null,
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "error": null,
+        "request": {
+          "route": "alphaengine",
+          "operation": "search_library",
+          "query": "微软 Azure 云 Copilot",
+          "start": "2026-11-04",
+          "end": "2026-11-10",
+          "limit": 20,
+          "params": {
+            "sort": "relevance"
+          }
+        }
+      }
+    ],
+    "new": {}
+  },
+  "sec": {
+    "status": [
+      {
+        "form": "8-K",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "8-K",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "10-Q",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "10-Q",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "10-K",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "10-K",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "S-3ASR",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "S-3ASR",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "424B2",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "424B2",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "424B5",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "424B5",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "FWP",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "MSFT",
+          "form": "FWP",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      }
+    ],
+    "new": {}
+  },
+  "x": {
+    "status": [
+      {
+        "query": "$MSFT min_faves:150 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 0,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "$MSFT min_faves:150 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "query": "$MSFT (Azure OR capex OR Copilot OR EPS OR estimates OR margin OR RPO OR multiple OR valuation OR OpenAI) min_faves:40 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 0,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "$MSFT (Azure OR capex OR Copilot OR EPS OR estimates OR margin OR RPO OR multiple OR valuation OR OpenAI) min_faves:40 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "query": "(Microsoft OR Azure OR Nadella) (capex OR \"gross margin\" OR RPO OR backlog OR Copilot OR seats) (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 0,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "(Microsoft OR Azure OR Nadella) (capex OR \"gross margin\" OR RPO OR backlog OR Copilot OR seats) (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      }
+    ],
+    "new": {},
+    "noise_ids": [],
+    "pool_size": 0,
+    "queries": [
+      "$MSFT min_faves:150 -filter:replies",
+      "$MSFT (Azure OR capex OR Copilot OR EPS OR estimates OR margin OR RPO OR multiple OR valuation OR OpenAI) min_faves:40 -filter:replies",
+      "(Microsoft OR Azure OR Nadella) (capex OR \"gross margin\" OR RPO OR backlog OR Copilot OR seats) (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies"
+    ],
+    "outside_window": 0,
+    "unprocessed_upstream": false,
+    "profile_followup": [],
+    "failures": [],
+    "metrics_note": "likes、reposts、replies、views 按 x-timeline 归一化结果保存；bookmarks 上游没有返回，记为 null，排序只用 likes+3*reposts。",
+    "note": "专业投资人观点作多空论据，权重低于 TMTB、卖方邮件和 AlphaEngine；券商动作和公司数字回原始来源核对。"
+  },
+  "news": {
+    "status": "pending_agent_search",
+    "queries": [
+      "Microsoft analyst estimates price target downgrade upgrade Azure",
+      "Microsoft OpenAI Copilot capex datacenter Anthropic news"
+    ],
+    "since": "2026-11-07",
+    "until": "2026-11-10",
+    "requires_original_fetch": true
+  },
+  "failed_sources": [
+    {
+      "source": "estimates",
+      "error": "partial: field_status={\"earnings_estimate\": \"ok\", \"revenue_estimate\": \"ok\", \"eps_trend\": \"ok\", \"eps_revisions\": \"ok\", \"price_targets\": \"ok\", \"price\": \"error\"}"
+    }
+  ],
+  "short_circuit_eligible": false,
+  "collected_at": "2026-11-10T22:50:00-05:00",
+  "internal_since": "2026-11-07",
+  "internal_retry_since": null,
+  "msft_ae_state": {
+    "queries": [
+      {
+        "query": "Microsoft Azure Copilot",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "cursor": null,
+        "has_more": false,
+        "complete": true,
+        "covered_until": "2026-11-10",
+        "ok": true,
+        "returned": 0,
+        "error": null,
+        "resumed_cursor": null
+      },
+      {
+        "query": "微软 Azure 云 Copilot",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "cursor": null,
+        "has_more": false,
+        "complete": true,
+        "covered_until": "2026-11-10",
+        "ok": true,
+        "returned": 0,
+        "error": null,
+        "resumed_cursor": null
+      }
+    ]
+  },
+  "limits": {
+    "internal_limit": 60,
+    "internal_read_cap_per_route": 12,
+    "internal_pages": 5,
+    "read_pages": 20,
+    "excerpt_max": 6000,
+    "ae_max_searches": 2,
+    "ae_limit": 20,
+    "sec_limit": 3,
+    "x_search_count": 40,
+    "x_timeline_count": 20,
+    "x_pool_max": 25,
+    "x_keep_max": 30,
+    "x_enrich_max": 20
+  },
+  "collection_complete": true
+}

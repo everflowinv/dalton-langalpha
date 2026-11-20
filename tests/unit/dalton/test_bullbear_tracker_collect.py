@@ -277,7 +277,7 @@ def test_normalized_envelopes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     assert {args["limit"] for args in ae_calls} == {20}
     sec_calls = [(tool, args) for tool, args in calls if args.get("route") == "sec"]
     assert {tool for tool, _args in sec_calls} == {"finance"}
-    assert [args["form"] for _tool, args in sec_calls] == list(cfg["sec_forms"])
+    assert [args["form"] for _tool, args in sec_calls] == list(cfg["sources"]["sec_forms"])
     assert {args["limit"] for _tool, args in sec_calls} == {3}
     assert all(args.get("ticker") == "MSFT" for _tool, args in sec_calls)
     assert not any(args.get("route") in {"news", "gsearch"} or "params" in args and args.get("route") == "x-timeline" for _tool, args in calls)
@@ -1769,3 +1769,2299 @@ def test_other_income_stays_on_basis_fiscal_year(monkeypatch: pytest.MonkeyPatch
     assert parsed[1]["other_income_bn"] == -0.4
     assert "other_income_reason" not in parsed[0]
     assert "other_income_reason" not in parsed[1]
+
+
+def test_fetch_consensus_snapshot_handles_empty_and_single_day_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    empty_df = pd.DataFrame()
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    fake_ticker = create_autospec(orig_ticker, instance=True)
+    fake_ticker.earnings_estimate = empty_df
+    fake_ticker.revenue_estimate = empty_df
+    fake_ticker.eps_trend = empty_df
+    fake_ticker.eps_revisions = empty_df
+    fake_ticker.analyst_price_targets = {}
+    fake_ticker.earnings_dates = empty_df
+
+    # 1) Benchmark has rows, newly listed ticker has 0 rows
+    zero_close = pd.DataFrame(
+        {"ANT": [float("nan"), float("nan")], "QQQ": [500.0, 505.0]},
+        index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+    )
+    zero_download = pd.concat({"Close": zero_close}, axis=1)
+
+    # 1) Benchmark has rows, timed-out company has 0 valid close rows -> price error
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=fake_ticker))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=zero_download))
+    snap_empty = collect_mod.fetch_consensus_snapshot("ANT", benchmark="QQQ")
+    assert snap_empty["ok"] is False
+    assert snap_empty["status"] == "error"
+    assert "error" in snap_empty["price"]
+    assert snap_empty["field_status"]["price"] == "error"
+    assert snap_empty["_meta"]["price_symbols"] == {"ANT": "no_rows", "QQQ": "ok"}
+    assert snap_empty["earnings_dates"] == []
+
+    # 2) Newly listed ticker has 1 trading day
+    one_close = pd.DataFrame(
+        {"ANT": [float("nan"), 120.5], "QQQ": [500.0, 505.0]},
+        index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+    )
+    one_download = pd.concat({"Close": one_close}, axis=1)
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=one_download))
+    snap_one = collect_mod.fetch_consensus_snapshot("ANT", benchmark="QQQ")
+    assert snap_one["ok"] is True
+    assert snap_one["status"] == "empty"
+    assert snap_one["price"]["close"] == 120.5
+    assert snap_one["price"]["as_of"] == "2026-11-10"
+    assert snap_one["price"]["chg_1d_pct"] is None
+    assert snap_one["price"]["chg_5d_pct"] is None
+
+
+def test_price_snapshot_two_and_five_days_marks_5d_unavailable_and_aligns_benchmark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    empty_df = pd.DataFrame()
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    fake_ticker = create_autospec(orig_ticker, instance=True)
+    fake_ticker.earnings_estimate = empty_df
+    fake_ticker.revenue_estimate = empty_df
+    fake_ticker.eps_trend = empty_df
+    fake_ticker.eps_revisions = empty_df
+    fake_ticker.analyst_price_targets = {}
+    fake_ticker.earnings_dates = empty_df
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=fake_ticker))
+
+    # 2 trading days: +10% 1d change must NOT compute 5d change or trigger 5d threshold;
+    # benchmark also has an extra prior day that must be ignored by date alignment.
+    two_close = pd.DataFrame(
+        {
+            "ANT": [float("nan"), 100.0, 110.0],
+            "QQQ": [490.0, 500.0, 505.0],
+        },
+        index=pd.to_datetime(["2026-11-06", "2026-11-09", "2026-11-10"]),
+    )
+    two_download = pd.concat({"Close": two_close}, axis=1)
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=two_download))
+    snap_two = collect_mod.fetch_consensus_snapshot("ANT", benchmark="QQQ")
+    assert snap_two["price"]["chg_1d_pct"] == 10.0
+    assert snap_two["price"]["bench_chg_1d_pct"] == 1.0
+    assert snap_two["price"]["chg_5d_pct"] is None
+    assert snap_two["price"]["bench_chg_5d_pct"] is None
+    thr = collect_mod.map_thresholds({})
+    _deltas, flags = collect_mod.consensus_deltas(snap_two, None, thr)
+    assert any("1 日涨跌" in f for f in flags)
+    assert not any("5 日涨跌" in f for f in flags)
+
+    # 5 trading days: still < 6, so 5d change stays None (unavailable)
+    five_close = pd.DataFrame(
+        {
+            "ANT": [float("nan"), 100.0, 102.0, 104.0, 106.0, 110.0],
+            "QQQ": [490.0, 500.0, 501.0, 502.0, 503.0, 505.0],
+        },
+        index=pd.to_datetime(["2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10"]),
+    )
+    five_download = pd.concat({"Close": five_close}, axis=1)
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=five_download))
+    snap_five = collect_mod.fetch_consensus_snapshot("ANT", benchmark="QQQ")
+    assert snap_five["price"]["chg_1d_pct"] == round((110.0 / 106.0 - 1.0) * 100.0, 2)
+    assert snap_five["price"]["chg_5d_pct"] is None
+    assert snap_five["price"]["bench_chg_5d_pct"] is None
+
+
+def test_has_estimates_requires_valid_forecast_values() -> None:
+    placeholder = {
+        "earnings_estimate": {"0y": {"numberOfAnalysts": 0, "avg": None, "low": None, "high": None}},
+        "revenue_estimate": {"0y": {"numberOfAnalysts": 0, "avg": None}},
+        "eps_trend": {"0y": {"current": None, "7daysAgo": None}},
+        "eps_revisions": {"0y": {"upLast7days": 0, "downLast7Days": 0}},
+        "price_targets": {"current": 120.0, "mean": None, "median": None, "low": None, "high": None},
+    }
+    assert collect_mod._has_estimates(placeholder) is False
+    placeholder["earnings_estimate"]["0y"] = {"numberOfAnalysts": 3, "avg": 2.5}
+    assert collect_mod._has_estimates(placeholder) is True
+
+
+@pytest.mark.parametrize("ticker", ["MSFT", "META", "AMZN", "GOOGL"])
+def test_legacy_four_tickers_packet_matches_origin_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ticker: str,
+) -> None:
+    fix_dir = REPO_ROOT / "tests" / "unit" / "dalton" / "fixtures" / "bullbear_regression"
+    expected_json = (fix_dir / f"{ticker}.packet.json").read_text(encoding="utf-8")
+    expected_md = (fix_dir / f"{ticker}.packet.md").read_text(encoding="utf-8")
+    cfg = json.loads(collect_mod.research_config_path(ticker).read_text(encoding="utf-8"))
+    kw = cfg["alias_terms"][0]
+    ae_co = cfg["ae_company_names"][0]
+    period_ends = {
+        "MSFT": ("2027-06-30", "2028-06-30"),
+        "META": ("2026-12-31", "2027-12-31"),
+        "AMZN": ("2026-12-31", "2027-12-31"),
+        "GOOGL": ("2026-12-31", "2027-12-31"),
+    }
+    p0, p1 = period_ends[ticker]
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments.get("operation") == "read":
+            return {"ok": True, "status": "ok", "data": {"content": f"{kw} revenue growth update.\n", "next_offset": None}}
+        route = arguments.get("route")
+        if route == "tmtb":
+            return {"ok": True, "data": {"results": [{"document_id": f"tmtb:{ticker.lower()}-1", "title": f"{ticker} Note", "date": "2026-11-10", "keyword_hits": 2}], "has_more": False}}
+        if route in {"sales-notes", "funda-ai", "company-wiki"}:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if route == "alphaengine":
+            return {"ok": True, "data": {"results": [{"doc_id": f"alphaengine:ae-{ticker.lower()}-1", "title": f"{ticker} AE Report", "companies": [ae_co], "publish_time": "2026-11-10"}], "has_more": False}}
+        if route == "sec":
+            if arguments.get("form") == "8-K":
+                return {"ok": True, "data": {"rows": [{"accession_no": "0000000001-26-000001", "form": "8-K", "filing_date": "2026-11-10"}]}}
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            if arguments.get("operation") == "search":
+                return {"ok": True, "data": {"data": {"items": [{"id": f"x-{ticker.lower()}-1", "text": f"${ticker} EPS and revenue beat", "created_at": "2026-11-10T12:00:00-05:00", "author_handle": "analyst1", "metrics": {"likes": 50, "reposts": 5, "replies": 1, "views": 100}}], "has_more": False}}}
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        raise AssertionError(arguments)
+
+    def cons(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        assert sym == ticker
+        return {
+            "ok": True,
+            "status": "ok",
+            "fetched_at": FROZEN.isoformat(),
+            "currency": "USD",
+            "field_status": {"earnings_estimate": "ok", "revenue_estimate": "ok", "eps_trend": "ok", "eps_revisions": "ok", "price_targets": "ok", "price": "ok"},
+            "earnings_estimate": {
+                "0y": {"avg": 10.0, "period_end": p0, "currency": "USD", "numberOfAnalysts": 30},
+                "+1y": {"avg": 12.0, "period_end": p1, "currency": "USD", "numberOfAnalysts": 28},
+            },
+            "revenue_estimate": {
+                "0y": {"avg": 100e9, "period_end": p0, "currency": "USD", "numberOfAnalysts": 30},
+                "+1y": {"avg": 120e9, "period_end": p1, "currency": "USD", "numberOfAnalysts": 28},
+            },
+            "eps_trend": {"+1y": {"current": 12.0, "7daysAgo": 12.0}},
+            "eps_revisions": {"+1y": {"upLast7days": 1, "downLast7Days": 0}},
+            "price_targets": {"mean": 450.0},
+            "price": {"as_of": "2026-11-10", "close": 400.0, "chg_1d_pct": 1.2, "chg_5d_pct": 2.5, "benchmark": benchmark, "bench_chg_1d_pct": 0.4, "bench_chg_5d_pct": 1.0},
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, cons)
+
+    ws = _workspace(tmp_path / ticker, ticker=ticker)
+    code, _payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"],
+        ticker=ticker,
+    )
+    assert code == 0
+    actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
+    actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert actual_json == expected_json
+    assert actual_md == expected_md
+    assert "data_status" not in json.loads(actual_json)
+    assert "财报日历" not in actual_md
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected_routes", "expected_forms", "expected_accounts"),
+    [
+        (
+            "ANT",
+            ["sales-notes", "tmtb", "funda-ai"],
+            ["424B4", "8-K", "S-1", "S-1/A", "10-Q", "4"],
+            ["AnthropicAI", "DarioAmodei"],
+        ),
+        (
+            "SPCX",
+            ["sales-notes", "tmtb"],
+            ["8-K"],
+            ["elonmusk", "xai", "SpaceX", "Starlink"],
+        ),
+    ],
+)
+def test_collect_ant_and_spcx_sparse_data_and_optional_config_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ticker: str,
+    expected_routes: list[str],
+    expected_forms: list[str],
+    expected_accounts: list[str],
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls.append((tool_name, arguments))
+        route = arguments.get("route")
+        if route == "x-timeline":
+            if arguments.get("operation") == "tweets":
+                handle = arguments.get("handle")
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": f"post-{handle}",
+                                    "text": f"{ticker} official update from {handle}: revenue and capex",
+                                    "created_at": "2026-11-10T12:00:00-05:00",
+                                    "author_handle": handle,
+                                    "metrics": {"likes": 50, "reposts": 5, "replies": 1, "views": 100},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    def empty_consensus(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        assert sym == ticker
+        return {
+            "ok": True,
+            "status": "empty",
+            "fetched_at": FROZEN.isoformat(),
+            "currency": None,
+            "field_status": {
+                "earnings_estimate": "empty",
+                "revenue_estimate": "empty",
+                "eps_trend": "empty",
+                "eps_revisions": "empty",
+                "price_targets": "empty",
+                "price": "empty",
+            },
+            "earnings_estimate": {},
+            "revenue_estimate": {},
+            "eps_trend": {},
+            "eps_revisions": {},
+            "price_targets": {},
+            "price": {},
+            "earnings_dates": [],
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, empty_consensus)
+
+    ws = _workspace(tmp_path / ticker, ticker=ticker)
+    run_id = "20261110-2250"
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", run_id],
+        ticker=ticker,
+    )
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["ticker"] == ticker
+    assert payload["failed_sources"] == []
+
+    packet = _read_json(ws / "research" / "tracker" / run_id / "packet.json")
+    assert packet["data_status"] == {
+        "price": "暂无",
+        "consensus": "暂无",
+        "earnings_calendar": "暂无",
+    }
+    assert packet["implied_model"]["status"] == "empty"
+    assert packet["implied_model"]["summary"] == "暂无"
+
+    packet_md = (ws / "research" / "tracker" / run_id / "packet.md").read_text(encoding="utf-8")
+    assert "历史行情：暂无" in packet_md
+    assert "一致预期：暂无" in packet_md
+    assert "财报日历：暂无" in packet_md
+    assert "隐含费用：暂无" in packet_md
+
+    cfg = json.loads(collect_mod.research_config_path(ticker).read_text(encoding="utf-8"))
+    expected_kw_query = " ".join(cfg["research_keywords"])
+    internal_calls = [args for _tool, args in calls if args.get("route") in {"sales-notes", "tmtb", "funda-ai", "company-wiki"}]
+    assert [args["route"] for args in internal_calls] == expected_routes
+    assert all(args["query"] == expected_kw_query for args in internal_calls)
+
+    sec_calls = [args for _tool, args in calls if args.get("route") == "sec"]
+    assert [args["form"] for args in sec_calls] == expected_forms
+
+    tweet_handles = [
+        args["handle"]
+        for _tool, args in calls
+        if args.get("route") == "x-timeline" and args.get("operation") == "tweets"
+    ]
+    assert tweet_handles == expected_accounts
+    for handle in expected_accounts:
+        assert packet["x"]["new"][f"x:post-{handle}"]["via"] == "config"
+
+
+def test_sources_toggle_can_skip_optional_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "mini-rules.md").write_text("# MINI\n", encoding="utf-8")
+    (fake_skill / "config" / "MINI.json").write_text(
+        json.dumps(
+            {
+                "ticker": "MINI",
+                "name": "MiniCo",
+                "research_keywords": ["MiniCo", "MINI"],
+                "sources": {
+                    "internal": False,
+                    "alphaengine": False,
+                    "sec": False,
+                    "consensus": False,
+                    "price": False,
+                    "earnings_calendar": False,
+                    "news": False,
+                    "x": False,
+                },
+                "card": {
+                    "title_prefix": "📈 MINI 跟踪｜",
+                    "subtitle": "MiniCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "MINI",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    def no_bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        raise AssertionError(f"disabled source called bridge: {tool_name} {arguments}")
+
+    def no_consensus(ticker: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        raise AssertionError("disabled consensus called fetch_consensus_snapshot")
+
+    _patch_bridge(monkeypatch, no_bridge)
+    _patch_consensus(monkeypatch, no_consensus)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws", ticker="MINI")
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"],
+        ticker="MINI",
+    )
+    assert code == 0 and payload["ok"] is True
+    assert payload["failed_sources"] == []
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert packet["news"]["status"] == "skipped"
+    assert packet["data_status"] == {"price": "暂无", "consensus": "暂无", "earnings_calendar": "已关闭"}
+
+
+@pytest.mark.parametrize(
+    ("enabled_key", "expected_status"),
+    [
+        ("price", {"price": "ok", "consensus": "暂无", "earnings_calendar": "已关闭"}),
+        ("earnings_calendar", {"price": "暂无", "consensus": "暂无", "earnings_calendar": "ok"}),
+        ("consensus", {"price": "暂无", "consensus": "ok", "earnings_calendar": "已关闭"}),
+    ],
+)
+def test_independent_source_toggles_price_calendar_consensus(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    enabled_key: str,
+    expected_status: dict[str, str],
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "solo-rules.md").write_text("# SOLO\n", encoding="utf-8")
+    (fake_skill / "config" / "SOLO.json").write_text(
+        json.dumps(
+            {
+                "ticker": "SOLO",
+                "name": "SoloCo",
+                "research_keywords": ["SoloCo", "SOLO"],
+                "sources": {
+                    "internal": False,
+                    "alphaengine": False,
+                    "sec": False,
+                    "consensus": enabled_key == "consensus",
+                    "price": enabled_key == "price",
+                    "earnings_calendar": enabled_key == "earnings_calendar",
+                    "news": False,
+                    "x": False,
+                },
+                "card": {
+                    "title_prefix": "📈 SOLO 跟踪｜",
+                    "subtitle": "SoloCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "SOLO",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    called = {"ticker": False, "download": False, "consensus": False, "calendar": False}
+
+    class _TickerStub:
+        @property
+        def earnings_estimate(self):
+            called["consensus"] = True
+            return pd.DataFrame(
+                {"numberOfAnalysts": [5], "avg": [3.0]},
+                index=["0y"],
+            )
+
+        @property
+        def revenue_estimate(self):
+            called["consensus"] = True
+            return pd.DataFrame()
+
+        @property
+        def eps_trend(self):
+            called["consensus"] = True
+            return pd.DataFrame()
+
+        @property
+        def eps_revisions(self):
+            called["consensus"] = True
+            return pd.DataFrame()
+
+        @property
+        def analyst_price_targets(self):
+            called["consensus"] = True
+            return {"mean": 150.0}
+
+        @property
+        def earnings_dates(self):
+            called["calendar"] = True
+            return pd.DataFrame({"EPS Estimate": [1.2]}, index=pd.to_datetime(["2026-12-01"]))
+
+    def make_ticker(sym: str):
+        called["ticker"] = True
+        return _TickerStub()
+
+    def make_download(*args, **kwargs):
+        called["download"] = True
+        close = pd.DataFrame(
+            {"SOLO": [100.0, 102.0], "QQQ": [500.0, 505.0]},
+            index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+        )
+        return pd.concat({"Close": close}, axis=1)
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=make_ticker))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, side_effect=make_download))
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / f"ws-{enabled_key}", ticker="SOLO")
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"],
+        ticker="SOLO",
+    )
+    assert code == 0 and payload["ok"] is True
+    assert payload["failed_sources"] == []
+    assert called["download"] is (enabled_key == "price")
+    assert called["consensus"] is (enabled_key == "consensus")
+    assert called["calendar"] is (enabled_key == "earnings_calendar")
+    assert called["ticker"] is (enabled_key in {"consensus", "earnings_calendar"})
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert packet["data_status"] == expected_status
+
+    # Verify undocumented "estimates" alias is NOT honored
+    assert collect_mod._source_enabled({"sources": {"estimates": False}}, "consensus") is True
+
+
+def test_config_x_accounts_require_relevance_and_skip_seen_when_unrelated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "x-timeline":
+            if arguments.get("operation") == "tweets" and arguments.get("handle") == "elonmusk":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "meme-offtopic",
+                                    "text": "Good morning everyone! Nice weather today.",
+                                    "created_at": "2026-11-10T12:00:00-05:00",
+                                    "author_handle": "elonmusk",
+                                    "metrics": {"likes": 99999, "reposts": 5000, "replies": 100, "views": 1000000},
+                                },
+                                {
+                                    "id": "spcx-ontopic",
+                                    "text": "SpaceX Starlink annual revenue continues scaling fast.",
+                                    "created_at": "2026-11-10T12:05:00-05:00",
+                                    "author_handle": "elonmusk",
+                                    "metrics": {"likes": 100, "reposts": 10, "replies": 5, "views": 5000},
+                                },
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    def empty_cons(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        return {
+            "ok": True,
+            "status": "empty",
+            "fetched_at": FROZEN.isoformat(),
+            "earnings_estimate": {},
+            "revenue_estimate": {},
+            "eps_trend": {},
+            "eps_revisions": {},
+            "price_targets": {},
+            "price": {},
+            "earnings_dates": [],
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, empty_cons)
+
+    ws = _workspace(tmp_path / "ws", ticker="SPCX")
+    run_id = "20261110-2250"
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", run_id],
+        ticker="SPCX",
+    )
+    assert code == 0 and payload["ok"] is True
+    packet = _read_json(ws / "research" / "tracker" / run_id / "packet.json")
+    assert "x:spcx-ontopic" in packet["x"]["new"]
+    assert packet["x"]["new"]["x:spcx-ontopic"]["via"] == "config"
+    assert "x:meme-offtopic" not in packet["x"]["new"]
+    assert "x:meme-offtopic" not in packet["x"]["noise_ids"]
+
+    code, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", run_id, "--material", "no", "--summary", "check x"],
+        ticker="SPCX",
+    )
+    assert code == 0
+    seen = set(_read_json(ws / "research" / "tracker" / "seen.json"))
+    assert "x:spcx-ontopic" in seen
+    assert "x:meme-offtopic" not in seen
+
+
+def test_new_company_without_sources_uses_5d_unavailable_and_missing_benchmark_is_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "fresh-rules.md").write_text("# FRESH\n", encoding="utf-8")
+    (fake_skill / "config" / "FRESH.json").write_text(
+        json.dumps(
+            {
+                "ticker": "FRESH",
+                "name": "FreshCo",
+                "research_keywords": ["FreshCo", "FRESH"],
+                "card": {
+                    "title_prefix": "📈 FRESH 跟踪｜",
+                    "subtitle": "FreshCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "FRESH",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    cal_accessed = False
+
+    class _FreshStub:
+        @property
+        def earnings_estimate(self):
+            return pd.DataFrame()
+
+        @property
+        def revenue_estimate(self):
+            return pd.DataFrame()
+
+        @property
+        def eps_trend(self):
+            return pd.DataFrame()
+
+        @property
+        def eps_revisions(self):
+            return pd.DataFrame()
+
+        @property
+        def analyst_price_targets(self):
+            return {}
+
+        @property
+        def earnings_dates(self):
+            nonlocal cal_accessed
+            cal_accessed = True
+            return pd.DataFrame()
+
+    # 5 trading days: 100,103,106,109,112 and QQQ column missing -> 5d is None, benchmark is None
+    close_no_bench = pd.DataFrame(
+        {"FRESH": [100.0, 103.0, 106.0, 109.0, 112.0]},
+        index=pd.to_datetime(["2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10"]),
+    )
+    dl_no_bench = pd.concat({"Close": close_no_bench}, axis=1)
+
+    def ok_bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        return {"ok": True, "data": {"data": {"items": [], "has_more": False}, "results": [], "rows": []}}
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _FreshStub()))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=dl_no_bench))
+    _patch_bridge(monkeypatch, ok_bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws", ticker="FRESH")
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"],
+        ticker="FRESH",
+    )
+    assert code == 0 and payload["ok"] is True
+    assert cal_accessed is False
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    packet_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert "data_status" not in packet
+    assert packet["consensus"]["price"]["chg_5d_pct"] is None
+    assert packet["consensus"]["price"]["bench_chg_1d_pct"] is None
+    assert packet["consensus"]["price"]["bench_chg_5d_pct"] is None
+    assert not any("5 日涨跌" in f for f in packet["auto_flags"])
+    assert "5 日 None%" in packet_md
+    assert "财报日历" not in packet_md
+
+
+def test_zero_analysts_only_eps_trend_triggers_no_alert_and_empty_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+
+    class _TrendOnlyStub:
+        @property
+        def earnings_estimate(self):
+            return pd.DataFrame(
+                {"numberOfAnalysts": [0], "avg": [float("nan")]},
+                index=["+1y"],
+            )
+
+        @property
+        def revenue_estimate(self):
+            return pd.DataFrame()
+
+        @property
+        def eps_trend(self):
+            return pd.DataFrame(
+                {"current": [1.25], "7daysAgo": [1.0], "30daysAgo": [1.0]},
+                index=["+1y"],
+            )
+
+        @property
+        def eps_revisions(self):
+            return pd.DataFrame(
+                {"upLast7days": [0], "downLast7Days": [8]},
+                index=["+1y"],
+            )
+
+        @property
+        def analyst_price_targets(self):
+            return {"mean": 500.0}
+
+        @property
+        def earnings_dates(self):
+            return pd.DataFrame()
+
+    def ok_bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        return {"ok": True, "data": {"data": {"items": [], "has_more": False}, "results": [], "rows": []}}
+
+    one_close = pd.DataFrame(
+        {"ANT": [100.0, 101.0], "QQQ": [500.0, 505.0]},
+        index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+    )
+    ok_dl = pd.concat({"Close": one_close}, axis=1)
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _TrendOnlyStub()))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=ok_dl))
+    _patch_bridge(monkeypatch, ok_bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws-ant", ticker="ANT")
+    code, payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"],
+        ticker="ANT",
+    )
+    assert code == 0 and payload["ok"] is True
+    assert payload["failed_sources"] == []
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert packet["consensus"]["status"] == "empty"
+    assert packet["data_status"]["consensus"] == "暂无"
+    assert packet["deltas"]["eps_+1y_vs_7d_pct"] is None
+    assert packet["deltas"]["fy1_revisions_7d"] == {"up": None, "down": None}
+    assert packet["auto_flags"] == []
+
+
+@pytest.mark.parametrize("ticker", ["MSFT", "META", "AMZN", "GOOGL"])
+def test_legacy_four_tickers_at_pool_matches_origin_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ticker: str,
+) -> None:
+    """Fixtures generated directly from origin/dalton/main collect.py with x_pool=@Analyst1."""
+    fix_dir = REPO_ROOT / "tests" / "unit" / "dalton" / "fixtures" / "bullbear_regression"
+    expected_json = (fix_dir / f"{ticker}.pool.packet.json").read_text(encoding="utf-8")
+    expected_md = (fix_dir / f"{ticker}.pool.packet.md").read_text(encoding="utf-8")
+    cfg = json.loads(collect_mod.research_config_path(ticker).read_text(encoding="utf-8"))
+    kw = cfg["alias_terms"][0]
+    ae_co = cfg["ae_company_names"][0]
+    p0, p1 = {
+        "MSFT": ("2027-06-30", "2028-06-30"),
+        "META": ("2026-12-31", "2027-12-31"),
+        "AMZN": ("2026-12-31", "2027-12-31"),
+        "GOOGL": ("2026-12-31", "2027-12-31"),
+    }[ticker]
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments.get("operation") == "read":
+            return {"ok": True, "status": "ok", "data": {"content": f"{kw} revenue growth update.\n", "next_offset": None}}
+        route = arguments.get("route")
+        if route == "tmtb":
+            return {"ok": True, "data": {"results": [{"document_id": f"tmtb:{ticker.lower()}-1", "title": f"{ticker} Note", "date": "2026-11-10", "keyword_hits": 2}], "has_more": False}}
+        if route in {"sales-notes", "funda-ai", "company-wiki"}:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if route == "alphaengine":
+            return {"ok": True, "data": {"results": [{"doc_id": f"alphaengine:ae-{ticker.lower()}-1", "title": f"{ticker} AE Report", "companies": [ae_co], "publish_time": "2026-11-10"}], "has_more": False}}
+        if route == "sec":
+            if arguments.get("form") == "8-K":
+                return {"ok": True, "data": {"rows": [{"accession_no": "0000000001-26-000001", "form": "8-K", "filing_date": "2026-11-10"}]}}
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            if arguments.get("operation") == "search":
+                return {"ok": True, "data": {"data": {"items": [{"id": f"x-{ticker.lower()}-1", "text": f"${ticker} EPS and revenue beat", "created_at": "2026-11-10T12:00:00-05:00", "author_handle": "analyst1", "metrics": {"likes": 50, "reposts": 5, "replies": 1, "views": 100}}], "has_more": False}}}
+            if arguments.get("operation") == "tweets" and arguments.get("handle") == "@Analyst1":
+                return {"ok": True, "data": {"data": {"items": [{"id": f"x-{ticker.lower()}-pool", "text": f"${ticker} cloud channel check", "created_at": "2026-11-10T13:00:00-05:00", "metrics": {"likes": 80, "reposts": 8, "replies": 2, "views": 300}}], "has_more": False}}}
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        raise AssertionError(arguments)
+
+    def cons(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        return {
+            "ok": True, "status": "ok", "fetched_at": FROZEN.isoformat(), "currency": "USD",
+            "field_status": {"earnings_estimate": "ok", "revenue_estimate": "ok", "eps_trend": "ok", "eps_revisions": "ok", "price_targets": "ok", "price": "ok"},
+            "earnings_estimate": {"0y": {"avg": 10.0, "period_end": p0, "currency": "USD", "numberOfAnalysts": 30}, "+1y": {"avg": 12.0, "period_end": p1, "currency": "USD", "numberOfAnalysts": 28}},
+            "revenue_estimate": {"0y": {"avg": 100e9, "period_end": p0, "currency": "USD", "numberOfAnalysts": 30}, "+1y": {"avg": 120e9, "period_end": p1, "currency": "USD", "numberOfAnalysts": 28}},
+            "eps_trend": {"+1y": {"current": 12.0, "7daysAgo": 12.0}},
+            "eps_revisions": {"+1y": {"upLast7days": 1, "downLast7Days": 0}},
+            "price_targets": {"mean": 450.0},
+            "price": {"as_of": "2026-11-10", "close": 400.0, "chg_1d_pct": 1.2, "chg_5d_pct": 2.5, "benchmark": benchmark, "bench_chg_1d_pct": 0.4, "bench_chg_5d_pct": 1.0},
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, cons)
+
+    ws = _workspace(tmp_path / ticker, ticker=ticker)
+    (ws / "research" / "tracker" / "x_pool.json").write_text(
+        json.dumps({"@Analyst1": {"active": True, "tickers": [ticker]}}), encoding="utf-8"
+    )
+    code, _payload = _run(
+        capsys,
+        ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"],
+        ticker=ticker,
+    )
+    assert code == 0
+    actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
+    actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert actual_json == expected_json
+    assert actual_md == expected_md
+
+
+def test_meta_news_off_preserves_legacy_packet_and_top_level_routes_fall_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    orig_meta = json.loads(collect_mod.research_config_path("META").read_text(encoding="utf-8"))
+    orig_meta["sources"] = dict(orig_meta["sources"])
+    orig_meta["sources"]["news"] = False
+    (fake_skill / "config" / "META.json").write_text(json.dumps(orig_meta), encoding="utf-8")
+    (fake_skill / "references" / "meta-rules.md").write_text("# META\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    cal_called = False
+
+    class _MetaStub:
+        @property
+        def earnings_estimate(self):
+            return pd.DataFrame()
+
+        @property
+        def revenue_estimate(self):
+            return pd.DataFrame()
+
+        @property
+        def eps_trend(self):
+            return pd.DataFrame()
+
+        @property
+        def eps_revisions(self):
+            return pd.DataFrame()
+
+        @property
+        def analyst_price_targets(self):
+            return {}
+
+        @property
+        def earnings_dates(self):
+            nonlocal cal_called
+            cal_called = True
+            return pd.DataFrame({"EPS Estimate": [2.0]}, index=pd.to_datetime(["2026-12-01"]))
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _MetaStub()))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=pd.DataFrame()))
+    _patch_bridge(monkeypatch, lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": [], "data": {"items": [], "has_more": False}}})
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws", ticker="META")
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="META")
+    assert code == 0
+    assert cal_called is False
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    packet_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    # 旧四家过滤掉 sources 下新增开关（含 news=false），始终走主分支默认新闻与配置口径
+    assert packet["news"]["status"] == "pending_agent_search"
+    assert "data_status" not in packet
+    assert "财报日历" not in packet_md
+    assert "历史行情：暂无" not in packet_md
+
+    # A main-era config keeps these at the top level; they are read when `sources` has none.
+    legacy = collect_mod._filter_legacy_config({"ticker": "META", "internal_routes": ["tmtb"], "sec_forms": ["8-K"]})
+    assert collect_mod._effective_internal_routes(legacy) == ["tmtb"]
+    assert collect_mod._effective_sec_forms(legacy) == ["8-K"]
+
+
+@pytest.mark.parametrize("cal_mode", ["disabled", "empty", "timeout"])
+def test_earnings_calendar_states_disabled_empty_and_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    cal_mode: str,
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "cal-rules.md").write_text("# CAL\n", encoding="utf-8")
+    (fake_skill / "config" / "CAL.json").write_text(
+        json.dumps(
+            {
+                "ticker": "CAL",
+                "name": "CalCo",
+                "sources": {
+                    "internal": False,
+                    "alphaengine": False,
+                    "sec": False,
+                    "consensus": False,
+                    "price": False,
+                    "earnings_calendar": cal_mode != "disabled",
+                    "news": False,
+                    "x": False,
+                },
+                "card": {
+                    "title_prefix": "📈 CAL 跟踪｜",
+                    "subtitle": "CalCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "CAL",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    orig_ticker = yf.Ticker
+    cal_hits = 0
+
+    class _CalStub:
+        @property
+        def earnings_dates(self):
+            nonlocal cal_hits
+            cal_hits += 1
+            if cal_mode == "timeout":
+                raise TimeoutError("yfinance calendar timed out")
+            return pd.DataFrame()
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _CalStub()))
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / f"ws-{cal_mode}", ticker="CAL")
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="CAL")
+    assert code == 0 and payload["ok"] is True
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    fs = packet["consensus"]["field_status"]
+    assert packet["consensus"]["_meta"]["field_status"] == fs
+    if cal_mode == "disabled":
+        assert cal_hits == 0
+        assert fs["earnings_dates"] == "skipped"
+        assert packet["data_status"]["earnings_calendar"] == "已关闭"
+        assert "财报日历：已关闭" in (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+        assert packet["failed_sources"] == []
+    elif cal_mode == "empty":
+        assert cal_hits == 1
+        assert fs["earnings_dates"] == "empty"
+        assert packet["data_status"]["earnings_calendar"] == "暂无"
+        assert packet["failed_sources"] == []
+    else:
+        assert cal_hits == 1
+        assert fs["earnings_dates"] == "error"
+        assert packet["data_status"]["earnings_calendar"] == "error"
+        assert any(item["source"] == "earnings_calendar" for item in packet["failed_sources"])
+
+
+def test_x_pool_max_keeps_config_accounts_and_filters_search_and_pool_config_authors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = json.loads(collect_mod.research_config_path("SPCX").read_text(encoding="utf-8"))
+    timeline_calls: list[str] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "x-timeline":
+            op = arguments.get("operation")
+            if op == "search":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "cfg-search-offtopic",
+                                    "text": "Just saying hello to everyone",
+                                    "created_at": "2026-11-10T12:00:00-05:00",
+                                    "author_handle": "@SpaceX",
+                                    "metrics": {"likes": 5000, "reposts": 200, "replies": 50, "views": 100000},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            handle = str(arguments.get("handle"))
+            timeline_calls.append(handle)
+            if handle == "elonmusk":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "cfg-pool-offtopic",
+                                    "text": "What a lovely dog!",
+                                    "created_at": "2026-11-10T12:01:00-05:00",
+                                    "author_handle": "elonmusk",
+                                    "metrics": {"likes": 8000, "reposts": 300, "replies": 40, "views": 200000},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            if handle == "xai":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "cfg-xai-ontopic",
+                                    "text": "xAI Colossus GPU capex expansion",
+                                    "created_at": "2026-11-10T12:02:00-05:00",
+                                    "author_handle": "xai",
+                                    "metrics": {"likes": 200, "reposts": 20, "replies": 5, "views": 5000},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "rows": []}}
+
+    _patch_bridge(monkeypatch, bridge)
+    ws = _workspace(tmp_path / "ws", ticker="SPCX")
+    # Pool has elonmusk (also in config.x_accounts) + extra_user; with x_pool_max=1 only elonmusk stays in pool,
+    # while config.x_accounts (xai, SpaceX, Starlink) must still be appended AFTER pool truncation.
+    (ws / "research" / "tracker" / "x_pool.json").write_text(
+        json.dumps(
+            {
+                "elonmusk": {"active": True, "tickers": ["SPCX"]},
+                "extra_user": {"active": True, "tickers": ["SPCX"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    narrow_cfg = dict(cfg)
+    narrow_cfg["x_pool_max"] = 1
+    prev_ticker = collect_mod.TICKER
+    collect_mod.TICKER = "SPCX"
+    try:
+        xdata = collect_mod.collect_x(narrow_cfg, "2026-11-09", "2026-11-10", set(), ws)
+    finally:
+        collect_mod.TICKER = prev_ticker
+
+    assert "extra_user" not in timeline_calls
+    assert set(timeline_calls) == {"elonmusk", "xai", "SpaceX", "Starlink"}
+    assert xdata["pool_size"] == 1
+    pool_rows = [s for s in xdata["status"] if "pool" in s]
+    cfg_rows = [s for s in xdata["status"] if "config" in s]
+    assert [s["pool"] for s in pool_rows] == ["elonmusk"]
+    assert {s["config"] for s in cfg_rows} == {"xai", "SpaceX", "Starlink"}
+    assert "x:cfg-xai-ontopic" in xdata["new"]
+    assert "x:cfg-pool-offtopic" not in xdata["new"] and "x:cfg-pool-offtopic" not in xdata["noise_ids"]
+    assert "x:cfg-search-offtopic" not in xdata["new"] and "x:cfg-search-offtopic" not in xdata["noise_ids"]
+
+    # Also test full collect -> commit flow leaves off-topic config posts out of seen.json
+    import pandas as pd
+    import yfinance as yf
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: object()))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=pd.DataFrame()))
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="SPCX")
+    assert code == 0
+    code, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "x"],
+        ticker="SPCX",
+    )
+    assert code == 0
+    seen = set(_read_json(ws / "research" / "tracker" / "seen.json"))
+    assert "x:cfg-xai-ontopic" in seen
+    assert "x:cfg-pool-offtopic" not in seen
+    assert "x:cfg-search-offtopic" not in seen
+
+
+def test_yfinance_no_data_exception_maps_to_empty_and_syncs_meta_field_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+    from yfinance.exceptions import YFTickerMissingError
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+
+    class _NoDataStub:
+        @property
+        def earnings_estimate(self):
+            raise YFTickerMissingError("ANT", "Quote not found for symbol: ANT")
+
+        @property
+        def revenue_estimate(self):
+            raise RuntimeError("HTTP Error 404: Quote not found")
+
+        @property
+        def eps_trend(self):
+            return None
+
+        @property
+        def eps_revisions(self):
+            return None
+
+        @property
+        def analyst_price_targets(self):
+            return {}
+
+        @property
+        def earnings_dates(self):
+            return None
+
+    one_close = pd.DataFrame(
+        {"ANT": [float("nan"), 100.0], "QQQ": [500.0, 505.0]},
+        index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+    )
+    one_dl = pd.concat({"Close": one_close}, axis=1)
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _NoDataStub()))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=one_dl))
+    _patch_bridge(monkeypatch, lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": [], "data": {"items": [], "has_more": False}}})
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws", ticker="ANT")
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code == 0 and payload["ok"] is True
+    assert payload["failed_sources"] == []
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert packet["consensus"]["status"] == "empty"
+    assert packet["consensus"]["_meta"]["field_status"] == packet["consensus"]["field_status"]
+    assert packet["data_status"] == {"price": "ok", "consensus": "暂无", "earnings_calendar": "暂无"}
+
+
+@pytest.mark.parametrize("ticker", ["MSFT", "META", "AMZN", "GOOGL"])
+@pytest.mark.parametrize("scenario", ["degenerate", "target_only", "price_fail"])
+def test_legacy_four_tickers_degraded_and_price_fail_match_origin_fixtures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ticker: str,
+    scenario: str,
+) -> None:
+    """Fixtures generated directly from origin/dalton/main collect.py for degraded consensus, target-only, and price failure."""
+    fix_dir = REPO_ROOT / "tests" / "unit" / "dalton" / "fixtures" / "bullbear_regression"
+    expected_json = (fix_dir / f"{ticker}.{scenario}.packet.json").read_text(encoding="utf-8")
+    expected_md = (fix_dir / f"{ticker}.{scenario}.packet.md").read_text(encoding="utf-8")
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route in {"tmtb", "sales-notes", "funda-ai", "company-wiki", "alphaengine"}:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if route == "sec":
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        raise AssertionError(arguments)
+
+    def cons_deg(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        return {
+            "ok": True, "status": "partial", "fetched_at": FROZEN.isoformat(), "currency": "USD",
+            "field_status": {"earnings_estimate": "empty", "revenue_estimate": "empty", "eps_trend": "ok", "eps_revisions": "ok", "price_targets": "empty", "price": "ok"},
+            "earnings_estimate": {"+1y": {"avg": None, "low": None, "high": None, "numberOfAnalysts": 0}},
+            "revenue_estimate": {},
+            "eps_trend": {"+1y": {"current": 12.5, "7daysAgo": 10.0}},
+            "eps_revisions": {"+1y": {"upLast7days": 0, "downLast7Days": 7}},
+            "price_targets": {},
+            "price": {"as_of": "2026-11-10", "close": 400.0, "chg_1d_pct": 0.5, "chg_5d_pct": 1.0, "benchmark": benchmark, "bench_chg_1d_pct": 0.2, "bench_chg_5d_pct": 0.5},
+        }
+
+    def cons_tgt(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        return {
+            "ok": False, "status": "error", "fetched_at": FROZEN.isoformat(), "currency": "USD",
+            "field_status": {"earnings_estimate": "empty", "revenue_estimate": "empty", "eps_trend": "empty", "eps_revisions": "empty", "price_targets": "ok", "price": "empty"},
+            "earnings_estimate": {}, "revenue_estimate": {}, "eps_trend": {}, "eps_revisions": {},
+            "price_targets": {"mean": 500.0}, "price": {},
+        }
+
+    def cons_pfail(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        return {
+            "ok": True, "status": "partial", "fetched_at": FROZEN.isoformat(), "currency": "USD",
+            "field_status": {"earnings_estimate": "ok", "revenue_estimate": "ok", "eps_trend": "ok", "eps_revisions": "ok", "price_targets": "ok", "price": "error"},
+            "earnings_estimate": {"0y": {"avg": 10.0, "period_end": "2026-12-31", "currency": "USD", "numberOfAnalysts": 30}},
+            "revenue_estimate": {"0y": {"avg": 100e9, "period_end": "2026-12-31", "currency": "USD", "numberOfAnalysts": 30}},
+            "eps_trend": {}, "eps_revisions": {}, "price_targets": {"mean": 450.0},
+            "price": {"error": "download timeout"},
+        }
+
+    cons_fn = {"degenerate": cons_deg, "target_only": cons_tgt, "price_fail": cons_pfail}[scenario]
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, cons_fn)
+
+    ws = _workspace(tmp_path / f"{ticker}-{scenario}", ticker=ticker)
+    if scenario == "target_only":
+        prev_time = datetime(2026, 11, 9, 22, 50, tzinfo=ET)
+        (ws / "data" / "consensus" / "2026-11-09_2250.json").write_text(
+            json.dumps({
+                "ok": True, "status": "error", "fetched_at": prev_time.isoformat(), "currency": "USD",
+                "earnings_estimate": {}, "revenue_estimate": {}, "eps_trend": {}, "eps_revisions": {},
+                "price_targets": {"mean": 400.0}, "price": {},
+            }),
+            encoding="utf-8",
+        )
+    code, _payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker=ticker)
+    assert code == 0
+    actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
+    actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert actual_json == expected_json
+    assert actual_md == expected_md
+
+
+def test_commit_with_delivered_card_and_escaping_rules_symlink_succeeds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ws = _workspace(tmp_path / "ws", ticker="ACME" if False else "ANT")
+    run_id = "20261110-2250"
+    run_dir = ws / "research" / "tracker" / run_id
+    run_dir.mkdir(parents=True)
+    snap_rel = "data/consensus/2026-11-10_2250.json"
+    (ws / snap_rel).write_text(json.dumps({"ok": True, "status": "empty"}), encoding="utf-8")
+    (run_dir / "packet.json").write_text(
+        json.dumps(
+            {
+                "ticker": "ANT",
+                "run_id": run_id,
+                "since": "2026-11-09",
+                "until": "2026-11-10",
+                "collected_at": FROZEN.isoformat(),
+                "snapshot_file": snap_rel,
+                "ant_ae_state": _ae_state("2026-11-10", run_id),
+                "internal": {},
+                "alphaengine": {},
+                "sec": {},
+                "x": {},
+                "collection_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "card.json").write_text(json.dumps({"schema": "2.0"}), encoding="utf-8")
+    outside = tmp_path / "outside-rules.md"
+    outside.write_text("# outside\n", encoding="utf-8")
+    (ws / "research" / "tracker" / "rules.md").symlink_to(outside)
+
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    code, payload = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", run_id, "--material", "yes", "--summary", "sent card"],
+        ticker="ANT",
+    )
+    assert code == 0 and payload["ok"] is True
+
+
+def test_yf_data_exception_and_ticker_init_failure_attribute_only_enabled_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import yfinance as yf
+    from yfinance.exceptions import YFDataException
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    (fake_skill / "references" / "calonly-rules.md").write_text("# CALONLY\n", encoding="utf-8")
+    (fake_skill / "config" / "CALONLY.json").write_text(
+        json.dumps(
+            {
+                "ticker": "CALONLY",
+                "name": "CalOnly",
+                "sources": {
+                    "internal": False,
+                    "alphaengine": False,
+                    "sec": False,
+                    "consensus": False,
+                    "price": False,
+                    "earnings_calendar": True,
+                    "news": False,
+                    "x": False,
+                },
+                "card": {
+                    "title_prefix": "📈 CALONLY 跟踪｜",
+                    "subtitle": "CalOnly",
+                    "tag": "CALONLY",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+    orig_ticker = yf.Ticker
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    # 1) YFDataException on earnings_dates -> failure recorded as earnings_calendar (not 暂无)
+    class _ParseFailStub:
+        @property
+        def earnings_dates(self):
+            raise YFDataException("Failed to parse earnings table")
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _ParseFailStub()))
+    ws1 = _workspace(tmp_path / "ws1", ticker="CALONLY")
+    code1, payload1 = _run(capsys, ["collect", "--workspace-dir", str(ws1), "--run-id", "20261110-2250"], ticker="CALONLY")
+    assert code1 == 0
+    assert payload1["failed_sources"] == [{"source": "earnings_calendar", "error": "Failed to parse earnings table"}]
+
+    # 2) yf.Ticker() init TimeoutError -> attributes to earnings_calendar ONLY, never estimates
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=TimeoutError("init timed out")))
+    ws2 = _workspace(tmp_path / "ws2", ticker="CALONLY")
+    code2, payload2 = _run(capsys, ["collect", "--workspace-dir", str(ws2), "--run-id", "20261110-2250"], ticker="CALONLY")
+    assert code2 == 0
+    assert [f["source"] for f in payload2["failed_sources"]] == ["earnings_calendar"]
+
+
+def test_spcx_x_relevance_filters_all_three_sources_uniformly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        route = arguments.get("route")
+        if route == "x-timeline":
+            op = arguments.get("operation")
+            if op == "search":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "search-offtopic",
+                                    "text": "Good morning beautiful weekend!",
+                                    "created_at": "2026-11-10T12:00:00-05:00",
+                                    "author_handle": "random_user",
+                                    "metrics": {"likes": 500, "reposts": 20, "replies": 5, "views": 1000},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            handle = str(arguments.get("handle"))
+            if handle == "plain_pool":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "pool-offtopic",
+                                    "text": "Having coffee at the beach.",
+                                    "created_at": "2026-11-10T12:01:00-05:00",
+                                    "author_handle": "plain_pool",
+                                    "metrics": {"likes": 900, "reposts": 50, "replies": 5, "views": 2000},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            if handle == "elonmusk":
+                return {
+                    "ok": True,
+                    "data": {
+                        "data": {
+                            "items": [
+                                {
+                                    "id": "config-offtopic",
+                                    "text": "Happy Friday everyone!",
+                                    "created_at": "2026-11-10T12:02:00-05:00",
+                                    "author_handle": "elonmusk",
+                                    "metrics": {"likes": 9999, "reposts": 900, "replies": 50, "views": 90000},
+                                },
+                                {
+                                    "id": "config-ontopic",
+                                    "text": "SpaceX revenue growth update.",
+                                    "created_at": "2026-11-10T12:03:00-05:00",
+                                    "author_handle": "elonmusk",
+                                    "metrics": {"likes": 100, "reposts": 10, "replies": 2, "views": 1000},
+                                },
+                            ],
+                            "has_more": False,
+                        }
+                    },
+                }
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        return {"ok": True, "data": {"results": [], "rows": []}}
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: object()))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=pd.DataFrame()))
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws-spcx", ticker="SPCX")
+    (ws / "research" / "tracker" / "x_pool.json").write_text(
+        json.dumps({"plain_pool": {"active": True, "tickers": ["SPCX"]}}), encoding="utf-8"
+    )
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="SPCX")
+    assert code == 0
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert list(packet["x"]["new"]) == ["x:config-ontopic"]
+    assert packet["x"]["noise_ids"] == []
+    code, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "x"],
+        ticker="SPCX",
+    )
+    assert code == 0
+    seen = set(_read_json(ws / "research" / "tracker" / "seen.json"))
+    assert "x:config-ontopic" in seen
+    for off in ("x:pool-offtopic", "x:config-offtopic", "x:search-offtopic"):
+        assert off not in seen
+
+
+def test_earnings_calendar_exceptions_and_empty_timeout_classified_as_calendar_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    valid_close = pd.DataFrame(
+        {"ANT": [100.0, 102.0], "QQQ": [500.0, 505.0]},
+        index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+    )
+    ok_dl = pd.concat({"Close": valid_close}, axis=1)
+
+    class _CalValueErrStub:
+        earnings_estimate = pd.DataFrame()
+        revenue_estimate = pd.DataFrame()
+        eps_trend = pd.DataFrame()
+        eps_revisions = pd.DataFrame()
+        analyst_price_targets: dict[str, Any] = {}
+
+        @property
+        def earnings_dates(self):
+            raise ValueError("Earnings Date column not found in response")
+
+    class _CalEmptyTimeoutStub(_CalValueErrStub):
+        @property
+        def earnings_dates(self):
+            raise TimeoutError()
+
+    class _CalEmptyDfStub(_CalValueErrStub):
+        @property
+        def earnings_dates(self):
+            return pd.DataFrame()
+
+    _patch_bridge(monkeypatch, lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": [], "data": {"items": [], "has_more": False}}})
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=ok_dl))
+
+    # 1) ValueError containing "not found" MUST record earnings_calendar failure, not "暂无"
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _CalValueErrStub()))
+    ws1 = _workspace(tmp_path / "ws1", ticker="ANT")
+    code1, p1 = _run(capsys, ["collect", "--workspace-dir", str(ws1), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code1 == 0
+    assert p1["failed_sources"] == [
+        {"source": "earnings_calendar", "error": "Earnings Date column not found in response"}
+    ]
+    pk1 = _read_json(ws1 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk1["data_status"]["earnings_calendar"] == "error"
+
+    # 2) TimeoutError() with empty str(exc) uses exception type name
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _CalEmptyTimeoutStub()))
+    ws2 = _workspace(tmp_path / "ws2", ticker="ANT")
+    code2, p2 = _run(capsys, ["collect", "--workspace-dir", str(ws2), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code2 == 0
+    assert p2["failed_sources"] == [{"source": "earnings_calendar", "error": "TimeoutError"}]
+    pk2 = _read_json(ws2 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk2["consensus"]["earnings_dates_error"] == "TimeoutError"
+
+    # 3) Normal empty DataFrame -> "暂无" and no failed_sources
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=lambda sym: _CalEmptyDfStub()))
+    ws3 = _workspace(tmp_path / "ws3", ticker="ANT")
+    code3, p3 = _run(capsys, ["collect", "--workspace-dir", str(ws3), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code3 == 0
+    assert p3["failed_sources"] == []
+    pk3 = _read_json(ws3 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk3["data_status"]["earnings_calendar"] == "暂无"
+
+
+def test_non_legacy_price_failures_record_price_source_only_and_symbol_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    empty_stub = create_autospec(orig_ticker, instance=True)
+    empty_stub.earnings_estimate = pd.DataFrame()
+    empty_stub.revenue_estimate = pd.DataFrame()
+    empty_stub.eps_trend = pd.DataFrame()
+    empty_stub.eps_revisions = pd.DataFrame()
+    empty_stub.analyst_price_targets = {}
+    empty_stub.earnings_dates = pd.DataFrame()
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=empty_stub))
+    _patch_bridge(monkeypatch, lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": [], "data": {"items": [], "has_more": False}}})
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    # 1) Single-symbol timeout returning empty DataFrame -> price failure, NO estimates failure
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=pd.DataFrame()))
+    ws1 = _workspace(tmp_path / "ws1", ticker="ANT")
+    code1, p1 = _run(capsys, ["collect", "--workspace-dir", str(ws1), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code1 == 0
+    assert [f["source"] for f in p1["failed_sources"]] == ["price"]
+    pk1 = _read_json(ws1 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk1["consensus"]["_meta"]["price_symbols"] == {"ANT": "empty", "QQQ": "empty"}
+    assert pk1["data_status"]["price"] == "error"
+
+    # 2) download() raising exception -> price failure, NO estimates failure
+    def raise_dl(*args: Any, **kwargs: Any) -> Any:
+        raise TimeoutError()
+
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, side_effect=raise_dl))
+    ws2 = _workspace(tmp_path / "ws2", ticker="ANT")
+    code2, p2 = _run(capsys, ["collect", "--workspace-dir", str(ws2), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code2 == 0
+    assert p2["failed_sources"] == [{"source": "price", "error": "TimeoutError"}]
+    pk2 = _read_json(ws2 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk2["consensus"]["_meta"]["price_symbols"] == {"ANT": "error: TimeoutError", "QQQ": "error: TimeoutError"}
+
+    # 3) Company column missing while benchmark present -> price failure with per-symbol outcomes
+    bench_only = pd.concat(
+        {"Close": pd.DataFrame({"QQQ": [500.0, 505.0]}, index=pd.to_datetime(["2026-11-09", "2026-11-10"]))},
+        axis=1,
+    )
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=bench_only))
+    ws3 = _workspace(tmp_path / "ws3", ticker="ANT")
+    code3, p3 = _run(capsys, ["collect", "--workspace-dir", str(ws3), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code3 == 0
+    assert [f["source"] for f in p3["failed_sources"]] == ["price"]
+    pk3 = _read_json(ws3 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk3["consensus"]["_meta"]["price_symbols"] == {"ANT": "missing_column", "QQQ": "ok"}
+
+
+def test_non_legacy_implied_model_sanitizes_periods_and_marks_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fake_skill = tmp_path / "skill"
+    for sub in ("config", "references"):
+        (fake_skill / sub).mkdir(parents=True)
+    cfg = {
+        "ticker": "ON",
+        "card": {
+            "title_prefix": "ON 跟踪",
+            "subtitle": "ON Semiconductor",
+            "tag": "ON",
+            "header_template": "blue",
+            "tag_color": "blue",
+        },
+        "sources": {
+            "internal_routes": [],
+            "sec_forms": [],
+            "alphaengine": False,
+            "consensus": True,
+            "price": False,
+            "earnings_calendar": False,
+            "x": False,
+            "news": False,
+        },
+        "model": {
+            "diluted_shares_bn": 1.0,
+            "tax_rate": 0.2,
+            "other_income_bn": {"0y": 0.0, "+1y": 0.0},
+            "source": "Yahoo 0y=FY26（2026-12 止），+1y=FY27",
+        },
+    }
+    (fake_skill / "config" / "ON.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (fake_skill / "references" / "on-rules.md").write_text("# ON\n", encoding="utf-8")
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    orig_ticker = yf.Ticker
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_bridge(monkeypatch, lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": []}})
+
+    class _InvalidConsensusStub:
+        earnings_estimate = pd.DataFrame(
+            {"avg": [2.0], "numberOfAnalysts": [0], "currency": ["USD"], "period_end": ["2026-12-31"]},
+            index=["0y"],
+        )
+        revenue_estimate = pd.DataFrame(
+            {"avg": [8e9], "numberOfAnalysts": [0], "currency": ["USD"], "period_end": ["2026-12-31"]},
+            index=["0y"],
+        )
+        eps_trend = pd.DataFrame()
+        eps_revisions = pd.DataFrame()
+        analyst_price_targets: dict[str, Any] = {}
+        earnings_dates = pd.DataFrame()
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=_InvalidConsensusStub()))
+    ws1 = _workspace(tmp_path / "ws1", ticker="ON")
+    code1, _ = _run(capsys, ["collect", "--workspace-dir", str(ws1), "--run-id", "20261110-2250"], ticker="ON")
+    assert code1 == 0
+    pk1 = _read_json(ws1 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk1["implied_model"]["status"] == "empty"
+    assert pk1["implied_model"]["summary"] == "暂无"
+    assert pk1["implied_model"]["periods"] == {}
+    md1 = (ws1 / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert "- 隐含费用：暂无" in md1
+
+    # Partial valid: only 0y valid and +1y 0 analysts -> summary "暂无" (both years required)
+    class _MixedConsensusStub:
+        earnings_estimate = pd.DataFrame(
+            {
+                "avg": [2.0, 3.0],
+                "numberOfAnalysts": [15, 0],
+                "currency": ["USD", "USD"],
+                "period_end": ["2026-12-31", "2027-12-31"],
+            },
+            index=["0y", "+1y"],
+        )
+        revenue_estimate = pd.DataFrame(
+            {
+                "avg": [8e9, 10e9],
+                "numberOfAnalysts": [15, 0],
+                "currency": ["USD", "USD"],
+                "period_end": ["2026-12-31", "2027-12-31"],
+            },
+            index=["0y", "+1y"],
+        )
+        eps_trend = pd.DataFrame()
+        eps_revisions = pd.DataFrame()
+        analyst_price_targets: dict[str, Any] = {}
+        earnings_dates = pd.DataFrame()
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=_MixedConsensusStub()))
+    ws2 = _workspace(tmp_path / "ws2", ticker="ON")
+    code2, _ = _run(capsys, ["collect", "--workspace-dir", str(ws2), "--run-id", "20261110-2250"], ticker="ON")
+    assert code2 == 0
+    pk2 = _read_json(ws2 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk2["implied_model"]["status"] == "empty"
+    assert pk2["implied_model"]["summary"] == "暂无"
+    assert pk2["implied_model"]["periods"] == {}
+    md2 = (ws2 / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert "- 隐含费用：暂无" in md2
+
+    # Both 0y and +1y valid -> computes both years
+    class _BothValidStub:
+        earnings_estimate = pd.DataFrame(
+            {
+                "avg": [2.0, 3.0],
+                "numberOfAnalysts": [15, 12],
+                "currency": ["USD", "USD"],
+                "period_end": ["2026-12-31", "2027-12-31"],
+            },
+            index=["0y", "+1y"],
+        )
+        revenue_estimate = pd.DataFrame(
+            {
+                "avg": [8e9, 10e9],
+                "numberOfAnalysts": [15, 12],
+                "currency": ["USD", "USD"],
+                "period_end": ["2026-12-31", "2027-12-31"],
+            },
+            index=["0y", "+1y"],
+        )
+        eps_trend = pd.DataFrame()
+        eps_revisions = pd.DataFrame()
+        analyst_price_targets: dict[str, Any] = {}
+        earnings_dates = pd.DataFrame()
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=_BothValidStub()))
+    ws_both = _workspace(tmp_path / "ws-both", ticker="ON")
+    code_b, _ = _run(capsys, ["collect", "--workspace-dir", str(ws_both), "--run-id", "20261110-2250"], ticker="ON")
+    assert code_b == 0
+    pk_b = _read_json(ws_both / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk_b["implied_model"]["periods"]["0y"]["status"] == "ok"
+    assert pk_b["implied_model"]["periods"]["+1y"]["status"] == "ok"
+
+    # +1y period mismatch between EPS (2027-12) and revenue (2028-04) -> whole model marks "暂无"
+    class _PeriodMismatchStub:
+        earnings_estimate = pd.DataFrame(
+            {
+                "avg": [2.0, 3.0],
+                "numberOfAnalysts": [15, 12],
+                "currency": ["USD", "USD"],
+                "period_end": ["2026-12-31", "2027-12-31"],
+            },
+            index=["0y", "+1y"],
+        )
+        revenue_estimate = pd.DataFrame(
+            {
+                "avg": [8e9, 10e9],
+                "numberOfAnalysts": [15, 12],
+                "currency": ["USD", "USD"],
+                "period_end": ["2026-12-31", "2028-04-30"],
+            },
+            index=["0y", "+1y"],
+        )
+        eps_trend = pd.DataFrame()
+        eps_revisions = pd.DataFrame()
+        analyst_price_targets: dict[str, Any] = {}
+        earnings_dates = pd.DataFrame()
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=_PeriodMismatchStub()))
+    ws_mm = _workspace(tmp_path / "ws-mm", ticker="ON")
+    code_mm, _ = _run(capsys, ["collect", "--workspace-dir", str(ws_mm), "--run-id", "20261110-2250"], ticker="ON")
+    assert code_mm == 0
+    pk_mm = _read_json(ws_mm / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk_mm["implied_model"]["status"] == "empty"
+    assert pk_mm["implied_model"]["summary"] == "暂无"
+    assert pk_mm["implied_model"]["periods"] == {}
+    md_mm = (ws_mm / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert "- 隐含费用：暂无" in md_mm
+
+    # Quarter-only valid (0q analysts > 0, no valid 0y/+1y EPS+revenue pair) -> summary "暂无"
+    class _QuarterOnlyStub:
+        earnings_estimate = pd.DataFrame(
+            {"avg": [0.5], "numberOfAnalysts": [15], "currency": ["USD"], "period_end": ["2026-03-31"]},
+            index=["0q"],
+        )
+        revenue_estimate = pd.DataFrame(
+            {"avg": [2e9], "numberOfAnalysts": [15], "currency": ["USD"], "period_end": ["2026-03-31"]},
+            index=["0q"],
+        )
+        eps_trend = pd.DataFrame()
+        eps_revisions = pd.DataFrame()
+        analyst_price_targets: dict[str, Any] = {}
+        earnings_dates = pd.DataFrame()
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=_QuarterOnlyStub()))
+    ws3 = _workspace(tmp_path / "ws3", ticker="ON")
+    code3, _ = _run(capsys, ["collect", "--workspace-dir", str(ws3), "--run-id", "20261110-2250"], ticker="ON")
+    assert code3 == 0
+    pk3 = _read_json(ws3 / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk3["implied_model"]["status"] == "empty"
+    assert pk3["implied_model"]["summary"] == "暂无"
+    assert pk3["implied_model"]["periods"] == {}
+    md3 = (ws3 / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert "- 隐含费用：暂无" in md3
+
+
+def test_minimal_config_without_aliases_regex_avoids_common_english_false_positives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_skill = tmp_path / "skill"
+    for sub in ("config", "references"):
+        (fake_skill / sub).mkdir(parents=True)
+    # Minimal ON config WITHOUT aliases_regex
+    cfg = {
+        "ticker": "ON",
+        "card": {
+            "title_prefix": "ON 跟踪",
+            "subtitle": "ON Semiconductor",
+            "tag": "ON",
+            "header_template": "blue",
+            "tag_color": "blue",
+        },
+        "sources": {
+            "internal_routes": ["tmtb"],
+            "sec_forms": [],
+            "alphaengine": False,
+            "consensus": False,
+            "price": False,
+            "earnings_calendar": False,
+            "x": True,
+            "news": True,
+        },
+        "x_accounts": [],
+        "x_queries": ["ON Semiconductor"],
+        "internal_read_cap_per_route": 10,
+    }
+    (fake_skill / "config" / "ON.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (fake_skill / "references" / "on-rules.md").write_text("# ON\n", encoding="utf-8")
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments.get("operation") == "read":
+            doc_id = arguments.get("document")
+            text = (
+                "Congratulations on another great weekend to everyone on our team."
+                if doc_id == "doc-noise"
+                else "Update on $ON SiC margin outlook."
+            )
+            return {"ok": True, "status": "ok", "data": {"content": text, "next_offset": None}}
+        route = arguments.get("route")
+        if route == "tmtb":
+            return {
+                "ok": True,
+                "data": {
+                    "results": [
+                        {"document_id": "doc-noise", "title": "Congratulations on another great weekend", "date": "2026-11-10"},
+                        {"document_id": "doc-hit", "title": "$ON guidance review", "date": "2026-11-10"},
+                    ],
+                    "has_more": False,
+                },
+            }
+        if route == "x-timeline":
+            return {
+                "ok": True,
+                "data": {
+                    "data": {
+                        "items": [
+                            {
+                                "id": "x-noise-on",
+                                "text": "Congratulations on another great weekend!",
+                                "created_at": "2026-11-10T12:00:00-05:00",
+                                "author_handle": "random_user",
+                                "metrics": {"likes": 500, "reposts": 50},
+                            },
+                            {
+                                "id": "x-oncall-noise",
+                                "text": "ON_CALL rotation starts Friday evening.",
+                                "created_at": "2026-11-10T12:02:00-05:00",
+                                "author_handle": "ops_user",
+                                "metrics": {"likes": 100, "reposts": 10},
+                            },
+                            {
+                                "id": "x-dollar-lower",
+                                "text": "Looking closely at $on production ramp.",
+                                "created_at": "2026-11-10T12:03:00-05:00",
+                                "author_handle": "analyst_y",
+                                "metrics": {"likes": 40, "reposts": 4},
+                            },
+                            {
+                                "id": "x-hit-on",
+                                "text": "Strong quarter from ON today.",
+                                "created_at": "2026-11-10T12:05:00-05:00",
+                                "author_handle": "analyst_x",
+                                "metrics": {"likes": 20, "reposts": 2},
+                            },
+                        ],
+                        "has_more": False,
+                    }
+                },
+            }
+        return {"ok": True, "data": {"results": [], "rows": []}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws-on", ticker="ON")
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="ON")
+    assert code == 0
+    packet = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert list(packet["internal"]["new"]) == ["doc-hit"]
+    assert "doc-noise" in packet["internal"]["irrelevant"]
+    assert set(packet["x"]["new"]) == {"x:x-hit-on", "x:x-dollar-lower"}
+    assert "x:x-oncall-noise" not in packet["x"]["new"]
+    assert packet["x"]["noise_ids"] == []
+
+    code_c, _ = _run(
+        capsys,
+        ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "s"],
+        ticker="ON",
+    )
+    assert code_c == 0
+    seen = set(_read_json(ws / "research" / "tracker" / "seen.json"))
+    assert {"x:x-hit-on", "x:x-dollar-lower"} <= seen
+    assert "x:x-noise-on" not in seen
+    assert "x:x-oncall-noise" not in seen
+    assert "doc-hit" in seen
+    assert "doc-noise" in seen
+
+
+def test_yfinance_import_error_and_company_timeout_with_benchmark_ok(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import builtins
+    import pandas as pd
+    import yfinance as yf
+
+    orig_import = builtins.__import__
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    _patch_bridge(
+        monkeypatch,
+        lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": [], "data": {"items": [], "has_more": False}}},
+    )
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    def fail_yf_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "yfinance":
+            raise ImportError("dlopen failed: symbol not found")
+        return orig_import(name, *args, **kwargs)
+
+    # 1) import yfinance error containing "not found": price=True -> price failure (no UnboundLocalError); calendar=True -> earnings_calendar failure
+    monkeypatch.setattr(builtins, "__import__", fail_yf_import)
+    price_only = collect_mod._fetch_configured_market_data(
+        "ANT", "QQQ", include_consensus=False, include_price=True, include_earnings_calendar=False
+    )
+    assert price_only["field_status"]["price"] == "error"
+    assert price_only["price"] == {"error": "dlopen failed: symbol not found"}
+    assert price_only["_meta"]["price_symbols"] == {
+        "ANT": "error: dlopen failed: symbol not found",
+        "QQQ": "error: dlopen failed: symbol not found",
+    }
+    assert collect_mod.failed_sources({}, {}, {}, {}, price_only, legacy_verbatim=False) == [
+        {"source": "price", "error": "dlopen failed: symbol not found"}
+    ]
+
+    cal_only = collect_mod._fetch_configured_market_data(
+        "ANT", "QQQ", include_consensus=False, include_price=False, include_earnings_calendar=True
+    )
+    assert cal_only["field_status"]["earnings_dates"] == "error"
+    assert cal_only["earnings_dates_error"] == "dlopen failed: symbol not found"
+    assert collect_mod.failed_sources({}, {}, {}, {}, cal_only, legacy_verbatim=False) == [
+        {"source": "earnings_calendar", "error": "dlopen failed: symbol not found"}
+    ]
+    monkeypatch.setattr(builtins, "__import__", orig_import)
+
+    # 2) Batch download where ANT times out (all NaN) while QQQ succeeds -> price failure, NO estimates failure
+    empty_stub = create_autospec(orig_ticker, instance=True)
+    empty_stub.earnings_estimate = pd.DataFrame()
+    empty_stub.revenue_estimate = pd.DataFrame()
+    empty_stub.eps_trend = pd.DataFrame()
+    empty_stub.eps_revisions = pd.DataFrame()
+    empty_stub.analyst_price_targets = {}
+    empty_stub.earnings_dates = pd.DataFrame()
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=empty_stub))
+
+    ant_timeout_df = pd.concat(
+        {
+            "Close": pd.DataFrame(
+                {"ANT": [float("nan"), float("nan")], "QQQ": [500.0, 505.0]},
+                index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+            )
+        },
+        axis=1,
+    )
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=ant_timeout_df))
+    ws_ant = _workspace(tmp_path / "ws-ant-to", ticker="ANT")
+    code_a, pay_a = _run(capsys, ["collect", "--workspace-dir", str(ws_ant), "--run-id", "20261110-2250"], ticker="ANT")
+    assert code_a == 0
+    assert [f["source"] for f in pay_a["failed_sources"]] == ["price"]
+    pk_a = _read_json(ws_ant / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert pk_a["consensus"]["_meta"]["price_symbols"] == {"ANT": "no_rows", "QQQ": "ok"}
+    assert pk_a["data_status"]["price"] == "error"
+
+    # 3) Company OK, benchmark missing -> succeeds with bench_chg_* = None
+    bench_missing_df = pd.concat(
+        {
+            "Close": pd.DataFrame(
+                {"ANT": [100.0, 105.0]},
+                index=pd.to_datetime(["2026-11-09", "2026-11-10"]),
+            )
+        },
+        axis=1,
+    )
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=bench_missing_df))
+    snap_ok = collect_mod._fetch_configured_market_data("ANT", "QQQ", include_consensus=False, include_price=True)
+    assert snap_ok["field_status"]["price"] == "ok"
+    assert snap_ok["price"]["chg_1d_pct"] == 5.0
+    assert snap_ok["price"]["bench_chg_1d_pct"] is None
+    assert snap_ok["_meta"]["price_symbols"] == {"ANT": "ok", "QQQ": "missing_column"}
+
+
+def test_non_legacy_minimal_config_price_error_renders_request_failed_in_md(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fake_skill = tmp_path / "skill"
+    for sub in ("config", "references"):
+        (fake_skill / sub).mkdir(parents=True)
+    # Non-legacy config WITHOUT explicit market switches in sources
+    cfg = {
+        "ticker": "ON",
+        "card": {
+            "title_prefix": "ON 跟踪",
+            "subtitle": "ON Semiconductor",
+            "tag": "ON",
+            "header_template": "blue",
+            "tag_color": "blue",
+        },
+    }
+    (fake_skill / "config" / "ON.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (fake_skill / "references" / "on-rules.md").write_text("# ON\n", encoding="utf-8")
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+    stub = create_autospec(orig_ticker, instance=True)
+    stub.earnings_estimate = pd.DataFrame()
+    stub.revenue_estimate = pd.DataFrame()
+    stub.eps_trend = pd.DataFrame()
+    stub.eps_revisions = pd.DataFrame()
+    stub.analyst_price_targets = {}
+    stub.earnings_dates = pd.DataFrame()
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, return_value=stub))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, return_value=pd.DataFrame()))
+    _patch_bridge(monkeypatch, lambda tool, args, timeout=120: {"ok": True, "data": {"results": [], "rows": []}})
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws-on-min", ticker="ON")
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="ON")
+    assert code == 0
+    md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert "- 历史行情：请求失败（" in md
+    assert "收盘 None" not in md
+
+
+@pytest.mark.parametrize("ticker", ["MSFT", "META", "AMZN", "GOOGL"])
+def test_legacy_four_tickers_ignore_explicit_sources_price_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ticker: str,
+) -> None:
+    import pandas as pd
+    import yfinance as yf
+
+    fix_dir = REPO_ROOT / "tests" / "unit" / "dalton" / "fixtures" / "bullbear_regression"
+    expected_json = (fix_dir / f"{ticker}.packet.json").read_text(encoding="utf-8")
+    expected_md = (fix_dir / f"{ticker}.packet.md").read_text(encoding="utf-8")
+
+    # Copy real config/references into tmp skill dir and inject sources.price=True
+    real_skill = collect_mod.SKILL_DIR
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "config").mkdir(parents=True)
+    (fake_skill / "references").mkdir(parents=True)
+    cfg = json.loads((real_skill / "config" / f"{ticker}.json").read_text(encoding="utf-8"))
+    cfg["x_accounts"] = ["ReviewAccount"]
+    cfg["research_keywords"] = ["ExtraIgnoreKw"]
+    cfg.setdefault("sources", {}).update(
+        {"price": True, "consensus": False, "earnings_calendar": False, "alphaengine": False}
+    )
+    (fake_skill / "config" / f"{ticker}.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (fake_skill / "references" / "common-rules.md").write_text("# common\n", encoding="utf-8")
+    (fake_skill / "references" / f"{ticker.lower()}-rules.md").write_text(f"# {ticker}\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    kw = cfg["alias_terms"][0]
+    ae_co = cfg["ae_company_names"][0]
+    period_ends = {
+        "MSFT": ("2027-06-30", "2028-06-30"),
+        "META": ("2026-12-31", "2027-12-31"),
+        "AMZN": ("2026-12-31", "2027-12-31"),
+        "GOOGL": ("2026-12-31", "2027-12-31"),
+    }
+    p0, p1 = period_ends[ticker]
+
+    seen_ae_queries: list[str] = []
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments.get("operation") == "read":
+            return {"ok": True, "status": "ok", "data": {"content": f"{kw} revenue growth update.\n", "next_offset": None}}
+        route = arguments.get("route")
+        if route == "tmtb":
+            return {"ok": True, "data": {"results": [{"document_id": f"tmtb:{ticker.lower()}-1", "title": f"{ticker} Note", "date": "2026-11-10", "keyword_hits": 2}], "has_more": False}}
+        if route in {"sales-notes", "funda-ai", "company-wiki"}:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        if route == "alphaengine":
+            seen_ae_queries.append(str(arguments.get("query") or ""))
+            return {"ok": True, "data": {"results": [{"doc_id": f"alphaengine:ae-{ticker.lower()}-1", "title": f"{ticker} AE Report", "companies": [ae_co], "publish_time": "2026-11-10"}], "has_more": False}}
+        if route == "sec":
+            if arguments.get("form") == "8-K":
+                return {"ok": True, "data": {"rows": [{"accession_no": "0000000001-26-000001", "form": "8-K", "filing_date": "2026-11-10"}]}}
+            return {"ok": True, "data": {"rows": []}}
+        if route == "x-timeline":
+            assert arguments.get("handle") != "reviewaccount"
+            if arguments.get("operation") == "search":
+                return {"ok": True, "data": {"data": {"items": [{"id": f"x-{ticker.lower()}-1", "text": f"${ticker} EPS and revenue beat", "created_at": "2026-11-10T12:00:00-05:00", "author_handle": "analyst1", "metrics": {"likes": 50, "reposts": 5, "replies": 1, "views": 100}}], "has_more": False}}}
+            return {"ok": True, "data": {"data": {"items": [], "has_more": False}}}
+        raise AssertionError(arguments)
+
+    def cons(sym: str, benchmark: str = "QQQ") -> dict[str, Any]:
+        assert sym == ticker
+        return {
+            "ok": True,
+            "status": "ok",
+            "fetched_at": FROZEN.isoformat(),
+            "currency": "USD",
+            "field_status": {"earnings_estimate": "ok", "revenue_estimate": "ok", "eps_trend": "ok", "eps_revisions": "ok", "price_targets": "ok", "price": "ok"},
+            "earnings_estimate": {
+                "0y": {"avg": 10.0, "period_end": p0, "currency": "USD", "numberOfAnalysts": 30},
+                "+1y": {"avg": 12.0, "period_end": p1, "currency": "USD", "numberOfAnalysts": 28},
+            },
+            "revenue_estimate": {
+                "0y": {"avg": 100e9, "period_end": p0, "currency": "USD", "numberOfAnalysts": 30},
+                "+1y": {"avg": 120e9, "period_end": p1, "currency": "USD", "numberOfAnalysts": 28},
+            },
+            "eps_trend": {"+1y": {"current": 12.0, "7daysAgo": 12.0}},
+            "eps_revisions": {"+1y": {"upLast7days": 1, "downLast7Days": 0}},
+            "price_targets": {"mean": 450.0},
+            "price": {"as_of": "2026-11-10", "close": 400.0, "chg_1d_pct": 1.2, "chg_5d_pct": 2.5, "benchmark": benchmark, "bench_chg_1d_pct": 0.4, "bench_chg_5d_pct": 1.0},
+        }
+
+    orig_configured = collect_mod._fetch_configured_market_data
+    forbid_configured = create_autospec(
+        orig_configured,
+        side_effect=AssertionError("legacy four must not route through _fetch_configured_market_data"),
+    )
+    monkeypatch.setattr(collect_mod, "_fetch_configured_market_data", forbid_configured)
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, cons)
+
+    ws = _workspace(tmp_path / f"ws-{ticker}", ticker=ticker)
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker=ticker)
+    assert code == 0
+    assert len(seen_ae_queries) == 2
+    assert forbid_configured.call_count == 0
+    actual_json = (ws / "research" / "tracker" / "20261110-2250" / "packet.json").read_text(encoding="utf-8")
+    actual_md = (ws / "research" / "tracker" / "20261110-2250" / "packet.md").read_text(encoding="utf-8")
+    assert actual_json == expected_json
+    assert actual_md == expected_md
+
+    # Verify request sequence with real _g.fetch_consensus_snapshot: Ticker consensus runs BEFORE download()
+    monkeypatch.setattr(collect_mod, "fetch_consensus_snapshot", collect_mod._DEFAULT_FETCH_CONSENSUS)
+    call_order: list[str] = []
+    orig_ticker = yf.Ticker
+    orig_download = yf.download
+
+    def track_ticker(sym: str) -> Any:
+        call_order.append("ticker")
+        stub = create_autospec(orig_ticker, instance=True)
+        stub.earnings_estimate = pd.DataFrame()
+        stub.revenue_estimate = pd.DataFrame()
+        stub.eps_trend = pd.DataFrame()
+        stub.eps_revisions = pd.DataFrame()
+        stub.analyst_price_targets = {}
+        return stub
+
+    def track_download(*args: Any, **kwargs: Any) -> Any:
+        call_order.append("download")
+        raise TimeoutError("download timeout")
+
+    monkeypatch.setattr(yf, "Ticker", create_autospec(orig_ticker, side_effect=track_ticker))
+    monkeypatch.setattr(yf, "download", create_autospec(orig_download, side_effect=track_download))
+    ws_seq = _workspace(tmp_path / f"ws-seq-{ticker}", ticker=ticker)
+    code_seq, pay_seq = _run(capsys, ["collect", "--workspace-dir", str(ws_seq), "--run-id", "20261110-2250"], ticker=ticker)
+    assert code_seq == 0
+    assert call_order[:2] == ["ticker", "download"]
+    assert [f["source"] for f in pay_seq["failed_sources"]] == ["estimates"]
+
+
+def test_short_dotted_ticker_pattern_requires_uppercase_bare_and_ignores_case_with_dollar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_skill = tmp_path / "skill"
+    for sub in ("config", "references"):
+        (fake_skill / sub).mkdir(parents=True)
+    cfg = {
+        "ticker": "BF.B",
+        "card": {
+            "title_prefix": "BF.B 跟踪",
+            "subtitle": "Brown-Forman Class B",
+            "tag": "BF.B",
+            "header_template": "blue",
+            "tag_color": "blue",
+        },
+        "sources": {
+            "internal_routes": [],
+            "sec_forms": [],
+            "alphaengine": False,
+            "consensus": False,
+            "price": False,
+            "earnings_calendar": False,
+            "x": True,
+            "news": False,
+        },
+        "x_accounts": [],
+        "x_queries": ["BF.B"],
+        "research_keywords": ["Brown-Forman"],
+    }
+    (fake_skill / "config" / "BF.B.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (fake_skill / "references" / "bf.b-rules.md").write_text("# BF.B\n", encoding="utf-8")
+    (fake_skill / "references" / "common-rules.md").write_text("# Common\n", encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "SKILL_DIR", fake_skill)
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments.get("route") == "x-timeline":
+            return {
+                "ok": True,
+                "data": {
+                    "data": {
+                        "items": [
+                            {"id": "bare-lower", "text": "bf.b slipped slightly today", "created_at": "2026-11-10T12:00:00-05:00", "author_handle": "a1", "metrics": {"likes": 10}},
+                            {"id": "underscore-hit", "text": "BF.B_CALL alert only", "created_at": "2026-11-10T12:01:00-05:00", "author_handle": "a2", "metrics": {"likes": 10}},
+                            {"id": "bare-upper", "text": "BF.B steady on volume", "created_at": "2026-11-10T12:02:00-05:00", "author_handle": "a3", "metrics": {"likes": 10}},
+                            {"id": "dollar-lower", "text": "Just added $bf.b today", "created_at": "2026-11-10T12:03:00-05:00", "author_handle": "a4", "metrics": {"likes": 10}},
+                            {"id": "dollar-upper", "text": "Watching $BF.B closely", "created_at": "2026-11-10T12:04:00-05:00", "author_handle": "a5", "metrics": {"likes": 10}},
+                            {"id": "alias-name", "text": "Brown-Forman raises outlook", "created_at": "2026-11-10T12:05:00-05:00", "author_handle": "a6", "metrics": {"likes": 10}},
+                        ],
+                        "has_more": False,
+                    }
+                },
+            }
+        return {"ok": True, "data": {"results": [], "rows": []}}
+
+    _patch_bridge(monkeypatch, bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+
+    ws = _workspace(tmp_path / "ws-bfb", ticker="BF.B")
+    code, _ = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"], ticker="BF.B")
+    assert code == 0
+    pk = _read_json(ws / "research" / "tracker" / "20261110-2250" / "packet.json")
+    assert set(pk["x"]["new"]) == {"x:bare-upper", "x:dollar-lower", "x:dollar-upper", "x:alias-name"}
+    assert "x:bare-lower" not in pk["x"]["new"]
+    assert "x:underscore-hit" not in pk["x"]["new"]
+    assert pk["x"]["noise_ids"] == []
+
+
+def test_top_level_routes_and_forms_from_a_main_era_config_are_still_read():
+    """A config written for origin/dalton/main keeps internal_routes / sec_forms at the top level."""
+    # Through the same filter the collector applies to the legacy four.
+    cfg = collect_mod._filter_legacy_config(
+        {"ticker": "MSFT", "internal_routes": ["tmtb", "wiki"], "sec_forms": ["8-K", "10-Q"]}
+    )
+    assert collect_mod._effective_internal_routes(cfg) == ["tmtb", "wiki"]
+    assert collect_mod._effective_sec_forms(cfg) == ["8-K", "10-Q"]
+    nested = collect_mod._filter_legacy_config(
+        {"ticker": "MSFT", "internal_routes": ["old"], "sources": {"internal_routes": ["new"], "sec_forms": ["4"]}}
+    )
+    assert collect_mod._effective_internal_routes(nested) == ["new"]
+    assert collect_mod._effective_sec_forms(nested) == ["4"]
+    # A new company never falls back to top-level lists: they are read from `sources` only.
+    ant = {"ticker": "ANT", "internal_routes": ["tmtb"], "sec_forms": ["8-K"], "sources": {"news": True}}
+    assert collect_mod._effective_internal_routes(ant) == []
+    assert collect_mod._effective_sec_forms(ant) == []
+
+
+def test_annual_period_pair_needs_the_same_end_date_not_just_the_same_month():
+    eps = {"+1y": {"period_end": "2027-12-31"}}
+    same_month = {"+1y": {"period_end": "2027-12-30"}}
+    same_day = {"+1y": {"period_end": "2027-12-31"}}
+    assert collect_mod._valid_annual_period_pair(eps, same_month, "+1y") is False
+    assert collect_mod._valid_annual_period_pair(eps, same_day, "+1y") is True
+
+
+def test_aliases_that_differ_only_in_case_from_each_other_are_both_kept():
+    pattern = collect_mod._aliases_pattern(
+        {"ticker": "BF.B", "research_keywords": ["Bf"], "alias_terms": ["BF"]}
+    )
+    assert pattern.search("Watching BF today")
+    assert pattern.search("$bf.b ramp")
+    assert not pattern.search("bf.b lowercase without dollar")

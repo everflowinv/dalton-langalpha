@@ -1,0 +1,87 @@
+{
+  "ticker": "SPCX",
+  "name": "SpaceX",
+  "aliases_regex": "\\bSPCX\\b|\\$SPCX|SpaceX|Starlink|星链|\\bxAI\\b|\\bGrok\\b|Starship|Falcon|Elon Musk|Colossus",
+  "alias_terms": [
+    "SpaceX",
+    "SPCX",
+    "xAI",
+    "Grok",
+    "Starlink",
+    "星链"
+  ],
+  "research_keywords": [
+    "SpaceX",
+    "SPCX",
+    "xAI",
+    "Grok",
+    "Starlink",
+    "星链"
+  ],
+  "internal_limit": 60,
+  "internal_read_cap_per_route": 12,
+  "excluded_documents": [],
+  "wiki_min_alias_hits": 2,
+  "ae_queries": [
+    "SpaceX SPCX xAI Grok Starlink",
+    "SpaceX 星链 算力 资本开支 估值"
+  ],
+  "ae_max_searches": 2,
+  "ae_company_names": [
+    "Space Exploration Technologies Corp.",
+    "Space Exploration Technologies",
+    "SpaceX",
+    "xAI"
+  ],
+  "news_queries": [
+    "SpaceX Starlink xAI Grok valuation revenue capex IPO news",
+    "SpaceX Starship Elon Musk xAI compute funding SEC 8-K news"
+  ],
+  "x_queries": [
+    "($SPCX OR SpaceX OR Starlink OR xAI) (revenue OR valuation OR capex OR compute OR Grok OR Colossus OR IPO OR estimates) min_faves:40 -filter:replies",
+    "(SpaceX OR Starlink OR \"Elon Musk\" OR xAI) (earnings OR margin OR launch OR subscribers OR GPU OR capex) min_faves:60 -filter:replies"
+  ],
+  "x_accounts": [
+    "elonmusk",
+    "xai",
+    "SpaceX",
+    "Starlink"
+  ],
+  "x_pool_max": 25,
+  "x_keep_max": 30,
+  "x_enrich_max": 20,
+  "sources": {
+    "internal": true,
+    "internal_routes": [
+      "sales-notes",
+      "tmtb"
+    ],
+    "alphaengine": true,
+    "sec": true,
+    "sec_forms": [
+      "8-K"
+    ],
+    "consensus": true,
+    "price": true,
+    "earnings_calendar": true,
+    "news": true,
+    "x": true
+  },
+  "model": {},
+  "thresholds": {
+    "fy1_eps_vs_last_run_pct": 1.0,
+    "fy1_eps_vs_7d_pct": 2.0,
+    "fy1_rev_vs_last_run_pct": 0.7,
+    "pt_mean_vs_last_run_pct": 2.0,
+    "fy1_down_revisions_7d": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0
+  },
+  "card": {
+    "title_prefix": "📈 SPCX 跟踪｜",
+    "subtitle": "SpaceX · 多空观点、盈利预测修正与催化剂",
+    "tag": "SPCX",
+    "header_template": "turquoise",
+    "tag_color": "turquoise"
+  }
+}
