@@ -150,13 +150,16 @@ async def test_live_order_tools_are_not_bound_for_the_turn(monkeypatch):
         await direct_tools.prepare_direct_mcp_tools(
             user_id="u", workspace_id="w", grants={"moomoo": "g"}, by_server=by_server
         )
-    assert seen["moomoo"] == ["sim_trade_input_order", "account_funds"]
+    # DALTON-HOOK(hide-trading): Dalton also excludes all order tools (including sim_trade_input_order).
+    assert seen["moomoo"] == ["account_funds"]
 
     with standing_under(ALLOW_ALL):
         await direct_tools.prepare_direct_mcp_tools(
             user_id="u", workspace_id="w", grants={"moomoo": "g"}, by_server=by_server
         )
-    assert {"trading_order_place", "a_tool_added_later"} <= set(seen["moomoo"])
+    assert "a_tool_added_later" in seen["moomoo"]
+    assert "trading_order_place" not in seen["moomoo"]
+    assert "sim_trade_input_order" not in seen["moomoo"]
 
 
 async def test_a_turn_without_live_order_tools_does_not_ask(monkeypatch):
@@ -212,26 +215,22 @@ async def test_a_paper_order_call_does_not_ask(monkeypatch):
 
 async def test_connecting_with_live_orders_is_refused_and_without_is_not():
     from src.server.services.mcp_oauth import connect
+    from src.server.services.mcp_saves import BROKERAGE_DISABLED_DETAIL
 
+    # DALTON-HOOK(hide-trading): Dalton disables all brokerage OAuth sign-ins regardless of capabilities.
     with (
         patch("src.server.services.account.require_policy", new_callable=AsyncMock, return_value=NO_TRADING),
         patch.object(connect, "oauth_http_client", side_effect=RuntimeError("dialled")),
     ):
-        with pytest.raises(HTTPException) as refused:
-            await connect.start_sign_in(
-                "u", "moomoo", "https://mcp.moomoo.com/mcp",
-                return_to=None, web_origin=None, loopback_redirect=None,
-                granted_capabilities=["account", "trading"],
-            )
-        # Past the policy, the flow goes on to dial the vendor.
-        with pytest.raises(RuntimeError, match="dialled"):
-            await connect.start_sign_in(
-                "u", "moomoo", "https://mcp.moomoo.com/mcp",
-                return_to=None, web_origin=None, loopback_redirect=None,
-                granted_capabilities=["account", "paper_trading"],
-            )
-    assert refused.value.status_code == 403
-    assert refused.value.detail["rule"] == TRADING
+        for caps in (["account", "trading"], ["account", "paper_trading"]):
+            with pytest.raises(HTTPException) as refused:
+                await connect.start_sign_in(
+                    "u", "moomoo", "https://mcp.moomoo.com/mcp",
+                    return_to=None, web_origin=None, loopback_redirect=None,
+                    granted_capabilities=caps,
+                )
+            assert refused.value.status_code == 403
+            assert refused.value.detail == BROKERAGE_DISABLED_DETAIL
 
 
 def _row(level: TradingPermission | None):
@@ -259,23 +258,15 @@ def _row(level: TradingPermission | None):
 async def test_the_trading_permission_cannot_be_raised(current, requested, refused):
     from src.server.app import trading_permission as route
 
+    # DALTON-HOOK(hide-trading): Dalton locks trading permission to NO_TRADING and refuses all updates (403).
     body = route.TradingPermissionUpdate(
         level=requested, agreement_version=TRADING_AGREEMENT_VERSION
     )
-    saved = AsyncMock(return_value=_row(requested))
-    with (
-        patch("src.server.services.account.require_policy", new_callable=AsyncMock, return_value=NO_TRADING),
-        patch.object(route, "get_trading_permission_row", AsyncMock(return_value=_row(current))),
-        patch.object(route, "set_trading_permission", saved),
-    ):
-        if refused:
-            with pytest.raises(HTTPException) as e:
-                await route.update_trading_permission(body, "u")
-            assert e.value.status_code == 403 and e.value.detail["rule"] == TRADING
-            saved.assert_not_awaited()
-        else:
+    with patch("src.server.services.account.require_policy", new_callable=AsyncMock, return_value=NO_TRADING):
+        with pytest.raises(HTTPException) as e:
             await route.update_trading_permission(body, "u")
-            saved.assert_awaited_once()
+        assert e.value.status_code == 403
+        assert "Trading permissions are disabled in Dalton" in str(e.value.detail)
 
 
 async def test_nothing_configured_reads_nothing_at_the_relay():

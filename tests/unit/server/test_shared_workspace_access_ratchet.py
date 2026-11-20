@@ -62,6 +62,11 @@ OWNER_ONLY_SITES: dict[tuple[str, str, str], str] = {
     ("src/server/app/workspaces.py", "cancel_workspace_move", "require_workspace_owner"): _COMPUTER,
     ("src/server/app/workspaces.py", "set_workspace_always_on", "require_workspace_owner"): _COMPUTER,
     ("src/server/app/workspaces.py", "set_workspace_spec", "require_workspace_owner"): _COMPUTER,
+    # DALTON-HOOK(colleague-dispatch): Supabase-mode bridge helpers that route
+    # shared-workspace holder threads through thread_access and fall back to
+    # require_thread_owner only for personal/colleague threads.
+    ("src/server/app/threads/crud.py", "_authorize_thread_write", "require_thread_owner"): _PERSONAL,
+    ("src/server/app/threads/sharing.py", "_authorize_thread_share", "require_thread_owner"): _PERSONAL,
 }
 
 

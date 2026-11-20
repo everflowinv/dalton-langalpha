@@ -1127,14 +1127,31 @@ async def maybe_publish_data_job_monitor(
 
 
 async def _authorize_grant(grant_token: str) -> tuple[MonitorRecord, str]:
+    from src.server.services import account as accounts
+
     try:
         verified = await verify_monitor_grant(grant_token)
     except MonitorGrantError:
         raise HTTPException(status_code=403, detail="监控面板授权无效或已过期") from None
 
+    if (
+        await accounts.read_standing(verified.user_id, unknown_on_cache_error=True)
+    ).suspended:
+        raise HTTPException(status_code=403, detail="监控面板授权无效或已过期")
+
     monitor = await monitor_db.get_monitor_by_id(verified.monitor_id)
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
+
+    if (
+        not is_company_system_user(monitor.owner_user_id)
+        and (
+            await accounts.read_standing(
+                monitor.owner_user_id, unknown_on_cache_error=True
+            )
+        ).suspended
+    ):
+        raise HTTPException(status_code=403, detail="监控面板授权无效或已过期")
 
     if monitor.acl_revision != verified.acl_revision:
         raise HTTPException(status_code=403, detail="监控面板权限已变更，授权已失效")

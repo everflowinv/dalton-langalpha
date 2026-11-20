@@ -8,7 +8,7 @@ commands, wakeups, approvals and thread status are the sender's.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -116,7 +116,9 @@ async def test_the_graph_redacts_the_owners_vault_and_reads_the_senders_profile_
             session=session, config=MagicMock(), user_id=SENDER, owner_id=OWNER,
             project=ProjectContext(WORKSPACE, "a"),
         )
-    vault.assert_awaited_once_with(OWNER)
+    # DALTON-HOOK(colleague-dispatch): when owner is not a shared-workspace
+    # holder, Dalton also reads the sender's vault secrets for leak detection.
+    assert vault.await_args_list == [call(OWNER), call(SENDER)]
     counts.assert_awaited_once_with(SENDER)
     built = agent.create_agent.call_args.kwargs
     assert (built["user_id"], built["owner_id"]) == (SENDER, OWNER)

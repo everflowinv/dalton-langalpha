@@ -259,52 +259,44 @@ async def test_a_key_redirected_to_another_host_is_recorded_by_host_only(
 # --- computers and trading ------------------------------------------------------
 
 
-async def test_the_trading_permission_change_is_recorded_from_and_to(insert, monkeypatch, in_org):
+async def test_the_trading_permission_change_is_recorded_from_and_to(insert, in_org):
+    from fastapi import HTTPException
+
     from src.server.app import trading_permission
     from src.server.services.trading_permission import TradingPermission
 
-    monkeypatch.setattr(
-        trading_permission, "set_trading_permission",
-        AsyncMock(return_value={
-            "level": "no_trading", "agreement_version": None, "agreed_at": None,
-            "updated_at": None, "previous_level": "approve_each",
-        }),
-    )
+    # DALTON-HOOK(hide-trading): Dalton forbids changing trading permission (403) and records no change.
     with patch(
         "src.server.services.account.policy_for", new_callable=AsyncMock, return_value=ALLOW_ALL
-    ):
+    ), pytest.raises(HTTPException) as exc:
         await trading_permission.update_trading_permission(
             trading_permission.TradingPermissionUpdate(level=TradingPermission.NO_TRADING), "u1"
         )
-    (row,) = await _rows(insert)
-    assert row["action"] == "trading.permission_changed"
-    assert row["detail"] == {"from": "approve_each", "to": "no_trading"}
+    assert exc.value.status_code == 403
+    assert await _rows(insert) == []
 
 
 @pytest.mark.parametrize("previous", ["no_trading", None], ids=["same", "never-chosen-default"])
 async def test_a_trading_permission_set_to_what_it_was_records_nothing(
-    insert, monkeypatch, in_org, previous
+    insert, in_org, previous
 ):
+    from fastapi import HTTPException
+
     from src.server.app import trading_permission
     from src.server.services.trading_permission import (
         DEFAULT_TRADING_PERMISSION,
         TradingPermission,
     )
 
+    # DALTON-HOOK(hide-trading): Dalton forbids changing trading permission (403) and records nothing.
     level = TradingPermission(previous) if previous else DEFAULT_TRADING_PERMISSION
-    monkeypatch.setattr(
-        trading_permission, "set_trading_permission",
-        AsyncMock(return_value={
-            "level": level.value, "agreement_version": None, "agreed_at": None,
-            "updated_at": None, "previous_level": previous,
-        }),
-    )
     with patch(
         "src.server.services.account.policy_for", new_callable=AsyncMock, return_value=ALLOW_ALL
-    ):
+    ), pytest.raises(HTTPException) as exc:
         await trading_permission.update_trading_permission(
             trading_permission.TradingPermissionUpdate(level=level), "u1"
         )
+    assert exc.value.status_code == 403
     assert await _rows(insert) == []
 
 

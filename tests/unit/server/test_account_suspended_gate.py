@@ -40,6 +40,7 @@ MESSAGE = (
 
 
 def _gated() -> set:
+    from src.dalton.app import transcriptions
     from src.server.app import livefs
 
     return {
@@ -50,6 +51,8 @@ def _gated() -> set:
         api.get_stamp_auth,
         get_principal,
         livefs._caller,
+        # DALTON-HOOK(dalton-auth): transcription routes admit session or task-ticket callers.
+        transcriptions._transcription_caller_gate,
     }
 
 
@@ -112,6 +115,46 @@ NO_USER_CREDENTIAL = {
     ("GET", "/api/v1/computers/ssh/pairings/{token}/key"),
     ("POST", "/api/v1/computers/ssh/pairings/{token}/report"),
     ("POST", "/api/v1/computers/ssh/pairings/{token}/tunnel"),
+    # DALTON-HOOK(invite-signup): pre-auth invite token validation and signup redemption.
+    ("POST", "/api/v1/dalton/invites/check"),
+    ("POST", "/api/v1/dalton/invites/redeem"),
+    # DALTON-HOOK(monitors): monitor grants check standing in _authorize_grant;
+    # public monitors are anonymous; internal monitor routes require X-Service-Token.
+    ("GET", "/api/v1/dalton/monitors/g/{grant}/v/{seq}/{path:path}"),
+    ("HEAD", "/api/v1/dalton/monitors/g/{grant}/v/{seq}/{path:path}"),
+    ("GET", "/api/v1/dalton/monitors/g/{grant}/data/{key}"),
+    ("GET", "/api/v1/dalton/monitors/public/{slug}"),
+    ("GET", "/api/v1/dalton/monitors/public/{slug}/data/{key}"),
+    ("GET", "/api/v1/dalton/monitors/public/{slug}/v/{seq}"),
+    ("HEAD", "/api/v1/dalton/monitors/public/{slug}/v/{seq}"),
+    ("GET", "/api/v1/dalton/monitors/public/{slug}/v/{seq}/"),
+    ("HEAD", "/api/v1/dalton/monitors/public/{slug}/v/{seq}/"),
+    ("GET", "/api/v1/dalton/monitors/public/{slug}/v/{seq}/{path:path}"),
+    ("HEAD", "/api/v1/dalton/monitors/public/{slug}/v/{seq}/{path:path}"),
+    ("PUT", "/api/v1/dalton/monitors/internal/{slug}/data/{key}"),
+    ("POST", "/api/v1/dalton/monitors/internal/data-jobs/{job_key}/publish"),
+    # DALTON-HOOK(dalton-notify): internal service-to-service routes guarded by X-Service-Token.
+    ("GET", "/api/v1/dalton/channels/internal/data-task-notifications/runs/{run_id}/artifacts/{artifact_id}"),
+    ("GET", "/api/v1/dalton/channels/internal/recover"),
+    ("GET", "/api/v1/dalton/channels/internal/state"),
+    ("GET", "/api/v1/dalton/channels/internal/weixin-state"),
+    ("GET", "/api/v1/dalton/internal/usage/by-model"),
+    ("POST", "/api/v1/dalton/channels/internal/automation-notifications/plan"),
+    ("POST", "/api/v1/dalton/channels/internal/automation-runs"),
+    ("POST", "/api/v1/dalton/channels/internal/automation-runs/{execution_id}/finish"),
+    ("POST", "/api/v1/dalton/channels/internal/bind-code/consume"),
+    ("POST", "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"),
+    ("POST", "/api/v1/dalton/channels/internal/data-task-notifications/plan"),
+    ("POST", "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"),
+    ("POST", "/api/v1/dalton/channels/internal/deliveries/progress"),
+    ("POST", "/api/v1/dalton/channels/internal/inbound/progress"),
+    ("POST", "/api/v1/dalton/channels/internal/inbound/register-and-resolve"),
+    ("POST", "/api/v1/dalton/channels/internal/session/command"),
+    ("POST", "/api/v1/dalton/channels/internal/steers/reconcile"),
+    ("POST", "/api/v1/dalton/internal/llm/complete"),
+    ("POST", "/api/v1/dalton/internal/model-availability/check"),
+    ("PUT", "/api/v1/dalton/channels/internal/settings"),
+    ("PUT", "/api/v1/dalton/channels/internal/weixin-state"),
 }
 
 
@@ -286,10 +329,12 @@ async def test_an_active_or_unknown_account_passes(account):
 
 
 @pytest.mark.asyncio
-async def test_the_token_kinds_are_refused_too():
+async def test_the_token_kinds_are_refused_too(monkeypatch):
     from src.server.auth.pats import PatPrincipal
     from src.server.services.cli_tokens import CliIdentity
 
+    # DALTON-HOOK(computer-cli-tokens-off): enable computer CLI tokens so the lac1 gate branch is exercised.
+    monkeypatch.setenv("DALTON_COMPUTER_CLI_TOKENS_ENABLED", "true")
     stack, _ = _deployment(SUSPENDED)
     with stack:
         stack.enter_context(
@@ -630,12 +675,14 @@ async def test_an_owner_artifact_grant_ends_with_the_account(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("account", "recorded"), [(SUSPENDED, False), (NO_ORG, True)])
-async def test_a_refused_computer_call_is_recorded_nowhere(account, recorded):
+async def test_a_refused_computer_call_is_recorded_nowhere(account, recorded, monkeypatch):
     import asyncio
 
     from src.server.services import cli_calls
     from src.server.services.cli_tokens import CliIdentity
 
+    # DALTON-HOOK(computer-cli-tokens-off): enable computer CLI tokens so lac1 call recording is exercised.
+    monkeypatch.setenv("DALTON_COMPUTER_CLI_TOKENS_ENABLED", "true")
     app = _app()
     app.add_middleware(cli_calls.CliCallRecorder)
     record = AsyncMock()

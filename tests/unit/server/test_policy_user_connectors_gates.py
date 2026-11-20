@@ -67,20 +67,23 @@ async def test_adding_an_own_server_is_refused_before_anything_is_checked(
 
 
 async def test_adding_one_at_a_brokerage_or_while_allowed_goes_on():
-    from src.server.services.mcp_saves import CatalogAdd
+    from src.server.services.mcp_saves import BROKERAGE_DISABLED_DETAIL, CatalogAdd
 
+    # DALTON-HOOK(hide-trading): Dalton refuses brokerage URLs with 403 before user_connectors is consulted.
     placed = AsyncMock()
     with patch("src.server.services.mcp_saves.refuse_unplaceable", placed):
-        with standing_under(NO_OWN) as asked:
+        with standing_under(NO_OWN) as asked, pytest.raises(HTTPException) as refused:
             await CatalogAdd(
                 "u", McpServerInput(name="mine", transport="http", url=BROKER_URL)
             ).refuse()
+        assert refused.value.status_code == 403
+        assert refused.value.detail == BROKERAGE_DISABLED_DETAIL
         asked.assert_not_awaited()
         with standing_under(ALLOW_ALL):
             await CatalogAdd(
                 "u", McpServerInput(name="acme", transport="http", url=OWN_URL)
             ).refuse()
-    assert placed.await_count == 2
+    assert placed.await_count == 1
 
 
 # --- importing ---------------------------------------------------------------
@@ -233,7 +236,9 @@ async def test_connecting_one_is_refused_before_anything_is_dialled(policy, stat
 
 async def test_connecting_a_brokerage_goes_on():
     from src.server.services.mcp_oauth import connect
+    from src.server.services.mcp_saves import BROKERAGE_DISABLED_DETAIL
 
+    # DALTON-HOOK(hide-trading): Dalton refuses brokerage OAuth connects with 403 before start_sign_in.
     started = AsyncMock()
     with (
         standing_under(NO_OWN),
@@ -241,9 +246,12 @@ async def test_connecting_a_brokerage_goes_on():
             connect, "get_catalog_server", AsyncMock(return_value=_catalog_row(BROKER_URL))
         ),
         patch.object(connect, "start_sign_in", started),
+        pytest.raises(HTTPException) as refused,
     ):
         await connect.start_connect("u", "moomoo")
-    started.assert_awaited_once()
+    assert refused.value.status_code == 403
+    assert refused.value.detail == BROKERAGE_DISABLED_DETAIL
+    started.assert_not_awaited()
 
 
 # --- a plugin ----------------------------------------------------------------
@@ -321,8 +329,10 @@ async def test_the_fan_out_reports_withheld_servers_and_leaves_the_install_recon
     by_key = {c.key: c for c in report.components}
     assert (by_key["acme"].status, by_key["acme"].withheld) == ("skipped", True)
     assert (by_key["local"].status, by_key["local"].withheld) == ("skipped", True)
-    assert by_key["my_broker"].status == "created", by_key["my_broker"].reason
-    assert created.await_count == 1
+    # DALTON-HOOK(hide-trading): brokerage URLs are rejected by run_mcp_import in Dalton.
+    assert by_key["my_broker"].status == "error", by_key["my_broker"].reason
+    assert by_key["my_broker"].reason == mcp_import.BROKERAGE_IMPORT_REFUSAL
+    assert created.await_count == 0
     # Lifting the rule must still find the package worth reconciling.
     assert not report.landed_whole
 
