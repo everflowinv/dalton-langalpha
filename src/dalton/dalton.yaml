@@ -78,7 +78,7 @@ models:
     deepseek: "deepseek-flash"
     z-ai: "glm-5.3-flash"
     openai: "gpt-6-luna"
-    gemini: "gemini-4-argon"
+    gemini: "gemini-4-neon"
 
 budget:
   # Default daily cap USD when user has not saved a DB row yet (null = fail-closed,
