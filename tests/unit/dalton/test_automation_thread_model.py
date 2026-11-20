@@ -909,11 +909,10 @@ def _subagent_runs_columns() -> set[str]:
                     "FOREIGN",
                 }:
                     cols.add(word)
-        cols.update(
-            re.findall(
-                r"ALTER TABLE subagent_runs ADD COLUMN IF NOT EXISTS ([a-z_]+)", text
-            )
-        )
+        if "subagent_runs" in text:
+            # Some migrations loop over several tables (``ALTER TABLE {table}``),
+            # so take every added column in a file that names the table.
+            cols.update(re.findall(r"ADD COLUMN IF NOT EXISTS ([a-z_]+)", text))
     return cols
 
 
@@ -930,6 +929,9 @@ def test_subagent_runs_query_uses_existing_columns():
         "task_id",
         "parent_run_id",
         "started_at",
+        "usage_settled_at",
+        "user_id",
+        "in_flight_credits",
     } <= cols
     assert "created_at" not in cols
     used = set(
