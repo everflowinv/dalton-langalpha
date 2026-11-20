@@ -55,6 +55,11 @@ TTL_TODAY_EMPTY_S = 30 * 60
 TTL_RECENT_7D_S = 12 * 3600
 TTL_OLDER_S = 7 * 86400
 STALE_RETENTION_S = 7 * 86400
+# The AlphaEngine MCP keeps search cursors in memory for 15 minutes (server.mjs
+# SEARCH_CURSOR_TTL_MS). A cached page that has more results carries one of those
+# cursors, so past this age a hit would hand the caller a dead cursor and page 2
+# fails with E_CURSOR_EXPIRED (seen 2026-11-20). Such hits are treated as misses.
+CURSOR_SAFE_AGE_S = 12 * 60
 
 DEFAULT_MAX_ROWS = 10_000
 CLEANUP_EVERY_WRITES = 50
@@ -705,6 +710,28 @@ def _locate_search_results_containers(
     return matches[0] if matches else (None, None, None)
 
 
+def payload_has_live_cursor(payload: dict[str, Any], *, op: str) -> bool:
+    """Whether a cached page says it has more results and carries a cursor for them."""
+    _, has_more = extract_result_metrics(payload, op=op)
+    if not has_more:
+        return False
+    return any(
+        container.get("cursor") not in (None, "", [], {})
+        for container, _, _ in _locate_all_search_results_containers(payload, op=op)
+    )
+
+
+def strip_cursor(payload: dict[str, Any], *, op: str) -> dict[str, Any]:
+    """A copy of *payload* with its page cursor removed (a stale copy cannot page on)."""
+    out = copy.deepcopy(payload)
+    for container, _, text_block in _locate_all_search_results_containers(out, op=op):
+        if "cursor" in container:
+            container["cursor"] = None
+            if text_block is not None:
+                text_block["text"] = json.dumps(container, ensure_ascii=False)
+    return out
+
+
 def extract_result_metrics(payload: dict[str, Any], *, op: str) -> tuple[int, bool]:
     """Return `(result_count, has_more)` from an unwrapped successful payload."""
     container, list_key, _ = _locate_search_results_containers(payload, op=op)
@@ -1049,6 +1076,13 @@ class AlphaEngineSearchCache:
 
                 payload_raw = json.loads(row[0])
                 if not isinstance(payload_raw, dict):
+                    return None, False
+
+                if (
+                    op == OP_SEARCH_LIBRARY
+                    and now - float(row[1]) >= CURSOR_SAFE_AGE_S
+                    and payload_has_live_cursor(payload_raw, op=op)
+                ):
                     return None, False
 
                 hit_note = ""

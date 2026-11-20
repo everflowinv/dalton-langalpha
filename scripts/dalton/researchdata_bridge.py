@@ -9178,9 +9178,11 @@ class ResearchDataBridge:
                 "stale": True,
                 "stale_reason": stale_reason,
             }
+            # A stale copy is served only when upstream is failing; its cursor is long
+            # dead in the MCP, so drop it rather than let the caller page into an error.
             return {
                 "ok": True,
-                "payload": stale_hit.payload,
+                "payload": _ae_cache.strip_cursor(stale_hit.payload, op=op),
                 "rpc_error": None,
                 "is_error": False,
                 "raw_text": "",

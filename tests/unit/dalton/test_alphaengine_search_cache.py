@@ -4738,3 +4738,34 @@ def test_p2_r5_gateway_long_escaped_json_error_parsed_before_truncation() -> Non
     assert len(raw) > 300
     flat = dg._page_error_text(raw)
     assert "无查看权限或额度已达上限" in flat
+
+
+def test_a_page_with_a_cursor_older_than_the_mcp_keeps_it_is_a_miss(tmp_path: Path) -> None:
+    """Regression (2026-11-20): a cached first page handed back a cursor the MCP had
+    already dropped (15-minute TTL), so page 2 failed with E_CURSOR_EXPIRED."""
+    now_box = [1000.0]
+    cache = ae_cache.AlphaEngineSearchCache(
+        tmp_path / "cursor.sqlite3", today_fn=lambda: "2026-11-20", now_fn=lambda: now_box[0]
+    )
+    common = dict(op=ae_cache.OP_SEARCH_LIBRARY, user_scope="team", req_limit=50, date_to="2026-11-20")
+    cache.put_sync(cache_key="more", base_key="b-more", result_count=50, has_more=True,
+                   payload=_ae_results_payload(50, has_more=True, cursor="ae1:abc"), **common)
+    cache.put_sync(cache_key="last", base_key="b-last", result_count=5, has_more=False,
+                   payload=_ae_results_payload(5), **common)
+
+    now_box[0] += ae_cache.CURSOR_SAFE_AGE_S - 1
+    assert cache.get_sync("more", "b-more", 50, op=ae_cache.OP_SEARCH_LIBRARY)[0] is not None
+
+    now_box[0] += 2
+    miss, degraded = cache.get_sync("more", "b-more", 50, op=ae_cache.OP_SEARCH_LIBRARY)
+    assert miss is None and not degraded
+    # A complete page (no more results, no cursor) still serves from cache.
+    assert cache.get_sync("last", "b-last", 50, op=ae_cache.OP_SEARCH_LIBRARY)[0] is not None
+
+
+def test_a_stale_copy_never_carries_a_cursor() -> None:
+    payload = _ae_results_payload(3, has_more=True, cursor="ae1:abc")
+    assert ae_cache.payload_has_live_cursor(payload, op=ae_cache.OP_SEARCH_LIBRARY)
+    stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_SEARCH_LIBRARY)
+    assert not ae_cache.payload_has_live_cursor(stripped, op=ae_cache.OP_SEARCH_LIBRARY)
+    assert ae_cache.payload_has_live_cursor(payload, op=ae_cache.OP_SEARCH_LIBRARY)  # original untouched
