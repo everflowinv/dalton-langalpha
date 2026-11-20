@@ -3,7 +3,8 @@
 Dalton containers never hold `GEMINI_API_KEY`; all embedding calls route over
 `host.docker.internal` to `scripts/dalton/researchdata_bridge.py` (`POST /embed`
 authenticated via request headers), which delegates to the host embedding
-configuration (`gemini-embedding-2`, 3072 dimensions).
+configuration (`gemini-embedding-2-preview` label, called as `gemini-embedding-2`,
+3072 dimensions).
 """
 
 from __future__ import annotations

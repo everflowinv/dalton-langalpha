@@ -43,7 +43,7 @@ See `config.example.json` for all available options:
 - **email_sources.priority_senders**: Names to flag as high-priority
 - **gmail.label_name / label_id**: Gmail label for marking processed emails
 - **output.discord_channel_id**: Discord channel for digest output (optional)
-- **embedding.model**: Gemini embedding model (`gemini-embedding-2`; the retired name `gemini-embedding-2-preview` is mapped to it at call time)
+- **embedding.model**: Gemini embedding model (`gemini-embedding-2-preview`, also the cache and index label; mapped to `gemini-embedding-2` at call time since the preview name was retired)
 - **sections**: Customizable digest sections
 
 ## OpenClaw Skill

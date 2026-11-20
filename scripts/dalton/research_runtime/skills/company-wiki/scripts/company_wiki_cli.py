@@ -238,8 +238,6 @@ def embed_texts(texts, model_name):
                     time.sleep(wait)
                 else:
                     raise
-        else:
-            raise RuntimeError(f"embedding rate-limited 5 times for texts {i}..{i + len(batch) - 1}")
 
     return embeddings
 
