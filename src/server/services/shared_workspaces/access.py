@@ -269,6 +269,24 @@ async def workspace_access(
     )
 
 
+async def _dalton_external_outside(meta: dict[str, Any], caller: str) -> bool:
+    """Under Dalton auth, whether an external member is asking about a thread
+    that is not theirs in their own workspace: such a thread answers 404 like
+    no thread, so its id says nothing (the rule ``require_thread_owner`` keeps)."""
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+
+    if not is_dalton_supabase_auth_enabled():
+        return False
+    from src.dalton.sharing import get_user_tier
+
+    if await get_user_tier(caller) != "external":
+        return False
+    if str(meta.get("user_id")) != str(caller):
+        return True
+    ws_owner = meta.get("workspace_owner_id")
+    return bool(ws_owner) and str(ws_owner) != str(caller)
+
+
 async def thread_access(
     thread_id: str,
     caller: str,
@@ -287,6 +305,9 @@ async def thread_access(
     if meta is None:
         raise _not_found("Thread")
     owner = meta["user_id"]
+    # DALTON-HOOK(colleague-dispatch): external members never learn of foreign threads (404, not 403), as require_thread_owner
+    if await _dalton_external_outside(meta, caller):
+        raise _not_found("Thread")
     if owner == caller:
         return Access(caller)
     if not is_holder(owner):
