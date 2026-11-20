@@ -12,8 +12,11 @@ import {
 import { useLocation, useNavigate } from 'react-router';
 import { useUser } from '@/hooks/useUser';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
+import { useOnboardingProgress } from '@/hooks/useOnboardingProgress';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { INTEGRATIONS_URL } from '@/config/supportLinks';
 import { isDesktopShell } from '@/lib/desktop';
+import { openAfterStamp } from './consoleHandOff';
 import {
   isPersonalizationSnoozed,
   subscribePersonalizationSnooze,
@@ -67,6 +70,22 @@ interface OnboardingContextValue {
   resetOnboarding: () => boolean;
   /** The user passed on the welcome flow: it never opens by itself again. */
   skipWelcome: () => void;
+  /** The chat apps prompt under a finished reply, in one thread. */
+  chatAppsPrompt: ChatAppsPrompt;
+}
+
+export interface ChatAppsPrompt {
+  /** Hosted only, for an account whose setup ran the answers flow, until the
+   *  user said Not now or opened the chat apps page. Whether a chat app is
+   *  linked is the card's to read. */
+  offered: boolean;
+  /** The one thread it shows in, once it has shown; null before. */
+  threadId: string | null;
+  /** Records the thread it first showed in. */
+  pin: (threadId: string) => void;
+  dismiss: () => void;
+  /** Opens the chat apps page, which completes that task. */
+  connect: () => void;
 }
 
 const OnboardingContext = createContext<OnboardingContextValue | null>(null);
@@ -78,6 +97,13 @@ export function useOnboarding(): OnboardingContextValue {
   return ctx;
 }
 
+/** The chat apps prompt, or null outside the provider (a page rendered on
+ *  its own), which offers none. */
+// eslint-disable-next-line react-refresh/only-export-components
+export function useChatAppsPrompt(): ChatAppsPrompt | null {
+  return useContext(OnboardingContext)?.chatAppsPrompt ?? null;
+}
+
 export function OnboardingProvider({ children }: { children: ReactNode }) {
   const { pathname, search, state } = useLocation();
   const navigate = useNavigate();
@@ -85,6 +111,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
   const {
     prefs,
     isLoading,
+    isLoaded,
     markPageIntroSeen,
     markTaskDone,
     dismissGettingStarted,
@@ -92,6 +119,8 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     setLastSeenReleaseVersion,
     ensureFirstRun,
     markWelcomeSkipped,
+    dismissChatAppsPrompt,
+    pinChatAppsPrompt,
     resetAll,
   } = useOnboardingPrefs();
 
@@ -379,6 +408,24 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
     };
   }, [prefs, onboardingCompleted, signals, thisMac.offered, isLoading, inWelcomeChat, dismissGettingStarted, markTaskDone]);
 
+  const { progress } = useOnboardingProgress({ enabled: !!INTEGRATIONS_URL });
+  const setupRan = !!progress?.setup_completed_at;
+  const chatAppsPrompt = useMemo<ChatAppsPrompt>(() => ({
+    offered:
+      !!INTEGRATIONS_URL &&
+      isLoaded &&
+      setupRan &&
+      prefs.chatAppsPromptDismissedAt === null &&
+      prefs.gettingStartedDoneAt.integrations == null,
+    threadId: prefs.chatAppsPromptThreadId,
+    pin: pinChatAppsPrompt,
+    dismiss: dismissChatAppsPrompt,
+    connect: () => {
+      if (!INTEGRATIONS_URL) return;
+      openAfterStamp(markTaskDone('integrations'), INTEGRATIONS_URL);
+    },
+  }), [isLoaded, setupRan, prefs, dismissChatAppsPrompt, pinChatAppsPrompt, markTaskDone]);
+
   useOnboardingOrchestrator({
     isLoading,
     phase,
@@ -407,6 +454,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       replayGuides,
       resetOnboarding,
       skipWelcome: markWelcomeSkipped,
+      chatAppsPrompt,
     }),
     [
       phase,
@@ -419,6 +467,7 @@ export function OnboardingProvider({ children }: { children: ReactNode }) {
       replayGuides,
       resetOnboarding,
       markWelcomeSkipped,
+      chatAppsPrompt,
     ]
   );
 

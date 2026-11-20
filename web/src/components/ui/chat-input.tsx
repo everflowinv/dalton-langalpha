@@ -38,6 +38,7 @@ import {
 import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
 import type { ModelRowStatus } from './chat-input.modelPicker';
 import { claudeCodeHold, isClaudeCodeModel } from '@/lib/claudeCode';
+import { useStepsHold } from '@/hooks/useClaudeCodeSteps';
 import { followErrorLink } from '@/lib/desktop';
 import { useMediumHold } from '@/pages/ChatAgent/hooks/useMediumAction';
 import { usePlanReader } from '@/hooks/useClaudeCodePlan';
@@ -1143,6 +1144,9 @@ function ChatInput({
   // A computer too small for Claude Code holds its models back with what gets
   // it to Medium, which picking one of them does.
   const mediumHold = useMediumHold(claudeCode.state === 'needs_bigger_computer' ? claudeCode.smallComputerId : null);
+  // For a user with no computer of their own, a hold the cloud steps clear
+  // says the step to take and opens the steps instead.
+  const stepsHold = useStepsHold(claudeCode, chiefOfStaff, selectedWorkspaceId, capabilities.claudeCode);
   const planReader = usePlanReader();
   const modelGroupList = useMemo(() => modelGroups({
     models: turn.models,
@@ -1168,6 +1172,7 @@ function ChatInput({
     }
     if (isClaudeCodeModel(modelMetadata[m])) {
       if (!capabilities.claudeCode) return { unavailable: t('sharedWorkspace.unavailable') };
+      if (stepsHold) return stepsHold;
       if (mediumHold) return mediumHold;
       const hold = claudeCodeHold(claudeCode.state, turn.workspaceId, {
         home: chiefOfStaff, cliComputerName: claudeCode.cliComputerName,

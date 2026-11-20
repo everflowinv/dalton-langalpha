@@ -18,7 +18,7 @@ import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 export function SubscriptionConnect({ state }: { state: LocationState }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const connected = useProviderConnected();
+  const connected = useProviderConnected(state.answering === true);
   const headingId = useId();
   const { isShared: isTeamShared, canManage } = useTeamCredentials();
   const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
@@ -53,7 +53,7 @@ export function SubscriptionConnect({ state }: { state: LocationState }) {
         </>
       )}
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { list: 'oauth' } }) }}
+        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { list: 'oauth', answering: state.answering } }) }}
         primary={null}
       />
     </div>
