@@ -9513,6 +9513,95 @@ def test_discord_native_interactions_session_command_and_recovery_unit(channel_t
     assert store.inbound_events[("discord", dual_mid)]["command_result"]["ok"] is True
 
 
+def test_suspended_user_workspace_command_returns_no_workspaces(
+    channel_test_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound Dalton user whose account is suspended is denied as unauthorized on /workspace."""
+    from src.server.services import account as account_svc
+    from src.server.services import membership as membership_svc
+    from src.server.services.account_contract import Account, Org
+
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    channel_test_env["writable_by_user"]["u-alice"] = {
+        "ws-1": "Alpha Workspace",
+        "ws-2": "Beta Workspace",
+    }
+
+    code_res = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "discord"}
+    )
+    assert code_res.status_code == 200
+    bind_res = client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "discord",
+            "platform_user_id": "dc_suspended_alice",
+            "code": code_res.json()["code"],
+            "is_group": False,
+        },
+    )
+    assert bind_res.status_code == 200 and bind_res.json()["ok"] is True
+    generations_before = copy.deepcopy(store.session_generations)
+
+    suspended = Account(org=Org("o-1", "Acme", suspended=True), features={"teams": True})
+    monkeypatch.setattr(
+        membership_svc,
+        "teams_door_open",
+        create_autospec(membership_svc.teams_door_open, return_value=True),
+    )
+    monkeypatch.setattr(
+        account_svc,
+        "read_standing",
+        create_autospec(
+            account_svc.read_standing,
+            return_value=account_svc.Standing(suspended, suspended),
+        ),
+    )
+
+    for payload in (
+        {
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_suspended_alice",
+            "chat_type": "dm",
+            "scope_key": "dm:dc_suspended_alice",
+            "is_internal_query": True,
+            "native_interaction": True,
+        },
+        {
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_suspended_alice",
+            "chat_type": "dm",
+            "chat_address": "discord:dm:dc_suspended_alice",
+            "scope_key": "dm:dc_suspended_alice",
+            "message_id": "msg_suspended_ws_1",
+            "request_key": str(uuid4()),
+            "native_interaction": True,
+        },
+    ):
+        res = client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=headers,
+            json=payload,
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is False
+        assert body["linked"] is False
+        assert body["allowed"] is False
+        assert body["deny_reason"] == "not_linked"
+        assert "workspaces" not in body
+        assert "suspended" not in json.dumps(body).lower()
+
+    assert store.session_generations == generations_before
+
+
 @pytest.mark.asyncio
 async def test_update_user_channel_settings_discord_channel_deliverable(
     channel_test_env,

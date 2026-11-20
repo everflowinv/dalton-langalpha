@@ -14,7 +14,7 @@ from src.server.models.command import (
 )
 from src.server.services.commands import control
 from src.server.dependencies.principal import ReadUserId, RunUserId
-from src.server.utils import api as auth_api
+from src.server.services.shared_workspaces.access import thread_access
 
 from ._deps import router
 
@@ -34,10 +34,16 @@ async def list_commands(
 
     if is_dalton_supabase_auth_enabled():
         from src.dalton.sharing import require_thread_access
+        from src.server.database.conversation import get_thread_auth_meta
+        from src.server.database.shared_workspaces import is_holder
 
-        await require_thread_access(thread_id, x_user_id, channel="web", need="read")
+        meta = await get_thread_auth_meta(thread_id)
+        if meta is not None and is_holder(meta["user_id"]):
+            await thread_access(thread_id, x_user_id, meta=meta)
+        else:
+            await require_thread_access(thread_id, x_user_id, channel="web", need="read")
     else:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        await thread_access(thread_id, x_user_id)
     rows = await cr_db.list_for_thread(thread_id, statuses=status, limit=limit)
     return CommandsResponse(
         thread_id=thread_id, commands=[CommandOut.model_validate(r) for r in rows]
@@ -54,7 +60,7 @@ async def stop_thread_command(
 
     ``stopped`` is False for one that had already ended; the row in the
     answer says how. 404 when the command is not this thread's."""
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    await thread_access(thread_id, x_user_id)
     result = await control.stop_thread_command(thread_id, command_id, by="user")
     if result.outcome == "not_found":
         raise HTTPException(status_code=404, detail="Command not found")

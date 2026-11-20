@@ -34,7 +34,7 @@ from src.dalton.services.transcriptions import (
     verify_transcription_ticket,
 )
 from src.dalton.settings import get_dalton_settings
-from src.server.utils.api import get_current_user_id, handle_api_exceptions
+from src.server.utils.api import admit_caller, get_current_user_id, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +51,56 @@ def _require_dalton_enabled() -> None:
         raise HTTPException(status_code=404, detail="Transcription is not enabled")
 
 
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+async def _transcription_caller_gate(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> None:
+    """Enforce account-suspension admission on every transcription route (ticket or session)."""
+    from src.dalton.company_identity import reject_company_system_auth
+
+    has_ticket, raw_ticket = _extract_ticket_from_request(request, credentials)
+    if has_ticket:
+        # `/usage` takes sessions only: refuse any ticket, valid or not, before verifying it,
+        # so an expired ticket still gets the endpoint's 403 rather than the verifier's 401.
+        if request.url.path.rstrip("/").endswith("/usage"):
+            raise HTTPException(
+                status_code=403,
+                detail="Task ticket cannot query aggregate usage reports",
+            )
+        claims = verify_transcription_ticket(raw_ticket)
+        ticket_uid = str(claims["user_id"])
+        reject_company_system_auth(ticket_uid)
+        await admit_caller(request, ticket_uid)
+        return
+
+    override = request.app.dependency_overrides.get(get_current_user_id)
+    if callable(override):
+        res = override()
+        if inspect.isawaitable(res):
+            res = await res
+        user_id = str(res or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        reject_company_system_auth(user_id)
+        await admit_caller(request, user_id)
+        return
+
+    user_id = await get_current_user_id(request, credentials)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    reject_company_system_auth(user_id)
+
+
 # A router dependency runs before FastAPI validates query and body parameters,
 # so a switched-off deployment answers 404 even to a malformed request.
 router = APIRouter(
     prefix="/api/v1/dalton/transcriptions",
     tags=["Dalton Transcriptions"],
-    dependencies=[Depends(_require_dalton_enabled)],
+    dependencies=[Depends(_require_dalton_enabled), Depends(_transcription_caller_gate)],
 )
-
-_optional_bearer = HTTPBearer(auto_error=False)
 
 
 class CreateOrSubmitTranscriptionRequest(BaseModel):
@@ -121,6 +162,7 @@ async def _resolve_caller_and_ticket(
         )
         ticket_uid = str(claims["user_id"])
         reject_company_system_auth(ticket_uid)
+        await admit_caller(request, ticket_uid)
         return ticket_uid, claims
 
     override = request.app.dependency_overrides.get(get_current_user_id)
@@ -129,11 +171,15 @@ async def _resolve_caller_and_ticket(
         if inspect.isawaitable(res):
             res = await res
         user_id = str(res or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        reject_company_system_auth(user_id)
+        await admit_caller(request, user_id)
     else:
         user_id = await get_current_user_id(request, credentials)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    reject_company_system_auth(user_id)
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        reject_company_system_auth(user_id)
     return user_id, None
 
 

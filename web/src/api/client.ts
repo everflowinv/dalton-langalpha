@@ -11,8 +11,10 @@
  * `response`. The error readers across the app were written against that
  * shape, so it is the contract here rather than an accident of the old client.
  */
+import { authSessionCheck } from '../lib/authResets';
 import { authGeneration, bearerTokenOf, getAccessToken, refreshAccessToken } from '../lib/authToken';
 import { trackRequest } from '../lib/reloadHolds';
+import { noteIfSuspended } from '../lib/accountSuspension';
 
 const baseURL: string = import.meta.env.VITE_API_BASE_URL ?? '';
 
@@ -258,6 +260,9 @@ async function send(
   const response: ApiResponse = { ...rest, headers: Object.fromEntries(rawHeaders) };
   const { status } = response;
   if (status >= 200 && status < 300) return response;
+  // Every route refuses a suspended account the same way: the shell turns
+  // the whole app into that one state rather than each caller failing alone.
+  if (status === 403) noteIfSuspended((response.data as { detail?: unknown } | null)?.detail);
   throw new ApiError(
     `Request failed with status code ${status}`,
     status >= 400 && status < 500 ? 'ERR_BAD_REQUEST' : 'ERR_BAD_RESPONSE',
@@ -281,6 +286,11 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
   }
   const target = buildUrl(url, config.params);
   let retried = false;
+  // The account the request was built for. A sign-out or an account switch
+  // during the token lookup leaves it nobody to go out as, and one during the
+  // send leaves a request that went out bare with no `sentAs` to compare, so
+  // this keeps it from going out, or being replayed, as the next account.
+  const sameSession = authSessionCheck();
 
   const attempt = async (): Promise<ApiResponse<T>> => {
     // Which user the request goes out as, so the 401 replay below can tell
@@ -295,6 +305,7 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
     } catch {
       /* proceed without auth */
     }
+    if (!sameSession()) throw new ApiError('canceled', 'ERR_CANCELED');
 
     try {
       return await send(method, target, headers, body, config);
@@ -313,7 +324,7 @@ async function request<T>(method: string, url: string, data: unknown, config: Re
       // trip and the switch can land inside it. The request still carries the
       // previous user's URL and body, so a replay stamped with the new user's
       // token is their mutation written to the new account.
-      const sameAccount = () => sentAs === undefined || sentAs === authGeneration();
+      const sameAccount = () => sameSession() && (sentAs === undefined || sentAs === authGeneration());
       if (!sameAccount()) throw e;
       retried = true;
       let token: string | null = null;

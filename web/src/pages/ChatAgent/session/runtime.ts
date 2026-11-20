@@ -31,10 +31,11 @@
 import type React from 'react';
 import type { QueryClient } from '@tanstack/react-query';
 import type {
-  SetMessages, TokenUsage, PendingInterrupt, OffloadBatch, SSEEvent,
+  SetMessages, TokenUsage, OffloadBatch, SSEEvent,
   TaskRefs, HistoryInterruptInfo, FallbackSuggestion, TurnStatus,
 } from './types';
 import type { CardUpdater } from './streamRefs';
+import type { PauseSlot } from './interrupts/pauseSlot';
 import type { SubagentHistoryStore } from './subagents/historyStore';
 import type { SubagentTokenUsage } from '../utils/tokenUsage';
 import type { NextSummary } from '../utils/api/messages';
@@ -152,7 +153,8 @@ export interface StreamRuntime {
   // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
   provenanceBuffer?: ProvenanceFrameBuffer;
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
-  setPendingInterrupt: React.Dispatch<React.SetStateAction<PendingInterrupt | null>>;
+  /** The pause the view shows (`pauseSlot.ts`). */
+  pause: PauseSlot;
   setTokenUsage: React.Dispatch<React.SetStateAction<TokenUsage | null>>;
   setNextSummary: React.Dispatch<React.SetStateAction<NextSummary | null>>;
   setMessageError: React.Dispatch<React.SetStateAction<string | StructuredError | null>>;
@@ -177,7 +179,6 @@ export interface StreamRuntime {
   // stable containers, ref-current reads — shared with other lanes
   threadIdRef: Ref<string>;
   lastEventIdRef: Ref<number | string | null>;
-  pendingInterruptIdsRef: Ref<Set<string>>;
   renderedInterruptIdsRef: Ref<Set<string>>;
   unresolvedHistoryInterruptRef: Ref<HistoryInterruptInfo[]>;
   terminalTaskOutcomesRef: Ref<Map<string, 'completed' | 'cancelled' | 'error'>>;
@@ -215,6 +216,7 @@ export interface RecoveryRuntime {
   setHasActiveSubagents: React.Dispatch<React.SetStateAction<boolean>>;
   setReloadTrigger: React.Dispatch<React.SetStateAction<number>>;
   setNextSummary: React.Dispatch<React.SetStateAction<NextSummary | null>>;
+  pause: PauseSlot;
   // stable containers, ref-current reads — owned by this lane
   isStreamingRef: Ref<boolean>;
   streamingThreadIdRef: Ref<string | null>;

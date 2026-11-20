@@ -762,10 +762,10 @@ class TestWebChannelEndpoints:
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1094,10 +1094,10 @@ class TestWebChannelEndpoints:
             create_autospec(ws_files_uploads.browser_uploads_enabled, return_value=False),
         )
         monkeypatch.setattr(
-            ws_files_uploads,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_uploads.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1551,10 +1551,10 @@ class TestChiefOfStaffChannel:
             ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )

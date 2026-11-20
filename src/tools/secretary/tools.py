@@ -531,8 +531,9 @@ async def threads_stop(
     from src.server.services.cancel_dispatch import cancel_workflow
 
     try:
+        # DALTON-HOOK(computer-cli-tokens-off): 跟上上游 cancel_workflow 的 by: Stopper 签名
         outcome = await cancel_workflow(
-            thread_id, run_id=run_id or None, by_user=False
+            thread_id, run_id=run_id or None, by="agent"
         )
     except Exception:
         # cancel_workflow logs the cause and raises it as a bare 500.
@@ -782,13 +783,15 @@ async def workspace_files_list_cos(
             ]
         else:
             owner_id = str(ws.get("user_id") or user_id)
+            from src.server.app.workspace_files._shared import RoutePaths
+
             async with acquire_sandbox_to_change(workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
                 files = await _live_listing(
                     sandbox,
-                    live_ws,
+                    RoutePaths.of(live_ws, owner_id),
                     path or ".",
                     "**/*",
                     False,

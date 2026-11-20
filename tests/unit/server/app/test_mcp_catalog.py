@@ -994,7 +994,7 @@ async def test_update_rediscovers_when_fingerprint_moves_and_consent_stays(clien
             new=refresh,
         ),
         patch(
-            "src.server.services.mcp_oauth.connect._resync_live_sandboxes",
+            "src.server.services.mcp_oauth.connect.resync_live_sandboxes",
             new=resync,
         ),
     ):
@@ -1130,7 +1130,7 @@ async def test_update_rediscovery_swallows_an_unusable_connection(client):
             new=refresh,
         ),
         patch(
-            "src.server.services.mcp_oauth.connect._resync_live_sandboxes",
+            "src.server.services.mcp_oauth.connect.resync_live_sandboxes",
             new=resync,
         ),
     ):

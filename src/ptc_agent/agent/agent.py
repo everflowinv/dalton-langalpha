@@ -174,7 +174,7 @@ from ptc_agent.config import AgentConfig
 from ptc_agent.config.agent import Admitted, TaskModel
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.sandbox import PTCSandbox
-from ptc_agent.core.sandbox.livefs_mount import CallContext
+from ptc_agent.core.sandbox.livefs_mount import CallContext, HistoryFiles
 from ptc_agent.agent.tools.command_handoff import HandOff
 
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
@@ -311,6 +311,8 @@ class PTCAgent:
         on_signed_url: Any | None = None,
         vault_secrets: dict[str, str] | None = None,
         user_id: str | None = None,
+        owner_id: str | None = None,
+        own_data: bool = True,
         user_data_counts: dict[str, Any] | None = None,
         tool_summary: str | None = None,
         disable_subagents: bool = False,
@@ -331,6 +333,7 @@ class PTCAgent:
         tail_turn_no_new_work: bool = False,
         computers: ComputerReach | None = None,
         claude_code_launcher: "Callable[..., Launcher] | None" = None,
+        thread_history: HistoryFiles | None = None,
         # DALTON-HOOK(team-memory-toggle): per-workspace / Home user-level Team Memory switch
         team_memory_enabled: bool = False,
         # DALTON-HOOK(research-writing): permanent Chinese research judgment and writing rules
@@ -347,9 +350,17 @@ class PTCAgent:
                 WriterGuard). None = no fence (single-writer deployment).
             thread_id: First 8 chars used as thread directory name under
                 ``.agents/threads/{id}/``.
-            user_id: First component of memory-namespace tuples. When ``None``,
-                memory is disabled entirely rather than falling back to a shared
-                namespace that would cross-pollinate unauthenticated sessions.
+            user_id: The turn's sender: whose commands, wakeups, approvals
+                and Claude Code session these are.
+            owner_id: The workspace's owner, the first component of the
+                memory-namespace tuples and whose files the file tools mount.
+                Without one, memory is disabled entirely rather than falling
+                back to a shared namespace that would cross-pollinate
+                unauthenticated sessions.
+            own_data: Whether the build may use the sender's own data (their
+                memory, memos, profile and automation files, workflows, chat
+                apps). False where other people read what the agent says and
+                steer it, as in a shared workspace.
             on_agent_md_write: Invalidates the Session's agent.md cache on write
                 and records the write's last-writer stamp.
             turn_context: What this turn knows about itself (when the previous
@@ -391,6 +402,11 @@ class PTCAgent:
                 turn's (``claude_code_admitted``), or its subagents' Claude
                 Code pins' on a turn of another model (``claude_code_pins``);
                 the server picks it, and the token it signs in with.
+            thread_history: The thread's own transcript, served to the file
+                tools in process where what serves the computer's past threads
+                leaves this thread out (a thread kept private in a shared
+                workspace); the agent's transcripts are saved and pointed at
+                there. Its subagents share it, as they share the computer's.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
@@ -424,6 +440,7 @@ class PTCAgent:
             sandbox,
             operation_callback=operation_callback,
             preview_owner=preview_owner,
+            history=thread_history,
         )
         # The one workspace root this build uses, read off the live computer
         # root plus the turn's folder rather than the config default.
@@ -445,7 +462,8 @@ class PTCAgent:
         folder_workspace_id = project.workspace_id if project else None
         gates = resolve_identity_gates(
             store=store,
-            user_id=user_id,
+            user_id=owner_id,
+            own_data=own_data,
             workspace_id=workspace_id_for_memory,
             disable_subagents=disable_subagents,
             channels=messaging_enabled(),
@@ -453,7 +471,7 @@ class PTCAgent:
         if store is not None and not gates.memory:
             logger.warning(
                 "memory disabled due to missing identity",
-                user_id_present=bool(user_id),
+                user_id_present=bool(owner_id),
                 workspace_id_present=bool(workspace_id_for_memory),
             )
 
@@ -468,11 +486,13 @@ class PTCAgent:
         # mount ever serves; where one may, its links show them instead.
         history = None if sandbox.mounts_livefs else sandbox.history
         history_routes = history.routes(backend) if history is not None else []
+        if thread_history is not None:
+            history_routes = [*history_routes, *thread_history.routes(backend)]
         filesystem_backend, baseline_store_sources = build_filesystem_backend(
             backend=backend,
             gates=gates,
             store=store,
-            user_id=user_id,
+            user_id=owner_id,
             workspace_id=workspace_id_for_memory,
             # DALTON-HOOK(colleague-dispatch): store routes belong to workspace owner
             **(
@@ -733,6 +753,7 @@ class PTCAgent:
             user_skills=self.config.user_skills,
             user_skill_dir=self.config.user_skill_dir,
             workspace_skill_dir=self.config.workspace_skill_dir,
+            withheld=self.config.withheld_skills,
         )
         # RunWorkflow is skill-gated: the run-workflow skill hides the tool from
         # model requests until the agent reads its SKILL.md. Drop the skill on
@@ -761,7 +782,9 @@ class PTCAgent:
             sources=skill_sources,
             known_skills=known_skills,
             skill_dirs=self.config.skills.local_skill_dirs(),
-            disabled_skills=self.config.disabled_skills,
+            # A shipped skill the registry does not know reaches the manifest
+            # through the filesystem scan, which only this set keeps it out of.
+            disabled_skills=self.config.disabled_skills | self.config.withheld_skills,
         )
         skill_loader_middleware = skills_middleware(
             skill_registry=skill_registry, inject_manifest=False
@@ -1299,7 +1322,8 @@ class PTCAgent:
                 thread_id=thread_id or "",
                 short_thread_id=short_thread_id,
                 store=store,
-                user_id=user_id,
+                # The workflow store the file tools mount (``workflow_fs``).
+                user_id=owner_id,
                 prebuilt_workflows=get_prebuilt_workflows(),
             )
             tools.append(run_workflow_tool)
@@ -1314,7 +1338,11 @@ class PTCAgent:
         # Messaging the user (send_message, list_message_targets), present only
         # when a channel gateway is configured. Main agent only, added after the
         # subagent snapshot: a subagent reports to its parent, never to a person.
-        tools.extend(build_messaging_tools(role, computers=reach))
+        # Never without the sender's own data: the tools act as the sender on
+        # their own chats, and in a shared workspace other members write what
+        # steers this agent.
+        if own_data:
+            tools.extend(build_messaging_tools(role, computers=reach))
 
         # The agent's own follow-ups on this thread, main agent only and
         # added after the subagent snapshot: a wakeup comes back to the

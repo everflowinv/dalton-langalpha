@@ -201,7 +201,8 @@
     "plugins": "插件",
     "orders": "订单",
     "menu": "菜单",
-    "search": "搜索研究 ({{shortcut}})"
+    "search": "搜索研究 ({{shortcut}})",
+    "library": "资料库"
   },
   "account": {
     "menuLabel": "账号菜单"
@@ -233,6 +234,7 @@
     "threadTurns": "轮次",
     "threadNeedsInput": "等待您的输入",
     "threadUnseen": "已完成，尚未查看",
+    "workspaceUnread": "有尚未查看的会话",
     "untitledThread": "未命名",
     "onComputer": "位于 {{name}} · {{kind}}",
     "noConversations": "暂无会话",
@@ -1846,6 +1848,7 @@
     "namePlaceholderCloud": "云端计算机",
     "namePlaceholderLocal": "本地计算机",
     "tierLabel": "计算机规格",
+    "tierAutomatic": "自动（跟随你的套餐）",
     "createDesc": "一台独立的计算机，有自己的文件。放在上面的工作区会随它一起启动和停止。",
     "planLimitedProvider": "需要当前套餐不包含的提供商？",
     "planLimitedBoth": "需要当前套餐不包含的提供商或规格？",
@@ -2013,6 +2016,7 @@
       "descRunning": "会先备份这台计算机上所有工作区的文件，再按新规格重建计算机并恢复文件。期间它上面的工作区会有几分钟不可用。",
       "descStopped": "会先备份这台计算机上所有工作区的文件。新规格在下次启动时生效，届时恢复文件。",
       "notKept": "已安装的软件包、缓存和正在运行的应用不会保留，Agent 会按需重新安装。",
+      "gitNotKept": "这台计算机上未推送的 git 提交、分支和 stash 不会保留。",
       "applying": "处理中...",
       "apply": "备份并更改规格",
       "current": "当前",
@@ -2346,7 +2350,9 @@
     "loadFailedBody": "加载过程中出了点问题，请稍后重试。",
     "retry": "重试",
     "signIn": "登录",
-    "goToLangAlpha": "前往 {{brand}}"
+    "goToLangAlpha": "前往 {{brand}}",
+    "membersOnlyTitle": "此链接仅对组织成员开放",
+    "membersOnlyBody": "请使用你的组织账号登录后打开。"
   },
   "publish": {
     "title": "发布 {{file}}",
@@ -3097,7 +3103,7 @@
       "claudeCodeNeedsBiggerComputerPlan": "需要中型及以上规格的云端计算机：可更改规格或升级 {{brand}} 套餐，或使用你自己的电脑",
       "claudeCodeNeedsMedium": "需要中型及以上的云端计算机。选择即可更改规格。",
       "claudeCodeNeedsMediumPlan": "需要中型及以上的云端计算机，当前套餐不含。选择即可升级套餐。",
-      "claudeCodeNeedsMediumResizing": "所在计算机正在改为中型。"
+      "claudeCodeNeedsMediumResizing": "所在计算机正在改为{{size}}。"
     },
     "voice": {
       "start": "开启语音输入",
@@ -3608,7 +3614,6 @@
       "tagResolved": "已解决",
       "tagQueued": "待发送",
       "tagNote": "笔记，未发送",
-      "you": "你",
       "agent": "Agent",
       "sentToAgent": "已发给 Agent",
       "working": "Agent 正在处理",
@@ -4813,7 +4818,6 @@
     "removeProvider": "移除",
     "addAnotherProviderHeading": "添加其他提供商",
     "addMoreProviders": "连接其他提供商以获取更多模型选择。",
-    "invitationRedeemed": "邀请码已兑换。你可以配置模型或添加提供商。",
     "invitationCodeLabel": "邀请码",
     "redeeming": "兑换中...",
     "redeem": "兑换",
@@ -4956,7 +4960,200 @@
     "xaiStep2Desc": "用你的 xAI 账号登录，并批准这里显示的代码。",
     "xaiStep3Title": "完成",
     "xaiStep3Desc": "批准后，本页面会自动识别。",
-    "usageCountsXai": "请求计入你的 SuperGrok 订阅额度，与在 Grok CLI 中使用时完全相同。"
+    "usageCountsXai": "请求计入你的 SuperGrok 订阅额度，与在 Grok CLI 中使用时完全相同。",
+    "answers": {
+      "fromYourAnswers": "根据你的回答",
+      "change": "修改",
+      "tag": {
+        "claude_code": "Claude Code",
+        "subscription_or_key": "订阅或 API key",
+        "langalpha_models": "LangAlpha 的模型",
+        "serverModels": "此服务器提供的模型",
+        "cloud": "云端计算机",
+        "serverComputer": "此服务器运行的计算机",
+        "own_computer": "你的计算机"
+      },
+      "rail": {
+        "use": "你的用途",
+        "computer": "计算机",
+        "model": "模型",
+        "default": "默认模型"
+      },
+      "use": {
+        "title": "你打算怎么使用 LangAlpha？",
+        "lead": "两个问题。后面的设置步骤按你的回答来定，之后也可以随时修改。",
+        "modelsLabel": "你想用哪些模型？",
+        "claudeCode": "你的 Claude 套餐，配合 Claude Code",
+        "claudeCodeDesc": "Pro 或 Max。Claude Code 用你的套餐运行，并使用 LangAlpha 的工具。",
+        "subscription": "其他订阅或 API key",
+        "subscriptionDesc": "ChatGPT、Grok、编程套餐，或任意服务商的 API key。",
+        "serverModels": "此服务器提供的模型",
+        "serverModelsDesc": "由你的管理员配置的模型。",
+        "whereLabel": "你的任务在哪里运行？",
+        "serverComputer": "在此服务器运行的计算机上",
+        "serverComputerDesc": "你的电脑关机时也能继续工作。",
+        "homeStays": "Home 会留在这台 Mac 上。可在设置中迁移。",
+        "own": "在你自己的计算机上",
+        "ownDesc": "你的 Mac，或任意可通过 SSH 连接的 Mac 或 Linux 计算机。",
+        "saveFailed": "你的回答没能保存，请重试。"
+      },
+      "computer": {
+        "title": "连接你的计算机",
+        "leadClaudeCode": "Claude Code 和你的任务都在这台计算机上运行。LangAlpha 以你选定的账户登录。",
+        "lead": "你的任务在这台计算机上运行。LangAlpha 以你选定的账户登录。",
+        "macDesktop": "配对这台 Mac 后，Home 和新工作区都会放在它上面。",
+        "continueOnMac": "在你的 Mac 上继续",
+        "pairThisMac": "配对这台 Mac",
+        "accountNote": "Agent 能做你所连接账户能做的任何事，所以请连接一个专门为它创建的账户，而不是你自己的。",
+        "onlineNote": "Home 会放在你连接的计算机上，你的对话也在那里运行，所以运行期间它需要保持开机并联网。",
+        "onlineNoteNamed": "Home 会放在 {{name}} 上，你的对话也在那里运行，所以运行期间它需要保持开机并联网。",
+        "noBackupNote": "不开启备份，这台计算机就不能设为你的默认计算机，所以 Home 和新工作区会放在云端计算机上。",
+        "macUpdateApp": "更新 LangAlpha 应用后即可配对这台 Mac。"
+      },
+      "ssh": {
+        "title": "通过 SSH 添加计算机",
+        "lead": "脚本让 LangAlpha 能够登录，并告知如何连接到这台计算机。本页会逐步显示进度。"
+      },
+      "model": {
+        "tokenTitle": "添加你的 Claude setup token",
+        "tokenForComputer": "用于 {{name}}。token 保存在那台计算机上，LangAlpha 不会保留。",
+        "tokenForCloud": "用于你的云端计算机。LangAlpha 会加密保存它，只用于为你的对话运行 Claude Code。",
+        "tokenForServer": "用于此服务器运行的计算机。LangAlpha 会加密保存它，只用于为你的对话运行 Claude Code。",
+        "replaceToken": "更换 token",
+        "planOutNote": "Claude 套餐用完后，Claude Code 的对话会等额度重置后再继续，除非你在设置中另行选择。不会改用其他模型。",
+        "subTitle": "连接你的订阅或 API key",
+        "subLead": "先选一个，之后可以在设置中添加更多。",
+        "saveDefaultFailed": "已连接，但没能设为默认模型。你可以在下一步选择它。",
+        "claudeCodeUnavailableTitle": "你暂时无法使用 Claude Code",
+        "claudeCodeUnavailableLead": "你的账户在这里无法使用 Claude Code，所以不需要添加 setup token。修改回答，改用其他模型。",
+        "withApiKey": "改用 API key 继续"
+      },
+      "default": {
+        "title": "选择你的模型",
+        "lead": "一个模型负责对话，另一个处理对话周边的工作。两者之后都可以在设置中随时更改。",
+        "recommended": "推荐",
+        "startChat": "开始对话",
+        "claudeCodeOn": "在 {{name}} 上运行的 Claude Code",
+        "claudeCodeOnCloud": "在你的云端计算机上运行的 Claude Code",
+        "none": "你目前还没有可用的模型，之后可以在设置中选择默认模型。",
+        "saveFailed": "默认模型没能保存，请重试。",
+        "recommendedSetup": "推荐配置",
+        "useRecommended": "使用推荐配置",
+        "customize": "自定义",
+        "intelligence": "智能",
+        "speed": "速度",
+        "rating": "{{label}}：{{value}}/5",
+        "why": {
+          "strongest": "在你的模型中智能评分最高。",
+          "strongestFastest": "在你的模型中智能评分最高，且是其中速度最快的。",
+          "deployment": "LangAlpha 模型的默认选择。",
+          "claudeCode": "适合任何 Claude 套餐。",
+          "fastestBackground": "你其他模型中速度最快的，正适合后台任务。",
+          "onlyBackground": "你唯一能运行后台任务的模型。",
+          "deploymentBackground": "LangAlpha 模型的后台默认选择。",
+          "claudeCodeBackground": "Claude Code 只运行对话，因此后台任务在 {{model}} 上运行。",
+          "claudeCodeCreditsBackground": "Claude Code 只运行对话，因此后台任务在 LangAlpha 的 {{model}} 上运行，会消耗你的 credits。"
+        },
+        "settingUp": {
+          "title": "正在为你完成设置",
+          "models": "保存你的模型",
+          "home": "准备 Home",
+          "finish": "完成设置",
+          "done": "设置已完成"
+        }
+      },
+      "saveFailed": "这一步没能保存，请重试。",
+      "changeAnswers": "修改我的回答",
+      "loadFailed": "这一步没能加载。",
+      "tryAgain": "重试"
+    },
+    "mac": {
+      "kicker": "你的 Mac",
+      "get": {
+        "title": "在你的 Mac 上继续",
+        "lead": "Mac 应用一步就能配对你的 Mac，剩下的设置也在那里继续。",
+        "step1": "下载 LangAlpha Mac 应用",
+        "download": "下载 Mac 应用",
+        "step2": "打开它，并以 {{email}} 登录",
+        "step2Unnamed": "打开它，并用同一个账户登录",
+        "step3": "配对这台 Mac，并在那里点几下完成设置"
+      },
+      "waiting": {
+        "title": "在 Mac 上的 LangAlpha 应用中完成设置",
+        "lead": "用同一个账户登录，应用会从这里接着进行。",
+        "artOs": "macOS",
+        "artStatus": "等待应用",
+        "artLabel": "你的 Mac，正在等待 LangAlpha 应用",
+        "live": "等待你在 Mac 上登录应用…"
+      },
+      "moved": {
+        "title": "设置已转到你的 Mac 上",
+        "lead": "你正在 {{name}} 上的 LangAlpha 应用中完成设置。",
+        "leadUnnamed": "你正在 Mac 上的 LangAlpha 应用中完成设置。",
+        "yourMac": "你的 Mac",
+        "open": "设置正在 LangAlpha 应用中进行",
+        "note": "你在 Mac 上完成后，这个标签页会跳到你的第一段对话。你也可以直接关闭它。"
+      },
+      "continueHere": "改为在这里继续"
+    },
+    "thisMac": {
+      "kicker": "登录之后",
+      "ask": {
+        "title": "要在 LangAlpha 中使用这台 Mac 吗？",
+        "lead": "配对后，LangAlpha 就能在这里运行你的任务。",
+        "leadHome": "配对后，Home 和新工作区都会放在这台 Mac 上。"
+      },
+      "art": {
+        "thisMac": "这台 Mac",
+        "notPaired": "未配对"
+      },
+      "point": {
+        "run": "你的任务和 Claude Code 可以在这台 Mac 上运行，没有规格限制。",
+        "closed": "无论应用是否打开都能工作，只要 Mac 处于唤醒并联网状态。",
+        "off": "随时可以在 LangAlpha 菜单中关闭。"
+      },
+      "account": "Agent 可以以 {{account}}（你当前使用的 macOS 账户）的身份运行命令并修改文件。",
+      "accountUnnamed": "Agent 可以以你当前使用的 macOS 账户的身份运行命令并修改文件。",
+      "notNow": "暂不",
+      "pairing": {
+        "title": "正在配对这台 Mac",
+        "lead": "应用会自己完成每一步，你只需回应 macOS 的提示。"
+      },
+      "step": {
+        "on": "远程控制已开启",
+        "loginItems": "在登录项中允许 LangAlpha",
+        "loginItemsDetail": "macOS 拦下了让你的 Mac 保持可连接的 LangAlpha 组件，允许一次即可。",
+        "loginItemsPath": "系统设置 → 通用 → 登录项",
+        "pairing": "配对",
+        "pairingDetail": "正在配对… {{elapsed}}。如果 80 秒内没有完成，我们会在这里提示，你可以再试一次。"
+      },
+      "openLoginItems": "打开登录项",
+      "timeout": "配对没有在 80 秒内完成，请再试一次。",
+      "paired": {
+        "title": "这台 Mac 已配对",
+        "home": "Home 和新工作区都会放在这台 Mac 上。",
+        "homeMoving": "Home 正在迁移到这台 Mac。云端计算机会保留，在 Mac 睡眠时接替工作。",
+        "homeMovingFromMachine": "Home 正在从 {{name}} 迁移到这台 Mac。"
+      }
+    },
+    "continueMac": {
+      "kickerNotPaired": "这台 Mac 尚未配对",
+      "title": "要在这台 Mac 上继续设置吗？",
+      "leadPaired": "从你在浏览器中停下的地方继续。还剩这些：",
+      "leadNotPaired": "你可以稍后在“计算机”中配对。从你在浏览器中停下的地方继续。还剩这些：",
+      "left": {
+        "computer": "一台运行任务的计算机",
+        "tokenThisMac": "这台 Mac 的 Claude setup token",
+        "token": "你的 Claude setup token",
+        "subscription": "你的订阅或 API key",
+        "default": "你的默认模型",
+        "invest": "几个关于你投资方式的问题",
+        "firstChat": "你的第一段对话"
+      },
+      "note": "无论选哪种，浏览器标签页和这个应用都会显示相同的进度。",
+      "inBrowser": "我在浏览器中完成",
+      "here": "在这里继续"
+    }
   },
   "marketView": {
     "pageHeading": "{{symbol}} 行情",
@@ -5569,6 +5766,12 @@
         "unreadable": "无法读取 {{name}}。",
         "uploadFailed": "{{name}} 上传失败，请重新添加。"
       }
+    },
+    "chatApps": {
+      "title": "也可以在聊天应用里提问",
+      "body": "Slack、Telegram、Discord、iMessage、飞书或电子邮件。同一个 Chief of Staff Agent，同样的对话。",
+      "notNow": "以后再说",
+      "connect": "连接聊天应用"
     }
   },
   "mcp": {
@@ -6415,7 +6618,8 @@
       "keyFormatLengthAtLeast_other": "当前长度为 {{count}} 个字符，插件要求至少 {{min}} 个。",
       "keyFormatCharacters": "其中有插件格式不允许的字符。",
       "hideKey": "隐藏密钥",
-      "sourceHintNoCatalog": "插件仓库，或任何包含 SKILL.md 技能或 agents/ 子 Agent 的文件夹。"
+      "sourceHintNoCatalog": "插件仓库，或任何包含 SKILL.md 技能或 agents/ 子 Agent 的文件夹。",
+      "statusHeldBack": "已暂停"
     },
     "bulk": {
       "select": "选择",
@@ -7396,7 +7600,9 @@
       "notConnected": "未连接",
       "offline": "离线",
       "off": "已关闭",
-      "needsComputer": "没有电脑"
+      "needsComputer": "没有电脑",
+      "notAllowed": "不允许",
+      "paired": "已配对"
     },
     "before": {
       "need": "您需要",
@@ -7556,6 +7762,7 @@
         "terms": "这种使用方式适用 Anthropic 为你的 Claude 套餐制定的条款，你需要自行确保遵守。Anthropic 可能会限制或停用它认定违反条款的账户。",
         "undo": "你可以随时切换回来，{{brand}} 会立即删除此 token。",
         "confirm": "保存我的 token",
+        "agree": "我同意让 LangAlpha 保存我的 setup token",
         "termsLink": "阅读 Anthropic 条款"
       },
       "leaveStored": {
@@ -7657,6 +7864,54 @@
         "rowResize": "Claude Code 只在中型及以上的计算机上运行。改为中型会让它重启几分钟。",
         "rowPlan": "Claude Code 只在中型及以上的计算机上运行，而当前套餐不含中型。",
         "rowResizing": "正在改为中型，完成后 Claude Code 即可在此运行。"
+      },
+      "steps": {
+        "done": "已完成",
+        "setUp": "设置 Claude Code",
+        "lead": {
+          "plan": "用你的 Claude 套餐，在 {{home}} 的云端计算机上运行 Claude Code。按顺序完成这三步。",
+          "medium": "下一步：把 {{home}} 的计算机改为{{size}}。",
+          "mediumPlan": "你已升级到 {{plan}}。下一步：把 {{home}} 的计算机改为{{size}}。",
+          "token": "就差一步了：登录 Claude。",
+          "tokenWhile": "就差一步了：计算机更改期间，先登录 Claude。"
+        },
+        "plan": {
+          "title": "含{{size}}及以上计算机的套餐",
+          "why": "Claude Code 需要含{{size}}及以上计算机的套餐。计算机越大，并行运行多个会话和子 Agent 的空间越多。",
+          "choose": "选择套餐",
+          "doneTitle": "{{plan}} 套餐",
+          "doneTitleUnnamed": "当前套餐",
+          "doneDetail": "最高可用{{size}}计算机。"
+        },
+        "medium": {
+          "title": "把 {{home}} 的计算机改为{{size}}",
+          "locked": "需要几分钟，文件会保留。",
+          "pushFirst": "请先推送。",
+          "apply": "备份并改为{{size}}",
+          "running": "正在改为{{size}}",
+          "runningNote": "需要几分钟，关闭这里也会继续进行。期间可以先登录 Claude。",
+          "doneTitle": "{{size}}计算机",
+          "doneDetail": "{{home}} 的计算机已是{{size}}。"
+        },
+        "token": {
+          "title": "登录 Claude",
+          "detail": "添加你的 setup token。",
+          "locked": "添加你的 setup token。计算机更改期间也可以添加。",
+          "doneTitle": "已登录 Claude",
+          "turnOnFailed": "无法开启 Claude Code，请重试。"
+        },
+        "own": {
+          "lead": "有 Mac 或服务器？",
+          "link": "改为在你自己的电脑上运行 Claude Code"
+        },
+        "picker": {
+          "plan": "需要含{{size}}及以上计算机的套餐。",
+          "medium": "需要一台{{size}}计算机。",
+          "resizing": "所在计算机正在改为{{size}}。",
+          "token": "需要先登录 Claude。"
+        },
+        "defaultHeld": "Claude Code 还没设置好，在此之前 {{home}} 的对话会使用 {{fallback}}。",
+        "composerHeld": "你的默认模型 {{model}} 需要先设置 Claude Code，所以这个对话使用 {{fallback}}。"
       }
     },
     "claude": {
@@ -8750,6 +9005,7 @@
     "thumbs": {
       "title": "报告问题",
       "description": "此报告会连同对话 ID 发送给我们的团队。只有在你申请人工审核时，才会分享你的消息。",
+      "descriptionNoReview": "此报告会连同对话 ID 发送给我们的团队，对话中的消息不会被分享。",
       "descriptionLocal": "帮助我们提升回答质量",
       "whatWentWrong": "哪里出了问题？",
       "commentLabel": "补充说明（可选）",
@@ -9078,6 +9334,362 @@
       "unavailable": "数据暂不可用",
       "dataAsOfPrefix": "数据时间：",
       "requestFailed": "请求失败"
+    }
+  },
+  "organization": {
+    "who": {
+      "deploymentStart": "此部署",
+      "deploymentMid": "此部署",
+      "yourOrganizationStart": "你所在的组织",
+      "yourOrganizationMid": "你所在的组织"
+    },
+    "yourOrganization": "你所在的组织",
+    "refusal": {
+      "modelNotAllowed": "{{who}}不允许使用 {{model}}",
+      "modelsLimited": "{{who}}限定了可用的模型",
+      "pickAllowed": {
+        "organization": "请选择组织允许的模型。",
+        "deployment": "请选择此部署允许的模型。"
+      },
+      "ownModels": "{{who}}不允许使用你自己的模型",
+      "ownModelBody": {
+        "organization": "{{model}} 使用你自己的密钥或接口运行。请选择组织提供的模型。",
+        "deployment": "{{model}} 使用你自己的密钥或接口运行。请选择此部署提供的模型。"
+      },
+      "ownApiKeys": "{{who}}不允许使用你自己的 API 密钥",
+      "ownSubscriptions": "{{who}}不允许使用你自己的订阅",
+      "ownSubscriptionBody": {
+        "organization": "{{model}} 使用你自己的订阅运行。请选择组织提供的模型。",
+        "deployment": "{{model}} 使用你自己的订阅运行。请选择此部署提供的模型。"
+      },
+      "ownMachines": "{{who}}不允许在你自己的机器上工作",
+      "ownMachinesBody": "那里没有运行任何内容。请使用云端电脑上的工作区。",
+      "publicLinks": "{{who}}不允许公开链接",
+      "publicLinksBody": "无法开启不需登录即可打开的链接。",
+      "trading": "{{who}}不允许交易",
+      "tradingBody": "Agent 无法为此账户下达或修改实盘订单。",
+      "userConnectors": "{{who}}不允许使用你自己添加的连接器",
+      "userConnectorsBody": "你添加的连接器会保留，规则放开后即可再次使用。",
+      "generic": "{{who}}不允许此操作",
+      "chooseModel": "选择模型",
+      "sharedWorkspaces": "{{who}}不允许成员创建共享工作区",
+      "sharedWorkspacesBody": "请管理员创建一个，或者把你加入已有的共享工作区。"
+    },
+    "suspended": {
+      "title": "你在 {{organization}} 的访问权限已结束",
+      "titleUnnamed": "你通过所在组织获得的访问权限已结束",
+      "body": "{{organization}} 的管理员暂停或移除了此账户，因此无法打开它的工作区、对话和设置。账户中的内容不会被删除。",
+      "bodyUnnamed": "你所在组织的管理员暂停或移除了此账户，因此无法打开它的工作区、对话和设置。账户中的内容不会被删除。",
+      "canStill": "你仍然可以",
+      "askAdmin": "如果这出乎意料，请联系 {{organization}} 的管理员。",
+      "askAdminUnnamed": "如果这出乎意料，请联系所在组织的管理员。",
+      "signOther": "退出登录，然后用其他账户登录。",
+      "checkAgain": "重新检查",
+      "checking": "正在检查…",
+      "stillEnded": "访问权限尚未恢复。",
+      "signOut": "退出登录",
+      "turnStopped": "已停止：此账户在 {{organization}} 的访问权限已结束",
+      "turnStoppedUnnamed": "已停止：此账户通过所在组织获得的访问权限已结束"
+    },
+    "modelAccess": {
+      "bothOff": "{{who}}不允许使用你自己的 API 密钥或订阅。",
+      "keysOff": "{{who}}不允许使用你自己的 API 密钥。",
+      "subscriptionsOff": "{{who}}不允许使用你自己的订阅。",
+      "provided": "对话只会使用{{who}}提供的模型。",
+      "savedStays": "已保存的内容会留在这里，暂不使用，以备规则调整。"
+    },
+    "picker": {
+      "foot": {
+        "allowList": "{{who}}决定你可以使用哪些模型。",
+        "ownApiKeys": "{{who}}不允许通过你自己的 API 密钥使用模型。",
+        "ownSubscriptions": "{{who}}不允许通过你自己的订阅使用模型。"
+      },
+      "row": {
+        "allowList": "{{whoMid}}不允许使用",
+        "custom": "{{whoMid}}限定了模型列表，你自己的模型无法使用",
+        "ownApiKeys": "{{who}}不允许使用你自己的 API 密钥",
+        "ownSubscriptions": "{{who}}不允许使用你自己的订阅"
+      }
+    },
+    "setup": {
+      "nothingToConnect": "此账户的模型由{{who}}提供，这里无需连接。"
+    },
+    "connectors": {
+      "title": "组织",
+      "setUpBy": "由{{organization}}设置",
+      "setUpByUnnamed": "由你所在的组织设置",
+      "offIn_other": "在 {{count}} 个工作区中已关闭",
+      "shared": "共享访问",
+      "yourSignIn": "你的登录",
+      "signInLine": "使用你自己的 {{name}} 账号登录",
+      "signInStopped": "登录已失效",
+      "notAnswering": "没有响应，暂时无法列出它的工具",
+      "signIn": "登录",
+      "signInAgain": "重新登录",
+      "signOut": "退出登录",
+      "signInFailed": "无法开始登录",
+      "signOutFailed": "无法退出登录",
+      "unreadable": "暂时无法读取你所在组织的连接器。",
+      "heldBack": "已暂停",
+      "ownOff": "{{who}}不允许使用你自己的连接器。它们会保留，规则放开后即可再次使用。",
+      "heldBackReason": "{{who}}不允许使用你自己的连接器。规则放开后，插件下次更新时会安装它。"
+    },
+    "share": {
+      "paused": "公开链接已暂停",
+      "cantShare": "{{who}}不允许无需登录即可打开的链接，因此无法分享此对话。",
+      "pausedBody": "在{{whoMid}}不允许公开链接期间，访客无法打开此链接。关闭它即可彻底停止分享。",
+      "pausedShort": "在{{whoMid}}不允许公开链接期间，访客无法打开此链接。",
+      "publishOff": "无法发布：{{whoMid}}不允许无需登录即可打开的链接。",
+      "audienceLabel": "谁可以打开",
+      "audienceAnyone": "任何拥有链接的人",
+      "audienceMembers": "{{organization}}的成员",
+      "audienceMembersUnnamed": "你所在组织的成员",
+      "membersLinkEnabled": "成员链接已启用",
+      "membersInstead": "{{who}}不允许无需登录即可打开的链接。你仍可以把此对话分享给所在组织的成员。",
+      "membersCanView": "{{organization}}的成员登录后，可以通过此链接查看对话。",
+      "membersCanViewUnnamed": "你所在组织的成员登录后，可以通过此链接查看对话。",
+      "fileMembersHint": "{{organization}}的成员登录后可以打开此文件。",
+      "fileMembersHintUnnamed": "你所在组织的成员登录后可以打开此文件。",
+      "publishMembersInstead": "无法向所有人发布：{{whoMid}}不允许无需登录即可打开的链接。选择所在组织的成员即可发布此文件。"
+    },
+    "machines": {
+      "notAllowed": "不允许",
+      "cardBody": "{{who}}不允许在你自己的机器上工作。",
+      "cantBeUsed": "无法使用。",
+      "heldBody": "{{who}}不允许在你自己的机器上工作。它的工作区和文件都会保留。"
+    },
+    "trading": {
+      "off": "{{who}}不允许交易。Agent 无法为此账户下达或修改实盘订单。"
+    },
+    "features": {
+      "on": "开启",
+      "off": "关闭",
+      "keptOn": "{{who}}保持开启此功能。",
+      "turnedOff": "{{who}}关闭了此功能。"
+    },
+    "unknown": {
+      "banner": "暂时无法读取你所在组织的设置。在恢复之前，对话和功能会暂停。",
+      "notSent": "这条消息未发送",
+      "notSentBody": "暂时无法读取你所在组织的设置。问题在我们这边，请几分钟后再试。"
+    },
+    "twoSentences": "{{first}}{{next}}",
+    "library": {
+      "title": "资料库",
+      "description": "{{organization}} 成员发布给彼此的对话、文件和技能。",
+      "descriptionUnnamed": "组织成员发布给彼此的对话、文件和技能。",
+      "filterLabel": "显示",
+      "filterAll": "全部",
+      "filterThreads": "对话",
+      "filterFiles": "文件",
+      "kindThread": "对话",
+      "kindFile": "文件",
+      "empty": "还没有人发布内容。可以在对话或文件的分享面板里发布，也可以在技能页面发布技能。",
+      "emptyFiltered": "这一类还没有发布的内容。",
+      "loadFailed": "无法加载资料库。",
+      "loadMore": "加载更多",
+      "loading": "加载中…",
+      "byYou": "由你发布 · {{date}}",
+      "byName": "由 {{name}} 发布 · {{date}}",
+      "byUnnamed": "发布于 {{date}}",
+      "membersOnly": "仅限成员",
+      "open": "打开",
+      "actions": "{{title}} 的操作",
+      "remove": "从资料库移除",
+      "removeShort": "移除",
+      "removeConfirm": "从资料库移除「{{title}}」？它的链接保持不变。",
+      "removed": "已从资料库移除",
+      "removeFailed": "移除失败，请重试。",
+      "sectionLabel": "资料库",
+      "publish": "发布到资料库",
+      "publishing": "发布中…",
+      "publishFailed": "发布失败，请重试。",
+      "inLibrary": "已在 {{organization}} 资料库中",
+      "inLibraryUnnamed": "已在组织资料库中",
+      "publishThreadHint": "成员可以在资料库里找到它，并通过这个链接打开。",
+      "publishFileHint": "成员可以在资料库里找到它，并通过这个链接打开。",
+      "publishNotAllowed": "{{who}}不允许你发布到资料库。",
+      "view": "查看资料库",
+      "filterSkills": "技能",
+      "kindSkill": "技能",
+      "install": "安装",
+      "installing": "安装中…",
+      "update": "更新",
+      "installed": "已安装",
+      "installedToast": "已安装 {{name}}，你的 Agent 在每个工作区都能使用它。",
+      "updatedToast": "已更新 {{name}}",
+      "installFailed": "安装失败，请重试。",
+      "nameTaken": "你已经有一个名为 {{name}} 的技能。重命名或移除你的技能后才能安装这个。",
+      "publishSkillHint": "成员可以在资料库里找到它并安装自己的副本。修改后再发布一次即可更新。"
+    }
+  },
+  "sharedWorkspace": {
+    "placeholder": "输入 / 使用命令，@ 引用文件",
+    "reviewOthersTurn": "只有发送这一轮的成员可以申请人工复核。请去掉该选项后再提交反馈。",
+    "kicker": "共享 · {{organization}}",
+    "sectionLabel": "{{organization}} 的共享工作区",
+    "new": "新建共享工作区",
+    "empty": "和 {{organization}} 的同事在同一个工作区里协作：每个人运行自己的轮次，大家都能看到文件和已共享的对话。",
+    "everyone": "{{organization}} 的所有人",
+    "peopleCount_other": "{{count}} 人",
+    "you": "（你）",
+    "youShort": "你",
+    "someone": "某位成员",
+    "badge": "共享",
+    "role": {
+      "manager": "管理者",
+      "member": "成员"
+    },
+    "create": {
+      "title": "新建共享工作区",
+      "description": "供 {{organization}} 成员使用的工作区，运行在它自己的云端电脑上。每个人的轮次都使用本人的席位和规则。",
+      "name": "名称",
+      "namePlaceholder": "第四季度财报复盘",
+      "purpose": "用途",
+      "everyoneBody": "组织里的任何人都可以打开并在其中工作。",
+      "people": "成员",
+      "alsoManagers": "另外单独列出的成员",
+      "peoplePlaceholder": "ana@company.com, ben@company.com",
+      "peopleHint": "填写 {{organization}} 成员的邮箱地址，之后还可以再添加。",
+      "submit": "创建",
+      "creating": "正在创建…",
+      "teamHint": "除了你列出的成员，团队里的每个人也都能打开。"
+    },
+    "members": {
+      "open": "成员",
+      "openLabel": "这个工作区的成员",
+      "title": "成员",
+      "description": "{{workspace}} 里的每个人都能看到其中的文件和已共享到工作区的对话。每个人的轮次都在本人的账户下运行。",
+      "everyoneBody": "除了列出的成员，组织里的任何人也都可以打开。",
+      "everyoneOn": "组织里的任何人都可以打开。",
+      "everyoneOff": "只有列出的成员可以打开。",
+      "addLabel": "通过邮箱添加成员",
+      "addPlaceholder": "邮箱地址",
+      "add": "添加",
+      "optionsFor": "{{name}} 的选项",
+      "makeManager": "设为管理者",
+      "makeMember": "设为成员",
+      "remove": "移除",
+      "leave": "退出",
+      "leaveWorkspace": "退出工作区",
+      "deleteWorkspace": "删除工作区",
+      "confirmLabel": "确认",
+      "leaveConfirm": "要退出 {{workspace}} 吗？之后你将看不到它的对话和文件。",
+      "removeConfirm": "要移除 {{name}} 吗？对方正在这里运行的轮次会停止。",
+      "deleteConfirm": "要为所有人删除 {{workspace}} 吗？它的对话、文件和电脑都会一并删除。",
+      "noLongerActive": "已不在组织中",
+      "everyoneOffTeam": "只有 {{team}} 和这里单独添加的成员可以打开。"
+    },
+    "refusal": {
+      "notInOrganization": "{{email}} 不是你所在组织的成员，请检查地址。",
+      "alreadyMember": "此人已经在这个工作区里了。",
+      "lastManager": "请先把其他人设为管理者，共享工作区至少需要一位管理者。",
+      "managersOnly": "只有管理者可以这样做。",
+      "limit": "你的组织的共享工作区已达上限（{{limit}} 个），删除一个后才能新建。",
+      "noCloudComputer": "共享工作区需要云端电脑，这里没有可用的云端电脑。",
+      "tooMany": "一次最多添加 50 人。",
+      "unavailable": "暂时无法读取组织设置，请稍后再试。",
+      "noAccess": "你已不在这个工作区中。",
+      "badName": "这个名称不可用，请换一个。",
+      "generic": "操作没有成功，请重试。",
+      "teamNotYours": "只能选择你所在的团队。",
+      "teamNotFound": "这个团队已不存在，请选择其他团队。"
+    },
+    "threads": {
+      "startedBy": "由 {{name}} 发起",
+      "startedByMe": "由你发起",
+      "lastBy": "最新消息来自 {{name}}",
+      "lastByMe": "最新消息来自你",
+      "mine": "我的",
+      "everyones": "所有人的",
+      "filterLabel": "按发起人筛选"
+    },
+    "otherWorkspace": "此对话属于另一个工作区，请从那个工作区打开后再发送。",
+    "rewrite": {
+      "edit": "这条消息之后有其他成员发过消息，所以无法编辑。你的内容已放回输入框，可作为新消息发送。",
+      "redo": "这条回复之后有其他成员发过消息，所以无法重新生成。请发送一条新消息。",
+      "answer": "只有这一轮的发送者可以回答。"
+    },
+    "othersTurn": {
+      "running": "{{name}} 的轮次正在这里运行，结束后你就可以发送。",
+      "waiting": "正在等待 {{name}} 回答，对方的轮次结束后你即可发送。",
+      "check": "再检查一次"
+    },
+    "gone": {
+      "title": "你已不在这个工作区中",
+      "body": "管理者移除了你、你已不在它的团队中，或者你在组织中的访问已经结束。",
+      "back": "返回工作区"
+    },
+    "deleted": {
+      "title": "这个共享工作区已被删除",
+      "body": "其中的对话和文件也一并删除了。"
+    },
+    "unavailable": "共享工作区中不可用",
+    "share": {
+      "membersOnly": "共享工作区的链接只对组织成员开放。"
+    },
+    "threadDeleted": {
+      "title": "这个对话已被删除",
+      "body": "你打开它期间，它被删除了。"
+    },
+    "threadPrivate": {
+      "title": "这段对话已设为私密",
+      "body": "发起人在你打开它时把它设为了私密。"
+    },
+    "anotherMembersTask": "这个任务属于其他成员的轮次，只有他们可以给它下指令。",
+    "shareOut": {
+      "label": "在工作区之外分享",
+      "help": "谁可以把对话或文件分享给 {{organization}} 的其他人，或发布到资料库。",
+      "groupLabel": "谁可以在工作区之外分享",
+      "managers": "仅限管理者",
+      "managersBody": "只有管理者可以开启链接、发布到资料库。",
+      "members": "任何成员",
+      "membersBody": "这个工作区里的任何人都可以开启链接、发布到资料库。",
+      "none": "不对外分享",
+      "noneBody": "链接只对这个工作区里的人开放。",
+      "managersLink": "只有这个工作区的管理者可以把它分享给 {{organization}}。",
+      "noneLink_other": "只有这个工作区里的 {{count}} 个人可以打开这个链接。",
+      "noneLinkUncounted": "只有这个工作区里的人可以打开这个链接。",
+      "libraryManagers": "只有这个工作区的管理者可以把它发布到资料库。",
+      "libraryNone": "这个工作区里的内容不能发布到资料库。管理者可以在“成员”里更改。"
+    },
+    "privacy": {
+      "onlyYou": "仅自己可见",
+      "sharedWith": "已共享给 {{workspace}}",
+      "share": "共享给工作区",
+      "makePrivate": "设为私密",
+      "note": "这段对话只有你能看到。它保存的文件位于 {{workspace}}，工作区里的每个人都能打开。",
+      "linkTurnedOff": "它的分享链接已关闭。",
+      "confirmTitle": "要把这段对话共享给 {{workspace}} 吗？",
+      "confirmBody": "工作区里的每个人都能从第一条消息开始看到它，也能在其中发送自己的消息。在其他人写下内容之前，你都可以把它重新设为私密。",
+      "confirmShare": "共享",
+      "chipPrivate": "私密",
+      "chipPrivateTitle": "只有你能看到这段对话",
+      "chipSharedTitle": "{{workspace}} 里的每个人都能看到这段对话",
+      "sharedMark": "已共享给工作区",
+      "shareFailed": "未能共享这段对话，请重试。",
+      "privateFailed": "未能把这段对话设为私密，请重试。",
+      "othersSent": "已有其他人在这段对话里写过内容，因此无法设为私密。"
+    },
+    "teamAndPeople_one": "{{team}} 和 {{count}} 人",
+    "teamAndPeople_other": "{{team}} 和 {{count}} 人",
+    "team": {
+      "label": "团队",
+      "individually": "单独添加的成员",
+      "none": "不指定团队",
+      "noneBody": "指定一个你所在的团队，团队里的每个人都能打开这个工作区。",
+      "unnamed": "一个团队",
+      "unnamedLower": "它的团队",
+      "people_one": "{{count}} 人 · 团队管理员可以管理这个工作区",
+      "people_other": "{{count}} 人 · 团队管理员可以管理这个工作区",
+      "loadFailed": "暂时无法加载团队成员。",
+      "change": "更换",
+      "choose": "选择",
+      "optionsLabel": "团队选项",
+      "current": "当前团队",
+      "remove": "移除团队",
+      "alsoIn": "也在 {{team}} 中",
+      "removeConfirmInTeam": "要把 {{name}} 从单独添加的成员中移除吗？对方也在 {{team}} 中，仍可通过团队使用这个工作区。",
+      "everyoneClears": "组织里的任何人都可以打开。开启后会移除团队。"
     }
   },
   "cliApproval": {

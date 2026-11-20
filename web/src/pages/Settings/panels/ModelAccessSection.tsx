@@ -30,7 +30,7 @@ import { linkedSheetAction, useClaudeCodeTokenRows } from '@/components/modelAcc
 import type { SheetAction, TokenTarget } from '@/components/modelAccess/tokenTarget';
 import { planLabel } from '@/components/modelAccess/planLabel';
 import { regionTag } from '@/components/modelAccess/optionLabels';
-import { StatusLabel, type AccessStatus } from '@/components/modelAccess/parts';
+import { Group, StatusLabel, type AccessStatus } from '@/components/modelAccess/parts';
 import { UsageHeaderRow } from '@/components/modelAccess/PlanUsage';
 import { SUMMARY_WIDTHS, UsageTableContext, useUsageSteps } from '@/components/modelAccess/usageSteps';
 import { usePlanClock } from '@/hooks/useClaudeCodePlan';
@@ -40,10 +40,16 @@ import { ProviderChoices } from '@/components/modelAccess/ProviderChoices';
 import { SubscriptionChoices } from '@/components/modelAccess/SubscriptionChoices';
 import { KeyProviderList, KeyStepFrame, ProviderTitle } from '@/components/modelAccess/KeyProviderPicker';
 import { NO_FILTER, optionsOf, startingOption, type KeyFilter, type KeyOption, type ProviderGroup } from '@/components/modelAccess/providerOptions';
-import { AccessRow, Group, KeyRow } from './modelAccess/AccessRows';
+import { AccessRow } from '@/components/modelAccess/AccessRow';
+import { KeyRow } from './modelAccess/AccessRows';
 import { KeySheet } from './modelAccess/KeySheet';
 import { ManageSheet, SubscriptionFlow } from './modelAccess/ManageSheet';
 import { ClaudeCodeSheet } from './modelAccess/ClaudeCodeSheet';
+import { ClaudeCodeSteps } from './modelAccess/ClaudeCodeSteps';
+import { stepsMissing, useClaudeCodeSteps } from '@/hooks/useClaudeCodeSteps';
+import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
+import { useAccount } from '@/hooks/useAccount';
+import { allows, RULE } from '@/lib/accountRules';
 import { claudeCodeHeadline } from './modelAccess/claudeCodeHeadline';
 
 /** The Subscriptions card as a usage table, once Claude Code's row has a
@@ -79,8 +85,11 @@ type Sheet =
   | { kind: 'local-key'; entry: ProviderCatalogEntry }
   | { kind: 'claude-code-token'; target: TokenTarget; action: SheetAction }
   /** Claude Code itself: where it stands, what sets it apart, and each
-   *  computer's token, the saved one, and the choice for cloud computers. */
-  | { kind: 'claude-code' }
+   *  computer's token, the saved one, and the choice for cloud computers.
+   *  For a user with no computer of their own it leads with the steps to
+   *  run it on a cloud computer (`ClaudeCodeSteps`) until they are done or
+   *  the user asks for their own computer instead (`own`). */
+  | { kind: 'claude-code'; own?: boolean }
   /** `from` the add-key flow keeps that flow's width for the key it just saved.
    *  `justConnected`: the flow before it made the connection, so its models
    *  start picked. */
@@ -89,10 +98,10 @@ type Sheet =
 /** The add-key flow is one size from the list to the saved key's models; see
  *  KeyStepFrame. Claude Code's view is a table of each token's plan use
  *  beside its status and button, so it is wider still. */
-function sheetWidth(sheet: Sheet): 'standard' | 'wide' | 'table' {
+function sheetWidth(sheet: Sheet, steps: boolean): 'standard' | 'wide' | 'table' {
   switch (sheet.kind) {
     case 'claude-code':
-      return 'table';
+      return steps ? 'wide' : 'table';
     case 'pick-key':
     case 'key':
       return 'wide';
@@ -151,6 +160,11 @@ export function ModelAccessSection({
   const signInLifecycle = useClaudeSignInLifecycle();
   const locale = useLocale();
   const now = useNow();
+  // A rule may keep the user's own keys or sign-ins off: what they saved
+  // stays listed, unused and removable, and nothing new can be added.
+  const { policy } = useAccount();
+  const ownKeys = allows(policy, RULE.ownApiKeys);
+  const ownSubscriptions = allows(policy, RULE.ownSubscriptions);
   const [opened, setSheet] = useState<Sheet | null>(null);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
   const [removingToken, setRemovingToken] = useState<TokenTarget | null>(null);
@@ -177,6 +191,11 @@ export function ModelAccessSection({
     ? { kind: 'claude-code-token', target: linkedRow.target, action: linkedAction }
     : searchParams.get(CLAUDE_CODE_TOKEN_PARAM) === CLAUDE_CODE_CHOICE && (setup || setupUnread) ? { kind: 'claude-code' } : null;
   const sheet: Sheet | null = opened ?? linkedSheet;
+  const steps = useClaudeCodeSteps();
+  // Claude Code's sheet leads with the steps while they apply; until the
+  // reads that decide it answer, it waits rather than show the other view.
+  const claudeCodeView = sheet?.kind !== 'claude-code' ? null
+    : sheet.own || steps.status === 'none' ? 'sheet' : steps.status === 'pending' ? 'steps' : 'loading';
   // A link to Claude Code's sheet may name a computer: its row's setting of
   // how many agents it runs at once (a turn that waited for one there).
   const linkedComputerId = searchParams.get(CLAUDE_CODE_TOKEN_PARAM) === CLAUDE_CODE_CHOICE
@@ -259,10 +278,12 @@ export function ModelAccessSection({
 
   /** What Claude Code's row says: the account, or the limit it is held at,
    *  of the token whose plan it shows; else the computers a token works on,
-   *  or what it runs on there, else what the view leads with, or that it is
+   *  or what it runs on there, else the first cloud step missing (`stepsMissing`),
+   *  else what the view leads with, or that it is
    *  off with a token left behind. */
   const claudeCodeDetail = () => {
     if (summary) return summary.limit ? limitDetail(t, summary.limit, clock) : summary.email ?? summary.name;
+    if (steps.status === 'pending') return stepsMissing(t, steps);
     if (!setup && setupUnread) return null;
     if (!setup?.on) return t(tokenRows.some(({ key }) => key === 'saved') ? 'modelAccess.claudeCode.optOut.saved' : 'modelAccess.claudeCode.optOut.computer');
     if (setup.state === 'checking') return null;
@@ -356,7 +377,7 @@ export function ModelAccessSection({
         {[
           ...(showPersonalClaudeCode && summary ? [<UsageHeaderRow key="header" first={t('claudeCodePlan.table.account')} />] : []),
           ...(showTeamGroups ? subscriptionRows.map((p) => p.access_type === 'coding_plan' ? (
-            <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
+            <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} notAllowed={!ownKeys} />
           ) : (
             <AccessRow
               key={p.provider}
@@ -365,8 +386,8 @@ export function ModelAccessSection({
               tag={p.provider === 'claude-oauth' && signInLifecycle !== 'active' ? t('modelAccess.claude.legacy') : null}
               detail={subscriptionDetail(p)}
               notice={signInNotice(p)}
-              status={rowStatus(p)}
               /* DALTON-HOOK(team-credentials): a member cannot reconnect a team-managed provider */
+              status={ownSubscriptions ? rowStatus(p) : 'not_allowed'}
               action={
                 <Button type="button" variant={p.state === 'needs_reauth' && !teamManagedByAdmin ? 'outline' : 'ghost'} size="sm" onClick={() => manage(p.provider)}>
                   {p.state === 'needs_reauth' && !teamManagedByAdmin ? t('modelAccess.reconnect') : t('modelAccess.manage')}
@@ -375,7 +396,7 @@ export function ModelAccessSection({
             />
           )) : []),
           // Claude Code is personal (account / computer token); keep in personal & all scopes
-          ...(showPersonalClaudeCode && (setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled)) ? [(
+          ...(showPersonalClaudeCode && (setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled && ownSubscriptions)) ? [(
             <AccessRow
               key={CLAUDE_CODE}
               provider={CLAUDE_CODE}
@@ -384,7 +405,7 @@ export function ModelAccessSection({
               wrapDetail={!summary}
               plan={summary?.plan}
               limited={!!summary?.limit}
-              status={summary?.limit ? 'limit_reached' : setup?.on ? CLAUDE_CODE_SETUP_STATUS[setup.state] : setupUnread ? 'unknown' : 'off'}
+              status={!ownSubscriptions ? 'not_allowed' : summary?.limit ? 'limit_reached' : setup?.on ? CLAUDE_CODE_SETUP_STATUS[setup.state] : setupUnread ? 'unknown' : 'off'}
               action={(
                 <Button type="button" variant="ghost" size="sm" className="tap-target" onClick={() => setSheet({ kind: 'claude-code' })}>
                   {t('modelAccess.manage')}
@@ -409,7 +430,7 @@ export function ModelAccessSection({
         <Group title={t('modelAccess.apiKeys')} empty={t('modelAccess.noneKeys')}>
           {[
             ...keyRows.map((p) => (
-              <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
+              <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} notAllowed={!ownKeys} />
             )),
             // Nothing to manage on a key no provider takes any more: only removing it.
             ...withdrawn.map((p) => (
@@ -436,27 +457,31 @@ export function ModelAccessSection({
       {showTeamGroups && !isPlatformMode && (
         <Group title={t('modelAccess.localServers')} empty={t('modelAccess.noneLocal')}>
           {localRows.map((p) => (
-            <KeyRow key={p.provider} p={p} onManage={() => manage(p.provider)} />
+            <KeyRow key={p.provider} p={p} onManage={() => manage(p.provider)} notAllowed={!ownKeys} />
           ))}
         </Group>
       )}
 
       {/* DALTON-HOOK(team-credentials): a non-PM member cannot write the
           shared credentials — the add buttons stay with the administrators. */}
-      {showTeamGroups && !teamManagedByAdmin && (
+      {showTeamGroups && !teamManagedByAdmin && (ownSubscriptions || ownKeys) && (
         <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
-            <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-            {t('modelAccess.connectSubscription')}
-          </Button>
-          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => {
-            setKeyFilter(NO_FILTER);
-            setSheet({ kind: 'pick-key' });
-          }}>
-            <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-            {t('modelAccess.addKey')}
-          </Button>
-          {!isPlatformMode && (
+          {ownSubscriptions && (
+            <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
+              <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+              {t('modelAccess.connectSubscription')}
+            </Button>
+          )}
+          {ownKeys && (
+            <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => {
+              setKeyFilter(NO_FILTER);
+              setSheet({ kind: 'pick-key' });
+            }}>
+              <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+              {t('modelAccess.addKey')}
+            </Button>
+          )}
+          {!isPlatformMode && ownKeys && (
             <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-local' })}>
               <Plus aria-hidden="true" className="h-3.5 w-3.5" />
               {t('modelAccess.addLocal')}
@@ -464,13 +489,14 @@ export function ModelAccessSection({
           )}
         </div>
       )}
+      <OwnAccessNote variant="settings" />
 
       {sheet && (
         <ModalShell
           labelId={sheetTitleId}
           title={sheetTitle}
           onClose={closeSheet}
-          width={sheetWidth(sheet)}
+          width={sheetWidth(sheet, claudeCodeView === 'steps')}
           covered={!!removing || (!!removingToken && sheet.kind === 'claude-code') || choiceCovered}
         >
           {sheet.kind === 'pick-subscription' && (
@@ -556,7 +582,11 @@ export function ModelAccessSection({
             />
           )}
           {sheet.kind === 'manage' && !managed && <StatusLabel status="working" />}
-          {sheet.kind === 'claude-code' && (setup || setupUnread || tokenRows.length > 0 ? (
+          {claudeCodeView === 'steps' && (
+            <ClaudeCodeSteps steps={steps} onOwnComputer={() => setSheet({ kind: 'claude-code', own: true })} />
+          )}
+          {claudeCodeView === 'loading' && <StatusLabel status="working" />}
+          {claudeCodeView === 'sheet' && (setup || setupUnread || tokenRows.length > 0 ? (
             <ClaudeCodeSheet
               setup={setup}
               tokenRows={tokenRows}

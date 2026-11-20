@@ -14,6 +14,8 @@ from src.server.models.chat import ChatRequest
 from src.server.services import automation_delivery, automation_settlement, user_skills
 from src.server.services.egress.direct_tools import order_ledger_for_turn
 from src.server.services.report_back.handoff import carry
+from src.server.services.shared_workspaces import turn as turn_mod
+from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.services.thread_agent import AgentInputs
 from src.server.services.turn_runtime import TurnRoute
 from src.server.services.wakeups import cancel_notice
@@ -52,7 +54,8 @@ async def _capture_graph_config(
         claude_code_admitted=None,
         claude_code=False,
         user_skill_dir=None,
-        disabled_skills=None,
+        disabled_skills=set(),
+        withheld_skills=set(),
         filesystem=SimpleNamespace(enabled_tools=None),
     )
 
@@ -101,7 +104,6 @@ async def _capture_graph_config(
             ("ensure_thread", create_autospec(ptc_run.ensure_thread, return_value=request_prep.PriorThread())),
             ("wait_or_steer", create_autospec(ptc_run.wait_or_steer, return_value=(True, None))),
             ("read_disk_notice", create_autospec(ptc_run.read_disk_notice, return_value=(None, False))),
-            ("get_user_profile_for_prompt", create_autospec(ptc_run.get_user_profile_for_prompt, return_value=None)),
             ("_resolve_fork", create_autospec(ptc_run._resolve_fork, return_value=("system", None))),
             ("_resolve_origin_meta", create_autospec(ptc_run._resolve_origin_meta, return_value={})),
             ("begin_run", create_autospec(ptc_run.begin_run, return_value=run_handle)),
@@ -209,6 +211,13 @@ async def _capture_graph_config(
         )
         stack.enter_context(
             patch.object(
+                turn_mod,
+                "get_user_profile_for_prompt",
+                create_autospec(turn_mod.get_user_profile_for_prompt, return_value=None),
+            )
+        )
+        stack.enter_context(
+            patch.object(
                 cancel_notice,
                 "ThreadCancelNotices",
                 create_autospec(cancel_notice.ThreadCancelNotices),
@@ -221,7 +230,8 @@ async def _capture_graph_config(
             run_id="r-2",
             user_input="",
             user_id="u-1",
-            route=TurnRoute("ws-1", "analyst"),
+            route=TurnRoute("ws-1", "analyst", "u-1"),
+            identity=TurnIdentity("u-1", "u-1", "u-1"),
             is_byok=False,
             config=config,
             extra_configurable=extra_configurable,

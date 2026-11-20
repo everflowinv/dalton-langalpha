@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import { useModels } from './useModels';
 import { usePreferences } from './usePreferences';
 import { getModelAccess, usePlatformModels } from './usePlatformModels';
@@ -15,6 +15,8 @@ import { modelPrefs } from '@/lib/modelPreferences';
 import { ownKeyRule, payerResolver, type Payer } from '@/lib/modelPayer';
 import { CLAUDE_CODE_CONNECTION, isClaudeCodeModel } from '@/lib/claudeCode';
 import { useClaudeCodeStatus } from './useClaudeCode';
+import { useAccount } from './useAccount';
+import { allows, modelRefusedBy, restrictsModels, RULE, withoutRefusedModels } from '@/lib/accountRules';
 
 export interface SystemDefaults {
   default_model?: string;
@@ -109,6 +111,11 @@ export interface UseAllModelsResult {
    *  the catalog and the custom models have both loaded, so a name missing
    *  from it means gone, never not loaded yet. */
   catalogModelNames: Set<string>;
+  /** Whether it is confirmed that `model` cannot run for the user: gone from
+   *  the catalog, or dropped from every group that lists it by a plan read as
+   *  excluding it or by the own list of the connection that group runs on. A read that failed or is still
+   *  loading confirms nothing, though it leaves the model out of `models`. */
+  cannotRun: (model: string) => boolean;
   /** Compaction profile catalog from the models API (name → preset values). */
   compactionProfiles: CompactionProfileCatalog | null;
   /** Web-search provider catalog from the models API (name → tiers + depths). */
@@ -117,6 +124,11 @@ export interface UseAllModelsResult {
   rawApiResponse: ModelsResponse | null;
   /** True while any upstream query is still loading. */
   isLoading: boolean;
+  /** The catalog, the user's connections or whether Claude Code is on for
+   *  them were never read, so `models` may leave out what the user can run. */
+  unread: boolean;
+  /** The connections whose own list is read to hide what they cannot run. */
+  listedProviders: readonly string[];
 }
 
 /**
@@ -127,10 +139,18 @@ export interface UseAllModelsResult {
  * `buildVisibleModels()`.
  */
 export function useAllModels(): UseAllModelsResult {
-  const { models: modelsData, isLoading: modelsLoading } = useModels();
+  const { models: modelsData, isLoading: modelsLoading, isError: modelsError } = useModels();
   const { preferences, isLoading: prefsLoading, isLoaded: prefsLoaded } = usePreferences();
   const { platform: rawPlatform, isLoading: platformLoading } = usePlatformModels();
-  const { providers: configuredProviders, byokEnabled, isLoading: configuredLoading } = useConfiguredProviders();
+  const { providers: configuredProviders, byokEnabled: byokSwitch, isLoading: configuredLoading, unread: configuredUnread } = useConfiguredProviders();
+  // The account's rules: the server runs no turn on the user's own keys or
+  // sign-ins while a rule keeps them off, so none reaches or pays for a model
+  // here either. A model a rule keeps a turn off is not offered to pick
+  // anywhere (`models`, `slotModels`), though it still counts as a model
+  // (`validModelNames`), so a favorite or a thread's model can say why.
+  const { policy } = useAccount();
+  const byokEnabled = byokSwitch && allows(policy, RULE.ownApiKeys);
+  const ownSignIns = allows(policy, RULE.ownSubscriptions);
   // Claude Code runs on a setup token kept for it, on the user's computer or
   // on the server, not on a connection of the user's: its models are listed
   // while it is on for them, and offered for a turn where that token works.
@@ -190,8 +210,8 @@ export function useAllModels(): UseAllModelsResult {
   // and a local or user-defined provider have no list here.
   const listedProviders = useMemo(() => configuredProviders
     .filter((p) => !p.is_custom && p.access_type !== 'local')
-    .filter((p) => (p.access_type === 'oauth' ? p.state === 'connected' : !isPlatformMode || byokEnabled))
-    .map((p) => p.provider), [configuredProviders, byokEnabled]);
+    .filter((p) => (p.access_type === 'oauth' ? ownSignIns && p.state === 'connected' : !isPlatformMode || byokEnabled))
+    .map((p) => p.provider), [configuredProviders, byokEnabled, ownSignIns]);
   const { missingByProvider: listedMissing, isLoading: listsLoading } = useMissingModels(listedProviders);
   // A plan slug run on a key held under another answers to that key's list.
   const missingByProvider = useMemo(() => {
@@ -211,6 +231,7 @@ export function useAllModels(): UseAllModelsResult {
         metadata: {},
         rawModels: {},
         validModelNames: new Set(),
+        listedModelNames: new Set(),
         customPairs: new Set(),
       };
     }
@@ -242,6 +263,22 @@ export function useAllModels(): UseAllModelsResult {
     }
     return names;
   }, [visible.rawModels, prefsLoaded, preferences]);
+
+  // A model some group carries that the confirmed drops took out of every
+  // group. A custom provider's own name is in no group, so it is never one.
+  const unrunnable = useMemo(() => {
+    const names = new Set<string>();
+    for (const data of Object.values(visible.rawModels)) {
+      for (const m of data.models ?? []) if (!visible.listedModelNames.has(m)) names.add(m);
+    }
+    return names;
+  }, [visible]);
+
+  const catalogLoaded = prefsLoaded && !!modelsData;
+  const cannotRun = useCallback(
+    (model: string) => catalogLoaded && (!catalogModelNames.has(model) || unrunnable.has(model)),
+    [catalogLoaded, catalogModelNames, unrunnable],
+  );
 
   const slotModels = useMemo(() => {
     const out: Record<string, ProviderModelsData> = {};
@@ -331,12 +368,29 @@ export function useAllModels(): UseAllModelsResult {
     return out;
   }, [visible, platform, modelsData, customModels, configuredProviders, byokEnabled]);
 
+  const offered = useMemo(
+    () => withoutRefusedModels(visible.models, policy, visible.metadata),
+    [visible, policy],
+  );
+  const offeredSlots = useMemo(
+    () => withoutRefusedModels(slotModels, policy, visible.metadata),
+    [slotModels, visible, policy],
+  );
+
+  // A model a rule refuses names no payer: nothing would pay for a turn on it.
+  const offeredPayers = useMemo(() => {
+    if (!restrictsModels(policy)) return payers;
+    return Object.fromEntries(Object.entries(payers).filter(([m]) => (
+      modelRefusedBy(policy, visible.metadata, m) === null
+    )));
+  }, [payers, policy, visible]);
+
   return {
-    models: visible.models,
-    slotModels,
+    models: offered,
+    slotModels: offeredSlots,
     metadata: visible.metadata,
     rawModels: visible.rawModels,
-    payers,
+    payers: offeredPayers,
     keylessModels,
     lockedModels,
     offPlanModels,
@@ -345,9 +399,12 @@ export function useAllModels(): UseAllModelsResult {
     customModels,
     validModelNames: visible.validModelNames,
     catalogModelNames,
+    cannotRun,
     compactionProfiles,
     searchProviders,
     rawApiResponse: modelsData,
     isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading || claudeCode.isLoading,
+    unread: (modelsError && !modelsData) || !!configuredUnread || claudeCode.unread,
+    listedProviders,
   };
 }

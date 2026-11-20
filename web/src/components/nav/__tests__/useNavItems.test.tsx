@@ -35,6 +35,8 @@ let shipped: Brokerage[] | undefined;
 let servers: CatalogServer[] | undefined;
 /** How many ledger rows the one-row probe finds; `undefined` is still in flight. */
 let ledgerRows: number | undefined;
+/** The flags as `/users/me/features` lists them; `undefined` is still in flight. */
+let features: { key: string; enabled: boolean }[] | undefined;
 
 /** What the shared cache holds for each query the gate asks. */
 function cached(queryKey: readonly unknown[]) {
@@ -46,6 +48,7 @@ function cached(queryKey: readonly unknown[]) {
   if (key === JSON.stringify(queryKeys.orders.any())) {
     return ledgerRows === undefined ? undefined : { items: Array(ledgerRows).fill({}), next_cursor: null };
   }
+  if (key === JSON.stringify(queryKeys.features.list())) return features;
   throw new Error(`the nav gate asked an unexpected query: ${key}`);
 }
 
@@ -62,11 +65,14 @@ beforeEach(() => {
   shipped = [MOOMOO];
   servers = [];
   ledgerRows = 0;
+  features = [];
 });
 
 describe('the primary nav', () => {
   it('draws every non-orders item by default when VITE_DALTON_MODE is unset', () => {
-    const defaultItems = NAV_ITEMS.filter((item) => item.requires !== 'orders').map((item) => item.key);
+    const defaultItems = NAV_ITEMS.filter(
+      (item) => item.requires !== 'orders' && item.requires !== 'org_library',
+    ).map((item) => item.key);
     expect(keys()).toEqual(defaultItems);
     servers = [httpCatalogServer({ url: MOOMOO.url, oauth_status: 'connected' })];
     expect(keys()).toEqual(expect.arrayContaining(defaultItems));
@@ -87,8 +93,19 @@ describe('the primary nav', () => {
   // DALTON-HOOK(hide-trading): Orders nav item is unconditionally hidden and never queries brokerage/order state
   it('hides Orders even when a shipped brokerage is connected', () => {
     servers = [httpCatalogServer({ name: 'moomoo', url: MOOMOO.url, oauth_status: 'connected' })];
+    features = [{ key: 'org_library', enabled: true }];
     expect(keys()).not.toContain('/orders');
-    expect(keys()).toEqual(NAV_ITEMS.map((item) => item.key));
+    expect(keys()).toEqual(NAV_ITEMS.filter((item) => item.requires !== 'orders').map((item) => item.key));
+  });
+
+  it('shows the Library only where the organization library is on for the account', () => {
+    expect(keys()).not.toContain('/library');
+    features = undefined;
+    expect(keys()).not.toContain('/library');
+    features = [{ key: 'org_library', enabled: false }];
+    expect(keys()).not.toContain('/library');
+    features = [{ key: 'org_library', enabled: true }];
+    expect(keys()).toContain('/library');
   });
 
   it('hides Orders while the answer is still in flight', () => {

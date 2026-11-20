@@ -1,14 +1,14 @@
-"""Data provenance: per-turn external-data access records and bodies."""
+"""Data provenance: per-turn external-data access records and bodies.
+
+Read by the thread's owner, or by any member of a shared workspace, who
+reads its turns anyway."""
 
 import hashlib
 
 
 from fastapi import HTTPException, Query
 
-# require_thread_owner is called through the module (auth_api.…) so a single
-# definition-site patch governs every route — a consumer-site patch that stops
-# intercepting after a move would silently bypass auth in tests.
-from src.server.utils import api as auth_api
+from src.server.services.shared_workspaces import access as shared_access
 from src.server.utils.api import (
     CurrentUserId,
 )
@@ -42,12 +42,18 @@ async def get_provenance(thread_id: str, x_user_id: CurrentUserId):
 
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import require_thread_access
+            from src.server.database.conversation import get_thread_auth_meta
+            from src.server.database.shared_workspaces import is_holder
 
-            await require_thread_access(
-                thread_id, x_user_id, channel="web", need="read"
-            )
+            meta = await get_thread_auth_meta(thread_id)
+            if meta is not None and is_holder(meta["user_id"]):
+                await shared_access.thread_access(thread_id, x_user_id, meta=meta)
+            else:
+                await require_thread_access(
+                    thread_id, x_user_id, channel="web", need="read"
+                )
         else:
-            await auth_api.require_thread_owner(thread_id, x_user_id)
+            await shared_access.thread_access(thread_id, x_user_id)
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         rows = await get_provenance_for_thread(thread_id)
 
@@ -131,12 +137,18 @@ async def get_provenance_bodies(
 
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import require_thread_access
+            from src.server.database.conversation import get_thread_auth_meta
+            from src.server.database.shared_workspaces import is_holder
 
-            await require_thread_access(
-                thread_id, x_user_id, channel="web", need="read"
-            )
+            meta = await get_thread_auth_meta(thread_id)
+            if meta is not None and is_holder(meta["user_id"]):
+                await shared_access.thread_access(thread_id, x_user_id, meta=meta)
+            else:
+                await require_thread_access(
+                    thread_id, x_user_id, channel="web", need="read"
+                )
         else:
-            await auth_api.require_thread_owner(thread_id, x_user_id)
+            await shared_access.thread_access(thread_id, x_user_id)
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
         from src.server.database.pool import get_db_connection
@@ -214,12 +226,18 @@ async def get_provenance_record_body(
 
         if is_dalton_supabase_auth_enabled():
             from src.dalton.sharing import require_thread_access
+            from src.server.database.conversation import get_thread_auth_meta
+            from src.server.database.shared_workspaces import is_holder
 
-            await require_thread_access(
-                thread_id, x_user_id, channel="web", need="read"
-            )
+            meta = await get_thread_auth_meta(thread_id)
+            if meta is not None and is_holder(meta["user_id"]):
+                await shared_access.thread_access(thread_id, x_user_id, meta=meta)
+            else:
+                await require_thread_access(
+                    thread_id, x_user_id, channel="web", need="read"
+                )
         else:
-            await auth_api.require_thread_owner(thread_id, x_user_id)
+            await shared_access.thread_access(thread_id, x_user_id)
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
         row = await get_provenance_record(thread_id, provenance_record_id)
         if row is None:

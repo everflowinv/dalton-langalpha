@@ -57,6 +57,8 @@ from src.server.database.artifacts.versions import (
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.database.workspace_file_blobs import store_unregistered_blobs
+from src.server.services import activity
+from src.server.services.activity import Action
 from src.server.services.artifacts.events import publish_artifact_change
 from src.server.services.served_paths import (
     is_text_content_type,
@@ -366,12 +368,14 @@ async def _capture(
     user_id: str,
     mode: ReadMode,
     source: _Walked | _Listed,
+    actor: str | None = None,
 ) -> Snapshot:
     """Read the artifact's files as ``source`` names them, from where
-    ``mode`` allows."""
+    ``mode`` allows. ``user_id`` owns the rows (a shared workspace's holder);
+    ``actor``, the person whose request starts a stopped computer."""
     workspace = await _workspace(artifact)
     try:
-        async with snapshot_reader(workspace, user_id, mode) as reader:
+        async with snapshot_reader(workspace, actor or user_id, mode) as reader:
             manifest = await source.manifest(reader, artifact)
             entries = manifest.entries
             source.caps.check(
@@ -651,6 +655,7 @@ async def status(
     user_id: str,
     loaded: tuple[str, ...],
     earlier: tuple[str, ...] = (),
+    actor: str | None = None,
 ) -> Status:
     """The live file against what a publish now would replace, and what it
     would carry: the shared version for a shared record, since a newer one
@@ -664,6 +669,7 @@ async def status(
             user_id=user_id,
             mode=ReadMode.OWNER,
             source=_Walked(loaded=loaded, earlier=earlier),
+            actor=actor,
         )
     except SnapshotRefused as e:
         if e.code not in _CAP_CODES or e.files is None:
@@ -688,6 +694,7 @@ async def publish(
     loaded: tuple[str, ...],
     earlier: tuple[str, ...] = (),
     reviewed_page: str | None = None,
+    actor: str | None = None,
 ) -> artifacts_db.PublishResult:
     """The owner's Publish or Update: share, and cut a version from the files
     the owner reviewed. ``SnapshotRefused('files_changed')`` carries the list
@@ -703,6 +710,7 @@ async def publish(
         user_id=user_id,
         mode=ReadMode.OWNER,
         source=_Walked(reviewed, loaded, earlier),
+        actor=actor,
     )
     if reviewed_page is not None and snapshot.page_sha256 != reviewed_page:
         raise SnapshotRefused("files_changed", files=snapshot.entries)
@@ -726,7 +734,24 @@ async def publish(
         # again, which the owner's review does once it hears of the change.
         raise SnapshotRefused("files_changed", files=snapshot.entries) from None
     await _announce(user_id, snapshot, result)
+    activity.record(
+        actor or user_id, Action.FILE_PUBLISHED, resource=("artifact", artifact.artifact_id),
+        workspace_id=artifact.workspace_id,
+        detail={
+            "path": artifact.path, "version": result.seq, "shared_now": result.shared_now,
+            **({"audience": artifact.audience} if artifact.audience else {}),
+        },
+    )
     return result
+
+
+def record_unshared(user_id: str, artifact: Artifact) -> None:
+    """The activity record of a file's link stopped, from either route that
+    stops one."""
+    activity.record(
+        user_id, Action.FILE_UNSHARED, resource=("artifact", artifact.artifact_id),
+        workspace_id=artifact.workspace_id, detail={"path": artifact.path},
+    )
 
 
 async def keep(
@@ -735,6 +760,7 @@ async def keep(
     user_id: str,
     loaded: tuple[str, ...] = (),
     earlier: tuple[str, ...] = (),
+    actor: str | None = None,
 ) -> Artifact:
     """Keep a record for its owner, with a version cut now from the files its
     page names and the ones it reported loading, as a publish takes them, so
@@ -748,6 +774,7 @@ async def keep(
         user_id=user_id,
         mode=ReadMode.OWNER,
         source=_Walked(loaded=loaded, earlier=earlier),
+        actor=actor,
     )
     await _store_blobs(user_id, snapshot)
     try:
@@ -860,6 +887,10 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
     Reads only a session this worker holds: a stored copy can lag the
     computer, and a version cut from it could undo the one before. No warm
     session means no check this turn; the next turn's end looks again.
+
+    ``user_id`` is whoever's turn or change it follows. The records, their
+    blobs and versions are the workspace owner's, which in a shared workspace
+    is its holder, not the member who acted, so the pass works as the owner.
     """
     # DALTON-HOOK(artifact-publishing-off): while the deployment keeps
     # publishing off, no shared link gains a version on its own — including
@@ -892,11 +923,12 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
         kept = await artifacts_db.list_kept_updated(workspace_id)
         if not kept:
             return
-        kept = await _release_unlisted(kept, workspace_id=workspace_id, user_id=user_id)
-        if not kept:
-            return
         workspace = await db_get_workspace(workspace_id)
-        if not workspace or workspace.get("status") != "running":
+        if not workspace or not workspace.get("user_id"):
+            return
+        owner_id = str(workspace["user_id"])
+        kept = await _release_unlisted(kept, workspace_id=workspace_id, user_id=owner_id)
+        if not kept or workspace.get("status") != "running":
             return
         owner_id = str(workspace["user_id"])
         for artifact in kept:

@@ -10,6 +10,7 @@ import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { useTurnDefaultModel } from '@/hooks/useTurnModels';
+import { isClaudeCodeModel } from '@/lib/claudeCode';
 import { modelLabel } from '@/lib/modelLabel';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey } from '@/lib/threadFieldMutations';
@@ -31,6 +32,13 @@ export interface RetiredModel {
 export interface LapsedSignIn {
   model: string;
   provider: SubscriptionProvider;
+}
+
+/** The account's Default, a Claude Code model a Chief of Staff turn cannot
+ *  run yet, and the model the composer starts on instead. */
+export interface HeldDefault {
+  model: string;
+  fallback: string;
 }
 
 /** A pick the user may make the account default. */
@@ -340,8 +348,16 @@ export function useThreadModel({
     ? { model: offered, defaultModel }
     : null;
 
+  // Said while the composer shows the Default it fell back to in its place,
+  // only on a thread that follows the Default: one with a model of its own,
+  // even one that left the catalog (`retired` says that), follows none.
+  const heldDefault: HeldDefault | null = chiefOfStaff && defaultModel && startsOn && defaultModel !== startsOn
+    && model === startsOn && !own && isClaudeCodeModel(metadata?.[defaultModel])
+    ? { model: defaultModel, fallback: startsOn }
+    : null;
+
   const sendModel = thread && seed !== own && model === seed ? null : model;
 
   // DALTON-HOOK(colleague-dispatch): expose thread detail record so ChatView can inspect thread_user_id / dispatched_by
-  return { model, sendModel, retired, lapsed, offer, pickModel, dismissOffer, thread };
+  return { model, sendModel, retired, lapsed, offer, heldDefault, pickModel, dismissOffer, thread };
 }

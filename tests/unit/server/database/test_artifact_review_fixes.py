@@ -89,7 +89,7 @@ async def test_require_destination_checks_the_thread_owner_not_the_workspaces(
 
     with pytest.raises(routing.DestinationUnavailable):
         await routing.require_destination(
-            mock_cursor, user_id=_U, workspace_id=_W, thread_id=_T
+            mock_cursor, user_id=_U, workspace_id=_W, thread_id=_T, caller=_U
         )
 
     (sql,) = _sql(mock_cursor)
@@ -106,7 +106,9 @@ async def test_destinations_candidates_filter_on_the_thread_owner(
     mock_cursor.fetchone = AsyncMock(return_value=_row(created_thread_id=_T))
     mock_cursor.fetchall = AsyncMock(return_value=[])
 
-    found = await routing.destinations(user_id=_U, artifact_id=_A)
+    found = await routing.destinations(
+        user_id=_U, artifact_id=_A, beside_thread_id=None, caller=_U
+    )
 
     assert found.creator is None
     assert found.bound is None

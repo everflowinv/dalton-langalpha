@@ -14,6 +14,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import call as mock_call
 
 import pytest
 
@@ -145,15 +146,16 @@ def _make_binding(workspace_id="ws-a", computer_id="comp-1", **overrides):
     return ComputerBinding(workspace_id=workspace_id, computer_id=computer_id, **fields)
 
 
-def _resolving(folder=None):
+def _resolving(folder=None, owner=None):
     """Resolve every project onto one machine, without a row read.
 
     The folder rides on the binding the edge resolve returns, which is where
-    every step below it now reads the project's folder from.
+    every step below it now reads the project's folder from, and so does the
+    machine's owner, which the attach gives the folder what it has.
     """
     return AsyncMock(
         side_effect=lambda workspace_id, **_kw: _make_binding(
-            workspace_id, dir_name=folder
+            workspace_id, dir_name=folder, user_id=owner
         )
     )
 
@@ -179,7 +181,7 @@ def _attaching(manager, session, *, folder="joiner-6c06", resolve_lands=True):
     reached = SimpleNamespace(resolve=AsyncMock(side_effect=_apply), sync=AsyncMock(side_effect=_synced))
     patches = (
         ("_acquire_session", AsyncMock(return_value=session)),
-        ("resolve_binding", _resolving(folder)),
+        ("resolve_binding", _resolving(folder, owner="user-1")),
         ("_ensure_workspace_dirs", AsyncMock()),
         ("_maybe_restore_files", AsyncMock(return_value=True)),
         ("_reconcile_skills", AsyncMock(return_value=True)),
@@ -691,6 +693,134 @@ class TestMintingAComputer(_Base):
 # ---------------------------------------------------------------------------
 # Machine keying
 # ---------------------------------------------------------------------------
+
+
+class TestPlanTier(_Base):
+    """The size the user's plan gives a computer, read past the cache; None
+    when it cannot be read."""
+
+    @contextmanager
+    def _plan(self, tier="performance"):
+        with patch(
+            "src.server.dependencies.usage_limits.plan_spec_tier",
+            AsyncMock(return_value=tier),
+        ) as picked:
+            yield picked
+
+    @pytest.mark.asyncio
+    async def test_a_new_home_reads_the_providers_tiers(self):
+        with self._plan("max") as picked:
+            assert await _make_manager().plan_tier("user-1") == "max"
+
+        assert picked.await_args.args[0] == "user-1"
+        assert set(picked.await_args.args[1]) == set(DaytonaConfig().resource_tiers)
+        assert picked.await_args.kwargs == {"current_tier": None}
+
+    @pytest.mark.asyncio
+    async def test_a_failure_reading_the_plan_is_unread(self):
+        with self._plan() as picked:
+            picked.side_effect = RuntimeError("platform down")
+            assert await _make_manager().plan_tier("user-1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_computer_counts_the_size_it_holds_as_its_own(self):
+        computer = _make_computer(resource_tier="performance")
+        with self._plan("max") as picked:
+            tier = await _make_manager().plan_tier("user-1", computer)
+
+        assert tier == "max"
+        assert picked.await_args.kwargs == {"current_tier": "performance"}
+
+
+class TestEnsureStandInHost(_Base):
+    """With Home on a machine of the user's own and no cloud computer, one the
+    plan grants is made for Home's stand-in: marked, not primary, at standard,
+    its first build left to the caller, and only on the platform's definitive
+    yes."""
+
+    @contextmanager
+    def _state(
+        self,
+        *,
+        gating=True,
+        needed=True,
+        marked=False,
+        adopted=False,
+        granted=True,
+        running_slot=True,
+    ):
+        @asynccontextmanager
+        async def capacity_lock(_user_id):
+            self.locked = True
+            yield self.lock_conn
+
+        self.locked = False
+        self.lock_conn = object()
+        manager = _make_manager()
+        manager.create_computer_for_user = AsyncMock(
+            return_value=_make_computer("stand-in-host", is_primary=False)
+        )
+        with (
+            patch("src.server.services.platform_client.platform_gating_active", return_value=gating),
+            patch(
+                "src.server.dependencies.usage_limits.computer_slot_granted",
+                AsyncMock(side_effect=lambda _u, running=False: running_slot if running else granted),
+            ),
+            patch(f"{_MACHINES}.stand_in_needed", AsyncMock(return_value=needed)) as needed_check,
+            patch(f"{_MACHINES}.stand_in_host_marked", AsyncMock(return_value=marked)) as marked_check,
+            patch(f"{_MACHINES}.adopt_stand_in_host", AsyncMock(return_value=adopted)) as adopt,
+            patch(f"{_MACHINES}.computer_capacity_lock", capacity_lock),
+        ):
+            self.adopt, self.needed, self.marked = adopt, needed_check, marked_check
+            yield manager
+
+    @pytest.mark.asyncio
+    async def test_its_reads_under_the_lock_use_the_locks_own_connection(self):
+        """Loads racing for the lock each wait on it holding a pool
+        connection, so a holder checking out another for its reads could wait
+        on the pool its waiters fill."""
+        with self._state(adopted=True) as manager:
+            assert await manager.ensure_stand_in_host("user-1") is None
+        for check in (self.needed, self.marked, self.adopt):
+            assert check.await_args_list[-1].kwargs == {"conn": self.lock_conn}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "running_slot", [True, False], ids=["built-now", "no-definitive-running-room"]
+    )
+    async def test_makes_a_marked_cloud_computer_at_standard(self, running_slot):
+        """Made at standard, it takes the plan's size at its first build
+        (``_first_build_tier``). It starts only on the plan's definitive room
+        to run it: the gate lets a start through on a read that times out, and
+        nobody asked for this one."""
+        with self._state(running_slot=running_slot) as manager:
+            made = await manager.ensure_stand_in_host("user-1")
+
+        assert made["computer_id"] == "stand-in-host"
+        assert self.locked
+        manager.create_computer_for_user.assert_awaited_once_with(
+            "user-1",
+            kind="daytona",
+            prepare=running_slot,
+            config={"stand_in_host": True},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state",
+        [
+            {"gating": False},
+            {"needed": False},
+            {"marked": True},
+            {"adopted": True},
+            {"granted": False},
+        ],
+        ids=["oss", "home-on-the-cloud", "marked-or-removed", "a-cloud-computer-it-marks", "plan-grants-none-or-unread"],
+    )
+    async def test_makes_nothing_otherwise(self, state):
+        with self._state(**state) as manager:
+            assert await manager.ensure_stand_in_host("user-1") is None
+        manager.create_computer_for_user.assert_not_awaited()
 
 
 class TestMachineKeying(_Base):
@@ -1319,6 +1449,29 @@ class TestTombstone(_Base):
         return manager, workspace or _make_workspace()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner_removing", [False, True], ids=["delete", "owners-remove"])
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_the_marker_says_whose_retirement_it_is(
+        self, mock_live, mock_get, mock_status, owner_removing
+    ):
+        """A sweep that takes the key first finishes the retirement, so the
+        marker carries that it is the owner's remove."""
+        manager, workspace = self._retiring_manager()
+        mock_live.return_value = []
+        mock_get.return_value = _make_computer(is_primary=False, status="running")
+        mock_status.return_value = None
+
+        await manager._retire_machine_if_empty(
+            "comp-1", "ws-a", workspace, owner_removing=owner_removing
+        )
+
+        assert self.mark_retirement_pending.await_args_list[0] == mock_call(
+            "comp-1", by_owner=owner_removing
+        )
+
+    @pytest.mark.asyncio
     @patch(f"{_RETIREMENT}.update_computer_status")
     @patch(f"{_RETIREMENT}.get_computer")
     @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
@@ -1345,7 +1498,11 @@ class TestTombstone(_Base):
         ]
         assert [item.kwargs for item in mock_status.await_args_list] == [
             {"expected": "running"},
-            {"expected": "stopping"},
+            {
+                "expected": "stopping",
+                "drop_config_key": "stand_in_host",
+                "unless_config_key": "retire_by_owner",
+            },
         ]
         manager._remove_workspace_folder.assert_not_awaited()
 
@@ -1519,7 +1676,11 @@ class TestTombstone(_Base):
         manager._teardown_machine.assert_awaited_once()
         assert [item.kwargs for item in mock_status.await_args_list] == [
             {"expected": "running"},
-            {"expected": "stopping"},
+            {
+                "expected": "stopping",
+                "drop_config_key": "stand_in_host",
+                "unless_config_key": "retire_by_owner",
+            },
         ]
 
     @pytest.mark.asyncio
@@ -1600,6 +1761,35 @@ class TestRemovingAComputer(_Base):
         assert refused.value.code == code
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["daytona", "ssh"])
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    @patch(f"{_RETIREMENT}.mark_computer_retirement_pending")
+    async def test_a_remove_is_marked_torn_down_only_once_a_cloud_sandbox_is_gone(
+        self, mock_mark, mock_live, mock_get, mock_status, kind
+    ):
+        """The sweep that finishes a torn-down remove only tombstones it, so the
+        mark waits for the teardown; and one of the user's own machines still
+        owes its machine what comes after the tombstone, so it never gets it."""
+        manager = self._removing_manager()
+        order = []
+        mock_mark.side_effect = lambda *_a, **kw: order.append(("mark", kw)) or True
+        manager._teardown_machine = AsyncMock(side_effect=lambda *_a: order.append(("teardown", {})))
+        computer = {**self._spare(status="stopped"), "kind": kind}
+        mock_get.return_value = computer
+        mock_live.return_value = []
+        mock_status.side_effect = [
+            {**computer, "status": "stopping"},
+            {**computer, "status": "deleted"},
+        ]
+
+        await manager.remove_computer("comp-1")
+
+        torn_down = [("mark", {"by_owner": True, "torn_down": True})] if kind == "daytona" else []
+        assert order == [("mark", {}), ("teardown", {}), *torn_down]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["stopped", "running", "error"])
     @patch(f"{_RETIREMENT}.update_computer_status")
     @patch(f"{_RETIREMENT}.get_computer")
@@ -1620,9 +1810,12 @@ class TestRemovingAComputer(_Base):
 
         await manager.remove_computer("comp-1")
 
-        # Marked before the decision, so a create or start reading the row
-        # from here on refuses it.
-        mock_mark.assert_awaited_once_with("comp-1")
+        # Marked before the checks, so a create or start reading the row from
+        # here on refuses it, and as the owner's in the claim itself.
+        assert mock_mark.await_args_list == [
+            mock_call("comp-1"),
+            mock_call("comp-1", by_owner=True, torn_down=True),
+        ]
         (binding,) = manager._teardown_machine.await_args.args
         assert (binding.workspace_id, binding.computer_id, binding.provider_ref) == (
             "",
@@ -1634,8 +1827,15 @@ class TestRemovingAComputer(_Base):
             ("comp-1", "deleted"),
         ]
         assert [item.kwargs for item in mock_status.await_args_list] == [
-            {"expected": status},
-            {"expected": "stopping"},
+            {
+                "expected": status,
+                "merge_config": {"retire_when_empty": True, "retire_by_owner": True},
+            },
+            {
+                "expected": "stopping",
+                "drop_config_key": None,
+                "unless_config_key": "retire_by_owner",
+            },
         ]
         self.clear_retirement_pending.assert_not_awaited()
         assert manager._machine_if_known("comp-1") is None
@@ -1915,8 +2115,95 @@ class TestRemovingAComputer(_Base):
 
         await self._refused(manager, "busy")
 
-        mock_status.assert_awaited_once_with("comp-1", "stopping", expected="stopped")
+        mock_status.assert_awaited_once_with(
+            "comp-1",
+            "stopping",
+            expected="stopped",
+            merge_config={"retire_when_empty": True, "retire_by_owner": True},
+        )
         manager._teardown_machine.assert_not_awaited()
+
+    @staticmethod
+    def _row_writes(row, mark, clear, status):
+        """Stand in for the marker and status writes on one row, the claim
+        refused when its fence misses."""
+
+        async def marked(_computer_id, **owner):
+            before = dict(row.get("config", {}))
+            row["config"] = {**before, "retire_when_empty": True}
+            if owner.get("by_owner"):
+                row["config"]["retire_by_owner"] = True
+            return row["config"] != before
+
+        async def set_status(_computer_id, new, *, expected, merge_config=None, **_kw):
+            if row["status"] != expected:
+                return None
+            row["status"] = str(new)
+            row["config"] = {**row.get("config", {}), **(merge_config or {})}
+            return dict(row)
+
+        async def cleared(_computer_id):
+            for key in ("retire_when_empty", "retire_by_owner", "retire_torn_down"):
+                row.get("config", {}).pop(key, None)
+            return True
+
+        mark.side_effect = marked
+        clear.side_effect = cleared
+        status.side_effect = set_status
+
+    @pytest.mark.asyncio
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_worker_gone_right_after_the_claim_leaves_the_owners_remove_durable(
+        self, mock_live, mock_get, mock_status
+    ):
+        """What it claimed is the sweep's to finish as its owner's remove,
+        which keeps a stand-in's mark rather than settle it as kept."""
+        manager = self._removing_manager()
+        row = self._spare()
+        self._row_writes(
+            row, self.mark_retirement_pending, self.clear_retirement_pending, mock_status
+        )
+        mock_get.side_effect = lambda *_a, **_k: dict(row)
+        mock_live.return_value = []
+        manager._binding_from_computer = MagicMock(side_effect=RuntimeError("worker gone"))
+
+        with pytest.raises(RuntimeError, match="worker gone"):
+            await manager.remove_computer("comp-1")
+
+        assert row["status"] == "stopping"
+        assert row["config"] == {"retire_when_empty": True, "retire_by_owner": True}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("left", [{}, {"retire_when_empty": True}], ids=["unmarked", "owed-a-delete"])
+    @patch(f"{_RETIREMENT}.update_computer_status")
+    @patch(f"{_RETIREMENT}.get_computer")
+    @patch(f"{_RETIREMENT}.get_live_workspace_ids_for_computer")
+    async def test_a_claim_lost_to_another_transition_leaves_no_owners_mark(
+        self, mock_live, mock_get, mock_status, left
+    ):
+        """The owner was told busy, so nothing may read as their remove, and
+        a retirement another delete left owed stays as it was."""
+        manager = self._removing_manager()
+        row = self._spare(config=dict(left))
+        self._row_writes(
+            row, self.mark_retirement_pending, self.clear_retirement_pending, mock_status
+        )
+        claim = mock_status.side_effect
+
+        async def start_lands_first(*args, **kwargs):
+            row["status"] = "starting"
+            return await claim(*args, **kwargs)
+
+        mock_status.side_effect = start_lands_first
+        mock_get.side_effect = lambda *_a, **_k: dict(row)
+        mock_live.return_value = []
+
+        await self._refused(manager, "busy")
+
+        mock_status.assert_awaited_once()
+        assert row["config"] == left
 
     @pytest.mark.asyncio
     @patch(f"{_RETIREMENT}.update_computer_status")
@@ -4809,7 +5096,7 @@ def _no_computer_to_promote():
 @pytest.fixture(autouse=True)
 def _local_lifecycle_capacity(monkeypatch):
     # Lifecycle fakes have no platform or database; admission is tested separately.
-    monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: False)
+    monkeypatch.setattr("src.server.services.platform_client.platform_gating_active", lambda: False)
 
 
 @pytest.mark.asyncio
@@ -4841,7 +5128,7 @@ async def test_capacity_admission_holds_user_lock_through_committed_claim(denied
         return {"status": "starting"}
 
     with (
-        patch("src.server.dependencies.usage_limits.platform_gating_active", return_value=True),
+        patch("src.server.services.platform_client.platform_gating_active", return_value=True),
         patch("src.server.dependencies.usage_limits.enforce_computer_limit", side_effect=admit),
         patch(f"{_MACHINES}.computer_capacity_lock", capacity_lock),
         patch(f"{_MACHINES}.get_computer", AsyncMock(return_value=_make_computer(status="stopped"))),
@@ -4864,7 +5151,7 @@ async def test_an_owners_machine_claims_its_start_outside_the_plan_cap():
     capacity = MagicMock(side_effect=AssertionError("capacity lock taken"))
     limit = AsyncMock(side_effect=AssertionError("limit read"))
     with (
-        patch("src.server.dependencies.usage_limits.platform_gating_active", return_value=True),
+        patch("src.server.services.platform_client.platform_gating_active", return_value=True),
         patch("src.server.dependencies.usage_limits.enforce_computer_limit", limit),
         patch(f"{_MACHINES}.computer_capacity_lock", capacity),
         patch(

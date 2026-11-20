@@ -351,6 +351,7 @@ async def resolve_automation_turn_llm_config(
     thread_id: str | None = None,
     enabled_subagents: list[str] | None = None,
     workspace_id: str | None = None,
+    identity: Any = None,
     role: Any = "analyst",
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve an automation first turn's LLM config with subscription fallback."""
@@ -365,6 +366,7 @@ async def resolve_automation_turn_llm_config(
             thread_id=thread_id,
             enabled_subagents=enabled_subagents,
             workspace_id=workspace_id,
+            identity=identity,
             role=role,
         )
 
@@ -403,6 +405,7 @@ async def resolve_ptc_turn_llm_config(
     is_byok: bool | None = None,
     thread_id: str | None = None,
     workspace_id: str | None = None,
+    identity: Any = None,
     role: Any = "analyst",
     run_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
@@ -418,6 +421,7 @@ async def resolve_ptc_turn_llm_config(
             thread_id=thread_id,
             enabled_subagents=getattr(request, "subagents_enabled", None),
             workspace_id=workspace_id,
+            identity=identity,
             role=role,
         )
         if fallback_record is not None:
@@ -437,6 +441,7 @@ async def resolve_ptc_turn_llm_config(
         thread_id=thread_id,
         enabled_subagents=getattr(request, "subagents_enabled", None),
         workspace_id=workspace_id,
+        identity=identity,
         role=role,
     )
     return config, run_metadata

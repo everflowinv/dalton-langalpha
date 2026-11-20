@@ -1,7 +1,7 @@
 import {
   useEffect, useId, useRef, useState, type CSSProperties, type ReactNode, type Ref, type RefObject,
 } from 'react';
-import { Check, Settings, Star } from 'lucide-react';
+import { Building2, Check, Settings, Star } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   Button, GridList, GridListHeader, GridListItem, GridListSection, ToggleButton, ToggleButtonGroup,
@@ -20,6 +20,8 @@ import { isImeComposing } from '@/lib/ime';
 import type { ModelConnection, ModelGroup } from '@/lib/modelGroups';
 import { isSubscription, subscriptionPayer, type Payer } from '@/lib/modelPayer';
 import { usePayerLabel } from '@/hooks/usePayerLabel';
+import { useAccount } from '@/hooks/useAccount';
+import { MODEL_RULE_COPY, modelsRule } from '@/lib/accountRules';
 import { useNow } from '@/hooks/useNow';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { ModelMark, MarkedModelName } from '@/components/model/ModelMark';
@@ -35,7 +37,7 @@ type Metadata = Record<string, ModelMetadataEntry>;
  *  picking, through `fix`. One a check may free offers Check now, through
  *  `check`, and stays enabled so the control is reached as a row's second
  *  one is, though a press on the row itself does nothing. */
-export type ModelRowStatus = { tag?: string } | { unavailable: string; fix?: () => void; check?: CheckTarget };
+export type ModelRowStatus = { tag?: string } | { unavailable: string; fix?: () => void; fixLabel?: string; check?: CheckTarget };
 
 interface ListProps {
   selectedModel: string | null;
@@ -156,6 +158,10 @@ function ModelList({
   const { t } = useTranslation();
   const payerLabel = usePayerLabel();
   const now = useNow();
+  // A rule that narrows the models is named once under the list, so a model
+  // the user remembers and cannot find here is explained.
+  const account = useAccount();
+  const narrowedBy = modelsRule(account.policy);
   const [query, setQuery] = useState('');
   const [tab, setTab] = useState<string | null>(null);
   const [connectionTab, setConnectionTab] = useState<string | null>(null);
@@ -360,6 +366,14 @@ function ModelList({
           </GridList>
         </div>
       </div>
+      {narrowedBy && (
+        <p className="rule-t flex flex-none items-start gap-2 px-3 py-2 text-xs text-(--color-text-tertiary)">
+          <Building2 aria-hidden className="mt-px h-3.5 w-3.5 flex-none" />
+          <span className="min-w-0">
+            {t(`organization.picker.foot.${MODEL_RULE_COPY[narrowedBy]}`, { who: account.setterName(narrowedBy).start })}
+          </span>
+        </p>
+      )}
     </>
   );
 }
@@ -452,6 +466,7 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
   const name = getModelDisplayName(model, metadata);
   const reason = 'unavailable' in status ? status.unavailable : undefined;
   const check = 'unavailable' in status ? status.check : undefined;
+  const fixLabel = 'unavailable' in status && status.fix ? status.fixLabel : undefined;
   const actionable = 'unavailable' in status && (!!status.fix || !!check);
   const tag = 'tag' in status ? status.tag : undefined;
   return (
@@ -460,7 +475,7 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
       id={model}
       // A row a reason holds back says it as part of its name, which is all a
       // screen reader reads of a row.
-      textValue={reason ? `${name}, ${reason}` : name}
+      textValue={[name, reason, fixLabel].filter(Boolean).join(', ')}
       isDisabled={reason !== undefined && !actionable}
       data-slot="menu-item"
       className={cn('group', MENU_ROW, 'data-disabled:text-(--color-text-tertiary)', actionable && 'text-(--color-text-tertiary)')}
@@ -496,7 +511,11 @@ function ModelRow({ model, rowRef, metadata, payer, selected, favorite, status, 
             star's column, which Check now takes on this line where it is offered. */}
         {reason && (
           <span className={cn('flex items-start gap-2 text-xs text-(--color-text-tertiary)', !check && 'pe-7', provider && llmProviderArt(provider) && 'ps-[1.375rem]')}>
-            <span className="min-w-0 flex-1 text-pretty">{reason}</span>
+            <span className="min-w-0 flex-1 text-pretty">
+              {reason}
+              {/* Picking the row runs the fix; the label says where it goes. */}
+              {fixLabel && <span aria-hidden="true" className="font-medium text-(--color-accent-primary)"> {fixLabel} →</span>}
+            </span>
             {check && <CheckNowFor target={check} icon />}
           </span>
         )}

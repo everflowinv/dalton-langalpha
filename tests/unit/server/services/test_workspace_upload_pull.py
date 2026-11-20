@@ -340,8 +340,8 @@ def _sandbox_pull(
     return (
         patch.object(
             upload_pull,
-            "owned_workspace_on_computer",
-            AsyncMock(return_value={"workspace_id": "ws-1", "status": "running"}),
+            "reached_workspace_on_computer",
+            AsyncMock(return_value=({"workspace_id": "ws-1", "status": "running"}, None)),
         ),
         # DALTON-HOOK(direct-upload-safety): default workspace row for resume owner/status lookup
         patch.object(
@@ -433,6 +433,48 @@ async def test_a_placement_a_retry_can_rescue_keeps_the_fetched_copy_for_it():
         with pytest.raises(RuntimeError):
             await _pull_once(_row(state="pulling", attempts=1), {})
     assert not [e for e in events if e[0] == "remove"]
+
+
+def _gate(*answers: set):
+    """A thread folder gate answering ``answers`` in turn, and what built it."""
+    gate = MagicMock()
+    gate.hidden = AsyncMock(side_effect=list(answers))
+    of = MagicMock(return_value=gate)
+    return gate, patch.object(upload_pull.ThreadFolderGate, "of", of), of
+
+
+@pytest.mark.asyncio
+async def test_a_folder_made_private_during_the_fetch_takes_no_file():
+    """A member's upload into a shared thread's folder, whose starter made it
+    private while the bytes were on their way: nothing is placed there."""
+    from contextlib import ExitStack
+
+    events: list = []
+    gate, gate_patch, of = _gate(set(), {"data/big.bin"})
+    with ExitStack() as stack:
+        for p in (*_sandbox_pull({"status": "ok"}, events=events), gate_patch):
+            stack.enter_context(p)
+        with pytest.raises(_Refused):
+            await _pull_once(_row(state="pulling", attempts=1), {})
+    assert of.call_args.args[1] == "user-1"
+    assert not [e for e in events if e[0] in ("placing", "place")]
+    assert events[-1] == ("remove", f"rm -f -- /home/u/Research/{STAGED}")
+    for call in gate.hidden.await_args_list:
+        assert tuple(call.args[0]) == ("data/big.bin", "data/big.bin")
+
+
+@pytest.mark.asyncio
+async def test_a_folder_private_before_the_pull_fetches_nothing():
+    from contextlib import ExitStack
+
+    events: list = []
+    _, gate_patch, _ = _gate({"data/big.bin"})
+    with ExitStack() as stack:
+        for p in (*_sandbox_pull({"status": "ok"}, events=events), gate_patch):
+            stack.enter_context(p)
+        with pytest.raises(_Refused):
+            await _pull_once(_row(state="pulling", attempts=1), {})
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -553,7 +595,7 @@ async def test_a_workspace_stopped_since_the_upload_began_is_not_started_again()
         for p in _sandbox_pull({"status": "ok"}):
             stack.enter_context(p)
         stack.enter_context(
-            patch.object(upload_pull, "owned_workspace_on_computer", AsyncMock(return_value=stopped))
+            patch.object(upload_pull, "reached_workspace_on_computer", AsyncMock(return_value=(stopped, None)))
         )
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquired))
         with pytest.raises(_Refused) as refused:
@@ -935,9 +977,9 @@ async def test_write_access_revoked_during_download_refuses_and_cleans_staged_an
     events: list = []
     ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=[
-            ws_row,
+            (ws_row, None),
             HTTPException(status_code=403, detail="Workspace write access revoked"),
         ],
     )
@@ -953,7 +995,7 @@ async def test_write_access_revoked_during_download_refuses_and_cleans_staged_an
     with ExitStack() as stack:
         for p in _sandbox_pull({"status": "ok"}, events=events):
             stack.enter_context(p)
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
         stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
         stack.enter_context(patch.object(store_multipart, "delete_object", delete_obj))
@@ -988,10 +1030,10 @@ async def test_write_access_revoked_while_waiting_for_path_lock_refuses_without_
         events.append(("check_access", lock_entered, user_id, need))
         if lock_entered:
             raise HTTPException(status_code=403, detail="Revoked while awaiting path lock")
-        return ws_row
+        return ws_row, None
 
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer, side_effect=verify_access
+        upload_pull.reached_workspace_on_computer, side_effect=verify_access
     )
     finish = create_autospec(
         upload_pull.db.finish_pull,
@@ -1022,7 +1064,7 @@ async def test_write_access_revoked_while_waiting_for_path_lock_refuses_without_
                 yield sb, ws
 
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire_wrapped))
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
         stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
         stack.enter_context(patch.object(upload_pull, "clean_up", clean))
@@ -1060,9 +1102,9 @@ async def test_write_access_revoked_on_staged_retry_refuses_and_removes_staged_c
     acquired_for: list[tuple[str, str]] = []
     ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
     err = HTTPException(status_code=status_code, detail="Access refused on staged retry")
-    side_effects = [err, err] if revoked_at == "before-retry" else [ws_row, err]
+    side_effects = [err, err] if revoked_at == "before-retry" else [(ws_row, None), err]
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer, side_effect=side_effects
+        upload_pull.reached_workspace_on_computer, side_effect=side_effects
     )
     get_ws = create_autospec(upload_pull.db_get_workspace, return_value=ws_row)
     finish = create_autospec(
@@ -1085,7 +1127,7 @@ async def test_write_access_revoked_on_staged_retry_refuses_and_removes_staged_c
                 yield sb, ws
 
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire_recording))
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
         stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
         stack.enter_context(patch.object(upload_pull.db, "release_pull", release))
@@ -1127,7 +1169,7 @@ async def test_already_placed_file_recovery_succeeds_even_if_write_access_later_
 
     ws_row = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=HTTPException(status_code=status_code, detail="Access revoked after placement"),
     )
     get_ws = create_autospec(upload_pull.db_get_workspace, return_value=ws_row)
@@ -1150,7 +1192,7 @@ async def test_already_placed_file_recovery_succeeds_even_if_write_access_later_
     layout = MagicMock(workspace=str(tmp_path))
     row = _row(state="pulling", attempts=2, placing_inode=inode)
     with ExitStack() as stack:
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
         stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
@@ -1192,7 +1234,7 @@ async def test_revoked_access_on_stopped_computer_does_not_start_computer_on_res
 
     non_running_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": ws_status}
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=HTTPException(status_code=status_code, detail="Access revoked"),
     )
     get_ws = create_autospec(upload_pull.db_get_workspace, return_value=non_running_ws)
@@ -1205,7 +1247,7 @@ async def test_revoked_access_on_stopped_computer_does_not_start_computer_on_res
     with ExitStack() as stack:
         for p in _sandbox_pull({"status": "ok"}):
             stack.enter_context(p)
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquired))
         stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
@@ -1250,7 +1292,7 @@ async def test_revoked_access_deferred_while_stopped_confirms_done_by_inode_when
     stopped_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "stopped"}
     running_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=HTTPException(status_code=status_code, detail="Access revoked"),
     )
     get_ws = create_autospec(
@@ -1275,7 +1317,7 @@ async def test_revoked_access_deferred_while_stopped_confirms_done_by_inode_when
     layout = MagicMock(workspace=str(tmp_path))
     row = _row(state="pulling", attempts=2, placing_inode=inode)
     with ExitStack() as stack:
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
         stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
@@ -1338,7 +1380,7 @@ async def test_revoked_access_deferred_while_stopped_cleans_staging_and_refuses_
     stopped_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "stopped"}
     running_ws = {"workspace_id": "ws-1", "user_id": "owner-1", "status": "running"}
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=HTTPException(status_code=status_code, detail="Access revoked"),
     )
     get_ws = create_autospec(
@@ -1364,7 +1406,7 @@ async def test_revoked_access_deferred_while_stopped_cleans_staging_and_refuses_
     layout = MagicMock(workspace=str(tmp_path))
     row = _row(state="pulling", attempts=2, placing_inode=inode)
     with ExitStack() as stack:
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
         stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
@@ -1422,7 +1464,7 @@ async def test_deleted_workspace_on_resume_is_refused_without_acquiring_sandbox(
     from unittest.mock import create_autospec
 
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=HTTPException(status_code=404, detail="Workspace not found"),
     )
     get_ws = create_autospec(upload_pull.db_get_workspace, return_value=deleted_row)
@@ -1438,7 +1480,7 @@ async def test_deleted_workspace_on_resume_is_refused_without_acquiring_sandbox(
     with ExitStack() as stack:
         for p in _sandbox_pull({"status": "ok"}):
             stack.enter_context(p)
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "db_get_workspace", get_ws))
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquired))
         stack.enter_context(patch.object(upload_pull.db, "finish_pull", finish))
@@ -1531,9 +1573,9 @@ async def test_existing_target_file_is_not_overwritten_when_write_access_revoked
 
     ws_row = {"workspace_id": "ws-1", "status": "running", "user_id": "owner-1"}
     check_access = create_autospec(
-        upload_pull.owned_workspace_on_computer,
+        upload_pull.reached_workspace_on_computer,
         side_effect=[
-            ws_row,
+            (ws_row, None),
             HTTPException(status_code=403, detail="Write access revoked"),
         ],
     )
@@ -1550,7 +1592,7 @@ async def test_existing_target_file_is_not_overwritten_when_write_access_revoked
     layout = MagicMock(workspace=str(tmp_path))
     row = _row(state="pulling", attempts=2, placing_inode=inode)
     with ExitStack() as stack:
-        stack.enter_context(patch.object(upload_pull, "owned_workspace_on_computer", check_access))
+        stack.enter_context(patch.object(upload_pull, "reached_workspace_on_computer", check_access))
         stack.enter_context(patch.object(upload_pull, "acquire_sandbox_to_change", acquire))
         stack.enter_context(patch.object(upload_pull, "owner_layout", MagicMock(return_value=layout)))
         stack.enter_context(patch.object(upload_pull, "previous_dir_names_of", MagicMock(return_value=())))

@@ -509,17 +509,19 @@ async def test_agent_inputs_and_budget_attribution_keep_caller_for_billing_and_o
         ),
     )
 
+    from src.server.services.shared_workspaces.turn import TurnIdentity
+
     inputs = await thread_agent.AgentInputs.read(
         session,
-        user_id="u-caller-a",
+        identity=TurnIdentity(sender="u-caller-a", owner="u-owner-b", recorded_as="u-caller-a"),
         workspace_id="ws-b",
         thread_id="th-1",
         role="analyst",
         user_profile={"name": "Caller A"},
         workspace_owner_id="u-owner-b",
     )
-    assert inputs.user_id == "u-caller-a"
-    assert inputs.workspace_owner_id == "u-owner-b"
+    assert inputs.identity.sender == "u-caller-a"
+    assert inputs.identity.owner == "u-owner-b"
     assert inputs.computer_id == "c-colleague-1"
     assert direct_calls == [
         {
@@ -531,6 +533,7 @@ async def test_agent_inputs_and_budget_attribution_keep_caller_for_billing_and_o
     ]
     built_kwargs = inputs.build_kwargs()
     assert built_kwargs["user_id"] == "u-caller-a"
+    assert built_kwargs["owner_id"] == "u-owner-b"
     assert built_kwargs["workspace_owner_id"] == "u-owner-b"
 
 

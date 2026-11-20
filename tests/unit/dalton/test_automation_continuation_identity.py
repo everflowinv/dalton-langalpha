@@ -35,6 +35,7 @@ from src.server.services.egress.direct_tools import order_ledger_for_turn
 from src.server.services.report_back import command as command_rb
 from src.server.services.report_back import subagent as subagent_rb
 from src.server.services.report_back.handoff import carry
+from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.services.thread_agent import AgentInputs
 from src.server.services.turn_runtime import TurnRoute
 from src.server.services.wakeups import cancel_notice
@@ -171,7 +172,8 @@ async def _run_ptc_through_graph_config(
         claude_code_admitted=None,
         claude_code=False,
         user_skill_dir=None,
-        disabled_skills=None,
+        disabled_skills=frozenset(),
+        withheld_skills=frozenset(),
         filesystem=SimpleNamespace(enabled_tools=None),
     )
     session_mock = create_autospec(Session, instance=True)
@@ -223,7 +225,10 @@ async def _run_ptc_through_graph_config(
         patch(f"{_PTC}.ensure_thread", create_autospec(ptc_run.ensure_thread, return_value=request_prep.PriorThread())),
         patch(f"{_PTC}.wait_or_steer", create_autospec(ptc_run.wait_or_steer, return_value=(True, None))),
         patch(f"{_PTC}.read_disk_notice", create_autospec(ptc_run.read_disk_notice, return_value=(None, False))),
-        patch(f"{_PTC}.get_user_profile_for_prompt", create_autospec(ptc_run.get_user_profile_for_prompt, return_value=None)),
+        patch(
+            "src.server.services.shared_workspaces.turn.get_user_profile_for_prompt",
+            AsyncMock(return_value=None),
+        ),
         patch(f"{_PTC}._resolve_fork", create_autospec(ptc_run._resolve_fork, return_value=("system", None))),
         patch(f"{_PTC}._resolve_origin_meta", create_autospec(ptc_run._resolve_origin_meta, return_value={})),
         patch(f"{_PTC}.begin_run", create_autospec(ptc_run.begin_run, side_effect=_fake_begin_run)),
@@ -272,6 +277,7 @@ async def _run_ptc_through_graph_config(
             user_input="continue",
             user_id=_USER,
             route=TurnRoute(_WORKSPACE, "analyst"),
+            identity=TurnIdentity(sender=_USER, owner=_USER, recorded_as=_USER),
             is_byok=False,
             config=config,
         )
@@ -1060,7 +1066,8 @@ async def test_s1_start_locks_execution_and_takes_over_inside_same_transaction()
             claude_code_admitted=None,
             claude_code=False,
             user_skill_dir=None,
-            disabled_skills=None,
+            disabled_skills=frozenset(),
+            withheld_skills=frozenset(),
             filesystem=SimpleNamespace(enabled_tools=None),
         )
         def _capture_cfg(*args, **kwargs):
@@ -1076,7 +1083,10 @@ async def test_s1_start_locks_execution_and_takes_over_inside_same_transaction()
                 patch(f"{_PTC}.ensure_thread", create_autospec(ptc_run.ensure_thread, return_value=request_prep.PriorThread())),
                 patch(f"{_PTC}.wait_or_steer", create_autospec(ptc_run.wait_or_steer, return_value=(True, None))),
                 patch(f"{_PTC}.read_disk_notice", create_autospec(ptc_run.read_disk_notice, return_value=(None, False))),
-                patch(f"{_PTC}.get_user_profile_for_prompt", create_autospec(ptc_run.get_user_profile_for_prompt, return_value=None)),
+                patch(
+            "src.server.services.shared_workspaces.turn.get_user_profile_for_prompt",
+            AsyncMock(return_value=None),
+        ),
                 patch(f"{_PTC}._resolve_fork", create_autospec(ptc_run._resolve_fork, return_value=("system", None))),
                 patch(f"{_PTC}._resolve_origin_meta", create_autospec(ptc_run._resolve_origin_meta, return_value={})),
                 patch(f"{_PTC}.keep_named_model", create_autospec(ptc_run.keep_named_model, return_value=None)),
@@ -1115,6 +1125,7 @@ async def test_s1_start_locks_execution_and_takes_over_inside_same_transaction()
                 user_input="continue",
                 user_id=_USER,
                 route=TurnRoute(_WORKSPACE, "analyst"),
+                identity=TurnIdentity(sender=_USER, owner=_USER, recorded_as=_USER),
                 is_byok=False,
                 config=config,
             )

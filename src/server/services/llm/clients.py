@@ -19,6 +19,8 @@ from src.llms.model_spec import (
     summary_reasoning_effort,
 )
 from src.llms.preferences import resolve_tuning, resolve_turn_tuning
+from src.server.services.policy import OWN_SUBSCRIPTIONS, Policy, raise_model_denied
+from src.server.services.account import require_policy
 
 from . import logger, user_models
 from .availability import (
@@ -267,7 +269,9 @@ def subscription_route(model_name: str, mc, *, custom_entry: dict | None) -> Sub
 
 def plan_includes(model_info: dict, plan_type: str | None) -> bool:
     """Whether a subscription on ``plan_type`` may run the model (manifest
-    ``oauth_plans``). An unknown plan passes: the upstream stays the authority."""
+    ``oauth_plans``). A model that lists no plans takes any, and a plan not
+    read (None or empty) passes, since the upstream stays the authority; a
+    plan that was read must be on the list."""
     allowed = model_info.get("oauth_plans")
     plan = (plan_type or "").lower()
     return not (allowed and plan and plan not in {p.lower() for p in allowed})
@@ -548,6 +552,7 @@ async def resolve_model_client(
     reasoning_effort=None,
     service_tier=None,
     allow_platform_fallback=False,
+    policy: Policy | None = None,
     _pref_cache=None,
     _byok_cache=None,
 ) -> ResolvedClient:
@@ -566,25 +571,40 @@ async def resolve_model_client(
 
     A Claude Code row resolves to its runtime target, on the user's own
     credential: the runtime signs in with the setup token kept for it, never a key.
+
+    Own access the ``policy`` denies (looked up when not given) is skipped as
+    if it were not there, and a model that runs only on a denied sign-in is
+    refused.
     """
+    if policy is None:
+        policy = await require_policy(user_id)
     source, entry = await user_models.classify_model(user_id, model_name, _pref_cache=_pref_cache)
+    custom_entry = entry if source == ModelSource.CUSTOM else None
 
     if source == ModelSource.SYSTEM and is_claude_code_model(model_name):
         from src.llms.llm import create_llm
 
+        if not policy.allows(OWN_SUBSCRIPTIONS):
+            raise_model_denied(policy, OWN_SUBSCRIPTIONS, model_name)
         return ResolvedClient(
             create_llm(model_name, reasoning_effort=reasoning_effort), source, CredentialSource.OAUTH
         )
 
-    client = await resolve_oauth_llm_client(
-        user_id, model_name, reasoning_effort,
-        service_tier=service_tier, cache_key=cache_key,
-        custom_entry=entry if source == ModelSource.CUSTOM else None,
-    )
-    if client:
-        return ResolvedClient(client, source, CredentialSource.OAUTH)
+    if policy.allows(OWN_SUBSCRIPTIONS):
+        client = await resolve_oauth_llm_client(
+            user_id, model_name, reasoning_effort,
+            service_tier=service_tier, cache_key=cache_key,
+            custom_entry=custom_entry,
+        )
+        if client:
+            return ResolvedClient(client, source, CredentialSource.OAUTH)
+    else:
+        from src.llms.llm import LLM as LLMFactory
 
-    if is_byok:
+        if subscription_route(model_name, LLMFactory.get_model_config(), custom_entry=custom_entry):
+            raise_model_denied(policy, OWN_SUBSCRIPTIONS, model_name)
+
+    if policy.byok(is_byok):
         client = await resolve_byok_llm_client(
             user_id, model_name, is_byok, reasoning_effort,
             _pref_cache=_pref_cache, cache_key=cache_key, _byok_cache=_byok_cache,
@@ -620,6 +640,7 @@ async def credential_route(
     model_name: str,
     *,
     is_byok: bool,
+    policy: Policy | None = None,
     _pref_cache: dict | None = None,
     _byok_cache: dict | None = None,
 ) -> Route:
@@ -629,18 +650,21 @@ async def credential_route(
     use: a subscription's model runs on that sign-in or not at all (whether
     the sign-in is there and its plan includes the model is the caller's
     question, ``plan_includes``); then the user's own key, when keys are on;
-    then, for a manifest model, the deployment.
+    then, for a manifest model, the deployment. Own access the ``policy``
+    denies is no route.
     """
     from src.llms.llm import LLM as LLMFactory
 
+    if policy is None:
+        policy = await require_policy(user_id)
     mc = LLMFactory.get_model_config()
     source, entry = await user_models.classify_model(user_id, model_name, _pref_cache=_pref_cache)
     custom = source == ModelSource.CUSTOM
     if source == ModelSource.SYSTEM and is_claude_code_model(model_name):
-        return ClaudeCodeRoute(entry)
+        return ClaudeCodeRoute(entry) if policy.allows(OWN_SUBSCRIPTIONS) else NoRoute()
     if route := subscription_route(model_name, mc, custom_entry=entry if custom else None):
-        return route
-    if is_byok and (route := await byok_key(
+        return route if policy.allows(OWN_SUBSCRIPTIONS) else NoRoute()
+    if policy.byok(is_byok) and (route := await byok_key(
         user_id, model_name, source, entry, mc,
         _pref_cache=_pref_cache, _byok_cache=_byok_cache,
     )):
@@ -801,7 +825,8 @@ def _stamp(config, client, prompt_guidance: str | None) -> None:
 
 async def _resolve_role_clients(
     config, user_id: str, roles: list[LLMRole], model_pref: dict,
-    byok_cache: dict, *, is_byok: bool, cache_key: str | None,
+    # DALTON-HOOK(subagent-model-pin): keep policy optional for legacy callers and unit tests
+    byok_cache: dict, *, is_byok: bool, cache_key: str | None, policy: Policy | None = None,
     main_model: str | None = None,
 ) -> None:
     """Resolve compaction/fetch/subagent role clients onto ``config`` in place.
@@ -838,7 +863,7 @@ async def _resolve_role_clients(
             rc = await resolve_model_client(
                 user_id, model, is_byok=is_byok, cache_key=cache_key,
                 allow_platform_fallback=platform_ok,
-                reasoning_effort=effort,
+                reasoning_effort=effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
             )
         except Exception:
@@ -856,7 +881,7 @@ async def _resolve_role_clients(
                 user_id, role.model, is_byok=is_byok, cache_key=cache_key,
                 allow_platform_fallback=_needs_own_client(role),
                 service_tier=role.service_tier,
-                reasoning_effort=role.reasoning_effort,
+                reasoning_effort=role.reasoning_effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
             )
         except Exception:
@@ -953,7 +978,8 @@ async def _resolve_role_clients(
 
 async def _resolve_fallback_clients(
     config, user_id: str, model_pref: dict, byok_cache: dict,
-    *, is_byok: bool, cache_key: str | None,
+    # DALTON-HOOK(llm-overlay): keep policy optional for legacy callers and unit tests
+    *, is_byok: bool, cache_key: str | None, policy: Policy | None = None,
     reasoning_effort: str | None = None, fast_mode: bool | None = None,
 ) -> None:
     """Resolve ``config.llm.fallback`` names into client instances in place.
@@ -990,7 +1016,7 @@ async def _resolve_fallback_clients(
                 user_id, model_name, is_byok=is_byok, cache_key=cache_key,
                 allow_platform_fallback=platform_ok,
                 service_tier=_tier_for(tuning.fast_mode),
-                reasoning_effort=tuning.reasoning_effort,
+                reasoning_effort=tuning.reasoning_effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
             )
         except Exception:
@@ -1052,6 +1078,7 @@ async def _resolve_fallback_clients(
 
 async def _stamp_credential_payer(
     config, user_id: str, model_name: str, *, is_byok: bool, model_pref: dict, byok_cache: dict,
+    policy: Policy,
 ) -> None:
     """Record who the main model's credential bills, for a failed turn to name.
 
@@ -1069,7 +1096,8 @@ async def _stamp_credential_payer(
     own = config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK)
     try:
         route = await credential_route(
-            user_id, model_name, is_byok=is_byok, _pref_cache=model_pref, _byok_cache=byok_cache,
+            user_id, model_name, is_byok=is_byok, policy=policy,
+            _pref_cache=model_pref, _byok_cache=byok_cache,
         )
         named = route_payer(route, LLMFactory.get_model_config())
         if named is not None and (own or named.payer == "local"):
@@ -1083,6 +1111,7 @@ async def resolve_clients(
     config, user_id: str, effective_model: str, model_pref: dict,
     subagent_roles: list[LLMRole], *, is_byok: bool, thread_id: str | None,
     reasoning_effort: str | None, fast_mode: bool | None, user_defined: bool,
+    policy: Policy,
 ) -> None:
     """Build every client this turn can reach, tuned and stamped as it is built.
 
@@ -1124,6 +1153,7 @@ async def resolve_clients(
         reasoning_effort=main_tuning.reasoning_effort,
         service_tier=_tier_for(main_tuning.fast_mode),
         allow_platform_fallback=bool(main_tuning.reasoning_effort),
+        policy=policy,
         _pref_cache=model_pref, _byok_cache=byok_cache,
     )
     # Always store credential_source (even NONE) — single source of truth
@@ -1131,7 +1161,7 @@ async def resolve_clients(
     config.credential_source = main.credential_source
     await _stamp_credential_payer(
         config, user_id, effective_model, is_byok=is_byok,
-        model_pref=model_pref, byok_cache=byok_cache,
+        model_pref=model_pref, byok_cache=byok_cache, policy=policy,
     )
     if main.client is not None:
         _stamp(config, main.client, config.prompt_guidance)
@@ -1153,12 +1183,12 @@ async def resolve_clients(
     await asyncio.gather(
         _resolve_role_clients(
             config, user_id, roles, model_pref, byok_cache,
-            is_byok=is_byok, cache_key=thread_id,
+            is_byok=is_byok, cache_key=thread_id, policy=policy,
             main_model=None if is_claude_code_model(effective_model) else effective_model,
         ),
         _resolve_fallback_clients(
             config, user_id, model_pref, byok_cache,
-            is_byok=is_byok, cache_key=thread_id,
+            is_byok=is_byok, cache_key=thread_id, policy=policy,
             reasoning_effort=reasoning_effort, fast_mode=fast_mode,
         ),
     )

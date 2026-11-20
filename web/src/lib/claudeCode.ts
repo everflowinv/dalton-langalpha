@@ -121,6 +121,16 @@ export function computerTokenWorks(c: ClaudeCodeComputer, now: number): boolean 
   return TOKEN_WORKS.has(c.state) && !(c.expires_at && Date.parse(c.expires_at) <= now);
 }
 
+/** Whose setup token: the one saved in Settings, or the one kept on one of
+ *  the user's own computers. Here rather than with the token sheets
+ *  (`tokenTarget`), since setup's facts read it on every page's first load. */
+export type TokenTarget = { kind: 'saved' } | { kind: 'computer'; computerId: string; name: string };
+
+export const SAVED_TOKEN: TokenTarget = { kind: 'saved' };
+
+export const computerTokenTarget = (c: Pick<ClaudeCodeComputer, 'computer_id' | 'name'>): TokenTarget =>
+  ({ kind: 'computer', computerId: c.computer_id, name: c.name });
+
 /** Settings → Model access. */
 export const MODEL_ACCESS_URL = '/settings?tab=model';
 
@@ -209,6 +219,14 @@ export const claudeCodeTokenLink = (workspaceId?: string | null): PageLinkSpec =
  *  token: the organization's policy there, no perl, or musl. One is news the
  *  list of computers does not have yet, and no token fixes it. */
 export const CLAUDE_CODE_UNRUNNABLE: ReadonlySet<string> = new Set(['policy_blocked', 'needs_perl', 'computer_unsupported']);
+
+/** The holds on a Claude Code model that the cloud steps clear for a user
+ *  with no computer of their own (`useClaudeCodeSteps`): no token or one
+ *  refused, Claude Code not chosen for cloud computers, or a computer too
+ *  small for it. */
+export const CLEARED_BY_STEPS: ReadonlySet<string> = new Set([
+  'no_token', 'rejected', 'hosted_off', 'no_own_computer', 'needs_bigger_computer',
+]);
 
 /** The refusals the app words itself, in the user's language; any other
  *  keeps the server's English words. */

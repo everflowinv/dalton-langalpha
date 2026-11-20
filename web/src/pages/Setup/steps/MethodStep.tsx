@@ -1,7 +1,7 @@
 import { useState, useCallback, useId } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Ticket, Key, Monitor, ChevronDown, ChevronRight, ChevronUp, CheckCircle2 } from 'lucide-react';
+import { Ticket, Key, Monitor, ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { WizardStepHeader } from '@/components/ui/wizard';
 import { SetupFooter } from '../SetupFooter';
@@ -18,10 +18,14 @@ import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { llmProviderArt } from '@/lib/brandArt';
 import { SUBSCRIPTIONS } from '@/api/oauth';
 import type { AccessType } from '@/components/model/types';
+import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
+import { useAccount } from '@/hooks/useAccount';
+import { methodAllowed } from '@/lib/accountRules';
+import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
 
 // ---------------------------------------------------------------------------
 // Ways to connect
@@ -151,6 +155,11 @@ function ConnectedSummary({
   );
 }
 
+/** The ways to connect no rule keeps off. */
+function allowedMethods(policy: AccountPolicy | null) {
+  return METHODS.filter((m) => methodAllowed(policy, m.id));
+}
+
 // ---------------------------------------------------------------------------
 // MethodStep
 // ---------------------------------------------------------------------------
@@ -174,6 +183,9 @@ export default function MethodStep() {
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
 
   const headingId = useId();
+  // Ways a rule keeps off are not offered; `OwnAccessNote` says who keeps
+  // them off.
+  const { policy } = useAccount();
 
   // Invitation code state
   const [showInvitation, setShowInvitation] = useState(false);
@@ -270,23 +282,12 @@ export default function MethodStep() {
         <RemoveAccessDialog provider={removing} name={removing.display_name} onClose={() => setRemoving(null)} />
       )}
 
-      {/* Invitation-redeemed note (when no other providers configured); the
-          way on from it is the footer's skip */}
-      {!userLoading && hasPlatformAccess && !hasConfigured && (
-        <div className="shell-box flex items-center gap-2 p-4">
-          <CheckCircle2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-success)' }} />
-          <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
-            {t('setup.invitationRedeemed')}
-          </span>
-        </div>
-      )}
-
       {/* Each way goes straight on, as the rows in Settings do. */}
       {/* DALTON-HOOK(team-credentials): hide credential-writing method rows for non-PM members under team sharing */}
       {!teamManagedByAdmin && (
         <ul aria-labelledby={headingId} className="flex flex-col gap-2">
           {/* DALTON-HOOK(team-credentials) */}
-          {METHODS.map((method) => (
+          {allowedMethods(policy).map((method) => (
             <li key={method.id}>
               {/* DALTON-HOOK(team-credentials) */}
               <button
@@ -307,6 +308,8 @@ export default function MethodStep() {
         </ul>
       )}
       {/* DALTON-HOOK(team-credentials) */}
+
+      <OwnAccessNote variant="setup" />
 
       {/* Invitation code section — hide only when user already has platform access */}
       {(userLoading || !hasPlatformAccess) && (

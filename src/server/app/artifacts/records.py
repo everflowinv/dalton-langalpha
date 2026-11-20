@@ -1,5 +1,12 @@
 """The owner's routes on a file's record: find or make it, where its comments
-go, publishing and versions."""
+go, publishing and versions.
+
+A shared workspace's members use them as its owner does: the record is the
+holder's, read and written as the holder's rows (``Access.owner_id``), while
+who acted is the member, and who a link may open to is judged by the
+holder's organization, as the link's visitors are. Publishing, unsharing,
+choosing the audience and keeping a shared file updated go as far as the
+workspace's managers allow (``shared_workspaces.share_out``)."""
 
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ from src.server.app.artifacts.models import (
     ArtifactPathRequest,
     ArtifactResponse,
     ArtifactThreadResponse,
+    AudienceRequest,
     ArtifactVersionResponse,
     BindRequest,
     DefaultDestination,
@@ -33,17 +41,35 @@ from src.server.app.artifacts.models import (
 from src.server.services.workspace_files import owner_work_dir
 from src.server.database import artifacts as artifacts_db
 from src.server.database.artifacts import Artifact
+from src.server.database.conversation import thread_reach
 from src.server.database.share_codes import share_path
 from src.server.services.artifacts import snapshot
 from src.server.services.artifacts.events import publish_artifact_change
-from src.server.services.artifacts.grants import grant_prefix, mint_artifact_grant
+from src.server.services.artifacts.grants import (
+    grant_prefix,
+    mint_artifact_grant,
+    mint_artifact_member_grant,
+)
 from src.server.services.file_grants import seconds_left
+from src.server.services import activity
+from src.server.services.activity import Action
+from src.server.services.share_audience import (
+    ORGANIZATION,
+    PUBLIC,
+    link_audience,
+    offered,
+    refuse_public_link_of,
+    require_members_audience,
+)
 from src.server.services.preview_base import artifact_base
 from src.server.services.served_paths import may_be_artifact
 from src.server.services.workspace_file_containment import contained_relative_path
+from src.server.services.account import AccountSuspended
+from src.server.services.shared_workspaces.access import Access, NoAccess, workspace_access
+from src.server.services.shared_workspaces.share_out import refuse_link_change
 from src.server.services.workspace_files import (
-    owned_workspace_on_computer,
     previous_dir_names_of,
+    reached_workspace_on_computer,
 )
 from src.dalton.access_tiers import get_user_tier as _default_get_user_tier  # DALTON-HOOK(monitors)
 from src.server.utils.api import CurrentUserId
@@ -120,14 +146,46 @@ def _snapshot_errors() -> Iterator[None]:
 
 
 async def owned(artifact_id: str, user_id: str) -> Artifact:
-    artifact = await artifacts_db.get_artifact(path_id(artifact_id), user_id=user_id)
+    return (await reached(artifact_id, user_id))[0]
+
+
+async def reached(artifact_id: str, caller: str) -> tuple[Artifact, Access]:
+    """The record and the caller's access to its workspace: its owner's, or
+    a shared workspace member's. Anyone else's, or a deleted workspace's, is
+    not found, as every owner route answers."""
+    artifact_id = path_id(artifact_id)
+    artifact = await artifacts_db.get_artifact(artifact_id, user_id=caller)
+    if artifact is not None:
+        return artifact, Access(caller)
+    from src.server.services.membership import teams_door_open
+
+    # Only a shared workspace's records are reached by anyone but their
+    # owner, and with the door shut there are none.
+    if not teams_door_open():
+        raise not_found()
+    workspace_id = await artifacts_db.artifact_workspace_id(artifact_id)
+    if workspace_id is None:
+        raise not_found()
+    from src.server.database.workspace import get_workspace
+
+    try:
+        access = await workspace_access(await get_workspace(workspace_id), caller)
+    except (NoAccess, AccountSuspended):
+        raise not_found() from None
+    artifact = await artifacts_db.get_artifact(artifact_id, user_id=access.owner_id)
     if artifact is None:
         raise not_found()
-    return artifact
+    return artifact, access
 
 
-async def _response(artifact: Artifact, user_id: str) -> ArtifactResponse:
+async def _response(artifact: Artifact, user_id: str, viewer: str) -> ArtifactResponse:
+    """``user_id`` is the record's owner: the holder's for a shared
+    workspace, whose comments and links they are. A thread it is bound to
+    that ``viewer`` does not reach is left out, as is everything of it."""
     counts = await artifacts_db.comment_counts(artifact.artifact_id, user_id=user_id)
+    bound = artifact.bound_thread_id
+    if bound and viewer != user_id and await thread_reach.hidden([bound], viewer):
+        bound = None
     return ArtifactResponse(
         artifact_id=artifact.artifact_id,
         code=artifact.code,
@@ -141,17 +199,19 @@ async def _response(artifact: Artifact, user_id: str) -> ArtifactResponse:
         kept=artifact.kept,
         latest_seq=artifact.latest_seq,
         shared_seq=artifact.shared_seq,
-        bound_thread_id=artifact.bound_thread_id,
+        bound_thread_id=bound,
         open_comments=counts.open,
         unread=counts.unread,
         created_at=artifact.created_at,
         legacy_refused=artifact.legacy_refused,
+        audience=link_audience(artifact.audience),
+        audiences=await offered(user_id, link_audience(artifact.audience)),
     )
 
 
-async def _changed(user_id: str, artifact: Artifact) -> ArtifactResponse:
+async def _changed(user_id: str, artifact: Artifact, viewer: str) -> ArtifactResponse:
     await publish_artifact_change(user_id, artifact)
-    return await _response(artifact, user_id)
+    return await _response(artifact, user_id, viewer)
 
 
 def artifact_path(workspace: dict[str, Any], path: str) -> tuple[str, str]:
@@ -215,18 +275,19 @@ async def _require_admin_for_public_publish(user_id: str) -> None:
 
 async def _workspace_path(
     workspace_id: str, path: str, user_id: str
-) -> tuple[str, str]:
-    """``artifact_path`` in the owner's workspace. Another user's workspace,
-    or a deleted one, is not found, as every owner route answers."""
+) -> tuple[str, str, str]:
+    """``artifact_path`` in a workspace the caller reaches, and whose rows
+    its records are. Another user's workspace, or a deleted one, is not
+    found, as every owner route answers."""
     try:
-        workspace = await owned_workspace_on_computer(workspace_id, user_id)
+        workspace, _ = await reached_workspace_on_computer(workspace_id, user_id)
     except HTTPException as e:
         if e.status_code == 403:
             raise not_found("Workspace") from None
         raise
     if workspace.get("status") == "deleted":
         raise not_found("Workspace")
-    return artifact_path(workspace, path)
+    return (*artifact_path(workspace, path), str(workspace["user_id"]))
 
 
 # --- records -----------------------------------------------------------------
@@ -241,10 +302,10 @@ async def find_artifact(
     path: str = Query(..., min_length=1, max_length=4096),
 ) -> ArtifactLookupResponse:
     """The file's record, or null for a file never recorded. Never makes one."""
-    ws_id, relative = await _workspace_path(workspace_id, path, x_user_id)
+    ws_id, relative, owner_id = await _workspace_path(workspace_id, path, x_user_id)
     artifact = await artifacts_db.find_artifact(ws_id, relative)
     return ArtifactLookupResponse(
-        artifact=await _response(artifact, x_user_id) if artifact else None
+        artifact=await _response(artifact, owner_id, x_user_id) if artifact else None
     )
 
 
@@ -253,14 +314,15 @@ async def ensure_artifact(
     workspace_id: str, body: ArtifactPathRequest, x_user_id: CurrentUserId
 ) -> ArtifactResponse:
     """The file's record, made private if new."""
-    ws_id, relative = await _workspace_path(workspace_id, body.path, x_user_id)
+    ws_id, relative, owner_id = await _workspace_path(workspace_id, body.path, x_user_id)
     artifact = await artifacts_db.ensure_artifact(ws_id, relative)
-    return await _response(artifact, x_user_id)
+    return await _response(artifact, owner_id, x_user_id)
 
 
 @router.get("/{artifact_id}", response_model=ArtifactResponse)
 async def get_artifact(artifact_id: str, x_user_id: CurrentUserId) -> ArtifactResponse:
-    return await _response(await owned(artifact_id, x_user_id), x_user_id)
+    artifact, access = await reached(artifact_id, x_user_id)
+    return await _response(artifact, access.owner_id, x_user_id)
 
 
 @router.patch("/{artifact_id}", response_model=ArtifactResponse)
@@ -273,18 +335,21 @@ async def update_artifact(
         _refuse_publishing_disabled()
         # DALTON-HOOK(external-share-guard): external members may not set it either
         await _require_non_external_for_publish(x_user_id)
+    current, access = await reached(artifact_id, x_user_id)
+    if body.keep_updated and current.shared:
         # DALTON-HOOK(monitors): enabling keep_updated on a publicly shared
         # artifact auto-publishes public content and requires an active admin.
-        existing = await owned(artifact_id, x_user_id)
-        if existing.shared:
-            await _require_admin_for_public_publish(x_user_id)
+        await _require_admin_for_public_publish(x_user_id)
+    if current.shared:
+        # Each later version a kept-updated link cuts reaches its visitors.
+        await refuse_link_change(access)
     with db_errors():
         artifact = await artifacts_db.set_keep_updated(
-            user_id=x_user_id,
+            user_id=access.owner_id,
             artifact_id=path_id(artifact_id),
             keep_updated=body.keep_updated,
         )
-    return await _changed(x_user_id, artifact)
+    return await _changed(access.owner_id, artifact, x_user_id)
 
 
 @router.put("/{artifact_id}/kept", response_model=ArtifactResponse)
@@ -300,7 +365,7 @@ async def set_artifact_kept(
     version (``shared_seq``). Stopping keeps the versions cut so far. A keep
     refused leaves the record as it was.
     """
-    artifact = await owned(artifact_id, x_user_id)
+    artifact, access = await reached(artifact_id, x_user_id)
     # DALTON-HOOK(monitors): enabling kept on an already-public artifact widens
     # automatic cuts to all walked dependencies; require an active admin.
     if body.kept and artifact.shared:
@@ -309,15 +374,16 @@ async def set_artifact_kept(
         if body.kept:
             artifact = await snapshot.keep(
                 artifact,
-                user_id=x_user_id,
+                user_id=access.owner_id,
                 loaded=tuple(body.loaded),
                 earlier=tuple(body.earlier),
+                actor=x_user_id,
             )
         else:
             artifact = await artifacts_db.stop_keeping(
-                user_id=x_user_id, artifact_id=artifact.artifact_id
+                user_id=access.owner_id, artifact_id=artifact.artifact_id
             )
-    return await _changed(x_user_id, artifact)
+    return await _changed(access.owner_id, artifact, x_user_id)
 
 
 @router.post("/{artifact_id}/left-out", response_model=ArtifactResponse)
@@ -332,10 +398,10 @@ async def set_file_left_out(
     _refuse_publishing_disabled()
     # DALTON-HOOK(external-share-guard): external members cannot change publish list
     await _require_non_external_for_publish(x_user_id)
-    artifact = await owned(artifact_id, x_user_id)
+    artifact, access = await reached(artifact_id, x_user_id)
     with db_errors():
         artifact = await artifacts_db.set_left_out(
-            user_id=x_user_id,
+            user_id=access.owner_id,
             artifact_id=artifact.artifact_id,
             path=body.path,
             left_out=body.left_out,
@@ -343,7 +409,7 @@ async def set_file_left_out(
         )
     if body.left_out and body.path not in artifact.left_out_files:
         raise HTTPException(status_code=422, detail="too_many_left_out")
-    return await _changed(x_user_id, artifact)
+    return await _changed(access.owner_id, artifact, x_user_id)
 
 
 # --- where comments go -------------------------------------------------------
@@ -358,24 +424,27 @@ async def bind_artifact(
     # DALTON-HOOK(artifact-publishing-off): no new comment settings while the
     # deployment keeps file comments off; DELETE stays open (cleanup).
     _refuse_publishing_disabled()
+    _, access = await reached(artifact_id, x_user_id)
     with db_errors():
         artifact = await artifacts_db.bind(
-            user_id=x_user_id,
+            user_id=access.owner_id,
             artifact_id=path_id(artifact_id),
             thread_id=body.thread_id,
+            caller=x_user_id,
         )
-    return await _changed(x_user_id, artifact)
+    return await _changed(access.owner_id, artifact, x_user_id)
 
 
 @router.delete("/{artifact_id}/binding", response_model=ArtifactResponse)
 async def unbind_artifact(
     artifact_id: str, x_user_id: CurrentUserId
 ) -> ArtifactResponse:
+    _, access = await reached(artifact_id, x_user_id)
     with db_errors():
         artifact = await artifacts_db.unbind(
-            user_id=x_user_id, artifact_id=path_id(artifact_id)
+            user_id=access.owner_id, artifact_id=path_id(artifact_id)
         )
-    return await _changed(x_user_id, artifact)
+    return await _changed(access.owner_id, artifact, x_user_id)
 
 
 def _thread(
@@ -392,11 +461,13 @@ async def get_destinations(
 ) -> DestinationsResponse:
     """The thread a comment goes to unless the owner picks another, and the
     candidates the composer's menu offers."""
+    _, access = await reached(artifact_id, x_user_id)
     with db_errors():
         found = await artifacts_db.destinations(
-            user_id=x_user_id,
+            user_id=access.owner_id,
             artifact_id=path_id(artifact_id),
             beside_thread_id=normalize_uuid(beside) if beside else None,
+            caller=x_user_id,
         )
     default, rule = found.default
     return DestinationsResponse(
@@ -440,10 +511,14 @@ async def get_status_unreported(
 async def _status(
     artifact_id: str, user_id: str, loaded: tuple[str, ...], earlier: tuple[str, ...]
 ) -> StatusResponse:
-    artifact = await owned(artifact_id, user_id)
+    artifact, access = await reached(artifact_id, user_id)
     with _snapshot_errors():
         found = await snapshot.status(
-            artifact, user_id=user_id, loaded=loaded, earlier=earlier
+            artifact,
+            user_id=access.owner_id,
+            loaded=loaded,
+            earlier=earlier,
+            actor=user_id,
         )
     over, sealed = found.over_cap, found.snapshot
     entries = over.entries if over else sealed.entries
@@ -483,11 +558,28 @@ async def publish_artifact(
     await _require_non_external_for_publish(x_user_id)
     # DALTON-HOOK(monitors): non-admin callers cannot call bare public publish
     await _require_admin_for_public_publish(x_user_id)
-    artifact = await owned(artifact_id, x_user_id)
+    artifact, access = await reached(artifact_id, x_user_id)
+    owner_id = access.owner_id
+    await refuse_link_change(access)
+    if link_audience(artifact.audience) == ORGANIZATION:
+        await require_members_audience(owner_id)
+    elif access.is_shared:
+        # A shared workspace's link opens to members only, so its first
+        # publish takes that audience rather than being refused the default.
+        await require_members_audience(owner_id)
+        with db_errors():
+            artifact = await artifacts_db.set_audience(
+                user_id=owner_id,
+                artifact_id=artifact.artifact_id,
+                audience=ORGANIZATION,
+            )
+    else:
+        await refuse_public_link_of(owner_id)
     with db_errors(), _snapshot_errors():
         result = await snapshot.publish(
             artifact,
-            user_id=x_user_id,
+            user_id=owner_id,
+            actor=x_user_id,
             reviewed=body.files,
             label=body.label,
             keep_updated=body.keep_updated,
@@ -499,10 +591,49 @@ async def publish_artifact(
     if version is None:
         raise not_found()
     return PublishResponse(
-        artifact=await _response(result.artifact, x_user_id),
+        artifact=await _response(result.artifact, owner_id, x_user_id),
         version=ArtifactVersionResponse.model_validate(version),
         cut=result.cut,
     )
+
+
+@router.put("/{artifact_id}/audience", response_model=ArtifactResponse)
+async def set_audience(
+    artifact_id: str, body: AudienceRequest, x_user_id: CurrentUserId
+) -> ArtifactResponse:
+    """Who the link opens to. Members of the owner's organization only, which
+    the owner must be an active member of to choose, or anyone, which on a
+    shared link is turning on a public link (``public_links``). Holds on every
+    visitor's next request; a member's grant opens nothing once the link opens
+    to anyone, and an anonymous one nothing once it opens to members."""
+    artifact, access = await reached(artifact_id, x_user_id)
+    owner_id = access.owner_id
+    await refuse_link_change(access)
+    before = link_audience(artifact.audience)
+    if body.audience == ORGANIZATION:
+        await require_members_audience(owner_id)
+    elif artifact.shared and before != PUBLIC:
+        await refuse_public_link_of(owner_id)
+    if body.audience == before:
+        return await _response(artifact, owner_id, x_user_id)
+    with db_errors():
+        artifact = await artifacts_db.set_audience(
+            user_id=owner_id,
+            artifact_id=artifact.artifact_id,
+            audience=ORGANIZATION if body.audience == ORGANIZATION else None,
+        )
+    activity.record(
+        x_user_id,
+        Action.FILE_AUDIENCE_CHANGED,
+        resource=("artifact", artifact.artifact_id),
+        workspace_id=artifact.workspace_id,
+        detail={
+            "path": artifact.path,
+            "audience": body.audience,
+            "shared": artifact.shared,
+        },
+    )
+    return await _changed(owner_id, artifact, x_user_id)
 
 
 @router.post("/{artifact_id}/unshare", response_model=ArtifactResponse)
@@ -511,11 +642,14 @@ async def unshare_artifact(
 ) -> ArtifactResponse:
     """Stop sharing; the versions stay, and publishing again resumes at the
     same link."""
+    _, access = await reached(artifact_id, x_user_id)
+    await refuse_link_change(access)
     with db_errors():
         artifact = await artifacts_db.unshare(
-            user_id=x_user_id, artifact_id=path_id(artifact_id)
+            user_id=access.owner_id, artifact_id=path_id(artifact_id)
         )
-    return await _changed(x_user_id, artifact)
+    snapshot.record_unshared(x_user_id, artifact)
+    return await _changed(access.owner_id, artifact, x_user_id)
 
 
 @router.get("/{artifact_id}/versions")
@@ -532,9 +666,13 @@ async def mint_grant(
     artifact_id: str, x_user_id: CurrentUserId
 ) -> ArtifactGrantResponse:
     """Where the owner's viewer frames a published version from, read only;
-    see ``services/artifacts/grants``."""
-    artifact = await owned(artifact_id, x_user_id)
-    grant = await mint_artifact_grant(artifact.artifact_id)
+    see ``services/artifacts/grants``. A shared workspace's member gets a
+    grant bound to them, which ends when they stop reaching the workspace."""
+    artifact, access = await reached(artifact_id, x_user_id)
+    if access.is_shared:
+        grant = await mint_artifact_member_grant(artifact.artifact_id, x_user_id)
+    else:
+        grant = await mint_artifact_grant(artifact.artifact_id)
     base = artifact_base()
     return ArtifactGrantResponse(
         base=base.artifact_url(grant.artifact_id, grant.token)

@@ -27,6 +27,8 @@ from src.server.database.workspace_folders import (
 from src.server.services.computer_usage.causes import computer_cause
 from src.server.models.computer_cause import StartCause
 from src.server.models.workspace import served_from_mirror
+from src.server.database.shared_workspaces import is_holder  # DALTON-HOOK(workspace-sharing-settings): check shared-workspace holder ownership
+from src.server.services.shared_workspaces.access import Access, workspace_access
 from src.server.services.ssh_computers import refuse_if_tunnel_down
 from src.server.services.workspace_file_containment import (
     contained_absolute_path,
@@ -38,7 +40,6 @@ from src.server.services.workspace_layout import (
     layout_from_binding,
 )
 from src.server.services.workspace_manager import WorkspaceManager
-from src.server.utils.api import require_workspace_owner
 from src.server.utils.error_sanitization import (
     sandbox_failure_http,
     sandbox_unreachable_detail,
@@ -57,21 +58,24 @@ HOME_NOT_ON_COMPUTER = "Home is not on a computer yet"
 HOME_NOT_ON_COMPUTER_REASON = "home_not_on_computer"
 
 
-async def owned_workspace_on_computer(
+async def reached_workspace_on_computer(
     workspace_id: str,
     user_id: str,
     *,
     need: str | None = None,
-) -> dict[str, Any]:
-    """The caller's workspace, for a route that reaches its files or sandbox.
-
-    Refused as any owner check refuses, and with a 400 while it is Home not
-    yet on a computer.
-    """
+) -> tuple[dict[str, Any], Access]:
+    """The workspace, for a route that reaches its files or sandbox: its
+    owner's, a colleague's (when ``need`` is set under Dalton auth), or a
+    shared workspace's members'.
+    Refused as the access check refuses, and with a 400 while it is Home not
+    yet on a computer. The row's ``user_id`` is whose rows the workspace's
+    are (the holder's, for a shared one), never the caller's."""
     workspace = await db_get_workspace(workspace_id)
-    # DALTON-HOOK(workspace-sharing-settings): when `need` is given and Dalton auth is on,
-    # check colleague web access (`read` or `write`) instead of strict owner-only.
-    if need is not None:
+    if workspace is not None and is_holder(workspace.get("user_id")):
+        access = await workspace_access(workspace, user_id)
+    elif need is not None:
+        # DALTON-HOOK(workspace-sharing-settings): when `need` is given and Dalton auth is on,
+        # check colleague web access (`read` or `write`) instead of strict owner-only.
         from src.dalton.settings import is_dalton_supabase_auth_enabled
         from src.dalton.sharing import require_workspace_access
 
@@ -83,12 +87,24 @@ async def owned_workspace_on_computer(
                 need="write" if need == "write" else "read",
                 workspace=workspace,
             )
+            access = Access(str(workspace["user_id"]))
         else:
-            require_workspace_owner(workspace, user_id=user_id)
+            access = await workspace_access(workspace, user_id)
     else:
-        require_workspace_owner(workspace, user_id=user_id)
+        access = await workspace_access(workspace, user_id)
     if is_unbound(workspace):
         raise HTTPException(status_code=400, detail=HOME_NOT_ON_COMPUTER)
+    return workspace, access
+
+
+async def owned_workspace_on_computer(
+    workspace_id: str,
+    user_id: str,
+    *,
+    need: str | None = None,
+) -> dict[str, Any]:
+    """Dalton compatibility wrapper over :func:`reached_workspace_on_computer`."""
+    workspace, _ = await reached_workspace_on_computer(workspace_id, user_id, need=need)
     return workspace
 
 

@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from '@/lib/framer';
 import { Button } from '@/components/ui/button';
@@ -6,21 +6,12 @@ import { Loader } from '@/components/ui/loader';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { useLocale } from '@/hooks/useLocale';
 import type { Computer, ComputerProviderOption, ResourceTier, WorkspaceQuota } from '@/types/api';
-import {
-  TierRadioGroup,
-  isTierBlocked,
-  needsBiggerPlan,
-  normalizeTier,
-  offeredTiers,
-  quotaForSpecChange,
-  tierCapacity,
-  tierLabel,
-  type TierOffer,
-} from './tierUi';
-import { DiskBar, diskUpgradeTier, diskUsageLabel, isDiskAlertLevel } from './computerDiskUi';
+import { TierRadioGroup, needsBiggerPlan, normalizeTier, tierLabel } from './tierUi';
+import { DiskBar, diskUsageLabel } from './computerDiskUi';
 import { specErrorFiles, type SpecError } from './specErrors';
-import { activeSpecChange, effectiveTier, specChangeLabel } from './specChangeUi';
+import { activeSpecChange, specChangeLabel } from './specChangeUi';
 import { PlanUpgradeHint } from './planUpgradeHint';
+import { useTierPick } from './tierPick';
 import type { SpecRequest } from '../hooks/computerPanelStore';
 import { MachinePreview } from './machineArt/MachinePreview';
 import { hostedPreview } from './machineArt/machine';
@@ -81,23 +72,7 @@ function ChangeSpecPanel({
   const { t } = useTranslation();
   const locale = useLocale();
   const titleId = useId();
-  const currentTier = effectiveTier(target);
-  const offer = offeredTiers(provider, currentTier);
-  // A computer bigger than Small moves in the slot it holds, so the other
-  // larger sizes the plan allows stay open to it. The slot is the size the row
-  // holds, which the server counts, even when an interrupted change shows the
-  // size it came from.
-  const quota = quotaForSpecChange(planQuota, normalizeTier(target.resource_tier));
-  // Derived rather than seeded: the quota and the provider's sizes land after
-  // the dialog opens and can refetch while it is open, and the row behind
-  // `target` is replaced on every list refetch. A pick holds while the
-  // provider offers it and the plan allows it (the current tier always does);
-  // otherwise the seed stands.
-  const [picked, setPicked] = useState<ResourceTier | null>(null);
-  const tier =
-    picked && offer.tiers.includes(picked) && (picked === currentTier || !isTierBlocked(tierCapacity(quota, picked)))
-      ? picked
-      : seedTier(currentTier, target, offer, quota, request?.tier ?? null);
+  const { currentTier, offer, quota, tier, setPicked } = useTierPick(target, provider, planQuota, request?.tier ?? null);
   const isRunning = target.status === 'running';
   const errorFiles = specErrorFiles(error?.files, t, locale);
   const change = activeSpecChange(target);
@@ -158,7 +133,8 @@ function ChangeSpecPanel({
           {t(
             'computer.spec.notKept',
             "Installed packages, caches and running apps aren't kept. The Agent reinstalls what it needs.",
-          )}
+          )}{' '}
+          {t('computer.spec.gitNotKept', 'Unpushed git commits, branches and stashes on this computer are not kept.')}
         </>
       }
       onClose={onClose}
@@ -229,17 +205,6 @@ function ChangeSpecPanel({
       )}
     </ModalShell>
   );
-}
-
-function seedTier(
-  current: ResourceTier,
-  target: SpecTarget,
-  offer: TierOffer,
-  quota: WorkspaceQuota | null | undefined,
-  wanted: ResourceTier | null,
-): ResourceTier {
-  if (wanted && offer.tiers.includes(wanted) && !isTierBlocked(tierCapacity(quota, wanted))) return wanted;
-  return (isDiskAlertLevel(target.disk?.level) && diskUpgradeTier(current, offer, quota)) || current;
 }
 
 export default ChangeSpecDialog;

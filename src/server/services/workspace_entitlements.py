@@ -15,9 +15,11 @@ from ptc_agent.core.session import Session
 from src.server.database.computer import (
     computer_capacity_lock,
     get_computer,
+    get_home_computer,
     set_computer_always_on as db_set_computer_always_on,
     set_computer_resource_tier as db_set_computer_resource_tier,
 )
+from src.server.database.home_stand_in import marked_stand_in_host
 from src.server.database.home_workspace import is_reserved_row
 from src.server.database.workspace import (
     SANDBOX_STAMP_KEYS,
@@ -27,12 +29,23 @@ from src.server.database.workspace import (
 )
 from src.server.database.workspace_names import WorkspaceNameTaken, copy_name
 from src.server.models.computer import ComputerStatus
+from src.server.services.account import read_standing
 from src.server.services.computer_usage.causes import computer_cause
 from src.server.services.computer_manager._types import ComputerBinding
+from src.server.services.spec_change import sized_by_owner, spec_change_from_row
 
 logger = logging.getLogger(__name__)
 
 _COPY_NAME_ATTEMPTS = 3
+
+
+async def _plan_follower(user_id: str, *, conn=None) -> str | None:
+    """The id of the computer that follows the user's plan: Home's, or while
+    Home lives on a machine of the user's own, the one marked for its stand-in."""
+    follows = await get_home_computer(user_id, conn=conn)
+    if follows is not None and not provider_class(follows["kind"]).recreatable:
+        follows = await marked_stand_in_host(user_id, conn=conn)
+    return str(follows["computer_id"]) if follows is not None else None
 
 
 class WorkspaceEntitlementsMixin:
@@ -53,10 +66,16 @@ class WorkspaceEntitlementsMixin:
         sandbox at a size the machine has left. Keeps the elevated size when the
         check is inconclusive (fail-safe / OSS) or the backed-up files would not
         fit the standard disk (data safety over enforcement). ``mirror_only``
-        is for a recovery, which has no sandbox left to back up from.
+        is for a recovery, which has no sandbox left to back up from. A
+        computer that follows the plan takes the plan's size at its first
+        build instead (``_first_build_tier``).
         """
         from src.server.dependencies.usage_limits import spec_entitlement_lost
 
+        if not binding.provider_ref and user_id:
+            first = await self._first_build_tier(binding, user_id)
+            if first is not None:
+                return first
         tier = binding.resource_tier or "standard"
         if tier == "standard" or not user_id:
             return tier
@@ -95,6 +114,104 @@ class WorkspaceEntitlementsMixin:
         )
         await db_set_computer_resource_tier(computer_id, "standard")
         return "standard"
+
+    async def _first_build_tier(
+        self, binding: ComputerBinding, user_id: str
+    ) -> str | None:
+        """The plan's size, written to the row, for the computer that follows
+        the plan at its first build when that size differs from its own;
+        None otherwise, which leaves the size to the lapse check. A smaller
+        one is taken too: a first build that failed after its size was
+        written retries at what the plan gives now, not at what the lapse
+        check would reclaim it to. The one that follows is Home's computer,
+        or while Home lives on a machine of the user's own, the cloud computer
+        marked for its stand-in (``marked_stand_in_host``). Only before its
+        first sandbox, so nothing is replaced, and never one whose owner chose
+        its size or is changing it.
+        Under the capacity lock every elevated claim takes, so two computers
+        cannot both take a slot the plan gives once, and the write is fenced
+        on the row still unbuilt in the status read under it.
+        """
+        from src.server.dependencies.usage_limits import tier_rank
+        from src.server.services.platform_client import platform_gating_active
+
+        if not platform_gating_active():
+            return None
+        computer_id = binding.computer_id
+        try:
+            if await _plan_follower(user_id) != computer_id:
+                return None
+            async with computer_capacity_lock(user_id) as conn:
+                # Again under the lock: a primary that moved while the start
+                # waited for it follows the plan no more.
+                if await _plan_follower(user_id, conn=conn) != computer_id:
+                    return None
+                computer = await get_computer(computer_id, conn=conn)
+                if computer is None or computer.get("provider_ref") or sized_by_owner(computer):
+                    return None
+                change = spec_change_from_row(computer)
+                if change is not None and change.state == "in_progress":
+                    return None
+                held = computer.get("resource_tier") or "standard"
+                planned = await self.plan_tier(user_id, computer)
+                if tier_rank(planned) is None or planned == held:
+                    return None
+                if await db_set_computer_resource_tier(
+                    computer_id,
+                    planned,
+                    expected_status=computer["status"],
+                    expected_provider_ref=None,
+                    conn=conn,
+                ) is None:
+                    return None
+        except Exception:
+            logger.warning(
+                f"Could not size computer {computer_id} (user {user_id}) by plan "
+                "at its first build",
+                exc_info=True,
+            )
+            return None
+        logger.info(
+            f"Computer {computer_id} (user {user_id}) is first built at its "
+            f"plan's tier {planned!r}"
+        )
+        return planned
+
+    async def plan_tier(
+        self, user_id: str, computer: dict[str, Any] | None = None
+    ) -> str | None:
+        """The largest size the user's plan gives ``computer`` on its cloud
+        provider, the slot it holds counted as its own, or a new computer on
+        the deployment's provider; None when the plan cannot be read, which no
+        caller may take for standard.
+        """
+        from src.server.dependencies.usage_limits import plan_spec_tier
+
+        try:
+            kind = computer["kind"] if computer else self.config.sandbox.provider
+            offered = self._provider_settings(
+                kind, computer.get("provider_config") if computer else None
+            ).resource_tiers
+            return await plan_spec_tier(
+                user_id,
+                offered,
+                current_tier=(computer.get("resource_tier") or "standard") if computer else None,
+            )
+        except Exception:
+            logger.warning("Could not size a computer for user %s by plan", user_id, exc_info=True)
+            return None
+
+    def largest_tier(self, computer: dict[str, Any] | None = None) -> str | None:
+        """The largest tier ``computer``'s provider builds, or the deployment's
+        own provider for a computer not made yet; None where it offers none."""
+        from src.server.dependencies.usage_limits import tier_rank
+
+        kind = computer["kind"] if computer else self.config.sandbox.provider
+        offered = self._provider_settings(
+            kind, computer.get("provider_config") if computer else None
+        ).resource_tiers
+        ranked = [tier for tier in offered if tier_rank(tier) is not None]
+        return max(ranked, key=tier_rank, default=None)
 
     async def _entitled_always_on(
         self, binding: ComputerBinding, user_id: str | None
@@ -256,9 +373,9 @@ class WorkspaceEntitlementsMixin:
                         raise RuntimeError(
                             "Always-on isn't available for this computer's provider"
                         )
+                from src.server.services.platform_client import platform_gating_active
                 from src.server.dependencies.usage_limits import (
                     assert_always_on_allowed,
-                    platform_gating_active,
                 )
 
                 if (
@@ -398,15 +515,41 @@ class WorkspaceEntitlementsMixin:
         falls through to idle reaping (reaped now if idle; stops on a later tick
         if in use, no mid-use yank). The entitlement check runs once per
         distinct owner (bounded-concurrent) so several always-on computers for
-        one user trigger a single platform validate.
+        one user trigger a single platform validate. A suspended owner's
+        machines, their own included, are not exempt either, and keep the flag.
         """
         from src.server.dependencies.usage_limits import always_on_entitlement_lost
+        from src.server.services.membership import teams_door_open
 
         exempt: set[str] = set()
+        # One cached read per distinct owner, none with ``teams`` off.
+        semaphore = asyncio.Semaphore(5)
+
+        async def _suspended(uid: str) -> tuple[str, bool]:
+            async with semaphore:
+                standing = await read_standing(uid, unknown_on_cache_error=True)
+                return uid, standing.suspended
+
+        flagged = [c for c in running_computers if c.get("is_always_on")]
+        suspended = (
+            {
+                uid
+                for uid, is_suspended in await asyncio.gather(
+                    *(_suspended(uid) for uid in {str(c["user_id"]) for c in flagged})
+                )
+                if is_suspended
+            }
+            if teams_door_open()
+            else set()
+        )
 
         always_on_rows = []
-        for c in running_computers:
-            if not c.get("is_always_on"):
+        for c in flagged:
+            # A suspended owner's computer does no more work, so it is not
+            # kept up: it stops once idle, and nothing starts it again while
+            # the suspension lasts. Its setting is left as the owner chose,
+            # for an account that is reinstated.
+            if str(c["user_id"]) in suspended:
                 continue
             # An unmetered machine is the user's own, so no plan can lapse it
             # and there is nothing to probe.
@@ -414,10 +557,9 @@ class WorkspaceEntitlementsMixin:
                 exempt.add(str(c["computer_id"]))
                 continue
             always_on_rows.append(c)
+
         # One platform validate per distinct owner, bounded-concurrent so a
         # large always-on fleet doesn't serialize the reaper cycle on RTTs.
-        semaphore = asyncio.Semaphore(5)
-
         async def _probe(uid: str) -> tuple[str, bool]:
             async with semaphore:
                 return uid, await always_on_entitlement_lost(uid)

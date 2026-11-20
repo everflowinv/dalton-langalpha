@@ -63,6 +63,7 @@ tests/unit/mcp_servers/test_market_data_yf_fallback.py
 tests/unit/server/handlers/chat/test_attachments_notes.py
 tests/unit/server/handlers/chat/test_unreadable_image_upload.py
 tests/unit/server/handlers/conftest.py
+tests/unit/server/services/llm/conftest.py
 tests/unit/ptc_agent/middleware/test_image_byte_fit.py
 tests/unit/ptc_agent/agent/middleware/test_removed_attachment_union.py
 # B5/D5: transport_lost abort records its spill reason and the failure the

@@ -6,11 +6,12 @@
  * the old `messagesRef` mirror created.
  */
 
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { reportRefusal, type ReportRefusal } from '@/api/reports';
 import { apiErrorObject } from '@/api/errors';
+import { OTHERS_TURN_REWRITE } from '@/lib/turnRefusal';
 import { refusalMessage } from '@/components/report/refusalMessage';
 import { submitFeedback, removeFeedback, getThreadFeedback, followUpFeedback, type ThreadFeedback } from '../utils/api';
 
@@ -30,15 +31,21 @@ export function useChatFeedback(threadId: string) {
   // and a thumbs-down dialog opened then would offer the form for a report the
   // team already has.
   const [feedbackLoading, setFeedbackLoading] = useState(false);
+  // Only the latest load applies. A thread load does not wait for its ratings,
+  // so a reload or a switch to another thread can start the next read while
+  // one is out, and the older answer may arrive last.
+  const loadSeq = useRef(0);
   const { t } = useTranslation();
 
   /** Fetch feedback state for the thread. Best-effort — display-only data. */
   const loadFeedback = useCallback(async (targetThreadId?: string) => {
     const tid = targetThreadId ?? threadId;
     if (!tid) return;
+    const seq = ++loadSeq.current;
     setFeedbackLoading(true);
     try {
       const feedbackList = await getThreadFeedback(tid);
+      if (seq !== loadSeq.current) return;
       const map: Record<number, ThreadFeedback> = {};
       feedbackList.forEach((fb) => { map[fb.turn_index] = fb; });
       setFeedbackByTurn(map);
@@ -46,7 +53,7 @@ export function useChatFeedback(threadId: string) {
       // Non-critical — feedback display is best-effort
       console.warn('[History] Failed to load feedback:', e);
     } finally {
-      setFeedbackLoading(false);
+      if (seq === loadSeq.current) setFeedbackLoading(false);
     }
   }, [threadId]);
 
@@ -94,6 +101,10 @@ export function useChatFeedback(threadId: string) {
       return { rating: 'thumbs_down' };
     } catch (e) {
       console.error('[Feedback] Error:', e);
+      // A shared thread: a human review is its sender's to ask for.
+      if (apiErrorObject(e)?.type === OTHERS_TURN_REWRITE) {
+        toast({ description: t('sharedWorkspace.reviewOthersTurn') });
+      }
       return null;
     }
   }, [threadId, t]);

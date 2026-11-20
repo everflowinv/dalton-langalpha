@@ -1,6 +1,8 @@
+import { useSharedBubble } from './SharedThreadContext';
 import React, { useContext, useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Copy, FileSearch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp } from 'lucide-react';
+import { Building2, Check, Copy, FileSearch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp } from 'lucide-react';
+import { useAccount } from '@/hooks/useAccount';
 import { ThumbDownDialog } from '../ThumbDownSentDialog';
 import FigureEightLoading, { FADE_MS } from '@/components/ui/figure-eight-loading';
 import { copyText } from '@/lib/clipboard';
@@ -13,7 +15,7 @@ import { ReportFailure } from '@/components/ui/error-banner';
 import { isReportable } from '@/lib/upstreamFailure';
 import { SentMessageBody } from './SentMessageBody';
 import type { StructuredError } from '@/utils/rateLimitError';
-import { countDedupedSources, type CreditPauseState, type MessageProvenance, type PendingToolCallChunk, type ProvenanceRecord, type PTCAgentProposalState, type SubagentTaskRecord, type ToolApprovalState } from '@/types/chat';
+import { countDedupedSources, type CreditPauseState, type MessageProvenance, type UserMessage, type PendingToolCallChunk, type ProvenanceRecord, type PTCAgentProposalState, type SubagentTaskRecord, type ToolApprovalState } from '@/types/chat';
 import { TextShimmer } from '@/components/ui/text-shimmer';
 import type { SelectionPreviewShape } from '../SelectionContextPreview';
 import { AttachmentCard, InlineSelectionCards, InlineWidgetDeck } from './attachments';
@@ -65,6 +67,21 @@ function useStillFor(busy: boolean, ms: number): boolean {
     return () => clearTimeout(timer);
   }, [busy, ms]);
   return still;
+}
+
+/** The stopped chip of a turn its account's suspension ended, in the same
+ *  quiet ink as the user's own stop: neither theirs nor a fault. */
+function SuspensionStopChip(): React.ReactElement {
+  const { orgT } = useAccount();
+  return (
+    <div
+      className="inline-flex items-center gap-1.5 self-start mt-1 text-xs"
+      style={{ color: 'var(--color-text-tertiary)' }}
+    >
+      <Building2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+      <span>{orgT('organization.suspended.turnStopped')}</span>
+    </div>
+  );
 }
 
 /** Collapsed bound for long user messages (~10 lines of chat text). */
@@ -159,6 +176,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
   const chartSelections = message.chartSelections as SelectionPreviewShape[] | undefined;
   const hasChartSelections = isUser && chartSelections && chartSelections.length > 0;
   const provenance = isUser ? (message.provenance as MessageProvenance | undefined) : undefined;
+  const shared = useSharedBubble(message as UserMessage, turnIndex);
   const homeFallback = isUser ? (message.homeFallback as HomeFallback | undefined) : undefined;
 
   // Edit mode lives in the host's draft store, so a reload that remounts the
@@ -277,7 +295,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     && isAssistant
     && !isTurnTail
     && !(message.error as boolean)
-    && !(message.stopped as boolean)
+    && !message.stopped
     && sourceCount === 0
     && !projection.hasRetained;
   // The footer row reads the message only through these, so a streaming
@@ -420,7 +438,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     {/* Nor does a send of file comments: an edit sends text, and the
         comments it carried are no longer queued to go again. */}
     {/* DALTON-HOOK(chat-large-upload): hide edit pencil on failed steers and unadmitted attachment sends */}
-    {isUser && onEditMessage && !isSteering && !artifactComments && !message.queueError && !(message.unadmitted && hasAttachments) && (
+    {isUser && onEditMessage && !isSteering && !artifactComments && !message.queueError && !(message.unadmitted && hasAttachments) && shared.canFork && (
       <button
         onClick={handleStartEdit}
         className={ACTION_BUTTON}
@@ -478,7 +496,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         (mid-run steering can't be replayed), so the affordance sits
         at the end of the full response. A turn that opened hidden has
         none: that checkpoint lacks the words its context carried. */}
-    {isAssistant && (!hasError || unloaded) && onRegenerate && isTurnTail && canRegenerate && (
+    {isAssistant && (!hasError || unloaded) && onRegenerate && isTurnTail && canRegenerate && shared.canFork && (
       <button
         onClick={() => onRegenerate(messageId)}
         className={ACTION_BUTTON}
@@ -487,7 +505,8 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         <RefreshCw className={ICON} style={QUIET_INK} />
       </button>
     )}
-    {isAssistant && hasError && !unloaded && onRetry && isLatestReply && (
+    {/* A rule's refusal gets the same answer however often it is sent. */}
+    {isAssistant && hasError && !unloaded && onRetry && isLatestReply && !failure?.ruleStop && shared.canFork && (
       <button
         onClick={onRetry}
         className={ACTION_BUTTON}
@@ -540,6 +559,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         toolApprovals={(message.toolApprovals as Record<string, ToolApprovalState>) || EMPTY_OBJ}
         htmlWidgetProcesses={(message.htmlWidgetProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
         readOnly={readOnly}
+        othersPause={!shared.answersPause}
         dispatcherContext={dispatcherContext}
         messageId={replyId}
       />
@@ -702,7 +722,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         {/* ===== NORMAL MODE ===== */}
         {isUser ? (
           <>
-            <UserBubble provenance={provenance} steered={!!message.steeringDelivered} readOnly={readOnly} isMobile={isMobile}>
+            <UserBubble provenance={provenance} sender={shared.sender} steered={!!message.steeringDelivered} readOnly={readOnly} isMobile={isMobile}>
               {bubbleContent}
             </UserBubble>
             {homeFallback && <HomeTurnBadge fallback={homeFallback} />}
@@ -739,7 +759,11 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         {/* Per-message "⏹ Stopped" marker — the turn was hard-stopped by the
             user (live finalize or replay of a stopped turn). Quiet ink, not
             red: a stop is the user's own action, not a loss/error state. */}
-        {isAssistant && (message.stopped as boolean) && (
+        {isAssistant && message.stopped && (
+          message.stopped === 'suspension' ? (
+            // Not the user's stop: their account's access ended mid-turn.
+            <SuspensionStopChip />
+          ) : (
           <div
             className="inline-flex items-center gap-1.5 self-start mt-1 text-xs"
             style={{ color: 'var(--color-text-tertiary)' }}
@@ -747,6 +771,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
             <StopCircle className="h-3.5 w-3.5 shrink-0" />
             <span>{t('chat.stoppedChip')}</span>
           </div>
+          )
         )}
 
         {/* The assistant's meta row: what the turn drew on, and what you can do
@@ -841,6 +866,7 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         {/* ThumbDown feedback modal */}
         {showThumbDownModal && (
           <ThumbDownDialog
+            humanReview={shared.humanReview}
             loading={feedbackLoading}
             sent={feedbackRating === 'thumbs_down' ? feedback ?? null : null}
             onSubmit={handleThumbDownSubmit}

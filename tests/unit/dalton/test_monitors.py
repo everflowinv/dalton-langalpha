@@ -1040,11 +1040,6 @@ async def test_r2_1_thread_share_allow_files_requires_admin_including_historical
         "get_user_tier",
         create_autospec(access_tiers.get_user_tier, side_effect=lambda uid: tiers[uid]),
     )
-    monkeypatch.setattr(
-        auth_api,
-        "require_thread_owner",
-        create_autospec(auth_api.require_thread_owner, return_value=None),
-    )
 
     threads = {
         "th-int": {
@@ -1066,6 +1061,11 @@ async def test_r2_1_thread_share_allow_files_requires_admin_including_historical
             "share_permissions": {"allow_files": True, "allow_download": False},
         },
     }
+    monkeypatch.setattr(
+        auth_api,
+        "require_thread_owner",
+        create_autospec(auth_api.require_thread_owner, return_value=None),
+    )
     monkeypatch.setattr(
         threads_sharing,
         "get_thread_by_id",
@@ -1143,6 +1143,14 @@ async def test_r2_1_thread_share_allow_files_requires_admin_including_historical
         public_app,
         "get_shared_thread",
         create_autospec(public_app.get_shared_thread, return_value=threads["th-int"]),
+    )
+    monkeypatch.setattr(
+        public_app,
+        "get_thread_by_share_token",
+        create_autospec(
+            public_app.get_thread_by_share_token,
+            return_value={**threads["th-int"], "owner_id": "int-u"},
+        ),
     )
     meta = await public_app.get_shared_thread_metadata(
         "tok-int",
@@ -1581,11 +1589,15 @@ async def test_r2_3_public_write_paths_check_current_admin_and_data_job_approver
     # 3e. Upstream PATCH /artifacts/{id} keep_updated=True & PUT /kept=True on shared artifact require admin
     from src.server.app import share_links as _share_links
 
+    from src.server.services.shared_workspaces.access import Access
+
     shared_art = _make_artifact(shared_at=NOW, latest_seq=1, shared_seq=1)
     monkeypatch.setattr(
         artifact_records,
-        "owned",
-        create_autospec(artifact_records.owned, return_value=shared_art),
+        "reached",
+        create_autospec(
+            artifact_records.reached, return_value=(shared_art, Access("adm-1"))
+        ),
     )
     monkeypatch.setattr(
         _share_links,

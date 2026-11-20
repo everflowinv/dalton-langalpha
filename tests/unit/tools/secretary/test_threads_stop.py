@@ -91,7 +91,7 @@ async def test_a_stop_names_its_run_and_tells_the_model_to_wait_for_the_report()
     cancel = create_autospec(cancel_workflow, return_value=_CANCELLED)
     payload = await _stop(cancel, thread_id=THREAD_ID, run_id=RUN_ID.upper())
 
-    cancel.assert_awaited_once_with(THREAD_ID, run_id=RUN_ID, by_user=False)
+    cancel.assert_awaited_once_with(THREAD_ID, run_id=RUN_ID, by="agent")
     assert payload == {"success": True, "cancelled": True, "message": _STOPPING}
 
 
@@ -100,7 +100,7 @@ async def test_without_a_run_id_the_stop_takes_whatever_the_thread_runs():
     cancel = create_autospec(cancel_workflow, return_value=_CANCELLED)
     await _stop(cancel, thread_id=THREAD_ID, run_id="")
 
-    cancel.assert_awaited_once_with(THREAD_ID, run_id=None, by_user=False)
+    cancel.assert_awaited_once_with(THREAD_ID, run_id=None, by="agent")
 
 
 @pytest.mark.asyncio
@@ -152,4 +152,4 @@ async def test_the_users_steers_never_reach_the_chief_of_staff():
     payload = await _stop(cancel, thread_id=THREAD_ID, run_id=RUN_ID)
 
     assert "returned_steers" not in payload
-    cancel.assert_awaited_once_with(THREAD_ID, run_id=RUN_ID, by_user=False)
+    cancel.assert_awaited_once_with(THREAD_ID, run_id=RUN_ID, by="agent")

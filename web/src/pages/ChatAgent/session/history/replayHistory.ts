@@ -52,6 +52,8 @@ import type { HistoryPageInfo, LoadedHistoryPage } from './olderPages';
 import type { PageBudget } from './pageBudget';
 import { applyHistoryToolResult, markSteeredResumeCards, settleResumedInterrupts } from './resumeSettlement';
 import { readStreamFailure } from '../stream/streamFailure';
+import { readStop } from '../stream/stopBubble';
+import { readTurnRefusal } from '@/lib/turnRefusal';
 
 /** A bubble the replay opened for a turn that nothing has written to. */
 function isEmptyStub(m: MessageRecord): boolean {
@@ -365,10 +367,10 @@ export async function loadConversationHistory(
           // show, none for its own (internal) faults; an older row's raw text
           // is all an unclassified one has.
           const text = (event.error || event.message || '') as string;
+          const failure = readStreamFailure(event, text, readTurnRefusal(event), rt.workspaceId, rt.t);
           handleHistoryError({
             assistantMessageId: msgId,
-            failure: readStreamFailure(event, text, rt.workspaceId, rt.t)
-              ?? { message: text || 'An error occurred while processing your request.' },
+            failure: failure ?? { message: text || 'An error occurred while processing your request.' },
             unloaded: event.type === 'replay_unavailable',
             setMessages: setMessagesForHandlers,
           });
@@ -572,6 +574,7 @@ export async function loadConversationHistory(
             assistantMessageId: currentAssistantMessageId,
             content: '',
             finishReason: event.finish_reason,
+            stop: readStop(event),
             pairState,
             setMessages: setMessagesForHandlers,
             eventId: event._eventId as number | undefined,
@@ -965,10 +968,12 @@ export async function loadConversationHistory(
       carry: { events: carryEvents, subagents: subagentHistoryByTaskId, steeredAgentIds },
     });
     // The thread's ratings (best-effort), started before the transcript shows
-    // so its turns read as loading rather than unrated.
-    const feedbackLoad = rt.threadId ? deps.loadFeedback(rt.threadId) : null;
+    // so its turns read as loading rather than unrated. Not awaited: the
+    // reveal opens the composer, and a turn sent while the load still waited
+    // on the ratings read as taking the load over, so the load ran again once
+    // that turn ended and replayed it.
+    if (rt.threadId) void deps.loadFeedback(rt.threadId);
     reveal(true);
-    await feedbackLoad;
     return true;
   } catch (error: unknown) {
     if (olderPage) throw error;

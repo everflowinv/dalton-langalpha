@@ -2040,22 +2040,27 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         create_autospec(user_db.get_user, side_effect=lambda uid: users_by_id.get(uid)),
     )
 
-    async def _fake_owned_ws_on_computer(
-        workspace_id: str, user_id: str, *, need: str | None = None
-    ) -> dict[str, Any]:
-        return {
-            "workspace_id": workspace_id,
-            "user_id": user_id,
-            "name": "WS",
-            "status": "running",
-        }
+    from src.server.services.shared_workspaces.access import Access
+
+    async def _fake_reached_ws_on_computer(
+        workspace_id: str, user_id: str, *, need: str = "read"
+    ) -> tuple[dict[str, Any], Access]:
+        return (
+            {
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "name": "WS",
+                "status": "running",
+            },
+            Access(user_id),
+        )
 
     monkeypatch.setattr(
         share_links_app,
-        "owned_workspace_on_computer",
+        "reached_workspace_on_computer",
         create_autospec(
-            share_links_app.owned_workspace_on_computer,
-            side_effect=_fake_owned_ws_on_computer,
+            share_links_app.reached_workspace_on_computer,
+            side_effect=_fake_reached_ws_on_computer,
         ),
     )
 
@@ -2448,21 +2453,25 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
             grant_prefix=lambda grant: f"/g/{grant.token}",
         ),
     )
+    shared_thread_row = {
+        "conversation_thread_id": thread_ext_id,
+        "workspace_id": ws_ext_id,
+        "owner_id": external_u,
+        "title": "Shared External Thread",
+        "created_at": now,
+        "updated_at": now,
+        "is_shared": True,
+        "share_permissions": {"allow_files": False, "allow_download": False},
+    }
     monkeypatch.setattr(
         pub_app,
         "get_shared_thread",
-        create_autospec(
-            pub_app.get_shared_thread,
-            return_value={
-                "conversation_thread_id": thread_ext_id,
-                "workspace_id": ws_ext_id,
-                "title": "Shared External Thread",
-                "created_at": now,
-                "updated_at": now,
-                "is_shared": True,
-                "share_permissions": {"allow_files": False, "allow_download": False},
-            },
-        ),
+        create_autospec(pub_app.get_shared_thread, return_value=shared_thread_row),
+    )
+    monkeypatch.setattr(
+        pub_app,
+        "get_thread_by_share_token",
+        create_autospec(pub_app.get_thread_by_share_token, return_value=shared_thread_row),
     )
 
     pub_file_meta = await pub_app.get_shared_thread_metadata(

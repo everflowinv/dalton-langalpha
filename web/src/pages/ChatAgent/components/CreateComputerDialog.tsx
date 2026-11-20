@@ -35,17 +35,19 @@ import { CreateRefusal, ownMachineCreate } from './addComputer';
 import { useAddThisMac } from './addThisMac';
 import { PlanUpgradeHint } from './planUpgradeHint';
 import {
-  computerCapReached,
   defaultProviderKind,
   isProviderLocked,
+  providerLock,
   providerCountsTowardCap,
   providerLabel,
   providerManagesSpec,
   providerOptions,
   THIS_MAC_OPTION,
   thisMacOption,
+  type ProviderGate,
   type ThisMacCard,
 } from './providerUi';
+import { useProviderGate } from '../hooks/useProviderGate';
 import { RadioCardGroup, type RadioCardOption } from './radioCardGroup';
 import { MachinePreview } from './machineArt/MachinePreview';
 import { hostedPreview, ownPreview } from './machineArt/machine';
@@ -75,11 +77,11 @@ function sourceOf(
   picked: string | null,
   providers: readonly ComputerProviderOption[],
   thisMac: ThisMacCard | null,
-  atCap: boolean,
+  gate: ProviderGate,
 ): Source {
-  if (picked === THIS_MAC_OPTION && thisMac === 'offered') return 'thisMac';
+  if (picked === THIS_MAC_OPTION && thisMac === 'offered' && gate.ownMachinesRule === null) return 'thisMac';
   const option = providers.find((p) => p.kind === picked);
-  const kind = option && !isProviderLocked(option, atCap) ? option.kind : defaultProviderKind(providers, atCap);
+  const kind = option && !isProviderLocked(option, gate) ? option.kind : defaultProviderKind(providers, gate);
   return kind === 'ssh' ? 'ssh' : { hosted: kind };
 }
 
@@ -128,6 +130,7 @@ function CreateComputerDialog({
   const nameRef = useRef<HTMLInputElement>(null);
   const [picked, setPicked] = useState<string | null>(initialPick);
   const [pickedTier, setPickedTier] = useState<ResourceTier>('standard');
+  const [sizeLeftToPlan, setSizeLeftToPlan] = useState(true);
   const errorRef = useRef<HTMLDivElement>(null);
 
   // The SSH summary makes the form taller than the dialog, so a refusal would
@@ -148,7 +151,9 @@ function CreateComputerDialog({
   // uses its default, as it does while the list is still loading.
   const choosesProvider = providers.length > 1;
 
-  const atCap = computerCapReached(quota);
+  // A rule against machines the user brings locks their cards in place.
+  const gate = useProviderGate(quota);
+  const { atCap } = gate;
 
   // This Mac, where the desktop app can pair it and this server can reach it.
   // Once a computer is this Mac the card says so instead of pairing it again,
@@ -168,7 +173,7 @@ function CreateComputerDialog({
     else if (os === 'mac' && !isDesktopShell()) thisMacCard = 'needsApp';
   }
 
-  const source = sourceOf(picked, providers, thisMacCard, atCap);
+  const source = sourceOf(picked, providers, thisMacCard, gate);
   const hosted = typeof source === 'object' ? source.hosted : null;
   // A size the picked provider does not run falls back the same way.
   const offer = offeredTiers(providers.find((p) => p.kind === hosted));
@@ -186,13 +191,26 @@ function CreateComputerDialog({
   const base = own ? own.defaultName : providers.find((p) => p.kind === (hosted ?? providers[0]?.kind))?.default_name;
   const suggested = base && computerList ? nextComputerName(base, computerList.computers.map((c) => c.name)) : null;
   const name = typed ?? suggested ?? '';
+  // A cloud computer made while the user has no primary becomes their Home,
+  // which the server sizes by the plan unless a size is sent, so leaving the
+  // size to the plan is offered there, and is the selection until a size is
+  // picked. A size picked stays picked, whatever it falls back to.
+  const followsPlan =
+    isPlatformMode && typeof source === 'object' && !!computerList && !computerList.computers.some((c) => c.is_primary);
+  const automaticSelected = followsPlan && sizeLeftToPlan;
+  const pickSize = (size: ResourceTier) => {
+    setPickedTier(size);
+    setSizeLeftToPlan(false);
+  };
 
   // A size the plan allows that this provider does not run but another open
   // one does (Extra Large, on E2B alone) is named with the way there, in
   // place of the upgrade line: a bigger plan is not what the user lacks.
-  const elsewhere = hosted !== null ? tierElsewhere(providers, hosted, offer.tiers, quota, atCap) : null;
+  const elsewhere = hosted !== null ? tierElsewhere(providers, hosted, offer.tiers, quota, gate) : null;
   const capLocked = atCap && providers.some((p) => providerCountsTowardCap(p.kind));
-  const providerLocked = choosesProvider && providers.some((p) => isProviderLocked(p));
+  // A plan's lock, which upgrading opens; a rule's is not.
+  const providerLocked = choosesProvider
+    && providers.some((p) => providerLock(p, { ...gate, atCap: false }) === 'not_on_plan');
   const tierLocked = !own && !elsewhere && offer.tiers.some((id) => needsBiggerPlan(quota, id));
   // The cap is the lock in the way of the most, so it is the one named.
   const upgradeLead = capLocked
@@ -209,7 +227,8 @@ function CreateComputerDialog({
   // its kind, since the server takes a target only with it. Only a name the
   // user typed is sent: the one the field suggests the server gives anyway,
   // numbering past a computer that took it meanwhile, where a name sent is
-  // refused when one of them has it.
+  // refused when one of them has it. The size is sent unless the user left it
+  // to the plan: a size sent is the owner's and stays put.
   const trimmedName = (typed ?? '').trim();
   const fields: ComputerCreate | null = source === 'thisMac'
     ? addThisMac.body({ name: trimmedName })
@@ -217,7 +236,7 @@ function CreateComputerDialog({
       ? ssh.create && ownMachineCreate(ssh.create, { name: trimmedName })
       : {
         ...(trimmedName ? { name: trimmedName } : {}),
-        resource_tier: tier,
+        ...(automaticSelected ? {} : { resource_tier: tier }),
         ...(choosesProvider && hosted ? { kind: hosted } : {}),
       };
   // Every provider on offer locked leaves nothing to create on. The cap locks
@@ -253,13 +272,13 @@ function CreateComputerDialog({
 
   // The hosted sandboxes come first, then the user's own machines: This Mac,
   // then SSH, both in preview.
-  const providerCards = providerOptions(t, providers, atCap).map((o) =>
+  const providerCards = providerOptions(t, providers, gate).map((o) =>
     // Beside the title, where a lock note would sit; a lock note wins.
     o.value === 'ssh' && !o.note ? { ...o, note: t('computer.ssh.previewLabel', 'Preview') } : o,
   );
   const options: RadioCardOption<string>[] = [
     ...providerCards.filter((o) => providerManagesSpec(o.value)),
-    ...(thisMacCard ? [thisMacOption(t, thisMacCard)] : []),
+    ...(thisMacCard ? [thisMacOption(t, thisMacCard, gate)] : []),
     ...providerCards.filter((o) => !providerManagesSpec(o.value)),
   ];
 
@@ -373,13 +392,21 @@ function CreateComputerDialog({
         ) : source === 'ssh' ? (
           <SshSetup state={ssh} busy={busy} />
         ) : (
-          <TierRadioGroup
-            offer={offer}
-            value={tier}
-            onChange={setPickedTier}
-            label={t('computer.tierLabel', 'Computer spec')}
-            quota={quota}
-          />
+          // Before the list answers whether the size may be left to the plan,
+          // a click on the size shown is a pick too, though the radio already
+          // checked changes nothing: the answer must not take it back.
+          <div className="contents" onClickCapture={computerList ? undefined : () => setSizeLeftToPlan(false)}>
+            <TierRadioGroup
+              offer={offer}
+              value={tier}
+              onChange={pickSize}
+              label={t('computer.tierLabel', 'Computer spec')}
+              quota={quota}
+              automatic={
+                followsPlan ? { checked: automaticSelected, onSelect: () => setSizeLeftToPlan(true) } : undefined
+              }
+            />
+          </div>
         )}
 
         {elsewhere && (
@@ -395,7 +422,7 @@ function CreateComputerDialog({
               disabled={busy}
               onClick={() => {
                 setPicked(elsewhere.kind);
-                setPickedTier(elsewhere.tier);
+                pickSize(elsewhere.tier);
               }}
             >
               {t('computer.switchProvider', 'Switch to {{provider}}', { provider: providerLabel(elsewhere.kind, t) })}
@@ -427,7 +454,7 @@ function tierElsewhere(
   kind: string,
   offered: readonly ResourceTier[],
   quota: WorkspaceQuota | null | undefined,
-  atCap: boolean,
+  gate: ProviderGate,
 ): { tier: ResourceTier; kind: string } | null {
   if (!isPlatformMode) return null;
   for (const tier of [...TIER_ORDER].reverse()) {
@@ -437,7 +464,7 @@ function tierElsewhere(
       (p) =>
         p.kind !== kind &&
         providerManagesSpec(p.kind) &&
-        !isProviderLocked(p, atCap) &&
+        !isProviderLocked(p, gate) &&
         offeredTiers(p).tiers.includes(tier),
     );
     if (other) return { tier, kind: other.kind };

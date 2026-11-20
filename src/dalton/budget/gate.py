@@ -51,6 +51,8 @@ def build_local_run_gate(
     tool_tracker: Any = None,
     model_name: Optional[str] = None,
     is_byok: bool = False,
+    *,
+    sender: Optional[str] = None,
 ) -> Optional[CreditGateState]:
     """Construct a `CreditGateState` bound to `LOCAL_PORT` (P0.8 §2)."""
     if not user_id:
@@ -60,7 +62,8 @@ def build_local_run_gate(
         kind="run",
         port=LOCAL_PORT,
         lease=CreditLease(
-            user_id=user_id,
+            recorded_as=user_id,
+            sender=sender or user_id,
             run_ref=run_id,
             port=LOCAL_PORT,
             is_byok=is_byok,

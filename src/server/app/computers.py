@@ -23,6 +23,8 @@ from ptc_agent.core.sandbox.providers.ssh_errors import (
 )
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.services.persistence.sync_result import BackupIncomplete
+from src.server.services import activity
+from src.server.services.activity import Action
 from src.server.services.background_starts import schedule_start
 from src.server.services.computer_usage.causes import computer_cause
 from src.server.app.status_stream import (
@@ -36,6 +38,7 @@ from src.server.database.computer import (
     computer_capacity_lock,
     get_computer,
     get_computers_for_user,
+    get_home_computer,
     observed_layout_version,
     removal_held,
     rename_computer as db_rename_computer,
@@ -49,14 +52,16 @@ from src.server.database.workspace import (
     get_live_workspace_folders_for_computer,
 )
 from src.server.database.workspace_move import MoveRefused
+from src.server.services.platform_client import platform_gating_active
 from src.server.dependencies.usage_limits import (
     assert_provider_allowed,
     assert_spec_allowed,
     enforce_computer_count,
     enforce_computer_limit,
     get_provider_allowances,
-    platform_gating_active,
+    tier_rank,
 )
+from src.server.database.user import get_user
 from src.server.models.computer import (
     CLAIMABLE_FOR_START,
     ComputerActionResponse,
@@ -78,6 +83,7 @@ from src.server.models.computer import (
     ComputerSessionResponse,
     ComputerSpecRequest,
     ComputerStorageResponse,
+    HomePlanSizeResponse,
 )
 from src.server.models.workspace_move import (
     MakePrimaryRequest,
@@ -103,7 +109,9 @@ from src.server.services.computer_errors import (
     UnknownResourceTier,
 )
 from src.server.services.spec_change import (
+    SIZED_BY_OWNER,
     SPEC_CHANGE_IN_PROGRESS,
+    sized_by_owner,
     spec_change_from_row,
     spec_refusal,
 )
@@ -143,6 +151,7 @@ from src.server.dependencies.principal import (
 )
 from src.server.utils.api import CurrentUserId
 from src.server.utils.error_sanitization import sandbox_failure_http
+from src.server.services.shared_workspaces.access import computer_access
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +389,16 @@ async def _owned_computer(computer_id: str, user_id: str) -> Dict[str, Any]:
     return computer  # type: ignore[return-value]
 
 
+async def _reached_computer(
+    computer_id: str, user_id: str, *, manage: bool = False
+) -> Dict[str, Any]:
+    """:func:`_owned_computer`, or a shared workspace's computer for one of
+    its members (a manager for ``manage``)."""
+    computer = await get_computer(computer_id)
+    await computer_access(computer, user_id, manage=manage)
+    return computer  # type: ignore[return-value]
+
+
 async def _report_start_failure(computer_id: str, exc: Exception) -> None:
     """A background start behind 202 must publish failure or subscribers wait until timeout.
 
@@ -511,6 +530,14 @@ async def create_computer(
                 status_code=422,
                 detail=_FILES_BACKUP_REQUIRED,
             )
+        # A size the owner picked here is never changed for the plan, even as
+        # Home; one left to the default (a CLI add with no tier) takes the
+        # plan's size at its first build if it becomes Home.
+        sized_here = (
+            {"config": {SIZED_BY_OWNER: True}}
+            if "resource_tier" in request.model_fields_set
+            else {}
+        )
         # Every create and rename holds this lock, so a name still free under
         # it is free at the insert, after a take-over that cannot be undone.
         async with _computer_quota_decision(x_user_id, always=True):
@@ -525,7 +552,7 @@ async def create_computer(
                 await enforce_computer_count(x_user_id)
                 await assert_spec_allowed(x_user_id, request.resource_tier)
                 await enforce_computer_limit(x_user_id)
-            create_kwargs = plan.create_kwargs() if plan is not None else {}
+            create_kwargs = plan.create_kwargs() if plan is not None else sized_here
             if request.make_primary:
                 # Kept on the row until its first start completes, which
                 # applies it (ComputerManager.apply_make_primary_intent).
@@ -644,6 +671,52 @@ async def list_computer_providers(x_user_id: ReadUserId):
     )
 
 
+@router.get("/home/plan-size", response_model=HomePlanSizeResponse)
+async def get_home_plan_size(x_user_id: ReadUserId):
+    """Home's size beside the one the plan gives it, for a plan page that says
+    what an upgrade does to Home before checkout. Home takes the plan's size
+    only at its first build, unless its owner chose one (``follows_plan``);
+    built at the size it was given, a bigger one the plan grants is its
+    owner's to take (``can_resize``). Without a platform there is no plan to read."""
+    async with _computer_action_errors("read the plan size of", "home"):
+        manager = _computer_manager()
+        computer = await get_home_computer(x_user_id)
+        gating = platform_gating_active()
+        if computer is None:
+            # A user who chose to work on their own machine gets no cloud Home.
+            cloud = provider_class(manager.config.sandbox.provider).recreatable and (
+                (await get_user(x_user_id) or {}).get("computer_choice") != "own_machine"
+            )
+            built = owner_sized = primary = False
+            held = None
+        else:
+            cloud = provider_class(computer["kind"]).recreatable
+            built = bool(computer.get("provider_ref"))
+            owner_sized = sized_by_owner(computer)
+            primary = bool(computer.get("is_primary"))
+            held = computer.get("resource_tier") or "standard"
+        planned = await manager.plan_tier(x_user_id, computer) if cloud and gating else None
+        follows_plan = gating and cloud and not built and not owner_sized
+        # The resize the app offers opens Home's primary, so only a cloud one
+        # built already counts.
+        can_resize = (
+            cloud
+            and built
+            and primary
+            and not owner_sized
+            and (tier_rank(planned) or 0) > (tier_rank(held) or 0)
+        )
+        largest_tier = manager.largest_tier(computer if cloud else None)
+    return HomePlanSizeResponse(
+        computer_id=str(computer["computer_id"]) if computer else None,
+        resource_tier=held,
+        plan_tier=planned or held or "standard",
+        largest_tier=largest_tier,
+        follows_plan=follows_plan,
+        can_resize=can_resize,
+    )
+
+
 def _tier_specs(sandbox: Any, kind: str) -> list[ComputerTierSpec]:
     """The sizes ``kind`` offers, from the settings its sandboxes are built from.
 
@@ -691,7 +764,7 @@ async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:
 
 @router.get("/{computer_id}", response_model=ComputerResponse)
 async def get_computer_details(computer_id: str, x_user_id: ReadUserId):
-    return await _counted_response(await _owned_computer(computer_id, x_user_id))
+    return await _counted_response(await _reached_computer(computer_id, x_user_id))
 
 
 @router.patch("/{computer_id}", response_model=ComputerResponse)
@@ -813,6 +886,13 @@ async def remove_computer(
         removed = await manager.remove_computer_for_owner(
             computer, named, delete_files=delete_files, remove_key=remove_key
         )
+        activity.record(
+            x_user_id, Action.COMPUTER_REMOVED, resource=("computer", computer_id),
+            detail={
+                "kind": computer.get("kind"), "name": computer.get("name"),
+                "workspaces_deleted": len(removed.deleted), "files_deleted": delete_files,
+            },
+        )
     return removed.response()
 
 
@@ -877,7 +957,7 @@ async def get_computer_storage(computer_id: str, x_user_id: ReadUserId):
 @router.get("/{computer_id}/session", response_model=ComputerSessionResponse)
 async def get_computer_session(computer_id: str, x_user_id: ReadUserId):
     """Resolve sessions only when Postgres says running so this read cannot provision."""
-    computer = await _owned_computer(computer_id, x_user_id)
+    computer = await _reached_computer(computer_id, x_user_id)
     response = ComputerSessionResponse(
         computer_id=str(computer["computer_id"]),
         status=computer["status"],
@@ -905,7 +985,7 @@ async def get_computer_session(computer_id: str, x_user_id: ReadUserId):
 
 @router.get("/{computer_id}/events")
 async def computer_status_events(computer_id: str, x_user_id: ReadUserId):
-    computer = await _owned_computer(computer_id, x_user_id)
+    computer = await _reached_computer(computer_id, x_user_id)
 
     def _frame(
         status: str,
@@ -954,10 +1034,10 @@ async def start_computer(
 ):
     async with _computer_action_errors("start", computer_id):
         manager = _computer_manager()
-        computer = await _owned_computer(computer_id, x_user_id)
+        computer = await _reached_computer(computer_id, x_user_id)
         if computer["status"] == "stopping":
             await manager.reconcile_stopping_computer(computer_id)
-            computer = await _owned_computer(computer_id, x_user_id)
+            computer = await _reached_computer(computer_id, x_user_id)
         status = computer["status"]
 
         if status == "running":
@@ -1009,7 +1089,7 @@ async def start_computer(
 @router.post("/{computer_id}/stop", response_model=ComputerActionResponse)
 async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
     async with _computer_action_errors("stop", computer_id):
-        await _owned_computer(computer_id, x_user_id)
+        await _reached_computer(computer_id, x_user_id, manage=True)
         with computer_cause("user"):
             updated = await _computer_manager().stop_computer(computer_id)
         logger.info(f"Stopped computer {computer_id}")
@@ -1023,7 +1103,7 @@ async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
 @router.post("/{computer_id}/archive", response_model=ComputerActionResponse)
 async def archive_computer(computer_id: str, x_user_id: ComputerEndUserId):
     async with _computer_action_errors("archive", computer_id):
-        await _owned_computer(computer_id, x_user_id)
+        await _reached_computer(computer_id, x_user_id, manage=True)
         with computer_cause("archive"):
             updated = await _computer_manager().archive_computer(computer_id)
         logger.info(f"Archived computer {computer_id}")

@@ -119,9 +119,11 @@ def _stub_thread_agent():
     messages = [MagicMock(id="m1"), MagicMock(id="m2")]
 
     async def _stub(
-        thread_id, verb, config=None, checkpointer=None, user_id=None, held=None, role="analyst"
+        thread_id, verb, config=None, checkpointer=None, user_id=None, held=None, role="analyst", route=None, **_kwargs
     ):
-        return ThreadAgent(thread_id, graph, state, messages, "ws-1", None, PROJECT)
+        return ThreadAgent(
+            thread_id, graph, state, messages, "ws-1", None, PROJECT, recorded_as=user_id
+        )
 
     return _stub
 

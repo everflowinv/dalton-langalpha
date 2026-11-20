@@ -18,7 +18,7 @@ import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 /** The wizard's step for a provider of the user's own: the shared form between the wizard's header and footer. */
 export function CustomProviderConnect({ state }: { state: LocationState }) {
   const navigate = useNavigate();
-  const connected = useProviderConnected();
+  const connected = useProviderConnected(state.answering === true);
   const { t } = useTranslation();
   const headingId = useId();
   const nameId = useId();
@@ -206,7 +206,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
       </div>
 
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { list: state.list } }) }}
+        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { list: state.list, answering: state.answering } }) }}
         primary={{
           label: form.saving ? t('setup.saving') : t('setup.continue'),
           onClick: handleSave,
