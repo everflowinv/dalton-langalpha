@@ -189,8 +189,8 @@ class Library:
             else:
                 config=json.loads((self.code_root/'skills'/name/'config.json').read_text())
             if source=='funda-ai':
-                from funda_ai import MODEL,DIMS
-                config['embedding']={'model':MODEL,'dimensions':DIMS}
+                from funda_ai import API_MODEL,DIMS
+                config['embedding']={'model':API_MODEL,'dimensions':DIMS}
             # Suppress provider fail() output; never let auth diagnostics enter JSON.
             with contextlib.redirect_stdout(io.StringIO()):
                 if source=='company-wiki':

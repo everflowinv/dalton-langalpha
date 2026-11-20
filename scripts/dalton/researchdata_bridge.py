@@ -6078,10 +6078,16 @@ def _apply_error_and_empty_contract(
                     payload["data"]["ok"] = True
                     payload["data"]["coverage"] = tr_cov
                 scan_clause = f"（扫描了 {records_sc} 条）" if records_sc is not None else ""
-                payload["hint"] = (
-                    f"已找到 {len(candidates)} 篇候选，但检索未覆盖完整期间{scan_clause}，最新一场可能不在其中；"
-                    "可用 continuation 参数续查（请将 coverage.continuation_params 交给 research(route='alphaengine', operation='search_library', ...)，不要传回 transcript）。"
-                )
+                if _ae_cache.cursor_unavailable_reason(payload) or not tr_cov.get("continuation_params"):
+                    payload["hint"] = (
+                        f"已找到 {len(candidates)} 篇候选，但检索未覆盖完整期间{scan_clause}，最新一场可能不在其中；"
+                        + _ae_cache.STALE_CURSOR_NOTE
+                    )
+                else:
+                    payload["hint"] = (
+                        f"已找到 {len(candidates)} 篇候选，但检索未覆盖完整期间{scan_clause}，最新一场可能不在其中；"
+                        "可用 continuation 参数续查（请将 coverage.continuation_params 交给 research(route='alphaengine', operation='search_library', ...)，不要传回 transcript）。"
+                    )
             else:
                 payload.pop("fallback", None)
                 if isinstance(payload.get("data"), dict):
@@ -6169,7 +6175,9 @@ def _apply_error_and_empty_contract(
                 payload["status"] = "ok"
             payload.setdefault(
                 "hint",
-                "当前页返回 results=[] 但 has_more=true（后续页仍有数据），请继续携带返回的 cursor（或 next_page）翻页，不得判为无匹配记录。",
+                _ae_cache.STALE_CURSOR_NOTE
+                if _ae_cache.cursor_unavailable_reason(payload)
+                else "当前页返回 results=[] 但 has_more=true（后续页仍有数据），请继续携带返回的 cursor（或 next_page）翻页，不得判为无匹配记录。",
             )
 
         if route == "alphaengine":
@@ -9178,9 +9186,11 @@ class ResearchDataBridge:
                 "stale": True,
                 "stale_reason": stale_reason,
             }
+            # A stale copy is served only when upstream is failing; its cursor is long
+            # dead in the MCP, so drop it rather than let the caller page into an error.
             return {
                 "ok": True,
-                "payload": stale_hit.payload,
+                "payload": _ae_cache.strip_cursor(stale_hit.payload, op=op),
                 "rpc_error": None,
                 "is_error": False,
                 "raw_text": "",
@@ -10439,11 +10449,25 @@ class ResearchDataBridge:
                 ae_section["stale_reason"] = str(ae_outcome.get("stale_reason") or "quota")
                 if ae_outcome.get("cached_at"):
                     ae_section["cached_at"] = str(ae_outcome["cached_at"])
+            # One rule for the paging hint: a cursor -> page with it; more results but no
+            # cursor (stale copy or a cut-down cached page) -> say why and what to do;
+            # nothing more -> no hint.
+            if not ae_section.get("cursor"):
+                if ae_section.get("has_more"):
+                    ae_section["next_page_hint"] = (
+                        _ae_cache.STALE_CURSOR_NOTE if ae_outcome.get("stale") else _ae_cache.SLICED_CACHE_NOTE
+                    )
+                else:
+                    ae_section.pop("next_page_hint", None)
             if clamped_pair:
                 ae_section["limit_clamped"] = list(clamped_pair)
                 ae_section["note"] = (
                     f"AlphaEngine search_library 单次上限为 50，已将 limit 从 {clamped_pair[0]} 截断为 50；"
-                    '如需更多结果请改用 research(route="alphaengine", operation="search_library") 并传 params.cursor 翻页。'
+                    + (
+                        '如需更多结果请改用 research(route="alphaengine", operation="search_library") 并传 params.cursor 翻页。'
+                        if ae_section.get("cursor")
+                        else ae_section.get("next_page_hint") or "本次结果已全部返回。"
+                    )
                 )
         else:
             st_cand = str(ae_outcome.get("status") or ae_raw_unwrapped.get("status") or "").strip().lower()
@@ -15206,8 +15230,11 @@ class ResearchDataBridge:
             )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
+        if res.get("ok") and isinstance(res.get("embeddings"), list) and len(res["embeddings"]) != len(texts):
+            # One vector per text or nothing: a short answer would shift vectors onto the wrong texts.
+            res = {"ok": False, "error": f"embedding returned {len(res['embeddings'])} vectors for {len(texts)} texts"}
         if res.get("ok") and isinstance(res.get("embeddings"), list):
-            model_used = str(res.get("model") or "gemini-embedding-001")
+            model_used = str(res.get("model") or "gemini-embedding-2-preview")
             dims_used = int(res.get("dimensions") or 3072)
             if not req_model:
                 self._resolved_embed_model = model_used

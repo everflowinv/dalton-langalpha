@@ -545,7 +545,28 @@ async def _handle_send_message(
         # All flags are pre-checked by chat_limit_for — no DB calls here.
         # A tier nobody could read is an outage, not a missing provider: telling
         # a paying user to set one up sends them to the setup wizard for it.
+        # DALTON-HOOK(automation-subscription-fallback): resolve service-auth flags ahead of the flagged-subscription gate
         from src.config.settings import HOST_MODE
+        from src.dalton.auth import is_dalton_supabase_auth_enabled
+
+        _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
+        _svc_token = _get_service_token()
+        is_internal = _is_service_request(raw_request)
+        is_dispatch = bool(
+            raw_request and raw_request.headers.get("X-Dispatch") == "background"
+        )
+        from_service = (
+            is_internal
+            if is_dalton_supabase_auth_enabled()
+            else service_token_matches(_req_token, _svc_token)
+        ) or is_dispatch
+        is_server_retry = (
+            is_internal
+            if is_dalton_supabase_auth_enabled()
+            else (service_token_matches(_req_token, _svc_token) or is_dispatch)
+        )
+
+        flagged_subscription: tuple[object, str | None] | None = None
         needs_plan = HOST_MODE == "platform" and not auth.is_byok and not auth.has_oauth
         if needs_plan and auth.access_tier is None:
             raise quota_service_unavailable()
@@ -559,15 +580,30 @@ async def _handle_send_message(
             flagged = await flagged_oauth_connection(user_id) if auth.own_subscriptions else None
             subscription = SUBSCRIPTIONS.get(flagged["provider"]) if flagged else None
             if subscription is not None:
-                raise_oauth_reauth_required(subscription, None, flagged["last_error_code"])
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "No provider configured. Set up an API key or connect via OAuth.",
-                    "type": "no_provider",
-                    "link": {"url": "/setup/method", "label": "Set up provider"},
-                },
-            )
+                # DALTON-HOOK(automation-subscription-fallback): defer flagged-subscription gate for automation notification turns
+                from src.dalton.services.automation_thread_model import (
+                    is_automation_notification_turn,
+                )
+
+                if (not is_dispatch or is_internal) and await is_automation_notification_turn(
+                    thread_id=thread_id,
+                    request=request,
+                    from_service=from_service,
+                    is_server_retry=is_server_retry,
+                    retry_of_run_id=retry_of_run_id,
+                ):
+                    flagged_subscription = (subscription, flagged["last_error_code"])
+                else:
+                    raise_oauth_reauth_required(subscription, None, flagged["last_error_code"])
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "message": "No provider configured. Set up an API key or connect via OAuth.",
+                        "type": "no_provider",
+                        "link": {"url": "/setup/method", "label": "Set up provider"},
+                    },
+                )
 
         # Reject an unauthenticated background dispatch up front, before the
         # owner lookup, workspace/LLM resolution, and credit check below — a
@@ -576,12 +612,6 @@ async def _handle_send_message(
         # authenticate against, so the self-dispatch is trusted; a configured
         # token is enforced in every mode. Past this check a dispatch is
         # always the server's own, so ``is_dispatch`` alone says so below.
-        _req_token = (raw_request.headers.get("X-Service-Token", "") if raw_request else "")
-        _svc_token = _get_service_token()
-        is_internal = _is_service_request(raw_request)
-        is_dispatch = bool(
-            raw_request and raw_request.headers.get("X-Dispatch") == "background"
-        )
         if is_dispatch and not is_internal:
             raise HTTPException(
                 status_code=403,
@@ -750,18 +780,13 @@ async def _handle_send_message(
         # names no model while its client has not read the thread yet, and
         # gets the refusal rather than an answer from a model it never chose.
         # DALTON-HOOK(dalton-auth): reuse _is_service_request result (with >=32-char check) when Dalton auth is enabled
-        from src.dalton.auth import is_dalton_supabase_auth_enabled
-
-        from_service = (
-            is_internal
-            if is_dalton_supabase_auth_enabled()
-            else service_token_matches(_req_token, _svc_token)
-        ) or is_dispatch
         # DALTON-HOOK(automation-thread-model): inherit automation execution's model for server notification turns with unservable fallback
+        # DALTON-HOOK(automation-subscription-fallback): forward deferred flagged subscription and capture fallback notice metadata
         from src.dalton.services.automation_thread_model import (
             resolve_turn_config_with_automation_inheritance,
         )
 
+        fallback_records: list[dict[str, object]] = []
         config = await resolve_turn_config_with_automation_inheritance(
             user_id=user_id,
             thread_id=thread_id,
@@ -769,13 +794,11 @@ async def _handle_send_message(
             requested_model=requested_model,
             held_model=held_model,
             from_service=from_service,
-            is_server_retry=(
-                is_internal
-                if is_dalton_supabase_auth_enabled()
-                else (service_token_matches(_req_token, _svc_token) or is_dispatch)
-            ),
+            is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
             resolve=resolve,
+            flagged_subscription=flagged_subscription,
+            on_fallback=fallback_records.append,
         )
 
         # is_byok is True only when the stamped credential_source confirms the user
@@ -881,6 +904,9 @@ async def _handle_send_message(
 
     # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
     run_meta: dict[str, object] = {}
+    # DALTON-HOOK(automation-subscription-fallback): record fallback notice on run row metadata
+    if fallback_records:
+        run_meta["subscription_fallback"] = fallback_records[0]
     if request.report_back_ptc_thread_id:
         run_meta["report_back_ptc_thread_id"] = request.report_back_ptc_thread_id
         run_meta["origin_dispatch_gen"] = request.origin_dispatch_gen

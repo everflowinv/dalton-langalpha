@@ -128,7 +128,7 @@ from .error_handling import handle_workflow_error
 from .agent_change import cancel_tool_calls_it_lacks, opens_afresh
 from src.llms.claude_code import is_claude_code_model
 from src.server.services.llm.clients import is_own_key_turn
-from src.server.services.llm.config import apply_fetch_override, resolve_llm_config
+from src.server.services.llm.config import apply_fetch_override  # DALTON-HOOK(automation-subscription-fallback): resolve_llm_config moved to resolve_ptc_turn_llm_config
 from src.server.services.llm.thread_model import NamedModel
 from .steering import open_with_steers_ahead
 from .run_stream_reader import stream_from_log
@@ -539,18 +539,14 @@ async def astream_ptc_workflow(
                 # route already resolves before this generator runs, so this only
                 # moves the standalone path onto the ordering production has.
                 if config is None:
-                    config = await resolve_llm_config(
-                        setup.agent_config,
-                        user_id,
-                        request.llm_model,
-                        is_byok,
-                        reasoning_effort=getattr(request, "reasoning_effort", None),
-                        fast_mode=getattr(request, "fast_mode", None),
-                        thread_id=thread_id,
-                        enabled_subagents=request.subagents_enabled,
-                        workspace_id=workspace_id,
-                        identity=identity,
-                        role=route.role,
+                    # DALTON-HOOK(automation-subscription-fallback): resolve LLM config with automation subscription fallback
+                    from src.dalton.services.automation_subscription_fallback import (
+                        resolve_ptc_turn_llm_config,
+                    )
+
+                    config, run_metadata = await resolve_ptc_turn_llm_config(
+                        setup.agent_config, user_id, request, is_byok=is_byok, thread_id=thread_id,
+                        workspace_id=workspace_id, identity=identity, role=route.role, run_metadata=run_metadata,
                     )
 
                 # Persist query start
@@ -688,6 +684,17 @@ async def astream_ptc_workflow(
                         )
                     extra_configurable = updated_configurable
 
+                # DALTON-HOOK(automation-subscription-fallback): mark execution row on START when a turn fell back
+                _fb_exec_id = None
+                if isinstance(run_metadata, dict) and isinstance(
+                    run_metadata.get("subscription_fallback"), dict
+                ):
+                    _fb_exec_id = (
+                        run_metadata.get("automation_execution_id")
+                        or (firing or {}).get("automation_execution_id")
+                        or run_metadata["subscription_fallback"].get("execution_id")
+                    )
+
                 # DALTON-HOOK(automation-continuation-identity): take over firing inside START txn after FOR UPDATE lock on execution
                 async def _on_start(conn) -> None:
                     if turn_attachments:
@@ -700,6 +707,14 @@ async def astream_ptc_workflow(
                     if firing:
                         await automation_settlement.take_over_firing(
                             firing["automation_execution_id"], run_id, conn=conn
+                        )
+                    if _fb_exec_id:
+                        from src.dalton.services.automation_subscription_fallback import (
+                            mark_execution_subscription_fallback,
+                        )
+
+                        await mark_execution_subscription_fallback(
+                            str(_fb_exec_id), conn=conn
                         )
 
                 run_handle = await begin_run(
@@ -740,7 +755,7 @@ async def astream_ptc_workflow(
                     in_start=home.in_start(
                         user_id,
                         run_id,
-                        _on_start if (turn_attachments or firing) else None,
+                        _on_start if (turn_attachments or firing or _fb_exec_id) else None,
                     ),
                     runs_in=home.moved_off,
                 )

@@ -774,6 +774,12 @@ async def resolve_llm_config(
                     "model": selection.effective_model,
                 },
             )
+        # DALTON-HOOK(automation-subscription-fallback): record selected effective_model so fallback notices name the rejected model
+        from src.dalton.services.automation_subscription_fallback import (
+            note_resolved_effective_model,
+        )
+
+        note_resolved_effective_model(selection.effective_model)
         if is_claude_code_model(selection.effective_model):
             config.claude_code_admitted = await require_runnable(
                 config, selection.effective_model, user_id=user_id, workspace_id=workspace_id,

@@ -428,6 +428,11 @@ ALLOWED_HOOKS=(
   # Firecrawl budget: skip stealth re-escalation after auto and keep 402 credit-exhaustion notice.
   "firecrawl-budget"
   "chat-attachment-count"
+  # Automation turns (executor first turn and automation notification turns)
+  # fall back to user fallback_models when the primary subscription is
+  # unavailable, record the notice in execution result_excerpt/delivery, and
+  # release pre-START claimed signals on synchronous executor failed settle.
+  "automation-subscription-fallback"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

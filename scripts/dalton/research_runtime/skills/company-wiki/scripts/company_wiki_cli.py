@@ -50,6 +50,16 @@ if _SCRIPTS_DIR not in sys.path:
 SKILL_DIR = Path(__file__).resolve().parent.parent
 
 
+
+# Google retired gemini-embedding-2-preview on 2026-11-19. The GA model returns the
+# same vectors for the same text (cosine 1.0, checked on the sales-notes and wiki
+# indexes), so stored labels and configs keep the old name and only the API call maps it.
+_API_MODEL_ALIASES = {"gemini-embedding-2-preview": "gemini-embedding-2"}
+
+
+def api_model(name):
+    return _API_MODEL_ALIASES.get(name, name)
+
 def _resolve_research_roots(default_code_root: Path) -> tuple[Path, Path]:
     raw_code = os.environ.get("DALTON_RESEARCH_CODE", "").strip()
     raw_home = os.environ.get("DALTON_RESEARCH_HOME", "").strip()
@@ -153,16 +163,17 @@ def get_genai_client():
 
 
 def resolve_embedding_model(config):
-    """Try preferred model first, fall back to default."""
+    """Try preferred model first; fall back only to a model in the same vector space."""
     preferred = config["embedding"].get("model_preferred")
     default = config["embedding"]["model"]
 
     if preferred:
+        error = "empty embedding"
         try:
             client = get_genai_client()
             # Test with a tiny embed call
             result = client.models.embed_content(
-                model=preferred,
+                model=api_model(preferred),
                 contents=["test"],
                 config={"task_type": "RETRIEVAL_DOCUMENT"}
             )
@@ -170,13 +181,18 @@ def resolve_embedding_model(config):
                 log(f"Using preferred model: {preferred} (dims={len(result.embeddings[0].values)})")
                 return preferred, len(result.embeddings[0].values)
         except Exception as e:
-            log(f"Preferred model {preferred} not available: {e}")
+            error = e
+        if api_model(preferred) != api_model(default):
+            # A different model writes and queries in an unrelated vector space
+            # (gemini-embedding-001 vs the stored index: cosine ~0), so fail instead.
+            fail(f"Embedding model {preferred} failed and {default} is not compatible: {error}")
+        log(f"Preferred model {preferred} not available: {error}")
 
     # Fall back to default
     try:
         client = get_genai_client()
         result = client.models.embed_content(
-            model=default,
+            model=api_model(default),
             contents=["test"],
             config={"task_type": "RETRIEVAL_DOCUMENT"}
         )
@@ -186,9 +202,10 @@ def resolve_embedding_model(config):
     except Exception as e:
         fail(f"Embedding model {default} failed: {e}")
 
-
 def embed_texts(texts, model_name):
     """Embed a list of texts using Gemini embedding API with true batch calls."""
+    from google.genai import types
+
     client = get_genai_client()
     log(f"Embedding {len(texts)} chunks with {model_name}")
 
@@ -199,17 +216,23 @@ def embed_texts(texts, model_name):
         batch = texts[i:i + BATCH_SIZE]
         for attempt in range(5):
             try:
+                # One Content per text: gemini-embedding-2 folds a list of plain
+                # strings into a single vector (seen 2026-11-19).
                 result = client.models.embed_content(
-                    model=model_name,
-                    contents=batch,
+                    model=api_model(model_name),
+                    contents=[types.Content(parts=[types.Part(text=t)]) for t in batch],
                     config={"task_type": "RETRIEVAL_DOCUMENT"}
                 )
+                if len(result.embeddings) != len(batch):
+                    raise RuntimeError(
+                        f"embedding returned {len(result.embeddings)} vectors for {len(batch)} texts"
+                    )
                 for emb in result.embeddings:
                     embeddings.append(emb.values)
                 break
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < 4:
                     wait = 2 ** attempt * 5
                     log(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/5)")
                     time.sleep(wait)
@@ -223,7 +246,7 @@ def embed_query(text, model_name):
     """Embed a single query text."""
     client = get_genai_client()
     result = client.models.embed_content(
-        model=model_name,
+        model=api_model(model_name),
         contents=text,
         config={"task_type": "RETRIEVAL_QUERY"}
     )

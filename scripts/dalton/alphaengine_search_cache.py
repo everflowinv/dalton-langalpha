@@ -55,6 +55,11 @@ TTL_TODAY_EMPTY_S = 30 * 60
 TTL_RECENT_7D_S = 12 * 3600
 TTL_OLDER_S = 7 * 86400
 STALE_RETENTION_S = 7 * 86400
+# The AlphaEngine MCP keeps search cursors in memory for 15 minutes (server.mjs
+# SEARCH_CURSOR_TTL_MS). A cached page that has more results carries one of those
+# cursors, so past this age a hit would hand the caller a dead cursor and page 2
+# fails with E_CURSOR_EXPIRED (seen 2026-11-20). Such hits are treated as misses.
+CURSOR_SAFE_AGE_S = 12 * 60
 
 DEFAULT_MAX_ROWS = 10_000
 CLEANUP_EVERY_WRITES = 50
@@ -705,6 +710,110 @@ def _locate_search_results_containers(
     return matches[0] if matches else (None, None, None)
 
 
+STALE_CURSOR_NOTE = "缓存副本：结果未取完，但翻页游标已失效，不能续查；需要更多结果请稍后重新检索。"
+STALE_CONTINUATION_NOTE = "当前为缓存副本，无法续查（游标与 continuation 参数已失效）；需要更多结果请稍后重新检索。"
+
+
+def _cursor_slots(obj: Any):
+    """Yield every ``(dict, "cursor")`` slot holding a cursor, at any depth.
+
+    search_library keeps it in the results container; transcript keeps it in
+    ``coverage.continuation_params``. JSON text blocks are re-serialized by callers."""
+    if isinstance(obj, dict):
+        if obj.get("cursor") not in (None, "", [], {}):
+            yield obj
+        for value in obj.values():
+            yield from _cursor_slots(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _cursor_slots(value)
+
+
+def payload_has_live_cursor(payload: dict[str, Any], *, op: str) -> bool:
+    """Whether *payload* carries a page cursor: in any nested dict, or in a results
+    container that only exists as a JSON text block."""
+    if any(True for _ in _cursor_slots(payload)):
+        return True
+    return any(
+        container.get("cursor") not in (None, "", [], {})
+        for container, _, _ in _locate_all_search_results_containers(payload, op=op)
+    )
+
+
+def cursor_unavailable_reason(obj: Any) -> str:
+    """``"stale"`` when :func:`strip_cursor` marked a page that has more results it can
+    no longer reach, else ``""`` (dict values only; JSON text blocks carry their own note)."""
+    if isinstance(obj, dict):
+        if obj.get("cursor_unavailable") == "stale":
+            return "stale"
+        for value in obj.values():
+            found = cursor_unavailable_reason(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = cursor_unavailable_reason(value)
+            if found:
+                return found
+    return ""
+
+
+def _says_more(obj: Any) -> bool:
+    """True only where the payload explicitly says results remain: a ``has_more`` that
+    is true, or a transcript ``coverage`` with ``complete: false``."""
+    if isinstance(obj, dict):
+        if obj.get("has_more") is True:
+            return True
+        cov = obj.get("coverage")
+        if isinstance(cov, dict) and cov.get("complete") is False:
+            return True
+        return any(_says_more(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_says_more(v) for v in obj)
+    return False
+
+
+def strip_cursor(payload: dict[str, Any], *, op: str) -> dict[str, Any]:
+    """A copy of *payload* with every cursor and transcript continuation removed.
+
+    A stale copy cannot page on: the MCP dropped its cursor. When the payload says
+    results remain, it is marked ``cursor_unavailable = "stale"`` and gets a note to
+    search again later; existing warnings are kept."""
+    out = copy.deepcopy(payload)
+    containers = _locate_all_search_results_containers(out, op=op)
+    more = _says_more(out) or any(_says_more(container) for container, _, _ in containers)
+    for slot in list(_cursor_slots(out)):
+        slot["cursor"] = None
+    _drop_continuations(out, more)
+    for container, _, text_block in containers:
+        for slot in list(_cursor_slots(container)):
+            slot["cursor"] = None
+        _drop_continuations(container, more)
+        if "cursor" in container:
+            container["cursor"] = None
+        if container.get("has_more") is True:
+            container["pagination_note"] = STALE_CURSOR_NOTE
+        if text_block is not None:
+            text_block["text"] = json.dumps(container, ensure_ascii=False)
+    if more:
+        out["cursor_unavailable"] = "stale"
+    return out
+
+
+def _drop_continuations(obj: Any, more: bool) -> None:
+    """Remove transcript ``continuation_params``; add the stale note beside them."""
+    if isinstance(obj, dict):
+        if "continuation_params" in obj:
+            obj.pop("continuation_params", None)
+            if more and isinstance(obj.get("warnings"), list):
+                obj["warnings"].append(STALE_CONTINUATION_NOTE)
+        for value in obj.values():
+            _drop_continuations(value, more)
+    elif isinstance(obj, list):
+        for value in obj:
+            _drop_continuations(value, more)
+
+
 def extract_result_metrics(payload: dict[str, Any], *, op: str) -> tuple[int, bool]:
     """Return `(result_count, has_more)` from an unwrapped successful payload."""
     container, list_key, _ = _locate_search_results_containers(payload, op=op)
@@ -778,6 +887,8 @@ def slice_cached_payload(
             if truncated_any and "cursor" in container:
                 # Never fabricate a cursor; stale end-of-larger-page cursor is cleared.
                 container["cursor"] = None
+                # The upstream note says to keep paging with the cursor that was just cleared.
+                container["pagination_note"] = SLICED_CACHE_NOTE
 
         if text_block is not None:
             text_block["text"] = json.dumps(container, ensure_ascii=False)
@@ -1059,6 +1170,11 @@ class AlphaEngineSearchCache:
                     hit_note = SLICED_CACHE_NOTE
                 else:
                     payload = copy.deepcopy(payload_raw)
+
+                # Judged on what would be returned: slicing already clears a large
+                # page's cursor, so only a page that still carries one is refreshed.
+                if now - float(row[1]) >= CURSOR_SAFE_AGE_S and payload_has_live_cursor(payload, op=op):
+                    return None, False
 
                 conn.execute("BEGIN IMMEDIATE")
                 try:

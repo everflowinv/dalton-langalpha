@@ -549,7 +549,7 @@
     "model": "gemini-2.5-flash"
   },
   "embedding": {
-    "model": "gemini-embedding-001",
+    "model": "gemini-embedding-2-preview",
     "model_preferred": "gemini-embedding-2-preview",
     "dimensions": 3072,
     "chunk_size": 1500,
