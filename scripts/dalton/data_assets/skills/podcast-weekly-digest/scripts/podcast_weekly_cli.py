@@ -99,7 +99,7 @@ API_SUBMIT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
 API_QUERY = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
 RESOURCE_ID = "volc.seedasr.auc"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_FALLBACK_TEXT_MODEL = "gemini-4-argon"
+GEMINI_FALLBACK_TEXT_MODEL = "gemini-4-neon"
 DALTON_PARALLEL = 3
 WINDOW_SEC = 720          # 12 分钟一段：实测一次视频判人约 68 秒、6.5 万 token
 ASR_POLL_MAX = 3600
@@ -1004,7 +1004,7 @@ def main(argv: list[str] | None = None):
     p.add_argument("--max-episodes", type=int)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--redo", action="store_true", help="已发布的也重跑")
-    p.add_argument("--video-model", default="gemini-4-argon")
+    p.add_argument("--video-model", default="gemini-4-neon")
     p.add_argument("--text-model", default="gemini-4-hydrogen-high-oauth")
     p.add_argument("--text-backend", choices=["dalton", "gemini-api"], default="dalton",
                    help="翻译走 Dalton 内部订阅模型接口（默认，失败块退回 Gemini API）或直接走 Gemini API")
