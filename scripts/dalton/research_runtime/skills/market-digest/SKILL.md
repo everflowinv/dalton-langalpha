@@ -38,7 +38,7 @@ Automated pipeline for investment bank sales email processing:
 
 ## Embedding Model
 
-- **Model**: 以 `config.json` 为准；当前文本配置为 `gemini-embedding-2-preview`（3072 维）。新增图片独立索引固定同型号、同维度，不与旧文本向量直接混排或静默降为 `001`。
+- **Model**: 以 `config.json` 为准；当前文本配置为 `gemini-embedding-2`（3072 维；2026-11-19 预览名 `gemini-embedding-2-preview` 下线，正式版向量与之相同）。新增图片独立索引固定同型号、同维度，不与旧文本向量直接混排或静默降为 `001`。
 - **SDK**: `google-genai>=1.0.0` (new SDK, not deprecated `google.generativeai`)
 - **Batch embedding**: True batch calls (100 texts per API call, not 100 individual calls)
 - **Rate limits**: Respects RPM/TPM with exponential backoff on 429

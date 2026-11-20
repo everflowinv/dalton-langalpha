@@ -119,7 +119,7 @@ Custom sectors can be created on the fly.
 
 ## Embedding Model
 
-- **Model**: `gemini-embedding-001` (fallback; tries `gemini-embedding-2-preview` first)
+- **Model**: `gemini-embedding-2`, no fallback: `gemini-embedding-001` vectors are in an unrelated space, so a fallback would break search
 - **SDK**: `google-genai>=1.0.0`
 - **Batch embedding**: 100 texts per API call
 - **Vector DB**: SQLite with numpy cosine similarity (same as market-digest)
@@ -349,8 +349,8 @@ When user asks about a topic across companies:
     "proxy_port": 7897
   },
   "embedding": {
-    "model": "gemini-embedding-001",
-    "model_preferred": "gemini-embedding-2-preview",
+    "model": "gemini-embedding-2",
+    "model_preferred": "gemini-embedding-2",
     "dimensions": 3072,
     "chunk_size": 1500,
     "chunk_overlap": 200

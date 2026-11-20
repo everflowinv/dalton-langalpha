@@ -189,6 +189,8 @@ def resolve_embedding_model(config):
 
 def embed_texts(texts, model_name):
     """Embed a list of texts using Gemini embedding API with true batch calls."""
+    from google.genai import types
+
     client = get_genai_client()
     log(f"Embedding {len(texts)} chunks with {model_name}")
 
@@ -199,11 +201,17 @@ def embed_texts(texts, model_name):
         batch = texts[i:i + BATCH_SIZE]
         for attempt in range(5):
             try:
+                # One Content per text: gemini-embedding-2 folds a list of plain
+                # strings into a single vector (seen 2026-11-19).
                 result = client.models.embed_content(
                     model=model_name,
-                    contents=batch,
+                    contents=[types.Content(parts=[types.Part(text=t)]) for t in batch],
                     config={"task_type": "RETRIEVAL_DOCUMENT"}
                 )
+                if len(result.embeddings) != len(batch):
+                    raise RuntimeError(
+                        f"embedding returned {len(result.embeddings)} vectors for {len(batch)} texts"
+                    )
                 for emb in result.embeddings:
                     embeddings.append(emb.values)
                 break
