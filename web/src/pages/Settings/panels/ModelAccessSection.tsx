@@ -44,6 +44,9 @@ import { AccessRow, Group, KeyRow } from './modelAccess/AccessRows';
 import { KeySheet } from './modelAccess/KeySheet';
 import { ManageSheet, SubscriptionFlow } from './modelAccess/ManageSheet';
 import { ClaudeCodeSheet } from './modelAccess/ClaudeCodeSheet';
+import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
+import { useAccount } from '@/hooks/useAccount';
+import { allows, RULE } from '@/lib/accountRules';
 import { claudeCodeHeadline } from './modelAccess/claudeCodeHeadline';
 
 /** The Subscriptions card as a usage table, once Claude Code's row has a
@@ -151,6 +154,11 @@ export function ModelAccessSection({
   const signInLifecycle = useClaudeSignInLifecycle();
   const locale = useLocale();
   const now = useNow();
+  // A rule may keep the user's own keys or sign-ins off: what they saved
+  // stays listed, unused and removable, and nothing new can be added.
+  const { policy } = useAccount();
+  const ownKeys = allows(policy, RULE.ownApiKeys);
+  const ownSubscriptions = allows(policy, RULE.ownSubscriptions);
   const [opened, setSheet] = useState<Sheet | null>(null);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
   const [removingToken, setRemovingToken] = useState<TokenTarget | null>(null);
@@ -356,7 +364,7 @@ export function ModelAccessSection({
         {[
           ...(showPersonalClaudeCode && summary ? [<UsageHeaderRow key="header" first={t('claudeCodePlan.table.account')} />] : []),
           ...(showTeamGroups ? subscriptionRows.map((p) => p.access_type === 'coding_plan' ? (
-            <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
+            <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} notAllowed={!ownKeys} />
           ) : (
             <AccessRow
               key={p.provider}
@@ -365,8 +373,8 @@ export function ModelAccessSection({
               tag={p.provider === 'claude-oauth' && signInLifecycle !== 'active' ? t('modelAccess.claude.legacy') : null}
               detail={subscriptionDetail(p)}
               notice={signInNotice(p)}
-              status={rowStatus(p)}
               /* DALTON-HOOK(team-credentials): a member cannot reconnect a team-managed provider */
+              status={ownSubscriptions ? rowStatus(p) : 'not_allowed'}
               action={
                 <Button type="button" variant={p.state === 'needs_reauth' && !teamManagedByAdmin ? 'outline' : 'ghost'} size="sm" onClick={() => manage(p.provider)}>
                   {p.state === 'needs_reauth' && !teamManagedByAdmin ? t('modelAccess.reconnect') : t('modelAccess.manage')}
@@ -375,7 +383,7 @@ export function ModelAccessSection({
             />
           )) : []),
           // Claude Code is personal (account / computer token); keep in personal & all scopes
-          ...(showPersonalClaudeCode && (setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled)) ? [(
+          ...(showPersonalClaudeCode && (setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled && ownSubscriptions)) ? [(
             <AccessRow
               key={CLAUDE_CODE}
               provider={CLAUDE_CODE}
@@ -384,7 +392,7 @@ export function ModelAccessSection({
               wrapDetail={!summary}
               plan={summary?.plan}
               limited={!!summary?.limit}
-              status={summary?.limit ? 'limit_reached' : setup?.on ? CLAUDE_CODE_SETUP_STATUS[setup.state] : setupUnread ? 'unknown' : 'off'}
+              status={!ownSubscriptions ? 'not_allowed' : summary?.limit ? 'limit_reached' : setup?.on ? CLAUDE_CODE_SETUP_STATUS[setup.state] : setupUnread ? 'unknown' : 'off'}
               action={(
                 <Button type="button" variant="ghost" size="sm" className="tap-target" onClick={() => setSheet({ kind: 'claude-code' })}>
                   {t('modelAccess.manage')}
@@ -409,7 +417,7 @@ export function ModelAccessSection({
         <Group title={t('modelAccess.apiKeys')} empty={t('modelAccess.noneKeys')}>
           {[
             ...keyRows.map((p) => (
-              <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
+              <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} notAllowed={!ownKeys} />
             )),
             // Nothing to manage on a key no provider takes any more: only removing it.
             ...withdrawn.map((p) => (
@@ -436,27 +444,31 @@ export function ModelAccessSection({
       {showTeamGroups && !isPlatformMode && (
         <Group title={t('modelAccess.localServers')} empty={t('modelAccess.noneLocal')}>
           {localRows.map((p) => (
-            <KeyRow key={p.provider} p={p} onManage={() => manage(p.provider)} />
+            <KeyRow key={p.provider} p={p} onManage={() => manage(p.provider)} notAllowed={!ownKeys} />
           ))}
         </Group>
       )}
 
       {/* DALTON-HOOK(team-credentials): a non-PM member cannot write the
           shared credentials — the add buttons stay with the administrators. */}
-      {showTeamGroups && !teamManagedByAdmin && (
+      {showTeamGroups && !teamManagedByAdmin && (ownSubscriptions || ownKeys) && (
         <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
-            <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-            {t('modelAccess.connectSubscription')}
-          </Button>
-          <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => {
-            setKeyFilter(NO_FILTER);
-            setSheet({ kind: 'pick-key' });
-          }}>
-            <Plus aria-hidden="true" className="h-3.5 w-3.5" />
-            {t('modelAccess.addKey')}
-          </Button>
-          {!isPlatformMode && (
+          {ownSubscriptions && (
+            <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-subscription' })}>
+              <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+              {t('modelAccess.connectSubscription')}
+            </Button>
+          )}
+          {ownKeys && (
+            <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => {
+              setKeyFilter(NO_FILTER);
+              setSheet({ kind: 'pick-key' });
+            }}>
+              <Plus aria-hidden="true" className="h-3.5 w-3.5" />
+              {t('modelAccess.addKey')}
+            </Button>
+          )}
+          {!isPlatformMode && ownKeys && (
             <Button type="button" variant="outline" size="sm" className="gap-1.5" onClick={() => setSheet({ kind: 'pick-local' })}>
               <Plus aria-hidden="true" className="h-3.5 w-3.5" />
               {t('modelAccess.addLocal')}
@@ -464,6 +476,7 @@ export function ModelAccessSection({
           )}
         </div>
       )}
+      <OwnAccessNote variant="settings" />
 
       {sheet && (
         <ModalShell

@@ -15,6 +15,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
+from src.server.services.shared_workspaces.turn import TurnIdentity
 
 if TYPE_CHECKING:
     from ptc_agent.agent.claude_code.launcher import Launcher
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
     from src.server.services.computer_manager._types import WorkspaceToolView
     from src.server.services.egress.direct_tools import DirectMCPBinding
+    from src.server.services.livefs.history_files import ThreadHistory
     from src.server.services.turn_runtime import TurnRoute
 
 
@@ -33,6 +35,7 @@ def thread_resolver(
     thread_id: str,
     route: TurnRoute,
     *,
+    identity: TurnIdentity,
     thread: Mapping[str, Any] | None,
     is_byok: bool,
     reasoning_effort: str | None = None,
@@ -66,6 +69,7 @@ def thread_resolver(
             thread_id=thread_id,
             enabled_subagents=enabled_subagents,
             workspace_id=route.workspace_id,
+            identity=identity,
             role=route.role,
         )
 
@@ -92,7 +96,9 @@ class AgentInputs:
     as a turn reads it. A run adds what only it has (its saver, its guard,
     its turn row, the order ledger) beside ``build_kwargs``."""
 
-    user_id: str | None
+    #: The sender, and the workspace's owner: whose connectors are bound,
+    #: whose vault is redacted, and whose memory and files the agent mounts.
+    identity: TurnIdentity
     thread_id: str
     workspace_id: str
     role: AgentRole
@@ -101,7 +107,8 @@ class AgentInputs:
     #: The project's frozen registry and summary: the session's own fields
     #: belong to whichever sibling on the machine resolved last.
     tool_view: WorkspaceToolView
-    #: The profile the prompt states, naming the trading rule the tools bring.
+    #: The turn's profile (``TurnIdentity.profile``), naming the trading
+    #: rule the tools bring.
     user_profile: dict[str, Any] | None
     #: The directly bound tools, unopened: a run opens them (``drive``).
     direct_mcp: DirectMCPBinding
@@ -109,13 +116,16 @@ class AgentInputs:
     computer_id: str | None
     # DALTON-HOOK(colleague-dispatch): workspace owner identity (B) distinct from turn caller (A)
     workspace_owner_id: str | None = None
+    #: The thread's own transcript, for the file tools of a turn in a thread
+    #: its sender keeps private in a shared workspace (``ThreadHistory``).
+    thread_history: ThreadHistory | None = None
 
     @classmethod
     async def read(
         cls,
         session: Any,
         *,
-        user_id: str | None,
+        identity: TurnIdentity,
         workspace_id: str,
         thread_id: str,
         role: AgentRole,
@@ -129,17 +139,20 @@ class AgentInputs:
         from dataclasses import replace
 
         from src.server.services.egress.direct_tools import direct_tools_for_turn
+        from src.server.services.livefs.history_files import private_thread_history
         from src.server.services.trading_rule import with_trading_rule
         from src.server.services.workspace_layout import resolve_project_context
         from src.server.services.workspace_manager import WorkspaceManager
 
         # DALTON-HOOK(colleague-dispatch): resolve workspace owner B and pass dual identity to direct MCP
-        eff_owner_id = workspace_owner_id or user_id
+        eff_owner_id = (
+            identity.owner if identity.shared else (workspace_owner_id or identity.owner)
+        )
         tool_view = WorkspaceManager.get_instance().tool_view(session, workspace_id)
         direct_kwargs: dict[str, Any] = {}
-        if eff_owner_id != user_id:
+        if not identity.shared and identity.sender and eff_owner_id != identity.sender:
             direct_kwargs["owner_user_id"] = eff_owner_id
-            direct_kwargs["caller_user_id"] = user_id
+            direct_kwargs["caller_user_id"] = identity.sender
         direct_mcp = await direct_tools_for_turn(
             session,
             user_id=eff_owner_id,
@@ -147,26 +160,34 @@ class AgentInputs:
             view=tool_view,
             **direct_kwargs,
         )
+        project = await resolve_project_context(session, workspace_id)
+        if project is not None and acting_for and acting_for != workspace_id:
+            project = replace(project, acting_for=acting_for)
         return cls(
-            user_id=user_id,
+            identity=identity,
             # DALTON-HOOK(colleague-dispatch): store workspace owner identity
             workspace_owner_id=eff_owner_id,
             thread_id=thread_id,
             workspace_id=workspace_id,
             role=role,
-            project=(
-                replace(project, acting_for=acting_for)
-                if (project := await resolve_project_context(session, workspace_id))
-                and acting_for
-                and acting_for != workspace_id
-                else project
-            ),
+            project=project,
             tool_view=tool_view,
             # Off the resolve, not the bind, so it moves only when a setting does.
             user_profile=with_trading_rule(user_profile, tool_view.trading_rule),
             # DALTON-HOOK(colleague-dispatch): bind direct_mcp resolved above
+            # The connectors are the workspace owner's, as on the computer.
             direct_mcp=direct_mcp,
             computer_id=session.computer_id,
+            thread_history=(
+                await private_thread_history(
+                    workspace_id,
+                    project.dir_name if project is not None else None,
+                    thread_id,
+                    identity.sender,
+                )
+                if identity.shared and thread_id
+                else None
+            ),
         )
 
     def build_kwargs(self) -> dict[str, Any]:
@@ -176,7 +197,9 @@ class AgentInputs:
 
         # DALTON-HOOK(colleague-dispatch): forward workspace_owner_id when distinct from caller
         kwargs: dict[str, Any] = {
-            "user_id": self.user_id,
+            "user_id": self.identity.sender,
+            "owner_id": self.identity.owner,
+            "own_data": not self.identity.shared,
             "user_profile": self.user_profile,
             "thread_id": self.thread_id,
             "store": setup.store,
@@ -186,9 +209,14 @@ class AgentInputs:
             "tool_view": self.tool_view,
             "role": self.role,
             "claude_code_launcher": self.claude_code_launcher,
+            "thread_history": self.thread_history,
         }
         # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to graph build
-        if self.workspace_owner_id and self.workspace_owner_id != self.user_id:
+        if (
+            self.workspace_owner_id
+            and not self.identity.shared
+            and self.workspace_owner_id != self.identity.sender
+        ):
             kwargs["workspace_owner_id"] = self.workspace_owner_id
         return kwargs
 
@@ -204,6 +232,6 @@ class AgentInputs:
         from src.server.services.claude_code.launchers import turn_launcher
 
         return turn_launcher(
-            sandbox, computer_id=self.computer_id, workspace_id=self.workspace_id, user_id=self.user_id,
+            sandbox, computer_id=self.computer_id, workspace_id=self.workspace_id, user_id=self.identity.sender,
             admitted=admitted, slot_wait_s=slot_wait_s, queue=queue,
         )

@@ -1,10 +1,12 @@
 import { Suspense, useEffect } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router';
 import PageLoading from '@/components/PageLoading/PageLoading';
+import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useSyncUserLocale } from '@/hooks/useSyncUserLocale';
 import { ContextOverflowPill } from '@/components/ui/ContextOverflowPill';
 import NetworkBanner from '@/components/NetworkBanner/NetworkBanner';
+import RulesUnknownBanner from '@/components/organization/RulesUnknownBanner';
 import ClaudeCodeAnnouncement from '@/components/ClaudeCodeAnnouncement/ClaudeCodeAnnouncement';
 import { StaleBuildBoundary } from '@/components/StaleBuildBoundary';
 import { lazyWithMotion, preloadableLazy } from '@/lib/lazyWithMotion';
@@ -27,6 +29,7 @@ const routeChunks = {
   // DALTON-HOOK(hide-trading): the Orders page is not built; an /orders warm
   // takes the dashboard chunk, the same one the catch-all redirect lands on.
   orders: () => import('../../pages/Dashboard/Dashboard'),
+  library: () => import('../../pages/Library/Library'),
   plugins: () => import('../../pages/Plugins/Plugins'),
   settings: () => import('../../pages/Settings/Settings'),
   // Alias so preloading /connectors (the legacy path) warms the right chunk.
@@ -41,6 +44,18 @@ const NewsDetailPage = preloadableLazy(routeChunks.news);
 const Automations = lazyWithMotion(routeChunks.automations);
 const Monitors = lazyWithMotion(routeChunks.monitors); // DALTON-HOOK(monitors)
 // DALTON-HOOK(hide-trading): do not mount Orders page
+const Library = lazyWithMotion(routeChunks.library);
+
+/** /library exists only where the organization library is on for the account;
+ *  anywhere else it is an unknown address and goes where every unknown one
+ *  goes. */
+function LibraryRoute() {
+  const { data, isPending } = useFeatures();
+  if (isPending) return <PageLoading variant="pane" />;
+  return isFeatureEnabled(data, 'org_library')
+    ? <Library />
+    : <Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />; // DALTON-HOOK(dalton-nav)
+}
 const Plugins = lazyWithMotion(routeChunks.plugins);
 const Settings = lazyWithMotion(routeChunks.settings);
 
@@ -56,6 +71,7 @@ const routePreloads = {
   monitors: Monitors.preload, // DALTON-HOOK(monitors)
   // DALTON-HOOK(hide-trading): the Orders page is not mounted; /orders warms the dashboard.
   orders: Dashboard.preload,
+  library: Library.preload,
   plugins: Plugins.preload,
   settings: Settings.preload,
   connectors: Plugins.preload,
@@ -145,6 +161,7 @@ function Main() {
           <Route path="/monitors" element={<Monitors />} />
           <Route path="/monitors/:slug" element={<Monitors />} />
           <Route path="/orders" element={<Navigate to={import.meta.env.VITE_DALTON_MODE ? '/chat' : '/dashboard'} replace />} /> {/* DALTON-HOOK(hide-trading) */}
+          <Route path="/library" element={<LibraryRoute />} />
           <Route path="/plugins" element={<Plugins />} />
           <Route path="/connectors" element={<LegacyConnectorsRedirect />} />
           <Route path="/settings" element={<Settings />} />
@@ -170,6 +187,7 @@ function Main() {
     return (
       <div className="main" style={{ height: '100%' }}>
         <NetworkBanner />
+        <RulesUnknownBanner />
         <ClaudeCodeAnnouncement />
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
           {routes}
@@ -182,6 +200,7 @@ function Main() {
   return (
     <div className="main">
       <NetworkBanner />
+      <RulesUnknownBanner />
       <ClaudeCodeAnnouncement />
       {/* Keyed on the section so a new one mounts fresh. It swaps in at once:
           the page under it draws in its final frame, and a fade over that

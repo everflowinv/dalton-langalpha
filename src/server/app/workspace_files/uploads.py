@@ -25,14 +25,11 @@ from src.server.models.workspace import served_from_mirror
 from src.server.services.background_starts import schedule_start
 from src.server.services.computer_disk import CRITICAL_FREE_BYTES
 from src.server.services.persistence.transfer import sandbox_pulls_from_store, scan_cap_bytes
-from src.server.services.workspace_file_containment import normalize_requested_path
 from src.server.services.workspace_files import (
     acquire_sandbox_to_change,
     contained_target,
     not_running_for_upload,
-    owned_workspace_on_computer,
-    owner_work_dir,
-    previous_dir_names_of,
+    reached_workspace_on_computer,
 )
 from src.server.services.store_multipart import (
     DIRECT_UPLOAD_MIN_BYTES,
@@ -64,6 +61,7 @@ from src.utils.storage import browser_uploads_enabled, is_storage_enabled
 
 from ._shared import (
     MAX_UPLOAD_BYTES,
+    RoutePaths,
     # DALTON-HOOK(workspace-sharing-settings): colleague path filter helper
     _is_non_owner_blocked_path,
     _virtual_file,
@@ -131,7 +129,7 @@ async def _owned_upload(workspace_id: str, upload_id: UUID, user_id: str) -> dic
     from src.dalton.settings import is_dalton_supabase_auth_enabled
 
     if is_dalton_supabase_auth_enabled():
-        await owned_workspace_on_computer(workspace_id, user_id, need="write")
+        await reached_workspace_on_computer(workspace_id, user_id, need="write")
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
     row = await db.get_upload(str(upload_id))
     if row is None or row["user_id"] != user_id or row["workspace_id"] != workspace_id:
@@ -152,17 +150,18 @@ async def begin_workspace_upload(
             status_code=413, detail=_too_large(MAX_DIRECT_UPLOAD_BYTES, body.size)
         )
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="write")
-    is_non_owner = workspace.get("user_id") != x_user_id
-    sandbox_owner_id = str(workspace.get("user_id") or x_user_id)
+    workspace, _ = await reached_workspace_on_computer(workspace_id, x_user_id, need="write")
+    from src.server.database.shared_workspaces import is_holder
+
+    is_shared_ws = is_holder(workspace.get("user_id"))
+    is_non_owner = not is_shared_ws and workspace.get("user_id") != x_user_id
+    sandbox_owner_id = x_user_id if is_shared_ws else str(workspace.get("user_id") or x_user_id)
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
     if served_from_mirror(workspace.get("status")):
         raise not_running_for_upload(workspace)
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     if is_non_owner:
-        work_dir = owner_work_dir(workspace)
-        previous_dirs = previous_dir_names_of(workspace)
-        normalized_req_path = normalize_requested_path(body.path, work_dir, previous_dirs)
+        normalized_req_path = RoutePaths.of(workspace, x_user_id).asked(body.path)
         if _is_non_owner_blocked_path(normalized_req_path):
             raise HTTPException(
                 status_code=403, detail="Cannot upload to system or hidden paths"
@@ -185,18 +184,19 @@ async def begin_workspace_upload(
                 # --- DALTON-HOOK(direct-upload-safety): end ---
             return {"mode": "relay"}
 
-        work_dir = owner_work_dir(workspace)
-        previous_dirs = previous_dir_names_of(workspace)
+        paths = RoutePaths.of(workspace, x_user_id)
+        work_dir = paths.work_dir
         # The checks the relay route makes, made before the bytes are sent.
-        normalized_req_path = normalize_requested_path(body.path, work_dir, previous_dirs)
-        virtual = _virtual_file(normalized_req_path)
+        req_path = await paths.requested(body.path)
+        virtual = _virtual_file(req_path)
         if virtual:
             raise HTTPException(status_code=400, detail=virtual.read_only)
         # DALTON-HOOK(workspace-sharing-settings): block hidden/system/virtual paths for non-owners
-        if is_non_owner and _is_non_owner_blocked_path(normalized_req_path):
+        if is_non_owner and _is_non_owner_blocked_path(req_path):
             raise HTTPException(status_code=403, detail="Cannot upload to system or hidden paths")
-        target = await contained_target(sandbox, body.path, work_dir, previous_dirs)
+        target = await contained_target(sandbox, body.path, work_dir, paths.previous_dirs)
         rel = target[len(work_dir.rstrip("/")) + 1 :]
+        await paths.refuse(rel)
         if not rel:
             raise HTTPException(status_code=400, detail="Destination path is required")
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---

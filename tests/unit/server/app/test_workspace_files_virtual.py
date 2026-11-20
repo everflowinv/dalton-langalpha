@@ -26,7 +26,7 @@ from src.dalton.services.chat_uploads import (
     begin_delete_workspace_chat_uploads,
     retire_deleted_workspace_chat_uploads,
 )
-from src.server.app.workspace_files import backup_reads, crud
+from src.server.app.workspace_files import _shared, backup_reads, crud
 from src.server.app.workspace_files._shared import (
     _present_virtual_file,
     _virtual_file,
@@ -137,7 +137,9 @@ def workspace(monkeypatch):
     monkeypatch.setattr(crud, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
     monkeypatch.setattr(workspace_files, "db_get_workspace", AsyncMock(return_value=WORKSPACE))
     monkeypatch.setattr(crud, "owner_work_dir", lambda _ws: ROOT)
+    monkeypatch.setattr(_shared, "owner_work_dir", lambda _ws: ROOT)
     monkeypatch.setattr(crud, "owner_layout", lambda _ws: SimpleNamespace(workspace=ROOT))
+    monkeypatch.setattr(_shared, "owner_layout", lambda _ws: SimpleNamespace(workspace=ROOT))
 
 
 async def _read(path: str) -> dict:

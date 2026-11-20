@@ -3,6 +3,7 @@
  * Handles events from history replay (SSE stream of past conversations)
  */
 
+import { readSender } from '../turnSender';
 import { isToolResultFailure, toolNameOf } from '../subagents/subagentStatus';
 import { ownerOfToolCall } from '../toolCallOwner';
 import { isTaskAgentId } from '../../utils/agentId';
@@ -14,7 +15,7 @@ import { deliveredEntryRow, failedSteerRow, steeringDeliveredEntries } from '../
 import { readHomeFallback } from '../stream/turnPlacement';
 import type { ArtifactCommentsShown, ReportSource } from '@/types/api';
 import { isDeliveredNotice, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
-import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
+import type { SubagentTaskRecord, TextSegment, TurnStop } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
@@ -166,11 +167,16 @@ function turnOpenerRow(
     ? wakeTurnOpener(pairIndex, event.metadata, timestamp, event.query_type)
     : null;
   if (wake) return { ...wake, isHistory: true };
+  // In a shared workspace the replay names who each turn is for. A row that
+  // draws its own label (a report, another agent's message) keeps that as
+  // data, not a caption: it is what says whose turns a rewrite would replace.
+  const sender = readSender(event.sender);
   if (event.query_type === 'system') {
     const source = event.metadata?.report_source;
     return source ? reportRow(source, {
       id, timestamp, isHistory: true, turnIndex: pairIndex,
       ...(event.report_run_id ? { runId: event.report_run_id } : {}),
+      ...(sender ? { sender } : {}),
     }) : null;
   }
   // DALTON-HOOK(chat-large-upload): keep explicit onboarding kickoffs hidden while rendering file-only user turns
@@ -184,6 +190,7 @@ function turnOpenerRow(
   };
   const provenance = senderProvenance(event.metadata);
   if (provenance) row.provenance = provenance;
+  if (sender) row.sender = sender;
   return row;
 }
 
@@ -528,10 +535,12 @@ export function handleHistoryReasoningContent({ assistantMessageId, content, pai
 }
 
 /** Handles text content chunks and finish_reason in history replay. */
-export function handleHistoryTextContent({ assistantMessageId, content, finishReason, pairState, setMessages, eventId, phase }: {
+export function handleHistoryTextContent({ assistantMessageId, content, finishReason, stop = true, pairState, setMessages, eventId, phase }: {
   assistantMessageId: string;
   content: string;
   finishReason: string | undefined;
+  /** How a stopped turn was stopped. */
+  stop?: TurnStop;
   pairState: PairState;
   setMessages: SetMessages;
   eventId?: number | null;
@@ -573,7 +582,7 @@ export function handleHistoryTextContent({ assistantMessageId, content, finishRe
     setMessages((prev: MessageRecord[]) =>
       prev.map((msg: MessageRecord) =>
         msg.id === assistantMessageId
-          ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: true } : {}) }
+          ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: stop } : {}) }
           : msg
       )
     );

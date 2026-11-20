@@ -1,4 +1,5 @@
-import React, { useState, useCallback, useMemo, useRef, useSyncExternalStore } from 'react';
+import React, { Suspense, lazy, useState, useCallback, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import type { DragStartEvent, DragEndEvent, Modifier } from '@dnd-kit/core';
 import { ChevronsDown } from 'lucide-react';
@@ -27,9 +28,15 @@ import type { ThreadsData } from './NavigationRows';
 import { useArchiveThreadConfirm } from './threadArchiveAction';
 import { useThreadDeleteConfirm } from './threadDeleteAction';
 import ShareThreadDialog, { type ShareThreadTarget } from './ShareThreadDialog';
-import { NavTreeContext, useNavTreeKit } from './navTreeKit';
+import { NavTreeContext, useNavTreeKit, type DragGate } from './navTreeKit';
 import { isThreadRemoved } from '@/lib/deletedThreads';
+import { useAccount } from '@/hooks/useAccount';
+import type { SharedWorkspaceEntry } from '@/types/sharedWorkspaces';
+import type { SharedNavRow } from './sharedNavRows';
 import './NavigationPanel.css';
+
+// Lazy: the tree is on every page, and the panel opens only from a shared row's menu.
+const MembersDialog = lazy(() => import('@/components/sharedWorkspaces/MembersDialog').then((m) => ({ default: m.MembersDialog })));
 
 interface NavigationPanelProps {
   /** Whether this panel's host ChatView is the visible one. Up to 5 ChatViews
@@ -69,6 +76,48 @@ interface NavigationPanelProps {
   onDeleteThread?: (wsId: string, threadId: string) => Promise<unknown>;
   /** Right-aligned controls (pin, minimize) rendered in a header row above the list. */
   headerActions?: React.ReactNode;
+  /** The organization's workspaces the person is in, drawn as a second group
+   *  after their own; absent with shared workspaces off or none to show. */
+  sharedWorkspaces?: SharedWorkspaceEntry[];
+}
+
+/**
+ * The shared group: its "Shared · <organization>" header, then each shared
+ * workspace as a section of the same tree. Who the viewer is there is read
+ * here, so the person's own group reads nothing new.
+ */
+function SharedGroup({ entries, onOpenPeople, renderSection }: {
+  entries: SharedWorkspaceEntry[];
+  onOpenPeople: (workspaceId: string) => void;
+  renderSection: (ws: NavWorkspace, dragDisabled: DragGate, shared: SharedNavRow) => React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const { organizationLabel: organization } = useAccount();
+  // Identity-stable per entry, so a memoized row re-renders only when its own
+  // standing does.
+  const rows = useMemo(() => entries.map((entry) => ({
+    ws: entry.workspace as NavWorkspace,
+    shared: {
+      canManage: entry.shared.can_manage,
+      hasUnread: !!entry.has_unread,
+      onOpenPeople,
+    } satisfies SharedNavRow,
+  })), [entries, onOpenPeople]);
+  return (
+    // Spaced as the person's own group is under its header: the tree's 8px
+    // above and below each list.
+    <div role="group" className="mt-2" aria-label={t('sharedWorkspace.sectionLabel', { organization })} data-testid="sidebar-shared-workspaces">
+      <div className="sidebar-section-header">
+        <button type="button" className="sidebar-section-title truncate" onClick={() => navigate('/chat')}>
+          {t('sharedWorkspace.kicker', { organization })}
+        </button>
+      </div>
+      <div className="pt-2">
+        {rows.map(({ ws, shared }) => renderSection(ws, true, shared))}
+      </div>
+    </div>
+  );
 }
 
 // Cap on how many extra thread pages the active-thread auto-reveal will fetch
@@ -114,6 +163,7 @@ function NavigationPanel({
   onRenameThread,
   onDeleteThread,
   headerActions,
+  sharedWorkspaces,
 }: NavigationPanelProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -156,6 +206,11 @@ function NavigationPanel({
   const handleShareThread = useCallback((wsId: string, threadId: string) => {
     setShareTarget({ workspaceId: wsId, threadId });
   }, []);
+  // A shared workspace's people panel, opened from its row's menu.
+  // Closing keeps the workspace, so the dialog leaves with its own content.
+  const [people, setPeople] = useState<{ workspaceId: string; open: boolean } | null>(null);
+  const openPeople = useCallback((workspaceId: string) => setPeople({ workspaceId, open: true }), []);
+  const peopleEntry = sharedWorkspaces?.find((e) => e.workspace.workspace_id === people?.workspaceId);
   // Id of the workspace currently being dragged — drives the DragOverlay chip.
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
   // Subscribe to the shared expansion store (navExpansionStore). One panel mounts
@@ -215,8 +270,9 @@ function NavigationPanel({
     if (!onLoadMoreThreads || !currentWorkspaceId) return;
     if (!currentThreadId || currentThreadId === '__default__') return;
     if (!expandedWorkspaces.has(currentWorkspaceId)) return;
-    const currentWs = workspaces.find((ws) => ws.workspace_id === currentWorkspaceId);
-    if (!currentWs) return;
+    const listed = workspaces.some((ws) => ws.workspace_id === currentWorkspaceId)
+      || !!sharedWorkspaces?.some((e) => e.workspace.workspace_id === currentWorkspaceId);
+    if (!listed) return;
     const data = workspaceThreads[currentWorkspaceId];
     if (!data || data.loading) return;
     const loaded = data.threads || [];
@@ -229,7 +285,7 @@ function NavigationPanel({
     if (revealAttemptRef.current.pages >= MAX_REVEAL_PAGES) return; // give up — leave "Show more" for manual paging
     revealAttemptRef.current.pages += 1;
     onLoadMoreThreads(currentWorkspaceId);
-  }, [isActive, currentWorkspaceId, currentThreadId, workspaces, workspaceThreads, onLoadMoreThreads]);
+  }, [isActive, currentWorkspaceId, currentThreadId, workspaces, sharedWorkspaces, workspaceThreads, onLoadMoreThreads]);
 
   const toggleWorkspace = useCallback((wsId: string) => {
     // Capture pre-toggle state: only an *expand* should lazy-load threads.
@@ -369,6 +425,57 @@ function NavigationPanel({
   // and every row's useSortable re-renders on it, memo or not.
   const sortableIds = useMemo(() => workspaces.map((ws) => ws.workspace_id), [workspaces]);
 
+  // One workspace section, the person's own or a shared one: a shared row is
+  // never dragged and offers no pin, and decides the rest itself.
+  const renderSection = (ws: NavWorkspace, dragDisabled: DragGate, shared?: SharedNavRow) => {
+    const wsId = ws.workspace_id;
+    // DALTON-HOOK(coverage-tree): resolve this row's chip text here so
+    // WorkspaceTreeRow receives a primitive (memo-stable; undefined
+    // when the row has no coverage role) instead of the whole map.
+    const coverageRole = coverageRoles.get(wsId);
+    const coverageChip = coverageRole?.kind === 'sector'
+      ? t('dalton.coverage.sectorChip')
+      : coverageRole?.kind === 'member' && coverageRole.sectorNames.length > 0
+        ? coverageRole.sectorNames.join('、')
+        : undefined;
+    return (
+      <WorkspaceTreeRow
+        key={wsId}
+        ws={ws}
+        isExpanded={expandedWorkspaces.has(wsId)}
+        isCurrent={wsId === currentWorkspaceId}
+        isMobile={isMobile}
+        dragDisabled={dragDisabled}
+        threadsData={workspaceThreads[wsId]}
+        currentThreadId={currentThreadId}
+        expandedThreadIds={expandedThreadIds}
+        agents={agents}
+        activeAgentId={activeAgentId}
+        // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
+        currentUserId={currentUserId}
+        callerTier={callerTier}
+        // DALTON-HOOK(coverage-tree): sector/member chip for bound workspaces
+        coverageChip={coverageChip}
+        wsActions={rowActions}
+        rename={renamingWsId === wsId ? activeRename : inactiveRename}
+        onToggleWorkspace={toggleWorkspace}
+        onToggleThread={toggleThread}
+        onNavigateThread={onNavigateThread}
+        onSelectAgent={onSelectAgent}
+        onRemoveAgent={onRemoveAgent}
+        onLoadMoreThreads={onLoadMoreThreads}
+        onPinWorkspace={shared ? undefined : onPinWorkspace}
+        onNewThread={onNewThread}
+        onPinThread={onPinThread}
+        onArchiveThread={onArchiveThread ? handleArchiveThread : undefined}
+        onRenameThread={onRenameThread}
+        onShareThread={handleShareThread}
+        onDeleteThread={onDeleteThread ? handleDeleteThread : undefined}
+        shared={shared}
+      />
+    );
+  };
+
   return (
     <div
       ref={rootRef}
@@ -397,15 +504,6 @@ function NavigationPanel({
           >
           {workspaces.map((ws) => {
             const wsId = ws.workspace_id;
-            // DALTON-HOOK(coverage-tree): resolve this row's chip text here so
-            // WorkspaceTreeRow receives a primitive (memo-stable; undefined
-            // when the row has no coverage role) instead of the whole map.
-            const coverageRole = coverageRoles.get(wsId);
-            const coverageChip = coverageRole?.kind === 'sector'
-              ? t('dalton.coverage.sectorChip')
-              : coverageRole?.kind === 'member' && coverageRole.sectorNames.length > 0
-                ? coverageRole.sectorNames.join('、')
-                : undefined;
             // While a drag is live, rows across the pin boundary from the
             // lifted workspace (Home counts as pinned) stop being drop
             // targets, so the preview can never show an arrangement the drop
@@ -417,45 +515,8 @@ function NavigationPanel({
               : crossBlock
                 ? { draggable: false, droppable: true }
                 : false;
-
-            return (
-              <WorkspaceTreeRow
-                key={wsId}
-                ws={ws}
-                isExpanded={expandedWorkspaces.has(wsId)}
-                isCurrent={wsId === currentWorkspaceId}
-                isMobile={isMobile}
-                dragDisabled={dragDisabled}
-                threadsData={workspaceThreads[wsId]}
-                currentThreadId={currentThreadId}
-                expandedThreadIds={expandedThreadIds}
-                agents={agents}
-                activeAgentId={activeAgentId}
-                // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
-                currentUserId={currentUserId}
-                callerTier={callerTier}
-                // DALTON-HOOK(coverage-tree): sector/member chip for bound workspaces
-                coverageChip={coverageChip}
-                wsActions={rowActions}
-                rename={renamingWsId === wsId ? activeRename : inactiveRename}
-                onToggleWorkspace={toggleWorkspace}
-                onToggleThread={toggleThread}
-                onNavigateThread={onNavigateThread}
-                onSelectAgent={onSelectAgent}
-                onRemoveAgent={onRemoveAgent}
-                onLoadMoreThreads={onLoadMoreThreads}
-                onPinWorkspace={onPinWorkspace}
-                onNewThread={onNewThread}
-                onPinThread={onPinThread}
-                onArchiveThread={onArchiveThread ? handleArchiveThread : undefined}
-                onRenameThread={onRenameThread}
-                onShareThread={handleShareThread}
-                onDeleteThread={onDeleteThread ? handleDeleteThread : undefined}
-              />
-            );
+            return renderSection(ws, dragDisabled);
           })}
-          </TreeRoot>
-          </NavTreeContext>
           {hasMore && (
             <div
               className="nav-panel-row"
@@ -468,12 +529,27 @@ function NavigationPanel({
               </span>
             </div>
           )}
+          {!!sharedWorkspaces?.length && (
+            <SharedGroup entries={sharedWorkspaces} onOpenPeople={openPeople} renderSection={renderSection} />
+          )}
+          </TreeRoot>
+          </NavTreeContext>
         </div>
       </div>
       {wsActions.dialogs}
       {archiveDialog}
       {deleteDialog}
       <ShareThreadDialog target={shareTarget} onClose={() => setShareTarget(null)} />
+      {peopleEntry && (
+        <Suspense fallback={null}>
+          <MembersDialog
+            workspaceId={peopleEntry.workspace.workspace_id}
+            workspaceName={peopleEntry.workspace.name}
+            open={!!people?.open}
+            onClose={() => setPeople((p) => p && { ...p, open: false })}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

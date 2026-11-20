@@ -35,6 +35,8 @@ from src.server.dependencies.principal import (
     WorkspaceWritePrincipal,
     WorkspaceWriteUserId,
 )
+from src.server.services.shared_workspaces import service as shared_service
+from src.server.services.shared_workspaces.access import workspace_access
 from src.server.utils.api import CurrentUserId, require_workspace_owner
 from src.server.dependencies.usage_limits import (
     COMPUTER_COUNT_QUOTA,
@@ -101,6 +103,7 @@ from src.server.services.turn_runtime import ensure_home
 from src.server.services.ssh_computers import computer_away
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.workspace_status_pubsub import subscribe_to_status
+from src.server.services.shared_workspaces.feed import publish_workspace_changed
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +183,7 @@ async def _workspace_action_errors(action: str, workspace_id: str):
 # implementation while both paths are live rather than two that can drift.
 
 
-def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
-    """Convert workspace dict to response model."""
+def workspace_response(workspace: dict) -> WorkspaceResponse:
     computer_id = workspace.get("computer_id")
     return WorkspaceResponse(
         workspace_id=str(workspace["workspace_id"]),
@@ -261,7 +263,7 @@ async def create_workspace(
         logger.info(
             f"Created workspace {workspace['workspace_id']} for user {x_user_id}"
         )
-        return _workspace_to_response(workspace)
+        return workspace_response(workspace)
 
     except (HTTPException, NeedsComputer):
         raise
@@ -333,7 +335,7 @@ async def list_workspaces(
         )
 
         return WorkspaceListResponse(
-            workspaces=[_workspace_to_response(w) for w in workspaces],
+            workspaces=[workspace_response(w) for w in workspaces],
             total=total,
             limit=limit,
             offset=offset,
@@ -387,7 +389,7 @@ async def workspace_status_events(workspace_id: str, x_user_id: ReadUserId):
     it runs on from the stream itself.
     """
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
+    await workspace_access(workspace, x_user_id)
 
     computer_id = (
         str(workspace["computer_id"]) if workspace.get("computer_id") else None
@@ -448,82 +450,88 @@ async def get_workspace(workspace_id: str, x_user_id: ReadUserId):
     """
     try:
         workspace = await db_get_workspace(workspace_id)
-        # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-        # DALTON-HOOK(colleague-dispatch): compute effective_web_access and support thread_only fallback on hidden workspace.
-        from src.dalton.settings import (
-            is_colleague_dispatch_enabled,
-            is_dalton_supabase_auth_enabled,
-        )
+        from src.server.database.shared_workspaces import is_holder
 
-        if is_dalton_supabase_auth_enabled():
-            from src.dalton.sharing import (
-                get_workspace_sharing,
-                require_workspace_access,
-            )
-            from src.server.database.conversation import (
-                user_has_threads_in_workspace,
+        if workspace is not None and is_holder(workspace.get("user_id")):
+            await workspace_access(workspace, x_user_id)
+        else:
+            # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+            # DALTON-HOOK(colleague-dispatch): compute effective_web_access and support thread_only fallback on hidden workspace.
+            from src.dalton.settings import (
+                is_colleague_dispatch_enabled,
+                is_dalton_supabase_auth_enabled,
             )
 
-            try:
-                workspace = await require_workspace_access(
-                    workspace, x_user_id, channel="web", need="read"
+            if is_dalton_supabase_auth_enabled():
+                from src.dalton.sharing import (
+                    get_workspace_sharing,
+                    require_workspace_access,
                 )
-                if str(workspace.get("user_id")) == str(x_user_id):
-                    workspace = {
-                        **workspace,
-                        "effective_web_access": "owner",
-                        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
-                    }
-                else:
-                    sh = await get_workspace_sharing(str(workspace["workspace_id"]))
-                    eff = str(sh.get("web_access") or "ro")
-                    if eff not in ("ro", "rw"):
-                        eff = "ro"
-                    workspace = {
-                        **workspace,
-                        "sandbox_id": None,
-                        "computer_id": None,
-                        "effective_web_access": eff,
-                        "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
-                    }
-            except HTTPException as exc:
-                if exc.status_code == 404 and is_colleague_dispatch_enabled():
-                    if workspace is None:
-                        workspace = await db_get_workspace(
-                            workspace_id, include_deleted=True
-                        )
-                    if (
-                        workspace is not None
-                        and str(workspace.get("user_id") or "") != str(x_user_id)
-                        and await user_has_threads_in_workspace(workspace_id, x_user_id)
-                    ):
+                from src.server.database.conversation import (
+                    user_has_threads_in_workspace,
+                )
+
+                try:
+                    workspace = await require_workspace_access(
+                        workspace, x_user_id, channel="web", need="read"
+                    )
+                    if str(workspace.get("user_id")) == str(x_user_id):
                         workspace = {
                             **workspace,
-                            "description": None,
-                            "config": None,
-                            "sandbox_id": None,
-                            "computer_id": None,
-                            "dir_name": None,
-                            "previous_dir_names": [],
-                            "computer_root_dir": None,
-                            "previous_root_dirs": [],
-                            "effective_web_access": "thread_only",
-                            "colleague_dispatch_enabled": True,
+                            "effective_web_access": "owner",
+                            "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
                         }
                     else:
+                        sh = await get_workspace_sharing(str(workspace["workspace_id"]))
+                        eff = str(sh.get("web_access") or "ro")
+                        if eff not in ("ro", "rw"):
+                            eff = "ro"
+                        workspace = {
+                            **workspace,
+                            "sandbox_id": None,
+                            "computer_id": None,
+                            "effective_web_access": eff,
+                            "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+                        }
+                except HTTPException as exc:
+                    if exc.status_code == 404 and is_colleague_dispatch_enabled():
+                        if workspace is None:
+                            workspace = await db_get_workspace(
+                                workspace_id, include_deleted=True
+                            )
+                        if (
+                            workspace is not None
+                            and not is_holder(workspace.get("user_id"))
+                            and str(workspace.get("user_id") or "") != str(x_user_id)
+                            and await user_has_threads_in_workspace(workspace_id, x_user_id)
+                        ):
+                            workspace = {
+                                **workspace,
+                                "description": None,
+                                "config": None,
+                                "sandbox_id": None,
+                                "computer_id": None,
+                                "dir_name": None,
+                                "previous_dir_names": [],
+                                "computer_root_dir": None,
+                                "previous_root_dirs": [],
+                                "effective_web_access": "thread_only",
+                                "colleague_dispatch_enabled": True,
+                            }
+                        else:
+                            raise
+                    else:
                         raise
-                else:
-                    raise
-        else:
-            require_workspace_owner(workspace, user_id=x_user_id)
-            workspace = {
-                **workspace,
-                "effective_web_access": "owner",
-                "colleague_dispatch_enabled": False,
-            }
-        # --- DALTON-HOOK(workspace-sharing-settings): end ---
+            else:
+                await workspace_access(workspace, x_user_id)
+                workspace = {
+                    **workspace,
+                    "effective_web_access": "owner",
+                    "colleague_dispatch_enabled": False,
+                }
+            # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
-        return _workspace_to_response(workspace)
+        return workspace_response(workspace)
 
     except HTTPException:
         raise
@@ -550,9 +558,10 @@ async def update_workspace(
         Updated workspace details
     """
     try:
-        # Check workspace exists and ownership
+        # Check workspace exists and ownership; a shared workspace's
+        # managers change it, for everyone in it.
         workspace = await db_get_workspace(workspace_id)
-        require_workspace_owner(workspace, user_id=x_user_id)
+        access = await workspace_access(workspace, x_user_id, manage=True)
         if (
             is_reserved_row(workspace)
             and request.name is not None
@@ -580,8 +589,12 @@ async def update_workspace(
 
         if not updated:
             raise HTTPException(status_code=404, detail="Workspace not found")
+        if access.is_shared:
+            await publish_workspace_changed(
+                access.org_id, workspace_id, "updated"
+            )
 
-        return _workspace_to_response(updated)
+        return workspace_response(updated)
 
     except HTTPException:
         raise
@@ -676,7 +689,9 @@ async def start_workspace(
         if not workspace:
             raise HTTPException(status_code=404, detail="Workspace not found")
 
-        require_workspace_owner(workspace, user_id=x_user_id)
+        # Any member of a shared workspace starts its computer: their turn
+        # would. Its tokens are kept for the caller (``user_id`` below).
+        await workspace_access(workspace, x_user_id)
 
         if is_unbound(workspace):
             # Home before its first turn: the warm puts it on the computer, as
@@ -702,7 +717,7 @@ async def start_workspace(
         if workspace["status"] == "stopping":
             await manager.reconcile_stopping_computer(str(workspace["computer_id"]))
             workspace = await db_get_workspace(warm_id)
-            require_workspace_owner(workspace, user_id=x_user_id)
+            await workspace_access(workspace, x_user_id)
 
         if lazy and workspace["status"] in {"stopped", "running"}:
             # A warm opens a workspace; nobody asked for a start. On a machine
@@ -804,7 +819,7 @@ async def archive_workspace(
     """
     async with _workspace_action_errors("archive", workspace_id):
         workspace = await db_get_workspace(workspace_id)
-        require_workspace_owner(workspace, user_id=x_user_id)
+        await workspace_access(workspace, x_user_id, manage=True)
 
         with computer_cause("archive"):
             await WorkspaceManager.get_instance().archive_workspace(workspace_id)
@@ -851,7 +866,7 @@ async def set_workspace_spec(
         logger.info(
             f"Set workspace {workspace_id} spec to {request.tier!r} for user {x_user_id}"
         )
-        return _workspace_to_response(updated)
+        return workspace_response(updated)
 
 
 @router.post("/{workspace_id}/always-on", response_model=WorkspaceResponse)
@@ -912,7 +927,7 @@ async def set_workspace_always_on(
             f"Set workspace {workspace_id} always-on to {request.enabled} "
             f"for user {x_user_id}"
         )
-        return _workspace_to_response(updated)
+        return workspace_response(updated)
 
 
 @router.post(
@@ -949,7 +964,7 @@ async def duplicate_workspace(
             f"Duplicated workspace {workspace_id} to "
             f"{new_workspace['workspace_id']} for user {x_user_id}"
         )
-        return _workspace_to_response(new_workspace)
+        return workspace_response(new_workspace)
 
 
 @router.post(
@@ -1005,7 +1020,7 @@ async def choose_files_restore(
             status_code=409,
             detail="No restore is waiting on a choice for this workspace.",
         )
-    return _workspace_to_response(await db_get_workspace(workspace_id) or workspace)
+    return workspace_response(await db_get_workspace(workspace_id) or workspace)
 
 
 @router.get("/{workspace_id}/move", response_model=Optional[WorkspaceMoveOut])
@@ -1045,12 +1060,13 @@ async def refresh_workspace(
     """Refresh sandbox skills + tool modules.
 
     Intended for long-lived/reconnected sandboxes where tool module generation
-    is skipped during reconnect.
+    is skipped during reconnect. Any member of a shared workspace may, as any
+    member may start its computer.
     """
 
     manager = WorkspaceManager.get_instance()
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
+    await workspace_access(workspace, x_user_id)
 
     try:
         with computer_cause("refresh"):
@@ -1077,9 +1093,7 @@ async def refresh_workspace(
     # acquisition can leave this route as the machine's first sync, so it has
     # to be the same call the acquisition path makes.
     try:
-        result = await manager.refresh_project_assets(
-            workspace_id, x_user_id, sandbox
-        )
+        result = await manager.refresh_project_assets(workspace_id, sandbox)
     except Exception as e:
         logger.exception(f"Refresh failed for workspace {workspace_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to refresh sandbox assets")
@@ -1136,7 +1150,12 @@ async def delete_workspace(
         workspace = await db_get_workspace(workspace_id)
         if is_reserved_row(workspace):
             raise HTTPException(status_code=400, detail="Cannot delete Home")
-        require_workspace_owner(workspace, user_id=principal.user_id)
+        access = await workspace_access(workspace, principal.user_id, manage=True)
+        if access.is_shared:
+            # A computer's token never gets here (``require_scopes``).
+            # With its computer, which is the workspace's alone.
+            await shared_service.delete(workspace_id, principal.user_id)
+            return
         await cli_approval.workspace_delete(
             http_request, principal, workspace, delete_files=delete_files
         )

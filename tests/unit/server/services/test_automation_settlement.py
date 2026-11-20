@@ -28,16 +28,18 @@ from src.server.services import automation_delivery
 from src.server.services import automation_settlement as settlement_mod
 from src.server.services.automation_delivery import Delivery, Finish, Target
 from src.server.services.automation_excerpt import RunAnswer
-from src.server.services.automation_settlement import (
+from src.server.services.automation_outcomes import (
     INTERRUPTED_ERROR,
     RUN_FAILURES,
     STOPPED_ERROR,
     UNREACHABLE_ERROR,
     Outcome,
-    _settle_finished_run,
-    drain_tails,
     ledger_outcome,
     run_failure_message,
+)
+from src.server.services.automation_settlement import (
+    _settle_finished_run,
+    drain_tails,
     settle,
     settle_abandoned,
 )
@@ -67,6 +69,8 @@ REARMS = {"cron": None, "once": None, "price_one_shot": "rearm_price", "price_re
 # A usage limit ends a one-shot alert, which would otherwise fire into the
 # same limit again; a one-time automation keeps its schedule to be retimed.
 CLOSES_ALERT = {**REARMS, "price_one_shot": "close_price"}
+# A suspension uses up no one-shot: each is put off, to fire again later.
+DEFERS = {"cron": None, "once": "defer_once", "price_one_shot": "defer_price", "price_recurring": "rearm_price"}
 
 _ANY = ("pending", "waiting", "running")
 
@@ -89,6 +93,8 @@ EXPECTED = {
     Outcome.PRECHECK_SKIPPED: ("skipped", ("pending", "running"), None, CLOSES, None, None, None, "precheck_skipped"),
     # DALTON-HOOK(automation-continuation-identity): hard timeout cap settles via failure webhook/finish
     Outcome.TIMEOUT: ("timeout", _ANY, "count", REARMS, "automation.failed", None, None, "timeout"),
+    # No strike and no channel told: only the organization can lift it.
+    Outcome.SUSPENDED: ("skipped", _ANY, None, DEFERS, None, None, None, "suspended"),
 }
 
 

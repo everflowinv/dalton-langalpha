@@ -190,7 +190,7 @@ async def test_a_preferences_reset_keeps_the_account_setup_stamp():
         yield
 
     @asynccontextmanager
-    async def _connection():
+    async def _connection(*_):
         yield conn
 
     conn.cursor, conn.transaction = _cursor, _transaction

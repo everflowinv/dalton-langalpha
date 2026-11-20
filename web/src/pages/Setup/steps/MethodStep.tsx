@@ -18,10 +18,14 @@ import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { llmProviderArt } from '@/lib/brandArt';
 import { SUBSCRIPTIONS } from '@/api/oauth';
 import type { AccessType } from '@/components/model/types';
+import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
+import { useAccount } from '@/hooks/useAccount';
+import { methodAllowed } from '@/lib/accountRules';
+import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
 
 // ---------------------------------------------------------------------------
 // Ways to connect
@@ -151,6 +155,11 @@ function ConnectedSummary({
   );
 }
 
+/** The ways to connect no rule keeps off. */
+function allowedMethods(policy: AccountPolicy | null) {
+  return METHODS.filter((m) => methodAllowed(policy, m.id));
+}
+
 // ---------------------------------------------------------------------------
 // MethodStep
 // ---------------------------------------------------------------------------
@@ -174,6 +183,9 @@ export default function MethodStep() {
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
 
   const headingId = useId();
+  // Ways a rule keeps off are not offered; `OwnAccessNote` says who keeps
+  // them off.
+  const { policy } = useAccount();
 
   // Invitation code state
   const [showInvitation, setShowInvitation] = useState(false);
@@ -286,7 +298,7 @@ export default function MethodStep() {
       {!teamManagedByAdmin && (
         <ul aria-labelledby={headingId} className="flex flex-col gap-2">
           {/* DALTON-HOOK(team-credentials) */}
-          {METHODS.map((method) => (
+          {allowedMethods(policy).map((method) => (
             <li key={method.id}>
               {/* DALTON-HOOK(team-credentials) */}
               <button
@@ -307,6 +319,8 @@ export default function MethodStep() {
         </ul>
       )}
       {/* DALTON-HOOK(team-credentials) */}
+
+      <OwnAccessNote variant="setup" />
 
       {/* Invitation code section — hide only when user already has platform access */}
       {(userLoading || !hasPlatformAccess) && (

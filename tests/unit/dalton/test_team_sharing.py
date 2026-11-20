@@ -34,6 +34,7 @@ from src.server.app.threads import messaging as threads_messaging
 from src.server.app.threads import provenance as threads_provenance
 from src.server.app.threads import tasks as threads_tasks
 from src.server.app.workspace_files import (
+    _shared as ws_files_shared,
     backup_reads as ws_files_backup,
     crud as ws_files_crud,
 )
@@ -824,10 +825,10 @@ class TestReadEndpointsAllowColleagues:
         acquire_spy = create_autospec(ws_files_crud.acquire_sandbox_to_change)
         monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", acquire_spy)
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1343,6 +1344,8 @@ class TestWriteEndpointsRejectColleagues:
             "db_get_workspace",
             create_autospec(ws_files_crud.db_get_workspace, return_value=stopped_ws),
         )
+        from src.server.services.shared_workspaces.access import Access
+
         owned_mock = create_autospec(
             ws_files_service.owned_workspace_on_computer, return_value=stopped_ws
         )
@@ -1353,14 +1356,17 @@ class TestWriteEndpointsRejectColleagues:
         )
         monkeypatch.setattr(
             ws_files_crud,
-            "owned_workspace_on_computer",
-            owned_mock,
+            "reached_workspace_on_computer",
+            create_autospec(
+                ws_files_crud.reached_workspace_on_computer,
+                return_value=(stopped_ws, Access("u-richard")),
+            ),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1460,10 +1466,10 @@ class TestRangeDownloadPermissionMatrix:
             create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1657,10 +1663,10 @@ class TestRangeDownloadPermissionMatrix:
             create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1741,10 +1747,10 @@ class TestRwColleagueFileDownloads:
             create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -1942,10 +1948,10 @@ class TestRwColleagueFileDownloads:
             create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir,
+                ws_files_shared.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )
@@ -2334,10 +2340,10 @@ class TestRwColleagueLargeFileStreams:
             create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir, return_value=self._WORK_DIR
+                ws_files_shared.owner_work_dir, return_value=self._WORK_DIR
             ),
         )
         sandbox = create_autospec(PTCSandbox, instance=True)
@@ -2545,7 +2551,14 @@ class TestRwColleagueRangeBlockedPaths:
     async def test_live_range_helper_404s_blocked_canonical_for_non_owner(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        ws = _sample_workspace(user_id="u-richard", status="running")
         sandbox = create_autospec(PTCSandbox, instance=True)
+        monkeypatch.setattr(
+            ws_files_shared,
+            "owner_work_dir",
+            create_autospec(ws_files_shared.owner_work_dir, return_value=self._WORK_DIR),
+        )
+        paths = ws_files_shared.RoutePaths.of(ws, "u-richard")
         monkeypatch.setattr(
             ws_files_crud,
             "read_contained_sandbox_range",
@@ -2558,7 +2571,7 @@ class TestRwColleagueRangeBlockedPaths:
             await ws_files_crud._live_range_response(
                 sandbox,
                 f"{self._WORK_DIR}/link.pdf",
-                self._WORK_DIR,
+                paths,
                 (0, 1023),
                 "inline",
                 blocked_for_non_owner=True,
@@ -2569,7 +2582,7 @@ class TestRwColleagueRangeBlockedPaths:
         owner_answer = await ws_files_crud._live_range_response(
             sandbox,
             f"{self._WORK_DIR}/link.pdf",
-            self._WORK_DIR,
+            paths,
             (0, 1023),
             "inline",
             blocked_for_non_owner=False,
@@ -2589,6 +2602,12 @@ class TestRwColleagueRangeBlockedPaths:
         sandbox = create_autospec(PTCSandbox, instance=True)
         sandbox.validate_path = lambda _p: True
         monkeypatch.setattr(
+            ws_files_shared,
+            "owner_work_dir",
+            create_autospec(ws_files_shared.owner_work_dir, return_value=self._WORK_DIR),
+        )
+        paths = ws_files_shared.RoutePaths.of(ws, "u-richard")
+        monkeypatch.setattr(
             ws_files_crud,
             "warm_sandbox",
             create_autospec(ws_files_crud.warm_sandbox, return_value=sandbox),
@@ -2602,10 +2621,9 @@ class TestRwColleagueRangeBlockedPaths:
             ),
         )
         settled, answer = await ws_files_crud._warm_range_response(
-            ws,
+            paths,
             WS_ID,
             f"{self._WORK_DIR}/link.pdf",
-            self._WORK_DIR,
             (0, 1023),
             "inline",
             blocked_for_non_owner=True,
@@ -2634,10 +2652,10 @@ class TestRwColleagueRangeBlockedPaths:
             create_autospec(ws_files_service.db_get_workspace, return_value=ws),
         )
         monkeypatch.setattr(
-            ws_files_crud,
+            ws_files_shared,
             "owner_work_dir",
             create_autospec(
-                ws_files_crud.owner_work_dir, return_value=self._WORK_DIR
+                ws_files_shared.owner_work_dir, return_value=self._WORK_DIR
             ),
         )
         # No warm session: the request goes straight through the acquisition.

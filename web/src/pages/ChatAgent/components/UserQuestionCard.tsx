@@ -172,6 +172,9 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
   const isAnswered = status === 'answered';
   const isSkipped = status === 'skipped';
   const isResolved = isAnswered || isSkipped;
+  // No handler: someone else's question (another member's turn, or a share),
+  // shown as asked but not answerable here.
+  const inert = !onAnswer;
 
   // Parse which options were selected from the answer string
   const answeredOptions = isAnswered && answer
@@ -288,11 +291,13 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
                   label={option}
                   checked={selected.has(option)}
                   onChange={() => handleToggle(option)}
+                  disabled={inert}
                 />
               ) : (
                 <OptionRadio
                   label={option}
                   onClick={() => onAnswer?.(option)}
+                  disabled={inert}
                 />
               )}
             </motion.div>
@@ -327,6 +332,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
           value={otherText}
           onChange={(e: React.ChangeEvent<HTMLInputElement>) => setOtherText(e.target.value)}
           onKeyDown={handleOtherKeyDown}
+          disabled={inert}
           className="flex-1 text-sm px-3 py-2 rounded-md transition-colors focus:border-(--color-accent-overlay)"
           style={{
             backgroundColor: 'var(--color-border-muted)',
@@ -363,7 +369,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
       </div>
 
       {/* Skip */}
-      <div className="pt-1">
+      {!inert && <div className="pt-1">
         <button
           onClick={() => onSkip?.()}
           className="press flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md"
@@ -384,7 +390,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
           {t('chat.skip')}
         </button>
         {/* DALTON-HOOK(team-sharing): read-only for a teammate's workspace */}
-      </div>
+      </div>}
       </>
       )}
     </ResolveSwap>

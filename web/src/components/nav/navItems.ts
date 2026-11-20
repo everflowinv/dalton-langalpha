@@ -1,4 +1,4 @@
-import { Blocks, ChartCandlestick, LayoutDashboard, MessagesSquare, Monitor, Settings, Timer } from 'lucide-react'; // DALTON-HOOK(monitors)
+import { Blocks, ChartCandlestick, LayoutDashboard, LibraryBig, MessagesSquare, Monitor, Settings, Timer } from 'lucide-react'; // DALTON-HOOK(monitors)
 import type { LucideIcon } from 'lucide-react';
 
 export interface NavItem {
@@ -16,7 +16,7 @@ export interface NavItem {
    * Never a route guard: the route stays reachable by URL, and the page it
    * leads to is the one that explains an empty answer.
    */
-  requires?: 'orders' | 'market' | 'dashboard'; // DALTON-HOOK(dalton-nav)
+  requires?: 'orders' | 'market' | 'dashboard' | 'org_library'; // DALTON-HOOK(dalton-nav)
 }
 
 // Single source of truth for primary navigation (rail + mobile tab bar).
@@ -26,6 +26,7 @@ export const NAV_ITEMS: NavItem[] = [
   { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub', requires: 'market' }, // DALTON-HOOK(dalton-nav)
   { key: '/automations', icon: Timer, labelKey: 'sidebar.automations', match: 'exact-or-sub' },
   { key: '/monitors', icon: Monitor, labelKey: 'monitors.navLabel', match: 'exact-or-sub' }, // DALTON-HOOK(monitors)
+  { key: '/library', icon: LibraryBig, labelKey: 'sidebar.library', match: 'exact-or-sub', requires: 'org_library' },
   // DALTON-HOOK(hide-trading): remove '/orders' from primary navigation
   { key: '/plugins', icon: Blocks, labelKey: 'sidebar.plugins', match: 'exact-or-sub' },
 ];

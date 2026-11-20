@@ -25,7 +25,7 @@ import re
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from contextlib import AsyncExitStack, aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha1
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -40,10 +40,12 @@ from src.server.services.brokerage_capabilities import (
     denied_tools,
     group_for_tool,
     order_tool,
+    trading_rule_withholds,
     vendor_for_url,
 )
 from src.server.services.egress import folded_contains
 from src.server.services.egress.execution_token import EXECUTION_HEADER
+from src.server.services.egress.policy_gate import PolicyGate
 from src.server.services.egress.relay_jwt import (
     CALLER_HOST,
     identity_claim,
@@ -257,6 +259,7 @@ class DirectMCPBinding:
     """
 
     user_id: str | None = None
+    workspace_id: str | None = None
     tools: list[BaseTool] = field(default_factory=list)
     _clients: list[tuple[str, Any]] = field(default_factory=list)
 
@@ -268,6 +271,17 @@ class DirectMCPBinding:
     ) -> str | None:
         if not self.user_id:
             return "no user is attached to this turn"
+        gate = PolicyGate(
+            self.user_id, via="direct", caller=CALLER_HOST,
+            workspace_id=self.workspace_id,
+        )
+        # A turn started before the suspension runs on; what it reaches
+        # through the account's connections does not.
+        if await gate.suspended():
+            return (
+                "No call was made: this account's access through the user's "
+                "organization has ended. Tell the user."
+            )
         connection = await get_connection(self.user_id, server)
         # A revoked record is history, not a claim on the row: the user
         # disconnected, and the row's own headers may authenticate it now.
@@ -294,9 +308,15 @@ class DirectMCPBinding:
         if identity is None:
             return f"{server} is switched off or no longer connected"
         vendor, granted = identity
+        # Judged on the address the call dials, as the relay judges it.
+        url = connection.server_url if connection is not None else row.get("url")
+        if refusal := await gate.own_server(url, server=server, tool=tool):
+            return refusal
         denied = denied_tools(vendor, granted)
         if denied and folded_contains(denied, tool):
             return f"the connection to {server} does not permit {tool}"
+        if refusal := await gate.live_order(vendor, tool, server=server):
+            return refusal
         # Resolved the way the binder resolved it, so a tool the user moved
         # back to the sandbox mid-turn stops being callable here. The relay's
         # own direct-only gate cannot catch this one: it refuses a sandbox
@@ -494,6 +514,38 @@ def _pointer(root: Mapping[str, Any], ref: str) -> Any:
 
 
 # DALTON-HOOK(colleague-dispatch): dual identity (owner_user_id for relay JWT/connection, caller_user_id for trading gate)
+async def _within_trading_policy(
+    user_id: str, by_server: Mapping[str, DirectServerTools]
+) -> Mapping[str, DirectServerTools]:
+    """The servers' tools less those the user's ``trading`` rule withholds.
+
+    Per turn rather than in the view: the view is frozen across turns, and a
+    policy set after it was built must still keep these tools unbound. The
+    policy is read only when the rule could withhold some tool here.
+    """
+    if not any(
+        trading_rule_withholds(entry.vendor, tool.name)
+        for entry in by_server.values()
+        for tool in entry.tools
+    ):
+        return by_server
+    from src.server.services.policy import TRADING, withheld_text
+    from src.server.services.account import policy_for
+
+    if withheld_text(await policy_for(user_id), TRADING) is None:
+        return by_server
+    logger.info("[DIRECT_MCP] brokerage tools withheld by the trading rule for user %s", user_id)
+    return {
+        name: replace(
+            entry,
+            tools=tuple(
+                t for t in entry.tools if not trading_rule_withholds(entry.vendor, t.name)
+            ),
+        )
+        for name, entry in by_server.items()
+    }
+
+
 async def prepare_direct_mcp_tools(
     *,
     user_id: str | None = None,
@@ -511,9 +563,10 @@ async def prepare_direct_mcp_tools(
     is_colleague_turn = bool(
         eff_owner_id and eff_caller_id and str(eff_owner_id) != str(eff_caller_id)
     )
-    binding = DirectMCPBinding(user_id=eff_owner_id)
+    binding = DirectMCPBinding(user_id=eff_owner_id, workspace_id=workspace_id)
     if not by_server or not grants or not EGRESS_RELAY_SECRET or not eff_owner_id:
         return binding
+    by_server = await _within_trading_policy(eff_caller_id, by_server)
 
     from mcp.types import Tool
 

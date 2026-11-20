@@ -4203,8 +4203,8 @@ async def test_parked_steer_failure_after_run_end_surfaces_via_status_and_wakes_
     )
     monkeypatch.setattr(
         steer_executor,
-        "_owner",
-        create_autospec(steer_executor._owner, return_value=(owner_id, ws_id)),
+        "turn_owner",
+        create_autospec(steer_executor.turn_owner, return_value=(owner_id, ws_id)),
     )
     monkeypatch.setattr(
         svc,
@@ -5035,10 +5035,16 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
     async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
         yield sbx, ws_meta
 
+    from src.server.app.workspace_files import _shared as ws_shared
+    from src.server.services.shared_workspaces.access import Access
+
     monkeypatch.setattr(
         ws_crud,
-        "owned_workspace_on_computer",
-        create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+        "reached_workspace_on_computer",
+        create_autospec(
+            ws_crud.reached_workspace_on_computer,
+            return_value=(ws_meta, Access(owner)),
+        ),
     )
     monkeypatch.setattr(
         ws_crud,
@@ -5046,14 +5052,14 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
         create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_work_dir",
-        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+        create_autospec(ws_shared.owner_work_dir, return_value=layout.workspace),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_layout",
-        create_autospec(ws_crud.owner_layout, return_value=layout),
+        create_autospec(ws_shared.owner_layout, return_value=layout),
     )
     monkeypatch.setattr(
         ws_db,
@@ -5484,10 +5490,16 @@ async def test_materialize_chat_uploads_direct_and_chunked_revoked_after_bytes_r
     async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
         yield sbx_delete, ws_meta
 
+    from src.server.app.workspace_files import _shared as ws_shared
+    from src.server.services.shared_workspaces.access import Access
+
     monkeypatch.setattr(
         ws_crud,
-        "owned_workspace_on_computer",
-        create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+        "reached_workspace_on_computer",
+        create_autospec(
+            ws_crud.reached_workspace_on_computer,
+            return_value=(ws_meta, Access(owner)),
+        ),
     )
     monkeypatch.setattr(
         ws_crud,
@@ -5495,14 +5507,14 @@ async def test_materialize_chat_uploads_direct_and_chunked_revoked_after_bytes_r
         create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_work_dir",
-        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+        create_autospec(ws_shared.owner_work_dir, return_value=layout.workspace),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_layout",
-        create_autospec(ws_crud.owner_layout, return_value=layout),
+        create_autospec(ws_shared.owner_layout, return_value=layout),
     )
     monkeypatch.setattr(
         ws_db,
@@ -5899,20 +5911,22 @@ async def test_delete_pending_not_swept_by_time_and_shared_writer_deletes_with_c
     async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
         yield sbx, ws_meta
 
+    from src.server.app.workspace_files import _shared as ws_shared
+
     monkeypatch.setattr(
         ws_crud,
         "acquire_sandbox_to_change",
         create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_work_dir",
-        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+        create_autospec(ws_shared.owner_work_dir, return_value=layout.workspace),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_layout",
-        create_autospec(ws_crud.owner_layout, return_value=layout),
+        create_autospec(ws_shared.owner_layout, return_value=layout),
     )
     monkeypatch.setattr(
         ws_db,
@@ -6350,10 +6364,16 @@ async def test_materialize_multi_target_sibling_deleted_during_later_transfer_ra
     async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
         yield sbx_delete, ws_meta
 
+    from src.server.app.workspace_files import _shared as ws_shared
+    from src.server.services.shared_workspaces.access import Access
+
     monkeypatch.setattr(
         ws_crud,
-        "owned_workspace_on_computer",
-        create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+        "reached_workspace_on_computer",
+        create_autospec(
+            ws_crud.reached_workspace_on_computer,
+            return_value=(ws_meta, Access(owner)),
+        ),
     )
     monkeypatch.setattr(
         ws_crud,
@@ -6361,14 +6381,14 @@ async def test_materialize_multi_target_sibling_deleted_during_later_transfer_ra
         create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_work_dir",
-        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+        create_autospec(ws_shared.owner_work_dir, return_value=layout.workspace),
     )
     monkeypatch.setattr(
-        ws_crud,
+        ws_shared,
         "owner_layout",
-        create_autospec(ws_crud.owner_layout, return_value=layout),
+        create_autospec(ws_shared.owner_layout, return_value=layout),
     )
     monkeypatch.setattr(
         ws_db,

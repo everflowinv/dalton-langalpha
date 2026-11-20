@@ -26,6 +26,7 @@ from enum import StrEnum
 from typing import Any
 
 from fastapi import HTTPException
+from urllib.parse import urlsplit
 from pydantic import BaseModel, ValidationError
 
 from src.server.database.mcp_oauth import ConnectionStatus, get_connection
@@ -37,6 +38,8 @@ from src.server.database.mcp_servers import (
 )
 from src.server.database.workspace import get_workspace
 from src.server.models.mcp_server import McpServerInput
+from src.server.services import activity
+from src.server.services.activity import Action
 from src.server.services.brokerages import (  # DALTON-HOOK(hide-trading)
     brokerage_for_url,
     brokerage_names,
@@ -76,6 +79,7 @@ from src.server.services.mcp_validation import (
     check_http_error,
     check_server,
 )
+from src.server.services.account import refuse_user_connector
 from src.server.services.plugins import (
     PendingPluginInstall,
     PluginRejected,
@@ -89,6 +93,8 @@ from src.server.utils.error_sanitization import validation_error_text
 logger = logging.getLogger(__name__)
 
 NOT_FOUND = "MCP server not found"
+#: An organization connector: members switch it off per workspace and nothing more.
+ORG_MANAGED = "This connector is managed by your organization"
 
 # DALTON-HOOK(hide-trading): shared service-layer refusal for brokerage names and host URLs
 BROKERAGE_DISABLED_DETAIL = (
@@ -162,6 +168,9 @@ class _Add:
         reject_reserved_catalog_name(self.server.name)
         # DALTON-HOOK(hide-trading): refuse custom servers whose URL points at a brokerage host
         refuse_brokerage_url(self.server.url)
+        await refuse_user_connector(
+            self.user_id, "Adding a connector", url=self.server.url
+        )
         await refuse_unplaceable(
             self.user_id, self.server.name, taken=name_taken(self.server.name)
         )
@@ -183,6 +192,16 @@ class _Add:
             await _store_or_take_back(
                 store, lambda: self._take_back(row_id), self.server.name
             )
+        activity.record(
+            self.user_id, Action.CONNECTOR_ADDED, resource=("mcp_server", self.server.name),
+            workspace_id=self.workspace_id,
+            detail={
+                "name": self.server.name,
+                "host": urlsplit(self.server.url).hostname if self.server.url else None,
+                "transport": self.server.transport,
+                "brokerage": isinstance(self, BrokerageAdd),
+            },
+        )
         return row
 
     async def after_write(self) -> None:
@@ -320,6 +339,8 @@ class ServerEdit:
         if self.workspace_id is None:
             return None
         ref = await classify_server_name(self.workspace_id, self.user_id, self.name)
+        if ref is not None and ref.origin is Origin.ORG:
+            raise HTTPException(status_code=403, detail=ORG_MANAGED)
         if ref is None or ref.origin is not Origin.USER:
             raise HTTPException(status_code=404, detail=NOT_FOUND)
         return ref
@@ -466,11 +487,16 @@ def _http_detail(e: HTTPException) -> str:
     return str(detail)
 
 
-async def _refused(step: Awaitable[Any]) -> Any:
-    """Run a save's step, its refusal becoming a reason the callback reports."""
+async def _refused(step: Awaitable[Any], user_id: str) -> Any:
+    """Run a save's step, its refusal becoming a reason the callback reports.
+
+    A refusal by policy ends here rather than at a handler, so it is
+    recorded here.
+    """
     try:
         return await step
     except HTTPException as e:
+        activity.record_refusal(e, user_id)
         raise CallbackFailed(CallbackError.INSTALL_FAILED, _http_detail(e)) from None
 
 
@@ -517,7 +543,7 @@ class _AddFinish:
         self.save = save
 
     async def before_exchange(self) -> None:
-        await _refused(self.save.refuse())
+        await _refused(self.save.refuse(), self.save.user_id)
 
     async def after_exchange(self, bearer: str) -> None:
         await self.before_exchange()
@@ -525,7 +551,7 @@ class _AddFinish:
         await _verify(self.save.user_id, server.name, server.url or "", bearer)
 
     async def write(self, store: StoreConnection) -> None:
-        await _refused(self.save.write(store))
+        await _refused(self.save.write(store), self.save.user_id)
 
     async def after_connect(self) -> None:
         await self.save.after_write()
@@ -563,7 +589,7 @@ class _EditFinish:
 
     async def before_exchange(self) -> None:
         # DALTON-HOOK(hide-trading): refuse editing a server to a brokerage host before code exchange
-        await _refused(self.edit.refuse())
+        await _refused(self.edit.refuse(), self.edit.user_id)
         row = await get_catalog_server(self._user_id, self._name)
         if row is None or dial_of(row) != self.prior:
             raise CallbackFailed(CallbackError.SERVER_CHANGED)
@@ -671,6 +697,7 @@ class _PluginFinish:
             await undo_pending_plugin_install(self.user_id, committed.progress)
 
         await _store_or_take_back(store, take_back, self.pending.plugin_name)
+        committed.record(self.user_id)
 
     async def after_connect(self) -> None:
         return None

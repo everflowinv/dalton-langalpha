@@ -31,6 +31,9 @@ export interface HeldSteer {
   artifact_comments?: unknown;
   // DALTON-HOOK(chat-large-upload): attachment metadata on parked or returned steers
   attachments?: unknown;
+  /** In a shared workspace's thread, the member who queued it
+   *  (`{user_id, name}`, as replay names a turn's sender). */
+  sender?: unknown;
 }
 
 export interface CancelOutcome {

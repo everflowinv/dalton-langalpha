@@ -54,6 +54,13 @@ import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { basename, dirname } from '../utils/fileRefResolver';
 import { shareLinkHref } from '../utils/api/shareLinks';
 import { filesChangedIn, refusalIn, type PublishRefusal } from './filePanel/usePublish';
+import { useAccount } from '@/hooks/useAccount';
+import { useLinkStanding } from '@/hooks/useLinkStanding';
+import { RULE } from '@/lib/accountRules';
+import { LinkRuleNote } from '@/components/organization/LinkRuleNote';
+import { AudiencePicker } from '@/components/organization/AudiencePicker';
+import { LibraryPublishRow } from '@/components/organization/LibraryPublishRow';
+import type { ShareAudience } from '@/types/api';
 
 /** The server takes a label of 1 to 200 characters. */
 const LABEL_MAX = 200;
@@ -366,8 +373,9 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   // Read once before the scout loads the page, naming the code it will run,
   // and again once it has heard the page out.
   const statusQuery = useArtifactStatus(artifact, { always: true, report: true, enabled: !unshareOnly && scout.reads });
-  const { unshare, keepUpdated } = useArtifactPublishing();
+  const { unshare, keepUpdated, audience: audienceChange } = useArtifactPublishing();
   const changingList = useFileLeftOutPending(artifact?.artifact_id ?? '');
+  const { setterName, orgT } = useAccount();
   const { copy, copiedCode } = useCopyShareLink();
 
   // DALTON-HOOK(monitors): load existing monitor config for this artifact if already published
@@ -390,7 +398,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const [copiedPermalink, setCopiedPermalink] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
 
-  const busy = publishingMonitor || unshare.isPending || keepUpdated.isPending;
+  const busy = publishingMonitor || unshare.isPending || keepUpdated.isPending || audienceChange.isPending;
   useEffect(() => {
     busyRef.current = busy;
   }, [busy, busyRef]);
@@ -415,7 +423,18 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const drift = shared ? status?.drift ?? null : null;
   const added = new Set(drift?.added ?? []);
   const rootRefs = status?.root_refs ?? [];
-
+  // A rule against public links refuses publishing; unsharing never is. A
+  // page published before it keeps its row, and visitors wait for the rule.
+  // A member held by the workspace's managers reads the file's link but
+  // does not publish, update, unshare or keep it updated.
+  const standing = useLinkStanding(workspaceId, {
+    surface: 'file',
+    linkOn: shared,
+    audience: artifact?.audience,
+    audiences: artifact?.audiences,
+  });
+  const { membersOnly, lockedOut } = standing;
+  const blocked = standing.state !== 'open';
   const name = artifact?.name ?? basename(path);
   const effectiveTitle = titleDraft ?? existingMonitor?.title ?? name.replace(/\.html?$/i, '');
   const effectiveCategory: MonitorCategory = categoryDraft ?? existingMonitor?.category ?? 'other';
@@ -452,7 +471,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 
   const membersInvalid = effectiveVisibility === 'members' && effectiveMembers.length === 0;
   const listReady = !!status && !overCap && !statusQuery.isFetching && !statusQuery.isError && !scout.holding && !changingList;
-  const canPublish = !unshareOnly && !!artifact && listReady && files.length > 0 && !busy && !membersInvalid;
+  const canPublish = !unshareOnly && !lockedOut && !!artifact && listReady && files.length > 0 && !busy && !membersInvalid;
   const recordFailed = !!owned.error;
   const href = existingMonitor
     ? monitorShareUrl(existingMonitor.slug, existingMonitor.visibility)
@@ -567,17 +586,27 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     if (artifact) void copy(artifact.code);
   };
 
+  const chooseAudience = (to: ShareAudience) => {
+    if (!artifact || busy) return;
+    audienceChange.mutate(
+      { artifactId: artifact.artifact_id, audience: to },
+      { onError: (err) => failed(err, t('publish.changeFailed')) },
+    );
+  };
+
   // DALTON-HOOK(monitors): summarize monitor publication state or legacy artifact state
   const legacyRefused = shared && !!artifact?.legacy_refused;
   let stateHint: string;
-  if (existingMonitor) {
+  if (standing.state === 'paused') {
+    stateHint = t('organization.share.pausedShort', { whoMid: setterName(RULE.publicLinks).mid });
+  } else if (existingMonitor) {
     stateHint = t('publish.publishedAt', { seq: existingMonitor.published_seq || latestSeq });
   } else if (!shared) {
     stateHint = latestSeq > 0 ? t('publish.privateWithVersions') : t('publish.privateHint');
   } else if (legacyRefused) {
     stateHint = t('publish.legacyRefused');
   } else if (visitorsAt === 0 || status?.changed == null) {
-    stateHint = t('publish.sharedHint');
+    stateHint = membersOnly ? orgT('organization.share.fileMembersHint') : t('publish.sharedHint');
   } else {
     stateHint = t('publish.changedSince', { seq: visitorsAt });
   }
@@ -779,15 +808,24 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 size="sm"
                 className="h-7 shrink-0 gap-1.5 px-2.5 text-xs"
                 onClick={stop}
-                disabled={busy}
+                disabled={busy || lockedOut}
               >
                 {unshare.isPending && <Loader size={12} style={{ color: 'inherit' }} />}
                 {t('publish.unshare')}
               </Button>
             )}
           </div>
+          {standing.picker && (
+            <div className="px-3 py-2.5" style={{ borderColor: 'var(--color-border-muted)' }}>
+              <AudiencePicker
+                {...standing.picker}
+                disabled={!artifact || busy}
+                onChange={chooseAudience}
+              />
+            </div>
+          )}
           {/* DALTON-HOOK(external-share-guard): keep-updated is the owner's */}
-          {!unshareOnly && (
+          {!unshareOnly && !blocked && (
           <div
             className="flex items-center justify-between gap-3 px-3 py-2.5"
             style={{ borderColor: 'var(--color-border-muted)' }}
@@ -806,13 +844,15 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 <ToggleSwitch
                   checked={keepOn}
                   onChange={toggleKeep}
-                  disabled={!artifact || busy}
+                  disabled={!artifact || busy || (shared && lockedOut)}
                   ariaLabel={t('monitors.dialog.keepUpdated')}
                 />
               )}
           </div>
           )}
         </div>
+
+        <LinkRuleNote note={standing.note} />
 
         {/* DALTON-HOOK(external-share-guard): versions are the owner's review */}
         {!unshareOnly && latestSeq > 0 && <VersionList artifactId={artifact?.artifact_id} />}
@@ -852,7 +892,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         )}
 
         {/* DALTON-HOOK(monitors): submit monitor review list and version note via send() */}
-        {!unshareOnly && !recordFailed && !blocking && (
+        {!unshareOnly && !recordFailed && !blocking && !blocked && (
           <ReviewList
             artifactId={artifact?.artifact_id ?? ''}
             heading={status ? listHeading : null}
@@ -868,7 +908,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         )}
 
         {/* DALTON-HOOK(monitors): disabled state syncs with publishingMonitor and send() handles Enter submit */}
-        {!unshareOnly && (
+        {!unshareOnly && !blocked && (
         <label className="flex flex-col gap-1.5">
           <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
             {t('publish.label')}
@@ -888,6 +928,13 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
             className="h-8 sm:text-xs bg-(--color-bg-input) border-(--color-border-muted) text-(--color-text-primary)"
           />
         </label>
+        )}
+        {artifact && (
+          <LibraryPublishRow
+            target={{ kind: 'file', artifactId: artifact.artifact_id }}
+            linkOn={shared}
+            hint={t('organization.library.publishFileHint')}
+          />
         )}
 
         {/* Footer */}
@@ -909,7 +956,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               {t('common.close')}
             </Button>
             {/* DALTON-HOOK(external-share-guard): no publish button here */}
-            {!unshareOnly && (
+            {!unshareOnly && !blocked && (
             <Button size="sm" className="gap-1.5" onClick={send} disabled={!canPublish}>
               {publishingMonitor && <Loader size={14} style={{ color: 'inherit' }} />}
               {monitorPublished ? t('publish.update') : t('publish.publish')}

@@ -48,6 +48,7 @@ from src.server.services.report_back.notify_turn import (
 if TYPE_CHECKING:
     from src.server.models.chat import TaskReport
 
+
 logger = logging.getLogger(__name__)
 
 # The report-backs on a thread's own chain that the status slice counts: its
@@ -283,9 +284,11 @@ def task_report_message(
 
 @dataclass(frozen=True)
 class OwedTaskReport:
-    """The report still owed: what the reader is shown, the subagent type
-    the model is told about, the run's failure text, and the thread's owner
-    and workspace a turn of its own posts as."""
+    """A task report still owed: what the reader is shown, the subagent type
+    the model is told about, the run's failure text, and the account and
+    workspace a turn of its own posts as. The account is the sender of the
+    turn that started the task (its run row's ``user_id``), whose turn the
+    report continues; the workspace's owner only where no run row names one."""
 
     report: "TaskReport"
     subagent_type: str | None
@@ -330,6 +333,7 @@ async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
     from src.server.database.runs import subagent_runs as sr_db
 
     payload = job.get("payload") or {}
+    user_id, workspace_id = payload.get("user_id"), payload.get("workspace_id")
     task_run_id = payload.get("task_run_id")
     if task_run_id:
         run_row = await sr_db.get_task_run(str(task_run_id))
@@ -342,10 +346,10 @@ async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
             await tl_db.get_run(str(parent_run_id)), run_row.get("finalized_at")
         ):
             return NotOwed("its turn was stopped after it settled")
+        user_id = user_id or run_row.get("user_id")
     # DALTON-HOOK(workflow-resume): failure_error rides the owed report so
     # the message can tell a resumable worker_lost workflow apart from an
     # ordinary failure.
-    user_id, workspace_id = payload.get("user_id"), payload.get("workspace_id")
     thread_id = job.get("conversation_thread_id") or payload.get("thread_id")
     return OwedTaskReport(
         task_report(payload),
@@ -359,10 +363,12 @@ async def task_report_verdict(job: dict) -> OwedTaskReport | NotOwed:
 
 
 async def _with_owner(job: dict, owed: OwedTaskReport) -> OwedTaskReport | NotOwed:
-    """Ledger-enqueued jobs carry task identity only, so owner and workspace
-    resolve from the thread, the durable source (older jobs carried both in
-    the payload)."""
+    """Ledger-enqueued jobs carry task identity only, so the workspace, and
+    the account where the task's run row names none (a row from before it
+    was recorded), resolve from the thread, the durable source (older jobs
+    carried both in the payload)."""
     from src.server.database import conversation as conv_db
+    from src.server.database.conversation.threads_read import person_of
 
     thread_id = job.get("conversation_thread_id") or (job.get("payload") or {}).get("thread_id")
     if (owed.user_id and owed.workspace_id) or not thread_id:
@@ -370,7 +376,7 @@ async def _with_owner(job: dict, owed: OwedTaskReport) -> OwedTaskReport | NotOw
     meta = await conv_db.get_thread_auth_meta(str(thread_id))
     if meta is None:
         return NotOwed("its thread is gone", wake=False)
-    user_id = owed.user_id or meta.get("user_id")
+    user_id = owed.user_id or person_of(meta.get("user_id"))
     workspace_id = owed.workspace_id or meta.get("workspace_id")
     return replace(
         owed,

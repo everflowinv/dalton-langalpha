@@ -15,6 +15,8 @@ from src.server.contracts.status import (
 )
 from src.server.database import pool
 from src.server.database.conversation import _sql
+from src.server.database.conversation.thread_reach import served_on_computer_sql
+from src.server.database.shared_workspaces import is_holder
 from src.server.utils.pg_sanitize import like_escape, normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -115,7 +117,7 @@ async def get_thread_branch_read(conversation_thread_id: str) -> ThreadBranchRea
 # run_seq — the one monotonic run ordering (turn_index is reused by retries
 # and lowered by branch rewinds). Alias prefix `latest_` keeps the row dict
 # collision-free with thread columns.
-_LATEST_ATTEMPT_LATERAL = """
+LATEST_ATTEMPT_LATERAL = """
     LEFT JOIN LATERAL (
         SELECT cr.conversation_response_id AS latest_run_id,
                cr.status AS latest_run_status,
@@ -131,7 +133,7 @@ _LATEST_ATTEMPT_LATERAL = """
     ) la ON TRUE
 """
 
-_LATEST_ATTEMPT_LATERAL_COLS = (
+LATEST_ATTEMPT_LATERAL_COLS = (
     "la.latest_run_id, la.latest_run_status, la.latest_cancel_requested_at, "
     "la.latest_interrupt_reason, la.latest_run_seq, la.latest_run_started_at, "
     "la.latest_run_model"
@@ -140,7 +142,7 @@ _LATEST_ATTEMPT_LATERAL_COLS = (
 # Exact turn count for a paged row: conversation_queries is one-row-per-turn
 # (unique (thread_id, turn_index)), unlike conversation_responses where
 # retries duplicate turn_index.
-_TURN_COUNT_LATERAL = """
+TURN_COUNT_LATERAL = """
     LEFT JOIN LATERAL (
         SELECT COUNT(*)::int AS turn_count
         FROM conversation_queries q
@@ -218,7 +220,7 @@ async def get_workspace_threads(
                            COALESCE(t.user_id, w.user_id) AS thread_user_id,
                            w.user_id AS workspace_owner_id,
                            t.metadata->'dispatched_by' AS dispatched_by,
-                           tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
+                           tc.turn_count, {LATEST_ATTEMPT_LATERAL_COLS}
                     FROM (
                         SELECT {_sql._THREAD_COLUMNS}, last_seen_run_seq
                         FROM conversation_threads
@@ -228,8 +230,8 @@ async def get_workspace_threads(
                         LIMIT %s OFFSET %s
                     ) t
                     LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
-                    {_TURN_COUNT_LATERAL}
-                    {_LATEST_ATTEMPT_LATERAL}
+                    {TURN_COUNT_LATERAL}
+                    {LATEST_ATTEMPT_LATERAL}
                     ORDER BY {outer_order}t.{sort_by} {sort_order.upper()},
                              t.conversation_thread_id DESC
                 """
@@ -321,7 +323,7 @@ async def get_threads_for_user(
                 # DALTON-HOOK(colleague-dispatch): project thread_user_id, workspace_owner_id, and dispatched_by
                 query = f"""
                     SELECT t.*, fq.content AS first_query_content,
-                           tc.turn_count, {_LATEST_ATTEMPT_LATERAL_COLS}
+                           tc.turn_count, {LATEST_ATTEMPT_LATERAL_COLS}
                     FROM (
                         SELECT {_sql._THREAD_COLUMNS_T}, t.last_seen_run_seq,
                                COALESCE(t.user_id, w.user_id) AS thread_user_id,
@@ -342,8 +344,8 @@ async def get_threads_for_user(
                         ORDER BY q.turn_index ASC
                         LIMIT 1
                     ) fq ON TRUE
-                    {_TURN_COUNT_LATERAL}
-                    {_LATEST_ATTEMPT_LATERAL}
+                    {TURN_COUNT_LATERAL}
+                    {LATEST_ATTEMPT_LATERAL}
                     ORDER BY t.{sort_by} {sort_order.upper()},
                              t.conversation_thread_id DESC
                 """
@@ -395,7 +397,7 @@ async def get_recent_threads_for_user(
                 f"""
                 SELECT t.conversation_thread_id, t.workspace_id, t.updated_at,
                        t.workspace_name, {_sql.TITLE_OR_FIRST_QUERY} AS title,
-                       {_LATEST_ATTEMPT_LATERAL_COLS}
+                       {LATEST_ATTEMPT_LATERAL_COLS}
                 FROM (
                     SELECT t.conversation_thread_id, t.workspace_id, t.title,
                            t.updated_at, w.name AS workspace_name
@@ -409,7 +411,7 @@ async def get_recent_threads_for_user(
                     ORDER BY t.updated_at DESC, t.conversation_thread_id DESC
                     LIMIT %s
                 ) t
-                {_LATEST_ATTEMPT_LATERAL}
+                {LATEST_ATTEMPT_LATERAL}
                 ORDER BY t.updated_at DESC, t.conversation_thread_id DESC
                 """,
                 (user_id, exclude_thread_id, *cos_extra_params, limit),
@@ -472,9 +474,10 @@ async def get_thread_labels(
 # attempt seen (GREATEST no-ops on a live one), so their absence is not
 # truncation.
 # DALTON-HOOK(colleague-dispatch): scope live/unseen feed snapshot to thread owner, not workspace owner.
-_LIFECYCLE_SNAPSHOT_SQL = f"""
-    WITH owned AS (
-        SELECT ct.conversation_thread_id, ct.workspace_id, ct.archived_at,
+def owned_threads(user: str) -> str:
+    """The snapshot's ``owned`` set: every latest attempt on the threads of
+    the workspaces ``user`` (a placeholder) owns or created."""
+    return f"""SELECT ct.conversation_thread_id, ct.workspace_id, ct.archived_at,
                COALESCE(ct.last_seen_run_seq, 0) AS last_seen_run_seq,
                la.latest_run_id, la.latest_run_status,
                la.latest_cancel_requested_at,
@@ -494,7 +497,15 @@ _LIFECYCLE_SNAPSHOT_SQL = f"""
             ORDER BY cr.run_seq DESC
             LIMIT 1
         ) la ON TRUE
-        WHERE COALESCE(ct.user_id, w.user_id) = %s AND w.status != 'deleted'
+        WHERE COALESCE(ct.user_id, w.user_id) = {user} AND w.status != 'deleted'"""
+
+
+def snapshot_sql(owned: str, cap: str) -> str:
+    """The snapshot over ``owned`` (an ``owned`` set's statement), with the
+    unseen branch capped by the placeholder ``cap``."""
+    return f"""
+    WITH owned AS (
+        {owned}
     ),
     watermark AS (
         SELECT COALESCE(MAX(latest_run_seq), 0) AS as_of_seq FROM owned
@@ -512,7 +523,7 @@ _LIFECYCLE_SNAPSHOT_SQL = f"""
           )
           AND o.latest_run_seq > o.last_seen_run_seq
         ORDER BY o.latest_run_seq DESC
-        LIMIT %s
+        LIMIT {cap}
     )
     SELECT wm.as_of_seq, sel.*
     FROM watermark wm
@@ -522,6 +533,9 @@ _LIFECYCLE_SNAPSHOT_SQL = f"""
         SELECT * FROM unseen
     ) sel ON TRUE
 """
+
+
+_LIFECYCLE_SNAPSHOT_SQL = snapshot_sql(owned_threads("%s"), "%s")
 
 
 async def get_thread_lifecycle_rows(
@@ -537,11 +551,15 @@ async def get_thread_lifecycle_rows(
     ``ix_responses_thread_run_seq``; threads with no runs are excluded (they
     have no lifecycle to report).
     """
+    return await read_snapshot(_LIFECYCLE_SNAPSHOT_SQL, (user_id, unseen_cap + 1))
+
+
+async def read_snapshot(
+    snapshot: str, params: Any
+) -> Tuple[List[Dict[str, Any]], int]:
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                _LIFECYCLE_SNAPSHOT_SQL, (user_id, unseen_cap + 1)
-            )
+            await cur.execute(snapshot, params)
             fetched = [dict(r) for r in await cur.fetchall()]
     if not fetched:
         return [], 0
@@ -555,15 +573,19 @@ async def count_threads_needing_attention(user_id: str) -> int:
     list badges them: the number an app icon shows. Counted over the
     snapshot with no cap on its unseen branch (``LIMIT NULL``), so a long
     unseen backlog is counted in full, not as the feed's first page."""
+    return await count_attention(_LIFECYCLE_SNAPSHOT_SQL, (user_id, None))
+
+
+async def count_attention(snapshot: str, params: Any) -> int:
     async with pool.get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 f"""
-                SELECT count(*) FROM ({_LIFECYCLE_SNAPSHOT_SQL}) s
+                SELECT count(*) FROM ({snapshot}) s
                 WHERE s.branch = 'unseen'
                    OR (s.branch = 'live' AND s.latest_run_status = 'interrupted')
                 """,
-                (user_id, None),
+                params,
             )
             (count,) = await cur.fetchone()
     return count
@@ -721,10 +743,11 @@ async def fenced_workspace_thread_prefixes(
 async def list_computer_threads(
     computer_id: str, *, rows: bool = True
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Threads of every live workspace on a computer, newest first, and
-    whether each has a stored transcript: the computer's thread index. With
-    Home's stand-in on the computer, Home's threads too, at the stand-in's
-    folder, where its transcript link serves Home's (``acting_for``).
+    """Threads of every live workspace on a computer that it serves
+    (``served_on_computer_sql``), newest first, and whether each has a
+    stored transcript: the computer's thread index. With Home's stand-in on
+    the computer, Home's threads too, at the stand-in's folder, where its
+    transcript link serves Home's (``acting_for``).
 
     Also a digest of every one of those fields, from the same snapshot, which
     changes whenever any of them does; ``rows=False`` returns the digest
@@ -744,6 +767,7 @@ async def list_computer_threads(
             FROM conversation_threads t
             JOIN workspaces w ON w.workspace_id = t.workspace_id
             WHERE w.computer_id = %(computer)s AND w.status <> 'deleted'
+              AND {served_on_computer_sql('t')}
           UNION ALL
             SELECT t.conversation_thread_id, t.title, t.created_at,
                    t.updated_at, h.workspace_id,
@@ -840,6 +864,17 @@ async def get_thread_owner_id(thread_id: str, *, conn=None) -> Optional[str]:
     """
     meta = await get_thread_auth_meta(thread_id, conn=conn)
     return meta["user_id"] if meta else None
+
+
+def person_of(owner: Optional[str]) -> Optional[str]:
+    """The person a turn on a thread owned by ``owner`` runs as when its job
+    names none: the owner, or None when the thread is gone or is a shared
+    workspace's, whose owner is its holder and no person to post as."""
+    return None if owner is None or is_holder(owner) else owner
+
+
+async def thread_person(thread_id: str) -> Optional[str]:
+    return person_of(await get_thread_owner_id(thread_id))
 
 
 async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
@@ -942,8 +977,8 @@ async def get_thread_by_share_token(share_token: str) -> Optional[Dict[str, Any]
     """
     Get a shared thread by its public share token.
 
-    Returns thread info + workspace_id + workspace name only if is_shared = TRUE,
-    with the workspace's folder and the root of the computer it is on, which
+    Returns thread info + workspace_id + workspace name and owner only if
+    is_shared = TRUE, with the workspace's folder and the root of the computer it is on, which
     the agent's absolute paths are spelled with, and the roots of the
     computers it moved off, which an older turn's paths are spelled with.
     """
@@ -968,6 +1003,7 @@ async def get_thread_by_share_token(share_token: str) -> Optional[Dict[str, Any]
                         COALESCE(t.user_id, w.user_id) AS user_id,
                         w.user_id AS owner_user_id,
                         w.name AS workspace_name,
+                        w.user_id AS owner_id,
                         w.dir_name,
                         w.previous_root_dirs,
                         c.root_dir

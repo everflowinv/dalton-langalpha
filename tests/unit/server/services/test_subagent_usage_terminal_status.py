@@ -65,7 +65,7 @@ async def _bill_with_ledger_status(ledger_statuses: dict[str, str]):
             tasks=[_make_task()],
             thread_id="thread-1",
             workspace_id="ws-1",
-            user_id="user-1",
+            recorded_as="user-1",
         )
     return service
 

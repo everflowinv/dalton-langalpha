@@ -10,7 +10,7 @@ import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { setCardStatus } from './buckets';
 import { buildCreditPauseState } from './creditPauseCard';
 import { isToolApprovalInterrupt, toolApprovalCards } from './toolApprovalCard';
-import type { SSEEvent, StreamProcessorRefs } from '../types';
+import type { PendingInterrupt, SSEEvent, StreamProcessorRefs } from '../types';
 import type { StreamRuntime } from '../runtime';
 import { eventOrder } from '../eventOrder';
 
@@ -39,6 +39,10 @@ export function projectLiveInterrupt(
     seg: AssistantMessage['contentSegments'][number],
   ): AssistantMessage['contentSegments'] =>
     interruptAlreadyRendered ? (segs || []) : [...(segs || []), seg];
+  // The run streaming now raised the pause.
+  const arm = (pending: PendingInterrupt): void => {
+    rt.pause.arm({ ...pending, runId: rt.currentRunIdRef.current }, [event.interrupt_id]);
+  };
 
   if (actionType === 'ask_user_question') {
     // --- User question interrupt ---
@@ -65,8 +69,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'ask_user_question',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -99,8 +102,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'create_workspace',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -129,8 +131,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'start_question',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -166,8 +167,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'ptc_agent',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -199,8 +199,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: actionType,
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -229,8 +228,7 @@ export function projectLiveInterrupt(
           }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'credit_pause',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -269,8 +267,7 @@ export function projectLiveInterrupt(
           }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'tool_approval',
       interruptId: event.interrupt_id,
       assistantMessageId,

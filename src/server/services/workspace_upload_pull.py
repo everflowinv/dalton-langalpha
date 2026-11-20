@@ -41,7 +41,7 @@ from src.server.services.workspace_files import (
     acquire_sandbox_to_change,
     contained_target,
     not_running_for_upload,
-    owned_workspace_on_computer,
+    reached_workspace_on_computer,
     owner_layout,
     previous_dir_names_of,
     record_fs_bytes,
@@ -54,6 +54,7 @@ from src.server.services.store_multipart import (
     discard_upload,
 )
 from src.server.services.sweep_loop import JitteredSweeper
+from src.server.services.thread_folders import ThreadFolderGate
 from src.server.utils.error_sanitization import single_line
 from src.utils.concurrency import cancel_and_join
 from src.utils.storage import get_signed_url, is_storage_enabled
@@ -377,7 +378,7 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
     # --- DALTON-HOOK(direct-upload-safety): end ---
     try:
         # DALTON-HOOK(workspace-sharing-settings): allow rw colleague pull and reject revoked access
-        current = await owned_workspace_on_computer(workspace_id, user_id, need="write")
+        current, _ = await reached_workspace_on_computer(workspace_id, user_id, need="write")
     except HTTPException as e:
         # Deleted, or no longer this user's: nothing will take the file.
         if e.status_code in (400, 403, 404):
@@ -396,8 +397,11 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
         raise _Refused(UPLOAD_FAILED)
     # --- DALTON-HOOK(direct-upload-safety): end ---
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    is_non_owner = current.get("user_id") != user_id
-    sandbox_owner_id = str(current.get("user_id") or user_id)
+    from src.server.database.shared_workspaces import is_holder
+
+    is_shared_ws = is_holder(current.get("user_id"))
+    is_non_owner = not is_shared_ws and current.get("user_id") != user_id
+    sandbox_owner_id = user_id if is_shared_ws else str(current.get("user_id") or user_id)
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
     # Stopped since the upload began: it fails as the one-request path would
     # refuse it, rather than starting the computer again under its owner.
@@ -458,6 +462,12 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
             if _is_non_owner_blocked_path(rel) or _virtual_file(rel):
                 raise _Refused(UPLOAD_FAILED)
         # --- DALTON-HOOK(workspace-sharing-settings): end ---
+        # The start judged the path for the sender, but a thread made private
+        # since takes its folder out of their reach, so it is judged again,
+        # as the start did, before the file is fetched and when it is placed.
+        gate = ThreadFolderGate.of(workspace, user_id)
+        if await gate.hidden((row["path"], rel)):
+            raise _Refused(UPLOAD_FAILED)
         item: dict[str, Any] = {"kind": "file", "size": size, "mode": 0o644}
         if row.get("sha256"):
             item["sha256"] = row["sha256"]
@@ -504,6 +514,9 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
                     sandbox, [{**item, "path": staged, "url": url}], layout=layout
                 )
                 _raise_unless_ok(row, fetched.get(staged))
+            if await gate.hidden((row["path"], rel)):
+                await _remove(sandbox, f"{work_dir.rstrip('/')}/{staged}")
+                raise _Refused(UPLOAD_FAILED)
             inode = await _inode_of(sandbox, f"{work_dir.rstrip('/')}/{staged}")
             if not await db.mark_placing(row["upload_id"], int(row["attempts"]), inode):
                 raise _ClaimLost
@@ -514,7 +527,7 @@ async def _pull_once(row: dict[str, Any], held: dict[str, Any]) -> None:
                     if initial_refusal is not None:
                         raise initial_refusal
                     try:
-                        current_now = await owned_workspace_on_computer(
+                        current_now, _ = await reached_workspace_on_computer(
                             workspace_id, user_id, need="write"
                         )
                     except HTTPException as e:

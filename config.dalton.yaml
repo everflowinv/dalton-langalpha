@@ -83,6 +83,16 @@ features:
   # product decision that opens it.
   scratchpad:
     enabled: false
+  # Keep upstream teams / shared workspaces / org libraries / org connectors off
+  # in Dalton production; Dalton uses colleague sharing instead.
+  teams:
+    enabled: false
+  shared_workspaces:
+    enabled: false
+  org_connectors:
+    enabled: false
+  org_library:
+    enabled: false
 
 
 # SYNC3 B3 (#647): upstream's model-written MCP server descriptions stay off.

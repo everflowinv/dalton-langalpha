@@ -782,13 +782,15 @@ async def workspace_files_list_cos(
             ]
         else:
             owner_id = str(ws.get("user_id") or user_id)
+            from src.server.app.workspace_files._shared import RoutePaths
+
             async with acquire_sandbox_to_change(workspace_id, owner_id) as (
                 sandbox,
                 live_ws,
             ):
                 files = await _live_listing(
                     sandbox,
-                    live_ws,
+                    RoutePaths.of(live_ws, owner_id),
                     path or ".",
                     "**/*",
                     False,

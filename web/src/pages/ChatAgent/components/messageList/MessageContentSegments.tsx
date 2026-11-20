@@ -73,6 +73,9 @@ interface MessageContentSegmentsProps {
   isTurnTail?: boolean;
   isSubagentView?: boolean;
   readOnly?: boolean;
+  /** A shared workspace's turn another member sent: its questions and
+   *  approvals are theirs to answer, so they draw without actions. */
+  othersPause?: boolean;
   ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, Record<string, unknown>>;
   creditPauses?: Record<string, CreditPauseState>;
@@ -161,7 +164,7 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
   const motionSafe = useMotionSafe();
   const {
@@ -265,6 +268,9 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     }
   }
 
+  // Whether this viewer answers the turn's pauses: never on a read-only
+  // surface, nor on another member's turn, whose cards draw without actions.
+  const answers = !readOnly && !othersPause;
   const proposalOf = (block: PTCAgentRenderBlock): PTCAgentProposalState | undefined =>
     block.proposal ?? ptcAgentProposals[block.segment.proposalId!];
 
@@ -471,8 +477,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               key={block.key}
               questionData={qd as any} // TODO: type properly, QuestionData not exported
               // DALTON-HOOK(team-sharing): omit answer/skip callbacks in read-only mode
-              onAnswer={!readOnly && onAnswerQuestion ? (answer: string) => onAnswerQuestion(answer, (block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
-              onSkip={!readOnly && onSkipQuestion ? () => onSkipQuestion((block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
+              onAnswer={!readOnly && answers && onAnswerQuestion ? (answer: string) => onAnswerQuestion(answer, (block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
+              onSkip={!readOnly && answers && onSkipQuestion ? () => onSkipQuestion((block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
             />
           );
         }
@@ -497,8 +503,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               key={block.key}
               proposalData={wd as any} // TODO: type properly, ProposalData not exported
               // DALTON-HOOK(team-sharing): render proposal card without action buttons in read-only mode
-              onApprove={!readOnly && onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
-              onReject={!readOnly && onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
+              onApprove={!readOnly && answers && onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
+              onReject={!readOnly && answers && onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
             />
           );
         }
@@ -511,8 +517,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               key={block.key}
               proposalData={sqd as any} // TODO: type properly, ProposalData not exported
               // DALTON-HOOK(team-sharing): render proposal card without action buttons in read-only mode
-              onApprove={!readOnly && onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
-              onReject={!readOnly && onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
+              onApprove={!readOnly && answers && onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
+              onReject={!readOnly && answers && onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
             />
           );
         }
@@ -525,8 +531,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               key={block.key}
               proposalData={sad as any}
               // DALTON-HOOK(team-sharing): render secretary confirm card without action buttons in read-only mode
-              onApprove={!readOnly && onApproveSecretaryAction ? () => onApproveSecretaryAction(sad) : undefined}
-              onReject={!readOnly && onRejectSecretaryAction ? () => onRejectSecretaryAction(sad) : undefined}
+              onApprove={!readOnly && answers && onApproveSecretaryAction ? () => onApproveSecretaryAction(sad) : undefined}
+              onReject={!readOnly && answers && onRejectSecretaryAction ? () => onRejectSecretaryAction(sad) : undefined}
             />
           );
         }
@@ -544,7 +550,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             <CreditPauseCard
               key={block.key}
               pauseData={cpd}
-              onResume={!readOnly && onResumeCreditPause ? () => onResumeCreditPause(pauseId, cpd.interruptId) : undefined}
+              onResume={answers && onResumeCreditPause ? () => onResumeCreditPause(pauseId, cpd.interruptId) : undefined}
             />
           );
         }
@@ -576,8 +582,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               data={ta}
               resultPending={resultPending}
               resultLost={resultLost}
-              onApprove={!readOnly && onApproveToolCall && interruptId ? () => onApproveToolCall(approvalId, interruptId, position, attemptId) : undefined}
-              onReject={!readOnly && onRejectToolCall && interruptId ? (message?: string) => onRejectToolCall(approvalId, interruptId, position, message, attemptId) : undefined}
+              onApprove={answers && onApproveToolCall && interruptId ? () => onApproveToolCall(approvalId, interruptId, position, attemptId) : undefined}
+              onReject={answers && onRejectToolCall && interruptId ? (message?: string) => onRejectToolCall(approvalId, interruptId, position, message, attemptId) : undefined}
             />
           );
         }
@@ -645,8 +651,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                   key={firstKey}
                   members={members}
                   // DALTON-HOOK(team-sharing): render analyst handoff without action buttons in read-only mode
-                  onApprove={!readOnly ? onApprovePTCAgent : undefined}
-                  onReject={!readOnly ? onRejectPTCAgent : undefined}
+                  onApprove={!readOnly && answers ? onApprovePTCAgent : undefined}
+                  onReject={!readOnly && answers ? onRejectPTCAgent : undefined}
                   dispatcherContext={dispatcherContext}
                 />
               );

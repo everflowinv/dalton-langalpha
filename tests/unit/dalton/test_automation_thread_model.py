@@ -176,10 +176,6 @@ def _send_route_stubs(
             create_autospec(request_prep.qr_db.get_thread_auth_meta, return_value=meta),
         ),
         patch(
-            f"{_THREADS_MOD}.auth_api.require_thread_owner",
-            AsyncMock(return_value=None),
-        ),
-        patch(
             f"{_THREADS_MOD}.get_thread_by_id",
             create_autospec(
                 request_prep.qr_db.get_thread_by_id,
