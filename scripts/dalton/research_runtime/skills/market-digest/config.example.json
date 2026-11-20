@@ -25,7 +25,7 @@
     "daily_log_dir": "market-memory"
   },
   "embedding": {
-    "model": "gemini-embedding-2",
+    "model": "gemini-embedding-2-preview",
     "dimensions": 3072
   },
   "sections": [

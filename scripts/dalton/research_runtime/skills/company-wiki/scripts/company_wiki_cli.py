@@ -163,11 +163,12 @@ def get_genai_client():
 
 
 def resolve_embedding_model(config):
-    """Try preferred model first, fall back to default."""
+    """Try preferred model first; fall back only to a model in the same vector space."""
     preferred = config["embedding"].get("model_preferred")
     default = config["embedding"]["model"]
 
     if preferred:
+        error = "empty embedding"
         try:
             client = get_genai_client()
             # Test with a tiny embed call
@@ -180,11 +181,12 @@ def resolve_embedding_model(config):
                 log(f"Using preferred model: {preferred} (dims={len(result.embeddings[0].values)})")
                 return preferred, len(result.embeddings[0].values)
         except Exception as e:
-            if api_model(preferred) != api_model(default):
-                # A different model writes and queries in an unrelated vector space
-                # (gemini-embedding-001 vs the stored index: cosine ~0), so fail instead.
-                fail(f"Embedding model {preferred} failed and {default} is not compatible: {e}")
-            log(f"Preferred model {preferred} not available: {e}")
+            error = e
+        if api_model(preferred) != api_model(default):
+            # A different model writes and queries in an unrelated vector space
+            # (gemini-embedding-001 vs the stored index: cosine ~0), so fail instead.
+            fail(f"Embedding model {preferred} failed and {default} is not compatible: {error}")
+        log(f"Preferred model {preferred} not available: {error}")
 
     # Fall back to default
     try:
@@ -199,7 +201,6 @@ def resolve_embedding_model(config):
         return default, dims
     except Exception as e:
         fail(f"Embedding model {default} failed: {e}")
-
 
 def embed_texts(texts, model_name):
     """Embed a list of texts using Gemini embedding API with true batch calls."""
@@ -231,7 +232,7 @@ def embed_texts(texts, model_name):
                 break
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < 4:
                     wait = 2 ** attempt * 5
                     log(f"Rate limited, waiting {wait}s (attempt {attempt + 1}/5)")
                     time.sleep(wait)

@@ -331,7 +331,7 @@ def embed_texts(texts, config):
                 break
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < 4:
                     wait = 2 ** attempt * 5
                     log(f"Rate limited, waiting {wait}s (attempt {attempt+1}/5)")
                     time.sleep(wait)
