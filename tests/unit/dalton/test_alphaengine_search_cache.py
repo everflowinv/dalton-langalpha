@@ -4832,7 +4832,7 @@ def test_a_complete_stale_transcript_is_not_called_incomplete() -> None:
 
 def test_a_sliced_page_replaces_the_upstream_paging_note() -> None:
     payload = _ae_results_payload(50, has_more=True, cursor="ae1:x")
+    payload["data"]["structuredContent"]["pagination_note"] = "继续使用 cursor，直到 has_more=false"
     sliced = ae_cache.slice_cached_payload(payload, op=ae_cache.OP_SEARCH_LIBRARY, target_limit=10)
-    text = json.dumps(sliced, ensure_ascii=False)
-    assert ae_cache.SLICED_CACHE_NOTE in text
+    assert sliced["data"]["structuredContent"]["pagination_note"] == ae_cache.SLICED_CACHE_NOTE
     assert not ae_cache.payload_has_live_cursor(sliced, op=ae_cache.OP_SEARCH_LIBRARY)

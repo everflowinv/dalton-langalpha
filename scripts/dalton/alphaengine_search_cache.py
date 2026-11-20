@@ -711,7 +711,7 @@ def _locate_search_results_containers(
 
 
 STALE_CURSOR_NOTE = "缓存副本：结果未取完，但翻页游标已失效，不能续查；需要更多结果请稍后重新检索。"
-STALE_CONTINUATION_NOTE = "缓存副本：上面关于用游标或 continuation 参数续查的建议已失效；需要更多结果请稍后重新检索。"
+STALE_CONTINUATION_NOTE = "当前为缓存副本，无法续查（游标与 continuation 参数已失效）；需要更多结果请稍后重新检索。"
 
 
 def _cursor_slots(obj: Any):
@@ -780,14 +780,15 @@ def strip_cursor(payload: dict[str, Any], *, op: str) -> dict[str, Any]:
     results remain, it is marked ``cursor_unavailable = "stale"`` and gets a note to
     search again later; existing warnings are kept."""
     out = copy.deepcopy(payload)
-    more = _says_more(out) or any(
-        container.get("has_more") is True
-        for container, _, _ in _locate_all_search_results_containers(out, op=op)
-    )
+    containers = _locate_all_search_results_containers(out, op=op)
+    more = _says_more(out) or any(_says_more(container) for container, _, _ in containers)
     for slot in list(_cursor_slots(out)):
         slot["cursor"] = None
     _drop_continuations(out, more)
-    for container, _, text_block in _locate_all_search_results_containers(out, op=op):
+    for container, _, text_block in containers:
+        for slot in list(_cursor_slots(container)):
+            slot["cursor"] = None
+        _drop_continuations(container, more)
         if "cursor" in container:
             container["cursor"] = None
         if container.get("has_more") is True:
