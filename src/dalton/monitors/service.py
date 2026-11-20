@@ -1143,8 +1143,9 @@ async def _authorize_grant(grant_token: str) -> tuple[MonitorRecord, str]:
     if monitor is None:
         raise HTTPException(status_code=404, detail="监控面板不存在")
 
-    # 匿名公开入口（/monitors/public/{slug}*）沿用上游“公开内容按所有者的公开链接策略
-    # 继续提供”的规则；应用内 grant（/monitors/g/{grant}/*）对停用所有者保守拒绝。
+    # 应用内 grant（/monitors/g/{grant}/*）对停用所有者保守拒绝。匿名公开入口
+    # （/monitors/public/{slug}*）只看 visibility == "public"，不随所有者停用下线；
+    # Dalton 以 OSS 模式运行（teams 关闭），read_standing 不会返回停用。
     if (
         not is_company_system_user(monitor.owner_user_id)
         and (

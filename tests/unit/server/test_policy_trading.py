@@ -213,7 +213,7 @@ async def test_a_paper_order_call_does_not_ask(monkeypatch):
 # --- granting -------------------------------------------------------------
 
 
-async def test_connecting_with_live_orders_is_refused_and_without_is_not():
+async def test_every_brokerage_sign_in_is_refused_in_dalton():
     from src.server.services.mcp_oauth import connect
     from src.server.services.mcp_saves import BROKERAGE_DISABLED_DETAIL
 
@@ -233,29 +233,16 @@ async def test_connecting_with_live_orders_is_refused_and_without_is_not():
             assert refused.value.detail == BROKERAGE_DISABLED_DETAIL
 
 
-def _row(level: TradingPermission | None):
-    if level is None:
-        return None
-    return {
-        "level": level.value,
-        "agreement_version": TRADING_AGREEMENT_VERSION,
-        "agreed_at": None,
-        "updated_at": None,
-    }
-
-
 @pytest.mark.parametrize(
-    ("current", "requested", "refused"),
+    "requested",
     [
-        (None, TradingPermission.AUTONOMOUS, True),
-        (TradingPermission.NO_TRADING, TradingPermission.APPROVE_EACH, True),
-        (TradingPermission.APPROVE_EACH, TradingPermission.PLAN_FIRST, True),
-        (TradingPermission.AUTONOMOUS, TradingPermission.APPROVE_EACH, False),
-        (TradingPermission.AUTONOMOUS, TradingPermission.AUTONOMOUS, False),
-        (TradingPermission.AUTONOMOUS, TradingPermission.NO_TRADING, False),
+        TradingPermission.AUTONOMOUS,
+        TradingPermission.APPROVE_EACH,
+        TradingPermission.PLAN_FIRST,
+        TradingPermission.NO_TRADING,
     ],
 )
-async def test_the_trading_permission_cannot_be_raised(current, requested, refused):
+async def test_every_trading_permission_update_is_refused_in_dalton(requested):
     from src.server.app import trading_permission as route
 
     # DALTON-HOOK(hide-trading): Dalton locks trading permission to NO_TRADING and refuses all updates (403).

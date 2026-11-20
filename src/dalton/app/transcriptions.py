@@ -63,6 +63,13 @@ async def _transcription_caller_gate(
 
     has_ticket, raw_ticket = _extract_ticket_from_request(request, credentials)
     if has_ticket:
+        # `/usage` takes sessions only: refuse any ticket, valid or not, before verifying it,
+        # so an expired ticket still gets the endpoint's 403 rather than the verifier's 401.
+        if request.url.path.rstrip("/").endswith("/usage"):
+            raise HTTPException(
+                status_code=403,
+                detail="Task ticket cannot query aggregate usage reports",
+            )
         claims = verify_transcription_ticket(raw_ticket)
         ticket_uid = str(claims["user_id"])
         reject_company_system_auth(ticket_uid)
