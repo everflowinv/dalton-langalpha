@@ -4763,9 +4763,42 @@ def test_a_page_with_a_cursor_older_than_the_mcp_keeps_it_is_a_miss(tmp_path: Pa
     assert cache.get_sync("last", "b-last", 50, op=ae_cache.OP_SEARCH_LIBRARY)[0] is not None
 
 
-def test_a_stale_copy_never_carries_a_cursor() -> None:
+def test_a_stale_copy_never_carries_a_cursor_and_says_why() -> None:
     payload = _ae_results_payload(3, has_more=True, cursor="ae1:abc")
     assert ae_cache.payload_has_live_cursor(payload, op=ae_cache.OP_SEARCH_LIBRARY)
     stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_SEARCH_LIBRARY)
     assert not ae_cache.payload_has_live_cursor(stripped, op=ae_cache.OP_SEARCH_LIBRARY)
+    assert ae_cache.STALE_CURSOR_NOTE in json.dumps(stripped, ensure_ascii=False)
     assert ae_cache.payload_has_live_cursor(payload, op=ae_cache.OP_SEARCH_LIBRARY)  # original untouched
+
+
+def test_a_transcript_continuation_cursor_counts_and_is_stripped(tmp_path: Path) -> None:
+    now_box = [1000.0]
+    cache = ae_cache.AlphaEngineSearchCache(
+        tmp_path / "t.sqlite3", today_fn=lambda: "2026-11-20", now_fn=lambda: now_box[0]
+    )
+    payload = {"ok": True, "data": {"structuredContent": {"results": [{"doc_id": "1"}], "returned": 1,
+               "coverage": {"complete": False, "continuation_params": {"cursor": "ae1:xyz", "query": "q"}}}}}
+    cache.put_sync(cache_key="t", base_key="bt", op=ae_cache.OP_TRANSCRIPT, user_scope="team",
+                   req_limit=50, result_count=1, has_more=True, payload=payload, date_to="2026-11-20")
+    assert ae_cache.payload_has_live_cursor(payload, op=ae_cache.OP_TRANSCRIPT)
+    now_box[0] += ae_cache.CURSOR_SAFE_AGE_S + 1
+    assert cache.get_sync("t", "bt", 50, op=ae_cache.OP_TRANSCRIPT)[0] is None
+    stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_TRANSCRIPT)
+    assert not ae_cache.payload_has_live_cursor(stripped, op=ae_cache.OP_TRANSCRIPT)
+
+
+def test_a_sliced_old_hit_without_a_cursor_still_serves(tmp_path: Path) -> None:
+    """Slicing a large page already clears its cursor, so an old large page can still
+    answer a smaller request from cache."""
+    now_box = [1000.0]
+    cache = ae_cache.AlphaEngineSearchCache(
+        tmp_path / "s.sqlite3", today_fn=lambda: "2026-11-20", now_fn=lambda: now_box[0]
+    )
+    cache.put_sync(cache_key="k50", base_key="b", op=ae_cache.OP_SEARCH_LIBRARY, user_scope="team",
+                   req_limit=50, result_count=50, has_more=True,
+                   payload=_ae_results_payload(50, has_more=True, cursor="ae1:abc"), date_to="2026-11-20")
+    now_box[0] += ae_cache.CURSOR_SAFE_AGE_S + 60
+    hit, _ = cache.get_sync("k10", "b", 10, op=ae_cache.OP_SEARCH_LIBRARY)
+    assert hit is not None
+    assert not ae_cache.payload_has_live_cursor(hit.payload, op=ae_cache.OP_SEARCH_LIBRARY)

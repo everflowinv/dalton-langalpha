@@ -710,11 +710,29 @@ def _locate_search_results_containers(
     return matches[0] if matches else (None, None, None)
 
 
+STALE_CURSOR_NOTE = "缓存副本：结果未取完，但翻页游标已失效，不能续查；需要更多结果请稍后重新检索。"
+
+
+def _cursor_slots(obj: Any):
+    """Yield every ``(dict, "cursor")`` slot holding a cursor, at any depth.
+
+    search_library keeps it in the results container; transcript keeps it in
+    ``coverage.continuation_params``. JSON text blocks are re-serialized by callers."""
+    if isinstance(obj, dict):
+        if obj.get("cursor") not in (None, "", [], {}):
+            yield obj
+        for value in obj.values():
+            yield from _cursor_slots(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _cursor_slots(value)
+
+
 def payload_has_live_cursor(payload: dict[str, Any], *, op: str) -> bool:
-    """Whether a cached page says it has more results and carries a cursor for them."""
-    _, has_more = extract_result_metrics(payload, op=op)
-    if not has_more:
-        return False
+    """Whether *payload* carries a page cursor: in any nested dict, or in a results
+    container that only exists as a JSON text block."""
+    if any(True for _ in _cursor_slots(payload)):
+        return True
     return any(
         container.get("cursor") not in (None, "", [], {})
         for container, _, _ in _locate_all_search_results_containers(payload, op=op)
@@ -722,13 +740,21 @@ def payload_has_live_cursor(payload: dict[str, Any], *, op: str) -> bool:
 
 
 def strip_cursor(payload: dict[str, Any], *, op: str) -> dict[str, Any]:
-    """A copy of *payload* with its page cursor removed (a stale copy cannot page on)."""
+    """A copy of *payload* with every cursor removed and the paging hint replaced.
+
+    A stale copy cannot page on: the MCP dropped its cursor. ``has_more`` is kept so
+    the caller still knows the list is incomplete; the note says to search again."""
     out = copy.deepcopy(payload)
+    for slot in list(_cursor_slots(out)):
+        slot["cursor"] = None
+        if "pagination_note" in slot or "has_more" in slot:
+            slot["pagination_note"] = STALE_CURSOR_NOTE
     for container, _, text_block in _locate_all_search_results_containers(out, op=op):
         if "cursor" in container:
             container["cursor"] = None
-            if text_block is not None:
-                text_block["text"] = json.dumps(container, ensure_ascii=False)
+            container["pagination_note"] = STALE_CURSOR_NOTE
+        if text_block is not None:
+            text_block["text"] = json.dumps(container, ensure_ascii=False)
     return out
 
 
@@ -1078,13 +1104,6 @@ class AlphaEngineSearchCache:
                 if not isinstance(payload_raw, dict):
                     return None, False
 
-                if (
-                    op == OP_SEARCH_LIBRARY
-                    and now - float(row[1]) >= CURSOR_SAFE_AGE_S
-                    and payload_has_live_cursor(payload_raw, op=op)
-                ):
-                    return None, False
-
                 hit_note = ""
                 if used_slice_fallback and req_limit is not None:
                     payload = slice_cached_payload(
@@ -1093,6 +1112,11 @@ class AlphaEngineSearchCache:
                     hit_note = SLICED_CACHE_NOTE
                 else:
                     payload = copy.deepcopy(payload_raw)
+
+                # Judged on what would be returned: slicing already clears a large
+                # page's cursor, so only a page that still carries one is refreshed.
+                if now - float(row[1]) >= CURSOR_SAFE_AGE_S and payload_has_live_cursor(payload, op=op):
+                    return None, False
 
                 conn.execute("BEGIN IMMEDIATE")
                 try:

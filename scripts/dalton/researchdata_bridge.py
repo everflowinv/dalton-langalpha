@@ -10441,6 +10441,9 @@ class ResearchDataBridge:
                 ae_section["stale_reason"] = str(ae_outcome.get("stale_reason") or "quota")
                 if ae_outcome.get("cached_at"):
                     ae_section["cached_at"] = str(ae_outcome["cached_at"])
+                if not ae_section.get("cursor"):
+                    # The stale copy's cursor was dropped; paging on would restart at page 1.
+                    ae_section["next_page_hint"] = _ae_cache.STALE_CURSOR_NOTE
             if clamped_pair:
                 ae_section["limit_clamped"] = list(clamped_pair)
                 ae_section["note"] = (
