@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.dalton.import_bullbear_tracker import import_bullbear_tracker
 
 SNAP = "2026-11-09_2250.json"
@@ -394,3 +396,76 @@ def test_legacy_msft_manifest_imports_again_without_rewriting(tmp_path: Path) ->
     assert repeat["paths"]["written"] == []
     assert manifest_path.read_bytes() == frozen
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["schema"] == "msft-tracker-import/1"
+
+
+def test_import_accepts_ant_spcx_and_config_dir_tickers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.dalton import bullbear_tickers
+
+    for ticker in ("ANT", "SPCX"):
+        source = tmp_path / f"source-{ticker}"
+        workspace = tmp_path / f"ws-{ticker}"
+        workspace.mkdir()
+        _snapshot(source)
+        res = import_bullbear_tracker(source, workspace, apply=True, ticker=ticker)
+        assert res["ok"] is True
+        assert (workspace / f"research/tracker/imported-{ticker.lower()}/thesis.md").is_file()
+
+    bad_ws = tmp_path / "ws-bad"
+    bad_ws.mkdir()
+    bad_src = tmp_path / "src-bad"
+    _snapshot(bad_src)
+    rejected = import_bullbear_tracker(bad_src, bad_ws, apply=True, ticker="NVDA")
+    assert rejected["ok"] is False
+    assert rejected["conflicts"] == [{"path": "ticker", "reason": "unsupported_ticker"}]
+
+    skill_dir = tmp_path / "skill"
+    (skill_dir / "config").mkdir(parents=True)
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "config" / "NEWCO.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NEWCO",
+                "card": {
+                    "title_prefix": "📈 NEWCO 跟踪｜",
+                    "subtitle": "NewCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "NEWCO",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "newco-rules.md").write_text("# NEWCO\n", encoding="utf-8")
+    (skill_dir / "config" / "NORULES.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NORULES",
+                "card": {
+                    "title_prefix": "📈 NORULES 跟踪｜",
+                    "subtitle": "NoRules · 多空观点、盈利预测修正与催化剂",
+                    "tag": "NORULES",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bullbear_tickers, "BULLBEAR_SKILL_DIR", skill_dir)
+    newco_ws = tmp_path / "ws-newco"
+    newco_ws.mkdir()
+    newco_src = tmp_path / "src-newco"
+    _snapshot(newco_src)
+    added = import_bullbear_tracker(newco_src, newco_ws, apply=True, ticker="NEWCO")
+    assert added["ok"] is True
+    assert (newco_ws / "research/tracker/imported-newco/thesis.md").is_file()
+
+    norules_ws = tmp_path / "ws-norules"
+    (norules_ws / "research" / "tracker").mkdir(parents=True)
+    (norules_ws / "research" / "tracker" / "rules.md").write_text("# workspace override\n", encoding="utf-8")
+    norules_res = import_bullbear_tracker(newco_src, norules_ws, apply=True, ticker="NORULES")
+    assert norules_res["ok"] is False
+    assert norules_res["conflicts"] == [{"path": "ticker", "reason": "unsupported_ticker"}]

@@ -1286,9 +1286,8 @@ async def _validate_report_automation_route_entries(
     )
     from src.dalton.services.report_delivery import (
         ReportDeliveryError,
-        allowed_profiles_for_instruction,
-        infer_report_profile,
         instruction_uses_report_skill,
+        resolve_report_profile_id,
         validate_report_profile_change,
     )
     from src.server.database import automation as auto_db
@@ -1309,12 +1308,14 @@ async def _validate_report_automation_route_entries(
         if existing_parsed:
             profile_id = str(existing_parsed["profile"])
         else:
-            inferred, _ = infer_report_profile(
-                auto.get("instruction"),
-                metadata=meta,
-                name=auto.get("name"),
-            )
-            profile_id = inferred or allowed_profiles_for_instruction(auto.get("instruction"))[0]
+            try:
+                profile_id = resolve_report_profile_id(
+                    auto.get("instruction"),
+                    metadata=meta,
+                    name=auto.get("name"),
+                )
+            except ReportDeliveryError as exc:
+                raise HTTPException(status_code=400, detail=exc.message) from None
 
         feishu_targets = [t for t in targets if t.startswith("feishu:")]
         discord_dms = [t for t in targets if t.startswith("discord:user:")]

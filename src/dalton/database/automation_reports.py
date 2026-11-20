@@ -31,7 +31,8 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any
@@ -40,6 +41,7 @@ from uuid import uuid4
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
+from src.dalton.bullbear_tickers import bullbear_report_profiles
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.server.database.pool import get_db_connection
 
@@ -70,12 +72,8 @@ _UNRESOLVED_NATIVE_ITEM_STATUSES = frozenset(
     {"in_flight", "unknown", "partial", "gateway_restarted"}
 )
 _RECONCILE_LOCK_ATTEMPTS = 4
-REPORT_PROFILES = frozenset(
+_STATIC_REPORT_PROFILES = frozenset(
     {
-        "msft-tracker",
-        "meta-tracker",
-        "amzn-tracker",
-        "googl-tracker",
         "market-digest-am",
         "market-digest-pm",
         "ai-finance-daily",
@@ -98,6 +96,34 @@ REPORT_PROFILES = frozenset(
         "podcast-weekly",
     }
 )
+
+
+class _DynamicReportProfiles(AbstractSet[str]):
+    """Set view of static report profiles plus config-derived bull/bear tracker profiles."""
+
+    @classmethod
+    def _from_iterable(cls, it: Any) -> frozenset[str]:
+        return frozenset(it)
+
+    def _all(self) -> frozenset[str]:
+        return _STATIC_REPORT_PROFILES | frozenset(bullbear_report_profiles())
+
+    def __contains__(self, item: object) -> bool:
+        if item in _STATIC_REPORT_PROFILES:
+            return True
+        return item in bullbear_report_profiles()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._all())
+
+    def __len__(self) -> int:
+        return len(self._all())
+
+    def __repr__(self) -> str:
+        return repr(self._all())
+
+
+REPORT_PROFILES: AbstractSet[str] = _DynamicReportProfiles()
 MAX_CARDS = 20
 MAX_CARD_JSON_BYTES = 262144
 MAX_FAILURE_TEXT_CHARS = 2000

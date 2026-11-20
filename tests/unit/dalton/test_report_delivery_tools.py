@@ -3814,3 +3814,219 @@ async def test_sync_owner_group_chat_settings_always_includes_workspace_id() -> 
 
 async def _fake_async_return(val: Any) -> Any:
     return val
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected_profile"),
+    [
+        ("MSFT", "msft-tracker"),
+        ("META", "meta-tracker"),
+        ("AMZN", "amzn-tracker"),
+        ("GOOGL", "googl-tracker"),
+        ("ANT", "ant-tracker"),
+        ("SPCX", "spcx-tracker"),
+    ],
+)
+def test_bullbear_profile_inference_accepts_legacy_ant_and_spcx(
+    ticker: str, expected_profile: str
+) -> None:
+    inst = "完整读取并执行 dalton-bullbear-tracker/SKILL.md"
+    assert expected_profile in rd_svc.MULTI_PROFILE_SKILLS["dalton-bullbear-tracker"]
+    assert expected_profile in rd_svc.allowed_profiles_for_instruction(inst)
+
+    by_meta, _ = rd_svc.infer_report_profile(inst, metadata={"ticker": ticker})
+    assert by_meta == expected_profile
+    by_name, _ = rd_svc.infer_report_profile(inst, name=f"{ticker} 多空日跟踪")
+    assert by_name == expected_profile
+    by_inst, _ = rd_svc.infer_report_profile(f"{inst}（跟踪 {ticker}）")
+    assert by_inst == expected_profile
+    assert rd_svc.resolve_report_profile_id(inst, metadata={"ticker": ticker}) == expected_profile
+    assert rd_svc.resolve_report_profile_id(inst, requested_profile=expected_profile) == expected_profile
+
+    ambiguous, _ = rd_svc.infer_report_profile(
+        inst, metadata=None, name="MSFT 与 ANT 对比" if ticker != "MSFT" else "MSFT 与 SPCX 对比"
+    )
+    assert ambiguous is None
+
+    # Metadata ticker overrides another ticker mentioned in prose
+    other = "ANT" if ticker != "ANT" else "MSFT"
+    meta_wins, _ = rd_svc.infer_report_profile(f"{inst}（涉及 {other}）", metadata={"ticker": ticker})
+    assert meta_wins == expected_profile
+
+    # Lowercase "ant" / "Ant Group" in prose must NOT match uppercase ANT (len <= 4)
+    if ticker == "MSFT":
+        msft_with_ant_word, _ = rd_svc.infer_report_profile(
+            f"{inst}：MSFT 与 Ant Group / ant 对比", metadata=None
+        )
+        assert msft_with_ant_word == "msft-tracker"
+        only_lowercase_ant, _ = rd_svc.infer_report_profile(f"{inst}：about ant colony", metadata=None)
+        assert only_lowercase_ant is None
+
+
+def test_bullbear_delivery_supports_new_config_ticker_without_code_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.dalton import bullbear_tickers
+
+    skill_dir = tmp_path / "dalton-bullbear-tracker"
+    (skill_dir / "config").mkdir(parents=True)
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "config" / "NEWCO.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NEWCO",
+                "card": {
+                    "title_prefix": "📈 NEWCO 跟踪｜",
+                    "subtitle": "NewCo · 多空观点、盈利预测修正与催化剂",
+                    "tag": "NEWCO",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "newco-rules.md").write_text("# NEWCO\n", encoding="utf-8")
+    # Config without rules file must NOT be accepted on delivery side
+    (skill_dir / "config" / "NORULES.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NORULES",
+                "card": {
+                    "title_prefix": "📈 NORULES 跟踪｜",
+                    "subtitle": "NoRules · 多空观点、盈利预测修正与催化剂",
+                    "tag": "NORULES",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bullbear_tickers, "BULLBEAR_SKILL_DIR", skill_dir)
+
+    inst = "完整读取并执行 dalton-bullbear-tracker/SKILL.md"
+    assert rd_svc.MULTI_PROFILE_SKILLS["dalton-bullbear-tracker"] == ("newco-tracker",)
+    assert rd_svc.allowed_profiles_for_instruction(inst) == ["newco-tracker"]
+    inferred, candidates = rd_svc.infer_report_profile(inst, metadata={"ticker": "NEWCO"})
+    assert inferred == "newco-tracker"
+    assert candidates == ["newco-tracker"]
+    assert rd_svc.resolve_report_profile_id(inst) == "newco-tracker"
+
+    with pytest.raises(rd_svc.ReportDeliveryError) as exc_info:
+        rd_svc.resolve_report_profile_id(inst, requested_profile="norules-tracker")
+    assert exc_info.value.code == "invalid_profile"
+
+    # Explicit metadata ticker outside supported set must error BEFORE len(candidates)==1 fallback
+    inferred_bad, _ = rd_svc.infer_report_profile(f"{inst}（涉及 NEWCO）", metadata={"ticker": "UNKNOWN"})
+    assert inferred_bad is None
+    with pytest.raises(rd_svc.ReportDeliveryError) as missing_both:
+        rd_svc.resolve_report_profile_id(f"{inst}（涉及 NEWCO）", metadata={"ticker": "UNKNOWN"})
+    assert missing_both.value.code == "unsupported_ticker"
+    assert "config/UNKNOWN.json" in str(missing_both.value)
+    assert "references/unknown-rules.md" in str(missing_both.value)
+
+    with pytest.raises(rd_svc.ReportDeliveryError) as missing_rules:
+        rd_svc.resolve_report_profile_id(f"{inst}（涉及 NEWCO）", metadata={"ticker": "NORULES"})
+    assert missing_rules.value.code == "unsupported_ticker"
+    assert "references/norules-rules.md" in str(missing_rules.value)
+
+
+@pytest.mark.asyncio
+async def test_notify_route_update_reuses_resolve_report_profile_and_rejects_bad_ticker_or_empty_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import create_autospec
+    from fastapi import HTTPException
+    from src.dalton import bullbear_tickers
+    from src.dalton.llm import model_prefs
+    from src.server.database import automation as auto_db
+
+    skill_dir = tmp_path / "dalton-bullbear-tracker"
+    (skill_dir / "config").mkdir(parents=True)
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "config" / "NEWCO.json").write_text(
+        json.dumps(
+            {
+                "ticker": "NEWCO",
+                "card": {
+                    "title_prefix": "📈 NEWCO 跟踪｜",
+                    "subtitle": "NewCo",
+                    "tag": "NEWCO",
+                    "header_template": "blue",
+                    "tag_color": "blue",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "references" / "newco-rules.md").write_text("# NEWCO\n", encoding="utf-8")
+    monkeypatch.setattr(bullbear_tickers, "BULLBEAR_SKILL_DIR", skill_dir)
+
+    aid1 = "11111111-1111-1111-1111-111111111111"
+    aid2 = "22222222-2222-2222-2222-222222222222"
+    orig_get_auto = auto_db.get_automation
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation",
+        create_autospec(
+            orig_get_auto,
+            return_value={
+                "automation_id": aid1,
+                "name": "Tracking",
+                "instruction": "完整读取并执行 dalton-bullbear-tracker/SKILL.md",
+                "metadata": {"ticker": "UNKNOWN"},
+            },
+        ),
+    )
+
+    with pytest.raises(HTTPException) as bad_ticker_exc:
+        await model_prefs._validate_report_automation_route_entries(
+            "user-1",
+            {f"automation:{aid1}": ["feishu:chat-1"]},
+            {},
+            via_rest=False,
+            user_confirmed=True,
+        )
+    assert bad_ticker_exc.value.status_code == 400
+    assert "UNKNOWN" in str(bad_ticker_exc.value.detail)
+
+    # Empty candidates (e.g. broken skill config dir) must raise HTTPException, never IndexError
+    monkeypatch.setattr(bullbear_tickers, "BULLBEAR_SKILL_DIR", tmp_path / "missing-skill")
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation",
+        create_autospec(
+            orig_get_auto,
+            return_value={
+                "automation_id": aid2,
+                "name": "Tracking",
+                "instruction": "完整读取并执行 dalton-bullbear-tracker/SKILL.md",
+                "metadata": {},
+            },
+        ),
+    )
+    with pytest.raises(HTTPException) as empty_cand_exc:
+        await model_prefs._validate_report_automation_route_entries(
+            "user-1",
+            {f"automation:{aid2}": ["feishu:chat-1"]},
+            {},
+            via_rest=False,
+            user_confirmed=True,
+        )
+    assert empty_cand_exc.value.status_code == 400
+
+
+def test_infer_report_profile_uses_explicit_supported_ticker_even_with_multiple_skills() -> None:
+    from src.dalton.services import report_delivery
+
+    instruction = "请依次读取 dalton-bullbear-tracker/SKILL.md 和 dalton-daily-filing-alert/SKILL.md"
+    assert len(report_delivery.extract_report_skills(instruction)) == 2
+    profile, candidates = report_delivery.infer_report_profile(
+        instruction,
+        metadata={"ticker": "ant"},
+        name="Tracking",
+    )
+    assert profile == "ant-tracker"
+    assert "ant-tracker" in candidates
+    assert "daily-filing-alert" in candidates

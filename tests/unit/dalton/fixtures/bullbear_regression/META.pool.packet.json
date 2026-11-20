@@ -1,0 +1,703 @@
+{
+  "ticker": "META",
+  "run_id": "20261110-2250",
+  "since": "2026-11-07",
+  "until": "2026-11-10",
+  "snapshot_file": "data/consensus/2026-11-10_2250.json",
+  "consensus": {
+    "ok": true,
+    "status": "ok",
+    "fetched_at": "2026-11-10T22:50:00-05:00",
+    "currency": "USD",
+    "field_status": {
+      "earnings_estimate": "ok",
+      "revenue_estimate": "ok",
+      "eps_trend": "ok",
+      "eps_revisions": "ok",
+      "price_targets": "ok",
+      "price": "ok"
+    },
+    "earnings_estimate": {
+      "0y": {
+        "avg": 10.0,
+        "period_end": "2026-12-31",
+        "currency": "USD",
+        "numberOfAnalysts": 30
+      },
+      "+1y": {
+        "avg": 12.0,
+        "period_end": "2027-12-31",
+        "currency": "USD",
+        "numberOfAnalysts": 28
+      }
+    },
+    "revenue_estimate": {
+      "0y": {
+        "avg": 100000000000.0,
+        "period_end": "2026-12-31",
+        "currency": "USD",
+        "numberOfAnalysts": 30
+      },
+      "+1y": {
+        "avg": 120000000000.0,
+        "period_end": "2027-12-31",
+        "currency": "USD",
+        "numberOfAnalysts": 28
+      }
+    },
+    "eps_trend": {
+      "+1y": {
+        "current": 12.0,
+        "7daysAgo": 12.0
+      }
+    },
+    "eps_revisions": {
+      "+1y": {
+        "upLast7days": 1,
+        "downLast7Days": 0
+      }
+    },
+    "price_targets": {
+      "mean": 450.0
+    },
+    "price": {
+      "as_of": "2026-11-10",
+      "close": 400.0,
+      "chg_1d_pct": 1.2,
+      "chg_5d_pct": 2.5,
+      "benchmark": "QQQ",
+      "bench_chg_1d_pct": 0.4,
+      "bench_chg_5d_pct": 1.0
+    }
+  },
+  "implied_model": {
+    "assumptions": {
+      "diluted_shares_bn": 2.56,
+      "tax_rate": 0.16,
+      "other_income_bn": {
+        "0y": 0,
+        "+1y": 0
+      },
+      "source": "2Q26 8-K 附件 99.1：净利润 158.48 亿美元 / 稀释 EPS 6.18 美元 ≈ 25.6 亿股；有效税率 16%；经营利润 187.75 亿与税前 187.56 亿几乎相等，其他收入按 0",
+      "applicable_years": [
+        {
+          "key": "0y",
+          "fiscal_year": "FY2026",
+          "period_end_prefix": "2026-12",
+          "other_income_bn": 0
+        },
+        {
+          "key": "+1y",
+          "fiscal_year": "FY2027",
+          "period_end_prefix": "2027-12",
+          "other_income_bn": 0
+        }
+      ],
+      "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿美元。其他收入只用于来源写明的财年末。"
+    },
+    "periods": {
+      "0y": {
+        "label": "本财年",
+        "status": "ok",
+        "period_end": "2026-12-31",
+        "fiscal_year": "FY2026",
+        "other_income_key": "0y",
+        "other_income_bn": 0.0,
+        "consensus_revenue_bn": 100.0,
+        "consensus_eps": 10.0,
+        "implied_pretax_bn": 30.5,
+        "implied_total_expenses_bn": 69.5,
+        "implied_op_margin_pct": 30.5,
+        "eps_per_10bn_expense": -3.28,
+        "eps_per_1pct_revenue_no_cost": 0.33
+      },
+      "+1y": {
+        "label": "下一财年",
+        "status": "ok",
+        "period_end": "2027-12-31",
+        "fiscal_year": "FY2027",
+        "other_income_key": "+1y",
+        "other_income_bn": 0.0,
+        "consensus_revenue_bn": 120.0,
+        "consensus_eps": 12.0,
+        "implied_pretax_bn": 36.6,
+        "implied_total_expenses_bn": 83.4,
+        "implied_op_margin_pct": 30.5,
+        "eps_per_10bn_expense": -3.28,
+        "eps_per_1pct_revenue_no_cost": 0.39
+      }
+    },
+    "0y": {
+      "label": "本财年",
+      "status": "ok",
+      "period_end": "2026-12-31",
+      "fiscal_year": "FY2026",
+      "other_income_key": "0y",
+      "other_income_bn": 0.0,
+      "consensus_revenue_bn": 100.0,
+      "consensus_eps": 10.0,
+      "implied_pretax_bn": 30.5,
+      "implied_total_expenses_bn": 69.5,
+      "implied_op_margin_pct": 30.5,
+      "eps_per_10bn_expense": -3.28,
+      "eps_per_1pct_revenue_no_cost": 0.33
+    },
+    "+1y": {
+      "label": "下一财年",
+      "status": "ok",
+      "period_end": "2027-12-31",
+      "fiscal_year": "FY2027",
+      "other_income_key": "+1y",
+      "other_income_bn": 0.0,
+      "consensus_revenue_bn": 120.0,
+      "consensus_eps": 12.0,
+      "implied_pretax_bn": 36.6,
+      "implied_total_expenses_bn": 83.4,
+      "implied_op_margin_pct": 30.5,
+      "eps_per_10bn_expense": -3.28,
+      "eps_per_1pct_revenue_no_cost": 0.39
+    }
+  },
+  "deltas": {
+    "eps_0q_vs_7d_pct": null,
+    "eps_0q_vs_30d_pct": null,
+    "eps_+1q_vs_7d_pct": null,
+    "eps_+1q_vs_30d_pct": null,
+    "eps_0y_vs_7d_pct": null,
+    "eps_0y_vs_30d_pct": null,
+    "eps_+1y_vs_7d_pct": 0.0,
+    "eps_+1y_vs_30d_pct": null,
+    "fy1_revisions_7d": {
+      "up": 1,
+      "down": 0
+    }
+  },
+  "auto_flags": [
+    "发现 1 份新 SEC filing"
+  ],
+  "thresholds": {
+    "eps_fy1_vs_last_pct": 1.0,
+    "eps_fy1_vs_7d_pct": 2.0,
+    "rev_fy1_or_q1_vs_last_pct": 0.7,
+    "target_price_vs_last_pct": 2.0,
+    "down_revisions_7d_min": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0,
+    "any_new_sec_filing": true
+  },
+  "internal": {
+    "status": {
+      "tmtb": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 1,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "tmtb",
+          "operation": "search",
+          "query": "Meta META Zuckerberg Muse Instagram WhatsApp Hyperion Prometheus",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "sales-notes": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "sales-notes",
+          "operation": "search",
+          "query": "Meta META Zuckerberg Muse Instagram WhatsApp Hyperion Prometheus",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "funda-ai": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "funda-ai",
+          "operation": "search",
+          "query": "Meta META Zuckerberg Muse Instagram WhatsApp Hyperion Prometheus",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "company-wiki": {
+        "operation": "list",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 100,
+        "read_cap": 12,
+        "request": {
+          "route": "company-wiki",
+          "operation": "list",
+          "limit": 100,
+          "params": {
+            "indexed_since": "2026-11-07",
+            "media": "text"
+          }
+        },
+        "pending_reads": []
+      }
+    },
+    "new": {
+      "tmtb:meta-1": {
+        "route": "tmtb",
+        "title": "META Note",
+        "date": "2026-11-10",
+        "indexed_at": null,
+        "from": null,
+        "location": null,
+        "score": 2,
+        "owned": false,
+        "queries": [
+          "alias-keyword"
+        ],
+        "chars": 28,
+        "read_pages": 1,
+        "alias_hits": 1,
+        "excerpt": "Meta revenue growth update.",
+        "excerpt_chars": 27,
+        "analyzed": true,
+        "excerpt_file": "research/tracker/20261110-2250/excerpts/tmtb_meta-1.txt"
+      }
+    },
+    "irrelevant": {},
+    "pending": {},
+    "withheld": {}
+  },
+  "alphaengine": {
+    "status": [
+      {
+        "query": "Meta Platforms",
+        "ok": true,
+        "returned": 1,
+        "has_more": false,
+        "incomplete": false,
+        "cursor": null,
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "error": null,
+        "request": {
+          "route": "alphaengine",
+          "operation": "search_library",
+          "query": "Meta Platforms",
+          "start": "2026-11-04",
+          "end": "2026-11-10",
+          "limit": 20,
+          "params": {
+            "sort": "relevance"
+          }
+        }
+      },
+      {
+        "query": "Meta 脸书 Muse",
+        "ok": true,
+        "returned": 1,
+        "has_more": false,
+        "incomplete": false,
+        "cursor": null,
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "error": null,
+        "request": {
+          "route": "alphaengine",
+          "operation": "search_library",
+          "query": "Meta 脸书 Muse",
+          "start": "2026-11-04",
+          "end": "2026-11-10",
+          "limit": 20,
+          "params": {
+            "sort": "relevance"
+          }
+        }
+      }
+    ],
+    "new": {
+      "alphaengine:ae-meta-1": {
+        "title": "META AE Report",
+        "publish_time": "2026-11-10",
+        "sources": null,
+        "document_code": null,
+        "companies": [
+          "Meta Platforms, Inc."
+        ],
+        "snippet": "",
+        "reference_url": null,
+        "source_attribution": null,
+        "query": "Meta Platforms"
+      }
+    }
+  },
+  "sec": {
+    "status": [
+      {
+        "form": "8-K",
+        "ok": true,
+        "count": 1,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "8-K",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "10-Q",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "10-Q",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "10-K",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "10-K",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "S-3ASR",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "S-3ASR",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "424B2",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "424B2",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "424B5",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "424B5",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "FWP",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "META",
+          "form": "FWP",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      }
+    ],
+    "new": {
+      "sec:0000000001-26-000001": {
+        "form": "8-K",
+        "filing_date": "2026-11-10",
+        "report_date": null,
+        "accession": "0000000001-26-000001"
+      }
+    }
+  },
+  "x": {
+    "status": [
+      {
+        "query": "$META min_faves:150 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 1,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "$META min_faves:150 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "query": "$META (capex OR opex OR EPS OR estimates OR guidance OR margin OR FCF OR multiple OR valuation OR Muse) min_faves:40 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 1,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "$META (capex OR opex OR EPS OR estimates OR guidance OR margin OR FCF OR multiple OR valuation OR Muse) min_faves:40 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "query": "(Meta OR Zuckerberg) (capex OR opex OR \"free cash flow\" OR depreciation OR Muse) (estimates OR EPS OR margin OR ROI OR revenue) min_faves:60 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 1,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "(Meta OR Zuckerberg) (capex OR opex OR \"free cash flow\" OR depreciation OR Muse) (estimates OR EPS OR margin OR ROI OR revenue) min_faves:60 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "pool": "@Analyst1",
+        "operation": "tweets",
+        "ok": true,
+        "count": 1,
+        "kept": 1,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "tweets",
+          "handle": "@Analyst1",
+          "since": "2026-11-07",
+          "until": "2026-11-11",
+          "count": 20
+        }
+      }
+    ],
+    "new": {
+      "x:x-meta-pool": {
+        "url": "https://x.com/@Analyst1/status/x-meta-pool",
+        "created_at": "2026-11-10T13:00:00-05:00",
+        "author": "@Analyst1",
+        "author_name": null,
+        "followers": null,
+        "bio": null,
+        "bookmarks": null,
+        "profile_source": "unavailable",
+        "profile_fetched_at": null,
+        "in_pool": true,
+        "via": "pool",
+        "likes": 80,
+        "reposts": 8,
+        "replies": 2,
+        "views": 300,
+        "fund_hits": 0,
+        "engagement": 104,
+        "is_reply": null,
+        "text": "$META cloud channel check"
+      },
+      "x:x-meta-1": {
+        "url": "https://x.com/analyst1/status/x-meta-1",
+        "created_at": "2026-11-10T12:00:00-05:00",
+        "author": "analyst1",
+        "author_name": null,
+        "followers": null,
+        "bio": null,
+        "bookmarks": null,
+        "profile_source": "unavailable",
+        "profile_fetched_at": null,
+        "in_pool": false,
+        "via": "search",
+        "likes": 50,
+        "reposts": 5,
+        "replies": 1,
+        "views": 100,
+        "fund_hits": 2,
+        "engagement": 65,
+        "is_reply": null,
+        "text": "$META EPS and revenue beat"
+      }
+    },
+    "noise_ids": [],
+    "pool_size": 1,
+    "queries": [
+      "$META min_faves:150 -filter:replies",
+      "$META (capex OR opex OR EPS OR estimates OR guidance OR margin OR FCF OR multiple OR valuation OR Muse) min_faves:40 -filter:replies",
+      "(Meta OR Zuckerberg) (capex OR opex OR \"free cash flow\" OR depreciation OR Muse) (estimates OR EPS OR margin OR ROI OR revenue) min_faves:60 -filter:replies"
+    ],
+    "outside_window": 0,
+    "unprocessed_upstream": false,
+    "profile_followup": [
+      {
+        "handle": "@Analyst1",
+        "id": "x:x-meta-pool",
+        "reason": "本地作者缓存没有这个账号"
+      },
+      {
+        "handle": "analyst1",
+        "id": "x:x-meta-1",
+        "reason": "本地作者缓存没有这个账号"
+      }
+    ],
+    "failures": [],
+    "metrics_note": "likes、reposts、replies、views 按 x-timeline 归一化结果保存；bookmarks 上游没有返回，记为 null，排序只用 likes+3*reposts。",
+    "note": "专业投资人观点作多空论据，权重低于 TMTB、卖方邮件和 AlphaEngine；券商动作和公司数字回原始来源核对。"
+  },
+  "news": {
+    "status": "pending_agent_search",
+    "queries": [
+      "Meta Platforms analyst estimates price target downgrade upgrade",
+      "Meta Platforms Muse capex financing regulation news"
+    ],
+    "since": "2026-11-07",
+    "until": "2026-11-10",
+    "requires_original_fetch": true
+  },
+  "failed_sources": [],
+  "short_circuit_eligible": false,
+  "collected_at": "2026-11-10T22:50:00-05:00",
+  "internal_since": "2026-11-07",
+  "internal_retry_since": null,
+  "meta_ae_state": {
+    "queries": [
+      {
+        "query": "Meta Platforms",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "cursor": null,
+        "has_more": false,
+        "complete": true,
+        "covered_until": "2026-11-10",
+        "ok": true,
+        "returned": 1,
+        "error": null,
+        "resumed_cursor": null
+      },
+      {
+        "query": "Meta 脸书 Muse",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "cursor": null,
+        "has_more": false,
+        "complete": true,
+        "covered_until": "2026-11-10",
+        "ok": true,
+        "returned": 1,
+        "error": null,
+        "resumed_cursor": null
+      }
+    ]
+  },
+  "limits": {
+    "internal_limit": 60,
+    "internal_read_cap_per_route": 12,
+    "internal_pages": 5,
+    "read_pages": 20,
+    "excerpt_max": 6000,
+    "ae_max_searches": 2,
+    "ae_limit": 20,
+    "sec_limit": 3,
+    "x_search_count": 40,
+    "x_timeline_count": 20,
+    "x_pool_max": 25,
+    "x_keep_max": 30,
+    "x_enrich_max": 20
+  },
+  "collection_complete": true
+}

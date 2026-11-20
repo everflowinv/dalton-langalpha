@@ -1,0 +1,526 @@
+{
+  "ticker": "AMZN",
+  "run_id": "20261110-2250",
+  "since": "2026-11-07",
+  "until": "2026-11-10",
+  "snapshot_file": "data/consensus/2026-11-10_2250.json",
+  "consensus": {
+    "ok": true,
+    "status": "partial",
+    "fetched_at": "2026-11-10T22:50:00-05:00",
+    "currency": "USD",
+    "field_status": {
+      "earnings_estimate": "empty",
+      "revenue_estimate": "empty",
+      "eps_trend": "ok",
+      "eps_revisions": "ok",
+      "price_targets": "empty",
+      "price": "ok"
+    },
+    "earnings_estimate": {
+      "+1y": {
+        "avg": null,
+        "low": null,
+        "high": null,
+        "numberOfAnalysts": 0
+      }
+    },
+    "revenue_estimate": {},
+    "eps_trend": {
+      "+1y": {
+        "current": 12.5,
+        "7daysAgo": 10.0
+      }
+    },
+    "eps_revisions": {
+      "+1y": {
+        "upLast7days": 0,
+        "downLast7Days": 7
+      }
+    },
+    "price_targets": {},
+    "price": {
+      "as_of": "2026-11-10",
+      "close": 400.0,
+      "chg_1d_pct": 0.5,
+      "chg_5d_pct": 1.0,
+      "benchmark": "QQQ",
+      "bench_chg_1d_pct": 0.2,
+      "bench_chg_5d_pct": 0.5
+    }
+  },
+  "implied_model": {
+    "assumptions": {
+      "diluted_shares_bn": 10.95,
+      "tax_rate": 0.2,
+      "other_income_bn": {
+        "0y": 69.1,
+        "+1y": 0
+      },
+      "source": "2Q26 10-Q（accession 0001018724-26-000026）：Q2 稀释股数 109.0 亿，上半年其他收入 690.6 亿（Anthropic 优先股重估 628 亿等）；FY2025 10-K 有效税率 19.6%。Yahoo 0y=FY2026（含上半年 Anthropic 重估收益）、+1y=FY2027；一致 EPS 为 GAAP，H2 与 FY27 基本不含投资收益",
+      "applicable_years": [
+        {
+          "key": "0y",
+          "fiscal_year": "FY2026",
+          "period_end_prefix": "2026-12",
+          "other_income_bn": 69.1
+        },
+        {
+          "key": "+1y",
+          "fiscal_year": "FY2027",
+          "period_end_prefix": "2027-12",
+          "other_income_bn": 0
+        }
+      ],
+      "note": "隐含总费用 = 一致收入 − EPS×股数/(1−税率) + 其他收入；单位十亿美元。其他收入只用于来源写明的财年末。"
+    },
+    "periods": {
+      "0y": {
+        "label": "本财年",
+        "status": "missing_period",
+        "reason": "0y 缺少 period_end，无法确认财年，未计算隐含费用"
+      },
+      "+1y": {
+        "label": "下一财年",
+        "status": "missing_period",
+        "reason": "+1y 缺少 period_end，无法确认财年，未计算隐含费用"
+      }
+    }
+  },
+  "deltas": {
+    "eps_0q_vs_7d_pct": null,
+    "eps_0q_vs_30d_pct": null,
+    "eps_+1q_vs_7d_pct": null,
+    "eps_+1q_vs_30d_pct": null,
+    "eps_0y_vs_7d_pct": null,
+    "eps_0y_vs_30d_pct": null,
+    "eps_+1y_vs_7d_pct": 25.0,
+    "eps_+1y_vs_30d_pct": null,
+    "fy1_revisions_7d": {
+      "up": 0,
+      "down": 7
+    }
+  },
+  "auto_flags": [
+    "下一财年(+1y) EPS 较 7 天前 +25.00%（阈值 ±2.0%）",
+    "下一财年 EPS 近 7 天下调 7 家（阈值 >=5 家）"
+  ],
+  "thresholds": {
+    "eps_fy1_vs_last_pct": 1.0,
+    "eps_fy1_vs_7d_pct": 2.0,
+    "rev_fy1_or_q1_vs_last_pct": 0.7,
+    "target_price_vs_last_pct": 2.0,
+    "down_revisions_7d_min": 5,
+    "price_1d_pct": 4.0,
+    "price_5d_pct": 8.0,
+    "any_new_sec_filing": true
+  },
+  "internal": {
+    "status": {
+      "tmtb": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "tmtb",
+          "operation": "search",
+          "query": "Amazon AMZN AWS Jassy Trainium Bedrock Kuiper Garman Rufus",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "sales-notes": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "sales-notes",
+          "operation": "search",
+          "query": "Amazon AMZN AWS Jassy Trainium Bedrock Kuiper Garman Rufus",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "funda-ai": {
+        "operation": "keyword-search",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 60,
+        "read_cap": 12,
+        "request": {
+          "route": "funda-ai",
+          "operation": "search",
+          "query": "Amazon AMZN AWS Jassy Trainium Bedrock Kuiper Garman Rufus",
+          "start": "2026-11-07",
+          "end": "2026-11-10",
+          "limit": 60,
+          "params": {
+            "media": "text",
+            "search_mode": "keyword"
+          }
+        },
+        "pending_reads": []
+      },
+      "company-wiki": {
+        "operation": "list",
+        "ok": true,
+        "status": "ok",
+        "returned": 0,
+        "pages": 1,
+        "incomplete": false,
+        "error": null,
+        "warnings": [],
+        "limit": 100,
+        "read_cap": 12,
+        "request": {
+          "route": "company-wiki",
+          "operation": "list",
+          "limit": 100,
+          "params": {
+            "indexed_since": "2026-11-07",
+            "media": "text"
+          }
+        },
+        "pending_reads": []
+      }
+    },
+    "new": {},
+    "irrelevant": {},
+    "pending": {},
+    "withheld": {}
+  },
+  "alphaengine": {
+    "status": [
+      {
+        "query": "Amazon AWS Trainium capex retail margin",
+        "ok": true,
+        "returned": 0,
+        "has_more": false,
+        "incomplete": false,
+        "cursor": null,
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "error": null,
+        "request": {
+          "route": "alphaengine",
+          "operation": "search_library",
+          "query": "Amazon AWS Trainium capex retail margin",
+          "start": "2026-11-04",
+          "end": "2026-11-10",
+          "limit": 20,
+          "params": {
+            "sort": "relevance"
+          }
+        }
+      },
+      {
+        "query": "亚马逊 AWS 云 资本开支 零售利润率",
+        "ok": true,
+        "returned": 0,
+        "has_more": false,
+        "incomplete": false,
+        "cursor": null,
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "error": null,
+        "request": {
+          "route": "alphaengine",
+          "operation": "search_library",
+          "query": "亚马逊 AWS 云 资本开支 零售利润率",
+          "start": "2026-11-04",
+          "end": "2026-11-10",
+          "limit": 20,
+          "params": {
+            "sort": "relevance"
+          }
+        }
+      }
+    ],
+    "new": {}
+  },
+  "sec": {
+    "status": [
+      {
+        "form": "8-K",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "8-K",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "10-Q",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "10-Q",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "10-K",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "10-K",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "S-3ASR",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "S-3ASR",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "424B2",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "424B2",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "424B5",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "424B5",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      },
+      {
+        "form": "FWP",
+        "ok": true,
+        "count": 0,
+        "incomplete": false,
+        "status": "ok",
+        "error": null,
+        "request": {
+          "route": "sec",
+          "operation": "list-filings",
+          "ticker": "AMZN",
+          "form": "FWP",
+          "limit": 3
+        },
+        "floor": "2026-11-05"
+      }
+    ],
+    "new": {}
+  },
+  "x": {
+    "status": [
+      {
+        "query": "$AMZN min_faves:150 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 0,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "$AMZN min_faves:150 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "query": "$AMZN (AWS OR capex OR Trainium OR EPS OR estimates OR margin OR backlog OR retail OR advertising OR Anthropic) min_faves:40 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 0,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "$AMZN (AWS OR capex OR Trainium OR EPS OR estimates OR margin OR backlog OR retail OR advertising OR Anthropic) min_faves:40 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      },
+      {
+        "query": "(Amazon OR AWS OR Jassy) (capex OR backlog OR Trainium OR \"operating margin\" OR \"free cash flow\") (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies",
+        "operation": "search",
+        "ok": true,
+        "count": 0,
+        "has_more": false,
+        "request": {
+          "route": "x-timeline",
+          "operation": "search",
+          "query": "(Amazon OR AWS OR Jassy) (capex OR backlog OR Trainium OR \"operating margin\" OR \"free cash flow\") (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies",
+          "since": "2026-11-07",
+          "until": "2026-11-12",
+          "count": 40
+        }
+      }
+    ],
+    "new": {},
+    "noise_ids": [],
+    "pool_size": 0,
+    "queries": [
+      "$AMZN min_faves:150 -filter:replies",
+      "$AMZN (AWS OR capex OR Trainium OR EPS OR estimates OR margin OR backlog OR retail OR advertising OR Anthropic) min_faves:40 -filter:replies",
+      "(Amazon OR AWS OR Jassy) (capex OR backlog OR Trainium OR \"operating margin\" OR \"free cash flow\") (EPS OR estimates OR margin OR growth OR guide) min_faves:60 -filter:replies"
+    ],
+    "outside_window": 0,
+    "unprocessed_upstream": false,
+    "profile_followup": [],
+    "failures": [],
+    "metrics_note": "likes、reposts、replies、views 按 x-timeline 归一化结果保存；bookmarks 上游没有返回，记为 null，排序只用 likes+3*reposts。",
+    "note": "专业投资人观点作多空论据，权重低于 TMTB、卖方邮件和 AlphaEngine；券商动作和公司数字回原始来源核对。"
+  },
+  "news": {
+    "status": "pending_agent_search",
+    "queries": [
+      "Amazon analyst estimates price target downgrade upgrade AWS",
+      "Amazon AWS Trainium Anthropic capex Kuiper retail news"
+    ],
+    "since": "2026-11-07",
+    "until": "2026-11-10",
+    "requires_original_fetch": true
+  },
+  "failed_sources": [
+    {
+      "source": "estimates",
+      "error": "partial: field_status={\"earnings_estimate\": \"empty\", \"revenue_estimate\": \"empty\", \"eps_trend\": \"ok\", \"eps_revisions\": \"ok\", \"price_targets\": \"empty\", \"price\": \"ok\"}"
+    }
+  ],
+  "short_circuit_eligible": false,
+  "collected_at": "2026-11-10T22:50:00-05:00",
+  "internal_since": "2026-11-07",
+  "internal_retry_since": null,
+  "amzn_ae_state": {
+    "queries": [
+      {
+        "query": "Amazon AWS Trainium capex retail margin",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "cursor": null,
+        "has_more": false,
+        "complete": true,
+        "covered_until": "2026-11-10",
+        "ok": true,
+        "returned": 0,
+        "error": null,
+        "resumed_cursor": null
+      },
+      {
+        "query": "亚马逊 AWS 云 资本开支 零售利润率",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-11-10"
+        },
+        "cursor": null,
+        "has_more": false,
+        "complete": true,
+        "covered_until": "2026-11-10",
+        "ok": true,
+        "returned": 0,
+        "error": null,
+        "resumed_cursor": null
+      }
+    ]
+  },
+  "limits": {
+    "internal_limit": 60,
+    "internal_read_cap_per_route": 12,
+    "internal_pages": 5,
+    "read_pages": 20,
+    "excerpt_max": 6000,
+    "ae_max_searches": 2,
+    "ae_limit": 20,
+    "sec_limit": 3,
+    "x_search_count": 40,
+    "x_timeline_count": 20,
+    "x_pool_max": 25,
+    "x_keep_max": 30,
+    "x_enrich_max": 20
+  },
+  "collection_complete": true
+}
