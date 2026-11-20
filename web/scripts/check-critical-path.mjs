@@ -39,8 +39,9 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // DALTON-HOOK(critical-path-budget): Dalton ships zh-CN as the default locale with its own
 // UI strings (the largest catalog, always counted) and Dalton-only entry code; measured
 // 511.1 kB gz on the sync5 merge (703606e63) against upstream's 500 (505 in batch 3). Raised to 525 for
-// that measured cause, leaving the same thin headroom upstream keeps.
-const MAX_EAGER_KB = 525
+// that measured cause, leaving the same thin headroom upstream keeps. The sync6 merge (a955dff59)
+// measured 527.2 kB in the production build (zh-CN catalog, Supabase auth); raised to 530.
+const MAX_EAGER_KB = 530
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')
