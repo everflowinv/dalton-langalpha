@@ -739,23 +739,68 @@ def payload_has_live_cursor(payload: dict[str, Any], *, op: str) -> bool:
     )
 
 
+def cursor_unavailable_reason(obj: Any) -> str:
+    """``"stale"`` or ``"sliced"`` when a served page has more results but no cursor to
+    reach them (set by :func:`strip_cursor` / :func:`slice_cached_payload`), else ``""``."""
+    if isinstance(obj, dict):
+        reason = obj.get("cursor_unavailable")
+        if reason in ("stale", "sliced"):
+            return reason
+        for value in obj.values():
+            found = cursor_unavailable_reason(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = cursor_unavailable_reason(value)
+            if found:
+                return found
+    return ""
+
+
+def cursor_unavailable_note(reason: str) -> str:
+    return SLICED_CACHE_NOTE if reason == "sliced" else STALE_CURSOR_NOTE
+
+
 def strip_cursor(payload: dict[str, Any], *, op: str) -> dict[str, Any]:
-    """A copy of *payload* with every cursor removed and the paging hint replaced.
+    """A copy of *payload* with every cursor and continuation removed.
 
     A stale copy cannot page on: the MCP dropped its cursor. ``has_more`` is kept so
-    the caller still knows the list is incomplete; the note says to search again."""
+    the caller still knows the list is incomplete; pages that have more results get
+    ``cursor_unavailable = "stale"``, which the bridge turns into "search again later"."""
     out = copy.deepcopy(payload)
+    _, has_more = extract_result_metrics(out, op=op)
     for slot in list(_cursor_slots(out)):
         slot["cursor"] = None
-        if "pagination_note" in slot or "has_more" in slot:
-            slot["pagination_note"] = STALE_CURSOR_NOTE
+    _drop_continuations(out)
     for container, _, text_block in _locate_all_search_results_containers(out, op=op):
         if "cursor" in container:
             container["cursor"] = None
+        container.pop("pagination_note", None)
+        if has_more:
+            container["cursor_unavailable"] = "stale"
             container["pagination_note"] = STALE_CURSOR_NOTE
         if text_block is not None:
             text_block["text"] = json.dumps(container, ensure_ascii=False)
+    if has_more:
+        out["cursor_unavailable"] = "stale"
     return out
+
+
+def _drop_continuations(obj: Any) -> None:
+    """Remove transcript ``continuation_params`` and the warnings that point at them."""
+    if isinstance(obj, dict):
+        if "continuation_params" in obj:
+            obj.pop("continuation_params", None)
+            warnings = obj.get("warnings")
+            if isinstance(warnings, list):
+                obj["warnings"] = [w for w in warnings if "续" not in str(w) and "continuation" not in str(w)]
+                obj["warnings"].append(STALE_CURSOR_NOTE)
+        for value in obj.values():
+            _drop_continuations(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            _drop_continuations(value)
 
 
 def extract_result_metrics(payload: dict[str, Any], *, op: str) -> tuple[int, bool]:
@@ -831,6 +876,8 @@ def slice_cached_payload(
             if truncated_any and "cursor" in container:
                 # Never fabricate a cursor; stale end-of-larger-page cursor is cleared.
                 container["cursor"] = None
+                container["cursor_unavailable"] = "sliced"
+                container["pagination_note"] = SLICED_CACHE_NOTE
 
         if text_block is not None:
             text_block["text"] = json.dumps(container, ensure_ascii=False)
