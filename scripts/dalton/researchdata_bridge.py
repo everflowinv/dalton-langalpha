@@ -6173,11 +6173,10 @@ def _apply_error_and_empty_contract(
         if has_more_flag and isinstance(results_list, list) and len(results_list) == 0:
             if str(payload.get("status") or "").strip().lower() in ("empty", "no_match", ""):
                 payload["status"] = "ok"
-            unavailable = _ae_cache.cursor_unavailable_reason(payload)
             payload.setdefault(
                 "hint",
-                _ae_cache.cursor_unavailable_note(unavailable)
-                if unavailable
+                _ae_cache.STALE_CURSOR_NOTE
+                if _ae_cache.cursor_unavailable_reason(payload)
                 else "当前页返回 results=[] 但 has_more=true（后续页仍有数据），请继续携带返回的 cursor（或 next_page）翻页，不得判为无匹配记录。",
             )
 
@@ -10455,8 +10454,8 @@ class ResearchDataBridge:
             # nothing more -> no hint.
             if not ae_section.get("cursor"):
                 if ae_section.get("has_more"):
-                    ae_section["next_page_hint"] = _ae_cache.cursor_unavailable_note(
-                        _ae_cache.cursor_unavailable_reason(ae_outcome) or "stale"
+                    ae_section["next_page_hint"] = (
+                        _ae_cache.STALE_CURSOR_NOTE if ae_outcome.get("stale") else _ae_cache.SLICED_CACHE_NOTE
                     )
                 else:
                     ae_section.pop("next_page_hint", None)

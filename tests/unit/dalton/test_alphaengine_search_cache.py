@@ -4811,17 +4811,20 @@ def test_cursorless_pages_say_why_and_complete_pages_say_nothing() -> None:
     complete = ae_cache.strip_cursor(_ae_results_payload(3), op=op)
     assert ae_cache.cursor_unavailable_reason(complete) == ""
     assert ae_cache.STALE_CURSOR_NOTE not in json.dumps(complete, ensure_ascii=False)
-    sliced = ae_cache.slice_cached_payload(
-        _ae_results_payload(50, has_more=True, cursor="ae1:x"), op=op, target_limit=10
-    )
-    assert ae_cache.cursor_unavailable_reason(sliced) == "sliced"
-    assert ae_cache.cursor_unavailable_note("sliced") == ae_cache.SLICED_CACHE_NOTE
 
 
-def test_a_stale_transcript_drops_its_continuation_and_the_warning_pointing_at_it() -> None:
-    payload = {"ok": True, "data": {"coverage": {"complete": False, "warnings": ["可用 continuation 续查"],
+def test_a_stale_transcript_drops_its_continuation_and_keeps_its_warnings() -> None:
+    payload = {"ok": True, "data": {"coverage": {"complete": False, "warnings": ["后续检索页失败，当前结果不完整"],
                "continuation_params": {"cursor": "ae1:xyz", "query": "q"}}}}
     stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_TRANSCRIPT)
     cov = stripped["data"]["coverage"]
     assert "continuation_params" not in cov
-    assert cov["warnings"] == [ae_cache.STALE_CURSOR_NOTE]
+    assert cov["warnings"] == ["后续检索页失败，当前结果不完整", ae_cache.STALE_CURSOR_NOTE]
+    assert ae_cache.cursor_unavailable_reason(stripped) == "stale"
+
+
+def test_a_complete_stale_transcript_is_not_called_incomplete() -> None:
+    payload = {"ok": True, "data": {"coverage": {"complete": True, "warnings": []}, "transcripts": [{"doc_id": "1"}]}}
+    stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_TRANSCRIPT)
+    assert ae_cache.cursor_unavailable_reason(stripped) == ""
+    assert ae_cache.STALE_CURSOR_NOTE not in json.dumps(stripped, ensure_ascii=False)
