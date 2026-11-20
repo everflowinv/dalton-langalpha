@@ -67,6 +67,8 @@ class OwedResume:
     tasks: Sequence[StoppedTask] = ()
     #: The interrupted run, when its input never reached the graph.
     retry_run_id: Optional[str] = None
+    # DALTON-HOOK(automation-subscription-fallback): interrupted turn's automation execution id
+    automation_execution_id: Optional[str] = None
 
     @property
     def report_source(self) -> None:
@@ -108,7 +110,11 @@ def resume_turn(owed: OwedResume, request_key: str) -> tuple[str, dict]:
     it never reached the graph, with the subagents the restart stopped as
     a directive beside it, else the hidden message."""
     if owed.retry_run_id is None:
-        return message_turn(owed, request_key)
+        route, body = message_turn(owed, request_key)
+        # DALTON-HOOK(automation-subscription-fallback): carry interrupted execution link on restart resume
+        if owed.automation_execution_id:
+            body["automation_delivery"] = {"id": owed.automation_execution_id}
+        return route, body
     body = {
         "run_id": owed.retry_run_id,
         "workspace_id": owed.workspace_id,
@@ -177,12 +183,19 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         retry_run_id = str(run_id)
     if not interrupted and not tasks:
         return NotOwed("nothing the restart stopped is left", wake=False)
+    # DALTON-HOOK(automation-subscription-fallback): carry interrupted run's execution link on restart resume
+    meta = state.get("metadata") or {}
+    raw_exec_id = meta.get("automation_execution_id")
+    if not raw_exec_id and isinstance(meta.get("automation_delivery"), Mapping):
+        raw_exec_id = meta["automation_delivery"].get("id")
+    execution_id = str(raw_exec_id).strip() if raw_exec_id else None
     return OwedResume(
         user_id=str(state["user_id"]),
         workspace_id=str(state["workspace_id"]),
         interrupted=interrupted,
         tasks=tuple(tasks),
         retry_run_id=retry_run_id,
+        automation_execution_id=execution_id or None,
     )
 
 

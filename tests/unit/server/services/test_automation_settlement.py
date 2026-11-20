@@ -1634,27 +1634,99 @@ def _dalton_automation(trigger: str = "cron") -> dict:
     }
 
 
+# DALTON-HOOK(automation-subscription-fallback): generic non-completed settlement
+# (timeout sweep, PRECHECK_SKIPPED, INTERRUPTED, or unflagged FAILED) does not
+# release signals; only executor's synchronous pre-START 'failed' path releases.
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "outcome",
     [Outcome.FAILED, Outcome.PRECHECK_SKIPPED, Outcome.TIMEOUT, Outcome.INTERRUPTED],
 )
-async def test_dalton_non_completed_settlement_releases_claimed_signals(
+async def test_dalton_generic_non_completed_settlement_does_not_release_claimed_signals(
     outcome: Outcome,
 ) -> None:
     from src.dalton.database import watch as watch_db
 
     release_mock = create_autospec(watch_db.release_signals_claimed_by, return_value=1)
     with (
-        _settlement(_row()),
+        _settlement(_row(run=None)),
         patch("src.dalton.database.watch.release_signals_claimed_by", new=release_mock),
     ):
         settled = await settle(_dalton_automation(), _EID, outcome, workspace_id="ws-meta-1")
         await drain_tails()
 
     assert settled is True
-    # Released inside the settlement transaction, on its connection.
-    release_mock.assert_awaited_once_with(_EID, conn=_CONN)
+    release_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dalton_executor_pre_start_failed_settlement_releases_claimed_signals() -> None:
+    """# DALTON-HOOK(automation-subscription-fallback): executor pre-START FAILED releases signals."""
+    from contextlib import asynccontextmanager as _acm
+    from psycopg import AsyncConnection, AsyncCursor
+    from src.dalton.database import watch as watch_db
+
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur.fetchone.return_value = None
+
+    @_acm
+    async def _cursor_ctx(*_a, **_kw):
+        yield cur
+
+    @_acm
+    async def _tx_ctx():
+        yield None
+
+    tx_conn = create_autospec(AsyncConnection, instance=True)
+    tx_conn.cursor.side_effect = _cursor_ctx
+    tx_conn.transaction.side_effect = _tx_ctx
+
+    async def _settle_with_tx(_execution_id, *, in_transaction=None, **_fields):
+        row = _row(run=None)
+        if in_transaction is not None:
+            await in_transaction(tx_conn, row)
+        return row
+
+    release_mock = create_autospec(watch_db.release_signals_claimed_by, return_value=1)
+    with _settlement(_row(run=None)) as fx:
+        fx.db.settle_execution.side_effect = _settle_with_tx
+        with patch("src.dalton.database.watch.release_signals_claimed_by", new=release_mock):
+            settled = await settle(
+                _dalton_automation(),
+                _EID,
+                Outcome.FAILED,
+                workspace_id="ws-meta-1",
+                release_pre_start_signals=True,
+            )
+            await drain_tails()
+
+    assert settled is True
+    release_mock.assert_awaited_once_with(_EID, conn=tx_conn)
+
+
+@pytest.mark.asyncio
+async def test_dalton_post_start_failed_settlement_keeps_claimed_signals() -> None:
+    """# DALTON-HOOK(automation-subscription-fallback): failures after START keep claimed signals."""
+    from src.dalton.database import watch as watch_db
+
+    release_mock = create_autospec(watch_db.release_signals_claimed_by, return_value=1)
+    with (
+        _settlement(_row(run=_RUN)),
+        patch("src.dalton.database.watch.release_signals_claimed_by", new=release_mock),
+    ):
+        assert (
+            await settle(
+                _dalton_automation(),
+                _EID,
+                Outcome.FAILED,
+                run_id=_RUN,
+                workspace_id="ws-meta-1",
+                release_pre_start_signals=True,
+            )
+        ) is True
+        await drain_tails()
+
+    release_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

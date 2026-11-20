@@ -42,6 +42,14 @@ from typing import Any
 from fastapi import HTTPException
 from psycopg.rows import dict_row
 
+from src.dalton.services.automation_subscription_fallback import (
+    build_flagged_subscription_error,
+    capture_resolved_effective_model,
+    extract_rejected_model_from_exc,
+    is_subscription_unavailable_error,
+    load_fallback_prefs_or_reraise,
+    resolve_with_subscription_fallback,
+)
 from src.server.contracts.turn_kinds import NOTIFICATION_QUERY_TYPES
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
@@ -131,23 +139,31 @@ async def _get_execution_by_id(execution_id: str) -> dict[str, Any] | None:
             return dict(row) if row else None
 
 
+def _response_execution_id_sql(alias: str) -> str:
+    """SQL expression resolving execution UUID from ``automation_execution_id`` or ``automation_delivery.id``."""
+    return (
+        f"COALESCE("
+        f"NULLIF({alias}.metadata->>'automation_execution_id', ''), "
+        f"NULLIF(split_part(COALESCE({alias}.metadata->'automation_delivery'->>'id', ''), '.', 1), '')"
+        f")"
+    )
+
+
 async def _get_execution_for_run_id(run_id: str) -> dict[str, Any] | None:
     if normalize_uuid(run_id) is None:
         return None
+    exec_expr = _response_execution_id_sql("r")
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
                        a.user_id
                 FROM conversation_responses r
                 JOIN automation_executions e
                   -- A handoff notification records its firing as automation_delivery.id.
-                  ON e.automation_execution_id::text = COALESCE(
-                      r.metadata->>'automation_execution_id',
-                      r.metadata->'automation_delivery'->>'id'
-                  )
+                  ON e.automation_execution_id::text = {exec_expr}
                 JOIN automations a ON a.automation_id = e.automation_id
                 WHERE r.conversation_response_id = %s::uuid
                 LIMIT 1
@@ -161,10 +177,11 @@ async def _get_execution_for_run_id(run_id: str) -> dict[str, Any] | None:
 async def _get_execution_for_command(
     thread_id: str, command_id: str
 ) -> dict[str, Any] | None:
+    exec_expr = _response_execution_id_sql("pr")
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
                        a.user_id
@@ -172,7 +189,7 @@ async def _get_execution_for_command(
                 JOIN conversation_responses pr
                   ON pr.conversation_response_id = cr.run_id
                 JOIN automation_executions e
-                  ON e.automation_execution_id::text = pr.metadata->>'automation_execution_id'
+                  ON e.automation_execution_id::text = {exec_expr}
                 JOIN automations a ON a.automation_id = e.automation_id
                 WHERE cr.command_id = %s::text
                   AND cr.conversation_thread_id = %s::uuid
@@ -198,6 +215,7 @@ async def _get_execution_for_task(
         param = task_id
     else:
         return None
+    exec_expr = _response_execution_id_sql("pr")
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -209,7 +227,7 @@ async def _get_execution_for_task(
                 JOIN conversation_responses pr
                   ON pr.conversation_response_id = sr.parent_run_id
                 JOIN automation_executions e
-                  ON e.automation_execution_id::text = pr.metadata->>'automation_execution_id'
+                  ON e.automation_execution_id::text = {exec_expr}
                 JOIN automations a ON a.automation_id = e.automation_id
                 WHERE {where_sql}
                 ORDER BY sr.started_at DESC
@@ -221,22 +239,42 @@ async def _get_execution_for_task(
             return dict(row) if row else None
 
 
+_EXPLICIT_EXECUTION_MATCH_KINDS = frozenset(
+    {"retry_run", "execution_id", "automation_delivery", "report_source"}
+)
+
+
+def _explicit_execution_id(request: Any) -> str | None:
+    raw = getattr(request, "automation_execution_id", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return normalize_uuid(raw.strip())
+
+
 async def _resolve_source_execution(
     request: Any,
     *,
     thread_id: str,
     retry_of_run_id: str | None = None,
+    allow_running_fallback: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     """Resolve the execution this notification turn belongs to.
 
-    Explicit source hints (``retry_of_run_id``, handoff ``automation_delivery``,
-    and ``report_source`` for ``command_report`` / ``task``) take precedence over
-    falling back to the thread's latest ``running`` execution.
+    Explicit source hints (``retry_of_run_id``, explicit execution id, handoff
+    ``automation_delivery``/``automation_earlier_runs``, and ``report_source``
+    for ``command_report``/``task``) take precedence over falling back to the
+    thread's latest ``running`` execution.
     """
     if retry_of_run_id:
         exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
         if exec_row is not None:
             return exec_row, "retry_run"
+
+    explicit_exec_id = _explicit_execution_id(request)
+    if explicit_exec_id:
+        exec_row = await _get_execution_by_id(explicit_exec_id)
+        if exec_row is not None:
+            return exec_row, "execution_id"
 
     delivery_exec_id = _delivery_execution_id(request)
     if delivery_exec_id:
@@ -269,6 +307,8 @@ async def _resolve_source_execution(
             if exec_row is not None:
                 return exec_row, "report_source"
 
+    if not allow_running_fallback:
+        return None, "none"
     running = await exec_db.get_running_executions_for_thread(thread_id)
     if not running:
         return None, "none"
@@ -338,7 +378,17 @@ async def _get_execution_first_turn_llm_model(
             return str(fallback_model) if fallback_model else None
 
 
-async def resolve_automation_notification_model(
+def _automation_model_unreadable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "type": "automation_model_unavailable",
+            "message": "暂时无法读取本次自动任务的模型设置；为避免改用其他模型，本回合已停止，请稍后重试。",
+        },
+    )
+
+
+async def _resolve_automation_notification_context(
     *,
     user_id: str,
     thread_id: str,
@@ -346,30 +396,45 @@ async def resolve_automation_notification_model(
     from_service: bool,
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
-) -> str | None:
-    """Return the automation execution's model for a notification turn, or ``None``."""
-    if getattr(request, "llm_model", None):
-        return None
+    allow_running_fallback: bool = True,
+    resolve_model: bool = True,
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None, bool]:
+    """Resolve ``(target_exec, inherited_model, user_prefs, fallback_eligible)``."""
     if not _is_server_notification_turn(
         request,
         from_service=from_service,
         retry_of_run_id=retry_of_run_id,
         is_server_retry=is_server_retry,
     ):
-        return None
+        return None, None, None, False
     if normalize_uuid(thread_id) is None:
-        return None
+        return None, None, None, False
 
     try:
         target_exec, match_kind = await _resolve_source_execution(
             request,
             thread_id=thread_id,
             retry_of_run_id=retry_of_run_id,
+            allow_running_fallback=allow_running_fallback,
         )
-        if target_exec is None:
-            return None
+    except Exception:
+        logger.warning(
+            f"[AUTOMATION_THREAD_MODEL] Failed resolving source execution "
+            f"for thread={thread_id}; falling back to default resolution",
+            exc_info=True,
+        )
+        return None, None, None, False
+    if target_exec is None:
+        return None, None, None, False
 
-        exec_id = str(target_exec["automation_execution_id"])
+    fallback_eligible = match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
+    if not resolve_model or getattr(request, "llm_model", None):
+        return target_exec, None, None, fallback_eligible
+
+    exec_id = str(target_exec["automation_execution_id"])
+    chosen_model: str | None = None
+    source: str | None = None
+    try:
         chosen_model = await _get_execution_first_turn_llm_model(
             target_exec, fallback_thread_id=thread_id
         )
@@ -385,31 +450,109 @@ async def resolve_automation_notification_model(
                 if cfg_model:
                     chosen_model = str(cfg_model)
                     source = "automation_config"
-
-        if not chosen_model:
-            return None
-
-        prefs = await user_models.get_model_preference(user_id)
-        if not model_resolves(prefs, chosen_model):
-            logger.warning(
-                f"[AUTOMATION_THREAD_MODEL] Model {chosen_model!r} for thread={thread_id} "
-                f"execution_id={exec_id} source={source} via={match_kind} is unavailable; "
-                f"using default resolution"
-            )
-            return None
-
-        logger.info(
-            f"[AUTOMATION_THREAD_MODEL] thread={thread_id} execution_id={exec_id} "
-            f"model={chosen_model} source={source} via={match_kind}"
-        )
-        return chosen_model
     except Exception:
         logger.warning(
-            f"[AUTOMATION_THREAD_MODEL] Failed resolving automation execution model "
-            f"for thread={thread_id}; falling back to default resolution",
+            f"[AUTOMATION_THREAD_MODEL] Failed reading execution model for thread={thread_id} "
+            f"execution_id={exec_id} via={match_kind}",
             exc_info=True,
         )
+        if fallback_eligible:
+            # Keep the confirmed link; the caller stops the turn if nothing else names
+            # a model (it must not run on the account default instead).
+            return {**target_exec, "_model_read_failed": True}, None, None, fallback_eligible
+        return None, None, None, False
+
+    if not chosen_model:
+        return target_exec, None, None, fallback_eligible
+
+    try:
+        prefs = await user_models.get_model_preference(user_id)
+    except Exception:
+        logger.warning(
+            f"[AUTOMATION_THREAD_MODEL] Failed reading user model preference for thread={thread_id} "
+            f"execution_id={exec_id} via={match_kind}",
+            exc_info=True,
+        )
+        if fallback_eligible:
+            # Confirmed link: keep the execution's model and its fallback rules.
+            return target_exec, chosen_model, None, fallback_eligible
+        # Inferred link only: the previous behavior, default resolution.
+        return None, None, None, False
+
+    if not model_resolves(prefs, chosen_model):
+        logger.warning(
+            f"[AUTOMATION_THREAD_MODEL] Model {chosen_model!r} for thread={thread_id} "
+            f"execution_id={exec_id} source={source} via={match_kind} is unavailable; "
+            f"using default resolution"
+        )
+        return target_exec, None, prefs, fallback_eligible
+
+    logger.info(
+        f"[AUTOMATION_THREAD_MODEL] thread={thread_id} execution_id={exec_id} "
+        f"model={chosen_model} source={source} via={match_kind}"
+    )
+    return target_exec, chosen_model, prefs, fallback_eligible
+
+
+async def is_automation_notification_turn(
+    *,
+    thread_id: str,
+    request: Any,
+    from_service: bool,
+    is_server_retry: bool = False,
+    retry_of_run_id: str | None = None,
+) -> bool:
+    """Return True when the request explicitly links to an automation execution."""
+    if not _is_server_notification_turn(
+        request,
+        from_service=from_service,
+        retry_of_run_id=retry_of_run_id,
+        is_server_retry=is_server_retry,
+    ):
+        return False
+    if normalize_uuid(thread_id) is None:
+        return False
+    try:
+        target_exec, match_kind = await _resolve_source_execution(
+            request,
+            thread_id=thread_id,
+            retry_of_run_id=retry_of_run_id,
+            allow_running_fallback=False,
+        )
+        return (
+            target_exec is not None
+            and match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
+        )
+    except Exception:
+        logger.warning(
+            f"[AUTOMATION_THREAD_MODEL] Failed checking automation notification status "
+            f"for thread={thread_id}",
+            exc_info=True,
+        )
+        return False
+
+
+async def resolve_automation_notification_model(
+    *,
+    user_id: str,
+    thread_id: str,
+    request: Any,
+    from_service: bool,
+    is_server_retry: bool = False,
+    retry_of_run_id: str | None = None,
+) -> str | None:
+    """Return the automation execution's model for a notification turn, or ``None``."""
+    if getattr(request, "llm_model", None):
         return None
+    _target_exec, chosen_model, _prefs, _eligible = await _resolve_automation_notification_context(
+        user_id=user_id,
+        thread_id=thread_id,
+        request=request,
+        from_service=from_service,
+        is_server_retry=is_server_retry,
+        retry_of_run_id=retry_of_run_id,
+    )
+    return chosen_model
 
 
 async def resolve_turn_config_with_automation_inheritance(
@@ -423,45 +566,181 @@ async def resolve_turn_config_with_automation_inheritance(
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
     resolve: Callable[[str | None], Awaitable[Any]],
+    flagged_subscription: tuple[Any, str | None] | None = None,
+    on_fallback: Callable[[dict[str, Any]], None] | None = None,
 ) -> Any:
     """Resolve turn LLM config, inheriting an automation execution's model with fallback.
 
-    If the inherited model triggers an unservable refusal (``_UNSERVABLE_REFUSALS``),
-    log a warning and re-resolve with ``named=None`` so the thread's held model or
-    account default still serves the notification turn instead of dropping it.
+    Only server notification turns that explicitly identify an automation
+    execution (``retry_of_run_id``, explicit execution ID, ``automation_delivery``/
+    ``automation_earlier_runs``, or ``report_source``) qualify for
+    ``fallback_models`` subscription fallback. Thread-level ``running`` heuristics
+    keep legacy inheritance only, and failed subscription fallbacks raise the
+    original refusal instead of dropping to thread/account default models.
     """
+    target_exec: dict[str, Any] | None = None
     inherited_model: str | None = None
-    if requested_model is None:
-        inherited_model = await resolve_automation_notification_model(
+    prefs: dict[str, Any] | None = None
+    fallback_eligible = False
+    if requested_model is None or flagged_subscription is not None or _is_server_notification_turn(
+        request,
+        from_service=from_service,
+        retry_of_run_id=retry_of_run_id,
+        is_server_retry=is_server_retry,
+    ):
+        (
+            target_exec,
+            inherited_model,
+            prefs,
+            fallback_eligible,
+        ) = await _resolve_automation_notification_context(
             user_id=user_id,
             thread_id=thread_id,
             request=request,
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
+            allow_running_fallback=(requested_model is None and flagged_subscription is None),
+            resolve_model=(requested_model is None),
         )
+
+    async def _try_subscription_fallback(
+        *,
+        original_model: str | None,
+        failed_provider: str | None,
+        reason: str | None,
+        exc_to_raise: BaseException,
+        failed_subject: str | None = None,
+    ) -> Any:
+        pref_map = (
+            prefs
+            if prefs is not None
+            else await load_fallback_prefs_or_reraise(
+                user_id,
+                exc_to_raise,
+                context=f"user={user_id} thread={thread_id}",
+            )
+        )
+        orig = (
+            None
+            if failed_subject is not None
+            else (original_model or thread_model.effective_default_model(pref_map))
+        )
+        cfg, record = await resolve_with_subscription_fallback(
+            user_id=user_id,
+            prefs=pref_map,
+            original_model=orig,
+            failed_provider=failed_provider,
+            reason=reason,
+            resolve_candidate=resolve,
+            exc_to_raise=exc_to_raise,
+            model_resolves_fn=model_resolves,
+            failed_subject=failed_subject,
+        )
+        if target_exec and target_exec.get("automation_execution_id"):
+            record = {
+                **record,
+                "execution_id": str(target_exec["automation_execution_id"]),
+            }
+        if on_fallback is not None:
+            on_fallback(record)
+        return cfg
+
+    if flagged_subscription is not None:
+        subscription, error_code = flagged_subscription
+        flagged_exc = build_flagged_subscription_error(subscription, error_code)
+        if not fallback_eligible:
+            raise flagged_exc
+        sub_name = getattr(subscription, "account_name", None) or getattr(
+            subscription, "id", None
+        )
+        failed_subject = f"{sub_name} 订阅" if sub_name else "当前订阅"
+        return await _try_subscription_fallback(
+            original_model=None,
+            failed_subject=failed_subject,
+            failed_provider=getattr(subscription, "id", None),
+            reason="oauth_reauth_required",
+            exc_to_raise=flagged_exc,
+        )
+
+    attempted_models: list[str | None] = []
+
+    async def _tracked_resolve(model_name: str | None) -> Any:
+        attempted_models.append(model_name)
+        return await resolve(model_name)
 
     if inherited_model is None:
-        return await thread_model.resolve_turn_config(
-            user_id,
-            thread_id,
-            named=requested_model,
-            held=held_model,
-            fall_back=from_service,
-            resolve=resolve,
-        )
+        if (
+            fallback_eligible
+            and target_exec
+            and target_exec.get("_model_read_failed")
+            and not requested_model
+            and not held_model
+        ):
+            raise _automation_model_unreadable()
+        if not fallback_eligible:
+            return await thread_model.resolve_turn_config(
+                user_id,
+                thread_id,
+                named=requested_model,
+                held=held_model,
+                fall_back=from_service,
+                resolve=resolve,
+            )
+        with capture_resolved_effective_model() as captured_model:
+            try:
+                return await thread_model.resolve_turn_config(
+                    user_id,
+                    thread_id,
+                    named=requested_model,
+                    held=held_model,
+                    fall_back=False,
+                    resolve=_tracked_resolve,
+                )
+            except HTTPException as exc:
+                if not is_subscription_unavailable_error(exc):
+                    raise
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                rejected_model = (
+                    (captured_model[-1] if captured_model else None)
+                    or extract_rejected_model_from_exc(exc)
+                    or (attempted_models[-1] if attempted_models else requested_model)
+                )
+                return await _try_subscription_fallback(
+                    original_model=rejected_model,
+                    failed_provider=detail.get("provider"),
+                    reason=detail.get("type"),
+                    exc_to_raise=exc,
+                )
 
     try:
-        return await thread_model.resolve_turn_config(
-            user_id,
-            thread_id,
-            named=inherited_model,
-            held=held_model,
-            fall_back=from_service,
-            resolve=resolve,
-        )
+        with capture_resolved_effective_model() as captured_model:
+            return await thread_model.resolve_turn_config(
+                user_id,
+                thread_id,
+                named=inherited_model,
+                held=held_model,
+                fall_back=False if fallback_eligible else from_service,
+                resolve=_tracked_resolve,
+            )
     except HTTPException as exc:
-        if not _is_unservable_refusal(exc):
+        if is_subscription_unavailable_error(exc):
+            if fallback_eligible:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                rejected_model = (
+                    (captured_model[-1] if captured_model else None)
+                    or extract_rejected_model_from_exc(exc)
+                    or (attempted_models[-1] if attempted_models else inherited_model)
+                )
+                return await _try_subscription_fallback(
+                    original_model=rejected_model,
+                    failed_provider=detail.get("provider"),
+                    reason=detail.get("type"),
+                    exc_to_raise=exc,
+                )
+            if not _is_unservable_refusal(exc):
+                raise
+        elif not _is_unservable_refusal(exc):
             raise
         reason = exc.detail.get("type") if isinstance(exc.detail, dict) else None
         logger.warning(

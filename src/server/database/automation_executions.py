@@ -587,11 +587,30 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
     """
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(f"""
-                UPDATE automation_executions SET delivery = %s
-                WHERE automation_execution_id = %s
-                  AND status IN {UNSETTLED_STATUSES}
-            """, (Json(stamp) if stamp is not None else None, execution_id))
+            if stamp is not None:
+                # DALTON-HOOK(automation-subscription-fallback): preserve fallback marker across delivery re-stamps
+                await cur.execute(f"""
+                    UPDATE automation_executions
+                    SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback' THEN
+                            %s::jsonb || jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        ELSE %s::jsonb
+                    END
+                    WHERE automation_execution_id = %s
+                      AND status IN {UNSETTLED_STATUSES}
+                """, (Json(stamp), Json(stamp), execution_id))
+            else:
+                # DALTON-HOOK(automation-subscription-fallback): keep fallback marker even when clearing delivery targets
+                await cur.execute(f"""
+                    UPDATE automation_executions
+                    SET delivery = CASE
+                        WHEN delivery ? 'subscription_fallback' THEN
+                            jsonb_build_object('subscription_fallback', delivery->'subscription_fallback')
+                        ELSE NULL
+                    END
+                    WHERE automation_execution_id = %s
+                      AND status IN {UNSETTLED_STATUSES}
+                """, (execution_id,))
             return cur.rowcount > 0
 
 
@@ -876,6 +895,7 @@ async def list_abandoned_executions(
                 override_secs.append(execution_timeout_seconds(ov))
 
             # DALTON-HOOK(automation-continuation-identity): bind Python-parsed timeouts and live-turn exclusion
+            # DALTON-HOOK(automation-subscription-fallback): fetch e.delivery to avoid extra notice queries on settle
             await cur.execute(f"""
                 WITH ov AS (
                     SELECT * FROM unnest(%s::uuid[], %s::double precision[])
@@ -883,7 +903,7 @@ async def list_abandoned_executions(
                 )
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.conversation_response_id,
-                       e.started_at, e.created_at,
+                       e.started_at, e.created_at, e.delivery,
                        a.user_id, t.workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
@@ -939,10 +959,11 @@ async def get_execution_for_settlement(execution_id: str) -> Optional[Dict[str, 
     """Columns of ``execution_id`` consulted before settling a finished run."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(automation-subscription-fallback): select delivery for execution fallback marker check
             await cur.execute("""
                 SELECT automation_execution_id, automation_id, status,
                        conversation_thread_id, conversation_response_id,
-                       started_at, created_at, heartbeat_at
+                       started_at, created_at, heartbeat_at, delivery
                 FROM automation_executions
                 WHERE automation_execution_id = %s::uuid
             """, (execution_id,))
@@ -954,10 +975,11 @@ async def get_running_executions_for_thread(thread_id: str) -> List[Dict[str, An
     """All ``running`` automation executions pinned to ``thread_id``, oldest first."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(automation-subscription-fallback): select delivery for execution fallback marker check
             await cur.execute("""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.conversation_response_id,
-                       e.started_at, e.created_at,
+                       e.started_at, e.created_at, e.delivery,
                        a.user_id, t.workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
@@ -1272,9 +1294,10 @@ async def get_running_execution_for_run(run_id: str) -> Optional[Dict[str, Any]]
     thread and workspace; None when there is none."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(automation-subscription-fallback): select e.delivery for execution fallback marker check
             await cur.execute("""
                 SELECT e.automation_execution_id, e.automation_id,
-                       e.conversation_thread_id, a.user_id, t.workspace_id
+                       e.conversation_thread_id, e.delivery, a.user_id, t.workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
                 LEFT JOIN conversation_threads t
