@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import httpx
 import pytest
@@ -711,3 +711,195 @@ async def test_a_database_error_reading_a_grants_owner_is_not_answered_as_not_fo
         serve, "db_get_workspace", AsyncMock(side_effect=ConnectionError("db down"))
     ), pytest.raises(ConnectionError):
         await serve.serve_workspace_file_endpoint(grant=_grant(), path="r.html", inject=None)
+
+
+# --- Dalton route-level gates (TestClient) -------------------------------------------
+
+
+def _enable_dalton_transcriptions(monkeypatch):
+    from src.dalton import settings as dalton_settings
+    from src.dalton.app import transcriptions as transcriptions_app
+    from src.dalton.services import transcriptions as svc_transcriptions
+
+    monkeypatch.setenv("DALTON_ENABLED", "true")
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "s" * 32)
+    monkeypatch.setattr(
+        transcriptions_app,
+        "get_dalton_settings",
+        create_autospec(
+            dalton_settings.get_dalton_settings,
+            return_value=SimpleNamespace(enabled=True),
+        ),
+    )
+    monkeypatch.setattr(
+        transcriptions_app,
+        "is_transcription_enabled",
+        create_autospec(svc_transcriptions.is_transcription_enabled, return_value=True),
+    )
+    return transcriptions_app
+
+
+def test_suspended_session_user_is_refused_on_transcriptions_route(monkeypatch):
+    """DALTON-HOOK(dalton-auth): suspended session caller is rejected with 403 on real transcription route."""
+    from fastapi.testclient import TestClient
+
+    transcriptions_app = _enable_dalton_transcriptions(monkeypatch)
+    get_status = create_autospec(
+        transcriptions_app.get_transcription_job_status,
+        return_value={"job_id": "job-1", "status": "running"},
+    )
+    monkeypatch.setattr(transcriptions_app, "get_transcription_job_status", get_status)
+
+    app = FastAPI()
+    app.include_router(transcriptions_app.router)
+    stack, _ = _deployment(SUSPENDED)
+    with stack, TestClient(app) as client:
+        resp = client.get("/api/v1/dalton/transcriptions/job-1", headers=SESSION)
+    _refused(resp)
+    get_status.assert_not_awaited()
+
+
+def test_suspended_ticket_user_is_refused_on_transcriptions_route(monkeypatch):
+    """DALTON-HOOK(dalton-auth): suspended task-ticket caller is rejected with 403 on real transcription route."""
+    from fastapi.testclient import TestClient
+
+    from src.dalton.services.transcriptions import issue_transcription_ticket
+
+    transcriptions_app = _enable_dalton_transcriptions(monkeypatch)
+    get_status = create_autospec(
+        transcriptions_app.get_transcription_job_status,
+        return_value={"job_id": "job-1", "status": "running"},
+    )
+    monkeypatch.setattr(transcriptions_app, "get_transcription_job_status", get_status)
+
+    ticket, _exp = issue_transcription_ticket(
+        job_id="job-1",
+        user_id="u",
+        workspace_id="ws-1",
+        thread_id=None,
+        source_object_key="k",
+        source_size_bytes=10,
+        source_sha256="a" * 64,
+    )
+    app = FastAPI()
+    app.include_router(transcriptions_app.router)
+    stack, _ = _deployment(SUSPENDED)
+    with stack, TestClient(app) as client:
+        resp = client.get(
+            "/api/v1/dalton/transcriptions/job-1",
+            headers={"X-Dalton-Transcription-Ticket": ticket},
+        )
+    _refused(resp)
+    get_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("viewer_account", "owner_account", "expected_status"),
+    [
+        (SUSPENDED, NO_ORG, 403),
+        (NO_ORG, SUSPENDED, 403),
+        (NO_ORG, NO_ORG, 200),
+    ],
+    ids=["suspended-viewer", "suspended-owner", "active-both"],
+)
+async def test_monitor_grant_route_refuses_suspended_viewer_or_owner(
+    monkeypatch, viewer_account, owner_account, expected_status
+):
+    """DALTON-HOOK(monitors): monitor grant route refuses both suspended viewer and suspended owner."""
+    from datetime import datetime, timezone
+
+    from fastapi.testclient import TestClient
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton.monitors import grants as monitor_grants
+    from src.dalton.monitors import router as monitor_router_mod
+    from src.dalton.monitors import service as monitor_service
+    from src.dalton.monitors.models import MonitorRecord
+    from src.server.database.artifacts import StoredVersionFile
+
+    monkeypatch.setattr(
+        monitor_router_mod,
+        "get_dalton_settings",
+        create_autospec(
+            dalton_settings.get_dalton_settings,
+            return_value=SimpleNamespace(enabled=True),
+        ),
+    )
+    monkeypatch.setattr(monitor_grants._MONITOR_CODEC, "_key", b"m" * 32)
+    monitor_id = "11111111-1111-4111-8111-111111111111"
+    grant = await monitor_grants.mint_monitor_grant(monitor_id, "viewer-u", acl_revision=1)
+    now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    monitor = MonitorRecord(
+        monitor_id=monitor_id,
+        slug="alpha",
+        artifact_id="22222222-2222-4222-8222-222222222222",
+        owner_user_id="owner-u",
+        title="Alpha",
+        category="research",
+        sort_order=0,
+        visibility="private",
+        published_seq=1,
+        keep_updated=False,
+        source_kind="workspace",
+        source_ref=None,
+        acl_revision=1,
+        created_at=now,
+        updated_at=now,
+    )
+    stored = StoredVersionFile(
+        user_id="owner-u",
+        sha256="a" * 64,
+        byte_len=2,
+        content_type="text/html; charset=utf-8",
+        content=b"ok",
+    )
+
+    monkeypatch.setattr(
+        monitor_service.monitor_db,
+        "get_monitor_by_id",
+        create_autospec(monitor_service.monitor_db.get_monitor_by_id, return_value=monitor),
+    )
+    monkeypatch.setattr(
+        monitor_service,
+        "require_monitor_view",
+        create_autospec(monitor_service.require_monitor_view, return_value=None),
+    )
+    monkeypatch.setattr(
+        monitor_service.monitor_db,
+        "is_monitor_version_published",
+        create_autospec(
+            monitor_service.monitor_db.is_monitor_version_published, return_value=True
+        ),
+    )
+    monkeypatch.setattr(
+        monitor_service.artifacts_db,
+        "get_version_file",
+        create_autospec(monitor_service.artifacts_db.get_version_file, return_value=stored),
+    )
+    from src.server.services import membership as membership_svc
+
+    monkeypatch.setattr(
+        membership_svc,
+        "teams_door_open",
+        create_autospec(membership_svc.teams_door_open, return_value=True),
+    )
+
+    async def _standing_for(uid: str, **_kwargs):
+        acct = viewer_account if uid == "viewer-u" else owner_account
+        return Standing(acct, acct)
+
+    monkeypatch.setattr(
+        f"{ACCOUNT}.read_standing",
+        create_autospec(
+            __import__(ACCOUNT, fromlist=["read_standing"]).read_standing,
+            side_effect=_standing_for,
+        ),
+    )
+
+    app = FastAPI()
+    app.include_router(monitor_router_mod.router)
+    with TestClient(app) as client:
+        resp = client.get(f"/api/v1/dalton/monitors/g/{grant.token}/v/1/index.html")
+    assert resp.status_code == expected_status

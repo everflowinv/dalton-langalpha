@@ -66,7 +66,7 @@ async def test_adding_an_own_server_is_refused_before_anything_is_checked(
     placed.assert_not_awaited()
 
 
-async def test_adding_one_at_a_brokerage_or_while_allowed_goes_on():
+async def test_adding_a_brokerage_is_refused_while_own_allowed_goes_on():
     from src.server.services.mcp_saves import BROKERAGE_DISABLED_DETAIL, CatalogAdd
 
     # DALTON-HOOK(hide-trading): Dalton refuses brokerage URLs with 403 before user_connectors is consulted.
@@ -234,7 +234,7 @@ async def test_connecting_one_is_refused_before_anything_is_dialled(policy, stat
     started.assert_not_awaited()
 
 
-async def test_connecting_a_brokerage_goes_on():
+async def test_connecting_a_brokerage_is_refused():
     from src.server.services.mcp_oauth import connect
     from src.server.services.mcp_saves import BROKERAGE_DISABLED_DETAIL
 

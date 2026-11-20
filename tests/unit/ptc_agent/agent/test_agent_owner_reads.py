@@ -103,13 +103,17 @@ async def test_the_graph_redacts_the_owners_vault_and_reads_the_senders_profile_
     owner's vault; the portfolio and watchlist counts are the person's."""
     session = MagicMock(mcp_tool_summary="summary")
     agent = MagicMock()
+    vault_by_user = {
+        OWNER: {"KEY": "synthetic-owner-value"},
+        SENDER: {"KEY": "synthetic-sender-value"},
+    }
     with (
         patch("ptc_agent.agent.graph.PTCAgent", return_value=agent),
         patch("ptc_agent.agent.graph._read_workspace_naming", AsyncMock(return_value=Workspace("A"))),
         patch("ptc_agent.agent.graph.fetch_user_data_counts", AsyncMock(return_value=None)) as counts,
         patch(
             "src.server.database.user_vault_secrets.get_user_secrets_decrypted",
-            AsyncMock(return_value={"KEY": "synthetic-owner-value"}),
+            AsyncMock(side_effect=lambda uid: vault_by_user.get(uid, {})),
         ) as vault,
     ):
         await build_ptc_graph_with_session(
@@ -122,4 +126,7 @@ async def test_the_graph_redacts_the_owners_vault_and_reads_the_senders_profile_
     counts.assert_awaited_once_with(SENDER)
     built = agent.create_agent.call_args.kwargs
     assert (built["user_id"], built["owner_id"]) == (SENDER, OWNER)
-    assert built["vault_secrets"] == {"KEY": "synthetic-owner-value"}
+    assert built["vault_secrets"] == {
+        "KEY": "synthetic-owner-value",
+        "KEY#caller": "synthetic-sender-value",
+    }

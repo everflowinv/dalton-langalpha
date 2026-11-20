@@ -3868,6 +3868,21 @@ async def _execute_session_command_once(
                         "deny_reason": "not_linked",
                     }
                 reject_company_system_auth(cleaned_uid)
+                # DALTON-HOOK(dalton-notify): deny suspended accounts before reading user data or mutating channel session state
+                from src.server.services.account import read_standing
+
+                if (
+                    await read_standing(cleaned_uid, unknown_on_cache_error=True)
+                ).suspended:
+                    return await _deny_and_ignore_command(
+                        {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "not_linked",
+                        },
+                        uid_val=None,
+                    )
 
                 # 2. Tier & group chat check
                 user_tier = await get_user_tier(cleaned_uid)

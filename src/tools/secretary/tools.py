@@ -531,7 +531,7 @@ async def threads_stop(
     from src.server.services.cancel_dispatch import cancel_workflow
 
     try:
-        # DALTON-HOOK(computer-cli-tokens-off): cancel_workflow takes Stopper `by="agent"`, not `by_user=False`
+        # DALTON-HOOK(computer-cli-tokens-off): 跟上上游 cancel_workflow 的 by: Stopper 签名
         outcome = await cancel_workflow(
             thread_id, run_id=run_id or None, by="agent"
         )

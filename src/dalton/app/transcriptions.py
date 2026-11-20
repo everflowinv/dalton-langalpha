@@ -63,11 +63,6 @@ async def _transcription_caller_gate(
 
     has_ticket, raw_ticket = _extract_ticket_from_request(request, credentials)
     if has_ticket:
-        if request.url.path.rstrip("/").endswith("/usage"):
-            raise HTTPException(
-                status_code=403,
-                detail="Task ticket cannot query aggregate usage reports",
-            )
         claims = verify_transcription_ticket(raw_ticket)
         ticket_uid = str(claims["user_id"])
         reject_company_system_auth(ticket_uid)
@@ -169,11 +164,15 @@ async def _resolve_caller_and_ticket(
         if inspect.isawaitable(res):
             res = await res
         user_id = str(res or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        reject_company_system_auth(user_id)
+        await admit_caller(request, user_id)
     else:
         user_id = await get_current_user_id(request, credentials)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    reject_company_system_auth(user_id)
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        reject_company_system_auth(user_id)
     return user_id, None
 
 

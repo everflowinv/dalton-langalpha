@@ -266,9 +266,7 @@ async def test_the_trading_permission_change_is_recorded_from_and_to(insert, in_
     from src.server.services.trading_permission import TradingPermission
 
     # DALTON-HOOK(hide-trading): Dalton forbids changing trading permission (403) and records no change.
-    with patch(
-        "src.server.services.account.policy_for", new_callable=AsyncMock, return_value=ALLOW_ALL
-    ), pytest.raises(HTTPException) as exc:
+    with pytest.raises(HTTPException) as exc:
         await trading_permission.update_trading_permission(
             trading_permission.TradingPermissionUpdate(level=TradingPermission.NO_TRADING), "u1"
         )
@@ -290,9 +288,7 @@ async def test_a_trading_permission_set_to_what_it_was_records_nothing(
 
     # DALTON-HOOK(hide-trading): Dalton forbids changing trading permission (403) and records nothing.
     level = TradingPermission(previous) if previous else DEFAULT_TRADING_PERMISSION
-    with patch(
-        "src.server.services.account.policy_for", new_callable=AsyncMock, return_value=ALLOW_ALL
-    ), pytest.raises(HTTPException) as exc:
+    with pytest.raises(HTTPException) as exc:
         await trading_permission.update_trading_permission(
             trading_permission.TradingPermissionUpdate(level=level), "u1"
         )
