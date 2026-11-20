@@ -218,7 +218,7 @@ def test_overlay_translate_defaults_to_dalton_and_falls_back_per_chunk(
     assert seen_args == {
         "text_backend": "dalton",
         "text_model": "gemini-4-hydrogen-high-oauth",
-        "video_model": "gemini-4-argon",
+        "video_model": "gemini-4-neon",
     }
 
     vid = "vid12345"
@@ -317,7 +317,7 @@ def test_overlay_translate_defaults_to_dalton_and_falls_back_per_chunk(
     assert len(dalton_calls) == 2
     assert all(c["model"] == "gemini-4-hydrogen-high-oauth" for c in dalton_calls)
     assert gemini_stub.call_count == 1
-    assert gemini_stub.call_args.args[0] == "gemini-4-argon"
+    assert gemini_stub.call_args.args[0] == "gemini-4-neon"
 
     notes = cli.stage_assemble(vid, wd, meta)
     assert notes["translation_routes"] == {"dalton": 1, "gemini-api": 1}

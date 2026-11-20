@@ -1445,19 +1445,19 @@ def test_provider_breakdown_uses_stamped_identity_and_cash_vs_nominal_classifica
 
     monkeypatch.setattr(LLM, "_model_config", None)
 
-    # 1. Custom cash alias reusing a subscription display name (`muse-spark-1.3-oauth` -> `openai` / `gpt-6-astra` via BYOK)
+    # 1. Custom cash alias reusing a subscription display name (`muse-spark-1.3-oauth` -> `openai` / `gpt-6.2-astra` via BYOK; gpt-6-astra's price card was dropped upstream in sync8)
     cash_alias_record = {
         "model_name": "muse-spark-1.3-oauth",
-        "pricing_model_id": "gpt-6-astra",
+        "pricing_model_id": "gpt-6.2-astra",
         "pricing_provider": "openai",
         "billing_type": "byok",
         "usage": {"input_tokens": 1_000, "output_tokens": 100, "cached_tokens": 0},
     }
     tracked_cash = calculate_cost_from_per_call_records([cash_alias_record])
-    assert tracked_cash["total_cost"] == pytest.approx(0.015)
+    assert tracked_cash["total_cost"] == pytest.approx(0.012)
     assert tracked_cash["platform_cost"] == 0.0
     assert tracked_cash["notional_cost"] == 0.0
-    assert tracked_cash["per_call_costs"][0]["pricing_model_id"] == "gpt-6-astra"
+    assert tracked_cash["per_call_costs"][0]["pricing_model_id"] == "gpt-6.2-astra"
     assert tracked_cash["per_call_costs"][0]["pricing_provider"] == "openai"
 
     cash_rows = [{"token_usage": tracked_cash}]
@@ -1465,7 +1465,7 @@ def test_provider_breakdown_uses_stamped_identity_and_cash_vs_nominal_classifica
     bd_cash = compute_provider_breakdown(cash_rows, journal_rows=[])
     assert bd_cash == {
         "openai": {
-            "cash_usd": 0.015,
+            "cash_usd": 0.012,
             "notional_usd": 0.0,
             "calls": 1,
         }
@@ -1539,7 +1539,7 @@ def test_provider_breakdown_uses_stamped_identity_and_cash_vs_nominal_classifica
             },
         ]
     )
-    assert combined_tracked["total_cost"] == pytest.approx(0.015)
+    assert combined_tracked["total_cost"] == pytest.approx(0.012)
     assert combined_tracked["platform_cost"] == 0.0
     assert combined_tracked["notional_cost"] == pytest.approx(0.01864)
 
@@ -1548,6 +1548,6 @@ def test_provider_breakdown_uses_stamped_identity_and_cash_vs_nominal_classifica
     bd_combined = compute_provider_breakdown(combined_rows, journal_rows=[])
     assert bd_combined == {
         "muse-oauth": {"cash_usd": 0.0, "notional_usd": 0.0155, "calls": 1},
-        "openai": {"cash_usd": 0.015, "notional_usd": 0.0, "calls": 1},
+        "openai": {"cash_usd": 0.012, "notional_usd": 0.0, "calls": 1},
         "z-ai-cn-coding": {"cash_usd": 0.0, "notional_usd": 0.00314, "calls": 1},
     }

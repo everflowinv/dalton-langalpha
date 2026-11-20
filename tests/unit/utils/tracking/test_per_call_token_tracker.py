@@ -518,14 +518,15 @@ class TestNotionalCostTracking:
             output_tokens=100,
             billing_type="byok",
         )
-        record.update(pricing_model_id="gpt-6-astra", pricing_provider="openai")
+        # DALTON-HOOK(notional-pricing): gpt-6-astra's price card was dropped upstream (sync8); its successor prices the cash route.
+        record.update(pricing_model_id="gpt-6.2-astra", pricing_provider="openai")
         result = calculate_cost_from_per_call_records([record])
 
-        assert result["total_cost"] == pytest.approx(0.015)
+        assert result["total_cost"] == pytest.approx(0.012)
         assert result["platform_cost"] == 0.0
         assert result["notional_cost"] == 0.0
         assert result["per_call_costs"][0]["notional_cost"] == 0.0
-        assert result["per_call_costs"][0]["pricing_model_id"] == "gpt-6-astra"
+        assert result["per_call_costs"][0]["pricing_model_id"] == "gpt-6.2-astra"
         assert result["per_call_costs"][0]["pricing_provider"] == "openai"
 
     @pytest.mark.parametrize("display_name", ["glm-5.3-plan", "glm-5.3-flash-plan", "custom-plan"])

@@ -2035,7 +2035,7 @@ async def test_removed_models_absent_and_visible_subscriptions_have_notional_pri
         ),
     )
     avail = await get_available_models_report(user_id="test-user")
-    assert "gemini-4-argon" in avail["available_keys"]
+    assert "gemini-4-neon" in avail["available_keys"]
     for key in removed_keys:
         assert key not in avail["available_keys"], f"{key} in available_keys"
         assert key not in avail["models"], f"{key} in available models report"
@@ -2078,7 +2078,7 @@ def test_gemini_4_overlay_models_default_to_expansive_compaction_and_user_pref_o
     gemini4_keys = [k for k in mc.llm_config if k.startswith("gemini-4-")]
     # No fixed count: an upstream sync that adds gemini-4-* API entries must
     # give them the same default (overlay model_overrides), and fails here if not.
-    assert "gemini-4-argon" in gemini4_keys
+    assert "gemini-4-neon" in gemini4_keys
 
     for key in gemini4_keys:
         entry = mc.get_model_config(key)

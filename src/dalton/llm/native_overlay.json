@@ -869,7 +869,7 @@
     }
   },
   "model_overrides": {
-    "gemini-4-argon": {
+    "gemini-4-neon": {
       "compaction_profile": "expansive"
     },
     "claude-fable-5-2": {

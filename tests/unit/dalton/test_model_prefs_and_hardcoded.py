@@ -549,9 +549,9 @@ async def test_restore_probe_models_budget_fallback_and_complete_empty_model_gua
     )
     assert (
         ps_mod._pick_probe_model(
-            "gemini", ["gemini-3.1-flash-lite", "gemini-4-argon"], {}
+            "gemini", ["gemini-3.1-flash-lite", "gemini-4-neon"], {}
         )
-        == "gemini-4-argon"
+        == "gemini-4-neon"
     )
 
     # 2. _notional_price_index retains fallback nominal rates when price card is empty/missing

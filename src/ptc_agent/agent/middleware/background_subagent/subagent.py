@@ -54,6 +54,7 @@ from src.llms.claude_code import ClaudeCodeTarget
 from src.llms.content_utils import extract_text_blocks  # DALTON-HOOK(subagent-spill-recovery)
 from src.llms.llm import narrow_prompt_cache_key
 from src.observability.langsmith_tracer import with_run_tracer
+from src.tools.turn_tool import input_schema
 from src.utils.concurrency import iterate_until
 from src.utils.stream_coalescing import HEARTBEAT_EVENT_TYPE
 
@@ -68,12 +69,19 @@ SUBAGENT_STOP_GRACE_S = 60.0
 # does: LangGraph awaits its cancelled node tasks with no bound.
 SUBAGENT_CLOSE_TIMEOUT_S = 30.0
 
-# The launching run's resume and replay flags, which LangGraph hands every task
-# of that run. A subagent takes both from its own input: inherited from a turn
-# that answered an interrupt, ``__pregel_resuming`` skips the prompt of a
+# The launching run's state, which LangGraph hands every task of that run. A
+# subagent takes its resume and replay from its own input: inherited from a
+# turn that answered an interrupt, ``__pregel_resuming`` skips the prompt of a
 # follow-up to a task that already has state, and from a retried turn,
 # ``__pregel_replay_state`` loads the task's state from before the retry point.
-PARENT_RUN_STATE_KEYS = frozenset({"__pregel_resuming", "__pregel_replay_state"})
+# Its namespace is its own too: every child run off one ``__pregel_scratchpad``
+# after the first gets ``|N`` appended to its ``task:<id>``, which history
+# never reads and whose tokens the messages stream drops. Tasks share one
+# wherever a single graph task makes several calls, as a Claude Code batch
+# does.
+PARENT_RUN_STATE_KEYS = frozenset(
+    {"__pregel_resuming", "__pregel_replay_state", "__pregel_scratchpad"}
+)
 
 
 
@@ -211,6 +219,34 @@ result."""
 ClaudeCodeSubagent = Callable[[Any, "SubAgent", ClaudeCodeTarget], Any]
 
 
+class SubagentGraphs(Mapping[str, Any]):
+    """The roster's graphs by type, each compiled the first time a run asks for it.
+
+    Compiling a graph is most of the garbage a turn's setup leaves:
+    ``create_agent``'s closures, signatures and tracing wrappers form reference
+    cycles that only a full collection frees, and most turns start no subagent.
+    A graph is kept once built, so the Task tool and a direct dispatch run the
+    same instance. Membership and the type names never build one."""
+
+    def __init__(self, builds: dict[str, Callable[[], Any]]) -> None:
+        self._builds = builds
+        self._built: dict[str, Any] = {}
+
+    def __getitem__(self, name: str) -> Any:
+        if name not in self._built:
+            self._built[name] = self._builds[name]()
+        return self._built[name]
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._builds
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._builds)
+
+    def __len__(self) -> int:
+        return len(self._builds)
+
+
 def _get_subagents(
     *,
     default_model: str | BaseChatModel,
@@ -221,17 +257,13 @@ def _get_subagents(
     general_purpose_agent: bool,
     build: Callable[[SubAgent], Any],
     checkpointer: Any | None = None,
-) -> tuple[dict[str, Any], list[str]]:
-    """Build compiled subagent instances from specs, each spec through
-    ``build``.
-
-    Returns ``(agent_dict, description_list)`` where ``agent_dict`` maps
-    agent names to runnable instances.
-    """
+) -> tuple[SubagentGraphs, list[str]]:
+    """The roster's graphs, each spec compiled through ``build`` when first
+    used, and its descriptions."""
     # Use empty list if None (no default middleware)
     default_subagent_middleware = default_middleware or []
 
-    agents: dict[str, Any] = {}
+    builds: dict[str, Callable[[], Any]] = {}
     subagent_descriptions = []
 
     # Create general-purpose agent if enabled
@@ -241,7 +273,8 @@ def _get_subagents(
             general_purpose_middleware.append(
                 HumanInTheLoopMiddleware(interrupt_on=default_interrupt_on)
             )
-        general_purpose_subagent = create_agent(
+        builds["general-purpose"] = partial(
+            create_agent,
             narrow_prompt_cache_key(default_model, "general-purpose"),
             system_prompt=DEFAULT_SUBAGENT_PROMPT,
             tools=default_tools,
@@ -250,7 +283,6 @@ def _get_subagents(
             checkpointer=checkpointer,
             state_schema=DeltaAgentState,
         )
-        agents["general-purpose"] = general_purpose_subagent
         subagent_descriptions.append(
             "- general-purpose: General-purpose agent with access to all tools."
         )
@@ -259,11 +291,11 @@ def _get_subagents(
     for agent_ in subagents:
         subagent_descriptions.append(f"- {agent_['name']}: {agent_['description']}")
         if "runnable" in agent_:
-            custom_agent = cast("CompiledSubAgent", agent_)
-            agents[custom_agent["name"]] = custom_agent["runnable"]
+            runnable = cast("CompiledSubAgent", agent_)["runnable"]
+            builds[agent_["name"]] = lambda runnable=runnable: runnable
             continue
-        agents[agent_["name"]] = build(cast("SubAgent", agent_))
-    return agents, subagent_descriptions
+        builds[agent_["name"]] = partial(build, cast("SubAgent", agent_))
+    return SubagentGraphs(builds), subagent_descriptions
 
 
 def claude_code_target(spec: SubAgent, default_model: Any) -> ClaudeCodeTarget | None:
@@ -703,7 +735,7 @@ def return_command_with_state_update(result: dict, tool_call_id: str) -> Command
 
 def _create_task_tool(
     *,
-    subagent_graphs: dict[str, Any],
+    subagent_graphs: Mapping[str, Any],
     task_description: str = TASK_TOOL_DESCRIPTION,
     registry: BackgroundTaskRegistry | None = None,
     checkpointer: Any | None = None,
@@ -711,12 +743,12 @@ def _create_task_tool(
 ) -> BaseTool:
     """Build a StructuredTool that dispatches Task tool calls to compiled subagents.
 
-    ``subagent_graphs`` are pre-compiled via ``_get_subagents`` by the caller
-    (``SubAgentMiddleware``) so the Task tool and any direct dispatch path
-    invoke the same graph instances. ``graph_on`` is the graph of a task on
-    the model its call named (``BackgroundTask.runs_on``), which the
-    background middleware resolved and gated before admitting the run; the
-    call's own ``model`` argument is only ever read there.
+    ``subagent_graphs`` is the caller's roster (``SubAgentMiddleware``), shared
+    with any direct dispatch path so both invoke the same graph instances.
+    ``graph_on`` is the graph of a task on the model its call named
+    (``BackgroundTask.runs_on``), which the background middleware resolved and
+    gated before admitting the run; the call's own ``model`` argument is only
+    ever read there.
     """
 
     async def _arun_subagent_streaming(
@@ -1026,6 +1058,7 @@ def _create_task_tool(
     return StructuredTool.from_function(
         name="Task",
         func=task,
+        args_schema=input_schema("Task", task),
         coroutine=atask,
         description=task_description,
     )
@@ -1131,8 +1164,8 @@ class SubAgentMiddleware(AgentMiddleware):
             default_interrupt_on=default_interrupt_on,
             checkpointer=checkpointer,
         )
-        # Compiled once and shared: the Task tool and any direct dispatch
-        # path (e.g. the workflow driver) must invoke the SAME graph
+        # Compiled on first use and shared: the Task tool and any direct
+        # dispatch path (e.g. the workflow driver) must invoke the SAME graph
         # instances so model resolution and middleware wiring are identical.
         self.subagent_graphs, _ = _get_subagents(
             default_model=default_model,
