@@ -212,7 +212,7 @@ async def _get_execution_for_task(
                   ON e.automation_execution_id::text = pr.metadata->>'automation_execution_id'
                 JOIN automations a ON a.automation_id = e.automation_id
                 WHERE {where_sql}
-                ORDER BY sr.created_at DESC
+                ORDER BY sr.started_at DESC
                 LIMIT 1
                 """,
                 (thread_id, param),
