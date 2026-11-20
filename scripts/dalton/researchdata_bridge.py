@@ -15206,8 +15206,11 @@ class ResearchDataBridge:
             )
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
+        if res.get("ok") and isinstance(res.get("embeddings"), list) and len(res["embeddings"]) != len(texts):
+            # One vector per text or nothing: a short answer would shift vectors onto the wrong texts.
+            res = {"ok": False, "error": f"embedding returned {len(res['embeddings'])} vectors for {len(texts)} texts"}
         if res.get("ok") and isinstance(res.get("embeddings"), list):
-            model_used = str(res.get("model") or "gemini-embedding-001")
+            model_used = str(res.get("model") or "gemini-embedding-2-preview")
             dims_used = int(res.get("dimensions") or 3072)
             if not req_model:
                 self._resolved_embed_model = model_used

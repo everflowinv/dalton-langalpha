@@ -27,6 +27,11 @@ _SAFE_CODES = frozenset({
 })
 
 
+
+# Google retired gemini-embedding-2-preview on 2026-11-19; the GA model returns the same
+# vectors, so the configured name (also the cache and index label) is mapped only here.
+_API_MODEL_ALIASES = {"gemini-embedding-2-preview": "gemini-embedding-2"}
+
 def _emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, allow_nan=False))
     sys.stdout.write("\n")
@@ -87,7 +92,7 @@ def _embed(texts: list[str], model: str, api_key: str) -> list[list[float]]:
     )
     # Each Content produces one vector in input order.
     response = client.models.embed_content(
-        model=model,
+        model=_API_MODEL_ALIASES.get(model, model),
         contents=[
             types.Content(parts=[types.Part(text=text)])
             for text in texts

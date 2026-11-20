@@ -33,7 +33,9 @@ def _resolve_research_roots(default_code_root: Path = _DEFAULT_CODE_ROOT) -> tup
 
 CODE_ROOT, DATA_ROOT = _resolve_research_roots()
 ROOT = DATA_ROOT
-MODEL='gemini-embedding-2-preview'
+MODEL='gemini-embedding-2-preview'  # index label; rows store it, keep as is
+# Google retired the preview name on 2026-11-19; the GA model gives the same vectors (cosine 1.0).
+API_MODEL='gemini-embedding-2'
 DIMS=3072
 SCHEMA_VERSION='image-only-v1'
 SOURCES=('company-wiki','sales-notes','tmtb','funda-ai')
@@ -101,7 +103,7 @@ class ImageStore:
         from google.genai import types
         import numpy as np
         content=types.Content(parts=[types.Part.from_bytes(data=data,mime_type=mime)]) if data is not None else query
-        r=self.client().models.embed_content(model=MODEL,contents=content,config={
+        r=self.client().models.embed_content(model=API_MODEL,contents=content,config={
             'task_type':'RETRIEVAL_DOCUMENT' if data is not None else 'RETRIEVAL_QUERY','output_dimensionality':DIMS})
         if len(r.embeddings)!=1:raise ValueError('图片 embedding 返回数量异常')
         vector=np.asarray(r.embeddings[0].values,dtype=np.float32)

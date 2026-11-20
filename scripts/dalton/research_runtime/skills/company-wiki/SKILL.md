@@ -12,7 +12,7 @@ user-invocable: true
 
 跨本地 wiki、卖方原邮件和 TMTB 查询用 `route="all"`。参数与来源口径见 workspace 的 `references/data-sources.md`。统一入口只读已有索引，不入库、不重建索引；下文原 CLI、目录命名、入库规则和 cron 调用继续有效。
 
-图片也走同一入口：`params.media="images"` 只搜图，默认 `all` 搜图文；`operation="read", document="image:<id>"` 返回预览和原件路径、原文 ID。正文 read 的 `images` 列出已关联图片。图向量固定使用 `gemini-embedding-2-preview`，与旧文本索引分开保存。原 CLI `search` 仍只搜原文本索引。
+图片也走同一入口：`params.media="images"` 只搜图，默认 `all` 搜图文；`operation="read", document="image:<id>"` 返回预览和原件路径、原文 ID。正文 read 的 `images` 列出已关联图片。图向量固定使用 `gemini-embedding-2`（索引标签沿用 `gemini-embedding-2-preview`，2026-11-19 预览名下线后调用正式版，向量相同），与旧文本索引分开保存。原 CLI `search` 仍只搜原文本索引。
 
 ## Overview
 
@@ -119,7 +119,7 @@ Custom sectors can be created on the fly.
 
 ## Embedding Model
 
-- **Model**: `gemini-embedding-001` (fallback; tries `gemini-embedding-2-preview` first)
+- **Model**: configured as `gemini-embedding-2-preview` (the index label); the API call maps it to `gemini-embedding-2`, which returns the same vectors. No fallback to `gemini-embedding-001`: its vectors are in an unrelated space
 - **SDK**: `google-genai>=1.0.0`
 - **Batch embedding**: 100 texts per API call
 - **Vector DB**: SQLite with numpy cosine similarity (same as market-digest)
@@ -349,7 +349,7 @@ When user asks about a topic across companies:
     "proxy_port": 7897
   },
   "embedding": {
-    "model": "gemini-embedding-001",
+    "model": "gemini-embedding-2-preview",
     "model_preferred": "gemini-embedding-2-preview",
     "dimensions": 3072,
     "chunk_size": 1500,

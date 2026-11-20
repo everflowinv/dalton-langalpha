@@ -3,8 +3,8 @@
 Dalton containers never hold `GEMINI_API_KEY`; all embedding calls route over
 `host.docker.internal` to `scripts/dalton/researchdata_bridge.py` (`POST /embed`
 authenticated via request headers), which delegates to the host embedding
-configuration (`gemini-embedding-2-preview` preferred, `gemini-embedding-001`
-fallback, 3072 dimensions).
+configuration (`gemini-embedding-2-preview` label, called as `gemini-embedding-2`,
+3072 dimensions).
 """
 
 from __future__ import annotations
@@ -160,6 +160,10 @@ async def embed_texts_via_bridge(
         if not resp.get("ok") or not isinstance(resp.get("embeddings"), list):
             err = str(resp.get("error") or "bridge_embed_failed")
             raise RuntimeError(f"Host bridge /embed failed: {err}")
+        if len(resp["embeddings"]) != len(batch):
+            raise RuntimeError(
+                f"Host bridge /embed returned {len(resp['embeddings'])} vectors for {len(batch)} texts"
+            )
         if resp.get("model"):
             model_used = str(resp["model"])
         for vec in resp["embeddings"]:

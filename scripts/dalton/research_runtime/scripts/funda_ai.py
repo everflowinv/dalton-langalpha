@@ -38,7 +38,9 @@ def _resolve_research_roots(default_code_root: Path = _DEFAULT_CODE_ROOT) -> tup
 CODE_ROOT, DATA_ROOT = _resolve_research_roots()
 ROOT = DATA_ROOT
 SENDER = 'fundaai@substack.com'
-MODEL = 'gemini-embedding-2-preview'
+MODEL = 'gemini-embedding-2-preview'  # index label; rows store it, keep as is
+# Google retired the preview name on 2026-11-19; the GA model gives the same vectors (cosine 1.0).
+API_MODEL = 'gemini-embedding-2'
 DIMS = 3072
 
 
@@ -352,7 +354,7 @@ def main():
                       'last_date': max(dates) if dates else None, 'dry_run': args.dry_run}
         elif args.command == 'index':
             if not 1 <= args.max_docs <= 10000: raise ValueError('max_docs_out_of_range')
-            md = load_mail_module(); config = {'embedding': {'model': MODEL, 'dimensions': DIMS}}
+            md = load_mail_module(); config = {'embedding': {'model': API_MODEL, 'dimensions': DIMS}}
             from research_images import atomic_json
             result = store.index_pending(lambda texts: md.embed_texts(texts, config), args.max_docs,
                 lambda v: atomic_json(store.home/'index-progress.json', {**v, 'at': now()}))
