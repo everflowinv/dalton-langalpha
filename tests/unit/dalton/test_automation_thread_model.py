@@ -884,3 +884,56 @@ async def test_automation_origin_non_notification_turn_is_rejected():
         )
         is None
     )
+
+
+def _subagent_runs_columns() -> set[str]:
+    """Columns of ``subagent_runs`` as the migrations define them."""
+    import re
+    from pathlib import Path
+
+    versions = Path(__file__).resolve().parents[3] / "migrations" / "versions"
+    cols: set[str] = set()
+    for path in sorted(versions.glob("*.py")):
+        text = path.read_text()
+        m = re.search(
+            r"CREATE TABLE IF NOT EXISTS subagent_runs \((.*?)\n\s*\)", text, re.DOTALL
+        )
+        if m:
+            for line in m.group(1).splitlines():
+                word = line.strip().split(" ", 1)[0]
+                if re.fullmatch(r"[a-z_]+", word) and word.upper() not in {
+                    "PRIMARY",
+                    "UNIQUE",
+                    "CONSTRAINT",
+                    "CHECK",
+                    "FOREIGN",
+                }:
+                    cols.add(word)
+        cols.update(
+            re.findall(
+                r"ALTER TABLE subagent_runs ADD COLUMN IF NOT EXISTS ([a-z_]+)", text
+            )
+        )
+    return cols
+
+
+def test_subagent_runs_query_uses_existing_columns():
+    """Regression (2026-11-19): ``sr.created_at`` does not exist, so every
+    report-back turn on an automation thread lost the automation's model."""
+    import inspect
+    import re
+
+    cols = _subagent_runs_columns()
+    assert {
+        "task_run_id",
+        "thread_id",
+        "task_id",
+        "parent_run_id",
+        "started_at",
+    } <= cols
+    assert "created_at" not in cols
+    used = set(
+        re.findall(r"\bsr\.([a-z_]+)", inspect.getsource(automation_thread_model))
+    )
+    assert used, "expected the subagent_runs query to alias the table as sr"
+    assert used <= cols, f"unknown subagent_runs columns: {sorted(used - cols)}"
