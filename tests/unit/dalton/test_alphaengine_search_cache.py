@@ -4819,7 +4819,7 @@ def test_a_stale_transcript_drops_its_continuation_and_keeps_its_warnings() -> N
     stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_TRANSCRIPT)
     cov = stripped["data"]["coverage"]
     assert "continuation_params" not in cov
-    assert cov["warnings"] == ["后续检索页失败，当前结果不完整", ae_cache.STALE_CURSOR_NOTE]
+    assert cov["warnings"] == ["后续检索页失败，当前结果不完整", ae_cache.STALE_CONTINUATION_NOTE]
     assert ae_cache.cursor_unavailable_reason(stripped) == "stale"
 
 
@@ -4828,3 +4828,11 @@ def test_a_complete_stale_transcript_is_not_called_incomplete() -> None:
     stripped = ae_cache.strip_cursor(payload, op=ae_cache.OP_TRANSCRIPT)
     assert ae_cache.cursor_unavailable_reason(stripped) == ""
     assert ae_cache.STALE_CURSOR_NOTE not in json.dumps(stripped, ensure_ascii=False)
+
+
+def test_a_sliced_page_replaces_the_upstream_paging_note() -> None:
+    payload = _ae_results_payload(50, has_more=True, cursor="ae1:x")
+    sliced = ae_cache.slice_cached_payload(payload, op=ae_cache.OP_SEARCH_LIBRARY, target_limit=10)
+    text = json.dumps(sliced, ensure_ascii=False)
+    assert ae_cache.SLICED_CACHE_NOTE in text
+    assert not ae_cache.payload_has_live_cursor(sliced, op=ae_cache.OP_SEARCH_LIBRARY)

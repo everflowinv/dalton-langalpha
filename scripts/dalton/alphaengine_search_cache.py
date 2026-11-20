@@ -711,6 +711,7 @@ def _locate_search_results_containers(
 
 
 STALE_CURSOR_NOTE = "缓存副本：结果未取完，但翻页游标已失效，不能续查；需要更多结果请稍后重新检索。"
+STALE_CONTINUATION_NOTE = "缓存副本：上面关于用游标或 continuation 参数续查的建议已失效；需要更多结果请稍后重新检索。"
 
 
 def _cursor_slots(obj: Any):
@@ -779,7 +780,10 @@ def strip_cursor(payload: dict[str, Any], *, op: str) -> dict[str, Any]:
     results remain, it is marked ``cursor_unavailable = "stale"`` and gets a note to
     search again later; existing warnings are kept."""
     out = copy.deepcopy(payload)
-    more = _says_more(out)
+    more = _says_more(out) or any(
+        container.get("has_more") is True
+        for container, _, _ in _locate_all_search_results_containers(out, op=op)
+    )
     for slot in list(_cursor_slots(out)):
         slot["cursor"] = None
     _drop_continuations(out, more)
@@ -801,7 +805,7 @@ def _drop_continuations(obj: Any, more: bool) -> None:
         if "continuation_params" in obj:
             obj.pop("continuation_params", None)
             if more and isinstance(obj.get("warnings"), list):
-                obj["warnings"].append(STALE_CURSOR_NOTE)
+                obj["warnings"].append(STALE_CONTINUATION_NOTE)
         for value in obj.values():
             _drop_continuations(value, more)
     elif isinstance(obj, list):
@@ -882,6 +886,8 @@ def slice_cached_payload(
             if truncated_any and "cursor" in container:
                 # Never fabricate a cursor; stale end-of-larger-page cursor is cleared.
                 container["cursor"] = None
+                # The upstream note says to keep paging with the cursor that was just cleared.
+                container["pagination_note"] = SLICED_CACHE_NOTE
 
         if text_block is not None:
             text_block["text"] = json.dumps(container, ensure_ascii=False)
