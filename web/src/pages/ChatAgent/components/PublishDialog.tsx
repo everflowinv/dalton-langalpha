@@ -564,6 +564,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     }
   };
 
+  // DALTON-HOOK(monitors): keep toggleMember helper alongside monitor keep-updated controls
   const toggleMember = (memberId: string) => {
     const next = effectiveMembers.includes(memberId)
       ? effectiveMembers.filter((id) => id !== memberId)

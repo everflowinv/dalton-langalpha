@@ -82,6 +82,7 @@ describe('live projection', () => {
     }) as StreamRuntime['setMessages'];
     const ids = ref(new Set<string>());
     const show = vi.fn();
+    // DALTON-HOOK(notify-routes): expose answerBoard from build() for notify confirmation card tests
     const board = createAnswerBoard({ pendingIds: ids, sessionEpoch: ref(0), setMessages });
     const rt = {
       setMessages,

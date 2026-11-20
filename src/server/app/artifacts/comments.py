@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import replace
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException  # DALTON-HOOK(artifact-publishing-off): 403 when publishing disabled
 from fastapi.responses import Response
 
 from src.server.app.artifacts.models import (

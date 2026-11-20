@@ -190,6 +190,7 @@ async def test_a_preferences_reset_keeps_the_account_setup_stamp():
         yield
 
     @asynccontextmanager
+    # DALTON-HOOK(data-jobs): accept optional conn forwarded by delete_user_preferences
     async def _connection(*_):
         yield conn
 

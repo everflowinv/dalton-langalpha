@@ -31,6 +31,7 @@ HOLDER_AUTH_PROVIDER = "shared_workspace"
 
 
 def is_holder(user_id: object) -> bool:
+    # DALTON-HOOK(colleague-dispatch): reject spec='str' MagicMock whose startswith() is truthy but not True
     return isinstance(user_id, str) and (user_id.startswith(HOLDER_PREFIX) is True)
 
 

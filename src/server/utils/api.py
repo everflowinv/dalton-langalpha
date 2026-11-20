@@ -105,6 +105,7 @@ class Caller:
 def note_caller(
     request: Request, user_id: str, auth: str, client_id: Optional[str] = None
 ) -> None:
+    # DALTON-HOOK(dalton-auth): tolerate autospec Request mocks without a .scope attribute
     scope = getattr(request, "scope", None)
     if isinstance(scope, dict):
         scope.setdefault("state", {})[_CALLER] = Caller(user_id, auth, client_id)

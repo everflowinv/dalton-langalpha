@@ -96,6 +96,7 @@ from src.server.services.workspace_files import (
     to_client_path,
 )
 
+# DALTON-HOOK(chat-large-upload): bridge legacy crud.owner_work_dir and crud.owner_layout test patches
 _DEFAULT_OWNER_LAYOUT = owner_layout
 _DEFAULT_OWNER_WORK_DIR = owner_work_dir
 
@@ -427,6 +428,7 @@ def _folded_refs(
     body: ResolveFileRefRequest, workspace: dict[str, Any]
 ) -> tuple[str, list[str], list[str]]:
     """The workspace's folder, and the reference and recent writes folded onto it."""
+    # DALTON-HOOK(chat-large-upload): resolve owner work_dir via crud/shared bridge
     work_dir = _resolve_owner_work_dir(workspace)
     previous_dirs = previous_dir_names_of(workspace)
     previous_roots = previous_roots_of(workspace)
@@ -1601,6 +1603,7 @@ async def backup_workspace_files(
     # the sync reports that as a clean pass.
     async with acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
         try:
+            # DALTON-HOOK(chat-large-upload): resolve owner layout via crud/shared bridge
             result = await FilePersistenceService.sync_to_db(
                 workspace_id, sandbox, layout=_resolve_owner_layout(workspace)
             )
@@ -1704,6 +1707,7 @@ async def get_backup_status(
     # moving or a failed scan all return DB-only info.
     try:
         async with acquire_sandbox_to_change(workspace_id, x_user_id) as (sandbox, workspace):
+            # DALTON-HOOK(chat-large-upload): resolve owner layout via crud/shared bridge
             sandbox_meta = await FilePersistenceService.list_sandbox_files(
                 sandbox, layout=_resolve_owner_layout(workspace)
             )

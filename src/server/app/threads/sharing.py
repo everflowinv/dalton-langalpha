@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
+# DALTON-HOOK(colleague-dispatch): auth_api module import and tier checks for sharing guards
 from src.server.utils import api as auth_api
 from src.server.utils.api import (
     CurrentUserId,

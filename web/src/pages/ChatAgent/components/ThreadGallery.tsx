@@ -313,6 +313,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   }, [workspaceId, setPanelOverride]);
 
   const navigate = useNavigate();
+  // DALTON-HOOK(global-search): keep urlWorkspaceId alias for cross-workspace global search navigation
   const { workspaceId: urlWorkspaceId, threadId: currentThreadId } = useParams();
   const routeWorkspaceId = urlWorkspaceId;
 

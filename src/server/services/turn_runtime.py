@@ -50,6 +50,7 @@ class TurnRoute:
 
     workspace_id: str
     role: AgentRole
+    # DALTON-HOOK(colleague-dispatch): default owner_id for two-argument TurnRoute callers
     owner_id: str = ""
     away: Optional[HomeAway] = None
 

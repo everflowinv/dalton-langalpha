@@ -116,6 +116,7 @@ async def test_a_files_first_publish_takes_the_members_audience(accounts):
     set_audience = AsyncMock(return_value=MagicMock(artifact_id="a1", audience=ORGANIZATION))
     publish = AsyncMock(side_effect=RuntimeError("published"))
     with (
+        # DALTON-HOOK(artifact-publishing-off): opt test into artifact publishing
         patch(
             "src.dalton.settings.is_artifact_publishing_enabled",
             return_value=True,

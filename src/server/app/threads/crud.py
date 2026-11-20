@@ -273,6 +273,7 @@ async def list_threads(
                 turn_count=thread.get("turn_count"),
                 created_at=thread["created_at"],
                 updated_at=thread["updated_at"],
+                # DALTON-HOOK(colleague-dispatch): preserve viewer vs thread-owner lifecycle state
                 **_lifecycle_fields(thread, current_user_id=x_user_id),
             )
             for thread in threads

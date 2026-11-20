@@ -8,7 +8,7 @@ commands, wakeups, approvals and thread status are the sender's.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch  # DALTON-HOOK(colleague-dispatch): asserts ordered vault_resolver calls
 
 import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel

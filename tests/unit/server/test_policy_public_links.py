@@ -93,6 +93,7 @@ async def test_sharing_a_thread_is_refused_and_unsharing_is_not():
 
     update = AsyncMock(return_value={"is_shared": False, "share_token": "t"})
     with (
+        # DALTON-HOOK(artifact-publishing-off): opt test into artifact publishing
         patch("src.dalton.settings.is_artifact_publishing_enabled", return_value=True),
         standing_under(NO_LINKS),
         patch("src.server.services.shared_workspaces.access.thread_access", new_callable=AsyncMock, side_effect=_as_owner),
@@ -121,6 +122,7 @@ async def test_publishing_a_file_is_refused():
 
     publish = AsyncMock()
     with (
+        # DALTON-HOOK(artifact-publishing-off): opt test into artifact publishing
         patch("src.dalton.settings.is_artifact_publishing_enabled", return_value=True),
         standing_under(NO_LINKS),
         patch("src.server.app.artifacts.records.reached", new_callable=AsyncMock, return_value=(MagicMock(audience=None), _as_owner(None, "u"))),

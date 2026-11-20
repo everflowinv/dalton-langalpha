@@ -548,6 +548,7 @@ async def _within_trading_policy(
 
 async def prepare_direct_mcp_tools(
     *,
+    # DALTON-HOOK(colleague-dispatch): accept distinct owner and caller user IDs
     user_id: str | None = None,
     owner_user_id: str | None = None,
     caller_user_id: str | None = None,

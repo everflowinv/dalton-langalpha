@@ -825,6 +825,7 @@ def _stamp(config, client, prompt_guidance: str | None) -> None:
 
 async def _resolve_role_clients(
     config, user_id: str, roles: list[LLMRole], model_pref: dict,
+    # DALTON-HOOK(subagent-model-pin): keep policy optional for legacy callers and unit tests
     byok_cache: dict, *, is_byok: bool, cache_key: str | None, policy: Policy | None = None,
     main_model: str | None = None,
 ) -> None:
@@ -977,6 +978,7 @@ async def _resolve_role_clients(
 
 async def _resolve_fallback_clients(
     config, user_id: str, model_pref: dict, byok_cache: dict,
+    # DALTON-HOOK(llm-overlay): keep policy optional for legacy callers and unit tests
     *, is_byok: bool, cache_key: str | None, policy: Policy | None = None,
     reasoning_effort: str | None = None, fast_mode: bool | None = None,
 ) -> None:

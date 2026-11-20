@@ -130,6 +130,7 @@ def brokerage_by_name(name: str) -> Brokerage | None:
 
 
 def _host_of(url: str | None) -> str | None:
+    # DALTON-HOOK(hide-trading): guard non-string urls before urlsplit in brokerage checks
     if not url or not isinstance(url, str):
         return None
     try:

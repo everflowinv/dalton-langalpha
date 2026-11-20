@@ -27,7 +27,7 @@ from src.server.database.workspace_folders import (
 from src.server.services.computer_usage.causes import computer_cause
 from src.server.models.computer_cause import StartCause
 from src.server.models.workspace import served_from_mirror
-from src.server.database.shared_workspaces import is_holder
+from src.server.database.shared_workspaces import is_holder  # DALTON-HOOK(workspace-sharing-settings): check shared-workspace holder ownership
 from src.server.services.shared_workspaces.access import Access, workspace_access
 from src.server.services.ssh_computers import refuse_if_tunnel_down
 from src.server.services.workspace_file_containment import (

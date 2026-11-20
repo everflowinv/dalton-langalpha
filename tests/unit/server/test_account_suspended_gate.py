@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, create_autospec, patch  # DALTON-HOOK(dalton-auth): used by Dalton route-level suspension tests
 
 import httpx
 import pytest

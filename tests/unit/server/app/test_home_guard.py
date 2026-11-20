@@ -14,6 +14,7 @@ from src.server.app.workspace_files import router as files_router
 from src.server.app.workspace_sandbox import router as sandbox_router
 from src.server.services.workspace_files import (
     HOME_NOT_ON_COMPUTER,
+    # DALTON-HOOK(workspace-sharing-settings): covered by Dalton colleague-access guard tests
     owned_workspace_on_computer,
     reached_workspace_on_computer,
 )

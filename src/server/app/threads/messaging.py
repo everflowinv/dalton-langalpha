@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional  # DALTON-HOOK(colleague-dispatch): typing for foreign-thread dispatch helpers
 from uuid import UUID, uuid4
 
 import asyncio
@@ -30,6 +30,7 @@ from src.server.contracts.status import to_public
 from src.server.contracts.turn_kinds import ANNOUNCED_KEYS
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.services.report_back.handoff.keys import ORIGIN_THREAD_META
+# DALTON-HOOK(colleague-dispatch): retain patchable thread_access fallback alongside foreign-thread write authorization
 from src.server.services.shared_workspaces.access import (
     Access,
     ThreadWatch,
@@ -1933,6 +1934,7 @@ async def retry_thread(
     scope = RunScope(user_id=auth.user_id, burst_slot_id=auth.burst_slot_id)
 
     try:
+        # DALTON-HOOK(colleague-dispatch): authorize foreign colleague retries via shared-workspace write check
         if thread_access is not _DEFAULT_THREAD_ACCESS:
             access = await thread_access(thread_id, auth.user_id)
         else:
